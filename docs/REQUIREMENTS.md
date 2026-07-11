@@ -130,6 +130,9 @@ the requirement says so explicitly rather than implying one.
   so that thread reply counts and quoted references have not broken.
 - **REQ-053.** Full message history has had no retention cutoff or paid-tier
   history cap of the kind Slack's free tier imposes.
+- **REQ-054.** A message body has been capped at approximately 64KB
+  (ARCH-30). Attachments (REQ-140) have not been subject to this cap, since
+  they are never sent as protocol frames.
 
 ### 2.2 Threads
 
@@ -180,6 +183,11 @@ the requirement says so explicitly rather than implying one.
   being accepted twice, via a client-generated idempotency token distinct
   from the server-assigned message id. **[needs ARCH decision — idempotency
   token placement in the frame format]**
+- **REQ-094.** The system's recovery point objective (RPO) on total loss of
+  a tenant's box has been 15 seconds — the interval at which committed
+  writes are shipped to remote object storage (ARCH-23). Messages
+  acknowledged to a client less than 15 seconds before a total box loss have
+  been at risk of not being recoverable.
 
 ### 3.2 Reconnect and Offline Behavior
 
@@ -279,8 +287,14 @@ the requirement says so explicitly rather than implying one.
 
 - **REQ-170.** A third-party service has been able to post a message into a
   channel via an incoming webhook URL scoped to that channel, without that
-  service holding a user session or JWT. **[needs ARCH decision — webhook
-  token format, payload schema, and rate limit]**
+  service holding a user session or JWT, over the embedded HTTP listener
+  (ARCH-32). **[needs ARCH decision — webhook token format, payload schema,
+  and rate limit]**
+- **REQ-171.** A tenant that has enabled webhooks has had a CA-signed TLS
+  certificate obtained on-demand for that endpoint, since third-party
+  webhook senders validate against a standard CA trust store and cannot pin
+  a custom certificate (ARCH-34). A tenant with webhooks disabled has had no
+  such certificate and no such requirement.
 
 ---
 
@@ -299,6 +313,13 @@ the requirement says so explicitly rather than implying one.
   revocation. **[needs ARCH decision — revocation propagation mechanism,
   since sessions are validated against provider JWKS rather than a local
   session table]**
+- **REQ-183.** Certificate trust for the client-daemon connection has been
+  established via TOFU (trust-on-first-connect) pinning against a
+  self-signed certificate the daemon generates on first run, not CA-chain
+  validation, uniformly across hosted and self-hosted tenants (ARCH-10).
+  The one exception has been the incoming-webhooks endpoint (REQ-171), which
+  uses a real CA-signed certificate because its clients are uncontrolled
+  third parties.
 
 ### 8.2 Abuse Prevention and Rate Limiting
 
@@ -331,3 +352,7 @@ the requirement says so explicitly rather than implying one.
   (~256MB) for a low-usage tenant and has scaled to a standard profile
   (~512MB) for a higher-concurrency tenant, without requiring an
   architecture change between the two profiles (ARCH-4).
+- **REQ-211.** The daemon has supported at least a low-hundreds count of
+  concurrent client connections per tenant within the lean memory profile
+  (ARCH-30), sufficient for the 50-100 target customer scale referenced
+  elsewhere in this project.
