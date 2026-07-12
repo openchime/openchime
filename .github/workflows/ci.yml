@@ -1,15 +1,20 @@
 name: ci
 
-# Runs on every PR targeting main. Two jobs:
+# Runs on pushes to main and on every PR targeting main. Two jobs:
 #   - build:       native gcc build of the daemon, plus unit tests (make test)
 #                  once the first tests/ TU exists.
 #   - integration: the durability path end-to-end on the Docker Compose stack —
 #                  replication reaching MinIO (ARCH-23) and restore-on-boot
 #                  (ARCH-24), automating the README's "Verify" steps.
-# Doc-only changes skip CI. Pushes to main do nothing; merges go through PRs.
-# See docs/TESTING.md for the full strategy.
+# Doc-only changes skip CI. See docs/TESTING.md for the full strategy.
 
 on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - '.env.example'
   pull_request:
     branches: [main]
     paths-ignore:

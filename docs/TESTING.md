@@ -196,9 +196,9 @@ real protocol.
 ## 4. Continuous integration
 
 CI is GitHub Actions (`.github/workflows/ci.yml`), mirroring openblocks'
-conventions: it triggers on pull requests targeting `main`, skips doc-only
-changes via `paths-ignore`, and uses a `concurrency` group to cancel superseded
-runs. Pushes to `main` don't run CI; changes land through PRs.
+conventions: it triggers on pushes to `main` and on pull requests targeting
+`main`, skips doc-only changes via `paths-ignore`, and uses a `concurrency`
+group to cancel superseded runs.
 
 Jobs:
 
