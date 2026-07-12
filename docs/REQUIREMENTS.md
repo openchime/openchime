@@ -173,16 +173,16 @@ the requirement says so explicitly rather than implying one.
   client to confirm receipt (ARCH-8).
 - **REQ-091.** A client has treated redelivery of a message it has already
   acked as a duplicate and has suppressed it rather than rendering it twice,
-  keyed on the server-assigned message id (REQ-050). **[needs ARCH decision
-  — dedup key and window]**
+  keyed on the server-assigned message id (REQ-050), using a per-channel
+  high-water mark of the highest id seen (ARCH-45).
 - **REQ-092.** Within a single channel, the daemon has delivered messages to
   a given connected client in the order the daemon accepted them. Ordering
   across different channels has carried no guarantee relative to each other.
 - **REQ-093.** A send the daemon has not acknowledged (connection drop before
   ack) has been safely retryable by the client without risk of the message
-  being accepted twice, via a client-generated idempotency token distinct
-  from the server-assigned message id. **[needs ARCH decision — idempotency
-  token placement in the frame format]**
+  being accepted twice, via a client-generated 16-byte idempotency token
+  distinct from the server-assigned message id, carried on the `SEND` frame
+  and de-duplicated by a persisted `(channel, token) → id` mapping (ARCH-44).
 - **REQ-094.** The system's recovery point objective (RPO) on total loss of
   a tenant's box has been 15 seconds — the interval at which committed
   writes are shipped to remote object storage (ARCH-23). Messages
@@ -198,8 +198,9 @@ the requirement says so explicitly rather than implying one.
 - **REQ-101.** On reconnect, the client has requested and received a replay
   of messages accepted by the daemon after the last message the client
   acked, across all channels the client is a member of, so that no message
-  sent during the disconnection window has been silently missed.
-  **[needs ARCH decision — backfill request shape]**
+  sent during the disconnection window has been silently missed, via a
+  `BACKFILL_REQUEST` carrying per-channel `after_message_id` cursors answered
+  with replayed messages and a `BACKFILL_DONE` marker (ARCH-46).
 - **REQ-102.** A message composed while the client is disconnected has been
   queued locally and sent automatically on reconnect, in the order composed,
   without requiring the user to resend it manually. **[needs ARCH decision]**
@@ -213,8 +214,8 @@ the requirement says so explicitly rather than implying one.
 - **REQ-111.** A protocol version rejection has carried a machine-readable
   reason code distinguishing "client too old" from "client too new," so a
   client has been able to present "please update the app" only when that is
-  actually the correct remedy. **[needs ARCH decision — version negotiation
-  and error code table]**
+  actually the correct remedy, via the `VERSION_TOO_OLD` / `VERSION_TOO_NEW`
+  reason codes returned in the handshake `REJECT` frame (ARCH-41, ARCH-47).
 
 ---
 

@@ -1,7 +1,10 @@
 # OpenChime
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
-[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for the project's design.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
+[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md), and
+[docs/PROTOCOL.md](docs/PROTOCOL.md) (the byte-level wire protocol spec for the
+core messaging path), and [docs/TESTING.md](docs/TESTING.md) (the unit +
+integration test strategy) for the project's design.
 
 This repo currently contains a **placeholder daemon** only — enough to
 prove the build/container/replication pipeline works end-to-end (ARCH-35

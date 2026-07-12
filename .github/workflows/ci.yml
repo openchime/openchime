@@ -1,0 +1,100 @@
+name: ci
+
+# Runs on every PR targeting main. Two jobs:
+#   - build:       native gcc build of the daemon, plus unit tests (make test)
+#                  once the first tests/ TU exists.
+#   - integration: the durability path end-to-end on the Docker Compose stack —
+#                  replication reaching MinIO (ARCH-23) and restore-on-boot
+#                  (ARCH-24), automating the README's "Verify" steps.
+# Doc-only changes skip CI. Pushes to main do nothing; merges go through PRs.
+# See docs/TESTING.md for the full strategy.
+
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - '.env.example'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build + unit tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsqlite3-dev
+      - name: Build daemon
+        run: make
+      - name: Run unit tests
+        run: |
+          if ls tests/*.c >/dev/null 2>&1; then
+            make test
+          else
+            echo "no unit tests yet — skipping (see docs/TESTING.md §2)"
+          fi
+
+  integration:
+    name: durability path (compose)
+    runs-on: ubuntu-22.04
+    # A stable project name so the volume is deterministically
+    # openchime_daemon-data for the restore-on-boot wipe below.
+    env:
+      COMPOSE_PROJECT_NAME: openchime
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare env
+        run: cp .env.example .env
+
+      - name: Build and start the stack
+        run: docker compose up --build -d
+
+      - name: Wait for the daemon health check (ARCH-25)
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8080/healthz >/dev/null 2>&1; then
+              echo "daemon healthy"; exit 0
+            fi
+            sleep 2
+          done
+          echo "daemon did not become healthy in time" >&2
+          docker compose logs
+          exit 1
+
+      - name: Verify replication reached MinIO (ARCH-23)
+        run: |
+          # Past the 15s Litestream sync interval, the replica prefix must be
+          # non-empty. Use a throwaway mc container on the compose network.
+          sleep 20
+          docker compose run --rm --no-deps --entrypoint sh minio-init -c '
+            until mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"; do sleep 1; done
+            mc ls --recursive local/"$LITESTREAM_BUCKET"/openchime | grep .
+          '
+
+      - name: Verify restore-on-boot (ARCH-24)
+        run: |
+          docker compose stop daemon
+          docker compose rm -f daemon
+          docker volume rm openchime_daemon-data
+          docker compose up -d daemon
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8080/healthz >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          # The entrypoint must have restored from the replica, not init'd fresh.
+          docker compose logs daemon | grep "attempting restore from replica"
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
