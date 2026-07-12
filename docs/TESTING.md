@@ -102,7 +102,8 @@ framework, and OpenChime follows suit.
   ids, idempotent replay, membership gate, broadcast fan-out list) driven
   directly through the job queue. The **event loop** (`itest_netloop`) is tested
   end-to-end: two TLS clients authenticate, one `SEND`s, and both receive the
-  `BROADCAST` while the sender is acked.
+  `BROADCAST` while the sender is acked; and a reconnecting client
+  `BACKFILL_REQUEST`s and receives its missed messages replayed in order.
 - **Idempotency + dedup** (ARCH-44/45) — a repeated `(channel, token)` returns
   the original id without a second insert; the client high-water mark
   suppresses a `message_id` at or below the mark.

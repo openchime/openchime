@@ -82,7 +82,7 @@ static void test_auth_and_send(void) {
     uint8_t idem[OC_IDEM_LEN];
     memset(idem, 0x11, sizeof idem);
     oc_job *j = oc_job_new(OC_JOB_SEND, 10);
-    j->author_id = a; j->channel_id = OC_DEFAULT_CHANNEL;
+    j->user_id = a; j->channel_id = OC_DEFAULT_CHANNEL;
     memcpy(j->idem, idem, sizeof idem);
     oc_job_set_body(j, "hello all", 9);
     oc_dbwriter_submit(w, j);
@@ -103,7 +103,7 @@ static void test_auth_and_send(void) {
 
     /* Same idempotency token -> replay of the original id, no new broadcast. */
     j = oc_job_new(OC_JOB_SEND, 10);
-    j->author_id = a; j->channel_id = OC_DEFAULT_CHANNEL;
+    j->user_id = a; j->channel_id = OC_DEFAULT_CHANNEL;
     memcpy(j->idem, idem, sizeof idem);
     oc_job_set_body(j, "hello all", 9);
     oc_dbwriter_submit(w, j);
@@ -114,7 +114,7 @@ static void test_auth_and_send(void) {
 
     /* A different token allocates a strictly greater id (monotonic, ARCH-43). */
     j = oc_job_new(OC_JOB_SEND, 11);
-    j->author_id = b; j->channel_id = OC_DEFAULT_CHANNEL;
+    j->user_id = b; j->channel_id = OC_DEFAULT_CHANNEL;
     memset(j->idem, 0x22, OC_IDEM_LEN);
     oc_job_set_body(j, "hi", 2);
     oc_dbwriter_submit(w, j);
@@ -124,7 +124,7 @@ static void test_auth_and_send(void) {
 
     /* A non-member author is rejected. */
     j = oc_job_new(OC_JOB_SEND, 99);
-    j->author_id = 9999; j->channel_id = OC_DEFAULT_CHANNEL;
+    j->user_id = 9999; j->channel_id = OC_DEFAULT_CHANNEL;
     memset(j->idem, 0x33, OC_IDEM_LEN);
     oc_job_set_body(j, "x", 1);
     oc_dbwriter_submit(w, j);
@@ -136,9 +136,69 @@ static void test_auth_and_send(void) {
     cleanup_db(path);
 }
 
+static uint64_t send_msg(oc_dbwriter *w, uint64_t uid, const uint8_t idem[OC_IDEM_LEN], const char *body) {
+    oc_job *j = oc_job_new(OC_JOB_SEND, 1);
+    j->user_id = uid; j->channel_id = OC_DEFAULT_CHANNEL;
+    memcpy(j->idem, idem, OC_IDEM_LEN);
+    oc_job_set_body(j, body, strlen(body));
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    uint64_t id = (r && r->type == OC_RES_SEND_OK) ? r->message_id : 0;
+    oc_dbres_free(r);
+    return id;
+}
+
+static oc_dbres *backfill(oc_dbwriter *w, uint64_t uid, uint64_t channel, uint64_t after) {
+    oc_job *j = oc_job_new(OC_JOB_BACKFILL, 1);
+    j->user_id = uid;
+    j->cursors = malloc(sizeof(oc_bf_cursor));
+    j->cursors[0].channel_id = channel;
+    j->cursors[0].after_message_id = after;
+    j->n_cursors = 1;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_backfill(void) {
+    const char *path = "build/test_dbwriter3.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t u = do_auth(w, 1, "bf-user");
+    CHECK(u != 0);
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 1, sizeof idem); uint64_t m1 = send_msg(w, u, idem, "one");
+    memset(idem, 2, sizeof idem); uint64_t m2 = send_msg(w, u, idem, "two");
+    memset(idem, 3, sizeof idem); uint64_t m3 = send_msg(w, u, idem, "three");
+    CHECK(m1 && m2 > m1 && m3 > m2);
+
+    /* From m1: replay m2, m3 in ascending order; high-water is m3. */
+    oc_dbres *r = backfill(w, u, OC_DEFAULT_CHANNEL, m1);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK && r->n_replay == 2);
+    CHECK(r->replay[0].message_id == m2 && r->replay[1].message_id == m3);
+    CHECK(r->replay[0].body_len == 3 && memcmp(r->replay[0].body, "two", 3) == 0);
+    CHECK(r->high_water == m3);
+    oc_dbres_free(r);
+
+    /* From 0: all three. */
+    r = backfill(w, u, OC_DEFAULT_CHANNEL, 0);
+    CHECK(r && r->n_replay == 3 && r->replay[0].message_id == m1);
+    oc_dbres_free(r);
+
+    /* A channel the user isn't a member of replays nothing. */
+    r = backfill(w, u, 999, 0);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK && r->n_replay == 0);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
-    printf("test_dbwriter: migrate-on-boot, AUTH upsert, SEND persist/idempotency/members\n");
+    printf("test_dbwriter: migrate-on-boot, AUTH upsert, SEND persist/idempotency/members, backfill\n");
     test_start_migrates_and_stops();
     test_auth_and_send();
+    test_backfill();
     return failures;
 }

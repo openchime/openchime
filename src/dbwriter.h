@@ -24,27 +24,42 @@
 
 /* --- Jobs (net thread -> writer) ---------------------------------------- */
 
-enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2 };
+enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3 };
+
+/* Per-channel reconnect cursor: replay messages with id > after_message_id. */
+typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
 
 typedef struct oc_job {
     struct oc_job *next;
     int            type;
     uint64_t       conn_id;   /* originating connection, echoed on the result */
+    uint64_t       user_id;   /* the authenticated user (for SEND author / backfill auth) */
 
     /* AUTH */
     char          *token;     /* heap; the (stubbed) credential, used as subject */
 
     /* SEND */
-    uint64_t       author_id; /* the authenticated user (net thread supplies it) */
     uint64_t       channel_id;
     uint8_t        idem[OC_IDEM_LEN];
     uint8_t       *body;      /* heap */
     size_t         body_len;
+
+    /* BACKFILL */
+    oc_bf_cursor  *cursors;   /* heap */
+    size_t         n_cursors;
 } oc_job;
 
 /* --- Results (writer -> net thread) ------------------------------------- */
 
-enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3, OC_RES_SEND_ERR = 4 };
+enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
+       OC_RES_SEND_ERR = 4, OC_RES_BACKFILL_OK = 5 };
+
+/* One message to replay on reconnect (rendered as a BROADCAST by the net thread). */
+typedef struct {
+    uint64_t message_id, channel_id, author_id, server_time;
+    uint8_t *body;       /* heap */
+    size_t   body_len;
+} oc_replay_msg;
 
 typedef struct oc_dbres {
     struct oc_dbres *next;
@@ -66,6 +81,11 @@ typedef struct oc_dbres {
     uint64_t      *members;   /* heap; user ids to fan the broadcast out to */
     size_t         n_members;
     int            duplicate; /* idempotent replay: ack only, no broadcast */
+
+    /* BACKFILL_OK */
+    oc_replay_msg *replay;    /* heap array, ascending message_id */
+    size_t         n_replay;
+    uint64_t       high_water;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;

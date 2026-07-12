@@ -218,7 +218,7 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
             if (oc_decode_send(&p, &s) != OC_OK) return -1;
             oc_job *j = oc_job_new(OC_JOB_SEND, c->conn_id);
             if (!j) return -1;
-            j->author_id = c->user_id;
+            j->user_id = c->user_id;
             j->channel_id = s.channel_id;
             memcpy(j->idem, s.idem, OC_IDEM_LEN);
             if (oc_job_set_body(j, s.body.ptr, s.body.len) != 0) return -1;
@@ -227,7 +227,28 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
         }
         if (hdr.msg_type == OC_MSG_CLIENT_ACK) {
             oc_client_ack ca;
-            oc_decode_client_ack(&p, &ca); /* accepted; delivery cursor is a later milestone */
+            oc_decode_client_ack(&p, &ca); /* accepted; the client drives backfill via its own cursors */
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_BACKFILL_REQUEST) {
+            oc_cursor cursors[256];
+            uint16_t count = 0;
+            if (oc_decode_backfill_request(&p, cursors, 256, &count) != OC_OK) return -1;
+            if (count > 256) count = 256; /* wire count may exceed our capacity */
+            oc_job *j = oc_job_new(OC_JOB_BACKFILL, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            if (count > 0) {
+                j->cursors = malloc((size_t)count * sizeof *j->cursors);
+                if (j->cursors) {
+                    for (uint16_t i = 0; i < count; i++) {
+                        j->cursors[i].channel_id = cursors[i].channel_id;
+                        j->cursors[i].after_message_id = cursors[i].after_message_id;
+                    }
+                    j->n_cursors = count;
+                }
+            }
+            oc_dbwriter_submit(dbw, j);
             continue;
         }
         /* Other post-auth frame types are ignored by this skeleton. */
@@ -306,6 +327,26 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         oc_error e = { r->err_code, 0, ctx, oc_slice_str("send rejected") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_BACKFILL_OK: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        int fd = c->fd;
+        /* Replay each missed message as a BROADCAST, in ascending id order. */
+        for (size_t i = 0; i < r->n_replay && conns[fd]; i++) {
+            oc_replay_msg *m = &r->replay[i];
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_slice body = { m->body, m->body_len };
+            oc_broadcast b = { m->message_id, m->channel_id, m->author_id, m->server_time, body };
+            oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+        }
+        if (!conns[fd]) return;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_backfill_done done = { r->high_water };
+        oc_encode_backfill_done(&w, OC_PROTOCOL_VERSION, &done);
+        send_bytes(ep, conns, fd, g_enc, w.len);
         break;
     }
     default: break;

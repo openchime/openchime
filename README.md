@@ -17,7 +17,8 @@ The network loop completes the TLS handshake, negotiates the protocol version
 (`HELLO`→`WELCOME`/`REJECT`), authenticates a session, and runs the core
 messaging path — a `SEND` is persisted (with a server-assigned monotonic id and
 idempotent-retry dedup) and delivered to the channel's connected members as a
-`BROADCAST`, with the sender acked. **Authentication is currently stubbed** (the
+`BROADCAST`, with the sender acked; a reconnecting client can `BACKFILL_REQUEST`
+the messages it missed and have them replayed. **Authentication is currently stubbed** (the
 token is accepted and mapped to a user; real OIDC/JWT validation against a
 provider's JWKS is the next milestone), and channel management is a single
 auto-provisioned default channel for now.

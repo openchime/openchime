@@ -190,8 +190,81 @@ static void test_message_vertical(int port, const uint8_t *pin) {
     client_close(&b);
 }
 
+/* A reconnecting client backfills messages it missed (REQ-101). */
+static void test_backfill_reconnect(int port, const uint8_t *pin) {
+    /* A sends a distinctive message and learns its id. */
+    client a;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "bf-sender", &ua) == 0);
+
+    uint8_t idem[OC_IDEM_SIZE];
+    memset(idem, 0x5C, sizeof idem);
+    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s;
+    s.channel_id = 1;
+    memcpy(s.idem, idem, OC_IDEM_SIZE);
+    s.body = oc_slice_str("backfill me");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+    CHECK(write_all(&a.conn, buf, w.len) == 0);
+
+    uint64_t mx = 0;
+    for (int i = 0; i < 2; i++) {          /* SEND_ACK + own BROADCAST */
+        oc_header hdr; oc_rbuf p;
+        CHECK(read_frame(&a, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) {
+            oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK);
+            mx = ack.message_id;
+        }
+    }
+    CHECK(mx != 0);
+
+    /* A fresh connection (a reconnect) authenticates and backfills from 0. */
+    client c;
+    CHECK(client_open(&c, port, pin) == 0);
+    CHECK(do_handshake(&c) == 0);
+    uint64_t uc = 0;
+    CHECK(do_auth(&c, "bf-reader", &uc) == 0);
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_cursor cur = { 1, 0 };
+    oc_backfill_request req = { 1, &cur };
+    CHECK(oc_encode_backfill_request(&w, OC_PROTOCOL_VERSION, &req) == OC_OK);
+    CHECK(write_all(&c.conn, buf, w.len) == 0);
+
+    /* Replayed BROADCASTs (ascending id) then a BACKFILL_DONE; mx must appear. */
+    int saw_mx = 0;
+    uint64_t hw = 0, prev = 0;
+    for (int i = 0; i < 1000; i++) {
+        oc_header hdr; oc_rbuf p;
+        CHECK(read_frame(&c, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_BROADCAST) {
+            oc_broadcast b; CHECK(oc_decode_broadcast(&p, &b) == OC_OK);
+            CHECK(b.message_id > prev);     /* ascending order */
+            prev = b.message_id;
+            if (b.message_id == mx) {
+                saw_mx = 1;
+                CHECK(b.body.len == 11 && memcmp(b.body.ptr, "backfill me", 11) == 0);
+            }
+        } else if (hdr.msg_type == OC_MSG_BACKFILL_DONE) {
+            oc_backfill_done d; CHECK(oc_decode_backfill_done(&p, &d) == OC_OK);
+            hw = d.high_water;
+            break;
+        } else {
+            CHECK(0 /* unexpected frame during backfill */);
+            break;
+        }
+    }
+    CHECK(saw_mx == 1);
+    CHECK(hw >= mx);
+
+    client_close(&a);
+    client_close(&c);
+}
+
 int run_netloop_tests(void) {
-    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST\n");
+    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill\n");
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -215,6 +288,7 @@ int run_netloop_tests(void) {
     if (failures == 0) {
         test_version_reject(arg.port, pin);
         test_message_vertical(arg.port, pin);
+        test_backfill_reconnect(arg.port, pin);
     }
 
     arg.stop = 1;

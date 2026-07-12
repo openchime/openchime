@@ -65,6 +65,7 @@ static void job_free(oc_job *j) {
     if (!j) return;
     free(j->token);
     free(j->body);
+    free(j->cursors);
     free(j);
 }
 
@@ -72,8 +73,14 @@ void oc_dbres_free(oc_dbres *r) {
     if (!r) return;
     free(r->body);
     free(r->members);
+    for (size_t i = 0; i < r->n_replay; i++) free(r->replay[i].body);
+    free(r->replay);
     free(r);
 }
+
+/* Replay is bounded per request; a client with more backlog issues a follow-up
+ * BACKFILL_REQUEST with an advanced cursor (PROTOCOL.md §6.2). */
+#define OC_BACKFILL_MAX 500
 
 /* --- Job processing (runs on the writer thread) ------------------------- */
 
@@ -162,7 +169,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     if (!r) return NULL;
     r->conn_id = j->conn_id;
     r->channel_id = j->channel_id;
-    r->author_id = j->author_id;
+    r->author_id = j->user_id;
     memcpy(r->idem, j->idem, OC_IDEM_LEN);
 
     /* Idempotent replay: a known (channel, token) re-acks the original id. */
@@ -183,7 +190,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     }
     sqlite3_finalize(st);
 
-    if (!is_member(db, j->channel_id, j->author_id)) {
+    if (!is_member(db, j->channel_id, j->user_id)) {
         r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;
         return r;
     }
@@ -195,7 +202,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
         "INSERT INTO messages(channel_id, author_id, body, created_at_ms) "
         "VALUES(?, ?, ?, ?);", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
-    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->author_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
     sqlite3_bind_blob(st, 3, j->body, (int)j->body_len, SQLITE_STATIC);
     sqlite3_bind_int64(st, 4, (sqlite3_int64)ts);
     int rc = sqlite3_step(st);
@@ -227,6 +234,61 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Replay messages newer than each cursor, for channels the user belongs to,
+ * bounded by OC_BACKFILL_MAX total (REQ-101, PROTOCOL.md §6). */
+static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_BACKFILL_OK;
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT COALESCE(MAX(id),0) FROM messages;", -1, &st, NULL);
+    if (sqlite3_step(st) == SQLITE_ROW) r->high_water = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+
+    size_t cap = 16, n = 0;
+    oc_replay_msg *arr = malloc(cap * sizeof *arr);
+    if (!arr) return r;
+
+    for (size_t ci = 0; ci < j->n_cursors && n < OC_BACKFILL_MAX; ci++) {
+        uint64_t ch = j->cursors[ci].channel_id;
+        if (!is_member(db, ch, j->user_id)) continue;
+
+        sqlite3_prepare_v2(db,
+            "SELECT id, author_id, created_at_ms, body FROM messages "
+            "WHERE channel_id=? AND id>? ORDER BY id LIMIT ?;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)ch);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->cursors[ci].after_message_id);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)(OC_BACKFILL_MAX - n));
+        while (sqlite3_step(st) == SQLITE_ROW && n < OC_BACKFILL_MAX) {
+            if (n == cap) {
+                cap *= 2;
+                oc_replay_msg *g = realloc(arr, cap * sizeof *arr);
+                if (!g) break;
+                arr = g;
+            }
+            oc_replay_msg *m = &arr[n];
+            memset(m, 0, sizeof *m);
+            m->message_id  = (uint64_t)sqlite3_column_int64(st, 0);
+            m->channel_id  = ch;
+            m->author_id   = (uint64_t)sqlite3_column_int64(st, 1);
+            m->server_time = (uint64_t)sqlite3_column_int64(st, 2);
+            const void *b = sqlite3_column_blob(st, 3);
+            int blen = sqlite3_column_bytes(st, 3);
+            if (b && blen > 0) {
+                m->body = malloc((size_t)blen);
+                if (m->body) { memcpy(m->body, b, (size_t)blen); m->body_len = (size_t)blen; }
+            }
+            n++;
+        }
+        sqlite3_finalize(st);
+    }
+    r->replay = arr;
+    r->n_replay = n;
+    return r;
+}
+
 /* --- Queue plumbing ----------------------------------------------------- */
 
 static void push_result(oc_dbwriter *w, oc_dbres *r) {
@@ -254,8 +316,9 @@ static void *writer_loop(void *arg) {
         pthread_mutex_unlock(&w->mu);
 
         oc_dbres *r = NULL;
-        if (j->type == OC_JOB_AUTH)      r = process_auth(w->db, j);
-        else if (j->type == OC_JOB_SEND) r = process_send(w->db, j);
+        if (j->type == OC_JOB_AUTH)          r = process_auth(w->db, j);
+        else if (j->type == OC_JOB_SEND)     r = process_send(w->db, j);
+        else if (j->type == OC_JOB_BACKFILL) r = process_backfill(w->db, j);
         job_free(j);
         push_result(w, r);
     }
