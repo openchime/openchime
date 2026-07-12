@@ -101,9 +101,14 @@ framework, and OpenChime follows suit.
   - version-negotiation math (§3): overlapping ranges pick
     `min(server_max, client_max)`; disjoint ranges yield the correct
     `VERSION_TOO_OLD` vs `VERSION_TOO_NEW` outcome.
+- **Frame reassembler** (`framebuf`, ARCH-9) — feeding a frame one byte at a
+  time yields nothing until complete; two frames in one push come out in order;
+  a frame split across pushes reassembles; bad/oversized lengths error rather
+  than buffer forever.
 - **Migration runner** (ARCH-27) — applying migrations against an empty
   `schema_version`, resuming a partially-migrated DB, and refusing to skip or
-  reorder.
+  reorder. The **DB-writer thread** (`dbwriter`) is tested for migrate-on-boot
+  and clean start/stop.
 - **Idempotency + dedup** (ARCH-44/45) — a repeated `(channel, token)` returns
   the original id without a second insert; the client high-water mark
   suppresses a `message_id` at or below the mark.
@@ -220,9 +225,12 @@ integration scenarios join the `integration` job once the client-TLS decision
 
 ```
 tests/
-  test_protocol.c        # unit: frame codec (first to land)
-  test_migrations.c      # unit: migration runner
-  itest_client.c         # integration: C client reusing src/protocol.c
+  test_protocol.c        # unit: frame codec
+  test_framebuf.c        # unit: incremental frame reassembler
+  test_migrate.c         # unit: migration runner
+  test_dbwriter.c        # integration: DB-writer thread migrate-on-boot
+  itest_tls.c            # integration: TLS handshake + TOFU pinning
+  itest_netloop.c        # integration: HELLO->WELCOME over the epoll loop
   ...
 Scripts/
   test-integration.sh    # brings up compose, runs scenarios, tears down

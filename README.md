@@ -8,10 +8,14 @@ migration mechanism), [docs/TLS.md](docs/TLS.md) (the mbedTLS-based transport
 and TOFU trust model), and [docs/TESTING.md](docs/TESTING.md) (the unit +
 integration test strategy) for the project's design.
 
-This repo currently contains a **placeholder daemon** only — enough to
-prove the build/container/replication pipeline works end-to-end (ARCH-35
-through ARCH-39), not the real wire protocol or chat features (ARCH-6
-onward, not yet implemented).
+The daemon is an **early skeleton**. It has the real foundations —
+the v1 wire-protocol frame codec (PROTOCOL.md), the two-thread model
+(ARCH-5: an epoll network loop + a single DB-writer thread), TLS termination
+with self-signed TOFU certs (ARCH-10, mbedTLS), and schema migrations applied
+on boot (ARCH-27) — plus the build/container/replication pipeline (ARCH-35–39).
+The network loop currently completes the TLS handshake and answers the protocol
+`HELLO` with `WELCOME`/`REJECT`; authentication and messaging (AUTH, SEND,
+BROADCAST, …) are not implemented yet.
 
 ## Local build
 

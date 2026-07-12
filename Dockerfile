@@ -1,9 +1,12 @@
 # syntax=docker/dockerfile:1
 
 FROM alpine:3.20 AS build
-RUN apk add --no-cache build-base sqlite-dev
+# build-base for the toolchain; bash/curl/tar/bzip2 for scripts/build_mbedtls.sh,
+# which `make` invokes to fetch + build the pinned mbedTLS static libs.
+RUN apk add --no-cache build-base sqlite-dev bash curl tar bzip2
 WORKDIR /src
 COPY Makefile .
+COPY scripts ./scripts
 COPY src ./src
 RUN make
 
@@ -29,7 +32,8 @@ RUN chmod +x /entrypoint.sh
 
 ENV OPENCHIME_DB_PATH=/data/openchime.db
 ENV OPENCHIME_HEALTH_PORT=8080
+ENV OPENCHIME_PROTO_PORT=8443
 
-EXPOSE 8080
+EXPOSE 8080 8443
 
 ENTRYPOINT ["/entrypoint.sh"]
