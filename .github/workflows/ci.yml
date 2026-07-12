@@ -35,7 +35,9 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libsqlite3-dev
+          # libsqlite3-dev for the daemon; bzip2 for the vendored mbedTLS
+          # tarball that `make test` builds via scripts/build_mbedtls.sh.
+          sudo apt-get install -y --no-install-recommends libsqlite3-dev bzip2
       - name: Build daemon
         run: make
       - name: Run unit tests

@@ -144,14 +144,12 @@ scenario driver) and is built by a dedicated make target. It speaks real
 frames: `HELLO`/`WELCOME`, `AUTH`, `SEND`/`SEND_ACK`/`BROADCAST`/`CLIENT_ACK`,
 `BACKFILL_REQUEST`/`BACKFILL_DONE`.
 
-**Open decision — client-side TLS.** The wire protocol runs over TLS with TOFU
-pinning (ARCH-10, REQ-180); there is no plaintext fallback. The test client
-therefore needs a TLS client that trusts the daemon's self-signed cert on first
-connect. The TLS library used by the *client* side is **not yet an ARCH
-decision** and is flagged here as one the daemon-side TLS work will settle;
-until then, integration scenarios that need a live socket are gated on that
-choice. Scenarios that don't need the socket (build, replication, restore) run
-today regardless.
+**Client-side TLS (settled).** The wire protocol runs over TLS with TOFU
+pinning (ARCH-10, REQ-180); there is no plaintext fallback. The TLS library is
+mbedTLS (ARCH-51, [TLS.md](./TLS.md)), used by both the daemon and the test
+client; `src/tls.c` already provides a TOFU-pinning client, so socket-level
+integration scenarios are no longer gated. `tests/itest_tls.c` exercises the
+handshake + pinning end-to-end today.
 
 ### 3.2 Runner: the existing Docker Compose stack
 

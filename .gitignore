@@ -1,5 +1,6 @@
 openchimed
 build/
+third_party/
 *.o
 *.db
 *.db-shm
