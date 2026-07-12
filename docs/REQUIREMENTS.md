@@ -53,13 +53,18 @@ the requirement says so explicitly rather than implying one.
 
 ### 1.1 Tenant Discovery and Resolution
 
-- **REQ-010.** The client has resolved a tenant from a user-supplied name
-  before opening a connection. A bare name (e.g. `acme`) has resolved via the
-  hosted service's DNS suffix; a name containing a domain (e.g. `acme.com`)
-  has resolved via SRV records, with optional `.well-known` metadata used for
-  self-hosted deployments (ARCH-14).
-- **REQ-011.** Resolution failure (no matching DNS suffix entry, no SRV
-  record, malformed `.well-known` metadata) has produced a distinct,
+- **REQ-010.** The client has collected an **instance** (the tenant's
+  address) and the user's **email** at sign-in, and has resolved the instance
+  to a daemon address by plain DNS before opening a connection — with no
+  hosted resolution service involved (ARCH-14). A self-hosted instance given
+  as a full domain (e.g. `chat.acme.com`) has resolved via SRV records plus
+  optional `.well-known` metadata; a hosted-tier instance given as a bare name
+  (e.g. `acme`) has had the service's known DNS suffix appended client-side
+  (`acme` → `acme.openchime.example`) and then resolved by ordinary DNS. The
+  email has been used only to drive the OIDC login (REQ-020), not to derive
+  the instance.
+- **REQ-011.** Resolution failure (the instance name does not resolve in DNS,
+  no SRV record, malformed `.well-known` metadata) has produced a distinct,
   user-facing error rather than being conflated with an authentication or
   network failure, since the user has needed to know which of "this org
   doesn't exist," "the org is unreachable," and "your login failed" applies.
@@ -107,10 +112,15 @@ the requirement says so explicitly rather than implying one.
   shared connection or shared query surface (ARCH-4, ARCH-7). Isolation has
   therefore been a property of the deployment topology, not of a
   tenant-ID filter inside shared queries.
-- **REQ-041.** The hosted service's tenant-resolution layer (REQ-010) has
-  been the only shared component across tenants, and it has held no message,
-  channel, or user content — only the name-to-daemon-address mapping.
-  **[needs ARCH decision — hosted resolution service design]**
+- **REQ-041.** No shared, always-on runtime component has existed across
+  tenants at all. Instance resolution has been plain DNS (REQ-010, ARCH-14),
+  so the name-to-daemon-address mapping has lived in DNS records — provisioned
+  at tenant creation — rather than in a bespoke hosted resolution service. The
+  only cross-tenant surfaces have therefore been static (DNS, and for the
+  hosted tier the tenant-provisioning step that writes those records), holding
+  no message, channel, or user content and running no request-serving process.
+  This strengthens REQ-040's isolation guarantee: there is no shared query
+  surface *and* no shared runtime service to isolate.
 
 ---
 
