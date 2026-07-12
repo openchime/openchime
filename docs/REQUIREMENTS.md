@@ -92,8 +92,9 @@ the requirement says so explicitly rather than implying one.
   the last owner. **[needs ARCH decision — role storage/enforcement point]**
 - **REQ-031.** Channel membership has been independent of tenant role: a
   member has belonged to zero or more channels, and only channel members
-  have been able to read or post in a channel that is not public.
-  **[needs ARCH decision]**
+  have been able to read or post in a channel that is not public. Membership
+  has been stored in the `channel_members` table, with `channels.is_public`
+  gating read/post on non-public channels (ARCH-50).
 - **REQ-032.** A user has been able to edit or delete only their own
   messages, with one exception: a tenant admin or owner has been able to
   delete (not edit) any message in a channel they belong to, for moderation

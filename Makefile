@@ -5,7 +5,7 @@ LDFLAGS ?= -lsqlite3 -lpthread
 BIN := openchimed
 SRC := src/main.c
 
-TEST_BIN := build/test_protocol
+TEST_BINS := build/test_protocol build/test_migrate
 
 .PHONY: all test clean
 
@@ -14,14 +14,20 @@ all: $(BIN)
 $(BIN): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
 
-# Unit tests (docs/TESTING.md §2). The test TU #includes the .c under test
-# directly, so it needs no extra objects and no sqlite/pthread link. Built
-# -O0 -g for debuggability; a non-zero exit fails the build and CI.
-test: $(TEST_BIN)
-	./$(TEST_BIN)
+# Unit tests (docs/TESTING.md §2). Each test TU #includes the .c under test
+# directly, so it needs no extra objects. Built -O0 -g for debuggability; a
+# non-zero exit fails the build and CI.
+test: $(TEST_BINS)
+	./build/test_protocol
+	./build/test_migrate
 
-$(TEST_BIN): tests/test_protocol.c src/protocol.c src/protocol.h | build
+# The codec is pure — no library link needed.
+build/test_protocol: tests/test_protocol.c src/protocol.c src/protocol.h | build
 	$(CC) $(CFLAGS) -O0 -g -Isrc tests/test_protocol.c -o $@
+
+# The migrations runner links SQLite.
+build/test_migrate: tests/test_migrate.c src/migrate.c src/migrate.h | build
+	$(CC) $(CFLAGS) -O0 -g -Isrc tests/test_migrate.c -o $@ -lsqlite3
 
 build:
 	mkdir -p build

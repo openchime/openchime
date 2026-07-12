@@ -3,7 +3,8 @@
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md), and
 [docs/PROTOCOL.md](docs/PROTOCOL.md) (the byte-level wire protocol spec for the
-core messaging path), and [docs/TESTING.md](docs/TESTING.md) (the unit +
+core messaging path), [docs/SCHEMA.md](docs/SCHEMA.md) (the SQLite schema and
+migration mechanism), and [docs/TESTING.md](docs/TESTING.md) (the unit +
 integration test strategy) for the project's design.
 
 This repo currently contains a **placeholder daemon** only — enough to
