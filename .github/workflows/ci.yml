@@ -76,12 +76,18 @@ jobs:
       - name: Verify replication reached MinIO (ARCH-23)
         run: |
           # Past the 15s Litestream sync interval, the replica prefix must be
-          # non-empty. Use a throwaway mc container on the compose network.
+          # non-empty. Use a throwaway mc container on the compose network; the
+          # mc image is minimal (no grep), so do the emptiness check on the host.
           sleep 20
-          docker compose run --rm --no-deps --entrypoint sh minio-init -c '
-            until mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"; do sleep 1; done
-            mc ls --recursive local/"$LITESTREAM_BUCKET"/openchime | grep .
-          '
+          out=$(docker compose run --rm --no-deps --entrypoint sh minio-init -c '
+            until mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; do sleep 1; done
+            mc ls --recursive local/"$LITESTREAM_BUCKET"/openchime
+          ')
+          echo "$out"
+          if [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
+            echo "replica prefix is empty — replication did not reach MinIO" >&2
+            exit 1
+          fi
 
       - name: Verify restore-on-boot (ARCH-24)
         run: |
