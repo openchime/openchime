@@ -1,25 +1,87 @@
 /*
- * OpenChime DB-writer thread (ARCH-5).
+ * OpenChime DB-writer thread (ARCH-5) + the write-job queue.
  *
  * The single SQLite write connection is owned by one dedicated thread; the
- * network event loop never writes the database directly. On startup the writer
- * opens the database in WAL mode, applies migrations (ARCH-27), and then idles
- * waiting for write jobs. (The job queue that the network thread hands work to
- * arrives with the message-handling milestone; this skeleton establishes the
- * thread, the connection ownership, and migrate-on-boot.)
+ * network event loop never touches the database. The net thread submits jobs
+ * (AUTH, SEND) via oc_dbwriter_submit and is woken to collect results by an
+ * eventfd it polls in epoll (ARCH-22) — keeping all socket I/O on the net
+ * thread and all DB writes on this one. On startup the writer opens the
+ * database in WAL mode and applies migrations (ARCH-27).
  */
 
 #ifndef OPENCHIME_DBWRITER_H
 #define OPENCHIME_DBWRITER_H
 
+#include <stddef.h>
+#include <stdint.h>
+
+#define OC_IDEM_LEN 16
+
+/* --- Jobs (net thread -> writer) ---------------------------------------- */
+
+enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2 };
+
+typedef struct oc_job {
+    struct oc_job *next;
+    int            type;
+    uint64_t       conn_id;   /* originating connection, echoed on the result */
+
+    /* AUTH */
+    char          *token;     /* heap; the (stubbed) credential, used as subject */
+
+    /* SEND */
+    uint64_t       author_id; /* the authenticated user (net thread supplies it) */
+    uint64_t       channel_id;
+    uint8_t        idem[OC_IDEM_LEN];
+    uint8_t       *body;      /* heap */
+    size_t         body_len;
+} oc_job;
+
+/* --- Results (writer -> net thread) ------------------------------------- */
+
+enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3, OC_RES_SEND_ERR = 4 };
+
+typedef struct oc_dbres {
+    struct oc_dbres *next;
+    int            type;
+    uint64_t       conn_id;
+    uint16_t       err_code;  /* reason code for *_ERR */
+
+    /* AUTH_OK */
+    uint64_t       user_id;
+
+    /* SEND_OK */
+    uint64_t       message_id;
+    uint64_t       server_time;
+    uint64_t       channel_id;
+    uint64_t       author_id;
+    uint8_t        idem[OC_IDEM_LEN];
+    uint8_t       *body;      /* heap; for the broadcast */
+    size_t         body_len;
+    uint64_t      *members;   /* heap; user ids to fan the broadcast out to */
+    size_t         n_members;
+    int            duplicate; /* idempotent replay: ack only, no broadcast */
+} oc_dbres;
+
 typedef struct oc_dbwriter oc_dbwriter;
 
-/* Open `path`, set WAL + foreign_keys, run migrations, and start the writer
- * thread. Returns NULL if the database can't be opened or migrations fail
- * (the daemon must not serve traffic in that case). */
+/* Open `path`, WAL + foreign_keys, migrate, start the thread. NULL on failure. */
 oc_dbwriter *oc_dbwriter_start(const char *path);
+void         oc_dbwriter_stop(oc_dbwriter *w);
 
-/* Stop the writer thread, join it, and close the database. */
-void oc_dbwriter_stop(oc_dbwriter *w);
+/* The eventfd the net thread registers in epoll; readable when results wait. */
+int  oc_dbwriter_eventfd(oc_dbwriter *w);
+
+/* Allocate a zeroed job of `type` for `conn_id`. Fill in the type's fields
+ * (oc_job_set_token / oc_job_set_body copy into heap) then submit. */
+oc_job *oc_job_new(int type, uint64_t conn_id);
+int     oc_job_set_token(oc_job *j, const void *tok, size_t len);
+int     oc_job_set_body(oc_job *j, const void *body, size_t len);
+
+/* Hand a job to the writer (transfers ownership; the writer frees it). */
+void       oc_dbwriter_submit(oc_dbwriter *w, oc_job *j);
+/* Pop the next completed result, or NULL when drained. Caller frees it. */
+oc_dbres *oc_dbwriter_next_result(oc_dbwriter *w);
+void       oc_dbres_free(oc_dbres *r);
 
 #endif /* OPENCHIME_DBWRITER_H */

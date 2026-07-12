@@ -58,8 +58,8 @@ build/test_dbwriter: tests/test_dbwriter.c src/dbwriter.c src/migrate.c src/*.h 
 build/itest_tls: tests/itest_tls.c src/tls.c src/tls.h $(MBEDTLS_A) | build
 	$(CC) $(CFLAGS) -O0 -g -Isrc -I$(MBEDTLS_INC) tests/itest_tls.c $(MBEDTLS_LIBS) -lpthread -o $@
 
-build/itest_netloop: tests/itest_netloop.c src/netloop.c src/framebuf.c src/protocol.c src/tls.c src/*.h $(MBEDTLS_A) | build
-	$(CC) $(CFLAGS) -O0 -g -Isrc -I$(MBEDTLS_INC) tests/itest_netloop.c $(MBEDTLS_LIBS) -lpthread -o $@
+build/itest_netloop: tests/itest_netloop.c src/netloop.c src/framebuf.c src/protocol.c src/tls.c src/dbwriter.c src/migrate.c src/*.h $(MBEDTLS_A) | build
+	$(CC) $(CFLAGS) -O0 -g -Isrc -I$(MBEDTLS_INC) tests/itest_netloop.c $(MBEDTLS_LIBS) -lsqlite3 -lpthread -o $@
 
 build:
 	mkdir -p build

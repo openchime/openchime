@@ -108,7 +108,7 @@ int main(void) {
     pthread_detach(hz);
 
     /* Serve the binary protocol until a shutdown signal. */
-    oc_netloop_run(proto_port, &tls, &g_stop);
+    oc_netloop_run(proto_port, &tls, db, &g_stop);
 
     oc_tls_server_free(&tls);
     oc_dbwriter_stop(db);

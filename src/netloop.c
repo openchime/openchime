@@ -1,5 +1,5 @@
 /*
- * OpenChime network event loop. See netloop.h, tls.h, framebuf.h, protocol.h.
+ * OpenChime network event loop. See netloop.h, dbwriter.h, tls.h, framebuf.h.
  */
 
 #include "netloop.h"
@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,21 +20,27 @@
 #include <unistd.h>
 
 #define OC_NETLOOP_MAX_FD 4096
-#define OC_CONN_OUT_CAP   256   /* WELCOME/REJECT are tiny; one pending response */
 
 typedef enum { CONN_HANDSHAKE, CONN_ESTABLISHED } conn_state;
 
 typedef struct {
     int          fd;
+    uint64_t     conn_id;
     oc_tls_conn  tls;
     oc_framebuf  fb;
     conn_state   state;
     int          did_hello;
-    uint8_t      out[OC_CONN_OUT_CAP];
-    size_t       out_len;   /* pending response length */
-    size_t       out_sent;  /* bytes already written */
-    uint32_t     events;    /* current epoll interest, to avoid redundant MODs */
+    int          authed;
+    uint64_t     user_id;
+    uint8_t     *out;       /* growable pending-output buffer */
+    size_t       out_cap, out_len, out_sent;
+    uint32_t     events;    /* current epoll interest */
 } conn;
+
+/* Scratch for encoding one outgoing frame; net thread only, so a single static
+ * buffer is safe and avoids per-send allocation (bodies can be ~64KB). */
+static uint8_t g_enc[OC_MAX_FRAME_SIZE];
+static uint64_t g_next_conn_id = 1;
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -46,6 +53,44 @@ static int set_nonblock(int fd) {
     return (fl < 0) ? -1 : fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
+/* --- Outgoing buffer ---------------------------------------------------- */
+
+static int out_append(conn *c, const uint8_t *buf, size_t len) {
+    if (c->out_sent > 0) {                       /* drop the already-sent prefix */
+        size_t rem = c->out_len - c->out_sent;
+        if (rem) memmove(c->out, c->out + c->out_sent, rem);
+        c->out_len = rem;
+        c->out_sent = 0;
+    }
+    if (c->out_len + len > c->out_cap) {
+        size_t ncap = c->out_cap ? c->out_cap : 2048;
+        while (ncap < c->out_len + len) ncap *= 2;
+        uint8_t *g = realloc(c->out, ncap);
+        if (!g) return -1;
+        c->out = g;
+        c->out_cap = ncap;
+    }
+    memcpy(c->out + c->out_len, buf, len);
+    c->out_len += len;
+    return 0;
+}
+
+/* Returns 1 if fully flushed, 0 if it would block, -1 on error. */
+static int flush_out(conn *c) {
+    while (c->out_sent < c->out_len) {
+        size_t n = 0;
+        oc_tls_status st = oc_tls_write(&c->tls, c->out + c->out_sent,
+                                        c->out_len - c->out_sent, &n);
+        if (st == OC_TLS_OK)         { c->out_sent += n; continue; }
+        if (st == OC_TLS_WANT_WRITE || st == OC_TLS_WANT_READ) return 0;
+        return -1;
+    }
+    c->out_len = c->out_sent = 0;
+    return 1;
+}
+
+/* --- epoll interest ----------------------------------------------------- */
+
 static void conn_set_events(int ep, conn *c, uint32_t events) {
     if (events == c->events) return;
     struct epoll_event ev;
@@ -56,117 +101,221 @@ static void conn_set_events(int ep, conn *c, uint32_t events) {
     c->events = events;
 }
 
-static void conn_close(int ep, conn **conns, int fd) {
-    conn *c = conns[fd];
-    if (!c) return;
-    epoll_ctl(ep, EPOLL_CTL_DEL, fd, NULL);
-    oc_tls_conn_free(&c->tls);
-    oc_framebuf_free(&c->fb);
-    close(fd);
-    free(c);
-    conns[fd] = NULL;
-}
-
-/* Build the WELCOME (or REJECT) answer to a HELLO frame. Returns 0 to keep the
- * connection, -1 to close it (fatal REJECT or malformed). */
-static int handle_hello(conn *c, oc_rbuf *payload) {
-    oc_hello h;
-    oc_wbuf w;
-    if (oc_decode_hello(payload, &h) != OC_OK) {
-        oc_reject rej = { OC_ERR_MALFORMED_FRAME, oc_slice_str("bad HELLO") };
-        oc_wbuf_init(&w, c->out, sizeof c->out);
-        oc_encode_reject(&w, &rej);
-        c->out_len = w.len; c->out_sent = 0;
-        return -1;
-    }
-
-    uint16_t chosen = 0, code = 0;
-    if (oc_negotiate_version(h.min_version, h.max_version,
-                             OC_PROTOCOL_VERSION, OC_PROTOCOL_VERSION,
-                             &chosen, &code) != OC_OK) {
-        oc_reject rej = { code, oc_slice_str("unsupported protocol version") };
-        oc_wbuf_init(&w, c->out, sizeof c->out);
-        oc_encode_reject(&w, &rej);
-        c->out_len = w.len; c->out_sent = 0;
-        return -1; /* REJECT is fatal */
-    }
-
-    oc_welcome wel = { chosen, now_ms() };
-    oc_wbuf_init(&w, c->out, sizeof c->out);
-    oc_encode_welcome(&w, &wel);
-    c->out_len = w.len; c->out_sent = 0;
-    return 0;
-}
-
-/* Dispatch every complete frame currently buffered. Returns 0 to keep the
- * connection or -1 to close it. */
-static int drain_frames(conn *c) {
-    const uint8_t *frame; size_t flen;
-    for (;;) {
-        int r = oc_framebuf_next(&c->fb, &frame, &flen);
-        if (r == 0) return 0;              /* need more bytes */
-        if (r < 0)  return -1;             /* malformed / too large: drop */
-
-        oc_header hdr; oc_rbuf payload;
-        if (oc_parse_frame(frame, flen, &hdr, &payload) != OC_OK) return -1;
-
-        if (!c->did_hello) {
-            if (hdr.msg_type != OC_MSG_HELLO) return -1; /* first frame must be HELLO */
-            c->did_hello = 1;
-            int keep = handle_hello(c, &payload);
-            return keep; /* one response queued; -1 also closes after flushing */
-        }
-        /* Post-HELLO frames (AUTH, messaging) are not handled by the skeleton
-         * yet — ignore them until the next milestone. */
-    }
-}
-
-/* Try to flush any queued response. Returns 1 if fully flushed, 0 if it would
- * block (retry on EPOLLOUT), -1 on error. */
-static int flush_out(conn *c) {
-    while (c->out_sent < c->out_len) {
-        size_t n = 0;
-        oc_tls_status st = oc_tls_write(&c->tls, c->out + c->out_sent,
-                                        c->out_len - c->out_sent, &n);
-        if (st == OC_TLS_OK)         { c->out_sent += n; continue; }
-        if (st == OC_TLS_WANT_WRITE) return 0;
-        if (st == OC_TLS_WANT_READ)  return 0; /* rare: renegotiation */
-        return -1;
-    }
-    c->out_len = c->out_sent = 0;
-    return 1;
-}
-
-/* Drive an established connection's readable event: read, reassemble, dispatch.
- * Returns 0 to keep the connection, -1 to close it. */
-static int on_readable(conn *c) {
-    for (;;) {
-        uint8_t chunk[OC_READ_CHUNK];
-        size_t n = 0;
-        oc_tls_status st = oc_tls_read(&c->tls, chunk, sizeof chunk, &n);
-        if (st == OC_TLS_WANT_READ)  return 0;
-        if (st == OC_TLS_WANT_WRITE) return 0;
-        if (st == OC_TLS_CLOSED || st == OC_TLS_ERROR) return -1;
-        /* OC_TLS_OK */
-        if (oc_framebuf_push(&c->fb, chunk, n) != 0) return -1;
-        int keep = drain_frames(c);
-        if (keep < 0) {
-            /* Flush a queued fatal REJECT best-effort, then close. */
-            flush_out(c);
-            return -1;
-        }
-        if (c->out_len > 0) return 0; /* a response is queued; go write it */
-    }
-}
-
-/* Compute and apply the epoll interest a connection currently needs. */
 static void update_interest(int ep, conn *c) {
     uint32_t ev = EPOLLIN;
     if (c->out_len > c->out_sent) ev |= EPOLLOUT;
     conn_set_events(ep, c, ev);
 }
 
-int oc_netloop_run(int port, oc_tls_server *tls, volatile sig_atomic_t *stop) {
+static void conn_close(int ep, conn **conns, int fd) {
+    conn *c = conns[fd];
+    if (!c) return;
+    epoll_ctl(ep, EPOLL_CTL_DEL, fd, NULL);
+    oc_tls_conn_free(&c->tls);
+    oc_framebuf_free(&c->fb);
+    free(c->out);
+    close(fd);
+    free(c);
+    conns[fd] = NULL;
+}
+
+static conn *find_by_id(conn **conns, uint64_t id) {
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
+        if (conns[fd] && conns[fd]->conn_id == id) return conns[fd];
+    return NULL;
+}
+
+static int in_members(uint64_t uid, const uint64_t *m, size_t n) {
+    for (size_t i = 0; i < n; i++) if (m[i] == uid) return 1;
+    return 0;
+}
+
+/* Append encoded bytes to a connection and try to flush; close it on error. */
+static void send_bytes(int ep, conn **conns, int fd, const uint8_t *buf, size_t len) {
+    conn *c = conns[fd];
+    if (!c) return;
+    if (out_append(c, buf, len) != 0 || flush_out(c) < 0) {
+        conn_close(ep, conns, fd);
+        return;
+    }
+    update_interest(ep, c);
+}
+
+/* --- Handshake response ------------------------------------------------- */
+
+/* Build WELCOME/REJECT for a HELLO into the connection's out buffer.
+ * Returns 0 to keep the connection, -1 to close it (fatal REJECT/malformed). */
+static int handle_hello(conn *c, oc_rbuf *payload) {
+    oc_hello h;
+    oc_wbuf w;
+    uint8_t tmp[128];
+    if (oc_decode_hello(payload, &h) != OC_OK) {
+        oc_wbuf_init(&w, tmp, sizeof tmp);
+        oc_reject rej = { OC_ERR_MALFORMED_FRAME, oc_slice_str("bad HELLO") };
+        oc_encode_reject(&w, &rej);
+        out_append(c, tmp, w.len);
+        return -1;
+    }
+    uint16_t chosen = 0, code = 0;
+    if (oc_negotiate_version(h.min_version, h.max_version,
+                             OC_PROTOCOL_VERSION, OC_PROTOCOL_VERSION,
+                             &chosen, &code) != OC_OK) {
+        oc_wbuf_init(&w, tmp, sizeof tmp);
+        oc_reject rej = { code, oc_slice_str("unsupported protocol version") };
+        oc_encode_reject(&w, &rej);
+        out_append(c, tmp, w.len);
+        return -1;
+    }
+    oc_wbuf_init(&w, tmp, sizeof tmp);
+    oc_welcome wel = { chosen, now_ms() };
+    oc_encode_welcome(&w, &wel);
+    out_append(c, tmp, w.len);
+    return 0;
+}
+
+/* --- Frame dispatch ----------------------------------------------------- */
+
+/* Dispatch every buffered frame. Returns 0 to keep the connection, -1 to close.
+ * AUTH/SEND become jobs for the DB writer; their replies arrive asynchronously
+ * via deliver_result. */
+static int drain_frames(conn *c, oc_dbwriter *dbw) {
+    const uint8_t *frame; size_t flen;
+    for (;;) {
+        int r = oc_framebuf_next(&c->fb, &frame, &flen);
+        if (r == 0) return 0;
+        if (r < 0)  return -1;
+
+        oc_header hdr; oc_rbuf p;
+        if (oc_parse_frame(frame, flen, &hdr, &p) != OC_OK) return -1;
+
+        if (!c->did_hello) {
+            if (hdr.msg_type != OC_MSG_HELLO) return -1;
+            c->did_hello = 1;
+            if (handle_hello(c, &p) < 0) return -1;
+            continue;
+        }
+
+        if (!c->authed) {
+            if (hdr.msg_type == OC_MSG_AUTH) {
+                oc_auth a;
+                if (oc_decode_auth(&p, &a) != OC_OK) return -1;
+                oc_job *j = oc_job_new(OC_JOB_AUTH, c->conn_id);
+                if (!j || oc_job_set_token(j, a.jwt.ptr, a.jwt.len) != 0) return -1;
+                oc_dbwriter_submit(dbw, j);
+                continue;
+            }
+            /* A messaging frame before AUTH is a fatal protocol error. */
+            oc_wbuf w; uint8_t tmp[64];
+            oc_wbuf_init(&w, tmp, sizeof tmp);
+            oc_error e = { OC_ERR_AUTH_REQUIRED, 1, { NULL, 0 }, oc_slice_str("auth required") };
+            oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+            out_append(c, tmp, w.len);
+            return -1;
+        }
+
+        if (hdr.msg_type == OC_MSG_SEND) {
+            oc_send s;
+            if (oc_decode_send(&p, &s) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SEND, c->conn_id);
+            if (!j) return -1;
+            j->author_id = c->user_id;
+            j->channel_id = s.channel_id;
+            memcpy(j->idem, s.idem, OC_IDEM_LEN);
+            if (oc_job_set_body(j, s.body.ptr, s.body.len) != 0) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CLIENT_ACK) {
+            oc_client_ack ca;
+            oc_decode_client_ack(&p, &ca); /* accepted; delivery cursor is a later milestone */
+            continue;
+        }
+        /* Other post-auth frame types are ignored by this skeleton. */
+    }
+}
+
+/* Read, reassemble, and dispatch. Returns 0 to keep, -1 to close. */
+static int on_readable(conn *c, oc_dbwriter *dbw) {
+    for (;;) {
+        uint8_t chunk[OC_READ_CHUNK];
+        size_t n = 0;
+        oc_tls_status st = oc_tls_read(&c->tls, chunk, sizeof chunk, &n);
+        if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) return 0;
+        if (st == OC_TLS_CLOSED || st == OC_TLS_ERROR) return -1;
+        if (oc_framebuf_push(&c->fb, chunk, n) != 0) return -1;
+        if (drain_frames(c, dbw) < 0) return -1;
+    }
+}
+
+/* --- Result delivery (from the DB-writer thread) ------------------------ */
+
+static void deliver_result(int ep, conn **conns, oc_dbres *r) {
+    oc_wbuf w;
+    switch (r->type) {
+    case OC_RES_AUTH_OK: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        c->authed = 1;
+        c->user_id = r->user_id;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_auth_ok m = { r->user_id, 0 /* session_expiry: real value with real AUTH */ };
+        oc_encode_auth_ok(&w, OC_PROTOCOL_VERSION, &m);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_AUTH_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_error e = { r->err_code, 1, { NULL, 0 }, oc_slice_str("auth failed") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_SEND_OK: {
+        conn *sender = find_by_id(conns, r->conn_id);
+        if (sender) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_send_ack ack;
+            memcpy(ack.idem, r->idem, OC_IDEM_LEN);
+            ack.channel_id = r->channel_id;
+            ack.message_id = r->message_id;
+            ack.server_time = r->server_time;
+            oc_encode_send_ack(&w, OC_PROTOCOL_VERSION, &ack);
+            send_bytes(ep, conns, sender->fd, g_enc, w.len);
+        }
+        if (!r->duplicate) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_slice body = { r->body, r->body_len };
+            oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, body };
+            oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
+            size_t blen = w.len;
+            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                conn *c = conns[fd];
+                if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
+                    send_bytes(ep, conns, fd, g_enc, blen);
+            }
+        }
+        break;
+    }
+    case OC_RES_SEND_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice ctx = { r->idem, OC_IDEM_LEN };
+        oc_error e = { r->err_code, 0, ctx, oc_slice_str("send rejected") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    default: break;
+    }
+}
+
+/* --- Main loop ---------------------------------------------------------- */
+
+int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
+                   volatile sig_atomic_t *stop) {
     conn **conns = calloc(OC_NETLOOP_MAX_FD, sizeof *conns);
     if (!conns) return -1;
 
@@ -186,17 +335,21 @@ int oc_netloop_run(int port, oc_tls_server *tls, volatile sig_atomic_t *stop) {
 
     int ep = epoll_create1(0);
     if (ep < 0) { close(lfd); free(conns); return -1; }
+    int evfd = oc_dbwriter_eventfd(dbw);
+
     struct epoll_event ev;
     memset(&ev, 0, sizeof ev);
-    ev.events = EPOLLIN;
-    ev.data.fd = lfd;
+    ev.events = EPOLLIN; ev.data.fd = lfd;
     epoll_ctl(ep, EPOLL_CTL_ADD, lfd, &ev);
+    memset(&ev, 0, sizeof ev);
+    ev.events = EPOLLIN; ev.data.fd = evfd;
+    epoll_ctl(ep, EPOLL_CTL_ADD, evfd, &ev);
 
     fprintf(stderr, "netloop: listening on :%d\n", port);
 
     struct epoll_event events[64];
     while (!*stop) {
-        int nfds = epoll_wait(ep, events, 64, 500 /* ms: poll *stop */);
+        int nfds = epoll_wait(ep, events, 64, 500);
         if (nfds < 0) { if (errno == EINTR) continue; break; }
 
         for (int i = 0; i < nfds; i++) {
@@ -205,7 +358,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, volatile sig_atomic_t *stop) {
             if (fd == lfd) {
                 for (;;) {
                     int cfd = accept(lfd, NULL, NULL);
-                    if (cfd < 0) break; /* EAGAIN: drained */
+                    if (cfd < 0) break;
                     if (cfd >= OC_NETLOOP_MAX_FD || set_nonblock(cfd) < 0) { close(cfd); continue; }
                     conn *c = calloc(1, sizeof *c);
                     if (!c || oc_framebuf_init(&c->fb) != 0 ||
@@ -215,14 +368,25 @@ int oc_netloop_run(int port, oc_tls_server *tls, volatile sig_atomic_t *stop) {
                         continue;
                     }
                     c->fd = cfd;
+                    c->conn_id = g_next_conn_id++;
                     c->state = CONN_HANDSHAKE;
                     conns[cfd] = c;
                     struct epoll_event cev;
                     memset(&cev, 0, sizeof cev);
-                    cev.events = EPOLLIN;
-                    cev.data.fd = cfd;
+                    cev.events = EPOLLIN; cev.data.fd = cfd;
                     epoll_ctl(ep, EPOLL_CTL_ADD, cfd, &cev);
                     c->events = EPOLLIN;
+                }
+                continue;
+            }
+
+            if (fd == evfd) {
+                uint64_t cnt;
+                while (read(evfd, &cnt, sizeof cnt) > 0) { /* drain the counter */ }
+                oc_dbres *r;
+                while ((r = oc_dbwriter_next_result(dbw)) != NULL) {
+                    deliver_result(ep, conns, r);
+                    oc_dbres_free(r);
                 }
                 continue;
             }
@@ -230,29 +394,19 @@ int oc_netloop_run(int port, oc_tls_server *tls, volatile sig_atomic_t *stop) {
             conn *c = conns[fd];
             if (!c) continue;
 
-            /* Flush a pending response first, if this was an EPOLLOUT wakeup. */
-            if ((events[i].events & EPOLLOUT) && c->out_len > c->out_sent) {
-                if (flush_out(c) < 0) { conn_close(ep, conns, fd); continue; }
-            }
-
             if (c->state == CONN_HANDSHAKE) {
                 oc_tls_status st = oc_tls_handshake(&c->tls);
                 if (st == OC_TLS_OK)              c->state = CONN_ESTABLISHED;
                 else if (st == OC_TLS_WANT_READ)  { conn_set_events(ep, c, EPOLLIN);  continue; }
                 else if (st == OC_TLS_WANT_WRITE) { conn_set_events(ep, c, EPOLLOUT); continue; }
                 else { conn_close(ep, conns, fd); continue; }
+                /* fall through: drain any app data mbedTLS already buffered */
             }
 
-            if (c->state == CONN_ESTABLISHED && (events[i].events & EPOLLIN)) {
-                if (on_readable(c) < 0) {
-                    if (c->out_len > c->out_sent) flush_out(c);
-                    conn_close(ep, conns, fd);
-                    continue;
-                }
+            if (c->state == CONN_ESTABLISHED) {
+                if (on_readable(c, dbw) < 0) { flush_out(c); conn_close(ep, conns, fd); continue; }
             }
-
-            /* If a response finished draining, close a connection that had a
-             * fatal REJECT queued is handled above; otherwise re-arm interest. */
+            if (flush_out(c) < 0) { conn_close(ep, conns, fd); continue; }
             update_interest(ep, c);
         }
     }

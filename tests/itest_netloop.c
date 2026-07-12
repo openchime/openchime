@@ -1,10 +1,13 @@
-/* Integration test for the event loop (netloop.c): a TLS client completes the
- * handshake, sends HELLO, and gets a WELCOME back; a bad version gets REJECT.
- * Runs the non-blocking epoll server in a thread and drives it with a blocking
- * TLS client. Includes the code under test directly; links mbedTLS + pthread. */
+/* Integration test for the event loop (netloop.c) end to end: TLS handshake,
+ * HELLO->WELCOME, version REJECT, and the message vertical — two clients
+ * authenticate, one SENDs, and both receive the BROADCAST while the sender is
+ * acked. Runs the non-blocking epoll server (with a real DB-writer thread) in a
+ * thread and drives it with blocking TLS clients. */
 
 #include "netloop.c"
+#include "dbwriter.c"
 #include "framebuf.c"
+#include "migrate.c"
 #include "protocol.c"
 #include "tls.c"
 
@@ -26,16 +29,20 @@ static int failures = 0;
     } while (0)
 
 struct loop_arg {
-    int                       port;
-    oc_tls_server            *srv;
-    volatile sig_atomic_t     stop;
+    int                   port;
+    oc_tls_server        *srv;
+    oc_dbwriter          *dbw;
+    volatile sig_atomic_t stop;
 };
 
 static void *loop_thread(void *p) {
     struct loop_arg *a = (struct loop_arg *)p;
-    oc_netloop_run(a->port, a->srv, &a->stop);
+    oc_netloop_run(a->port, a->srv, a->dbw, &a->stop);
     return NULL;
 }
+
+/* A connected + TLS-handshaked client. */
+typedef struct { int fd; oc_tls_client cli; oc_tls_conn conn; oc_framebuf fb; } client;
 
 static oc_tls_status handshake_blocking(oc_tls_conn *c) {
     for (;;) {
@@ -45,30 +52,32 @@ static oc_tls_status handshake_blocking(oc_tls_conn *c) {
     }
 }
 
-/* Connect (with retry until the loop is listening) and TLS-handshake, pinning
- * the server fingerprint. Returns the connected fd via *out_fd. */
-static int connect_client(int port, const uint8_t *pin, oc_tls_client *cli,
-                          oc_tls_conn *c, int *out_fd) {
+static int client_open(client *c, int port, const uint8_t *pin) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons((uint16_t)port);
-
-    int fd = -1;
-    for (int i = 0; i < 100; i++) {
-        fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) break;
-        close(fd); fd = -1;
-        usleep(20000); /* 20ms; loop may not be listening yet */
+    c->fd = -1;
+    for (int i = 0; i < 200; i++) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) { c->fd = fd; break; }
+        close(fd);
+        usleep(20000);
     }
-    if (fd < 0) return -1;
-
-    if (oc_tls_client_init(cli, pin) != 0) { close(fd); return -1; }
-    if (oc_tls_conn_init(c, &cli->conf, fd) != 0) { close(fd); return -1; }
-    if (handshake_blocking(c) != OC_TLS_OK) { close(fd); return -1; }
-    *out_fd = fd;
+    if (c->fd < 0) return -1;
+    if (oc_tls_client_init(&c->cli, pin) != 0) return -1;
+    if (oc_tls_conn_init(&c->conn, &c->cli.conf, c->fd) != 0) return -1;
+    if (handshake_blocking(&c->conn) != OC_TLS_OK) return -1;
+    oc_framebuf_init(&c->fb);
     return 0;
+}
+
+static void client_close(client *c) {
+    oc_framebuf_free(&c->fb);
+    oc_tls_conn_free(&c->conn);
+    oc_tls_client_free(&c->cli);
+    close(c->fd);
 }
 
 static int write_all(oc_tls_conn *c, const uint8_t *buf, size_t len) {
@@ -81,86 +90,152 @@ static int write_all(oc_tls_conn *c, const uint8_t *buf, size_t len) {
     return 0;
 }
 
-/* Read exactly one protocol frame from the (blocking) client connection. */
-static int read_frame(oc_tls_conn *c, oc_framebuf *fb, oc_header *hdr, oc_rbuf *payload) {
+static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
     for (;;) {
         const uint8_t *frame; size_t flen;
-        int r = oc_framebuf_next(fb, &frame, &flen);
+        int r = oc_framebuf_next(&c->fb, &frame, &flen);
         if (r == 1) return oc_parse_frame(frame, flen, hdr, payload) == OC_OK ? 0 : -1;
         if (r < 0) return -1;
-        uint8_t buf[2048]; size_t n = 0;
-        if (oc_tls_read(c, buf, sizeof buf, &n) != OC_TLS_OK) return -1;
-        if (oc_framebuf_push(fb, buf, n) != 0) return -1;
+        uint8_t buf[4096]; size_t n = 0;
+        if (oc_tls_read(&c->conn, buf, sizeof buf, &n) != OC_TLS_OK) return -1;
+        if (oc_framebuf_push(&c->fb, buf, n) != 0) return -1;
     }
 }
 
-static void test_hello_welcome_and_reject(void) {
+static int send_hello(client *c, uint16_t mn, uint16_t mx) {
+    uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_hello h = { mn, mx, oc_slice_str("itest") };
+    if (oc_encode_hello(&w, &h) != OC_OK) return -1;
+    return write_all(&c->conn, buf, w.len);
+}
+
+static int do_handshake(client *c) {
+    if (send_hello(c, 1, 1) != 0) return -1;
+    oc_header hdr; oc_rbuf p;
+    if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_WELCOME) return -1;
+    oc_welcome wel;
+    return oc_decode_welcome(&p, &wel) == OC_OK ? 0 : -1;
+}
+
+static int do_auth(client *c, const char *token, uint64_t *user_id) {
+    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_auth a = { oc_slice_str(token) };
+    if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a) != 0) return -1;
+    if (write_all(&c->conn, buf, w.len) != 0) return -1;
+    oc_header hdr; oc_rbuf p;
+    if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_AUTH_OK) return -1;
+    oc_auth_ok ok;
+    if (oc_decode_auth_ok(&p, &ok) != OC_OK) return -1;
+    *user_id = ok.user_id;
+    return 0;
+}
+
+static void test_version_reject(int port, const uint8_t *pin) {
+    client c;
+    CHECK(client_open(&c, port, pin) == 0);
+    CHECK(send_hello(&c, 5, 5) == 0);            /* too new */
+    oc_header hdr; oc_rbuf p;
+    CHECK(read_frame(&c, &hdr, &p) == 0);
+    CHECK(hdr.msg_type == OC_MSG_REJECT);
+    oc_reject rej;
+    CHECK(oc_decode_reject(&p, &rej) == OC_OK);
+    CHECK(rej.code == OC_ERR_VERSION_TOO_NEW);
+    client_close(&c);
+}
+
+static void test_message_vertical(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    CHECK(do_handshake(&b) == 0);
+
+    uint64_t ua = 0, ub = 0;
+    CHECK(do_auth(&a, "alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", &ub) == 0);
+    CHECK(ua != 0 && ub != 0 && ua != ub);
+
+    /* alice sends to the default channel. */
+    uint8_t idem[OC_IDEM_SIZE];
+    memset(idem, 0x7E, sizeof idem);
+    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s;
+    s.channel_id = 1;
+    memcpy(s.idem, idem, OC_IDEM_SIZE);
+    s.body = oc_slice_str("hello everyone");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+    CHECK(write_all(&a.conn, buf, w.len) == 0);
+
+    /* alice receives SEND_ACK then the BROADCAST (order not guaranteed between
+     * the two, but both must arrive); read two frames and classify. */
+    uint64_t acked_id = 0, bcast_id_a = 0;
+    for (int i = 0; i < 2; i++) {
+        oc_header hdr; oc_rbuf p;
+        CHECK(read_frame(&a, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) {
+            oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK);
+            CHECK(memcmp(ack.idem, idem, OC_IDEM_SIZE) == 0);
+            acked_id = ack.message_id;
+        } else if (hdr.msg_type == OC_MSG_BROADCAST) {
+            oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
+            CHECK(bc.author_id == ua);
+            CHECK(bc.body.len == 14 && memcmp(bc.body.ptr, "hello everyone", 14) == 0);
+            bcast_id_a = bc.message_id;
+        } else {
+            CHECK(0 /* unexpected frame to sender */);
+        }
+    }
+    CHECK(acked_id != 0 && acked_id == bcast_id_a);
+
+    /* bob receives the same BROADCAST. */
+    oc_header hdr; oc_rbuf p;
+    CHECK(read_frame(&b, &hdr, &p) == 0);
+    CHECK(hdr.msg_type == OC_MSG_BROADCAST);
+    oc_broadcast bcb;
+    CHECK(oc_decode_broadcast(&p, &bcb) == OC_OK);
+    CHECK(bcb.message_id == acked_id);
+    CHECK(bcb.author_id == ua);
+    CHECK(bcb.body.len == 14 && memcmp(bcb.body.ptr, "hello everyone", 14) == 0);
+
+    client_close(&a);
+    client_close(&b);
+}
+
+int main(void) {
+    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST\n");
+
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
     uint8_t pin[OC_TLS_FINGERPRINT_LEN];
     CHECK(oc_tls_server_fingerprint(&srv, pin) == 0);
 
+    unlink("build/itest_netloop.db");
+    unlink("build/itest_netloop.db-wal");
+    unlink("build/itest_netloop.db-shm");
+    oc_dbwriter *dbw = oc_dbwriter_start("build/itest_netloop.db");
+    CHECK(dbw != NULL);
+
     struct loop_arg arg;
     arg.port = 18000 + (int)(getpid() % 2000);
     arg.srv = &srv;
+    arg.dbw = dbw;
     arg.stop = 0;
     pthread_t th;
     CHECK(pthread_create(&th, NULL, loop_thread, &arg) == 0);
 
-    /* Case 1: a supported HELLO gets a WELCOME with the chosen version. */
-    {
-        oc_tls_client cli; oc_tls_conn c; int fd = -1;
-        CHECK(connect_client(arg.port, pin, &cli, &c, &fd) == 0);
-
-        uint8_t buf[128];
-        oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-        oc_hello h = { 1, 1, oc_slice_str("itest") };
-        CHECK(oc_encode_hello(&w, &h) == OC_OK);
-        CHECK(write_all(&c, buf, w.len) == 0);
-
-        oc_framebuf fb; oc_framebuf_init(&fb);
-        oc_header hdr; oc_rbuf payload;
-        CHECK(read_frame(&c, &fb, &hdr, &payload) == 0);
-        CHECK(hdr.msg_type == OC_MSG_WELCOME);
-        oc_welcome wel;
-        CHECK(oc_decode_welcome(&payload, &wel) == OC_OK);
-        CHECK(wel.chosen_version == OC_PROTOCOL_VERSION);
-
-        oc_framebuf_free(&fb);
-        oc_tls_conn_free(&c); oc_tls_client_free(&cli); close(fd);
-    }
-
-    /* Case 2: a too-new HELLO gets a REJECT with VERSION_TOO_NEW. */
-    {
-        oc_tls_client cli; oc_tls_conn c; int fd = -1;
-        CHECK(connect_client(arg.port, pin, &cli, &c, &fd) == 0);
-
-        uint8_t buf[128];
-        oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-        oc_hello h = { 5, 5, oc_slice_str("itest") };
-        CHECK(oc_encode_hello(&w, &h) == OC_OK);
-        CHECK(write_all(&c, buf, w.len) == 0);
-
-        oc_framebuf fb; oc_framebuf_init(&fb);
-        oc_header hdr; oc_rbuf payload;
-        CHECK(read_frame(&c, &fb, &hdr, &payload) == 0);
-        CHECK(hdr.msg_type == OC_MSG_REJECT);
-        oc_reject rej;
-        CHECK(oc_decode_reject(&payload, &rej) == OC_OK);
-        CHECK(rej.code == OC_ERR_VERSION_TOO_NEW);
-
-        oc_framebuf_free(&fb);
-        oc_tls_conn_free(&c); oc_tls_client_free(&cli); close(fd);
+    if (failures == 0) {
+        test_version_reject(arg.port, pin);
+        test_message_vertical(arg.port, pin);
     }
 
     arg.stop = 1;
     pthread_join(th, NULL);
+    oc_dbwriter_stop(dbw);
     oc_tls_server_free(&srv);
-}
+    unlink("build/itest_netloop.db");
+    unlink("build/itest_netloop.db-wal");
+    unlink("build/itest_netloop.db-shm");
 
-int main(void) {
-    printf("itest_netloop: TLS handshake, HELLO->WELCOME, version REJECT\n");
-    test_hello_welcome_and_reject();
     if (failures == 0) { printf("OK: all checks passed\n"); return 0; }
     printf("FAILED: %d check(s)\n", failures);
     return 1;

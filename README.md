@@ -13,9 +13,14 @@ the v1 wire-protocol frame codec (PROTOCOL.md), the two-thread model
 (ARCH-5: an epoll network loop + a single DB-writer thread), TLS termination
 with self-signed TOFU certs (ARCH-10, mbedTLS), and schema migrations applied
 on boot (ARCH-27) — plus the build/container/replication pipeline (ARCH-35–39).
-The network loop currently completes the TLS handshake and answers the protocol
-`HELLO` with `WELCOME`/`REJECT`; authentication and messaging (AUTH, SEND,
-BROADCAST, …) are not implemented yet.
+The network loop completes the TLS handshake, negotiates the protocol version
+(`HELLO`→`WELCOME`/`REJECT`), authenticates a session, and runs the core
+messaging path — a `SEND` is persisted (with a server-assigned monotonic id and
+idempotent-retry dedup) and delivered to the channel's connected members as a
+`BROADCAST`, with the sender acked. **Authentication is currently stubbed** (the
+token is accepted and mapped to a user; real OIDC/JWT validation against a
+provider's JWKS is the next milestone), and channel management is a single
+auto-provisioned default channel for now.
 
 ## Local build
 

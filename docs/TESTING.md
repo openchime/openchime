@@ -107,8 +107,12 @@ framework, and OpenChime follows suit.
   than buffer forever.
 - **Migration runner** (ARCH-27) — applying migrations against an empty
   `schema_version`, resuming a partially-migrated DB, and refusing to skip or
-  reorder. The **DB-writer thread** (`dbwriter`) is tested for migrate-on-boot
-  and clean start/stop.
+  reorder. The **DB-writer thread** (`dbwriter`) is tested for migrate-on-boot,
+  clean start/stop, and its AUTH/SEND job processing (user upsert, monotonic
+  ids, idempotent replay, membership gate, broadcast fan-out list) driven
+  directly through the job queue. The **event loop** (`itest_netloop`) is tested
+  end-to-end: two TLS clients authenticate, one `SEND`s, and both receive the
+  `BROADCAST` while the sender is acked.
 - **Idempotency + dedup** (ARCH-44/45) — a repeated `(channel, token)` returns
   the original id without a second insert; the client high-water mark
   suppresses a `message_id` at or below the mark.
