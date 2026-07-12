@@ -1,4 +1,5 @@
 openchimed
+build/
 *.o
 *.db
 *.db-shm
