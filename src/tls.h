@@ -90,4 +90,8 @@ oc_tls_status oc_tls_write(oc_tls_conn *c, const void *buf, size_t len, size_t *
  * Returns 0 on success, negative if no peer cert is available. */
 int  oc_tls_peer_fingerprint(const oc_tls_conn *c, uint8_t out[OC_TLS_FINGERPRINT_LEN]);
 
+/* The ALPN protocol negotiated on this connection, or NULL if none. The daemon
+ * routes port 443 by this: OC_ALPN_PROTO is the binary protocol (PROTOCOL.md §1). */
+const char *oc_tls_alpn_selected(const oc_tls_conn *c);
+
 #endif /* OPENCHIME_TLS_H */

@@ -21,6 +21,14 @@
 /* --- Constants (PROTOCOL.md §2.1, §7) ----------------------------------- */
 
 #define OC_PROTOCOL_VERSION 1u     /* the only version this codec speaks */
+
+/* Transport conventions (see PROTOCOL.md §1). The binary protocol shares TLS
+ * port 443 with the future HTTP/webhook surface, demultiplexed by ALPN: a
+ * client offers OC_ALPN_PROTO, and the daemon routes that to the binary
+ * handler (anything else is HTTP). Clients dial OC_DEFAULT_PORT unless a SRV
+ * record or .well-known metadata overrides the port. */
+#define OC_ALPN_PROTO   "oc/1"     /* ALPN id for the binary protocol */
+#define OC_DEFAULT_PORT 443        /* default client connect port */
 #define OC_HEADER_SIZE      8u     /* length(4) + version(2) + msg_type(2) */
 #define OC_LENGTH_MIN       4u     /* version(2) + msg_type(2), empty payload */
 #define OC_MAX_FRAME_SIZE   66560u /* 65 KiB, total on wire (4 + length) */

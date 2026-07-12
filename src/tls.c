@@ -3,6 +3,7 @@
  */
 
 #include "tls.h"
+#include "protocol.h"   /* OC_ALPN_PROTO */
 
 #include <errno.h>
 #include <stdio.h>
@@ -36,6 +37,11 @@ static int bio_recv(void *ctx, unsigned char *buf, size_t len) {
         return MBEDTLS_ERR_SSL_WANT_READ;
     return MBEDTLS_ERR_NET_RECV_FAILED;
 }
+
+/* ALPN list offered by clients and advertised by the server, so port 443 can
+ * be demultiplexed between the binary protocol and the HTTP/webhook surface
+ * (PROTOCOL.md §1, ARCH-54). NULL-terminated; the array must outlive the config. */
+static const char *oc_tls_alpn[] = { OC_ALPN_PROTO, NULL };
 
 static oc_tls_status status_of(int rc) {
     if (rc == MBEDTLS_ERR_SSL_WANT_READ)  return OC_TLS_WANT_READ;
@@ -148,6 +154,8 @@ int oc_tls_server_init(oc_tls_server *s, const char *cert_path, const char *key_
     mbedtls_ssl_conf_rng(&s->conf, mbedtls_ctr_drbg_random, &s->ctr_drbg);
     if ((rc = mbedtls_ssl_conf_own_cert(&s->conf, &s->cert, &s->key)) != 0)
         return rc;
+    if ((rc = mbedtls_ssl_conf_alpn_protocols(&s->conf, oc_tls_alpn)) != 0)
+        return rc;
     return 0;
 }
 
@@ -204,6 +212,8 @@ int oc_tls_client_init(oc_tls_client *c, const uint8_t *pin) {
      * mismatch still fails the connection (TOFU, ARCH-10). */
     mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
     mbedtls_ssl_conf_verify(&c->conf, client_verify, c);
+    if ((rc = mbedtls_ssl_conf_alpn_protocols(&c->conf, oc_tls_alpn)) != 0)
+        return rc;
     return 0;
 }
 
@@ -258,4 +268,8 @@ oc_tls_status oc_tls_write(oc_tls_conn *c, const void *buf, size_t len, size_t *
 int oc_tls_peer_fingerprint(const oc_tls_conn *c, uint8_t out[OC_TLS_FINGERPRINT_LEN]) {
     const mbedtls_x509_crt *peer = mbedtls_ssl_get_peer_cert(&c->ssl);
     return sha256_der(peer, out);
+}
+
+const char *oc_tls_alpn_selected(const oc_tls_conn *c) {
+    return mbedtls_ssl_get_alpn_protocol(&c->ssl);
 }

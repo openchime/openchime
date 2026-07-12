@@ -6,6 +6,7 @@
  * convention; links vendored mbedTLS + pthread. */
 
 #include "tls.h"
+#include "protocol.h"
 #include "check.h"
 
 #include <arpa/inet.h>
@@ -95,6 +96,10 @@ static void test_tls_handshake_and_echo(void) {
     uint8_t peer_fp[OC_TLS_FINGERPRINT_LEN];
     CHECK(oc_tls_peer_fingerprint(&c, peer_fp) == 0);
     CHECK(memcmp(peer_fp, srv_fp, sizeof peer_fp) == 0);
+
+    /* Both sides negotiated the binary-protocol ALPN (443 demux, PROTOCOL.md §1). */
+    const char *alpn = oc_tls_alpn_selected(&c);
+    CHECK(alpn != NULL && strcmp(alpn, OC_ALPN_PROTO) == 0);
 
     /* Round-trip a message through the tunnel. */
     const char *msg = "ping openchime";

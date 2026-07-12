@@ -27,13 +27,63 @@ code yet.
 - The protocol runs over a single TLS/TCP connection per client (ARCH-6,
   ARCH-10, REQ-180). There is no unencrypted fallback.
 - TLS trust is TOFU pinning against the daemon's self-signed certificate
-  (ARCH-10, REQ-183). TLS is out of scope for this document; everything below
-  describes the plaintext *inside* the TLS session.
+  (ARCH-10, REQ-183). Everything below §1 describes the plaintext *inside* the
+  TLS session.
 - The connection is bidirectional and full-duplex. After the handshake and
   auth complete, either side may send an applicable frame at any time (e.g.
   the server may push a `BROADCAST` while the client is composing a `SEND`).
 - One TCP connection carries exactly one authenticated session. There is no
   multiplexing of multiple users over one connection.
+
+### 1.1 Port and ALPN multiplexing (ARCH-54)
+
+This is a client-facing contract: it is fixed now and clients must conform,
+because changing it later means re-releasing every client.
+
+**Port.** The public port is **443** — the standard TLS port, chosen so clients
+behind restrictive networks reach the daemon on the one port those networks
+almost always allow outbound, and so third-party webhook senders (which only
+speak standard ports) can reach the same host. `443` is a default, not a
+hardcode: a client resolves the port with this precedence —
+
+1. the **port in a SRV record**, if discovery used SRV (a self-hoster on a
+   non-standard port is honored automatically — SRV carries a port);
+2. a **`port` field in `.well-known` metadata**, if present;
+3. otherwise **`OC_DEFAULT_PORT` = 443**.
+
+The daemon *binds* a configurable port (`OPENCHIME_PROTO_PORT`). In production it
+binds 443 (self-hosted: the systemd unit grants `CAP_NET_BIND_SERVICE`, per
+ARCH-20; hosted: Fly maps external 443 → the container). Local/dev binds a
+high port (8443) to avoid needing privilege — a deploy-time override, never a
+value a client assumes.
+
+**ALPN demultiplexing.** Port 443 is shared between this binary protocol and the
+daemon's HTTP/1.1 surface (incoming webhooks, ARCH-32/34; the health check,
+ARCH-25) by **ALPN** negotiated during the TLS handshake:
+
+- The client **MUST** offer ALPN **`oc/1`** (`OC_ALPN_PROTO`). The daemon
+  selects it and routes the connection to the binary-protocol handler.
+- A connection that negotiates anything else (or offers `http/1.1`) is routed to
+  the HTTP handler instead. Third-party webhook clients are ordinary HTTPS and
+  never offer `oc/1`, so they land on the HTTP side automatically.
+
+```
+                          TLS on :443
+   client (ALPN oc/1) ───────────────▶ ┌───────────────┐
+                                        │ ALPN = oc/1 ? │
+   webhook sender (HTTP) ──────────────▶└──────┬────────┘
+                                    yes  │      │  no
+                                         ▼      ▼
+                              binary protocol   HTTP/1.1 (webhooks, /healthz)
+                              (this document)   (ARCH-32/34)
+```
+
+Only the binary-protocol side and TLS termination exist today; the HTTP handler
+and its CA-signed cert (ARCH-34) are a later milestone. The **`oc/1` ALPN and
+the 443 default are fixed now** so clients are correct from first release and
+the HTTP surface can be added on the same port without touching them. The `oc`
+version suffix (`/1`) tracks the transport-framing generation, distinct from the
+per-frame `version` field in §2.
 
 ---
 
