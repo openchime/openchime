@@ -3,20 +3,10 @@
  * directly so file-static helpers are reachable, and a single CHECK macro
  * counts failures. Built and run by `make test`; non-zero exit means failure. */
 
-#include "protocol.c"
+#include "protocol.h"
+#include "check.h"
 
-#include <stdio.h>
 #include <string.h>
-
-static int failures = 0;
-
-#define CHECK(cond)                                                          \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond);         \
-            failures++;                                                      \
-        }                                                                    \
-    } while (0)
 
 /* Scratch buffers sized for a full frame plus a max body. */
 static uint8_t frame[OC_MAX_FRAME_SIZE];
@@ -299,7 +289,7 @@ static void test_version_negotiation(void) {
     CHECK(code == OC_ERR_VERSION_TOO_NEW);
 }
 
-int main(void) {
+int run_protocol_tests(void) {
     printf("test_protocol: primitives, handshake, auth, messaging, backfill,\n");
     printf("               error, size limits, malformed frames, version negotiation\n");
     test_primitives();
@@ -310,7 +300,5 @@ int main(void) {
     test_size_limits();
     test_malformed();
     test_version_negotiation();
-    if (failures == 0) { printf("OK: all checks passed\n"); return 0; }
-    printf("FAILED: %d check(s)\n", failures);
-    return 1;
+    return failures;
 }

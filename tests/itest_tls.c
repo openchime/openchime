@@ -5,24 +5,14 @@
  * so it runs under `make test`. Includes tls.c directly per the openblocks
  * convention; links vendored mbedTLS + pthread. */
 
-#include "tls.c"
+#include "tls.h"
+#include "check.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
-#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-
-static int failures = 0;
-
-#define CHECK(cond)                                                          \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond);         \
-            failures++;                                                      \
-        }                                                                    \
-    } while (0)
 
 static oc_tls_status handshake_blocking(oc_tls_conn *c) {
     for (;;) {
@@ -168,12 +158,10 @@ static void test_tls_pin_mismatch(void) {
     close(lfd);
 }
 
-int main(void) {
+int run_tls_tests(void) {
     printf("itest_tls: self-signed cert generation, TOFU-pinned handshake,\n");
     printf("           byte round-trip, pin-mismatch rejection\n");
     test_tls_handshake_and_echo();
     test_tls_pin_mismatch();
-    if (failures == 0) { printf("OK: all checks passed\n"); return 0; }
-    printf("FAILED: %d check(s)\n", failures);
-    return 1;
+    return failures;
 }

@@ -3,21 +3,13 @@
  * list) exercised directly through the job queue — no network involved.
  * Includes the code under test directly; links sqlite + pthread. */
 
-#include "dbwriter.c"
-#include "migrate.c"
+#include "dbwriter.h"
+#include "migrate.h"
+#include "protocol.h"
+#include "check.h"
 
-#include <stdio.h>
+#include <string.h>
 #include <unistd.h>
-
-static int failures = 0;
-
-#define CHECK(cond)                                                          \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond);         \
-            failures++;                                                      \
-        }                                                                    \
-    } while (0)
 
 static int table_exists(sqlite3 *db, const char *name) {
     sqlite3_stmt *st = NULL;
@@ -144,11 +136,9 @@ static void test_auth_and_send(void) {
     cleanup_db(path);
 }
 
-int main(void) {
+int run_dbwriter_tests(void) {
     printf("test_dbwriter: migrate-on-boot, AUTH upsert, SEND persist/idempotency/members\n");
     test_start_migrates_and_stops();
     test_auth_and_send();
-    if (failures == 0) { printf("OK: all checks passed\n"); return 0; }
-    printf("FAILED: %d check(s)\n", failures);
-    return 1;
+    return failures;
 }

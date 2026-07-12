@@ -17,10 +17,15 @@ MBEDTLS_LIBS := $(MBEDTLS_DIR)/library/libmbedtls.a \
                 $(MBEDTLS_DIR)/library/libmbedx509.a \
                 $(MBEDTLS_DIR)/library/libmbedcrypto.a
 
-TEST_BINS := build/test_protocol build/test_migrate build/test_framebuf \
-             build/test_dbwriter build/itest_tls build/itest_netloop
+# Every source except the daemon entry point; the test binary links these and
+# calls their public APIs (no per-test binaries, no unity #include of .c).
+APP_SRC   := $(filter-out src/main.c,$(SRC))
+# e2e_client is a standalone black-box tool (its own main), not part of the
+# single in-process test binary.
+TEST_SRC  := $(filter-out tests/e2e_client.c,$(wildcard tests/*.c))
+TEST_BIN  := build/tests
 
-.PHONY: all test clean
+.PHONY: all test integration clean
 
 all: $(BIN)
 
@@ -30,36 +35,23 @@ $(BIN): $(SRC) $(MBEDTLS_A) $(wildcard src/*.h)
 $(MBEDTLS_A):
 	scripts/build_mbedtls.sh
 
-# Unit/integration tests (docs/TESTING.md §2). Each test TU #includes the .c
-# under test directly. Built -O0 -g; a non-zero exit fails the build and CI.
-test: $(TEST_BINS)
-	./build/test_protocol
-	./build/test_migrate
-	./build/test_framebuf
-	./build/test_dbwriter
-	./build/itest_tls
-	./build/itest_netloop
+# Unit + in-process integration tests, one binary (docs/TESTING.md §2). Built
+# -O0 -g; a non-zero exit fails the build and CI.
+test: $(TEST_BIN)
+	./$(TEST_BIN)
 
-# Pure modules — no library link needed.
-build/test_protocol: tests/test_protocol.c src/protocol.c src/protocol.h | build
-	$(CC) $(CFLAGS) -O0 -g -Isrc tests/test_protocol.c -o $@
+$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(wildcard src/*.h) $(wildcard tests/*.h) $(MBEDTLS_A) | build
+	$(CC) $(CFLAGS) -O0 -g -Isrc -Itests -I$(MBEDTLS_INC) \
+	    $(TEST_SRC) $(APP_SRC) $(MBEDTLS_LIBS) -lsqlite3 -lpthread -o $@
 
-build/test_framebuf: tests/test_framebuf.c src/framebuf.c src/protocol.c src/*.h | build
-	$(CC) $(CFLAGS) -O0 -g -Isrc tests/test_framebuf.c -o $@
+# Black-box end-to-end integration against the containerized daemon (compose).
+integration: build/e2e_client
+	Scripts/test-integration.sh
 
-# Modules linking SQLite.
-build/test_migrate: tests/test_migrate.c src/migrate.c src/migrate.h | build
-	$(CC) $(CFLAGS) -O0 -g -Isrc tests/test_migrate.c -o $@ -lsqlite3
-
-build/test_dbwriter: tests/test_dbwriter.c src/dbwriter.c src/migrate.c src/*.h | build
-	$(CC) $(CFLAGS) -O0 -g -Isrc tests/test_dbwriter.c -o $@ -lsqlite3 -lpthread
-
-# Modules linking vendored mbedTLS (+ pthread for the threaded harnesses).
-build/itest_tls: tests/itest_tls.c src/tls.c src/tls.h $(MBEDTLS_A) | build
-	$(CC) $(CFLAGS) -O0 -g -Isrc -I$(MBEDTLS_INC) tests/itest_tls.c $(MBEDTLS_LIBS) -lpthread -o $@
-
-build/itest_netloop: tests/itest_netloop.c src/netloop.c src/framebuf.c src/protocol.c src/tls.c src/dbwriter.c src/migrate.c src/*.h $(MBEDTLS_A) | build
-	$(CC) $(CFLAGS) -O0 -g -Isrc -I$(MBEDTLS_INC) tests/itest_netloop.c $(MBEDTLS_LIBS) -lsqlite3 -lpthread -o $@
+# The e2e client links only the protocol + TLS modules (no daemon internals).
+build/e2e_client: tests/e2e_client.c src/protocol.c src/framebuf.c src/tls.c $(wildcard src/*.h) $(MBEDTLS_A) | build
+	$(CC) $(CFLAGS) -O0 -g -Isrc -I$(MBEDTLS_INC) \
+	    tests/e2e_client.c src/protocol.c src/framebuf.c src/tls.c $(MBEDTLS_LIBS) -o $@
 
 build:
 	mkdir -p build

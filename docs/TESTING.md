@@ -34,19 +34,19 @@ order" belongs in integration.
 
 ## 2. Unit tier
 
-### 2.1 Convention (mirrors openblocks)
+### 2.1 Convention
 
-- Tests live in `tests/`, one translation unit per subject
-  (e.g. `tests/test_protocol.c`).
-- A test TU **`#include`s the `.c` under test directly** (e.g.
-  `#include "protocol.c"`) so it can reach file-static helpers and state
-  without exporting them just for testing. This is the same technique
-  openblocks uses to test `game.c`/`input.c` in isolation.
-- A single hand-rolled macro, no framework:
+- All unit and in-process integration suites compile into **one** binary,
+  `build/tests`, run by `make test`. There is deliberately no per-test binary:
+  the tests exercise public APIs, so each `tests/*.c` links the real module
+  objects rather than `#include`-ing the `.c` under test.
+- A subject's tests live in one translation unit exposing a single entry point,
+  `int run_<subject>_tests(void)`, which runs its groups and returns its
+  failure count. `tests/main.c` calls each and sums; a non-zero total exits
+  non-zero and fails CI.
+- A single hand-rolled `CHECK` macro, no framework, shared via `tests/check.h`:
 
   ```c
-  static int failures = 0;
-
   #define CHECK(cond)                                                    \
       do {                                                               \
           if (!(cond)) {                                                 \
@@ -56,19 +56,9 @@ order" belongs in integration.
       } while (0)
   ```
 
-- `main()` runs each test group, prints a one-line summary, and returns
-  non-zero if `failures > 0`:
-
-  ```c
-  int main(void) {
-      test_header_roundtrip();
-      test_size_limits();
-      test_version_negotiation();
-      if (failures == 0) { printf("OK: all checks passed\n"); return 0; }
-      printf("FAILED: %d check(s)\n", failures);
-      return 1;
-  }
-  ```
+- If a future test genuinely needs a file-static helper, that one TU can
+  `#include` the `.c` under test directly (the openblocks technique) — but none
+  currently do, so all link the public API instead.
 
 - Built and run by `make test`, compiled `-O0 -g` (debuggable, and cheap since
   there is no window/GL/TLS to link). A non-zero exit fails the build and CI.
@@ -229,17 +219,26 @@ integration scenarios join the `integration` job once the client-TLS decision
 
 ```
 tests/
-  test_protocol.c        # unit: frame codec
-  test_framebuf.c        # unit: incremental frame reassembler
-  test_migrate.c         # unit: migration runner
-  test_dbwriter.c        # integration: DB-writer thread migrate-on-boot
-  itest_tls.c            # integration: TLS handshake + TOFU pinning
-  itest_netloop.c        # integration: HELLO->WELCOME over the epoll loop
-  ...
+  check.h                # shared CHECK macro
+  main.c                 # calls each run_<suite>_tests(), sums failures
+  test_protocol.c        # frame codec
+  test_framebuf.c        # incremental frame reassembler
+  test_migrate.c         # migration runner
+  test_dbwriter.c        # DB-writer thread: migrate-on-boot, AUTH/SEND jobs
+  itest_tls.c            # in-process: TLS handshake + TOFU pinning
+  itest_netloop.c        # in-process: two-client AUTH + SEND + BROADCAST
+  e2e_client.c           # black-box client for the harness (standalone binary)
 Scripts/
-  test-integration.sh    # brings up compose, runs scenarios, tears down
+  test-integration.sh    # brings up compose, runs the 4 e2e checks, tears down
 .github/workflows/
-  ci.yml                 # build + unit tests, and the compose durability path
+  ci.yml                 # build + `make test`, and the compose e2e harness
 Makefile
-  test:                  # builds + runs the unit binaries (-O0 -g)
+  test:                  # one binary (build/tests): unit + in-process integration
+  integration:           # Scripts/test-integration.sh (containerized daemon)
 ```
+
+All unit and in-process integration suites compile into a **single** binary
+(`build/tests`): each `tests/*.c` links the module's public API (no per-test
+binary, no unity `#include` of a `.c`) and exposes `run_<suite>_tests()`, which
+`tests/main.c` aggregates. The only separate artifact is `e2e_client`, which by
+definition talks to a *deployed* daemon rather than in-process modules.

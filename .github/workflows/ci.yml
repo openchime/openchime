@@ -49,65 +49,22 @@ jobs:
           fi
 
   integration:
-    name: durability path (compose)
+    name: end-to-end (compose)
     runs-on: ubuntu-22.04
-    # A stable project name so the volume is deterministically
-    # openchime_daemon-data for the restore-on-boot wipe below.
-    env:
-      COMPOSE_PROJECT_NAME: openchime
     steps:
       - uses: actions/checkout@v4
-      - name: Prepare env
-        run: cp .env.example .env
-
-      - name: Build and start the stack
-        run: docker compose up --build -d
-
-      - name: Wait for the daemon health check (ARCH-25)
+      - name: Install deps
         run: |
-          for i in $(seq 1 60); do
-            if curl -sf http://localhost:8080/healthz >/dev/null 2>&1; then
-              echo "daemon healthy"; exit 0
-            fi
-            sleep 2
-          done
-          echo "daemon did not become healthy in time" >&2
-          docker compose logs
-          exit 1
+          sudo apt-get update
+          # bzip2 for the vendored mbedTLS tarball that the e2e client builds.
+          sudo apt-get install -y --no-install-recommends bzip2
 
-      - name: Verify replication reached MinIO (ARCH-23)
-        run: |
-          # Past the 15s Litestream sync interval, the replica prefix must be
-          # non-empty. Use a throwaway mc container on the compose network; the
-          # mc image is minimal (no grep), so do the emptiness check on the host.
-          sleep 20
-          out=$(docker compose run --rm --no-deps --entrypoint sh minio-init -c '
-            until mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; do sleep 1; done
-            mc ls --recursive local/"$LITESTREAM_BUCKET"/openchime
-          ')
-          echo "$out"
-          if [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
-            echo "replica prefix is empty — replication did not reach MinIO" >&2
-            exit 1
-          fi
-
-      - name: Verify restore-on-boot (ARCH-24)
-        run: |
-          docker compose stop daemon
-          docker compose rm -f daemon
-          docker volume rm openchime_daemon-data
-          docker compose up -d daemon
-          for i in $(seq 1 60); do
-            if curl -sf http://localhost:8080/healthz >/dev/null 2>&1; then break; fi
-            sleep 2
-          done
-          # The entrypoint must have restored from the replica, not init'd fresh.
-          docker compose logs daemon | grep "attempting restore from replica"
-
-      - name: Dump logs on failure
-        if: failure()
-        run: docker compose logs
+      # The whole harness — healthz, replication, protocol vertical over TLS,
+      # and restore-on-boot — lives in one script so it runs identically here
+      # and locally (`make integration`). See docs/TESTING.md §3.
+      - name: Run integration harness
+        run: Scripts/test-integration.sh
 
       - name: Tear down
         if: always()
-        run: docker compose down -v
+        run: COMPOSE_PROJECT_NAME=openchime docker compose down -v

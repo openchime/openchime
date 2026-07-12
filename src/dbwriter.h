@@ -17,6 +17,11 @@
 
 #define OC_IDEM_LEN 16
 
+/* The stub AUTH auto-provisions this one shared channel and joins every user to
+ * it, so the SEND/BROADCAST path has somewhere to deliver. Real channel
+ * create/join is a later feature. */
+#define OC_DEFAULT_CHANNEL 1
+
 /* --- Jobs (net thread -> writer) ---------------------------------------- */
 
 enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2 };

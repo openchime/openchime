@@ -2,20 +2,10 @@
  * Includes migrate.c directly per the openblocks convention; links libsqlite3.
  * All tests run against in-memory databases — no files touched. */
 
-#include "migrate.c"
+#include "migrate.h"
+#include "check.h"
 
-#include <stdio.h>
 #include <string.h>
-
-static int failures = 0;
-
-#define CHECK(cond)                                                          \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond);         \
-            failures++;                                                      \
-        }                                                                    \
-    } while (0)
 
 static sqlite3 *open_mem(void) {
     sqlite3 *db = NULL;
@@ -136,7 +126,7 @@ static void test_embedded_schema(void) {
     sqlite3_close(db);
 }
 
-int main(void) {
+int run_migrate_tests(void) {
     printf("test_migrate: fresh apply, idempotent rerun, resume, rollback,\n");
     printf("              embedded core schema\n");
     test_fresh_apply();
@@ -144,7 +134,5 @@ int main(void) {
     test_resume_partial();
     test_failure_rolls_back();
     test_embedded_schema();
-    if (failures == 0) { printf("OK: all checks passed\n"); return 0; }
-    printf("FAILED: %d check(s)\n", failures);
-    return 1;
+    return failures;
 }

@@ -2,21 +2,11 @@
  * two-phase read discipline over a boundary-less stream. Includes the code
  * under test directly (openblocks convention); pure, no sockets. */
 
-#include "framebuf.c"
-#include "protocol.c"
+#include "framebuf.h"
+#include "protocol.h"
+#include "check.h"
 
-#include <stdio.h>
 #include <string.h>
-
-static int failures = 0;
-
-#define CHECK(cond)                                                          \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond);         \
-            failures++;                                                      \
-        }                                                                    \
-    } while (0)
 
 /* Encode a HELLO with the given range into `out`; return its byte length. */
 static size_t make_hello(uint8_t *out, size_t cap, uint16_t mn, uint16_t mx) {
@@ -115,13 +105,11 @@ static void test_bad_length(void) {
     oc_framebuf_free(&fb);
 }
 
-int main(void) {
+int run_framebuf_tests(void) {
     printf("test_framebuf: byte-at-a-time, two-at-once, split push, bad length\n");
     test_byte_at_a_time();
     test_two_at_once();
     test_split_push();
     test_bad_length();
-    if (failures == 0) { printf("OK: all checks passed\n"); return 0; }
-    printf("FAILED: %d check(s)\n", failures);
-    return 1;
+    return failures;
 }

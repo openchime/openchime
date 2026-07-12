@@ -4,29 +4,18 @@
  * acked. Runs the non-blocking epoll server (with a real DB-writer thread) in a
  * thread and drives it with blocking TLS clients. */
 
-#include "netloop.c"
-#include "dbwriter.c"
-#include "framebuf.c"
-#include "migrate.c"
-#include "protocol.c"
-#include "tls.c"
+#include "netloop.h"
+#include "dbwriter.h"
+#include "framebuf.h"
+#include "protocol.h"
+#include "tls.h"
+#include "check.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
-#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-
-static int failures = 0;
-
-#define CHECK(cond)                                                          \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond);         \
-            failures++;                                                      \
-        }                                                                    \
-    } while (0)
 
 struct loop_arg {
     int                   port;
@@ -201,7 +190,7 @@ static void test_message_vertical(int port, const uint8_t *pin) {
     client_close(&b);
 }
 
-int main(void) {
+int run_netloop_tests(void) {
     printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST\n");
 
     oc_tls_server srv;
@@ -236,7 +225,5 @@ int main(void) {
     unlink("build/itest_netloop.db-wal");
     unlink("build/itest_netloop.db-shm");
 
-    if (failures == 0) { printf("OK: all checks passed\n"); return 0; }
-    printf("FAILED: %d check(s)\n", failures);
-    return 1;
+    return failures;
 }

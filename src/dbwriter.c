@@ -19,11 +19,6 @@
 #include <time.h>
 #include <unistd.h>
 
-/* The stub AUTH auto-provisions a single shared channel and joins every user
- * to it, so the SEND/BROADCAST path has somewhere to deliver. Real channel
- * create/join is a later feature. */
-#define OC_DEFAULT_CHANNEL 1
-
 struct oc_dbwriter {
     sqlite3        *db;
     pthread_t       thread;

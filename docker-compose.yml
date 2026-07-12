@@ -38,7 +38,8 @@ services:
       LITESTREAM_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       LITESTREAM_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
     ports:
-      - "8080:8080"
+      - "8080:8080"   # /healthz
+      - "8443:8443"   # binary protocol (TLS)
     volumes:
       - daemon-data:/data
     # Approximates Fly.io's smallest instance (shared-cpu-1x / 256MB, per
