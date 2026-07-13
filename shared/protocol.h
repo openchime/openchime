@@ -232,4 +232,13 @@ oc_result oc_decode_backfill_request(oc_rbuf *p, oc_cursor *cursors, uint16_t ca
 oc_result oc_decode_backfill_done(oc_rbuf *p, oc_backfill_done *m);
 oc_result oc_decode_error(oc_rbuf *p, oc_error *m);
 
+/* --- Inner credential codec (AUTH.md §2; PROTOCOL.md §4.2) --------------- */
+/* For method=local the AUTH `credential` payload is itself `str username`
+ * followed by `str password`. These pack/parse that inner payload, kept here
+ * so the client and daemon share one definition of the format. Encode writes
+ * into `w` (whose bytes then become the credential slice); parse reads a
+ * credential slice, rejecting trailing garbage with OC_E_MALFORMED. */
+oc_result oc_encode_local_credential(oc_wbuf *w, oc_slice username, oc_slice password);
+oc_result oc_parse_local_credential(oc_slice credential, oc_slice *username, oc_slice *password);
+
 #endif /* OPENCHIME_PROTOCOL_H */

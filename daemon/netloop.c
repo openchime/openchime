@@ -170,6 +170,14 @@ static int handle_hello(conn *c, oc_rbuf *payload) {
     oc_welcome wel = { chosen, now_ms() };
     oc_encode_welcome(&w, &wel);
     out_append(c, tmp, w.len);
+
+    /* Immediately advertise the auth methods this deployment accepts (AUTH.md
+     * §5). This is a local-mode daemon: local passwords plus session reconnect.
+     * OIDC advertising (with oidc_params) arrives with the OIDC milestone. */
+    oc_wbuf_init(&w, tmp, sizeof tmp);
+    oc_auth_challenge ch = { OC_AUTH_LOCAL | OC_AUTH_SESSION, { NULL, 0 } };
+    oc_encode_auth_challenge(&w, OC_PROTOCOL_VERSION, &ch);
+    out_append(c, tmp, w.len);
     return 0;
 }
 
@@ -200,7 +208,9 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
                 oc_auth a;
                 if (oc_decode_auth(&p, &a) != OC_OK) return -1;
                 oc_job *j = oc_job_new(OC_JOB_AUTH, c->conn_id);
-                if (!j || oc_job_set_token(j, a.credential.ptr, a.credential.len) != 0) return -1;
+                if (!j) return -1;
+                j->method = a.method;
+                if (oc_job_set_token(j, a.credential.ptr, a.credential.len) != 0) return -1;
                 oc_dbwriter_submit(dbw, j);
                 continue;
             }
@@ -279,8 +289,12 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         c->authed = 1;
         c->user_id = r->user_id;
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
-        /* role/session are filled in by the real auth core; stub sends defaults. */
-        oc_auth_ok m = { r->user_id, OC_ROLE_MEMBER, 0, { NULL, 0 } };
+        /* Fresh auth carries the session token; a session re-auth omits it
+         * (PROTOCOL.md §4.3). */
+        oc_slice tok = r->has_session_token
+                     ? (oc_slice){ r->session_token, OC_SESSION_TOKEN_LEN }
+                     : (oc_slice){ NULL, 0 };
+        oc_auth_ok m = { r->user_id, r->role, r->session_expiry, tok };
         oc_encode_auth_ok(&w, OC_PROTOCOL_VERSION, &m);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;

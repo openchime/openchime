@@ -7,7 +7,7 @@ BIN := openchimed
 # The tree is split into three concerns: shared/ is the wire contract (linked by
 # both the daemon and the client), daemon/ is the server, client/ is the app.
 SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c
-DAEMON_SRC := daemon/main.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c
+DAEMON_SRC := daemon/main.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c
 SRC        := $(SHARED_SRC) $(DAEMON_SRC)
 HDRS       := $(wildcard shared/*.h daemon/*.h)
 

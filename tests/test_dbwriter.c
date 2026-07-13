@@ -8,6 +8,7 @@
 #include "protocol.h"
 #include "check.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -55,13 +56,42 @@ static void test_start_migrates_and_stops(void) {
     cleanup_db(path);
 }
 
-static uint64_t do_auth(oc_dbwriter *w, uint64_t conn_id, const char *token) {
+/* Low PBKDF2 rounds keep the tests fast; the production default is 600k. */
+#define TEST_PW_ITERS 2048
+
+static uint64_t reg(oc_dbwriter *w, const char *user, const char *pass, uint8_t role) {
+    return oc_dbwriter_register_local(w, user, pass, role, TEST_PW_ITERS);
+}
+
+/* Local auth over a conn; optionally captures the minted session token + role. */
+static uint64_t auth_local(oc_dbwriter *w, uint64_t conn_id, const char *user,
+                           const char *pass, uint8_t *token_out, uint8_t *role_out) {
+    uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+    oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass));
     oc_job *j = oc_job_new(OC_JOB_AUTH, conn_id);
-    oc_job_set_token(j, token, strlen(token));
+    j->method = OC_AUTH_LOCAL;
+    oc_job_set_token(j, cbuf, cw.len);
     oc_dbwriter_submit(w, j);
     oc_dbres *r = wait_result(w);
     uint64_t uid = 0;
-    if (r && r->type == OC_RES_AUTH_OK && r->conn_id == conn_id) uid = r->user_id;
+    if (r && r->type == OC_RES_AUTH_OK && r->conn_id == conn_id) {
+        uid = r->user_id;
+        if (token_out && r->has_session_token)
+            memcpy(token_out, r->session_token, OC_SESSION_TOKEN_LEN);
+        if (role_out) *role_out = r->role;
+    }
+    oc_dbres_free(r);
+    return uid;
+}
+
+/* Reconnect with a previously minted session token. */
+static uint64_t auth_session(oc_dbwriter *w, uint64_t conn_id, const uint8_t token[OC_SESSION_TOKEN_LEN]) {
+    oc_job *j = oc_job_new(OC_JOB_AUTH, conn_id);
+    j->method = OC_AUTH_SESSION;
+    oc_job_set_token(j, token, OC_SESSION_TOKEN_LEN);
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    uint64_t uid = (r && r->type == OC_RES_AUTH_OK && r->conn_id == conn_id) ? r->user_id : 0;
     oc_dbres_free(r);
     return uid;
 }
@@ -72,12 +102,27 @@ static void test_auth_and_send(void) {
     oc_dbwriter *w = oc_dbwriter_start(path);
     CHECK(w != NULL);
 
-    /* Two users authenticate; each gets a distinct id and joins the channel. */
-    uint64_t a = do_auth(w, 10, "user-a");
-    uint64_t b = do_auth(w, 11, "user-b");
+    /* Register two local accounts (owner + member); each gets a distinct id and
+     * joins the default channel. */
+    uint64_t a = reg(w, "alice", "pw-alice", OC_ROLE_OWNER);
+    uint64_t b = reg(w, "bob",   "pw-bob",   OC_ROLE_MEMBER);
     CHECK(a != 0 && b != 0 && a != b);
-    /* Re-auth of the same subject is idempotent (same id). */
-    CHECK(do_auth(w, 12, "user-a") == a);
+
+    /* Local auth returns the account's id + role and mints a session token. */
+    uint8_t atoken[OC_SESSION_TOKEN_LEN]; uint8_t arole = 0xFF;
+    memset(atoken, 0, sizeof atoken);
+    CHECK(auth_local(w, 10, "alice", "pw-alice", atoken, &arole) == a);
+    CHECK(arole == OC_ROLE_OWNER);
+    /* A wrong password is rejected; an unknown user too. */
+    CHECK(auth_local(w, 11, "alice", "wrong",    NULL, NULL) == 0);
+    CHECK(auth_local(w, 11, "nobody", "whatever", NULL, NULL) == 0);
+    /* Reconnect with the minted session token resolves the same user. */
+    CHECK(auth_session(w, 12, atoken) == a);
+    /* A bogus session token is rejected. */
+    uint8_t bogus[OC_SESSION_TOKEN_LEN]; memset(bogus, 0xEE, sizeof bogus);
+    CHECK(auth_session(w, 12, bogus) == 0);
+    /* bob logs in for the send test below. */
+    CHECK(auth_local(w, 13, "bob", "pw-bob", NULL, NULL) == b);
 
     /* user-a sends to the default channel: gets an id and both members back. */
     uint8_t idem[OC_IDEM_LEN];
@@ -166,7 +211,7 @@ static void test_backfill(void) {
     oc_dbwriter *w = oc_dbwriter_start(path);
     CHECK(w != NULL);
 
-    uint64_t u = do_auth(w, 1, "bf-user");
+    uint64_t u = reg(w, "bf-user", "pw", OC_ROLE_MEMBER);
     CHECK(u != 0);
     uint8_t idem[OC_IDEM_LEN];
     memset(idem, 1, sizeof idem); uint64_t m1 = send_msg(w, u, idem, "one");
@@ -197,7 +242,7 @@ static void test_backfill(void) {
 }
 
 int run_dbwriter_tests(void) {
-    printf("test_dbwriter: migrate-on-boot, AUTH upsert, SEND persist/idempotency/members, backfill\n");
+    printf("test_dbwriter: migrate-on-boot, register + local/session auth, SEND persist/idempotency/members, backfill\n");
     test_start_migrates_and_stops();
     test_auth_and_send();
     test_backfill();

@@ -179,11 +179,31 @@ static void *net_thread(void *arg) {
         if (hdr.msg_type != OC_MSG_WELCOME) goto drop;
     }
 
-    /* Stub AUTH -> AUTH_OK (matches today's stubbed daemon; the real
-     * AUTH_CHALLENGE/method flow lands with the auth-core milestone). */
+    /* WELCOME is followed by AUTH_CHALLENGE advertising the daemon's methods
+     * (PROTOCOL.md §4.1). This skeleton only does local auth, so we read and
+     * accept the challenge without inspecting the offered set. */
     {
-        uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-        oc_auth a = { OC_AUTH_LOCAL, oc_slice_str(n->token ? n->token : "client") };
+        oc_header hdr; oc_rbuf p;
+        if (read_one(&conn, fd, &fb, &hdr, &p, &n->stop) != 0) goto drop;
+        if (hdr.msg_type != OC_MSG_AUTH_CHALLENGE) goto drop;
+        oc_auth_challenge ch;
+        if (oc_decode_auth_challenge(&p, &ch) != OC_OK) goto drop;
+    }
+
+    /* Local AUTH -> AUTH_OK. `token` carries "username:password" for now; the
+     * real login UI (plus OIDC and session reconnect) arrives in a later client
+     * phase. The session token in AUTH_OK is ignored until the store phase. */
+    {
+        const char *cred = n->token ? n->token : "";
+        const char *sep = strchr(cred, ':');
+        oc_slice user = sep ? (oc_slice){ (const uint8_t *)cred, (size_t)(sep - cred) }
+                            : oc_slice_str(cred);
+        oc_slice pass = sep ? oc_slice_str(sep + 1) : (oc_slice){ (const uint8_t *)"", 0 };
+        uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+        if (oc_encode_local_credential(&cw, user, pass) != OC_OK) goto drop;
+
+        uint8_t buf[1024]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        oc_auth a = { OC_AUTH_LOCAL, { cbuf, cw.len } };
         if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a) != OC_OK || write_all(&conn, fd, buf, w.len, &n->stop) != 0) goto drop;
         oc_header hdr; oc_rbuf p;
         if (read_one(&conn, fd, &fb, &hdr, &p, &n->stop) != 0) goto drop;

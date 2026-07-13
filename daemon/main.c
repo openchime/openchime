@@ -4,9 +4,11 @@
  * Wires the skeleton together (ARCH-5, ARCH-22): a DB-writer thread that owns
  * the SQLite connection and migrates on boot, a lightweight /healthz HTTP
  * responder for the orchestrator (ARCH-25), and the epoll network loop that
- * terminates TLS (ARCH-10) and serves the binary protocol. AUTH and messaging
- * are not handled yet — the loop currently completes the handshake and answers
- * HELLO with WELCOME/REJECT (PROTOCOL.md §3).
+ * terminates TLS (ARCH-10) and serves the binary protocol. The loop completes
+ * the handshake (PROTOCOL.md §3), runs the two-mode auth handshake — local
+ * passwords + session reconnect today, OIDC to follow (AUTH.md) — and serves
+ * the messaging vertical. Local accounts can be provisioned at boot via
+ * OC_BOOTSTRAP_USERS.
  */
 
 #include "dbwriter.h"
@@ -34,6 +36,36 @@ static const char *env_or(const char *name, const char *dflt) {
 static int env_port(const char *name, int dflt) {
     const char *v = getenv(name);
     return v ? atoi(v) : dflt;
+}
+
+/* Provision local accounts from OC_BOOTSTRAP_USERS="user:pass[:role],..."
+ * (AUTH.md §2 — the owner bootstrap / air-gapped account setup). Idempotent:
+ * re-running never clobbers an existing password. role ∈ owner|admin|member
+ * (default member). Runs before the loop serves traffic, so registering through
+ * the writer thread cannot race a live result consumer. */
+static void bootstrap_users(oc_dbwriter *db, const char *spec) {
+    if (!spec || !*spec) return;
+    char *dup = strdup(spec);
+    if (!dup) return;
+    char *save = NULL;
+    for (char *ent = strtok_r(dup, ",", &save); ent; ent = strtok_r(NULL, ",", &save)) {
+        char *pass = strchr(ent, ':');
+        if (!pass) continue;
+        *pass++ = '\0';
+        uint8_t role = OC_ROLE_MEMBER;
+        char *rs = strchr(pass, ':');
+        if (rs) {
+            *rs++ = '\0';
+            if (strcmp(rs, "owner") == 0)      role = OC_ROLE_OWNER;
+            else if (strcmp(rs, "admin") == 0) role = OC_ROLE_ADMIN;
+        }
+        if (*ent && *pass) {
+            uint64_t uid = oc_dbwriter_register_local(db, ent, pass, role, 0);
+            fprintf(stderr, "openchimed: bootstrap user '%s' -> id %llu%s\n",
+                    ent, (unsigned long long)uid, uid ? "" : " (FAILED)");
+        }
+    }
+    free(dup);
 }
 
 /* --- /healthz (ARCH-25) ------------------------------------------------- */
@@ -94,6 +126,9 @@ int main(void) {
      * serve any traffic (ARCH-27). Fatal if it can't. */
     oc_dbwriter *db = oc_dbwriter_start(db_path);
     if (!db) { fprintf(stderr, "openchimed: DB init failed\n"); return 1; }
+
+    /* Optionally provision local accounts before serving (AUTH.md §2). */
+    bootstrap_users(db, getenv("OC_BOOTSTRAP_USERS"));
 
     /* Self-signed cert on first run, reused thereafter (ARCH-10). */
     oc_tls_server tls;

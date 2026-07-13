@@ -5,11 +5,15 @@ This is the authoritative design; it is cross-referenced from ARCHITECTURE.md
 (ARCH-19, ARCH-55–ARCH-60), REQUIREMENTS.md (§1.2, §8.1), PROTOCOL.md (§4), and
 SCHEMA.md (migration 0002).
 
-**Status.** Design. As of this writing authentication is **stubbed** — the
-daemon accepts any token string as a user subject (`process_auth` in
-`daemon/dbwriter.c`) so the messaging vertical could be built. This document
-defines the real design that replaces the stub; the implementation is a
-follow-on milestone.
+**Status.** **Local mode is implemented** — the daemon verifies username +
+password against PBKDF2-HMAC-SHA256 credentials (`local_credentials`), mints
+daemon-issued sessions (§4), and accepts session tokens on reconnect
+(`process_auth` in `daemon/dbwriter.c`, crypto in `daemon/auth.c`, wire frames
+in PROTOCOL.md §4). Accounts are provisioned at boot from `OC_BOOTSTRAP_USERS`
+(the owner-bootstrap path, §2). **OIDC mode (§3) is the remaining milestone** —
+the `AUTH_CHALLENGE` methods bitset advertises `local | session` today; `oidc`
+is added when the central ES256 JWT verification lands. Roles (§6) beyond the
+`role` column + `AUTH_OK` are enforced incrementally.
 
 ---
 

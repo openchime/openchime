@@ -415,3 +415,22 @@ oc_result oc_decode_error(oc_rbuf *p, oc_error *m) {
     m->message = oc_r_str(p);
     return r_done(p);
 }
+
+/* --- Inner credential codec (AUTH.md §2; PROTOCOL.md §4.2) --------------- */
+
+oc_result oc_encode_local_credential(oc_wbuf *w, oc_slice username, oc_slice password) {
+    oc_w_str(w, username);
+    oc_w_str(w, password);
+    return w->overflow ? OC_E_OVERFLOW : OC_OK;
+}
+
+oc_result oc_parse_local_credential(oc_slice credential, oc_slice *username, oc_slice *password) {
+    oc_rbuf r;
+    oc_rbuf_init(&r, credential.ptr, credential.len);
+    oc_slice u = oc_r_str(&r);
+    oc_slice p = oc_r_str(&r);
+    if (r_done(&r) != OC_OK) return OC_E_MALFORMED;
+    if (username) *username = u;
+    if (password) *password = p;
+    return OC_OK;
+}

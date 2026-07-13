@@ -88,12 +88,18 @@ static int do_handshake(client *c) {
     oc_header hdr; oc_rbuf p;
     if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_WELCOME) return -1;
     oc_welcome wel;
-    return oc_decode_welcome(&p, &wel) == OC_OK ? 0 : -1;
+    if (oc_decode_welcome(&p, &wel) != OC_OK) return -1;
+    /* The daemon follows WELCOME with AUTH_CHALLENGE (PROTOCOL.md §4.1). */
+    if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_AUTH_CHALLENGE) return -1;
+    oc_auth_challenge ch;
+    return oc_decode_auth_challenge(&p, &ch) == OC_OK ? 0 : -1;
 }
 
-static int do_auth(client *c, const char *token, uint64_t *uid) {
-    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_auth a = { OC_AUTH_LOCAL, oc_slice_str(token) };
+static int do_auth(client *c, const char *user, const char *pass, uint64_t *uid) {
+    uint8_t cbuf[256]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+    if (oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass)) != OC_OK) return -1;
+    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_auth a = { OC_AUTH_LOCAL, { cbuf, cw.len } };
     if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a) != 0 || write_all(&c->conn, buf, w.len) != 0) return -1;
     oc_header hdr; oc_rbuf p;
     if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_AUTH_OK) return -1;
@@ -110,7 +116,8 @@ static int run(const char *host, int port) {
     if (do_handshake(&a) != 0 || do_handshake(&b) != 0) FAIL("handshake");
 
     uint64_t ua = 0, ub = 0;
-    if (do_auth(&a, "e2e-alice", &ua) != 0 || do_auth(&b, "e2e-bob", &ub) != 0) FAIL("auth");
+    if (do_auth(&a, "e2e-alice", "e2e-pw", &ua) != 0 ||
+        do_auth(&b, "e2e-bob",   "e2e-pw", &ub) != 0) FAIL("auth");
     if (ua == 0 || ub == 0) FAIL("user ids");
 
     uint8_t idem[OC_IDEM_SIZE];

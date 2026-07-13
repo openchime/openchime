@@ -45,8 +45,9 @@ int main(int argc, char **argv) {
     if (!host) host = "127.0.0.1";
     const char *port_s = getenv("OPENCHIME_PORT");
     int port = port_s ? atoi(port_s) : 8443;
+    /* Local credentials as "username:password" until the login UI exists. */
     const char *token = getenv("OPENCHIME_TOKEN");
-    if (!token) token = "client";
+    if (!token) token = "client:client";
     if (argc > 1) host = argv[1];
     if (argc > 2) port = atoi(argv[2]);
 

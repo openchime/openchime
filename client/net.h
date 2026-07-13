@@ -15,9 +15,9 @@
 
 typedef struct oc_net oc_net;
 
-/* Start the network thread. `token` is the stub-auth credential for now (the
- * real AUTH_CHALLENGE/method flow lands with the daemon's auth-core milestone).
- * Returns NULL on failure to spawn. */
+/* Start the network thread. `token` carries local credentials as
+ * "username:password" (the real login UI, OIDC, and session reconnect land in a
+ * later client phase). Returns NULL on failure to spawn. */
 oc_net *oc_net_start(const char *host, int port, const char *token,
                      oc_queue *to_ui, oc_queue *from_ui);
 

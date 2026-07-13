@@ -103,12 +103,19 @@ static int do_handshake(client *c) {
     oc_header hdr; oc_rbuf p;
     if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_WELCOME) return -1;
     oc_welcome wel;
-    return oc_decode_welcome(&p, &wel) == OC_OK ? 0 : -1;
+    if (oc_decode_welcome(&p, &wel) != OC_OK) return -1;
+    /* The daemon follows WELCOME with AUTH_CHALLENGE advertising its methods. */
+    if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_AUTH_CHALLENGE) return -1;
+    oc_auth_challenge ch;
+    if (oc_decode_auth_challenge(&p, &ch) != OC_OK) return -1;
+    return (ch.methods & OC_AUTH_LOCAL) ? 0 : -1;
 }
 
-static int do_auth(client *c, const char *token, uint64_t *user_id) {
-    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_auth a = { OC_AUTH_LOCAL, oc_slice_str(token) };
+static int do_auth(client *c, const char *user, const char *pass, uint64_t *user_id) {
+    uint8_t cbuf[256]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+    if (oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass)) != OC_OK) return -1;
+    uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_auth a = { OC_AUTH_LOCAL, { cbuf, cw.len } };
     if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a) != 0) return -1;
     if (write_all(&c->conn, buf, w.len) != 0) return -1;
     oc_header hdr; oc_rbuf p;
@@ -140,8 +147,8 @@ static void test_message_vertical(int port, const uint8_t *pin) {
     CHECK(do_handshake(&b) == 0);
 
     uint64_t ua = 0, ub = 0;
-    CHECK(do_auth(&a, "alice", &ua) == 0);
-    CHECK(do_auth(&b, "bob", &ub) == 0);
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
     CHECK(ua != 0 && ub != 0 && ua != ub);
 
     /* alice sends to the default channel. */
@@ -197,7 +204,7 @@ static void test_backfill_reconnect(int port, const uint8_t *pin) {
     CHECK(client_open(&a, port, pin) == 0);
     CHECK(do_handshake(&a) == 0);
     uint64_t ua = 0;
-    CHECK(do_auth(&a, "bf-sender", &ua) == 0);
+    CHECK(do_auth(&a, "bf-sender", "pw", &ua) == 0);
 
     uint8_t idem[OC_IDEM_SIZE];
     memset(idem, 0x5C, sizeof idem);
@@ -225,7 +232,7 @@ static void test_backfill_reconnect(int port, const uint8_t *pin) {
     CHECK(client_open(&c, port, pin) == 0);
     CHECK(do_handshake(&c) == 0);
     uint64_t uc = 0;
-    CHECK(do_auth(&c, "bf-reader", &uc) == 0);
+    CHECK(do_auth(&c, "bf-reader", "pw", &uc) == 0);
 
     oc_wbuf_init(&w, buf, sizeof buf);
     oc_cursor cur = { 1, 0 };
@@ -276,6 +283,13 @@ int run_netloop_tests(void) {
     unlink("build/itest_netloop.db-shm");
     oc_dbwriter *dbw = oc_dbwriter_start("build/itest_netloop.db");
     CHECK(dbw != NULL);
+
+    /* Provision the accounts the clients log in as, before the loop serves
+     * traffic (register runs on the writer thread; no live consumer yet). */
+    CHECK(oc_dbwriter_register_local(dbw, "alice",     "pw-alice", OC_ROLE_OWNER,  2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw, "bob",       "pw-bob",   OC_ROLE_MEMBER, 2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw, "bf-sender", "pw",       OC_ROLE_MEMBER, 2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw, "bf-reader", "pw",       OC_ROLE_MEMBER, 2048) != 0);
 
     struct loop_arg arg;
     arg.port = 18000 + (int)(getpid() % 2000);

@@ -2,13 +2,15 @@
  * OpenChime DB-writer thread + write-job queue. See dbwriter.h and migrate.h.
  *
  * One thread owns the write connection. It pops jobs off a request queue,
- * performs all DB work (AUTH upsert, SEND persist with idempotency), and pushes
- * results onto a completion queue, signalling the net thread via an eventfd.
+ * performs all DB work (local/session AUTH + account REGISTER, SEND persist with
+ * idempotency, backfill), and pushes results onto a completion queue, signalling
+ * the net thread via an eventfd.
  */
 
 #include "dbwriter.h"
 #include "migrate.h"
 #include "protocol.h"
+#include "auth.h"
 
 #include <pthread.h>
 #include <sqlite3.h>
@@ -50,6 +52,17 @@ int oc_job_set_token(oc_job *j, const void *tok, size_t len) {
     if (!j->token) return -1;
     memcpy(j->token, tok, len);
     j->token[len] = '\0';
+    j->token_len = len;
+    return 0;
+}
+
+int oc_job_set_register(oc_job *j, const char *username, const char *password,
+                        uint8_t role, uint32_t iterations) {
+    j->username = username ? strdup(username) : NULL;
+    j->password = password ? strdup(password) : NULL;
+    if ((username && !j->username) || (password && !j->password)) return -1;
+    j->role = role;
+    j->iterations = iterations;
     return 0;
 }
 
@@ -64,6 +77,8 @@ int oc_job_set_body(oc_job *j, const void *body, size_t len) {
 static void job_free(oc_job *j) {
     if (!j) return;
     free(j->token);
+    free(j->username);
+    free(j->password);
     free(j->body);
     free(j->cursors);
     free(j);
@@ -84,22 +99,29 @@ void oc_dbres_free(oc_dbres *r) {
 
 /* --- Job processing (runs on the writer thread) ------------------------- */
 
-/* Look up (or insert) a user by subject; returns the user id or 0 on error. */
-static uint64_t upsert_user(sqlite3 *db, const char *subject) {
-    sqlite3_stmt *st = NULL;
-    sqlite3_prepare_v2(db,
-        "INSERT OR IGNORE INTO users(subject, created_at_ms) VALUES(?, ?);", -1, &st, NULL);
-    sqlite3_bind_text(st, 1, subject, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(st, 2, (sqlite3_int64)dbw_now_ms());
-    sqlite3_step(st);
-    sqlite3_finalize(st);
+/* Session lifetime — the daemon's own expiry, no longer tied to a provider
+ * token (REQ-181, AUTH.md §4). */
+#define OC_SESSION_TTL_MS (30ull * 24 * 60 * 60 * 1000)
 
-    uint64_t id = 0;
-    sqlite3_prepare_v2(db, "SELECT id FROM users WHERE subject=?;", -1, &st, NULL);
-    sqlite3_bind_text(st, 1, subject, -1, SQLITE_STATIC);
-    if (sqlite3_step(st) == SQLITE_ROW) id = (uint64_t)sqlite3_column_int64(st, 0);
-    sqlite3_finalize(st);
-    return id;
+static uint8_t role_to_u8(const char *r) {
+    if (r && strcmp(r, "owner") == 0) return OC_ROLE_OWNER;
+    if (r && strcmp(r, "admin") == 0) return OC_ROLE_ADMIN;
+    return OC_ROLE_MEMBER;
+}
+
+static const char *u8_to_role(uint8_t r) {
+    if (r == OC_ROLE_OWNER) return "owner";
+    if (r == OC_ROLE_ADMIN) return "admin";
+    return "member";
+}
+
+/* Build "local:<username>" into buf; returns length, or 0 if username is empty
+ * or too long to namespace safely. */
+static size_t local_subject(char *buf, size_t cap, const char *username, size_t ulen) {
+    if (ulen == 0 || ulen + 6 > cap) return 0;
+    memcpy(buf, "local:", 6);
+    memcpy(buf + 6, username, ulen);
+    return ulen + 6;
 }
 
 static void ensure_default_membership(sqlite3 *db, uint64_t user_id) {
@@ -122,17 +144,213 @@ static void ensure_default_membership(sqlite3 *db, uint64_t user_id) {
     sqlite3_finalize(st);
 }
 
+/* Create a local account: `local:<username>` user + PBKDF2 credential (AUTH.md
+ * §2). Idempotent — INSERT OR IGNORE means re-running bootstrap never clobbers
+ * an existing password. Returns the user id, or 0 on error. */
+static uint64_t register_local(sqlite3 *db, const char *username, size_t ulen,
+                               const char *password, size_t plen,
+                               uint8_t role, uint32_t iterations) {
+    char subject[256];
+    size_t sublen = local_subject(subject, sizeof subject, username, ulen);
+    if (sublen == 0 || plen == 0) return 0;
+    if (iterations == 0) iterations = OC_PW_ITERATIONS;
+
+    uint8_t salt[OC_PW_SALT_LEN], hash[OC_PW_HASH_LEN];
+    if (oc_rand_bytes(salt, sizeof salt) != 0) return 0;
+    if (oc_pw_derive(password, plen, salt, sizeof salt, iterations, hash) != 0) return 0;
+
+    uint64_t now = dbw_now_ms();
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT OR IGNORE INTO users(subject, role, created_at_ms) VALUES(?, ?, ?);", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, subject, (int)sublen, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, u8_to_role(role), -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)now);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+
+    uint64_t uid = 0;
+    sqlite3_prepare_v2(db, "SELECT id FROM users WHERE subject=?;", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, subject, (int)sublen, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) uid = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    if (uid == 0) { sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL); return 0; }
+
+    sqlite3_prepare_v2(db,
+        "INSERT OR IGNORE INTO local_credentials(user_id,salt,iterations,hash,updated_at_ms) "
+        "VALUES(?,?,?,?,?);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    sqlite3_bind_blob(st, 2, salt, sizeof salt, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)iterations);
+    sqlite3_bind_blob(st, 4, hash, sizeof hash, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)now);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    ensure_default_membership(db, uid);
+    return uid;
+}
+
+/* Verify a local username+password against local_credentials, constant-time on
+ * the hash. Returns user id + role on success, 0 otherwise. */
+static uint64_t verify_local(sqlite3 *db, const char *username, size_t ulen,
+                             const char *password, size_t plen, uint8_t *role_out) {
+    char subject[256];
+    size_t sublen = local_subject(subject, sizeof subject, username, ulen);
+    if (sublen == 0) return 0;
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT u.id, u.role, c.salt, c.iterations, c.hash FROM users u "
+        "JOIN local_credentials c ON c.user_id = u.id WHERE u.subject = ?;", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, subject, (int)sublen, SQLITE_TRANSIENT);
+
+    uint64_t uid = 0; uint8_t role = OC_ROLE_MEMBER; int ok = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        uint64_t cand = (uint64_t)sqlite3_column_int64(st, 0);
+        uint8_t  crole = role_to_u8((const char *)sqlite3_column_text(st, 1));
+        const void *salt = sqlite3_column_blob(st, 2);
+        int slen = sqlite3_column_bytes(st, 2);
+        uint32_t iters = (uint32_t)sqlite3_column_int64(st, 3);
+        const void *stored = sqlite3_column_blob(st, 4);
+        int hlen = sqlite3_column_bytes(st, 4);
+        uint8_t derived[OC_PW_HASH_LEN];
+        if (salt && stored && hlen == (int)OC_PW_HASH_LEN &&
+            oc_pw_derive(password, plen, salt, (size_t)slen, iters, derived) == 0 &&
+            oc_ct_eq(derived, stored, OC_PW_HASH_LEN)) {
+            ok = 1; uid = cand; role = crole;
+        }
+    }
+    sqlite3_finalize(st);
+    if (!ok) return 0;
+    if (role_out) *role_out = role;
+    return uid;
+}
+
+/* Mint a session: random 32-byte token to the caller, only its SHA-256 stored
+ * (AUTH.md §4). Returns 0 and fills token/expiry, or -1. */
+static int mint_session(sqlite3 *db, uint64_t user_id,
+                        uint8_t token_out[OC_SESSION_TOKEN_LEN], uint64_t *expiry_out) {
+    uint8_t token[OC_SESSION_TOKEN_LEN], hash[OC_SHA256_LEN];
+    if (oc_rand_bytes(token, sizeof token) != 0) return -1;
+    if (oc_sha256(token, sizeof token, hash) != 0) return -1;
+
+    uint64_t now = dbw_now_ms(), expiry = now + OC_SESSION_TTL_MS;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO sessions(token_hash,user_id,created_at_ms,expires_at_ms,last_seen_ms) "
+        "VALUES(?,?,?,?,?);", -1, &st, NULL);
+    sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)now);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)expiry);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)now);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return -1;
+
+    memcpy(token_out, token, sizeof token);
+    if (expiry_out) *expiry_out = expiry;
+    return 0;
+}
+
+/* Reconnect: hash the presented token, look up a live session, touch last_seen.
+ * Returns user id + role + expiry, or 0 if unknown/expired (AUTH.md §4). */
+static uint64_t lookup_session(sqlite3 *db, const uint8_t *token, size_t tlen,
+                               uint8_t *role_out, uint64_t *expiry_out) {
+    if (tlen != OC_SESSION_TOKEN_LEN) return 0;
+    uint8_t hash[OC_SHA256_LEN];
+    if (oc_sha256(token, tlen, hash) != 0) return 0;
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT s.user_id, s.expires_at_ms, u.role FROM sessions s "
+        "JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?;", -1, &st, NULL);
+    sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
+    uint64_t uid = 0, exp = 0; uint8_t role = OC_ROLE_MEMBER;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        uid  = (uint64_t)sqlite3_column_int64(st, 0);
+        exp  = (uint64_t)sqlite3_column_int64(st, 1);
+        role = role_to_u8((const char *)sqlite3_column_text(st, 2));
+    }
+    sqlite3_finalize(st);
+    if (uid == 0) return 0;
+    if (exp != 0 && dbw_now_ms() >= exp) return 0;   /* expired */
+
+    sqlite3_prepare_v2(db, "UPDATE sessions SET last_seen_ms=? WHERE token_hash=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+    sqlite3_bind_blob(st, 2, hash, sizeof hash, SQLITE_STATIC);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+
+    if (role_out) *role_out = role;
+    if (expiry_out) *expiry_out = exp;
+    return uid;
+}
+
+static oc_dbres *process_register(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    uint64_t uid = register_local(db,
+        j->username ? j->username : "", j->username ? strlen(j->username) : 0,
+        j->password ? j->password : "", j->password ? strlen(j->password) : 0,
+        j->role, j->iterations);
+    if (uid == 0) { r->type = OC_RES_REGISTER_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    r->type = OC_RES_REGISTER_OK;
+    r->user_id = uid;
+    r->role = j->role;
+    return r;
+}
+
+/* Prove identity (local password or an existing session token) and converge on
+ * a daemon-issued session (AUTH.md §4). OIDC arrives in a later milestone. */
 static oc_dbres *process_auth(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
 
-    uint64_t uid = upsert_user(db, j->token ? j->token : "");
-    if (uid == 0) { r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    uint64_t uid = 0, sess_exp = 0;
+    uint8_t role = OC_ROLE_MEMBER;
+    int fresh = 1;   /* mint a new session unless this is a session re-auth */
+
+    if (j->method == OC_AUTH_LOCAL) {
+        oc_slice cred = { (const uint8_t *)j->token, j->token_len };
+        oc_slice user, pass;
+        if (oc_parse_local_credential(cred, &user, &pass) != OC_OK) {
+            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+        }
+        uid = verify_local(db, (const char *)user.ptr, user.len,
+                           (const char *)pass.ptr, pass.len, &role);
+    } else if (j->method == OC_AUTH_SESSION) {
+        uid = lookup_session(db, (const uint8_t *)j->token, j->token_len, &role, &sess_exp);
+        fresh = 0;
+    } else {
+        /* OIDC (method 0x02) is not accepted by this deployment yet. */
+        r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_REQUIRED; return r;
+    }
+
+    if (uid == 0) { r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r; }
     ensure_default_membership(db, uid);
 
     r->type = OC_RES_AUTH_OK;
     r->user_id = uid;
+    r->role = role;
+    if (fresh) {
+        uint8_t token[OC_SESSION_TOKEN_LEN]; uint64_t expiry = 0;
+        if (mint_session(db, uid, token, &expiry) != 0) {
+            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+        }
+        memcpy(r->session_token, token, sizeof token);
+        r->has_session_token = 1;
+        r->session_expiry = expiry;
+    } else {
+        r->has_session_token = 0;   /* no new token on reconnect (PROTOCOL.md §4.3) */
+        r->session_expiry = sess_exp;
+    }
     return r;
 }
 
@@ -319,6 +537,7 @@ static void *writer_loop(void *arg) {
         if (j->type == OC_JOB_AUTH)          r = process_auth(w->db, j);
         else if (j->type == OC_JOB_SEND)     r = process_send(w->db, j);
         else if (j->type == OC_JOB_BACKFILL) r = process_backfill(w->db, j);
+        else if (j->type == OC_JOB_REGISTER) r = process_register(w->db, j);
         job_free(j);
         push_result(w, r);
     }
@@ -343,6 +562,30 @@ oc_dbres *oc_dbwriter_next_result(oc_dbwriter *w) {
 }
 
 int oc_dbwriter_eventfd(oc_dbwriter *w) { return w->evfd; }
+
+/* Setup-time helper: submit a REGISTER job and block for its result. Intended
+ * for bootstrap / test fixtures before the net loop is serving traffic — it
+ * consumes one result from the queue, so it must not race a live consumer. */
+uint64_t oc_dbwriter_register_local(oc_dbwriter *w, const char *username,
+                                    const char *password, uint8_t role,
+                                    uint32_t iterations) {
+    oc_job *j = oc_job_new(OC_JOB_REGISTER, 0);
+    if (!j || oc_job_set_register(j, username, password, role, iterations) != 0) {
+        job_free(j);
+        return 0;
+    }
+    oc_dbwriter_submit(w, j);
+    for (int i = 0; i < 3000; i++) {
+        oc_dbres *r = oc_dbwriter_next_result(w);
+        if (r) {
+            uint64_t uid = (r->type == OC_RES_REGISTER_OK) ? r->user_id : 0;
+            oc_dbres_free(r);
+            return uid;
+        }
+        usleep(1000);
+    }
+    return 0;
+}
 
 /* --- Lifecycle ---------------------------------------------------------- */
 
