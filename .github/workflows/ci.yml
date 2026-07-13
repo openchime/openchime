@@ -70,11 +70,15 @@ jobs:
         run: COMPOSE_PROJECT_NAME=openchime docker compose down -v
 
   client:
-    name: client build (raylib)
+    name: client build (windows / mingw)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      # The client's GUI toolchain (raylib + X11/GL) is isolated in a container
-      # (ARCH-65); building the image compiles + links the client end-to-end.
-      - name: Build client image
-        run: docker build -f Dockerfile.client -t openchime-client-build .
+      # The client is cross-compiled to a Windows .exe with mingw-w64 on Linux
+      # (ARCH-65, openblocks pattern). bzip2 for the mbedTLS tarball.
+      - name: Install mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mingw-w64 bzip2
+      - name: Cross-compile Windows client
+        run: make windows

@@ -36,28 +36,25 @@ make
 Requires a C toolchain and SQLite development headers (`sqlite3.h`,
 `libsqlite3`) on the host.
 
-## Client (raylib)
+## Client (raylib, Windows)
 
-The native client ([docs/CLIENT.md](docs/CLIENT.md)) is a GUI app whose raylib
-build pulls in the X11/GL toolchain, so it builds in a container to keep those
-deps off the host:
-
-```
-docker build -f Dockerfile.client -t openchime-client-build .
-docker create --name c openchime-client-build \
-  && docker cp c:/src/build/openchime-client ./build/ && docker rm c
-```
-
-The container-built binary runs on a desktop/WSLg host (it dynamically links the
-X11/GL runtime). Point it at a running daemon:
+The native client ([docs/CLIENT.md](docs/CLIENT.md)) targets **Windows** this
+iteration, cross-compiled from Linux with mingw-w64 — no Windows machine needed:
 
 ```
-./build/openchime-client 127.0.0.1 8443
+sudo apt-get install mingw-w64   # one-time
+make windows                     # -> build/openchime-client.exe
+```
+
+`make windows` vendors raylib + mbedTLS for Windows and links a standalone,
+statically-linked `.exe`. Run it on Windows against a reachable daemon:
+
+```
+openchime-client.exe <host> <port>
 ```
 
 Phase 1 is a bare skeleton — connect, handshake, stub-auth, and a live message
-list + composer. (If you have the raylib/X11 dev libs on the host already,
-`make client` builds it directly.)
+list + composer. Linux/macOS/wasm/Android/iOS builds follow.
 
 ## Local Docker environment
 

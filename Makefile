@@ -30,15 +30,29 @@ APP_SRC   := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC))
 TEST_SRC  := $(filter-out tests/e2e_client.c,$(wildcard tests/*.c))
 TEST_BIN  := build/tests
 
-# --- Client (raylib GUI; built in a container, see Dockerfile.client) ---------
-RAYLIB_DIR  := third_party/raylib-install
+# --- Client (raylib GUI) ------------------------------------------------------
+# This iteration targets Windows only (cross-compiled with mingw-w64, the
+# openblocks `make windows` pattern — runs on Linux/CI, no Windows machine).
+# Linux/macOS/wasm/Android/iOS are added later. See docs/CLIENT.md.
 CLIENT_SRC  := $(wildcard client/*.c)
-CLIENT_BIN  := build/openchime-client
-# Static raylib pulls in the GL/X11 stack at link time.
-CLIENT_LIBS := $(RAYLIB_DIR)/lib/libraylib.a -lGL -lm -lpthread -ldl -lrt \
-               -lX11 -lXrandr -lXinerama -lXcursor -lXi
 
-.PHONY: all test integration client clean
+MINGW_CC     := x86_64-w64-mingw32-gcc
+RAYLIB_WIN   := third_party/raylib-install-win
+MBEDTLS_WIN  := third_party/mbedtls-3.6.2-win
+RAYLIB_WIN_A := $(RAYLIB_WIN)/lib/libraylib.a
+MBEDTLS_WIN_A := $(MBEDTLS_WIN)/library/libmbedtls.a
+MBEDTLS_WIN_LIBS := $(MBEDTLS_WIN)/library/libmbedtls.a \
+                    $(MBEDTLS_WIN)/library/libmbedx509.a \
+                    $(MBEDTLS_WIN)/library/libmbedcrypto.a
+WIN_BIN      := build/openchime-client.exe
+# -std=gnu99 exposes strdup/getaddrinfo on mingw; _WIN32_WINNT>=0x0600 for WSAPoll.
+WIN_CFLAGS   := -std=gnu99 -Wall -Wextra -O2 -D_WIN32_WINNT=0x0601
+# Static raylib on Windows pulls in the GDI/GL/multimedia libs; the protocol
+# needs winsock; mbedTLS's entropy uses BCryptGenRandom (-lbcrypt); -static makes
+# a standalone .exe (bundles libgcc/winpthread).
+WIN_SYS_LIBS := -lopengl32 -lgdi32 -lwinmm -lws2_32 -lbcrypt
+
+.PHONY: all test integration windows clean
 
 all: $(BIN)
 
@@ -66,11 +80,20 @@ build/e2e_client: tests/e2e_client.c $(SHARED_SRC) $(wildcard shared/*.h) $(MBED
 	$(CC) $(CFLAGS) -O0 -g -Ishared -I$(MBEDTLS_INC) \
 	    tests/e2e_client.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
 
-client: $(CLIENT_BIN)
+# Cross-compile the Windows client (.exe). Vendors raylib + mbedTLS for Windows
+# on demand, then links client/ + shared/ wire code statically.
+windows: $(WIN_BIN)
 
-$(CLIENT_BIN): $(CLIENT_SRC) $(SHARED_SRC) $(wildcard client/*.h shared/*.h) $(MBEDTLS_A) | build
-	$(CC) $(CFLAGS) -Ishared -Iclient -I$(RAYLIB_DIR)/include -I$(MBEDTLS_INC) \
-	    $(CLIENT_SRC) $(SHARED_SRC) $(MBEDTLS_LIBS) $(CLIENT_LIBS) -o $@
+$(WIN_BIN): $(CLIENT_SRC) $(SHARED_SRC) $(wildcard client/*.h shared/*.h) $(RAYLIB_WIN_A) $(MBEDTLS_WIN_A) | build
+	$(MINGW_CC) $(WIN_CFLAGS) -Ishared -Iclient -I$(RAYLIB_WIN)/include -I$(MBEDTLS_WIN)/include \
+	    $(CLIENT_SRC) $(SHARED_SRC) $(RAYLIB_WIN_A) $(MBEDTLS_WIN_LIBS) \
+	    $(WIN_SYS_LIBS) -lpthread -static -o $@
+
+$(RAYLIB_WIN_A):
+	scripts/build_raylib_windows.sh
+
+$(MBEDTLS_WIN_A):
+	scripts/build_mbedtls_windows.sh
 
 build:
 	mkdir -p build

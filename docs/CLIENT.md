@@ -4,12 +4,13 @@ The native client's architecture and how it's built. Cross-referenced from
 ARCHITECTURE.md (ARCH-11/12/13, ARCH-61–ARCH-66) and PROTOCOL.md (the wire flow
 the client drives).
 
-**Status.** Design + Phase 1 skeleton. The daemon has a working core; this is
-the first client. Phase 1 is a Linux raylib skeleton that connects to a running
-daemon, completes the handshake + (stubbed) auth, and shows/sends messages in a
-bare UI — the client-side analogue of the daemon's first end-to-end proof. Later
-phases (real text UI, local cache, reconnect/offline, real auth, cross-platform
-packaging) are a roadmap in §8.
+**Status.** Design + Phase 1 skeleton, **targeting Windows** for this iteration
+(Linux/macOS/wasm/Android/iOS follow). Phase 1 is a raylib skeleton that connects
+to a running daemon, completes the handshake + (stubbed) auth, and shows/sends
+messages in a bare UI — the client-side analogue of the daemon's first end-to-end
+proof, cross-compiled to a Windows `.exe` with mingw-w64. Later phases (real text
+UI, local cache, reconnect/offline, real auth, more platforms) are a roadmap in
+§9.
 
 ---
 
@@ -20,10 +21,12 @@ so the two can't drift on the protocol (the same reason `tests/e2e_client.c`
 reuses `shared/protocol.c`). The tree is split into three concerns:
 
 ```
-shared/   protocol, tls, framebuf    — the wire contract (daemon + client)
+shared/   protocol, tls, framebuf, sock.h  — the wire contract (daemon + client)
 daemon/   dbwriter, netloop, migrate, main
 client/   gfx, ui, app, net, queue, main
 ```
+
+(`shared/sock.h` is the POSIX/Winsock portability shim, §8.)
 
 A separate client repo was rejected: it would need a submodule or a vendored
 copy of the wire code, reintroducing drift risk and cross-repo release
@@ -130,22 +133,34 @@ and are flushed on reconnect with their original idempotency tokens (REQ-102).
 Client-side dedup is the per-channel high-water mark on `message_id` (ARCH-45,
 REQ-091), held in the store.
 
-## 8. Build
+## 8. Build (ARCH-65)
 
-The client is a GUI app whose raylib build pulls in the X11/GL toolchain
-(`libgl1-mesa-dev`, `libx11-dev`, `libxrandr/xinerama/xcursor/xi-dev`,
-`libasound2-dev`), plus cross-compile toolchains later. To keep that off the
-host it builds in a **container**: `Dockerfile.client` (a Debian base) installs
-the toolchain, vendors raylib via `scripts/build_raylib_linux.sh` into
-`third_party/raylib-install/` (the openblocks vendoring pattern) and mbedTLS via
-`scripts/build_mbedtls.sh`, and compiles `client/*.c` + `shared/{protocol,tls,
-framebuf}.c` + raylib + mbedTLS + pthread. The container-built binary dynamically
-links X11/GL, whose runtime is present on a desktop/WSLg host, so it runs on the
-host for GUI verification without a display in the container.
+The client is built the openblocks way — a Makefile target per platform that
+vendors raylib + mbedTLS for that target and compiles `client/*.c` +
+`shared/{protocol,tls,framebuf}.c` directly. **No build container** (a Debian
+one was tried and dropped: it only fits the Linux desktop target and doesn't
+generalize — macOS/iOS can't be containerized, Windows/Android use their own
+toolchains).
+
+**This iteration targets Windows only.** `make windows` cross-compiles a static
+`.exe` with **mingw-w64** on Linux/CI (no Windows machine): it runs
+`scripts/build_raylib_windows.sh` and `scripts/build_mbedtls_windows.sh` (mingw
+cross-builds into separate `third_party/*-win` prefixes), then links
+`client/*.c` + `shared/*` + raylib + mbedTLS + winsock (`-lws2_32`, `-lbcrypt`
+for mbedTLS's `BCryptGenRandom`). Cross-platform builds need a small
+socket-portability shim — `shared/sock.h` abstracts POSIX vs Winsock (would-block
+detection, `close`, non-blocking, a one-shot `poll`, `WSAStartup`) for
+`shared/tls.c`'s BIO callbacks and `client/net.c`, behind `#ifdef _WIN32`; the
+Linux daemon is unaffected. (The `.exe` is currently a console subsystem for
+easy stderr logs; `-mwindows` for a console-less GUI is a later polish.)
+
+Linux/macOS/wasm/Android/iOS targets follow, each with its own vendoring script +
+Makefile target (openblocks' per-platform pattern). Release artifacts come from
+CI/CD, never a dev machine.
 
 ## 9. Phase roadmap
 
-- **Phase 1 (this):** Linux raylib skeleton — connect, handshake, stub-auth,
+- **Phase 1 (this):** Windows raylib skeleton — connect, handshake, stub-auth,
   bare UI (connection status + a channel's live messages + a composer that
   sends), built in the container.
 - **Phase 2 — real UI + text:** HarfBuzz + Unicode line-break message view,

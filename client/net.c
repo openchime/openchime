@@ -8,16 +8,12 @@
 #include "protocol.h"
 #include "tls.h"
 #include "framebuf.h"
+#include "sock.h"       /* POSIX/Winsock shim (also pulls in getaddrinfo) */
 
-#include <errno.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 struct oc_net {
     pthread_t     thread;
@@ -48,6 +44,7 @@ static void gen_idem(uint8_t out[OC_IDEM_SIZE]) {
 }
 
 static int dial(const char *host, int port) {
+    oc_sock_startup();
     char portstr[16];
     snprintf(portstr, sizeof portstr, "%d", port);
     struct addrinfo hints, *res = NULL;
@@ -57,24 +54,18 @@ static int dial(const char *host, int port) {
     if (getaddrinfo(host, portstr, &hints, &res) != 0) return -1;
     int fd = -1;
     for (struct addrinfo *a = res; a; a = a->ai_next) {
-        fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        fd = (int)socket(a->ai_family, a->ai_socktype, a->ai_protocol);
         if (fd < 0) continue;
-        if (connect(fd, a->ai_addr, a->ai_addrlen) == 0) break;
-        close(fd); fd = -1;
+        if (connect(fd, a->ai_addr, (int)a->ai_addrlen) == 0) break;
+        oc_closesock(fd); fd = -1;
     }
     freeaddrinfo(res);
-    if (fd >= 0) {
-        int fl = fcntl(fd, F_GETFL, 0);
-        if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-    }
+    if (fd >= 0) oc_sock_setnonblock(fd);
     return fd;
 }
 
 static void wait_io(int fd, oc_tls_status st, int timeout_ms) {
-    struct pollfd p = { fd, 0, 0 };
-    if (st == OC_TLS_WANT_WRITE) p.events = POLLOUT;
-    else                        p.events = POLLIN;
-    poll(&p, 1, timeout_ms);
+    oc_poll(fd, st == OC_TLS_WANT_WRITE, timeout_ms);
 }
 
 /* Drive a TLS handshake to completion. Returns 0 on success, -1 on error. */
@@ -171,7 +162,7 @@ static void *net_thread(void *arg) {
     /* Phase 1 TOFU: trust the presented cert (pin=NULL); persisting/pinning the
      * fingerprint arrives with the client store phase. */
     if (oc_tls_client_init(&cli, NULL) != 0 || oc_tls_conn_init(&conn, &cli.conf, fd) != 0) {
-        close(fd); push_err(n->to_ui, "tls init failed"); push_simple(n->to_ui, OC_EV_DISCONNECTED, 0); return NULL;
+        oc_closesock(fd); push_err(n->to_ui, "tls init failed"); push_simple(n->to_ui, OC_EV_DISCONNECTED, 0); return NULL;
     }
     oc_framebuf_init(&fb);
 
@@ -220,9 +211,7 @@ static void *net_thread(void *arg) {
             oc_cmd_free(c);
         }
 
-        struct pollfd pf = { fd, POLLIN, 0 };
-        int pr = poll(&pf, 1, 50);
-        if (pr > 0 && (pf.revents & (POLLIN | POLLHUP | POLLERR))) {
+        if (oc_poll(fd, 0, 50) > 0) {
             uint8_t buf[4096]; size_t rn = 0;
             oc_tls_status st = oc_tls_read(&conn, buf, sizeof buf, &rn);
             if (st == OC_TLS_OK) {
@@ -238,7 +227,7 @@ drop:
     oc_framebuf_free(&fb);
     oc_tls_conn_free(&conn);
     oc_tls_client_free(&cli);
-    close(fd);
+    oc_closesock(fd);
     return NULL;
 }
 

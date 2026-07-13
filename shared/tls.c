@@ -4,11 +4,10 @@
 
 #include "tls.h"
 #include "protocol.h"   /* OC_ALPN_PROTO */
+#include "sock.h"       /* POSIX/Winsock shim for the BIO callbacks */
 
-#include <errno.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/socket.h>
 
 #include <mbedtls/error.h>
 #include <mbedtls/net_sockets.h>
@@ -19,22 +18,22 @@
 
 static int bio_send(void *ctx, const unsigned char *buf, size_t len) {
     int fd = *(int *)ctx;
-    ssize_t n = send(fd, buf, len, 0);
-    if (n >= 0) return (int)n;
-    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-        return MBEDTLS_ERR_SSL_WANT_WRITE;
+    /* send() takes (const char *, int) on Winsock and (const void *, size_t) on
+     * POSIX; our frames are well under INT_MAX so the casts are safe on both. */
+    int n = (int)send(fd, (const char *)buf, (int)len, 0);
+    if (n >= 0) return n;
+    if (oc_sock_wouldblock()) return MBEDTLS_ERR_SSL_WANT_WRITE;
     return MBEDTLS_ERR_NET_SEND_FAILED;
 }
 
 static int bio_recv(void *ctx, unsigned char *buf, size_t len) {
     int fd = *(int *)ctx;
-    ssize_t n = recv(fd, buf, len, 0);
-    if (n > 0) return (int)n;
+    int n = (int)recv(fd, (char *)buf, (int)len, 0);
+    if (n > 0) return n;
     /* A recv() of 0 is EOF. Returning 0 to mbedTLS would spin its input loop
      * forever (it keeps asking for the same bytes), so surface a real error. */
     if (n == 0) return MBEDTLS_ERR_NET_CONN_RESET;
-    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-        return MBEDTLS_ERR_SSL_WANT_READ;
+    if (oc_sock_wouldblock()) return MBEDTLS_ERR_SSL_WANT_READ;
     return MBEDTLS_ERR_NET_RECV_FAILED;
 }
 
