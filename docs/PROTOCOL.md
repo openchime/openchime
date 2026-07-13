@@ -16,7 +16,7 @@ revisions of this document, reusing the framing and encoding rules defined
 below. New message types are additive; the header format and the frozen
 handshake frames (§3) do not change.
 
-**Status.** Specification, not yet implemented. `src/main.c` today is the
+**Status.** Specification, not yet implemented. `daemon/main.c` today is the
 placeholder daemon (heartbeat + `/healthz`); none of the frames below exist in
 code yet.
 

@@ -47,11 +47,11 @@ matches the pin. After the handshake, `oc_tls_handshake` inspects
 set and the connection is rejected. A **server** connection performs no peer
 verification, so its result is exactly `BADCERT_SKIP_VERIFY`, which is masked off
 — everything else is a real failure. (Both of these were live bugs found while
-building `src/tls.c`; the test guards against regressions.)
+building `shared/tls.c`; the test guards against regressions.)
 
 ## Non-blocking integration
 
-`src/tls.c` is written for the epoll event loop (ARCH-22): custom BIO callbacks
+`shared/tls.c` is written for the epoll event loop (ARCH-22): custom BIO callbacks
 translate socket `EAGAIN` into `MBEDTLS_ERR_SSL_WANT_READ/WRITE`, and
 `oc_tls_handshake` / `oc_tls_read` / `oc_tls_write` surface those as
 `OC_TLS_WANT_READ` / `OC_TLS_WANT_WRITE` for the caller to re-arm epoll interest.

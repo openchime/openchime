@@ -7,7 +7,7 @@ SCHEMA.md (migration 0002).
 
 **Status.** Design. As of this writing authentication is **stubbed** — the
 daemon accepts any token string as a user subject (`process_auth` in
-`src/dbwriter.c`) so the messaging vertical could be built. This document
+`daemon/dbwriter.c`) so the messaging vertical could be built. This document
 defines the real design that replaces the stub; the implementation is a
 follow-on milestone.
 

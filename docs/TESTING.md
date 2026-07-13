@@ -6,7 +6,7 @@ with the sibling C project openblocks, whose hand-rolled test convention this
 mirrors.
 
 **Status.** Strategy defined before implementation. As of this writing the
-only code is the placeholder daemon (`src/main.c`); the unit tier below has no
+only code is the placeholder daemon (`daemon/main.c`); the unit tier below has no
 tests yet, and the integration tier exercises the placeholder's
 build → replicate → restore pipeline (ARCH-35–39). Both tiers grow as the real
 daemon lands, starting with the frame codec.
@@ -67,7 +67,7 @@ order" belongs in integration.
   test: build/test_protocol
   	./build/test_protocol
 
-  build/test_protocol: tests/test_protocol.c src/protocol.c src/protocol.h | build
+  build/test_protocol: tests/test_protocol.c shared/protocol.c shared/protocol.h | build
   	$(CC) $(CFLAGS) -O0 -g -Isrc tests/test_protocol.c -o $@
   ```
 
@@ -132,7 +132,7 @@ Unit tests must be reproducible and independent of wall-clock or environment:
 ### 3.1 A C test client that reuses `protocol.c`
 
 Integration tests drive the daemon with a small in-repo **C test client that
-links the same `src/protocol.c` the daemon uses** — not a re-implementation of
+links the same `shared/protocol.c` the daemon uses** — not a re-implementation of
 the wire format in another language. This is a deliberate choice: a second
 protocol implementation (e.g. a Python harness) would be free to silently drift
 from the C encoder, so a bug that affects both in the same way would pass. One
@@ -147,7 +147,7 @@ frames: `HELLO`/`WELCOME`, `AUTH`, `SEND`/`SEND_ACK`/`BROADCAST`/`CLIENT_ACK`,
 **Client-side TLS (settled).** The wire protocol runs over TLS with TOFU
 pinning (ARCH-10, REQ-180); there is no plaintext fallback. The TLS library is
 mbedTLS (ARCH-51, [TLS.md](./TLS.md)), used by both the daemon and the test
-client; `src/tls.c` already provides a TOFU-pinning client, so socket-level
+client; `shared/tls.c` already provides a TOFU-pinning client, so socket-level
 integration scenarios are no longer gated. `tests/itest_tls.c` exercises the
 handshake + pinning end-to-end today.
 

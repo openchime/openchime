@@ -7,7 +7,8 @@ RUN apk add --no-cache build-base sqlite-dev bash curl tar bzip2
 WORKDIR /src
 COPY Makefile .
 COPY scripts ./scripts
-COPY src ./src
+COPY shared ./shared
+COPY daemon ./daemon
 RUN make
 
 FROM alpine:3.20 AS litestream

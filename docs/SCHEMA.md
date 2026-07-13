@@ -18,7 +18,7 @@ requirement is settled.
 ## 1. The migration mechanism (ARCH-27)
 
 - Migrations are an ordered, embedded C array (`OC_MIGRATIONS` in
-  `src/migrate.c`): `{ version, sql }`, versions strictly increasing from 1.
+  `daemon/migrate.c`): `{ version, sql }`, versions strictly increasing from 1.
 - On startup the daemon calls `oc_migrate_default(db, …)`, which:
   1. ensures a `schema_version` table exists;
   2. reads the highest applied version;

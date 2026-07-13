@@ -3,10 +3,13 @@ CFLAGS ?= -std=c99 -D_GNU_SOURCE -Wall -Wextra -O2
 LDFLAGS ?= -lsqlite3 -lpthread
 
 BIN := openchimed
-# The daemon links every module; each .c is a separate TU (the tests instead
-# #include them directly, openblocks-style).
-SRC := src/main.c src/protocol.c src/migrate.c src/framebuf.c \
-       src/dbwriter.c src/tls.c src/netloop.c
+
+# The tree is split into three concerns: shared/ is the wire contract (linked by
+# both the daemon and the client), daemon/ is the server, client/ is the app.
+SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c
+DAEMON_SRC := daemon/main.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c
+SRC        := $(SHARED_SRC) $(DAEMON_SRC)
+HDRS       := $(wildcard shared/*.h daemon/*.h)
 
 # Vendored, pinned mbedTLS (scripts/build_mbedtls.sh) — one version across
 # local/CI/Docker. Link order matters for static archives: tls -> x509 -> crypto.
@@ -17,9 +20,11 @@ MBEDTLS_LIBS := $(MBEDTLS_DIR)/library/libmbedtls.a \
                 $(MBEDTLS_DIR)/library/libmbedx509.a \
                 $(MBEDTLS_DIR)/library/libmbedcrypto.a
 
+INC := -Ishared -Idaemon -I$(MBEDTLS_INC)
+
 # Every source except the daemon entry point; the test binary links these and
 # calls their public APIs (no per-test binaries, no unity #include of .c).
-APP_SRC   := $(filter-out src/main.c,$(SRC))
+APP_SRC   := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC))
 # e2e_client is a standalone black-box tool (its own main), not part of the
 # single in-process test binary.
 TEST_SRC  := $(filter-out tests/e2e_client.c,$(wildcard tests/*.c))
@@ -29,8 +34,8 @@ TEST_BIN  := build/tests
 
 all: $(BIN)
 
-$(BIN): $(SRC) $(MBEDTLS_A) $(wildcard src/*.h)
-	$(CC) $(CFLAGS) -I$(MBEDTLS_INC) -o $@ $(SRC) $(MBEDTLS_LIBS) $(LDFLAGS)
+$(BIN): $(SRC) $(MBEDTLS_A) $(HDRS)
+	$(CC) $(CFLAGS) $(INC) -o $@ $(SRC) $(MBEDTLS_LIBS) $(LDFLAGS)
 
 $(MBEDTLS_A):
 	scripts/build_mbedtls.sh
@@ -40,18 +45,18 @@ $(MBEDTLS_A):
 test: $(TEST_BIN)
 	./$(TEST_BIN)
 
-$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(wildcard src/*.h) $(wildcard tests/*.h) $(MBEDTLS_A) | build
-	$(CC) $(CFLAGS) -O0 -g -Isrc -Itests -I$(MBEDTLS_INC) \
+$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(HDRS) $(wildcard tests/*.h) $(MBEDTLS_A) | build
+	$(CC) $(CFLAGS) -O0 -g $(INC) -Itests \
 	    $(TEST_SRC) $(APP_SRC) $(MBEDTLS_LIBS) -lsqlite3 -lpthread -o $@
 
 # Black-box end-to-end integration against the containerized daemon (compose).
 integration: build/e2e_client
 	Scripts/test-integration.sh
 
-# The e2e client links only the protocol + TLS modules (no daemon internals).
-build/e2e_client: tests/e2e_client.c src/protocol.c src/framebuf.c src/tls.c $(wildcard src/*.h) $(MBEDTLS_A) | build
-	$(CC) $(CFLAGS) -O0 -g -Isrc -I$(MBEDTLS_INC) \
-	    tests/e2e_client.c src/protocol.c src/framebuf.c src/tls.c $(MBEDTLS_LIBS) -o $@
+# The e2e client links only the shared wire modules (no daemon internals).
+build/e2e_client: tests/e2e_client.c $(SHARED_SRC) $(wildcard shared/*.h) $(MBEDTLS_A) | build
+	$(CC) $(CFLAGS) -O0 -g -Ishared -I$(MBEDTLS_INC) \
+	    tests/e2e_client.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
 
 build:
 	mkdir -p build
@@ -59,3 +64,6 @@ build:
 clean:
 	rm -f $(BIN)
 	rm -rf build
+
+# The client is a GUI app (raylib) built in a container so the X11/GL toolchain
+# stays off the host — see Dockerfile.client and docs/CLIENT.md.
