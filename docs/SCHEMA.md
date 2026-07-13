@@ -125,9 +125,6 @@ window at runtime (target 24h, ARCH-44) — pruning is a delete job, not schema.
 
 ## 3. Migration 0002 — authentication, sessions, roles
 
-*Design for the next migration — not yet in `OC_MIGRATIONS` (which currently
-holds only `{1}`); it lands with the auth-core implementation milestone.*
-
 Adds the tables the real auth design ([AUTH.md](./AUTH.md), ARCH-55–60) needs,
 and extends `users`. Appended as `MIGRATION_0002` + a `{ 2, ... }` entry in
 `OC_MIGRATIONS` — the runner is unchanged (§1). `users` gains columns via

@@ -56,8 +56,43 @@ static const char MIGRATION_0001[] =
     "  PRIMARY KEY (channel_id, idempotency_token)"
     ");";
 
+/* 0002: authentication data model (docs/AUTH.md, SCHEMA.md §3, ARCH-58/59/60).
+ * Adds sessions, local passwords, invites, and a role/avatar on users. */
+static const char MIGRATION_0002[] =
+    "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'member' "
+    "  CHECK (role IN ('owner','admin','member'));"        /* tenant role (ARCH-60) */
+    "ALTER TABLE users ADD COLUMN avatar_key TEXT;"        /* object-storage key (ARCH-17) */
+
+    "CREATE TABLE sessions ("                              /* daemon-issued sessions (ARCH-58) */
+    "  id            INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  token_hash    BLOB NOT NULL UNIQUE,"                /* SHA-256 of the 32-byte token */
+    "  user_id       INTEGER NOT NULL REFERENCES users(id),"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  expires_at_ms INTEGER NOT NULL,"                    /* daemon-set lifetime (REQ-181) */
+    "  last_seen_ms  INTEGER,"
+    "  device_label  TEXT"
+    ");"
+    "CREATE INDEX idx_sessions_user ON sessions(user_id);"
+
+    "CREATE TABLE local_credentials ("                     /* local-mode passwords (ARCH-59) */
+    "  user_id       INTEGER PRIMARY KEY REFERENCES users(id),"
+    "  salt          BLOB NOT NULL,"
+    "  iterations    INTEGER NOT NULL,"                    /* PBKDF2 count (raisable) */
+    "  hash          BLOB NOT NULL,"                       /* derived key; never a plaintext pw */
+    "  updated_at_ms INTEGER NOT NULL"
+    ");"
+
+    "CREATE TABLE invites ("                               /* local account creation (REQ-033) */
+    "  token_hash     BLOB PRIMARY KEY,"                   /* SHA-256 of the invite token */
+    "  created_by     INTEGER REFERENCES users(id),"
+    "  role           TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('owner','admin','member')),"
+    "  expires_at_ms  INTEGER NOT NULL,"
+    "  consumed_at_ms INTEGER"                             /* null until used; single-use */
+    ");";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
+    { 2, MIGRATION_0002 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 
