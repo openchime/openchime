@@ -87,7 +87,7 @@ windows: $(WIN_BIN)
 $(WIN_BIN): $(CLIENT_SRC) $(SHARED_SRC) $(wildcard client/*.h shared/*.h) $(RAYLIB_WIN_A) $(MBEDTLS_WIN_A) | build
 	$(MINGW_CC) $(WIN_CFLAGS) -Ishared -Iclient -I$(RAYLIB_WIN)/include -I$(MBEDTLS_WIN)/include \
 	    $(CLIENT_SRC) $(SHARED_SRC) $(RAYLIB_WIN_A) $(MBEDTLS_WIN_LIBS) \
-	    $(WIN_SYS_LIBS) -lpthread -static -o $@
+	    $(WIN_SYS_LIBS) -lpthread -static -mwindows -o $@
 
 $(RAYLIB_WIN_A):
 	scripts/build_raylib_windows.sh

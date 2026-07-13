@@ -54,7 +54,16 @@ docker compose rm -f daemon
 docker volume rm openchime_daemon-data
 docker compose up -d daemon
 wait_healthz
-docker compose logs daemon 2>&1 | grep -q "attempting restore from replica" \
+# Poll the logs rather than grepping once: healthz can go green a beat before
+# the restore line is flushed to the log stream (the source of an earlier flake).
+wait_log() {
+  for _ in $(seq 1 30); do
+    docker compose logs daemon 2>&1 | grep -q "$1" && return 0
+    sleep 1
+  done
+  return 1
+}
+wait_log "attempting restore from replica" \
   || { echo "[itest] restore-on-boot log line missing" >&2; docker compose logs daemon; exit 1; }
 echo "[itest] 4/4 restore-on-boot OK"
 
