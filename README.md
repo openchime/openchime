@@ -6,7 +6,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
 core messaging path), [docs/SCHEMA.md](docs/SCHEMA.md) (the SQLite schema and
 migration mechanism), [docs/TLS.md](docs/TLS.md) (the mbedTLS-based transport
 and TOFU trust model), [docs/AUTH.md](docs/AUTH.md) (the two-mode
-authentication design), and [docs/TESTING.md](docs/TESTING.md) (the unit +
+authentication design), [docs/CLIENT.md](docs/CLIENT.md) (the native client
+architecture), and [docs/TESTING.md](docs/TESTING.md) (the unit +
 integration test strategy) for the project's design.
 
 The daemon is an **early skeleton**. It has the real foundations —
@@ -26,7 +27,7 @@ daemon-issued session — is specified in [docs/AUTH.md](docs/AUTH.md) and is th
 next implementation milestone. Channel management is a single auto-provisioned
 default channel for now.
 
-## Local build
+## Local build (daemon)
 
 ```
 make
@@ -34,6 +35,29 @@ make
 
 Requires a C toolchain and SQLite development headers (`sqlite3.h`,
 `libsqlite3`) on the host.
+
+## Client (raylib)
+
+The native client ([docs/CLIENT.md](docs/CLIENT.md)) is a GUI app whose raylib
+build pulls in the X11/GL toolchain, so it builds in a container to keep those
+deps off the host:
+
+```
+docker build -f Dockerfile.client -t openchime-client-build .
+docker create --name c openchime-client-build \
+  && docker cp c:/src/build/openchime-client ./build/ && docker rm c
+```
+
+The container-built binary runs on a desktop/WSLg host (it dynamically links the
+X11/GL runtime). Point it at a running daemon:
+
+```
+./build/openchime-client 127.0.0.1 8443
+```
+
+Phase 1 is a bare skeleton — connect, handshake, stub-auth, and a live message
+list + composer. (If you have the raylib/X11 dev libs on the host already,
+`make client` builds it directly.)
 
 ## Local Docker environment
 

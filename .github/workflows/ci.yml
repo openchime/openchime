@@ -68,3 +68,13 @@ jobs:
       - name: Tear down
         if: always()
         run: COMPOSE_PROJECT_NAME=openchime docker compose down -v
+
+  client:
+    name: client build (raylib)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      # The client's GUI toolchain (raylib + X11/GL) is isolated in a container
+      # (ARCH-65); building the image compiles + links the client end-to-end.
+      - name: Build client image
+        run: docker build -f Dockerfile.client -t openchime-client-build .

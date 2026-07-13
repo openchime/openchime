@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+#
+# OpenChime client build container (ARCH-65). Isolates the raylib GUI toolchain
+# (X11/GL dev libs) off the host. Produces build/openchime-client, which runs on
+# a desktop/WSLg host (it dynamically links the X11/GL runtime present there).
+#
+#   docker build -f Dockerfile.client -t openchime-client-build .
+#   docker create --name c openchime-client-build && \
+#     docker cp c:/src/build/openchime-client ./build/ && docker rm c
+#
+FROM debian:bookworm-slim AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential git curl tar bzip2 ca-certificates \
+      libgl1-mesa-dev libx11-dev libxrandr-dev libxinerama-dev \
+      libxcursor-dev libxi-dev libasound2-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY Makefile .
+COPY scripts ./scripts
+COPY shared ./shared
+COPY client ./client
+
+# Vendor mbedTLS + raylib, then compile the client. Both vendoring scripts write
+# into third_party/ (gitignored); `make client` links shared/ + client/ + both.
+RUN scripts/build_mbedtls.sh \
+ && scripts/build_raylib_linux.sh \
+ && make client
+
+# Build container only — no runtime stage; the binary is extracted and run on a
+# GUI host (see the docker cp recipe above).

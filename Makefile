@@ -30,7 +30,15 @@ APP_SRC   := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC))
 TEST_SRC  := $(filter-out tests/e2e_client.c,$(wildcard tests/*.c))
 TEST_BIN  := build/tests
 
-.PHONY: all test integration clean
+# --- Client (raylib GUI; built in a container, see Dockerfile.client) ---------
+RAYLIB_DIR  := third_party/raylib-install
+CLIENT_SRC  := $(wildcard client/*.c)
+CLIENT_BIN  := build/openchime-client
+# Static raylib pulls in the GL/X11 stack at link time.
+CLIENT_LIBS := $(RAYLIB_DIR)/lib/libraylib.a -lGL -lm -lpthread -ldl -lrt \
+               -lX11 -lXrandr -lXinerama -lXcursor -lXi
+
+.PHONY: all test integration client clean
 
 all: $(BIN)
 
@@ -57,6 +65,12 @@ integration: build/e2e_client
 build/e2e_client: tests/e2e_client.c $(SHARED_SRC) $(wildcard shared/*.h) $(MBEDTLS_A) | build
 	$(CC) $(CFLAGS) -O0 -g -Ishared -I$(MBEDTLS_INC) \
 	    tests/e2e_client.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
+
+client: $(CLIENT_BIN)
+
+$(CLIENT_BIN): $(CLIENT_SRC) $(SHARED_SRC) $(wildcard client/*.h shared/*.h) $(MBEDTLS_A) | build
+	$(CC) $(CFLAGS) -Ishared -Iclient -I$(RAYLIB_DIR)/include -I$(MBEDTLS_INC) \
+	    $(CLIENT_SRC) $(SHARED_SRC) $(MBEDTLS_LIBS) $(CLIENT_LIBS) -o $@
 
 build:
 	mkdir -p build

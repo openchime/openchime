@@ -239,8 +239,10 @@ the requirement says so explicitly rather than implying one.
   `BACKFILL_REQUEST` carrying per-channel `after_message_id` cursors answered
   with replayed messages and a `BACKFILL_DONE` marker (ARCH-46).
 - **REQ-102.** A message composed while the client is disconnected has been
-  queued locally and sent automatically on reconnect, in the order composed,
-  without requiring the user to resend it manually. **[needs ARCH decision]**
+  queued locally in the client's **offline outbox** (a table in its SQLite
+  store, ARCH-64) and sent automatically on reconnect, in the order composed,
+  each with its original idempotency token (REQ-093), without requiring the user
+  to resend it manually.
 
 ### 3.3 Protocol Versioning and Compatibility
 
