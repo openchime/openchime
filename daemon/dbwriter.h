@@ -42,6 +42,7 @@ typedef struct oc_job {
     uint8_t        method;    /* OC_AUTH_LOCAL / OC_AUTH_OIDC / OC_AUTH_SESSION */
     char          *token;     /* heap; the raw credential bytes (method-specific) */
     size_t         token_len; /* credential length (token has a trailing NUL too) */
+    char           source[46];/* peer IP string, for per-source rate limiting ("" if none) */
 
     /* REGISTER (create a local account; AUTH.md §2 — bootstrap / invite) */
     char          *username;  /* heap */

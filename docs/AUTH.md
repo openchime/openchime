@@ -18,11 +18,12 @@ bitset (`local|session` or `oidc|session`). Failed local-auth is **rate-limited
 per account** (REQ-191, `daemon/ratelimit.c`): after a burst of failures the
 account is refused with `AUTH_RATE_LIMITED`, checked before the expensive PBKDF2.
 Role **changes** are enforced in the writer (`SET_ROLE`, `daemon/roles.c`): the
-owner/admin/member policy plus the ≥1-owner invariant (§6). **Remaining:**
-per-source (IP) rate-limiting (needs peer-address plumbing), invite-token account
-creation (§2), a configurable OIDC bootstrap-owner subject, the moderation-delete
-(REQ-032) and invite/remove (REQ-033) operations, and the wire frames that expose
-role management to clients (the enforced ops exist as writer jobs today).
+owner/admin/member policy plus the ≥1-owner invariant (§6). Failed local-auth is
+rate-limited both per account and per source IP (REQ-191). **Remaining:**
+invite-token account creation (§2), a configurable OIDC bootstrap-owner subject,
+the moderation-delete (REQ-032) and invite/remove (REQ-033) operations, and the
+wire frames that expose role management to clients (the enforced ops exist as
+writer jobs today).
 
 ---
 
@@ -75,11 +76,13 @@ authority.
   token**; the invitee sets their password by presenting the token. Email
   magic-link delivery is an optional future enhancement, never required.
 - **Brute-force protection (REQ-191):** the daemon rate-limits failed local-auth
-  attempts and answers excess attempts with `ERROR AUTH_RATE_LIMITED`. Per-account
-  throttling is implemented (`daemon/ratelimit.c`, a fixed-window counter checked
-  before PBKDF2 so a flood can't burn CPU); per-source (IP) throttling is a
-  follow-on that needs the peer address plumbed to the writer. This is why
-  REQ-191 lives with the auth design — it is squarely a local-password concern.
+  attempts per account **and** per source IP (`daemon/ratelimit.c`, fixed-window
+  counters checked before PBKDF2 so a flood can't burn CPU), answering excess
+  attempts with `ERROR AUTH_RATE_LIMITED`. The per-source cap is higher than
+  per-account, so many users behind one NAT are tolerated while an account-spray
+  from a single IP is still stopped; a successful login clears the account
+  counter but not the source counter. This is why REQ-191 lives with the auth
+  design — it is squarely a local-password concern.
 
 ---
 

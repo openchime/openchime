@@ -85,18 +85,29 @@ static uint64_t auth_local(oc_dbwriter *w, uint64_t conn_id, const char *user,
     return uid;
 }
 
-/* Local auth returning the result's reason code (0 on AUTH_OK). */
-static uint16_t auth_local_code(oc_dbwriter *w, uint64_t conn_id, const char *user, const char *pass) {
+/* Local auth from `source` (NULL = none), returning the reason code (0 on OK). */
+static uint16_t auth_local_from(oc_dbwriter *w, uint64_t conn_id, const char *user,
+                                const char *pass, const char *source) {
     uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
     oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass));
     oc_job *j = oc_job_new(OC_JOB_AUTH, conn_id);
     j->method = OC_AUTH_LOCAL;
+    if (source) {
+        size_t n = strlen(source);
+        if (n >= sizeof j->source) n = sizeof j->source - 1;
+        memcpy(j->source, source, n);
+        j->source[n] = '\0';
+    }
     oc_job_set_token(j, cbuf, cw.len);
     oc_dbwriter_submit(w, j);
     oc_dbres *r = wait_result(w);
     uint16_t code = (r && r->type == OC_RES_AUTH_OK) ? 0 : (r ? r->err_code : 0xFFFF);
     oc_dbres_free(r);
     return code;
+}
+
+static uint16_t auth_local_code(oc_dbwriter *w, uint64_t conn_id, const char *user, const char *pass) {
+    return auth_local_from(w, conn_id, user, pass, NULL);
 }
 
 /* Reconnect with a previously minted session token. */
@@ -367,6 +378,34 @@ static void test_auth_rate_limit(void) {
     cleanup_db(path);
 }
 
+/* Per-source throttling: an account-spray from one IP is stopped even though no
+ * single account trips the per-account limit (REQ-191). */
+static void test_source_rate_limit(void) {
+    const char *path = "build/test_dbwriter_srcrl.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    CHECK(reg(w, "target", "right-pw", OC_ROLE_MEMBER) != 0);
+
+    /* 20 failures (OC_AUTH_SOURCE_MAX_FAILURES) from one IP, each against a
+     * distinct username so the per-account limiter never trips. */
+    for (int i = 0; i < 20; i++) {
+        char u[32];
+        snprintf(u, sizeof u, "spray%d", i);
+        CHECK(auth_local_from(w, 60, u, "x", "203.0.113.9") == OC_ERR_AUTH_INVALID_TOKEN);
+    }
+
+    /* The IP is now throttled — even a correct login from it is refused. */
+    CHECK(auth_local_from(w, 60, "target", "right-pw", "203.0.113.9") == OC_ERR_AUTH_RATE_LIMITED);
+
+    /* The same account from a different IP still succeeds. */
+    CHECK(auth_local_from(w, 61, "target", "right-pw", "198.51.100.7") == 0);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* Submit a SET_ROLE job (actor changes target's role); returns the result's
  * reason code (0 on OC_RES_SETROLE_OK). */
 static uint16_t set_role(oc_dbwriter *w, uint64_t actor, uint64_t target, uint8_t next) {
@@ -426,6 +465,7 @@ int run_dbwriter_tests(void) {
     test_auth_and_send();
     test_oidc_auth();
     test_auth_rate_limit();
+    test_source_rate_limit();
     test_role_enforcement();
     test_backfill();
     return failures;

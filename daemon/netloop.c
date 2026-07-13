@@ -32,6 +32,7 @@ typedef struct {
     int          did_hello;
     int          authed;
     uint64_t     user_id;
+    char         source[46]; /* peer IP string, for per-source rate limiting */
     uint8_t     *out;       /* growable pending-output buffer */
     size_t       out_cap, out_len, out_sent;
     uint32_t     events;    /* current epoll interest */
@@ -213,6 +214,7 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
                 oc_job *j = oc_job_new(OC_JOB_AUTH, c->conn_id);
                 if (!j) return -1;
                 j->method = a.method;
+                memcpy(j->source, c->source, sizeof j->source);
                 if (oc_job_set_token(j, a.credential.ptr, a.credential.len) != 0) return -1;
                 oc_dbwriter_submit(dbw, j);
                 continue;
@@ -416,7 +418,9 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
 
             if (fd == lfd) {
                 for (;;) {
-                    int cfd = accept(lfd, NULL, NULL);
+                    struct sockaddr_storage ss;
+                    socklen_t sl = sizeof ss;
+                    int cfd = accept(lfd, (struct sockaddr *)&ss, &sl);
                     if (cfd < 0) break;
                     if (cfd >= OC_NETLOOP_MAX_FD || set_nonblock(cfd) < 0) { close(cfd); continue; }
                     conn *c = calloc(1, sizeof *c);
@@ -427,6 +431,14 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                         continue;
                     }
                     c->fd = cfd;
+                    /* Record the peer IP for per-source auth rate limiting (REQ-191). */
+                    if (ss.ss_family == AF_INET) {
+                        inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr,
+                                  c->source, sizeof c->source);
+                    } else if (ss.ss_family == AF_INET6) {
+                        inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&ss)->sin6_addr,
+                                  c->source, sizeof c->source);
+                    }
                     c->conn_id = g_next_conn_id++;
                     c->state = CONN_HANDSHAKE;
                     conns[cfd] = c;
