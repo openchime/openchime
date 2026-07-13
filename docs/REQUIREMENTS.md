@@ -71,25 +71,44 @@ the requirement says so explicitly rather than implying one.
 
 ### 1.2 Authentication
 
-- **REQ-020.** The system has authenticated a user via a client-driven
-  browser flow using platform-native auth session APIs — `ASWebAuthenticationSession`
-  on iOS/macOS, a loopback redirect on desktop — with PKCE (ARCH-19).
+- **REQ-020.** The system has authenticated a user in one of two deployment-selected
+  modes (ARCH-19, ARCH-55, [AUTH.md](./AUTH.md)): **local** (daemon-managed
+  username+password) or **OIDC** (social login via the maintainer's central
+  service). In OIDC mode the login has been a client-driven browser flow using
+  platform-native auth session APIs — `ASWebAuthenticationSession` on iOS/macOS,
+  a loopback redirect on desktop — with PKCE. The daemon has advertised its mode
+  to the client before authentication.
 - **REQ-021.** The system has supported OIDC login against Microsoft Entra
-  ID and Google Workspace as identity providers.
+  ID and Google Workspace as identity providers. Provider integration has lived
+  in the central service (ARCH-56), not the daemon.
 - **REQ-022.** The system has supported Apple Sign-In, required for iOS App
   Store compliance for any app offering third-party login. The system has
-  not supported Facebook login.
-- **REQ-023.** The daemon has validated a returned JWT against the issuing
-  provider's published JWKS on every session establishment, and has rejected
-  a connection outright on signature, audience, or expiry mismatch, without
-  attempting partial trust of an unverified token (ARCH-19).
+  not supported Facebook login. (Also brokered by the central service.)
+- **REQ-023.** The daemon has established a session only against a verified
+  credential appropriate to its mode, rejecting a connection outright on any
+  mismatch without partial trust (ARCH-19): in **OIDC mode** a compact identity
+  token re-issued by the central service, verified by ECDSA-P256 signature
+  against a pinned public key plus audience and expiry checks (ARCH-56/57) — the
+  daemon has not validated raw provider JWTs or fetched JWKS itself; in **local
+  mode** a username+password checked against the stored PBKDF2 hash (ARCH-59).
+- **REQ-024.** In local mode the daemon has managed accounts itself: passwords
+  hashed with PBKDF2-HMAC-SHA256 and never stored in the clear, the first owner
+  bootstrapped from a one-time setup token, further users created by invite
+  token, and repeated failed attempts rate-limited (ARCH-59). This mode has
+  required no external identity provider and has functioned air-gapped.
+- **REQ-025.** In OIDC mode the maintainer's central service has held the
+  provider app credentials and re-issued an instance-scoped identity token that
+  the daemon trusts; self-hosted deployments have reached it through a relay so
+  their users get social login without registering provider apps, and the client
+  (not the central service) has carried the token to the daemon (ARCH-56).
 
 ### 1.3 Authorization and Roles
 
 - **REQ-030.** Every user in a tenant has held exactly one tenant-level role
-  at a time: **owner**, **admin**, or **member**. A tenant has had at least
-  one owner at all times; the system has refused an action that would remove
-  the last owner. **[needs ARCH decision — role storage/enforcement point]**
+  at a time: **owner**, **admin**, or **member**, stored as a `role` column on
+  `users` and enforced in the DB-writer handlers (ARCH-60). A tenant has had at
+  least one owner at all times; the system has refused an action that would
+  remove or demote the last owner.
 - **REQ-031.** Channel membership has been independent of tenant role: a
   member has belonged to zero or more channels, and only channel members
   have been able to read or post in a channel that is not public. Membership
@@ -99,11 +118,12 @@ the requirement says so explicitly rather than implying one.
   messages, with one exception: a tenant admin or owner has been able to
   delete (not edit) any message in a channel they belong to, for moderation
   purposes. Deletion by a non-author has been distinguishable in the message
-  record from self-deletion (REQ-052). **[needs ARCH decision]**
+  record from self-deletion via the `messages.deleted_by` column (REQ-052), with
+  the admin/owner gate enforced in the delete handler (ARCH-60).
 - **REQ-033.** Only an owner or admin has been able to invite or remove a
   member from the tenant. Channel-level invite/remove for private channels
   has been available to any existing member of that channel, not gated to
-  admins. **[needs ARCH decision]**
+  admins. Both gates have been enforced in the DB-writer handlers (ARCH-60).
 
 ### 1.4 Multi-Tenant Data Isolation
 
@@ -113,15 +133,20 @@ the requirement says so explicitly rather than implying one.
   shared connection or shared query surface (ARCH-4, ARCH-7). Isolation has
   therefore been a property of the deployment topology, not of a
   tenant-ID filter inside shared queries.
-- **REQ-041.** No shared, always-on runtime component has existed across
-  tenants at all. Instance resolution has been plain DNS (REQ-010, ARCH-14),
-  so the name-to-daemon-address mapping has lived in DNS records — provisioned
-  at tenant creation — rather than in a bespoke hosted resolution service. The
-  only cross-tenant surfaces have therefore been static (DNS, and for the
-  hosted tier the tenant-provisioning step that writes those records), holding
-  no message, channel, or user content and running no request-serving process.
-  This strengthens REQ-040's isolation guarantee: there is no shared query
-  surface *and* no shared runtime service to isolate.
+- **REQ-041.** No shared, always-on runtime component has existed in the
+  message/data path across tenants. Instance resolution has been plain DNS
+  (REQ-010, ARCH-14), so the name-to-daemon-address mapping has lived in DNS
+  records — provisioned at tenant creation — rather than in a bespoke hosted
+  resolution service. The cross-tenant surfaces touching data have therefore been
+  static (DNS, and for the hosted tier the tenant-provisioning step that writes
+  those records), holding no message, channel, or user content and running no
+  request-serving process in the message path — which strengthens REQ-040's
+  isolation guarantee. **The one shared runtime component has been the central
+  OIDC service (ARCH-56), and only in OIDC mode:** it is contacted at *login
+  time* only (never per-message), brokers *identity* only (it never sees message
+  or channel content), and is absent entirely in local mode. So multi-tenant
+  *data* isolation has been unconditional; the only shared dependency has been a
+  login-time identity broker, present only where a deployment opts into OIDC.
 
 ---
 
@@ -316,15 +341,17 @@ the requirement says so explicitly rather than implying one.
 
 - **REQ-180.** Every client-daemon connection has been encrypted in transit;
   the system has offered no unencrypted TCP fallback (ARCH-6, ARCH-10).
-- **REQ-181.** A session established from a validated JWT (REQ-023) has
-  remained valid only until that JWT's expiry; the daemon has not
-  independently extended a session past the token's stated expiry.
+- **REQ-181.** A session has been the daemon's own to control: after a
+  successful auth (REQ-023) the daemon has minted an opaque session token with a
+  daemon-set expiry, recorded in a local `sessions` table (ARCH-58), rather than
+  binding the session lifetime to an external provider token's expiry. The
+  daemon has not extended a session past its recorded expiry.
 - **REQ-182.** A user has been able to revoke an active session (e.g. "log
-  out other devices") from any authenticated client, and the daemon has
-  terminated the targeted connection on the next protocol interaction after
-  revocation. **[needs ARCH decision — revocation propagation mechanism,
-  since sessions are validated against provider JWKS rather than a local
-  session table]**
+  out other devices") from any authenticated client; the daemon has deleted the
+  targeted `sessions` row and terminated the targeted connection on its next
+  protocol interaction (ARCH-58). Because sessions are validated against the
+  daemon's own local session table — not against a stateless provider token —
+  revocation is an immediate row delete.
 - **REQ-183.** Certificate trust for the client-daemon connection has been
   established via TOFU (trust-on-first-connect) pinning against a
   self-signed certificate the daemon generates on first run, not CA-chain
@@ -339,9 +366,12 @@ the requirement says so explicitly rather than implying one.
   per-connection, rejecting excess sends with a distinct error rather than
   silently dropping them. **[needs ARCH decision — limit values and
   algorithm]**
-- **REQ-191.** The daemon has rate-limited authentication attempts per
-  tenant to blunt credential-stuffing and brute-force attempts against the
-  JWT validation path (REQ-023). **[needs ARCH decision]**
+- **REQ-191.** The daemon has rate-limited failed authentication attempts,
+  per account and per source, to blunt credential-stuffing and brute-force
+  against local-mode passwords, answering excess attempts with
+  `AUTH_RATE_LIMITED` (ARCH-59). (OIDC-mode credential checking is a signature
+  verification against a pinned key, not a guessable secret, so the local-auth
+  path is the meaningful target.)
 
 ---
 

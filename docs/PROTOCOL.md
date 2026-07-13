@@ -182,7 +182,7 @@ frames in **both** directions use `chosen_version`.
 | `chosen_version` | u16  | The version both sides will use for the rest of the session. |
 | `server_time`    | u64  | Server wall-clock time, ms since Unix epoch UTC (§7), so the client can estimate clock skew. |
 
-After `WELCOME`, the server expects `AUTH` (§4) as the next client frame.
+After `WELCOME`, the server sends `AUTH_CHALLENGE` and expects `AUTH` (§4) next.
 
 ### 3.3 `REJECT` (server → client), msg_type `0x0003`, fatal
 
@@ -216,33 +216,55 @@ Client                                  Server
 
 ---
 
-## 4. Authentication (REQ-020, REQ-023; ARCH-19)
+## 4. Authentication (REQ-020, REQ-023; ARCH-19/55–60)
 
-After `WELCOME`, the client MUST authenticate before sending any messaging
-frame. A messaging frame received before `AUTH_OK` is answered with `ERROR
-AUTH_REQUIRED` (fatal).
+After `WELCOME`, the daemon sends `AUTH_CHALLENGE` advertising the auth method(s)
+it accepts; the client MUST authenticate before sending any messaging frame. A
+messaging frame received before `AUTH_OK` is answered with `ERROR AUTH_REQUIRED`
+(fatal). Full design in [AUTH.md](./AUTH.md).
 
-### 4.1 `AUTH` (client → server), msg_type `0x0010`
+### 4.1 `AUTH_CHALLENGE` (server → client), msg_type `0x0012`
 
-| Field | Type | Notes                                                         |
-|-------|------|---------------------------------------------------------------|
-| `jwt` | str  | The OIDC ID/access token obtained via the browser flow (ARCH-19). Bounded by `MAX_BODY_SIZE`. |
+Sent immediately after `WELCOME`. Advertises the deployment's auth mode (ARCH-55)
+so the client presents the right login UI.
 
-The daemon validates the JWT against the issuing provider's published JWKS —
-signature, audience, and expiry (REQ-023) — and rejects on any mismatch with
-`ERROR AUTH_INVALID_TOKEN` (fatal). Repeated failures are rate-limited per
-tenant (REQ-191) with `ERROR AUTH_RATE_LIMITED` (fatal). Auth token *contents*
-and JWKS caching are out of scope for this document.
+| Field         | Type | Notes                                                          |
+|---------------|------|----------------------------------------------------------------|
+| `methods`     | u8   | Bitset of accepted methods: `0x01` local, `0x02` oidc, `0x04` session (reconnect is always accepted alongside the primary mode). |
+| `oidc_params` | str  | Empty unless `oidc` is offered; otherwise a compact opaque blob the client passes to its OIDC helper (central authorize URL/`client_id`, this instance's `audience`). Ignorable by clients that only reconnect. |
 
-### 4.2 `AUTH_OK` (server → client), msg_type `0x0011`
+### 4.2 `AUTH` (client → server), msg_type `0x0010`
+
+A `method` discriminator selects the credential the payload carries (ARCH-59 for
+`local`, ARCH-56/57 for `oidc`, ARCH-58 for `session`).
+
+| Field        | Type | Notes                                                          |
+|--------------|------|----------------------------------------------------------------|
+| `method`     | u8   | `0x01` local, `0x02` oidc, `0x04` session.                     |
+| `credential` | lstr | Method-specific, bounded by `MAX_BODY_SIZE`: **local** — `username` (str) then `password` (str); **oidc** — the compact central identity token (AUTH.md §3.3); **session** — the 32-byte session token from a prior `AUTH_OK`. |
+
+The daemon verifies per its mode and rejects on any mismatch with a fatal
+`ERROR`: `AUTH_INVALID_TOKEN` (bad/expired/ wrong-audience token or bad
+password), `AUTH_RATE_LIMITED` (too many failed attempts, REQ-191), or
+`AUTH_REQUIRED` (method not offered by this deployment). The daemon never
+validates raw provider JWTs or fetches JWKS — in `oidc` it verifies a compact
+token from the central service against a pinned key (AUTH.md §3).
+
+### 4.3 `AUTH_OK` (server → client), msg_type `0x0011`
+
+On success the daemon mints a session (ARCH-58) and returns:
 
 | Field           | Type | Notes                                                          |
 |-----------------|------|----------------------------------------------------------------|
 | `user_id`       | u64  | The authenticated user's stable tenant-local id.               |
-| `session_expiry`| u64  | Ms since epoch UTC after which this session is invalid; equals the JWT's expiry (REQ-181). The daemon does not extend a session past this. |
+| `role`          | u8   | Tenant role: `0` member, `1` admin, `2` owner (ARCH-60).       |
+| `session_expiry`| u64  | Ms since epoch UTC after which the session is invalid (the daemon's own expiry, REQ-181). |
+| `session_token` | bytes| 32-byte token the client stores and re-presents on reconnect (`AUTH` method `session`). Sent only on a fresh (non-`session`) auth; empty on a `session` re-auth. |
 
 A freshly-authenticated client typically follows `AUTH_OK` with a
-`BACKFILL_REQUEST` (§6) to catch up on anything missed while disconnected.
+`BACKFILL_REQUEST` (§6) to catch up on anything missed while disconnected. To end
+a session (logout / "log out other devices"), the client sends `LOGOUT`
+(reserved, §9); the daemon deletes the session row(s) (REQ-182).
 
 ---
 
@@ -438,8 +460,15 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0001` | `HELLO`            | C → S     | yes       | §3.1    |
 | `0x0002` | `WELCOME`          | S → C     | yes       | §3.2    |
 | `0x0003` | `REJECT`           | S → C     | yes       | §3.3    |
-| `0x0010` | `AUTH`             | C → S     | no        | §4.1    |
-| `0x0011` | `AUTH_OK`          | S → C     | no        | §4.2    |
+| `0x0010` | `AUTH`             | C → S     | no        | §4.2    |
+| `0x0011` | `AUTH_OK`          | S → C     | no        | §4.3    |
+| `0x0012` | `AUTH_CHALLENGE`   | S → C     | no        | §4.1    |
+| `0x0013` | `LOGOUT`           | C → S     | no        | (reserved — session revocation, REQ-182) |
+| `0x0040` | `LIST_USERS`       | C → S     | no        | (reserved — user enumeration) |
+| `0x0041` | `USER_LIST`        | S → C     | no        | (reserved) |
+| `0x0042` | `UPDATE_PROFILE`   | C → S     | no        | (reserved — profile edit) |
+| `0x0043` | `INVITE_USER`      | C → S     | no        | (reserved — REQ-033) |
+| `0x0044` | `REMOVE_USER`      | C → S     | no        | (reserved — REQ-033) |
 | `0x0020` | `SEND`             | C → S     | no        | §5.1    |
 | `0x0021` | `SEND_ACK`         | S → C     | no        | §5.2    |
 | `0x0022` | `BROADCAST`        | S → C     | no        | §5.3    |
@@ -448,9 +477,12 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0031` | `BACKFILL_DONE`    | S → C     | no        | §6.2    |
 | `0x00FF` | `ERROR`            | S → C     | no        | §8.1    |
 
-Ranges are left sparse (`0x0001–` handshake, `0x0010–` auth, `0x0020–`
-messaging, `0x0030–` reconnect, `0x00FF` error) so later revisions can slot in
-presence, typing, reactions, threads, and audio signaling without renumbering.
+Ranges are left sparse (`0x0001–` handshake, `0x0010–` auth/session, `0x0020–`
+messaging, `0x0030–` reconnect, `0x0040–` users/profiles, `0x00FF` error) so
+later revisions can slot in presence, typing, reactions, threads, and audio
+signaling without renumbering. The `0x0013` and `0x0040–0x0044` entries are
+**reserved** — their frame layouts are defined when the corresponding milestone
+(session revocation; user enumeration/profiles/management, AUTH.md §6) lands.
 
 ---
 
@@ -459,9 +491,11 @@ presence, typing, reactions, threads, and audio signaling without renumbering.
 ```
              HELLO
    (new) ─────────────▶ AWAIT_WELCOME
-                             │ WELCOME
+                             │ WELCOME + AUTH_CHALLENGE
                              ▼
-                        AWAIT_AUTH ──── AUTH ───▶ (validate JWT)
+                        AWAIT_AUTH ──── AUTH ───▶ (verify per mode:
+                             │                     local pw / oidc token /
+                             │                     session token)
                              │                        │ ok
                              │ bad/none               ▼
                              ▼                    AUTHENTICATED ◀─┐

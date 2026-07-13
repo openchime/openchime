@@ -177,9 +177,13 @@ real protocol.
 - **Handshake/versioning:** a client advertising an unsupported range gets a
   `REJECT` with the right `VERSION_TOO_OLD`/`VERSION_TOO_NEW` code and a closed
   connection (REQ-110/111).
-- **Auth:** a valid JWT reaches `AUTH_OK`; an invalid one gets
-  `AUTH_INVALID_TOKEN` and is closed (REQ-023). (JWKS is stubbed with a
-  test-issuer keypair; real provider integration is a separate concern.)
+- **Auth (AUTH.md):** *local mode* — a correct username+password reaches
+  `AUTH_OK`, a wrong password gets `AUTH_INVALID_TOKEN` and is rate-limited after
+  repeats; *OIDC mode* — a compact identity token signed by a **test issuer**
+  keypair (standing in for the central service) reaches `AUTH_OK`, and a
+  bad-signature / wrong-audience / expired token is rejected; *session* — a
+  reconnect with a stored session token resumes without re-auth, and a revoked
+  session is refused (REQ-023, REQ-100, REQ-182).
 - **Messaging:** two clients in a channel — a `SEND` from one produces a
   `SEND_ACK` to the sender and a `BROADCAST` to both; ordering within the
   channel matches send order (REQ-092).

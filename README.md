@@ -5,7 +5,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
 [docs/PROTOCOL.md](docs/PROTOCOL.md) (the byte-level wire protocol spec for the
 core messaging path), [docs/SCHEMA.md](docs/SCHEMA.md) (the SQLite schema and
 migration mechanism), [docs/TLS.md](docs/TLS.md) (the mbedTLS-based transport
-and TOFU trust model), and [docs/TESTING.md](docs/TESTING.md) (the unit +
+and TOFU trust model), [docs/AUTH.md](docs/AUTH.md) (the two-mode
+authentication design), and [docs/TESTING.md](docs/TESTING.md) (the unit +
 integration test strategy) for the project's design.
 
 The daemon is an **early skeleton**. It has the real foundations —
@@ -18,10 +19,12 @@ The network loop completes the TLS handshake, negotiates the protocol version
 messaging path — a `SEND` is persisted (with a server-assigned monotonic id and
 idempotent-retry dedup) and delivered to the channel's connected members as a
 `BROADCAST`, with the sender acked; a reconnecting client can `BACKFILL_REQUEST`
-the messages it missed and have them replayed. **Authentication is currently stubbed** (the
-token is accepted and mapped to a user; real OIDC/JWT validation against a
-provider's JWKS is the next milestone), and channel management is a single
-auto-provisioned default channel for now.
+the messages it missed and have them replayed. **Authentication is currently
+stubbed** (any token is accepted and mapped to a user); the real design — two
+modes (local accounts, or OIDC brokered by a central service) converging on a
+daemon-issued session — is specified in [docs/AUTH.md](docs/AUTH.md) and is the
+next implementation milestone. Channel management is a single auto-provisioned
+default channel for now.
 
 ## Local build
 

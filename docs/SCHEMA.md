@@ -6,12 +6,12 @@ arrive as later numbered migrations, never as edits to an existing one.
 
 **Status.** Migration 0001 establishes the foundational tables for the core
 messaging path — the frames the v1 codec already supports (send / broadcast /
-ack / backfill). Roles (REQ-030), reactions (REQ-070), threads (REQ-060),
+ack / backfill). **Migration 0002** (§3) adds the authentication data model
+(sessions, local credentials, invites, and `users` role/avatar) for the two-mode
+auth design ([AUTH.md](./AUTH.md)). Reactions (REQ-070), threads (REQ-060),
 full-text search (REQ-080/FTS5), presence, notification config, and attachments
 are intentionally **not** here yet; each is a future migration once its own
-requirement is settled. What is present is grounded in already-decided
-requirements, so 0001 makes only one genuinely new storage decision (membership,
-REQ-031).
+requirement is settled.
 
 ---
 
@@ -123,16 +123,75 @@ window at runtime (target 24h, ARCH-44) — pruning is a delete job, not schema.
 
 ---
 
-## 3. Deferred to later migrations
+## 3. Migration 0002 — authentication, sessions, roles
+
+*Design for the next migration — not yet in `OC_MIGRATIONS` (which currently
+holds only `{1}`); it lands with the auth-core implementation milestone.*
+
+Adds the tables the real auth design ([AUTH.md](./AUTH.md), ARCH-55–60) needs,
+and extends `users`. Appended as `MIGRATION_0002` + a `{ 2, ... }` entry in
+`OC_MIGRATIONS` — the runner is unchanged (§1). `users` gains columns via
+`ALTER TABLE ADD COLUMN` (SQLite-supported; existing rows default).
+
+### `users` (added columns)
+`subject` remains the unique identity key, namespaced by source
+(`oidc:<issuer>|<sub>` or `local:<username>`, ARCH-19).
+
+| column       | type    | notes                                                     |
+|--------------|---------|-----------------------------------------------------------|
+| `role`       | TEXT    | `NOT NULL DEFAULT 'member' CHECK (role IN ('owner','admin','member'))` — tenant role (ARCH-60, REQ-030). |
+| `avatar_key` | TEXT    | object-storage key for the profile image (ARCH-17); null if none. |
+
+### `sessions`  — daemon-issued sessions (ARCH-58)
+The convergence point of both auth modes. Stores only the **hash** of the
+session token, so a DB leak does not expose live sessions.
+
+| column         | type    | notes                                                  |
+|----------------|---------|--------------------------------------------------------|
+| `id`           | INTEGER | primary key.                                           |
+| `token_hash`   | BLOB    | `NOT NULL UNIQUE` — SHA-256 of the 32-byte session token. |
+| `user_id`      | INTEGER | → `users(id)`.                                         |
+| `created_at_ms`| INTEGER |                                                        |
+| `expires_at_ms`| INTEGER | daemon-set lifetime (REQ-181).                         |
+| `last_seen_ms` | INTEGER | updated on use.                                        |
+| `device_label` | TEXT    | optional, for "log out other devices" (REQ-182).       |
+
+Reconnect hashes the presented token and looks it up here; logout/revoke deletes
+the row(s) (REQ-182).
+
+### `local_credentials`  — local-mode passwords (ARCH-59)
+Only local users have a row. PBKDF2-HMAC-SHA256; never a plaintext password.
+
+| column        | type    | notes                                                   |
+|---------------|---------|---------------------------------------------------------|
+| `user_id`     | INTEGER | primary key, → `users(id)`.                             |
+| `salt`        | BLOB    | per-user random salt.                                   |
+| `iterations`  | INTEGER | PBKDF2 iteration count (recorded so it can be raised).  |
+| `hash`        | BLOB    | the derived key.                                        |
+| `updated_at_ms`| INTEGER |                                                        |
+
+### `invites`  — local-mode account creation (ARCH-59, REQ-033)
+An owner/admin issues an invite; the invitee sets a password by presenting it.
+
+| column        | type    | notes                                                   |
+|---------------|---------|---------------------------------------------------------|
+| `token_hash`  | BLOB    | primary key — SHA-256 of the invite token.              |
+| `created_by`  | INTEGER | → `users(id)`.                                          |
+| `role`        | TEXT    | role the invitee will receive.                          |
+| `expires_at_ms`| INTEGER |                                                        |
+| `consumed_at_ms`| INTEGER | null until used; single-use.                          |
+
+---
+
+## 4. Deferred to later migrations
 
 Tracked here so the omissions are deliberate, not forgotten:
 
-- **Roles** (owner/admin/member) and their enforcement point — REQ-030,
-  REQ-032's authorization half, REQ-033. Still `[needs ARCH decision]`.
 - **Reactions** (REQ-070/071), **threads** (parent linkage, REQ-060/061).
 - **FTS5** full-text index over `messages.body` (REQ-080, ARCH-15).
 - **Presence / typing** (REQ-120/121) — likely in-memory, not schema.
 - **Notification settings** and DND (REQ-130/131).
 - **Attachments** metadata (REQ-140) — object-storage pointers, not blobs.
-- **Sessions / revocation** bookkeeping (REQ-182) if a local session table is
-  needed alongside JWT validation.
+
+(Roles, sessions/revocation, and local credentials — previously deferred — are
+now defined in migration 0002 above.)
