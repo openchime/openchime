@@ -509,6 +509,36 @@ static oc_dbres *process_set_role(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Revoke sessions (REQ-182): the presented token (scope THIS) or all of the
+ * user's sessions (scope ALL). The THIS delete is scoped to the authenticated
+ * user, so a leaked token still can't revoke another user's session. */
+static oc_dbres *process_logout(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->user_id = j->user_id;
+
+    sqlite3_stmt *st = NULL;
+    if (j->scope == OC_LOGOUT_ALL) {
+        sqlite3_prepare_v2(db, "DELETE FROM sessions WHERE user_id=?;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    } else {
+        uint8_t hash[OC_SHA256_LEN];
+        if (j->token_len != OC_SESSION_TOKEN_LEN ||
+            oc_sha256(j->token, j->token_len, hash) != 0) {
+            r->type = OC_RES_LOGOUT_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+        }
+        sqlite3_prepare_v2(db,
+            "DELETE FROM sessions WHERE token_hash=? AND user_id=?;", -1, &st, NULL);
+        sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    }
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    r->type = OC_RES_LOGOUT_OK;
+    return r;
+}
+
 static int is_member(sqlite3 *db, uint64_t channel_id, uint64_t user_id) {
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
@@ -694,6 +724,7 @@ static void *writer_loop(void *arg) {
         else if (j->type == OC_JOB_BACKFILL) r = process_backfill(w->db, j);
         else if (j->type == OC_JOB_REGISTER) r = process_register(w->db, j);
         else if (j->type == OC_JOB_SET_ROLE) r = process_set_role(w->db, j);
+        else if (j->type == OC_JOB_LOGOUT)   r = process_logout(w->db, j);
         job_free(j);
         push_result(w, r);
     }

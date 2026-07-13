@@ -131,6 +131,18 @@ static void test_auth_frames(void) {
         CHECK(out.session_token.len == OC_SESSION_TOKEN_LEN);
         CHECK(memcmp(out.session_token.ptr, token, sizeof token) == 0);
     }
+    {
+        /* LOGOUT — scope + the session token to revoke. */
+        uint8_t token[OC_SESSION_TOKEN_LEN];
+        memset(token, 0x3C, sizeof token);
+        oc_logout in = { OC_LOGOUT_THIS, { token, sizeof token } };
+        ROUNDTRIP(oc_encode_logout(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LOGOUT, h, p);
+        oc_logout out;
+        CHECK(oc_decode_logout(&p, &out) == OC_OK);
+        CHECK(out.scope == OC_LOGOUT_THIS);
+        CHECK(out.session_token.len == OC_SESSION_TOKEN_LEN);
+        CHECK(memcmp(out.session_token.ptr, token, sizeof token) == 0);
+    }
 }
 
 static void test_messaging_frames(void) {

@@ -27,7 +27,7 @@
 /* --- Jobs (net thread -> writer) ---------------------------------------- */
 
 enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 4,
-       OC_JOB_SET_ROLE = 5 };
+       OC_JOB_SET_ROLE = 5, OC_JOB_LOGOUT = 6 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -53,6 +53,10 @@ typedef struct oc_job {
     /* SET_ROLE (change a user's tenant role; ARCH-60). Actor is `user_id`. */
     uint64_t       target_user_id;
 
+    /* LOGOUT (revoke sessions; REQ-182). Actor is `user_id`; the token to revoke
+     * (scope THIS) is carried in `token`/`token_len`. */
+    uint8_t        scope;     /* OC_LOGOUT_THIS / OC_LOGOUT_ALL */
+
     /* SEND */
     uint64_t       channel_id;
     uint8_t        idem[OC_IDEM_LEN];
@@ -69,7 +73,8 @@ typedef struct oc_job {
 enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_SEND_ERR = 4, OC_RES_BACKFILL_OK = 5,
        OC_RES_REGISTER_OK = 6, OC_RES_REGISTER_ERR = 7,
-       OC_RES_SETROLE_OK = 8, OC_RES_SETROLE_ERR = 9 };
+       OC_RES_SETROLE_OK = 8, OC_RES_SETROLE_ERR = 9,
+       OC_RES_LOGOUT_OK = 10, OC_RES_LOGOUT_ERR = 11 };
 
 /* One message to replay on reconnect (rendered as a BROADCAST by the net thread). */
 typedef struct {

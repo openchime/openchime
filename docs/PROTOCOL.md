@@ -262,9 +262,22 @@ On success the daemon mints a session (ARCH-58) and returns:
 | `session_token` | bytes| 32-byte token the client stores and re-presents on reconnect (`AUTH` method `session`). Sent only on a fresh (non-`session`) auth; empty on a `session` re-auth. |
 
 A freshly-authenticated client typically follows `AUTH_OK` with a
-`BACKFILL_REQUEST` (§6) to catch up on anything missed while disconnected. To end
-a session (logout / "log out other devices"), the client sends `LOGOUT`
-(reserved, §9); the daemon deletes the session row(s) (REQ-182).
+`BACKFILL_REQUEST` (§6) to catch up on anything missed while disconnected.
+
+### 4.4 `LOGOUT` (client → server), msg_type `0x0013`
+
+Revokes daemon-issued sessions (REQ-182) — the local revocation a stateless
+provider JWT cannot offer, and the reason the daemon issues its own sessions.
+
+| Field           | Type | Notes                                                          |
+|-----------------|------|----------------------------------------------------------------|
+| `scope`         | u8   | `0` this session only, `1` all of the caller's sessions.       |
+| `session_token` | bytes| The 32-byte token to revoke when `scope=0`; ignored for `scope=1`. |
+
+The daemon deletes the matching `sessions` row(s) — the `scope=0` delete is
+scoped to the authenticated user, so a leaked token still cannot revoke another
+user's session — then closes the connection (the client re-authenticates to
+continue).
 
 ---
 
@@ -465,7 +478,7 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0010` | `AUTH`             | C → S     | no        | §4.2    |
 | `0x0011` | `AUTH_OK`          | S → C     | no        | §4.3    |
 | `0x0012` | `AUTH_CHALLENGE`   | S → C     | no        | §4.1    |
-| `0x0013` | `LOGOUT`           | C → S     | no        | (reserved — session revocation, REQ-182) |
+| `0x0013` | `LOGOUT`           | C → S     | no        | §4.4    |
 | `0x0040` | `LIST_USERS`       | C → S     | no        | (reserved — user enumeration) |
 | `0x0041` | `USER_LIST`        | S → C     | no        | (reserved) |
 | `0x0042` | `UPDATE_PROFILE`   | C → S     | no        | (reserved — profile edit) |
@@ -482,9 +495,9 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 Ranges are left sparse (`0x0001–` handshake, `0x0010–` auth/session, `0x0020–`
 messaging, `0x0030–` reconnect, `0x0040–` users/profiles, `0x00FF` error) so
 later revisions can slot in presence, typing, reactions, threads, and audio
-signaling without renumbering. The `0x0013` and `0x0040–0x0044` entries are
-**reserved** — their frame layouts are defined when the corresponding milestone
-(session revocation; user enumeration/profiles/management, AUTH.md §6) lands.
+signaling without renumbering. The `0x0040–0x0044` entries are **reserved** —
+their frame layouts are defined when the corresponding milestone (user
+enumeration / profiles / management, AUTH.md §6) lands.
 
 ---
 

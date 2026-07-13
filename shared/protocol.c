@@ -259,6 +259,13 @@ oc_result oc_encode_auth_ok(oc_wbuf *w, uint16_t version, const oc_auth_ok *m) {
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_logout(oc_wbuf *w, uint16_t version, const oc_logout *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LOGOUT);
+    oc_w_u8(w, m->scope);
+    oc_w_bytes(w, m->session_token);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_send(oc_wbuf *w, uint16_t version, const oc_send *m) {
     OC_CHECK_BODY(m->body);
     size_t off = oc_frame_begin(w, version, OC_MSG_SEND);
@@ -357,6 +364,12 @@ oc_result oc_decode_auth_ok(oc_rbuf *p, oc_auth_ok *m) {
     m->user_id = oc_r_u64(p);
     m->role = oc_r_u8(p);
     m->session_expiry = oc_r_u64(p);
+    m->session_token = oc_r_bytes(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_logout(oc_rbuf *p, oc_logout *m) {
+    m->scope = oc_r_u8(p);
     m->session_token = oc_r_bytes(p);
     return r_done(p);
 }

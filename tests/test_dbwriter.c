@@ -420,6 +420,56 @@ static uint16_t set_role(oc_dbwriter *w, uint64_t actor, uint64_t target, uint8_
     return code;
 }
 
+/* Revoke sessions via a LOGOUT job; returns the reason code (0 on OK). */
+static uint16_t do_logout(oc_dbwriter *w, uint64_t uid, uint8_t scope, const uint8_t *token) {
+    oc_job *j = oc_job_new(OC_JOB_LOGOUT, 70);
+    j->user_id = uid;
+    j->scope = scope;
+    if (token) oc_job_set_token(j, token, OC_SESSION_TOKEN_LEN);
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    uint16_t code = (r && r->type == OC_RES_LOGOUT_OK) ? 0 : (r ? r->err_code : 0xFFFF);
+    oc_dbres_free(r);
+    return code;
+}
+
+/* Session revocation (REQ-182): LOGOUT scope THIS drops one session, scope ALL
+ * drops them all, and a user cannot revoke another user's session. */
+static void test_logout(void) {
+    const char *path = "build/test_dbwriter_logout.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t uid = reg(w, "victim", "pw", OC_ROLE_MEMBER);
+    uint64_t other = reg(w, "other", "pw", OC_ROLE_MEMBER);
+    CHECK(uid && other);
+
+    /* Two independent sessions for the same user. */
+    uint8_t t1[OC_SESSION_TOKEN_LEN], t2[OC_SESSION_TOKEN_LEN];
+    memset(t1, 0, sizeof t1); memset(t2, 0, sizeof t2);
+    CHECK(auth_local(w, 80, "victim", "pw", t1, NULL) == uid);
+    CHECK(auth_local(w, 81, "victim", "pw", t2, NULL) == uid);
+    CHECK(auth_session(w, 82, t1) == uid);
+    CHECK(auth_session(w, 83, t2) == uid);
+
+    /* Another user cannot revoke victim's session (scoped to the actor). */
+    CHECK(do_logout(w, other, OC_LOGOUT_THIS, t1) == 0);   /* no-op delete */
+    CHECK(auth_session(w, 84, t1) == uid);                 /* still valid */
+
+    /* Scope THIS revokes exactly the presented token. */
+    CHECK(do_logout(w, uid, OC_LOGOUT_THIS, t1) == 0);
+    CHECK(auth_session(w, 85, t1) == 0);                   /* revoked */
+    CHECK(auth_session(w, 86, t2) == uid);                 /* the other survives */
+
+    /* Scope ALL revokes everything the user has. */
+    CHECK(do_logout(w, uid, OC_LOGOUT_ALL, NULL) == 0);
+    CHECK(auth_session(w, 87, t2) == 0);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* Role enforcement (ARCH-60): the policy matrix and the ≥1-owner invariant. */
 static void test_role_enforcement(void) {
     const char *path = "build/test_dbwriter_roles.db";
@@ -466,6 +516,7 @@ int run_dbwriter_tests(void) {
     test_oidc_auth();
     test_auth_rate_limit();
     test_source_rate_limit();
+    test_logout();
     test_role_enforcement();
     test_backfill();
     return failures;

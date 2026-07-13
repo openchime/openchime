@@ -270,8 +270,28 @@ static void test_backfill_reconnect(int port, const uint8_t *pin) {
     client_close(&c);
 }
 
+/* LOGOUT over the wire: the daemon revokes the session and drops the
+ * connection (REQ-182). */
+static void test_logout_closes(int port, const uint8_t *pin) {
+    client a;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+
+    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_logout lo = { OC_LOGOUT_ALL, { NULL, 0 } };
+    CHECK(oc_encode_logout(&w, OC_PROTOCOL_VERSION, &lo) == OC_OK);
+    CHECK(write_all(&a.conn, buf, w.len) == 0);
+
+    /* No reply frame — the server closes the connection after revoking. */
+    oc_header hdr; oc_rbuf p;
+    CHECK(read_frame(&a, &hdr, &p) != 0);
+    client_close(&a);
+}
+
 int run_netloop_tests(void) {
-    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill\n");
+    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, logout\n");
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -303,6 +323,7 @@ int run_netloop_tests(void) {
         test_version_reject(arg.port, pin);
         test_message_vertical(arg.port, pin);
         test_backfill_reconnect(arg.port, pin);
+        test_logout_closes(arg.port, pin);
     }
 
     arg.stop = 1;

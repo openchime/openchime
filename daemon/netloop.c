@@ -245,6 +245,17 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
             oc_decode_client_ack(&p, &ca); /* accepted; the client drives backfill via its own cursors */
             continue;
         }
+        if (hdr.msg_type == OC_MSG_LOGOUT) {
+            oc_logout lo;
+            if (oc_decode_logout(&p, &lo) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LOGOUT, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->scope = lo.scope;
+            if (oc_job_set_token(j, lo.session_token.ptr, lo.session_token.len) != 0) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_BACKFILL_REQUEST) {
             oc_cursor cursors[256];
             uint16_t count = 0;
@@ -311,6 +322,13 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         oc_error e = { r->err_code, 1, { NULL, 0 }, oc_slice_str("auth failed") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_LOGOUT_OK: {
+        /* The session is revoked; drop the connection (the client re-auths to
+         * continue). Any queued output is discarded with the conn. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (c) conn_close(ep, conns, c->fd);
         break;
     }
     case OC_RES_SEND_OK: {

@@ -44,6 +44,7 @@ typedef enum {
     OC_MSG_AUTH             = 0x0010, /* C->S */
     OC_MSG_AUTH_OK          = 0x0011, /* S->C */
     OC_MSG_AUTH_CHALLENGE   = 0x0012, /* S->C */
+    OC_MSG_LOGOUT           = 0x0013, /* C->S */
     OC_MSG_SEND             = 0x0020, /* C->S */
     OC_MSG_SEND_ACK         = 0x0021, /* S->C */
     OC_MSG_BROADCAST        = 0x0022, /* S->C */
@@ -174,6 +175,10 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 
 #define OC_SESSION_TOKEN_LEN 32u  /* random session token; only its hash is stored */
 
+/* LOGOUT scope (PROTOCOL.md §4; REQ-182). */
+#define OC_LOGOUT_THIS 0u   /* revoke just the presented session token */
+#define OC_LOGOUT_ALL  1u   /* revoke every session of the authenticated user */
+
 /* --- Frame payload structs ---------------------------------------------- */
 
 typedef struct { uint16_t min_version; uint16_t max_version; oc_slice client_info; } oc_hello;
@@ -182,6 +187,7 @@ typedef struct { uint16_t code; oc_slice message; } oc_reject;
 typedef struct { uint8_t methods; oc_slice oidc_params; } oc_auth_challenge;
 typedef struct { uint8_t method; oc_slice credential; } oc_auth;
 typedef struct { uint64_t user_id; uint8_t role; uint64_t session_expiry; oc_slice session_token; } oc_auth_ok;
+typedef struct { uint8_t scope; oc_slice session_token; } oc_logout;
 typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; oc_slice body; } oc_send;
 typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; uint64_t message_id; uint64_t server_time; } oc_send_ack;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time; oc_slice body; } oc_broadcast;
@@ -204,6 +210,7 @@ oc_result oc_encode_reject(oc_wbuf *w, const oc_reject *m);
 oc_result oc_encode_auth_challenge(oc_wbuf *w, uint16_t version, const oc_auth_challenge *m);
 oc_result oc_encode_auth(oc_wbuf *w, uint16_t version, const oc_auth *m);
 oc_result oc_encode_auth_ok(oc_wbuf *w, uint16_t version, const oc_auth_ok *m);
+oc_result oc_encode_logout(oc_wbuf *w, uint16_t version, const oc_logout *m);
 oc_result oc_encode_send(oc_wbuf *w, uint16_t version, const oc_send *m);
 oc_result oc_encode_send_ack(oc_wbuf *w, uint16_t version, const oc_send_ack *m);
 oc_result oc_encode_broadcast(oc_wbuf *w, uint16_t version, const oc_broadcast *m);
@@ -226,6 +233,7 @@ oc_result oc_decode_reject(oc_rbuf *p, oc_reject *m);
 oc_result oc_decode_auth_challenge(oc_rbuf *p, oc_auth_challenge *m);
 oc_result oc_decode_auth(oc_rbuf *p, oc_auth *m);
 oc_result oc_decode_auth_ok(oc_rbuf *p, oc_auth_ok *m);
+oc_result oc_decode_logout(oc_rbuf *p, oc_logout *m);
 oc_result oc_decode_send(oc_rbuf *p, oc_send *m);
 oc_result oc_decode_send_ack(oc_rbuf *p, oc_send_ack *m);
 oc_result oc_decode_broadcast(oc_rbuf *p, oc_broadcast *m);
