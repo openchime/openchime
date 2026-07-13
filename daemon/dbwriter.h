@@ -26,7 +26,8 @@
 
 /* --- Jobs (net thread -> writer) ---------------------------------------- */
 
-enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 4 };
+enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 4,
+       OC_JOB_SET_ROLE = 5 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -45,8 +46,11 @@ typedef struct oc_job {
     /* REGISTER (create a local account; AUTH.md §2 — bootstrap / invite) */
     char          *username;  /* heap */
     char          *password;  /* heap */
-    uint8_t        role;      /* OC_ROLE_* for the new account */
+    uint8_t        role;      /* OC_ROLE_* for the new account (also SET_ROLE next) */
     uint32_t       iterations;/* PBKDF2 rounds (0 -> OC_PW_ITERATIONS default) */
+
+    /* SET_ROLE (change a user's tenant role; ARCH-60). Actor is `user_id`. */
+    uint64_t       target_user_id;
 
     /* SEND */
     uint64_t       channel_id;
@@ -63,7 +67,8 @@ typedef struct oc_job {
 
 enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_SEND_ERR = 4, OC_RES_BACKFILL_OK = 5,
-       OC_RES_REGISTER_OK = 6, OC_RES_REGISTER_ERR = 7 };
+       OC_RES_REGISTER_OK = 6, OC_RES_REGISTER_ERR = 7,
+       OC_RES_SETROLE_OK = 8, OC_RES_SETROLE_ERR = 9 };
 
 /* One message to replay on reconnect (rendered as a BROADCAST by the net thread). */
 typedef struct {

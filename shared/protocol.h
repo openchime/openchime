@@ -68,6 +68,8 @@ typedef enum {
     OC_ERR_NOT_A_MEMBER        = 3002,
     OC_ERR_UNKNOWN_CHANNEL     = 3003,
     OC_ERR_SEND_RATE_LIMITED   = 3004,
+    OC_ERR_FORBIDDEN           = 3005, /* actor's role may not perform the action */
+    OC_ERR_LAST_OWNER          = 3006, /* would remove/demote the last owner (REQ-030) */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 

@@ -13,6 +13,7 @@
 #include "auth.h"
 #include "jwt.h"
 #include "ratelimit.h"
+#include "roles.h"
 
 #include <pthread.h>
 #include <sqlite3.h>
@@ -308,15 +309,33 @@ static uint64_t lookup_session(sqlite3 *db, const uint8_t *token, size_t tlen,
     return uid;
 }
 
-static uint8_t get_role(sqlite3 *db, uint64_t uid) {
+/* Look up a user's role; returns 1 and sets *role_out if the user exists. */
+static int user_role(sqlite3 *db, uint64_t uid, uint8_t *role_out) {
     sqlite3_stmt *st = NULL;
-    uint8_t role = OC_ROLE_MEMBER;
+    int found = 0;
     sqlite3_prepare_v2(db, "SELECT role FROM users WHERE id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
-    if (sqlite3_step(st) == SQLITE_ROW)
-        role = role_to_u8((const char *)sqlite3_column_text(st, 0));
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        *role_out = role_to_u8((const char *)sqlite3_column_text(st, 0));
+        found = 1;
+    }
     sqlite3_finalize(st);
+    return found;
+}
+
+static uint8_t get_role(sqlite3 *db, uint64_t uid) {
+    uint8_t role = OC_ROLE_MEMBER;
+    user_role(db, uid, &role);
     return role;
+}
+
+static int count_owners(sqlite3 *db) {
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM users WHERE role='owner';", -1, &st, NULL);
+    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return n;
 }
 
 /* Just-in-time provision an OIDC user by subject (AUTH.md §4); refreshes the
@@ -437,6 +456,44 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         r->has_session_token = 0;   /* no new token on reconnect (PROTOCOL.md §4.3) */
         r->session_expiry = sess_exp;
     }
+    return r;
+}
+
+/* Change a user's tenant role (ARCH-60, §6). Enforces the role policy
+ * (roles.c) and the ≥1-owner invariant (REQ-030): the last owner cannot be
+ * demoted. The actor is j->user_id (the authenticated caller). */
+static oc_dbres *process_set_role(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+
+    uint8_t actor_role = OC_ROLE_MEMBER, target_cur = OC_ROLE_MEMBER;
+    if (!user_role(db, j->user_id, &actor_role) ||
+        !user_role(db, j->target_user_id, &target_cur)) {
+        /* Unknown actor or target: don't disclose which — just forbid. */
+        r->type = OC_RES_SETROLE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    uint8_t next = j->role;
+    if (!oc_role_can_set_role(actor_role, target_cur, next)) {
+        r->type = OC_RES_SETROLE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    /* ≥1-owner invariant: refuse demoting the tenant's last owner. */
+    if (target_cur == OC_ROLE_OWNER && next != OC_ROLE_OWNER && count_owners(db) <= 1) {
+        r->type = OC_RES_SETROLE_ERR; r->err_code = OC_ERR_LAST_OWNER; return r;
+    }
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "UPDATE users SET role=? WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, u8_to_role(next), -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->target_user_id);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        r->type = OC_RES_SETROLE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+    }
+    r->type = OC_RES_SETROLE_OK;
+    r->user_id = j->target_user_id;
+    r->role = next;
     return r;
 }
 
@@ -624,6 +681,7 @@ static void *writer_loop(void *arg) {
         else if (j->type == OC_JOB_SEND)     r = process_send(w->db, j);
         else if (j->type == OC_JOB_BACKFILL) r = process_backfill(w->db, j);
         else if (j->type == OC_JOB_REGISTER) r = process_register(w->db, j);
+        else if (j->type == OC_JOB_SET_ROLE) r = process_set_role(w->db, j);
         job_free(j);
         push_result(w, r);
     }

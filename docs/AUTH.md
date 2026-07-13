@@ -17,9 +17,12 @@ owner, §2), or `OC_AUTH_MODE=oidc` with `OC_OIDC_ISSUER` / `OC_OIDC_AUDIENCE` /
 bitset (`local|session` or `oidc|session`). Failed local-auth is **rate-limited
 per account** (REQ-191, `daemon/ratelimit.c`): after a burst of failures the
 account is refused with `AUTH_RATE_LIMITED`, checked before the expensive PBKDF2.
-**Remaining:** per-source (IP) rate-limiting (needs peer-address plumbing),
-invite-token account creation (§2), a configurable OIDC bootstrap-owner subject,
-and role enforcement (§6) beyond the `role` column + `AUTH_OK`.
+Role **changes** are enforced in the writer (`SET_ROLE`, `daemon/roles.c`): the
+owner/admin/member policy plus the ≥1-owner invariant (§6). **Remaining:**
+per-source (IP) rate-limiting (needs peer-address plumbing), invite-token account
+creation (§2), a configurable OIDC bootstrap-owner subject, the moderation-delete
+(REQ-032) and invite/remove (REQ-033) operations, and the wire frames that expose
+role management to clients (the enforced ops exist as writer jobs today).
 
 ---
 
@@ -254,16 +257,21 @@ The daemon answers with `AUTH_OK` (session established) or a fatal `ERROR`
 
 Every user holds exactly one tenant-level role — `owner`, `admin`, or `member`
 (REQ-030) — stored as a `role` column on `users`. Enforcement lives in the
-DB-writer handlers (the single write path):
+DB-writer handlers (the single write path); the policy predicates are pure and
+unit-tested in `daemon/roles.c`.
 
-- **≥1 owner invariant:** an action that would remove or demote the last owner
-  is refused (REQ-030).
-- **Moderation delete (REQ-032):** an admin/owner may delete (not edit) others'
-  messages in a channel they belong to; the existing `messages.deleted_by`
-  column records that it was a non-author deletion.
-- **Invite/remove (REQ-033):** only owner/admin may invite or remove tenant
-  members; channel-level invite/remove for private channels is any member of
-  that channel.
+- **Role changes (implemented):** `SET_ROLE` applies the policy — only owner/admin
+  may change roles, only an owner may grant/revoke owner, an admin may only
+  promote/keep members — refusing with `FORBIDDEN`.
+- **≥1 owner invariant (implemented):** demoting the tenant's last owner is
+  refused with `LAST_OWNER` (REQ-030), checked against a live `COUNT(*)` of owners.
+- **Moderation delete (REQ-032, pending):** an admin/owner may delete (not edit)
+  others' messages in a channel they belong to; the existing `messages.deleted_by`
+  column records that it was a non-author deletion. (`oc_role_can_moderate` is in
+  place; the delete operation itself is future work.)
+- **Invite/remove (REQ-033, pending):** only owner/admin may invite or remove
+  tenant members; channel-level invite/remove for private channels is any member
+  of that channel. (`oc_role_can_manage_members` is in place.)
 
 ---
 

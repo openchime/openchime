@@ -367,12 +367,66 @@ static void test_auth_rate_limit(void) {
     cleanup_db(path);
 }
 
+/* Submit a SET_ROLE job (actor changes target's role); returns the result's
+ * reason code (0 on OC_RES_SETROLE_OK). */
+static uint16_t set_role(oc_dbwriter *w, uint64_t actor, uint64_t target, uint8_t next) {
+    oc_job *j = oc_job_new(OC_JOB_SET_ROLE, 40);
+    j->user_id = actor;
+    j->target_user_id = target;
+    j->role = next;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    uint16_t code = (r && r->type == OC_RES_SETROLE_OK) ? 0 : (r ? r->err_code : 0xFFFF);
+    oc_dbres_free(r);
+    return code;
+}
+
+/* Role enforcement (ARCH-60): the policy matrix and the ≥1-owner invariant. */
+static void test_role_enforcement(void) {
+    const char *path = "build/test_dbwriter_roles.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t owner  = reg(w, "owner",  "pw", OC_ROLE_OWNER);
+    uint64_t admin  = reg(w, "admin",  "pw", OC_ROLE_ADMIN);
+    uint64_t member = reg(w, "member", "pw", OC_ROLE_MEMBER);
+    uint64_t m2     = reg(w, "member2", "pw", OC_ROLE_MEMBER);
+    CHECK(owner && admin && member && m2);
+
+    /* A member may not change roles. */
+    CHECK(set_role(w, member, m2, OC_ROLE_ADMIN) == OC_ERR_FORBIDDEN);
+    /* An admin may promote a member... */
+    CHECK(set_role(w, admin, m2, OC_ROLE_ADMIN) == 0);
+    /* ...but may not grant owner, nor touch another admin/owner. */
+    CHECK(set_role(w, admin, member, OC_ROLE_OWNER) == OC_ERR_FORBIDDEN);
+    CHECK(set_role(w, admin, m2, OC_ROLE_MEMBER) == OC_ERR_FORBIDDEN); /* m2 is now admin */
+    CHECK(set_role(w, admin, owner, OC_ROLE_MEMBER) == OC_ERR_FORBIDDEN);
+
+    /* The owner may promote and demote freely... */
+    CHECK(set_role(w, owner, member, OC_ROLE_ADMIN) == 0);
+    CHECK(set_role(w, owner, member, OC_ROLE_MEMBER) == 0);
+
+    /* ...except demoting the last owner, which the invariant refuses. */
+    CHECK(set_role(w, owner, owner, OC_ROLE_MEMBER) == OC_ERR_LAST_OWNER);
+    /* With a second owner, the first may then be demoted. */
+    CHECK(set_role(w, owner, admin, OC_ROLE_OWNER) == 0);   /* admin -> owner */
+    CHECK(set_role(w, owner, owner, OC_ROLE_MEMBER) == 0);  /* now safe */
+
+    /* An unknown target is forbidden (no existence disclosure). */
+    CHECK(set_role(w, admin, 99999, OC_ROLE_ADMIN) == OC_ERR_FORBIDDEN);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
-    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, SEND persist/idempotency/members, backfill\n");
+    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill\n");
     test_start_migrates_and_stops();
     test_auth_and_send();
     test_oidc_auth();
     test_auth_rate_limit();
+    test_role_enforcement();
     test_backfill();
     return failures;
 }
