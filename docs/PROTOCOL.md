@@ -231,7 +231,7 @@ so the client presents the right login UI.
 | Field         | Type | Notes                                                          |
 |---------------|------|----------------------------------------------------------------|
 | `methods`     | u8   | Bitset of accepted methods: `0x01` local, `0x02` oidc, `0x04` session (reconnect is always accepted alongside the primary mode). |
-| `oidc_params` | str  | Empty unless `oidc` is offered; otherwise a compact opaque blob the client passes to its OIDC helper (central authorize URL/`client_id`, this instance's `audience`). Ignorable by clients that only reconnect. |
+| `oidc_params` | str  | Empty unless `oidc` is offered; otherwise a small opaque blob the client passes to its OIDC helper (central authorize URL/`client_id`, this instance's `audience`). Ignorable by clients that only reconnect. |
 
 ### 4.2 `AUTH` (client → server), msg_type `0x0010`
 
@@ -241,14 +241,14 @@ A `method` discriminator selects the credential the payload carries (ARCH-59 for
 | Field        | Type | Notes                                                          |
 |--------------|------|----------------------------------------------------------------|
 | `method`     | u8   | `0x01` local, `0x02` oidc, `0x04` session.                     |
-| `credential` | lstr | Method-specific, bounded by `MAX_BODY_SIZE`: **local** — `username` (str) then `password` (str); **oidc** — the compact central identity token (AUTH.md §3.3); **session** — the 32-byte session token from a prior `AUTH_OK`. |
+| `credential` | lstr | Method-specific, bounded by `MAX_BODY_SIZE`: **local** — `username` (str) then `password` (str); **oidc** — the central-issued ES256 JWT (AUTH.md §3.3); **session** — the 32-byte session token from a prior `AUTH_OK`. |
 
 The daemon verifies per its mode and rejects on any mismatch with a fatal
 `ERROR`: `AUTH_INVALID_TOKEN` (bad/expired/ wrong-audience token or bad
 password), `AUTH_RATE_LIMITED` (too many failed attempts, REQ-191), or
 `AUTH_REQUIRED` (method not offered by this deployment). The daemon never
-validates raw provider JWTs or fetches JWKS — in `oidc` it verifies a compact
-token from the central service against a pinned key (AUTH.md §3).
+validates raw *provider* JWTs or fetches provider JWKS — in `oidc` it verifies a
+central-issued ES256 JWT against a single pinned key (AUTH.md §3).
 
 ### 4.3 `AUTH_OK` (server → client), msg_type `0x0011`
 

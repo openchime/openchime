@@ -28,8 +28,9 @@ revocation — is identical regardless of mode.
 
 There is deliberately **no "point the daemon straight at your own IdP" mode**:
 OIDC always routes through the central service. This keeps the daemon maximally
-lean (it never speaks OIDC/JWKS/JSON) and means self-hosters never register
-provider apps or hold provider credentials. A self-hoster who wants social login
+lean (it never fetches JWKS or handles multiple providers — it verifies one JWT
+from one pinned key, §3.3) and means self-hosters never register provider apps
+or hold provider credentials. A self-hoster who wants social login
 but no central involvement should instead run local mode. **v1 supports one mode
 per tenant** (local XOR oidc); both-at-once is a future extension.
 
@@ -76,10 +77,11 @@ each operator registering provider apps.
 
 The **central service** (maintainer-controlled) is the OIDC Relying Party: it
 holds the Google/MS/Apple client credentials, runs the login flow, and
-**re-issues** a compact OpenChime identity token (§3.3) that the daemon trusts.
-All the OIDC machinery — JSON, JWKS, provider quirks, key rotation — lives in
-that service (a higher-level web service), **never in the C daemon**. The daemon
-only verifies one signature against one configured public key.
+**re-issues** an OpenChime **ES256 JWT** (§3.3) that the daemon trusts. All the
+OIDC machinery — JWKS fetching, provider quirks, key rotation, multi-provider
+handling — lives in that service (a higher-level web service), **never in the C
+daemon**. The daemon only verifies one JWT signature against one configured,
+pinned public key (plus a tiny vendored JSON reader for the claims).
 
 ### 3.2 The flow — the client is the courier
 
@@ -96,8 +98,8 @@ carries the token from center to daemon. This preserves the island model
       │                                    ┌────────────────◀──┘
       │                                    ▼
       │                            ┌───────────────┐
-      │  4. compact identity token │   central     │  exchanges code (secret),
-      │◀───(audience=acme.example)─│   service      │  verifies, mints token
+      │  4. ES256 JWT              │   central     │  exchanges code (secret),
+      │◀───(aud=acme.example)──────│   service      │  verifies, mints JWT
       │                            └───────────────┘
       │  5. AUTH{method=oidc, token}
       ▼
@@ -114,29 +116,41 @@ carries the token from center to daemon. This preserves the island model
 2. The user authenticates at the provider.
 3. The provider redirects to central's callback with an auth code.
 4. Central exchanges the code (with its client secret), verifies the provider
-   token, extracts identity (subject, email, name), and mints a **compact
-   identity token scoped to that instance** (`audience = acme.example`),
-   returned to the *client*.
+   token, extracts identity (subject, email, name), and mints an **ES256 JWT
+   scoped to that instance** (`aud = acme.example`), returned to the *client*.
 5. The client presents that token to the `acme.example` daemon in `AUTH`
    (method `oidc`). The daemon verifies it (§3.3) and mints a session.
 
-### 3.3 The compact identity token (ARCH-57)
+### 3.3 The identity token — an ES256 JWT (ARCH-57)
 
-Central issues a **compact, field-encoded, ECDSA-P256-signed** token — not a
-JSON JWT — so the daemon needs no JSON parser:
+Central issues a **standard JWT** signed with **ES256** (ECDSA P-256 + SHA-256),
+carrying the identity claims:
 
 ```
-version (u16) | subject (str) | email (str) | display_name (str) |
-audience (str) | issued_at_ms (u64) | expires_at_ms (u64) | signature (ECDSA-P256)
+{ "iss": "https://auth.openchime.io",   // the central service
+  "aud": "acme.example",                 // the target instance
+  "sub": "<provider issuer>|<subject>",  // stable identity
+  "email": "...", "name": "...",
+  "iat": ..., "exp": ... }
 ```
 
-(Field encodings are the same primitives as the wire protocol, PROTOCOL.md §7.)
-The daemon verifies the signature with mbedTLS (already linked; ECDSA-P256 is
-fully supported — Ed25519 is not, hence P-256), then checks `audience` equals
-its own configured instance id (so a token minted for one instance cannot be
-replayed at another) and that it is unexpired. A JSON JWT was rejected: it would
-force a JSON parser into the lean daemon for no benefit when both ends (central
-and daemon) are ours — the same reasoning as ARCH-6.
+The daemon validates it by **pinning both the key and the algorithm**:
+
+- it requires `alg = ES256` and rejects anything else — this closes JWT's classic
+  footguns (`alg=none`, RS256/HS256 confusion) up front;
+- it verifies the signature with mbedTLS (ES256 = ECDSA-P256, which mbedTLS
+  supports directly; EdDSA/Ed25519 is not supported, so ES256 is the choice);
+- it checks `iss` (central), `aud` (== this instance's configured id, so a token
+  minted for one instance cannot be replayed at another), and `exp`.
+
+The JWT payload is JSON, so the daemon vendors a single-file JSON tokenizer
+(**jsmn** — MIT, zero-allocation, ~300 lines, in the same spirit as
+picohttpparser) to read the claims, plus a small base64url decoder. A bespoke
+compact binary token was considered — to avoid the JSON parser — and rejected:
+JWT is a standard, battle-tested format with well-understood mitigations, which
+is exactly what a security-critical validation path wants; and the JSON cost is
+negligible for a **once-per-login** token. (ARCH-6's "no JSON overhead" rule
+targets the high-frequency message path, not the auth bootstrap.)
 
 ### 3.4 Trust setup and dependency
 
@@ -167,12 +181,12 @@ The central service + relay are a **separate system** — a web service, not the
 daemon — and are built independently. Its contract with the daemon is narrow:
 
 - run the Authorization-Code-+-PKCE flow against the configured providers;
-- mint compact identity tokens (§3.3) signed by the key the daemon pins,
-  audience-scoped to the requesting instance;
+- mint ES256 JWTs (§3.3) signed by the key the daemon pins, audience-scoped to
+  the requesting instance;
 - maintain the instance registry (which `audience` ids are valid).
 
 Until it exists, the daemon's OIDC path is tested with a **test issuer**:
-generate an ECDSA-P256 keypair in the test, mint central-style tokens, and
+generate an ECDSA-P256 keypair in the test, mint central-style ES256 JWTs, and
 configure the daemon with the test public key — the same faking approach as the
 existing TLS/netloop integration tests.
 
@@ -216,7 +230,7 @@ selects the path:
 
 - `local` — username + password (first login) → server verifies against
   `local_credentials`.
-- `oidc` — the compact central token (§3.3).
+- `oidc` — the central-issued ES256 JWT (§3.3).
 - `session` — a previously issued session token (reconnect).
 
 The daemon answers with `AUTH_OK` (session established) or a fatal `ERROR`

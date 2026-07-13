@@ -179,9 +179,9 @@ real protocol.
   connection (REQ-110/111).
 - **Auth (AUTH.md):** *local mode* — a correct username+password reaches
   `AUTH_OK`, a wrong password gets `AUTH_INVALID_TOKEN` and is rate-limited after
-  repeats; *OIDC mode* — a compact identity token signed by a **test issuer**
-  keypair (standing in for the central service) reaches `AUTH_OK`, and a
-  bad-signature / wrong-audience / expired token is rejected; *session* — a
+  repeats; *OIDC mode* — an ES256 JWT signed by a **test issuer** keypair
+  (standing in for the central service) reaches `AUTH_OK`, and a bad-signature /
+  wrong-algorithm / wrong-audience / expired token is rejected; *session* — a
   reconnect with a stored session token resumes without re-auth, and a revoked
   session is refused (REQ-023, REQ-100, REQ-182).
 - **Messaging:** two clients in a channel — a `SEND` from one produces a

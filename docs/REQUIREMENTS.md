@@ -86,11 +86,12 @@ the requirement says so explicitly rather than implying one.
   not supported Facebook login. (Also brokered by the central service.)
 - **REQ-023.** The daemon has established a session only against a verified
   credential appropriate to its mode, rejecting a connection outright on any
-  mismatch without partial trust (ARCH-19): in **OIDC mode** a compact identity
-  token re-issued by the central service, verified by ECDSA-P256 signature
-  against a pinned public key plus audience and expiry checks (ARCH-56/57) — the
-  daemon has not validated raw provider JWTs or fetched JWKS itself; in **local
-  mode** a username+password checked against the stored PBKDF2 hash (ARCH-59).
+  mismatch without partial trust (ARCH-19): in **OIDC mode** an ES256 JWT
+  re-issued by the central service, verified against a pinned key with the
+  algorithm pinned to `ES256` plus `iss`/`aud`/`exp` checks (ARCH-56/57) — the
+  daemon has not validated raw *provider* JWTs or fetched provider JWKS itself;
+  in **local mode** a username+password checked against the stored PBKDF2 hash
+  (ARCH-59).
 - **REQ-024.** In local mode the daemon has managed accounts itself: passwords
   hashed with PBKDF2-HMAC-SHA256 and never stored in the clear, the first owner
   bootstrapped from a one-time setup token, further users created by invite
