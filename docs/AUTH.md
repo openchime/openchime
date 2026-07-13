@@ -14,10 +14,12 @@ session (§4) and accept session tokens on reconnect (`process_auth` in
 The mode is chosen at boot: default local (`OC_BOOTSTRAP_USERS` provisions the
 owner, §2), or `OC_AUTH_MODE=oidc` with `OC_OIDC_ISSUER` / `OC_OIDC_AUDIENCE` /
 `OC_OIDC_PUBKEY[_FILE]` — `AUTH_CHALLENGE` then advertises the matching methods
-bitset (`local|session` or `oidc|session`). **Remaining:** brute-force
-rate-limiting (§2, REQ-191), invite-token account creation (§2), a configurable
-OIDC bootstrap-owner subject, and role enforcement (§6) beyond the `role` column
-+ `AUTH_OK`.
+bitset (`local|session` or `oidc|session`). Failed local-auth is **rate-limited
+per account** (REQ-191, `daemon/ratelimit.c`): after a burst of failures the
+account is refused with `AUTH_RATE_LIMITED`, checked before the expensive PBKDF2.
+**Remaining:** per-source (IP) rate-limiting (needs peer-address plumbing),
+invite-token account creation (§2), a configurable OIDC bootstrap-owner subject,
+and role enforcement (§6) beyond the `role` column + `AUTH_OK`.
 
 ---
 
@@ -70,9 +72,11 @@ authority.
   token**; the invitee sets their password by presenting the token. Email
   magic-link delivery is an optional future enhancement, never required.
 - **Brute-force protection (REQ-191):** the daemon rate-limits failed local-auth
-  attempts (per account and per source) and answers excess attempts with
-  `ERROR AUTH_RATE_LIMITED`. This is why REQ-191 lives with the auth design — it
-  is squarely a local-password concern.
+  attempts and answers excess attempts with `ERROR AUTH_RATE_LIMITED`. Per-account
+  throttling is implemented (`daemon/ratelimit.c`, a fixed-window counter checked
+  before PBKDF2 so a flood can't burn CPU); per-source (IP) throttling is a
+  follow-on that needs the peer address plumbed to the writer. This is why
+  REQ-191 lives with the auth design — it is squarely a local-password concern.
 
 ---
 

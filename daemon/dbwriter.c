@@ -12,6 +12,7 @@
 #include "protocol.h"
 #include "auth.h"
 #include "jwt.h"
+#include "ratelimit.h"
 
 #include <pthread.h>
 #include <sqlite3.h>
@@ -40,7 +41,14 @@ struct oc_dbwriter {
     char           *oidc_audience;
     char           *oidc_pubkey_pem;
     char           *oidc_params;             /* advertised blob ("" if none) */
+    oc_ratelimit   *auth_rl;                 /* failed local-auth per account */
 };
+
+/* Failed local-auth throttle (REQ-191, AUTH.md §2): after this many failures
+ * within the window, further attempts on that account get AUTH_RATE_LIMITED. */
+#define OC_AUTH_MAX_FAILURES 5
+#define OC_AUTH_WINDOW_MS    60000u
+#define OC_AUTH_RL_CAPACITY  1024u
 
 static uint64_t dbw_now_ms(void) {
     struct timespec ts;
@@ -373,8 +381,20 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         if (oc_parse_local_credential(cred, &user, &pass) != OC_OK) {
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
         }
+        /* Throttle brute force per account (REQ-191). Check before the
+         * expensive PBKDF2 so a flood can't also burn CPU. */
+        char acct[OC_RL_KEYMAX];
+        size_t al = user.len < sizeof acct - 1 ? user.len : sizeof acct - 1;
+        memcpy(acct, user.ptr, al);
+        acct[al] = '\0';
+        uint64_t now = dbw_now_ms();
+        if (oc_ratelimit_blocked(w->auth_rl, acct, now)) {
+            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_RATE_LIMITED; return r;
+        }
         uid = verify_local(db, (const char *)user.ptr, user.len,
                            (const char *)pass.ptr, pass.len, &role);
+        if (uid == 0) oc_ratelimit_record(w->auth_rl, acct, now);  /* count the failure */
+        else          oc_ratelimit_reset(w->auth_rl, acct);        /* success clears it */
     } else if (j->method == OC_AUTH_OIDC) {
         if (!w->oidc_enabled) {
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_REQUIRED; return r;
@@ -684,6 +704,8 @@ oc_dbwriter *oc_dbwriter_start(const char *path) {
     if (!w) return NULL;
     w->evfd = -1;
     w->auth_methods = OC_AUTH_LOCAL | OC_AUTH_SESSION;  /* local mode by default */
+    w->auth_rl = oc_ratelimit_new(OC_AUTH_MAX_FAILURES, OC_AUTH_WINDOW_MS, OC_AUTH_RL_CAPACITY);
+    if (!w->auth_rl) { free(w); return NULL; }
 
     if (sqlite3_open(path, &w->db) != SQLITE_OK) {
         fprintf(stderr, "dbwriter: open %s failed: %s\n", path, sqlite3_errmsg(w->db));
@@ -736,6 +758,7 @@ void oc_dbwriter_stop(oc_dbwriter *w) {
     for (oc_dbres *r = w->res_head; r; ) { oc_dbres *n = r->next; oc_dbres_free(r); r = n; }
     free(w->oidc_issuer); free(w->oidc_audience);
     free(w->oidc_pubkey_pem); free(w->oidc_params);
+    oc_ratelimit_free(w->auth_rl);
     if (w->evfd >= 0) close(w->evfd);
     sqlite3_close(w->db);
     free(w);

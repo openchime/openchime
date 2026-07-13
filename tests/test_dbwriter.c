@@ -85,6 +85,20 @@ static uint64_t auth_local(oc_dbwriter *w, uint64_t conn_id, const char *user,
     return uid;
 }
 
+/* Local auth returning the result's reason code (0 on AUTH_OK). */
+static uint16_t auth_local_code(oc_dbwriter *w, uint64_t conn_id, const char *user, const char *pass) {
+    uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+    oc_encode_local_credential(&cw, oc_slice_str(user), oc_slice_str(pass));
+    oc_job *j = oc_job_new(OC_JOB_AUTH, conn_id);
+    j->method = OC_AUTH_LOCAL;
+    oc_job_set_token(j, cbuf, cw.len);
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    uint16_t code = (r && r->type == OC_RES_AUTH_OK) ? 0 : (r ? r->err_code : 0xFFFF);
+    oc_dbres_free(r);
+    return code;
+}
+
 /* Reconnect with a previously minted session token. */
 static uint64_t auth_session(oc_dbwriter *w, uint64_t conn_id, const uint8_t token[OC_SESSION_TOKEN_LEN]) {
     oc_job *j = oc_job_new(OC_JOB_AUTH, conn_id);
@@ -327,11 +341,38 @@ static void test_oidc_auth(void) {
     cleanup_db(path);
 }
 
+/* Failed local-auth attempts are throttled per account (REQ-191). After the
+ * configured number of failures the account is AUTH_RATE_LIMITED — even with
+ * the correct password — while other accounts stay unaffected. */
+static void test_auth_rate_limit(void) {
+    const char *path = "build/test_dbwriter_rl.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    CHECK(reg(w, "victim", "correct-horse", OC_ROLE_MEMBER) != 0);
+    CHECK(reg(w, "other",  "other-pw",      OC_ROLE_MEMBER) != 0);
+
+    /* Burn through the failure budget (OC_AUTH_MAX_FAILURES = 5). */
+    for (int i = 0; i < 5; i++)
+        CHECK(auth_local_code(w, 30, "victim", "wrong") == OC_ERR_AUTH_INVALID_TOKEN);
+
+    /* Now the account is throttled — even the correct password is refused. */
+    CHECK(auth_local_code(w, 30, "victim", "correct-horse") == OC_ERR_AUTH_RATE_LIMITED);
+
+    /* A different account is unaffected. */
+    CHECK(auth_local_code(w, 31, "other", "other-pw") == 0);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
-    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, SEND persist/idempotency/members, backfill\n");
+    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, SEND persist/idempotency/members, backfill\n");
     test_start_migrates_and_stops();
     test_auth_and_send();
     test_oidc_auth();
+    test_auth_rate_limit();
     test_backfill();
     return failures;
 }
