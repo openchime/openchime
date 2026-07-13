@@ -7,7 +7,7 @@ BIN := openchimed
 # The tree is split into three concerns: shared/ is the wire contract (linked by
 # both the daemon and the client), daemon/ is the server, client/ is the app.
 SHARED_SRC := shared/protocol.c shared/framebuf.c shared/tls.c
-DAEMON_SRC := daemon/main.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c
+DAEMON_SRC := daemon/main.c daemon/migrate.c daemon/dbwriter.c daemon/netloop.c daemon/auth.c daemon/jwt.c
 SRC        := $(SHARED_SRC) $(DAEMON_SRC)
 HDRS       := $(wildcard shared/*.h daemon/*.h)
 
@@ -20,7 +20,7 @@ MBEDTLS_LIBS := $(MBEDTLS_DIR)/library/libmbedtls.a \
                 $(MBEDTLS_DIR)/library/libmbedx509.a \
                 $(MBEDTLS_DIR)/library/libmbedcrypto.a
 
-INC := -Ishared -Idaemon -I$(MBEDTLS_INC)
+INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_INC)
 
 # Every source except the daemon entry point; the test binary links these and
 # calls their public APIs (no per-test binaries, no unity #include of .c).

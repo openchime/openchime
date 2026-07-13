@@ -11,6 +11,7 @@ int run_protocol_tests(void);
 int run_framebuf_tests(void);
 int run_migrate_tests(void);
 int run_auth_tests(void);
+int run_jwt_tests(void);
 int run_dbwriter_tests(void);
 int run_tls_tests(void);
 int run_netloop_tests(void);
@@ -21,6 +22,7 @@ int main(void) {
     total += run_framebuf_tests();
     total += run_migrate_tests();
     total += run_auth_tests();
+    total += run_jwt_tests();
     total += run_dbwriter_tests();
     total += run_tls_tests();
     total += run_netloop_tests();
