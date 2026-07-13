@@ -112,6 +112,20 @@ void         oc_dbwriter_stop(oc_dbwriter *w);
 /* The eventfd the net thread registers in epoll; readable when results wait. */
 int  oc_dbwriter_eventfd(oc_dbwriter *w);
 
+/* Switch the deployment to OIDC mode (AUTH.md §3): AUTH{oidc} tokens are then
+ * verified against the pinned ES256 key, and AUTH_CHALLENGE advertises oidc +
+ * session (local is disabled — v1 is one mode per tenant). Copies its args;
+ * call once before serving traffic. `pubkey_pem` is a PEM SubjectPublicKeyInfo;
+ * `oidc_params` is the opaque blob advertised to clients. Returns 0 / -1. */
+int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
+                               const char *audience, const char *pubkey_pem,
+                               const char *oidc_params);
+
+/* Auth methods bitset (OC_AUTH_*) to advertise in AUTH_CHALLENGE, and the
+ * OIDC params blob ("" unless OIDC is configured). For the net loop. */
+uint8_t     oc_dbwriter_auth_methods(oc_dbwriter *w);
+const char *oc_dbwriter_oidc_params(oc_dbwriter *w);
+
 /* Allocate a zeroed job of `type` for `conn_id`. Fill in the type's fields
  * (oc_job_set_token / oc_job_set_body copy into heap) then submit. */
 oc_job *oc_job_new(int type, uint64_t conn_id);

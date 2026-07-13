@@ -38,6 +38,30 @@ static int env_port(const char *name, int dflt) {
     return v ? atoi(v) : dflt;
 }
 
+/* Read a whole file into a malloc'd NUL-terminated buffer, or NULL. */
+static char *read_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long n = ftell(f);
+    if (n < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    char *buf = malloc((size_t)n + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t rd = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    buf[rd] = '\0';
+    return buf;
+}
+
+/* The pinned central public key (AUTH.md §3.4): OC_OIDC_PUBKEY_FILE (a path) or
+ * OC_OIDC_PUBKEY (inline PEM). Caller frees. */
+static char *load_oidc_pubkey(void) {
+    const char *path = getenv("OC_OIDC_PUBKEY_FILE");
+    if (path) return read_file(path);
+    const char *inl = getenv("OC_OIDC_PUBKEY");
+    return inl ? strdup(inl) : NULL;
+}
+
 /* Provision local accounts from OC_BOOTSTRAP_USERS="user:pass[:role],..."
  * (AUTH.md §2 — the owner bootstrap / air-gapped account setup). Idempotent:
  * re-running never clobbers an existing password. role ∈ owner|admin|member
@@ -129,6 +153,25 @@ int main(void) {
 
     /* Optionally provision local accounts before serving (AUTH.md §2). */
     bootstrap_users(db, getenv("OC_BOOTSTRAP_USERS"));
+
+    /* OIDC mode (AUTH.md §3): pin central's ES256 key + issuer/audience. When
+     * set, AUTH_CHALLENGE advertises oidc+session instead of local+session. */
+    if (strcmp(env_or("OC_AUTH_MODE", "local"), "oidc") == 0) {
+        const char *iss = getenv("OC_OIDC_ISSUER");
+        const char *aud = getenv("OC_OIDC_AUDIENCE");
+        char *pem = load_oidc_pubkey();
+        if (!iss || !aud || !pem) {
+            fprintf(stderr, "openchimed: OIDC mode needs OC_OIDC_ISSUER, "
+                            "OC_OIDC_AUDIENCE, and OC_OIDC_PUBKEY[_FILE]\n");
+            free(pem); oc_dbwriter_stop(db); return 1;
+        }
+        if (oc_dbwriter_configure_oidc(db, iss, aud, pem, env_or("OC_OIDC_PARAMS", "")) != 0) {
+            fprintf(stderr, "openchimed: OIDC configuration failed\n");
+            free(pem); oc_dbwriter_stop(db); return 1;
+        }
+        free(pem);
+        fprintf(stderr, "openchimed: OIDC mode (issuer=%s audience=%s)\n", iss, aud);
+    }
 
     /* Self-signed cert on first run, reused thereafter (ARCH-10). */
     oc_tls_server tls;

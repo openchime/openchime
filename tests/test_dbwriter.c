@@ -6,6 +6,7 @@
 #include "dbwriter.h"
 #include "migrate.h"
 #include "protocol.h"
+#include "issuer.h"
 #include "check.h"
 
 #include <stdlib.h>
@@ -241,10 +242,96 @@ static void test_backfill(void) {
     cleanup_db(path);
 }
 
+/* OIDC-mode auth: a test issuer stands in for the central service (AUTH.md
+ * §3.6). Proves the wiring — configure -> JWT verify -> JIT-provision -> session
+ * -> reconnect — on top of the crypto that test_jwt covers in isolation. */
+static void test_oidc_auth(void) {
+    const char *path = "build/test_dbwriter_oidc.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    oc_issuer is;
+    CHECK(oc_issuer_init(&is, "oc-dbw-oidc") == 0);
+    const char *ISS = "https://auth.openchime.io";
+    const char *AUD = "acme.example";
+    CHECK(oc_dbwriter_configure_oidc(w, ISS, AUD, is.pem,
+                                     "authorize=https://auth.openchime.io/authorize") == 0);
+    CHECK(oc_dbwriter_auth_methods(w) == (OC_AUTH_OIDC | OC_AUTH_SESSION));
+    CHECK(strlen(oc_dbwriter_oidc_params(w)) > 0);
+
+    const char *HDR = "{\"alg\":\"ES256\",\"typ\":\"JWT\"}";
+    char payload[512];
+    /* exp far in the real future — the daemon checks against wall-clock time. */
+    snprintf(payload, sizeof payload,
+        "{\"iss\":\"%s\",\"aud\":\"%s\",\"sub\":\"google|42\","
+        "\"email\":\"a@acme.example\",\"name\":\"A\",\"exp\":4102444800}", ISS, AUD);
+    char token[2048];
+    size_t tlen = oc_issuer_mint(&is, HDR, payload, token);
+
+    /* A valid central JWT provisions the user and mints a session. */
+    uint8_t sess[OC_SESSION_TOKEN_LEN]; memset(sess, 0, sizeof sess);
+    uint64_t uid = 0; uint8_t role = 0xFF; int has_tok = 0;
+    {
+        oc_job *j = oc_job_new(OC_JOB_AUTH, 20);
+        j->method = OC_AUTH_OIDC;
+        oc_job_set_token(j, token, tlen);
+        oc_dbwriter_submit(w, j);
+        oc_dbres *r = wait_result(w);
+        CHECK(r && r->type == OC_RES_AUTH_OK);
+        if (r && r->type == OC_RES_AUTH_OK) {
+            uid = r->user_id; role = r->role; has_tok = r->has_session_token;
+            if (r->has_session_token) memcpy(sess, r->session_token, OC_SESSION_TOKEN_LEN);
+        }
+        oc_dbres_free(r);
+    }
+    CHECK(uid != 0);
+    CHECK(role == OC_ROLE_MEMBER);
+    CHECK(has_tok == 1);
+
+    /* Re-auth with the same JWT is idempotent (same user). */
+    {
+        oc_job *j = oc_job_new(OC_JOB_AUTH, 21);
+        j->method = OC_AUTH_OIDC;
+        oc_job_set_token(j, token, tlen);
+        oc_dbwriter_submit(w, j);
+        oc_dbres *r = wait_result(w);
+        CHECK(r && r->type == OC_RES_AUTH_OK && r->user_id == uid);
+        oc_dbres_free(r);
+    }
+
+    /* The minted session token reconnects to the same user. */
+    CHECK(has_tok && auth_session(w, 22, sess) == uid);
+
+    /* A JWT minted for a different audience is rejected. */
+    {
+        char bad[512];
+        snprintf(bad, sizeof bad,
+            "{\"iss\":\"%s\",\"aud\":\"other.example\",\"sub\":\"google|42\",\"exp\":4102444800}", ISS);
+        char bt[2048];
+        size_t bl = oc_issuer_mint(&is, HDR, bad, bt);
+        oc_job *j = oc_job_new(OC_JOB_AUTH, 23);
+        j->method = OC_AUTH_OIDC;
+        oc_job_set_token(j, bt, bl);
+        oc_dbwriter_submit(w, j);
+        oc_dbres *r = wait_result(w);
+        CHECK(r && r->type == OC_RES_AUTH_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
+        oc_dbres_free(r);
+    }
+
+    /* Local auth is refused in OIDC mode (one mode per tenant). */
+    CHECK(auth_local(w, 24, "someone", "pw", NULL, NULL) == 0);
+
+    oc_issuer_free(&is);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
-    printf("test_dbwriter: migrate-on-boot, register + local/session auth, SEND persist/idempotency/members, backfill\n");
+    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, SEND persist/idempotency/members, backfill\n");
     test_start_migrates_and_stops();
     test_auth_and_send();
+    test_oidc_auth();
     test_backfill();
     return failures;
 }

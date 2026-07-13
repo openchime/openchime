@@ -5,15 +5,19 @@ This is the authoritative design; it is cross-referenced from ARCHITECTURE.md
 (ARCH-19, ARCH-55–ARCH-60), REQUIREMENTS.md (§1.2, §8.1), PROTOCOL.md (§4), and
 SCHEMA.md (migration 0002).
 
-**Status.** **Local mode is implemented** — the daemon verifies username +
-password against PBKDF2-HMAC-SHA256 credentials (`local_credentials`), mints
-daemon-issued sessions (§4), and accepts session tokens on reconnect
-(`process_auth` in `daemon/dbwriter.c`, crypto in `daemon/auth.c`, wire frames
-in PROTOCOL.md §4). Accounts are provisioned at boot from `OC_BOOTSTRAP_USERS`
-(the owner-bootstrap path, §2). **OIDC mode (§3) is the remaining milestone** —
-the `AUTH_CHALLENGE` methods bitset advertises `local | session` today; `oidc`
-is added when the central ES256 JWT verification lands. Roles (§6) beyond the
-`role` column + `AUTH_OK` are enforced incrementally.
+**Status.** **Both modes are implemented.** Local mode verifies username +
+password against PBKDF2-HMAC-SHA256 credentials (`local_credentials`); OIDC mode
+verifies a central-issued ES256 JWT against a pinned key (`daemon/jwt.c`, jsmn
+for the claims) and JIT-provisions the user. Both converge on a daemon-issued
+session (§4) and accept session tokens on reconnect (`process_auth` in
+`daemon/dbwriter.c`, crypto in `daemon/auth.c`, wire frames in PROTOCOL.md §4).
+The mode is chosen at boot: default local (`OC_BOOTSTRAP_USERS` provisions the
+owner, §2), or `OC_AUTH_MODE=oidc` with `OC_OIDC_ISSUER` / `OC_OIDC_AUDIENCE` /
+`OC_OIDC_PUBKEY[_FILE]` — `AUTH_CHALLENGE` then advertises the matching methods
+bitset (`local|session` or `oidc|session`). **Remaining:** brute-force
+rate-limiting (§2, REQ-191), invite-token account creation (§2), a configurable
+OIDC bootstrap-owner subject, and role enforcement (§6) beyond the `role` column
++ `AUTH_OK`.
 
 ---
 

@@ -11,6 +11,7 @@
 #include "migrate.h"
 #include "protocol.h"
 #include "auth.h"
+#include "jwt.h"
 
 #include <pthread.h>
 #include <sqlite3.h>
@@ -31,6 +32,14 @@ struct oc_dbwriter {
     int             evfd;                    /* signals results ready */
     int             stop;
     int             started;
+
+    /* Auth config (set before serving; read only on the writer thread). */
+    uint8_t         auth_methods;            /* advertised in AUTH_CHALLENGE */
+    int             oidc_enabled;
+    char           *oidc_issuer;
+    char           *oidc_audience;
+    char           *oidc_pubkey_pem;
+    char           *oidc_params;             /* advertised blob ("" if none) */
 };
 
 static uint64_t dbw_now_ms(void) {
@@ -291,6 +300,43 @@ static uint64_t lookup_session(sqlite3 *db, const uint8_t *token, size_t tlen,
     return uid;
 }
 
+static uint8_t get_role(sqlite3 *db, uint64_t uid) {
+    sqlite3_stmt *st = NULL;
+    uint8_t role = OC_ROLE_MEMBER;
+    sqlite3_prepare_v2(db, "SELECT role FROM users WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    if (sqlite3_step(st) == SQLITE_ROW)
+        role = role_to_u8((const char *)sqlite3_column_text(st, 0));
+    sqlite3_finalize(st);
+    return role;
+}
+
+/* Just-in-time provision an OIDC user by subject (AUTH.md §4); refreshes the
+ * email/name on each login. Returns the user id, or 0. Role defaults to member
+ * via the schema; promotion is a separate action. */
+static uint64_t upsert_oidc_user(sqlite3 *db, const char *subject,
+                                 const char *email, const char *name) {
+    uint64_t now = dbw_now_ms();
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO users(subject, email, display_name, created_at_ms) VALUES(?,?,?,?) "
+        "ON CONFLICT(subject) DO UPDATE SET email=excluded.email, "
+        "display_name=excluded.display_name;", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, subject, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, email, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 3, name, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)now);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+
+    uint64_t uid = 0;
+    sqlite3_prepare_v2(db, "SELECT id FROM users WHERE subject=?;", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, subject, -1, SQLITE_STATIC);
+    if (sqlite3_step(st) == SQLITE_ROW) uid = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return uid;
+}
+
 static oc_dbres *process_register(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -306,9 +352,10 @@ static oc_dbres *process_register(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
-/* Prove identity (local password or an existing session token) and converge on
- * a daemon-issued session (AUTH.md §4). OIDC arrives in a later milestone. */
-static oc_dbres *process_auth(sqlite3 *db, const oc_job *j) {
+/* Prove identity (local password, an OIDC ES256 JWT, or an existing session
+ * token) and converge on a daemon-issued session (AUTH.md §4). */
+static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
+    sqlite3 *db = w->db;
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
@@ -318,6 +365,9 @@ static oc_dbres *process_auth(sqlite3 *db, const oc_job *j) {
     int fresh = 1;   /* mint a new session unless this is a session re-auth */
 
     if (j->method == OC_AUTH_LOCAL) {
+        if (!(w->auth_methods & OC_AUTH_LOCAL)) {
+            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_REQUIRED; return r;
+        }
         oc_slice cred = { (const uint8_t *)j->token, j->token_len };
         oc_slice user, pass;
         if (oc_parse_local_credential(cred, &user, &pass) != OC_OK) {
@@ -325,11 +375,27 @@ static oc_dbres *process_auth(sqlite3 *db, const oc_job *j) {
         }
         uid = verify_local(db, (const char *)user.ptr, user.len,
                            (const char *)pass.ptr, pass.len, &role);
+    } else if (j->method == OC_AUTH_OIDC) {
+        if (!w->oidc_enabled) {
+            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_REQUIRED; return r;
+        }
+        oc_jwt_claims claims;
+        oc_jwt_result jr = oc_jwt_verify(j->token, j->token_len,
+                                         w->oidc_pubkey_pem, strlen(w->oidc_pubkey_pem) + 1,
+                                         w->oidc_issuer, w->oidc_audience,
+                                         dbw_now_ms() / 1000u, &claims);
+        if (jr != OC_JWT_OK) {
+            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+        }
+        /* Namespace by source: "oidc:<central issuer>|<provider sub>" (AUTH.md §4). */
+        char subject[OC_JWT_MAX_FIELD * 2 + 8];
+        snprintf(subject, sizeof subject, "oidc:%s|%s", claims.iss, claims.sub);
+        uid = upsert_oidc_user(db, subject, claims.email, claims.name);
+        if (uid) role = get_role(db, uid);   /* membership ensured on the common path */
     } else if (j->method == OC_AUTH_SESSION) {
         uid = lookup_session(db, (const uint8_t *)j->token, j->token_len, &role, &sess_exp);
         fresh = 0;
     } else {
-        /* OIDC (method 0x02) is not accepted by this deployment yet. */
         r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_REQUIRED; return r;
     }
 
@@ -534,7 +600,7 @@ static void *writer_loop(void *arg) {
         pthread_mutex_unlock(&w->mu);
 
         oc_dbres *r = NULL;
-        if (j->type == OC_JOB_AUTH)          r = process_auth(w->db, j);
+        if (j->type == OC_JOB_AUTH)          r = process_auth(w, j);
         else if (j->type == OC_JOB_SEND)     r = process_send(w->db, j);
         else if (j->type == OC_JOB_BACKFILL) r = process_backfill(w->db, j);
         else if (j->type == OC_JOB_REGISTER) r = process_register(w->db, j);
@@ -562,6 +628,30 @@ oc_dbres *oc_dbwriter_next_result(oc_dbwriter *w) {
 }
 
 int oc_dbwriter_eventfd(oc_dbwriter *w) { return w->evfd; }
+
+int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
+                               const char *audience, const char *pubkey_pem,
+                               const char *oidc_params) {
+    if (!issuer || !audience || !pubkey_pem) return -1;
+    free(w->oidc_issuer); free(w->oidc_audience);
+    free(w->oidc_pubkey_pem); free(w->oidc_params);
+    w->oidc_issuer     = strdup(issuer);
+    w->oidc_audience   = strdup(audience);
+    w->oidc_pubkey_pem = strdup(pubkey_pem);
+    w->oidc_params     = strdup(oidc_params ? oidc_params : "");
+    if (!w->oidc_issuer || !w->oidc_audience || !w->oidc_pubkey_pem || !w->oidc_params)
+        return -1;
+    w->oidc_enabled = 1;
+    /* v1 is one mode per tenant: OIDC replaces local, session stays. */
+    w->auth_methods = OC_AUTH_OIDC | OC_AUTH_SESSION;
+    return 0;
+}
+
+uint8_t oc_dbwriter_auth_methods(oc_dbwriter *w) { return w->auth_methods; }
+
+const char *oc_dbwriter_oidc_params(oc_dbwriter *w) {
+    return w->oidc_params ? w->oidc_params : "";
+}
 
 /* Setup-time helper: submit a REGISTER job and block for its result. Intended
  * for bootstrap / test fixtures before the net loop is serving traffic — it
@@ -593,6 +683,7 @@ oc_dbwriter *oc_dbwriter_start(const char *path) {
     oc_dbwriter *w = calloc(1, sizeof *w);
     if (!w) return NULL;
     w->evfd = -1;
+    w->auth_methods = OC_AUTH_LOCAL | OC_AUTH_SESSION;  /* local mode by default */
 
     if (sqlite3_open(path, &w->db) != SQLITE_OK) {
         fprintf(stderr, "dbwriter: open %s failed: %s\n", path, sqlite3_errmsg(w->db));
@@ -643,6 +734,8 @@ void oc_dbwriter_stop(oc_dbwriter *w) {
     }
     for (oc_job *j = w->jobs_head; j; ) { oc_job *n = j->next; job_free(j); j = n; }
     for (oc_dbres *r = w->res_head; r; ) { oc_dbres *n = r->next; oc_dbres_free(r); r = n; }
+    free(w->oidc_issuer); free(w->oidc_audience);
+    free(w->oidc_pubkey_pem); free(w->oidc_params);
     if (w->evfd >= 0) close(w->evfd);
     sqlite3_close(w->db);
     free(w);

@@ -145,7 +145,7 @@ static void send_bytes(int ep, conn **conns, int fd, const uint8_t *buf, size_t 
 
 /* Build WELCOME/REJECT for a HELLO into the connection's out buffer.
  * Returns 0 to keep the connection, -1 to close it (fatal REJECT/malformed). */
-static int handle_hello(conn *c, oc_rbuf *payload) {
+static int handle_hello(conn *c, oc_rbuf *payload, oc_dbwriter *dbw) {
     oc_hello h;
     oc_wbuf w;
     uint8_t tmp[128];
@@ -172,12 +172,15 @@ static int handle_hello(conn *c, oc_rbuf *payload) {
     out_append(c, tmp, w.len);
 
     /* Immediately advertise the auth methods this deployment accepts (AUTH.md
-     * §5). This is a local-mode daemon: local passwords plus session reconnect.
-     * OIDC advertising (with oidc_params) arrives with the OIDC milestone. */
-    oc_wbuf_init(&w, tmp, sizeof tmp);
-    oc_auth_challenge ch = { OC_AUTH_LOCAL | OC_AUTH_SESSION, { NULL, 0 } };
-    oc_encode_auth_challenge(&w, OC_PROTOCOL_VERSION, &ch);
-    out_append(c, tmp, w.len);
+     * §5) — local+session, or oidc+session in OIDC mode — plus the OIDC params
+     * blob (empty in local mode). Sized for an authorize URL in oidc_params. */
+    {
+        uint8_t cbuf[1024]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+        oc_auth_challenge ch = { oc_dbwriter_auth_methods(dbw),
+                                 oc_slice_str(oc_dbwriter_oidc_params(dbw)) };
+        oc_encode_auth_challenge(&cw, OC_PROTOCOL_VERSION, &ch);
+        out_append(c, cbuf, cw.len);
+    }
     return 0;
 }
 
@@ -199,7 +202,7 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
         if (!c->did_hello) {
             if (hdr.msg_type != OC_MSG_HELLO) return -1;
             c->did_hello = 1;
-            if (handle_hello(c, &p) < 0) return -1;
+            if (handle_hello(c, &p, dbw) < 0) return -1;
             continue;
         }
 
