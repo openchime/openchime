@@ -93,7 +93,7 @@ static int do_handshake(client *c) {
 
 static int do_auth(client *c, const char *token, uint64_t *uid) {
     uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_auth a = { oc_slice_str(token) };
+    oc_auth a = { OC_AUTH_LOCAL, oc_slice_str(token) };
     if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a) != 0 || write_all(&c->conn, buf, w.len) != 0) return -1;
     oc_header hdr; oc_rbuf p;
     if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_AUTH_OK) return -1;

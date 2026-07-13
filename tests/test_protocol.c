@@ -99,18 +99,37 @@ static void test_handshake_frames(void) {
 
 static void test_auth_frames(void) {
     {
-        oc_auth in = { oc_slice_str("eyJ.header.sig") };
+        /* AUTH_CHALLENGE — the server advertises its enabled methods (a bitset)
+         * plus any OIDC authorize params. */
+        oc_auth_challenge in = { OC_AUTH_LOCAL | OC_AUTH_OIDC, oc_slice_str("issuer=https://c") };
+        ROUNDTRIP(oc_encode_auth_challenge(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_CHALLENGE, h, p);
+        oc_auth_challenge out;
+        CHECK(oc_decode_auth_challenge(&p, &out) == OC_OK);
+        CHECK(out.methods == (OC_AUTH_LOCAL | OC_AUTH_OIDC));
+        CHECK(slice_eq_str(out.oidc_params, "issuer=https://c"));
+    }
+    {
+        /* AUTH — method-discriminated credential (here a local password). */
+        oc_auth in = { OC_AUTH_LOCAL, oc_slice_str("alice:hunter2") };
         ROUNDTRIP(oc_encode_auth(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH, h, p);
         oc_auth out;
         CHECK(oc_decode_auth(&p, &out) == OC_OK);
-        CHECK(slice_eq_str(out.jwt, "eyJ.header.sig"));
+        CHECK(out.method == OC_AUTH_LOCAL);
+        CHECK(slice_eq_str(out.credential, "alice:hunter2"));
     }
     {
-        oc_auth_ok in = { 42, 1751200999000ull };
+        /* AUTH_OK — carries the tenant role and a fresh 32-byte session token. */
+        uint8_t token[OC_SESSION_TOKEN_LEN];
+        memset(token, 0xA5, sizeof token);
+        oc_auth_ok in = { 42, OC_ROLE_OWNER, 1751200999000ull,
+                          { token, sizeof token } };
         ROUNDTRIP(oc_encode_auth_ok(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_AUTH_OK, h, p);
         oc_auth_ok out;
         CHECK(oc_decode_auth_ok(&p, &out) == OC_OK);
-        CHECK(out.user_id == 42 && out.session_expiry == 1751200999000ull);
+        CHECK(out.user_id == 42 && out.role == OC_ROLE_OWNER);
+        CHECK(out.session_expiry == 1751200999000ull);
+        CHECK(out.session_token.len == OC_SESSION_TOKEN_LEN);
+        CHECK(memcmp(out.session_token.ptr, token, sizeof token) == 0);
     }
 }
 

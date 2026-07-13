@@ -235,17 +235,27 @@ oc_result oc_encode_reject(oc_wbuf *w, const oc_reject *m) {
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_auth_challenge(oc_wbuf *w, uint16_t version, const oc_auth_challenge *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_AUTH_CHALLENGE);
+    oc_w_u8(w, m->methods);
+    oc_w_str(w, m->oidc_params);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_auth(oc_wbuf *w, uint16_t version, const oc_auth *m) {
-    OC_CHECK_BODY(m->jwt);
+    OC_CHECK_BODY(m->credential);
     size_t off = oc_frame_begin(w, version, OC_MSG_AUTH);
-    oc_w_lstr(w, m->jwt);
+    oc_w_u8(w, m->method);
+    oc_w_lstr(w, m->credential);
     return oc_frame_end(w, off);
 }
 
 oc_result oc_encode_auth_ok(oc_wbuf *w, uint16_t version, const oc_auth_ok *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_AUTH_OK);
     oc_w_u64(w, m->user_id);
+    oc_w_u8(w, m->role);
     oc_w_u64(w, m->session_expiry);
+    oc_w_bytes(w, m->session_token);
     return oc_frame_end(w, off);
 }
 
@@ -331,14 +341,23 @@ oc_result oc_decode_reject(oc_rbuf *p, oc_reject *m) {
     return r_done(p);
 }
 
+oc_result oc_decode_auth_challenge(oc_rbuf *p, oc_auth_challenge *m) {
+    m->methods = oc_r_u8(p);
+    m->oidc_params = oc_r_str(p);
+    return r_done(p);
+}
+
 oc_result oc_decode_auth(oc_rbuf *p, oc_auth *m) {
-    m->jwt = oc_r_lstr(p);
+    m->method = oc_r_u8(p);
+    m->credential = oc_r_lstr(p);
     return r_done(p);
 }
 
 oc_result oc_decode_auth_ok(oc_rbuf *p, oc_auth_ok *m) {
     m->user_id = oc_r_u64(p);
+    m->role = oc_r_u8(p);
     m->session_expiry = oc_r_u64(p);
+    m->session_token = oc_r_bytes(p);
     return r_done(p);
 }
 

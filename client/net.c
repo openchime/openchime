@@ -183,7 +183,7 @@ static void *net_thread(void *arg) {
      * AUTH_CHALLENGE/method flow lands with the auth-core milestone). */
     {
         uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-        oc_auth a = { oc_slice_str(n->token ? n->token : "client") };
+        oc_auth a = { OC_AUTH_LOCAL, oc_slice_str(n->token ? n->token : "client") };
         if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a) != OC_OK || write_all(&conn, fd, buf, w.len, &n->stop) != 0) goto drop;
         oc_header hdr; oc_rbuf p;
         if (read_one(&conn, fd, &fb, &hdr, &p, &n->stop) != 0) goto drop;

@@ -43,6 +43,7 @@ typedef enum {
     OC_MSG_REJECT           = 0x0003, /* S->C, frozen@v1, fatal */
     OC_MSG_AUTH             = 0x0010, /* C->S */
     OC_MSG_AUTH_OK          = 0x0011, /* S->C */
+    OC_MSG_AUTH_CHALLENGE   = 0x0012, /* S->C */
     OC_MSG_SEND             = 0x0020, /* C->S */
     OC_MSG_SEND_ACK         = 0x0021, /* S->C */
     OC_MSG_BROADCAST        = 0x0022, /* S->C */
@@ -157,13 +158,28 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
                                uint16_t server_min, uint16_t server_max,
                                uint16_t *chosen, uint16_t *reject_code);
 
+/* --- Auth methods and roles (PROTOCOL.md §4, AUTH.md) ------------------- */
+
+/* AUTH `method` discriminator; also the bitset in AUTH_CHALLENGE.methods. */
+#define OC_AUTH_LOCAL   0x01u   /* username + password (ARCH-59) */
+#define OC_AUTH_OIDC    0x02u   /* central-issued ES256 JWT (ARCH-56/57) */
+#define OC_AUTH_SESSION 0x04u   /* a prior session token (reconnect, ARCH-58) */
+
+/* AUTH_OK.role (ARCH-60). */
+#define OC_ROLE_MEMBER  0u
+#define OC_ROLE_ADMIN   1u
+#define OC_ROLE_OWNER   2u
+
+#define OC_SESSION_TOKEN_LEN 32u  /* random session token; only its hash is stored */
+
 /* --- Frame payload structs ---------------------------------------------- */
 
 typedef struct { uint16_t min_version; uint16_t max_version; oc_slice client_info; } oc_hello;
 typedef struct { uint16_t chosen_version; uint64_t server_time; } oc_welcome;
 typedef struct { uint16_t code; oc_slice message; } oc_reject;
-typedef struct { oc_slice jwt; } oc_auth;
-typedef struct { uint64_t user_id; uint64_t session_expiry; } oc_auth_ok;
+typedef struct { uint8_t methods; oc_slice oidc_params; } oc_auth_challenge;
+typedef struct { uint8_t method; oc_slice credential; } oc_auth;
+typedef struct { uint64_t user_id; uint8_t role; uint64_t session_expiry; oc_slice session_token; } oc_auth_ok;
 typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; oc_slice body; } oc_send;
 typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; uint64_t message_id; uint64_t server_time; } oc_send_ack;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time; oc_slice body; } oc_broadcast;
@@ -183,6 +199,7 @@ typedef struct { uint16_t code; uint8_t fatal; oc_slice context; oc_slice messag
 oc_result oc_encode_hello(oc_wbuf *w, const oc_hello *m);
 oc_result oc_encode_welcome(oc_wbuf *w, const oc_welcome *m);
 oc_result oc_encode_reject(oc_wbuf *w, const oc_reject *m);
+oc_result oc_encode_auth_challenge(oc_wbuf *w, uint16_t version, const oc_auth_challenge *m);
 oc_result oc_encode_auth(oc_wbuf *w, uint16_t version, const oc_auth *m);
 oc_result oc_encode_auth_ok(oc_wbuf *w, uint16_t version, const oc_auth_ok *m);
 oc_result oc_encode_send(oc_wbuf *w, uint16_t version, const oc_send *m);
@@ -204,6 +221,7 @@ oc_result oc_encode_error(oc_wbuf *w, uint16_t version, const oc_error *m);
 oc_result oc_decode_hello(oc_rbuf *p, oc_hello *m);
 oc_result oc_decode_welcome(oc_rbuf *p, oc_welcome *m);
 oc_result oc_decode_reject(oc_rbuf *p, oc_reject *m);
+oc_result oc_decode_auth_challenge(oc_rbuf *p, oc_auth_challenge *m);
 oc_result oc_decode_auth(oc_rbuf *p, oc_auth *m);
 oc_result oc_decode_auth_ok(oc_rbuf *p, oc_auth_ok *m);
 oc_result oc_decode_send(oc_rbuf *p, oc_send *m);

@@ -200,7 +200,7 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
                 oc_auth a;
                 if (oc_decode_auth(&p, &a) != OC_OK) return -1;
                 oc_job *j = oc_job_new(OC_JOB_AUTH, c->conn_id);
-                if (!j || oc_job_set_token(j, a.jwt.ptr, a.jwt.len) != 0) return -1;
+                if (!j || oc_job_set_token(j, a.credential.ptr, a.credential.len) != 0) return -1;
                 oc_dbwriter_submit(dbw, j);
                 continue;
             }
@@ -279,7 +279,8 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         c->authed = 1;
         c->user_id = r->user_id;
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
-        oc_auth_ok m = { r->user_id, 0 /* session_expiry: real value with real AUTH */ };
+        /* role/session are filled in by the real auth core; stub sends defaults. */
+        oc_auth_ok m = { r->user_id, OC_ROLE_MEMBER, 0, { NULL, 0 } };
         oc_encode_auth_ok(&w, OC_PROTOCOL_VERSION, &m);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
