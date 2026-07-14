@@ -9,9 +9,10 @@ messaging path — the frames the v1 codec already supports (send / broadcast /
 ack / backfill). **Migration 0002** (§3) adds the authentication data model
 (sessions, local credentials, invites, and `users` role/avatar) for the two-mode
 auth design ([AUTH.md](./AUTH.md)). **Migration 0003** (§3a) adds a
-`users.disabled` lockout flag for tenant member removal (REQ-033). Reactions (REQ-070), threads (REQ-060),
-full-text search (REQ-080/FTS5), presence, notification config, and attachments
-are intentionally **not** here yet; each is a future migration once its own
+`users.disabled` lockout flag for tenant member removal (REQ-033). **Migration
+0004** (§3b) adds emoji reactions (REQ-070/071). Threads (REQ-060), full-text
+search (REQ-080/FTS5), presence, notification config, and attachments are
+intentionally **not** here yet; each is a future migration once its own
 requirement is settled.
 
 ---
@@ -203,11 +204,34 @@ their row (which authored messages/tombstones still reference). Appended as
 
 ---
 
+## 3b. Migration 0004 — reactions
+
+Emoji reactions (REQ-070/071), added as `MIGRATION_0004`.
+
+### `reactions`
+The composite primary key enforces REQ-070's "one reaction of a given emoji per
+user per message": an add is `INSERT OR IGNORE` (no stacking), a remove is a
+delete (toggle), and the aggregate per emoji is a `COUNT(*)`. A message tombstone
+(REQ-052) deletes its reaction rows.
+
+| column          | type    | notes                                            |
+|-----------------|---------|--------------------------------------------------|
+| `message_id`    | INTEGER | → `messages(id)`.                                |
+| `user_id`       | INTEGER | → `users(id)`.                                   |
+| `emoji`         | TEXT    | the reacted emoji (≤ 32 bytes on the wire).       |
+| `created_at_ms` | INTEGER |                                                  |
+|                 |         | primary key `(message_id, user_id, emoji)`.      |
+
+Index `idx_reactions_message (message_id)` serves per-message aggregation and the
+`LIST_REACTIONS` inspection query (PROTOCOL.md §5.9).
+
+---
+
 ## 4. Deferred to later migrations
 
 Tracked here so the omissions are deliberate, not forgotten:
 
-- **Reactions** (REQ-070/071), **threads** (parent linkage, REQ-060/061).
+- **Threads** (parent linkage, REQ-060/061).
 - **FTS5** full-text index over `messages.body` (REQ-080, ARCH-15).
 - **Presence / typing** (REQ-120/121) — likely in-memory, not schema.
 - **Notification settings** and DND (REQ-130/131).

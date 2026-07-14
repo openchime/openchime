@@ -339,6 +339,44 @@ oc_result oc_encode_msg_deleted(oc_wbuf *w, uint16_t version, const oc_msg_delet
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_react(oc_wbuf *w, uint16_t version, const oc_react *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_REACT);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->message_id);
+    oc_w_str(w, m->emoji);
+    oc_w_u8(w, m->op);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_reaction_updated(oc_wbuf *w, uint16_t version, const oc_reaction_updated *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_REACTION_UPDATED);
+    oc_w_u64(w, m->message_id);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->user_id);
+    oc_w_str(w, m->emoji);
+    oc_w_u8(w, m->op);
+    oc_w_u64(w, m->count);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_list_reactions(oc_wbuf *w, uint16_t version, const oc_list_reactions *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_REACTIONS);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->message_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_reactions(oc_wbuf *w, uint16_t version, const oc_reactions *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_REACTIONS);
+    oc_w_u64(w, m->message_id);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        oc_w_str(w, m->entries[i].emoji);
+        oc_w_u64(w, m->entries[i].user_id);
+    }
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_create_channel(oc_wbuf *w, uint16_t version, const oc_create_channel *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CREATE_CHANNEL);
     oc_w_str(w, m->name);
@@ -591,6 +629,43 @@ oc_result oc_decode_msg_deleted(oc_rbuf *p, oc_msg_deleted *m) {
     m->author_id = oc_r_u64(p);
     m->deleted_by = oc_r_u64(p);
     m->deleted_at = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_react(oc_rbuf *p, oc_react *m) {
+    m->channel_id = oc_r_u64(p);
+    m->message_id = oc_r_u64(p);
+    m->emoji = oc_r_str(p);
+    m->op = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_reaction_updated(oc_rbuf *p, oc_reaction_updated *m) {
+    m->message_id = oc_r_u64(p);
+    m->channel_id = oc_r_u64(p);
+    m->user_id = oc_r_u64(p);
+    m->emoji = oc_r_str(p);
+    m->op = oc_r_u8(p);
+    m->count = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_list_reactions(oc_rbuf *p, oc_list_reactions *m) {
+    m->channel_id = oc_r_u64(p);
+    m->message_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_reactions(oc_rbuf *p, oc_reaction_entry *entries, uint16_t cap,
+                              uint16_t *out_count, uint64_t *out_message_id) {
+    *out_message_id = oc_r_u64(p);
+    uint16_t count = oc_r_u16(p);
+    *out_count = count;
+    for (uint16_t i = 0; i < count; i++) {
+        oc_slice emoji = oc_r_str(p);
+        uint64_t uid = oc_r_u64(p);
+        if (i < cap) { entries[i].emoji = emoji; entries[i].user_id = uid; }
+    }
     return r_done(p);
 }
 

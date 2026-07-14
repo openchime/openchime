@@ -217,6 +217,45 @@ static void test_messaging_frames(void) {
     }
 }
 
+static void test_reaction_frames(void) {
+    {
+        oc_react in = { 7, 1001, oc_slice_str("\xF0\x9F\x91\x8D"), OC_REACT_ADD };
+        ROUNDTRIP(oc_encode_react(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REACT, h, p);
+        oc_react out;
+        CHECK(oc_decode_react(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.message_id == 1001 && out.op == OC_REACT_ADD);
+        CHECK(slice_eq_str(out.emoji, "\xF0\x9F\x91\x8D"));
+    }
+    {
+        oc_reaction_updated in = { 1001, 7, 42, oc_slice_str(":tada:"), OC_REACT_ADD, 3 };
+        ROUNDTRIP(oc_encode_reaction_updated(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REACTION_UPDATED, h, p);
+        oc_reaction_updated out;
+        CHECK(oc_decode_reaction_updated(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1001 && out.channel_id == 7 && out.user_id == 42);
+        CHECK(slice_eq_str(out.emoji, ":tada:") && out.op == OC_REACT_ADD && out.count == 3);
+    }
+    {
+        oc_list_reactions in = { 7, 1001 };
+        ROUNDTRIP(oc_encode_list_reactions(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_REACTIONS, h, p);
+        oc_list_reactions out;
+        CHECK(oc_decode_list_reactions(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.message_id == 1001);
+    }
+    {
+        oc_reaction_entry ents[2] = {
+            { oc_slice_str(":+1:"),   5 },
+            { oc_slice_str(":tada:"), 9 },
+        };
+        oc_reactions in = { 1001, 2, ents };
+        ROUNDTRIP(oc_encode_reactions(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REACTIONS, h, p);
+        oc_reaction_entry out[2]; uint16_t n = 0; uint64_t mid = 0;
+        CHECK(oc_decode_reactions(&p, out, 2, &n, &mid) == OC_OK);
+        CHECK(mid == 1001 && n == 2);
+        CHECK(slice_eq_str(out[0].emoji, ":+1:") && out[0].user_id == 5);
+        CHECK(slice_eq_str(out[1].emoji, ":tada:") && out[1].user_id == 9);
+    }
+}
+
 static void test_channel_frames(void) {
     {
         oc_create_channel in = { oc_slice_str("engineering"), 0 };
@@ -499,6 +538,7 @@ int run_protocol_tests(void) {
     test_handshake_frames();
     test_auth_frames();
     test_messaging_frames();
+    test_reaction_frames();
     test_channel_frames();
     test_admin_frames();
     test_backfill_and_error();

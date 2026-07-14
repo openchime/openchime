@@ -31,7 +31,7 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_CREATE_CHANNEL = 9, OC_JOB_LIST_CHANNELS = 10, OC_JOB_JOIN_CHANNEL = 11,
        OC_JOB_LEAVE_CHANNEL = 12, OC_JOB_INVITE_CHANNEL = 13, OC_JOB_REMOVE_CHANNEL = 14,
        OC_JOB_LIST_USERS = 15, OC_JOB_INVITE_USER = 16, OC_JOB_REMOVE_USER = 17,
-       OC_JOB_REDEEM = 18 };
+       OC_JOB_REDEEM = 18, OC_JOB_REACT = 19, OC_JOB_LIST_REACTIONS = 20 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -62,6 +62,10 @@ typedef struct oc_job {
     char          *ch_name;    /* heap */
     uint8_t        ch_is_public;
 
+    /* REACT (channel_id + message_id above); emoji is heap, op is add/remove. */
+    char          *emoji;      /* heap */
+    uint8_t        react_op;
+
     /* LOGOUT (revoke sessions; REQ-182). Actor is `user_id`; the token to revoke
      * (scope THIS) is carried in `token`/`token_len`. */
     uint8_t        scope;     /* OC_LOGOUT_THIS / OC_LOGOUT_ALL */
@@ -90,7 +94,11 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_CHANNEL_INFO = 16, OC_RES_CHANNEL_ERR = 17,
        OC_RES_CHANNEL_LIST = 18, OC_RES_USER_LIST = 19,
        OC_RES_INVITE_OK = 20, OC_RES_INVITE_ERR = 21,
-       OC_RES_USER_UPDATED = 22, OC_RES_USER_ERR = 23 };
+       OC_RES_USER_UPDATED = 22, OC_RES_USER_ERR = 23,
+       OC_RES_REACTION_OK = 24, OC_RES_REACTION_ERR = 25, OC_RES_REACTIONS = 26 };
+
+/* One row in a REACTIONS result (a distinct emoji + one reacting user). */
+typedef struct { char *emoji; uint64_t user_id; } oc_reaction_row;
 
 /* One row in a CHANNEL_LIST result (net thread renders as a list entry). */
 typedef struct {
@@ -163,6 +171,15 @@ typedef struct oc_dbres {
     uint8_t         disabled;       /* USER_UPDATED: the target's disabled flag */
     oc_user_row    *ulist;          /* USER_LIST: heap array */
     size_t          n_ulist;
+
+    /* Reactions (REQ-070/071). REACTION_OK: emoji + op + aggregate count for the
+     * fan-out (message_id/channel_id/user_id above, members for the recipients).
+     * REACTIONS: the full per-message reactor list. */
+    char           *emoji;          /* heap; REACTION_OK */
+    uint8_t         react_op;
+    uint64_t        react_count;
+    oc_reaction_row *rlist;         /* heap array; REACTIONS */
+    size_t           n_rlist;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;

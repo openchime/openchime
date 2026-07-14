@@ -101,11 +101,11 @@ static void test_embedded_schema(void) {
     char *err = NULL;
     CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
     CHECK(err == NULL);
-    CHECK(oc_schema_version(db) == 3);   /* 0001 core + 0002 auth + 0003 disabled */
+    CHECK(oc_schema_version(db) == 4);   /* 0001 core + 0002 auth + 0003 disabled + 0004 reactions */
 
     const char *tables[] = { "users", "channels", "channel_members",
                              "messages", "sent_messages",
-                             "sessions", "local_credentials", "invites" };
+                             "sessions", "local_credentials", "invites", "reactions" };
     for (size_t i = 0; i < sizeof tables / sizeof tables[0]; i++) {
         CHECK(table_exists(db, tables[i]));
     }

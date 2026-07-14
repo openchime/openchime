@@ -50,7 +50,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 3);
+    CHECK(oc_schema_version(db) == 4);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -908,6 +908,133 @@ static void test_admin_ops(void) {
     cleanup_db(path);
 }
 
+/* --- Reactions (REQ-070/071) -------------------------------------------- */
+
+static oc_dbres *react(oc_dbwriter *w, uint64_t uid, uint64_t ch, uint64_t mid,
+                       const char *emoji, uint8_t op) {
+    oc_job *j = oc_job_new(OC_JOB_REACT, 110);
+    j->user_id = uid; j->channel_id = ch; j->message_id = mid; j->react_op = op;
+    j->emoji = strdup(emoji);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *list_reactions_r(oc_dbwriter *w, uint64_t uid, uint64_t ch, uint64_t mid) {
+    oc_job *j = oc_job_new(OC_JOB_LIST_REACTIONS, 111);
+    j->user_id = uid; j->channel_id = ch; j->message_id = mid;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static uint64_t send_id(oc_dbwriter *w, uint64_t uid, uint64_t ch, const char *body) {
+    oc_job *j = oc_job_new(OC_JOB_SEND, 112);
+    j->user_id = uid; j->channel_id = ch;
+    memset(j->idem, ++g_send_seq, OC_IDEM_LEN);
+    oc_job_set_body(j, body, strlen(body));
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    uint64_t id = (r && r->type == OC_RES_SEND_OK) ? r->message_id : 0;
+    oc_dbres_free(r);
+    return id;
+}
+
+static void test_reactions(void) {
+    const char *path = "build/test_dbwriter_react.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t alice = reg(w, "rx-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "rx-bob",   "pw", OC_ROLE_MEMBER);
+    uint64_t carol = reg(w, "rx-carol", "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob && carol);
+
+    uint8_t idem[OC_IDEM_LEN]; memset(idem, 0xC1, sizeof idem);
+    uint64_t mid = send_msg(w, alice, idem, "react to me");
+    CHECK(mid != 0);
+
+    /* alice adds :+1:; the aggregate is 1, and the fan-out spans all members. */
+    oc_dbres *r = react(w, alice, OC_DEFAULT_CHANNEL, mid, ":+1:", OC_REACT_ADD);
+    CHECK(r && r->type == OC_RES_REACTION_OK);
+    CHECK(r->react_op == OC_REACT_ADD && r->react_count == 1 && r->user_id == alice);
+    CHECK(r->message_id == mid && r->n_members == 3);
+    CHECK(strcmp(r->emoji, ":+1:") == 0);
+    oc_dbres_free(r);
+
+    /* bob adds the same emoji -> aggregate 2. */
+    r = react(w, bob, OC_DEFAULT_CHANNEL, mid, ":+1:", OC_REACT_ADD);
+    CHECK(r && r->type == OC_RES_REACTION_OK && r->react_count == 2);
+    oc_dbres_free(r);
+
+    /* A repeat add by alice does not stack (still 2, REQ-070). */
+    r = react(w, alice, OC_DEFAULT_CHANNEL, mid, ":+1:", OC_REACT_ADD);
+    CHECK(r && r->type == OC_RES_REACTION_OK && r->react_count == 2);
+    oc_dbres_free(r);
+
+    /* A distinct emoji aggregates separately. */
+    r = react(w, carol, OC_DEFAULT_CHANNEL, mid, ":tada:", OC_REACT_ADD);
+    CHECK(r && r->type == OC_RES_REACTION_OK && r->react_count == 1);
+    oc_dbres_free(r);
+
+    /* Inspect: three rows (:+1:/alice, :+1:/bob, :tada:/carol), ordered. */
+    r = list_reactions_r(w, bob, OC_DEFAULT_CHANNEL, mid);
+    CHECK(r && r->type == OC_RES_REACTIONS && r->n_rlist == 3);
+    int plus = 0, tada = 0;
+    for (size_t i = 0; i < r->n_rlist; i++) {
+        if (strcmp(r->rlist[i].emoji, ":+1:") == 0) plus++;
+        if (strcmp(r->rlist[i].emoji, ":tada:") == 0) tada++;
+    }
+    CHECK(plus == 2 && tada == 1);
+    oc_dbres_free(r);
+
+    /* Toggle off: bob removes :+1: -> aggregate 1. */
+    r = react(w, bob, OC_DEFAULT_CHANNEL, mid, ":+1:", OC_REACT_REMOVE);
+    CHECK(r && r->type == OC_RES_REACTION_OK && r->react_op == OC_REACT_REMOVE && r->react_count == 1);
+    oc_dbres_free(r);
+
+    /* An empty or oversized emoji is refused. */
+    r = react(w, alice, OC_DEFAULT_CHANNEL, mid, "", OC_REACT_ADD);
+    CHECK(r && r->type == OC_RES_REACTION_ERR && r->err_code == OC_ERR_INVALID_REACTION);
+    oc_dbres_free(r);
+    r = react(w, alice, OC_DEFAULT_CHANNEL, mid, "0123456789012345678901234567890123", OC_REACT_ADD);
+    CHECK(r && r->type == OC_RES_REACTION_ERR && r->err_code == OC_ERR_INVALID_REACTION);
+    oc_dbres_free(r);
+
+    /* Reacting to a message that does not exist is UNKNOWN_MESSAGE. */
+    r = react(w, alice, OC_DEFAULT_CHANNEL, 99999, ":+1:", OC_REACT_ADD);
+    CHECK(r && r->type == OC_RES_REACTION_ERR && r->err_code == OC_ERR_UNKNOWN_MESSAGE);
+    oc_dbres_free(r);
+
+    /* Private read gate: a non-member cannot react to, or inspect, a message in
+     * a private channel they do not belong to (REQ-070/031). */
+    r = create_channel(w, alice, "vault", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t vault = r->channel_id;
+    oc_dbres_free(r);
+    uint64_t pmid = send_id(w, alice, vault, "secret");
+    CHECK(pmid != 0);
+    r = react(w, carol, vault, pmid, ":eyes:", OC_REACT_ADD);
+    CHECK(r && r->type == OC_RES_REACTION_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+    r = list_reactions_r(w, carol, vault, pmid);
+    CHECK(r && r->type == OC_RES_REACTION_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+
+    /* Deleting a message clears its reactions and blocks new ones (REQ-052). */
+    r = do_delete(w, alice, OC_DEFAULT_CHANNEL, mid);
+    CHECK(r && r->type == OC_RES_DELETE_OK);
+    oc_dbres_free(r);
+    r = list_reactions_r(w, alice, OC_DEFAULT_CHANNEL, mid);
+    CHECK(r && r->type == OC_RES_REACTIONS && r->n_rlist == 0);
+    oc_dbres_free(r);
+    r = react(w, alice, OC_DEFAULT_CHANNEL, mid, ":+1:", OC_REACT_ADD);
+    CHECK(r && r->type == OC_RES_REACTION_ERR && r->err_code == OC_ERR_UNKNOWN_MESSAGE);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill\n");
     test_start_migrates_and_stops();
@@ -920,6 +1047,7 @@ int run_dbwriter_tests(void) {
     test_edit_delete();
     test_channels();
     test_admin_ops();
+    test_reactions();
     test_backfill();
     return failures;
 }

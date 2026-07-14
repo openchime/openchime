@@ -104,6 +104,7 @@ static void job_free(oc_job *j) {
     free(j->body);
     free(j->cursors);
     free(j->ch_name);
+    free(j->emoji);
     free(j);
 }
 
@@ -118,6 +119,9 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->chlist);
     for (size_t i = 0; i < r->n_ulist; i++) { free(r->ulist[i].email); free(r->ulist[i].display_name); }
     free(r->ulist);
+    free(r->emoji);
+    for (size_t i = 0; i < r->n_rlist; i++) free(r->rlist[i].emoji);
+    free(r->rlist);
     free(r);
 }
 
@@ -992,6 +996,11 @@ static oc_dbres *process_delete(sqlite3 *db, const oc_job *j) {
     if (rc != SQLITE_DONE) {
         r->type = OC_RES_DELETE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
+    /* A tombstone has no body to react to; drop its reactions (REQ-052/070). */
+    sqlite3_prepare_v2(db, "DELETE FROM reactions WHERE message_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
 
     r->type = OC_RES_DELETE_OK;
     r->author_id = author;
@@ -1183,6 +1192,100 @@ static oc_dbres *process_remove_channel(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Toggle an emoji reaction on a message (REQ-070). A user may react to any
+ * message they can read; the (message,user,emoji) PK makes a repeat add a no-op
+ * (no stacking) and remove a delete. Returns the new aggregate count for the
+ * emoji plus the member set for the fan-out. */
+static oc_dbres *process_react(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+    r->message_id = j->message_id;
+
+    size_t elen = j->emoji ? strlen(j->emoji) : 0;
+    if (elen == 0 || elen > OC_MAX_EMOJI) {
+        r->type = OC_RES_REACTION_ERR; r->err_code = OC_ERR_INVALID_REACTION; return r;
+    }
+    uint64_t author = 0; int deleted = 0;
+    if (!message_lookup(db, j->channel_id, j->message_id, &author, &deleted) || deleted) {
+        r->type = OC_RES_REACTION_ERR; r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r;
+    }
+    if (!channel_read_access(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_REACTION_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+
+    sqlite3_stmt *st = NULL;
+    if (j->react_op == OC_REACT_ADD) {
+        sqlite3_prepare_v2(db,
+            "INSERT OR IGNORE INTO reactions(message_id,user_id,emoji,created_at_ms) "
+            "VALUES(?,?,?,?);", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+        sqlite3_bind_text(st, 3, j->emoji, (int)elen, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+    } else {
+        sqlite3_prepare_v2(db,
+            "DELETE FROM reactions WHERE message_id=? AND user_id=? AND emoji=?;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+        sqlite3_bind_text(st, 3, j->emoji, (int)elen, SQLITE_STATIC);
+    }
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+
+    uint64_t count = 0;
+    sqlite3_prepare_v2(db,
+        "SELECT COUNT(*) FROM reactions WHERE message_id=? AND emoji=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+    sqlite3_bind_text(st, 2, j->emoji, (int)elen, SQLITE_STATIC);
+    if (sqlite3_step(st) == SQLITE_ROW) count = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+
+    r->type = OC_RES_REACTION_OK;
+    r->user_id = j->user_id;
+    r->emoji = strdup(j->emoji);
+    r->react_op = j->react_op;
+    r->react_count = count;
+    load_members(db, j->channel_id, r);
+    return r;
+}
+
+/* Every reaction on a message: (emoji, user_id) rows for inspection (REQ-071). */
+static oc_dbres *process_list_reactions(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->message_id = j->message_id;
+
+    uint64_t author = 0; int deleted = 0;
+    if (!message_lookup(db, j->channel_id, j->message_id, &author, &deleted)) {
+        r->type = OC_RES_REACTION_ERR; r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r;
+    }
+    if (!channel_read_access(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_REACTION_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+    r->type = OC_RES_REACTIONS;
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT emoji, user_id FROM reactions WHERE message_id=? ORDER BY emoji, user_id;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+    size_t cap = 8, n = 0;
+    oc_reaction_row *arr = malloc(cap * sizeof *arr);
+    while (arr && sqlite3_step(st) == SQLITE_ROW) {
+        if (n == cap) { cap *= 2; oc_reaction_row *g = realloc(arr, cap * sizeof *arr); if (!g) break; arr = g; }
+        arr[n].emoji   = strdup((const char *)sqlite3_column_text(st, 0));
+        arr[n].user_id = (uint64_t)sqlite3_column_int64(st, 1);
+        n++;
+    }
+    sqlite3_finalize(st);
+    r->rlist = arr;
+    r->n_rlist = n;
+    return r;
+}
+
 /* Replay messages newer than each cursor, for channels the user belongs to,
  * bounded by OC_BACKFILL_MAX total (REQ-101, PROTOCOL.md §6). */
 static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
@@ -1283,6 +1386,8 @@ static void *writer_loop(void *arg) {
         else if (j->type == OC_JOB_INVITE_USER)    r = process_invite_user(w->db, j);
         else if (j->type == OC_JOB_REMOVE_USER)    r = process_remove_user(w->db, j);
         else if (j->type == OC_JOB_REDEEM)         r = process_redeem(w->db, j);
+        else if (j->type == OC_JOB_REACT)          r = process_react(w->db, j);
+        else if (j->type == OC_JOB_LIST_REACTIONS) r = process_list_reactions(w->db, j);
         job_free(j);
         push_result(w, r);
     }

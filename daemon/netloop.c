@@ -24,6 +24,7 @@
  * client with more would page (not needed at current scale). */
 #define OC_CHANNEL_LIST_MAX 512
 #define OC_USER_LIST_MAX    512
+#define OC_REACTION_LIST_MAX 1024
 
 typedef enum { CONN_HANDSHAKE, CONN_ESTABLISHED } conn_state;
 
@@ -368,6 +369,33 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_REACT) {
+            oc_react rc;
+            if (oc_decode_react(&p, &rc) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_REACT, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = rc.channel_id;
+            j->message_id = rc.message_id;
+            j->react_op = rc.op;
+            j->emoji = malloc(rc.emoji.len + 1);
+            if (!j->emoji) return -1;
+            if (rc.emoji.len) memcpy(j->emoji, rc.emoji.ptr, rc.emoji.len);
+            j->emoji[rc.emoji.len] = '\0';
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_REACTIONS) {
+            oc_list_reactions lr;
+            if (oc_decode_list_reactions(&p, &lr) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_REACTIONS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = lr.channel_id;
+            j->message_id = lr.message_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_CLIENT_ACK) {
             oc_client_ack ca;
             oc_decode_client_ack(&p, &ca); /* accepted; the client drives backfill via its own cursors */
@@ -668,6 +696,50 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
                 if (r->disabled && conns[fd]) conn_close(ep, conns, fd);
             }
         }
+        break;
+    }
+    case OC_RES_REACTION_OK: {
+        /* Fan the reaction change out to every connected member (REQ-070/071). */
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_reaction_updated m = { r->message_id, r->channel_id, r->user_id,
+                                  oc_slice_str(r->emoji ? r->emoji : ""),
+                                  r->react_op, r->react_count };
+        oc_encode_reaction_updated(&w, OC_PROTOCOL_VERSION, &m);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_REACTION_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        uint8_t ctx[8];
+        for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->message_id >> (56 - 8 * i));
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice cs = { ctx, sizeof ctx };
+        oc_error e = { r->err_code, 0, cs, oc_slice_str("reaction rejected") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_REACTIONS: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        size_t n = r->n_rlist > OC_REACTION_LIST_MAX ? OC_REACTION_LIST_MAX : r->n_rlist;
+        oc_reaction_entry *ents = n ? malloc(n * sizeof *ents) : NULL;
+        if (n && !ents) n = 0;
+        for (size_t i = 0; i < n; i++) {
+            ents[i].emoji = oc_slice_str(r->rlist[i].emoji ? r->rlist[i].emoji : "");
+            ents[i].user_id = r->rlist[i].user_id;
+        }
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_reactions rr = { r->message_id, (uint16_t)n, ents };
+        oc_encode_reactions(&w, OC_PROTOCOL_VERSION, &rr);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        free(ents);
         break;
     }
     case OC_RES_BACKFILL_OK: {

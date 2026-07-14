@@ -6,20 +6,19 @@ It is the detailed realization of the frame decisions in
 resolves the protocol-shaped `[needs ARCH decision]` items in
 [REQUIREMENTS.md](./REQUIREMENTS.md).
 
-**Scope of this revision.** This covers the *core messaging path* only:
-connection handshake and version negotiation, authentication, the message
-send/broadcast/ack cycle, message edit/delete (§5.5/5.6), reconnect backfill,
-and the error frame. Presence
-(REQ-120/121), typing indicators, reactions (REQ-070/071), threads
-(REQ-060/061), notification configuration, and audio-call signaling
-(REQ-150–152) are deliberately out of scope here and will be added in later
-revisions of this document, reusing the framing and encoding rules defined
-below. New message types are additive; the header format and the frozen
-handshake frames (§3) do not change.
+**Scope of this revision.** This covers connection handshake and version
+negotiation, authentication, the message send/broadcast/ack cycle, message
+edit/delete (§5.5/5.6), reactions (§5.9), channel management (§5.7), tenant
+administration (§5.8), and reconnect backfill, plus the error frame. Presence
+(REQ-120/121), typing indicators, threads (REQ-060/061), notification
+configuration, and audio-call signaling (REQ-150–152) are deliberately out of
+scope here and will be added in later revisions of this document, reusing the
+framing and encoding rules defined below. New message types are additive; the
+header format and the frozen handshake frames (§3) do not change.
 
-**Status.** Specification, not yet implemented. `daemon/main.c` today is the
-placeholder daemon (heartbeat + `/healthz`); none of the frames below exist in
-code yet.
+**Status.** Implemented. The frames in this document are realized in
+`shared/protocol.c` (codec), `daemon/dbwriter.c` (handlers), and
+`daemon/netloop.c` (dispatch), exercised end-to-end by the test suite.
 
 ---
 
@@ -549,6 +548,49 @@ live connections receive the same notice and are then dropped.
 (`FORBIDDEN`, `LAST_OWNER`, `INTERNAL_ERROR`); a `REDEEM_INVITE` failure is fatal
 (the connection never authenticated).
 
+### 5.9 Reactions (REQ-070, REQ-071)
+
+A user may attach emoji reactions to any message they can **read** (public
+channel or a member of a private one, §5.7). A given `(message, user, emoji)` is
+unique — a repeat add is a no-op, so a reaction is toggled, never stacked
+(REQ-070).
+
+**`REACT` (client → server), msg_type `0x0028`:**
+
+| Field        | Type | Notes                                                    |
+|--------------|------|----------------------------------------------------------|
+| `channel_id` | u64  | The message's channel (for the read-access check).       |
+| `message_id` | u64  | The message being reacted to.                            |
+| `emoji`      | str  | 1..32 bytes (fits multi-codepoint sequences).            |
+| `op`         | u8   | `1` add, `0` remove.                                     |
+
+On success the daemon fans a **`REACTION_UPDATED` (server → client), msg_type
+`0x0029`** out to every connected member of the channel:
+
+| Field        | Type | Notes                                                    |
+|--------------|------|----------------------------------------------------------|
+| `message_id` | u64  | The reacted message.                                     |
+| `channel_id` | u64  | The message's channel.                                   |
+| `user_id`    | u64  | Who added/removed the reaction.                          |
+| `emoji`      | str  | The emoji.                                               |
+| `op`         | u8   | `1` add, `0` remove.                                     |
+| `count`      | u64  | New aggregate count of this emoji on the message (REQ-071). |
+
+**`LIST_REACTIONS` (client → server), msg_type `0x002A`**
+`{ channel_id: u64, message_id: u64 }` — replies **`REACTIONS` (server → client),
+msg_type `0x002B`** with the full reactor list for inspection (REQ-071):
+
+| Field        | Type            | Notes                                             |
+|--------------|-----------------|---------------------------------------------------|
+| `message_id` | u64             | The inspected message.                            |
+| `count`      | u16             | Number of entries.                                |
+| `entries[]`  | `count` × entry | Each: `emoji` (str) + `user_id` (u64), ordered by emoji then user. |
+
+Failures are non-fatal `ERROR` frames carrying the `message_id` (8 bytes,
+big-endian) in `context`: `UNKNOWN_MESSAGE` (no such message, or it is
+tombstoned — a tombstone's reactions are cleared, §5.6), `NOT_A_MEMBER` (cannot
+read the channel), or `INVALID_REACTION` (empty/oversized emoji).
+
 ---
 
 ## 6. Reconnect backfill (resolves REQ-101)
@@ -655,6 +697,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3006` | `LAST_OWNER`          | admin      | no    | Would remove or demote the tenant's last owner (REQ-030).      |
 | `3007` | `UNKNOWN_MESSAGE`     | messaging  | no    | `EDIT`/`DELETE` names a message not in the channel, or already tombstoned (§5.5/5.6). |
 | `3008` | `INVALID_CHANNEL`     | messaging  | no    | `CREATE_CHANNEL` name empty or over 64 bytes (§5.7). |
+| `3009` | `INVALID_REACTION`    | messaging  | no    | `REACT` emoji empty or over 32 bytes (§5.9). |
 | `9001` | `INTERNAL_ERROR`      | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage version codes (`1001`/`1002`) are delivered via `REJECT`, which
@@ -690,6 +733,10 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0025` | `DELETE`           | C → S     | no        | §5.6    |
 | `0x0026` | `MSG_EDITED`       | S → C     | no        | §5.5    |
 | `0x0027` | `MSG_DELETED`      | S → C     | no        | §5.6    |
+| `0x0028` | `REACT`            | C → S     | no        | §5.9    |
+| `0x0029` | `REACTION_UPDATED` | S → C     | no        | §5.9    |
+| `0x002A` | `LIST_REACTIONS`   | C → S     | no        | §5.9    |
+| `0x002B` | `REACTIONS`        | S → C     | no        | §5.9    |
 | `0x0050` | `CREATE_CHANNEL`   | C → S     | no        | §5.7    |
 | `0x0051` | `CHANNEL_INFO`     | S → C     | no        | §5.7    |
 | `0x0052` | `LIST_CHANNELS`    | C → S     | no        | §5.7    |

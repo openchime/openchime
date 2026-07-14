@@ -97,10 +97,24 @@ static const char MIGRATION_0003[] =
     "ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0 "
     "  CHECK (disabled IN (0,1));";
 
+/* 0004: emoji reactions (REQ-070/071). The composite primary key enforces
+ * "one reaction of a given emoji per user per message" — a repeat add is a
+ * silent no-op (toggle off is a delete), never a stacked duplicate. */
+static const char MIGRATION_0004[] =
+    "CREATE TABLE reactions ("
+    "  message_id    INTEGER NOT NULL REFERENCES messages(id),"
+    "  user_id       INTEGER NOT NULL REFERENCES users(id),"
+    "  emoji         TEXT NOT NULL,"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  PRIMARY KEY (message_id, user_id, emoji)"
+    ");"
+    "CREATE INDEX idx_reactions_message ON reactions(message_id);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
     { 3, MIGRATION_0003 },
+    { 4, MIGRATION_0004 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

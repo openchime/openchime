@@ -53,6 +53,10 @@ typedef enum {
     OC_MSG_DELETE           = 0x0025, /* C->S (REQ-052) */
     OC_MSG_MSG_EDITED       = 0x0026, /* S->C, edit fan-out */
     OC_MSG_MSG_DELETED      = 0x0027, /* S->C, tombstone fan-out */
+    OC_MSG_REACT            = 0x0028, /* C->S (REQ-070) */
+    OC_MSG_REACTION_UPDATED = 0x0029, /* S->C, reaction fan-out */
+    OC_MSG_LIST_REACTIONS   = 0x002A, /* C->S (REQ-071) */
+    OC_MSG_REACTIONS        = 0x002B, /* S->C */
     OC_MSG_CREATE_CHANNEL     = 0x0050, /* C->S (REQ-050) */
     OC_MSG_CHANNEL_INFO       = 0x0051, /* S->C, ack for create/join/leave/invite/remove */
     OC_MSG_LIST_CHANNELS      = 0x0052, /* C->S */
@@ -93,6 +97,7 @@ typedef enum {
     OC_ERR_LAST_OWNER          = 3006, /* would remove/demote the last owner (REQ-030) */
     OC_ERR_UNKNOWN_MESSAGE     = 3007, /* no such message in the channel (edit/delete) */
     OC_ERR_INVALID_CHANNEL     = 3008, /* bad channel name on CREATE_CHANNEL (empty/too long) */
+    OC_ERR_INVALID_REACTION    = 3009, /* empty/oversized emoji on REACT */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 
@@ -206,6 +211,12 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
  * SHA-256 is stored. Presented in REDEEM_INVITE to set a password. */
 #define OC_INVITE_TOKEN_LEN 32u
 
+/* Emoji reaction op (REQ-070) and the emoji length cap (bytes; fits multi-
+ * codepoint sequences like flags/ZWJ). */
+#define OC_REACT_REMOVE 0u
+#define OC_REACT_ADD    1u
+#define OC_MAX_EMOJI    32u
+
 /* LOGOUT scope (PROTOCOL.md §4; REQ-182). */
 #define OC_LOGOUT_THIS 0u   /* revoke just the presented session token */
 #define OC_LOGOUT_ALL  1u   /* revoke every session of the authenticated user */
@@ -227,6 +238,11 @@ typedef struct { uint64_t channel_id; uint64_t message_id; oc_slice body; } oc_e
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_delete;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t edited_at; oc_slice body; } oc_msg_edited;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t deleted_by; uint64_t deleted_at; } oc_msg_deleted;
+typedef struct { uint64_t channel_id; uint64_t message_id; oc_slice emoji; uint8_t op; } oc_react;
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t user_id; oc_slice emoji; uint8_t op; uint64_t count; } oc_reaction_updated;
+typedef struct { uint64_t channel_id; uint64_t message_id; } oc_list_reactions;
+typedef struct { oc_slice emoji; uint64_t user_id; } oc_reaction_entry;
+typedef struct { uint64_t message_id; uint16_t count; const oc_reaction_entry *entries; } oc_reactions;
 typedef struct { oc_slice name; uint8_t is_public; } oc_create_channel;
 typedef struct { uint64_t channel_id; uint8_t kind; oc_slice name; uint8_t is_public; uint8_t joined; uint64_t created_at; } oc_channel_info;
 typedef struct { uint64_t channel_id; } oc_channel_ref;                       /* JOIN / LEAVE */
@@ -268,6 +284,10 @@ oc_result oc_encode_edit(oc_wbuf *w, uint16_t version, const oc_edit *m);
 oc_result oc_encode_delete(oc_wbuf *w, uint16_t version, const oc_delete *m);
 oc_result oc_encode_msg_edited(oc_wbuf *w, uint16_t version, const oc_msg_edited *m);
 oc_result oc_encode_msg_deleted(oc_wbuf *w, uint16_t version, const oc_msg_deleted *m);
+oc_result oc_encode_react(oc_wbuf *w, uint16_t version, const oc_react *m);
+oc_result oc_encode_reaction_updated(oc_wbuf *w, uint16_t version, const oc_reaction_updated *m);
+oc_result oc_encode_list_reactions(oc_wbuf *w, uint16_t version, const oc_list_reactions *m);
+oc_result oc_encode_reactions(oc_wbuf *w, uint16_t version, const oc_reactions *m);
 oc_result oc_encode_create_channel(oc_wbuf *w, uint16_t version, const oc_create_channel *m);
 oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_info *m);
 oc_result oc_encode_list_channels(oc_wbuf *w, uint16_t version);
@@ -311,6 +331,10 @@ oc_result oc_decode_edit(oc_rbuf *p, oc_edit *m);
 oc_result oc_decode_delete(oc_rbuf *p, oc_delete *m);
 oc_result oc_decode_msg_edited(oc_rbuf *p, oc_msg_edited *m);
 oc_result oc_decode_msg_deleted(oc_rbuf *p, oc_msg_deleted *m);
+oc_result oc_decode_react(oc_rbuf *p, oc_react *m);
+oc_result oc_decode_reaction_updated(oc_rbuf *p, oc_reaction_updated *m);
+oc_result oc_decode_list_reactions(oc_rbuf *p, oc_list_reactions *m);
+oc_result oc_decode_reactions(oc_rbuf *p, oc_reaction_entry *entries, uint16_t cap, uint16_t *out_count, uint64_t *out_message_id);
 oc_result oc_decode_create_channel(oc_rbuf *p, oc_create_channel *m);
 oc_result oc_decode_channel_info(oc_rbuf *p, oc_channel_info *m);
 oc_result oc_decode_list_channels(oc_rbuf *p);

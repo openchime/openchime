@@ -439,6 +439,86 @@ static void test_channels_vertical(int port, const uint8_t *pin) {
     client_close(&cc);
 }
 
+/* Emoji reactions over the wire (REQ-070/071): two members react to a message,
+ * each REACT fans a REACTION_UPDATED with the running aggregate to every member,
+ * LIST_REACTIONS returns the reactor rows, and a remove toggles the count down. */
+static void test_reactions_vertical(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    CHECK(do_handshake(&b) == 0);
+    uint64_t ua = 0, ub = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+
+    uint8_t buf[256]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+
+    /* alice posts; learn the id, drain both members' BROADCAST. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s; s.channel_id = 1; memset(s.idem, 0x5B, OC_IDEM_SIZE);
+    s.body = oc_slice_str("react to this");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    uint64_t mid = 0;
+    for (int i = 0; i < 2; i++) {
+        CHECK(read_frame(&a, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) { oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK); mid = ack.message_id; }
+    }
+    CHECK(mid != 0);
+    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BROADCAST);
+
+    /* alice adds :+1: -> both members receive REACTION_UPDATED, count 1. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_react rc = { 1, mid, oc_slice_str(":+1:"), OC_REACT_ADD };
+    CHECK(oc_encode_react(&w, OC_PROTOCOL_VERSION, &rc) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    for (int who = 0; who < 2; who++) {
+        client *cc = who ? &a : &b;
+        CHECK(read_frame(cc, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_REACTION_UPDATED);
+        oc_reaction_updated ru; CHECK(oc_decode_reaction_updated(&p, &ru) == OC_OK);
+        CHECK(ru.message_id == mid && ru.user_id == ua && ru.op == OC_REACT_ADD && ru.count == 1);
+        CHECK(ru.emoji.len == 4 && memcmp(ru.emoji.ptr, ":+1:", 4) == 0);
+    }
+
+    /* bob adds the same emoji -> count 2 for both. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_react rc2 = { 1, mid, oc_slice_str(":+1:"), OC_REACT_ADD };
+    CHECK(oc_encode_react(&w, OC_PROTOCOL_VERSION, &rc2) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    for (int who = 0; who < 2; who++) {
+        client *cc = who ? &a : &b;
+        CHECK(read_frame(cc, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_REACTION_UPDATED);
+        oc_reaction_updated ru; CHECK(oc_decode_reaction_updated(&p, &ru) == OC_OK);
+        CHECK(ru.count == 2 && ru.user_id == ub);
+    }
+
+    /* LIST_REACTIONS returns both reactor rows. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_list_reactions lr = { 1, mid };
+    CHECK(oc_encode_list_reactions(&w, OC_PROTOCOL_VERSION, &lr) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_REACTIONS);
+    oc_reaction_entry ents[8]; uint16_t n = 0; uint64_t lmid = 0;
+    CHECK(oc_decode_reactions(&p, ents, 8, &n, &lmid) == OC_OK);
+    CHECK(lmid == mid && n == 2);
+
+    /* bob toggles off -> count 1. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_react rc3 = { 1, mid, oc_slice_str(":+1:"), OC_REACT_REMOVE };
+    CHECK(oc_encode_react(&w, OC_PROTOCOL_VERSION, &rc3) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    for (int who = 0; who < 2; who++) {
+        client *cc = who ? &a : &b;
+        CHECK(read_frame(cc, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_REACTION_UPDATED);
+        oc_reaction_updated ru; CHECK(oc_decode_reaction_updated(&p, &ru) == OC_OK);
+        CHECK(ru.op == OC_REACT_REMOVE && ru.count == 1);
+    }
+
+    client_close(&a);
+    client_close(&b);
+}
+
 /* Tenant admin ops over the wire (REQ-033): an owner mints an invite, a fresh
  * client redeems it to create + authenticate an account, the owner promotes that
  * user (SET_ROLE pushes USER_UPDATED to them), lists users, and removes a member
@@ -544,7 +624,7 @@ static void test_logout_closes(int port, const uint8_t *pin) {
 }
 
 int run_netloop_tests(void) {
-    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, admin, logout\n");
+    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, admin, logout\n");
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -579,6 +659,7 @@ int run_netloop_tests(void) {
         test_backfill_reconnect(arg.port, pin);
         test_edit_delete_vertical(arg.port, pin);
         test_channels_vertical(arg.port, pin);
+        test_reactions_vertical(arg.port, pin);
         test_admin_vertical(arg.port, pin);
         test_logout_closes(arg.port, pin);
     }
