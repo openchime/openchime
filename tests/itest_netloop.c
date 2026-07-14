@@ -350,6 +350,95 @@ static void test_edit_delete_vertical(int port, const uint8_t *pin) {
     client_close(&b);
 }
 
+static int send_frame(client *c, const uint8_t *buf, size_t len) {
+    return write_all(&c->conn, buf, len);
+}
+
+/* Channel management over the wire (REQ-031/033/050): create a private channel,
+ * a non-member is refused, an invite grants access + pushes CHANNEL_INFO to the
+ * invitee, both members then exchange a BROADCAST, and a third user never sees
+ * the private channel in LIST_CHANNELS. */
+static void test_channels_vertical(int port, const uint8_t *pin) {
+    client a, b, cc;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(client_open(&cc, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    CHECK(do_handshake(&b) == 0);
+    CHECK(do_handshake(&cc) == 0);
+    uint64_t ua = 0, ub = 0, uc = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    CHECK(do_auth(&cc, "carol", "pw", &uc) == 0);
+
+    uint8_t buf[256]; oc_wbuf w;
+    oc_header hdr; oc_rbuf p;
+
+    /* alice creates a private channel and auto-joins. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_channel cch = { oc_slice_str("war-room"), 0 };
+    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cch) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
+    oc_channel_info info; CHECK(oc_decode_channel_info(&p, &info) == OC_OK);
+    CHECK(info.is_public == 0 && info.joined == 1);
+    uint64_t cid = info.channel_id;
+
+    /* bob is not a member: his SEND is refused with a non-fatal NOT_A_MEMBER. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s1; s1.channel_id = cid; memset(s1.idem, 0x11, OC_IDEM_SIZE);
+    s1.body = oc_slice_str("intruding");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s1) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
+    oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK);
+    CHECK(er.code == OC_ERR_NOT_A_MEMBER && er.fatal == 0);
+
+    /* alice invites bob: alice gets a CHANNEL_INFO ack, bob gets a pushed one. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_channel_member_op inv = { cid, ub };
+    CHECK(oc_encode_invite_to_channel(&w, OC_PROTOCOL_VERSION, &inv) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
+    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
+    oc_channel_info pushed; CHECK(oc_decode_channel_info(&p, &pushed) == OC_OK);
+    CHECK(pushed.channel_id == cid && pushed.joined == 1);
+
+    /* Now bob posts to the private channel; both members receive the BROADCAST. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s2; s2.channel_id = cid; memset(s2.idem, 0x22, OC_IDEM_SIZE);
+    s2.body = oc_slice_str("war plans");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s2) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    uint64_t bmid = 0;
+    for (int i = 0; i < 2; i++) {            /* bob: SEND_ACK + own BROADCAST */
+        CHECK(read_frame(&b, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) { oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK); bmid = ack.message_id; }
+    }
+    CHECK(bmid != 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BROADCAST);
+    oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
+    CHECK(bc.channel_id == cid && bc.author_id == ub && bc.message_id == bmid);
+
+    /* carol (a non-member) never sees the private channel in LIST_CHANNELS. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_list_channels(&w, OC_PROTOCOL_VERSION) == OC_OK);
+    CHECK(send_frame(&cc, buf, w.len) == 0);
+    CHECK(read_frame(&cc, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_LIST);
+    oc_channel_list_entry ents[64]; uint16_t n = 0;
+    CHECK(oc_decode_channel_list(&p, ents, 64, &n) == OC_OK);
+    int saw_private = 0, saw_general = 0;
+    for (uint16_t i = 0; i < n && i < 64; i++) {
+        if (ents[i].channel_id == cid) saw_private = 1;
+        if (ents[i].channel_id == 1)   saw_general = 1;
+    }
+    CHECK(saw_general == 1 && saw_private == 0);
+
+    client_close(&a);
+    client_close(&b);
+    client_close(&cc);
+}
+
 /* LOGOUT over the wire: the daemon revokes the session and drops the
  * connection (REQ-182). */
 static void test_logout_closes(int port, const uint8_t *pin) {
@@ -371,7 +460,7 @@ static void test_logout_closes(int port, const uint8_t *pin) {
 }
 
 int run_netloop_tests(void) {
-    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, logout\n");
+    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, logout\n");
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -390,6 +479,7 @@ int run_netloop_tests(void) {
     CHECK(oc_dbwriter_register_local(dbw, "bob",       "pw-bob",   OC_ROLE_MEMBER, 2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw, "bf-sender", "pw",       OC_ROLE_MEMBER, 2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw, "bf-reader", "pw",       OC_ROLE_MEMBER, 2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw, "carol",     "pw",       OC_ROLE_MEMBER, 2048) != 0);
 
     struct loop_arg arg;
     arg.port = 18000 + (int)(getpid() % 2000);
@@ -404,6 +494,7 @@ int run_netloop_tests(void) {
         test_message_vertical(arg.port, pin);
         test_backfill_reconnect(arg.port, pin);
         test_edit_delete_vertical(arg.port, pin);
+        test_channels_vertical(arg.port, pin);
         test_logout_closes(arg.port, pin);
     }
 

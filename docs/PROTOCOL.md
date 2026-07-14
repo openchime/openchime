@@ -417,6 +417,76 @@ correlate: `UNKNOWN_MESSAGE` (no such message in the channel, or it is already
 tombstoned) or `FORBIDDEN` (not the author — and, for delete, neither the author
 nor a channel moderator who belongs to the channel).
 
+### 5.7 Channel management (REQ-050, REQ-031, REQ-033)
+
+Channels are the containers messages belong to. A channel is either **public**
+(open to every tenant user) or **private** (members-only). Membership
+(`channel_members`) is the fan-out set for `BROADCAST`/`MSG_EDITED`/`MSG_DELETED`
+and the read/post gate:
+
+- **Read** (backfill, §6) a channel: allowed if it is public **or** the user is
+  a member (REQ-031). Private channels reveal nothing to non-members.
+- **Post** (`SEND`/`EDIT`/`DELETE`): a member may always post; posting to a
+  **public** channel the user has not joined **auto-joins** them (so subsequent
+  broadcasts reach them); a **private** channel the user does not belong to
+  rejects with `NOT_A_MEMBER`. A `channel_id` that does not exist rejects with
+  `UNKNOWN_CHANNEL`.
+
+Each operation below is acknowledged with a **`CHANNEL_INFO` (server → client),
+msg_type `0x0051`** describing the channel and the caller's membership:
+
+| Field        | Type | Notes                                             |
+|--------------|------|---------------------------------------------------|
+| `channel_id` | u64  | The channel.                                      |
+| `kind`       | u8   | `0` channel, `1` DM (reserved; only `0` today).   |
+| `name`       | str  | Channel name.                                     |
+| `is_public`  | u8   | `1` public, `0` private.                          |
+| `joined`     | u8   | `1` if the recipient is now a member.             |
+| `created_at` | u64  | Creation time, ms since epoch UTC.                |
+
+Failures are non-fatal `ERROR` frames carrying the `channel_id` (8 bytes,
+big-endian) in `context`: `UNKNOWN_CHANNEL`, `NOT_A_MEMBER`, `FORBIDDEN`, or
+`INVALID_CHANNEL` (empty/oversized name on create).
+
+**`CREATE_CHANNEL` (client → server), msg_type `0x0050`** — the creator
+auto-joins; replies `CHANNEL_INFO`.
+
+| Field       | Type | Notes                                                    |
+|-------------|------|----------------------------------------------------------|
+| `name`      | str  | 1..64 bytes (`INVALID_CHANNEL` otherwise).               |
+| `is_public` | u8   | `1` public, `0` private.                                 |
+
+**`LIST_CHANNELS` (client → server), msg_type `0x0052`** — empty payload;
+replies **`CHANNEL_LIST` (server → client), msg_type `0x0053`** with every
+public channel plus the private channels the user belongs to:
+
+| Field       | Type            | Notes                                             |
+|-------------|-----------------|---------------------------------------------------|
+| `count`     | u16             | Number of entries.                                |
+| `entries[]` | `count` × entry | Each: `channel_id` (u64), `name` (str), `is_public` (u8), `joined` (u8). |
+
+**`JOIN_CHANNEL` (client → server), msg_type `0x0054`** `{ channel_id: u64 }` —
+public channels are self-joinable; a private channel rejects with `FORBIDDEN`
+unless the caller was already invited. Replies `CHANNEL_INFO` (`joined=1`).
+
+**`LEAVE_CHANNEL` (client → server), msg_type `0x0055`** `{ channel_id: u64 }` —
+drops the caller's membership (idempotent). Replies `CHANNEL_INFO` (`joined=0`).
+
+**`INVITE_TO_CHANNEL` (client → server), msg_type `0x0056`**
+`{ channel_id: u64, user_id: u64 }` — any existing **member** may add another
+user (REQ-033, channel-level, not gated to admins); this is how a private
+channel becomes reachable. The actor gets a `CHANNEL_INFO` ack, and the invited
+user's live connections are **pushed** a `CHANNEL_INFO` (`joined=1`) so their
+client learns of the new channel immediately.
+
+**`REMOVE_FROM_CHANNEL` (client → server), msg_type `0x0057`**
+`{ channel_id: u64, user_id: u64 }` — any existing member may remove another
+(REQ-033). Replies `CHANNEL_INFO` to the actor.
+
+Every tenant has one auto-provisioned public **`general`** channel (id `1`) that
+every user joins at authentication, so the messaging path always has a channel
+to deliver to.
+
 ---
 
 ## 6. Reconnect backfill (resolves REQ-101)
@@ -522,6 +592,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3005` | `FORBIDDEN`           | admin/msg  | no    | The actor may not perform the action — role (ARCH-60, §6) or not the message's author (§5.5/5.6). |
 | `3006` | `LAST_OWNER`          | admin      | no    | Would remove or demote the tenant's last owner (REQ-030).      |
 | `3007` | `UNKNOWN_MESSAGE`     | messaging  | no    | `EDIT`/`DELETE` names a message not in the channel, or already tombstoned (§5.5/5.6). |
+| `3008` | `INVALID_CHANNEL`     | messaging  | no    | `CREATE_CHANNEL` name empty or over 64 bytes (§5.7). |
 | `9001` | `INTERNAL_ERROR`      | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage version codes (`1001`/`1002`) are delivered via `REJECT`, which
@@ -553,14 +624,23 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0025` | `DELETE`           | C → S     | no        | §5.6    |
 | `0x0026` | `MSG_EDITED`       | S → C     | no        | §5.5    |
 | `0x0027` | `MSG_DELETED`      | S → C     | no        | §5.6    |
+| `0x0050` | `CREATE_CHANNEL`   | C → S     | no        | §5.7    |
+| `0x0051` | `CHANNEL_INFO`     | S → C     | no        | §5.7    |
+| `0x0052` | `LIST_CHANNELS`    | C → S     | no        | §5.7    |
+| `0x0053` | `CHANNEL_LIST`     | S → C     | no        | §5.7    |
+| `0x0054` | `JOIN_CHANNEL`     | C → S     | no        | §5.7    |
+| `0x0055` | `LEAVE_CHANNEL`    | C → S     | no        | §5.7    |
+| `0x0056` | `INVITE_TO_CHANNEL`| C → S     | no        | §5.7    |
+| `0x0057` | `REMOVE_FROM_CHANNEL`| C → S   | no        | §5.7    |
 | `0x0030` | `BACKFILL_REQUEST` | C → S     | no        | §6.1    |
 | `0x0031` | `BACKFILL_DONE`    | S → C     | no        | §6.2    |
 | `0x00FF` | `ERROR`            | S → C     | no        | §8.1    |
 
 Ranges are left sparse (`0x0001–` handshake, `0x0010–` auth/session, `0x0020–`
-messaging, `0x0030–` reconnect, `0x0040–` users/profiles, `0x00FF` error) so
-later revisions can slot in presence, typing, reactions, threads, and audio
-signaling without renumbering. The `0x0040–0x0044` entries are **reserved** —
+messaging, `0x0030–` reconnect, `0x0040–` users/profiles, `0x0050–` channel
+management, `0x00FF` error) so later revisions can slot in presence, typing,
+reactions, threads, and audio signaling without renumbering. The `0x0040–0x0044`
+entries are **reserved** —
 their frame layouts are defined when the corresponding milestone (user
 enumeration / profiles / management, AUTH.md §6) lands.
 

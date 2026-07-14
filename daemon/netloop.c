@@ -20,6 +20,9 @@
 #include <unistd.h>
 
 #define OC_NETLOOP_MAX_FD 4096
+/* Cap channels per CHANNEL_LIST frame so it never exceeds the wire limit; a
+ * client with more would page (not needed at current scale). */
+#define OC_CHANNEL_LIST_MAX 512
 
 typedef enum { CONN_HANDSHAKE, CONN_ESTABLISHED } conn_state;
 
@@ -263,6 +266,51 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_CREATE_CHANNEL) {
+            oc_create_channel cc;
+            if (oc_decode_create_channel(&p, &cc) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_CREATE_CHANNEL, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->ch_is_public = cc.is_public;
+            j->ch_name = malloc(cc.name.len + 1);
+            if (!j->ch_name) return -1;
+            if (cc.name.len) memcpy(j->ch_name, cc.name.ptr, cc.name.len);
+            j->ch_name[cc.name.len] = '\0';
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_CHANNELS) {
+            if (oc_decode_list_channels(&p) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_CHANNELS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_JOIN_CHANNEL || hdr.msg_type == OC_MSG_LEAVE_CHANNEL) {
+            oc_channel_ref cr;
+            if (oc_decode_join_channel(&p, &cr) != OC_OK) return -1;
+            int jt = (hdr.msg_type == OC_MSG_JOIN_CHANNEL) ? OC_JOB_JOIN_CHANNEL : OC_JOB_LEAVE_CHANNEL;
+            oc_job *j = oc_job_new(jt, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = cr.channel_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_INVITE_TO_CHANNEL || hdr.msg_type == OC_MSG_REMOVE_FROM_CHANNEL) {
+            oc_channel_member_op op;
+            if (oc_decode_invite_to_channel(&p, &op) != OC_OK) return -1;
+            int jt = (hdr.msg_type == OC_MSG_INVITE_TO_CHANNEL) ? OC_JOB_INVITE_CHANNEL : OC_JOB_REMOVE_CHANNEL;
+            oc_job *j = oc_job_new(jt, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = op.channel_id;
+            j->target_user_id = op.user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_CLIENT_ACK) {
             oc_client_ack ca;
             oc_decode_client_ack(&p, &ca); /* accepted; the client drives backfill via its own cursors */
@@ -430,6 +478,64 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         oc_error e = { r->err_code, 0, cs, oc_slice_str("edit/delete rejected") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_CHANNEL_INFO: {
+        /* Ack the actor with the channel's state. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (c) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_channel_info ci = { r->channel_id, r->ch_kind,
+                                   oc_slice_str(r->ch_name ? r->ch_name : ""),
+                                   r->ch_is_public, r->ch_joined, r->ch_created_at };
+            oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        /* On INVITE, push the (now-member) channel to the target's live conns. */
+        if (r->push_user_id) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_channel_info ci = { r->channel_id, r->ch_kind,
+                                   oc_slice_str(r->ch_name ? r->ch_name : ""),
+                                   r->ch_is_public, 1, r->ch_created_at };
+            oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci);
+            size_t len = w.len;
+            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                conn *t = conns[fd];
+                if (t && t->authed && t->user_id == r->push_user_id)
+                    send_bytes(ep, conns, fd, g_enc, len);
+            }
+        }
+        break;
+    }
+    case OC_RES_CHANNEL_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        uint8_t ctx[8];
+        for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->channel_id >> (56 - 8 * i));
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice cs = { ctx, sizeof ctx };
+        oc_error e = { r->err_code, 0, cs, oc_slice_str("channel op rejected") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_CHANNEL_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        size_t n = r->n_chlist > OC_CHANNEL_LIST_MAX ? OC_CHANNEL_LIST_MAX : r->n_chlist;
+        oc_channel_list_entry *ents = n ? malloc(n * sizeof *ents) : NULL;
+        if (n && !ents) n = 0;
+        for (size_t i = 0; i < n; i++) {
+            ents[i].channel_id = r->chlist[i].channel_id;
+            ents[i].name = oc_slice_str(r->chlist[i].name ? r->chlist[i].name : "");
+            ents[i].is_public = r->chlist[i].is_public;
+            ents[i].joined = r->chlist[i].joined;
+        }
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_channel_list cl = { (uint16_t)n, ents };
+        oc_encode_channel_list(&w, OC_PROTOCOL_VERSION, &cl);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        free(ents);
         break;
     }
     case OC_RES_BACKFILL_OK: {

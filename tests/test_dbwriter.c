@@ -194,14 +194,16 @@ static void test_auth_and_send(void) {
     CHECK(r && r->type == OC_RES_SEND_OK && r->message_id > first_id);
     oc_dbres_free(r);
 
-    /* A non-member author is rejected. */
+    /* A send to a channel that does not exist is rejected. (The public/private
+     * membership gate is exercised in test_channels; the default channel is
+     * public, so posting to it auto-joins rather than rejecting.) */
     j = oc_job_new(OC_JOB_SEND, 99);
-    j->user_id = 9999; j->channel_id = OC_DEFAULT_CHANNEL;
+    j->user_id = b; j->channel_id = 4242;
     memset(j->idem, 0x33, OC_IDEM_LEN);
     oc_job_set_body(j, "x", 1);
     oc_dbwriter_submit(w, j);
     r = wait_result(w);
-    CHECK(r && r->type == OC_RES_SEND_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    CHECK(r && r->type == OC_RES_SEND_ERR && r->err_code == OC_ERR_UNKNOWN_CHANNEL);
     oc_dbres_free(r);
 
     oc_dbwriter_stop(w);
@@ -610,6 +612,162 @@ static void test_edit_delete(void) {
     cleanup_db(path);
 }
 
+/* --- Channel management (REQ-031/033/050) ------------------------------- */
+
+static oc_dbres *create_channel(oc_dbwriter *w, uint64_t uid, const char *name, uint8_t is_public) {
+    oc_job *j = oc_job_new(OC_JOB_CREATE_CHANNEL, 90);
+    j->user_id = uid; j->ch_is_public = is_public;
+    j->ch_name = name ? strdup(name) : NULL;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *list_channels(oc_dbwriter *w, uint64_t uid) {
+    oc_job *j = oc_job_new(OC_JOB_LIST_CHANNELS, 91);
+    j->user_id = uid;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+/* JOIN (type OC_JOB_JOIN_CHANNEL) or LEAVE (OC_JOB_LEAVE_CHANNEL). */
+static oc_dbres *chan_ref(oc_dbwriter *w, int type, uint64_t uid, uint64_t channel) {
+    oc_job *j = oc_job_new(type, 92);
+    j->user_id = uid; j->channel_id = channel;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+/* INVITE (OC_JOB_INVITE_CHANNEL) or REMOVE (OC_JOB_REMOVE_CHANNEL). */
+static oc_dbres *chan_member(oc_dbwriter *w, int type, uint64_t actor, uint64_t channel, uint64_t target) {
+    oc_job *j = oc_job_new(type, 93);
+    j->user_id = actor; j->channel_id = channel; j->target_user_id = target;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static uint8_t g_send_seq = 0;
+static uint16_t send_to(oc_dbwriter *w, uint64_t uid, uint64_t channel, const char *body) {
+    oc_job *j = oc_job_new(OC_JOB_SEND, 94);
+    j->user_id = uid; j->channel_id = channel;
+    memset(j->idem, ++g_send_seq, OC_IDEM_LEN);
+    oc_job_set_body(j, body, strlen(body));
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    uint16_t code = (r && r->type == OC_RES_SEND_OK) ? 0 : (r ? r->err_code : 0xFFFF);
+    oc_dbres_free(r);
+    return code;
+}
+
+static int list_has(oc_dbres *r, uint64_t cid, int *joined_out) {
+    for (size_t i = 0; i < r->n_chlist; i++)
+        if (r->chlist[i].channel_id == cid) {
+            if (joined_out) *joined_out = r->chlist[i].joined;
+            return 1;
+        }
+    return 0;
+}
+
+static void test_channels(void) {
+    const char *path = "build/test_dbwriter_channels.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t alice = reg(w, "ch-alice", "pw", OC_ROLE_MEMBER);
+    uint64_t bob   = reg(w, "ch-bob",   "pw", OC_ROLE_MEMBER);
+    uint64_t carol = reg(w, "ch-carol", "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob && carol);
+
+    /* alice creates a private channel and auto-joins it. */
+    oc_dbres *r = create_channel(w, alice, "secret", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    CHECK(r->ch_is_public == 0 && r->ch_joined == 1);
+    uint64_t secret = r->channel_id;
+    CHECK(secret != OC_DEFAULT_CHANNEL);
+    oc_dbres_free(r);
+
+    /* An empty name is rejected. */
+    r = create_channel(w, alice, "", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_INVALID_CHANNEL);
+    oc_dbres_free(r);
+
+    /* alice sees general + secret (joined); bob sees general but not secret. */
+    int joined = -1;
+    r = list_channels(w, alice);
+    CHECK(r && list_has(r, OC_DEFAULT_CHANNEL, NULL) && list_has(r, secret, &joined) && joined == 1);
+    oc_dbres_free(r);
+    r = list_channels(w, bob);
+    CHECK(r && list_has(r, OC_DEFAULT_CHANNEL, NULL) && !list_has(r, secret, NULL));
+    oc_dbres_free(r);
+
+    /* bob cannot self-join a private channel, nor post to it. */
+    r = chan_ref(w, OC_JOB_JOIN_CHANNEL, bob, secret);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    CHECK(send_to(w, bob, secret, "sneaking in") == OC_ERR_NOT_A_MEMBER);
+
+    /* alice invites bob; the result flags bob for the CHANNEL_INFO push. */
+    r = chan_member(w, OC_JOB_INVITE_CHANNEL, alice, secret, bob);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->push_user_id == bob);
+    oc_dbres_free(r);
+
+    /* Now bob is a member: he can post, and secret shows up joined in his list. */
+    CHECK(send_to(w, bob, secret, "made it") == 0);
+    r = list_channels(w, bob);
+    CHECK(r && list_has(r, secret, &joined) && joined == 1);
+    oc_dbres_free(r);
+
+    /* A non-member (carol) cannot invite into secret. */
+    r = chan_member(w, OC_JOB_INVITE_CHANNEL, carol, secret, alice);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+
+    /* Private read gate: carol (non-member) backfills nothing from secret,
+     * even though it has messages. */
+    r = backfill(w, carol, secret, 0);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK && r->n_replay == 0);
+    oc_dbres_free(r);
+
+    /* Public channel: anyone may post (auto-joining) and read. */
+    r = create_channel(w, alice, "townhall", 1);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->ch_is_public == 1);
+    uint64_t townhall = r->channel_id;
+    oc_dbres_free(r);
+
+    /* carol posts to the public channel without an explicit join -> auto-joined. */
+    CHECK(send_to(w, carol, townhall, "hello town") == 0);
+    r = list_channels(w, carol);
+    CHECK(r && list_has(r, townhall, &joined) && joined == 1);
+    oc_dbres_free(r);
+
+    /* carol can also read the public channel by backfill. */
+    r = backfill(w, carol, townhall, 0);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK && r->n_replay >= 1);
+    oc_dbres_free(r);
+
+    /* Posting to a channel that does not exist is UNKNOWN_CHANNEL. */
+    CHECK(send_to(w, alice, 99999, "void") == OC_ERR_UNKNOWN_CHANNEL);
+
+    /* bob leaves secret: he loses post access again. */
+    r = chan_ref(w, OC_JOB_LEAVE_CHANNEL, bob, secret);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->ch_joined == 0);
+    oc_dbres_free(r);
+    CHECK(send_to(w, bob, secret, "back in?") == OC_ERR_NOT_A_MEMBER);
+
+    /* alice re-invites bob, then removes him: post access is revoked. */
+    r = chan_member(w, OC_JOB_INVITE_CHANNEL, alice, secret, bob);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    oc_dbres_free(r);
+    CHECK(send_to(w, bob, secret, "member again") == 0);
+    r = chan_member(w, OC_JOB_REMOVE_CHANNEL, alice, secret, bob);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    oc_dbres_free(r);
+    CHECK(send_to(w, bob, secret, "removed") == OC_ERR_NOT_A_MEMBER);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill\n");
     test_start_migrates_and_stops();
@@ -620,6 +778,7 @@ int run_dbwriter_tests(void) {
     test_logout();
     test_role_enforcement();
     test_edit_delete();
+    test_channels();
     test_backfill();
     return failures;
 }

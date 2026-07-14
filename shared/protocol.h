@@ -53,6 +53,14 @@ typedef enum {
     OC_MSG_DELETE           = 0x0025, /* C->S (REQ-052) */
     OC_MSG_MSG_EDITED       = 0x0026, /* S->C, edit fan-out */
     OC_MSG_MSG_DELETED      = 0x0027, /* S->C, tombstone fan-out */
+    OC_MSG_CREATE_CHANNEL     = 0x0050, /* C->S (REQ-050) */
+    OC_MSG_CHANNEL_INFO       = 0x0051, /* S->C, ack for create/join/leave/invite/remove */
+    OC_MSG_LIST_CHANNELS      = 0x0052, /* C->S */
+    OC_MSG_CHANNEL_LIST       = 0x0053, /* S->C */
+    OC_MSG_JOIN_CHANNEL       = 0x0054, /* C->S */
+    OC_MSG_LEAVE_CHANNEL      = 0x0055, /* C->S */
+    OC_MSG_INVITE_TO_CHANNEL  = 0x0056, /* C->S (REQ-033, channel-level) */
+    OC_MSG_REMOVE_FROM_CHANNEL= 0x0057, /* C->S (REQ-033, channel-level) */
     OC_MSG_BACKFILL_REQUEST = 0x0030, /* C->S */
     OC_MSG_BACKFILL_DONE    = 0x0031, /* S->C */
     OC_MSG_ERROR            = 0x00FF  /* S->C */
@@ -76,6 +84,7 @@ typedef enum {
     OC_ERR_FORBIDDEN           = 3005, /* actor may not perform the action (role, or not the author) */
     OC_ERR_LAST_OWNER          = 3006, /* would remove/demote the last owner (REQ-030) */
     OC_ERR_UNKNOWN_MESSAGE     = 3007, /* no such message in the channel (edit/delete) */
+    OC_ERR_INVALID_CHANNEL     = 3008, /* bad channel name on CREATE_CHANNEL (empty/too long) */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 
@@ -180,6 +189,11 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 
 #define OC_SESSION_TOKEN_LEN 32u  /* random session token; only its hash is stored */
 
+/* Channel kind (SCHEMA.md channels.kind) and the name cap for CREATE_CHANNEL. */
+#define OC_CHANNEL_KIND    0u   /* a named channel */
+#define OC_CHANNEL_KIND_DM 1u   /* a direct-message conversation (reserved) */
+#define OC_MAX_CHANNEL_NAME 64u /* channel-name length cap (bytes) */
+
 /* LOGOUT scope (PROTOCOL.md §4; REQ-182). */
 #define OC_LOGOUT_THIS 0u   /* revoke just the presented session token */
 #define OC_LOGOUT_ALL  1u   /* revoke every session of the authenticated user */
@@ -201,6 +215,12 @@ typedef struct { uint64_t channel_id; uint64_t message_id; oc_slice body; } oc_e
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_delete;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t edited_at; oc_slice body; } oc_msg_edited;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t deleted_by; uint64_t deleted_at; } oc_msg_deleted;
+typedef struct { oc_slice name; uint8_t is_public; } oc_create_channel;
+typedef struct { uint64_t channel_id; uint8_t kind; oc_slice name; uint8_t is_public; uint8_t joined; uint64_t created_at; } oc_channel_info;
+typedef struct { uint64_t channel_id; } oc_channel_ref;                       /* JOIN / LEAVE */
+typedef struct { uint64_t channel_id; uint64_t user_id; } oc_channel_member_op; /* INVITE / REMOVE */
+typedef struct { uint64_t channel_id; oc_slice name; uint8_t is_public; uint8_t joined; } oc_channel_list_entry;
+typedef struct { uint16_t count; const oc_channel_list_entry *entries; } oc_channel_list;
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_cursor;
 typedef struct { uint16_t count; const oc_cursor *cursors; } oc_backfill_request;
 typedef struct { uint64_t high_water; } oc_backfill_done;
@@ -228,6 +248,14 @@ oc_result oc_encode_edit(oc_wbuf *w, uint16_t version, const oc_edit *m);
 oc_result oc_encode_delete(oc_wbuf *w, uint16_t version, const oc_delete *m);
 oc_result oc_encode_msg_edited(oc_wbuf *w, uint16_t version, const oc_msg_edited *m);
 oc_result oc_encode_msg_deleted(oc_wbuf *w, uint16_t version, const oc_msg_deleted *m);
+oc_result oc_encode_create_channel(oc_wbuf *w, uint16_t version, const oc_create_channel *m);
+oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_info *m);
+oc_result oc_encode_list_channels(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_channel_list(oc_wbuf *w, uint16_t version, const oc_channel_list *m);
+oc_result oc_encode_join_channel(oc_wbuf *w, uint16_t version, const oc_channel_ref *m);
+oc_result oc_encode_leave_channel(oc_wbuf *w, uint16_t version, const oc_channel_ref *m);
+oc_result oc_encode_invite_to_channel(oc_wbuf *w, uint16_t version, const oc_channel_member_op *m);
+oc_result oc_encode_remove_from_channel(oc_wbuf *w, uint16_t version, const oc_channel_member_op *m);
 oc_result oc_encode_backfill_request(oc_wbuf *w, uint16_t version, const oc_backfill_request *m);
 oc_result oc_encode_backfill_done(oc_wbuf *w, uint16_t version, const oc_backfill_done *m);
 oc_result oc_encode_error(oc_wbuf *w, uint16_t version, const oc_error *m);
@@ -255,6 +283,14 @@ oc_result oc_decode_edit(oc_rbuf *p, oc_edit *m);
 oc_result oc_decode_delete(oc_rbuf *p, oc_delete *m);
 oc_result oc_decode_msg_edited(oc_rbuf *p, oc_msg_edited *m);
 oc_result oc_decode_msg_deleted(oc_rbuf *p, oc_msg_deleted *m);
+oc_result oc_decode_create_channel(oc_rbuf *p, oc_create_channel *m);
+oc_result oc_decode_channel_info(oc_rbuf *p, oc_channel_info *m);
+oc_result oc_decode_list_channels(oc_rbuf *p);
+oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries, uint16_t cap, uint16_t *out_count);
+oc_result oc_decode_join_channel(oc_rbuf *p, oc_channel_ref *m);
+oc_result oc_decode_leave_channel(oc_rbuf *p, oc_channel_ref *m);
+oc_result oc_decode_invite_to_channel(oc_rbuf *p, oc_channel_member_op *m);
+oc_result oc_decode_remove_from_channel(oc_rbuf *p, oc_channel_member_op *m);
 oc_result oc_decode_backfill_request(oc_rbuf *p, oc_cursor *cursors, uint16_t cap, uint16_t *out_count);
 oc_result oc_decode_backfill_done(oc_rbuf *p, oc_backfill_done *m);
 oc_result oc_decode_error(oc_rbuf *p, oc_error *m);

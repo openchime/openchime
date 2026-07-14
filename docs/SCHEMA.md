@@ -74,7 +74,11 @@ open channels from private ones for the read/post gate in REQ-031.
 
 ### `channel_members`  — resolves REQ-031
 Membership is independent of any tenant role. Only members may read/post in a
-non-public channel; this table is that membership set.
+non-public channel; this table is that membership set. The channel-management
+frames (PROTOCOL.md §5.7) maintain it: create/join/invite insert rows,
+leave/remove delete them, and posting to a *public* channel auto-joins the
+sender. Public channels are readable/postable by any tenant user; private
+channels are members-only, reachable only via `INVITE_TO_CHANNEL` (REQ-033).
 
 | column         | type    | notes                                    |
 |----------------|---------|------------------------------------------|

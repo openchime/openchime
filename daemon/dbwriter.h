@@ -27,7 +27,9 @@
 /* --- Jobs (net thread -> writer) ---------------------------------------- */
 
 enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 4,
-       OC_JOB_SET_ROLE = 5, OC_JOB_LOGOUT = 6, OC_JOB_EDIT = 7, OC_JOB_DELETE = 8 };
+       OC_JOB_SET_ROLE = 5, OC_JOB_LOGOUT = 6, OC_JOB_EDIT = 7, OC_JOB_DELETE = 8,
+       OC_JOB_CREATE_CHANNEL = 9, OC_JOB_LIST_CHANNELS = 10, OC_JOB_JOIN_CHANNEL = 11,
+       OC_JOB_LEAVE_CHANNEL = 12, OC_JOB_INVITE_CHANNEL = 13, OC_JOB_REMOVE_CHANNEL = 14 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -50,8 +52,13 @@ typedef struct oc_job {
     uint8_t        role;      /* OC_ROLE_* for the new account (also SET_ROLE next) */
     uint32_t       iterations;/* PBKDF2 rounds (0 -> OC_PW_ITERATIONS default) */
 
-    /* SET_ROLE (change a user's tenant role; ARCH-60). Actor is `user_id`. */
+    /* SET_ROLE (change a user's tenant role; ARCH-60). Actor is `user_id`.
+     * Also carries the target for channel INVITE/REMOVE. */
     uint64_t       target_user_id;
+
+    /* CREATE_CHANNEL */
+    char          *ch_name;    /* heap */
+    uint8_t        ch_is_public;
 
     /* LOGOUT (revoke sessions; REQ-182). Actor is `user_id`; the token to revoke
      * (scope THIS) is carried in `token`/`token_len`. */
@@ -77,7 +84,17 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_SETROLE_OK = 8, OC_RES_SETROLE_ERR = 9,
        OC_RES_LOGOUT_OK = 10, OC_RES_LOGOUT_ERR = 11,
        OC_RES_EDIT_OK = 12, OC_RES_EDIT_ERR = 13,
-       OC_RES_DELETE_OK = 14, OC_RES_DELETE_ERR = 15 };
+       OC_RES_DELETE_OK = 14, OC_RES_DELETE_ERR = 15,
+       OC_RES_CHANNEL_INFO = 16, OC_RES_CHANNEL_ERR = 17,
+       OC_RES_CHANNEL_LIST = 18 };
+
+/* One row in a CHANNEL_LIST result (net thread renders as a list entry). */
+typedef struct {
+    uint64_t channel_id;
+    char    *name;       /* heap */
+    uint8_t  is_public;
+    uint8_t  joined;     /* 1 if the requesting user is a member */
+} oc_channel_row;
 
 /* One message to replay on reconnect (rendered as a BROADCAST by the net thread). */
 typedef struct {
@@ -115,6 +132,18 @@ typedef struct oc_dbres {
     oc_replay_msg *replay;    /* heap array, ascending message_id */
     size_t         n_replay;
     uint64_t       high_water;
+
+    /* CHANNEL_INFO (create/join/leave/invite/remove ack). channel_id above. */
+    uint8_t        ch_kind;
+    char          *ch_name;         /* heap */
+    uint8_t        ch_is_public;
+    uint8_t        ch_joined;       /* the actor's membership after the op */
+    uint64_t       ch_created_at;
+    uint64_t       push_user_id;    /* INVITE: also push CHANNEL_INFO to this user (0 = none) */
+
+    /* CHANNEL_LIST */
+    oc_channel_row *chlist;         /* heap array */
+    size_t          n_chlist;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;

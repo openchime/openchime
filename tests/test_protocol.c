@@ -217,6 +217,74 @@ static void test_messaging_frames(void) {
     }
 }
 
+static void test_channel_frames(void) {
+    {
+        oc_create_channel in = { oc_slice_str("engineering"), 0 };
+        ROUNDTRIP(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CREATE_CHANNEL, h, p);
+        oc_create_channel out;
+        CHECK(oc_decode_create_channel(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.name, "engineering") && out.is_public == 0);
+    }
+    {
+        oc_channel_info in = { 5, OC_CHANNEL_KIND, oc_slice_str("engineering"), 0, 1, 1751200500000ull };
+        ROUNDTRIP(oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANNEL_INFO, h, p);
+        oc_channel_info out;
+        CHECK(oc_decode_channel_info(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 5 && out.kind == OC_CHANNEL_KIND);
+        CHECK(slice_eq_str(out.name, "engineering"));
+        CHECK(out.is_public == 0 && out.joined == 1 && out.created_at == 1751200500000ull);
+    }
+    {
+        oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+        CHECK(oc_encode_list_channels(&w, OC_PROTOCOL_VERSION) == OC_OK);
+        oc_header h; oc_rbuf p;
+        CHECK(oc_parse_frame(frame, w.len, &h, &p) == OC_OK);
+        CHECK(h.msg_type == OC_MSG_LIST_CHANNELS);
+        CHECK(oc_decode_list_channels(&p) == OC_OK);
+    }
+    {
+        oc_channel_list_entry ents[2] = {
+            { 1, oc_slice_str("general"),   1, 1 },
+            { 5, oc_slice_str("engineering"), 0, 1 },
+        };
+        oc_channel_list in = { 2, ents };
+        ROUNDTRIP(oc_encode_channel_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANNEL_LIST, h, p);
+        oc_channel_list_entry out[2]; uint16_t n = 0;
+        CHECK(oc_decode_channel_list(&p, out, 2, &n) == OC_OK);
+        CHECK(n == 2);
+        CHECK(out[0].channel_id == 1 && slice_eq_str(out[0].name, "general") && out[0].is_public == 1);
+        CHECK(out[1].channel_id == 5 && slice_eq_str(out[1].name, "engineering") && out[1].joined == 1);
+    }
+    {
+        oc_channel_ref in = { 5 };
+        ROUNDTRIP(oc_encode_join_channel(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_JOIN_CHANNEL, h, p);
+        oc_channel_ref out;
+        CHECK(oc_decode_join_channel(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 5);
+    }
+    {
+        oc_channel_ref in = { 5 };
+        ROUNDTRIP(oc_encode_leave_channel(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LEAVE_CHANNEL, h, p);
+        oc_channel_ref out;
+        CHECK(oc_decode_leave_channel(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 5);
+    }
+    {
+        oc_channel_member_op in = { 5, 42 };
+        ROUNDTRIP(oc_encode_invite_to_channel(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_INVITE_TO_CHANNEL, h, p);
+        oc_channel_member_op out;
+        CHECK(oc_decode_invite_to_channel(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 5 && out.user_id == 42);
+    }
+    {
+        oc_channel_member_op in = { 5, 42 };
+        ROUNDTRIP(oc_encode_remove_from_channel(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REMOVE_FROM_CHANNEL, h, p);
+        oc_channel_member_op out;
+        CHECK(oc_decode_remove_from_channel(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 5 && out.user_id == 42);
+    }
+}
+
 static void test_backfill_and_error(void) {
     {
         oc_cursor cursors[3] = { {7, 1000}, {8, 0}, {9, 512} };
@@ -359,6 +427,7 @@ int run_protocol_tests(void) {
     test_handshake_frames();
     test_auth_frames();
     test_messaging_frames();
+    test_channel_frames();
     test_backfill_and_error();
     test_size_limits();
     test_malformed();

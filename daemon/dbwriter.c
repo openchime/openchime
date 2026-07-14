@@ -103,6 +103,7 @@ static void job_free(oc_job *j) {
     free(j->password);
     free(j->body);
     free(j->cursors);
+    free(j->ch_name);
     free(j);
 }
 
@@ -112,6 +113,9 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->members);
     for (size_t i = 0; i < r->n_replay; i++) free(r->replay[i].body);
     free(r->replay);
+    free(r->ch_name);
+    for (size_t i = 0; i < r->n_chlist; i++) free(r->chlist[i].name);
+    free(r->chlist);
     free(r);
 }
 
@@ -567,6 +571,53 @@ static void load_members(sqlite3 *db, uint64_t channel_id, oc_dbres *r) {
     r->n_members = n;
 }
 
+/* Does the channel exist (kind='channel')? Fills *is_public if so. */
+static int channel_exists(sqlite3 *db, uint64_t channel_id, uint8_t *is_public) {
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    sqlite3_prepare_v2(db,
+        "SELECT is_public FROM channels WHERE id=? AND kind='channel';", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        if (is_public) *is_public = (uint8_t)(sqlite3_column_int(st, 0) != 0);
+        found = 1;
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
+static void add_membership(sqlite3 *db, uint64_t channel_id, uint64_t user_id) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT OR IGNORE INTO channel_members(channel_id,user_id,joined_at_ms) "
+        "VALUES(?,?,?);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+/* May the user read (backfill) this channel? Public channels are open to any
+ * tenant user; private channels are members-only (REQ-031). */
+static int channel_read_access(sqlite3 *db, uint64_t channel_id, uint64_t user_id) {
+    uint8_t is_public = 0;
+    if (!channel_exists(db, channel_id, &is_public)) return 0;
+    return is_public || is_member(db, channel_id, user_id);
+}
+
+/* Post access (REQ-031). CH_OK: allowed (a public channel auto-joins the poster
+ * so broadcasts reach them); CH_UNKNOWN: no such channel; CH_DENIED: a private
+ * channel the user does not belong to. */
+enum { CH_OK = 0, CH_UNKNOWN = 1, CH_DENIED = 2 };
+static int channel_post_access(sqlite3 *db, uint64_t channel_id, uint64_t user_id) {
+    uint8_t is_public = 0;
+    if (!channel_exists(db, channel_id, &is_public)) return CH_UNKNOWN;
+    if (is_member(db, channel_id, user_id)) return CH_OK;
+    if (is_public) { add_membership(db, channel_id, user_id); return CH_OK; }
+    return CH_DENIED;
+}
+
 static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -593,10 +644,9 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     }
     sqlite3_finalize(st);
 
-    if (!is_member(db, j->channel_id, j->user_id)) {
-        r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;
-        return r;
-    }
+    int acc = channel_post_access(db, j->channel_id, j->user_id);
+    if (acc == CH_UNKNOWN) { r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
+    if (acc == CH_DENIED)  { r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;   return r; }
 
     uint64_t ts = dbw_now_ms();
     sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
@@ -742,6 +792,188 @@ static oc_dbres *process_delete(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Fill a result's ch_* fields from the channel row + the actor's membership.
+ * Returns 1 if the channel exists (result is a valid CHANNEL_INFO), 0 if not. */
+static int load_channel_info(sqlite3 *db, uint64_t channel_id, uint64_t actor, oc_dbres *r) {
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    sqlite3_prepare_v2(db,
+        "SELECT name, is_public, created_at_ms FROM channels WHERE id=? AND kind='channel';",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *nm = sqlite3_column_text(st, 0);
+        r->ch_name       = strdup(nm ? (const char *)nm : "");
+        r->ch_is_public  = (uint8_t)(sqlite3_column_int(st, 1) != 0);
+        r->ch_created_at = (uint64_t)sqlite3_column_int64(st, 2);
+        r->ch_kind       = OC_CHANNEL_KIND;
+        r->channel_id    = channel_id;
+        found = 1;
+    }
+    sqlite3_finalize(st);
+    if (found) r->ch_joined = (uint8_t)(is_member(db, channel_id, actor) ? 1 : 0);
+    return found;
+}
+
+/* Create a named channel (REQ-050); the creator auto-joins. */
+static oc_dbres *process_create_channel(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+
+    size_t nlen = j->ch_name ? strlen(j->ch_name) : 0;
+    if (nlen == 0 || nlen > OC_MAX_CHANNEL_NAME) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_INVALID_CHANNEL; return r;
+    }
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO channels(kind,name,is_public,created_at_ms) VALUES('channel',?,?,?);",
+        -1, &st, NULL);
+    sqlite3_bind_text(st, 1, j->ch_name, (int)nlen, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 2, j->ch_is_public ? 1 : 0);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+    }
+    uint64_t cid = (uint64_t)sqlite3_last_insert_rowid(db);
+    add_membership(db, cid, j->user_id);
+
+    r->type = OC_RES_CHANNEL_INFO;
+    load_channel_info(db, cid, j->user_id, r);
+    return r;
+}
+
+/* List the channels visible to the user: every public channel plus any private
+ * channel they belong to, each flagged with whether they are a member. */
+static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_CHANNEL_LIST;
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT c.id, c.name, c.is_public, "
+        "  EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1) "
+        "FROM channels c WHERE c.kind='channel' AND "
+        "  (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1)) "
+        "ORDER BY c.id;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+
+    size_t cap = 8, n = 0;
+    oc_channel_row *arr = malloc(cap * sizeof *arr);
+    while (arr && sqlite3_step(st) == SQLITE_ROW) {
+        if (n == cap) { cap *= 2; oc_channel_row *g = realloc(arr, cap * sizeof *arr); if (!g) break; arr = g; }
+        const unsigned char *nm = sqlite3_column_text(st, 1);
+        arr[n].channel_id = (uint64_t)sqlite3_column_int64(st, 0);
+        arr[n].name       = strdup(nm ? (const char *)nm : "");
+        arr[n].is_public  = (uint8_t)(sqlite3_column_int(st, 2) != 0);
+        arr[n].joined     = (uint8_t)(sqlite3_column_int(st, 3) != 0);
+        n++;
+    }
+    sqlite3_finalize(st);
+    r->chlist = arr;
+    r->n_chlist = n;
+    return r;
+}
+
+/* Join a channel: public channels are self-joinable; a private channel requires
+ * an existing membership (obtained via INVITE), else FORBIDDEN. */
+static oc_dbres *process_join_channel(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+
+    uint8_t is_public = 0;
+    if (!channel_exists(db, j->channel_id, &is_public)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r;
+    }
+    if (!is_public && !is_member(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    add_membership(db, j->channel_id, j->user_id);
+    r->type = OC_RES_CHANNEL_INFO;
+    load_channel_info(db, j->channel_id, j->user_id, r);
+    return r;
+}
+
+/* Leave a channel: drop the caller's own membership (idempotent). */
+static oc_dbres *process_leave_channel(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+
+    if (!channel_exists(db, j->channel_id, NULL)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r;
+    }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "DELETE FROM channel_members WHERE channel_id=? AND user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+
+    r->type = OC_RES_CHANNEL_INFO;
+    load_channel_info(db, j->channel_id, j->user_id, r);   /* ch_joined now 0 */
+    return r;
+}
+
+/* Invite another user to a channel (REQ-033, channel-level): any existing member
+ * may add anyone — the mechanism that makes a private channel reachable. The
+ * result acks the actor and flags the target so the net thread can push it a
+ * CHANNEL_INFO. */
+static oc_dbres *process_invite_channel(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+
+    if (!channel_exists(db, j->channel_id, NULL)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r;
+    }
+    if (!is_member(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+    uint8_t trole = OC_ROLE_MEMBER;
+    if (!user_role(db, j->target_user_id, &trole)) {   /* unknown target: no disclosure */
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    add_membership(db, j->channel_id, j->target_user_id);
+
+    r->type = OC_RES_CHANNEL_INFO;
+    load_channel_info(db, j->channel_id, j->user_id, r);
+    r->push_user_id = j->target_user_id;
+    return r;
+}
+
+/* Remove another user from a channel (REQ-033): any existing member may. */
+static oc_dbres *process_remove_channel(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+
+    if (!channel_exists(db, j->channel_id, NULL)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r;
+    }
+    if (!is_member(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "DELETE FROM channel_members WHERE channel_id=? AND user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->target_user_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+
+    r->type = OC_RES_CHANNEL_INFO;
+    load_channel_info(db, j->channel_id, j->user_id, r);
+    return r;
+}
+
 /* Replay messages newer than each cursor, for channels the user belongs to,
  * bounded by OC_BACKFILL_MAX total (REQ-101, PROTOCOL.md §6). */
 static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
@@ -761,7 +993,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
 
     for (size_t ci = 0; ci < j->n_cursors && n < OC_BACKFILL_MAX; ci++) {
         uint64_t ch = j->cursors[ci].channel_id;
-        if (!is_member(db, ch, j->user_id)) continue;
+        if (!channel_read_access(db, ch, j->user_id)) continue;
 
         sqlite3_prepare_v2(db,
             "SELECT id, author_id, created_at_ms, body FROM messages "
@@ -832,6 +1064,12 @@ static void *writer_loop(void *arg) {
         else if (j->type == OC_JOB_LOGOUT)   r = process_logout(w->db, j);
         else if (j->type == OC_JOB_EDIT)     r = process_edit(w->db, j);
         else if (j->type == OC_JOB_DELETE)   r = process_delete(w->db, j);
+        else if (j->type == OC_JOB_CREATE_CHANNEL) r = process_create_channel(w->db, j);
+        else if (j->type == OC_JOB_LIST_CHANNELS)  r = process_list_channels(w->db, j);
+        else if (j->type == OC_JOB_JOIN_CHANNEL)   r = process_join_channel(w->db, j);
+        else if (j->type == OC_JOB_LEAVE_CHANNEL)  r = process_leave_channel(w->db, j);
+        else if (j->type == OC_JOB_INVITE_CHANNEL) r = process_invite_channel(w->db, j);
+        else if (j->type == OC_JOB_REMOVE_CHANNEL) r = process_remove_channel(w->db, j);
         job_free(j);
         push_result(w, r);
     }

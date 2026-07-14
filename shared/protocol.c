@@ -339,6 +339,67 @@ oc_result oc_encode_msg_deleted(oc_wbuf *w, uint16_t version, const oc_msg_delet
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_create_channel(oc_wbuf *w, uint16_t version, const oc_create_channel *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CREATE_CHANNEL);
+    oc_w_str(w, m->name);
+    oc_w_u8(w, m->is_public);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_info *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CHANNEL_INFO);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u8(w, m->kind);
+    oc_w_str(w, m->name);
+    oc_w_u8(w, m->is_public);
+    oc_w_u8(w, m->joined);
+    oc_w_u64(w, m->created_at);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_list_channels(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_CHANNELS);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_channel_list(oc_wbuf *w, uint16_t version, const oc_channel_list *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CHANNEL_LIST);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        oc_w_u64(w, m->entries[i].channel_id);
+        oc_w_str(w, m->entries[i].name);
+        oc_w_u8(w, m->entries[i].is_public);
+        oc_w_u8(w, m->entries[i].joined);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_join_channel(oc_wbuf *w, uint16_t version, const oc_channel_ref *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_JOIN_CHANNEL);
+    oc_w_u64(w, m->channel_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_leave_channel(oc_wbuf *w, uint16_t version, const oc_channel_ref *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LEAVE_CHANNEL);
+    oc_w_u64(w, m->channel_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_invite_to_channel(oc_wbuf *w, uint16_t version, const oc_channel_member_op *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_INVITE_TO_CHANNEL);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->user_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_remove_from_channel(oc_wbuf *w, uint16_t version, const oc_channel_member_op *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_REMOVE_FROM_CHANNEL);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->user_id);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_backfill_request(oc_wbuf *w, uint16_t version, const oc_backfill_request *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_BACKFILL_REQUEST);
     oc_w_u16(w, m->count);
@@ -469,6 +530,67 @@ oc_result oc_decode_msg_deleted(oc_rbuf *p, oc_msg_deleted *m) {
     m->author_id = oc_r_u64(p);
     m->deleted_by = oc_r_u64(p);
     m->deleted_at = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_create_channel(oc_rbuf *p, oc_create_channel *m) {
+    m->name = oc_r_str(p);
+    m->is_public = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_channel_info(oc_rbuf *p, oc_channel_info *m) {
+    m->channel_id = oc_r_u64(p);
+    m->kind = oc_r_u8(p);
+    m->name = oc_r_str(p);
+    m->is_public = oc_r_u8(p);
+    m->joined = oc_r_u8(p);
+    m->created_at = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_list_channels(oc_rbuf *p) {
+    return r_done(p);   /* empty payload */
+}
+
+oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries,
+                                 uint16_t cap, uint16_t *out_count) {
+    uint16_t count = oc_r_u16(p);
+    *out_count = count;
+    for (uint16_t i = 0; i < count; i++) {
+        uint64_t id = oc_r_u64(p);
+        oc_slice name = oc_r_str(p);
+        uint8_t is_public = oc_r_u8(p);
+        uint8_t joined = oc_r_u8(p);
+        if (i < cap) {
+            entries[i].channel_id = id;
+            entries[i].name = name;
+            entries[i].is_public = is_public;
+            entries[i].joined = joined;
+        }
+    }
+    return r_done(p);
+}
+
+oc_result oc_decode_join_channel(oc_rbuf *p, oc_channel_ref *m) {
+    m->channel_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_leave_channel(oc_rbuf *p, oc_channel_ref *m) {
+    m->channel_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_invite_to_channel(oc_rbuf *p, oc_channel_member_op *m) {
+    m->channel_id = oc_r_u64(p);
+    m->user_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_remove_from_channel(oc_rbuf *p, oc_channel_member_op *m) {
+    m->channel_id = oc_r_u64(p);
+    m->user_id = oc_r_u64(p);
     return r_done(p);
 }
 
