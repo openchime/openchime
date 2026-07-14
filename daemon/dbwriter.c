@@ -1481,6 +1481,7 @@ static oc_dbres *process_list_thread(sqlite3 *db, const oc_job *j) {
     sqlite3_finalize(st);
     r->thread = arr;
     r->n_thread = n;
+    r->truncated = (n >= OC_BACKFILL_MAX);
     return r;
 }
 
@@ -1565,6 +1566,7 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
     sqlite3_finalize(st);
     r->search = arr;
     r->n_search = n;
+    r->truncated = (n >= lim);   /* filled the requested limit -> maybe more */
     return r;
 }
 
@@ -1675,6 +1677,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
     free(derived);
     r->replay = arr;
     r->n_replay = n;
+    r->truncated = (n >= OC_BACKFILL_MAX);   /* hit the per-response cap */
     return r;
 }
 

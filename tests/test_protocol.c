@@ -247,10 +247,11 @@ static void test_thread_frames(void) {
         CHECK(out.channel_id == 7 && out.parent_id == 500);
     }
     {
-        oc_thread in = { 500, 3 };
+        oc_thread in = { 500, 3, 1 };
         ROUNDTRIP(oc_encode_thread(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD, h, p);
         oc_thread out;
         CHECK(oc_decode_thread(&p, &out) == OC_OK);
+        CHECK(out.truncated == 1);
         CHECK(out.parent_id == 500 && out.count == 3);
     }
     {
@@ -454,11 +455,11 @@ static void test_search_frames(void) {
             { 1001, 7, 42, 1751200500000ull, oc_slice_str("... the deploy ...") },
             { 990,  7, 43, 1751200400000ull, oc_slice_str("deploy again") },
         };
-        oc_search_results in = { 2, ents };
+        oc_search_results in = { 2, ents, 1 };
         ROUNDTRIP(oc_encode_search_results(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH_RESULTS, h, p);
-        oc_search_result_entry out[2]; uint16_t n = 0;
-        CHECK(oc_decode_search_results(&p, out, 2, &n) == OC_OK);
-        CHECK(n == 2);
+        oc_search_result_entry out[2]; uint16_t n = 0; uint8_t trunc = 0;
+        CHECK(oc_decode_search_results(&p, out, 2, &n, &trunc) == OC_OK);
+        CHECK(n == 2 && trunc == 1);
         CHECK(out[0].message_id == 1001 && out[0].channel_id == 7 && out[0].author_id == 42);
         CHECK(out[0].server_time == 1751200500000ull && slice_eq_str(out[0].snippet, "... the deploy ..."));
         CHECK(out[1].message_id == 990 && slice_eq_str(out[1].snippet, "deploy again"));
@@ -496,11 +497,12 @@ static void test_backfill_and_error(void) {
         CHECK(out[0].channel_id == 1 && out[1].channel_id == 2);
     }
     {
-        oc_backfill_done in = { 4242 };
+        oc_backfill_done in = { 4242, 1 };
         ROUNDTRIP(oc_encode_backfill_done(&w, OC_PROTOCOL_VERSION, &in),
                   OC_MSG_BACKFILL_DONE, h, p);
         oc_backfill_done out;
         CHECK(oc_decode_backfill_done(&p, &out) == OC_OK);
+        CHECK(out.more == 1);
         CHECK(out.high_water == 4242);
     }
     {

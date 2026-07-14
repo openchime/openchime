@@ -411,6 +411,7 @@ oc_result oc_encode_thread(oc_wbuf *w, uint16_t version, const oc_thread *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_THREAD);
     oc_w_u64(w, m->parent_id);
     oc_w_u32(w, m->count);
+    oc_w_u8(w, m->truncated);   /* 1 if replies were capped */
     return oc_frame_end(w, off);
 }
 
@@ -561,6 +562,7 @@ oc_result oc_encode_search_results(oc_wbuf *w, uint16_t version, const oc_search
         oc_w_u64(w, m->entries[i].server_time);
         oc_w_str(w, m->entries[i].snippet);
     }
+    oc_w_u8(w, m->truncated);   /* 1 if more matches exist past the cap */
     return oc_frame_end(w, off);
 }
 
@@ -577,6 +579,7 @@ oc_result oc_encode_backfill_request(oc_wbuf *w, uint16_t version, const oc_back
 oc_result oc_encode_backfill_done(oc_wbuf *w, uint16_t version, const oc_backfill_done *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_BACKFILL_DONE);
     oc_w_u64(w, m->high_water);
+    oc_w_u8(w, m->more);   /* 1 if the replay hit the per-response cap */
     return oc_frame_end(w, off);
 }
 
@@ -762,6 +765,7 @@ oc_result oc_decode_list_thread(oc_rbuf *p, oc_list_thread *m) {
 oc_result oc_decode_thread(oc_rbuf *p, oc_thread *m) {
     m->parent_id = oc_r_u64(p);
     m->count = oc_r_u32(p);
+    m->truncated = oc_r_u8(p);
     return r_done(p);
 }
 
@@ -902,7 +906,7 @@ oc_result oc_decode_search(oc_rbuf *p, oc_search *m) {
 }
 
 oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries,
-                                   uint16_t cap, uint16_t *out_count) {
+                                   uint16_t cap, uint16_t *out_count, uint8_t *out_truncated) {
     uint16_t count = oc_r_u16(p);
     *out_count = count;
     for (uint16_t i = 0; i < count; i++) {
@@ -919,6 +923,8 @@ oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries,
             entries[i].snippet = snip;
         }
     }
+    uint8_t trunc = oc_r_u8(p);
+    if (out_truncated) *out_truncated = trunc;
     return r_done(p);
 }
 
@@ -936,6 +942,7 @@ oc_result oc_decode_backfill_request(oc_rbuf *p, oc_cursor *cursors,
 
 oc_result oc_decode_backfill_done(oc_rbuf *p, oc_backfill_done *m) {
     m->high_water = oc_r_u64(p);
+    m->more = oc_r_u8(p);
     return r_done(p);
 }
 

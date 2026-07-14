@@ -256,7 +256,7 @@ typedef struct { uint64_t channel_id; uint64_t parent_id; } oc_list_thread;
 /* THREAD is the terminator of a LIST_THREAD response: the daemon streams the
  * replies as THREAD_REPLY frames (each self-framed, so a 64KB body is fine),
  * then this frame closes the stream — mirroring BACKFILL_DONE (§6.2). */
-typedef struct { uint64_t parent_id; uint32_t count; } oc_thread;
+typedef struct { uint64_t parent_id; uint32_t count; uint8_t truncated; } oc_thread;
 typedef struct { uint64_t message_id; uint32_t reply_count; uint64_t last_reply_at; } oc_thread_meta;
 typedef struct { oc_slice name; uint8_t is_public; } oc_create_channel;
 typedef struct { uint64_t channel_id; uint8_t kind; oc_slice name; uint8_t is_public; uint8_t joined; uint64_t created_at; } oc_channel_info;
@@ -274,10 +274,10 @@ typedef struct { oc_slice token; uint8_t role; uint64_t expires_at; } oc_invite_
 typedef struct { oc_slice token; oc_slice username; oc_slice password; } oc_redeem_invite;
 typedef struct { oc_slice query; uint16_t limit; } oc_search;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time; oc_slice snippet; } oc_search_result_entry;
-typedef struct { uint16_t count; const oc_search_result_entry *entries; } oc_search_results;
+typedef struct { uint16_t count; const oc_search_result_entry *entries; uint8_t truncated; } oc_search_results;
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_cursor;
 typedef struct { uint16_t count; const oc_cursor *cursors; } oc_backfill_request;
-typedef struct { uint64_t high_water; } oc_backfill_done;
+typedef struct { uint64_t high_water; uint8_t more; } oc_backfill_done;
 typedef struct { uint16_t code; uint8_t fatal; oc_slice context; oc_slice message; } oc_error;
 
 /* --- Frame encoders ----------------------------------------------------- */
@@ -382,7 +382,7 @@ oc_result oc_decode_user_updated(oc_rbuf *p, oc_user_updated *m);
 oc_result oc_decode_invite_created(oc_rbuf *p, oc_invite_created *m);
 oc_result oc_decode_redeem_invite(oc_rbuf *p, oc_redeem_invite *m);
 oc_result oc_decode_search(oc_rbuf *p, oc_search *m);
-oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries, uint16_t cap, uint16_t *out_count);
+oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries, uint16_t cap, uint16_t *out_count, uint8_t *out_truncated);
 oc_result oc_decode_backfill_request(oc_rbuf *p, oc_cursor *cursors, uint16_t cap, uint16_t *out_count);
 oc_result oc_decode_backfill_done(oc_rbuf *p, oc_backfill_done *m);
 oc_result oc_decode_error(oc_rbuf *p, oc_error *m);

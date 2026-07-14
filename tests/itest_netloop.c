@@ -642,7 +642,7 @@ static void test_search_vertical(int port, const uint8_t *pin) {
     CHECK(send_frame(&b, buf, w.len) == 0);
     CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SEARCH_RESULTS);
     oc_search_result_entry se[8]; uint16_t n = 0;
-    CHECK(oc_decode_search_results(&p, se, 8, &n) == OC_OK);
+    CHECK(oc_decode_search_results(&p, se, 8, &n, NULL) == OC_OK);
     CHECK(n == 1 && se[0].message_id == m1 && se[0].channel_id == 1 && se[0].author_id == ua);
     CHECK(se[0].snippet.len > 0);
 
@@ -667,14 +667,14 @@ static void test_search_vertical(int port, const uint8_t *pin) {
     CHECK(oc_encode_search(&w, OC_PROTOCOL_VERSION, &sq2) == OC_OK);
     CHECK(send_frame(&b, buf, w.len) == 0);
     CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SEARCH_RESULTS);
-    CHECK(oc_decode_search_results(&p, se, 8, &n) == OC_OK && n == 0);
+    CHECK(oc_decode_search_results(&p, se, 8, &n, NULL) == OC_OK && n == 0);
 
     /* alice, a member, does find it. */
     oc_wbuf_init(&w, buf, sizeof buf);
     CHECK(oc_encode_search(&w, OC_PROTOCOL_VERSION, &sq2) == OC_OK);
     CHECK(send_frame(&a, buf, w.len) == 0);
     CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SEARCH_RESULTS);
-    CHECK(oc_decode_search_results(&p, se, 8, &n) == OC_OK && n == 1 && se[0].channel_id == cid);
+    CHECK(oc_decode_search_results(&p, se, 8, &n, NULL) == OC_OK && n == 1 && se[0].channel_id == cid);
 
     client_close(&a);
     client_close(&b);

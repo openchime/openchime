@@ -906,7 +906,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         }
         if (!conns[fd]) break;
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
-        oc_thread th = { r->parent_id, (uint32_t)r->n_thread };
+        oc_thread th = { r->parent_id, (uint32_t)r->n_thread, r->truncated };
         oc_encode_thread(&w, OC_PROTOCOL_VERSION, &th);
         send_bytes(ep, conns, fd, g_enc, w.len);
         break;
@@ -926,7 +926,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             ents[i].snippet.len = r->search[i].body_len;
         }
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
-        oc_search_results sr = { (uint16_t)n, ents };
+        oc_search_results sr = { (uint16_t)n, ents, r->truncated };
         oc_encode_search_results(&w, OC_PROTOCOL_VERSION, &sr);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         free(ents);
@@ -955,7 +955,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         }
         if (!conns[fd]) return;
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
-        oc_backfill_done done = { r->high_water };
+        oc_backfill_done done = { r->high_water, r->truncated };
         oc_encode_backfill_done(&w, OC_PROTOCOL_VERSION, &done);
         send_bytes(ep, conns, fd, g_enc, w.len);
         break;

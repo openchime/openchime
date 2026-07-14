@@ -165,6 +165,7 @@ typedef struct oc_dbres {
     oc_replay_msg *replay;    /* heap array, ascending message_id */
     size_t         n_replay;
     uint64_t       high_water;
+    uint8_t        truncated;  /* results hit the per-response cap (backfill/search/thread) */
 
     /* CHANNEL_INFO (create/join/leave/invite/remove ack). channel_id above. */
     uint8_t        ch_kind;
