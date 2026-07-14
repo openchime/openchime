@@ -1221,6 +1221,46 @@ static void test_search(void) {
     cleanup_db(path);
 }
 
+/* Idempotency-map pruning (ARCH-44): a (channel, token) mapping older than the
+ * retention window is dropped, so a much-later retry of the same token is no
+ * longer deduplicated, while a recent token still is. */
+static void test_idem_pruning(void) {
+    const char *path = "build/test_dbwriter_prune.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    /* Tiny retention + prune-every-write so the test can observe it. */
+    oc_dbwriter_set_idem_retention(w, 50 /*ms*/, 0 /*interval*/);
+
+    uint64_t uid = reg(w, "pr-user", "pw", OC_ROLE_MEMBER);
+    CHECK(uid != 0);
+
+    uint8_t tokA[OC_IDEM_LEN], tokB[OC_IDEM_LEN];
+    memset(tokA, 0xA1, sizeof tokA);
+    memset(tokB, 0xB2, sizeof tokB);
+
+    uint64_t m1 = send_msg(w, uid, tokA, "first");
+    CHECK(m1 != 0);
+    /* Fresh token is still deduplicated. */
+    CHECK(send_msg(w, uid, tokA, "first-again") == m1);
+
+    usleep(120000);   /* age tokA past the 50ms retention */
+
+    /* A new send triggers the prune, dropping tokA's aged mapping. */
+    uint64_t m2 = send_msg(w, uid, tokB, "second");
+    CHECK(m2 > m1);
+
+    /* tokA is no longer deduplicated -> a retry allocates a fresh id. */
+    uint64_t m3 = send_msg(w, uid, tokA, "first-retry");
+    CHECK(m3 != m1 && m3 > m2);
+
+    /* tokB, still within retention, is deduplicated. */
+    CHECK(send_msg(w, uid, tokB, "second-again") == m2);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill\n");
     test_start_migrates_and_stops();
@@ -1236,6 +1276,7 @@ int run_dbwriter_tests(void) {
     test_reactions();
     test_threads();
     test_search();
+    test_idem_pruning();
     test_backfill();
     return failures;
 }

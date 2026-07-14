@@ -25,15 +25,20 @@
 #include <unistd.h>
 
 struct oc_dbwriter {
-    sqlite3        *db;
-    pthread_t       thread;
+    sqlite3        *db;                       /* the single write connection (ARCH-5) */
+    sqlite3        *rdb;                      /* read-only connection for query jobs (ARCH-66) */
+    pthread_t       thread;                   /* writer */
+    pthread_t       reader;                   /* read-only query worker */
     pthread_mutex_t mu;
-    pthread_cond_t  cv;
-    oc_job         *jobs_head, *jobs_tail;   /* net -> writer */
-    oc_dbres      *res_head,  *res_tail;    /* writer -> net */
+    pthread_cond_t  cv;                       /* wakes the writer */
+    pthread_cond_t  read_cv;                  /* wakes the reader */
+    oc_job         *jobs_head, *jobs_tail;    /* net -> writer (write jobs) */
+    oc_job         *rjobs_head, *rjobs_tail;  /* net -> reader (read-only jobs) */
+    oc_dbres      *res_head,  *res_tail;     /* writer|reader -> net */
     int             evfd;                    /* signals results ready */
     int             stop;
     int             started;
+    int             reader_started;
 
     /* Auth config (set before serving; read only on the writer thread). */
     uint8_t         auth_methods;            /* advertised in AUTH_CHALLENGE */
@@ -44,6 +49,12 @@ struct oc_dbwriter {
     char           *oidc_params;             /* advertised blob ("" if none) */
     oc_ratelimit   *auth_rl;                 /* failed local-auth per account */
     oc_ratelimit   *source_rl;               /* failed local-auth per source IP */
+
+    /* Idempotency-map pruning (ARCH-44): drop sent_messages rows older than the
+     * retention window, at most once per interval. Writer-thread state only. */
+    uint64_t        idem_retention_ms;
+    uint64_t        prune_interval_ms;
+    uint64_t        last_prune_ms;
 };
 
 /* Failed local-auth throttle (REQ-191, AUTH.md §2): after this many failures
@@ -54,6 +65,12 @@ struct oc_dbwriter {
 #define OC_AUTH_SOURCE_MAX_FAILURES 20
 #define OC_AUTH_WINDOW_MS           60000u
 #define OC_AUTH_RL_CAPACITY         1024u
+
+/* Idempotency retention (ARCH-44): keep a (channel, token) -> id mapping this
+ * long — enough to cover realistic reconnect-retry — then prune it. Pruning runs
+ * at most once per interval on the writer thread. */
+#define OC_IDEM_RETENTION_MS (24ull * 60 * 60 * 1000)
+#define OC_PRUNE_INTERVAL_MS (60ull * 60 * 1000)
 
 static uint64_t dbw_now_ms(void) {
     struct timespec ts;
@@ -1598,6 +1615,60 @@ static void push_result(oc_dbwriter *w, oc_dbres *r) {
     (void)wr;
 }
 
+/* Read-only query jobs run on the reader connection (ARCH-66), off the writer
+ * thread, so a heavy search/backfill can't stall message sends or auth. */
+static int is_read_job(int type) {
+    return type == OC_JOB_BACKFILL || type == OC_JOB_SEARCH ||
+           type == OC_JOB_LIST_CHANNELS || type == OC_JOB_LIST_USERS ||
+           type == OC_JOB_LIST_REACTIONS || type == OC_JOB_LIST_THREAD;
+}
+
+/* Dispatch a read-only job against `rdb`. */
+static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
+    if (j->type == OC_JOB_BACKFILL)       return process_backfill(rdb, j);
+    if (j->type == OC_JOB_SEARCH)         return process_search(rdb, j);
+    if (j->type == OC_JOB_LIST_CHANNELS)  return process_list_channels(rdb, j);
+    if (j->type == OC_JOB_LIST_USERS)     return process_list_users(rdb, j);
+    if (j->type == OC_JOB_LIST_REACTIONS) return process_list_reactions(rdb, j);
+    if (j->type == OC_JOB_LIST_THREAD)    return process_list_thread(rdb, j);
+    return NULL;
+}
+
+/* Dispatch a write (or auth) job against the single write connection. */
+static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
+    if (j->type == OC_JOB_AUTH)          return process_auth(w, j);
+    if (j->type == OC_JOB_SEND)          return process_send(w->db, j);
+    if (j->type == OC_JOB_REGISTER)      return process_register(w->db, j);
+    if (j->type == OC_JOB_SET_ROLE)      return process_set_role(w->db, j);
+    if (j->type == OC_JOB_LOGOUT)        return process_logout(w->db, j);
+    if (j->type == OC_JOB_EDIT)          return process_edit(w->db, j);
+    if (j->type == OC_JOB_DELETE)        return process_delete(w->db, j);
+    if (j->type == OC_JOB_CREATE_CHANNEL) return process_create_channel(w->db, j);
+    if (j->type == OC_JOB_JOIN_CHANNEL)   return process_join_channel(w->db, j);
+    if (j->type == OC_JOB_LEAVE_CHANNEL)  return process_leave_channel(w->db, j);
+    if (j->type == OC_JOB_INVITE_CHANNEL) return process_invite_channel(w->db, j);
+    if (j->type == OC_JOB_REMOVE_CHANNEL) return process_remove_channel(w->db, j);
+    if (j->type == OC_JOB_INVITE_USER)    return process_invite_user(w->db, j);
+    if (j->type == OC_JOB_REMOVE_USER)    return process_remove_user(w->db, j);
+    if (j->type == OC_JOB_REDEEM)         return process_redeem(w->db, j);
+    if (j->type == OC_JOB_REACT)          return process_react(w->db, j);
+    if (j->type == OC_JOB_SEND_REPLY)     return process_send_reply(w->db, j);
+    return NULL;
+}
+
+/* Prune the idempotency map (ARCH-44) at most once per interval, dropping
+ * (channel, token) rows older than the retention window. Writer thread only. */
+static void maybe_prune_idem(oc_dbwriter *w) {
+    uint64_t now = dbw_now_ms();
+    if (w->last_prune_ms != 0 && now - w->last_prune_ms < w->prune_interval_ms) return;
+    w->last_prune_ms = now;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(w->db, "DELETE FROM sent_messages WHERE created_at_ms < ?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)(now - w->idem_retention_ms));
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
 static void *writer_loop(void *arg) {
     oc_dbwriter *w = (oc_dbwriter *)arg;
     for (;;) {
@@ -1610,30 +1681,27 @@ static void *writer_loop(void *arg) {
         if (!w->jobs_head) w->jobs_tail = NULL;
         pthread_mutex_unlock(&w->mu);
 
-        oc_dbres *r = NULL;
-        if (j->type == OC_JOB_AUTH)          r = process_auth(w, j);
-        else if (j->type == OC_JOB_SEND)     r = process_send(w->db, j);
-        else if (j->type == OC_JOB_BACKFILL) r = process_backfill(w->db, j);
-        else if (j->type == OC_JOB_REGISTER) r = process_register(w->db, j);
-        else if (j->type == OC_JOB_SET_ROLE) r = process_set_role(w->db, j);
-        else if (j->type == OC_JOB_LOGOUT)   r = process_logout(w->db, j);
-        else if (j->type == OC_JOB_EDIT)     r = process_edit(w->db, j);
-        else if (j->type == OC_JOB_DELETE)   r = process_delete(w->db, j);
-        else if (j->type == OC_JOB_CREATE_CHANNEL) r = process_create_channel(w->db, j);
-        else if (j->type == OC_JOB_LIST_CHANNELS)  r = process_list_channels(w->db, j);
-        else if (j->type == OC_JOB_JOIN_CHANNEL)   r = process_join_channel(w->db, j);
-        else if (j->type == OC_JOB_LEAVE_CHANNEL)  r = process_leave_channel(w->db, j);
-        else if (j->type == OC_JOB_INVITE_CHANNEL) r = process_invite_channel(w->db, j);
-        else if (j->type == OC_JOB_REMOVE_CHANNEL) r = process_remove_channel(w->db, j);
-        else if (j->type == OC_JOB_LIST_USERS)     r = process_list_users(w->db, j);
-        else if (j->type == OC_JOB_INVITE_USER)    r = process_invite_user(w->db, j);
-        else if (j->type == OC_JOB_REMOVE_USER)    r = process_remove_user(w->db, j);
-        else if (j->type == OC_JOB_REDEEM)         r = process_redeem(w->db, j);
-        else if (j->type == OC_JOB_REACT)          r = process_react(w->db, j);
-        else if (j->type == OC_JOB_LIST_REACTIONS) r = process_list_reactions(w->db, j);
-        else if (j->type == OC_JOB_SEND_REPLY)     r = process_send_reply(w->db, j);
-        else if (j->type == OC_JOB_LIST_THREAD)    r = process_list_thread(w->db, j);
-        else if (j->type == OC_JOB_SEARCH)         r = process_search(w->db, j);
+        oc_dbres *r = process_write(w, j);
+        job_free(j);
+        push_result(w, r);
+        maybe_prune_idem(w);
+    }
+    return NULL;
+}
+
+static void *reader_loop(void *arg) {
+    oc_dbwriter *w = (oc_dbwriter *)arg;
+    for (;;) {
+        pthread_mutex_lock(&w->mu);
+        while (!w->stop && !w->rjobs_head)
+            pthread_cond_wait(&w->read_cv, &w->mu);
+        if (w->stop && !w->rjobs_head) { pthread_mutex_unlock(&w->mu); break; }
+        oc_job *j = w->rjobs_head;
+        w->rjobs_head = j->next;
+        if (!w->rjobs_head) w->rjobs_tail = NULL;
+        pthread_mutex_unlock(&w->mu);
+
+        oc_dbres *r = process_read(w->rdb, j);
         job_free(j);
         push_result(w, r);
     }
@@ -1643,9 +1711,15 @@ static void *writer_loop(void *arg) {
 void oc_dbwriter_submit(oc_dbwriter *w, oc_job *j) {
     pthread_mutex_lock(&w->mu);
     j->next = NULL;
-    if (w->jobs_tail) w->jobs_tail->next = j; else w->jobs_head = j;
-    w->jobs_tail = j;
-    pthread_cond_signal(&w->cv);
+    if (is_read_job(j->type)) {                 /* route to the reader (ARCH-66) */
+        if (w->rjobs_tail) w->rjobs_tail->next = j; else w->rjobs_head = j;
+        w->rjobs_tail = j;
+        pthread_cond_signal(&w->read_cv);
+    } else {
+        if (w->jobs_tail) w->jobs_tail->next = j; else w->jobs_head = j;
+        w->jobs_tail = j;
+        pthread_cond_signal(&w->cv);
+    }
     pthread_mutex_unlock(&w->mu);
 }
 
@@ -1683,6 +1757,15 @@ const char *oc_dbwriter_oidc_params(oc_dbwriter *w) {
     return w->oidc_params ? w->oidc_params : "";
 }
 
+void oc_dbwriter_set_idem_retention(oc_dbwriter *w, uint64_t retention_ms,
+                                    uint64_t interval_ms) {
+    pthread_mutex_lock(&w->mu);
+    w->idem_retention_ms = retention_ms;
+    w->prune_interval_ms = interval_ms;
+    w->last_prune_ms = 0;   /* let the next write prune immediately */
+    pthread_mutex_unlock(&w->mu);
+}
+
 /* Setup-time helper: submit a REGISTER job and block for its result. Intended
  * for bootstrap / test fixtures before the net loop is serving traffic — it
  * consumes one result from the queue, so it must not race a live consumer. */
@@ -1714,6 +1797,8 @@ oc_dbwriter *oc_dbwriter_start(const char *path) {
     if (!w) return NULL;
     w->evfd = -1;
     w->auth_methods = OC_AUTH_LOCAL | OC_AUTH_SESSION;  /* local mode by default */
+    w->idem_retention_ms = OC_IDEM_RETENTION_MS;
+    w->prune_interval_ms = OC_PRUNE_INTERVAL_MS;
     w->auth_rl   = oc_ratelimit_new(OC_AUTH_MAX_FAILURES, OC_AUTH_WINDOW_MS, OC_AUTH_RL_CAPACITY);
     w->source_rl = oc_ratelimit_new(OC_AUTH_SOURCE_MAX_FAILURES, OC_AUTH_WINDOW_MS, OC_AUTH_RL_CAPACITY);
     if (!w->auth_rl || !w->source_rl) {
@@ -1739,19 +1824,47 @@ oc_dbwriter *oc_dbwriter_start(const char *path) {
     w->evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (w->evfd < 0) { fprintf(stderr, "dbwriter: eventfd failed\n"); goto fail; }
 
+    /* Read-only connection for query jobs (ARCH-66): the same WAL file, opened
+     * query_only so it can never write. WAL lets it read concurrently with the
+     * writer without blocking it. */
+    if (sqlite3_open(path, &w->rdb) != SQLITE_OK) {
+        fprintf(stderr, "dbwriter: open read conn failed: %s\n", sqlite3_errmsg(w->rdb));
+        goto fail;
+    }
+    sqlite3_busy_timeout(w->rdb, 5000);
+    sqlite3_exec(w->rdb, "PRAGMA query_only=1;", NULL, NULL, NULL);
+
     pthread_mutex_init(&w->mu, NULL);
     pthread_cond_init(&w->cv, NULL);
+    pthread_cond_init(&w->read_cv, NULL);
     if (pthread_create(&w->thread, NULL, writer_loop, w) != 0) {
-        fprintf(stderr, "dbwriter: thread create failed\n");
+        fprintf(stderr, "dbwriter: writer thread create failed\n");
         pthread_mutex_destroy(&w->mu);
         pthread_cond_destroy(&w->cv);
+        pthread_cond_destroy(&w->read_cv);
         goto fail;
     }
     w->started = 1;
+    if (pthread_create(&w->reader, NULL, reader_loop, w) != 0) {
+        fprintf(stderr, "dbwriter: reader thread create failed\n");
+        pthread_mutex_lock(&w->mu);
+        w->stop = 1;
+        pthread_cond_signal(&w->cv);
+        pthread_cond_signal(&w->read_cv);
+        pthread_mutex_unlock(&w->mu);
+        pthread_join(w->thread, NULL);
+        pthread_mutex_destroy(&w->mu);
+        pthread_cond_destroy(&w->cv);
+        pthread_cond_destroy(&w->read_cv);
+        w->started = 0;
+        goto fail;
+    }
+    w->reader_started = 1;
     return w;
 
 fail:
     if (w->evfd >= 0) close(w->evfd);
+    sqlite3_close(w->rdb);
     sqlite3_close(w->db);
     free(w);
     return NULL;
@@ -1763,18 +1876,23 @@ void oc_dbwriter_stop(oc_dbwriter *w) {
         pthread_mutex_lock(&w->mu);
         w->stop = 1;
         pthread_cond_signal(&w->cv);
+        pthread_cond_signal(&w->read_cv);
         pthread_mutex_unlock(&w->mu);
         pthread_join(w->thread, NULL);
+        if (w->reader_started) pthread_join(w->reader, NULL);
         pthread_mutex_destroy(&w->mu);
         pthread_cond_destroy(&w->cv);
+        pthread_cond_destroy(&w->read_cv);
     }
     for (oc_job *j = w->jobs_head; j; ) { oc_job *n = j->next; job_free(j); j = n; }
+    for (oc_job *j = w->rjobs_head; j; ) { oc_job *n = j->next; job_free(j); j = n; }
     for (oc_dbres *r = w->res_head; r; ) { oc_dbres *n = r->next; oc_dbres_free(r); r = n; }
     free(w->oidc_issuer); free(w->oidc_audience);
     free(w->oidc_pubkey_pem); free(w->oidc_params);
     oc_ratelimit_free(w->auth_rl);
     oc_ratelimit_free(w->source_rl);
     if (w->evfd >= 0) close(w->evfd);
+    sqlite3_close(w->rdb);
     sqlite3_close(w->db);
     free(w);
 }

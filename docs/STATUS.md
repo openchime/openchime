@@ -128,29 +128,30 @@ ordering, not a commitment.
   output at 1 MiB; a client that stops reading while the daemon fans out is
   dropped rather than growing daemon memory without limit (delivery stays
   recoverable via reconnect + backfill). Tested over the wire.
+- ✅ **`sent_messages` pruning (ARCH-44).** The writer runs a time-gated delete of
+  idempotency rows older than 24h (at most once/hour), bounding the table.
+  Tested (an aged token re-allocates; a recent one still dedups).
+- ✅ **Reads decoupled from the writer thread (ARCH-66).** Backfill, search, and
+  the `LIST_*` ops run on a third thread with its own `query_only` WAL
+  connection, so a heavy query no longer stalls sends/auth. All existing read
+  tests now exercise that path.
 
 **Open**
 
-1. **`sent_messages` never pruned (Medium).** ARCH-44 specifies ~24h pruning;
-   unbounded growth otherwise. Add a periodic delete job on the writer thread.
-2. **Single writer thread blocks on reads (Medium).** Search, backfill, and list
-   ops run on the one DB-writer thread alongside all writes; a heavy query
-   stalls every send/auth for that tenant. Consider a separate read-only
-   connection (WAL readers don't block the writer) for query jobs.
-3. **`CLIENT_ACK` ignored — no delivery accounting (Medium).** Backfill relies
+1. **`CLIENT_ACK` ignored — no delivery accounting (Medium).** Backfill relies
    entirely on client-supplied cursors; the server keeps no per-client delivery
    cursor, so there's no server-side delivery state to reason about or prune.
-4. **No connection/accept throttle (Medium).** Fixed `OC_NETLOOP_MAX_FD` with no
+2. **No connection/accept throttle (Medium).** Fixed `OC_NETLOOP_MAX_FD` with no
    per-IP connection cap → connection-exhaustion DoS.
-5. **Litestream restore ↔ TOFU cert (Medium).** Restore-on-boot can change the
+3. **Litestream restore ↔ TOFU cert (Medium).** Restore-on-boot can change the
    self-signed cert, tripping every client's pin (open item in TLS.md). Decide:
    persist the cert in the replica, or a client re-pin flow.
-6. **Silent truncation signals (Low).** Thread/search/backfill cap at fixed
+4. **Silent truncation signals (Low).** Thread/search/backfill cap at fixed
    limits with no "more available" flag; a client can't tell it was truncated.
-7. **No load/stress/fuzz coverage (Low–Medium).** REQ-210/211 unverified; the
+5. **No load/stress/fuzz coverage (Low–Medium).** REQ-210/211 unverified; the
    codec has no fuzzer. A load test + a frame fuzzer would validate the
    memory/concurrency claims and parser robustness.
-8. **First-owner setup token (Low).** REQ-024 specifies a one-time setup token;
+6. **First-owner setup token (Low).** REQ-024 specifies a one-time setup token;
    today the first owner comes from `OC_BOOTSTRAP_USERS`. Functional, but not
    the spec'd air-gapped bootstrap.
 
@@ -168,8 +169,10 @@ skeleton (the only consumer of all the above), and (b) whole **feature families
 not yet begun**: presence/typing, notifications/push, attachments, audio, and
 webhooks.
 
-The two clearest denial-of-service vectors — an unthrottled `SEND` flood
-(REQ-190) and the unbounded per-connection output buffer — are now **closed**.
-The remaining **robustness backlog** above (idempotency-table pruning, moving
-query ops off the single writer thread, connection throttling, the restore↔cert
-interaction) continues hardening the server before new feature work.
+The clearest denial-of-service and unbounded-growth vectors are now **closed**:
+`SEND`-flood rate limiting (REQ-190), the per-connection output-buffer cap,
+idempotency-map pruning (ARCH-44), and moving query ops onto a read-only
+connection so a heavy read can't stall the writer (ARCH-66). The remaining
+**robustness backlog** above (delivery accounting, connection throttling, the
+restore↔cert interaction, load/fuzz coverage) continues hardening the server
+before new feature work.

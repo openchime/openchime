@@ -229,6 +229,11 @@ int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
 uint8_t     oc_dbwriter_auth_methods(oc_dbwriter *w);
 const char *oc_dbwriter_oidc_params(oc_dbwriter *w);
 
+/* Override the idempotency-map retention + prune interval (ARCH-44). Production
+ * defaults are 24h / 1h; tests set small values to exercise pruning. */
+void oc_dbwriter_set_idem_retention(oc_dbwriter *w, uint64_t retention_ms,
+                                    uint64_t interval_ms);
+
 /* Allocate a zeroed job of `type` for `conn_id`. Fill in the type's fields
  * (oc_job_set_token / oc_job_set_body copy into heap) then submit. */
 oc_job *oc_job_new(int type, uint64_t conn_id);
