@@ -377,6 +377,51 @@ oc_result oc_encode_reactions(oc_wbuf *w, uint16_t version, const oc_reactions *
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_send_reply(oc_wbuf *w, uint16_t version, const oc_send_reply *m) {
+    OC_CHECK_BODY(m->body);
+    size_t off = oc_frame_begin(w, version, OC_MSG_SEND_REPLY);
+    oc_w_u64(w, m->channel_id);
+    oc_w_idem(w, m->idem);
+    oc_w_u64(w, m->parent_id);
+    oc_w_lstr(w, m->body);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_thread_reply(oc_wbuf *w, uint16_t version, const oc_thread_reply *m) {
+    OC_CHECK_BODY(m->body);
+    size_t off = oc_frame_begin(w, version, OC_MSG_THREAD_REPLY);
+    oc_w_u64(w, m->message_id);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->parent_id);
+    oc_w_u64(w, m->author_id);
+    oc_w_u64(w, m->server_time);
+    oc_w_u32(w, m->reply_count);
+    oc_w_lstr(w, m->body);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_list_thread(oc_wbuf *w, uint16_t version, const oc_list_thread *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_THREAD);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->parent_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_thread(oc_wbuf *w, uint16_t version, const oc_thread *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_THREAD);
+    oc_w_u64(w, m->parent_id);
+    oc_w_u32(w, m->count);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_thread_meta(oc_wbuf *w, uint16_t version, const oc_thread_meta *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_THREAD_META);
+    oc_w_u64(w, m->message_id);
+    oc_w_u32(w, m->reply_count);
+    oc_w_u64(w, m->last_reply_at);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_create_channel(oc_wbuf *w, uint16_t version, const oc_create_channel *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CREATE_CHANNEL);
     oc_w_str(w, m->name);
@@ -666,6 +711,44 @@ oc_result oc_decode_reactions(oc_rbuf *p, oc_reaction_entry *entries, uint16_t c
         uint64_t uid = oc_r_u64(p);
         if (i < cap) { entries[i].emoji = emoji; entries[i].user_id = uid; }
     }
+    return r_done(p);
+}
+
+oc_result oc_decode_send_reply(oc_rbuf *p, oc_send_reply *m) {
+    m->channel_id = oc_r_u64(p);
+    oc_r_idem(p, m->idem);
+    m->parent_id = oc_r_u64(p);
+    m->body = oc_r_lstr(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_thread_reply(oc_rbuf *p, oc_thread_reply *m) {
+    m->message_id = oc_r_u64(p);
+    m->channel_id = oc_r_u64(p);
+    m->parent_id = oc_r_u64(p);
+    m->author_id = oc_r_u64(p);
+    m->server_time = oc_r_u64(p);
+    m->reply_count = oc_r_u32(p);
+    m->body = oc_r_lstr(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_list_thread(oc_rbuf *p, oc_list_thread *m) {
+    m->channel_id = oc_r_u64(p);
+    m->parent_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_thread(oc_rbuf *p, oc_thread *m) {
+    m->parent_id = oc_r_u64(p);
+    m->count = oc_r_u32(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_thread_meta(oc_rbuf *p, oc_thread_meta *m) {
+    m->message_id = oc_r_u64(p);
+    m->reply_count = oc_r_u32(p);
+    m->last_reply_at = oc_r_u64(p);
     return r_done(p);
 }
 

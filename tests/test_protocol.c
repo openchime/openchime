@@ -217,6 +217,51 @@ static void test_messaging_frames(void) {
     }
 }
 
+static void test_thread_frames(void) {
+    uint8_t idem[OC_IDEM_SIZE];
+    for (int i = 0; i < (int)OC_IDEM_SIZE; i++) idem[i] = (uint8_t)(0xC0 + i);
+    {
+        oc_send_reply in; in.channel_id = 7; memcpy(in.idem, idem, OC_IDEM_SIZE);
+        in.parent_id = 500; in.body = oc_slice_str("a reply");
+        ROUNDTRIP(oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEND_REPLY, h, p);
+        oc_send_reply out;
+        CHECK(oc_decode_send_reply(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.parent_id == 500);
+        CHECK(memcmp(out.idem, idem, OC_IDEM_SIZE) == 0);
+        CHECK(slice_eq_str(out.body, "a reply"));
+    }
+    {
+        oc_thread_reply in = { 1002, 7, 500, 42, 1751200500000ull, 3, oc_slice_str("a reply") };
+        ROUNDTRIP(oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_REPLY, h, p);
+        oc_thread_reply out;
+        CHECK(oc_decode_thread_reply(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1002 && out.channel_id == 7 && out.parent_id == 500);
+        CHECK(out.author_id == 42 && out.server_time == 1751200500000ull && out.reply_count == 3);
+        CHECK(slice_eq_str(out.body, "a reply"));
+    }
+    {
+        oc_list_thread in = { 7, 500 };
+        ROUNDTRIP(oc_encode_list_thread(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_THREAD, h, p);
+        oc_list_thread out;
+        CHECK(oc_decode_list_thread(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.parent_id == 500);
+    }
+    {
+        oc_thread in = { 500, 3 };
+        ROUNDTRIP(oc_encode_thread(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD, h, p);
+        oc_thread out;
+        CHECK(oc_decode_thread(&p, &out) == OC_OK);
+        CHECK(out.parent_id == 500 && out.count == 3);
+    }
+    {
+        oc_thread_meta in = { 500, 3, 1751200500000ull };
+        ROUNDTRIP(oc_encode_thread_meta(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_META, h, p);
+        oc_thread_meta out;
+        CHECK(oc_decode_thread_meta(&p, &out) == OC_OK);
+        CHECK(out.message_id == 500 && out.reply_count == 3 && out.last_reply_at == 1751200500000ull);
+    }
+}
+
 static void test_reaction_frames(void) {
     {
         oc_react in = { 7, 1001, oc_slice_str("\xF0\x9F\x91\x8D"), OC_REACT_ADD };
@@ -539,6 +584,7 @@ int run_protocol_tests(void) {
     test_auth_frames();
     test_messaging_frames();
     test_reaction_frames();
+    test_thread_frames();
     test_channel_frames();
     test_admin_frames();
     test_backfill_and_error();

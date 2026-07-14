@@ -396,6 +396,30 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SEND_REPLY) {
+            oc_send_reply sr;
+            if (oc_decode_send_reply(&p, &sr) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SEND_REPLY, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = sr.channel_id;
+            j->parent_id = sr.parent_id;
+            memcpy(j->idem, sr.idem, OC_IDEM_LEN);
+            if (oc_job_set_body(j, sr.body.ptr, sr.body.len) != 0) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_THREAD) {
+            oc_list_thread lt;
+            if (oc_decode_list_thread(&p, &lt) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_THREAD, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = lt.channel_id;
+            j->parent_id = lt.parent_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_CLIENT_ACK) {
             oc_client_ack ca;
             oc_decode_client_ack(&p, &ca); /* accepted; the client drives backfill via its own cursors */
@@ -742,11 +766,84 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         free(ents);
         break;
     }
+    case OC_RES_REPLY_OK: {
+        /* Ack the sender; then, unless it was an idempotent replay, fan the reply
+         * out as a THREAD_REPLY (never to the main scroll, REQ-060). */
+        conn *sender = find_by_id(conns, r->conn_id);
+        if (sender) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_send_ack ack;
+            memcpy(ack.idem, r->idem, OC_IDEM_LEN);
+            ack.channel_id = r->channel_id;
+            ack.message_id = r->message_id;
+            ack.server_time = r->server_time;
+            oc_encode_send_ack(&w, OC_PROTOCOL_VERSION, &ack);
+            send_bytes(ep, conns, sender->fd, g_enc, w.len);
+        }
+        if (!r->duplicate) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_slice body = { r->body, r->body_len };
+            oc_thread_reply tr = { r->message_id, r->channel_id, r->parent_id,
+                                   r->author_id, r->server_time, r->reply_count, body };
+            oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &tr);
+            size_t blen = w.len;
+            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                conn *c = conns[fd];
+                if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
+                    send_bytes(ep, conns, fd, g_enc, blen);
+            }
+        }
+        break;
+    }
+    case OC_RES_REPLY_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice ctx = { r->idem, OC_IDEM_LEN };
+        oc_error e = { r->err_code, 0, ctx, oc_slice_str("reply rejected") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_THREAD: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        if (r->err_code) {
+            uint8_t ctx[8];
+            for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->parent_id >> (56 - 8 * i));
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_slice cs = { ctx, sizeof ctx };
+            oc_error e = { r->err_code, 0, cs, oc_slice_str("thread unavailable") };
+            oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+            break;
+        }
+        /* Stream each reply as a self-framed THREAD_REPLY (a 64KB body is fine),
+         * then close with the THREAD terminator (like BACKFILL_DONE). */
+        int fd = c->fd;
+        for (size_t i = 0; i < r->n_thread && conns[fd]; i++) {
+            oc_replay_msg *m = &r->thread[i];
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_slice body = { m->body, m->body_len };
+            oc_thread_reply tr = { m->message_id, m->channel_id, r->parent_id,
+                                   m->author_id, m->server_time, (uint32_t)r->n_thread, body };
+            oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &tr);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+        }
+        if (!conns[fd]) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_thread th = { r->parent_id, (uint32_t)r->n_thread };
+        oc_encode_thread(&w, OC_PROTOCOL_VERSION, &th);
+        send_bytes(ep, conns, fd, g_enc, w.len);
+        break;
+    }
     case OC_RES_BACKFILL_OK: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
         int fd = c->fd;
-        /* Replay each missed message as a BROADCAST, in ascending id order. */
+        /* Replay each missed top-level message as a BROADCAST, ascending id.
+         * A message with thread replies is followed by a THREAD_META so the
+         * client can show its reply count without opening the thread (REQ-060). */
         for (size_t i = 0; i < r->n_replay && conns[fd]; i++) {
             oc_replay_msg *m = &r->replay[i];
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
@@ -754,6 +851,12 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             oc_broadcast b = { m->message_id, m->channel_id, m->author_id, m->server_time, body };
             oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
             send_bytes(ep, conns, fd, g_enc, w.len);
+            if (m->reply_count > 0 && conns[fd]) {
+                oc_wbuf_init(&w, g_enc, sizeof g_enc);
+                oc_thread_meta tm = { m->message_id, m->reply_count, m->last_reply_at };
+                oc_encode_thread_meta(&w, OC_PROTOCOL_VERSION, &tm);
+                send_bytes(ep, conns, fd, g_enc, w.len);
+            }
         }
         if (!conns[fd]) return;
         oc_wbuf_init(&w, g_enc, sizeof g_enc);

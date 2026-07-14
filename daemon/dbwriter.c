@@ -122,6 +122,8 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->emoji);
     for (size_t i = 0; i < r->n_rlist; i++) free(r->rlist[i].emoji);
     free(r->rlist);
+    for (size_t i = 0; i < r->n_thread; i++) free(r->thread[i].body);
+    free(r->thread);
     free(r);
 }
 
@@ -1286,6 +1288,152 @@ static oc_dbres *process_list_reactions(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Count a thread's replies and the time of the latest one. */
+static void thread_stats(sqlite3 *db, uint64_t root, uint32_t *count, uint64_t *last) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT COUNT(*), COALESCE(MAX(created_at_ms),0) FROM messages WHERE parent_id=?;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)root);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        if (count) *count = (uint32_t)sqlite3_column_int64(st, 0);
+        if (last)  *last  = (uint64_t)sqlite3_column_int64(st, 1);
+    }
+    sqlite3_finalize(st);
+}
+
+/* Post a threaded reply (REQ-060). The reply threads under a top-level root
+ * (replying to a reply flattens to that reply's root) and is NOT delivered to
+ * the channel's main scroll — the net thread fans it out as a THREAD_REPLY.
+ * Idempotent on (channel, token) exactly like SEND. */
+static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+    r->author_id = j->user_id;
+    memcpy(r->idem, j->idem, OC_IDEM_LEN);
+
+    /* Idempotent replay: a known (channel, token) re-acks the original id. */
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT s.message_id, m.created_at_ms, m.parent_id FROM sent_messages s "
+        "JOIN messages m ON m.id = s.message_id "
+        "WHERE s.channel_id=? AND s.idempotency_token=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_blob(st, 2, j->idem, OC_IDEM_LEN, SQLITE_STATIC);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        r->type = OC_RES_REPLY_OK;
+        r->message_id = (uint64_t)sqlite3_column_int64(st, 0);
+        r->server_time = (uint64_t)sqlite3_column_int64(st, 1);
+        r->parent_id = (uint64_t)sqlite3_column_int64(st, 2);
+        r->duplicate = 1;
+        sqlite3_finalize(st);
+        return r;
+    }
+    sqlite3_finalize(st);
+
+    /* The parent must exist in this channel and not be tombstoned. */
+    uint64_t pauthor = 0; int pdel = 0;
+    if (!message_lookup(db, j->channel_id, j->parent_id, &pauthor, &pdel) || pdel) {
+        r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r;
+    }
+    /* Flatten: if the parent is itself a reply, thread under its root. */
+    uint64_t root = j->parent_id;
+    sqlite3_prepare_v2(db, "SELECT parent_id FROM messages WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->parent_id);
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL)
+        root = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+
+    int acc = channel_post_access(db, j->channel_id, j->user_id);
+    if (acc == CH_UNKNOWN) { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
+    if (acc == CH_DENIED)  { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;   return r; }
+
+    uint64_t ts = dbw_now_ms();
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    sqlite3_prepare_v2(db,
+        "INSERT INTO messages(channel_id, author_id, body, created_at_ms, parent_id) "
+        "VALUES(?, ?, ?, ?, ?);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_bind_blob(st, 3, j->body, (int)j->body_len, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)ts);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)root);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+    }
+    uint64_t mid = (uint64_t)sqlite3_last_insert_rowid(db);
+    sqlite3_prepare_v2(db,
+        "INSERT INTO sent_messages(channel_id, idempotency_token, message_id, created_at_ms) "
+        "VALUES(?, ?, ?, ?);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_blob(st, 2, j->idem, OC_IDEM_LEN, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)mid);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)ts);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+
+    uint32_t count = 0;
+    thread_stats(db, root, &count, NULL);
+    r->type = OC_RES_REPLY_OK;
+    r->message_id = mid;
+    r->server_time = ts;
+    r->parent_id = root;
+    r->reply_count = count;
+    if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
+    load_members(db, j->channel_id, r);
+    return r;
+}
+
+/* Return a thread's replies (REQ-060), oldest first. Errors are carried on the
+ * OC_RES_THREAD result via err_code (net thread emits an ERROR then). */
+static oc_dbres *process_list_thread(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_THREAD;
+    r->parent_id = j->parent_id;
+
+    uint64_t pa = 0; int pd = 0;
+    if (!message_lookup(db, j->channel_id, j->parent_id, &pa, &pd)) {
+        r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r;
+    }
+    if (!channel_read_access(db, j->channel_id, j->user_id)) {
+        r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT id, author_id, created_at_ms, body FROM messages "
+        "WHERE parent_id=? ORDER BY id LIMIT ?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->parent_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)OC_BACKFILL_MAX);
+    size_t cap = 8, n = 0;
+    oc_replay_msg *arr = malloc(cap * sizeof *arr);
+    while (arr && sqlite3_step(st) == SQLITE_ROW) {
+        if (n == cap) { cap *= 2; oc_replay_msg *g = realloc(arr, cap * sizeof *arr); if (!g) break; arr = g; }
+        oc_replay_msg *m = &arr[n];
+        memset(m, 0, sizeof *m);
+        m->message_id  = (uint64_t)sqlite3_column_int64(st, 0);
+        m->channel_id  = j->channel_id;
+        m->author_id   = (uint64_t)sqlite3_column_int64(st, 1);
+        m->server_time = (uint64_t)sqlite3_column_int64(st, 2);
+        const void *b = sqlite3_column_blob(st, 3);
+        int blen = sqlite3_column_bytes(st, 3);
+        if (b && blen > 0) { m->body = malloc((size_t)blen); if (m->body) { memcpy(m->body, b, (size_t)blen); m->body_len = (size_t)blen; } }
+        n++;
+    }
+    sqlite3_finalize(st);
+    r->thread = arr;
+    r->n_thread = n;
+    return r;
+}
+
 /* Replay messages newer than each cursor, for channels the user belongs to,
  * bounded by OC_BACKFILL_MAX total (REQ-101, PROTOCOL.md §6). */
 static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
@@ -1307,9 +1455,16 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
         uint64_t ch = j->cursors[ci].channel_id;
         if (!channel_read_access(db, ch, j->user_id)) continue;
 
+        /* Only top-level messages are replayed to the main scroll (REQ-060);
+         * thread replies (parent_id set) are fetched per-thread via LIST_THREAD.
+         * Each row also carries its thread reply count + latest-reply time so the
+         * net thread can emit a THREAD_META for parents that have replies. */
         sqlite3_prepare_v2(db,
-            "SELECT id, author_id, created_at_ms, body FROM messages "
-            "WHERE channel_id=? AND id>? ORDER BY id LIMIT ?;", -1, &st, NULL);
+            "SELECT m.id, m.author_id, m.created_at_ms, m.body, "
+            "  (SELECT COUNT(*) FROM messages c WHERE c.parent_id=m.id), "
+            "  (SELECT COALESCE(MAX(c.created_at_ms),0) FROM messages c WHERE c.parent_id=m.id) "
+            "FROM messages m WHERE m.channel_id=? AND m.id>? AND m.parent_id IS NULL "
+            "ORDER BY m.id LIMIT ?;", -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)ch);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->cursors[ci].after_message_id);
         sqlite3_bind_int64(st, 3, (sqlite3_int64)(OC_BACKFILL_MAX - n));
@@ -1332,6 +1487,8 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
                 m->body = malloc((size_t)blen);
                 if (m->body) { memcpy(m->body, b, (size_t)blen); m->body_len = (size_t)blen; }
             }
+            m->reply_count   = (uint32_t)sqlite3_column_int64(st, 4);
+            m->last_reply_at = (uint64_t)sqlite3_column_int64(st, 5);
             n++;
         }
         sqlite3_finalize(st);
@@ -1388,6 +1545,8 @@ static void *writer_loop(void *arg) {
         else if (j->type == OC_JOB_REDEEM)         r = process_redeem(w->db, j);
         else if (j->type == OC_JOB_REACT)          r = process_react(w->db, j);
         else if (j->type == OC_JOB_LIST_REACTIONS) r = process_list_reactions(w->db, j);
+        else if (j->type == OC_JOB_SEND_REPLY)     r = process_send_reply(w->db, j);
+        else if (j->type == OC_JOB_LIST_THREAD)    r = process_list_thread(w->db, j);
         job_free(j);
         push_result(w, r);
     }

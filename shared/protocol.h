@@ -57,6 +57,11 @@ typedef enum {
     OC_MSG_REACTION_UPDATED = 0x0029, /* S->C, reaction fan-out */
     OC_MSG_LIST_REACTIONS   = 0x002A, /* C->S (REQ-071) */
     OC_MSG_REACTIONS        = 0x002B, /* S->C */
+    OC_MSG_SEND_REPLY       = 0x002C, /* C->S (REQ-060), a threaded reply */
+    OC_MSG_THREAD_REPLY     = 0x002D, /* S->C, reply fan-out (not in main scroll) */
+    OC_MSG_LIST_THREAD      = 0x002E, /* C->S, open a thread */
+    OC_MSG_THREAD           = 0x002F, /* S->C, a thread's replies */
+    OC_MSG_THREAD_META      = 0x0032, /* S->C, a parent's reply count (backfill) */
     OC_MSG_CREATE_CHANNEL     = 0x0050, /* C->S (REQ-050) */
     OC_MSG_CHANNEL_INFO       = 0x0051, /* S->C, ack for create/join/leave/invite/remove */
     OC_MSG_LIST_CHANNELS      = 0x0052, /* C->S */
@@ -243,6 +248,14 @@ typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t user_id; oc_
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_list_reactions;
 typedef struct { oc_slice emoji; uint64_t user_id; } oc_reaction_entry;
 typedef struct { uint64_t message_id; uint16_t count; const oc_reaction_entry *entries; } oc_reactions;
+typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; uint64_t parent_id; oc_slice body; } oc_send_reply;
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t parent_id; uint64_t author_id; uint64_t server_time; uint32_t reply_count; oc_slice body; } oc_thread_reply;
+typedef struct { uint64_t channel_id; uint64_t parent_id; } oc_list_thread;
+/* THREAD is the terminator of a LIST_THREAD response: the daemon streams the
+ * replies as THREAD_REPLY frames (each self-framed, so a 64KB body is fine),
+ * then this frame closes the stream — mirroring BACKFILL_DONE (§6.2). */
+typedef struct { uint64_t parent_id; uint32_t count; } oc_thread;
+typedef struct { uint64_t message_id; uint32_t reply_count; uint64_t last_reply_at; } oc_thread_meta;
 typedef struct { oc_slice name; uint8_t is_public; } oc_create_channel;
 typedef struct { uint64_t channel_id; uint8_t kind; oc_slice name; uint8_t is_public; uint8_t joined; uint64_t created_at; } oc_channel_info;
 typedef struct { uint64_t channel_id; } oc_channel_ref;                       /* JOIN / LEAVE */
@@ -288,6 +301,11 @@ oc_result oc_encode_react(oc_wbuf *w, uint16_t version, const oc_react *m);
 oc_result oc_encode_reaction_updated(oc_wbuf *w, uint16_t version, const oc_reaction_updated *m);
 oc_result oc_encode_list_reactions(oc_wbuf *w, uint16_t version, const oc_list_reactions *m);
 oc_result oc_encode_reactions(oc_wbuf *w, uint16_t version, const oc_reactions *m);
+oc_result oc_encode_send_reply(oc_wbuf *w, uint16_t version, const oc_send_reply *m);
+oc_result oc_encode_thread_reply(oc_wbuf *w, uint16_t version, const oc_thread_reply *m);
+oc_result oc_encode_list_thread(oc_wbuf *w, uint16_t version, const oc_list_thread *m);
+oc_result oc_encode_thread(oc_wbuf *w, uint16_t version, const oc_thread *m);
+oc_result oc_encode_thread_meta(oc_wbuf *w, uint16_t version, const oc_thread_meta *m);
 oc_result oc_encode_create_channel(oc_wbuf *w, uint16_t version, const oc_create_channel *m);
 oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_info *m);
 oc_result oc_encode_list_channels(oc_wbuf *w, uint16_t version);
@@ -335,6 +353,11 @@ oc_result oc_decode_react(oc_rbuf *p, oc_react *m);
 oc_result oc_decode_reaction_updated(oc_rbuf *p, oc_reaction_updated *m);
 oc_result oc_decode_list_reactions(oc_rbuf *p, oc_list_reactions *m);
 oc_result oc_decode_reactions(oc_rbuf *p, oc_reaction_entry *entries, uint16_t cap, uint16_t *out_count, uint64_t *out_message_id);
+oc_result oc_decode_send_reply(oc_rbuf *p, oc_send_reply *m);
+oc_result oc_decode_thread_reply(oc_rbuf *p, oc_thread_reply *m);
+oc_result oc_decode_list_thread(oc_rbuf *p, oc_list_thread *m);
+oc_result oc_decode_thread(oc_rbuf *p, oc_thread *m);
+oc_result oc_decode_thread_meta(oc_rbuf *p, oc_thread_meta *m);
 oc_result oc_decode_create_channel(oc_rbuf *p, oc_create_channel *m);
 oc_result oc_decode_channel_info(oc_rbuf *p, oc_channel_info *m);
 oc_result oc_decode_list_channels(oc_rbuf *p);

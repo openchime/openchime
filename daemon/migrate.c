@@ -110,11 +110,21 @@ static const char MIGRATION_0004[] =
     ");"
     "CREATE INDEX idx_reactions_message ON reactions(message_id);";
 
+/* 0005: message threads (REQ-060). `parent_id` links a reply to the top-level
+ * message it threads under (NULL for a top-level message). Threads are flat: a
+ * reply to a reply resolves to the same root, so parent_id always names a
+ * top-level message. The default-NULL column keeps the ADD COLUMN a metadata-
+ * only change (existing rows become top-level). */
+static const char MIGRATION_0005[] =
+    "ALTER TABLE messages ADD COLUMN parent_id INTEGER REFERENCES messages(id);"
+    "CREATE INDEX idx_messages_parent ON messages(parent_id, id);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
     { 3, MIGRATION_0003 },
     { 4, MIGRATION_0004 },
+    { 5, MIGRATION_0005 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

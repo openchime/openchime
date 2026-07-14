@@ -50,7 +50,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 4);
+    CHECK(oc_schema_version(db) == 5);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -1035,6 +1035,103 @@ static void test_reactions(void) {
     cleanup_db(path);
 }
 
+/* --- Threads (REQ-060) -------------------------------------------------- */
+
+static oc_dbres *send_reply(oc_dbwriter *w, uint64_t uid, uint64_t ch, uint64_t parent, const char *body) {
+    oc_job *j = oc_job_new(OC_JOB_SEND_REPLY, 120);
+    j->user_id = uid; j->channel_id = ch; j->parent_id = parent;
+    memset(j->idem, ++g_send_seq, OC_IDEM_LEN);
+    oc_job_set_body(j, body, strlen(body));
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *list_thread_r(oc_dbwriter *w, uint64_t uid, uint64_t ch, uint64_t parent) {
+    oc_job *j = oc_job_new(OC_JOB_LIST_THREAD, 121);
+    j->user_id = uid; j->channel_id = ch; j->parent_id = parent;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_threads(void) {
+    const char *path = "build/test_dbwriter_threads.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t alice = reg(w, "th-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "th-bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    uint8_t idem[OC_IDEM_LEN]; memset(idem, 0xD1, sizeof idem);
+    uint64_t mid = send_msg(w, alice, idem, "top-level");
+    CHECK(mid != 0);
+
+    /* bob replies under the top-level message: reply threads under mid, count 1. */
+    oc_dbres *r = send_reply(w, bob, OC_DEFAULT_CHANNEL, mid, "reply one");
+    CHECK(r && r->type == OC_RES_REPLY_OK);
+    CHECK(r->parent_id == mid && r->reply_count == 1 && r->message_id > mid);
+    CHECK(r->n_members == 2);
+    uint64_t reply1 = r->message_id;
+    oc_dbres_free(r);
+
+    /* alice replies too -> count 2. */
+    r = send_reply(w, alice, OC_DEFAULT_CHANNEL, mid, "reply two");
+    CHECK(r && r->type == OC_RES_REPLY_OK && r->reply_count == 2);
+    oc_dbres_free(r);
+
+    /* Replying to a reply flattens to the root (parent_id stays mid), count 3. */
+    r = send_reply(w, bob, OC_DEFAULT_CHANNEL, reply1, "nested");
+    CHECK(r && r->type == OC_RES_REPLY_OK && r->parent_id == mid && r->reply_count == 3);
+    oc_dbres_free(r);
+
+    /* Inspect the thread: three replies, oldest first, no error. */
+    r = list_thread_r(w, alice, OC_DEFAULT_CHANNEL, mid);
+    CHECK(r && r->type == OC_RES_THREAD && r->err_code == 0 && r->n_thread == 3);
+    CHECK(r->thread[0].message_id == reply1);
+    CHECK(r->thread[0].body_len == 9 && memcmp(r->thread[0].body, "reply one", 9) == 0);
+    oc_dbres_free(r);
+
+    /* Replying to a non-existent message is UNKNOWN_MESSAGE. */
+    r = send_reply(w, alice, OC_DEFAULT_CHANNEL, 99999, "into the void");
+    CHECK(r && r->type == OC_RES_REPLY_ERR && r->err_code == OC_ERR_UNKNOWN_MESSAGE);
+    oc_dbres_free(r);
+
+    /* Backfill of the main scroll excludes replies but carries the reply count:
+     * only the top-level message replays, with reply_count 3. */
+    r = backfill(w, alice, OC_DEFAULT_CHANNEL, 0);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK && r->n_replay == 1);
+    CHECK(r->replay[0].message_id == mid && r->replay[0].reply_count == 3);
+    CHECK(r->replay[0].last_reply_at != 0);
+    oc_dbres_free(r);
+
+    /* A tombstoned parent cannot be replied to. */
+    r = do_delete(w, alice, OC_DEFAULT_CHANNEL, mid);
+    CHECK(r && r->type == OC_RES_DELETE_OK);
+    oc_dbres_free(r);
+    r = send_reply(w, alice, OC_DEFAULT_CHANNEL, mid, "too late");
+    CHECK(r && r->type == OC_RES_REPLY_ERR && r->err_code == OC_ERR_UNKNOWN_MESSAGE);
+    oc_dbres_free(r);
+
+    /* Private read gate: a non-member cannot reply to, or open, a thread in a
+     * channel they do not belong to. */
+    r = create_channel(w, alice, "war-room", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t priv = r->channel_id;
+    oc_dbres_free(r);
+    uint64_t pmid = send_id(w, alice, priv, "classified");
+    CHECK(pmid != 0);
+    r = send_reply(w, bob, priv, pmid, "intruding");
+    CHECK(r && r->type == OC_RES_REPLY_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+    r = list_thread_r(w, bob, priv, pmid);
+    CHECK(r && r->type == OC_RES_THREAD && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill\n");
     test_start_migrates_and_stops();
@@ -1048,6 +1145,7 @@ int run_dbwriter_tests(void) {
     test_channels();
     test_admin_ops();
     test_reactions();
+    test_threads();
     test_backfill();
     return failures;
 }

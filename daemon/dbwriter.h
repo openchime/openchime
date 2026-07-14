@@ -31,7 +31,8 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_CREATE_CHANNEL = 9, OC_JOB_LIST_CHANNELS = 10, OC_JOB_JOIN_CHANNEL = 11,
        OC_JOB_LEAVE_CHANNEL = 12, OC_JOB_INVITE_CHANNEL = 13, OC_JOB_REMOVE_CHANNEL = 14,
        OC_JOB_LIST_USERS = 15, OC_JOB_INVITE_USER = 16, OC_JOB_REMOVE_USER = 17,
-       OC_JOB_REDEEM = 18, OC_JOB_REACT = 19, OC_JOB_LIST_REACTIONS = 20 };
+       OC_JOB_REDEEM = 18, OC_JOB_REACT = 19, OC_JOB_LIST_REACTIONS = 20,
+       OC_JOB_SEND_REPLY = 21, OC_JOB_LIST_THREAD = 22 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -70,9 +71,10 @@ typedef struct oc_job {
      * (scope THIS) is carried in `token`/`token_len`. */
     uint8_t        scope;     /* OC_LOGOUT_THIS / OC_LOGOUT_ALL */
 
-    /* SEND / EDIT / DELETE */
+    /* SEND / EDIT / DELETE / SEND_REPLY */
     uint64_t       channel_id;
     uint64_t       message_id; /* target message for EDIT / DELETE */
+    uint64_t       parent_id;  /* thread parent for SEND_REPLY / LIST_THREAD */
     uint8_t        idem[OC_IDEM_LEN];
     uint8_t       *body;      /* heap (SEND / EDIT new body) */
     size_t         body_len;
@@ -95,7 +97,8 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_CHANNEL_LIST = 18, OC_RES_USER_LIST = 19,
        OC_RES_INVITE_OK = 20, OC_RES_INVITE_ERR = 21,
        OC_RES_USER_UPDATED = 22, OC_RES_USER_ERR = 23,
-       OC_RES_REACTION_OK = 24, OC_RES_REACTION_ERR = 25, OC_RES_REACTIONS = 26 };
+       OC_RES_REACTION_OK = 24, OC_RES_REACTION_ERR = 25, OC_RES_REACTIONS = 26,
+       OC_RES_REPLY_OK = 27, OC_RES_REPLY_ERR = 28, OC_RES_THREAD = 29 };
 
 /* One row in a REACTIONS result (a distinct emoji + one reacting user). */
 typedef struct { char *emoji; uint64_t user_id; } oc_reaction_row;
@@ -117,11 +120,15 @@ typedef struct {
     char    *display_name;  /* heap; may be "" */
 } oc_user_row;
 
-/* One message to replay on reconnect (rendered as a BROADCAST by the net thread). */
+/* One message to replay on reconnect (rendered as a BROADCAST by the net thread),
+ * or one reply in a THREAD. reply_count/last_reply_at are set for backfilled
+ * top-level messages that have thread replies (drives THREAD_META). */
 typedef struct {
     uint64_t message_id, channel_id, author_id, server_time;
     uint8_t *body;       /* heap */
     size_t   body_len;
+    uint32_t reply_count;
+    uint64_t last_reply_at;
 } oc_replay_msg;
 
 typedef struct oc_dbres {
@@ -180,6 +187,14 @@ typedef struct oc_dbres {
     uint64_t        react_count;
     oc_reaction_row *rlist;         /* heap array; REACTIONS */
     size_t           n_rlist;
+
+    /* Threads (REQ-060). REPLY_OK reuses message_id/channel_id/author_id/
+     * server_time/body/idem/members/duplicate above, plus parent_id + reply_count.
+     * THREAD carries the reply list. */
+    uint64_t        parent_id;
+    uint32_t        reply_count;
+    oc_replay_msg  *thread;         /* heap array; THREAD replies */
+    size_t          n_thread;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;

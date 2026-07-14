@@ -519,6 +519,91 @@ static void test_reactions_vertical(int port, const uint8_t *pin) {
     client_close(&b);
 }
 
+/* Threads over the wire (REQ-060): a reply is delivered as THREAD_REPLY (never a
+ * BROADCAST in the main scroll), LIST_THREAD streams the replies + a THREAD
+ * terminator, and a reconnect backfill carries a THREAD_META for the parent. */
+static void test_threads_vertical(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    CHECK(do_handshake(&b) == 0);
+    uint64_t ua = 0, ub = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+
+    uint8_t buf[256]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+
+    /* alice posts a top-level message; learn its id, drain both BROADCASTs. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s; s.channel_id = 1; memset(s.idem, 0x71, OC_IDEM_SIZE);
+    s.body = oc_slice_str("thread root");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    uint64_t mid = 0;
+    for (int i = 0; i < 2; i++) {
+        CHECK(read_frame(&a, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) { oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK); mid = ack.message_id; }
+    }
+    CHECK(mid != 0);
+    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BROADCAST);
+
+    /* bob replies: he gets a SEND_ACK, and both members get a THREAD_REPLY (not
+     * a BROADCAST — the reply stays out of the main scroll). */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send_reply sr; sr.channel_id = 1; memset(sr.idem, 0x72, OC_IDEM_SIZE);
+    sr.parent_id = mid; sr.body = oc_slice_str("first reply");
+    CHECK(oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &sr) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    for (int i = 0; i < 2; i++) {          /* bob: SEND_ACK + THREAD_REPLY */
+        CHECK(read_frame(&b, &hdr, &p) == 0);
+        CHECK(hdr.msg_type == OC_MSG_SEND_ACK || hdr.msg_type == OC_MSG_THREAD_REPLY);
+    }
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_THREAD_REPLY);
+    oc_thread_reply tr; CHECK(oc_decode_thread_reply(&p, &tr) == OC_OK);
+    CHECK(tr.parent_id == mid && tr.author_id == ub && tr.reply_count == 1);
+    CHECK(tr.body.len == 11 && memcmp(tr.body.ptr, "first reply", 11) == 0);
+
+    /* alice opens the thread: the reply is streamed, then a THREAD terminator. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_list_thread lt = { 1, mid };
+    CHECK(oc_encode_list_thread(&w, OC_PROTOCOL_VERSION, &lt) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_THREAD_REPLY);
+    CHECK(oc_decode_thread_reply(&p, &tr) == OC_OK && tr.parent_id == mid);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_THREAD);
+    oc_thread th; CHECK(oc_decode_thread(&p, &th) == OC_OK);
+    CHECK(th.parent_id == mid && th.count == 1);
+
+    /* A reconnecting member backfills the channel: the parent replays as a
+     * BROADCAST followed by a THREAD_META carrying its reply count. */
+    client c;
+    CHECK(client_open(&c, port, pin) == 0);
+    CHECK(do_handshake(&c) == 0);
+    uint64_t uc = 0;
+    CHECK(do_auth(&c, "carol", "pw", &uc) == 0);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_cursor cur = { 1, 0 };
+    oc_backfill_request req = { 1, &cur };
+    CHECK(oc_encode_backfill_request(&w, OC_PROTOCOL_VERSION, &req) == OC_OK);
+    CHECK(send_frame(&c, buf, w.len) == 0);
+    int saw_meta = 0;
+    for (int i = 0; i < 3000; i++) {
+        CHECK(read_frame(&c, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_BROADCAST) { oc_broadcast bx; CHECK(oc_decode_broadcast(&p, &bx) == OC_OK); }
+        else if (hdr.msg_type == OC_MSG_THREAD_META) {
+            oc_thread_meta tm; CHECK(oc_decode_thread_meta(&p, &tm) == OC_OK);
+            if (tm.message_id == mid) { saw_meta = 1; CHECK(tm.reply_count == 1); }
+        } else if (hdr.msg_type == OC_MSG_BACKFILL_DONE) break;
+        else CHECK(0 /* unexpected frame during backfill */);
+    }
+    CHECK(saw_meta == 1);
+
+    client_close(&a);
+    client_close(&b);
+    client_close(&c);
+}
+
 /* Tenant admin ops over the wire (REQ-033): an owner mints an invite, a fresh
  * client redeems it to create + authenticate an account, the owner promotes that
  * user (SET_ROLE pushes USER_UPDATED to them), lists users, and removes a member
@@ -624,7 +709,7 @@ static void test_logout_closes(int port, const uint8_t *pin) {
 }
 
 int run_netloop_tests(void) {
-    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, admin, logout\n");
+    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, admin, logout\n");
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -660,6 +745,7 @@ int run_netloop_tests(void) {
         test_edit_delete_vertical(arg.port, pin);
         test_channels_vertical(arg.port, pin);
         test_reactions_vertical(arg.port, pin);
+        test_threads_vertical(arg.port, pin);
         test_admin_vertical(arg.port, pin);
         test_logout_closes(arg.port, pin);
     }

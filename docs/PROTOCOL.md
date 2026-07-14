@@ -8,10 +8,10 @@ resolves the protocol-shaped `[needs ARCH decision]` items in
 
 **Scope of this revision.** This covers connection handshake and version
 negotiation, authentication, the message send/broadcast/ack cycle, message
-edit/delete (§5.5/5.6), reactions (§5.9), channel management (§5.7), tenant
-administration (§5.8), and reconnect backfill, plus the error frame. Presence
-(REQ-120/121), typing indicators, threads (REQ-060/061), notification
-configuration, and audio-call signaling (REQ-150–152) are deliberately out of
+edit/delete (§5.5/5.6), reactions (§5.9), threads (§5.10), channel management
+(§5.7), tenant administration (§5.8), and reconnect backfill, plus the error
+frame. Presence (REQ-120/121), typing indicators, thread notifications
+(REQ-061/130), and audio-call signaling (REQ-150–152) are deliberately out of
 scope here and will be added in later revisions of this document, reusing the
 framing and encoding rules defined below. New message types are additive; the
 header format and the frozen handshake frames (§3) do not change.
@@ -591,6 +591,67 @@ big-endian) in `context`: `UNKNOWN_MESSAGE` (no such message, or it is
 tombstoned — a tombstone's reactions are cleared, §5.6), `NOT_A_MEMBER` (cannot
 read the channel), or `INVALID_REACTION` (empty/oversized emoji).
 
+### 5.10 Threads (REQ-060)
+
+Any message can be replied to as a thread. A reply threads under a **top-level
+root** — replying to a reply flattens to that reply's root, so threads are one
+level deep. A reply is **not** delivered to the channel's main scroll (§5.3): it
+is fanned out as a `THREAD_REPLY`, and the parent shows a reply count.
+
+**`SEND_REPLY` (client → server), msg_type `0x002C`:**
+
+| Field        | Type | Notes                                                     |
+|--------------|------|-----------------------------------------------------------|
+| `channel_id` | u64  | The channel.                                              |
+| `idem`       | 16 B | Idempotency token (§7), exactly as `SEND` (REQ-093).      |
+| `parent_id`  | u64  | The message being replied to (resolved to its root).      |
+| `body`       | lstr | Reply body, `<= MAX_BODY_SIZE`.                           |
+
+The sender is acked with a normal `SEND_ACK` (§5.2). Then the daemon fans a
+**`THREAD_REPLY` (server → client), msg_type `0x002D`** out to every connected
+member of the channel:
+
+| Field         | Type | Notes                                                    |
+|---------------|------|----------------------------------------------------------|
+| `message_id`  | u64  | The reply's server id.                                   |
+| `channel_id`  | u64  | The channel.                                             |
+| `parent_id`   | u64  | The thread root.                                         |
+| `author_id`   | u64  | Who replied.                                             |
+| `server_time` | u64  | Server timestamp, ms since epoch UTC.                    |
+| `reply_count` | u32  | The root's total reply count after this reply (REQ-060). |
+| `body`        | lstr | The reply body.                                          |
+
+**`LIST_THREAD` (client → server), msg_type `0x002E`**
+`{ channel_id: u64, parent_id: u64 }` opens a thread. The daemon **streams** the
+replies (oldest first) as `THREAD_REPLY` frames — each self-framed, so a 64KB
+body is fine — then closes with a **`THREAD` (server → client), msg_type
+`0x002F`** terminator, mirroring backfill's `BACKFILL_DONE` (§6.2):
+
+| Field       | Type | Notes                                        |
+|-------------|------|----------------------------------------------|
+| `parent_id` | u64  | The thread root.                             |
+| `count`     | u32  | Number of replies streamed.                  |
+
+On reconnect backfill (§6) the main scroll replays only top-level messages; a
+parent that has replies is followed by a **`THREAD_META` (server → client),
+msg_type `0x0032`** so the client can show the reply count without opening the
+thread:
+
+| Field          | Type | Notes                                       |
+|----------------|------|---------------------------------------------|
+| `message_id`   | u64  | The parent message.                         |
+| `reply_count`  | u32  | Its total reply count.                      |
+| `last_reply_at`| u64  | Timestamp of the most recent reply, ms UTC. |
+
+`SEND_REPLY`/`LIST_THREAD` failures are non-fatal `ERROR` frames:
+`UNKNOWN_MESSAGE` (no such parent, or it is tombstoned), `NOT_A_MEMBER` /
+`UNKNOWN_CHANNEL` (cannot post to / read the channel).
+
+*Thread notifications (REQ-061) — notifying a thread's prior participants per
+their per-channel notification setting — depend on notification configuration
+(REQ-130) and are a later revision; today a `THREAD_REPLY` reaches every
+connected channel member.*
+
 ---
 
 ## 6. Reconnect backfill (resolves REQ-101)
@@ -737,6 +798,11 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0029` | `REACTION_UPDATED` | S → C     | no        | §5.9    |
 | `0x002A` | `LIST_REACTIONS`   | C → S     | no        | §5.9    |
 | `0x002B` | `REACTIONS`        | S → C     | no        | §5.9    |
+| `0x002C` | `SEND_REPLY`       | C → S     | no        | §5.10   |
+| `0x002D` | `THREAD_REPLY`     | S → C     | no        | §5.10   |
+| `0x002E` | `LIST_THREAD`      | C → S     | no        | §5.10   |
+| `0x002F` | `THREAD`           | S → C     | no        | §5.10   |
+| `0x0032` | `THREAD_META`      | S → C     | no        | §5.10   |
 | `0x0050` | `CREATE_CHANNEL`   | C → S     | no        | §5.7    |
 | `0x0051` | `CHANNEL_INFO`     | S → C     | no        | §5.7    |
 | `0x0052` | `LIST_CHANNELS`    | C → S     | no        | §5.7    |
@@ -752,7 +818,7 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 Ranges are left sparse (`0x0001–` handshake, `0x0010–` auth/session, `0x0020–`
 messaging, `0x0030–` reconnect, `0x0040–` users/profiles, `0x0050–` channel
 management, `0x00FF` error) so later revisions can slot in presence, typing,
-reactions, threads, and audio signaling without renumbering. The `0x0040–0x0047`
+presence/typing and audio signaling without renumbering. The `0x0040–0x0047`
 management frames (user enumeration, roles, tenant invite/remove; §5.8) are
 defined; `0x0048` `UPDATE_PROFILE` (avatar/display-name edit) remains **reserved**
 until that milestone lands.

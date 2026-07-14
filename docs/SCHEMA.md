@@ -10,10 +10,10 @@ ack / backfill). **Migration 0002** (§3) adds the authentication data model
 (sessions, local credentials, invites, and `users` role/avatar) for the two-mode
 auth design ([AUTH.md](./AUTH.md)). **Migration 0003** (§3a) adds a
 `users.disabled` lockout flag for tenant member removal (REQ-033). **Migration
-0004** (§3b) adds emoji reactions (REQ-070/071). Threads (REQ-060), full-text
-search (REQ-080/FTS5), presence, notification config, and attachments are
-intentionally **not** here yet; each is a future migration once its own
-requirement is settled.
+0004** (§3b) adds emoji reactions (REQ-070/071) and **migration 0005** (§3c) adds
+message threads (REQ-060). Full-text search (REQ-080/FTS5), presence,
+notification config, and attachments are intentionally **not** here yet; each is
+a future migration once its own requirement is settled.
 
 ---
 
@@ -227,11 +227,27 @@ Index `idx_reactions_message (message_id)` serves per-message aggregation and th
 
 ---
 
+## 3c. Migration 0005 — threads
+
+Message threads (REQ-060), added as `MIGRATION_0005`.
+
+### `messages` (added column)
+
+| column      | type    | notes                                                     |
+|-------------|---------|-----------------------------------------------------------|
+| `parent_id` | INTEGER | → `messages(id)`; `NULL` for a top-level message. A reply threads under a **top-level root** (replying to a reply flattens to that reply's root), so `parent_id` always names a top-level message. Existing rows default to `NULL`. |
+
+Index `idx_messages_parent (parent_id, id)` serves the per-thread reply query
+(`LIST_THREAD`) and the reply-count subqueries. The main-scroll backfill filters
+`parent_id IS NULL` so replies never appear inline (PROTOCOL.md §5.10).
+
+---
+
 ## 4. Deferred to later migrations
 
 Tracked here so the omissions are deliberate, not forgotten:
 
-- **Threads** (parent linkage, REQ-060/061).
+- **Thread notifications** (REQ-061) — needs notification config (REQ-130).
 - **FTS5** full-text index over `messages.body` (REQ-080, ARCH-15).
 - **Presence / typing** (REQ-120/121) — likely in-memory, not schema.
 - **Notification settings** and DND (REQ-130/131).
