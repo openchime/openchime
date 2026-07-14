@@ -101,7 +101,7 @@ static void test_embedded_schema(void) {
     char *err = NULL;
     CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
     CHECK(err == NULL);
-    CHECK(oc_schema_version(db) == 2);   /* 0001 core + 0002 auth */
+    CHECK(oc_schema_version(db) == 3);   /* 0001 core + 0002 auth + 0003 disabled */
 
     const char *tables[] = { "users", "channels", "channel_members",
                              "messages", "sent_messages",
@@ -110,10 +110,11 @@ static void test_embedded_schema(void) {
         CHECK(table_exists(db, tables[i]));
     }
 
-    /* 0002 added users.role, defaulting to 'member' (ARCH-60). */
+    /* 0002 added users.role, defaulting to 'member' (ARCH-60); 0003 added
+     * users.disabled, defaulting to 0 (REQ-033). */
     CHECK(sqlite3_exec(db, "INSERT INTO users(id,subject,created_at_ms) VALUES(9,'s9',0);",
                        NULL, NULL, NULL) == SQLITE_OK);
-    CHECK(scalar(db, "SELECT COUNT(*) FROM users WHERE id=9 AND role='member';") == 1);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM users WHERE id=9 AND role='member' AND disabled=0;") == 1);
 
     /* message ids are strictly increasing (ARCH-43): seed a user + channel,
      * insert two messages, check the second id exceeds the first. */

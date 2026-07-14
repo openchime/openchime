@@ -8,7 +8,8 @@ arrive as later numbered migrations, never as edits to an existing one.
 messaging path — the frames the v1 codec already supports (send / broadcast /
 ack / backfill). **Migration 0002** (§3) adds the authentication data model
 (sessions, local credentials, invites, and `users` role/avatar) for the two-mode
-auth design ([AUTH.md](./AUTH.md)). Reactions (REQ-070), threads (REQ-060),
+auth design ([AUTH.md](./AUTH.md)). **Migration 0003** (§3a) adds a
+`users.disabled` lockout flag for tenant member removal (REQ-033). Reactions (REQ-070), threads (REQ-060),
 full-text search (REQ-080/FTS5), presence, notification config, and attachments
 are intentionally **not** here yet; each is a future migration once its own
 requirement is settled.
@@ -181,6 +182,24 @@ An owner/admin issues an invite; the invitee sets a password by presenting it.
 | `role`        | TEXT    | role the invitee will receive.                          |
 | `expires_at_ms`| INTEGER |                                                        |
 | `consumed_at_ms`| INTEGER | null until used; single-use.                          |
+
+The `invites` and `local_credentials` tables are exercised by the tenant-admin
+wire ops (PROTOCOL.md §5.8): `INVITE_USER` inserts an `invites` row and
+`REDEEM_INVITE` consumes it while creating the account.
+
+---
+
+## 3a. Migration 0003 — member removal
+
+`REMOVE_USER` (REQ-033) locks a member out of the tenant rather than deleting
+their row (which authored messages/tombstones still reference). Appended as
+`MIGRATION_0003` + a `{ 3, ... }` entry in `OC_MIGRATIONS`.
+
+### `users` (added column)
+
+| column     | type    | notes                                                        |
+|------------|---------|--------------------------------------------------------------|
+| `disabled` | INTEGER | `NOT NULL DEFAULT 0 CHECK (disabled IN (0,1))` — `1` once removed; every auth path (local/session/oidc) refuses a disabled user. Removal also deletes the user's `sessions`, `channel_members`, and `local_credentials`. |
 
 ---
 

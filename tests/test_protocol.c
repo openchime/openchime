@@ -285,6 +285,78 @@ static void test_channel_frames(void) {
     }
 }
 
+static void test_admin_frames(void) {
+    {
+        oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+        CHECK(oc_encode_list_users(&w, OC_PROTOCOL_VERSION) == OC_OK);
+        oc_header h; oc_rbuf p;
+        CHECK(oc_parse_frame(frame, w.len, &h, &p) == OC_OK);
+        CHECK(h.msg_type == OC_MSG_LIST_USERS);
+        CHECK(oc_decode_list_users(&p) == OC_OK);
+    }
+    {
+        oc_user_list_entry ents[2] = {
+            { 1, OC_ROLE_OWNER,  0, oc_slice_str("a@x.io"), oc_slice_str("Alice") },
+            { 2, OC_ROLE_MEMBER, 1, oc_slice_str(""),       oc_slice_str("Bob") },
+        };
+        oc_user_list in = { 2, ents };
+        ROUNDTRIP(oc_encode_user_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_USER_LIST, h, p);
+        oc_user_list_entry out[2]; uint16_t n = 0;
+        CHECK(oc_decode_user_list(&p, out, 2, &n) == OC_OK);
+        CHECK(n == 2);
+        CHECK(out[0].user_id == 1 && out[0].role == OC_ROLE_OWNER && out[0].disabled == 0);
+        CHECK(slice_eq_str(out[0].email, "a@x.io") && slice_eq_str(out[0].display_name, "Alice"));
+        CHECK(out[1].user_id == 2 && out[1].disabled == 1 && slice_eq_str(out[1].display_name, "Bob"));
+    }
+    {
+        oc_set_role in = { 7, OC_ROLE_ADMIN };
+        ROUNDTRIP(oc_encode_set_role(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_ROLE, h, p);
+        oc_set_role out;
+        CHECK(oc_decode_set_role(&p, &out) == OC_OK);
+        CHECK(out.user_id == 7 && out.role == OC_ROLE_ADMIN);
+    }
+    {
+        oc_invite_user in = { OC_ROLE_ADMIN };
+        ROUNDTRIP(oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_INVITE_USER, h, p);
+        oc_invite_user out;
+        CHECK(oc_decode_invite_user(&p, &out) == OC_OK);
+        CHECK(out.role == OC_ROLE_ADMIN);
+    }
+    {
+        oc_remove_user in = { 42 };
+        ROUNDTRIP(oc_encode_remove_user(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REMOVE_USER, h, p);
+        oc_remove_user out;
+        CHECK(oc_decode_remove_user(&p, &out) == OC_OK);
+        CHECK(out.user_id == 42);
+    }
+    {
+        oc_user_updated in = { 42, OC_ROLE_MEMBER, 1 };
+        ROUNDTRIP(oc_encode_user_updated(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_USER_UPDATED, h, p);
+        oc_user_updated out;
+        CHECK(oc_decode_user_updated(&p, &out) == OC_OK);
+        CHECK(out.user_id == 42 && out.role == OC_ROLE_MEMBER && out.disabled == 1);
+    }
+    {
+        uint8_t tok[OC_INVITE_TOKEN_LEN];
+        for (int i = 0; i < (int)OC_INVITE_TOKEN_LEN; i++) tok[i] = (uint8_t)(i + 3);
+        oc_invite_created in = { { tok, OC_INVITE_TOKEN_LEN }, OC_ROLE_MEMBER, 1751200500000ull };
+        ROUNDTRIP(oc_encode_invite_created(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_INVITE_CREATED, h, p);
+        oc_invite_created out;
+        CHECK(oc_decode_invite_created(&p, &out) == OC_OK);
+        CHECK(out.token.len == OC_INVITE_TOKEN_LEN && out.token.ptr[0] == 3);
+        CHECK(out.role == OC_ROLE_MEMBER && out.expires_at == 1751200500000ull);
+    }
+    {
+        uint8_t tok[OC_INVITE_TOKEN_LEN]; memset(tok, 0x9A, sizeof tok);
+        oc_redeem_invite in = { { tok, OC_INVITE_TOKEN_LEN }, oc_slice_str("newbie"), oc_slice_str("hunter2") };
+        ROUNDTRIP(oc_encode_redeem_invite(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_REDEEM_INVITE, h, p);
+        oc_redeem_invite out;
+        CHECK(oc_decode_redeem_invite(&p, &out) == OC_OK);
+        CHECK(out.token.len == OC_INVITE_TOKEN_LEN && out.token.ptr[0] == 0x9A);
+        CHECK(slice_eq_str(out.username, "newbie") && slice_eq_str(out.password, "hunter2"));
+    }
+}
+
 static void test_backfill_and_error(void) {
     {
         oc_cursor cursors[3] = { {7, 1000}, {8, 0}, {9, 512} };
@@ -428,6 +500,7 @@ int run_protocol_tests(void) {
     test_auth_frames();
     test_messaging_frames();
     test_channel_frames();
+    test_admin_frames();
     test_backfill_and_error();
     test_size_limits();
     test_malformed();

@@ -116,6 +116,8 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->ch_name);
     for (size_t i = 0; i < r->n_chlist; i++) free(r->chlist[i].name);
     free(r->chlist);
+    for (size_t i = 0; i < r->n_ulist; i++) { free(r->ulist[i].email); free(r->ulist[i].display_name); }
+    free(r->ulist);
     free(r);
 }
 
@@ -128,6 +130,9 @@ void oc_dbres_free(oc_dbres *r) {
 /* Session lifetime — the daemon's own expiry, no longer tied to a provider
  * token (REQ-181, AUTH.md §4). */
 #define OC_SESSION_TTL_MS (30ull * 24 * 60 * 60 * 1000)
+
+/* Invite-token lifetime (AUTH.md §2): the invitee must redeem within this window. */
+#define OC_INVITE_TTL_MS (7ull * 24 * 60 * 60 * 1000)
 
 static uint8_t role_to_u8(const char *r) {
     if (r && strcmp(r, "owner") == 0) return OC_ROLE_OWNER;
@@ -337,6 +342,18 @@ static uint8_t get_role(sqlite3 *db, uint64_t uid) {
     return role;
 }
 
+/* Has this user been removed from the tenant (REQ-033)? A removed member is
+ * locked out of every auth path but their row survives for message authorship. */
+static int user_disabled(sqlite3 *db, uint64_t uid) {
+    sqlite3_stmt *st = NULL;
+    int disabled = 0;
+    sqlite3_prepare_v2(db, "SELECT disabled FROM users WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    if (sqlite3_step(st) == SQLITE_ROW) disabled = sqlite3_column_int(st, 0) != 0;
+    sqlite3_finalize(st);
+    return disabled;
+}
+
 static int count_owners(sqlite3 *db) {
     sqlite3_stmt *st = NULL;
     int n = 0;
@@ -454,6 +471,9 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_REQUIRED; return r;
     }
 
+    /* A removed member is refused regardless of how identity was proven (REQ-033).
+     * Reported as an invalid credential so removal isn't disclosed. */
+    if (uid && user_disabled(db, uid)) uid = 0;
     if (uid == 0) { r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r; }
     ensure_default_membership(db, uid);
 
@@ -540,6 +560,195 @@ static oc_dbres *process_logout(sqlite3 *db, const oc_job *j) {
     sqlite3_step(st);
     sqlite3_finalize(st);
     r->type = OC_RES_LOGOUT_OK;
+    return r;
+}
+
+/* --- Admin ops (REQ-033, tenant-level; owner/admin) --------------------- */
+
+/* Enumerate every tenant user. Available to any authenticated user (a client
+ * needs the roster to address messages and pick op targets). */
+static oc_dbres *process_list_users(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_USER_LIST;
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT id, role, disabled, COALESCE(email,''), COALESCE(display_name,'') "
+        "FROM users ORDER BY id;", -1, &st, NULL);
+    size_t cap = 8, n = 0;
+    oc_user_row *arr = malloc(cap * sizeof *arr);
+    while (arr && sqlite3_step(st) == SQLITE_ROW) {
+        if (n == cap) { cap *= 2; oc_user_row *g = realloc(arr, cap * sizeof *arr); if (!g) break; arr = g; }
+        arr[n].user_id      = (uint64_t)sqlite3_column_int64(st, 0);
+        arr[n].role         = role_to_u8((const char *)sqlite3_column_text(st, 1));
+        arr[n].disabled     = (uint8_t)(sqlite3_column_int(st, 2) != 0);
+        arr[n].email        = strdup((const char *)sqlite3_column_text(st, 3));
+        arr[n].display_name = strdup((const char *)sqlite3_column_text(st, 4));
+        n++;
+    }
+    sqlite3_finalize(st);
+    r->ulist = arr;
+    r->n_ulist = n;
+    return r;
+}
+
+/* Mint an invite token for a new local account (REQ-033). Owner/admin only; only
+ * an owner may invite at an elevated (admin/owner) role. Only the token's SHA-256
+ * is stored; the raw token is returned once for the actor to share. */
+static oc_dbres *process_invite_user(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+
+    uint8_t actor_role = OC_ROLE_MEMBER;
+    if (!user_role(db, j->user_id, &actor_role) || !oc_role_can_manage_members(actor_role)) {
+        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    uint8_t want = j->role > OC_ROLE_OWNER ? OC_ROLE_MEMBER : j->role;
+    if (want != OC_ROLE_MEMBER && actor_role != OC_ROLE_OWNER) {
+        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+
+    uint8_t token[OC_INVITE_TOKEN_LEN], hash[OC_SHA256_LEN];
+    if (oc_rand_bytes(token, sizeof token) != 0 || oc_sha256(token, sizeof token, hash) != 0) {
+        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+    }
+    uint64_t expiry = dbw_now_ms() + OC_INVITE_TTL_MS;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO invites(token_hash,created_by,role,expires_at_ms) VALUES(?,?,?,?);",
+        -1, &st, NULL);
+    sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_bind_text(st, 3, u8_to_role(want), -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)expiry);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+    }
+    r->type = OC_RES_INVITE_OK;
+    memcpy(r->session_token, token, OC_INVITE_TOKEN_LEN);  /* carries the invite token */
+    r->session_expiry = expiry;
+    r->role = want;
+    return r;
+}
+
+/* Redeem an invite (pre-auth): create the local account with the invite's role,
+ * single-use-consume the token, and mint a session — the redeeming client is now
+ * authenticated (result is an AUTH_OK). Any failure is a non-disclosing
+ * AUTH_INVALID_TOKEN. */
+static oc_dbres *process_redeem(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+
+    if (j->token_len != OC_INVITE_TOKEN_LEN) {
+        r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+    }
+    uint8_t hash[OC_SHA256_LEN];
+    if (oc_sha256((const uint8_t *)j->token, j->token_len, hash) != 0) {
+        r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+    }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT role, expires_at_ms, consumed_at_ms FROM invites WHERE token_hash=?;",
+        -1, &st, NULL);
+    sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
+    uint8_t role = OC_ROLE_MEMBER; uint64_t expiry = 0; int consumed = 1, found = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        role     = role_to_u8((const char *)sqlite3_column_text(st, 0));
+        expiry   = (uint64_t)sqlite3_column_int64(st, 1);
+        consumed = sqlite3_column_type(st, 2) != SQLITE_NULL;
+        found = 1;
+    }
+    sqlite3_finalize(st);
+    if (!found || consumed || (expiry != 0 && dbw_now_ms() >= expiry)) {
+        r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+    }
+
+    /* The username must be free — register_local is INSERT-OR-IGNORE, so a
+     * collision would silently map to the existing account without setting the
+     * new password. Reject rather than hijack. */
+    const char *user = j->username ? j->username : "";
+    const char *pass = j->password ? j->password : "";
+    char subject[256];
+    size_t sublen = local_subject(subject, sizeof subject, user, strlen(user));
+    if (sublen == 0 || strlen(pass) == 0) {
+        r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r;
+    }
+    sqlite3_prepare_v2(db, "SELECT 1 FROM users WHERE subject=?;", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, subject, (int)sublen, SQLITE_TRANSIENT);
+    int taken = (sqlite3_step(st) == SQLITE_ROW);
+    sqlite3_finalize(st);
+    if (taken) { r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r; }
+
+    uint64_t uid = register_local(db, user, strlen(user), pass, strlen(pass), role, j->iterations);
+    if (uid == 0) { r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+
+    /* Consume the invite (single-use); the single writer thread makes this atomic
+     * with the account creation above. */
+    sqlite3_prepare_v2(db, "UPDATE invites SET consumed_at_ms=? WHERE token_hash=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+    sqlite3_bind_blob(st, 2, hash, sizeof hash, SQLITE_STATIC);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+
+    uint8_t token[OC_SESSION_TOKEN_LEN]; uint64_t sexp = 0;
+    if (mint_session(db, uid, token, &sexp) != 0) {
+        r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+    }
+    r->type = OC_RES_AUTH_OK;
+    r->user_id = uid;
+    r->role = role;
+    memcpy(r->session_token, token, sizeof token);
+    r->has_session_token = 1;
+    r->session_expiry = sexp;
+    return r;
+}
+
+/* Remove a member from the tenant (REQ-033): lock them out (disabled=1) and
+ * revoke access — sessions, channel memberships, and local password. The row
+ * survives so their authored messages keep a valid author. Owner/admin only; an
+ * admin cannot remove an admin/owner, and the last owner cannot be removed. */
+static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+
+    uint8_t actor_role = OC_ROLE_MEMBER, target_role = OC_ROLE_MEMBER;
+    if (!user_role(db, j->user_id, &actor_role) ||
+        !user_role(db, j->target_user_id, &target_role)) {
+        r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    if (!oc_role_can_manage_members(actor_role)) {
+        r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    if (target_role != OC_ROLE_MEMBER && actor_role != OC_ROLE_OWNER) {
+        r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    if (target_role == OC_ROLE_OWNER && count_owners(db) <= 1) {
+        r->type = OC_RES_USER_ERR; r->err_code = OC_ERR_LAST_OWNER; return r;
+    }
+
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "UPDATE users SET disabled=1 WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db, "DELETE FROM sessions WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db, "DELETE FROM channel_members WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db, "DELETE FROM local_credentials WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+
+    r->type = OC_RES_USER_UPDATED;
+    r->user_id = j->target_user_id;
+    r->role = target_role;
+    r->disabled = 1;
     return r;
 }
 
@@ -1070,6 +1279,10 @@ static void *writer_loop(void *arg) {
         else if (j->type == OC_JOB_LEAVE_CHANNEL)  r = process_leave_channel(w->db, j);
         else if (j->type == OC_JOB_INVITE_CHANNEL) r = process_invite_channel(w->db, j);
         else if (j->type == OC_JOB_REMOVE_CHANNEL) r = process_remove_channel(w->db, j);
+        else if (j->type == OC_JOB_LIST_USERS)     r = process_list_users(w->db, j);
+        else if (j->type == OC_JOB_INVITE_USER)    r = process_invite_user(w->db, j);
+        else if (j->type == OC_JOB_REMOVE_USER)    r = process_remove_user(w->db, j);
+        else if (j->type == OC_JOB_REDEEM)         r = process_redeem(w->db, j);
         job_free(j);
         push_result(w, r);
     }

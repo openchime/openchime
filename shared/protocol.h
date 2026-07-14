@@ -61,6 +61,14 @@ typedef enum {
     OC_MSG_LEAVE_CHANNEL      = 0x0055, /* C->S */
     OC_MSG_INVITE_TO_CHANNEL  = 0x0056, /* C->S (REQ-033, channel-level) */
     OC_MSG_REMOVE_FROM_CHANNEL= 0x0057, /* C->S (REQ-033, channel-level) */
+    OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
+    OC_MSG_USER_LIST        = 0x0041, /* S->C */
+    OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
+    OC_MSG_INVITE_USER      = 0x0043, /* C->S (REQ-033, tenant-level; owner/admin) */
+    OC_MSG_REMOVE_USER      = 0x0044, /* C->S (REQ-033, tenant-level; owner/admin) */
+    OC_MSG_USER_UPDATED     = 0x0045, /* S->C, ack/push for SET_ROLE + REMOVE_USER */
+    OC_MSG_INVITE_CREATED   = 0x0046, /* S->C, the minted invite token */
+    OC_MSG_REDEEM_INVITE    = 0x0047, /* C->S, pre-auth account creation */
     OC_MSG_BACKFILL_REQUEST = 0x0030, /* C->S */
     OC_MSG_BACKFILL_DONE    = 0x0031, /* S->C */
     OC_MSG_ERROR            = 0x00FF  /* S->C */
@@ -194,6 +202,10 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_CHANNEL_KIND_DM 1u   /* a direct-message conversation (reserved) */
 #define OC_MAX_CHANNEL_NAME 64u /* channel-name length cap (bytes) */
 
+/* Account-creation invite token (AUTH.md §2); like a session token, only its
+ * SHA-256 is stored. Presented in REDEEM_INVITE to set a password. */
+#define OC_INVITE_TOKEN_LEN 32u
+
 /* LOGOUT scope (PROTOCOL.md §4; REQ-182). */
 #define OC_LOGOUT_THIS 0u   /* revoke just the presented session token */
 #define OC_LOGOUT_ALL  1u   /* revoke every session of the authenticated user */
@@ -221,6 +233,14 @@ typedef struct { uint64_t channel_id; } oc_channel_ref;                       /*
 typedef struct { uint64_t channel_id; uint64_t user_id; } oc_channel_member_op; /* INVITE / REMOVE */
 typedef struct { uint64_t channel_id; oc_slice name; uint8_t is_public; uint8_t joined; } oc_channel_list_entry;
 typedef struct { uint16_t count; const oc_channel_list_entry *entries; } oc_channel_list;
+typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; oc_slice email; oc_slice display_name; } oc_user_list_entry;
+typedef struct { uint16_t count; const oc_user_list_entry *entries; } oc_user_list;
+typedef struct { uint64_t user_id; uint8_t role; } oc_set_role;
+typedef struct { uint8_t role; } oc_invite_user;
+typedef struct { uint64_t user_id; } oc_remove_user;
+typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; } oc_user_updated;
+typedef struct { oc_slice token; uint8_t role; uint64_t expires_at; } oc_invite_created;
+typedef struct { oc_slice token; oc_slice username; oc_slice password; } oc_redeem_invite;
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_cursor;
 typedef struct { uint16_t count; const oc_cursor *cursors; } oc_backfill_request;
 typedef struct { uint64_t high_water; } oc_backfill_done;
@@ -256,6 +276,14 @@ oc_result oc_encode_join_channel(oc_wbuf *w, uint16_t version, const oc_channel_
 oc_result oc_encode_leave_channel(oc_wbuf *w, uint16_t version, const oc_channel_ref *m);
 oc_result oc_encode_invite_to_channel(oc_wbuf *w, uint16_t version, const oc_channel_member_op *m);
 oc_result oc_encode_remove_from_channel(oc_wbuf *w, uint16_t version, const oc_channel_member_op *m);
+oc_result oc_encode_list_users(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_user_list(oc_wbuf *w, uint16_t version, const oc_user_list *m);
+oc_result oc_encode_set_role(oc_wbuf *w, uint16_t version, const oc_set_role *m);
+oc_result oc_encode_invite_user(oc_wbuf *w, uint16_t version, const oc_invite_user *m);
+oc_result oc_encode_remove_user(oc_wbuf *w, uint16_t version, const oc_remove_user *m);
+oc_result oc_encode_user_updated(oc_wbuf *w, uint16_t version, const oc_user_updated *m);
+oc_result oc_encode_invite_created(oc_wbuf *w, uint16_t version, const oc_invite_created *m);
+oc_result oc_encode_redeem_invite(oc_wbuf *w, uint16_t version, const oc_redeem_invite *m);
 oc_result oc_encode_backfill_request(oc_wbuf *w, uint16_t version, const oc_backfill_request *m);
 oc_result oc_encode_backfill_done(oc_wbuf *w, uint16_t version, const oc_backfill_done *m);
 oc_result oc_encode_error(oc_wbuf *w, uint16_t version, const oc_error *m);
@@ -291,6 +319,14 @@ oc_result oc_decode_join_channel(oc_rbuf *p, oc_channel_ref *m);
 oc_result oc_decode_leave_channel(oc_rbuf *p, oc_channel_ref *m);
 oc_result oc_decode_invite_to_channel(oc_rbuf *p, oc_channel_member_op *m);
 oc_result oc_decode_remove_from_channel(oc_rbuf *p, oc_channel_member_op *m);
+oc_result oc_decode_list_users(oc_rbuf *p);
+oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries, uint16_t cap, uint16_t *out_count);
+oc_result oc_decode_set_role(oc_rbuf *p, oc_set_role *m);
+oc_result oc_decode_invite_user(oc_rbuf *p, oc_invite_user *m);
+oc_result oc_decode_remove_user(oc_rbuf *p, oc_remove_user *m);
+oc_result oc_decode_user_updated(oc_rbuf *p, oc_user_updated *m);
+oc_result oc_decode_invite_created(oc_rbuf *p, oc_invite_created *m);
+oc_result oc_decode_redeem_invite(oc_rbuf *p, oc_redeem_invite *m);
 oc_result oc_decode_backfill_request(oc_rbuf *p, oc_cursor *cursors, uint16_t cap, uint16_t *out_count);
 oc_result oc_decode_backfill_done(oc_rbuf *p, oc_backfill_done *m);
 oc_result oc_decode_error(oc_rbuf *p, oc_error *m);

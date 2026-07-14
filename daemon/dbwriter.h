@@ -29,7 +29,9 @@
 enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 4,
        OC_JOB_SET_ROLE = 5, OC_JOB_LOGOUT = 6, OC_JOB_EDIT = 7, OC_JOB_DELETE = 8,
        OC_JOB_CREATE_CHANNEL = 9, OC_JOB_LIST_CHANNELS = 10, OC_JOB_JOIN_CHANNEL = 11,
-       OC_JOB_LEAVE_CHANNEL = 12, OC_JOB_INVITE_CHANNEL = 13, OC_JOB_REMOVE_CHANNEL = 14 };
+       OC_JOB_LEAVE_CHANNEL = 12, OC_JOB_INVITE_CHANNEL = 13, OC_JOB_REMOVE_CHANNEL = 14,
+       OC_JOB_LIST_USERS = 15, OC_JOB_INVITE_USER = 16, OC_JOB_REMOVE_USER = 17,
+       OC_JOB_REDEEM = 18 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -86,7 +88,9 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_EDIT_OK = 12, OC_RES_EDIT_ERR = 13,
        OC_RES_DELETE_OK = 14, OC_RES_DELETE_ERR = 15,
        OC_RES_CHANNEL_INFO = 16, OC_RES_CHANNEL_ERR = 17,
-       OC_RES_CHANNEL_LIST = 18 };
+       OC_RES_CHANNEL_LIST = 18, OC_RES_USER_LIST = 19,
+       OC_RES_INVITE_OK = 20, OC_RES_INVITE_ERR = 21,
+       OC_RES_USER_UPDATED = 22, OC_RES_USER_ERR = 23 };
 
 /* One row in a CHANNEL_LIST result (net thread renders as a list entry). */
 typedef struct {
@@ -95,6 +99,15 @@ typedef struct {
     uint8_t  is_public;
     uint8_t  joined;     /* 1 if the requesting user is a member */
 } oc_channel_row;
+
+/* One row in a USER_LIST result. */
+typedef struct {
+    uint64_t user_id;
+    uint8_t  role;
+    uint8_t  disabled;
+    char    *email;         /* heap; may be "" */
+    char    *display_name;  /* heap; may be "" */
+} oc_user_row;
 
 /* One message to replay on reconnect (rendered as a BROADCAST by the net thread). */
 typedef struct {
@@ -144,6 +157,12 @@ typedef struct oc_dbres {
     /* CHANNEL_LIST */
     oc_channel_row *chlist;         /* heap array */
     size_t          n_chlist;
+
+    /* Admin ops (REQ-033). USER_UPDATED carries user_id (above) + role + disabled.
+     * INVITE_OK reuses session_token/session_expiry/role for the minted invite. */
+    uint8_t         disabled;       /* USER_UPDATED: the target's disabled flag */
+    oc_user_row    *ulist;          /* USER_LIST: heap array */
+    size_t          n_ulist;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;

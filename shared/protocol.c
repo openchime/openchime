@@ -400,6 +400,67 @@ oc_result oc_encode_remove_from_channel(oc_wbuf *w, uint16_t version, const oc_c
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_list_users(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_USERS);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_user_list(oc_wbuf *w, uint16_t version, const oc_user_list *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_USER_LIST);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        oc_w_u64(w, m->entries[i].user_id);
+        oc_w_u8(w, m->entries[i].role);
+        oc_w_u8(w, m->entries[i].disabled);
+        oc_w_str(w, m->entries[i].email);
+        oc_w_str(w, m->entries[i].display_name);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_set_role(oc_wbuf *w, uint16_t version, const oc_set_role *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_ROLE);
+    oc_w_u64(w, m->user_id);
+    oc_w_u8(w, m->role);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_invite_user(oc_wbuf *w, uint16_t version, const oc_invite_user *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_INVITE_USER);
+    oc_w_u8(w, m->role);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_remove_user(oc_wbuf *w, uint16_t version, const oc_remove_user *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_REMOVE_USER);
+    oc_w_u64(w, m->user_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_user_updated(oc_wbuf *w, uint16_t version, const oc_user_updated *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_USER_UPDATED);
+    oc_w_u64(w, m->user_id);
+    oc_w_u8(w, m->role);
+    oc_w_u8(w, m->disabled);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_invite_created(oc_wbuf *w, uint16_t version, const oc_invite_created *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_INVITE_CREATED);
+    oc_w_bytes(w, m->token);
+    oc_w_u8(w, m->role);
+    oc_w_u64(w, m->expires_at);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_redeem_invite(oc_wbuf *w, uint16_t version, const oc_redeem_invite *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_REDEEM_INVITE);
+    oc_w_bytes(w, m->token);
+    oc_w_str(w, m->username);
+    oc_w_str(w, m->password);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_backfill_request(oc_wbuf *w, uint16_t version, const oc_backfill_request *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_BACKFILL_REQUEST);
     oc_w_u16(w, m->count);
@@ -591,6 +652,68 @@ oc_result oc_decode_invite_to_channel(oc_rbuf *p, oc_channel_member_op *m) {
 oc_result oc_decode_remove_from_channel(oc_rbuf *p, oc_channel_member_op *m) {
     m->channel_id = oc_r_u64(p);
     m->user_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_list_users(oc_rbuf *p) {
+    return r_done(p);   /* empty payload */
+}
+
+oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries,
+                              uint16_t cap, uint16_t *out_count) {
+    uint16_t count = oc_r_u16(p);
+    *out_count = count;
+    for (uint16_t i = 0; i < count; i++) {
+        uint64_t uid = oc_r_u64(p);
+        uint8_t role = oc_r_u8(p);
+        uint8_t disabled = oc_r_u8(p);
+        oc_slice email = oc_r_str(p);
+        oc_slice name = oc_r_str(p);
+        if (i < cap) {
+            entries[i].user_id = uid;
+            entries[i].role = role;
+            entries[i].disabled = disabled;
+            entries[i].email = email;
+            entries[i].display_name = name;
+        }
+    }
+    return r_done(p);
+}
+
+oc_result oc_decode_set_role(oc_rbuf *p, oc_set_role *m) {
+    m->user_id = oc_r_u64(p);
+    m->role = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_invite_user(oc_rbuf *p, oc_invite_user *m) {
+    m->role = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_remove_user(oc_rbuf *p, oc_remove_user *m) {
+    m->user_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_user_updated(oc_rbuf *p, oc_user_updated *m) {
+    m->user_id = oc_r_u64(p);
+    m->role = oc_r_u8(p);
+    m->disabled = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_invite_created(oc_rbuf *p, oc_invite_created *m) {
+    m->token = oc_r_bytes(p);
+    m->role = oc_r_u8(p);
+    m->expires_at = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_redeem_invite(oc_rbuf *p, oc_redeem_invite *m) {
+    m->token = oc_r_bytes(p);
+    m->username = oc_r_str(p);
+    m->password = oc_r_str(p);
     return r_done(p);
 }
 

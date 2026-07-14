@@ -50,7 +50,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 2);
+    CHECK(oc_schema_version(db) == 3);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -768,6 +768,146 @@ static void test_channels(void) {
     cleanup_db(path);
 }
 
+/* --- Tenant admin ops (REQ-033) ----------------------------------------- */
+
+static oc_dbres *invite_user(oc_dbwriter *w, uint64_t actor, uint8_t role) {
+    oc_job *j = oc_job_new(OC_JOB_INVITE_USER, 95);
+    j->user_id = actor; j->role = role;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *redeem_invite(oc_dbwriter *w, const uint8_t *token, const char *user, const char *pass) {
+    oc_job *j = oc_job_new(OC_JOB_REDEEM, 96);
+    oc_job_set_register(j, user, pass, 0, TEST_PW_ITERS);   /* fast PBKDF2 for tests */
+    oc_job_set_token(j, token, OC_INVITE_TOKEN_LEN);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *list_users(oc_dbwriter *w, uint64_t actor) {
+    oc_job *j = oc_job_new(OC_JOB_LIST_USERS, 98);
+    j->user_id = actor;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static uint16_t remove_user(oc_dbwriter *w, uint64_t actor, uint64_t target) {
+    oc_job *j = oc_job_new(OC_JOB_REMOVE_USER, 97);
+    j->user_id = actor; j->target_user_id = target;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    uint16_t code = (r && r->type == OC_RES_USER_UPDATED) ? 0 : (r ? r->err_code : 0xFFFF);
+    oc_dbres_free(r);
+    return code;
+}
+
+static void test_admin_ops(void) {
+    const char *path = "build/test_dbwriter_admin.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t owner  = reg(w, "ad-owner",  "pw", OC_ROLE_OWNER);
+    uint64_t admin  = reg(w, "ad-admin",  "pw", OC_ROLE_ADMIN);
+    uint64_t member = reg(w, "ad-member", "pw", OC_ROLE_MEMBER);
+    CHECK(owner && admin && member);
+
+    /* --- Invites --- */
+    /* A member cannot invite. */
+    oc_dbres *r = invite_user(w, member, OC_ROLE_MEMBER);
+    CHECK(r && r->type == OC_RES_INVITE_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    /* An admin can invite a member, but not at an elevated role. */
+    r = invite_user(w, admin, OC_ROLE_ADMIN);
+    CHECK(r && r->type == OC_RES_INVITE_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    r = invite_user(w, admin, OC_ROLE_MEMBER);
+    CHECK(r && r->type == OC_RES_INVITE_OK && r->role == OC_ROLE_MEMBER);
+    uint8_t tok_member[OC_INVITE_TOKEN_LEN];
+    memcpy(tok_member, r->session_token, OC_INVITE_TOKEN_LEN);
+    oc_dbres_free(r);
+
+    /* An owner can invite at an elevated (admin) role. */
+    r = invite_user(w, owner, OC_ROLE_ADMIN);
+    CHECK(r && r->type == OC_RES_INVITE_OK && r->role == OC_ROLE_ADMIN);
+    uint8_t tok_admin[OC_INVITE_TOKEN_LEN];
+    memcpy(tok_admin, r->session_token, OC_INVITE_TOKEN_LEN);
+    oc_dbres_free(r);
+
+    /* --- Redemption --- */
+    /* Redeem the member invite: a new account is created + authenticated. */
+    r = redeem_invite(w, tok_member, "newbie", "newpw");
+    CHECK(r && r->type == OC_RES_AUTH_OK && r->role == OC_ROLE_MEMBER && r->has_session_token);
+    uint64_t newbie = r->user_id;
+    CHECK(newbie != 0);
+    oc_dbres_free(r);
+    /* The new account can now log in with its password. */
+    CHECK(auth_local(w, 100, "newbie", "newpw", NULL, NULL) == newbie);
+
+    /* The token is single-use: a second redemption is refused. */
+    r = redeem_invite(w, tok_member, "newbie2", "x");
+    CHECK(r && r->type == OC_RES_AUTH_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
+    oc_dbres_free(r);
+
+    /* The admin invite yields an admin account. */
+    r = redeem_invite(w, tok_admin, "boss", "bosspw");
+    CHECK(r && r->type == OC_RES_AUTH_OK && r->role == OC_ROLE_ADMIN);
+    oc_dbres_free(r);
+
+    /* A redemption onto a taken username is refused and does NOT consume the
+     * token (so it can still be redeemed with a free name). */
+    r = invite_user(w, owner, OC_ROLE_MEMBER);
+    CHECK(r && r->type == OC_RES_INVITE_OK);
+    uint8_t tok_reuse[OC_INVITE_TOKEN_LEN];
+    memcpy(tok_reuse, r->session_token, OC_INVITE_TOKEN_LEN);
+    oc_dbres_free(r);
+    r = redeem_invite(w, tok_reuse, "ad-owner", "whatever");   /* username already exists */
+    CHECK(r && r->type == OC_RES_AUTH_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
+    oc_dbres_free(r);
+    r = redeem_invite(w, tok_reuse, "fresh", "freshpw");       /* same token, free name */
+    CHECK(r && r->type == OC_RES_AUTH_OK);
+    oc_dbres_free(r);
+
+    /* A garbage token is refused. */
+    uint8_t bogus[OC_INVITE_TOKEN_LEN]; memset(bogus, 0xEE, sizeof bogus);
+    r = redeem_invite(w, bogus, "ghost", "x");
+    CHECK(r && r->type == OC_RES_AUTH_ERR && r->err_code == OC_ERR_AUTH_INVALID_TOKEN);
+    oc_dbres_free(r);
+
+    /* --- Listing --- */
+    r = list_users(w, member);   /* any authed user may list */
+    CHECK(r && r->type == OC_RES_USER_LIST);
+    int saw_owner = 0, saw_newbie = 0;
+    for (size_t i = 0; i < r->n_ulist; i++) {
+        if (r->ulist[i].user_id == owner)  { saw_owner = 1; CHECK(r->ulist[i].role == OC_ROLE_OWNER); }
+        if (r->ulist[i].user_id == newbie) saw_newbie = 1;
+    }
+    CHECK(saw_owner && saw_newbie);
+    oc_dbres_free(r);
+
+    /* --- Removal --- */
+    /* Give the member a live session, to prove removal revokes it. */
+    uint8_t mtok[OC_SESSION_TOKEN_LEN]; memset(mtok, 0, sizeof mtok);
+    CHECK(auth_local(w, 101, "ad-member", "pw", mtok, NULL) == member);
+    CHECK(auth_session(w, 102, mtok) == member);
+
+    /* A member cannot remove anyone; an admin cannot remove an owner. */
+    CHECK(remove_user(w, member, admin) == OC_ERR_FORBIDDEN);
+    CHECK(remove_user(w, admin, owner) == OC_ERR_FORBIDDEN);
+    /* The last owner cannot remove themselves. */
+    CHECK(remove_user(w, owner, owner) == OC_ERR_LAST_OWNER);
+
+    /* An owner removes the member: session revoked, password gone, locked out. */
+    CHECK(remove_user(w, owner, member) == 0);
+    CHECK(auth_session(w, 103, mtok) == 0);                      /* session revoked */
+    CHECK(auth_local(w, 104, "ad-member", "pw", NULL, NULL) == 0); /* login refused */
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill\n");
     test_start_migrates_and_stops();
@@ -779,6 +919,7 @@ int run_dbwriter_tests(void) {
     test_role_enforcement();
     test_edit_delete();
     test_channels();
+    test_admin_ops();
     test_backfill();
     return failures;
 }

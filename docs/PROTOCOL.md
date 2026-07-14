@@ -487,6 +487,68 @@ Every tenant has one auto-provisioned public **`general`** channel (id `1`) that
 every user joins at authentication, so the messaging path always has a channel
 to deliver to.
 
+### 5.8 Tenant administration (REQ-030, REQ-033)
+
+Managing the tenant's people: enumerating them, changing roles, and adding or
+removing members. Role changes and member add/remove are gated by the tenant
+role policy (owner/admin/member, ARCH-60, AUTH.md §6); enumeration is open to any
+authenticated user.
+
+**`LIST_USERS` (client → server), msg_type `0x0040`** — empty payload; replies
+**`USER_LIST` (server → client), msg_type `0x0041`**:
+
+| Field       | Type            | Notes                                                        |
+|-------------|-----------------|--------------------------------------------------------------|
+| `count`     | u16             | Number of entries.                                           |
+| `entries[]` | `count` × entry | Each: `user_id` (u64), `role` (u8), `disabled` (u8), `email` (str), `display_name` (str). |
+
+**`SET_ROLE` (client → server), msg_type `0x0042`** `{ user_id: u64, role: u8 }` —
+changes a user's tenant role. Enforced by the role policy: only owner/admin may
+change roles, only an owner may grant/revoke owner, an admin may only
+promote/keep members; demoting the last owner is refused (`LAST_OWNER`, REQ-030).
+On success the actor is acked with **`USER_UPDATED` (server → client), msg_type
+`0x0045`** `{ user_id: u64, role: u8, disabled: u8 }`, and the same frame is
+pushed to the affected user's live connections so their client updates its
+capabilities immediately.
+
+**`INVITE_USER` (client → server), msg_type `0x0043`** `{ role: u8 }` — owner/admin
+only (only an owner may invite at admin/owner role). Mints a single-use invite
+token for a **new** local account and replies **`INVITE_CREATED` (server →
+client), msg_type `0x0046`**:
+
+| Field        | Type  | Notes                                                       |
+|--------------|-------|-------------------------------------------------------------|
+| `token`      | bytes | The 32-byte invite token (only its SHA-256 is stored). The actor shares it out-of-band. |
+| `role`       | u8    | The role the redeemed account will receive.                 |
+| `expires_at` | u64   | Ms since epoch UTC after which the token is dead.           |
+
+**`REDEEM_INVITE` (client → server), msg_type `0x0047`** — sent **before** `AUTH`
+(the invitee has no account yet), it creates the account and authenticates in one
+step:
+
+| Field      | Type  | Notes                                                        |
+|------------|-------|--------------------------------------------------------------|
+| `token`    | bytes | The invite token from `INVITE_CREATED`.                      |
+| `username` | str   | Desired username; must be unused.                            |
+| `password` | str   | The account password (PBKDF2-hashed server-side, AUTH.md §2).|
+
+On success the daemon consumes the token (single-use), creates the account with
+the invite's role, and replies with a normal **`AUTH_OK`** (§4.3) — the
+connection is now authenticated. Any failure (bad/expired/consumed token, taken
+username) is a fatal `ERROR AUTH_INVALID_TOKEN`, non-disclosing by design.
+
+**`REMOVE_USER` (client → server), msg_type `0x0044`** `{ user_id: u64 }` —
+owner/admin only; an admin cannot remove an admin/owner, and the last owner
+cannot be removed (`LAST_OWNER`). The member is **locked out** (their sessions,
+channel memberships, and local password are dropped, and a `disabled` flag bars
+every future login) rather than deleted, so their authored messages keep a valid
+author. The actor is acked with `USER_UPDATED` (`disabled=1`); the removed user's
+live connections receive the same notice and are then dropped.
+
+`SET_ROLE`/`INVITE_USER`/`REMOVE_USER` failures are non-fatal `ERROR` frames
+(`FORBIDDEN`, `LAST_OWNER`, `INTERNAL_ERROR`); a `REDEEM_INVITE` failure is fatal
+(the connection never authenticated).
+
 ---
 
 ## 6. Reconnect backfill (resolves REQ-101)
@@ -611,11 +673,15 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0011` | `AUTH_OK`          | S → C     | no        | §4.3    |
 | `0x0012` | `AUTH_CHALLENGE`   | S → C     | no        | §4.1    |
 | `0x0013` | `LOGOUT`           | C → S     | no        | §4.4    |
-| `0x0040` | `LIST_USERS`       | C → S     | no        | (reserved — user enumeration) |
-| `0x0041` | `USER_LIST`        | S → C     | no        | (reserved) |
-| `0x0042` | `UPDATE_PROFILE`   | C → S     | no        | (reserved — profile edit) |
-| `0x0043` | `INVITE_USER`      | C → S     | no        | (reserved — REQ-033) |
-| `0x0044` | `REMOVE_USER`      | C → S     | no        | (reserved — REQ-033) |
+| `0x0040` | `LIST_USERS`       | C → S     | no        | §5.8    |
+| `0x0041` | `USER_LIST`        | S → C     | no        | §5.8    |
+| `0x0042` | `SET_ROLE`         | C → S     | no        | §5.8    |
+| `0x0043` | `INVITE_USER`      | C → S     | no        | §5.8    |
+| `0x0044` | `REMOVE_USER`      | C → S     | no        | §5.8    |
+| `0x0045` | `USER_UPDATED`     | S → C     | no        | §5.8    |
+| `0x0046` | `INVITE_CREATED`   | S → C     | no        | §5.8    |
+| `0x0047` | `REDEEM_INVITE`    | C → S     | no        | §5.8    |
+| `0x0048` | `UPDATE_PROFILE`   | C → S     | no        | (reserved — profile edit) |
 | `0x0020` | `SEND`             | C → S     | no        | §5.1    |
 | `0x0021` | `SEND_ACK`         | S → C     | no        | §5.2    |
 | `0x0022` | `BROADCAST`        | S → C     | no        | §5.3    |
@@ -639,10 +705,10 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 Ranges are left sparse (`0x0001–` handshake, `0x0010–` auth/session, `0x0020–`
 messaging, `0x0030–` reconnect, `0x0040–` users/profiles, `0x0050–` channel
 management, `0x00FF` error) so later revisions can slot in presence, typing,
-reactions, threads, and audio signaling without renumbering. The `0x0040–0x0044`
-entries are **reserved** —
-their frame layouts are defined when the corresponding milestone (user
-enumeration / profiles / management, AUTH.md §6) lands.
+reactions, threads, and audio signaling without renumbering. The `0x0040–0x0047`
+management frames (user enumeration, roles, tenant invite/remove; §5.8) are
+defined; `0x0048` `UPDATE_PROFILE` (avatar/display-name edit) remains **reserved**
+until that milestone lands.
 
 ---
 

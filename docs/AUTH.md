@@ -19,11 +19,13 @@ per account** (REQ-191, `daemon/ratelimit.c`): after a burst of failures the
 account is refused with `AUTH_RATE_LIMITED`, checked before the expensive PBKDF2.
 Role **changes** are enforced in the writer (`SET_ROLE`, `daemon/roles.c`): the
 owner/admin/member policy plus the ≥1-owner invariant (§6). Failed local-auth is
-rate-limited both per account and per source IP (REQ-191). **Remaining:**
-invite-token account creation (§2), a configurable OIDC bootstrap-owner subject,
-the moderation-delete (REQ-032) and invite/remove (REQ-033) operations, and the
-wire frames that expose role management to clients (the enforced ops exist as
-writer jobs today).
+rate-limited both per account and per source IP (REQ-191). Tenant management is
+**implemented and exposed over the wire** (PROTOCOL.md §5.8): `SET_ROLE`,
+`LIST_USERS`, `INVITE_USER` + `REDEEM_INVITE` (invite-token account creation, §2),
+and `REMOVE_USER` (which locks a member out via the `users.disabled` flag added in
+migration 0003, checked in every auth path). Moderation-delete (REQ-032) and
+channel management (REQ-031) also landed. **Remaining:** a configurable OIDC
+bootstrap-owner subject, and email magic-link invite delivery (§7).
 
 ---
 
@@ -272,9 +274,13 @@ unit-tested in `daemon/roles.c`.
   others' messages in a channel they belong to; the existing `messages.deleted_by`
   column records that it was a non-author deletion. (`oc_role_can_moderate` is in
   place; the delete operation itself is future work.)
-- **Invite/remove (REQ-033, pending):** only owner/admin may invite or remove
-  tenant members; channel-level invite/remove for private channels is any member
-  of that channel. (`oc_role_can_manage_members` is in place.)
+- **Invite/remove (REQ-033, implemented):** only owner/admin may invite or remove
+  tenant members (`oc_role_can_manage_members`), and only an owner may invite at
+  or remove an admin/owner. Invite mints a single-use token (`invites`);
+  `REMOVE_USER` locks the member out via `users.disabled` (migration 0003) and
+  revokes their sessions/credentials rather than deleting the row. Channel-level
+  invite/remove for private channels is any member of that channel (PROTOCOL.md
+  §5.7). Wire frames: PROTOCOL.md §5.8.
 
 ---
 

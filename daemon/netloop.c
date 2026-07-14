@@ -23,6 +23,7 @@
 /* Cap channels per CHANNEL_LIST frame so it never exceeds the wire limit; a
  * client with more would page (not needed at current scale). */
 #define OC_CHANNEL_LIST_MAX 512
+#define OC_USER_LIST_MAX    512
 
 typedef enum { CONN_HANDSHAKE, CONN_ESTABLISHED } conn_state;
 
@@ -222,6 +223,23 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
                 oc_dbwriter_submit(dbw, j);
                 continue;
             }
+            if (hdr.msg_type == OC_MSG_REDEEM_INVITE) {
+                /* Pre-auth account creation: redeem an invite, which both creates
+                 * the account and authenticates (reply is AUTH_OK). */
+                oc_redeem_invite ri;
+                if (oc_decode_redeem_invite(&p, &ri) != OC_OK) return -1;
+                oc_job *j = oc_job_new(OC_JOB_REDEEM, c->conn_id);
+                if (!j) return -1;
+                char *u = strndup((const char *)ri.username.ptr, ri.username.len);
+                char *pw = strndup((const char *)ri.password.ptr, ri.password.len);
+                int ok = u && pw &&
+                         oc_job_set_register(j, u, pw, 0, 0) == 0 &&
+                         oc_job_set_token(j, ri.token.ptr, ri.token.len) == 0;
+                free(u); free(pw);
+                if (!ok) return -1;
+                oc_dbwriter_submit(dbw, j);
+                continue;
+            }
             /* A messaging frame before AUTH is a fatal protocol error. */
             oc_wbuf w; uint8_t tmp[64];
             oc_wbuf_init(&w, tmp, sizeof tmp);
@@ -308,6 +326,45 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
             j->user_id = c->user_id;
             j->channel_id = op.channel_id;
             j->target_user_id = op.user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_USERS) {
+            if (oc_decode_list_users(&p) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_USERS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_ROLE) {
+            oc_set_role sr;
+            if (oc_decode_set_role(&p, &sr) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_ROLE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->target_user_id = sr.user_id;
+            j->role = sr.role;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_INVITE_USER) {
+            oc_invite_user iu;
+            if (oc_decode_invite_user(&p, &iu) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_INVITE_USER, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->role = iu.role;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_REMOVE_USER) {
+            oc_remove_user ru;
+            if (oc_decode_remove_user(&p, &ru) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_REMOVE_USER, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->target_user_id = ru.user_id;
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -536,6 +593,81 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         oc_encode_channel_list(&w, OC_PROTOCOL_VERSION, &cl);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         free(ents);
+        break;
+    }
+    case OC_RES_USER_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        size_t n = r->n_ulist > OC_USER_LIST_MAX ? OC_USER_LIST_MAX : r->n_ulist;
+        oc_user_list_entry *ents = n ? malloc(n * sizeof *ents) : NULL;
+        if (n && !ents) n = 0;
+        for (size_t i = 0; i < n; i++) {
+            ents[i].user_id = r->ulist[i].user_id;
+            ents[i].role = r->ulist[i].role;
+            ents[i].disabled = r->ulist[i].disabled;
+            ents[i].email = oc_slice_str(r->ulist[i].email ? r->ulist[i].email : "");
+            ents[i].display_name = oc_slice_str(r->ulist[i].display_name ? r->ulist[i].display_name : "");
+        }
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_user_list ul = { (uint16_t)n, ents };
+        oc_encode_user_list(&w, OC_PROTOCOL_VERSION, &ul);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        free(ents);
+        break;
+    }
+    case OC_RES_INVITE_OK: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        oc_slice tok = { r->session_token, OC_INVITE_TOKEN_LEN };
+        oc_invite_created ic = { tok, r->role, r->session_expiry };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_invite_created(&w, OC_PROTOCOL_VERSION, &ic);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_INVITE_ERR:
+    case OC_RES_SETROLE_ERR:
+    case OC_RES_USER_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("admin op rejected") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_SETROLE_OK: {
+        /* Ack the actor and push the new role to the affected user's live conns
+         * (so their client updates its capabilities immediately). */
+        oc_user_updated m = { r->user_id, r->role, 0 };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_user_updated(&w, OC_PROTOCOL_VERSION, &m);
+        size_t len = w.len;
+        conn *actor = find_by_id(conns, r->conn_id);
+        if (actor) send_bytes(ep, conns, actor->fd, g_enc, len);
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *t = conns[fd];
+            if (t && t->authed && t->user_id == r->user_id)
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_USER_UPDATED: {
+        /* Removal (disabled=1): ack the actor, notify the removed user's live
+         * connections, then drop them (they cannot re-authenticate). */
+        oc_user_updated m = { r->user_id, r->role, r->disabled };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_user_updated(&w, OC_PROTOCOL_VERSION, &m);
+        size_t len = w.len;
+        conn *actor = find_by_id(conns, r->conn_id);
+        if (actor) send_bytes(ep, conns, actor->fd, g_enc, len);
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *t = conns[fd];
+            if (t && t->authed && t->user_id == r->user_id) {
+                send_bytes(ep, conns, fd, g_enc, len);
+                if (r->disabled && conns[fd]) conn_close(ep, conns, fd);
+            }
+        }
         break;
     }
     case OC_RES_BACKFILL_OK: {

@@ -90,9 +90,17 @@ static const char MIGRATION_0002[] =
     "  consumed_at_ms INTEGER"                             /* null until used; single-use */
     ");";
 
+/* 0003: tenant member removal (REQ-033). A removed member is locked out rather
+ * than deleted, so their authored messages and tombstones keep a valid author.
+ * The flag is checked in every auth path (local/session/oidc). */
+static const char MIGRATION_0003[] =
+    "ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0 "
+    "  CHECK (disabled IN (0,1));";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
+    { 3, MIGRATION_0003 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

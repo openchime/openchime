@@ -439,6 +439,90 @@ static void test_channels_vertical(int port, const uint8_t *pin) {
     client_close(&cc);
 }
 
+/* Tenant admin ops over the wire (REQ-033): an owner mints an invite, a fresh
+ * client redeems it to create + authenticate an account, the owner promotes that
+ * user (SET_ROLE pushes USER_UPDATED to them), lists users, and removes a member
+ * (whose connection is then dropped). */
+static void test_admin_vertical(int port, const uint8_t *pin) {
+    client owner;
+    CHECK(client_open(&owner, port, pin) == 0);
+    CHECK(do_handshake(&owner) == 0);
+    uint64_t uo = 0;
+    CHECK(do_auth(&owner, "alice", "pw-alice", &uo) == 0);   /* alice is owner */
+
+    uint8_t buf[512]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+
+    /* Owner mints a member invite and receives the token. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_invite_user iu = { OC_ROLE_MEMBER };
+    CHECK(oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &iu) == OC_OK);
+    CHECK(send_frame(&owner, buf, w.len) == 0);
+    CHECK(read_frame(&owner, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_INVITE_CREATED);
+    oc_invite_created ic; CHECK(oc_decode_invite_created(&p, &ic) == OC_OK);
+    CHECK(ic.token.len == OC_INVITE_TOKEN_LEN && ic.role == OC_ROLE_MEMBER);
+    uint8_t token[OC_INVITE_TOKEN_LEN]; memcpy(token, ic.token.ptr, OC_INVITE_TOKEN_LEN);
+
+    /* A fresh client redeems the invite: pre-auth account creation -> AUTH_OK. */
+    client nh;
+    CHECK(client_open(&nh, port, pin) == 0);
+    CHECK(do_handshake(&nh) == 0);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_redeem_invite ri = { { token, OC_INVITE_TOKEN_LEN }, oc_slice_str("newhire"), oc_slice_str("nhpw") };
+    CHECK(oc_encode_redeem_invite(&w, OC_PROTOCOL_VERSION, &ri) == OC_OK);
+    CHECK(send_frame(&nh, buf, w.len) == 0);
+    CHECK(read_frame(&nh, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_AUTH_OK);
+    oc_auth_ok ok; CHECK(oc_decode_auth_ok(&p, &ok) == OC_OK);
+    uint64_t unh = ok.user_id;
+    CHECK(unh != 0 && ok.role == OC_ROLE_MEMBER);
+
+    /* Owner promotes the new hire to admin: owner acks, the hire is pushed the
+     * new role on their live connection. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_role sr = { unh, OC_ROLE_ADMIN };
+    CHECK(oc_encode_set_role(&w, OC_PROTOCOL_VERSION, &sr) == OC_OK);
+    CHECK(send_frame(&owner, buf, w.len) == 0);
+    CHECK(read_frame(&owner, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_USER_UPDATED);
+    oc_user_updated uu; CHECK(oc_decode_user_updated(&p, &uu) == OC_OK);
+    CHECK(uu.user_id == unh && uu.role == OC_ROLE_ADMIN);
+    CHECK(read_frame(&nh, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_USER_UPDATED);
+    CHECK(oc_decode_user_updated(&p, &uu) == OC_OK && uu.user_id == unh && uu.role == OC_ROLE_ADMIN);
+
+    /* LIST_USERS returns the roster including the owner. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_list_users(&w, OC_PROTOCOL_VERSION) == OC_OK);
+    CHECK(send_frame(&owner, buf, w.len) == 0);
+    CHECK(read_frame(&owner, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_USER_LIST);
+    oc_user_list_entry ents[64]; uint16_t n = 0;
+    CHECK(oc_decode_user_list(&p, ents, 64, &n) == OC_OK);
+    int saw_owner = 0;
+    for (uint16_t i = 0; i < n && i < 64; i++)
+        if (ents[i].user_id == uo) { saw_owner = 1; CHECK(ents[i].role == OC_ROLE_OWNER); }
+    CHECK(saw_owner == 1);
+
+    /* Owner removes a connected member (bob); bob's connection is dropped. */
+    client bob;
+    CHECK(client_open(&bob, port, pin) == 0);
+    CHECK(do_handshake(&bob) == 0);
+    uint64_t ub = 0;
+    CHECK(do_auth(&bob, "bob", "pw-bob", &ub) == 0);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_remove_user ru = { ub };
+    CHECK(oc_encode_remove_user(&w, OC_PROTOCOL_VERSION, &ru) == OC_OK);
+    CHECK(send_frame(&owner, buf, w.len) == 0);
+    CHECK(read_frame(&owner, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_USER_UPDATED);
+    CHECK(oc_decode_user_updated(&p, &uu) == OC_OK && uu.user_id == ub && uu.disabled == 1);
+    /* bob receives the notice and then the connection closes. */
+    int bob_closed = 0;
+    for (int i = 0; i < 4; i++) {
+        if (read_frame(&bob, &hdr, &p) != 0) { bob_closed = 1; break; }
+    }
+    CHECK(bob_closed == 1);
+
+    client_close(&owner);
+    client_close(&nh);
+    client_close(&bob);
+}
+
 /* LOGOUT over the wire: the daemon revokes the session and drops the
  * connection (REQ-182). */
 static void test_logout_closes(int port, const uint8_t *pin) {
@@ -460,7 +544,7 @@ static void test_logout_closes(int port, const uint8_t *pin) {
 }
 
 int run_netloop_tests(void) {
-    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, logout\n");
+    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, admin, logout\n");
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -495,6 +579,7 @@ int run_netloop_tests(void) {
         test_backfill_reconnect(arg.port, pin);
         test_edit_delete_vertical(arg.port, pin);
         test_channels_vertical(arg.port, pin);
+        test_admin_vertical(arg.port, pin);
         test_logout_closes(arg.port, pin);
     }
 
