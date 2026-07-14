@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t g_stop = 0;
@@ -51,6 +52,17 @@ static char *read_file(const char *path) {
     fclose(f);
     buf[rd] = '\0';
     return buf;
+}
+
+/* Write `data` to `path`, owner-read/write only (key material). Returns 0/-1. */
+static int write_file(const char *path, const char *data) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    size_t len = strlen(data);
+    size_t wr = fwrite(data, 1, len, f);
+    if (fclose(f) != 0 || wr != len) return -1;
+    chmod(path, S_IRUSR | S_IWUSR);
+    return 0;
 }
 
 /* The pinned central public key (AUTH.md §3.4): OC_OIDC_PUBKEY_FILE (a path) or
@@ -187,12 +199,34 @@ int main(void) {
         }
     }
 
+    /* TLS identity (ARCH-10). A persisted cert+key in the DB (ARCH-66b) is
+     * restored to the cert/key files first, so a cold restore-on-boot (ARCH-24)
+     * keeps the same TOFU fingerprint instead of generating a new, pin-breaking
+     * one. If none is stored, the first-run generation below creates one and we
+     * persist it. */
+    char *stored_cert = NULL, *stored_key = NULL;
+    int had_identity = oc_dbwriter_load_identity(db, &stored_cert, &stored_key);
+    if (had_identity &&
+        (write_file(cert_path, stored_cert) != 0 || write_file(key_path, stored_key) != 0)) {
+        fprintf(stderr, "openchimed: warning: could not restore TLS identity to disk\n");
+    }
+    free(stored_cert); free(stored_key);
+
     /* Self-signed cert on first run, reused thereafter (ARCH-10). */
     oc_tls_server tls;
     if (oc_tls_server_init(&tls, cert_path, key_path) != 0) {
         fprintf(stderr, "openchimed: TLS init failed\n");
         oc_dbwriter_stop(db);
         return 1;
+    }
+
+    /* First run (nothing was persisted): capture the just-generated (or
+     * pre-existing on-disk) identity into the DB so a later restore reloads it. */
+    if (!had_identity) {
+        char *cert = read_file(cert_path), *key = read_file(key_path);
+        if (cert && key && !oc_dbwriter_store_identity(db, cert, key))
+            fprintf(stderr, "openchimed: warning: could not persist TLS identity\n");
+        free(cert); free(key);
     }
 
     pthread_t hz;

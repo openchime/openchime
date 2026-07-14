@@ -154,6 +154,19 @@ static const char MIGRATION_0007[] =
     "  PRIMARY KEY (user_id, channel_id)"
     ");";
 
+/* 0008: persist the daemon's self-signed TLS identity (ARCH-66b) so the TOFU
+ * fingerprint (ARCH-10) survives restore-on-boot (ARCH-24). The cert+key live in
+ * the replicated database; on a cold restore the daemon reloads the same
+ * identity instead of generating a new one (which would trip every client's
+ * pin). Single row (id=1). */
+static const char MIGRATION_0008[] =
+    "CREATE TABLE server_identity ("
+    "  id            INTEGER PRIMARY KEY CHECK (id = 1),"
+    "  cert_pem      TEXT NOT NULL,"
+    "  key_pem       TEXT NOT NULL,"
+    "  created_at_ms INTEGER NOT NULL"
+    ");";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -162,6 +175,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 5, MIGRATION_0005 },
     { 6, MIGRATION_0006 },
     { 7, MIGRATION_0007 },
+    { 8, MIGRATION_0008 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

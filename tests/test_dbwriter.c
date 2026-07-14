@@ -50,7 +50,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 7);
+    CHECK(oc_schema_version(db) == 8);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -1221,6 +1221,34 @@ static void test_search(void) {
     cleanup_db(path);
 }
 
+/* Persisted TLS identity (ARCH-66b): store + load round-trips through the DB so
+ * a restore-on-boot keeps the same TOFU cert. */
+static void test_tls_identity(void) {
+    const char *path = "build/test_dbwriter_identity.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    /* Fresh tenant: nothing stored. */
+    char *c = (char *)1, *k = (char *)1;
+    CHECK(oc_dbwriter_load_identity(w, &c, &k) == 0);
+    CHECK(c == NULL && k == NULL);
+
+    /* Store, then load returns the same PEMs. */
+    CHECK(oc_dbwriter_store_identity(w, "CERT-PEM-DATA", "KEY-PEM-DATA") == 1);
+    CHECK(oc_dbwriter_load_identity(w, &c, &k) == 1);
+    CHECK(c && k && strcmp(c, "CERT-PEM-DATA") == 0 && strcmp(k, "KEY-PEM-DATA") == 0);
+    free(c); free(k);
+
+    /* Re-store replaces the single row. */
+    CHECK(oc_dbwriter_store_identity(w, "CERT2", "KEY2") == 1);
+    CHECK(oc_dbwriter_load_identity(w, &c, &k) == 1 && strcmp(c, "CERT2") == 0);
+    free(c); free(k);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* First-owner setup token (REQ-024): a fresh tenant mints a one-time owner
  * invite; redeeming it creates the owner; afterward none is minted. */
 static void test_setup_invite(void) {
@@ -1361,6 +1389,7 @@ int run_dbwriter_tests(void) {
     test_threads();
     test_search();
     test_setup_invite();
+    test_tls_identity();
     test_delivery_cursor();
     test_idem_pruning();
     test_backfill();

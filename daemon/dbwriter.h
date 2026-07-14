@@ -33,7 +33,8 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_LIST_USERS = 15, OC_JOB_INVITE_USER = 16, OC_JOB_REMOVE_USER = 17,
        OC_JOB_REDEEM = 18, OC_JOB_REACT = 19, OC_JOB_LIST_REACTIONS = 20,
        OC_JOB_SEND_REPLY = 21, OC_JOB_LIST_THREAD = 22, OC_JOB_SEARCH = 23,
-       OC_JOB_SETUP_INVITE = 24, OC_JOB_CLIENT_ACK = 25 };
+       OC_JOB_SETUP_INVITE = 24, OC_JOB_CLIENT_ACK = 25,
+       OC_JOB_LOAD_IDENTITY = 26, OC_JOB_STORE_IDENTITY = 27 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -63,6 +64,10 @@ typedef struct oc_job {
     /* CREATE_CHANNEL */
     char          *ch_name;    /* heap */
     uint8_t        ch_is_public;
+
+    /* STORE_IDENTITY (persist the TLS cert+key PEM) */
+    char          *cert_pem;   /* heap */
+    char          *key_pem;    /* heap */
 
     /* REACT (channel_id + message_id above); emoji is heap, op is add/remove. */
     char          *emoji;      /* heap */
@@ -103,7 +108,7 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_USER_UPDATED = 22, OC_RES_USER_ERR = 23,
        OC_RES_REACTION_OK = 24, OC_RES_REACTION_ERR = 25, OC_RES_REACTIONS = 26,
        OC_RES_REPLY_OK = 27, OC_RES_REPLY_ERR = 28, OC_RES_THREAD = 29,
-       OC_RES_SEARCH = 30 };
+       OC_RES_SEARCH = 30, OC_RES_IDENTITY = 31, OC_RES_OK = 32 };
 
 /* One row in a REACTIONS result (a distinct emoji + one reacting user). */
 typedef struct { char *emoji; uint64_t user_id; } oc_reaction_row;
@@ -206,6 +211,10 @@ typedef struct oc_dbres {
      * holding the FTS snippet. */
     oc_replay_msg  *search;
     size_t          n_search;
+
+    /* IDENTITY (load): the stored TLS cert+key PEM, or NULL if none. */
+    char           *cert_pem;
+    char           *key_pem;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;
@@ -256,6 +265,12 @@ uint64_t oc_dbwriter_register_local(oc_dbwriter *w, const char *username,
  * owner invite and return its raw token in `token_out` (returns 1); returns 0
  * if an owner already exists. Setup-time only (drains one result). */
 int oc_dbwriter_setup_invite(oc_dbwriter *w, uint8_t token_out[OC_INVITE_TOKEN_LEN]);
+
+/* Persisted TLS identity (ARCH-66b) so the TOFU cert survives restore-on-boot.
+ * load returns 1 + heap cert/key PEM (caller frees) if stored, else 0; store
+ * returns 1 on success. Setup-time only (each drains one result). */
+int oc_dbwriter_load_identity(oc_dbwriter *w, char **cert_out, char **key_out);
+int oc_dbwriter_store_identity(oc_dbwriter *w, const char *cert_pem, const char *key_pem);
 
 /* Hand a job to the writer (transfers ownership; the writer frees it). */
 void       oc_dbwriter_submit(oc_dbwriter *w, oc_job *j);

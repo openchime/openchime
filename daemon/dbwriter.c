@@ -122,6 +122,8 @@ static void job_free(oc_job *j) {
     free(j->cursors);
     free(j->ch_name);
     free(j->emoji);
+    free(j->cert_pem);
+    free(j->key_pem);
     free(j);
 }
 
@@ -143,6 +145,8 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->thread);
     for (size_t i = 0; i < r->n_search; i++) free(r->search[i].body);
     free(r->search);
+    free(r->cert_pem);
+    free(r->key_pem);
     free(r);
 }
 
@@ -762,6 +766,42 @@ static oc_dbres *process_redeem(sqlite3 *db, const oc_job *j) {
     memcpy(r->session_token, token, sizeof token);
     r->has_session_token = 1;
     r->session_expiry = sexp;
+    return r;
+}
+
+/* Load the persisted TLS identity (ARCH-66b); result cert_pem/key_pem are NULL
+ * when none is stored yet (first run). */
+static oc_dbres *process_load_identity(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_IDENTITY;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT cert_pem, key_pem FROM server_identity WHERE id=1;", -1, &st, NULL);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        r->cert_pem = strdup((const char *)sqlite3_column_text(st, 0));
+        r->key_pem  = strdup((const char *)sqlite3_column_text(st, 1));
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* Persist the TLS identity so restore-on-boot keeps the same TOFU cert. */
+static oc_dbres *process_store_identity(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT OR REPLACE INTO server_identity(id,cert_pem,key_pem,created_at_ms) "
+        "VALUES(1,?,?,?);", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, j->cert_pem ? j->cert_pem : "", -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, j->key_pem ? j->key_pem : "", -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc == SQLITE_DONE) r->type = OC_RES_OK;
+    else { r->err_code = OC_ERR_INTERNAL; }
     return r;
 }
 
@@ -1735,6 +1775,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SEND_REPLY)     return process_send_reply(w->db, j);
     if (j->type == OC_JOB_SETUP_INVITE)   return process_setup_invite(w->db, j);
     if (j->type == OC_JOB_CLIENT_ACK)     return process_client_ack(w->db, j);
+    if (j->type == OC_JOB_LOAD_IDENTITY)  return process_load_identity(w->db, j);
+    if (j->type == OC_JOB_STORE_IDENTITY) return process_store_identity(w->db, j);
     return NULL;
 }
 
@@ -1890,6 +1932,52 @@ int oc_dbwriter_setup_invite(oc_dbwriter *w, uint8_t token_out[OC_INVITE_TOKEN_L
             }
             oc_dbres_free(r);
             return minted;
+        }
+        usleep(1000);
+    }
+    return 0;
+}
+
+/* Load the persisted TLS identity (ARCH-66b). Returns 1 and heap-allocates the
+ * cert/key PEM into the out params (caller frees) if one is stored, else 0.
+ * Setup-time only. */
+int oc_dbwriter_load_identity(oc_dbwriter *w, char **cert_out, char **key_out) {
+    *cert_out = NULL; *key_out = NULL;
+    oc_job *j = oc_job_new(OC_JOB_LOAD_IDENTITY, 0);
+    if (!j) return 0;
+    oc_dbwriter_submit(w, j);
+    for (int i = 0; i < 3000; i++) {
+        oc_dbres *r = oc_dbwriter_next_result(w);
+        if (r) {
+            int have = 0;
+            if (r->type == OC_RES_IDENTITY && r->cert_pem && r->key_pem) {
+                *cert_out = strdup(r->cert_pem);
+                *key_out  = strdup(r->key_pem);
+                have = (*cert_out && *key_out);
+            }
+            oc_dbres_free(r);
+            return have;
+        }
+        usleep(1000);
+    }
+    return 0;
+}
+
+/* Persist the TLS identity so it survives restore-on-boot. Returns 1 on success.
+ * Setup-time only. */
+int oc_dbwriter_store_identity(oc_dbwriter *w, const char *cert_pem, const char *key_pem) {
+    oc_job *j = oc_job_new(OC_JOB_STORE_IDENTITY, 0);
+    if (!j) return 0;
+    j->cert_pem = strdup(cert_pem);
+    j->key_pem  = strdup(key_pem);
+    if (!j->cert_pem || !j->key_pem) { job_free(j); return 0; }
+    oc_dbwriter_submit(w, j);
+    for (int i = 0; i < 3000; i++) {
+        oc_dbres *r = oc_dbwriter_next_result(w);
+        if (r) {
+            int ok = (r->type == OC_RES_OK);
+            oc_dbres_free(r);
+            return ok;
         }
         usleep(1000);
     }
