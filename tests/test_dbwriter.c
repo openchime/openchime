@@ -50,7 +50,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 6);
+    CHECK(oc_schema_version(db) == 7);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -1285,6 +1285,66 @@ static void test_idem_pruning(void) {
     cleanup_db(path);
 }
 
+/* Server-side delivery accounting (REQ-090): CLIENT_ACK advances a per-(user,
+ * channel) cursor, and a cursorless (count=0) backfill resumes each member
+ * channel from that cursor. */
+static void client_ack(oc_dbwriter *w, uint64_t uid, uint64_t channel, uint64_t mid) {
+    oc_job *j = oc_job_new(OC_JOB_CLIENT_ACK, 1);
+    j->user_id = uid; j->channel_id = channel; j->message_id = mid;
+    oc_dbwriter_submit(w, j);   /* fire-and-forget: CLIENT_ACK has no result */
+}
+
+static oc_dbres *backfill0(oc_dbwriter *w, uint64_t uid) {
+    oc_job *j = oc_job_new(OC_JOB_BACKFILL, 1);   /* n_cursors = 0 */
+    j->user_id = uid;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_delivery_cursor(void) {
+    const char *path = "build/test_dbwriter_delivery.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t alice = reg(w, "dc-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "dc-bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 1, sizeof idem); uint64_t m1 = send_msg(w, alice, idem, "one");
+    memset(idem, 2, sizeof idem); uint64_t m2 = send_msg(w, alice, idem, "two");
+    memset(idem, 3, sizeof idem); uint64_t m3 = send_msg(w, alice, idem, "three");
+    CHECK(m1 && m2 > m1 && m3 > m2);
+
+    /* No prior ack: a cursorless backfill replays the whole channel from 0. */
+    oc_dbres *r = backfill0(w, bob);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK && r->n_replay == 3);
+    oc_dbres_free(r);
+
+    /* bob acks m2; a synchronous send afterwards flushes the writer past the
+     * ack (FIFO), so the reader sees the committed cursor. */
+    client_ack(w, bob, OC_DEFAULT_CHANNEL, m2);
+    memset(idem, 4, sizeof idem); uint64_t m4 = send_msg(w, alice, idem, "four");
+    CHECK(m4 > m3);
+
+    /* Now a cursorless backfill resumes after m2 -> only m3 and m4. */
+    r = backfill0(w, bob);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK && r->n_replay == 2);
+    CHECK(r->replay[0].message_id == m3 && r->replay[1].message_id == m4);
+    oc_dbres_free(r);
+
+    /* The cursor only advances: acking an older id does not rewind it. */
+    client_ack(w, bob, OC_DEFAULT_CHANNEL, m1);
+    memset(idem, 5, sizeof idem); (void)send_msg(w, alice, idem, "five");   /* barrier */
+    r = backfill0(w, bob);
+    CHECK(r && r->n_replay == 3);   /* still resuming after m2: m3, m4, m5 */
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill\n");
     test_start_migrates_and_stops();
@@ -1301,6 +1361,7 @@ int run_dbwriter_tests(void) {
     test_threads();
     test_search();
     test_setup_invite();
+    test_delivery_cursor();
     test_idem_pruning();
     test_backfill();
     return failures;

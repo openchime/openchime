@@ -1568,8 +1568,29 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Record a client's cumulative delivery cursor (REQ-090). CLIENT_ACK(N) means
+ * everything <= N in the channel has been received; the stored cursor only ever
+ * advances. No client response. */
+static oc_dbres *process_client_ack(sqlite3 *db, const oc_job *j) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO delivery_cursors(user_id,channel_id,message_id,updated_at_ms) "
+        "VALUES(?,?,?,?) ON CONFLICT(user_id,channel_id) DO UPDATE SET "
+        "message_id=MAX(message_id,excluded.message_id), updated_at_ms=excluded.updated_at_ms;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->message_id);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    return NULL;   /* CLIENT_ACK has no reply */
+}
+
 /* Replay messages newer than each cursor, for channels the user belongs to,
- * bounded by OC_BACKFILL_MAX total (REQ-101, PROTOCOL.md §6). */
+ * bounded by OC_BACKFILL_MAX total (REQ-101, PROTOCOL.md §6). A request with no
+ * cursors (count=0) resumes every member channel from the server's stored
+ * delivery cursor (REQ-090) — 0 for a fresh client, else its last ack. */
 static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -1585,8 +1606,32 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
     oc_replay_msg *arr = malloc(cap * sizeof *arr);
     if (!arr) return r;
 
-    for (size_t ci = 0; ci < j->n_cursors && n < OC_BACKFILL_MAX; ci++) {
-        uint64_t ch = j->cursors[ci].channel_id;
+    /* Effective cursors: the client's explicit list, or — when it sent none —
+     * every member channel resumed from the stored delivery cursor (REQ-090):
+     * 0 for a fresh client, else its last ack. */
+    const oc_bf_cursor *curs = j->cursors;
+    size_t ncurs = j->n_cursors;
+    oc_bf_cursor *derived = NULL;
+    if (ncurs == 0) {
+        sqlite3_prepare_v2(db,
+            "SELECT cm.channel_id, COALESCE(dc.message_id,0) FROM channel_members cm "
+            "LEFT JOIN delivery_cursors dc ON dc.user_id=cm.user_id AND dc.channel_id=cm.channel_id "
+            "WHERE cm.user_id=? ORDER BY cm.channel_id;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        size_t dcap = 8, dn = 0;
+        derived = malloc(dcap * sizeof *derived);
+        while (derived && sqlite3_step(st) == SQLITE_ROW) {
+            if (dn == dcap) { dcap *= 2; oc_bf_cursor *g = realloc(derived, dcap * sizeof *derived); if (!g) break; derived = g; }
+            derived[dn].channel_id = (uint64_t)sqlite3_column_int64(st, 0);
+            derived[dn].after_message_id = (uint64_t)sqlite3_column_int64(st, 1);
+            dn++;
+        }
+        sqlite3_finalize(st);
+        curs = derived; ncurs = dn;
+    }
+
+    for (size_t ci = 0; ci < ncurs && n < OC_BACKFILL_MAX; ci++) {
+        uint64_t ch = curs[ci].channel_id;
         if (!channel_read_access(db, ch, j->user_id)) continue;
 
         /* Only top-level messages are replayed to the main scroll (REQ-060);
@@ -1600,7 +1645,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             "FROM messages m WHERE m.channel_id=? AND m.id>? AND m.parent_id IS NULL "
             "ORDER BY m.id LIMIT ?;", -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)ch);
-        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->cursors[ci].after_message_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)curs[ci].after_message_id);
         sqlite3_bind_int64(st, 3, (sqlite3_int64)(OC_BACKFILL_MAX - n));
         while (sqlite3_step(st) == SQLITE_ROW && n < OC_BACKFILL_MAX) {
             if (n == cap) {
@@ -1627,6 +1672,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
         }
         sqlite3_finalize(st);
     }
+    free(derived);
     r->replay = arr;
     r->n_replay = n;
     return r;
@@ -1685,6 +1731,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_REACT)          return process_react(w->db, j);
     if (j->type == OC_JOB_SEND_REPLY)     return process_send_reply(w->db, j);
     if (j->type == OC_JOB_SETUP_INVITE)   return process_setup_invite(w->db, j);
+    if (j->type == OC_JOB_CLIENT_ACK)     return process_client_ack(w->db, j);
     return NULL;
 }
 

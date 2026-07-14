@@ -33,7 +33,7 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_LIST_USERS = 15, OC_JOB_INVITE_USER = 16, OC_JOB_REMOVE_USER = 17,
        OC_JOB_REDEEM = 18, OC_JOB_REACT = 19, OC_JOB_LIST_REACTIONS = 20,
        OC_JOB_SEND_REPLY = 21, OC_JOB_LIST_THREAD = 22, OC_JOB_SEARCH = 23,
-       OC_JOB_SETUP_INVITE = 24 };
+       OC_JOB_SETUP_INVITE = 24, OC_JOB_CLIENT_ACK = 25 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;

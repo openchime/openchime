@@ -489,7 +489,14 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
         }
         if (hdr.msg_type == OC_MSG_CLIENT_ACK) {
             oc_client_ack ca;
-            oc_decode_client_ack(&p, &ca); /* accepted; the client drives backfill via its own cursors */
+            if (oc_decode_client_ack(&p, &ca) != OC_OK) return -1;
+            /* Record the delivery cursor (REQ-090); no reply. */
+            oc_job *j = oc_job_new(OC_JOB_CLIENT_ACK, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = ca.channel_id;
+            j->message_id = ca.message_id;
+            oc_dbwriter_submit(dbw, j);
             continue;
         }
         if (hdr.msg_type == OC_MSG_LOGOUT) {

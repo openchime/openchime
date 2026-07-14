@@ -141,6 +141,19 @@ static const char MIGRATION_0006[] =
     "  INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);"
     "END;";
 
+/* 0007: server-side delivery accounting (REQ-090). A per-(user, channel) cursor
+ * of the highest contiguously-acked message id (CLIENT_ACK). Lets the daemon
+ * catch a returning client up from where it left off when it backfills without
+ * supplying its own cursors, and records at-least-once delivery state. */
+static const char MIGRATION_0007[] =
+    "CREATE TABLE delivery_cursors ("
+    "  user_id       INTEGER NOT NULL REFERENCES users(id),"
+    "  channel_id    INTEGER NOT NULL REFERENCES channels(id),"
+    "  message_id    INTEGER NOT NULL,"           /* highest cumulatively acked */
+    "  updated_at_ms INTEGER NOT NULL,"
+    "  PRIMARY KEY (user_id, channel_id)"
+    ");";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -148,6 +161,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 4, MIGRATION_0004 },
     { 5, MIGRATION_0005 },
     { 6, MIGRATION_0006 },
+    { 7, MIGRATION_0007 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 
