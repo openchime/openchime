@@ -302,6 +302,43 @@ oc_result oc_encode_client_ack(oc_wbuf *w, uint16_t version, const oc_client_ack
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_edit(oc_wbuf *w, uint16_t version, const oc_edit *m) {
+    OC_CHECK_BODY(m->body);
+    size_t off = oc_frame_begin(w, version, OC_MSG_EDIT);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->message_id);
+    oc_w_lstr(w, m->body);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_delete(oc_wbuf *w, uint16_t version, const oc_delete *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_DELETE);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->message_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_msg_edited(oc_wbuf *w, uint16_t version, const oc_msg_edited *m) {
+    OC_CHECK_BODY(m->body);
+    size_t off = oc_frame_begin(w, version, OC_MSG_MSG_EDITED);
+    oc_w_u64(w, m->message_id);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->author_id);
+    oc_w_u64(w, m->edited_at);
+    oc_w_lstr(w, m->body);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_msg_deleted(oc_wbuf *w, uint16_t version, const oc_msg_deleted *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_MSG_DELETED);
+    oc_w_u64(w, m->message_id);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->author_id);
+    oc_w_u64(w, m->deleted_by);
+    oc_w_u64(w, m->deleted_at);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_backfill_request(oc_wbuf *w, uint16_t version, const oc_backfill_request *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_BACKFILL_REQUEST);
     oc_w_u16(w, m->count);
@@ -401,6 +438,37 @@ oc_result oc_decode_broadcast(oc_rbuf *p, oc_broadcast *m) {
 oc_result oc_decode_client_ack(oc_rbuf *p, oc_client_ack *m) {
     m->channel_id = oc_r_u64(p);
     m->message_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_edit(oc_rbuf *p, oc_edit *m) {
+    m->channel_id = oc_r_u64(p);
+    m->message_id = oc_r_u64(p);
+    m->body = oc_r_lstr(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_delete(oc_rbuf *p, oc_delete *m) {
+    m->channel_id = oc_r_u64(p);
+    m->message_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_msg_edited(oc_rbuf *p, oc_msg_edited *m) {
+    m->message_id = oc_r_u64(p);
+    m->channel_id = oc_r_u64(p);
+    m->author_id = oc_r_u64(p);
+    m->edited_at = oc_r_u64(p);
+    m->body = oc_r_lstr(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_msg_deleted(oc_rbuf *p, oc_msg_deleted *m) {
+    m->message_id = oc_r_u64(p);
+    m->channel_id = oc_r_u64(p);
+    m->author_id = oc_r_u64(p);
+    m->deleted_by = oc_r_u64(p);
+    m->deleted_at = oc_r_u64(p);
     return r_done(p);
 }
 

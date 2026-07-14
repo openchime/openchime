@@ -27,7 +27,7 @@
 /* --- Jobs (net thread -> writer) ---------------------------------------- */
 
 enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 4,
-       OC_JOB_SET_ROLE = 5, OC_JOB_LOGOUT = 6 };
+       OC_JOB_SET_ROLE = 5, OC_JOB_LOGOUT = 6, OC_JOB_EDIT = 7, OC_JOB_DELETE = 8 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -57,10 +57,11 @@ typedef struct oc_job {
      * (scope THIS) is carried in `token`/`token_len`. */
     uint8_t        scope;     /* OC_LOGOUT_THIS / OC_LOGOUT_ALL */
 
-    /* SEND */
+    /* SEND / EDIT / DELETE */
     uint64_t       channel_id;
+    uint64_t       message_id; /* target message for EDIT / DELETE */
     uint8_t        idem[OC_IDEM_LEN];
-    uint8_t       *body;      /* heap */
+    uint8_t       *body;      /* heap (SEND / EDIT new body) */
     size_t         body_len;
 
     /* BACKFILL */
@@ -74,7 +75,9 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_SEND_ERR = 4, OC_RES_BACKFILL_OK = 5,
        OC_RES_REGISTER_OK = 6, OC_RES_REGISTER_ERR = 7,
        OC_RES_SETROLE_OK = 8, OC_RES_SETROLE_ERR = 9,
-       OC_RES_LOGOUT_OK = 10, OC_RES_LOGOUT_ERR = 11 };
+       OC_RES_LOGOUT_OK = 10, OC_RES_LOGOUT_ERR = 11,
+       OC_RES_EDIT_OK = 12, OC_RES_EDIT_ERR = 13,
+       OC_RES_DELETE_OK = 14, OC_RES_DELETE_ERR = 15 };
 
 /* One message to replay on reconnect (rendered as a BROADCAST by the net thread). */
 typedef struct {

@@ -509,6 +509,107 @@ static void test_role_enforcement(void) {
     cleanup_db(path);
 }
 
+/* Submit an EDIT job; caller frees the returned result. */
+static oc_dbres *do_edit(oc_dbwriter *w, uint64_t uid, uint64_t channel,
+                         uint64_t mid, const char *body) {
+    oc_job *j = oc_job_new(OC_JOB_EDIT, 50);
+    j->user_id = uid; j->channel_id = channel; j->message_id = mid;
+    oc_job_set_body(j, body, strlen(body));
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+/* Submit a DELETE job; caller frees the returned result. */
+static oc_dbres *do_delete(oc_dbwriter *w, uint64_t uid, uint64_t channel, uint64_t mid) {
+    oc_job *j = oc_job_new(OC_JOB_DELETE, 51);
+    j->user_id = uid; j->channel_id = channel; j->message_id = mid;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+/* Message management (REQ-032/051/052): author-only edit, self- and
+ * moderator-delete tombstones, and the not-found / forbidden gates. */
+static void test_edit_delete(void) {
+    const char *path = "build/test_dbwriter_msgmgmt.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t owner  = reg(w, "md-owner",  "pw", OC_ROLE_OWNER);
+    uint64_t author = reg(w, "md-author", "pw", OC_ROLE_MEMBER);
+    uint64_t other  = reg(w, "md-other",  "pw", OC_ROLE_MEMBER);
+    CHECK(owner && author && other);
+
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0xA1, sizeof idem);
+    uint64_t mid = send_msg(w, author, idem, "original");
+    CHECK(mid != 0);
+
+    /* A non-author may not edit (no moderator edit, REQ-032). */
+    oc_dbres *r = do_edit(w, other, OC_DEFAULT_CHANNEL, mid, "hijacked");
+    CHECK(r && r->type == OC_RES_EDIT_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    /* Editing a message that does not exist is UNKNOWN_MESSAGE. */
+    r = do_edit(w, author, OC_DEFAULT_CHANNEL, 99999, "nope");
+    CHECK(r && r->type == OC_RES_EDIT_ERR && r->err_code == OC_ERR_UNKNOWN_MESSAGE);
+    oc_dbres_free(r);
+
+    /* The author edits: OK, new body echoed, fan-out spans the members. */
+    r = do_edit(w, author, OC_DEFAULT_CHANNEL, mid, "edited body");
+    CHECK(r && r->type == OC_RES_EDIT_OK);
+    CHECK(r->message_id == mid && r->author_id == author);
+    CHECK(r->server_time != 0);   /* edited_at_ms stamped */
+    CHECK(r->body_len == 11 && memcmp(r->body, "edited body", 11) == 0);
+    CHECK(r->n_members == 3);
+    oc_dbres_free(r);
+
+    /* The edit persisted (backfill replays the new body). */
+    r = backfill(w, author, OC_DEFAULT_CHANNEL, mid - 1);
+    CHECK(r && r->n_replay >= 1);
+    CHECK(r->replay[0].message_id == mid);
+    CHECK(r->replay[0].body_len == 11 && memcmp(r->replay[0].body, "edited body", 11) == 0);
+    oc_dbres_free(r);
+
+    /* A non-author, non-moderator member may not delete someone else's message. */
+    r = do_delete(w, other, OC_DEFAULT_CHANNEL, mid);
+    CHECK(r && r->type == OC_RES_DELETE_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    /* The author deletes their own: tombstone, deleted_by == author (REQ-052). */
+    r = do_delete(w, author, OC_DEFAULT_CHANNEL, mid);
+    CHECK(r && r->type == OC_RES_DELETE_OK);
+    CHECK(r->message_id == mid && r->author_id == author && r->user_id == author);
+    CHECK(r->n_members == 3);
+    oc_dbres_free(r);
+
+    /* A tombstoned message is no longer editable, and re-delete is a no-op error. */
+    r = do_edit(w, author, OC_DEFAULT_CHANNEL, mid, "resurrect");
+    CHECK(r && r->type == OC_RES_EDIT_ERR && r->err_code == OC_ERR_UNKNOWN_MESSAGE);
+    oc_dbres_free(r);
+    r = do_delete(w, author, OC_DEFAULT_CHANNEL, mid);
+    CHECK(r && r->type == OC_RES_DELETE_ERR && r->err_code == OC_ERR_UNKNOWN_MESSAGE);
+    oc_dbres_free(r);
+
+    /* Tombstone survives replay with an empty body (thread linkage preserved). */
+    r = backfill(w, author, OC_DEFAULT_CHANNEL, mid - 1);
+    CHECK(r && r->n_replay >= 1 && r->replay[0].message_id == mid);
+    CHECK(r->replay[0].body_len == 0);
+    oc_dbres_free(r);
+
+    /* Moderation: an owner deletes another user's message, deleted_by == owner. */
+    memset(idem, 0xB2, sizeof idem);
+    uint64_t mid2 = send_msg(w, author, idem, "moderate me");
+    CHECK(mid2 != 0);
+    r = do_delete(w, owner, OC_DEFAULT_CHANNEL, mid2);
+    CHECK(r && r->type == OC_RES_DELETE_OK);
+    CHECK(r->author_id == author && r->user_id == owner);   /* self vs moderator */
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill\n");
     test_start_migrates_and_stops();
@@ -518,6 +619,7 @@ int run_dbwriter_tests(void) {
     test_source_rate_limit();
     test_logout();
     test_role_enforcement();
+    test_edit_delete();
     test_backfill();
     return failures;
 }

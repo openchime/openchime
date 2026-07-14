@@ -270,6 +270,86 @@ static void test_backfill_reconnect(int port, const uint8_t *pin) {
     client_close(&c);
 }
 
+/* Edit + delete over the wire (REQ-032/051/052): the author edits, the fan-out
+ * reaches every member, an owner moderator-deletes another user's message, and a
+ * follow-up edit on the tombstone is refused with a non-fatal ERROR. */
+static void test_edit_delete_vertical(int port, const uint8_t *pin) {
+    client a, b;   /* a = owner (moderator), b = author */
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    CHECK(do_handshake(&b) == 0);
+    uint64_t ua = 0, ub = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);   /* owner */
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);        /* member */
+
+    /* bob sends; learn the id from his SEND_ACK, and drain both members' BROADCAST. */
+    uint8_t idem[OC_IDEM_SIZE]; memset(idem, 0x3D, sizeof idem);
+    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s; s.channel_id = 1; memcpy(s.idem, idem, OC_IDEM_SIZE);
+    s.body = oc_slice_str("first draft");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+    CHECK(write_all(&b.conn, buf, w.len) == 0);
+
+    uint64_t mid = 0;
+    for (int i = 0; i < 2; i++) {
+        oc_header hdr; oc_rbuf p; CHECK(read_frame(&b, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) {
+            oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK);
+            mid = ack.message_id;
+        }
+    }
+    CHECK(mid != 0);
+    { oc_header hdr; oc_rbuf p; CHECK(read_frame(&a, &hdr, &p) == 0);
+      CHECK(hdr.msg_type == OC_MSG_BROADCAST); }
+
+    /* bob edits his own message -> both members receive MSG_EDITED, new body. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_edit e = { 1, mid, oc_slice_str("second draft") };
+    CHECK(oc_encode_edit(&w, OC_PROTOCOL_VERSION, &e) == OC_OK);
+    CHECK(write_all(&b.conn, buf, w.len) == 0);
+    for (int who = 0; who < 2; who++) {
+        client *cc = who ? &a : &b;
+        oc_header hdr; oc_rbuf p; CHECK(read_frame(cc, &hdr, &p) == 0);
+        CHECK(hdr.msg_type == OC_MSG_MSG_EDITED);
+        oc_msg_edited m; CHECK(oc_decode_msg_edited(&p, &m) == OC_OK);
+        CHECK(m.message_id == mid && m.author_id == ub);
+        CHECK(m.body.len == 12 && memcmp(m.body.ptr, "second draft", 12) == 0);
+    }
+
+    /* alice (owner) moderator-deletes bob's message -> both get MSG_DELETED with
+     * deleted_by == alice, author == bob (self vs moderator, REQ-032). */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_delete d = { 1, mid };
+    CHECK(oc_encode_delete(&w, OC_PROTOCOL_VERSION, &d) == OC_OK);
+    CHECK(write_all(&a.conn, buf, w.len) == 0);
+    for (int who = 0; who < 2; who++) {
+        client *cc = who ? &a : &b;
+        oc_header hdr; oc_rbuf p; CHECK(read_frame(cc, &hdr, &p) == 0);
+        CHECK(hdr.msg_type == OC_MSG_MSG_DELETED);
+        oc_msg_deleted m; CHECK(oc_decode_msg_deleted(&p, &m) == OC_OK);
+        CHECK(m.message_id == mid && m.author_id == ub && m.deleted_by == ua);
+    }
+
+    /* A follow-up edit on the tombstone is refused with a non-fatal ERROR whose
+     * context echoes the offending message id (8 bytes, big-endian). */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_edit e2 = { 1, mid, oc_slice_str("third") };
+    CHECK(oc_encode_edit(&w, OC_PROTOCOL_VERSION, &e2) == OC_OK);
+    CHECK(write_all(&b.conn, buf, w.len) == 0);
+    { oc_header hdr; oc_rbuf p; CHECK(read_frame(&b, &hdr, &p) == 0);
+      CHECK(hdr.msg_type == OC_MSG_ERROR);
+      oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK);
+      CHECK(er.code == OC_ERR_UNKNOWN_MESSAGE && er.fatal == 0);
+      CHECK(er.context.len == 8);
+      uint64_t ctx = 0; for (int i = 0; i < 8; i++) ctx = (ctx << 8) | er.context.ptr[i];
+      CHECK(ctx == mid);
+    }
+
+    client_close(&a);
+    client_close(&b);
+}
+
 /* LOGOUT over the wire: the daemon revokes the session and drops the
  * connection (REQ-182). */
 static void test_logout_closes(int port, const uint8_t *pin) {
@@ -291,7 +371,7 @@ static void test_logout_closes(int port, const uint8_t *pin) {
 }
 
 int run_netloop_tests(void) {
-    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, logout\n");
+    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, logout\n");
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -323,6 +403,7 @@ int run_netloop_tests(void) {
         test_version_reject(arg.port, pin);
         test_message_vertical(arg.port, pin);
         test_backfill_reconnect(arg.port, pin);
+        test_edit_delete_vertical(arg.port, pin);
         test_logout_closes(arg.port, pin);
     }
 

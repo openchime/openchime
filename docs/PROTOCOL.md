@@ -8,7 +8,8 @@ resolves the protocol-shaped `[needs ARCH decision]` items in
 
 **Scope of this revision.** This covers the *core messaging path* only:
 connection handshake and version negotiation, authentication, the message
-send/broadcast/ack cycle, reconnect backfill, and the error frame. Presence
+send/broadcast/ack cycle, message edit/delete (§5.5/5.6), reconnect backfill,
+and the error frame. Presence
 (REQ-120/121), typing indicators, reactions (REQ-070/071), threads
 (REQ-060/061), notification configuration, and audio-call signaling
 (REQ-150–152) are deliberately out of scope here and will be added in later
@@ -281,7 +282,7 @@ continue).
 
 ---
 
-## 5. Messaging (REQ-050, REQ-090, REQ-092, REQ-093)
+## 5. Messaging (REQ-050, REQ-090, REQ-092, REQ-093; edit/delete REQ-051/052/032)
 
 ### 5.1 `SEND` (client → server), msg_type `0x0020`
 
@@ -356,6 +357,65 @@ Client                                  Server
   | <--- BROADCAST(id, ch, ...) ------- |  (to every member, incl. sender)
   | ---- CLIENT_ACK(ch, id) ----------> |  advance delivery cursor
 ```
+
+### 5.5 Editing a message (REQ-051)
+
+A user may edit **their own** message; there is no moderator edit (REQ-032). The
+edit replaces the body and stamps `edited_at_ms`, keeping the original
+`message_id`, `created_at_ms`, and position in history.
+
+**`EDIT` (client → server), msg_type `0x0024`:**
+
+| Field        | Type | Notes                                             |
+|--------------|------|---------------------------------------------------|
+| `channel_id` | u64  | Channel the message belongs to.                   |
+| `message_id` | u64  | The message to edit.                              |
+| `body`       | lstr | Replacement body, `<= MAX_BODY_SIZE` (REQ-054).   |
+
+On success the daemon fans a **`MSG_EDITED` (server → client), msg_type
+`0x0026`** out to every connected member of the channel — including the editor,
+whose copy doubles as the acknowledgement:
+
+| Field        | Type | Notes                                            |
+|--------------|------|--------------------------------------------------|
+| `message_id` | u64  | The edited message (the client's dedup key).     |
+| `channel_id` | u64  | Channel the message belongs to.                  |
+| `author_id`  | u64  | The message's author.                            |
+| `edited_at`  | u64  | Server edit time, ms since epoch UTC (REQ-051).  |
+| `body`       | lstr | The new body (§7).                               |
+
+### 5.6 Deleting a message (REQ-052, REQ-032)
+
+Deletion is a **tombstone**, not a row removal: the body is nulled while
+`message_id`, `author_id`, and timestamps survive, so thread links and reply
+counts do not break (REQ-052). A user may delete **their own** message; an
+**admin or owner who belongs to the channel** may delete **any** message in it
+for moderation (REQ-032). `deleted_by` records who removed it, distinguishing a
+self-delete from a moderator delete.
+
+**`DELETE` (client → server), msg_type `0x0025`:**
+
+| Field        | Type | Notes                                             |
+|--------------|------|---------------------------------------------------|
+| `channel_id` | u64  | Channel the message belongs to.                   |
+| `message_id` | u64  | The message to delete.                            |
+
+On success the daemon fans a **`MSG_DELETED` (server → client), msg_type
+`0x0027`** out to every connected member:
+
+| Field         | Type | Notes                                           |
+|---------------|------|-------------------------------------------------|
+| `message_id`  | u64  | The tombstoned message.                         |
+| `channel_id`  | u64  | Channel the message belongs to.                 |
+| `author_id`   | u64  | The message's original author.                  |
+| `deleted_by`  | u64  | Who deleted it — the author (self) or a moderator (REQ-032). |
+| `deleted_at`  | u64  | Server delete time, ms since epoch UTC.         |
+
+Errors for both `EDIT` and `DELETE` are non-fatal `ERROR` frames carrying the
+offending `message_id` (8 bytes, big-endian) in `context` so the client can
+correlate: `UNKNOWN_MESSAGE` (no such message in the channel, or it is already
+tombstoned) or `FORBIDDEN` (not the author — and, for delete, neither the author
+nor a channel moderator who belongs to the channel).
 
 ---
 
@@ -459,8 +519,9 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3002` | `NOT_A_MEMBER`        | messaging  | no    | Sender is not a member of the target channel (REQ-031).        |
 | `3003` | `UNKNOWN_CHANNEL`     | messaging  | no    | `channel_id` does not exist in this tenant.                    |
 | `3004` | `SEND_RATE_LIMITED`   | messaging  | no    | Per-connection send rate exceeded (REQ-190).                   |
-| `3005` | `FORBIDDEN`           | admin      | no    | The actor's role may not perform the action (ARCH-60, §6).     |
+| `3005` | `FORBIDDEN`           | admin/msg  | no    | The actor may not perform the action — role (ARCH-60, §6) or not the message's author (§5.5/5.6). |
 | `3006` | `LAST_OWNER`          | admin      | no    | Would remove or demote the tenant's last owner (REQ-030).      |
+| `3007` | `UNKNOWN_MESSAGE`     | messaging  | no    | `EDIT`/`DELETE` names a message not in the channel, or already tombstoned (§5.5/5.6). |
 | `9001` | `INTERNAL_ERROR`      | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage version codes (`1001`/`1002`) are delivered via `REJECT`, which
@@ -488,6 +549,10 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0021` | `SEND_ACK`         | S → C     | no        | §5.2    |
 | `0x0022` | `BROADCAST`        | S → C     | no        | §5.3    |
 | `0x0023` | `CLIENT_ACK`       | C → S     | no        | §5.4    |
+| `0x0024` | `EDIT`             | C → S     | no        | §5.5    |
+| `0x0025` | `DELETE`           | C → S     | no        | §5.6    |
+| `0x0026` | `MSG_EDITED`       | S → C     | no        | §5.5    |
+| `0x0027` | `MSG_DELETED`      | S → C     | no        | §5.6    |
 | `0x0030` | `BACKFILL_REQUEST` | C → S     | no        | §6.1    |
 | `0x0031` | `BACKFILL_DONE`    | S → C     | no        | §6.2    |
 | `0x00FF` | `ERROR`            | S → C     | no        | §8.1    |

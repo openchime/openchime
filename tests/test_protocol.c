@@ -183,6 +183,38 @@ static void test_messaging_frames(void) {
         CHECK(oc_decode_client_ack(&p, &out) == OC_OK);
         CHECK(out.channel_id == 7 && out.message_id == 1001);
     }
+    {
+        oc_edit in = { 7, 1001, oc_slice_str("edited body") };
+        ROUNDTRIP(oc_encode_edit(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_EDIT, h, p);
+        oc_edit out;
+        CHECK(oc_decode_edit(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.message_id == 1001);
+        CHECK(slice_eq_str(out.body, "edited body"));
+    }
+    {
+        oc_delete in = { 7, 1001 };
+        ROUNDTRIP(oc_encode_delete(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DELETE, h, p);
+        oc_delete out;
+        CHECK(oc_decode_delete(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.message_id == 1001);
+    }
+    {
+        oc_msg_edited in = { 1001, 7, 42, 1751200500000ull, oc_slice_str("edited body") };
+        ROUNDTRIP(oc_encode_msg_edited(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MSG_EDITED, h, p);
+        oc_msg_edited out;
+        CHECK(oc_decode_msg_edited(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1001 && out.channel_id == 7 && out.author_id == 42);
+        CHECK(out.edited_at == 1751200500000ull);
+        CHECK(slice_eq_str(out.body, "edited body"));
+    }
+    {
+        oc_msg_deleted in = { 1001, 7, 42, 9, 1751200500000ull };
+        ROUNDTRIP(oc_encode_msg_deleted(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MSG_DELETED, h, p);
+        oc_msg_deleted out;
+        CHECK(oc_decode_msg_deleted(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1001 && out.channel_id == 7 && out.author_id == 42);
+        CHECK(out.deleted_by == 9 && out.deleted_at == 1751200500000ull);
+    }
 }
 
 static void test_backfill_and_error(void) {

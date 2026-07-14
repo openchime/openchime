@@ -240,6 +240,29 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_EDIT) {
+            oc_edit e;
+            if (oc_decode_edit(&p, &e) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_EDIT, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = e.channel_id;
+            j->message_id = e.message_id;
+            if (oc_job_set_body(j, e.body.ptr, e.body.len) != 0) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_DELETE) {
+            oc_delete d;
+            if (oc_decode_delete(&p, &d) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_DELETE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = d.channel_id;
+            j->message_id = d.message_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_CLIENT_ACK) {
             oc_client_ack ca;
             oc_decode_client_ack(&p, &ca); /* accepted; the client drives backfill via its own cursors */
@@ -363,6 +386,48 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_slice ctx = { r->idem, OC_IDEM_LEN };
         oc_error e = { r->err_code, 0, ctx, oc_slice_str("send rejected") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_EDIT_OK: {
+        /* Fan the edit out to every connected member (including the editor, whose
+         * frame doubles as the confirmation) — same shape as a BROADCAST. */
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice body = { r->body, r->body_len };
+        oc_msg_edited m = { r->message_id, r->channel_id, r->author_id, r->server_time, body };
+        oc_encode_msg_edited(&w, OC_PROTOCOL_VERSION, &m);
+        size_t blen = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
+                send_bytes(ep, conns, fd, g_enc, blen);
+        }
+        break;
+    }
+    case OC_RES_DELETE_OK: {
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_msg_deleted m = { r->message_id, r->channel_id, r->author_id, r->user_id, r->server_time };
+        oc_encode_msg_deleted(&w, OC_PROTOCOL_VERSION, &m);
+        size_t blen = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
+                send_bytes(ep, conns, fd, g_enc, blen);
+        }
+        break;
+    }
+    case OC_RES_EDIT_ERR:
+    case OC_RES_DELETE_ERR: {
+        /* Non-fatal: report to the requester with the offending message_id in
+         * `context` (8 bytes, big-endian) so the client can correlate. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        uint8_t ctx[8];
+        for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->message_id >> (56 - 8 * i));
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice cs = { ctx, sizeof ctx };
+        oc_error e = { r->err_code, 0, cs, oc_slice_str("edit/delete rejected") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;

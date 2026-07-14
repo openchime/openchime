@@ -49,6 +49,10 @@ typedef enum {
     OC_MSG_SEND_ACK         = 0x0021, /* S->C */
     OC_MSG_BROADCAST        = 0x0022, /* S->C */
     OC_MSG_CLIENT_ACK       = 0x0023, /* C->S */
+    OC_MSG_EDIT             = 0x0024, /* C->S (REQ-051) */
+    OC_MSG_DELETE           = 0x0025, /* C->S (REQ-052) */
+    OC_MSG_MSG_EDITED       = 0x0026, /* S->C, edit fan-out */
+    OC_MSG_MSG_DELETED      = 0x0027, /* S->C, tombstone fan-out */
     OC_MSG_BACKFILL_REQUEST = 0x0030, /* C->S */
     OC_MSG_BACKFILL_DONE    = 0x0031, /* S->C */
     OC_MSG_ERROR            = 0x00FF  /* S->C */
@@ -69,8 +73,9 @@ typedef enum {
     OC_ERR_NOT_A_MEMBER        = 3002,
     OC_ERR_UNKNOWN_CHANNEL     = 3003,
     OC_ERR_SEND_RATE_LIMITED   = 3004,
-    OC_ERR_FORBIDDEN           = 3005, /* actor's role may not perform the action */
+    OC_ERR_FORBIDDEN           = 3005, /* actor may not perform the action (role, or not the author) */
     OC_ERR_LAST_OWNER          = 3006, /* would remove/demote the last owner (REQ-030) */
+    OC_ERR_UNKNOWN_MESSAGE     = 3007, /* no such message in the channel (edit/delete) */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 
@@ -192,6 +197,10 @@ typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; oc_slice body;
 typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; uint64_t message_id; uint64_t server_time; } oc_send_ack;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time; oc_slice body; } oc_broadcast;
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_client_ack;
+typedef struct { uint64_t channel_id; uint64_t message_id; oc_slice body; } oc_edit;
+typedef struct { uint64_t channel_id; uint64_t message_id; } oc_delete;
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t edited_at; oc_slice body; } oc_msg_edited;
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t deleted_by; uint64_t deleted_at; } oc_msg_deleted;
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_cursor;
 typedef struct { uint16_t count; const oc_cursor *cursors; } oc_backfill_request;
 typedef struct { uint64_t high_water; } oc_backfill_done;
@@ -215,6 +224,10 @@ oc_result oc_encode_send(oc_wbuf *w, uint16_t version, const oc_send *m);
 oc_result oc_encode_send_ack(oc_wbuf *w, uint16_t version, const oc_send_ack *m);
 oc_result oc_encode_broadcast(oc_wbuf *w, uint16_t version, const oc_broadcast *m);
 oc_result oc_encode_client_ack(oc_wbuf *w, uint16_t version, const oc_client_ack *m);
+oc_result oc_encode_edit(oc_wbuf *w, uint16_t version, const oc_edit *m);
+oc_result oc_encode_delete(oc_wbuf *w, uint16_t version, const oc_delete *m);
+oc_result oc_encode_msg_edited(oc_wbuf *w, uint16_t version, const oc_msg_edited *m);
+oc_result oc_encode_msg_deleted(oc_wbuf *w, uint16_t version, const oc_msg_deleted *m);
 oc_result oc_encode_backfill_request(oc_wbuf *w, uint16_t version, const oc_backfill_request *m);
 oc_result oc_encode_backfill_done(oc_wbuf *w, uint16_t version, const oc_backfill_done *m);
 oc_result oc_encode_error(oc_wbuf *w, uint16_t version, const oc_error *m);
@@ -238,6 +251,10 @@ oc_result oc_decode_send(oc_rbuf *p, oc_send *m);
 oc_result oc_decode_send_ack(oc_rbuf *p, oc_send_ack *m);
 oc_result oc_decode_broadcast(oc_rbuf *p, oc_broadcast *m);
 oc_result oc_decode_client_ack(oc_rbuf *p, oc_client_ack *m);
+oc_result oc_decode_edit(oc_rbuf *p, oc_edit *m);
+oc_result oc_decode_delete(oc_rbuf *p, oc_delete *m);
+oc_result oc_decode_msg_edited(oc_rbuf *p, oc_msg_edited *m);
+oc_result oc_decode_msg_deleted(oc_rbuf *p, oc_msg_deleted *m);
 oc_result oc_decode_backfill_request(oc_rbuf *p, oc_cursor *cursors, uint16_t cap, uint16_t *out_count);
 oc_result oc_decode_backfill_done(oc_rbuf *p, oc_backfill_done *m);
 oc_result oc_decode_error(oc_rbuf *p, oc_error *m);

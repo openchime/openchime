@@ -637,6 +637,111 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Look up a message's author and tombstone state within a channel. Returns 1 if
+ * the (channel_id, message_id) row exists, filling *author and *deleted (1 if
+ * already tombstoned); 0 if there is no such message. */
+static int message_lookup(sqlite3 *db, uint64_t channel_id, uint64_t message_id,
+                          uint64_t *author, int *deleted) {
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    sqlite3_prepare_v2(db,
+        "SELECT author_id, deleted_at_ms FROM messages WHERE id=? AND channel_id=?;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)message_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)channel_id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        *author  = (uint64_t)sqlite3_column_int64(st, 0);
+        *deleted = sqlite3_column_type(st, 1) != SQLITE_NULL;
+        found = 1;
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
+/* Edit one's own message (REQ-051): only the author may edit, the body is
+ * replaced and edited_at_ms is stamped while the original id/created_at/position
+ * are kept. A tombstoned message is no longer editable. */
+static oc_dbres *process_edit(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+    r->message_id = j->message_id;
+
+    uint64_t author = 0; int deleted = 0;
+    if (!message_lookup(db, j->channel_id, j->message_id, &author, &deleted) || deleted) {
+        r->type = OC_RES_EDIT_ERR; r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r;
+    }
+    if (author != j->user_id) {   /* no moderator edit — author only (REQ-032) */
+        r->type = OC_RES_EDIT_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+
+    uint64_t ts = dbw_now_ms();
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "UPDATE messages SET body=?, edited_at_ms=? WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_blob(st, 1, j->body, (int)j->body_len, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)ts);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->message_id);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        r->type = OC_RES_EDIT_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+    }
+
+    r->type = OC_RES_EDIT_OK;
+    r->author_id = author;
+    r->server_time = ts;   /* edited_at_ms */
+    if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
+    load_members(db, j->channel_id, r);
+    return r;
+}
+
+/* Delete a message as a tombstone (REQ-052): the author may delete their own,
+ * and an admin/owner who belongs to the channel may delete any (moderation,
+ * REQ-032). The body is nulled while id/author/timestamps survive; deleted_by
+ * records who removed it, distinguishing a self- from a moderator-delete. */
+static oc_dbres *process_delete(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+    r->message_id = j->message_id;
+
+    uint64_t author = 0; int deleted = 0;
+    if (!message_lookup(db, j->channel_id, j->message_id, &author, &deleted) || deleted) {
+        r->type = OC_RES_DELETE_ERR; r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r;
+    }
+    /* The actor must belong to the channel in every case (REQ-031/032). */
+    if (!is_member(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_DELETE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    if (author != j->user_id && !oc_role_can_moderate(get_role(db, j->user_id))) {
+        r->type = OC_RES_DELETE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+
+    uint64_t ts = dbw_now_ms();
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "UPDATE messages SET body=NULL, deleted_at_ms=?, deleted_by=? WHERE id=?;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)ts);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->message_id);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        r->type = OC_RES_DELETE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+    }
+
+    r->type = OC_RES_DELETE_OK;
+    r->author_id = author;
+    r->user_id = j->user_id;   /* deleted_by */
+    r->server_time = ts;       /* deleted_at_ms */
+    load_members(db, j->channel_id, r);
+    return r;
+}
+
 /* Replay messages newer than each cursor, for channels the user belongs to,
  * bounded by OC_BACKFILL_MAX total (REQ-101, PROTOCOL.md §6). */
 static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
@@ -725,6 +830,8 @@ static void *writer_loop(void *arg) {
         else if (j->type == OC_JOB_REGISTER) r = process_register(w->db, j);
         else if (j->type == OC_JOB_SET_ROLE) r = process_set_role(w->db, j);
         else if (j->type == OC_JOB_LOGOUT)   r = process_logout(w->db, j);
+        else if (j->type == OC_JOB_EDIT)     r = process_edit(w->db, j);
+        else if (j->type == OC_JOB_DELETE)   r = process_delete(w->db, j);
         job_free(j);
         push_result(w, r);
     }
