@@ -872,6 +872,54 @@ static void test_logout_closes(int port, const uint8_t *pin) {
     client_close(&a);
 }
 
+/* Concurrency load (robustness backlog #5): many clients connect, authenticate,
+ * and send at once, exercising the accept path + writer + fan-out under
+ * contention. Each must get an ack for every message it sent — proving the
+ * two-thread (now three-thread) model stays correct and deadlock-free under
+ * concurrent load. */
+struct load_arg { int port; const uint8_t *pin; int tid; int ok; };
+static void *load_client(void *vp) {
+    struct load_arg *a = (struct load_arg *)vp;
+    client c;
+    if (client_open(&c, a->port, a->pin) != 0) return NULL;
+    if (do_handshake(&c) != 0) { client_close(&c); return NULL; }
+    uint64_t uid = 0;
+    if (do_auth(&c, "alice", "pw-alice", &uid) != 0) { client_close(&c); return NULL; }
+
+    const int K = 5;   /* under the 30/3s send rate limit */
+    for (int i = 0; i < K; i++) {
+        uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        oc_send s; s.channel_id = 1;
+        memset(s.idem, 0, OC_IDEM_SIZE);
+        s.idem[0] = (uint8_t)i; s.idem[1] = (uint8_t)a->tid; s.idem[2] = 0xEE; /* globally unique */
+        s.body = oc_slice_str("load");
+        if (oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) != OC_OK) { client_close(&c); return NULL; }
+        if (write_all(&c.conn, buf, w.len) != 0) { client_close(&c); return NULL; }
+    }
+    /* Read until our K acks arrive (draining the interleaved broadcasts). */
+    int acks = 0;
+    for (int i = 0; i < 4000 && acks < K; i++) {
+        oc_header hdr; oc_rbuf p;
+        if (read_frame(&c, &hdr, &p) != 0) break;
+        if (hdr.msg_type == OC_MSG_SEND_ACK) acks++;
+    }
+    client_close(&c);
+    a->ok = (acks == K);
+    return NULL;
+}
+
+static void test_concurrent_load(int port, const uint8_t *pin) {
+    enum { N = 8 };
+    pthread_t th[N];
+    struct load_arg args[N];
+    for (int i = 0; i < N; i++) {
+        args[i].port = port; args[i].pin = pin; args[i].tid = i; args[i].ok = 0;
+        CHECK(pthread_create(&th[i], NULL, load_client, &args[i]) == 0);
+    }
+    for (int i = 0; i < N; i++) pthread_join(th[i], NULL);
+    for (int i = 0; i < N; i++) CHECK(args[i].ok == 1);
+}
+
 /* Per-IP connection throttle (robustness): a single source IP can hold at most
  * OPENCHIME_MAX_CONNS_PER_IP concurrent connections; the daemon closes excess
  * connections at accept, before spending a TLS context on them. Uses its own
@@ -918,7 +966,7 @@ static void test_conn_throttle(int port) {
 }
 
 int run_netloop_tests(void) {
-    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, search, rate-limit, out-cap, admin, logout\n");
+    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, search, load, rate-limit, out-cap, throttle, admin, logout\n");
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -958,6 +1006,7 @@ int run_netloop_tests(void) {
         test_reactions_vertical(arg.port, pin);
         test_threads_vertical(arg.port, pin);
         test_search_vertical(arg.port, pin);
+        test_concurrent_load(arg.port, pin);
         test_send_rate_limit(arg.port, pin);
         test_out_buffer_cap(arg.port, pin, dbw, flooder);
         test_admin_vertical(arg.port, pin);

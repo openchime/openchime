@@ -35,7 +35,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 021 Entra/Google providers | ➖ | Lives in the central relay service (out of this repo); the daemon only verifies the re-issued token. |
 | 022 Apple Sign-In / no Facebook | ➖ | Central service concern. |
 | 023 verified credential per mode | ✅ | ES256 pinned (alg+iss+aud+exp), or PBKDF2 password. |
-| 024 local accounts | 🟡 | PBKDF2 ✅, invite-token creation + redeem ✅, failed-auth rate-limit ✅. **First-owner one-time setup token ⛔** — bootstrap is via `OC_BOOTSTRAP_USERS` env instead. |
+| 024 local accounts | ✅ | PBKDF2, invite-token creation + redeem, failed-auth rate-limit, and a first-run one-time owner setup token (or `OC_BOOTSTRAP_USERS`). |
 | 025 OIDC central relay | ➖ / ✅ | Relay is out-of-repo; daemon trusts the re-issued token. |
 | 030 roles + ≥1-owner invariant | ✅ | |
 | 031 channel membership, public/private read-post | ✅ | Public auto-joins the poster; private is members-only. |
@@ -63,7 +63,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 
 | REQ | Status | Notes |
 |-----|--------|-------|
-| 090 at-least-once + ack msg type | 🟡 | Fan-out to connected members ✅; missed messages recovered via backfill. **`CLIENT_ACK` is decoded then ignored — no server-side delivery cursor.** |
+| 090 at-least-once + ack msg type | ✅ | Fan-out to connected members; `CLIENT_ACK` advances a per-(user,channel) delivery cursor (migration 0007); backfill recovers misses. |
 | 091 client dedup on high-water | 🔵 ✅ | Implemented in the skeleton client. |
 | 092 in-channel order = accept order | ✅ | Ascending, tenant-monotonic `message_id`. |
 | 093 idempotent retry | ✅ | Persisted `(channel, token) → id`. |
@@ -108,7 +108,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 |-----|--------|-------|
 | 200 Linux/Win/macOS/iOS/Android clients | 🟡 | Windows `.exe` cross-compiles (skeleton UI); other platforms ⛔. Daemon is Linux-only (epoll/eventfd). |
 | 210 lean/standard memory profile | ❔ | Plausible; not measured. |
-| 211 low-hundreds concurrent connections | ❔ | epoll loop, `OC_NETLOOP_MAX_FD=4096`; not load-tested. |
+| 211 low-hundreds concurrent connections | ❔ | epoll loop, `OC_NETLOOP_MAX_FD=4096`; concurrency is correctness-tested (8-client load test) but the low-hundreds ceiling is not benchmarked. |
 
 ---
 
@@ -135,25 +135,31 @@ ordering, not a commitment.
   the `LIST_*` ops run on a third thread with its own `query_only` WAL
   connection, so a heavy query no longer stalls sends/auth. All existing read
   tests now exercise that path.
+- ✅ **Server-side delivery accounting (REQ-090).** `CLIENT_ACK` now advances a
+  per-(user,channel) cursor (migration 0007); a cursorless backfill resumes each
+  member channel from that cursor. Tested.
+- ✅ **Per-IP connection throttle.** The accept loop caps concurrent connections
+  per source IP (`OPENCHIME_MAX_CONNS_PER_IP`, default 256) and closes excess at
+  accept. Tested with a tiny-cap loop.
+- ✅ **TLS identity persisted across restore (ARCH-66b).** The self-signed cert+key
+  live in the replicated DB (migration 0008), restored on boot so the TOFU pin
+  survives restore-on-boot. Tested (round-trip + end-to-end fingerprint check).
+- ✅ **Truncation signals.** `BACKFILL_DONE`/`SEARCH_RESULTS`/`THREAD` carry a
+  more/truncated flag so a client knows to page.
+- ✅ **First-owner setup token (REQ-024).** First run in local mode with no owner
+  mints a one-time owner invite and logs its token (redeemed to create the
+  owner); reuses the invite path. Tested.
+- ✅ **Codec fuzzer + concurrency load test.** A deterministic fuzzer runs 180k
+  iterations of random/framed bytes through `oc_parse_frame` + every decoder
+  (clean under ASan/UBSan); an 8-client concurrent-send load test exercises the
+  accept path, writer, and fan-out under contention.
 
 **Open**
 
-1. **`CLIENT_ACK` ignored — no delivery accounting (Medium).** Backfill relies
-   entirely on client-supplied cursors; the server keeps no per-client delivery
-   cursor, so there's no server-side delivery state to reason about or prune.
-2. **No connection/accept throttle (Medium).** Fixed `OC_NETLOOP_MAX_FD` with no
-   per-IP connection cap → connection-exhaustion DoS.
-3. **Litestream restore ↔ TOFU cert (Medium).** Restore-on-boot can change the
-   self-signed cert, tripping every client's pin (open item in TLS.md). Decide:
-   persist the cert in the replica, or a client re-pin flow.
-4. **Silent truncation signals (Low).** Thread/search/backfill cap at fixed
-   limits with no "more available" flag; a client can't tell it was truncated.
-5. **No load/stress/fuzz coverage (Low–Medium).** REQ-210/211 unverified; the
-   codec has no fuzzer. A load test + a frame fuzzer would validate the
-   memory/concurrency claims and parser robustness.
-6. **First-owner setup token (Low).** REQ-024 specifies a one-time setup token;
-   today the first owner comes from `OC_BOOTSTRAP_USERS`. Functional, but not
-   the spec'd air-gapped bootstrap.
+None — the robustness backlog is clear. Remaining unknowns are quantitative, not
+correctness: REQ-210/211's exact memory/connection-count profile is still
+un-benchmarked (the load test proves concurrency correctness at small N, not the
+low-hundreds-connection ceiling), and there is no periodic large-scale soak.
 
 ---
 
@@ -169,10 +175,11 @@ skeleton (the only consumer of all the above), and (b) whole **feature families
 not yet begun**: presence/typing, notifications/push, attachments, audio, and
 webhooks.
 
-The clearest denial-of-service and unbounded-growth vectors are now **closed**:
-`SEND`-flood rate limiting (REQ-190), the per-connection output-buffer cap,
-idempotency-map pruning (ARCH-44), and moving query ops onto a read-only
-connection so a heavy read can't stall the writer (ARCH-66). The remaining
-**robustness backlog** above (delivery accounting, connection throttling, the
-restore↔cert interaction, load/fuzz coverage) continues hardening the server
-before new feature work.
+The **server-robustness backlog is cleared** (see Resolved above): SEND-flood
+rate limiting, the per-connection output-buffer cap, idempotency-map pruning,
+reads decoupled onto a read-only connection, server-side delivery accounting, a
+per-IP connection throttle, TLS-identity persistence across restore, truncation
+signals, the first-owner setup token, and a codec fuzzer + concurrency load
+test. What remains is **not** hardening but **scope**: a real client, the
+unbuilt feature families (presence, notifications/push, attachments, audio,
+webhooks), and a quantitative capacity benchmark for REQ-210/211.
