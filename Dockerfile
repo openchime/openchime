@@ -9,6 +9,10 @@ COPY Makefile .
 COPY scripts ./scripts
 COPY shared ./shared
 COPY daemon ./daemon
+# The vendored jsmn single-header (daemon/jwt.c) has no fetch script — unlike
+# mbedTLS, which scripts/build_mbedtls.sh downloads during `make` — so it must
+# be copied from the build context.
+COPY third_party/jsmn ./third_party/jsmn
 RUN make
 
 FROM alpine:3.20 AS litestream
