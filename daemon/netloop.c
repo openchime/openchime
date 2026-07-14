@@ -165,6 +165,15 @@ static conn *find_by_id(conn **conns, uint64_t id) {
     return NULL;
 }
 
+/* Count live connections from a peer IP (for the accept throttle). */
+static int conns_from_ip(conn **conns, const char *src) {
+    if (!src[0]) return 0;
+    int n = 0;
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
+        if (conns[fd] && strcmp(conns[fd]->source, src) == 0) n++;
+    return n;
+}
+
 static int in_members(uint64_t uid, const uint64_t *m, size_t n) {
     for (size_t i = 0; i < n; i++) if (m[i] == uid) return 1;
     return 0;
@@ -973,6 +982,16 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     if (ep < 0) { close(lfd); free(conns); return -1; }
     int evfd = oc_dbwriter_eventfd(dbw);
 
+    /* Per-source-IP concurrent-connection cap (0 disables). Blunts a
+     * connection-exhaustion flood from one host while staying generous enough
+     * for a large office behind one NAT; operators tune it. The global cap is
+     * OC_NETLOOP_MAX_FD. */
+    int max_per_ip = 256;
+    {
+        const char *v = getenv("OPENCHIME_MAX_CONNS_PER_IP");
+        if (v) { int n = atoi(v); if (n >= 0) max_per_ip = n; }
+    }
+
     struct epoll_event ev;
     memset(&ev, 0, sizeof ev);
     ev.events = EPOLLIN; ev.data.fd = lfd;
@@ -998,6 +1017,18 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                     int cfd = accept(lfd, (struct sockaddr *)&ss, &sl);
                     if (cfd < 0) break;
                     if (cfd >= OC_NETLOOP_MAX_FD || set_nonblock(cfd) < 0) { close(cfd); continue; }
+                    /* Peer IP (for the accept throttle + per-source auth limit). */
+                    char src[46] = {0};
+                    if (ss.ss_family == AF_INET) {
+                        inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr, src, sizeof src);
+                    } else if (ss.ss_family == AF_INET6) {
+                        inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&ss)->sin6_addr, src, sizeof src);
+                    }
+                    /* Throttle a single IP before spending a conn/TLS context on it. */
+                    if (max_per_ip > 0 && conns_from_ip(conns, src) >= max_per_ip) {
+                        close(cfd);
+                        continue;
+                    }
                     conn *c = calloc(1, sizeof *c);
                     if (!c || oc_framebuf_init(&c->fb) != 0 ||
                         oc_tls_conn_init(&c->tls, &tls->conf, cfd) != 0) {
@@ -1006,14 +1037,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                         continue;
                     }
                     c->fd = cfd;
-                    /* Record the peer IP for per-source auth rate limiting (REQ-191). */
-                    if (ss.ss_family == AF_INET) {
-                        inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr,
-                                  c->source, sizeof c->source);
-                    } else if (ss.ss_family == AF_INET6) {
-                        inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&ss)->sin6_addr,
-                                  c->source, sizeof c->source);
-                    }
+                    memcpy(c->source, src, sizeof c->source);
                     c->conn_id = g_next_conn_id++;
                     c->state = CONN_HANDSHAKE;
                     conns[cfd] = c;

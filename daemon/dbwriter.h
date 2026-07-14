@@ -32,7 +32,8 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_LEAVE_CHANNEL = 12, OC_JOB_INVITE_CHANNEL = 13, OC_JOB_REMOVE_CHANNEL = 14,
        OC_JOB_LIST_USERS = 15, OC_JOB_INVITE_USER = 16, OC_JOB_REMOVE_USER = 17,
        OC_JOB_REDEEM = 18, OC_JOB_REACT = 19, OC_JOB_LIST_REACTIONS = 20,
-       OC_JOB_SEND_REPLY = 21, OC_JOB_LIST_THREAD = 22, OC_JOB_SEARCH = 23 };
+       OC_JOB_SEND_REPLY = 21, OC_JOB_LIST_THREAD = 22, OC_JOB_SEARCH = 23,
+       OC_JOB_SETUP_INVITE = 24 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -249,6 +250,11 @@ int     oc_job_set_register(oc_job *j, const char *username, const char *passwor
 uint64_t oc_dbwriter_register_local(oc_dbwriter *w, const char *username,
                                     const char *password, uint8_t role,
                                     uint32_t iterations);
+
+/* First-run bootstrap (REQ-024): if the tenant has no owner, mint a one-time
+ * owner invite and return its raw token in `token_out` (returns 1); returns 0
+ * if an owner already exists. Setup-time only (drains one result). */
+int oc_dbwriter_setup_invite(oc_dbwriter *w, uint8_t token_out[OC_INVITE_TOKEN_LEN]);
 
 /* Hand a job to the writer (transfers ownership; the writer frees it). */
 void       oc_dbwriter_submit(oc_dbwriter *w, oc_job *j);

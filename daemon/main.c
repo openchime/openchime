@@ -173,6 +173,20 @@ int main(void) {
         fprintf(stderr, "openchimed: OIDC mode (issuer=%s audience=%s)\n", iss, aud);
     }
 
+    /* First-run bootstrap (REQ-024, local mode only): if there is no owner yet
+     * and none was provisioned via OC_BOOTSTRAP_USERS, mint a one-time owner
+     * setup token and print it once — the operator redeems it (REDEEM_INVITE)
+     * to create the first owner, no pre-existing admin needed. */
+    if (oc_dbwriter_auth_methods(db) & OC_AUTH_LOCAL) {
+        uint8_t stok[OC_INVITE_TOKEN_LEN];
+        if (oc_dbwriter_setup_invite(db, stok)) {
+            fprintf(stderr, "openchimed: no owner yet — first-run setup token "
+                            "(redeem to create the owner): ");
+            for (size_t i = 0; i < OC_INVITE_TOKEN_LEN; i++) fprintf(stderr, "%02x", stok[i]);
+            fprintf(stderr, "\n");
+        }
+    }
+
     /* Self-signed cert on first run, reused thereafter (ARCH-10). */
     oc_tls_server tls;
     if (oc_tls_server_init(&tls, cert_path, key_path) != 0) {

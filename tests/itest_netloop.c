@@ -14,6 +14,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <stdlib.h>
 #include <pthread.h>
 #include <string.h>
 #include <unistd.h>
@@ -871,6 +872,51 @@ static void test_logout_closes(int port, const uint8_t *pin) {
     client_close(&a);
 }
 
+/* Per-IP connection throttle (robustness): a single source IP can hold at most
+ * OPENCHIME_MAX_CONNS_PER_IP concurrent connections; the daemon closes excess
+ * connections at accept, before spending a TLS context on them. Uses its own
+ * loop so the tiny cap doesn't disturb the shared test loop. */
+static void test_conn_throttle(int port) {
+    setenv("OPENCHIME_MAX_CONNS_PER_IP", "2", 1);
+    oc_tls_server srv2;
+    CHECK(oc_tls_server_init(&srv2, NULL, NULL) == 0);
+    uint8_t pin2[OC_TLS_FINGERPRINT_LEN];
+    CHECK(oc_tls_server_fingerprint(&srv2, pin2) == 0);
+
+    unlink("build/itest_throttle.db");
+    unlink("build/itest_throttle.db-wal");
+    unlink("build/itest_throttle.db-shm");
+    oc_dbwriter *dbw2 = oc_dbwriter_start("build/itest_throttle.db");
+    CHECK(dbw2 != NULL);
+
+    struct loop_arg arg2;
+    arg2.port = port; arg2.srv = &srv2; arg2.dbw = dbw2; arg2.stop = 0;
+    pthread_t th2;
+    CHECK(pthread_create(&th2, NULL, loop_thread, &arg2) == 0);
+
+    /* Two connections from loopback are within the cap. */
+    client a, b;
+    CHECK(client_open(&a, port, pin2) == 0);
+    CHECK(client_open(&b, port, pin2) == 0);
+    /* The third is refused at accept — its TLS handshake never completes. */
+    client c;
+    int rc = client_open(&c, port, pin2);
+    CHECK(rc != 0);
+
+    client_close(&a);
+    client_close(&b);
+    if (rc == 0) client_close(&c);
+
+    arg2.stop = 1;
+    pthread_join(th2, NULL);
+    oc_dbwriter_stop(dbw2);
+    oc_tls_server_free(&srv2);
+    unsetenv("OPENCHIME_MAX_CONNS_PER_IP");
+    unlink("build/itest_throttle.db");
+    unlink("build/itest_throttle.db-wal");
+    unlink("build/itest_throttle.db-shm");
+}
+
 int run_netloop_tests(void) {
     printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, search, rate-limit, out-cap, admin, logout\n");
 
@@ -916,6 +962,7 @@ int run_netloop_tests(void) {
         test_out_buffer_cap(arg.port, pin, dbw, flooder);
         test_admin_vertical(arg.port, pin);
         test_logout_closes(arg.port, pin);
+        test_conn_throttle(arg.port + 123);
     }
 
     arg.stop = 1;

@@ -622,6 +622,31 @@ static oc_dbres *process_list_users(sqlite3 *db, const oc_job *j) {
 /* Mint an invite token for a new local account (REQ-033). Owner/admin only; only
  * an owner may invite at an elevated (admin/owner) role. Only the token's SHA-256
  * is stored; the raw token is returned once for the actor to share. */
+/* Mint an invite for `role`: random token to the caller, only its SHA-256 +
+ * expiry stored. `created_by` is the issuing user (0 -> NULL, e.g. a first-run
+ * setup token with no issuer). Returns 0 and fills token/expiry, or -1. */
+static int mint_invite(sqlite3 *db, uint64_t created_by, uint8_t role,
+                       uint8_t token[OC_INVITE_TOKEN_LEN], uint64_t *expiry_out) {
+    uint8_t hash[OC_SHA256_LEN];
+    if (oc_rand_bytes(token, OC_INVITE_TOKEN_LEN) != 0 ||
+        oc_sha256(token, OC_INVITE_TOKEN_LEN, hash) != 0) return -1;
+    uint64_t expiry = dbw_now_ms() + OC_INVITE_TTL_MS;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO invites(token_hash,created_by,role,expires_at_ms) VALUES(?,?,?,?);",
+        -1, &st, NULL);
+    sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
+    if (created_by) sqlite3_bind_int64(st, 2, (sqlite3_int64)created_by);
+    else            sqlite3_bind_null(st, 2);
+    sqlite3_bind_text(st, 3, u8_to_role(role), -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)expiry);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return -1;
+    if (expiry_out) *expiry_out = expiry;
+    return 0;
+}
+
 static oc_dbres *process_invite_user(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -636,28 +661,34 @@ static oc_dbres *process_invite_user(sqlite3 *db, const oc_job *j) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
 
-    uint8_t token[OC_INVITE_TOKEN_LEN], hash[OC_SHA256_LEN];
-    if (oc_rand_bytes(token, sizeof token) != 0 || oc_sha256(token, sizeof token, hash) != 0) {
-        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
-    }
-    uint64_t expiry = dbw_now_ms() + OC_INVITE_TTL_MS;
-    sqlite3_stmt *st = NULL;
-    sqlite3_prepare_v2(db,
-        "INSERT INTO invites(token_hash,created_by,role,expires_at_ms) VALUES(?,?,?,?);",
-        -1, &st, NULL);
-    sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
-    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
-    sqlite3_bind_text(st, 3, u8_to_role(want), -1, SQLITE_STATIC);
-    sqlite3_bind_int64(st, 4, (sqlite3_int64)expiry);
-    int rc = sqlite3_step(st);
-    sqlite3_finalize(st);
-    if (rc != SQLITE_DONE) {
+    uint8_t token[OC_INVITE_TOKEN_LEN]; uint64_t expiry = 0;
+    if (mint_invite(db, j->user_id, want, token, &expiry) != 0) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
     r->type = OC_RES_INVITE_OK;
     memcpy(r->session_token, token, OC_INVITE_TOKEN_LEN);  /* carries the invite token */
     r->session_expiry = expiry;
     r->role = want;
+    return r;
+}
+
+/* First-run bootstrap (REQ-024): if the tenant has no owner yet, mint a one-time
+ * owner invite so the operator can create the first owner by redeeming it (no
+ * pre-existing admin needed, air-gapped-safe). Returns INVITE_OK with the token,
+ * or INVITE_ERR/err_code 0 when an owner already exists (nothing to do). */
+static oc_dbres *process_setup_invite(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    if (count_owners(db) > 0) { r->type = OC_RES_INVITE_ERR; r->err_code = 0; return r; }
+    uint8_t token[OC_INVITE_TOKEN_LEN]; uint64_t expiry = 0;
+    if (mint_invite(db, 0, OC_ROLE_OWNER, token, &expiry) != 0) {
+        r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+    }
+    r->type = OC_RES_INVITE_OK;
+    memcpy(r->session_token, token, OC_INVITE_TOKEN_LEN);
+    r->session_expiry = expiry;
+    r->role = OC_ROLE_OWNER;
     return r;
 }
 
@@ -1653,6 +1684,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_REDEEM)         return process_redeem(w->db, j);
     if (j->type == OC_JOB_REACT)          return process_react(w->db, j);
     if (j->type == OC_JOB_SEND_REPLY)     return process_send_reply(w->db, j);
+    if (j->type == OC_JOB_SETUP_INVITE)   return process_setup_invite(w->db, j);
     return NULL;
 }
 
@@ -1784,6 +1816,30 @@ uint64_t oc_dbwriter_register_local(oc_dbwriter *w, const char *username,
             uint64_t uid = (r->type == OC_RES_REGISTER_OK) ? r->user_id : 0;
             oc_dbres_free(r);
             return uid;
+        }
+        usleep(1000);
+    }
+    return 0;
+}
+
+/* Setup-time helper (REQ-024): if the tenant has no owner, mint a one-time owner
+ * invite and return its raw token via `token_out` (returns 1); returns 0 if an
+ * owner already exists or on error. Like register_local, must run before a live
+ * result consumer (it drains one result). */
+int oc_dbwriter_setup_invite(oc_dbwriter *w, uint8_t token_out[OC_INVITE_TOKEN_LEN]) {
+    oc_job *j = oc_job_new(OC_JOB_SETUP_INVITE, 0);
+    if (!j) return 0;
+    oc_dbwriter_submit(w, j);
+    for (int i = 0; i < 3000; i++) {
+        oc_dbres *r = oc_dbwriter_next_result(w);
+        if (r) {
+            int minted = 0;
+            if (r->type == OC_RES_INVITE_OK) {
+                memcpy(token_out, r->session_token, OC_INVITE_TOKEN_LEN);
+                minted = 1;
+            }
+            oc_dbres_free(r);
+            return minted;
         }
         usleep(1000);
     }

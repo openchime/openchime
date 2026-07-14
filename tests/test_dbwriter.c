@@ -1221,6 +1221,30 @@ static void test_search(void) {
     cleanup_db(path);
 }
 
+/* First-owner setup token (REQ-024): a fresh tenant mints a one-time owner
+ * invite; redeeming it creates the owner; afterward none is minted. */
+static void test_setup_invite(void) {
+    const char *path = "build/test_dbwriter_setup.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    /* No owner yet -> a setup token is minted. */
+    uint8_t tok[OC_INVITE_TOKEN_LEN];
+    CHECK(oc_dbwriter_setup_invite(w, tok) == 1);
+
+    /* Redeeming it creates the first owner. */
+    oc_dbres *r = redeem_invite(w, tok, "founder", "founder-pw");
+    CHECK(r && r->type == OC_RES_AUTH_OK && r->role == OC_ROLE_OWNER);
+    oc_dbres_free(r);
+
+    /* An owner now exists -> nothing is minted. */
+    CHECK(oc_dbwriter_setup_invite(w, tok) == 0);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* Idempotency-map pruning (ARCH-44): a (channel, token) mapping older than the
  * retention window is dropped, so a much-later retry of the same token is no
  * longer deduplicated, while a recent token still is. */
@@ -1276,6 +1300,7 @@ int run_dbwriter_tests(void) {
     test_reactions();
     test_threads();
     test_search();
+    test_setup_invite();
     test_idem_pruning();
     test_backfill();
     return failures;
