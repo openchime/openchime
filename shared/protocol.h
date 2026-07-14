@@ -78,6 +78,8 @@ typedef enum {
     OC_MSG_USER_UPDATED     = 0x0045, /* S->C, ack/push for SET_ROLE + REMOVE_USER */
     OC_MSG_INVITE_CREATED   = 0x0046, /* S->C, the minted invite token */
     OC_MSG_REDEEM_INVITE    = 0x0047, /* C->S, pre-auth account creation */
+    OC_MSG_SEARCH           = 0x0060, /* C->S (REQ-080) */
+    OC_MSG_SEARCH_RESULTS   = 0x0061, /* S->C */
     OC_MSG_BACKFILL_REQUEST = 0x0030, /* C->S */
     OC_MSG_BACKFILL_DONE    = 0x0031, /* S->C */
     OC_MSG_ERROR            = 0x00FF  /* S->C */
@@ -270,6 +272,9 @@ typedef struct { uint64_t user_id; } oc_remove_user;
 typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; } oc_user_updated;
 typedef struct { oc_slice token; uint8_t role; uint64_t expires_at; } oc_invite_created;
 typedef struct { oc_slice token; oc_slice username; oc_slice password; } oc_redeem_invite;
+typedef struct { oc_slice query; uint16_t limit; } oc_search;
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time; oc_slice snippet; } oc_search_result_entry;
+typedef struct { uint16_t count; const oc_search_result_entry *entries; } oc_search_results;
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_cursor;
 typedef struct { uint16_t count; const oc_cursor *cursors; } oc_backfill_request;
 typedef struct { uint64_t high_water; } oc_backfill_done;
@@ -322,6 +327,8 @@ oc_result oc_encode_remove_user(oc_wbuf *w, uint16_t version, const oc_remove_us
 oc_result oc_encode_user_updated(oc_wbuf *w, uint16_t version, const oc_user_updated *m);
 oc_result oc_encode_invite_created(oc_wbuf *w, uint16_t version, const oc_invite_created *m);
 oc_result oc_encode_redeem_invite(oc_wbuf *w, uint16_t version, const oc_redeem_invite *m);
+oc_result oc_encode_search(oc_wbuf *w, uint16_t version, const oc_search *m);
+oc_result oc_encode_search_results(oc_wbuf *w, uint16_t version, const oc_search_results *m);
 oc_result oc_encode_backfill_request(oc_wbuf *w, uint16_t version, const oc_backfill_request *m);
 oc_result oc_encode_backfill_done(oc_wbuf *w, uint16_t version, const oc_backfill_done *m);
 oc_result oc_encode_error(oc_wbuf *w, uint16_t version, const oc_error *m);
@@ -374,6 +381,8 @@ oc_result oc_decode_remove_user(oc_rbuf *p, oc_remove_user *m);
 oc_result oc_decode_user_updated(oc_rbuf *p, oc_user_updated *m);
 oc_result oc_decode_invite_created(oc_rbuf *p, oc_invite_created *m);
 oc_result oc_decode_redeem_invite(oc_rbuf *p, oc_redeem_invite *m);
+oc_result oc_decode_search(oc_rbuf *p, oc_search *m);
+oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries, uint16_t cap, uint16_t *out_count);
 oc_result oc_decode_backfill_request(oc_rbuf *p, oc_cursor *cursors, uint16_t cap, uint16_t *out_count);
 oc_result oc_decode_backfill_done(oc_rbuf *p, oc_backfill_done *m);
 oc_result oc_decode_error(oc_rbuf *p, oc_error *m);

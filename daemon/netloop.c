@@ -420,6 +420,17 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SEARCH) {
+            oc_search sq;
+            if (oc_decode_search(&p, &sq) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SEARCH, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->search_limit = sq.limit;
+            if (oc_job_set_body(j, sq.query.ptr, sq.query.len) != 0) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_CLIENT_ACK) {
             oc_client_ack ca;
             oc_decode_client_ack(&p, &ca); /* accepted; the client drives backfill via its own cursors */
@@ -835,6 +846,27 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         oc_thread th = { r->parent_id, (uint32_t)r->n_thread };
         oc_encode_thread(&w, OC_PROTOCOL_VERSION, &th);
         send_bytes(ep, conns, fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_SEARCH: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        size_t n = r->n_search;   /* already bounded by OC_SEARCH_MAX */
+        oc_search_result_entry *ents = n ? malloc(n * sizeof *ents) : NULL;
+        if (n && !ents) n = 0;
+        for (size_t i = 0; i < n; i++) {
+            ents[i].message_id = r->search[i].message_id;
+            ents[i].channel_id = r->search[i].channel_id;
+            ents[i].author_id = r->search[i].author_id;
+            ents[i].server_time = r->search[i].server_time;
+            ents[i].snippet.ptr = r->search[i].body;
+            ents[i].snippet.len = r->search[i].body_len;
+        }
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_search_results sr = { (uint16_t)n, ents };
+        oc_encode_search_results(&w, OC_PROTOCOL_VERSION, &sr);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        free(ents);
         break;
     }
     case OC_RES_BACKFILL_OK: {

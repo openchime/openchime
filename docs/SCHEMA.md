@@ -11,9 +11,9 @@ ack / backfill). **Migration 0002** (§3) adds the authentication data model
 auth design ([AUTH.md](./AUTH.md)). **Migration 0003** (§3a) adds a
 `users.disabled` lockout flag for tenant member removal (REQ-033). **Migration
 0004** (§3b) adds emoji reactions (REQ-070/071) and **migration 0005** (§3c) adds
-message threads (REQ-060). Full-text search (REQ-080/FTS5), presence,
-notification config, and attachments are intentionally **not** here yet; each is
-a future migration once its own requirement is settled.
+message threads (REQ-060) and **migration 0006** (§3d) adds FTS5 full-text search
+(REQ-080). Presence, notification config, and attachments are intentionally
+**not** here yet; each is a future migration once its own requirement is settled.
 
 ---
 
@@ -243,12 +243,34 @@ Index `idx_messages_parent (parent_id, id)` serves the per-thread reply query
 
 ---
 
+## 3d. Migration 0006 — full-text search
+
+Full-text search over message bodies (REQ-080, ARCH-15), added as
+`MIGRATION_0006`. Requires an SQLite built with FTS5 (Alpine's `sqlite-libs` and
+the system/vendored libs used here enable it).
+
+### `messages_fts`  (FTS5 virtual table)
+An **external-content** FTS5 index (`content='messages', content_rowid='id'`)
+over `messages.body` — it stores only the inverted index, not a copy of the
+bodies. Three triggers keep it in sync:
+
+- `messages_fts_ai` (after insert) indexes a new message;
+- `messages_fts_au` (after update) re-indexes on edit and drops the text on
+  tombstone (body → NULL);
+- `messages_fts_ad` (after delete) removes the entry.
+
+The migration seeds the index from existing rows. `SEARCH` (PROTOCOL.md §5.11)
+joins `messages_fts MATCH ?` back to `messages`/`channels`, filters tombstones
+and to the user's readable channels (REQ-031), and returns `snippet()` excerpts
+newest-first.
+
+---
+
 ## 4. Deferred to later migrations
 
 Tracked here so the omissions are deliberate, not forgotten:
 
 - **Thread notifications** (REQ-061) — needs notification config (REQ-130).
-- **FTS5** full-text index over `messages.body` (REQ-080, ARCH-15).
 - **Presence / typing** (REQ-120/121) — likely in-memory, not schema.
 - **Notification settings** and DND (REQ-130/131).
 - **Attachments** metadata (REQ-140) — object-storage pointers, not blobs.

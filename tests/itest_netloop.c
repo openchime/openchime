@@ -604,6 +604,80 @@ static void test_threads_vertical(int port, const uint8_t *pin) {
     client_close(&c);
 }
 
+/* Full-text search over the wire (REQ-080): a member searches and gets matching
+ * messages as snippets, and a private channel's messages never surface to a
+ * non-member (the member-scoping security property, REQ-031). */
+static void test_search_vertical(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    CHECK(do_handshake(&b) == 0);
+    uint64_t ua = 0, ub = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+
+    uint8_t buf[256]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+
+    /* alice posts a distinctive message to the shared channel. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s; s.channel_id = 1; memset(s.idem, 0x91, OC_IDEM_SIZE);
+    s.body = oc_slice_str("orbital laser schematics");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    uint64_t m1 = 0;
+    for (int i = 0; i < 2; i++) {
+        CHECK(read_frame(&a, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) { oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK); m1 = ack.message_id; }
+    }
+    CHECK(m1 != 0);
+    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BROADCAST);
+
+    /* bob searches and finds it, with the right ids and a non-empty snippet. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_search sq = { oc_slice_str("orbital"), 10 };
+    CHECK(oc_encode_search(&w, OC_PROTOCOL_VERSION, &sq) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SEARCH_RESULTS);
+    oc_search_result_entry se[8]; uint16_t n = 0;
+    CHECK(oc_decode_search_results(&p, se, 8, &n) == OC_OK);
+    CHECK(n == 1 && se[0].message_id == m1 && se[0].channel_id == 1 && se[0].author_id == ua);
+    CHECK(se[0].snippet.len > 0);
+
+    /* alice creates a private channel and posts to it. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_channel cch = { oc_slice_str("bunker"), 0 };
+    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cch) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
+    oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
+    uint64_t cid = ci.channel_id;
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s2; s2.channel_id = cid; memset(s2.idem, 0x92, OC_IDEM_SIZE);
+    s2.body = oc_slice_str("nuclear launch codes");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s2) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    for (int i = 0; i < 2; i++) { CHECK(read_frame(&a, &hdr, &p) == 0); }   /* ACK + BROADCAST */
+
+    /* bob (not a member of the private channel) cannot find it. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_search sq2 = { oc_slice_str("nuclear"), 10 };
+    CHECK(oc_encode_search(&w, OC_PROTOCOL_VERSION, &sq2) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SEARCH_RESULTS);
+    CHECK(oc_decode_search_results(&p, se, 8, &n) == OC_OK && n == 0);
+
+    /* alice, a member, does find it. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_search(&w, OC_PROTOCOL_VERSION, &sq2) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SEARCH_RESULTS);
+    CHECK(oc_decode_search_results(&p, se, 8, &n) == OC_OK && n == 1 && se[0].channel_id == cid);
+
+    client_close(&a);
+    client_close(&b);
+}
+
 /* Tenant admin ops over the wire (REQ-033): an owner mints an invite, a fresh
  * client redeems it to create + authenticate an account, the owner promotes that
  * user (SET_ROLE pushes USER_UPDATED to them), lists users, and removes a member
@@ -709,7 +783,7 @@ static void test_logout_closes(int port, const uint8_t *pin) {
 }
 
 int run_netloop_tests(void) {
-    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, admin, logout\n");
+    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, search, admin, logout\n");
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -746,6 +820,7 @@ int run_netloop_tests(void) {
         test_channels_vertical(arg.port, pin);
         test_reactions_vertical(arg.port, pin);
         test_threads_vertical(arg.port, pin);
+        test_search_vertical(arg.port, pin);
         test_admin_vertical(arg.port, pin);
         test_logout_closes(arg.port, pin);
     }

@@ -119,12 +119,35 @@ static const char MIGRATION_0005[] =
     "ALTER TABLE messages ADD COLUMN parent_id INTEGER REFERENCES messages(id);"
     "CREATE INDEX idx_messages_parent ON messages(parent_id, id);";
 
+/* 0006: full-text search over message bodies (REQ-080, ARCH-15). An external-
+ * content FTS5 table indexes messages.body without duplicating it; the three
+ * triggers keep it in sync (insert/tombstone/edit), and the seed indexes rows
+ * that predate this migration. Requires an SQLite built with FTS5 (Alpine's
+ * sqlite-libs and the vendored/system libs used here all enable it). */
+static const char MIGRATION_0006[] =
+    "CREATE VIRTUAL TABLE messages_fts USING fts5("
+    "  body, content='messages', content_rowid='id');"
+
+    "INSERT INTO messages_fts(rowid, body) SELECT id, body FROM messages;"
+
+    "CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages BEGIN"
+    "  INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);"
+    "END;"
+    "CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages BEGIN"
+    "  INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, old.body);"
+    "END;"
+    "CREATE TRIGGER messages_fts_au AFTER UPDATE ON messages BEGIN"
+    "  INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, old.body);"
+    "  INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);"
+    "END;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
     { 3, MIGRATION_0003 },
     { 4, MIGRATION_0004 },
     { 5, MIGRATION_0005 },
+    { 6, MIGRATION_0006 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

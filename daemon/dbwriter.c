@@ -124,6 +124,8 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->rlist);
     for (size_t i = 0; i < r->n_thread; i++) free(r->thread[i].body);
     free(r->thread);
+    for (size_t i = 0; i < r->n_search; i++) free(r->search[i].body);
+    free(r->search);
     free(r);
 }
 
@@ -1434,6 +1436,90 @@ static oc_dbres *process_list_thread(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Max search results per response (REQ-080 has no history cutoff; this bounds a
+ * single response, and a client can refine the query for more). */
+#define OC_SEARCH_MAX 50
+
+/* Turn arbitrary user input into a safe FTS5 MATCH string: each whitespace-
+ * separated token becomes a double-quoted phrase (internal quotes doubled per
+ * FTS5), so query punctuation can never trip the FTS5 grammar. Multiple tokens
+ * are implicitly ANDed. Returns the token count (0 = nothing to search). */
+static int build_fts_query(const char *in, size_t inlen, char *out, size_t outcap) {
+    size_t o = 0; int tokens = 0; size_t i = 0;
+    while (i < inlen) {
+        while (i < inlen && (in[i] == ' ' || in[i] == '\t' || in[i] == '\n' || in[i] == '\r')) i++;
+        if (i >= inlen) break;
+        /* One token spans until the next whitespace. */
+        if (o + 2 >= outcap) break;
+        if (tokens > 0) { if (o + 1 >= outcap) break; out[o++] = ' '; }
+        out[o++] = '"';
+        while (i < inlen && in[i] != ' ' && in[i] != '\t' && in[i] != '\n' && in[i] != '\r') {
+            if (in[i] == '"') { if (o + 2 >= outcap) break; out[o++] = '"'; out[o++] = '"'; }
+            else              { if (o + 1 >= outcap) break; out[o++] = in[i]; }
+            i++;
+        }
+        if (o + 1 >= outcap) break;
+        out[o++] = '"';
+        tokens++;
+    }
+    out[o < outcap ? o : outcap - 1] = '\0';
+    return tokens;
+}
+
+/* Full-text search over message bodies (REQ-080). Scoped to the channels the
+ * user can read (public or a member, REQ-031); tombstones are excluded. Results
+ * are FTS5 snippets, newest first, bounded by OC_SEARCH_MAX. */
+static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_SEARCH;
+
+    char fts[1024];
+    if (!j->body || j->body_len == 0) return r;   /* empty query -> no results */
+    if (build_fts_query((const char *)j->body, j->body_len, fts, sizeof fts) == 0) return r;
+
+    uint16_t lim = j->search_limit;
+    if (lim == 0 || lim > OC_SEARCH_MAX) lim = OC_SEARCH_MAX;
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+        "SELECT m.id, m.channel_id, m.author_id, m.created_at_ms, "
+        "  snippet(messages_fts, 0, '', '', ' ... ', 12) "
+        "FROM messages_fts "
+        "JOIN messages m ON m.id = messages_fts.rowid "
+        "JOIN channels c ON c.id = m.channel_id "
+        "WHERE messages_fts MATCH ?1 AND m.deleted_at_ms IS NULL "
+        "  AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members cm "
+        "       WHERE cm.channel_id=m.channel_id AND cm.user_id=?2)) "
+        "ORDER BY m.id DESC LIMIT ?3;", -1, &st, NULL) != SQLITE_OK) {
+        return r;   /* malformed FTS query -> empty results, never a fatal error */
+    }
+    sqlite3_bind_text(st, 1, fts, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)lim);
+
+    size_t cap = 8, n = 0;
+    oc_replay_msg *arr = malloc(cap * sizeof *arr);
+    while (arr && sqlite3_step(st) == SQLITE_ROW) {
+        if (n == cap) { cap *= 2; oc_replay_msg *g = realloc(arr, cap * sizeof *arr); if (!g) break; arr = g; }
+        oc_replay_msg *m = &arr[n];
+        memset(m, 0, sizeof *m);
+        m->message_id  = (uint64_t)sqlite3_column_int64(st, 0);
+        m->channel_id  = (uint64_t)sqlite3_column_int64(st, 1);
+        m->author_id   = (uint64_t)sqlite3_column_int64(st, 2);
+        m->server_time = (uint64_t)sqlite3_column_int64(st, 3);
+        const unsigned char *snip = sqlite3_column_text(st, 4);
+        int slen = sqlite3_column_bytes(st, 4);
+        if (snip && slen > 0) { m->body = malloc((size_t)slen); if (m->body) { memcpy(m->body, snip, (size_t)slen); m->body_len = (size_t)slen; } }
+        n++;
+    }
+    sqlite3_finalize(st);
+    r->search = arr;
+    r->n_search = n;
+    return r;
+}
+
 /* Replay messages newer than each cursor, for channels the user belongs to,
  * bounded by OC_BACKFILL_MAX total (REQ-101, PROTOCOL.md §6). */
 static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
@@ -1547,6 +1633,7 @@ static void *writer_loop(void *arg) {
         else if (j->type == OC_JOB_LIST_REACTIONS) r = process_list_reactions(w->db, j);
         else if (j->type == OC_JOB_SEND_REPLY)     r = process_send_reply(w->db, j);
         else if (j->type == OC_JOB_LIST_THREAD)    r = process_list_thread(w->db, j);
+        else if (j->type == OC_JOB_SEARCH)         r = process_search(w->db, j);
         job_free(j);
         push_result(w, r);
     }

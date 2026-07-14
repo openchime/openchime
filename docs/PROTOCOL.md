@@ -8,9 +8,9 @@ resolves the protocol-shaped `[needs ARCH decision]` items in
 
 **Scope of this revision.** This covers connection handshake and version
 negotiation, authentication, the message send/broadcast/ack cycle, message
-edit/delete (§5.5/5.6), reactions (§5.9), threads (§5.10), channel management
-(§5.7), tenant administration (§5.8), and reconnect backfill, plus the error
-frame. Presence (REQ-120/121), typing indicators, thread notifications
+edit/delete (§5.5/5.6), reactions (§5.9), threads (§5.10), search (§5.11),
+channel management (§5.7), tenant administration (§5.8), and reconnect backfill,
+plus the error frame. Presence (REQ-120/121), typing indicators, thread notifications
 (REQ-061/130), and audio-call signaling (REQ-150–152) are deliberately out of
 scope here and will be added in later revisions of this document, reusing the
 framing and encoding rules defined below. New message types are additive; the
@@ -652,6 +652,31 @@ their per-channel notification setting — depend on notification configuration
 (REQ-130) and are a later revision; today a `THREAD_REPLY` reaches every
 connected channel member.*
 
+### 5.11 Search (REQ-080)
+
+Full-text search over message history, scoped to what the searching user can
+read (public channels and the private channels they belong to, REQ-031).
+Implemented with a SQLite FTS5 index over message bodies (ARCH-15, SCHEMA.md
+§3d); there is no history cutoff.
+
+**`SEARCH` (client → server), msg_type `0x0060`:**
+
+| Field   | Type | Notes                                                          |
+|---------|------|----------------------------------------------------------------|
+| `query` | str  | Free text. The daemon quotes each whitespace-separated term, so query punctuation is literal and multiple terms are ANDed; it never errors on syntax. |
+| `limit` | u16  | Max results wanted; the daemon caps it (currently 50).         |
+
+Replies **`SEARCH_RESULTS` (server → client), msg_type `0x0061`**, newest match
+first:
+
+| Field       | Type            | Notes                                                |
+|-------------|-----------------|------------------------------------------------------|
+| `count`     | u16             | Number of entries.                                   |
+| `entries[]` | `count` × entry | Each: `message_id` (u64), `channel_id` (u64), `author_id` (u64), `server_time` (u64), `snippet` (str — an FTS5 excerpt around the match). |
+
+Tombstoned messages (§5.6) are excluded, and an edit (§5.5) re-indexes the
+message. An empty or all-punctuation query returns zero results (never an error).
+
 ---
 
 ## 6. Reconnect backfill (resolves REQ-101)
@@ -786,6 +811,8 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0046` | `INVITE_CREATED`   | S → C     | no        | §5.8    |
 | `0x0047` | `REDEEM_INVITE`    | C → S     | no        | §5.8    |
 | `0x0048` | `UPDATE_PROFILE`   | C → S     | no        | (reserved — profile edit) |
+| `0x0060` | `SEARCH`           | C → S     | no        | §5.11   |
+| `0x0061` | `SEARCH_RESULTS`   | S → C     | no        | §5.11   |
 | `0x0020` | `SEND`             | C → S     | no        | §5.1    |
 | `0x0021` | `SEND_ACK`         | S → C     | no        | §5.2    |
 | `0x0022` | `BROADCAST`        | S → C     | no        | §5.3    |
@@ -817,7 +844,7 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 
 Ranges are left sparse (`0x0001–` handshake, `0x0010–` auth/session, `0x0020–`
 messaging, `0x0030–` reconnect, `0x0040–` users/profiles, `0x0050–` channel
-management, `0x00FF` error) so later revisions can slot in presence, typing,
+management, `0x0060–` search, `0x00FF` error) so later revisions can slot in presence, typing,
 presence/typing and audio signaling without renumbering. The `0x0040–0x0047`
 management frames (user enumeration, roles, tenant invite/remove; §5.8) are
 defined; `0x0048` `UPDATE_PROFILE` (avatar/display-name edit) remains **reserved**

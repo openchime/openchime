@@ -441,6 +441,30 @@ static void test_admin_frames(void) {
     }
 }
 
+static void test_search_frames(void) {
+    {
+        oc_search in = { oc_slice_str("deploy pipeline"), 25 };
+        ROUNDTRIP(oc_encode_search(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH, h, p);
+        oc_search out;
+        CHECK(oc_decode_search(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.query, "deploy pipeline") && out.limit == 25);
+    }
+    {
+        oc_search_result_entry ents[2] = {
+            { 1001, 7, 42, 1751200500000ull, oc_slice_str("... the deploy ...") },
+            { 990,  7, 43, 1751200400000ull, oc_slice_str("deploy again") },
+        };
+        oc_search_results in = { 2, ents };
+        ROUNDTRIP(oc_encode_search_results(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH_RESULTS, h, p);
+        oc_search_result_entry out[2]; uint16_t n = 0;
+        CHECK(oc_decode_search_results(&p, out, 2, &n) == OC_OK);
+        CHECK(n == 2);
+        CHECK(out[0].message_id == 1001 && out[0].channel_id == 7 && out[0].author_id == 42);
+        CHECK(out[0].server_time == 1751200500000ull && slice_eq_str(out[0].snippet, "... the deploy ..."));
+        CHECK(out[1].message_id == 990 && slice_eq_str(out[1].snippet, "deploy again"));
+    }
+}
+
 static void test_backfill_and_error(void) {
     {
         oc_cursor cursors[3] = { {7, 1000}, {8, 0}, {9, 512} };
@@ -587,6 +611,7 @@ int run_protocol_tests(void) {
     test_thread_frames();
     test_channel_frames();
     test_admin_frames();
+    test_search_frames();
     test_backfill_and_error();
     test_size_limits();
     test_malformed();

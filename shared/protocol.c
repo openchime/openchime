@@ -544,6 +544,26 @@ oc_result oc_encode_redeem_invite(oc_wbuf *w, uint16_t version, const oc_redeem_
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_search(oc_wbuf *w, uint16_t version, const oc_search *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SEARCH);
+    oc_w_str(w, m->query);
+    oc_w_u16(w, m->limit);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_search_results(oc_wbuf *w, uint16_t version, const oc_search_results *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SEARCH_RESULTS);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        oc_w_u64(w, m->entries[i].message_id);
+        oc_w_u64(w, m->entries[i].channel_id);
+        oc_w_u64(w, m->entries[i].author_id);
+        oc_w_u64(w, m->entries[i].server_time);
+        oc_w_str(w, m->entries[i].snippet);
+    }
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_backfill_request(oc_wbuf *w, uint16_t version, const oc_backfill_request *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_BACKFILL_REQUEST);
     oc_w_u16(w, m->count);
@@ -872,6 +892,33 @@ oc_result oc_decode_redeem_invite(oc_rbuf *p, oc_redeem_invite *m) {
     m->token = oc_r_bytes(p);
     m->username = oc_r_str(p);
     m->password = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_search(oc_rbuf *p, oc_search *m) {
+    m->query = oc_r_str(p);
+    m->limit = oc_r_u16(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries,
+                                   uint16_t cap, uint16_t *out_count) {
+    uint16_t count = oc_r_u16(p);
+    *out_count = count;
+    for (uint16_t i = 0; i < count; i++) {
+        uint64_t mid = oc_r_u64(p);
+        uint64_t ch = oc_r_u64(p);
+        uint64_t author = oc_r_u64(p);
+        uint64_t ts = oc_r_u64(p);
+        oc_slice snip = oc_r_str(p);
+        if (i < cap) {
+            entries[i].message_id = mid;
+            entries[i].channel_id = ch;
+            entries[i].author_id = author;
+            entries[i].server_time = ts;
+            entries[i].snippet = snip;
+        }
+    }
     return r_done(p);
 }
 

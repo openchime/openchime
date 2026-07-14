@@ -50,7 +50,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 5);
+    CHECK(oc_schema_version(db) == 6);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -1132,6 +1132,95 @@ static void test_threads(void) {
     cleanup_db(path);
 }
 
+/* --- Full-text search (REQ-080) ----------------------------------------- */
+
+static oc_dbres *search(oc_dbwriter *w, uint64_t uid, const char *query, uint16_t limit) {
+    oc_job *j = oc_job_new(OC_JOB_SEARCH, 130);
+    j->user_id = uid; j->search_limit = limit;
+    oc_job_set_body(j, query, strlen(query));
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_search(void) {
+    const char *path = "build/test_dbwriter_search.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t alice = reg(w, "se-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "se-bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 1, sizeof idem); uint64_t m_fox    = send_msg(w, alice, idem, "the quick brown fox");
+    memset(idem, 2, sizeof idem); uint64_t m_deploy = send_msg(w, alice, idem, "deploy the pipeline");
+    memset(idem, 3, sizeof idem); uint64_t m_lunch  = send_msg(w, alice, idem, "lunch plans today");
+    CHECK(m_fox && m_deploy && m_lunch);
+
+    /* A term matches the one message that contains it, returned as a snippet. */
+    oc_dbres *r = search(w, alice, "deploy", 0);
+    CHECK(r && r->type == OC_RES_SEARCH && r->n_search == 1);
+    CHECK(r->search[0].message_id == m_deploy && r->search[0].body_len > 0);
+    oc_dbres_free(r);
+
+    /* A common term matches multiple messages, newest first (id DESC). */
+    r = search(w, alice, "the", 0);
+    CHECK(r && r->n_search == 2);
+    CHECK(r->search[0].message_id == m_deploy && r->search[1].message_id == m_fox);
+    oc_dbres_free(r);
+
+    /* Another member of the (public default) channel sees the same history. */
+    r = search(w, bob, "quick", 0);
+    CHECK(r && r->n_search == 1 && r->search[0].message_id == m_fox);
+    oc_dbres_free(r);
+
+    /* Member scoping: a private channel's messages are invisible to non-members. */
+    r = create_channel(w, alice, "vault", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t vault = r->channel_id;
+    oc_dbres_free(r);
+    uint64_t m_secret = send_id(w, alice, vault, "secret sauce recipe");
+    CHECK(m_secret != 0);
+    r = search(w, bob, "secret", 0);
+    CHECK(r && r->n_search == 0);                       /* bob is not a member */
+    oc_dbres_free(r);
+    r = search(w, alice, "secret", 0);
+    CHECK(r && r->n_search == 1 && r->search[0].message_id == m_secret);
+    oc_dbres_free(r);
+
+    /* An edit re-indexes: the old term stops matching, the new term matches. */
+    r = do_edit(w, alice, OC_DEFAULT_CHANNEL, m_deploy, "shipping the release");
+    CHECK(r && r->type == OC_RES_EDIT_OK);
+    oc_dbres_free(r);
+    r = search(w, alice, "deploy", 0);
+    CHECK(r && r->n_search == 0);
+    oc_dbres_free(r);
+    r = search(w, alice, "release", 0);
+    CHECK(r && r->n_search == 1 && r->search[0].message_id == m_deploy);
+    oc_dbres_free(r);
+
+    /* A tombstoned message drops out of the index (REQ-052). */
+    r = do_delete(w, alice, OC_DEFAULT_CHANNEL, m_lunch);
+    CHECK(r && r->type == OC_RES_DELETE_OK);
+    oc_dbres_free(r);
+    r = search(w, alice, "lunch", 0);
+    CHECK(r && r->n_search == 0);
+    oc_dbres_free(r);
+
+    /* An empty query returns nothing; punctuation-only input cannot crash the
+     * FTS grammar (it is quoted term-by-term). */
+    r = search(w, alice, "", 0);
+    CHECK(r && r->type == OC_RES_SEARCH && r->n_search == 0);
+    oc_dbres_free(r);
+    r = search(w, alice, "\"(* :^", 0);
+    CHECK(r && r->type == OC_RES_SEARCH && r->n_search == 0);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill\n");
     test_start_migrates_and_stops();
@@ -1146,6 +1235,7 @@ int run_dbwriter_tests(void) {
     test_admin_ops();
     test_reactions();
     test_threads();
+    test_search();
     test_backfill();
     return failures;
 }
