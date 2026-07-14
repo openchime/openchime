@@ -1,5 +1,9 @@
 # OpenChime
 
+For what is actually built vs. specified, see
+**[docs/STATUS.md](docs/STATUS.md)** — a reconciliation of every requirement
+against the current tree, plus the server-robustness backlog.
+
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md), and
 [docs/PROTOCOL.md](docs/PROTOCOL.md) (the byte-level wire protocol spec for the

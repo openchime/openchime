@@ -1,11 +1,15 @@
 # OpenChime — Requirements
 
-**Status:** pre-implementation specification. Written in descriptive,
-present-perfect tense ("the system has supported X") as a target-state
-contract — the form the finished system is required to take — even though no
-code has yet been written against it. This mirrors the reproduction-grade
+**Status:** target-state specification, partially implemented. Written in
+descriptive, present-perfect tense ("the system has supported X") as a
+target-state contract — the form the finished system is required to take. It is
+**not** a record of what is built; for that, see
+[STATUS.md](./STATUS.md), which reconciles each `REQ-NNN` below against the
+current tree (the daemon's messaging/auth/roles/channels/reactions/threads/search
+core is implemented; presence, notifications, attachments, audio, webhooks, and a
+full client are not). This present-perfect style mirrors the reproduction-grade
 style of OpenChime's sibling projects; here it functions as a forward
-specification rather than a record of an existing build.
+specification, with STATUS.md tracking progress against it.
 
 This document is technical scope only. Business model, pricing, licensing,
 and go-to-market decisions are out of scope; they are not tracked in any
