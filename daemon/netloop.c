@@ -26,6 +26,23 @@
 #define OC_USER_LIST_MAX    512
 #define OC_REACTION_LIST_MAX 1024
 
+/* Per-connection pending-output cap. A client that stops reading while the
+ * daemon keeps fanning out broadcasts would otherwise grow its output buffer
+ * without bound (a single-client memory-exhaustion DoS). At the cap the
+ * connection is dropped; nothing is lost because delivery is recoverable via
+ * reconnect + backfill. Sized to the ~256MB lean profile (REQ-210/211): even a
+ * few hundred simultaneously-backlogged connections stay bounded, while a normal
+ * client's buffer is near-empty. */
+#define OC_MAX_OUT_BUFFER    (1u << 20)   /* 1 MiB */
+
+/* Per-connection message-send rate limit (REQ-190): a fixed window bounds how
+ * fast one authenticated client can create messages (SEND / SEND_REPLY), which
+ * the broadcast fan-out would otherwise amplify to every channel member. Excess
+ * sends get a non-fatal SEND_RATE_LIMITED and are dropped. Generous for a human
+ * (10/s sustained, 30 burst); a tight send loop trips it immediately. */
+#define OC_SEND_RATE_MAX       30u
+#define OC_SEND_RATE_WINDOW_MS 3000u
+
 typedef enum { CONN_HANDSHAKE, CONN_ESTABLISHED } conn_state;
 
 typedef struct {
@@ -38,9 +55,11 @@ typedef struct {
     int          authed;
     uint64_t     user_id;
     char         source[46]; /* peer IP string, for per-source rate limiting */
-    uint8_t     *out;       /* growable pending-output buffer */
+    uint8_t     *out;       /* growable pending-output buffer (capped, see out_append) */
     size_t       out_cap, out_len, out_sent;
     uint32_t     events;    /* current epoll interest */
+    uint64_t     send_win_start; /* fixed-window start for the send rate limit */
+    uint32_t     send_count;     /* sends counted in the current window */
 } conn;
 
 /* Scratch for encoding one outgoing frame; net thread only, so a single static
@@ -59,6 +78,18 @@ static int set_nonblock(int fd) {
     return (fl < 0) ? -1 : fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
+/* Fixed-window send rate limit (REQ-190). Returns 1 if this send is within
+ * budget for the current window, 0 if the cap is exceeded. */
+static int send_rate_ok(conn *c) {
+    uint64_t now = now_ms();
+    if (now - c->send_win_start >= OC_SEND_RATE_WINDOW_MS) {
+        c->send_win_start = now;
+        c->send_count = 0;
+    }
+    c->send_count++;
+    return c->send_count <= OC_SEND_RATE_MAX;
+}
+
 /* --- Outgoing buffer ---------------------------------------------------- */
 
 static int out_append(conn *c, const uint8_t *buf, size_t len) {
@@ -68,6 +99,9 @@ static int out_append(conn *c, const uint8_t *buf, size_t len) {
         c->out_len = rem;
         c->out_sent = 0;
     }
+    /* Bound the backlog: a stuck/malicious reader can't grow this without limit.
+     * Over the cap, fail — send_bytes/flush_out then drop the connection. */
+    if (c->out_len + len > OC_MAX_OUT_BUFFER) return -1;
     if (c->out_len + len > c->out_cap) {
         size_t ncap = c->out_cap ? c->out_cap : 2048;
         while (ncap < c->out_len + len) ncap *= 2;
@@ -192,6 +226,17 @@ static int handle_hello(conn *c, oc_rbuf *payload, oc_dbwriter *dbw) {
 
 /* --- Frame dispatch ----------------------------------------------------- */
 
+/* Queue a non-fatal SEND_RATE_LIMITED error echoing the offending idempotency
+ * token (so the client can correlate the dropped send). Returns out_append's
+ * result: 0 keep the connection, -1 (buffer full) -> caller closes. */
+static int reject_send_rate(conn *c, const uint8_t idem[OC_IDEM_LEN]) {
+    uint8_t tmp[96]; oc_wbuf w; oc_wbuf_init(&w, tmp, sizeof tmp);
+    oc_slice ctx = { idem, OC_IDEM_LEN };
+    oc_error e = { OC_ERR_SEND_RATE_LIMITED, 0, ctx, oc_slice_str("send rate exceeded") };
+    oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+    return out_append(c, tmp, w.len);
+}
+
 /* Dispatch every buffered frame. Returns 0 to keep the connection, -1 to close.
  * AUTH/SEND become jobs for the DB writer; their replies arrive asynchronously
  * via deliver_result. */
@@ -253,6 +298,7 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_SEND) {
             oc_send s;
             if (oc_decode_send(&p, &s) != OC_OK) return -1;
+            if (!send_rate_ok(c)) { if (reject_send_rate(c, s.idem) != 0) return -1; continue; }
             oc_job *j = oc_job_new(OC_JOB_SEND, c->conn_id);
             if (!j) return -1;
             j->user_id = c->user_id;
@@ -399,6 +445,7 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_SEND_REPLY) {
             oc_send_reply sr;
             if (oc_decode_send_reply(&p, &sr) != OC_OK) return -1;
+            if (!send_rate_ok(c)) { if (reject_send_rate(c, sr.idem) != 0) return -1; continue; }
             oc_job *j = oc_job_new(OC_JOB_SEND_REPLY, c->conn_id);
             if (!j) return -1;
             j->user_id = c->user_id;

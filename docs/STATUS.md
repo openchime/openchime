@@ -99,7 +99,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 181 daemon-controlled session + expiry | ✅ | `sessions` table, daemon-set TTL. |
 | 182 session revocation / logout | ✅ | `LOGOUT` deletes rows + drops the connection. |
 | 183 TOFU self-signed pinning | ✅ | Webhook CA-cert exception (REQ-171) not built (webhooks not built). |
-| 190 per-connection send rate limit | ⛔ | **Reason code exists; no enforcement.** See robustness backlog. |
+| 190 per-connection send rate limit | ✅ | Per-connection fixed window (30 sends / 3s) on `SEND`/`SEND_REPLY`; excess → non-fatal `SEND_RATE_LIMITED`. |
 | 191 failed-auth rate limit (account + source) | ✅ | Fixed-window, checked before PBKDF2. |
 
 ### 9–10. Platform, Infrastructure
@@ -118,36 +118,41 @@ Correctness/hardening gaps **in already-shipped features** — the work to make
 the server production-robust before adding more features. Priority is a rough
 ordering, not a commitment.
 
-1. **REQ-190 — no SEND rate limit (High).** A single authenticated client can
-   flood `SEND` unbounded, amplified by broadcast fan-out to every channel
-   member. Add a per-connection fixed-window limiter (reuse `ratelimit.c`),
-   answering excess with the existing `SEND_RATE_LIMITED` code.
-2. **Unbounded per-connection output buffer (High).** `out_append` grows
-   `out_cap` to fit; a client that stops reading while the server fans out
-   broadcasts grows the buffer without bound → single-client memory-exhaustion
-   DoS. Cap the pending-output size and drop/disconnect a stuck consumer.
-3. **`sent_messages` never pruned (Medium).** ARCH-44 specifies ~24h pruning;
+**Resolved**
+
+- ✅ **REQ-190 — SEND rate limit.** A per-connection fixed-window limiter (30
+  sends / 3s) on `SEND`/`SEND_REPLY` in the net thread, answering excess with a
+  non-fatal `SEND_RATE_LIMITED` before the send becomes a job. Tested over the
+  wire.
+- ✅ **Per-connection output-buffer cap.** `out_append` now bounds the pending
+  output at 1 MiB; a client that stops reading while the daemon fans out is
+  dropped rather than growing daemon memory without limit (delivery stays
+  recoverable via reconnect + backfill). Tested over the wire.
+
+**Open**
+
+1. **`sent_messages` never pruned (Medium).** ARCH-44 specifies ~24h pruning;
    unbounded growth otherwise. Add a periodic delete job on the writer thread.
-4. **Single writer thread blocks on reads (Medium).** Search, backfill, and list
+2. **Single writer thread blocks on reads (Medium).** Search, backfill, and list
    ops run on the one DB-writer thread alongside all writes; a heavy query
    stalls every send/auth for that tenant. Consider a separate read-only
    connection (WAL readers don't block the writer) for query jobs.
-5. **`CLIENT_ACK` ignored — no delivery accounting (Medium).** Backfill relies
+3. **`CLIENT_ACK` ignored — no delivery accounting (Medium).** Backfill relies
    entirely on client-supplied cursors; the server keeps no per-client delivery
    cursor, so there's no server-side delivery state to reason about or prune.
-6. **No connection/accept throttle (Medium).** Fixed `OC_NETLOOP_MAX_FD` with no
+4. **No connection/accept throttle (Medium).** Fixed `OC_NETLOOP_MAX_FD` with no
    per-IP connection cap → connection-exhaustion DoS.
-7. **Litestream restore ↔ TOFU cert (Medium).** Restore-on-boot can change the
+5. **Litestream restore ↔ TOFU cert (Medium).** Restore-on-boot can change the
    self-signed cert, tripping every client's pin (open item in TLS.md). Decide:
    persist the cert in the replica, or a client re-pin flow.
-8. **Silent truncation signals (Low).** Thread/search/backfill cap at fixed
+6. **Silent truncation signals (Low).** Thread/search/backfill cap at fixed
    limits with no "more available" flag; a client can't tell it was truncated.
-9. **No load/stress/fuzz coverage (Low–Medium).** REQ-210/211 unverified; the
+7. **No load/stress/fuzz coverage (Low–Medium).** REQ-210/211 unverified; the
    codec has no fuzzer. A load test + a frame fuzzer would validate the
    memory/concurrency claims and parser robustness.
-10. **First-owner setup token (Low).** REQ-024 specifies a one-time setup token;
-    today the first owner comes from `OC_BOOTSTRAP_USERS`. Functional, but not
-    the spec'd air-gapped bootstrap.
+8. **First-owner setup token (Low).** REQ-024 specifies a one-time setup token;
+   today the first owner comes from `OC_BOOTSTRAP_USERS`. Functional, but not
+   the spec'd air-gapped bootstrap.
 
 ---
 
@@ -163,7 +168,8 @@ skeleton (the only consumer of all the above), and (b) whole **feature families
 not yet begun**: presence/typing, notifications/push, attachments, audio, and
 webhooks.
 
-Before building more, the **robustness backlog** above hardens the existing
-server — most importantly send rate-limiting (REQ-190) and the unbounded
-per-connection output buffer, which are the two clearest denial-of-service
-vectors in the current build.
+The two clearest denial-of-service vectors — an unthrottled `SEND` flood
+(REQ-190) and the unbounded per-connection output buffer — are now **closed**.
+The remaining **robustness backlog** above (idempotency-table pruning, moving
+query ops off the single writer thread, connection throttling, the restore↔cert
+interaction) continues hardening the server before new feature work.

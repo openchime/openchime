@@ -13,6 +13,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
 #include <pthread.h>
 #include <string.h>
 #include <unistd.h>
@@ -762,6 +763,94 @@ static void test_admin_vertical(int port, const uint8_t *pin) {
     client_close(&bob);
 }
 
+/* Per-connection send rate limit (REQ-190): a burst past the window cap is
+ * throttled with non-fatal SEND_RATE_LIMITED errors while the in-budget sends
+ * still succeed. */
+static void test_send_rate_limit(int port, const uint8_t *pin) {
+    client a;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+
+    /* Fire OC_SEND_RATE_MAX + 5 sends back-to-back (one window). The first
+     * OC_SEND_RATE_MAX are accepted (each -> SEND_ACK + BROADCAST to us), the
+     * rest are rejected (each -> one ERROR). */
+    const int max = 30;   /* mirrors OC_SEND_RATE_MAX in netloop.c */
+    const int over = 5;
+    for (int i = 0; i < max + over; i++) {
+        uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        oc_send s; s.channel_id = 1;
+        memset(s.idem, 0, OC_IDEM_SIZE); s.idem[0] = (uint8_t)i; s.idem[1] = 0x5A;
+        s.body = oc_slice_str("flood");
+        CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+        CHECK(send_frame(&a, buf, w.len) == 0);
+    }
+
+    /* Exactly max*(ACK+BROADCAST) + over*ERROR frames come back. */
+    int acks = 0, bcasts = 0, limited = 0;
+    for (int i = 0; i < max * 2 + over; i++) {
+        oc_header hdr; oc_rbuf p;
+        CHECK(read_frame(&a, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) acks++;
+        else if (hdr.msg_type == OC_MSG_BROADCAST) bcasts++;
+        else if (hdr.msg_type == OC_MSG_ERROR) {
+            oc_error e; CHECK(oc_decode_error(&p, &e) == OC_OK);
+            CHECK(e.code == OC_ERR_SEND_RATE_LIMITED && e.fatal == 0);
+            limited++;
+        } else CHECK(0 /* unexpected frame */);
+    }
+    CHECK(acks == max && bcasts == max && limited == over);
+
+    client_close(&a);
+}
+
+/* Per-connection output-buffer cap: a client that stops reading while the daemon
+ * fans a large backfill at it has its connection dropped rather than being
+ * allowed to grow the daemon's memory without bound. Seeds through the writer to
+ * bypass the wire send limit, and shrinks its own receive window so the cap is
+ * reached with a modest backlog. */
+static void test_out_buffer_cap(int port, const uint8_t *pin, oc_dbwriter *dbw, uint64_t flooder) {
+    CHECK(flooder != 0);
+    static uint8_t big[60000];
+    memset(big, 'x', sizeof big);
+    for (int i = 0; i < 60; i++) {           /* ~3.6 MB, well over the 1 MiB cap */
+        oc_job *j = oc_job_new(OC_JOB_SEND, 0);
+        if (!j) { CHECK(0); return; }
+        j->user_id = flooder; j->channel_id = 1;
+        memset(j->idem, 0, OC_IDEM_LEN); j->idem[0] = (uint8_t)i; j->idem[1] = 0xC7;
+        oc_job_set_body(j, big, sizeof big);
+        oc_dbwriter_submit(dbw, j);
+    }
+    usleep(400000);   /* let the writer persist them */
+
+    client v;
+    CHECK(client_open(&v, port, pin) == 0);
+    CHECK(do_handshake(&v) == 0);
+    uint64_t uv = 0;
+    CHECK(do_auth(&v, "flooder", "pw", &uv) == 0);
+    int rb = 8192;    /* tiny receive window: TCP backpressure hits fast */
+    setsockopt(v.fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof rb);
+
+    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_cursor cur = { 1, 0 };
+    oc_backfill_request req = { 1, &cur };
+    CHECK(oc_encode_backfill_request(&w, OC_PROTOCOL_VERSION, &req) == OC_OK);
+    CHECK(write_all(&v.conn, buf, w.len) == 0);
+
+    usleep(600000);   /* stay silent: the daemon fills our buffer past the cap */
+
+    /* The daemon dropped us mid-backfill: we never see a clean BACKFILL_DONE. */
+    int done = 0, closed = 0;
+    for (int i = 0; i < 4000; i++) {
+        oc_header hdr; oc_rbuf p;
+        if (read_frame(&v, &hdr, &p) != 0) { closed = 1; break; }
+        if (hdr.msg_type == OC_MSG_BACKFILL_DONE) { done = 1; break; }
+    }
+    CHECK(closed == 1 && done == 0);
+    client_close(&v);
+}
+
 /* LOGOUT over the wire: the daemon revokes the session and drops the
  * connection (REQ-182). */
 static void test_logout_closes(int port, const uint8_t *pin) {
@@ -783,7 +872,7 @@ static void test_logout_closes(int port, const uint8_t *pin) {
 }
 
 int run_netloop_tests(void) {
-    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, search, admin, logout\n");
+    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, search, rate-limit, out-cap, admin, logout\n");
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -803,6 +892,8 @@ int run_netloop_tests(void) {
     CHECK(oc_dbwriter_register_local(dbw, "bf-sender", "pw",       OC_ROLE_MEMBER, 2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw, "bf-reader", "pw",       OC_ROLE_MEMBER, 2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw, "carol",     "pw",       OC_ROLE_MEMBER, 2048) != 0);
+    uint64_t flooder = oc_dbwriter_register_local(dbw, "flooder", "pw", OC_ROLE_MEMBER, 2048);
+    CHECK(flooder != 0);
 
     struct loop_arg arg;
     arg.port = 18000 + (int)(getpid() % 2000);
@@ -821,6 +912,8 @@ int run_netloop_tests(void) {
         test_reactions_vertical(arg.port, pin);
         test_threads_vertical(arg.port, pin);
         test_search_vertical(arg.port, pin);
+        test_send_rate_limit(arg.port, pin);
+        test_out_buffer_cap(arg.port, pin, dbw, flooder);
         test_admin_vertical(arg.port, pin);
         test_logout_closes(arg.port, pin);
     }
