@@ -1,6 +1,11 @@
 openchimed
 build/
-third_party/
+# Ignore vendored third_party contents (mbedTLS/raylib are fetched by
+# scripts/build_*.sh) — but keep the jsmn single-header, which has no fetch
+# script and so must live in the repo. (Ignore the *contents* with /* rather
+# than the directory, so re-inclusion below is possible.)
+/third_party/*
+!/third_party/jsmn/
 *.o
 *.db
 *.db-shm
