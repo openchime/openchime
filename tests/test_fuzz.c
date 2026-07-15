@@ -75,6 +75,22 @@ static void decode_all(const uint8_t *buf, size_t len) {
     oc_redeem_invite ri; D(oc_decode_redeem_invite(&p, &ri));
     oc_backfill_done bd; D(oc_decode_backfill_done(&p, &bd));
     oc_error er; D(oc_decode_error(&p, &er));
+    oc_open_dm odm; D(oc_decode_open_dm(&p, &odm));
+    oc_set_presence sp; D(oc_decode_set_presence(&p, &sp));
+    oc_presence_update pu; D(oc_decode_presence_update(&p, &pu));
+    oc_typing ty; D(oc_decode_typing(&p, &ty));
+    oc_typing_update tu2; D(oc_decode_typing_update(&p, &tu2));
+    oc_upload_begin ub; D(oc_decode_upload_begin(&p, &ub));
+    oc_upload_ready urd; D(oc_decode_upload_ready(&p, &urd));
+    oc_upload_chunk uc; D(oc_decode_upload_chunk(&p, &uc));
+    oc_upload_ack uak; D(oc_decode_upload_ack(&p, &uak));
+    oc_upload_end ue2; D(oc_decode_upload_end(&p, &ue2));
+    oc_upload_ok uok; D(oc_decode_upload_ok(&p, &uok));
+    oc_download_begin db; D(oc_decode_download_begin(&p, &db));
+    oc_download_info di; D(oc_decode_download_info(&p, &di));
+    oc_download_chunk dc; D(oc_decode_download_chunk(&p, &dc));
+    oc_download_end den; D(oc_decode_download_end(&p, &den));
+    oc_transfer_cancel tc; D(oc_decode_transfer_cancel(&p, &tc));
 
     /* Array/paging decoders with small caller buffers. */
     { oc_cursor cur[4]; uint16_t nc = 0;

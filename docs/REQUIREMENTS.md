@@ -172,8 +172,9 @@ the requirement says so explicitly rather than implying one.
 - **REQ-053.** Full message history has had no retention cutoff or paid-tier
   history cap of the kind Slack's free tier imposes.
 - **REQ-054.** A message body has been capped at approximately 64KB
-  (ARCH-30). Attachments (REQ-140) have not been subject to this cap, since
-  they are never sent as protocol frames.
+  (ARCH-30). Attachment bytes (REQ-140) are exempt from this cap: they are
+  chunked across many frames (ARCH-69) and bounded instead by
+  `MAX_ATTACHMENT_SIZE`; each individual chunk still fits one frame.
 - **REQ-055.** A user has been able to open a direct-message conversation with
   **themselves** — a private personal space ("notes to self" / saved messages) —
   realized as a single-participant DM. Like any DM it has been idempotent (a
@@ -312,11 +313,20 @@ the requirement says so explicitly rather than implying one.
 
 - **REQ-140.** A user has been able to upload and share a file attachment in
   a channel, thread, or direct message, persisted in object storage rather
-  than in SQLite (ARCH-17).
+  than in SQLite (ARCH-17). Bytes are **proxied through the daemon** over the
+  existing pinned-TLS connection in chunks (ARCH-69, PROTOCOL.md §5.14); the
+  blob lands in object storage behind a swappable adapter (ARCH-70) while only a
+  pointer + metadata row is stored in SQLite (SCHEMA.md migration 0009). An
+  attachment is published by referencing it from a message, so it rides the one
+  message model through delivery, backfill, threads, and DMs.
 - **REQ-141.** An attachment has remained retrievable by any user authorized
   to read the message it is attached to (REQ-031), and by no one else, for
-  as long as the message itself exists. **[needs ARCH decision — signed URL
-  scheme / access control on the object storage layer]**
+  as long as the message itself exists. Resolved (ARCH-69): because every byte
+  is proxied through the daemon, access control is a **single in-daemon check on
+  the same membership path as reading the message** (`channel_read_access`) —
+  there is no signed-URL scheme, TTL, or object-store ACL. Proxying (not
+  presigned URLs) is forced by TOFU pinning (ARCH-10, one trusted cert, no CA
+  bundle) and the island model (ARCH-4/26, object store stays private).
 
 ### 6.2 Audio Conferencing
 

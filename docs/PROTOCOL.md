@@ -130,8 +130,13 @@ type-specific payload. All multi-byte integers are **network byte order**
 - `MAX_BODY_SIZE` = **65,536 bytes** (64 KiB) for a message body (REQ-054).
   The 1 KiB gap between body and frame limits is framing/field-header
   headroom, reconciling REQ-054's "~64KB body" with ARCH-30's "~64KB frame."
-- Attachments are never carried in a frame; they go through object storage
-  (ARCH-17, REQ-140). Nothing in this protocol transports file bytes.
+- `MAX_ATTACHMENT_SIZE` = **100 MiB** (default; `OPENCHIME_MAX_ATTACHMENT_SIZE`
+  overridable, REQ-140). A file's *bytes* are never in SQLite (they go to object
+  storage, ARCH-17/70), but they **do** transport over this protocol — proxied
+  through the daemon, split into chunks (§5.14). Each chunk is an ordinary frame:
+  its `data` payload is capped so the whole frame stays `<= MAX_FRAME_SIZE`, so
+  the reassembly/parse path is unchanged. Attachment bytes are exempt from
+  `MAX_BODY_SIZE` (that governs message text only).
 
 ### 2.2 Reading discipline (ARCH-9)
 
@@ -741,6 +746,87 @@ each new `TYPING_UPDATE` for that `(channel, user)`.
 
 ---
 
+### 5.14 Attachments (REQ-140, REQ-141)
+
+File bytes are **proxied through the daemon** over this same pinned-TLS
+connection, split into chunks — never fetched from a directly-reachable object
+store via a signed URL (ARCH-69). This makes access control a single in-daemon
+check on the ordinary membership path (§5.7, REQ-031), identical to reading the
+message the attachment hangs off — there is no URL to leak and no object-store
+ACL to configure (resolves REQ-141). The blob itself lands in object storage,
+never SQLite (ARCH-17/70); only pointer + metadata rows are stored.
+
+A transfer is a short state machine over the existing frame stream; the
+`attachment_id` correlates all frames of one transfer, and either side may abort
+with `TRANSFER_CANCEL`. Chunk `data` is bounded so each frame stays
+`<= MAX_FRAME_SIZE`; total bytes are bounded by `MAX_ATTACHMENT_SIZE` (§2.1).
+
+**Upload (client → server bytes):**
+
+1. **`UPLOAD_BEGIN` (C → S), `0x0080`** `{ channel_id: u64, idempotency_token:
+   16B, filename: str, mime: str, total_size: u64 }` — the client declares an
+   upload targeting a channel/DM it can post to. The server authorizes
+   membership, checks `total_size <= MAX_ATTACHMENT_SIZE`, allocates an
+   `attachment_id` + opaque storage key, and opens a streaming write to object
+   storage. Idempotent on `(channel, token)` like `SEND` (§5.1, ARCH-44). On
+   failure → `ERROR` (`FORBIDDEN`, `ATTACHMENT_TOO_LARGE`, …).
+2. **`UPLOAD_READY` (S → C), `0x0081`** `{ attachment_id: u64, chunk_size: u32,
+   window_bytes: u32 }` — the server advertises the max `data` per chunk and the
+   **in-flight window**: the client may have at most `window_bytes` of un-acked
+   chunk data outstanding.
+3. **`UPLOAD_CHUNK` (C → S), `0x0082`** `{ attachment_id: u64, seq: u32, data:
+   bytes }` — sequential chunks. The server streams each to storage. If the
+   storage writer falls behind, the net thread stops reading this connection
+   (drops `EPOLLIN`) so TCP flow control throttles the client; the window plus
+   `UPLOAD_ACK` bound app-level in-flight bytes.
+4. **`UPLOAD_ACK` (S → C), `0x0083`** `{ attachment_id: u64, acked_through: u32 }`
+   — advances the window as chunks are durably handed to storage; the client may
+   send more once space frees.
+5. **`UPLOAD_END` (C → S), `0x0084`** `{ attachment_id: u64 }` — the client
+   signals completion. The server finalizes the object, verifies the received
+   size equals `total_size`, and commits the `attachments` row on the DB-writer
+   thread. On mismatch → `ERROR` and the partial blob is discarded.
+6. **`UPLOAD_OK` (S → C), `0x0085`** `{ attachment_id: u64, size: u64, sha256:
+   bytes }` — the attachment is now **pending**: owned by the uploader, bound to
+   the target channel, not yet visible. The client references it in a subsequent
+   message to publish it (below).
+
+**Linking to a message.** An attachment becomes visible only when referenced by
+a message. `SEND` / `SEND_REPLY` gain an optional trailing **attachment list**
+(`count: u16` then `count × { attachment_id: u64 }`), introduced at a **bumped
+protocol version** so an older peer negotiates down and never sees the new field.
+The server validates each id is a pending attachment owned by the caller and
+targeting this channel, flips it to committed, and includes its metadata in the
+outgoing frame. `BROADCAST` / `THREAD_REPLY` correspondingly carry a trailing
+attachment list of `{ attachment_id, filename, mime, size }`, so every reader —
+live, via backfill (§6), or in a thread (§5.10) — sees the attachment through the
+one message model, with no attachment-specific delivery path. A message body may
+be empty when it carries attachments.
+
+**Download (server → client bytes):**
+
+1. **`DOWNLOAD_BEGIN` (C → S), `0x0086`** `{ attachment_id: u64 }` — the server
+   authorizes the requester against the message the attachment belongs to
+   (`channel_read_access`, REQ-141); an unauthorized or unknown id → `ERROR`
+   (`FORBIDDEN` / `NOT_FOUND`). It opens a streaming read from storage on a
+   transfer worker.
+2. **`DOWNLOAD_INFO` (S → C), `0x0087`** `{ attachment_id: u64, filename: str,
+   mime: str, total_size: u64, sha256: bytes }` — sent once before the bytes.
+3. **`DOWNLOAD_CHUNK` (S → C), `0x0088`** `{ attachment_id: u64, seq: u32, data:
+   bytes }` — sequential chunks. Backpressure is implicit: the worker pauses
+   reading from storage when this connection's output buffer nears the 1 MiB cap
+   and resumes on `EPOLLOUT` drain, so a slow reader never grows daemon memory
+   (the same discipline as message fan-out).
+4. **`DOWNLOAD_END` (S → C), `0x0089`** `{ attachment_id: u64 }` — all bytes
+   sent; the client verifies the reassembled size (and optionally `sha256`).
+
+**`TRANSFER_CANCEL` (C → S), `0x008A`** `{ attachment_id: u64 }` — aborts an
+in-progress upload or download; the server tears down the transfer and, for an
+uncommitted upload, discards the partial blob. Abandoned uploads that never
+finalize are swept by a time-gated cleanup (ARCH-70).
+
+---
+
 ## 6. Reconnect backfill (resolves REQ-101)
 
 A client that reconnects (REQ-100) requests everything it missed since its
@@ -905,14 +991,26 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0071` | `PRESENCE_UPDATE`  | S → C     | no        | §5.13   |
 | `0x0072` | `TYPING`           | C → S     | no        | §5.13   |
 | `0x0073` | `TYPING_UPDATE`    | S → C     | no        | §5.13   |
+| `0x0080` | `UPLOAD_BEGIN`     | C → S     | no        | §5.14   |
+| `0x0081` | `UPLOAD_READY`     | S → C     | no        | §5.14   |
+| `0x0082` | `UPLOAD_CHUNK`     | C → S     | no        | §5.14   |
+| `0x0083` | `UPLOAD_ACK`       | S → C     | no        | §5.14   |
+| `0x0084` | `UPLOAD_END`       | C → S     | no        | §5.14   |
+| `0x0085` | `UPLOAD_OK`        | S → C     | no        | §5.14   |
+| `0x0086` | `DOWNLOAD_BEGIN`   | C → S     | no        | §5.14   |
+| `0x0087` | `DOWNLOAD_INFO`    | S → C     | no        | §5.14   |
+| `0x0088` | `DOWNLOAD_CHUNK`   | S → C     | no        | §5.14   |
+| `0x0089` | `DOWNLOAD_END`     | S → C     | no        | §5.14   |
+| `0x008A` | `TRANSFER_CANCEL`  | C → S     | no        | §5.14   |
 | `0x0030` | `BACKFILL_REQUEST` | C → S     | no        | §6.1    |
 | `0x0031` | `BACKFILL_DONE`    | S → C     | no        | §6.2    |
 | `0x00FF` | `ERROR`            | S → C     | no        | §8.1    |
 
 Ranges are left sparse (`0x0001–` handshake, `0x0010–` auth/session, `0x0020–`
 messaging, `0x0030–` reconnect, `0x0040–` users/profiles, `0x0050–` channel
-management, `0x0060–` search, `0x0070–` presence/typing, `0x00FF` error) so later
-revisions can slot in audio signaling without renumbering. The `0x0040–0x0047`
+management, `0x0060–` search, `0x0070–` presence/typing, `0x0080–` attachment
+transfer, `0x00FF` error) so later revisions can slot in audio signaling without
+renumbering. The `0x0040–0x0047`
 management frames (user enumeration, roles, tenant invite/remove; §5.8) are
 defined; `0x0048` `UPDATE_PROFILE` (avatar/display-name edit) remains **reserved**
 until that milestone lands.
@@ -960,6 +1058,8 @@ until that milestone lands.
 | REQ-111     | `VERSION_TOO_OLD` / `VERSION_TOO_NEW` reason codes distinguish the remedy (§3.3, §8.2, ARCH-41). |
 | REQ-120     | `SET_PRESENCE` / `PRESENCE_UPDATE` + auth-time online snapshot (§5.13, ARCH-67). |
 | REQ-121     | Member-scoped `TYPING` / `TYPING_UPDATE`; ~6s client-side expiry, no stop frame (§5.13, ARCH-68). |
+| REQ-140     | Chunked upload/download proxied through the daemon; blob in object storage, pointer in SQLite (§5.14, ARCH-69/70). |
+| REQ-141     | Every byte proxied, so access control is the ordinary membership check on the attached message — no signed URLs (§5.14, ARCH-69). |
 
 Related decisions newly recorded in ARCHITECTURE.md: ARCH-41 (handshake &
 version negotiation), ARCH-42 (primitive field encodings), ARCH-43 (message id

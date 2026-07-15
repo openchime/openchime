@@ -491,6 +491,91 @@ oc_result oc_encode_typing_update(oc_wbuf *w, uint16_t version, const oc_typing_
     return oc_frame_end(w, off);
 }
 
+/* --- Attachment transfer (REQ-140/141, ARCH-69) ------------------------- */
+
+oc_result oc_encode_upload_begin(oc_wbuf *w, uint16_t version, const oc_upload_begin *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_UPLOAD_BEGIN);
+    oc_w_u64(w, m->channel_id);
+    oc_w_idem(w, m->idem);
+    oc_w_str(w, m->filename);
+    oc_w_str(w, m->mime);
+    oc_w_u64(w, m->total_size);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_upload_ready(oc_wbuf *w, uint16_t version, const oc_upload_ready *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_UPLOAD_READY);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u32(w, m->chunk_size);
+    oc_w_u32(w, m->window_bytes);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_upload_chunk(oc_wbuf *w, uint16_t version, const oc_upload_chunk *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_UPLOAD_CHUNK);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u32(w, m->seq);
+    oc_w_bytes(w, m->data);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_upload_ack(oc_wbuf *w, uint16_t version, const oc_upload_ack *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_UPLOAD_ACK);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u32(w, m->acked_through);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_upload_end(oc_wbuf *w, uint16_t version, const oc_upload_end *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_UPLOAD_END);
+    oc_w_u64(w, m->attachment_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_upload_ok(oc_wbuf *w, uint16_t version, const oc_upload_ok *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_UPLOAD_OK);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u64(w, m->size);
+    oc_w_bytes(w, m->sha256);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_download_begin(oc_wbuf *w, uint16_t version, const oc_download_begin *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_DOWNLOAD_BEGIN);
+    oc_w_u64(w, m->attachment_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_download_info(oc_wbuf *w, uint16_t version, const oc_download_info *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_DOWNLOAD_INFO);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_str(w, m->filename);
+    oc_w_str(w, m->mime);
+    oc_w_u64(w, m->total_size);
+    oc_w_bytes(w, m->sha256);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_download_chunk(oc_wbuf *w, uint16_t version, const oc_download_chunk *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_DOWNLOAD_CHUNK);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u32(w, m->seq);
+    oc_w_bytes(w, m->data);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_download_end(oc_wbuf *w, uint16_t version, const oc_download_end *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_DOWNLOAD_END);
+    oc_w_u64(w, m->attachment_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_transfer_cancel(oc_wbuf *w, uint16_t version, const oc_transfer_cancel *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_TRANSFER_CANCEL);
+    oc_w_u64(w, m->attachment_id);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_join_channel(oc_wbuf *w, uint16_t version, const oc_channel_ref *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_JOIN_CHANNEL);
     oc_w_u64(w, m->channel_id);
@@ -874,6 +959,78 @@ oc_result oc_decode_typing(oc_rbuf *p, oc_typing *m) {
 oc_result oc_decode_typing_update(oc_rbuf *p, oc_typing_update *m) {
     m->channel_id = oc_r_u64(p);
     m->user_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_upload_begin(oc_rbuf *p, oc_upload_begin *m) {
+    m->channel_id = oc_r_u64(p);
+    oc_r_idem(p, m->idem);
+    m->filename = oc_r_str(p);
+    m->mime = oc_r_str(p);
+    m->total_size = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_upload_ready(oc_rbuf *p, oc_upload_ready *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->chunk_size = oc_r_u32(p);
+    m->window_bytes = oc_r_u32(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_upload_chunk(oc_rbuf *p, oc_upload_chunk *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->seq = oc_r_u32(p);
+    m->data = oc_r_bytes(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_upload_ack(oc_rbuf *p, oc_upload_ack *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->acked_through = oc_r_u32(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_upload_end(oc_rbuf *p, oc_upload_end *m) {
+    m->attachment_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_upload_ok(oc_rbuf *p, oc_upload_ok *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->size = oc_r_u64(p);
+    m->sha256 = oc_r_bytes(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_download_begin(oc_rbuf *p, oc_download_begin *m) {
+    m->attachment_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_download_info(oc_rbuf *p, oc_download_info *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->filename = oc_r_str(p);
+    m->mime = oc_r_str(p);
+    m->total_size = oc_r_u64(p);
+    m->sha256 = oc_r_bytes(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_download_chunk(oc_rbuf *p, oc_download_chunk *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->seq = oc_r_u32(p);
+    m->data = oc_r_bytes(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_download_end(oc_rbuf *p, oc_download_end *m) {
+    m->attachment_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_transfer_cancel(oc_rbuf *p, oc_transfer_cancel *m) {
+    m->attachment_id = oc_r_u64(p);
     return r_done(p);
 }
 

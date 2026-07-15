@@ -502,6 +502,97 @@ static void test_presence_frames(void) {
     }
 }
 
+static void test_attachment_frames(void) {
+    uint8_t idem[OC_IDEM_SIZE];
+    for (int i = 0; i < (int)OC_IDEM_SIZE; i++) idem[i] = (uint8_t)(0x30 + i);
+    uint8_t digest[32];
+    for (int i = 0; i < 32; i++) digest[i] = (uint8_t)(0xC0 + i);
+    {
+        oc_upload_begin in; in.channel_id = 5; memcpy(in.idem, idem, OC_IDEM_SIZE);
+        in.filename = oc_slice_str("report.pdf"); in.mime = oc_slice_str("application/pdf");
+        in.total_size = 1048576;
+        ROUNDTRIP(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_UPLOAD_BEGIN, h, p);
+        oc_upload_begin out;
+        CHECK(oc_decode_upload_begin(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 5 && memcmp(out.idem, idem, OC_IDEM_SIZE) == 0);
+        CHECK(slice_eq_str(out.filename, "report.pdf") && slice_eq_str(out.mime, "application/pdf"));
+        CHECK(out.total_size == 1048576);
+    }
+    {
+        oc_upload_ready in = { 99, OC_ATTACH_CHUNK_SIZE, 262144 };
+        ROUNDTRIP(oc_encode_upload_ready(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_UPLOAD_READY, h, p);
+        oc_upload_ready out;
+        CHECK(oc_decode_upload_ready(&p, &out) == OC_OK);
+        CHECK(out.attachment_id == 99 && out.chunk_size == OC_ATTACH_CHUNK_SIZE && out.window_bytes == 262144);
+    }
+    {
+        oc_upload_chunk in; in.attachment_id = 99; in.seq = 3;
+        in.data = (oc_slice){ (const uint8_t *)"blobbytes", 9 };
+        ROUNDTRIP(oc_encode_upload_chunk(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_UPLOAD_CHUNK, h, p);
+        oc_upload_chunk out;
+        CHECK(oc_decode_upload_chunk(&p, &out) == OC_OK);
+        CHECK(out.attachment_id == 99 && out.seq == 3 && out.data.len == 9);
+        CHECK(memcmp(out.data.ptr, "blobbytes", 9) == 0);
+    }
+    {
+        oc_upload_ack in = { 99, 4 };
+        ROUNDTRIP(oc_encode_upload_ack(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_UPLOAD_ACK, h, p);
+        oc_upload_ack out;
+        CHECK(oc_decode_upload_ack(&p, &out) == OC_OK && out.attachment_id == 99 && out.acked_through == 4);
+    }
+    {
+        oc_upload_end in = { 99 };
+        ROUNDTRIP(oc_encode_upload_end(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_UPLOAD_END, h, p);
+        oc_upload_end out;
+        CHECK(oc_decode_upload_end(&p, &out) == OC_OK && out.attachment_id == 99);
+    }
+    {
+        oc_upload_ok in; in.attachment_id = 99; in.size = 1048576;
+        in.sha256 = (oc_slice){ digest, 32 };
+        ROUNDTRIP(oc_encode_upload_ok(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_UPLOAD_OK, h, p);
+        oc_upload_ok out;
+        CHECK(oc_decode_upload_ok(&p, &out) == OC_OK);
+        CHECK(out.attachment_id == 99 && out.size == 1048576 && out.sha256.len == 32);
+        CHECK(memcmp(out.sha256.ptr, digest, 32) == 0);
+    }
+    {
+        oc_download_begin in = { 99 };
+        ROUNDTRIP(oc_encode_download_begin(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DOWNLOAD_BEGIN, h, p);
+        oc_download_begin out;
+        CHECK(oc_decode_download_begin(&p, &out) == OC_OK && out.attachment_id == 99);
+    }
+    {
+        oc_download_info in; in.attachment_id = 99;
+        in.filename = oc_slice_str("report.pdf"); in.mime = oc_slice_str("application/pdf");
+        in.total_size = 1048576; in.sha256 = (oc_slice){ digest, 32 };
+        ROUNDTRIP(oc_encode_download_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DOWNLOAD_INFO, h, p);
+        oc_download_info out;
+        CHECK(oc_decode_download_info(&p, &out) == OC_OK);
+        CHECK(out.attachment_id == 99 && out.total_size == 1048576);
+        CHECK(slice_eq_str(out.filename, "report.pdf") && out.sha256.len == 32);
+    }
+    {
+        oc_download_chunk in; in.attachment_id = 99; in.seq = 0;
+        in.data = (oc_slice){ (const uint8_t *)"xyz", 3 };
+        ROUNDTRIP(oc_encode_download_chunk(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DOWNLOAD_CHUNK, h, p);
+        oc_download_chunk out;
+        CHECK(oc_decode_download_chunk(&p, &out) == OC_OK);
+        CHECK(out.attachment_id == 99 && out.seq == 0 && out.data.len == 3);
+    }
+    {
+        oc_download_end in = { 99 };
+        ROUNDTRIP(oc_encode_download_end(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DOWNLOAD_END, h, p);
+        oc_download_end out;
+        CHECK(oc_decode_download_end(&p, &out) == OC_OK && out.attachment_id == 99);
+    }
+    {
+        oc_transfer_cancel in = { 99 };
+        ROUNDTRIP(oc_encode_transfer_cancel(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TRANSFER_CANCEL, h, p);
+        oc_transfer_cancel out;
+        CHECK(oc_decode_transfer_cancel(&p, &out) == OC_OK && out.attachment_id == 99);
+    }
+}
+
 static void test_backfill_and_error(void) {
     {
         oc_cursor cursors[3] = { {7, 1000}, {8, 0}, {9, 512} };
@@ -651,6 +742,7 @@ int run_protocol_tests(void) {
     test_admin_frames();
     test_search_frames();
     test_presence_frames();
+    test_attachment_frames();
     test_backfill_and_error();
     test_size_limits();
     test_malformed();

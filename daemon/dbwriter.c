@@ -124,6 +124,8 @@ static void job_free(oc_job *j) {
     free(j->emoji);
     free(j->cert_pem);
     free(j->key_pem);
+    free(j->filename);
+    free(j->mime);
     free(j);
 }
 
@@ -147,6 +149,9 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->search);
     free(r->cert_pem);
     free(r->key_pem);
+    free(r->storage_key);
+    free(r->filename);
+    free(r->mime);
     free(r);
 }
 
@@ -583,7 +588,9 @@ static oc_dbres *process_logout(sqlite3 *db, const oc_job *j) {
         }
         sqlite3_prepare_v2(db,
             "DELETE FROM sessions WHERE token_hash=? AND user_id=?;", -1, &st, NULL);
-        sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
+        /* TRANSIENT: `hash` is block-scoped and would dangle at sqlite3_step()
+         * (below, outside this block) under SQLITE_STATIC — copy it now. */
+        sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_TRANSIENT);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
     }
     sqlite3_step(st);
@@ -1846,13 +1853,147 @@ static oc_dbres *process_typing(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Attachments (REQ-140/141, ARCH-69/70). CREATE mints a pending row (message_id
+ * NULL, sha256 NULL) for an upload targeting a channel the caller may post to,
+ * and hands back the row id + an opaque storage key so the net thread can open
+ * the blob. The blob bytes never touch this thread — only the pointer. Write. */
+static oc_dbres *process_attach_create(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+
+    if (j->att_size > OC_MAX_ATTACHMENT_SIZE) {
+        r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_ATTACHMENT_TOO_LARGE;
+        return r;
+    }
+    int acc = channel_post_access(db, j->channel_id, j->user_id);
+    if (acc == CH_UNKNOWN) { r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
+    if (acc == CH_DENIED)  { r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;   return r; }
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO attachments(channel_id, message_id, uploader_id, storage_key, "
+        "  filename, mime, size, sha256, created_at_ms) "
+        "VALUES(?, NULL, ?, '', ?, ?, ?, NULL, ?);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_bind_text (st, 3, j->filename ? j->filename : "", -1, SQLITE_STATIC);
+    sqlite3_bind_text (st, 4, j->mime ? j->mime : "", -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)j->att_size);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)dbw_now_ms());
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+
+    uint64_t aid = (uint64_t)sqlite3_last_insert_rowid(db);
+    /* The storage key is the row id in hex — unique, opaque, never on the wire. */
+    char key[32];
+    snprintf(key, sizeof key, "%016llx", (unsigned long long)aid);
+    sqlite3_prepare_v2(db, "UPDATE attachments SET storage_key=? WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_text (st, 1, key, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)aid);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+
+    r->type = OC_RES_ATTACH_CREATED;
+    r->attachment_id = aid;
+    r->storage_key = strdup(key);
+    r->att_size = j->att_size;
+    return r;
+}
+
+/* FINALIZE records the streamed byte count + digest on UPLOAD_END, verifying the
+ * received size matches what UPLOAD_BEGIN declared. A non-NULL sha256 marks the
+ * blob complete and thus downloadable; a size mismatch is refused (the net
+ * thread discards the partial blob). Only the uploader may finalize, and only a
+ * still-pending (unfinalized) row. Write. */
+static oc_dbres *process_attach_finalize(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->attachment_id = j->attachment_id;
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT size, uploader_id, sha256 FROM attachments WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+    int found = sqlite3_step(st) == SQLITE_ROW;
+    uint64_t declared = found ? (uint64_t)sqlite3_column_int64(st, 0) : 0;
+    uint64_t owner    = found ? (uint64_t)sqlite3_column_int64(st, 1) : 0;
+    int already       = found && sqlite3_column_type(st, 2) != SQLITE_NULL;
+    sqlite3_finalize(st);
+
+    if (!found || owner != j->user_id || already) {
+        r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_UNKNOWN_ATTACHMENT; return r;
+    }
+    if (j->att_size != declared) {
+        r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_TRANSFER_PROTOCOL; return r;
+    }
+
+    sqlite3_prepare_v2(db, "UPDATE attachments SET sha256=? WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_blob (st, 1, j->att_sha256, 32, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->attachment_id);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+
+    r->type = OC_RES_ATTACH_OK;
+    r->att_size = declared;
+    return r;
+}
+
+/* LOOKUP authorizes a download and returns the pointer + metadata. Access is the
+ * ordinary channel read check on the attachment's channel (REQ-141) — the same
+ * gate as reading a message — so proxying needs no signed URL. Only a finalized
+ * blob (sha256 present) is served. Read (query connection). */
+static oc_dbres *process_attach_lookup(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->attachment_id = j->attachment_id;
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT channel_id, storage_key, filename, mime, size, sha256 "
+        "FROM attachments WHERE id=? AND sha256 IS NOT NULL;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
+    if (sqlite3_step(st) != SQLITE_ROW) {
+        sqlite3_finalize(st);
+        r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_UNKNOWN_ATTACHMENT;
+        return r;
+    }
+    uint64_t cid = (uint64_t)sqlite3_column_int64(st, 0);
+    const char *key = (const char *)sqlite3_column_text(st, 1);
+    const char *fn  = (const char *)sqlite3_column_text(st, 2);
+    const char *mm  = (const char *)sqlite3_column_text(st, 3);
+    uint64_t sz     = (uint64_t)sqlite3_column_int64(st, 4);
+    const void *dg  = sqlite3_column_blob(st, 5);
+    int dglen       = sqlite3_column_bytes(st, 5);
+
+    if (!channel_read_access(db, cid, j->user_id)) {
+        sqlite3_finalize(st);
+        r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_FORBIDDEN;
+        return r;
+    }
+    r->type = OC_RES_ATTACH_META;
+    r->channel_id = cid;
+    r->storage_key = strdup(key ? key : "");
+    r->filename = strdup(fn ? fn : "");
+    r->mime = strdup(mm ? mm : "");
+    r->att_size = sz;
+    if (dg && dglen == 32) memcpy(r->att_sha256, dg, 32);
+    sqlite3_finalize(st);
+    return r;
+}
+
 /* Read-only query jobs run on the reader connection (ARCH-66), off the writer
  * thread, so a heavy search/backfill can't stall message sends or auth. */
 static int is_read_job(int type) {
     return type == OC_JOB_BACKFILL || type == OC_JOB_SEARCH ||
            type == OC_JOB_LIST_CHANNELS || type == OC_JOB_LIST_USERS ||
            type == OC_JOB_LIST_REACTIONS || type == OC_JOB_LIST_THREAD ||
-           type == OC_JOB_TYPING;
+           type == OC_JOB_TYPING || type == OC_JOB_ATTACH_LOOKUP;
 }
 
 /* Dispatch a read-only job against `rdb`. */
@@ -1864,6 +2005,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_LIST_REACTIONS) return process_list_reactions(rdb, j);
     if (j->type == OC_JOB_LIST_THREAD)    return process_list_thread(rdb, j);
     if (j->type == OC_JOB_TYPING)         return process_typing(rdb, j);
+    if (j->type == OC_JOB_ATTACH_LOOKUP)  return process_attach_lookup(rdb, j);
     return NULL;
 }
 
@@ -1891,6 +2033,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_CLIENT_ACK)     return process_client_ack(w->db, j);
     if (j->type == OC_JOB_LOAD_IDENTITY)  return process_load_identity(w->db, j);
     if (j->type == OC_JOB_STORE_IDENTITY) return process_store_identity(w->db, j);
+    if (j->type == OC_JOB_ATTACH_CREATE)   return process_attach_create(w->db, j);
+    if (j->type == OC_JOB_ATTACH_FINALIZE) return process_attach_finalize(w->db, j);
     return NULL;
 }
 

@@ -3,8 +3,11 @@
  */
 
 #include "netloop.h"
+#include "blobstore.h"
 #include "framebuf.h"
 #include "protocol.h"
+
+#include <mbedtls/sha256.h>
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -45,6 +48,34 @@
 
 typedef enum { CONN_HANDSHAKE, CONN_ESTABLISHED } conn_state;
 
+/* Attachment transfer state (REQ-140/141, ARCH-69). A connection carries at most
+ * one transfer at a time. Uploads stream client->blob (net-thread writes to the
+ * local blob store, which is fast page-cache I/O — a dedicated worker only
+ * becomes necessary for a remote/S3 backend). Downloads stream blob->client,
+ * paced by the output-buffer occupancy so a large file never buffers in full. */
+typedef enum {
+    XFER_NONE = 0,
+    XFER_UP_AWAIT_CREATE,   /* sent ATTACH_CREATE; awaiting the id + storage key */
+    XFER_UP_ACTIVE,         /* streaming UPLOAD_CHUNKs into the blob */
+    XFER_UP_AWAIT_FINAL,    /* blob committed; awaiting ATTACH_FINALIZE */
+    XFER_DOWN_AWAIT_LOOKUP, /* sent ATTACH_LOOKUP; awaiting authz + metadata */
+    XFER_DOWN_ACTIVE        /* streaming DOWNLOAD_CHUNKs from the blob */
+} xfer_state;
+
+typedef struct {
+    xfer_state       state;
+    uint64_t         attachment_id;
+    uint64_t         declared_size;   /* upload: bytes promised by UPLOAD_BEGIN */
+    uint64_t         received;        /* upload: bytes streamed so far */
+    uint32_t         next_seq;        /* next expected (upload) / next sent (download) */
+    oc_blob_writer  *bw;              /* upload sink */
+    mbedtls_sha256_context sha;       /* upload: running digest */
+    int              sha_init;        /* sha context needs freeing */
+    uint8_t          digest[32];      /* upload: final digest, echoed in UPLOAD_OK */
+    oc_blob_reader  *br;              /* download source */
+    uint64_t         remaining;       /* download: bytes still to send */
+} conn_xfer;
+
 typedef struct {
     int          fd;
     uint64_t     conn_id;
@@ -61,12 +92,29 @@ typedef struct {
     uint64_t     send_win_start; /* fixed-window start for the send rate limit */
     uint32_t     send_count;     /* sends counted in the current window */
     uint8_t      presence;       /* OC_PRESENCE_ONLINE / _AWAY (per connection) */
+    conn_xfer    xfer;           /* in-flight attachment transfer, if any */
 } conn;
 
 /* Scratch for encoding one outgoing frame; net thread only, so a single static
  * buffer is safe and avoids per-send allocation (bodies can be ~64KB). */
 static uint8_t g_enc[OC_MAX_FRAME_SIZE];
 static uint64_t g_next_conn_id = 1;
+
+/* Attachment blob store + the upload size cap (ARCH-70). Set once at the top of
+ * oc_netloop_run; the loop is single-threaded so file-scope state is safe, as
+ * with g_enc/g_next_conn_id. */
+static oc_blobstore *g_blobs;
+static uint64_t      g_max_attach = OC_MAX_ATTACHMENT_SIZE;
+
+/* Abort/close any in-flight transfer on a connection and reset its state. A
+ * still-open upload writer is aborted (its staged bytes discarded), so an
+ * interrupted upload never publishes a partial blob. */
+static void xfer_reset(conn_xfer *x) {
+    if (x->bw) { oc_blob_put_abort(x->bw); x->bw = NULL; }
+    if (x->br) { oc_blob_get_close(x->br); x->br = NULL; }
+    if (x->sha_init) { mbedtls_sha256_free(&x->sha); x->sha_init = 0; }
+    memset(x, 0, sizeof *x);
+}
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -144,7 +192,13 @@ static void conn_set_events(int ep, conn *c, uint32_t events) {
 
 static void update_interest(int ep, conn *c) {
     uint32_t ev = EPOLLIN;
-    if (c->out_len > c->out_sent) ev |= EPOLLOUT;
+    /* Pending output, or an active download with bytes still to stream, both need
+     * writability. epoll here is level-triggered, so keeping EPOLLOUT set while a
+     * download has bytes left drives the pump each time the socket is writable and
+     * naturally stalls when its buffer fills (backpressure, ARCH-69). */
+    if (c->out_len > c->out_sent ||
+        (c->xfer.state == XFER_DOWN_ACTIVE && c->xfer.remaining > 0))
+        ev |= EPOLLOUT;
     conn_set_events(ep, c, ev);
 }
 
@@ -158,6 +212,7 @@ static void conn_close(int ep, conn **conns, int fd) {
     uint64_t uid = c->user_id;
     int was_authed = c->authed;
     epoll_ctl(ep, EPOLL_CTL_DEL, fd, NULL);
+    xfer_reset(&c->xfer);
     oc_tls_conn_free(&c->tls);
     oc_framebuf_free(&c->fb);
     free(c->out);
@@ -299,6 +354,58 @@ static int reject_send_rate(conn *c, const uint8_t idem[OC_IDEM_LEN]) {
     oc_error e = { OC_ERR_SEND_RATE_LIMITED, 0, ctx, oc_slice_str("send rate exceeded") };
     oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
     return out_append(c, tmp, w.len);
+}
+
+/* --- Attachment transfer (REQ-140/141, ARCH-69) ------------------------- */
+
+/* Soft pending-output target while streaming a download: the pump tops the
+ * output buffer up to here and lets the rest follow on the next writable
+ * wakeup, so a 100 MiB download never buffers in full. Well under the 1 MiB
+ * hard output cap. Also the upload receive window advertised to the client. */
+#define OC_DOWNLOAD_SOFT_CAP  (256u * 1024u)
+#define OC_UPLOAD_WINDOW      (OC_ATTACH_CHUNK_SIZE * 8u)
+
+/* Non-fatal transfer error carrying the attachment id in `context` (8 bytes,
+ * big-endian) so the client can correlate, then reset the transfer. Returns
+ * out_append's result (0 keep, -1 buffer full -> caller closes). */
+static int send_transfer_error(conn *c, uint64_t aid, uint16_t code) {
+    uint8_t ctxb[8];
+    for (int i = 0; i < 8; i++) ctxb[i] = (uint8_t)(aid >> (56 - 8 * i));
+    uint8_t tmp[96]; oc_wbuf w; oc_wbuf_init(&w, tmp, sizeof tmp);
+    oc_slice ctx = { ctxb, 8 };
+    oc_error e = { code, 0, ctx, oc_slice_str("transfer error") };
+    oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+    int rc = out_append(c, tmp, w.len);
+    xfer_reset(&c->xfer);
+    return rc;
+}
+
+/* Stream DOWNLOAD_CHUNKs from the blob into the output buffer up to the soft cap;
+ * the rest follows on the next writable wakeup (EPOLLOUT stays armed while a
+ * download has bytes left). Emits DOWNLOAD_END once the blob is drained. */
+static void download_pump(conn *c) {
+    conn_xfer *x = &c->xfer;
+    if (x->state != XFER_DOWN_ACTIVE) return;
+    while (x->remaining > 0 && (c->out_len - c->out_sent) < OC_DOWNLOAD_SOFT_CAP) {
+        uint8_t data[OC_ATTACH_CHUNK_SIZE];
+        size_t want = x->remaining < sizeof data ? (size_t)x->remaining : sizeof data;
+        long n = oc_blob_get_chunk(x->br, data, want);
+        if (n <= 0) { send_transfer_error(c, x->attachment_id, OC_ERR_INTERNAL); return; }
+        oc_download_chunk ch = { x->attachment_id, x->next_seq, { data, (size_t)n } };
+        oc_wbuf w; oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_download_chunk(&w, OC_PROTOCOL_VERSION, &ch);
+        if (out_append(c, g_enc, w.len) != 0) return; /* hit hard cap; resume on drain */
+        x->next_seq++;
+        x->remaining -= (uint64_t)n;
+    }
+    if (x->remaining == 0) {
+        oc_download_end de = { x->attachment_id };
+        oc_wbuf w; oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_download_end(&w, OC_PROTOCOL_VERSION, &de);
+        out_append(c, g_enc, w.len);
+        oc_blob_get_close(x->br); x->br = NULL;
+        x->state = XFER_NONE;
+    }
 }
 
 /* Dispatch every buffered frame. Returns 0 to keep the connection, -1 to close.
@@ -612,6 +719,103 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
                 }
             }
             oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_UPLOAD_BEGIN) {
+            oc_upload_begin ub;
+            if (oc_decode_upload_begin(&p, &ub) != OC_OK) return -1;
+            if (c->xfer.state != XFER_NONE) {
+                if (send_transfer_error(c, 0, OC_ERR_TRANSFER_PROTOCOL) != 0) return -1;
+                continue;
+            }
+            if (ub.total_size > g_max_attach) {
+                if (send_transfer_error(c, 0, OC_ERR_ATTACHMENT_TOO_LARGE) != 0) return -1;
+                continue;
+            }
+            oc_job *j = oc_job_new(OC_JOB_ATTACH_CREATE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = ub.channel_id;
+            memcpy(j->idem, ub.idem, OC_IDEM_LEN);
+            j->att_size = ub.total_size;
+            j->filename = ub.filename.len ? strndup((const char *)ub.filename.ptr, ub.filename.len) : strdup("");
+            j->mime     = ub.mime.len     ? strndup((const char *)ub.mime.ptr, ub.mime.len)         : strdup("");
+            if (!j->filename || !j->mime) { return -1; }
+            oc_dbwriter_submit(dbw, j);
+            c->xfer.state = XFER_UP_AWAIT_CREATE;
+            c->xfer.declared_size = ub.total_size;
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_UPLOAD_CHUNK) {
+            oc_upload_chunk uc;
+            if (oc_decode_upload_chunk(&p, &uc) != OC_OK) return -1;
+            conn_xfer *x = &c->xfer;
+            if (x->state != XFER_UP_ACTIVE || uc.attachment_id != x->attachment_id ||
+                uc.seq != x->next_seq || uc.data.len > OC_ATTACH_CHUNK_SIZE ||
+                x->received + uc.data.len > x->declared_size) {
+                if (send_transfer_error(c, uc.attachment_id, OC_ERR_TRANSFER_PROTOCOL) != 0) return -1;
+                continue;
+            }
+            if (oc_blob_put_chunk(x->bw, uc.data.ptr, uc.data.len) != 0) {
+                if (send_transfer_error(c, uc.attachment_id, OC_ERR_INTERNAL) != 0) return -1;
+                continue;
+            }
+            if (uc.data.len) mbedtls_sha256_update(&x->sha, uc.data.ptr, uc.data.len);
+            x->received += uc.data.len;
+            x->next_seq++;
+            oc_upload_ack ack = { x->attachment_id, x->next_seq };
+            oc_wbuf w; oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_upload_ack(&w, OC_PROTOCOL_VERSION, &ack);
+            if (out_append(c, g_enc, w.len) != 0) return -1;
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_UPLOAD_END) {
+            oc_upload_end ue;
+            if (oc_decode_upload_end(&p, &ue) != OC_OK) return -1;
+            conn_xfer *x = &c->xfer;
+            if (x->state != XFER_UP_ACTIVE || ue.attachment_id != x->attachment_id ||
+                x->received != x->declared_size) {
+                if (send_transfer_error(c, ue.attachment_id, OC_ERR_TRANSFER_PROTOCOL) != 0) return -1;
+                continue;
+            }
+            mbedtls_sha256_finish(&x->sha, x->digest);
+            mbedtls_sha256_free(&x->sha); x->sha_init = 0;
+            int committed = oc_blob_put_commit(x->bw) == 0;
+            x->bw = NULL;  /* commit frees the writer on either outcome */
+            if (!committed) {
+                if (send_transfer_error(c, ue.attachment_id, OC_ERR_INTERNAL) != 0) return -1;
+                continue;
+            }
+            oc_job *j = oc_job_new(OC_JOB_ATTACH_FINALIZE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->attachment_id = x->attachment_id;
+            j->att_size = x->received;
+            memcpy(j->att_sha256, x->digest, 32);
+            oc_dbwriter_submit(dbw, j);
+            x->state = XFER_UP_AWAIT_FINAL;
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_DOWNLOAD_BEGIN) {
+            oc_download_begin db;
+            if (oc_decode_download_begin(&p, &db) != OC_OK) return -1;
+            if (c->xfer.state != XFER_NONE) {
+                if (send_transfer_error(c, db.attachment_id, OC_ERR_TRANSFER_PROTOCOL) != 0) return -1;
+                continue;
+            }
+            oc_job *j = oc_job_new(OC_JOB_ATTACH_LOOKUP, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->attachment_id = db.attachment_id;
+            oc_dbwriter_submit(dbw, j);
+            c->xfer.state = XFER_DOWN_AWAIT_LOOKUP;
+            c->xfer.attachment_id = db.attachment_id;
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_TRANSFER_CANCEL) {
+            oc_transfer_cancel tc;
+            if (oc_decode_transfer_cancel(&p, &tc) != OC_OK) return -1;
+            xfer_reset(&c->xfer);   /* aborts an open upload blob; drops a download */
             continue;
         }
         /* Other post-auth frame types are ignored by this skeleton. */
@@ -1054,6 +1258,85 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         }
         break;
     }
+    case OC_RES_ATTACH_CREATED: {
+        /* UPLOAD_BEGIN accepted: open the blob sink and tell the client to stream
+         * (REQ-140, ARCH-69). The blob bytes never came near the writer thread. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        conn_xfer *x = &c->xfer;
+        if (x->state != XFER_UP_AWAIT_CREATE) break;   /* client canceled/closed */
+        x->bw = oc_blob_put_begin(g_blobs, r->storage_key);
+        if (!x->bw) {
+            int fd = c->fd;
+            send_transfer_error(c, r->attachment_id, OC_ERR_INTERNAL);
+            if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
+            break;
+        }
+        x->attachment_id = r->attachment_id;
+        x->declared_size = r->att_size;
+        x->received = 0;
+        x->next_seq = 0;
+        mbedtls_sha256_init(&x->sha);
+        mbedtls_sha256_starts(&x->sha, 0);
+        x->sha_init = 1;
+        x->state = XFER_UP_ACTIVE;
+        oc_upload_ready rd = { r->attachment_id, OC_ATTACH_CHUNK_SIZE, OC_UPLOAD_WINDOW };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_upload_ready(&w, OC_PROTOCOL_VERSION, &rd);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_ATTACH_OK: {
+        /* UPLOAD_END finalized: confirm with the digest computed while streaming. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        conn_xfer *x = &c->xfer;
+        if (x->state != XFER_UP_AWAIT_FINAL) break;
+        int fd = c->fd;
+        oc_upload_ok ok = { x->attachment_id, r->att_size, { x->digest, 32 } };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_upload_ok(&w, OC_PROTOCOL_VERSION, &ok);
+        xfer_reset(x);
+        send_bytes(ep, conns, fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_ATTACH_META: {
+        /* DOWNLOAD_BEGIN authorized: open the blob and stream it (REQ-141). */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        conn_xfer *x = &c->xfer;
+        if (x->state != XFER_DOWN_AWAIT_LOOKUP) break;
+        x->br = oc_blob_get_begin(g_blobs, r->storage_key, NULL);
+        if (!x->br) {
+            int fd = c->fd;
+            send_transfer_error(c, r->attachment_id, OC_ERR_INTERNAL);
+            if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
+            break;
+        }
+        x->attachment_id = r->attachment_id;
+        x->remaining = r->att_size;
+        x->next_seq = 0;
+        x->state = XFER_DOWN_ACTIVE;
+        oc_download_info di = { r->attachment_id, oc_slice_str(r->filename ? r->filename : ""),
+                                oc_slice_str(r->mime ? r->mime : ""), r->att_size,
+                                { r->att_sha256, 32 } };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_download_info(&w, OC_PROTOCOL_VERSION, &di);
+        int fd = c->fd;
+        if (out_append(c, g_enc, w.len) != 0) { conn_close(ep, conns, fd); break; }
+        download_pump(c);
+        if (flush_out(c) < 0) { conn_close(ep, conns, fd); break; }
+        update_interest(ep, c);
+        break;
+    }
+    case OC_RES_ATTACH_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        int fd = c->fd;
+        send_transfer_error(c, r->attachment_id, r->err_code);   /* resets the xfer */
+        if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
+        break;
+    }
     case OC_RES_BACKFILL_OK: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
@@ -1110,6 +1393,18 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     int ep = epoll_create1(0);
     if (ep < 0) { close(lfd); free(conns); return -1; }
     int evfd = oc_dbwriter_eventfd(dbw);
+
+    /* Attachment blob store (ARCH-70) + upload size cap (REQ-140). Bytes are
+     * proxied through this loop to/from the store; keep it beside the daemon. */
+    {
+        const char *bd = getenv("OPENCHIME_BLOB_DIR");
+        if (!bd || !*bd) bd = "/data/blobs";
+        g_blobs = oc_blobstore_open(bd);
+        if (!g_blobs) { close(ep); close(lfd); free(conns); return -1; }
+        const char *cap = getenv("OPENCHIME_MAX_ATTACHMENT_SIZE");
+        g_max_attach = OC_MAX_ATTACHMENT_SIZE;
+        if (cap && *cap) { unsigned long long v = strtoull(cap, NULL, 10); if (v) g_max_attach = v; }
+    }
 
     /* Per-source-IP concurrent-connection cap (0 disables). Blunts a
      * connection-exhaustion flood from one host while staying generous enough
@@ -1205,6 +1500,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
             if (c->state == CONN_ESTABLISHED) {
                 if (on_readable(ep, conns, c, dbw) < 0) { flush_out(c); conn_close(ep, conns, fd); continue; }
             }
+            download_pump(c);   /* refill an active download as the socket drains */
             if (flush_out(c) < 0) { conn_close(ep, conns, fd); continue; }
             update_interest(ep, c);
         }
@@ -1212,6 +1508,8 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
 
     for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
         if (conns[fd]) conn_close(ep, conns, fd);
+    oc_blobstore_close(g_blobs);
+    g_blobs = NULL;
     close(ep);
     close(lfd);
     free(conns);

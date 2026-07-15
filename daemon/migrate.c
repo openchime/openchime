@@ -167,6 +167,29 @@ static const char MIGRATION_0008[] =
     "  created_at_ms INTEGER NOT NULL"
     ");";
 
+/* 0009: file attachments (REQ-140/141, ARCH-69/70). Blob bytes live in object
+ * storage, never here — this table holds only the pointer (`storage_key`) and
+ * metadata. `message_id` is NULL while an attachment is pending (uploaded but not
+ * yet referenced by a message); it is set when a SEND links it, at which point
+ * access control follows the message's channel (REQ-141). The two indexes serve
+ * delivery (fetch a message's attachments) and the orphan sweep of pending rows
+ * whose upload was abandoned (time-gated, like sent_messages pruning). */
+static const char MIGRATION_0009[] =
+    "CREATE TABLE attachments ("
+    "  id            INTEGER PRIMARY KEY,"
+    "  channel_id    INTEGER NOT NULL REFERENCES channels(id),"
+    "  message_id    INTEGER REFERENCES messages(id),"   /* NULL while pending */
+    "  uploader_id   INTEGER NOT NULL REFERENCES users(id),"
+    "  storage_key   TEXT NOT NULL,"
+    "  filename      TEXT NOT NULL,"
+    "  mime          TEXT NOT NULL,"
+    "  size          INTEGER NOT NULL,"
+    "  sha256        BLOB,"
+    "  created_at_ms INTEGER NOT NULL"
+    ");"
+    "CREATE INDEX idx_attachments_message ON attachments(message_id);"
+    "CREATE INDEX idx_attachments_pending ON attachments(uploader_id, created_at_ms);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -176,6 +199,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 6, MIGRATION_0006 },
     { 7, MIGRATION_0007 },
     { 8, MIGRATION_0008 },
+    { 9, MIGRATION_0009 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

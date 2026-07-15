@@ -34,6 +34,10 @@
 #define OC_MAX_FRAME_SIZE   66560u /* 65 KiB, total on wire (4 + length) */
 #define OC_MAX_BODY_SIZE    65536u /* 64 KiB, message body cap (REQ-054) */
 #define OC_IDEM_SIZE        16u    /* 128-bit idempotency token, fixed width */
+/* Attachment transfer (REQ-140, ARCH-69). A chunk's data must leave room for the
+ * frame header + the chunk's fixed fields under OC_MAX_FRAME_SIZE. */
+#define OC_ATTACH_CHUNK_SIZE   65024u /* 63.5 KiB data per UPLOAD/DOWNLOAD chunk  */
+#define OC_MAX_ATTACHMENT_SIZE (100ull * 1024 * 1024) /* 100 MiB default cap      */
 
 /* --- Message types (PROTOCOL.md §9) ------------------------------------- */
 
@@ -75,6 +79,17 @@ typedef enum {
     OC_MSG_PRESENCE_UPDATE  = 0x0071, /* S->C, a user's presence changed */
     OC_MSG_TYPING           = 0x0072, /* C->S, "I am typing" in a channel (REQ-121) */
     OC_MSG_TYPING_UPDATE    = 0x0073, /* S->C, relay of a typing signal */
+    OC_MSG_UPLOAD_BEGIN     = 0x0080, /* C->S, declare an attachment upload (REQ-140) */
+    OC_MSG_UPLOAD_READY     = 0x0081, /* S->C, id + chunk size + in-flight window */
+    OC_MSG_UPLOAD_CHUNK     = 0x0082, /* C->S, one upload chunk */
+    OC_MSG_UPLOAD_ACK       = 0x0083, /* S->C, window advance */
+    OC_MSG_UPLOAD_END       = 0x0084, /* C->S, finish the upload */
+    OC_MSG_UPLOAD_OK        = 0x0085, /* S->C, upload finalized (id + size + sha256) */
+    OC_MSG_DOWNLOAD_BEGIN   = 0x0086, /* C->S, request an attachment (REQ-141) */
+    OC_MSG_DOWNLOAD_INFO    = 0x0087, /* S->C, metadata preceding the bytes */
+    OC_MSG_DOWNLOAD_CHUNK   = 0x0088, /* S->C, one download chunk */
+    OC_MSG_DOWNLOAD_END     = 0x0089, /* S->C, all bytes sent */
+    OC_MSG_TRANSFER_CANCEL  = 0x008A, /* C->S, abort an in-progress transfer */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -110,6 +125,9 @@ typedef enum {
     OC_ERR_UNKNOWN_MESSAGE     = 3007, /* no such message in the channel (edit/delete) */
     OC_ERR_INVALID_CHANNEL     = 3008, /* bad channel name on CREATE_CHANNEL (empty/too long) */
     OC_ERR_INVALID_REACTION    = 3009, /* empty/oversized emoji on REACT */
+    OC_ERR_ATTACHMENT_TOO_LARGE = 3010, /* upload exceeds MAX_ATTACHMENT_SIZE (REQ-140) */
+    OC_ERR_UNKNOWN_ATTACHMENT  = 3011, /* no such attachment, or not finalized (REQ-141) */
+    OC_ERR_TRANSFER_PROTOCOL   = 3012, /* out-of-order/oversized chunk or bad transfer state */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 
@@ -279,6 +297,19 @@ typedef struct { uint8_t status; } oc_set_presence;
 typedef struct { uint64_t user_id; uint8_t status; } oc_presence_update;
 typedef struct { uint64_t channel_id; } oc_typing;
 typedef struct { uint64_t channel_id; uint64_t user_id; } oc_typing_update;
+/* Attachment transfer (REQ-140/141, ARCH-69). `data` chunks are zero-copy views.
+ * sha256 is a 32-byte digest carried as `bytes`. */
+typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; oc_slice filename; oc_slice mime; uint64_t total_size; } oc_upload_begin;
+typedef struct { uint64_t attachment_id; uint32_t chunk_size; uint32_t window_bytes; } oc_upload_ready;
+typedef struct { uint64_t attachment_id; uint32_t seq; oc_slice data; } oc_upload_chunk;
+typedef struct { uint64_t attachment_id; uint32_t acked_through; } oc_upload_ack;
+typedef struct { uint64_t attachment_id; } oc_upload_end;
+typedef struct { uint64_t attachment_id; uint64_t size; oc_slice sha256; } oc_upload_ok;
+typedef struct { uint64_t attachment_id; } oc_download_begin;
+typedef struct { uint64_t attachment_id; oc_slice filename; oc_slice mime; uint64_t total_size; oc_slice sha256; } oc_download_info;
+typedef struct { uint64_t attachment_id; uint32_t seq; oc_slice data; } oc_download_chunk;
+typedef struct { uint64_t attachment_id; } oc_download_end;
+typedef struct { uint64_t attachment_id; } oc_transfer_cancel;
 typedef struct { uint16_t count; const oc_channel_list_entry *entries; } oc_channel_list;
 typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; oc_slice email; oc_slice display_name; } oc_user_list_entry;
 typedef struct { uint16_t count; const oc_user_list_entry *entries; } oc_user_list;
@@ -340,6 +371,17 @@ oc_result oc_encode_set_presence(oc_wbuf *w, uint16_t version, const oc_set_pres
 oc_result oc_encode_presence_update(oc_wbuf *w, uint16_t version, const oc_presence_update *m);
 oc_result oc_encode_typing(oc_wbuf *w, uint16_t version, const oc_typing *m);
 oc_result oc_encode_typing_update(oc_wbuf *w, uint16_t version, const oc_typing_update *m);
+oc_result oc_encode_upload_begin(oc_wbuf *w, uint16_t version, const oc_upload_begin *m);
+oc_result oc_encode_upload_ready(oc_wbuf *w, uint16_t version, const oc_upload_ready *m);
+oc_result oc_encode_upload_chunk(oc_wbuf *w, uint16_t version, const oc_upload_chunk *m);
+oc_result oc_encode_upload_ack(oc_wbuf *w, uint16_t version, const oc_upload_ack *m);
+oc_result oc_encode_upload_end(oc_wbuf *w, uint16_t version, const oc_upload_end *m);
+oc_result oc_encode_upload_ok(oc_wbuf *w, uint16_t version, const oc_upload_ok *m);
+oc_result oc_encode_download_begin(oc_wbuf *w, uint16_t version, const oc_download_begin *m);
+oc_result oc_encode_download_info(oc_wbuf *w, uint16_t version, const oc_download_info *m);
+oc_result oc_encode_download_chunk(oc_wbuf *w, uint16_t version, const oc_download_chunk *m);
+oc_result oc_encode_download_end(oc_wbuf *w, uint16_t version, const oc_download_end *m);
+oc_result oc_encode_transfer_cancel(oc_wbuf *w, uint16_t version, const oc_transfer_cancel *m);
 oc_result oc_encode_list_users(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_user_list(oc_wbuf *w, uint16_t version, const oc_user_list *m);
 oc_result oc_encode_set_role(oc_wbuf *w, uint16_t version, const oc_set_role *m);
@@ -399,6 +441,17 @@ oc_result oc_decode_set_presence(oc_rbuf *p, oc_set_presence *m);
 oc_result oc_decode_presence_update(oc_rbuf *p, oc_presence_update *m);
 oc_result oc_decode_typing(oc_rbuf *p, oc_typing *m);
 oc_result oc_decode_typing_update(oc_rbuf *p, oc_typing_update *m);
+oc_result oc_decode_upload_begin(oc_rbuf *p, oc_upload_begin *m);
+oc_result oc_decode_upload_ready(oc_rbuf *p, oc_upload_ready *m);
+oc_result oc_decode_upload_chunk(oc_rbuf *p, oc_upload_chunk *m);
+oc_result oc_decode_upload_ack(oc_rbuf *p, oc_upload_ack *m);
+oc_result oc_decode_upload_end(oc_rbuf *p, oc_upload_end *m);
+oc_result oc_decode_upload_ok(oc_rbuf *p, oc_upload_ok *m);
+oc_result oc_decode_download_begin(oc_rbuf *p, oc_download_begin *m);
+oc_result oc_decode_download_info(oc_rbuf *p, oc_download_info *m);
+oc_result oc_decode_download_chunk(oc_rbuf *p, oc_download_chunk *m);
+oc_result oc_decode_download_end(oc_rbuf *p, oc_download_end *m);
+oc_result oc_decode_transfer_cancel(oc_rbuf *p, oc_transfer_cancel *m);
 oc_result oc_decode_list_users(oc_rbuf *p);
 oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries, uint16_t cap, uint16_t *out_count);
 oc_result oc_decode_set_role(oc_rbuf *p, oc_set_role *m);

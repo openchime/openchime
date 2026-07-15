@@ -85,8 +85,8 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 131 do-not-disturb schedule | ⛔ | |
 | 132 APNs/FCM push | ⛔ | |
 | 133 self-host push gateway | ⛔ | |
-| 140 file attachments (object storage) | ⛔ | |
-| 141 attachment access control | ⛔ | `[needs ARCH decision]`. |
+| 140 file attachments (object storage) | 🟡 | **Transfer built + tested end-to-end:** proxied chunked upload/download over the wire (ARCH-69), local-FS blob-adapter behind the ARCH-70 seam (S3/MinIO impl is a follow-up), `attachments` migration 0009, frames §5.14. **Pending:** linking an attachment to a message (the SEND/BROADCAST attachment list at a bumped protocol version) — until then an attachment is retrievable by id but not yet surfaced inline in a channel. |
+| 141 attachment access control | ✅ | Proxied bytes → download authorized by the ordinary channel-read check on the attachment's channel; no signed URLs (ARCH-69). Verified over the wire (cross-user fetch allowed; non-member refused) and in dbwriter units. |
 | 150–152 server-relayed audio | ⛔ | |
 | 160 video | ➖ | Deliberate scope exclusion. |
 | 170 incoming webhooks | ⛔ | Only `/healthz` HTTP exists; ALPN demux to an HTTP handler is designed, not built. |
@@ -173,8 +173,11 @@ full-text search — all reachable over the wire and tested end-to-end.
 
 The **largest missing surfaces** are (a) a real **client** beyond the Phase-1
 skeleton (the only consumer of all the above), and (b) whole **feature families
-not yet begun**: notifications/push, attachments, audio, and webhooks.
-Presence/typing (REQ-120/121) is now built and tested end-to-end.
+not yet begun**: notifications/push, audio, and webhooks. Presence/typing
+(REQ-120/121) is built and tested end-to-end. **Attachments** (REQ-140/141) have
+their proxied chunked transfer + access control built and tested over the wire
+(local-FS blob store; S3/MinIO adapter and message-linking are the remaining
+follow-ups).
 
 The **server-robustness backlog is cleared** (see Resolved above): SEND-flood
 rate limiting, the per-connection output-buffer cap, idempotency-map pruning,

@@ -101,7 +101,7 @@ static void test_embedded_schema(void) {
     char *err = NULL;
     CHECK(oc_migrate_default(db, &err) == SQLITE_OK);
     CHECK(err == NULL);
-    CHECK(oc_schema_version(db) == 8);   /* + reactions + threads + FTS + delivery_cursors */
+    CHECK(oc_schema_version(db) == 9);   /* + reactions + threads + FTS + cursors + identity + attachments */
 
     const char *tables[] = { "users", "channels", "channel_members",
                              "messages", "sent_messages",

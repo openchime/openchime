@@ -270,14 +270,62 @@ newest-first.
 
 ---
 
+## 3e. Migration 0007 — delivery cursors
+
+Server-side delivery accounting (REQ-090); see the server-robustness notes in
+STATUS.md. A `delivery_cursors` row per `(user, channel)` advanced by
+`CLIENT_ACK` so a cursorless backfill can resume where the user left off.
+
+---
+
+## 3f. Migration 0008 — server identity
+
+Persists the daemon's TLS identity across restart/restore so the TOFU
+fingerprint clients pinned (ARCH-10) survives a redeploy.
+
+---
+
+## 3g. Migration 0009 — attachments (REQ-140, ARCH-17/69/70)
+
+Attachment **bytes live in object storage, never in SQLite** — this table holds
+only the pointer and metadata. Bytes are proxied through the daemon in chunks
+(PROTOCOL.md §5.14); this row is the durable record the transfer produces.
+
+### `attachments`
+- `id` (PK) — the `attachment_id` on the wire.
+- `channel_id` (FK `channels`) — the channel/DM the upload targeted; access
+  control derives from this via the message it is linked to (REQ-141).
+- `message_id` (FK `messages`, nullable) — the message that published the
+  attachment. **NULL while pending** (uploaded but not yet referenced); set when
+  a `SEND`/`SEND_REPLY` references the id.
+- `uploader_id` (FK `users`) — who uploaded it; the only user allowed to link a
+  pending attachment.
+- `storage_key` (TEXT) — opaque object-storage key (never exposed on the wire).
+- `filename`, `mime` (TEXT) — original name and declared content type.
+- `size` (INTEGER) — byte length, verified against the streamed total on
+  `UPLOAD_END`.
+- `sha256` (BLOB) — content digest, returned in `UPLOAD_OK` / `DOWNLOAD_INFO`.
+- `created_at` (INTEGER) — upload time; drives the orphan sweep of pending rows
+  whose blob was never finalized/linked (time-gated, like `sent_messages`
+  pruning, ARCH-44/70).
+
+Indexed by `message_id` (fetch a message's attachments for delivery/backfill)
+and by `(uploader_id, created_at)` (sweep abandoned pending uploads). A committed
+attachment's lifetime is tied to its message: a tombstoned/deleted message's
+attachment blob is eligible for removal (REQ-141, "as long as the message
+exists").
+
+---
+
 ## 4. Deferred to later migrations
 
 Tracked here so the omissions are deliberate, not forgotten:
 
 - **Thread notifications** (REQ-061) — needs notification config (REQ-130).
-- **Presence / typing** (REQ-120/121) — likely in-memory, not schema.
 - **Notification settings** and DND (REQ-130/131).
-- **Attachments** metadata (REQ-140) — object-storage pointers, not blobs.
+- **Audio** call state (REQ-150–152) — likely a UDP sidecar, not schema (ARCH-18).
 
-(Roles, sessions/revocation, and local credentials — previously deferred — are
-now defined in migration 0002 above.)
+(Roles, sessions/revocation, local credentials, delivery cursors, server
+identity, and attachment metadata — previously deferred — are now defined in
+migrations 0002 and 0007–0009 above. Presence/typing (REQ-120/121) stayed
+in-memory by design, ARCH-67/68, and needs no schema.)

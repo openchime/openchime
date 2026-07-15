@@ -744,6 +744,157 @@ static void test_presence_typing(int port, const uint8_t *pin) {
     client_close(&b);
 }
 
+/* Issue DOWNLOAD_BEGIN for `aid` and reassemble the streamed blob into `out`
+ * (bounded by `cap`), verifying DOWNLOAD_INFO's digest matches `expect_sha` and
+ * that chunk sequence numbers are contiguous. Returns the bytes received. */
+static size_t download_attachment(client *c, uint64_t aid, uint8_t *out, size_t cap,
+                                  const uint8_t expect_sha[32]) {
+    uint8_t hb[64]; oc_wbuf w; oc_wbuf_init(&w, hb, sizeof hb);
+    oc_download_begin dlb = { aid };
+    CHECK(oc_encode_download_begin(&w, OC_PROTOCOL_VERSION, &dlb) == OC_OK);
+    CHECK(send_frame(c, hb, w.len) == 0);
+
+    oc_header hdr; oc_rbuf p;
+    CHECK(read_frame(c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_DOWNLOAD_INFO);
+    oc_download_info di; CHECK(oc_decode_download_info(&p, &di) == OC_OK);
+    CHECK(di.attachment_id == aid && di.total_size <= cap);
+    if (expect_sha) CHECK(di.sha256.len == 32 && memcmp(di.sha256.ptr, expect_sha, 32) == 0);
+
+    size_t off = 0; uint32_t exp = 0;
+    for (;;) {
+        CHECK(read_frame(c, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_DOWNLOAD_CHUNK) {
+            oc_download_chunk dc; CHECK(oc_decode_download_chunk(&p, &dc) == OC_OK);
+            CHECK(dc.attachment_id == aid && dc.seq == exp && off + dc.data.len <= cap);
+            memcpy(out + off, dc.data.ptr, dc.data.len);   /* copy before the next read */
+            off += dc.data.len; exp++;
+        } else if (hdr.msg_type == OC_MSG_DOWNLOAD_END) {
+            oc_download_end de; CHECK(oc_decode_download_end(&p, &de) == OC_OK && de.attachment_id == aid);
+            break;
+        } else {
+            CHECK(0 && "unexpected frame during download");
+        }
+    }
+    CHECK(off == di.total_size);
+    return off;
+}
+
+/* Attachments over the wire (REQ-140/141, ARCH-69). A multi-chunk blob is
+ * uploaded and streamed back byte-for-byte; a second user retrieves the same
+ * blob from a shared channel; and a non-member is refused a private one — all
+ * proxied through the daemon, with access control on the message-channel gate. */
+static void test_attachments_vertical(int port, const uint8_t *pin) {
+    client a;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0; CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+
+    oc_header hdr; oc_rbuf p;
+    uint8_t *fbuf = malloc(OC_MAX_FRAME_SIZE);   /* one chunk frame can be ~64 KiB */
+    CHECK(fbuf != NULL);
+    oc_wbuf w;
+
+    /* A ~150 KiB payload spans several chunks (exercises the pump + windowing). */
+    const size_t total = 150000;
+    uint8_t *payload = malloc(total);
+    CHECK(payload != NULL);
+    for (size_t i = 0; i < total; i++) payload[i] = (uint8_t)(i * 31u + 7u);
+
+    uint8_t idem[OC_IDEM_SIZE]; memset(idem, 0xA1, sizeof idem);
+
+    /* UPLOAD_BEGIN on the public default channel. */
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    oc_upload_begin ub = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("data.bin"), oc_slice_str("application/octet-stream"), total };
+    memcpy(ub.idem, idem, OC_IDEM_SIZE);
+    CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub) == OC_OK);
+    CHECK(send_frame(&a, fbuf, w.len) == 0);
+
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_READY);
+    oc_upload_ready urd; CHECK(oc_decode_upload_ready(&p, &urd) == OC_OK);
+    uint64_t aid = urd.attachment_id;
+    CHECK(aid != 0 && urd.chunk_size > 0 && urd.chunk_size <= OC_ATTACH_CHUNK_SIZE);
+
+    /* Stream the payload, acked chunk by chunk. */
+    uint32_t seq = 0; size_t off = 0;
+    while (off < total) {
+        size_t n = total - off; if (n > urd.chunk_size) n = urd.chunk_size;
+        oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+        oc_upload_chunk uc = { aid, seq, { payload + off, n } };
+        CHECK(oc_encode_upload_chunk(&w, OC_PROTOCOL_VERSION, &uc) == OC_OK);
+        CHECK(send_frame(&a, fbuf, w.len) == 0);
+        CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_ACK);
+        oc_upload_ack uak; CHECK(oc_decode_upload_ack(&p, &uak) == OC_OK);
+        CHECK(uak.attachment_id == aid && uak.acked_through == seq + 1);
+        off += n; seq++;
+    }
+
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    oc_upload_end ue = { aid };
+    CHECK(oc_encode_upload_end(&w, OC_PROTOCOL_VERSION, &ue) == OC_OK);
+    CHECK(send_frame(&a, fbuf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_OK);
+    oc_upload_ok uok; CHECK(oc_decode_upload_ok(&p, &uok) == OC_OK);
+    CHECK(uok.attachment_id == aid && uok.size == total && uok.sha256.len == 32);
+    uint8_t digest[32]; memcpy(digest, uok.sha256.ptr, 32);
+
+    /* Download it back and reassemble; bytes and digest must match. */
+    uint8_t *got = malloc(total); CHECK(got != NULL);
+    size_t glen = download_attachment(&a, aid, got, total, digest);
+    CHECK(glen == total && memcmp(got, payload, total) == 0);
+
+    /* A second user in the same (public) channel retrieves the same blob. */
+    client b;
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&b) == 0);
+    uint64_t ubid = 0; CHECK(do_auth(&b, "bob", "pw-bob", &ubid) == 0);
+    memset(got, 0, total);
+    glen = download_attachment(&b, aid, got, total, digest);
+    CHECK(glen == total && memcmp(got, payload, total) == 0);
+
+    /* Access control (REQ-141): an attachment on a private channel alice creates
+     * is refused to bob, a non-member. */
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    oc_create_channel cc = { oc_slice_str("vault"), 0 };
+    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cc) == OC_OK);
+    CHECK(send_frame(&a, fbuf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
+    oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
+    uint64_t priv = ci.channel_id;
+
+    const char *small = "secret bytes";
+    size_t slen = strlen(small);
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    oc_upload_begin ub2 = { priv, {0}, oc_slice_str("s.txt"), oc_slice_str("text/plain"), slen };
+    memset(ub2.idem, 0xB2, OC_IDEM_SIZE);
+    CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub2) == OC_OK);
+    CHECK(send_frame(&a, fbuf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_READY);
+    CHECK(oc_decode_upload_ready(&p, &urd) == OC_OK);
+    uint64_t paid = urd.attachment_id;
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    oc_upload_chunk uc2 = { paid, 0, { (const uint8_t *)small, slen } };
+    CHECK(oc_encode_upload_chunk(&w, OC_PROTOCOL_VERSION, &uc2) == OC_OK);
+    CHECK(send_frame(&a, fbuf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_ACK);
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    oc_upload_end ue2 = { paid };
+    CHECK(oc_encode_upload_end(&w, OC_PROTOCOL_VERSION, &ue2) == OC_OK);
+    CHECK(send_frame(&a, fbuf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_OK);
+
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    oc_download_begin dlb = { paid };
+    CHECK(oc_encode_download_begin(&w, OC_PROTOCOL_VERSION, &dlb) == OC_OK);
+    CHECK(send_frame(&b, fbuf, w.len) == 0);
+    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
+    oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK);
+    CHECK(er.code == OC_ERR_FORBIDDEN);
+
+    free(payload); free(got); free(fbuf);
+    client_close(&a);
+    client_close(&b);
+}
+
 /* Direct messages over the wire (REQ-050): OPEN_DM creates a kind=DM channel,
  * pushes a CHANNEL_INFO to the peer, the two participants exchange messages
  * through it, and a third user cannot post to it. */
@@ -1122,6 +1273,10 @@ static void test_conn_throttle(int port) {
 int run_netloop_tests(void) {
     printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, search, dm, load, rate-limit, out-cap, throttle, admin, logout\n");
 
+    /* Attachment blobs go to a build-local dir (REQ-140); the daemon defaults to
+     * /data/blobs, which isn't writable in the test sandbox. */
+    setenv("OPENCHIME_BLOB_DIR", "build/itest_blobs", 1);
+
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
     uint8_t pin[OC_TLS_FINGERPRINT_LEN];
@@ -1162,6 +1317,7 @@ int run_netloop_tests(void) {
         test_search_vertical(arg.port, pin);
         test_dm_vertical(arg.port, pin);
         test_presence_typing(arg.port, pin);
+        test_attachments_vertical(arg.port, pin);
         test_concurrent_load(arg.port, pin);
         test_send_rate_limit(arg.port, pin);
         test_out_buffer_cap(arg.port, pin, dbw, flooder);

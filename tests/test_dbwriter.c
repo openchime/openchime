@@ -50,7 +50,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 8);
+    CHECK(oc_schema_version(db) == 9);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -1382,6 +1382,140 @@ static oc_dbres *open_dm(oc_dbwriter *w, uint64_t actor, uint64_t target) {
     return wait_result(w);
 }
 
+/* Attachment metadata jobs (REQ-140/141, ARCH-69/70). The blob bytes never touch
+ * the dbwriter — these jobs mint/finalize the pointer row and authorize a
+ * download by the ordinary channel-read gate. */
+static void test_attachments(void) {
+    const char *path = "build/test_dbwriter_attach.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t alice = reg(w, "at-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "at-bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    uint8_t idem[OC_IDEM_LEN]; memset(idem, 0x5A, sizeof idem);
+    uint8_t sha[32]; for (int i = 0; i < 32; i++) sha[i] = (uint8_t)i;
+
+    /* CREATE a pending attachment on the default (public) channel. */
+    oc_job *j = oc_job_new(OC_JOB_ATTACH_CREATE, 1);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->att_size = 2048;
+    memcpy(j->idem, idem, sizeof idem);
+    j->filename = strdup("notes.txt"); j->mime = strdup("text/plain");
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_CREATED);
+    CHECK(r->attachment_id > 0 && r->storage_key && r->storage_key[0]);
+    uint64_t aid = r->attachment_id;
+    oc_dbres_free(r);
+
+    /* A download LOOKUP before finalize fails — the blob is not complete. */
+    j = oc_job_new(OC_JOB_ATTACH_LOOKUP, 2);
+    j->user_id = bob; j->attachment_id = aid;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_ERR && r->err_code == OC_ERR_UNKNOWN_ATTACHMENT);
+    oc_dbres_free(r);
+
+    /* Only the uploader may finalize, and the streamed size must match. */
+    j = oc_job_new(OC_JOB_ATTACH_FINALIZE, 3);
+    j->user_id = bob; j->attachment_id = aid; j->att_size = 2048; memcpy(j->att_sha256, sha, 32);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_ERR && r->err_code == OC_ERR_UNKNOWN_ATTACHMENT); /* not owner */
+    oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_ATTACH_FINALIZE, 4);
+    j->user_id = alice; j->attachment_id = aid; j->att_size = 999; memcpy(j->att_sha256, sha, 32);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_ERR && r->err_code == OC_ERR_TRANSFER_PROTOCOL); /* size mismatch */
+    oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_ATTACH_FINALIZE, 5);
+    j->user_id = alice; j->attachment_id = aid; j->att_size = 2048; memcpy(j->att_sha256, sha, 32);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_OK && r->att_size == 2048);
+    oc_dbres_free(r);
+
+    /* Double-finalize is refused (already complete). */
+    j = oc_job_new(OC_JOB_ATTACH_FINALIZE, 6);
+    j->user_id = alice; j->attachment_id = aid; j->att_size = 2048; memcpy(j->att_sha256, sha, 32);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_ERR && r->err_code == OC_ERR_UNKNOWN_ATTACHMENT);
+    oc_dbres_free(r);
+
+    /* bob is a member of the public default channel, so his LOOKUP is authorized
+     * and returns the pointer + metadata (REQ-141). */
+    j = oc_job_new(OC_JOB_ATTACH_LOOKUP, 7);
+    j->user_id = bob; j->attachment_id = aid;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_META);
+    CHECK(r->channel_id == OC_DEFAULT_CHANNEL && r->att_size == 2048);
+    CHECK(r->filename && strcmp(r->filename, "notes.txt") == 0);
+    CHECK(r->mime && strcmp(r->mime, "text/plain") == 0);
+    CHECK(r->storage_key && r->storage_key[0]);
+    CHECK(memcmp(r->att_sha256, sha, 32) == 0);
+    oc_dbres_free(r);
+
+    /* Access control: an attachment on a private channel alice creates is NOT
+     * downloadable by bob, a non-member (the core of REQ-141). */
+    r = create_channel(w, alice, "secret", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->ch_is_public == 0);
+    uint64_t priv = r->channel_id;
+    oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_ATTACH_CREATE, 8);
+    j->user_id = alice; j->channel_id = priv; j->att_size = 10;
+    memset(j->idem, 0x77, OC_IDEM_LEN);
+    j->filename = strdup("s.txt"); j->mime = strdup("text/plain");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_CREATED);
+    uint64_t paid = r->attachment_id;
+    oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_ATTACH_FINALIZE, 9);
+    j->user_id = alice; j->attachment_id = paid; j->att_size = 10; memcpy(j->att_sha256, sha, 32);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_OK);
+    oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_ATTACH_LOOKUP, 10);
+    j->user_id = bob; j->attachment_id = paid;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    /* An oversized declared upload is refused up front. */
+    j = oc_job_new(OC_JOB_ATTACH_CREATE, 11);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL;
+    j->att_size = OC_MAX_ATTACHMENT_SIZE + 1;
+    memset(j->idem, 0x33, OC_IDEM_LEN);
+    j->filename = strdup("big.bin"); j->mime = strdup("application/octet-stream");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_ERR && r->err_code == OC_ERR_ATTACHMENT_TOO_LARGE);
+    oc_dbres_free(r);
+
+    /* An unknown attachment id looks up as unknown. */
+    j = oc_job_new(OC_JOB_ATTACH_LOOKUP, 12);
+    j->user_id = alice; j->attachment_id = 999999;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_ERR && r->err_code == OC_ERR_UNKNOWN_ATTACHMENT);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_dm(void) {
     const char *path = "build/test_dbwriter_dm.db";
     cleanup_db(path);
@@ -1479,6 +1613,7 @@ int run_dbwriter_tests(void) {
     test_edit_delete();
     test_channels();
     test_dm();
+    test_attachments();
     test_admin_ops();
     test_reactions();
     test_threads();
