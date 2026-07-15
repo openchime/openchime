@@ -705,6 +705,42 @@ and reject a DM id with `UNKNOWN_CHANNEL`.
 
 ---
 
+### 5.13 Presence and typing (REQ-120, REQ-121)
+
+Presence and typing are **ephemeral real-time state**, never persisted. Presence
+is derived from live connections on the network thread (ARCH-67); typing is a
+member-scoped relay (ARCH-68). Both are advisory — a dropped frame is
+self-correcting and never fatal.
+
+**Presence status values:** `0 = offline`, `1 = online`, `2 = away`.
+
+**`SET_PRESENCE` (client → server), msg_type `0x0070`** `{ status: u8 }` — the
+client marks *this connection* online (`1`) or away (`2`); `offline` is not
+settable (it is implied by disconnect). The server recomputes the user's
+aggregate status — **online** if any of their connections is active, **away** if
+all are away, **offline** once the last closes — and, if it changed, broadcasts.
+
+**`PRESENCE_UPDATE` (server → client), msg_type `0x0071`** `{ user_id: u64,
+status: u8 }` — sent tenant-wide to every *other* authenticated connection when a
+user's aggregate status changes (a client tracks its own presence locally, so it
+is excluded from its own broadcast). On authenticating, a client also receives a
+**one-shot snapshot** — one `PRESENCE_UPDATE` per currently-online user — so it
+starts with an accurate roster without polling.
+
+**`TYPING` (client → server), msg_type `0x0072`** `{ channel_id: u64 }` — the
+caller signals they are composing in `channel_id`. The server resolves the
+channel's members (on the read connection, ARCH-66) and, if the caller has access,
+relays to the other connected members only — private-channel and DM typing never
+leaks to non-members.
+
+**`TYPING_UPDATE` (server → client), msg_type `0x0073`** `{ channel_id: u64,
+user_id: u64 }` — delivered to each connected member of `channel_id` except the
+sender. There is **no expiry frame and no "stopped typing" signal**: the client
+displays the indicator and expires it locally after **~6 seconds**, refreshed by
+each new `TYPING_UPDATE` for that `(channel, user)`.
+
+---
+
 ## 6. Reconnect backfill (resolves REQ-101)
 
 A client that reconnects (REQ-100) requests everything it missed since its
@@ -865,14 +901,18 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0056` | `INVITE_TO_CHANNEL`| C → S     | no        | §5.7    |
 | `0x0057` | `REMOVE_FROM_CHANNEL`| C → S   | no        | §5.7    |
 | `0x0058` | `OPEN_DM`          | C → S     | no        | §5.12   |
+| `0x0070` | `SET_PRESENCE`     | C → S     | no        | §5.13   |
+| `0x0071` | `PRESENCE_UPDATE`  | S → C     | no        | §5.13   |
+| `0x0072` | `TYPING`           | C → S     | no        | §5.13   |
+| `0x0073` | `TYPING_UPDATE`    | S → C     | no        | §5.13   |
 | `0x0030` | `BACKFILL_REQUEST` | C → S     | no        | §6.1    |
 | `0x0031` | `BACKFILL_DONE`    | S → C     | no        | §6.2    |
 | `0x00FF` | `ERROR`            | S → C     | no        | §8.1    |
 
 Ranges are left sparse (`0x0001–` handshake, `0x0010–` auth/session, `0x0020–`
 messaging, `0x0030–` reconnect, `0x0040–` users/profiles, `0x0050–` channel
-management, `0x0060–` search, `0x00FF` error) so later revisions can slot in presence, typing,
-presence/typing and audio signaling without renumbering. The `0x0040–0x0047`
+management, `0x0060–` search, `0x0070–` presence/typing, `0x00FF` error) so later
+revisions can slot in audio signaling without renumbering. The `0x0040–0x0047`
 management frames (user enumeration, roles, tenant invite/remove; §5.8) are
 defined; `0x0048` `UPDATE_PROFILE` (avatar/display-name edit) remains **reserved**
 until that milestone lands.
@@ -918,6 +958,8 @@ until that milestone lands.
 | REQ-101     | Per-channel cursor `BACKFILL_REQUEST` + `BACKFILL_DONE` (§6, ARCH-46).      |
 | REQ-110     | First frame must be `HELLO`; version validated before any further parse (§3). |
 | REQ-111     | `VERSION_TOO_OLD` / `VERSION_TOO_NEW` reason codes distinguish the remedy (§3.3, §8.2, ARCH-41). |
+| REQ-120     | `SET_PRESENCE` / `PRESENCE_UPDATE` + auth-time online snapshot (§5.13, ARCH-67). |
+| REQ-121     | Member-scoped `TYPING` / `TYPING_UPDATE`; ~6s client-side expiry, no stop frame (§5.13, ARCH-68). |
 
 Related decisions newly recorded in ARCHITECTURE.md: ARCH-41 (handshake &
 version negotiation), ARCH-42 (primitive field encodings), ARCH-43 (message id

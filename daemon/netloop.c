@@ -60,6 +60,7 @@ typedef struct {
     uint32_t     events;    /* current epoll interest */
     uint64_t     send_win_start; /* fixed-window start for the send rate limit */
     uint32_t     send_count;     /* sends counted in the current window */
+    uint8_t      presence;       /* OC_PRESENCE_ONLINE / _AWAY (per connection) */
 } conn;
 
 /* Scratch for encoding one outgoing frame; net thread only, so a single static
@@ -147,9 +148,15 @@ static void update_interest(int ep, conn *c) {
     conn_set_events(ep, c, ev);
 }
 
+/* Broadcast that a user has gone offline if the just-closed connection was their
+ * last one (REQ-120). Defined below; declared here for conn_close. */
+static void presence_offline_if_gone(int ep, conn **conns, uint64_t user_id);
+
 static void conn_close(int ep, conn **conns, int fd) {
     conn *c = conns[fd];
     if (!c) return;
+    uint64_t uid = c->user_id;
+    int was_authed = c->authed;
     epoll_ctl(ep, EPOLL_CTL_DEL, fd, NULL);
     oc_tls_conn_free(&c->tls);
     oc_framebuf_free(&c->fb);
@@ -157,6 +164,7 @@ static void conn_close(int ep, conn **conns, int fd) {
     close(fd);
     free(c);
     conns[fd] = NULL;
+    if (was_authed) presence_offline_if_gone(ep, conns, uid);
 }
 
 static conn *find_by_id(conn **conns, uint64_t id) {
@@ -172,6 +180,53 @@ static int conns_from_ip(conn **conns, const char *src) {
     for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
         if (conns[fd] && strcmp(conns[fd]->source, src) == 0) n++;
     return n;
+}
+
+/* --- Presence (REQ-120, in-memory net-thread state, ARCH-67) ------------ */
+
+/* A user's aggregate presence across their connections: online if any is online,
+ * away if all connected are away, offline if none are connected. */
+static uint8_t presence_of(conn **conns, uint64_t uid) {
+    uint8_t st = OC_PRESENCE_OFFLINE;
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+        conn *c = conns[fd];
+        if (c && c->authed && c->user_id == uid) {
+            if (c->presence == OC_PRESENCE_ONLINE) return OC_PRESENCE_ONLINE;
+            st = OC_PRESENCE_AWAY;
+        }
+    }
+    return st;
+}
+
+/* Best-effort append+flush that never closes the connection — so presence fan-out
+ * can't recurse into conn_close (which itself broadcasts presence). A dead
+ * connection is reaped on its next epoll event. */
+static void presence_send(int ep, conn *c, const uint8_t *buf, size_t len) {
+    if (!c) return;
+    if (out_append(c, buf, len) == 0) { flush_out(c); update_interest(ep, c); }
+}
+
+static void encode_presence(uint8_t *buf, size_t cap, size_t *outlen, uint64_t uid, uint8_t status) {
+    oc_wbuf w; oc_wbuf_init(&w, buf, cap);
+    oc_presence_update pu = { uid, status };
+    oc_encode_presence_update(&w, OC_PROTOCOL_VERSION, &pu);
+    *outlen = w.len;
+}
+
+/* Tell every other authenticated connection that `uid` is now `status`
+ * (tenant-wide). The subject's own connections are skipped — a client tracks its
+ * own presence locally. */
+static void broadcast_presence(int ep, conn **conns, uint64_t uid, uint8_t status) {
+    uint8_t buf[32]; size_t len = 0;
+    encode_presence(buf, sizeof buf, &len, uid, status);
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
+        if (conns[fd] && conns[fd]->authed && conns[fd]->user_id != uid)
+            presence_send(ep, conns[fd], buf, len);
+}
+
+static void presence_offline_if_gone(int ep, conn **conns, uint64_t user_id) {
+    if (presence_of(conns, user_id) == OC_PRESENCE_OFFLINE)
+        broadcast_presence(ep, conns, user_id, OC_PRESENCE_OFFLINE);
 }
 
 static int in_members(uint64_t uid, const uint64_t *m, size_t n) {
@@ -249,7 +304,7 @@ static int reject_send_rate(conn *c, const uint8_t idem[OC_IDEM_LEN]) {
 /* Dispatch every buffered frame. Returns 0 to keep the connection, -1 to close.
  * AUTH/SEND become jobs for the DB writer; their replies arrive asynchronously
  * via deliver_result. */
-static int drain_frames(conn *c, oc_dbwriter *dbw) {
+static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
     const uint8_t *frame; size_t flen;
     for (;;) {
         int r = oc_framebuf_next(&c->fb, &frame, &flen);
@@ -497,6 +552,24 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_PRESENCE) {
+            oc_set_presence sp;
+            if (oc_decode_set_presence(&p, &sp) != OC_OK) return -1;
+            /* Only online/away are settable while connected (REQ-120). */
+            c->presence = (sp.status == OC_PRESENCE_AWAY) ? OC_PRESENCE_AWAY : OC_PRESENCE_ONLINE;
+            broadcast_presence(ep, conns, c->user_id, presence_of(conns, c->user_id));
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_TYPING) {
+            oc_typing t;
+            if (oc_decode_typing(&p, &t) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_TYPING, c->conn_id);   /* read job -> members */
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = t.channel_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_CLIENT_ACK) {
             oc_client_ack ca;
             if (oc_decode_client_ack(&p, &ca) != OC_OK) return -1;
@@ -546,7 +619,7 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
 }
 
 /* Read, reassemble, and dispatch. Returns 0 to keep, -1 to close. */
-static int on_readable(conn *c, oc_dbwriter *dbw) {
+static int on_readable(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
     for (;;) {
         uint8_t chunk[OC_READ_CHUNK];
         size_t n = 0;
@@ -554,7 +627,7 @@ static int on_readable(conn *c, oc_dbwriter *dbw) {
         if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) return 0;
         if (st == OC_TLS_CLOSED || st == OC_TLS_ERROR) return -1;
         if (oc_framebuf_push(&c->fb, chunk, n) != 0) return -1;
-        if (drain_frames(c, dbw) < 0) return -1;
+        if (drain_frames(ep, conns, c, dbw) < 0) return -1;
     }
 }
 
@@ -568,6 +641,9 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         if (!c) return;
         c->authed = 1;
         c->user_id = r->user_id;
+        c->presence = OC_PRESENCE_ONLINE;
+        int fd = c->fd;
+        uint64_t uid = r->user_id;
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         /* Fresh auth carries the session token; a session re-auth omits it
          * (PROTOCOL.md §4.3). */
@@ -576,7 +652,27 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
                      : (oc_slice){ NULL, 0 };
         oc_auth_ok m = { r->user_id, r->role, r->session_expiry, tok };
         oc_encode_auth_ok(&w, OC_PROTOCOL_VERSION, &m);
-        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        send_bytes(ep, conns, fd, g_enc, w.len);
+        if (!conns[fd]) break;   /* dropped on the AUTH_OK write */
+
+        /* Presence (REQ-120): send the new client a snapshot of who is currently
+         * online/away, then — if this is the user's first connection — announce
+         * them online to everyone. */
+        for (int f = 0; f < OC_NETLOOP_MAX_FD; f++) {
+            conn *v = conns[f];
+            if (!v || !v->authed || v->user_id == uid) continue;
+            int first = 1;
+            for (int g = 0; g < f; g++)
+                if (conns[g] && conns[g]->authed && conns[g]->user_id == v->user_id) { first = 0; break; }
+            if (!first) continue;
+            uint8_t pbuf[32]; size_t plen = 0;
+            encode_presence(pbuf, sizeof pbuf, &plen, v->user_id, presence_of(conns, v->user_id));
+            presence_send(ep, conns[fd], pbuf, plen);
+        }
+        int others = 0;
+        for (int f = 0; f < OC_NETLOOP_MAX_FD; f++)
+            if (conns[f] && conns[f]->authed && conns[f]->user_id == uid && conns[f] != conns[fd]) { others = 1; break; }
+        if (!others) broadcast_presence(ep, conns, uid, OC_PRESENCE_ONLINE);
         break;
     }
     case OC_RES_AUTH_ERR: {
@@ -943,6 +1039,21 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         free(ents);
         break;
     }
+    case OC_RES_TYPING: {
+        /* Relay to every connected member except the typer (REQ-121). Members is
+         * empty if the typer couldn't read the channel, so nothing leaks. */
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_typing_update tu = { r->channel_id, r->author_id };
+        oc_encode_typing_update(&w, OC_PROTOCOL_VERSION, &tu);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id != r->author_id &&
+                in_members(c->user_id, r->members, r->n_members))
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
+        break;
+    }
     case OC_RES_BACKFILL_OK: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
@@ -1092,7 +1203,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
             }
 
             if (c->state == CONN_ESTABLISHED) {
-                if (on_readable(c, dbw) < 0) { flush_out(c); conn_close(ep, conns, fd); continue; }
+                if (on_readable(ep, conns, c, dbw) < 0) { flush_out(c); conn_close(ep, conns, fd); continue; }
             }
             if (flush_out(c) < 0) { conn_close(ep, conns, fd); continue; }
             update_interest(ep, c);

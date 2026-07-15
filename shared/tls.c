@@ -16,11 +16,19 @@
 
 /* --- Non-blocking socket BIO ------------------------------------------- */
 
+/* Suppress SIGPIPE at the syscall so a peer vanishing mid-write can't kill the
+ * whole process. Absent on Winsock (which never raises SIGPIPE) and on some BSDs
+ * (which use SO_NOSIGPIPE); on those it degrades to 0 and hosts fall back to a
+ * SIG_IGN handler. */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 static int bio_send(void *ctx, const unsigned char *buf, size_t len) {
     int fd = *(int *)ctx;
     /* send() takes (const char *, int) on Winsock and (const void *, size_t) on
      * POSIX; our frames are well under INT_MAX so the casts are safe on both. */
-    int n = (int)send(fd, (const char *)buf, (int)len, 0);
+    int n = (int)send(fd, (const char *)buf, (int)len, MSG_NOSIGNAL);
     if (n >= 0) return n;
     if (oc_sock_wouldblock()) return MBEDTLS_ERR_SSL_WANT_WRITE;
     return MBEDTLS_ERR_NET_SEND_FAILED;

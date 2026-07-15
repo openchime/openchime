@@ -81,7 +81,7 @@ static int write_all(oc_tls_conn *c, const uint8_t *buf, size_t len) {
     return 0;
 }
 
-static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
+static int read_frame_raw(client *c, oc_header *hdr, oc_rbuf *payload) {
     for (;;) {
         const uint8_t *frame; size_t flen;
         int r = oc_framebuf_next(&c->fb, &frame, &flen);
@@ -90,6 +90,19 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
         uint8_t buf[4096]; size_t n = 0;
         if (oc_tls_read(&c->conn, buf, sizeof buf, &n) != OC_TLS_OK) return -1;
         if (oc_framebuf_push(&c->fb, buf, n) != 0) return -1;
+    }
+}
+
+/* Presence/typing are tenant-wide async notifications the server may inject into
+ * any connection at any time (a peer coming online, a member typing). Verticals
+ * that aren't testing presence use this wrapper so those frames don't desync
+ * their expected read stream; the presence/typing test uses read_frame_raw. */
+static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
+    for (;;) {
+        int r = read_frame_raw(c, hdr, payload);
+        if (r != 0) return r;
+        if (hdr->msg_type != OC_MSG_PRESENCE_UPDATE && hdr->msg_type != OC_MSG_TYPING_UPDATE)
+            return 0;
     }
 }
 
@@ -680,6 +693,57 @@ static void test_search_vertical(int port, const uint8_t *pin) {
     client_close(&b);
 }
 
+/* Presence + typing over the wire (REQ-120/121): a connecting user is announced
+ * online (and gets a snapshot of who's online), an away change propagates, a
+ * typing signal reaches other channel members, and a disconnect announces
+ * offline. */
+static void test_presence_typing(int port, const uint8_t *pin) {
+    client a;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);   /* first user: no presence yet */
+
+    client b;
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&b) == 0);
+    uint64_t ub = 0;
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+
+    oc_header hdr; oc_rbuf p; uint8_t buf[128]; oc_wbuf w;
+
+    /* bob connecting -> alice sees bob online; bob gets a snapshot incl. alice. */
+    CHECK(read_frame_raw(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_PRESENCE_UPDATE);
+    oc_presence_update pu; CHECK(oc_decode_presence_update(&p, &pu) == OC_OK);
+    CHECK(pu.user_id == ub && pu.status == OC_PRESENCE_ONLINE);
+    CHECK(read_frame_raw(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_PRESENCE_UPDATE);
+    CHECK(oc_decode_presence_update(&p, &pu) == OC_OK && pu.user_id == ua && pu.status == OC_PRESENCE_ONLINE);
+
+    /* alice goes away -> bob sees it. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_presence sp = { OC_PRESENCE_AWAY };
+    CHECK(oc_encode_set_presence(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame_raw(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_PRESENCE_UPDATE);
+    CHECK(oc_decode_presence_update(&p, &pu) == OC_OK && pu.user_id == ua && pu.status == OC_PRESENCE_AWAY);
+
+    /* bob types in the shared channel -> alice (a member) gets TYPING_UPDATE. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_typing ty = { 1 };
+    CHECK(oc_encode_typing(&w, OC_PROTOCOL_VERSION, &ty) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    CHECK(read_frame_raw(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_TYPING_UPDATE);
+    oc_typing_update tu; CHECK(oc_decode_typing_update(&p, &tu) == OC_OK);
+    CHECK(tu.channel_id == 1 && tu.user_id == ub);
+
+    /* alice disconnects -> bob sees her offline. */
+    client_close(&a);
+    CHECK(read_frame_raw(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_PRESENCE_UPDATE);
+    CHECK(oc_decode_presence_update(&p, &pu) == OC_OK && pu.user_id == ua && pu.status == OC_PRESENCE_OFFLINE);
+
+    client_close(&b);
+}
+
 /* Direct messages over the wire (REQ-050): OPEN_DM creates a kind=DM channel,
  * pushes a CHANNEL_INFO to the peer, the two participants exchange messages
  * through it, and a third user cannot post to it. */
@@ -1097,6 +1161,7 @@ int run_netloop_tests(void) {
         test_threads_vertical(arg.port, pin);
         test_search_vertical(arg.port, pin);
         test_dm_vertical(arg.port, pin);
+        test_presence_typing(arg.port, pin);
         test_concurrent_load(arg.port, pin);
         test_send_rate_limit(arg.port, pin);
         test_out_buffer_cap(arg.port, pin, dbw, flooder);

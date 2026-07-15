@@ -71,6 +71,10 @@ typedef enum {
     OC_MSG_INVITE_TO_CHANNEL  = 0x0056, /* C->S (REQ-033, channel-level) */
     OC_MSG_REMOVE_FROM_CHANNEL= 0x0057, /* C->S (REQ-033, channel-level) */
     OC_MSG_OPEN_DM            = 0x0058, /* C->S, open/get a 1:1 DM (REQ-050) */
+    OC_MSG_SET_PRESENCE     = 0x0070, /* C->S, set own presence (REQ-120) */
+    OC_MSG_PRESENCE_UPDATE  = 0x0071, /* S->C, a user's presence changed */
+    OC_MSG_TYPING           = 0x0072, /* C->S, "I am typing" in a channel (REQ-121) */
+    OC_MSG_TYPING_UPDATE    = 0x0073, /* S->C, relay of a typing signal */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -210,6 +214,12 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 
 #define OC_SESSION_TOKEN_LEN 32u  /* random session token; only its hash is stored */
 
+/* Presence status (REQ-120). offline is implicit (no connection); a client sets
+ * online/away. */
+#define OC_PRESENCE_OFFLINE 0u
+#define OC_PRESENCE_ONLINE  1u
+#define OC_PRESENCE_AWAY    2u
+
 /* Channel kind (SCHEMA.md channels.kind) and the name cap for CREATE_CHANNEL. */
 #define OC_CHANNEL_KIND    0u   /* a named channel */
 #define OC_CHANNEL_KIND_DM 1u   /* a direct-message conversation (reserved) */
@@ -265,6 +275,10 @@ typedef struct { uint64_t channel_id; } oc_channel_ref;                       /*
 typedef struct { uint64_t channel_id; uint64_t user_id; } oc_channel_member_op; /* INVITE / REMOVE */
 typedef struct { uint64_t channel_id; oc_slice name; uint8_t is_public; uint8_t joined; uint8_t kind; } oc_channel_list_entry;
 typedef struct { uint64_t user_id; } oc_open_dm;
+typedef struct { uint8_t status; } oc_set_presence;
+typedef struct { uint64_t user_id; uint8_t status; } oc_presence_update;
+typedef struct { uint64_t channel_id; } oc_typing;
+typedef struct { uint64_t channel_id; uint64_t user_id; } oc_typing_update;
 typedef struct { uint16_t count; const oc_channel_list_entry *entries; } oc_channel_list;
 typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; oc_slice email; oc_slice display_name; } oc_user_list_entry;
 typedef struct { uint16_t count; const oc_user_list_entry *entries; } oc_user_list;
@@ -322,6 +336,10 @@ oc_result oc_encode_leave_channel(oc_wbuf *w, uint16_t version, const oc_channel
 oc_result oc_encode_invite_to_channel(oc_wbuf *w, uint16_t version, const oc_channel_member_op *m);
 oc_result oc_encode_remove_from_channel(oc_wbuf *w, uint16_t version, const oc_channel_member_op *m);
 oc_result oc_encode_open_dm(oc_wbuf *w, uint16_t version, const oc_open_dm *m);
+oc_result oc_encode_set_presence(oc_wbuf *w, uint16_t version, const oc_set_presence *m);
+oc_result oc_encode_presence_update(oc_wbuf *w, uint16_t version, const oc_presence_update *m);
+oc_result oc_encode_typing(oc_wbuf *w, uint16_t version, const oc_typing *m);
+oc_result oc_encode_typing_update(oc_wbuf *w, uint16_t version, const oc_typing_update *m);
 oc_result oc_encode_list_users(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_user_list(oc_wbuf *w, uint16_t version, const oc_user_list *m);
 oc_result oc_encode_set_role(oc_wbuf *w, uint16_t version, const oc_set_role *m);
@@ -377,6 +395,10 @@ oc_result oc_decode_leave_channel(oc_rbuf *p, oc_channel_ref *m);
 oc_result oc_decode_invite_to_channel(oc_rbuf *p, oc_channel_member_op *m);
 oc_result oc_decode_remove_from_channel(oc_rbuf *p, oc_channel_member_op *m);
 oc_result oc_decode_open_dm(oc_rbuf *p, oc_open_dm *m);
+oc_result oc_decode_set_presence(oc_rbuf *p, oc_set_presence *m);
+oc_result oc_decode_presence_update(oc_rbuf *p, oc_presence_update *m);
+oc_result oc_decode_typing(oc_rbuf *p, oc_typing *m);
+oc_result oc_decode_typing_update(oc_rbuf *p, oc_typing_update *m);
 oc_result oc_decode_list_users(oc_rbuf *p);
 oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries, uint16_t cap, uint16_t *out_count);
 oc_result oc_decode_set_role(oc_rbuf *p, oc_set_role *m);

@@ -34,7 +34,8 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_REDEEM = 18, OC_JOB_REACT = 19, OC_JOB_LIST_REACTIONS = 20,
        OC_JOB_SEND_REPLY = 21, OC_JOB_LIST_THREAD = 22, OC_JOB_SEARCH = 23,
        OC_JOB_SETUP_INVITE = 24, OC_JOB_CLIENT_ACK = 25,
-       OC_JOB_LOAD_IDENTITY = 26, OC_JOB_STORE_IDENTITY = 27, OC_JOB_OPEN_DM = 28 };
+       OC_JOB_LOAD_IDENTITY = 26, OC_JOB_STORE_IDENTITY = 27, OC_JOB_OPEN_DM = 28,
+       OC_JOB_TYPING = 29 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -108,7 +109,8 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_USER_UPDATED = 22, OC_RES_USER_ERR = 23,
        OC_RES_REACTION_OK = 24, OC_RES_REACTION_ERR = 25, OC_RES_REACTIONS = 26,
        OC_RES_REPLY_OK = 27, OC_RES_REPLY_ERR = 28, OC_RES_THREAD = 29,
-       OC_RES_SEARCH = 30, OC_RES_IDENTITY = 31, OC_RES_OK = 32 };
+       OC_RES_SEARCH = 30, OC_RES_IDENTITY = 31, OC_RES_OK = 32,
+       OC_RES_TYPING = 33 };
 
 /* One row in a REACTIONS result (a distinct emoji + one reacting user). */
 typedef struct { char *emoji; uint64_t user_id; } oc_reaction_row;

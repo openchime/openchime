@@ -79,8 +79,8 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 
 | REQ | Status | Notes |
 |-----|--------|-------|
-| 120 presence | ⛔ | No presence frames/state. |
-| 121 typing indicator | ⛔ | `[needs ARCH decision — expiry window]`. |
+| 120 presence | ✅ | In-memory net-thread state; `SET_PRESENCE`/`PRESENCE_UPDATE` + auth-time online snapshot (ARCH-67). |
+| 121 typing indicator | ✅ | Member-scoped `TYPING`/`TYPING_UPDATE` relay; ~6s client-side expiry resolves the window (ARCH-68). |
 | 130 per-channel notification level | ⛔ | |
 | 131 do-not-disturb schedule | ⛔ | |
 | 132 APNs/FCM push | ⛔ | |
@@ -173,8 +173,8 @@ full-text search — all reachable over the wire and tested end-to-end.
 
 The **largest missing surfaces** are (a) a real **client** beyond the Phase-1
 skeleton (the only consumer of all the above), and (b) whole **feature families
-not yet begun**: presence/typing, notifications/push, attachments, audio, and
-webhooks.
+not yet begun**: notifications/push, attachments, audio, and webhooks.
+Presence/typing (REQ-120/121) is now built and tested end-to-end.
 
 The **server-robustness backlog is cleared** (see Resolved above): SEND-flood
 rate limiting, the per-connection output-buffer cap, idempotency-map pruning,
@@ -182,5 +182,5 @@ reads decoupled onto a read-only connection, server-side delivery accounting, a
 per-IP connection throttle, TLS-identity persistence across restore, truncation
 signals, the first-owner setup token, and a codec fuzzer + concurrency load
 test. What remains is **not** hardening but **scope**: a real client, the
-unbuilt feature families (presence, notifications/push, attachments, audio,
-webhooks), and a quantitative capacity benchmark for REQ-210/211.
+unbuilt feature families (notifications/push, attachments, audio, webhooks), and
+a quantitative capacity benchmark for REQ-210/211.

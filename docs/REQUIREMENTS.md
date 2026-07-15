@@ -271,13 +271,20 @@ the requirement says so explicitly rather than implying one.
 ## 4. Presence and Real-Time State
 
 - **REQ-120.** Clients have reflected other users' online, away, and offline
-  state in near-real-time, propagated via the `presence-update` message type
-  (ARCH-8).
+  state in near-real-time, propagated via the `PRESENCE_UPDATE` message type
+  (ARCH-8). Presence is derived from live connection state on the network thread
+  and never persisted (ARCH-67): a `SET_PRESENCE` marks a connection away/online,
+  a user is online while any connection is active and offline once the last
+  closes, and each transition fans out tenant-wide to other authenticated
+  clients while a newly authenticated client gets a snapshot of who is online.
 - **REQ-121.** Clients have shown a transient "user is typing" indicator
   scoped to the active channel or thread, which has expired automatically
   client-side if no further typing signal arrives within a short window
-  (avoiding a stuck indicator on an ungraceful disconnect). **[needs ARCH
-  decision — expiry window]**
+  (avoiding a stuck indicator on an ungraceful disconnect). A `TYPING` signal is
+  relayed as a member-scoped `TYPING_UPDATE` (ARCH-68), so private-channel and DM
+  typing never leaks to non-members; the server keeps no expiry timer. Resolved:
+  the indicator expires **client-side after ~6 seconds**, refreshed by each new
+  `TYPING` signal — no "stopped typing" frame is sent.
 
 ---
 

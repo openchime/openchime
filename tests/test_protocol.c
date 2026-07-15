@@ -473,6 +473,35 @@ static void test_search_frames(void) {
     }
 }
 
+static void test_presence_frames(void) {
+    {
+        oc_set_presence in = { OC_PRESENCE_AWAY };
+        ROUNDTRIP(oc_encode_set_presence(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_PRESENCE, h, p);
+        oc_set_presence out;
+        CHECK(oc_decode_set_presence(&p, &out) == OC_OK && out.status == OC_PRESENCE_AWAY);
+    }
+    {
+        oc_presence_update in = { 42, OC_PRESENCE_ONLINE };
+        ROUNDTRIP(oc_encode_presence_update(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PRESENCE_UPDATE, h, p);
+        oc_presence_update out;
+        CHECK(oc_decode_presence_update(&p, &out) == OC_OK);
+        CHECK(out.user_id == 42 && out.status == OC_PRESENCE_ONLINE);
+    }
+    {
+        oc_typing in = { 7 };
+        ROUNDTRIP(oc_encode_typing(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TYPING, h, p);
+        oc_typing out;
+        CHECK(oc_decode_typing(&p, &out) == OC_OK && out.channel_id == 7);
+    }
+    {
+        oc_typing_update in = { 7, 42 };
+        ROUNDTRIP(oc_encode_typing_update(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_TYPING_UPDATE, h, p);
+        oc_typing_update out;
+        CHECK(oc_decode_typing_update(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.user_id == 42);
+    }
+}
+
 static void test_backfill_and_error(void) {
     {
         oc_cursor cursors[3] = { {7, 1000}, {8, 0}, {9, 512} };
@@ -621,6 +650,7 @@ int run_protocol_tests(void) {
     test_channel_frames();
     test_admin_frames();
     test_search_frames();
+    test_presence_frames();
     test_backfill_and_error();
     test_size_limits();
     test_malformed();

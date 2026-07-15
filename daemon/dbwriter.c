@@ -1830,12 +1830,29 @@ static void push_result(oc_dbwriter *w, oc_dbres *r) {
     (void)wr;
 }
 
+/* Relay a typing signal (REQ-121): resolve the channel's members so the net
+ * thread can fan a TYPING_UPDATE to them. Read-only; no state kept. Members are
+ * empty (nothing relayed) if the typer can't read the channel — so typing in a
+ * private channel or DM never leaks to non-members. */
+static oc_dbres *process_typing(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_TYPING;
+    r->channel_id = j->channel_id;
+    r->author_id = j->user_id;   /* the user who is typing */
+    if (channel_read_access(db, j->channel_id, j->user_id))
+        load_members(db, j->channel_id, r);
+    return r;
+}
+
 /* Read-only query jobs run on the reader connection (ARCH-66), off the writer
  * thread, so a heavy search/backfill can't stall message sends or auth. */
 static int is_read_job(int type) {
     return type == OC_JOB_BACKFILL || type == OC_JOB_SEARCH ||
            type == OC_JOB_LIST_CHANNELS || type == OC_JOB_LIST_USERS ||
-           type == OC_JOB_LIST_REACTIONS || type == OC_JOB_LIST_THREAD;
+           type == OC_JOB_LIST_REACTIONS || type == OC_JOB_LIST_THREAD ||
+           type == OC_JOB_TYPING;
 }
 
 /* Dispatch a read-only job against `rdb`. */
@@ -1846,6 +1863,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_LIST_USERS)     return process_list_users(rdb, j);
     if (j->type == OC_JOB_LIST_REACTIONS) return process_list_reactions(rdb, j);
     if (j->type == OC_JOB_LIST_THREAD)    return process_list_thread(rdb, j);
+    if (j->type == OC_JOB_TYPING)         return process_typing(rdb, j);
     return NULL;
 }
 

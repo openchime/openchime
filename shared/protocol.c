@@ -465,6 +465,32 @@ oc_result oc_encode_open_dm(oc_wbuf *w, uint16_t version, const oc_open_dm *m) {
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_set_presence(oc_wbuf *w, uint16_t version, const oc_set_presence *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_PRESENCE);
+    oc_w_u8(w, m->status);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_presence_update(oc_wbuf *w, uint16_t version, const oc_presence_update *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PRESENCE_UPDATE);
+    oc_w_u64(w, m->user_id);
+    oc_w_u8(w, m->status);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_typing(oc_wbuf *w, uint16_t version, const oc_typing *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_TYPING);
+    oc_w_u64(w, m->channel_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_typing_update(oc_wbuf *w, uint16_t version, const oc_typing_update *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_TYPING_UPDATE);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->user_id);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_join_channel(oc_wbuf *w, uint16_t version, const oc_channel_ref *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_JOIN_CHANNEL);
     oc_w_u64(w, m->channel_id);
@@ -825,6 +851,28 @@ oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries,
 }
 
 oc_result oc_decode_open_dm(oc_rbuf *p, oc_open_dm *m) {
+    m->user_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_set_presence(oc_rbuf *p, oc_set_presence *m) {
+    m->status = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_presence_update(oc_rbuf *p, oc_presence_update *m) {
+    m->user_id = oc_r_u64(p);
+    m->status = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_typing(oc_rbuf *p, oc_typing *m) {
+    m->channel_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_typing_update(oc_rbuf *p, oc_typing_update *m) {
+    m->channel_id = oc_r_u64(p);
     m->user_id = oc_r_u64(p);
     return r_done(p);
 }
