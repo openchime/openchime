@@ -876,8 +876,26 @@ static void load_members(sqlite3 *db, uint64_t channel_id, oc_dbres *r) {
     r->n_members = n;
 }
 
-/* Does the channel exist (kind='channel')? Fills *is_public if so. */
+/* Does the channel exist (any kind — a named channel or a DM)? Fills *is_public.
+ * Used by the read/post-access gate, which applies to DMs too. */
 static int channel_exists(sqlite3 *db, uint64_t channel_id, uint8_t *is_public) {
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    sqlite3_prepare_v2(db,
+        "SELECT is_public FROM channels WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        if (is_public) *is_public = (uint8_t)(sqlite3_column_int(st, 0) != 0);
+        found = 1;
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
+/* Does a *named channel* (kind='channel', not a DM) exist? The channel-
+ * management ops (join/leave/invite/remove) operate only on named channels;
+ * DMs are managed only via OPEN_DM. Fills *is_public. */
+static int named_channel_exists(sqlite3 *db, uint64_t channel_id, uint8_t *is_public) {
     sqlite3_stmt *st = NULL;
     int found = 0;
     sqlite3_prepare_v2(db,
@@ -1108,15 +1126,16 @@ static int load_channel_info(sqlite3 *db, uint64_t channel_id, uint64_t actor, o
     sqlite3_stmt *st = NULL;
     int found = 0;
     sqlite3_prepare_v2(db,
-        "SELECT name, is_public, created_at_ms FROM channels WHERE id=? AND kind='channel';",
+        "SELECT kind, name, is_public, created_at_ms FROM channels WHERE id=?;",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
     if (sqlite3_step(st) == SQLITE_ROW) {
-        const unsigned char *nm = sqlite3_column_text(st, 0);
+        const unsigned char *kn = sqlite3_column_text(st, 0);
+        const unsigned char *nm = sqlite3_column_text(st, 1);
+        r->ch_kind       = (kn && strcmp((const char *)kn, "dm") == 0) ? OC_CHANNEL_KIND_DM : OC_CHANNEL_KIND;
         r->ch_name       = strdup(nm ? (const char *)nm : "");
-        r->ch_is_public  = (uint8_t)(sqlite3_column_int(st, 1) != 0);
-        r->ch_created_at = (uint64_t)sqlite3_column_int64(st, 2);
-        r->ch_kind       = OC_CHANNEL_KIND;
+        r->ch_is_public  = (uint8_t)(sqlite3_column_int(st, 2) != 0);
+        r->ch_created_at = (uint64_t)sqlite3_column_int64(st, 3);
         r->channel_id    = channel_id;
         found = 1;
     }
@@ -1164,12 +1183,16 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
     r->conn_id = j->conn_id;
     r->type = OC_RES_CHANNEL_LIST;
 
+    /* Every public named channel, plus any named channel or DM the user belongs
+     * to. DMs are members-only (is_public=0) and surface only to their two
+     * participants (REQ-050). */
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
         "SELECT c.id, c.name, c.is_public, "
-        "  EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1) "
-        "FROM channels c WHERE c.kind='channel' AND "
-        "  (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1)) "
+        "  EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1), c.kind "
+        "FROM channels c WHERE "
+        "  (c.kind='channel' AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1))) "
+        "  OR (c.kind='dm' AND EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1)) "
         "ORDER BY c.id;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
 
@@ -1178,10 +1201,12 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
     while (arr && sqlite3_step(st) == SQLITE_ROW) {
         if (n == cap) { cap *= 2; oc_channel_row *g = realloc(arr, cap * sizeof *arr); if (!g) break; arr = g; }
         const unsigned char *nm = sqlite3_column_text(st, 1);
+        const unsigned char *kn = sqlite3_column_text(st, 4);
         arr[n].channel_id = (uint64_t)sqlite3_column_int64(st, 0);
         arr[n].name       = strdup(nm ? (const char *)nm : "");
         arr[n].is_public  = (uint8_t)(sqlite3_column_int(st, 2) != 0);
         arr[n].joined     = (uint8_t)(sqlite3_column_int(st, 3) != 0);
+        arr[n].kind       = (kn && strcmp((const char *)kn, "dm") == 0) ? OC_CHANNEL_KIND_DM : OC_CHANNEL_KIND;
         n++;
     }
     sqlite3_finalize(st);
@@ -1198,7 +1223,7 @@ static oc_dbres *process_join_channel(sqlite3 *db, const oc_job *j) {
     r->conn_id = j->conn_id;
 
     uint8_t is_public = 0;
-    if (!channel_exists(db, j->channel_id, &is_public)) {
+    if (!named_channel_exists(db, j->channel_id, &is_public)) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r;
     }
     if (!is_public && !is_member(db, j->channel_id, j->user_id)) {
@@ -1216,7 +1241,7 @@ static oc_dbres *process_leave_channel(sqlite3 *db, const oc_job *j) {
     if (!r) return NULL;
     r->conn_id = j->conn_id;
 
-    if (!channel_exists(db, j->channel_id, NULL)) {
+    if (!named_channel_exists(db, j->channel_id, NULL)) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r;
     }
     sqlite3_stmt *st = NULL;
@@ -1241,7 +1266,7 @@ static oc_dbres *process_invite_channel(sqlite3 *db, const oc_job *j) {
     if (!r) return NULL;
     r->conn_id = j->conn_id;
 
-    if (!channel_exists(db, j->channel_id, NULL)) {
+    if (!named_channel_exists(db, j->channel_id, NULL)) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r;
     }
     if (!is_member(db, j->channel_id, j->user_id)) {
@@ -1265,7 +1290,7 @@ static oc_dbres *process_remove_channel(sqlite3 *db, const oc_job *j) {
     if (!r) return NULL;
     r->conn_id = j->conn_id;
 
-    if (!channel_exists(db, j->channel_id, NULL)) {
+    if (!named_channel_exists(db, j->channel_id, NULL)) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r;
     }
     if (!is_member(db, j->channel_id, j->user_id)) {
@@ -1281,6 +1306,63 @@ static oc_dbres *process_remove_channel(sqlite3 *db, const oc_job *j) {
 
     r->type = OC_RES_CHANNEL_INFO;
     load_channel_info(db, j->channel_id, j->user_id, r);
+    return r;
+}
+
+/* Open (or get) the 1:1 DM between the caller and target (REQ-050). A DM is a
+ * kind='dm' channel with exactly the two participants; idempotent — an existing
+ * DM is returned rather than a duplicate created. Replies CHANNEL_INFO (kind=DM),
+ * pushed to the peer so their client learns of it. Messaging/backfill/search
+ * then work through the normal membership path. */
+static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    uint64_t self = j->user_id, other = j->target_user_id;
+    if (other == 0 || other == self) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    uint8_t trole = OC_ROLE_MEMBER;
+    if (!user_role(db, other, &trole)) {   /* unknown target: no disclosure */
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+
+    /* An existing 1:1 DM is a kind='dm' channel whose membership is exactly {self, other}. */
+    uint64_t cid = 0;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT c.id FROM channels c "
+        "JOIN channel_members a ON a.channel_id=c.id AND a.user_id=?1 "
+        "JOIN channel_members b ON b.channel_id=c.id AND b.user_id=?2 "
+        "WHERE c.kind='dm' "
+        "  AND (SELECT COUNT(*) FROM channel_members m WHERE m.channel_id=c.id)=2 "
+        "LIMIT 1;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)self);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)other);
+    if (sqlite3_step(st) == SQLITE_ROW) cid = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+
+    if (cid == 0) {
+        sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+        sqlite3_prepare_v2(db,
+            "INSERT INTO channels(kind,name,is_public,created_at_ms) VALUES('dm',NULL,0,?);",
+            -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+        int rc = sqlite3_step(st);
+        sqlite3_finalize(st);
+        if (rc != SQLITE_DONE) {
+            sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+            r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+        }
+        cid = (uint64_t)sqlite3_last_insert_rowid(db);
+        add_membership(db, cid, self);
+        add_membership(db, cid, other);
+        sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    }
+
+    r->type = OC_RES_CHANNEL_INFO;
+    load_channel_info(db, cid, self, r);
+    r->push_user_id = other;
     return r;
 }
 
@@ -1768,6 +1850,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_LEAVE_CHANNEL)  return process_leave_channel(w->db, j);
     if (j->type == OC_JOB_INVITE_CHANNEL) return process_invite_channel(w->db, j);
     if (j->type == OC_JOB_REMOVE_CHANNEL) return process_remove_channel(w->db, j);
+    if (j->type == OC_JOB_OPEN_DM)        return process_open_dm(w->db, j);
     if (j->type == OC_JOB_INVITE_USER)    return process_invite_user(w->db, j);
     if (j->type == OC_JOB_REMOVE_USER)    return process_remove_user(w->db, j);
     if (j->type == OC_JOB_REDEEM)         return process_redeem(w->db, j);

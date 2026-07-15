@@ -680,6 +680,68 @@ static void test_search_vertical(int port, const uint8_t *pin) {
     client_close(&b);
 }
 
+/* Direct messages over the wire (REQ-050): OPEN_DM creates a kind=DM channel,
+ * pushes a CHANNEL_INFO to the peer, the two participants exchange messages
+ * through it, and a third user cannot post to it. */
+static void test_dm_vertical(int port, const uint8_t *pin) {
+    client a, b, c;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(client_open(&c, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    CHECK(do_handshake(&b) == 0);
+    CHECK(do_handshake(&c) == 0);
+    uint64_t ua = 0, ub = 0, uc = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    CHECK(do_auth(&c, "carol", "pw", &uc) == 0);
+
+    uint8_t buf[256]; oc_wbuf w; oc_header hdr; oc_rbuf p;
+
+    /* alice opens a DM with bob: alice gets CHANNEL_INFO(kind=DM), bob is pushed one. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_open_dm od = { ub };
+    CHECK(oc_encode_open_dm(&w, OC_PROTOCOL_VERSION, &od) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
+    oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
+    CHECK(ci.kind == OC_CHANNEL_KIND_DM && ci.joined == 1);
+    uint64_t dm = ci.channel_id;
+    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
+    oc_channel_info ci2; CHECK(oc_decode_channel_info(&p, &ci2) == OC_OK);
+    CHECK(ci2.channel_id == dm && ci2.kind == OC_CHANNEL_KIND_DM);
+
+    /* alice messages the DM; both participants receive the BROADCAST. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s; s.channel_id = dm; memset(s.idem, 0x4D, OC_IDEM_SIZE);
+    s.body = oc_slice_str("hi bob, dm here");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    uint64_t mid = 0;
+    for (int i = 0; i < 2; i++) {          /* alice: SEND_ACK + own BROADCAST */
+        CHECK(read_frame(&a, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) { oc_send_ack ack; CHECK(oc_decode_send_ack(&p, &ack) == OC_OK); mid = ack.message_id; }
+    }
+    CHECK(mid != 0);
+    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BROADCAST);
+    oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
+    CHECK(bc.channel_id == dm && bc.author_id == ua && bc.message_id == mid);
+
+    /* carol (not a participant) cannot post to the DM. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s2; s2.channel_id = dm; memset(s2.idem, 0x4E, OC_IDEM_SIZE);
+    s2.body = oc_slice_str("intruding");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s2) == OC_OK);
+    CHECK(send_frame(&c, buf, w.len) == 0);
+    CHECK(read_frame(&c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
+    oc_error e; CHECK(oc_decode_error(&p, &e) == OC_OK);
+    CHECK(e.code == OC_ERR_NOT_A_MEMBER && e.fatal == 0);
+
+    client_close(&a);
+    client_close(&b);
+    client_close(&c);
+}
+
 /* Tenant admin ops over the wire (REQ-033): an owner mints an invite, a fresh
  * client redeems it to create + authenticate an account, the owner promotes that
  * user (SET_ROLE pushes USER_UPDATED to them), lists users, and removes a member
@@ -966,7 +1028,7 @@ static void test_conn_throttle(int port) {
 }
 
 int run_netloop_tests(void) {
-    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, search, load, rate-limit, out-cap, throttle, admin, logout\n");
+    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, search, dm, load, rate-limit, out-cap, throttle, admin, logout\n");
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -1006,6 +1068,7 @@ int run_netloop_tests(void) {
         test_reactions_vertical(arg.port, pin);
         test_threads_vertical(arg.port, pin);
         test_search_vertical(arg.port, pin);
+        test_dm_vertical(arg.port, pin);
         test_concurrent_load(arg.port, pin);
         test_send_rate_limit(arg.port, pin);
         test_out_buffer_cap(arg.port, pin, dbw, flooder);

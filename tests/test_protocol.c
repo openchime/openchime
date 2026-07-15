@@ -329,16 +329,23 @@ static void test_channel_frames(void) {
     }
     {
         oc_channel_list_entry ents[2] = {
-            { 1, oc_slice_str("general"),   1, 1 },
-            { 5, oc_slice_str("engineering"), 0, 1 },
+            { 1, oc_slice_str("general"),   1, 1, OC_CHANNEL_KIND },
+            { 9, oc_slice_str(""),          0, 1, OC_CHANNEL_KIND_DM },
         };
         oc_channel_list in = { 2, ents };
         ROUNDTRIP(oc_encode_channel_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANNEL_LIST, h, p);
         oc_channel_list_entry out[2]; uint16_t n = 0;
         CHECK(oc_decode_channel_list(&p, out, 2, &n) == OC_OK);
         CHECK(n == 2);
-        CHECK(out[0].channel_id == 1 && slice_eq_str(out[0].name, "general") && out[0].is_public == 1);
-        CHECK(out[1].channel_id == 5 && slice_eq_str(out[1].name, "engineering") && out[1].joined == 1);
+        CHECK(out[0].channel_id == 1 && slice_eq_str(out[0].name, "general") && out[0].kind == OC_CHANNEL_KIND);
+        CHECK(out[1].channel_id == 9 && out[1].joined == 1 && out[1].kind == OC_CHANNEL_KIND_DM);
+    }
+    {
+        oc_open_dm in = { 42 };
+        ROUNDTRIP(oc_encode_open_dm(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_OPEN_DM, h, p);
+        oc_open_dm out;
+        CHECK(oc_decode_open_dm(&p, &out) == OC_OK);
+        CHECK(out.user_id == 42);
     }
     {
         oc_channel_ref in = { 5 };

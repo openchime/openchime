@@ -64,7 +64,10 @@ Identity resolved from the OIDC token (REQ-023). `id` is the tenant-local
 
 ### `channels`
 A channel or a direct-message conversation (REQ-050). `is_public` distinguishes
-open channels from private ones for the read/post gate in REQ-031.
+open channels from private ones for the read/post gate in REQ-031. A **DM** is a
+`kind='dm'` row with `name=NULL`, `is_public=0`, and exactly two members
+(`OPEN_DM`, PROTOCOL.md §5.12) — so messaging/backfill/search reuse the ordinary
+membership path. The channel-management ops act only on `kind='channel'`.
 
 | column          | type    | notes                                            |
 |-----------------|---------|--------------------------------------------------|

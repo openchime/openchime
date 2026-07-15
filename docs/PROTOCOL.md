@@ -9,8 +9,8 @@ resolves the protocol-shaped `[needs ARCH decision]` items in
 **Scope of this revision.** This covers connection handshake and version
 negotiation, authentication, the message send/broadcast/ack cycle, message
 edit/delete (§5.5/5.6), reactions (§5.9), threads (§5.10), search (§5.11),
-channel management (§5.7), tenant administration (§5.8), and reconnect backfill,
-plus the error frame. Presence (REQ-120/121), typing indicators, thread notifications
+direct messages (§5.12), channel management (§5.7), tenant administration (§5.8),
+and reconnect backfill, plus the error frame. Presence (REQ-120/121), typing indicators, thread notifications
 (REQ-061/130), and audio-call signaling (REQ-150–152) are deliberately out of
 scope here and will be added in later revisions of this document, reusing the
 framing and encoding rules defined below. New message types are additive; the
@@ -462,7 +462,10 @@ public channel plus the private channels the user belongs to:
 | Field       | Type            | Notes                                             |
 |-------------|-----------------|---------------------------------------------------|
 | `count`     | u16             | Number of entries.                                |
-| `entries[]` | `count` × entry | Each: `channel_id` (u64), `name` (str), `is_public` (u8), `joined` (u8). |
+| `entries[]` | `count` × entry | Each: `channel_id` (u64), `name` (str), `is_public` (u8), `joined` (u8), `kind` (u8 — `0` channel, `1` DM). |
+
+The list includes the caller's DMs (§5.12) alongside channels; DM entries have
+`kind=1`, an empty `name`, and `is_public=0`.
 
 **`JOIN_CHANNEL` (client → server), msg_type `0x0054`** `{ channel_id: u64 }` —
 public channels are self-joinable; a private channel rejects with `FORBIDDEN`
@@ -677,6 +680,25 @@ first:
 Tombstoned messages (§5.6) are excluded, and an edit (§5.5) re-indexes the
 message. An empty or all-punctuation query returns zero results (never an error).
 
+### 5.12 Direct messages (REQ-050)
+
+A direct message conversation is a **`kind='dm'` channel with exactly two
+members** — so once opened, everything else (send/broadcast, backfill, search,
+reactions, threads) works through the ordinary membership path with no
+DM-specific machinery. DMs are members-only (`is_public=0`) and never named.
+
+**`OPEN_DM` (client → server), msg_type `0x0058`** `{ user_id: u64 }` — opens (or
+returns) the 1:1 DM between the caller and `user_id`. Idempotent: an existing DM
+between the two is returned rather than a second created; you cannot DM yourself
+or an unknown user (`FORBIDDEN`). Replies **`CHANNEL_INFO`** (§5.7, `kind=1`) to
+the caller, and pushes the same to the peer's live connections so their client
+learns of the DM. Thereafter the client sends to the returned `channel_id` with
+an ordinary `SEND`, and both participants receive the `BROADCAST`.
+
+DMs a user belongs to appear in `LIST_CHANNELS` (§5.7) with `kind=1`. The
+channel-management ops (join/leave/invite/remove) operate only on named channels
+and reject a DM id with `UNKNOWN_CHANNEL`.
+
 ---
 
 ## 6. Reconnect backfill (resolves REQ-101)
@@ -838,6 +860,7 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0055` | `LEAVE_CHANNEL`    | C → S     | no        | §5.7    |
 | `0x0056` | `INVITE_TO_CHANNEL`| C → S     | no        | §5.7    |
 | `0x0057` | `REMOVE_FROM_CHANNEL`| C → S   | no        | §5.7    |
+| `0x0058` | `OPEN_DM`          | C → S     | no        | §5.12   |
 | `0x0030` | `BACKFILL_REQUEST` | C → S     | no        | §6.1    |
 | `0x0031` | `BACKFILL_DONE`    | S → C     | no        | §6.2    |
 | `0x00FF` | `ERROR`            | S → C     | no        | §8.1    |

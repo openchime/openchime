@@ -34,7 +34,7 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_REDEEM = 18, OC_JOB_REACT = 19, OC_JOB_LIST_REACTIONS = 20,
        OC_JOB_SEND_REPLY = 21, OC_JOB_LIST_THREAD = 22, OC_JOB_SEARCH = 23,
        OC_JOB_SETUP_INVITE = 24, OC_JOB_CLIENT_ACK = 25,
-       OC_JOB_LOAD_IDENTITY = 26, OC_JOB_STORE_IDENTITY = 27 };
+       OC_JOB_LOAD_IDENTITY = 26, OC_JOB_STORE_IDENTITY = 27, OC_JOB_OPEN_DM = 28 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -119,6 +119,7 @@ typedef struct {
     char    *name;       /* heap */
     uint8_t  is_public;
     uint8_t  joined;     /* 1 if the requesting user is a member */
+    uint8_t  kind;       /* OC_CHANNEL_KIND / OC_CHANNEL_KIND_DM */
 } oc_channel_row;
 
 /* One row in a USER_LIST result. */

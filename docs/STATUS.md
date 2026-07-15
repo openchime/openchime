@@ -48,7 +48,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 
 | REQ | Status | Notes |
 |-----|--------|-------|
-| 050 message → channel/DM, author, server time | ✅ / ⛔ | Channel messaging ✅. **Direct messages ⛔** — schema has `kind='dm'` but no create/open op. |
+| 050 message → channel/DM, author, server time | ✅ | Channel messaging + **direct messages** (`OPEN_DM`, 1:1 `kind='dm'` channels; messaging/backfill/search via the membership path). |
 | 051 edit + "edited" marker | ✅ | `edited_at_ms`; original time/position kept. Marker rendering is client-side. |
 | 052 delete tombstone | ✅ | Body nulled; id/author/timestamps kept; reactions cleared. |
 | 053 no retention cutoff | ✅ | No message pruning of any kind. |

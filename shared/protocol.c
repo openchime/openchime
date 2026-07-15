@@ -454,7 +454,14 @@ oc_result oc_encode_channel_list(oc_wbuf *w, uint16_t version, const oc_channel_
         oc_w_str(w, m->entries[i].name);
         oc_w_u8(w, m->entries[i].is_public);
         oc_w_u8(w, m->entries[i].joined);
+        oc_w_u8(w, m->entries[i].kind);
     }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_open_dm(oc_wbuf *w, uint16_t version, const oc_open_dm *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_OPEN_DM);
+    oc_w_u64(w, m->user_id);
     return oc_frame_end(w, off);
 }
 
@@ -805,13 +812,20 @@ oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries,
         oc_slice name = oc_r_str(p);
         uint8_t is_public = oc_r_u8(p);
         uint8_t joined = oc_r_u8(p);
+        uint8_t kind = oc_r_u8(p);
         if (i < cap) {
             entries[i].channel_id = id;
             entries[i].name = name;
             entries[i].is_public = is_public;
             entries[i].joined = joined;
+            entries[i].kind = kind;
         }
     }
+    return r_done(p);
+}
+
+oc_result oc_decode_open_dm(oc_rbuf *p, oc_open_dm *m) {
+    m->user_id = oc_r_u64(p);
     return r_done(p);
 }
 

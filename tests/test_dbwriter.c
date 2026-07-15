@@ -1373,6 +1373,82 @@ static void test_delivery_cursor(void) {
     cleanup_db(path);
 }
 
+/* --- Direct messages (REQ-050) ------------------------------------------ */
+
+static oc_dbres *open_dm(oc_dbwriter *w, uint64_t actor, uint64_t target) {
+    oc_job *j = oc_job_new(OC_JOB_OPEN_DM, 55);
+    j->user_id = actor; j->target_user_id = target;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_dm(void) {
+    const char *path = "build/test_dbwriter_dm.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t alice = reg(w, "dm-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "dm-bob",   "pw", OC_ROLE_MEMBER);
+    uint64_t carol = reg(w, "dm-carol", "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob && carol);
+
+    /* Open a DM alice<->bob: a kind=DM channel, alice joined, bob flagged for push. */
+    oc_dbres *r = open_dm(w, alice, bob);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    CHECK(r->ch_kind == OC_CHANNEL_KIND_DM && r->ch_joined == 1 && r->push_user_id == bob);
+    uint64_t dm = r->channel_id;
+    CHECK(dm != OC_DEFAULT_CHANNEL);
+    oc_dbres_free(r);
+
+    /* Idempotent: re-opening (either direction) returns the same channel. */
+    r = open_dm(w, alice, bob);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->channel_id == dm);
+    oc_dbres_free(r);
+    r = open_dm(w, bob, alice);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->channel_id == dm);
+    oc_dbres_free(r);
+
+    /* Can't DM yourself or an unknown user. */
+    r = open_dm(w, alice, alice);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+    r = open_dm(w, alice, 99999);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    /* Messaging works through the DM channel; only the two participants read it. */
+    uint64_t mid = send_id(w, alice, dm, "hey bob");
+    CHECK(mid != 0);
+    r = backfill(w, bob, dm, 0);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK && r->n_replay == 1 && r->replay[0].message_id == mid);
+    oc_dbres_free(r);
+    r = backfill(w, carol, dm, 0);                         /* carol is not a participant */
+    CHECK(r && r->type == OC_RES_BACKFILL_OK && r->n_replay == 0);
+    oc_dbres_free(r);
+    CHECK(send_to(w, carol, dm, "eavesdrop") == OC_ERR_NOT_A_MEMBER);
+
+    /* The DM shows in the participants' channel list (kind=DM), not carol's. */
+    int joined = -1;
+    r = list_channels(w, alice);
+    CHECK(r && list_has(r, dm, &joined) && joined == 1);
+    int kind_ok = 0;
+    for (size_t i = 0; i < r->n_chlist; i++) if (r->chlist[i].channel_id == dm) kind_ok = (r->chlist[i].kind == OC_CHANNEL_KIND_DM);
+    CHECK(kind_ok);
+    oc_dbres_free(r);
+    r = list_channels(w, carol);
+    CHECK(r && !list_has(r, dm, NULL));
+    oc_dbres_free(r);
+
+    /* A DM is not a named channel: channel-management ops reject it. */
+    r = chan_ref(w, OC_JOB_JOIN_CHANNEL, carol, dm);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_UNKNOWN_CHANNEL);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill\n");
     test_start_migrates_and_stops();
@@ -1384,6 +1460,7 @@ int run_dbwriter_tests(void) {
     test_role_enforcement();
     test_edit_delete();
     test_channels();
+    test_dm();
     test_admin_ops();
     test_reactions();
     test_threads();

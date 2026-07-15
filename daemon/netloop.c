@@ -385,6 +385,16 @@ static int drain_frames(conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_OPEN_DM) {
+            oc_open_dm od;
+            if (oc_decode_open_dm(&p, &od) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_OPEN_DM, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->target_user_id = od.user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_LIST_USERS) {
             if (oc_decode_list_users(&p) != OC_OK) return -1;
             oc_job *j = oc_job_new(OC_JOB_LIST_USERS, c->conn_id);
@@ -713,6 +723,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             ents[i].name = oc_slice_str(r->chlist[i].name ? r->chlist[i].name : "");
             ents[i].is_public = r->chlist[i].is_public;
             ents[i].joined = r->chlist[i].joined;
+            ents[i].kind = r->chlist[i].kind;
         }
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_channel_list cl = { (uint16_t)n, ents };

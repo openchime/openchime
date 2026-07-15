@@ -70,6 +70,7 @@ typedef enum {
     OC_MSG_LEAVE_CHANNEL      = 0x0055, /* C->S */
     OC_MSG_INVITE_TO_CHANNEL  = 0x0056, /* C->S (REQ-033, channel-level) */
     OC_MSG_REMOVE_FROM_CHANNEL= 0x0057, /* C->S (REQ-033, channel-level) */
+    OC_MSG_OPEN_DM            = 0x0058, /* C->S, open/get a 1:1 DM (REQ-050) */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -262,7 +263,8 @@ typedef struct { oc_slice name; uint8_t is_public; } oc_create_channel;
 typedef struct { uint64_t channel_id; uint8_t kind; oc_slice name; uint8_t is_public; uint8_t joined; uint64_t created_at; } oc_channel_info;
 typedef struct { uint64_t channel_id; } oc_channel_ref;                       /* JOIN / LEAVE */
 typedef struct { uint64_t channel_id; uint64_t user_id; } oc_channel_member_op; /* INVITE / REMOVE */
-typedef struct { uint64_t channel_id; oc_slice name; uint8_t is_public; uint8_t joined; } oc_channel_list_entry;
+typedef struct { uint64_t channel_id; oc_slice name; uint8_t is_public; uint8_t joined; uint8_t kind; } oc_channel_list_entry;
+typedef struct { uint64_t user_id; } oc_open_dm;
 typedef struct { uint16_t count; const oc_channel_list_entry *entries; } oc_channel_list;
 typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; oc_slice email; oc_slice display_name; } oc_user_list_entry;
 typedef struct { uint16_t count; const oc_user_list_entry *entries; } oc_user_list;
@@ -319,6 +321,7 @@ oc_result oc_encode_join_channel(oc_wbuf *w, uint16_t version, const oc_channel_
 oc_result oc_encode_leave_channel(oc_wbuf *w, uint16_t version, const oc_channel_ref *m);
 oc_result oc_encode_invite_to_channel(oc_wbuf *w, uint16_t version, const oc_channel_member_op *m);
 oc_result oc_encode_remove_from_channel(oc_wbuf *w, uint16_t version, const oc_channel_member_op *m);
+oc_result oc_encode_open_dm(oc_wbuf *w, uint16_t version, const oc_open_dm *m);
 oc_result oc_encode_list_users(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_user_list(oc_wbuf *w, uint16_t version, const oc_user_list *m);
 oc_result oc_encode_set_role(oc_wbuf *w, uint16_t version, const oc_set_role *m);
@@ -373,6 +376,7 @@ oc_result oc_decode_join_channel(oc_rbuf *p, oc_channel_ref *m);
 oc_result oc_decode_leave_channel(oc_rbuf *p, oc_channel_ref *m);
 oc_result oc_decode_invite_to_channel(oc_rbuf *p, oc_channel_member_op *m);
 oc_result oc_decode_remove_from_channel(oc_rbuf *p, oc_channel_member_op *m);
+oc_result oc_decode_open_dm(oc_rbuf *p, oc_open_dm *m);
 oc_result oc_decode_list_users(oc_rbuf *p);
 oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries, uint16_t cap, uint16_t *out_count);
 oc_result oc_decode_set_role(oc_rbuf *p, oc_set_role *m);
