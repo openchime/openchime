@@ -729,7 +729,7 @@ oc_result oc_decode_reactions(oc_rbuf *p, oc_reaction_entry *entries, uint16_t c
     *out_message_id = oc_r_u64(p);
     uint16_t count = oc_r_u16(p);
     *out_count = count;
-    for (uint16_t i = 0; i < count; i++) {
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
         oc_slice emoji = oc_r_str(p);
         uint64_t uid = oc_r_u64(p);
         if (i < cap) { entries[i].emoji = emoji; entries[i].user_id = uid; }
@@ -800,7 +800,7 @@ oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries,
                                  uint16_t cap, uint16_t *out_count) {
     uint16_t count = oc_r_u16(p);
     *out_count = count;
-    for (uint16_t i = 0; i < count; i++) {
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
         uint64_t id = oc_r_u64(p);
         oc_slice name = oc_r_str(p);
         uint8_t is_public = oc_r_u8(p);
@@ -845,7 +845,7 @@ oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries,
                               uint16_t cap, uint16_t *out_count) {
     uint16_t count = oc_r_u16(p);
     *out_count = count;
-    for (uint16_t i = 0; i < count; i++) {
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
         uint64_t uid = oc_r_u64(p);
         uint8_t role = oc_r_u8(p);
         uint8_t disabled = oc_r_u8(p);
@@ -909,7 +909,7 @@ oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries,
                                    uint16_t cap, uint16_t *out_count, uint8_t *out_truncated) {
     uint16_t count = oc_r_u16(p);
     *out_count = count;
-    for (uint16_t i = 0; i < count; i++) {
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
         uint64_t mid = oc_r_u64(p);
         uint64_t ch = oc_r_u64(p);
         uint64_t author = oc_r_u64(p);
@@ -932,7 +932,7 @@ oc_result oc_decode_backfill_request(oc_rbuf *p, oc_cursor *cursors,
                                      uint16_t cap, uint16_t *out_count) {
     uint16_t count = oc_r_u16(p);
     *out_count = count;
-    for (uint16_t i = 0; i < count; i++) {
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
         uint64_t ch = oc_r_u64(p);
         uint64_t after = oc_r_u64(p);
         if (i < cap) { cursors[i].channel_id = ch; cursors[i].after_message_id = after; }
