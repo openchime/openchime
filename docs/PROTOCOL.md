@@ -792,15 +792,20 @@ with `TRANSFER_CANCEL`. Chunk `data` is bounded so each frame stays
    message to publish it (below).
 
 **Linking to a message.** An attachment becomes visible only when referenced by
-a message. `SEND` / `SEND_REPLY` gain an optional trailing **attachment list**
-(`count: u16` then `count × { attachment_id: u64 }`), introduced at a **bumped
-protocol version** so an older peer negotiates down and never sees the new field.
-The server validates each id is a pending attachment owned by the caller and
-targeting this channel, flips it to committed, and includes its metadata in the
-outgoing frame. `BROADCAST` / `THREAD_REPLY` correspondingly carry a trailing
-attachment list of `{ attachment_id, filename, mime, size }`, so every reader —
-live, via backfill (§6), or in a thread (§5.10) — sees the attachment through the
-one message model, with no attachment-specific delivery path. A message body may
+a message. `SEND` gains an **optional trailing attachment list** (`count: u16`
+then `count × { attachment_id: u64 }`, at most `OC_MAX_ATTACH` = 16). It is a
+*self-describing optional field*: written only when non-empty, and read only if
+bytes remain after the base fields — so a message with no attachments is
+byte-identical to the pre-attachment layout and **no protocol-version bump is
+needed** (client and daemon share this codec, so there is no older peer to
+negotiate against). The server links each id that is a finalized, still-unlinked
+attachment the caller uploaded to this same channel (others are ignored, i.e.
+simply not shared) and sets its `message_id`. `BROADCAST` correspondingly carries
+a trailing attachment list of `{ attachment_id, filename, mime, size }`, so every
+reader — live or via backfill (§6) — sees the attachment through the one message
+model, with no attachment-specific delivery path. (The same optional list on
+`SEND_REPLY`/`THREAD_REPLY` for thread attachments is a planned follow-up.) A
+message body may
 be empty when it carries attachments.
 
 **Download (server → client bytes):**

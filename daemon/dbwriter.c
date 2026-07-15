@@ -129,11 +129,17 @@ static void job_free(oc_job *j) {
     free(j);
 }
 
+/* Free the heap metadata of an attachment list (filename/mime per entry). */
+static void free_attach_meta(oc_attach_meta *a, size_t n) {
+    for (size_t i = 0; i < n; i++) { free(a[i].filename); free(a[i].mime); }
+}
+
 void oc_dbres_free(oc_dbres *r) {
     if (!r) return;
     free(r->body);
     free(r->members);
-    for (size_t i = 0; i < r->n_replay; i++) free(r->replay[i].body);
+    free_attach_meta(r->attach, r->n_attach);
+    for (size_t i = 0; i < r->n_replay; i++) { free(r->replay[i].body); free_attach_meta(r->replay[i].attach, r->replay[i].n_attach); }
     free(r->replay);
     free(r->ch_name);
     for (size_t i = 0; i < r->n_chlist; i++) free(r->chlist[i].name);
@@ -143,9 +149,9 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->emoji);
     for (size_t i = 0; i < r->n_rlist; i++) free(r->rlist[i].emoji);
     free(r->rlist);
-    for (size_t i = 0; i < r->n_thread; i++) free(r->thread[i].body);
+    for (size_t i = 0; i < r->n_thread; i++) { free(r->thread[i].body); free_attach_meta(r->thread[i].attach, r->thread[i].n_attach); }
     free(r->thread);
-    for (size_t i = 0; i < r->n_search; i++) free(r->search[i].body);
+    for (size_t i = 0; i < r->n_search; i++) { free(r->search[i].body); free_attach_meta(r->search[i].attach, r->search[i].n_attach); }
     free(r->search);
     free(r->cert_pem);
     free(r->key_pem);
@@ -948,6 +954,47 @@ static int channel_post_access(sqlite3 *db, uint64_t channel_id, uint64_t user_i
     return CH_DENIED;
 }
 
+/* Load the attachments linked to message `mid` into `out` (up to OC_MAX_ATTACH),
+ * ascending id. Serves the SEND broadcast and backfill replay (REQ-140). */
+static void load_message_attachments(sqlite3 *db, uint64_t mid, oc_attach_meta *out, size_t *n) {
+    *n = 0;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT id, filename, mime, size FROM attachments "
+        "WHERE message_id=? ORDER BY id LIMIT ?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+    sqlite3_bind_int(st, 2, (int)OC_MAX_ATTACH);
+    while (sqlite3_step(st) == SQLITE_ROW && *n < OC_MAX_ATTACH) {
+        oc_attach_meta *a = &out[(*n)++];
+        a->id = (uint64_t)sqlite3_column_int64(st, 0);
+        a->filename = strdup((const char *)sqlite3_column_text(st, 1));
+        a->mime = strdup((const char *)sqlite3_column_text(st, 2));
+        a->size = (uint64_t)sqlite3_column_int64(st, 3);
+    }
+    sqlite3_finalize(st);
+}
+
+/* Link the caller's pending attachments to message `mid` (REQ-140). An id links
+ * only if it is a finalized, still-unlinked attachment the same user uploaded to
+ * this same channel; any other id is silently ignored (it simply isn't shared). */
+static void link_attachments(sqlite3 *db, uint64_t mid, uint64_t channel_id,
+                             uint64_t uploader_id, const uint64_t *ids, uint16_t n) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "UPDATE attachments SET message_id=? "
+        "WHERE id=? AND message_id IS NULL AND sha256 IS NOT NULL "
+        "  AND uploader_id=? AND channel_id=?;", -1, &st, NULL);
+    for (uint16_t i = 0; i < n && i < OC_MAX_ATTACH; i++) {
+        sqlite3_reset(st);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)ids[i]);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)uploader_id);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)channel_id);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+}
+
 static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -1006,6 +1053,13 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_int64(st, 4, (sqlite3_int64)ts);
     sqlite3_step(st);
     sqlite3_finalize(st);
+
+    /* Link any referenced attachments atomically with the message (REQ-140), then
+     * load their metadata for the broadcast so every member sees them inline. */
+    if (j->n_attach) {
+        link_attachments(db, mid, j->channel_id, j->user_id, j->attach_ids, j->n_attach);
+        load_message_attachments(db, mid, r->attach, &r->n_attach);
+    }
 
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
@@ -1812,6 +1866,9 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             }
             m->reply_count   = (uint32_t)sqlite3_column_int64(st, 4);
             m->last_reply_at = (uint64_t)sqlite3_column_int64(st, 5);
+            /* Re-attach the message's linked attachments so a reconnecting client
+             * sees them inline, not just live members (REQ-140). */
+            load_message_attachments(db, m->message_id, m->attach, &m->n_attach);
             n++;
         }
         sqlite3_finalize(st);

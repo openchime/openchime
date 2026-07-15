@@ -259,6 +259,17 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 
 /* --- Frame payload structs ---------------------------------------------- */
 
+/* Attachment linkage (REQ-140, ARCH-69). A message may reference up to
+ * OC_MAX_ATTACH uploaded attachments. On the wire the list is an *optional
+ * trailing field* on SEND/BROADCAST: it is written only when non-empty, and the
+ * decoder reads it only if bytes remain after the base fields — so a message
+ * with no attachments is byte-identical to the pre-attachment format and no
+ * protocol-version bump is needed (client and daemon share this codec). SEND
+ * carries just the ids to link; BROADCAST carries each linked attachment's
+ * metadata so every reader can render/fetch it. */
+#define OC_MAX_ATTACH 16u
+typedef struct { uint64_t id; oc_slice filename; oc_slice mime; uint64_t size; } oc_attach_entry;
+
 typedef struct { uint16_t min_version; uint16_t max_version; oc_slice client_info; } oc_hello;
 typedef struct { uint16_t chosen_version; uint64_t server_time; } oc_welcome;
 typedef struct { uint16_t code; oc_slice message; } oc_reject;
@@ -266,9 +277,11 @@ typedef struct { uint8_t methods; oc_slice oidc_params; } oc_auth_challenge;
 typedef struct { uint8_t method; oc_slice credential; } oc_auth;
 typedef struct { uint64_t user_id; uint8_t role; uint64_t session_expiry; oc_slice session_token; } oc_auth_ok;
 typedef struct { uint8_t scope; oc_slice session_token; } oc_logout;
-typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; oc_slice body; } oc_send;
+typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; oc_slice body;
+                 uint16_t n_attach; uint64_t attach_ids[OC_MAX_ATTACH]; } oc_send;
 typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; uint64_t message_id; uint64_t server_time; } oc_send_ack;
-typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time; oc_slice body; } oc_broadcast;
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time; oc_slice body;
+                 uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH]; } oc_broadcast;
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_client_ack;
 typedef struct { uint64_t channel_id; uint64_t message_id; oc_slice body; } oc_edit;
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_delete;

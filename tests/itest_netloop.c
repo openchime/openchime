@@ -170,7 +170,7 @@ static void test_message_vertical(int port, const uint8_t *pin) {
     uint8_t idem[OC_IDEM_SIZE];
     memset(idem, 0x7E, sizeof idem);
     uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send s;
+    oc_send s = {0};
     s.channel_id = 1;
     memcpy(s.idem, idem, OC_IDEM_SIZE);
     s.body = oc_slice_str("hello everyone");
@@ -224,7 +224,7 @@ static void test_backfill_reconnect(int port, const uint8_t *pin) {
     uint8_t idem[OC_IDEM_SIZE];
     memset(idem, 0x5C, sizeof idem);
     uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send s;
+    oc_send s = {0};
     s.channel_id = 1;
     memcpy(s.idem, idem, OC_IDEM_SIZE);
     s.body = oc_slice_str("backfill me");
@@ -301,7 +301,7 @@ static void test_edit_delete_vertical(int port, const uint8_t *pin) {
     /* bob sends; learn the id from his SEND_ACK, and drain both members' BROADCAST. */
     uint8_t idem[OC_IDEM_SIZE]; memset(idem, 0x3D, sizeof idem);
     uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send s; s.channel_id = 1; memcpy(s.idem, idem, OC_IDEM_SIZE);
+    oc_send s = {0}; s.channel_id = 1; memcpy(s.idem, idem, OC_IDEM_SIZE);
     s.body = oc_slice_str("first draft");
     CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
     CHECK(write_all(&b.conn, buf, w.len) == 0);
@@ -401,7 +401,7 @@ static void test_channels_vertical(int port, const uint8_t *pin) {
 
     /* bob is not a member: his SEND is refused with a non-fatal NOT_A_MEMBER. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send s1; s1.channel_id = cid; memset(s1.idem, 0x11, OC_IDEM_SIZE);
+    oc_send s1 = {0}; s1.channel_id = cid; memset(s1.idem, 0x11, OC_IDEM_SIZE);
     s1.body = oc_slice_str("intruding");
     CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s1) == OC_OK);
     CHECK(send_frame(&b, buf, w.len) == 0);
@@ -421,7 +421,7 @@ static void test_channels_vertical(int port, const uint8_t *pin) {
 
     /* Now bob posts to the private channel; both members receive the BROADCAST. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send s2; s2.channel_id = cid; memset(s2.idem, 0x22, OC_IDEM_SIZE);
+    oc_send s2 = {0}; s2.channel_id = cid; memset(s2.idem, 0x22, OC_IDEM_SIZE);
     s2.body = oc_slice_str("war plans");
     CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s2) == OC_OK);
     CHECK(send_frame(&b, buf, w.len) == 0);
@@ -471,7 +471,7 @@ static void test_reactions_vertical(int port, const uint8_t *pin) {
 
     /* alice posts; learn the id, drain both members' BROADCAST. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send s; s.channel_id = 1; memset(s.idem, 0x5B, OC_IDEM_SIZE);
+    oc_send s = {0}; s.channel_id = 1; memset(s.idem, 0x5B, OC_IDEM_SIZE);
     s.body = oc_slice_str("react to this");
     CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
     CHECK(send_frame(&a, buf, w.len) == 0);
@@ -551,7 +551,7 @@ static void test_threads_vertical(int port, const uint8_t *pin) {
 
     /* alice posts a top-level message; learn its id, drain both BROADCASTs. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send s; s.channel_id = 1; memset(s.idem, 0x71, OC_IDEM_SIZE);
+    oc_send s = {0}; s.channel_id = 1; memset(s.idem, 0x71, OC_IDEM_SIZE);
     s.body = oc_slice_str("thread root");
     CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
     CHECK(send_frame(&a, buf, w.len) == 0);
@@ -636,7 +636,7 @@ static void test_search_vertical(int port, const uint8_t *pin) {
 
     /* alice posts a distinctive message to the shared channel. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send s; s.channel_id = 1; memset(s.idem, 0x91, OC_IDEM_SIZE);
+    oc_send s = {0}; s.channel_id = 1; memset(s.idem, 0x91, OC_IDEM_SIZE);
     s.body = oc_slice_str("orbital laser schematics");
     CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
     CHECK(send_frame(&a, buf, w.len) == 0);
@@ -668,7 +668,7 @@ static void test_search_vertical(int port, const uint8_t *pin) {
     oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
     uint64_t cid = ci.channel_id;
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send s2; s2.channel_id = cid; memset(s2.idem, 0x92, OC_IDEM_SIZE);
+    oc_send s2 = {0}; s2.channel_id = cid; memset(s2.idem, 0x92, OC_IDEM_SIZE);
     s2.body = oc_slice_str("nuclear launch codes");
     CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s2) == OC_OK);
     CHECK(send_frame(&a, buf, w.len) == 0);
@@ -851,6 +851,23 @@ static void test_attachments_vertical(int port, const uint8_t *pin) {
     glen = download_attachment(&b, aid, got, total, digest);
     CHECK(glen == total && memcmp(got, payload, total) == 0);
 
+    /* Linking (REQ-140): alice references the attachment in a SEND to the shared
+     * channel; bob receives the BROADCAST with the attachment metadata inline. */
+    uint8_t midem[OC_IDEM_SIZE]; memset(midem, 0xC3, sizeof midem);
+    oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+    oc_send sm = {0};
+    sm.channel_id = OC_DEFAULT_CHANNEL; memcpy(sm.idem, midem, OC_IDEM_SIZE);
+    sm.body = oc_slice_str("here's the file");
+    sm.n_attach = 1; sm.attach_ids[0] = aid;
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK);
+    CHECK(send_frame(&a, fbuf, w.len) == 0);
+    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BROADCAST);
+    oc_broadcast bcast; CHECK(oc_decode_broadcast(&p, &bcast) == OC_OK);
+    CHECK(bcast.n_attach == 1 && bcast.attach[0].id == aid && bcast.attach[0].size == total);
+    CHECK(bcast.attach[0].filename.len == 8 && memcmp(bcast.attach[0].filename.ptr, "data.bin", 8) == 0);
+    /* Drain alice's own SEND_ACK + BROADCAST so her stream is clean for the next step. */
+    for (int i = 0; i < 2; i++) { CHECK(read_frame(&a, &hdr, &p) == 0); }
+
     /* Access control (REQ-141): an attachment on a private channel alice creates
      * is refused to bob, a non-member. */
     oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
@@ -928,7 +945,7 @@ static void test_dm_vertical(int port, const uint8_t *pin) {
 
     /* alice messages the DM; both participants receive the BROADCAST. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send s; s.channel_id = dm; memset(s.idem, 0x4D, OC_IDEM_SIZE);
+    oc_send s = {0}; s.channel_id = dm; memset(s.idem, 0x4D, OC_IDEM_SIZE);
     s.body = oc_slice_str("hi bob, dm here");
     CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
     CHECK(send_frame(&a, buf, w.len) == 0);
@@ -944,7 +961,7 @@ static void test_dm_vertical(int port, const uint8_t *pin) {
 
     /* carol (not a participant) cannot post to the DM. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send s2; s2.channel_id = dm; memset(s2.idem, 0x4E, OC_IDEM_SIZE);
+    oc_send s2 = {0}; s2.channel_id = dm; memset(s2.idem, 0x4E, OC_IDEM_SIZE);
     s2.body = oc_slice_str("intruding");
     CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s2) == OC_OK);
     CHECK(send_frame(&c, buf, w.len) == 0);
@@ -964,7 +981,7 @@ static void test_dm_vertical(int port, const uint8_t *pin) {
     uint64_t selfdm = sci.channel_id;
     CHECK(selfdm != dm);
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send s3; s3.channel_id = selfdm; memset(s3.idem, 0x4F, OC_IDEM_SIZE);
+    oc_send s3 = {0}; s3.channel_id = selfdm; memset(s3.idem, 0x4F, OC_IDEM_SIZE);
     s3.body = oc_slice_str("note to self");
     CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s3) == OC_OK);
     CHECK(send_frame(&a, buf, w.len) == 0);
@@ -1086,7 +1103,7 @@ static void test_send_rate_limit(int port, const uint8_t *pin) {
     const int over = 5;
     for (int i = 0; i < max + over; i++) {
         uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-        oc_send s; s.channel_id = 1;
+        oc_send s = {0}; s.channel_id = 1;
         memset(s.idem, 0, OC_IDEM_SIZE); s.idem[0] = (uint8_t)i; s.idem[1] = 0x5A;
         s.body = oc_slice_str("flood");
         CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK);
@@ -1194,7 +1211,7 @@ static void *load_client(void *vp) {
     const int K = 5;   /* under the 30/3s send rate limit */
     for (int i = 0; i < K; i++) {
         uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-        oc_send s; s.channel_id = 1;
+        oc_send s = {0}; s.channel_id = 1;
         memset(s.idem, 0, OC_IDEM_SIZE);
         s.idem[0] = (uint8_t)i; s.idem[1] = (uint8_t)a->tid; s.idem[2] = 0xEE; /* globally unique */
         s.body = oc_slice_str("load");

@@ -149,10 +149,10 @@ static void test_messaging_frames(void) {
     uint8_t idem[OC_IDEM_SIZE];
     for (int i = 0; i < (int)OC_IDEM_SIZE; i++) idem[i] = (uint8_t)(0xA0 + i);
     {
-        oc_send in; in.channel_id = 7; memcpy(in.idem, idem, OC_IDEM_SIZE);
+        oc_send in = {0}; in.channel_id = 7; memcpy(in.idem, idem, OC_IDEM_SIZE);
         in.body = oc_slice_str("hello channel");
         ROUNDTRIP(oc_encode_send(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEND, h, p);
-        oc_send out;
+        oc_send out = {0};
         CHECK(oc_decode_send(&p, &out) == OC_OK);
         CHECK(out.channel_id == 7);
         CHECK(memcmp(out.idem, idem, OC_IDEM_SIZE) == 0);
@@ -591,6 +591,39 @@ static void test_attachment_frames(void) {
         oc_transfer_cancel out;
         CHECK(oc_decode_transfer_cancel(&p, &out) == OC_OK && out.attachment_id == 99);
     }
+    /* SEND with a trailing attachment-id list (REQ-140 linking). */
+    {
+        oc_send in = {0}; in.channel_id = 3; memset(in.idem, 0x11, OC_IDEM_SIZE);
+        in.body = oc_slice_str("see file");
+        in.n_attach = 2; in.attach_ids[0] = 100; in.attach_ids[1] = 200;
+        ROUNDTRIP(oc_encode_send(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEND, h, p);
+        oc_send out = {0};
+        CHECK(oc_decode_send(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 3 && out.n_attach == 2);
+        CHECK(out.attach_ids[0] == 100 && out.attach_ids[1] == 200);
+        CHECK(slice_eq_str(out.body, "see file"));
+    }
+    /* Zero attachments -> the list is omitted; decode yields n_attach 0. */
+    {
+        oc_send in = {0}; in.channel_id = 3; in.body = oc_slice_str("plain");
+        ROUNDTRIP(oc_encode_send(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEND, h, p);
+        oc_send out = {0};
+        CHECK(oc_decode_send(&p, &out) == OC_OK && out.n_attach == 0);
+        CHECK(slice_eq_str(out.body, "plain"));
+    }
+    /* BROADCAST carrying attachment metadata. */
+    {
+        oc_broadcast in = { 5, 3, 42, 999, oc_slice_str("here"), 0, {{0}} };
+        in.n_attach = 1;
+        in.attach[0].id = 77; in.attach[0].filename = oc_slice_str("a.png");
+        in.attach[0].mime = oc_slice_str("image/png"); in.attach[0].size = 4096;
+        ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
+        oc_broadcast out;
+        CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
+        CHECK(out.n_attach == 1 && out.attach[0].id == 77 && out.attach[0].size == 4096);
+        CHECK(slice_eq_str(out.attach[0].filename, "a.png"));
+        CHECK(slice_eq_str(out.attach[0].mime, "image/png"));
+    }
 }
 
 static void test_backfill_and_error(void) {
@@ -653,7 +686,7 @@ static void test_size_limits(void) {
 
     /* A body at exactly MAX_BODY_SIZE fits within a frame (headroom reconciles
      * REQ-054's 64KB body with the 65KB frame cap). */
-    oc_send in; in.channel_id = 1; memset(in.idem, 0, OC_IDEM_SIZE);
+    oc_send in = {0}; in.channel_id = 1; memset(in.idem, 0, OC_IDEM_SIZE);
     in.body.ptr = big; in.body.len = OC_MAX_BODY_SIZE;
     oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
     CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &in) == OC_OK);

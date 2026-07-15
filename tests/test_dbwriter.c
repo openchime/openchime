@@ -1462,6 +1462,48 @@ static void test_attachments(void) {
     CHECK(memcmp(r->att_sha256, sha, 32) == 0);
     oc_dbres_free(r);
 
+    /* Linking (REQ-140): a SEND referencing the finalized attachment links it and
+     * the broadcast carries its metadata inline. */
+    uint8_t sidem[OC_IDEM_LEN]; memset(sidem, 0x10, sizeof sidem);
+    oc_job *sj = oc_job_new(OC_JOB_SEND, 20);
+    sj->user_id = alice; sj->channel_id = OC_DEFAULT_CHANNEL;
+    memcpy(sj->idem, sidem, OC_IDEM_LEN);
+    oc_job_set_body(sj, "file!", 5);
+    sj->attach_ids[0] = aid; sj->n_attach = 1;
+    oc_dbwriter_submit(w, sj);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_SEND_OK && r->n_attach == 1);
+    CHECK(r->attach[0].id == aid && r->attach[0].size == 2048);
+    CHECK(r->attach[0].filename && strcmp(r->attach[0].filename, "notes.txt") == 0);
+    uint64_t linked_mid = r->message_id;
+    oc_dbres_free(r);
+
+    /* The attachment is now linked; a later SEND can't re-link it. */
+    memset(sidem, 0x11, sizeof sidem);
+    sj = oc_job_new(OC_JOB_SEND, 21);
+    sj->user_id = alice; sj->channel_id = OC_DEFAULT_CHANNEL;
+    memcpy(sj->idem, sidem, OC_IDEM_LEN);
+    oc_job_set_body(sj, "again", 5);
+    sj->attach_ids[0] = aid; sj->n_attach = 1;
+    oc_dbwriter_submit(w, sj);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_SEND_OK && r->n_attach == 0);
+    oc_dbres_free(r);
+
+    /* A reconnecting member sees the attachment inline via backfill. */
+    r = backfill(w, bob, OC_DEFAULT_CHANNEL, linked_mid - 1);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK);
+    int saw = 0;
+    for (size_t i = 0; i < r->n_replay; i++) {
+        if (r->replay[i].message_id == linked_mid) {
+            saw = 1;
+            CHECK(r->replay[i].n_attach == 1 && r->replay[i].attach[0].id == aid);
+            CHECK(r->replay[i].attach[0].size == 2048);
+        }
+    }
+    CHECK(saw);
+    oc_dbres_free(r);
+
     /* Access control: an attachment on a private channel alice creates is NOT
      * downloadable by bob, a non-member (the core of REQ-141). */
     r = create_channel(w, alice, "secret", 0);

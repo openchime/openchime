@@ -85,7 +85,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 131 do-not-disturb schedule | ⛔ | |
 | 132 APNs/FCM push | ⛔ | |
 | 133 self-host push gateway | ⛔ | |
-| 140 file attachments (object storage) | 🟡 | **Transfer built + tested end-to-end:** proxied chunked upload/download over the wire (ARCH-69), local-FS blob-adapter behind the ARCH-70 seam (S3/MinIO impl is a follow-up), `attachments` migration 0009, frames §5.14. **Pending:** linking an attachment to a message (the SEND/BROADCAST attachment list at a bumped protocol version) — until then an attachment is retrievable by id but not yet surfaced inline in a channel. |
+| 140 file attachments (object storage) | 🟡 | **Built + tested end-to-end:** proxied chunked upload/download over the wire (ARCH-69), `attachments` migration 0009, frames §5.14, and **message-linking** — a SEND references uploaded attachments (self-describing optional list), the BROADCAST carries their metadata inline, and backfill re-attaches them on reconnect. Local-FS blob store behind the ARCH-70 seam. **Follow-ups:** the S3/MinIO adapter impl, and the same attachment list on SEND_REPLY/THREAD_REPLY for thread attachments. |
 | 141 attachment access control | ✅ | Proxied bytes → download authorized by the ordinary channel-read check on the attachment's channel; no signed URLs (ARCH-69). Verified over the wire (cross-user fetch allowed; non-member refused) and in dbwriter units. |
 | 150–152 server-relayed audio | ⛔ | |
 | 160 video | ➖ | Deliberate scope exclusion. |
@@ -186,4 +186,6 @@ per-IP connection throttle, TLS-identity persistence across restore, truncation
 signals, the first-owner setup token, and a codec fuzzer + concurrency load
 test. What remains is **not** hardening but **scope**: a real client, the
 unbuilt feature families (notifications/push, attachments, audio, webhooks), and
-a quantitative capacity benchmark for REQ-210/211.
+a quantitative capacity benchmark for REQ-210/211. Attachments (REQ-140/141) are
+built end-to-end — proxied chunked transfer, access control, and message-linking
+— with the S3/MinIO blob adapter and thread-reply attachments as follow-ups.

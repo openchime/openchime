@@ -132,7 +132,7 @@ static int run(const char *host, int port) {
     uint8_t idem[OC_IDEM_SIZE];
     memset(idem, 0x42, sizeof idem);
     uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send s;
+    oc_send s = {0};
     s.channel_id = 1;
     memcpy(s.idem, idem, OC_IDEM_SIZE);
     s.body = oc_slice_str("end to end");

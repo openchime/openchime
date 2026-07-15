@@ -272,6 +272,13 @@ oc_result oc_encode_send(oc_wbuf *w, uint16_t version, const oc_send *m) {
     oc_w_u64(w, m->channel_id);
     oc_w_idem(w, m->idem);
     oc_w_lstr(w, m->body);
+    /* Optional trailing attachment-id list (REQ-140): written only when present,
+     * so a message with no attachments matches the original layout exactly. */
+    if (m->n_attach) {
+        uint16_t n = m->n_attach > OC_MAX_ATTACH ? OC_MAX_ATTACH : m->n_attach;
+        oc_w_u16(w, n);
+        for (uint16_t i = 0; i < n; i++) oc_w_u64(w, m->attach_ids[i]);
+    }
     return oc_frame_end(w, off);
 }
 
@@ -292,6 +299,17 @@ oc_result oc_encode_broadcast(oc_wbuf *w, uint16_t version, const oc_broadcast *
     oc_w_u64(w, m->author_id);
     oc_w_u64(w, m->server_time);
     oc_w_lstr(w, m->body);
+    /* Optional trailing attachment metadata (REQ-140), same optionality as SEND. */
+    if (m->n_attach) {
+        uint16_t n = m->n_attach > OC_MAX_ATTACH ? OC_MAX_ATTACH : m->n_attach;
+        oc_w_u16(w, n);
+        for (uint16_t i = 0; i < n; i++) {
+            oc_w_u64(w, m->attach[i].id);
+            oc_w_str(w, m->attach[i].filename);
+            oc_w_str(w, m->attach[i].mime);
+            oc_w_u64(w, m->attach[i].size);
+        }
+    }
     return oc_frame_end(w, off);
 }
 
@@ -761,6 +779,15 @@ oc_result oc_decode_send(oc_rbuf *p, oc_send *m) {
     m->channel_id = oc_r_u64(p);
     oc_r_idem(p, m->idem);
     m->body = oc_r_lstr(p);
+    /* Optional trailing attachment-id list (REQ-140): present only if bytes
+     * remain after the body. Absent -> zero attachments (original layout). */
+    m->n_attach = 0;
+    if (!p->underflow && p->pos < p->len) {
+        uint16_t n = oc_r_u16(p);
+        if (n > OC_MAX_ATTACH) return OC_E_MALFORMED;
+        for (uint16_t i = 0; i < n && !p->underflow; i++) m->attach_ids[i] = oc_r_u64(p);
+        m->n_attach = n;
+    }
     return r_done(p);
 }
 
@@ -778,6 +805,19 @@ oc_result oc_decode_broadcast(oc_rbuf *p, oc_broadcast *m) {
     m->author_id = oc_r_u64(p);
     m->server_time = oc_r_u64(p);
     m->body = oc_r_lstr(p);
+    /* Optional trailing attachment metadata (REQ-140), same optionality as SEND. */
+    m->n_attach = 0;
+    if (!p->underflow && p->pos < p->len) {
+        uint16_t n = oc_r_u16(p);
+        if (n > OC_MAX_ATTACH) return OC_E_MALFORMED;
+        for (uint16_t i = 0; i < n && !p->underflow; i++) {
+            m->attach[i].id = oc_r_u64(p);
+            m->attach[i].filename = oc_r_str(p);
+            m->attach[i].mime = oc_r_str(p);
+            m->attach[i].size = oc_r_u64(p);
+        }
+        m->n_attach = n;
+    }
     return r_done(p);
 }
 

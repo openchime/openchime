@@ -94,6 +94,9 @@ typedef struct oc_job {
     uint8_t        idem[OC_IDEM_LEN];
     uint8_t       *body;      /* heap (SEND / EDIT new body) */
     size_t         body_len;
+    /* SEND: attachment ids to link to this message (REQ-140). */
+    uint64_t       attach_ids[OC_MAX_ATTACH];
+    uint16_t       n_attach;
 
     /* BACKFILL */
     oc_bf_cursor  *cursors;   /* heap */
@@ -156,12 +159,23 @@ typedef struct {
 /* One message to replay on reconnect (rendered as a BROADCAST by the net thread),
  * or one reply in a THREAD. reply_count/last_reply_at are set for backfilled
  * top-level messages that have thread replies (drives THREAD_META). */
+/* One attachment linked to a message (REQ-140): its id + metadata for delivery.
+ * filename/mime are heap; the blob itself lives in object storage. */
+typedef struct {
+    uint64_t id;
+    char    *filename;   /* heap */
+    char    *mime;       /* heap */
+    uint64_t size;
+} oc_attach_meta;
+
 typedef struct {
     uint64_t message_id, channel_id, author_id, server_time;
     uint8_t *body;       /* heap */
     size_t   body_len;
     uint32_t reply_count;
     uint64_t last_reply_at;
+    oc_attach_meta attach[OC_MAX_ATTACH];  /* linked attachments (REQ-140) */
+    size_t         n_attach;
 } oc_replay_msg;
 
 typedef struct oc_dbres {
@@ -188,6 +202,8 @@ typedef struct oc_dbres {
     uint64_t      *members;   /* heap; user ids to fan the broadcast out to */
     size_t         n_members;
     int            duplicate; /* idempotent replay: ack only, no broadcast */
+    oc_attach_meta attach[OC_MAX_ATTACH];  /* SEND_OK: attachments linked to this message */
+    size_t         n_attach;
 
     /* BACKFILL_OK */
     oc_replay_msg *replay;    /* heap array, ascending message_id */

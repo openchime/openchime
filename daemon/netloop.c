@@ -289,6 +289,19 @@ static int in_members(uint64_t uid, const uint64_t *m, size_t n) {
     return 0;
 }
 
+/* Copy linked-attachment metadata (REQ-140) into a broadcast before encoding, so
+ * every recipient — live or via backfill — sees the attachments inline. */
+static void broadcast_set_attach(oc_broadcast *b, const oc_attach_meta *att, size_t n) {
+    if (n > OC_MAX_ATTACH) n = OC_MAX_ATTACH;
+    for (size_t i = 0; i < n; i++) {
+        b->attach[i].id = att[i].id;
+        b->attach[i].filename = oc_slice_str(att[i].filename ? att[i].filename : "");
+        b->attach[i].mime = oc_slice_str(att[i].mime ? att[i].mime : "");
+        b->attach[i].size = att[i].size;
+    }
+    b->n_attach = (uint16_t)n;
+}
+
 /* Append encoded bytes to a connection and try to flush; close it on error. */
 static void send_bytes(int ep, conn **conns, int fd, const uint8_t *buf, size_t len) {
     conn *c = conns[fd];
@@ -467,7 +480,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         }
 
         if (hdr.msg_type == OC_MSG_SEND) {
-            oc_send s;
+            oc_send s = {0};
             if (oc_decode_send(&p, &s) != OC_OK) return -1;
             if (!send_rate_ok(c)) { if (reject_send_rate(c, s.idem) != 0) return -1; continue; }
             oc_job *j = oc_job_new(OC_JOB_SEND, c->conn_id);
@@ -476,6 +489,10 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->channel_id = s.channel_id;
             memcpy(j->idem, s.idem, OC_IDEM_LEN);
             if (oc_job_set_body(j, s.body.ptr, s.body.len) != 0) return -1;
+            /* Attachments to link to this message (REQ-140). */
+            uint16_t na = s.n_attach > OC_MAX_ATTACH ? OC_MAX_ATTACH : s.n_attach;
+            for (uint16_t i = 0; i < na; i++) j->attach_ids[i] = s.attach_ids[i];
+            j->n_attach = na;
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -910,7 +927,8 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         if (!r->duplicate) {
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
             oc_slice body = { r->body, r->body_len };
-            oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, body };
+            oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, body, 0, {{0}} };
+            broadcast_set_attach(&b, r->attach, r->n_attach);
             oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
             size_t blen = w.len;
             for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
@@ -1348,7 +1366,8 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             oc_replay_msg *m = &r->replay[i];
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
             oc_slice body = { m->body, m->body_len };
-            oc_broadcast b = { m->message_id, m->channel_id, m->author_id, m->server_time, body };
+            oc_broadcast b = { m->message_id, m->channel_id, m->author_id, m->server_time, body, 0, {{0}} };
+            broadcast_set_attach(&b, m->attach, m->n_attach);
             oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
             send_bytes(ep, conns, fd, g_enc, w.len);
             if (m->reply_count > 0 && conns[fd]) {

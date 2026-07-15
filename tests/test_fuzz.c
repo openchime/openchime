@@ -47,7 +47,7 @@ static void decode_all(const uint8_t *buf, size_t len) {
     oc_auth au; D(oc_decode_auth(&p, &au));
     oc_auth_ok aok; D(oc_decode_auth_ok(&p, &aok));
     oc_logout lo; D(oc_decode_logout(&p, &lo));
-    oc_send s; D(oc_decode_send(&p, &s));
+    oc_send s = {0}; D(oc_decode_send(&p, &s));
     oc_send_ack sa; D(oc_decode_send_ack(&p, &sa));
     oc_broadcast b; D(oc_decode_broadcast(&p, &b));
     oc_client_ack ca; D(oc_decode_client_ack(&p, &ca));
