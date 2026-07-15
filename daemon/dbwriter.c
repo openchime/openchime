@@ -1309,36 +1309,49 @@ static oc_dbres *process_remove_channel(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
-/* Open (or get) the 1:1 DM between the caller and target (REQ-050). A DM is a
- * kind='dm' channel with exactly the two participants; idempotent — an existing
- * DM is returned rather than a duplicate created. Replies CHANNEL_INFO (kind=DM),
- * pushed to the peer so their client learns of it. Messaging/backfill/search
- * then work through the normal membership path. */
+/* Open (or get) the DM between the caller and target (REQ-050). A DM is a
+ * kind='dm' channel with exactly its participants — two for a normal DM, or one
+ * for a **self-DM** (target == self: a personal "notes to self" space, REQ-055).
+ * Idempotent — an existing DM is returned rather than a duplicate created.
+ * Replies CHANNEL_INFO (kind=DM), pushed to the peer (not for a self-DM).
+ * Messaging/backfill/search then work through the normal membership path. */
 static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
     uint64_t self = j->user_id, other = j->target_user_id;
-    if (other == 0 || other == self) {
+    if (other == 0) {   /* no such user */
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
+    int self_dm = (other == self);
     uint8_t trole = OC_ROLE_MEMBER;
-    if (!user_role(db, other, &trole)) {   /* unknown target: no disclosure */
+    if (!self_dm && !user_role(db, other, &trole)) {   /* unknown target: no disclosure */
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
 
-    /* An existing 1:1 DM is a kind='dm' channel whose membership is exactly {self, other}. */
+    /* An existing DM is a kind='dm' channel whose membership is exactly the
+     * participants: {self} for a self-DM, else {self, other}. */
     uint64_t cid = 0;
     sqlite3_stmt *st = NULL;
-    sqlite3_prepare_v2(db,
-        "SELECT c.id FROM channels c "
-        "JOIN channel_members a ON a.channel_id=c.id AND a.user_id=?1 "
-        "JOIN channel_members b ON b.channel_id=c.id AND b.user_id=?2 "
-        "WHERE c.kind='dm' "
-        "  AND (SELECT COUNT(*) FROM channel_members m WHERE m.channel_id=c.id)=2 "
-        "LIMIT 1;", -1, &st, NULL);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)self);
-    sqlite3_bind_int64(st, 2, (sqlite3_int64)other);
+    if (self_dm) {
+        sqlite3_prepare_v2(db,
+            "SELECT c.id FROM channels c "
+            "JOIN channel_members a ON a.channel_id=c.id AND a.user_id=?1 "
+            "WHERE c.kind='dm' "
+            "  AND (SELECT COUNT(*) FROM channel_members m WHERE m.channel_id=c.id)=1 "
+            "LIMIT 1;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)self);
+    } else {
+        sqlite3_prepare_v2(db,
+            "SELECT c.id FROM channels c "
+            "JOIN channel_members a ON a.channel_id=c.id AND a.user_id=?1 "
+            "JOIN channel_members b ON b.channel_id=c.id AND b.user_id=?2 "
+            "WHERE c.kind='dm' "
+            "  AND (SELECT COUNT(*) FROM channel_members m WHERE m.channel_id=c.id)=2 "
+            "LIMIT 1;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)self);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)other);
+    }
     if (sqlite3_step(st) == SQLITE_ROW) cid = (uint64_t)sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
 
@@ -1356,13 +1369,13 @@ static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
         }
         cid = (uint64_t)sqlite3_last_insert_rowid(db);
         add_membership(db, cid, self);
-        add_membership(db, cid, other);
+        if (!self_dm) add_membership(db, cid, other);
         sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
     }
 
     r->type = OC_RES_CHANNEL_INFO;
     load_channel_info(db, cid, self, r);
-    r->push_user_id = other;
+    r->push_user_id = self_dm ? 0 : other;   /* no peer to push a self-DM to */
     return r;
 }
 

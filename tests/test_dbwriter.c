@@ -1409,10 +1409,28 @@ static void test_dm(void) {
     CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->channel_id == dm);
     oc_dbres_free(r);
 
-    /* Can't DM yourself or an unknown user. */
+    /* A self-DM (notes to self, REQ-055) is a single-participant DM, distinct
+     * from the alice<->bob DM, and idempotent. */
     r = open_dm(w, alice, alice);
-    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->ch_kind == OC_CHANNEL_KIND_DM);
+    CHECK(r->ch_joined == 1 && r->push_user_id == 0);   /* no peer to push to */
+    uint64_t selfdm = r->channel_id;
+    CHECK(selfdm != dm);
     oc_dbres_free(r);
+    r = open_dm(w, alice, alice);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->channel_id == selfdm);
+    oc_dbres_free(r);
+    /* alice can post to and read her self-DM; nobody else can read it. */
+    uint64_t smid = send_id(w, alice, selfdm, "note to self");
+    CHECK(smid != 0);
+    r = backfill(w, alice, selfdm, 0);
+    CHECK(r && r->n_replay == 1 && r->replay[0].message_id == smid);
+    oc_dbres_free(r);
+    r = backfill(w, bob, selfdm, 0);
+    CHECK(r && r->n_replay == 0);
+    oc_dbres_free(r);
+
+    /* Opening a DM with an unknown user is still refused. */
     r = open_dm(w, alice, 99999);
     CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
     oc_dbres_free(r);

@@ -682,18 +682,22 @@ message. An empty or all-punctuation query returns zero results (never an error)
 
 ### 5.12 Direct messages (REQ-050)
 
-A direct message conversation is a **`kind='dm'` channel with exactly two
-members** — so once opened, everything else (send/broadcast, backfill, search,
-reactions, threads) works through the ordinary membership path with no
-DM-specific machinery. DMs are members-only (`is_public=0`) and never named.
+A direct message conversation is a **`kind='dm'` channel with exactly its
+participants** — two for a normal DM, or **one for a self-DM** (a personal
+"notes to self" space, REQ-055). Once opened, everything else (send/broadcast,
+backfill, search, reactions, threads) works through the ordinary membership path
+with no DM-specific machinery. DMs are members-only (`is_public=0`) and never
+named.
 
 **`OPEN_DM` (client → server), msg_type `0x0058`** `{ user_id: u64 }` — opens (or
-returns) the 1:1 DM between the caller and `user_id`. Idempotent: an existing DM
-between the two is returned rather than a second created; you cannot DM yourself
-or an unknown user (`FORBIDDEN`). Replies **`CHANNEL_INFO`** (§5.7, `kind=1`) to
-the caller, and pushes the same to the peer's live connections so their client
-learns of the DM. Thereafter the client sends to the returned `channel_id` with
-an ordinary `SEND`, and both participants receive the `BROADCAST`.
+returns) the DM between the caller and `user_id`. `user_id` may be the caller's
+own id, which opens a **self-DM** (single participant). Idempotent: an existing
+DM is returned rather than a second created; an unknown target is refused
+(`FORBIDDEN`). Replies **`CHANNEL_INFO`** (§5.7, `kind=1`) to the caller, and —
+for a two-party DM — pushes the same to the peer's live connections so their
+client learns of it. Thereafter the client sends to the returned `channel_id`
+with an ordinary `SEND`; all participants (just the sender, for a self-DM)
+receive the `BROADCAST`.
 
 DMs a user belongs to appear in `LIST_CHANNELS` (§5.7) with `kind=1`. The
 channel-management ops (join/leave/invite/remove) operate only on named channels

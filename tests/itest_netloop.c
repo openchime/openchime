@@ -737,6 +737,34 @@ static void test_dm_vertical(int port, const uint8_t *pin) {
     oc_error e; CHECK(oc_decode_error(&p, &e) == OC_OK);
     CHECK(e.code == OC_ERR_NOT_A_MEMBER && e.fatal == 0);
 
+    /* Self-DM (REQ-055): alice opens a DM with herself and messages it; the
+     * BROADCAST echoes back to her (she is the only participant). */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_open_dm self = { ua };
+    CHECK(oc_encode_open_dm(&w, OC_PROTOCOL_VERSION, &self) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
+    oc_channel_info sci; CHECK(oc_decode_channel_info(&p, &sci) == OC_OK);
+    CHECK(sci.kind == OC_CHANNEL_KIND_DM && sci.joined == 1);
+    uint64_t selfdm = sci.channel_id;
+    CHECK(selfdm != dm);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s3; s3.channel_id = selfdm; memset(s3.idem, 0x4F, OC_IDEM_SIZE);
+    s3.body = oc_slice_str("note to self");
+    CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &s3) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    int got_ack = 0, got_bc = 0;
+    for (int i = 0; i < 2; i++) {
+        CHECK(read_frame(&a, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) got_ack = 1;
+        else if (hdr.msg_type == OC_MSG_BROADCAST) {
+            oc_broadcast sb; CHECK(oc_decode_broadcast(&p, &sb) == OC_OK);
+            CHECK(sb.channel_id == selfdm && sb.author_id == ua);
+            got_bc = 1;
+        }
+    }
+    CHECK(got_ack && got_bc);
+
     client_close(&a);
     client_close(&b);
     client_close(&c);

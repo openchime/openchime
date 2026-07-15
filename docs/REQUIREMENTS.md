@@ -174,6 +174,12 @@ the requirement says so explicitly rather than implying one.
 - **REQ-054.** A message body has been capped at approximately 64KB
   (ARCH-30). Attachments (REQ-140) have not been subject to this cap, since
   they are never sent as protocol frames.
+- **REQ-055.** A user has been able to open a direct-message conversation with
+  **themselves** — a private personal space ("notes to self" / saved messages) —
+  realized as a single-participant DM. Like any DM it has been idempotent (a
+  second open returned the existing self-DM), members-only, and reached through
+  the ordinary messaging path; the daemon has not treated a self-target as an
+  error (PROTOCOL.md §5.12, ARCH-50).
 
 ### 2.2 Threads
 
