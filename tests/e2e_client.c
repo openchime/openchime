@@ -73,7 +73,16 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
     for (;;) {
         const uint8_t *frame; size_t flen;
         int r = oc_framebuf_next(&c->fb, &frame, &flen);
-        if (r == 1) return oc_parse_frame(frame, flen, hdr, payload) == OC_OK ? 0 : -1;
+        if (r == 1) {
+            if (oc_parse_frame(frame, flen, hdr, payload) != OC_OK) return -1;
+            /* Presence/typing are tenant-wide async notifications the server may
+             * inject into any connection (a peer coming online, a member typing);
+             * this black-box test doesn't exercise them, so skip them rather than
+             * let a broadcast desync the expected stream. */
+            if (hdr->msg_type == OC_MSG_PRESENCE_UPDATE || hdr->msg_type == OC_MSG_TYPING_UPDATE)
+                continue;
+            return 0;
+        }
         if (r < 0) return -1;
         uint8_t buf[4096]; size_t n = 0;
         if (oc_tls_read(&c->conn, buf, sizeof buf, &n) != OC_TLS_OK) return -1;
