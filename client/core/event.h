@@ -28,6 +28,7 @@ typedef struct {
     uint64_t message_id;
     uint64_t server_time;
     uint8_t  status;       /* PRESENCE: online/away/offline; CHANNEL: joined flag */
+    char     author_name[64]; /* MESSAGE: author display name ("" = fall back to id) */
     char    *body;         /* heap; MESSAGE/ERROR/CHANNEL(name) only, else NULL */
 } oc_ev;
 

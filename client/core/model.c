@@ -58,8 +58,8 @@ static oc_channel *channel_ensure(oc_model *m, uint64_t channel_id) {
 
 /* Append a message, stealing ownership of `*body` (set to NULL on success).
  * Returns 1 if a message was appended, 0 if it was a dedup/alloc no-op. */
-static int channel_append(oc_channel *c, uint64_t author_id, uint64_t message_id,
-                          uint64_t server_time, char **body) {
+static int channel_append(oc_channel *c, uint64_t author_id, const char *author_name,
+                          uint64_t message_id, uint64_t server_time, char **body) {
     /* Dedup on the per-channel high-water mark (ARCH-45). message_id 0 means the
      * server did not assign one (shouldn't happen for a BROADCAST) — keep it. */
     if (message_id && message_id <= c->high_water) return 0;
@@ -72,6 +72,7 @@ static int channel_append(oc_channel *c, uint64_t author_id, uint64_t message_id
     }
     oc_msg *msg = &c->msgs[c->n_msgs++];
     msg->body = *body;
+    snprintf(msg->author_name, sizeof msg->author_name, "%s", author_name ? author_name : "");
     msg->author_id = author_id;
     msg->message_id = message_id;
     msg->server_time = server_time;
@@ -128,7 +129,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     }
     case OC_EV_MESSAGE: {
         oc_channel *c = channel_ensure(m, e->channel_id);
-        if (c && channel_append(c, e->author_id, e->message_id, e->server_time, &e->body)) {
+        if (c && channel_append(c, e->author_id, e->author_name, e->message_id, e->server_time, &e->body)) {
             /* Count as unread only messages from others past the read marker; a
              * frontend clears this by marking the focused channel read. */
             if (e->author_id != m->user_id && e->message_id > c->read_marker)

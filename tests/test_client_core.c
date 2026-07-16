@@ -88,6 +88,19 @@ static int channel_unread(const oc_model *m, uint64_t cid) {
     return -1;
 }
 
+/* Does channel `cid` hold a message whose body and author display name match? */
+static int channel_has_named(const oc_model *m, uint64_t cid, const char *body, const char *name) {
+    for (size_t i = 0; i < m->n_channels; i++) {
+        if (m->channels[i].channel_id != cid) continue;
+        for (size_t j = 0; j < m->channels[i].n_msgs; j++) {
+            const oc_msg *msg = &m->channels[i].msgs[j];
+            if (msg->body && strcmp(msg->body, body) == 0 && strcmp(msg->author_name, name) == 0)
+                return 1;
+        }
+    }
+    return 0;
+}
+
 int run_client_core_tests(void) {
     printf("test_client_core: connect+auth, channel-list, send round-trip, unread, backfill\n");
 
@@ -140,6 +153,9 @@ int run_client_core_tests(void) {
         CHECK(WAIT_FOR(a, channel_has_body(m, 1, "hello from the core")));
         CHECK(WAIT_FOR(b, channel_has_body(m, 1, "hello from the core") && channel_unread(m, 1) == 1));
 
+        /* The message carries dana's display name (= her login name), live. */
+        CHECK(channel_has_named(oc_client_model(b), 1, "hello from the core", "dana"));
+
         /* Marking channel 1 read clears erik's unread. */
         oc_client_mark_read(b, 1);
         oc_client_tick(b);
@@ -160,6 +176,9 @@ int run_client_core_tests(void) {
             oc_client_backfill(c, 1);
             CHECK(WAIT_FOR(c, channel_has_body(m, 1, "hello from the core") &&
                               channel_has_body(m, 1, "second line for history")));
+            /* Backfilled history carries the author's display name too (the JOIN
+             * fallback in the replay query). */
+            CHECK(channel_has_named(oc_client_model(c), 1, "second line for history", "dana"));
             oc_client_stop(c);
         }
 

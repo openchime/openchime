@@ -130,6 +130,12 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                 e->author_id = b.author_id;
                 e->message_id = b.message_id;
                 e->server_time = b.server_time;
+                if (b.author_name.len) {
+                    size_t an = b.author_name.len < sizeof e->author_name - 1
+                                    ? b.author_name.len : sizeof e->author_name - 1;
+                    memcpy(e->author_name, b.author_name.ptr, an);
+                    e->author_name[an] = '\0';
+                }
                 e->body = malloc(b.body.len + 1);
                 if (e->body) { memcpy(e->body, b.body.ptr, b.body.len); e->body[b.body.len] = '\0'; }
                 oc_queue_push(to_ui, e);

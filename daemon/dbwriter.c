@@ -239,10 +239,12 @@ static uint64_t register_local(sqlite3 *db, const char *username, size_t ulen,
 
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "INSERT OR IGNORE INTO users(subject, role, created_at_ms) VALUES(?, ?, ?);", -1, &st, NULL);
+        "INSERT OR IGNORE INTO users(subject, display_name, role, created_at_ms) "
+        "VALUES(?, ?, ?, ?);", -1, &st, NULL);
     sqlite3_bind_text(st, 1, subject, (int)sublen, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 2, u8_to_role(role), -1, SQLITE_STATIC);
-    sqlite3_bind_int64(st, 3, (sqlite3_int64)now);
+    sqlite3_bind_text(st, 2, username, (int)ulen, SQLITE_TRANSIENT);   /* display name = login name */
+    sqlite3_bind_text(st, 3, u8_to_role(role), -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)now);
     sqlite3_step(st);
     sqlite3_finalize(st);
 
@@ -999,6 +1001,22 @@ static void link_attachments(sqlite3 *db, uint64_t mid, uint64_t channel_id,
     sqlite3_finalize(st);
 }
 
+/* The author's display name (users.display_name), or NULL if unset. Caller frees.
+ * Used to stamp a live BROADCAST with the sender's name (ARCH-74 client). */
+static char *lookup_display_name(sqlite3 *db, uint64_t user_id) {
+    sqlite3_stmt *st = NULL;
+    char *name = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT display_name FROM users WHERE id=?;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)user_id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char *dn = sqlite3_column_text(st, 0);
+            if (dn && dn[0]) name = strdup((const char *)dn);
+        }
+        sqlite3_finalize(st);
+    }
+    return name;
+}
+
 static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -1070,6 +1088,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     r->type = OC_RES_SEND_OK;
     r->message_id = mid;
     r->server_time = ts;
+    r->author_name = lookup_display_name(db, j->user_id);   /* name for the live BROADCAST */
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
     load_members(db, j->channel_id, r);
     return r;
@@ -1852,8 +1871,11 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             "SELECT m.id, m.author_id, m.created_at_ms, m.body, "
             "  (SELECT COUNT(*) FROM messages c WHERE c.parent_id=m.id), "
             "  (SELECT COALESCE(MAX(c.created_at_ms),0) FROM messages c WHERE c.parent_id=m.id), "
-            "  m.author_name "
-            "FROM messages m WHERE m.channel_id=? AND m.id>? AND m.parent_id IS NULL "
+            /* The display name to show: a webhook label overrides (REQ-170),
+             * else the author's display_name (ARCH-74 client shows names). */
+            "  COALESCE(NULLIF(m.author_name,''), u.display_name, '') "
+            "FROM messages m LEFT JOIN users u ON u.id = m.author_id "
+            "WHERE m.channel_id=? AND m.id>? AND m.parent_id IS NULL "
             "ORDER BY m.id LIMIT ?;", -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)ch);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)curs[ci].after_message_id);

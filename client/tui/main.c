@@ -129,9 +129,11 @@ static void build_rows(rows_t *r, const oc_channel *ch, uint64_t me, int width) 
             struct tm tmv;
             if (localtime_r(&t, &tmv)) strftime(stamp, sizeof stamp, "%H:%M", &tmv);
         }
-        /* Header row: "HH:MM  nick" in the author's color ("you" for self). We
-         * don't have display names in the model yet, so ids stand in. */
-        if (m->author_id == me)
+        /* Header row: "HH:MM  nick" in the author's color. Prefer the display
+         * name the daemon sends; fall back to "you" for self, else "user<id>". */
+        if (m->author_name[0])
+            snprintf(line, sizeof line, "%s  %s", stamp, m->author_name);
+        else if (m->author_id == me)
             snprintf(line, sizeof line, "%s  you", stamp);
         else
             snprintf(line, sizeof line, "%s  user%llu", stamp, (unsigned long long)m->author_id);

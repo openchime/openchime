@@ -340,10 +340,13 @@ tenant-monotonic (ARCH-43).
 | `body`         | lstr | Message body (§7).                           |
 
 The frame may then carry the **optional trailing block** (§5.14): the attachment
-metadata list, followed by an optional `author_name` (str) display-name override
-(set for webhook posts, §5.15). Both are self-describing — present only when
-non-empty — so a plain message is byte-identical to the base layout; because two
-optional fields share the tail, a name with no attachments is preceded by a zero
+metadata list, followed by an optional `author_name` (str) — the **display name
+to show** for the message: a webhook's label override (§5.15) if set, otherwise
+the author's `display_name` (so clients render "dana" rather than a bare id,
+ARCH-74); empty means fall back to `author_id`. Both are self-describing —
+present only when non-empty — so a plain message with a known author name is
+still compact; because two optional fields share the tail, a name with no
+attachments is preceded by a zero
 attachment count.
 
 Client-side dedup (REQ-091): each client keeps a per-channel high-water mark of

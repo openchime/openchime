@@ -16,6 +16,7 @@
 
 typedef struct {
     char    *body;         /* heap */
+    char     author_name[64]; /* author display name ("" = fall back to id) */
     uint64_t author_id;
     uint64_t message_id;
     uint64_t server_time;
