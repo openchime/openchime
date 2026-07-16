@@ -50,7 +50,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 11);
+    CHECK(oc_schema_version(db) == 12);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -1707,6 +1707,74 @@ static void test_webhooks(void) {
     cleanup_db(path);
 }
 
+/* Notification preferences (REQ-130/131): per-channel level + DND, persisted and
+ * upserted, gated on channel access. */
+static void test_notify_prefs(void) {
+    const char *path = "build/test_dbwriter_notify.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "np-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "np-bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    /* Default: no prefs, DND off. */
+    oc_job *j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 1);
+    j->user_id = alice; oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_NOTIFY_PREFS && r->n_nprefs == 0 && r->np_dnd_enabled == 0);
+    oc_dbres_free(r);
+
+    /* Set a channel level; the snapshot reflects it. */
+    j = oc_job_new(OC_JOB_SET_NOTIFY_PREF, 2);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->notify_level = OC_NOTIFY_MENTIONS;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_NOTIFY_PREFS && r->n_nprefs == 1);
+    CHECK(r->nprefs[0].channel_id == OC_DEFAULT_CHANNEL && r->nprefs[0].level == OC_NOTIFY_MENTIONS);
+    oc_dbres_free(r);
+
+    /* Set DND; the pref persists alongside. */
+    j = oc_job_new(OC_JOB_SET_DND, 3);
+    j->user_id = alice; j->dnd_enabled = 1; j->dnd_start_min = 1320; j->dnd_end_min = 480;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_NOTIFY_PREFS && r->np_dnd_enabled == 1);
+    CHECK(r->np_dnd_start_min == 1320 && r->np_dnd_end_min == 480 && r->n_nprefs == 1);
+    oc_dbres_free(r);
+
+    /* Re-setting the level upserts (no duplicate row). */
+    j = oc_job_new(OC_JOB_SET_NOTIFY_PREF, 4);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->notify_level = OC_NOTIFY_NONE;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->n_nprefs == 1 && r->nprefs[0].level == OC_NOTIFY_NONE);
+    oc_dbres_free(r);
+
+    /* An invalid level is refused. */
+    j = oc_job_new(OC_JOB_SET_NOTIFY_PREF, 5);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->notify_level = 9;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_NOTIFY_ERR);
+    oc_dbres_free(r);
+
+    /* A channel the user can't read is refused. */
+    r = create_channel(w, bob, "priv", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t priv = r->channel_id;
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_SET_NOTIFY_PREF, 6);
+    j->user_id = alice; j->channel_id = priv; j->notify_level = OC_NOTIFY_ALL;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_NOTIFY_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_dm(void) {
     const char *path = "build/test_dbwriter_dm.db";
     cleanup_db(path);
@@ -1806,6 +1874,7 @@ int run_dbwriter_tests(void) {
     test_dm();
     test_attachments();
     test_webhooks();
+    test_notify_prefs();
     test_admin_ops();
     test_reactions();
     test_threads();

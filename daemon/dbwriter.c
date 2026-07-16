@@ -161,6 +161,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->mime);
     for (size_t i = 0; i < r->n_whlist; i++) free(r->whlist[i].label);
     free(r->whlist);
+    free(r->nprefs);
     free(r);
 }
 
@@ -2202,6 +2203,92 @@ static oc_dbres *process_delete_webhook(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* --- Notification preferences (REQ-130/131) ----------------------------- */
+
+/* Load the user's DND window + per-channel levels into `r` as a NOTIFY_PREFS
+ * snapshot. Shared by set (returns a fresh snapshot to sync all devices) and
+ * list. */
+static void build_notify_prefs(sqlite3 *db, uint64_t user_id, oc_dbres *r) {
+    r->type = OC_RES_NOTIFY_PREFS;
+    r->user_id = user_id;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT dnd_enabled, dnd_start_min, dnd_end_min FROM users WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)user_id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        r->np_dnd_enabled   = (uint8_t)sqlite3_column_int(st, 0);
+        r->np_dnd_start_min = (uint16_t)sqlite3_column_int(st, 1);
+        r->np_dnd_end_min   = (uint16_t)sqlite3_column_int(st, 2);
+    }
+    sqlite3_finalize(st);
+
+    sqlite3_prepare_v2(db,
+        "SELECT channel_id, level FROM notification_prefs WHERE user_id=? ORDER BY channel_id LIMIT ?;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)user_id);
+    sqlite3_bind_int(st, 2, (int)OC_MAX_NOTIFY_PREFS);
+    size_t cap = 8;
+    r->nprefs = malloc(cap * sizeof *r->nprefs);
+    while (r->nprefs && sqlite3_step(st) == SQLITE_ROW && r->n_nprefs < OC_MAX_NOTIFY_PREFS) {
+        if (r->n_nprefs == cap) { cap *= 2; oc_notify_pref_row *g = realloc(r->nprefs, cap * sizeof *g); if (!g) break; r->nprefs = g; }
+        r->nprefs[r->n_nprefs].channel_id = (uint64_t)sqlite3_column_int64(st, 0);
+        r->nprefs[r->n_nprefs].level = (uint8_t)sqlite3_column_int(st, 1);
+        r->n_nprefs++;
+    }
+    sqlite3_finalize(st);
+}
+
+/* Set a channel's notification level for the caller (REQ-130). The channel must
+ * be one the caller can read. Returns a fresh snapshot (net thread syncs it to
+ * the user's other devices). Write. */
+static oc_dbres *process_set_notify_pref(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    if (j->notify_level > OC_NOTIFY_NONE || !channel_read_access(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; r->user_id = j->user_id; return r;
+    }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT OR REPLACE INTO notification_prefs(user_id, channel_id, level) VALUES(?, ?, ?);",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int  (st, 3, (int)j->notify_level);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_INTERNAL; r->user_id = j->user_id; return r; }
+    build_notify_prefs(db, j->user_id, r);
+    return r;
+}
+
+/* Set the caller's do-not-disturb window (REQ-131). Write. */
+static oc_dbres *process_set_dnd(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "UPDATE users SET dnd_enabled=?, dnd_start_min=?, dnd_end_min=? WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int  (st, 1, j->dnd_enabled ? 1 : 0);
+    sqlite3_bind_int  (st, 2, (int)j->dnd_start_min);
+    sqlite3_bind_int  (st, 3, (int)j->dnd_end_min);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)j->user_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    build_notify_prefs(db, j->user_id, r);
+    return r;
+}
+
+/* The caller's full notification settings (REQ-130/131). Read. */
+static oc_dbres *process_list_notify_prefs(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    build_notify_prefs(db, j->user_id, r);
+    return r;
+}
+
 /* Read-only query jobs run on the reader connection (ARCH-66), off the writer
  * thread, so a heavy search/backfill can't stall message sends or auth. */
 static int is_read_job(int type) {
@@ -2209,7 +2296,7 @@ static int is_read_job(int type) {
            type == OC_JOB_LIST_CHANNELS || type == OC_JOB_LIST_USERS ||
            type == OC_JOB_LIST_REACTIONS || type == OC_JOB_LIST_THREAD ||
            type == OC_JOB_TYPING || type == OC_JOB_ATTACH_LOOKUP ||
-           type == OC_JOB_LIST_WEBHOOKS;
+           type == OC_JOB_LIST_WEBHOOKS || type == OC_JOB_LIST_NOTIFY_PREFS;
 }
 
 /* Dispatch a read-only job against `rdb`. */
@@ -2223,6 +2310,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_TYPING)         return process_typing(rdb, j);
     if (j->type == OC_JOB_ATTACH_LOOKUP)  return process_attach_lookup(rdb, j);
     if (j->type == OC_JOB_LIST_WEBHOOKS)  return process_list_webhooks(rdb, j);
+    if (j->type == OC_JOB_LIST_NOTIFY_PREFS) return process_list_notify_prefs(rdb, j);
     return NULL;
 }
 
@@ -2255,6 +2343,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_CREATE_WEBHOOK)  return process_create_webhook(w->db, j);
     if (j->type == OC_JOB_WEBHOOK_POST)    return process_webhook_post(w->db, j);
     if (j->type == OC_JOB_DELETE_WEBHOOK)  return process_delete_webhook(w->db, j);
+    if (j->type == OC_JOB_SET_NOTIFY_PREF) return process_set_notify_pref(w->db, j);
+    if (j->type == OC_JOB_SET_DND)         return process_set_dnd(w->db, j);
     return NULL;
 }
 

@@ -46,7 +46,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * for a client; WEBHOOK_POST resolves a token presented over HTTP and
         * posts the message as the webhook's creator. */
        OC_JOB_CREATE_WEBHOOK = 33, OC_JOB_WEBHOOK_POST = 34,
-       OC_JOB_LIST_WEBHOOKS = 35, OC_JOB_DELETE_WEBHOOK = 36 };
+       OC_JOB_LIST_WEBHOOKS = 35, OC_JOB_DELETE_WEBHOOK = 36,
+       /* Notification preferences (REQ-130/131). */
+       OC_JOB_SET_NOTIFY_PREF = 37, OC_JOB_SET_DND = 38,
+       OC_JOB_LIST_NOTIFY_PREFS = 39 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -103,6 +106,12 @@ typedef struct oc_job {
     uint64_t       attach_ids[OC_MAX_ATTACH];
     uint16_t       n_attach;
 
+    /* Notification prefs (REQ-130/131). SET_NOTIFY_PREF uses channel_id + level;
+     * SET_DND uses the dnd_* fields. */
+    uint8_t        notify_level;
+    uint8_t        dnd_enabled;
+    uint16_t       dnd_start_min, dnd_end_min;
+
     /* BACKFILL */
     oc_bf_cursor  *cursors;   /* heap */
     size_t         n_cursors;
@@ -143,7 +152,9 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
         * posted via HTTP (carries SEND-style broadcast fields). ERR: err_code. */
        OC_RES_WEBHOOK_CREATED = 38, OC_RES_WEBHOOK_POSTED = 39,
        OC_RES_WEBHOOK_ERR = 40, OC_RES_WEBHOOK_LIST = 41,
-       OC_RES_WEBHOOK_DELETED = 42 };
+       OC_RES_WEBHOOK_DELETED = 42,
+       /* Notification prefs snapshot (also a sync push); ERR on a bad set. */
+       OC_RES_NOTIFY_PREFS = 43, OC_RES_NOTIFY_ERR = 44 };
 
 /* One row in a REACTIONS result (a distinct emoji + one reacting user). */
 typedef struct { char *emoji; uint64_t user_id; } oc_reaction_row;
@@ -156,6 +167,9 @@ typedef struct {
     uint8_t  joined;     /* 1 if the requesting user is a member */
     uint8_t  kind;       /* OC_CHANNEL_KIND / OC_CHANNEL_KIND_DM */
 } oc_channel_row;
+
+/* One row in a NOTIFY_PREFS result (REQ-130): a channel and its level. */
+typedef struct { uint64_t channel_id; uint8_t level; } oc_notify_pref_row;
 
 /* One row in a WEBHOOK_LIST result (REQ-170); the token is never returned. */
 typedef struct {
@@ -289,6 +303,12 @@ typedef struct oc_dbres {
      * message_id above to echo the removed webhook id. */
     oc_webhook_row *whlist;        /* heap array */
     size_t          n_whlist;
+
+    /* NOTIFY_PREFS (REQ-130/131): the user's DND window + per-channel levels. */
+    oc_notify_pref_row *nprefs;    /* heap array */
+    size_t              n_nprefs;
+    uint8_t             np_dnd_enabled;
+    uint16_t            np_dnd_start_min, np_dnd_end_min;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;

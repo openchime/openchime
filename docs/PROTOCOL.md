@@ -879,6 +879,35 @@ endpoint is not yet implemented — it currently uses the daemon's TOFU cert.
 
 ---
 
+### 5.16 Notification preferences (REQ-130, REQ-131)
+
+A user's notification settings are **server-authoritative and synced across their
+devices**. Two settings: a per-channel **level** (REQ-130) and a **do-not-disturb
+window** (REQ-131). They are the config that clients honor and that the future
+push gateway (REQ-132/133, deferred) will consult; DND suppresses *push*, not
+in-app unread (REQ-131).
+
+**`SET_NOTIFY_PREF` (C → S), `0x0090`** `{ channel_id: u64, level: u8 }` — set the
+level for a channel the caller can read: `0` all, `1` mentions-only, `2` none. An
+absent pref means the default (all). Refused with `ERROR NOT_A_MEMBER` for a
+channel the caller can't access, or an invalid level.
+
+**`SET_DND` (C → S), `0x0091`** `{ enabled: u8, start_min: u16, end_min: u16 }` —
+set the do-not-disturb window as a daily `[start, end)` range in **minutes of day
+(UTC**; the client converts from local time), wrapping past midnight when
+`start > end`.
+
+**`LIST_NOTIFY_PREFS` (C → S), `0x0092`** (empty) — request the caller's full
+settings.
+
+**`NOTIFY_PREFS` (S → C), `0x0093`** `{ dnd_enabled: u8, dnd_start_min: u16,
+dnd_end_min: u16, count: u16, count × { channel_id: u64, level: u8 } }` — the
+snapshot. It is sent both as the reply to `LIST_NOTIFY_PREFS` and, after any
+`SET_*`, **pushed to every one of the user's connections** so a change on one
+device updates the others.
+
+---
+
 ## 6. Reconnect backfill (resolves REQ-101)
 
 A client that reconnects (REQ-100) requests everything it missed since its
@@ -1049,6 +1078,10 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0071` | `PRESENCE_UPDATE`  | S → C     | no        | §5.13   |
 | `0x0072` | `TYPING`           | C → S     | no        | §5.13   |
 | `0x0073` | `TYPING_UPDATE`    | S → C     | no        | §5.13   |
+| `0x0090` | `SET_NOTIFY_PREF`  | C → S     | no        | §5.16   |
+| `0x0091` | `SET_DND`          | C → S     | no        | §5.16   |
+| `0x0092` | `LIST_NOTIFY_PREFS`| C → S     | no        | §5.16   |
+| `0x0093` | `NOTIFY_PREFS`     | S → C     | no        | §5.16   |
 | `0x0080` | `UPLOAD_BEGIN`     | C → S     | no        | §5.14   |
 | `0x0081` | `UPLOAD_READY`     | S → C     | no        | §5.14   |
 | `0x0082` | `UPLOAD_CHUNK`     | C → S     | no        | §5.14   |
@@ -1067,8 +1100,8 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 Ranges are left sparse (`0x0001–` handshake, `0x0010–` auth/session, `0x0020–`
 messaging, `0x0030–` reconnect, `0x0040–` users/profiles, `0x0050–` channel
 management, `0x0060–` search, `0x0070–` presence/typing, `0x0080–` attachment
-transfer, `0x00FF` error) so later revisions can slot in audio signaling without
-renumbering. The `0x0040–0x0047`
+transfer, `0x0090–` notification prefs, `0x00FF` error) so later revisions can
+slot in audio signaling without renumbering. The `0x0040–0x0047`
 management frames (user enumeration, roles, tenant invite/remove; §5.8) are
 defined; `0x0048` `UPDATE_PROFILE` (avatar/display-name edit) remains **reserved**
 until that milestone lands.
@@ -1119,6 +1152,7 @@ until that milestone lands.
 | REQ-140     | Chunked upload/download proxied through the daemon; blob in object storage, pointer in SQLite (§5.14, ARCH-69/70). |
 | REQ-141     | Every byte proxied, so access control is the ordinary membership check on the attached message — no signed URLs (§5.14, ARCH-69). |
 | REQ-170     | `CREATE_WEBHOOK`/`WEBHOOK_INFO` mint a hashed per-channel token; `POST /webhook/<token>` (ALPN-demuxed HTTP) posts as the creator (§5.15, ARCH-71). |
+| REQ-130/131 | `SET_NOTIFY_PREF`/`SET_DND`/`LIST_NOTIFY_PREFS` → `NOTIFY_PREFS`; server-authoritative settings synced to all the user's devices (§5.16, ARCH-72). |
 
 Related decisions newly recorded in ARCHITECTURE.md: ARCH-41 (handshake &
 version negotiation), ARCH-42 (primitive field encodings), ARCH-43 (message id

@@ -80,6 +80,13 @@ static void decode_all(const uint8_t *buf, size_t len) {
     oc_presence_update pu; D(oc_decode_presence_update(&p, &pu));
     oc_typing ty; D(oc_decode_typing(&p, &ty));
     oc_typing_update tu2; D(oc_decode_typing_update(&p, &tu2));
+    oc_set_notify_pref snp; D(oc_decode_set_notify_pref(&p, &snp));
+    oc_set_dnd sdnd; D(oc_decode_set_dnd(&p, &sdnd));
+    D(oc_decode_list_notify_prefs(&p));
+    { oc_notify_pref_entry ne[4]; uint16_t nc = 0; oc_set_dnd dd;
+      oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_notify_prefs(&p, ne, 4, &nc, &dd);
+      CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
     oc_upload_begin ub; D(oc_decode_upload_begin(&p, &ub));
     oc_upload_ready urd; D(oc_decode_upload_ready(&p, &urd));
     oc_upload_chunk uc; D(oc_decode_upload_chunk(&p, &uc));

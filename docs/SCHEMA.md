@@ -348,12 +348,30 @@ backfill. A metadata-only default-NULL add.
 
 ---
 
+## 3j. Migration 0012 — notification preferences (REQ-130/131, ARCH-72)
+
+Server-authoritative notification settings, synced across a user's devices.
+
+### `notification_prefs`
+- `(user_id, channel_id)` (PK) — one level per user per channel.
+- `level` (INTEGER 0/1/2) — 0 all, 1 mentions-only, 2 none. An **absent row means
+  the default** (all), so the table stays sparse.
+
+### `users` (added columns)
+- `dnd_enabled` (INTEGER 0/1) — do-not-disturb on/off.
+- `dnd_start_min`, `dnd_end_min` (INTEGER) — the daily DND window as minutes of
+  day (UTC; the client converts from local), wrapping past midnight when
+  `start > end`. DND suppresses push, not in-app unread (REQ-131).
+
+---
+
 ## 4. Deferred to later migrations
 
 Tracked here so the omissions are deliberate, not forgotten:
 
 - **Thread notifications** (REQ-061) — needs notification config (REQ-130).
-- **Notification settings** and DND (REQ-130/131).
+- **Push delivery** state (REQ-132/133) — device tokens for APNs/FCM; the
+  notification *settings* (REQ-130/131) are now in migration 0012 above.
 - **Audio** call state (REQ-150–152) — likely a UDP sidecar, not schema (ARCH-18).
 
 (Roles, sessions/revocation, local credentials, delivery cursors, server

@@ -1036,6 +1036,48 @@ static void test_webhook_vertical(int port, const uint8_t *pin) {
     client_close(&a);
 }
 
+/* Notification preferences sync across a user's devices (REQ-130/131): setting a
+ * channel level or DND on one connection pushes a fresh NOTIFY_PREFS snapshot to
+ * all of the same user's connections. */
+static void test_notify_prefs_vertical(int port, const uint8_t *pin) {
+    client a1, a2;                       /* same user, two devices */
+    CHECK(client_open(&a1, port, pin) == 0); CHECK(do_handshake(&a1) == 0);
+    CHECK(client_open(&a2, port, pin) == 0); CHECK(do_handshake(&a2) == 0);
+    uint64_t ua = 0, ua2 = 0;
+    CHECK(do_auth(&a1, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&a2, "alice", "pw-alice", &ua2) == 0);
+    CHECK(ua == ua2);
+
+    oc_header hdr; oc_rbuf p; uint8_t buf[128]; oc_wbuf w;
+    oc_notify_pref_entry ents[16]; uint16_t n; oc_set_dnd dnd;
+
+    /* Set a channel level on device 1 -> both devices get the snapshot. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_notify_pref sp = { OC_DEFAULT_CHANNEL, OC_NOTIFY_MENTIONS };
+    CHECK(oc_encode_set_notify_pref(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK);
+    CHECK(send_frame(&a1, buf, w.len) == 0);
+    client *devs[2] = { &a1, &a2 };
+    for (int d = 0; d < 2; d++) {
+        CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_NOTIFY_PREFS);
+        CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, &dnd) == OC_OK && n == 1);
+        CHECK(ents[0].channel_id == OC_DEFAULT_CHANNEL && ents[0].level == OC_NOTIFY_MENTIONS);
+    }
+
+    /* Set DND on device 2 -> both devices get the snapshot (pref persists). */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_dnd sd = { 1, 1320, 480 };
+    CHECK(oc_encode_set_dnd(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK);
+    CHECK(send_frame(&a2, buf, w.len) == 0);
+    for (int d = 0; d < 2; d++) {
+        CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_NOTIFY_PREFS);
+        CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, &dnd) == OC_OK);
+        CHECK(dnd.enabled == 1 && dnd.start_min == 1320 && dnd.end_min == 480 && n == 1);
+    }
+
+    client_close(&a1);
+    client_close(&a2);
+}
+
 /* Direct messages over the wire (REQ-050): OPEN_DM creates a kind=DM channel,
  * pushes a CHANNEL_INFO to the peer, the two participants exchange messages
  * through it, and a third user cannot post to it. */
@@ -1460,6 +1502,7 @@ int run_netloop_tests(void) {
         test_presence_typing(arg.port, pin);
         test_attachments_vertical(arg.port, pin);
         test_webhook_vertical(arg.port, pin);
+        test_notify_prefs_vertical(arg.port, pin);
         test_concurrent_load(arg.port, pin);
         test_send_rate_limit(arg.port, pin);
         test_out_buffer_cap(arg.port, pin, dbw, flooder);

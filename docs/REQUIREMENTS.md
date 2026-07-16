@@ -293,9 +293,15 @@ the requirement says so explicitly rather than implying one.
 
 - **REQ-130.** Each user has been able to independently set a notification
   level — all messages, mentions only, or none — per channel they belong to.
+  Built (ARCH-72): `SET_NOTIFY_PREF` stores the level in `notification_prefs`
+  (server-authoritative), and a `NOTIFY_PREFS` snapshot syncs it to all the
+  user's devices.
 - **REQ-131.** Each user has been able to configure a do-not-disturb
   schedule that has suppressed push notification delivery without altering
-  in-app unread state (badges/counts have still updated).
+  in-app unread state (badges/counts have still updated). Built (ARCH-72):
+  `SET_DND` stores a daily UTC minutes-of-day window on `users`; it governs push
+  only. The push *delivery* it gates (REQ-132/133) is the deferred mobile-push
+  milestone.
 - **REQ-132.** Push notifications have been delivered via APNs on iOS/macOS
   and FCM on Android (ARCH-16), at no per-notification cost, per the
   providers' free tiers as of this writing.

@@ -508,6 +508,35 @@ static void test_presence_frames(void) {
     }
 }
 
+static void test_notify_frames(void) {
+    {
+        oc_set_notify_pref in = { 7, OC_NOTIFY_MENTIONS };
+        ROUNDTRIP(oc_encode_set_notify_pref(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_NOTIFY_PREF, h, p);
+        oc_set_notify_pref out;
+        CHECK(oc_decode_set_notify_pref(&p, &out) == OC_OK && out.channel_id == 7 && out.level == OC_NOTIFY_MENTIONS);
+    }
+    {
+        oc_set_dnd in = { 1, 1320, 480 };   /* 22:00 -> 08:00 UTC */
+        ROUNDTRIP(oc_encode_set_dnd(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_DND, h, p);
+        oc_set_dnd out;
+        CHECK(oc_decode_set_dnd(&p, &out) == OC_OK && out.enabled == 1 && out.start_min == 1320 && out.end_min == 480);
+    }
+    {
+        ROUNDTRIP(oc_encode_list_notify_prefs(&w, OC_PROTOCOL_VERSION), OC_MSG_LIST_NOTIFY_PREFS, h, p);
+        CHECK(oc_decode_list_notify_prefs(&p) == OC_OK);
+    }
+    {
+        oc_notify_pref_entry ents[2] = { { 7, OC_NOTIFY_MENTIONS }, { 9, OC_NOTIFY_NONE } };
+        oc_notify_prefs in = { 1, 1320, 480, 2, ents };
+        ROUNDTRIP(oc_encode_notify_prefs(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_NOTIFY_PREFS, h, p);
+        oc_notify_pref_entry got[4]; uint16_t n = 0; oc_set_dnd dnd;
+        CHECK(oc_decode_notify_prefs(&p, got, 4, &n, &dnd) == OC_OK && n == 2);
+        CHECK(dnd.enabled == 1 && dnd.start_min == 1320 && dnd.end_min == 480);
+        CHECK(got[0].channel_id == 7 && got[0].level == OC_NOTIFY_MENTIONS);
+        CHECK(got[1].channel_id == 9 && got[1].level == OC_NOTIFY_NONE);
+    }
+}
+
 static void test_webhook_frames(void) {
     {
         oc_create_webhook in = { 9, oc_slice_str("github") };
@@ -851,6 +880,7 @@ int run_protocol_tests(void) {
     test_presence_frames();
     test_attachment_frames();
     test_webhook_frames();
+    test_notify_frames();
     test_backfill_and_error();
     test_size_limits();
     test_malformed();

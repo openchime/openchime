@@ -81,10 +81,10 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 |-----|--------|-------|
 | 120 presence | ✅ | In-memory net-thread state; `SET_PRESENCE`/`PRESENCE_UPDATE` + auth-time online snapshot (ARCH-67). |
 | 121 typing indicator | ✅ | Member-scoped `TYPING`/`TYPING_UPDATE` relay; ~6s client-side expiry resolves the window (ARCH-68). |
-| 130 per-channel notification level | ⛔ | |
-| 131 do-not-disturb schedule | ⛔ | |
-| 132 APNs/FCM push | ⛔ | |
-| 133 self-host push gateway | ⛔ | |
+| 130 per-channel notification level | ✅ | `SET_NOTIFY_PREF`/`LIST_NOTIFY_PREFS` → `NOTIFY_PREFS`; server-authoritative level (all/mentions/none) in `notification_prefs` (migration 0012), synced to all the user's devices (ARCH-72). |
+| 131 do-not-disturb schedule | ✅ | `SET_DND` stores a daily UTC minutes-of-day window on `users`; governs push, not in-app unread (ARCH-72). |
+| 132 APNs/FCM push | ⛔ | Deferred mobile-push milestone: needs the push transport + per-message notify decision. Settings (REQ-130/131) that gate it are built. |
+| 133 self-host push gateway | ⛔ | Tied to REQ-132. |
 | 140 file attachments (object storage) | 🟡 | **Built + tested end-to-end:** proxied chunked upload/download over the wire (ARCH-69), `attachments` migration 0009, frames §5.14, and **message-linking** — a SEND references uploaded attachments (self-describing optional list), the BROADCAST carries their metadata inline, and backfill re-attaches them on reconnect. Thread replies carry attachments too (SEND_REPLY/THREAD_REPLY + LIST_THREAD). Two blob backends behind the ARCH-70 vtable: local-FS (default) and S3/MinIO (`OPENCHIME_BLOB_BACKEND=s3`, SigV4-signed, verified end-to-end against MinIO). |
 | 141 attachment access control | ✅ | Proxied bytes → download authorized by the ordinary channel-read check on the attachment's channel; no signed URLs (ARCH-69). Verified over the wire (cross-user fetch allowed; non-member refused) and in dbwriter units. |
 | 150–152 server-relayed audio | ⛔ | |
@@ -172,9 +172,11 @@ public/private channels, messaging with edit/delete, reactions, threads, and
 full-text search — all reachable over the wire and tested end-to-end.
 
 The **largest missing surfaces** are (a) a real **client** beyond the Phase-1
-skeleton (the only consumer of all the above), and (b) whole **feature families
-not yet begun**: notifications/push and audio. Presence/typing
-(REQ-120/121) is built and tested end-to-end. **Attachments** (REQ-140/141) have
+skeleton (the only consumer of all the above), and (b) **mobile push transport**
+(REQ-132/133) and **audio** (REQ-150–152). Presence/typing (REQ-120/121) is
+built and tested end-to-end, as are **notification settings** (REQ-130/131:
+per-channel level + DND, server-authoritative and device-synced; the push
+delivery they gate is the deferred piece). **Attachments** (REQ-140/141) have
 their proxied chunked transfer + access control built and tested over the wire
 (local-FS blob store; S3/MinIO adapter and message-linking are the remaining
 follow-ups).
@@ -185,7 +187,7 @@ reads decoupled onto a read-only connection, server-side delivery accounting, a
 per-IP connection throttle, TLS-identity persistence across restore, truncation
 signals, the first-owner setup token, and a codec fuzzer + concurrency load
 test. What remains is **not** hardening but **scope**: a real client, the
-unbuilt feature families (notifications/push, audio), and a quantitative capacity
+unbuilt feature families (mobile push transport, audio), and a quantitative capacity
 benchmark for REQ-210/211. Incoming webhooks (REQ-170) are built end-to-end
 (ARCH-71), pending only the CA-signed cert (REQ-171). Attachments (REQ-140/141)
 are built end-to-end — proxied chunked transfer, access control, and message-linking

@@ -795,6 +795,33 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_NOTIFY_PREF) {
+            oc_set_notify_pref sp;
+            if (oc_decode_set_notify_pref(&p, &sp) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_NOTIFY_PREF, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->channel_id = sp.channel_id; j->notify_level = sp.level;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_DND) {
+            oc_set_dnd sd;
+            if (oc_decode_set_dnd(&p, &sd) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_DND, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->dnd_enabled = sd.enabled;
+            j->dnd_start_min = sd.start_min; j->dnd_end_min = sd.end_min;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_NOTIFY_PREFS) {
+            if (oc_decode_list_notify_prefs(&p) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_UPLOAD_BEGIN) {
             oc_upload_begin ub;
             if (oc_decode_upload_begin(&p, &ub) != OC_OK) return -1;
@@ -1616,6 +1643,36 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         oc_webhook_deleted wd = { r->message_id };
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_encode_webhook_deleted(&w, OC_PROTOCOL_VERSION, &wd);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_NOTIFY_PREFS: {
+        /* Sync the settings snapshot to *all* of the user's connections, so a
+         * change on one device updates the others (REQ-130/131). */
+        static oc_notify_pref_entry ents[OC_MAX_NOTIFY_PREFS];
+        uint16_t n = 0;
+        for (size_t i = 0; i < r->n_nprefs && n < OC_MAX_NOTIFY_PREFS; i++) {
+            ents[n].channel_id = r->nprefs[i].channel_id;
+            ents[n].level = r->nprefs[i].level;
+            n++;
+        }
+        oc_notify_prefs np = { r->np_dnd_enabled, r->np_dnd_start_min, r->np_dnd_end_min, n, ents };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_notify_prefs(&w, OC_PROTOCOL_VERSION, &np);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id == r->user_id)
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_NOTIFY_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("notify pref error") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }

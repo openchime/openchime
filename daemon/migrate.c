@@ -214,6 +214,24 @@ static const char MIGRATION_0010[] =
 static const char MIGRATION_0011[] =
     "ALTER TABLE messages ADD COLUMN author_name TEXT;";
 
+/* 0012: notification preferences (REQ-130/131). Per-channel notification level
+ * (0=all, 1=mentions, 2=none) — an absent row means the default (all). Plus a
+ * per-user do-not-disturb window as columns on `users`: a daily [start,end)
+ * range in minutes-of-day (UTC; the client converts from local), wrapping past
+ * midnight when start > end. These are the server-authoritative settings that
+ * clients honor and the future push gateway (REQ-132/133) will consult; DND
+ * suppresses push, not in-app unread (REQ-131). */
+static const char MIGRATION_0012[] =
+    "CREATE TABLE notification_prefs ("
+    "  user_id    INTEGER NOT NULL REFERENCES users(id),"
+    "  channel_id INTEGER NOT NULL REFERENCES channels(id),"
+    "  level      INTEGER NOT NULL DEFAULT 0 CHECK (level IN (0,1,2)),"
+    "  PRIMARY KEY (user_id, channel_id)"
+    ");"
+    "ALTER TABLE users ADD COLUMN dnd_enabled INTEGER NOT NULL DEFAULT 0 CHECK (dnd_enabled IN (0,1));"
+    "ALTER TABLE users ADD COLUMN dnd_start_min INTEGER NOT NULL DEFAULT 0;"
+    "ALTER TABLE users ADD COLUMN dnd_end_min INTEGER NOT NULL DEFAULT 0;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -226,6 +244,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 9, MIGRATION_0009 },
     { 10, MIGRATION_0010 },
     { 11, MIGRATION_0011 },
+    { 12, MIGRATION_0012 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

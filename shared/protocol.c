@@ -577,6 +577,73 @@ oc_result oc_encode_typing_update(oc_wbuf *w, uint16_t version, const oc_typing_
     return oc_frame_end(w, off);
 }
 
+/* --- Notification preferences (REQ-130/131) ----------------------------- */
+
+oc_result oc_encode_set_notify_pref(oc_wbuf *w, uint16_t version, const oc_set_notify_pref *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_NOTIFY_PREF);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u8(w, m->level);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_set_dnd(oc_wbuf *w, uint16_t version, const oc_set_dnd *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_DND);
+    oc_w_u8(w, m->enabled);
+    oc_w_u16(w, m->start_min);
+    oc_w_u16(w, m->end_min);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_list_notify_prefs(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_NOTIFY_PREFS);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_notify_prefs(oc_wbuf *w, uint16_t version, const oc_notify_prefs *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_NOTIFY_PREFS);
+    oc_w_u8(w, m->dnd_enabled);
+    oc_w_u16(w, m->dnd_start_min);
+    oc_w_u16(w, m->dnd_end_min);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        oc_w_u64(w, m->entries[i].channel_id);
+        oc_w_u8(w, m->entries[i].level);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_notify_pref(oc_rbuf *p, oc_set_notify_pref *m) {
+    m->channel_id = oc_r_u64(p);
+    m->level = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_set_dnd(oc_rbuf *p, oc_set_dnd *m) {
+    m->enabled = oc_r_u8(p);
+    m->start_min = oc_r_u16(p);
+    m->end_min = oc_r_u16(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_list_notify_prefs(oc_rbuf *p) {
+    return r_done(p);   /* empty payload */
+}
+
+oc_result oc_decode_notify_prefs(oc_rbuf *p, oc_notify_pref_entry *entries, uint16_t cap,
+                                 uint16_t *out_count, oc_set_dnd *dnd_out) {
+    dnd_out->enabled = oc_r_u8(p);
+    dnd_out->start_min = oc_r_u16(p);
+    dnd_out->end_min = oc_r_u16(p);
+    uint16_t count = oc_r_u16(p);
+    *out_count = count;
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
+        uint64_t cid = oc_r_u64(p);
+        uint8_t level = oc_r_u8(p);
+        if (i < cap) { entries[i].channel_id = cid; entries[i].level = level; }
+    }
+    return r_done(p);
+}
+
 /* --- Attachment transfer (REQ-140/141, ARCH-69) ------------------------- */
 
 oc_result oc_encode_upload_begin(oc_wbuf *w, uint16_t version, const oc_upload_begin *m) {

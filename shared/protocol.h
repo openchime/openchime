@@ -96,6 +96,10 @@ typedef enum {
     OC_MSG_DOWNLOAD_CHUNK   = 0x0088, /* S->C, one download chunk */
     OC_MSG_DOWNLOAD_END     = 0x0089, /* S->C, all bytes sent */
     OC_MSG_TRANSFER_CANCEL  = 0x008A, /* C->S, abort an in-progress transfer */
+    OC_MSG_SET_NOTIFY_PREF  = 0x0090, /* C->S, set a channel's notification level (REQ-130) */
+    OC_MSG_SET_DND          = 0x0091, /* C->S, set the do-not-disturb window (REQ-131) */
+    OC_MSG_LIST_NOTIFY_PREFS= 0x0092, /* C->S, request all notification settings */
+    OC_MSG_NOTIFY_PREFS     = 0x0093, /* S->C, DND + per-channel levels (also a sync push) */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -245,6 +249,12 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_PRESENCE_ONLINE  1u
 #define OC_PRESENCE_AWAY    2u
 
+/* Per-channel notification level (REQ-130). */
+#define OC_NOTIFY_ALL      0u
+#define OC_NOTIFY_MENTIONS 1u
+#define OC_NOTIFY_NONE     2u
+#define OC_MAX_NOTIFY_PREFS 1024u   /* cap on a NOTIFY_PREFS list */
+
 /* Channel kind (SCHEMA.md channels.kind) and the name cap for CREATE_CHANNEL. */
 #define OC_CHANNEL_KIND    0u   /* a named channel */
 #define OC_CHANNEL_KIND_DM 1u   /* a direct-message conversation (reserved) */
@@ -330,6 +340,12 @@ typedef struct { uint8_t status; } oc_set_presence;
 typedef struct { uint64_t user_id; uint8_t status; } oc_presence_update;
 typedef struct { uint64_t channel_id; } oc_typing;
 typedef struct { uint64_t channel_id; uint64_t user_id; } oc_typing_update;
+/* Notification preferences (REQ-130/131). */
+typedef struct { uint64_t channel_id; uint8_t level; } oc_set_notify_pref;
+typedef struct { uint8_t enabled; uint16_t start_min; uint16_t end_min; } oc_set_dnd;
+typedef struct { uint64_t channel_id; uint8_t level; } oc_notify_pref_entry;
+typedef struct { uint8_t dnd_enabled; uint16_t dnd_start_min; uint16_t dnd_end_min;
+                 uint16_t count; const oc_notify_pref_entry *entries; } oc_notify_prefs;
 /* Attachment transfer (REQ-140/141, ARCH-69). `data` chunks are zero-copy views.
  * sha256 is a 32-byte digest carried as `bytes`. */
 typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; oc_slice filename; oc_slice mime; uint64_t total_size; } oc_upload_begin;
@@ -410,6 +426,10 @@ oc_result oc_encode_set_presence(oc_wbuf *w, uint16_t version, const oc_set_pres
 oc_result oc_encode_presence_update(oc_wbuf *w, uint16_t version, const oc_presence_update *m);
 oc_result oc_encode_typing(oc_wbuf *w, uint16_t version, const oc_typing *m);
 oc_result oc_encode_typing_update(oc_wbuf *w, uint16_t version, const oc_typing_update *m);
+oc_result oc_encode_set_notify_pref(oc_wbuf *w, uint16_t version, const oc_set_notify_pref *m);
+oc_result oc_encode_set_dnd(oc_wbuf *w, uint16_t version, const oc_set_dnd *m);
+oc_result oc_encode_list_notify_prefs(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_notify_prefs(oc_wbuf *w, uint16_t version, const oc_notify_prefs *m);
 oc_result oc_encode_upload_begin(oc_wbuf *w, uint16_t version, const oc_upload_begin *m);
 oc_result oc_encode_upload_ready(oc_wbuf *w, uint16_t version, const oc_upload_ready *m);
 oc_result oc_encode_upload_chunk(oc_wbuf *w, uint16_t version, const oc_upload_chunk *m);
@@ -486,6 +506,11 @@ oc_result oc_decode_set_presence(oc_rbuf *p, oc_set_presence *m);
 oc_result oc_decode_presence_update(oc_rbuf *p, oc_presence_update *m);
 oc_result oc_decode_typing(oc_rbuf *p, oc_typing *m);
 oc_result oc_decode_typing_update(oc_rbuf *p, oc_typing_update *m);
+oc_result oc_decode_set_notify_pref(oc_rbuf *p, oc_set_notify_pref *m);
+oc_result oc_decode_set_dnd(oc_rbuf *p, oc_set_dnd *m);
+oc_result oc_decode_list_notify_prefs(oc_rbuf *p);
+oc_result oc_decode_notify_prefs(oc_rbuf *p, oc_notify_pref_entry *entries, uint16_t cap,
+                                 uint16_t *out_count, oc_set_dnd *dnd_out);
 oc_result oc_decode_upload_begin(oc_rbuf *p, oc_upload_begin *m);
 oc_result oc_decode_upload_ready(oc_rbuf *p, oc_upload_ready *m);
 oc_result oc_decode_upload_chunk(oc_rbuf *p, oc_upload_chunk *m);
