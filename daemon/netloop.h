@@ -25,4 +25,9 @@
 int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                    volatile sig_atomic_t *stop);
 
+/* Wire the audio relay sidecar (REQ-150, ARCH-31): the IPC socket to it and the
+ * UDP port it listens on. Call before oc_netloop_run. With ipc_fd < 0 (the
+ * default) calls still form but carry no media endpoint. */
+void oc_netloop_set_audio(int ipc_fd, uint16_t udp_port);
+
 #endif /* OPENCHIME_NETLOOP_H */

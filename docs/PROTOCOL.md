@@ -923,9 +923,12 @@ channel's call. Authorized by the ordinary channel-read gate; a non-member gets
 **`CALL_JOINED` (S → C, to the joiner), `0x00A2`** `{ channel_id: u64, call_id:
 u64, udp_port: u16, token: bytes, count: u16, count × { user_id: u64 } }` — the
 joiner's confirmation: the current roster plus their **private** media endpoint —
-the sidecar's `udp_port` and a per-join bearer `token` the client will put in
-each audio packet (both are placeholders — `0` / empty — until the sidecar
-milestone lands).
+the audio sidecar's `udp_port` and a per-join 16-byte bearer `token`. The client
+then speaks **UDP directly to the sidecar** (out of band from this TCP protocol):
+`token(16) ‖ seq(u16) ‖ opus-payload` to it, and receives
+`sender_user_id(u64) ‖ seq(u16) ‖ opus-payload` from it (the sidecar relays
+opaque payloads to the other participants — it never decodes Opus). See
+`daemon/audio.h` for the exact media framing.
 
 **`CALL_ROSTER` (S → C, to the other participants), `0x00A3`** `{ channel_id:
 u64, call_id: u64, count: u16, count × { user_id: u64 } }` — pushed to every

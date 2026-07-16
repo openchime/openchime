@@ -5,6 +5,7 @@
  * thread and drives it with blocking TLS clients. */
 
 #include "netloop.h"
+#include "audio.h"
 #include "dbwriter.h"
 #include "framebuf.h"
 #include "protocol.h"
@@ -14,6 +15,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <stdlib.h>
 #include <pthread.h>
 #include <string.h>
@@ -25,6 +27,41 @@ struct loop_arg {
     oc_dbwriter          *dbw;
     volatile sig_atomic_t stop;
 };
+
+/* An audio sidecar driven on a thread so the call e2e has a live media relay. */
+static struct { int ipc_fd, udp_fd; volatile sig_atomic_t stop; } g_audio_arg;
+static void *audio_thread(void *p) {
+    (void)p;
+    oc_audio_sidecar_run(g_audio_arg.ipc_fd, g_audio_arg.udp_fd, &g_audio_arg.stop);
+    return NULL;
+}
+
+/* token(16) + seq(u16 BE) + payload -> the relay. */
+static void udp_send_audio(int fd, const struct sockaddr_in *to, const uint8_t *tok,
+                           uint16_t seq, const char *payload) {
+    uint8_t pkt[128]; size_t pl = payload ? strlen(payload) : 0;
+    memcpy(pkt, tok, OC_AUDIO_TOKEN_LEN);
+    pkt[16] = (uint8_t)(seq >> 8); pkt[17] = (uint8_t)seq;
+    if (pl) memcpy(pkt + OC_AUDIO_C2S_HDR, payload, pl);
+    sendto(fd, pkt, OC_AUDIO_C2S_HDR + pl, 0, (const struct sockaddr *)to, sizeof *to);
+}
+/* Receive a forwarded datagram: sender(u64) seq(u16) payload. -1 on timeout. */
+static int udp_recv_audio(int fd, uint64_t *sender, uint16_t *seq, char *out, size_t cap) {
+    uint8_t pkt[256];
+    ssize_t n = recv(fd, pkt, sizeof pkt, 0);
+    if (n < (ssize_t)OC_AUDIO_S2C_HDR) return -1;
+    uint64_t s = 0; for (int i = 0; i < 8; i++) s = (s << 8) | pkt[i];
+    *sender = s; *seq = (uint16_t)((pkt[8] << 8) | pkt[9]);
+    size_t pl = (size_t)n - OC_AUDIO_S2C_HDR; if (pl > cap) pl = cap;
+    memcpy(out, pkt + OC_AUDIO_S2C_HDR, pl);
+    return (int)pl;
+}
+static int mk_udp_client(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct timeval tv = { 0, 400000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    return fd;
+}
 
 static void *loop_thread(void *p) {
     struct loop_arg *a = (struct loop_arg *)p;
@@ -1138,6 +1175,64 @@ static void test_call_vertical(int port, const uint8_t *pin) {
     client_close(&a);
 }
 
+/* Full audio path (REQ-150/151): two participants join a call, each gets a UDP
+ * endpoint + bearer token in CALL_JOINED, and one participant's audio is relayed
+ * to the other by the sidecar, tagged with the sender's user id. */
+static void test_call_udp_vertical(int port, const uint8_t *pin, uint16_t audio_port) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0); CHECK(do_handshake(&a) == 0);
+    CHECK(client_open(&b, port, pin) == 0); CHECK(do_handshake(&b) == 0);
+    uint64_t ua = 0, ub = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+
+    oc_header hdr; oc_rbuf p; uint8_t buf[128]; oc_wbuf w; uint64_t parts[32];
+    uint8_t atok[OC_AUDIO_TOKEN_LEN], btok[OC_AUDIO_TOKEN_LEN];
+
+    /* alice joins -> CALL_JOINED with the real UDP port + a 16-byte token. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_call_join cj = { OC_DEFAULT_CHANNEL };
+    CHECK(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_JOINED);
+    oc_call_joined jd; CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK);
+    CHECK(jd.udp_port == audio_port && jd.token.len == OC_AUDIO_TOKEN_LEN);
+    memcpy(atok, jd.token.ptr, OC_AUDIO_TOKEN_LEN);
+
+    /* bob joins -> his own token; alice gets a roster update. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_JOINED);
+    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.token.len == OC_AUDIO_TOKEN_LEN);
+    memcpy(btok, jd.token.ptr, OC_AUDIO_TOKEN_LEN);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_ROSTER);
+
+    struct sockaddr_in relay; memset(&relay, 0, sizeof relay);
+    relay.sin_family = AF_INET; relay.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    relay.sin_port = htons(audio_port);
+    int sa = mk_udp_client(), sb = mk_udp_client();
+
+    /* Each side sends a hello so the sidecar learns its UDP address. */
+    udp_send_audio(sb, &relay, btok, 0, NULL);
+    udp_send_audio(sa, &relay, atok, 0, NULL);
+    usleep(120000);
+    { char tmp[64]; uint64_t s; uint16_t sq;   /* discard any forwarded helloes */
+      while (udp_recv_audio(sa, &s, &sq, tmp, sizeof tmp) >= 0) {}
+      while (udp_recv_audio(sb, &s, &sq, tmp, sizeof tmp) >= 0) {} }
+
+    /* alice speaks -> bob receives it, tagged with alice's user id. */
+    udp_send_audio(sa, &relay, atok, 7, "hey");
+    usleep(80000);
+    uint64_t sender; uint16_t seq; char body[64];
+    int n = udp_recv_audio(sb, &sender, &seq, body, sizeof body);
+    CHECK(n == 3 && sender == ua && seq == 7 && memcmp(body, "hey", 3) == 0);
+
+    close(sa); close(sb);
+    client_close(&a);
+    client_close(&b);
+}
+
 /* Direct messages over the wire (REQ-050): OPEN_DM creates a kind=DM channel,
  * pushes a CHANNEL_INFO to the peer, the two participants exchange messages
  * through it, and a third user cannot post to it. */
@@ -1525,6 +1620,20 @@ int run_netloop_tests(void) {
     uint8_t pin[OC_TLS_FINGERPRINT_LEN];
     CHECK(oc_tls_server_fingerprint(&srv, pin) == 0);
 
+    /* Bring up an audio relay sidecar (on a thread) + wire the netloop to it, so
+     * CALL_JOINED carries a real UDP port + token and the call e2e can relay. */
+    int audio_udp = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in ua; memset(&ua, 0, sizeof ua);
+    ua.sin_family = AF_INET; ua.sin_addr.s_addr = htonl(INADDR_LOOPBACK); ua.sin_port = 0;
+    CHECK(bind(audio_udp, (struct sockaddr *)&ua, sizeof ua) == 0);
+    socklen_t ual = sizeof ua; getsockname(audio_udp, (struct sockaddr *)&ua, &ual);
+    uint16_t audio_port = ntohs(ua.sin_port);
+    int asv[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, asv) == 0);
+    g_audio_arg.ipc_fd = asv[1]; g_audio_arg.udp_fd = audio_udp; g_audio_arg.stop = 0;
+    pthread_t audio_th;
+    CHECK(pthread_create(&audio_th, NULL, audio_thread, NULL) == 0);
+    oc_netloop_set_audio(asv[0], audio_port);
+
     unlink("build/itest_netloop.db");
     unlink("build/itest_netloop.db-wal");
     unlink("build/itest_netloop.db-shm");
@@ -1564,6 +1673,7 @@ int run_netloop_tests(void) {
         test_webhook_vertical(arg.port, pin);
         test_notify_prefs_vertical(arg.port, pin);
         test_call_vertical(arg.port, pin);
+        test_call_udp_vertical(arg.port, pin, audio_port);
         test_concurrent_load(arg.port, pin);
         test_send_rate_limit(arg.port, pin);
         test_out_buffer_cap(arg.port, pin, dbw, flooder);
@@ -1574,6 +1684,16 @@ int run_netloop_tests(void) {
 
     arg.stop = 1;
     pthread_join(th, NULL);
+
+    /* Stop the audio sidecar: the netloop is done, so unwire it and close the
+     * daemon IPC end (the sidecar exits on EOF), then join + close fds. */
+    oc_netloop_set_audio(-1, 0);
+    g_audio_arg.stop = 1;
+    close(asv[0]);
+    pthread_join(audio_th, NULL);
+    close(asv[1]);
+    close(audio_udp);
+
     oc_dbwriter_stop(dbw);
     oc_tls_server_free(&srv);
     unlink("build/itest_netloop.db");

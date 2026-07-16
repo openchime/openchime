@@ -87,7 +87,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 133 self-host push gateway | ⛔ | Tied to REQ-132. |
 | 140 file attachments (object storage) | 🟡 | **Built + tested end-to-end:** proxied chunked upload/download over the wire (ARCH-69), `attachments` migration 0009, frames §5.14, and **message-linking** — a SEND references uploaded attachments (self-describing optional list), the BROADCAST carries their metadata inline, and backfill re-attaches them on reconnect. Thread replies carry attachments too (SEND_REPLY/THREAD_REPLY + LIST_THREAD). Two blob backends behind the ARCH-70 vtable: local-FS (default) and S3/MinIO (`OPENCHIME_BLOB_BACKEND=s3`, SigV4-signed, verified end-to-end against MinIO). |
 | 141 attachment access control | ✅ | Proxied bytes → download authorized by the ordinary channel-read check on the attachment's channel; no signed URLs (ARCH-69). Verified over the wire (cross-user fetch allowed; non-member refused) and in dbwriter units. |
-| 150–152 server-relayed audio | 🟡 | **Signaling built** (Phase A): `CALL_JOIN`/`CALL_LEAVE` + per-channel ephemeral roster on the net thread, `CALL_JOINED`/`CALL_ROSTER` delivery, member-gated, disconnect drops-and-re-rosters (REQ-152), tested over the wire (ARCH-73, PROTOCOL.md §5.17). **Pending:** the `--mode=audio-sidecar` UDP relay + Unix-socket IPC (Phase B/C) that carries the actual Opus media. The server relays opaque audio — no libopus dependency. |
+| 150–152 server-relayed audio | ✅ (server) | **Built + tested end-to-end** (ARCH-73): `CALL_JOIN`/`CALL_LEAVE` + per-channel ephemeral roster on the net thread; a forked UDP relay sidecar (`daemon/audio_sidecar.c`) that the daemon drives over a Unix socket (AUTHORIZE/REVOKE) and advertises via `udp_port`+token in `CALL_JOINED`. The sidecar relays opaque Opus payloads to a call's participants — no libopus server-side. Disconnect drops-and-re-rosters + REVOKEs, with a UDP silence sweep (REQ-152). An itest joins two clients and relays audio between them over real UDP. **Client-side** Opus encode/decode + UDP I/O is Phase-2 client work. |
 | 160 video | ➖ | Deliberate scope exclusion. |
 | 170 incoming webhooks | ✅ | ALPN-demuxed HTTP handler on the proto port; `POST /webhook/<token>` posts as the creator with the webhook's label as a display-name override (ARCH-71, migrations 0010–0011). Client mints tokens via `CREATE_WEBHOOK`; hashed storage; JSON/plain body; per-token rate limit; list/delete management (LIST_WEBHOOKS/DELETE_WEBHOOK). Tested end-to-end. |
 | 171 CA-signed cert for webhooks | ⛔ | Endpoint currently served on the daemon's TOFU cert; on-demand CA/ACME issuance (ARCH-34) is the remaining infra follow-up. |
@@ -174,9 +174,11 @@ daemon-owned sessions and revocation, roles + full tenant administration,
 public/private channels, messaging with edit/delete, reactions, threads, and
 full-text search — all reachable over the wire and tested end-to-end.
 
-The **largest missing surfaces** are (a) a real **client** beyond the Phase-1
-skeleton (the only consumer of all the above), and (b) **mobile push transport**
-(REQ-132/133) and **audio** (REQ-150–152). Presence/typing (REQ-120/121) is
+The **largest missing surface** is a real **client** beyond the Phase-1 skeleton
+(the only consumer of all the above); the remaining server-side gap is **mobile
+push transport** (REQ-132/133). **Server-relayed audio** (REQ-150–152) is now
+built end-to-end — call signaling + a forked UDP relay sidecar — with only the
+client-side Opus/UDP left (Phase-2 client work). Presence/typing (REQ-120/121) is
 built and tested end-to-end, as are **notification settings** (REQ-130/131:
 per-channel level + DND, server-authoritative and device-synced; the push
 delivery they gate is the deferred piece). **Attachments** (REQ-140/141) have
@@ -190,7 +192,8 @@ reads decoupled onto a read-only connection, server-side delivery accounting, a
 per-IP connection throttle, TLS-identity persistence across restore, truncation
 signals, the first-owner setup token, and a codec fuzzer + concurrency load
 test. What remains is **not** hardening but **scope**: a real client and the
-unbuilt feature families (mobile push transport, audio). The capacity profile
+unbuilt server surface (mobile push transport; audio's server side is now built).
+The capacity profile
 (REQ-210/211) is now benchmarked — see [BENCHMARK.md](./BENCHMARK.md)
 (`Scripts/bench.sh`). Incoming webhooks
 (REQ-170) are built end-to-end

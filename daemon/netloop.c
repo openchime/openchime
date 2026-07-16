@@ -3,6 +3,8 @@
  */
 
 #include "netloop.h"
+#include "audio.h"
+#include "auth.h"
 #include "blobstore.h"
 #include "framebuf.h"
 #include "http.h"
@@ -315,9 +317,45 @@ static void presence_offline_if_gone(int ep, conn **conns, uint64_t user_id) {
 /* One call per channel; call_id == channel_id. State is in-memory on the net
  * thread (like presence, ARCH-67) — calls reset on restart. */
 #define OC_MAX_CALLS 64
-typedef struct { uint64_t user_id, conn_id; } call_part;
+typedef struct { uint64_t user_id, conn_id; uint8_t token[OC_AUDIO_TOKEN_LEN]; } call_part;
 typedef struct { uint64_t channel_id; call_part parts[OC_MAX_CALL_PARTICIPANTS]; int n; } call_t;
 static call_t g_calls[OC_MAX_CALLS];   /* channel_id == 0 marks a free slot */
+
+/* Audio sidecar (ARCH-31): the IPC socket to it and the UDP port it listens on,
+ * set by oc_netloop_set_audio before the loop runs. ipc_fd < 0 => no sidecar
+ * (calls still form, but with no media endpoint). */
+static int      g_audio_ipc = -1;
+static uint16_t g_audio_udp_port;
+
+void oc_netloop_set_audio(int ipc_fd, uint16_t udp_port) {
+    g_audio_ipc = ipc_fd;
+    g_audio_udp_port = udp_port;
+}
+
+/* Send one length-prefixed IPC message (type + payload) to the sidecar. */
+static void audio_ipc_send(uint8_t type, const uint8_t *payload, size_t plen) {
+    if (g_audio_ipc < 0) return;
+    uint8_t buf[64];
+    if (5 + plen > sizeof buf) return;
+    uint32_t mlen = (uint32_t)(1 + plen);
+    buf[0] = (uint8_t)(mlen >> 24); buf[1] = (uint8_t)(mlen >> 16);
+    buf[2] = (uint8_t)(mlen >> 8);  buf[3] = (uint8_t)mlen;
+    buf[4] = type;
+    memcpy(buf + 5, payload, plen);
+    ssize_t n = write(g_audio_ipc, buf, 5 + plen); (void)n;   /* best-effort */
+}
+
+static void audio_authorize(uint64_t call_id, uint64_t user_id, const uint8_t *token) {
+    uint8_t p[16 + OC_AUDIO_TOKEN_LEN];
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(call_id >> (56 - 8 * i));
+    for (int i = 0; i < 8; i++) p[8 + i] = (uint8_t)(user_id >> (56 - 8 * i));
+    memcpy(p + 16, token, OC_AUDIO_TOKEN_LEN);
+    audio_ipc_send(OC_AUDIO_IPC_AUTHORIZE, p, sizeof p);
+}
+
+static void audio_revoke(const uint8_t *token) {
+    audio_ipc_send(OC_AUDIO_IPC_REVOKE, token, OC_AUDIO_TOKEN_LEN);
+}
 
 static call_t *call_find(uint64_t channel_id) {
     if (!channel_id) return NULL;
@@ -334,24 +372,33 @@ static call_t *call_get_or_create(uint64_t channel_id) {
     return NULL;   /* all call slots busy */
 }
 
-/* Add a user (or refresh their connection) in a call. 1 ok, 0 if full. */
-static int call_add(call_t *c, uint64_t user_id, uint64_t conn_id) {
+/* Add a user (or refresh their connection) in a call with their media token.
+ * 1 ok, 0 if full. */
+static int call_add(call_t *c, uint64_t user_id, uint64_t conn_id, const uint8_t *token) {
     for (int i = 0; i < c->n; i++)
-        if (c->parts[i].user_id == user_id) { c->parts[i].conn_id = conn_id; return 1; }
+        if (c->parts[i].user_id == user_id) {
+            c->parts[i].conn_id = conn_id;
+            memcpy(c->parts[i].token, token, OC_AUDIO_TOKEN_LEN);
+            return 1;
+        }
     if (c->n >= (int)OC_MAX_CALL_PARTICIPANTS) return 0;
-    c->parts[c->n].user_id = user_id; c->parts[c->n].conn_id = conn_id; c->n++;
+    c->parts[c->n].user_id = user_id; c->parts[c->n].conn_id = conn_id;
+    memcpy(c->parts[c->n].token, token, OC_AUDIO_TOKEN_LEN);
+    c->n++;
     return 1;
 }
 
 /* Remove the participant on `conn_id` from whatever call it is in; returns that
- * call's channel_id (for a roster push) or 0. Frees the call if it empties. */
-static uint64_t call_remove_conn(uint64_t conn_id) {
+ * call's channel_id (for a roster push) or 0, and copies the removed token to
+ * `out_token` (for a sidecar revoke). Frees the call if it empties. */
+static uint64_t call_remove_conn(uint64_t conn_id, uint8_t *out_token) {
     for (int i = 0; i < OC_MAX_CALLS; i++) {
         call_t *c = &g_calls[i];
         if (!c->channel_id) continue;
         for (int j = 0; j < c->n; j++)
             if (c->parts[j].conn_id == conn_id) {
                 uint64_t ch = c->channel_id;
+                if (out_token) memcpy(out_token, c->parts[j].token, OC_AUDIO_TOKEN_LEN);
                 c->parts[j] = c->parts[--c->n];
                 if (c->n == 0) c->channel_id = 0;
                 return ch;
@@ -379,8 +426,13 @@ static void call_send_roster(int ep, conn **conns, call_t *c, uint64_t except_co
 }
 
 static void call_conn_closed(int ep, conn **conns, uint64_t conn_id) {
-    uint64_t ch = call_remove_conn(conn_id);
-    if (ch) { call_t *c = call_find(ch); if (c) call_send_roster(ep, conns, c, 0); }
+    uint8_t token[OC_AUDIO_TOKEN_LEN];
+    uint64_t ch = call_remove_conn(conn_id, token);
+    if (ch) {
+        audio_revoke(token);
+        call_t *c = call_find(ch);
+        if (c) call_send_roster(ep, conns, c, 0);
+    }
 }
 
 static int in_members(uint64_t uid, const uint64_t *m, size_t n) {
@@ -915,8 +967,13 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (hdr.msg_type == OC_MSG_CALL_LEAVE) {
             oc_call_leave cl;
             if (oc_decode_call_leave(&p, &cl) != OC_OK) return -1;
-            uint64_t ch = call_remove_conn(c->conn_id);
-            if (ch) { call_t *cc = call_find(ch); if (cc) call_send_roster(ep, conns, cc, 0); }
+            uint8_t token[OC_AUDIO_TOKEN_LEN];
+            uint64_t ch = call_remove_conn(c->conn_id, token);
+            if (ch) {
+                audio_revoke(token);
+                call_t *cc = call_find(ch);
+                if (cc) call_send_roster(ep, conns, cc, 0);
+            }
             continue;
         }
         if (hdr.msg_type == OC_MSG_UPLOAD_BEGIN) {
@@ -1780,17 +1837,22 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         if (!jc) break;
         int jfd = jc->fd;
         call_t *c = call_get_or_create(r->channel_id);
-        if (!c || !call_add(c, r->user_id, r->conn_id)) {
+        uint8_t token[OC_AUDIO_TOKEN_LEN];
+        if (!c || oc_rand_bytes(token, sizeof token) != 0 ||
+            !call_add(c, r->user_id, r->conn_id, token)) {
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
             oc_error e = { OC_ERR_INTERNAL, 0, { NULL, 0 }, oc_slice_str("call full") };
             oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
             send_bytes(ep, conns, jfd, g_enc, w.len);
             break;
         }
+        /* Register the participant + token with the media sidecar (ARCH-31). */
+        audio_authorize(r->channel_id, r->user_id, token);
         uint64_t parts[OC_MAX_CALL_PARTICIPANTS];
         for (int i = 0; i < c->n; i++) parts[i] = c->parts[i].user_id;
-        /* udp_port + token are placeholders until the sidecar milestone (Phase B/C). */
-        oc_call_joined jd = { c->channel_id, c->channel_id, 0, { NULL, 0 }, (uint16_t)c->n, parts };
+        /* The joiner's private media endpoint: the sidecar's UDP port + its token. */
+        oc_call_joined jd = { c->channel_id, c->channel_id, g_audio_udp_port,
+                              { token, OC_AUDIO_TOKEN_LEN }, (uint16_t)c->n, parts };
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_encode_call_joined(&w, OC_PROTOCOL_VERSION, &jd);
         send_bytes(ep, conns, jfd, g_enc, w.len);

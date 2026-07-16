@@ -11,6 +11,7 @@
  * OC_BOOTSTRAP_USERS.
  */
 
+#include "audio.h"
 #include "dbwriter.h"
 #include "netloop.h"
 #include "tls.h"
@@ -232,6 +233,34 @@ int main(void) {
     pthread_t hz;
     pthread_create(&hz, NULL, health_thread, &health_port);
     pthread_detach(hz);
+
+    /* Fork the audio relay sidecar (REQ-150/151, ARCH-28/31): bind its UDP
+     * socket here (so we learn the port to advertise), pair a Unix socket for
+     * IPC, and fork. The child runs the relay and exits when this daemon closes
+     * its IPC end (EOF); a fork failure just disables media (calls still form). */
+    {
+        int uport = env_port("OPENCHIME_AUDIO_PORT", 0);   /* 0 = ephemeral */
+        int udp = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in ua; memset(&ua, 0, sizeof ua);
+        ua.sin_family = AF_INET; ua.sin_addr.s_addr = htonl(INADDR_ANY);
+        ua.sin_port = htons((uint16_t)uport);
+        int sv[2];
+        if (udp >= 0 && bind(udp, (struct sockaddr *)&ua, sizeof ua) == 0 &&
+            socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+            socklen_t sl = sizeof ua; getsockname(udp, (struct sockaddr *)&ua, &sl);
+            uint16_t audio_port = ntohs(ua.sin_port);
+            pid_t pid = fork();
+            if (pid == 0) {                 /* sidecar */
+                close(sv[0]);
+                _exit(oc_audio_sidecar_run(sv[1], udp, &g_stop));
+            }
+            close(sv[1]); close(udp);       /* the sidecar owns these now */
+            if (pid > 0) {
+                oc_netloop_set_audio(sv[0], audio_port);
+                fprintf(stderr, "openchimed: audio sidecar pid %d, UDP :%u\n", (int)pid, audio_port);
+            } else { close(sv[0]); }
+        } else if (udp >= 0) { close(udp); }
+    }
 
     /* Serve the binary protocol until a shutdown signal. */
     oc_netloop_run(proto_port, &tls, db, &g_stop);

@@ -338,10 +338,14 @@ the requirement says so explicitly rather than implying one.
 
 - **REQ-150.** A user has been able to start or join a server-relayed audio
   call scoped to a channel or a direct message. No peer-to-peer or ICE
-  negotiation path has existed (ARCH-18).
+  negotiation path has existed (ARCH-18). Built (server side): `CALL_JOIN`
+  forms/joins the channel's call and returns a UDP media endpoint + token.
 - **REQ-151.** Audio has been encoded with Opus and relayed over an isolated
   UDP-based sidecar process, kept out of the daemon's TCP event loop so a
-  call cannot starve message delivery on the same tenant (ARCH-18).
+  call cannot starve message delivery on the same tenant (ARCH-18). Built: the
+  forked `audio_sidecar` relays opaque Opus payloads over UDP (ARCH-28/31/73);
+  the daemon never touches the codec. The client-side Opus encode/decode is
+  Phase-2 client work.
 - **REQ-152.** A participant's connection loss during a call has not
   terminated the call for other participants; the daemon has continued
   relaying for remaining participants and has allowed the disconnected
