@@ -12,8 +12,10 @@ OpenSSL and LibreSSL for fit with this project's constraints:
 
 - Lean, pure-C, and small-footprint — matches the 256MB-per-tenant target
   (ARCH-4, REQ-210).
-- Trivially vendored and cross-compiled to Alpine, Windows, and macOS, which the
-  pure-C client (ARCH-11) needs across all three; no reliance on a system TLS.
+- Trivially vendored and portable across the platforms the client targets: the
+  shared C app-core (ARCH-74) links it on every host, and each native frontend
+  builds it with its own toolchain (the TUI on the host, like the daemon); no
+  reliance on a system TLS.
 - In-process X.509 certificate *writing* (`x509write`), so the daemon mints its
   own self-signed cert without shelling out to `openssl`.
 - A verify callback for client-side TOFU pinning, and standard CA verification
@@ -22,8 +24,8 @@ OpenSSL and LibreSSL for fit with this project's constraints:
 **Why vendored, not the distro package:** Ubuntu ships mbedTLS 2.28 and Alpine
 ships 3.6.x, whose APIs are not source-compatible. Pinning one version from
 source gives local, CI, and the Docker image an identical library and avoids
-`#ifdef` version shims. This mirrors how the sibling project openblocks vendors
-raylib via a build script.
+`#ifdef` version shims. The client's notcurses TUI toolkit is vendored + pinned
+the same way (ARCH-75), for the same reason.
 
 ## Trust model (ARCH-10)
 

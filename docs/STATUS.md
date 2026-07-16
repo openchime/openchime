@@ -107,7 +107,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 
 | REQ | Status | Notes |
 |-----|--------|-------|
-| 200 Linux/Win/macOS/iOS/Android clients | 🟡 | Windows `.exe` cross-compiles (skeleton UI); other platforms ⛔. Daemon is Linux-only (epoll/eventfd). |
+| 200 Linux/Win/macOS/iOS/Android clients | 🟡 | Client pivoted to **one shared C app-core + native UI per platform** (ARCH-74, tdlib model — supersedes the raylib/Windows-cross-compile plan). The app-core (`client/core/`: net thread, queues, view-model + reducers, `oc_client` facade) is **built and headless-tested** (`tests/test_client_core.c` drives it against an in-process daemon; `make core` compile-check, linked into `make test`). First frontend is a **notcurses TUI** (ARCH-75, in progress); native Win32/AppKit/Android/DOM frontends pending. Daemon is Linux-only (epoll/eventfd). |
 | 210 lean/standard memory profile | ✅ | **Measured** (`Scripts/bench.sh`): ~5 MB baseline + **~50 KB RSS per idle connection**, so a few hundred connections sit in ~15–30 MB and low-thousands stay within the 256 MB lean profile. Message round-trip p50 ~4 ms, p99 ~20–40 ms under concurrency. |
 | 211 low-hundreds concurrent connections | ✅ | **Measured**: hundreds of concurrent pinned-TLS connections held in a small fraction of the lean profile. Connection *setup* is bounded by the 600k-iteration PBKDF2 auth on the single writer (~6–7 logins/s), so a burst of simultaneous logins queues there; steady-state is cheap. `OC_NETLOOP_MAX_FD=4096`. |
 
@@ -174,9 +174,12 @@ daemon-owned sessions and revocation, roles + full tenant administration,
 public/private channels, messaging with edit/delete, reactions, threads, and
 full-text search — all reachable over the wire and tested end-to-end.
 
-The **largest missing surface** is a real **client** beyond the Phase-1 skeleton
-(the only consumer of all the above); the remaining server-side gap is **mobile
-push transport** (REQ-132/133). **Server-relayed audio** (REQ-150–152) is now
+The **largest missing surface** is a usable **client frontend**. The client was
+re-architected to a shared, frontend-agnostic **C app-core** (ARCH-74) — network
+thread, view-model, and reducers, driven headlessly against the in-process daemon
+in CI — which is now **built**; what remains is the first real frontend over it,
+a **notcurses TUI** (ARCH-75, in progress), and the later native GUIs. The
+remaining server-side gap is **mobile push transport** (REQ-132/133). **Server-relayed audio** (REQ-150–152) is now
 built end-to-end — call signaling + a forked UDP relay sidecar — with only the
 client-side Opus/UDP left (Phase-2 client work). Presence/typing (REQ-120/121) is
 built and tested end-to-end, as are **notification settings** (REQ-130/131:

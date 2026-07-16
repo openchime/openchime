@@ -76,7 +76,24 @@ model; translate input to intents }, stop.
   mbedTLS (identical lib across local/CI), built `--disable-multimedia`. **The
   TUI is text-only and never renders graphics — no sixel/kitty images, ever** —
   so the multimedia disable is permanent and the dependency footprint stays at
-  notcurses + libunistring. Built on the host like the daemon.
+  notcurses + libunistring. Built on the host like the daemon (`make tui`).
+
+  **Interaction model — modeless (weechat/irssi/Slack), not modal.** The input
+  line is always ready to type a message (Enter sends); actions are
+  `/`-commands (`/join`, `/dm`, `/react`, `/thread`, `/search`, …) and
+  navigation is Ctrl/Alt chords (switch buffer, scroll, quick-jump). A chat app's
+  reflex is "type and hit Enter"; a modal/vim scheme taxes every message with an
+  `i` first, so it's rejected. **Loop:** notcurses on the main thread, draining
+  `oc_client` events each iteration and reading input with a short timeout (the
+  "read events at frame start" shape); a wakeup fd on the client queue is a later
+  optimization if idle cost ever matters. **Layout** is planes (sidebar / message
+  pane / status+composer / overlays for thread & search), re-laid-out on resize;
+  the message pane renders its visible window each frame. **Build order:** a lean
+  core loop first (sidebar, focus/switch, history backfill on open, live
+  messages, send, presence dots, unread, scrollback, reflow, per-nick colors),
+  then **reactions display** as the next increment — it's cheap and it exercises
+  the exact wide-char/emoji correctness that justified notcurses. Threads,
+  edit/delete UX, typing, and attachment download follow.
 - **Windows (later):** Win32/WinUI (C++/WinRT or C#) over the C core.
 - **macOS/iOS (later):** AppKit/UIKit (Swift) over the core.
 - **Android (later):** Android views (Kotlin) over the core.
@@ -123,8 +140,9 @@ a dev machine.
 
 ## 8. Roadmap
 
-- **Now:** app-core + TUI — connect, auth, live messages across channels,
-  presence, send; headless core test in CI.
+- **Now:** app-core (done — connect, auth, live messages, presence, send; headless
+  core test in CI) → the notcurses TUI, lean core loop first (sidebar, backfill on
+  open, send, presence, unread, scrollback), then reactions display.
 - **Next:** store + reconnect/offline; auth completeness (local + OIDC);
   attachments (chunked up/download) and the **audio client** (Opus encode/decode
   + UDP to the sidecar — the deferred half of REQ-150/151).
