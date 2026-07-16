@@ -37,6 +37,7 @@ void   oc_ev_free(oc_ev *e);
 /* UI thread -> net thread */
 enum {
     OC_CMD_SEND = 1,       /* send `body` to `channel_id` */
+    OC_CMD_BACKFILL,       /* request history for `channel_id` (from id 0) */
     OC_CMD_QUIT
 };
 

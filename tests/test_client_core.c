@@ -15,8 +15,12 @@
 #include "tls.h"
 #include "check.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -32,6 +36,25 @@ static void *core_loop_thread(void *p) {
     struct core_loop_arg *a = (struct core_loop_arg *)p;
     oc_netloop_run(a->port, a->srv, a->dbw, &a->stop);
     return NULL;
+}
+
+/* Wait until the in-process daemon accepts TCP on `port` (the netloop thread is
+ * spawned concurrently). oc_client's connect does not retry, so starting a
+ * client before the listener is up would lose the startup race — the itest's
+ * client_open handles this by retrying connect; here we gate on readiness. */
+static void wait_port_ready(int port) {
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((uint16_t)port);
+    for (int i = 0; i < 500; i++) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd >= 0 && connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) { close(fd); return; }
+        if (fd >= 0) close(fd);
+        struct timespec ts = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
 }
 
 /* Tick the client and sleep briefly, up to ~5s, until `cond(model)` holds.
@@ -59,8 +82,19 @@ static int channel_has_body(const oc_model *m, uint64_t cid, const char *body) {
     return 0;
 }
 
+static int channel_unread(const oc_model *m, uint64_t cid) {
+    for (size_t i = 0; i < m->n_channels; i++)
+        if (m->channels[i].channel_id == cid) return m->channels[i].unread;
+    return -1;
+}
+
 int run_client_core_tests(void) {
-    printf("test_client_core: connect+auth, channel-list populate, send round-trip\n");
+    printf("test_client_core: connect+auth, channel-list, send round-trip, unread, backfill\n");
+
+    /* The daemon opens its blob store at netloop startup; point it at a build-local
+     * dir (the /data/blobs default isn't writable in the test sandbox), matching
+     * how itest_netloop provisions it. */
+    setenv("OPENCHIME_BLOB_DIR", "build/itest_core_blobs", 1);
 
     oc_tls_server srv;
     CHECK(oc_tls_server_init(&srv, NULL, NULL) == 0);
@@ -72,8 +106,10 @@ int run_client_core_tests(void) {
     CHECK(dbw != NULL);
     if (!dbw) { oc_tls_server_free(&srv); return failures; }
 
-    /* The account the core authenticates as (client sends "user:pass"). */
-    CHECK(oc_dbwriter_register_local(dbw, "dana", "pw-dana", OC_ROLE_OWNER, 2048) != 0);
+    /* Accounts the cores authenticate as (client sends "user:pass"). */
+    CHECK(oc_dbwriter_register_local(dbw, "dana", "pw-dana", OC_ROLE_OWNER,  2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw, "erik", "pw-erik", OC_ROLE_MEMBER, 2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw, "faye", "pw-faye", OC_ROLE_MEMBER, 2048) != 0);
 
     struct core_loop_arg arg;
     arg.port = 19000 + (int)(getpid() % 2000);
@@ -82,24 +118,56 @@ int run_client_core_tests(void) {
     arg.stop = 0;
     pthread_t th;
     CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
+    wait_port_ready(arg.port);
 
-    oc_client *cl = oc_client_start("127.0.0.1", arg.port, "dana:pw-dana");
-    CHECK(cl != NULL);
+    oc_client *a = oc_client_start("127.0.0.1", arg.port, "dana:pw-dana");
+    oc_client *b = oc_client_start("127.0.0.1", arg.port, "erik:pw-erik");
+    CHECK(a != NULL);
+    CHECK(b != NULL);
 
-    if (cl) {
-        /* Auth completes: the model reports connected+authed with our user id. */
-        CHECK(WAIT_FOR(cl, m->authed && m->user_id != 0));
-        const oc_model *mm = oc_client_model(cl);
-        CHECK(mm->connected);
+    if (a && b) {
+        /* Auth completes: each model reports connected+authed with its user id,
+         * and the post-auth LIST_CHANNELS populates the default channel (id 1). */
+        CHECK(WAIT_FOR(a, m->authed && m->user_id != 0));
+        CHECK(WAIT_FOR(b, m->authed && m->user_id != 0));
+        CHECK(oc_client_model(a)->connected);
+        CHECK(WAIT_FOR(a, oc_model_channel((oc_model *)m, 1) != NULL));
+        CHECK(WAIT_FOR(b, oc_model_channel((oc_model *)m, 1) != NULL));
 
-        /* The post-auth LIST_CHANNELS populates the default channel (id 1). */
-        CHECK(WAIT_FOR(cl, oc_model_channel((oc_model *)m, 1) != NULL));
+        /* dana sends: it round-trips to her own model as a BROADCAST (channel 1),
+         * and reaches erik live. erik counts it unread (author != self). */
+        oc_client_send(a, 1, "hello from the core");
+        CHECK(WAIT_FOR(a, channel_has_body(m, 1, "hello from the core")));
+        CHECK(WAIT_FOR(b, channel_has_body(m, 1, "hello from the core") && channel_unread(m, 1) == 1));
 
-        /* A sent message round-trips back as a BROADCAST folded into channel 1. */
-        oc_client_send(cl, 1, "hello from the core");
-        CHECK(WAIT_FOR(cl, channel_has_body(m, 1, "hello from the core")));
+        /* Marking channel 1 read clears erik's unread. */
+        oc_client_mark_read(b, 1);
+        oc_client_tick(b);
+        CHECK(channel_unread(oc_client_model(b), 1) == 0);
 
-        oc_client_stop(cl);
+        /* dana's own send never counts as unread for her. */
+        CHECK(channel_unread(oc_client_model(a), 1) == 0);
+
+        /* A second message, then a fresh client (faye) that was not connected for
+         * either: it backfills channel 1 and sees the full history replayed. */
+        oc_client_send(a, 1, "second line for history");
+        CHECK(WAIT_FOR(b, channel_has_body(m, 1, "second line for history")));
+
+        oc_client *c = oc_client_start("127.0.0.1", arg.port, "faye:pw-faye");
+        CHECK(c != NULL);
+        if (c) {
+            CHECK(WAIT_FOR(c, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+            oc_client_backfill(c, 1);
+            CHECK(WAIT_FOR(c, channel_has_body(m, 1, "hello from the core") &&
+                              channel_has_body(m, 1, "second line for history")));
+            oc_client_stop(c);
+        }
+
+        oc_client_stop(a);
+        oc_client_stop(b);
+    } else {
+        if (a) oc_client_stop(a);
+        if (b) oc_client_stop(b);
     }
 
     arg.stop = 1;

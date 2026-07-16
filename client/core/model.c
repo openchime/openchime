@@ -33,6 +33,13 @@ oc_channel *oc_model_channel(oc_model *m, uint64_t channel_id) {
     return NULL;
 }
 
+void oc_model_mark_read(oc_model *m, uint64_t channel_id) {
+    oc_channel *c = oc_model_channel(m, channel_id);
+    if (!c) return;
+    c->read_marker = c->high_water;
+    c->unread = 0;
+}
+
 static oc_channel *channel_ensure(oc_model *m, uint64_t channel_id) {
     oc_channel *c = oc_model_channel(m, channel_id);
     if (c) return c;
@@ -49,16 +56,17 @@ static oc_channel *channel_ensure(oc_model *m, uint64_t channel_id) {
     return c;
 }
 
-/* Append a message, stealing ownership of `*body` (set to NULL on success). */
-static void channel_append(oc_channel *c, uint64_t author_id, uint64_t message_id,
-                           uint64_t server_time, char **body) {
+/* Append a message, stealing ownership of `*body` (set to NULL on success).
+ * Returns 1 if a message was appended, 0 if it was a dedup/alloc no-op. */
+static int channel_append(oc_channel *c, uint64_t author_id, uint64_t message_id,
+                          uint64_t server_time, char **body) {
     /* Dedup on the per-channel high-water mark (ARCH-45). message_id 0 means the
      * server did not assign one (shouldn't happen for a BROADCAST) — keep it. */
-    if (message_id && message_id <= c->high_water) return;
+    if (message_id && message_id <= c->high_water) return 0;
     if (c->n_msgs == c->cap_msgs) {
         size_t cap = c->cap_msgs ? c->cap_msgs * 2 : 32;
         oc_msg *nm = realloc(c->msgs, cap * sizeof *nm);
-        if (!nm) return;
+        if (!nm) return 0;
         c->msgs = nm;
         c->cap_msgs = cap;
     }
@@ -69,6 +77,7 @@ static void channel_append(oc_channel *c, uint64_t author_id, uint64_t message_i
     msg->server_time = server_time;
     *body = NULL;
     if (message_id > c->high_water) c->high_water = message_id;
+    return 1;
 }
 
 static void presence_set(oc_model *m, uint64_t user_id, uint8_t status) {
@@ -119,7 +128,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     }
     case OC_EV_MESSAGE: {
         oc_channel *c = channel_ensure(m, e->channel_id);
-        if (c) channel_append(c, e->author_id, e->message_id, e->server_time, &e->body);
+        if (c && channel_append(c, e->author_id, e->message_id, e->server_time, &e->body)) {
+            /* Count as unread only messages from others past the read marker; a
+             * frontend clears this by marking the focused channel read. */
+            if (e->author_id != m->user_id && e->message_id > c->read_marker)
+                c->unread++;
+        }
         break;
     }
     case OC_EV_PRESENCE:

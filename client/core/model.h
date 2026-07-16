@@ -27,7 +27,10 @@ typedef struct {
     oc_msg  *msgs;
     size_t   n_msgs, cap_msgs;
     uint64_t high_water;   /* dedup mark: ignore message_id <= this (ARCH-45) */
+    uint64_t read_marker;  /* high_water as of the last mark-read; drives unread */
+    int      unread;       /* messages from others since the last mark-read */
     uint8_t  joined;
+    uint8_t  history_requested; /* a backfill has been asked for (once per open) */
 } oc_channel;
 
 typedef struct { uint64_t user_id; uint8_t status; } oc_presence_row;
@@ -52,6 +55,8 @@ void oc_model_apply(oc_model *m, oc_ev *e);
 
 /* Find a channel by id, or NULL. */
 oc_channel *oc_model_channel(oc_model *m, uint64_t channel_id);
+/* Clear a channel's unread count and advance its read marker to high_water. */
+void oc_model_mark_read(oc_model *m, uint64_t channel_id);
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);
 

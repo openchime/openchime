@@ -57,6 +57,26 @@ void oc_client_send(oc_client *c, uint64_t channel_id, const char *body) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_backfill(oc_client *c, uint64_t channel_id) {
+    if (!c) return;
+    /* Ask at most once per channel; a known channel gets its flag set, an
+     * unknown one is requested anyway (the reducer will create it on reply). */
+    oc_channel *ch = oc_model_channel(&c->model, channel_id);
+    if (ch) {
+        if (ch->history_requested) return;
+        ch->history_requested = 1;
+    }
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_BACKFILL);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_mark_read(oc_client *c, uint64_t channel_id) {
+    if (!c) return;
+    oc_model_mark_read(&c->model, channel_id);
+}
+
 void oc_client_stop(oc_client *c) {
     if (!c) return;
     oc_net_stop(c->net);   /* signals QUIT, joins the thread */

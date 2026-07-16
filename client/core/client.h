@@ -30,6 +30,14 @@ const oc_model *oc_client_model(oc_client *c);
 /* Queue a message to `channel_id` for the network thread to send. */
 void oc_client_send(oc_client *c, uint64_t channel_id, const char *body);
 
+/* Request history for `channel_id` (once per channel — a frontend calls this the
+ * first time a channel is opened). Replayed messages fold into the model. */
+void oc_client_backfill(oc_client *c, uint64_t channel_id);
+
+/* Mark `channel_id` read (clear its unread count). A frontend calls this for the
+ * focused channel. */
+void oc_client_mark_read(oc_client *c, uint64_t channel_id);
+
 /* Stop the network thread, drain remaining events, and free everything. */
 void oc_client_stop(oc_client *c);
 

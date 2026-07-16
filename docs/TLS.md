@@ -24,8 +24,8 @@ OpenSSL and LibreSSL for fit with this project's constraints:
 **Why vendored, not the distro package:** Ubuntu ships mbedTLS 2.28 and Alpine
 ships 3.6.x, whose APIs are not source-compatible. Pinning one version from
 source gives local, CI, and the Docker image an identical library and avoids
-`#ifdef` version shims. The client's notcurses TUI toolkit is vendored + pinned
-the same way (ARCH-75), for the same reason.
+`#ifdef` version shims. The client's TUI libraries (termbox2, utf8proc) are
+likewise vendored — as committed single-file source, both MIT (ARCH-75).
 
 ## Trust model (ARCH-10)
 

@@ -38,7 +38,15 @@ TEST_BIN  := build/tests
 CORE_SRC := $(wildcard client/core/*.c)
 CORE_INC := -Iclient/core
 
-.PHONY: all test integration core bench clean
+# --- Client TUI frontend (ARCH-75) --------------------------------------------
+# termbox2 (cell grid + input) + utf8proc (Unicode width/grapheme), both vendored
+# as committed MIT single-file source. Builds on the host like the daemon.
+TUI_SRC   := $(wildcard client/tui/*.c)
+UTF8PROC  := third_party/utf8proc/utf8proc.c
+TUI_INC   := $(CORE_INC) -Iclient/tui -Ithird_party/termbox2 -Ithird_party/utf8proc
+TUI_BIN   := build/openchime-tui
+
+.PHONY: all test integration core tui bench clean
 
 all: $(BIN)
 
@@ -81,6 +89,14 @@ core: $(CORE_SRC) $(SHARED_SRC) $(wildcard client/core/*.h shared/*.h) $(MBEDTLS
 	for f in $(CORE_SRC); do \
 	    $(CC) $(CFLAGS) $(INC) $(CORE_INC) -c $$f -o build/core/$$(basename $$f .c).o || exit 1; \
 	done
+
+# The TUI: app-core + shared wire + termbox2/utf8proc. -Wno-unused-result relaxes
+# one warning from the vendored termbox2 header (its read/write/strerror_r calls).
+tui: $(TUI_BIN)
+$(TUI_BIN): $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) \
+            $(wildcard client/tui/*.h client/core/*.h shared/*.h) $(MBEDTLS_A) | build
+	$(CC) $(CFLAGS) -Wno-unused-result $(INC) $(TUI_INC) \
+	    $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(MBEDTLS_LIBS) -lpthread -o $@
 
 build:
 	mkdir -p build

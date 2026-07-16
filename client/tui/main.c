@@ -1,0 +1,326 @@
+/*
+ * OpenChime TUI — the first frontend over the app-core (ARCH-74/75). termbox2
+ * gives the cell grid + input; utf8proc gives correct display width so emoji and
+ * CJK don't corrupt the layout. This is the lean core loop: a channel sidebar
+ * (with presence + unread), a wrapped scrolling message pane, and a modeless
+ * composer. All state/logic lives in oc_client; this file is pure view + input.
+ *
+ * Usage: openchime-tui <host> <port> [user:pass]
+ *        (credentials also read from $OPENCHIME_CRED = "user:pass")
+ *
+ * Keys: type + Enter to send · Tab next channel · ↑/↓ + PgUp/PgDn scroll ·
+ *       Ctrl-Q quit.
+ */
+
+#define TB_IMPL
+#include "termbox2.h"
+
+#include "utf8proc.h"
+
+#include "client.h"
+#include "model.h"
+#include "protocol.h"   /* OC_PRESENCE_* */
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define SIDEBAR_W 22
+#define COMPOSER_CAP 1024
+
+/* Distinct-ish colors for author nicks, picked by hashing the user id. */
+static const uintattr_t NICK_COLORS[] = {
+    TB_RED, TB_GREEN, TB_YELLOW, TB_BLUE, TB_MAGENTA, TB_CYAN, TB_WHITE
+};
+static uintattr_t nick_color(uint64_t uid) {
+    return NICK_COLORS[uid % (sizeof NICK_COLORS / sizeof NICK_COLORS[0])];
+}
+
+static int cp_width(int32_t cp) {
+    int w = utf8proc_charwidth(cp);
+    if (w < 0) return 0;         /* control/combining: no advance */
+    return w > 2 ? 2 : w;
+}
+
+/* Draw a UTF-8 string starting at (x,y), clipped to columns [x, xmax). Advances
+ * by each glyph's display width (utf8proc). Returns the next free column. */
+static int draw_clip(int x, int y, int xmax, const char *s, uintattr_t fg, uintattr_t bg) {
+    utf8proc_ssize_t len = (utf8proc_ssize_t)strlen(s), off = 0;
+    while (off < len && x < xmax) {
+        int32_t cp;
+        utf8proc_ssize_t n = utf8proc_iterate((const utf8proc_uint8_t *)s + off, len - off, &cp);
+        if (n <= 0) break;
+        off += n;
+        int w = cp_width(cp);
+        if (w == 0) continue;                 /* skip zero-width (combining/control) */
+        if (x + w > xmax) break;              /* a wide glyph won't fit the last cell */
+        tb_set_cell(x, y, (uint32_t)cp, fg, bg);
+        x += w;
+    }
+    return x;
+}
+
+static void fill_row(int y, int x0, int x1, uintattr_t bg) {
+    for (int x = x0; x < x1; x++) tb_set_cell(x, y, ' ', TB_DEFAULT, bg);
+}
+
+/* ---- a rebuilt-each-frame list of wrapped display rows for the message pane -- */
+
+typedef struct { char *s; uintattr_t fg; } row_t;
+typedef struct { row_t *v; size_t n, cap; } rows_t;
+
+static void rows_push(rows_t *r, char *s, uintattr_t fg) {
+    if (r->n == r->cap) {
+        size_t cap = r->cap ? r->cap * 2 : 64;
+        row_t *nv = realloc(r->v, cap * sizeof *nv);
+        if (!nv) { free(s); return; }
+        r->v = nv; r->cap = cap;
+    }
+    r->v[r->n].s = s; r->v[r->n].fg = fg; r->n++;
+}
+static void rows_free(rows_t *r) {
+    for (size_t i = 0; i < r->n; i++) free(r->v[i].s);
+    free(r->v);
+    r->v = NULL; r->n = r->cap = 0;
+}
+
+/* Wrap `text` to `width` display columns, pushing each row (with `fg`). A
+ * continuation row is prefixed with `indent` spaces. */
+static void wrap_push(rows_t *r, const char *text, uintattr_t fg, int width, int indent) {
+    if (width < 4) width = 4;
+    utf8proc_ssize_t len = (utf8proc_ssize_t)strlen(text), off = 0;
+    int first = 1;
+    do {
+        int avail = width - (first ? 0 : indent);
+        if (avail < 1) avail = 1;
+        int used = 0;
+        utf8proc_ssize_t start = off;
+        while (off < len) {
+            int32_t cp;
+            utf8proc_ssize_t n = utf8proc_iterate((const utf8proc_uint8_t *)text + off, len - off, &cp);
+            if (n <= 0) { off = len; break; }
+            int w = cp_width(cp);
+            if (used + w > avail) break;
+            used += w; off += n;
+        }
+        size_t blen = (size_t)(off - start);
+        char *row = malloc((size_t)indent + blen + 1);
+        if (!row) return;
+        size_t p = 0;
+        if (!first) for (int i = 0; i < indent; i++) row[p++] = ' ';
+        memcpy(row + p, text + start, blen); p += blen;
+        row[p] = '\0';
+        rows_push(r, row, fg);
+        first = 0;
+        if (off == start) break;              /* no progress (avail too small) — stop */
+    } while (off < len);
+}
+
+/* Build the wrapped rows for a channel's messages (oldest→newest). */
+static void build_rows(rows_t *r, const oc_channel *ch, uint64_t me, int width) {
+    char line[256];
+    for (size_t i = 0; i < ch->n_msgs; i++) {
+        const oc_msg *m = &ch->msgs[i];
+        char stamp[8] = "--:--";
+        if (m->server_time) {
+            time_t t = (time_t)(m->server_time / 1000);
+            struct tm tmv;
+            if (localtime_r(&t, &tmv)) strftime(stamp, sizeof stamp, "%H:%M", &tmv);
+        }
+        /* Header row: "HH:MM  nick" in the author's color ("you" for self). We
+         * don't have display names in the model yet, so ids stand in. */
+        if (m->author_id == me)
+            snprintf(line, sizeof line, "%s  you", stamp);
+        else
+            snprintf(line, sizeof line, "%s  user%llu", stamp, (unsigned long long)m->author_id);
+        char *hdr = malloc(strlen(line) + 1);
+        if (hdr) { strcpy(hdr, line); rows_push(r, hdr, nick_color(m->author_id) | TB_BOLD); }
+        /* Body rows, indented, default color. */
+        wrap_push(r, m->body ? m->body : "", TB_DEFAULT, width, 4);
+    }
+}
+
+/* ---- rendering ------------------------------------------------------------- */
+
+static const char *presence_dot(uint8_t status) {
+    switch (status) {
+        case OC_PRESENCE_ONLINE: return "●";
+        case OC_PRESENCE_AWAY:   return "◐";
+        default:                 return "○";
+    }
+}
+
+static void render(oc_client *cl, size_t focus, const char *composer,
+                   size_t clen, int scroll) {
+    (void)clen;
+    const oc_model *m = oc_client_model(cl);
+    int W = tb_width(), H = tb_height();
+    if (W < SIDEBAR_W + 10 || H < 4) { tb_clear(); return; }
+    tb_clear();
+
+    /* Sidebar. */
+    draw_clip(1, 0, SIDEBAR_W, "CHANNELS", TB_CYAN | TB_BOLD, TB_DEFAULT);
+    for (size_t i = 0; i < m->n_channels && (int)i + 1 < H - 1; i++) {
+        const oc_channel *c = &m->channels[i];
+        uintattr_t bg = (i == focus) ? TB_BLUE : TB_DEFAULT;
+        uintattr_t fg = (i == focus) ? TB_WHITE | TB_BOLD : TB_DEFAULT;
+        int y = (int)i + 1;
+        fill_row(y, 0, SIDEBAR_W, bg);
+        char label[128];
+        if (c->unread > 0)
+            snprintf(label, sizeof label, "# %s (%d)", c->name ? c->name : "…", c->unread);
+        else
+            snprintf(label, sizeof label, "# %s", c->name ? c->name : "…");
+        draw_clip(1, y, SIDEBAR_W, label, fg, bg);
+    }
+    for (int y = 0; y < H; y++) tb_set_cell(SIDEBAR_W, y, '|', TB_DEFAULT, TB_DEFAULT);
+
+    int px0 = SIDEBAR_W + 1, pxmax = W;          /* message pane columns */
+    int pane_top = 1, pane_bot = H - 2;          /* rows: [top, bot) */
+    int pane_h = pane_bot - pane_top;
+    if (pane_h < 1) pane_h = 1;
+
+    /* Title bar (row 0 over the pane). */
+    const oc_channel *fc = (focus < m->n_channels) ? &m->channels[focus] : NULL;
+    char title[160];
+    if (fc) snprintf(title, sizeof title, " #%s", fc->name ? fc->name : "…");
+    else    snprintf(title, sizeof title, " (no channel)");
+    fill_row(0, px0, W, TB_BLUE);
+    draw_clip(px0, 0, pxmax, title, TB_WHITE | TB_BOLD, TB_BLUE);
+
+    /* Message rows for the focused channel, showing the window ending `scroll`
+     * rows above the bottom. */
+    if (fc) {
+        rows_t rows = {0};
+        build_rows(&rows, fc, m->user_id, pxmax - px0);
+        int total = (int)rows.n;
+        int end = total - scroll;                /* one past the last visible row */
+        if (end > total) end = total;
+        if (end < 0) end = 0;
+        int start = end - pane_h;
+        if (start < 0) start = 0;
+        int y = pane_top + (pane_h - (end - start)); /* bottom-align when few rows */
+        for (int i = start; i < end; i++, y++)
+            draw_clip(px0, y, pxmax, rows.v[i].s, rows.v[i].fg, TB_DEFAULT);
+        rows_free(&rows);
+    }
+
+    /* Status line (row H-2). */
+    char status[200];
+    const char *conn = m->authed ? "online" : (m->connected ? "connecting…" : "offline");
+    snprintf(status, sizeof status, " %s · %s%s", conn, m->status,
+             scroll > 0 ? "  [scrolled]" : "");
+    fill_row(H - 2, 0, W, TB_DEFAULT);
+    draw_clip(0, H - 2, W, status, TB_YELLOW, TB_DEFAULT);
+    if (fc) draw_clip(SIDEBAR_W - 2, H - 2, SIDEBAR_W, presence_dot(OC_PRESENCE_ONLINE),
+                      TB_GREEN, TB_DEFAULT);
+
+    /* Composer (row H-1). */
+    fill_row(H - 1, 0, W, TB_DEFAULT);
+    int cx = draw_clip(0, H - 1, W, "> ", TB_GREEN | TB_BOLD, TB_DEFAULT);
+    cx = draw_clip(cx, H - 1, W, composer, TB_DEFAULT, TB_DEFAULT);
+    if (cx < W) tb_set_cell(cx, H - 1, ' ', TB_DEFAULT, TB_REVERSE);   /* cursor */
+
+    tb_present();
+}
+
+/* ---- input helpers --------------------------------------------------------- */
+
+/* Remove the last full UTF-8 character from `buf` (length *len). */
+static void backspace_utf8(char *buf, size_t *len) {
+    size_t n = *len;
+    if (n == 0) return;
+    n--;
+    while (n > 0 && (buf[n] & 0xC0) == 0x80) n--;   /* back over continuation bytes */
+    buf[n] = '\0';
+    *len = n;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 3) {
+        fprintf(stderr, "usage: %s <host> <port> [user:pass]\n", argv[0]);
+        return 2;
+    }
+    const char *host = argv[1];
+    int port = atoi(argv[2]);
+    const char *cred = argc > 3 ? argv[3] : getenv("OPENCHIME_CRED");
+    if (!cred) cred = "";
+
+    oc_client *cl = oc_client_start(host, port, cred);
+    if (!cl) { fprintf(stderr, "failed to start client\n"); return 1; }
+
+    if (tb_init() != TB_OK) {
+        fprintf(stderr, "failed to init terminal (need a tty)\n");
+        oc_client_stop(cl);
+        return 1;
+    }
+
+    char composer[COMPOSER_CAP];
+    size_t clen = 0;
+    composer[0] = '\0';
+    size_t focus = 0;
+    int scroll = 0;
+    uint64_t last_focus_cid = 0;
+    int running = 1;
+
+    while (running) {
+        oc_client_tick(cl);
+
+        const oc_model *m = oc_client_model(cl);
+        if (focus >= m->n_channels) focus = m->n_channels ? m->n_channels - 1 : 0;
+
+        /* Lazy backfill + keep the focused channel marked read. */
+        if (focus < m->n_channels) {
+            uint64_t cid = m->channels[focus].channel_id;
+            oc_client_backfill(cl, cid);
+            oc_client_mark_read(cl, cid);
+            if (cid != last_focus_cid) { scroll = 0; last_focus_cid = cid; }
+        }
+
+        render(cl, focus, composer, clen, scroll);
+
+        struct tb_event ev;
+        int rc = tb_peek_event(&ev, 30);
+        if (rc != TB_OK) continue;               /* timeout: loop to re-tick + redraw */
+        if (ev.type == TB_EVENT_RESIZE) continue;
+        if (ev.type != TB_EVENT_KEY) continue;
+
+        size_t nch = oc_client_model(cl)->n_channels;
+        if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) {
+            running = 0;
+        } else if (ev.key == TB_KEY_ENTER) {
+            if (clen > 0 && focus < nch) {
+                oc_client_send(cl, oc_client_model(cl)->channels[focus].channel_id, composer);
+                clen = 0; composer[0] = '\0'; scroll = 0;
+            }
+        } else if (ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2) {
+            backspace_utf8(composer, &clen);
+        } else if (ev.key == TB_KEY_TAB) {
+            if (nch) focus = (focus + 1) % nch;
+        } else if (ev.key == TB_KEY_ARROW_UP) {
+            scroll += 1;
+        } else if (ev.key == TB_KEY_ARROW_DOWN) {
+            if (scroll > 0) scroll -= 1;
+        } else if (ev.key == TB_KEY_PGUP) {
+            scroll += (tb_height() - 3) / 2;
+        } else if (ev.key == TB_KEY_PGDN) {
+            scroll -= (tb_height() - 3) / 2;
+            if (scroll < 0) scroll = 0;
+        } else if (ev.ch != 0) {
+            /* A typed codepoint: append its UTF-8 encoding to the composer. */
+            utf8proc_uint8_t enc[4];
+            utf8proc_ssize_t k = utf8proc_encode_char((utf8proc_int32_t)ev.ch, enc);
+            if (k > 0 && clen + (size_t)k + 1 < sizeof composer) {
+                memcpy(composer + clen, enc, (size_t)k);
+                clen += (size_t)k;
+                composer[clen] = '\0';
+            }
+        }
+    }
+
+    tb_shutdown();
+    oc_client_stop(cl);
+    return 0;
+}

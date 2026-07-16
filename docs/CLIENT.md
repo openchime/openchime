@@ -69,30 +69,34 @@ model; translate input to intents }, stop.
 
 - **TUI (`client/tui/`, first):** a terminal cell grid — a channel sidebar (with
   presence), a scrolling wrapped message pane, and an input line — built on
-  **notcurses** (ARCH-75). notcurses is chosen for one reason that matters to a
-  chat client: **correct Unicode wide-character / grapheme width**, so emoji
-  reactions (REQ-070/071) and wrapped messages don't corrupt the layout the way
-  they do under ncurses/termbox2. It is **vendored + pinned from source** like
-  mbedTLS (identical lib across local/CI), built `--disable-multimedia`. **The
-  TUI is text-only and never renders graphics — no sixel/kitty images, ever** —
-  so the multimedia disable is permanent and the dependency footprint stays at
-  notcurses + libunistring. Built on the host like the daemon (`make tui`).
+  **termbox2** (the cell grid + input) and **utf8proc** (Unicode width +
+  grapheme breaking), both **MIT**, both vendored as committed single-file source
+  (ARCH-75). The one property that matters to a chat client is **correct
+  wide-character / emoji width**, so emoji reactions (REQ-070/071) and wrapped
+  messages don't corrupt the layout — utf8proc's `utf8proc_charwidth` + UAX #29
+  segmentation (with bundled UCD tables) gives us that without hand-rolling.
+  **notcurses was rejected on licensing** — it hard-depends on libunistring
+  (LGPL); termbox2 + utf8proc keep the whole client permissive. **The TUI is
+  text-only and never renders graphics — no images, ever.** Built on the host
+  like the daemon (`make tui`), zero transitive dependencies.
 
   **Interaction model — modeless (weechat/irssi/Slack), not modal.** The input
   line is always ready to type a message (Enter sends); actions are
   `/`-commands (`/join`, `/dm`, `/react`, `/thread`, `/search`, …) and
   navigation is Ctrl/Alt chords (switch buffer, scroll, quick-jump). A chat app's
   reflex is "type and hit Enter"; a modal/vim scheme taxes every message with an
-  `i` first, so it's rejected. **Loop:** notcurses on the main thread, draining
-  `oc_client` events each iteration and reading input with a short timeout (the
-  "read events at frame start" shape); a wakeup fd on the client queue is a later
-  optimization if idle cost ever matters. **Layout** is planes (sidebar / message
-  pane / status+composer / overlays for thread & search), re-laid-out on resize;
-  the message pane renders its visible window each frame. **Build order:** a lean
-  core loop first (sidebar, focus/switch, history backfill on open, live
-  messages, send, presence dots, unread, scrollback, reflow, per-nick colors),
-  then **reactions display** as the next increment — it's cheap and it exercises
-  the exact wide-char/emoji correctness that justified notcurses. Threads,
+  `i` first, so it's rejected. **Loop:** termbox2 on the main thread, draining
+  `oc_client` events each iteration and polling input with a short timeout
+  (`tb_peek_event`, the "read events at frame start" shape); a wakeup fd on the
+  client queue is a later optimization if idle cost ever matters. **Layout** is
+  regions (sidebar / message pane / status+composer / overlays for thread &
+  search) drawn cell-by-cell, re-laid-out on the resize event; the message pane
+  renders its visible window each frame, measuring glyph width with utf8proc.
+  **Build order:** a lean core loop first (sidebar, focus/switch, history backfill
+  on open, live messages, send, presence dots, unread, scrollback, reflow,
+  per-nick colors), then **reactions display** as the next increment — it's cheap
+  and it exercises the exact wide-char/emoji correctness that justified the
+  toolkit. Threads,
   edit/delete UX, typing, and attachment download follow.
 - **Windows (later):** Win32/WinUI (C++/WinRT or C#) over the C core.
 - **macOS/iOS (later):** AppKit/UIKit (Swift) over the core.
@@ -131,17 +135,18 @@ reconnect with the stored token. Instance+email → DNS resolution (SRV port >
 ## 7. Build
 
 The core + TUI build on the host (a `make tui` target linking `client/core/*.c` +
-`client/tui/*.c` + `shared/*` + notcurses), like the daemon — no cross-compile,
-no container. notcurses is vendored + pinned from source (a `scripts/`-built
-tarball into `third_party/`, `--disable-multimedia`), the same discipline as
-mbedTLS (ARCH-51/75), so local and CI share one library. Native GUIs build with
-their platform toolchains over the core; release artifacts come from CI/CD, never
-a dev machine.
+`client/tui/*.c` + `shared/*` + `third_party/utf8proc/utf8proc.c`, with
+`termbox2.h` compiled `TB_IMPL` in one TU), like the daemon — no cross-compile,
+no container, no external build system. termbox2 and utf8proc are **vendored as
+committed single-file source** in `third_party/` (like jsmn, pinned to termbox2
+v2.5.0 / utf8proc v2.11.3), both MIT, so local and CI share identical sources with
+zero transitive dependencies (ARCH-75). Native GUIs build with their platform
+toolchains over the core; release artifacts come from CI/CD, never a dev machine.
 
 ## 8. Roadmap
 
 - **Now:** app-core (done — connect, auth, live messages, presence, send; headless
-  core test in CI) → the notcurses TUI, lean core loop first (sidebar, backfill on
+  core test in CI) → the termbox2 TUI, lean core loop first (sidebar, backfill on
   open, send, presence, unread, scrollback), then reactions display.
 - **Next:** store + reconnect/offline; auth completeness (local + OIDC);
   attachments (chunked up/download) and the **audio client** (Opus encode/decode
