@@ -1078,6 +1078,66 @@ static void test_notify_prefs_vertical(int port, const uint8_t *pin) {
     client_close(&a2);
 }
 
+/* Audio call signaling over the wire (REQ-150/152): joining a channel's call
+ * returns a roster and pushes roster updates to the other participants; a
+ * disconnect mid-call drops the participant but keeps the call for the rest; a
+ * non-member is refused. (Phase A — signaling only, no audio relay yet.) */
+static void test_call_vertical(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0); CHECK(do_handshake(&a) == 0);
+    CHECK(client_open(&b, port, pin) == 0); CHECK(do_handshake(&b) == 0);
+    uint64_t ua = 0, ub = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+
+    oc_header hdr; oc_rbuf p; uint8_t buf[128]; oc_wbuf w; uint64_t parts[32];
+
+    /* alice joins the default channel's call -> CALL_JOINED with just herself. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_call_join cj = { OC_DEFAULT_CHANNEL };
+    CHECK(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_JOINED);
+    oc_call_joined jd; CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK);
+    CHECK(jd.channel_id == OC_DEFAULT_CHANNEL && jd.count == 1 && parts[0] == ua);
+
+    /* bob joins -> bob gets a 2-person roster; alice gets a CALL_ROSTER update. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cj) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_JOINED);
+    CHECK(oc_decode_call_joined(&p, &jd, parts, 32) == OC_OK && jd.count == 2);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_ROSTER);
+    oc_call_roster ro; CHECK(oc_decode_call_roster(&p, &ro, parts, 32) == OC_OK && ro.count == 2);
+
+    /* bob disconnects mid-call -> alice's roster drops to just herself (REQ-152). */
+    client_close(&b);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CALL_ROSTER);
+    CHECK(oc_decode_call_roster(&p, &ro, parts, 32) == OC_OK && ro.count == 1 && parts[0] == ua);
+
+    /* A non-member is refused: carol tries to join a private channel's call. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_channel cc = { oc_slice_str("callvault"), 0 };
+    CHECK(oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cc) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_CHANNEL_INFO);
+    oc_channel_info ci; CHECK(oc_decode_channel_info(&p, &ci) == OC_OK);
+    uint64_t priv = ci.channel_id;
+
+    client cclient;
+    CHECK(client_open(&cclient, port, pin) == 0); CHECK(do_handshake(&cclient) == 0);
+    uint64_t uc = 0; CHECK(do_auth(&cclient, "carol", "pw", &uc) == 0);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_call_join cjv = { priv };
+    CHECK(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &cjv) == OC_OK);
+    CHECK(send_frame(&cclient, buf, w.len) == 0);
+    CHECK(read_frame(&cclient, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ERROR);
+    oc_error er; CHECK(oc_decode_error(&p, &er) == OC_OK && er.code == OC_ERR_NOT_A_MEMBER);
+
+    client_close(&cclient);
+    client_close(&a);
+}
+
 /* Direct messages over the wire (REQ-050): OPEN_DM creates a kind=DM channel,
  * pushes a CHANNEL_INFO to the peer, the two participants exchange messages
  * through it, and a third user cannot post to it. */
@@ -1503,6 +1563,7 @@ int run_netloop_tests(void) {
         test_attachments_vertical(arg.port, pin);
         test_webhook_vertical(arg.port, pin);
         test_notify_prefs_vertical(arg.port, pin);
+        test_call_vertical(arg.port, pin);
         test_concurrent_load(arg.port, pin);
         test_send_rate_limit(arg.port, pin);
         test_out_buffer_cap(arg.port, pin, dbw, flooder);

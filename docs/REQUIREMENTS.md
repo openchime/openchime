@@ -345,7 +345,12 @@ the requirement says so explicitly rather than implying one.
 - **REQ-152.** A participant's connection loss during a call has not
   terminated the call for other participants; the daemon has continued
   relaying for remaining participants and has allowed the disconnected
-  participant to rejoin. **[needs ARCH decision]**
+  participant to rejoin. Resolved (ARCH-73): the call roster is ephemeral
+  net-thread state; a `CALL_LEAVE` or TCP disconnect drops the participant and
+  re-rosters the rest, but the call persists while ≥1 participant remains, and
+  rejoin is a fresh `CALL_JOIN` (new token). The media-side mirror is a UDP
+  silence timeout in the sidecar. **Signaling built (PROTOCOL.md §5.17); the UDP
+  relay + timeout land in the sidecar milestone.**
 
 ### 6.3 Video (Out of Scope)
 

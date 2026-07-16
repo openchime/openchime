@@ -537,6 +537,38 @@ static void test_notify_frames(void) {
     }
 }
 
+static void test_call_frames(void) {
+    {
+        oc_call_join in = { 7 };
+        ROUNDTRIP(oc_encode_call_join(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_JOIN, h, p);
+        oc_call_join out; CHECK(oc_decode_call_join(&p, &out) == OC_OK && out.channel_id == 7);
+    }
+    {
+        oc_call_leave in = { 7 };
+        ROUNDTRIP(oc_encode_call_leave(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_LEAVE, h, p);
+        oc_call_leave out; CHECK(oc_decode_call_leave(&p, &out) == OC_OK && out.channel_id == 7);
+    }
+    {
+        uint64_t parts[3] = { 10, 20, 30 };
+        uint8_t tok[16]; for (int i = 0; i < 16; i++) tok[i] = (uint8_t)(i + 1);
+        oc_call_joined in = { 7, 7, 41234, { tok, 16 }, 3, parts };
+        ROUNDTRIP(oc_encode_call_joined(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_JOINED, h, p);
+        oc_call_joined out; uint64_t got[8];
+        CHECK(oc_decode_call_joined(&p, &out, got, 8) == OC_OK);
+        CHECK(out.channel_id == 7 && out.call_id == 7 && out.udp_port == 41234);
+        CHECK(out.token.len == 16 && out.count == 3);
+        CHECK(got[0] == 10 && got[1] == 20 && got[2] == 30);
+    }
+    {
+        uint64_t parts[2] = { 10, 20 };
+        oc_call_roster in = { 7, 7, 2, parts };
+        ROUNDTRIP(oc_encode_call_roster(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CALL_ROSTER, h, p);
+        oc_call_roster out; uint64_t got[8];
+        CHECK(oc_decode_call_roster(&p, &out, got, 8) == OC_OK && out.count == 2);
+        CHECK(got[0] == 10 && got[1] == 20);
+    }
+}
+
 static void test_webhook_frames(void) {
     {
         oc_create_webhook in = { 9, oc_slice_str("github") };
@@ -881,6 +913,7 @@ int run_protocol_tests(void) {
     test_attachment_frames();
     test_webhook_frames();
     test_notify_frames();
+    test_call_frames();
     test_backfill_and_error();
     test_size_limits();
     test_malformed();

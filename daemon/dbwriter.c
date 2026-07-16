@@ -1925,6 +1925,23 @@ static oc_dbres *process_typing(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Authorize joining a channel's audio call (REQ-150): the ordinary channel-read
+ * gate. The net thread owns the ephemeral call roster; this is just the access
+ * check. Read (query connection). */
+static oc_dbres *process_call_auth(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+    r->user_id = j->user_id;
+    if (channel_read_access(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_CALL_AUTH;
+    } else {
+        r->type = OC_RES_CALL_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;
+    }
+    return r;
+}
+
 /* Attachments (REQ-140/141, ARCH-69/70). CREATE mints a pending row (message_id
  * NULL, sha256 NULL) for an upload targeting a channel the caller may post to,
  * and hands back the row id + an opaque storage key so the net thread can open
@@ -2296,7 +2313,8 @@ static int is_read_job(int type) {
            type == OC_JOB_LIST_CHANNELS || type == OC_JOB_LIST_USERS ||
            type == OC_JOB_LIST_REACTIONS || type == OC_JOB_LIST_THREAD ||
            type == OC_JOB_TYPING || type == OC_JOB_ATTACH_LOOKUP ||
-           type == OC_JOB_LIST_WEBHOOKS || type == OC_JOB_LIST_NOTIFY_PREFS;
+           type == OC_JOB_LIST_WEBHOOKS || type == OC_JOB_LIST_NOTIFY_PREFS ||
+           type == OC_JOB_CALL_AUTH;
 }
 
 /* Dispatch a read-only job against `rdb`. */
@@ -2311,6 +2329,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_ATTACH_LOOKUP)  return process_attach_lookup(rdb, j);
     if (j->type == OC_JOB_LIST_WEBHOOKS)  return process_list_webhooks(rdb, j);
     if (j->type == OC_JOB_LIST_NOTIFY_PREFS) return process_list_notify_prefs(rdb, j);
+    if (j->type == OC_JOB_CALL_AUTH)      return process_call_auth(rdb, j);
     return NULL;
 }
 

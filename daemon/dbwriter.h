@@ -49,7 +49,9 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_LIST_WEBHOOKS = 35, OC_JOB_DELETE_WEBHOOK = 36,
        /* Notification preferences (REQ-130/131). */
        OC_JOB_SET_NOTIFY_PREF = 37, OC_JOB_SET_DND = 38,
-       OC_JOB_LIST_NOTIFY_PREFS = 39 };
+       OC_JOB_LIST_NOTIFY_PREFS = 39,
+       /* Audio call join authorization (REQ-150): read job, channel access gate. */
+       OC_JOB_CALL_AUTH = 40 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -154,7 +156,9 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_WEBHOOK_ERR = 40, OC_RES_WEBHOOK_LIST = 41,
        OC_RES_WEBHOOK_DELETED = 42,
        /* Notification prefs snapshot (also a sync push); ERR on a bad set. */
-       OC_RES_NOTIFY_PREFS = 43, OC_RES_NOTIFY_ERR = 44 };
+       OC_RES_NOTIFY_PREFS = 43, OC_RES_NOTIFY_ERR = 44,
+       /* Call join authorized (net thread then updates in-memory call state) / denied. */
+       OC_RES_CALL_AUTH = 45, OC_RES_CALL_ERR = 46 };
 
 /* One row in a REACTIONS result (a distinct emoji + one reacting user). */
 typedef struct { char *emoji; uint64_t user_id; } oc_reaction_row;

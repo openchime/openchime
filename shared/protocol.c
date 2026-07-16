@@ -644,6 +644,78 @@ oc_result oc_decode_notify_prefs(oc_rbuf *p, oc_notify_pref_entry *entries, uint
     return r_done(p);
 }
 
+/* --- Audio call signaling (REQ-150) ------------------------------------- */
+
+oc_result oc_encode_call_join(oc_wbuf *w, uint16_t version, const oc_call_join *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_JOIN);
+    oc_w_u64(w, m->channel_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_leave(oc_wbuf *w, uint16_t version, const oc_call_leave *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_LEAVE);
+    oc_w_u64(w, m->channel_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_joined(oc_wbuf *w, uint16_t version, const oc_call_joined *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_JOINED);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->call_id);
+    oc_w_u16(w, m->udp_port);
+    oc_w_bytes(w, m->token);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) oc_w_u64(w, m->participants[i]);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_call_roster(oc_wbuf *w, uint16_t version, const oc_call_roster *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CALL_ROSTER);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->call_id);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) oc_w_u64(w, m->participants[i]);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_call_join(oc_rbuf *p, oc_call_join *m) {
+    m->channel_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_leave(oc_rbuf *p, oc_call_leave *m) {
+    m->channel_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_call_joined(oc_rbuf *p, oc_call_joined *m, uint64_t *parts, uint16_t cap) {
+    m->channel_id = oc_r_u64(p);
+    m->call_id = oc_r_u64(p);
+    m->udp_port = oc_r_u16(p);
+    m->token = oc_r_bytes(p);
+    uint16_t count = oc_r_u16(p);
+    m->count = count;
+    m->participants = parts;
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
+        uint64_t u = oc_r_u64(p);
+        if (i < cap) parts[i] = u;
+    }
+    return r_done(p);
+}
+
+oc_result oc_decode_call_roster(oc_rbuf *p, oc_call_roster *m, uint64_t *parts, uint16_t cap) {
+    m->channel_id = oc_r_u64(p);
+    m->call_id = oc_r_u64(p);
+    uint16_t count = oc_r_u16(p);
+    m->count = count;
+    m->participants = parts;
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
+        uint64_t u = oc_r_u64(p);
+        if (i < cap) parts[i] = u;
+    }
+    return r_done(p);
+}
+
 /* --- Attachment transfer (REQ-140/141, ARCH-69) ------------------------- */
 
 oc_result oc_encode_upload_begin(oc_wbuf *w, uint16_t version, const oc_upload_begin *m) {

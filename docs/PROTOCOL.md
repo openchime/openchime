@@ -908,6 +908,40 @@ device updates the others.
 
 ---
 
+### 5.17 Audio call signaling (REQ-150, REQ-152)
+
+Audio is **server-relayed** (no P2P/ICE, ARCH-18): the media itself flows over a
+separate UDP sidecar (ARCH-31, a later milestone), but a call is *set up* over
+this TCP protocol. A call is **one per channel** (`call_id == channel_id`), and
+its roster is **ephemeral net-thread state** (like presence, ARCH-67) — it holds
+no DB rows and resets on daemon restart.
+
+**`CALL_JOIN` (C → S), `0x00A0`** `{ channel_id: u64 }` — join (or start) the
+channel's call. Authorized by the ordinary channel-read gate; a non-member gets
+`ERROR NOT_A_MEMBER`.
+
+**`CALL_JOINED` (S → C, to the joiner), `0x00A2`** `{ channel_id: u64, call_id:
+u64, udp_port: u16, token: bytes, count: u16, count × { user_id: u64 } }` — the
+joiner's confirmation: the current roster plus their **private** media endpoint —
+the sidecar's `udp_port` and a per-join bearer `token` the client will put in
+each audio packet (both are placeholders — `0` / empty — until the sidecar
+milestone lands).
+
+**`CALL_ROSTER` (S → C, to the other participants), `0x00A3`** `{ channel_id:
+u64, call_id: u64, count: u16, count × { user_id: u64 } }` — pushed to every
+other participant whenever the roster changes (a join, a leave, or a
+disconnect).
+
+**`CALL_LEAVE` (C → S), `0x00A1`** `{ channel_id: u64 }` — leave the call.
+
+**Loss and rejoin (REQ-152).** A participant is dropped on `CALL_LEAVE` or on TCP
+disconnect (the net thread removes them and pushes a fresh `CALL_ROSTER` to the
+rest), but the **call persists as long as one participant remains**; the dropped
+user simply re-`CALL_JOIN`s (minting a fresh token). The media-side silence
+timeout that mirrors this lives in the sidecar.
+
+---
+
 ## 6. Reconnect backfill (resolves REQ-101)
 
 A client that reconnects (REQ-100) requests everything it missed since its
@@ -1082,6 +1116,10 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0091` | `SET_DND`          | C → S     | no        | §5.16   |
 | `0x0092` | `LIST_NOTIFY_PREFS`| C → S     | no        | §5.16   |
 | `0x0093` | `NOTIFY_PREFS`     | S → C     | no        | §5.16   |
+| `0x00A0` | `CALL_JOIN`        | C → S     | no        | §5.17   |
+| `0x00A1` | `CALL_LEAVE`       | C → S     | no        | §5.17   |
+| `0x00A2` | `CALL_JOINED`      | S → C     | no        | §5.17   |
+| `0x00A3` | `CALL_ROSTER`      | S → C     | no        | §5.17   |
 | `0x0080` | `UPLOAD_BEGIN`     | C → S     | no        | §5.14   |
 | `0x0081` | `UPLOAD_READY`     | S → C     | no        | §5.14   |
 | `0x0082` | `UPLOAD_CHUNK`     | C → S     | no        | §5.14   |

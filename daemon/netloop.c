@@ -222,11 +222,18 @@ static void update_interest(int ep, conn *c) {
 /* Broadcast that a user has gone offline if the just-closed connection was their
  * last one (REQ-120). Defined below; declared here for conn_close. */
 static void presence_offline_if_gone(int ep, conn **conns, uint64_t user_id);
+/* Drop a closed connection from any audio call it was in (REQ-152). Defined
+ * below; declared here for conn_close. */
+static void call_conn_closed(int ep, conn **conns, uint64_t conn_id);
+/* Append + flush to a connection (closes it on error). Defined below; declared
+ * here for the call roster helpers. */
+static void send_bytes(int ep, conn **conns, int fd, const uint8_t *buf, size_t len);
 
 static void conn_close(int ep, conn **conns, int fd) {
     conn *c = conns[fd];
     if (!c) return;
     uint64_t uid = c->user_id;
+    uint64_t cid = c->conn_id;
     int was_authed = c->authed;
     epoll_ctl(ep, EPOLL_CTL_DEL, fd, NULL);
     xfer_reset(&c->xfer);
@@ -238,6 +245,7 @@ static void conn_close(int ep, conn **conns, int fd) {
     free(c);
     conns[fd] = NULL;
     if (was_authed) presence_offline_if_gone(ep, conns, uid);
+    call_conn_closed(ep, conns, cid);   /* leave any call; roster remaining (REQ-152) */
 }
 
 static conn *find_by_id(conn **conns, uint64_t id) {
@@ -300,6 +308,79 @@ static void broadcast_presence(int ep, conn **conns, uint64_t uid, uint8_t statu
 static void presence_offline_if_gone(int ep, conn **conns, uint64_t user_id) {
     if (presence_of(conns, user_id) == OC_PRESENCE_OFFLINE)
         broadcast_presence(ep, conns, user_id, OC_PRESENCE_OFFLINE);
+}
+
+/* --- Audio calls (REQ-150, ephemeral net-thread state) ------------------ */
+
+/* One call per channel; call_id == channel_id. State is in-memory on the net
+ * thread (like presence, ARCH-67) — calls reset on restart. */
+#define OC_MAX_CALLS 64
+typedef struct { uint64_t user_id, conn_id; } call_part;
+typedef struct { uint64_t channel_id; call_part parts[OC_MAX_CALL_PARTICIPANTS]; int n; } call_t;
+static call_t g_calls[OC_MAX_CALLS];   /* channel_id == 0 marks a free slot */
+
+static call_t *call_find(uint64_t channel_id) {
+    if (!channel_id) return NULL;
+    for (int i = 0; i < OC_MAX_CALLS; i++)
+        if (g_calls[i].channel_id == channel_id) return &g_calls[i];
+    return NULL;
+}
+
+static call_t *call_get_or_create(uint64_t channel_id) {
+    call_t *c = call_find(channel_id);
+    if (c) return c;
+    for (int i = 0; i < OC_MAX_CALLS; i++)
+        if (g_calls[i].channel_id == 0) { g_calls[i].channel_id = channel_id; g_calls[i].n = 0; return &g_calls[i]; }
+    return NULL;   /* all call slots busy */
+}
+
+/* Add a user (or refresh their connection) in a call. 1 ok, 0 if full. */
+static int call_add(call_t *c, uint64_t user_id, uint64_t conn_id) {
+    for (int i = 0; i < c->n; i++)
+        if (c->parts[i].user_id == user_id) { c->parts[i].conn_id = conn_id; return 1; }
+    if (c->n >= (int)OC_MAX_CALL_PARTICIPANTS) return 0;
+    c->parts[c->n].user_id = user_id; c->parts[c->n].conn_id = conn_id; c->n++;
+    return 1;
+}
+
+/* Remove the participant on `conn_id` from whatever call it is in; returns that
+ * call's channel_id (for a roster push) or 0. Frees the call if it empties. */
+static uint64_t call_remove_conn(uint64_t conn_id) {
+    for (int i = 0; i < OC_MAX_CALLS; i++) {
+        call_t *c = &g_calls[i];
+        if (!c->channel_id) continue;
+        for (int j = 0; j < c->n; j++)
+            if (c->parts[j].conn_id == conn_id) {
+                uint64_t ch = c->channel_id;
+                c->parts[j] = c->parts[--c->n];
+                if (c->n == 0) c->channel_id = 0;
+                return ch;
+            }
+    }
+    return 0;
+}
+
+/* Send a CALL_ROSTER for `c` to every participant except `except_conn` (0 = all).
+ * Snapshots the recipient set first so a send that drops a connection (and thus
+ * mutates the call) can't corrupt the iteration. */
+static void call_send_roster(int ep, conn **conns, call_t *c, uint64_t except_conn) {
+    uint64_t parts[OC_MAX_CALL_PARTICIPANTS], cids[OC_MAX_CALL_PARTICIPANTS];
+    int n = c->n;
+    for (int i = 0; i < n; i++) { parts[i] = c->parts[i].user_id; cids[i] = c->parts[i].conn_id; }
+    oc_call_roster ro = { c->channel_id, c->channel_id, (uint16_t)n, parts };
+    oc_wbuf w; oc_wbuf_init(&w, g_enc, sizeof g_enc);
+    oc_encode_call_roster(&w, OC_PROTOCOL_VERSION, &ro);
+    size_t len = w.len;
+    for (int i = 0; i < n; i++) {
+        if (cids[i] == except_conn) continue;
+        conn *pc = find_by_id(conns, cids[i]);
+        if (pc) send_bytes(ep, conns, pc->fd, g_enc, len);
+    }
+}
+
+static void call_conn_closed(int ep, conn **conns, uint64_t conn_id) {
+    uint64_t ch = call_remove_conn(conn_id);
+    if (ch) { call_t *c = call_find(ch); if (c) call_send_roster(ep, conns, c, 0); }
 }
 
 static int in_members(uint64_t uid, const uint64_t *m, size_t n) {
@@ -820,6 +901,22 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             if (!j) return -1;
             j->user_id = c->user_id;
             oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CALL_JOIN) {
+            oc_call_join cj;
+            if (oc_decode_call_join(&p, &cj) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_CALL_AUTH, c->conn_id);   /* read job: access gate */
+            if (!j) return -1;
+            j->user_id = c->user_id; j->channel_id = cj.channel_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CALL_LEAVE) {
+            oc_call_leave cl;
+            if (oc_decode_call_leave(&p, &cl) != OC_OK) return -1;
+            uint64_t ch = call_remove_conn(c->conn_id);
+            if (ch) { call_t *cc = call_find(ch); if (cc) call_send_roster(ep, conns, cc, 0); }
             continue;
         }
         if (hdr.msg_type == OC_MSG_UPLOAD_BEGIN) {
@@ -1674,6 +1771,42 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("notify pref error") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_CALL_AUTH: {
+        /* Authorized: add to the channel's ephemeral call, tell the joiner (with
+         * the roster), and push a roster update to the other participants. */
+        conn *jc = find_by_id(conns, r->conn_id);
+        if (!jc) break;
+        int jfd = jc->fd;
+        call_t *c = call_get_or_create(r->channel_id);
+        if (!c || !call_add(c, r->user_id, r->conn_id)) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_error e = { OC_ERR_INTERNAL, 0, { NULL, 0 }, oc_slice_str("call full") };
+            oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+            send_bytes(ep, conns, jfd, g_enc, w.len);
+            break;
+        }
+        uint64_t parts[OC_MAX_CALL_PARTICIPANTS];
+        for (int i = 0; i < c->n; i++) parts[i] = c->parts[i].user_id;
+        /* udp_port + token are placeholders until the sidecar milestone (Phase B/C). */
+        oc_call_joined jd = { c->channel_id, c->channel_id, 0, { NULL, 0 }, (uint16_t)c->n, parts };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_call_joined(&w, OC_PROTOCOL_VERSION, &jd);
+        send_bytes(ep, conns, jfd, g_enc, w.len);
+        if (conns[jfd]) {   /* joiner still up */
+            call_t *cc = call_find(r->channel_id);
+            if (cc) call_send_roster(ep, conns, cc, r->conn_id);
+        }
+        break;
+    }
+    case OC_RES_CALL_ERR: {
+        conn *jc = find_by_id(conns, r->conn_id);
+        if (!jc) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("call join denied") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, jc->fd, g_enc, w.len);
         break;
     }
     case OC_RES_BACKFILL_OK: {

@@ -100,6 +100,10 @@ typedef enum {
     OC_MSG_SET_DND          = 0x0091, /* C->S, set the do-not-disturb window (REQ-131) */
     OC_MSG_LIST_NOTIFY_PREFS= 0x0092, /* C->S, request all notification settings */
     OC_MSG_NOTIFY_PREFS     = 0x0093, /* S->C, DND + per-channel levels (also a sync push) */
+    OC_MSG_CALL_JOIN        = 0x00A0, /* C->S, join a channel's audio call (REQ-150) */
+    OC_MSG_CALL_LEAVE       = 0x00A1, /* C->S, leave the call */
+    OC_MSG_CALL_JOINED      = 0x00A2, /* S->C, to the joiner: call id + UDP endpoint/token + roster */
+    OC_MSG_CALL_ROSTER      = 0x00A3, /* S->C, to participants: roster changed */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -249,6 +253,9 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_PRESENCE_ONLINE  1u
 #define OC_PRESENCE_AWAY    2u
 
+/* Audio calls (REQ-150-152): one call per channel, small participant sets. */
+#define OC_MAX_CALL_PARTICIPANTS 32u
+
 /* Per-channel notification level (REQ-130). */
 #define OC_NOTIFY_ALL      0u
 #define OC_NOTIFY_MENTIONS 1u
@@ -346,6 +353,15 @@ typedef struct { uint8_t enabled; uint16_t start_min; uint16_t end_min; } oc_set
 typedef struct { uint64_t channel_id; uint8_t level; } oc_notify_pref_entry;
 typedef struct { uint8_t dnd_enabled; uint16_t dnd_start_min; uint16_t dnd_end_min;
                  uint16_t count; const oc_notify_pref_entry *entries; } oc_notify_prefs;
+/* Audio call signaling (REQ-150). CALL_JOINED carries the joiner's private UDP
+ * endpoint + bearer token (empty until the sidecar milestone) plus the roster;
+ * CALL_ROSTER carries just the participant list, pushed on any change. */
+typedef struct { uint64_t channel_id; } oc_call_join;
+typedef struct { uint64_t channel_id; } oc_call_leave;
+typedef struct { uint64_t channel_id; uint64_t call_id; uint16_t udp_port; oc_slice token;
+                 uint16_t count; const uint64_t *participants; } oc_call_joined;
+typedef struct { uint64_t channel_id; uint64_t call_id;
+                 uint16_t count; const uint64_t *participants; } oc_call_roster;
 /* Attachment transfer (REQ-140/141, ARCH-69). `data` chunks are zero-copy views.
  * sha256 is a 32-byte digest carried as `bytes`. */
 typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; oc_slice filename; oc_slice mime; uint64_t total_size; } oc_upload_begin;
@@ -430,6 +446,10 @@ oc_result oc_encode_set_notify_pref(oc_wbuf *w, uint16_t version, const oc_set_n
 oc_result oc_encode_set_dnd(oc_wbuf *w, uint16_t version, const oc_set_dnd *m);
 oc_result oc_encode_list_notify_prefs(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_notify_prefs(oc_wbuf *w, uint16_t version, const oc_notify_prefs *m);
+oc_result oc_encode_call_join(oc_wbuf *w, uint16_t version, const oc_call_join *m);
+oc_result oc_encode_call_leave(oc_wbuf *w, uint16_t version, const oc_call_leave *m);
+oc_result oc_encode_call_joined(oc_wbuf *w, uint16_t version, const oc_call_joined *m);
+oc_result oc_encode_call_roster(oc_wbuf *w, uint16_t version, const oc_call_roster *m);
 oc_result oc_encode_upload_begin(oc_wbuf *w, uint16_t version, const oc_upload_begin *m);
 oc_result oc_encode_upload_ready(oc_wbuf *w, uint16_t version, const oc_upload_ready *m);
 oc_result oc_encode_upload_chunk(oc_wbuf *w, uint16_t version, const oc_upload_chunk *m);
@@ -511,6 +531,11 @@ oc_result oc_decode_set_dnd(oc_rbuf *p, oc_set_dnd *m);
 oc_result oc_decode_list_notify_prefs(oc_rbuf *p);
 oc_result oc_decode_notify_prefs(oc_rbuf *p, oc_notify_pref_entry *entries, uint16_t cap,
                                  uint16_t *out_count, oc_set_dnd *dnd_out);
+oc_result oc_decode_call_join(oc_rbuf *p, oc_call_join *m);
+oc_result oc_decode_call_leave(oc_rbuf *p, oc_call_leave *m);
+/* CALL_JOINED/CALL_ROSTER decode the participant ids into a caller buffer. */
+oc_result oc_decode_call_joined(oc_rbuf *p, oc_call_joined *m, uint64_t *parts, uint16_t cap);
+oc_result oc_decode_call_roster(oc_rbuf *p, oc_call_roster *m, uint64_t *parts, uint16_t cap);
 oc_result oc_decode_upload_begin(oc_rbuf *p, oc_upload_begin *m);
 oc_result oc_decode_upload_ready(oc_rbuf *p, oc_upload_ready *m);
 oc_result oc_decode_upload_chunk(oc_rbuf *p, oc_upload_chunk *m);

@@ -87,6 +87,12 @@ static void decode_all(const uint8_t *buf, size_t len) {
       oc_rbuf_init(&p, buf, len);
       rc = oc_decode_notify_prefs(&p, ne, 4, &nc, &dd);
       CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
+    oc_call_join cj; D(oc_decode_call_join(&p, &cj));
+    oc_call_leave cle; D(oc_decode_call_leave(&p, &cle));
+    { oc_call_joined jn; uint64_t pr[4]; oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_call_joined(&p, &jn, pr, 4); CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
+    { oc_call_roster ros; uint64_t pr[4]; oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_call_roster(&p, &ros, pr, 4); CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
     oc_upload_begin ub; D(oc_decode_upload_begin(&p, &ub));
     oc_upload_ready urd; D(oc_decode_upload_ready(&p, &urd));
     oc_upload_chunk uc; D(oc_decode_upload_chunk(&p, &uc));
