@@ -207,6 +207,13 @@ static const char MIGRATION_0010[] =
     ");"
     "CREATE UNIQUE INDEX idx_webhooks_token ON webhooks(token_hash);";
 
+/* 0011: an optional per-message display-name override (REQ-170). NULL for an
+ * ordinary message (the client renders the author's own name); set to the
+ * webhook's label for a webhook post, so it shows as e.g. "GitHub CI" rather
+ * than the human who created the webhook. A metadata-only default-NULL add. */
+static const char MIGRATION_0011[] =
+    "ALTER TABLE messages ADD COLUMN author_name TEXT;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -218,6 +225,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 8, MIGRATION_0008 },
     { 9, MIGRATION_0009 },
     { 10, MIGRATION_0010 },
+    { 11, MIGRATION_0011 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

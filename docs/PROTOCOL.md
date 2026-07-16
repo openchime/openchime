@@ -339,6 +339,13 @@ tenant-monotonic (ARCH-43).
 | `server_time`  | u64  | Server timestamp, ms since epoch UTC.        |
 | `body`         | lstr | Message body (§7).                           |
 
+The frame may then carry the **optional trailing block** (§5.14): the attachment
+metadata list, followed by an optional `author_name` (str) display-name override
+(set for webhook posts, §5.15). Both are self-describing — present only when
+non-empty — so a plain message is byte-identical to the base layout; because two
+optional fields share the tail, a name with no attachments is preceded by a zero
+attachment count.
+
 Client-side dedup (REQ-091): each client keeps a per-channel high-water mark of
 the highest `message_id` it has seen. A `BROADCAST` with
 `message_id <= high_water[channel_id]` is a redelivery and is suppressed rather
@@ -803,9 +810,9 @@ attachment the caller uploaded to this same channel (others are ignored, i.e.
 simply not shared) and sets its `message_id`. `BROADCAST` correspondingly carries
 a trailing attachment list of `{ attachment_id, filename, mime, size }`, so every
 reader — live or via backfill (§6) — sees the attachment through the one message
-model, with no attachment-specific delivery path. (The same optional list on
-`SEND_REPLY`/`THREAD_REPLY` for thread attachments is a planned follow-up.) A
-message body may
+model, with no attachment-specific delivery path. Thread replies work the same
+way: `SEND_REPLY` carries the id list and `THREAD_REPLY` the metadata, live and
+via `LIST_THREAD` (§5.10). A message body may
 be empty when it carries attachments.
 
 **Download (server → client bytes):**
@@ -849,13 +856,22 @@ bytes }` — the minted **32-byte token, shown once**. Only its SHA-256 is store
 (ARCH-71); the client hex-encodes the token into the POST URL and cannot recover
 it later.
 
+**Management.** `LIST_WEBHOOKS` (C → S, `0x005B`) `{ channel_id: u64 }` → a
+`WEBHOOK_LIST` (S → C, `0x005C`) of `{ webhook_id, channel_id, label, disabled }`
+for a channel the caller can read — **never the token**. `DELETE_WEBHOOK` (C → S,
+`0x005D`) `{ webhook_id: u64 }`, allowed to any member of the webhook's channel,
+removes it and replies `WEBHOOK_DELETED` (S → C, `0x005E`) `{ webhook_id: u64 }`
+(or `ERROR UNKNOWN_WEBHOOK` / `NOT_A_MEMBER`); the token then stops resolving.
+
 **HTTP endpoint — `POST /webhook/<hex-token>`.** Reached over the same TLS proto
 port, demultiplexed by ALPN (ARCH-54): a connection that does **not** negotiate
 `oc/1` is served by the HTTP/1.1 handler. The body is either
 `application/json {"text": "..."}` or a raw `text/plain` message, capped at
 `MAX_BODY_SIZE`. The daemon hex-decodes the token, looks it up by hash, and posts
-the text as a message **authored by the webhook's creator** — delivered to the
-channel's members as an ordinary `BROADCAST` (§5.3) and included in backfill.
+the text as a message **authored by the webhook's creator**, carrying the
+webhook's **label as a display-name override** (the `author_name` field on
+`BROADCAST`, so the post shows as e.g. "GitHub CI") — delivered to the channel's
+members as an ordinary `BROADCAST` (§5.3) and included in backfill.
 Responses: `200 {"ok":true,"message_id":N}` on success; `400` (empty/bad body),
 `404` (unknown or disabled token), `405` (non-POST), `413` (too large), `429`
 (per-token rate limit, 60/min). Note: REQ-171's CA-signed certificate for this
@@ -1025,6 +1041,10 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0058` | `OPEN_DM`          | C → S     | no        | §5.12   |
 | `0x0059` | `CREATE_WEBHOOK`   | C → S     | no        | §5.15   |
 | `0x005A` | `WEBHOOK_INFO`     | S → C     | no        | §5.15   |
+| `0x005B` | `LIST_WEBHOOKS`    | C → S     | no        | §5.15   |
+| `0x005C` | `WEBHOOK_LIST`     | S → C     | no        | §5.15   |
+| `0x005D` | `DELETE_WEBHOOK`   | C → S     | no        | §5.15   |
+| `0x005E` | `WEBHOOK_DELETED`  | S → C     | no        | §5.15   |
 | `0x0070` | `SET_PRESENCE`     | C → S     | no        | §5.13   |
 | `0x0071` | `PRESENCE_UPDATE`  | S → C     | no        | §5.13   |
 | `0x0072` | `TYPING`           | C → S     | no        | §5.13   |

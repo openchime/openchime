@@ -604,7 +604,7 @@ static void test_threads_vertical(int port, const uint8_t *pin) {
     /* bob replies: he gets a SEND_ACK, and both members get a THREAD_REPLY (not
      * a BROADCAST — the reply stays out of the main scroll). */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_send_reply sr; sr.channel_id = 1; memset(sr.idem, 0x72, OC_IDEM_SIZE);
+    oc_send_reply sr = {0}; sr.channel_id = 1; memset(sr.idem, 0x72, OC_IDEM_SIZE);
     sr.parent_id = mid; sr.body = oc_slice_str("first reply");
     CHECK(oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &sr) == OC_OK);
     CHECK(send_frame(&b, buf, w.len) == 0);
@@ -613,7 +613,7 @@ static void test_threads_vertical(int port, const uint8_t *pin) {
         CHECK(hdr.msg_type == OC_MSG_SEND_ACK || hdr.msg_type == OC_MSG_THREAD_REPLY);
     }
     CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_THREAD_REPLY);
-    oc_thread_reply tr; CHECK(oc_decode_thread_reply(&p, &tr) == OC_OK);
+    oc_thread_reply tr = {0}; CHECK(oc_decode_thread_reply(&p, &tr) == OC_OK);
     CHECK(tr.parent_id == mid && tr.author_id == ub && tr.reply_count == 1);
     CHECK(tr.body.len == 11 && memcmp(tr.body.ptr, "first reply", 11) == 0);
 
@@ -989,6 +989,7 @@ static void test_webhook_vertical(int port, const uint8_t *pin) {
     oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
     CHECK(bc.channel_id == OC_DEFAULT_CHANNEL && bc.author_id == ua);
     CHECK(bc.body.len == 12 && memcmp(bc.body.ptr, "from webhook", 12) == 0);
+    CHECK(bc.author_name.len == 2 && memcmp(bc.author_name.ptr, "ci", 2) == 0);  /* label override */
 
     /* The sender gets a 200. */
     char resp[512];
@@ -1006,6 +1007,31 @@ static void test_webhook_vertical(int port, const uint8_t *pin) {
     http_read_response(&h2, resp, sizeof resp);
     CHECK(strncmp(resp, "HTTP/1.1 404", 12) == 0);
     client_close(&h2);
+
+    /* Management: the channel lists its webhook, then a delete removes it. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_list_webhooks lw = { OC_DEFAULT_CHANNEL };
+    CHECK(oc_encode_list_webhooks(&w, OC_PROTOCOL_VERSION, &lw) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_WEBHOOK_LIST);
+    oc_webhook_list_entry ents[8]; uint16_t nents = 0;
+    CHECK(oc_decode_webhook_list(&p, ents, 8, &nents) == OC_OK && nents == 1);
+    CHECK(ents[0].webhook_id == wi.webhook_id);
+    CHECK(ents[0].label.len == 2 && memcmp(ents[0].label.ptr, "ci", 2) == 0);
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_delete_webhook dw = { wi.webhook_id };
+    CHECK(oc_encode_delete_webhook(&w, OC_PROTOCOL_VERSION, &dw) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_WEBHOOK_DELETED);
+    oc_webhook_deleted wdd; CHECK(oc_decode_webhook_deleted(&p, &wdd) == OC_OK);
+    CHECK(wdd.webhook_id == wi.webhook_id);
+
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_list_webhooks(&w, OC_PROTOCOL_VERSION, &lw) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_WEBHOOK_LIST);
+    CHECK(oc_decode_webhook_list(&p, ents, 8, &nents) == OC_OK && nents == 0);
 
     client_close(&a);
 }

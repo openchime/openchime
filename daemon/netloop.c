@@ -29,6 +29,7 @@
  * client with more would page (not needed at current scale). */
 #define OC_CHANNEL_LIST_MAX 512
 #define OC_USER_LIST_MAX    512
+#define OC_WEBHOOK_LIST_MAX 256
 #define OC_REACTION_LIST_MAX 1024
 
 /* Per-connection pending-output cap. A client that stops reading while the
@@ -306,17 +307,23 @@ static int in_members(uint64_t uid, const uint64_t *m, size_t n) {
     return 0;
 }
 
-/* Copy linked-attachment metadata (REQ-140) into a broadcast before encoding, so
- * every recipient — live or via backfill — sees the attachments inline. */
-static void broadcast_set_attach(oc_broadcast *b, const oc_attach_meta *att, size_t n) {
+/* Fill an on-wire attachment-entry array from the DB's attachment metadata
+ * (REQ-140). Returns the count written (capped at OC_MAX_ATTACH). Shared by the
+ * BROADCAST and THREAD_REPLY encoders so every recipient — live or via backfill/
+ * thread listing — sees the attachments inline. */
+static uint16_t fill_attach_entries(oc_attach_entry *out, const oc_attach_meta *att, size_t n) {
     if (n > OC_MAX_ATTACH) n = OC_MAX_ATTACH;
     for (size_t i = 0; i < n; i++) {
-        b->attach[i].id = att[i].id;
-        b->attach[i].filename = oc_slice_str(att[i].filename ? att[i].filename : "");
-        b->attach[i].mime = oc_slice_str(att[i].mime ? att[i].mime : "");
-        b->attach[i].size = att[i].size;
+        out[i].id = att[i].id;
+        out[i].filename = oc_slice_str(att[i].filename ? att[i].filename : "");
+        out[i].mime = oc_slice_str(att[i].mime ? att[i].mime : "");
+        out[i].size = att[i].size;
     }
-    b->n_attach = (uint16_t)n;
+    return (uint16_t)n;
+}
+
+static void broadcast_set_attach(oc_broadcast *b, const oc_attach_meta *att, size_t n) {
+    b->n_attach = fill_attach_entries(b->attach, att, n);
 }
 
 /* Append encoded bytes to a connection and try to flush; close it on error. */
@@ -658,7 +665,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             continue;
         }
         if (hdr.msg_type == OC_MSG_SEND_REPLY) {
-            oc_send_reply sr;
+            oc_send_reply sr = {0};
             if (oc_decode_send_reply(&p, &sr) != OC_OK) return -1;
             if (!send_rate_ok(c)) { if (reject_send_rate(c, sr.idem) != 0) return -1; continue; }
             oc_job *j = oc_job_new(OC_JOB_SEND_REPLY, c->conn_id);
@@ -668,6 +675,9 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->parent_id = sr.parent_id;
             memcpy(j->idem, sr.idem, OC_IDEM_LEN);
             if (oc_job_set_body(j, sr.body.ptr, sr.body.len) != 0) return -1;
+            uint16_t na = sr.n_attach > OC_MAX_ATTACH ? OC_MAX_ATTACH : sr.n_attach;
+            for (uint16_t i = 0; i < na; i++) j->attach_ids[i] = sr.attach_ids[i];
+            j->n_attach = na;
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -764,6 +774,24 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->channel_id = cw.channel_id;
             j->ch_name = cw.label.len ? strndup((const char *)cw.label.ptr, cw.label.len) : strdup("");
             if (!j->ch_name) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_WEBHOOKS) {
+            oc_list_webhooks lw;
+            if (oc_decode_list_webhooks(&p, &lw) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_WEBHOOKS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->channel_id = lw.channel_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_DELETE_WEBHOOK) {
+            oc_delete_webhook dw;
+            if (oc_decode_delete_webhook(&p, &dw) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_DELETE_WEBHOOK, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->message_id = dw.webhook_id;   /* id carried in message_id */
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -1080,8 +1108,9 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         if (!r->duplicate) {
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
             oc_slice body = { r->body, r->body_len };
-            oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, body, 0, {{0}} };
+            oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, body, 0, {{0}}, {0} };
             broadcast_set_attach(&b, r->attach, r->n_attach);
+            b.author_name = oc_slice_str(r->author_name ? r->author_name : "");
             oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
             size_t blen = w.len;
             for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
@@ -1340,7 +1369,8 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
             oc_slice body = { r->body, r->body_len };
             oc_thread_reply tr = { r->message_id, r->channel_id, r->parent_id,
-                                   r->author_id, r->server_time, r->reply_count, body };
+                                   r->author_id, r->server_time, r->reply_count, body, 0, {{0}} };
+            tr.n_attach = fill_attach_entries(tr.attach, r->attach, r->n_attach);
             oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &tr);
             size_t blen = w.len;
             for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
@@ -1382,7 +1412,8 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
             oc_slice body = { m->body, m->body_len };
             oc_thread_reply tr = { m->message_id, m->channel_id, r->parent_id,
-                                   m->author_id, m->server_time, (uint32_t)r->n_thread, body };
+                                   m->author_id, m->server_time, (uint32_t)r->n_thread, body, 0, {{0}} };
+            tr.n_attach = fill_attach_entries(tr.attach, m->attach, m->n_attach);
             oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &tr);
             send_bytes(ep, conns, fd, g_enc, w.len);
         }
@@ -1522,7 +1553,8 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         /* Fan the posted message out to connected members (like SEND_OK)... */
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_slice body = { r->body, r->body_len };
-        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, body, 0, {{0}} };
+        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, body, 0, {{0}}, {0} };
+        b.author_name = oc_slice_str(r->author_name ? r->author_name : "");   /* webhook label (REQ-170) */
         oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
         size_t blen = w.len;
         for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
@@ -1560,6 +1592,33 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         }
         break;
     }
+    case OC_RES_WEBHOOK_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_webhook_list_entry ents[OC_WEBHOOK_LIST_MAX];
+        uint16_t n = 0;
+        for (size_t i = 0; i < r->n_whlist && n < OC_WEBHOOK_LIST_MAX; i++) {
+            ents[n].webhook_id = r->whlist[i].id;
+            ents[n].channel_id = r->whlist[i].channel_id;
+            ents[n].label = oc_slice_str(r->whlist[i].label ? r->whlist[i].label : "");
+            ents[n].disabled = r->whlist[i].disabled;
+            n++;
+        }
+        oc_webhook_list wl = { n, ents };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_webhook_list(&w, OC_PROTOCOL_VERSION, &wl);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_WEBHOOK_DELETED: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_webhook_deleted wd = { r->message_id };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_webhook_deleted(&w, OC_PROTOCOL_VERSION, &wd);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
     case OC_RES_BACKFILL_OK: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
@@ -1571,8 +1630,9 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             oc_replay_msg *m = &r->replay[i];
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
             oc_slice body = { m->body, m->body_len };
-            oc_broadcast b = { m->message_id, m->channel_id, m->author_id, m->server_time, body, 0, {{0}} };
+            oc_broadcast b = { m->message_id, m->channel_id, m->author_id, m->server_time, body, 0, {{0}}, {0} };
             broadcast_set_attach(&b, m->attach, m->n_attach);
+            b.author_name = oc_slice_str(m->author_name ? m->author_name : "");
             oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
             send_bytes(ep, conns, fd, g_enc, w.len);
             if (m->reply_count > 0 && conns[fd]) {

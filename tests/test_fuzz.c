@@ -58,8 +58,8 @@ static void decode_all(const uint8_t *buf, size_t len) {
     oc_react rc2; D(oc_decode_react(&p, &rc2));
     oc_reaction_updated ru; D(oc_decode_reaction_updated(&p, &ru));
     oc_list_reactions lr; D(oc_decode_list_reactions(&p, &lr));
-    oc_send_reply sr; D(oc_decode_send_reply(&p, &sr));
-    oc_thread_reply tr; D(oc_decode_thread_reply(&p, &tr));
+    oc_send_reply sr = {0}; D(oc_decode_send_reply(&p, &sr));
+    oc_thread_reply tr = {0}; D(oc_decode_thread_reply(&p, &tr));
     oc_list_thread lt; D(oc_decode_list_thread(&p, &lt));
     oc_thread th; D(oc_decode_thread(&p, &th));
     oc_thread_meta tm; D(oc_decode_thread_meta(&p, &tm));
@@ -93,6 +93,13 @@ static void decode_all(const uint8_t *buf, size_t len) {
     oc_transfer_cancel tc; D(oc_decode_transfer_cancel(&p, &tc));
     oc_create_webhook cwh; D(oc_decode_create_webhook(&p, &cwh));
     oc_webhook_info whi; D(oc_decode_webhook_info(&p, &whi));
+    oc_list_webhooks lwh; D(oc_decode_list_webhooks(&p, &lwh));
+    oc_delete_webhook dwh; D(oc_decode_delete_webhook(&p, &dwh));
+    oc_webhook_deleted wdh; D(oc_decode_webhook_deleted(&p, &wdh));
+    { oc_webhook_list_entry we[4]; uint16_t nc = 0;
+      oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_webhook_list(&p, we, 4, &nc);
+      CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
 
     /* Array/paging decoders with small caller buffers. */
     { oc_cursor cur[4]; uint16_t nc = 0;

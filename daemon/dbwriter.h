@@ -45,7 +45,8 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* Incoming webhooks (REQ-170). CREATE_WEBHOOK mints a per-channel token
         * for a client; WEBHOOK_POST resolves a token presented over HTTP and
         * posts the message as the webhook's creator. */
-       OC_JOB_CREATE_WEBHOOK = 33, OC_JOB_WEBHOOK_POST = 34 };
+       OC_JOB_CREATE_WEBHOOK = 33, OC_JOB_WEBHOOK_POST = 34,
+       OC_JOB_LIST_WEBHOOKS = 35, OC_JOB_DELETE_WEBHOOK = 36 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -141,7 +142,8 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* Webhooks. CREATED: a minted token for a client. POSTED: a message
         * posted via HTTP (carries SEND-style broadcast fields). ERR: err_code. */
        OC_RES_WEBHOOK_CREATED = 38, OC_RES_WEBHOOK_POSTED = 39,
-       OC_RES_WEBHOOK_ERR = 40 };
+       OC_RES_WEBHOOK_ERR = 40, OC_RES_WEBHOOK_LIST = 41,
+       OC_RES_WEBHOOK_DELETED = 42 };
 
 /* One row in a REACTIONS result (a distinct emoji + one reacting user). */
 typedef struct { char *emoji; uint64_t user_id; } oc_reaction_row;
@@ -154,6 +156,14 @@ typedef struct {
     uint8_t  joined;     /* 1 if the requesting user is a member */
     uint8_t  kind;       /* OC_CHANNEL_KIND / OC_CHANNEL_KIND_DM */
 } oc_channel_row;
+
+/* One row in a WEBHOOK_LIST result (REQ-170); the token is never returned. */
+typedef struct {
+    uint64_t id;
+    uint64_t channel_id;
+    char    *label;       /* heap */
+    uint8_t  disabled;
+} oc_webhook_row;
 
 /* One row in a USER_LIST result. */
 typedef struct {
@@ -184,6 +194,7 @@ typedef struct {
     uint64_t last_reply_at;
     oc_attach_meta attach[OC_MAX_ATTACH];  /* linked attachments (REQ-140) */
     size_t         n_attach;
+    char    *author_name;  /* heap; override display name (webhooks), else NULL */
 } oc_replay_msg;
 
 typedef struct oc_dbres {
@@ -212,6 +223,7 @@ typedef struct oc_dbres {
     int            duplicate; /* idempotent replay: ack only, no broadcast */
     oc_attach_meta attach[OC_MAX_ATTACH];  /* SEND_OK: attachments linked to this message */
     size_t         n_attach;
+    char          *author_name;  /* heap; SEND_OK/WEBHOOK_POSTED override name, else NULL */
 
     /* BACKFILL_OK */
     oc_replay_msg *replay;    /* heap array, ascending message_id */
@@ -272,6 +284,11 @@ typedef struct oc_dbres {
     char           *mime;          /* heap */
     uint64_t        att_size;
     uint8_t         att_sha256[32];
+
+    /* Webhook management (REQ-170). WEBHOOK_LIST: the rows; WEBHOOK_DELETED reuses
+     * message_id above to echo the removed webhook id. */
+    oc_webhook_row *whlist;        /* heap array */
+    size_t          n_whlist;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;

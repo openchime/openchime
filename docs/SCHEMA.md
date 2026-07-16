@@ -338,6 +338,16 @@ single indexed probe and forbids duplicate tokens.
 
 ---
 
+## 3i. Migration 0011 — message display-name override (REQ-170)
+
+`ALTER TABLE messages ADD COLUMN author_name TEXT;` — NULL for an ordinary
+message (the client renders the `author_id` user's own name), set to the
+webhook's label for a webhook post so it shows as e.g. "GitHub CI". Persisting it
+on the message (not just the live broadcast) keeps the name consistent through
+backfill. A metadata-only default-NULL add.
+
+---
+
 ## 4. Deferred to later migrations
 
 Tracked here so the omissions are deliberate, not forgotten:

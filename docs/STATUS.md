@@ -85,11 +85,11 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 131 do-not-disturb schedule | ⛔ | |
 | 132 APNs/FCM push | ⛔ | |
 | 133 self-host push gateway | ⛔ | |
-| 140 file attachments (object storage) | 🟡 | **Built + tested end-to-end:** proxied chunked upload/download over the wire (ARCH-69), `attachments` migration 0009, frames §5.14, and **message-linking** — a SEND references uploaded attachments (self-describing optional list), the BROADCAST carries their metadata inline, and backfill re-attaches them on reconnect. Local-FS blob store behind the ARCH-70 seam. **Follow-ups:** the S3/MinIO adapter impl, and the same attachment list on SEND_REPLY/THREAD_REPLY for thread attachments. |
+| 140 file attachments (object storage) | 🟡 | **Built + tested end-to-end:** proxied chunked upload/download over the wire (ARCH-69), `attachments` migration 0009, frames §5.14, and **message-linking** — a SEND references uploaded attachments (self-describing optional list), the BROADCAST carries their metadata inline, and backfill re-attaches them on reconnect. Thread replies carry attachments too (SEND_REPLY/THREAD_REPLY + LIST_THREAD). Local-FS blob store behind the ARCH-70 seam. **Follow-up:** the S3/MinIO adapter impl. |
 | 141 attachment access control | ✅ | Proxied bytes → download authorized by the ordinary channel-read check on the attachment's channel; no signed URLs (ARCH-69). Verified over the wire (cross-user fetch allowed; non-member refused) and in dbwriter units. |
 | 150–152 server-relayed audio | ⛔ | |
 | 160 video | ➖ | Deliberate scope exclusion. |
-| 170 incoming webhooks | ✅ | ALPN-demuxed HTTP handler on the proto port; `POST /webhook/<token>` posts as the creator (ARCH-71). Client mints tokens via `CREATE_WEBHOOK`; hashed storage (migration 0010); JSON/plain body; per-token rate limit. Tested end-to-end. |
+| 170 incoming webhooks | ✅ | ALPN-demuxed HTTP handler on the proto port; `POST /webhook/<token>` posts as the creator with the webhook's label as a display-name override (ARCH-71, migrations 0010–0011). Client mints tokens via `CREATE_WEBHOOK`; hashed storage; JSON/plain body; per-token rate limit; list/delete management (LIST_WEBHOOKS/DELETE_WEBHOOK). Tested end-to-end. |
 | 171 CA-signed cert for webhooks | ⛔ | Endpoint currently served on the daemon's TOFU cert; on-demand CA/ACME issuance (ARCH-34) is the remaining infra follow-up. |
 
 ### 8. Security Posture
@@ -189,4 +189,4 @@ unbuilt feature families (notifications/push, audio), and a quantitative capacit
 benchmark for REQ-210/211. Incoming webhooks (REQ-170) are built end-to-end
 (ARCH-71), pending only the CA-signed cert (REQ-171). Attachments (REQ-140/141)
 are built end-to-end — proxied chunked transfer, access control, and message-linking
-— with the S3/MinIO blob adapter and thread-reply attachments as follow-ups.
+— including thread-reply attachments, with the S3/MinIO blob adapter as the remaining follow-up.

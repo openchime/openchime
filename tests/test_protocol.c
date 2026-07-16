@@ -221,23 +221,29 @@ static void test_thread_frames(void) {
     uint8_t idem[OC_IDEM_SIZE];
     for (int i = 0; i < (int)OC_IDEM_SIZE; i++) idem[i] = (uint8_t)(0xC0 + i);
     {
-        oc_send_reply in; in.channel_id = 7; memcpy(in.idem, idem, OC_IDEM_SIZE);
+        oc_send_reply in = {0}; in.channel_id = 7; memcpy(in.idem, idem, OC_IDEM_SIZE);
         in.parent_id = 500; in.body = oc_slice_str("a reply");
+        in.n_attach = 1; in.attach_ids[0] = 321;   /* REQ-140 thread attachment */
         ROUNDTRIP(oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEND_REPLY, h, p);
-        oc_send_reply out;
+        oc_send_reply out = {0};
         CHECK(oc_decode_send_reply(&p, &out) == OC_OK);
         CHECK(out.channel_id == 7 && out.parent_id == 500);
         CHECK(memcmp(out.idem, idem, OC_IDEM_SIZE) == 0);
         CHECK(slice_eq_str(out.body, "a reply"));
+        CHECK(out.n_attach == 1 && out.attach_ids[0] == 321);
     }
     {
-        oc_thread_reply in = { 1002, 7, 500, 42, 1751200500000ull, 3, oc_slice_str("a reply") };
+        oc_thread_reply in = { 1002, 7, 500, 42, 1751200500000ull, 3, oc_slice_str("a reply"), 0, {{0}} };
+        in.n_attach = 1; in.attach[0].id = 321; in.attach[0].filename = oc_slice_str("t.pdf");
+        in.attach[0].mime = oc_slice_str("application/pdf"); in.attach[0].size = 88;
         ROUNDTRIP(oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_REPLY, h, p);
-        oc_thread_reply out;
+        oc_thread_reply out = {0};
         CHECK(oc_decode_thread_reply(&p, &out) == OC_OK);
         CHECK(out.message_id == 1002 && out.channel_id == 7 && out.parent_id == 500);
         CHECK(out.author_id == 42 && out.server_time == 1751200500000ull && out.reply_count == 3);
         CHECK(slice_eq_str(out.body, "a reply"));
+        CHECK(out.n_attach == 1 && out.attach[0].id == 321 && out.attach[0].size == 88);
+        CHECK(slice_eq_str(out.attach[0].filename, "t.pdf"));
     }
     {
         oc_list_thread in = { 7, 500 };
@@ -520,6 +526,34 @@ static void test_webhook_frames(void) {
         CHECK(out.webhook_id == 5 && out.channel_id == 9 && out.token.len == OC_SESSION_TOKEN_LEN);
         CHECK(memcmp(out.token.ptr, tok, sizeof tok) == 0);
     }
+    {
+        oc_list_webhooks in = { 9 };
+        ROUNDTRIP(oc_encode_list_webhooks(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_WEBHOOKS, h, p);
+        oc_list_webhooks out;
+        CHECK(oc_decode_list_webhooks(&p, &out) == OC_OK && out.channel_id == 9);
+    }
+    {
+        oc_webhook_list_entry ents[2] = { { 1, 9, oc_slice_str("ci"), 0 },
+                                          { 2, 9, oc_slice_str("bot"), 1 } };
+        oc_webhook_list in = { 2, ents };
+        ROUNDTRIP(oc_encode_webhook_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WEBHOOK_LIST, h, p);
+        oc_webhook_list_entry got[4]; uint16_t n = 0;
+        CHECK(oc_decode_webhook_list(&p, got, 4, &n) == OC_OK && n == 2);
+        CHECK(got[0].webhook_id == 1 && slice_eq_str(got[0].label, "ci") && got[0].disabled == 0);
+        CHECK(got[1].webhook_id == 2 && got[1].disabled == 1);
+    }
+    {
+        oc_delete_webhook in = { 5 };
+        ROUNDTRIP(oc_encode_delete_webhook(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DELETE_WEBHOOK, h, p);
+        oc_delete_webhook out;
+        CHECK(oc_decode_delete_webhook(&p, &out) == OC_OK && out.webhook_id == 5);
+    }
+    {
+        oc_webhook_deleted in = { 5 };
+        ROUNDTRIP(oc_encode_webhook_deleted(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WEBHOOK_DELETED, h, p);
+        oc_webhook_deleted out;
+        CHECK(oc_decode_webhook_deleted(&p, &out) == OC_OK && out.webhook_id == 5);
+    }
 }
 
 static void test_attachment_frames(void) {
@@ -631,18 +665,38 @@ static void test_attachment_frames(void) {
         CHECK(oc_decode_send(&p, &out) == OC_OK && out.n_attach == 0);
         CHECK(slice_eq_str(out.body, "plain"));
     }
-    /* BROADCAST carrying attachment metadata. */
+    /* BROADCAST carrying attachment metadata AND a display-name override. */
     {
         oc_broadcast in = { 5, 3, 42, 999, oc_slice_str("here"), 0, {{0}} };
         in.n_attach = 1;
         in.attach[0].id = 77; in.attach[0].filename = oc_slice_str("a.png");
         in.attach[0].mime = oc_slice_str("image/png"); in.attach[0].size = 4096;
+        in.author_name = oc_slice_str("GitHub CI");
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
         CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
         CHECK(out.n_attach == 1 && out.attach[0].id == 77 && out.attach[0].size == 4096);
         CHECK(slice_eq_str(out.attach[0].filename, "a.png"));
-        CHECK(slice_eq_str(out.attach[0].mime, "image/png"));
+        CHECK(slice_eq_str(out.author_name, "GitHub CI"));
+    }
+    /* Author name with NO attachments: a zero attachment count precedes the name
+     * (REQ-170 display-name override, ARCH-71). */
+    {
+        oc_broadcast in = { 6, 3, 42, 999, oc_slice_str("hi"), 0, {{0}} };
+        in.author_name = oc_slice_str("Zapier");
+        ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
+        oc_broadcast out;
+        CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
+        CHECK(out.n_attach == 0 && slice_eq_str(out.author_name, "Zapier"));
+        CHECK(slice_eq_str(out.body, "hi"));
+    }
+    /* No attachments and no name -> byte-identical to the original layout. */
+    {
+        oc_broadcast in = { 7, 3, 42, 999, oc_slice_str("plain"), 0, {{0}} };
+        ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
+        oc_broadcast out;
+        CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
+        CHECK(out.n_attach == 0 && out.author_name.len == 0 && slice_eq_str(out.body, "plain"));
     }
 }
 

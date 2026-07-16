@@ -367,7 +367,13 @@ the requirement says so explicitly rather than implying one.
   certificate obtained on-demand for that endpoint, since third-party
   webhook senders validate against a standard CA trust store and cannot pin
   a custom certificate (ARCH-34). A tenant with webhooks disabled has had no
-  such certificate and no such requirement.
+  such certificate and no such requirement. **Deferred (infrastructure):** the
+  webhook receiver (REQ-170) currently reuses the daemon's TOFU cert, which
+  works for controlled senders and the test suite. On-demand ACME/CA issuance is
+  intentionally left for a later infrastructure milestone — it needs public HTTP
+  or DNS reachability to complete a challenge (ARCH-10's rationale), which is a
+  deployment concern separate from the daemon's request handling. The SNI-based
+  cert selection at the TLS layer (ARCH-34) is the wiring that lands with it.
 
 ---
 

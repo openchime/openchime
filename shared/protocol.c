@@ -299,8 +299,13 @@ oc_result oc_encode_broadcast(oc_wbuf *w, uint16_t version, const oc_broadcast *
     oc_w_u64(w, m->author_id);
     oc_w_u64(w, m->server_time);
     oc_w_lstr(w, m->body);
-    /* Optional trailing attachment metadata (REQ-140), same optionality as SEND. */
-    if (m->n_attach) {
+    /* Optional trailing block (REQ-140/170): the attachment list, then an
+     * optional author-name override. Both are self-describing — present only
+     * when non-empty — but because two optional fields share the tail, an
+     * author name with no attachments still writes a zero attachment count so
+     * the decoder knows a name follows. Absent entirely -> byte-identical to the
+     * original layout. */
+    if (m->n_attach || m->author_name.len) {
         uint16_t n = m->n_attach > OC_MAX_ATTACH ? OC_MAX_ATTACH : m->n_attach;
         oc_w_u16(w, n);
         for (uint16_t i = 0; i < n; i++) {
@@ -309,6 +314,7 @@ oc_result oc_encode_broadcast(oc_wbuf *w, uint16_t version, const oc_broadcast *
             oc_w_str(w, m->attach[i].mime);
             oc_w_u64(w, m->attach[i].size);
         }
+        if (m->author_name.len) oc_w_str(w, m->author_name);
     }
     return oc_frame_end(w, off);
 }
@@ -402,6 +408,12 @@ oc_result oc_encode_send_reply(oc_wbuf *w, uint16_t version, const oc_send_reply
     oc_w_idem(w, m->idem);
     oc_w_u64(w, m->parent_id);
     oc_w_lstr(w, m->body);
+    /* Optional trailing attachment-id list (REQ-140), as on SEND. */
+    if (m->n_attach) {
+        uint16_t n = m->n_attach > OC_MAX_ATTACH ? OC_MAX_ATTACH : m->n_attach;
+        oc_w_u16(w, n);
+        for (uint16_t i = 0; i < n; i++) oc_w_u64(w, m->attach_ids[i]);
+    }
     return oc_frame_end(w, off);
 }
 
@@ -415,6 +427,17 @@ oc_result oc_encode_thread_reply(oc_wbuf *w, uint16_t version, const oc_thread_r
     oc_w_u64(w, m->server_time);
     oc_w_u32(w, m->reply_count);
     oc_w_lstr(w, m->body);
+    /* Optional trailing attachment metadata (REQ-140), as on BROADCAST. */
+    if (m->n_attach) {
+        uint16_t n = m->n_attach > OC_MAX_ATTACH ? OC_MAX_ATTACH : m->n_attach;
+        oc_w_u16(w, n);
+        for (uint16_t i = 0; i < n; i++) {
+            oc_w_u64(w, m->attach[i].id);
+            oc_w_str(w, m->attach[i].filename);
+            oc_w_str(w, m->attach[i].mime);
+            oc_w_u64(w, m->attach[i].size);
+        }
+    }
     return oc_frame_end(w, off);
 }
 
@@ -495,6 +518,36 @@ oc_result oc_encode_webhook_info(oc_wbuf *w, uint16_t version, const oc_webhook_
     oc_w_u64(w, m->webhook_id);
     oc_w_u64(w, m->channel_id);
     oc_w_bytes(w, m->token);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_list_webhooks(oc_wbuf *w, uint16_t version, const oc_list_webhooks *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_WEBHOOKS);
+    oc_w_u64(w, m->channel_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_webhook_list(oc_wbuf *w, uint16_t version, const oc_webhook_list *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_WEBHOOK_LIST);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        oc_w_u64(w, m->entries[i].webhook_id);
+        oc_w_u64(w, m->entries[i].channel_id);
+        oc_w_str(w, m->entries[i].label);
+        oc_w_u8(w, m->entries[i].disabled);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_delete_webhook(oc_wbuf *w, uint16_t version, const oc_delete_webhook *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_DELETE_WEBHOOK);
+    oc_w_u64(w, m->webhook_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_webhook_deleted(oc_wbuf *w, uint16_t version, const oc_webhook_deleted *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_WEBHOOK_DELETED);
+    oc_w_u64(w, m->webhook_id);
     return oc_frame_end(w, off);
 }
 
@@ -820,8 +873,9 @@ oc_result oc_decode_broadcast(oc_rbuf *p, oc_broadcast *m) {
     m->author_id = oc_r_u64(p);
     m->server_time = oc_r_u64(p);
     m->body = oc_r_lstr(p);
-    /* Optional trailing attachment metadata (REQ-140), same optionality as SEND. */
+    /* Optional trailing block: attachment list, then an optional author name. */
     m->n_attach = 0;
+    m->author_name = (oc_slice){ NULL, 0 };
     if (!p->underflow && p->pos < p->len) {
         uint16_t n = oc_r_u16(p);
         if (n > OC_MAX_ATTACH) return OC_E_MALFORMED;
@@ -832,6 +886,7 @@ oc_result oc_decode_broadcast(oc_rbuf *p, oc_broadcast *m) {
             m->attach[i].size = oc_r_u64(p);
         }
         m->n_attach = n;
+        if (!p->underflow && p->pos < p->len) m->author_name = oc_r_str(p);
     }
     return r_done(p);
 }
@@ -915,6 +970,13 @@ oc_result oc_decode_send_reply(oc_rbuf *p, oc_send_reply *m) {
     oc_r_idem(p, m->idem);
     m->parent_id = oc_r_u64(p);
     m->body = oc_r_lstr(p);
+    m->n_attach = 0;
+    if (!p->underflow && p->pos < p->len) {
+        uint16_t n = oc_r_u16(p);
+        if (n > OC_MAX_ATTACH) return OC_E_MALFORMED;
+        for (uint16_t i = 0; i < n && !p->underflow; i++) m->attach_ids[i] = oc_r_u64(p);
+        m->n_attach = n;
+    }
     return r_done(p);
 }
 
@@ -926,6 +988,18 @@ oc_result oc_decode_thread_reply(oc_rbuf *p, oc_thread_reply *m) {
     m->server_time = oc_r_u64(p);
     m->reply_count = oc_r_u32(p);
     m->body = oc_r_lstr(p);
+    m->n_attach = 0;
+    if (!p->underflow && p->pos < p->len) {
+        uint16_t n = oc_r_u16(p);
+        if (n > OC_MAX_ATTACH) return OC_E_MALFORMED;
+        for (uint16_t i = 0; i < n && !p->underflow; i++) {
+            m->attach[i].id = oc_r_u64(p);
+            m->attach[i].filename = oc_r_str(p);
+            m->attach[i].mime = oc_r_str(p);
+            m->attach[i].size = oc_r_u64(p);
+        }
+        m->n_attach = n;
+    }
     return r_done(p);
 }
 
@@ -1005,6 +1079,40 @@ oc_result oc_decode_webhook_info(oc_rbuf *p, oc_webhook_info *m) {
     m->webhook_id = oc_r_u64(p);
     m->channel_id = oc_r_u64(p);
     m->token = oc_r_bytes(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_list_webhooks(oc_rbuf *p, oc_list_webhooks *m) {
+    m->channel_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_webhook_list(oc_rbuf *p, oc_webhook_list_entry *entries,
+                                 uint16_t cap, uint16_t *out_count) {
+    uint16_t count = oc_r_u16(p);
+    *out_count = count;
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
+        uint64_t wid = oc_r_u64(p);
+        uint64_t cid = oc_r_u64(p);
+        oc_slice label = oc_r_str(p);
+        uint8_t disabled = oc_r_u8(p);
+        if (i < cap) {
+            entries[i].webhook_id = wid;
+            entries[i].channel_id = cid;
+            entries[i].label = label;
+            entries[i].disabled = disabled;
+        }
+    }
+    return r_done(p);
+}
+
+oc_result oc_decode_delete_webhook(oc_rbuf *p, oc_delete_webhook *m) {
+    m->webhook_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_webhook_deleted(oc_rbuf *p, oc_webhook_deleted *m) {
+    m->webhook_id = oc_r_u64(p);
     return r_done(p);
 }
 

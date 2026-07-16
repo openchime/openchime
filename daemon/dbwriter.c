@@ -138,8 +138,9 @@ void oc_dbres_free(oc_dbres *r) {
     if (!r) return;
     free(r->body);
     free(r->members);
+    free(r->author_name);
     free_attach_meta(r->attach, r->n_attach);
-    for (size_t i = 0; i < r->n_replay; i++) { free(r->replay[i].body); free_attach_meta(r->replay[i].attach, r->replay[i].n_attach); }
+    for (size_t i = 0; i < r->n_replay; i++) { free(r->replay[i].body); free(r->replay[i].author_name); free_attach_meta(r->replay[i].attach, r->replay[i].n_attach); }
     free(r->replay);
     free(r->ch_name);
     for (size_t i = 0; i < r->n_chlist; i++) free(r->chlist[i].name);
@@ -149,15 +150,17 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->emoji);
     for (size_t i = 0; i < r->n_rlist; i++) free(r->rlist[i].emoji);
     free(r->rlist);
-    for (size_t i = 0; i < r->n_thread; i++) { free(r->thread[i].body); free_attach_meta(r->thread[i].attach, r->thread[i].n_attach); }
+    for (size_t i = 0; i < r->n_thread; i++) { free(r->thread[i].body); free(r->thread[i].author_name); free_attach_meta(r->thread[i].attach, r->thread[i].n_attach); }
     free(r->thread);
-    for (size_t i = 0; i < r->n_search; i++) { free(r->search[i].body); free_attach_meta(r->search[i].attach, r->search[i].n_attach); }
+    for (size_t i = 0; i < r->n_search; i++) { free(r->search[i].body); free(r->search[i].author_name); free_attach_meta(r->search[i].attach, r->search[i].n_attach); }
     free(r->search);
     free(r->cert_pem);
     free(r->key_pem);
     free(r->storage_key);
     free(r->filename);
     free(r->mime);
+    for (size_t i = 0; i < r->n_whlist; i++) free(r->whlist[i].label);
+    free(r->whlist);
     free(r);
 }
 
@@ -1622,6 +1625,13 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_int64(st, 4, (sqlite3_int64)ts);
     sqlite3_step(st);
     sqlite3_finalize(st);
+
+    /* Link any referenced attachments to this reply, like SEND (REQ-140). */
+    if (j->n_attach) {
+        link_attachments(db, mid, j->channel_id, j->user_id, j->attach_ids, j->n_attach);
+        load_message_attachments(db, mid, r->attach, &r->n_attach);
+    }
+
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
     uint32_t count = 0;
@@ -1672,6 +1682,7 @@ static oc_dbres *process_list_thread(sqlite3 *db, const oc_job *j) {
         const void *b = sqlite3_column_blob(st, 3);
         int blen = sqlite3_column_bytes(st, 3);
         if (b && blen > 0) { m->body = malloc((size_t)blen); if (m->body) { memcpy(m->body, b, (size_t)blen); m->body_len = (size_t)blen; } }
+        load_message_attachments(db, m->message_id, m->attach, &m->n_attach);  /* REQ-140 */
         n++;
     }
     sqlite3_finalize(st);
@@ -1839,7 +1850,8 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
         sqlite3_prepare_v2(db,
             "SELECT m.id, m.author_id, m.created_at_ms, m.body, "
             "  (SELECT COUNT(*) FROM messages c WHERE c.parent_id=m.id), "
-            "  (SELECT COALESCE(MAX(c.created_at_ms),0) FROM messages c WHERE c.parent_id=m.id) "
+            "  (SELECT COALESCE(MAX(c.created_at_ms),0) FROM messages c WHERE c.parent_id=m.id), "
+            "  m.author_name "
             "FROM messages m WHERE m.channel_id=? AND m.id>? AND m.parent_id IS NULL "
             "ORDER BY m.id LIMIT ?;", -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)ch);
@@ -1866,6 +1878,8 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             }
             m->reply_count   = (uint32_t)sqlite3_column_int64(st, 4);
             m->last_reply_at = (uint64_t)sqlite3_column_int64(st, 5);
+            const char *an = (const char *)sqlite3_column_text(st, 6);
+            if (an && an[0]) m->author_name = strdup(an);   /* webhook display name (REQ-170) */
             /* Re-attach the message's linked attachments so a reconnecting client
              * sees them inline, not just live members (REQ-140). */
             load_message_attachments(db, m->message_id, m->attach, &m->n_attach);
@@ -2095,33 +2109,96 @@ static oc_dbres *process_webhook_post(sqlite3 *db, const oc_job *j) {
     }
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT channel_id, creator_id FROM webhooks WHERE token_hash=? AND disabled=0;", -1, &st, NULL);
+        "SELECT channel_id, creator_id, label FROM webhooks WHERE token_hash=? AND disabled=0;", -1, &st, NULL);
     sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_TRANSIENT);
     int found = sqlite3_step(st) == SQLITE_ROW;
     uint64_t cid = found ? (uint64_t)sqlite3_column_int64(st, 0) : 0;
     uint64_t creator = found ? (uint64_t)sqlite3_column_int64(st, 1) : 0;
+    const char *label = found ? (const char *)sqlite3_column_text(st, 2) : NULL;
+    char *label_dup = (label && label[0]) ? strdup(label) : NULL;  /* copy before finalize */
     sqlite3_finalize(st);
-    if (!found) { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_UNKNOWN_WEBHOOK; return r; }
+    if (!found) { free(label_dup); r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_UNKNOWN_WEBHOOK; return r; }
 
+    /* Post as the webhook's label (display-name override, REQ-170), falling back
+     * to the creator's identity if the webhook was created without a label. */
     uint64_t ts = dbw_now_ms();
     sqlite3_prepare_v2(db,
-        "INSERT INTO messages(channel_id, author_id, body, created_at_ms) VALUES(?, ?, ?, ?);",
+        "INSERT INTO messages(channel_id, author_id, body, created_at_ms, author_name) VALUES(?, ?, ?, ?, ?);",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)cid);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)creator);
     sqlite3_bind_blob (st, 3, j->body, (int)j->body_len, SQLITE_STATIC);
     sqlite3_bind_int64(st, 4, (sqlite3_int64)ts);
+    if (label_dup) sqlite3_bind_text(st, 5, label_dup, -1, SQLITE_STATIC);
+    else           sqlite3_bind_null(st, 5);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
-    if (rc != SQLITE_DONE) { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    if (rc != SQLITE_DONE) { free(label_dup); r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
 
     r->type = OC_RES_WEBHOOK_POSTED;
     r->message_id = (uint64_t)sqlite3_last_insert_rowid(db);
     r->channel_id = cid;
     r->author_id = creator;
+    r->author_name = label_dup;   /* transferred; freed by oc_dbres_free */
     r->server_time = ts;
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
     load_members(db, cid, r);
+    return r;
+}
+
+/* List a channel's webhooks (REQ-170) — ids, labels, disabled flag; never the
+ * token. Gated on channel read access (a member/public-channel viewer). Read. */
+static oc_dbres *process_list_webhooks(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+    if (!channel_read_access(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+    r->type = OC_RES_WEBHOOK_LIST;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT id, channel_id, label, disabled FROM webhooks WHERE channel_id=? ORDER BY id;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    size_t cap = 8;
+    r->whlist = malloc(cap * sizeof *r->whlist);
+    while (r->whlist && sqlite3_step(st) == SQLITE_ROW) {
+        if (r->n_whlist == cap) { cap *= 2; oc_webhook_row *g = realloc(r->whlist, cap * sizeof *g); if (!g) break; r->whlist = g; }
+        oc_webhook_row *e = &r->whlist[r->n_whlist++];
+        e->id = (uint64_t)sqlite3_column_int64(st, 0);
+        e->channel_id = (uint64_t)sqlite3_column_int64(st, 1);
+        e->label = strdup((const char *)sqlite3_column_text(st, 2));
+        e->disabled = (uint8_t)sqlite3_column_int(st, 3);
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* Delete a webhook (REQ-170). The actor must be a member of the webhook's
+ * channel (same gate as creating one). Write. */
+static oc_dbres *process_delete_webhook(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT channel_id FROM webhooks WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);   /* webhook id carried in message_id */
+    int found = sqlite3_step(st) == SQLITE_ROW;
+    uint64_t cid = found ? (uint64_t)sqlite3_column_int64(st, 0) : 0;
+    sqlite3_finalize(st);
+    if (!found) { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_UNKNOWN_WEBHOOK; return r; }
+    if (!is_member(db, cid, j->user_id)) { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r; }
+
+    sqlite3_prepare_v2(db, "DELETE FROM webhooks WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    r->type = OC_RES_WEBHOOK_DELETED;
+    r->message_id = j->message_id;   /* echo the removed id */
     return r;
 }
 
@@ -2131,7 +2208,8 @@ static int is_read_job(int type) {
     return type == OC_JOB_BACKFILL || type == OC_JOB_SEARCH ||
            type == OC_JOB_LIST_CHANNELS || type == OC_JOB_LIST_USERS ||
            type == OC_JOB_LIST_REACTIONS || type == OC_JOB_LIST_THREAD ||
-           type == OC_JOB_TYPING || type == OC_JOB_ATTACH_LOOKUP;
+           type == OC_JOB_TYPING || type == OC_JOB_ATTACH_LOOKUP ||
+           type == OC_JOB_LIST_WEBHOOKS;
 }
 
 /* Dispatch a read-only job against `rdb`. */
@@ -2144,6 +2222,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_LIST_THREAD)    return process_list_thread(rdb, j);
     if (j->type == OC_JOB_TYPING)         return process_typing(rdb, j);
     if (j->type == OC_JOB_ATTACH_LOOKUP)  return process_attach_lookup(rdb, j);
+    if (j->type == OC_JOB_LIST_WEBHOOKS)  return process_list_webhooks(rdb, j);
     return NULL;
 }
 
@@ -2175,6 +2254,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_ATTACH_FINALIZE) return process_attach_finalize(w->db, j);
     if (j->type == OC_JOB_CREATE_WEBHOOK)  return process_create_webhook(w->db, j);
     if (j->type == OC_JOB_WEBHOOK_POST)    return process_webhook_post(w->db, j);
+    if (j->type == OC_JOB_DELETE_WEBHOOK)  return process_delete_webhook(w->db, j);
     return NULL;
 }
 

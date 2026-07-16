@@ -50,7 +50,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 10);
+    CHECK(oc_schema_version(db) == 11);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -1504,6 +1504,50 @@ static void test_attachments(void) {
     CHECK(saw);
     oc_dbres_free(r);
 
+    /* Thread-reply attachments (REQ-140): a fresh attachment linked from a reply
+     * appears on REPLY_OK and in the thread listing. */
+    oc_job *cj = oc_job_new(OC_JOB_ATTACH_CREATE, 30);
+    cj->user_id = alice; cj->channel_id = OC_DEFAULT_CHANNEL; cj->att_size = 64;
+    memset(cj->idem, 0x5C, OC_IDEM_LEN);
+    cj->filename = strdup("r.bin"); cj->mime = strdup("application/octet-stream");
+    oc_dbwriter_submit(w, cj);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_CREATED);
+    uint64_t aid2 = r->attachment_id;
+    oc_dbres_free(r);
+    cj = oc_job_new(OC_JOB_ATTACH_FINALIZE, 31);
+    cj->user_id = alice; cj->attachment_id = aid2; cj->att_size = 64; memcpy(cj->att_sha256, sha, 32);
+    oc_dbwriter_submit(w, cj);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_OK);
+    oc_dbres_free(r);
+
+    sj = oc_job_new(OC_JOB_SEND_REPLY, 32);
+    sj->user_id = alice; sj->channel_id = OC_DEFAULT_CHANNEL; sj->parent_id = linked_mid;
+    memset(sj->idem, 0x5D, OC_IDEM_LEN);
+    oc_job_set_body(sj, "reply", 5);
+    sj->attach_ids[0] = aid2; sj->n_attach = 1;
+    oc_dbwriter_submit(w, sj);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_REPLY_OK && r->n_attach == 1 && r->attach[0].id == aid2);
+    uint64_t reply_mid = r->message_id;
+    oc_dbres_free(r);
+
+    sj = oc_job_new(OC_JOB_LIST_THREAD, 33);
+    sj->user_id = bob; sj->channel_id = OC_DEFAULT_CHANNEL; sj->parent_id = linked_mid;
+    oc_dbwriter_submit(w, sj);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_THREAD);
+    int sawr = 0;
+    for (size_t i = 0; i < r->n_thread; i++) {
+        if (r->thread[i].message_id == reply_mid) {
+            sawr = 1;
+            CHECK(r->thread[i].n_attach == 1 && r->thread[i].attach[0].id == aid2);
+        }
+    }
+    CHECK(sawr);
+    oc_dbres_free(r);
+
     /* Access control: an attachment on a private channel alice creates is NOT
      * downloadable by bob, a non-member (the core of REQ-141). */
     r = create_channel(w, alice, "secret", 0);
@@ -1576,6 +1620,7 @@ static void test_webhooks(void) {
     oc_dbwriter_submit(w, j);
     oc_dbres *r = wait_result(w);
     CHECK(r && r->type == OC_RES_WEBHOOK_CREATED && r->message_id > 0);
+    uint64_t wid = r->message_id;
     uint8_t token[OC_SESSION_TOKEN_LEN];
     memcpy(token, r->session_token, sizeof token);
     oc_dbres_free(r);
@@ -1589,6 +1634,7 @@ static void test_webhooks(void) {
     CHECK(r && r->type == OC_RES_WEBHOOK_POSTED);
     CHECK(r->channel_id == OC_DEFAULT_CHANNEL && r->author_id == alice && r->message_id > 0);
     CHECK(r->body_len == 7 && memcmp(r->body, "from ci", 7) == 0);
+    CHECK(r->author_name && strcmp(r->author_name, "ci") == 0);   /* display-name override */
     int saw_alice = 0;
     for (size_t i = 0; i < r->n_members; i++) if (r->members[i] == alice) saw_alice = 1;
     CHECK(saw_alice);
@@ -1599,6 +1645,47 @@ static void test_webhooks(void) {
     j = oc_job_new(OC_JOB_WEBHOOK_POST, 3);
     oc_job_set_token(j, bad, sizeof bad);
     oc_job_set_body(j, "x", 1);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_ERR && r->err_code == OC_ERR_UNKNOWN_WEBHOOK);
+    oc_dbres_free(r);
+
+    /* Management: the channel's webhooks list (no tokens); delete removes it. */
+    j = oc_job_new(OC_JOB_LIST_WEBHOOKS, 5);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_LIST && r->n_whlist == 1);
+    CHECK(r->whlist[0].id == wid && r->whlist[0].disabled == 0);
+    CHECK(r->whlist[0].label && strcmp(r->whlist[0].label, "ci") == 0);
+    oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_DELETE_WEBHOOK, 6);
+    j->user_id = alice; j->message_id = wid;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_DELETED && r->message_id == wid);
+    oc_dbres_free(r);
+
+    /* After delete: the token no longer resolves and the list is empty. */
+    j = oc_job_new(OC_JOB_WEBHOOK_POST, 7);
+    oc_job_set_token(j, token, sizeof token);
+    oc_job_set_body(j, "late", 4);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_ERR && r->err_code == OC_ERR_UNKNOWN_WEBHOOK);
+    oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_LIST_WEBHOOKS, 8);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_LIST && r->n_whlist == 0);
+    oc_dbres_free(r);
+
+    /* Deleting an unknown id is refused. */
+    j = oc_job_new(OC_JOB_DELETE_WEBHOOK, 9);
+    j->user_id = alice; j->message_id = 999999;
     oc_dbwriter_submit(w, j);
     r = wait_result(w);
     CHECK(r && r->type == OC_RES_WEBHOOK_ERR && r->err_code == OC_ERR_UNKNOWN_WEBHOOK);
