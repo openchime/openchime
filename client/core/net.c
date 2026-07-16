@@ -159,6 +159,22 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                 oc_ev *e = oc_ev_new(OC_EV_PRESENCE);
                 if (e) { e->user_id = pu.user_id; e->status = pu.status; oc_queue_push(to_ui, e); }
             }
+        } else if (hdr.msg_type == OC_MSG_REACTION_UPDATED) {
+            oc_reaction_updated ru;
+            if (oc_decode_reaction_updated(&p, &ru) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_REACTION);
+                if (e) {
+                    e->channel_id = ru.channel_id;
+                    e->message_id = ru.message_id;
+                    e->user_id = ru.user_id;
+                    e->op = ru.op;
+                    e->count = (uint32_t)ru.count;
+                    size_t en = ru.emoji.len < sizeof e->emoji - 1 ? ru.emoji.len : sizeof e->emoji - 1;
+                    memcpy(e->emoji, ru.emoji.ptr, en);
+                    e->emoji[en] = '\0';
+                    oc_queue_push(to_ui, e);
+                }
+            }
         } else if (hdr.msg_type == OC_MSG_ERROR) {
             oc_error err;
             if (oc_decode_error(&p, &err) == OC_OK) {
@@ -281,6 +297,12 @@ static void *net_thread(void *arg) {
                 gen_idem(s.idem);
                 s.body = oc_slice_str(c->body);
                 if (oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_REACT && c->body) {
+                uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_react rc = { c->channel_id, c->message_id, oc_slice_str(c->body), c->op };
+                if (oc_encode_react(&w, OC_PROTOCOL_VERSION, &rc) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             oc_cmd_free(c);

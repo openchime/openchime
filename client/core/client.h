@@ -38,6 +38,11 @@ void oc_client_backfill(oc_client *c, uint64_t channel_id);
  * focused channel. */
 void oc_client_mark_read(oc_client *c, uint64_t channel_id);
 
+/* React to a message: `op` is 1 (add) or 0 (remove). The server fans back a
+ * REACTION_UPDATED that folds into the message's aggregates. */
+void oc_client_react(oc_client *c, uint64_t channel_id, uint64_t message_id,
+                     const char *emoji, uint8_t op);
+
 /* Stop the network thread, drain remaining events, and free everything. */
 void oc_client_stop(oc_client *c);
 

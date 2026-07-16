@@ -9,7 +9,8 @@
  *        (credentials also read from $OPENCHIME_CRED = "user:pass")
  *
  * Keys: type + Enter to send · Tab next channel · ↑/↓ + PgUp/PgDn scroll ·
- *       Ctrl-Q quit.
+ *       Ctrl-Q quit. Commands: /react <emoji> toggles a reaction on the last
+ *       message in the focused channel.
  */
 
 #define TB_IMPL
@@ -141,6 +142,21 @@ static void build_rows(rows_t *r, const oc_channel *ch, uint64_t me, int width) 
         if (hdr) { strcpy(hdr, line); rows_push(r, hdr, nick_color(m->author_id) | TB_BOLD); }
         /* Body rows, indented, default color. */
         wrap_push(r, m->body ? m->body : "", TB_DEFAULT, width, 4);
+        /* Reaction line: "emoji count" per emoji, [n] if we reacted. */
+        if (m->n_reactions) {
+            char rl[256]; size_t p = 0;
+            p += (size_t)snprintf(rl, sizeof rl, "    ");
+            for (uint8_t k = 0; k < m->n_reactions && p < sizeof rl - 1; k++) {
+                const oc_reaction *rx = &m->reactions[k];
+                int w = rx->mine
+                    ? snprintf(rl + p, sizeof rl - p, "%s [%u]  ", rx->emoji, rx->count)
+                    : snprintf(rl + p, sizeof rl - p, "%s %u  ", rx->emoji, rx->count);
+                if (w < 0 || (size_t)w >= sizeof rl - p) break;
+                p += (size_t)w;
+            }
+            char *rr = malloc(p + 1);
+            if (rr) { memcpy(rr, rl, p); rr[p] = '\0'; rows_push(r, rr, TB_MAGENTA); }
+        }
     }
 }
 
@@ -240,6 +256,27 @@ static void backspace_utf8(char *buf, size_t *len) {
     *len = n;
 }
 
+/* Handle a "/command" typed in the composer. Currently only /react <emoji>,
+ * which toggles a reaction on the most recent message in the focused channel. */
+static void handle_command(oc_client *cl, uint64_t cid, const char *line) {
+    if (strncmp(line, "/react ", 7) != 0) return;
+    const char *emoji = line + 7;
+    while (*emoji == ' ') emoji++;
+    if (!*emoji) return;
+    const oc_model *m = oc_client_model(cl);
+    for (size_t i = 0; i < m->n_channels; i++) {
+        if (m->channels[i].channel_id != cid) continue;
+        const oc_channel *ch = &m->channels[i];
+        if (ch->n_msgs == 0) return;
+        const oc_msg *last = &ch->msgs[ch->n_msgs - 1];
+        uint8_t op = 1;                       /* add, unless we already reacted */
+        for (uint8_t k = 0; k < last->n_reactions; k++)
+            if (strcmp(last->reactions[k].emoji, emoji) == 0 && last->reactions[k].mine) { op = 0; break; }
+        oc_client_react(cl, cid, last->message_id, emoji, op);
+        return;
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: %s <host> <port> [user:pass]\n", argv[0]);
@@ -294,7 +331,9 @@ int main(int argc, char **argv) {
             running = 0;
         } else if (ev.key == TB_KEY_ENTER) {
             if (clen > 0 && focus < nch) {
-                oc_client_send(cl, oc_client_model(cl)->channels[focus].channel_id, composer);
+                uint64_t cid = oc_client_model(cl)->channels[focus].channel_id;
+                if (composer[0] == '/') handle_command(cl, cid, composer);
+                else                    oc_client_send(cl, cid, composer);
                 clen = 0; composer[0] = '\0'; scroll = 0;
             }
         } else if (ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2) {

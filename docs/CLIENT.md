@@ -92,12 +92,13 @@ model; translate input to intents }, stop.
   regions (sidebar / message pane / status+composer / overlays for thread &
   search) drawn cell-by-cell, re-laid-out on the resize event; the message pane
   renders its visible window each frame, measuring glyph width with utf8proc.
-  **Build order:** a lean core loop first (sidebar, focus/switch, history backfill
-  on open, live messages, send, presence dots, unread, scrollback, reflow,
-  per-nick colors), then **reactions display** as the next increment — it's cheap
-  and it exercises the exact wide-char/emoji correctness that justified the
-  toolkit. Threads,
-  edit/delete UX, typing, and attachment download follow.
+  **Build order:** the lean core loop landed first (sidebar, focus/switch, history
+  backfill on open, live messages + display names, send, presence dots, unread,
+  scrollback, reflow, per-nick colors), then **reactions display** (emoji
+  aggregates under each message with a `[n]` "you reacted" marker, `/react
+  <emoji>` toggling on the last message) — which exercises the exact
+  wide-char/emoji correctness that justified the toolkit. Threads, edit/delete UX,
+  typing, and attachment download follow.
 - **Windows (later):** Win32/WinUI (C++/WinRT or C#) over the C core.
 - **macOS/iOS (later):** AppKit/UIKit (Swift) over the core.
 - **Android (later):** Android views (Kotlin) over the core.
@@ -145,9 +146,10 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
 
 ## 8. Roadmap
 
-- **Now:** app-core (done — connect, auth, live messages, presence, send; headless
-  core test in CI) → the termbox2 TUI, lean core loop first (sidebar, backfill on
-  open, send, presence, unread, scrollback), then reactions display.
+- **Now:** app-core + termbox2 TUI shipped — the lean core loop (sidebar,
+  backfill on open, send, display names, presence, unread, scrollback) and
+  **reactions display** (`/react`) are done. Next TUI increments: threads,
+  edit/delete, typing indicators, search.
 - **Next:** store + reconnect/offline; auth completeness (local + OIDC);
   attachments (chunked up/download) and the **audio client** (Opus encode/decode
   + UDP to the sidecar — the deferred half of REQ-150/151).

@@ -88,6 +88,37 @@ static int channel_unread(const oc_model *m, uint64_t cid) {
     return -1;
 }
 
+/* The message id of the message with `body` in channel `cid`, or 0. */
+static uint64_t message_id_of(const oc_model *m, uint64_t cid, const char *body) {
+    for (size_t i = 0; i < m->n_channels; i++) {
+        if (m->channels[i].channel_id != cid) continue;
+        for (size_t j = 0; j < m->channels[i].n_msgs; j++)
+            if (m->channels[i].msgs[j].body && strcmp(m->channels[i].msgs[j].body, body) == 0)
+                return m->channels[i].msgs[j].message_id;
+    }
+    return 0;
+}
+
+/* The aggregate count for `emoji` on message `mid` (-1 if the message/emoji is
+ * absent), and separately whether we reacted (`mine`). */
+static int reaction_count(const oc_model *m, uint64_t cid, uint64_t mid, const char *emoji, int *mine) {
+    if (mine) *mine = 0;
+    for (size_t i = 0; i < m->n_channels; i++) {
+        if (m->channels[i].channel_id != cid) continue;
+        for (size_t j = 0; j < m->channels[i].n_msgs; j++) {
+            const oc_msg *msg = &m->channels[i].msgs[j];
+            if (msg->message_id != mid) continue;
+            for (uint8_t k = 0; k < msg->n_reactions; k++)
+                if (strcmp(msg->reactions[k].emoji, emoji) == 0) {
+                    if (mine) *mine = msg->reactions[k].mine;
+                    return (int)msg->reactions[k].count;
+                }
+            return 0;
+        }
+    }
+    return -1;
+}
+
 /* Does channel `cid` hold a message whose body and author display name match? */
 static int channel_has_named(const oc_model *m, uint64_t cid, const char *body, const char *name) {
     for (size_t i = 0; i < m->n_channels; i++) {
@@ -155,6 +186,18 @@ int run_client_core_tests(void) {
 
         /* The message carries dana's display name (= her login name), live. */
         CHECK(channel_has_named(oc_client_model(b), 1, "hello from the core", "dana"));
+
+        /* erik reacts to dana's message: both see the aggregate (count 1), erik
+         * sees it as his own; a second react toggles it off (count 0). */
+        uint64_t mid = message_id_of(oc_client_model(b), 1, "hello from the core");
+        CHECK(mid != 0);
+        oc_client_react(b, 1, mid, ":+1:", 1);
+        int mine = 0;
+        CHECK(WAIT_FOR(b, reaction_count(m, 1, mid, ":+1:", NULL) == 1));
+        CHECK(reaction_count(oc_client_model(b), 1, mid, ":+1:", &mine) == 1 && mine == 1);
+        CHECK(WAIT_FOR(a, reaction_count(m, 1, mid, ":+1:", NULL) == 1));
+        oc_client_react(b, 1, mid, ":+1:", 0);
+        CHECK(WAIT_FOR(a, reaction_count(m, 1, mid, ":+1:", NULL) == 0));
 
         /* Marking channel 1 read clears erik's unread. */
         oc_client_mark_read(b, 1);

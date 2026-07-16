@@ -14,12 +14,17 @@
 
 #include "event.h"
 
+/* One emoji's aggregate on a message: the running count and whether we reacted. */
+typedef struct { char emoji[40]; uint32_t count; uint8_t mine; } oc_reaction;
+
 typedef struct {
     char    *body;         /* heap */
     char     author_name[64]; /* author display name ("" = fall back to id) */
     uint64_t author_id;
     uint64_t message_id;
     uint64_t server_time;
+    oc_reaction *reactions;   /* heap, NULL until the message gets a reaction */
+    uint8_t      n_reactions, cap_reactions;
 } oc_msg;
 
 typedef struct {

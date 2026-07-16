@@ -15,9 +15,40 @@ void oc_model_init(oc_model *m) {
 }
 
 static void channel_free(oc_channel *c) {
-    for (size_t i = 0; i < c->n_msgs; i++) free(c->msgs[i].body);
+    for (size_t i = 0; i < c->n_msgs; i++) { free(c->msgs[i].body); free(c->msgs[i].reactions); }
     free(c->msgs);
     free(c->name);
+}
+
+/* Fold a reaction aggregate (emoji now has `count` reactors) into a message. */
+static void msg_apply_reaction(oc_msg *msg, const char *emoji, uint32_t count,
+                               uint8_t op, int is_me) {
+    if (!emoji || !emoji[0]) return;
+    uint8_t idx = msg->n_reactions;
+    for (uint8_t i = 0; i < msg->n_reactions; i++)
+        if (strcmp(msg->reactions[i].emoji, emoji) == 0) { idx = i; break; }
+
+    if (count == 0) {                         /* emoji fully removed: drop the row */
+        if (idx < msg->n_reactions) {
+            msg->reactions[idx] = msg->reactions[msg->n_reactions - 1];
+            msg->n_reactions--;
+        }
+        return;
+    }
+    if (idx == msg->n_reactions) {            /* new emoji: append (grow if needed) */
+        if (msg->n_reactions == msg->cap_reactions) {
+            uint8_t cap = msg->cap_reactions ? (uint8_t)(msg->cap_reactions * 2) : 4;
+            oc_reaction *nr = realloc(msg->reactions, (size_t)cap * sizeof *nr);
+            if (!nr) return;
+            msg->reactions = nr; msg->cap_reactions = cap;
+        }
+        oc_reaction *r = &msg->reactions[idx];
+        memset(r, 0, sizeof *r);
+        snprintf(r->emoji, sizeof r->emoji, "%s", emoji);
+        msg->n_reactions++;
+    }
+    msg->reactions[idx].count = count;
+    if (is_me) msg->reactions[idx].mine = (op == 1 /* OC_REACT_ADD */) ? 1 : 0;
 }
 
 void oc_model_free(oc_model *m) {
@@ -71,6 +102,7 @@ static int channel_append(oc_channel *c, uint64_t author_id, const char *author_
         c->cap_msgs = cap;
     }
     oc_msg *msg = &c->msgs[c->n_msgs++];
+    memset(msg, 0, sizeof *msg);   /* clear reactions et al. before we populate */
     msg->body = *body;
     snprintf(msg->author_name, sizeof msg->author_name, "%s", author_name ? author_name : "");
     msg->author_id = author_id;
@@ -140,6 +172,19 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     case OC_EV_PRESENCE:
         presence_set(m, e->user_id, e->status);
         break;
+    case OC_EV_REACTION: {
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (c) {
+            for (size_t i = 0; i < c->n_msgs; i++) {
+                if (c->msgs[i].message_id == e->message_id) {
+                    msg_apply_reaction(&c->msgs[i], e->emoji, e->count, e->op,
+                                       e->user_id == m->user_id);
+                    break;
+                }
+            }
+        }
+        break;
+    }
     case OC_EV_DISCONNECTED:
         m->connected = false;
         m->authed = false;

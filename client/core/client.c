@@ -77,6 +77,18 @@ void oc_client_mark_read(oc_client *c, uint64_t channel_id) {
     oc_model_mark_read(&c->model, channel_id);
 }
 
+void oc_client_react(oc_client *c, uint64_t channel_id, uint64_t message_id,
+                     const char *emoji, uint8_t op) {
+    if (!c || !emoji || !emoji[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_REACT);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = message_id;
+    cmd->op = op;
+    cmd->body = strdup(emoji);
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_stop(oc_client *c) {
     if (!c) return;
     oc_net_stop(c->net);   /* signals QUIT, joins the thread */
