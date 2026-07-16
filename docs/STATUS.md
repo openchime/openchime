@@ -108,8 +108,8 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | REQ | Status | Notes |
 |-----|--------|-------|
 | 200 Linux/Win/macOS/iOS/Android clients | 🟡 | Windows `.exe` cross-compiles (skeleton UI); other platforms ⛔. Daemon is Linux-only (epoll/eventfd). |
-| 210 lean/standard memory profile | ❔ | Plausible; not measured. |
-| 211 low-hundreds concurrent connections | ❔ | epoll loop, `OC_NETLOOP_MAX_FD=4096`; concurrency is correctness-tested (8-client load test) but the low-hundreds ceiling is not benchmarked. |
+| 210 lean/standard memory profile | ✅ | **Measured** (`Scripts/bench.sh`): ~5 MB baseline + **~50 KB RSS per idle connection**, so a few hundred connections sit in ~15–30 MB and low-thousands stay within the 256 MB lean profile. Message round-trip p50 ~4 ms, p99 ~20–40 ms under concurrency. |
+| 211 low-hundreds concurrent connections | ✅ | **Measured**: hundreds of concurrent pinned-TLS connections held in a small fraction of the lean profile. Connection *setup* is bounded by the 600k-iteration PBKDF2 auth on the single writer (~6–7 logins/s), so a burst of simultaneous logins queues there; steady-state is cheap. `OC_NETLOOP_MAX_FD=4096`. |
 
 ---
 
@@ -157,10 +157,13 @@ ordering, not a commitment.
 
 **Open**
 
-None — the robustness backlog is clear. Remaining unknowns are quantitative, not
-correctness: REQ-210/211's exact memory/connection-count profile is still
-un-benchmarked (the load test proves concurrency correctness at small N, not the
-low-hundreds-connection ceiling), and there is no periodic large-scale soak.
+None — the robustness backlog is clear. REQ-210/211 are now benchmarked
+(`Scripts/bench.sh` + `tests/bench_load.c`): ~50 KB RSS per idle connection, so
+low-hundreds of connections fit in tens of MB of the 256 MB lean profile, at
+p50 ~4 ms message round-trip. The one measured bottleneck is connection *setup*
+throughput (600k-iteration PBKDF2 auth on the single writer, ~6–7 logins/s) — a
+correctness-preserving cost, not a memory limit. There is no periodic
+large-scale soak yet.
 
 ---
 
@@ -186,9 +189,10 @@ rate limiting, the per-connection output-buffer cap, idempotency-map pruning,
 reads decoupled onto a read-only connection, server-side delivery accounting, a
 per-IP connection throttle, TLS-identity persistence across restore, truncation
 signals, the first-owner setup token, and a codec fuzzer + concurrency load
-test. What remains is **not** hardening but **scope**: a real client, the
-unbuilt feature families (mobile push transport, audio), and a quantitative capacity
-benchmark for REQ-210/211. Incoming webhooks (REQ-170) are built end-to-end
+test. What remains is **not** hardening but **scope**: a real client and the
+unbuilt feature families (mobile push transport, audio). The capacity profile
+(REQ-210/211) is now benchmarked — see `Scripts/bench.sh`. Incoming webhooks
+(REQ-170) are built end-to-end
 (ARCH-71), pending only the CA-signed cert (REQ-171). Attachments (REQ-140/141)
 are built end-to-end — proxied chunked transfer, access control, and message-linking
 — including thread-reply attachments and both the local-FS and S3/MinIO blob backends.

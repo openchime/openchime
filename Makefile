@@ -27,7 +27,7 @@ INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_INC)
 APP_SRC   := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC))
 # e2e_client is a standalone black-box tool (its own main), not part of the
 # single in-process test binary.
-TEST_SRC  := $(filter-out tests/e2e_client.c,$(wildcard tests/*.c))
+TEST_SRC  := $(filter-out tests/e2e_client.c tests/bench_load.c,$(wildcard tests/*.c))
 TEST_BIN  := build/tests
 
 # --- Client (raylib GUI) ------------------------------------------------------
@@ -52,7 +52,7 @@ WIN_CFLAGS   := -std=gnu99 -Wall -Wextra -O2 -D_WIN32_WINNT=0x0601
 # a standalone .exe (bundles libgcc/winpthread).
 WIN_SYS_LIBS := -lopengl32 -lgdi32 -lwinmm -lws2_32 -lbcrypt
 
-.PHONY: all test integration windows clean
+.PHONY: all test integration windows bench clean
 
 all: $(BIN)
 
@@ -79,6 +79,13 @@ integration: build/e2e_client
 build/e2e_client: tests/e2e_client.c $(SHARED_SRC) $(wildcard shared/*.h) $(MBEDTLS_A) | build
 	$(CC) $(CFLAGS) -O0 -g -Ishared -I$(MBEDTLS_INC) \
 	    tests/e2e_client.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
+
+# Capacity benchmark load client (REQ-210/211); driven by Scripts/bench.sh.
+# Links only the shared wire modules, like the e2e client.
+bench: build/bench_load
+build/bench_load: tests/bench_load.c $(SHARED_SRC) $(wildcard shared/*.h) $(MBEDTLS_A) | build
+	$(CC) $(CFLAGS) -O2 -Ishared -I$(MBEDTLS_INC) \
+	    tests/bench_load.c $(SHARED_SRC) $(MBEDTLS_LIBS) -lpthread -o $@
 
 # Cross-compile the Windows client (.exe). Vendors raylib + mbedTLS for Windows
 # on demand, then links client/ + shared/ wire code statically.
