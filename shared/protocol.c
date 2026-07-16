@@ -483,6 +483,21 @@ oc_result oc_encode_open_dm(oc_wbuf *w, uint16_t version, const oc_open_dm *m) {
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_create_webhook(oc_wbuf *w, uint16_t version, const oc_create_webhook *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CREATE_WEBHOOK);
+    oc_w_u64(w, m->channel_id);
+    oc_w_str(w, m->label);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_webhook_info(oc_wbuf *w, uint16_t version, const oc_webhook_info *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_WEBHOOK_INFO);
+    oc_w_u64(w, m->webhook_id);
+    oc_w_u64(w, m->channel_id);
+    oc_w_bytes(w, m->token);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_set_presence(oc_wbuf *w, uint16_t version, const oc_set_presence *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_SET_PRESENCE);
     oc_w_u8(w, m->status);
@@ -977,6 +992,19 @@ oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries,
 
 oc_result oc_decode_open_dm(oc_rbuf *p, oc_open_dm *m) {
     m->user_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_create_webhook(oc_rbuf *p, oc_create_webhook *m) {
+    m->channel_id = oc_r_u64(p);
+    m->label = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_webhook_info(oc_rbuf *p, oc_webhook_info *m) {
+    m->webhook_id = oc_r_u64(p);
+    m->channel_id = oc_r_u64(p);
+    m->token = oc_r_bytes(p);
     return r_done(p);
 }
 

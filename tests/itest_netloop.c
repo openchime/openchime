@@ -64,6 +64,44 @@ static int client_open(client *c, int port, const uint8_t *pin) {
     return 0;
 }
 
+/* Open a TLS connection that does NOT offer the oc/1 ALPN, so the daemon routes
+ * it to the HTTP handler (ARCH-54) — used to drive the webhook endpoint. */
+static int http_client_open(client *c, int port, const uint8_t *pin) {
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((uint16_t)port);
+    c->fd = -1;
+    for (int i = 0; i < 200; i++) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) { c->fd = fd; break; }
+        close(fd);
+        usleep(20000);
+    }
+    if (c->fd < 0) return -1;
+    if (oc_tls_client_init_ex(&c->cli, pin, 0) != 0) return -1;   /* no ALPN */
+    if (oc_tls_conn_init(&c->conn, &c->cli.conf, c->fd) != 0) return -1;
+    if (handshake_blocking(&c->conn) != OC_TLS_OK) return -1;
+    oc_framebuf_init(&c->fb);
+    return 0;
+}
+
+/* Read the full HTTP response (until the server closes) into `buf`. */
+static size_t http_read_response(client *c, char *buf, size_t cap) {
+    size_t total = 0;
+    while (total < cap - 1) {
+        size_t n = 0;
+        oc_tls_status st = oc_tls_read(&c->conn, (uint8_t *)buf + total, cap - 1 - total, &n);
+        if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) continue;
+        if (n == 0) break;                 /* closed */
+        total += n;
+        if (st != OC_TLS_OK) break;
+    }
+    buf[total] = '\0';
+    return total;
+}
+
 static void client_close(client *c) {
     oc_framebuf_free(&c->fb);
     oc_tls_conn_free(&c->conn);
@@ -912,6 +950,66 @@ static void test_attachments_vertical(int port, const uint8_t *pin) {
     client_close(&b);
 }
 
+/* Incoming webhooks over the wire (REQ-170, ARCH-32/54): a client mints a
+ * per-channel token; a separate non-oc/1 (HTTP) TLS connection POSTs JSON to
+ * /webhook/<token>; the channel member receives the message as a BROADCAST and
+ * the sender gets 200. An unknown token gets 404. */
+static void test_webhook_vertical(int port, const uint8_t *pin) {
+    client a;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0; CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+
+    oc_header hdr; oc_rbuf p; uint8_t buf[256]; oc_wbuf w;
+
+    /* Mint a webhook for the default channel. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_create_webhook cw = { OC_DEFAULT_CHANNEL, oc_slice_str("ci") };
+    CHECK(oc_encode_create_webhook(&w, OC_PROTOCOL_VERSION, &cw) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_WEBHOOK_INFO);
+    oc_webhook_info wi; CHECK(oc_decode_webhook_info(&p, &wi) == OC_OK);
+    CHECK(wi.channel_id == OC_DEFAULT_CHANNEL && wi.token.len == 32);
+    char hex[65];
+    for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", wi.token.ptr[i]);
+
+    /* POST to the webhook over a non-oc/1 (HTTP) connection. */
+    client h;
+    CHECK(http_client_open(&h, port, pin) == 0);
+    const char *body = "{\"text\":\"from webhook\"}";
+    char req[512];
+    int rn = snprintf(req, sizeof req,
+        "POST /webhook/%s HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        "Content-Length: %zu\r\nConnection: close\r\n\r\n%s", hex, strlen(body), body);
+    CHECK(write_all(&h.conn, (const uint8_t *)req, (size_t)rn) == 0);
+
+    /* alice (a member) receives the posted message as a BROADCAST authored by
+     * the webhook's creator. */
+    CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BROADCAST);
+    oc_broadcast bc; CHECK(oc_decode_broadcast(&p, &bc) == OC_OK);
+    CHECK(bc.channel_id == OC_DEFAULT_CHANNEL && bc.author_id == ua);
+    CHECK(bc.body.len == 12 && memcmp(bc.body.ptr, "from webhook", 12) == 0);
+
+    /* The sender gets a 200. */
+    char resp[512];
+    http_read_response(&h, resp, sizeof resp);
+    CHECK(strncmp(resp, "HTTP/1.1 200", 12) == 0);
+    client_close(&h);
+
+    /* An unknown token gets a 404. */
+    client h2;
+    CHECK(http_client_open(&h2, port, pin) == 0);
+    rn = snprintf(req, sizeof req,
+        "POST /webhook/%064d HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\n"
+        "Content-Length: 2\r\nConnection: close\r\n\r\nhi", 0);
+    CHECK(write_all(&h2.conn, (const uint8_t *)req, (size_t)rn) == 0);
+    http_read_response(&h2, resp, sizeof resp);
+    CHECK(strncmp(resp, "HTTP/1.1 404", 12) == 0);
+    client_close(&h2);
+
+    client_close(&a);
+}
+
 /* Direct messages over the wire (REQ-050): OPEN_DM creates a kind=DM channel,
  * pushes a CHANNEL_INFO to the peer, the two participants exchange messages
  * through it, and a third user cannot post to it. */
@@ -1335,6 +1433,7 @@ int run_netloop_tests(void) {
         test_dm_vertical(arg.port, pin);
         test_presence_typing(arg.port, pin);
         test_attachments_vertical(arg.port, pin);
+        test_webhook_vertical(arg.port, pin);
         test_concurrent_load(arg.port, pin);
         test_send_rate_limit(arg.port, pin);
         test_out_buffer_cap(arg.port, pin, dbw, flooder);

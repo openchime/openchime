@@ -190,6 +190,23 @@ static const char MIGRATION_0009[] =
     "CREATE INDEX idx_attachments_message ON attachments(message_id);"
     "CREATE INDEX idx_attachments_pending ON attachments(uploader_id, created_at_ms);";
 
+/* 0010: incoming webhooks (REQ-170, ARCH-32). A webhook is a per-channel secret
+ * that lets an uncontrolled third party post a message without a user session.
+ * The token is stored hashed (SHA-256), like sessions — the raw value is shown
+ * once at creation. Posts are attributed to the creating user (`creator_id`).
+ * The unique token_hash index makes the HTTP-side lookup a single indexed probe. */
+static const char MIGRATION_0010[] =
+    "CREATE TABLE webhooks ("
+    "  id            INTEGER PRIMARY KEY,"
+    "  channel_id    INTEGER NOT NULL REFERENCES channels(id),"
+    "  creator_id    INTEGER NOT NULL REFERENCES users(id),"
+    "  token_hash    BLOB NOT NULL,"
+    "  label         TEXT NOT NULL DEFAULT '',"
+    "  disabled      INTEGER NOT NULL DEFAULT 0 CHECK (disabled IN (0,1)),"
+    "  created_at_ms INTEGER NOT NULL"
+    ");"
+    "CREATE UNIQUE INDEX idx_webhooks_token ON webhooks(token_hash);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -200,6 +217,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 7, MIGRATION_0007 },
     { 8, MIGRATION_0008 },
     { 9, MIGRATION_0009 },
+    { 10, MIGRATION_0010 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

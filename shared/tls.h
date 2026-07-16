@@ -72,6 +72,9 @@ int  oc_tls_server_fingerprint(const oc_tls_server *s, uint8_t out[OC_TLS_FINGER
 /* Initialize a client. If `pin` is non-NULL it must point to
  * OC_TLS_FINGERPRINT_LEN bytes and enables TOFU pinning. Returns 0 on success. */
 int  oc_tls_client_init(oc_tls_client *c, const uint8_t *pin);
+/* As above, but `with_alpn == 0` omits the oc/1 ALPN — for an HTTP/webhook
+ * client that the daemon should route to its HTTP handler (ARCH-32/54). */
+int  oc_tls_client_init_ex(oc_tls_client *c, const uint8_t *pin, int with_alpn);
 void oc_tls_client_free(oc_tls_client *c);
 
 /* Set up a connection object. `endpoint` is MBEDTLS_SSL_IS_SERVER or

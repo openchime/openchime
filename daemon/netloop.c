@@ -5,7 +5,9 @@
 #include "netloop.h"
 #include "blobstore.h"
 #include "framebuf.h"
+#include "http.h"
 #include "protocol.h"
+#include "ratelimit.h"
 
 #include <mbedtls/sha256.h>
 
@@ -93,6 +95,13 @@ typedef struct {
     uint32_t     send_count;     /* sends counted in the current window */
     uint8_t      presence;       /* OC_PRESENCE_ONLINE / _AWAY (per connection) */
     conn_xfer    xfer;           /* in-flight attachment transfer, if any */
+    /* HTTP mode (ARCH-32/54): a connection that did not negotiate the oc/1 ALPN
+     * is a webhook/HTTP client, not a binary-protocol peer. `hin` accumulates the
+     * request; `http_pending` marks it as awaiting a webhook-post result. */
+    int          http;
+    uint8_t     *hin;
+    size_t       hlen, hcap;
+    int          http_pending;
 } conn;
 
 /* Scratch for encoding one outgoing frame; net thread only, so a single static
@@ -105,6 +114,13 @@ static uint64_t g_next_conn_id = 1;
  * with g_enc/g_next_conn_id. */
 static oc_blobstore *g_blobs;
 static uint64_t      g_max_attach = OC_MAX_ATTACHMENT_SIZE;
+
+/* Per-webhook-token rate limit for the incoming-webhook endpoint (REQ-170). A
+ * fixed window keyed by the token, so one noisy integration can't flood a
+ * channel. Created in oc_netloop_run. */
+static oc_ratelimit *g_webhook_rl;
+#define OC_WEBHOOK_RATE_MAX     60u
+#define OC_WEBHOOK_RATE_WINDOW  60000u
 
 /* Abort/close any in-flight transfer on a connection and reset its state. A
  * still-open upload writer is aborted (its staged bytes discarded), so an
@@ -216,6 +232,7 @@ static void conn_close(int ep, conn **conns, int fd) {
     oc_tls_conn_free(&c->tls);
     oc_framebuf_free(&c->fb);
     free(c->out);
+    free(c->hin);
     close(fd);
     free(c);
     conns[fd] = NULL;
@@ -738,6 +755,18 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_CREATE_WEBHOOK) {
+            oc_create_webhook cw;
+            if (oc_decode_create_webhook(&p, &cw) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_CREATE_WEBHOOK, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = cw.channel_id;
+            j->ch_name = cw.label.len ? strndup((const char *)cw.label.ptr, cw.label.len) : strdup("");
+            if (!j->ch_name) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_UPLOAD_BEGIN) {
             oc_upload_begin ub;
             if (oc_decode_upload_begin(&p, &ub) != OC_OK) return -1;
@@ -839,8 +868,132 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
     }
 }
 
+/* --- HTTP / incoming webhooks (ARCH-32, REQ-170) ------------------------ */
+
+/* Total request bytes we'll buffer for an HTTP connection: a full body plus
+ * generous header headroom. Beyond this the request is refused (413). */
+#define OC_HTTP_MAX_REQUEST (OC_MAX_BODY_SIZE + 16384u)
+
+static int hexval(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+static int hex_decode(const char *hex, size_t hexlen, uint8_t *out, size_t outcap) {
+    if (hexlen % 2 != 0 || hexlen / 2 > outcap) return -1;
+    for (size_t i = 0; i < hexlen; i += 2) {
+        int hi = hexval(hex[i]), lo = hexval(hex[i + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        out[i / 2] = (uint8_t)((hi << 4) | lo);
+    }
+    return (int)(hexlen / 2);
+}
+
+/* Queue an HTTP/1.1 response (Connection: close) into the output buffer. */
+static void http_reply(conn *c, int status, const char *reason,
+                       const char *ctype, const char *body, size_t blen) {
+    char hdr[256];
+    int n = snprintf(hdr, sizeof hdr,
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n\r\n",
+        status, reason, ctype, blen);
+    if (n < 0 || n >= (int)sizeof hdr) return;
+    out_append(c, (const uint8_t *)hdr, (size_t)n);
+    if (body && blen) out_append(c, (const uint8_t *)body, blen);
+}
+
+/* Dispatch one fully-parsed HTTP request. The only route is
+ * POST /webhook/<hex-token>; everything else gets a terminal status. Returns 0
+ * to keep the connection (a webhook post is awaiting its result) or -1 to close
+ * (a response has been queued). */
+static int on_http_request(conn *c, const oc_http_req *req, oc_dbwriter *dbw) {
+    if (req->method_len != 4 || memcmp(req->method, "POST", 4) != 0) {
+        http_reply(c, 405, "Method Not Allowed", "text/plain", "method not allowed\n", 19);
+        return -1;
+    }
+    static const char PFX[] = "/webhook/";
+    size_t pfx = sizeof PFX - 1;
+    if (req->path_len <= pfx || memcmp(req->path, PFX, pfx) != 0) {
+        http_reply(c, 404, "Not Found", "text/plain", "not found\n", 10);
+        return -1;
+    }
+    const char *tokhex = req->path + pfx;
+    size_t tokhexlen = req->path_len - pfx;
+    const char *q = memchr(tokhex, '?', tokhexlen);      /* drop any query string */
+    if (q) tokhexlen = (size_t)(q - tokhex);
+
+    uint8_t token[OC_SESSION_TOKEN_LEN];
+    if (hex_decode(tokhex, tokhexlen, token, sizeof token) != (int)sizeof token) {
+        http_reply(c, 404, "Not Found", "text/plain", "not found\n", 10);
+        return -1;
+    }
+    const char *text = NULL; size_t tlen = 0;
+    if (!oc_http_webhook_text(req, &text, &tlen) || tlen == 0) {
+        http_reply(c, 400, "Bad Request", "text/plain", "empty message\n", 14);
+        return -1;
+    }
+    if (tlen > OC_MAX_BODY_SIZE) tlen = OC_MAX_BODY_SIZE;
+
+    char key[2 * OC_SESSION_TOKEN_LEN + 1];
+    size_t klen = tokhexlen < sizeof key - 1 ? tokhexlen : sizeof key - 1;
+    memcpy(key, tokhex, klen); key[klen] = '\0';
+    uint64_t now = now_ms();
+    if (g_webhook_rl && oc_ratelimit_blocked(g_webhook_rl, key, now)) {
+        http_reply(c, 429, "Too Many Requests", "text/plain", "rate limited\n", 13);
+        return -1;
+    }
+    if (g_webhook_rl) oc_ratelimit_record(g_webhook_rl, key, now);
+
+    oc_job *j = oc_job_new(OC_JOB_WEBHOOK_POST, c->conn_id);
+    if (!j || oc_job_set_token(j, token, sizeof token) != 0 ||
+        oc_job_set_body(j, text, tlen) != 0) {
+        http_reply(c, 500, "Internal Server Error", "text/plain", "error\n", 6);
+        return -1;
+    }
+    oc_dbwriter_submit(dbw, j);
+    c->http_pending = 1;       /* response written when the post result returns */
+    return 0;
+}
+
+/* Read for an HTTP (non-oc/1) connection: accumulate the request, parse, dispatch.
+ * Returns 0 to keep, -1 to close. */
+static int on_http_readable(conn *c, oc_dbwriter *dbw) {
+    for (;;) {
+        uint8_t chunk[OC_READ_CHUNK];
+        size_t n = 0;
+        oc_tls_status st = oc_tls_read(&c->tls, chunk, sizeof chunk, &n);
+        if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) return 0;
+        if (st == OC_TLS_CLOSED || st == OC_TLS_ERROR) return -1;
+        if (c->http_pending) continue;              /* already dispatched; drain quietly */
+        if (c->hlen + n > OC_HTTP_MAX_REQUEST) {
+            http_reply(c, 413, "Payload Too Large", "text/plain", "too large\n", 10);
+            return -1;
+        }
+        if (c->hlen + n > c->hcap) {
+            size_t nc = c->hcap ? c->hcap : 4096;
+            while (nc < c->hlen + n) nc *= 2;
+            uint8_t *g = realloc(c->hin, nc);
+            if (!g) return -1;
+            c->hin = g; c->hcap = nc;
+        }
+        memcpy(c->hin + c->hlen, chunk, n);
+        c->hlen += n;
+
+        oc_http_req req;
+        int pr = oc_http_parse((const char *)c->hin, c->hlen, OC_MAX_BODY_SIZE, &req);
+        if (pr < 0) { http_reply(c, 400, "Bad Request", "text/plain", "bad request\n", 12); return -1; }
+        if (pr == 0) continue;                      /* need more bytes */
+        return on_http_request(c, &req, dbw);       /* complete request */
+    }
+}
+
 /* Read, reassemble, and dispatch. Returns 0 to keep, -1 to close. */
 static int on_readable(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
+    if (c->http) return on_http_readable(c, dbw);
     for (;;) {
         uint8_t chunk[OC_READ_CHUNK];
         size_t n = 0;
@@ -1355,6 +1508,58 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
         break;
     }
+    case OC_RES_WEBHOOK_CREATED: {
+        /* Hand the minted token back to the client that asked (shown once). */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_webhook_info wi = { r->message_id, r->channel_id, { r->session_token, OC_SESSION_TOKEN_LEN } };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_webhook_info(&w, OC_PROTOCOL_VERSION, &wi);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_WEBHOOK_POSTED: {
+        /* Fan the posted message out to connected members (like SEND_OK)... */
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice body = { r->body, r->body_len };
+        oc_broadcast b = { r->message_id, r->channel_id, r->author_id, r->server_time, body, 0, {{0}} };
+        oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &b);
+        size_t blen = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *m = conns[fd];
+            if (m && m->authed && in_members(m->user_id, r->members, r->n_members))
+                send_bytes(ep, conns, fd, g_enc, blen);
+        }
+        /* ...then 200 the webhook sender and close its HTTP connection. */
+        conn *hc = find_by_id(conns, r->conn_id);
+        if (hc) {
+            char jb[64];
+            int jn = snprintf(jb, sizeof jb, "{\"ok\":true,\"message_id\":%llu}\n",
+                              (unsigned long long)r->message_id);
+            http_reply(hc, 200, "OK", "application/json", jb, jn > 0 ? (size_t)jn : 0);
+            flush_out(hc);
+            conn_close(ep, conns, hc->fd);
+        }
+        break;
+    }
+    case OC_RES_WEBHOOK_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        if (c->http) {
+            int status = 404; const char *reason = "Not Found"; const char *msg = "unknown webhook\n";
+            if (r->err_code == OC_ERR_INTERNAL) { status = 500; reason = "Internal Server Error"; msg = "error\n"; }
+            http_reply(c, status, reason, "text/plain", msg, strlen(msg));
+            flush_out(c);
+            conn_close(ep, conns, c->fd);
+        } else {
+            /* CREATE_WEBHOOK failure on a binary client -> ERROR frame. */
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("webhook error") };
+            oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        break;
+    }
     case OC_RES_BACKFILL_OK: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
@@ -1424,6 +1629,10 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         g_max_attach = OC_MAX_ATTACHMENT_SIZE;
         if (cap && *cap) { unsigned long long v = strtoull(cap, NULL, 10); if (v) g_max_attach = v; }
     }
+
+    /* Per-webhook rate limit (REQ-170); best-effort — if allocation fails the
+     * endpoint still works, just unthrottled. */
+    g_webhook_rl = oc_ratelimit_new(OC_WEBHOOK_RATE_MAX, OC_WEBHOOK_RATE_WINDOW, 1024);
 
     /* Per-source-IP concurrent-connection cap (0 disables). Blunts a
      * connection-exhaustion flood from one host while staying generous enough
@@ -1509,7 +1718,13 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
 
             if (c->state == CONN_HANDSHAKE) {
                 oc_tls_status st = oc_tls_handshake(&c->tls);
-                if (st == OC_TLS_OK)              c->state = CONN_ESTABLISHED;
+                if (st == OC_TLS_OK) {
+                    c->state = CONN_ESTABLISHED;
+                    /* ALPN demux (ARCH-54): a peer that didn't negotiate oc/1 is an
+                     * HTTP/webhook client, routed to the HTTP handler (ARCH-32). */
+                    const char *alpn = oc_tls_alpn_selected(&c->tls);
+                    c->http = (!alpn || strcmp(alpn, OC_ALPN_PROTO) != 0);
+                }
                 else if (st == OC_TLS_WANT_READ)  { conn_set_events(ep, c, EPOLLIN);  continue; }
                 else if (st == OC_TLS_WANT_WRITE) { conn_set_events(ep, c, EPOLLOUT); continue; }
                 else { conn_close(ep, conns, fd); continue; }
@@ -1529,6 +1744,8 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         if (conns[fd]) conn_close(ep, conns, fd);
     oc_blobstore_close(g_blobs);
     g_blobs = NULL;
+    oc_ratelimit_free(g_webhook_rl);
+    g_webhook_rl = NULL;
     close(ep);
     close(lfd);
     free(conns);

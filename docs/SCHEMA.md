@@ -317,6 +317,27 @@ exists").
 
 ---
 
+## 3h. Migration 0010 — incoming webhooks (REQ-170, ARCH-32/71)
+
+Lets an uncontrolled third party post a message into one channel over the HTTP
+endpoint without a user session or JWT.
+
+### `webhooks`
+- `id` (PK) — the webhook id (returned to the creating client).
+- `channel_id` (FK `channels`) — the single channel this token may post to.
+- `creator_id` (FK `users`) — the member who minted it; posts are attributed to
+  this user.
+- `token_hash` (BLOB) — **SHA-256 of the 32-byte token**, never the token
+  itself (the raw value is shown once at creation, like a session — ARCH-58).
+- `label` (TEXT) — a human note (e.g. "GitHub CI").
+- `disabled` (INTEGER 0/1) — a soft off switch; a disabled token 404s.
+- `created_at_ms` (INTEGER).
+
+A **unique index on `token_hash`** makes the per-request HTTP-side lookup a
+single indexed probe and forbids duplicate tokens.
+
+---
+
 ## 4. Deferred to later migrations
 
 Tracked here so the omissions are deliberate, not forgotten:

@@ -2044,6 +2044,87 @@ static oc_dbres *process_attach_lookup(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Incoming webhooks (REQ-170, ARCH-32). CREATE_WEBHOOK mints a per-channel token
+ * for a client that can post to the channel; the raw 32-byte token is returned
+ * once (only its SHA-256 is stored, like a session). Write. */
+static oc_dbres *process_create_webhook(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+
+    int acc = channel_post_access(db, j->channel_id, j->user_id);
+    if (acc == CH_UNKNOWN) { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
+    if (acc == CH_DENIED)  { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;   return r; }
+
+    uint8_t token[OC_SESSION_TOKEN_LEN], hash[OC_SHA256_LEN];
+    if (oc_rand_bytes(token, sizeof token) != 0 || oc_sha256(token, sizeof token, hash) != 0) {
+        r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+    }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO webhooks(channel_id, creator_id, token_hash, label, created_at_ms) "
+        "VALUES(?, ?, ?, ?, ?);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_bind_blob (st, 3, hash, sizeof hash, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 4, j->ch_name ? j->ch_name : "", -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)dbw_now_ms());
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+
+    r->type = OC_RES_WEBHOOK_CREATED;
+    r->message_id = (uint64_t)sqlite3_last_insert_rowid(db);  /* webhook id */
+    memcpy(r->session_token, token, sizeof token);            /* raw token, shown once */
+    return r;
+}
+
+/* WEBHOOK_POST resolves a token presented over HTTP and posts the message body
+ * as the webhook's creator (REQ-170). Each POST is a fresh message (no
+ * idempotency — the sender is an uncontrolled third party). Result carries the
+ * SEND-style broadcast fields so the net thread fans it out to members. Write. */
+static oc_dbres *process_webhook_post(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+
+    uint8_t hash[OC_SHA256_LEN];
+    if (j->token_len != OC_SESSION_TOKEN_LEN || oc_sha256(j->token, j->token_len, hash) != 0) {
+        r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_UNKNOWN_WEBHOOK; return r;
+    }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT channel_id, creator_id FROM webhooks WHERE token_hash=? AND disabled=0;", -1, &st, NULL);
+    sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_TRANSIENT);
+    int found = sqlite3_step(st) == SQLITE_ROW;
+    uint64_t cid = found ? (uint64_t)sqlite3_column_int64(st, 0) : 0;
+    uint64_t creator = found ? (uint64_t)sqlite3_column_int64(st, 1) : 0;
+    sqlite3_finalize(st);
+    if (!found) { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_UNKNOWN_WEBHOOK; return r; }
+
+    uint64_t ts = dbw_now_ms();
+    sqlite3_prepare_v2(db,
+        "INSERT INTO messages(channel_id, author_id, body, created_at_ms) VALUES(?, ?, ?, ?);",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)cid);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)creator);
+    sqlite3_bind_blob (st, 3, j->body, (int)j->body_len, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)ts);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+
+    r->type = OC_RES_WEBHOOK_POSTED;
+    r->message_id = (uint64_t)sqlite3_last_insert_rowid(db);
+    r->channel_id = cid;
+    r->author_id = creator;
+    r->server_time = ts;
+    if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
+    load_members(db, cid, r);
+    return r;
+}
+
 /* Read-only query jobs run on the reader connection (ARCH-66), off the writer
  * thread, so a heavy search/backfill can't stall message sends or auth. */
 static int is_read_job(int type) {
@@ -2092,6 +2173,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_STORE_IDENTITY) return process_store_identity(w->db, j);
     if (j->type == OC_JOB_ATTACH_CREATE)   return process_attach_create(w->db, j);
     if (j->type == OC_JOB_ATTACH_FINALIZE) return process_attach_finalize(w->db, j);
+    if (j->type == OC_JOB_CREATE_WEBHOOK)  return process_create_webhook(w->db, j);
+    if (j->type == OC_JOB_WEBHOOK_POST)    return process_webhook_post(w->db, j);
     return NULL;
 }
 

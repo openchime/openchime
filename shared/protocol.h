@@ -75,6 +75,8 @@ typedef enum {
     OC_MSG_INVITE_TO_CHANNEL  = 0x0056, /* C->S (REQ-033, channel-level) */
     OC_MSG_REMOVE_FROM_CHANNEL= 0x0057, /* C->S (REQ-033, channel-level) */
     OC_MSG_OPEN_DM            = 0x0058, /* C->S, open/get a 1:1 DM (REQ-050) */
+    OC_MSG_CREATE_WEBHOOK     = 0x0059, /* C->S, mint an incoming-webhook token (REQ-170) */
+    OC_MSG_WEBHOOK_INFO       = 0x005A, /* S->C, the minted webhook id + token (shown once) */
     OC_MSG_SET_PRESENCE     = 0x0070, /* C->S, set own presence (REQ-120) */
     OC_MSG_PRESENCE_UPDATE  = 0x0071, /* S->C, a user's presence changed */
     OC_MSG_TYPING           = 0x0072, /* C->S, "I am typing" in a channel (REQ-121) */
@@ -128,6 +130,7 @@ typedef enum {
     OC_ERR_ATTACHMENT_TOO_LARGE = 3010, /* upload exceeds MAX_ATTACHMENT_SIZE (REQ-140) */
     OC_ERR_UNKNOWN_ATTACHMENT  = 3011, /* no such attachment, or not finalized (REQ-141) */
     OC_ERR_TRANSFER_PROTOCOL   = 3012, /* out-of-order/oversized chunk or bad transfer state */
+    OC_ERR_UNKNOWN_WEBHOOK     = 3013, /* no such (or disabled) incoming webhook token (REQ-170) */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 
@@ -306,6 +309,11 @@ typedef struct { uint64_t channel_id; } oc_channel_ref;                       /*
 typedef struct { uint64_t channel_id; uint64_t user_id; } oc_channel_member_op; /* INVITE / REMOVE */
 typedef struct { uint64_t channel_id; oc_slice name; uint8_t is_public; uint8_t joined; uint8_t kind; } oc_channel_list_entry;
 typedef struct { uint64_t user_id; } oc_open_dm;
+/* Incoming-webhook management (REQ-170). CREATE_WEBHOOK asks for a token scoped
+ * to a channel; WEBHOOK_INFO returns the id + the raw 32-byte token (shown once,
+ * the client hex-encodes it into the POST URL). */
+typedef struct { uint64_t channel_id; oc_slice label; } oc_create_webhook;
+typedef struct { uint64_t webhook_id; uint64_t channel_id; oc_slice token; } oc_webhook_info;
 typedef struct { uint8_t status; } oc_set_presence;
 typedef struct { uint64_t user_id; uint8_t status; } oc_presence_update;
 typedef struct { uint64_t channel_id; } oc_typing;
@@ -380,6 +388,8 @@ oc_result oc_encode_leave_channel(oc_wbuf *w, uint16_t version, const oc_channel
 oc_result oc_encode_invite_to_channel(oc_wbuf *w, uint16_t version, const oc_channel_member_op *m);
 oc_result oc_encode_remove_from_channel(oc_wbuf *w, uint16_t version, const oc_channel_member_op *m);
 oc_result oc_encode_open_dm(oc_wbuf *w, uint16_t version, const oc_open_dm *m);
+oc_result oc_encode_create_webhook(oc_wbuf *w, uint16_t version, const oc_create_webhook *m);
+oc_result oc_encode_webhook_info(oc_wbuf *w, uint16_t version, const oc_webhook_info *m);
 oc_result oc_encode_set_presence(oc_wbuf *w, uint16_t version, const oc_set_presence *m);
 oc_result oc_encode_presence_update(oc_wbuf *w, uint16_t version, const oc_presence_update *m);
 oc_result oc_encode_typing(oc_wbuf *w, uint16_t version, const oc_typing *m);
@@ -450,6 +460,8 @@ oc_result oc_decode_leave_channel(oc_rbuf *p, oc_channel_ref *m);
 oc_result oc_decode_invite_to_channel(oc_rbuf *p, oc_channel_member_op *m);
 oc_result oc_decode_remove_from_channel(oc_rbuf *p, oc_channel_member_op *m);
 oc_result oc_decode_open_dm(oc_rbuf *p, oc_open_dm *m);
+oc_result oc_decode_create_webhook(oc_rbuf *p, oc_create_webhook *m);
+oc_result oc_decode_webhook_info(oc_rbuf *p, oc_webhook_info *m);
 oc_result oc_decode_set_presence(oc_rbuf *p, oc_set_presence *m);
 oc_result oc_decode_presence_update(oc_rbuf *p, oc_presence_update *m);
 oc_result oc_decode_typing(oc_rbuf *p, oc_typing *m);

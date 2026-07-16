@@ -41,7 +41,11 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * size + digest on UPLOAD_END (write); LOOKUP authorizes + fetches the
         * pointer for a download (read). */
        OC_JOB_ATTACH_CREATE = 30, OC_JOB_ATTACH_FINALIZE = 31,
-       OC_JOB_ATTACH_LOOKUP = 32 };
+       OC_JOB_ATTACH_LOOKUP = 32,
+       /* Incoming webhooks (REQ-170). CREATE_WEBHOOK mints a per-channel token
+        * for a client; WEBHOOK_POST resolves a token presented over HTTP and
+        * posts the message as the webhook's creator. */
+       OC_JOB_CREATE_WEBHOOK = 33, OC_JOB_WEBHOOK_POST = 34 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -133,7 +137,11 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
         * opens the blob). ATTACH_OK: an upload finalized. ATTACH_META: an
         * authorized download's pointer + metadata. ATTACH_ERR: err_code. */
        OC_RES_ATTACH_CREATED = 34, OC_RES_ATTACH_OK = 35,
-       OC_RES_ATTACH_META = 36, OC_RES_ATTACH_ERR = 37 };
+       OC_RES_ATTACH_META = 36, OC_RES_ATTACH_ERR = 37,
+       /* Webhooks. CREATED: a minted token for a client. POSTED: a message
+        * posted via HTTP (carries SEND-style broadcast fields). ERR: err_code. */
+       OC_RES_WEBHOOK_CREATED = 38, OC_RES_WEBHOOK_POSTED = 39,
+       OC_RES_WEBHOOK_ERR = 40 };
 
 /* One row in a REACTIONS result (a distinct emoji + one reacting user). */
 typedef struct { char *emoji; uint64_t user_id; } oc_reaction_row;

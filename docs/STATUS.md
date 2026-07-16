@@ -89,8 +89,8 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 141 attachment access control | ✅ | Proxied bytes → download authorized by the ordinary channel-read check on the attachment's channel; no signed URLs (ARCH-69). Verified over the wire (cross-user fetch allowed; non-member refused) and in dbwriter units. |
 | 150–152 server-relayed audio | ⛔ | |
 | 160 video | ➖ | Deliberate scope exclusion. |
-| 170 incoming webhooks | ⛔ | Only `/healthz` HTTP exists; ALPN demux to an HTTP handler is designed, not built. |
-| 171 CA-signed cert for webhooks | ⛔ | Tied to webhooks. |
+| 170 incoming webhooks | ✅ | ALPN-demuxed HTTP handler on the proto port; `POST /webhook/<token>` posts as the creator (ARCH-71). Client mints tokens via `CREATE_WEBHOOK`; hashed storage (migration 0010); JSON/plain body; per-token rate limit. Tested end-to-end. |
+| 171 CA-signed cert for webhooks | ⛔ | Endpoint currently served on the daemon's TOFU cert; on-demand CA/ACME issuance (ARCH-34) is the remaining infra follow-up. |
 
 ### 8. Security Posture
 
@@ -99,7 +99,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 180 encrypted transport, no plaintext fallback | ✅ | TLS-only. |
 | 181 daemon-controlled session + expiry | ✅ | `sessions` table, daemon-set TTL. |
 | 182 session revocation / logout | ✅ | `LOGOUT` deletes rows + drops the connection. |
-| 183 TOFU self-signed pinning | ✅ | Webhook CA-cert exception (REQ-171) not built (webhooks not built). |
+| 183 TOFU self-signed pinning | ✅ | Client-daemon TLS is TOFU-pinned; the webhook CA-cert exception (REQ-171) is not yet built, so the webhook endpoint currently reuses the TOFU cert. |
 | 190 per-connection send rate limit | ✅ | Per-connection fixed window (30 sends / 3s) on `SEND`/`SEND_REPLY`; excess → non-fatal `SEND_RATE_LIMITED`. |
 | 191 failed-auth rate limit (account + source) | ✅ | Fixed-window, checked before PBKDF2. |
 
@@ -173,7 +173,7 @@ full-text search — all reachable over the wire and tested end-to-end.
 
 The **largest missing surfaces** are (a) a real **client** beyond the Phase-1
 skeleton (the only consumer of all the above), and (b) whole **feature families
-not yet begun**: notifications/push, audio, and webhooks. Presence/typing
+not yet begun**: notifications/push and audio. Presence/typing
 (REQ-120/121) is built and tested end-to-end. **Attachments** (REQ-140/141) have
 their proxied chunked transfer + access control built and tested over the wire
 (local-FS blob store; S3/MinIO adapter and message-linking are the remaining
@@ -185,7 +185,8 @@ reads decoupled onto a read-only connection, server-side delivery accounting, a
 per-IP connection throttle, TLS-identity persistence across restore, truncation
 signals, the first-owner setup token, and a codec fuzzer + concurrency load
 test. What remains is **not** hardening but **scope**: a real client, the
-unbuilt feature families (notifications/push, attachments, audio, webhooks), and
-a quantitative capacity benchmark for REQ-210/211. Attachments (REQ-140/141) are
-built end-to-end — proxied chunked transfer, access control, and message-linking
+unbuilt feature families (notifications/push, audio), and a quantitative capacity
+benchmark for REQ-210/211. Incoming webhooks (REQ-170) are built end-to-end
+(ARCH-71), pending only the CA-signed cert (REQ-171). Attachments (REQ-140/141)
+are built end-to-end — proxied chunked transfer, access control, and message-linking
 — with the S3/MinIO blob adapter and thread-reply attachments as follow-ups.

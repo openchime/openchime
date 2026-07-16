@@ -195,7 +195,7 @@ static int client_verify(void *ctx, mbedtls_x509_crt *crt, int depth, uint32_t *
     return 0;
 }
 
-int oc_tls_client_init(oc_tls_client *c, const uint8_t *pin) {
+int oc_tls_client_init_ex(oc_tls_client *c, const uint8_t *pin, int with_alpn) {
     int rc;
     static const char *pers = "openchimed-tls-client";
 
@@ -219,9 +219,15 @@ int oc_tls_client_init(oc_tls_client *c, const uint8_t *pin) {
      * mismatch still fails the connection (TOFU, ARCH-10). */
     mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
     mbedtls_ssl_conf_verify(&c->conf, client_verify, c);
-    if ((rc = mbedtls_ssl_conf_alpn_protocols(&c->conf, oc_tls_alpn)) != 0)
+    /* Offer the oc/1 ALPN for the binary protocol; an HTTP/webhook client omits
+     * it so the daemon's ALPN demux (ARCH-54) routes it to the HTTP handler. */
+    if (with_alpn && (rc = mbedtls_ssl_conf_alpn_protocols(&c->conf, oc_tls_alpn)) != 0)
         return rc;
     return 0;
+}
+
+int oc_tls_client_init(oc_tls_client *c, const uint8_t *pin) {
+    return oc_tls_client_init_ex(c, pin, 1);
 }
 
 void oc_tls_client_free(oc_tls_client *c) {

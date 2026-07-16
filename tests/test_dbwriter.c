@@ -50,7 +50,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 9);
+    CHECK(oc_schema_version(db) == 10);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -1558,6 +1558,68 @@ static void test_attachments(void) {
     cleanup_db(path);
 }
 
+/* Incoming webhooks (REQ-170): minting a token and posting via it resolve to a
+ * message in the scoped channel authored by the webhook's creator. */
+static void test_webhooks(void) {
+    const char *path = "build/test_dbwriter_webhook.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t alice = reg(w, "wh-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "wh-bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    /* Mint a webhook on the default (public) channel. */
+    oc_job *j = oc_job_new(OC_JOB_CREATE_WEBHOOK, 1);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->ch_name = strdup("ci");
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_CREATED && r->message_id > 0);
+    uint8_t token[OC_SESSION_TOKEN_LEN];
+    memcpy(token, r->session_token, sizeof token);
+    oc_dbres_free(r);
+
+    /* Post via the token: a message in the channel authored by the creator. */
+    j = oc_job_new(OC_JOB_WEBHOOK_POST, 2);
+    oc_job_set_token(j, token, sizeof token);
+    oc_job_set_body(j, "from ci", 7);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_POSTED);
+    CHECK(r->channel_id == OC_DEFAULT_CHANNEL && r->author_id == alice && r->message_id > 0);
+    CHECK(r->body_len == 7 && memcmp(r->body, "from ci", 7) == 0);
+    int saw_alice = 0;
+    for (size_t i = 0; i < r->n_members; i++) if (r->members[i] == alice) saw_alice = 1;
+    CHECK(saw_alice);
+    oc_dbres_free(r);
+
+    /* An unknown token is refused. */
+    uint8_t bad[OC_SESSION_TOKEN_LEN]; memset(bad, 0xEE, sizeof bad);
+    j = oc_job_new(OC_JOB_WEBHOOK_POST, 3);
+    oc_job_set_token(j, bad, sizeof bad);
+    oc_job_set_body(j, "x", 1);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_ERR && r->err_code == OC_ERR_UNKNOWN_WEBHOOK);
+    oc_dbres_free(r);
+
+    /* A non-member cannot mint a webhook on a private channel. */
+    r = create_channel(w, alice, "secret", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t priv = r->channel_id;
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_CREATE_WEBHOOK, 4);
+    j->user_id = bob; j->channel_id = priv; j->ch_name = strdup("x");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_dm(void) {
     const char *path = "build/test_dbwriter_dm.db";
     cleanup_db(path);
@@ -1656,6 +1718,7 @@ int run_dbwriter_tests(void) {
     test_channels();
     test_dm();
     test_attachments();
+    test_webhooks();
     test_admin_ops();
     test_reactions();
     test_threads();

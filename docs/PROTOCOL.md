@@ -832,6 +832,37 @@ finalize are swept by a time-gated cleanup (ARCH-70).
 
 ---
 
+### 5.15 Incoming webhooks (REQ-170, ARCH-32/71)
+
+An incoming webhook lets an uncontrolled third party post a message into one
+channel over HTTP, with no user session. There are two surfaces: the
+**binary-protocol frames** a client uses to mint a token, and the **HTTP
+endpoint** the third party posts to.
+
+**`CREATE_WEBHOOK` (C → S), `0x0059`** `{ channel_id: u64, label: str }` — an
+authenticated member of `channel_id` mints a webhook (same post access as
+sending). `label` is a human note. Fails (`ERROR`) with `UNKNOWN_CHANNEL` /
+`NOT_A_MEMBER` if the caller can't post there.
+
+**`WEBHOOK_INFO` (S → C), `0x005A`** `{ webhook_id: u64, channel_id: u64, token:
+bytes }` — the minted **32-byte token, shown once**. Only its SHA-256 is stored
+(ARCH-71); the client hex-encodes the token into the POST URL and cannot recover
+it later.
+
+**HTTP endpoint — `POST /webhook/<hex-token>`.** Reached over the same TLS proto
+port, demultiplexed by ALPN (ARCH-54): a connection that does **not** negotiate
+`oc/1` is served by the HTTP/1.1 handler. The body is either
+`application/json {"text": "..."}` or a raw `text/plain` message, capped at
+`MAX_BODY_SIZE`. The daemon hex-decodes the token, looks it up by hash, and posts
+the text as a message **authored by the webhook's creator** — delivered to the
+channel's members as an ordinary `BROADCAST` (§5.3) and included in backfill.
+Responses: `200 {"ok":true,"message_id":N}` on success; `400` (empty/bad body),
+`404` (unknown or disabled token), `405` (non-POST), `413` (too large), `429`
+(per-token rate limit, 60/min). Note: REQ-171's CA-signed certificate for this
+endpoint is not yet implemented — it currently uses the daemon's TOFU cert.
+
+---
+
 ## 6. Reconnect backfill (resolves REQ-101)
 
 A client that reconnects (REQ-100) requests everything it missed since its
@@ -992,6 +1023,8 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0056` | `INVITE_TO_CHANNEL`| C → S     | no        | §5.7    |
 | `0x0057` | `REMOVE_FROM_CHANNEL`| C → S   | no        | §5.7    |
 | `0x0058` | `OPEN_DM`          | C → S     | no        | §5.12   |
+| `0x0059` | `CREATE_WEBHOOK`   | C → S     | no        | §5.15   |
+| `0x005A` | `WEBHOOK_INFO`     | S → C     | no        | §5.15   |
 | `0x0070` | `SET_PRESENCE`     | C → S     | no        | §5.13   |
 | `0x0071` | `PRESENCE_UPDATE`  | S → C     | no        | §5.13   |
 | `0x0072` | `TYPING`           | C → S     | no        | §5.13   |
@@ -1065,6 +1098,7 @@ until that milestone lands.
 | REQ-121     | Member-scoped `TYPING` / `TYPING_UPDATE`; ~6s client-side expiry, no stop frame (§5.13, ARCH-68). |
 | REQ-140     | Chunked upload/download proxied through the daemon; blob in object storage, pointer in SQLite (§5.14, ARCH-69/70). |
 | REQ-141     | Every byte proxied, so access control is the ordinary membership check on the attached message — no signed URLs (§5.14, ARCH-69). |
+| REQ-170     | `CREATE_WEBHOOK`/`WEBHOOK_INFO` mint a hashed per-channel token; `POST /webhook/<token>` (ALPN-demuxed HTTP) posts as the creator (§5.15, ARCH-71). |
 
 Related decisions newly recorded in ARCHITECTURE.md: ARCH-41 (handshake &
 version negotiation), ARCH-42 (primitive field encodings), ARCH-43 (message id

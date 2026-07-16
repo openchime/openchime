@@ -91,6 +91,8 @@ static void decode_all(const uint8_t *buf, size_t len) {
     oc_download_chunk dc; D(oc_decode_download_chunk(&p, &dc));
     oc_download_end den; D(oc_decode_download_end(&p, &den));
     oc_transfer_cancel tc; D(oc_decode_transfer_cancel(&p, &tc));
+    oc_create_webhook cwh; D(oc_decode_create_webhook(&p, &cwh));
+    oc_webhook_info whi; D(oc_decode_webhook_info(&p, &whi));
 
     /* Array/paging decoders with small caller buffers. */
     { oc_cursor cur[4]; uint16_t nc = 0;

@@ -502,6 +502,26 @@ static void test_presence_frames(void) {
     }
 }
 
+static void test_webhook_frames(void) {
+    {
+        oc_create_webhook in = { 9, oc_slice_str("github") };
+        ROUNDTRIP(oc_encode_create_webhook(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CREATE_WEBHOOK, h, p);
+        oc_create_webhook out;
+        CHECK(oc_decode_create_webhook(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 9 && slice_eq_str(out.label, "github"));
+    }
+    {
+        uint8_t tok[OC_SESSION_TOKEN_LEN];
+        for (int i = 0; i < (int)OC_SESSION_TOKEN_LEN; i++) tok[i] = (uint8_t)(i * 7 + 1);
+        oc_webhook_info in = { 5, 9, { tok, sizeof tok } };
+        ROUNDTRIP(oc_encode_webhook_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WEBHOOK_INFO, h, p);
+        oc_webhook_info out;
+        CHECK(oc_decode_webhook_info(&p, &out) == OC_OK);
+        CHECK(out.webhook_id == 5 && out.channel_id == 9 && out.token.len == OC_SESSION_TOKEN_LEN);
+        CHECK(memcmp(out.token.ptr, tok, sizeof tok) == 0);
+    }
+}
+
 static void test_attachment_frames(void) {
     uint8_t idem[OC_IDEM_SIZE];
     for (int i = 0; i < (int)OC_IDEM_SIZE; i++) idem[i] = (uint8_t)(0x30 + i);
@@ -776,6 +796,7 @@ int run_protocol_tests(void) {
     test_search_frames();
     test_presence_frames();
     test_attachment_frames();
+    test_webhook_frames();
     test_backfill_and_error();
     test_size_limits();
     test_malformed();
