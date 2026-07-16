@@ -85,7 +85,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 131 do-not-disturb schedule | ⛔ | |
 | 132 APNs/FCM push | ⛔ | |
 | 133 self-host push gateway | ⛔ | |
-| 140 file attachments (object storage) | 🟡 | **Built + tested end-to-end:** proxied chunked upload/download over the wire (ARCH-69), `attachments` migration 0009, frames §5.14, and **message-linking** — a SEND references uploaded attachments (self-describing optional list), the BROADCAST carries their metadata inline, and backfill re-attaches them on reconnect. Thread replies carry attachments too (SEND_REPLY/THREAD_REPLY + LIST_THREAD). Local-FS blob store behind the ARCH-70 seam. **Follow-up:** the S3/MinIO adapter impl. |
+| 140 file attachments (object storage) | 🟡 | **Built + tested end-to-end:** proxied chunked upload/download over the wire (ARCH-69), `attachments` migration 0009, frames §5.14, and **message-linking** — a SEND references uploaded attachments (self-describing optional list), the BROADCAST carries their metadata inline, and backfill re-attaches them on reconnect. Thread replies carry attachments too (SEND_REPLY/THREAD_REPLY + LIST_THREAD). Two blob backends behind the ARCH-70 vtable: local-FS (default) and S3/MinIO (`OPENCHIME_BLOB_BACKEND=s3`, SigV4-signed, verified end-to-end against MinIO). |
 | 141 attachment access control | ✅ | Proxied bytes → download authorized by the ordinary channel-read check on the attachment's channel; no signed URLs (ARCH-69). Verified over the wire (cross-user fetch allowed; non-member refused) and in dbwriter units. |
 | 150–152 server-relayed audio | ⛔ | |
 | 160 video | ➖ | Deliberate scope exclusion. |
@@ -189,4 +189,4 @@ unbuilt feature families (notifications/push, audio), and a quantitative capacit
 benchmark for REQ-210/211. Incoming webhooks (REQ-170) are built end-to-end
 (ARCH-71), pending only the CA-signed cert (REQ-171). Attachments (REQ-140/141)
 are built end-to-end — proxied chunked transfer, access control, and message-linking
-— including thread-reply attachments, with the S3/MinIO blob adapter as the remaining follow-up.
+— including thread-reply attachments and both the local-FS and S3/MinIO blob backends.

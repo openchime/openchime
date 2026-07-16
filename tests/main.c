@@ -17,6 +17,7 @@ int run_ratelimit_tests(void);
 int run_roles_tests(void);
 int run_dbwriter_tests(void);
 int run_http_tests(void);
+int run_sigv4_tests(void);
 int run_tls_tests(void);
 int run_netloop_tests(void);
 
@@ -32,6 +33,7 @@ int main(void) {
     total += run_roles_tests();
     total += run_dbwriter_tests();
     total += run_http_tests();
+    total += run_sigv4_tests();
     total += run_tls_tests();
     total += run_netloop_tests();
 

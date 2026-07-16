@@ -1467,7 +1467,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         if (!c) break;
         conn_xfer *x = &c->xfer;
         if (x->state != XFER_UP_AWAIT_CREATE) break;   /* client canceled/closed */
-        x->bw = oc_blob_put_begin(g_blobs, r->storage_key);
+        x->bw = oc_blob_put_begin(g_blobs, r->storage_key, r->att_size);
         if (!x->bw) {
             int fd = c->fd;
             send_transfer_error(c, r->attachment_id, OC_ERR_INTERNAL);
