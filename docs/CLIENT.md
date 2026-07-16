@@ -1,176 +1,131 @@
 # OpenChime — Client
 
-The native client's architecture and how it's built. Cross-referenced from
-ARCHITECTURE.md (ARCH-11/12/13, ARCH-61–ARCH-66) and PROTOCOL.md (the wire flow
-the client drives).
+The client's architecture and how it's built. Cross-referenced from
+ARCHITECTURE.md (ARCH-11, **ARCH-74**, and the superseded ARCH-12/62/63/65) and
+PROTOCOL.md (the wire flow the core drives).
 
-**Status.** Design + Phase 1 skeleton, **targeting Windows** for this iteration
-(Linux/macOS/wasm/Android/iOS follow). Phase 1 is a raylib skeleton that connects
-to a running daemon, completes the handshake + (stubbed) auth, and shows/sends
-messages in a bare UI — the client-side analogue of the daemon's first end-to-end
-proof, cross-compiled to a Windows `.exe` with mingw-w64. Later phases (real text
-UI, local cache, reconnect/offline, real auth, more platforms) are a roadmap in
-§9.
+**Direction (ARCH-74).** The client is **one shared C app-core with a native UI
+per platform** — the *tdlib* model — chosen for real native feel over a
+custom-rendered single UI. The earlier raylib + `gfx.h` + HarfBuzz plan is
+dropped; there is no shared rendering layer, because each platform's OS shapes
+its own text and provides its own widgets.
+
+**Status.** Building the app-core + a **TUI** frontend first (the fastest usable,
+CI-testable client). Native GUIs (Win32/WinUI, AppKit, Android, a web DOM UI)
+and mobile follow.
 
 ---
 
-## 1. Repository layout (shared / daemon / client)
-
-The client lives in the **same repo** and links the daemon's exact wire source,
-so the two can't drift on the protocol (the same reason `tests/e2e_client.c`
-reuses `shared/protocol.c`). The tree is split into three concerns:
+## 1. Layers
 
 ```
-shared/   protocol, tls, framebuf, sock.h  — the wire contract (daemon + client)
-daemon/   dbwriter, netloop, migrate, main
-client/   gfx, ui, app, net, queue, main
+shared/        wire contract: protocol, tls, framebuf, sock   (daemon + client)
+client/core/   the app-core — frontend-agnostic, headless-testable C:
+               net thread + session + (later) SQLite store + the view-model
+               (channels, messages, roster, presence, unread) + reducers
+client/tui/    terminal frontend over the core                (first frontend)
+[client/win, client/mac, ...]   native GUIs over the same core (later)
 ```
 
-(`shared/sock.h` is the POSIX/Winsock portability shim, §8.)
+The **app-core is the one shared asset.** It holds *all* logic and state; a
+frontend is pure view + input — it renders the view-model and emits intents. Get
+this boundary right and each new frontend is small; get it wrong and you rewrite
+the client per platform. The core lives in the same repo and links the daemon's
+exact `shared/` wire source, so client and server can't drift (the same reason
+`tests/e2e_client.c` reuses `shared/protocol.c`).
 
-A separate client repo was rejected: it would need a submodule or a vendored
-copy of the wire code, reintroducing drift risk and cross-repo release
-coordination for zero benefit.
+## 2. The app-core (`client/core/`)
 
-## 2. Loop + threads (openblocks pattern + the daemon's threading)
+- **`net.c` — the network thread.** A blocking-socket TLS connection (the client
+  is one connection on its own thread, so no epoll): `dial` → `oc_tls_handshake`
+  → `HELLO`/`WELCOME` → `AUTH_CHALLENGE` → `AUTH` → `AUTH_OK`, then a serve loop
+  that interleaves sending queued intents with reading + dispatching server
+  frames. Lifted from the Phase-1 skeleton (which lifted it from
+  `tests/e2e_client.c`).
+- **`queue.c` — two thread-safe queues** (mutex+condvar FIFO, the daemon's
+  net↔dbwriter shape): **intents in** (send, later: switch/join-call) and
+  **events out** (connected, auth-ok, message, presence, channel, disconnected,
+  error).
+- **`event.h` — the core's wire-agnostic vocabulary:** the `oc_ev` (net→UI) and
+  `oc_cmd` (UI→net) types crossing the queues.
+- **`model.c` — the view-model + reducers.** `oc_model` holds the connection
+  state, the channel/DM list, a per-channel message buffer (with the ARCH-45
+  high-water dedup mark), roster/presence, and unread counts. `oc_model_apply`
+  folds one `oc_ev` into that state. A frontend owns an `oc_model`, drains events
+  each tick, applies them, and renders — the "read events at frame start" shape,
+  fed by the net thread. Single-threaded on the frontend, so no locking.
+- **`client.c` — the facade.** `oc_client_start(host, port, cred)` /
+  `oc_client_tick()` (drain + apply) / `oc_client_model()` / `oc_client_send()` /
+  `oc_client_stop()`. A frontend uses only this.
 
-The client follows the sibling raylib project **openblocks** for its loop
-structure and adds threading for the network (which openblocks has none of):
+**Headless-testable.** A test starts the daemon's netloop in-process (like the
+itest), drives an `oc_client` against it, sends a message, and asserts the
+view-model updated — so the core is fully CI-covered with no UI.
 
-- **One `AppCtx` struct + one `app_frame()`**, driven by a swappable loop driver
-  (`while(!WindowShouldClose())` on desktop now; emscripten / iOS callbacks
-  later) — exactly openblocks' `main.c` shape, so cross-platform drivers slot in
-  without reshaping the loop.
-- **UI thread** runs `app_frame()`: input + render at frame rate; it never
-  touches a socket.
-- **Network thread** owns the TLS socket end to end: connect → handshake →
-  auth → the read loop → dispatch, and it drains an outbound queue to send
-  frames. Because it's its own thread, it uses **blocking** sockets (no epoll) —
-  simpler than the daemon's non-blocking loop and sufficient for one connection.
-- **Two thread-safe queues** (a mutex+condvar linked list, like the daemon's
-  net↔dbwriter queue): **UI→net** carries user actions (send, switch channel,
-  reconnect); **net→UI** carries events (connected, auth-ok, message-received,
-  disconnected, error). The UI thread **drains the net→UI queue at the top of
-  `app_frame()`** and updates view state — the same "read events at frame start"
-  shape openblocks uses, just fed by another thread.
+## 3. Frontends
 
-## 3. Rendering through the `gfx.h` seam (ARCH-12)
+Each frontend is thin: create a client, loop { `oc_client_tick`; render the
+model; translate input to intents }, stop.
 
-Drawing goes through a **narrow `gfx.h` primitive seam** — `gfx_begin_frame` /
-`gfx_end_frame` / `gfx_clear` / `gfx_rect` / `gfx_line` / `gfx_text` /
-`gfx_measure_text` (openblocks' proven ARCH-12 seam) — implemented by
-`client/gfx_raylib.c`. A later iOS build can swap the whole graphics stack by
-providing a second implementation of that one header (openblocks does exactly
-this with a Metal backend), and the seam is widened where a chat UI needs it
-(clip/scroll regions, avatar images, glyph quads). App state
-(`client/app.{c,h}`) is kept **raylib-free** and separate from rendering
-(`client/ui.c`), so it stays testable and the text upgrade is contained. Per-
-platform capabilities are gated through `client/platform.h`.
-
-**Text.** raylib's built-in font is used in **Phase 1** to get a running UI
-fast. The real message view needs **HarfBuzz** shaping + a **Unicode line-break**
-library for wrapping (ARCH-12) — greenfield (openblocks renders only ASCII
-pixel-font) — which lands in Phase 2 behind the `gfx.h`/state seams.
+- **TUI (`client/tui/`, first):** a terminal cell grid — a channel sidebar (with
+  presence), a scrolling wrapped message pane, and an input line — built on
+  **notcurses** (ARCH-75). notcurses is chosen for one reason that matters to a
+  chat client: **correct Unicode wide-character / grapheme width**, so emoji
+  reactions (REQ-070/071) and wrapped messages don't corrupt the layout the way
+  they do under ncurses/termbox2. It is **vendored + pinned from source** like
+  mbedTLS (identical lib across local/CI), built `--disable-multimedia`. **The
+  TUI is text-only and never renders graphics — no sixel/kitty images, ever** —
+  so the multimedia disable is permanent and the dependency footprint stays at
+  notcurses + libunistring. Built on the host like the daemon.
+- **Windows (later):** Win32/WinUI (C++/WinRT or C#) over the C core.
+- **macOS/iOS (later):** AppKit/UIKit (Swift) over the core.
+- **Android (later):** Android views (Kotlin) over the core.
+- **Web (later):** a DOM UI — WASM can't use native desktop widgets; the core
+  compiles to WASM and drives a JS/TS view.
 
 ## 4. The wire layer (reused, already tested)
 
-The client links `shared/protocol.c` (every `oc_encode_*`/`oc_decode_*` for both
-directions already exists), `shared/tls.c` (client TLS + TOFU), and
-`shared/framebuf.c` (incremental reassembly). The network thread's connect/read/
-write logic is **lifted from `tests/e2e_client.c`**: `dial()` →
-`oc_tls_client_init(pin)` → `oc_tls_conn_init` → drive `oc_tls_handshake` →
-`read_frame` (framebuf + `oc_parse_frame`) for reads, `oc_encode_*` +
-`oc_tls_write` for writes. The wire sequence the client drives is
-PROTOCOL.md §3–§6 and the §10 state machine.
+The core links `shared/protocol.c` (every `oc_encode_*`/`oc_decode_*` for both
+directions exists), `shared/tls.c` (client TLS + TOFU), `shared/framebuf.c`
+(reassembly), and `shared/sock.h` (POSIX/Winsock shim). The wire sequence is
+PROTOCOL.md §3–§6 and the §10 state machine. **TOFU pinning (ARCH-10):** Phase 1
+trusts the presented cert (`pin=NULL`); persisting + pinning the fingerprint
+arrives with the store phase.
 
-**TOFU pinning (ARCH-10).** On first connect to an instance the client trusts
-the presented self-signed cert, captures its fingerprint via
-`oc_tls_peer_fingerprint`, and stores it; on later connects it passes that
-fingerprint as the `pin` so a changed cert fails the handshake. (A first-connect
-trust prompt + `.well-known` out-of-band verification is Phase 4.)
+## 5. Local store (later)
 
-## 5. Local store: SQLite (Phase 3)
+The core bundles SQLite and reuses the daemon's migration-runner pattern with its
+own client migration set: cached history per channel + the high-water/backfill
+cursors (ARCH-45/46), the **offline outbox** (messages composed offline, resent
+on reconnect with their idempotency tokens — the concrete answer to REQ-102), the
+session token (ARCH-58), per-instance TOFU pins, and config. Platform config dir;
+keychains are noted future hardening. The core is in-memory until this lands.
 
-The client bundles SQLite and reuses the daemon's migration-runner pattern
-(`daemon/migrate.c`) with its **own** client migration set, holding: cached
-message history per channel (offline view + the per-channel high-water marks
-that drive dedup, ARCH-45, and backfill cursors, ARCH-46); the **offline outbox**
-(messages composed while disconnected, resent on reconnect with their
-idempotency tokens — this is the concrete answer to REQ-102); the session token
-(reconnect without re-login, ARCH-58); per-instance TOFU fingerprints; and config
-(known instances, email, last used). Stored under the platform config dir (XDG /
-AppData / `~/Library`). Session token + pins sit in SQLite with tight file perms
-for v1; platform keychains (macOS Keychain / Windows DPAPI / libsecret) are noted
-future hardening. (Phase 1 keeps everything in memory; the store lands in
-Phase 3.)
+## 6. Auth + reconnect/offline (later)
 
-## 6. Authentication UX (ARCH-19)
+Auth UX (ARCH-19): a **local** username+password form; **OIDC** via the system
+browser to central's authorize URL with a loopback `127.0.0.1` redirect catching
+the ES256 JWT (`ASWebAuthenticationSession` on iOS/macOS); **session** silent
+reconnect with the stored token. Instance+email → DNS resolution (SRV port >
+`.well-known` > 443), failures surfaced distinctly (REQ-010/011). Reconnect
+(REQ-100/101/102): the net thread auto-reconnects with the session token,
+`BACKFILL_REQUEST`s per-channel cursors, and flushes the outbox.
 
-**Sequencing:** the revised auth frames (`AUTH_CHALLENGE`, method-discriminated
-`AUTH`, `AUTH_OK` with role + session token) are *documented* but **not yet in
-code** — `shared/protocol.c` still has the stub-era `oc_auth`/`oc_auth_ok`. So
-Phase 1 authenticates against today's stub exactly as `e2e_client.c` does (send a
-token, get `AUTH_OK`). The real login UI lands with the daemon's auth-core
-milestone, which updates `shared/protocol.c` for both sides at once. Then:
+## 7. Build
 
-- **local** — a username+password form → `AUTH{local}`.
-- **oidc** — open the system browser to central's authorize URL (from
-  `AUTH_CHALLENGE.oidc_params`); catch the redirect with a **loopback HTTP
-  listener** on `127.0.0.1:port` (desktop) to receive the ES256 JWT →
-  `AUTH{oidc}`. iOS/macOS use `ASWebAuthenticationSession`.
-- **session** — automatic on reconnect using the stored token → `AUTH{session}`.
+The core + TUI build on the host (a `make tui` target linking `client/core/*.c` +
+`client/tui/*.c` + `shared/*` + notcurses), like the daemon — no cross-compile,
+no container. notcurses is vendored + pinned from source (a `scripts/`-built
+tarball into `third_party/`, `--disable-multimedia`), the same discipline as
+mbedTLS (ARCH-51/75), so local and CI share one library. Native GUIs build with
+their platform toolchains over the core; release artifacts come from CI/CD, never
+a dev machine.
 
-At sign-in the client collects the **instance + email** (ARCH-14) and resolves
-the instance to a host+port by DNS (SRV port > `.well-known` > 443), surfacing
-resolution failures distinctly from auth/network errors (REQ-010/011).
+## 8. Roadmap
 
-## 7. Reconnect / offline (REQ-100/101/102)
-
-The network thread auto-reconnects with the stored session token, then issues a
-`BACKFILL_REQUEST` with per-channel cursors from the local store, replaying
-missed messages (REQ-101). Offline-composed messages wait in the SQLite outbox
-and are flushed on reconnect with their original idempotency tokens (REQ-102).
-Client-side dedup is the per-channel high-water mark on `message_id` (ARCH-45,
-REQ-091), held in the store.
-
-## 8. Build (ARCH-65)
-
-The client is built the openblocks way — a Makefile target per platform that
-vendors raylib + mbedTLS for that target and compiles `client/*.c` +
-`shared/{protocol,tls,framebuf}.c` directly. **No build container** (a Debian
-one was tried and dropped: it only fits the Linux desktop target and doesn't
-generalize — macOS/iOS can't be containerized, Windows/Android use their own
-toolchains).
-
-**This iteration targets Windows only.** `make windows` cross-compiles a static
-`.exe` with **mingw-w64** on Linux/CI (no Windows machine): it runs
-`scripts/build_raylib_windows.sh` and `scripts/build_mbedtls_windows.sh` (mingw
-cross-builds into separate `third_party/*-win` prefixes), then links
-`client/*.c` + `shared/*` + raylib + mbedTLS + winsock (`-lws2_32`, `-lbcrypt`
-for mbedTLS's `BCryptGenRandom`). Cross-platform builds need a small
-socket-portability shim — `shared/sock.h` abstracts POSIX vs Winsock (would-block
-detection, `close`, non-blocking, a one-shot `poll`, `WSAStartup`) for
-`shared/tls.c`'s BIO callbacks and `client/net.c`, behind `#ifdef _WIN32`; the
-Linux daemon is unaffected. (The `.exe` is currently a console subsystem for
-easy stderr logs; `-mwindows` for a console-less GUI is a later polish.)
-
-Linux/macOS/wasm/Android/iOS targets follow, each with its own vendoring script +
-Makefile target (openblocks' per-platform pattern). Release artifacts come from
-CI/CD, never a dev machine.
-
-## 9. Phase roadmap
-
-- **Phase 1 (this):** Windows raylib skeleton — connect, handshake, stub-auth,
-  bare UI (connection status + a channel's live messages + a composer that
-  sends), built in the container.
-- **Phase 2 — real UI + text:** HarfBuzz + Unicode line-break message view,
-  channel list, layout, scrolling.
-- **Phase 3 — store + reconnect/offline:** SQLite cache (history, cursors,
-  outbox), auto-reconnect, backfill, offline outbox flush.
-- **Phase 4 — auth completeness:** the `AUTH_CHALLENGE` flow, local + OIDC
-  loopback browser flow, session persistence, TOFU first-connect trust UX.
-- **Phase 5 — cross-platform + packaging:** Windows/macOS then iOS/Android,
-  following openblocks' Makefile/`build_raylib_*.sh`/per-object-dir pattern.
-  Note the store packaging (ARCH-20 `.deb`+systemd, ARCH-21 MSIX, App-Store
-  signing) is greenfield beyond the openblocks template (which ships plain
-  archives and an unsigned `.ipa`).
+- **Now:** app-core + TUI — connect, auth, live messages across channels,
+  presence, send; headless core test in CI.
+- **Next:** store + reconnect/offline; auth completeness (local + OIDC);
+  attachments (chunked up/download) and the **audio client** (Opus encode/decode
+  + UDP to the sidecar — the deferred half of REQ-150/151).
+- **Then:** native desktop GUIs (Windows/macOS), a web DOM UI, and mobile.

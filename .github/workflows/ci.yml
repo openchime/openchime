@@ -1,11 +1,12 @@
 name: ci
 
-# Runs on pushes to main and on every PR targeting main. Two jobs:
-#   - build:       native gcc build of the daemon, plus unit tests (make test)
-#                  once the first tests/ TU exists.
+# Runs on pushes to main and on every PR targeting main. Three jobs:
+#   - build:       native gcc build of the daemon, plus unit tests (make test),
+#                  which include the headless client app-core test.
 #   - integration: the durability path end-to-end on the Docker Compose stack —
 #                  replication reaching MinIO (ARCH-23) and restore-on-boot
 #                  (ARCH-24), automating the README's "Verify" steps.
+#   - core:        standalone compile check of the client app-core (ARCH-74).
 # Doc-only changes skip CI. See docs/TESTING.md for the full strategy.
 
 on:
@@ -69,16 +70,18 @@ jobs:
         if: always()
         run: COMPOSE_PROJECT_NAME=openchime docker compose down -v
 
-  client:
-    name: client build (windows / mingw)
+  core:
+    name: client app-core (compile check)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      # The client is cross-compiled to a Windows .exe with mingw-w64 on Linux
-      # (ARCH-65, openblocks pattern). bzip2 for the mbedTLS tarball.
-      - name: Install mingw-w64
+      # The client app-core (ARCH-74) is frontend-agnostic C linking the shared
+      # wire code; `make core` proves it compiles standalone. Its behaviour is
+      # driven end-to-end by the headless test in the build job's `make test`
+      # (tests/test_client_core.c). bzip2 for the vendored mbedTLS tarball.
+      - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends mingw-w64 bzip2
-      - name: Cross-compile Windows client
-        run: make windows
+          sudo apt-get install -y --no-install-recommends bzip2
+      - name: Compile the app-core
+        run: make core

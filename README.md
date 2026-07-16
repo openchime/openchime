@@ -40,25 +40,20 @@ make
 Requires a C toolchain and SQLite development headers (`sqlite3.h`,
 `libsqlite3`) on the host.
 
-## Client (raylib, Windows)
+## Client (app-core + native frontends)
 
-The native client ([docs/CLIENT.md](docs/CLIENT.md)) targets **Windows** this
-iteration, cross-compiled from Linux with mingw-w64 — no Windows machine needed:
-
-```
-sudo apt-get install mingw-w64   # one-time
-make windows                     # -> build/openchime-client.exe
-```
-
-`make windows` vendors raylib + mbedTLS for Windows and links a standalone,
-statically-linked `.exe`. Run it on Windows against a reachable daemon:
+The client ([docs/CLIENT.md](docs/CLIENT.md)) is **one shared C app-core with a
+native UI per platform** (the tdlib model, ARCH-74). The app-core
+(`client/core/`) is frontend-agnostic — it links the daemon's exact `shared/`
+wire code, owns the network thread and the view-model, and is driven headlessly
+by `make test` (`tests/test_client_core.c`). A standalone compile check:
 
 ```
-openchime-client.exe <host> <port>
+make core
 ```
 
-Phase 1 is a bare skeleton — connect, handshake, stub-auth, and a live message
-list + composer. Linux/macOS/wasm/Android/iOS builds follow.
+The first frontend is a **TUI**, built on the host like the daemon; native GUIs
+(Windows/macOS), a web DOM UI, and mobile follow.
 
 ## Local Docker environment
 

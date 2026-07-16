@@ -1,0 +1,36 @@
+/*
+ * OpenChime client — the app-core facade (ARCH-74). A frontend uses ONLY this:
+ * start a client, tick it once per frame (drains net events into the model),
+ * read the model to render, send messages, and stop. The facade owns the two
+ * UI↔net queues, the network thread, and the view-model; a frontend never
+ * touches a socket or a queue directly.
+ */
+
+#ifndef OC_CLIENT_H
+#define OC_CLIENT_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "model.h"
+
+typedef struct oc_client oc_client;
+
+/* Start the core: spawn the network thread and connect to host:port. `cred`
+ * carries local credentials as "username:password" for now. Returns NULL if the
+ * thread could not be spawned. */
+oc_client *oc_client_start(const char *host, int port, const char *cred);
+
+/* Drain all queued net events into the model. Call once per frame/tick. */
+void oc_client_tick(oc_client *c);
+
+/* The current view-model (owned by the client; valid until oc_client_stop). */
+const oc_model *oc_client_model(oc_client *c);
+
+/* Queue a message to `channel_id` for the network thread to send. */
+void oc_client_send(oc_client *c, uint64_t channel_id, const char *body);
+
+/* Stop the network thread, drain remaining events, and free everything. */
+void oc_client_stop(oc_client *c);
+
+#endif /* OC_CLIENT_H */

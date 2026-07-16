@@ -134,6 +134,25 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                 if (e->body) { memcpy(e->body, b.body.ptr, b.body.len); e->body[b.body.len] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_CHANNEL_LIST) {
+            oc_channel_list_entry ents[256]; uint16_t count = 0;
+            if (oc_decode_channel_list(&p, ents, 256, &count) != OC_OK) return -1;
+            if (count > 256) count = 256;
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_CHANNEL);
+                if (!e) continue;
+                e->channel_id = ents[i].channel_id;
+                e->status = ents[i].joined;
+                e->body = malloc(ents[i].name.len + 1);
+                if (e->body) { memcpy(e->body, ents[i].name.ptr, ents[i].name.len); e->body[ents[i].name.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_PRESENCE_UPDATE) {
+            oc_presence_update pu;
+            if (oc_decode_presence_update(&p, &pu) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_PRESENCE);
+                if (e) { e->user_id = pu.user_id; e->status = pu.status; oc_queue_push(to_ui, e); }
+            }
         } else if (hdr.msg_type == OC_MSG_ERROR) {
             oc_error err;
             if (oc_decode_error(&p, &err) == OC_OK) {
@@ -212,6 +231,11 @@ static void *net_thread(void *arg) {
         oc_decode_auth_ok(&p, &ok);
         push_simple(n->to_ui, OC_EV_CONNECTED, ok.user_id);
         push_simple(n->to_ui, OC_EV_AUTH_OK, ok.user_id);
+
+        /* Ask for the channel list so the model can populate its sidebar. */
+        uint8_t lb[16]; oc_wbuf lw; oc_wbuf_init(&lw, lb, sizeof lb);
+        if (oc_encode_list_channels(&lw, OC_PROTOCOL_VERSION) == OC_OK)
+            (void)write_all(&conn, fd, lb, lw.len, &n->stop);
     }
 
     /* Serve: interleave reading server frames with sending queued user actions. */
