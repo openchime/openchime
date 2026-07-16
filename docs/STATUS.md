@@ -191,7 +191,8 @@ per-IP connection throttle, TLS-identity persistence across restore, truncation
 signals, the first-owner setup token, and a codec fuzzer + concurrency load
 test. What remains is **not** hardening but **scope**: a real client and the
 unbuilt feature families (mobile push transport, audio). The capacity profile
-(REQ-210/211) is now benchmarked — see `Scripts/bench.sh`. Incoming webhooks
+(REQ-210/211) is now benchmarked — see [BENCHMARK.md](./BENCHMARK.md)
+(`Scripts/bench.sh`). Incoming webhooks
 (REQ-170) are built end-to-end
 (ARCH-71), pending only the CA-signed cert (REQ-171). Attachments (REQ-140/141)
 are built end-to-end — proxied chunked transfer, access control, and message-linking
