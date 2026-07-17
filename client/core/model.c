@@ -9,6 +9,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#define OC_TYPING_TIMEOUT 6   /* seconds a typing mark stays live without refresh */
 
 void oc_model_init(oc_model *m) {
     memset(m, 0, sizeof *m);
@@ -55,7 +58,44 @@ void oc_model_free(oc_model *m) {
     for (size_t i = 0; i < m->n_channels; i++) channel_free(&m->channels[i]);
     free(m->channels);
     free(m->presence);
+    free(m->typing);
     memset(m, 0, sizeof *m);
+}
+
+/* Record that `user_id` is typing in `channel_id` now, pruning stale marks. */
+static void typing_touch(oc_model *m, uint64_t channel_id, uint64_t user_id) {
+    long long now = (long long)time(NULL);
+    size_t w = 0, found = (size_t)-1;
+    for (size_t i = 0; i < m->n_typing; i++) {
+        if (now - m->typing[i].seen > OC_TYPING_TIMEOUT) continue;   /* drop expired */
+        if (m->typing[i].channel_id == channel_id && m->typing[i].user_id == user_id) found = w;
+        m->typing[w++] = m->typing[i];
+    }
+    m->n_typing = w;
+    if (found != (size_t)-1) { m->typing[found].seen = now; return; }
+    if (m->n_typing == m->cap_typing) {
+        size_t cap = m->cap_typing ? m->cap_typing * 2 : 8;
+        oc_typing_row *nt = realloc(m->typing, cap * sizeof *nt);
+        if (!nt) return;
+        m->typing = nt; m->cap_typing = cap;
+    }
+    m->typing[m->n_typing].channel_id = channel_id;
+    m->typing[m->n_typing].user_id = user_id;
+    m->typing[m->n_typing].seen = now;
+    m->n_typing++;
+}
+
+size_t oc_model_typing(const oc_model *m, uint64_t channel_id, uint64_t exclude,
+                       uint64_t *out, size_t cap) {
+    long long now = (long long)time(NULL);
+    size_t n = 0;
+    for (size_t i = 0; i < m->n_typing && n < cap; i++) {
+        if (m->typing[i].channel_id != channel_id) continue;
+        if (m->typing[i].user_id == exclude) continue;
+        if (now - m->typing[i].seen > OC_TYPING_TIMEOUT) continue;
+        out[n++] = m->typing[i].user_id;
+    }
+    return n;
 }
 
 oc_channel *oc_model_channel(oc_model *m, uint64_t channel_id) {
@@ -171,6 +211,9 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     }
     case OC_EV_PRESENCE:
         presence_set(m, e->user_id, e->status);
+        break;
+    case OC_EV_TYPING:
+        typing_touch(m, e->channel_id, e->user_id);
         break;
     case OC_EV_REACTION: {
         oc_channel *c = oc_model_channel(m, e->channel_id);

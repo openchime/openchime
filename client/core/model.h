@@ -43,6 +43,9 @@ typedef struct {
 
 typedef struct { uint64_t user_id; uint8_t status; } oc_presence_row;
 
+/* An ephemeral "user is typing in channel" mark, expiring on a timeout. */
+typedef struct { uint64_t channel_id; uint64_t user_id; long long seen; } oc_typing_row;
+
 typedef struct {
     bool     connected;
     bool     authed;
@@ -51,6 +54,8 @@ typedef struct {
     size_t           n_channels, cap_channels;
     oc_presence_row *presence;
     size_t           n_presence, cap_presence;
+    oc_typing_row   *typing;
+    size_t           n_typing, cap_typing;
     char     status[160];             /* last status / error line */
 } oc_model;
 
@@ -67,5 +72,10 @@ oc_channel *oc_model_channel(oc_model *m, uint64_t channel_id);
 void oc_model_mark_read(oc_model *m, uint64_t channel_id);
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);
+
+/* User ids currently typing in `channel_id` (last seen within the timeout),
+ * excluding `exclude` (typically self). Fills `out` up to `cap`; returns count. */
+size_t oc_model_typing(const oc_model *m, uint64_t channel_id, uint64_t exclude,
+                       uint64_t *out, size_t cap);
 
 #endif /* OC_MODEL_H */

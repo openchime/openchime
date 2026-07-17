@@ -197,6 +197,14 @@ int run_client_core_tests(void) {
         /* The message carries dana's display name (= her login name), live. */
         CHECK(channel_has_named(oc_client_model(b), 1, "hello from the core", "dana"));
 
+        /* erik signals typing in channel 1; dana sees erik (and only erik) typing
+         * (the server relays to other members, so dana's own view excludes her). */
+        uint64_t erik_id = oc_client_model(b)->user_id;
+        oc_client_typing(b, 1);
+        uint64_t typers[4];
+        CHECK(WAIT_FOR(a, oc_model_typing(m, 1, m->user_id, typers, 4) == 1));
+        CHECK(typers[0] == erik_id);
+
         /* erik reacts to dana's message: both see the aggregate (count 1), erik
          * sees it as his own; a second react toggles it off (count 0). */
         uint64_t mid = message_id_of(oc_client_model(b), 1, "hello from the core");

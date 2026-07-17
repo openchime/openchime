@@ -108,6 +108,14 @@ void oc_client_delete(oc_client *c, uint64_t channel_id, uint64_t message_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_typing(oc_client *c, uint64_t channel_id) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_TYPING);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_stop(oc_client *c) {
     if (!c) return;
     oc_net_stop(c->net);   /* signals QUIT, joins the thread */

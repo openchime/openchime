@@ -48,6 +48,10 @@ void oc_client_react(oc_client *c, uint64_t channel_id, uint64_t message_id,
 void oc_client_edit(oc_client *c, uint64_t channel_id, uint64_t message_id, const char *body);
 void oc_client_delete(oc_client *c, uint64_t channel_id, uint64_t message_id);
 
+/* Signal "I am typing" in `channel_id`. The frontend calls this (throttled) as
+ * the user composes; the server relays a TYPING_UPDATE to other members. */
+void oc_client_typing(oc_client *c, uint64_t channel_id);
+
 /* Stop the network thread, drain remaining events, and free everything. */
 void oc_client_stop(oc_client *c);
 

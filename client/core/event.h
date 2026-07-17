@@ -19,6 +19,7 @@ enum {
     OC_EV_REACTION,        /* a REACTION_UPDATED: channel/message/user + emoji/op/count */
     OC_EV_EDIT,            /* a MSG_EDITED: channel/message + new body */
     OC_EV_DELETE,          /* a MSG_DELETED: channel/message tombstone */
+    OC_EV_TYPING,          /* a TYPING_UPDATE: user_id is typing in channel_id */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
     OC_EV_ERROR            /* protocol/transport error; body = human message */
 };
@@ -48,6 +49,7 @@ enum {
     OC_CMD_REACT,          /* react to `message_id` in `channel_id`: body=emoji, op */
     OC_CMD_EDIT,           /* edit `message_id` in `channel_id`: body=new text */
     OC_CMD_DELETE,         /* delete `message_id` in `channel_id` */
+    OC_CMD_TYPING,         /* signal "I am typing" in `channel_id` */
     OC_CMD_QUIT
 };
 

@@ -172,6 +172,15 @@ static void build_rows(rows_t *r, const oc_channel *ch, uint64_t me, int width) 
 
 /* ---- rendering ------------------------------------------------------------- */
 
+/* A display name for `uid`, taken from that user's most recent named message in
+ * the channel; "someone" if we've never seen them post. */
+static const char *name_for(const oc_channel *ch, uint64_t uid) {
+    for (size_t i = ch->n_msgs; i > 0; i--)
+        if (ch->msgs[i - 1].author_id == uid && ch->msgs[i - 1].author_name[0])
+            return ch->msgs[i - 1].author_name;
+    return "someone";
+}
+
 static void render(oc_client *cl, size_t focus, const char *composer,
                    size_t clen, int scroll) {
     (void)clen;
@@ -233,7 +242,21 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     snprintf(status, sizeof status, " %s · %s%s", conn, m->status,
              scroll > 0 ? "  [scrolled]" : "");
     fill_row(H - 2, 0, W, TB_DEFAULT);
-    draw_clip(0, H - 2, W, status, TB_YELLOW, TB_DEFAULT);
+    int sx = draw_clip(0, H - 2, W, status, TB_YELLOW, TB_DEFAULT);
+
+    /* Typing indicator for the focused channel (excluding ourselves). */
+    if (fc) {
+        uint64_t typers[8];
+        size_t nt = oc_model_typing(m, fc->channel_id, m->user_id, typers, 8);
+        if (nt) {
+            char tline[140];
+            if (nt == 1)
+                snprintf(tline, sizeof tline, "  ✎ %s is typing…", name_for(fc, typers[0]));
+            else
+                snprintf(tline, sizeof tline, "  ✎ %zu people are typing…", nt);
+            draw_clip(sx, H - 2, W, tline, TB_CYAN, TB_DEFAULT);
+        }
+    }
 
     /* Composer (row H-1). */
     fill_row(H - 1, 0, W, TB_DEFAULT);
@@ -333,6 +356,7 @@ int main(int argc, char **argv) {
     size_t focus = 0;
     int scroll = 0;
     uint64_t last_focus_cid = 0;
+    time_t last_typing = 0;                   /* throttle outbound TYPING signals */
     int running = 1;
 
     while (running) {
@@ -388,6 +412,12 @@ int main(int argc, char **argv) {
                 memcpy(composer + clen, enc, (size_t)k);
                 clen += (size_t)k;
                 composer[clen] = '\0';
+            }
+            /* Signal typing while composing a message (not a /command), throttled. */
+            time_t now = time(NULL);
+            if (focus < nch && composer[0] != '/' && now - last_typing >= 3) {
+                oc_client_typing(cl, oc_client_model(cl)->channels[focus].channel_id);
+                last_typing = now;
             }
         }
     }

@@ -175,6 +175,12 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                     oc_queue_push(to_ui, e);
                 }
             }
+        } else if (hdr.msg_type == OC_MSG_TYPING_UPDATE) {
+            oc_typing_update tu;
+            if (oc_decode_typing_update(&p, &tu) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_TYPING);
+                if (e) { e->channel_id = tu.channel_id; e->user_id = tu.user_id; oc_queue_push(to_ui, e); }
+            }
         } else if (hdr.msg_type == OC_MSG_MSG_EDITED) {
             oc_msg_edited me;
             if (oc_decode_msg_edited(&p, &me) == OC_OK) {
@@ -333,6 +339,12 @@ static void *net_thread(void *arg) {
                 uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_delete dl = { c->channel_id, c->message_id };
                 if (oc_encode_delete(&w, OC_PROTOCOL_VERSION, &dl) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_TYPING) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_typing ty = { c->channel_id };
+                if (oc_encode_typing(&w, OC_PROTOCOL_VERSION, &ty) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             oc_cmd_free(c);
