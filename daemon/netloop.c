@@ -1355,22 +1355,27 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         break;
     }
     case OC_RES_CHANNEL_INFO: {
-        /* Ack the actor with the channel's state. */
+        /* Ack the actor with the channel's state. For a DM, peer_id is the other
+         * participant (from the actor's view). */
         conn *c = find_by_id(conns, r->conn_id);
+        uint64_t actor = c ? c->user_id : 0;
         if (c) {
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
             oc_channel_info ci = { r->channel_id, r->ch_kind,
                                    oc_slice_str(r->ch_name ? r->ch_name : ""),
-                                   r->ch_is_public, r->ch_joined, r->ch_created_at };
+                                   r->ch_is_public, r->ch_joined, r->ch_created_at, r->ch_peer };
             oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
-        /* On INVITE, push the (now-member) channel to the target's live conns. */
+        /* Push the (now-member) channel to the target: an INVITE (regular channel)
+         * or the peer of a new DM. For a DM the peer, from the target's view, is
+         * the actor. */
         if (r->push_user_id) {
+            uint64_t push_peer = (r->ch_kind == OC_CHANNEL_KIND_DM) ? actor : 0;
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
             oc_channel_info ci = { r->channel_id, r->ch_kind,
                                    oc_slice_str(r->ch_name ? r->ch_name : ""),
-                                   r->ch_is_public, 1, r->ch_created_at };
+                                   r->ch_is_public, 1, r->ch_created_at, push_peer };
             oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci);
             size_t len = w.len;
             for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {

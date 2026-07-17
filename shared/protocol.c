@@ -479,6 +479,9 @@ oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_
     oc_w_u8(w, m->is_public);
     oc_w_u8(w, m->joined);
     oc_w_u64(w, m->created_at);
+    /* Optional trailing (DMs): the other participant's id. Written only for a
+     * DM, so a named channel's CHANNEL_INFO is byte-identical to before. */
+    if (m->peer_id) oc_w_u64(w, m->peer_id);
     return oc_frame_end(w, off);
 }
 
@@ -1175,6 +1178,7 @@ oc_result oc_decode_channel_info(oc_rbuf *p, oc_channel_info *m) {
     m->is_public = oc_r_u8(p);
     m->joined = oc_r_u8(p);
     m->created_at = oc_r_u64(p);
+    m->peer_id = (!p->underflow && p->pos < p->len) ? oc_r_u64(p) : 0;
     return r_done(p);
 }
 

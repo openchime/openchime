@@ -119,6 +119,14 @@ static int reaction_count(const oc_model *m, uint64_t cid, uint64_t mid, const c
     return -1;
 }
 
+/* The id of a DM channel whose peer is `peer`, or 0. */
+static uint64_t dm_with_peer(const oc_model *m, uint64_t peer) {
+    for (size_t i = 0; i < m->n_channels; i++)
+        if (m->channels[i].kind == OC_CHANNEL_KIND_DM && m->channels[i].peer_id == peer)
+            return m->channels[i].channel_id;
+    return 0;
+}
+
 /* The id of a channel with the given name, or 0. */
 static uint64_t channel_named(const oc_model *m, const char *name) {
     for (size_t i = 0; i < m->n_channels; i++)
@@ -273,6 +281,13 @@ int run_client_core_tests(void) {
         oc_client_join_channel(b, warroom);
         CHECK(WAIT_FOR(b, oc_model_channel((oc_model *)m, warroom) &&
                           oc_model_channel((oc_model *)m, warroom)->joined));
+
+        /* dana opens a DM with erik: a DM channel appears carrying erik as the
+         * peer (the daemon now reports the DM peer in CHANNEL_INFO). */
+        uint64_t erikid = oc_model_user_id(oc_client_model(a), "erik");
+        CHECK(erikid != 0);
+        oc_client_open_dm(a, erikid);
+        CHECK(WAIT_FOR(a, dm_with_peer(m, erikid) != 0));
 
         /* Marking channel 1 read clears erik's unread. */
         oc_client_mark_read(b, 1);

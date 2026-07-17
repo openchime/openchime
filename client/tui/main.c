@@ -13,7 +13,8 @@
  *       /react <emoji> · /edit <text> · /delete · /thread (open its thread;
  *       then Enter posts a reply) · /search <query> · /close (leave a
  *       thread/search/roster overlay) · /create <name> · /join <name> · /leave ·
- *       /who (member roster + presence) · /away · /online.
+ *       /who (member roster + presence) · /away · /online · /dm <name> (open a
+ *       direct message).
  */
 
 #define TB_IMPL
@@ -282,11 +283,17 @@ static void render(oc_client *cl, size_t focus, const char *composer,
                                      : TB_BLACK | TB_BOLD;
         int y = (int)i + 1;
         fill_row(y, 0, SIDEBAR_W, bg);
+        char title[96];
+        if (c->kind == OC_CHANNEL_KIND_DM) {   /* a DM: title by the other participant */
+            const char *pn = (c->peer_id == m->user_id) ? "you" : oc_model_user_name(m, c->peer_id);
+            if (pn[0]) snprintf(title, sizeof title, "@%s", pn);
+            else       snprintf(title, sizeof title, "@user%llu", (unsigned long long)c->peer_id);
+        } else {
+            snprintf(title, sizeof title, "%s%s", c->joined ? "# " : "+ ", c->name ? c->name : "…");
+        }
         char label[128];
-        if (c->unread > 0)
-            snprintf(label, sizeof label, "# %s (%d)", c->name ? c->name : "…", c->unread);
-        else
-            snprintf(label, sizeof label, "%s%s", c->joined ? "# " : "+ ", c->name ? c->name : "…");
+        if (c->unread > 0) snprintf(label, sizeof label, "%s (%d)", title, c->unread);
+        else               snprintf(label, sizeof label, "%s", title);
         draw_clip(1, y, SIDEBAR_W, label, fg, bg);
     }
     for (int y = 0; y < H; y++) tb_set_cell(SIDEBAR_W, y, '|', TB_DEFAULT, TB_DEFAULT);
@@ -424,6 +431,13 @@ static void handle_command(oc_client *cl, uint64_t cid, const char *line) {
     }
     if (strcmp(line, "/leave") == 0) { oc_client_leave_channel(cl, cid); return; }
     if (strcmp(line, "/list") == 0)  { oc_client_list_channels(cl); return; }
+    if (strncmp(line, "/dm ", 4) == 0) {          /* open a DM with a user by name */
+        const char *nm = line + 4;
+        while (*nm == ' ') nm++;
+        uint64_t uid = oc_model_user_id(m, nm);
+        if (uid) oc_client_open_dm(cl, uid);
+        return;
+    }
 
     const oc_channel *ch = focused_channel(m, cid);
     if (!ch || ch->n_msgs == 0) return;

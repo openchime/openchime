@@ -115,8 +115,10 @@ model; translate input to intents }, stop.
   matching messages — channel, author, snippet). **channel management** (`/create`, `/join`, `/leave`,
   `/list`; non-joined public channels show dimmed with a `+`), and a **member
   roster + presence** (`/who` overlays the tenant roster with online/away/offline
-  dots + roles; `/away` and `/online` set your own presence). The remaining engine
-  features are client-only surfacing work: DMs and attachment transfer.
+  dots + roles; `/away` and `/online` set your own presence). and **direct messages** (`/dm <name>`
+  opens a 1:1 DM, titled `@peer` in the sidebar; the daemon reports the DM peer
+  in CHANNEL_INFO — a small protocol addition). The remaining engine features are
+  client-only surfacing work: attachment transfer.
 - **Windows (later):** Win32/WinUI (C++/WinRT or C#) over the C core.
 - **macOS/iOS (later):** AppKit/UIKit (Swift) over the core.
 - **Android (later):** Android views (Kotlin) over the core.
@@ -168,10 +170,9 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
   backfill on open, send, display names, unread, scrollback) plus **reactions**
   (`/react`), **edit/delete** (`/edit`, `/delete`, `(edited)` marker + `[message
   deleted]` tombstone), and **typing indicators** (`✎ X is typing…`) are done.
-  Remaining TUI increments surface engine features already on the wire: DMs,
-  attachment transfer, who-reacted, notification prefs/DND, admin, webhook
-  management, logout. (Shipped: threads, search, channel management, member
-  roster + presence via /who·/away·/online.)
+  Remaining TUI increments surface engine features already on the wire: attachment
+  transfer, who-reacted, notification prefs/DND, admin, webhook management,
+  logout. (Shipped: threads, search, channel management, roster + presence, DMs.)
 - **Next:** store + reconnect/offline; auth completeness (local + OIDC);
   attachments (chunked up/download) and the **audio client** (Opus encode/decode
   + UDP to the sidecar — the deferred half of REQ-150/151).

@@ -149,6 +149,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                 if (!e) continue;
                 e->channel_id = ents[i].channel_id;
                 e->status = ents[i].joined;
+                e->op = ents[i].kind;
                 e->body = malloc(ents[i].name.len + 1);
                 if (e->body) { memcpy(e->body, ents[i].name.ptr, ents[i].name.len); e->body[ents[i].name.len] = '\0'; }
                 oc_queue_push(to_ui, e);
@@ -160,6 +161,8 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                 if (e) {
                     e->channel_id = ci.channel_id;
                     e->status = ci.joined;
+                    e->op = ci.kind;
+                    e->user_id = ci.peer_id;           /* DM peer, if any */
                     e->body = malloc(ci.name.len + 1);
                     if (e->body) { memcpy(e->body, ci.name.ptr, ci.name.len); e->body[ci.name.len] = '\0'; }
                     oc_queue_push(to_ui, e);
@@ -452,6 +455,12 @@ static void *net_thread(void *arg) {
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_set_presence sp = { c->op };
                 if (oc_encode_set_presence(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_OPEN_DM) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_open_dm od = { c->channel_id };   /* channel_id reused as target user id */
+                if (oc_encode_open_dm(&w, OC_PROTOCOL_VERSION, &od) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             oc_cmd_free(c);

@@ -319,6 +319,8 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         oc_channel *c = channel_ensure(m, e->channel_id);
         if (c) {
             c->joined = e->status;
+            c->kind = e->op;                     /* channel vs DM */
+            if (e->user_id) c->peer_id = e->user_id;   /* DM peer (CHANNEL_INFO only) */
             if (e->body) { free(c->name); c->name = e->body; e->body = NULL; }
         }
         break;

@@ -40,6 +40,8 @@ typedef struct {
     int      unread;       /* messages from others since the last mark-read */
     uint8_t  joined;
     uint8_t  history_requested; /* a backfill has been asked for (once per open) */
+    uint8_t  kind;             /* OC_CHANNEL_KIND / _DM */
+    uint64_t peer_id;          /* DM: the other participant (for the title) */
 } oc_channel;
 
 typedef struct { uint64_t user_id; uint8_t status; } oc_presence_row;

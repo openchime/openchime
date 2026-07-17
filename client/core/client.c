@@ -200,6 +200,14 @@ void oc_client_toggle_roster(oc_client *c, int open) {
     if (open) oc_client_list_users(c);   /* refresh on open */
 }
 
+void oc_client_open_dm(oc_client *c, uint64_t user_id) {
+    if (!c || !user_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_OPEN_DM);
+    if (!cmd) return;
+    cmd->channel_id = user_id;   /* reused as the target user id */
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_stop(oc_client *c) {
     if (!c) return;
     oc_net_stop(c->net);   /* signals QUIT, joins the thread */

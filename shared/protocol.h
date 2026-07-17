@@ -328,7 +328,8 @@ typedef struct { uint64_t channel_id; uint64_t parent_id; } oc_list_thread;
 typedef struct { uint64_t parent_id; uint32_t count; uint8_t truncated; } oc_thread;
 typedef struct { uint64_t message_id; uint32_t reply_count; uint64_t last_reply_at; } oc_thread_meta;
 typedef struct { oc_slice name; uint8_t is_public; } oc_create_channel;
-typedef struct { uint64_t channel_id; uint8_t kind; oc_slice name; uint8_t is_public; uint8_t joined; uint64_t created_at; } oc_channel_info;
+typedef struct { uint64_t channel_id; uint8_t kind; oc_slice name; uint8_t is_public; uint8_t joined; uint64_t created_at;
+                 uint64_t peer_id; } oc_channel_info;  /* peer_id: for a DM (kind=1), the other participant; optional trailing */
 typedef struct { uint64_t channel_id; } oc_channel_ref;                       /* JOIN / LEAVE */
 typedef struct { uint64_t channel_id; uint64_t user_id; } oc_channel_member_op; /* INVITE / REMOVE */
 typedef struct { uint64_t channel_id; oc_slice name; uint8_t is_public; uint8_t joined; uint8_t kind; } oc_channel_list_entry;

@@ -452,11 +452,12 @@ msg_type `0x0051`** describing the channel and the caller's membership:
 | Field        | Type | Notes                                             |
 |--------------|------|---------------------------------------------------|
 | `channel_id` | u64  | The channel.                                      |
-| `kind`       | u8   | `0` channel, `1` DM (reserved; only `0` today).   |
-| `name`       | str  | Channel name.                                     |
+| `kind`       | u8   | `0` channel, `1` DM.                              |
+| `name`       | str  | Channel name (empty for a DM).                    |
 | `is_public`  | u8   | `1` public, `0` private.                          |
 | `joined`     | u8   | `1` if the recipient is now a member.             |
 | `created_at` | u64  | Creation time, ms since epoch UTC.                |
+| `peer_id`    | u64  | **Optional trailing.** For a DM (`kind=1`), the other participant *from the recipient's view* — the client titles the DM from the roster. Written only for a DM, so a named-channel `CHANNEL_INFO` is byte-identical to the pre-DM layout. |
 
 Failures are non-fatal `ERROR` frames carrying the `channel_id` (8 bytes,
 big-endian) in `context`: `UNKNOWN_CHANNEL`, `NOT_A_MEMBER`, `FORBIDDEN`, or

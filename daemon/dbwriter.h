@@ -255,6 +255,7 @@ typedef struct oc_dbres {
     uint8_t        ch_is_public;
     uint8_t        ch_joined;       /* the actor's membership after the op */
     uint64_t       ch_created_at;
+    uint64_t       ch_peer;         /* DM (ch_kind=1): the other participant's id (0 = not a DM) */
     uint64_t       push_user_id;    /* INVITE: also push CHANNEL_INFO to this user (0 = none) */
 
     /* CHANNEL_LIST */

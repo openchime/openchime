@@ -77,6 +77,10 @@ void oc_client_list_users(oc_client *c);
 void oc_client_set_presence(oc_client *c, uint8_t status);
 void oc_client_toggle_roster(oc_client *c, int open);
 
+/* Open (or get) a 1:1 DM with `user_id`; the server answers with a CHANNEL_INFO
+ * that carries the peer, so the DM titles itself from the roster. */
+void oc_client_open_dm(oc_client *c, uint64_t user_id);
+
 /* Stop the network thread, drain remaining events, and free everything. */
 void oc_client_stop(oc_client *c);
 

@@ -1459,6 +1459,7 @@ static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
 
     r->type = OC_RES_CHANNEL_INFO;
     load_channel_info(db, cid, self, r);
+    r->ch_peer = other;                      /* the DM's other participant (self for a self-DM) */
     r->push_user_id = self_dm ? 0 : other;   /* no peer to push a self-DM to */
     return r;
 }
