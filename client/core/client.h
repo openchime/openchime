@@ -71,6 +71,12 @@ void oc_client_leave_channel(oc_client *c, uint64_t channel_id);
 /* Refresh the channel list (to discover channels created since login). */
 void oc_client_list_channels(oc_client *c);
 
+/* Refresh the tenant roster; set your own presence (OC_PRESENCE_ONLINE/_AWAY);
+ * toggle the roster overlay (frontend view state). */
+void oc_client_list_users(oc_client *c);
+void oc_client_set_presence(oc_client *c, uint8_t status);
+void oc_client_toggle_roster(oc_client *c, int open);
+
 /* Stop the network thread, drain remaining events, and free everything. */
 void oc_client_stop(oc_client *c);
 

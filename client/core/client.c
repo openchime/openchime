@@ -179,6 +179,27 @@ void oc_client_list_channels(oc_client *c) {
     if (cmd) oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_list_users(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_USERS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_presence(oc_client *c, uint8_t status) {
+    if (!c) return;
+    oc_model_note_presence(&c->model, c->model.user_id, status);   /* reflect locally */
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_PRESENCE);
+    if (!cmd) return;
+    cmd->op = status;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_toggle_roster(oc_client *c, int open) {
+    if (!c) return;
+    c->model.roster_open = open ? 1 : 0;
+    if (open) oc_client_list_users(c);   /* refresh on open */
+}
+
 void oc_client_stop(oc_client *c) {
     if (!c) return;
     oc_net_stop(c->net);   /* signals QUIT, joins the thread */

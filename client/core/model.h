@@ -44,6 +44,9 @@ typedef struct {
 
 typedef struct { uint64_t user_id; uint8_t status; } oc_presence_row;
 
+/* A tenant roster entry (from LIST_USERS): id, display name, role, disabled. */
+typedef struct { uint64_t user_id; char name[64]; uint8_t role; uint8_t disabled; } oc_member;
+
 /* An ephemeral "user is typing in channel" mark, expiring on a timeout. */
 typedef struct { uint64_t channel_id; uint64_t user_id; long long seen; } oc_typing_row;
 
@@ -72,6 +75,10 @@ typedef struct {
     char      search_query[128];
     oc_search_result *search_results;
     size_t    n_search, cap_search;
+    /* The tenant roster (REQ, LIST_USERS) + whether the roster view is open. */
+    uint8_t   roster_open;
+    oc_member *users;
+    size_t    n_users, cap_users;
     char     status[160];             /* last status / error line */
 } oc_model;
 
@@ -96,6 +103,13 @@ void oc_model_search_begin(oc_model *m, const char *query);
 void oc_model_close_search(oc_model *m);
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);
+/* Record a presence value (used for our own presence, which the server does not
+ * echo back to us). */
+void oc_model_note_presence(oc_model *m, uint64_t user_id, uint8_t status);
+
+/* Roster lookups: a user's display name ("" if unknown), or an id by name (0). */
+const char *oc_model_user_name(const oc_model *m, uint64_t user_id);
+uint64_t    oc_model_user_id(const oc_model *m, const char *name);
 
 /* User ids currently typing in `channel_id` (last seen within the timeout),
  * excluding `exclude` (typically self). Fills `out` up to `cap`; returns count. */

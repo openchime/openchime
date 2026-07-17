@@ -165,6 +165,20 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                     oc_queue_push(to_ui, e);
                 }
             }
+        } else if (hdr.msg_type == OC_MSG_USER_LIST) {
+            oc_user_list_entry ue[512]; uint16_t count = 0;
+            if (oc_decode_user_list(&p, ue, 512, &count) != OC_OK) return -1;
+            if (count > 512) count = 512;
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_USER);
+                if (!e) continue;
+                e->user_id = ue[i].user_id;
+                e->status = ue[i].role;
+                e->op = ue[i].disabled;
+                e->body = malloc(ue[i].display_name.len + 1);
+                if (e->body) { memcpy(e->body, ue[i].display_name.ptr, ue[i].display_name.len); e->body[ue[i].display_name.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
         } else if (hdr.msg_type == OC_MSG_PRESENCE_UPDATE) {
             oc_presence_update pu;
             if (oc_decode_presence_update(&p, &pu) == OC_OK) {
@@ -329,9 +343,13 @@ static void *net_thread(void *arg) {
         push_simple(n->to_ui, OC_EV_CONNECTED, ok.user_id);
         push_simple(n->to_ui, OC_EV_AUTH_OK, ok.user_id);
 
-        /* Ask for the channel list so the model can populate its sidebar. */
+        /* Ask for the channel list + the roster so the model can populate the
+         * sidebar and resolve user names (for DMs, mentions). */
         uint8_t lb[16]; oc_wbuf lw; oc_wbuf_init(&lw, lb, sizeof lb);
         if (oc_encode_list_channels(&lw, OC_PROTOCOL_VERSION) == OC_OK)
+            (void)write_all(&conn, fd, lb, lw.len, &n->stop);
+        oc_wbuf_init(&lw, lb, sizeof lb);
+        if (oc_encode_list_users(&lw, OC_PROTOCOL_VERSION) == OC_OK)
             (void)write_all(&conn, fd, lb, lw.len, &n->stop);
     }
 
@@ -423,6 +441,17 @@ static void *net_thread(void *arg) {
             if (c->type == OC_CMD_LIST_CHANNELS) {
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 if (oc_encode_list_channels(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_USERS) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_users(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_PRESENCE) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_presence sp = { c->op };
+                if (oc_encode_set_presence(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             oc_cmd_free(c);

@@ -65,7 +65,40 @@ void oc_model_free(oc_model *m) {
     free(m->thread_msgs);
     for (size_t i = 0; i < m->n_search; i++) free(m->search_results[i].snippet);
     free(m->search_results);
+    free(m->users);
     memset(m, 0, sizeof *m);
+}
+
+/* Upsert a roster entry keyed on user_id. */
+static void user_upsert(oc_model *m, uint64_t user_id, const char *name, uint8_t role, uint8_t disabled) {
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == user_id) {
+            snprintf(m->users[i].name, sizeof m->users[i].name, "%s", name ? name : "");
+            m->users[i].role = role; m->users[i].disabled = disabled; return;
+        }
+    if (m->n_users == m->cap_users) {
+        size_t cap = m->cap_users ? m->cap_users * 2 : 16;
+        oc_member *nu = realloc(m->users, cap * sizeof *nu);
+        if (!nu) return;
+        m->users = nu; m->cap_users = cap;
+    }
+    oc_member *u = &m->users[m->n_users++];
+    memset(u, 0, sizeof *u);
+    u->user_id = user_id; u->role = role; u->disabled = disabled;
+    snprintf(u->name, sizeof u->name, "%s", name ? name : "");
+}
+
+const char *oc_model_user_name(const oc_model *m, uint64_t user_id) {
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == user_id) return m->users[i].name;
+    return "";
+}
+
+uint64_t oc_model_user_id(const oc_model *m, const char *name) {
+    if (!name) return 0;
+    for (size_t i = 0; i < m->n_users; i++)
+        if (strcmp(m->users[i].name, name) == 0) return m->users[i].user_id;
+    return 0;
 }
 
 void oc_model_close_search(oc_model *m) {
@@ -255,6 +288,10 @@ static void presence_set(oc_model *m, uint64_t user_id, uint8_t status) {
     m->n_presence++;
 }
 
+void oc_model_note_presence(oc_model *m, uint64_t user_id, uint8_t status) {
+    presence_set(m, user_id, status);
+}
+
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id) {
     for (size_t i = 0; i < m->n_presence; i++)
         if (m->presence[i].user_id == user_id) return m->presence[i].status;
@@ -275,6 +312,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     case OC_EV_AUTH_OK:
         m->authed = true;
         m->user_id = e->user_id;
+        presence_set(m, e->user_id, OC_PRESENCE_ONLINE);   /* self: the server won't tell us */
         set_status(m, "authenticated");
         break;
     case OC_EV_CHANNEL: {
@@ -349,6 +387,9 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     case OC_EV_SEARCH_RESULT:
         if (m->search_open)
             search_append(m, e->message_id, e->channel_id, e->author_id, e->server_time, &e->body);
+        break;
+    case OC_EV_USER:
+        user_upsert(m, e->user_id, e->body ? e->body : "", e->status, e->op);
         break;
     case OC_EV_DISCONNECTED:
         m->connected = false;

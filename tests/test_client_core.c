@@ -196,6 +196,14 @@ int run_client_core_tests(void) {
         CHECK(WAIT_FOR(a, oc_model_channel((oc_model *)m, 1) != NULL));
         CHECK(WAIT_FOR(b, oc_model_channel((oc_model *)m, 1) != NULL));
 
+        /* The roster loads after auth: dana resolves erik (and faye) by name. */
+        CHECK(WAIT_FOR(a, oc_model_user_id(m, "erik") != 0 && oc_model_user_id(m, "faye") != 0));
+        {
+            const oc_model *am = oc_client_model(a);
+            uint64_t eid = oc_model_user_id(am, "erik");
+            CHECK(eid != 0 && strcmp(oc_model_user_name(am, eid), "erik") == 0);
+        }
+
         /* dana sends: it round-trips to her own model as a BROADCAST (channel 1),
          * and reaches erik live. erik counts it unread (author != self). */
         oc_client_send(a, 1, "hello from the core");

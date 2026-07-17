@@ -12,7 +12,8 @@
  *       Ctrl-Q quit. Commands (on the last message in the focused channel):
  *       /react <emoji> · /edit <text> · /delete · /thread (open its thread;
  *       then Enter posts a reply) · /search <query> · /close (leave a
- *       thread/search overlay) · /create <name> · /join <name> · /leave.
+ *       thread/search/roster overlay) · /create <name> · /join <name> · /leave ·
+ *       /who (member roster + presence) · /away · /online.
  */
 
 #define TB_IMPL
@@ -237,6 +238,31 @@ static void build_search_rows(rows_t *r, const oc_model *m, int width) {
     }
 }
 
+/* Build the rows for the roster overlay: each member with a presence dot,
+ * colored by presence, plus a role tag. */
+static void build_roster_rows(rows_t *r, const oc_model *m, int width) {
+    (void)width;
+    char line[160];
+    snprintf(line, sizeof line, "%zu member%s", m->n_users, m->n_users == 1 ? "" : "s");
+    char *h = malloc(strlen(line) + 1);
+    if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
+    for (size_t i = 0; i < m->n_users; i++) {
+        const oc_member *u = &m->users[i];
+        uint8_t pr = oc_model_presence_of(m, u->user_id);
+        const char *dot = pr == OC_PRESENCE_ONLINE ? "\xe2\x97\x8f"    /* ● */
+                        : pr == OC_PRESENCE_AWAY   ? "\xe2\x97\x90"    /* ◐ */
+                                                   : "\xe2\x97\x8b";   /* ○ */
+        const char *role = u->role == OC_ROLE_OWNER ? "  (owner)"
+                         : u->role == OC_ROLE_ADMIN ? "  (admin)" : "";
+        snprintf(line, sizeof line, "%s %s%s%s", dot, u->name[0] ? u->name : "?",
+                 role, u->disabled ? "  (disabled)" : "");
+        uintattr_t col = pr == OC_PRESENCE_ONLINE ? TB_GREEN
+                       : pr == OC_PRESENCE_AWAY   ? TB_YELLOW : TB_DEFAULT;
+        char *rr = malloc(strlen(line) + 1);
+        if (rr) { strcpy(rr, line); rows_push(r, rr, col); }
+    }
+}
+
 static void render(oc_client *cl, size_t focus, const char *composer,
                    size_t clen, int scroll) {
     (void)clen;
@@ -273,7 +299,8 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     /* Title bar (row 0 over the pane) — a thread view overlays the channel. */
     const oc_channel *fc = (focus < m->n_channels) ? &m->channels[focus] : NULL;
     char title[160];
-    if (m->search_open)      snprintf(title, sizeof title, " search (/close to exit)");
+    if (m->roster_open)      snprintf(title, sizeof title, " members (/close to exit)");
+    else if (m->search_open) snprintf(title, sizeof title, " search (/close to exit)");
     else if (m->thread_open) snprintf(title, sizeof title, " thread · #%s (/close to exit)",
                                       fc && fc->name ? fc->name : "…");
     else if (fc)             snprintf(title, sizeof title, " #%s", fc->name ? fc->name : "…");
@@ -281,11 +308,12 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     fill_row(0, px0, W, TB_BLUE);
     draw_clip(px0, 0, pxmax, title, TB_WHITE | TB_BOLD, TB_BLUE);
 
-    /* Message rows for the focused channel, or an open thread / search overlay,
-     * showing the window ending `scroll` rows above the bottom. */
-    if (fc || m->thread_open || m->search_open) {
+    /* Message rows for the focused channel, or an open overlay (thread / search /
+     * roster), showing the window ending `scroll` rows above the bottom. */
+    if (fc || m->thread_open || m->search_open || m->roster_open) {
         rows_t rows = {0};
-        if (m->search_open)      build_search_rows(&rows, m, pxmax - px0);
+        if (m->roster_open)      build_roster_rows(&rows, m, pxmax - px0);
+        else if (m->search_open) build_search_rows(&rows, m, pxmax - px0);
         else if (m->thread_open) build_thread_rows(&rows, m, fc, m->user_id, pxmax - px0);
         else                     build_rows(&rows, fc, m->user_id, pxmax - px0);
         int total = (int)rows.n;
@@ -366,7 +394,13 @@ static const oc_msg *my_last_message(const oc_channel *ch, uint64_t me) {
  */
 static void handle_command(oc_client *cl, uint64_t cid, const char *line) {
     const oc_model *m = oc_client_model(cl);
-    if (strcmp(line, "/close") == 0) { oc_client_close_thread(cl); oc_client_close_search(cl); return; }
+    if (strcmp(line, "/close") == 0) {
+        oc_client_close_thread(cl); oc_client_close_search(cl); oc_client_toggle_roster(cl, 0);
+        return;
+    }
+    if (strcmp(line, "/who") == 0)    { oc_client_toggle_roster(cl, 1); return; }
+    if (strcmp(line, "/away") == 0)   { oc_client_set_presence(cl, OC_PRESENCE_AWAY); return; }
+    if (strcmp(line, "/online") == 0) { oc_client_set_presence(cl, OC_PRESENCE_ONLINE); return; }
     if (strncmp(line, "/search ", 8) == 0) {
         const char *q = line + 8;
         while (*q == ' ') q++;
@@ -479,10 +513,10 @@ int main(int argc, char **argv) {
             if (clen > 0 && focus < nch) {
                 const oc_model *mm = oc_client_model(cl);
                 uint64_t cid = mm->channels[focus].channel_id;
-                if (composer[0] == '/')     handle_command(cl, cid, composer);
-                else if (mm->search_open)   { /* read-only overlay: ignore plain text */ }
-                else if (mm->thread_open)   oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
-                else                        oc_client_send(cl, cid, composer);
+                if (composer[0] == '/')                       handle_command(cl, cid, composer);
+                else if (mm->search_open || mm->roster_open)  { /* read-only overlay: ignore */ }
+                else if (mm->thread_open)                     oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
+                else                                          oc_client_send(cl, cid, composer);
                 clen = 0; composer[0] = '\0'; scroll = 0;
             }
         } else if (ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2) {
