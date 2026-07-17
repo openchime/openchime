@@ -96,6 +96,14 @@ void oc_client_set_dnd(oc_client *c, uint8_t enabled, uint16_t start_min, uint16
 void oc_client_list_notify_prefs(oc_client *c);
 void oc_client_toggle_prefs(oc_client *c, int open);
 
+/* Admin / user management (REQ-030/033; owner/admin only, enforced server-side).
+ * Set a user's tenant role (OC_ROLE_MEMBER/_ADMIN/_OWNER), mint a tenant invite
+ * token for a role (the server answers with an INVITE_CREATED, shown once in the
+ * model), or remove/disable a user. Each folds a USER_UPDATED into the roster. */
+void oc_client_set_role(oc_client *c, uint64_t user_id, uint8_t role);
+void oc_client_invite_user(oc_client *c, uint8_t role);
+void oc_client_remove_user(oc_client *c, uint64_t user_id);
+
 /* Log out: revoke this session (scope OC_LOGOUT_THIS) or all of the user's
  * (OC_LOGOUT_ALL); the server closes the connection. */
 void oc_client_logout(oc_client *c, uint8_t scope);

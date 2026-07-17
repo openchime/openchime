@@ -123,8 +123,12 @@ model; translate input to intents }, stop.
   message — each reactor paired with the emoji they used, REQ-071), and
   **notification prefs** (`/prefs` overlays the DND window + per-channel levels;
   `/notify all|mentions|none` sets the focused channel; `/dnd HH:MM HH:MM | off`
-  the do-not-disturb window — REQ-130/131, each SET returns a full sync). The
-  remaining engine features are client-only surfacing work: attachment transfer.
+  the do-not-disturb window — REQ-130/131, each SET returns a full sync), and
+  **admin / user management** (`/role <name> owner|admin|member`, `/invite
+  [admin|member]` mints a tenant token shown once in the roster, `/remove <name>`
+  disables a user — REQ-030/033, owner/admin only; a USER_UPDATED folds each
+  change into the roster). The remaining engine features are client-only
+  surfacing work: attachment transfer.
 - **Windows (later):** Win32/WinUI (C++/WinRT or C#) over the C core.
 - **macOS/iOS (later):** AppKit/UIKit (Swift) over the core.
 - **Android (later):** Android views (Kotlin) over the core.
@@ -177,8 +181,8 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
   (`/react`), **edit/delete** (`/edit`, `/delete`, `(edited)` marker + `[message
   deleted]` tombstone), and **typing indicators** (`✎ X is typing…`) are done.
   Remaining TUI increments surface engine features already on the wire: attachment
-  transfer, admin, webhook management. (Shipped: threads, search, channel
-  management, roster + presence, DMs, logout, who-reacted, notification prefs/DND.)
+  transfer, webhook management. (Shipped: threads, search, channel management,
+  roster + presence, DMs, logout, who-reacted, notification prefs/DND, admin.)
 - **Next:** store + reconnect/offline; auth completeness (local + OIDC);
   attachments (chunked up/download) and the **audio client** (Opus encode/decode
   + UDP to the sidecar — the deferred half of REQ-150/151).

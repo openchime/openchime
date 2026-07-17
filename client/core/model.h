@@ -98,6 +98,11 @@ typedef struct {
     uint8_t   prefs_open;
     uint8_t   dnd_enabled;
     uint16_t  dnd_start_min, dnd_end_min;
+    /* The last invite token minted this session (REQ-033, shown once): the
+     * token is empty until an INVITE_CREATED arrives. */
+    char      invite_token[96];
+    uint8_t   invite_role;
+    uint64_t  invite_expires;
     char     status[160];             /* last status / error line */
 } oc_model;
 

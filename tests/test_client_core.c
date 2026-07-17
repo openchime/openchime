@@ -119,6 +119,18 @@ static int reaction_count(const oc_model *m, uint64_t cid, uint64_t mid, const c
     return -1;
 }
 
+/* A roster member's role / disabled flag (-1 if the user isn't in the roster). */
+static int member_role(const oc_model *m, uint64_t uid) {
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == uid) return (int)m->users[i].role;
+    return -1;
+}
+static int member_disabled(const oc_model *m, uint64_t uid) {
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == uid) return (int)m->users[i].disabled;
+    return -1;
+}
+
 /* The id of a DM channel whose peer is `peer`, or 0. */
 static uint64_t dm_with_peer(const oc_model *m, uint64_t peer) {
     for (size_t i = 0; i < m->n_channels; i++)
@@ -368,6 +380,18 @@ int run_client_core_tests(void) {
                           strcmp(find_msg(m, 1, mid)->body, "edited body") == 0));
         oc_client_delete(a, 1, mid);
         CHECK(WAIT_FOR(b, find_msg(m, 1, mid) && find_msg(m, 1, mid)->deleted));
+
+        /* admin / user management (REQ-030/033): dana (owner) promotes erik to
+         * admin — the USER_UPDATED folds his new role into her roster — mints a
+         * tenant invite token (shown once in the model), then removes him, which
+         * marks him disabled in the roster and drops his connection. This runs
+         * last, since removal closes erik's client (b). */
+        oc_client_set_role(a, erikid, OC_ROLE_ADMIN);
+        CHECK(WAIT_FOR(a, member_role(m, erikid) == OC_ROLE_ADMIN));
+        oc_client_invite_user(a, OC_ROLE_MEMBER);
+        CHECK(WAIT_FOR(a, m->invite_token[0] != '\0' && m->invite_role == OC_ROLE_MEMBER));
+        oc_client_remove_user(a, erikid);
+        CHECK(WAIT_FOR(a, member_disabled(m, erikid) == 1));
 
         oc_client_stop(a);
         oc_client_stop(b);

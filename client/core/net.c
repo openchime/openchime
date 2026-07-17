@@ -297,6 +297,22 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                 e->op = ne[i].level;
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_USER_UPDATED) {
+            oc_user_updated uu;
+            if (oc_decode_user_updated(&p, &uu) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_USER_UPDATED);
+            if (e) { e->user_id = uu.user_id; e->status = uu.role; e->op = uu.disabled; oc_queue_push(to_ui, e); }
+        } else if (hdr.msg_type == OC_MSG_INVITE_CREATED) {
+            oc_invite_created ic;
+            if (oc_decode_invite_created(&p, &ic) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_INVITE);
+            if (e) {
+                e->op = ic.role;
+                e->server_time = ic.expires_at;
+                e->body = malloc(ic.token.len + 1);
+                if (e->body) { memcpy(e->body, ic.token.ptr, ic.token.len); e->body[ic.token.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
         } else if (hdr.msg_type == OC_MSG_ERROR) {
             oc_error err;
             if (oc_decode_error(&p, &err) == OC_OK) {
@@ -511,6 +527,24 @@ static void *net_thread(void *arg) {
             if (c->type == OC_CMD_LIST_NOTIFY_PREFS) {
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 if (oc_encode_list_notify_prefs(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_ROLE) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_role sr = { c->channel_id, c->op };   /* channel_id reused as user id, op = role */
+                if (oc_encode_set_role(&w, OC_PROTOCOL_VERSION, &sr) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_INVITE_USER) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_invite_user iu = { c->op };   /* op = role */
+                if (oc_encode_invite_user(&w, OC_PROTOCOL_VERSION, &iu) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_REMOVE_USER) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_remove_user ru = { c->channel_id };   /* channel_id reused as user id */
+                if (oc_encode_remove_user(&w, OC_PROTOCOL_VERSION, &ru) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_OPEN_DM) {

@@ -89,6 +89,16 @@ static void user_upsert(oc_model *m, uint64_t user_id, const char *name, uint8_t
     snprintf(u->name, sizeof u->name, "%s", name ? name : "");
 }
 
+/* Update a roster member's role/disabled without disturbing its name (a
+ * USER_UPDATED carries no name); upsert with an empty name if unseen. */
+static void user_update_role(oc_model *m, uint64_t user_id, uint8_t role, uint8_t disabled) {
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == user_id) {
+            m->users[i].role = role; m->users[i].disabled = disabled; return;
+        }
+    user_upsert(m, user_id, "", role, disabled);
+}
+
 const char *oc_model_user_name(const oc_model *m, uint64_t user_id) {
     for (size_t i = 0; i < m->n_users; i++)
         if (m->users[i].user_id == user_id) return m->users[i].name;
@@ -441,6 +451,28 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         if (c) c->notify_level = e->op;
         break;
     }
+    case OC_EV_USER_UPDATED: {
+        user_update_role(m, e->user_id, e->status, e->op);
+        const char *nm = oc_model_user_name(m, e->user_id);
+        const char *what = e->op ? "removed"
+                         : e->status == OC_ROLE_OWNER ? "now owner"
+                         : e->status == OC_ROLE_ADMIN ? "now admin" : "now member";
+        char buf[160];
+        snprintf(buf, sizeof buf, "%s %s", nm[0] ? nm : "user", what);
+        set_status(m, buf);
+        break;
+    }
+    case OC_EV_INVITE:
+        snprintf(m->invite_token, sizeof m->invite_token, "%s", e->body ? e->body : "");
+        m->invite_role = e->op;
+        m->invite_expires = e->server_time;
+        {
+            char buf[160];
+            snprintf(buf, sizeof buf, "invite (%s): %s",
+                     e->op == OC_ROLE_ADMIN ? "admin" : "member", m->invite_token);
+            set_status(m, buf);
+        }
+        break;
     case OC_EV_USER:
         user_upsert(m, e->user_id, e->body ? e->body : "", e->status, e->op);
         break;

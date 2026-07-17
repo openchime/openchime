@@ -17,7 +17,9 @@
  *       /who (member roster + presence) · /away · /online · /dm <name> (open a
  *       direct message) · /prefs (notification settings) · /notify
  *       all|mentions|none (this channel's level) · /dnd HH:MM HH:MM | off
- *       (do-not-disturb window) · /logout (revoke this session and quit).
+ *       (do-not-disturb window) · /role <name> owner|admin|member ·
+ *       /invite [admin|member] (mint a token) · /remove <name> (owner/admin) ·
+ *       /logout (revoke this session and quit).
  */
 
 #define TB_IMPL
@@ -246,10 +248,17 @@ static void build_search_rows(rows_t *r, const oc_model *m, int width) {
  * colored by presence, plus a role tag. */
 static void build_roster_rows(rows_t *r, const oc_model *m, int width) {
     (void)width;
-    char line[160];
+    char line[200];
     snprintf(line, sizeof line, "%zu member%s", m->n_users, m->n_users == 1 ? "" : "s");
     char *h = malloc(strlen(line) + 1);
     if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
+    /* Surface the last-minted invite token (shown once) at the top of the roster. */
+    if (m->invite_token[0]) {
+        snprintf(line, sizeof line, "invite (%s): %s",
+                 m->invite_role == OC_ROLE_ADMIN ? "admin" : "member", m->invite_token);
+        char *iv = malloc(strlen(line) + 1);
+        if (iv) { strcpy(iv, line); rows_push(r, iv, TB_MAGENTA | TB_BOLD); }
+    }
     for (size_t i = 0; i < m->n_users; i++) {
         const oc_member *u = &m->users[i];
         uint8_t pr = oc_model_presence_of(m, u->user_id);
@@ -539,6 +548,32 @@ static void handle_command(oc_client *cl, uint64_t cid, const char *line) {
         while (*nm == ' ') nm++;
         uint64_t uid = oc_model_user_id(m, nm);
         if (uid) oc_client_open_dm(cl, uid);
+        return;
+    }
+    if (strncmp(line, "/role ", 6) == 0) {        /* /role <name> owner|admin|member */
+        char nm[64] = {0}, rl[16] = {0};
+        if (sscanf(line + 6, "%63s %15s", nm, rl) != 2) return;
+        uint8_t role;
+        if      (strcmp(rl, "owner") == 0)  role = OC_ROLE_OWNER;
+        else if (strcmp(rl, "admin") == 0)  role = OC_ROLE_ADMIN;
+        else if (strcmp(rl, "member") == 0) role = OC_ROLE_MEMBER;
+        else return;
+        uint64_t uid = oc_model_user_id(m, nm);
+        if (uid) oc_client_set_role(cl, uid, role);
+        return;
+    }
+    if (strncmp(line, "/invite", 7) == 0) {       /* /invite [admin|member] (default member) */
+        const char *rl = line + 7;
+        while (*rl == ' ') rl++;
+        uint8_t role = strcmp(rl, "admin") == 0 ? OC_ROLE_ADMIN : OC_ROLE_MEMBER;
+        oc_client_invite_user(cl, role);
+        return;
+    }
+    if (strncmp(line, "/remove ", 8) == 0) {      /* /remove <name> */
+        const char *nm = line + 8;
+        while (*nm == ' ') nm++;
+        uint64_t uid = oc_model_user_id(m, nm);
+        if (uid) oc_client_remove_user(cl, uid);
         return;
     }
 

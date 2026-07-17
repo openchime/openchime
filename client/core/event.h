@@ -26,6 +26,8 @@ enum {
     OC_EV_REACTIONS,       /* a REACTIONS entry: message_id + one reactor (user_id + emoji) */
     OC_EV_DND,             /* a NOTIFY_PREFS header (frame start): status=enabled, count=(start<<16|end) */
     OC_EV_NOTIFY_PREF,     /* a NOTIFY_PREFS entry: channel_id + level(op) */
+    OC_EV_USER_UPDATED,    /* a USER_UPDATED: user_id + role(status) + disabled(op) */
+    OC_EV_INVITE,          /* an INVITE_CREATED: body=token, op=role, server_time=expires_at */
     OC_EV_USER,            /* a USER_LIST entry: user_id + name(body) + role(status) + disabled(op) */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
     OC_EV_ERROR            /* protocol/transport error; body = human message */
@@ -72,6 +74,9 @@ enum {
     OC_CMD_SET_NOTIFY_PREF, /* set `channel_id`'s notification level (op = level) */
     OC_CMD_SET_DND,         /* set the DND window: op = enabled, channel_id = start_min, message_id = end_min */
     OC_CMD_LIST_NOTIFY_PREFS, /* request all notification settings (DND + per-channel) */
+    OC_CMD_SET_ROLE,        /* set a user's tenant role: channel_id = user_id, op = role */
+    OC_CMD_INVITE_USER,     /* mint a tenant invite token: op = role */
+    OC_CMD_REMOVE_USER,     /* remove/disable a user: channel_id = user_id */
     OC_CMD_LOGOUT,          /* revoke this session (op = scope) and close the connection */
     OC_CMD_QUIT
 };

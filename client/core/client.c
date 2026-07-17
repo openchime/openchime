@@ -254,6 +254,31 @@ void oc_client_toggle_prefs(oc_client *c, int open) {
     if (open) oc_client_list_notify_prefs(c);   /* refresh on open */
 }
 
+void oc_client_set_role(oc_client *c, uint64_t user_id, uint8_t role) {
+    if (!c || !user_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_ROLE);
+    if (!cmd) return;
+    cmd->channel_id = user_id;   /* reused as the target user id */
+    cmd->op = role;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_invite_user(oc_client *c, uint8_t role) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_INVITE_USER);
+    if (!cmd) return;
+    cmd->op = role;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_remove_user(oc_client *c, uint64_t user_id) {
+    if (!c || !user_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_REMOVE_USER);
+    if (!cmd) return;
+    cmd->channel_id = user_id;   /* reused as the target user id */
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_logout(oc_client *c, uint8_t scope) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_LOGOUT);
