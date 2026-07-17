@@ -166,6 +166,13 @@ static void hwtab_note(oc_hwtab *t, uint64_t channel_id, uint64_t message_id) {
 }
 static void hwtab_free(oc_hwtab *t) { free(t->v); t->v = NULL; t->n = t->cap = 0; }
 
+/* The last-seen message id for a channel (0 if none) — the backfill cursor. */
+static uint64_t hwtab_get(const oc_hwtab *t, uint64_t channel_id) {
+    for (size_t i = 0; i < t->n; i++)
+        if (t->v[i].channel_id == channel_id) return t->v[i].high_water;
+    return 0;
+}
+
 typedef struct {
     oc_queue    *to_ui;
     oc_tls_conn *conn;
@@ -173,6 +180,8 @@ typedef struct {
     volatile int *stop;
     oc_xfer     *xfer;
     oc_hwtab    *hw;
+    oc_store    *store;      /* cache messages as they arrive (NULL = no store) */
+    const char  *instance;
 } disp_ctx;
 
 /* Push a transfer notice (phase: 0 progress, 1 done, 2 error) to the UI. */
@@ -270,6 +279,18 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 push_attachments(to_ui, b.channel_id, b.message_id, b.attach, b.n_attach);
             }
             if (ctx && ctx->hw) hwtab_note(ctx->hw, b.channel_id, b.message_id);
+            /* Cache the message so a relaunch shows it instantly (ARCH-45/46). */
+            if (ctx && ctx->store) {
+                char an[64]; size_t al = b.author_name.len < sizeof an - 1 ? b.author_name.len : sizeof an - 1;
+                memcpy(an, b.author_name.ptr, al); an[al] = '\0';
+                char *cb = malloc(b.body.len + 1);
+                if (cb) {
+                    memcpy(cb, b.body.ptr, b.body.len); cb[b.body.len] = '\0';
+                    oc_store_save_message(ctx->store, ctx->instance, b.channel_id, b.message_id,
+                                          b.author_id, an, b.server_time, cb, 0, 0);
+                    free(cb);
+                }
+            }
         } else if (hdr.msg_type == OC_MSG_CHANNEL_LIST) {
             oc_channel_list_entry ents[256]; uint16_t count = 0;
             if (oc_decode_channel_list(&p, ents, 256, &count) != OC_OK) return -1;
@@ -350,6 +371,8 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->body = malloc(me.body.len + 1);
                     if (e->body) { memcpy(e->body, me.body.ptr, me.body.len); e->body[me.body.len] = '\0'; }
                     oc_queue_push(to_ui, e);
+                    if (ctx && ctx->store && e->body)   /* keep the cache current */
+                        oc_store_edit_message(ctx->store, ctx->instance, me.message_id, e->body);
                 }
             }
         } else if (hdr.msg_type == OC_MSG_MSG_DELETED) {
@@ -357,6 +380,8 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (oc_decode_msg_deleted(&p, &md) == OC_OK) {
                 oc_ev *e = oc_ev_new(OC_EV_DELETE);
                 if (e) { e->channel_id = md.channel_id; e->message_id = md.message_id; oc_queue_push(to_ui, e); }
+                if (ctx && ctx->store)
+                    oc_store_delete_message(ctx->store, ctx->instance, md.message_id);
             }
         } else if (hdr.msg_type == OC_MSG_THREAD_REPLY) {
             oc_thread_reply tr;
@@ -696,18 +721,19 @@ static int run_connection(oc_net *n, int reconnecting,
     /* Serve: interleave reading server frames with sending queued user actions.
      * An in-flight attachment transfer (upload/download) is driven by both. */
     *served = 1;
-    disp_ctx ctx = { n->to_ui, &conn, fd, &n->stop, &xfer, hw };
+    disp_ctx ctx = { n->to_ui, &conn, fd, &n->stop, &xfer, hw,
+                     cs ? cs->store : NULL, cs ? cs->instance : NULL };
     while (!n->stop) {
         oc_cmd *c;
         while ((c = oc_queue_try_pop(n->from_ui)) != NULL) {
             if (c->type == OC_CMD_QUIT) { oc_cmd_free(c); rc = RC_STOP; goto drop; }
             if (c->type == OC_CMD_BACKFILL) {
-                /* Replay history for one channel from the start (no local store
-                 * yet, so the cursor is 0). Replies arrive as BROADCASTs that
-                 * dispatch() already turns into OC_EV_MESSAGE, dedup'd by the
-                 * model's high-water mark; a trailing BACKFILL_DONE is ignored. */
+                /* Replay history for one channel from the last id we already hold
+                 * (cached-history cursor, ARCH-45/46) — 0 the first time. Replies
+                 * arrive as BROADCASTs that dispatch() turns into OC_EV_MESSAGE,
+                 * dedup'd by the model's high-water mark; BACKFILL_DONE is ignored. */
                 uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                oc_cursor cur = { c->channel_id, 0 };
+                oc_cursor cur = { c->channel_id, hwtab_get(hw, c->channel_id) };
                 oc_backfill_request req = { 1, &cur };
                 if (oc_encode_backfill_request(&w, OC_PROTOCOL_VERSION, &req) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
@@ -953,6 +979,50 @@ drop:
     return rc;
 }
 
+/* Replay one cached message into the model at startup: push it as an ordinary
+ * OC_EV_MESSAGE (folded + deduped by the reducer), plus an OC_EV_EDIT/_DELETE so
+ * the "(edited)" marker / tombstone survives a relaunch, and seed the backfill
+ * cursor. */
+struct replay_ctx { oc_queue *to_ui; oc_hwtab *hw; };
+static void replay_msg_cb(void *vctx, uint64_t channel_id, uint64_t message_id,
+                          uint64_t author_id, const char *author_name,
+                          uint64_t server_time, const char *body,
+                          int edited, int deleted) {
+    struct replay_ctx *r = (struct replay_ctx *)vctx;
+    oc_ev *e = oc_ev_new(OC_EV_MESSAGE);
+    if (e) {
+        e->channel_id = channel_id;
+        e->author_id = author_id;
+        e->message_id = message_id;
+        e->server_time = server_time;
+        if (author_name) snprintf(e->author_name, sizeof e->author_name, "%s", author_name);
+        e->body = strdup(body ? body : "");
+        oc_queue_push(r->to_ui, e);
+    }
+    if (deleted) {
+        oc_ev *d = oc_ev_new(OC_EV_DELETE);
+        if (d) { d->channel_id = channel_id; d->message_id = message_id; oc_queue_push(r->to_ui, d); }
+    } else if (edited) {
+        oc_ev *ed = oc_ev_new(OC_EV_EDIT);
+        if (ed) { ed->channel_id = channel_id; ed->message_id = message_id;
+                  ed->body = strdup(body ? body : ""); oc_queue_push(r->to_ui, ed); }
+    }
+    hwtab_note(r->hw, channel_id, message_id);
+}
+
+/* Load cached history into the model before the first connect (ARCH-45/46), then
+ * mark each channel's replayed messages read so a relaunch shows history without
+ * everything reading as unread. Seeds `hw` so the first backfill resumes from the
+ * last cached id rather than refetching from 0. */
+static void replay_cache(oc_queue *to_ui, oc_store *store, const char *instance, oc_hwtab *hw) {
+    struct replay_ctx r = { to_ui, hw };
+    oc_store_each_message(store, instance, replay_msg_cb, &r);
+    for (size_t i = 0; i < hw->n; i++) {
+        oc_ev *e = oc_ev_new(OC_EV_READ_STATE);
+        if (e) { e->channel_id = hw->v[i].channel_id; oc_queue_push(to_ui, e); }
+    }
+}
+
 /* The net thread: run one connection after another, silently reconnecting with
  * the session token after an unexpected drop (REQ-100). The model is preserved
  * across reconnects (dedup on high-water), so a blip is invisible beyond a brief
@@ -979,6 +1049,8 @@ static void *net_thread(void *arg) {
             have_sess = 1;
             reconnecting = 1;   /* use OC_AUTH_SESSION on the very first connect */
         }
+        /* Show cached history immediately + seed the backfill cursor (ARCH-45/46). */
+        replay_cache(n->to_ui, cs.store, instance, &hw);
     }
 
     while (!n->stop) {

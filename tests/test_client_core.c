@@ -206,7 +206,7 @@ static int file_matches(const char *path, const unsigned char *data, size_t len)
 }
 
 int run_client_core_tests(void) {
-    printf("test_client_core: connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, persisted store, session reconnect\n");
+    printf("test_client_core: connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, persisted store, cached history, session reconnect\n");
 
     /* The daemon opens its blob store at netloop startup; point it at a build-local
      * dir (the /data/blobs default isn't writable in the test sandbox), matching
@@ -546,6 +546,37 @@ int run_client_core_tests(void) {
             CHECK(WAIT_FOR(rc, channel_has_body(m, 1, "after the restart")));
 
             oc_client_stop(rc);
+        }
+
+        /* cached history (ARCH-45/46): a client with a store caches what it sees;
+         * a relaunch shows that history *from the cache alone* — proven by loading
+         * it while the daemon is down, so it cannot have come over the wire. */
+        {
+            const char *hp = "build/itest_core_hist.db";
+            unlink(hp); unlink("build/itest_core_hist.db-wal"); unlink("build/itest_core_hist.db-shm");
+            oc_client *h1 = oc_client_start_stored("127.0.0.1", arg.port, "faye:pw-faye", hp);
+            CHECK(h1 != NULL);
+            if (h1) {
+                CHECK(WAIT_FOR(h1, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+                oc_client_send(h1, 1, "line to cache for relaunch");
+                CHECK(WAIT_FOR(h1, channel_has_body(m, 1, "line to cache for relaunch")));
+                oc_client_stop(h1);   /* the message is now in the store */
+            }
+            /* Take the daemon down, then relaunch against the same store. */
+            arg.stop = 1;
+            pthread_join(th, NULL);
+            oc_client *h2 = oc_client_start_stored("127.0.0.1", arg.port, "faye:pw-faye", hp);
+            CHECK(h2 != NULL);
+            if (h2) {
+                /* No server is up, so this can only be the cached copy. */
+                CHECK(WAIT_FOR(h2, channel_has_body(m, 1, "line to cache for relaunch")));
+                oc_client_stop(h2);
+            }
+            /* Restart the netloop so the trailing cleanup joins a live thread. */
+            arg.stop = 0;
+            CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
+            wait_port_ready(arg.port);
+            unlink(hp); unlink("build/itest_core_hist.db-wal"); unlink("build/itest_core_hist.db-shm");
         }
     } else {
         if (a) oc_client_stop(a);

@@ -70,8 +70,8 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 093 idempotent retry | ✅ | Persisted `(channel, token) → id`. |
 | 094 RPO 15s (Litestream) | ✅ | Replication to object storage + restore-on-boot (compose). |
 | 100 auto-reconnect w/o re-auth | ✅ | Daemon accepts `session`-token reconnect; **the client net thread auto-reconnects** — captures the AUTH_OK token, silently re-auths with `OC_AUTH_SESSION` (no password) under backoff on a drop, preserving the in-memory model. **Now also across process restarts:** a client SQLite store (`client/core/store.c`) persists the session token + TOFU pin per instance, so a relaunch reconnects silently against the pinned cert. Headless-tested (daemon bounce; wrong-password client rides the stored token). |
-| 101 backfill on reconnect | ✅ | Per-channel cursors → replayed messages + `BACKFILL_DONE` (+ `THREAD_META`). **The client drives it on reconnect**, backfilling each channel from its last-seen id (net-thread high-water); replays dedup on the model mark. |
-| 102 offline outbox | 🔵 ⛔ | The client SQLite store now exists (`client/core/store.c`, session token + TOFU pin); the outbox table + resend-on-reconnect flush is the remaining piece. |
+| 101 backfill on reconnect | ✅ | Per-channel cursors → replayed messages + `BACKFILL_DONE` (+ `THREAD_META`). **The client drives it on reconnect**, backfilling each channel from its last-seen id (net-thread high-water); replays dedup on the model mark. **Now cursor-backed by the store:** cached messages seed the high-water at startup, so even a first backfill after relaunch resumes from the last cached id, not 0. |
+| 102 offline outbox | 🔵 ⛔ | The client SQLite store now persists the session token + TOFU pin **and cached history** (`client/core/store.c`); the outbox table + resend-on-reconnect flush is the one remaining piece of the store project. |
 | 110 reject unsupported version pre-parse | ✅ | |
 | 111 VERSION_TOO_OLD/NEW reason codes | ✅ | |
 

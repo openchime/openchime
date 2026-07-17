@@ -171,17 +171,25 @@ arrives with the store phase.
 
 The core bundles SQLite (`client/core/store.c`) and reuses the daemon's
 migration-runner (`oc_migrate`) with its own client migration set. **Built so
-far:** an `instance_state` row per server (`"host:port"`) holding the **session
-token + expiry** (ARCH-58) and the **per-instance TOFU pin** (ARCH-10), so a
-relaunched client reconnects silently with the token — no password — against the
-pinned cert. The store is owned by the net thread (one connection, one thread);
-an unusable path just disables persistence (in-memory only). The TUI puts it at
-`$OPENCHIME_STATE` or `$HOME/.local/state/openchime/state.db`; a headless test
-authenticates, then a second client with a *wrong* password rides in on the
-stored token.
+far:**
+- `instance_state` (one row per `"host:port"`) — the **session token + expiry**
+  (ARCH-58) and the **per-instance TOFU pin** (ARCH-10), so a relaunched client
+  reconnects silently with the token — no password — against the pinned cert.
+- `cached_message` — **cached history** per channel (ARCH-45/46). Every BROADCAST
+  is written through as it arrives (edits/deletes update the row); on startup the
+  net thread replays the cache into the model *before connecting*, so history
+  shows instantly (proven offline: a headless test and a PTY smoke both load it
+  with the daemon down). The replay also seeds the net thread's per-channel
+  high-water, so the first `BACKFILL_REQUEST` resumes from the last cached id
+  instead of refetching from 0, and replayed history is marked read (not stale
+  "unread"). Reactions/attachments on cached messages aren't cached yet — they
+  re-appear only for messages the backfill re-sends.
 
-**Still to add:** cached history per channel + the high-water/backfill cursors
-(ARCH-45/46), and the **offline outbox** (messages composed offline, resent on
+The store is owned by the net thread (one connection, one thread); an unusable
+path just disables persistence (in-memory only). The TUI puts it at
+`$OPENCHIME_STATE` or `$HOME/.local/state/openchime/state.db`.
+
+**Still to add:** the **offline outbox** (messages composed offline, resent on
 reconnect with their idempotency tokens — the concrete answer to REQ-102).
 Keychains for the token are noted future hardening.
 

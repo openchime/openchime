@@ -43,4 +43,25 @@ int  oc_store_load_pin(oc_store *s, const char *instance,
 void oc_store_save_pin(oc_store *s, const char *instance,
                        const uint8_t pin[OC_TLS_FINGERPRINT_LEN]);
 
+/* Cached message history (ARCH-45/46), so a relaunch shows history instantly and
+ * backfills only from the last cached id. save upserts one message; edit/delete
+ * update an existing row's body/flags. All keyed by (instance, message_id). */
+void oc_store_save_message(oc_store *s, const char *instance, uint64_t channel_id,
+                           uint64_t message_id, uint64_t author_id,
+                           const char *author_name, uint64_t server_time,
+                           const char *body, int edited, int deleted);
+void oc_store_edit_message(oc_store *s, const char *instance, uint64_t message_id,
+                           const char *body);
+void oc_store_delete_message(oc_store *s, const char *instance, uint64_t message_id);
+
+/* Replay cached messages for `instance` in ascending message-id order, invoking
+ * `cb` for each. `body` may be NULL (deleted). The store owns the strings for the
+ * duration of the callback only. */
+typedef void (*oc_store_msg_cb)(void *ctx, uint64_t channel_id, uint64_t message_id,
+                                uint64_t author_id, const char *author_name,
+                                uint64_t server_time, const char *body,
+                                int edited, int deleted);
+void oc_store_each_message(oc_store *s, const char *instance,
+                           oc_store_msg_cb cb, void *ctx);
+
 #endif /* OC_STORE_H */

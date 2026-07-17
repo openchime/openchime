@@ -34,6 +34,7 @@ enum {
     OC_EV_WEBHOOK_DELETED, /* a WEBHOOK_DELETED: message_id=webhook_id */
     OC_EV_ATTACHMENT,      /* a message's attachment: channel_id + message_id + parent_id=attachment_id + server_time=size + body=filename + author_name=mime */
     OC_EV_XFER,            /* a transfer notice: op=phase (0 progress, 1 done, 2 error), body=status text */
+    OC_EV_READ_STATE,      /* channel_id: mark its currently-loaded messages read (replayed cache is not "unread") */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
     OC_EV_ERROR            /* protocol/transport error; body = human message */
 };

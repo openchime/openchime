@@ -22,6 +22,19 @@ static const oc_migration CLIENT_MIGRATIONS[] = {
       "  session_expiry INTEGER,"
       "  tls_pin        BLOB"
       ");" },
+    { 2,
+      "CREATE TABLE cached_message ("
+      "  instance     TEXT    NOT NULL,"
+      "  channel_id   INTEGER NOT NULL,"
+      "  message_id   INTEGER NOT NULL,"
+      "  author_id    INTEGER,"
+      "  author_name  TEXT,"
+      "  server_time  INTEGER,"
+      "  body         TEXT,"
+      "  edited       INTEGER NOT NULL DEFAULT 0,"
+      "  deleted      INTEGER NOT NULL DEFAULT 0,"
+      "  PRIMARY KEY (instance, message_id)"
+      ");" },
 };
 static const int CLIENT_MIGRATIONS_COUNT =
     (int)(sizeof CLIENT_MIGRATIONS / sizeof CLIENT_MIGRATIONS[0]);
@@ -133,4 +146,82 @@ void oc_store_save_pin(oc_store *s, const char *instance,
            "INSERT INTO instance_state (instance, tls_pin) VALUES (?1, ?2) "
            "ON CONFLICT(instance) DO UPDATE SET tls_pin=?2;",
            pin, OC_TLS_FINGERPRINT_LEN, 0, 0);
+}
+
+void oc_store_save_message(oc_store *s, const char *instance, uint64_t channel_id,
+                           uint64_t message_id, uint64_t author_id,
+                           const char *author_name, uint64_t server_time,
+                           const char *body, int edited, int deleted) {
+    if (!s || !s->db || !instance || !message_id) return;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "INSERT INTO cached_message "
+            "(instance, channel_id, message_id, author_id, author_name, server_time, body, edited, deleted) "
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) "
+            "ON CONFLICT(instance, message_id) DO UPDATE SET "
+            "  channel_id=?2, author_id=?4, author_name=?5, server_time=?6, body=?7, edited=?8, deleted=?9;",
+            -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(st, 1, instance, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, (int64_t)channel_id);
+    sqlite3_bind_int64(st, 3, (int64_t)message_id);
+    sqlite3_bind_int64(st, 4, (int64_t)author_id);
+    sqlite3_bind_text(st, 5, author_name ? author_name : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 6, (int64_t)server_time);
+    if (body) sqlite3_bind_text(st, 7, body, -1, SQLITE_TRANSIENT);
+    else      sqlite3_bind_null(st, 7);
+    sqlite3_bind_int(st, 8, edited ? 1 : 0);
+    sqlite3_bind_int(st, 9, deleted ? 1 : 0);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+void oc_store_edit_message(oc_store *s, const char *instance, uint64_t message_id,
+                           const char *body) {
+    if (!s || !s->db || !instance) return;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "UPDATE cached_message SET body=?3, edited=1 WHERE instance=?1 AND message_id=?2;",
+            -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(st, 1, instance, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, (int64_t)message_id);
+    if (body) sqlite3_bind_text(st, 3, body, -1, SQLITE_TRANSIENT);
+    else      sqlite3_bind_null(st, 3);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+void oc_store_delete_message(oc_store *s, const char *instance, uint64_t message_id) {
+    if (!s || !s->db || !instance) return;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "UPDATE cached_message SET body=NULL, deleted=1 WHERE instance=?1 AND message_id=?2;",
+            -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(st, 1, instance, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, (int64_t)message_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+void oc_store_each_message(oc_store *s, const char *instance,
+                           oc_store_msg_cb cb, void *ctx) {
+    if (!s || !s->db || !instance || !cb) return;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT channel_id, message_id, author_id, author_name, server_time, body, edited, deleted "
+            "FROM cached_message WHERE instance=?1 ORDER BY message_id ASC;",
+            -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(st, 1, instance, -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *body = (const char *)sqlite3_column_text(st, 5);   /* NULL if deleted */
+        cb(ctx,
+           (uint64_t)sqlite3_column_int64(st, 0),
+           (uint64_t)sqlite3_column_int64(st, 1),
+           (uint64_t)sqlite3_column_int64(st, 2),
+           (const char *)sqlite3_column_text(st, 3),
+           (uint64_t)sqlite3_column_int64(st, 4),
+           body,
+           sqlite3_column_int(st, 6),
+           sqlite3_column_int(st, 7));
+    }
+    sqlite3_finalize(st);
 }

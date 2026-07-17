@@ -590,6 +590,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     case OC_EV_XFER:
         if (e->body) set_status(m, e->body);
         break;
+    case OC_EV_READ_STATE:
+        /* Cached history restored at startup is not "new": mark it read so a
+         * relaunch doesn't show every replayed message as unread. Genuinely new
+         * messages (backfilled past this mark) still count. */
+        oc_model_mark_read(m, e->channel_id);
+        break;
     case OC_EV_DISCONNECTED:
         m->connected = false;
         m->authed = false;
