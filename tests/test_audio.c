@@ -47,7 +47,10 @@ static void authorize(int fd, uint64_t call, uint64_t user, const uint8_t *tok) 
 /* A mock client UDP socket with a short receive timeout. */
 static int mk_client(void) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct timeval tv = { 0, 300000 };   /* 300 ms */
+    struct timeval tv = { 1, 0 };   /* 1 s — generous ceiling so a loaded CI
+                                     * runner doesn't miss a forwarded datagram
+                                     * (loopback UDP doesn't drop; this only waits
+                                     * longer for a delayed one). */
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     return fd;
 }

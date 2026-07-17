@@ -58,7 +58,9 @@ static int udp_recv_audio(int fd, uint64_t *sender, uint16_t *seq, char *out, si
 }
 static int mk_udp_client(void) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct timeval tv = { 0, 400000 };
+    struct timeval tv = { 1, 0 };   /* 1 s — generous ceiling for the audio relay
+                                     * round-trip under CI load (loopback UDP
+                                     * doesn't drop). */
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     return fd;
 }

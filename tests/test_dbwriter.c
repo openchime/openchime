@@ -1282,7 +1282,10 @@ static void test_idem_pruning(void) {
     oc_dbwriter *w = oc_dbwriter_start(path);
     CHECK(w != NULL);
     /* Tiny retention + prune-every-write so the test can observe it. */
-    oc_dbwriter_set_idem_retention(w, 50 /*ms*/, 0 /*interval*/);
+    /* A generous retention window: the "still deduplicated" checks below do
+     * several async round-trips that must land inside it, so a tight window
+     * (e.g. 50 ms) races the clock on a slow/loaded CI runner. */
+    oc_dbwriter_set_idem_retention(w, 1000 /*ms*/, 0 /*interval*/);
 
     uint64_t uid = reg(w, "pr-user", "pw", OC_ROLE_MEMBER);
     CHECK(uid != 0);
@@ -1296,7 +1299,7 @@ static void test_idem_pruning(void) {
     /* Fresh token is still deduplicated. */
     CHECK(send_msg(w, uid, tokA, "first-again") == m1);
 
-    usleep(120000);   /* age tokA past the 50ms retention */
+    usleep(1300000);   /* age tokA past the 1000ms retention */
 
     /* A new send triggers the prune, dropping tokA's aged mapping. */
     uint64_t m2 = send_msg(w, uid, tokB, "second");
