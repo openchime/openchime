@@ -22,6 +22,7 @@
 #include "model.h"
 #include "protocol.h"   /* OC_PRESENCE_* */
 
+#include <locale.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -162,14 +163,6 @@ static void build_rows(rows_t *r, const oc_channel *ch, uint64_t me, int width) 
 
 /* ---- rendering ------------------------------------------------------------- */
 
-static const char *presence_dot(uint8_t status) {
-    switch (status) {
-        case OC_PRESENCE_ONLINE: return "●";
-        case OC_PRESENCE_AWAY:   return "◐";
-        default:                 return "○";
-    }
-}
-
 static void render(oc_client *cl, size_t focus, const char *composer,
                    size_t clen, int scroll) {
     (void)clen;
@@ -232,8 +225,6 @@ static void render(oc_client *cl, size_t focus, const char *composer,
              scroll > 0 ? "  [scrolled]" : "");
     fill_row(H - 2, 0, W, TB_DEFAULT);
     draw_clip(0, H - 2, W, status, TB_YELLOW, TB_DEFAULT);
-    if (fc) draw_clip(SIDEBAR_W - 2, H - 2, SIDEBAR_W, presence_dot(OC_PRESENCE_ONLINE),
-                      TB_GREEN, TB_DEFAULT);
 
     /* Composer (row H-1). */
     fill_row(H - 1, 0, W, TB_DEFAULT);
@@ -282,6 +273,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s <host> <port> [user:pass]\n", argv[0]);
         return 2;
     }
+    /* Adopt the environment's locale so termbox2's iswprint() check recognizes
+     * non-ASCII codepoints as printable — without this it renders every emoji /
+     * wide glyph as U+FFFD, defeating the whole point of utf8proc. */
+    setlocale(LC_ALL, "");
+
     const char *host = argv[1];
     int port = atoi(argv[2]);
     const char *cred = argc > 3 ? argv[3] : getenv("OPENCHIME_CRED");
