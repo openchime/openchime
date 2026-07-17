@@ -55,6 +55,10 @@ typedef struct { uint64_t channel_id; uint64_t user_id; long long seen; } oc_typ
 /* One full-text search hit (REQ-080). */
 typedef struct { uint64_t message_id, channel_id, author_id, server_time; char *snippet; } oc_search_result;
 
+/* One reactor entry (from LIST_REACTIONS -> REACTIONS, REQ-071): who reacted
+ * with which emoji on the inspected message. */
+typedef struct { uint64_t user_id; char emoji[40]; } oc_reactor_row;
+
 typedef struct {
     bool     connected;
     bool     authed;
@@ -77,6 +81,12 @@ typedef struct {
     char      search_query[128];
     oc_search_result *search_results;
     size_t    n_search, cap_search;
+    /* The open "who reacted" view (REQ-071): the inspected message + its full
+     * reactor list. reactlist_open is 0 when no such overlay is open. */
+    uint8_t   reactlist_open;
+    uint64_t  reactlist_message;
+    oc_reactor_row *reactors;
+    size_t    n_reactors, cap_reactors;
     /* The tenant roster (REQ, LIST_USERS) + whether the roster view is open. */
     uint8_t   roster_open;
     oc_member *users;
@@ -103,6 +113,11 @@ void oc_model_close_thread(oc_model *m);
 /* Begin a search (clears prior hits, records the query) / close the search view. */
 void oc_model_search_begin(oc_model *m, const char *query);
 void oc_model_close_search(oc_model *m);
+
+/* Begin a "who reacted" inspection (clears prior reactors, records the message)
+ * / close the overlay. */
+void oc_model_reactlist_begin(oc_model *m, uint64_t message_id);
+void oc_model_close_reactlist(oc_model *m);
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);
 /* Record a presence value (used for our own presence, which the server does not

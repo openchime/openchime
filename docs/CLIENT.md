@@ -117,8 +117,10 @@ model; translate input to intents }, stop.
   roster + presence** (`/who` overlays the tenant roster with online/away/offline
   dots + roles; `/away` and `/online` set your own presence). and **direct messages** (`/dm <name>`
   opens a 1:1 DM, titled `@peer` in the sidebar; the daemon reports the DM peer
-  in CHANNEL_INFO — a small protocol addition), and **logout** (`/logout` revokes
-  this session server-side and quits once the connection drops). The remaining
+  in CHANNEL_INFO — a small protocol addition), **logout** (`/logout` revokes
+  this session server-side and quits once the connection drops), and
+  **who-reacted** (`/reactions` overlays the full reactor list of the last
+  message — each reactor paired with the emoji they used, REQ-071). The remaining
   engine features are client-only surfacing work: attachment transfer.
 - **Windows (later):** Win32/WinUI (C++/WinRT or C#) over the C core.
 - **macOS/iOS (later):** AppKit/UIKit (Swift) over the core.
@@ -172,8 +174,8 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
   (`/react`), **edit/delete** (`/edit`, `/delete`, `(edited)` marker + `[message
   deleted]` tombstone), and **typing indicators** (`✎ X is typing…`) are done.
   Remaining TUI increments surface engine features already on the wire: attachment
-  transfer, who-reacted, notification prefs/DND, admin, webhook management.
-  (Shipped: threads, search, channel management, roster + presence, DMs, logout.)
+  transfer, notification prefs/DND, admin, webhook management. (Shipped: threads,
+  search, channel management, roster + presence, DMs, logout, who-reacted.)
 - **Next:** store + reconnect/offline; auth completeness (local + OIDC);
   attachments (chunked up/download) and the **audio client** (Opus encode/decode
   + UDP to the sidecar — the deferred half of REQ-150/151).

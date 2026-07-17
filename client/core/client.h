@@ -81,6 +81,11 @@ void oc_client_toggle_roster(oc_client *c, int open);
  * that carries the peer, so the DM titles itself from the roster. */
 void oc_client_open_dm(oc_client *c, uint64_t user_id);
 
+/* Inspect who reacted to a message (REQ-071): the reactors stream into the
+ * model's reactor list (a "who reacted" overlay) / close that overlay. */
+void oc_client_list_reactions(oc_client *c, uint64_t channel_id, uint64_t message_id);
+void oc_client_close_reactions(oc_client *c);
+
 /* Log out: revoke this session (scope OC_LOGOUT_THIS) or all of the user's
  * (OC_LOGOUT_ALL); the server closes the connection. */
 void oc_client_logout(oc_client *c, uint8_t scope);

@@ -23,6 +23,7 @@ enum {
     OC_EV_THREAD_REPLY,    /* a THREAD_REPLY: parent_id/message + body + count */
     OC_EV_THREAD_META,     /* a THREAD_META: message_id + reply count (backfill) */
     OC_EV_SEARCH_RESULT,   /* a SEARCH_RESULTS entry: channel/message/author + snippet(body) */
+    OC_EV_REACTIONS,       /* a REACTIONS entry: message_id + one reactor (user_id + emoji) */
     OC_EV_USER,            /* a USER_LIST entry: user_id + name(body) + role(status) + disabled(op) */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
     OC_EV_ERROR            /* protocol/transport error; body = human message */
@@ -65,6 +66,7 @@ enum {
     OC_CMD_LIST_USERS,      /* request the tenant roster */
     OC_CMD_SET_PRESENCE,    /* set own presence: op = OC_PRESENCE_ONLINE / _AWAY */
     OC_CMD_OPEN_DM,         /* open/get a 1:1 DM with `channel_id` (reused as target user id) */
+    OC_CMD_LIST_REACTIONS,  /* inspect who reacted to `message_id` in `channel_id` */
     OC_CMD_LOGOUT,          /* revoke this session (op = scope) and close the connection */
     OC_CMD_QUIT
 };

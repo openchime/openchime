@@ -265,6 +265,19 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                 if (e->body) { memcpy(e->body, se[i].snippet.ptr, se[i].snippet.len); e->body[se[i].snippet.len] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_REACTIONS) {
+            oc_reaction_entry re[256]; uint16_t count = 0; uint64_t mid = 0;
+            if (oc_decode_reactions(&p, re, 256, &count, &mid) != OC_OK) return -1;
+            if (count > 256) count = 256;
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_REACTIONS);
+                if (!e) continue;
+                e->message_id = mid;
+                e->user_id = re[i].user_id;
+                size_t n = re[i].emoji.len < sizeof e->emoji - 1 ? re[i].emoji.len : sizeof e->emoji - 1;
+                memcpy(e->emoji, re[i].emoji.ptr, n); e->emoji[n] = '\0';
+                oc_queue_push(to_ui, e);
+            }
         } else if (hdr.msg_type == OC_MSG_ERROR) {
             oc_error err;
             if (oc_decode_error(&p, &err) == OC_OK) {
@@ -455,6 +468,12 @@ static void *net_thread(void *arg) {
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_set_presence sp = { c->op };
                 if (oc_encode_set_presence(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_REACTIONS) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_list_reactions lr = { c->channel_id, c->message_id };
+                if (oc_encode_list_reactions(&w, OC_PROTOCOL_VERSION, &lr) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_OPEN_DM) {

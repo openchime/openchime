@@ -65,6 +65,7 @@ void oc_model_free(oc_model *m) {
     free(m->thread_msgs);
     for (size_t i = 0; i < m->n_search; i++) free(m->search_results[i].snippet);
     free(m->search_results);
+    free(m->reactors);
     free(m->users);
     memset(m, 0, sizeof *m);
 }
@@ -114,6 +115,20 @@ void oc_model_search_begin(oc_model *m, const char *query) {
     oc_model_close_search(m);      /* drop any prior hits */
     m->search_open = 1;
     snprintf(m->search_query, sizeof m->search_query, "%s", query ? query : "");
+}
+
+void oc_model_close_reactlist(oc_model *m) {
+    free(m->reactors);
+    m->reactors = NULL;
+    m->n_reactors = m->cap_reactors = 0;
+    m->reactlist_open = 0;
+    m->reactlist_message = 0;
+}
+
+void oc_model_reactlist_begin(oc_model *m, uint64_t message_id) {
+    oc_model_close_reactlist(m);   /* drop any prior reactors */
+    m->reactlist_open = 1;
+    m->reactlist_message = message_id;
 }
 
 void oc_model_close_thread(oc_model *m) {
@@ -167,6 +182,19 @@ static void search_append(oc_model *m, uint64_t message_id, uint64_t channel_id,
     sr->message_id = message_id; sr->channel_id = channel_id;
     sr->author_id = author_id; sr->server_time = server_time;
     sr->snippet = *snippet; *snippet = NULL;
+}
+
+/* Append one reactor (user_id + emoji) to the open who-reacted list. */
+static void reactor_append(oc_model *m, uint64_t user_id, const char *emoji) {
+    if (m->n_reactors == m->cap_reactors) {
+        size_t cap = m->cap_reactors ? m->cap_reactors * 2 : 16;
+        oc_reactor_row *nr = realloc(m->reactors, cap * sizeof *nr);
+        if (!nr) return;
+        m->reactors = nr; m->cap_reactors = cap;
+    }
+    oc_reactor_row *r = &m->reactors[m->n_reactors++];
+    r->user_id = user_id;
+    snprintf(r->emoji, sizeof r->emoji, "%s", emoji ? emoji : "");
 }
 
 /* Raise a message's thread reply count, finding it in any channel (message ids
@@ -389,6 +417,10 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     case OC_EV_SEARCH_RESULT:
         if (m->search_open)
             search_append(m, e->message_id, e->channel_id, e->author_id, e->server_time, &e->body);
+        break;
+    case OC_EV_REACTIONS:
+        if (m->reactlist_open && e->message_id == m->reactlist_message)
+            reactor_append(m, e->user_id, e->emoji);
         break;
     case OC_EV_USER:
         user_upsert(m, e->user_id, e->body ? e->body : "", e->status, e->op);

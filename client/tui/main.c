@@ -10,9 +10,10 @@
  *
  * Keys: type + Enter to send · Tab next channel · ↑/↓ + PgUp/PgDn scroll ·
  *       Ctrl-Q quit. Commands (on the last message in the focused channel):
- *       /react <emoji> · /edit <text> · /delete · /thread (open its thread;
- *       then Enter posts a reply) · /search <query> · /close (leave a
- *       thread/search/roster overlay) · /create <name> · /join <name> · /leave ·
+ *       /react <emoji> · /reactions (who reacted to it) · /edit <text> ·
+ *       /delete · /thread (open its thread; then Enter posts a reply) ·
+ *       /search <query> · /close (leave a thread/search/roster/reactions
+ *       overlay) · /create <name> · /join <name> · /leave ·
  *       /who (member roster + presence) · /away · /online · /dm <name> (open a
  *       direct message) · /logout (revoke this session and quit).
  */
@@ -264,6 +265,26 @@ static void build_roster_rows(rows_t *r, const oc_model *m, int width) {
     }
 }
 
+/* Build the rows for the "who reacted" overlay: each reactor as "<emoji> name",
+ * grouped in the emoji-then-user order the server returns. */
+static void build_reactlist_rows(rows_t *r, const oc_model *m, int width) {
+    (void)width;
+    char line[160];
+    snprintf(line, sizeof line, "%zu reaction%s", m->n_reactors,
+             m->n_reactors == 1 ? "" : "s");
+    char *h = malloc(strlen(line) + 1);
+    if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
+    for (size_t i = 0; i < m->n_reactors; i++) {
+        const oc_reactor_row *rr = &m->reactors[i];
+        const char *nm = oc_model_user_name(m, rr->user_id);
+        if (nm[0]) snprintf(line, sizeof line, "%s  %s", rr->emoji, nm);
+        else       snprintf(line, sizeof line, "%s  user%llu", rr->emoji,
+                            (unsigned long long)rr->user_id);
+        char *rw = malloc(strlen(line) + 1);
+        if (rw) { strcpy(rw, line); rows_push(r, rw, TB_DEFAULT); }
+    }
+}
+
 static void render(oc_client *cl, size_t focus, const char *composer,
                    size_t clen, int scroll) {
     (void)clen;
@@ -306,8 +327,9 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     /* Title bar (row 0 over the pane) — a thread view overlays the channel. */
     const oc_channel *fc = (focus < m->n_channels) ? &m->channels[focus] : NULL;
     char title[160];
-    if (m->roster_open)      snprintf(title, sizeof title, " members (/close to exit)");
-    else if (m->search_open) snprintf(title, sizeof title, " search (/close to exit)");
+    if (m->roster_open)          snprintf(title, sizeof title, " members (/close to exit)");
+    else if (m->search_open)     snprintf(title, sizeof title, " search (/close to exit)");
+    else if (m->reactlist_open)  snprintf(title, sizeof title, " reactions (/close to exit)");
     else if (m->thread_open) snprintf(title, sizeof title, " thread · #%s (/close to exit)",
                                       fc && fc->name ? fc->name : "…");
     else if (fc)             snprintf(title, sizeof title, " #%s", fc->name ? fc->name : "…");
@@ -317,12 +339,13 @@ static void render(oc_client *cl, size_t focus, const char *composer,
 
     /* Message rows for the focused channel, or an open overlay (thread / search /
      * roster), showing the window ending `scroll` rows above the bottom. */
-    if (fc || m->thread_open || m->search_open || m->roster_open) {
+    if (fc || m->thread_open || m->search_open || m->roster_open || m->reactlist_open) {
         rows_t rows = {0};
-        if (m->roster_open)      build_roster_rows(&rows, m, pxmax - px0);
-        else if (m->search_open) build_search_rows(&rows, m, pxmax - px0);
-        else if (m->thread_open) build_thread_rows(&rows, m, fc, m->user_id, pxmax - px0);
-        else                     build_rows(&rows, fc, m->user_id, pxmax - px0);
+        if (m->roster_open)         build_roster_rows(&rows, m, pxmax - px0);
+        else if (m->search_open)    build_search_rows(&rows, m, pxmax - px0);
+        else if (m->reactlist_open) build_reactlist_rows(&rows, m, pxmax - px0);
+        else if (m->thread_open)    build_thread_rows(&rows, m, fc, m->user_id, pxmax - px0);
+        else                        build_rows(&rows, fc, m->user_id, pxmax - px0);
         int total = (int)rows.n;
         int end = total - scroll;                /* one past the last visible row */
         if (end > total) end = total;
@@ -402,7 +425,8 @@ static const oc_msg *my_last_message(const oc_channel *ch, uint64_t me) {
 static void handle_command(oc_client *cl, uint64_t cid, const char *line) {
     const oc_model *m = oc_client_model(cl);
     if (strcmp(line, "/close") == 0) {
-        oc_client_close_thread(cl); oc_client_close_search(cl); oc_client_toggle_roster(cl, 0);
+        oc_client_close_thread(cl); oc_client_close_search(cl);
+        oc_client_close_reactions(cl); oc_client_toggle_roster(cl, 0);
         return;
     }
     if (strcmp(line, "/who") == 0)    { oc_client_toggle_roster(cl, 1); return; }
@@ -444,6 +468,8 @@ static void handle_command(oc_client *cl, uint64_t cid, const char *line) {
 
     if (strcmp(line, "/thread") == 0) {       /* open the last message's thread */
         oc_client_open_thread(cl, cid, ch->msgs[ch->n_msgs - 1].message_id);
+    } else if (strcmp(line, "/reactions") == 0) {   /* who reacted to the last message */
+        oc_client_list_reactions(cl, cid, ch->msgs[ch->n_msgs - 1].message_id);
     } else if (strncmp(line, "/react ", 7) == 0) {
         const char *emoji = line + 7;
         while (*emoji == ' ') emoji++;
@@ -531,7 +557,7 @@ int main(int argc, char **argv) {
                 uint64_t cid = mm->channels[focus].channel_id;
                 if (strcmp(composer, "/logout") == 0)         { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
                 else if (composer[0] == '/')                  handle_command(cl, cid, composer);
-                else if (mm->search_open || mm->roster_open)  { /* read-only overlay: ignore */ }
+                else if (mm->search_open || mm->roster_open || mm->reactlist_open) { /* read-only overlay: ignore */ }
                 else if (mm->thread_open)                     oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
                 else                                          oc_client_send(cl, cid, composer);
                 clen = 0; composer[0] = '\0'; scroll = 0;

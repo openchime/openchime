@@ -208,6 +208,21 @@ void oc_client_open_dm(oc_client *c, uint64_t user_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_list_reactions(oc_client *c, uint64_t channel_id, uint64_t message_id) {
+    if (!c || !message_id) return;
+    oc_model_reactlist_begin(&c->model, message_id);   /* clears prior + records it */
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_REACTIONS);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = message_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_close_reactions(oc_client *c) {
+    if (!c) return;
+    oc_model_close_reactlist(&c->model);
+}
+
 void oc_client_logout(oc_client *c, uint8_t scope) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_LOGOUT);

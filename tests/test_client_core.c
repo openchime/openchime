@@ -241,6 +241,28 @@ int run_client_core_tests(void) {
         oc_client_react(b, 1, mid, ":+1:", 0);
         CHECK(WAIT_FOR(a, reaction_count(m, 1, mid, ":+1:", NULL) == 0));
 
+        /* who-reacted (REQ-071): erik reacts :+1:, dana reacts :tada:; dana
+         * inspects the message and the reactor list carries both — each reactor
+         * paired with the emoji they used. */
+        oc_client_react(b, 1, mid, ":+1:", 1);
+        oc_client_react(a, 1, mid, ":tada:", 1);
+        CHECK(WAIT_FOR(a, reaction_count(m, 1, mid, ":+1:", NULL) == 1 &&
+                          reaction_count(m, 1, mid, ":tada:", NULL) == 1));
+        oc_client_list_reactions(a, 1, mid);
+        CHECK(WAIT_FOR(a, m->reactlist_open && m->n_reactors >= 2));
+        {
+            const oc_model *am = oc_client_model(a);
+            int erik_thumb = 0, dana_tada = 0;
+            for (size_t j = 0; j < am->n_reactors; j++) {
+                const char *nm = oc_model_user_name(am, am->reactors[j].user_id);
+                if (nm && strcmp(nm, "erik") == 0 && strcmp(am->reactors[j].emoji, ":+1:") == 0) erik_thumb = 1;
+                if (nm && strcmp(nm, "dana") == 0 && strcmp(am->reactors[j].emoji, ":tada:") == 0) dana_tada = 1;
+            }
+            CHECK(erik_thumb && dana_tada);
+        }
+        oc_client_close_reactions(a);
+        CHECK(!oc_client_model(a)->reactlist_open && oc_client_model(a)->n_reactors == 0);
+
         /* erik replies to dana's message in a thread: both see the parent's reply
          * count rise, and opening the thread streams the reply into the buffer. */
         oc_client_reply(b, 1, mid, "a threaded reply");
