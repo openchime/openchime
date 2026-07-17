@@ -57,6 +57,10 @@ enum {
     OC_CMD_OPEN_THREAD,    /* request a thread's replies: `message_id` = parent */
     OC_CMD_REPLY,          /* reply in a thread: `message_id` = parent, body=text */
     OC_CMD_SEARCH,         /* full-text search: body = query */
+    OC_CMD_CREATE_CHANNEL,  /* create a public channel: body = name */
+    OC_CMD_JOIN_CHANNEL,    /* join `channel_id` */
+    OC_CMD_LEAVE_CHANNEL,   /* leave `channel_id` */
+    OC_CMD_LIST_CHANNELS,   /* refresh the channel list (discover new channels) */
     OC_CMD_QUIT
 };
 

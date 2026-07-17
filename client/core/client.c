@@ -155,6 +155,30 @@ void oc_client_close_search(oc_client *c) {
     oc_model_close_search(&c->model);
 }
 
+void oc_client_create_channel(oc_client *c, const char *name) {
+    if (!c || !name || !name[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CREATE_CHANNEL);
+    if (!cmd) return;
+    cmd->body = strdup(name);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+static void channel_op(oc_client *c, int type, uint64_t channel_id) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(type);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+void oc_client_join_channel(oc_client *c, uint64_t channel_id)  { channel_op(c, OC_CMD_JOIN_CHANNEL, channel_id); }
+void oc_client_leave_channel(oc_client *c, uint64_t channel_id) { channel_op(c, OC_CMD_LEAVE_CHANNEL, channel_id); }
+
+void oc_client_list_channels(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_CHANNELS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_stop(oc_client *c) {
     if (!c) return;
     oc_net_stop(c->net);   /* signals QUIT, joins the thread */

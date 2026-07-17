@@ -12,7 +12,7 @@
  *       Ctrl-Q quit. Commands (on the last message in the focused channel):
  *       /react <emoji> · /edit <text> · /delete · /thread (open its thread;
  *       then Enter posts a reply) · /search <query> · /close (leave a
- *       thread/search overlay).
+ *       thread/search overlay) · /create <name> · /join <name> · /leave.
  */
 
 #define TB_IMPL
@@ -250,14 +250,17 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     for (size_t i = 0; i < m->n_channels && (int)i + 1 < H - 1; i++) {
         const oc_channel *c = &m->channels[i];
         uintattr_t bg = (i == focus) ? TB_BLUE : TB_DEFAULT;
-        uintattr_t fg = (i == focus) ? TB_WHITE | TB_BOLD : TB_DEFAULT;
+        /* Not-joined channels (public ones you can /join) render dim. */
+        uintattr_t fg = (i == focus) ? TB_WHITE | TB_BOLD
+                      : c->joined    ? TB_DEFAULT
+                                     : TB_BLACK | TB_BOLD;
         int y = (int)i + 1;
         fill_row(y, 0, SIDEBAR_W, bg);
         char label[128];
         if (c->unread > 0)
             snprintf(label, sizeof label, "# %s (%d)", c->name ? c->name : "…", c->unread);
         else
-            snprintf(label, sizeof label, "# %s", c->name ? c->name : "…");
+            snprintf(label, sizeof label, "%s%s", c->joined ? "# " : "+ ", c->name ? c->name : "…");
         draw_clip(1, y, SIDEBAR_W, label, fg, bg);
     }
     for (int y = 0; y < H; y++) tb_set_cell(SIDEBAR_W, y, '|', TB_DEFAULT, TB_DEFAULT);
@@ -370,6 +373,23 @@ static void handle_command(oc_client *cl, uint64_t cid, const char *line) {
         if (*q) oc_client_search(cl, q);
         return;
     }
+    if (strncmp(line, "/create ", 8) == 0) {
+        const char *nm = line + 8;
+        while (*nm == ' ') nm++;
+        if (*nm) oc_client_create_channel(cl, nm);
+        return;
+    }
+    if (strncmp(line, "/join ", 6) == 0) {
+        const char *nm = line + 6;
+        while (*nm == ' ') nm++;
+        for (size_t i = 0; i < m->n_channels; i++)   /* resolve id by name */
+            if (m->channels[i].name && strcmp(m->channels[i].name, nm) == 0) {
+                oc_client_join_channel(cl, m->channels[i].channel_id); break;
+            }
+        return;
+    }
+    if (strcmp(line, "/leave") == 0) { oc_client_leave_channel(cl, cid); return; }
+    if (strcmp(line, "/list") == 0)  { oc_client_list_channels(cl); return; }
 
     const oc_channel *ch = focused_channel(m, cid);
     if (!ch || ch->n_msgs == 0) return;

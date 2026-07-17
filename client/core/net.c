@@ -153,6 +153,18 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                 if (e->body) { memcpy(e->body, ents[i].name.ptr, ents[i].name.len); e->body[ents[i].name.len] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_CHANNEL_INFO) {
+            oc_channel_info ci;
+            if (oc_decode_channel_info(&p, &ci) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_CHANNEL);   /* add/update the channel */
+                if (e) {
+                    e->channel_id = ci.channel_id;
+                    e->status = ci.joined;
+                    e->body = malloc(ci.name.len + 1);
+                    if (e->body) { memcpy(e->body, ci.name.ptr, ci.name.len); e->body[ci.name.len] = '\0'; }
+                    oc_queue_push(to_ui, e);
+                }
+            }
         } else if (hdr.msg_type == OC_MSG_PRESENCE_UPDATE) {
             oc_presence_update pu;
             if (oc_decode_presence_update(&p, &pu) == OC_OK) {
@@ -392,6 +404,25 @@ static void *net_thread(void *arg) {
                 uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_search s = { oc_slice_str(c->body), 50 };
                 if (oc_encode_search(&w, OC_PROTOCOL_VERSION, &s) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_CREATE_CHANNEL && c->body) {
+                uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_create_channel cc = { oc_slice_str(c->body), 1 };   /* public */
+                if (oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cc) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_JOIN_CHANNEL || c->type == OC_CMD_LEAVE_CHANNEL) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_channel_ref cr = { c->channel_id };
+                oc_result rr = (c->type == OC_CMD_JOIN_CHANNEL)
+                    ? oc_encode_join_channel(&w, OC_PROTOCOL_VERSION, &cr)
+                    : oc_encode_leave_channel(&w, OC_PROTOCOL_VERSION, &cr);
+                if (rr == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_CHANNELS) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_channels(&w, OC_PROTOCOL_VERSION) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             oc_cmd_free(c);

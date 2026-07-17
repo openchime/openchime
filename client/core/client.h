@@ -63,6 +63,14 @@ void oc_client_close_thread(oc_client *c);
 void oc_client_search(oc_client *c, const char *query);
 void oc_client_close_search(oc_client *c);
 
+/* Channel management: create a public channel, join / leave one. The server
+ * answers with a CHANNEL_INFO that folds into the channel list. */
+void oc_client_create_channel(oc_client *c, const char *name);
+void oc_client_join_channel(oc_client *c, uint64_t channel_id);
+void oc_client_leave_channel(oc_client *c, uint64_t channel_id);
+/* Refresh the channel list (to discover channels created since login). */
+void oc_client_list_channels(oc_client *c);
+
 /* Stop the network thread, drain remaining events, and free everything. */
 void oc_client_stop(oc_client *c);
 

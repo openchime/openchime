@@ -119,6 +119,14 @@ static int reaction_count(const oc_model *m, uint64_t cid, uint64_t mid, const c
     return -1;
 }
 
+/* The id of a channel with the given name, or 0. */
+static uint64_t channel_named(const oc_model *m, const char *name) {
+    for (size_t i = 0; i < m->n_channels; i++)
+        if (m->channels[i].name && strcmp(m->channels[i].name, name) == 0)
+            return m->channels[i].channel_id;
+    return 0;
+}
+
 /* Find a message by id; return NULL if absent. */
 static const oc_msg *find_msg(const oc_model *m, uint64_t cid, uint64_t mid) {
     for (size_t i = 0; i < m->n_channels; i++) {
@@ -247,6 +255,16 @@ int run_client_core_tests(void) {
         }
         oc_client_close_search(a);
         CHECK(!oc_client_model(a)->search_open && oc_client_model(a)->n_search == 0);
+
+        /* dana creates a public channel — it shows up joined in her list — and
+         * erik joins it by id, seeing it joined too. */
+        oc_client_create_channel(a, "war-room");
+        CHECK(WAIT_FOR(a, channel_named(m, "war-room") != 0));
+        uint64_t warroom = channel_named(oc_client_model(a), "war-room");
+        CHECK(warroom != 0);
+        oc_client_join_channel(b, warroom);
+        CHECK(WAIT_FOR(b, oc_model_channel((oc_model *)m, warroom) &&
+                          oc_model_channel((oc_model *)m, warroom)->joined));
 
         /* Marking channel 1 read clears erik's unread. */
         oc_client_mark_read(b, 1);
