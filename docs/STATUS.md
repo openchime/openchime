@@ -71,7 +71,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 094 RPO 15s (Litestream) | ✅ | Replication to object storage + restore-on-boot (compose). |
 | 100 auto-reconnect w/o re-auth | ✅ | Daemon accepts `session`-token reconnect; **the client net thread auto-reconnects** — captures the AUTH_OK token, silently re-auths with `OC_AUTH_SESSION` (no password) under backoff on a drop, preserving the in-memory model. **Now also across process restarts:** a client SQLite store (`client/core/store.c`) persists the session token + TOFU pin per instance, so a relaunch reconnects silently against the pinned cert. Headless-tested (daemon bounce; wrong-password client rides the stored token). |
 | 101 backfill on reconnect | ✅ | Per-channel cursors → replayed messages + `BACKFILL_DONE` (+ `THREAD_META`). **The client drives it on reconnect**, backfilling each channel from its last-seen id (net-thread high-water); replays dedup on the model mark. **Now cursor-backed by the store:** cached messages seed the high-water at startup, so even a first backfill after relaunch resumes from the last cached id, not 0. |
-| 102 offline outbox | 🔵 ⛔ | The client SQLite store now persists the session token + TOFU pin **and cached history** (`client/core/store.c`); the outbox table + resend-on-reconnect flush is the one remaining piece of the store project. |
+| 102 offline outbox | 🔵 ✅ | **Built.** The client store's `outbox` table records each send (with its idem token) before delivery; the net thread resends the outbox on reconnect and clears a row on its `SEND_ACK`, so a message composed offline (or in flight at a drop, or queued at app-close) goes out on the next connection, deduped by the daemon. Headless-tested + PTY-smoked (compose with the daemon down; a later run flushes it). |
 | 110 reject unsupported version pre-parse | ✅ | |
 | 111 VERSION_TOO_OLD/NEW reason codes | ✅ | |
 
@@ -181,8 +181,14 @@ TUI does live messaging with history backfill, display names, unread, reactions,
 edit/delete, typing, threads, search, channel/DM management, presence + roster,
 who-reacted, notification prefs + DND, admin (roles/invite/remove), webhook
 management, attachments (`/upload`/`/download`), and logout — **every engine
-feature on the wire is now reachable from the TUI**, so the remaining client work
-is the later native GUIs. The remaining server-side gap is **mobile
+feature on the wire is now reachable from the TUI**. The app-core also has a
+**local SQLite store** (`client/core/store.c`) that makes it durable across
+restarts: silent session-token reconnect (auto after a drop, and after a
+relaunch), a persisted TOFU pin, cached history that shows instantly + seeds the
+backfill cursor, and an **offline outbox** that resends messages composed while
+disconnected — i.e. the reconnect/offline requirements (REQ-100/101/102) are now
+met client-side. The remaining client work is the later native GUIs and the
+fuller auth UX (OIDC, DNS resolution). The remaining server-side gap is **mobile
 push transport** (REQ-132/133). **Server-relayed audio** (REQ-150–152) is now
 built end-to-end — call signaling + a forked UDP relay sidecar — with only the
 client-side Opus/UDP left (Phase-2 client work). Presence/typing (REQ-120/121) is

@@ -206,7 +206,7 @@ static int file_matches(const char *path, const unsigned char *data, size_t len)
 }
 
 int run_client_core_tests(void) {
-    printf("test_client_core: connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, persisted store, cached history, session reconnect\n");
+    printf("test_client_core: connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, persisted store, cached history, session reconnect, offline outbox\n");
 
     /* The daemon opens its blob store at netloop startup; point it at a build-local
      * dir (the /data/blobs default isn't writable in the test sandbox), matching
@@ -577,6 +577,39 @@ int run_client_core_tests(void) {
             CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
             wait_port_ready(arg.port);
             unlink(hp); unlink("build/itest_core_hist.db-wal"); unlink("build/itest_core_hist.db-shm");
+        }
+
+        /* offline outbox (REQ-102): a message composed while the daemon is down is
+         * persisted to the store and resent on reconnect. o1 authenticates, then
+         * — with the daemon torn down — composes a message and is closed; the send
+         * lands in the store's outbox. A fresh o2 against the same store reconnects
+         * and flushes it, so the message finally round-trips. */
+        {
+            const char *op = "build/itest_core_outbox.db";
+            unlink(op); unlink("build/itest_core_outbox.db-wal"); unlink("build/itest_core_outbox.db-shm");
+            oc_client *o1 = oc_client_start_stored("127.0.0.1", arg.port, "faye:pw-faye", op);
+            CHECK(o1 != NULL);
+            if (o1) {
+                CHECK(WAIT_FOR(o1, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+                /* Take the daemon down, wait for the client to notice, then compose. */
+                arg.stop = 1;
+                pthread_join(th, NULL);
+                CHECK(WAIT_FOR(o1, !m->connected));
+                oc_client_send(o1, 1, "queued while offline");
+                oc_client_stop(o1);   /* the send is flushed to the outbox on close */
+            }
+            /* Bring the daemon back and relaunch: the outbox flush delivers it. */
+            arg.stop = 0;
+            CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
+            wait_port_ready(arg.port);
+            oc_client *o2 = oc_client_start_stored("127.0.0.1", arg.port, "faye:pw-faye", op);
+            CHECK(o2 != NULL);
+            if (o2) {
+                CHECK(WAIT_FOR(o2, m->authed));
+                CHECK(WAIT_FOR(o2, channel_has_body(m, 1, "queued while offline")));
+                oc_client_stop(o2);
+            }
+            unlink(op); unlink("build/itest_core_outbox.db-wal"); unlink("build/itest_core_outbox.db-shm");
         }
     } else {
         if (a) oc_client_stop(a);

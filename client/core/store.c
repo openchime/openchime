@@ -35,6 +35,15 @@ static const oc_migration CLIENT_MIGRATIONS[] = {
       "  deleted      INTEGER NOT NULL DEFAULT 0,"
       "  PRIMARY KEY (instance, message_id)"
       ");" },
+    { 3,
+      "CREATE TABLE outbox ("
+      "  instance     TEXT NOT NULL,"
+      "  idem         BLOB NOT NULL,"
+      "  channel_id   INTEGER NOT NULL,"
+      "  body         TEXT,"
+      "  created      INTEGER,"
+      "  PRIMARY KEY (instance, idem)"
+      ");" },
 };
 static const int CLIENT_MIGRATIONS_COUNT =
     (int)(sizeof CLIENT_MIGRATIONS / sizeof CLIENT_MIGRATIONS[0]);
@@ -222,6 +231,53 @@ void oc_store_each_message(oc_store *s, const char *instance,
            body,
            sqlite3_column_int(st, 6),
            sqlite3_column_int(st, 7));
+    }
+    sqlite3_finalize(st);
+}
+
+void oc_store_outbox_add(oc_store *s, const char *instance,
+                         const uint8_t idem[OC_IDEM_SIZE], uint64_t channel_id,
+                         const char *body) {
+    if (!s || !s->db || !instance) return;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "INSERT INTO outbox (instance, idem, channel_id, body, created) "
+            "VALUES (?1, ?2, ?3, ?4, strftime('%s','now')) "
+            "ON CONFLICT(instance, idem) DO NOTHING;",
+            -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(st, 1, instance, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(st, 2, idem, OC_IDEM_SIZE, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 3, (int64_t)channel_id);
+    sqlite3_bind_text(st, 4, body ? body : "", -1, SQLITE_TRANSIENT);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+void oc_store_outbox_remove(oc_store *s, const char *instance,
+                            const uint8_t idem[OC_IDEM_SIZE]) {
+    if (!s || !s->db || !instance) return;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "DELETE FROM outbox WHERE instance=?1 AND idem=?2;", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(st, 1, instance, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(st, 2, idem, OC_IDEM_SIZE, SQLITE_TRANSIENT);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+void oc_store_outbox_each(oc_store *s, const char *instance,
+                          oc_store_outbox_cb cb, void *ctx) {
+    if (!s || !s->db || !instance || !cb) return;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT idem, channel_id, body FROM outbox WHERE instance=?1 ORDER BY created ASC, rowid ASC;",
+            -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(st, 1, instance, -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (sqlite3_column_bytes(st, 0) != OC_IDEM_SIZE) continue;
+        cb(ctx, (const uint8_t *)sqlite3_column_blob(st, 0),
+           (uint64_t)sqlite3_column_int64(st, 1),
+           (const char *)sqlite3_column_text(st, 2));
     }
     sqlite3_finalize(st);
 }

@@ -185,13 +185,22 @@ far:**
   "unread"). Reactions/attachments on cached messages aren't cached yet — they
   re-appear only for messages the backfill re-sends.
 
+- `outbox` — the **offline outbox** (REQ-102). Every send is recorded here (with
+  its idempotency token) before it goes out, removed on the `SEND_ACK`, and
+  resent on reconnect — so a message composed while disconnected (or in flight
+  when the connection dropped, or still queued when the app closed) survives, and
+  the daemon's idempotency dedups any partial delivery. Proven end-to-end: a
+  headless test and a PTY smoke both compose a message with the daemon down, and
+  a later run flushes it.
+
 The store is owned by the net thread (one connection, one thread); an unusable
 path just disables persistence (in-memory only). The TUI puts it at
 `$OPENCHIME_STATE` or `$HOME/.local/state/openchime/state.db`.
 
-**Still to add:** the **offline outbox** (messages composed offline, resent on
-reconnect with their idempotency tokens — the concrete answer to REQ-102).
-Keychains for the token are noted future hardening.
+With the outbox, **the store + reconnect/offline work (REQ-100/101/102) is
+complete.** Keychains for the token are noted future hardening; optimistic local
+echo of an offline-composed message (showing it before the reconnect delivers it)
+is a later UI refinement.
 
 ## 6. Auth + reconnect/offline
 
@@ -213,7 +222,12 @@ pre-loads a still-valid stored token and pins the stored fingerprint, so the
 prompt. A rejected token (expired/revoked) is dropped and, if a password is
 still held, retried once with it; `/logout` clears the stored token.
 
-**Still to build:** the offline outbox (REQ-102) and the fuller auth
+**The offline outbox (REQ-102) is built** (see §5): the net thread records each
+send in the store before delivery, resends the outbox on reconnect, and clears a
+row on its `SEND_ACK` — so an offline-composed send goes out on the next
+connection, deduped by the daemon.
+
+**Still to build:** the fuller auth
 UX (ARCH-19) — a **local** username+password form; **OIDC** via the system
 browser to central's authorize URL with a loopback `127.0.0.1` redirect catching
 the ES256 JWT (`ASWebAuthenticationSession` on iOS/macOS); and instance+email →

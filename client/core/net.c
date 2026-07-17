@@ -106,6 +106,20 @@ static int write_all(oc_tls_conn *c, int fd, const uint8_t *buf, size_t len, vol
     return 0;
 }
 
+/* Encode + write one SEND with a caller-chosen idempotency token (so a resend
+ * from the outbox reuses it and the daemon dedups). */
+static void send_message(oc_tls_conn *c, int fd, volatile int *stop,
+                         uint64_t channel_id, const uint8_t idem[OC_IDEM_SIZE],
+                         const char *body) {
+    uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send s; memset(&s, 0, sizeof s);   /* n_attach = 0: a plain text message */
+    s.channel_id = channel_id ? channel_id : 1;
+    memcpy(s.idem, idem, OC_IDEM_SIZE);
+    s.body = oc_slice_str(body ? body : "");
+    if (oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK)
+        (void)write_all(c, fd, buf, w.len, stop);
+}
+
 /* Block until one full frame is read (used only during handshake/auth). */
 static int read_one(oc_tls_conn *c, int fd, oc_framebuf *fb, oc_header *hdr,
                     oc_rbuf *payload, volatile int *stop) {
@@ -567,6 +581,13 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (oc_decode_webhook_deleted(&p, &wd) != OC_OK) return -1;
             oc_ev *e = oc_ev_new(OC_EV_WEBHOOK_DELETED);
             if (e) { e->message_id = wd.webhook_id; oc_queue_push(to_ui, e); }
+        } else if (hdr.msg_type == OC_MSG_SEND_ACK) {
+            /* The server has durably accepted a send: clear it from the outbox so
+             * it isn't resent (REQ-102). The matching BROADCAST already folded it
+             * into the model. */
+            oc_send_ack ack;
+            if (oc_decode_send_ack(&p, &ack) == OC_OK && ctx && ctx->store)
+                oc_store_outbox_remove(ctx->store, ctx->instance, ack.idem);
         } else if (hdr.msg_type == OC_MSG_ERROR) {
             oc_error err;
             if (oc_decode_error(&p, &err) == OC_OK) {
@@ -594,6 +615,15 @@ enum { RC_STOP = 0, RC_LOST = 1, RC_FATAL = 2 };
  * (graceful quit/logout), RC_LOST (dropped — a session reconnect may follow), or
  * RC_FATAL (version/auth reject — do not retry). `*served` is set once the serve
  * loop is entered, so the caller can shorten the backoff after a live session. */
+/* Resend every pending outbox message (REQ-102), reusing each stored idem so the
+ * daemon dedups anything already delivered. Runs once per successful auth. */
+struct flush_ctx { oc_tls_conn *conn; int fd; volatile int *stop; };
+static void flush_outbox_cb(void *v, const uint8_t idem[OC_IDEM_SIZE],
+                            uint64_t channel_id, const char *body) {
+    struct flush_ctx *f = (struct flush_ctx *)v;
+    send_message(f->conn, f->fd, f->stop, channel_id, idem, body);
+}
+
 static int run_connection(oc_net *n, int reconnecting,
                           uint8_t sess[OC_SESSION_TOKEN_LEN], int *have_sess,
                           oc_hwtab *hw, int *served, conn_store *cs) {
@@ -716,6 +746,13 @@ static int run_connection(oc_net *n, int reconnecting,
                 free(curs);
             }
         }
+
+        /* Flush the offline outbox (REQ-102): resend anything composed while
+         * disconnected (this run or a prior one), reusing each stored idem. */
+        if (cs && cs->store) {
+            struct flush_ctx fc = { &conn, fd, &n->stop };
+            oc_store_outbox_each(cs->store, cs->instance, flush_outbox_cb, &fc);
+        }
     }
 
     /* Serve: interleave reading server frames with sending queued user actions.
@@ -739,13 +776,12 @@ static int run_connection(oc_net *n, int reconnecting,
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SEND && c->body) {
-                uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                oc_send s;
-                s.channel_id = c->channel_id ? c->channel_id : 1;
-                gen_idem(s.idem);
-                s.body = oc_slice_str(c->body);
-                if (oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK)
-                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+                /* Record in the outbox before sending (REQ-102): a drop before the
+                 * SEND_ACK leaves it there to be resent, deduped by the idem. */
+                uint8_t idem[OC_IDEM_SIZE]; gen_idem(idem);
+                uint64_t cid = c->channel_id ? c->channel_id : 1;
+                if (ctx.store) oc_store_outbox_add(ctx.store, ctx.instance, idem, cid, c->body);
+                send_message(&conn, fd, &n->stop, cid, idem, c->body);
             }
             if (c->type == OC_CMD_REACT && c->body) {
                 uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
@@ -1080,6 +1116,20 @@ static void *net_thread(void *arg) {
             nanosleep(&ts, NULL);
         }
         reconnecting = 1;
+    }
+
+    /* Closing while offline: persist any sends still queued (composed but never
+     * connected to deliver) so they go out on the next run (REQ-102). */
+    if (cs.store) {
+        oc_cmd *c;
+        while ((c = oc_queue_try_pop(n->from_ui)) != NULL) {
+            if (c->type == OC_CMD_SEND && c->body) {
+                uint8_t idem[OC_IDEM_SIZE]; gen_idem(idem);
+                oc_store_outbox_add(cs.store, instance, idem,
+                                    c->channel_id ? c->channel_id : 1, c->body);
+            }
+            oc_cmd_free(c);
+        }
     }
 
     oc_store_close(cs.store);

@@ -64,4 +64,19 @@ typedef void (*oc_store_msg_cb)(void *ctx, uint64_t channel_id, uint64_t message
 void oc_store_each_message(oc_store *s, const char *instance,
                            oc_store_msg_cb cb, void *ctx);
 
+/* Offline outbox (REQ-102). A message is added here (with its idempotency token)
+ * before it is sent, removed when the server acks it, and re-sent from here on
+ * reconnect — so a send survives a drop or an app restart, and the daemon's
+ * idempotency dedups any partial delivery. Keyed by (instance, idem). */
+void oc_store_outbox_add(oc_store *s, const char *instance,
+                         const uint8_t idem[OC_IDEM_SIZE], uint64_t channel_id,
+                         const char *body);
+void oc_store_outbox_remove(oc_store *s, const char *instance,
+                            const uint8_t idem[OC_IDEM_SIZE]);
+/* Replay pending outbox messages in insertion order (oldest first). */
+typedef void (*oc_store_outbox_cb)(void *ctx, const uint8_t idem[OC_IDEM_SIZE],
+                                   uint64_t channel_id, const char *body);
+void oc_store_outbox_each(oc_store *s, const char *instance,
+                          oc_store_outbox_cb cb, void *ctx);
+
 #endif /* OC_STORE_H */
