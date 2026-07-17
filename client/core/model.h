@@ -42,6 +42,7 @@ typedef struct {
     uint8_t  history_requested; /* a backfill has been asked for (once per open) */
     uint8_t  kind;             /* OC_CHANNEL_KIND / _DM */
     uint64_t peer_id;          /* DM: the other participant (for the title) */
+    uint8_t  notify_level;     /* OC_NOTIFY_ALL/_MENTIONS/_NONE (REQ-130) */
 } oc_channel;
 
 typedef struct { uint64_t user_id; uint8_t status; } oc_presence_row;
@@ -91,6 +92,12 @@ typedef struct {
     uint8_t   roster_open;
     oc_member *users;
     size_t    n_users, cap_users;
+    /* Notification preferences (REQ-130/131): the DND window (minutes since
+     * midnight, local) + whether the prefs overlay is open. Per-channel levels
+     * live on each oc_channel.notify_level. A NOTIFY_PREFS frame is a full sync. */
+    uint8_t   prefs_open;
+    uint8_t   dnd_enabled;
+    uint16_t  dnd_start_min, dnd_end_min;
     char     status[160];             /* last status / error line */
 } oc_model;
 
@@ -118,6 +125,9 @@ void oc_model_close_search(oc_model *m);
  * / close the overlay. */
 void oc_model_reactlist_begin(oc_model *m, uint64_t message_id);
 void oc_model_close_reactlist(oc_model *m);
+
+/* Open/close the notification-prefs overlay (frontend view state). */
+void oc_model_set_prefs_open(oc_model *m, int open);
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);
 /* Record a presence value (used for our own presence, which the server does not

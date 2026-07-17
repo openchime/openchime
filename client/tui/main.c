@@ -15,7 +15,9 @@
  *       /search <query> · /close (leave a thread/search/roster/reactions
  *       overlay) · /create <name> · /join <name> · /leave ·
  *       /who (member roster + presence) · /away · /online · /dm <name> (open a
- *       direct message) · /logout (revoke this session and quit).
+ *       direct message) · /prefs (notification settings) · /notify
+ *       all|mentions|none (this channel's level) · /dnd HH:MM HH:MM | off
+ *       (do-not-disturb window) · /logout (revoke this session and quit).
  */
 
 #define TB_IMPL
@@ -285,6 +287,49 @@ static void build_reactlist_rows(rows_t *r, const oc_model *m, int width) {
     }
 }
 
+/* Human label for a per-channel notification level. */
+static const char *notify_label(uint8_t level) {
+    return level == OC_NOTIFY_NONE     ? "none"
+         : level == OC_NOTIFY_MENTIONS ? "mentions" : "all";
+}
+
+/* Build the rows for the notification-prefs overlay: the DND window, then each
+ * channel with a non-default level (default = all, elided to keep it short). */
+static void build_prefs_rows(rows_t *r, const oc_model *m, int width) {
+    (void)width;
+    char line[160];
+    if (m->dnd_enabled)
+        snprintf(line, sizeof line, "do-not-disturb: %02u:%02u\xe2\x80\x93%02u:%02u",
+                 m->dnd_start_min / 60, m->dnd_start_min % 60,
+                 m->dnd_end_min / 60, m->dnd_end_min % 60);
+    else
+        snprintf(line, sizeof line, "do-not-disturb: off");
+    char *h = malloc(strlen(line) + 1);
+    if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
+
+    int any = 0;
+    for (size_t i = 0; i < m->n_channels; i++) {
+        const oc_channel *c = &m->channels[i];
+        if (c->notify_level == OC_NOTIFY_ALL) continue;   /* default — elide */
+        any = 1;
+        const char *nm = c->name ? c->name : "…";
+        if (c->kind == OC_CHANNEL_KIND_DM) {
+            const char *pn = oc_model_user_name(m, c->peer_id);
+            snprintf(line, sizeof line, "@%s  %s", pn[0] ? pn : "dm", notify_label(c->notify_level));
+        } else {
+            snprintf(line, sizeof line, "#%s  %s", nm, notify_label(c->notify_level));
+        }
+        uintattr_t col = c->notify_level == OC_NOTIFY_NONE ? TB_BLACK | TB_BOLD : TB_DEFAULT;
+        char *rw = malloc(strlen(line) + 1);
+        if (rw) { strcpy(rw, line); rows_push(r, rw, col); }
+    }
+    if (!any) {
+        const char *msg = "all channels: all";
+        char *rw = malloc(strlen(msg) + 1);
+        if (rw) { strcpy(rw, msg); rows_push(r, rw, TB_DEFAULT); }
+    }
+}
+
 static void render(oc_client *cl, size_t focus, const char *composer,
                    size_t clen, int scroll) {
     (void)clen;
@@ -330,6 +375,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     if (m->roster_open)          snprintf(title, sizeof title, " members (/close to exit)");
     else if (m->search_open)     snprintf(title, sizeof title, " search (/close to exit)");
     else if (m->reactlist_open)  snprintf(title, sizeof title, " reactions (/close to exit)");
+    else if (m->prefs_open)      snprintf(title, sizeof title, " notifications (/close to exit)");
     else if (m->thread_open) snprintf(title, sizeof title, " thread · #%s (/close to exit)",
                                       fc && fc->name ? fc->name : "…");
     else if (fc)             snprintf(title, sizeof title, " #%s", fc->name ? fc->name : "…");
@@ -339,11 +385,12 @@ static void render(oc_client *cl, size_t focus, const char *composer,
 
     /* Message rows for the focused channel, or an open overlay (thread / search /
      * roster), showing the window ending `scroll` rows above the bottom. */
-    if (fc || m->thread_open || m->search_open || m->roster_open || m->reactlist_open) {
+    if (fc || m->thread_open || m->search_open || m->roster_open || m->reactlist_open || m->prefs_open) {
         rows_t rows = {0};
         if (m->roster_open)         build_roster_rows(&rows, m, pxmax - px0);
         else if (m->search_open)    build_search_rows(&rows, m, pxmax - px0);
         else if (m->reactlist_open) build_reactlist_rows(&rows, m, pxmax - px0);
+        else if (m->prefs_open)     build_prefs_rows(&rows, m, pxmax - px0);
         else if (m->thread_open)    build_thread_rows(&rows, m, fc, m->user_id, pxmax - px0);
         else                        build_rows(&rows, fc, m->user_id, pxmax - px0);
         int total = (int)rows.n;
@@ -417,6 +464,14 @@ static const oc_msg *my_last_message(const oc_channel *ch, uint64_t me) {
     return NULL;
 }
 
+/* Parse "HH:MM" into minutes-since-midnight, or -1 if malformed. */
+static int parse_hhmm(const char *s) {
+    int h = 0, mi = 0;
+    if (sscanf(s, "%d:%d", &h, &mi) != 2) return -1;
+    if (h < 0 || h > 23 || mi < 0 || mi > 59) return -1;
+    return h * 60 + mi;
+}
+
 /* Handle a "/command" typed in the composer:
  *   /react <emoji>  toggle a reaction on the last message in the channel
  *   /edit  <text>   replace the text of your last message
@@ -427,6 +482,30 @@ static void handle_command(oc_client *cl, uint64_t cid, const char *line) {
     if (strcmp(line, "/close") == 0) {
         oc_client_close_thread(cl); oc_client_close_search(cl);
         oc_client_close_reactions(cl); oc_client_toggle_roster(cl, 0);
+        oc_client_toggle_prefs(cl, 0);
+        return;
+    }
+    if (strcmp(line, "/prefs") == 0) { oc_client_toggle_prefs(cl, 1); return; }
+    if (strncmp(line, "/notify ", 8) == 0) {   /* set the focused channel's level */
+        const char *lv = line + 8;
+        while (*lv == ' ') lv++;
+        uint8_t level;
+        if      (strcmp(lv, "all") == 0)      level = OC_NOTIFY_ALL;
+        else if (strcmp(lv, "mentions") == 0) level = OC_NOTIFY_MENTIONS;
+        else if (strcmp(lv, "none") == 0)     level = OC_NOTIFY_NONE;
+        else return;
+        oc_client_set_notify_pref(cl, cid, level);
+        return;
+    }
+    if (strncmp(line, "/dnd", 4) == 0) {       /* /dnd off | /dnd HH:MM HH:MM */
+        const char *a = line + 4;
+        while (*a == ' ') a++;
+        if (strcmp(a, "off") == 0 || *a == '\0') { oc_client_set_dnd(cl, 0, 0, 0); return; }
+        char s1[16] = {0}, s2[16] = {0};
+        if (sscanf(a, "%15s %15s", s1, s2) != 2) return;
+        int start = parse_hhmm(s1), end = parse_hhmm(s2);
+        if (start < 0 || end < 0) return;
+        oc_client_set_dnd(cl, 1, (uint16_t)start, (uint16_t)end);
         return;
     }
     if (strcmp(line, "/who") == 0)    { oc_client_toggle_roster(cl, 1); return; }
@@ -557,7 +636,7 @@ int main(int argc, char **argv) {
                 uint64_t cid = mm->channels[focus].channel_id;
                 if (strcmp(composer, "/logout") == 0)         { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
                 else if (composer[0] == '/')                  handle_command(cl, cid, composer);
-                else if (mm->search_open || mm->roster_open || mm->reactlist_open) { /* read-only overlay: ignore */ }
+                else if (mm->search_open || mm->roster_open || mm->reactlist_open || mm->prefs_open) { /* read-only overlay: ignore */ }
                 else if (mm->thread_open)                     oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
                 else                                          oc_client_send(cl, cid, composer);
                 clen = 0; composer[0] = '\0'; scroll = 0;

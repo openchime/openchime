@@ -263,6 +263,24 @@ int run_client_core_tests(void) {
         oc_client_close_reactions(a);
         CHECK(!oc_client_model(a)->reactlist_open && oc_client_model(a)->n_reactors == 0);
 
+        /* notification prefs (REQ-130/131): dana mutes channel 1 to mentions-only
+         * and sets a DND window; each SET returns a fresh NOTIFY_PREFS sync that
+         * folds into the channel's notify_level + the model DND fields. */
+        oc_client_set_notify_pref(a, 1, OC_NOTIFY_MENTIONS);
+        CHECK(WAIT_FOR(a, oc_model_channel((oc_model *)m, 1) &&
+                          oc_model_channel((oc_model *)m, 1)->notify_level == OC_NOTIFY_MENTIONS));
+        oc_client_set_dnd(a, 1, 1320, 420);        /* 22:00 -> 07:00 */
+        CHECK(WAIT_FOR(a, m->dnd_enabled && m->dnd_start_min == 1320 && m->dnd_end_min == 420));
+        /* Opening the prefs overlay re-syncs and the channel level survives. */
+        oc_client_toggle_prefs(a, 1);
+        CHECK(WAIT_FOR(a, m->prefs_open &&
+                          oc_model_channel((oc_model *)m, 1)->notify_level == OC_NOTIFY_MENTIONS));
+        /* Clearing DND turns it off. */
+        oc_client_set_dnd(a, 0, 0, 0);
+        CHECK(WAIT_FOR(a, !m->dnd_enabled));
+        oc_client_toggle_prefs(a, 0);
+        CHECK(!oc_client_model(a)->prefs_open);
+
         /* erik replies to dana's message in a thread: both see the parent's reply
          * count rise, and opening the thread streams the reply into the buffer. */
         oc_client_reply(b, 1, mid, "a threaded reply");

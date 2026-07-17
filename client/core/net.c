@@ -278,6 +278,25 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                 memcpy(e->emoji, re[i].emoji.ptr, n); e->emoji[n] = '\0';
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_NOTIFY_PREFS) {
+            enum { NPREF_CAP = 256 };
+            oc_notify_pref_entry ne[NPREF_CAP]; uint16_t count = 0; oc_set_dnd dnd = {0,0,0};
+            if (oc_decode_notify_prefs(&p, ne, NPREF_CAP, &count, &dnd) != OC_OK) return -1;
+            if (count > NPREF_CAP) count = NPREF_CAP;
+            /* Header first (the sync boundary), then one event per channel. */
+            oc_ev *h = oc_ev_new(OC_EV_DND);
+            if (h) {
+                h->status = dnd.enabled;
+                h->count = ((uint32_t)dnd.start_min << 16) | dnd.end_min;
+                oc_queue_push(to_ui, h);
+            }
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_NOTIFY_PREF);
+                if (!e) continue;
+                e->channel_id = ne[i].channel_id;
+                e->op = ne[i].level;
+                oc_queue_push(to_ui, e);
+            }
         } else if (hdr.msg_type == OC_MSG_ERROR) {
             oc_error err;
             if (oc_decode_error(&p, &err) == OC_OK) {
@@ -474,6 +493,24 @@ static void *net_thread(void *arg) {
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_list_reactions lr = { c->channel_id, c->message_id };
                 if (oc_encode_list_reactions(&w, OC_PROTOCOL_VERSION, &lr) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_NOTIFY_PREF) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_notify_pref sp = { c->channel_id, c->op };   /* op = level */
+                if (oc_encode_set_notify_pref(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_DND) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                /* op = enabled; channel_id = start_min, message_id = end_min. */
+                oc_set_dnd sd = { c->op, (uint16_t)c->channel_id, (uint16_t)c->message_id };
+                if (oc_encode_set_dnd(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_NOTIFY_PREFS) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_notify_prefs(&w, OC_PROTOCOL_VERSION) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_OPEN_DM) {

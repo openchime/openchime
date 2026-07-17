@@ -131,6 +131,10 @@ void oc_model_reactlist_begin(oc_model *m, uint64_t message_id) {
     m->reactlist_message = message_id;
 }
 
+void oc_model_set_prefs_open(oc_model *m, int open) {
+    m->prefs_open = open ? 1 : 0;
+}
+
 void oc_model_close_thread(oc_model *m) {
     for (size_t i = 0; i < m->n_thread_msgs; i++) msg_free(&m->thread_msgs[i]);
     free(m->thread_msgs);
@@ -422,6 +426,21 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         if (m->reactlist_open && e->message_id == m->reactlist_message)
             reactor_append(m, e->user_id, e->emoji);
         break;
+    case OC_EV_DND:
+        /* A NOTIFY_PREFS frame's header: it always precedes the per-channel
+         * entries, so treat it as the sync boundary and reset every channel to
+         * the default level; the following OC_EV_NOTIFY_PREF events set the
+         * non-default ones. Works for both solicited and pushed syncs. */
+        for (size_t i = 0; i < m->n_channels; i++) m->channels[i].notify_level = OC_NOTIFY_ALL;
+        m->dnd_enabled   = e->status;
+        m->dnd_start_min = (uint16_t)(e->count >> 16);
+        m->dnd_end_min   = (uint16_t)(e->count & 0xFFFF);
+        break;
+    case OC_EV_NOTIFY_PREF: {
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (c) c->notify_level = e->op;
+        break;
+    }
     case OC_EV_USER:
         user_upsert(m, e->user_id, e->body ? e->body : "", e->status, e->op);
         break;

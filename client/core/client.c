@@ -223,6 +223,37 @@ void oc_client_close_reactions(oc_client *c) {
     oc_model_close_reactlist(&c->model);
 }
 
+void oc_client_set_notify_pref(oc_client *c, uint64_t channel_id, uint8_t level) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_NOTIFY_PREF);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->op = level;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_dnd(oc_client *c, uint8_t enabled, uint16_t start_min, uint16_t end_min) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_DND);
+    if (!cmd) return;
+    cmd->op = enabled;
+    cmd->channel_id = start_min;   /* reused: DND window start (minutes) */
+    cmd->message_id = end_min;     /* reused: DND window end (minutes) */
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_notify_prefs(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_NOTIFY_PREFS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_toggle_prefs(oc_client *c, int open) {
+    if (!c) return;
+    oc_model_set_prefs_open(&c->model, open);
+    if (open) oc_client_list_notify_prefs(c);   /* refresh on open */
+}
+
 void oc_client_logout(oc_client *c, uint8_t scope) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_LOGOUT);

@@ -86,6 +86,16 @@ void oc_client_open_dm(oc_client *c, uint64_t user_id);
 void oc_client_list_reactions(oc_client *c, uint64_t channel_id, uint64_t message_id);
 void oc_client_close_reactions(oc_client *c);
 
+/* Notification preferences (REQ-130/131). Set a channel's level
+ * (OC_NOTIFY_ALL/_MENTIONS/_NONE) or the do-not-disturb window (minutes since
+ * local midnight; enabled=0 clears it) — the server answers with a NOTIFY_PREFS
+ * sync that folds into the channels + the model DND fields. Toggle the prefs
+ * overlay (frontend view state; opening refreshes the sync). */
+void oc_client_set_notify_pref(oc_client *c, uint64_t channel_id, uint8_t level);
+void oc_client_set_dnd(oc_client *c, uint8_t enabled, uint16_t start_min, uint16_t end_min);
+void oc_client_list_notify_prefs(oc_client *c);
+void oc_client_toggle_prefs(oc_client *c, int open);
+
 /* Log out: revoke this session (scope OC_LOGOUT_THIS) or all of the user's
  * (OC_LOGOUT_ALL); the server closes the connection. */
 void oc_client_logout(oc_client *c, uint8_t scope);
