@@ -43,6 +43,9 @@ CORE_INC := -Iclient/core
 # as committed MIT single-file source. Builds on the host like the daemon.
 TUI_SRC   := $(wildcard client/tui/*.c)
 UTF8PROC  := third_party/utf8proc/utf8proc.c
+# The core's local store (client/core/store.c) reuses the daemon's migration
+# runner and SQLite, so the frontend links migrate.c + libsqlite3.
+STORE_DEPS := daemon/migrate.c
 TUI_INC   := $(CORE_INC) -Iclient/tui -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
@@ -96,7 +99,7 @@ tui: $(TUI_BIN)
 $(TUI_BIN): $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) \
             $(wildcard client/tui/*.h client/core/*.h shared/*.h) $(MBEDTLS_A) | build
 	$(CC) $(CFLAGS) -Wno-unused-result $(INC) $(TUI_INC) \
-	    $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(MBEDTLS_LIBS) -lpthread -o $@
+	    $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(UTF8PROC) $(MBEDTLS_LIBS) -lsqlite3 -lpthread -o $@
 
 build:
 	mkdir -p build

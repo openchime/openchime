@@ -16,10 +16,11 @@
 typedef struct oc_net oc_net;
 
 /* Start the network thread. `token` carries local credentials as
- * "username:password" (the real login UI, OIDC, and session reconnect land in a
- * later client phase). Returns NULL on failure to spawn. */
+ * "username:password". `store_path` (or NULL for in-memory only) is a local
+ * SQLite store persisting the session token + TOFU pin, so a relaunch reconnects
+ * silently. Returns NULL on failure to spawn. */
 oc_net *oc_net_start(const char *host, int port, const char *token,
-                     oc_queue *to_ui, oc_queue *from_ui);
+                     const char *store_path, oc_queue *to_ui, oc_queue *from_ui);
 
 /* Signal the thread to stop, join it, and free. */
 void oc_net_stop(oc_net *n);

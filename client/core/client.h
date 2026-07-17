@@ -21,6 +21,13 @@ typedef struct oc_client oc_client;
  * thread could not be spawned. */
 oc_client *oc_client_start(const char *host, int port, const char *cred);
 
+/* As oc_client_start, plus a local SQLite store at `store_path` (NULL = none)
+ * that persists the session token + TOFU pin, so a relaunch reconnects silently
+ * with the token instead of the password (REQ-100, ARCH-58). The parent
+ * directory must exist; an unusable path just disables persistence. */
+oc_client *oc_client_start_stored(const char *host, int port, const char *cred,
+                                  const char *store_path);
+
 /* Drain all queued net events into the model. Call once per frame/tick. */
 void oc_client_tick(oc_client *c);
 

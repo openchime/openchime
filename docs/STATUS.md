@@ -69,9 +69,9 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 092 in-channel order = accept order | ✅ | Ascending, tenant-monotonic `message_id`. |
 | 093 idempotent retry | ✅ | Persisted `(channel, token) → id`. |
 | 094 RPO 15s (Litestream) | ✅ | Replication to object storage + restore-on-boot (compose). |
-| 100 auto-reconnect w/o re-auth | ✅ | Daemon accepts `session`-token reconnect; **the client net thread now auto-reconnects** — captures the AUTH_OK token, silently re-auths with `OC_AUTH_SESSION` (no password) under backoff on a drop, preserving the in-memory model. Headless-tested by bouncing the daemon. Cross-restart (persisted token) waits on the store. |
+| 100 auto-reconnect w/o re-auth | ✅ | Daemon accepts `session`-token reconnect; **the client net thread auto-reconnects** — captures the AUTH_OK token, silently re-auths with `OC_AUTH_SESSION` (no password) under backoff on a drop, preserving the in-memory model. **Now also across process restarts:** a client SQLite store (`client/core/store.c`) persists the session token + TOFU pin per instance, so a relaunch reconnects silently against the pinned cert. Headless-tested (daemon bounce; wrong-password client rides the stored token). |
 | 101 backfill on reconnect | ✅ | Per-channel cursors → replayed messages + `BACKFILL_DONE` (+ `THREAD_META`). **The client drives it on reconnect**, backfilling each channel from its last-seen id (net-thread high-water); replays dedup on the model mark. |
-| 102 offline outbox | 🔵 ⛔ | Client SQLite store not built. |
+| 102 offline outbox | 🔵 ⛔ | The client SQLite store now exists (`client/core/store.c`, session token + TOFU pin); the outbox table + resend-on-reconnect flush is the remaining piece. |
 | 110 reject unsupported version pre-parse | ✅ | |
 | 111 VERSION_TOO_OLD/NEW reason codes | ✅ | |
 
@@ -99,7 +99,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 180 encrypted transport, no plaintext fallback | ✅ | TLS-only. |
 | 181 daemon-controlled session + expiry | ✅ | `sessions` table, daemon-set TTL. |
 | 182 session revocation / logout | ✅ | `LOGOUT` deletes rows + drops the connection. |
-| 183 TOFU self-signed pinning | ✅ | Client-daemon TLS is TOFU-pinned; the webhook CA-cert exception (REQ-171) is not yet built, so the webhook endpoint currently reuses the TOFU cert. |
+| 183 TOFU self-signed pinning | ✅ | Client-daemon TLS is TOFU-pinned, and **the client now persists the pin** (`instance_state.tls_pin` in the client store): first connect trusts + records the cert SHA-256, every later connect/restart enforces it. The webhook CA-cert exception (REQ-171) is not yet built, so the webhook endpoint currently reuses the TOFU cert. |
 | 190 per-connection send rate limit | ✅ | Per-connection fixed window (30 sends / 3s) on `SEND`/`SEND_REPLY`; excess → non-fatal `SEND_RATE_LIMITED`. |
 | 191 failed-auth rate limit (account + source) | ✅ | Fixed-window, checked before PBKDF2. |
 

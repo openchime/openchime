@@ -19,12 +19,17 @@ struct oc_client {
 };
 
 oc_client *oc_client_start(const char *host, int port, const char *cred) {
+    return oc_client_start_stored(host, port, cred, NULL);
+}
+
+oc_client *oc_client_start_stored(const char *host, int port, const char *cred,
+                                  const char *store_path) {
     oc_client *c = calloc(1, sizeof *c);
     if (!c) return NULL;
     oc_queue_init(&c->events);
     oc_queue_init(&c->cmds);
     oc_model_init(&c->model);
-    c->net = oc_net_start(host, port, cred, &c->events, &c->cmds);
+    c->net = oc_net_start(host, port, cred, store_path, &c->events, &c->cmds);
     if (!c->net) {
         oc_queue_destroy(&c->events);
         oc_queue_destroy(&c->cmds);

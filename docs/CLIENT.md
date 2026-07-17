@@ -167,14 +167,23 @@ PROTOCOL.md §3–§6 and the §10 state machine. **TOFU pinning (ARCH-10):** Ph
 trusts the presented cert (`pin=NULL`); persisting + pinning the fingerprint
 arrives with the store phase.
 
-## 5. Local store (later)
+## 5. Local store
 
-The core bundles SQLite and reuses the daemon's migration-runner pattern with its
-own client migration set: cached history per channel + the high-water/backfill
-cursors (ARCH-45/46), the **offline outbox** (messages composed offline, resent
-on reconnect with their idempotency tokens — the concrete answer to REQ-102), the
-session token (ARCH-58), per-instance TOFU pins, and config. Platform config dir;
-keychains are noted future hardening. The core is in-memory until this lands.
+The core bundles SQLite (`client/core/store.c`) and reuses the daemon's
+migration-runner (`oc_migrate`) with its own client migration set. **Built so
+far:** an `instance_state` row per server (`"host:port"`) holding the **session
+token + expiry** (ARCH-58) and the **per-instance TOFU pin** (ARCH-10), so a
+relaunched client reconnects silently with the token — no password — against the
+pinned cert. The store is owned by the net thread (one connection, one thread);
+an unusable path just disables persistence (in-memory only). The TUI puts it at
+`$OPENCHIME_STATE` or `$HOME/.local/state/openchime/state.db`; a headless test
+authenticates, then a second client with a *wrong* password rides in on the
+stored token.
+
+**Still to add:** cached history per channel + the high-water/backfill cursors
+(ARCH-45/46), and the **offline outbox** (messages composed offline, resent on
+reconnect with their idempotency tokens — the concrete answer to REQ-102).
+Keychains for the token are noted future hardening.
 
 ## 6. Auth + reconnect/offline
 
@@ -190,8 +199,13 @@ session) ends the loop instead of retrying. The net thread tracks its own
 per-channel high-water for the reconnect cursors; a headless test bounces the
 daemon and asserts the client re-auths, keeps its history, and can send again.
 
-**Still to build:** persisting the session token + TOFU pin across process
-restarts (needs the §5 store), the offline outbox (REQ-102), and the fuller auth
+**Cross-restart reconnect is built too (via the §5 store).** The net thread
+pre-loads a still-valid stored token and pins the stored fingerprint, so the
+*first* connect after a relaunch already uses `OC_AUTH_SESSION` — no password
+prompt. A rejected token (expired/revoked) is dropped and, if a password is
+still held, retried once with it; `/logout` clears the stored token.
+
+**Still to build:** the offline outbox (REQ-102) and the fuller auth
 UX (ARCH-19) — a **local** username+password form; **OIDC** via the system
 browser to central's authorize URL with a loopback `127.0.0.1` redirect catching
 the ES256 JWT (`ASWebAuthenticationSession` on iOS/macOS); and instance+email →

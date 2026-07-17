@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #define SIDEBAR_W 22
@@ -703,6 +704,24 @@ static void handle_command(oc_client *cl, uint64_t cid, const char *line) {
     }
 }
 
+/* Resolve the local store path (session token + TOFU pin persistence): the
+ * explicit $OPENCHIME_STATE if set, else $HOME/.local/state/openchime/state.db
+ * (creating the dirs). Returns NULL when there is nowhere to put it (persistence
+ * then disabled — the client still runs, just in-memory). */
+static const char *resolve_store_path(void) {
+    const char *explicit = getenv("OPENCHIME_STATE");
+    if (explicit && explicit[0]) return explicit;
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return NULL;
+    static char path[1200];
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s/.local", home);            mkdir(dir, 0700);
+    snprintf(dir, sizeof dir, "%s/.local/state", home);      mkdir(dir, 0700);
+    snprintf(dir, sizeof dir, "%s/.local/state/openchime", home); mkdir(dir, 0700);
+    snprintf(path, sizeof path, "%s/state.db", dir);
+    return path;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: %s <host> <port> [user:pass]\n", argv[0]);
@@ -718,7 +737,7 @@ int main(int argc, char **argv) {
     const char *cred = argc > 3 ? argv[3] : getenv("OPENCHIME_CRED");
     if (!cred) cred = "";
 
-    oc_client *cl = oc_client_start(host, port, cred);
+    oc_client *cl = oc_client_start_stored(host, port, cred, resolve_store_path());
     if (!cl) { fprintf(stderr, "failed to start client\n"); return 1; }
 
     if (tb_init() != TB_OK) {

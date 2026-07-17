@@ -8,6 +8,7 @@
 
 #include "client.h"     /* the core facade under test */
 #include "model.h"
+#include "store.h"       /* to assert the persisted token/pin */
 
 #include "netloop.h"
 #include "dbwriter.h"
@@ -205,7 +206,7 @@ static int file_matches(const char *path, const unsigned char *data, size_t len)
 }
 
 int run_client_core_tests(void) {
-    printf("test_client_core: connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, session reconnect\n");
+    printf("test_client_core: connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, persisted store, session reconnect\n");
 
     /* The daemon opens its blob store at netloop startup; point it at a build-local
      * dir (the /data/blobs default isn't writable in the test sandbox), matching
@@ -480,6 +481,41 @@ int run_client_core_tests(void) {
 
         oc_client_stop(a);
         oc_client_stop(b);
+
+        /* local store (ARCH-58): the session token + TOFU pin persist to a client
+         * SQLite file. A client authenticates with a password, its token lands in
+         * the store, and a second client pointed at the same store — given a
+         * *wrong* password — still authenticates, because it rides in on the
+         * stored session token (OC_AUTH_SESSION), never using the password. */
+        {
+            const char *sp = "build/itest_core_store.db";
+            unlink(sp); unlink("build/itest_core_store.db-wal"); unlink("build/itest_core_store.db-shm");
+            char inst[64]; snprintf(inst, sizeof inst, "127.0.0.1:%d", arg.port);
+
+            oc_client *s1 = oc_client_start_stored("127.0.0.1", arg.port, "faye:pw-faye", sp);
+            CHECK(s1 != NULL);
+            if (s1) {
+                CHECK(WAIT_FOR(s1, m->authed && m->user_id != 0));
+                oc_client_stop(s1);   /* QUIT (not logout): the session stays live */
+            }
+            /* The token + pin were persisted for this instance. */
+            oc_store *chk = oc_store_open(sp);
+            CHECK(chk != NULL);
+            if (chk) {
+                uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN];
+                CHECK(oc_store_load_session(chk, inst, tok, NULL, 0) == 1);
+                CHECK(oc_store_load_pin(chk, inst, pin) == 1);
+                oc_store_close(chk);
+            }
+            /* Wrong password, but the stored token authenticates it anyway. */
+            oc_client *s2 = oc_client_start_stored("127.0.0.1", arg.port, "faye:WRONG-pw", sp);
+            CHECK(s2 != NULL);
+            if (s2) {
+                CHECK(WAIT_FOR(s2, m->authed && m->user_id != 0));
+                oc_client_stop(s2);
+            }
+            unlink(sp); unlink("build/itest_core_store.db-wal"); unlink("build/itest_core_store.db-shm");
+        }
 
         /* auto-reconnect with the session token (REQ-100/101). A fresh client
          * authenticates (capturing a session token), sends a message, then the

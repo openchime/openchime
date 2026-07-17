@@ -4,6 +4,7 @@
 
 #include "net.h"
 #include "event.h"
+#include "store.h"
 
 #include "protocol.h"
 #include "tls.h"
@@ -22,9 +23,20 @@ struct oc_net {
     char          host[256];
     int           port;
     char         *token;
+    char         *store_path;   /* local store for token/pin persistence, or NULL */
     oc_queue     *to_ui;
     oc_queue     *from_ui;
 };
+
+/* The store-backed connection context (session token + TOFU pin persistence),
+ * threaded through run_connection so the net thread persists across restarts. */
+typedef struct {
+    oc_store   *store;                          /* NULL = no persistence */
+    const char *instance;                       /* "host:port" key */
+    uint8_t     pin[OC_TLS_FINGERPRINT_LEN];
+    int         have_pin;                       /* pin loaded/captured this run */
+    int         logged_out;                     /* set on /logout: drop the stored token */
+} conn_store;
 
 /* ---- helpers ---- */
 
@@ -559,7 +571,7 @@ enum { RC_STOP = 0, RC_LOST = 1, RC_FATAL = 2 };
  * loop is entered, so the caller can shorten the backoff after a live session. */
 static int run_connection(oc_net *n, int reconnecting,
                           uint8_t sess[OC_SESSION_TOKEN_LEN], int *have_sess,
-                          oc_hwtab *hw, int *served) {
+                          oc_hwtab *hw, int *served, conn_store *cs) {
     int rc = RC_LOST;
     *served = 0;
 
@@ -569,11 +581,12 @@ static int run_connection(oc_net *n, int reconnecting,
     oc_tls_client cli;
     oc_tls_conn conn;
     oc_framebuf fb;
-    /* Phase 1 TOFU: trust the presented cert (pin=NULL); persisting/pinning the
-     * fingerprint arrives with the client store phase. Multiple oc_clients in one
-     * process (the headless test) set up TLS concurrently; that is safe because
-     * the vendored mbedTLS is built with MBEDTLS_THREADING (scripts/build_mbedtls.sh). */
-    if (oc_tls_client_init(&cli, NULL) != 0 || oc_tls_conn_init(&conn, &cli.conf, fd) != 0) {
+    /* TOFU (ARCH-10): pin the stored fingerprint if we have one; otherwise trust
+     * the presented cert this once and capture its fingerprint below. Multiple
+     * oc_clients in one process (the headless test) set up TLS concurrently; safe
+     * because the vendored mbedTLS is built with MBEDTLS_THREADING. */
+    if (oc_tls_client_init(&cli, cs && cs->have_pin ? cs->pin : NULL) != 0 ||
+        oc_tls_conn_init(&conn, &cli.conf, fd) != 0) {
         oc_closesock(fd); return RC_LOST;
     }
     oc_framebuf_init(&fb);
@@ -581,6 +594,13 @@ static int run_connection(oc_net *n, int reconnecting,
     oc_xfer xfer; memset(&xfer, 0, sizeof xfer);
 
     if (do_handshake(&conn, fd, &n->stop) != 0) goto drop;
+
+    /* First contact with this instance: remember the cert fingerprint so every
+     * later connection pins it (TOFU first-use, ARCH-10). */
+    if (cs && !cs->have_pin && oc_tls_peer_fingerprint(&conn, cs->pin) == 0) {
+        cs->have_pin = 1;
+        if (cs->store) oc_store_save_pin(cs->store, cs->instance, cs->pin);
+    }
 
     /* HELLO -> WELCOME */
     {
@@ -639,6 +659,8 @@ static int run_connection(oc_net *n, int reconnecting,
         if (ok.session_token.len == OC_SESSION_TOKEN_LEN) {   /* fresh token (first auth) */
             memcpy(sess, ok.session_token.ptr, OC_SESSION_TOKEN_LEN);
             *have_sess = 1;
+            if (cs && cs->store)   /* persist it so a relaunch reconnects silently */
+                oc_store_save_session(cs->store, cs->instance, sess, ok.session_expiry);
         }
         push_simple(n->to_ui, OC_EV_CONNECTED, ok.user_id);
         push_simple(n->to_ui, OC_EV_AUTH_OK, ok.user_id);
@@ -901,7 +923,9 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_logout(&w, OC_PROTOCOL_VERSION, &lo) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
                 /* The daemon revokes + closes; treat it as a graceful stop (and
-                 * do not session-reconnect — the session is now dead). */
+                 * do not session-reconnect — the session is now dead, so drop the
+                 * stored token too). */
+                if (cs) cs->logged_out = 1;
                 oc_cmd_free(c);
                 rc = RC_STOP;
                 goto drop;
@@ -940,11 +964,40 @@ static void *net_thread(void *arg) {
     uint8_t sess[OC_SESSION_TOKEN_LEN];
     int have_sess = 0, reconnecting = 0, backoff_ms = 0;
 
+    /* Local store (ARCH-58): pre-load the pin + a still-valid session token for
+     * this instance, so the first connect can pin the cert and auth silently with
+     * the token instead of the password. */
+    conn_store cs; memset(&cs, 0, sizeof cs);
+    char instance[288];
+    snprintf(instance, sizeof instance, "%s:%d", n->host, n->port);
+    cs.instance = instance;
+    cs.store = n->store_path ? oc_store_open(n->store_path) : NULL;
+    if (cs.store) {
+        cs.have_pin = oc_store_load_pin(cs.store, instance, cs.pin);
+        uint64_t now_ms = (uint64_t)time(NULL) * 1000;
+        if (oc_store_load_session(cs.store, instance, sess, NULL, now_ms)) {
+            have_sess = 1;
+            reconnecting = 1;   /* use OC_AUTH_SESSION on the very first connect */
+        }
+    }
+
     while (!n->stop) {
         int served = 0;
-        int rc = run_connection(n, reconnecting, sess, &have_sess, &hw, &served);
+        int rc = run_connection(n, reconnecting, sess, &have_sess, &hw, &served, &cs);
         push_simple(n->to_ui, OC_EV_DISCONNECTED, 0);   /* this connection ended */
-        if (rc == RC_STOP || rc == RC_FATAL || n->stop || !have_sess) break;
+        if (cs.store && cs.logged_out) oc_store_clear_session(cs.store, instance);
+        if (rc == RC_STOP || n->stop) break;
+        if (rc == RC_FATAL) {
+            /* A session token (stored or reconnect) was rejected — drop it. If we
+             * still hold a password, fall back to it once; otherwise give up. */
+            if (reconnecting && cs.store) oc_store_clear_session(cs.store, instance);
+            if (reconnecting && n->token && n->token[0]) {
+                have_sess = 0; reconnecting = 0; backoff_ms = 0;
+                continue;   /* retry immediately with the password */
+            }
+            break;
+        }
+        if (!have_sess) break;   /* never authenticated: nothing to reconnect with */
         /* Connection lost mid-session: back off, then reconnect with the token.
          * A connection that actually served resets the backoff so the first
          * retry is prompt; repeated connect/auth failures grow it. */
@@ -957,6 +1010,7 @@ static void *net_thread(void *arg) {
         reconnecting = 1;
     }
 
+    oc_store_close(cs.store);
     hwtab_free(&hw);
     return NULL;
 }
@@ -964,16 +1018,17 @@ static void *net_thread(void *arg) {
 /* ---- lifecycle ---- */
 
 oc_net *oc_net_start(const char *host, int port, const char *token,
-                     oc_queue *to_ui, oc_queue *from_ui) {
+                     const char *store_path, oc_queue *to_ui, oc_queue *from_ui) {
     oc_net *n = calloc(1, sizeof *n);
     if (!n) return NULL;
     snprintf(n->host, sizeof n->host, "%s", host ? host : "127.0.0.1");
     n->port = port;
     n->token = token ? strdup(token) : NULL;
+    n->store_path = (store_path && store_path[0]) ? strdup(store_path) : NULL;
     n->to_ui = to_ui;
     n->from_ui = from_ui;
     if (pthread_create(&n->thread, NULL, net_thread, n) != 0) {
-        free(n->token); free(n); return NULL;
+        free(n->token); free(n->store_path); free(n); return NULL;
     }
     return n;
 }
@@ -984,5 +1039,6 @@ void oc_net_stop(oc_net *n) {
     oc_queue_push(n->from_ui, oc_cmd_new(OC_CMD_QUIT)); /* wake it promptly */
     pthread_join(n->thread, NULL);
     free(n->token);
+    free(n->store_path);
     free(n);
 }
