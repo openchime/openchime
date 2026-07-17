@@ -29,7 +29,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 
 | REQ | Status | Notes |
 |-----|--------|-------|
-| 010 instance+email+DNS resolution | 🔵 ⛔ | Client-side; skeleton client connects to a raw host:port, no SRV/`.well-known`. |
+| 010 instance+email+DNS resolution | 🔵 ⛔ | Client-side; the TUI connects to a raw host:port, no SRV/`.well-known` yet. |
 | 011 distinct resolution-failure error | 🔵 ⛔ | Client-side. |
 | 020 two-mode auth, mode advertised | ✅ / 🔵 | Daemon: local + OIDC verify, `AUTH_CHALLENGE` advertises the mode. OIDC *browser flow + PKCE* is client-side (⛔). |
 | 021 Entra/Google providers | ➖ | Lives in the central relay service (out of this repo); the daemon only verifies the re-issued token. |
@@ -65,7 +65,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | REQ | Status | Notes |
 |-----|--------|-------|
 | 090 at-least-once + ack msg type | ✅ | Fan-out to connected members; `CLIENT_ACK` advances a per-(user,channel) delivery cursor (migration 0007); backfill recovers misses. |
-| 091 client dedup on high-water | 🔵 ✅ | Implemented in the skeleton client. |
+| 091 client dedup on high-water | 🔵 ✅ | Implemented in the app-core view-model (per-channel high-water mark). |
 | 092 in-channel order = accept order | ✅ | Ascending, tenant-monotonic `message_id`. |
 | 093 idempotent retry | ✅ | Persisted `(channel, token) → id`. |
 | 094 RPO 15s (Litestream) | ✅ | Replication to object storage + restore-on-boot (compose). |
@@ -107,7 +107,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 
 | REQ | Status | Notes |
 |-----|--------|-------|
-| 200 Linux/Win/macOS/iOS/Android clients | 🟡 | Client pivoted to **one shared C app-core + native UI per platform** (ARCH-74, tdlib model — supersedes the raylib/Windows-cross-compile plan). The app-core (`client/core/`: net thread, queues, view-model + reducers, `oc_client` facade) is **built and headless-tested** (`tests/test_client_core.c` drives it against an in-process daemon; `make core` compile-check, linked into `make test`). First frontend is a **notcurses TUI** (ARCH-75, in progress); native Win32/AppKit/Android/DOM frontends pending. Daemon is Linux-only (epoll/eventfd). |
+| 200 Linux/Win/macOS/iOS/Android clients | 🟡 | Client pivoted to **one shared C app-core + native UI per platform** (ARCH-74, tdlib model — supersedes the raylib/Windows-cross-compile plan). The app-core (`client/core/`: net thread, queues, view-model + reducers, `oc_client` facade) is **built and headless-tested** (`tests/test_client_core.c` drives it against an in-process daemon; `make core` compile-check, linked into `make test`). First frontend is a **termbox2 + utf8proc TUI** (ARCH-75, `make tui`) with: connect + local auth, channel sidebar + unread, live messages + history backfill, display names, per-nick colors, scrollback, send, **reactions** (`/react`), **edit/delete** (`/edit`, `/delete`), and **typing indicators**. Remaining TUI work is surfacing existing engine features (threads, search, channel/DM management, presence display, roster, attachments, notify prefs, admin, webhooks, logout); native Win32/AppKit/Android/DOM frontends pending. Daemon is Linux-only (epoll/eventfd). |
 | 210 lean/standard memory profile | ✅ | **Measured** (`Scripts/bench.sh`): ~5 MB baseline + **~50 KB RSS per idle connection**, so a few hundred connections sit in ~15–30 MB and low-thousands stay within the 256 MB lean profile. Message round-trip p50 ~4 ms, p99 ~20–40 ms under concurrency. |
 | 211 low-hundreds concurrent connections | ✅ | **Measured**: hundreds of concurrent pinned-TLS connections held in a small fraction of the lean profile. Connection *setup* is bounded by the 600k-iteration PBKDF2 auth on the single writer (~6–7 logins/s), so a burst of simultaneous logins queues there; steady-state is cheap. `OC_NETLOOP_MAX_FD=4096`. |
 
@@ -174,12 +174,15 @@ daemon-owned sessions and revocation, roles + full tenant administration,
 public/private channels, messaging with edit/delete, reactions, threads, and
 full-text search — all reachable over the wire and tested end-to-end.
 
-The **largest missing surface** is a usable **client frontend**. The client was
-re-architected to a shared, frontend-agnostic **C app-core** (ARCH-74) — network
+The **client** is a shared, frontend-agnostic **C app-core** (ARCH-74) — network
 thread, view-model, and reducers, driven headlessly against the in-process daemon
-in CI — which is now **built**; what remains is the first real frontend over it,
-a **notcurses TUI** (ARCH-75, in progress), and the later native GUIs. The
-remaining server-side gap is **mobile push transport** (REQ-132/133). **Server-relayed audio** (REQ-150–152) is now
+in CI — with a **termbox2 + utf8proc TUI** (ARCH-75) as the first frontend. The
+TUI already does live messaging with history backfill, display names, unread,
+reactions, edit/delete, and typing; the remaining TUI work is **surfacing engine
+features that already exist over the wire** (threads, search, channel/DM
+management, presence display, roster, attachments, notification prefs, admin,
+webhooks) plus the later native GUIs. The remaining server-side gap is **mobile
+push transport** (REQ-132/133). **Server-relayed audio** (REQ-150–152) is now
 built end-to-end — call signaling + a forked UDP relay sidecar — with only the
 client-side Opus/UDP left (Phase-2 client work). Presence/typing (REQ-120/121) is
 built and tested end-to-end, as are **notification settings** (REQ-130/131:

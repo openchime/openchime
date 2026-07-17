@@ -40,27 +40,36 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   is one connection on its own thread, so no epoll): `dial` → `oc_tls_handshake`
   → `HELLO`/`WELCOME` → `AUTH_CHALLENGE` → `AUTH` → `AUTH_OK`, then a serve loop
   that interleaves sending queued intents with reading + dispatching server
-  frames. Lifted from the Phase-1 skeleton (which lifted it from
-  `tests/e2e_client.c`).
+  frames. Lifted from `tests/e2e_client.c`. **One caveat:** the vendored mbedTLS
+  is built without `MBEDTLS_THREADING`, so TLS context setup + handshake is
+  serialized behind a process-wide mutex — harmless for the one-client-per-process
+  product, but it lets a multi-client harness (the headless test) connect several
+  cores safely.
 - **`queue.c` — two thread-safe queues** (mutex+condvar FIFO, the daemon's
-  net↔dbwriter shape): **intents in** (send, later: switch/join-call) and
-  **events out** (connected, auth-ok, message, presence, channel, disconnected,
-  error).
+  net↔dbwriter shape): **intents in** (send, backfill, react, edit, delete,
+  typing) and **events out** (connected, auth-ok, message, channel, presence,
+  reaction, edit, delete, typing, disconnected, error).
 - **`event.h` — the core's wire-agnostic vocabulary:** the `oc_ev` (net→UI) and
   `oc_cmd` (UI→net) types crossing the queues.
 - **`model.c` — the view-model + reducers.** `oc_model` holds the connection
   state, the channel/DM list, a per-channel message buffer (with the ARCH-45
-  high-water dedup mark), roster/presence, and unread counts. `oc_model_apply`
-  folds one `oc_ev` into that state. A frontend owns an `oc_model`, drains events
-  each tick, applies them, and renders — the "read events at frame start" shape,
-  fed by the net thread. Single-threaded on the frontend, so no locking.
+  high-water dedup mark) carrying per-message reaction aggregates and
+  edited/deleted flags, roster/presence, an ephemeral (expiring) typing table,
+  and per-channel unread + read-marker counts. `oc_model_apply` folds one `oc_ev`
+  into that state. A frontend owns an `oc_model`, drains events each tick, applies
+  them, and renders — the "read events at frame start" shape, fed by the net
+  thread. Single-threaded on the frontend, so no locking.
 - **`client.c` — the facade.** `oc_client_start(host, port, cred)` /
   `oc_client_tick()` (drain + apply) / `oc_client_model()` / `oc_client_send()` /
+  `oc_client_backfill()` / `oc_client_mark_read()` / `oc_client_react()` /
+  `oc_client_edit()` / `oc_client_delete()` / `oc_client_typing()` /
   `oc_client_stop()`. A frontend uses only this.
 
-**Headless-testable.** A test starts the daemon's netloop in-process (like the
-itest), drives an `oc_client` against it, sends a message, and asserts the
-view-model updated — so the core is fully CI-covered with no UI.
+**Headless-testable.** `tests/test_client_core.c` starts the daemon's netloop
+in-process (like the itest) and drives real `oc_client`s against it — connect +
+auth, channel-list populate, send round-trip, unread + mark-read, history
+backfill, display names, reaction aggregates, edit/delete, and typing — so the
+whole reducer set is CI-covered with no UI.
 
 ## 3. Frontends
 
@@ -68,7 +77,8 @@ Each frontend is thin: create a client, loop { `oc_client_tick`; render the
 model; translate input to intents }, stop.
 
 - **TUI (`client/tui/`, first):** a terminal cell grid — a channel sidebar (with
-  presence), a scrolling wrapped message pane, and an input line — built on
+  unread counts; presence dots planned), a scrolling wrapped message pane, and an
+  input line — built on
   **termbox2** (the cell grid + input) and **utf8proc** (Unicode width +
   grapheme breaking), both **MIT**, both vendored as committed single-file source
   (ARCH-75). The one property that matters to a chat client is **correct
@@ -93,12 +103,15 @@ model; translate input to intents }, stop.
   search) drawn cell-by-cell, re-laid-out on the resize event; the message pane
   renders its visible window each frame, measuring glyph width with utf8proc.
   **Build order:** the lean core loop landed first (sidebar, focus/switch, history
-  backfill on open, live messages + display names, send, presence dots, unread,
-  scrollback, reflow, per-nick colors), then **reactions display** (emoji
-  aggregates under each message with a `[n]` "you reacted" marker, `/react
-  <emoji>` toggling on the last message) — which exercises the exact
-  wide-char/emoji correctness that justified the toolkit. Threads, edit/delete UX,
-  typing, and attachment download follow.
+  backfill on open, live messages + display names, send, unread, scrollback,
+  reflow, per-nick colors), then **reactions display** (emoji aggregates with a
+  `[n]` "you reacted" marker, `/react <emoji>` toggling on the last message —
+  exercising the exact wide-char/emoji correctness that justified the toolkit),
+  **edit/delete** (`/edit`, `/delete`, an `(edited)` marker + `[message deleted]`
+  tombstone), and **typing indicators** (throttled `TYPING` while composing,
+  `✎ X is typing…` on the status line). The remaining engine features are
+  client-only surfacing work: threads, search, channel/DM management, presence
+  display, member roster, and attachment transfer.
 - **Windows (later):** Win32/WinUI (C++/WinRT or C#) over the C core.
 - **macOS/iOS (later):** AppKit/UIKit (Swift) over the core.
 - **Android (later):** Android views (Kotlin) over the core.
@@ -147,10 +160,13 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
 ## 8. Roadmap
 
 - **Now:** app-core + termbox2 TUI shipped — the lean core loop (sidebar,
-  backfill on open, send, display names, presence, unread, scrollback) and
-  **reactions display** (`/react`) and **edit/delete** (`/edit`, `/delete` with
-  an `(edited)` marker and `[message deleted]` tombstone) are done. Next TUI
-  increments: typing indicators, search, threads.
+  backfill on open, send, display names, unread, scrollback) plus **reactions**
+  (`/react`), **edit/delete** (`/edit`, `/delete`, `(edited)` marker + `[message
+  deleted]` tombstone), and **typing indicators** (`✎ X is typing…`) are done.
+  Remaining TUI increments surface engine features already on the wire: threads,
+  search, channel/DM management, presence display + set-away, member roster,
+  attachment transfer, who-reacted, notification prefs/DND, admin, webhook
+  management, logout.
 - **Next:** store + reconnect/offline; auth completeness (local + OIDC);
   attachments (chunked up/download) and the **audio client** (Opus encode/decode
   + UDP to the sidecar — the deferred half of REQ-150/151).

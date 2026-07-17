@@ -5,11 +5,14 @@ descriptive, present-perfect tense ("the system has supported X") as a
 target-state contract — the form the finished system is required to take. It is
 **not** a record of what is built; for that, see
 [STATUS.md](./STATUS.md), which reconciles each `REQ-NNN` below against the
-current tree (the daemon's messaging/auth/roles/channels/reactions/threads/search
-core is implemented; presence, notifications, attachments, audio, webhooks, and a
-full client are not). This present-perfect style mirrors the reproduction-grade
-style of OpenChime's sibling projects; here it functions as a forward
-specification, with STATUS.md tracking progress against it.
+current tree. As of this writing the daemon's messaging/auth/roles/channels/
+reactions/threads/search/presence/typing/notification-settings/attachments/
+webhooks core is implemented, along with a shared C client app-core and a
+termbox2 TUI (ARCH-74/75); mobile push (REQ-132/133), the client-side audio codec
+(REQ-150–152), the full multi-platform client, and all of Sections 11–14 are
+forward scope. This present-perfect style mirrors the reproduction-grade style of
+OpenChime's sibling projects; here it functions as a forward specification, with
+STATUS.md tracking progress against it.
 
 This document is technical scope only. Business model, pricing, licensing,
 and go-to-market decisions are out of scope; they are not tracked in any
@@ -50,6 +53,10 @@ the requirement says so explicitly rather than implying one.
 8. [Security Posture](#8-security-posture)
 9. [Client and Platform Support](#9-client-and-platform-support)
 10. [Infrastructure and Resource Constraints](#10-infrastructure-and-resource-constraints)
+11. [Rich Text and Message Composition](#11-rich-text-and-message-composition)
+12. [Message Organization and Retrieval](#12-message-organization-and-retrieval)
+13. [User Profiles](#13-user-profiles)
+14. [Compliance and Data Governance](#14-compliance-and-data-governance)
 
 ---
 
@@ -129,6 +136,17 @@ the requirement says so explicitly rather than implying one.
   member from the tenant. Channel-level invite/remove for private channels
   has been available to any existing member of that channel, not gated to
   admins. Both gates have been enforced in the DB-writer handlers (ARCH-60).
+- **REQ-034.** Each channel has carried an optional human-set **topic/
+  description** — a short line shown in the channel header — set by a channel
+  member (or restricted to admins per a deployment setting). It is metadata on
+  the channel, distinct from the channel name. **[needs ARCH decision — who may
+  set a topic + storage column.]**
+- **REQ-035.** A channel has been **archivable** by an owner or admin: an
+  archived channel has become read-only and hidden from the default channel list
+  while its history remained searchable and retrievable (REQ-031/080), and it has
+  been restorable. Archiving (reversible) is distinct from deletion, which is not
+  offered for channels holding history. **[needs ARCH decision — archive flag +
+  read-only enforcement.]**
 
 ### 1.4 Multi-Tenant Data Isolation
 
@@ -181,6 +199,12 @@ the requirement says so explicitly rather than implying one.
   second open returned the existing self-DM), members-only, and reached through
   the ordinary messaging path; the daemon has not treated a self-target as an
   error (PROTOCOL.md §5.12, ARCH-50).
+- **REQ-056.** A **group direct message** among three or more users has been
+  supported as a first-class conversation distinct from a named channel — a
+  participant-defined, unnamed DM any participant could post to but not rename or
+  govern membership on. It has ridden the same message model as a 1:1 or self-DM
+  (REQ-050/055), extended to N participants. **[needs ARCH decision — group-DM
+  identity/membership model vs. reusing a private channel.]**
 
 ### 2.2 Threads
 
@@ -202,12 +226,24 @@ the requirement says so explicitly rather than implying one.
 - **REQ-071.** A message has displayed an aggregate count per distinct
   emoji reacted with, and the identities of the reacting users have been
   available on inspection (hover/tap).
+- **REQ-072.** A tenant has been able to register **custom emoji** (a named
+  image usable in reactions and message text) beyond the built-in Unicode set,
+  under admin control of who may add them. A reaction (REQ-070) references an
+  emoji by a stable shortcode that resolves to either a Unicode sequence or a
+  tenant custom-emoji asset; a text-only client (the TUI) shows the shortcode
+  rather than the image. **[needs ARCH decision — custom-emoji asset storage
+  (object store, ARCH-17) + shortcode namespace.]**
 
 ### 2.4 Search
 
 - **REQ-080.** Full-text search has covered the complete message history
   visible to the searching user (i.e., channels they are a member of, per
   REQ-031), with no retention cutoff, implemented via SQLite FTS5 (ARCH-15).
+- **REQ-081.** Search has accepted **structured operators** that scope a query —
+  at minimum `from:<user>`, `in:<channel>`, `has:<attachment|link>`, and a date
+  range (`before:`/`after:`/`on:`) — combined with free-text terms, all still
+  bounded to history the searcher may read (REQ-031). **[needs ARCH decision —
+  operator grammar + mapping onto the FTS5 query.]**
 
 ---
 
@@ -236,6 +272,14 @@ the requirement says so explicitly rather than implying one.
   writes are shipped to remote object storage (ARCH-23). Messages
   acknowledged to a client less than 15 seconds before a total box loss have
   been at risk of not being recoverable.
+- **REQ-095.** The system has optionally surfaced **read state** — for a direct
+  message, whether the other participant has seen a message; for a channel, an
+  aggregate "seen by" on inspection — derived from the per-(user, channel)
+  delivery cursor the daemon already maintains (REQ-090, `CLIENT_ACK`). Read
+  receipts have been a privacy-governed setting, off where a deployment or user
+  disables them, and have never applied retroactively to messages sent before the
+  feature was enabled. **[needs ARCH decision — receipt scope (DM vs. channel),
+  privacy controls, and whether channel-level "seen by" is offered at all.]**
 
 ### 3.2 Reconnect and Offline Behavior
 
@@ -389,6 +433,29 @@ the requirement says so explicitly rather than implying one.
   or DNS reachability to complete a challenge (ARCH-10's rationale), which is a
   deployment concern separate from the daemon's request handling. The SNI-based
   cert selection at the TLS layer (ARCH-34) is the wiring that lands with it.
+- **REQ-172.** A tenant has been able to install **app integrations** that post
+  and respond in channels under a **bot identity** distinct from human users,
+  including **slash-command apps** invoked as `/command` from the composer and
+  dispatched to a registered integration endpoint. Install has been role-gated to
+  owner/admin. **[needs ARCH decision — bot identity model, slash-command
+  registration + dispatch, install authorization.]**
+- **REQ-173.** The system has supported **outgoing webhooks / event
+  subscriptions**: a tenant-registered endpoint has received notifications of
+  selected events (new message in a channel, mention, membership change) so
+  external systems could react to activity — the outbound complement to the
+  incoming webhooks of REQ-170. Delivery has been at-least-once with retry and a
+  signed payload so the receiver could verify origin. **[needs ARCH decision —
+  event catalog, delivery/retry, payload signing.]**
+- **REQ-174.** The system has offered **workflow automation** — declarative
+  triggers (a message match, a schedule, a form submission) driving actions (post
+  a message, call a webhook) — so common routines could run without an external
+  app. This may reduce to a first-party consumer of the app platform (REQ-172).
+  **[needs ARCH decision — workflow model + execution surface.]**
+- **REQ-175.** Installable integrations have been discoverable through an **app
+  directory** curated by the maintaining project, from which an owner/admin could
+  install an app into their tenant. Directory hosting is a central-service concern
+  (cf. ARCH-56), not the daemon's. **[needs ARCH decision — directory hosting +
+  per-tenant install/permission model.]**
 
 ---
 
@@ -455,3 +522,122 @@ the requirement says so explicitly rather than implying one.
   concurrent client connections per tenant within the lean memory profile
   (ARCH-30), sufficient for the 50-100 target customer scale referenced
   elsewhere in this project.
+
+---
+
+## 11. Rich Text and Message Composition
+
+*Content-level messaging features layered on the core message model (Section 2).
+None are yet backed by an architecture decision.*
+
+- **REQ-220.** A message body has supported **inline rich-text formatting** —
+  bold, italic, strikethrough, inline `code`, fenced code blocks, blockquotes,
+  and ordered/unordered lists — authored in a markdown-like syntax and rendered
+  by each client per its capabilities (a text frontend renders the same structure
+  without proportional styling; the TUI shows code blocks and emphasis in-band).
+  The stored body has remained plain UTF-8 (REQ-054) with formatting expressed
+  in-band, so no schema change is required, and a client that does not render a
+  construct has shown its literal source legibly. **[needs ARCH decision — the
+  markup dialect + whether it is parsed server-side or purely client-side.]**
+- **REQ-221.** A message has been able to **@mention** a user or channel, and the
+  broadcast audiences `@here` / `@channel` / `@everyone`. A mention has been
+  stored as a stable reference (user/channel id) that survives display-name
+  changes, has highlighted for the mentioned party, and has driven notification
+  delivery under the recipient's per-channel level (REQ-130) — the "mentions"
+  notification level *depends* on this feature. **[needs ARCH decision — mention
+  encoding in the body + resolution, and the mention→notify decision, which is
+  the deferred half of ARCH-72.]**
+- **REQ-222.** A URL in a message has optionally been **unfurled** into a preview
+  (title, description, thumbnail) fetched from the linked page. The fetch has been
+  performed **server-side by the daemon or an isolated helper** — never by pushing
+  arbitrary client-side fetches — consistent with the island model, and
+  disable-able per tenant for privacy/egress reasons. **[needs ARCH decision —
+  unfurl-fetcher placement + egress/SSRF controls; likely out-of-daemon.]**
+- **REQ-223.** An unsent composer's contents (per channel/thread/DM) have been
+  preserved as a **draft** across app restarts and, for a signed-in identity,
+  synced across that user's devices, so a half-written message has not been lost.
+  **[needs ARCH decision — draft storage: client-local (ARCH-64) vs.
+  server-synced.]**
+- **REQ-224.** A user has been able to **schedule a message** for future delivery
+  to a channel or DM; the message has been held until its send time, then
+  delivered through the ordinary path (REQ-090), and cancelable before it fired.
+  **[needs ARCH decision — where a scheduled message is held (a server-side queue)
+  and its interaction with idempotency (REQ-093).]**
+
+---
+
+## 12. Message Organization and Retrieval
+
+*Ways to mark, find, and revisit individual messages. None are yet backed by an
+architecture decision.*
+
+- **REQ-230.** Any channel member has been able to **pin** a message to its
+  channel; pinned messages have been listed for the channel, visible to all
+  members, and unpinnable by a member or an admin. **[needs ARCH decision — pin
+  storage + who may pin/unpin.]**
+- **REQ-231.** A user has been able to **save (bookmark)** any message they can
+  read into a private, personal list for later retrieval, visible only to them.
+  **[needs ARCH decision — per-user saved-item storage.]**
+- **REQ-232.** Every message has had a stable **permalink** — an addressable
+  reference resolving to the message in its channel/thread — that a client could
+  follow to **jump to that message** in context, loading surrounding history as
+  needed. **[needs ARCH decision — permalink form + a fetch-around-an-id backfill
+  mode, cf. ARCH-46's cursor replay.]**
+- **REQ-233.** A user has been able to set a **reminder** on a message or a
+  free-text note for a chosen time, delivered to them (typically as a bot DM) when
+  due. **[needs ARCH decision — reminder storage + delivery, cf. the scheduled-
+  delivery mechanism of REQ-224.]**
+- **REQ-234.** A user has been able to **star (favorite)** channels and DMs and
+  organize their sidebar into **custom sections** — per-user view state that has
+  synced across their devices without affecting other users. **[needs ARCH
+  decision — per-user sidebar state storage: client-local vs. synced.]**
+
+---
+
+## 13. User Profiles
+
+*Per-user identity presentation beyond the display name already carried on
+messages (author name, ARCH-74). Not yet backed by an architecture decision.*
+
+- **REQ-240.** Each user has had a **profile** — display name, avatar image,
+  title/role text, timezone, and pronouns — set by the user (some fields possibly
+  admin-managed in a corporate deployment) and shown wherever the user appears.
+  Avatars have been stored as image assets in object storage (ARCH-17), not
+  SQLite. **[needs ARCH decision — profile field set, edit authority, avatar asset
+  storage.]**
+- **REQ-241.** A user has been able to set a transient **custom status** — a
+  short text plus an emoji, with an optional expiry — shown alongside their name
+  and presence (Section 4). **[needs ARCH decision — status storage + expiry and
+  its relation to presence (ARCH-67).]**
+
+---
+
+## 14. Compliance and Data Governance
+
+*Enterprise-tier data-lifecycle and governance surface. Some items may be
+explicitly excluded for the self-hosted / small-team target; each is flagged.
+None are yet backed by an architecture decision.*
+
+- **REQ-250.** A tenant has optionally configured a **message retention policy** —
+  retain forever (the default, REQ-053) or delete messages/attachments older than
+  a set age — applied uniformly and irreversibly once messages age out. This has
+  been opt-in for organizations with data-minimization obligations and is **not** a
+  paid-tier history *cap* (REQ-053 stands). **[needs ARCH decision — retention job
+  + its interaction with backfill, search, and attachment cleanup.]**
+- **REQ-251.** The daemon has recorded an **audit log** of administrative and
+  security-relevant actions — role changes, user invite/remove, session
+  revocation, webhook/app install, channel archive, retention changes — append-
+  only, admin-readable, and kept outside the normal message store. **[needs ARCH
+  decision — audit event catalog + storage.]**
+- **REQ-252.** A tenant subject to legal/compliance obligations has been able to
+  place a **legal hold** and **export** message history (including DMs, subject to
+  authorization policy) for eDiscovery, and to apply data-loss-prevention scanning
+  to content. This is an enterprise concern and **may be explicitly out of scope**
+  for the self-hosted/small-team target. **[needs ARCH decision — export/hold
+  model, or a decision to exclude it.]**
+- **REQ-253.** In OIDC/enterprise deployments, user provisioning and
+  deprovisioning have been automatable via **SCIM** from the organization's
+  identity provider, so account lifecycle matched the directory. Like OIDC this
+  has been brokered through the central service (ARCH-56), not the daemon, and has
+  no local-mode applicability. **[needs ARCH decision — SCIM endpoint placement
+  (central service).]**
