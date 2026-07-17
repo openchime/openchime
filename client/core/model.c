@@ -185,6 +185,30 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         }
         break;
     }
+    case OC_EV_EDIT: {
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (c) {
+            for (size_t i = 0; i < c->n_msgs; i++) {
+                if (c->msgs[i].message_id == e->message_id) {
+                    free(c->msgs[i].body);
+                    c->msgs[i].body = e->body;   /* steal the new text */
+                    e->body = NULL;
+                    c->msgs[i].edited = 1;
+                    break;
+                }
+            }
+        }
+        break;
+    }
+    case OC_EV_DELETE: {
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (c) {
+            for (size_t i = 0; i < c->n_msgs; i++) {
+                if (c->msgs[i].message_id == e->message_id) { c->msgs[i].deleted = 1; break; }
+            }
+        }
+        break;
+    }
     case OC_EV_DISCONNECTED:
         m->connected = false;
         m->authed = false;

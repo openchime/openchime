@@ -43,6 +43,11 @@ void oc_client_mark_read(oc_client *c, uint64_t channel_id);
 void oc_client_react(oc_client *c, uint64_t channel_id, uint64_t message_id,
                      const char *emoji, uint8_t op);
 
+/* Edit / delete a message (your own, or as a moderator). The server fans back a
+ * MSG_EDITED / MSG_DELETED that updates the model. */
+void oc_client_edit(oc_client *c, uint64_t channel_id, uint64_t message_id, const char *body);
+void oc_client_delete(oc_client *c, uint64_t channel_id, uint64_t message_id);
+
 /* Stop the network thread, drain remaining events, and free everything. */
 void oc_client_stop(oc_client *c);
 

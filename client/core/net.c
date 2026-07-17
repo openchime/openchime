@@ -175,6 +175,24 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                     oc_queue_push(to_ui, e);
                 }
             }
+        } else if (hdr.msg_type == OC_MSG_MSG_EDITED) {
+            oc_msg_edited me;
+            if (oc_decode_msg_edited(&p, &me) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_EDIT);
+                if (e) {
+                    e->channel_id = me.channel_id;
+                    e->message_id = me.message_id;
+                    e->body = malloc(me.body.len + 1);
+                    if (e->body) { memcpy(e->body, me.body.ptr, me.body.len); e->body[me.body.len] = '\0'; }
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_MSG_DELETED) {
+            oc_msg_deleted md;
+            if (oc_decode_msg_deleted(&p, &md) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_DELETE);
+                if (e) { e->channel_id = md.channel_id; e->message_id = md.message_id; oc_queue_push(to_ui, e); }
+            }
         } else if (hdr.msg_type == OC_MSG_ERROR) {
             oc_error err;
             if (oc_decode_error(&p, &err) == OC_OK) {
@@ -303,6 +321,18 @@ static void *net_thread(void *arg) {
                 uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_react rc = { c->channel_id, c->message_id, oc_slice_str(c->body), c->op };
                 if (oc_encode_react(&w, OC_PROTOCOL_VERSION, &rc) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_EDIT && c->body) {
+                uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_edit ed = { c->channel_id, c->message_id, oc_slice_str(c->body) };
+                if (oc_encode_edit(&w, OC_PROTOCOL_VERSION, &ed) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_DELETE) {
+                uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_delete dl = { c->channel_id, c->message_id };
+                if (oc_encode_delete(&w, OC_PROTOCOL_VERSION, &dl) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             oc_cmd_free(c);

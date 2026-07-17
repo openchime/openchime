@@ -17,6 +17,8 @@ enum {
     OC_EV_CHANNEL,         /* a CHANNEL_LIST entry: channel_id + name(body) + status */
     OC_EV_PRESENCE,        /* a PRESENCE_UPDATE: user_id + status */
     OC_EV_REACTION,        /* a REACTION_UPDATED: channel/message/user + emoji/op/count */
+    OC_EV_EDIT,            /* a MSG_EDITED: channel/message + new body */
+    OC_EV_DELETE,          /* a MSG_DELETED: channel/message tombstone */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
     OC_EV_ERROR            /* protocol/transport error; body = human message */
 };
@@ -44,6 +46,8 @@ enum {
     OC_CMD_SEND = 1,       /* send `body` to `channel_id` */
     OC_CMD_BACKFILL,       /* request history for `channel_id` (from id 0) */
     OC_CMD_REACT,          /* react to `message_id` in `channel_id`: body=emoji, op */
+    OC_CMD_EDIT,           /* edit `message_id` in `channel_id`: body=new text */
+    OC_CMD_DELETE,         /* delete `message_id` in `channel_id` */
     OC_CMD_QUIT
 };
 

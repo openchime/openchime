@@ -9,8 +9,8 @@
  *        (credentials also read from $OPENCHIME_CRED = "user:pass")
  *
  * Keys: type + Enter to send · Tab next channel · ↑/↓ + PgUp/PgDn scroll ·
- *       Ctrl-Q quit. Commands: /react <emoji> toggles a reaction on the last
- *       message in the focused channel.
+ *       Ctrl-Q quit. Commands (on the last message in the focused channel):
+ *       /react <emoji> · /edit <text> · /delete.
  */
 
 #define TB_IMPL
@@ -139,8 +139,17 @@ static void build_rows(rows_t *r, const oc_channel *ch, uint64_t me, int width) 
             snprintf(line, sizeof line, "%s  you", stamp);
         else
             snprintf(line, sizeof line, "%s  user%llu", stamp, (unsigned long long)m->author_id);
+        if (m->edited && !m->deleted) {
+            size_t l = strlen(line);
+            snprintf(line + l, sizeof line - l, " (edited)");
+        }
         char *hdr = malloc(strlen(line) + 1);
         if (hdr) { strcpy(hdr, line); rows_push(r, hdr, nick_color(m->author_id) | TB_BOLD); }
+        if (m->deleted) {                     /* tombstone: no body, no reactions */
+            char *d = malloc(sizeof "    [message deleted]");
+            if (d) { strcpy(d, "    [message deleted]"); rows_push(r, d, TB_DEFAULT); }
+            continue;
+        }
         /* Body rows, indented, default color. */
         wrap_push(r, m->body ? m->body : "", TB_DEFAULT, width, 4);
         /* Reaction line: "emoji count" per emoji, [n] if we reacted. */
@@ -247,24 +256,50 @@ static void backspace_utf8(char *buf, size_t *len) {
     *len = n;
 }
 
-/* Handle a "/command" typed in the composer. Currently only /react <emoji>,
- * which toggles a reaction on the most recent message in the focused channel. */
+/* The focused channel in the model, or NULL. */
+static const oc_channel *focused_channel(const oc_model *m, uint64_t cid) {
+    for (size_t i = 0; i < m->n_channels; i++)
+        if (m->channels[i].channel_id == cid) return &m->channels[i];
+    return NULL;
+}
+
+/* Our own most recent, non-deleted message in a channel (for /edit, /delete). */
+static const oc_msg *my_last_message(const oc_channel *ch, uint64_t me) {
+    for (size_t i = ch->n_msgs; i > 0; i--) {
+        const oc_msg *msg = &ch->msgs[i - 1];
+        if (msg->author_id == me && !msg->deleted) return msg;
+    }
+    return NULL;
+}
+
+/* Handle a "/command" typed in the composer:
+ *   /react <emoji>  toggle a reaction on the last message in the channel
+ *   /edit  <text>   replace the text of your last message
+ *   /delete         tombstone your last message
+ */
 static void handle_command(oc_client *cl, uint64_t cid, const char *line) {
-    if (strncmp(line, "/react ", 7) != 0) return;
-    const char *emoji = line + 7;
-    while (*emoji == ' ') emoji++;
-    if (!*emoji) return;
     const oc_model *m = oc_client_model(cl);
-    for (size_t i = 0; i < m->n_channels; i++) {
-        if (m->channels[i].channel_id != cid) continue;
-        const oc_channel *ch = &m->channels[i];
-        if (ch->n_msgs == 0) return;
+    const oc_channel *ch = focused_channel(m, cid);
+    if (!ch || ch->n_msgs == 0) return;
+
+    if (strncmp(line, "/react ", 7) == 0) {
+        const char *emoji = line + 7;
+        while (*emoji == ' ') emoji++;
+        if (!*emoji) return;
         const oc_msg *last = &ch->msgs[ch->n_msgs - 1];
         uint8_t op = 1;                       /* add, unless we already reacted */
         for (uint8_t k = 0; k < last->n_reactions; k++)
             if (strcmp(last->reactions[k].emoji, emoji) == 0 && last->reactions[k].mine) { op = 0; break; }
         oc_client_react(cl, cid, last->message_id, emoji, op);
-        return;
+    } else if (strncmp(line, "/edit ", 6) == 0) {
+        const char *text = line + 6;
+        while (*text == ' ') text++;
+        if (!*text) return;
+        const oc_msg *mine = my_last_message(ch, m->user_id);
+        if (mine) oc_client_edit(cl, cid, mine->message_id, text);
+    } else if (strcmp(line, "/delete") == 0) {
+        const oc_msg *mine = my_last_message(ch, m->user_id);
+        if (mine) oc_client_delete(cl, cid, mine->message_id);
     }
 }
 

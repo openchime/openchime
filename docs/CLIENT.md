@@ -148,8 +148,9 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
 
 - **Now:** app-core + termbox2 TUI shipped — the lean core loop (sidebar,
   backfill on open, send, display names, presence, unread, scrollback) and
-  **reactions display** (`/react`) are done. Next TUI increments: threads,
-  edit/delete, typing indicators, search.
+  **reactions display** (`/react`) and **edit/delete** (`/edit`, `/delete` with
+  an `(edited)` marker and `[message deleted]` tombstone) are done. Next TUI
+  increments: typing indicators, search, threads.
 - **Next:** store + reconnect/offline; auth completeness (local + OIDC);
   attachments (chunked up/download) and the **audio client** (Opus encode/decode
   + UDP to the sidecar — the deferred half of REQ-150/151).

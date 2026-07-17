@@ -25,6 +25,8 @@ typedef struct {
     uint64_t server_time;
     oc_reaction *reactions;   /* heap, NULL until the message gets a reaction */
     uint8_t      n_reactions, cap_reactions;
+    uint8_t      edited;      /* body was edited (REQ-051) */
+    uint8_t      deleted;     /* tombstoned (REQ-052) */
 } oc_msg;
 
 typedef struct {

@@ -119,6 +119,16 @@ static int reaction_count(const oc_model *m, uint64_t cid, uint64_t mid, const c
     return -1;
 }
 
+/* Find a message by id; return NULL if absent. */
+static const oc_msg *find_msg(const oc_model *m, uint64_t cid, uint64_t mid) {
+    for (size_t i = 0; i < m->n_channels; i++) {
+        if (m->channels[i].channel_id != cid) continue;
+        for (size_t j = 0; j < m->channels[i].n_msgs; j++)
+            if (m->channels[i].msgs[j].message_id == mid) return &m->channels[i].msgs[j];
+    }
+    return NULL;
+}
+
 /* Does channel `cid` hold a message whose body and author display name match? */
 static int channel_has_named(const oc_model *m, uint64_t cid, const char *body, const char *name) {
     for (size_t i = 0; i < m->n_channels; i++) {
@@ -224,6 +234,16 @@ int run_client_core_tests(void) {
             CHECK(channel_has_named(oc_client_model(c), 1, "second line for history", "dana"));
             oc_client_stop(c);
         }
+
+        /* dana edits her first message; erik sees the new body + edited flag,
+         * then dana deletes it and erik sees the tombstone. (After faye's
+         * backfill, which asserted the pre-edit body.) */
+        oc_client_edit(a, 1, mid, "edited body");
+        CHECK(WAIT_FOR(b, find_msg(m, 1, mid) && find_msg(m, 1, mid)->edited &&
+                          find_msg(m, 1, mid)->body &&
+                          strcmp(find_msg(m, 1, mid)->body, "edited body") == 0));
+        oc_client_delete(a, 1, mid);
+        CHECK(WAIT_FOR(b, find_msg(m, 1, mid) && find_msg(m, 1, mid)->deleted));
 
         oc_client_stop(a);
         oc_client_stop(b);
