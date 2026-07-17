@@ -381,6 +381,26 @@ int run_client_core_tests(void) {
         oc_client_delete(a, 1, mid);
         CHECK(WAIT_FOR(b, find_msg(m, 1, mid) && find_msg(m, 1, mid)->deleted));
 
+        /* incoming webhooks (REQ-170): dana mints a webhook on channel 1 — the
+         * server answers with a WEBHOOK_INFO whose token is shown once in her
+         * model. She opens the webhook overlay (a list refresh), sees the labeled
+         * entry, then deletes it and the row drops from the list. */
+        oc_client_create_webhook(a, 1, "ci-bot");
+        CHECK(WAIT_FOR(a, m->webhook_token[0] != '\0' && m->webhook_new_id != 0));
+        uint64_t wid = oc_client_model(a)->webhook_new_id;
+        oc_client_webhooks(a, 1);
+        CHECK(WAIT_FOR(a, m->weblist_open && m->n_webhooks >= 1));
+        {
+            const oc_model *am = oc_client_model(a);
+            int found = 0;
+            for (size_t j = 0; j < am->n_webhooks; j++)
+                if (am->webhooks[j].webhook_id == wid && strcmp(am->webhooks[j].label, "ci-bot") == 0) found = 1;
+            CHECK(found);
+        }
+        oc_client_delete_webhook(a, wid);
+        CHECK(WAIT_FOR(a, m->n_webhooks == 0));
+        oc_client_close_webhooks(a);
+
         /* admin / user management (REQ-030/033): dana (owner) promotes erik to
          * admin — the USER_UPDATED folds his new role into her roster — mints a
          * tenant invite token (shown once in the model), then removes him, which

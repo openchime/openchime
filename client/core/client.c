@@ -279,6 +279,37 @@ void oc_client_remove_user(oc_client *c, uint64_t user_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_webhooks(oc_client *c, uint64_t channel_id) {
+    if (!c || !channel_id) return;
+    oc_model_weblist_begin(&c->model, channel_id);   /* open overlay + clear prior */
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_WEBHOOKS);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_close_webhooks(oc_client *c) {
+    if (!c) return;
+    oc_model_close_weblist(&c->model);
+}
+
+void oc_client_create_webhook(oc_client *c, uint64_t channel_id, const char *label) {
+    if (!c || !channel_id || !label || !label[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CREATE_WEBHOOK);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->body = strdup(label);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_delete_webhook(oc_client *c, uint64_t webhook_id) {
+    if (!c || !webhook_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_DELETE_WEBHOOK);
+    if (!cmd) return;
+    cmd->message_id = webhook_id;   /* reused as the webhook id */
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_logout(oc_client *c, uint8_t scope) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_LOGOUT);

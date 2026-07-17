@@ -313,6 +313,36 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                 if (e->body) { memcpy(e->body, ic.token.ptr, ic.token.len); e->body[ic.token.len] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_WEBHOOK_INFO) {
+            oc_webhook_info wi;
+            if (oc_decode_webhook_info(&p, &wi) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_WEBHOOK_INFO);
+            if (e) {
+                e->message_id = wi.webhook_id;
+                e->channel_id = wi.channel_id;
+                e->body = malloc(wi.token.len + 1);
+                if (e->body) { memcpy(e->body, wi.token.ptr, wi.token.len); e->body[wi.token.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_WEBHOOK_LIST) {
+            oc_webhook_list_entry we[256]; uint16_t count = 0;
+            if (oc_decode_webhook_list(&p, we, 256, &count) != OC_OK) return -1;
+            if (count > 256) count = 256;
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_WEBHOOK);
+                if (!e) continue;
+                e->message_id = we[i].webhook_id;
+                e->channel_id = we[i].channel_id;
+                e->op = we[i].disabled;
+                e->body = malloc(we[i].label.len + 1);
+                if (e->body) { memcpy(e->body, we[i].label.ptr, we[i].label.len); e->body[we[i].label.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_WEBHOOK_DELETED) {
+            oc_webhook_deleted wd;
+            if (oc_decode_webhook_deleted(&p, &wd) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_WEBHOOK_DELETED);
+            if (e) { e->message_id = wd.webhook_id; oc_queue_push(to_ui, e); }
         } else if (hdr.msg_type == OC_MSG_ERROR) {
             oc_error err;
             if (oc_decode_error(&p, &err) == OC_OK) {
@@ -545,6 +575,24 @@ static void *net_thread(void *arg) {
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_remove_user ru = { c->channel_id };   /* channel_id reused as user id */
                 if (oc_encode_remove_user(&w, OC_PROTOCOL_VERSION, &ru) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_CREATE_WEBHOOK && c->body) {
+                uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_create_webhook cw = { c->channel_id, oc_slice_str(c->body) };
+                if (oc_encode_create_webhook(&w, OC_PROTOCOL_VERSION, &cw) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_WEBHOOKS) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_list_webhooks lw = { c->channel_id };
+                if (oc_encode_list_webhooks(&w, OC_PROTOCOL_VERSION, &lw) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_DELETE_WEBHOOK) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_delete_webhook dw = { c->message_id };   /* message_id reused as webhook id */
+                if (oc_encode_delete_webhook(&w, OC_PROTOCOL_VERSION, &dw) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_OPEN_DM) {

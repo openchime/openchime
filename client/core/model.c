@@ -67,6 +67,7 @@ void oc_model_free(oc_model *m) {
     free(m->search_results);
     free(m->reactors);
     free(m->users);
+    free(m->webhooks);
     memset(m, 0, sizeof *m);
 }
 
@@ -141,6 +142,22 @@ void oc_model_reactlist_begin(oc_model *m, uint64_t message_id) {
     m->reactlist_message = message_id;
 }
 
+void oc_model_close_weblist(oc_model *m) {
+    free(m->webhooks);
+    m->webhooks = NULL;
+    m->n_webhooks = m->cap_webhooks = 0;
+    m->weblist_open = 0;
+    m->weblist_channel = 0;
+}
+
+void oc_model_weblist_begin(oc_model *m, uint64_t channel_id) {
+    oc_model_close_weblist(m);     /* drop any prior list */
+    m->weblist_open = 1;
+    m->weblist_channel = channel_id;
+    m->webhook_token[0] = '\0';    /* clear any prior shown-once token */
+    m->webhook_new_id = 0;
+}
+
 void oc_model_set_prefs_open(oc_model *m, int open) {
     m->prefs_open = open ? 1 : 0;
 }
@@ -209,6 +226,34 @@ static void reactor_append(oc_model *m, uint64_t user_id, const char *emoji) {
     oc_reactor_row *r = &m->reactors[m->n_reactors++];
     r->user_id = user_id;
     snprintf(r->emoji, sizeof r->emoji, "%s", emoji ? emoji : "");
+}
+
+/* Upsert one webhook (id + label + disabled) into the open webhook list. */
+static void webhook_upsert(oc_model *m, uint64_t webhook_id, const char *label, uint8_t disabled) {
+    for (size_t i = 0; i < m->n_webhooks; i++)
+        if (m->webhooks[i].webhook_id == webhook_id) {
+            snprintf(m->webhooks[i].label, sizeof m->webhooks[i].label, "%s", label ? label : "");
+            m->webhooks[i].disabled = disabled; return;
+        }
+    if (m->n_webhooks == m->cap_webhooks) {
+        size_t cap = m->cap_webhooks ? m->cap_webhooks * 2 : 16;
+        oc_webhook_view *nw = realloc(m->webhooks, cap * sizeof *nw);
+        if (!nw) return;
+        m->webhooks = nw; m->cap_webhooks = cap;
+    }
+    oc_webhook_view *w = &m->webhooks[m->n_webhooks++];
+    w->webhook_id = webhook_id;
+    w->disabled = disabled;
+    snprintf(w->label, sizeof w->label, "%s", label ? label : "");
+}
+
+/* Drop a webhook from the open list by id (a WEBHOOK_DELETED ack). */
+static void webhook_remove(oc_model *m, uint64_t webhook_id) {
+    for (size_t i = 0; i < m->n_webhooks; i++)
+        if (m->webhooks[i].webhook_id == webhook_id) {
+            m->webhooks[i] = m->webhooks[--m->n_webhooks];
+            return;
+        }
 }
 
 /* Raise a message's thread reply count, finding it in any channel (message ids
@@ -475,6 +520,30 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         break;
     case OC_EV_USER:
         user_upsert(m, e->user_id, e->body ? e->body : "", e->status, e->op);
+        break;
+    case OC_EV_WEBHOOK_INFO:
+        /* A freshly-minted webhook: the token is shown once. Record it and, if the
+         * list overlay is open for this channel, add the new row (label unknown
+         * until the next list refresh). */
+        snprintf(m->webhook_token, sizeof m->webhook_token, "%s", e->body ? e->body : "");
+        m->webhook_new_id = e->message_id;
+        if (m->weblist_open && e->channel_id == m->weblist_channel)
+            webhook_upsert(m, e->message_id, "", 0);
+        {
+            char buf[160];
+            snprintf(buf, sizeof buf, "webhook #%llu token: %s",
+                     (unsigned long long)e->message_id, m->webhook_token);
+            set_status(m, buf);
+        }
+        break;
+    case OC_EV_WEBHOOK:
+        if (m->weblist_open && e->channel_id == m->weblist_channel)
+            webhook_upsert(m, e->message_id, e->body ? e->body : "", e->op);
+        break;
+    case OC_EV_WEBHOOK_DELETED:
+        webhook_remove(m, e->message_id);
+        if (m->webhook_new_id == e->message_id) { m->webhook_token[0] = '\0'; m->webhook_new_id = 0; }
+        set_status(m, "webhook deleted");
         break;
     case OC_EV_DISCONNECTED:
         m->connected = false;

@@ -138,9 +138,12 @@ model; translate input to intents }, stop.
     [admin|member]` (mints a tenant token, shown once atop the roster), `/remove
     <name>` disables a user (REQ-030/033, owner/admin only; a `USER_UPDATED` folds
     each change into the roster).
+  - **webhook management** — `/webhook` overlays the focused channel's incoming
+    webhooks; `/webhook create <label>` mints one (the 32-byte token is shown
+    once atop the overlay, like `/invite`); `/webhook rm <id>` deletes one
+    (REQ-170; CREATE/LIST/DELETE_WEBHOOK, a WEBHOOK_DELETED drops the row).
 
-  The remaining engine features to surface are **attachment transfer** and
-  **webhook management**.
+  The remaining engine feature to surface is **attachment transfer**.
 - **Windows (later):** Win32/WinUI (C++/WinRT or C#) over the C core.
 - **macOS/iOS (later):** AppKit/UIKit (Swift) over the core.
 - **Android (later):** Android views (Kotlin) over the core.
@@ -191,9 +194,9 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
 - **Now:** app-core + termbox2 TUI shipped. On top of the lean core loop
   (sidebar, backfill on open, send, display names, unread, scrollback), the TUI
   surfaces: reactions, edit/delete, typing, threads, search, channel management,
-  roster + presence, DMs, logout, who-reacted, notification prefs/DND, and admin
-  (see §3 for the commands). The only engine features not yet surfaced are
-  **attachment transfer** and **webhook management**.
+  roster + presence, DMs, logout, who-reacted, notification prefs/DND, admin, and
+  webhook management (see §3 for the commands). The only engine feature not yet
+  surfaced is **attachment transfer**.
 - **Next:** store + reconnect/offline; auth completeness (local + OIDC);
   attachments (chunked up/download) and the **audio client** (Opus encode/decode
   + UDP to the sidecar — the deferred half of REQ-150/151).

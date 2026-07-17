@@ -29,6 +29,9 @@ enum {
     OC_EV_USER_UPDATED,    /* a USER_UPDATED: user_id + role(status) + disabled(op) */
     OC_EV_INVITE,          /* an INVITE_CREATED: body=token, op=role, server_time=expires_at */
     OC_EV_USER,            /* a USER_LIST entry: user_id + name(body) + role(status) + disabled(op) */
+    OC_EV_WEBHOOK_INFO,    /* a WEBHOOK_INFO: message_id=webhook_id + channel_id + body=token (shown once) */
+    OC_EV_WEBHOOK,         /* a WEBHOOK_LIST entry: message_id=webhook_id + channel_id + body=label + op=disabled */
+    OC_EV_WEBHOOK_DELETED, /* a WEBHOOK_DELETED: message_id=webhook_id */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
     OC_EV_ERROR            /* protocol/transport error; body = human message */
 };
@@ -77,6 +80,9 @@ enum {
     OC_CMD_SET_ROLE,        /* set a user's tenant role: channel_id = user_id, op = role */
     OC_CMD_INVITE_USER,     /* mint a tenant invite token: op = role */
     OC_CMD_REMOVE_USER,     /* remove/disable a user: channel_id = user_id */
+    OC_CMD_CREATE_WEBHOOK,  /* mint an incoming webhook for `channel_id`: body = label */
+    OC_CMD_LIST_WEBHOOKS,   /* list `channel_id`'s webhooks */
+    OC_CMD_DELETE_WEBHOOK,  /* delete a webhook: message_id = webhook_id */
     OC_CMD_LOGOUT,          /* revoke this session (op = scope) and close the connection */
     OC_CMD_QUIT
 };

@@ -104,6 +104,14 @@ void oc_client_set_role(oc_client *c, uint64_t user_id, uint8_t role);
 void oc_client_invite_user(oc_client *c, uint8_t role);
 void oc_client_remove_user(oc_client *c, uint64_t user_id);
 
+/* Incoming-webhook management (REQ-170). Open the webhook overlay for a channel
+ * (refreshes the list), close it, mint a webhook (the server answers with a
+ * WEBHOOK_INFO whose token is shown once in the model), or delete one by id. */
+void oc_client_webhooks(oc_client *c, uint64_t channel_id);
+void oc_client_close_webhooks(oc_client *c);
+void oc_client_create_webhook(oc_client *c, uint64_t channel_id, const char *label);
+void oc_client_delete_webhook(oc_client *c, uint64_t webhook_id);
+
 /* Log out: revoke this session (scope OC_LOGOUT_THIS) or all of the user's
  * (OC_LOGOUT_ALL); the server closes the connection. */
 void oc_client_logout(oc_client *c, uint8_t scope);

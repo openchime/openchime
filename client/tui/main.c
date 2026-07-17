@@ -19,6 +19,8 @@
  *       all|mentions|none (this channel's level) · /dnd HH:MM HH:MM | off
  *       (do-not-disturb window) · /role <name> owner|admin|member ·
  *       /invite [admin|member] (mint a token) · /remove <name> (owner/admin) ·
+ *       /webhook (list this channel's incoming webhooks) · /webhook create
+ *       <label> (mint one; token shown once) · /webhook rm <id> (delete one) ·
  *       /logout (revoke this session and quit).
  */
 
@@ -339,6 +341,32 @@ static void build_prefs_rows(rows_t *r, const oc_model *m, int width) {
     }
 }
 
+/* Build the rows for the incoming-webhook overlay (REQ-170): a header, the
+ * last-minted token (shown once), then each webhook as "#id  label". */
+static void build_webhooks_rows(rows_t *r, const oc_model *m, int width) {
+    (void)width;
+    char line[200];
+    snprintf(line, sizeof line, "%zu webhook%s  (/webhook create <label>, /webhook rm <id>)",
+             m->n_webhooks, m->n_webhooks == 1 ? "" : "s");
+    char *h = malloc(strlen(line) + 1);
+    if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
+    /* Surface the last-minted token (shown once) below the header. */
+    if (m->webhook_token[0]) {
+        snprintf(line, sizeof line, "new #%llu token: %s",
+                 (unsigned long long)m->webhook_new_id, m->webhook_token);
+        char *tk = malloc(strlen(line) + 1);
+        if (tk) { strcpy(tk, line); rows_push(r, tk, TB_MAGENTA | TB_BOLD); }
+    }
+    for (size_t i = 0; i < m->n_webhooks; i++) {
+        const oc_webhook_view *w = &m->webhooks[i];
+        snprintf(line, sizeof line, "#%llu  %s%s", (unsigned long long)w->webhook_id,
+                 w->label[0] ? w->label : "(webhook)", w->disabled ? "  (disabled)" : "");
+        uintattr_t col = w->disabled ? TB_BLACK | TB_BOLD : TB_DEFAULT;
+        char *rw = malloc(strlen(line) + 1);
+        if (rw) { strcpy(rw, line); rows_push(r, rw, col); }
+    }
+}
+
 static void render(oc_client *cl, size_t focus, const char *composer,
                    size_t clen, int scroll) {
     (void)clen;
@@ -385,6 +413,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     else if (m->search_open)     snprintf(title, sizeof title, " search (/close to exit)");
     else if (m->reactlist_open)  snprintf(title, sizeof title, " reactions (/close to exit)");
     else if (m->prefs_open)      snprintf(title, sizeof title, " notifications (/close to exit)");
+    else if (m->weblist_open)    snprintf(title, sizeof title, " webhooks (/close to exit)");
     else if (m->thread_open) snprintf(title, sizeof title, " thread · #%s (/close to exit)",
                                       fc && fc->name ? fc->name : "…");
     else if (fc)             snprintf(title, sizeof title, " #%s", fc->name ? fc->name : "…");
@@ -394,12 +423,13 @@ static void render(oc_client *cl, size_t focus, const char *composer,
 
     /* Message rows for the focused channel, or an open overlay (thread / search /
      * roster), showing the window ending `scroll` rows above the bottom. */
-    if (fc || m->thread_open || m->search_open || m->roster_open || m->reactlist_open || m->prefs_open) {
+    if (fc || m->thread_open || m->search_open || m->roster_open || m->reactlist_open || m->prefs_open || m->weblist_open) {
         rows_t rows = {0};
         if (m->roster_open)         build_roster_rows(&rows, m, pxmax - px0);
         else if (m->search_open)    build_search_rows(&rows, m, pxmax - px0);
         else if (m->reactlist_open) build_reactlist_rows(&rows, m, pxmax - px0);
         else if (m->prefs_open)     build_prefs_rows(&rows, m, pxmax - px0);
+        else if (m->weblist_open)   build_webhooks_rows(&rows, m, pxmax - px0);
         else if (m->thread_open)    build_thread_rows(&rows, m, fc, m->user_id, pxmax - px0);
         else                        build_rows(&rows, fc, m->user_id, pxmax - px0);
         int total = (int)rows.n;
@@ -491,7 +521,24 @@ static void handle_command(oc_client *cl, uint64_t cid, const char *line) {
     if (strcmp(line, "/close") == 0) {
         oc_client_close_thread(cl); oc_client_close_search(cl);
         oc_client_close_reactions(cl); oc_client_toggle_roster(cl, 0);
-        oc_client_toggle_prefs(cl, 0);
+        oc_client_toggle_prefs(cl, 0); oc_client_close_webhooks(cl);
+        return;
+    }
+    if (strncmp(line, "/webhook", 8) == 0) {   /* /webhook | /webhook create <label> | /webhook rm <id> */
+        const char *a = line + 8;
+        while (*a == ' ') a++;
+        if (strncmp(a, "create ", 7) == 0) {
+            const char *lb = a + 7;
+            while (*lb == ' ') lb++;
+            if (*lb) oc_client_create_webhook(cl, cid, lb);
+        } else if (strncmp(a, "rm ", 3) == 0 || strncmp(a, "delete ", 7) == 0) {
+            const char *id = a + (a[0] == 'r' ? 3 : 7);
+            while (*id == ' ') id++;
+            unsigned long long wid = strtoull(id, NULL, 10);
+            if (wid) oc_client_delete_webhook(cl, wid);
+        } else {
+            oc_client_webhooks(cl, cid);   /* open the overlay + refresh */
+        }
         return;
     }
     if (strcmp(line, "/prefs") == 0) { oc_client_toggle_prefs(cl, 1); return; }
@@ -671,7 +718,7 @@ int main(int argc, char **argv) {
                 uint64_t cid = mm->channels[focus].channel_id;
                 if (strcmp(composer, "/logout") == 0)         { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
                 else if (composer[0] == '/')                  handle_command(cl, cid, composer);
-                else if (mm->search_open || mm->roster_open || mm->reactlist_open || mm->prefs_open) { /* read-only overlay: ignore */ }
+                else if (mm->search_open || mm->roster_open || mm->reactlist_open || mm->prefs_open || mm->weblist_open) { /* read-only overlay: ignore */ }
                 else if (mm->thread_open)                     oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
                 else                                          oc_client_send(cl, cid, composer);
                 clen = 0; composer[0] = '\0'; scroll = 0;

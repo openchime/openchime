@@ -60,6 +60,11 @@ typedef struct { uint64_t message_id, channel_id, author_id, server_time; char *
  * with which emoji on the inspected message. */
 typedef struct { uint64_t user_id; char emoji[40]; } oc_reactor_row;
 
+/* One incoming-webhook entry (from LIST_WEBHOOKS -> WEBHOOK_LIST, REQ-170): the
+ * webhook's id + label + disabled flag. Tokens are never listed (shown once at
+ * creation, in webhook_token). */
+typedef struct { uint64_t webhook_id; char label[64]; uint8_t disabled; } oc_webhook_view;
+
 typedef struct {
     bool     connected;
     bool     authed;
@@ -103,6 +108,15 @@ typedef struct {
     char      invite_token[96];
     uint8_t   invite_role;
     uint64_t  invite_expires;
+    /* The incoming-webhook overlay (REQ-170): the channel it lists, its webhooks,
+     * and the last-minted token (shown once, empty until a WEBHOOK_INFO arrives).
+     * weblist_open is 0 when no such overlay is open. */
+    uint8_t   weblist_open;
+    uint64_t  weblist_channel;
+    oc_webhook_view *webhooks;
+    size_t    n_webhooks, cap_webhooks;
+    char      webhook_token[80];
+    uint64_t  webhook_new_id;
     char     status[160];             /* last status / error line */
 } oc_model;
 
@@ -130,6 +144,11 @@ void oc_model_close_search(oc_model *m);
  * / close the overlay. */
 void oc_model_reactlist_begin(oc_model *m, uint64_t message_id);
 void oc_model_close_reactlist(oc_model *m);
+
+/* Begin listing a channel's incoming webhooks (clears prior entries + the
+ * shown-once token, records the channel) / close the overlay. */
+void oc_model_weblist_begin(oc_model *m, uint64_t channel_id);
+void oc_model_close_weblist(oc_model *m);
 
 /* Open/close the notification-prefs overlay (frontend view state). */
 void oc_model_set_prefs_open(oc_model *m, int open);
