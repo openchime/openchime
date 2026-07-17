@@ -94,6 +94,8 @@ static int client_open(client *c, int port, const uint8_t *pin) {
         usleep(20000);
     }
     if (c->fd < 0) return -1;
+    /* Concurrent TLS setup across threads (test_concurrent_load opens 8 clients
+     * at once) is safe: the vendored mbedTLS is built with MBEDTLS_THREADING. */
     if (oc_tls_client_init(&c->cli, pin) != 0) return -1;
     if (oc_tls_conn_init(&c->conn, &c->cli.conf, c->fd) != 0) return -1;
     if (handshake_blocking(&c->conn) != OC_TLS_OK) return -1;
@@ -1458,15 +1460,21 @@ static void test_out_buffer_cap(int port, const uint8_t *pin, oc_dbwriter *dbw, 
     CHECK(flooder != 0);
     static uint8_t big[60000];
     memset(big, 'x', sizeof big);
-    for (int i = 0; i < 60; i++) {           /* ~3.6 MB, well over the 1 MiB cap */
+    /* Seed ~28 MB — far more than any kernel send/recv buffer can absorb (the
+     * daemon's SO_SNDBUF autotunes to a few MB). This makes the daemon's 1 MiB
+     * userspace out-buffer the binding constraint, so the overflow-drop is
+     * deterministic rather than depending on kernel buffer sizes. Bounded by
+     * OC_BACKFILL_MAX (500) on replay. idem must be unique for >255 messages. */
+    for (int i = 0; i < 480; i++) {
         oc_job *j = oc_job_new(OC_JOB_SEND, 0);
         if (!j) { CHECK(0); return; }
         j->user_id = flooder; j->channel_id = 1;
-        memset(j->idem, 0, OC_IDEM_LEN); j->idem[0] = (uint8_t)i; j->idem[1] = 0xC7;
+        memset(j->idem, 0, OC_IDEM_LEN);
+        j->idem[0] = (uint8_t)i; j->idem[1] = 0xC7; j->idem[2] = (uint8_t)(i >> 8);
         oc_job_set_body(j, big, sizeof big);
         oc_dbwriter_submit(dbw, j);
     }
-    usleep(400000);   /* let the writer persist them */
+    usleep(1500000);   /* let the writer persist them (~28 MB) */
 
     client v;
     CHECK(client_open(&v, port, pin) == 0);
@@ -1482,7 +1490,7 @@ static void test_out_buffer_cap(int port, const uint8_t *pin, oc_dbwriter *dbw, 
     CHECK(oc_encode_backfill_request(&w, OC_PROTOCOL_VERSION, &req) == OC_OK);
     CHECK(write_all(&v.conn, buf, w.len) == 0);
 
-    usleep(600000);   /* stay silent: the daemon fills our buffer past the cap */
+    usleep(1000000);   /* stay silent: the daemon fills our buffer past the cap */
 
     /* The daemon dropped us mid-backfill: we never see a clean BACKFILL_DONE. */
     int done = 0, closed = 0;

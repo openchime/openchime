@@ -40,11 +40,11 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   is one connection on its own thread, so no epoll): `dial` → `oc_tls_handshake`
   → `HELLO`/`WELCOME` → `AUTH_CHALLENGE` → `AUTH` → `AUTH_OK`, then a serve loop
   that interleaves sending queued intents with reading + dispatching server
-  frames. Lifted from `tests/e2e_client.c`. **One caveat:** the vendored mbedTLS
-  is built without `MBEDTLS_THREADING`, so TLS context setup + handshake is
-  serialized behind a process-wide mutex — harmless for the one-client-per-process
-  product, but it lets a multi-client harness (the headless test) connect several
-  cores safely.
+  frames. Lifted from `tests/e2e_client.c`. A process normally has one oc_client
+  (one net thread), but a multi-client harness (the headless test) spins several
+  concurrently; that is safe because the vendored mbedTLS is built with
+  **`MBEDTLS_THREADING`** (`scripts/build_mbedtls.sh`), so its internal shared
+  state is mutex-protected.
 - **`queue.c` — two thread-safe queues** (mutex+condvar FIFO, the daemon's
   net↔dbwriter shape): **intents in** (send, backfill, react, edit, delete,
   typing) and **events out** (connected, auth-ok, message, channel, presence,

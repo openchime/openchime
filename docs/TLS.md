@@ -21,6 +21,15 @@ OpenSSL and LibreSSL for fit with this project's constraints:
 - A verify callback for client-side TOFU pinning, and standard CA verification
   available for the webhook endpoint (ARCH-34).
 
+**Thread safety.** The vendored build enables **`MBEDTLS_THREADING_C` +
+`MBEDTLS_THREADING_PTHREAD`** (`scripts/build_mbedtls.sh`). OpenChime uses mbedTLS
+from multiple threads — the client app-core runs a network thread per connection
+and the test suite drives several TLS clients concurrently — and mbedTLS has
+internal shared state that is not otherwise safe under concurrency; without the
+threading layer, concurrent context setup/handshake races and fails
+intermittently. The daemon's single-threaded TLS use pays only uncontended-lock
+overhead. The final binaries already link `-lpthread`.
+
 **Why vendored, not the distro package:** Ubuntu ships mbedTLS 2.28 and Alpine
 ships 3.6.x, whose APIs are not source-compatible. Pinning one version from
 source gives local, CI, and the Docker image an identical library and avoids

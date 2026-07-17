@@ -24,6 +24,17 @@ if [ ! -f "${SRC}/library/libmbedtls.a" ]; then
     tar -xjf "${TARBALL}"
     rm -f "${TARBALL}"
   fi
+  # Thread safety: OpenChime uses mbedTLS from multiple threads — the client
+  # app-core runs a network thread per connection, and the test suite drives
+  # several TLS clients concurrently. Without MBEDTLS_THREADING the library's
+  # internal shared state races (intermittent handshake failures). Enable the
+  # pthread threading layer; the final binaries already link -lpthread. Idempotent.
+  CONF="${SRC}/include/mbedtls/mbedtls_config.h"
+  sed -i \
+    -e 's|^//#define MBEDTLS_THREADING_C$|#define MBEDTLS_THREADING_C|' \
+    -e 's|^//#define MBEDTLS_THREADING_PTHREAD$|#define MBEDTLS_THREADING_PTHREAD|' \
+    "${CONF}"
+
   echo "build_mbedtls: building ${SRC} static libraries"
   # `make lib` builds only the libraries (skips programs/tests). The release
   # tarball ships pre-generated sources, so no Python is required.

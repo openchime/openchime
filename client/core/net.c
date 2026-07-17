@@ -225,27 +225,15 @@ static void *net_thread(void *arg) {
     oc_tls_conn conn;
     oc_framebuf fb;
     /* Phase 1 TOFU: trust the presented cert (pin=NULL); persisting/pinning the
-     * fingerprint arrives with the client store phase.
-     *
-     * The vendored mbedTLS is built without MBEDTLS_THREADING, so its RNG/entropy
-     * setup is not safe to run from multiple threads at once. A process normally
-     * has a single oc_client (one net thread), so this never bites in production;
-     * but a multi-client harness (the headless test) spins several. Serialize the
-     * TLS setup — context init through handshake — behind a process-wide mutex so
-     * those cases are safe. Steady-state reads/writes use per-connection contexts
-     * with no shared state and run concurrently, so the lock is released once the
-     * handshake completes. */
-    static pthread_mutex_t g_tls_setup = PTHREAD_MUTEX_INITIALIZER;
-    pthread_mutex_lock(&g_tls_setup);
+     * fingerprint arrives with the client store phase. Multiple oc_clients in one
+     * process (the headless test) set up TLS concurrently; that is safe because
+     * the vendored mbedTLS is built with MBEDTLS_THREADING (scripts/build_mbedtls.sh). */
     if (oc_tls_client_init(&cli, NULL) != 0 || oc_tls_conn_init(&conn, &cli.conf, fd) != 0) {
-        pthread_mutex_unlock(&g_tls_setup);
         oc_closesock(fd); push_err(n->to_ui, "tls init failed"); push_simple(n->to_ui, OC_EV_DISCONNECTED, 0); return NULL;
     }
     oc_framebuf_init(&fb);
 
-    int hs = do_handshake(&conn, fd, &n->stop);
-    pthread_mutex_unlock(&g_tls_setup);
-    if (hs != 0) goto drop;
+    if (do_handshake(&conn, fd, &n->stop) != 0) goto drop;
 
     /* HELLO -> WELCOME */
     {
