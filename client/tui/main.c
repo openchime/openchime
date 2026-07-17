@@ -10,7 +10,8 @@
  *
  * Keys: type + Enter to send · Tab next channel · ↑/↓ + PgUp/PgDn scroll ·
  *       Ctrl-Q quit. Commands (on the last message in the focused channel):
- *       /react <emoji> · /edit <text> · /delete.
+ *       /react <emoji> · /edit <text> · /delete · /thread (open its thread;
+ *       then Enter posts a reply) · /close (leave the thread).
  */
 
 #define TB_IMPL
@@ -120,54 +121,85 @@ static void wrap_push(rows_t *r, const char *text, uintattr_t fg, int width, int
     } while (off < len);
 }
 
+/* Forward decl: resolve a display name for a message's author. */
+static const char *name_for(const oc_channel *ch, uint64_t uid);
+
+/* Fill `out` with the nick to show for message `m`: the name the daemon stamped,
+ * "you" for self, a name resolved from the channel (thread replies carry no
+ * name), else "user<id>". */
+static void msg_nick(char *out, size_t cap, const oc_msg *m, uint64_t me, const oc_channel *ch) {
+    if (m->author_name[0]) { snprintf(out, cap, "%s", m->author_name); return; }
+    if (m->author_id == me) { snprintf(out, cap, "you"); return; }
+    const char *nm = ch ? name_for(ch, m->author_id) : "someone";
+    if (strcmp(nm, "someone") != 0) { snprintf(out, cap, "%s", nm); return; }
+    snprintf(out, cap, "user%llu", (unsigned long long)m->author_id);
+}
+
+/* Append the wrapped rows for one message: header, body (or tombstone),
+ * reactions, and — when `show_replies` — a thread reply-count marker. `ch` is
+ * used only to resolve author names. */
+static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
+                            const oc_channel *ch, int show_replies) {
+    char line[256], nick[80];
+    char stamp[8] = "--:--";
+    if (m->server_time) {
+        time_t t = (time_t)(m->server_time / 1000);
+        struct tm tmv;
+        if (localtime_r(&t, &tmv)) strftime(stamp, sizeof stamp, "%H:%M", &tmv);
+    }
+    msg_nick(nick, sizeof nick, m, me, ch);
+    snprintf(line, sizeof line, "%s  %s", stamp, nick);
+    if (m->edited && !m->deleted) {
+        size_t l = strlen(line);
+        snprintf(line + l, sizeof line - l, " (edited)");
+    }
+    char *hdr = malloc(strlen(line) + 1);
+    if (hdr) { strcpy(hdr, line); rows_push(r, hdr, nick_color(m->author_id) | TB_BOLD); }
+    if (m->deleted) {                     /* tombstone: no body, no reactions */
+        char *d = malloc(sizeof "    [message deleted]");
+        if (d) { strcpy(d, "    [message deleted]"); rows_push(r, d, TB_DEFAULT); }
+        return;
+    }
+    wrap_push(r, m->body ? m->body : "", TB_DEFAULT, width, 4);
+    if (m->n_reactions) {
+        char rl[256]; size_t p = 0;
+        p += (size_t)snprintf(rl, sizeof rl, "    ");
+        for (uint8_t k = 0; k < m->n_reactions && p < sizeof rl - 1; k++) {
+            const oc_reaction *rx = &m->reactions[k];
+            int w = rx->mine
+                ? snprintf(rl + p, sizeof rl - p, "%s [%u]  ", rx->emoji, rx->count)
+                : snprintf(rl + p, sizeof rl - p, "%s %u  ", rx->emoji, rx->count);
+            if (w < 0 || (size_t)w >= sizeof rl - p) break;
+            p += (size_t)w;
+        }
+        char *rr = malloc(p + 1);
+        if (rr) { memcpy(rr, rl, p); rr[p] = '\0'; rows_push(r, rr, TB_MAGENTA); }
+    }
+    if (show_replies && m->reply_count > 0) {
+        char rl[64];
+        snprintf(rl, sizeof rl, "    \xe2\x86\xb3 %u %s", m->reply_count,
+                 m->reply_count == 1 ? "reply" : "replies");
+        char *rr = malloc(strlen(rl) + 1);
+        if (rr) { strcpy(rr, rl); rows_push(r, rr, TB_CYAN); }
+    }
+}
+
 /* Build the wrapped rows for a channel's messages (oldest→newest). */
 static void build_rows(rows_t *r, const oc_channel *ch, uint64_t me, int width) {
-    char line[256];
-    for (size_t i = 0; i < ch->n_msgs; i++) {
-        const oc_msg *m = &ch->msgs[i];
-        char stamp[8] = "--:--";
-        if (m->server_time) {
-            time_t t = (time_t)(m->server_time / 1000);
-            struct tm tmv;
-            if (localtime_r(&t, &tmv)) strftime(stamp, sizeof stamp, "%H:%M", &tmv);
+    for (size_t i = 0; i < ch->n_msgs; i++)
+        append_msg_rows(r, &ch->msgs[i], me, width, ch, 1);
+}
+
+/* Build the rows for the open thread: the parent (found in `ch`) then replies. */
+static void build_thread_rows(rows_t *r, const oc_model *m, const oc_channel *ch,
+                              uint64_t me, int width) {
+    if (ch) for (size_t i = 0; i < ch->n_msgs; i++)
+        if (ch->msgs[i].message_id == m->thread_parent) {
+            append_msg_rows(r, &ch->msgs[i], me, width, ch, 0);
+            break;
         }
-        /* Header row: "HH:MM  nick" in the author's color. Prefer the display
-         * name the daemon sends; fall back to "you" for self, else "user<id>". */
-        if (m->author_name[0])
-            snprintf(line, sizeof line, "%s  %s", stamp, m->author_name);
-        else if (m->author_id == me)
-            snprintf(line, sizeof line, "%s  you", stamp);
-        else
-            snprintf(line, sizeof line, "%s  user%llu", stamp, (unsigned long long)m->author_id);
-        if (m->edited && !m->deleted) {
-            size_t l = strlen(line);
-            snprintf(line + l, sizeof line - l, " (edited)");
-        }
-        char *hdr = malloc(strlen(line) + 1);
-        if (hdr) { strcpy(hdr, line); rows_push(r, hdr, nick_color(m->author_id) | TB_BOLD); }
-        if (m->deleted) {                     /* tombstone: no body, no reactions */
-            char *d = malloc(sizeof "    [message deleted]");
-            if (d) { strcpy(d, "    [message deleted]"); rows_push(r, d, TB_DEFAULT); }
-            continue;
-        }
-        /* Body rows, indented, default color. */
-        wrap_push(r, m->body ? m->body : "", TB_DEFAULT, width, 4);
-        /* Reaction line: "emoji count" per emoji, [n] if we reacted. */
-        if (m->n_reactions) {
-            char rl[256]; size_t p = 0;
-            p += (size_t)snprintf(rl, sizeof rl, "    ");
-            for (uint8_t k = 0; k < m->n_reactions && p < sizeof rl - 1; k++) {
-                const oc_reaction *rx = &m->reactions[k];
-                int w = rx->mine
-                    ? snprintf(rl + p, sizeof rl - p, "%s [%u]  ", rx->emoji, rx->count)
-                    : snprintf(rl + p, sizeof rl - p, "%s %u  ", rx->emoji, rx->count);
-                if (w < 0 || (size_t)w >= sizeof rl - p) break;
-                p += (size_t)w;
-            }
-            char *rr = malloc(p + 1);
-            if (rr) { memcpy(rr, rl, p); rr[p] = '\0'; rows_push(r, rr, TB_MAGENTA); }
-        }
-    }
+    for (size_t i = 0; i < m->n_thread_msgs; i++)
+        append_msg_rows(r, &m->thread_msgs[i], me, width, ch, 0);
 }
 
 /* ---- rendering ------------------------------------------------------------- */
@@ -211,19 +243,22 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     int pane_h = pane_bot - pane_top;
     if (pane_h < 1) pane_h = 1;
 
-    /* Title bar (row 0 over the pane). */
+    /* Title bar (row 0 over the pane) — a thread view overlays the channel. */
     const oc_channel *fc = (focus < m->n_channels) ? &m->channels[focus] : NULL;
     char title[160];
-    if (fc) snprintf(title, sizeof title, " #%s", fc->name ? fc->name : "…");
-    else    snprintf(title, sizeof title, " (no channel)");
+    if (m->thread_open) snprintf(title, sizeof title, " thread · #%s (/close to exit)",
+                                 fc && fc->name ? fc->name : "…");
+    else if (fc)        snprintf(title, sizeof title, " #%s", fc->name ? fc->name : "…");
+    else                snprintf(title, sizeof title, " (no channel)");
     fill_row(0, px0, W, TB_BLUE);
     draw_clip(px0, 0, pxmax, title, TB_WHITE | TB_BOLD, TB_BLUE);
 
-    /* Message rows for the focused channel, showing the window ending `scroll`
-     * rows above the bottom. */
-    if (fc) {
+    /* Message rows for the focused channel (or the open thread), showing the
+     * window ending `scroll` rows above the bottom. */
+    if (fc || m->thread_open) {
         rows_t rows = {0};
-        build_rows(&rows, fc, m->user_id, pxmax - px0);
+        if (m->thread_open) build_thread_rows(&rows, m, fc, m->user_id, pxmax - px0);
+        else                build_rows(&rows, fc, m->user_id, pxmax - px0);
         int total = (int)rows.n;
         int end = total - scroll;                /* one past the last visible row */
         if (end > total) end = total;
@@ -302,10 +337,14 @@ static const oc_msg *my_last_message(const oc_channel *ch, uint64_t me) {
  */
 static void handle_command(oc_client *cl, uint64_t cid, const char *line) {
     const oc_model *m = oc_client_model(cl);
+    if (strcmp(line, "/close") == 0) { oc_client_close_thread(cl); return; }
+
     const oc_channel *ch = focused_channel(m, cid);
     if (!ch || ch->n_msgs == 0) return;
 
-    if (strncmp(line, "/react ", 7) == 0) {
+    if (strcmp(line, "/thread") == 0) {       /* open the last message's thread */
+        oc_client_open_thread(cl, cid, ch->msgs[ch->n_msgs - 1].message_id);
+    } else if (strncmp(line, "/react ", 7) == 0) {
         const char *emoji = line + 7;
         while (*emoji == ' ') emoji++;
         if (!*emoji) return;
@@ -386,9 +425,11 @@ int main(int argc, char **argv) {
             running = 0;
         } else if (ev.key == TB_KEY_ENTER) {
             if (clen > 0 && focus < nch) {
-                uint64_t cid = oc_client_model(cl)->channels[focus].channel_id;
-                if (composer[0] == '/') handle_command(cl, cid, composer);
-                else                    oc_client_send(cl, cid, composer);
+                const oc_model *mm = oc_client_model(cl);
+                uint64_t cid = mm->channels[focus].channel_id;
+                if (composer[0] == '/')     handle_command(cl, cid, composer);
+                else if (mm->thread_open)   oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
+                else                        oc_client_send(cl, cid, composer);
                 clen = 0; composer[0] = '\0'; scroll = 0;
             }
         } else if (ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2) {

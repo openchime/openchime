@@ -17,8 +17,10 @@ void oc_model_init(oc_model *m) {
     memset(m, 0, sizeof *m);
 }
 
+static void msg_free(oc_msg *m) { free(m->body); free(m->reactions); }
+
 static void channel_free(oc_channel *c) {
-    for (size_t i = 0; i < c->n_msgs; i++) { free(c->msgs[i].body); free(c->msgs[i].reactions); }
+    for (size_t i = 0; i < c->n_msgs; i++) msg_free(&c->msgs[i]);
     free(c->msgs);
     free(c->name);
 }
@@ -59,7 +61,57 @@ void oc_model_free(oc_model *m) {
     free(m->channels);
     free(m->presence);
     free(m->typing);
+    for (size_t i = 0; i < m->n_thread_msgs; i++) msg_free(&m->thread_msgs[i]);
+    free(m->thread_msgs);
     memset(m, 0, sizeof *m);
+}
+
+void oc_model_close_thread(oc_model *m) {
+    for (size_t i = 0; i < m->n_thread_msgs; i++) msg_free(&m->thread_msgs[i]);
+    free(m->thread_msgs);
+    m->thread_msgs = NULL;
+    m->n_thread_msgs = m->cap_thread_msgs = 0;
+    m->thread_open = 0;
+    m->thread_parent = m->thread_channel = 0;
+}
+
+void oc_model_open_thread(oc_model *m, uint64_t channel_id, uint64_t parent_id) {
+    oc_model_close_thread(m);      /* drop any prior thread's replies */
+    m->thread_open = 1;
+    m->thread_channel = channel_id;
+    m->thread_parent = parent_id;
+}
+
+/* Append a thread reply, stealing ownership of `*body` (NULL on success). */
+static void thread_append(oc_model *m, uint64_t message_id, uint64_t author_id,
+                          uint64_t server_time, char **body) {
+    for (size_t i = 0; i < m->n_thread_msgs; i++)
+        if (m->thread_msgs[i].message_id == message_id) return;   /* dedup */
+    if (m->n_thread_msgs == m->cap_thread_msgs) {
+        size_t cap = m->cap_thread_msgs ? m->cap_thread_msgs * 2 : 16;
+        oc_msg *nm = realloc(m->thread_msgs, cap * sizeof *nm);
+        if (!nm) return;
+        m->thread_msgs = nm; m->cap_thread_msgs = cap;
+    }
+    oc_msg *msg = &m->thread_msgs[m->n_thread_msgs++];
+    memset(msg, 0, sizeof *msg);
+    msg->body = *body;
+    msg->author_id = author_id;
+    msg->message_id = message_id;
+    msg->server_time = server_time;
+    *body = NULL;
+}
+
+/* Raise a message's thread reply count, finding it in any channel (message ids
+ * are globally unique, and THREAD_META carries no channel_id). */
+static void bump_reply_count(oc_model *m, uint64_t message_id, uint32_t count) {
+    for (size_t ci = 0; ci < m->n_channels; ci++)
+        for (size_t i = 0; i < m->channels[ci].n_msgs; i++)
+            if (m->channels[ci].msgs[i].message_id == message_id) {
+                if (count > m->channels[ci].msgs[i].reply_count)
+                    m->channels[ci].msgs[i].reply_count = count;
+                return;
+            }
 }
 
 /* Record that `user_id` is typing in `channel_id` now, pruning stale marks. */
@@ -252,6 +304,14 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         }
         break;
     }
+    case OC_EV_THREAD_REPLY:
+        bump_reply_count(m, e->parent_id, e->count);   /* mark the parent in scroll */
+        if (m->thread_open && e->parent_id == m->thread_parent)
+            thread_append(m, e->message_id, e->author_id, e->server_time, &e->body);
+        break;
+    case OC_EV_THREAD_META:
+        bump_reply_count(m, e->message_id, e->count);
+        break;
     case OC_EV_DISCONNECTED:
         m->connected = false;
         m->authed = false;

@@ -217,6 +217,23 @@ int run_client_core_tests(void) {
         oc_client_react(b, 1, mid, ":+1:", 0);
         CHECK(WAIT_FOR(a, reaction_count(m, 1, mid, ":+1:", NULL) == 0));
 
+        /* erik replies to dana's message in a thread: both see the parent's reply
+         * count rise, and opening the thread streams the reply into the buffer. */
+        oc_client_reply(b, 1, mid, "a threaded reply");
+        CHECK(WAIT_FOR(a, find_msg(m, 1, mid) && find_msg(m, 1, mid)->reply_count == 1));
+        oc_client_open_thread(b, 1, mid);
+        CHECK(WAIT_FOR(b, m->thread_open && m->n_thread_msgs >= 1));
+        {
+            const oc_model *bm = oc_client_model(b);
+            int found = 0;
+            for (size_t j = 0; j < bm->n_thread_msgs; j++)
+                if (bm->thread_msgs[j].body && strcmp(bm->thread_msgs[j].body, "a threaded reply") == 0)
+                    found = 1;
+            CHECK(found);
+        }
+        oc_client_close_thread(b);
+        CHECK(!oc_client_model(b)->thread_open && oc_client_model(b)->n_thread_msgs == 0);
+
         /* Marking channel 1 read clears erik's unread. */
         oc_client_mark_read(b, 1);
         oc_client_tick(b);

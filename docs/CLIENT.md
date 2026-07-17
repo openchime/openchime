@@ -108,10 +108,12 @@ model; translate input to intents }, stop.
   `[n]` "you reacted" marker, `/react <emoji>` toggling on the last message —
   exercising the exact wide-char/emoji correctness that justified the toolkit),
   **edit/delete** (`/edit`, `/delete`, an `(edited)` marker + `[message deleted]`
-  tombstone), and **typing indicators** (throttled `TYPING` while composing,
-  `✎ X is typing…` on the status line). The remaining engine features are
-  client-only surfacing work: threads, search, channel/DM management, presence
-  display, member roster, and attachment transfer.
+  tombstone), **typing indicators** (throttled `TYPING` while composing,
+  `✎ X is typing…` on the status line), and **threads** (`/thread` opens a
+  message's thread in place of the channel — Enter then posts a reply — with a
+  `↳ N replies` marker on the parent in the main scroll, `/close` to exit). The
+  remaining engine features are client-only surfacing work: search, channel/DM
+  management, presence display, member roster, and attachment transfer.
 - **Windows (later):** Win32/WinUI (C++/WinRT or C#) over the C core.
 - **macOS/iOS (later):** AppKit/UIKit (Swift) over the core.
 - **Android (later):** Android views (Kotlin) over the core.
@@ -163,10 +165,10 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
   backfill on open, send, display names, unread, scrollback) plus **reactions**
   (`/react`), **edit/delete** (`/edit`, `/delete`, `(edited)` marker + `[message
   deleted]` tombstone), and **typing indicators** (`✎ X is typing…`) are done.
-  Remaining TUI increments surface engine features already on the wire: threads,
-  search, channel/DM management, presence display + set-away, member roster,
-  attachment transfer, who-reacted, notification prefs/DND, admin, webhook
-  management, logout.
+  Remaining TUI increments surface engine features already on the wire: search,
+  channel/DM management, presence display + set-away, member roster, attachment
+  transfer, who-reacted, notification prefs/DND, admin, webhook management,
+  logout. (Threads shipped: `/thread`, in-thread reply, `↳ N replies` markers.)
 - **Next:** store + reconnect/offline; auth completeness (local + OIDC);
   attachments (chunked up/download) and the **audio client** (Opus encode/decode
   + UDP to the sidecar — the deferred half of REQ-150/151).

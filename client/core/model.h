@@ -27,6 +27,7 @@ typedef struct {
     uint8_t      n_reactions, cap_reactions;
     uint8_t      edited;      /* body was edited (REQ-051) */
     uint8_t      deleted;     /* tombstoned (REQ-052) */
+    uint32_t     reply_count; /* thread replies to this message (REQ-060) */
 } oc_msg;
 
 typedef struct {
@@ -56,6 +57,13 @@ typedef struct {
     size_t           n_presence, cap_presence;
     oc_typing_row   *typing;
     size_t           n_typing, cap_typing;
+    /* The open thread (REQ-060): the parent's channel + id, and its replies. A
+     * frontend opens a thread, gets replies streamed in, and renders parent +
+     * replies in place of the channel; thread_open is 0 when no thread is open. */
+    uint8_t   thread_open;
+    uint64_t  thread_channel, thread_parent;
+    oc_msg   *thread_msgs;
+    size_t    n_thread_msgs, cap_thread_msgs;
     char     status[160];             /* last status / error line */
 } oc_model;
 
@@ -70,6 +78,10 @@ void oc_model_apply(oc_model *m, oc_ev *e);
 oc_channel *oc_model_channel(oc_model *m, uint64_t channel_id);
 /* Clear a channel's unread count and advance its read marker to high_water. */
 void oc_model_mark_read(oc_model *m, uint64_t channel_id);
+
+/* Begin/end viewing a thread. open clears any previously-loaded replies. */
+void oc_model_open_thread(oc_model *m, uint64_t channel_id, uint64_t parent_id);
+void oc_model_close_thread(oc_model *m);
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);
 

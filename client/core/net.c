@@ -199,6 +199,28 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                 oc_ev *e = oc_ev_new(OC_EV_DELETE);
                 if (e) { e->channel_id = md.channel_id; e->message_id = md.message_id; oc_queue_push(to_ui, e); }
             }
+        } else if (hdr.msg_type == OC_MSG_THREAD_REPLY) {
+            oc_thread_reply tr;
+            if (oc_decode_thread_reply(&p, &tr) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_THREAD_REPLY);
+                if (e) {
+                    e->channel_id = tr.channel_id;
+                    e->parent_id = tr.parent_id;
+                    e->message_id = tr.message_id;
+                    e->author_id = tr.author_id;
+                    e->server_time = tr.server_time;
+                    e->count = tr.reply_count;
+                    e->body = malloc(tr.body.len + 1);
+                    if (e->body) { memcpy(e->body, tr.body.ptr, tr.body.len); e->body[tr.body.len] = '\0'; }
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_THREAD_META) {
+            oc_thread_meta tm;
+            if (oc_decode_thread_meta(&p, &tm) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_THREAD_META);
+                if (e) { e->message_id = tm.message_id; e->count = tm.reply_count; oc_queue_push(to_ui, e); }
+            }
         } else if (hdr.msg_type == OC_MSG_ERROR) {
             oc_error err;
             if (oc_decode_error(&p, &err) == OC_OK) {
@@ -333,6 +355,22 @@ static void *net_thread(void *arg) {
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_typing ty = { c->channel_id };
                 if (oc_encode_typing(&w, OC_PROTOCOL_VERSION, &ty) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_OPEN_THREAD) {
+                uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_list_thread lt = { c->channel_id, c->message_id };
+                if (oc_encode_list_thread(&w, OC_PROTOCOL_VERSION, &lt) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_REPLY && c->body) {
+                uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_send_reply sr = {0};
+                sr.channel_id = c->channel_id;
+                gen_idem(sr.idem);
+                sr.parent_id = c->message_id;
+                sr.body = oc_slice_str(c->body);
+                if (oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &sr) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             oc_cmd_free(c);

@@ -52,6 +52,12 @@ void oc_client_delete(oc_client *c, uint64_t channel_id, uint64_t message_id);
  * the user composes; the server relays a TYPING_UPDATE to other members. */
 void oc_client_typing(oc_client *c, uint64_t channel_id);
 
+/* Open a thread on `parent_id` (requests its replies), post a reply to it, or
+ * close the thread view. Replies stream into the model's thread buffer. */
+void oc_client_open_thread(oc_client *c, uint64_t channel_id, uint64_t parent_id);
+void oc_client_reply(oc_client *c, uint64_t channel_id, uint64_t parent_id, const char *body);
+void oc_client_close_thread(oc_client *c);
+
 /* Stop the network thread, drain remaining events, and free everything. */
 void oc_client_stop(oc_client *c);
 

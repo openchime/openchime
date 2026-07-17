@@ -20,6 +20,8 @@ enum {
     OC_EV_EDIT,            /* a MSG_EDITED: channel/message + new body */
     OC_EV_DELETE,          /* a MSG_DELETED: channel/message tombstone */
     OC_EV_TYPING,          /* a TYPING_UPDATE: user_id is typing in channel_id */
+    OC_EV_THREAD_REPLY,    /* a THREAD_REPLY: parent_id/message + body + count */
+    OC_EV_THREAD_META,     /* a THREAD_META: message_id + reply count (backfill) */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
     OC_EV_ERROR            /* protocol/transport error; body = human message */
 };
@@ -30,6 +32,7 @@ typedef struct {
     uint64_t channel_id;
     uint64_t author_id;
     uint64_t message_id;
+    uint64_t parent_id;    /* THREAD_REPLY: the parent message this replies to */
     uint64_t server_time;
     uint8_t  status;       /* PRESENCE: online/away/offline; CHANNEL: joined flag */
     uint8_t  op;           /* REACTION: add/remove */
@@ -50,6 +53,8 @@ enum {
     OC_CMD_EDIT,           /* edit `message_id` in `channel_id`: body=new text */
     OC_CMD_DELETE,         /* delete `message_id` in `channel_id` */
     OC_CMD_TYPING,         /* signal "I am typing" in `channel_id` */
+    OC_CMD_OPEN_THREAD,    /* request a thread's replies: `message_id` = parent */
+    OC_CMD_REPLY,          /* reply in a thread: `message_id` = parent, body=text */
     OC_CMD_QUIT
 };
 
