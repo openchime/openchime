@@ -69,8 +69,8 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 092 in-channel order = accept order | ✅ | Ascending, tenant-monotonic `message_id`. |
 | 093 idempotent retry | ✅ | Persisted `(channel, token) → id`. |
 | 094 RPO 15s (Litestream) | ✅ | Replication to object storage + restore-on-boot (compose). |
-| 100 auto-reconnect w/o re-auth | ✅ / 🔵 | Daemon accepts `session`-token reconnect; robust client auto-reconnect is partial. |
-| 101 backfill on reconnect | ✅ | Per-channel cursors → replayed messages + `BACKFILL_DONE` (+ `THREAD_META`). |
+| 100 auto-reconnect w/o re-auth | ✅ | Daemon accepts `session`-token reconnect; **the client net thread now auto-reconnects** — captures the AUTH_OK token, silently re-auths with `OC_AUTH_SESSION` (no password) under backoff on a drop, preserving the in-memory model. Headless-tested by bouncing the daemon. Cross-restart (persisted token) waits on the store. |
+| 101 backfill on reconnect | ✅ | Per-channel cursors → replayed messages + `BACKFILL_DONE` (+ `THREAD_META`). **The client drives it on reconnect**, backfilling each channel from its last-seen id (net-thread high-water); replays dedup on the model mark. |
 | 102 offline outbox | 🔵 ⛔ | Client SQLite store not built. |
 | 110 reject unsupported version pre-parse | ✅ | |
 | 111 VERSION_TOO_OLD/NEW reason codes | ✅ | |

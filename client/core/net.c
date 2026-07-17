@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 struct oc_net {
     pthread_t     thread;
@@ -131,12 +132,35 @@ typedef struct {
     char     name[128];   /* filename (upload src basename / download dest label) */
 } oc_xfer;
 
+/* Per-channel high-water the net thread tracks (from every BROADCAST) so a
+ * reconnect can BACKFILL_REQUEST from where each channel left off (REQ-101). It
+ * persists across reconnects; the model dedups replays by its own high-water. */
+typedef struct { uint64_t channel_id, high_water; } oc_hwrow;
+typedef struct { oc_hwrow *v; size_t n, cap; } oc_hwtab;
+
+static void hwtab_note(oc_hwtab *t, uint64_t channel_id, uint64_t message_id) {
+    for (size_t i = 0; i < t->n; i++)
+        if (t->v[i].channel_id == channel_id) {
+            if (message_id > t->v[i].high_water) t->v[i].high_water = message_id;
+            return;
+        }
+    if (t->n == t->cap) {
+        size_t cap = t->cap ? t->cap * 2 : 16;
+        oc_hwrow *nv = realloc(t->v, cap * sizeof *nv);
+        if (!nv) return;
+        t->v = nv; t->cap = cap;
+    }
+    t->v[t->n].channel_id = channel_id; t->v[t->n].high_water = message_id; t->n++;
+}
+static void hwtab_free(oc_hwtab *t) { free(t->v); t->v = NULL; t->n = t->cap = 0; }
+
 typedef struct {
     oc_queue    *to_ui;
     oc_tls_conn *conn;
     int          fd;
     volatile int *stop;
     oc_xfer     *xfer;
+    oc_hwtab    *hw;
 } disp_ctx;
 
 /* Push a transfer notice (phase: 0 progress, 1 done, 2 error) to the UI. */
@@ -233,6 +257,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 /* Trailing attachment metadata (REQ-140): fold each onto the message. */
                 push_attachments(to_ui, b.channel_id, b.message_id, b.attach, b.n_attach);
             }
+            if (ctx && ctx->hw) hwtab_note(ctx->hw, b.channel_id, b.message_id);
         } else if (hdr.msg_type == OC_MSG_CHANNEL_LIST) {
             oc_channel_list_entry ents[256]; uint16_t count = 0;
             if (oc_decode_channel_list(&p, ents, 256, &count) != OC_OK) return -1;
@@ -523,11 +548,23 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
 
 /* ---- the thread ---- */
 
-static void *net_thread(void *arg) {
-    oc_net *n = (oc_net *)arg;
+enum { RC_STOP = 0, RC_LOST = 1, RC_FATAL = 2 };
+
+/* One connection lifecycle: dial → TLS → handshake → auth → serve, then clean up.
+ * `reconnecting` selects session-token auth (OC_AUTH_SESSION) over password; the
+ * AUTH_OK session token is captured into `sess`/`*have_sess` (kept across
+ * reconnects — the daemon issues no new token on reconnect). Returns RC_STOP
+ * (graceful quit/logout), RC_LOST (dropped — a session reconnect may follow), or
+ * RC_FATAL (version/auth reject — do not retry). `*served` is set once the serve
+ * loop is entered, so the caller can shorten the backoff after a live session. */
+static int run_connection(oc_net *n, int reconnecting,
+                          uint8_t sess[OC_SESSION_TOKEN_LEN], int *have_sess,
+                          oc_hwtab *hw, int *served) {
+    int rc = RC_LOST;
+    *served = 0;
 
     int fd = dial(n->host, n->port);
-    if (fd < 0) { push_err(n->to_ui, "could not connect"); push_simple(n->to_ui, OC_EV_DISCONNECTED, 0); return NULL; }
+    if (fd < 0) return RC_LOST;
 
     oc_tls_client cli;
     oc_tls_conn conn;
@@ -537,7 +574,7 @@ static void *net_thread(void *arg) {
      * process (the headless test) set up TLS concurrently; that is safe because
      * the vendored mbedTLS is built with MBEDTLS_THREADING (scripts/build_mbedtls.sh). */
     if (oc_tls_client_init(&cli, NULL) != 0 || oc_tls_conn_init(&conn, &cli.conf, fd) != 0) {
-        oc_closesock(fd); push_err(n->to_ui, "tls init failed"); push_simple(n->to_ui, OC_EV_DISCONNECTED, 0); return NULL;
+        oc_closesock(fd); return RC_LOST;
     }
     oc_framebuf_init(&fb);
     /* Attachment transfer state, valid from here to `drop:` (which may reset it). */
@@ -552,7 +589,7 @@ static void *net_thread(void *arg) {
         if (oc_encode_hello(&w, &h) != OC_OK || write_all(&conn, fd, buf, w.len, &n->stop) != 0) goto drop;
         oc_header hdr; oc_rbuf p;
         if (read_one(&conn, fd, &fb, &hdr, &p, &n->stop) != 0) goto drop;
-        if (hdr.msg_type == OC_MSG_REJECT) { push_err(n->to_ui, "version rejected"); goto drop; }
+        if (hdr.msg_type == OC_MSG_REJECT) { push_err(n->to_ui, "version rejected"); rc = RC_FATAL; goto drop; }
         if (hdr.msg_type != OC_MSG_WELCOME) goto drop;
     }
 
@@ -567,26 +604,42 @@ static void *net_thread(void *arg) {
         if (oc_decode_auth_challenge(&p, &ch) != OC_OK) goto drop;
     }
 
-    /* Local AUTH -> AUTH_OK. `token` carries "username:password" for now; the
-     * real login UI (plus OIDC and session reconnect) arrives in a later client
-     * phase. The session token in AUTH_OK is ignored until the store phase. */
+    /* AUTH -> AUTH_OK. A reconnect re-auths silently with the stored session
+     * token (OC_AUTH_SESSION, ARCH-58); the first connect uses "user:password"
+     * (`n->token`). The AUTH_OK session token is captured so a later drop can
+     * reconnect without the password. */
     {
-        const char *cred = n->token ? n->token : "";
-        const char *sep = strchr(cred, ':');
-        oc_slice user = sep ? (oc_slice){ (const uint8_t *)cred, (size_t)(sep - cred) }
-                            : oc_slice_str(cred);
-        oc_slice pass = sep ? oc_slice_str(sep + 1) : (oc_slice){ (const uint8_t *)"", 0 };
-        uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
-        if (oc_encode_local_credential(&cw, user, pass) != OC_OK) goto drop;
-
         uint8_t buf[1024]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-        oc_auth a = { OC_AUTH_LOCAL, { cbuf, cw.len } };
-        if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a) != OC_OK || write_all(&conn, fd, buf, w.len, &n->stop) != 0) goto drop;
+        oc_result er;
+        if (reconnecting && *have_sess) {
+            oc_auth a = { OC_AUTH_SESSION, { sess, OC_SESSION_TOKEN_LEN } };
+            er = oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a);
+        } else {
+            const char *cred = n->token ? n->token : "";
+            const char *sep = strchr(cred, ':');
+            oc_slice user = sep ? (oc_slice){ (const uint8_t *)cred, (size_t)(sep - cred) }
+                                : oc_slice_str(cred);
+            oc_slice pass = sep ? oc_slice_str(sep + 1) : (oc_slice){ (const uint8_t *)"", 0 };
+            uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+            if (oc_encode_local_credential(&cw, user, pass) != OC_OK) goto drop;
+            oc_auth a = { OC_AUTH_LOCAL, { cbuf, cw.len } };
+            er = oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a);
+        }
+        if (er != OC_OK || write_all(&conn, fd, buf, w.len, &n->stop) != 0) goto drop;
         oc_header hdr; oc_rbuf p;
         if (read_one(&conn, fd, &fb, &hdr, &p, &n->stop) != 0) goto drop;
-        if (hdr.msg_type != OC_MSG_AUTH_OK) { push_err(n->to_ui, "auth failed"); goto drop; }
+        if (hdr.msg_type != OC_MSG_AUTH_OK) {
+            /* Bad password, or an expired/revoked session on reconnect — either
+             * way there is nothing to silently retry. */
+            push_err(n->to_ui, reconnecting ? "session expired — please log in again" : "auth failed");
+            rc = RC_FATAL; goto drop;
+        }
         oc_auth_ok ok;
         oc_decode_auth_ok(&p, &ok);
+        if (ok.session_token.len == OC_SESSION_TOKEN_LEN) {   /* fresh token (first auth) */
+            memcpy(sess, ok.session_token.ptr, OC_SESSION_TOKEN_LEN);
+            *have_sess = 1;
+        }
         push_simple(n->to_ui, OC_EV_CONNECTED, ok.user_id);
         push_simple(n->to_ui, OC_EV_AUTH_OK, ok.user_id);
 
@@ -598,15 +651,34 @@ static void *net_thread(void *arg) {
         oc_wbuf_init(&lw, lb, sizeof lb);
         if (oc_encode_list_users(&lw, OC_PROTOCOL_VERSION) == OC_OK)
             (void)write_all(&conn, fd, lb, lw.len, &n->stop);
+
+        /* On a reconnect, recover anything missed while offline: backfill each
+         * known channel from its last-seen message id (REQ-101). Replays dedup on
+         * the model's high-water mark. */
+        if (reconnecting && hw->n > 0) {
+            oc_cursor *curs = malloc(hw->n * sizeof *curs);
+            if (curs) {
+                for (size_t i = 0; i < hw->n; i++) {
+                    curs[i].channel_id = hw->v[i].channel_id;
+                    curs[i].after_message_id = hw->v[i].high_water;
+                }
+                uint8_t bb[OC_MAX_FRAME_SIZE]; oc_wbuf bw; oc_wbuf_init(&bw, bb, sizeof bb);
+                oc_backfill_request req = { (uint16_t)(hw->n > 0xFFFF ? 0xFFFF : hw->n), curs };
+                if (oc_encode_backfill_request(&bw, OC_PROTOCOL_VERSION, &req) == OC_OK)
+                    (void)write_all(&conn, fd, bb, bw.len, &n->stop);
+                free(curs);
+            }
+        }
     }
 
     /* Serve: interleave reading server frames with sending queued user actions.
      * An in-flight attachment transfer (upload/download) is driven by both. */
-    disp_ctx ctx = { n->to_ui, &conn, fd, &n->stop, &xfer };
+    *served = 1;
+    disp_ctx ctx = { n->to_ui, &conn, fd, &n->stop, &xfer, hw };
     while (!n->stop) {
         oc_cmd *c;
         while ((c = oc_queue_try_pop(n->from_ui)) != NULL) {
-            if (c->type == OC_CMD_QUIT) { oc_cmd_free(c); goto drop; }
+            if (c->type == OC_CMD_QUIT) { oc_cmd_free(c); rc = RC_STOP; goto drop; }
             if (c->type == OC_CMD_BACKFILL) {
                 /* Replay history for one channel from the start (no local store
                  * yet, so the cursor is 0). Replies arrive as BROADCASTs that
@@ -828,8 +900,10 @@ static void *net_thread(void *arg) {
                 oc_logout lo = { c->op, { NULL, 0 } };   /* op = scope; empty token = this session */
                 if (oc_encode_logout(&w, OC_PROTOCOL_VERSION, &lo) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
-                /* The daemon revokes + closes; treat it as a graceful stop. */
+                /* The daemon revokes + closes; treat it as a graceful stop (and
+                 * do not session-reconnect — the session is now dead). */
                 oc_cmd_free(c);
+                rc = RC_STOP;
                 goto drop;
             }
             oc_cmd_free(c);
@@ -848,11 +922,42 @@ static void *net_thread(void *arg) {
 
 drop:
     xfer_reset(&xfer);   /* close any half-done transfer file */
-    push_simple(n->to_ui, OC_EV_DISCONNECTED, 0);
     oc_framebuf_free(&fb);
     oc_tls_conn_free(&conn);
     oc_tls_client_free(&cli);
     oc_closesock(fd);
+    return rc;
+}
+
+/* The net thread: run one connection after another, silently reconnecting with
+ * the session token after an unexpected drop (REQ-100). The model is preserved
+ * across reconnects (dedup on high-water), so a blip is invisible beyond a brief
+ * status line. Gives up on a graceful stop, a fatal reject, or before ever
+ * authenticating (no session token to reconnect with). */
+static void *net_thread(void *arg) {
+    oc_net *n = (oc_net *)arg;
+    oc_hwtab hw; memset(&hw, 0, sizeof hw);
+    uint8_t sess[OC_SESSION_TOKEN_LEN];
+    int have_sess = 0, reconnecting = 0, backoff_ms = 0;
+
+    while (!n->stop) {
+        int served = 0;
+        int rc = run_connection(n, reconnecting, sess, &have_sess, &hw, &served);
+        push_simple(n->to_ui, OC_EV_DISCONNECTED, 0);   /* this connection ended */
+        if (rc == RC_STOP || rc == RC_FATAL || n->stop || !have_sess) break;
+        /* Connection lost mid-session: back off, then reconnect with the token.
+         * A connection that actually served resets the backoff so the first
+         * retry is prompt; repeated connect/auth failures grow it. */
+        backoff_ms = served ? 500 : (backoff_ms ? (backoff_ms < 4000 ? backoff_ms * 2 : 4000) : 500);
+        push_err(n->to_ui, "connection lost — reconnecting…");
+        for (int s = 0; s < backoff_ms && !n->stop; s += 50) {
+            struct timespec ts = { 0, 50 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+        }
+        reconnecting = 1;
+    }
+
+    hwtab_free(&hw);
     return NULL;
 }
 

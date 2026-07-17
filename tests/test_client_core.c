@@ -205,7 +205,7 @@ static int file_matches(const char *path, const unsigned char *data, size_t len)
 }
 
 int run_client_core_tests(void) {
-    printf("test_client_core: connect+auth, channel-list, send round-trip, unread, backfill\n");
+    printf("test_client_core: connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, session reconnect\n");
 
     /* The daemon opens its blob store at netloop startup; point it at a build-local
      * dir (the /data/blobs default isn't writable in the test sandbox), matching
@@ -480,6 +480,37 @@ int run_client_core_tests(void) {
 
         oc_client_stop(a);
         oc_client_stop(b);
+
+        /* auto-reconnect with the session token (REQ-100/101). A fresh client
+         * authenticates (capturing a session token), sends a message, then the
+         * daemon's netloop is torn down and restarted on the same port (same DB,
+         * so the session survives). The client silently re-authenticates with the
+         * stored token — no password — its in-memory history is preserved, and it
+         * can send again on the recovered session. */
+        oc_client *rc = oc_client_start("127.0.0.1", arg.port, "faye:pw-faye");
+        CHECK(rc != NULL);
+        if (rc) {
+            CHECK(WAIT_FOR(rc, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+            oc_client_send(rc, 1, "before the restart");
+            CHECK(WAIT_FOR(rc, channel_has_body(m, 1, "before the restart")));
+
+            /* Bounce the daemon: the client's connection drops and it begins
+             * reconnecting with backoff while the listener is down. */
+            arg.stop = 1;
+            pthread_join(th, NULL);
+            arg.stop = 0;
+            CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
+            wait_port_ready(arg.port);
+
+            /* It comes back authenticated (session-token reconnect), with its
+             * pre-restart history intact, and a new send round-trips. */
+            CHECK(WAIT_FOR(rc, m->connected && m->authed));
+            CHECK(channel_has_body(oc_client_model(rc), 1, "before the restart"));
+            oc_client_send(rc, 1, "after the restart");
+            CHECK(WAIT_FOR(rc, channel_has_body(m, 1, "after the restart")));
+
+            oc_client_stop(rc);
+        }
     } else {
         if (a) oc_client_stop(a);
         if (b) oc_client_stop(b);

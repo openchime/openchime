@@ -176,15 +176,27 @@ on reconnect with their idempotency tokens — the concrete answer to REQ-102), 
 session token (ARCH-58), per-instance TOFU pins, and config. Platform config dir;
 keychains are noted future hardening. The core is in-memory until this lands.
 
-## 6. Auth + reconnect/offline (later)
+## 6. Auth + reconnect/offline
 
-Auth UX (ARCH-19): a **local** username+password form; **OIDC** via the system
+**In-session auto-reconnect is built (REQ-100/101).** The net thread runs one
+connection after another in a loop: it captures the `session_token` from
+`AUTH_OK`, and on an unexpected drop it silently re-authenticates with that token
+(`OC_AUTH_SESSION` — no password) under exponential backoff, then
+`BACKFILL_REQUEST`s each known channel from its last-seen message id to recover
+anything missed while offline. The in-memory model is preserved across the blip
+(replays dedup on the high-water mark), so a reconnect is invisible beyond a
+brief status line. A graceful `/logout` or a fatal reject (bad version, expired
+session) ends the loop instead of retrying. The net thread tracks its own
+per-channel high-water for the reconnect cursors; a headless test bounces the
+daemon and asserts the client re-auths, keeps its history, and can send again.
+
+**Still to build:** persisting the session token + TOFU pin across process
+restarts (needs the §5 store), the offline outbox (REQ-102), and the fuller auth
+UX (ARCH-19) — a **local** username+password form; **OIDC** via the system
 browser to central's authorize URL with a loopback `127.0.0.1` redirect catching
-the ES256 JWT (`ASWebAuthenticationSession` on iOS/macOS); **session** silent
-reconnect with the stored token. Instance+email → DNS resolution (SRV port >
-`.well-known` > 443), failures surfaced distinctly (REQ-010/011). Reconnect
-(REQ-100/101/102): the net thread auto-reconnects with the session token,
-`BACKFILL_REQUEST`s per-channel cursors, and flushes the outbox.
+the ES256 JWT (`ASWebAuthenticationSession` on iOS/macOS); and instance+email →
+DNS resolution (SRV port > `.well-known` > 443), failures surfaced distinctly
+(REQ-010/011).
 
 ## 7. Build
 
