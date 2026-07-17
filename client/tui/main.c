@@ -14,7 +14,7 @@
  *       then Enter posts a reply) · /search <query> · /close (leave a
  *       thread/search/roster overlay) · /create <name> · /join <name> · /leave ·
  *       /who (member roster + presence) · /away · /online · /dm <name> (open a
- *       direct message).
+ *       direct message) · /logout (revoke this session and quit).
  */
 
 #define TB_IMPL
@@ -496,13 +496,15 @@ int main(int argc, char **argv) {
     int scroll = 0;
     uint64_t last_focus_cid = 0;
     time_t last_typing = 0;                   /* throttle outbound TYPING signals */
-    int running = 1;
+    int running = 1, logging_out = 0;
 
     while (running) {
         oc_client_tick(cl);
 
         const oc_model *m = oc_client_model(cl);
         if (focus >= m->n_channels) focus = m->n_channels ? m->n_channels - 1 : 0;
+        /* After /logout, quit once the server has closed the connection. */
+        if (logging_out && !m->connected) running = 0;
 
         /* Lazy backfill + keep the focused channel marked read. */
         if (focus < m->n_channels) {
@@ -527,7 +529,8 @@ int main(int argc, char **argv) {
             if (clen > 0 && focus < nch) {
                 const oc_model *mm = oc_client_model(cl);
                 uint64_t cid = mm->channels[focus].channel_id;
-                if (composer[0] == '/')                       handle_command(cl, cid, composer);
+                if (strcmp(composer, "/logout") == 0)         { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
+                else if (composer[0] == '/')                  handle_command(cl, cid, composer);
                 else if (mm->search_open || mm->roster_open)  { /* read-only overlay: ignore */ }
                 else if (mm->thread_open)                     oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
                 else                                          oc_client_send(cl, cid, composer);

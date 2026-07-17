@@ -312,6 +312,10 @@ int run_client_core_tests(void) {
             /* Backfilled history carries the author's display name too (the JOIN
              * fallback in the replay query). */
             CHECK(channel_has_named(oc_client_model(c), 1, "second line for history", "dana"));
+            /* faye logs out: the server revokes her session and closes the
+             * connection, so the model reports disconnected. */
+            oc_client_logout(c, OC_LOGOUT_THIS);
+            CHECK(WAIT_FOR(c, !m->connected));
             oc_client_stop(c);
         }
 

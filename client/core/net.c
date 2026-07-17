@@ -463,6 +463,15 @@ static void *net_thread(void *arg) {
                 if (oc_encode_open_dm(&w, OC_PROTOCOL_VERSION, &od) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_LOGOUT) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_logout lo = { c->op, { NULL, 0 } };   /* op = scope; empty token = this session */
+                if (oc_encode_logout(&w, OC_PROTOCOL_VERSION, &lo) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+                /* The daemon revokes + closes; treat it as a graceful stop. */
+                oc_cmd_free(c);
+                goto drop;
+            }
             oc_cmd_free(c);
         }
 

@@ -208,6 +208,14 @@ void oc_client_open_dm(oc_client *c, uint64_t user_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_logout(oc_client *c, uint8_t scope) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LOGOUT);
+    if (!cmd) return;
+    cmd->op = scope;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_stop(oc_client *c) {
     if (!c) return;
     oc_net_stop(c->net);   /* signals QUIT, joins the thread */

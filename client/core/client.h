@@ -81,6 +81,10 @@ void oc_client_toggle_roster(oc_client *c, int open);
  * that carries the peer, so the DM titles itself from the roster. */
 void oc_client_open_dm(oc_client *c, uint64_t user_id);
 
+/* Log out: revoke this session (scope OC_LOGOUT_THIS) or all of the user's
+ * (OC_LOGOUT_ALL); the server closes the connection. */
+void oc_client_logout(oc_client *c, uint8_t scope);
+
 /* Stop the network thread, drain remaining events, and free everything. */
 void oc_client_stop(oc_client *c);
 

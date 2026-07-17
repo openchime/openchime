@@ -65,6 +65,7 @@ enum {
     OC_CMD_LIST_USERS,      /* request the tenant roster */
     OC_CMD_SET_PRESENCE,    /* set own presence: op = OC_PRESENCE_ONLINE / _AWAY */
     OC_CMD_OPEN_DM,         /* open/get a 1:1 DM with `channel_id` (reused as target user id) */
+    OC_CMD_LOGOUT,          /* revoke this session (op = scope) and close the connection */
     OC_CMD_QUIT
 };
 
