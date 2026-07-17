@@ -52,7 +52,11 @@ by `make test` (`tests/test_client_core.c`). A standalone compile check:
 make core
 ```
 
-The first frontend is a **TUI**, built on the host like the daemon; native GUIs
+The first frontend is a **TUI** (`make tui`, termbox2 + utf8proc), built on the
+host like the daemon. It covers live messaging with history backfill, reactions,
+edit/delete, typing, threads, search, channel + DM management, roster + presence,
+who-reacted, notification prefs + DND, admin (roles/invite/remove), and logout;
+only attachments and webhook management remain to surface. Native GUIs
 (Windows/macOS), a web DOM UI, and mobile follow.
 
 ## Local Docker environment

@@ -99,36 +99,48 @@ model; translate input to intents }, stop.
   `oc_client` events each iteration and polling input with a short timeout
   (`tb_peek_event`, the "read events at frame start" shape); a wakeup fd on the
   client queue is a later optimization if idle cost ever matters. **Layout** is
-  regions (sidebar / message pane / status+composer / overlays for thread &
-  search) drawn cell-by-cell, re-laid-out on the resize event; the message pane
+  regions — sidebar, message pane, status+composer, and read-only overlays
+  (thread, search, roster, who-reacted, notification prefs) shown in place of the
+  message pane — drawn cell-by-cell, re-laid-out on the resize event; the pane
   renders its visible window each frame, measuring glyph width with utf8proc.
   **Build order:** the lean core loop landed first (sidebar, focus/switch, history
   backfill on open, live messages + display names, send, unread, scrollback,
-  reflow, per-nick colors), then **reactions display** (emoji aggregates with a
-  `[n]` "you reacted" marker, `/react <emoji>` toggling on the last message —
-  exercising the exact wide-char/emoji correctness that justified the toolkit),
-  **edit/delete** (`/edit`, `/delete`, an `(edited)` marker + `[message deleted]`
-  tombstone), **typing indicators** (throttled `TYPING` while composing,
-  `✎ X is typing…` on the status line), and **threads** (`/thread` opens a
-  message's thread in place of the channel — Enter then posts a reply — with a
-  `↳ N replies` marker on the parent in the main scroll, `/close` to exit), and **search** (`/search <query>` shows a results overlay of
-  matching messages — channel, author, snippet). **channel management** (`/create`, `/join`, `/leave`,
-  `/list`; non-joined public channels show dimmed with a `+`), and a **member
-  roster + presence** (`/who` overlays the tenant roster with online/away/offline
-  dots + roles; `/away` and `/online` set your own presence). and **direct messages** (`/dm <name>`
-  opens a 1:1 DM, titled `@peer` in the sidebar; the daemon reports the DM peer
-  in CHANNEL_INFO — a small protocol addition), **logout** (`/logout` revokes
-  this session server-side and quits once the connection drops),
-  **who-reacted** (`/reactions` overlays the full reactor list of the last
-  message — each reactor paired with the emoji they used, REQ-071), and
-  **notification prefs** (`/prefs` overlays the DND window + per-channel levels;
-  `/notify all|mentions|none` sets the focused channel; `/dnd HH:MM HH:MM | off`
-  the do-not-disturb window — REQ-130/131, each SET returns a full sync), and
-  **admin / user management** (`/role <name> owner|admin|member`, `/invite
-  [admin|member]` mints a tenant token shown once in the roster, `/remove <name>`
-  disables a user — REQ-030/033, owner/admin only; a USER_UPDATED folds each
-  change into the roster). The remaining engine features are client-only
-  surfacing work: attachment transfer.
+  reflow, per-nick colors), then each of the following surfaced one engine feature
+  already on the wire —
+  - **reactions** — emoji aggregates with a `[n]` "you reacted" marker; `/react
+    <emoji>` toggles on the last message (exercising the wide-char/emoji
+    correctness that justified the toolkit).
+  - **edit/delete** — `/edit`, `/delete`; an `(edited)` marker + `[message
+    deleted]` tombstone.
+  - **typing indicators** — throttled `TYPING` while composing; `✎ X is typing…`
+    on the status line.
+  - **threads** — `/thread` opens a message's thread in place of the channel
+    (Enter then posts a reply), with a `↳ N replies` marker on the parent;
+    `/close` exits.
+  - **search** — `/search <query>` overlays matching messages (channel, author,
+    snippet).
+  - **channel management** — `/create`, `/join`, `/leave`, `/list`; non-joined
+    public channels show dimmed with a `+`.
+  - **roster + presence** — `/who` overlays the tenant roster with
+    online/away/offline dots + roles; `/away` and `/online` set your own presence.
+  - **direct messages** — `/dm <name>` opens a 1:1 DM, titled `@peer` in the
+    sidebar (the daemon reports the DM peer in `CHANNEL_INFO` — a small protocol
+    addition).
+  - **logout** — `/logout` revokes this session server-side and quits once the
+    connection drops.
+  - **who-reacted** — `/reactions` overlays the full reactor list of the last
+    message, each reactor paired with the emoji they used (REQ-071).
+  - **notification prefs + DND** — `/prefs` overlays the DND window + per-channel
+    levels; `/notify all|mentions|none` sets the focused channel; `/dnd HH:MM
+    HH:MM | off` sets the do-not-disturb window (REQ-130/131; each SET returns a
+    full sync that the model folds in).
+  - **admin / user management** — `/role <name> owner|admin|member`, `/invite
+    [admin|member]` (mints a tenant token, shown once atop the roster), `/remove
+    <name>` disables a user (REQ-030/033, owner/admin only; a `USER_UPDATED` folds
+    each change into the roster).
+
+  The remaining engine features to surface are **attachment transfer** and
+  **webhook management**.
 - **Windows (later):** Win32/WinUI (C++/WinRT or C#) over the C core.
 - **macOS/iOS (later):** AppKit/UIKit (Swift) over the core.
 - **Android (later):** Android views (Kotlin) over the core.
@@ -176,13 +188,12 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
 
 ## 8. Roadmap
 
-- **Now:** app-core + termbox2 TUI shipped — the lean core loop (sidebar,
-  backfill on open, send, display names, unread, scrollback) plus **reactions**
-  (`/react`), **edit/delete** (`/edit`, `/delete`, `(edited)` marker + `[message
-  deleted]` tombstone), and **typing indicators** (`✎ X is typing…`) are done.
-  Remaining TUI increments surface engine features already on the wire: attachment
-  transfer, webhook management. (Shipped: threads, search, channel management,
-  roster + presence, DMs, logout, who-reacted, notification prefs/DND, admin.)
+- **Now:** app-core + termbox2 TUI shipped. On top of the lean core loop
+  (sidebar, backfill on open, send, display names, unread, scrollback), the TUI
+  surfaces: reactions, edit/delete, typing, threads, search, channel management,
+  roster + presence, DMs, logout, who-reacted, notification prefs/DND, and admin
+  (see §3 for the commands). The only engine features not yet surfaced are
+  **attachment transfer** and **webhook management**.
 - **Next:** store + reconnect/offline; auth completeness (local + OIDC);
   attachments (chunked up/download) and the **audio client** (Opus encode/decode
   + UDP to the sidecar — the deferred half of REQ-150/151).
