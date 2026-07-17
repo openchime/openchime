@@ -310,6 +310,24 @@ void oc_client_delete_webhook(oc_client *c, uint64_t webhook_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_upload(oc_client *c, uint64_t channel_id, const char *path) {
+    if (!c || !channel_id || !path || !path[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_UPLOAD);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->body = strdup(path);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_download(oc_client *c, uint64_t attachment_id, const char *dest_path) {
+    if (!c || !attachment_id || !dest_path || !dest_path[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_DOWNLOAD);
+    if (!cmd) return;
+    cmd->message_id = attachment_id;   /* reused as the attachment id */
+    cmd->body = strdup(dest_path);
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_logout(oc_client *c, uint8_t scope) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_LOGOUT);

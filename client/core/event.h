@@ -32,6 +32,8 @@ enum {
     OC_EV_WEBHOOK_INFO,    /* a WEBHOOK_INFO: message_id=webhook_id + channel_id + body=token (shown once) */
     OC_EV_WEBHOOK,         /* a WEBHOOK_LIST entry: message_id=webhook_id + channel_id + body=label + op=disabled */
     OC_EV_WEBHOOK_DELETED, /* a WEBHOOK_DELETED: message_id=webhook_id */
+    OC_EV_ATTACHMENT,      /* a message's attachment: channel_id + message_id + parent_id=attachment_id + server_time=size + body=filename + author_name=mime */
+    OC_EV_XFER,            /* a transfer notice: op=phase (0 progress, 1 done, 2 error), body=status text */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
     OC_EV_ERROR            /* protocol/transport error; body = human message */
 };
@@ -83,6 +85,8 @@ enum {
     OC_CMD_CREATE_WEBHOOK,  /* mint an incoming webhook for `channel_id`: body = label */
     OC_CMD_LIST_WEBHOOKS,   /* list `channel_id`'s webhooks */
     OC_CMD_DELETE_WEBHOOK,  /* delete a webhook: message_id = webhook_id */
+    OC_CMD_UPLOAD,          /* upload+post a file to `channel_id`: body = local path */
+    OC_CMD_DOWNLOAD,        /* download an attachment: message_id = attachment_id, body = dest path */
     OC_CMD_LOGOUT,          /* revoke this session (op = scope) and close the connection */
     OC_CMD_QUIT
 };

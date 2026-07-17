@@ -110,9 +110,100 @@ static int read_one(oc_tls_conn *c, int fd, oc_framebuf *fb, oc_header *hdr,
     }
 }
 
+/* ---- attachment transfer (REQ-140/141, ARCH-69) ----
+ * One transfer at a time per connection (matching the daemon). An upload streams
+ * a local file out as UPLOAD_CHUNKs within the server-advertised window, then
+ * links it into a SEND; a download writes DOWNLOAD_CHUNKs to a local file. The
+ * state lives on the net thread and is driven by the serve loop (commands) and
+ * dispatch (server frames). */
+typedef struct {
+    int      mode;        /* 0 idle, 1 upload, 2 download */
+    uint64_t id;          /* attachment id (0 for an upload until UPLOAD_READY) */
+    FILE    *fp;          /* the local file (source for upload, sink for download) */
+    uint64_t total;       /* declared/expected byte size */
+    uint64_t done;        /* upload: bytes handed to chunks; download: bytes written */
+    uint32_t chunk;       /* max data bytes per chunk (from UPLOAD_READY) */
+    uint32_t win_chunks;  /* in-flight window, in chunks (from UPLOAD_READY) */
+    uint32_t next_seq;    /* next chunk seq to send (upload) / expect (download) */
+    uint32_t acked_seq;   /* upload: chunks the server has acked */
+    int      ended;       /* upload: UPLOAD_END has been sent */
+    uint64_t channel;     /* upload: channel to link the finished attachment into */
+    char     name[128];   /* filename (upload src basename / download dest label) */
+} oc_xfer;
+
+typedef struct {
+    oc_queue    *to_ui;
+    oc_tls_conn *conn;
+    int          fd;
+    volatile int *stop;
+    oc_xfer     *xfer;
+} disp_ctx;
+
+/* Push a transfer notice (phase: 0 progress, 1 done, 2 error) to the UI. */
+static void xfer_notice(disp_ctx *ctx, uint8_t phase, const char *msg) {
+    oc_ev *e = oc_ev_new(OC_EV_XFER);
+    if (e) { e->op = phase; e->body = strdup(msg); oc_queue_push(ctx->to_ui, e); }
+}
+
+/* Tear down the active transfer (closing the file), leaving it idle. */
+static void xfer_reset(oc_xfer *x) {
+    if (x->fp) fclose(x->fp);
+    memset(x, 0, sizeof *x);
+}
+
+/* Emit OC_EV_ATTACHMENT events for a message's attachment list (BROADCAST /
+ * THREAD_REPLY), each folded onto its message by the model. */
+static void push_attachments(oc_queue *to_ui, uint64_t channel_id, uint64_t message_id,
+                             const oc_attach_entry *att, uint16_t n) {
+    for (uint16_t i = 0; i < n && i < OC_MAX_ATTACH; i++) {
+        oc_ev *e = oc_ev_new(OC_EV_ATTACHMENT);
+        if (!e) continue;
+        e->channel_id = channel_id;
+        e->message_id = message_id;
+        e->parent_id  = att[i].id;        /* attachment id (used to download) */
+        e->server_time = att[i].size;
+        size_t fn = att[i].filename.len < sizeof e->author_name - 1 ? att[i].filename.len : 0;
+        /* filename in body (heap, may be long), mime in author_name (bounded). */
+        e->body = malloc(att[i].filename.len + 1);
+        if (e->body) { memcpy(e->body, att[i].filename.ptr, att[i].filename.len); e->body[att[i].filename.len] = '\0'; }
+        size_t mn = att[i].mime.len < sizeof e->author_name - 1 ? att[i].mime.len : sizeof e->author_name - 1;
+        memcpy(e->author_name, att[i].mime.ptr, mn); e->author_name[mn] = '\0';
+        (void)fn;
+        oc_queue_push(to_ui, e);
+    }
+}
+
+/* Send as many UPLOAD_CHUNKs as the window allows, then UPLOAD_END once the whole
+ * file has been streamed. Called on UPLOAD_READY and each UPLOAD_ACK. */
+static void upload_pump(disp_ctx *ctx) {
+    oc_xfer *x = ctx->xfer;
+    if (x->mode != 1 || x->id == 0 || x->ended) return;
+    static uint8_t frame[OC_MAX_FRAME_SIZE];
+    uint8_t data[OC_ATTACH_CHUNK_SIZE];
+    while (x->done < x->total && (x->next_seq - x->acked_seq) < x->win_chunks) {
+        size_t want = (x->total - x->done) < x->chunk ? (size_t)(x->total - x->done) : x->chunk;
+        size_t got = fread(data, 1, want, x->fp);
+        if (got != want) { xfer_notice(ctx, 2, "upload: read error"); xfer_reset(x); return; }
+        oc_upload_chunk uc = { x->id, x->next_seq, { data, got } };
+        oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+        if (oc_encode_upload_chunk(&w, OC_PROTOCOL_VERSION, &uc) != OC_OK ||
+            write_all(ctx->conn, ctx->fd, frame, w.len, ctx->stop) != 0) {
+            xfer_notice(ctx, 2, "upload: send failed"); xfer_reset(x); return;
+        }
+        x->next_seq++; x->done += got;
+    }
+    if (x->done == x->total && !x->ended) {
+        oc_upload_end ue = { x->id };
+        oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+        if (oc_encode_upload_end(&w, OC_PROTOCOL_VERSION, &ue) == OC_OK)
+            (void)write_all(ctx->conn, ctx->fd, frame, w.len, ctx->stop);
+        x->ended = 1;
+    }
+}
+
 /* Dispatch every buffered server frame into UI events. Returns 0 to keep the
  * connection, -1 to drop it. */
-static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
+static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
     for (;;) {
         const uint8_t *frame; size_t flen;
         int r = oc_framebuf_next(fb, &frame, &flen);
@@ -139,6 +230,8 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                 e->body = malloc(b.body.len + 1);
                 if (e->body) { memcpy(e->body, b.body.ptr, b.body.len); e->body[b.body.len] = '\0'; }
                 oc_queue_push(to_ui, e);
+                /* Trailing attachment metadata (REQ-140): fold each onto the message. */
+                push_attachments(to_ui, b.channel_id, b.message_id, b.attach, b.n_attach);
             }
         } else if (hdr.msg_type == OC_MSG_CHANNEL_LIST) {
             oc_channel_list_entry ents[256]; uint16_t count = 0;
@@ -242,6 +335,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                     e->body = malloc(tr.body.len + 1);
                     if (e->body) { memcpy(e->body, tr.body.ptr, tr.body.len); e->body[tr.body.len] = '\0'; }
                     oc_queue_push(to_ui, e);
+                    push_attachments(to_ui, tr.channel_id, tr.message_id, tr.attach, tr.n_attach);
                 }
             }
         } else if (hdr.msg_type == OC_MSG_THREAD_META) {
@@ -313,6 +407,74 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                 if (e->body) { memcpy(e->body, ic.token.ptr, ic.token.len); e->body[ic.token.len] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_UPLOAD_READY) {
+            oc_upload_ready rd;
+            if (oc_decode_upload_ready(&p, &rd) == OC_OK && ctx && ctx->xfer->mode == 1) {
+                oc_xfer *x = ctx->xfer;
+                x->id = rd.attachment_id;
+                x->chunk = rd.chunk_size ? rd.chunk_size : OC_ATTACH_CHUNK_SIZE;
+                if (x->chunk > OC_ATTACH_CHUNK_SIZE) x->chunk = OC_ATTACH_CHUNK_SIZE;
+                x->win_chunks = rd.window_bytes / x->chunk;
+                if (x->win_chunks == 0) x->win_chunks = 1;
+                upload_pump(ctx);
+            }
+        } else if (hdr.msg_type == OC_MSG_UPLOAD_ACK) {
+            oc_upload_ack ack;
+            if (oc_decode_upload_ack(&p, &ack) == OC_OK && ctx && ctx->xfer->mode == 1 &&
+                ack.attachment_id == ctx->xfer->id) {
+                ctx->xfer->acked_seq = ack.acked_through;
+                upload_pump(ctx);
+            }
+        } else if (hdr.msg_type == OC_MSG_UPLOAD_OK) {
+            oc_upload_ok ok;
+            if (oc_decode_upload_ok(&p, &ok) == OC_OK && ctx && ctx->xfer->mode == 1 &&
+                ok.attachment_id == ctx->xfer->id) {
+                oc_xfer *x = ctx->xfer;
+                /* Publish the pending attachment by linking it into a SEND. */
+                uint8_t frame[256]; oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
+                oc_send s; memset(&s, 0, sizeof s);
+                s.channel_id = x->channel;
+                gen_idem(s.idem);
+                s.body = oc_slice_str("");
+                s.n_attach = 1; s.attach_ids[0] = x->id;
+                if (oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK)
+                    (void)write_all(ctx->conn, ctx->fd, frame, w.len, ctx->stop);
+                char msg[200];
+                snprintf(msg, sizeof msg, "uploaded %s (%llu bytes)", x->name, (unsigned long long)ok.size);
+                xfer_notice(ctx, 1, msg);
+                xfer_reset(x);
+            }
+        } else if (hdr.msg_type == OC_MSG_DOWNLOAD_INFO) {
+            oc_download_info di;
+            if (oc_decode_download_info(&p, &di) == OC_OK && ctx && ctx->xfer->mode == 2 &&
+                di.attachment_id == ctx->xfer->id) {
+                ctx->xfer->total = di.total_size;
+            }
+        } else if (hdr.msg_type == OC_MSG_DOWNLOAD_CHUNK) {
+            oc_download_chunk dc;
+            if (oc_decode_download_chunk(&p, &dc) == OC_OK && ctx && ctx->xfer->mode == 2 &&
+                dc.attachment_id == ctx->xfer->id && dc.seq == ctx->xfer->next_seq) {
+                oc_xfer *x = ctx->xfer;
+                if (dc.data.len && fwrite(dc.data.ptr, 1, dc.data.len, x->fp) != dc.data.len) {
+                    xfer_notice(ctx, 2, "download: write error"); xfer_reset(x);
+                } else {
+                    x->done += dc.data.len; x->next_seq++;
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_DOWNLOAD_END) {
+            oc_download_end de;
+            if (oc_decode_download_end(&p, &de) == OC_OK && ctx && ctx->xfer->mode == 2 &&
+                de.attachment_id == ctx->xfer->id) {
+                oc_xfer *x = ctx->xfer;
+                char msg[256];
+                if (x->total && x->done != x->total)
+                    snprintf(msg, sizeof msg, "download: size mismatch (%llu/%llu)",
+                             (unsigned long long)x->done, (unsigned long long)x->total);
+                else
+                    snprintf(msg, sizeof msg, "saved %s (%llu bytes)", x->name, (unsigned long long)x->done);
+                xfer_notice(ctx, x->total && x->done != x->total ? 2 : 1, msg);
+                xfer_reset(x);
+            }
         } else if (hdr.msg_type == OC_MSG_WEBHOOK_INFO) {
             oc_webhook_info wi;
             if (oc_decode_webhook_info(&p, &wi) != OC_OK) return -1;
@@ -350,6 +512,8 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                 size_t n = err.message.len < sizeof msg - 1 ? err.message.len : sizeof msg - 1;
                 memcpy(msg, err.message.ptr, n); msg[n] = '\0';
                 push_err(to_ui, msg[0] ? msg : "server error");
+                /* An error mid-transfer aborts it; abandon the local file. */
+                if (ctx && ctx->xfer->mode != 0) xfer_reset(ctx->xfer);
                 if (err.fatal) return -1;
             }
         }
@@ -376,6 +540,8 @@ static void *net_thread(void *arg) {
         oc_closesock(fd); push_err(n->to_ui, "tls init failed"); push_simple(n->to_ui, OC_EV_DISCONNECTED, 0); return NULL;
     }
     oc_framebuf_init(&fb);
+    /* Attachment transfer state, valid from here to `drop:` (which may reset it). */
+    oc_xfer xfer; memset(&xfer, 0, sizeof xfer);
 
     if (do_handshake(&conn, fd, &n->stop) != 0) goto drop;
 
@@ -434,7 +600,9 @@ static void *net_thread(void *arg) {
             (void)write_all(&conn, fd, lb, lw.len, &n->stop);
     }
 
-    /* Serve: interleave reading server frames with sending queued user actions. */
+    /* Serve: interleave reading server frames with sending queued user actions.
+     * An in-flight attachment transfer (upload/download) is driven by both. */
+    disp_ctx ctx = { n->to_ui, &conn, fd, &n->stop, &xfer };
     while (!n->stop) {
         oc_cmd *c;
         while ((c = oc_queue_try_pop(n->from_ui)) != NULL) {
@@ -595,6 +763,60 @@ static void *net_thread(void *arg) {
                 if (oc_encode_delete_webhook(&w, OC_PROTOCOL_VERSION, &dw) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_UPLOAD && c->body) {
+                if (xfer.mode != 0) { xfer_notice(&ctx, 2, "busy: another transfer is in progress"); }
+                else {
+                    FILE *fp = fopen(c->body, "rb");
+                    if (!fp) { xfer_notice(&ctx, 2, "upload: cannot open file"); }
+                    else if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); xfer_notice(&ctx, 2, "upload: not a regular file"); }
+                    else {
+                        long sz = ftell(fp);
+                        if (sz < 0 || (unsigned long long)sz > OC_MAX_ATTACHMENT_SIZE) {
+                            fclose(fp); xfer_notice(&ctx, 2, "upload: file too large");
+                        } else {
+                            rewind(fp);
+                            memset(&xfer, 0, sizeof xfer);
+                            xfer.mode = 1; xfer.fp = fp; xfer.total = (uint64_t)sz;
+                            xfer.chunk = OC_ATTACH_CHUNK_SIZE; xfer.win_chunks = 8;
+                            xfer.channel = c->channel_id;
+                            const char *slash = strrchr(c->body, '/');
+                            snprintf(xfer.name, sizeof xfer.name, "%s", slash ? slash + 1 : c->body);
+                            uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                            oc_upload_begin ub; memset(&ub, 0, sizeof ub);
+                            ub.channel_id = c->channel_id;
+                            gen_idem(ub.idem);
+                            ub.filename = oc_slice_str(xfer.name);
+                            ub.mime = oc_slice_str("application/octet-stream");
+                            ub.total_size = (uint64_t)sz;
+                            if (oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub) == OC_OK &&
+                                write_all(&conn, fd, buf, w.len, &n->stop) == 0) {
+                                char msg[200]; snprintf(msg, sizeof msg, "uploading %s…", xfer.name);
+                                xfer_notice(&ctx, 0, msg);
+                            } else { xfer_notice(&ctx, 2, "upload: begin failed"); xfer_reset(&xfer); }
+                        }
+                    }
+                }
+            }
+            if (c->type == OC_CMD_DOWNLOAD && c->body) {
+                if (xfer.mode != 0) { xfer_notice(&ctx, 2, "busy: another transfer is in progress"); }
+                else {
+                    FILE *fp = fopen(c->body, "wb");
+                    if (!fp) { xfer_notice(&ctx, 2, "download: cannot create file"); }
+                    else {
+                        memset(&xfer, 0, sizeof xfer);
+                        xfer.mode = 2; xfer.fp = fp; xfer.id = c->message_id;
+                        const char *slash = strrchr(c->body, '/');
+                        snprintf(xfer.name, sizeof xfer.name, "%s", slash ? slash + 1 : c->body);
+                        uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                        oc_download_begin db = { c->message_id };
+                        if (oc_encode_download_begin(&w, OC_PROTOCOL_VERSION, &db) == OC_OK &&
+                            write_all(&conn, fd, buf, w.len, &n->stop) == 0) {
+                            char msg[200]; snprintf(msg, sizeof msg, "downloading to %s…", xfer.name);
+                            xfer_notice(&ctx, 0, msg);
+                        } else { xfer_notice(&ctx, 2, "download: begin failed"); xfer_reset(&xfer); }
+                    }
+                }
+            }
             if (c->type == OC_CMD_OPEN_DM) {
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_open_dm od = { c->channel_id };   /* channel_id reused as target user id */
@@ -617,7 +839,7 @@ static void *net_thread(void *arg) {
             uint8_t buf[4096]; size_t rn = 0;
             oc_tls_status st = oc_tls_read(&conn, buf, sizeof buf, &rn);
             if (st == OC_TLS_OK) {
-                if (oc_framebuf_push(&fb, buf, rn) != 0 || dispatch(&fb, n->to_ui) < 0) break;
+                if (oc_framebuf_push(&fb, buf, rn) != 0 || dispatch(&fb, n->to_ui, &ctx) < 0) break;
             } else if (st == OC_TLS_CLOSED || st == OC_TLS_ERROR) {
                 break;
             }
@@ -625,6 +847,7 @@ static void *net_thread(void *arg) {
     }
 
 drop:
+    xfer_reset(&xfer);   /* close any half-done transfer file */
     push_simple(n->to_ui, OC_EV_DISCONNECTED, 0);
     oc_framebuf_free(&fb);
     oc_tls_conn_free(&conn);

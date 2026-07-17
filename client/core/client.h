@@ -112,6 +112,12 @@ void oc_client_close_webhooks(oc_client *c);
 void oc_client_create_webhook(oc_client *c, uint64_t channel_id, const char *label);
 void oc_client_delete_webhook(oc_client *c, uint64_t webhook_id);
 
+/* Attachments (REQ-140/141). Upload a local file and post it to `channel_id`
+ * (the core streams it, then links it into a message); download an attachment by
+ * id to `dest_path`. Progress + completion arrive as OC_EV_XFER status lines. */
+void oc_client_upload(oc_client *c, uint64_t channel_id, const char *path);
+void oc_client_download(oc_client *c, uint64_t attachment_id, const char *dest_path);
+
 /* Log out: revoke this session (scope OC_LOGOUT_THIS) or all of the user's
  * (OC_LOGOUT_ALL); the server closes the connection. */
 void oc_client_logout(oc_client *c, uint8_t scope);

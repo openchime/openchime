@@ -17,6 +17,10 @@
 /* One emoji's aggregate on a message: the running count and whether we reacted. */
 typedef struct { char emoji[40]; uint32_t count; uint8_t mine; } oc_reaction;
 
+/* One attachment hanging off a message (REQ-140): the server id (used to
+ * download it), its filename + mime, and the byte size. */
+typedef struct { uint64_t id; char filename[128]; char mime[64]; uint64_t size; } oc_attachment;
+
 typedef struct {
     char    *body;         /* heap */
     char     author_name[64]; /* author display name ("" = fall back to id) */
@@ -25,6 +29,8 @@ typedef struct {
     uint64_t server_time;
     oc_reaction *reactions;   /* heap, NULL until the message gets a reaction */
     uint8_t      n_reactions, cap_reactions;
+    oc_attachment *attach;    /* heap, NULL until the message carries an attachment */
+    uint8_t      n_attach, cap_attach;
     uint8_t      edited;      /* body was edited (REQ-051) */
     uint8_t      deleted;     /* tombstoned (REQ-052) */
     uint32_t     reply_count; /* thread replies to this message (REQ-060) */

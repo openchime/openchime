@@ -21,7 +21,8 @@
  *       /invite [admin|member] (mint a token) · /remove <name> (owner/admin) ·
  *       /webhook (list this channel's incoming webhooks) · /webhook create
  *       <label> (mint one; token shown once) · /webhook rm <id> (delete one) ·
- *       /logout (revoke this session and quit).
+ *       /upload <path> (post a file here) · /download <id> [path] (save an
+ *       attachment) · /logout (revoke this session and quit).
  */
 
 #define TB_IMPL
@@ -171,6 +172,20 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
         return;
     }
     wrap_push(r, m->body ? m->body : "", TB_DEFAULT, width, 4);
+    for (uint8_t k = 0; k < m->n_attach; k++) {           /* attachments (REQ-140) */
+        const oc_attachment *a = &m->attach[k];
+        char al[256];
+        /* 📎 filename (12.3 KB) #id — download with /download <id> */
+        double kb = (double)a->size / 1024.0;
+        if (a->size >= 1024ull * 1024)
+            snprintf(al, sizeof al, "    \xf0\x9f\x93\x8e %s (%.1f MB) #%llu",
+                     a->filename[0] ? a->filename : "file", kb / 1024.0, (unsigned long long)a->id);
+        else
+            snprintf(al, sizeof al, "    \xf0\x9f\x93\x8e %s (%.1f KB) #%llu",
+                     a->filename[0] ? a->filename : "file", kb, (unsigned long long)a->id);
+        char *ar = malloc(strlen(al) + 1);
+        if (ar) { strcpy(ar, al); rows_push(r, ar, TB_CYAN | TB_BOLD); }
+    }
     if (m->n_reactions) {
         char rl[256]; size_t p = 0;
         p += (size_t)snprintf(rl, sizeof rl, "    ");
@@ -494,6 +509,18 @@ static const oc_channel *focused_channel(const oc_model *m, uint64_t cid) {
     return NULL;
 }
 
+/* The filename of an attachment by id (searching every channel's messages), or
+ * "" if unknown. Used to pick a default download path. */
+static const char *attach_filename(const oc_model *m, uint64_t id) {
+    for (size_t ci = 0; ci < m->n_channels; ci++)
+        for (size_t i = 0; i < m->channels[ci].n_msgs; i++) {
+            const oc_msg *msg = &m->channels[ci].msgs[i];
+            for (uint8_t k = 0; k < msg->n_attach; k++)
+                if (msg->attach[k].id == id) return msg->attach[k].filename;
+        }
+    return "";
+}
+
 /* Our own most recent, non-deleted message in a channel (for /edit, /delete). */
 static const oc_msg *my_last_message(const oc_channel *ch, uint64_t me) {
     for (size_t i = ch->n_msgs; i > 0; i--) {
@@ -539,6 +566,30 @@ static void handle_command(oc_client *cl, uint64_t cid, const char *line) {
         } else {
             oc_client_webhooks(cl, cid);   /* open the overlay + refresh */
         }
+        return;
+    }
+    if (strncmp(line, "/upload ", 8) == 0) {   /* /upload <path> — post a file here */
+        const char *path = line + 8;
+        while (*path == ' ') path++;
+        if (*path) oc_client_upload(cl, cid, path);
+        return;
+    }
+    if (strncmp(line, "/download ", 10) == 0) {  /* /download <id> [dest path] */
+        const char *a = line + 10;
+        while (*a == ' ') a++;
+        char *end = NULL;
+        unsigned long long id = strtoull(a, &end, 10);
+        if (!id) return;
+        while (end && *end == ' ') end++;
+        char dest[512];
+        if (end && *end) {
+            snprintf(dest, sizeof dest, "%s", end);   /* explicit destination */
+        } else {
+            const char *fn = attach_filename(m, id);   /* default to the filename in cwd */
+            if (fn[0]) snprintf(dest, sizeof dest, "%s", fn);
+            else       snprintf(dest, sizeof dest, "attachment-%llu", id);
+        }
+        oc_client_download(cl, id, dest);
         return;
     }
     if (strcmp(line, "/prefs") == 0) { oc_client_toggle_prefs(cl, 1); return; }

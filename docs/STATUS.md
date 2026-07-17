@@ -85,7 +85,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 131 do-not-disturb schedule | ✅ | `SET_DND` stores a daily UTC minutes-of-day window on `users`; governs push, not in-app unread (ARCH-72). |
 | 132 APNs/FCM push | ⛔ | Deferred mobile-push milestone: needs the push transport + per-message notify decision. Settings (REQ-130/131) that gate it are built. |
 | 133 self-host push gateway | ⛔ | Tied to REQ-132. |
-| 140 file attachments (object storage) | 🟡 | **Built + tested end-to-end:** proxied chunked upload/download over the wire (ARCH-69), `attachments` migration 0009, frames §5.14, and **message-linking** — a SEND references uploaded attachments (self-describing optional list), the BROADCAST carries their metadata inline, and backfill re-attaches them on reconnect. Thread replies carry attachments too (SEND_REPLY/THREAD_REPLY + LIST_THREAD). Two blob backends behind the ARCH-70 vtable: local-FS (default) and S3/MinIO (`OPENCHIME_BLOB_BACKEND=s3`, SigV4-signed, verified end-to-end against MinIO). |
+| 140 file attachments (object storage) | 🟡 | **Built + tested end-to-end:** proxied chunked upload/download over the wire (ARCH-69), `attachments` migration 0009, frames §5.14, and **message-linking** — a SEND references uploaded attachments (self-describing optional list), the BROADCAST carries their metadata inline, and backfill re-attaches them on reconnect. Thread replies carry attachments too (SEND_REPLY/THREAD_REPLY + LIST_THREAD). Two blob backends behind the ARCH-70 vtable: local-FS (default) and S3/MinIO (`OPENCHIME_BLOB_BACKEND=s3`, SigV4-signed, verified end-to-end against MinIO). **Surfaced in the TUI** (`/upload <path>`, `/download <id> [path]`): the net thread runs one transfer at a time as a state machine over the frame stream, respecting the upload window; the headless test round-trips a multi-chunk blob. |
 | 141 attachment access control | ✅ | Proxied bytes → download authorized by the ordinary channel-read check on the attachment's channel; no signed URLs (ARCH-69). Verified over the wire (cross-user fetch allowed; non-member refused) and in dbwriter units. |
 | 150–152 server-relayed audio | ✅ (server) | **Built + tested end-to-end** (ARCH-73): `CALL_JOIN`/`CALL_LEAVE` + per-channel ephemeral roster on the net thread; a forked UDP relay sidecar (`daemon/audio_sidecar.c`) that the daemon drives over a Unix socket (AUTHORIZE/REVOKE) and advertises via `udp_port`+token in `CALL_JOINED`. The sidecar relays opaque Opus payloads to a call's participants — no libopus server-side. Disconnect drops-and-re-rosters + REVOKEs, with a UDP silence sweep (REQ-152). An itest joins two clients and relays audio between them over real UDP. **Client-side** Opus encode/decode + UDP I/O is Phase-2 client work. |
 | 160 video | ➖ | Deliberate scope exclusion. |
@@ -107,7 +107,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 
 | REQ | Status | Notes |
 |-----|--------|-------|
-| 200 Linux/Win/macOS/iOS/Android clients | 🟡 | Client pivoted to **one shared C app-core + native UI per platform** (ARCH-74, tdlib model — supersedes the raylib/Windows-cross-compile plan). The app-core (`client/core/`: net thread, queues, view-model + reducers, `oc_client` facade) is **built and headless-tested** (`tests/test_client_core.c` drives it against an in-process daemon; `make core` compile-check, linked into `make test`). First frontend is a **termbox2 + utf8proc TUI** (ARCH-75, `make tui`) with: connect + local auth, channel sidebar + unread, live messages + history backfill, display names, per-nick colors, scrollback, send, **reactions** (`/react`), **edit/delete**, **typing indicators**, **threads**, **search**, **channel + DM management**, **presence + roster** (`/who`, `/away`), **who-reacted** (`/reactions`), **notification prefs + DND** (`/prefs`, `/notify`, `/dnd`), **admin** (`/role`, `/invite`, `/remove`), **webhook management** (`/webhook` create/list/delete), and **logout**. Remaining TUI work is surfacing the last engine feature (attachments); native Win32/AppKit/Android/DOM frontends pending. Daemon is Linux-only (epoll/eventfd). |
+| 200 Linux/Win/macOS/iOS/Android clients | 🟡 | Client pivoted to **one shared C app-core + native UI per platform** (ARCH-74, tdlib model — supersedes the raylib/Windows-cross-compile plan). The app-core (`client/core/`: net thread, queues, view-model + reducers, `oc_client` facade) is **built and headless-tested** (`tests/test_client_core.c` drives it against an in-process daemon; `make core` compile-check, linked into `make test`). First frontend is a **termbox2 + utf8proc TUI** (ARCH-75, `make tui`) with: connect + local auth, channel sidebar + unread, live messages + history backfill, display names, per-nick colors, scrollback, send, **reactions** (`/react`), **edit/delete**, **typing indicators**, **threads**, **search**, **channel + DM management**, **presence + roster** (`/who`, `/away`), **who-reacted** (`/reactions`), **notification prefs + DND** (`/prefs`, `/notify`, `/dnd`), **admin** (`/role`, `/invite`, `/remove`), **webhook management** (`/webhook` create/list/delete), **attachments** (`/upload`, `/download`), and **logout**. Every engine feature on the wire is now reachable from the TUI; native Win32/AppKit/Android/DOM frontends pending. Daemon is Linux-only (epoll/eventfd). |
 | 210 lean/standard memory profile | ✅ | **Measured** (`Scripts/bench.sh`): ~5 MB baseline + **~50 KB RSS per idle connection**, so a few hundred connections sit in ~15–30 MB and low-thousands stay within the 256 MB lean profile. Message round-trip p50 ~4 ms, p99 ~20–40 ms under concurrency. |
 | 211 low-hundreds concurrent connections | ✅ | **Measured**: hundreds of concurrent pinned-TLS connections held in a small fraction of the lean profile. Connection *setup* is bounded by the 600k-iteration PBKDF2 auth on the single writer (~6–7 logins/s), so a burst of simultaneous logins queues there; steady-state is cheap. `OC_NETLOOP_MAX_FD=4096`. |
 
@@ -180,18 +180,18 @@ in CI — with a **termbox2 + utf8proc TUI** (ARCH-75) as the first frontend. Th
 TUI does live messaging with history backfill, display names, unread, reactions,
 edit/delete, typing, threads, search, channel/DM management, presence + roster,
 who-reacted, notification prefs + DND, admin (roles/invite/remove), webhook
-management, and logout;
-the remaining TUI work is **surfacing the last engine feature that already
-exists over the wire** (attachments) plus the later native GUIs. The remaining server-side gap is **mobile
+management, attachments (`/upload`/`/download`), and logout — **every engine
+feature on the wire is now reachable from the TUI**, so the remaining client work
+is the later native GUIs. The remaining server-side gap is **mobile
 push transport** (REQ-132/133). **Server-relayed audio** (REQ-150–152) is now
 built end-to-end — call signaling + a forked UDP relay sidecar — with only the
 client-side Opus/UDP left (Phase-2 client work). Presence/typing (REQ-120/121) is
 built and tested end-to-end, as are **notification settings** (REQ-130/131:
 per-channel level + DND, server-authoritative and device-synced; the push
-delivery they gate is the deferred piece). **Attachments** (REQ-140/141) have
-their proxied chunked transfer + access control built and tested over the wire
-(local-FS blob store; S3/MinIO adapter and message-linking are the remaining
-follow-ups).
+delivery they gate is the deferred piece). **Attachments** (REQ-140/141) are
+built end-to-end — proxied chunked transfer, access control, message-linking, and
+both blob backends — and now **surfaced in the TUI** (`/upload`/`/download`), so
+there is no attachment work left on either side.
 
 The **server-robustness backlog is cleared** (see Resolved above): SEND-flood
 rate limiting, the per-connection output-buffer cap, idempotency-map pruning,

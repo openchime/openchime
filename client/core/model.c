@@ -17,7 +17,7 @@ void oc_model_init(oc_model *m) {
     memset(m, 0, sizeof *m);
 }
 
-static void msg_free(oc_msg *m) { free(m->body); free(m->reactions); }
+static void msg_free(oc_msg *m) { free(m->body); free(m->reactions); free(m->attach); }
 
 static void channel_free(oc_channel *c) {
     for (size_t i = 0; i < c->n_msgs; i++) msg_free(&c->msgs[i]);
@@ -266,6 +266,42 @@ static void bump_reply_count(oc_model *m, uint64_t message_id, uint32_t count) {
                     m->channels[ci].msgs[i].reply_count = count;
                 return;
             }
+}
+
+/* Append an attachment to a message, deduped by id. Frees nothing; the caller
+ * owns the source strings (copied in). */
+static void msg_add_attach(oc_msg *msg, uint64_t id, const char *filename,
+                           const char *mime, uint64_t size) {
+    for (uint8_t i = 0; i < msg->n_attach; i++)
+        if (msg->attach[i].id == id) return;   /* dedup (backfill re-delivery) */
+    if (msg->n_attach >= OC_MAX_ATTACH) return;
+    if (msg->n_attach == msg->cap_attach) {
+        uint8_t cap = msg->cap_attach ? (uint8_t)(msg->cap_attach * 2) : 2;
+        oc_attachment *na = realloc(msg->attach, (size_t)cap * sizeof *na);
+        if (!na) return;
+        msg->attach = na; msg->cap_attach = cap;
+    }
+    oc_attachment *a = &msg->attach[msg->n_attach++];
+    a->id = id; a->size = size;
+    snprintf(a->filename, sizeof a->filename, "%s", filename ? filename : "");
+    snprintf(a->mime, sizeof a->mime, "%s", mime ? mime : "");
+}
+
+/* Attach an attachment to the message with `message_id`, searching every channel
+ * buffer and the open thread's replies (message ids are globally unique). */
+static void attach_to_msg(oc_model *m, uint64_t message_id, uint64_t id,
+                          const char *filename, const char *mime, uint64_t size) {
+    for (size_t ci = 0; ci < m->n_channels; ci++)
+        for (size_t i = 0; i < m->channels[ci].n_msgs; i++)
+            if (m->channels[ci].msgs[i].message_id == message_id) {
+                msg_add_attach(&m->channels[ci].msgs[i], id, filename, mime, size);
+                return;
+            }
+    for (size_t i = 0; i < m->n_thread_msgs; i++)
+        if (m->thread_msgs[i].message_id == message_id) {
+            msg_add_attach(&m->thread_msgs[i], id, filename, mime, size);
+            return;
+        }
 }
 
 /* Record that `user_id` is typing in `channel_id` now, pruning stale marks. */
@@ -544,6 +580,15 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         webhook_remove(m, e->message_id);
         if (m->webhook_new_id == e->message_id) { m->webhook_token[0] = '\0'; m->webhook_new_id = 0; }
         set_status(m, "webhook deleted");
+        break;
+    case OC_EV_ATTACHMENT:
+        /* parent_id = attachment id, server_time = size, body = filename,
+         * author_name = mime. Arrives right after its OC_EV_MESSAGE. */
+        attach_to_msg(m, e->message_id, e->parent_id, e->body ? e->body : "",
+                      e->author_name, e->server_time);
+        break;
+    case OC_EV_XFER:
+        if (e->body) set_status(m, e->body);
         break;
     case OC_EV_DISCONNECTED:
         m->connected = false;

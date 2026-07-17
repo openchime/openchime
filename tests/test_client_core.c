@@ -170,6 +170,40 @@ static int channel_has_named(const oc_model *m, uint64_t cid, const char *body, 
     return 0;
 }
 
+/* The id of the first attachment on any message in channel `cid` (0 if none),
+ * filling `fn_out`/`size_out` with its filename + byte size. */
+static uint64_t channel_attach(const oc_model *m, uint64_t cid, char *fn_out,
+                               size_t fncap, uint64_t *size_out) {
+    for (size_t i = 0; i < m->n_channels; i++) {
+        if (m->channels[i].channel_id != cid) continue;
+        for (size_t j = 0; j < m->channels[i].n_msgs; j++) {
+            const oc_msg *msg = &m->channels[i].msgs[j];
+            if (msg->n_attach > 0) {
+                snprintf(fn_out, fncap, "%s", msg->attach[0].filename);
+                if (size_out) *size_out = msg->attach[0].size;
+                return msg->attach[0].id;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Whole-file compare: does `path` hold exactly `data[0..len)`? */
+static int file_matches(const char *path, const unsigned char *data, size_t len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char buf[8192];
+    size_t off = 0; int ok = 1;
+    for (;;) {
+        size_t got = fread(buf, 1, sizeof buf, f);
+        if (got == 0) break;
+        if (off + got > len || memcmp(buf, data + off, got) != 0) { ok = 0; break; }
+        off += got;
+    }
+    fclose(f);
+    return ok && off == len;
+}
+
 int run_client_core_tests(void) {
     printf("test_client_core: connect+auth, channel-list, send round-trip, unread, backfill\n");
 
@@ -380,6 +414,37 @@ int run_client_core_tests(void) {
                           strcmp(find_msg(m, 1, mid)->body, "edited body") == 0));
         oc_client_delete(a, 1, mid);
         CHECK(WAIT_FOR(b, find_msg(m, 1, mid) && find_msg(m, 1, mid)->deleted));
+
+        /* attachments (REQ-140/141): dana uploads a multi-chunk file to channel 1;
+         * the core streams it (UPLOAD_BEGIN→CHUNK×N→END→OK) and links it into a
+         * message. erik sees the message carry the attachment metadata, downloads
+         * it by id, and the reassembled bytes match the original. */
+        {
+            const size_t N = 150000;   /* > 2× the 65024-byte chunk: exercises windowing */
+            unsigned char *blob = malloc(N);
+            CHECK(blob != NULL);
+            for (size_t k = 0; k < N; k++) blob[k] = (unsigned char)((k * 7 + 3) % 251);
+            const char *src = "build/itest_core_upload.bin";
+            const char *dst = "build/itest_core_download.bin";
+            unlink(src); unlink(dst);
+            FILE *sf = fopen(src, "wb");
+            CHECK(sf != NULL);
+            if (sf) { CHECK(fwrite(blob, 1, N, sf) == N); fclose(sf); }
+
+            oc_client_upload(a, 1, src);
+            /* erik receives a message carrying the attachment (empty body). */
+            char fn[128] = {0}; uint64_t asz = 0, aid = 0;
+            CHECK(WAIT_FOR(b, (aid = channel_attach(m, 1, fn, sizeof fn, &asz)) != 0));
+            CHECK(asz == N);
+            CHECK(strcmp(fn, "itest_core_upload.bin") == 0);
+            /* erik downloads it by id; the bytes round-trip intact. */
+            uint64_t aid_b = channel_attach(oc_client_model(b), 1, fn, sizeof fn, &asz);
+            oc_client_download(b, aid_b, dst);
+            CHECK(WAIT_FOR(b, file_matches(dst, blob, N)));
+
+            free(blob);
+            unlink(src); unlink(dst);
+        }
 
         /* incoming webhooks (REQ-170): dana mints a webhook on channel 1 — the
          * server answers with a WEBHOOK_INFO whose token is shown once in her
