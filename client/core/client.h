@@ -58,6 +58,11 @@ void oc_client_open_thread(oc_client *c, uint64_t channel_id, uint64_t parent_id
 void oc_client_reply(oc_client *c, uint64_t channel_id, uint64_t parent_id, const char *body);
 void oc_client_close_thread(oc_client *c);
 
+/* Run a full-text search (results stream into the model's search buffer) / close
+ * the search view. */
+void oc_client_search(oc_client *c, const char *query);
+void oc_client_close_search(oc_client *c);
+
 /* Stop the network thread, drain remaining events, and free everything. */
 void oc_client_stop(oc_client *c);
 

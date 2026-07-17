@@ -47,6 +47,9 @@ typedef struct { uint64_t user_id; uint8_t status; } oc_presence_row;
 /* An ephemeral "user is typing in channel" mark, expiring on a timeout. */
 typedef struct { uint64_t channel_id; uint64_t user_id; long long seen; } oc_typing_row;
 
+/* One full-text search hit (REQ-080). */
+typedef struct { uint64_t message_id, channel_id, author_id, server_time; char *snippet; } oc_search_result;
+
 typedef struct {
     bool     connected;
     bool     authed;
@@ -64,6 +67,11 @@ typedef struct {
     uint64_t  thread_channel, thread_parent;
     oc_msg   *thread_msgs;
     size_t    n_thread_msgs, cap_thread_msgs;
+    /* The open search view (REQ-080): the query and its hits. */
+    uint8_t   search_open;
+    char      search_query[128];
+    oc_search_result *search_results;
+    size_t    n_search, cap_search;
     char     status[160];             /* last status / error line */
 } oc_model;
 
@@ -82,6 +90,10 @@ void oc_model_mark_read(oc_model *m, uint64_t channel_id);
 /* Begin/end viewing a thread. open clears any previously-loaded replies. */
 void oc_model_open_thread(oc_model *m, uint64_t channel_id, uint64_t parent_id);
 void oc_model_close_thread(oc_model *m);
+
+/* Begin a search (clears prior hits, records the query) / close the search view. */
+void oc_model_search_begin(oc_model *m, const char *query);
+void oc_model_close_search(oc_model *m);
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);
 

@@ -234,6 +234,20 @@ int run_client_core_tests(void) {
         oc_client_close_thread(b);
         CHECK(!oc_client_model(b)->thread_open && oc_client_model(b)->n_thread_msgs == 0);
 
+        /* dana searches for a word in her message; the hit streams into the
+         * search buffer and includes that message. */
+        oc_client_search(a, "core");
+        CHECK(WAIT_FOR(a, m->search_open && m->n_search >= 1));
+        {
+            const oc_model *am = oc_client_model(a);
+            int found = 0;
+            for (size_t j = 0; j < am->n_search; j++)
+                if (am->search_results[j].message_id == mid) found = 1;
+            CHECK(found);
+        }
+        oc_client_close_search(a);
+        CHECK(!oc_client_model(a)->search_open && oc_client_model(a)->n_search == 0);
+
         /* Marking channel 1 read clears erik's unread. */
         oc_client_mark_read(b, 1);
         oc_client_tick(b);

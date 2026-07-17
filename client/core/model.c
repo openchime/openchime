@@ -63,7 +63,24 @@ void oc_model_free(oc_model *m) {
     free(m->typing);
     for (size_t i = 0; i < m->n_thread_msgs; i++) msg_free(&m->thread_msgs[i]);
     free(m->thread_msgs);
+    for (size_t i = 0; i < m->n_search; i++) free(m->search_results[i].snippet);
+    free(m->search_results);
     memset(m, 0, sizeof *m);
+}
+
+void oc_model_close_search(oc_model *m) {
+    for (size_t i = 0; i < m->n_search; i++) free(m->search_results[i].snippet);
+    free(m->search_results);
+    m->search_results = NULL;
+    m->n_search = m->cap_search = 0;
+    m->search_open = 0;
+    m->search_query[0] = '\0';
+}
+
+void oc_model_search_begin(oc_model *m, const char *query) {
+    oc_model_close_search(m);      /* drop any prior hits */
+    m->search_open = 1;
+    snprintf(m->search_query, sizeof m->search_query, "%s", query ? query : "");
 }
 
 void oc_model_close_thread(oc_model *m) {
@@ -100,6 +117,23 @@ static void thread_append(oc_model *m, uint64_t message_id, uint64_t author_id,
     msg->message_id = message_id;
     msg->server_time = server_time;
     *body = NULL;
+}
+
+/* Append a search hit, stealing ownership of `*snippet` (NULL on success). */
+static void search_append(oc_model *m, uint64_t message_id, uint64_t channel_id,
+                          uint64_t author_id, uint64_t server_time, char **snippet) {
+    for (size_t i = 0; i < m->n_search; i++)
+        if (m->search_results[i].message_id == message_id) return;   /* dedup */
+    if (m->n_search == m->cap_search) {
+        size_t cap = m->cap_search ? m->cap_search * 2 : 16;
+        oc_search_result *ns = realloc(m->search_results, cap * sizeof *ns);
+        if (!ns) return;
+        m->search_results = ns; m->cap_search = cap;
+    }
+    oc_search_result *sr = &m->search_results[m->n_search++];
+    sr->message_id = message_id; sr->channel_id = channel_id;
+    sr->author_id = author_id; sr->server_time = server_time;
+    sr->snippet = *snippet; *snippet = NULL;
 }
 
 /* Raise a message's thread reply count, finding it in any channel (message ids
@@ -311,6 +345,10 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         break;
     case OC_EV_THREAD_META:
         bump_reply_count(m, e->message_id, e->count);
+        break;
+    case OC_EV_SEARCH_RESULT:
+        if (m->search_open)
+            search_append(m, e->message_id, e->channel_id, e->author_id, e->server_time, &e->body);
         break;
     case OC_EV_DISCONNECTED:
         m->connected = false;

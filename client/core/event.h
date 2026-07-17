@@ -22,6 +22,7 @@ enum {
     OC_EV_TYPING,          /* a TYPING_UPDATE: user_id is typing in channel_id */
     OC_EV_THREAD_REPLY,    /* a THREAD_REPLY: parent_id/message + body + count */
     OC_EV_THREAD_META,     /* a THREAD_META: message_id + reply count (backfill) */
+    OC_EV_SEARCH_RESULT,   /* a SEARCH_RESULTS entry: channel/message/author + snippet(body) */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
     OC_EV_ERROR            /* protocol/transport error; body = human message */
 };
@@ -55,6 +56,7 @@ enum {
     OC_CMD_TYPING,         /* signal "I am typing" in `channel_id` */
     OC_CMD_OPEN_THREAD,    /* request a thread's replies: `message_id` = parent */
     OC_CMD_REPLY,          /* reply in a thread: `message_id` = parent, body=text */
+    OC_CMD_SEARCH,         /* full-text search: body = query */
     OC_CMD_QUIT
 };
 

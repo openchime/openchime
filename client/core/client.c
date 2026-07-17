@@ -141,6 +141,20 @@ void oc_client_close_thread(oc_client *c) {
     oc_model_close_thread(&c->model);
 }
 
+void oc_client_search(oc_client *c, const char *query) {
+    if (!c || !query || !query[0]) return;
+    oc_model_search_begin(&c->model, query);      /* clears prior hits + records it */
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SEARCH);
+    if (!cmd) return;
+    cmd->body = strdup(query);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_close_search(oc_client *c) {
+    if (!c) return;
+    oc_model_close_search(&c->model);
+}
+
 void oc_client_stop(oc_client *c) {
     if (!c) return;
     oc_net_stop(c->net);   /* signals QUIT, joins the thread */

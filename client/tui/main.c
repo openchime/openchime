@@ -11,7 +11,8 @@
  * Keys: type + Enter to send · Tab next channel · ↑/↓ + PgUp/PgDn scroll ·
  *       Ctrl-Q quit. Commands (on the last message in the focused channel):
  *       /react <emoji> · /edit <text> · /delete · /thread (open its thread;
- *       then Enter posts a reply) · /close (leave the thread).
+ *       then Enter posts a reply) · /search <query> · /close (leave a
+ *       thread/search overlay).
  */
 
 #define TB_IMPL
@@ -213,6 +214,29 @@ static const char *name_for(const oc_channel *ch, uint64_t uid) {
     return "someone";
 }
 
+/* Build the rows for the open search view: a header + each hit (channel, time,
+ * author, snippet). */
+static void build_search_rows(rows_t *r, const oc_model *m, int width) {
+    char line[200];
+    snprintf(line, sizeof line, "%zu result%s for \"%s\"", m->n_search,
+             m->n_search == 1 ? "" : "s", m->search_query);
+    char *h = malloc(strlen(line) + 1);
+    if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
+    for (size_t i = 0; i < m->n_search; i++) {
+        const oc_search_result *s = &m->search_results[i];
+        const char *cn = "?";
+        for (size_t j = 0; j < m->n_channels; j++)
+            if (m->channels[j].channel_id == s->channel_id) { cn = m->channels[j].name ? m->channels[j].name : "…"; break; }
+        char stamp[8] = "--:--";
+        if (s->server_time) { time_t t = (time_t)(s->server_time / 1000); struct tm tv;
+            if (localtime_r(&t, &tv)) strftime(stamp, sizeof stamp, "%H:%M", &tv); }
+        snprintf(line, sizeof line, "#%s  %s  user%llu:", cn, stamp, (unsigned long long)s->author_id);
+        char *hd = malloc(strlen(line) + 1);
+        if (hd) { strcpy(hd, line); rows_push(r, hd, TB_CYAN); }
+        wrap_push(r, s->snippet ? s->snippet : "", TB_DEFAULT, width, 4);
+    }
+}
+
 static void render(oc_client *cl, size_t focus, const char *composer,
                    size_t clen, int scroll) {
     (void)clen;
@@ -246,19 +270,21 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     /* Title bar (row 0 over the pane) — a thread view overlays the channel. */
     const oc_channel *fc = (focus < m->n_channels) ? &m->channels[focus] : NULL;
     char title[160];
-    if (m->thread_open) snprintf(title, sizeof title, " thread · #%s (/close to exit)",
-                                 fc && fc->name ? fc->name : "…");
-    else if (fc)        snprintf(title, sizeof title, " #%s", fc->name ? fc->name : "…");
-    else                snprintf(title, sizeof title, " (no channel)");
+    if (m->search_open)      snprintf(title, sizeof title, " search (/close to exit)");
+    else if (m->thread_open) snprintf(title, sizeof title, " thread · #%s (/close to exit)",
+                                      fc && fc->name ? fc->name : "…");
+    else if (fc)             snprintf(title, sizeof title, " #%s", fc->name ? fc->name : "…");
+    else                     snprintf(title, sizeof title, " (no channel)");
     fill_row(0, px0, W, TB_BLUE);
     draw_clip(px0, 0, pxmax, title, TB_WHITE | TB_BOLD, TB_BLUE);
 
-    /* Message rows for the focused channel (or the open thread), showing the
-     * window ending `scroll` rows above the bottom. */
-    if (fc || m->thread_open) {
+    /* Message rows for the focused channel, or an open thread / search overlay,
+     * showing the window ending `scroll` rows above the bottom. */
+    if (fc || m->thread_open || m->search_open) {
         rows_t rows = {0};
-        if (m->thread_open) build_thread_rows(&rows, m, fc, m->user_id, pxmax - px0);
-        else                build_rows(&rows, fc, m->user_id, pxmax - px0);
+        if (m->search_open)      build_search_rows(&rows, m, pxmax - px0);
+        else if (m->thread_open) build_thread_rows(&rows, m, fc, m->user_id, pxmax - px0);
+        else                     build_rows(&rows, fc, m->user_id, pxmax - px0);
         int total = (int)rows.n;
         int end = total - scroll;                /* one past the last visible row */
         if (end > total) end = total;
@@ -337,7 +363,13 @@ static const oc_msg *my_last_message(const oc_channel *ch, uint64_t me) {
  */
 static void handle_command(oc_client *cl, uint64_t cid, const char *line) {
     const oc_model *m = oc_client_model(cl);
-    if (strcmp(line, "/close") == 0) { oc_client_close_thread(cl); return; }
+    if (strcmp(line, "/close") == 0) { oc_client_close_thread(cl); oc_client_close_search(cl); return; }
+    if (strncmp(line, "/search ", 8) == 0) {
+        const char *q = line + 8;
+        while (*q == ' ') q++;
+        if (*q) oc_client_search(cl, q);
+        return;
+    }
 
     const oc_channel *ch = focused_channel(m, cid);
     if (!ch || ch->n_msgs == 0) return;
@@ -428,6 +460,7 @@ int main(int argc, char **argv) {
                 const oc_model *mm = oc_client_model(cl);
                 uint64_t cid = mm->channels[focus].channel_id;
                 if (composer[0] == '/')     handle_command(cl, cid, composer);
+                else if (mm->search_open)   { /* read-only overlay: ignore plain text */ }
                 else if (mm->thread_open)   oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
                 else                        oc_client_send(cl, cid, composer);
                 clen = 0; composer[0] = '\0'; scroll = 0;

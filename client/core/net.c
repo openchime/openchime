@@ -221,6 +221,21 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui) {
                 oc_ev *e = oc_ev_new(OC_EV_THREAD_META);
                 if (e) { e->message_id = tm.message_id; e->count = tm.reply_count; oc_queue_push(to_ui, e); }
             }
+        } else if (hdr.msg_type == OC_MSG_SEARCH_RESULTS) {
+            oc_search_result_entry se[64]; uint16_t count = 0;
+            if (oc_decode_search_results(&p, se, 64, &count, NULL) != OC_OK) return -1;
+            if (count > 64) count = 64;
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_SEARCH_RESULT);
+                if (!e) continue;
+                e->channel_id = se[i].channel_id;
+                e->message_id = se[i].message_id;
+                e->author_id = se[i].author_id;
+                e->server_time = se[i].server_time;
+                e->body = malloc(se[i].snippet.len + 1);
+                if (e->body) { memcpy(e->body, se[i].snippet.ptr, se[i].snippet.len); e->body[se[i].snippet.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
         } else if (hdr.msg_type == OC_MSG_ERROR) {
             oc_error err;
             if (oc_decode_error(&p, &err) == OC_OK) {
@@ -371,6 +386,12 @@ static void *net_thread(void *arg) {
                 sr.parent_id = c->message_id;
                 sr.body = oc_slice_str(c->body);
                 if (oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &sr) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SEARCH && c->body) {
+                uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_search s = { oc_slice_str(c->body), 50 };
+                if (oc_encode_search(&w, OC_PROTOCOL_VERSION, &s) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             oc_cmd_free(c);
