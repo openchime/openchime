@@ -51,7 +51,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_SET_NOTIFY_PREF = 37, OC_JOB_SET_DND = 38,
        OC_JOB_LIST_NOTIFY_PREFS = 39,
        /* Audio call join authorization (REQ-150): read job, channel access gate. */
-       OC_JOB_CALL_AUTH = 40 };
+       OC_JOB_CALL_AUTH = 40,
+       /* Synced client settings bucket. SET upserts/deletes one key; LIST reads a
+        * client_type bucket. Both answer with a CLIENT_SETTINGS snapshot. */
+       OC_JOB_SET_CLIENT_SETTING = 41, OC_JOB_LIST_CLIENT_SETTINGS = 42 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -126,6 +129,12 @@ typedef struct oc_job {
     char          *filename;   /* heap */
     char          *mime;       /* heap */
     uint8_t        att_sha256[32];
+
+    /* Synced client settings. SET uses client_type + key + value (empty value
+     * deletes); LIST uses client_type only. */
+    char          *cs_client_type; /* heap */
+    char          *cs_key;         /* heap */
+    char          *cs_value;       /* heap */
 } oc_job;
 
 /* --- Results (writer -> net thread) ------------------------------------- */
@@ -158,7 +167,9 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* Notification prefs snapshot (also a sync push); ERR on a bad set. */
        OC_RES_NOTIFY_PREFS = 43, OC_RES_NOTIFY_ERR = 44,
        /* Call join authorized (net thread then updates in-memory call state) / denied. */
-       OC_RES_CALL_AUTH = 45, OC_RES_CALL_ERR = 46 };
+       OC_RES_CALL_AUTH = 45, OC_RES_CALL_ERR = 46,
+       /* Synced client settings bucket snapshot (also fanned as a device-sync push). */
+       OC_RES_CLIENT_SETTINGS = 47 };
 
 /* One row in a REACTIONS result (a distinct emoji + one reacting user). */
 typedef struct { char *emoji; uint64_t user_id; } oc_reaction_row;
@@ -174,6 +185,9 @@ typedef struct {
 
 /* One row in a NOTIFY_PREFS result (REQ-130): a channel and its level. */
 typedef struct { uint64_t channel_id; uint8_t level; } oc_notify_pref_row;
+
+/* One row in a CLIENT_SETTINGS result: a synced key/value. */
+typedef struct { char *key; char *value; } oc_client_setting_row;
 
 /* One row in a WEBHOOK_LIST result (REQ-170); the token is never returned. */
 typedef struct {
@@ -314,6 +328,11 @@ typedef struct oc_dbres {
     size_t              n_nprefs;
     uint8_t             np_dnd_enabled;
     uint16_t            np_dnd_start_min, np_dnd_end_min;
+
+    /* CLIENT_SETTINGS: the bucket's client_type + its key/value rows. */
+    char                   *cs_client_type;  /* heap */
+    oc_client_setting_row  *cslist;          /* heap array */
+    size_t                  n_cslist;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;

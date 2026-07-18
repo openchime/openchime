@@ -110,6 +110,15 @@ void oc_client_set_dnd(oc_client *c, uint8_t enabled, uint16_t start_min, uint16
 void oc_client_list_notify_prefs(oc_client *c);
 void oc_client_toggle_prefs(oc_client *c, int open);
 
+/* Synced client settings (the daemon-side config bucket). Identify this
+ * frontend's bucket (default "tui"; call once at startup before listing), then
+ * upsert a key (empty value deletes) or request the whole bucket — the server
+ * answers with a CLIENT_SETTINGS snapshot that folds into the model (read with
+ * oc_model_setting) and syncs to the user's other same-type devices. */
+void oc_client_set_client_type(oc_client *c, const char *client_type);
+void oc_client_set_setting(oc_client *c, const char *key, const char *value);
+void oc_client_list_settings(oc_client *c);
+
 /* Admin / user management (REQ-030/033; owner/admin only, enforced server-side).
  * Set a user's tenant role (OC_ROLE_MEMBER/_ADMIN/_OWNER), mint a tenant invite
  * token for a role (the server answers with an INVITE_CREATED, shown once in the

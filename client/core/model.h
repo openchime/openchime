@@ -17,6 +17,10 @@
 /* One emoji's aggregate on a message: the running count and whether we reacted. */
 typedef struct { char emoji[40]; uint32_t count; uint8_t mine; } oc_reaction;
 
+/* One synced client setting (the daemon-side config bucket). key/value sizes
+ * mirror OC_SETTING_KEY_MAX / OC_SETTING_VALUE_MAX (+1 for NUL). */
+typedef struct { char key[65]; char value[513]; } oc_setting;
+
 /* One attachment hanging off a message (REQ-140): the server id (used to
  * download it), its filename + mime, and the byte size. */
 typedef struct { uint64_t id; char filename[128]; char mime[64]; uint64_t size; } oc_attachment;
@@ -123,6 +127,14 @@ typedef struct {
     size_t    n_webhooks, cap_webhooks;
     char      webhook_token[80];
     uint64_t  webhook_new_id;
+    /* The synced client-settings bucket (the daemon-side config layer). A
+     * CLIENT_SETTINGS frame — solicited or a device-sync push — replaces it
+     * wholesale (OC_EV_SETTINGS_BEGIN clears, OC_EV_SETTING entries refill). The
+     * frontend reads values with oc_model_setting and layers them over its
+     * machine-local file defaults. */
+    oc_setting *settings;
+    size_t    n_settings, cap_settings;
+    uint8_t   settings_synced;        /* a snapshot has arrived at least once */
     char     status[160];             /* last status / error line */
     /* The last hard error (auth failed, unreachable, …). Unlike `status` it is
      * NOT overwritten by the "disconnected" line, so a login flow can read the
@@ -159,6 +171,10 @@ void oc_model_close_reactlist(oc_model *m);
  * shown-once token, records the channel) / close the overlay. */
 void oc_model_weblist_begin(oc_model *m, uint64_t channel_id);
 void oc_model_close_weblist(oc_model *m);
+
+/* A synced setting's value by key, or NULL if the bucket has no such key. Valid
+ * until the next CLIENT_SETTINGS frame folds in. */
+const char *oc_model_setting(const oc_model *m, const char *key);
 
 /* Open/close the notification-prefs overlay (frontend view state). */
 void oc_model_set_prefs_open(oc_model *m, int open);

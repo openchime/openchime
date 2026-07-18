@@ -21,5 +21,6 @@ oc_cmd *oc_cmd_new(int type) {
 void oc_cmd_free(oc_cmd *c) {
     if (!c) return;
     free(c->body);
+    free(c->body2);
     free(c);
 }

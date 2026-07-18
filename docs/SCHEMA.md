@@ -365,6 +365,32 @@ Server-authoritative notification settings, synced across a user's devices.
 
 ---
 
+## 3k. Migration 0013 — synced client settings
+
+The daemon-side layer of the client's config: portable, cross-device UI prefs a
+frontend chooses to sync (the machine-local `~/.config/openchime/config` still
+holds terminal-bound defaults; the synced value, when present, wins). Opaque
+key/value storage — the daemon stores and fans it back, the frontend owns the
+meaning (PROTOCOL.md: `SET_CLIENT_SETTING` / `LIST_CLIENT_SETTINGS` /
+`CLIENT_SETTINGS`).
+
+### `client_settings`
+- `(user_id, client_type, key)` (PK) — one value per user, per frontend bucket,
+  per key. `client_type` (e.g. `tui`, a future `gui`) partitions the store so
+  one frontend's prefs never collide with another's.
+- `value` (TEXT) — the setting value; an empty value on `SET` deletes the row, so
+  the bucket stays sparse and a deleted key falls back to the client's file
+  default.
+- `updated_ms` (INTEGER) — last-write timestamp (last-writer-wins; no vector
+  clock — these are single-user, low-contention prefs).
+
+A `SET` returns a fresh bucket snapshot, which the daemon fans to **all** of the
+user's live connections; each client folds only the snapshot whose `client_type`
+matches its own, so a change on one device reaches the user's other same-type
+devices.
+
+---
+
 ## 4. Deferred to later migrations
 
 Tracked here so the omissions are deliberate, not forgotten:

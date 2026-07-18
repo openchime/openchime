@@ -232,6 +232,22 @@ static const char MIGRATION_0012[] =
     "ALTER TABLE users ADD COLUMN dnd_start_min INTEGER NOT NULL DEFAULT 0;"
     "ALTER TABLE users ADD COLUMN dnd_end_min INTEGER NOT NULL DEFAULT 0;";
 
+/* Portable, device-synced client settings (the daemon half of the layered client
+ * config). A row is one (user, client_type, key) -> value: the client_type
+ * partitions the store into per-frontend buckets ("tui", a future "gui", …) so a
+ * TUI's synced prefs don't collide with a GUI's. The daemon is opaque about the
+ * keys/values — it stores and fans them back; the frontend decides their meaning.
+ * Machine-local prefs stay in the client's home config file (never synced here). */
+static const char MIGRATION_0013[] =
+    "CREATE TABLE client_settings ("
+    "  user_id     INTEGER NOT NULL REFERENCES users(id),"
+    "  client_type TEXT NOT NULL,"
+    "  key         TEXT NOT NULL,"
+    "  value       TEXT NOT NULL,"
+    "  updated_ms  INTEGER NOT NULL DEFAULT 0,"
+    "  PRIMARY KEY (user_id, client_type, key)"
+    ");";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -245,6 +261,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 10, MIGRATION_0010 },
     { 11, MIGRATION_0011 },
     { 12, MIGRATION_0012 },
+    { 13, MIGRATION_0013 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

@@ -100,6 +100,9 @@ typedef enum {
     OC_MSG_SET_DND          = 0x0091, /* C->S, set the do-not-disturb window (REQ-131) */
     OC_MSG_LIST_NOTIFY_PREFS= 0x0092, /* C->S, request all notification settings */
     OC_MSG_NOTIFY_PREFS     = 0x0093, /* S->C, DND + per-channel levels (also a sync push) */
+    OC_MSG_SET_CLIENT_SETTING  = 0x0094, /* C->S, upsert a synced client setting (empty value = delete) */
+    OC_MSG_LIST_CLIENT_SETTINGS= 0x0095, /* C->S, request a client_type bucket's settings */
+    OC_MSG_CLIENT_SETTINGS     = 0x0096, /* S->C, a bucket snapshot (also a device-sync push) */
     OC_MSG_CALL_JOIN        = 0x00A0, /* C->S, join a channel's audio call (REQ-150) */
     OC_MSG_CALL_LEAVE       = 0x00A1, /* C->S, leave the call */
     OC_MSG_CALL_JOINED      = 0x00A2, /* S->C, to the joiner: call id + UDP endpoint/token + roster */
@@ -262,6 +265,12 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_NOTIFY_NONE     2u
 #define OC_MAX_NOTIFY_PREFS 1024u   /* cap on a NOTIFY_PREFS list */
 
+/* Synced client settings (the daemon-side settings bucket). */
+#define OC_MAX_CLIENT_SETTINGS 128u /* cap on a CLIENT_SETTINGS snapshot */
+#define OC_CLIENT_TYPE_MAX     32u  /* client_type string cap (bytes) */
+#define OC_SETTING_KEY_MAX     64u  /* setting key string cap (bytes) */
+#define OC_SETTING_VALUE_MAX   512u /* setting value string cap (bytes) */
+
 /* Channel kind (SCHEMA.md channels.kind) and the name cap for CREATE_CHANNEL. */
 #define OC_CHANNEL_KIND    0u   /* a named channel */
 #define OC_CHANNEL_KIND_DM 1u   /* a direct-message conversation (reserved) */
@@ -354,6 +363,12 @@ typedef struct { uint8_t enabled; uint16_t start_min; uint16_t end_min; } oc_set
 typedef struct { uint64_t channel_id; uint8_t level; } oc_notify_pref_entry;
 typedef struct { uint8_t dnd_enabled; uint16_t dnd_start_min; uint16_t dnd_end_min;
                  uint16_t count; const oc_notify_pref_entry *entries; } oc_notify_prefs;
+/* Synced client settings bucket (the daemon-side layer of the client config). */
+typedef struct { oc_slice client_type; oc_slice key; oc_slice value; } oc_set_client_setting;
+typedef struct { oc_slice client_type; } oc_list_client_settings;
+typedef struct { oc_slice key; oc_slice value; } oc_client_setting_entry;
+typedef struct { oc_slice client_type; uint16_t count;
+                 const oc_client_setting_entry *entries; } oc_client_settings;
 /* Audio call signaling (REQ-150). CALL_JOINED carries the joiner's private UDP
  * endpoint + bearer token (empty until the sidecar milestone) plus the roster;
  * CALL_ROSTER carries just the participant list, pushed on any change. */
@@ -447,6 +462,9 @@ oc_result oc_encode_set_notify_pref(oc_wbuf *w, uint16_t version, const oc_set_n
 oc_result oc_encode_set_dnd(oc_wbuf *w, uint16_t version, const oc_set_dnd *m);
 oc_result oc_encode_list_notify_prefs(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_notify_prefs(oc_wbuf *w, uint16_t version, const oc_notify_prefs *m);
+oc_result oc_encode_set_client_setting(oc_wbuf *w, uint16_t version, const oc_set_client_setting *m);
+oc_result oc_encode_list_client_settings(oc_wbuf *w, uint16_t version, const oc_list_client_settings *m);
+oc_result oc_encode_client_settings(oc_wbuf *w, uint16_t version, const oc_client_settings *m);
 oc_result oc_encode_call_join(oc_wbuf *w, uint16_t version, const oc_call_join *m);
 oc_result oc_encode_call_leave(oc_wbuf *w, uint16_t version, const oc_call_leave *m);
 oc_result oc_encode_call_joined(oc_wbuf *w, uint16_t version, const oc_call_joined *m);
@@ -532,6 +550,12 @@ oc_result oc_decode_set_dnd(oc_rbuf *p, oc_set_dnd *m);
 oc_result oc_decode_list_notify_prefs(oc_rbuf *p);
 oc_result oc_decode_notify_prefs(oc_rbuf *p, oc_notify_pref_entry *entries, uint16_t cap,
                                  uint16_t *out_count, oc_set_dnd *dnd_out);
+oc_result oc_decode_set_client_setting(oc_rbuf *p, oc_set_client_setting *m);
+oc_result oc_decode_list_client_settings(oc_rbuf *p, oc_list_client_settings *m);
+/* CLIENT_SETTINGS decodes the entries into a caller buffer; client_type stays a
+ * view into the frame. */
+oc_result oc_decode_client_settings(oc_rbuf *p, oc_client_settings *m,
+                                    oc_client_setting_entry *entries, uint16_t cap);
 oc_result oc_decode_call_join(oc_rbuf *p, oc_call_join *m);
 oc_result oc_decode_call_leave(oc_rbuf *p, oc_call_leave *m);
 /* CALL_JOINED/CALL_ROSTER decode the participant ids into a caller buffer. */

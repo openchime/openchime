@@ -35,6 +35,8 @@ enum {
     OC_EV_ATTACHMENT,      /* a message's attachment: channel_id + message_id + parent_id=attachment_id + server_time=size + body=filename + author_name=mime */
     OC_EV_XFER,            /* a transfer notice: op=phase (0 progress, 1 done, 2 error), body=status text */
     OC_EV_READ_STATE,      /* channel_id: mark its currently-loaded messages read (replayed cache is not "unread") */
+    OC_EV_SETTINGS_BEGIN,  /* a CLIENT_SETTINGS frame start: clears the synced bucket before its entries */
+    OC_EV_SETTING,         /* one synced setting: author_name=key, body=value */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
     OC_EV_ERROR            /* protocol/transport error; body = human message */
 };
@@ -80,6 +82,8 @@ enum {
     OC_CMD_SET_NOTIFY_PREF, /* set `channel_id`'s notification level (op = level) */
     OC_CMD_SET_DND,         /* set the DND window: op = enabled, channel_id = start_min, message_id = end_min */
     OC_CMD_LIST_NOTIFY_PREFS, /* request all notification settings (DND + per-channel) */
+    OC_CMD_SET_SETTING,     /* upsert a synced client setting: body=key, body2=value (empty value deletes) */
+    OC_CMD_LIST_SETTINGS,   /* request the synced client-settings bucket */
     OC_CMD_SET_ROLE,        /* set a user's tenant role: channel_id = user_id, op = role */
     OC_CMD_INVITE_USER,     /* mint a tenant invite token: op = role */
     OC_CMD_REMOVE_USER,     /* remove/disable a user: channel_id = user_id */
@@ -97,7 +101,8 @@ typedef struct {
     uint64_t channel_id;
     uint64_t message_id;   /* REACT */
     uint8_t  op;           /* REACT: add/remove */
-    char    *body;         /* heap; SEND body / REACT emoji */
+    char    *body;         /* heap; SEND body / REACT emoji / SET_SETTING key */
+    char    *body2;        /* heap; SET_SETTING value, else NULL */
 } oc_cmd;
 
 oc_cmd *oc_cmd_new(int type);

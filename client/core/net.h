@@ -29,6 +29,11 @@ oc_net *oc_net_start(const char *host, int port, const char *token,
  * if not currently backing off). */
 void oc_net_reconnect(oc_net *n);
 
+/* Set the synced-settings bucket id for this client (default "tui"). Call once
+ * right after start, before soliciting settings; identifies the per-frontend
+ * bucket so a TUI's synced prefs stay separate from a future GUI's. */
+void oc_net_set_client_type(oc_net *n, const char *client_type);
+
 /* Signal the thread to stop, join it, and free. */
 void oc_net_stop(oc_net *n);
 

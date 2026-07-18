@@ -955,6 +955,34 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_CLIENT_SETTING) {
+            oc_set_client_setting cs;
+            if (oc_decode_set_client_setting(&p, &cs) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_CLIENT_SETTING, c->conn_id);
+            if (!j) return -1;
+            size_t ctl = cs.client_type.len < OC_CLIENT_TYPE_MAX ? cs.client_type.len : OC_CLIENT_TYPE_MAX;
+            size_t kl  = cs.key.len   < OC_SETTING_KEY_MAX   ? cs.key.len   : OC_SETTING_KEY_MAX;
+            size_t vl  = cs.value.len < OC_SETTING_VALUE_MAX ? cs.value.len : OC_SETTING_VALUE_MAX;
+            j->user_id = c->user_id;
+            j->cs_client_type = strndup((const char *)cs.client_type.ptr, ctl);
+            j->cs_key   = strndup((const char *)cs.key.ptr, kl);
+            j->cs_value = strndup((const char *)cs.value.ptr, vl);
+            if (!j->cs_client_type || !j->cs_key || !j->cs_value) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_CLIENT_SETTINGS) {
+            oc_list_client_settings ls;
+            if (oc_decode_list_client_settings(&p, &ls) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_CLIENT_SETTINGS, c->conn_id);
+            if (!j) return -1;
+            size_t ctl = ls.client_type.len < OC_CLIENT_TYPE_MAX ? ls.client_type.len : OC_CLIENT_TYPE_MAX;
+            j->user_id = c->user_id;
+            j->cs_client_type = strndup((const char *)ls.client_type.ptr, ctl);
+            if (!j->cs_client_type) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_CALL_JOIN) {
             oc_call_join cj;
             if (oc_decode_call_join(&p, &cj) != OC_OK) return -1;
@@ -1833,6 +1861,28 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("notify pref error") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_CLIENT_SETTINGS: {
+        /* Sync the bucket snapshot to *all* of the user's connections, so a change
+         * on one device reaches the others; each client folds it only if the
+         * client_type matches its own (per-frontend buckets). */
+        static oc_client_setting_entry ents[OC_MAX_CLIENT_SETTINGS];
+        uint16_t n = 0;
+        for (size_t i = 0; i < r->n_cslist && n < OC_MAX_CLIENT_SETTINGS; i++) {
+            ents[n].key = oc_slice_str(r->cslist[i].key ? r->cslist[i].key : "");
+            ents[n].value = oc_slice_str(r->cslist[i].value ? r->cslist[i].value : "");
+            n++;
+        }
+        oc_client_settings cst = { oc_slice_str(r->cs_client_type ? r->cs_client_type : ""), n, ents };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_client_settings(&w, OC_PROTOCOL_VERSION, &cst);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id == r->user_id)
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
         break;
     }
     case OC_RES_CALL_AUTH: {

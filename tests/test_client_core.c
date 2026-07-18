@@ -330,7 +330,7 @@ static void test_secret_routing(void) {
 }
 
 int run_client_core_tests(void) {
-    printf("test_client_core: resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, persisted store, cached history, session reconnect, offline outbox\n");
+    printf("test_client_core: resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, client-settings, persisted store, cached history, session reconnect, offline outbox\n");
 
     test_resolve();
     test_last_error();
@@ -455,6 +455,28 @@ int run_client_core_tests(void) {
         CHECK(WAIT_FOR(a, !m->dnd_enabled));
         oc_client_toggle_prefs(a, 0);
         CHECK(!oc_client_model(a)->prefs_open);
+
+        /* synced client-settings bucket: dana sets keys on device `a`; each SET
+         * returns a fresh snapshot that folds into her model (read via
+         * oc_model_setting) and — because the daemon fans the sync to all of a
+         * user's connections — reaches a second dana device `d`. Deleting a key
+         * (empty value) drops it everywhere. */
+        oc_client *d = oc_client_start("127.0.0.1", arg.port, "dana:pw-dana");
+        CHECK(d);
+        CHECK(WAIT_FOR(d, m->authed && m->user_id != 0));
+        oc_client_list_settings(d);                 /* subscribe to the (empty) bucket */
+        CHECK(WAIT_FOR(d, m->settings_synced));
+        oc_client_set_setting(a, "mouse", "1");
+        CHECK(WAIT_FOR(a, oc_model_setting(m, "mouse") && strcmp(oc_model_setting(m, "mouse"), "1") == 0));
+        CHECK(WAIT_FOR(d, oc_model_setting(m, "mouse") && strcmp(oc_model_setting(m, "mouse"), "1") == 0));
+        oc_client_set_setting(a, "time_24h", "1");   /* a second key: both persist */
+        CHECK(WAIT_FOR(d, oc_model_setting(m, "time_24h") &&
+                          strcmp(oc_model_setting(m, "time_24h"), "1") == 0 &&
+                          oc_model_setting(m, "mouse") != NULL));
+        oc_client_set_setting(a, "mouse", "");       /* empty value deletes the key */
+        CHECK(WAIT_FOR(d, oc_model_setting(m, "mouse") == NULL &&
+                          oc_model_setting(m, "time_24h") != NULL));
+        oc_client_stop(d);
 
         /* erik replies to dana's message in a thread: both see the parent's reply
          * count rise, and opening the thread streams the reply into the buffer. */

@@ -123,8 +123,20 @@ model; translate input to intents }, stop.
   select, wheel to scroll) and reads machine-local prefs from
   `~/.config/openchime/config` (`client/tui/config.c`, XDG, created with commented
   defaults on first run): `mouse`, `members_panel` (off/on/auto), panel widths,
-  `time` (12/24h), and a default `instance`. Portable, cross-device settings will
-  live in a daemon per-`(user, client_type)` settings bucket instead.
+  `time` (12/24h), and a default `instance`. **Layered config:** the portable
+  prefs (everything but `instance`) also sync through the daemon's per-`(user,
+  client_type)` settings bucket (a `client_settings` key/value table; wire
+  `SET_CLIENT_SETTING` / `LIST_CLIENT_SETTINGS` / `CLIENT_SETTINGS`), layered
+  *over* the machine-local file — a value in the daemon bucket wins, else the
+  file default stands. The core exposes it as `oc_client_set_setting` /
+  `oc_client_list_settings`, folding each snapshot into the model
+  (`oc_model_setting`); the `tui` bucket is separate from a future `gui` one, so
+  frontends never step on each other. `/set <key>
+  <value>` (`mouse on|off`, `members off|on|auto`, `time 12h|24h`,
+  `channels-width N`, `members-width N`, `reset <key>`) writes a key, which
+  round-trips back and applies live; the daemon fans the change to your other
+  logged-in TUIs so they update in place. Which server you connect to
+  (`instance`) is deliberately machine-local and never synced.
   **Composer autocomplete:** as you type, a live suggestion strip offers
   context-aware completions — slash commands, `#channel` and `@user` names (from
   the model's channel list + roster), command arguments (channels for

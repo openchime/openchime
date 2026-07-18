@@ -26,6 +26,7 @@ struct oc_net {
     char         *token;
     char         *store_path;   /* local store for token/pin persistence, or NULL */
     oc_secret    *secret;       /* borrowed OS keyring for the session token, or NULL */
+    char          client_type[32]; /* synced-settings bucket id (default "tui") */
     oc_queue     *to_ui;
     oc_queue     *from_ui;
 };
@@ -198,6 +199,7 @@ typedef struct {
     oc_hwtab    *hw;
     oc_store    *store;      /* cache messages as they arrive (NULL = no store) */
     const char  *instance;
+    const char  *client_type; /* which settings bucket this frontend syncs */
 } disp_ctx;
 
 /* Push a transfer notice (phase: 0 progress, 1 done, 2 error) to the UI. */
@@ -467,6 +469,28 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (!e) continue;
                 e->channel_id = ne[i].channel_id;
                 e->op = ne[i].level;
+                oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_CLIENT_SETTINGS) {
+            enum { CS_CAP = OC_MAX_CLIENT_SETTINGS };
+            oc_client_setting_entry ce[CS_CAP];
+            oc_client_settings cst;
+            if (oc_decode_client_settings(&p, &cst, ce, CS_CAP) != OC_OK) return -1;
+            /* Only fold a bucket meant for this frontend; the daemon fans the sync
+             * to all of a user's connections regardless of client_type. */
+            const char *ct = ctx->client_type ? ctx->client_type : "";
+            if (cst.client_type.len != strlen(ct) ||
+                (cst.client_type.len && memcmp(cst.client_type.ptr, ct, cst.client_type.len) != 0))
+                continue;
+            oc_ev *h = oc_ev_new(OC_EV_SETTINGS_BEGIN);   /* clears the bucket (sync boundary) */
+            if (h) oc_queue_push(to_ui, h);
+            for (uint16_t i = 0; i < cst.count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_SETTING);
+                if (!e) continue;
+                size_t kn = ce[i].key.len < sizeof e->author_name - 1 ? ce[i].key.len : sizeof e->author_name - 1;
+                memcpy(e->author_name, ce[i].key.ptr, kn); e->author_name[kn] = '\0';
+                e->body = malloc(ce[i].value.len + 1);
+                if (e->body) { memcpy(e->body, ce[i].value.ptr, ce[i].value.len); e->body[ce[i].value.len] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_USER_UPDATED) {
@@ -761,7 +785,7 @@ static int run_connection(oc_net *n, int reconnecting,
      * An in-flight attachment transfer (upload/download) is driven by both. */
     *served = 1;
     disp_ctx ctx = { n->to_ui, &conn, fd, &n->stop, &xfer, hw,
-                     cs ? cs->store : NULL, cs ? cs->instance : NULL };
+                     cs ? cs->store : NULL, cs ? cs->instance : NULL, n->client_type };
     while (!n->stop) {
         oc_cmd *c;
         while ((c = oc_queue_try_pop(n->from_ui)) != NULL) {
@@ -883,6 +907,20 @@ static int run_connection(oc_net *n, int reconnecting,
             if (c->type == OC_CMD_LIST_NOTIFY_PREFS) {
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 if (oc_encode_list_notify_prefs(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_SETTING) {
+                static uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_client_setting cs = { oc_slice_str(n->client_type),
+                                             oc_slice_str(c->body ? c->body : ""),
+                                             oc_slice_str(c->body2 ? c->body2 : "") };
+                if (oc_encode_set_client_setting(&w, OC_PROTOCOL_VERSION, &cs) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_SETTINGS) {
+                uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_list_client_settings ls = { oc_slice_str(n->client_type) };
+                if (oc_encode_list_client_settings(&w, OC_PROTOCOL_VERSION, &ls) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SET_ROLE) {
@@ -1167,6 +1205,7 @@ oc_net *oc_net_start(const char *host, int port, const char *token,
     n->token = token ? strdup(token) : NULL;
     n->store_path = (store_path && store_path[0]) ? strdup(store_path) : NULL;
     n->secret = secret;
+    snprintf(n->client_type, sizeof n->client_type, "%s", "tui");
     n->to_ui = to_ui;
     n->from_ui = from_ui;
     if (pthread_create(&n->thread, NULL, net_thread, n) != 0) {
@@ -1177,6 +1216,11 @@ oc_net *oc_net_start(const char *host, int port, const char *token,
 
 void oc_net_reconnect(oc_net *n) {
     if (n) n->reconnect_now = 1;   /* the backoff loop polls this and retries at once */
+}
+
+void oc_net_set_client_type(oc_net *n, const char *client_type) {
+    if (n && client_type && client_type[0])
+        snprintf(n->client_type, sizeof n->client_type, "%s", client_type);
 }
 
 void oc_net_stop(oc_net *n) {

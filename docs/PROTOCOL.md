@@ -912,6 +912,30 @@ device updates the others.
 
 ---
 
+### 5.16a Synced client settings
+
+The daemon-side layer of the client config: portable UI prefs a frontend syncs
+across its devices, keyed by a `client_type` bucket so a TUI's prefs stay
+separate from a future GUI's. The daemon is opaque about the keys/values — it
+stores and fans them back; the frontend owns their meaning (SCHEMA.md §3k).
+
+**`SET_CLIENT_SETTING` (C → S), `0x0094`** `{ client_type: str, key: str, value:
+str }` — upsert one key in the caller's `(user, client_type)` bucket. An **empty
+`value` deletes** the key (it then falls back to the client's machine-local
+default). Answered with a `CLIENT_SETTINGS` snapshot.
+
+**`LIST_CLIENT_SETTINGS` (C → S), `0x0095`** `{ client_type: str }` — request the
+caller's full bucket for a `client_type`. Answered with `CLIENT_SETTINGS`.
+
+**`CLIENT_SETTINGS` (S → C), `0x0096`** `{ client_type: str, count: u16, count ×
+{ key: str, value: str } }` — the bucket snapshot. Sent as the reply to
+`LIST_CLIENT_SETTINGS` and, after any `SET_CLIENT_SETTING`, **pushed to every one
+of the user's connections**; a client folds only the snapshot whose
+`client_type` matches its own, so the sync reaches the user's other same-type
+devices without leaking one frontend's bucket to another.
+
+---
+
 ### 5.17 Audio call signaling (REQ-150, REQ-152)
 
 Audio is **server-relayed** (no P2P/ICE, ARCH-18): the media itself flows over a
@@ -1123,6 +1147,9 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0091` | `SET_DND`          | C → S     | no        | §5.16   |
 | `0x0092` | `LIST_NOTIFY_PREFS`| C → S     | no        | §5.16   |
 | `0x0093` | `NOTIFY_PREFS`     | S → C     | no        | §5.16   |
+| `0x0094` | `SET_CLIENT_SETTING`   | C → S | no        | §5.16a  |
+| `0x0095` | `LIST_CLIENT_SETTINGS` | C → S | no        | §5.16a  |
+| `0x0096` | `CLIENT_SETTINGS`      | S → C | no        | §5.16a  |
 | `0x00A0` | `CALL_JOIN`        | C → S     | no        | §5.17   |
 | `0x00A1` | `CALL_LEAVE`       | C → S     | no        | §5.17   |
 | `0x00A2` | `CALL_JOINED`      | S → C     | no        | §5.17   |

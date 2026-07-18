@@ -264,6 +264,25 @@ void oc_client_toggle_prefs(oc_client *c, int open) {
     if (open) oc_client_list_notify_prefs(c);   /* refresh on open */
 }
 
+void oc_client_set_client_type(oc_client *c, const char *client_type) {
+    if (c) oc_net_set_client_type(c->net, client_type);
+}
+
+void oc_client_set_setting(oc_client *c, const char *key, const char *value) {
+    if (!c || !key || !key[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_SETTING);
+    if (!cmd) return;
+    cmd->body  = strdup(key);
+    cmd->body2 = strdup(value ? value : "");   /* empty value deletes the key */
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_settings(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_SETTINGS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_set_role(oc_client *c, uint64_t user_id, uint8_t role) {
     if (!c || !user_id) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_ROLE);

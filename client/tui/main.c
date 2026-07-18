@@ -33,7 +33,9 @@
  *       /who (member roster + presence) · /away · /online · /dm <name> (open a
  *       direct message) · /prefs (notification settings) · /notify
  *       all|mentions|none (this channel's level) · /dnd HH:MM HH:MM | off
- *       (do-not-disturb window) · /role <name> owner|admin|member ·
+ *       (do-not-disturb window) · /set <key> <value> (a synced pref: mouse,
+ *       members, time, channels-width, members-width, reset) ·
+ *       /role <name> owner|admin|member ·
  *       /invite [admin|member] (mint a token) · /remove <name> (owner/admin) ·
  *       /webhook (list this channel's incoming webhooks) · /webhook create
  *       <label> (mint one; token shown once) · /webhook rm <id> (delete one) ·
@@ -68,6 +70,38 @@
 
 /* Machine-local prefs, loaded once in main() (see config.h). */
 static const oc_config *g_cfg = NULL;
+
+/* Keys of the portable prefs mirrored into the daemon's synced settings bucket
+ * (the daemon-side config layer). Machine-local-only fields (e.g. instance) are
+ * deliberately absent — which server you connect to should not sync. */
+#define OC_SYNC_KEY_MOUSE     "mouse"
+#define OC_SYNC_KEY_MEMBERS   "members_panel"
+#define OC_SYNC_KEY_TIME24    "time_24h"
+#define OC_SYNC_KEY_CHWIDTH   "channels_width"
+#define OC_SYNC_KEY_MEMWIDTH  "members_width"
+
+/* A synced setting's integer value, or `fallback` when the bucket lacks the key. */
+static int synced_int(const oc_model *m, const char *key, int fallback) {
+    const char *v = oc_model_setting(m, key);
+    if (!v || !v[0]) return fallback;
+    return atoi(v);
+}
+
+/* Layer the daemon's synced bucket over the machine-local file defaults (`base`):
+ * a key present in the bucket wins, else the file/default value stands. Returns 1
+ * if the effective mouse setting changed, so the caller re-arms termbox input. */
+static int apply_synced_settings(oc_config *cfg, const oc_config *base, const oc_model *m) {
+    int old_mouse = cfg->mouse;
+    cfg->mouse          = synced_int(m, OC_SYNC_KEY_MOUSE,    base->mouse) ? 1 : 0;
+    cfg->members_panel  = synced_int(m, OC_SYNC_KEY_MEMBERS,  base->members_panel);
+    cfg->time_24h       = synced_int(m, OC_SYNC_KEY_TIME24,   base->time_24h) ? 1 : 0;
+    cfg->channels_width = synced_int(m, OC_SYNC_KEY_CHWIDTH,  base->channels_width);
+    cfg->members_width  = synced_int(m, OC_SYNC_KEY_MEMWIDTH, base->members_width);
+    if (cfg->members_panel < 0 || cfg->members_panel > 2) cfg->members_panel = base->members_panel;
+    if (cfg->channels_width < 10 || cfg->channels_width > 60) cfg->channels_width = base->channels_width;
+    if (cfg->members_width  < 10 || cfg->members_width  > 60) cfg->members_width  = base->members_width;
+    return cfg->mouse != old_mouse;
+}
 
 /* Distinct-ish colors for author nicks, picked by hashing the user id. */
 static const uintattr_t NICK_COLORS[] = {
@@ -466,6 +500,8 @@ static void draw_help(int W, int H) {
         "  /search <query>  /close",
         "People & notifications:",
         "  /who  /away  /online  /prefs  /notify <lvl>  /dnd <win|off>",
+        "Preferences (synced):",
+        "  /set mouse|members|time|channels-width|members-width <value>",
         "Files, webhooks, admin:",
         "  /upload <path>  /download <id>  /webhook  /invite  /role  /remove",
         "Session:",
@@ -498,7 +534,7 @@ static int ci_prefix(const char *s, const char *pre) {
 static const char *AC_COMMANDS[] = {
     "/react", "/reactions", "/edit", "/delete", "/thread", "/search", "/close",
     "/create", "/join", "/leave", "/list", "/dm", "/who", "/away", "/online",
-    "/prefs", "/notify", "/dnd", "/role", "/invite", "/remove", "/webhook",
+    "/prefs", "/notify", "/dnd", "/set", "/role", "/invite", "/remove", "/webhook",
     "/upload", "/download", "/logout", "/help",
 };
 
@@ -786,7 +822,8 @@ static const struct { const char *cmd; const char *desc; int arg; } PAL_CMDS[] =
     {"/away","set yourself away",0}, {"/online","set yourself online",0}, {"/search","search messages",1},
     {"/thread","open last message's thread",0}, {"/reactions","who reacted (last)",0}, {"/react","react to last",1},
     {"/edit","edit your last message",1}, {"/delete","delete your last message",0}, {"/prefs","notification settings",0},
-    {"/notify","set channel notify level",1}, {"/dnd","do-not-disturb window",1}, {"/role","set a user's role",1},
+    {"/notify","set channel notify level",1}, {"/dnd","do-not-disturb window",1},
+    {"/set","synced pref (mouse/members/time/…)",1}, {"/role","set a user's role",1},
     {"/invite","mint an invite token",0}, {"/remove","remove a user",1}, {"/webhook","channel webhooks",0},
     {"/upload","upload a file",1}, {"/download","download an attachment",1}, {"/help","keys & commands",0},
     {"/logout","sign out",0}, {"/close","close the open overlay",0},
@@ -951,6 +988,12 @@ static int parse_hhmm(const char *s) {
  *   /edit  <text>   replace the text of your last message
  *   /delete         tombstone your last message
  */
+/* Parse an on/off token (on/1/true/yes = 1; anything else = 0). */
+static int setting_onoff(const char *v) {
+    return v && (strcmp(v, "on") == 0 || strcmp(v, "1") == 0 ||
+                 strcmp(v, "true") == 0 || strcmp(v, "yes") == 0);
+}
+
 static void handle_command(oc_client *cl, uint64_t cid, const char *line) {
     const oc_model *m = oc_client_model(cl);
     if (strcmp(line, "/close") == 0) {
@@ -1080,6 +1123,37 @@ static void handle_command(oc_client *cl, uint64_t cid, const char *line) {
         while (*nm == ' ') nm++;
         uint64_t uid = oc_model_user_id(m, nm);
         if (uid) oc_client_remove_user(cl, uid);
+        return;
+    }
+    if (strncmp(line, "/set", 4) == 0 && (line[4] == '\0' || line[4] == ' ')) {
+        /* Portable prefs that sync via the daemon bucket (see apply_synced_settings).
+         *   /set mouse on|off · /set members off|on|auto · /set time 12h|24h
+         *   /set channels-width N · /set members-width N · /set reset <key> */
+        char key[24] = {0}, val[32] = {0};
+        sscanf(line + 4, "%23s %31s", key, val);
+        char num[8];
+        if (strcmp(key, "mouse") == 0) {
+            oc_client_set_setting(cl, OC_SYNC_KEY_MOUSE, setting_onoff(val) ? "1" : "0");
+        } else if (strcmp(key, "members") == 0) {
+            int v = strcmp(val, "auto") == 0 ? 2 : (setting_onoff(val) ? 1 : 0);
+            snprintf(num, sizeof num, "%d", v);
+            oc_client_set_setting(cl, OC_SYNC_KEY_MEMBERS, num);
+        } else if (strcmp(key, "time") == 0) {
+            oc_client_set_setting(cl, OC_SYNC_KEY_TIME24, strcmp(val, "24h") == 0 ? "1" : "0");
+        } else if (strcmp(key, "channels-width") == 0 || strcmp(key, "members-width") == 0) {
+            int n = atoi(val);
+            if (n >= 10 && n <= 60) {
+                snprintf(num, sizeof num, "%d", n);
+                oc_client_set_setting(cl, key[0] == 'c' ? OC_SYNC_KEY_CHWIDTH : OC_SYNC_KEY_MEMWIDTH, num);
+            }
+        } else if (strcmp(key, "reset") == 0) {
+            /* Delete a synced key (empty value) so the file default takes over. */
+            if      (strcmp(val, "mouse") == 0)          oc_client_set_setting(cl, OC_SYNC_KEY_MOUSE, "");
+            else if (strcmp(val, "members") == 0)        oc_client_set_setting(cl, OC_SYNC_KEY_MEMBERS, "");
+            else if (strcmp(val, "time") == 0)           oc_client_set_setting(cl, OC_SYNC_KEY_TIME24, "");
+            else if (strcmp(val, "channels-width") == 0) oc_client_set_setting(cl, OC_SYNC_KEY_CHWIDTH, "");
+            else if (strcmp(val, "members-width") == 0)  oc_client_set_setting(cl, OC_SYNC_KEY_MEMWIDTH, "");
+        }
         return;
     }
 
@@ -1324,8 +1398,9 @@ int main(int argc, char **argv) {
      * wide glyph as U+FFFD, defeating the whole point of utf8proc. */
     setlocale(LC_ALL, "");
 
-    static oc_config cfg;
+    static oc_config cfg, file_cfg;
     oc_config_load(&cfg);
+    file_cfg = cfg;          /* the machine-local base; synced settings layer over it */
     g_cfg = &cfg;
 
     const char *store_path = resolve_store_path();
@@ -1400,12 +1475,20 @@ int main(int argc, char **argv) {
     uint64_t last_focus_cid = 0;
     time_t last_typing = 0;                   /* throttle outbound TYPING signals */
     int running = 1, logging_out = 0;
+    int settings_req = 0;                      /* asked the daemon for the synced bucket this session */
 
     while (running) {
         oc_client_tick(cl);
 
         const oc_model *m = oc_client_model(cl);
         if (focus >= m->n_channels) focus = m->n_channels ? m->n_channels - 1 : 0;
+        /* Pull the synced settings bucket once per authenticated session (a
+         * reconnect re-pulls); then layer whatever has arrived over the file
+         * defaults, re-arming mouse input if that pref flipped. */
+        if (!m->connected) settings_req = 0;
+        else if (m->authed && !settings_req) { oc_client_list_settings(cl); settings_req = 1; }
+        if (apply_synced_settings(&cfg, &file_cfg, m))
+            tb_set_input_mode(TB_INPUT_ESC | (cfg.mouse ? TB_INPUT_MOUSE : 0));
         /* After /logout, quit once the server has closed the connection. */
         if (logging_out && !m->connected) running = 0;
 

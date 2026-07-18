@@ -647,6 +647,60 @@ oc_result oc_decode_notify_prefs(oc_rbuf *p, oc_notify_pref_entry *entries, uint
     return r_done(p);
 }
 
+/* --- Synced client settings bucket -------------------------------------- */
+
+oc_result oc_encode_set_client_setting(oc_wbuf *w, uint16_t version, const oc_set_client_setting *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_CLIENT_SETTING);
+    oc_w_str(w, m->client_type);
+    oc_w_str(w, m->key);
+    oc_w_str(w, m->value);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_list_client_settings(oc_wbuf *w, uint16_t version, const oc_list_client_settings *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_CLIENT_SETTINGS);
+    oc_w_str(w, m->client_type);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_client_settings(oc_wbuf *w, uint16_t version, const oc_client_settings *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CLIENT_SETTINGS);
+    oc_w_str(w, m->client_type);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        oc_w_str(w, m->entries[i].key);
+        oc_w_str(w, m->entries[i].value);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_client_setting(oc_rbuf *p, oc_set_client_setting *m) {
+    m->client_type = oc_r_str(p);
+    m->key = oc_r_str(p);
+    m->value = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_list_client_settings(oc_rbuf *p, oc_list_client_settings *m) {
+    m->client_type = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_client_settings(oc_rbuf *p, oc_client_settings *m,
+                                    oc_client_setting_entry *entries, uint16_t cap) {
+    m->client_type = oc_r_str(p);
+    uint16_t count = oc_r_u16(p);
+    m->count = count;
+    m->entries = entries;
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
+        oc_slice k = oc_r_str(p);
+        oc_slice v = oc_r_str(p);
+        if (i < cap) { entries[i].key = k; entries[i].value = v; }
+    }
+    if (m->count > cap) m->count = cap;
+    return r_done(p);
+}
+
 /* --- Audio call signaling (REQ-150) ------------------------------------- */
 
 oc_result oc_encode_call_join(oc_wbuf *w, uint16_t version, const oc_call_join *m) {

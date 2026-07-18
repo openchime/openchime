@@ -537,6 +537,39 @@ static void test_notify_frames(void) {
     }
 }
 
+static void test_client_settings_frames(void) {
+    {
+        oc_set_client_setting in = { oc_slice_str("tui"), oc_slice_str("mouse"), oc_slice_str("1") };
+        ROUNDTRIP(oc_encode_set_client_setting(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_CLIENT_SETTING, h, p);
+        oc_set_client_setting out;
+        CHECK(oc_decode_set_client_setting(&p, &out) == OC_OK);
+        CHECK(out.client_type.len == 3 && memcmp(out.client_type.ptr, "tui", 3) == 0);
+        CHECK(out.key.len == 5 && memcmp(out.key.ptr, "mouse", 5) == 0);
+        CHECK(out.value.len == 1 && out.value.ptr[0] == '1');
+    }
+    {
+        oc_list_client_settings in = { oc_slice_str("tui") };
+        ROUNDTRIP(oc_encode_list_client_settings(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_CLIENT_SETTINGS, h, p);
+        oc_list_client_settings out;
+        CHECK(oc_decode_list_client_settings(&p, &out) == OC_OK);
+        CHECK(out.client_type.len == 3 && memcmp(out.client_type.ptr, "tui", 3) == 0);
+    }
+    {
+        oc_client_setting_entry ents[2] = {
+            { oc_slice_str("mouse"), oc_slice_str("1") },
+            { oc_slice_str("time_24h"), oc_slice_str("0") },
+        };
+        oc_client_settings in = { oc_slice_str("tui"), 2, ents };
+        ROUNDTRIP(oc_encode_client_settings(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CLIENT_SETTINGS, h, p);
+        oc_client_setting_entry got[4]; oc_client_settings out;
+        CHECK(oc_decode_client_settings(&p, &out, got, 4) == OC_OK && out.count == 2);
+        CHECK(out.client_type.len == 3 && memcmp(out.client_type.ptr, "tui", 3) == 0);
+        CHECK(got[0].key.len == 5 && memcmp(got[0].key.ptr, "mouse", 5) == 0);
+        CHECK(got[0].value.len == 1 && got[0].value.ptr[0] == '1');
+        CHECK(got[1].key.len == 8 && memcmp(got[1].key.ptr, "time_24h", 8) == 0);
+    }
+}
+
 static void test_call_frames(void) {
     {
         oc_call_join in = { 7 };
@@ -913,6 +946,7 @@ int run_protocol_tests(void) {
     test_attachment_frames();
     test_webhook_frames();
     test_notify_frames();
+    test_client_settings_frames();
     test_call_frames();
     test_backfill_and_error();
     test_size_limits();

@@ -126,6 +126,9 @@ static void job_free(oc_job *j) {
     free(j->key_pem);
     free(j->filename);
     free(j->mime);
+    free(j->cs_client_type);
+    free(j->cs_key);
+    free(j->cs_value);
     free(j);
 }
 
@@ -162,6 +165,9 @@ void oc_dbres_free(oc_dbres *r) {
     for (size_t i = 0; i < r->n_whlist; i++) free(r->whlist[i].label);
     free(r->whlist);
     free(r->nprefs);
+    free(r->cs_client_type);
+    for (size_t i = 0; i < r->n_cslist; i++) { free(r->cslist[i].key); free(r->cslist[i].value); }
+    free(r->cslist);
     free(r);
 }
 
@@ -2329,6 +2335,83 @@ static oc_dbres *process_list_notify_prefs(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Load a (user, client_type) settings bucket into `r` as a CLIENT_SETTINGS
+ * snapshot. Shared by set (returns a fresh snapshot to sync the user's other
+ * devices of the same client_type) and list. */
+static void build_client_settings(sqlite3 *db, uint64_t user_id, const char *client_type, oc_dbres *r) {
+    r->type = OC_RES_CLIENT_SETTINGS;
+    r->user_id = user_id;
+    r->cs_client_type = client_type ? strdup(client_type) : strdup("");
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT key, value FROM client_settings WHERE user_id=? AND client_type=? "
+        "ORDER BY key LIMIT ?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)user_id);
+    sqlite3_bind_text (st, 2, client_type ? client_type : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int  (st, 3, (int)OC_MAX_CLIENT_SETTINGS);
+    size_t cap = 8;
+    r->cslist = malloc(cap * sizeof *r->cslist);
+    while (r->cslist && sqlite3_step(st) == SQLITE_ROW && r->n_cslist < OC_MAX_CLIENT_SETTINGS) {
+        if (r->n_cslist == cap) {
+            cap *= 2;
+            oc_client_setting_row *g = realloc(r->cslist, cap * sizeof *g);
+            if (!g) break;
+            r->cslist = g;
+        }
+        const char *k = (const char *)sqlite3_column_text(st, 0);
+        const char *v = (const char *)sqlite3_column_text(st, 1);
+        r->cslist[r->n_cslist].key = strdup(k ? k : "");
+        r->cslist[r->n_cslist].value = strdup(v ? v : "");
+        r->n_cslist++;
+    }
+    sqlite3_finalize(st);
+}
+
+/* Upsert (or, with an empty value, delete) one synced client setting. Returns a
+ * fresh bucket snapshot (net thread syncs it to the user's same-type devices).
+ * Write. */
+static oc_dbres *process_set_client_setting(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    const char *ct = j->cs_client_type ? j->cs_client_type : "";
+    const char *key = j->cs_key ? j->cs_key : "";
+    const char *val = j->cs_value ? j->cs_value : "";
+    sqlite3_stmt *st = NULL;
+    if (val[0] == '\0') {
+        sqlite3_prepare_v2(db,
+            "DELETE FROM client_settings WHERE user_id=? AND client_type=? AND key=?;",
+            -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_text (st, 2, ct, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (st, 3, key, -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_prepare_v2(db,
+            "INSERT INTO client_settings(user_id, client_type, key, value, updated_ms) "
+            "VALUES(?, ?, ?, ?, ?) ON CONFLICT(user_id, client_type, key) "
+            "DO UPDATE SET value=excluded.value, updated_ms=excluded.updated_ms;",
+            -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_text (st, 2, ct, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (st, 3, key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (st, 4, val, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 5, (sqlite3_int64)dbw_now_ms());
+    }
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    build_client_settings(db, j->user_id, ct, r);
+    return r;
+}
+
+/* The caller's full settings bucket for a client_type. Read. */
+static oc_dbres *process_list_client_settings(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    build_client_settings(db, j->user_id, j->cs_client_type ? j->cs_client_type : "", r);
+    return r;
+}
+
 /* Read-only query jobs run on the reader connection (ARCH-66), off the writer
  * thread, so a heavy search/backfill can't stall message sends or auth. */
 static int is_read_job(int type) {
@@ -2337,6 +2420,7 @@ static int is_read_job(int type) {
            type == OC_JOB_LIST_REACTIONS || type == OC_JOB_LIST_THREAD ||
            type == OC_JOB_TYPING || type == OC_JOB_ATTACH_LOOKUP ||
            type == OC_JOB_LIST_WEBHOOKS || type == OC_JOB_LIST_NOTIFY_PREFS ||
+           type == OC_JOB_LIST_CLIENT_SETTINGS ||
            type == OC_JOB_CALL_AUTH;
 }
 
@@ -2352,6 +2436,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_ATTACH_LOOKUP)  return process_attach_lookup(rdb, j);
     if (j->type == OC_JOB_LIST_WEBHOOKS)  return process_list_webhooks(rdb, j);
     if (j->type == OC_JOB_LIST_NOTIFY_PREFS) return process_list_notify_prefs(rdb, j);
+    if (j->type == OC_JOB_LIST_CLIENT_SETTINGS) return process_list_client_settings(rdb, j);
     if (j->type == OC_JOB_CALL_AUTH)      return process_call_auth(rdb, j);
     return NULL;
 }
@@ -2387,6 +2472,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_DELETE_WEBHOOK)  return process_delete_webhook(w->db, j);
     if (j->type == OC_JOB_SET_NOTIFY_PREF) return process_set_notify_pref(w->db, j);
     if (j->type == OC_JOB_SET_DND)         return process_set_dnd(w->db, j);
+    if (j->type == OC_JOB_SET_CLIENT_SETTING) return process_set_client_setting(w->db, j);
     return NULL;
 }
 

@@ -68,7 +68,34 @@ void oc_model_free(oc_model *m) {
     free(m->reactors);
     free(m->users);
     free(m->webhooks);
+    free(m->settings);
     memset(m, 0, sizeof *m);
+}
+
+/* Upsert a synced setting keyed on `key` (grow the bucket as needed). */
+static void setting_upsert(oc_model *m, const char *key, const char *value) {
+    if (!key || !key[0]) return;
+    for (size_t i = 0; i < m->n_settings; i++)
+        if (strcmp(m->settings[i].key, key) == 0) {
+            snprintf(m->settings[i].value, sizeof m->settings[i].value, "%s", value ? value : "");
+            return;
+        }
+    if (m->n_settings == m->cap_settings) {
+        size_t cap = m->cap_settings ? m->cap_settings * 2 : 8;
+        oc_setting *ns = realloc(m->settings, cap * sizeof *ns);
+        if (!ns) return;
+        m->settings = ns; m->cap_settings = cap;
+    }
+    oc_setting *s = &m->settings[m->n_settings++];
+    snprintf(s->key, sizeof s->key, "%s", key);
+    snprintf(s->value, sizeof s->value, "%s", value ? value : "");
+}
+
+const char *oc_model_setting(const oc_model *m, const char *key) {
+    if (!key) return NULL;
+    for (size_t i = 0; i < m->n_settings; i++)
+        if (strcmp(m->settings[i].key, key) == 0) return m->settings[i].value;
+    return NULL;
 }
 
 /* Upsert a roster entry keyed on user_id. */
@@ -534,6 +561,15 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         if (c) c->notify_level = e->op;
         break;
     }
+    case OC_EV_SETTINGS_BEGIN:
+        /* A CLIENT_SETTINGS frame start (solicited or a device-sync push): the
+         * snapshot replaces the bucket wholesale, so clear it before the entries. */
+        m->n_settings = 0;
+        m->settings_synced = 1;
+        break;
+    case OC_EV_SETTING:
+        setting_upsert(m, e->author_name, e->body ? e->body : "");
+        break;
     case OC_EV_USER_UPDATED: {
         user_update_role(m, e->user_id, e->status, e->op);
         const char *nm = oc_model_user_name(m, e->user_id);
