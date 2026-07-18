@@ -33,7 +33,8 @@
 #include "client.h"
 #include "model.h"
 #include "resolve.h"    /* instance -> host:port (REQ-010/011) */
-#include "protocol.h"   /* OC_PRESENCE_* */
+#include "store.h"      /* peek a stored session token (skip the login box) */
+#include "protocol.h"   /* OC_PRESENCE_*, OC_SESSION_TOKEN_LEN */
 
 #include <locale.h>
 #include <stdint.h>
@@ -729,51 +730,234 @@ static int all_digits(const char *s) {
     return 1;
 }
 
+/* ---- connect / login dialog (REQ-020 local sign-in) --------------------------
+ * A modal box collecting instance + username + password (+ remember-me), shown
+ * when no credential and no stored session token are available. The instance is
+ * resolved on submit (inline "not found"); the caller starts the client and, on
+ * an auth/connect failure, comes back here with the reason. */
+
+enum { LOGIN_SUBMIT, LOGIN_QUIT };
+enum { AUTH_R_OK, AUTH_R_FAILED, AUTH_R_UNREACHABLE, AUTH_R_CANCELLED };
+
+typedef struct {
+    char instance[256];
+    char user[128];
+    char pass[128];
+    int  remember;
+    oc_endpoint ep;                       /* filled by oc_resolve on submit */
+} login_form;
+
+/* Draw a single-line box border and clear its interior. */
+static void draw_frame(int x, int y, int w, int h) {
+    for (int j = 1; j < h - 1; j++)
+        for (int i = 1; i < w - 1; i++) tb_set_cell(x + i, y + j, ' ', TB_DEFAULT, TB_DEFAULT);
+    for (int i = 1; i < w - 1; i++) {
+        tb_set_cell(x + i, y,         0x2500, TB_WHITE, TB_DEFAULT);
+        tb_set_cell(x + i, y + h - 1, 0x2500, TB_WHITE, TB_DEFAULT);
+    }
+    for (int j = 1; j < h - 1; j++) {
+        tb_set_cell(x,         y + j, 0x2502, TB_WHITE, TB_DEFAULT);
+        tb_set_cell(x + w - 1, y + j, 0x2502, TB_WHITE, TB_DEFAULT);
+    }
+    tb_set_cell(x,         y,         0x250c, TB_WHITE, TB_DEFAULT);
+    tb_set_cell(x + w - 1, y,         0x2510, TB_WHITE, TB_DEFAULT);
+    tb_set_cell(x,         y + h - 1, 0x2514, TB_WHITE, TB_DEFAULT);
+    tb_set_cell(x + w - 1, y + h - 1, 0x2518, TB_WHITE, TB_DEFAULT);
+}
+
+/* A labeled input row; `focused` highlights the field, `mask` renders dots. */
+static void draw_field(int x, int y, int w, const char *label, const char *val,
+                       int focused, int mask) {
+    draw_clip(x, y, x + 11, label, TB_DEFAULT, TB_DEFAULT);
+    int fx = x + 11, fw = w - 11;
+    uintattr_t bg = focused ? TB_BLUE : (TB_BLACK | TB_BOLD);
+    fill_row(y, fx, fx + fw, bg);
+    if (mask) {
+        char dots[130]; size_t n = strlen(val);
+        if (n > sizeof dots - 1) n = sizeof dots - 1;
+        memset(dots, '*', n); dots[n] = '\0';
+        draw_clip(fx + 1, y, fx + fw, dots, TB_WHITE, bg);
+    } else {
+        draw_clip(fx + 1, y, fx + fw, val, TB_WHITE | (focused ? TB_BOLD : 0), bg);
+    }
+}
+
+/* Run the login box until the user submits (fields filled, instance resolved into
+ * `f->ep`) or quits. `err` is an optional message to show (e.g. a prior auth
+ * failure). Returns LOGIN_SUBMIT or LOGIN_QUIT. */
+static int login_dialog(login_form *f, const char *err) {
+    /* On a retry (err set) land on the password — that's what needs fixing;
+     * otherwise start past a pre-filled instance. */
+    int focus = err ? 2 : (f->instance[0] ? 1 : 0);
+    char inl[160]; inl[0] = '\0';
+    for (;;) {
+        int W = tb_width(), H = tb_height();
+        tb_clear();
+        int bw = 56; if (bw > W - 2) bw = W - 2; if (bw < 24) bw = 24;
+        int bh = 12;
+        int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
+        draw_frame(x, y, bw, bh);
+        draw_clip(x + 2, y, x + bw - 1, " Sign in to OpenChime ", TB_CYAN | TB_BOLD, TB_DEFAULT);
+        int ix = x + 2, iw = bw - 4;
+        draw_field(ix, y + 2, iw, "Instance", f->instance, focus == 0, 0);
+        draw_field(ix, y + 4, iw, "Username", f->user, focus == 1, 0);
+        draw_field(ix, y + 5, iw, "Password", f->pass, focus == 2, 1);
+        char rem[40]; snprintf(rem, sizeof rem, "[%c] Remember me", f->remember ? 'x' : ' ');
+        draw_clip(ix, y + 7, ix + iw, rem, focus == 3 ? TB_CYAN | TB_BOLD : TB_DEFAULT, TB_DEFAULT);
+        const char *e = inl[0] ? inl : err;
+        if (e) draw_clip(ix, y + 9, ix + iw, e, TB_RED | TB_BOLD, TB_DEFAULT);
+        draw_clip(ix, y + bh - 1, ix + iw, " Enter connect · Tab next · Esc quit ",
+                  TB_BLACK | TB_BOLD, TB_DEFAULT);
+        tb_present();
+
+        struct tb_event ev;
+        if (tb_poll_event(&ev) != TB_OK) continue;
+        if (ev.type != TB_EVENT_KEY) continue;
+        if (ev.key == TB_KEY_ESC || ev.key == TB_KEY_CTRL_C || ev.key == TB_KEY_CTRL_Q)
+            return LOGIN_QUIT;
+        if (ev.key == TB_KEY_TAB || ev.key == TB_KEY_ARROW_DOWN) { focus = (focus + 1) & 3; continue; }
+        if (ev.key == TB_KEY_ARROW_UP) { focus = (focus + 3) & 3; continue; }
+        int is_space = (ev.ch == ' ' || ev.key == TB_KEY_SPACE);
+        if (ev.key == TB_KEY_ENTER) {
+            if (!f->instance[0]) { snprintf(inl, sizeof inl, "enter an instance (domain or name)"); focus = 0; continue; }
+            if (!f->user[0])     { snprintf(inl, sizeof inl, "enter a username"); focus = 1; continue; }
+            oc_resolve_status st = oc_resolve(f->instance, getenv("OPENCHIME_SUFFIX"), &f->ep);
+            if (st == OC_RESOLVE_BAD_INSTANCE) { snprintf(inl, sizeof inl, "invalid instance '%s'", f->instance); focus = 0; continue; }
+            if (st == OC_RESOLVE_NOT_FOUND)    { snprintf(inl, sizeof inl, "'%s' not found — does not resolve in DNS", f->instance); focus = 0; continue; }
+            return LOGIN_SUBMIT;
+        }
+        if (focus == 3) { if (is_space) f->remember = !f->remember; continue; }
+        char *buf; size_t cap;
+        if (focus == 0)      { buf = f->instance; cap = sizeof f->instance; }
+        else if (focus == 1) { buf = f->user;     cap = sizeof f->user; }
+        else                 { buf = f->pass;     cap = sizeof f->pass; }
+        if (ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2) {
+            size_t n = strlen(buf); if (n) { buf[n - 1] = '\0'; inl[0] = '\0'; }
+        } else if (is_space) {
+            size_t n = strlen(buf); if (n + 1 < cap) { buf[n] = ' '; buf[n + 1] = '\0'; inl[0] = '\0'; }
+        } else if (ev.ch >= 0x21 && ev.ch <= 0x7e) {   /* printable ASCII (credentials) */
+            size_t n = strlen(buf); if (n + 1 < cap) { buf[n] = (char)ev.ch; buf[n + 1] = '\0'; inl[0] = '\0'; }
+        }
+    }
+}
+
+/* Tick a freshly-started client until it authenticates, fails, or is cancelled,
+ * drawing a "connecting…" screen. Distinguishes auth-fail from unreachable via
+ * the model's sticky last_error. */
+static int await_auth(oc_client *cl, const char *host) {
+    for (int i = 0; i < 1200; i++) {          /* ~18s at 15ms per tick */
+        oc_client_tick(cl);
+        const oc_model *m = oc_client_model(cl);
+        if (m->authed) return AUTH_R_OK;
+        if (m->last_error[0] && !m->connected)
+            return strstr(m->last_error, "reach") ? AUTH_R_UNREACHABLE : AUTH_R_FAILED;
+        int W = tb_width(), H = tb_height();
+        tb_clear();
+        char msg[320]; snprintf(msg, sizeof msg, "Connecting to %s …   (Esc to cancel)", host);
+        draw_clip((W - (int)strlen(msg)) / 2, H / 2, W, msg, TB_WHITE | TB_BOLD, TB_DEFAULT);
+        tb_present();
+        struct tb_event ev;
+        if (tb_peek_event(&ev, 15) == TB_OK && ev.type == TB_EVENT_KEY &&
+            (ev.key == TB_KEY_ESC || ev.key == TB_KEY_CTRL_C || ev.key == TB_KEY_CTRL_Q))
+            return AUTH_R_CANCELLED;
+    }
+    return AUTH_R_UNREACHABLE;
+}
+
+/* Drive the login box + connect, retrying on failure, until authenticated or the
+ * user quits. On success sets *out to the authenticated client and returns 1. */
+static int run_login(const char *initial_instance, const char *store_path, oc_client **out) {
+    login_form f; memset(&f, 0, sizeof f);
+    snprintf(f.instance, sizeof f.instance, "%s", initial_instance ? initial_instance : "");
+    f.remember = 1;
+    char err[320]; err[0] = '\0';
+    for (;;) {
+        if (login_dialog(&f, err[0] ? err : NULL) == LOGIN_QUIT) return 0;
+        char cred[260]; snprintf(cred, sizeof cred, "%s:%s", f.user, f.pass);
+        oc_client *cl = oc_client_start_stored(f.ep.host, f.ep.port, cred,
+                                               f.remember ? store_path : NULL);
+        if (!cl) { snprintf(err, sizeof err, "could not start the client"); continue; }
+        int res = await_auth(cl, f.ep.host);
+        if (res == AUTH_R_OK) { *out = cl; return 1; }
+        oc_client_stop(cl);
+        if (res == AUTH_R_CANCELLED) return 0;
+        if (res == AUTH_R_UNREACHABLE) snprintf(err, sizeof err, "could not reach %s", f.ep.host);
+        else                          snprintf(err, sizeof err, "sign-in failed — check your username and password");
+        f.pass[0] = '\0';   /* clear the password for the retry */
+    }
+}
+
+/* Is a still-valid session token stored for this instance? If so we skip the
+ * login box and let the net thread reconnect silently. */
+static int have_stored_token(const char *store_path, const char *host, int port) {
+    if (!store_path) return 0;
+    oc_store *s = oc_store_open(store_path);
+    if (!s) return 0;
+    char inst[288]; snprintf(inst, sizeof inst, "%s:%d", host, port);
+    uint8_t tok[OC_SESSION_TOKEN_LEN];
+    int has = oc_store_load_session(s, inst, tok, NULL, (uint64_t)time(NULL) * 1000);
+    oc_store_close(s);
+    return has;
+}
+
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s <instance> [user:pass]\n"
-                        "       %s <host> <port> [user:pass]\n", argv[0], argv[0]);
-        return 2;
+    if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
+        fprintf(stderr, "usage: %s [<instance>] [user:pass]\n"
+                        "       %s <host> <port> [user:pass]\n"
+                        "  With no instance (or no credentials) a login box is shown.\n",
+                        argv[0], argv[0]);
+        return 0;
     }
     /* Adopt the environment's locale so termbox2's iswprint() check recognizes
      * non-ASCII codepoints as printable — without this it renders every emoji /
      * wide glyph as U+FFFD, defeating the whole point of utf8proc. */
     setlocale(LC_ALL, "");
 
-    /* Two invocations: a raw "<host> <port>" (dev/local, when argv[2] is a port
-     * number), or a single "<instance>" resolved to host:port by DNS (REQ-010).
-     * A resolution failure is reported distinctly from connect/auth failure. */
-    char host[256];
-    int port;
-    const char *cred;
-    if (argc >= 3 && all_digits(argv[2])) {
+    const char *store_path = resolve_store_path();
+
+    /* Decide how to connect. Three shapes:
+     *   <host> <port> [cred]  — dev/local direct connect (argv[2] is a port);
+     *   <instance> [cred]     — resolve by DNS (REQ-010), then connect;
+     *   (no credentials)      — show the login box (REQ-020).
+     * Connect directly when a credential is supplied or a session token is
+     * already stored; otherwise prompt. A resolution failure is reported
+     * distinctly from connect/auth failure (REQ-011). */
+    char host[256] = ""; int port = 0; const char *cred = NULL;
+    int direct = 0;
+    const char *prefill = "";
+
+    if (argc >= 3 && all_digits(argv[2])) {          /* dev host:port */
         snprintf(host, sizeof host, "%s", argv[1]);
         port = atoi(argv[2]);
         cred = argc > 3 ? argv[3] : getenv("OPENCHIME_CRED");
-    } else {
+        direct = 1;
+    } else if (argc >= 2) {                          /* instance mode */
+        const char *inst = argv[1];
+        const char *cli_cred = argc >= 3 ? argv[2] : getenv("OPENCHIME_CRED");
         oc_endpoint ep;
-        oc_resolve_status st = oc_resolve(argv[1], getenv("OPENCHIME_SUFFIX"), &ep);
-        if (st == OC_RESOLVE_BAD_INSTANCE) {
-            fprintf(stderr, "openchime: invalid instance '%s'\n", argv[1]);
-            return 2;
-        }
-        if (st == OC_RESOLVE_NOT_FOUND) {
-            fprintf(stderr, "openchime: instance '%s' not found — it does not resolve in DNS\n", argv[1]);
-            return 3;
-        }
+        oc_resolve_status st = oc_resolve(inst, getenv("OPENCHIME_SUFFIX"), &ep);
+        if (st == OC_RESOLVE_BAD_INSTANCE) { fprintf(stderr, "openchime: invalid instance '%s'\n", inst); return 2; }
+        if (st == OC_RESOLVE_NOT_FOUND)    { fprintf(stderr, "openchime: instance '%s' not found — it does not resolve in DNS\n", inst); return 3; }
         snprintf(host, sizeof host, "%s", ep.host);
         port = ep.port;
-        cred = argc > 2 ? argv[2] : getenv("OPENCHIME_CRED");
-    }
+        if (cli_cred && cli_cred[0])                       { cred = cli_cred; direct = 1; }
+        else if (have_stored_token(store_path, host, port)) { cred = "";      direct = 1; }  /* silent reconnect */
+        else                                                { prefill = inst; direct = 0; }  /* prompt */
+    }                                                /* else: no args -> login box */
     if (!cred) cred = "";
-
-    oc_client *cl = oc_client_start_stored(host, port, cred, resolve_store_path());
-    if (!cl) { fprintf(stderr, "failed to start client\n"); return 1; }
 
     if (tb_init() != TB_OK) {
         fprintf(stderr, "failed to init terminal (need a tty)\n");
-        oc_client_stop(cl);
         return 1;
+    }
+
+    oc_client *cl = NULL;
+    if (direct) {
+        cl = oc_client_start_stored(host, port, cred, store_path);
+        if (!cl) { tb_shutdown(); fprintf(stderr, "failed to start client\n"); return 1; }
+    } else if (!run_login(prefill, store_path, &cl)) {
+        tb_shutdown();       /* user quit the login box */
+        return 0;
     }
 
     char composer[COMPOSER_CAP];

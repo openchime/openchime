@@ -236,6 +236,9 @@ static void test_resolve(void) {
     CHECK(oc_resolve_domain("", "x", d, sizeof d) == -1);
     oc_endpoint ep;
     CHECK(oc_resolve("", NULL, &ep) == OC_RESOLVE_BAD_INSTANCE);
+    /* An explicit host:port (literal IP resolves instantly, no DNS) pins the port. */
+    CHECK(oc_resolve("127.0.0.1:9000", NULL, &ep) == OC_RESOLVE_OK &&
+          strcmp(ep.host, "127.0.0.1") == 0 && ep.port == 9000);
 
     /* The SRV parser picks the target host + port out of the wire answer. */
     char host[256]; int port = 0;
@@ -243,10 +246,26 @@ static void test_resolve(void) {
     CHECK(strcmp(host, "srv.acme.com") == 0 && port == 8443);
 }
 
+/* The model's sticky last_error (the login flow reads it to tell auth-fail from
+ * unreachable): set by an error, preserved across the "disconnected" line, and
+ * cleared on a successful auth. */
+static void test_last_error(void) {
+    oc_model m; oc_model_init(&m);
+    oc_ev *e = oc_ev_new(OC_EV_ERROR); e->body = strdup("auth failed");
+    oc_model_apply(&m, e); oc_ev_free(e);
+    CHECK(strcmp(m.last_error, "auth failed") == 0);
+    e = oc_ev_new(OC_EV_DISCONNECTED); oc_model_apply(&m, e); oc_ev_free(e);
+    CHECK(strcmp(m.last_error, "auth failed") == 0 && m.connected == false);   /* not overwritten */
+    e = oc_ev_new(OC_EV_AUTH_OK); e->user_id = 7; oc_model_apply(&m, e); oc_ev_free(e);
+    CHECK(m.last_error[0] == '\0');                                            /* cleared on auth */
+    oc_model_free(&m);
+}
+
 int run_client_core_tests(void) {
-    printf("test_client_core: resolve, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, persisted store, cached history, session reconnect, offline outbox\n");
+    printf("test_client_core: resolve, last-error, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, persisted store, cached history, session reconnect, offline outbox\n");
 
     test_resolve();
+    test_last_error();
 
     /* The daemon opens its blob store at netloop startup; point it at a build-local
      * dir (the /data/blobs default isn't writable in the test sandbox), matching

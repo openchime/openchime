@@ -72,6 +72,22 @@ static int srv_lookup(const char *domain, char *host, size_t hostcap, int *port)
     return oc_srv_parse(ans, len, host, hostcap, port);
 }
 
+/* An explicit `:port` on the instance (after any scheme), or 0 if none. Lets a
+ * user pin a non-standard port, e.g. `chat.acme.com:9000`. */
+static int explicit_port(const char *instance) {
+    if (!instance) return 0;
+    const char *s = instance;
+    const char *scheme = strstr(s, "://"); if (scheme) s = scheme + 3;
+    const char *slash = strchr(s, '/');
+    const char *colon = strchr(s, ':');
+    if (!colon || (slash && colon > slash)) return 0;   /* no port, or ':' is in the path */
+    long port = 0;
+    const char *p = colon + 1;
+    if (!*p || *p == '/') return 0;
+    for (; *p && *p != '/'; p++) { if (*p < '0' || *p > '9') return 0; port = port * 10 + (*p - '0'); }
+    return (port > 0 && port <= 65535) ? (int)port : 0;
+}
+
 /* Does `domain` resolve to any A/AAAA address? */
 static int host_resolves(const char *domain) {
     struct addrinfo hints, *res = NULL;
@@ -88,6 +104,15 @@ oc_resolve_status oc_resolve(const char *instance, const char *suffix, oc_endpoi
     char domain[256];
     if (oc_resolve_domain(instance, suffix, domain, sizeof domain) != 0)
         return OC_RESOLVE_BAD_INSTANCE;
+
+    /* An explicit `:port` pins host:port directly, skipping SRV. */
+    int xport = explicit_port(instance);
+    if (xport > 0) {
+        if (!host_resolves(domain)) return OC_RESOLVE_NOT_FOUND;
+        snprintf(out->host, sizeof out->host, "%s", domain);
+        out->port = xport;
+        return OC_RESOLVE_OK;
+    }
 
     /* Preferred: an SRV record names the daemon host + port. */
     if (srv_lookup(domain, out->host, sizeof out->host, &out->port) == 0)

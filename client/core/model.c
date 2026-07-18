@@ -430,11 +430,13 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     case OC_EV_CONNECTED:
         m->connected = true;
         m->user_id = e->user_id;
+        m->last_error[0] = '\0';        /* a live connection clears any prior error */
         set_status(m, "connected");
         break;
     case OC_EV_AUTH_OK:
         m->authed = true;
         m->user_id = e->user_id;
+        m->last_error[0] = '\0';
         presence_set(m, e->user_id, OC_PRESENCE_ONLINE);   /* self: the server won't tell us */
         set_status(m, "authenticated");
         break;
@@ -602,7 +604,10 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         set_status(m, "disconnected");
         break;
     case OC_EV_ERROR:
-        if (e->body) set_status(m, e->body);
+        if (e->body) {
+            set_status(m, e->body);
+            snprintf(m->last_error, sizeof m->last_error, "%s", e->body);
+        }
         break;
     default:
         break;

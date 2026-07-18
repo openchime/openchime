@@ -234,13 +234,24 @@ appended) — resolves by plain DNS: SRV (`_openchime._tcp.<domain>`) first, the
 the domain's A record at 443. A resolution failure is a distinct status, so the
 TUI tells "instance not found" apart from "could not reach the server" (connect)
 and "auth failed" (login). The TUI accepts `<instance>` (resolved) or a raw
-`<host> <port>` (dev/local). The optional `.well-known` metadata half is not
-consulted yet.
+`<host> <port>` (dev/local); an explicit `:port` on the instance
+(`chat.acme.com:9000`) pins the port and skips SRV. The optional `.well-known`
+metadata half is not consulted yet.
 
-**Still to build:** the fuller auth
-UX (ARCH-19) — a **local** username+password form; and **OIDC** via the system
-browser to central's authorize URL with a loopback `127.0.0.1` redirect catching
-the ES256 JWT (`ASWebAuthenticationSession` on iOS/macOS).
+**The local login box is built (REQ-020 local mode).** With no credential and no
+stored session token, the TUI shows a modal **Sign in** dialog — instance /
+username / masked password / *Remember me* — that resolves the instance on submit
+(inline "not found"), then connects; an auth failure keeps the box up with the
+reason and refocuses the password to retry. *Remember me* gates whether the
+session token persists (the store) or stays session-only. A returning user with a
+stored token skips the box entirely (silent reconnect). Cross-cutting: the model
+gained a sticky `last_error` (not overwritten by "disconnected") so the flow can
+tell auth-failure from unreachable.
+
+**Still to build:** **OIDC** via the system browser to central's authorize URL
+with a loopback `127.0.0.1` redirect catching the ES256 JWT
+(`ASWebAuthenticationSession` on iOS/macOS) — its client half only, since the
+central relay is out of repo.
 
 ## 7. Build
 

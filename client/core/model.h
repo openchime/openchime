@@ -124,6 +124,10 @@ typedef struct {
     char      webhook_token[80];
     uint64_t  webhook_new_id;
     char     status[160];             /* last status / error line */
+    /* The last hard error (auth failed, unreachable, …). Unlike `status` it is
+     * NOT overwritten by the "disconnected" line, so a login flow can read the
+     * reason after the connection drops; cleared on a successful connect. */
+    char     last_error[160];
 } oc_model;
 
 void oc_model_init(oc_model *m);
