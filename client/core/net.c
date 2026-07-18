@@ -20,6 +20,7 @@
 struct oc_net {
     pthread_t     thread;
     volatile int  stop;
+    volatile int  reconnect_now;   /* set by oc_net_reconnect: cut short the backoff */
     char          host[256];
     int           port;
     char         *token;
@@ -1120,11 +1121,18 @@ static void *net_thread(void *arg) {
          * A connection that actually served resets the backoff so the first
          * retry is prompt; repeated connect/auth failures grow it. */
         backoff_ms = served ? 500 : (backoff_ms ? (backoff_ms < 4000 ? backoff_ms * 2 : 4000) : 500);
-        push_err(n->to_ui, "connection lost — reconnecting…");
-        for (int s = 0; s < backoff_ms && !n->stop; s += 50) {
+        {
+            char msg[96];
+            snprintf(msg, sizeof msg, "connection lost — reconnecting in %ds… (^R to retry now)",
+                     (backoff_ms + 999) / 1000);
+            push_err(n->to_ui, msg);
+        }
+        n->reconnect_now = 0;
+        for (int s = 0; s < backoff_ms && !n->stop && !n->reconnect_now; s += 50) {
             struct timespec ts = { 0, 50 * 1000 * 1000 };
             nanosleep(&ts, NULL);
         }
+        n->reconnect_now = 0;
         reconnecting = 1;
     }
 
@@ -1165,6 +1173,10 @@ oc_net *oc_net_start(const char *host, int port, const char *token,
         free(n->token); free(n->store_path); free(n); return NULL;
     }
     return n;
+}
+
+void oc_net_reconnect(oc_net *n) {
+    if (n) n->reconnect_now = 1;   /* the backoff loop polls this and retries at once */
 }
 
 void oc_net_stop(oc_net *n) {

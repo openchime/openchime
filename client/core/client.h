@@ -136,6 +136,10 @@ void oc_client_download(oc_client *c, uint64_t attachment_id, const char *dest_p
  * (OC_LOGOUT_ALL); the server closes the connection. */
 void oc_client_logout(oc_client *c, uint8_t scope);
 
+/* Force an immediate reconnect if the client is currently backing off after a
+ * dropped connection (otherwise a no-op). */
+void oc_client_reconnect(oc_client *c);
+
 /* Stop the network thread, drain remaining events, and free everything. */
 void oc_client_stop(oc_client *c);
 

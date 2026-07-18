@@ -253,6 +253,9 @@ brief status line. A graceful `/logout` or a fatal reject (bad version, expired
 session) ends the loop instead of retrying. The net thread tracks its own
 per-channel high-water for the reconnect cursors; a headless test bounces the
 daemon and asserts the client re-auths, keeps its history, and can send again.
+While backing off, the status line counts the wait down (`connection lost —
+reconnecting in Ns… (^R to retry now)`), and `oc_client_reconnect` (bound to
+`^R` in the TUI) cuts the current sleep short to retry immediately.
 
 **Cross-restart reconnect is built too (via the §5 store).** The net thread
 pre-loads a still-valid stored token and pins the stored fingerprint, so the

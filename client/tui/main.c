@@ -457,7 +457,7 @@ static void draw_help(int W, int H) {
         "Tab            next channel",
         "↑ ↓ PgUp PgDn  scroll the message pane",
         "type + Enter   send a message",
-        "/command       run a command (below)   ·   ^Q  quit",
+        "/command       run a command (below)   ·   ^K palette   ^R reconnect   ^Q quit",
         "",
         "Channels & DMs:",
         "  /join <name>  /leave  /create <name>  /list  /dm <name>",
@@ -1507,6 +1507,10 @@ int main(int argc, char **argv) {
         }
         if (ev.key == TB_KEY_CTRL_K) {         /* open the palette from any mode */
             palette_open = 1; pq[0] = '\0'; pqlen = 0; psel = 0;
+            continue;
+        }
+        if (ev.key == TB_KEY_CTRL_R) {         /* force an immediate reconnect */
+            oc_client_reconnect(cl);
             continue;
         }
         if (ev.key != TB_KEY_TAB) ac_idx = 0;  /* any non-Tab key restarts cycling */

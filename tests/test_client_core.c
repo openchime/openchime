@@ -665,6 +665,7 @@ int run_client_core_tests(void) {
             arg.stop = 0;
             CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
             wait_port_ready(arg.port);
+            oc_client_reconnect(rc);   /* cut the backoff so the retry is prompt */
 
             /* It comes back authenticated (session-token reconnect), with its
              * pre-restart history intact, and a new send round-trips. */

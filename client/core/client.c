@@ -346,6 +346,10 @@ void oc_client_logout(oc_client *c, uint8_t scope) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_reconnect(oc_client *c) {
+    if (c) oc_net_reconnect(c->net);
+}
+
 void oc_client_stop(oc_client *c) {
     if (!c) return;
     oc_net_stop(c->net);   /* signals QUIT, joins the thread */

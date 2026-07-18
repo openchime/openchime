@@ -25,6 +25,10 @@ oc_net *oc_net_start(const char *host, int port, const char *token,
                      const char *store_path, oc_secret *secret,
                      oc_queue *to_ui, oc_queue *from_ui);
 
+/* Cut short the reconnect backoff so the next attempt happens immediately (no-op
+ * if not currently backing off). */
+void oc_net_reconnect(oc_net *n);
+
 /* Signal the thread to stop, join it, and free. */
 void oc_net_stop(oc_net *n);
 
