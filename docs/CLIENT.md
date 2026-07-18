@@ -175,6 +175,11 @@ model; translate input to intents }, stop.
     levels; `/notify all|mentions|none` sets the focused channel; `/dnd HH:MM
     HH:MM | off` sets the do-not-disturb window (REQ-130/131; each SET returns a
     full sync that the model folds in).
+  - **self-service profile (REQ-020)** — `/profile` opens a modal with your name,
+    role, id, and presence; `/nick <name>` renames you (the daemon fans a
+    `PROFILE_UPDATED` so every roster — and your own header — updates live);
+    `/passwd <old> <new>` rotates your local password (the server verifies the old
+    one, and a wrong one shows an error).
   - **admin / user management** — `/role <name> owner|admin|member`, `/invite
     [admin|member]` (mints a tenant token, shown once atop the roster), `/remove
     <name>` disables a user (REQ-030/033, owner/admin only; a `USER_UPDATED` folds

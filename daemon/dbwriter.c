@@ -129,6 +129,9 @@ static void job_free(oc_job *j) {
     free(j->cs_client_type);
     free(j->cs_key);
     free(j->cs_value);
+    free(j->pf_name);
+    free(j->pf_old_pw);
+    free(j->pf_new_pw);
     free(j);
 }
 
@@ -168,6 +171,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->cs_client_type);
     for (size_t i = 0; i < r->n_cslist; i++) { free(r->cslist[i].key); free(r->cslist[i].value); }
     free(r->cslist);
+    free(r->profile_name);
     free(r);
 }
 
@@ -2412,6 +2416,90 @@ static oc_dbres *process_list_client_settings(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* --- Self-service profile (REQ-020) ------------------------------------- */
+
+/* Ok result: PROFILE_UPDATED carrying `name` (ownership taken) for user_id. */
+static oc_dbres *profile_ok(const oc_job *j, char *name) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) { free(name); return NULL; }
+    r->type = OC_RES_PROFILE_UPDATED;
+    r->conn_id = j->conn_id;
+    r->user_id = j->user_id;
+    r->profile_name = name ? name : strdup("");
+    return r;
+}
+
+static oc_dbres *profile_err(const oc_job *j, uint16_t code) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_PROFILE_ERR;
+    r->conn_id = j->conn_id;
+    r->err_code = code;
+    r->user_id = j->user_id;
+    return r;
+}
+
+/* Rename yourself. The new name folds into every client's roster (net thread
+ * fans PROFILE_UPDATED tenant-wide). Write. */
+static oc_dbres *process_set_display_name(sqlite3 *db, const oc_job *j) {
+    const char *name = j->pf_name ? j->pf_name : "";
+    size_t nlen = strlen(name);
+    if (nlen == 0 || nlen > OC_MAX_DISPLAY_NAME) return profile_err(j, OC_ERR_FORBIDDEN);
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "UPDATE users SET display_name=? WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_text (st, 1, name, (int)nlen, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return profile_err(j, OC_ERR_INTERNAL);
+    return profile_ok(j, strdup(name));
+}
+
+/* Rotate your local password: verify the old one (constant-time), then store a
+ * fresh PBKDF2 salt+hash. A non-local (OIDC) account, or a wrong old password,
+ * is FORBIDDEN. On success the self ack echoes the unchanged display name. Write. */
+static oc_dbres *process_change_password(sqlite3 *db, const oc_job *j) {
+    const char *oldpw = j->pf_old_pw ? j->pf_old_pw : "";
+    const char *newpw = j->pf_new_pw ? j->pf_new_pw : "";
+    if (newpw[0] == '\0') return profile_err(j, OC_ERR_FORBIDDEN);
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT salt, iterations, hash FROM local_credentials WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    int ok = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const void *salt = sqlite3_column_blob(st, 0);
+        int slen = sqlite3_column_bytes(st, 0);
+        uint32_t iters = (uint32_t)sqlite3_column_int64(st, 1);
+        const void *stored = sqlite3_column_blob(st, 2);
+        int hlen = sqlite3_column_bytes(st, 2);
+        uint8_t derived[OC_PW_HASH_LEN];
+        if (salt && stored && hlen == (int)OC_PW_HASH_LEN &&
+            oc_pw_derive(oldpw, strlen(oldpw), salt, (size_t)slen, iters, derived) == 0 &&
+            oc_ct_eq(derived, stored, OC_PW_HASH_LEN)) ok = 1;
+    }
+    sqlite3_finalize(st);
+    if (!ok) return profile_err(j, OC_ERR_FORBIDDEN);
+
+    uint8_t salt[OC_PW_SALT_LEN], hash[OC_PW_HASH_LEN];
+    if (oc_rand_bytes(salt, sizeof salt) != 0 ||
+        oc_pw_derive(newpw, strlen(newpw), salt, sizeof salt, OC_PW_ITERATIONS, hash) != 0)
+        return profile_err(j, OC_ERR_INTERNAL);
+    sqlite3_prepare_v2(db,
+        "UPDATE local_credentials SET salt=?, iterations=?, hash=?, updated_at_ms=? WHERE user_id=?;",
+        -1, &st, NULL);
+    sqlite3_bind_blob (st, 1, salt, sizeof salt, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)OC_PW_ITERATIONS);
+    sqlite3_bind_blob (st, 3, hash, sizeof hash, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)j->user_id);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return profile_err(j, OC_ERR_INTERNAL);
+    return profile_ok(j, lookup_display_name(db, j->user_id));
+}
+
 /* Read-only query jobs run on the reader connection (ARCH-66), off the writer
  * thread, so a heavy search/backfill can't stall message sends or auth. */
 static int is_read_job(int type) {
@@ -2473,6 +2561,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_NOTIFY_PREF) return process_set_notify_pref(w->db, j);
     if (j->type == OC_JOB_SET_DND)         return process_set_dnd(w->db, j);
     if (j->type == OC_JOB_SET_CLIENT_SETTING) return process_set_client_setting(w->db, j);
+    if (j->type == OC_JOB_SET_DISPLAY_NAME)   return process_set_display_name(w->db, j);
+    if (j->type == OC_JOB_CHANGE_PASSWORD)    return process_change_password(w->db, j);
     return NULL;
 }
 

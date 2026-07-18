@@ -570,6 +570,16 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     case OC_EV_SETTING:
         setting_upsert(m, e->author_name, e->body ? e->body : "");
         break;
+    case OC_EV_PROFILE:
+        /* A display-name change (REQ-020): update the roster entry's name in place
+         * (role/disabled untouched). For our own id it doubles as the change ack. */
+        for (size_t i = 0; i < m->n_users; i++)
+            if (m->users[i].user_id == e->user_id) {
+                snprintf(m->users[i].name, sizeof m->users[i].name, "%s", e->body ? e->body : "");
+                break;
+            }
+        if (e->user_id == m->user_id) set_status(m, "profile updated");
+        break;
     case OC_EV_USER_UPDATED: {
         user_update_role(m, e->user_id, e->status, e->op);
         const char *nm = oc_model_user_name(m, e->user_id);

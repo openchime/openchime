@@ -37,6 +37,7 @@ enum {
     OC_EV_READ_STATE,      /* channel_id: mark its currently-loaded messages read (replayed cache is not "unread") */
     OC_EV_SETTINGS_BEGIN,  /* a CLIENT_SETTINGS frame start: clears the synced bucket before its entries */
     OC_EV_SETTING,         /* one synced setting: author_name=key, body=value */
+    OC_EV_PROFILE,         /* a PROFILE_UPDATED: user_id + body=display_name (own = the change ack) */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
     OC_EV_ERROR            /* protocol/transport error; body = human message */
 };
@@ -84,6 +85,8 @@ enum {
     OC_CMD_LIST_NOTIFY_PREFS, /* request all notification settings (DND + per-channel) */
     OC_CMD_SET_SETTING,     /* upsert a synced client setting: body=key, body2=value (empty value deletes) */
     OC_CMD_LIST_SETTINGS,   /* request the synced client-settings bucket */
+    OC_CMD_SET_DISPLAY_NAME, /* change your own display name: body=name */
+    OC_CMD_CHANGE_PASSWORD, /* change your own password: body=old, body2=new */
     OC_CMD_SET_ROLE,        /* set a user's tenant role: channel_id = user_id, op = role */
     OC_CMD_INVITE_USER,     /* mint a tenant invite token: op = role */
     OC_CMD_REMOVE_USER,     /* remove/disable a user: channel_id = user_id */

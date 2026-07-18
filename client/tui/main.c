@@ -35,6 +35,8 @@
  *       all|mentions|none (this channel's level) · /dnd HH:MM HH:MM | off
  *       (do-not-disturb window) · /set <key> <value> (a synced pref: mouse,
  *       members, time, channels-width, members-width, reset) ·
+ *       /profile (your identity modal) · /nick <name> (rename yourself) ·
+ *       /passwd <old> <new> (change your password) ·
  *       /role <name> owner|admin|member ·
  *       /invite [admin|member] (mint a token) · /remove <name> (owner/admin) ·
  *       /webhook (list this channel's incoming webhooks) · /webhook create
@@ -500,6 +502,8 @@ static void draw_help(int W, int H) {
         "  /search <query>  /close",
         "People & notifications:",
         "  /who  /away  /online  /prefs  /notify <lvl>  /dnd <win|off>",
+        "Profile (yourself):",
+        "  /profile  /nick <name>  /passwd <old> <new>",
         "Preferences (synced):",
         "  /set mouse|members|time|channels-width|members-width <value>",
         "Files, webhooks, admin:",
@@ -521,6 +525,36 @@ static void draw_help(int W, int H) {
     }
 }
 
+/* The /profile modal (REQ-020): your identity + how to change it. Drawn over the
+ * presented frame like the palette/picker, so it self-presents. */
+static void draw_profile(const oc_model *m, int W, int H) {
+    const char *me = m->user_id ? oc_model_user_name(m, m->user_id) : "";
+    uint8_t role = OC_ROLE_MEMBER;
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == m->user_id) { role = m->users[i].role; break; }
+    uint8_t pr = oc_model_presence_of(m, m->user_id);
+    const char *rn = role == OC_ROLE_OWNER ? "owner" : role == OC_ROLE_ADMIN ? "admin" : "member";
+    const char *pn = pr == OC_PRESENCE_ONLINE ? "online" : pr == OC_PRESENCE_AWAY ? "away" : "offline";
+    char L[6][96];
+    snprintf(L[0], sizeof L[0], "Name      %s", me[0] ? me : "(unknown)");
+    snprintf(L[1], sizeof L[1], "User ID   %llu", (unsigned long long)m->user_id);
+    snprintf(L[2], sizeof L[2], "Role      %s", rn);
+    snprintf(L[3], sizeof L[3], "Presence  %s", pn);
+    snprintf(L[4], sizeof L[4], "%s", "");
+    snprintf(L[5], sizeof L[5], "%s", "/nick <name>   ·   /passwd <old> <new>");
+    int n = 6;
+    int bw = 52; if (bw > W - 4) bw = W - 4; if (bw < 24) bw = 24;
+    int bh = n + 2; if (bh > H - 2) bh = H - 2; if (bh < 4) bh = 4;
+    int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
+    for (int j = 0; j < bh; j++) fill_row(y + j, x, x + bw, TB_DEFAULT);
+    draw_panel(x, y, bw, bh, "Profile  ·  any key to close", 1);
+    for (int i = 0; i < n && i + 1 < bh - 1; i++) {
+        uintattr_t col = L[i][0] == '/' ? TB_CYAN : (TB_WHITE | TB_BOLD);
+        draw_clip(x + 2, y + 1 + i, x + bw - 1, L[i], col, TB_DEFAULT);
+    }
+    tb_present();
+}
+
 /* ---- composer autocomplete (commands, channels, @users, :emoji:) ----------- */
 
 typedef struct { char repl[80]; char disp[96]; } ac_cand;
@@ -534,7 +568,8 @@ static int ci_prefix(const char *s, const char *pre) {
 static const char *AC_COMMANDS[] = {
     "/react", "/reactions", "/edit", "/delete", "/thread", "/search", "/close",
     "/create", "/join", "/leave", "/list", "/dm", "/who", "/away", "/online",
-    "/prefs", "/notify", "/dnd", "/set", "/role", "/invite", "/remove", "/webhook",
+    "/prefs", "/notify", "/dnd", "/set", "/profile", "/nick", "/passwd",
+    "/role", "/invite", "/remove", "/webhook",
     "/upload", "/download", "/logout", "/help",
 };
 
@@ -823,7 +858,9 @@ static const struct { const char *cmd; const char *desc; int arg; } PAL_CMDS[] =
     {"/thread","open last message's thread",0}, {"/reactions","who reacted (last)",0}, {"/react","react to last",1},
     {"/edit","edit your last message",1}, {"/delete","delete your last message",0}, {"/prefs","notification settings",0},
     {"/notify","set channel notify level",1}, {"/dnd","do-not-disturb window",1},
-    {"/set","synced pref (mouse/members/time/…)",1}, {"/role","set a user's role",1},
+    {"/set","synced pref (mouse/members/time/…)",1},
+    {"/profile","your identity (name/role/id)",0}, {"/nick","change your display name",1},
+    {"/passwd","change your password",1}, {"/role","set a user's role",1},
     {"/invite","mint an invite token",0}, {"/remove","remove a user",1}, {"/webhook","channel webhooks",0},
     {"/upload","upload a file",1}, {"/download","download an attachment",1}, {"/help","keys & commands",0},
     {"/logout","sign out",0}, {"/close","close the open overlay",0},
@@ -1123,6 +1160,18 @@ static void handle_command(oc_client *cl, uint64_t cid, const char *line) {
         while (*nm == ' ') nm++;
         uint64_t uid = oc_model_user_id(m, nm);
         if (uid) oc_client_remove_user(cl, uid);
+        return;
+    }
+    if (strncmp(line, "/nick ", 6) == 0) {        /* rename yourself (REQ-020) */
+        const char *nm = line + 6;
+        while (*nm == ' ') nm++;
+        if (*nm) oc_client_set_display_name(cl, nm);
+        return;
+    }
+    if (strncmp(line, "/passwd ", 8) == 0) {      /* /passwd <old> <new> — rotate password */
+        char oldp[128] = {0}, newp[128] = {0};
+        if (sscanf(line + 8, "%127s %127s", oldp, newp) == 2 && newp[0])
+            oc_client_change_password(cl, oldp, newp);
         return;
     }
     if (strncmp(line, "/set", 4) == 0 && (line[4] == '\0' || line[4] == ' ')) {
@@ -1463,6 +1512,7 @@ int main(int argc, char **argv) {
     size_t focus = 0;
     int scroll = 0;
     int help_open = 0;
+    int profile_open = 0;                     /* /profile identity modal */
     int ac_idx = 0;                           /* autocomplete cycle index */
     int panel = 0;                            /* 0 composer · 1 channels · 2 messages · 3 members */
     int msg_sel = -1, mem_sel = 0;            /* selection within the messages / members panel */
@@ -1503,6 +1553,7 @@ int main(int argc, char **argv) {
         render(cl, focus, composer, clen, scroll, help_open, ac_idx, panel, msg_sel, mem_sel, editing);
         if (palette_open) draw_palette(oc_client_model(cl), pq, psel);
         if (picker_open) draw_picker(eq, esel);
+        if (profile_open) draw_profile(oc_client_model(cl), tb_width(), tb_height());
 
         struct tb_event ev;
         int rc = tb_peek_event(&ev, 30);
@@ -1530,6 +1581,11 @@ int main(int argc, char **argv) {
         if (help_open) {                       /* help overlay: any key closes it */
             if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
             else help_open = 0;
+            continue;
+        }
+        if (profile_open) {                    /* profile modal: any key closes it */
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else profile_open = 0;
             continue;
         }
         if (palette_open) {                    /* command palette: type to filter */
@@ -1665,6 +1721,7 @@ int main(int argc, char **argv) {
                 const oc_model *mm = oc_client_model(cl);
                 uint64_t cid = mm->channels[focus].channel_id;
                 if (strcmp(composer, "/help") == 0)           { help_open = 1; }
+                else if (strcmp(composer, "/profile") == 0)   { profile_open = 1; }
                 else if (strcmp(composer, "/logout") == 0)    { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
                 else if (composer[0] == '/')                  handle_command(cl, cid, composer);
                 else if (mm->search_open || mm->roster_open || mm->reactlist_open || mm->prefs_open || mm->weblist_open) { /* read-only overlay: ignore */ }

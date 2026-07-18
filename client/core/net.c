@@ -493,6 +493,16 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (e->body) { memcpy(e->body, ce[i].value.ptr, ce[i].value.len); e->body[ce[i].value.len] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_PROFILE_UPDATED) {
+            oc_profile_updated pu;
+            if (oc_decode_profile_updated(&p, &pu) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_PROFILE);
+            if (e) {
+                e->user_id = pu.user_id;
+                e->body = malloc(pu.display_name.len + 1);
+                if (e->body) { memcpy(e->body, pu.display_name.ptr, pu.display_name.len); e->body[pu.display_name.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
         } else if (hdr.msg_type == OC_MSG_USER_UPDATED) {
             oc_user_updated uu;
             if (oc_decode_user_updated(&p, &uu) != OC_OK) return -1;
@@ -921,6 +931,19 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_list_client_settings ls = { oc_slice_str(n->client_type) };
                 if (oc_encode_list_client_settings(&w, OC_PROTOCOL_VERSION, &ls) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_DISPLAY_NAME) {
+                uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_display_name sn = { oc_slice_str(c->body ? c->body : "") };
+                if (oc_encode_set_display_name(&w, OC_PROTOCOL_VERSION, &sn) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_CHANGE_PASSWORD) {
+                uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_change_password cp = { oc_slice_str(c->body ? c->body : ""),
+                                          oc_slice_str(c->body2 ? c->body2 : "") };
+                if (oc_encode_change_password(&w, OC_PROTOCOL_VERSION, &cp) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SET_ROLE) {

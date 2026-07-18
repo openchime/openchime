@@ -119,6 +119,13 @@ void oc_client_set_client_type(oc_client *c, const char *client_type);
 void oc_client_set_setting(oc_client *c, const char *key, const char *value);
 void oc_client_list_settings(oc_client *c);
 
+/* Self-service profile (REQ-020). Change your own display name (fans to every
+ * roster) or rotate your local password (the server verifies `old_pw`). Each
+ * folds a PROFILE_UPDATED into the model on success; a failure (e.g. wrong old
+ * password) surfaces as a status/error line. */
+void oc_client_set_display_name(oc_client *c, const char *name);
+void oc_client_change_password(oc_client *c, const char *old_pw, const char *new_pw);
+
 /* Admin / user management (REQ-030/033; owner/admin only, enforced server-side).
  * Set a user's tenant role (OC_ROLE_MEMBER/_ADMIN/_OWNER), mint a tenant invite
  * token for a role (the server answers with an INVITE_CREATED, shown once in the

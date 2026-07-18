@@ -115,6 +115,9 @@ typedef enum {
     OC_MSG_USER_UPDATED     = 0x0045, /* S->C, ack/push for SET_ROLE + REMOVE_USER */
     OC_MSG_INVITE_CREATED   = 0x0046, /* S->C, the minted invite token */
     OC_MSG_REDEEM_INVITE    = 0x0047, /* C->S, pre-auth account creation */
+    OC_MSG_SET_DISPLAY_NAME = 0x0048, /* C->S, change your own display name (REQ-020) */
+    OC_MSG_CHANGE_PASSWORD  = 0x0049, /* C->S, change your own local password (verify old) */
+    OC_MSG_PROFILE_UPDATED  = 0x004A, /* S->C, a user's display name changed (also the self ack) */
     OC_MSG_SEARCH           = 0x0060, /* C->S (REQ-080) */
     OC_MSG_SEARCH_RESULTS   = 0x0061, /* S->C */
     OC_MSG_BACKFILL_REQUEST = 0x0030, /* C->S */
@@ -275,6 +278,7 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_CHANNEL_KIND    0u   /* a named channel */
 #define OC_CHANNEL_KIND_DM 1u   /* a direct-message conversation (reserved) */
 #define OC_MAX_CHANNEL_NAME 64u /* channel-name length cap (bytes) */
+#define OC_MAX_DISPLAY_NAME 48u /* display-name length cap (bytes), self-service rename */
 
 /* Account-creation invite token (AUTH.md §2); like a session token, only its
  * SHA-256 is stored. Presented in REDEEM_INVITE to set a password. */
@@ -400,6 +404,10 @@ typedef struct { uint64_t user_id; } oc_remove_user;
 typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; } oc_user_updated;
 typedef struct { oc_slice token; uint8_t role; uint64_t expires_at; } oc_invite_created;
 typedef struct { oc_slice token; oc_slice username; oc_slice password; } oc_redeem_invite;
+/* Self-service profile (REQ-020). */
+typedef struct { oc_slice name; } oc_set_display_name;
+typedef struct { oc_slice old_password; oc_slice new_password; } oc_change_password;
+typedef struct { uint64_t user_id; oc_slice display_name; } oc_profile_updated;
 typedef struct { oc_slice query; uint16_t limit; } oc_search;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time; oc_slice snippet; } oc_search_result_entry;
 typedef struct { uint16_t count; const oc_search_result_entry *entries; uint8_t truncated; } oc_search_results;
@@ -488,6 +496,9 @@ oc_result oc_encode_remove_user(oc_wbuf *w, uint16_t version, const oc_remove_us
 oc_result oc_encode_user_updated(oc_wbuf *w, uint16_t version, const oc_user_updated *m);
 oc_result oc_encode_invite_created(oc_wbuf *w, uint16_t version, const oc_invite_created *m);
 oc_result oc_encode_redeem_invite(oc_wbuf *w, uint16_t version, const oc_redeem_invite *m);
+oc_result oc_encode_set_display_name(oc_wbuf *w, uint16_t version, const oc_set_display_name *m);
+oc_result oc_encode_change_password(oc_wbuf *w, uint16_t version, const oc_change_password *m);
+oc_result oc_encode_profile_updated(oc_wbuf *w, uint16_t version, const oc_profile_updated *m);
 oc_result oc_encode_search(oc_wbuf *w, uint16_t version, const oc_search *m);
 oc_result oc_encode_search_results(oc_wbuf *w, uint16_t version, const oc_search_results *m);
 oc_result oc_encode_backfill_request(oc_wbuf *w, uint16_t version, const oc_backfill_request *m);
@@ -580,6 +591,9 @@ oc_result oc_decode_remove_user(oc_rbuf *p, oc_remove_user *m);
 oc_result oc_decode_user_updated(oc_rbuf *p, oc_user_updated *m);
 oc_result oc_decode_invite_created(oc_rbuf *p, oc_invite_created *m);
 oc_result oc_decode_redeem_invite(oc_rbuf *p, oc_redeem_invite *m);
+oc_result oc_decode_set_display_name(oc_rbuf *p, oc_set_display_name *m);
+oc_result oc_decode_change_password(oc_rbuf *p, oc_change_password *m);
+oc_result oc_decode_profile_updated(oc_rbuf *p, oc_profile_updated *m);
 oc_result oc_decode_search(oc_rbuf *p, oc_search *m);
 oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries, uint16_t cap, uint16_t *out_count, uint8_t *out_truncated);
 oc_result oc_decode_backfill_request(oc_rbuf *p, oc_cursor *cursors, uint16_t cap, uint16_t *out_count);

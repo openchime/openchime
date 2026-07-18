@@ -983,6 +983,30 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_DISPLAY_NAME) {
+            oc_set_display_name sn;
+            if (oc_decode_set_display_name(&p, &sn) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_DISPLAY_NAME, c->conn_id);
+            if (!j) return -1;
+            size_t nl = sn.name.len < OC_MAX_DISPLAY_NAME ? sn.name.len : OC_MAX_DISPLAY_NAME;
+            j->user_id = c->user_id;
+            j->pf_name = strndup((const char *)sn.name.ptr, nl);
+            if (!j->pf_name) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CHANGE_PASSWORD) {
+            oc_change_password cp;
+            if (oc_decode_change_password(&p, &cp) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_CHANGE_PASSWORD, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->pf_old_pw = strndup((const char *)cp.old_password.ptr, cp.old_password.len);
+            j->pf_new_pw = strndup((const char *)cp.new_password.ptr, cp.new_password.len);
+            if (!j->pf_old_pw || !j->pf_new_pw) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_CALL_JOIN) {
             oc_call_join cj;
             if (oc_decode_call_join(&p, &cj) != OC_OK) return -1;
@@ -1883,6 +1907,29 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             if (c && c->authed && c->user_id == r->user_id)
                 send_bytes(ep, conns, fd, g_enc, len);
         }
+        break;
+    }
+    case OC_RES_PROFILE_UPDATED: {
+        /* A display-name change (REQ-020): fan it to every authed connection so all
+         * rosters update; the originator reads it as its own ack (a password change
+         * echoes the unchanged name, which is a harmless roster no-op). */
+        oc_profile_updated pu = { r->user_id, oc_slice_str(r->profile_name ? r->profile_name : "") };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_profile_updated(&w, OC_PROTOCOL_VERSION, &pu);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed) send_bytes(ep, conns, fd, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_PROFILE_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("profile update rejected") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
     case OC_RES_CALL_AUTH: {

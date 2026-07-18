@@ -330,7 +330,7 @@ static void test_secret_routing(void) {
 }
 
 int run_client_core_tests(void) {
-    printf("test_client_core: resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, client-settings, persisted store, cached history, session reconnect, offline outbox\n");
+    printf("test_client_core: resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, client-settings, profile, persisted store, cached history, session reconnect, offline outbox\n");
 
     test_resolve();
     test_last_error();
@@ -477,6 +477,23 @@ int run_client_core_tests(void) {
         CHECK(WAIT_FOR(d, oc_model_setting(m, "mouse") == NULL &&
                           oc_model_setting(m, "time_24h") != NULL));
         oc_client_stop(d);
+
+        /* self-service profile (REQ-020): dana renames herself; the change fans to
+         * every roster — her own (a) and erik's view (b). A password rotation
+         * succeeds with the right old password and is rejected with a wrong one.
+         * Restore both so the later "dana" author/roster assertions still hold. */
+        uint64_t danaid = oc_client_model(a)->user_id;
+        oc_client_set_display_name(a, "Dana Q");
+        CHECK(WAIT_FOR(a, strcmp(oc_model_user_name(m, danaid), "Dana Q") == 0));
+        CHECK(WAIT_FOR(b, strcmp(oc_model_user_name(m, danaid), "Dana Q") == 0));
+        oc_client_change_password(a, "pw-dana", "pw-dana-2");
+        CHECK(WAIT_FOR(a, strstr(m->status, "profile updated") != NULL));
+        oc_client_change_password(a, "wrong-old", "irrelevant");   /* rejected */
+        CHECK(WAIT_FOR(a, m->last_error[0] != '\0'));
+        oc_client_change_password(a, "pw-dana-2", "pw-dana");       /* restore password */
+        oc_client_set_display_name(a, "dana");                      /* restore name */
+        CHECK(WAIT_FOR(a, strcmp(oc_model_user_name(m, danaid), "dana") == 0));
+        CHECK(WAIT_FOR(b, strcmp(oc_model_user_name(m, danaid), "dana") == 0));
 
         /* erik replies to dana's message in a thread: both see the parent's reply
          * count rise, and opening the thread streams the reply into the buffer. */

@@ -570,6 +570,31 @@ static void test_client_settings_frames(void) {
     }
 }
 
+static void test_profile_frames(void) {
+    {
+        oc_set_display_name in = { oc_slice_str("Dana Q") };
+        ROUNDTRIP(oc_encode_set_display_name(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_DISPLAY_NAME, h, p);
+        oc_set_display_name out;
+        CHECK(oc_decode_set_display_name(&p, &out) == OC_OK);
+        CHECK(out.name.len == 6 && memcmp(out.name.ptr, "Dana Q", 6) == 0);
+    }
+    {
+        oc_change_password in = { oc_slice_str("old-secret"), oc_slice_str("new-secret") };
+        ROUNDTRIP(oc_encode_change_password(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANGE_PASSWORD, h, p);
+        oc_change_password out;
+        CHECK(oc_decode_change_password(&p, &out) == OC_OK);
+        CHECK(out.old_password.len == 10 && memcmp(out.old_password.ptr, "old-secret", 10) == 0);
+        CHECK(out.new_password.len == 10 && memcmp(out.new_password.ptr, "new-secret", 10) == 0);
+    }
+    {
+        oc_profile_updated in = { 42, oc_slice_str("Dana Q") };
+        ROUNDTRIP(oc_encode_profile_updated(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PROFILE_UPDATED, h, p);
+        oc_profile_updated out;
+        CHECK(oc_decode_profile_updated(&p, &out) == OC_OK && out.user_id == 42);
+        CHECK(out.display_name.len == 6 && memcmp(out.display_name.ptr, "Dana Q", 6) == 0);
+    }
+}
+
 static void test_call_frames(void) {
     {
         oc_call_join in = { 7 };
@@ -947,6 +972,7 @@ int run_protocol_tests(void) {
     test_webhook_frames();
     test_notify_frames();
     test_client_settings_frames();
+    test_profile_frames();
     test_call_frames();
     test_backfill_and_error();
     test_size_limits();

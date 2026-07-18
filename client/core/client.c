@@ -283,6 +283,23 @@ void oc_client_list_settings(oc_client *c) {
     if (cmd) oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_set_display_name(oc_client *c, const char *name) {
+    if (!c || !name || !name[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_DISPLAY_NAME);
+    if (!cmd) return;
+    cmd->body = strdup(name);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_change_password(oc_client *c, const char *old_pw, const char *new_pw) {
+    if (!c || !new_pw || !new_pw[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CHANGE_PASSWORD);
+    if (!cmd) return;
+    cmd->body  = strdup(old_pw ? old_pw : "");
+    cmd->body2 = strdup(new_pw);
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_set_role(oc_client *c, uint64_t user_id, uint8_t role) {
     if (!c || !user_id) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_ROLE);

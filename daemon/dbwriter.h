@@ -54,7 +54,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_CALL_AUTH = 40,
        /* Synced client settings bucket. SET upserts/deletes one key; LIST reads a
         * client_type bucket. Both answer with a CLIENT_SETTINGS snapshot. */
-       OC_JOB_SET_CLIENT_SETTING = 41, OC_JOB_LIST_CLIENT_SETTINGS = 42 };
+       OC_JOB_SET_CLIENT_SETTING = 41, OC_JOB_LIST_CLIENT_SETTINGS = 42,
+       /* Self-service profile (REQ-020): rename yourself / rotate your local
+        * password (verifies the old one). Both are writes. */
+       OC_JOB_SET_DISPLAY_NAME = 43, OC_JOB_CHANGE_PASSWORD = 44 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -135,6 +138,12 @@ typedef struct oc_job {
     char          *cs_client_type; /* heap */
     char          *cs_key;         /* heap */
     char          *cs_value;       /* heap */
+
+    /* Self-service profile (REQ-020). SET_DISPLAY_NAME uses pf_name;
+     * CHANGE_PASSWORD uses pf_old_pw + pf_new_pw. */
+    char          *pf_name;        /* heap */
+    char          *pf_old_pw;      /* heap */
+    char          *pf_new_pw;      /* heap */
 } oc_job;
 
 /* --- Results (writer -> net thread) ------------------------------------- */
@@ -169,7 +178,10 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* Call join authorized (net thread then updates in-memory call state) / denied. */
        OC_RES_CALL_AUTH = 45, OC_RES_CALL_ERR = 46,
        /* Synced client settings bucket snapshot (also fanned as a device-sync push). */
-       OC_RES_CLIENT_SETTINGS = 47 };
+       OC_RES_CLIENT_SETTINGS = 47,
+       /* Profile change ok (display name fanned tenant-wide; also the self ack for a
+        * password change) / denied (bad old password, etc.). */
+       OC_RES_PROFILE_UPDATED = 48, OC_RES_PROFILE_ERR = 49 };
 
 /* One row in a REACTIONS result (a distinct emoji + one reacting user). */
 typedef struct { char *emoji; uint64_t user_id; } oc_reaction_row;
@@ -333,6 +345,10 @@ typedef struct oc_dbres {
     char                   *cs_client_type;  /* heap */
     oc_client_setting_row  *cslist;          /* heap array */
     size_t                  n_cslist;
+
+    /* PROFILE_UPDATED: the (possibly unchanged) display name to broadcast; the
+     * subject user is `user_id` above. */
+    char                   *profile_name;    /* heap */
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;

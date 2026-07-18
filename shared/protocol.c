@@ -945,6 +945,26 @@ oc_result oc_encode_redeem_invite(oc_wbuf *w, uint16_t version, const oc_redeem_
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_set_display_name(oc_wbuf *w, uint16_t version, const oc_set_display_name *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_DISPLAY_NAME);
+    oc_w_str(w, m->name);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_change_password(oc_wbuf *w, uint16_t version, const oc_change_password *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CHANGE_PASSWORD);
+    oc_w_str(w, m->old_password);
+    oc_w_str(w, m->new_password);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_profile_updated(oc_wbuf *w, uint16_t version, const oc_profile_updated *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PROFILE_UPDATED);
+    oc_w_u64(w, m->user_id);
+    oc_w_str(w, m->display_name);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_search(oc_wbuf *w, uint16_t version, const oc_search *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_SEARCH);
     oc_w_str(w, m->query);
@@ -1488,6 +1508,23 @@ oc_result oc_decode_redeem_invite(oc_rbuf *p, oc_redeem_invite *m) {
     m->token = oc_r_bytes(p);
     m->username = oc_r_str(p);
     m->password = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_set_display_name(oc_rbuf *p, oc_set_display_name *m) {
+    m->name = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_change_password(oc_rbuf *p, oc_change_password *m) {
+    m->old_password = oc_r_str(p);
+    m->new_password = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_profile_updated(oc_rbuf *p, oc_profile_updated *m) {
+    m->user_id = oc_r_u64(p);
+    m->display_name = oc_r_str(p);
     return r_done(p);
 }
 

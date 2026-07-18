@@ -936,6 +936,28 @@ devices without leaking one frontend's bucket to another.
 
 ---
 
+### 5.16b Self-service profile (REQ-020)
+
+A user editing their own account: renaming themselves and rotating their local
+password. Both act on the **authenticated** user (`user_id` from the session, not
+a field), so neither can touch another account.
+
+**`SET_DISPLAY_NAME` (C → S), `0x0048`** `{ name: str }` — set your own
+`users.display_name` (non-empty, ≤ 48 bytes). Answered with `PROFILE_UPDATED`.
+
+**`CHANGE_PASSWORD` (C → S), `0x0049`** `{ old_password: str, new_password: str }`
+— rotate your local password. The daemon verifies `old_password` (constant-time)
+against `local_credentials` and stores a fresh PBKDF2 salt+hash. A non-local
+(OIDC) account or a wrong `old_password` is `FORBIDDEN` (an `ERROR`, non-fatal);
+success answers with `PROFILE_UPDATED` (the name unchanged) as the ack.
+
+**`PROFILE_UPDATED` (S → C), `0x004A`** `{ user_id: u64, display_name: str }` — a
+user's display name (after a rename; or the caller's unchanged name after a
+password change). **Fanned to every authed connection** so all rosters update in
+place; the originator reads its own as the operation's success ack.
+
+---
+
 ### 5.17 Audio call signaling (REQ-150, REQ-152)
 
 Audio is **server-relayed** (no P2P/ICE, ARCH-18): the media itself flows over a
@@ -1150,6 +1172,9 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0094` | `SET_CLIENT_SETTING`   | C → S | no        | §5.16a  |
 | `0x0095` | `LIST_CLIENT_SETTINGS` | C → S | no        | §5.16a  |
 | `0x0096` | `CLIENT_SETTINGS`      | S → C | no        | §5.16a  |
+| `0x0048` | `SET_DISPLAY_NAME` | C → S     | no        | §5.16b  |
+| `0x0049` | `CHANGE_PASSWORD`  | C → S     | no        | §5.16b  |
+| `0x004A` | `PROFILE_UPDATED`  | S → C     | no        | §5.16b  |
 | `0x00A0` | `CALL_JOIN`        | C → S     | no        | §5.17   |
 | `0x00A1` | `CALL_LEAVE`       | C → S     | no        | §5.17   |
 | `0x00A2` | `CALL_JOINED`      | S → C     | no        | §5.17   |
