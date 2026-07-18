@@ -12,15 +12,18 @@
 #define OC_NET_H
 
 #include "queue.h"
+#include "secret.h"
 
 typedef struct oc_net oc_net;
 
 /* Start the network thread. `token` carries local credentials as
  * "username:password". `store_path` (or NULL for in-memory only) is a local
  * SQLite store persisting the session token + TOFU pin, so a relaunch reconnects
- * silently. Returns NULL on failure to spawn. */
+ * silently. `secret` (borrowed; NULL = none) routes the session token into an OS
+ * keyring instead of the SQLite file. Returns NULL on failure to spawn. */
 oc_net *oc_net_start(const char *host, int port, const char *token,
-                     const char *store_path, oc_queue *to_ui, oc_queue *from_ui);
+                     const char *store_path, oc_secret *secret,
+                     oc_queue *to_ui, oc_queue *from_ui);
 
 /* Signal the thread to stop, join it, and free. */
 void oc_net_stop(oc_net *n);

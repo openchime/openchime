@@ -261,11 +261,80 @@ static void test_last_error(void) {
     oc_model_free(&m);
 }
 
+/* A mock oc_secret (in-memory keyring) for the credential-cache routing test. */
+static struct { char account[64]; uint8_t val[64]; size_t len; int used; } g_mock[8];
+static int mock_get(void *ctx, const char *a, uint8_t *out, size_t cap, size_t *len) {
+    (void)ctx;
+    for (int i = 0; i < 8; i++)
+        if (g_mock[i].used && strcmp(g_mock[i].account, a) == 0) {
+            if (g_mock[i].len > cap) return 0;
+            memcpy(out, g_mock[i].val, g_mock[i].len); *len = g_mock[i].len; return 1;
+        }
+    return 0;
+}
+static int mock_put(void *ctx, const char *a, const uint8_t *v, size_t n) {
+    (void)ctx;
+    if (n > sizeof g_mock[0].val) return 0;
+    for (int i = 0; i < 8; i++)
+        if (!g_mock[i].used || strcmp(g_mock[i].account, a) == 0) {
+            g_mock[i].used = 1; snprintf(g_mock[i].account, sizeof g_mock[i].account, "%s", a);
+            memcpy(g_mock[i].val, v, n); g_mock[i].len = n; return 1;
+        }
+    return 0;
+}
+static void mock_del(void *ctx, const char *a) {
+    (void)ctx;
+    for (int i = 0; i < 8; i++)
+        if (g_mock[i].used && strcmp(g_mock[i].account, a) == 0) g_mock[i].used = 0;
+}
+
+/* With a secret set, the session token round-trips through the keyring vtable and
+ * does NOT land in the SQLite column; clearing goes through the vtable too. */
+static void test_secret_routing(void) {
+    memset(g_mock, 0, sizeof g_mock);
+    oc_secret sec = { mock_get, mock_put, mock_del, NULL, NULL };
+    const char *sp = "build/itest_core_secret.db";
+    unlink(sp); unlink("build/itest_core_secret.db-wal"); unlink("build/itest_core_secret.db-shm");
+
+    uint8_t tok[OC_SESSION_TOKEN_LEN];
+    for (int i = 0; i < OC_SESSION_TOKEN_LEN; i++) tok[i] = (uint8_t)(i + 1);
+
+    oc_store *s = oc_store_open(sp);
+    CHECK(s != NULL);
+    if (s) {
+        oc_store_set_secret(s, &sec);
+        oc_store_save_session(s, "host:1", tok, 0);
+        uint8_t got[OC_SESSION_TOKEN_LEN];
+        CHECK(oc_store_load_session(s, "host:1", got, NULL, 0) == 1 &&
+              memcmp(got, tok, OC_SESSION_TOKEN_LEN) == 0);      /* via the keyring */
+        oc_store_close(s);
+    }
+    /* Reopen WITHOUT the secret: the token is not in SQLite (it went to the mock). */
+    oc_store *s2 = oc_store_open(sp);
+    CHECK(s2 != NULL);
+    if (s2) {
+        uint8_t g2[OC_SESSION_TOKEN_LEN];
+        CHECK(oc_store_load_session(s2, "host:1", g2, NULL, 0) == 0);
+        oc_store_close(s2);
+    }
+    /* Clear via the secret. */
+    oc_store *s3 = oc_store_open(sp);
+    if (s3) {
+        oc_store_set_secret(s3, &sec);
+        oc_store_clear_session(s3, "host:1");
+        uint8_t g3[OC_SESSION_TOKEN_LEN];
+        CHECK(oc_store_load_session(s3, "host:1", g3, NULL, 0) == 0);
+        oc_store_close(s3);
+    }
+    unlink(sp); unlink("build/itest_core_secret.db-wal"); unlink("build/itest_core_secret.db-shm");
+}
+
 int run_client_core_tests(void) {
-    printf("test_client_core: resolve, last-error, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, persisted store, cached history, session reconnect, offline outbox\n");
+    printf("test_client_core: resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, persisted store, cached history, session reconnect, offline outbox\n");
 
     test_resolve();
     test_last_error();
+    test_secret_routing();
 
     /* The daemon opens its blob store at netloop startup; point it at a build-local
      * dir (the /data/blobs default isn't writable in the test sandbox), matching

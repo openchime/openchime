@@ -34,6 +34,7 @@
 #include "model.h"
 #include "resolve.h"    /* instance -> host:port (REQ-010/011) */
 #include "store.h"      /* peek a stored session token (skip the login box) */
+#include "secret_backend.h" /* OS keyring for the session token */
 #include "protocol.h"   /* OC_PRESENCE_*, OC_SESSION_TOKEN_LEN */
 
 #include <locale.h>
@@ -866,7 +867,8 @@ static int await_auth(oc_client *cl, const char *host) {
 
 /* Drive the login box + connect, retrying on failure, until authenticated or the
  * user quits. On success sets *out to the authenticated client and returns 1. */
-static int run_login(const char *initial_instance, const char *store_path, oc_client **out) {
+static int run_login(const char *initial_instance, const char *store_path,
+                     oc_secret *secret, oc_client **out) {
     login_form f; memset(&f, 0, sizeof f);
     snprintf(f.instance, sizeof f.instance, "%s", initial_instance ? initial_instance : "");
     f.remember = 1;
@@ -874,8 +876,9 @@ static int run_login(const char *initial_instance, const char *store_path, oc_cl
     for (;;) {
         if (login_dialog(&f, err[0] ? err : NULL) == LOGIN_QUIT) return 0;
         char cred[260]; snprintf(cred, sizeof cred, "%s:%s", f.user, f.pass);
-        oc_client *cl = oc_client_start_stored(f.ep.host, f.ep.port, cred,
-                                               f.remember ? store_path : NULL);
+        oc_client *cl = oc_client_start_secure(f.ep.host, f.ep.port, cred,
+                                               f.remember ? store_path : NULL,
+                                               f.remember ? secret : NULL);
         if (!cl) { snprintf(err, sizeof err, "could not start the client"); continue; }
         int res = await_auth(cl, f.ep.host);
         if (res == AUTH_R_OK) { *out = cl; return 1; }
@@ -889,13 +892,14 @@ static int run_login(const char *initial_instance, const char *store_path, oc_cl
 
 /* Is a still-valid session token stored for this instance? If so we skip the
  * login box and let the net thread reconnect silently. */
-static int have_stored_token(const char *store_path, const char *host, int port) {
-    if (!store_path) return 0;
-    oc_store *s = oc_store_open(store_path);
-    if (!s) return 0;
+static int have_stored_token(const char *store_path, const char *host, int port,
+                             oc_secret *secret) {
+    oc_store *s = store_path ? oc_store_open(store_path) : NULL;
+    if (!s && !secret) return 0;
+    if (s) oc_store_set_secret(s, secret);   /* look in the keyring too */
     char inst[288]; snprintf(inst, sizeof inst, "%s:%d", host, port);
     uint8_t tok[OC_SESSION_TOKEN_LEN];
-    int has = oc_store_load_session(s, inst, tok, NULL, (uint64_t)time(NULL) * 1000);
+    int has = s ? oc_store_load_session(s, inst, tok, NULL, (uint64_t)time(NULL) * 1000) : 0;
     oc_store_close(s);
     return has;
 }
@@ -914,6 +918,9 @@ int main(int argc, char **argv) {
     setlocale(LC_ALL, "");
 
     const char *store_path = resolve_store_path();
+    /* Prefer the OS keyring for the session token; NULL (headless / no keyring)
+     * falls back to the SQLite store. Owned here, freed after the client stops. */
+    oc_secret *secret = oc_tui_secret_open("openchime");
 
     /* Decide how to connect. Three shapes:
      *   <host> <port> [cred]  — dev/local direct connect (argv[2] is a port);
@@ -940,9 +947,9 @@ int main(int argc, char **argv) {
         if (st == OC_RESOLVE_NOT_FOUND)    { fprintf(stderr, "openchime: instance '%s' not found — it does not resolve in DNS\n", inst); return 3; }
         snprintf(host, sizeof host, "%s", ep.host);
         port = ep.port;
-        if (cli_cred && cli_cred[0])                       { cred = cli_cred; direct = 1; }
-        else if (have_stored_token(store_path, host, port)) { cred = "";      direct = 1; }  /* silent reconnect */
-        else                                                { prefill = inst; direct = 0; }  /* prompt */
+        if (cli_cred && cli_cred[0])                               { cred = cli_cred; direct = 1; }
+        else if (have_stored_token(store_path, host, port, secret)) { cred = "";      direct = 1; }  /* silent reconnect */
+        else                                                       { prefill = inst; direct = 0; }  /* prompt */
     }                                                /* else: no args -> login box */
     if (!cred) cred = "";
 
@@ -953,10 +960,11 @@ int main(int argc, char **argv) {
 
     oc_client *cl = NULL;
     if (direct) {
-        cl = oc_client_start_stored(host, port, cred, store_path);
-        if (!cl) { tb_shutdown(); fprintf(stderr, "failed to start client\n"); return 1; }
-    } else if (!run_login(prefill, store_path, &cl)) {
+        cl = oc_client_start_secure(host, port, cred, store_path, secret);
+        if (!cl) { tb_shutdown(); oc_secret_free(secret); fprintf(stderr, "failed to start client\n"); return 1; }
+    } else if (!run_login(prefill, store_path, secret, &cl)) {
         tb_shutdown();       /* user quit the login box */
+        oc_secret_free(secret);
         return 0;
     }
 
@@ -1040,5 +1048,6 @@ int main(int argc, char **argv) {
 
     tb_shutdown();
     oc_client_stop(cl);
+    oc_secret_free(secret);
     return 0;
 }

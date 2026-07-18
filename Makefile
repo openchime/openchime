@@ -46,6 +46,17 @@ UTF8PROC  := third_party/utf8proc/utf8proc.c
 # The core's local store (client/core/store.c) reuses the daemon's migration
 # runner and SQLite, so the frontend links migrate.c + libsqlite3.
 STORE_DEPS := daemon/migrate.c
+# The TUI's credential backend (client/tui/secret_backend.c, already in TUI_SRC)
+# uses the OS keyring via libsecret when the dev package is present; otherwise it
+# compiles a stub and the core falls back to the SQLite store — so `make tui`
+# works with or without libsecret installed.
+ifeq ($(shell pkg-config --exists libsecret-1 && echo yes),yes)
+  SECRET_CFLAGS := $(shell pkg-config --cflags libsecret-1) -DOC_HAVE_LIBSECRET
+  SECRET_LIBS   := $(shell pkg-config --libs libsecret-1)
+else
+  SECRET_CFLAGS :=
+  SECRET_LIBS   :=
+endif
 TUI_INC   := $(CORE_INC) -Iclient/tui -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
@@ -98,8 +109,8 @@ core: $(CORE_SRC) $(SHARED_SRC) $(wildcard client/core/*.h shared/*.h) $(MBEDTLS
 tui: $(TUI_BIN)
 $(TUI_BIN): $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) \
             $(wildcard client/tui/*.h client/core/*.h shared/*.h) $(MBEDTLS_A) | build
-	$(CC) $(CFLAGS) -Wno-unused-result $(INC) $(TUI_INC) \
-	    $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(UTF8PROC) $(MBEDTLS_LIBS) -lsqlite3 -lresolv -lpthread -o $@
+	$(CC) $(CFLAGS) -Wno-unused-result $(INC) $(TUI_INC) $(SECRET_CFLAGS) \
+	    $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(UTF8PROC) $(MBEDTLS_LIBS) -lsqlite3 -lresolv -lpthread $(SECRET_LIBS) -o $@
 
 build:
 	mkdir -p build

@@ -13,6 +13,7 @@
 #include <stdint.h>
 
 #include "model.h"
+#include "secret.h"
 
 typedef struct oc_client oc_client;
 
@@ -27,6 +28,12 @@ oc_client *oc_client_start(const char *host, int port, const char *cred);
  * directory must exist; an unusable path just disables persistence. */
 oc_client *oc_client_start_stored(const char *host, int port, const char *cred,
                                   const char *store_path);
+
+/* As oc_client_start_stored, plus an OS secret store (borrowed; NULL = none) that
+ * holds the session token in the platform keyring instead of the SQLite file
+ * (ARCH-74). The caller owns `secret` and frees it after oc_client_stop. */
+oc_client *oc_client_start_secure(const char *host, int port, const char *cred,
+                                  const char *store_path, oc_secret *secret);
 
 /* Drain all queued net events into the model. Call once per frame/tick. */
 void oc_client_tick(oc_client *c);

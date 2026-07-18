@@ -24,6 +24,7 @@ struct oc_net {
     int           port;
     char         *token;
     char         *store_path;   /* local store for token/pin persistence, or NULL */
+    oc_secret    *secret;       /* borrowed OS keyring for the session token, or NULL */
     oc_queue     *to_ui;
     oc_queue     *from_ui;
 };
@@ -1079,6 +1080,7 @@ static void *net_thread(void *arg) {
     cs.instance = instance;
     cs.store = n->store_path ? oc_store_open(n->store_path) : NULL;
     if (cs.store) {
+        oc_store_set_secret(cs.store, n->secret);   /* token -> keyring if available */
         cs.have_pin = oc_store_load_pin(cs.store, instance, cs.pin);
         uint64_t now_ms = (uint64_t)time(NULL) * 1000;
         if (oc_store_load_session(cs.store, instance, sess, NULL, now_ms)) {
@@ -1148,13 +1150,15 @@ static void *net_thread(void *arg) {
 /* ---- lifecycle ---- */
 
 oc_net *oc_net_start(const char *host, int port, const char *token,
-                     const char *store_path, oc_queue *to_ui, oc_queue *from_ui) {
+                     const char *store_path, oc_secret *secret,
+                     oc_queue *to_ui, oc_queue *from_ui) {
     oc_net *n = calloc(1, sizeof *n);
     if (!n) return NULL;
     snprintf(n->host, sizeof n->host, "%s", host ? host : "127.0.0.1");
     n->port = port;
     n->token = token ? strdup(token) : NULL;
     n->store_path = (store_path && store_path[0]) ? strdup(store_path) : NULL;
+    n->secret = secret;
     n->to_ui = to_ui;
     n->from_ui = from_ui;
     if (pthread_create(&n->thread, NULL, net_thread, n) != 0) {

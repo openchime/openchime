@@ -18,6 +18,7 @@
 
 #include "tls.h"        /* OC_TLS_FINGERPRINT_LEN */
 #include "protocol.h"   /* OC_SESSION_TOKEN_LEN */
+#include "secret.h"     /* optional OS keyring backend for the session token */
 
 typedef struct oc_store oc_store;
 
@@ -25,6 +26,11 @@ typedef struct oc_store oc_store;
  * caller then runs without persistence). The parent directory must exist. */
 oc_store *oc_store_open(const char *path);
 void      oc_store_close(oc_store *s);
+
+/* Route the session token through an OS secret store (borrowed; NULL = keep it in
+ * SQLite). When set, save/load/clear_session use the keyring; the pin + cache
+ * stay in SQLite regardless. Set once, right after open. */
+void      oc_store_set_secret(oc_store *s, oc_secret *secret);
 
 /* Session token (ARCH-58). load returns 1 and fills `token`/`expiry` iff a
  * non-expired token is stored for `instance` (`now_ms` = current time in ms; use

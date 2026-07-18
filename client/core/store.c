@@ -10,7 +10,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-struct oc_store { sqlite3 *db; };
+struct oc_store { sqlite3 *db; oc_secret *secret; };
+
+void oc_store_set_secret(oc_store *s, oc_secret *secret) {
+    if (s) s->secret = secret;
+}
 
 /* The client migration set (independent of the daemon's OC_MIGRATIONS). One row
  * per server instance holds the reconnect state. */
@@ -89,10 +93,33 @@ static void upsert(oc_store *s, const char *instance, const char *sql,
     sqlite3_finalize(st);
 }
 
+/* Pack/unpack a token + 8-byte little-endian expiry as one keyring blob. */
+#define OC_SECRET_BLOB (OC_SESSION_TOKEN_LEN + 8)
+static void secret_pack(const uint8_t *token, uint64_t expiry, uint8_t *out) {
+    memcpy(out, token, OC_SESSION_TOKEN_LEN);
+    for (int i = 0; i < 8; i++) out[OC_SESSION_TOKEN_LEN + i] = (uint8_t)(expiry >> (8 * i));
+}
+static uint64_t secret_unpack_expiry(const uint8_t *blob) {
+    uint64_t e = 0;
+    for (int i = 0; i < 8; i++) e |= (uint64_t)blob[OC_SESSION_TOKEN_LEN + i] << (8 * i);
+    return e;
+}
+
 int oc_store_load_session(oc_store *s, const char *instance,
                           uint8_t token[OC_SESSION_TOKEN_LEN], uint64_t *expiry,
                           uint64_t now_ms) {
-    if (!s || !s->db || !instance) return 0;
+    if (!s || !instance) return 0;
+    if (s->secret) {   /* keyring-backed: one token+expiry blob per instance */
+        uint8_t blob[OC_SECRET_BLOB]; size_t got = 0;
+        if (!oc_secret_get(s->secret, instance, blob, sizeof blob, &got) || got != OC_SECRET_BLOB)
+            return 0;
+        uint64_t exp = secret_unpack_expiry(blob);
+        if (now_ms != 0 && exp != 0 && exp <= now_ms) return 0;   /* expired */
+        memcpy(token, blob, OC_SESSION_TOKEN_LEN);
+        if (expiry) *expiry = exp;
+        return 1;
+    }
+    if (!s->db) return 0;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db,
             "SELECT session_token, session_expiry FROM instance_state WHERE instance=?1;",
@@ -114,6 +141,12 @@ int oc_store_load_session(oc_store *s, const char *instance,
 
 void oc_store_save_session(oc_store *s, const char *instance,
                            const uint8_t token[OC_SESSION_TOKEN_LEN], uint64_t expiry) {
+    if (s && s->secret) {
+        uint8_t blob[OC_SECRET_BLOB];
+        secret_pack(token, expiry, blob);
+        oc_secret_put(s->secret, instance, blob, sizeof blob);
+        return;
+    }
     upsert(s, instance,
            "INSERT INTO instance_state (instance, session_token, session_expiry) VALUES (?1, ?2, ?3) "
            "ON CONFLICT(instance) DO UPDATE SET session_token=?2, session_expiry=?3;",
@@ -121,7 +154,9 @@ void oc_store_save_session(oc_store *s, const char *instance,
 }
 
 void oc_store_clear_session(oc_store *s, const char *instance) {
-    if (!s || !s->db || !instance) return;
+    if (!s || !instance) return;
+    if (s->secret) { oc_secret_del(s->secret, instance); return; }
+    if (!s->db) return;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db,
             "UPDATE instance_state SET session_token=NULL, session_expiry=0 WHERE instance=?1;",

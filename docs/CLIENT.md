@@ -175,6 +175,15 @@ far:**
 - `instance_state` (one row per `"host:port"`) — the **session token + expiry**
   (ARCH-58) and the **per-instance TOFU pin** (ARCH-10), so a relaunched client
   reconnects silently with the token — no password — against the pinned cert.
+  **The session token prefers the OS keyring:** the core exposes an abstract
+  `oc_secret` get/put/del vtable (`client/core/secret.h`, no keyring library in
+  the core), and the store routes the token through it when set — so on a desktop
+  the token lives in the platform secret store, not the plaintext SQLite file.
+  The TUI supplies a **libsecret** backend (`client/tui/secret_backend.c`, Secret
+  Service → GNOME Keyring/KWallet); when there's no keyring (headless / no D-Bus)
+  the backend returns NULL and the token falls back to the SQLite column. Only the
+  token goes to the keyring — the (public) pin + cache stay in SQLite. Windows'
+  Credential Manager / macOS Keychain slot behind the same vtable later.
 - `cached_message` — **cached history** per channel (ARCH-45/46). Every BROADCAST
   is written through as it arrives (edits/deletes update the row); on startup the
   net thread replays the cache into the model *before connecting*, so history
