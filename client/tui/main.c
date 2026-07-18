@@ -17,8 +17,8 @@
  *       (Esc from the composer): a panel is focused — Tab cycles Channels /
  *       Messages / Members, j/k select, Esc returns to the composer. On the
  *       Messages panel single keys act on the selected message: Enter/t thread ·
- *       r react (👍) · e edit · x delete · w who-reacted. Members: Enter opens a
- *       DM. **Command palette** (`:` on an empty composer, or Ctrl-K anywhere):
+ *       r react (opens a filterable emoji picker) · e edit · x delete · w
+ *       who-reacted. Members: Enter opens a DM. **Command palette** (`:` on an empty composer, or Ctrl-K anywhere):
  *       fuzzy-filter every command + jump to any channel/DM; Enter runs it (or
  *       prefills the composer for commands needing an argument). A live
  *       autocomplete strip shows candidates as you type. Commands (on the last
@@ -831,6 +831,52 @@ static void draw_palette(const oc_model *m, const char *q, int psel) {
     tb_present();
 }
 
+/* ---- emoji picker (r on a selected message) ------------------------------- */
+
+static int picker_build(const char *q, const char **emoji, const char **name, int max) {
+    int n = 0;
+    for (size_t i = 0; i < sizeof AC_EMOJI / sizeof *AC_EMOJI && n < max; i++)
+        if (fuzzy(AC_EMOJI[i].name, q)) { emoji[n] = AC_EMOJI[i].emoji; name[n] = AC_EMOJI[i].name; n++; }
+    return n;
+}
+
+static void draw_picker(const char *q, int esel) {
+    int W = tb_width(), H = tb_height();
+    const char *em[64], *nm[64]; int n = picker_build(q, em, nm, 64);
+    int show = n > 12 ? 12 : (n < 1 ? 1 : n);
+    int bw = 40; if (bw > W - 4) bw = W - 4; if (bw < 20) bw = 20;
+    int bh = show + 4; if (bh > H - 2) bh = H - 2;
+    int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
+    for (int j = 0; j < bh; j++) fill_row(y + j, x, x + bw, TB_DEFAULT);
+    draw_panel(x, y, bw, bh, "React  \xc2\xb7  Esc to close", 1);
+    char ql[64]; snprintf(ql, sizeof ql, "\xe2\x80\xba %s", q);
+    draw_clip(x + 2, y + 1, x + bw - 1, ql, TB_GREEN | TB_BOLD, TB_DEFAULT);
+    int cxq = x + 4 + (int)strlen(q);
+    if (cxq < x + bw - 1) tb_set_cell(cxq, y + 1, ' ', TB_DEFAULT, TB_REVERSE);
+    int top = (esel >= show) ? esel - show + 1 : 0;
+    for (int i = 0; i < show && top + i < n; i++) {
+        int idx = top + i, sel = (idx == esel);
+        uintattr_t bg = sel ? TB_BLUE : TB_DEFAULT, fg = sel ? TB_WHITE | TB_BOLD : TB_DEFAULT;
+        char line[64]; snprintf(line, sizeof line, "%s  :%s:", em[idx], nm[idx]);
+        if (sel) fill_row(y + 2 + i, x + 1, x + bw - 1, bg);
+        draw_clip(x + 2, y + 2 + i, x + bw - 1, line, fg, bg);
+    }
+    if (n == 0) draw_clip(x + 2, y + 2, x + bw - 1, "(no matches)", TB_BLACK | TB_BOLD, TB_DEFAULT);
+    tb_present();
+}
+
+/* Whether `mid` in the focused channel already carries `emoji` as our reaction —
+ * so the picker can toggle it off. */
+static int my_reaction(const oc_model *m, uint64_t channel_id, uint64_t mid, const char *emoji) {
+    const oc_channel *c = oc_model_channel((oc_model *)m, channel_id);
+    if (!c) return 0;
+    for (size_t i = 0; i < c->n_msgs; i++)
+        if (c->msgs[i].message_id == mid)
+            for (uint8_t k = 0; k < c->msgs[i].n_reactions; k++)
+                if (strcmp(c->msgs[i].reactions[k].emoji, emoji) == 0) return c->msgs[i].reactions[k].mine;
+    return 0;
+}
+
 /* ---- input helpers --------------------------------------------------------- */
 
 /* Remove the last full UTF-8 character from `buf` (length *len). */
@@ -1322,6 +1368,9 @@ int main(int argc, char **argv) {
     uint64_t editing = 0;                     /* message id being edited (0 = none) */
     int palette_open = 0, psel = 0;           /* command palette (: or Ctrl-K) */
     char pq[64] = ""; size_t pqlen = 0;       /* palette query */
+    int picker_open = 0, esel = 0;            /* emoji picker (r on a message) */
+    char eq[32] = ""; size_t eqlen = 0;       /* picker query */
+    uint64_t picker_cid = 0, picker_mid = 0;  /* message being reacted to */
     uint64_t last_focus_cid = 0;
     time_t last_typing = 0;                   /* throttle outbound TYPING signals */
     int running = 1, logging_out = 0;
@@ -1344,6 +1393,7 @@ int main(int argc, char **argv) {
 
         render(cl, focus, composer, clen, scroll, help_open, ac_idx, panel, msg_sel, mem_sel, editing);
         if (palette_open) draw_palette(oc_client_model(cl), pq, psel);
+        if (picker_open) draw_picker(eq, esel);
 
         struct tb_event ev;
         int rc = tb_peek_event(&ev, 30);
@@ -1393,6 +1443,26 @@ int main(int argc, char **argv) {
             }
             continue;
         }
+        if (picker_open) {                     /* emoji picker: type to filter, Enter reacts */
+            const char *em[64], *nm[64]; int n = picker_build(eq, em, nm, 64);
+            if (ev.key == TB_KEY_ESC || ev.key == TB_KEY_CTRL_C || ev.key == TB_KEY_CTRL_Q) {
+                picker_open = 0;
+            } else if (ev.key == TB_KEY_ARROW_DOWN) { if (esel + 1 < n) esel++; }
+            else if (ev.key == TB_KEY_ARROW_UP)     { if (esel > 0) esel--; }
+            else if (ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2) {
+                if (eqlen) eq[--eqlen] = '\0';
+                esel = 0;
+            } else if (ev.key == TB_KEY_ENTER) {
+                if (n > 0 && esel < n) {
+                    int op = my_reaction(oc_client_model(cl), picker_cid, picker_mid, em[esel]) ? 0 : 1;
+                    oc_client_react(cl, picker_cid, picker_mid, em[esel], op);   /* toggle */
+                }
+                picker_open = 0;
+            } else if (ev.ch >= 0x20 && ev.ch <= 0x7e && eqlen + 1 < sizeof eq) {
+                eq[eqlen++] = (char)ev.ch; eq[eqlen] = '\0'; esel = 0;
+            }
+            continue;
+        }
         if (ev.key == TB_KEY_CTRL_K) {         /* open the palette from any mode */
             palette_open = 1; pq[0] = '\0'; pqlen = 0; psel = 0;
             continue;
@@ -1438,11 +1508,9 @@ int main(int argc, char **argv) {
                     if (ev.key == TB_KEY_ENTER || ev.ch == 't') oc_client_open_thread(cl, cid, mid);
                     else if (ev.ch == 'w') oc_client_list_reactions(cl, cid, mid);
                     else if ((ev.ch == 'x' || ev.ch == 'd') && own) oc_client_delete(cl, cid, mid);
-                    else if (ev.ch == 'r' && !sel->deleted) {   /* quick 👍 toggle (picker: incr 4) */
-                        int mine = 0;
-                        for (uint8_t z = 0; z < sel->n_reactions; z++)
-                            if (strcmp(sel->reactions[z].emoji, "\xf0\x9f\x91\x8d") == 0 && sel->reactions[z].mine) mine = 1;
-                        oc_client_react(cl, cid, mid, "\xf0\x9f\x91\x8d", mine ? 0 : 1);
+                    else if (ev.ch == 'r' && !sel->deleted) {   /* open the emoji picker */
+                        picker_open = 1; eq[0] = '\0'; eqlen = 0; esel = 0;
+                        picker_cid = cid; picker_mid = mid;
                     }
                     else if (ev.ch == 'e' && own) {             /* edit: prefill + drop to composer */
                         editing = mid;

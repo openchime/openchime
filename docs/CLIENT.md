@@ -115,7 +115,10 @@ model; translate input to intents }, stop.
   empty composer, or Ctrl-K): a fuzzy-filtered popup over every command plus
   jump-to-channel / open-DM entries — Enter runs a parameterless command, prefills
   the composer for one needing an argument (autocomplete then helps), or jumps.
-  An emoji picker + polish complete the redesign.
+  **Emoji picker:** `r` on a selected message opens a filterable emoji popup
+  (type a shortcode name, Enter reacts with the real Unicode emoji, toggling).
+  This completes the v2 redesign — panels + focus, navigation mode, autocomplete,
+  command palette, and the picker — all frontend-only over the unchanged app-core.
   **Composer autocomplete:** as you type, a live suggestion strip offers
   context-aware completions — slash commands, `#channel` and `@user` names (from
   the model's channel list + roster), command arguments (channels for
