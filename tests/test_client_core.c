@@ -330,7 +330,7 @@ static void test_secret_routing(void) {
 }
 
 int run_client_core_tests(void) {
-    printf("test_client_core: resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, client-settings, profile, persisted store, cached history, session reconnect, offline outbox\n");
+    printf("test_client_core: resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, client-settings, profile, seen-by, persisted store, cached history, session reconnect, offline outbox\n");
 
     test_resolve();
     test_last_error();
@@ -415,6 +415,15 @@ int run_client_core_tests(void) {
         CHECK(WAIT_FOR(a, reaction_count(m, 1, mid, ":+1:", NULL) == 1));
         oc_client_react(b, 1, mid, ":+1:", 0);
         CHECK(WAIT_FOR(a, reaction_count(m, 1, mid, ":+1:", NULL) == 0));
+
+        /* read receipts (REQ-090 seen-by): erik marks channel 1 read; the server
+         * fans his advanced read cursor to dana, whose seen-by (excluding herself)
+         * then names erik as having read up to dana's message. */
+        oc_client_mark_read(b, 1);
+        {
+            uint64_t seen[8];
+            CHECK(WAIT_FOR(a, oc_model_seen_by(m, 1, mid, m->user_id, seen, 8) == 1 && seen[0] == erik_id));
+        }
 
         /* who-reacted (REQ-071): erik reacts :+1:, dana reacts :tada:; dana
          * inspects the message and the reactor list carries both — each reactor

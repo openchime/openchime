@@ -493,6 +493,11 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (e->body) { memcpy(e->body, ce[i].value.ptr, ce[i].value.len); e->body[ce[i].value.len] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_READ_CURSOR) {
+            oc_read_cursor rc;
+            if (oc_decode_read_cursor(&p, &rc) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_READ_CURSOR);
+            if (e) { e->channel_id = rc.channel_id; e->user_id = rc.user_id; e->message_id = rc.message_id; oc_queue_push(to_ui, e); }
         } else if (hdr.msg_type == OC_MSG_PROFILE_UPDATED) {
             oc_profile_updated pu;
             if (oc_decode_profile_updated(&p, &pu) != OC_OK) return -1;
@@ -931,6 +936,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_list_client_settings ls = { oc_slice_str(n->client_type) };
                 if (oc_encode_list_client_settings(&w, OC_PROTOCOL_VERSION, &ls) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_MARK_READ) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_client_ack ca = { c->channel_id, c->message_id };
+                if (oc_encode_client_ack(&w, OC_PROTOCOL_VERSION, &ca) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SET_DISPLAY_NAME) {

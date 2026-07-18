@@ -181,7 +181,10 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_CLIENT_SETTINGS = 47,
        /* Profile change ok (display name fanned tenant-wide; also the self ack for a
         * password change) / denied (bad old password, etc.). */
-       OC_RES_PROFILE_UPDATED = 48, OC_RES_PROFILE_ERR = 49 };
+       OC_RES_PROFILE_UPDATED = 48, OC_RES_PROFILE_ERR = 49,
+       /* A read cursor advanced (REQ-090 seen-by): fan the acker's new cursor to
+        * the channel's members + backfill the acker with the others' cursors. */
+       OC_RES_READ_CURSOR = 50 };
 
 /* One row in a REACTIONS result (a distinct emoji + one reacting user). */
 typedef struct { char *emoji; uint64_t user_id; } oc_reaction_row;
@@ -200,6 +203,9 @@ typedef struct { uint64_t channel_id; uint8_t level; } oc_notify_pref_row;
 
 /* One row in a CLIENT_SETTINGS result: a synced key/value. */
 typedef struct { char *key; char *value; } oc_client_setting_row;
+
+/* One row in a READ_CURSOR result: a member's read position in the channel. */
+typedef struct { uint64_t user_id; uint64_t message_id; } oc_read_cursor_row;
 
 /* One row in a WEBHOOK_LIST result (REQ-170); the token is never returned. */
 typedef struct {
@@ -349,6 +355,12 @@ typedef struct oc_dbres {
     /* PROFILE_UPDATED: the (possibly unchanged) display name to broadcast; the
      * subject user is `user_id` above. */
     char                   *profile_name;    /* heap */
+
+    /* READ_CURSOR (REQ-090): the acker (user_id) advanced to message_id in
+     * channel_id; members holds the channel members to fan it to, and rcur holds
+     * the *other* members' current cursors to backfill the acker. */
+    oc_read_cursor_row     *rcur;            /* heap array */
+    size_t                  n_rcur;
 } oc_dbres;
 
 typedef struct oc_dbwriter oc_dbwriter;

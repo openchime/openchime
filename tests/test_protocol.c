@@ -570,6 +570,14 @@ static void test_client_settings_frames(void) {
     }
 }
 
+static void test_read_cursor_frames(void) {
+    oc_read_cursor in = { 7, 42, 100 };
+    ROUNDTRIP(oc_encode_read_cursor(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_READ_CURSOR, h, p);
+    oc_read_cursor out;
+    CHECK(oc_decode_read_cursor(&p, &out) == OC_OK);
+    CHECK(out.channel_id == 7 && out.user_id == 42 && out.message_id == 100);
+}
+
 static void test_profile_frames(void) {
     {
         oc_set_display_name in = { oc_slice_str("Dana Q") };
@@ -972,6 +980,7 @@ int run_protocol_tests(void) {
     test_webhook_frames();
     test_notify_frames();
     test_client_settings_frames();
+    test_read_cursor_frames();
     test_profile_frames();
     test_call_frames();
     test_backfill_and_error();

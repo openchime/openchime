@@ -21,6 +21,9 @@ typedef struct { char emoji[40]; uint32_t count; uint8_t mine; } oc_reaction;
  * mirror OC_SETTING_KEY_MAX / OC_SETTING_VALUE_MAX (+1 for NUL). */
 typedef struct { char key[65]; char value[513]; } oc_setting;
 
+/* One member's read cursor in a channel (REQ-090 seen-by). */
+typedef struct { uint64_t user_id; uint64_t message_id; } oc_read_cursor_view;
+
 /* One attachment hanging off a message (REQ-140): the server id (used to
  * download it), its filename + mime, and the byte size. */
 typedef struct { uint64_t id; char filename[128]; char mime[64]; uint64_t size; } oc_attachment;
@@ -53,6 +56,10 @@ typedef struct {
     uint8_t  kind;             /* OC_CHANNEL_KIND / _DM */
     uint64_t peer_id;          /* DM: the other participant (for the title) */
     uint8_t  notify_level;     /* OC_NOTIFY_ALL/_MENTIONS/_NONE (REQ-130) */
+    /* Per-member read cursors (REQ-090 seen-by): the highest message id each
+     * member has read in this channel. Advance-only; drives "seen by …". */
+    oc_read_cursor_view *readers;
+    size_t   n_readers, cap_readers;
 } oc_channel;
 
 typedef struct { uint64_t user_id; uint8_t status; } oc_presence_row;
@@ -175,6 +182,12 @@ void oc_model_close_weblist(oc_model *m);
 /* A synced setting's value by key, or NULL if the bucket has no such key. Valid
  * until the next CLIENT_SETTINGS frame folds in. */
 const char *oc_model_setting(const oc_model *m, const char *key);
+
+/* Seen-by (REQ-090): fill `out` with up to `cap` user ids who have read
+ * `channel_id` up to at least `message_id`, excluding `exclude` (typically self).
+ * Returns the count. */
+size_t oc_model_seen_by(const oc_model *m, uint64_t channel_id, uint64_t message_id,
+                        uint64_t exclude, uint64_t *out, size_t cap);
 
 /* Open/close the notification-prefs overlay (frontend view state). */
 void oc_model_set_prefs_open(oc_model *m, int open);

@@ -1322,7 +1322,15 @@ static void test_idem_pruning(void) {
 static void client_ack(oc_dbwriter *w, uint64_t uid, uint64_t channel, uint64_t mid) {
     oc_job *j = oc_job_new(OC_JOB_CLIENT_ACK, 1);
     j->user_id = uid; j->channel_id = channel; j->message_id = mid;
-    oc_dbwriter_submit(w, j);   /* fire-and-forget: CLIENT_ACK has no result */
+    oc_dbwriter_submit(w, j);
+    /* A real advance now yields a READ_CURSOR result (REQ-090 seen-by); drain it
+     * so it doesn't bleed into the next helper's result. A non-advancing ack
+     * yields nothing, so the poll is bounded and simply times out. */
+    for (int i = 0; i < 50; i++) {
+        oc_dbres *r = oc_dbwriter_next_result(w);
+        if (r) { oc_dbres_free(r); return; }
+        usleep(2000);
+    }
 }
 
 static oc_dbres *backfill0(oc_dbwriter *w, uint64_t uid) {

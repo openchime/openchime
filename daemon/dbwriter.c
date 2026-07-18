@@ -172,6 +172,7 @@ void oc_dbres_free(oc_dbres *r) {
     for (size_t i = 0; i < r->n_cslist; i++) { free(r->cslist[i].key); free(r->cslist[i].value); }
     free(r->cslist);
     free(r->profile_name);
+    free(r->rcur);
     free(r);
 }
 
@@ -1810,9 +1811,21 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
 
 /* Record a client's cumulative delivery cursor (REQ-090). CLIENT_ACK(N) means
  * everything <= N in the channel has been received; the stored cursor only ever
- * advances. No client response. */
+ * advances. When it does advance, answer with a READ_CURSOR result so the net
+ * thread can drive seen-by: fan the acker's new cursor to the channel members and
+ * backfill the acker with the other members' current cursors. A stale/duplicate
+ * ack (no advance) has no reply. */
 static oc_dbres *process_client_ack(sqlite3 *db, const oc_job *j) {
+    /* Was this a real advance? Only broadcast if so (avoids fan-out on replays). */
     sqlite3_stmt *st = NULL;
+    uint64_t prev = 0;
+    sqlite3_prepare_v2(db,
+        "SELECT message_id FROM delivery_cursors WHERE user_id=? AND channel_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+    if (sqlite3_step(st) == SQLITE_ROW) prev = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+
     sqlite3_prepare_v2(db,
         "INSERT INTO delivery_cursors(user_id,channel_id,message_id,updated_at_ms) "
         "VALUES(?,?,?,?) ON CONFLICT(user_id,channel_id) DO UPDATE SET "
@@ -1824,7 +1837,35 @@ static oc_dbres *process_client_ack(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
     sqlite3_step(st);
     sqlite3_finalize(st);
-    return NULL;   /* CLIENT_ACK has no reply */
+
+    if (j->message_id <= prev) return NULL;   /* no advance: nothing to broadcast */
+
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_READ_CURSOR;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+    r->user_id = j->user_id;
+    r->message_id = j->message_id;
+    load_members(db, j->channel_id, r);   /* who to fan the acker's cursor to */
+
+    /* The other members' current cursors, to bootstrap the acker's seen-by view. */
+    size_t cap = 8, n = 0;
+    r->rcur = malloc(cap * sizeof *r->rcur);
+    sqlite3_prepare_v2(db,
+        "SELECT user_id, message_id FROM delivery_cursors WHERE channel_id=? AND user_id<>?;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    while (r->rcur && sqlite3_step(st) == SQLITE_ROW) {
+        if (n == cap) { cap *= 2; oc_read_cursor_row *g = realloc(r->rcur, cap * sizeof *g); if (!g) break; r->rcur = g; }
+        r->rcur[n].user_id    = (uint64_t)sqlite3_column_int64(st, 0);
+        r->rcur[n].message_id = (uint64_t)sqlite3_column_int64(st, 1);
+        n++;
+    }
+    sqlite3_finalize(st);
+    r->n_rcur = n;
+    return r;
 }
 
 /* Replay messages newer than each cursor, for channels the user belongs to,

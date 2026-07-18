@@ -175,6 +175,11 @@ model; translate input to intents }, stop.
     levels; `/notify all|mentions|none` sets the focused channel; `/dnd HH:MM
     HH:MM | off` sets the do-not-disturb window (REQ-130/131; each SET returns a
     full sync that the model folds in).
+  - **read receipts / seen-by (REQ-090)** — the core now sends a `CLIENT_ACK`
+    whenever the focused channel's read marker advances; the daemon fans each
+    member's read cursor to the others as `READ_CURSOR`, and the TUI renders a
+    dim "✓ seen by …" footer under the last message naming everyone (bar you)
+    who has read up to it.
   - **self-service profile (REQ-020)** — `/profile` opens a modal with your name,
     role, id, and presence; `/nick <name>` renames you (the daemon fans a
     `PROFILE_UPDATED` so every roster — and your own header — updates live);

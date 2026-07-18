@@ -66,6 +66,7 @@ typedef enum {
     OC_MSG_LIST_THREAD      = 0x002E, /* C->S, open a thread */
     OC_MSG_THREAD           = 0x002F, /* S->C, a thread's replies */
     OC_MSG_THREAD_META      = 0x0032, /* S->C, a parent's reply count (backfill) */
+    OC_MSG_READ_CURSOR      = 0x0033, /* S->C, a member's read cursor advanced (REQ-090 seen-by) */
     OC_MSG_CREATE_CHANNEL     = 0x0050, /* C->S (REQ-050) */
     OC_MSG_CHANNEL_INFO       = 0x0051, /* S->C, ack for create/join/leave/invite/remove */
     OC_MSG_LIST_CHANNELS      = 0x0052, /* C->S */
@@ -321,6 +322,8 @@ typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; u
                  uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH];
                  oc_slice author_name; } oc_broadcast;  /* override name (webhooks); empty = use author_id */
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_client_ack;
+/* A member's read cursor in a channel advanced (REQ-090 seen-by). */
+typedef struct { uint64_t channel_id; uint64_t user_id; uint64_t message_id; } oc_read_cursor;
 typedef struct { uint64_t channel_id; uint64_t message_id; oc_slice body; } oc_edit;
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_delete;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t edited_at; oc_slice body; } oc_msg_edited;
@@ -434,6 +437,7 @@ oc_result oc_encode_send(oc_wbuf *w, uint16_t version, const oc_send *m);
 oc_result oc_encode_send_ack(oc_wbuf *w, uint16_t version, const oc_send_ack *m);
 oc_result oc_encode_broadcast(oc_wbuf *w, uint16_t version, const oc_broadcast *m);
 oc_result oc_encode_client_ack(oc_wbuf *w, uint16_t version, const oc_client_ack *m);
+oc_result oc_encode_read_cursor(oc_wbuf *w, uint16_t version, const oc_read_cursor *m);
 oc_result oc_encode_edit(oc_wbuf *w, uint16_t version, const oc_edit *m);
 oc_result oc_encode_delete(oc_wbuf *w, uint16_t version, const oc_delete *m);
 oc_result oc_encode_msg_edited(oc_wbuf *w, uint16_t version, const oc_msg_edited *m);
@@ -524,6 +528,7 @@ oc_result oc_decode_send(oc_rbuf *p, oc_send *m);
 oc_result oc_decode_send_ack(oc_rbuf *p, oc_send_ack *m);
 oc_result oc_decode_broadcast(oc_rbuf *p, oc_broadcast *m);
 oc_result oc_decode_client_ack(oc_rbuf *p, oc_client_ack *m);
+oc_result oc_decode_read_cursor(oc_rbuf *p, oc_read_cursor *m);
 oc_result oc_decode_edit(oc_rbuf *p, oc_edit *m);
 oc_result oc_decode_delete(oc_rbuf *p, oc_delete *m);
 oc_result oc_decode_msg_edited(oc_rbuf *p, oc_msg_edited *m);

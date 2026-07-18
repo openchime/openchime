@@ -84,7 +84,14 @@ void oc_client_backfill(oc_client *c, uint64_t channel_id) {
 
 void oc_client_mark_read(oc_client *c, uint64_t channel_id) {
     if (!c) return;
+    oc_channel *ch = oc_model_channel(&c->model, channel_id);
+    uint64_t before = ch ? ch->read_marker : 0;
     oc_model_mark_read(&c->model, channel_id);
+    ch = oc_model_channel(&c->model, channel_id);
+    if (ch && ch->read_marker > before) {   /* advanced: ack the server (drives seen-by, REQ-090) */
+        oc_cmd *cmd = oc_cmd_new(OC_CMD_MARK_READ);
+        if (cmd) { cmd->channel_id = channel_id; cmd->message_id = ch->read_marker; oc_queue_push(&c->cmds, cmd); }
+    }
 }
 
 void oc_client_react(oc_client *c, uint64_t channel_id, uint64_t message_id,

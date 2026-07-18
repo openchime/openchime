@@ -23,6 +23,7 @@ static void channel_free(oc_channel *c) {
     for (size_t i = 0; i < c->n_msgs; i++) msg_free(&c->msgs[i]);
     free(c->msgs);
     free(c->name);
+    free(c->readers);
 }
 
 /* Fold a reaction aggregate (emoji now has `count` reactors) into a message. */
@@ -96,6 +97,35 @@ const char *oc_model_setting(const oc_model *m, const char *key) {
     for (size_t i = 0; i < m->n_settings; i++)
         if (strcmp(m->settings[i].key, key) == 0) return m->settings[i].value;
     return NULL;
+}
+
+/* Advance a member's read cursor in a channel (grow the list as needed). */
+static void reader_advance(oc_channel *c, uint64_t user_id, uint64_t message_id) {
+    for (size_t i = 0; i < c->n_readers; i++)
+        if (c->readers[i].user_id == user_id) {
+            if (message_id > c->readers[i].message_id) c->readers[i].message_id = message_id;
+            return;
+        }
+    if (c->n_readers == c->cap_readers) {
+        size_t cap = c->cap_readers ? c->cap_readers * 2 : 8;
+        oc_read_cursor_view *nr = realloc(c->readers, cap * sizeof *nr);
+        if (!nr) return;
+        c->readers = nr; c->cap_readers = cap;
+    }
+    c->readers[c->n_readers].user_id = user_id;
+    c->readers[c->n_readers].message_id = message_id;
+    c->n_readers++;
+}
+
+size_t oc_model_seen_by(const oc_model *m, uint64_t channel_id, uint64_t message_id,
+                        uint64_t exclude, uint64_t *out, size_t cap) {
+    oc_channel *c = oc_model_channel((oc_model *)m, channel_id);
+    if (!c || message_id == 0) return 0;
+    size_t n = 0;
+    for (size_t i = 0; i < c->n_readers && n < cap; i++)
+        if (c->readers[i].user_id != exclude && c->readers[i].message_id >= message_id)
+            out[n++] = c->readers[i].user_id;
+    return n;
 }
 
 /* Upsert a roster entry keyed on user_id. */
@@ -580,6 +610,12 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             }
         if (e->user_id == m->user_id) set_status(m, "profile updated");
         break;
+    case OC_EV_READ_CURSOR: {
+        /* Seen-by (REQ-090): a member read `channel_id` up to `message_id`. */
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (c) reader_advance(c, e->user_id, e->message_id);
+        break;
+    }
     case OC_EV_USER_UPDATED: {
         user_update_role(m, e->user_id, e->status, e->op);
         const char *nm = oc_model_user_name(m, e->user_id);

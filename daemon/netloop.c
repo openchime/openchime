@@ -1932,6 +1932,31 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
+    case OC_RES_READ_CURSOR: {
+        /* Seen-by (REQ-090): tell the channel's other members that this member
+         * advanced their read cursor, and backfill the acker with the others'
+         * current cursors so opening a channel shows who has already read it. */
+        oc_read_cursor rc = { r->channel_id, r->user_id, r->message_id };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_read_cursor(&w, OC_PROTOCOL_VERSION, &rc);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id != r->user_id &&
+                in_members(c->user_id, r->members, r->n_members))
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
+        conn *ac = find_by_id(conns, r->conn_id);
+        if (ac) {
+            for (size_t i = 0; i < r->n_rcur; i++) {
+                oc_read_cursor rb = { r->channel_id, r->rcur[i].user_id, r->rcur[i].message_id };
+                oc_wbuf_init(&w, g_enc, sizeof g_enc);
+                oc_encode_read_cursor(&w, OC_PROTOCOL_VERSION, &rb);
+                send_bytes(ep, conns, ac->fd, g_enc, w.len);
+            }
+        }
+        break;
+    }
     case OC_RES_CALL_AUTH: {
         /* Authorized: add to the channel's ephemeral call, tell the joiner (with
          * the roster), and push a roster update to the other participants. */

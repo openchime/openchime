@@ -326,6 +326,14 @@ oc_result oc_encode_client_ack(oc_wbuf *w, uint16_t version, const oc_client_ack
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_read_cursor(oc_wbuf *w, uint16_t version, const oc_read_cursor *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_READ_CURSOR);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->user_id);
+    oc_w_u64(w, m->message_id);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_edit(oc_wbuf *w, uint16_t version, const oc_edit *m) {
     OC_CHECK_BODY(m->body);
     size_t off = oc_frame_begin(w, version, OC_MSG_EDIT);
@@ -1109,6 +1117,13 @@ oc_result oc_decode_broadcast(oc_rbuf *p, oc_broadcast *m) {
 
 oc_result oc_decode_client_ack(oc_rbuf *p, oc_client_ack *m) {
     m->channel_id = oc_r_u64(p);
+    m->message_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_read_cursor(oc_rbuf *p, oc_read_cursor *m) {
+    m->channel_id = oc_r_u64(p);
+    m->user_id = oc_r_u64(p);
     m->message_id = oc_r_u64(p);
     return r_done(p);
 }

@@ -372,6 +372,16 @@ Client                                  Server
   | ---- CLIENT_ACK(ch, id) ----------> |  advance delivery cursor
 ```
 
+When a `CLIENT_ACK` **advances** the stored cursor, the daemon also drives
+read-receipts (seen-by, REQ-090): it fans a `READ_CURSOR` to the channel's other
+members and backfills the acker with those members' current cursors.
+
+**`READ_CURSOR` (S → C), `0x0033`** `{ channel_id: u64, user_id: u64, message_id:
+u64 }` — `user_id` has read `channel_id` up to `message_id`. A client folds these
+per-channel (advance-only) and renders "seen by …" on the last message for every
+member whose cursor has reached it. A duplicate/stale ack (no advance) fans
+nothing, so idle re-acks are silent.
+
 ### 5.5 Editing a message (REQ-051)
 
 A user may edit **their own** message; there is no moderator edit (REQ-032). The
@@ -1133,6 +1143,7 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0021` | `SEND_ACK`         | S → C     | no        | §5.2    |
 | `0x0022` | `BROADCAST`        | S → C     | no        | §5.3    |
 | `0x0023` | `CLIENT_ACK`       | C → S     | no        | §5.4    |
+| `0x0033` | `READ_CURSOR`      | S → C     | no        | §5.4    |
 | `0x0024` | `EDIT`             | C → S     | no        | §5.5    |
 | `0x0025` | `DELETE`           | C → S     | no        | §5.6    |
 | `0x0026` | `MSG_EDITED`       | S → C     | no        | §5.5    |

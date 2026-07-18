@@ -274,10 +274,28 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
     for (size_t k = rstart; k < r->n; k++) r->v[k].mi = mi;   /* tag rows with the message */
 }
 
-/* Build the wrapped rows for a channel's messages (oldest→newest). */
-static void build_rows(rows_t *r, const oc_channel *ch, uint64_t me, int width) {
+/* Build the wrapped rows for a channel's messages (oldest→newest), then a
+ * "seen by …" footer (REQ-090) naming the other members whose read cursor has
+ * reached the last message. */
+static void build_rows(rows_t *r, const oc_model *m, const oc_channel *ch, uint64_t me, int width) {
     for (size_t i = 0; i < ch->n_msgs; i++)
         append_msg_rows(r, &ch->msgs[i], me, width, ch, 1, (int)i);
+    if (ch->n_msgs == 0) return;
+    uint64_t last = ch->msgs[ch->n_msgs - 1].message_id;
+    char names[192]; size_t p = 0; int shown = 0;
+    for (size_t i = 0; i < ch->n_readers; i++) {
+        if (ch->readers[i].user_id == me || ch->readers[i].message_id < last) continue;
+        const char *nm = oc_model_user_name(m, ch->readers[i].user_id);   /* roster first */
+        if (!nm || !nm[0]) nm = name_for(ch, ch->readers[i].user_id);     /* else a message author */
+        int w = snprintf(names + p, sizeof names - p, "%s%s", shown ? ", " : "", nm);
+        if (w < 0 || (size_t)w >= sizeof names - p) break;
+        p += (size_t)w; shown++;
+    }
+    if (shown) {
+        char line[224];
+        snprintf(line, sizeof line, "    \xe2\x9c\x93 seen by %s", names);   /* ✓ */
+        wrap_push(r, line, TB_GREEN, width, 6);
+    }
 }
 
 /* Build the rows for the open thread: the parent (found in `ch`) then replies. */
@@ -747,7 +765,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
             else if (m->prefs_open)     build_prefs_rows(&rows, m, iw);
             else if (m->weblist_open)   build_webhooks_rows(&rows, m, iw);
             else if (m->thread_open)    build_thread_rows(&rows, m, fc, m->user_id, iw);
-            else                        build_rows(&rows, fc, m->user_id, iw);
+            else                        build_rows(&rows, m, fc, m->user_id, iw);
             int total = (int)rows.n, end;
             if (panel == 2 && normal && msg_sel >= 0) {   /* keep the selection visible */
                 int last = -1;
