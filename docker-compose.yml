@@ -1,4 +1,7 @@
 services:
+  # MinIO is the local S3-compatible store. It currently has no consumer: the
+  # daemon's S3 blob backend (ARCH-70) defaults to the local filesystem and is
+  # not wired up here. Kept for the pending object-storage decision.
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
@@ -18,11 +21,11 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
-      LITESTREAM_BUCKET: ${LITESTREAM_BUCKET:-openchime-dev}
+      OPENCHIME_BUCKET: ${OPENCHIME_BUCKET:-openchime-dev}
     entrypoint: >
       /bin/sh -c "
       until mc alias set local http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\"; do sleep 1; done &&
-      mc mb -p local/\"$$LITESTREAM_BUCKET\" || true
+      mc mb -p local/\"$$OPENCHIME_BUCKET\" || true
       "
 
   daemon:
@@ -36,10 +39,6 @@ services:
       # Local accounts provisioned at boot (AUTH.md §2); the e2e client logs in
       # as these. Idempotent — re-running never clobbers an existing password.
       OC_BOOTSTRAP_USERS: "e2e-alice:e2e-pw:owner,e2e-bob:e2e-pw:member"
-      LITESTREAM_BUCKET: ${LITESTREAM_BUCKET:-openchime-dev}
-      LITESTREAM_ENDPOINT: http://minio:9000
-      LITESTREAM_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
-      LITESTREAM_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
     ports:
       - "8080:8080"   # /healthz
       - "8443:8443"   # binary protocol (TLS)

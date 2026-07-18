@@ -72,7 +72,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 091 client dedup on high-water | 🔵 ✅ | Implemented in the app-core view-model (per-channel high-water mark). |
 | 092 in-channel order = accept order | ✅ | Ascending, tenant-monotonic `message_id`. |
 | 093 idempotent retry | ✅ | Persisted `(channel, token) → id`. |
-| 094 RPO 15s (Litestream) | ✅ | Replication to object storage + restore-on-boot (compose). |
+| 094 ack after local commit; RPO is a deployment property | ✅ / ➖ | The daemon acks only after the local WAL commit (✅). Off-box replication and any stated RPO are a deployment concern (ARCH-3): hosted is implemented in the `openchime-saas` repo, self-hosted is the operator's own backup. Nothing to build here. |
 | 100 auto-reconnect w/o re-auth | ✅ | Daemon accepts `session`-token reconnect; **the client net thread auto-reconnects** — captures the AUTH_OK token, silently re-auths with `OC_AUTH_SESSION` (no password) under backoff on a drop, preserving the in-memory model. **Now also across process restarts:** a client SQLite store (`client/core/store.c`) persists the session token + TOFU pin per workspace, so a relaunch reconnects silently against the pinned cert. Headless-tested (daemon bounce; wrong-password client rides the stored token). |
 | 101 backfill on reconnect | ✅ | Per-channel cursors → replayed messages + `BACKFILL_DONE` (+ `THREAD_META`). **The client drives it on reconnect**, backfilling each channel from its last-seen id (net-thread high-water); replays dedup on the model mark. **Now cursor-backed by the store:** cached messages seed the high-water at startup, so even a first backfill after relaunch resumes from the last cached id, not 0. |
 | 102 offline outbox | 🔵 ✅ | **Built.** The client store's `outbox` table records each send (with its idem token) before delivery; the net thread resends the outbox on reconnect and clears a row on its `SEND_ACK`, so a message composed offline (or in flight at a drop, or queued at app-close) goes out on the next connection, deduped by the daemon. Headless-tested + PTY-smoked (compose with the daemon down; a later run flushes it). |
@@ -148,7 +148,7 @@ ordering, not a commitment.
   accept. Tested with a tiny-cap loop.
 - ✅ **TLS identity persisted across restore (ARCH-66b).** The self-signed cert+key
   live in the replicated DB (migration 0008), restored on boot so the TOFU pin
-  survives restore-on-boot. Tested (round-trip + end-to-end fingerprint check).
+  survives a restore onto a new box. Tested (round-trip + end-to-end fingerprint check).
 - ✅ **Truncation signals.** `BACKFILL_DONE`/`SEARCH_RESULTS`/`THREAD` carry a
   more/truncated flag so a client knows to page.
 - ✅ **First-owner setup token (REQ-024).** First run in local mode with no owner

@@ -412,7 +412,8 @@ uint64_t oc_dbwriter_register_local(oc_dbwriter *w, const char *username,
  * if an owner already exists. Setup-time only (drains one result). */
 int oc_dbwriter_setup_invite(oc_dbwriter *w, uint8_t token_out[OC_INVITE_TOKEN_LEN]);
 
-/* Persisted TLS identity (ARCH-66b) so the TOFU cert survives restore-on-boot.
+/* Persisted TLS identity (ARCH-66b) so the TOFU cert survives the database being
+ * restored onto a new box (the cert lives in the DB, not just on local disk).
  * load returns 1 + heap cert/key PEM (caller frees) if stored, else 0; store
  * returns 1 on success. Setup-time only (each drains one result). */
 int oc_dbwriter_load_identity(oc_dbwriter *w, char **cert_out, char **key_out);

@@ -80,16 +80,15 @@ and the client falls back to the SQLite store (headless / no D-Bus). They are
 | Image / tool | Version | Purpose | License | Source |
 |--------------|---------|---------|---------|--------|
 | **Alpine Linux** | `3.20` | Build + runtime base image | mixed (base OS) | https://alpinelinux.org |
-| **Litestream** | `v0.3.13` | Continuous SQLite replication to object storage (RPO, REQ-094) | Apache-2.0 | https://github.com/benbjohnson/litestream |
-| **MinIO** | `minio/minio:latest` | S3-compatible object storage — attachment blobs + Litestream target, **dev/test only** | AGPL-3.0 | https://github.com/minio/minio |
+| **MinIO** | `minio/minio:latest` | S3-compatible object storage, **dev/test only** | AGPL-3.0 | https://github.com/minio/minio |
 | **MinIO Client (`mc`)** | `minio/mc:latest` | One-shot bucket init (compose `minio-init`) | AGPL-3.0 | https://github.com/minio/mc |
 
-- **Litestream** is fetched (its glibc release binary) during the Docker build and
-  runs beside the daemon; Alpine's `gcompat` provides the glibc shim.
-- **MinIO** runs as its own container in `docker-compose.yml` to simulate S3/R2/B2
-  (ARCH-38). It is **not part of the daemon** and its AGPL does not reach any
-  OpenChime binary. In production the S3 target is a managed store (R2/B2/S3).
-- Runtime Alpine packages: `sqlite-libs`, `sqlite`, `ca-certificates`, `gcompat`.
+- **MinIO** runs as its own container in `docker-compose.yml` to simulate a
+  managed S3-compatible store (ARCH-38). It is **not part of the daemon** and its
+  AGPL does not reach any OpenChime binary. It currently has no consumer — the
+  daemon's S3 blob backend (ARCH-70) defaults to the local filesystem and is not
+  wired into compose.
+- Runtime Alpine packages: `sqlite-libs`, `sqlite`, `ca-certificates`.
 - **Pinning gap:** the MinIO images use `:latest` (not version-pinned) — worth
   pinning to a digest for reproducible dev/test.
 
@@ -127,7 +126,7 @@ client plan was superseded by the shared-core + native-UI-per-platform model
 | License | Packages | Notes |
 |---------|----------|-------|
 | **MIT** | termbox2, utf8proc, jsmn | Vendored, committed |
-| **Apache-2.0** | Mbed TLS (chosen from its dual license), Litestream | mbedTLS static-linked; Litestream a separate binary |
+| **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
 | **Public Domain** | SQLite | System-linked |
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
 | **zlib/libpng** | raylib | Vestigial, unused |

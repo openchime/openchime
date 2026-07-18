@@ -1222,7 +1222,7 @@ static void test_search(void) {
 }
 
 /* Persisted TLS identity (ARCH-66b): store + load round-trips through the DB so
- * a restore-on-boot keeps the same TOFU cert. */
+ * a database restored onto a new box keeps the same TOFU cert. */
 static void test_tls_identity(void) {
     const char *path = "build/test_dbwriter_identity.db";
     cleanup_db(path);

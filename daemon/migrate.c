@@ -155,7 +155,7 @@ static const char MIGRATION_0007[] =
     ");";
 
 /* 0008: persist the daemon's self-signed TLS identity (ARCH-66b) so the TOFU
- * fingerprint (ARCH-10) survives restore-on-boot (ARCH-24). The cert+key live in
+ * fingerprint (ARCH-10) survives the database being restored onto a new box. The cert+key live in
  * the replicated database; on a cold restore the daemon reloads the same
  * identity instead of generating a new one (which would trip every client's
  * pin). Single row (id=1). */

@@ -21,10 +21,11 @@ The codebase splits cleanly by testability:
   codec, migration runner, idempotency/dedup bookkeeping, rate limiter, and the
   protocol state machine. Fast, deterministic, run on every build.
 - **Integration tier** — the whole daemon running as a process, exercised over
-  its real wire protocol and its real SQLite + Litestream + object-storage
-  path. This is where durability-critical behavior (ARCH-23 replication, ARCH-24
-  restore-on-boot) *must* be proven, because none of it is reachable from a unit
-  test.
+  its real wire protocol against its real SQLite path. This is where behavior
+  that is unreachable from a unit test — the deployed image, TLS termination,
+  and the protocol vertical end to end — is proven. Off-box backup is **not**
+  exercised here: it is a deployment concern (ARCH-3), and in the hosted model
+  it lives in the `openchime-saas` repo.
 
 A behavior is tested at the lowest tier that can actually observe it. Codec
 edge cases belong in unit tests; "two clients see each other's messages in
@@ -155,9 +156,8 @@ handshake + pinning end-to-end today.
 
 Integration tests run **against the Docker Compose environment already defined
 for local dev** (ARCH-36/38/39), not a second bespoke environment — the same
-`daemon` + `minio` + `minio-init` topology, so replication and restore are
-exercised against a real S3-compatible store and a real Litestream, exactly as
-production does. A wrapper script, `Scripts/test-integration.sh`, brings the
+`daemon` + `minio` + `minio-init` topology, so what CI exercises is the image
+that ships. A wrapper script, `Scripts/test-integration.sh`, brings the
 stack up, runs the scenario driver, and tears it down with a non-zero exit on
 any failed scenario. It sits alongside the existing `run.sh`/`stop.sh`/`reset.sh`
 wrappers (ARCH-40).
@@ -168,11 +168,7 @@ Grouped by what they prove. The starred (★) ones are reachable **today** with
 the placeholder daemon and are what CI runs now; the rest come online with the
 real protocol.
 
-- **Durability (must-have, ARCH-23/24):**
-  - ★ replication reaches object storage: after startup, the Litestream replica
-    prefix in MinIO is non-empty within the sync interval;
-  - ★ restore-on-boot: wipe the daemon's local volume, restart, and confirm the
-    daemon logs a restore-from-replica (not a fresh init) and comes healthy;
+- **Liveness:**
   - ★ health check: `/healthz` returns `200 OK` (ARCH-25).
 - **Handshake/versioning:** a client advertising an unsupported range gets a
   `REJECT` with the right `VERSION_TOO_OLD`/`VERSION_TOO_NEW` code and a closed
@@ -206,11 +202,10 @@ Jobs:
 
 - **`build`** — installs `libsqlite3-dev`, runs `make` (and `make test` once the
   first `tests/` TU exists). Fast feedback on compile + unit tests.
-- **`integration`** — the durability path end-to-end on the Compose stack:
-  build the image, bring the stack up, wait for `/healthz`, assert the MinIO
-  replica prefix is non-empty (replication, ARCH-23), then wipe the daemon
-  volume, restart, and assert a restore-from-replica log line (ARCH-24). This
-  is the automation of the manual steps in the README's "Verify" sections.
+- **`integration`** — the deployed image end-to-end on the Compose stack:
+  build the image, bring the stack up, wait for `/healthz`, then drive the
+  protocol vertical over TLS with the e2e client. This is the automation of the
+  manual steps in the README's "Verify" section.
 
 Everything runs non-interactively and communicates pass/fail purely through
 exit codes, so no scenario depends on a human reading output. New unit test

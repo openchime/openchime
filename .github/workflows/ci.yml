@@ -3,9 +3,8 @@ name: ci
 # Runs on pushes to main and on every PR targeting main. Three jobs:
 #   - build:       native gcc build of the daemon, plus unit tests (make test),
 #                  which include the headless client app-core test.
-#   - integration: the durability path end-to-end on the Docker Compose stack —
-#                  replication reaching MinIO (ARCH-23) and restore-on-boot
-#                  (ARCH-24), automating the README's "Verify" steps.
+#   - integration: the deployed image end-to-end on the Docker Compose stack —
+#                  health check plus the protocol vertical over TLS.
 #   - core:        standalone compile check of the client app-core (ARCH-74).
 # Doc-only changes skip CI. See docs/TESTING.md for the full strategy.
 
@@ -60,9 +59,9 @@ jobs:
           # bzip2 for the vendored mbedTLS tarball that the e2e client builds.
           sudo apt-get install -y --no-install-recommends bzip2
 
-      # The whole harness — healthz, replication, protocol vertical over TLS,
-      # and restore-on-boot — lives in one script so it runs identically here
-      # and locally (`make integration`). See docs/TESTING.md §3.
+      # The whole harness — healthz plus the protocol vertical over TLS — lives
+      # in one script so it runs identically here and locally
+      # (`make integration`). See docs/TESTING.md §3.
       - name: Run integration harness
         run: Scripts/test-integration.sh
 

@@ -310,5 +310,6 @@ Tracked so the omissions are deliberate:
   contractors) — v1 is one mode per tenant.
 - **Email magic-link** local login (needs outbound email; not air-gapped-safe).
 - **Argon2** password hashing (a small vendored lib; PBKDF2 ships first).
-- **Cert-vs-restore interaction** (the TOFU fingerprint changes after
-  restore-on-boot) — a separate, already-noted open item, orthogonal to auth.
+- **Cert-vs-restore interaction** (the TOFU fingerprint changing when a database
+  is restored onto a new box) — addressed by persisting the TLS identity in the
+  database (ARCH-66b); orthogonal to auth.

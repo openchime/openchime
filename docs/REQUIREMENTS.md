@@ -325,11 +325,16 @@ the requirement says so explicitly rather than implying one.
   being accepted twice, via a client-generated 16-byte idempotency token
   distinct from the server-assigned message id, carried on the `SEND` frame
   and de-duplicated by a persisted `(channel, token) → id` mapping (ARCH-44).
-- **REQ-094.** The system's recovery point objective (RPO) on total loss of
-  a tenant's box has been 15 seconds — the interval at which committed
-  writes are shipped to remote object storage (ARCH-23). Messages
-  acknowledged to a client less than 15 seconds before a total box loss have
-  been at risk of not being recoverable.
+- **REQ-094.** A message acknowledged to its sender has been durably committed
+  to the tenant's local database before the ack was sent (ARCH-23) — the daemon
+  has never acked on the strength of an in-memory buffer alone. **Off-box
+  durability, and therefore the deployment's recovery point objective, has been
+  a property of the deployment rather than of the daemon** (ARCH-3): in the
+  hosted model the operator of the box has provided continuous replication and
+  stated an RPO (implemented in the `openchime-saas` repo, not this one); in the
+  self-hosted models the operator has backed up the SQLite file by their own
+  means, and their RPO has been whatever that backup schedule gives them. The
+  daemon has neither required nor assumed any particular backup mechanism.
 - **REQ-095.** The system has optionally surfaced **read state** — for a direct
   message, whether the other participant has seen a message; for a channel, an
   aggregate "seen by" on inspection — derived from the per-(user, channel)

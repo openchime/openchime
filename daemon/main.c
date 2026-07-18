@@ -265,10 +265,10 @@ int main(void) {
     }
 
     /* TLS identity (ARCH-10). A persisted cert+key in the DB (ARCH-66b) is
-     * restored to the cert/key files first, so a cold restore-on-boot (ARCH-24)
-     * keeps the same TOFU fingerprint instead of generating a new, pin-breaking
-     * one. If none is stored, the first-run generation below creates one and we
-     * persist it. */
+     * restored to the cert/key files first, so a database moved or restored onto
+     * a new box keeps the same TOFU fingerprint instead of generating a new,
+     * pin-breaking one. If none is stored, the first-run generation below
+     * creates one and we persist it. */
     char *stored_cert = NULL, *stored_key = NULL;
     int had_identity = oc_dbwriter_load_identity(db, &stored_cert, &stored_key);
     if (had_identity &&

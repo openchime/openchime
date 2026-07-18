@@ -31,8 +31,8 @@ message threads (REQ-060) and **migration 0006** (§3d) adds FTS5 full-text sear
   restart resumes from exactly there. This is why each step is independently
   committed rather than all-pending-in-one transaction.
 - **Forward-only:** there are no down-migrations. Recovery from a bad migration
-  is roll-forward (a new migration) or restore from the Litestream replica
-  (ARCH-24), consistent with the single-box model.
+  is roll-forward (a new migration) or restore from the operator's own backup
+  (ARCH-3), consistent with the island model (ARCH-4).
 
 `schema_version`:
 

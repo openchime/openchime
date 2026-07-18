@@ -816,7 +816,8 @@ static oc_dbres *process_load_identity(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
-/* Persist the TLS identity so restore-on-boot keeps the same TOFU cert. */
+/* Persist the TLS identity so a database restored onto a new box keeps the same
+ * TOFU cert. */
 static oc_dbres *process_store_identity(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -2790,7 +2791,7 @@ int oc_dbwriter_load_identity(oc_dbwriter *w, char **cert_out, char **key_out) {
     return 0;
 }
 
-/* Persist the TLS identity so it survives restore-on-boot. Returns 1 on success.
+/* Persist the TLS identity so it survives a restore onto a new box. Returns 1 on success.
  * Setup-time only. */
 int oc_dbwriter_store_identity(oc_dbwriter *w, const char *cert_pem, const char *key_pem) {
     oc_job *j = oc_job_new(OC_JOB_STORE_IDENTITY, 0);
