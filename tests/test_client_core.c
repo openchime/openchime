@@ -9,13 +9,15 @@
 #include "client.h"     /* the core facade under test */
 #include "model.h"
 #include "store.h"       /* to assert the persisted token/pin */
-#include "resolve.h"     /* instance resolution (REQ-010/011) */
+#include "resolve.h"     /* workspace resolution (REQ-010/011) */
 
 #include "netloop.h"
 #include "dbwriter.h"
 #include "protocol.h"
 #include "tls.h"
 #include "check.h"
+
+#include <sqlite3.h>     /* to hand-build a pre-rename store for the upgrade test */
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -206,7 +208,7 @@ static int file_matches(const char *path, const unsigned char *data, size_t len)
     return ok && off == len;
 }
 
-/* Instance resolution (REQ-010/011). The pure pieces are tested here without
+/* Workspace resolution (REQ-010/011). The pure pieces are tested here without
  * live DNS: normalization and the SRV-answer parser (fed a canned wire response).
  * A minimal DNS reply for `_openchime._tcp.acme.com` -> `srv.acme.com:8443`
  * (priority 10, weight 5), the answer name a compression pointer to the query. */
@@ -232,10 +234,10 @@ static void test_resolve(void) {
     /* A scheme and :port are stripped. */
     CHECK(oc_resolve_domain("openchime://chat.acme.com:8443", "x", d, sizeof d) == 0 &&
           strcmp(d, "chat.acme.com") == 0);
-    /* Empty instance is rejected distinctly. */
+    /* Empty workspace is rejected distinctly. */
     CHECK(oc_resolve_domain("", "x", d, sizeof d) == -1);
     oc_endpoint ep;
-    CHECK(oc_resolve("", NULL, &ep) == OC_RESOLVE_BAD_INSTANCE);
+    CHECK(oc_resolve("", NULL, &ep) == OC_RESOLVE_BAD_WORKSPACE);
     /* An explicit host:port (literal IP resolves instantly, no DNS) pins the port. */
     CHECK(oc_resolve("127.0.0.1:9000", NULL, &ep) == OC_RESOLVE_OK &&
           strcmp(ep.host, "127.0.0.1") == 0 && ep.port == 9000);
@@ -288,6 +290,80 @@ static void mock_del(void *ctx, const char *a) {
         if (g_mock[i].used && strcmp(g_mock[i].account, a) == 0) g_mock[i].used = 0;
 }
 
+static void count_msg_cb(void *ctx, uint64_t ch, uint64_t id, uint64_t aid,
+                         const char *an, uint64_t t, const char *body, int e, int d) {
+    (void)ch; (void)id; (void)aid; (void)an; (void)t; (void)body; (void)e; (void)d;
+    (*(int *)ctx)++;
+}
+static void count_outbox_cb(void *ctx, const uint8_t idem[OC_IDEM_SIZE],
+                            uint64_t ch, const char *body) {
+    (void)idem; (void)ch; (void)body;
+    (*(int *)ctx)++;
+}
+
+/* A store written before the instance->workspace rename (client schema v3) must
+ * upgrade in place: migration 4 renames the table + columns, and every row —
+ * session token, TOFU pin, cached history, outbox — survives. Losing these would
+ * silently log the user out and re-pin on upgrade, so pin the whole path. */
+static void test_store_workspace_upgrade(void) {
+    const char *sp = "build/itest_core_upgrade.db";
+    unlink(sp); unlink("build/itest_core_upgrade.db-wal"); unlink("build/itest_core_upgrade.db-shm");
+
+    /* Hand-build the exact v3 schema (pre-rename), with one row in each table. */
+    sqlite3 *raw = NULL;
+    CHECK(sqlite3_open(sp, &raw) == SQLITE_OK);
+    const char *v3 =
+        "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER);"
+        "INSERT INTO schema_version VALUES (1,0),(2,0),(3,0);"
+        "CREATE TABLE instance_state ("
+        "  instance TEXT PRIMARY KEY, session_token BLOB, session_expiry INTEGER, tls_pin BLOB);"
+        "CREATE TABLE cached_message ("
+        "  instance TEXT NOT NULL, channel_id INTEGER NOT NULL, message_id INTEGER NOT NULL,"
+        "  author_id INTEGER, author_name TEXT, server_time INTEGER, body TEXT,"
+        "  edited INTEGER NOT NULL DEFAULT 0, deleted INTEGER NOT NULL DEFAULT 0,"
+        "  PRIMARY KEY (instance, message_id));"
+        "CREATE TABLE outbox ("
+        "  instance TEXT NOT NULL, idem BLOB NOT NULL, channel_id INTEGER NOT NULL,"
+        "  body TEXT, created INTEGER, PRIMARY KEY (instance, idem));";
+    CHECK(sqlite3_exec(raw, v3, NULL, NULL, NULL) == SQLITE_OK);
+
+    uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN];
+    for (int i = 0; i < OC_SESSION_TOKEN_LEN; i++)    tok[i] = (uint8_t)(i + 7);
+    for (int i = 0; i < OC_TLS_FINGERPRINT_LEN; i++)  pin[i] = (uint8_t)(i + 3);
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(raw, "INSERT INTO instance_state VALUES ('acme:443', ?1, 0, ?2);", -1, &st, NULL);
+    sqlite3_bind_blob(st, 1, tok, OC_SESSION_TOKEN_LEN, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(st, 2, pin, OC_TLS_FINGERPRINT_LEN, SQLITE_TRANSIENT);
+    CHECK(sqlite3_step(st) == SQLITE_DONE);
+    sqlite3_finalize(st);
+    CHECK(sqlite3_exec(raw,
+        "INSERT INTO cached_message VALUES ('acme:443',9,42,5,'dana',1000,'hello',0,0);"
+        "INSERT INTO outbox VALUES ('acme:443', x'0102030405060708090a0b0c0d0e0f10', 9, 'queued', 1);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(raw);
+
+    /* Opening with the current code applies migration 4 and reads through the
+     * new `workspace` spelling. */
+    oc_store *s = oc_store_open(sp);
+    CHECK(s != NULL);
+    if (s) {
+        uint8_t gt[OC_SESSION_TOKEN_LEN], gp[OC_TLS_FINGERPRINT_LEN];
+        CHECK(oc_store_load_session(s, "acme:443", gt, NULL, 0) == 1 &&
+              memcmp(gt, tok, OC_SESSION_TOKEN_LEN) == 0);
+        CHECK(oc_store_load_pin(s, "acme:443", gp) == 1 &&
+              memcmp(gp, pin, OC_TLS_FINGERPRINT_LEN) == 0);
+
+        int msgs = 0, out = 0;
+        oc_store_each_message(s, "acme:443", count_msg_cb, &msgs);
+        oc_store_outbox_each(s, "acme:443", count_outbox_cb, &out);
+        CHECK(msgs == 1);
+        CHECK(out == 1);
+        oc_store_close(s);
+    }
+    unlink(sp); unlink("build/itest_core_upgrade.db-wal"); unlink("build/itest_core_upgrade.db-shm");
+}
+
 /* With a secret set, the session token round-trips through the keyring vtable and
  * does NOT land in the SQLite column; clearing goes through the vtable too. */
 static void test_secret_routing(void) {
@@ -330,11 +406,12 @@ static void test_secret_routing(void) {
 }
 
 int run_client_core_tests(void) {
-    printf("test_client_core: resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, client-settings, profile, seen-by, persisted store, cached history, session reconnect, offline outbox\n");
+    printf("test_client_core: resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, client-settings, profile, seen-by, persisted store, v3 workspace upgrade, cached history, session reconnect, offline outbox\n");
 
     test_resolve();
     test_last_error();
     test_secret_routing();
+    test_store_workspace_upgrade();
 
     /* The daemon opens its blob store at netloop startup; point it at a build-local
      * dir (the /data/blobs default isn't writable in the test sandbox), matching
@@ -674,7 +751,7 @@ int run_client_core_tests(void) {
                 CHECK(WAIT_FOR(s1, m->authed && m->user_id != 0));
                 oc_client_stop(s1);   /* QUIT (not logout): the session stays live */
             }
-            /* The token + pin were persisted for this instance. */
+            /* The token + pin were persisted for this workspace. */
             oc_store *chk = oc_store_open(sp);
             CHECK(chk != NULL);
             if (chk) {

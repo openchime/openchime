@@ -111,7 +111,7 @@ carries the token from center to daemon. This preserves the island model
 
 ```
   ┌────────┐   1. authorize (central's client_id,        ┌──────────┐
-  │ client │──────redirect_uri, PKCE, state=instance)───▶│ provider │
+  │ client │──────redirect_uri, PKCE, state=workspace)───▶│ provider │
   │ (app)  │◀──────────────── 2. login ──────────────────│ (Google) │
   └───┬────┘                                              └────┬─────┘
       │                                    3. auth code        │
@@ -132,12 +132,12 @@ carries the token from center to daemon. This preserves the island model
 1. The client opens a browser to the provider's authorize endpoint using
    **central's** `client_id` and redirect URI (e.g.
    `https://auth.openchime.io/callback`), a PKCE challenge, and a `state` that
-   encodes the **target instance** + a client nonce.
+   encodes the **target workspace** + a client nonce.
 2. The user authenticates at the provider.
 3. The provider redirects to central's callback with an auth code.
 4. Central exchanges the code (with its client secret), verifies the provider
    token, extracts identity (subject, email, name), and mints an **ES256 JWT
-   scoped to that instance** (`aud = acme.example`), returned to the *client*.
+   scoped to that workspace** (`aud = acme.example`), returned to the *client*.
 5. The client presents that token to the `acme.example` daemon in `AUTH`
    (method `oidc`). The daemon verifies it (§3.3) and mints a session.
 
@@ -148,7 +148,7 @@ carrying the identity claims:
 
 ```
 { "iss": "https://auth.openchime.io",   // the central service
-  "aud": "acme.example",                 // the target instance
+  "aud": "acme.example",                 // the target workspace
   "sub": "<provider issuer>|<subject>",  // stable identity
   "email": "...", "name": "...",
   "iat": ..., "exp": ... }
@@ -160,8 +160,8 @@ The daemon validates it by **pinning both the key and the algorithm**:
   footguns (`alg=none`, RS256/HS256 confusion) up front;
 - it verifies the signature with mbedTLS (ES256 = ECDSA-P256, which mbedTLS
   supports directly; EdDSA/Ed25519 is not supported, so ES256 is the choice);
-- it checks `iss` (central), `aud` (== this instance's configured id, so a token
-  minted for one instance cannot be replayed at another), and `exp`.
+- it checks `iss` (central), `aud` (== this workspace's configured id, so a token
+  minted for one workspace cannot be replayed at another), and `exp`.
 
 The JWT payload is JSON, so the daemon vendors a single-file JSON tokenizer
 (**jsmn** — MIT, zero-allocation, ~300 lines, in the same spirit as
@@ -176,13 +176,13 @@ targets the high-frequency message path, not the auth bootstrap.)
 
 - The daemon config (ARCH-26) carries **central's public key** (bundled/pinned
   in the OpenChime distribution — central is maintainer-controlled and stable)
-  and this instance's **`audience` id**. A self-hoster enabling relay-OIDC
-  registers their instance with central once to obtain that id.
+  and this workspace's **`audience` id**. A self-hoster enabling relay-OIDC
+  registers their workspace with central once to obtain that id.
 - **Dependency is login-time only.** Once the daemon issues a session (§4), it
   never contacts central again; existing sessions survive a central outage. Only
   *new logins* need central up. Local mode has no central dependency at all.
 - **Privacy tradeoff:** in relay-OIDC the central service sees *who* logs into
-  which instance (identities, not message content — it never touches
+  which workspace (identities, not message content — it never touches
   messages/channels). A self-hoster wanting zero maintainer visibility uses
   local mode.
 
@@ -202,8 +202,8 @@ daemon — and are built independently. Its contract with the daemon is narrow:
 
 - run the Authorization-Code-+-PKCE flow against the configured providers;
 - mint ES256 JWTs (§3.3) signed by the key the daemon pins, audience-scoped to
-  the requesting instance;
-- maintain the instance registry (which `audience` ids are valid).
+  the requesting workspace;
+- maintain the workspace registry (which `audience` ids are valid).
 
 Until it exists, the daemon's OIDC path is tested with a **test issuer**:
 generate an ECDSA-P256 keypair in the test, mint central-style ES256 JWTs, and
@@ -244,7 +244,7 @@ token on reconnect), the daemon then does the same thing:
 
 After `WELCOME` and before `AUTH`, the daemon sends **`AUTH_CHALLENGE`**
 (PROTOCOL.md §4) advertising the accepted method(s) and, in OIDC mode, the
-central authorize parameters plus this instance's `audience`. The client renders
+central authorize parameters plus this workspace's `audience`. The client renders
 the appropriate login UI and replies with `AUTH`, whose `method` discriminator
 selects the path:
 

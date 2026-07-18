@@ -35,7 +35,7 @@ struct oc_net {
  * threaded through run_connection so the net thread persists across restarts. */
 typedef struct {
     oc_store   *store;                          /* NULL = no persistence */
-    const char *instance;                       /* "host:port" key */
+    const char *workspace;                       /* "host:port" key */
     uint8_t     pin[OC_TLS_FINGERPRINT_LEN];
     int         have_pin;                       /* pin loaded/captured this run */
     int         logged_out;                     /* set on /logout: drop the stored token */
@@ -198,7 +198,7 @@ typedef struct {
     oc_xfer     *xfer;
     oc_hwtab    *hw;
     oc_store    *store;      /* cache messages as they arrive (NULL = no store) */
-    const char  *instance;
+    const char  *workspace;
     const char  *client_type; /* which settings bucket this frontend syncs */
 } disp_ctx;
 
@@ -304,7 +304,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 char *cb = malloc(b.body.len + 1);
                 if (cb) {
                     memcpy(cb, b.body.ptr, b.body.len); cb[b.body.len] = '\0';
-                    oc_store_save_message(ctx->store, ctx->instance, b.channel_id, b.message_id,
+                    oc_store_save_message(ctx->store, ctx->workspace, b.channel_id, b.message_id,
                                           b.author_id, an, b.server_time, cb, 0, 0);
                     free(cb);
                 }
@@ -390,7 +390,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     if (e->body) { memcpy(e->body, me.body.ptr, me.body.len); e->body[me.body.len] = '\0'; }
                     oc_queue_push(to_ui, e);
                     if (ctx && ctx->store && e->body)   /* keep the cache current */
-                        oc_store_edit_message(ctx->store, ctx->instance, me.message_id, e->body);
+                        oc_store_edit_message(ctx->store, ctx->workspace, me.message_id, e->body);
                 }
             }
         } else if (hdr.msg_type == OC_MSG_MSG_DELETED) {
@@ -399,7 +399,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 oc_ev *e = oc_ev_new(OC_EV_DELETE);
                 if (e) { e->channel_id = md.channel_id; e->message_id = md.message_id; oc_queue_push(to_ui, e); }
                 if (ctx && ctx->store)
-                    oc_store_delete_message(ctx->store, ctx->instance, md.message_id);
+                    oc_store_delete_message(ctx->store, ctx->workspace, md.message_id);
             }
         } else if (hdr.msg_type == OC_MSG_THREAD_REPLY) {
             oc_thread_reply tr;
@@ -628,7 +628,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
              * into the model. */
             oc_send_ack ack;
             if (oc_decode_send_ack(&p, &ack) == OC_OK && ctx && ctx->store)
-                oc_store_outbox_remove(ctx->store, ctx->instance, ack.idem);
+                oc_store_outbox_remove(ctx->store, ctx->workspace, ack.idem);
         } else if (hdr.msg_type == OC_MSG_ERROR) {
             oc_error err;
             if (oc_decode_error(&p, &err) == OC_OK) {
@@ -691,11 +691,11 @@ static int run_connection(oc_net *n, int reconnecting,
 
     if (do_handshake(&conn, fd, &n->stop) != 0) goto drop;
 
-    /* First contact with this instance: remember the cert fingerprint so every
+    /* First contact with this workspace: remember the cert fingerprint so every
      * later connection pins it (TOFU first-use, ARCH-10). */
     if (cs && !cs->have_pin && oc_tls_peer_fingerprint(&conn, cs->pin) == 0) {
         cs->have_pin = 1;
-        if (cs->store) oc_store_save_pin(cs->store, cs->instance, cs->pin);
+        if (cs->store) oc_store_save_pin(cs->store, cs->workspace, cs->pin);
     }
 
     /* HELLO -> WELCOME */
@@ -756,7 +756,7 @@ static int run_connection(oc_net *n, int reconnecting,
             memcpy(sess, ok.session_token.ptr, OC_SESSION_TOKEN_LEN);
             *have_sess = 1;
             if (cs && cs->store)   /* persist it so a relaunch reconnects silently */
-                oc_store_save_session(cs->store, cs->instance, sess, ok.session_expiry);
+                oc_store_save_session(cs->store, cs->workspace, sess, ok.session_expiry);
         }
         push_simple(n->to_ui, OC_EV_CONNECTED, ok.user_id);
         push_simple(n->to_ui, OC_EV_AUTH_OK, ok.user_id);
@@ -792,7 +792,7 @@ static int run_connection(oc_net *n, int reconnecting,
          * disconnected (this run or a prior one), reusing each stored idem. */
         if (cs && cs->store) {
             struct flush_ctx fc = { &conn, fd, &n->stop };
-            oc_store_outbox_each(cs->store, cs->instance, flush_outbox_cb, &fc);
+            oc_store_outbox_each(cs->store, cs->workspace, flush_outbox_cb, &fc);
         }
     }
 
@@ -800,7 +800,7 @@ static int run_connection(oc_net *n, int reconnecting,
      * An in-flight attachment transfer (upload/download) is driven by both. */
     *served = 1;
     disp_ctx ctx = { n->to_ui, &conn, fd, &n->stop, &xfer, hw,
-                     cs ? cs->store : NULL, cs ? cs->instance : NULL, n->client_type };
+                     cs ? cs->store : NULL, cs ? cs->workspace : NULL, n->client_type };
     while (!n->stop) {
         oc_cmd *c;
         while ((c = oc_queue_try_pop(n->from_ui)) != NULL) {
@@ -821,7 +821,7 @@ static int run_connection(oc_net *n, int reconnecting,
                  * SEND_ACK leaves it there to be resent, deduped by the idem. */
                 uint8_t idem[OC_IDEM_SIZE]; gen_idem(idem);
                 uint64_t cid = c->channel_id ? c->channel_id : 1;
-                if (ctx.store) oc_store_outbox_add(ctx.store, ctx.instance, idem, cid, c->body);
+                if (ctx.store) oc_store_outbox_add(ctx.store, ctx.workspace, idem, cid, c->body);
                 send_message(&conn, fd, &n->stop, cid, idem, c->body);
             }
             if (c->type == OC_CMD_REACT && c->body) {
@@ -1124,9 +1124,9 @@ static void replay_msg_cb(void *vctx, uint64_t channel_id, uint64_t message_id,
  * mark each channel's replayed messages read so a relaunch shows history without
  * everything reading as unread. Seeds `hw` so the first backfill resumes from the
  * last cached id rather than refetching from 0. */
-static void replay_cache(oc_queue *to_ui, oc_store *store, const char *instance, oc_hwtab *hw) {
+static void replay_cache(oc_queue *to_ui, oc_store *store, const char *workspace, oc_hwtab *hw) {
     struct replay_ctx r = { to_ui, hw };
-    oc_store_each_message(store, instance, replay_msg_cb, &r);
+    oc_store_each_message(store, workspace, replay_msg_cb, &r);
     for (size_t i = 0; i < hw->n; i++) {
         oc_ev *e = oc_ev_new(OC_EV_READ_STATE);
         if (e) { e->channel_id = hw->v[i].channel_id; oc_queue_push(to_ui, e); }
@@ -1145,23 +1145,23 @@ static void *net_thread(void *arg) {
     int have_sess = 0, reconnecting = 0, backoff_ms = 0;
 
     /* Local store (ARCH-58): pre-load the pin + a still-valid session token for
-     * this instance, so the first connect can pin the cert and auth silently with
+     * this workspace, so the first connect can pin the cert and auth silently with
      * the token instead of the password. */
     conn_store cs; memset(&cs, 0, sizeof cs);
-    char instance[288];
-    snprintf(instance, sizeof instance, "%s:%d", n->host, n->port);
-    cs.instance = instance;
+    char workspace[288];
+    snprintf(workspace, sizeof workspace, "%s:%d", n->host, n->port);
+    cs.workspace = workspace;
     cs.store = n->store_path ? oc_store_open(n->store_path) : NULL;
     if (cs.store) {
         oc_store_set_secret(cs.store, n->secret);   /* token -> keyring if available */
-        cs.have_pin = oc_store_load_pin(cs.store, instance, cs.pin);
+        cs.have_pin = oc_store_load_pin(cs.store, workspace, cs.pin);
         uint64_t now_ms = (uint64_t)time(NULL) * 1000;
-        if (oc_store_load_session(cs.store, instance, sess, NULL, now_ms)) {
+        if (oc_store_load_session(cs.store, workspace, sess, NULL, now_ms)) {
             have_sess = 1;
             reconnecting = 1;   /* use OC_AUTH_SESSION on the very first connect */
         }
         /* Show cached history immediately + seed the backfill cursor (ARCH-45/46). */
-        replay_cache(n->to_ui, cs.store, instance, &hw);
+        replay_cache(n->to_ui, cs.store, workspace, &hw);
     }
 
     int reach_notified = 0;   /* latch so "unreachable" isn't repeated each retry */
@@ -1169,7 +1169,7 @@ static void *net_thread(void *arg) {
         int served = 0;
         int rc = run_connection(n, reconnecting, sess, &have_sess, &hw, &served, &cs);
         push_simple(n->to_ui, OC_EV_DISCONNECTED, 0);   /* this connection ended */
-        if (cs.store && cs.logged_out) oc_store_clear_session(cs.store, instance);
+        if (cs.store && cs.logged_out) oc_store_clear_session(cs.store, workspace);
         /* Distinguish "unreachable" from "login failed" (REQ-011): a drop before
          * ever serving, without a fatal auth reject, is a connectivity problem. */
         if (served) reach_notified = 0;
@@ -1181,7 +1181,7 @@ static void *net_thread(void *arg) {
         if (rc == RC_FATAL) {
             /* A session token (stored or reconnect) was rejected — drop it. If we
              * still hold a password, fall back to it once; otherwise give up. */
-            if (reconnecting && cs.store) oc_store_clear_session(cs.store, instance);
+            if (reconnecting && cs.store) oc_store_clear_session(cs.store, workspace);
             if (reconnecting && n->token && n->token[0]) {
                 have_sess = 0; reconnecting = 0; backoff_ms = 0;
                 continue;   /* retry immediately with the password */
@@ -1215,7 +1215,7 @@ static void *net_thread(void *arg) {
         while ((c = oc_queue_try_pop(n->from_ui)) != NULL) {
             if (c->type == OC_CMD_SEND && c->body) {
                 uint8_t idem[OC_IDEM_SIZE]; gen_idem(idem);
-                oc_store_outbox_add(cs.store, instance, idem,
+                oc_store_outbox_add(cs.store, workspace, idem,
                                     c->channel_id ? c->channel_id : 1, c->body);
             }
             oc_cmd_free(c);

@@ -32,7 +32,7 @@ the requirement says so explicitly rather than implying one.
   Rationale, when it matters, is a separate sentence after the requirement.
 - "The system" refers to the daemon and a client jointly. "The daemon" and
   "the client" are used when a requirement applies to only one side.
-- "Tenant" refers to one self-hosted or hosted-service organization instance
+- "Tenant" refers to one self-hosted or hosted-service organization workspace
   (one daemon, one SQLite database, per ARCH-4). "Organization" and "tenant"
   are used interchangeably.
 - Cross-references cite the implementing decision as `(ARCH-N)`. A
@@ -64,17 +64,17 @@ the requirement says so explicitly rather than implying one.
 
 ### 1.1 Tenant Discovery and Resolution
 
-- **REQ-010.** The client has collected an **instance** (the tenant's
-  address) and the user's **email** at sign-in, and has resolved the instance
+- **REQ-010.** The client has collected an **workspace** (the tenant's
+  address) and the user's **email** at sign-in, and has resolved the workspace
   to a daemon address by plain DNS before opening a connection — with no
-  hosted resolution service involved (ARCH-14). A self-hosted instance given
+  hosted resolution service involved (ARCH-14). A self-hosted workspace given
   as a full domain (e.g. `chat.acme.com`) has resolved via SRV records plus
-  optional `.well-known` metadata; a hosted-tier instance given as a bare name
+  optional `.well-known` metadata; a hosted-tier workspace given as a bare name
   (e.g. `acme`) has had the service's known DNS suffix appended client-side
   (`acme` → `acme.openchime.example`) and then resolved by ordinary DNS. The
   email has been used only to drive the OIDC login (REQ-020), not to derive
-  the instance.
-- **REQ-011.** Resolution failure (the instance name does not resolve in DNS,
+  the workspace.
+- **REQ-011.** Resolution failure (the workspace name does not resolve in DNS,
   no SRV record, malformed `.well-known` metadata) has produced a distinct,
   user-facing error rather than being conflated with an authentication or
   network failure, since the user has needed to know which of "this org
@@ -109,7 +109,7 @@ the requirement says so explicitly rather than implying one.
   token, and repeated failed attempts rate-limited (ARCH-59). This mode has
   required no external identity provider and has functioned air-gapped.
 - **REQ-025.** In OIDC mode the maintainer's central service has held the
-  provider app credentials and re-issued an instance-scoped identity token that
+  provider app credentials and re-issued a workspace-scoped identity token that
   the daemon trusts; self-hosted deployments have reached it through a relay so
   their users get social login without registering provider apps, and the client
   (not the central service) has carried the token to the daemon (ARCH-56).
@@ -157,7 +157,7 @@ the requirement says so explicitly rather than implying one.
   therefore been a property of the deployment topology, not of a
   tenant-ID filter inside shared queries.
 - **REQ-041.** No shared, always-on runtime component has existed in the
-  message/data path across tenants. Instance resolution has been plain DNS
+  message/data path across tenants. Workspace resolution has been plain DNS
   (REQ-010, ARCH-14), so the name-to-daemon-address mapping has lived in DNS
   records — provisioned at tenant creation — rather than in a bespoke hosted
   resolution service. The cross-tenant surfaces touching data have therefore been

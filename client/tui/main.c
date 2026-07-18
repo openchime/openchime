@@ -2,15 +2,15 @@
  * OpenChime TUI — the first frontend over the app-core (ARCH-74/75). termbox2
  * gives the cell grid + input; utf8proc gives correct display width so emoji and
  * CJK don't corrupt the layout. A modern paneled layout (the lazygit/k9s idiom):
- * a header bar (instance · you · presence · connection · unread), three bordered
+ * a header bar (workspace · you · presence · connection · unread), three bordered
  * panels — Channels │ Messages │ Members — a status line, an always-ready
  * composer, and a context keybinding hint bar; `?` opens a full help overlay.
  * All state/logic lives in oc_client; this file is pure view + input. Mouse
  * (click a channel/member, wheel to scroll) and machine-local prefs — panel
- * widths, Members visibility, 12/24h time, a default instance — come from
+ * widths, Members visibility, 12/24h time, a default workspace — come from
  * ~/.config/openchime/config (config.c), created with defaults on first run.
  *
- * Usage: openchime-tui [<instance>] [user:pass]   (login box if omitted)
+ * Usage: openchime-tui [<workspace>] [user:pass]   (login box if omitted)
  *        openchime-tui <host> <port> [user:pass]   (dev/local direct connect)
  *        (credentials also read from $OPENCHIME_CRED = "user:pass")
  *
@@ -52,7 +52,7 @@
 
 #include "client.h"
 #include "model.h"
-#include "resolve.h"    /* instance -> host:port (REQ-010/011) */
+#include "resolve.h"    /* workspace -> host:port (REQ-010/011) */
 #include "store.h"      /* peek a stored session token (skip the login box) */
 #include "secret_backend.h" /* OS keyring for the session token */
 #include "config.h"     /* machine-local prefs (mouse, panels, time) */
@@ -74,7 +74,7 @@
 static const oc_config *g_cfg = NULL;
 
 /* Keys of the portable prefs mirrored into the daemon's synced settings bucket
- * (the daemon-side config layer). Machine-local-only fields (e.g. instance) are
+ * (the daemon-side config layer). Machine-local-only fields (e.g. workspace) are
  * deliberately absent — which server you connect to should not sync. */
 #define OC_SYNC_KEY_MOUSE     "mouse"
 #define OC_SYNC_KEY_MEMBERS   "members_panel"
@@ -465,8 +465,8 @@ static void build_webhooks_rows(rows_t *r, const oc_model *m, int width) {
     }
 }
 
-/* The instance/host label shown in the header, set once in main(). */
-static char g_instance[256] = "";
+/* The workspace/host label shown in the header, set once in main(). */
+static char g_workspace[256] = "";
 
 /* Compute panel columns from the terminal width + config (shared by render and
  * the mouse handler so clicks map to what's drawn). */
@@ -697,7 +697,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     const oc_channel *fc = (focus < m->n_channels) ? &m->channels[focus] : NULL;
     const char *conn = m->authed ? "connected" : (m->connected ? "connecting…" : "offline");
 
-    /* Header bar (row 0): instance · you · presence · connection · unread. */
+    /* Header bar (row 0): workspace · you · presence · connection · unread. */
     int unread = 0;
     for (size_t i = 0; i < m->n_channels; i++) if (m->channels[i].unread > 0) unread += m->channels[i].unread;
     const char *me = m->user_id ? oc_model_user_name(m, m->user_id) : "";
@@ -705,7 +705,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     const char *dot = pr == OC_PRESENCE_ONLINE ? "\xe2\x97\x8f" : pr == OC_PRESENCE_AWAY ? "\xe2\x97\x90" : "\xe2\x97\x8b";
     char hdr[256];
     snprintf(hdr, sizeof hdr, " OpenChime · %.120s · %.48s %s · %s",
-             g_instance[0] ? g_instance : "—", me[0] ? me : "…", dot, conn);
+             g_workspace[0] ? g_workspace : "—", me[0] ? me : "…", dot, conn);
     fill_row(0, 0, W, TB_BLUE);
     draw_clip(0, 0, W, hdr, TB_WHITE | TB_BOLD, TB_BLUE);
     if (unread) {
@@ -1277,8 +1277,8 @@ static int all_digits(const char *s) {
 }
 
 /* ---- connect / login dialog (REQ-020 local sign-in) --------------------------
- * A modal box collecting instance + username + password (+ remember-me), shown
- * when no credential and no stored session token are available. The instance is
+ * A modal box collecting workspace + username + password (+ remember-me), shown
+ * when no credential and no stored session token are available. The workspace is
  * resolved on submit (inline "not found"); the caller starts the client and, on
  * an auth/connect failure, comes back here with the reason. */
 
@@ -1286,7 +1286,7 @@ enum { LOGIN_SUBMIT, LOGIN_QUIT };
 enum { AUTH_R_OK, AUTH_R_FAILED, AUTH_R_UNREACHABLE, AUTH_R_CANCELLED };
 
 typedef struct {
-    char instance[256];
+    char workspace[256];
     char user[128];
     char pass[128];
     int  remember;
@@ -1328,13 +1328,13 @@ static void draw_field(int x, int y, int w, const char *label, const char *val,
     }
 }
 
-/* Run the login box until the user submits (fields filled, instance resolved into
+/* Run the login box until the user submits (fields filled, workspace resolved into
  * `f->ep`) or quits. `err` is an optional message to show (e.g. a prior auth
  * failure). Returns LOGIN_SUBMIT or LOGIN_QUIT. */
 static int login_dialog(login_form *f, const char *err) {
     /* On a retry (err set) land on the password — that's what needs fixing;
-     * otherwise start past a pre-filled instance. */
-    int focus = err ? 2 : (f->instance[0] ? 1 : 0);
+     * otherwise start past a pre-filled workspace. */
+    int focus = err ? 2 : (f->workspace[0] ? 1 : 0);
     char inl[160]; inl[0] = '\0';
     for (;;) {
         int W = tb_width(), H = tb_height();
@@ -1345,7 +1345,7 @@ static int login_dialog(login_form *f, const char *err) {
         draw_frame(x, y, bw, bh);
         draw_clip(x + 2, y, x + bw - 1, " Sign in to OpenChime ", TB_CYAN | TB_BOLD, TB_DEFAULT);
         int ix = x + 2, iw = bw - 4;
-        draw_field(ix, y + 2, iw, "Instance", f->instance, focus == 0, 0);
+        draw_field(ix, y + 2, iw, "Workspace", f->workspace, focus == 0, 0);
         draw_field(ix, y + 4, iw, "Username", f->user, focus == 1, 0);
         draw_field(ix, y + 5, iw, "Password", f->pass, focus == 2, 1);
         char rem[40]; snprintf(rem, sizeof rem, "[%c] Remember me", f->remember ? 'x' : ' ');
@@ -1365,16 +1365,16 @@ static int login_dialog(login_form *f, const char *err) {
         if (ev.key == TB_KEY_ARROW_UP) { focus = (focus + 3) & 3; continue; }
         int is_space = (ev.ch == ' ' || ev.key == TB_KEY_SPACE);
         if (ev.key == TB_KEY_ENTER) {
-            if (!f->instance[0]) { snprintf(inl, sizeof inl, "enter an instance (domain or name)"); focus = 0; continue; }
+            if (!f->workspace[0]) { snprintf(inl, sizeof inl, "enter a workspace (domain or name)"); focus = 0; continue; }
             if (!f->user[0])     { snprintf(inl, sizeof inl, "enter a username"); focus = 1; continue; }
-            oc_resolve_status st = oc_resolve(f->instance, getenv("OPENCHIME_SUFFIX"), &f->ep);
-            if (st == OC_RESOLVE_BAD_INSTANCE) { snprintf(inl, sizeof inl, "invalid instance '%s'", f->instance); focus = 0; continue; }
-            if (st == OC_RESOLVE_NOT_FOUND)    { snprintf(inl, sizeof inl, "'%s' not found — does not resolve in DNS", f->instance); focus = 0; continue; }
+            oc_resolve_status st = oc_resolve(f->workspace, getenv("OPENCHIME_SUFFIX"), &f->ep);
+            if (st == OC_RESOLVE_BAD_WORKSPACE) { snprintf(inl, sizeof inl, "invalid workspace '%s'", f->workspace); focus = 0; continue; }
+            if (st == OC_RESOLVE_NOT_FOUND)    { snprintf(inl, sizeof inl, "'%s' not found — does not resolve in DNS", f->workspace); focus = 0; continue; }
             return LOGIN_SUBMIT;
         }
         if (focus == 3) { if (is_space) f->remember = !f->remember; continue; }
         char *buf; size_t cap;
-        if (focus == 0)      { buf = f->instance; cap = sizeof f->instance; }
+        if (focus == 0)      { buf = f->workspace; cap = sizeof f->workspace; }
         else if (focus == 1) { buf = f->user;     cap = sizeof f->user; }
         else                 { buf = f->pass;     cap = sizeof f->pass; }
         if (ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2) {
@@ -1412,10 +1412,10 @@ static int await_auth(oc_client *cl, const char *host) {
 
 /* Drive the login box + connect, retrying on failure, until authenticated or the
  * user quits. On success sets *out to the authenticated client and returns 1. */
-static int run_login(const char *initial_instance, const char *store_path,
+static int run_login(const char *initial_workspace, const char *store_path,
                      oc_secret *secret, oc_client **out) {
     login_form f; memset(&f, 0, sizeof f);
-    snprintf(f.instance, sizeof f.instance, "%s", initial_instance ? initial_instance : "");
+    snprintf(f.workspace, sizeof f.workspace, "%s", initial_workspace ? initial_workspace : "");
     f.remember = 1;
     char err[320]; err[0] = '\0';
     for (;;) {
@@ -1427,7 +1427,7 @@ static int run_login(const char *initial_instance, const char *store_path,
         if (!cl) { snprintf(err, sizeof err, "could not start the client"); continue; }
         int res = await_auth(cl, f.ep.host);
         if (res == AUTH_R_OK) {
-            snprintf(g_instance, sizeof g_instance, "%s", f.instance[0] ? f.instance : f.ep.host);
+            snprintf(g_workspace, sizeof g_workspace, "%s", f.workspace[0] ? f.workspace : f.ep.host);
             *out = cl; return 1;
         }
         oc_client_stop(cl);
@@ -1438,7 +1438,7 @@ static int run_login(const char *initial_instance, const char *store_path,
     }
 }
 
-/* Is a still-valid session token stored for this instance? If so we skip the
+/* Is a still-valid session token stored for this workspace? If so we skip the
  * login box and let the net thread reconnect silently. */
 static int have_stored_token(const char *store_path, const char *host, int port,
                              oc_secret *secret) {
@@ -1454,9 +1454,9 @@ static int have_stored_token(const char *store_path, const char *host, int port,
 
 int main(int argc, char **argv) {
     if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
-        fprintf(stderr, "usage: %s [<instance>] [user:pass]\n"
+        fprintf(stderr, "usage: %s [<workspace>] [user:pass]\n"
                         "       %s <host> <port> [user:pass]\n"
-                        "  With no instance (or no credentials) a login box is shown.\n",
+                        "  With no workspace (or no credentials) a login box is shown.\n",
                         argv[0], argv[0]);
         return 0;
     }
@@ -1477,7 +1477,7 @@ int main(int argc, char **argv) {
 
     /* Decide how to connect. Three shapes:
      *   <host> <port> [cred]  — dev/local direct connect (argv[2] is a port);
-     *   <instance> [cred]     — resolve by DNS (REQ-010), then connect;
+     *   <workspace> [cred]     — resolve by DNS (REQ-010), then connect;
      *   (no credentials)      — show the login box (REQ-020).
      * Connect directly when a credential is supplied or a session token is
      * already stored; otherwise prompt. A resolution failure is reported
@@ -1491,13 +1491,13 @@ int main(int argc, char **argv) {
         port = atoi(argv[2]);
         cred = argc > 3 ? argv[3] : getenv("OPENCHIME_CRED");
         direct = 1;
-    } else if (argc >= 2 || cfg.instance[0]) {       /* instance mode (arg or config default) */
-        const char *inst = (argc >= 2) ? argv[1] : cfg.instance;
+    } else if (argc >= 2 || cfg.workspace[0]) {       /* workspace mode (arg or config default) */
+        const char *inst = (argc >= 2) ? argv[1] : cfg.workspace;
         const char *cli_cred = argc >= 3 ? argv[2] : getenv("OPENCHIME_CRED");
         oc_endpoint ep;
         oc_resolve_status st = oc_resolve(inst, getenv("OPENCHIME_SUFFIX"), &ep);
-        if (st == OC_RESOLVE_BAD_INSTANCE) { fprintf(stderr, "openchime: invalid instance '%s'\n", inst); return 2; }
-        if (st == OC_RESOLVE_NOT_FOUND)    { fprintf(stderr, "openchime: instance '%s' not found — it does not resolve in DNS\n", inst); return 3; }
+        if (st == OC_RESOLVE_BAD_WORKSPACE) { fprintf(stderr, "openchime: invalid workspace '%s'\n", inst); return 2; }
+        if (st == OC_RESOLVE_NOT_FOUND)    { fprintf(stderr, "openchime: workspace '%s' not found — it does not resolve in DNS\n", inst); return 3; }
         snprintf(host, sizeof host, "%s", ep.host);
         port = ep.port;
         if (cli_cred && cli_cred[0])                               { cred = cli_cred; direct = 1; }
@@ -1521,8 +1521,8 @@ int main(int argc, char **argv) {
         oc_secret_free(secret);
         return 0;
     }
-    /* Header label (run_login sets it from the typed instance for the dialog). */
-    if (!g_instance[0]) snprintf(g_instance, sizeof g_instance, "%s", host[0] ? host : "");
+    /* Header label (run_login sets it from the typed workspace for the dialog). */
+    if (!g_workspace[0]) snprintf(g_workspace, sizeof g_workspace, "%s", host[0] ? host : "");
 
     char composer[COMPOSER_CAP];
     size_t clen = 0;

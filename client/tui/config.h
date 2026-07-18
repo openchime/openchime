@@ -15,7 +15,7 @@ typedef struct {
     int  channels_width;     /* Channels panel width, columns */
     int  members_width;      /* Members panel width, columns */
     int  time_24h;           /* 1 = 24-hour timestamps, 0 = 12-hour */
-    char instance[192];      /* default instance to connect to (optional) */
+    char workspace[192];      /* default workspace to connect to (optional) */
 } oc_config;
 
 /* Built-in defaults. */

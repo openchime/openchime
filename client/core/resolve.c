@@ -1,5 +1,5 @@
 /*
- * OpenChime client — instance resolution. See resolve.h.
+ * OpenChime client — workspace resolution. See resolve.h.
  */
 
 #include "resolve.h"
@@ -13,9 +13,9 @@
 #include <stdio.h>
 #include <string.h>
 
-int oc_resolve_domain(const char *instance, const char *suffix, char *out, size_t cap) {
-    if (!instance || !out || cap == 0) return -1;
-    const char *s = instance;
+int oc_resolve_domain(const char *workspace, const char *suffix, char *out, size_t cap) {
+    if (!workspace || !out || cap == 0) return -1;
+    const char *s = workspace;
     while (*s == ' ') s++;                       /* skip leading spaces */
     const char *scheme = strstr(s, "://");       /* strip a leading scheme */
     if (scheme) s = scheme + 3;
@@ -72,11 +72,11 @@ static int srv_lookup(const char *domain, char *host, size_t hostcap, int *port)
     return oc_srv_parse(ans, len, host, hostcap, port);
 }
 
-/* An explicit `:port` on the instance (after any scheme), or 0 if none. Lets a
+/* An explicit `:port` on the workspace (after any scheme), or 0 if none. Lets a
  * user pin a non-standard port, e.g. `chat.acme.com:9000`. */
-static int explicit_port(const char *instance) {
-    if (!instance) return 0;
-    const char *s = instance;
+static int explicit_port(const char *workspace) {
+    if (!workspace) return 0;
+    const char *s = workspace;
     const char *scheme = strstr(s, "://"); if (scheme) s = scheme + 3;
     const char *slash = strchr(s, '/');
     const char *colon = strchr(s, ':');
@@ -99,14 +99,14 @@ static int host_resolves(const char *domain) {
     return 1;
 }
 
-oc_resolve_status oc_resolve(const char *instance, const char *suffix, oc_endpoint *out) {
-    if (!out) return OC_RESOLVE_BAD_INSTANCE;
+oc_resolve_status oc_resolve(const char *workspace, const char *suffix, oc_endpoint *out) {
+    if (!out) return OC_RESOLVE_BAD_WORKSPACE;
     char domain[256];
-    if (oc_resolve_domain(instance, suffix, domain, sizeof domain) != 0)
-        return OC_RESOLVE_BAD_INSTANCE;
+    if (oc_resolve_domain(workspace, suffix, domain, sizeof domain) != 0)
+        return OC_RESOLVE_BAD_WORKSPACE;
 
     /* An explicit `:port` pins host:port directly, skipping SRV. */
-    int xport = explicit_port(instance);
+    int xport = explicit_port(workspace);
     if (xport > 0) {
         if (!host_resolves(domain)) return OC_RESOLVE_NOT_FOUND;
         snprintf(out->host, sizeof out->host, "%s", domain);

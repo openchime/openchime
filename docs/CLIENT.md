@@ -99,7 +99,7 @@ model; translate input to intents }, stop.
   `oc_client` events each iteration and polling input with a short timeout
   (`tb_peek_event`, the "read events at frame start" shape); a wakeup fd on the
   client queue is a later optimization if idle cost ever matters. **Layout (v2,
-  the lazygit/k9s idiom):** a header bar (instance · you · presence · connection ·
+  the lazygit/k9s idiom):** a header bar (workspace · you · presence · connection ·
   unread), three **bordered, titled panels** — Channels │ Messages │ Members
   (the active one drawn in a bright border) — a status line, the always-ready
   composer, and a **context keybinding hint bar**; `?` (or `/help`) opens a full
@@ -123,8 +123,8 @@ model; translate input to intents }, stop.
   select, wheel to scroll) and reads machine-local prefs from
   `~/.config/openchime/config` (`client/tui/config.c`, XDG, created with commented
   defaults on first run): `mouse`, `members_panel` (off/on/auto), panel widths,
-  `time` (12/24h), and a default `instance`. **Layered config:** the portable
-  prefs (everything but `instance`) also sync through the daemon's per-`(user,
+  `time` (12/24h), and a default `workspace`. **Layered config:** the portable
+  prefs (everything but `workspace`) also sync through the daemon's per-`(user,
   client_type)` settings bucket (a `client_settings` key/value table; wire
   `SET_CLIENT_SETTING` / `LIST_CLIENT_SETTINGS` / `CLIENT_SETTINGS`), layered
   *over* the machine-local file — a value in the daemon bucket wins, else the
@@ -136,7 +136,7 @@ model; translate input to intents }, stop.
   `channels-width N`, `members-width N`, `reset <key>`) writes a key, which
   round-trips back and applies live; the daemon fans the change to your other
   logged-in TUIs so they update in place. Which server you connect to
-  (`instance`) is deliberately machine-local and never synced.
+  (`workspace`) is deliberately machine-local and never synced.
   **Composer autocomplete:** as you type, a live suggestion strip offers
   context-aware completions — slash commands, `#channel` and `@user` names (from
   the model's channel list + roster), command arguments (channels for
@@ -223,8 +223,8 @@ arrives with the store phase.
 The core bundles SQLite (`client/core/store.c`) and reuses the daemon's
 migration-runner (`oc_migrate`) with its own client migration set. **Built so
 far:**
-- `instance_state` (one row per `"host:port"`) — the **session token + expiry**
-  (ARCH-58) and the **per-instance TOFU pin** (ARCH-10), so a relaunched client
+- `workspace_state` (one row per `"host:port"`) — the **session token + expiry**
+  (ARCH-58) and the **per-workspace TOFU pin** (ARCH-10), so a relaunched client
   reconnects silently with the token — no password — against the pinned cert.
   **The session token prefers the OS keyring:** the core exposes an abstract
   `oc_secret` get/put/del vtable (`client/core/secret.h`, no keyring library in
@@ -290,20 +290,20 @@ send in the store before delivery, resends the outbox on reconnect, and clears a
 row on its `SEND_ACK` — so an offline-composed send goes out on the next
 connection, deduped by the daemon.
 
-**Instance resolution is built (REQ-010/011,** `client/core/resolve.c`**).** A
-user-typed instance — a self-hosted domain (`chat.acme.com`) or a bare
+**Workspace resolution is built (REQ-010/011,** `client/core/resolve.c`**).** A
+user-typed workspace — a self-hosted domain (`chat.acme.com`) or a bare
 hosted-tier name (`acme`, which gets the configured `$OPENCHIME_SUFFIX`
 appended) — resolves by plain DNS: SRV (`_openchime._tcp.<domain>`) first, then
 the domain's A record at 443. A resolution failure is a distinct status, so the
-TUI tells "instance not found" apart from "could not reach the server" (connect)
-and "auth failed" (login). The TUI accepts `<instance>` (resolved) or a raw
-`<host> <port>` (dev/local); an explicit `:port` on the instance
+TUI tells "workspace not found" apart from "could not reach the server" (connect)
+and "auth failed" (login). The TUI accepts `<workspace>` (resolved) or a raw
+`<host> <port>` (dev/local); an explicit `:port` on the workspace
 (`chat.acme.com:9000`) pins the port and skips SRV. The optional `.well-known`
 metadata half is not consulted yet.
 
 **The local login box is built (REQ-020 local mode).** With no credential and no
-stored session token, the TUI shows a modal **Sign in** dialog — instance /
-username / masked password / *Remember me* — that resolves the instance on submit
+stored session token, the TUI shows a modal **Sign in** dialog — workspace /
+username / masked password / *Remember me* — that resolves the workspace on submit
 (inline "not found"), then connects; an auth failure keeps the box up with the
 reason and refocuses the password to retry. *Remember me* gates whether the
 session token persists (the store) or stays session-only. A returning user with a

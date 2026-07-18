@@ -22,7 +22,7 @@ typedef struct {
     char     email[OC_JWT_MAX_FIELD];
     char     name[OC_JWT_MAX_FIELD];
     char     iss[OC_JWT_MAX_FIELD];    /* the central service */
-    char     aud[OC_JWT_MAX_FIELD];    /* this instance's id */
+    char     aud[OC_JWT_MAX_FIELD];    /* this workspace's id */
     uint64_t exp;                      /* seconds since epoch */
     uint64_t iat;
 } oc_jwt_claims;

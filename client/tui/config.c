@@ -15,7 +15,7 @@ void oc_config_defaults(oc_config *c) {
     c->channels_width = 22;
     c->members_width = 22;
     c->time_24h = 1;
-    c->instance[0] = '\0';
+    c->workspace[0] = '\0';
 }
 
 /* Resolve the config file path into `out`; returns 0 on success. Ensures the
@@ -66,8 +66,8 @@ static void write_defaults(const char *path, const oc_config *c) {
         "# Timestamps: 24h or 12h.\n"
         "time = %s\n"
         "\n"
-        "# Default instance to connect to when none is given on the command line.\n"
-        "# instance = chat.example.com\n",
+        "# Default workspace to connect to when none is given on the command line.\n"
+        "# workspace = chat.example.com\n",
         c->mouse ? "on" : "off",
         c->members_panel == 0 ? "off" : c->members_panel == 1 ? "on" : "auto",
         c->channels_width, c->members_width,
@@ -102,7 +102,10 @@ void oc_config_load(oc_config *c) {
         else if (strcmp(key, "channels_width") == 0) { int n = atoi(val); if (n >= 10 && n <= 60) c->channels_width = n; }
         else if (strcmp(key, "members_width") == 0)  { int n = atoi(val); if (n >= 10 && n <= 60) c->members_width = n; }
         else if (strcmp(key, "time") == 0) c->time_24h = (strcmp(val, "12h") != 0);
-        else if (strcmp(key, "instance") == 0) snprintf(c->instance, sizeof c->instance, "%s", val);
+        /* `instance` is the pre-rename spelling — still accepted so an existing
+         * config file keeps working. */
+        else if (strcmp(key, "workspace") == 0 || strcmp(key, "instance") == 0)
+            snprintf(c->workspace, sizeof c->workspace, "%s", val);
     }
     fclose(f);
 }

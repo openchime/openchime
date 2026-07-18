@@ -17,7 +17,12 @@ void oc_store_set_secret(oc_store *s, oc_secret *secret) {
 }
 
 /* The client migration set (independent of the daemon's OC_MIGRATIONS). One row
- * per server instance holds the reconnect state. */
+ * per workspace holds the reconnect state.
+ *
+ * Migrations are forward-only, so 1-3 keep the historical `instance` spelling
+ * they shipped with; migration 4 renames it to `workspace` everywhere (the term
+ * the whole client now uses). A fresh store runs 1-3 then 4 and lands on the
+ * same schema an upgraded store does. */
 static const oc_migration CLIENT_MIGRATIONS[] = {
     { 1,
       "CREATE TABLE instance_state ("
@@ -48,6 +53,11 @@ static const oc_migration CLIENT_MIGRATIONS[] = {
       "  created      INTEGER,"
       "  PRIMARY KEY (instance, idem)"
       ");" },
+    { 4,
+      "ALTER TABLE instance_state RENAME TO workspace_state;"
+      "ALTER TABLE workspace_state RENAME COLUMN instance TO workspace;"
+      "ALTER TABLE cached_message  RENAME COLUMN instance TO workspace;"
+      "ALTER TABLE outbox          RENAME COLUMN instance TO workspace;" },
 };
 static const int CLIENT_MIGRATIONS_COUNT =
     (int)(sizeof CLIENT_MIGRATIONS / sizeof CLIENT_MIGRATIONS[0]);
@@ -78,14 +88,14 @@ void oc_store_close(oc_store *s) {
     free(s);
 }
 
-/* Upsert one blob/int column pair for `instance`, preserving the other columns
+/* Upsert one blob/int column pair for `workspace`, preserving the other columns
  * (INSERT ... ON CONFLICT DO UPDATE). Used by both save paths. */
-static void upsert(oc_store *s, const char *instance, const char *sql,
+static void upsert(oc_store *s, const char *workspace, const char *sql,
                    const void *blob, int blob_len, int64_t num, int has_num) {
-    if (!s || !s->db || !instance) return;
+    if (!s || !s->db || !workspace) return;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db, sql, -1, &st, NULL) != SQLITE_OK) return;
-    sqlite3_bind_text(st, 1, instance, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 1, workspace, -1, SQLITE_TRANSIENT);
     int col = 2;
     if (blob) sqlite3_bind_blob(st, col++, blob, blob_len, SQLITE_TRANSIENT);
     if (has_num) sqlite3_bind_int64(st, col++, num);
@@ -105,13 +115,13 @@ static uint64_t secret_unpack_expiry(const uint8_t *blob) {
     return e;
 }
 
-int oc_store_load_session(oc_store *s, const char *instance,
+int oc_store_load_session(oc_store *s, const char *workspace,
                           uint8_t token[OC_SESSION_TOKEN_LEN], uint64_t *expiry,
                           uint64_t now_ms) {
-    if (!s || !instance) return 0;
-    if (s->secret) {   /* keyring-backed: one token+expiry blob per instance */
+    if (!s || !workspace) return 0;
+    if (s->secret) {   /* keyring-backed: one token+expiry blob per workspace */
         uint8_t blob[OC_SECRET_BLOB]; size_t got = 0;
-        if (!oc_secret_get(s->secret, instance, blob, sizeof blob, &got) || got != OC_SECRET_BLOB)
+        if (!oc_secret_get(s->secret, workspace, blob, sizeof blob, &got) || got != OC_SECRET_BLOB)
             return 0;
         uint64_t exp = secret_unpack_expiry(blob);
         if (now_ms != 0 && exp != 0 && exp <= now_ms) return 0;   /* expired */
@@ -122,9 +132,9 @@ int oc_store_load_session(oc_store *s, const char *instance,
     if (!s->db) return 0;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db,
-            "SELECT session_token, session_expiry FROM instance_state WHERE instance=?1;",
+            "SELECT session_token, session_expiry FROM workspace_state WHERE workspace=?1;",
             -1, &st, NULL) != SQLITE_OK) return 0;
-    sqlite3_bind_text(st, 1, instance, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 1, workspace, -1, SQLITE_TRANSIENT);
     int found = 0;
     if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) == SQLITE_BLOB &&
         sqlite3_column_bytes(st, 0) == OC_SESSION_TOKEN_LEN) {
@@ -139,41 +149,41 @@ int oc_store_load_session(oc_store *s, const char *instance,
     return found;
 }
 
-void oc_store_save_session(oc_store *s, const char *instance,
+void oc_store_save_session(oc_store *s, const char *workspace,
                            const uint8_t token[OC_SESSION_TOKEN_LEN], uint64_t expiry) {
     if (s && s->secret) {
         uint8_t blob[OC_SECRET_BLOB];
         secret_pack(token, expiry, blob);
-        oc_secret_put(s->secret, instance, blob, sizeof blob);
+        oc_secret_put(s->secret, workspace, blob, sizeof blob);
         return;
     }
-    upsert(s, instance,
-           "INSERT INTO instance_state (instance, session_token, session_expiry) VALUES (?1, ?2, ?3) "
-           "ON CONFLICT(instance) DO UPDATE SET session_token=?2, session_expiry=?3;",
+    upsert(s, workspace,
+           "INSERT INTO workspace_state (workspace, session_token, session_expiry) VALUES (?1, ?2, ?3) "
+           "ON CONFLICT(workspace) DO UPDATE SET session_token=?2, session_expiry=?3;",
            token, OC_SESSION_TOKEN_LEN, (int64_t)expiry, 1);
 }
 
-void oc_store_clear_session(oc_store *s, const char *instance) {
-    if (!s || !instance) return;
-    if (s->secret) { oc_secret_del(s->secret, instance); return; }
+void oc_store_clear_session(oc_store *s, const char *workspace) {
+    if (!s || !workspace) return;
+    if (s->secret) { oc_secret_del(s->secret, workspace); return; }
     if (!s->db) return;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db,
-            "UPDATE instance_state SET session_token=NULL, session_expiry=0 WHERE instance=?1;",
+            "UPDATE workspace_state SET session_token=NULL, session_expiry=0 WHERE workspace=?1;",
             -1, &st, NULL) != SQLITE_OK) return;
-    sqlite3_bind_text(st, 1, instance, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 1, workspace, -1, SQLITE_TRANSIENT);
     sqlite3_step(st);
     sqlite3_finalize(st);
 }
 
-int oc_store_load_pin(oc_store *s, const char *instance,
+int oc_store_load_pin(oc_store *s, const char *workspace,
                       uint8_t pin[OC_TLS_FINGERPRINT_LEN]) {
-    if (!s || !s->db || !instance) return 0;
+    if (!s || !s->db || !workspace) return 0;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db,
-            "SELECT tls_pin FROM instance_state WHERE instance=?1;", -1, &st, NULL) != SQLITE_OK)
+            "SELECT tls_pin FROM workspace_state WHERE workspace=?1;", -1, &st, NULL) != SQLITE_OK)
         return 0;
-    sqlite3_bind_text(st, 1, instance, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 1, workspace, -1, SQLITE_TRANSIENT);
     int found = 0;
     if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) == SQLITE_BLOB &&
         sqlite3_column_bytes(st, 0) == OC_TLS_FINGERPRINT_LEN) {
@@ -184,28 +194,28 @@ int oc_store_load_pin(oc_store *s, const char *instance,
     return found;
 }
 
-void oc_store_save_pin(oc_store *s, const char *instance,
+void oc_store_save_pin(oc_store *s, const char *workspace,
                        const uint8_t pin[OC_TLS_FINGERPRINT_LEN]) {
-    upsert(s, instance,
-           "INSERT INTO instance_state (instance, tls_pin) VALUES (?1, ?2) "
-           "ON CONFLICT(instance) DO UPDATE SET tls_pin=?2;",
+    upsert(s, workspace,
+           "INSERT INTO workspace_state (workspace, tls_pin) VALUES (?1, ?2) "
+           "ON CONFLICT(workspace) DO UPDATE SET tls_pin=?2;",
            pin, OC_TLS_FINGERPRINT_LEN, 0, 0);
 }
 
-void oc_store_save_message(oc_store *s, const char *instance, uint64_t channel_id,
+void oc_store_save_message(oc_store *s, const char *workspace, uint64_t channel_id,
                            uint64_t message_id, uint64_t author_id,
                            const char *author_name, uint64_t server_time,
                            const char *body, int edited, int deleted) {
-    if (!s || !s->db || !instance || !message_id) return;
+    if (!s || !s->db || !workspace || !message_id) return;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db,
             "INSERT INTO cached_message "
-            "(instance, channel_id, message_id, author_id, author_name, server_time, body, edited, deleted) "
+            "(workspace, channel_id, message_id, author_id, author_name, server_time, body, edited, deleted) "
             "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) "
-            "ON CONFLICT(instance, message_id) DO UPDATE SET "
+            "ON CONFLICT(workspace, message_id) DO UPDATE SET "
             "  channel_id=?2, author_id=?4, author_name=?5, server_time=?6, body=?7, edited=?8, deleted=?9;",
             -1, &st, NULL) != SQLITE_OK) return;
-    sqlite3_bind_text(st, 1, instance, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 1, workspace, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, (int64_t)channel_id);
     sqlite3_bind_int64(st, 3, (int64_t)message_id);
     sqlite3_bind_int64(st, 4, (int64_t)author_id);
@@ -219,14 +229,14 @@ void oc_store_save_message(oc_store *s, const char *instance, uint64_t channel_i
     sqlite3_finalize(st);
 }
 
-void oc_store_edit_message(oc_store *s, const char *instance, uint64_t message_id,
+void oc_store_edit_message(oc_store *s, const char *workspace, uint64_t message_id,
                            const char *body) {
-    if (!s || !s->db || !instance) return;
+    if (!s || !s->db || !workspace) return;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db,
-            "UPDATE cached_message SET body=?3, edited=1 WHERE instance=?1 AND message_id=?2;",
+            "UPDATE cached_message SET body=?3, edited=1 WHERE workspace=?1 AND message_id=?2;",
             -1, &st, NULL) != SQLITE_OK) return;
-    sqlite3_bind_text(st, 1, instance, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 1, workspace, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, (int64_t)message_id);
     if (body) sqlite3_bind_text(st, 3, body, -1, SQLITE_TRANSIENT);
     else      sqlite3_bind_null(st, 3);
@@ -234,27 +244,27 @@ void oc_store_edit_message(oc_store *s, const char *instance, uint64_t message_i
     sqlite3_finalize(st);
 }
 
-void oc_store_delete_message(oc_store *s, const char *instance, uint64_t message_id) {
-    if (!s || !s->db || !instance) return;
+void oc_store_delete_message(oc_store *s, const char *workspace, uint64_t message_id) {
+    if (!s || !s->db || !workspace) return;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db,
-            "UPDATE cached_message SET body=NULL, deleted=1 WHERE instance=?1 AND message_id=?2;",
+            "UPDATE cached_message SET body=NULL, deleted=1 WHERE workspace=?1 AND message_id=?2;",
             -1, &st, NULL) != SQLITE_OK) return;
-    sqlite3_bind_text(st, 1, instance, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 1, workspace, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, (int64_t)message_id);
     sqlite3_step(st);
     sqlite3_finalize(st);
 }
 
-void oc_store_each_message(oc_store *s, const char *instance,
+void oc_store_each_message(oc_store *s, const char *workspace,
                            oc_store_msg_cb cb, void *ctx) {
-    if (!s || !s->db || !instance || !cb) return;
+    if (!s || !s->db || !workspace || !cb) return;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db,
             "SELECT channel_id, message_id, author_id, author_name, server_time, body, edited, deleted "
-            "FROM cached_message WHERE instance=?1 ORDER BY message_id ASC;",
+            "FROM cached_message WHERE workspace=?1 ORDER BY message_id ASC;",
             -1, &st, NULL) != SQLITE_OK) return;
-    sqlite3_bind_text(st, 1, instance, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 1, workspace, -1, SQLITE_TRANSIENT);
     while (sqlite3_step(st) == SQLITE_ROW) {
         const char *body = (const char *)sqlite3_column_text(st, 5);   /* NULL if deleted */
         cb(ctx,
@@ -270,17 +280,17 @@ void oc_store_each_message(oc_store *s, const char *instance,
     sqlite3_finalize(st);
 }
 
-void oc_store_outbox_add(oc_store *s, const char *instance,
+void oc_store_outbox_add(oc_store *s, const char *workspace,
                          const uint8_t idem[OC_IDEM_SIZE], uint64_t channel_id,
                          const char *body) {
-    if (!s || !s->db || !instance) return;
+    if (!s || !s->db || !workspace) return;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db,
-            "INSERT INTO outbox (instance, idem, channel_id, body, created) "
+            "INSERT INTO outbox (workspace, idem, channel_id, body, created) "
             "VALUES (?1, ?2, ?3, ?4, strftime('%s','now')) "
-            "ON CONFLICT(instance, idem) DO NOTHING;",
+            "ON CONFLICT(workspace, idem) DO NOTHING;",
             -1, &st, NULL) != SQLITE_OK) return;
-    sqlite3_bind_text(st, 1, instance, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 1, workspace, -1, SQLITE_TRANSIENT);
     sqlite3_bind_blob(st, 2, idem, OC_IDEM_SIZE, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 3, (int64_t)channel_id);
     sqlite3_bind_text(st, 4, body ? body : "", -1, SQLITE_TRANSIENT);
@@ -288,26 +298,26 @@ void oc_store_outbox_add(oc_store *s, const char *instance,
     sqlite3_finalize(st);
 }
 
-void oc_store_outbox_remove(oc_store *s, const char *instance,
+void oc_store_outbox_remove(oc_store *s, const char *workspace,
                             const uint8_t idem[OC_IDEM_SIZE]) {
-    if (!s || !s->db || !instance) return;
+    if (!s || !s->db || !workspace) return;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db,
-            "DELETE FROM outbox WHERE instance=?1 AND idem=?2;", -1, &st, NULL) != SQLITE_OK) return;
-    sqlite3_bind_text(st, 1, instance, -1, SQLITE_TRANSIENT);
+            "DELETE FROM outbox WHERE workspace=?1 AND idem=?2;", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(st, 1, workspace, -1, SQLITE_TRANSIENT);
     sqlite3_bind_blob(st, 2, idem, OC_IDEM_SIZE, SQLITE_TRANSIENT);
     sqlite3_step(st);
     sqlite3_finalize(st);
 }
 
-void oc_store_outbox_each(oc_store *s, const char *instance,
+void oc_store_outbox_each(oc_store *s, const char *workspace,
                           oc_store_outbox_cb cb, void *ctx) {
-    if (!s || !s->db || !instance || !cb) return;
+    if (!s || !s->db || !workspace || !cb) return;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db,
-            "SELECT idem, channel_id, body FROM outbox WHERE instance=?1 ORDER BY created ASC, rowid ASC;",
+            "SELECT idem, channel_id, body FROM outbox WHERE workspace=?1 ORDER BY created ASC, rowid ASC;",
             -1, &st, NULL) != SQLITE_OK) return;
-    sqlite3_bind_text(st, 1, instance, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 1, workspace, -1, SQLITE_TRANSIENT);
     while (sqlite3_step(st) == SQLITE_ROW) {
         if (sqlite3_column_bytes(st, 0) != OC_IDEM_SIZE) continue;
         cb(ctx, (const uint8_t *)sqlite3_column_blob(st, 0),

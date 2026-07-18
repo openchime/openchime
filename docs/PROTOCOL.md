@@ -236,7 +236,7 @@ so the client presents the right login UI.
 | Field         | Type | Notes                                                          |
 |---------------|------|----------------------------------------------------------------|
 | `methods`     | u8   | Bitset of accepted methods: `0x01` local, `0x02` oidc, `0x04` session (reconnect is always accepted alongside the primary mode). |
-| `oidc_params` | str  | Empty unless `oidc` is offered; otherwise a small opaque blob the client passes to its OIDC helper (central authorize URL/`client_id`, this instance's `audience`). Ignorable by clients that only reconnect. |
+| `oidc_params` | str  | Empty unless `oidc` is offered; otherwise a small opaque blob the client passes to its OIDC helper (central authorize URL/`client_id`, this workspace's `audience`). Ignorable by clients that only reconnect. |
 
 ### 4.2 `AUTH` (client → server), msg_type `0x0010`
 
