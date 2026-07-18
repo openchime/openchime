@@ -106,8 +106,12 @@ model; translate input to intents }, stop.
   help overlay. Read-only overlays (thread, search, roster, who-reacted,
   notification prefs, webhooks) render inside the Messages panel. Everything is
   drawn cell-by-cell, re-laid-out on resize, measuring glyph width with utf8proc.
-  Increment 1 (the shell) keeps the modeless composer + `/`-commands; a message
-  navigation mode with single-key actions and a `:` command palette follow.
+  **Navigation mode** (Esc from the composer, or Tab on an empty composer): a
+  panel is focused (bright border); Tab cycles Channels / Messages / Members,
+  j/k move a highlighted selection, Esc returns to the composer. On the Messages
+  panel single keys act on the *selected* message — Enter/`t` thread, `r` react
+  (👍; the picker comes later), `e` edit (prefills the composer), `x` delete,
+  `w` who-reacted; on Members, Enter opens a DM. A `:` command palette follows.
   **Composer autocomplete:** as you type, a live suggestion strip offers
   context-aware completions — slash commands, `#channel` and `@user` names (from
   the model's channel list + roster), command arguments (channels for

@@ -12,10 +12,14 @@
  *        (credentials also read from $OPENCHIME_CRED = "user:pass")
  *
  * Keys: type + Enter to send · Tab autocompletes the trailing token (commands,
- *       #channels, @users, :emoji:) or switches channel when the composer is
- *       empty · ↑/↓ + PgUp/PgDn scroll · ? help · Ctrl-Q quit. A live suggestion
- *       strip shows candidates as you type. Commands (on the last message in the
- *       focused channel):
+ *       #channels, @users, :emoji:) or, on an empty composer, enters navigation
+ *       mode · ↑/↓ + PgUp/PgDn scroll · ? help · Ctrl-Q quit. **Navigation mode**
+ *       (Esc from the composer): a panel is focused — Tab cycles Channels /
+ *       Messages / Members, j/k select, Esc returns to the composer. On the
+ *       Messages panel single keys act on the selected message: Enter/t thread ·
+ *       r react (👍) · e edit · x delete · w who-reacted. Members: Enter opens a
+ *       DM. A live autocomplete strip shows candidates as you type. Commands (on
+ *       the last message in the focused channel):
  *       /react <emoji> · /reactions (who reacted to it) · /edit <text> ·
  *       /delete · /thread (open its thread; then Enter posts a reply) ·
  *       /search <query> · /close (leave a thread/search/roster/reactions
@@ -93,7 +97,7 @@ static void fill_row(int y, int x0, int x1, uintattr_t bg) {
 
 /* ---- a rebuilt-each-frame list of wrapped display rows for the message pane -- */
 
-typedef struct { char *s; uintattr_t fg; } row_t;
+typedef struct { char *s; uintattr_t fg; int mi; } row_t;   /* mi = message index (-1 = none) */
 typedef struct { row_t *v; size_t n, cap; } rows_t;
 
 static void rows_push(rows_t *r, char *s, uintattr_t fg) {
@@ -103,7 +107,7 @@ static void rows_push(rows_t *r, char *s, uintattr_t fg) {
         if (!nv) { free(s); return; }
         r->v = nv; r->cap = cap;
     }
-    r->v[r->n].s = s; r->v[r->n].fg = fg; r->n++;
+    r->v[r->n].s = s; r->v[r->n].fg = fg; r->v[r->n].mi = -1; r->n++;
 }
 static void rows_free(rows_t *r) {
     for (size_t i = 0; i < r->n; i++) free(r->v[i].s);
@@ -161,7 +165,8 @@ static void msg_nick(char *out, size_t cap, const oc_msg *m, uint64_t me, const 
  * reactions, and — when `show_replies` — a thread reply-count marker. `ch` is
  * used only to resolve author names. */
 static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
-                            const oc_channel *ch, int show_replies) {
+                            const oc_channel *ch, int show_replies, int mi) {
+    size_t rstart = r->n;
     char line[256], nick[80];
     char stamp[8] = "--:--";
     if (m->server_time) {
@@ -180,6 +185,7 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
     if (m->deleted) {                     /* tombstone: no body, no reactions */
         char *d = malloc(sizeof "    [message deleted]");
         if (d) { strcpy(d, "    [message deleted]"); rows_push(r, d, TB_DEFAULT); }
+        for (size_t k = rstart; k < r->n; k++) r->v[k].mi = mi;
         return;
     }
     wrap_push(r, m->body ? m->body : "", TB_DEFAULT, width, 4);
@@ -218,12 +224,13 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
         char *rr = malloc(strlen(rl) + 1);
         if (rr) { strcpy(rr, rl); rows_push(r, rr, TB_CYAN); }
     }
+    for (size_t k = rstart; k < r->n; k++) r->v[k].mi = mi;   /* tag rows with the message */
 }
 
 /* Build the wrapped rows for a channel's messages (oldest→newest). */
 static void build_rows(rows_t *r, const oc_channel *ch, uint64_t me, int width) {
     for (size_t i = 0; i < ch->n_msgs; i++)
-        append_msg_rows(r, &ch->msgs[i], me, width, ch, 1);
+        append_msg_rows(r, &ch->msgs[i], me, width, ch, 1, (int)i);
 }
 
 /* Build the rows for the open thread: the parent (found in `ch`) then replies. */
@@ -231,11 +238,11 @@ static void build_thread_rows(rows_t *r, const oc_model *m, const oc_channel *ch
                               uint64_t me, int width) {
     if (ch) for (size_t i = 0; i < ch->n_msgs; i++)
         if (ch->msgs[i].message_id == m->thread_parent) {
-            append_msg_rows(r, &ch->msgs[i], me, width, ch, 0);
+            append_msg_rows(r, &ch->msgs[i], me, width, ch, 0, -1);
             break;
         }
     for (size_t i = 0; i < m->n_thread_msgs; i++)
-        append_msg_rows(r, &m->thread_msgs[i], me, width, ch, 0);
+        append_msg_rows(r, &m->thread_msgs[i], me, width, ch, 0, -1);
 }
 
 /* ---- rendering ------------------------------------------------------------- */
@@ -565,8 +572,10 @@ static int ac_candidates(const oc_model *m, const char *s, ac_cand *out, int max
 }
 
 static void render(oc_client *cl, size_t focus, const char *composer,
-                   size_t clen, int scroll, int help_open, int ac_idx) {
+                   size_t clen, int scroll, int help_open, int ac_idx,
+                   int panel, int msg_sel, int mem_sel, uint64_t editing) {
     const oc_model *m = oc_client_model(cl);
+    int ch_act = (panel == 1), msg_act = (panel == 0 || panel == 2), mem_act = (panel == 3);
     int W = tb_width(), H = tb_height();
     tb_clear();
     if (W < 24 || H < 8) { draw_clip(0, 0, W, " terminal too small ", TB_RED | TB_BOLD, TB_DEFAULT); tb_present(); return; }
@@ -598,7 +607,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     int msg_x = ch_w, msg_w = W - ch_w - mem_w;
 
     /* Channels panel. */
-    draw_panel(0, panels_top, ch_w, panels_h, "Channels", 0);
+    draw_panel(0, panels_top, ch_w, panels_h, "Channels", ch_act);
     for (size_t i = 0, iy = panels_top + 1; i < m->n_channels && (int)iy < panels_top + panels_h - 1; i++, iy++) {
         const oc_channel *c = &m->channels[i];
         int sel = (i == focus);
@@ -631,10 +640,11 @@ static void render(oc_client *cl, size_t focus, const char *composer,
         snprintf(mt, sizeof mt, "@%s", pn[0] ? pn : "dm");
     } else if (fc)               snprintf(mt, sizeof mt, "#%s", fc->name ? fc->name : "…");
     else                         snprintf(mt, sizeof mt, "no channel");
-    draw_panel(msg_x, panels_top, msg_w, panels_h, mt, 1);
+    draw_panel(msg_x, panels_top, msg_w, panels_h, mt, msg_act);
     {
         int ix = msg_x + 1, iy = panels_top + 1, iw = msg_w - 2, ih = panels_h - 2;
-        if (ih > 0 && (fc || m->thread_open || m->search_open || m->roster_open || m->reactlist_open || m->prefs_open || m->weblist_open)) {
+        int normal = !(m->thread_open || m->search_open || m->roster_open || m->reactlist_open || m->prefs_open || m->weblist_open);
+        if (ih > 0 && (fc || !normal)) {
             rows_t rows = {0};
             if (m->roster_open)         build_roster_rows(&rows, m, iw);
             else if (m->search_open)    build_search_rows(&rows, m, iw);
@@ -643,14 +653,27 @@ static void render(oc_client *cl, size_t focus, const char *composer,
             else if (m->weblist_open)   build_webhooks_rows(&rows, m, iw);
             else if (m->thread_open)    build_thread_rows(&rows, m, fc, m->user_id, iw);
             else                        build_rows(&rows, fc, m->user_id, iw);
-            int total = (int)rows.n, end = total - scroll;
-            if (end > total) end = total;
-            if (end < 0) end = 0;
+            int total = (int)rows.n, end;
+            if (panel == 2 && normal && msg_sel >= 0) {   /* keep the selection visible */
+                int last = -1;
+                for (int i = 0; i < total; i++) if (rows.v[i].mi == msg_sel) last = i;
+                end = (last < 0) ? total : last + 1;
+                if (end < ih) end = ih;
+                if (end > total) end = total;
+            } else {
+                end = total - scroll;
+                if (end > total) end = total;
+                if (end < 0) end = 0;
+            }
             int start = end - ih;
             if (start < 0) start = 0;
             int y = iy + (ih - (end - start));
-            for (int i = start; i < end; i++, y++)
-                draw_clip(ix, y, ix + iw, rows.v[i].s, rows.v[i].fg, TB_DEFAULT);
+            for (int i = start; i < end; i++, y++) {
+                int selrow = (panel == 2 && normal && rows.v[i].mi >= 0 && rows.v[i].mi == msg_sel);
+                uintattr_t bg = selrow ? TB_BLUE : TB_DEFAULT;
+                if (selrow) fill_row(y, ix, ix + iw, bg);
+                draw_clip(ix, y, ix + iw, rows.v[i].s, selrow ? (TB_WHITE | TB_BOLD) : rows.v[i].fg, bg);
+            }
             rows_free(&rows);
         }
     }
@@ -658,16 +681,20 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     /* Members panel (roster + presence), on wide terminals. */
     if (mem_w) {
         int mx = msg_x + msg_w;
-        draw_panel(mx, panels_top, mem_w, panels_h, "Members", 0);
+        draw_panel(mx, panels_top, mem_w, panels_h, "Members", mem_act);
         for (size_t i = 0, iy = panels_top + 1; i < m->n_users && (int)iy < panels_top + panels_h - 1; i++, iy++) {
             const oc_member *u = &m->users[i];
             uint8_t p = oc_model_presence_of(m, u->user_id);
             const char *d = p == OC_PRESENCE_ONLINE ? "\xe2\x97\x8f" : p == OC_PRESENCE_AWAY ? "\xe2\x97\x90" : "\xe2\x97\x8b";
-            uintattr_t col = u->disabled ? (TB_BLACK | TB_BOLD)
+            int sel = (mem_act && (int)i == mem_sel);
+            uintattr_t bg = sel ? TB_BLUE : TB_DEFAULT;
+            uintattr_t col = sel ? (TB_WHITE | TB_BOLD)
+                           : u->disabled ? (TB_BLACK | TB_BOLD)
                            : p == OC_PRESENCE_ONLINE ? TB_GREEN : p == OC_PRESENCE_AWAY ? TB_YELLOW : TB_DEFAULT;
             const char *role = u->role == OC_ROLE_OWNER ? " *" : u->role == OC_ROLE_ADMIN ? " +" : "";
             char line[80]; snprintf(line, sizeof line, "%s %s%s", d, u->name[0] ? u->name : "?", role);
-            draw_clip(mx + 1, (int)iy, mx + mem_w - 1, line, col, TB_DEFAULT);
+            if (sel) fill_row((int)iy, mx + 1, mx + mem_w - 1, bg);
+            draw_clip(mx + 1, (int)iy, mx + mem_w - 1, line, col, bg);
         }
     }
 
@@ -703,16 +730,20 @@ static void render(oc_client *cl, size_t focus, const char *composer,
         }
     }
 
-    /* Composer (row H-2). */
+    /* Composer (row H-2). Editing an existing message shows a distinct prompt. */
     fill_row(H - 2, 0, W, TB_DEFAULT);
-    int cx = draw_clip(0, H - 2, W, "\xe2\x80\xba ", TB_GREEN | TB_BOLD, TB_DEFAULT);   /* › prompt */
+    int cx = editing ? draw_clip(0, H - 2, W, "\xe2\x9c\x8e edit \xe2\x80\xba ", TB_YELLOW | TB_BOLD, TB_DEFAULT)
+                     : draw_clip(0, H - 2, W, "\xe2\x80\xba ", TB_GREEN | TB_BOLD, TB_DEFAULT);   /* › */
     cx = draw_clip(cx, H - 2, W, composer, TB_DEFAULT, TB_DEFAULT);
     if (cx < W) tb_set_cell(cx, H - 2, ' ', TB_DEFAULT, TB_REVERSE);   /* cursor */
 
-    /* Keybinding hint bar (row H-1). */
-    const char *hint = help_open
-        ? " press ? or Esc to close help "
-        : " Tab: channel   \xe2\x86\x91\xe2\x86\x93: scroll   Enter: send   /: command   ?: help   ^Q: quit ";
+    /* Context keybinding hint bar (row H-1), per focused panel. */
+    const char *hint;
+    if (help_open)        hint = " press ? or Esc to close help ";
+    else if (panel == 1)  hint = " Channels  ·  j/k select  ·  Enter open  ·  Tab panel  ·  Esc composer ";
+    else if (panel == 2)  hint = " Messages  ·  j/k select  ·  Enter/t thread  r react  e edit  x delete  w reactions  ·  Tab panel  ·  Esc composer ";
+    else if (panel == 3)  hint = " Members  ·  j/k select  ·  Enter DM  ·  Tab panel  ·  Esc composer ";
+    else                  hint = " Enter: send   Tab: complete   Esc: navigate   /: command   ?: help   ^Q: quit ";
     fill_row(H - 1, 0, W, TB_BLACK | TB_BOLD);
     draw_clip(0, H - 1, W, hint, TB_WHITE, TB_BLACK | TB_BOLD);
 
@@ -1206,6 +1237,9 @@ int main(int argc, char **argv) {
     int scroll = 0;
     int help_open = 0;
     int ac_idx = 0;                           /* autocomplete cycle index */
+    int panel = 0;                            /* 0 composer · 1 channels · 2 messages · 3 members */
+    int msg_sel = -1, mem_sel = 0;            /* selection within the messages / members panel */
+    uint64_t editing = 0;                     /* message id being edited (0 = none) */
     uint64_t last_focus_cid = 0;
     time_t last_typing = 0;                   /* throttle outbound TYPING signals */
     int running = 1, logging_out = 0;
@@ -1223,10 +1257,10 @@ int main(int argc, char **argv) {
             uint64_t cid = m->channels[focus].channel_id;
             oc_client_backfill(cl, cid);
             oc_client_mark_read(cl, cid);
-            if (cid != last_focus_cid) { scroll = 0; last_focus_cid = cid; }
+            if (cid != last_focus_cid) { scroll = 0; msg_sel = -1; last_focus_cid = cid; }
         }
 
-        render(cl, focus, composer, clen, scroll, help_open, ac_idx);
+        render(cl, focus, composer, clen, scroll, help_open, ac_idx, panel, msg_sel, mem_sel, editing);
 
         struct tb_event ev;
         int rc = tb_peek_event(&ev, 30);
@@ -1241,10 +1275,73 @@ int main(int argc, char **argv) {
             continue;
         }
         if (ev.key != TB_KEY_TAB) ac_idx = 0;  /* any non-Tab key restarts cycling */
+
+        /* ---- navigation mode (a panel is focused; single keys act) ---- */
+        if (panel != 0) {
+            const oc_model *mm = oc_client_model(cl);
+            const oc_channel *ch = (focus < mm->n_channels) ? &mm->channels[focus] : NULL;
+            uint64_t cid = ch ? ch->channel_id : 0;
+            int up   = (ev.ch == 'k' || ev.key == TB_KEY_ARROW_UP);
+            int down = (ev.ch == 'j' || ev.key == TB_KEY_ARROW_DOWN);
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) { running = 0; }
+            else if (ev.key == TB_KEY_ESC || ev.ch == 'i') { panel = 0; }   /* back to composing */
+            else if (ev.key == TB_KEY_TAB) {                                /* cycle panels 1→2→3 */
+                panel = (panel == 1) ? 2 : (panel == 2) ? 3 : 1;
+                if (panel == 2 && ch && (msg_sel < 0 || msg_sel >= (int)ch->n_msgs))
+                    msg_sel = ch->n_msgs ? (int)ch->n_msgs - 1 : -1;
+                if (panel == 3 && mem_sel >= (int)mm->n_users)
+                    mem_sel = mm->n_users ? (int)mm->n_users - 1 : 0;
+            }
+            else if (panel == 1) {                                          /* channels */
+                if (up && focus > 0) focus--;
+                else if (down && focus + 1 < mm->n_channels) focus++;
+                else if (ev.key == TB_KEY_ENTER) panel = 0;   /* it's already focused; compose */
+            }
+            else if (panel == 3) {                                          /* members */
+                if (up && mem_sel > 0) mem_sel--;
+                else if (down && mem_sel + 1 < (int)mm->n_users) mem_sel++;
+                else if (ev.key == TB_KEY_ENTER && mem_sel < (int)mm->n_users) {
+                    oc_client_open_dm(cl, mm->users[mem_sel].user_id); panel = 0;
+                }
+            }
+            else if (panel == 2 && ch) {                                    /* messages */
+                int n = (int)ch->n_msgs;
+                if (up)        { if (msg_sel > 0) msg_sel--; }
+                else if (down) { if (msg_sel + 1 < n) msg_sel++; }
+                else if (msg_sel >= 0 && msg_sel < n) {
+                    const oc_msg *sel = &ch->msgs[msg_sel];
+                    uint64_t mid = sel->message_id;
+                    int own = (sel->author_id == mm->user_id) && !sel->deleted;
+                    if (ev.key == TB_KEY_ENTER || ev.ch == 't') oc_client_open_thread(cl, cid, mid);
+                    else if (ev.ch == 'w') oc_client_list_reactions(cl, cid, mid);
+                    else if ((ev.ch == 'x' || ev.ch == 'd') && own) oc_client_delete(cl, cid, mid);
+                    else if (ev.ch == 'r' && !sel->deleted) {   /* quick 👍 toggle (picker: incr 4) */
+                        int mine = 0;
+                        for (uint8_t z = 0; z < sel->n_reactions; z++)
+                            if (strcmp(sel->reactions[z].emoji, "\xf0\x9f\x91\x8d") == 0 && sel->reactions[z].mine) mine = 1;
+                        oc_client_react(cl, cid, mid, "\xf0\x9f\x91\x8d", mine ? 0 : 1);
+                    }
+                    else if (ev.ch == 'e' && own) {             /* edit: prefill + drop to composer */
+                        editing = mid;
+                        snprintf(composer, sizeof composer, "%s", sel->body ? sel->body : "");
+                        clen = strlen(composer);
+                        panel = 0;
+                    }
+                }
+            }
+            continue;
+        }
+
         if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) {
             running = 0;
+        } else if (ev.key == TB_KEY_ESC) {    /* composer → navigation mode */
+            if (editing) { editing = 0; composer[0] = '\0'; clen = 0; }
+            else { panel = 2; if (focus < nch) msg_sel = m->channels[focus].n_msgs ? (int)m->channels[focus].n_msgs - 1 : -1; }
         } else if (ev.key == TB_KEY_ENTER) {
-            if (clen > 0 && focus < nch) {
+            if (editing) {                     /* apply the edit (or cancel if emptied) */
+                if (clen > 0 && focus < nch) oc_client_edit(cl, m->channels[focus].channel_id, editing, composer);
+                editing = 0; clen = 0; composer[0] = '\0'; scroll = 0;
+            } else if (clen > 0 && focus < nch) {
                 const oc_model *mm = oc_client_model(cl);
                 uint64_t cid = mm->channels[focus].channel_id;
                 if (strcmp(composer, "/help") == 0)           { help_open = 1; }
@@ -1268,8 +1365,9 @@ int main(int argc, char **argv) {
                     if (k > 0 && k < (int)sizeof nb) { memcpy(composer, nb, (size_t)k + 1); clen = (size_t)k; }
                     ac_idx++;
                 }
-            } else if (nch) {                  /* empty composer: switch channel */
-                focus = (focus + 1) % nch;
+            } else {                           /* empty composer: enter navigation mode */
+                panel = 2;
+                if (focus < nch) msg_sel = m->channels[focus].n_msgs ? (int)m->channels[focus].n_msgs - 1 : -1;
             }
         } else if (ev.key == TB_KEY_ARROW_UP) {
             scroll += 1;
