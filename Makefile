@@ -66,7 +66,7 @@ test: $(TEST_BIN)
 
 $(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(HDRS) $(wildcard tests/*.h client/core/*.h) $(MBEDTLS_A) | build
 	$(CC) $(CFLAGS) -O0 -g $(INC) $(CORE_INC) -Itests \
-	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MBEDTLS_LIBS) -lsqlite3 -lpthread -o $@
+	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MBEDTLS_LIBS) -lsqlite3 -lresolv -lpthread -o $@
 
 # Black-box end-to-end integration against the containerized daemon (compose).
 integration: build/e2e_client
@@ -99,7 +99,7 @@ tui: $(TUI_BIN)
 $(TUI_BIN): $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) \
             $(wildcard client/tui/*.h client/core/*.h shared/*.h) $(MBEDTLS_A) | build
 	$(CC) $(CFLAGS) -Wno-unused-result $(INC) $(TUI_INC) \
-	    $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(UTF8PROC) $(MBEDTLS_LIBS) -lsqlite3 -lpthread -o $@
+	    $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(UTF8PROC) $(MBEDTLS_LIBS) -lsqlite3 -lresolv -lpthread -o $@
 
 build:
 	mkdir -p build

@@ -9,6 +9,7 @@
 #include "client.h"     /* the core facade under test */
 #include "model.h"
 #include "store.h"       /* to assert the persisted token/pin */
+#include "resolve.h"     /* instance resolution (REQ-010/011) */
 
 #include "netloop.h"
 #include "dbwriter.h"
@@ -205,8 +206,47 @@ static int file_matches(const char *path, const unsigned char *data, size_t len)
     return ok && off == len;
 }
 
+/* Instance resolution (REQ-010/011). The pure pieces are tested here without
+ * live DNS: normalization and the SRV-answer parser (fed a canned wire response).
+ * A minimal DNS reply for `_openchime._tcp.acme.com` -> `srv.acme.com:8443`
+ * (priority 10, weight 5), the answer name a compression pointer to the query. */
+static const unsigned char SRV_ANSWER[] = {
+    0x12,0x34, 0x81,0x80, 0x00,0x01, 0x00,0x01, 0x00,0x00, 0x00,0x00,   /* header */
+    0x0a,'_','o','p','e','n','c','h','i','m','e', 0x04,'_','t','c','p',   /* qname */
+    0x04,'a','c','m','e', 0x03,'c','o','m', 0x00,
+    0x00,0x21, 0x00,0x01,                                                /* qtype SRV, qclass IN */
+    0xc0,0x0c,                                                           /* answer name -> qname */
+    0x00,0x21, 0x00,0x01, 0x00,0x00,0x01,0x2c, 0x00,0x14,                /* SRV, IN, ttl 300, rdlen 20 */
+    0x00,0x0a, 0x00,0x05, 0x20,0xfb,                                     /* prio 10, weight 5, port 8443 */
+    0x03,'s','r','v', 0x04,'a','c','m','e', 0x03,'c','o','m', 0x00       /* target srv.acme.com */
+};
+
+static void test_resolve(void) {
+    char d[256];
+    /* Bare name gets the suffix; a dotted name passes through; no suffix = as-is. */
+    CHECK(oc_resolve_domain("acme", "openchime.example", d, sizeof d) == 0 &&
+          strcmp(d, "acme.openchime.example") == 0);
+    CHECK(oc_resolve_domain("chat.acme.com", "openchime.example", d, sizeof d) == 0 &&
+          strcmp(d, "chat.acme.com") == 0);
+    CHECK(oc_resolve_domain("acme", NULL, d, sizeof d) == 0 && strcmp(d, "acme") == 0);
+    /* A scheme and :port are stripped. */
+    CHECK(oc_resolve_domain("openchime://chat.acme.com:8443", "x", d, sizeof d) == 0 &&
+          strcmp(d, "chat.acme.com") == 0);
+    /* Empty instance is rejected distinctly. */
+    CHECK(oc_resolve_domain("", "x", d, sizeof d) == -1);
+    oc_endpoint ep;
+    CHECK(oc_resolve("", NULL, &ep) == OC_RESOLVE_BAD_INSTANCE);
+
+    /* The SRV parser picks the target host + port out of the wire answer. */
+    char host[256]; int port = 0;
+    CHECK(oc_srv_parse(SRV_ANSWER, (int)sizeof SRV_ANSWER, host, sizeof host, &port) == 0);
+    CHECK(strcmp(host, "srv.acme.com") == 0 && port == 8443);
+}
+
 int run_client_core_tests(void) {
-    printf("test_client_core: connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, persisted store, cached history, session reconnect, offline outbox\n");
+    printf("test_client_core: resolve, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, persisted store, cached history, session reconnect, offline outbox\n");
+
+    test_resolve();
 
     /* The daemon opens its blob store at netloop startup; point it at a build-local
      * dir (the /data/blobs default isn't writable in the test sandbox), matching

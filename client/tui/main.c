@@ -32,6 +32,7 @@
 
 #include "client.h"
 #include "model.h"
+#include "resolve.h"    /* instance -> host:port (REQ-010/011) */
 #include "protocol.h"   /* OC_PRESENCE_* */
 
 #include <locale.h>
@@ -722,9 +723,16 @@ static const char *resolve_store_path(void) {
     return path;
 }
 
+static int all_digits(const char *s) {
+    if (!s || !*s) return 0;
+    for (; *s; s++) if (*s < '0' || *s > '9') return 0;
+    return 1;
+}
+
 int main(int argc, char **argv) {
-    if (argc < 3) {
-        fprintf(stderr, "usage: %s <host> <port> [user:pass]\n", argv[0]);
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <instance> [user:pass]\n"
+                        "       %s <host> <port> [user:pass]\n", argv[0], argv[0]);
         return 2;
     }
     /* Adopt the environment's locale so termbox2's iswprint() check recognizes
@@ -732,9 +740,31 @@ int main(int argc, char **argv) {
      * wide glyph as U+FFFD, defeating the whole point of utf8proc. */
     setlocale(LC_ALL, "");
 
-    const char *host = argv[1];
-    int port = atoi(argv[2]);
-    const char *cred = argc > 3 ? argv[3] : getenv("OPENCHIME_CRED");
+    /* Two invocations: a raw "<host> <port>" (dev/local, when argv[2] is a port
+     * number), or a single "<instance>" resolved to host:port by DNS (REQ-010).
+     * A resolution failure is reported distinctly from connect/auth failure. */
+    char host[256];
+    int port;
+    const char *cred;
+    if (argc >= 3 && all_digits(argv[2])) {
+        snprintf(host, sizeof host, "%s", argv[1]);
+        port = atoi(argv[2]);
+        cred = argc > 3 ? argv[3] : getenv("OPENCHIME_CRED");
+    } else {
+        oc_endpoint ep;
+        oc_resolve_status st = oc_resolve(argv[1], getenv("OPENCHIME_SUFFIX"), &ep);
+        if (st == OC_RESOLVE_BAD_INSTANCE) {
+            fprintf(stderr, "openchime: invalid instance '%s'\n", argv[1]);
+            return 2;
+        }
+        if (st == OC_RESOLVE_NOT_FOUND) {
+            fprintf(stderr, "openchime: instance '%s' not found — it does not resolve in DNS\n", argv[1]);
+            return 3;
+        }
+        snprintf(host, sizeof host, "%s", ep.host);
+        port = ep.port;
+        cred = argc > 2 ? argv[2] : getenv("OPENCHIME_CRED");
+    }
     if (!cred) cred = "";
 
     oc_client *cl = oc_client_start_stored(host, port, cred, resolve_store_path());

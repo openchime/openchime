@@ -227,12 +227,20 @@ send in the store before delivery, resends the outbox on reconnect, and clears a
 row on its `SEND_ACK` — so an offline-composed send goes out on the next
 connection, deduped by the daemon.
 
+**Instance resolution is built (REQ-010/011,** `client/core/resolve.c`**).** A
+user-typed instance — a self-hosted domain (`chat.acme.com`) or a bare
+hosted-tier name (`acme`, which gets the configured `$OPENCHIME_SUFFIX`
+appended) — resolves by plain DNS: SRV (`_openchime._tcp.<domain>`) first, then
+the domain's A record at 443. A resolution failure is a distinct status, so the
+TUI tells "instance not found" apart from "could not reach the server" (connect)
+and "auth failed" (login). The TUI accepts `<instance>` (resolved) or a raw
+`<host> <port>` (dev/local). The optional `.well-known` metadata half is not
+consulted yet.
+
 **Still to build:** the fuller auth
-UX (ARCH-19) — a **local** username+password form; **OIDC** via the system
+UX (ARCH-19) — a **local** username+password form; and **OIDC** via the system
 browser to central's authorize URL with a loopback `127.0.0.1` redirect catching
-the ES256 JWT (`ASWebAuthenticationSession` on iOS/macOS); and instance+email →
-DNS resolution (SRV port > `.well-known` > 443), failures surfaced distinctly
-(REQ-010/011).
+the ES256 JWT (`ASWebAuthenticationSession` on iOS/macOS).
 
 ## 7. Build
 

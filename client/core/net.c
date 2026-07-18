@@ -1089,11 +1089,19 @@ static void *net_thread(void *arg) {
         replay_cache(n->to_ui, cs.store, instance, &hw);
     }
 
+    int reach_notified = 0;   /* latch so "unreachable" isn't repeated each retry */
     while (!n->stop) {
         int served = 0;
         int rc = run_connection(n, reconnecting, sess, &have_sess, &hw, &served, &cs);
         push_simple(n->to_ui, OC_EV_DISCONNECTED, 0);   /* this connection ended */
         if (cs.store && cs.logged_out) oc_store_clear_session(cs.store, instance);
+        /* Distinguish "unreachable" from "login failed" (REQ-011): a drop before
+         * ever serving, without a fatal auth reject, is a connectivity problem. */
+        if (served) reach_notified = 0;
+        else if (rc == RC_LOST && !reach_notified) {
+            push_err(n->to_ui, "could not reach the server");
+            reach_notified = 1;
+        }
         if (rc == RC_STOP || n->stop) break;
         if (rc == RC_FATAL) {
             /* A session token (stored or reconnect) was rejected — drop it. If we
