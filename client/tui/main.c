@@ -10,6 +10,14 @@
  * widths, Members visibility, 12/24h time, a default workspace — come from
  * ~/.config/openchime/config (config.c), created with defaults on first run.
  *
+ * **Multiple workspaces (REQ-012/013/014/015).** The TUI holds one oc_client per
+ * signed-in workspace (g_ws, up to MAX_WS), ticks them all every frame so a
+ * background workspace keeps receiving and counting unread, and renders only the
+ * active one. ^W opens the switcher: remembered workspaces with their unread +
+ * connection state, and an always-present "Log in to new workspace" row. Each
+ * session carries its own focused channel, scroll, and half-typed message, so
+ * switching away and back doesn't lose work.
+ *
  * Usage: openchime-tui [<workspace>] [user:pass]   (login box if omitted)
  *        openchime-tui <host> <port> [user:pass]   (dev/local direct connect)
  *        (credentials also read from $OPENCHIME_CRED = "user:pass")
@@ -465,8 +473,56 @@ static void build_webhooks_rows(rows_t *r, const oc_model *m, int width) {
     }
 }
 
-/* The workspace/host label shown in the header, set once in main(). */
-static char g_workspace[256] = "";
+/* ---- workspace sessions (REQ-013/014) ---------------------------------------
+ * The TUI holds one oc_client per signed-in workspace, all ticking every frame,
+ * so a workspace the user isn't looking at still receives messages and counts
+ * unread (REQ-014). Only the active one is rendered. Each session also carries
+ * its own view state — focused channel, scroll, half-typed message — so
+ * switching away and back doesn't discard work in progress (REQ-015).
+ *
+ * The cap is a fixed array rather than a grown list: a human signs into a
+ * handful of workspaces, and every session costs a thread + a TLS connection. */
+#define MAX_WS 8
+
+typedef struct {
+    oc_client *cl;
+    char       key[288];              /* "host:port" — the store/book key */
+    char       label[256];            /* what the user typed, e.g. acme.example.com */
+    char       user[128];             /* the account signed in as */
+    /* Per-workspace view state, saved on switch-away and restored on return. */
+    char       composer[COMPOSER_CAP];
+    size_t     clen;
+    size_t     focus;
+    int        scroll;
+    uint64_t   last_focus_cid;
+    int        settings_req;          /* pulled the synced bucket this session */
+} ws_session;
+
+static ws_session g_ws[MAX_WS];
+static int        g_nws = 0;          /* live sessions */
+static int        g_active = 0;       /* index into g_ws */
+
+/* The workspace label shown in the header (the active session's). */
+static const char *active_label(void) {
+    return (g_nws && g_active < g_nws && g_ws[g_active].label[0])
+         ? g_ws[g_active].label : "—";
+}
+
+/* Total unread across a workspace's channels — what the switcher badges. */
+static int ws_unread(const ws_session *w) {
+    if (!w->cl) return 0;
+    const oc_model *m = oc_client_model(w->cl);
+    int n = 0;
+    for (size_t i = 0; i < m->n_channels; i++) n += m->channels[i].unread;
+    return n;
+}
+
+/* Index of the open session for `key`, or -1. */
+static int ws_find(const char *key) {
+    for (int i = 0; i < g_nws; i++)
+        if (strcmp(g_ws[i].key, key) == 0) return i;
+    return -1;
+}
 
 /* Compute panel columns from the terminal width + config (shared by render and
  * the mouse handler so clicks map to what's drawn). */
@@ -512,6 +568,7 @@ static void draw_help(int W, int H) {
         "↑ ↓ PgUp PgDn  scroll the message pane",
         "type + Enter   send a message",
         "/command       run a command (below)   ·   ^K palette   ^R reconnect   ^Q quit",
+        "^W             switch workspace (or add one)",
         "",
         "Channels & DMs:",
         "  /join <name>  /leave  /create <name>  /list  /dm <name>",
@@ -526,6 +583,8 @@ static void draw_help(int W, int H) {
         "  /set mouse|members|time|channels-width|members-width <value>",
         "Files, webhooks, admin:",
         "  /upload <path>  /download <id>  /webhook  /invite  /role  /remove",
+        "Workspaces:",
+        "  ^W or /workspaces — switch, add, or forget (d) a workspace",
         "Session:",
         "  /logout",
     };
@@ -586,7 +645,7 @@ static int ci_prefix(const char *s, const char *pre) {
 static const char *AC_COMMANDS[] = {
     "/react", "/reactions", "/edit", "/delete", "/thread", "/search", "/close",
     "/create", "/join", "/leave", "/list", "/dm", "/who", "/away", "/online",
-    "/prefs", "/notify", "/dnd", "/set", "/profile", "/nick", "/passwd",
+    "/prefs", "/notify", "/dnd", "/set", "/profile", "/nick", "/passwd", "/workspaces",
     "/role", "/invite", "/remove", "/webhook",
     "/upload", "/download", "/logout", "/help",
 };
@@ -705,13 +764,19 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     const char *dot = pr == OC_PRESENCE_ONLINE ? "\xe2\x97\x8f" : pr == OC_PRESENCE_AWAY ? "\xe2\x97\x90" : "\xe2\x97\x8b";
     char hdr[256];
     snprintf(hdr, sizeof hdr, " OpenChime · %.120s · %.48s %s · %s",
-             g_workspace[0] ? g_workspace : "—", me[0] ? me : "…", dot, conn);
+             active_label(), me[0] ? me : "…", dot, conn);
     fill_row(0, 0, W, TB_BLUE);
     draw_clip(0, 0, W, hdr, TB_WHITE | TB_BOLD, TB_BLUE);
-    if (unread) {
-        char u[32]; snprintf(u, sizeof u, "%d unread ", unread);
-        draw_clip(W - (int)strlen(u) - 1, 0, W, u, TB_YELLOW | TB_BOLD, TB_BLUE);
-    }
+    /* Unread here, and — so a background workspace isn't invisible — a count of
+     * what's waiting in the others (REQ-014). */
+    int other = 0;
+    for (int i = 0; i < g_nws; i++) if (i != g_active) other += ws_unread(&g_ws[i]);
+    char u[64];
+    if (unread && other)   snprintf(u, sizeof u, "%d unread · %d elsewhere ", unread, other);
+    else if (unread)       snprintf(u, sizeof u, "%d unread ", unread);
+    else if (other)        snprintf(u, sizeof u, "%d elsewhere ", other);
+    else                   u[0] = '\0';
+    if (u[0]) draw_clip(W - (int)strlen(u) - 1, 0, W, u, TB_YELLOW | TB_BOLD, TB_BLUE);
 
     /* Rows: header=0; panels=[1, H-3); status=H-3; composer=H-2; hint=H-1. */
     int panels_top = 1, panels_h = H - 4;
@@ -877,6 +942,7 @@ static const struct { const char *cmd; const char *desc; int arg; } PAL_CMDS[] =
     {"/edit","edit your last message",1}, {"/delete","delete your last message",0}, {"/prefs","notification settings",0},
     {"/notify","set channel notify level",1}, {"/dnd","do-not-disturb window",1},
     {"/set","synced pref (mouse/members/time/…)",1},
+    {"/workspaces","switch workspace (^W)",0},
     {"/profile","your identity (name/role/id)",0}, {"/nick","change your display name",1},
     {"/passwd","change your password",1}, {"/role","set a user's role",1},
     {"/invite","mint an invite token",0}, {"/remove","remove a user",1}, {"/webhook","channel webhooks",0},
@@ -941,6 +1007,102 @@ static void draw_palette(const oc_model *m, const char *q, int psel) {
         draw_clip(x + 2, y + 2 + i, x + bw - 1, items[idx].label, fg, bg);
     }
     if (n == 0) draw_clip(x + 2, y + 2, x + bw - 1, "(no matches)", TB_BLACK | TB_BOLD, TB_DEFAULT);
+    tb_present();
+}
+
+/* ---- workspace switcher (REQ-013) -------------------------------------------
+ * One list, the same on every platform: the workspaces this device remembers,
+ * each with its unread + connection state, and an always-present "Log in to new
+ * workspace" row at the bottom. Open sessions come first (they have live state
+ * to show), then remembered-but-closed workspaces from the book. */
+
+static const char *g_store_path = NULL;   /* set in main(); the book lives here */
+static oc_secret  *g_secret = NULL;
+
+typedef struct {
+    char key[288];
+    char label[256];
+    char user[128];
+    int  session;                 /* index into g_ws, or -1 when not open */
+} sw_entry;
+
+static sw_entry g_sw[MAX_WS + 16];
+static int      g_nsw = 0;
+
+static void sw_book_cb(void *ctx, const char *key, const char *label,
+                       const char *user, uint64_t last_used) {
+    (void)ctx; (void)last_used;
+    if (g_nsw >= (int)(sizeof g_sw / sizeof g_sw[0])) return;
+    if (!key || !key[0]) return;
+    for (int i = 0; i < g_nsw; i++)                  /* already listed as open */
+        if (strcmp(g_sw[i].key, key) == 0) return;
+    sw_entry *e = &g_sw[g_nsw++];
+    snprintf(e->key,   sizeof e->key,   "%s", key);
+    snprintf(e->label, sizeof e->label, "%s", (label && label[0]) ? label : key);
+    snprintf(e->user,  sizeof e->user,  "%s", user ? user : "");
+    e->session = -1;
+}
+
+/* Rebuild the switcher list. Called when the switcher opens (not per frame) —
+ * it touches the book's SQLite file. */
+static void sw_build(void) {
+    g_nsw = 0;
+    for (int i = 0; i < g_nws && g_nsw < (int)(sizeof g_sw / sizeof g_sw[0]); i++) {
+        sw_entry *e = &g_sw[g_nsw++];
+        snprintf(e->key,   sizeof e->key,   "%s", g_ws[i].key);
+        snprintf(e->label, sizeof e->label, "%s", g_ws[i].label[0] ? g_ws[i].label : g_ws[i].key);
+        snprintf(e->user,  sizeof e->user,  "%s", g_ws[i].user);
+        e->session = i;
+    }
+    oc_store *s = g_store_path ? oc_store_open(g_store_path) : NULL;
+    if (s) { oc_store_workspace_each(s, sw_book_cb, NULL); oc_store_close(s); }
+}
+
+static void draw_switcher(int sel) {
+    int W = tb_width(), H = tb_height();
+    int rows = g_nsw + 1;                       /* + the "log in" row */
+    int show = rows > 12 ? 12 : rows;
+    int bw = 60; if (bw > W - 4) bw = W - 4; if (bw < 28) bw = 28;
+    int bh = show + 4; if (bh > H - 2) bh = H - 2;
+    int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
+    for (int j = 0; j < bh; j++) fill_row(y + j, x, x + bw, TB_DEFAULT);
+    draw_panel(x, y, bw, bh, "Workspaces  \xc2\xb7  Enter switch  \xc2\xb7  Esc close", 1);
+
+    int top = (sel >= show) ? sel - show + 1 : 0;
+    for (int i = 0; i < show && top + i < rows; i++) {
+        int idx = top + i, is_sel = (idx == sel);
+        uintattr_t bg = is_sel ? TB_BLUE : TB_DEFAULT;
+        uintattr_t fg = is_sel ? TB_WHITE | TB_BOLD : TB_DEFAULT;
+        if (is_sel) fill_row(y + 1 + i, x + 1, x + bw - 1, bg);
+
+        char line[320];
+        if (idx == g_nsw) {                      /* the always-present last row */
+            snprintf(line, sizeof line, "+ Log in to new workspace");
+            draw_clip(x + 2, y + 1 + i, x + bw - 1, line,
+                      is_sel ? fg : (TB_GREEN | TB_BOLD), bg);
+            continue;
+        }
+        const sw_entry *e = &g_sw[idx];
+        const char *mark = (e->session == g_active) ? "\xe2\x96\xb8" : " ";   /* ▸ active */
+        if (e->session >= 0) {
+            const oc_model *m = oc_client_model(g_ws[e->session].cl);
+            int un = ws_unread(&g_ws[e->session]);
+            /* ● connected · ◌ reconnecting — a dropped background workspace
+             * should be visible here, not a silent gap. */
+            const char *dot = m->authed ? "\xe2\x97\x8f" : "\xe2\x97\x8c";
+            if (un) snprintf(line, sizeof line, "%s %s %-28.28s %-14.14s %d unread",
+                             mark, dot, e->label, e->user, un);
+            else    snprintf(line, sizeof line, "%s %s %-28.28s %-14.14s",
+                             mark, dot, e->label, e->user);
+        } else {
+            snprintf(line, sizeof line, "%s   %-28.28s %-14.14s signed out",
+                     mark, e->label, e->user);
+        }
+        draw_clip(x + 2, y + 1 + i, x + bw - 1, line,
+                  is_sel ? fg : (e->session >= 0 ? TB_DEFAULT : (TB_BLACK | TB_BOLD)), bg);
+    }
+    draw_clip(x + 2, y + bh - 1, x + bw - 1,
+              " ^W switch \xc2\xb7 d forget \xc2\xb7 Esc close ", TB_BLACK | TB_BOLD, TB_DEFAULT);
     tb_present();
 }
 
@@ -1410,12 +1572,27 @@ static int await_auth(oc_client *cl, const char *host) {
     return AUTH_R_UNREACHABLE;
 }
 
+static int have_stored_token(const char *store_path, const char *host, int port,
+                             oc_secret *secret);
+
+/* Record a workspace in the book so the switcher can offer it later (REQ-012).
+ * Best-effort: a store we can't open just means no switcher entry. */
+static void remember_workspace(const char *key, const char *label, const char *user) {
+    if (!g_store_path) return;
+    oc_store *s = oc_store_open(g_store_path);
+    if (!s) return;
+    oc_store_workspace_remember(s, key, label, user, (uint64_t)time(NULL) * 1000);
+    oc_store_close(s);
+}
+
 /* Drive the login box + connect, retrying on failure, until authenticated or the
- * user quits. On success sets *out to the authenticated client and returns 1. */
-static int run_login(const char *initial_workspace, const char *store_path,
-                     oc_secret *secret, oc_client **out) {
+ * user quits. On success fills `w` (client + key/label/user) and returns 1.
+ * `initial_user` pre-fills the username when re-signing into a known workspace. */
+static int run_login(const char *initial_workspace, const char *initial_user,
+                     const char *store_path, oc_secret *secret, ws_session *w) {
     login_form f; memset(&f, 0, sizeof f);
     snprintf(f.workspace, sizeof f.workspace, "%s", initial_workspace ? initial_workspace : "");
+    snprintf(f.user, sizeof f.user, "%s", initial_user ? initial_user : "");
     f.remember = 1;
     char err[320]; err[0] = '\0';
     for (;;) {
@@ -1427,8 +1604,15 @@ static int run_login(const char *initial_workspace, const char *store_path,
         if (!cl) { snprintf(err, sizeof err, "could not start the client"); continue; }
         int res = await_auth(cl, f.ep.host);
         if (res == AUTH_R_OK) {
-            snprintf(g_workspace, sizeof g_workspace, "%s", f.workspace[0] ? f.workspace : f.ep.host);
-            *out = cl; return 1;
+            memset(w, 0, sizeof *w);
+            w->cl = cl;
+            snprintf(w->key,   sizeof w->key,   "%s:%d", f.ep.host, f.ep.port);
+            snprintf(w->label, sizeof w->label, "%s", f.workspace[0] ? f.workspace : f.ep.host);
+            snprintf(w->user,  sizeof w->user,  "%s", f.user);
+            /* Only remember it if the user asked us to keep the credential —
+             * "remember me" off means leave no trace of this workspace. */
+            if (f.remember) remember_workspace(w->key, w->label, w->user);
+            return 1;
         }
         oc_client_stop(cl);
         if (res == AUTH_R_CANCELLED) return 0;
@@ -1436,6 +1620,43 @@ static int run_login(const char *initial_workspace, const char *store_path,
         else                          snprintf(err, sizeof err, "sign-in failed — check your username and password");
         f.pass[0] = '\0';   /* clear the password for the retry */
     }
+}
+
+/* Open (or re-focus) a workspace from the switcher. A stored session token
+ * reconnects silently; without one we fall back to the login box pre-filled with
+ * what the book knows. Returns the session index, or -1 if it didn't open. */
+static int open_workspace(const char *key, const char *label, const char *user) {
+    int existing = ws_find(key);
+    if (existing >= 0) return existing;                  /* already open */
+    if (g_nws >= MAX_WS) return -1;
+
+    char host[256] = ""; int port = 0;
+    const char *colon = strrchr(key, ':');
+    if (!colon) return -1;
+    size_t hl = (size_t)(colon - key);
+    if (hl >= sizeof host) return -1;
+    memcpy(host, key, hl); host[hl] = '\0';
+    port = atoi(colon + 1);
+    if (!port) return -1;
+
+    ws_session *w = &g_ws[g_nws];
+    if (have_stored_token(g_store_path, host, port, g_secret)) {
+        oc_client *cl = oc_client_start_secure(host, port, "", g_store_path, g_secret);
+        if (!cl) return -1;
+        if (await_auth(cl, host) != AUTH_R_OK) {         /* token stale/rejected */
+            oc_client_stop(cl);
+        } else {
+            memset(w, 0, sizeof *w);
+            w->cl = cl;
+            snprintf(w->key,   sizeof w->key,   "%s", key);
+            snprintf(w->label, sizeof w->label, "%.255s", (label && label[0]) ? label : key);
+            snprintf(w->user,  sizeof w->user,  "%s", user ? user : "");
+            remember_workspace(w->key, w->label, w->user);
+            return g_nws++;
+        }
+    }
+    if (!run_login(label, user, g_store_path, g_secret, w)) return -1;
+    return g_nws++;
 }
 
 /* Is a still-valid session token stored for this workspace? If so we skip the
@@ -1474,6 +1695,8 @@ int main(int argc, char **argv) {
     /* Prefer the OS keyring for the session token; NULL (headless / no keyring)
      * falls back to the SQLite store. Owned here, freed after the client stops. */
     oc_secret *secret = oc_tui_secret_open("openchime");
+    g_store_path = store_path;    /* the switcher reads the book from here */
+    g_secret = secret;
 
     /* Decide how to connect. Three shapes:
      *   <host> <port> [cred]  — dev/local direct connect (argv[2] is a port);
@@ -1512,23 +1735,44 @@ int main(int argc, char **argv) {
     }
     tb_set_input_mode(TB_INPUT_ESC | (cfg.mouse ? TB_INPUT_MOUSE : 0));
 
-    oc_client *cl = NULL;
+    /* The first session. Everything after this point works through g_ws, so the
+     * command line is just one more way to open a workspace. */
     if (direct) {
-        cl = oc_client_start_secure(host, port, cred, store_path, secret);
-        if (!cl) { tb_shutdown(); oc_secret_free(secret); fprintf(stderr, "failed to start client\n"); return 1; }
-    } else if (!run_login(prefill, store_path, secret, &cl)) {
+        oc_client *c0 = oc_client_start_secure(host, port, cred, store_path, secret);
+        if (!c0) { tb_shutdown(); oc_secret_free(secret); fprintf(stderr, "failed to start client\n"); return 1; }
+        ws_session *w = &g_ws[0];
+        memset(w, 0, sizeof *w);
+        w->cl = c0;
+        snprintf(w->key,   sizeof w->key,   "%s:%d", host, port);
+        /* Fall back to the full "host:port", not the bare host — two dev
+         * workspaces on the same host would otherwise be indistinguishable
+         * in the switcher. */
+        snprintf(w->label, sizeof w->label, "%.255s", prefill[0] ? prefill : w->key);
+        /* `cred` is "user:pass" (or "" for a stored-token reconnect). */
+        const char *colon = strchr(cred, ':');
+        if (colon && colon > cred) {
+            size_t ul = (size_t)(colon - cred);
+            if (ul >= sizeof w->user) ul = sizeof w->user - 1;
+            memcpy(w->user, cred, ul); w->user[ul] = '\0';
+        }
+        g_nws = 1;
+        remember_workspace(w->key, w->label, w->user);
+    } else if (run_login(prefill, NULL, store_path, secret, &g_ws[0])) {
+        g_nws = 1;
+    } else {
         tb_shutdown();       /* user quit the login box */
         oc_secret_free(secret);
         return 0;
     }
-    /* Header label (run_login sets it from the typed workspace for the dialog). */
-    if (!g_workspace[0]) snprintf(g_workspace, sizeof g_workspace, "%s", host[0] ? host : "");
+    g_active = 0;
+    oc_client *cl = g_ws[0].cl;
 
     char composer[COMPOSER_CAP];
     size_t clen = 0;
     composer[0] = '\0';
     size_t focus = 0;
     int scroll = 0;
+    int switcher_open = 0, wsel = 0;          /* workspace switcher (^W) */
     int help_open = 0;
     int profile_open = 0;                     /* /profile identity modal */
     int ac_idx = 0;                           /* autocomplete cycle index */
@@ -1543,22 +1787,49 @@ int main(int argc, char **argv) {
     uint64_t last_focus_cid = 0;
     time_t last_typing = 0;                   /* throttle outbound TYPING signals */
     int running = 1, logging_out = 0;
-    int settings_req = 0;                      /* asked the daemon for the synced bucket this session */
 
     while (running) {
-        oc_client_tick(cl);
+        /* Tick EVERY workspace, not just the visible one: a background session
+         * has to keep receiving so its unread count is live in the switcher
+         * (REQ-014). Only the active session is rendered, below. */
+        for (int i = 0; i < g_nws; i++) {
+            oc_client_tick(g_ws[i].cl);
+            /* Each session pulls its own synced settings bucket once per
+             * authenticated connection (a reconnect re-pulls). */
+            const oc_model *wm = oc_client_model(g_ws[i].cl);
+            if (!wm->connected) g_ws[i].settings_req = 0;
+            else if (wm->authed && !g_ws[i].settings_req) {
+                oc_client_list_settings(g_ws[i].cl);
+                g_ws[i].settings_req = 1;
+            }
+        }
+        cl = g_ws[g_active].cl;
 
         const oc_model *m = oc_client_model(cl);
         if (focus >= m->n_channels) focus = m->n_channels ? m->n_channels - 1 : 0;
-        /* Pull the synced settings bucket once per authenticated session (a
-         * reconnect re-pulls); then layer whatever has arrived over the file
-         * defaults, re-arming mouse input if that pref flipped. */
-        if (!m->connected) settings_req = 0;
-        else if (m->authed && !settings_req) { oc_client_list_settings(cl); settings_req = 1; }
+        /* Layer the active workspace's synced settings over the file defaults,
+         * re-arming mouse input if that pref flipped. */
         if (apply_synced_settings(&cfg, &file_cfg, m))
             tb_set_input_mode(TB_INPUT_ESC | (cfg.mouse ? TB_INPUT_MOUSE : 0));
-        /* After /logout, quit once the server has closed the connection. */
-        if (logging_out && !m->connected) running = 0;
+        /* After /logout, close that workspace once the server has dropped it —
+         * and only quit when it was the last one open. */
+        if (logging_out && !m->connected) {
+            oc_client_stop(cl);
+            for (int i = g_active; i + 1 < g_nws; i++) g_ws[i] = g_ws[i + 1];
+            g_nws--;
+            logging_out = 0;
+            if (g_nws == 0) { running = 0; continue; }
+            if (g_active >= g_nws) g_active = g_nws - 1;
+            /* Adopt the newly-active workspace's saved view state. */
+            cl = g_ws[g_active].cl;
+            focus = g_ws[g_active].focus; scroll = g_ws[g_active].scroll;
+            snprintf(composer, sizeof composer, "%s", g_ws[g_active].composer);
+            clen = strlen(composer);
+            last_focus_cid = g_ws[g_active].last_focus_cid;
+            msg_sel = -1;
+            m = oc_client_model(cl);
+            if (focus >= m->n_channels) focus = m->n_channels ? m->n_channels - 1 : 0;
+        }
 
         /* Lazy backfill + keep the focused channel marked read. */
         if (focus < m->n_channels) {
@@ -1572,6 +1843,7 @@ int main(int argc, char **argv) {
         if (palette_open) draw_palette(oc_client_model(cl), pq, psel);
         if (picker_open) draw_picker(eq, esel);
         if (profile_open) draw_profile(oc_client_model(cl), tb_width(), tb_height());
+        if (switcher_open) draw_switcher(wsel);
 
         struct tb_event ev;
         int rc = tb_peek_event(&ev, 30);
@@ -1596,6 +1868,57 @@ int main(int argc, char **argv) {
         if (ev.type != TB_EVENT_KEY) continue;
 
         size_t nch = oc_client_model(cl)->n_channels;
+        if (switcher_open) {                   /* workspace switcher (REQ-013) */
+            int rows = g_nsw + 1;              /* + the "log in to new" row */
+            if (ev.key == TB_KEY_ESC || ev.key == TB_KEY_CTRL_C) switcher_open = 0;
+            else if (ev.key == TB_KEY_CTRL_Q) running = 0;
+            else if (ev.key == TB_KEY_ARROW_DOWN) { if (wsel + 1 < rows) wsel++; }
+            else if (ev.key == TB_KEY_ARROW_UP)   { if (wsel > 0) wsel--; }
+            else if (ev.ch == 'd' && wsel < g_nsw && g_sw[wsel].session < 0) {
+                /* Forget a closed workspace — credentials + cache go with it.
+                 * Only offered for closed ones; forgetting a live session would
+                 * pull the store out from under its running net thread. */
+                oc_store *s = g_store_path ? oc_store_open(g_store_path) : NULL;
+                if (s) {
+                    oc_store_set_secret(s, g_secret);
+                    oc_store_workspace_forget(s, g_sw[wsel].key);
+                    oc_store_close(s);
+                }
+                sw_build();
+                if (wsel > g_nsw) wsel = g_nsw;
+            } else if (ev.key == TB_KEY_ENTER) {
+                /* Save the active workspace's view state before leaving it. */
+                snprintf(g_ws[g_active].composer, sizeof g_ws[g_active].composer, "%s", composer);
+                g_ws[g_active].clen = clen;
+                g_ws[g_active].focus = focus;
+                g_ws[g_active].scroll = scroll;
+                g_ws[g_active].last_focus_cid = last_focus_cid;
+
+                int target;
+                if (wsel >= g_nsw) {           /* "+ Log in to new workspace" */
+                    if (g_nws >= MAX_WS) { switcher_open = 0; continue; }
+                    target = run_login(NULL, NULL, store_path, secret, &g_ws[g_nws])
+                           ? g_nws++ : -1;
+                } else if (g_sw[wsel].session >= 0) {
+                    target = g_sw[wsel].session;
+                } else {
+                    target = open_workspace(g_sw[wsel].key, g_sw[wsel].label, g_sw[wsel].user);
+                }
+                switcher_open = 0;
+                if (target < 0) continue;      /* cancelled / failed: stay put */
+                g_active = target;
+                /* Restore the target's view state (REQ-015). */
+                cl = g_ws[g_active].cl;
+                focus = g_ws[g_active].focus;
+                scroll = g_ws[g_active].scroll;
+                snprintf(composer, sizeof composer, "%s", g_ws[g_active].composer);
+                clen = strlen(composer);
+                last_focus_cid = g_ws[g_active].last_focus_cid;
+                msg_sel = -1; panel = 0; editing = 0;
+                remember_workspace(g_ws[g_active].key, NULL, NULL);   /* bump last-used */
+            }
+            continue;
+        }
         if (help_open) {                       /* help overlay: any key closes it */
             if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
             else help_open = 0;
@@ -1670,6 +1993,12 @@ int main(int argc, char **argv) {
             oc_client_reconnect(cl);
             continue;
         }
+        if (ev.key == TB_KEY_CTRL_W) {         /* workspace switcher (REQ-013) */
+            sw_build();
+            wsel = (g_active < g_nsw) ? g_active : 0;
+            switcher_open = 1;
+            continue;
+        }
         if (ev.key != TB_KEY_TAB) ac_idx = 0;  /* any non-Tab key restarts cycling */
 
         /* ---- navigation mode (a panel is focused; single keys act) ---- */
@@ -1740,6 +2069,11 @@ int main(int argc, char **argv) {
                 uint64_t cid = mm->channels[focus].channel_id;
                 if (strcmp(composer, "/help") == 0)           { help_open = 1; }
                 else if (strcmp(composer, "/profile") == 0)   { profile_open = 1; }
+                else if (strcmp(composer, "/workspaces") == 0 || strcmp(composer, "/workspace") == 0) {
+                    sw_build();
+                    wsel = (g_active < g_nsw) ? g_active : 0;
+                    switcher_open = 1;
+                }
                 else if (strcmp(composer, "/logout") == 0)    { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
                 else if (composer[0] == '/')                  handle_command(cl, cid, composer);
                 else if (mm->search_open || mm->roster_open || mm->reactlist_open || mm->prefs_open || mm->weblist_open) { /* read-only overlay: ignore */ }
@@ -1796,7 +2130,8 @@ int main(int argc, char **argv) {
     }
 
     tb_shutdown();
-    oc_client_stop(cl);
+    for (int i = 0; i < g_nws; i++) oc_client_stop(g_ws[i].cl);
+    g_nws = 0;
     oc_secret_free(secret);
     return 0;
 }

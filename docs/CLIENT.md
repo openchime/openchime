@@ -137,6 +137,19 @@ model; translate input to intents }, stop.
   round-trips back and applies live; the daemon fans the change to your other
   logged-in TUIs so they update in place. Which server you connect to
   (`workspace`) is deliberately machine-local and never synced.
+  **Multiple workspaces (REQ-012–015):** the TUI holds **one `oc_client` per
+  signed-in workspace** (`g_ws`, capped at `MAX_WS`) and ticks *all* of them every
+  frame, rendering only the active one — so a workspace you aren't looking at
+  keeps receiving and counting unread, and the header shows an "N elsewhere"
+  badge. `^W` (or `/workspaces`) opens the **switcher**: each remembered
+  workspace with its connection dot, account, and unread count, plus an
+  always-present **"+ Log in to new workspace"** row; `d` forgets a closed one.
+  The list comes from the store's **workspace book** (§5) unioned with the open
+  sessions, so a workspace with no running client is still offered — selecting it
+  reconnects silently on its stored session token, falling back to the login box
+  pre-filled from the book. Each session carries its own focused channel, scroll,
+  and half-typed message, restored on switch-back, and nothing crosses between
+  workspaces: separate connection, credentials, model, and cached history.
   **Composer autocomplete:** as you type, a live suggestion strip offers
   context-aware completions — slash commands, `#channel` and `@user` names (from
   the model's channel list + roster), command arguments (channels for
@@ -253,9 +266,25 @@ far:**
   headless test and a PTY smoke both compose a message with the daemon down, and
   a later run flushes it.
 
+- `workspace_book` — the **workspace book** (REQ-012), one row per workspace this
+  device has signed into: the address the user typed (friendlier than the
+  resolved `"host:port"` key), the account used, and a last-used stamp for
+  most-recently-used ordering. It backs the switcher, so returning to a workspace
+  never means retyping its address. `oc_store_workspace_forget` removes the row
+  *and* that workspace's session token, TOFU pin, cached history, and outbox — so
+  "forget" leaves nothing of it on disk.
+
 The store is owned by the net thread (one connection, one thread); an unusable
 path just disables persistence (in-memory only). The TUI puts it at
-`$OPENCHIME_STATE` or `$HOME/.local/state/openchime/state.db`.
+`$OPENCHIME_STATE` or `$HOME/.local/state/openchime/state.db`. The three
+`workspace_book` calls are the one exception to net-thread ownership: they are
+safe from a second `oc_store` handle on the same file (WAL + busy timeout, and
+they run at login/logout rather than on the message path), which is how the
+switcher lists workspaces that have no running client.
+
+Note migrations are forward-only, so the historical `instance_*` spellings
+persist in migrations 1–3; migration 4 renames them to `workspace_*`, and a
+fresh store lands on the same schema an upgraded one does.
 
 With the outbox, **the store + reconnect/offline work (REQ-100/101/102) is
 complete.** Keychains for the token are noted future hardening; optimistic local
