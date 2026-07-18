@@ -1,15 +1,18 @@
 /*
  * OpenChime TUI — the first frontend over the app-core (ARCH-74/75). termbox2
  * gives the cell grid + input; utf8proc gives correct display width so emoji and
- * CJK don't corrupt the layout. This is the lean core loop: a channel sidebar
- * (with presence + unread), a wrapped scrolling message pane, and a modeless
- * composer. All state/logic lives in oc_client; this file is pure view + input.
+ * CJK don't corrupt the layout. A modern paneled layout (the lazygit/k9s idiom):
+ * a header bar (instance · you · presence · connection · unread), three bordered
+ * panels — Channels │ Messages │ Members — a status line, an always-ready
+ * composer, and a context keybinding hint bar; `?` opens a full help overlay.
+ * All state/logic lives in oc_client; this file is pure view + input.
  *
- * Usage: openchime-tui <host> <port> [user:pass]
+ * Usage: openchime-tui [<instance>] [user:pass]   (login box if omitted)
+ *        openchime-tui <host> <port> [user:pass]   (dev/local direct connect)
  *        (credentials also read from $OPENCHIME_CRED = "user:pass")
  *
  * Keys: type + Enter to send · Tab next channel · ↑/↓ + PgUp/PgDn scroll ·
- *       Ctrl-Q quit. Commands (on the last message in the focused channel):
+ *       ? help · Ctrl-Q quit. Commands (on the last message in the focused channel):
  *       /react <emoji> · /reactions (who reacted to it) · /edit <text> ·
  *       /delete · /thread (open its thread; then Enter posts a reply) ·
  *       /search <query> · /close (leave a thread/search/roster/reactions
@@ -386,111 +389,202 @@ static void build_webhooks_rows(rows_t *r, const oc_model *m, int width) {
     }
 }
 
+/* The instance/host label shown in the header, set once in main(). */
+static char g_instance[256] = "";
+
+/* A bordered, titled panel; content is drawn inside by the caller. An active
+ * panel gets a bright (cyan) border, matching the lazygit/k9s idiom. */
+static void draw_panel(int x, int y, int w, int h, const char *title, int active) {
+    if (w < 2 || h < 2) return;
+    uintattr_t bc = active ? (TB_CYAN | TB_BOLD) : TB_WHITE;
+    for (int i = 1; i < w - 1; i++) {
+        tb_set_cell(x + i, y, 0x2500, bc, TB_DEFAULT);
+        tb_set_cell(x + i, y + h - 1, 0x2500, bc, TB_DEFAULT);
+    }
+    for (int j = 1; j < h - 1; j++) {
+        tb_set_cell(x, y + j, 0x2502, bc, TB_DEFAULT);
+        tb_set_cell(x + w - 1, y + j, 0x2502, bc, TB_DEFAULT);
+    }
+    tb_set_cell(x, y, 0x250c, bc, TB_DEFAULT);
+    tb_set_cell(x + w - 1, y, 0x2510, bc, TB_DEFAULT);
+    tb_set_cell(x, y + h - 1, 0x2514, bc, TB_DEFAULT);
+    tb_set_cell(x + w - 1, y + h - 1, 0x2518, bc, TB_DEFAULT);
+    if (title && title[0]) {
+        char t[96]; snprintf(t, sizeof t, " %s ", title);
+        draw_clip(x + 2, y, x + w - 1, t, active ? TB_CYAN | TB_BOLD : TB_WHITE | TB_BOLD, TB_DEFAULT);
+    }
+}
+
+/* The ? help overlay: a centered popup listing keys + commands. */
+static void draw_help(int W, int H) {
+    static const char *L[] = {
+        "Tab            next channel",
+        "↑ ↓ PgUp PgDn  scroll the message pane",
+        "type + Enter   send a message",
+        "/command       run a command (below)   ·   ^Q  quit",
+        "",
+        "Channels & DMs:",
+        "  /join <name>  /leave  /create <name>  /list  /dm <name>",
+        "Messages (last message):",
+        "  /react <emoji>  /reactions  /edit <text>  /delete  /thread",
+        "  /search <query>  /close",
+        "People & notifications:",
+        "  /who  /away  /online  /prefs  /notify <lvl>  /dnd <win|off>",
+        "Files, webhooks, admin:",
+        "  /upload <path>  /download <id>  /webhook  /invite  /role  /remove",
+        "Session:",
+        "  /logout",
+    };
+    int n = (int)(sizeof L / sizeof L[0]);
+    int bw = 64; if (bw > W - 4) bw = W - 4; if (bw < 24) bw = 24;
+    int bh = n + 2; if (bh > H - 2) bh = H - 2; if (bh < 4) bh = 4;
+    int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
+    for (int j = 0; j < bh; j++) fill_row(y + j, x, x + bw, TB_DEFAULT);   /* clear */
+    draw_panel(x, y, bw, bh, "Help  ·  ? or Esc to close", 1);
+    for (int i = 0; i < n && i + 1 < bh - 1; i++) {
+        size_t len = strlen(L[i]);
+        uintattr_t col = (len && L[i][len - 1] == ':') ? (TB_YELLOW | TB_BOLD)
+                       : (L[i][0] == '/' || L[i][0] == ' ') ? TB_DEFAULT : (TB_WHITE | TB_BOLD);
+        draw_clip(x + 2, y + 1 + i, x + bw - 1, L[i], col, TB_DEFAULT);
+    }
+}
+
 static void render(oc_client *cl, size_t focus, const char *composer,
-                   size_t clen, int scroll) {
+                   size_t clen, int scroll, int help_open) {
     (void)clen;
     const oc_model *m = oc_client_model(cl);
     int W = tb_width(), H = tb_height();
-    if (W < SIDEBAR_W + 10 || H < 4) { tb_clear(); return; }
     tb_clear();
+    if (W < 24 || H < 8) { draw_clip(0, 0, W, " terminal too small ", TB_RED | TB_BOLD, TB_DEFAULT); tb_present(); return; }
 
-    /* Sidebar. */
-    draw_clip(1, 0, SIDEBAR_W, "CHANNELS", TB_CYAN | TB_BOLD, TB_DEFAULT);
-    for (size_t i = 0; i < m->n_channels && (int)i + 1 < H - 1; i++) {
+    const oc_channel *fc = (focus < m->n_channels) ? &m->channels[focus] : NULL;
+    const char *conn = m->authed ? "connected" : (m->connected ? "connecting…" : "offline");
+
+    /* Header bar (row 0): instance · you · presence · connection · unread. */
+    int unread = 0;
+    for (size_t i = 0; i < m->n_channels; i++) if (m->channels[i].unread > 0) unread += m->channels[i].unread;
+    const char *me = m->user_id ? oc_model_user_name(m, m->user_id) : "";
+    uint8_t pr = oc_model_presence_of(m, m->user_id);
+    const char *dot = pr == OC_PRESENCE_ONLINE ? "\xe2\x97\x8f" : pr == OC_PRESENCE_AWAY ? "\xe2\x97\x90" : "\xe2\x97\x8b";
+    char hdr[256];
+    snprintf(hdr, sizeof hdr, " OpenChime · %.120s · %.48s %s · %s",
+             g_instance[0] ? g_instance : "—", me[0] ? me : "…", dot, conn);
+    fill_row(0, 0, W, TB_BLUE);
+    draw_clip(0, 0, W, hdr, TB_WHITE | TB_BOLD, TB_BLUE);
+    if (unread) {
+        char u[32]; snprintf(u, sizeof u, "%d unread ", unread);
+        draw_clip(W - (int)strlen(u) - 1, 0, W, u, TB_YELLOW | TB_BOLD, TB_BLUE);
+    }
+
+    /* Rows: header=0; panels=[1, H-3); status=H-3; composer=H-2; hint=H-1. */
+    int panels_top = 1, panels_h = H - 4;
+    if (panels_h < 3) panels_h = 3;
+    int ch_w  = W >= 60 ? 22 : (W / 4 < 12 ? 12 : W / 4);
+    int mem_w = W >= 74 ? 22 : 0;
+    int msg_x = ch_w, msg_w = W - ch_w - mem_w;
+
+    /* Channels panel. */
+    draw_panel(0, panels_top, ch_w, panels_h, "Channels", 0);
+    for (size_t i = 0, iy = panels_top + 1; i < m->n_channels && (int)iy < panels_top + panels_h - 1; i++, iy++) {
         const oc_channel *c = &m->channels[i];
-        uintattr_t bg = (i == focus) ? TB_BLUE : TB_DEFAULT;
-        /* Not-joined channels (public ones you can /join) render dim. */
-        uintattr_t fg = (i == focus) ? TB_WHITE | TB_BOLD
-                      : c->joined    ? TB_DEFAULT
-                                     : TB_BLACK | TB_BOLD;
-        int y = (int)i + 1;
-        fill_row(y, 0, SIDEBAR_W, bg);
+        int sel = (i == focus);
+        uintattr_t bg = sel ? TB_BLUE : TB_DEFAULT;
+        uintattr_t fg = sel ? TB_WHITE | TB_BOLD : c->joined ? TB_DEFAULT : TB_BLACK | TB_BOLD;
+        fill_row((int)iy, 1, ch_w - 1, bg);
         char title[96];
-        if (c->kind == OC_CHANNEL_KIND_DM) {   /* a DM: title by the other participant */
+        if (c->kind == OC_CHANNEL_KIND_DM) {
             const char *pn = (c->peer_id == m->user_id) ? "you" : oc_model_user_name(m, c->peer_id);
-            if (pn[0]) snprintf(title, sizeof title, "@%s", pn);
-            else       snprintf(title, sizeof title, "@user%llu", (unsigned long long)c->peer_id);
+            snprintf(title, sizeof title, "@%s", pn[0] ? pn : "dm");
         } else {
             snprintf(title, sizeof title, "%s%s", c->joined ? "# " : "+ ", c->name ? c->name : "…");
         }
         char label[128];
-        if (c->unread > 0) snprintf(label, sizeof label, "%s (%d)", title, c->unread);
-        else               snprintf(label, sizeof label, "%s", title);
-        draw_clip(1, y, SIDEBAR_W, label, fg, bg);
-    }
-    for (int y = 0; y < H; y++) tb_set_cell(SIDEBAR_W, y, '|', TB_DEFAULT, TB_DEFAULT);
-
-    int px0 = SIDEBAR_W + 1, pxmax = W;          /* message pane columns */
-    int pane_top = 1, pane_bot = H - 2;          /* rows: [top, bot) */
-    int pane_h = pane_bot - pane_top;
-    if (pane_h < 1) pane_h = 1;
-
-    /* Title bar (row 0 over the pane) — a thread view overlays the channel. */
-    const oc_channel *fc = (focus < m->n_channels) ? &m->channels[focus] : NULL;
-    char title[160];
-    if (m->roster_open)          snprintf(title, sizeof title, " members (/close to exit)");
-    else if (m->search_open)     snprintf(title, sizeof title, " search (/close to exit)");
-    else if (m->reactlist_open)  snprintf(title, sizeof title, " reactions (/close to exit)");
-    else if (m->prefs_open)      snprintf(title, sizeof title, " notifications (/close to exit)");
-    else if (m->weblist_open)    snprintf(title, sizeof title, " webhooks (/close to exit)");
-    else if (m->thread_open) snprintf(title, sizeof title, " thread · #%s (/close to exit)",
-                                      fc && fc->name ? fc->name : "…");
-    else if (fc)             snprintf(title, sizeof title, " #%s", fc->name ? fc->name : "…");
-    else                     snprintf(title, sizeof title, " (no channel)");
-    fill_row(0, px0, W, TB_BLUE);
-    draw_clip(px0, 0, pxmax, title, TB_WHITE | TB_BOLD, TB_BLUE);
-
-    /* Message rows for the focused channel, or an open overlay (thread / search /
-     * roster), showing the window ending `scroll` rows above the bottom. */
-    if (fc || m->thread_open || m->search_open || m->roster_open || m->reactlist_open || m->prefs_open || m->weblist_open) {
-        rows_t rows = {0};
-        if (m->roster_open)         build_roster_rows(&rows, m, pxmax - px0);
-        else if (m->search_open)    build_search_rows(&rows, m, pxmax - px0);
-        else if (m->reactlist_open) build_reactlist_rows(&rows, m, pxmax - px0);
-        else if (m->prefs_open)     build_prefs_rows(&rows, m, pxmax - px0);
-        else if (m->weblist_open)   build_webhooks_rows(&rows, m, pxmax - px0);
-        else if (m->thread_open)    build_thread_rows(&rows, m, fc, m->user_id, pxmax - px0);
-        else                        build_rows(&rows, fc, m->user_id, pxmax - px0);
-        int total = (int)rows.n;
-        int end = total - scroll;                /* one past the last visible row */
-        if (end > total) end = total;
-        if (end < 0) end = 0;
-        int start = end - pane_h;
-        if (start < 0) start = 0;
-        int y = pane_top + (pane_h - (end - start)); /* bottom-align when few rows */
-        for (int i = start; i < end; i++, y++)
-            draw_clip(px0, y, pxmax, rows.v[i].s, rows.v[i].fg, TB_DEFAULT);
-        rows_free(&rows);
+        if (c->unread > 0) snprintf(label, sizeof label, "%s%s (%d)", sel ? "\xe2\x96\xb8" : " ", title, c->unread);
+        else               snprintf(label, sizeof label, "%s%s", sel ? "\xe2\x96\xb8" : " ", title);
+        draw_clip(1, (int)iy, ch_w - 1, label, fg, bg);
     }
 
-    /* Status line (row H-2). */
-    char status[200];
-    const char *conn = m->authed ? "online" : (m->connected ? "connecting…" : "offline");
-    snprintf(status, sizeof status, " %s · %s%s", conn, m->status,
-             scroll > 0 ? "  [scrolled]" : "");
-    fill_row(H - 2, 0, W, TB_DEFAULT);
-    int sx = draw_clip(0, H - 2, W, status, TB_YELLOW, TB_DEFAULT);
-
-    /* Typing indicator for the focused channel (excluding ourselves). */
-    if (fc) {
-        uint64_t typers[8];
-        size_t nt = oc_model_typing(m, fc->channel_id, m->user_id, typers, 8);
-        if (nt) {
-            char tline[140];
-            if (nt == 1)
-                snprintf(tline, sizeof tline, "  ✎ %s is typing…", name_for(fc, typers[0]));
-            else
-                snprintf(tline, sizeof tline, "  ✎ %zu people are typing…", nt);
-            draw_clip(sx, H - 2, W, tline, TB_CYAN, TB_DEFAULT);
+    /* Messages panel (title = channel, or the open overlay). */
+    char mt[120];
+    if (m->roster_open)          snprintf(mt, sizeof mt, "members");
+    else if (m->search_open)     snprintf(mt, sizeof mt, "search");
+    else if (m->reactlist_open)  snprintf(mt, sizeof mt, "reactions");
+    else if (m->prefs_open)      snprintf(mt, sizeof mt, "notifications");
+    else if (m->weblist_open)    snprintf(mt, sizeof mt, "webhooks");
+    else if (m->thread_open)     snprintf(mt, sizeof mt, "thread · #%s", fc && fc->name ? fc->name : "…");
+    else if (fc && fc->kind == OC_CHANNEL_KIND_DM) {
+        const char *pn = (fc->peer_id == m->user_id) ? "you" : oc_model_user_name(m, fc->peer_id);
+        snprintf(mt, sizeof mt, "@%s", pn[0] ? pn : "dm");
+    } else if (fc)               snprintf(mt, sizeof mt, "#%s", fc->name ? fc->name : "…");
+    else                         snprintf(mt, sizeof mt, "no channel");
+    draw_panel(msg_x, panels_top, msg_w, panels_h, mt, 1);
+    {
+        int ix = msg_x + 1, iy = panels_top + 1, iw = msg_w - 2, ih = panels_h - 2;
+        if (ih > 0 && (fc || m->thread_open || m->search_open || m->roster_open || m->reactlist_open || m->prefs_open || m->weblist_open)) {
+            rows_t rows = {0};
+            if (m->roster_open)         build_roster_rows(&rows, m, iw);
+            else if (m->search_open)    build_search_rows(&rows, m, iw);
+            else if (m->reactlist_open) build_reactlist_rows(&rows, m, iw);
+            else if (m->prefs_open)     build_prefs_rows(&rows, m, iw);
+            else if (m->weblist_open)   build_webhooks_rows(&rows, m, iw);
+            else if (m->thread_open)    build_thread_rows(&rows, m, fc, m->user_id, iw);
+            else                        build_rows(&rows, fc, m->user_id, iw);
+            int total = (int)rows.n, end = total - scroll;
+            if (end > total) end = total;
+            if (end < 0) end = 0;
+            int start = end - ih;
+            if (start < 0) start = 0;
+            int y = iy + (ih - (end - start));
+            for (int i = start; i < end; i++, y++)
+                draw_clip(ix, y, ix + iw, rows.v[i].s, rows.v[i].fg, TB_DEFAULT);
+            rows_free(&rows);
         }
     }
 
-    /* Composer (row H-1). */
-    fill_row(H - 1, 0, W, TB_DEFAULT);
-    int cx = draw_clip(0, H - 1, W, "> ", TB_GREEN | TB_BOLD, TB_DEFAULT);
-    cx = draw_clip(cx, H - 1, W, composer, TB_DEFAULT, TB_DEFAULT);
-    if (cx < W) tb_set_cell(cx, H - 1, ' ', TB_DEFAULT, TB_REVERSE);   /* cursor */
+    /* Members panel (roster + presence), on wide terminals. */
+    if (mem_w) {
+        int mx = msg_x + msg_w;
+        draw_panel(mx, panels_top, mem_w, panels_h, "Members", 0);
+        for (size_t i = 0, iy = panels_top + 1; i < m->n_users && (int)iy < panels_top + panels_h - 1; i++, iy++) {
+            const oc_member *u = &m->users[i];
+            uint8_t p = oc_model_presence_of(m, u->user_id);
+            const char *d = p == OC_PRESENCE_ONLINE ? "\xe2\x97\x8f" : p == OC_PRESENCE_AWAY ? "\xe2\x97\x90" : "\xe2\x97\x8b";
+            uintattr_t col = u->disabled ? (TB_BLACK | TB_BOLD)
+                           : p == OC_PRESENCE_ONLINE ? TB_GREEN : p == OC_PRESENCE_AWAY ? TB_YELLOW : TB_DEFAULT;
+            const char *role = u->role == OC_ROLE_OWNER ? " *" : u->role == OC_ROLE_ADMIN ? " +" : "";
+            char line[80]; snprintf(line, sizeof line, "%s %s%s", d, u->name[0] ? u->name : "?", role);
+            draw_clip(mx + 1, (int)iy, mx + mem_w - 1, line, col, TB_DEFAULT);
+        }
+    }
 
+    /* Status line (row H-3): last status / error + typing indicator. */
+    fill_row(H - 3, 0, W, TB_DEFAULT);
+    char st[220]; snprintf(st, sizeof st, " %s%s", m->status[0] ? m->status : "", scroll > 0 ? "   [scrolled]" : "");
+    int sx = draw_clip(0, H - 3, W, st, TB_YELLOW, TB_DEFAULT);
+    if (fc) {
+        uint64_t tp[8]; size_t nt = oc_model_typing(m, fc->channel_id, m->user_id, tp, 8);
+        if (nt) {
+            char tl[140];
+            if (nt == 1) snprintf(tl, sizeof tl, "  ✎ %s is typing…", name_for(fc, tp[0]));
+            else         snprintf(tl, sizeof tl, "  ✎ %zu people are typing…", nt);
+            draw_clip(sx, H - 3, W, tl, TB_CYAN, TB_DEFAULT);
+        }
+    }
+
+    /* Composer (row H-2). */
+    fill_row(H - 2, 0, W, TB_DEFAULT);
+    int cx = draw_clip(0, H - 2, W, "\xe2\x80\xba ", TB_GREEN | TB_BOLD, TB_DEFAULT);   /* › prompt */
+    cx = draw_clip(cx, H - 2, W, composer, TB_DEFAULT, TB_DEFAULT);
+    if (cx < W) tb_set_cell(cx, H - 2, ' ', TB_DEFAULT, TB_REVERSE);   /* cursor */
+
+    /* Keybinding hint bar (row H-1). */
+    const char *hint = help_open
+        ? " press ? or Esc to close help "
+        : " Tab: channel   \xe2\x86\x91\xe2\x86\x93: scroll   Enter: send   /: command   ?: help   ^Q: quit ";
+    fill_row(H - 1, 0, W, TB_BLACK | TB_BOLD);
+    draw_clip(0, H - 1, W, hint, TB_WHITE, TB_BLACK | TB_BOLD);
+
+    if (help_open) draw_help(W, H);
     tb_present();
 }
 
@@ -881,7 +975,10 @@ static int run_login(const char *initial_instance, const char *store_path,
                                                f.remember ? secret : NULL);
         if (!cl) { snprintf(err, sizeof err, "could not start the client"); continue; }
         int res = await_auth(cl, f.ep.host);
-        if (res == AUTH_R_OK) { *out = cl; return 1; }
+        if (res == AUTH_R_OK) {
+            snprintf(g_instance, sizeof g_instance, "%s", f.instance[0] ? f.instance : f.ep.host);
+            *out = cl; return 1;
+        }
         oc_client_stop(cl);
         if (res == AUTH_R_CANCELLED) return 0;
         if (res == AUTH_R_UNREACHABLE) snprintf(err, sizeof err, "could not reach %s", f.ep.host);
@@ -967,12 +1064,15 @@ int main(int argc, char **argv) {
         oc_secret_free(secret);
         return 0;
     }
+    /* Header label (run_login sets it from the typed instance for the dialog). */
+    if (!g_instance[0]) snprintf(g_instance, sizeof g_instance, "%s", host[0] ? host : "");
 
     char composer[COMPOSER_CAP];
     size_t clen = 0;
     composer[0] = '\0';
     size_t focus = 0;
     int scroll = 0;
+    int help_open = 0;
     uint64_t last_focus_cid = 0;
     time_t last_typing = 0;                   /* throttle outbound TYPING signals */
     int running = 1, logging_out = 0;
@@ -993,7 +1093,7 @@ int main(int argc, char **argv) {
             if (cid != last_focus_cid) { scroll = 0; last_focus_cid = cid; }
         }
 
-        render(cl, focus, composer, clen, scroll);
+        render(cl, focus, composer, clen, scroll, help_open);
 
         struct tb_event ev;
         int rc = tb_peek_event(&ev, 30);
@@ -1002,13 +1102,19 @@ int main(int argc, char **argv) {
         if (ev.type != TB_EVENT_KEY) continue;
 
         size_t nch = oc_client_model(cl)->n_channels;
+        if (help_open) {                       /* help overlay: any key closes it */
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else help_open = 0;
+            continue;
+        }
         if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) {
             running = 0;
         } else if (ev.key == TB_KEY_ENTER) {
             if (clen > 0 && focus < nch) {
                 const oc_model *mm = oc_client_model(cl);
                 uint64_t cid = mm->channels[focus].channel_id;
-                if (strcmp(composer, "/logout") == 0)         { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
+                if (strcmp(composer, "/help") == 0)           { help_open = 1; }
+                else if (strcmp(composer, "/logout") == 0)    { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
                 else if (composer[0] == '/')                  handle_command(cl, cid, composer);
                 else if (mm->search_open || mm->roster_open || mm->reactlist_open || mm->prefs_open || mm->weblist_open) { /* read-only overlay: ignore */ }
                 else if (mm->thread_open)                     oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
@@ -1028,6 +1134,8 @@ int main(int argc, char **argv) {
         } else if (ev.key == TB_KEY_PGDN) {
             scroll -= (tb_height() - 3) / 2;
             if (scroll < 0) scroll = 0;
+        } else if (ev.ch == '?' && clen == 0) {
+            help_open = 1;                     /* ? on an empty composer opens help */
         } else if (ev.ch != 0) {
             /* A typed codepoint: append its UTF-8 encoding to the composer. */
             utf8proc_uint8_t enc[4];

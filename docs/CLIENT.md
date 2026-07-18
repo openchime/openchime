@@ -98,11 +98,16 @@ model; translate input to intents }, stop.
   `i` first, so it's rejected. **Loop:** termbox2 on the main thread, draining
   `oc_client` events each iteration and polling input with a short timeout
   (`tb_peek_event`, the "read events at frame start" shape); a wakeup fd on the
-  client queue is a later optimization if idle cost ever matters. **Layout** is
-  regions — sidebar, message pane, status+composer, and read-only overlays
-  (thread, search, roster, who-reacted, notification prefs) shown in place of the
-  message pane — drawn cell-by-cell, re-laid-out on the resize event; the pane
-  renders its visible window each frame, measuring glyph width with utf8proc.
+  client queue is a later optimization if idle cost ever matters. **Layout (v2,
+  the lazygit/k9s idiom):** a header bar (instance · you · presence · connection ·
+  unread), three **bordered, titled panels** — Channels │ Messages │ Members
+  (the active one drawn in a bright border) — a status line, the always-ready
+  composer, and a **context keybinding hint bar**; `?` (or `/help`) opens a full
+  help overlay. Read-only overlays (thread, search, roster, who-reacted,
+  notification prefs, webhooks) render inside the Messages panel. Everything is
+  drawn cell-by-cell, re-laid-out on resize, measuring glyph width with utf8proc.
+  Increment 1 (this shell) keeps the modeless composer + `/`-commands; a message
+  navigation mode with single-key actions and a `:` command palette follow.
   **Build order:** the lean core loop landed first (sidebar, focus/switch, history
   backfill on open, live messages + display names, send, unread, scrollback,
   reflow, per-nick colors), then each of the following surfaced one engine feature
