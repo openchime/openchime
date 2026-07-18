@@ -5,7 +5,10 @@
  * a header bar (instance · you · presence · connection · unread), three bordered
  * panels — Channels │ Messages │ Members — a status line, an always-ready
  * composer, and a context keybinding hint bar; `?` opens a full help overlay.
- * All state/logic lives in oc_client; this file is pure view + input.
+ * All state/logic lives in oc_client; this file is pure view + input. Mouse
+ * (click a channel/member, wheel to scroll) and machine-local prefs — panel
+ * widths, Members visibility, 12/24h time, a default instance — come from
+ * ~/.config/openchime/config (config.c), created with defaults on first run.
  *
  * Usage: openchime-tui [<instance>] [user:pass]   (login box if omitted)
  *        openchime-tui <host> <port> [user:pass]   (dev/local direct connect)
@@ -48,6 +51,7 @@
 #include "resolve.h"    /* instance -> host:port (REQ-010/011) */
 #include "store.h"      /* peek a stored session token (skip the login box) */
 #include "secret_backend.h" /* OS keyring for the session token */
+#include "config.h"     /* machine-local prefs (mouse, panels, time) */
 #include "protocol.h"   /* OC_PRESENCE_*, OC_SESSION_TOKEN_LEN */
 
 #include <ctype.h>
@@ -61,6 +65,9 @@
 
 #define SIDEBAR_W 22
 #define COMPOSER_CAP 1024
+
+/* Machine-local prefs, loaded once in main() (see config.h). */
+static const oc_config *g_cfg = NULL;
 
 /* Distinct-ish colors for author nicks, picked by hashing the user id. */
 static const uintattr_t NICK_COLORS[] = {
@@ -171,11 +178,12 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
                             const oc_channel *ch, int show_replies, int mi) {
     size_t rstart = r->n;
     char line[256], nick[80];
-    char stamp[8] = "--:--";
+    char stamp[12] = "--:--";
     if (m->server_time) {
         time_t t = (time_t)(m->server_time / 1000);
         struct tm tmv;
-        if (localtime_r(&t, &tmv)) strftime(stamp, sizeof stamp, "%H:%M", &tmv);
+        if (localtime_r(&t, &tmv))
+            strftime(stamp, sizeof stamp, (g_cfg && !g_cfg->time_24h) ? "%I:%M%p" : "%H:%M", &tmv);
     }
     msg_nick(nick, sizeof nick, m, me, ch);
     snprintf(line, sizeof line, "%s  %s", stamp, nick);
@@ -406,6 +414,20 @@ static void build_webhooks_rows(rows_t *r, const oc_model *m, int width) {
 /* The instance/host label shown in the header, set once in main(). */
 static char g_instance[256] = "";
 
+/* Compute panel columns from the terminal width + config (shared by render and
+ * the mouse handler so clicks map to what's drawn). */
+static void layout(int W, int *ch_w, int *mem_w, int *msg_x, int *msg_w) {
+    int cw = g_cfg ? g_cfg->channels_width : 22;
+    if (cw < 8) cw = 8;
+    if (cw > W / 3) cw = W / 3;
+    int want = g_cfg ? g_cfg->members_width : 22;
+    int mode = g_cfg ? g_cfg->members_panel : 2;
+    int mw = (mode == 0) ? 0 : (mode == 1) ? want : (W >= 74 ? want : 0);
+    if (mw > W / 3) mw = W / 3;
+    if (W - cw - mw < 24) mw = 0;             /* keep the message pane usable */
+    *ch_w = cw; *mem_w = mw; *msg_x = cw; *msg_w = W - cw - mw;
+}
+
 /* A bordered, titled panel; content is drawn inside by the caller. An active
  * panel gets a bright (cyan) border, matching the lazygit/k9s idiom. */
 static void draw_panel(int x, int y, int w, int h, const char *title, int active) {
@@ -605,9 +627,8 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     /* Rows: header=0; panels=[1, H-3); status=H-3; composer=H-2; hint=H-1. */
     int panels_top = 1, panels_h = H - 4;
     if (panels_h < 3) panels_h = 3;
-    int ch_w  = W >= 60 ? 22 : (W / 4 < 12 ? 12 : W / 4);
-    int mem_w = W >= 74 ? 22 : 0;
-    int msg_x = ch_w, msg_w = W - ch_w - mem_w;
+    int ch_w, mem_w, msg_x, msg_w;
+    layout(W, &ch_w, &mem_w, &msg_x, &msg_w);
 
     /* Channels panel. */
     draw_panel(0, panels_top, ch_w, panels_h, "Channels", ch_act);
@@ -1303,6 +1324,10 @@ int main(int argc, char **argv) {
      * wide glyph as U+FFFD, defeating the whole point of utf8proc. */
     setlocale(LC_ALL, "");
 
+    static oc_config cfg;
+    oc_config_load(&cfg);
+    g_cfg = &cfg;
+
     const char *store_path = resolve_store_path();
     /* Prefer the OS keyring for the session token; NULL (headless / no keyring)
      * falls back to the SQLite store. Owned here, freed after the client stops. */
@@ -1324,8 +1349,8 @@ int main(int argc, char **argv) {
         port = atoi(argv[2]);
         cred = argc > 3 ? argv[3] : getenv("OPENCHIME_CRED");
         direct = 1;
-    } else if (argc >= 2) {                          /* instance mode */
-        const char *inst = argv[1];
+    } else if (argc >= 2 || cfg.instance[0]) {       /* instance mode (arg or config default) */
+        const char *inst = (argc >= 2) ? argv[1] : cfg.instance;
         const char *cli_cred = argc >= 3 ? argv[2] : getenv("OPENCHIME_CRED");
         oc_endpoint ep;
         oc_resolve_status st = oc_resolve(inst, getenv("OPENCHIME_SUFFIX"), &ep);
@@ -1343,6 +1368,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "failed to init terminal (need a tty)\n");
         return 1;
     }
+    tb_set_input_mode(TB_INPUT_ESC | (cfg.mouse ? TB_INPUT_MOUSE : 0));
 
     oc_client *cl = NULL;
     if (direct) {
@@ -1399,6 +1425,22 @@ int main(int argc, char **argv) {
         int rc = tb_peek_event(&ev, 30);
         if (rc != TB_OK) continue;               /* timeout: loop to re-tick + redraw */
         if (ev.type == TB_EVENT_RESIZE) continue;
+        if (ev.type == TB_EVENT_MOUSE) {       /* wheel scrolls; click focuses a channel/member */
+            if (ev.key == TB_KEY_MOUSE_WHEEL_UP) scroll += 3;
+            else if (ev.key == TB_KEY_MOUSE_WHEEL_DOWN) { scroll -= 3; if (scroll < 0) scroll = 0; }
+            else if (ev.key == TB_KEY_MOUSE_LEFT && !help_open && !palette_open && !picker_open) {
+                int Wm = tb_width(); int chw, memw, msgx, msgw;
+                layout(Wm, &chw, &memw, &msgx, &msgw);
+                int prow = ev.y - 2;           /* first panel content row */
+                const oc_model *mm = oc_client_model(cl);
+                if (prow >= 0 && ev.x < chw) {                      /* Channels */
+                    if ((size_t)prow < mm->n_channels) { focus = (size_t)prow; panel = 0; }
+                } else if (memw && prow >= 0 && ev.x >= msgx + msgw) {   /* Members */
+                    if ((size_t)prow < mm->n_users) oc_client_open_dm(cl, mm->users[prow].user_id);
+                }
+            }
+            continue;
+        }
         if (ev.type != TB_EVENT_KEY) continue;
 
         size_t nch = oc_client_model(cl)->n_channels;

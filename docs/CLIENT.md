@@ -119,6 +119,12 @@ model; translate input to intents }, stop.
   (type a shortcode name, Enter reacts with the real Unicode emoji, toggling).
   This completes the v2 redesign — panels + focus, navigation mode, autocomplete,
   command palette, and the picker — all frontend-only over the unchanged app-core.
+  **Mouse + config:** the TUI enables mouse input (click a channel/member to
+  select, wheel to scroll) and reads machine-local prefs from
+  `~/.config/openchime/config` (`client/tui/config.c`, XDG, created with commented
+  defaults on first run): `mouse`, `members_panel` (off/on/auto), panel widths,
+  `time` (12/24h), and a default `instance`. Portable, cross-device settings will
+  live in a daemon per-`(user, client_type)` settings bucket instead.
   **Composer autocomplete:** as you type, a live suggestion strip offers
   context-aware completions — slash commands, `#channel` and `@user` names (from
   the model's channel list + roster), command arguments (channels for
