@@ -111,7 +111,11 @@ model; translate input to intents }, stop.
   j/k move a highlighted selection, Esc returns to the composer. On the Messages
   panel single keys act on the *selected* message — Enter/`t` thread, `r` react
   (👍; the picker comes later), `e` edit (prefills the composer), `x` delete,
-  `w` who-reacted; on Members, Enter opens a DM. A `:` command palette follows.
+  `w` who-reacted; on Members, Enter opens a DM. **Command palette** (`:` on an
+  empty composer, or Ctrl-K): a fuzzy-filtered popup over every command plus
+  jump-to-channel / open-DM entries — Enter runs a parameterless command, prefills
+  the composer for one needing an argument (autocomplete then helps), or jumps.
+  An emoji picker + polish complete the redesign.
   **Composer autocomplete:** as you type, a live suggestion strip offers
   context-aware completions — slash commands, `#channel` and `@user` names (from
   the model's channel list + roster), command arguments (channels for

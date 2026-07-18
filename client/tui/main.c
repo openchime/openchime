@@ -18,8 +18,11 @@
  *       Messages / Members, j/k select, Esc returns to the composer. On the
  *       Messages panel single keys act on the selected message: Enter/t thread ·
  *       r react (👍) · e edit · x delete · w who-reacted. Members: Enter opens a
- *       DM. A live autocomplete strip shows candidates as you type. Commands (on
- *       the last message in the focused channel):
+ *       DM. **Command palette** (`:` on an empty composer, or Ctrl-K anywhere):
+ *       fuzzy-filter every command + jump to any channel/DM; Enter runs it (or
+ *       prefills the composer for commands needing an argument). A live
+ *       autocomplete strip shows candidates as you type. Commands (on the last
+ *       message in the focused channel):
  *       /react <emoji> · /reactions (who reacted to it) · /edit <text> ·
  *       /delete · /thread (open its thread; then Enter posts a reply) ·
  *       /search <query> · /close (leave a thread/search/roster/reactions
@@ -751,6 +754,83 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     tb_present();
 }
 
+/* ---- command palette (:  or Ctrl-K) --------------------------------------- */
+
+enum { PAL_CMD, PAL_CHAN, PAL_DM };
+typedef struct { char label[96]; int kind; uint64_t id; const char *cmd; int needs_arg; } pal_item;
+
+static const struct { const char *cmd; const char *desc; int arg; } PAL_CMDS[] = {
+    {"/join","join a channel",1}, {"/leave","leave this channel",0}, {"/create","create a channel",1},
+    {"/list","refresh channel list",0}, {"/dm","open a direct message",1}, {"/who","member roster",0},
+    {"/away","set yourself away",0}, {"/online","set yourself online",0}, {"/search","search messages",1},
+    {"/thread","open last message's thread",0}, {"/reactions","who reacted (last)",0}, {"/react","react to last",1},
+    {"/edit","edit your last message",1}, {"/delete","delete your last message",0}, {"/prefs","notification settings",0},
+    {"/notify","set channel notify level",1}, {"/dnd","do-not-disturb window",1}, {"/role","set a user's role",1},
+    {"/invite","mint an invite token",0}, {"/remove","remove a user",1}, {"/webhook","channel webhooks",0},
+    {"/upload","upload a file",1}, {"/download","download an attachment",1}, {"/help","keys & commands",0},
+    {"/logout","sign out",0}, {"/close","close the open overlay",0},
+};
+
+/* Case-insensitive subsequence ("fuzzy") match: do needle's chars appear in
+ * order within hay? An empty needle matches everything. */
+static int fuzzy(const char *hay, const char *needle) {
+    if (!*needle) return 1;
+    for (; *hay; hay++)
+        if (tolower((unsigned char)*hay) == tolower((unsigned char)*needle)) {
+            needle++;
+            if (!*needle) return 1;
+        }
+    return 0;
+}
+
+/* Build the filtered palette list from commands, channels, and members. */
+static int palette_build(const oc_model *m, const char *q, pal_item *out, int max) {
+    int n = 0;
+    for (size_t i = 0; i < sizeof PAL_CMDS / sizeof *PAL_CMDS && n < max; i++)
+        if (fuzzy(PAL_CMDS[i].cmd, q) || fuzzy(PAL_CMDS[i].desc, q)) {
+            snprintf(out[n].label, sizeof out[n].label, "%-11s %s", PAL_CMDS[i].cmd, PAL_CMDS[i].desc);
+            out[n].kind = PAL_CMD; out[n].cmd = PAL_CMDS[i].cmd; out[n].needs_arg = PAL_CMDS[i].arg; n++;
+        }
+    for (size_t i = 0; i < m->n_channels && n < max; i++) {
+        const oc_channel *c = &m->channels[i];
+        if (c->kind != OC_CHANNEL_KIND_DM && c->name && fuzzy(c->name, q)) {
+            snprintf(out[n].label, sizeof out[n].label, "# %-16s jump to channel", c->name);
+            out[n].kind = PAL_CHAN; out[n].id = c->channel_id; n++;
+        }
+    }
+    for (size_t i = 0; i < m->n_users && n < max; i++)
+        if (m->users[i].name[0] && fuzzy(m->users[i].name, q)) {
+            snprintf(out[n].label, sizeof out[n].label, "@ %-16s direct message", m->users[i].name);
+            out[n].kind = PAL_DM; out[n].id = m->users[i].user_id; n++;
+        }
+    return n;
+}
+
+/* Draw the palette popup (query line + filtered list, selection highlighted). */
+static void draw_palette(const oc_model *m, const char *q, int psel) {
+    int W = tb_width(), H = tb_height();
+    pal_item items[64]; int n = palette_build(m, q, items, 64);
+    int show = n > 12 ? 12 : (n < 1 ? 1 : n);
+    int bw = 64; if (bw > W - 4) bw = W - 4; if (bw < 24) bw = 24;
+    int bh = show + 4; if (bh > H - 2) bh = H - 2;
+    int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
+    for (int j = 0; j < bh; j++) fill_row(y + j, x, x + bw, TB_DEFAULT);
+    draw_panel(x, y, bw, bh, "Command palette  \xc2\xb7  Esc to close", 1);
+    char ql[128]; snprintf(ql, sizeof ql, "\xe2\x80\xba %s", q);
+    draw_clip(x + 2, y + 1, x + bw - 1, ql, TB_GREEN | TB_BOLD, TB_DEFAULT);
+    int cxq = x + 4 + (int)strlen(q);
+    if (cxq < x + bw - 1) tb_set_cell(cxq, y + 1, ' ', TB_DEFAULT, TB_REVERSE);
+    int top = (psel >= show) ? psel - show + 1 : 0;
+    for (int i = 0; i < show && top + i < n; i++) {
+        int idx = top + i, sel = (idx == psel);
+        uintattr_t bg = sel ? TB_BLUE : TB_DEFAULT, fg = sel ? TB_WHITE | TB_BOLD : TB_DEFAULT;
+        if (sel) fill_row(y + 2 + i, x + 1, x + bw - 1, bg);
+        draw_clip(x + 2, y + 2 + i, x + bw - 1, items[idx].label, fg, bg);
+    }
+    if (n == 0) draw_clip(x + 2, y + 2, x + bw - 1, "(no matches)", TB_BLACK | TB_BOLD, TB_DEFAULT);
+    tb_present();
+}
+
 /* ---- input helpers --------------------------------------------------------- */
 
 /* Remove the last full UTF-8 character from `buf` (length *len). */
@@ -1240,6 +1320,8 @@ int main(int argc, char **argv) {
     int panel = 0;                            /* 0 composer · 1 channels · 2 messages · 3 members */
     int msg_sel = -1, mem_sel = 0;            /* selection within the messages / members panel */
     uint64_t editing = 0;                     /* message id being edited (0 = none) */
+    int palette_open = 0, psel = 0;           /* command palette (: or Ctrl-K) */
+    char pq[64] = ""; size_t pqlen = 0;       /* palette query */
     uint64_t last_focus_cid = 0;
     time_t last_typing = 0;                   /* throttle outbound TYPING signals */
     int running = 1, logging_out = 0;
@@ -1261,6 +1343,7 @@ int main(int argc, char **argv) {
         }
 
         render(cl, focus, composer, clen, scroll, help_open, ac_idx, panel, msg_sel, mem_sel, editing);
+        if (palette_open) draw_palette(oc_client_model(cl), pq, psel);
 
         struct tb_event ev;
         int rc = tb_peek_event(&ev, 30);
@@ -1272,6 +1355,46 @@ int main(int argc, char **argv) {
         if (help_open) {                       /* help overlay: any key closes it */
             if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
             else help_open = 0;
+            continue;
+        }
+        if (palette_open) {                    /* command palette: type to filter */
+            const oc_model *mm = oc_client_model(cl);
+            pal_item items[64]; int n = palette_build(mm, pq, items, 64);
+            if (ev.key == TB_KEY_ESC || ev.key == TB_KEY_CTRL_C || ev.key == TB_KEY_CTRL_Q) {
+                palette_open = 0;
+            } else if (ev.key == TB_KEY_ARROW_DOWN) { if (psel + 1 < n) psel++; }
+            else if (ev.key == TB_KEY_ARROW_UP)     { if (psel > 0) psel--; }
+            else if (ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2) {
+                if (pqlen) pq[--pqlen] = '\0';
+                psel = 0;
+            } else if (ev.key == TB_KEY_ENTER) {
+                if (n > 0 && psel < n) {
+                    pal_item *it = &items[psel];
+                    uint64_t cid = (focus < mm->n_channels) ? mm->channels[focus].channel_id : 0;
+                    if (it->kind == PAL_CHAN) {
+                        for (size_t z = 0; z < mm->n_channels; z++)
+                            if (mm->channels[z].channel_id == it->id) { focus = z; break; }
+                    } else if (it->kind == PAL_DM) {
+                        oc_client_open_dm(cl, it->id);
+                    } else if (strcmp(it->cmd, "/logout") == 0) {
+                        oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1;
+                    } else if (strcmp(it->cmd, "/help") == 0) {
+                        help_open = 1;
+                    } else if (!it->needs_arg) {
+                        handle_command(cl, cid, it->cmd);
+                    } else {                   /* command needs an argument: prefill composer */
+                        snprintf(composer, sizeof composer, "%s ", it->cmd);
+                        clen = strlen(composer); panel = 0;
+                    }
+                }
+                palette_open = 0;
+            } else if (ev.ch >= 0x20 && ev.ch <= 0x7e && pqlen + 1 < sizeof pq) {
+                pq[pqlen++] = (char)ev.ch; pq[pqlen] = '\0'; psel = 0;
+            }
+            continue;
+        }
+        if (ev.key == TB_KEY_CTRL_K) {         /* open the palette from any mode */
+            palette_open = 1; pq[0] = '\0'; pqlen = 0; psel = 0;
             continue;
         }
         if (ev.key != TB_KEY_TAB) ac_idx = 0;  /* any non-Tab key restarts cycling */
@@ -1380,6 +1503,8 @@ int main(int argc, char **argv) {
             if (scroll < 0) scroll = 0;
         } else if (ev.ch == '?' && clen == 0) {
             help_open = 1;                     /* ? on an empty composer opens help */
+        } else if (ev.ch == ':' && clen == 0) {
+            palette_open = 1; pq[0] = '\0'; pqlen = 0; psel = 0;   /* : opens the palette */
         } else if (ev.ch != 0) {
             /* A typed codepoint: append its UTF-8 encoding to the composer. */
             utf8proc_uint8_t enc[4];
