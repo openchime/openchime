@@ -36,11 +36,15 @@ only in how identity is *proven*; both then **converge on a daemon-issued
 session** (§4), so everything downstream — SEND, backfill, reconnect,
 revocation — is identical regardless of mode.
 
-| Deployment | Mode | How identity is proven |
+The three rows below are exactly the three deployment models of ARCH-76 — OIDC
+is one of the functions a deployment federates, so the auth mode follows from
+the model rather than being an independent choice.
+
+| Deployment model (ARCH-76) | Mode | How identity is proven |
 |---|---|---|
-| Self-hosted, standalone / air-gapped | **Local** | The daemon manages accounts + passwords itself. No external dependency. |
-| Self-hosted, wants social login | **OIDC (via relay)** | The client logs in with Google/MS/Apple through the maintainer's central service, which re-issues a token the daemon trusts. |
-| Hosted tier | **OIDC (in-house)** | Same central service, operated by the maintainer alongside the daemons. |
+| **Self-hosted stand-alone** | **Local** | The daemon manages accounts + passwords itself. No dependency on any OpenChime-operated service — this model is fully air-gappable. |
+| **Self-hosted federated** | **Local** or **OIDC (via relay)** | Opting in to the federated OIDC function means the client logs in with Google/MS/Apple through the project's central service, which re-issues a token the daemon trusts. A federated deployment may equally decline OIDC and stay on local accounts while federating only push, directory, SCIM, DNS, or packages. |
+| **Hosted** | **OIDC (in-house)** | The same central service, operated by the project alongside the daemons. |
 
 There is deliberately **no "point the daemon straight at your own IdP" mode**:
 OIDC always routes through the central service. This keeps the daemon maximally
@@ -180,20 +184,31 @@ targets the high-frequency message path, not the auth bootstrap.)
   registers their workspace with central once to obtain that id.
 - **Dependency is login-time only.** Once the daemon issues a session (§4), it
   never contacts central again; existing sessions survive a central outage. Only
-  *new logins* need central up. Local mode has no central dependency at all.
+  *new logins* need central up, and the message path never does. Local mode has
+  no central dependency at all — which is what makes self-hosted stand-alone
+  (ARCH-76) possible.
 - **Privacy tradeoff:** in relay-OIDC the central service sees *who* logs into
   which workspace (identities, not message content — it never touches
-  messages/channels). A self-hoster wanting zero maintainer visibility uses
-  local mode.
+  messages/channels). A self-hoster wanting zero project visibility declines the
+  OIDC function and uses local mode; declining every federated function is
+  exactly the self-hosted stand-alone model (ARCH-76).
 
 ### 3.5 Reconciling with the island model (REQ-041)
 
-REQ-041 states the message/data path has no shared cross-tenant runtime
-component, and that remains true — data isolation (REQ-040) is untouched. The
-central OIDC service is a **login-time** shared component that exists **only in
-OIDC mode**, brokers **identity only**, and is **absent entirely in local mode**.
-REQ-041 is updated to scope its claim to the data path and acknowledge this
-login-time broker.
+REQ-041 states that **no shared runtime component sits in the message/data path,
+in any deployment model** — and that holds here: data isolation (REQ-040) is
+untouched. The central OIDC service is contacted at **login time only** (never
+per-message), brokers **identity only** (it never sees message or channel
+content), and is **absent entirely in local mode**, hence absent from every
+self-hosted stand-alone deployment.
+
+OIDC is not the only federated function, though — a self-hosted federated
+deployment may also depend on the project for push (ARCH-16), the app directory
+(REQ-175), SCIM (REQ-253), a DNS name and the workspace registry (ARCH-14), and
+packages (ARCH-20). What unites them, and what REQ-041 actually guarantees, is
+that each brokers identity, notification, discovery, or provisioning metadata
+and **none carries message content**. So federating costs availability
+independence, never message confidentiality.
 
 ### 3.6 The central service / relay (separate component)
 
@@ -203,7 +218,10 @@ daemon — and are built independently. Its contract with the daemon is narrow:
 - run the Authorization-Code-+-PKCE flow against the configured providers;
 - mint ES256 JWTs (§3.3) signed by the key the daemon pins, audience-scoped to
   the requesting workspace;
-- maintain the workspace registry (which `audience` ids are valid).
+- maintain the workspace registry (which `audience` ids are valid) — a federated
+  self-hoster registers once to obtain an id (§3.4). This registry is part of the
+  OIDC function and is never consulted for workspace discovery, which is plain
+  DNS in every model (ARCH-14).
 
 Until it exists, the daemon's OIDC path is tested with a **test issuer**:
 generate an ECDSA-P256 keypair in the test, mint central-style ES256 JWTs, and

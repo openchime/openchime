@@ -1,5 +1,23 @@
 # OpenChime
 
+A self-hostable business chat system: a C daemon, a shared C client app-core,
+and native frontends.
+
+**Three deployment models** (ARCH-76 in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
+
+| Model | Who runs the daemon | Depends on OpenChime-operated services |
+|---|---|---|
+| **Self-hosted stand-alone** | you | **none** — fully independent, and air-gappable. Federated-only features are absent, most visibly mobile push. |
+| **Self-hosted federated** | you | opt-in, per function: OIDC login, push delivery, the app directory, SCIM, an optional DNS name, package distribution. You still run the daemon and own **all message data**. |
+| **Hosted** | OpenChime | all of the above, operated for you. |
+
+In every model, **no OpenChime-operated service is ever in the message path** —
+the federated services broker identity, notification, discovery, and
+provisioning metadata, and none can read message content. Federating trades
+availability independence for capability, never message confidentiality
+(REQ-040/041).
+
 For what is actually built vs. specified, see
 **[docs/STATUS.md](docs/STATUS.md)** — a reconciliation of every requirement
 against the current tree, plus the server-robustness backlog.

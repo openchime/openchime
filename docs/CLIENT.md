@@ -320,8 +320,8 @@ row on its `SEND_ACK` — so an offline-composed send goes out on the next
 connection, deduped by the daemon.
 
 **Workspace resolution is built (REQ-010/011,** `client/core/resolve.c`**).** A
-user-typed workspace — a self-hosted domain (`chat.acme.com`) or a bare
-hosted-tier name (`acme`, which gets the configured `$OPENCHIME_SUFFIX`
+user-typed workspace — a full domain (`chat.acme.com`) or a bare
+name (`acme`, which gets the configured `$OPENCHIME_SUFFIX`
 appended) — resolves by plain DNS: SRV (`_openchime._tcp.<domain>`) first, then
 the domain's A record at 443. A resolution failure is a distinct status, so the
 TUI tells "workspace not found" apart from "could not reach the server" (connect)

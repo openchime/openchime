@@ -45,8 +45,8 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 031 channel membership, public/private read-post | ✅ | Public auto-joins the poster; private is members-only. |
 | 032 edit/delete own + admin moderation delete | ✅ | `deleted_by` distinguishes self vs moderator. |
 | 033 tenant + channel invite/remove | ✅ | Tenant invite/remove owner/admin-gated; channel invite/remove any member. |
-| 040 per-tenant isolation | ➖ | One process + one DB per tenant; no shared query surface. |
-| 041 no shared runtime in message path | ➖ | Only shared dependency is the login-time OIDC relay (OIDC mode only). |
+| 040 per-tenant isolation | ➖ | One process + one DB per tenant; no shared query surface. Identical in all three deployment models (ARCH-76). |
+| 041 no shared runtime in message path | ➖ | Holds in all three deployment models (ARCH-76): no OpenChime-operated service is ever in the message/data path. Federated deployments additionally depend on the project for OIDC, push, directory, SCIM, DNS name, and packages — all identity/notification/discovery/provisioning metadata, never message content. Stand-alone depends on none of them. |
 
 ### 2. Messaging
 
@@ -88,7 +88,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 130 per-channel notification level | ✅ | `SET_NOTIFY_PREF`/`LIST_NOTIFY_PREFS` → `NOTIFY_PREFS`; server-authoritative level (all/mentions/none) in `notification_prefs` (migration 0012), synced to all the user's devices (ARCH-72). |
 | 131 do-not-disturb schedule | ✅ | `SET_DND` stores a daily UTC minutes-of-day window on `users`; governs push, not in-app unread (ARCH-72). |
 | 132 APNs/FCM push | ⛔ | Deferred mobile-push milestone: needs the push transport + per-message notify decision. Settings (REQ-130/131) that gate it are built. |
-| 133 self-host push gateway | ⛔ | Tied to REQ-132. |
+| 133 push is a federated function | ⛔ | Tied to REQ-132. Push requires the project's gateway (the mobile clients are signed under the project's developer accounts), so it is available in the self-hosted federated and hosted models and **absent in self-hosted stand-alone** (ARCH-76/ARCH-16). |
 | 140 file attachments (object storage) | 🟡 | **Built + tested end-to-end:** proxied chunked upload/download over the wire (ARCH-69), `attachments` migration 0009, frames §5.14, and **message-linking** — a SEND references uploaded attachments (self-describing optional list), the BROADCAST carries their metadata inline, and backfill re-attaches them on reconnect. Thread replies carry attachments too (SEND_REPLY/THREAD_REPLY + LIST_THREAD). Two blob backends behind the ARCH-70 vtable: local-FS (default) and S3/MinIO (`OPENCHIME_BLOB_BACKEND=s3`, SigV4-signed, verified end-to-end against MinIO). **Surfaced in the TUI** (`/upload <path>`, `/download <id> [path]`): the net thread runs one transfer at a time as a state machine over the frame stream, respecting the upload window; the headless test round-trips a multi-chunk blob. |
 | 141 attachment access control | ✅ | Proxied bytes → download authorized by the ordinary channel-read check on the attachment's channel; no signed URLs (ARCH-69). Verified over the wire (cross-user fetch allowed; non-member refused) and in dbwriter units. |
 | 150–152 server-relayed audio | ✅ (server) | **Built + tested end-to-end** (ARCH-73): `CALL_JOIN`/`CALL_LEAVE` + per-channel ephemeral roster on the net thread; a forked UDP relay sidecar (`daemon/audio_sidecar.c`) that the daemon drives over a Unix socket (AUTHORIZE/REVOKE) and advertises via `udp_port`+token in `CALL_JOINED`. The sidecar relays opaque Opus payloads to a call's participants — no libopus server-side. Disconnect drops-and-re-rosters + REVOKEs, with a UDP silence sweep (REQ-152). An itest joins two clients and relays audio between them over real UDP. **Client-side** Opus encode/decode + UDP I/O is Phase-2 client work. |

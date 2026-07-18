@@ -14,9 +14,12 @@ forward scope. This present-perfect style mirrors the reproduction-grade style o
 OpenChime's sibling projects; here it functions as a forward specification, with
 STATUS.md tracking progress against it.
 
-This document is technical scope only. Business model, pricing, licensing,
-and go-to-market decisions are out of scope; they are not tracked in any
-document in this repository as of this writing. Technical design decisions —
+This document is technical scope only. **Deployment topology is an
+architectural concern and is tracked here** — the three deployment models
+(self-hosted stand-alone, self-hosted federated, hosted; ARCH-76) determine
+what a given deployment does and does not do, so requirements state which
+models they apply to. Pricing, licensing, and go-to-market decisions remain
+out of scope and are not tracked in any document in this repository. Technical design decisions —
 *how* a requirement below has been implemented — live in
 [ARCHITECTURE.md](./ARCHITECTURE.md) and are cross-referenced by `ARCH-N` id
 where one exists. Where no architecture decision yet covers a requirement,
@@ -32,9 +35,16 @@ the requirement says so explicitly rather than implying one.
   Rationale, when it matters, is a separate sentence after the requirement.
 - "The system" refers to the daemon and a client jointly. "The daemon" and
   "the client" are used when a requirement applies to only one side.
-- "Tenant" refers to one self-hosted or hosted-service organization workspace
-  (one daemon, one SQLite database, per ARCH-4). "Organization" and "tenant"
-  are used interchangeably.
+- "Tenant" refers to one organization's workspace — one daemon, one SQLite
+  database (ARCH-4) — in any of the three deployment models (ARCH-76).
+  "Organization" and "tenant" are used interchangeably.
+- "Deployment model" means one of the three shapes defined in ARCH-76:
+  **self-hosted stand-alone** (no dependency on any OpenChime-operated
+  service), **self-hosted federated** (operator runs the daemon and owns all
+  message data, opting in to OpenChime-operated services for OIDC, push, the
+  app directory, SCIM, an optional DNS name, and packages), and **hosted**
+  (OpenChime operates the daemon and those services). A requirement that
+  applies to only some models says so.
 - Cross-references cite the implementing decision as `(ARCH-N)`. A
   requirement with no such citation is not yet backed by an architecture
   decision and is flagged inline as **[needs ARCH decision]**.
@@ -67,11 +77,16 @@ the requirement says so explicitly rather than implying one.
 - **REQ-010.** The client has collected a **workspace** (the tenant's
   address) and the user's **email** at sign-in, and has resolved the workspace
   to a daemon address by plain DNS before opening a connection — with no
-  hosted resolution service involved (ARCH-14). A self-hosted workspace given
-  as a full domain (e.g. `chat.acme.com`) has resolved via SRV records plus
-  optional `.well-known` metadata; a hosted-tier workspace given as a bare name
-  (e.g. `acme`) has had the service's known DNS suffix appended client-side
-  (`acme` → `acme.openchime.example`) and then resolved by ordinary DNS. The
+  resolution *service* involved in any deployment model (ARCH-14/76). A
+  workspace given as a full domain (e.g. `chat.acme.com`) — the stand-alone
+  case, and the federated case where the operator keeps their own DNS — has
+  resolved via SRV records plus optional `.well-known` metadata; a workspace
+  given as a bare name (e.g. `acme`) — a hosted tenant, or a federated
+  self-hoster who took a vanity name under the service suffix — has had the
+  service's known DNS suffix appended client-side (`acme` →
+  `acme.openchime.example`) and then resolved by ordinary DNS. In every case
+  the mapping has lived in static DNS records, so no lookup has reached an
+  OpenChime-operated service. The
   email has been used only to drive the OIDC login (REQ-020), not to derive
   the workspace.
 - **REQ-011.** Resolution failure (the workspace name does not resolve in DNS,
@@ -107,8 +122,11 @@ the requirement says so explicitly rather than implying one.
 
 - **REQ-020.** The system has authenticated a user in one of two deployment-selected
   modes (ARCH-19, ARCH-55, [AUTH.md](./AUTH.md)): **local** (daemon-managed
-  username+password) or **OIDC** (social login via the maintainer's central
-  service). In OIDC mode the login has been a client-driven browser flow using
+  username+password) or **OIDC** (social login via the project's central
+  service). Because OIDC is a federated function (ARCH-76), self-hosted
+  stand-alone deployments have used **local** mode; self-hosted federated
+  deployments have used either, choosing OIDC precisely by opting in; hosted
+  deployments have used OIDC. In OIDC mode the login has been a client-driven browser flow using
   platform-native auth session APIs — `ASWebAuthenticationSession` on iOS/macOS,
   a loopback redirect on desktop — with PKCE. The daemon has advertised its mode
   to the client before authentication.
@@ -179,20 +197,37 @@ the requirement says so explicitly rather than implying one.
   shared connection or shared query surface (ARCH-4, ARCH-7). Isolation has
   therefore been a property of the deployment topology, not of a
   tenant-ID filter inside shared queries.
-- **REQ-041.** No shared, always-on runtime component has existed in the
-  message/data path across tenants. Workspace resolution has been plain DNS
-  (REQ-010, ARCH-14), so the name-to-daemon-address mapping has lived in DNS
-  records — provisioned at tenant creation — rather than in a bespoke hosted
-  resolution service. The cross-tenant surfaces touching data have therefore been
-  static (DNS, and for the hosted tier the tenant-provisioning step that writes
-  those records), holding no message, channel, or user content and running no
-  request-serving process in the message path — which strengthens REQ-040's
-  isolation guarantee. **The one shared runtime component has been the central
-  OIDC service (ARCH-56), and only in OIDC mode:** it is contacted at *login
-  time* only (never per-message), brokers *identity* only (it never sees message
-  or channel content), and is absent entirely in local mode. So multi-tenant
-  *data* isolation has been unconditional; the only shared dependency has been a
-  login-time identity broker, present only where a deployment opts into OIDC.
+- **REQ-041.** **No shared, always-on runtime component has existed in the
+  message/data path — in any deployment model (ARCH-76).** Every message a
+  tenant sends, stores, backfills, or searches has been handled solely by that
+  tenant's own daemon and database (REQ-040); no OpenChime-operated service has
+  ever received, relayed, stored, or been able to read message content, whether
+  the deployment was stand-alone, federated, or hosted. Workspace resolution has
+  been plain DNS (REQ-010, ARCH-14), so the name-to-daemon-address mapping has
+  lived in static DNS records rather than in a resolution service, and no lookup
+  traffic has reached the project.
+
+  A **self-hosted federated** deployment (ARCH-76) has additionally depended on
+  OpenChime-operated services for functions it opted into — OIDC login
+  (ARCH-56), push delivery (ARCH-16), the app directory (REQ-175), SCIM
+  (REQ-253), an optional DNS name and the workspace/audience registry (ARCH-14),
+  and package distribution (ARCH-20). Each of these has brokered only
+  **identity, notification, discovery, or provisioning metadata**: which user
+  signed in to which workspace, that a notification is due and for whom, which
+  integrations exist, which accounts to provision. **None has carried message
+  content, and none has sat in the message path**, so a federated deployment has
+  held exactly the same data-sovereignty guarantee as a stand-alone one — it has
+  traded independence of *availability* (those functions stop when the project's
+  services are unreachable) for capability, never confidentiality of messages.
+
+  A **self-hosted stand-alone** deployment has depended on no OpenChime-operated
+  service at all at runtime, at the cost of the federated-only features — most
+  visibly mobile push (REQ-133). A **hosted** deployment has run the same daemon
+  with the same per-tenant isolation, operated by the project.
+
+  So multi-tenant *data* isolation has been unconditional across all three
+  models; what has varied between them is only which non-message functions a
+  deployment has delegated.
 
 ---
 
@@ -372,11 +407,19 @@ the requirement says so explicitly rather than implying one.
 - **REQ-132.** Push notifications have been delivered via APNs on iOS/macOS
   and FCM on Android (ARCH-16), at no per-notification cost, per the
   providers' free tiers as of this writing.
-- **REQ-133.** A self-hosted deployment has routed push delivery through an
-  operator-run push gateway rather than registering its own APNs/FCM
-  application identity, because the published mobile clients are signed
-  under the maintaining project's developer accounts, not the self-hoster's
-  (ARCH-16).
+- **REQ-133.** Push delivery has been a **federated function** (ARCH-76): the
+  published mobile clients are signed under the maintaining project's Apple and
+  Google developer accounts, so only the project has been able to mint valid
+  APNs/FCM credentials for them, and a self-hoster has not been able to register
+  its own application identity for the published apps (ARCH-16). Consequently
+  push has been available in the **self-hosted federated** and **hosted** models
+  — routed through the project's push gateway — and **absent in self-hosted
+  stand-alone**, whose mobile clients have fallen back to in-app/foreground
+  notification only. Where the gateway has been used it has received only the
+  fact that a notification is due and for whom, never message content (REQ-041).
+  An operator unwilling to depend on the gateway and unwilling to lose push has
+  had one remaining option: build and sign their own mobile clients under their
+  own developer accounts, which is outside what this project distributes.
 
 ---
 
@@ -399,7 +442,7 @@ the requirement says so explicitly rather than implying one.
   the same membership path as reading the message** (`channel_read_access`) —
   there is no signed-URL scheme, TTL, or object-store ACL. Proxying (not
   presigned URLs) is forced by TOFU pinning (ARCH-10, one trusted cert, no CA
-  bundle) and the island model (ARCH-4/26, object store stays private).
+  bundle) and the island model (ARCH-4/26, the tenant's object store stays private).
 
 ### 6.2 Audio Conferencing
 
@@ -476,9 +519,12 @@ the requirement says so explicitly rather than implying one.
   **[needs ARCH decision — workflow model + execution surface.]**
 - **REQ-175.** Installable integrations have been discoverable through an **app
   directory** curated by the maintaining project, from which an owner/admin could
-  install an app into their tenant. Directory hosting is a central-service concern
-  (cf. ARCH-56), not the daemon's. **[needs ARCH decision — directory hosting +
-  per-tenant install/permission model.]**
+  install an app into their tenant. Directory hosting has been a **federated
+  function** (ARCH-76, cf. ARCH-56), not the daemon's — so the directory has been
+  available to self-hosted federated and hosted deployments, while a self-hosted
+  stand-alone deployment has installed integrations by direct configuration
+  instead of browsing a curated catalog. **[needs ARCH decision — directory
+  hosting + per-tenant install/permission model.]**
 
 ---
 
@@ -502,7 +548,7 @@ the requirement says so explicitly rather than implying one.
 - **REQ-183.** Certificate trust for the client-daemon connection has been
   established via TOFU (trust-on-first-connect) pinning against a
   self-signed certificate the daemon generates on first run, not CA-chain
-  validation, uniformly across hosted and self-hosted tenants (ARCH-10).
+  validation, uniformly across all three deployment models (ARCH-76) (ARCH-10).
   The one exception has been the incoming-webhooks endpoint (REQ-171), which
   uses a real CA-signed certificate because its clients are uncontrolled
   third parties.
@@ -661,6 +707,7 @@ None are yet backed by an architecture decision.*
 - **REQ-253.** In OIDC/enterprise deployments, user provisioning and
   deprovisioning have been automatable via **SCIM** from the organization's
   identity provider, so account lifecycle matched the directory. Like OIDC this
-  has been brokered through the central service (ARCH-56), not the daemon, and has
-  no local-mode applicability. **[needs ARCH decision — SCIM endpoint placement
+  has been a **federated function** brokered through the central service (ARCH-76,
+  ARCH-56), not the daemon — available to self-hosted federated and hosted
+  deployments, with no local-mode or stand-alone applicability. **[needs ARCH decision — SCIM endpoint placement
   (central service).]**
