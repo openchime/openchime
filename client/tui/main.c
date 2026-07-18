@@ -11,8 +11,11 @@
  *        openchime-tui <host> <port> [user:pass]   (dev/local direct connect)
  *        (credentials also read from $OPENCHIME_CRED = "user:pass")
  *
- * Keys: type + Enter to send · Tab next channel · ↑/↓ + PgUp/PgDn scroll ·
- *       ? help · Ctrl-Q quit. Commands (on the last message in the focused channel):
+ * Keys: type + Enter to send · Tab autocompletes the trailing token (commands,
+ *       #channels, @users, :emoji:) or switches channel when the composer is
+ *       empty · ↑/↓ + PgUp/PgDn scroll · ? help · Ctrl-Q quit. A live suggestion
+ *       strip shows candidates as you type. Commands (on the last message in the
+ *       focused channel):
  *       /react <emoji> · /reactions (who reacted to it) · /edit <text> ·
  *       /delete · /thread (open its thread; then Enter posts a reply) ·
  *       /search <query> · /close (leave a thread/search/roster/reactions
@@ -40,6 +43,7 @@
 #include "secret_backend.h" /* OS keyring for the session token */
 #include "protocol.h"   /* OC_PRESENCE_*, OC_SESSION_TOKEN_LEN */
 
+#include <ctype.h>
 #include <locale.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -449,9 +453,119 @@ static void draw_help(int W, int H) {
     }
 }
 
+/* ---- composer autocomplete (commands, channels, @users, :emoji:) ----------- */
+
+typedef struct { char repl[80]; char disp[96]; } ac_cand;
+
+static int ci_prefix(const char *s, const char *pre) {
+    for (; *pre; s++, pre++)
+        if (!*s || tolower((unsigned char)*s) != tolower((unsigned char)*pre)) return 0;
+    return 1;
+}
+
+static const char *AC_COMMANDS[] = {
+    "/react", "/reactions", "/edit", "/delete", "/thread", "/search", "/close",
+    "/create", "/join", "/leave", "/list", "/dm", "/who", "/away", "/online",
+    "/prefs", "/notify", "/dnd", "/role", "/invite", "/remove", "/webhook",
+    "/upload", "/download", "/logout", "/help",
+};
+
+static const struct { const char *name; const char *emoji; } AC_EMOJI[] = {
+    {"+1","\xf0\x9f\x91\x8d"}, {"-1","\xf0\x9f\x91\x8e"}, {"thumbsup","\xf0\x9f\x91\x8d"},
+    {"heart","\xe2\x9d\xa4\xef\xb8\x8f"}, {"fire","\xf0\x9f\x94\xa5"}, {"tada","\xf0\x9f\x8e\x89"},
+    {"smile","\xf0\x9f\x98\x84"}, {"laughing","\xf0\x9f\x98\x86"}, {"joy","\xf0\x9f\x98\x82"},
+    {"grin","\xf0\x9f\x98\x81"}, {"wink","\xf0\x9f\x98\x89"}, {"thinking","\xf0\x9f\xa4\x94"},
+    {"eyes","\xf0\x9f\x91\x80"}, {"100","\xf0\x9f\x92\xaf"}, {"clap","\xf0\x9f\x91\x8f"},
+    {"pray","\xf0\x9f\x99\x8f"}, {"rocket","\xf0\x9f\x9a\x80"}, {"star","\xe2\xad\x90"},
+    {"sparkles","\xe2\x9c\xa8"}, {"check","\xe2\x9c\x85"}, {"x","\xe2\x9d\x8c"},
+    {"warning","\xe2\x9a\xa0\xef\xb8\x8f"}, {"bulb","\xf0\x9f\x92\xa1"}, {"bug","\xf0\x9f\x90\x9b"},
+    {"wave","\xf0\x9f\x91\x8b"}, {"ok","\xf0\x9f\x91\x8c"}, {"muscle","\xf0\x9f\x92\xaa"},
+    {"cry","\xf0\x9f\x98\xa2"}, {"sob","\xf0\x9f\x98\xad"}, {"sweat","\xf0\x9f\x98\x85"},
+    {"sunglasses","\xf0\x9f\x98\x8e"}, {"ghost","\xf0\x9f\x91\xbb"}, {"skull","\xf0\x9f\x92\x80"},
+    {"coffee","\xe2\x98\x95"}, {"pizza","\xf0\x9f\x8d\x95"}, {"beer","\xf0\x9f\x8d\xba"},
+    {"cake","\xf0\x9f\x8e\x82"}, {"gift","\xf0\x9f\x8e\x81"}, {"zap","\xe2\x9a\xa1"},
+    {"question","\xe2\x9d\x93"},
+};
+
+/* Context-aware completions for the current (trailing) composer token. Returns
+ * the candidate count, fills out[], and sets *repl_start to the byte offset where
+ * the replacement begins. Recomputed live each frame and on Tab. */
+static int ac_candidates(const oc_model *m, const char *s, ac_cand *out, int max, int *repl_start) {
+    size_t len = strlen(s);
+    int ws = 0;
+    for (int i = (int)len - 1; i >= 0; i--) if (s[i] == ' ') { ws = i + 1; break; }
+    const char *tok = s + ws;
+    int n = 0;
+    *repl_start = ws;
+
+    if (ws == 0 && tok[0] == '/') {                          /* slash command */
+        *repl_start = 0;
+        for (size_t i = 0; i < sizeof AC_COMMANDS / sizeof *AC_COMMANDS && n < max; i++)
+            if (ci_prefix(AC_COMMANDS[i] + 1, tok + 1)) {
+                snprintf(out[n].repl, sizeof out[n].repl, "%s", AC_COMMANDS[i]);
+                snprintf(out[n].disp, sizeof out[n].disp, "%s", AC_COMMANDS[i]);
+                n++;
+            }
+        return n;
+    }
+    if (tok[0] == ':' && !strchr(tok + 1, ':')) {            /* :emoji: shortcode */
+        for (size_t i = 0; i < sizeof AC_EMOJI / sizeof *AC_EMOJI && n < max; i++)
+            if (ci_prefix(AC_EMOJI[i].name, tok + 1)) {
+                snprintf(out[n].repl, sizeof out[n].repl, "%s", AC_EMOJI[i].emoji);
+                snprintf(out[n].disp, sizeof out[n].disp, ":%s: %s", AC_EMOJI[i].name, AC_EMOJI[i].emoji);
+                n++;
+            }
+        return n;
+    }
+    if (tok[0] == '@') {                                     /* @mention */
+        for (size_t i = 0; i < m->n_users && n < max; i++)
+            if (m->users[i].name[0] && ci_prefix(m->users[i].name, tok + 1)) {
+                snprintf(out[n].repl, sizeof out[n].repl, "@%s", m->users[i].name);
+                snprintf(out[n].disp, sizeof out[n].disp, "%s", m->users[i].name);
+                n++;
+            }
+        return n;
+    }
+    if (tok[0] == '#') {                                     /* #channel in a message */
+        for (size_t i = 0; i < m->n_channels && n < max; i++) {
+            const oc_channel *c = &m->channels[i];
+            if (c->kind != OC_CHANNEL_KIND_DM && c->name && ci_prefix(c->name, tok + 1)) {
+                snprintf(out[n].repl, sizeof out[n].repl, "#%s", c->name);
+                snprintf(out[n].disp, sizeof out[n].disp, "%s", c->name);
+                n++;
+            }
+        }
+        return n;
+    }
+    if (s[0] == '/') {                                       /* command argument */
+        char cmd[24]; int ci = 0;
+        for (; s[ci] && s[ci] != ' ' && ci < (int)sizeof cmd - 1; ci++) cmd[ci] = s[ci];
+        cmd[ci] = '\0';
+        int chan = (strcmp(cmd, "/join") == 0 || strcmp(cmd, "/leave") == 0);
+        int usr  = (strcmp(cmd, "/dm") == 0 || strcmp(cmd, "/role") == 0 || strcmp(cmd, "/remove") == 0);
+        if (chan)
+            for (size_t i = 0; i < m->n_channels && n < max; i++) {
+                const oc_channel *c = &m->channels[i];
+                if (c->kind != OC_CHANNEL_KIND_DM && c->name && ci_prefix(c->name, tok)) {
+                    snprintf(out[n].repl, sizeof out[n].repl, "%s", c->name);
+                    snprintf(out[n].disp, sizeof out[n].disp, "%s", c->name);
+                    n++;
+                }
+            }
+        else if (usr)
+            for (size_t i = 0; i < m->n_users && n < max; i++)
+                if (m->users[i].name[0] && ci_prefix(m->users[i].name, tok)) {
+                    snprintf(out[n].repl, sizeof out[n].repl, "%s", m->users[i].name);
+                    snprintf(out[n].disp, sizeof out[n].disp, "%s", m->users[i].name);
+                    n++;
+                }
+        return n;
+    }
+    return 0;
+}
+
 static void render(oc_client *cl, size_t focus, const char *composer,
-                   size_t clen, int scroll, int help_open) {
-    (void)clen;
+                   size_t clen, int scroll, int help_open, int ac_idx) {
     const oc_model *m = oc_client_model(cl);
     int W = tb_width(), H = tb_height();
     tb_clear();
@@ -557,17 +671,35 @@ static void render(oc_client *cl, size_t focus, const char *composer,
         }
     }
 
-    /* Status line (row H-3): last status / error + typing indicator. */
+    /* Row H-3: the autocomplete suggestion strip when completing, else the status
+     * line (last status/error + typing indicator). */
     fill_row(H - 3, 0, W, TB_DEFAULT);
-    char st[220]; snprintf(st, sizeof st, " %s%s", m->status[0] ? m->status : "", scroll > 0 ? "   [scrolled]" : "");
-    int sx = draw_clip(0, H - 3, W, st, TB_YELLOW, TB_DEFAULT);
-    if (fc) {
-        uint64_t tp[8]; size_t nt = oc_model_typing(m, fc->channel_id, m->user_id, tp, 8);
-        if (nt) {
-            char tl[140];
-            if (nt == 1) snprintf(tl, sizeof tl, "  ✎ %s is typing…", name_for(fc, tp[0]));
-            else         snprintf(tl, sizeof tl, "  ✎ %zu people are typing…", nt);
-            draw_clip(sx, H - 3, W, tl, TB_CYAN, TB_DEFAULT);
+    ac_cand cands[16]; int rs, nc = 0;
+    if (clen > 0) nc = ac_candidates(m, composer, cands, 16, &rs);
+    if (nc > 0) {
+        int active = ((ac_idx % nc) + nc) % nc;
+        int cx = draw_clip(0, H - 3, W, " \xe2\x96\xb8 ", TB_CYAN | TB_BOLD, TB_DEFAULT);   /* ▸ */
+        for (int i = 0; i < nc && cx < W - 2; i++) {
+            char item[110]; snprintf(item, sizeof item, "%s", cands[i].disp);
+            uintattr_t fg = (i == active) ? TB_BLACK : TB_WHITE | TB_BOLD;
+            uintattr_t bg = (i == active) ? TB_CYAN : TB_DEFAULT;
+            if (i == active) tb_set_cell(cx - 1, H - 3, ' ', fg, bg);
+            cx = draw_clip(cx, H - 3, W, item, fg, bg);
+            if (i == active && cx < W) tb_set_cell(cx, H - 3, ' ', fg, bg);
+            cx = draw_clip(cx, H - 3, W, "  ", TB_DEFAULT, TB_DEFAULT);
+        }
+        draw_clip(cx, H - 3, W, nc > 1 ? "(Tab cycles)" : "(Tab)", TB_BLACK | TB_BOLD, TB_DEFAULT);
+    } else {
+        char st[220]; snprintf(st, sizeof st, " %s%s", m->status[0] ? m->status : "", scroll > 0 ? "   [scrolled]" : "");
+        int sx = draw_clip(0, H - 3, W, st, TB_YELLOW, TB_DEFAULT);
+        if (fc) {
+            uint64_t tp[8]; size_t nt = oc_model_typing(m, fc->channel_id, m->user_id, tp, 8);
+            if (nt) {
+                char tl[140];
+                if (nt == 1) snprintf(tl, sizeof tl, "  ✎ %s is typing…", name_for(fc, tp[0]));
+                else         snprintf(tl, sizeof tl, "  ✎ %zu people are typing…", nt);
+                draw_clip(sx, H - 3, W, tl, TB_CYAN, TB_DEFAULT);
+            }
         }
     }
 
@@ -1073,6 +1205,7 @@ int main(int argc, char **argv) {
     size_t focus = 0;
     int scroll = 0;
     int help_open = 0;
+    int ac_idx = 0;                           /* autocomplete cycle index */
     uint64_t last_focus_cid = 0;
     time_t last_typing = 0;                   /* throttle outbound TYPING signals */
     int running = 1, logging_out = 0;
@@ -1093,7 +1226,7 @@ int main(int argc, char **argv) {
             if (cid != last_focus_cid) { scroll = 0; last_focus_cid = cid; }
         }
 
-        render(cl, focus, composer, clen, scroll, help_open);
+        render(cl, focus, composer, clen, scroll, help_open, ac_idx);
 
         struct tb_event ev;
         int rc = tb_peek_event(&ev, 30);
@@ -1107,6 +1240,7 @@ int main(int argc, char **argv) {
             else help_open = 0;
             continue;
         }
+        if (ev.key != TB_KEY_TAB) ac_idx = 0;  /* any non-Tab key restarts cycling */
         if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) {
             running = 0;
         } else if (ev.key == TB_KEY_ENTER) {
@@ -1124,7 +1258,19 @@ int main(int argc, char **argv) {
         } else if (ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2) {
             backspace_utf8(composer, &clen);
         } else if (ev.key == TB_KEY_TAB) {
-            if (nch) focus = (focus + 1) % nch;
+            if (clen > 0) {                    /* autocomplete the trailing token */
+                ac_cand cands[16]; int rs;
+                int n = ac_candidates(oc_client_model(cl), composer, cands, 16, &rs);
+                if (n > 0) {
+                    const char *repl = cands[((ac_idx % n) + n) % n].repl;
+                    char nb[COMPOSER_CAP];
+                    int k = snprintf(nb, sizeof nb, "%.*s%s", rs, composer, repl);
+                    if (k > 0 && k < (int)sizeof nb) { memcpy(composer, nb, (size_t)k + 1); clen = (size_t)k; }
+                    ac_idx++;
+                }
+            } else if (nch) {                  /* empty composer: switch channel */
+                focus = (focus + 1) % nch;
+            }
         } else if (ev.key == TB_KEY_ARROW_UP) {
             scroll += 1;
         } else if (ev.key == TB_KEY_ARROW_DOWN) {
