@@ -105,7 +105,7 @@ static void bootstrap_users(oc_dbwriter *db, const char *spec) {
     free(dup);
 }
 
-/* --- /healthz (ARCH-25) ------------------------------------------------- */
+/* --- /healthz (ARCH-25) + the landing page -------------------------------- */
 
 static const char HEALTH_RESPONSE[] =
     "HTTP/1.1 200 OK\r\n"
@@ -114,6 +114,54 @@ static const char HEALTH_RESPONSE[] =
     "Connection: close\r\n"
     "\r\n"
     "OK";
+
+/* A workspace address is a perfectly natural thing to paste into a browser, so
+ * every non-/healthz path answers with this instead of a bare 404 / connection
+ * reset: enough to confirm "yes, an OpenChime workspace lives here, you need a
+ * client", and nothing more. It deliberately leaks no workspace identity, user
+ * list, or version — an unauthenticated stranger learns only that the daemon is
+ * running. Static and self-contained (no external fetches). */
+static const char LANDING_BODY[] =
+    "<!DOCTYPE html>\n"
+    "<html lang=\"en\">\n"
+    "<head>\n"
+    "<meta charset=\"utf-8\">\n"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
+    "<title>OpenChime</title>\n"
+    "<style>\n"
+    "body{background:#14161a;color:#d8dee9;font:16px/1.6 ui-sans-serif,system-ui,"
+    "-apple-system,Segoe UI,Roboto,sans-serif;display:flex;align-items:center;"
+    "justify-content:center;min-height:100vh;margin:0}\n"
+    "main{max-width:32rem;padding:2rem;text-align:center}\n"
+    "h1{font-size:1.5rem;font-weight:600;margin:0 0 .5rem}\n"
+    "p{margin:.5rem 0;color:#9aa5b1}\n"
+    "a{color:#88c0d0}\n"
+    "</style>\n"
+    "</head>\n"
+    "<body>\n"
+    "<main>\n"
+    "<h1>OpenChime</h1>\n"
+    "<p>An OpenChime workspace is running here.</p>\n"
+    "<p>This address speaks the OpenChime protocol, not the web &mdash; "
+    "open it in an OpenChime client to sign in.</p>\n"
+    "<p><a href=\"https://github.com/danheskett/openchime\">openchime</a></p>\n"
+    "</main>\n"
+    "</body>\n"
+    "</html>\n";
+
+/* Is the request line's path exactly `want` (ignoring any ?query)? `req` is the
+ * raw request as read; a malformed or truncated request line matches nothing. */
+static int path_is(const char *req, size_t len, const char *want) {
+    const char *sp = memchr(req, ' ', len);            /* end of the method */
+    if (!sp) return 0;
+    const char *p = sp + 1;
+    size_t rest = len - (size_t)(p - req);
+    size_t plen = 0;
+    while (plen < rest && p[plen] != ' ' && p[plen] != '?' &&
+           p[plen] != '\r' && p[plen] != '\n') plen++;
+    size_t wlen = strlen(want);
+    return plen == wlen && memcmp(p, want, wlen) == 0;
+}
 
 static void *health_thread(void *arg) {
     int port = *(int *)arg;
@@ -140,8 +188,24 @@ static void *health_thread(void *arg) {
         if (fd < 0) continue;
         char buf[512];
         ssize_t n = read(fd, buf, sizeof buf);
-        (void)n;
-        ssize_t w = write(fd, HEALTH_RESPONSE, sizeof HEALTH_RESPONSE - 1);
+        size_t got = (n > 0) ? (size_t)n : 0;
+        ssize_t w;
+        if (path_is(buf, got, "/healthz")) {
+            w = write(fd, HEALTH_RESPONSE, sizeof HEALTH_RESPONSE - 1);
+        } else {
+            /* Everything else — including `/` and any unknown path — gets the
+             * landing page, so a browser never sees a 404 or a raw reset. */
+            char head[192];
+            int hl = snprintf(head, sizeof head,
+                              "HTTP/1.1 200 OK\r\n"
+                              "Content-Type: text/html; charset=utf-8\r\n"
+                              "Content-Length: %zu\r\n"
+                              "Connection: close\r\n"
+                              "\r\n",
+                              sizeof LANDING_BODY - 1);
+            w = write(fd, head, (size_t)hl);
+            if (w > 0) w = write(fd, LANDING_BODY, sizeof LANDING_BODY - 1);
+        }
         (void)w;
         close(fd);
     }
