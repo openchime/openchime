@@ -433,8 +433,12 @@ the requirement says so explicitly rather than implying one.
 ### 6.1 File Attachments
 
 - **REQ-140.** A user has been able to upload and share a file attachment in
-  a channel, thread, or direct message, persisted in object storage rather
-  than in SQLite (ARCH-17). Bytes are **proxied through the daemon** over the
+  a channel, thread, or direct message, persisted outside SQLite (ARCH-17) —
+  either on the box's **local disk** or in an **operator-supplied S3-compatible
+  service**, selected by whether S3 credentials are configured (ARCH-70).
+  OpenChime has shipped **no object-storage server of its own** in any
+  deployment model: where S3 is used the daemon has been purely a *client* of a
+  service the operator provides. Bytes are **proxied through the daemon** over the
   existing pinned-TLS connection in chunks (ARCH-69, PROTOCOL.md §5.14); the
   blob lands in object storage behind a swappable adapter (ARCH-70) while only a
   pointer + metadata row is stored in SQLite (SCHEMA.md migration 0009). An
@@ -442,7 +446,12 @@ the requirement says so explicitly rather than implying one.
   message model through delivery, backfill, threads, and DMs.
 - **REQ-141.** An attachment has remained retrievable by any user authorized
   to read the message it is attached to (REQ-031), and by no one else, for
-  as long as the message itself exists. Resolved (ARCH-69): because every byte
+  as long as the message itself exists — **except where storage pressure forced
+  its eviction (REQ-215) or an operator's retention policy aged it out
+  (REQ-250)**. In both exceptions the attachment's metadata has survived as a
+  tombstone so the message stays intelligible; the *authorization* rule below is
+  unconditional and has never been relaxed for any reason. Resolved (ARCH-69):
+  because every byte
   is proxied through the daemon, access control is a **single in-daemon check on
   the same membership path as reading the message** (`channel_read_access`) —
   there is no signed-URL scheme, TTL, or object-store ACL. Proxying (not
@@ -596,6 +605,64 @@ the requirement says so explicitly rather than implying one.
   concurrent client connections per tenant within the lean memory profile
   (ARCH-30), sufficient for the 50-100 target customer scale referenced
   elsewhere in this project.
+
+### 10.1 Disk-Space Management
+
+*Design premise: a self-hosted box is assumed to be **unmanaged** — nobody is
+watching a dashboard, and nobody will intervene before the disk fills. The
+daemon has therefore had to keep itself alive on a finite disk without operator
+action (ARCH-77). These requirements apply to the **local** blob backend; where
+attachments live in external S3 (REQ-140) only database growth is local, and
+only REQ-212/213/214 apply.*
+
+- **REQ-212.** **Text messaging has survived attachment-storage exhaustion.**
+  No amount of attachment data has been able to prevent the daemon from
+  accepting, storing, delivering, or searching messages: the database's required
+  headroom has been reserved and never consumed by attachment bytes. A box out
+  of attachment space has degraded to "attachments unavailable," never to "chat
+  down." This has been the highest-priority invariant of this subsection —
+  every mechanism below exists to preserve it.
+- **REQ-213.** The daemon has continuously reclaimed storage that nothing was
+  promised to keep, without operator action and without user-visible loss:
+  staged bytes from aborted or interrupted uploads, and blobs orphaned by
+  message deletion (REQ-052) or by an upload that was never referenced by a
+  message. This garbage collection has run before any destructive measure, so
+  that reclaimable waste has always been freed ahead of data a user could still
+  see.
+- **REQ-214.** The daemon has monitored available disk space and surfaced it to
+  owners and admins — current attachment usage, free space, and whether the
+  daemon is currently under storage pressure — so that an operator who *is*
+  paying attention has been able to act before automation did.
+- **REQ-215.** Under sustained storage pressure, after REQ-213's reclamation was
+  exhausted, the daemon has **automatically evicted attachment blobs, oldest
+  first, by default and without operator action**, until free space returned
+  above its recovery watermark. This is a deliberate trade of durability for
+  unattended uptime, made because the target deployment is an unmanaged box
+  where the alternative outcome is a full disk and a dead tenant (REQ-212).
+  Constrained as follows, so the trade stays bounded:
+  - **Messages have never been evicted.** Only attachment *bytes* are
+    reclaimed; message history has remained complete and searchable, so
+    REQ-053's "no retention cutoff" has continued to hold for messages.
+  - **An evicted attachment has left a tombstone, not a hole.** Its metadata row
+    — filename, size, uploader, timestamp — has been retained and marked
+    unavailable, so a client has rendered "this attachment is no longer
+    available" rather than failing an opaque download. The conversation has
+    stayed intelligible.
+  - **A grace period has protected recent uploads.** An attachment younger than
+    a configured minimum age has never been evicted, so a file shared into a
+    live conversation could not vanish mid-discussion.
+  - **Eviction has been auditable** — each eviction recorded (REQ-251) and
+    reported through REQ-214 — so an operator has been able to discover after
+    the fact exactly what was reclaimed and why.
+  - **An operator has been able to disable eviction**, accepting upload refusal
+    (REQ-216) instead. The behavior is default-on, not mandatory.
+- **REQ-216.** When free space has fallen below its floor and neither
+  reclamation (REQ-213) nor eviction (REQ-215) could recover it — because
+  eviction was disabled, or everything remaining was within the grace period —
+  the daemon has **refused new uploads** with a distinct, user-facing error
+  rather than failing partway through a transfer or writing into the database's
+  reserve. Refusal has been the terminal state, never silent failure, and has
+  never affected messaging (REQ-212).
 
 ---
 

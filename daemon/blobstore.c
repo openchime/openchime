@@ -164,10 +164,43 @@ const oc_blob_backend oc_blob_backend_fs = {
 
 /* --- Public dispatch ------------------------------------------------------- */
 
+/* Is a usable S3 configuration present? Selection is by *configuration*, not a
+ * mode flag (ARCH-70): an operator who supplies S3 credentials gets the S3
+ * backend, and one who doesn't gets local disk. All four values are required —
+ * a partial configuration is an operator error, and silently falling back to
+ * local disk would put attachments somewhere they didn't intend, so we say so
+ * and let the caller fail rather than guess. */
+static int s3_configured(void) {
+    static const char *const REQUIRED[] = {
+        "OPENCHIME_S3_ENDPOINT", "OPENCHIME_S3_BUCKET",
+        "OPENCHIME_S3_ACCESS_KEY", "OPENCHIME_S3_SECRET_KEY",
+    };
+    int set = 0;
+    for (size_t i = 0; i < sizeof REQUIRED / sizeof REQUIRED[0]; i++) {
+        const char *v = getenv(REQUIRED[i]);
+        if (v && *v) set++;
+    }
+    if (set == 0) return 0;                     /* none: local disk */
+    if (set == (int)(sizeof REQUIRED / sizeof REQUIRED[0])) return 1;   /* all: S3 */
+    fprintf(stderr, "openchimed: incomplete S3 configuration (%d of 4 of "
+                    "OPENCHIME_S3_ENDPOINT/_BUCKET/_ACCESS_KEY/_SECRET_KEY set); "
+                    "set all four for S3 or none for local disk\n", set);
+    return -1;
+}
+
 oc_blobstore *oc_blobstore_open(const char *base_dir) {
+    int s3 = s3_configured();
+    if (s3 < 0) return NULL;                    /* misconfigured: refuse to guess */
+    /* OPENCHIME_BLOB_BACKEND is the legacy explicit selector, still honored so
+     * an existing deployment keeps working; the credential check above is the
+     * documented path. */
     const char *sel = getenv("OPENCHIME_BLOB_BACKEND");
-    const oc_blob_backend *be = (sel && strcmp(sel, "s3") == 0)
-                              ? &oc_blob_backend_s3 : &oc_blob_backend_fs;
+    if (sel && strcmp(sel, "s3") == 0) s3 = 1;
+    else if (sel && strcmp(sel, "fs") == 0) s3 = 0;
+
+    const oc_blob_backend *be = s3 ? &oc_blob_backend_s3 : &oc_blob_backend_fs;
+    fprintf(stderr, "openchimed: blob storage = %s\n",
+            s3 ? "s3 (operator-supplied endpoint)" : "local disk");
     void *store = be->open(base_dir);
     if (!store) return NULL;
     oc_blobstore *bs = calloc(1, sizeof *bs);
