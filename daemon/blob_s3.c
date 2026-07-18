@@ -1,9 +1,20 @@
-/* S3/MinIO backend for the oc_blobstore seam (ARCH-70). Speaks the S3 REST API
- * (path-style `/<bucket>/<key>`) over plain HTTP to the configured endpoint,
- * signing each request with SigV4 (daemon/sigv4.c) and streaming the body with
+/* S3 backend for the oc_blobstore seam (ARCH-70). Speaks the S3 REST API
+ * (path-style `/<bucket>/<key>`), signing each request with SigV4
+ * (daemon/sigv4.c) and streaming the body with
  * `x-amz-content-sha256: UNSIGNED-PAYLOAD` so an upload/download need not be
- * buffered whole. Selected with OPENCHIME_BLOB_BACKEND=s3; configured via
- * OPENCHIME_S3_ENDPOINT (host:port), _BUCKET, _ACCESS_KEY, _SECRET_KEY, _REGION.
+ * buffered whole. Selected by the presence of S3 credentials (blobstore.c);
+ * configured via OPENCHIME_S3_ENDPOINT, _BUCKET, _ACCESS_KEY, _SECRET_KEY,
+ * _REGION.
+ *
+ * **Transport.** HTTPS by default, with real CA-chain + hostname verification
+ * (oc_tls_client_init_ca) — every public S3 provider is HTTPS-only, and sending
+ * SigV4 credentials and attachment bytes over an unauthenticated channel would
+ * be trivially interceptable. Note this is the *opposite* trust model from
+ * ARCH-10: there the client pins a daemon's self-signed cert, whereas here the
+ * daemon is an ordinary client of someone else's public service, with no
+ * fingerprint to pin and a provider that rotates certs freely. Plaintext is
+ * still reachable with an explicit `http://` scheme or a non-443 port, for a
+ * local S3 implementation on a private network.
  *
  * NOTE: this backend does blocking network I/O; the daemon currently drives it
  * from the net thread, which is fine for the local-FS default but means a slow
@@ -12,6 +23,7 @@
 
 #include "blob_backend.h"
 #include "sigv4.h"
+#include "tls.h"
 
 #include <netdb.h>
 #include <stdio.h>
@@ -23,17 +35,26 @@
 #include <unistd.h>
 
 typedef struct {
-    char endpoint[256];   /* host:port, as sent in the Host header */
-    char host[256];       /* host only, for connect() */
+    char endpoint[256];   /* host[:port], as sent in the Host header */
+    char host[256];       /* host only, for connect() + SNI/cert check */
     char port[16];
     char bucket[256];
     char region[64];
     char ak[256];
     char sk[256];
+    int  use_tls;
+    oc_tls_client tls;    /* valid iff use_tls; CA-verifying config */
 } s3_store;
 
+/* One request's transport: a socket, optionally wrapped in TLS. */
 typedef struct {
-    int      fd;
+    int           fd;
+    int           tls;
+    oc_tls_conn   conn;
+} s3_conn;
+
+typedef struct {
+    s3_conn  c;
     uint64_t remaining;   /* body bytes still to send */
     int      failed;
 } s3_writer;
@@ -42,7 +63,7 @@ typedef struct {
  * arrive alongside the header block are kept, never truncated. */
 #define S3_SPILL 8192
 typedef struct {
-    int      fd;
+    s3_conn  c;
     uint64_t remaining;   /* body bytes still to read */
     uint8_t  buf[S3_SPILL]; /* body bytes read while parsing headers */
     size_t   buf_off, buf_len;
@@ -63,17 +84,37 @@ static void *s3_open(const char *cfg) {
 
     s3_store *s = calloc(1, sizeof *s);
     if (!s) return NULL;
+    /* Scheme, if given, decides the transport outright; otherwise the port does,
+     * and a bare host defaults to HTTPS/443 because every public provider is
+     * HTTPS-only. A local S3 implementation on a private network is reached with
+     * an explicit http:// or a non-443 port. */
+    int explicit_scheme = 0;
+    if (strncmp(ep, "https://", 8) == 0) { s->use_tls = 1; explicit_scheme = 1; ep += 8; }
+    else if (strncmp(ep, "http://", 7) == 0) { s->use_tls = 0; explicit_scheme = 1; ep += 7; }
+
     if (snprintf(s->endpoint, sizeof s->endpoint, "%s", ep) >= (int)sizeof s->endpoint) { free(s); return NULL; }
-    /* Split host:port; default port 80. */
-    const char *colon = strrchr(ep, ':');
+    /* Trim any trailing path — the endpoint is an authority, not a URL. */
+    char *slash = strchr(s->endpoint, '/');
+    if (slash) *slash = '\0';
+
+    const char *colon = strrchr(s->endpoint, ':');
     if (colon) {
-        size_t hn = (size_t)(colon - ep);
+        size_t hn = (size_t)(colon - s->endpoint);
         if (hn >= sizeof s->host) { free(s); return NULL; }
-        memcpy(s->host, ep, hn); s->host[hn] = '\0';
+        memcpy(s->host, s->endpoint, hn); s->host[hn] = '\0';
         snprintf(s->port, sizeof s->port, "%s", colon + 1);
+        if (!explicit_scheme) s->use_tls = (strcmp(s->port, "443") == 0);
     } else {
-        snprintf(s->host, sizeof s->host, "%s", ep);
-        snprintf(s->port, sizeof s->port, "80");
+        snprintf(s->host, sizeof s->host, "%s", s->endpoint);
+        if (!explicit_scheme) s->use_tls = 1;
+        snprintf(s->port, sizeof s->port, "%s", s->use_tls ? "443" : "80");
+    }
+
+    if (s->use_tls && oc_tls_client_init_ca(&s->tls, getenv("OPENCHIME_S3_CA_BUNDLE")) != 0) {
+        fprintf(stderr, "openchimed: S3 endpoint is HTTPS but no CA bundle could be "
+                        "loaded; install ca-certificates or set OPENCHIME_S3_CA_BUNDLE\n");
+        free(s);
+        return NULL;
     }
     snprintf(s->bucket, sizeof s->bucket, "%s", bucket);
     snprintf(s->region, sizeof s->region, "%s", env_or("OPENCHIME_S3_REGION", "us-east-1"));
@@ -82,7 +123,12 @@ static void *s3_open(const char *cfg) {
     return s;
 }
 
-static void s3_close(void *store) { free(store); }
+static void s3_close(void *store) {
+    s3_store *s = store;
+    if (!s) return;
+    if (s->use_tls) oc_tls_client_free(&s->tls);
+    free(s);
+}
 
 /* --- small blocking HTTP helpers ------------------------------------------ */
 
@@ -110,14 +156,76 @@ static int tcp_connect(const s3_store *s) {
     return fd;
 }
 
-static int write_all(int fd, const void *buf, size_t len) {
+/* --- transport: plaintext fd, or TLS over it ------------------------------
+ * The socket is blocking with send/recv timeouts (tcp_connect), so mbedTLS
+ * normally completes each operation in one call; WANT_READ/WANT_WRITE are still
+ * looped on because a renegotiation or a partial record can produce them. A
+ * timeout surfaces as an error and fails the transfer rather than spinning. */
+
+static int conn_open(s3_conn *c, s3_store *s) {
+    memset(c, 0, sizeof *c);
+    c->fd = tcp_connect(s);
+    if (c->fd < 0) return -1;
+    if (!s->use_tls) return 0;
+
+    if (oc_tls_conn_init(&c->conn, &s->tls.conf, c->fd) != 0) { close(c->fd); return -1; }
+    /* Without the hostname there is no SNI and, more importantly, no name check
+     * against the certificate — a valid cert for any other host would pass. */
+    if (oc_tls_conn_set_hostname(&c->conn, s->host) != 0) {
+        oc_tls_conn_free(&c->conn); close(c->fd); return -1;
+    }
+    for (;;) {
+        oc_tls_status st = oc_tls_handshake(&c->conn);
+        if (st == OC_TLS_OK) break;
+        if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) continue;
+        fprintf(stderr, "openchimed: S3 TLS handshake failed for %s "
+                        "(certificate not trusted, or name mismatch)\n", s->host);
+        oc_tls_conn_free(&c->conn); close(c->fd);
+        return -1;
+    }
+    c->tls = 1;
+    return 0;
+}
+
+static void conn_close(s3_conn *c) {
+    if (!c) return;
+    if (c->tls) oc_tls_conn_free(&c->conn);
+    if (c->fd >= 0) close(c->fd);
+    c->fd = -1; c->tls = 0;
+}
+
+static int conn_write(s3_conn *c, const void *buf, size_t len) {
     const char *p = buf; size_t sent = 0;
     while (sent < len) {
-        ssize_t n = write(fd, p + sent, len - sent);
-        if (n <= 0) return -1;
-        sent += (size_t)n;
+        if (c->tls) {
+            size_t n = 0;
+            oc_tls_status st = oc_tls_write(&c->conn, p + sent, len - sent, &n);
+            if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) continue;
+            if (st != OC_TLS_OK || n == 0) return -1;
+            sent += n;
+        } else {
+            ssize_t n = write(c->fd, p + sent, len - sent);
+            if (n <= 0) return -1;
+            sent += (size_t)n;
+        }
     }
     return 0;
+}
+
+/* Returns bytes read (>0), 0 on clean EOF, <0 on error. */
+static long conn_read(s3_conn *c, void *buf, size_t cap) {
+    if (c->tls) {
+        for (;;) {
+            size_t n = 0;
+            oc_tls_status st = oc_tls_read(&c->conn, buf, cap, &n);
+            if (st == OC_TLS_WANT_READ || st == OC_TLS_WANT_WRITE) continue;
+            if (st == OC_TLS_CLOSED) return 0;
+            if (st != OC_TLS_OK) return -1;
+            return (long)n;
+        }
+    }
+    ssize_t n = read(c->fd, buf, cap);
+    return (n < 0) ? -1 : (long)n;
 }
 
 static void iso8601(char amzdate[20], char datestamp[12]) {
@@ -130,7 +238,7 @@ static void iso8601(char amzdate[20], char datestamp[12]) {
 
 /* Build + send the request line and signed headers. For PUT, `content_length` is
  * the body size that follows; for GET/DELETE pass -1 (no body). Returns 0 ok. */
-static int send_request(const s3_store *s, int fd, const char *method,
+static int send_request(const s3_store *s, s3_conn *c, const char *method,
                         const char *key, long long content_length) {
     char uri[600];
     if (snprintf(uri, sizeof uri, "/%s/%s", s->bucket, key) >= (int)sizeof uri) return -1;
@@ -155,19 +263,19 @@ static int send_request(const s3_store *s, int fd, const char *method,
             method, uri, s->endpoint, amzdate, auth);
     }
     if (n < 0 || n >= (int)sizeof req) return -1;
-    return write_all(fd, req, (size_t)n);
+    return conn_write(c, req, (size_t)n);
 }
 
 /* Read the response status line + headers. Returns the HTTP status code, fills
  * *content_length (or -1 if absent), and copies any body bytes already read into
  * `spill`. Returns -1 on I/O/parse error. */
-static int read_response_head(int fd, long long *content_length,
+static int read_response_head(s3_conn *c, long long *content_length,
                               uint8_t *spill, size_t spill_cap, size_t *spill_len) {
     char hdr[8192];
     size_t len = 0;
     const char *term = NULL;
     while (len < sizeof hdr - 1) {
-        ssize_t n = read(fd, hdr + len, sizeof hdr - 1 - len);
+        long n = conn_read(c, hdr + len, sizeof hdr - 1 - len);
         if (n <= 0) return -1;
         len += (size_t)n;
         hdr[len] = '\0';
@@ -200,12 +308,12 @@ static int read_response_head(int fd, long long *content_length,
 
 static void *s3_put_begin(void *store, const char *key, uint64_t size_hint) {
     s3_store *s = store;
-    int fd = tcp_connect(s);
-    if (fd < 0) return NULL;
-    if (send_request(s, fd, "PUT", key, (long long)size_hint) != 0) { close(fd); return NULL; }
     s3_writer *w = calloc(1, sizeof *w);
-    if (!w) { close(fd); return NULL; }
-    w->fd = fd;
+    if (!w) return NULL;
+    if (conn_open(&w->c, s) != 0) { free(w); return NULL; }
+    if (send_request(s, &w->c, "PUT", key, (long long)size_hint) != 0) {
+        conn_close(&w->c); free(w); return NULL;
+    }
     w->remaining = size_hint;
     return w;
 }
@@ -214,7 +322,7 @@ static int s3_put_chunk(void *wv, const void *data, size_t len) {
     s3_writer *w = wv;
     if (!w || w->failed || len == 0) return w && w->failed ? -1 : 0;
     if (len > w->remaining) { w->failed = 1; return -1; }
-    if (write_all(w->fd, data, len) != 0) { w->failed = 1; return -1; }
+    if (conn_write(&w->c, data, len) != 0) { w->failed = 1; return -1; }
     w->remaining -= len;
     return 0;
 }
@@ -224,17 +332,17 @@ static int s3_put_commit(void *wv) {
     int rc = -1;
     if (w && !w->failed && w->remaining == 0) {
         long long cl; uint8_t spill[64]; size_t sl;
-        int status = read_response_head(w->fd, &cl, spill, sizeof spill, &sl);
+        int status = read_response_head(&w->c, &cl, spill, sizeof spill, &sl);
         if (status >= 200 && status < 300) rc = 0;
     }
-    if (w) { close(w->fd); free(w); }
+    if (w) { conn_close(&w->c); free(w); }
     return rc;
 }
 
 static void s3_put_abort(void *wv) {
     s3_writer *w = wv;
     if (!w) return;
-    close(w->fd);   /* incomplete body -> S3 does not create the object */
+    conn_close(&w->c);   /* incomplete body -> S3 does not create the object */
     free(w);
 }
 
@@ -242,15 +350,15 @@ static void s3_put_abort(void *wv) {
 
 static void *s3_get_begin(void *store, const char *key, uint64_t *size_out) {
     s3_store *s = store;
-    int fd = tcp_connect(s);
-    if (fd < 0) return NULL;
-    if (send_request(s, fd, "GET", key, -1) != 0) { close(fd); return NULL; }
     s3_reader *r = calloc(1, sizeof *r);
-    if (!r) { close(fd); return NULL; }
-    r->fd = fd;
+    if (!r) return NULL;
+    if (conn_open(&r->c, s) != 0) { free(r); return NULL; }
+    if (send_request(s, &r->c, "GET", key, -1) != 0) {
+        conn_close(&r->c); free(r); return NULL;
+    }
     long long cl;
-    int status = read_response_head(fd, &cl, r->buf, sizeof r->buf, &r->buf_len);
-    if (status < 200 || status >= 300 || cl < 0) { close(fd); free(r); return NULL; }
+    int status = read_response_head(&r->c, &cl, r->buf, sizeof r->buf, &r->buf_len);
+    if (status < 200 || status >= 300 || cl < 0) { conn_close(&r->c); free(r); return NULL; }
     r->remaining = (uint64_t)cl;
     if (size_out) *size_out = (uint64_t)cl;
     return r;
@@ -270,7 +378,7 @@ static long s3_get_chunk(void *rv, void *buf, size_t cap) {
     }
     if (r->remaining == 0) return 0;
     size_t want = cap < r->remaining ? cap : (size_t)r->remaining;
-    ssize_t n = read(r->fd, buf, want);
+    long n = conn_read(&r->c, buf, want);
     if (n < 0) return -1;
     if (n == 0) return 0;
     r->remaining -= (uint64_t)n;
@@ -280,21 +388,21 @@ static long s3_get_chunk(void *rv, void *buf, size_t cap) {
 static void s3_get_close(void *rv) {
     s3_reader *r = rv;
     if (!r) return;
-    close(r->fd);
+    conn_close(&r->c);
     free(r);
 }
 
 static int s3_del(void *store, const char *key) {
     s3_store *s = store;
-    int fd = tcp_connect(s);
-    if (fd < 0) return -1;
+    s3_conn c;
+    if (conn_open(&c, s) != 0) return -1;
     int rc = -1;
-    if (send_request(s, fd, "DELETE", key, -1) == 0) {
+    if (send_request(s, &c, "DELETE", key, -1) == 0) {
         long long cl; uint8_t spill[64]; size_t sl;
-        int status = read_response_head(fd, &cl, spill, sizeof spill, &sl);
+        int status = read_response_head(&c, &cl, spill, sizeof spill, &sl);
         if ((status >= 200 && status < 300) || status == 404) rc = 0;
     }
-    close(fd);
+    conn_close(&c);
     return rc;
 }
 

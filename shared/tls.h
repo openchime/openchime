@@ -42,15 +42,27 @@ typedef struct {
     mbedtls_ssl_config       conf;
 } oc_tls_server;
 
-/* Client-side TLS state. `pin` selects trust: if it is non-NULL, the peer
- * certificate's SHA-256 must equal it (TOFU pinning, ARCH-10); if NULL, any
- * certificate is accepted (used only where the caller pins out-of-band). */
+/* Client-side TLS state, with three mutually exclusive trust modes:
+ *   - **TOFU pinning** (`oc_tls_client_init` with a non-NULL `pin`): the peer
+ *     leaf's SHA-256 must equal the pin. This is how clients trust a daemon's
+ *     self-signed cert (ARCH-10) and is the project's normal mode.
+ *   - **No verification** (`oc_tls_client_init` with `pin == NULL`): any
+ *     certificate is accepted. Only for callers that pin out-of-band.
+ *   - **CA-chain verification** (`oc_tls_client_init_ca`): an ordinary public
+ *     PKI check against a CA bundle, plus hostname verification. Used where the
+ *     daemon is a *client of someone else's public service* — an S3-compatible
+ *     object store (ARCH-70) — which is the opposite trust relationship from
+ *     ARCH-10's: there is no fingerprint to pin, the provider rotates certs
+ *     freely, and accepting any cert would expose credentials and attachment
+ *     bytes to trivial interception. */
 typedef struct {
     mbedtls_entropy_context  entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
     mbedtls_ssl_config       conf;
+    mbedtls_x509_crt         ca;
     uint8_t                  pin[OC_TLS_FINGERPRINT_LEN];
     int                      have_pin;
+    int                      ca_mode;
 } oc_tls_client;
 
 /* One TLS connection over an already-connected, non-blocking socket `fd`. */
@@ -75,11 +87,23 @@ int  oc_tls_client_init(oc_tls_client *c, const uint8_t *pin);
 /* As above, but `with_alpn == 0` omits the oc/1 ALPN — for an HTTP/webhook
  * client that the daemon should route to its HTTP handler (ARCH-32/54). */
 int  oc_tls_client_init_ex(oc_tls_client *c, const uint8_t *pin, int with_alpn);
+
+/* Initialize a client that verifies the peer against a **CA bundle** with
+ * hostname checking (MBEDTLS_SSL_VERIFY_REQUIRED), for talking to a public
+ * HTTPS service rather than to an OpenChime daemon. `ca_bundle` is a PEM file
+ * or directory; NULL probes the usual system locations. No ALPN is offered.
+ * The caller MUST call oc_tls_conn_set_hostname() before the handshake, or the
+ * hostname is not checked. Returns 0 on success, negative on failure (including
+ * "no CA bundle found", which is fatal rather than a silent downgrade). */
+int  oc_tls_client_init_ca(oc_tls_client *c, const char *ca_bundle);
 void oc_tls_client_free(oc_tls_client *c);
 
 /* Set up a connection object. `endpoint` is MBEDTLS_SSL_IS_SERVER or
  * MBEDTLS_SSL_IS_CLIENT and must match `conf`. Returns 0 on success. */
 int  oc_tls_conn_init(oc_tls_conn *c, mbedtls_ssl_config *conf, int fd);
+/* Set the expected peer hostname: sends SNI and, under CA verification, makes
+ * the certificate's name actually get checked. Call before the handshake. */
+int  oc_tls_conn_set_hostname(oc_tls_conn *c, const char *host);
 void oc_tls_conn_free(oc_tls_conn *c);
 
 /* Drive the handshake / I/O. Each returns an oc_tls_status; on OK, read/write

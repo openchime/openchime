@@ -184,6 +184,8 @@ int oc_tls_server_fingerprint(const oc_tls_server *s, uint8_t out[OC_TLS_FINGERP
  * pin, overriding the usual CA-chain result (TOFU, ARCH-10). */
 static int client_verify(void *ctx, mbedtls_x509_crt *crt, int depth, uint32_t *flags) {
     oc_tls_client *c = (oc_tls_client *)ctx;
+    /* CA mode does a real chain check; leave mbedTLS's own result untouched. */
+    if (c->ca_mode) return 0;
     /* Pin only the leaf; there is no CA chain, so clear chain-level flags. */
     if (depth != 0) { *flags = 0; return 0; }
     if (!c->have_pin) { *flags = 0; return 0; }
@@ -202,7 +204,9 @@ int oc_tls_client_init_ex(oc_tls_client *c, const uint8_t *pin, int with_alpn) {
     mbedtls_entropy_init(&c->entropy);
     mbedtls_ctr_drbg_init(&c->ctr_drbg);
     mbedtls_ssl_config_init(&c->conf);
+    mbedtls_x509_crt_init(&c->ca);
     c->have_pin = 0;
+    c->ca_mode = 0;
     if (pin) { memcpy(c->pin, pin, OC_TLS_FINGERPRINT_LEN); c->have_pin = 1; }
 
     if ((rc = mbedtls_ctr_drbg_seed(&c->ctr_drbg, mbedtls_entropy_func, &c->entropy,
@@ -230,7 +234,45 @@ int oc_tls_client_init(oc_tls_client *c, const uint8_t *pin) {
     return oc_tls_client_init_ex(c, pin, 1);
 }
 
+/* Where distributions keep the trusted-root bundle. Probed in order when the
+ * caller doesn't name one; Alpine (the daemon's runtime image) and Debian/Ubuntu
+ * both ship the first entry via the `ca-certificates` package. */
+static const char *const CA_BUNDLES[] = {
+    "/etc/ssl/certs/ca-certificates.crt",   /* Alpine, Debian, Ubuntu */
+    "/etc/pki/tls/certs/ca-bundle.crt",     /* Fedora, RHEL */
+    "/etc/ssl/cert.pem",                    /* macOS (Homebrew), BSD */
+    "/etc/ssl/certs",                       /* hashed directory fallback */
+};
+
+int oc_tls_client_init_ca(oc_tls_client *c, const char *ca_bundle) {
+    int rc = oc_tls_client_init_ex(c, NULL, 0);   /* no pin, no ALPN */
+    if (rc != 0) return rc;
+    c->ca_mode = 1;
+
+    int loaded = 0;
+    if (ca_bundle && *ca_bundle) {
+        loaded = (mbedtls_x509_crt_parse_file(&c->ca, ca_bundle) >= 0) ||
+                 (mbedtls_x509_crt_parse_path(&c->ca, ca_bundle) >= 0);
+    } else {
+        for (size_t i = 0; i < sizeof CA_BUNDLES / sizeof CA_BUNDLES[0] && !loaded; i++) {
+            /* parse_file returns >0 for "parsed some, skipped some", which is
+             * normal for a big system bundle; only <0 is a real failure. */
+            if (mbedtls_x509_crt_parse_file(&c->ca, CA_BUNDLES[i]) >= 0) loaded = 1;
+            else if (mbedtls_x509_crt_parse_path(&c->ca, CA_BUNDLES[i]) >= 0) loaded = 1;
+        }
+    }
+    /* No bundle means we cannot verify anyone. Fail loudly rather than fall back
+     * to accepting any certificate, which would silently turn a secure client
+     * into an interceptable one. */
+    if (!loaded) return -1;
+
+    mbedtls_ssl_conf_ca_chain(&c->conf, &c->ca, NULL);
+    mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    return 0;
+}
+
 void oc_tls_client_free(oc_tls_client *c) {
+    mbedtls_x509_crt_free(&c->ca);
     mbedtls_ssl_config_free(&c->conf);
     mbedtls_ctr_drbg_free(&c->ctr_drbg);
     mbedtls_entropy_free(&c->entropy);
@@ -245,6 +287,10 @@ int oc_tls_conn_init(oc_tls_conn *c, mbedtls_ssl_config *conf, int fd) {
     if ((rc = mbedtls_ssl_setup(&c->ssl, conf)) != 0) return rc;
     mbedtls_ssl_set_bio(&c->ssl, &c->fd, bio_send, bio_recv, NULL);
     return 0;
+}
+
+int oc_tls_conn_set_hostname(oc_tls_conn *c, const char *host) {
+    return mbedtls_ssl_set_hostname(&c->ssl, host);
 }
 
 void oc_tls_conn_free(oc_tls_conn *c) {
