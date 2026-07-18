@@ -85,4 +85,28 @@ typedef void (*oc_store_outbox_cb)(void *ctx, const uint8_t idem[OC_IDEM_SIZE],
 void oc_store_outbox_each(oc_store *s, const char *workspace,
                           oc_store_outbox_cb cb, void *ctx);
 
+/* The workspace book (REQ-012): the list of workspaces this machine knows about,
+ * so a frontend can offer a switcher without the user retyping an address. One
+ * row per workspace, holding the `label` the user typed (`acme.example.com` —
+ * friendlier than the resolved "host:port" key) and the `username` they signed
+ * in as, ordered most-recently-used first.
+ *
+ * Unlike the rest of this header these three are safe to call from a SECOND
+ * oc_store handle on the same file, opened by the frontend outside the net
+ * thread — the book is written at login/logout, not on the message path, and
+ * SQLite's WAL + busy timeout cover the overlap. That is how the switcher lists
+ * workspaces that have no running client.
+ *
+ * remember() upserts and stamps last-used; a NULL label/username preserves the
+ * stored one, so re-login never blanks the switcher. forget() removes the entry
+ * AND that workspace's session token, TOFU pin, cached history, and outbox. */
+void oc_store_workspace_remember(oc_store *s, const char *workspace,
+                                 const char *label, const char *username,
+                                 uint64_t now_ms);
+void oc_store_workspace_forget(oc_store *s, const char *workspace);
+typedef void (*oc_store_workspace_cb)(void *ctx, const char *workspace,
+                                      const char *label, const char *username,
+                                      uint64_t last_used_ms);
+void oc_store_workspace_each(oc_store *s, oc_store_workspace_cb cb, void *ctx);
+
 #endif /* OC_STORE_H */

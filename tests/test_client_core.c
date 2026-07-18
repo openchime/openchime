@@ -364,6 +364,71 @@ static void test_store_workspace_upgrade(void) {
     unlink(sp); unlink("build/itest_core_upgrade.db-wal"); unlink("build/itest_core_upgrade.db-shm");
 }
 
+/* Collect the workspace book into a fixed buffer, in the order it is returned. */
+struct book_capture { int n; char ws[8][64]; char label[8][64]; char user[8][64]; };
+static void book_cb(void *ctx, const char *ws, const char *label,
+                    const char *user, uint64_t last_used) {
+    struct book_capture *b = (struct book_capture *)ctx;
+    (void)last_used;
+    if (b->n >= 8) return;
+    snprintf(b->ws[b->n],    sizeof b->ws[0],    "%s", ws    ? ws    : "");
+    snprintf(b->label[b->n], sizeof b->label[0], "%s", label ? label : "");
+    snprintf(b->user[b->n],  sizeof b->user[0],  "%s", user  ? user  : "");
+    b->n++;
+}
+
+/* The workspace book (REQ-012) backs the switcher: it lists remembered
+ * workspaces most-recently-used first, a re-login preserves the label/username,
+ * and forgetting one erases its credentials and cached history too. */
+static void test_workspace_book(void) {
+    const char *sp = "build/itest_core_book.db";
+    unlink(sp); unlink("build/itest_core_book.db-wal"); unlink("build/itest_core_book.db-shm");
+
+    oc_store *s = oc_store_open(sp);
+    CHECK(s != NULL);
+    if (!s) return;
+
+    oc_store_workspace_remember(s, "acme:443",   "acme.example.com",   "dana", 1000);
+    oc_store_workspace_remember(s, "globex:443", "globex.example.com", "dana", 2000);
+
+    /* Most-recently-used first: globex (2000) before acme (1000). */
+    struct book_capture b = { 0, {{0}}, {{0}}, {{0}} };
+    oc_store_workspace_each(s, book_cb, &b);
+    CHECK(b.n == 2);
+    CHECK(strcmp(b.ws[0], "globex:443") == 0);
+    CHECK(strcmp(b.ws[1], "acme:443") == 0);
+    CHECK(strcmp(b.label[1], "acme.example.com") == 0);
+
+    /* Re-touching acme moves it to the front, and a NULL label/username keeps
+     * what was stored rather than blanking the switcher entry. */
+    oc_store_workspace_remember(s, "acme:443", NULL, NULL, 3000);
+    struct book_capture b2 = { 0, {{0}}, {{0}}, {{0}} };
+    oc_store_workspace_each(s, book_cb, &b2);
+    CHECK(b2.n == 2);
+    CHECK(strcmp(b2.ws[0], "acme:443") == 0);
+    CHECK(strcmp(b2.label[0], "acme.example.com") == 0);
+    CHECK(strcmp(b2.user[0], "dana") == 0);
+
+    /* Forgetting a workspace takes its session token and cached history with it. */
+    uint8_t tok[OC_SESSION_TOKEN_LEN];
+    for (int i = 0; i < OC_SESSION_TOKEN_LEN; i++) tok[i] = (uint8_t)(i + 1);
+    oc_store_save_session(s, "acme:443", tok, 0);
+    oc_store_save_message(s, "acme:443", 9, 42, 5, "dana", 1000, "hello", 0, 0);
+    CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1);
+
+    oc_store_workspace_forget(s, "acme:443");
+    struct book_capture b3 = { 0, {{0}}, {{0}}, {{0}} };
+    oc_store_workspace_each(s, book_cb, &b3);
+    CHECK(b3.n == 1 && strcmp(b3.ws[0], "globex:443") == 0);
+    CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 0);
+    int left = 0;
+    oc_store_each_message(s, "acme:443", count_msg_cb, &left);
+    CHECK(left == 0);
+
+    oc_store_close(s);
+    unlink(sp); unlink("build/itest_core_book.db-wal"); unlink("build/itest_core_book.db-shm");
+}
+
 /* With a secret set, the session token round-trips through the keyring vtable and
  * does NOT land in the SQLite column; clearing goes through the vtable too. */
 static void test_secret_routing(void) {
@@ -406,12 +471,13 @@ static void test_secret_routing(void) {
 }
 
 int run_client_core_tests(void) {
-    printf("test_client_core: resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, client-settings, profile, seen-by, persisted store, v3 workspace upgrade, cached history, session reconnect, offline outbox\n");
+    printf("test_client_core: resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, client-settings, profile, seen-by, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox\n");
 
     test_resolve();
     test_last_error();
     test_secret_routing();
     test_store_workspace_upgrade();
+    test_workspace_book();
 
     /* The daemon opens its blob store at netloop startup; point it at a build-local
      * dir (the /data/blobs default isn't writable in the test sandbox), matching

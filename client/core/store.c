@@ -58,6 +58,13 @@ static const oc_migration CLIENT_MIGRATIONS[] = {
       "ALTER TABLE workspace_state RENAME COLUMN instance TO workspace;"
       "ALTER TABLE cached_message  RENAME COLUMN instance TO workspace;"
       "ALTER TABLE outbox          RENAME COLUMN instance TO workspace;" },
+    { 5,
+      "CREATE TABLE workspace_book ("
+      "  workspace    TEXT PRIMARY KEY,"
+      "  label        TEXT,"
+      "  username     TEXT,"
+      "  last_used_ms INTEGER NOT NULL DEFAULT 0"
+      ");" },
 };
 static const int CLIENT_MIGRATIONS_COUNT =
     (int)(sizeof CLIENT_MIGRATIONS / sizeof CLIENT_MIGRATIONS[0]);
@@ -307,6 +314,72 @@ void oc_store_outbox_remove(oc_store *s, const char *workspace,
     sqlite3_bind_text(st, 1, workspace, -1, SQLITE_TRANSIENT);
     sqlite3_bind_blob(st, 2, idem, OC_IDEM_SIZE, SQLITE_TRANSIENT);
     sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+/* --- the workspace book (REQ-012) ---------------------------------------- */
+
+void oc_store_workspace_remember(oc_store *s, const char *workspace,
+                                 const char *label, const char *username,
+                                 uint64_t now_ms) {
+    if (!s || !s->db || !workspace || !workspace[0]) return;
+    sqlite3_stmt *st = NULL;
+    /* A re-login keeps the existing label/username when the caller passes NULL,
+     * so re-signing-in never blanks out what the switcher shows. */
+    if (sqlite3_prepare_v2(s->db,
+            "INSERT INTO workspace_book (workspace, label, username, last_used_ms) "
+            "VALUES (?1, ?2, ?3, ?4) "
+            "ON CONFLICT(workspace) DO UPDATE SET "
+            "  label        = COALESCE(?2, label),"
+            "  username     = COALESCE(?3, username),"
+            "  last_used_ms = ?4;",
+            -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(st, 1, workspace, -1, SQLITE_TRANSIENT);
+    if (label)    sqlite3_bind_text(st, 2, label, -1, SQLITE_TRANSIENT);
+    else          sqlite3_bind_null(st, 2);
+    if (username) sqlite3_bind_text(st, 3, username, -1, SQLITE_TRANSIENT);
+    else          sqlite3_bind_null(st, 3);
+    sqlite3_bind_int64(st, 4, (int64_t)now_ms);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+void oc_store_workspace_forget(oc_store *s, const char *workspace) {
+    if (!s || !s->db || !workspace) return;
+    /* Drop the book entry AND every trace of the workspace: leaving the session
+     * token or cached history behind would mean "forget" silently kept the
+     * user's messages on disk. */
+    static const char *const SQL[] = {
+        "DELETE FROM workspace_book  WHERE workspace=?1;",
+        "DELETE FROM workspace_state WHERE workspace=?1;",
+        "DELETE FROM cached_message  WHERE workspace=?1;",
+        "DELETE FROM outbox          WHERE workspace=?1;",
+    };
+    for (size_t i = 0; i < sizeof SQL / sizeof SQL[0]; i++) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(s->db, SQL[i], -1, &st, NULL) != SQLITE_OK) continue;
+        sqlite3_bind_text(st, 1, workspace, -1, SQLITE_TRANSIENT);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+    /* The token may live in the OS keyring rather than the column above. */
+    if (s->secret) oc_secret_del(s->secret, workspace);
+}
+
+void oc_store_workspace_each(oc_store *s, oc_store_workspace_cb cb, void *ctx) {
+    if (!s || !s->db || !cb) return;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT workspace, label, username, last_used_ms FROM workspace_book "
+            "ORDER BY last_used_ms DESC, workspace ASC;",
+            -1, &st, NULL) != SQLITE_OK) return;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        cb(ctx,
+           (const char *)sqlite3_column_text(st, 0),
+           (const char *)sqlite3_column_text(st, 1),
+           (const char *)sqlite3_column_text(st, 2),
+           (uint64_t)sqlite3_column_int64(st, 3));
+    }
     sqlite3_finalize(st);
 }
 

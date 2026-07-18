@@ -64,7 +64,7 @@ the requirement says so explicitly rather than implying one.
 
 ### 1.1 Tenant Discovery and Resolution
 
-- **REQ-010.** The client has collected an **workspace** (the tenant's
+- **REQ-010.** The client has collected a **workspace** (the tenant's
   address) and the user's **email** at sign-in, and has resolved the workspace
   to a daemon address by plain DNS before opening a connection — with no
   hosted resolution service involved (ARCH-14). A self-hosted workspace given
@@ -79,6 +79,29 @@ the requirement says so explicitly rather than implying one.
   user-facing error rather than being conflated with an authentication or
   network failure, since the user has needed to know which of "this org
   doesn't exist," "the org is unreachable," and "your login failed" applies.
+
+### 1.1a Multiple Workspaces
+
+- **REQ-012.** A client has remembered every workspace the user has signed into
+  on that device — the address they typed, the account they used, and when they
+  last used it — so that returning to a workspace has never required retyping
+  its address or re-resolving it by hand. Forgetting a workspace has removed its
+  stored credentials and cached history along with the entry, so that "forget"
+  has left nothing of that workspace on disk.
+- **REQ-013.** Every client has offered a **workspace switcher** with the same
+  shape across platforms: the remembered workspaces, an indication of unread
+  activity and connection state for each, and an always-present **"Log in to new
+  workspace"** entry. Switching has been possible at any time without restarting
+  the client.
+- **REQ-014.** A client has held sessions to **several workspaces at once**, so
+  that activity in a workspace the user is not currently looking at has still
+  arrived and been counted as unread — the switcher has therefore shown live
+  unread state rather than state as of the last visit. Each workspace's
+  connection, credentials, model, and cached history have stayed isolated from
+  every other's; nothing has crossed between them (REQ-040).
+- **REQ-015.** Per-workspace view state — the focused channel, scroll position,
+  and a partly-typed message — has survived switching away and back, so that a
+  switch has not discarded work in progress.
 
 ### 1.2 Authentication
 
