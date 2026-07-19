@@ -73,7 +73,7 @@ outbound mapping.
    └──────┬──────┘                                                 └──────┬──────┘
           │                                                               │
    ┌──────┴───────────────────────────────────────────────────────────────┴──────┐
-   │  audio engine (duplex device, one clock)                                    │
+   │  audio engine (duplex callback; clock shared only on some hardware)         │
    │     capture ──→ [ processor: AEC ] ──→ encode                               │
    │     playback ←── mixer ←── jitter buffers ←── decode                        │
    │                     └────────────────────────→ AEC far-end reference        │
@@ -87,15 +87,56 @@ is wideband rather than fullband audio — clearly better than a phone call,
 short of music-grade. For a work huddle that is the right trade, and it is the
 single cheapest lever on echo-canceller cost.
 
-The device is opened in **duplex mode** — capture and playback on one device,
-one callback, one clock. This is not a convenience:
+The device is opened in **duplex mode** — both directions in one callback.
 
-- **It is what makes echo cancellation viable.** The canceller needs capture and
-  playback time-aligned with a known delay. Two independent devices means two
-  crystals, continuous clock drift, and a filter that never stays converged —
-  which is precisely speexdsp's documented weak point (§6.2).
-- **It is expensive to retrofit.** Decoupled capture and playback paths are the
-  natural thing to build and the hard thing to undo.
+**Duplex gives one callback, not necessarily one clock.** That distinction
+matters and is easy to get wrong. On most platforms capture and playback are
+*separate objects* even for a single piece of hardware: PulseAudio and PipeWire
+expose a sink and a source, and **WASAPI has no duplex device concept at all** —
+you open a render endpoint and a capture endpoint. Only ALSA against a single
+card, and CoreAudio with one device or an aggregate, give a genuinely shared
+clock. So duplex mode buys **alignment** (both buffers in one callback, with a
+known relationship), which is what the delay contract in §6.3 needs. It does not
+by itself buy a shared clock.
+
+What decides drift is the **clock domain**, and it correlates usefully with where
+echo cancellation is actually needed:
+
+| Setup | Clock | Is AEC needed? |
+|---|---|---|
+| Built-in laptop speaker + mic | **shared** (one codec chip) | **Yes — the case AEC exists for** |
+| USB headset | shared (one USB device) | Barely — it is in your ears |
+| Bluetooth headset | the headset's own | Barely — in your ears |
+| USB mic + desk speakers | **two crystals** | Yes, and the worst case for drift |
+
+The happy part: the configuration where AEC matters most (built-in laptop) is
+also the one with a shared clock. The nasty case — a separate microphone and
+speakers — is both the hardest for drift and a real setup people use.
+
+So the engine does three things rather than assuming the problem away:
+
+- **Prefer a single physical device**, defaulting to the built-in one.
+- **Detect drift at runtime** by tracking capture versus playback sample counts;
+  steady divergence means separate clock domains. That is a few lines, and it
+  converts an invisible failure into a known condition.
+- **Degrade honestly.** On a split-device rig, either compensate by resampling
+  one side or tell the user echo cancellation is unreliable — rather than
+  silently cancelling nothing.
+
+**Bluetooth deserves its own note**, because it fails in a way clocks do not
+explain. A headset is one physical device, but audio rides two profiles: **A2DP**
+(good stereo, *playback only, no microphone*) and **HSP/HFP** (bidirectional, but
+8 kHz mono with CVSD, or 16 kHz with mSBC where both ends support it). The moment
+the microphone opens, the stack switches A2DP → HFP and playback quality
+collapses — on Linux automatically, since WirePlumber auto-switches on detecting
+an input stream. This is unavoidable and is why every Bluetooth headset sounds
+markedly worse on a call than on music. One convenient consequence: our 16 kHz
+pipeline is exactly mSBC's rate, so on a wideband-capable headset we lose nothing
+to our own choice — the Bluetooth link is the bottleneck, not us.
+
+Finally, **it is expensive to retrofit.** Decoupled capture and playback paths are
+the natural thing to build and the hard thing to undo, which is the real argument
+for settling this in Phase 1.
 
 ---
 
@@ -224,7 +265,9 @@ together define the difficulty:
    room's impulse response — direct path, reflections, reverb. The filter must
    be *estimated adaptively*, not derived.
 2. **Clocks drift.** Separate capture and playback crystals slide continuously,
-   so a converged filter goes stale. §2's single duplex device is the mitigation.
+   so a converged filter goes stale. §2's device preference and runtime drift
+   detection are the mitigation — note duplex mode alone does not guarantee a
+   shared clock.
 3. **Speakers are nonlinear.** A linear filter mathematically cannot cancel a
    nonlinearly distorted echo, so a residual suppressor after the linear stage
    is mandatory, not optional polish.
@@ -248,7 +291,7 @@ user's voice, which is worse and much harder to diagnose. For a first
 implementation, failing softly is the more valuable property, and the vtable
 means the decision is reversible.
 
-The mitigations in §2 (single duplex device, 16 kHz, and capping output gain to
+The mitigations in §2 (preferring a single physical device, 16 kHz, and capping output gain to
 keep the speaker in its linear region) address speexdsp's three real weaknesses
 directly. They move it from "mediocre" to "acceptable on most machines."
 
@@ -297,7 +340,7 @@ late — after the seams that make it replaceable exist.
 
 | Phase | Deliverable | Proves |
 |---|---|---|
-| **1** | Duplex engine + ring buffers + local loopback | the device layer, in isolation |
+| **1** | Duplex engine + ring buffers + drift detection + local loopback | the device layer, in isolation |
 | **2** | Opus encode → decode round-trip locally | the codec |
 | **3** | `CALL_*` signaling in the app-core; TUI shows the roster | the control plane, with no media |
 | **4** | UDP media with one peer, jitter buffer, PLC | **1:1 audio works** |
@@ -330,6 +373,9 @@ it happens to also sidestep echo entirely while held.
 
 ## 9. Open decisions
 
+- **Split-device drift policy.** §2 detects divergent clocks; what to *do* then
+  is undecided — resample one side to compensate, or disable cancellation and
+  say so. Resampling is more work and can itself colour the far-end reference.
 - **Adaptive jitter depth.** Fixed first; adaptive is a later refinement, and
   needs a policy for how fast to grow and shrink.
 - **Automatic gain control.** Out of scope for a first version, but a quiet
