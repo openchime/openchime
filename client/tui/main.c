@@ -53,8 +53,8 @@
  *       attachment) · /logout (revoke this session and quit).
  */
 
-#define TB_IMPL
-#include "termbox2.h"
+#define OC_TB_IMPL
+#include "tb_compat.h"   /* termbox2 on POSIX, Console-API backend on Windows (ARCH-81) */
 
 #include "utf8proc.h"
 
