@@ -28,6 +28,9 @@ OPENCHIME_DB_PATH="$WORK/bench.db" OPENCHIME_TLS_CERT="$WORK/cert.pem" \
 OPENCHIME_TLS_KEY="$WORK/key.pem" OPENCHIME_BLOB_DIR="$WORK/blobs" \
 OPENCHIME_PROTO_PORT="$PROTO_PORT" OPENCHIME_HEALTH_PORT="$HEALTH_PORT" \
 OPENCHIME_MAX_CONNS_PER_IP=8192 OC_BOOTSTRAP_USERS="$USERS" \
+OPENCHIME_MAINT_INTERVAL_MS="${OPENCHIME_MAINT_INTERVAL_MS:-}" \
+OPENCHIME_ATTACH_MAX_AGE_DAYS="${OPENCHIME_ATTACH_MAX_AGE_DAYS:-}" \
+OPENCHIME_AUDIT_MAX_DAYS="${OPENCHIME_AUDIT_MAX_DAYS:-}" \
   ./openchimed > "$WORK/daemon.log" 2>&1 &
 DAEMON_PID=$!
 
@@ -54,4 +57,12 @@ done
 
 echo
 echo "Message round-trip latency ($LAT_N concurrent senders, isolated channels):"
-./build/bench_load 127.0.0.1 "$PROTO_PORT" "$LAT_N" 6 8 "$NUSERS" | sed -n 's/.*\(rtt_ms.*\)/  \1/p'
+# Print the WHOLE line, including connections_ok= and sends=. Stripping the
+# prefix hid a degenerate run: failed connections report rtt 0.00, which reads
+# like a fantastic result instead of a broken measurement.
+# 20s, not 6: auth is a 600k-iteration PBKDF2 on the single writer (~6-7
+# logins/s, BENCHMARK.md), so a burst of $LAT_N simultaneous logins queues for
+# several seconds. A 6s window let most connections time out before they ever
+# authenticated, and the run then reported rtt 0.00 from the handful that made
+# it -- a broken measurement that looked like a great one.
+./build/bench_load 127.0.0.1 "$PROTO_PORT" "$LAT_N" 20 8 "$NUSERS" | sed 's/^/  /'

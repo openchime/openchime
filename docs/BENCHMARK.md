@@ -93,3 +93,62 @@ login), not to add RAM. It is a non-issue at the low-hundreds target scale
 - Localhost measurement — excludes real network RTT (which would dominate the
   ~4 ms local figure) and NIC/kernel socket-buffer memory under real load.
 - No periodic large-scale soak test yet; these are point-in-time measurements.
+
+## Slow-backend isolation (ARCH-69)
+
+`itest_slow_blob` (in `make test`) answers the question the transfer pool exists
+for and that nothing previously tested: **does a slow blob backend stall message
+delivery?** Every earlier test ran against the local filesystem, where a blob
+operation completes in microseconds — the ~100 ms/op regime the pool was built
+for was never exercised.
+
+The test points the daemon's S3 backend at a loopback endpoint that dribbles a
+download 16 KB at a time with a 120 ms delay between pieces, then measures one
+client's message round-trips while another client's download crawls through it.
+
+```
+bob round-trip: idle median 57ms | during slow-download median 52ms, max 62ms
+backend 120 ms/op, 3 slow segment(s) served DURING the measurement
+  (= 360 ms of backend stall the loop did not absorb)
+```
+
+**The test discriminates.** Temporarily reverting `download_pump` to read inline
+on the epoll thread (pre-ARCH-69 behavior) makes the run **time out entirely** —
+the loop freezes on the slow reads and the daemon stops serving anyone. A test
+that cannot fail proves nothing, so this was verified rather than assumed.
+
+Two implementation notes worth keeping, both learned by getting it wrong first:
+
+- The slow path must be a **download**, not an upload. Making a *write* block
+  requires exceeding the sender's socket send buffer (~2.5 MB), so an
+  upload-based version needs a multi-megabyte payload and runs for minutes. A
+  slow *reader* blocks trivially — there is no data yet.
+- The concurrent client must run on **its own thread**. Ticking it between the
+  measured client's sends makes the two barely overlap, and the measurement
+  becomes a no-op that passes either way.
+
+## Maintenance-pass overhead (ARCH-78)
+
+Running the storage maintenance pass every 200 ms — 25× more often than the
+5-minute default — against the same load shows no measurable cost:
+
+| | baseline | maint every 200 ms |
+|---|---|---|
+| Daemon RSS | 5.0 MB | 5.1 MB |
+| KB per connection | 55–57 | 52–65 |
+| Round-trip latency | unchanged | unchanged |
+
+## Known harness limitations
+
+**The latency phase measures a fraction of its intended load.** A 32-connection
+burst reliably yields only ~10 authenticated connections, even with a 20-second
+window. Auth is a 600k-iteration PBKDF2 on the single writer (~6–7 logins/s), so
+some queueing is expected — but that alone does not explain the shortfall, and
+the cause is **not yet diagnosed**. The reported latency figures are therefore
+real but drawn from roughly a third of the intended concurrency.
+
+**This was previously invisible.** `Scripts/bench.sh` piped the result through a
+`sed` that extracted only the `rtt_ms...` portion, hiding the `connections_ok=`
+prefix. Failed connections report `rtt 0.00`, so a degenerate run printed
+`p50=0.00 p90=0.00 p99=0.00` — which reads like an outstanding result rather than
+a broken measurement. The script now prints the whole line.
