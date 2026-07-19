@@ -6,6 +6,7 @@
 #include "audio.h"
 #include "auth.h"
 #include "blobstore.h"
+#include "xferpool.h"
 #include "framebuf.h"
 #include "http.h"
 #include "protocol.h"
@@ -55,15 +56,21 @@ typedef enum { CONN_HANDSHAKE, CONN_ESTABLISHED } conn_state;
 
 /* Attachment transfer state (REQ-140/141, ARCH-69). A connection carries at most
  * one transfer at a time. Uploads stream client->blob (net-thread writes to the
- * local blob store, which is fast page-cache I/O — a dedicated worker only
- * becomes necessary for a remote/S3 backend). Downloads stream blob->client,
- * paced by the output-buffer occupancy so a large file never buffers in full. */
+ * a worker pool (ARCH-69, daemon/xferpool.c) rather than inline, so a slow S3
+ * endpoint cannot stall the event loop. At most one blob job per transfer is in
+ * flight; while one is, the connection stops being read, so a client cannot
+ * outrun the store and the frame buffer cannot grow unbounded. Downloads stream
+ * blob->client, paced by output-buffer occupancy so a large file never buffers
+ * in full. */
 typedef enum {
     XFER_NONE = 0,
     XFER_UP_AWAIT_CREATE,   /* sent ATTACH_CREATE; awaiting the id + storage key */
+    XFER_UP_AWAIT_OPEN,     /* asked the pool to open the blob sink */
     XFER_UP_ACTIVE,         /* streaming UPLOAD_CHUNKs into the blob */
+    XFER_UP_AWAIT_COMMIT,   /* asked the pool to commit the blob */
     XFER_UP_AWAIT_FINAL,    /* blob committed; awaiting ATTACH_FINALIZE */
     XFER_DOWN_AWAIT_LOOKUP, /* sent ATTACH_LOOKUP; awaiting authz + metadata */
+    XFER_DOWN_AWAIT_OPEN,   /* asked the pool to open the blob source */
     XFER_DOWN_ACTIVE        /* streaming DOWNLOAD_CHUNKs from the blob */
 } xfer_state;
 
@@ -79,6 +86,16 @@ typedef struct {
     uint8_t          digest[32];      /* upload: final digest, echoed in UPLOAD_OK */
     oc_blob_reader  *br;              /* download source */
     uint64_t         remaining;       /* download: bytes still to send */
+    /* A blob job is with a worker. While set, the handle above belongs to that
+     * job and must NOT be released here (xferpool.h), and the connection stops
+     * being read so the client cannot outrun the store (ARCH-69). */
+    int              in_flight;
+    /* DOWNLOAD_INFO fields, stashed from the DB result because it is freed
+     * before the blob finishes opening. */
+    char            *dl_filename;
+    char            *dl_mime;
+    uint8_t          dl_sha[32];
+    int              dl_have_sha;
 } conn_xfer;
 
 typedef struct {
@@ -116,6 +133,7 @@ static uint64_t g_next_conn_id = 1;
  * oc_netloop_run; the loop is single-threaded so file-scope state is safe, as
  * with g_enc/g_next_conn_id. */
 static oc_blobstore *g_blobs;
+static oc_xferpool  *g_xfers;   /* blob I/O off the net thread (ARCH-69) */
 static uint64_t      g_max_attach = OC_MAX_ATTACHMENT_SIZE;
 
 /* Per-webhook-token rate limit for the incoming-webhook endpoint (REQ-170). A
@@ -125,14 +143,49 @@ static oc_ratelimit *g_webhook_rl;
 #define OC_WEBHOOK_RATE_MAX     60u
 #define OC_WEBHOOK_RATE_WINDOW  60000u
 
-/* Abort/close any in-flight transfer on a connection and reset its state. A
- * still-open upload writer is aborted (its staged bytes discarded), so an
- * interrupted upload never publishes a partial blob. */
+/* Release any transfer state on a connection and reset it. A still-open upload
+ * writer is aborted (its staged bytes discarded), so an interrupted upload never
+ * publishes a partial blob.
+ *
+ * Two rules make this safe now that blob I/O is asynchronous (ARCH-69):
+ *
+ *   1. If a job is in flight, the handle belongs to that job, not to us. The
+ *      completion path finds the connection gone and releases it there.
+ *      Aborting it here would be a double free — this is the sharp edge of the
+ *      whole change, and it is why `in_flight` exists.
+ *   2. Otherwise we own the handle, but must not release it inline: put_abort
+ *      and get_close can both block on an S3 round trip, which is exactly what
+ *      this work exists to keep off the net thread. So it goes to the pool as a
+ *      fire-and-forget job (conn_id 0), which runs it and frees it with no
+ *      result coming back. */
 static void xfer_reset(conn_xfer *x) {
-    if (x->bw) { oc_blob_put_abort(x->bw); x->bw = NULL; }
-    if (x->br) { oc_blob_get_close(x->br); x->br = NULL; }
+    if (!x->in_flight) {
+        if (x->bw) {
+            oc_xfer_job *j = oc_xfer_job_new(OC_XFER_ABORT, 0);
+            if (j) { j->bw = x->bw; oc_xferpool_submit(g_xfers, j); }
+        }
+        if (x->br) {
+            oc_xfer_job *j = oc_xfer_job_new(OC_XFER_CLOSE, 0);
+            if (j) { j->br = x->br; oc_xferpool_submit(g_xfers, j); }
+        }
+    }
+    x->bw = NULL;
+    x->br = NULL;
     if (x->sha_init) { mbedtls_sha256_free(&x->sha); x->sha_init = 0; }
+    free(x->dl_filename);
+    free(x->dl_mime);
+
+    /* `in_flight` must SURVIVE the reset. It describes the connection, not the
+     * transfer: a job is still out with a worker, and the memset below would
+     * otherwise report the connection as idle. It would then un-pause, accept a
+     * new UPLOAD_BEGIN, and put a second operation in flight — breaking the
+     * one-op-per-transfer rule the whole design rests on, and ending in a
+     * double abort of the same handle. Keeping the flag set holds the
+     * connection paused until the outstanding completion lands, which then
+     * clears it. */
+    int outstanding = x->in_flight;
     memset(x, 0, sizeof *x);
+    x->in_flight = outstanding;
 }
 
 static uint64_t now_ms(void) {
@@ -218,6 +271,11 @@ static void update_interest(int ep, conn *c) {
     if (c->out_len > c->out_sent ||
         (c->xfer.state == XFER_DOWN_ACTIVE && c->xfer.remaining > 0))
         ev |= EPOLLOUT;
+    /* Blob job in flight: stop reading this connection so a client streaming
+     * faster than the store can absorb is throttled by TCP itself, and so no
+     * further push can overflow the frame buffer while the drain is paused
+     * (ARCH-69). */
+    if (c->xfer.in_flight) ev &= ~(uint32_t)EPOLLIN;
     conn_set_events(ep, c, ev);
 }
 
@@ -550,32 +608,40 @@ static int send_transfer_error(conn *c, uint64_t aid, uint16_t code) {
     return rc;
 }
 
-/* Stream DOWNLOAD_CHUNKs from the blob into the output buffer up to the soft cap;
- * the rest follows on the next writable wakeup (EPOLLOUT stays armed while a
- * download has bytes left). Emits DOWNLOAD_END once the blob is drained. */
+/* Ask the pool for the next slice of the blob, if the output buffer has room.
+ * The read completes asynchronously; xfer_read_done appends the chunk and calls
+ * back in here, so the loop is driven by completions rather than by a blocking
+ * read on the net thread (ARCH-69). Backpressure is unchanged in spirit: while
+ * the output buffer is above the soft cap we simply don't ask for more, and the
+ * EPOLLOUT drain calls us again once it empties. */
 static void download_pump(conn *c) {
     conn_xfer *x = &c->xfer;
-    if (x->state != XFER_DOWN_ACTIVE) return;
-    while (x->remaining > 0 && (c->out_len - c->out_sent) < OC_DOWNLOAD_SOFT_CAP) {
-        uint8_t data[OC_ATTACH_CHUNK_SIZE];
-        size_t want = x->remaining < sizeof data ? (size_t)x->remaining : sizeof data;
-        long n = oc_blob_get_chunk(x->br, data, want);
-        if (n <= 0) { send_transfer_error(c, x->attachment_id, OC_ERR_INTERNAL); return; }
-        oc_download_chunk ch = { x->attachment_id, x->next_seq, { data, (size_t)n } };
-        oc_wbuf w; oc_wbuf_init(&w, g_enc, sizeof g_enc);
-        oc_encode_download_chunk(&w, OC_PROTOCOL_VERSION, &ch);
-        if (out_append(c, g_enc, w.len) != 0) return; /* hit hard cap; resume on drain */
-        x->next_seq++;
-        x->remaining -= (uint64_t)n;
-    }
+    if (x->state != XFER_DOWN_ACTIVE || x->in_flight) return;
     if (x->remaining == 0) {
         oc_download_end de = { x->attachment_id };
         oc_wbuf w; oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_encode_download_end(&w, OC_PROTOCOL_VERSION, &de);
         out_append(c, g_enc, w.len);
-        oc_blob_get_close(x->br); x->br = NULL;
+        /* Closing can block on S3, so hand it to the pool and forget it. */
+        if (x->br) {
+            oc_xfer_job *cl = oc_xfer_job_new(OC_XFER_CLOSE, 0);
+            if (cl) { cl->br = x->br; oc_xferpool_submit(g_xfers, cl); }
+            x->br = NULL;
+        }
         x->state = XFER_NONE;
+        return;
     }
+    if ((c->out_len - c->out_sent) >= OC_DOWNLOAD_SOFT_CAP) return;  /* resume on drain */
+    size_t want = x->remaining < OC_ATTACH_CHUNK_SIZE ? (size_t)x->remaining : OC_ATTACH_CHUNK_SIZE;
+    oc_xfer_job *j = oc_xfer_job_new(OC_XFER_READ, c->conn_id);
+    if (!j) return;
+    j->br = x->br;
+    j->attachment_id = x->attachment_id;
+    j->len = want;
+    j->data = malloc(want);
+    if (!j->data) { oc_xfer_job_free(j); return; }
+    x->in_flight = 1;
+    oc_xferpool_submit(g_xfers, j);
 }
 
 /* Dispatch every buffered frame. Returns 0 to keep the connection, -1 to close.
@@ -584,6 +650,10 @@ static void download_pump(conn *c) {
 static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
     const uint8_t *frame; size_t flen;
     for (;;) {
+        /* A blob job is with a worker: leave the remaining frames buffered and
+         * stop reading (update_interest drops EPOLLIN). The completion handler
+         * calls back in here. */
+        if (c->xfer.in_flight) return 0;
         int r = oc_framebuf_next(&c->fb, &frame, &flen);
         if (r == 0) return 0;
         if (r < 0)  return -1;
@@ -1063,18 +1133,27 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
                 if (send_transfer_error(c, uc.attachment_id, OC_ERR_TRANSFER_PROTOCOL) != 0) return -1;
                 continue;
             }
-            if (oc_blob_put_chunk(x->bw, uc.data.ptr, uc.data.len) != 0) {
-                if (send_transfer_error(c, uc.attachment_id, OC_ERR_INTERNAL) != 0) return -1;
-                continue;
+            /* Hand the bytes to a worker. The job owns a copy because the frame
+             * buffer is reused, and because the write may outlive this frame.
+             * UPLOAD_ACK is sent on completion, so an ack now means "durably
+             * written" rather than merely "received". */
+            oc_xfer_job *wj = oc_xfer_job_new(OC_XFER_WRITE, c->conn_id);
+            if (!wj) return -1;
+            wj->bw = x->bw;
+            wj->attachment_id = x->attachment_id;
+            wj->len = uc.data.len;
+            if (uc.data.len) {
+                wj->data = malloc(uc.data.len);
+                if (!wj->data) { oc_xfer_job_free(wj); return -1; }
+                memcpy(wj->data, uc.data.ptr, uc.data.len);
             }
-            if (uc.data.len) mbedtls_sha256_update(&x->sha, uc.data.ptr, uc.data.len);
-            x->received += uc.data.len;
-            x->next_seq++;
-            oc_upload_ack ack = { x->attachment_id, x->next_seq };
-            oc_wbuf w; oc_wbuf_init(&w, g_enc, sizeof g_enc);
-            oc_encode_upload_ack(&w, OC_PROTOCOL_VERSION, &ack);
-            if (out_append(c, g_enc, w.len) != 0) return -1;
-            continue;
+            x->in_flight = 1;
+            oc_xferpool_submit(g_xfers, wj);
+            /* Stop draining here. Frames already buffered stay buffered, and
+             * update_interest drops EPOLLIN, so no further push can overflow the
+             * frame buffer while we are paused (framebuf.h). Draining resumes
+             * from the completion handler. */
+            return 0;
         }
         if (hdr.msg_type == OC_MSG_UPLOAD_END) {
             oc_upload_end ue;
@@ -1087,21 +1166,24 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             }
             mbedtls_sha256_finish(&x->sha, x->digest);
             mbedtls_sha256_free(&x->sha); x->sha_init = 0;
-            int committed = oc_blob_put_commit(x->bw) == 0;
-            x->bw = NULL;  /* commit frees the writer on either outcome */
-            if (!committed) {
-                if (send_transfer_error(c, ue.attachment_id, OC_ERR_INTERNAL) != 0) return -1;
-                continue;
-            }
-            oc_job *j = oc_job_new(OC_JOB_ATTACH_FINALIZE, c->conn_id);
-            if (!j) return -1;
-            j->user_id = c->user_id;
-            j->attachment_id = x->attachment_id;
-            j->att_size = x->received;
-            memcpy(j->att_sha256, x->digest, 32);
-            oc_dbwriter_submit(dbw, j);
-            x->state = XFER_UP_AWAIT_FINAL;
-            continue;
+            /* Committing can be a full request/response against S3, so it goes
+             * to the pool; the ATTACH_FINALIZE job is submitted when it lands.
+             * Reaching here means no write is in flight: the read pause above
+             * guarantees UPLOAD_END is only dispatched once the previous chunk
+             * has completed. */
+            oc_xfer_job *cj = oc_xfer_job_new(OC_XFER_COMMIT, c->conn_id);
+            if (!cj) return -1;
+            cj->bw = x->bw;
+            /* COMMIT *consumes* the writer (oc_blob_put_commit frees it), so
+             * ownership moves to the job here. Leaving x->bw set would let a
+             * later xfer_reset abort an already-freed writer — the handle must
+             * be reachable from exactly one place at a time. */
+            x->bw = NULL;
+            cj->attachment_id = x->attachment_id;
+            x->state = XFER_UP_AWAIT_COMMIT;
+            x->in_flight = 1;
+            oc_xferpool_submit(g_xfers, cj);
+            return 0;
         }
         if (hdr.msg_type == OC_MSG_DOWNLOAD_BEGIN) {
             oc_download_begin db;
@@ -1263,6 +1345,12 @@ static int on_readable(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (st == OC_TLS_CLOSED || st == OC_TLS_ERROR) return -1;
         if (oc_framebuf_push(&c->fb, chunk, n) != 0) return -1;
         if (drain_frames(ep, conns, c, dbw) < 0) return -1;
+        /* A blob job went in flight, so the drain is paused. Stop reading here
+         * too: dropping EPOLLIN only governs the next epoll wakeup, and this
+         * loop would otherwise keep pushing frames nobody is draining until the
+         * frame buffer overflows (framebuf.h sizes it for drain-after-push).
+         * The completion handler resumes both. */
+        if (c->xfer.in_flight) return 0;
     }
 }
 
@@ -1705,25 +1793,26 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         if (!c) break;
         conn_xfer *x = &c->xfer;
         if (x->state != XFER_UP_AWAIT_CREATE) break;   /* client canceled/closed */
-        x->bw = oc_blob_put_begin(g_blobs, r->storage_key, r->att_size);
-        if (!x->bw) {
+        /* Opening an S3 object is a connect + TLS handshake, so it goes to the
+         * pool; UPLOAD_READY is sent when it completes. */
+        oc_xfer_job *j = oc_xfer_job_new(OC_XFER_OPEN_W, c->conn_id);
+        if (!j || !(j->key = strdup(r->storage_key ? r->storage_key : ""))) {
+            oc_xfer_job_free(j);
             int fd = c->fd;
             send_transfer_error(c, r->attachment_id, OC_ERR_INTERNAL);
             if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
             break;
         }
+        j->size_hint = r->att_size;
+        j->attachment_id = r->attachment_id;
         x->attachment_id = r->attachment_id;
         x->declared_size = r->att_size;
         x->received = 0;
         x->next_seq = 0;
-        mbedtls_sha256_init(&x->sha);
-        mbedtls_sha256_starts(&x->sha, 0);
-        x->sha_init = 1;
-        x->state = XFER_UP_ACTIVE;
-        oc_upload_ready rd = { r->attachment_id, OC_ATTACH_CHUNK_SIZE, OC_UPLOAD_WINDOW };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
-        oc_encode_upload_ready(&w, OC_PROTOCOL_VERSION, &rd);
-        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        x->state = XFER_UP_AWAIT_OPEN;
+        x->in_flight = 1;
+        oc_xferpool_submit(g_xfers, j);
+        update_interest(ep, c);
         break;
     }
     case OC_RES_ATTACH_OK: {
@@ -1746,26 +1835,28 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         if (!c) break;
         conn_xfer *x = &c->xfer;
         if (x->state != XFER_DOWN_AWAIT_LOOKUP) break;
-        x->br = oc_blob_get_begin(g_blobs, r->storage_key, NULL);
-        if (!x->br) {
+        /* Stash what DOWNLOAD_INFO needs: this DB result is freed before the
+         * blob finishes opening on the worker. */
+        free(x->dl_filename); free(x->dl_mime);
+        x->dl_filename = strdup(r->filename ? r->filename : "");
+        x->dl_mime = strdup(r->mime ? r->mime : "");
+        memcpy(x->dl_sha, r->att_sha256, 32);
+        x->dl_have_sha = 1;
+        oc_xfer_job *j = oc_xfer_job_new(OC_XFER_OPEN_R, c->conn_id);
+        if (!j || !(j->key = strdup(r->storage_key ? r->storage_key : ""))) {
+            oc_xfer_job_free(j);
             int fd = c->fd;
             send_transfer_error(c, r->attachment_id, OC_ERR_INTERNAL);
             if (conns[fd]) { flush_out(conns[fd]); update_interest(ep, conns[fd]); }
             break;
         }
+        j->attachment_id = r->attachment_id;
         x->attachment_id = r->attachment_id;
         x->remaining = r->att_size;
         x->next_seq = 0;
-        x->state = XFER_DOWN_ACTIVE;
-        oc_download_info di = { r->attachment_id, oc_slice_str(r->filename ? r->filename : ""),
-                                oc_slice_str(r->mime ? r->mime : ""), r->att_size,
-                                { r->att_sha256, 32 } };
-        oc_wbuf_init(&w, g_enc, sizeof g_enc);
-        oc_encode_download_info(&w, OC_PROTOCOL_VERSION, &di);
-        int fd = c->fd;
-        if (out_append(c, g_enc, w.len) != 0) { conn_close(ep, conns, fd); break; }
-        download_pump(c);
-        if (flush_out(c) < 0) { conn_close(ep, conns, fd); break; }
+        x->state = XFER_DOWN_AWAIT_OPEN;
+        x->in_flight = 1;
+        oc_xferpool_submit(g_xfers, j);
         update_interest(ep, c);
         break;
     }
@@ -2034,6 +2125,166 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
 
 /* --- Main loop ---------------------------------------------------------- */
 
+
+/* Collect one finished blob job (ARCH-69) and advance that transfer.
+ *
+ * The connection may have closed while the job was with a worker, which is the
+ * case this whole design exists to make safe: the handle travels with the job,
+ * so if the connection is gone we still own something valid and release it here
+ * rather than leaking it. Nothing dereferences a stale `conn *` — the job
+ * carries a conn_id and connection ids are never reused. */
+static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_job *j) {
+    conn *c = find_by_id(conns, j->conn_id);
+    if (!c) {
+        /* Orphaned: release whatever the job is still holding, off-thread. */
+        if (j->bw) {
+            oc_xfer_job *ab = oc_xfer_job_new(OC_XFER_ABORT, 0);
+            if (ab) { ab->bw = j->bw; oc_xferpool_submit(g_xfers, ab); }
+        }
+        if (j->br) {
+            oc_xfer_job *cl = oc_xfer_job_new(OC_XFER_CLOSE, 0);
+            if (cl) { cl->br = j->br; oc_xferpool_submit(g_xfers, cl); }
+        }
+        return;
+    }
+
+    conn_xfer *x = &c->xfer;
+    int fd = c->fd;
+    oc_wbuf w;
+
+    /* The job is done, so the connection owns its transfer state again. Clear
+     * this before anything below, since xfer_reset consults it to decide
+     * whether a handle is ours to release. */
+    x->in_flight = 0;
+
+    /* A stale completion for a transfer the client already abandoned (it sent
+     * TRANSFER_CANCEL, or started a new one). Release the handle and stop. */
+    if (j->attachment_id && x->attachment_id != j->attachment_id) {
+        if (j->bw) {
+            oc_xfer_job *ab = oc_xfer_job_new(OC_XFER_ABORT, 0);
+            if (ab) { ab->bw = j->bw; oc_xferpool_submit(g_xfers, ab); }
+        }
+        if (j->br) {
+            oc_xfer_job *cl = oc_xfer_job_new(OC_XFER_CLOSE, 0);
+            if (cl) { cl->br = j->br; oc_xferpool_submit(g_xfers, cl); }
+        }
+        update_interest(ep, c);
+        return;
+    }
+
+    switch (j->op) {
+    case OC_XFER_OPEN_W:
+        if (j->rc != 0 || !j->bw || x->state != XFER_UP_AWAIT_OPEN) {
+            if (j->bw) {   /* opened, but the client moved on */
+                oc_xfer_job *ab = oc_xfer_job_new(OC_XFER_ABORT, 0);
+                if (ab) { ab->bw = j->bw; oc_xferpool_submit(g_xfers, ab); }
+            }
+            send_transfer_error(c, j->attachment_id, OC_ERR_INTERNAL);
+            break;
+        }
+        x->bw = j->bw;
+        mbedtls_sha256_init(&x->sha);
+        mbedtls_sha256_starts(&x->sha, 0);
+        x->sha_init = 1;
+        x->state = XFER_UP_ACTIVE;
+        {
+            oc_upload_ready rd = { x->attachment_id, OC_ATTACH_CHUNK_SIZE, OC_UPLOAD_WINDOW };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_upload_ready(&w, OC_PROTOCOL_VERSION, &rd);
+            if (out_append(c, g_enc, w.len) != 0) { conn_close(ep, conns, fd); return; }
+        }
+        break;
+
+    case OC_XFER_WRITE:
+        if (j->rc != 0 || x->state != XFER_UP_ACTIVE) {
+            send_transfer_error(c, j->attachment_id, OC_ERR_INTERNAL);
+            break;
+        }
+        /* Hash here, not at submit time: completions arrive in submission order
+         * (one job per transfer in flight), so this matches what was stored. */
+        if (j->len) mbedtls_sha256_update(&x->sha, j->data, j->len);
+        x->received += j->len;
+        x->next_seq++;
+        {
+            oc_upload_ack ack = { x->attachment_id, x->next_seq };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_upload_ack(&w, OC_PROTOCOL_VERSION, &ack);
+            if (out_append(c, g_enc, w.len) != 0) { conn_close(ep, conns, fd); return; }
+        }
+        break;
+
+    case OC_XFER_COMMIT:
+        if (j->rc != 0 || x->state != XFER_UP_AWAIT_COMMIT) {
+            send_transfer_error(c, j->attachment_id, OC_ERR_INTERNAL);
+            break;
+        }
+        {
+            oc_job *fj = oc_job_new(OC_JOB_ATTACH_FINALIZE, c->conn_id);
+            if (!fj) { send_transfer_error(c, j->attachment_id, OC_ERR_INTERNAL); break; }
+            fj->user_id = c->user_id;
+            fj->attachment_id = x->attachment_id;
+            fj->att_size = x->received;
+            memcpy(fj->att_sha256, x->digest, 32);
+            oc_dbwriter_submit(dbw, fj);
+            x->state = XFER_UP_AWAIT_FINAL;
+        }
+        break;
+
+    case OC_XFER_OPEN_R:
+        if (j->rc != 0 || !j->br || x->state != XFER_DOWN_AWAIT_OPEN) {
+            if (j->br) {
+                oc_xfer_job *cl = oc_xfer_job_new(OC_XFER_CLOSE, 0);
+                if (cl) { cl->br = j->br; oc_xferpool_submit(g_xfers, cl); }
+            }
+            send_transfer_error(c, j->attachment_id, OC_ERR_INTERNAL);
+            break;
+        }
+        x->br = j->br;
+        x->state = XFER_DOWN_ACTIVE;
+        {
+            oc_download_info di = { x->attachment_id,
+                                    oc_slice_str(x->dl_filename ? x->dl_filename : ""),
+                                    oc_slice_str(x->dl_mime ? x->dl_mime : ""),
+                                    x->remaining, { x->dl_sha, 32 } };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_download_info(&w, OC_PROTOCOL_VERSION, &di);
+            if (out_append(c, g_enc, w.len) != 0) { conn_close(ep, conns, fd); return; }
+        }
+        download_pump(c);
+        break;
+
+    case OC_XFER_READ:
+        if (j->rc != 0 || j->len == 0 || x->state != XFER_DOWN_ACTIVE) {
+            send_transfer_error(c, j->attachment_id, OC_ERR_INTERNAL);
+            break;
+        }
+        {
+            oc_download_chunk ch = { x->attachment_id, x->next_seq, { j->data, j->len } };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_download_chunk(&w, OC_PROTOCOL_VERSION, &ch);
+            if (out_append(c, g_enc, w.len) != 0) { conn_close(ep, conns, fd); return; }
+        }
+        x->next_seq++;
+        x->remaining -= (uint64_t)j->len;
+        download_pump(c);                      /* ask for the next slice */
+        break;
+
+    case OC_XFER_ABORT:
+    case OC_XFER_CLOSE:
+        break;                                  /* submitted fire-and-forget */
+    }
+
+    if (!conns[fd]) return;                     /* closed above */
+    /* An upload write just finished: resume draining the frames that arrived
+     * while we were paused, then re-arm EPOLLIN via update_interest. */
+    if (j->op == OC_XFER_WRITE && !x->in_flight) {
+        if (drain_frames(ep, conns, c, dbw) < 0) { conn_close(ep, conns, fd); return; }
+        if (!conns[fd]) return;
+    }
+    if (flush_out(c) < 0) { conn_close(ep, conns, fd); return; }
+    if (conns[fd]) update_interest(ep, c);
+}
+
 int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                    volatile sig_atomic_t *stop) {
     conn **conns = calloc(OC_NETLOOP_MAX_FD, sizeof *conns);
@@ -2067,6 +2318,19 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         const char *cap = getenv("OPENCHIME_MAX_ATTACHMENT_SIZE");
         g_max_attach = OC_MAX_ATTACHMENT_SIZE;
         if (cap && *cap) { unsigned long long v = strtoull(cap, NULL, 10); if (v) g_max_attach = v; }
+
+        /* Blob I/O runs here, off the net thread (ARCH-69). Two workers by
+         * default: each in-flight transfer holds a TLS session plus a chunk
+         * buffer, which has to stay modest against the 256MB lean profile
+         * (REQ-210). */
+        int nw = 2;
+        const char *nws = getenv("OPENCHIME_XFER_WORKERS");
+        if (nws && *nws) { int v = atoi(nws); if (v > 0 && v <= 16) nw = v; }
+        g_xfers = oc_xferpool_start(g_blobs, nw);
+        if (!g_xfers) {
+            oc_blobstore_close(g_blobs); g_blobs = NULL;
+            close(ep); close(lfd); free(conns); return -1;
+        }
     }
 
     /* Per-webhook rate limit (REQ-170); best-effort — if allocation fails the
@@ -2090,6 +2354,10 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     memset(&ev, 0, sizeof ev);
     ev.events = EPOLLIN; ev.data.fd = evfd;
     epoll_ctl(ep, EPOLL_CTL_ADD, evfd, &ev);
+
+    int xfd = oc_xferpool_eventfd(g_xfers);
+    ev.events = EPOLLIN; ev.data.fd = xfd;
+    epoll_ctl(ep, EPOLL_CTL_ADD, xfd, &ev);
 
     fprintf(stderr, "netloop: listening on :%d\n", port);
 
@@ -2152,6 +2420,17 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                 continue;
             }
 
+            if (fd == xfd) {
+                uint64_t cnt;
+                while (read(xfd, &cnt, sizeof cnt) > 0) { /* drain the counter */ }
+                oc_xfer_job *xj;
+                while ((xj = oc_xferpool_next_result(g_xfers)) != NULL) {
+                    deliver_xfer_result(ep, conns, dbw, xj);
+                    oc_xfer_job_free(xj);
+                }
+                continue;
+            }
+
             conn *c = conns[fd];
             if (!c) continue;
 
@@ -2181,6 +2460,10 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
 
     for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
         if (conns[fd]) conn_close(ep, conns, fd);
+    /* Stop the workers before the store they borrow; this also drains any
+     * fire-and-forget cleanup the closes above just queued. */
+    oc_xferpool_stop(g_xfers);
+    g_xfers = NULL;
     oc_blobstore_close(g_blobs);
     g_blobs = NULL;
     oc_ratelimit_free(g_webhook_rl);

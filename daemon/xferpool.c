@@ -155,6 +155,20 @@ oc_xferpool *oc_xferpool_start(oc_blobstore *bs, int nthreads) {
     return p;
 }
 
+/* Free a drained job, releasing its handle only if this op OWNS one. */
+static void release_owned(oc_xfer_job *j) {
+    switch (j->op) {
+    case OC_XFER_OPEN_W: case OC_XFER_OPEN_R:
+    case OC_XFER_COMMIT: case OC_XFER_ABORT: case OC_XFER_CLOSE:
+        if (j->bw) oc_blob_put_abort(j->bw);
+        if (j->br) oc_blob_get_close(j->br);
+        break;
+    case OC_XFER_WRITE: case OC_XFER_READ:
+        break;                      /* borrowed: the transfer still owns it */
+    }
+    oc_xfer_job_free(j);
+}
+
 void oc_xferpool_stop(oc_xferpool *p) {
     if (!p) return;
     pthread_mutex_lock(&p->mu);
@@ -163,19 +177,19 @@ void oc_xferpool_stop(oc_xferpool *p) {
     pthread_mutex_unlock(&p->mu);
     for (int i = 0; i < p->nthreads; i++) pthread_join(p->threads[i], NULL);
 
-    /* Drain whatever never ran or was never collected. Any blob handle still
-     * attached is released so a shutdown mid-transfer doesn't leak it. */
+    /* Drain whatever never ran or was never collected, releasing only the
+     * handles these jobs actually OWN.
+     *
+     * WRITE and READ merely *borrow* the handle — the transfer still owns it and
+     * may already have committed or closed it. Releasing those here is a double
+     * free: a completed-but-uncollected WRITE whose transfer later committed
+     * would abort a freed writer, and a WRITE queued alongside a real ABORT
+     * would abort the same handle twice. Only the ops that take ownership
+     * (an OPEN whose result was never collected, or a pending COMMIT / ABORT /
+     * CLOSE) release anything. */
     oc_xfer_job *j;
-    while ((j = q_pop(&p->in_head, &p->in_tail))) {
-        if (j->bw) oc_blob_put_abort(j->bw);
-        if (j->br) oc_blob_get_close(j->br);
-        oc_xfer_job_free(j);
-    }
-    while ((j = q_pop(&p->out_head, &p->out_tail))) {
-        if (j->bw) oc_blob_put_abort(j->bw);
-        if (j->br) oc_blob_get_close(j->br);
-        oc_xfer_job_free(j);
-    }
+    while ((j = q_pop(&p->in_head, &p->in_tail)))  release_owned(j);
+    while ((j = q_pop(&p->out_head, &p->out_tail))) release_owned(j);
     free(p->threads);
     pthread_cond_destroy(&p->cv);
     pthread_mutex_destroy(&p->mu);

@@ -858,6 +858,103 @@ static size_t download_attachment(client *c, uint64_t aid, uint8_t *out, size_t 
     return off;
 }
 
+/* Disconnecting mid-upload (ARCH-69). The dangerous shape once blob I/O moved
+ * off the net thread: a client vanishes while a chunk write is still with a
+ * worker, so the completion arrives for a connection that has already been
+ * freed. The handle travels with the job precisely so that path can release it
+ * instead of touching freed memory. Under ASan this is what would catch a
+ * use-after-free or a double free; without a sanitizer it mostly proves the
+ * daemon survives and keeps serving.
+ *
+ * Repeated, and at several points in the transfer, because the race only opens
+ * in the window where a job is actually in flight. */
+static void test_upload_abandoned(int port, const uint8_t *pin) {
+    uint8_t *fbuf = malloc(OC_MAX_FRAME_SIZE);
+    CHECK(fbuf != NULL);
+    if (!fbuf) return;
+
+    for (int round = 0; round < 4; round++) {
+        client a;
+        if (client_open(&a, port, pin) != 0) { CHECK(0); break; }
+        if (do_handshake(&a) != 0) { CHECK(0); client_close(&a); break; }
+        uint64_t ua = 0;
+        if (do_auth(&a, "alice", "pw-alice", &ua) != 0) { CHECK(0); client_close(&a); break; }
+
+        oc_header hdr; oc_rbuf p; oc_wbuf w;
+        const size_t total = 200000;              /* several chunks */
+        uint8_t idem[OC_IDEM_SIZE];
+        memset(idem, (uint8_t)(0xC0 + round), sizeof idem);
+
+        oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+        oc_upload_begin ub = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("gone.bin"),
+                               oc_slice_str("application/octet-stream"), total };
+        memcpy(ub.idem, idem, OC_IDEM_SIZE);
+        CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub) == OC_OK);
+        CHECK(send_frame(&a, fbuf, w.len) == 0);
+        CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_READY);
+        oc_upload_ready urd;
+        CHECK(oc_decode_upload_ready(&p, &urd) == OC_OK);
+
+        /* Push `round` chunks, then drop the connection WITHOUT reading the
+         * acks — so a write is very likely still in flight server-side. */
+        uint8_t *chunk = calloc(1, urd.chunk_size ? urd.chunk_size : 1);
+        CHECK(chunk != NULL);
+        if (chunk) {
+            for (int i = 0; i < round; i++) {
+                oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+                oc_upload_chunk uc = { urd.attachment_id, (uint32_t)i,
+                                       { chunk, urd.chunk_size } };
+                if (oc_encode_upload_chunk(&w, OC_PROTOCOL_VERSION, &uc) != OC_OK) break;
+                if (send_frame(&a, fbuf, w.len) != 0) break;
+            }
+            free(chunk);
+        }
+        client_close(&a);                          /* vanish mid-transfer */
+    }
+
+    /* The daemon must still be healthy: a fresh client completes a normal
+     * upload afterwards. This is the real assertion — the loop above only
+     * creates the hazard. */
+    client b;
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&b) == 0);
+    uint64_t ub_id = 0;
+    CHECK(do_auth(&b, "alice", "pw-alice", &ub_id) == 0);
+
+    oc_header hdr; oc_rbuf p; oc_wbuf w;
+    const size_t small = 1024;
+    uint8_t *payload = malloc(small);
+    CHECK(payload != NULL);
+    if (payload) {
+        for (size_t i = 0; i < small; i++) payload[i] = (uint8_t)(i * 7u + 3u);
+        uint8_t idem2[OC_IDEM_SIZE]; memset(idem2, 0xD9, sizeof idem2);
+        oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+        oc_upload_begin ub2 = { OC_DEFAULT_CHANNEL, {0}, oc_slice_str("after.bin"),
+                                oc_slice_str("application/octet-stream"), small };
+        memcpy(ub2.idem, idem2, OC_IDEM_SIZE);
+        CHECK(oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub2) == OC_OK);
+        CHECK(send_frame(&b, fbuf, w.len) == 0);
+        CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_READY);
+        oc_upload_ready urd2;
+        CHECK(oc_decode_upload_ready(&p, &urd2) == OC_OK);
+
+        oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+        oc_upload_chunk uc = { urd2.attachment_id, 0, { payload, small } };
+        CHECK(oc_encode_upload_chunk(&w, OC_PROTOCOL_VERSION, &uc) == OC_OK);
+        CHECK(send_frame(&b, fbuf, w.len) == 0);
+        CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_ACK);
+
+        oc_wbuf_init(&w, fbuf, OC_MAX_FRAME_SIZE);
+        oc_upload_end ue = { urd2.attachment_id };
+        CHECK(oc_encode_upload_end(&w, OC_PROTOCOL_VERSION, &ue) == OC_OK);
+        CHECK(send_frame(&b, fbuf, w.len) == 0);
+        CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_UPLOAD_OK);
+        free(payload);
+    }
+    client_close(&b);
+    free(fbuf);
+}
+
 /* Attachments over the wire (REQ-140/141, ARCH-69). A multi-chunk blob is
  * uploaded and streamed back byte-for-byte; a second user retrieves the same
  * blob from a shared channel; and a non-member is refused a private one — all
@@ -1680,6 +1777,7 @@ int run_netloop_tests(void) {
         test_dm_vertical(arg.port, pin);
         test_presence_typing(arg.port, pin);
         test_attachments_vertical(arg.port, pin);
+        test_upload_abandoned(arg.port, pin);
         test_webhook_vertical(arg.port, pin);
         test_notify_prefs_vertical(arg.port, pin);
         test_call_vertical(arg.port, pin);
