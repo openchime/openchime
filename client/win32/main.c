@@ -24,6 +24,7 @@
 #include "client.h"
 #include "model.h"
 #include "resolve.h"
+#include "chat.h"
 
 /* Control ids */
 enum { ID_WS = 100, ID_USER, ID_PASS, ID_CONNECT, ID_STATUS };
@@ -31,7 +32,6 @@ enum { ID_WS = 100, ID_USER, ID_PASS, ID_CONNECT, ID_STATUS };
 
 static oc_client *g_client;
 static HWND g_hws, g_huser, g_hpass, g_hconnect, g_hstatus;
-static int  g_authed_shown;
 
 /* Read a control's text into a fixed buffer (UTF-8 not needed here — the fields
  * are host/user/pass, ASCII in practice; GetWindowTextA suffices for now). */
@@ -79,28 +79,46 @@ static void do_connect(HWND hwnd) {
     g_client = oc_client_start_secure(host, port, cred, NULL, NULL);
     if (!g_client) { set_status("failed to start client"); return; }
 
-    g_authed_shown = 0;
     EnableWindow(g_hconnect, FALSE);
     set_status("connecting…");
     SetTimer(hwnd, TIMER_TICK, 30, NULL);   /* ~30 Hz: drain events, refresh UI */
 }
 
+/* Hide the login controls and grow the window into the chat shell (once). */
+static void enter_chat(HWND hwnd) {
+    HINSTANCE inst = (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE);
+    ShowWindow(g_hws, SW_HIDE);       ShowWindow(g_huser, SW_HIDE);
+    ShowWindow(g_hpass, SW_HIDE);     ShowWindow(g_hconnect, SW_HIDE);
+    ShowWindow(g_hstatus, SW_HIDE);
+    /* Drop the login button's default-push style so Enter routes to chat's Send. */
+    SendMessage(g_hconnect, BM_SETSTYLE, BS_PUSHBUTTON, TRUE);
+    /* Hide the static labels too (they have no ids; enumerate children). */
+    for (HWND c = GetWindow(hwnd, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT)) {
+        char cls[16]; GetClassNameA(c, cls, sizeof cls);
+        if (strcmp(cls, "Static") == 0 && c != g_hstatus) ShowWindow(c, SW_HIDE);
+    }
+    /* Grow to a comfortable chat size and re-center. */
+    RECT wr; GetWindowRect(hwnd, &wr);
+    int nw = 1000, nh = 660;
+    int x = wr.left - (nw - (wr.right - wr.left)) / 2;
+    int y = wr.top  - (nh - (wr.bottom - wr.top)) / 2;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    SetWindowText(hwnd, "OpenChime");
+    MoveWindow(hwnd, x, y, nw, nh, TRUE);
+    chat_build(hwnd, inst, g_client);
+}
+
 /* Called on every timer tick: drain the core's events into the model, then
- * reflect connection/auth state in the status line. */
+ * either drive the chat shell (once authenticated) or reflect login progress. */
 static void on_tick(HWND hwnd) {
     if (!g_client) return;
     oc_client_tick(g_client);
     const oc_model *m = oc_client_model(g_client);
 
     if (m->authed) {
-        if (!g_authed_shown) {
-            char s[160];
-            const char *me = m->user_id ? oc_model_user_name(m, m->user_id) : "";
-            snprintf(s, sizeof s, "connected — signed in as %s  (%zu channel%s)",
-                     me[0] ? me : "you", m->n_channels, m->n_channels == 1 ? "" : "s");
-            set_status(s);
-            g_authed_shown = 1;
-        }
+        if (!chat_active()) enter_chat(hwnd);
+        chat_render();
         return;
     }
     if (m->last_error[0] && !m->connected) {
@@ -149,6 +167,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             do_connect(hwnd);
             return 0;
         }
+        if (chat_command(hwnd, wp, lp)) return 0;
+        return 0;
+    case WM_SIZE:
+        chat_layout(hwnd);
         return 0;
     case WM_TIMER:
         if (wp == TIMER_TICK) on_tick(hwnd);
@@ -177,7 +199,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
     if (!RegisterClassA(&wc)) return 1;
 
     HWND hwnd = CreateWindowExA(0, "OpenChimeWin", "OpenChime",
-                    WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                    WS_OVERLAPPEDWINDOW,   /* caption + sysmenu + min/max + resizable */
                     CW_USEDEFAULT, CW_USEDEFAULT, 440, 320,
                     NULL, NULL, inst, NULL);
     if (!hwnd) return 1;
