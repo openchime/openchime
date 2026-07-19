@@ -600,6 +600,11 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     case OC_EV_SETTING:
         setting_upsert(m, e->author_name, e->body ? e->body : "");
         break;
+    case OC_EV_STORAGE:
+        m->storage = e->storage;
+        m->storage_have = 1;
+        set_status(m, "storage report updated");
+        break;
     case OC_EV_PROFILE:
         /* A display-name change (REQ-020): update the roster entry's name in place
          * (role/disabled untouched). For our own id it doubles as the change ack. */

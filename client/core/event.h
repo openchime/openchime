@@ -9,6 +9,16 @@
 
 #include <stdint.h>
 
+/* Storage usage, policy, and what maintenance has reclaimed (REQ-214/215),
+ * carried on OC_EV_STORAGE and folded into the model for the frontend to
+ * render. Owner/admin only — the daemon refuses the request otherwise. */
+typedef struct {
+    uint64_t total_bytes, avail_bytes, attach_bytes, attach_count;
+    uint64_t rec_orphan, rec_expired, rec_evicted, last_reclaim_ms;
+    uint64_t max_age_days, reserve_bytes;
+    uint8_t  evict_enabled, under_pressure;
+} oc_storage_view;
+
 /* net thread -> UI thread */
 enum {
     OC_EV_CONNECTED = 1,   /* TLS + handshake up */
@@ -39,6 +49,7 @@ enum {
     OC_EV_SETTING,         /* one synced setting: author_name=key, body=value */
     OC_EV_PROFILE,         /* a PROFILE_UPDATED: user_id + body=display_name (own = the change ack) */
     OC_EV_READ_CURSOR,     /* a READ_CURSOR: user_id read up to message_id in channel_id (seen-by) */
+    OC_EV_STORAGE,         /* a STORAGE_STATUS: usage + policy report (REQ-214) */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
     OC_EV_ERROR            /* protocol/transport error; body = human message */
 };
@@ -52,6 +63,7 @@ typedef struct {
     uint64_t parent_id;    /* THREAD_REPLY: the parent message this replies to */
     uint64_t server_time;
     uint8_t  status;       /* PRESENCE: online/away/offline; CHANNEL: joined flag */
+    oc_storage_view storage;  /* OC_EV_STORAGE */
     uint8_t  op;           /* REACTION: add/remove */
     uint32_t count;        /* REACTION: running aggregate count for the emoji */
     char     emoji[40];    /* REACTION: the emoji */
@@ -89,6 +101,7 @@ enum {
     OC_CMD_SET_DISPLAY_NAME, /* change your own display name: body=name */
     OC_CMD_CHANGE_PASSWORD, /* change your own password: body=old, body2=new */
     OC_CMD_MARK_READ,       /* CLIENT_ACK: read `channel_id` up to `message_id` (drives seen-by) */
+    OC_CMD_STORAGE_STATUS,  /* ask for the storage usage report (owner/admin) */
     OC_CMD_SET_ROLE,        /* set a user's tenant role: channel_id = user_id, op = role */
     OC_CMD_INVITE_USER,     /* mint a tenant invite token: op = role */
     OC_CMD_REMOVE_USER,     /* remove/disable a user: channel_id = user_id */

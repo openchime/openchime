@@ -258,6 +258,16 @@ static const char MIGRATION_0014[] =
     "ALTER TABLE attachments ADD COLUMN reclaimed_at_ms INTEGER NOT NULL DEFAULT 0;"
     "CREATE INDEX idx_attachments_reclaim ON attachments(reclaimed_at_ms, created_at_ms);";
 
+/* 0015: why a blob was reclaimed (REQ-215 auditability). The attachments table
+ * already records WHEN via reclaimed_at_ms; this records WHICH TIER did it —
+ * 1 orphan, 2 aged out, 3 evicted under pressure. That makes the audit trail a
+ * query against a table we already keep rather than a second, ever-growing log:
+ * an operator can ask exactly what eviction took and when, which matters
+ * because eviction is default-on and destroys data nobody approved
+ * individually. */
+static const char MIGRATION_0015[] =
+    "ALTER TABLE attachments ADD COLUMN reclaim_reason INTEGER NOT NULL DEFAULT 0;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -273,6 +283,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 12, MIGRATION_0012 },
     { 13, MIGRATION_0013 },
     { 14, MIGRATION_0014 },
+    { 15, MIGRATION_0015 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

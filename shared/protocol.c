@@ -498,6 +498,11 @@ oc_result oc_encode_list_channels(oc_wbuf *w, uint16_t version) {
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_storage_status_req(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_STORAGE_STATUS_REQ);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_channel_list(oc_wbuf *w, uint16_t version, const oc_channel_list *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CHANNEL_LIST);
     oc_w_u16(w, m->count);
@@ -669,6 +674,42 @@ oc_result oc_encode_list_client_settings(oc_wbuf *w, uint16_t version, const oc_
     size_t off = oc_frame_begin(w, version, OC_MSG_LIST_CLIENT_SETTINGS);
     oc_w_str(w, m->client_type);
     return oc_frame_end(w, off);
+}
+
+/* Storage usage report (REQ-214). Fixed-width fields only, so it needs no
+ * length prefixes and stays trivially forward-compatible: a later version can
+ * append fields and an older client simply stops reading early. */
+oc_result oc_encode_storage_status(oc_wbuf *w, uint16_t version, const oc_storage_status *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_STORAGE_STATUS);
+    oc_w_u64(w, m->total_bytes);
+    oc_w_u64(w, m->avail_bytes);
+    oc_w_u64(w, m->attach_bytes);
+    oc_w_u64(w, m->attach_count);
+    oc_w_u64(w, m->reclaimed_orphan);
+    oc_w_u64(w, m->reclaimed_expired);
+    oc_w_u64(w, m->reclaimed_evicted);
+    oc_w_u64(w, m->last_reclaim_ms);
+    oc_w_u64(w, m->max_age_days);
+    oc_w_u64(w, m->reserve_bytes);
+    oc_w_u8(w, m->evict_enabled);
+    oc_w_u8(w, m->under_pressure);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_storage_status(oc_rbuf *r, oc_storage_status *m) {
+    m->total_bytes      = oc_r_u64(r);
+    m->avail_bytes      = oc_r_u64(r);
+    m->attach_bytes     = oc_r_u64(r);
+    m->attach_count     = oc_r_u64(r);
+    m->reclaimed_orphan = oc_r_u64(r);
+    m->reclaimed_expired= oc_r_u64(r);
+    m->reclaimed_evicted= oc_r_u64(r);
+    m->last_reclaim_ms  = oc_r_u64(r);
+    m->max_age_days     = oc_r_u64(r);
+    m->reserve_bytes    = oc_r_u64(r);
+    m->evict_enabled    = oc_r_u8(r);
+    m->under_pressure   = oc_r_u8(r);
+    return r_done(r);
 }
 
 oc_result oc_encode_client_settings(oc_wbuf *w, uint16_t version, const oc_client_settings *m) {

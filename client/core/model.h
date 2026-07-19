@@ -142,6 +142,13 @@ typedef struct {
     oc_setting *settings;
     size_t    n_settings, cap_settings;
     uint8_t   settings_synced;        /* a snapshot has arrived at least once */
+
+    /* Storage report (REQ-214). Owner/admin only, so it stays zeroed for a
+     * member — the daemon refuses the request rather than sending zeros.
+     * `storage_open` is frontend view state for the overlay. */
+    oc_storage_view storage;
+    uint8_t   storage_have;
+    uint8_t   storage_open;
     char     status[160];             /* last status / error line */
     /* The last hard error (auth failed, unreachable, …). Unlike `status` it is
      * NOT overwritten by the "disconnected" line, so a login flow can read the

@@ -119,6 +119,12 @@ void oc_client_set_client_type(oc_client *c, const char *client_type);
 void oc_client_set_setting(oc_client *c, const char *key, const char *value);
 void oc_client_list_settings(oc_client *c);
 
+/* Storage usage report (REQ-214; owner/admin only — the daemon refuses it for a
+ * member). The answer folds into the model as `storage`/`storage_have`. Toggle
+ * the overlay is frontend view state. */
+void oc_client_storage_status(oc_client *c);
+void oc_client_toggle_storage(oc_client *c, int open);
+
 /* Self-service profile (REQ-020). Change your own display name (fans to every
  * roster) or rotate your local password (the server verifies `old_pw`). Each
  * folds a PROFILE_UPDATED into the model on success; a failure (e.g. wrong old

@@ -493,6 +493,25 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (e->body) { memcpy(e->body, ce[i].value.ptr, ce[i].value.len); e->body[ce[i].value.len] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_STORAGE_STATUS) {
+            oc_storage_status ss;
+            if (oc_decode_storage_status(&p, &ss) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_STORAGE);
+            if (e) {
+                e->storage.total_bytes  = ss.total_bytes;
+                e->storage.avail_bytes  = ss.avail_bytes;
+                e->storage.attach_bytes = ss.attach_bytes;
+                e->storage.attach_count = ss.attach_count;
+                e->storage.rec_orphan   = ss.reclaimed_orphan;
+                e->storage.rec_expired  = ss.reclaimed_expired;
+                e->storage.rec_evicted  = ss.reclaimed_evicted;
+                e->storage.last_reclaim_ms = ss.last_reclaim_ms;
+                e->storage.max_age_days = ss.max_age_days;
+                e->storage.reserve_bytes = ss.reserve_bytes;
+                e->storage.evict_enabled = ss.evict_enabled;
+                e->storage.under_pressure = ss.under_pressure;
+                oc_queue_push(ctx->to_ui, e);
+            }
         } else if (hdr.msg_type == OC_MSG_READ_CURSOR) {
             oc_read_cursor rc;
             if (oc_decode_read_cursor(&p, &rc) != OC_OK) return -1;
@@ -635,7 +654,18 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 char msg[256];
                 size_t n = err.message.len < sizeof msg - 1 ? err.message.len : sizeof msg - 1;
                 memcpy(msg, err.message.ptr, n); msg[n] = '\0';
-                push_err(to_ui, msg[0] ? msg : "server error");
+                /* Two storage conditions deserve their own wording: the server
+                 * sends a generic "transfer error" string, but "this file was
+                 * reclaimed" and "the server is out of space" are different
+                 * situations a user can act on, and neither is a bug they
+                 * should read as one (REQ-215/216). */
+                if (err.code == OC_ERR_ATTACHMENT_GONE)
+                    push_err(to_ui, "attachment is no longer available "
+                                    "(reclaimed by the server's storage policy)");
+                else if (err.code == OC_ERR_STORAGE_FULL)
+                    push_err(to_ui, "upload refused: the server is low on storage");
+                else
+                    push_err(to_ui, msg[0] ? msg : "server error");
                 /* An error mid-transfer aborts it; abandon the local file. */
                 if (ctx && ctx->xfer->mode != 0) xfer_reset(ctx->xfer);
                 if (err.fatal) return -1;
@@ -883,6 +913,11 @@ static int run_connection(oc_net *n, int reconnecting,
                     ? oc_encode_join_channel(&w, OC_PROTOCOL_VERSION, &cr)
                     : oc_encode_leave_channel(&w, OC_PROTOCOL_VERSION, &cr);
                 if (rr == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_STORAGE_STATUS) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_storage_status_req(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_LIST_CHANNELS) {
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);

@@ -1106,6 +1106,17 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             }
             continue;
         }
+        if (hdr.msg_type == OC_MSG_STORAGE_STATUS_REQ) {
+            /* Owner/admin only (REQ-214). The check lives in the writer, which
+             * reads the user's CURRENT role, rather than here — the same shape
+             * as SET_ROLE and the other admin operations. A role revoked
+             * mid-session therefore takes effect immediately. */
+            oc_job *j = oc_job_new(OC_JOB_STORAGE_STATUS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_UPLOAD_BEGIN) {
             oc_upload_begin ub;
             if (oc_decode_upload_begin(&p, &ub) != OC_OK) return -1;
@@ -1875,6 +1886,39 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         x->in_flight = 1;
         oc_xferpool_submit(g_xfers, j);
         update_interest(ep, c);
+        break;
+    }
+    case OC_RES_STORAGE_STATUS: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        /* The writer knows the database half; free space comes from the net
+         * thread's cached statvfs sample, so the two halves meet here. */
+        oc_storage_status ss;
+        memset(&ss, 0, sizeof ss);
+        ss.total_bytes  = g_sstat.total_bytes;
+        ss.avail_bytes  = g_sstat.avail_bytes;
+        ss.attach_bytes = r->st_attach_bytes;
+        ss.attach_count = r->st_attach_count;
+        ss.reclaimed_orphan  = r->st_rec_orphan;
+        ss.reclaimed_expired = r->st_rec_expired;
+        ss.reclaimed_evicted = r->st_rec_evicted;
+        ss.last_reclaim_ms   = r->st_last_reclaim_ms;
+        ss.max_age_days   = g_spol.max_age_ms / (24ull * 3600 * 1000);
+        ss.reserve_bytes  = g_spol.reserve_bytes;
+        ss.evict_enabled  = (uint8_t)g_spol.evict_enabled;
+        ss.under_pressure = (uint8_t)oc_storage_under_pressure(&g_sstat, &g_spol);
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_storage_status(&w, OC_PROTOCOL_VERSION, &ss);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_STORAGE_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("storage status denied") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
     case OC_RES_STORAGE_MAINT: {

@@ -583,6 +583,7 @@ static void draw_help(int W, int H) {
         "  /set mouse|members|time|channels-width|members-width <value>",
         "Files, webhooks, admin:",
         "  /upload <path>  /download <id>  /webhook  /invite  /role  /remove",
+        "  /storage — disk usage, retention policy, what was reclaimed (admin)",
         "Workspaces:",
         "  ^W or /workspaces — switch, add, or forget (d) a workspace",
         "Session:",
@@ -645,7 +646,7 @@ static int ci_prefix(const char *s, const char *pre) {
 static const char *AC_COMMANDS[] = {
     "/react", "/reactions", "/edit", "/delete", "/thread", "/search", "/close",
     "/create", "/join", "/leave", "/list", "/dm", "/who", "/away", "/online",
-    "/prefs", "/notify", "/dnd", "/set", "/profile", "/nick", "/passwd", "/workspaces",
+    "/prefs", "/notify", "/dnd", "/set", "/profile", "/nick", "/passwd", "/workspaces", "/storage",
     "/role", "/invite", "/remove", "/webhook",
     "/upload", "/download", "/logout", "/help",
 };
@@ -943,6 +944,7 @@ static const struct { const char *cmd; const char *desc; int arg; } PAL_CMDS[] =
     {"/notify","set channel notify level",1}, {"/dnd","do-not-disturb window",1},
     {"/set","synced pref (mouse/members/time/…)",1},
     {"/workspaces","switch workspace (^W)",0},
+    {"/storage","server storage usage (admin)",0},
     {"/profile","your identity (name/role/id)",0}, {"/nick","change your display name",1},
     {"/passwd","change your password",1}, {"/role","set a user's role",1},
     {"/invite","mint an invite token",0}, {"/remove","remove a user",1}, {"/webhook","channel webhooks",0},
@@ -1007,6 +1009,72 @@ static void draw_palette(const oc_model *m, const char *q, int psel) {
         draw_clip(x + 2, y + 2 + i, x + bw - 1, items[idx].label, fg, bg);
     }
     if (n == 0) draw_clip(x + 2, y + 2, x + bw - 1, "(no matches)", TB_BLACK | TB_BOLD, TB_DEFAULT);
+    tb_present();
+}
+
+
+/* The /storage overlay (REQ-214): usage, the active policy, and what
+ * maintenance has reclaimed. Owner/admin only — a member's request is refused
+ * server-side, which surfaces as an error line rather than an empty panel. */
+static void draw_storage(const oc_model *m, int W, int H) {
+    int bw = 62; if (bw > W - 4) bw = W - 4; if (bw < 30) bw = 30;
+    int bh = 15; if (bh > H - 2) bh = H - 2;
+    int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
+    for (int j = 0; j < bh; j++) fill_row(y + j, x, x + bw, TB_DEFAULT);
+    draw_panel(x, y, bw, bh, "Storage  \xc2\xb7  any key to close", 1);
+
+    char l[160];
+    int row = y + 1;
+    if (!m->storage_have) {
+        draw_clip(x + 2, row, x + bw - 1, "(no report yet — owner/admin only)",
+                  TB_BLACK | TB_BOLD, TB_DEFAULT);
+        tb_present();
+        return;
+    }
+    const oc_storage_view *s = &m->storage;
+    const uint64_t MBv = 1024 * 1024;
+
+    snprintf(l, sizeof l, "Disk        %llu MB free of %llu MB",
+             (unsigned long long)(s->avail_bytes / MBv),
+             (unsigned long long)(s->total_bytes / MBv));
+    draw_clip(x + 2, row++, x + bw - 1, l,
+              s->under_pressure ? (TB_RED | TB_BOLD) : TB_DEFAULT, TB_DEFAULT);
+
+    snprintf(l, sizeof l, "Attachments %llu file(s), %llu MB",
+             (unsigned long long)s->attach_count,
+             (unsigned long long)(s->attach_bytes / MBv));
+    draw_clip(x + 2, row++, x + bw - 1, l, TB_DEFAULT, TB_DEFAULT);
+
+    if (s->under_pressure)
+        draw_clip(x + 2, row++, x + bw - 1,
+                  "UNDER PRESSURE — reclaiming storage", TB_RED | TB_BOLD, TB_DEFAULT);
+    row++;
+
+    draw_clip(x + 2, row++, x + bw - 1, "Policy", TB_YELLOW | TB_BOLD, TB_DEFAULT);
+    if (s->max_age_days)
+        snprintf(l, sizeof l, "  attachments expire after %llu day(s)",
+                 (unsigned long long)s->max_age_days);
+    else
+        snprintf(l, sizeof l, "  attachments kept indefinitely");
+    draw_clip(x + 2, row++, x + bw - 1, l, TB_DEFAULT, TB_DEFAULT);
+    snprintf(l, sizeof l, "  eviction under pressure: %s",
+             s->evict_enabled ? "on (oldest first)" : "off");
+    draw_clip(x + 2, row++, x + bw - 1, l, TB_DEFAULT, TB_DEFAULT);
+    snprintf(l, sizeof l, "  database reserve: %llu MB",
+             (unsigned long long)(s->reserve_bytes / MBv));
+    draw_clip(x + 2, row++, x + bw - 1, l, TB_DEFAULT, TB_DEFAULT);
+    row++;
+
+    draw_clip(x + 2, row++, x + bw - 1, "Reclaimed so far", TB_YELLOW | TB_BOLD, TB_DEFAULT);
+    snprintf(l, sizeof l, "  %llu abandoned  %llu expired  %llu evicted",
+             (unsigned long long)s->rec_orphan,
+             (unsigned long long)s->rec_expired,
+             (unsigned long long)s->rec_evicted);
+    /* Evictions are the destructive ones, so they are called out in red when
+     * any have happened — an operator should not have to read carefully to
+     * notice that the daemon deleted files nobody approved individually. */
+    draw_clip(x + 2, row++, x + bw - 1, l,
+              s->rec_evicted ? (TB_RED | TB_BOLD) : TB_DEFAULT, TB_DEFAULT);
     tb_present();
 }
 
@@ -1773,6 +1841,7 @@ int main(int argc, char **argv) {
     size_t focus = 0;
     int scroll = 0;
     int switcher_open = 0, wsel = 0;          /* workspace switcher (^W) */
+    int storage_open = 0;                     /* /storage overlay (REQ-214) */
     int help_open = 0;
     int profile_open = 0;                     /* /profile identity modal */
     int ac_idx = 0;                           /* autocomplete cycle index */
@@ -1844,6 +1913,7 @@ int main(int argc, char **argv) {
         if (picker_open) draw_picker(eq, esel);
         if (profile_open) draw_profile(oc_client_model(cl), tb_width(), tb_height());
         if (switcher_open) draw_switcher(wsel);
+        if (storage_open) draw_storage(oc_client_model(cl), tb_width(), tb_height());
 
         struct tb_event ev;
         int rc = tb_peek_event(&ev, 30);
@@ -1917,6 +1987,11 @@ int main(int argc, char **argv) {
                 msg_sel = -1; panel = 0; editing = 0;
                 remember_workspace(g_ws[g_active].key, NULL, NULL);   /* bump last-used */
             }
+            continue;
+        }
+        if (storage_open) {                    /* storage overlay: any key closes */
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else storage_open = 0;
             continue;
         }
         if (help_open) {                       /* help overlay: any key closes it */
@@ -2069,6 +2144,10 @@ int main(int argc, char **argv) {
                 uint64_t cid = mm->channels[focus].channel_id;
                 if (strcmp(composer, "/help") == 0)           { help_open = 1; }
                 else if (strcmp(composer, "/profile") == 0)   { profile_open = 1; }
+                else if (strcmp(composer, "/storage") == 0) {
+                    oc_client_storage_status(cl);   /* refuses for a member */
+                    storage_open = 1;
+                }
                 else if (strcmp(composer, "/workspaces") == 0 || strcmp(composer, "/workspace") == 0) {
                     sw_build();
                     wsel = (g_active < g_nsw) ? g_active : 0;

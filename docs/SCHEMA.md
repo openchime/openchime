@@ -146,6 +146,13 @@ client then renders "no longer available" instead of failing an opaque
 download, and message history (REQ-053) is untouched — only attachment bytes
 are ever removed, never messages.
 
+Migration 0015 adds `reclaim_reason` (1 orphan, 2 aged out, 3 evicted under
+pressure). The table already recorded *when* a blob went; this records *which
+tier took it*, which makes REQ-215's audit trail a query against a table we
+already keep rather than a second, ever-growing log — and eviction is
+default-on and destroys data nobody approved individually, so being able to ask
+exactly what it took matters.
+
 Ordering note: the row is tombstoned by the writer *before* the transfer pool
 deletes the bytes. A crash between the two leaves an orphaned blob, which the
 next orphan sweep collects. That asymmetry is deliberate — dangling metadata

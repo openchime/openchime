@@ -60,7 +60,9 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_SET_DISPLAY_NAME = 43, OC_JOB_CHANGE_PASSWORD = 44,
        /* Storage maintenance pass (ARCH-78): find what to reclaim. Read-mostly
         * but it tombstones rows, so it runs on the writer. */
-       OC_JOB_STORAGE_MAINT = 45 };
+       OC_JOB_STORAGE_MAINT = 45,
+       /* Storage usage report for an owner/admin (REQ-214). Read-only. */
+       OC_JOB_STORAGE_STATUS = 46 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -194,6 +196,7 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* Storage keys whose bytes the net thread should hand to the transfer
         * pool for deletion (ARCH-78). */
        OC_RES_STORAGE_MAINT = 51,
+       OC_RES_STORAGE_STATUS = 52, OC_RES_STORAGE_ERR = 53,
        /* A read cursor advanced (REQ-090 seen-by): fan the acker's new cursor to
         * the channel's members + backfill the acker with the others' cursors. */
        OC_RES_READ_CURSOR = 50 };
@@ -218,6 +221,11 @@ typedef struct { char *key; char *value; } oc_client_setting_row;
 /* One blob the maintenance pass decided to reclaim (ARCH-78). The row is already
  * tombstoned in SQLite; only the bytes remain, and deleting those is the net
  * thread's job via the transfer pool because it can block on S3. */
+/* Why a blob was reclaimed, recorded on the attachments row (migration 0015) so
+ * REQ-215's audit trail is a query rather than a second log. */
+enum { OC_RECLAIM_NONE = 0, OC_RECLAIM_ORPHAN = 1,
+       OC_RECLAIM_EXPIRED = 2, OC_RECLAIM_EVICTED = 3 };
+
 typedef struct { char *storage_key; uint64_t attachment_id; } oc_reclaim_row;
 
 /* One row in a READ_CURSOR result: a member's read position in the channel. */
@@ -372,6 +380,12 @@ typedef struct oc_dbres {
     uint64_t                maint_orphans;   /* counts, for the log line */
     uint64_t                maint_expired;
     uint64_t                maint_evicted;
+    /* Storage report (REQ-214). The free-space half is filled in by the net
+     * thread from its cached statvfs sample; the writer supplies what only the
+     * database knows. */
+    uint64_t                st_attach_bytes, st_attach_count;
+    uint64_t                st_rec_orphan, st_rec_expired, st_rec_evicted;
+    uint64_t                st_last_reclaim_ms;
 
     /* PROFILE_UPDATED: the (possibly unchanged) display name to broadcast; the
      * subject user is `user_id` above. */

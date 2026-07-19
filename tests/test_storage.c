@@ -176,7 +176,8 @@ static const uint64_t DAY  = 24ull * 60 * 60 * 1000;
 int run_storage_tests(void) {
     printf("test_storage: policy defaults + env override, watermark ordering, "
            "unmeasurable-fs safety, statvfs, and the maintenance pass "
-           "(orphans, age expiry, pressure eviction, grace window, tombstones)\n");
+           "(orphans, age expiry, pressure eviction, grace window, tombstones), "
+           "plus the usage report and its owner/admin gate\n");
 
     test_policy_defaults();
     test_policy_env();
@@ -324,6 +325,54 @@ int run_storage_tests(void) {
         for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
         CHECK(r != NULL);
         if (r) { CHECK(r->n_reclaim == 5); oc_dbres_free(r); }
+    }
+
+
+    /* --- the report, and its authorization gate (REQ-214) ------------------ */
+    /* The gate matters: free space and what eviction has taken are operational
+     * details, and the check reads the user's CURRENT role rather than trusting
+     * the connection, so a demotion takes effect at once. */
+    {
+        uint64_t member = oc_dbwriter_register_local(w, "plain", "pw-plain", OC_ROLE_MEMBER, 1000);
+        CHECK(member != 0);
+
+        /* An owner gets the report. */
+        oc_job *j = oc_job_new(OC_JOB_STORAGE_STATUS, 0);
+        CHECK(j != NULL);
+        j->user_id = 1;                       /* "sa", registered as owner above */
+        oc_dbwriter_submit(w, j);
+        oc_dbres *r = NULL;
+        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        CHECK(r != NULL);
+        if (r) {
+            CHECK(r->type == OC_RES_STORAGE_STATUS);
+            /* Reclamation counts come from reclaim_reason, which is what makes
+             * eviction auditable after the fact. Earlier passes reclaimed one
+             * of each kind. */
+            /* 6 orphans: one from the first pass, plus the 5 the batch-cap
+             * step reclaimed. One expired and one evicted from their passes. */
+            CHECK(r->st_rec_orphan == 6);
+            CHECK(r->st_rec_expired == 1);
+            CHECK(r->st_rec_evicted == 1);
+            CHECK(r->st_last_reclaim_ms > 0);
+            oc_dbres_free(r);
+        }
+
+        /* A plain member is refused. */
+        j = oc_job_new(OC_JOB_STORAGE_STATUS, 0);
+        CHECK(j != NULL);
+        j->user_id = member;
+        oc_dbwriter_submit(w, j);
+        r = NULL;
+        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        CHECK(r != NULL);
+        if (r) {
+            CHECK(r->type == OC_RES_STORAGE_ERR);
+            CHECK(r->err_code == OC_ERR_FORBIDDEN);
+            /* And it must not leak the numbers alongside the refusal. */
+            CHECK(r->st_attach_bytes == 0 && r->st_rec_evicted == 0);
+            oc_dbres_free(r);
+        }
     }
 
     sqlite3_close(db);

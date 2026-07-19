@@ -290,6 +290,16 @@ void oc_client_list_settings(oc_client *c) {
     if (cmd) oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_storage_status(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_STORAGE_STATUS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_toggle_storage(oc_client *c, int open) {
+    if (c) c->model.storage_open = open ? 1 : 0;
+}
+
 void oc_client_set_display_name(oc_client *c, const char *name) {
     if (!c || !name || !name[0]) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_DISPLAY_NAME);

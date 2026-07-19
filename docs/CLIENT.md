@@ -137,6 +137,15 @@ model; translate input to intents }, stop.
   round-trips back and applies live; the daemon fans the change to your other
   logged-in TUIs so they update in place. Which server you connect to
   (`workspace`) is deliberately machine-local and never synced.
+  **Storage report (REQ-214):** `/storage` opens an admin overlay showing free
+  space, live attachment usage, the active retention/eviction policy, and how
+  much maintenance has reclaimed by reason — with pressure and any evictions
+  called out in red, since an operator should not have to read carefully to
+  notice the daemon deleted files nobody approved individually. Owner/admin
+  only; the daemon refuses a member's request rather than sending zeros. An
+  attachment reclaimed by age or pressure returns `OC_ERR_ATTACHMENT_GONE`,
+  which the core renders as "no longer available" rather than a generic
+  transfer error (REQ-215).
   **Multiple workspaces (REQ-012–015):** the TUI holds **one `oc_client` per
   signed-in workspace** (`g_ws`, capped at `MAX_WS`) and ticks *all* of them every
   frame, rendering only the active one — so a workspace you aren't looking at

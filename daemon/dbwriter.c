@@ -2554,6 +2554,8 @@ static oc_dbres *process_change_password(sqlite3 *db, const oc_job *j) {
 
 /* Read-only query jobs run on the reader connection (ARCH-66), off the writer
  * thread, so a heavy search/backfill can't stall message sends or auth. */
+static oc_dbres *process_storage_status(sqlite3 *db, const oc_job *j);
+
 static int is_read_job(int type) {
     return type == OC_JOB_BACKFILL || type == OC_JOB_SEARCH ||
            type == OC_JOB_LIST_CHANNELS || type == OC_JOB_LIST_USERS ||
@@ -2561,7 +2563,8 @@ static int is_read_job(int type) {
            type == OC_JOB_TYPING || type == OC_JOB_ATTACH_LOOKUP ||
            type == OC_JOB_LIST_WEBHOOKS || type == OC_JOB_LIST_NOTIFY_PREFS ||
            type == OC_JOB_LIST_CLIENT_SETTINGS ||
-           type == OC_JOB_CALL_AUTH;
+           type == OC_JOB_CALL_AUTH ||
+           type == OC_JOB_STORAGE_STATUS;
 }
 
 /* Dispatch a read-only job against `rdb`. */
@@ -2574,6 +2577,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_LIST_THREAD)    return process_list_thread(rdb, j);
     if (j->type == OC_JOB_TYPING)         return process_typing(rdb, j);
     if (j->type == OC_JOB_ATTACH_LOOKUP)  return process_attach_lookup(rdb, j);
+    if (j->type == OC_JOB_STORAGE_STATUS) return process_storage_status(rdb, j);
     if (j->type == OC_JOB_LIST_WEBHOOKS)  return process_list_webhooks(rdb, j);
     if (j->type == OC_JOB_LIST_NOTIFY_PREFS) return process_list_notify_prefs(rdb, j);
     if (j->type == OC_JOB_LIST_CLIENT_SETTINGS) return process_list_client_settings(rdb, j);
@@ -2622,6 +2626,58 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
 }
 
 
+
+/* Storage usage for an owner/admin (REQ-214). The authorization check happens on
+ * the net thread before this job is submitted; here we only gather. The
+ * reclamation counts come from the attachments table's reclaim_reason
+ * (migration 0015), which is what makes eviction auditable after the fact
+ * without keeping a second, ever-growing log. */
+static oc_dbres *process_storage_status(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_STORAGE_STATUS;
+    r->conn_id = j->conn_id;
+
+    /* Authorization on the CURRENT role, read here rather than trusted from the
+     * connection, so a demotion mid-session takes effect at once. */
+    uint8_t role = OC_ROLE_MEMBER;
+    if (!user_role(db, j->user_id, &role) || !oc_role_can_manage_members(role)) {
+        r->type = OC_RES_STORAGE_ERR;
+        r->err_code = OC_ERR_FORBIDDEN;
+        return r;
+    }
+
+    sqlite3_stmt *st = NULL;
+    /* Live attachments: those whose bytes are still present. */
+    if (sqlite3_prepare_v2(db,
+            "SELECT COUNT(*), COALESCE(SUM(size),0) FROM attachments "
+            "WHERE reclaimed_at_ms = 0;", -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            r->st_attach_count = (uint64_t)sqlite3_column_int64(st, 0);
+            r->st_attach_bytes = (uint64_t)sqlite3_column_int64(st, 1);
+        }
+        sqlite3_finalize(st);
+    }
+    st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT reclaim_reason, COUNT(*), MAX(reclaimed_at_ms) FROM attachments "
+            "WHERE reclaimed_at_ms > 0 GROUP BY reclaim_reason;", -1, &st, NULL) == SQLITE_OK) {
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            uint64_t n = (uint64_t)sqlite3_column_int64(st, 1);
+            uint64_t last = (uint64_t)sqlite3_column_int64(st, 2);
+            switch (sqlite3_column_int(st, 0)) {
+            case OC_RECLAIM_ORPHAN:  r->st_rec_orphan  = n; break;
+            case OC_RECLAIM_EXPIRED: r->st_rec_expired = n; break;
+            case OC_RECLAIM_EVICTED: r->st_rec_evicted = n; break;
+            default: break;
+            }
+            if (last > r->st_last_reclaim_ms) r->st_last_reclaim_ms = last;
+        }
+        sqlite3_finalize(st);
+    }
+    return r;
+}
+
 /* --- storage maintenance (REQ-213/215/217, ARCH-78) ----------------------- */
 
 /* Append one row to the reclaim list, tombstoning it in the same step. Returns 1
@@ -2631,16 +2687,18 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
  * live row pointing at bytes that are gone. That asymmetry is deliberate:
  * dangling metadata is a visible bug, a stray blob is merely wasted space. */
 static int reclaim_add(sqlite3 *db, oc_dbres *r, size_t cap,
-                       uint64_t aid, const char *key, uint64_t now) {
+                       uint64_t aid, const char *key, uint64_t now, int reason) {
     if (r->n_reclaim >= cap) return 0;
     char *dup = key ? strdup(key) : NULL;
     if (!dup) return 0;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db,
-            "UPDATE attachments SET reclaimed_at_ms=?1 WHERE id=?2 AND reclaimed_at_ms=0;",
+            "UPDATE attachments SET reclaimed_at_ms=?1, reclaim_reason=?3 "
+            "WHERE id=?2 AND reclaimed_at_ms=0;",
             -1, &st, NULL) != SQLITE_OK) { free(dup); return 0; }
     sqlite3_bind_int64(st, 1, (sqlite3_int64)now);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)aid);
+    sqlite3_bind_int(st, 3, reason);
     int done = (sqlite3_step(st) == SQLITE_DONE) && sqlite3_changes(db) > 0;
     sqlite3_finalize(st);
     if (!done) { free(dup); return 0; }          /* someone else got there first */
@@ -2679,7 +2737,7 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
         sqlite3_bind_int64(st, 2, (sqlite3_int64)cap);
         while (sqlite3_step(st) == SQLITE_ROW && r->n_reclaim < cap) {
             if (reclaim_add(db, r, cap, (uint64_t)sqlite3_column_int64(st, 0),
-                            (const char *)sqlite3_column_text(st, 1), now))
+                            (const char *)sqlite3_column_text(st, 1), now, OC_RECLAIM_ORPHAN))
                 r->maint_orphans++;
         }
         sqlite3_finalize(st);
@@ -2698,7 +2756,7 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
             sqlite3_bind_int64(st, 2, (sqlite3_int64)(cap - r->n_reclaim));
             while (sqlite3_step(st) == SQLITE_ROW && r->n_reclaim < cap) {
                 if (reclaim_add(db, r, cap, (uint64_t)sqlite3_column_int64(st, 0),
-                                (const char *)sqlite3_column_text(st, 1), now))
+                                (const char *)sqlite3_column_text(st, 1), now, OC_RECLAIM_EXPIRED))
                     r->maint_expired++;
             }
             sqlite3_finalize(st);
@@ -2722,7 +2780,7 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
             sqlite3_bind_int64(st, 2, (sqlite3_int64)(cap - r->n_reclaim));
             while (sqlite3_step(st) == SQLITE_ROW && r->n_reclaim < cap) {
                 if (reclaim_add(db, r, cap, (uint64_t)sqlite3_column_int64(st, 0),
-                                (const char *)sqlite3_column_text(st, 1), now))
+                                (const char *)sqlite3_column_text(st, 1), now, OC_RECLAIM_EVICTED))
                     r->maint_evicted++;
             }
             sqlite3_finalize(st);

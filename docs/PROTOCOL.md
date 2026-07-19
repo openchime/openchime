@@ -1183,6 +1183,8 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0094` | `SET_CLIENT_SETTING`   | C → S | no        | §5.16a  |
 | `0x0095` | `LIST_CLIENT_SETTINGS` | C → S | no        | §5.16a  |
 | `0x0096` | `CLIENT_SETTINGS`      | S → C | no        | §5.16a  |
+| `0x0097` | `STORAGE_STATUS_REQ` | C→S | Owner/admin: request the storage usage report (REQ-214). No body. |
+| `0x0098` | `STORAGE_STATUS` | S→C | Usage, the active retention/eviction policy, and cumulative reclamation counts by reason. Fixed-width fields, so a later version may append without a version bump. |
 | `0x0048` | `SET_DISPLAY_NAME` | C → S     | no        | §5.16b  |
 | `0x0049` | `CHANGE_PASSWORD`  | C → S     | no        | §5.16b  |
 | `0x004A` | `PROFILE_UPDATED`  | S → C     | no        | §5.16b  |

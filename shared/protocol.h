@@ -104,6 +104,8 @@ typedef enum {
     OC_MSG_SET_CLIENT_SETTING  = 0x0094, /* C->S, upsert a synced client setting (empty value = delete) */
     OC_MSG_LIST_CLIENT_SETTINGS= 0x0095, /* C->S, request a client_type bucket's settings */
     OC_MSG_CLIENT_SETTINGS     = 0x0096, /* S->C, a bucket snapshot (also a device-sync push) */
+    OC_MSG_STORAGE_STATUS_REQ  = 0x0097, /* C->S, owner/admin: ask for storage usage (REQ-214) */
+    OC_MSG_STORAGE_STATUS      = 0x0098, /* S->C, usage + policy + what maintenance reclaimed */
     OC_MSG_CALL_JOIN        = 0x00A0, /* C->S, join a channel's audio call (REQ-150) */
     OC_MSG_CALL_LEAVE       = 0x00A1, /* C->S, leave the call */
     OC_MSG_CALL_JOINED      = 0x00A2, /* S->C, to the joiner: call id + UDP endpoint/token + roster */
@@ -376,6 +378,25 @@ typedef struct { uint8_t dnd_enabled; uint16_t dnd_start_min; uint16_t dnd_end_m
 typedef struct { oc_slice client_type; oc_slice key; oc_slice value; } oc_set_client_setting;
 typedef struct { oc_slice client_type; } oc_list_client_settings;
 typedef struct { oc_slice key; oc_slice value; } oc_client_setting_entry;
+/* Storage usage + policy + reclamation history (REQ-214/215). Sent only to an
+ * owner/admin. `attach_bytes`/`attach_count` cover live attachments; the
+ * reclaimed_* counts are cumulative and come from the attachments table's
+ * reclaim_reason, which is what makes eviction auditable after the fact. */
+typedef struct {
+    uint64_t total_bytes;
+    uint64_t avail_bytes;
+    uint64_t attach_bytes;
+    uint64_t attach_count;
+    uint64_t reclaimed_orphan;
+    uint64_t reclaimed_expired;
+    uint64_t reclaimed_evicted;
+    uint64_t last_reclaim_ms;   /* 0 if nothing has ever been reclaimed */
+    uint64_t max_age_days;      /* 0 = keep forever */
+    uint64_t reserve_bytes;
+    uint8_t  evict_enabled;
+    uint8_t  under_pressure;
+} oc_storage_status;
+
 typedef struct { oc_slice client_type; uint16_t count;
                  const oc_client_setting_entry *entries; } oc_client_settings;
 /* Audio call signaling (REQ-150). CALL_JOINED carries the joiner's private UDP
@@ -456,6 +477,8 @@ oc_result oc_encode_thread_meta(oc_wbuf *w, uint16_t version, const oc_thread_me
 oc_result oc_encode_create_channel(oc_wbuf *w, uint16_t version, const oc_create_channel *m);
 oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_info *m);
 oc_result oc_encode_list_channels(oc_wbuf *w, uint16_t version);
+/* Bodyless request for the storage report (REQ-214); owner/admin only. */
+oc_result oc_encode_storage_status_req(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_channel_list(oc_wbuf *w, uint16_t version, const oc_channel_list *m);
 oc_result oc_encode_join_channel(oc_wbuf *w, uint16_t version, const oc_channel_ref *m);
 oc_result oc_encode_leave_channel(oc_wbuf *w, uint16_t version, const oc_channel_ref *m);
@@ -478,6 +501,9 @@ oc_result oc_encode_list_notify_prefs(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_notify_prefs(oc_wbuf *w, uint16_t version, const oc_notify_prefs *m);
 oc_result oc_encode_set_client_setting(oc_wbuf *w, uint16_t version, const oc_set_client_setting *m);
 oc_result oc_encode_list_client_settings(oc_wbuf *w, uint16_t version, const oc_list_client_settings *m);
+oc_result oc_encode_storage_status(oc_wbuf *w, uint16_t ver, const oc_storage_status *m);
+oc_result oc_decode_storage_status(oc_rbuf *r, oc_storage_status *m);
+
 oc_result oc_encode_client_settings(oc_wbuf *w, uint16_t version, const oc_client_settings *m);
 oc_result oc_encode_call_join(oc_wbuf *w, uint16_t version, const oc_call_join *m);
 oc_result oc_encode_call_leave(oc_wbuf *w, uint16_t version, const oc_call_leave *m);

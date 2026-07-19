@@ -963,6 +963,34 @@ static void test_version_negotiation(void) {
     CHECK(code == OC_ERR_VERSION_TOO_NEW);
 }
 
+
+/* Storage status (REQ-214): a fixed-width report, so the round-trip is the
+ * whole contract. */
+static void test_storage_status_frames(void) {
+    uint8_t buf[256];
+    oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_storage_status in = { 1000, 200, 50, 7, 3, 2, 1, 12345, 30, 256, 1, 1 };
+    CHECK(oc_encode_storage_status(&w, OC_PROTOCOL_VERSION, &in) == OC_OK);
+
+    oc_header h; oc_rbuf r;
+    CHECK(oc_parse_frame(buf, w.len, &h, &r) == OC_OK);
+    CHECK(h.msg_type == OC_MSG_STORAGE_STATUS);
+    oc_storage_status out;
+    CHECK(oc_decode_storage_status(&r, &out) == OC_OK);
+    CHECK(out.total_bytes == 1000 && out.avail_bytes == 200);
+    CHECK(out.attach_bytes == 50 && out.attach_count == 7);
+    CHECK(out.reclaimed_orphan == 3 && out.reclaimed_expired == 2 && out.reclaimed_evicted == 1);
+    CHECK(out.last_reclaim_ms == 12345);
+    CHECK(out.max_age_days == 30 && out.reserve_bytes == 256);
+    CHECK(out.evict_enabled == 1 && out.under_pressure == 1);
+
+    /* The request carries no body. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_storage_status_req(&w, OC_PROTOCOL_VERSION) == OC_OK);
+    CHECK(oc_parse_frame(buf, w.len, &h, &r) == OC_OK);
+    CHECK(h.msg_type == OC_MSG_STORAGE_STATUS_REQ);
+}
+
 int run_protocol_tests(void) {
     printf("test_protocol: primitives, handshake, auth, messaging, backfill,\n");
     printf("               error, size limits, malformed frames, version negotiation\n");
@@ -981,6 +1009,7 @@ int run_protocol_tests(void) {
     test_notify_frames();
     test_client_settings_frames();
     test_read_cursor_frames();
+    test_storage_status_frames();
     test_profile_frames();
     test_call_frames();
     test_backfill_and_error();
