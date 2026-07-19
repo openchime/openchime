@@ -98,6 +98,16 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **Deliberate durability trade.** Tier 2 destroys user-visible data without a human deciding, which is a real cost — sharpened by ARCH-3, since this repo ships no replication and an unmanaged self-hosted box may have no backup at all. It is default-on regardless because the alternative on the target deployment is a dead tenant; the grace period, tombstones, audit trail, oldest-first ordering, and the disable switch exist to bound that trade rather than to hide it.
 
+- **ARCH-78 (Storage maintenance pass):** The housekeeping of ARCH-77 runs as a single **periodic maintenance pass** (REQ-218) rather than as work scattered across request handlers.
+
+  **It runs on a timer, not opportunistically.** The daemon already has a time-gated prune — `maybe_prune_idem` (ARCH-44) drops old `sent_messages` rows — but that one piggybacks on the writer loop and so only fires when writes are happening. That is fine for idempotency rows and wrong here: **an idle tenant is exactly the one whose disk fills with nothing prompting a cleanup**. The pass is therefore driven by the net loop's existing 500 ms `epoll_wait` tick, gated to its own interval, so it fires on a quiet box too. The interval and the maximum attachment age are configuration (REQ-217), and both are overridable so a test can compress the clock the way `oc_dbwriter_set_idem_retention` already allows.
+
+  **Work is split across the three threads by what each owns.** Finding what to remove is a query, so the *writer* selects expired or orphaned rows (age past the configured maximum, aborted uploads, blobs whose message is gone). Deleting the bytes is I/O that can block on an S3 round trip, so it goes to the **transfer pool** (ARCH-69) as fire-and-forget jobs, never inline on the net loop. The metadata row is tombstoned by the writer once the blob delete is queued. This is the same seam the upload path already uses, so no new threading model is introduced.
+
+  **Each pass is bounded.** It deletes at most a fixed number of blobs per run and re-checks free space between batches, so a box that is badly over its limit recovers across several passes instead of stalling the daemon in one long sweep — housekeeping must never compete with message delivery (REQ-212).
+
+  Free space itself comes from `statvfs` on the blob directory and the database's filesystem, sampled once per pass and cached for REQ-214's reporting; nothing in the tree measures disk today.
+
 ## Feature Implementation
 
 - **ARCH-15 (Search):** FTS5 full-text search, positioned as a competitive wedge against Slack's history caps.

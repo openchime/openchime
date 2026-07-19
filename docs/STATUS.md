@@ -119,6 +119,8 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 214 surface storage usage to admins | ⛔ | Specified (ARCH-77). |
 | 215 automatic oldest-first eviction | ⛔ | Specified (ARCH-77). Default-on by decision; needs tombstoning, grace period, audit, and a disable switch. |
 | 216 refuse uploads below the floor | ⛔ | Specified (ARCH-77). Refusal at `UPLOAD_BEGIN`, before any bytes move. |
+| 217 max attachment age | ⛔ | Specified (ARCH-77/78). Distinct from pressure eviction (215) and from the opt-in compliance retention (250). |
+| 218 periodic maintenance pass | ⛔ | Specified (ARCH-78). **The reusable pattern already exists** — `maybe_prune_idem` (ARCH-44) is age-gated pruning with a configurable window — but it piggybacks on writes, so it would never fire on the idle tenant that most needs it. The new pass hangs off the net loop's 500 ms tick instead. Migration 0009's index was already written for "the orphan sweep of pending rows", which was never built. |
 
 ---
 

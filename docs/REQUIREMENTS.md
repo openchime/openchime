@@ -664,6 +664,27 @@ only REQ-212/213/214 apply.*
   reserve. Refusal has been the terminal state, never silent failure, and has
   never affected messaging (REQ-212).
 
+- **REQ-217.** The daemon has expired attachments by **age**: a configuration
+  value has set the maximum attachment age, and attachments older than it have
+  been deleted — blob bytes reclaimed, metadata left as a tombstone (REQ-215) so
+  the conversation stayed intelligible. This has been a standing policy applied
+  continuously, distinct from the two other paths that remove attachment bytes:
+  it is not triggered by storage pressure (REQ-215) and it is not the
+  compliance-driven, opt-in retention policy that can also age out *messages*
+  (REQ-250). A deployment that set no maximum age has kept attachments
+  indefinitely, bounded only by REQ-215.
+- **REQ-218.** The daemon has run a **periodic maintenance pass** — on its own
+  schedule, not merely when other work happened to occur — that has performed
+  the storage housekeeping of this subsection: reclaiming orphaned and aborted
+  uploads (REQ-213), expiring attachments past the maximum age (REQ-217),
+  measuring free space and publishing it (REQ-214), and, under pressure,
+  evicting (REQ-215). Running on a timer rather than opportunistically has been
+  the point: **an idle tenant is precisely the one whose disk fills without
+  anything prompting a cleanup**, so maintenance driven only by incoming writes
+  would stop exactly when it was most needed. The pass has been bounded in the
+  work it does per run, so housekeeping has never blocked message delivery or
+  monopolized the daemon, and its interval has been configurable so a test could
+  compress it.
 ---
 
 ## 11. Rich Text and Message Composition
