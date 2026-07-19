@@ -281,6 +281,7 @@ typedef struct {
     char    *filename;   /* heap */
     char    *mime;       /* heap */
     uint64_t size;
+    uint8_t  reclaimed;  /* bytes removed by age or pressure; row is a tombstone */
 } oc_attach_meta;
 
 typedef struct {

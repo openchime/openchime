@@ -329,7 +329,7 @@ static void bump_reply_count(oc_model *m, uint64_t message_id, uint32_t count) {
 /* Append an attachment to a message, deduped by id. Frees nothing; the caller
  * owns the source strings (copied in). */
 static void msg_add_attach(oc_msg *msg, uint64_t id, const char *filename,
-                           const char *mime, uint64_t size) {
+                           const char *mime, uint64_t size, uint8_t reclaimed) {
     for (uint8_t i = 0; i < msg->n_attach; i++)
         if (msg->attach[i].id == id) return;   /* dedup (backfill re-delivery) */
     if (msg->n_attach >= OC_MAX_ATTACH) return;
@@ -340,7 +340,7 @@ static void msg_add_attach(oc_msg *msg, uint64_t id, const char *filename,
         msg->attach = na; msg->cap_attach = cap;
     }
     oc_attachment *a = &msg->attach[msg->n_attach++];
-    a->id = id; a->size = size;
+    a->id = id; a->size = size; a->reclaimed = reclaimed;
     snprintf(a->filename, sizeof a->filename, "%s", filename ? filename : "");
     snprintf(a->mime, sizeof a->mime, "%s", mime ? mime : "");
 }
@@ -348,16 +348,17 @@ static void msg_add_attach(oc_msg *msg, uint64_t id, const char *filename,
 /* Attach an attachment to the message with `message_id`, searching every channel
  * buffer and the open thread's replies (message ids are globally unique). */
 static void attach_to_msg(oc_model *m, uint64_t message_id, uint64_t id,
-                          const char *filename, const char *mime, uint64_t size) {
+                          const char *filename, const char *mime, uint64_t size,
+                          uint8_t reclaimed) {
     for (size_t ci = 0; ci < m->n_channels; ci++)
         for (size_t i = 0; i < m->channels[ci].n_msgs; i++)
             if (m->channels[ci].msgs[i].message_id == message_id) {
-                msg_add_attach(&m->channels[ci].msgs[i], id, filename, mime, size);
+                msg_add_attach(&m->channels[ci].msgs[i], id, filename, mime, size, reclaimed);
                 return;
             }
     for (size_t i = 0; i < m->n_thread_msgs; i++)
         if (m->thread_msgs[i].message_id == message_id) {
-            msg_add_attach(&m->thread_msgs[i], id, filename, mime, size);
+            msg_add_attach(&m->thread_msgs[i], id, filename, mime, size, reclaimed);
             return;
         }
 }
@@ -687,7 +688,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         /* parent_id = attachment id, server_time = size, body = filename,
          * author_name = mime. Arrives right after its OC_EV_MESSAGE. */
         attach_to_msg(m, e->message_id, e->parent_id, e->body ? e->body : "",
-                      e->author_name, e->server_time);
+                      e->author_name, e->server_time, e->status);
         break;
     case OC_EV_XFER:
         if (e->body) set_status(m, e->body);

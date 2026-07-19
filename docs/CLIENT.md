@@ -145,7 +145,10 @@ model; translate input to intents }, stop.
   only; the daemon refuses a member's request rather than sending zeros. An
   attachment reclaimed by age or pressure returns `OC_ERR_ATTACHMENT_GONE`,
   which the core renders as "no longer available" rather than a generic
-  transfer error (REQ-215).
+  transfer error (REQ-215). The message list shows the same thing **in place**:
+  the attachment metadata carries a `reclaimed` flag, so a tombstoned file
+  renders dimmed as `📎 name — no longer available` with no download id, instead
+  of offering a fetch that is guaranteed to fail.
   **Multiple workspaces (REQ-012–015):** the TUI holds **one `oc_client` per
   signed-in workspace** (`g_ws`, capped at `MAX_WS`) and ticks *all* of them every
   frame, rendering only the active one — so a workspace you aren't looking at

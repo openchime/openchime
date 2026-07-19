@@ -312,7 +312,17 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
  * carries just the ids to link; BROADCAST carries each linked attachment's
  * metadata so every reader can render/fetch it. */
 #define OC_MAX_ATTACH 16u
-typedef struct { uint64_t id; oc_slice filename; oc_slice mime; uint64_t size; } oc_attach_entry;
+/* One attachment's metadata as carried on a message (REQ-140). `reclaimed` is
+ * set when the bytes have been removed by age or storage pressure (REQ-215/217)
+ * while the row survives as a tombstone — so a client can render "no longer
+ * available" in place, instead of offering a download that will fail. */
+typedef struct {
+    uint64_t id;
+    oc_slice filename;
+    oc_slice mime;
+    uint64_t size;
+    uint8_t  reclaimed;
+} oc_attach_entry;
 
 typedef struct { uint16_t min_version; uint16_t max_version; oc_slice client_info; } oc_hello;
 typedef struct { uint16_t chosen_version; uint64_t server_time; } oc_welcome;

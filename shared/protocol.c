@@ -313,6 +313,7 @@ oc_result oc_encode_broadcast(oc_wbuf *w, uint16_t version, const oc_broadcast *
             oc_w_str(w, m->attach[i].filename);
             oc_w_str(w, m->attach[i].mime);
             oc_w_u64(w, m->attach[i].size);
+            oc_w_u8(w, m->attach[i].reclaimed);
         }
         if (m->author_name.len) oc_w_str(w, m->author_name);
     }
@@ -444,6 +445,7 @@ oc_result oc_encode_thread_reply(oc_wbuf *w, uint16_t version, const oc_thread_r
             oc_w_str(w, m->attach[i].filename);
             oc_w_str(w, m->attach[i].mime);
             oc_w_u64(w, m->attach[i].size);
+            oc_w_u8(w, m->attach[i].reclaimed);
         }
     }
     return oc_frame_end(w, off);
@@ -1198,6 +1200,7 @@ oc_result oc_decode_broadcast(oc_rbuf *p, oc_broadcast *m) {
             m->attach[i].filename = oc_r_str(p);
             m->attach[i].mime = oc_r_str(p);
             m->attach[i].size = oc_r_u64(p);
+            m->attach[i].reclaimed = oc_r_u8(p);
         }
         m->n_attach = n;
         if (!p->underflow && p->pos < p->len) m->author_name = oc_r_str(p);
@@ -1318,6 +1321,7 @@ oc_result oc_decode_thread_reply(oc_rbuf *p, oc_thread_reply *m) {
             m->attach[i].filename = oc_r_str(p);
             m->attach[i].mime = oc_r_str(p);
             m->attach[i].size = oc_r_u64(p);
+            m->attach[i].reclaimed = oc_r_u8(p);
         }
         m->n_attach = n;
     }

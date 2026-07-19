@@ -26,7 +26,16 @@ typedef struct { uint64_t user_id; uint64_t message_id; } oc_read_cursor_view;
 
 /* One attachment hanging off a message (REQ-140): the server id (used to
  * download it), its filename + mime, and the byte size. */
-typedef struct { uint64_t id; char filename[128]; char mime[64]; uint64_t size; } oc_attachment;
+/* `reclaimed` means the server removed the bytes by age or storage pressure
+ * (REQ-215/217) while keeping the row, so the message still reads sensibly. A
+ * frontend should show it as unavailable rather than offer a download. */
+typedef struct {
+    uint64_t id;
+    char     filename[128];
+    char     mime[64];
+    uint64_t size;
+    uint8_t  reclaimed;
+} oc_attachment;
 
 typedef struct {
     char    *body;         /* heap */

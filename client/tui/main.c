@@ -247,16 +247,27 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
     for (uint8_t k = 0; k < m->n_attach; k++) {           /* attachments (REQ-140) */
         const oc_attachment *a = &m->attach[k];
         char al[256];
-        /* 📎 filename (12.3 KB) #id — download with /download <id> */
-        double kb = (double)a->size / 1024.0;
-        if (a->size >= 1024ull * 1024)
-            snprintf(al, sizeof al, "    \xf0\x9f\x93\x8e %s (%.1f MB) #%llu",
-                     a->filename[0] ? a->filename : "file", kb / 1024.0, (unsigned long long)a->id);
-        else
-            snprintf(al, sizeof al, "    \xf0\x9f\x93\x8e %s (%.1f KB) #%llu",
-                     a->filename[0] ? a->filename : "file", kb, (unsigned long long)a->id);
+        uintattr_t acol = TB_CYAN | TB_BOLD;
+        if (a->reclaimed) {
+            /* The server removed the bytes by age or storage pressure
+             * (REQ-215/217) and kept the row so the conversation still reads.
+             * Say so in place, dimmed and without an id: offering a download
+             * that is guaranteed to fail would look like a broken client. */
+            snprintf(al, sizeof al, "    \xf0\x9f\x93\x8e %s \xe2\x80\x94 no longer available",
+                     a->filename[0] ? a->filename : "file");
+            acol = TB_BLACK | TB_BOLD;
+        } else {
+            /* 📎 filename (12.3 KB) #id — download with /download <id> */
+            double kb = (double)a->size / 1024.0;
+            if (a->size >= 1024ull * 1024)
+                snprintf(al, sizeof al, "    \xf0\x9f\x93\x8e %s (%.1f MB) #%llu",
+                         a->filename[0] ? a->filename : "file", kb / 1024.0, (unsigned long long)a->id);
+            else
+                snprintf(al, sizeof al, "    \xf0\x9f\x93\x8e %s (%.1f KB) #%llu",
+                         a->filename[0] ? a->filename : "file", kb, (unsigned long long)a->id);
+        }
         char *ar = malloc(strlen(al) + 1);
-        if (ar) { strcpy(ar, al); rows_push(r, ar, TB_CYAN | TB_BOLD); }
+        if (ar) { strcpy(ar, al); rows_push(r, ar, acol); }
     }
     if (m->n_reactions) {
         char rl[256]; size_t p = 0;

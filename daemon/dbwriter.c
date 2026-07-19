@@ -1071,7 +1071,7 @@ static void load_message_attachments(sqlite3 *db, uint64_t mid, oc_attach_meta *
     *n = 0;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT id, filename, mime, size FROM attachments "
+        "SELECT id, filename, mime, size, reclaimed_at_ms FROM attachments "
         "WHERE message_id=? ORDER BY id LIMIT ?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
     sqlite3_bind_int(st, 2, (int)OC_MAX_ATTACH);
@@ -1081,6 +1081,11 @@ static void load_message_attachments(sqlite3 *db, uint64_t mid, oc_attach_meta *
         a->filename = strdup((const char *)sqlite3_column_text(st, 1));
         a->mime = strdup((const char *)sqlite3_column_text(st, 2));
         a->size = (uint64_t)sqlite3_column_int64(st, 3);
+        /* Tombstoned: the row survives so the message stays readable, but the
+         * bytes are gone. Telling the client here means it can render "no
+         * longer available" in place rather than offering a download that is
+         * guaranteed to fail (REQ-215/217). */
+        a->reclaimed = sqlite3_column_int64(st, 4) != 0 ? 1 : 0;
     }
     sqlite3_finalize(st);
 }

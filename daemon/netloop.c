@@ -517,6 +517,7 @@ static uint16_t fill_attach_entries(oc_attach_entry *out, const oc_attach_meta *
         out[i].filename = oc_slice_str(att[i].filename ? att[i].filename : "");
         out[i].mime = oc_slice_str(att[i].mime ? att[i].mime : "");
         out[i].size = att[i].size;
+        out[i].reclaimed = att[i].reclaimed;
     }
     return (uint16_t)n;
 }

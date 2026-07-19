@@ -232,6 +232,7 @@ static void push_attachments(oc_queue *to_ui, uint64_t channel_id, uint64_t mess
         e->message_id = message_id;
         e->parent_id  = att[i].id;        /* attachment id (used to download) */
         e->server_time = att[i].size;
+        e->status = att[i].reclaimed;   /* bytes gone; row is a tombstone */
         size_t fn = att[i].filename.len < sizeof e->author_name - 1 ? att[i].filename.len : 0;
         /* filename in body (heap, may be long), mime in author_name (bounded). */
         e->body = malloc(att[i].filename.len + 1);
