@@ -99,6 +99,11 @@ static void run_job(oc_blobstore *bs, oc_xfer_job *j) {
         j->br = NULL;
         j->rc = 0;
         break;
+    case OC_XFER_DELETE:
+        /* Reclaiming bytes can be a network round trip against S3, which is why
+         * it runs here rather than on the writer that decided to reclaim. */
+        j->rc = oc_blob_delete(bs, j->key);
+        break;
     }
 }
 
@@ -164,7 +169,8 @@ static void release_owned(oc_xfer_job *j) {
         if (j->br) oc_blob_get_close(j->br);
         break;
     case OC_XFER_WRITE: case OC_XFER_READ:
-        break;                      /* borrowed: the transfer still owns it */
+    case OC_XFER_DELETE:
+        break;                      /* holds no handle to release */
     }
     oc_xfer_job_free(j);
 }

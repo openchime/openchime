@@ -106,7 +106,7 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **Each pass is bounded.** It deletes at most a fixed number of blobs per run and re-checks free space between batches, so a box that is badly over its limit recovers across several passes instead of stalling the daemon in one long sweep — housekeeping must never compete with message delivery (REQ-212).
 
-  Free space itself comes from `statvfs` on the blob directory and the database's filesystem, sampled once per pass and cached for REQ-214's reporting; nothing in the tree measures disk today.
+  Free space comes from `statvfs` on the blob directory, sampled once per pass and cached — so the upload admission check (REQ-216) costs no syscall on the hot path. An **unmeasurable filesystem reads as unconstrained**: guessing "pressured" would make the daemon destroy user data because a syscall failed, which is a far worse outcome than doing nothing. Built in `daemon/storage.c` (policy + measurement), `process_storage_maint` (the writer-side tiers), and `maybe_run_maintenance` (the tick).
 
 ## Feature Implementation
 

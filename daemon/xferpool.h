@@ -60,6 +60,7 @@ typedef enum {
     OC_XFER_OPEN_R,      /* oc_blob_get_begin(key) -> br + size                */
     OC_XFER_READ,        /* oc_blob_get_chunk(br, buf, cap)                    */
     OC_XFER_CLOSE,       /* oc_blob_get_close(br)  — frees br                  */
+    OC_XFER_DELETE,      /* oc_blob_delete(key) — storage reclamation (ARCH-78) */
 } oc_xfer_op;
 
 typedef struct oc_xfer_job {

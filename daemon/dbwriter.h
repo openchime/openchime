@@ -57,7 +57,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_SET_CLIENT_SETTING = 41, OC_JOB_LIST_CLIENT_SETTINGS = 42,
        /* Self-service profile (REQ-020): rename yourself / rotate your local
         * password (verifies the old one). Both are writes. */
-       OC_JOB_SET_DISPLAY_NAME = 43, OC_JOB_CHANGE_PASSWORD = 44 };
+       OC_JOB_SET_DISPLAY_NAME = 43, OC_JOB_CHANGE_PASSWORD = 44,
+       /* Storage maintenance pass (ARCH-78): find what to reclaim. Read-mostly
+        * but it tombstones rows, so it runs on the writer. */
+       OC_JOB_STORAGE_MAINT = 45 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -144,6 +147,12 @@ typedef struct oc_job {
     char          *pf_name;        /* heap */
     char          *pf_old_pw;      /* heap */
     char          *pf_new_pw;      /* heap */
+
+    /* Storage maintenance pass inputs (ARCH-78). */
+    uint64_t       maint_max_age_ms;  /* expire attachments older than this (0 = never) */
+    uint64_t       maint_grace_ms;    /* never reclaim anything younger than this */
+    uint32_t       maint_batch;       /* cap on rows reclaimed in one pass */
+    int            maint_evict;       /* also evict oldest under pressure (REQ-215) */
 } oc_job;
 
 /* --- Results (writer -> net thread) ------------------------------------- */
@@ -182,6 +191,9 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* Profile change ok (display name fanned tenant-wide; also the self ack for a
         * password change) / denied (bad old password, etc.). */
        OC_RES_PROFILE_UPDATED = 48, OC_RES_PROFILE_ERR = 49,
+       /* Storage keys whose bytes the net thread should hand to the transfer
+        * pool for deletion (ARCH-78). */
+       OC_RES_STORAGE_MAINT = 51,
        /* A read cursor advanced (REQ-090 seen-by): fan the acker's new cursor to
         * the channel's members + backfill the acker with the others' cursors. */
        OC_RES_READ_CURSOR = 50 };
@@ -203,6 +215,10 @@ typedef struct { uint64_t channel_id; uint8_t level; } oc_notify_pref_row;
 
 /* One row in a CLIENT_SETTINGS result: a synced key/value. */
 typedef struct { char *key; char *value; } oc_client_setting_row;
+/* One blob the maintenance pass decided to reclaim (ARCH-78). The row is already
+ * tombstoned in SQLite; only the bytes remain, and deleting those is the net
+ * thread's job via the transfer pool because it can block on S3. */
+typedef struct { char *storage_key; uint64_t attachment_id; } oc_reclaim_row;
 
 /* One row in a READ_CURSOR result: a member's read position in the channel. */
 typedef struct { uint64_t user_id; uint64_t message_id; } oc_read_cursor_row;
@@ -351,6 +367,11 @@ typedef struct oc_dbres {
     char                   *cs_client_type;  /* heap */
     oc_client_setting_row  *cslist;          /* heap array */
     size_t                  n_cslist;
+    oc_reclaim_row         *reclaim;         /* heap array (OC_RES_STORAGE_MAINT) */
+    size_t                  n_reclaim;
+    uint64_t                maint_orphans;   /* counts, for the log line */
+    uint64_t                maint_expired;
+    uint64_t                maint_evicted;
 
     /* PROFILE_UPDATED: the (possibly unchanged) display name to broadcast; the
      * subject user is `user_id` above. */

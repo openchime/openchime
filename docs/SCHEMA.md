@@ -133,6 +133,25 @@ window at runtime (target 24h, ARCH-44) — pruning is a delete job, not schema.
 
 ---
 
+
+### Migration 0014 — attachment tombstones
+
+`attachments.reclaimed_at_ms` (0 = the blob is present) plus an index on
+`(reclaimed_at_ms, created_at_ms)` for the maintenance pass's oldest-first scan
+(REQ-215/217, ARCH-77/78).
+
+When storage pressure evicts a blob or it ages past the configured maximum, the
+**bytes** go but the **row stays**, stamped with when it was reclaimed. A
+client then renders "no longer available" instead of failing an opaque
+download, and message history (REQ-053) is untouched — only attachment bytes
+are ever removed, never messages.
+
+Ordering note: the row is tombstoned by the writer *before* the transfer pool
+deletes the bytes. A crash between the two leaves an orphaned blob, which the
+next orphan sweep collects. That asymmetry is deliberate — dangling metadata
+pointing at bytes that are gone is a visible bug, whereas a stray blob is
+merely wasted space.
+
 ## 3. Migration 0002 — authentication, sessions, roles
 
 Adds the tables the real auth design ([AUTH.md](./AUTH.md), ARCH-55–60) needs,

@@ -20,6 +20,7 @@ int run_http_tests(void);
 int run_sigv4_tests(void);
 int run_blob_s3_tests(void);
 int run_xferpool_tests(void);
+int run_storage_tests(void);
 int run_audio_tests(void);
 int run_tls_tests(void);
 int run_netloop_tests(void);
@@ -40,6 +41,7 @@ int main(void) {
     total += run_sigv4_tests();
     total += run_blob_s3_tests();
     total += run_xferpool_tests();
+    total += run_storage_tests();
     total += run_audio_tests();
     total += run_tls_tests();
     total += run_netloop_tests();

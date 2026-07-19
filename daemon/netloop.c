@@ -7,6 +7,7 @@
 #include "auth.h"
 #include "blobstore.h"
 #include "xferpool.h"
+#include "storage.h"
 #include "framebuf.h"
 #include "http.h"
 #include "protocol.h"
@@ -134,6 +135,13 @@ static uint64_t g_next_conn_id = 1;
  * with g_enc/g_next_conn_id. */
 static oc_blobstore *g_blobs;
 static oc_xferpool  *g_xfers;   /* blob I/O off the net thread (ARCH-69) */
+/* Storage maintenance (ARCH-78): policy, the last free-space sample, and when
+ * the pass last ran. The sample is refreshed by the pass and read by the upload
+ * admission check, so a refusal never costs a statvfs on the hot path. */
+static oc_storage_policy g_spol;
+static oc_storage_stats  g_sstat;
+static uint64_t          g_last_maint_ms;
+static char              g_blob_dir[1024];
 static uint64_t      g_max_attach = OC_MAX_ATTACHMENT_SIZE;
 
 /* Per-webhook-token rate limit for the incoming-webhook endpoint (REQ-170). A
@@ -1109,6 +1117,15 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
                 if (send_transfer_error(c, 0, OC_ERR_ATTACHMENT_TOO_LARGE) != 0) return -1;
                 continue;
             }
+            /* Admission control (REQ-216): refuse at declaration, before a byte
+             * moves, rather than failing a half-finished transfer. The reserve
+             * below this point belongs to SQLite — spending it on attachments is
+             * what would turn "attachments unavailable" into "chat down"
+             * (REQ-212). Uses the cached sample, so this costs no syscall. */
+            if (oc_storage_must_refuse(&g_sstat, &g_spol)) {
+                if (send_transfer_error(c, 0, OC_ERR_STORAGE_FULL) != 0) return -1;
+                continue;
+            }
             oc_job *j = oc_job_new(OC_JOB_ATTACH_CREATE, c->conn_id);
             if (!j) return -1;
             j->user_id = c->user_id;
@@ -1860,6 +1877,28 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         update_interest(ep, c);
         break;
     }
+    case OC_RES_STORAGE_MAINT: {
+        /* The rows are already tombstoned; delete the bytes off-thread. These
+         * are fire-and-forget (conn_id 0) — no connection is waiting, and a
+         * failed delete simply leaves a blob the next orphan sweep will retry. */
+        for (size_t i = 0; i < r->n_reclaim; i++) {
+            oc_xfer_job *dj = oc_xfer_job_new(OC_XFER_DELETE, 0);
+            if (!dj) break;
+            dj->key = strdup(r->reclaim[i].storage_key ? r->reclaim[i].storage_key : "");
+            dj->attachment_id = r->reclaim[i].attachment_id;
+            if (!dj->key) { oc_xfer_job_free(dj); break; }
+            oc_xferpool_submit(g_xfers, dj);
+        }
+        if (r->n_reclaim)
+            fprintf(stderr, "openchimed: storage maintenance reclaimed %zu blob(s) "
+                            "(%llu orphaned, %llu expired, %llu evicted); %llu MB free\n",
+                    r->n_reclaim,
+                    (unsigned long long)r->maint_orphans,
+                    (unsigned long long)r->maint_expired,
+                    (unsigned long long)r->maint_evicted,
+                    (unsigned long long)(g_sstat.avail_bytes / (1024 * 1024)));
+        break;
+    }
     case OC_RES_ATTACH_ERR: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
@@ -2133,6 +2172,36 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
  * so if the connection is gone we still own something valid and release it here
  * rather than leaking it. Nothing dereferences a stale `conn *` — the job
  * carries a conn_id and connection ids are never reused. */
+/* Run the storage maintenance pass if its interval has elapsed (ARCH-78).
+ *
+ * Driven by the net loop's regular tick rather than by incoming writes: an idle
+ * tenant is exactly the one whose disk fills with nothing prompting a cleanup,
+ * so piggybacking on traffic (the way ARCH-44's idempotency prune does) would
+ * stop precisely when it matters most. The pass itself is a DB job — finding
+ * what to reclaim is a query — and the bytes are deleted by the transfer pool
+ * when the result comes back. */
+static void maybe_run_maintenance(oc_dbwriter *dbw) {
+    uint64_t now = now_ms();
+    if (g_last_maint_ms && now - g_last_maint_ms < g_spol.interval_ms) return;
+    g_last_maint_ms = now;
+
+    oc_storage_sample(g_blob_dir, now, &g_sstat);
+
+    /* Eviction is the destructive tier, so it is requested only when free space
+     * is genuinely below the watermark AND the operator left it enabled. The
+     * orphan sweep runs every pass regardless: it frees bytes nobody was ever
+     * promised, so there is no reason to wait for pressure. */
+    int pressure = oc_storage_under_pressure(&g_sstat, &g_spol);
+
+    oc_job *j = oc_job_new(OC_JOB_STORAGE_MAINT, 0);   /* no connection owns this */
+    if (!j) return;
+    j->maint_max_age_ms = g_spol.max_age_ms;
+    j->maint_grace_ms   = g_spol.grace_ms;
+    j->maint_batch      = g_spol.batch;
+    j->maint_evict      = (pressure && g_spol.evict_enabled);
+    oc_dbwriter_submit(dbw, j);
+}
+
 static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_job *j) {
     conn *c = find_by_id(conns, j->conn_id);
     if (!c) {
@@ -2271,6 +2340,7 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
 
     case OC_XFER_ABORT:
     case OC_XFER_CLOSE:
+    case OC_XFER_DELETE:
         break;                                  /* submitted fire-and-forget */
     }
 
@@ -2326,6 +2396,16 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         int nw = 2;
         const char *nws = getenv("OPENCHIME_XFER_WORKERS");
         if (nws && *nws) { int v = atoi(nws); if (v > 0 && v <= 16) nw = v; }
+        snprintf(g_blob_dir, sizeof g_blob_dir, "%s", bd);
+        oc_storage_policy_load(&g_spol);
+        oc_storage_sample(g_blob_dir, now_ms(), &g_sstat);
+        fprintf(stderr, "openchimed: storage maintenance every %llus, "
+                        "max attachment age %llud, eviction %s, %llu MB free\n",
+                (unsigned long long)(g_spol.interval_ms / 1000),
+                (unsigned long long)(g_spol.max_age_ms / (24ull * 3600 * 1000)),
+                g_spol.evict_enabled ? "on" : "off",
+                (unsigned long long)(g_sstat.avail_bytes / (1024 * 1024)));
+
         g_xfers = oc_xferpool_start(g_blobs, nw);
         if (!g_xfers) {
             oc_blobstore_close(g_blobs); g_blobs = NULL;
@@ -2364,6 +2444,8 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     struct epoll_event events[64];
     while (!*stop) {
         int nfds = epoll_wait(ep, events, 64, 500);
+        /* Every tick, timeout included — a quiet box must still be maintained. */
+        maybe_run_maintenance(dbw);
         if (nfds < 0) { if (errno == EINTR) continue; break; }
 
         for (int i = 0; i < nfds; i++) {

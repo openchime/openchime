@@ -163,6 +163,8 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->cert_pem);
     free(r->key_pem);
     free(r->storage_key);
+    for (size_t i = 0; i < r->n_reclaim; i++) free(r->reclaim[i].storage_key);
+    free(r->reclaim);
     free(r->filename);
     free(r->mime);
     for (size_t i = 0; i < r->n_whlist; i++) free(r->whlist[i].label);
@@ -2119,12 +2121,20 @@ static oc_dbres *process_attach_lookup(sqlite3 *db, const oc_job *j) {
 
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT channel_id, storage_key, filename, mime, size, sha256 "
+        "SELECT channel_id, storage_key, filename, mime, size, sha256, reclaimed_at_ms "
         "FROM attachments WHERE id=? AND sha256 IS NOT NULL;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->attachment_id);
     if (sqlite3_step(st) != SQLITE_ROW) {
         sqlite3_finalize(st);
         r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_UNKNOWN_ATTACHMENT;
+        return r;
+    }
+    /* Tombstoned (REQ-215/217): the row survives so the message stays readable,
+     * but the bytes are gone. Report that distinctly — "no longer available" is
+     * a very different thing for a user to see than "no such attachment". */
+    if (sqlite3_column_int64(st, 6) != 0) {
+        sqlite3_finalize(st);
+        r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_ATTACHMENT_GONE;
         return r;
     }
     uint64_t cid = (uint64_t)sqlite3_column_int64(st, 0);
@@ -2572,6 +2582,8 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
 }
 
 /* Dispatch a write (or auth) job against the single write connection. */
+static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j);
+
 static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_AUTH)          return process_auth(w, j);
     if (j->type == OC_JOB_SEND)          return process_send(w->db, j);
@@ -2605,7 +2617,118 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_CLIENT_SETTING) return process_set_client_setting(w->db, j);
     if (j->type == OC_JOB_SET_DISPLAY_NAME)   return process_set_display_name(w->db, j);
     if (j->type == OC_JOB_CHANGE_PASSWORD)    return process_change_password(w->db, j);
+    if (j->type == OC_JOB_STORAGE_MAINT)      return process_storage_maint(w->db, j);
     return NULL;
+}
+
+
+/* --- storage maintenance (REQ-213/215/217, ARCH-78) ----------------------- */
+
+/* Append one row to the reclaim list, tombstoning it in the same step. Returns 1
+ * if it was added. The row is marked reclaimed here, on the writer, while the
+ * BYTES are deleted later by the transfer pool — so a crash between the two
+ * leaves an orphaned blob (which the next orphan sweep collects) rather than a
+ * live row pointing at bytes that are gone. That asymmetry is deliberate:
+ * dangling metadata is a visible bug, a stray blob is merely wasted space. */
+static int reclaim_add(sqlite3 *db, oc_dbres *r, size_t cap,
+                       uint64_t aid, const char *key, uint64_t now) {
+    if (r->n_reclaim >= cap) return 0;
+    char *dup = key ? strdup(key) : NULL;
+    if (!dup) return 0;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE attachments SET reclaimed_at_ms=?1 WHERE id=?2 AND reclaimed_at_ms=0;",
+            -1, &st, NULL) != SQLITE_OK) { free(dup); return 0; }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)now);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)aid);
+    int done = (sqlite3_step(st) == SQLITE_DONE) && sqlite3_changes(db) > 0;
+    sqlite3_finalize(st);
+    if (!done) { free(dup); return 0; }          /* someone else got there first */
+    r->reclaim[r->n_reclaim].storage_key = dup;
+    r->reclaim[r->n_reclaim].attachment_id = aid;
+    r->n_reclaim++;
+    return 1;
+}
+
+/* Run one maintenance pass. Three tiers in order, stopping at the batch cap so a
+ * badly over-limit box recovers across several passes instead of stalling the
+ * daemon in one long sweep (REQ-212/218). */
+static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_STORAGE_MAINT;
+    r->conn_id = j->conn_id;
+
+    size_t cap = j->maint_batch ? j->maint_batch : 64;
+    r->reclaim = calloc(cap, sizeof *r->reclaim);
+    if (!r->reclaim) { free(r); return NULL; }
+
+    uint64_t now = dbw_now_ms();
+    sqlite3_stmt *st = NULL;
+
+    /* Tier 1 (REQ-213): orphans — uploaded but never referenced by a message,
+     * and old enough that an in-flight upload cannot be caught by mistake. This
+     * is the sweep migration 0009's index was created for, and it is pure
+     * garbage collection: nobody was ever promised these bytes. */
+    if (sqlite3_prepare_v2(db,
+            "SELECT id, storage_key FROM attachments "
+            "WHERE message_id IS NULL AND reclaimed_at_ms = 0 AND created_at_ms < ?1 "
+            "ORDER BY created_at_ms ASC LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
+        uint64_t cutoff = (now > j->maint_grace_ms) ? now - j->maint_grace_ms : 0;
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)cap);
+        while (sqlite3_step(st) == SQLITE_ROW && r->n_reclaim < cap) {
+            if (reclaim_add(db, r, cap, (uint64_t)sqlite3_column_int64(st, 0),
+                            (const char *)sqlite3_column_text(st, 1), now))
+                r->maint_orphans++;
+        }
+        sqlite3_finalize(st);
+    }
+
+    /* Tier 2a (REQ-217): past the configured maximum age. A standing policy, not
+     * a response to pressure — it runs whether or not the disk is tight. */
+    if (j->maint_max_age_ms && r->n_reclaim < cap) {
+        st = NULL;
+        if (sqlite3_prepare_v2(db,
+                "SELECT id, storage_key FROM attachments "
+                "WHERE reclaimed_at_ms = 0 AND created_at_ms < ?1 "
+                "ORDER BY created_at_ms ASC LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
+            uint64_t cutoff = (now > j->maint_max_age_ms) ? now - j->maint_max_age_ms : 0;
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)(cap - r->n_reclaim));
+            while (sqlite3_step(st) == SQLITE_ROW && r->n_reclaim < cap) {
+                if (reclaim_add(db, r, cap, (uint64_t)sqlite3_column_int64(st, 0),
+                                (const char *)sqlite3_column_text(st, 1), now))
+                    r->maint_expired++;
+            }
+            sqlite3_finalize(st);
+        }
+    }
+
+    /* Tier 2b (REQ-215): under pressure, evict the oldest attachments regardless
+     * of age — the destructive tier, and the only one that removes something a
+     * user can still see. The caller sets maint_evict only when free space is
+     * actually below the pressure watermark and the operator has not disabled
+     * it. The grace window protects a file shared into a live conversation from
+     * vanishing mid-discussion. */
+    if (j->maint_evict && r->n_reclaim < cap) {
+        st = NULL;
+        if (sqlite3_prepare_v2(db,
+                "SELECT id, storage_key FROM attachments "
+                "WHERE reclaimed_at_ms = 0 AND created_at_ms < ?1 "
+                "ORDER BY created_at_ms ASC LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
+            uint64_t cutoff = (now > j->maint_grace_ms) ? now - j->maint_grace_ms : 0;
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)(cap - r->n_reclaim));
+            while (sqlite3_step(st) == SQLITE_ROW && r->n_reclaim < cap) {
+                if (reclaim_add(db, r, cap, (uint64_t)sqlite3_column_int64(st, 0),
+                                (const char *)sqlite3_column_text(st, 1), now))
+                    r->maint_evicted++;
+            }
+            sqlite3_finalize(st);
+        }
+    }
+    return r;
 }
 
 /* Prune the idempotency map (ARCH-44) at most once per interval, dropping

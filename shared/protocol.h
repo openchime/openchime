@@ -148,6 +148,8 @@ typedef enum {
     OC_ERR_INVALID_REACTION    = 3009, /* empty/oversized emoji on REACT */
     OC_ERR_ATTACHMENT_TOO_LARGE = 3010, /* upload exceeds MAX_ATTACHMENT_SIZE (REQ-140) */
     OC_ERR_UNKNOWN_ATTACHMENT  = 3011, /* no such attachment, or not finalized (REQ-141) */
+    OC_ERR_STORAGE_FULL        = 3012, /* upload refused: below the DB reserve (REQ-216) */
+    OC_ERR_ATTACHMENT_GONE     = 3013, /* reclaimed by age or storage pressure (REQ-215/217) */
     OC_ERR_TRANSFER_PROTOCOL   = 3012, /* out-of-order/oversized chunk or bad transfer state */
     OC_ERR_UNKNOWN_WEBHOOK     = 3013, /* no such (or disabled) incoming webhook token (REQ-170) */
     OC_ERR_INTERNAL            = 9001

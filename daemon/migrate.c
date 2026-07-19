@@ -248,6 +248,16 @@ static const char MIGRATION_0013[] =
     "  PRIMARY KEY (user_id, client_type, key)"
     ");";
 
+/* 0014: attachment tombstones (REQ-215/217, ARCH-77/78). When storage pressure
+ * evicts a blob or it ages past the configured maximum, the BYTES go but the row
+ * stays, marked with the time it was reclaimed. A client then renders "no longer
+ * available" instead of failing an opaque download, so the conversation stays
+ * intelligible and message history (REQ-053) is untouched. Zero means the blob is
+ * present; the index serves the maintenance pass's oldest-first scan. */
+static const char MIGRATION_0014[] =
+    "ALTER TABLE attachments ADD COLUMN reclaimed_at_ms INTEGER NOT NULL DEFAULT 0;"
+    "CREATE INDEX idx_attachments_reclaim ON attachments(reclaimed_at_ms, created_at_ms);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -262,6 +272,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 11, MIGRATION_0011 },
     { 12, MIGRATION_0012 },
     { 13, MIGRATION_0013 },
+    { 14, MIGRATION_0014 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 
