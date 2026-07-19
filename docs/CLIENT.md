@@ -231,8 +231,9 @@ model; translate input to intents }, stop.
 - **Windows (next):** **Win32 + comctl32 in pure C** over the core — no WinUI,
   no .NET, no cross-platform toolkit (ARCH-80). Preceded by a **Windows TUI**
   that validates the core port — pthreads, DNS SRV, sockets — before the GUI
-  (ARCH-81); note termbox2 has no native Windows backend, so that TUI needs a
-  Console-API terminal layer built first.
+  (ARCH-81); note termbox2 has no native Windows backend, so that TUI needs a small
+  termbox2-API layer over the Windows Console API built first — bounded work, not
+  a research risk (ARCH-81).
 - **Linux GUI (later):** **GTK in pure C** — GTK is the native Linux toolkit and
   a C library (ARCH-80). Distributed as an AppImage/Flatpak, not a static binary
   (GTK cannot cleanly static-link).
