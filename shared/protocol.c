@@ -679,6 +679,55 @@ oc_result oc_encode_list_client_settings(oc_wbuf *w, uint16_t version, const oc_
 /* Storage usage report (REQ-214). Fixed-width fields only, so it needs no
  * length prefixes and stays trivially forward-compatible: a later version can
  * append fields and an older client simply stops reading early. */
+oc_result oc_encode_audit_query(oc_wbuf *w, uint16_t version, const oc_audit_query *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_AUDIT_QUERY);
+    oc_w_u64(w, m->before_ms);
+    oc_w_u16(w, m->limit);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_audit_query(oc_rbuf *r, oc_audit_query *m) {
+    m->before_ms = oc_r_u64(r);
+    m->limit = oc_r_u16(r);
+    return r_done(r);
+}
+
+oc_result oc_encode_audit_page(oc_wbuf *w, uint16_t version, const oc_audit_page *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_AUDIT_PAGE);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        const oc_audit_entry *e = &m->entries[i];
+        oc_w_u64(w, e->at_ms);
+        oc_w_u64(w, e->actor_id);
+        oc_w_u64(w, e->target_id);
+        oc_w_u8(w, e->family);
+        oc_w_u8(w, e->outcome);
+        oc_w_str(w, e->actor_name);
+        oc_w_str(w, e->action);
+        oc_w_str(w, e->target);
+        oc_w_str(w, e->detail);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_audit_page(oc_rbuf *r, oc_audit_entry *out, uint16_t cap, uint16_t *n) {
+    uint16_t count = oc_r_u16(r);
+    if (count > cap) count = cap;          /* clamp: never write past the caller's array */
+    for (uint16_t i = 0; i < count; i++) {
+        out[i].at_ms     = oc_r_u64(r);
+        out[i].actor_id  = oc_r_u64(r);
+        out[i].target_id = oc_r_u64(r);
+        out[i].family    = oc_r_u8(r);
+        out[i].outcome   = oc_r_u8(r);
+        out[i].actor_name = oc_r_str(r);
+        out[i].action     = oc_r_str(r);
+        out[i].target     = oc_r_str(r);
+        out[i].detail     = oc_r_str(r);
+    }
+    *n = count;
+    return r_done(r);
+}
+
 oc_result oc_encode_storage_status(oc_wbuf *w, uint16_t version, const oc_storage_status *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_STORAGE_STATUS);
     oc_w_u64(w, m->total_bytes);

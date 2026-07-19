@@ -224,3 +224,18 @@ The capacity profile
 (ARCH-71), pending only the CA-signed cert (REQ-171). Attachments (REQ-140/141)
 are built end-to-end — proxied chunked transfer, access control, and message-linking
 — including thread-reply attachments and both the local-FS and S3/MinIO blob backends.
+
+### 11–14. Rich Text, Retrieval, Profiles, Compliance
+
+*Mostly forward scope; tracked here so the omission is visible rather than implied.*
+
+| REQ | Status | Notes |
+|-----|--------|-------|
+| 220–231 rich text, threads-in-place, pins, saved items | ⛔ | Forward scope; none backed by an ARCH decision yet. |
+| 240–242 profiles, timezone, status text | ⛔ | Forward scope. |
+| 250 opt-in retention policy | ⛔ | Distinct from REQ-217's max attachment age (built) — 250 also ages out *messages*, which nothing does today. Still `[needs ARCH decision]`. |
+| 251 audit log | ✅ | **Built** (ARCH-79, migration 0016): four families — admin, account, security, moderation — recorded on the writer, read via `AUDIT_QUERY`/`AUDIT_PAGE` (0x0099/0x009A) and the TUI's `/audit`, owner/admin gated against the user's *current* role. Never records the secret involved. Verified live: role change, invite, and password change all appear with the acting user, and a member promoted mid-session immediately gains access. |
+| 251a bounded audit log | ✅ | Aged out by the ARCH-78 maintenance pass, `OPENCHIME_AUDIT_MAX_DAYS` (default 365). |
+| 251b per-family cap | ✅ | **The cap is applied per family**, so a flood of attacker-controlled `auth.failed` entries cannot age out administrative history — without this the audit log becomes an evidence-shredder. Rate-limited attempts are dropped silently rather than audited, so a throttled spray produces no rows at all. Regression-tested with a 200-entry security flood against a surviving admin entry. |
+| 252 legal hold + export | ⛔ | Forward scope; `[needs ARCH decision]`. |
+| 253 SCIM provisioning | ⛔ | Federated function (ARCH-76); central-service concern. |

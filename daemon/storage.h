@@ -40,6 +40,7 @@ typedef struct {
     uint64_t recover_bytes;   /* reclaim until free is back above this         */
     uint32_t batch;           /* max blobs reclaimed per pass                  */
     int      evict_enabled;   /* pressure eviction (REQ-215); default on       */
+    uint64_t audit_max_age_ms;/* audit entries older than this age out, per family */
 } oc_storage_policy;
 
 /* Load the policy from the environment, applying documented defaults for
@@ -52,6 +53,7 @@ typedef struct {
  *   OPENCHIME_RECOVER_MB          (default 1024)
  *   OPENCHIME_MAINT_BATCH         (default 64)
  *   OPENCHIME_EVICT               (default on; "off"/"0" disables)
+ *   OPENCHIME_AUDIT_MAX_DAYS      (default 365; 0 = never prune the audit log)
  * The two watermarks are deliberately distinct: reclaiming down to the same
  * threshold that triggered it would leave the daemon oscillating at the
  * boundary, running a pass on nearly every tick. */

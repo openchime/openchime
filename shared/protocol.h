@@ -106,6 +106,8 @@ typedef enum {
     OC_MSG_CLIENT_SETTINGS     = 0x0096, /* S->C, a bucket snapshot (also a device-sync push) */
     OC_MSG_STORAGE_STATUS_REQ  = 0x0097, /* C->S, owner/admin: ask for storage usage (REQ-214) */
     OC_MSG_STORAGE_STATUS      = 0x0098, /* S->C, usage + policy + what maintenance reclaimed */
+    OC_MSG_AUDIT_QUERY         = 0x0099, /* C->S, owner/admin: page the audit log (REQ-251) */
+    OC_MSG_AUDIT_PAGE          = 0x009A, /* S->C, a page of entries, newest first */
     OC_MSG_CALL_JOIN        = 0x00A0, /* C->S, join a channel's audio call (REQ-150) */
     OC_MSG_CALL_LEAVE       = 0x00A1, /* C->S, leave the call */
     OC_MSG_CALL_JOINED      = 0x00A2, /* S->C, to the joiner: call id + UDP endpoint/token + roster */
@@ -397,6 +399,29 @@ typedef struct {
     uint8_t  under_pressure;
 } oc_storage_status;
 
+/* Audit log paging (REQ-251). `before_ms` pages backwards from a timestamp
+ * rather than by offset, so a boundary stays stable as new entries arrive;
+ * 0 asks for the newest page. */
+#define OC_AUDIT_PAGE_MAX 200u
+typedef struct { uint64_t before_ms; uint16_t limit; } oc_audit_query;
+
+typedef struct {
+    uint64_t at_ms;
+    uint64_t actor_id;
+    uint64_t target_id;
+    oc_slice actor_name;
+    oc_slice action;
+    oc_slice target;
+    oc_slice detail;      /* never the secret involved (ARCH-79) */
+    uint8_t  family;      /* 1 admin, 2 account, 3 security, 4 moderation */
+    uint8_t  outcome;     /* 1 ok, 0 denied/failed */
+} oc_audit_entry;
+
+typedef struct {
+    uint16_t count;
+    const oc_audit_entry *entries;
+} oc_audit_page;
+
 typedef struct { oc_slice client_type; uint16_t count;
                  const oc_client_setting_entry *entries; } oc_client_settings;
 /* Audio call signaling (REQ-150). CALL_JOINED carries the joiner's private UDP
@@ -501,6 +526,12 @@ oc_result oc_encode_list_notify_prefs(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_notify_prefs(oc_wbuf *w, uint16_t version, const oc_notify_prefs *m);
 oc_result oc_encode_set_client_setting(oc_wbuf *w, uint16_t version, const oc_set_client_setting *m);
 oc_result oc_encode_list_client_settings(oc_wbuf *w, uint16_t version, const oc_list_client_settings *m);
+oc_result oc_encode_audit_query(oc_wbuf *w, uint16_t ver, const oc_audit_query *m);
+oc_result oc_decode_audit_query(oc_rbuf *r, oc_audit_query *m);
+oc_result oc_encode_audit_page(oc_wbuf *w, uint16_t ver, const oc_audit_page *m);
+/* Decodes into `out` (caller-provided, `cap` entries); slices point into `r`. */
+oc_result oc_decode_audit_page(oc_rbuf *r, oc_audit_entry *out, uint16_t cap, uint16_t *n);
+
 oc_result oc_encode_storage_status(oc_wbuf *w, uint16_t ver, const oc_storage_status *m);
 oc_result oc_decode_storage_status(oc_rbuf *r, oc_storage_status *m);
 

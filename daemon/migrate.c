@@ -268,6 +268,34 @@ static const char MIGRATION_0014[] =
 static const char MIGRATION_0015[] =
     "ALTER TABLE attachments ADD COLUMN reclaim_reason INTEGER NOT NULL DEFAULT 0;";
 
+/* 0016: the audit log (REQ-251, ARCH-79). Its own table, sharing no schema or
+ * query surface with messages. Append-only as a write policy — the daemon emits
+ * only INSERT, and the single age-based prune of ARCH-78.
+ *
+ * `family` is what makes the cap safe: the catalog deliberately includes failed
+ * authentication, whose volume an attacker controls, so each family ages out
+ * against its own budget and a flood of security noise cannot evict
+ * administrative history (REQ-251b). The index serves both the newest-first read
+ * and that per-family prune.
+ *
+ * `detail` is a short human string. It must never carry the secret involved:
+ * that a password changed, never the password. */
+static const char MIGRATION_0016[] =
+    "CREATE TABLE audit_log ("
+    "  id         INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  at_ms      INTEGER NOT NULL,"
+    "  family     INTEGER NOT NULL,"   /* 1 admin, 2 account, 3 security, 4 moderation */
+    "  action     TEXT    NOT NULL,"
+    "  actor_id   INTEGER,"            /* NULL when unauthenticated (a failed login) */
+    "  actor_name TEXT,"               /* denormalized: the actor may later be removed */
+    "  target_id  INTEGER,"
+    "  target     TEXT,"
+    "  outcome    INTEGER NOT NULL DEFAULT 1,"  /* 1 ok, 0 denied/failed */
+    "  detail     TEXT"
+    ");"
+    "CREATE INDEX idx_audit_family_time ON audit_log(family, at_ms);"
+    "CREATE INDEX idx_audit_time ON audit_log(at_ms);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -284,6 +312,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 13, MIGRATION_0013 },
     { 14, MIGRATION_0014 },
     { 15, MIGRATION_0015 },
+    { 16, MIGRATION_0016 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

@@ -300,6 +300,16 @@ void oc_client_toggle_storage(oc_client *c, int open) {
     if (c) c->model.storage_open = open ? 1 : 0;
 }
 
+void oc_client_audit_query(oc_client *c, uint64_t before_ms) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_AUDIT_QUERY);
+    if (cmd) { cmd->message_id = before_ms; oc_queue_push(&c->cmds, cmd); }
+}
+
+void oc_client_toggle_audit(oc_client *c, int open) {
+    if (c) c->model.audit_open = open ? 1 : 0;
+}
+
 void oc_client_set_display_name(oc_client *c, const char *name) {
     if (!c || !name || !name[0]) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_DISPLAY_NAME);

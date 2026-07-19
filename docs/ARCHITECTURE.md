@@ -108,6 +108,17 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   Free space comes from `statvfs` on the blob directory, sampled once per pass and cached — so the upload admission check (REQ-216) costs no syscall on the hot path. An **unmeasurable filesystem reads as unconstrained**: guessing "pressured" would make the daemon destroy user data because a syscall failed, which is a far worse outcome than doing nothing. Built in `daemon/storage.c` (policy + measurement), `process_storage_maint` (the writer-side tiers), and `maybe_run_maintenance` (the tick).
 
+- **ARCH-79 (Audit log):** REQ-251's log is an `audit_log` **table in the tenant's own database** (migration 0016), not a separate file and not a hash chain.
+
+  *Why a table in the same database.* "Kept outside the normal message store" is satisfied by being its own table with its own access path — it shares no schema, no query surface, and no read permission with messages. A second SQLite file was considered and rejected for this scope: it doubles the connection and backup story (ARCH-3 already makes backup the operator's own affair) for a threat model this design does not otherwise defend against. **Append-only is a write policy, not a guarantee** — the daemon emits only INSERT, and never UPDATE or DELETE except the age-based prune below. An operator with the database file can still rewrite history; detecting that would require a hash chain, which is the natural upgrade if REQ-252's compliance work ever demands tamper-*evidence* rather than tamper-*discouragement*. That tradeoff is recorded here rather than hidden.
+
+  *Bounded, and partitioned.* The log ages out with everything else on the ARCH-78 maintenance pass. The subtlety is REQ-251b: the catalog deliberately includes **failed authentication and denied privileged actions**, whose volume an unauthenticated attacker controls. A single global cap would therefore hand that attacker a way to evict the record of their own earlier successful actions — the audit trail becomes an evidence-shredder. So the cap is **per family** (administrative / account / security / moderation): each ages against its own budget, and a flood of security noise cannot touch administrative history. This is why the `family` column exists and is indexed.
+
+  *Never the secret.* Entries record that a password changed, never the password; that an invite was redeemed, never the token; that authentication failed for a username, never the attempted password. An audit log is a high-value target precisely because admins read it, so it must not become a place where credentials accumulate.
+
+  *Read path.* `AUDIT_QUERY` / `AUDIT_PAGE` (PROTOCOL.md), owner/admin only, authorized in the **writer against the user's current role** — the same shape as ARCH-77's storage report, so a demotion takes effect mid-session. The TUI renders it as an `/audit` overlay, newest first, paged. Reads are ordinary queries on the read connection (ARCH-66); writes go through the writer like every other mutation, so the log inherits the same single-writer ordering as the data it describes.
+
+## Feature Implementation
 ## Feature Implementation
 
 - **ARCH-15 (Search):** FTS5 full-text search, positioned as a competitive wedge against Slack's history caps.

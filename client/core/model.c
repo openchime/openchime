@@ -70,6 +70,7 @@ void oc_model_free(oc_model *m) {
     free(m->users);
     free(m->webhooks);
     free(m->settings);
+    free(m->audit);
     memset(m, 0, sizeof *m);
 }
 
@@ -599,6 +600,18 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         break;
     case OC_EV_SETTING:
         setting_upsert(m, e->author_name, e->body ? e->body : "");
+        break;
+    case OC_EV_AUDIT_BEGIN:
+        m->n_audit = 0;              /* a page replaces whatever was shown */
+        break;
+    case OC_EV_AUDIT:
+        if (m->n_audit == m->cap_audit) {
+            size_t nc = m->cap_audit ? m->cap_audit * 2 : 64;
+            oc_audit_view *na = realloc(m->audit, nc * sizeof *na);
+            if (!na) break;
+            m->audit = na; m->cap_audit = nc;
+        }
+        m->audit[m->n_audit++] = e->audit;
         break;
     case OC_EV_STORAGE:
         m->storage = e->storage;

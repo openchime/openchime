@@ -43,6 +43,13 @@ typedef struct {
 
 /* ---- helpers ---- */
 
+/* Copy a wire slice into a fixed buffer, NUL-terminated and truncated to fit. */
+static void slice_to_buf(oc_slice sl, char *out, size_t cap) {
+    size_t n = sl.len < cap - 1 ? sl.len : cap - 1;
+    if (n && sl.ptr) memcpy(out, sl.ptr, n);
+    out[n] = '\0';
+}
+
 static void push_err(oc_queue *to_ui, const char *msg) {
     oc_ev *e = oc_ev_new(OC_EV_ERROR);
     if (e) { e->body = strdup(msg); oc_queue_push(to_ui, e); }
@@ -493,6 +500,26 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (e->body) { memcpy(e->body, ce[i].value.ptr, ce[i].value.len); e->body[ce[i].value.len] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_AUDIT_PAGE) {
+            oc_audit_entry ents[OC_AUDIT_PAGE_MAX];
+            uint16_t n = 0;
+            if (oc_decode_audit_page(&p, ents, OC_AUDIT_PAGE_MAX, &n) != OC_OK) return -1;
+            oc_ev *b = oc_ev_new(OC_EV_AUDIT_BEGIN);
+            if (b) oc_queue_push(ctx->to_ui, b);
+            for (uint16_t i = 0; i < n; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_AUDIT);
+                if (!e) break;
+                e->audit.at_ms     = ents[i].at_ms;
+                e->audit.actor_id  = ents[i].actor_id;
+                e->audit.target_id = ents[i].target_id;
+                e->audit.family    = ents[i].family;
+                e->audit.outcome   = ents[i].outcome;
+                slice_to_buf(ents[i].actor_name, e->audit.actor_name, sizeof e->audit.actor_name);
+                slice_to_buf(ents[i].action,     e->audit.action,     sizeof e->audit.action);
+                slice_to_buf(ents[i].target,     e->audit.target,     sizeof e->audit.target);
+                slice_to_buf(ents[i].detail,     e->audit.detail,     sizeof e->audit.detail);
+                oc_queue_push(ctx->to_ui, e);
+            }
         } else if (hdr.msg_type == OC_MSG_STORAGE_STATUS) {
             oc_storage_status ss;
             if (oc_decode_storage_status(&p, &ss) != OC_OK) return -1;
@@ -913,6 +940,12 @@ static int run_connection(oc_net *n, int reconnecting,
                     ? oc_encode_join_channel(&w, OC_PROTOCOL_VERSION, &cr)
                     : oc_encode_leave_channel(&w, OC_PROTOCOL_VERSION, &cr);
                 if (rr == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_AUDIT_QUERY) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_audit_query aq = { c->message_id, 50 };   /* message_id = before_ms */
+                if (oc_encode_audit_query(&w, OC_PROTOCOL_VERSION, &aq) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_STORAGE_STATUS) {
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);

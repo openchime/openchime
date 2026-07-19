@@ -787,10 +787,28 @@ None are yet backed by an architecture decision.*
   paid-tier history *cap* (REQ-053 stands). **[needs ARCH decision — retention job
   + its interaction with backfill, search, and attachment cleanup.]**
 - **REQ-251.** The daemon has recorded an **audit log** of administrative and
-  security-relevant actions — role changes, user invite/remove, session
-  revocation, webhook/app install, channel archive, retention changes — append-
-  only, admin-readable, and kept outside the normal message store. **[needs ARCH
-  decision — audit event catalog + storage.]**
+  security-relevant actions, **append-only, admin-readable, and kept apart from
+  the message store** (ARCH-79). The catalog has covered four families:
+  **administrative** (role change, user invite/remove, channel archive,
+  retention or storage-policy change), **account lifecycle** (registration,
+  password change, invite redeemed, owner bootstrap), **security** (session
+  revocation, failed authentication, denied privileged action), and
+  **moderation** (a moderator deleting another user's message, removing a member
+  from a channel). Each entry has recorded when, who acted, what action, on what
+  target, and the outcome — **never the secret involved**: that a password
+  changed, never the password; that an invite was redeemed, never the token.
+- **REQ-251a.** The audit log has been **bounded**, since an unbounded table on a
+  finite disk is the failure mode REQ-212 exists to prevent: entries older than a
+  configured maximum age have been dropped by the maintenance pass (REQ-218).
+  "Append-only" has therefore described how entries are *written* — never updated,
+  never selectively deleted — rather than promising infinite retention.
+- **REQ-251b.** **The cap has been partitioned by family**, so that a
+  high-volume family could not evict a low-volume one. Without this, an
+  unauthenticated attacker able to generate failed logins at will could flood the
+  log and age out the record of their own earlier successful actions — turning
+  the audit trail into a means of erasing evidence. Each family has therefore
+  aged out against its own budget, and administrative history has survived a
+  flood of security noise.
 - **REQ-252.** A tenant subject to legal/compliance obligations has been able to
   place a **legal hold** and **export** message history (including DMs, subject to
   authorization policy) for eDiscovery, and to apply data-loss-prevention scanning

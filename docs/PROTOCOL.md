@@ -1185,6 +1185,8 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0096` | `CLIENT_SETTINGS`      | S → C | no        | §5.16a  |
 | `0x0097` | `STORAGE_STATUS_REQ` | C→S | Owner/admin: request the storage usage report (REQ-214). No body. |
 | `0x0098` | `STORAGE_STATUS` | S→C | Usage, the active retention/eviction policy, and cumulative reclamation counts by reason. Fixed-width fields, so a later version may append without a version bump. |
+| `0x0099` | `AUDIT_QUERY` | C→S | Owner/admin: page the audit log (REQ-251). `before_ms` pages backwards from a timestamp rather than by offset, so a boundary stays stable as entries arrive; 0 asks for the newest page. |
+| `0x009A` | `AUDIT_PAGE` | S→C | A page of entries, newest first: time, family, action, actor, target, outcome, detail. Never carries the secret involved. |
 | `0x0048` | `SET_DISPLAY_NAME` | C → S     | no        | §5.16b  |
 | `0x0049` | `CHANGE_PASSWORD`  | C → S     | no        | §5.16b  |
 | `0x004A` | `PROFILE_UPDATED`  | S → C     | no        | §5.16b  |

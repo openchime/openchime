@@ -62,7 +62,8 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * but it tombstones rows, so it runs on the writer. */
        OC_JOB_STORAGE_MAINT = 45,
        /* Storage usage report for an owner/admin (REQ-214). Read-only. */
-       OC_JOB_STORAGE_STATUS = 46 };
+       OC_JOB_STORAGE_STATUS = 46,
+       OC_JOB_AUDIT_QUERY = 47 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -154,6 +155,9 @@ typedef struct oc_job {
     uint64_t       maint_max_age_ms;  /* expire attachments older than this (0 = never) */
     uint64_t       maint_grace_ms;    /* never reclaim anything younger than this */
     uint32_t       maint_batch;       /* cap on rows reclaimed in one pass */
+    uint32_t       audit_limit;       /* AUDIT_QUERY: rows per page */
+    uint64_t       audit_before_ms;   /* AUDIT_QUERY: page backwards from here (0 = newest) */
+    uint64_t       audit_max_age_ms;  /* STORAGE_MAINT: age out audit entries past this */
     int            maint_evict;       /* also evict oldest under pressure (REQ-215) */
 } oc_job;
 
@@ -197,6 +201,7 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
         * pool for deletion (ARCH-78). */
        OC_RES_STORAGE_MAINT = 51,
        OC_RES_STORAGE_STATUS = 52, OC_RES_STORAGE_ERR = 53,
+       OC_RES_AUDIT_PAGE = 54, OC_RES_AUDIT_ERR = 55,
        /* A read cursor advanced (REQ-090 seen-by): fan the acker's new cursor to
         * the channel's members + backfill the acker with the others' cursors. */
        OC_RES_READ_CURSOR = 50 };
@@ -223,10 +228,28 @@ typedef struct { char *key; char *value; } oc_client_setting_row;
  * thread's job via the transfer pool because it can block on S3. */
 /* Why a blob was reclaimed, recorded on the attachments row (migration 0015) so
  * REQ-215's audit trail is a query rather than a second log. */
+/* Audit families (REQ-251, ARCH-79). The cap is applied per family so a flood of
+ * attacker-controlled security events cannot evict administrative history. */
+enum { OC_AUDIT_ADMIN = 1, OC_AUDIT_ACCOUNT = 2,
+       OC_AUDIT_SECURITY = 3, OC_AUDIT_MODERATION = 4 };
+
 enum { OC_RECLAIM_NONE = 0, OC_RECLAIM_ORPHAN = 1,
        OC_RECLAIM_EXPIRED = 2, OC_RECLAIM_EVICTED = 3 };
 
 typedef struct { char *storage_key; uint64_t attachment_id; } oc_reclaim_row;
+
+/* One audit entry as read back for an admin (REQ-251). */
+typedef struct oc_audit_row {
+    uint64_t at_ms;
+    uint64_t actor_id;
+    uint64_t target_id;
+    char    *actor_name;   /* heap; denormalized, the actor may since be removed */
+    char    *action;       /* heap */
+    char    *target;       /* heap */
+    char    *detail;       /* heap; never carries the secret involved */
+    uint8_t  family;
+    uint8_t  outcome;      /* 1 ok, 0 denied/failed */
+} oc_audit_row;
 
 /* One row in a READ_CURSOR result: a member's read position in the channel. */
 typedef struct { uint64_t user_id; uint64_t message_id; } oc_read_cursor_row;
@@ -386,6 +409,9 @@ typedef struct oc_dbres {
     uint64_t                st_attach_bytes, st_attach_count;
     uint64_t                st_rec_orphan, st_rec_expired, st_rec_evicted;
     uint64_t                st_last_reclaim_ms;
+    /* Audit page (REQ-251). `audit` is a heap array of rows, newest first. */
+    struct oc_audit_row    *audit;
+    size_t                  n_audit;
 
     /* PROFILE_UPDATED: the (possibly unchanged) display name to broadcast; the
      * subject user is `user_id` above. */

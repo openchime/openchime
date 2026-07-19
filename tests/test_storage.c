@@ -173,11 +173,114 @@ static int row_exists(sqlite3 *db, uint64_t id) {
 static const uint64_t HOUR = 60ull * 60 * 1000;
 static const uint64_t DAY  = 24ull * 60 * 60 * 1000;
 
+
+/* --- audit log (REQ-251) -------------------------------------------------- */
+
+static int audit_count(sqlite3 *db, int family) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM audit_log WHERE family=?;", -1, &st, NULL);
+    sqlite3_bind_int(st, 1, family);
+    int n = (sqlite3_step(st) == SQLITE_ROW) ? sqlite3_column_int(st, 0) : -1;
+    sqlite3_finalize(st);
+    return n;
+}
+
+static void audit_insert(sqlite3 *db, int family, const char *action, uint64_t at_ms) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO audit_log(at_ms, family, action, outcome) VALUES(?1,?2,?3,1);",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)at_ms);
+    sqlite3_bind_int(st, 2, family);
+    sqlite3_bind_text(st, 3, action, -1, SQLITE_TRANSIENT);
+    CHECK(sqlite3_step(st) == SQLITE_DONE);
+    sqlite3_finalize(st);
+}
+
+/* The property REQ-251b exists for: a flood of attacker-controlled SECURITY
+ * entries must not age out ADMIN history. With one global cap it would; with a
+ * per-family cap it cannot. This is the test that would catch a regression
+ * turning the audit log back into an evidence-shredder. */
+static void test_audit_partitioned_cap(oc_dbwriter *w, sqlite3 *db, uint64_t now) {
+    const uint64_t DAYms = 24ull * 60 * 60 * 1000;
+
+    /* One old admin entry we must keep, and a flood of even older security ones. */
+    audit_insert(db, OC_AUDIT_ADMIN, "role.change", now - 10 * DAYms);
+    for (int i = 0; i < 200; i++)
+        audit_insert(db, OC_AUDIT_SECURITY, "auth.failed", now - 40 * DAYms - i);
+
+    CHECK(audit_count(db, OC_AUDIT_ADMIN) == 1);
+    CHECK(audit_count(db, OC_AUDIT_SECURITY) == 200);
+
+    /* Prune at 30 days: the security flood is older and goes; the 10-day-old
+     * admin entry is younger than the cutoff and survives. */
+    oc_job *j = oc_job_new(OC_JOB_STORAGE_MAINT, 0);
+    CHECK(j != NULL);
+    if (!j) return;
+    j->maint_grace_ms = 1 * HOUR;
+    j->maint_batch = 8;
+    j->audit_max_age_ms = 30 * DAYms;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = NULL;
+    for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+    CHECK(r != NULL);
+    if (r) oc_dbres_free(r);
+
+    CHECK(audit_count(db, OC_AUDIT_SECURITY) == 0);   /* aged out */
+    CHECK(audit_count(db, OC_AUDIT_ADMIN) == 1);      /* SURVIVED the flood */
+}
+
+/* Reading a page: newest first, gated to owner/admin. */
+static void test_audit_query(oc_dbwriter *w, sqlite3 *db, uint64_t now, uint64_t member_id) {
+    audit_insert(db, OC_AUDIT_ADMIN, "webhook.create", now - 3000);
+    audit_insert(db, OC_AUDIT_ADMIN, "user.invite",    now - 2000);
+    audit_insert(db, OC_AUDIT_ACCOUNT, "password.change", now - 1000);
+
+    oc_job *j = oc_job_new(OC_JOB_AUDIT_QUERY, 0);
+    CHECK(j != NULL);
+    if (!j) return;
+    j->user_id = 1;                 /* owner */
+    j->audit_limit = 10;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = NULL;
+    for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+    CHECK(r != NULL);
+    if (r) {
+        CHECK(r->type == OC_RES_AUDIT_PAGE);
+        CHECK(r->n_audit >= 3);
+        /* Newest first. */
+        if (r->n_audit >= 2) CHECK(r->audit[0].at_ms >= r->audit[1].at_ms);
+        int saw_pw = 0;
+        for (size_t i = 0; i < r->n_audit; i++)
+            if (r->audit[i].action && strcmp(r->audit[i].action, "password.change") == 0) saw_pw = 1;
+        CHECK(saw_pw);
+        oc_dbres_free(r);
+    }
+
+    /* A member is refused, and gets no entries with the refusal. */
+    j = oc_job_new(OC_JOB_AUDIT_QUERY, 0);
+    CHECK(j != NULL);
+    if (!j) return;
+    j->user_id = member_id;
+    j->audit_limit = 10;
+    oc_dbwriter_submit(w, j);
+    r = NULL;
+    for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+    CHECK(r != NULL);
+    if (r) {
+        CHECK(r->type == OC_RES_AUDIT_ERR);
+        CHECK(r->err_code == OC_ERR_FORBIDDEN);
+        CHECK(r->n_audit == 0);
+        oc_dbres_free(r);
+    }
+}
+
 int run_storage_tests(void) {
     printf("test_storage: policy defaults + env override, watermark ordering, "
            "unmeasurable-fs safety, statvfs, and the maintenance pass "
            "(orphans, age expiry, pressure eviction, grace window, tombstones), "
-           "plus the usage report and its owner/admin gate\n");
+           "plus the usage report and its owner/admin gate, and the audit log "
+           "(per-family cap defeating the flood attack, paging, admin gate)\n");
 
     test_policy_defaults();
     test_policy_env();
@@ -373,6 +476,13 @@ int run_storage_tests(void) {
             CHECK(r->st_attach_bytes == 0 && r->st_rec_evicted == 0);
             oc_dbres_free(r);
         }
+    }
+
+    test_audit_partitioned_cap(w, db, now);
+    {
+        uint64_t mid = oc_dbwriter_register_local(w, "plain2", "pw-p2", OC_ROLE_MEMBER, 1000);
+        CHECK(mid != 0);
+        test_audit_query(w, db, now, mid);
     }
 
     sqlite3_close(db);

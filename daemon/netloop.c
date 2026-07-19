@@ -1106,6 +1106,18 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             }
             continue;
         }
+        if (hdr.msg_type == OC_MSG_AUDIT_QUERY) {
+            oc_audit_query aq;
+            if (oc_decode_audit_query(&p, &aq) != OC_OK) return -1;
+            /* Owner/admin only; checked in the writer against the current role. */
+            oc_job *j = oc_job_new(OC_JOB_AUDIT_QUERY, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->audit_limit = aq.limit ? aq.limit : 50;
+            j->audit_before_ms = aq.before_ms;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_STORAGE_STATUS_REQ) {
             /* Owner/admin only (REQ-214). The check lives in the writer, which
              * reads the user's CURRENT role, rather than here — the same shape
@@ -1912,6 +1924,38 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
+    case OC_RES_AUDIT_PAGE: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_audit_entry ents[OC_AUDIT_PAGE_MAX];
+        uint16_t n = 0;
+        for (size_t i = 0; i < r->n_audit && n < OC_AUDIT_PAGE_MAX; i++, n++) {
+            const oc_audit_row *a = &r->audit[i];
+            ents[n].at_ms     = a->at_ms;
+            ents[n].actor_id  = a->actor_id;
+            ents[n].target_id = a->target_id;
+            ents[n].family    = a->family;
+            ents[n].outcome   = a->outcome;
+            ents[n].actor_name = oc_slice_str(a->actor_name ? a->actor_name : "");
+            ents[n].action     = oc_slice_str(a->action ? a->action : "");
+            ents[n].target     = oc_slice_str(a->target ? a->target : "");
+            ents[n].detail     = oc_slice_str(a->detail ? a->detail : "");
+        }
+        oc_audit_page pg = { n, ents };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_audit_page(&w, OC_PROTOCOL_VERSION, &pg);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_AUDIT_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("audit query denied") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
     case OC_RES_STORAGE_ERR: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
@@ -2243,6 +2287,7 @@ static void maybe_run_maintenance(oc_dbwriter *dbw) {
     j->maint_grace_ms   = g_spol.grace_ms;
     j->maint_batch      = g_spol.batch;
     j->maint_evict      = (pressure && g_spol.evict_enabled);
+    j->audit_max_age_ms = g_spol.audit_max_age_ms;
     oc_dbwriter_submit(dbw, j);
 }
 

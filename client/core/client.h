@@ -125,6 +125,11 @@ void oc_client_list_settings(oc_client *c);
 void oc_client_storage_status(oc_client *c);
 void oc_client_toggle_storage(oc_client *c, int open);
 
+/* Audit log (REQ-251; owner/admin only). Request a page ending before
+ * `before_ms` (0 = newest); entries fold into the model, newest first. */
+void oc_client_audit_query(oc_client *c, uint64_t before_ms);
+void oc_client_toggle_audit(oc_client *c, int open);
+
 /* Self-service profile (REQ-020). Change your own display name (fans to every
  * roster) or rotate your local password (the server verifies `old_pw`). Each
  * folds a PROFILE_UPDATED into the model on success; a failure (e.g. wrong old

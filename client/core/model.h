@@ -149,6 +149,11 @@ typedef struct {
     oc_storage_view storage;
     uint8_t   storage_have;
     uint8_t   storage_open;
+
+    /* Audit log page (REQ-251), newest first. Owner/admin only. */
+    oc_audit_view *audit;
+    size_t    n_audit, cap_audit;
+    uint8_t   audit_open;
     char     status[160];             /* last status / error line */
     /* The last hard error (auth failed, unreachable, …). Unlike `status` it is
      * NOT overwritten by the "disconnected" line, so a login flow can read the

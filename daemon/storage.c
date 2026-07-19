@@ -26,6 +26,9 @@ void oc_storage_policy_load(oc_storage_policy *p) {
     p->pressure_bytes = env_u64("OPENCHIME_PRESSURE_MB", 512) * MB;
     p->recover_bytes  = env_u64("OPENCHIME_RECOVER_MB", 1024) * MB;
     p->batch          = (uint32_t)env_u64("OPENCHIME_MAINT_BATCH", 64);
+    /* Audit retention (REQ-251a). Applied PER FAMILY by the writer, so a flood
+     * of security events cannot age out administrative history (REQ-251b). */
+    p->audit_max_age_ms = env_u64("OPENCHIME_AUDIT_MAX_DAYS", 365) * 24ull * 60 * 60 * 1000;
 
     const char *ev = getenv("OPENCHIME_EVICT");
     p->evict_enabled = !(ev && (strcmp(ev, "off") == 0 || strcmp(ev, "0") == 0));

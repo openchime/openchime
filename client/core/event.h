@@ -19,6 +19,20 @@ typedef struct {
     uint8_t  evict_enabled, under_pressure;
 } oc_storage_view;
 
+/* One audit entry as the frontend sees it (REQ-251). Fixed-size strings: a page
+ * is bounded and short-lived, so this avoids per-entry heap churn. */
+typedef struct {
+    uint64_t at_ms;
+    uint64_t actor_id;
+    uint64_t target_id;
+    char     actor_name[64];
+    char     action[48];
+    char     target[64];
+    char     detail[96];
+    uint8_t  family;    /* 1 admin, 2 account, 3 security, 4 moderation */
+    uint8_t  outcome;   /* 1 ok, 0 denied/failed */
+} oc_audit_view;
+
 /* net thread -> UI thread */
 enum {
     OC_EV_CONNECTED = 1,   /* TLS + handshake up */
@@ -50,6 +64,8 @@ enum {
     OC_EV_PROFILE,         /* a PROFILE_UPDATED: user_id + body=display_name (own = the change ack) */
     OC_EV_READ_CURSOR,     /* a READ_CURSOR: user_id read up to message_id in channel_id (seen-by) */
     OC_EV_STORAGE,         /* a STORAGE_STATUS: usage + policy report (REQ-214) */
+    OC_EV_AUDIT_BEGIN,     /* an AUDIT_PAGE starts: clears the model's page */
+    OC_EV_AUDIT,           /* one audit entry (REQ-251) */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
     OC_EV_ERROR            /* protocol/transport error; body = human message */
 };
@@ -64,6 +80,7 @@ typedef struct {
     uint64_t server_time;
     uint8_t  status;       /* PRESENCE: online/away/offline; CHANNEL: joined flag */
     oc_storage_view storage;  /* OC_EV_STORAGE */
+    oc_audit_view   audit;    /* OC_EV_AUDIT */
     uint8_t  op;           /* REACTION: add/remove */
     uint32_t count;        /* REACTION: running aggregate count for the emoji */
     char     emoji[40];    /* REACTION: the emoji */
@@ -102,6 +119,7 @@ enum {
     OC_CMD_CHANGE_PASSWORD, /* change your own password: body=old, body2=new */
     OC_CMD_MARK_READ,       /* CLIENT_ACK: read `channel_id` up to `message_id` (drives seen-by) */
     OC_CMD_STORAGE_STATUS,  /* ask for the storage usage report (owner/admin) */
+    OC_CMD_AUDIT_QUERY,     /* page the audit log (owner/admin): message_id = before_ms */
     OC_CMD_SET_ROLE,        /* set a user's tenant role: channel_id = user_id, op = role */
     OC_CMD_INVITE_USER,     /* mint a tenant invite token: op = role */
     OC_CMD_REMOVE_USER,     /* remove/disable a user: channel_id = user_id */

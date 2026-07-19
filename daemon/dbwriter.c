@@ -78,6 +78,70 @@ static uint64_t dbw_now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
+/* --- audit log (REQ-251, ARCH-79) ----------------------------------------- */
+
+/* Append one audit entry. Best-effort by design: auditing must never fail the
+ * action it describes — a full disk should not make role changes impossible —
+ * so errors are swallowed. Writer thread only, so entries inherit the same
+ * single-writer ordering as the data they describe.
+ *
+ * `detail` must never carry the secret involved (ARCH-79): that a password
+ * changed, never the password. */
+static void audit_log(sqlite3 *db, int family, const char *action,
+                      uint64_t actor_id, const char *actor_name,
+                      uint64_t target_id, const char *target,
+                      int outcome, const char *detail) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO audit_log(at_ms, family, action, actor_id, actor_name,"
+            " target_id, target, outcome, detail) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+    sqlite3_bind_int(st, 2, family);
+    sqlite3_bind_text(st, 3, action, -1, SQLITE_TRANSIENT);
+    if (actor_id) sqlite3_bind_int64(st, 4, (sqlite3_int64)actor_id);
+    else          sqlite3_bind_null(st, 4);
+    if (actor_name) sqlite3_bind_text(st, 5, actor_name, -1, SQLITE_TRANSIENT);
+    else            sqlite3_bind_null(st, 5);
+    if (target_id) sqlite3_bind_int64(st, 6, (sqlite3_int64)target_id);
+    else           sqlite3_bind_null(st, 6);
+    if (target) sqlite3_bind_text(st, 7, target, -1, SQLITE_TRANSIENT);
+    else        sqlite3_bind_null(st, 7);
+    sqlite3_bind_int(st, 8, outcome ? 1 : 0);
+    if (detail) sqlite3_bind_text(st, 9, detail, -1, SQLITE_TRANSIENT);
+    else        sqlite3_bind_null(st, 9);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+/* Resolve a user's display name for denormalizing into an entry, so the log
+ * still reads sensibly after the user is removed. */
+static char *audit_name_of(sqlite3 *db, uint64_t uid) {
+    if (!uid) return NULL;
+    sqlite3_stmt *st = NULL;
+    char *out = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT COALESCE(display_name, subject) FROM users WHERE id=?;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *v = (const char *)sqlite3_column_text(st, 0);
+            if (v) out = strdup(v);
+        }
+        sqlite3_finalize(st);
+    }
+    return out;
+}
+
+/* Convenience: log with the actor's name looked up. */
+static void audit_actor(sqlite3 *db, int family, const char *action,
+                        uint64_t actor_id, uint64_t target_id, const char *target,
+                        int outcome, const char *detail) {
+    char *nm = audit_name_of(db, actor_id);
+    audit_log(db, family, action, actor_id, nm, target_id, target, outcome, detail);
+    free(nm);
+}
+
+
 /* --- Job / result allocation ------------------------------------------- */
 
 oc_job *oc_job_new(int type, uint64_t conn_id) {
@@ -165,6 +229,11 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->storage_key);
     for (size_t i = 0; i < r->n_reclaim; i++) free(r->reclaim[i].storage_key);
     free(r->reclaim);
+    for (size_t i = 0; i < r->n_audit; i++) {
+        free(r->audit[i].actor_name); free(r->audit[i].action);
+        free(r->audit[i].target);     free(r->audit[i].detail);
+    }
+    free(r->audit);
     free(r->filename);
     free(r->mime);
     for (size_t i = 0; i < r->n_whlist; i++) free(r->whlist[i].label);
@@ -494,6 +563,11 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         uint64_t now = dbw_now_ms();
         if (oc_ratelimit_blocked(w->auth_rl, acct, now) ||
             (has_src && oc_ratelimit_blocked(w->source_rl, j->source, now))) {
+            /* Throttled attempts are dropped SILENTLY and are deliberately not
+             * audited (REQ-251b). Logging them would hand an attacker the very
+             * amplification the limiter exists to remove: one packet, one row.
+             * The failures that got far enough to be checked are logged below,
+             * and the limiter caps those at 5/min/account and 20/min/source. */
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_RATE_LIMITED; return r;
         }
         uid = verify_local(db, (const char *)user.ptr, user.len,
@@ -501,6 +575,12 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         if (uid == 0) {
             oc_ratelimit_record(w->auth_rl, acct, now);
             if (has_src) oc_ratelimit_record(w->source_rl, j->source, now);
+            /* The attempted username and source, never the attempted password
+             * (ARCH-79). Bounded by the limiter above — a throttled attempt has
+             * already returned — so a spray yields a handful of rows per window
+             * rather than one per packet. */
+            audit_log(db, OC_AUDIT_SECURITY, "auth.failed", 0, NULL, 0, acct, 0,
+                      j->source[0] ? j->source : NULL);
         } else {
             /* Success clears the account counter; the source counter is left so a
              * single success can't reset an in-progress account-spray. */
@@ -570,6 +650,9 @@ static oc_dbres *process_set_role(sqlite3 *db, const oc_job *j) {
     }
     uint8_t next = j->role;
     if (!oc_role_can_set_role(actor_role, target_cur, next)) {
+        /* A denied privileged action is exactly what an audit log is for. */
+        audit_actor(db, OC_AUDIT_SECURITY, "role.change.denied", j->user_id,
+                    j->target_user_id, NULL, 0, "insufficient privilege");
         r->type = OC_RES_SETROLE_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
     /* ≥1-owner invariant: refuse demoting the tenant's last owner. */
@@ -586,6 +669,8 @@ static oc_dbres *process_set_role(sqlite3 *db, const oc_job *j) {
     if (rc != SQLITE_DONE) {
         r->type = OC_RES_SETROLE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
+    audit_actor(db, OC_AUDIT_ADMIN, "role.change", j->user_id,
+                j->target_user_id, u8_to_role(next), 1, NULL);
     r->type = OC_RES_SETROLE_OK;
     r->user_id = j->target_user_id;
     r->role = next;
@@ -620,6 +705,8 @@ static oc_dbres *process_logout(sqlite3 *db, const oc_job *j) {
     }
     sqlite3_step(st);
     sqlite3_finalize(st);
+    audit_actor(db, OC_AUDIT_SECURITY, "session.revoke", j->user_id, 0,
+                j->scope == OC_LOGOUT_ALL ? "all" : "this", 1, NULL);
     r->type = OC_RES_LOGOUT_OK;
     return r;
 }
@@ -701,6 +788,8 @@ static oc_dbres *process_invite_user(sqlite3 *db, const oc_job *j) {
     if (mint_invite(db, j->user_id, want, token, &expiry) != 0) {
         r->type = OC_RES_INVITE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
+    audit_actor(db, OC_AUDIT_ADMIN, "user.invite", j->user_id, 0,
+                u8_to_role(j->role), 1, NULL);
     r->type = OC_RES_INVITE_OK;
     memcpy(r->session_token, token, OC_INVITE_TOKEN_LEN);  /* carries the invite token */
     r->session_expiry = expiry;
@@ -874,6 +963,8 @@ static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
+    audit_actor(db, OC_AUDIT_ADMIN, "user.remove", j->user_id,
+                j->target_user_id, NULL, 1, NULL);
     r->type = OC_RES_USER_UPDATED;
     r->user_id = j->target_user_id;
     r->role = target_role;
@@ -1209,6 +1300,13 @@ static oc_dbres *process_delete(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
     sqlite3_step(st);
     sqlite3_finalize(st);
+
+    /* Only a MODERATOR delete is auditable governance; a user removing their
+     * own message is ordinary use and would drown the log (REQ-032 already
+     * distinguishes the two via deleted_by). */
+    if (author != j->user_id)
+        audit_actor(db, OC_AUDIT_MODERATION, "message.delete", j->user_id,
+                    j->message_id, NULL, 1, "moderator delete");
 
     r->type = OC_RES_DELETE_OK;
     r->author_id = author;
@@ -2193,6 +2291,12 @@ static oc_dbres *process_create_webhook(sqlite3 *db, const oc_job *j) {
 
     r->type = OC_RES_WEBHOOK_CREATED;
     r->message_id = (uint64_t)sqlite3_last_insert_rowid(db);  /* webhook id */
+    /* AFTER last_insert_rowid is read: audit_log INSERTs a row of its own, which
+     * would otherwise become "the last inserted row" and hand the caller the
+     * audit entry's id instead of the webhook's. Any audit call placed near an
+     * INSERT whose generated id is still needed has to come after that read. */
+    audit_actor(db, OC_AUDIT_ADMIN, "webhook.create", j->user_id,
+                r->message_id, NULL, 1, NULL);
     memcpy(r->session_token, token, sizeof token);            /* raw token, shown once */
     return r;
 }
@@ -2300,6 +2404,8 @@ static oc_dbres *process_delete_webhook(sqlite3 *db, const oc_job *j) {
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    audit_actor(db, OC_AUDIT_ADMIN, "webhook.delete", j->user_id,
+                j->message_id, NULL, 1, NULL);   /* webhook id rides message_id */
     r->type = OC_RES_WEBHOOK_DELETED;
     r->message_id = j->message_id;   /* echo the removed id */
     return r;
@@ -2549,12 +2655,15 @@ static oc_dbres *process_change_password(sqlite3 *db, const oc_job *j) {
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) return profile_err(j, OC_ERR_INTERNAL);
+    /* Never the password itself — only that it changed (ARCH-79). */
+    audit_actor(db, OC_AUDIT_ACCOUNT, "password.change", j->user_id, 0, NULL, 1, NULL);
     return profile_ok(j, lookup_display_name(db, j->user_id));
 }
 
 /* Read-only query jobs run on the reader connection (ARCH-66), off the writer
  * thread, so a heavy search/backfill can't stall message sends or auth. */
 static oc_dbres *process_storage_status(sqlite3 *db, const oc_job *j);
+static oc_dbres *process_audit_query(sqlite3 *db, const oc_job *j);
 
 static int is_read_job(int type) {
     return type == OC_JOB_BACKFILL || type == OC_JOB_SEARCH ||
@@ -2564,7 +2673,8 @@ static int is_read_job(int type) {
            type == OC_JOB_LIST_WEBHOOKS || type == OC_JOB_LIST_NOTIFY_PREFS ||
            type == OC_JOB_LIST_CLIENT_SETTINGS ||
            type == OC_JOB_CALL_AUTH ||
-           type == OC_JOB_STORAGE_STATUS;
+           type == OC_JOB_STORAGE_STATUS ||
+           type == OC_JOB_AUDIT_QUERY;
 }
 
 /* Dispatch a read-only job against `rdb`. */
@@ -2578,6 +2688,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_TYPING)         return process_typing(rdb, j);
     if (j->type == OC_JOB_ATTACH_LOOKUP)  return process_attach_lookup(rdb, j);
     if (j->type == OC_JOB_STORAGE_STATUS) return process_storage_status(rdb, j);
+    if (j->type == OC_JOB_AUDIT_QUERY)    return process_audit_query(rdb, j);
     if (j->type == OC_JOB_LIST_WEBHOOKS)  return process_list_webhooks(rdb, j);
     if (j->type == OC_JOB_LIST_NOTIFY_PREFS) return process_list_notify_prefs(rdb, j);
     if (j->type == OC_JOB_LIST_CLIENT_SETTINGS) return process_list_client_settings(rdb, j);
@@ -2678,6 +2789,81 @@ static oc_dbres *process_storage_status(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+
+
+/* Read a page of the audit log, newest first (REQ-251). Paging is by
+ * `audit_before_ms` rather than an offset so a page boundary stays stable while
+ * new entries arrive. Authorization is on the CURRENT role, like the storage
+ * report, so a demotion takes effect mid-session. */
+static oc_dbres *process_audit_query(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->type = OC_RES_AUDIT_PAGE;
+    r->conn_id = j->conn_id;
+
+    uint8_t role = OC_ROLE_MEMBER;
+    if (!user_role(db, j->user_id, &role) || !oc_role_can_manage_members(role)) {
+        r->type = OC_RES_AUDIT_ERR;
+        r->err_code = OC_ERR_FORBIDDEN;
+        return r;
+    }
+
+    uint32_t lim = j->audit_limit ? j->audit_limit : 50;
+    if (lim > 200) lim = 200;
+    r->audit = calloc(lim, sizeof *r->audit);
+    if (!r->audit) { r->type = OC_RES_AUDIT_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT at_ms, family, action, actor_id, actor_name, target_id, target,"
+            " outcome, detail FROM audit_log "
+            "WHERE (?1 = 0 OR at_ms < ?1) ORDER BY at_ms DESC, id DESC LIMIT ?2;",
+            -1, &st, NULL) != SQLITE_OK) {
+        r->type = OC_RES_AUDIT_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+    }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->audit_before_ms);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)lim);
+    while (sqlite3_step(st) == SQLITE_ROW && r->n_audit < lim) {
+        oc_audit_row *a = &r->audit[r->n_audit];
+        a->at_ms     = (uint64_t)sqlite3_column_int64(st, 0);
+        a->family    = (uint8_t)sqlite3_column_int(st, 1);
+        const char *v;
+        v = (const char *)sqlite3_column_text(st, 2); a->action     = v ? strdup(v) : NULL;
+        a->actor_id  = (uint64_t)sqlite3_column_int64(st, 3);
+        v = (const char *)sqlite3_column_text(st, 4); a->actor_name = v ? strdup(v) : NULL;
+        a->target_id = (uint64_t)sqlite3_column_int64(st, 5);
+        v = (const char *)sqlite3_column_text(st, 6); a->target     = v ? strdup(v) : NULL;
+        a->outcome   = (uint8_t)sqlite3_column_int(st, 7);
+        v = (const char *)sqlite3_column_text(st, 8); a->detail     = v ? strdup(v) : NULL;
+        r->n_audit++;
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* Age out audit entries, PER FAMILY (REQ-251b). A single global cap would let an
+ * attacker who can generate failed logins flood the table and push older
+ * administrative entries past the limit — the audit trail becomes a way to erase
+ * evidence. Each family is pruned against its own age budget instead, so
+ * security noise can only evict security noise. */
+static void prune_audit(sqlite3 *db, uint64_t max_age_ms) {
+    if (!max_age_ms) return;
+    uint64_t now = dbw_now_ms();
+    uint64_t cutoff = (now > max_age_ms) ? now - max_age_ms : 0;
+    static const int FAMILIES[] = { OC_AUDIT_ADMIN, OC_AUDIT_ACCOUNT,
+                                    OC_AUDIT_SECURITY, OC_AUDIT_MODERATION };
+    for (size_t i = 0; i < sizeof FAMILIES / sizeof FAMILIES[0]; i++) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db,
+                "DELETE FROM audit_log WHERE family=?1 AND at_ms < ?2;",
+                -1, &st, NULL) != SQLITE_OK) continue;
+        sqlite3_bind_int(st, 1, FAMILIES[i]);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)cutoff);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+}
+
 /* --- storage maintenance (REQ-213/215/217, ARCH-78) ----------------------- */
 
 /* Append one row to the reclaim list, tombstoning it in the same step. Returns 1
@@ -2723,6 +2909,9 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
 
     uint64_t now = dbw_now_ms();
     sqlite3_stmt *st = NULL;
+
+    /* Age out the audit log alongside the blobs (REQ-251a), per family. */
+    prune_audit(db, j->audit_max_age_ms);
 
     /* Tier 1 (REQ-213): orphans — uploaded but never referenced by a message,
      * and old enough that an in-flight upload cannot be caught by mistake. This

@@ -584,6 +584,7 @@ static void draw_help(int W, int H) {
         "Files, webhooks, admin:",
         "  /upload <path>  /download <id>  /webhook  /invite  /role  /remove",
         "  /storage — disk usage, retention policy, what was reclaimed (admin)",
+        "  /audit — role changes, invites, revocations, failed logins (admin)",
         "Workspaces:",
         "  ^W or /workspaces — switch, add, or forget (d) a workspace",
         "Session:",
@@ -646,7 +647,7 @@ static int ci_prefix(const char *s, const char *pre) {
 static const char *AC_COMMANDS[] = {
     "/react", "/reactions", "/edit", "/delete", "/thread", "/search", "/close",
     "/create", "/join", "/leave", "/list", "/dm", "/who", "/away", "/online",
-    "/prefs", "/notify", "/dnd", "/set", "/profile", "/nick", "/passwd", "/workspaces", "/storage",
+    "/prefs", "/notify", "/dnd", "/set", "/profile", "/nick", "/passwd", "/workspaces", "/storage", "/audit",
     "/role", "/invite", "/remove", "/webhook",
     "/upload", "/download", "/logout", "/help",
 };
@@ -945,6 +946,7 @@ static const struct { const char *cmd; const char *desc; int arg; } PAL_CMDS[] =
     {"/set","synced pref (mouse/members/time/…)",1},
     {"/workspaces","switch workspace (^W)",0},
     {"/storage","server storage usage (admin)",0},
+    {"/audit","admin + security audit log",0},
     {"/profile","your identity (name/role/id)",0}, {"/nick","change your display name",1},
     {"/passwd","change your password",1}, {"/role","set a user's role",1},
     {"/invite","mint an invite token",0}, {"/remove","remove a user",1}, {"/webhook","channel webhooks",0},
@@ -1075,6 +1077,49 @@ static void draw_storage(const oc_model *m, int W, int H) {
      * notice that the daemon deleted files nobody approved individually. */
     draw_clip(x + 2, row++, x + bw - 1, l,
               s->rec_evicted ? (TB_RED | TB_BOLD) : TB_DEFAULT, TB_DEFAULT);
+    tb_present();
+}
+
+
+/* The /audit overlay (REQ-251): administrative and security-relevant actions,
+ * newest first. Owner/admin only — a member's request is refused server-side.
+ * Denied and failed entries are drawn in red, since those are what an operator
+ * is usually scanning for. */
+static void draw_audit(const oc_model *m, int W, int H) {
+    int bw = 92; if (bw > W - 4) bw = W - 4; if (bw < 40) bw = 40;
+    int bh = H - 4; if (bh < 8) bh = 8; if (bh > H - 2) bh = H - 2;
+    int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
+    for (int j = 0; j < bh; j++) fill_row(y + j, x, x + bw, TB_DEFAULT);
+    draw_panel(x, y, bw, bh, "Audit log  \xc2\xb7  newest first  \xc2\xb7  any key to close", 1);
+
+    if (!m->n_audit) {
+        draw_clip(x + 2, y + 1, x + bw - 1,
+                  m->audit_open ? "(no entries, or you are not an admin)" : "",
+                  TB_BLACK | TB_BOLD, TB_DEFAULT);
+        tb_present();
+        return;
+    }
+    static const char *FAM[] = { "?", "admin", "account", "security", "moder" };
+    int rows = bh - 2;
+    for (int i = 0; i < rows && (size_t)i < m->n_audit; i++) {
+        const oc_audit_view *a = &m->audit[i];
+        char when[32];
+        time_t t = (time_t)(a->at_ms / 1000);
+        struct tm tmv;
+        localtime_r(&t, &tmv);
+        strftime(when, sizeof when, g_cfg && g_cfg->time_24h ? "%m-%d %H:%M" : "%m-%d %I:%M%p", &tmv);
+
+        char line[256];
+        const char *fam = (a->family <= 4) ? FAM[a->family] : "?";
+        snprintf(line, sizeof line, "%-12s %-8s %-22.22s %-14.14s %-16.16s %s",
+                 when, fam, a->action,
+                 a->actor_name[0] ? a->actor_name : "-",
+                 a->target[0] ? a->target : "-",
+                 a->detail);
+        /* A denial or failure is the interesting case; make it findable. */
+        draw_clip(x + 2, y + 1 + i, x + bw - 1, line,
+                  a->outcome ? TB_DEFAULT : (TB_RED | TB_BOLD), TB_DEFAULT);
+    }
     tb_present();
 }
 
@@ -1842,6 +1887,7 @@ int main(int argc, char **argv) {
     int scroll = 0;
     int switcher_open = 0, wsel = 0;          /* workspace switcher (^W) */
     int storage_open = 0;                     /* /storage overlay (REQ-214) */
+    int audit_open = 0;                       /* /audit overlay (REQ-251) */
     int help_open = 0;
     int profile_open = 0;                     /* /profile identity modal */
     int ac_idx = 0;                           /* autocomplete cycle index */
@@ -1914,6 +1960,7 @@ int main(int argc, char **argv) {
         if (profile_open) draw_profile(oc_client_model(cl), tb_width(), tb_height());
         if (switcher_open) draw_switcher(wsel);
         if (storage_open) draw_storage(oc_client_model(cl), tb_width(), tb_height());
+        if (audit_open) draw_audit(oc_client_model(cl), tb_width(), tb_height());
 
         struct tb_event ev;
         int rc = tb_peek_event(&ev, 30);
@@ -1987,6 +2034,11 @@ int main(int argc, char **argv) {
                 msg_sel = -1; panel = 0; editing = 0;
                 remember_workspace(g_ws[g_active].key, NULL, NULL);   /* bump last-used */
             }
+            continue;
+        }
+        if (audit_open) {                      /* audit overlay: any key closes */
+            if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
+            else audit_open = 0;
             continue;
         }
         if (storage_open) {                    /* storage overlay: any key closes */
@@ -2144,6 +2196,10 @@ int main(int argc, char **argv) {
                 uint64_t cid = mm->channels[focus].channel_id;
                 if (strcmp(composer, "/help") == 0)           { help_open = 1; }
                 else if (strcmp(composer, "/profile") == 0)   { profile_open = 1; }
+                else if (strcmp(composer, "/audit") == 0) {
+                    oc_client_audit_query(cl, 0);   /* newest page; refused for a member */
+                    audit_open = 1;
+                }
                 else if (strcmp(composer, "/storage") == 0) {
                     oc_client_storage_status(cl);   /* refuses for a member */
                     storage_open = 1;
