@@ -228,8 +228,17 @@ model; translate input to intents }, stop.
 
   With attachments surfaced, **every engine feature now on the wire is reachable
   from the TUI**; the remaining client work is the later native GUIs.
-- **Windows (later):** Win32/WinUI (C++/WinRT or C#) over the C core.
-- **macOS/iOS (later):** AppKit/UIKit (Swift) over the core.
+- **Windows (next):** **Win32 + comctl32 in pure C** over the core — no WinUI,
+  no .NET, no cross-platform toolkit (ARCH-80). Preceded by a **Windows TUI**
+  that validates the core port — pthreads, DNS SRV, sockets — before the GUI
+  (ARCH-81); note termbox2 has no native Windows backend, so that TUI needs a
+  Console-API terminal layer built first.
+- **Linux GUI (later):** **GTK in pure C** — GTK is the native Linux toolkit and
+  a C library (ARCH-80). Distributed as an AppImage/Flatpak, not a static binary
+  (GTK cannot cleanly static-link).
+- **macOS/iOS (later):** AppKit/UIKit over the core. **Objective-C, not pure C** —
+  there is no C-native GUI on modern macOS (ARCH-80); Obj-C is a C superset, so
+  the UI shell calls the core with no FFI.
 - **Android (later):** Android views (Kotlin) over the core.
 - **Web (later):** a DOM UI — WASM can't use native desktop widgets; the core
   compiles to WASM and drives a JS/TS view.
