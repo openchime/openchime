@@ -60,7 +60,7 @@ endif
 TUI_INC   := $(CORE_INC) -Iclient/tui -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
-.PHONY: all test integration core tui bench clean s3-smoke windows-tui
+.PHONY: all test integration core tui bench clean s3-smoke windows-tui windows-gui
 
 all: $(BIN)
 
@@ -142,6 +142,23 @@ $(WIN_TUI_BIN): $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(STORE_DEPS) $
 	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result $(WIN_INC) \
 	    $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(UTF8PROC) $(SQLITE_SRC) \
 	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -static -o $@
+
+
+# --- Windows GUI client (ARCH-80) ---------------------------------------------
+# Native Win32 GUI over the shared core; pure C, comctl32 controls. Same core +
+# win mbedTLS + vendored SQLite as the Windows TUI, minus termbox2/utf8proc
+# (GUI, not terminal). -mwindows selects the GUI subsystem (WinMain, no console).
+WIN_GUI_SRC := $(wildcard client/win32/*.c)
+WIN_GUI_BIN := build/openchime-win.exe
+WIN_GUI_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include $(CORE_INC) -Ithird_party/sqlite
+
+windows-gui: $(WIN_GUI_BIN)
+$(WIN_GUI_BIN): $(WIN_GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(SQLITE_SRC) \
+                $(wildcard client/win32/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) | build
+	$(WINCC) $(WIN_CFLAGS) $(WIN_GUI_INC) \
+	    $(WIN_GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(SQLITE_SRC) \
+	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -luser32 -lgdi32 -lcomctl32 \
+	    -mwindows -static -o $@
 
 build:
 	mkdir -p build
