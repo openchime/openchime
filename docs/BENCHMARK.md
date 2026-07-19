@@ -34,8 +34,20 @@ Representative figures (they vary a few KB/ms run to run):
 | RSS per idle authenticated connection | **~50 KB** |
 | 100 idle connections | ~10–12 MB total |
 | 200 idle connections | ~15–18 MB total |
-| Message round-trip (persist + `SEND_ACK`), ~32 concurrent senders | **p50 ~4 ms, p90 ~15–30 ms, p99 ~20–40 ms** |
-| Connection *setup* throughput | **~6–7 logins/sec** (see bottleneck below) |
+| Message round-trip (persist + `SEND_ACK`), 32 concurrent senders | **p50 ~2–3 ms, p90 ~80 ms, p99 ~130 ms** |
+| Connection *setup* throughput | **~2 logins/sec** (see bottleneck below) |
+
+> **Corrected 2026-07-19.** The two figures above were previously recorded as
+> *p99 ~20–40 ms* and *~6–7 logins/sec*. Both were measured against a harness
+> that was silently dropping most of its connections: `bench_load` used a 10 s
+> read timeout while authentication is a 600k-iteration PBKDF2 serialized on the
+> single writer, so a 32-connection burst only ever landed ~10 authenticated
+> clients — and `Scripts/bench.sh` stripped the `connections_ok=` prefix that
+> would have shown it. The latency percentiles were therefore measured at about a
+> third of the intended concurrency, which flattered them by roughly 5×. With the
+> timeout raised so all 32 connect, p99 is ~130 ms. The per-connection memory
+> figure survived the correction largely unchanged (~58–60 KB), because peak RSS
+> had included the connections that later timed out.
 
 The per-connection cost is dominated by the mbedTLS session buffers plus the
 per-connection frame reassembler and output buffer — flat and predictable, with
@@ -140,15 +152,30 @@ Running the storage maintenance pass every 200 ms — 25× more often than the
 
 ## Known harness limitations
 
-**The latency phase measures a fraction of its intended load.** A 32-connection
-burst reliably yields only ~10 authenticated connections, even with a 20-second
-window. Auth is a 600k-iteration PBKDF2 on the single writer (~6–7 logins/s), so
-some queueing is expected — but that alone does not explain the shortfall, and
-the cause is **not yet diagnosed**. The reported latency figures are therefore
-real but drawn from roughly a third of the intended concurrency.
+**Diagnosed and fixed.** The shortfall was `bench_load`'s own 10-second read
+timeout, not a daemon limit. Authentication is a 600k-iteration PBKDF2 that runs
+**serialized on the single writer thread**, measured here at **~2 logins/sec**
+(≈500 ms each — the expected cost of 600k iterations). A burst of N clients
+therefore takes N/2 seconds to drain, so everything past roughly the 20th client
+gave up mid-authentication and was counted as a connection failure.
 
-**This was previously invisible.** `Scripts/bench.sh` piped the result through a
-`sed` that extracted only the `rtt_ms...` portion, hiding the `connections_ok=`
-prefix. Failed connections report `rtt 0.00`, so a degenerate run printed
-`p50=0.00 p90=0.00 p99=0.00` — which reads like an outstanding result rather than
-a broken measurement. The script now prints the whole line.
+The knee is sharp and reproducible: 8/8 and 16/16 connect, 24 drops to 22/24.
+
+Three fixes, all in the harness — the daemon was behaving exactly as designed:
+
+- `bench_load`'s read timeout is now 180 s, so the auth ramp is never the limit.
+- `Scripts/bench.sh` prints the whole result line. It previously piped through a
+  `sed` that kept only `rtt_ms...` and dropped the `connections_ok=` prefix —
+  and failed connections report `rtt 0.00`, so a degenerate run printed
+  `p50=0.00 p90=0.00 p99=0.00`, which reads like an outstanding result rather
+  than no result at all.
+- The memory table now reports **requested vs connected** and divides by the
+  connections that actually established, rather than by the number requested.
+
+**The real constraint this exposes** is that connection setup is bounded at
+~2/sec by design (REQ-191 wants PBKDF2 expensive). A server restart with a few
+hundred clients reconnecting takes minutes to fully re-authenticate them, and
+session-token reconnect (ARCH-58) — which skips PBKDF2 entirely — is what makes
+that tolerable in practice. Worth remembering before quoting a connection-count
+capacity number: the daemon *holds* thousands of connections, but *establishes*
+them at two per second.

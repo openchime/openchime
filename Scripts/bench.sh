@@ -44,15 +44,23 @@ done
 rss_kb() { awk '/^VmRSS:/{print $2}' "/proc/$DAEMON_PID/status" 2>/dev/null || echo 0; }
 BASE=$(rss_kb)
 printf '\nBaseline daemon RSS: %.1f MB\n\n' "$(awk -v k=$BASE 'BEGIN{print k/1024}')"
-printf '%-12s %-14s %-16s\n' "idle_conns" "peak_rss_mb" "kb_per_conn"
-printf '%s\n' "----------------------------------------"
+printf '%s\n' "--------------------------------------------------------"
+printf '%-12s %-12s %-14s %-16s\n' "requested" "connected" "peak_rss_mb" "kb_per_conn"
 for N in "${CONNS[@]}"; do
-  HOLD=$(( N / 5 + 8 ))                       # allow the auth ramp (~6-7 logins/s)
-  ( timeout $((HOLD+15)) ./build/bench_load 127.0.0.1 "$PROTO_PORT" "$N" "$HOLD" 0 "$NUSERS" >/dev/null 2>&1 ) &
+  # Auth is a 600k-iteration PBKDF2 serialized on the writer (~2 logins/s here),
+  # so the ramp is N/2 seconds, not N/5.
+  HOLD=$(( N / 2 + 10 ))
+  OUT="$WORK/idle_$N.txt"
+  ( timeout $((HOLD+120)) ./build/bench_load 127.0.0.1 "$PROTO_PORT" "$N" "$HOLD" 0 "$NUSERS" >"$OUT" 2>&1 ) &
   BP=$!; peak=$BASE
   while kill -0 $BP 2>/dev/null; do r=$(rss_kb); [ "$r" -gt "$peak" ] && peak=$r; sleep 0.3; done
-  printf '%-12s %-14s %-16s\n' "$N" \
-    "$(awk -v k=$peak 'BEGIN{printf "%.1f",k/1024}')" "$(( (peak-BASE)/N ))"
+  # Divide by the connections that ACTUALLY established. Dividing by the
+  # requested count understated per-connection memory by >2x whenever the auth
+  # ramp outran the client timeout.
+  OK=$(sed -n 's/.*connections_ok=\([0-9]*\)\/.*/\1/p' "$OUT"); OK=${OK:-0}
+  if [ "$OK" -gt 0 ]; then PER=$(( (peak-BASE)/OK )); else PER="n/a"; fi
+  printf '%-12s %-12s %-14s %-16s\n' "$N" "$OK" \
+    "$(awk -v k=$peak 'BEGIN{printf "%.1f",k/1024}')" "$PER"
 done
 
 echo

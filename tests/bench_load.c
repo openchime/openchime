@@ -69,7 +69,13 @@ static int client_open(client *c, const char *host, int port) {
     /* Bound every blocking read so a worker can never hang the run (auth does a
      * 600k-iteration PBKDF2 on the daemon's single writer, so AUTH_OK can lag
      * under a connection burst). recv() blocks up to this, so no busy-spin. */
-    { struct timeval tv = { 10, 0 }; setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv); }
+    /* Generous, because AUTH is deliberately expensive: a 600k-iteration PBKDF2
+     * on the single writer thread, serialized across all connections. At ~2
+     * logins/s a burst of N clients takes N/2 seconds to drain, and a 10s
+     * timeout silently capped usable concurrency at ~20 — every connection past
+     * that gave up mid-auth and was counted as a failure, which then skewed the
+     * per-connection memory figure it was feeding. */
+    { struct timeval tv = { 180, 0 }; setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv); }
     if (oc_tls_client_init(&c->cli, NULL) != 0) return -1;
     if (oc_tls_conn_init(&c->conn, &c->cli.conf, c->fd) != 0) return -1;
     if (handshake_blocking(&c->conn) != OC_TLS_OK) return -1;
