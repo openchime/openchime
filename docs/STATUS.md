@@ -121,7 +121,6 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 216 refuse uploads below the floor | ✅ | **Built**: `UPLOAD_BEGIN` is rejected with `OC_ERR_STORAGE_FULL` when free space is under the reserve — at declaration, before a byte moves, off the cached sample so it costs no syscall. |
 | 217 max attachment age | ✅ | **Built**: `OPENCHIME_ATTACH_MAX_AGE_DAYS` (default 0 = keep forever). Expiry runs every pass regardless of pressure, tombstoning as 215 does. Headless-tested that a 90-day-old attachment expires under a 30-day policy while a 2-day-old one does not. |
 | 218 periodic maintenance pass | ✅ | **Built** (`maybe_run_maintenance`): runs off the net loop's 500 ms tick, gated to `OPENCHIME_MAINT_INTERVAL_MS` (default 5 min), so a quiet box is maintained too — deliberately unlike `maybe_prune_idem`, which only fires when writes happen. Work splits by thread: the writer selects and tombstones rows, the transfer pool deletes bytes (it can block on S3). Bounded by `OPENCHIME_MAINT_BATCH` (default 64) per pass. |
-| 218 periodic maintenance pass | ⛔ | Specified (ARCH-78). **The reusable pattern already exists** — `maybe_prune_idem` (ARCH-44) is age-gated pruning with a configurable window — but it piggybacks on writes, so it would never fire on the idle tenant that most needs it. The new pass hangs off the net loop's 500 ms tick instead. Migration 0009's index was already written for "the orphan sweep of pending rows", which was never built. |
 
 ---
 
