@@ -115,9 +115,18 @@ client plan was superseded by the shared-core + native-UI-per-platform model
 
 ## 7. Planned — not yet a dependency
 
-- **libopus** — Opus encode/decode for the deferred **audio client**
-  (REQ-150/151). BSD-3-Clause. Not yet linked; the server-relayed audio path
-  carries opaque Opus payloads and does not link libopus.
+- **libopus** — Opus encode/decode for the **audio client** (REQ-150/151).
+  BSD-3-Clause. Not yet linked; the server-relayed audio path carries opaque
+  Opus payloads and does not link libopus (ARCH-73). Client-side only.
+- **miniaudio** — planned single-header device I/O (capture + playback) for the
+  audio client, wrapping ALSA/PulseAudio/PipeWire/CoreAudio/WASAPI.
+  MIT-0/public-domain, vendored like termbox2/utf8proc/jsmn (ARCH-75). Chosen
+  for its **duplex** mode, which AUDIO.md §2 requires so capture and playback
+  share one clock. Not yet vendored.
+- **speexdsp** — planned acoustic echo canceller (`speex_echo_state`) for the
+  audio client, BSD-3-Clause, behind the processor vtable in AUDIO.md §3.3 so it
+  is swappable. Not yet vendored. See AUDIO.md §6.2 for why it is preferred over
+  WebRTC AEC3 as a first implementation despite being the weaker canceller.
 
 ---
 

@@ -460,6 +460,8 @@ the requirement says so explicitly rather than implying one.
 
 ### 6.2 Audio Conferencing
 
+*Design: [AUDIO.md](./AUDIO.md).*
+
 - **REQ-150.** A user has been able to start or join a server-relayed audio
   call scoped to a channel or a direct message. No peer-to-peer or ICE
   negotiation path has existed (ARCH-18). Built (server side): `CALL_JOIN`

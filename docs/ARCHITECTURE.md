@@ -124,7 +124,7 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 - **ARCH-15 (Search):** FTS5 full-text search, positioned as a competitive wedge against Slack's history caps.
 - **ARCH-16 (Notifications delivery):** Push via APNs/FCM. The published mobile clients are signed under the project's Apple/Google developer accounts, so only the project can mint valid APNs/FCM credentials for them — which makes push delivery a **federated service** (ARCH-76) rather than something a self-hoster can stand up alone. Consequently **push is available in the self-hosted federated and hosted models and is absent in self-hosted stand-alone**, where mobile clients fall back to in-app/foreground notification. The gateway learns *that* a notification is due and for whom, never message content (the ARCH-76 invariant). Concrete design is deferred: REQ-132/133.
 - **ARCH-17 (Attachments):** Via object storage.
-- **ARCH-18 (Audio conferencing):** Server-relay (no P2P/ICE), Opus codec, delivered as an isolated UDP-based sidecar process rather than embedded in the daemon's TCP loop.
+- **ARCH-18 (Audio conferencing):** Server-relay (no P2P/ICE), Opus codec, delivered as an isolated UDP-based sidecar process rather than embedded in the daemon's TCP loop. The full design — the huddle model, client-side mixing (forced by the server never decoding), the duplex audio engine, and acoustic echo cancellation — is [AUDIO.md](./AUDIO.md).
 - **ARCH-31 (Audio sidecar IPC):** The daemon and the audio sidecar process (ARCH-18, ARCH-28) communicate over a Unix domain socket — native POSIX IPC via the same `socket()` API already used for TCP, no extra library, no network exposure.
 
 ## HTTP and Webhooks

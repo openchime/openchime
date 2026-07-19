@@ -28,7 +28,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
 core messaging path), [docs/SCHEMA.md](docs/SCHEMA.md) (the SQLite schema and
 migration mechanism), [docs/TLS.md](docs/TLS.md) (the mbedTLS-based transport
 and TOFU trust model), [docs/AUTH.md](docs/AUTH.md) (the two-mode
-authentication design), [docs/CLIENT.md](docs/CLIENT.md) (the native client
+authentication design), [docs/AUDIO.md](docs/AUDIO.md) (the huddle model, media
+path, and echo cancellation), [docs/CLIENT.md](docs/CLIENT.md) (the native client
 architecture), [docs/TESTING.md](docs/TESTING.md) (the unit +
 integration test strategy), and [docs/VENDORS.md](docs/VENDORS.md) (every
 third-party dependency, with source, version pinning, and license) for the

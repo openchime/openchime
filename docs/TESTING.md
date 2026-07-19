@@ -208,7 +208,14 @@ Jobs:
   manual steps in the README's "Verify" section.
 
 Everything runs non-interactively and communicates pass/fail purely through
-exit codes, so no scenario depends on a human reading output. New unit test
+exit codes, so no scenario depends on a human reading output.
+
+**Audio (AUDIO.md §6.4).** Echo cancellation is testable with no hardware: a
+synthetic room impulse response convolved with a far-end signal produces a known
+"echo", near-end speech is mixed in, and the harness measures **ERLE** (dB of
+echo removed). Clock drift is injected by resampling one side. This keeps a
+notoriously subjective component on the same footing as everything else here —
+a number in `make test` rather than someone listening and forming an opinion. New unit test
 binaries are added to the `build` job's `make test`; new socket-level
 integration scenarios join the `integration` job once the client-TLS decision
 (§3.1) is settled.
