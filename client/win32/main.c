@@ -25,6 +25,7 @@
 #include "model.h"
 #include "resolve.h"
 #include "chat.h"
+#include "oc_port.h"    /* oc_mkdir */
 
 /* Control ids */
 enum { ID_WS = 100, ID_USER, ID_PASS, ID_CONNECT, ID_STATUS };
@@ -55,6 +56,22 @@ static int resolve_target(const char *ws, char *host, size_t hostcap, int *port)
     return 0;
 }
 
+/* Resolve the local session store: %LOCALAPPDATA%\openchime\state.db (creating
+ * the dir), so a relaunch reconnects silently with the persisted token instead
+ * of the password (REQ-100), matching the TUI. NULL if there's nowhere to put
+ * it — persistence is then simply disabled and the client still runs. */
+static const char *store_path(void) {
+    const char *base = getenv("LOCALAPPDATA");
+    if (!base || !base[0]) base = getenv("APPDATA");
+    if (!base || !base[0]) return NULL;
+    static char path[1024];
+    char dir[900];
+    snprintf(dir, sizeof dir, "%s\\openchime", base);
+    oc_mkdir(dir);
+    snprintf(path, sizeof path, "%s\\state.db", dir);
+    return path;
+}
+
 static void do_connect(HWND hwnd) {
     if (g_client) { set_status("already connecting"); return; }
 
@@ -74,9 +91,10 @@ static void do_connect(HWND hwnd) {
     char cred[264];
     snprintf(cred, sizeof cred, "%s:%s", user, pass);
 
-    /* Store/keyring are NULL for this first pass — no persistence yet, matching
-     * the "basic, get to login" scope. */
-    g_client = oc_client_start_secure(host, port, cred, NULL, NULL);
+    /* Persist the session token to a local SQLite store so a relaunch reconnects
+     * silently (REQ-100). Keyring is NULL — the Windows keyring (Credential
+     * Manager) backend isn't wired yet, so the token lives in the store file. */
+    g_client = oc_client_start_secure(host, port, cred, store_path(), NULL);
     if (!g_client) { set_status("failed to start client"); return; }
 
     EnableWindow(g_hconnect, FALSE);
