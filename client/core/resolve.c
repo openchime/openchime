@@ -3,6 +3,7 @@
  */
 
 #include "resolve.h"
+#include "sock.h"      /* oc_sock_startup: getaddrinfo needs WSAStartup on Windows */
 
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -134,6 +135,7 @@ static int host_resolves(const char *domain) {
 
 oc_resolve_status oc_resolve(const char *workspace, const char *suffix, oc_endpoint *out) {
     if (!out) return OC_RESOLVE_BAD_WORKSPACE;
+    oc_sock_startup();   /* idempotent; on Windows getaddrinfo fails until WSAStartup */
     char domain[256];
     if (oc_resolve_domain(workspace, suffix, domain, sizeof domain) != 0)
         return OC_RESOLVE_BAD_WORKSPACE;
