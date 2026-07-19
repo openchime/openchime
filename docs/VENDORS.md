@@ -118,6 +118,7 @@ client plan was superseded by the shared-core + native-UI-per-platform model
 - **libopus** — Opus encode/decode for the **audio client** (REQ-150/151).
   BSD-3-Clause. Not yet linked; the server-relayed audio path carries opaque
   Opus payloads and does not link libopus (ARCH-73). Client-side only.
+- **SQLite (amalgamation)** — vendored `third_party/sqlite/sqlite3.{c,h}` (v3.46.1, public domain) for the **Windows client build only**: the client store (`client/core/store.c`) needs SQLite and mingw has no system `-lsqlite3`. The Linux/daemon builds keep using system `-lsqlite3`; this is the same library, amalgamated. Fetched from sqlite.org, committed like the other single-file vendored deps (jsmn/termbox2/utf8proc).
 - **miniaudio** — planned single-header device I/O (capture + playback) for the
   audio client, wrapping ALSA/PulseAudio/PipeWire/CoreAudio/WASAPI.
   MIT-0/public-domain, vendored like termbox2/utf8proc/jsmn (ARCH-75). Chosen

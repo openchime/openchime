@@ -55,6 +55,7 @@
 
 #define OC_TB_IMPL
 #include "tb_compat.h"   /* termbox2 on POSIX, Console-API backend on Windows (ARCH-81) */
+#include "oc_port.h"
 
 #include "utf8proc.h"
 
@@ -226,7 +227,7 @@ static void append_msg_rows(rows_t *r, const oc_msg *m, uint64_t me, int width,
     if (m->server_time) {
         time_t t = (time_t)(m->server_time / 1000);
         struct tm tmv;
-        if (localtime_r(&t, &tmv))
+        if (oc_localtime_r(&t, &tmv))
             strftime(stamp, sizeof stamp, (g_cfg && !g_cfg->time_24h) ? "%I:%M%p" : "%H:%M", &tmv);
     }
     msg_nick(nick, sizeof nick, m, me, ch);
@@ -355,7 +356,7 @@ static void build_search_rows(rows_t *r, const oc_model *m, int width) {
             if (m->channels[j].channel_id == s->channel_id) { cn = m->channels[j].name ? m->channels[j].name : "…"; break; }
         char stamp[8] = "--:--";
         if (s->server_time) { time_t t = (time_t)(s->server_time / 1000); struct tm tv;
-            if (localtime_r(&t, &tv)) strftime(stamp, sizeof stamp, "%H:%M", &tv); }
+            if (oc_localtime_r(&t, &tv)) strftime(stamp, sizeof stamp, "%H:%M", &tv); }
         snprintf(line, sizeof line, "#%s  %s  user%llu:", cn, stamp, (unsigned long long)s->author_id);
         char *hd = malloc(strlen(line) + 1);
         if (hd) { strcpy(hd, line); rows_push(r, hd, TB_CYAN); }
@@ -1117,7 +1118,7 @@ static void draw_audit(const oc_model *m, int W, int H) {
         char when[32];
         time_t t = (time_t)(a->at_ms / 1000);
         struct tm tmv;
-        localtime_r(&t, &tmv);
+        oc_localtime_r(&t, &tmv);
         strftime(when, sizeof when, g_cfg && g_cfg->time_24h ? "%m-%d %H:%M" : "%m-%d %I:%M%p", &tmv);
 
         char line[256];
@@ -1549,9 +1550,9 @@ static const char *resolve_store_path(void) {
     if (!home || !home[0]) return NULL;
     static char path[1200];
     char dir[1024];
-    snprintf(dir, sizeof dir, "%s/.local", home);            mkdir(dir, 0700);
-    snprintf(dir, sizeof dir, "%s/.local/state", home);      mkdir(dir, 0700);
-    snprintf(dir, sizeof dir, "%s/.local/state/openchime", home); mkdir(dir, 0700);
+    snprintf(dir, sizeof dir, "%s/.local", home);            oc_mkdir(dir);
+    snprintf(dir, sizeof dir, "%s/.local/state", home);      oc_mkdir(dir);
+    snprintf(dir, sizeof dir, "%s/.local/state/openchime", home); oc_mkdir(dir);
     snprintf(path, sizeof path, "%s/state.db", dir);
     return path;
 }

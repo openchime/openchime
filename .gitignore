@@ -9,6 +9,7 @@ build/
 !/third_party/jsmn/
 !/third_party/termbox2/
 !/third_party/utf8proc/
+!/third_party/sqlite/
 *.o
 *.db
 *.db-shm

@@ -3,6 +3,7 @@
  */
 
 #include "config.h"
+#include "oc_port.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,16 +25,16 @@ static int config_path(char *out, size_t cap) {
     const char *xdg = getenv("XDG_CONFIG_HOME");
     char dir[900];
     if (xdg && xdg[0]) {
-        mkdir(xdg, 0700);                              /* ensure the base exists */
+        oc_mkdir(xdg);                              /* ensure the base exists */
         snprintf(dir, sizeof dir, "%s/openchime", xdg);
     } else {
         const char *home = getenv("HOME");
         if (!home || !home[0]) return -1;
         char base[700];
-        snprintf(base, sizeof base, "%s/.config", home);   mkdir(base, 0700);
+        snprintf(base, sizeof base, "%s/.config", home);   oc_mkdir(base);
         snprintf(dir, sizeof dir, "%s/.config/openchime", home);
     }
-    mkdir(dir, 0700);
+    oc_mkdir(dir);
     if ((size_t)snprintf(out, cap, "%s/config", dir) >= cap) return -1;
     return 0;
 }

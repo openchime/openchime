@@ -60,7 +60,7 @@ endif
 TUI_INC   := $(CORE_INC) -Iclient/tui -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
-.PHONY: all test integration core tui bench clean s3-smoke
+.PHONY: all test integration core tui bench clean s3-smoke windows-tui
 
 all: $(BIN)
 
@@ -118,6 +118,30 @@ $(TUI_BIN): $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) \
             $(wildcard client/tui/*.h client/core/*.h shared/*.h) $(MBEDTLS_A) | build
 	$(CC) $(CFLAGS) -Wno-unused-result $(INC) $(TUI_INC) $(SECRET_CFLAGS) \
 	    $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(UTF8PROC) $(MBEDTLS_LIBS) -lsqlite3 -lresolv -lpthread $(SECRET_LIBS) -o $@
+
+
+# --- Windows TUI (ARCH-81) ----------------------------------------------------
+# Cross-compiled with mingw-w64 to a standalone .exe. Uses the Windows mbedTLS
+# (third_party/mbedtls-3.6.2-win) and the vendored SQLite amalgamation (mingw has
+# no system sqlite). The termbox2 backend is termbox2_win.c (Console API); the
+# core seams (threads/DNS/RNG) are in shared/oc_thread.h + resolve.c + net.c.
+WINCC     ?= x86_64-w64-mingw32-gcc
+MBEDTLS_WIN := third_party/mbedtls-3.6.2-win
+WIN_MBEDLIBS := $(MBEDTLS_WIN)/library/libmbedtls.a \
+                $(MBEDTLS_WIN)/library/libmbedx509.a \
+                $(MBEDTLS_WIN)/library/libmbedcrypto.a
+SQLITE_SRC := third_party/sqlite/sqlite3.c
+WIN_TUI_BIN := build/openchime-tui.exe
+WIN_CFLAGS := -std=c99 -Wall -Wextra -O2 -D_WIN32_WINNT=0x0601 -DSQLITE_OMIT_LOAD_EXTENSION -DUTF8PROC_STATIC
+WIN_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
+           $(CORE_INC) -Iclient/tui -Ithird_party/termbox2 -Ithird_party/utf8proc -Ithird_party/sqlite
+
+windows-tui: $(WIN_TUI_BIN)
+$(WIN_TUI_BIN): $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(STORE_DEPS) $(SQLITE_SRC) \
+                $(wildcard client/tui/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) | build
+	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result $(WIN_INC) \
+	    $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(UTF8PROC) $(SQLITE_SRC) \
+	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -static -o $@
 
 build:
 	mkdir -p build

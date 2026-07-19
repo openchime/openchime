@@ -47,6 +47,7 @@ typedef struct {
 static struct {
     HANDLE   hin, hout;
     DWORD    old_in_mode, old_out_mode;
+    UINT     old_out_cp;
     int      inited;
     int      w, h;
     tb_cell *back;      /* what tb_set_cell writes */
@@ -141,9 +142,16 @@ int tb_init(void) {
     if (!GetConsoleMode(T.hin, &T.old_in_mode) ||
         !GetConsoleMode(T.hout, &T.old_out_mode)) return TB_ERR;
 
-    /* Output: interpret VT sequences. */
+    /* Output: interpret VT sequences AND decode our byte stream as UTF-8. Both
+     * are needed: VT processing handles the escape sequences, but the console
+     * still decodes the *text* bytes using the output code page — left at the
+     * legacy OEM page, a box-drawing glyph's UTF-8 bytes render as CP437 mojibake
+     * (│ 0xE2 0x94 0x82 shows as "Γöé"). CP_UTF8 makes WriteConsoleA read the
+     * buffer as the UTF-8 we emit. */
+    T.old_out_cp = GetConsoleOutputCP();
+    SetConsoleOutputCP(CP_UTF8);
     DWORD om = T.old_out_mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-    if (!SetConsoleMode(T.hout, om)) return TB_ERR;
+    if (!SetConsoleMode(T.hout, om)) { SetConsoleOutputCP(T.old_out_cp); return TB_ERR; }
 
     /* Input: raw. Crucially clear ENABLE_PROCESSED_INPUT so Ctrl+C / Ctrl+Q are
      * delivered as key events rather than signals, and clear QUICK_EDIT so mouse
@@ -177,6 +185,7 @@ int tb_shutdown(void) {
     outs("\x1b[?1049l");   /* leave alternate screen */
     SetConsoleMode(T.hin, T.old_in_mode);
     SetConsoleMode(T.hout, T.old_out_mode);
+    SetConsoleOutputCP(T.old_out_cp);
     free(T.back);  T.back  = NULL;
     free(T.front); T.front = NULL;
     T.inited = 0;

@@ -12,6 +12,7 @@
 #include "sock.h"       /* POSIX/Winsock shim (also pulls in getaddrinfo) */
 
 #include "oc_thread.h"
+#include "oc_port.h"
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
 #    define WIN32_LEAN_AND_MEAN
@@ -1284,8 +1285,7 @@ static void *net_thread(void *arg) {
         }
         n->reconnect_now = 0;
         for (int s = 0; s < backoff_ms && !n->stop && !n->reconnect_now; s += 50) {
-            struct timespec ts = { 0, 50 * 1000 * 1000 };
-            nanosleep(&ts, NULL);
+            oc_nanosleep(50 * 1000 * 1000);
         }
         n->reconnect_now = 0;
         reconnecting = 1;
