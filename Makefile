@@ -60,7 +60,7 @@ endif
 TUI_INC   := $(CORE_INC) -Iclient/tui -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
-.PHONY: all test integration core tui bench clean
+.PHONY: all test integration core tui bench clean s3-smoke
 
 all: $(BIN)
 
@@ -98,6 +98,13 @@ build/bench_load: tests/bench_load.c $(SHARED_SRC) $(wildcard shared/*.h) $(MBED
 # Standalone compile check for the client app-core (no frontend, no main). The
 # headless test binary (make test) is the real coverage; this just proves the
 # core still compiles on its own against the shared wire code.
+# Manual S3 smoke test (tests/manual/s3_smoke.c) -- NOT part of `make test`.
+# Needs live S3 credentials in the environment; see the header of that file.
+s3-smoke: tests/manual/s3_smoke.c daemon/blobstore.c daemon/blob_s3.c daemon/sigv4.c shared/tls.c $(MBEDTLS_A) | build
+	$(CC) $(CFLAGS) $(INC) tests/manual/s3_smoke.c daemon/blobstore.c \
+	    daemon/blob_s3.c daemon/sigv4.c shared/tls.c $(MBEDTLS_LIBS) -lpthread -o build/s3_smoke
+	@echo "built build/s3_smoke -- needs OPENCHIME_S3_* credentials to run"
+
 core: $(CORE_SRC) $(SHARED_SRC) $(wildcard client/core/*.h shared/*.h) $(MBEDTLS_A) | build
 	mkdir -p build/core
 	for f in $(CORE_SRC); do \
