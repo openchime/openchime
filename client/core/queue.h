@@ -10,13 +10,13 @@
 #ifndef OC_QUEUE_H
 #define OC_QUEUE_H
 
-#include <pthread.h>
+#include "oc_thread.h"
 
 typedef struct oc_qnode { void *item; struct oc_qnode *next; } oc_qnode;
 
 typedef struct {
-    pthread_mutex_t mu;
-    pthread_cond_t  cv;
+    oc_mutex_t mu;
+    oc_cond_t  cv;
     oc_qnode       *head, *tail;
 } oc_queue;
 

@@ -4,11 +4,20 @@
 
 #include "resolve.h"
 
-#include <resolv.h>
-#include <arpa/nameser.h>
-#include <netinet/in.h>
-#include <netdb.h>
-#include <sys/socket.h>
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  include <windns.h>
+#else
+#  include <resolv.h>
+#  include <arpa/nameser.h>
+#  include <netinet/in.h>
+#  include <netdb.h>
+#  include <sys/socket.h>
+#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -34,6 +43,7 @@ int oc_resolve_domain(const char *workspace, const char *suffix, char *out, size
     return 0;
 }
 
+#ifndef _WIN32
 int oc_srv_parse(const unsigned char *answer, int len, char *host, size_t hostcap, int *port) {
     if (!answer || len <= 0 || !host || hostcap == 0 || !port) return -1;
     ns_msg msg;
@@ -60,16 +70,39 @@ int oc_srv_parse(const unsigned char *answer, int len, char *host, size_t hostca
     }
     return found ? 0 : -1;
 }
+#endif /* !_WIN32 */
 
-/* Query SRV for `_openchime._tcp.<domain>`; 0 + host/port on success, -1 else. */
+/* Query SRV for `_openchime._tcp.<domain>`; 0 + host/port on success, -1 else.
+ * POSIX uses res_query + oc_srv_parse; Windows uses DnsQuery, which returns the
+ * SRV records already parsed, so there is no raw answer to hand to oc_srv_parse.
+ * Both pick the lowest-priority (most-preferred) target. */
 static int srv_lookup(const char *domain, char *host, size_t hostcap, int *port) {
     char qname[300];
     if ((size_t)snprintf(qname, sizeof qname, "_openchime._tcp.%s", domain) >= sizeof qname)
         return -1;
+#ifdef _WIN32
+    PDNS_RECORD recs = NULL;
+    if (DnsQuery_A(qname, DNS_TYPE_SRV, DNS_QUERY_STANDARD, NULL, &recs, NULL) != 0)
+        return -1;
+    int found = 0; unsigned best_prio = 0;
+    for (PDNS_RECORD r = recs; r; r = r->pNext) {
+        if (r->wType != DNS_TYPE_SRV) continue;
+        const char *tgt = r->Data.SRV.pNameTarget;
+        if (!tgt || tgt[0] == '\0' || (tgt[0] == '.' && tgt[1] == '\0')) continue;
+        if (!found || r->Data.SRV.wPriority < best_prio) {
+            best_prio = r->Data.SRV.wPriority; found = 1;
+            snprintf(host, hostcap, "%s", tgt);
+            *port = r->Data.SRV.wPort;
+        }
+    }
+    if (recs) DnsRecordListFree(recs, DnsFreeRecordList);
+    return found ? 0 : -1;
+#else
     unsigned char ans[NS_PACKETSZ];
     int len = res_query(qname, ns_c_in, ns_t_srv, ans, sizeof ans);
     if (len <= 0) return -1;
     return oc_srv_parse(ans, len, host, hostcap, port);
+#endif
 }
 
 /* An explicit `:port` on the workspace (after any scheme), or 0 if none. Lets a

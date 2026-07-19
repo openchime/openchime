@@ -11,14 +11,21 @@
 #include "framebuf.h"
 #include "sock.h"       /* POSIX/Winsock shim (also pulls in getaddrinfo) */
 
-#include <pthread.h>
+#include "oc_thread.h"
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#  include <bcrypt.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 struct oc_net {
-    pthread_t     thread;
+    oc_thread_t   thread;
     volatile int  stop;
     volatile int  reconnect_now;   /* set by oc_net_reconnect: cut short the backoff */
     char          host[256];
@@ -61,9 +68,16 @@ static void push_simple(oc_queue *to_ui, int type, uint64_t user_id) {
 }
 
 static void gen_idem(uint8_t out[OC_IDEM_SIZE]) {
+#ifdef _WIN32
+    /* CSPRNG from the OS (bcrypt). Falls back to rand() only if that fails. */
+    if (BCryptGenRandom(NULL, out, OC_IDEM_SIZE, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0)
+        return;
+    for (int i = 0; i < (int)OC_IDEM_SIZE; i++) out[i] = (uint8_t)rand();
+#else
     FILE *f = fopen("/dev/urandom", "rb");
     if (f) { size_t r = fread(out, 1, OC_IDEM_SIZE, f); (void)r; fclose(f); }
     else   { for (int i = 0; i < (int)OC_IDEM_SIZE; i++) out[i] = (uint8_t)rand(); }
+#endif
 }
 
 static int dial(const char *host, int port) {
@@ -1311,7 +1325,7 @@ oc_net *oc_net_start(const char *host, int port, const char *token,
     snprintf(n->client_type, sizeof n->client_type, "%s", "tui");
     n->to_ui = to_ui;
     n->from_ui = from_ui;
-    if (pthread_create(&n->thread, NULL, net_thread, n) != 0) {
+    if (oc_thread_create(&n->thread, net_thread, n) != 0) {
         free(n->token); free(n->store_path); free(n); return NULL;
     }
     return n;
@@ -1330,7 +1344,7 @@ void oc_net_stop(oc_net *n) {
     if (!n) return;
     n->stop = 1;
     oc_queue_push(n->from_ui, oc_cmd_new(OC_CMD_QUIT)); /* wake it promptly */
-    pthread_join(n->thread, NULL);
+    oc_thread_join(n->thread);
     free(n->token);
     free(n->store_path);
     free(n);
