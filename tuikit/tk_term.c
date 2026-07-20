@@ -316,8 +316,10 @@ static int key_event(const KEY_EVENT_RECORD *k, struct tb_event *ev) {
     ev->mod  = mods_of(k->dwControlKeyState);
 
     switch (k->wVirtualKeyCode) {
-    case VK_UP:     ev->key = TB_KEY_ARROW_UP;   return 1;
-    case VK_DOWN:   ev->key = TB_KEY_ARROW_DOWN; return 1;
+    case VK_UP:     ev->key = TB_KEY_ARROW_UP;    return 1;
+    case VK_DOWN:   ev->key = TB_KEY_ARROW_DOWN;  return 1;
+    case VK_LEFT:   ev->key = TB_KEY_ARROW_LEFT;  return 1;
+    case VK_RIGHT:  ev->key = TB_KEY_ARROW_RIGHT; return 1;
     case VK_PRIOR:  ev->key = TB_KEY_PGUP;       return 1;
     case VK_NEXT:   ev->key = TB_KEY_PGDN;       return 1;
     case VK_RETURN: ev->key = TB_KEY_ENTER;      return 1;

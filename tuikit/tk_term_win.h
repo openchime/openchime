@@ -69,6 +69,8 @@ struct tb_event {
 #define TB_KEY_PGDN             (0xffff - 17)
 #define TB_KEY_ARROW_UP         (0xffff - 18)
 #define TB_KEY_ARROW_DOWN       (0xffff - 19)
+#define TB_KEY_ARROW_LEFT       (0xffff - 20)
+#define TB_KEY_ARROW_RIGHT      (0xffff - 21)
 #define TB_KEY_MOUSE_LEFT       (0xffff - 23)
 #define TB_KEY_MOUSE_WHEEL_UP   (0xffff - 27)
 #define TB_KEY_MOUSE_WHEEL_DOWN (0xffff - 28)

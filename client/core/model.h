@@ -63,6 +63,7 @@ typedef struct {
     uint8_t  joined;
     uint8_t  history_requested; /* a backfill has been asked for (once per open) */
     uint8_t  kind;             /* OC_CHANNEL_KIND / _DM */
+    uint8_t  is_public;        /* 1 public, 0 private/DM (REQ-031) */
     uint64_t peer_id;          /* DM: the other participant (for the title) */
     uint8_t  notify_level;     /* OC_NOTIFY_ALL/_MENTIONS/_NONE (REQ-130) */
     /* Per-member read cursors (REQ-090 seen-by): the highest message id each

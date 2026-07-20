@@ -342,6 +342,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->channel_id = ents[i].channel_id;
                 e->status = ents[i].joined;
                 e->op = ents[i].kind;
+                e->is_public = ents[i].is_public;
                 e->body = malloc(ents[i].name.len + 1);
                 if (e->body) { memcpy(e->body, ents[i].name.ptr, ents[i].name.len); e->body[ents[i].name.len] = '\0'; }
                 oc_queue_push(to_ui, e);
@@ -354,6 +355,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->channel_id = ci.channel_id;
                     e->status = ci.joined;
                     e->op = ci.kind;
+                    e->is_public = ci.is_public;
                     e->user_id = ci.peer_id;           /* DM peer, if any */
                     e->body = malloc(ci.name.len + 1);
                     if (e->body) { memcpy(e->body, ci.name.ptr, ci.name.len); e->body[ci.name.len] = '\0'; }

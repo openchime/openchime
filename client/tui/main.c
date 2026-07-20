@@ -720,6 +720,64 @@ static const tk_pal_item g_launcher_items[] = {
     { "Session", "Log out",             NULL, NULL, ACT_LOGOUT },
 };
 
+/* ---- sidebar grouping (public / DM / private, each collapsible) ------------ */
+enum { SBG_PUBLIC = 0, SBG_DM = 1, SBG_PRIVATE = 2, SBG_N = 3 };
+static const char *SBG_LABEL[SBG_N] = { "Public", "Direct messages", "Private" };
+static uint8_t g_grp_collapsed[SBG_N];   /* per-group fold state, persists across frames */
+static int g_sb_hdr = -1;                /* if >=0, a group header is the selection (else a channel) */
+
+static int chan_group(const oc_channel *c) {
+    if (c->kind == OC_CHANNEL_KIND_DM) return SBG_DM;
+    return c->is_public ? SBG_PUBLIC : SBG_PRIVATE;
+}
+
+/* One visible sidebar row: a group header, or a channel (idx into m->channels). */
+typedef struct { uint8_t header; uint8_t group; size_t idx; } sb_row;
+
+/* Build the ordered visible rows: for each non-empty group in fixed order, a
+ * header, then (unless the group is collapsed) its channels in model order. */
+static int sidebar_build(const oc_model *m, sb_row *out, int cap) {
+    int n = 0;
+    for (int g = 0; g < SBG_N; g++) {
+        int has = 0;
+        for (size_t i = 0; i < m->n_channels; i++)
+            if (chan_group(&m->channels[i]) == g) { has = 1; break; }
+        if (!has) continue;
+        if (n < cap) out[n++] = (sb_row){ 1, (uint8_t)g, 0 };
+        if (g_grp_collapsed[g]) continue;
+        for (size_t i = 0; i < m->n_channels && n < cap; i++)
+            if (chan_group(&m->channels[i]) == g) out[n++] = (sb_row){ 0, (uint8_t)g, i };
+    }
+    return n;
+}
+
+/* Marker + name for a channel row, e.g. "# general", "@alice", "\U0001F512 secret". */
+static void sidebar_label(const oc_model *m, const oc_channel *c, char *buf, size_t cap) {
+    if (c->kind == OC_CHANNEL_KIND_DM) {
+        const char *pn = (c->peer_id == m->user_id) ? "you" : oc_model_user_name(m, c->peer_id);
+        snprintf(buf, cap, "@%s", pn[0] ? pn : "dm");
+    } else if (c->is_public) {
+        snprintf(buf, cap, "# %s", c->name ? c->name : "…");
+    } else {
+        snprintf(buf, cap, "\xf0\x9f\x94\x92 %s", c->name ? c->name : "…");  /* 🔒 */
+    }
+}
+
+/* Locate the current selection's display-row index (header or channel==focus). */
+static int sidebar_cursor(const sb_row *rows, int n, size_t focus) {
+    for (int i = 0; i < n; i++) {
+        if (g_sb_hdr >= 0) { if (rows[i].header && rows[i].group == g_sb_hdr) return i; }
+        else if (!rows[i].header && rows[i].idx == focus) return i;
+    }
+    return 0;
+}
+
+/* Move the selection to display row i, updating focus / g_sb_hdr accordingly. */
+static void sidebar_select(const sb_row *rows, int i, size_t *focus) {
+    if (rows[i].header) g_sb_hdr = rows[i].group;
+    else { g_sb_hdr = -1; *focus = rows[i].idx; }
+}
+
 static void render(oc_client *cl, size_t focus, const char *composer,
                    size_t clen, int scroll, int help_open, int ac_idx,
                    int panel, int msg_sel, int mem_sel, uint64_t editing) {
@@ -761,25 +819,40 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     int ch_w, mem_w, msg_x, msg_w;
     layout(W, &ch_w, &mem_w, &msg_x, &msg_w);
 
-    /* Channels panel. */
+    /* Channels panel — grouped (public / DMs / private), each group foldable,
+     * channels indented under their header. */
     tk_panel(0, panels_top, ch_w, panels_h, "Channels", ch_act);
-    for (size_t i = 0, iy = panels_top + 1; i < m->n_channels && (int)iy < panels_top + panels_h - 1; i++, iy++) {
-        const oc_channel *c = &m->channels[i];
-        int sel = (i == focus);
-        uintattr_t bg = sel ? th->sel_bg : th->bg;
-        uintattr_t fg = sel ? (th->sel_fg | TB_BOLD) : c->joined ? th->fg : th->muted;
-        tk_fill((int)iy, 1, ch_w - 1, bg);
-        char title[96];
-        if (c->kind == OC_CHANNEL_KIND_DM) {
-            const char *pn = (c->peer_id == m->user_id) ? "you" : oc_model_user_name(m, c->peer_id);
-            snprintf(title, sizeof title, "@%s", pn[0] ? pn : "dm");
-        } else {
-            snprintf(title, sizeof title, "%s%s", c->joined ? "# " : "+ ", c->name ? c->name : "…");
+    {
+        sb_row rows[256];
+        int nrows = sidebar_build(m, rows, 256);
+        for (int r = 0, iy = panels_top + 1;
+             r < nrows && iy < panels_top + panels_h - 1; r++, iy++) {
+            int hdr_sel = rows[r].header && g_sb_hdr == rows[r].group;
+            int chn_sel = !rows[r].header && g_sb_hdr < 0 && rows[r].idx == focus;
+            int sel = hdr_sel || chn_sel;
+            uintattr_t bg = sel ? th->sel_bg : th->bg;
+            tk_fill(iy, 1, ch_w - 1, bg);
+            char label[160];
+            if (rows[r].header) {
+                /* count of this group's unread, so a collapsed group still speaks up */
+                int gu = 0;
+                for (size_t i = 0; i < m->n_channels; i++)
+                    if (chan_group(&m->channels[i]) == rows[r].group) gu += m->channels[i].unread;
+                const char *tri = g_grp_collapsed[rows[r].group] ? "\xe2\x96\xb8" : "\xe2\x96\xbe"; /* ▸ / ▾ */
+                if (gu) snprintf(label, sizeof label, "%s %s (%d)", tri, SBG_LABEL[rows[r].group], gu);
+                else    snprintf(label, sizeof label, "%s %s", tri, SBG_LABEL[rows[r].group]);
+                uintattr_t hfg = sel ? (th->sel_fg | TB_BOLD) : (th->accent | TB_BOLD);
+                tk_text(1, iy, ch_w - 1, label, hfg, bg);
+            } else {
+                const oc_channel *c = &m->channels[rows[r].idx];
+                uintattr_t fg = sel ? (th->sel_fg | TB_BOLD) : c->joined ? th->fg : th->muted;
+                char title[96];
+                sidebar_label(m, c, title, sizeof title);
+                if (c->unread > 0) snprintf(label, sizeof label, "  %s (%d)", title, c->unread);
+                else               snprintf(label, sizeof label, "  %s", title);
+                tk_text(1, iy, ch_w - 1, label, fg, bg);
+            }
         }
-        char label[128];
-        if (c->unread > 0) snprintf(label, sizeof label, "%s%s (%d)", sel ? "\xe2\x96\xb8" : " ", title, c->unread);
-        else               snprintf(label, sizeof label, "%s%s", sel ? "\xe2\x96\xb8" : " ", title);
-        tk_text(1, (int)iy, ch_w - 1, label, fg, bg);
     }
 
     /* Messages panel (title = channel, or the open overlay). */
@@ -793,7 +866,9 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     else if (fc && fc->kind == OC_CHANNEL_KIND_DM) {
         const char *pn = (fc->peer_id == m->user_id) ? "you" : oc_model_user_name(m, fc->peer_id);
         snprintf(mt, sizeof mt, "@%s", pn[0] ? pn : "dm");
-    } else if (fc)               snprintf(mt, sizeof mt, "#%s", fc->name ? fc->name : "…");
+    } else if (fc && !fc->is_public)
+        snprintf(mt, sizeof mt, "\xf0\x9f\x94\x92 %s", fc->name ? fc->name : "…");  /* 🔒 private */
+    else if (fc)                 snprintf(mt, sizeof mt, "#%s", fc->name ? fc->name : "…");
     else                         snprintf(mt, sizeof mt, "no channel");
     tk_panel(msg_x, panels_top, msg_w, panels_h, mt, msg_act);
     {
@@ -1724,7 +1799,14 @@ int main(int argc, char **argv) {
                 int prow = ev.y - 2;           /* first panel content row */
                 const oc_model *mm = oc_client_model(cl);
                 if (prow >= 0 && ev.x < chw) {                      /* Channels */
-                    if ((size_t)prow < mm->n_channels) { focus = (size_t)prow; panel = 0; }
+                    sb_row rows[256];
+                    int nrows = sidebar_build(mm, rows, 256);
+                    if (prow < nrows) {
+                        if (rows[prow].header) {   /* click a header → fold/unfold */
+                            g_grp_collapsed[rows[prow].group] = !g_grp_collapsed[rows[prow].group];
+                            g_sb_hdr = rows[prow].group;
+                        } else { g_sb_hdr = -1; focus = rows[prow].idx; panel = 0; }
+                    }
                 } else if (memw && prow >= 0 && ev.x >= msgx + msgw) {   /* Members */
                     if ((size_t)prow < mm->n_users) oc_client_open_dm(cl, mm->users[prow].user_id);
                 }
@@ -2017,13 +2099,28 @@ int main(int argc, char **argv) {
                     mem_sel = mm->n_users ? (int)mm->n_users - 1 : 0;
             }
             else if (panel == 1) {                                          /* channels */
-                if (up && focus > 0) focus--;
-                else if (down && focus + 1 < mm->n_channels) focus++;
+                sb_row rows[256];
+                int nrows = sidebar_build(mm, rows, 256);
+                int cur = sidebar_cursor(rows, nrows, focus);
+                if (up && cur > 0) sidebar_select(rows, cur - 1, &focus);
+                else if (down && cur + 1 < nrows) sidebar_select(rows, cur + 1, &focus);
+                else if (ev.key == TB_KEY_ARROW_LEFT) {                      /* collapse / go to header */
+                    int g = g_sb_hdr >= 0 ? g_sb_hdr
+                          : (focus < mm->n_channels ? chan_group(&mm->channels[focus]) : -1);
+                    if (g >= 0) { g_grp_collapsed[g] = 1; g_sb_hdr = g; }
+                }
+                else if (ev.key == TB_KEY_ARROW_RIGHT) {                     /* expand a folded group */
+                    if (g_sb_hdr >= 0 && g_grp_collapsed[g_sb_hdr]) g_grp_collapsed[g_sb_hdr] = 0;
+                }
                 else if (ev.ch == 'n') { prompt_kind = PROMPT_NEWCHAN; prompt_title = "New channel"; tk_input_init(&prompt_input, 0, "name"); }
-                else if (ev.key == TB_KEY_ENTER && focus < mm->n_channels) {   /* channel action menu */
-                    menu_build_channel(mm->channels[focus].joined);
-                    act_cid = mm->channels[focus].channel_id; act_uid = 0; act_mid = 0; act_title = "Channel";
-                    action_open = 1; tk_list_reset_filter(&action_menu);
+                else if (ev.key == TB_KEY_ENTER) {
+                    if (g_sb_hdr >= 0) {                                      /* toggle the group's fold */
+                        g_grp_collapsed[g_sb_hdr] = !g_grp_collapsed[g_sb_hdr];
+                    } else if (focus < mm->n_channels) {                     /* channel action menu */
+                        menu_build_channel(mm->channels[focus].joined);
+                        act_cid = mm->channels[focus].channel_id; act_uid = 0; act_mid = 0; act_title = "Channel";
+                        action_open = 1; tk_list_reset_filter(&action_menu);
+                    }
                 }
             }
             else if (panel == 3) {                                          /* members */

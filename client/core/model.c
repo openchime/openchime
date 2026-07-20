@@ -504,6 +504,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         if (c) {
             c->joined = e->status;
             c->kind = e->op;                     /* channel vs DM */
+            c->is_public = e->is_public;         /* public vs private (REQ-031) */
             if (e->user_id) c->peer_id = e->user_id;   /* DM peer (CHANNEL_INFO only) */
             if (e->body) { free(c->name); c->name = e->body; e->body = NULL; }
         }

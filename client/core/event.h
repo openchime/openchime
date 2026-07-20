@@ -79,6 +79,7 @@ typedef struct {
     uint64_t parent_id;    /* THREAD_REPLY: the parent message this replies to */
     uint64_t server_time;
     uint8_t  status;       /* PRESENCE: online/away/offline; CHANNEL: joined flag */
+    uint8_t  is_public;    /* CHANNEL: 1 public, 0 private/DM */
     oc_storage_view storage;  /* OC_EV_STORAGE */
     oc_audit_view   audit;    /* OC_EV_AUDIT */
     uint8_t  op;           /* REACTION: add/remove */
