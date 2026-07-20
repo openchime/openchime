@@ -228,12 +228,17 @@ model; translate input to intents }, stop.
 
   With attachments surfaced, **every engine feature now on the wire is reachable
   from the TUI**; the remaining client work is the later native GUIs.
-- **Windows (next):** **Win32 + comctl32 in pure C** over the core — no WinUI,
-  no .NET, no cross-platform toolkit (ARCH-80). Preceded by a **Windows TUI**
-  that validates the core port — pthreads, DNS SRV, sockets — before the GUI
-  (ARCH-81); note termbox2 has no native Windows backend, so that TUI needs a small
-  termbox2-API layer over the Windows Console API built first — bounded work, not
-  a research risk (ARCH-81).
+- **Windows (next):** **Win32 in pure C** over the core — **Direct2D/DirectWrite
+  (+ WIC)** for the custom surfaces (message transcript, sidebar, rails) and
+  **native controls for the hard bits** (RichEdit composer, EDIT search, Win32
+  menus, dialogs). No WinUI, no .NET, no C++, no cross-platform toolkit
+  (ARCH-80/82). The **Windows TUI** already shipped and validated the core port —
+  pthreads, DNS SRV, sockets — via a termbox2-API layer over the Windows Console
+  API (ARCH-81, done), so the GUI proceeds against a trusted core. Two earlier
+  GUI drafts were built and rejected (ARCH-82): a comctl32 GUI (too dated) and a
+  self-rendered Clay+raylib GUI (non-native, perpetually lags). **The GUI is
+  affordance-driven — buttons/menus/dialogs/drag-drop, never slash commands**
+  (those belong to the TUI).
 - **Linux GUI (later):** **GTK in pure C** — GTK is the native Linux toolkit and
   a C library (ARCH-80). Distributed as an AppImage/Flatpak, not a static binary
   (GTK cannot cleanly static-link).

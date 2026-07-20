@@ -104,14 +104,17 @@ and the client falls back to the SQLite store (headless / no D-Bus). They are
 
 ## 6. Vestigial — present locally but in NO current build
 
-These are gitignored and **not linked by any build target**. The raylib-based GUI
-client plan was superseded by the shared-core + native-UI-per-platform model
-(ARCH-74), so raylib is retained only as an artifact of that dropped direction.
+The self-rendered GUI direction (Clay layout + raylib/OpenGL) was tried and
+rejected in favour of native per-platform UIs (**ARCH-82**): a self-rendered UI
+is non-native and perpetually lags. **raylib and Clay have been removed** — the
+`clay/`, `raylib-6.0-win`, `raylib-install-*` trees, the `build_raylib_*.sh`
+scripts, and the `client/gui` + comctl32 `client/win32` clients are all deleted.
+Retained Windows artifacts below are for the **Windows TUI** (ARCH-81, shipped),
+not the GUI.
 
 | Item | Version | Note | License |
 |------|---------|------|---------|
-| **raylib** (`third_party/raylib-6.0-win`, `raylib-install-win`) | 6.0.0 | Dropped GUI-client toolkit (ARCH-74); unused | zlib/libpng |
-| `scripts/build_raylib_windows.sh`, `scripts/build_mbedtls_windows.sh`, `third_party/mbedtls-3.6.2-win` | — | Experimental Windows cross-compile artifacts | (per package) |
+| `scripts/build_mbedtls_windows.sh`, `third_party/mbedtls-3.6.2-win` | 3.6.2 | Windows TUI cross-compile (mingw); still used by `make windows-tui` | Apache-2.0 |
 
 ## 7. Planned — not yet a dependency
 
@@ -139,8 +142,8 @@ client plan was superseded by the shared-core + native-UI-per-platform model
 | **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
 | **Public Domain** | SQLite | System-linked |
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
-| **zlib/libpng** | raylib | GUI (ARCH-80): window + GPU + text. Static-linked. Built by scripts/build_raylib_{linux,windows}.sh; source + built lib gitignored |
-| **zlib** | Clay | GUI layout engine (single-header). Vendored + committed at third_party/clay/ (clay.h + clay_renderer_raylib.c) |
+| **zlib/libpng** | raylib | Dropped self-rendered-GUI toolkit (ARCH-82); unused, not linked |
+| **zlib** | Clay | Dropped GUI layout engine (ARCH-82); unused, not linked |
 | **AGPL-3.0** | MinIO, mc | **Dev/test infra only — never linked into a shipped binary** |
 | **Unicode license** | utf8proc bundled data tables | Alongside utf8proc's MIT code |
 

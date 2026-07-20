@@ -60,7 +60,7 @@ endif
 TUI_INC   := $(CORE_INC) -Iclient/tui -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
-.PHONY: all test integration core tui bench clean s3-smoke windows-tui windows-gui linux-gui
+.PHONY: all test integration core tui bench clean s3-smoke windows-tui
 
 all: $(BIN)
 
@@ -144,41 +144,10 @@ $(WIN_TUI_BIN): $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(STORE_DEPS) $
 	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -static -o $@
 
 
-# --- Windows GUI client (ARCH-80) ---------------------------------------------
-# Native Win32 GUI over the shared core; pure C, comctl32 controls. Same core +
-# win mbedTLS + vendored SQLite as the Windows TUI, minus termbox2/utf8proc
-# (GUI, not terminal). -mwindows selects the GUI subsystem (WinMain, no console).
-WIN_GUI_SRC := $(wildcard client/win32/*.c)
-WIN_GUI_BIN := build/openchime-win.exe
-WIN_GUI_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include $(CORE_INC) -Ithird_party/sqlite
-
-windows-gui: $(WIN_GUI_BIN)
-$(WIN_GUI_BIN): $(WIN_GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(SQLITE_SRC) \
-                $(wildcard client/win32/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) | build
-	$(WINCC) $(WIN_CFLAGS) $(WIN_GUI_INC) \
-	    $(WIN_GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(SQLITE_SRC) \
-	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -luser32 -lgdi32 -lcomctl32 \
-	    -mwindows -static -o $@
-
-# --- Linux GUI client (ARCH-80, take 2: Clay + raylib) ------------------------
-# Self-rendered cross-platform GUI over the shared core. Clay (single-header
-# layout) draws onto raylib (window + GPU + text). Built on Linux first; the same
-# client/gui/*.c will cross-compile to Windows/macOS later. raylib is the Linux
-# static lib built from the vendored 6.0 source (see docs/VENDORS.md).
-RAYLIB_LINUX := third_party/raylib-install-linux
-GUI_SRC := $(wildcard client/gui/*.c)
-GUI_BIN := build/openchime-gui
-GUI_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_INC) $(CORE_INC) \
-           -I$(RAYLIB_LINUX)/include -Ithird_party/clay
-# raylib on desktop Linux needs GL + X11 + math/dl/pthread.
-GUI_LIBS := $(RAYLIB_LINUX)/lib/libraylib.a -lGL -lm -lpthread -ldl -lrt -lX11
-
-linux-gui: $(GUI_BIN)
-$(GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) \
-            $(wildcard client/gui/*.h client/core/*.h shared/*.h) $(MBEDTLS_A) | build
-	$(CC) $(CFLAGS) $(GUI_INC) \
-	    $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) \
-	    $(MBEDTLS_LIBS) -lsqlite3 -lresolv $(GUI_LIBS) -o $@
+# The native Windows GUI (Win32 + Direct2D/DirectWrite + RichEdit, pure C —
+# ARCH-82) is not yet built; its target lands with that client. Two first-draft
+# GUIs (a comctl32 Win32 client and a self-rendered Clay+raylib client) were
+# removed — see ARCH-82 / docs/VENDORS.md.
 
 build:
 	mkdir -p build
