@@ -671,9 +671,9 @@ static int ac_candidates(const oc_model *m, const char *s, ac_cand *out, int max
 enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLOAD,
        ACT_DM, ACT_ROLE_ADMIN, ACT_ROLE_MEMBER, ACT_REMOVE,
        /* channel menu */
-       ACT_OPEN, ACT_JOIN, ACT_NOTIFY_ALL, ACT_NOTIFY_MENTIONS, ACT_NOTIFY_NONE,
+       ACT_OPEN, ACT_JOIN, ACT_NOTIFY_ALL, ACT_NOTIFY_MENTIONS, ACT_NOTIFY_NONE, ACT_WEBHOOK_CREATE,
        /* global action launcher (Ctrl-K) — replaces the remaining slash commands */
-       ACT_NEWCHAN, ACT_NEWDM, ACT_SEARCH, ACT_NICK, ACT_AWAY, ACT_ONLINE,
+       ACT_NEWCHAN, ACT_NEWDM, ACT_SEARCH, ACT_NICK, ACT_AWAY, ACT_ONLINE, ACT_DND, ACT_PASSWD,
        ACT_PREFS, ACT_WEBHOOKS, ACT_LEAVE, ACT_INVITE, ACT_PROFILE, ACT_UPLOAD,
        ACT_STORAGE, ACT_AUDIT, ACT_WORKSPACES, ACT_HELP, ACT_LOGOUT };
 typedef struct { const char *label; int id; } menuitem;
@@ -707,6 +707,7 @@ static void menu_build_channel(int joined) {
     g_menu[g_nmenu++] = (menuitem){ "Notify: mentions",    ACT_NOTIFY_MENTIONS };
     g_menu[g_nmenu++] = (menuitem){ "Notify: none",        ACT_NOTIFY_NONE };
     g_menu[g_nmenu++] = (menuitem){ "Webhooks",            ACT_WEBHOOKS };
+    g_menu[g_nmenu++] = (menuitem){ "Create webhook",      ACT_WEBHOOK_CREATE };
     if (joined)  g_menu[g_nmenu++] = (menuitem){ "Leave",  ACT_LEAVE };
 }
 /* The global action launcher (Ctrl-K / ':') — a tk_palette: incremental search,
@@ -722,6 +723,8 @@ static const tk_pal_item g_launcher_items[] = {
     { "You",     "Set away",            NULL, NULL, ACT_AWAY },
     { "You",     "Set online",          NULL, NULL, ACT_ONLINE },
     { "You",     "Change display name", NULL, NULL, ACT_NICK },
+    { "You",     "Change password",     NULL, NULL, ACT_PASSWD },
+    { "You",     "Do not disturb",      NULL, NULL, ACT_DND },
     { "You",     "Your profile",        NULL, NULL, ACT_PROFILE },
     { "Admin",   "Invite a user",       NULL, NULL, ACT_INVITE },
     { "Admin",   "Storage usage",       NULL, NULL, ACT_STORAGE },
@@ -1636,8 +1639,10 @@ int main(int argc, char **argv) {
 
     /* Prompt dialog (tuikit tk_input in a modal) — replaces /create /search /dm
      * /nick with a discoverable text prompt. */
-    enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_DM, PROMPT_NICK, PROMPT_UPLOAD };
+    enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_DM, PROMPT_NICK, PROMPT_UPLOAD,
+           PROMPT_DND, PROMPT_WEBHOOK, PROMPT_PASSWD_OLD, PROMPT_PASSWD_NEW };
     int prompt_kind = PROMPT_NONE; const char *prompt_title = "";
+    char pw_old[128] = "";                 /* stashed between the two password prompts */
     tk_input prompt_input; tk_input_init(&prompt_input, 0, "");
 
     /* Global action launcher (tuikit tk_palette, Ctrl-K / ':'). */
@@ -1831,20 +1836,38 @@ int main(int argc, char **argv) {
             if (pr == TK_CANCEL) prompt_kind = PROMPT_NONE;
             else if (pr == TK_SELECT) {
                 const char *v = tk_input_value(&prompt_input);
-                if (*v) {
-                    if      (prompt_kind == PROMPT_NEWCHAN) oc_client_create_channel(cl, v);
-                    else if (prompt_kind == PROMPT_SEARCH)  oc_client_search(cl, v);
-                    else if (prompt_kind == PROMPT_NICK)    oc_client_set_display_name(cl, v);
-                    else if (prompt_kind == PROMPT_UPLOAD) {
-                        const oc_model *pm = oc_client_model(cl);
-                        if (focus < pm->n_channels) oc_client_upload(cl, pm->channels[focus].channel_id, v);
-                    }
-                    else if (prompt_kind == PROMPT_DM) {
-                        uint64_t u = oc_model_user_id(oc_client_model(cl), v);
-                        if (u) oc_client_open_dm(cl, u);
+                int k = prompt_kind;
+                prompt_kind = PROMPT_NONE;
+                if      (k == PROMPT_NEWCHAN && *v) oc_client_create_channel(cl, v);
+                else if (k == PROMPT_SEARCH  && *v) oc_client_search(cl, v);
+                else if (k == PROMPT_NICK    && *v) oc_client_set_display_name(cl, v);
+                else if (k == PROMPT_WEBHOOK && *v) oc_client_create_webhook(cl, act_cid, v);
+                else if (k == PROMPT_UPLOAD && *v) {
+                    const oc_model *pm = oc_client_model(cl);
+                    if (focus < pm->n_channels) oc_client_upload(cl, pm->channels[focus].channel_id, v);
+                }
+                else if (k == PROMPT_DM && *v) {
+                    uint64_t u = oc_model_user_id(oc_client_model(cl), v);
+                    if (u) oc_client_open_dm(cl, u);
+                }
+                else if (k == PROMPT_DND) {
+                    if (strcmp(v, "off") == 0 || !*v) oc_client_set_dnd(cl, 0, 0, 0);
+                    else {
+                        char s1[16] = "", s2[16] = "";
+                        int a = parse_hhmm((sscanf(v, "%15s %15s", s1, s2) == 2) ? s1 : "");
+                        int b = parse_hhmm(s2);
+                        if (a >= 0 && b >= 0) oc_client_set_dnd(cl, 1, (uint16_t)a, (uint16_t)b);
                     }
                 }
-                prompt_kind = PROMPT_NONE;
+                else if (k == PROMPT_PASSWD_OLD) {     /* step 1: stash, ask for the new one */
+                    snprintf(pw_old, sizeof pw_old, "%s", v);
+                    prompt_kind = PROMPT_PASSWD_NEW; prompt_title = "New password";
+                    tk_input_init(&prompt_input, 1, "");
+                }
+                else if (k == PROMPT_PASSWD_NEW) {     /* step 2: change it */
+                    if (*v && pw_old[0]) oc_client_change_password(cl, pw_old, v);
+                    pw_old[0] = '\0';
+                }
             }
             continue;
         }
@@ -1859,6 +1882,8 @@ int main(int argc, char **argv) {
                 else if (id == ACT_SEARCH)  { prompt_kind = PROMPT_SEARCH; prompt_title = "Search messages"; tk_input_init(&prompt_input, 0, "query"); }
                 else if (id == ACT_NICK)    { prompt_kind = PROMPT_NICK; prompt_title = "Change display name"; tk_input_init(&prompt_input, 0, "new name"); }
                 else if (id == ACT_UPLOAD)  { prompt_kind = PROMPT_UPLOAD; prompt_title = "Upload a file"; tk_input_init(&prompt_input, 0, "path"); }
+                else if (id == ACT_DND)     { prompt_kind = PROMPT_DND; prompt_title = "Do not disturb (HH:MM HH:MM, or 'off')"; tk_input_init(&prompt_input, 0, "e.g. 22:00 08:00"); }
+                else if (id == ACT_PASSWD)  { prompt_kind = PROMPT_PASSWD_OLD; prompt_title = "Current password"; tk_input_init(&prompt_input, 1, ""); pw_old[0] = '\0'; }
                 else if (id == ACT_AWAY)    oc_client_set_presence(cl, OC_PRESENCE_AWAY);
                 else if (id == ACT_ONLINE)  oc_client_set_presence(cl, OC_PRESENCE_ONLINE);
                 else if (id == ACT_PREFS)   oc_client_toggle_prefs(cl, 1);
@@ -1914,6 +1939,7 @@ int main(int argc, char **argv) {
                     /* channel menu actions */
                     else if (id == ACT_OPEN)  panel = 0;
                     else if (id == ACT_JOIN)  { oc_client_join_channel(cl, act_cid); panel = 0; }
+                    else if (id == ACT_WEBHOOK_CREATE) { prompt_kind = PROMPT_WEBHOOK; prompt_title = "Create webhook (label)"; tk_input_init(&prompt_input, 0, "label"); }
                     else if (id == ACT_NOTIFY_ALL)      oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_ALL);
                     else if (id == ACT_NOTIFY_MENTIONS) oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_MENTIONS);
                     else if (id == ACT_NOTIFY_NONE)     oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_NONE);
