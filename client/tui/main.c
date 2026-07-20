@@ -915,23 +915,24 @@ static void render(oc_client *cl, size_t focus, const char *composer,
      * tuikit tk_binding tables (tk_help_footer) so the hints can't drift from the
      * keys. Phase 4 wires input matching to these same tables. */
     static const tk_binding KB_COMPOSER[] = {
-        { TB_KEY_ENTER, 0, "Enter", "send", 1 }, { TB_KEY_TAB, 0, "Tab", "complete", 1 },
-        { TB_KEY_ESC, 0, "Esc", "navigate", 1 }, { 0, '/', "/", "command", 1 },
+        { TB_KEY_ENTER, 0, "Enter", "send", 1 }, { TB_KEY_ESC, 0, "Esc", "navigate", 1 },
+        { TB_KEY_CTRL_F, 0, "^F", "search", 1 }, { TB_KEY_CTRL_K, 0, "^K", "actions", 1 },
         { 0, '?', "?", "help", 1 }, { TB_KEY_CTRL_Q, 0, "^Q", "quit", 1 },
     };
     static const tk_binding KB_CHANNELS[] = {
         { 0, 'j', "j/k", "select", 1 }, { TB_KEY_ENTER, 0, "Enter", "open", 1 },
-        { TB_KEY_TAB, 0, "Tab", "panel", 1 }, { TB_KEY_ESC, 0, "Esc", "composer", 1 },
-    };
-    static const tk_binding KB_MESSAGES[] = {
-        { 0, 'j', "j/k", "select", 1 }, { 0, 't', "Enter/t", "thread", 1 },
-        { 0, 'r', "r", "react", 1 }, { 0, 'e', "e", "edit", 1 }, { 0, 'x', "x", "delete", 1 },
-        { 0, 'w', "w", "reactions", 1 }, { TB_KEY_TAB, 0, "Tab", "panel", 1 },
+        { 0, 'n', "n", "new", 1 }, { TB_KEY_TAB, 0, "Tab", "panel", 1 },
         { TB_KEY_ESC, 0, "Esc", "composer", 1 },
     };
-    static const tk_binding KB_MEMBERS[] = {
-        { 0, 'j', "j/k", "select", 1 }, { TB_KEY_ENTER, 0, "Enter", "DM", 1 },
+    static const tk_binding KB_MESSAGES[] = {
+        { 0, 'j', "j/k", "select", 1 }, { TB_KEY_ENTER, 0, "Enter", "actions", 1 },
+        { 0, 't', "t", "thread", 1 }, { 0, 'r', "r", "react", 1 }, { 0, 'e', "e", "edit", 1 },
         { TB_KEY_TAB, 0, "Tab", "panel", 1 }, { TB_KEY_ESC, 0, "Esc", "composer", 1 },
+    };
+    static const tk_binding KB_MEMBERS[] = {
+        { 0, 'j', "j/k", "select", 1 }, { TB_KEY_ENTER, 0, "Enter", "actions", 1 },
+        { 0, 'n', "n", "new DM", 1 }, { TB_KEY_TAB, 0, "Tab", "panel", 1 },
+        { TB_KEY_ESC, 0, "Esc", "composer", 1 },
     };
     tk_fill(H - 1, 0, W, TB_BLACK | TB_BOLD);
     if (help_open) {
@@ -1911,6 +1912,12 @@ int main(int argc, char **argv) {
     tk_list_opts action_opts = { NULL, menu_count, menu_text, NULL, 0 };
     tk_list_init(&action_menu, &action_opts);
 
+    /* Prompt dialog (tuikit tk_input in a modal) — replaces /create /search /dm
+     * /nick with a discoverable text prompt. */
+    enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_DM, PROMPT_NICK };
+    int prompt_kind = PROMPT_NONE; const char *prompt_title = "";
+    tk_input prompt_input; tk_input_init(&prompt_input, 0, "");
+
     while (running) {
         /* Tick EVERY workspace, not just the visible one: a background session
          * has to keep receiving so its unread count is live in the switcher
@@ -1967,6 +1974,11 @@ int main(int argc, char **argv) {
             tk_rect in = tk_modal_begin(tb_width(), tb_height(), 30, g_nmenu + 2,
                                         act_uid ? "Member" : "Message");
             tk_list_draw(&action_menu, in);
+            tb_present();
+        }
+        if (prompt_kind) {
+            tk_rect in = tk_modal_begin(tb_width(), tb_height(), 46, 3, prompt_title);
+            tk_input_draw(&prompt_input, (tk_rect){ in.x, in.y, in.w, 1 }, 1);
             tb_present();
         }
         if (palette_open) draw_palette(oc_client_model(cl), pq, psel);
@@ -2070,6 +2082,24 @@ int main(int argc, char **argv) {
             else profile_open = 0;
             continue;
         }
+        if (prompt_kind) {                     /* text prompt dialog (tuikit) */
+            tk_result pr = tk_input_handle(&prompt_input, &ev);
+            if (pr == TK_CANCEL) prompt_kind = PROMPT_NONE;
+            else if (pr == TK_SELECT) {
+                const char *v = tk_input_value(&prompt_input);
+                if (*v) {
+                    if      (prompt_kind == PROMPT_NEWCHAN) oc_client_create_channel(cl, v);
+                    else if (prompt_kind == PROMPT_SEARCH)  oc_client_search(cl, v);
+                    else if (prompt_kind == PROMPT_NICK)    oc_client_set_display_name(cl, v);
+                    else if (prompt_kind == PROMPT_DM) {
+                        uint64_t u = oc_model_user_id(oc_client_model(cl), v);
+                        if (u) oc_client_open_dm(cl, u);
+                    }
+                }
+                prompt_kind = PROMPT_NONE;
+            }
+            continue;
+        }
         if (action_open) {                     /* message action menu (tuikit) */
             tk_result ar = tk_list_handle(&action_menu, &ev);
             if (ar == TK_CANCEL) action_open = 0;
@@ -2159,6 +2189,11 @@ int main(int argc, char **argv) {
             palette_open = 1; pq[0] = '\0'; pqlen = 0; psel = 0;
             continue;
         }
+        if (ev.key == TB_KEY_CTRL_F) {         /* search dialog (tuikit) — replaces /search */
+            prompt_kind = PROMPT_SEARCH; prompt_title = "Search messages";
+            tk_input_init(&prompt_input, 0, "query");
+            continue;
+        }
         if (ev.key == TB_KEY_CTRL_R) {         /* force an immediate reconnect */
             oc_client_reconnect(cl);
             continue;
@@ -2190,11 +2225,13 @@ int main(int argc, char **argv) {
             else if (panel == 1) {                                          /* channels */
                 if (up && focus > 0) focus--;
                 else if (down && focus + 1 < mm->n_channels) focus++;
+                else if (ev.ch == 'n') { prompt_kind = PROMPT_NEWCHAN; prompt_title = "New channel"; tk_input_init(&prompt_input, 0, "name"); }
                 else if (ev.key == TB_KEY_ENTER) panel = 0;   /* it's already focused; compose */
             }
             else if (panel == 3) {                                          /* members */
                 if (up && mem_sel > 0) mem_sel--;
                 else if (down && mem_sel + 1 < (int)mm->n_users) mem_sel++;
+                else if (ev.ch == 'n') { prompt_kind = PROMPT_DM; prompt_title = "New direct message"; tk_input_init(&prompt_input, 0, "username"); }
                 else if (ev.key == TB_KEY_ENTER && mem_sel < (int)mm->n_users) {
                     /* discoverable member action menu (Message / role / remove) */
                     uint64_t uid = mm->users[mem_sel].user_id;

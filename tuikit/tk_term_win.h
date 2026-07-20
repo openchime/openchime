@@ -52,6 +52,7 @@ struct tb_event {
 
 /* Keys (control range == the raw control codes) */
 #define TB_KEY_CTRL_C     0x03
+#define TB_KEY_CTRL_F     0x06
 #define TB_KEY_BACKSPACE  0x08
 #define TB_KEY_TAB        0x09
 #define TB_KEY_CTRL_K     0x0b
