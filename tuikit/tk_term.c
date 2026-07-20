@@ -1,6 +1,12 @@
 /*
- * termbox2 Windows Console backend (ARCH-81) — the implementation of the
- * contract in termbox2_win.h, so client/tui/main.c runs unchanged on Windows.
+ * tuikit — terminal layer implementation (tk_term). This is the ONE translation
+ * unit that instantiates the terminal backend: on POSIX it compiles termbox2's
+ * single-header implementation (TB_IMPL); on Windows it is the Console-API
+ * backend below. Previously the POSIX impl was compiled inline in main.c via
+ * OC_TB_IMPL; it lives here now so the app just links tuikit.
+ *
+ * ---- Windows Console backend (ARCH-81) — the implementation of the
+ * contract in tk_term_win.h, so the toolbox runs unchanged on Windows.
  *
  * Output is VT/ANSI, not the classic CHAR_INFO console buffer: Windows 10+
  * consoles interpret the same escape sequences termbox2 already emits once
@@ -26,7 +32,7 @@
 
 #ifdef _WIN32
 
-#include "termbox2_win.h"
+#include "tk_term_win.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #  define WIN32_LEAN_AND_MEAN
@@ -404,5 +410,10 @@ int tb_poll_event(struct tb_event *event) {
 int tb_peek_event(struct tb_event *event, int timeout_ms) {
     return read_event(event, timeout_ms);
 }
+
+#else  /* !_WIN32 — POSIX: compile termbox2's single-header implementation here */
+
+#define TB_IMPL
+#include "termbox2.h"
 
 #endif /* _WIN32 */

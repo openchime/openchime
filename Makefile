@@ -42,6 +42,11 @@ CORE_INC := -Iclient/core
 # termbox2 (cell grid + input) + utf8proc (Unicode width/grapheme), both vendored
 # as committed MIT single-file source. Builds on the host like the daemon.
 TUI_SRC   := $(wildcard client/tui/*.c)
+# tuikit — the in-tree TUI toolbox (terminal layer + widgets + formatting). Owns
+# the termbox2 instantiation + the Windows console backend (ARCH-83). Linked into
+# both the POSIX and Windows TUI.
+TUIKIT_SRC := $(wildcard tuikit/*.c)
+TUIKIT_INC := -Ituikit
 UTF8PROC  := third_party/utf8proc/utf8proc.c
 # The core's local store (client/core/store.c) reuses the daemon's migration
 # runner and SQLite, so the frontend links migrate.c + libsqlite3.
@@ -114,10 +119,10 @@ core: $(CORE_SRC) $(SHARED_SRC) $(wildcard client/core/*.h shared/*.h) $(MBEDTLS
 # The TUI: app-core + shared wire + termbox2/utf8proc. -Wno-unused-result relaxes
 # one warning from the vendored termbox2 header (its read/write/strerror_r calls).
 tui: $(TUI_BIN)
-$(TUI_BIN): $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) \
-            $(wildcard client/tui/*.h client/core/*.h shared/*.h) $(MBEDTLS_A) | build
-	$(CC) $(CFLAGS) -Wno-unused-result $(INC) $(TUI_INC) $(SECRET_CFLAGS) \
-	    $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(UTF8PROC) $(MBEDTLS_LIBS) -lsqlite3 -lresolv -lpthread $(SECRET_LIBS) -o $@
+$(TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) \
+            $(wildcard client/tui/*.h tuikit/*.h client/core/*.h shared/*.h) $(MBEDTLS_A) | build
+	$(CC) $(CFLAGS) -Wno-unused-result $(INC) $(TUI_INC) $(TUIKIT_INC) $(SECRET_CFLAGS) \
+	    $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(UTF8PROC) $(MBEDTLS_LIBS) -lsqlite3 -lresolv -lpthread $(SECRET_LIBS) -o $@
 
 
 # --- Windows TUI (ARCH-81) ----------------------------------------------------
@@ -134,13 +139,13 @@ SQLITE_SRC := third_party/sqlite/sqlite3.c
 WIN_TUI_BIN := build/openchime-tui.exe
 WIN_CFLAGS := -std=c99 -Wall -Wextra -O2 -D_WIN32_WINNT=0x0601 -DSQLITE_OMIT_LOAD_EXTENSION -DUTF8PROC_STATIC
 WIN_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
-           $(CORE_INC) -Iclient/tui -Ithird_party/termbox2 -Ithird_party/utf8proc -Ithird_party/sqlite
+           $(CORE_INC) -Iclient/tui -Ituikit -Ithird_party/termbox2 -Ithird_party/utf8proc -Ithird_party/sqlite
 
 windows-tui: $(WIN_TUI_BIN)
-$(WIN_TUI_BIN): $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(STORE_DEPS) $(SQLITE_SRC) \
-                $(wildcard client/tui/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) | build
+$(WIN_TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(STORE_DEPS) $(SQLITE_SRC) \
+                $(wildcard client/tui/*.h tuikit/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) | build
 	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result $(WIN_INC) \
-	    $(TUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(UTF8PROC) $(SQLITE_SRC) \
+	    $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(UTF8PROC) $(SQLITE_SRC) \
 	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -static -o $@
 
 

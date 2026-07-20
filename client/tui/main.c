@@ -53,8 +53,7 @@
  *       attachment) · /logout (revoke this session and quit).
  */
 
-#define OC_TB_IMPL
-#include "tb_compat.h"   /* termbox2 on POSIX, Console-API backend on Windows (ARCH-81) */
+#include "tuikit.h"      /* terminal layer + width-correct draw/style primitives (tuikit) */
 #include "oc_port.h"
 
 #include "utf8proc.h"
@@ -122,33 +121,8 @@ static uintattr_t nick_color(uint64_t uid) {
     return NICK_COLORS[uid % (sizeof NICK_COLORS / sizeof NICK_COLORS[0])];
 }
 
-static int cp_width(int32_t cp) {
-    int w = utf8proc_charwidth(cp);
-    if (w < 0) return 0;         /* control/combining: no advance */
-    return w > 2 ? 2 : w;
-}
-
-/* Draw a UTF-8 string starting at (x,y), clipped to columns [x, xmax). Advances
- * by each glyph's display width (utf8proc). Returns the next free column. */
-static int draw_clip(int x, int y, int xmax, const char *s, uintattr_t fg, uintattr_t bg) {
-    utf8proc_ssize_t len = (utf8proc_ssize_t)strlen(s), off = 0;
-    while (off < len && x < xmax) {
-        int32_t cp;
-        utf8proc_ssize_t n = utf8proc_iterate((const utf8proc_uint8_t *)s + off, len - off, &cp);
-        if (n <= 0) break;
-        off += n;
-        int w = cp_width(cp);
-        if (w == 0) continue;                 /* skip zero-width (combining/control) */
-        if (x + w > xmax) break;              /* a wide glyph won't fit the last cell */
-        tb_set_cell(x, y, (uint32_t)cp, fg, bg);
-        x += w;
-    }
-    return x;
-}
-
-static void fill_row(int y, int x0, int x1, uintattr_t bg) {
-    for (int x = x0; x < x1; x++) tb_set_cell(x, y, ' ', TB_DEFAULT, bg);
-}
+/* The width-correct draw primitives (tk_cp_width/tk_text/tk_fill) now live in
+ * tuikit as tk_cp_width/tk_text/tk_fill; panels/frames as tk_panel/tk_box. */
 
 /* ---- a rebuilt-each-frame list of wrapped display rows for the message pane -- */
 
@@ -185,7 +159,7 @@ static void wrap_push(rows_t *r, const char *text, uintattr_t fg, int width, int
             int32_t cp;
             utf8proc_ssize_t n = utf8proc_iterate((const utf8proc_uint8_t *)text + off, len - off, &cp);
             if (n <= 0) { off = len; break; }
-            int w = cp_width(cp);
+            int w = tk_cp_width(cp);
             if (used + w > avail) break;
             used += w; off += n;
         }
@@ -552,27 +526,6 @@ static void layout(int W, int *ch_w, int *mem_w, int *msg_x, int *msg_w) {
 
 /* A bordered, titled panel; content is drawn inside by the caller. An active
  * panel gets a bright (cyan) border, matching the lazygit/k9s idiom. */
-static void draw_panel(int x, int y, int w, int h, const char *title, int active) {
-    if (w < 2 || h < 2) return;
-    uintattr_t bc = active ? (TB_CYAN | TB_BOLD) : TB_WHITE;
-    for (int i = 1; i < w - 1; i++) {
-        tb_set_cell(x + i, y, 0x2500, bc, TB_DEFAULT);
-        tb_set_cell(x + i, y + h - 1, 0x2500, bc, TB_DEFAULT);
-    }
-    for (int j = 1; j < h - 1; j++) {
-        tb_set_cell(x, y + j, 0x2502, bc, TB_DEFAULT);
-        tb_set_cell(x + w - 1, y + j, 0x2502, bc, TB_DEFAULT);
-    }
-    tb_set_cell(x, y, 0x250c, bc, TB_DEFAULT);
-    tb_set_cell(x + w - 1, y, 0x2510, bc, TB_DEFAULT);
-    tb_set_cell(x, y + h - 1, 0x2514, bc, TB_DEFAULT);
-    tb_set_cell(x + w - 1, y + h - 1, 0x2518, bc, TB_DEFAULT);
-    if (title && title[0]) {
-        char t[96]; snprintf(t, sizeof t, " %s ", title);
-        draw_clip(x + 2, y, x + w - 1, t, active ? TB_CYAN | TB_BOLD : TB_WHITE | TB_BOLD, TB_DEFAULT);
-    }
-}
-
 /* The ? help overlay: a centered popup listing keys + commands. */
 static void draw_help(int W, int H) {
     static const char *L[] = {
@@ -606,13 +559,13 @@ static void draw_help(int W, int H) {
     int bw = 64; if (bw > W - 4) bw = W - 4; if (bw < 24) bw = 24;
     int bh = n + 2; if (bh > H - 2) bh = H - 2; if (bh < 4) bh = 4;
     int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
-    for (int j = 0; j < bh; j++) fill_row(y + j, x, x + bw, TB_DEFAULT);   /* clear */
-    draw_panel(x, y, bw, bh, "Help  ·  ? or Esc to close", 1);
+    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, TB_DEFAULT);   /* clear */
+    tk_panel(x, y, bw, bh, "Help  ·  ? or Esc to close", 1);
     for (int i = 0; i < n && i + 1 < bh - 1; i++) {
         size_t len = strlen(L[i]);
         uintattr_t col = (len && L[i][len - 1] == ':') ? (TB_YELLOW | TB_BOLD)
                        : (L[i][0] == '/' || L[i][0] == ' ') ? TB_DEFAULT : (TB_WHITE | TB_BOLD);
-        draw_clip(x + 2, y + 1 + i, x + bw - 1, L[i], col, TB_DEFAULT);
+        tk_text(x + 2, y + 1 + i, x + bw - 1, L[i], col, TB_DEFAULT);
     }
 }
 
@@ -637,11 +590,11 @@ static void draw_profile(const oc_model *m, int W, int H) {
     int bw = 52; if (bw > W - 4) bw = W - 4; if (bw < 24) bw = 24;
     int bh = n + 2; if (bh > H - 2) bh = H - 2; if (bh < 4) bh = 4;
     int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
-    for (int j = 0; j < bh; j++) fill_row(y + j, x, x + bw, TB_DEFAULT);
-    draw_panel(x, y, bw, bh, "Profile  ·  any key to close", 1);
+    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, TB_DEFAULT);
+    tk_panel(x, y, bw, bh, "Profile  ·  any key to close", 1);
     for (int i = 0; i < n && i + 1 < bh - 1; i++) {
         uintattr_t col = L[i][0] == '/' ? TB_CYAN : (TB_WHITE | TB_BOLD);
-        draw_clip(x + 2, y + 1 + i, x + bw - 1, L[i], col, TB_DEFAULT);
+        tk_text(x + 2, y + 1 + i, x + bw - 1, L[i], col, TB_DEFAULT);
     }
     tb_present();
 }
@@ -765,7 +718,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     int ch_act = (panel == 1), msg_act = (panel == 0 || panel == 2), mem_act = (panel == 3);
     int W = tb_width(), H = tb_height();
     tb_clear();
-    if (W < 24 || H < 8) { draw_clip(0, 0, W, " terminal too small ", TB_RED | TB_BOLD, TB_DEFAULT); tb_present(); return; }
+    if (W < 24 || H < 8) { tk_text(0, 0, W, " terminal too small ", TB_RED | TB_BOLD, TB_DEFAULT); tb_present(); return; }
 
     const oc_channel *fc = (focus < m->n_channels) ? &m->channels[focus] : NULL;
     const char *conn = m->authed ? "connected" : (m->connected ? "connecting…" : "offline");
@@ -779,8 +732,8 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     char hdr[256];
     snprintf(hdr, sizeof hdr, " OpenChime · %.120s · %.48s %s · %s",
              active_label(), me[0] ? me : "…", dot, conn);
-    fill_row(0, 0, W, TB_BLUE);
-    draw_clip(0, 0, W, hdr, TB_WHITE | TB_BOLD, TB_BLUE);
+    tk_fill(0, 0, W, TB_BLUE);
+    tk_text(0, 0, W, hdr, TB_WHITE | TB_BOLD, TB_BLUE);
     /* Unread here, and — so a background workspace isn't invisible — a count of
      * what's waiting in the others (REQ-014). */
     int other = 0;
@@ -790,7 +743,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     else if (unread)       snprintf(u, sizeof u, "%d unread ", unread);
     else if (other)        snprintf(u, sizeof u, "%d elsewhere ", other);
     else                   u[0] = '\0';
-    if (u[0]) draw_clip(W - (int)strlen(u) - 1, 0, W, u, TB_YELLOW | TB_BOLD, TB_BLUE);
+    if (u[0]) tk_text(W - (int)strlen(u) - 1, 0, W, u, TB_YELLOW | TB_BOLD, TB_BLUE);
 
     /* Rows: header=0; panels=[1, H-3); status=H-3; composer=H-2; hint=H-1. */
     int panels_top = 1, panels_h = H - 4;
@@ -799,13 +752,13 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     layout(W, &ch_w, &mem_w, &msg_x, &msg_w);
 
     /* Channels panel. */
-    draw_panel(0, panels_top, ch_w, panels_h, "Channels", ch_act);
+    tk_panel(0, panels_top, ch_w, panels_h, "Channels", ch_act);
     for (size_t i = 0, iy = panels_top + 1; i < m->n_channels && (int)iy < panels_top + panels_h - 1; i++, iy++) {
         const oc_channel *c = &m->channels[i];
         int sel = (i == focus);
         uintattr_t bg = sel ? TB_BLUE : TB_DEFAULT;
         uintattr_t fg = sel ? TB_WHITE | TB_BOLD : c->joined ? TB_DEFAULT : TB_BLACK | TB_BOLD;
-        fill_row((int)iy, 1, ch_w - 1, bg);
+        tk_fill((int)iy, 1, ch_w - 1, bg);
         char title[96];
         if (c->kind == OC_CHANNEL_KIND_DM) {
             const char *pn = (c->peer_id == m->user_id) ? "you" : oc_model_user_name(m, c->peer_id);
@@ -816,7 +769,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
         char label[128];
         if (c->unread > 0) snprintf(label, sizeof label, "%s%s (%d)", sel ? "\xe2\x96\xb8" : " ", title, c->unread);
         else               snprintf(label, sizeof label, "%s%s", sel ? "\xe2\x96\xb8" : " ", title);
-        draw_clip(1, (int)iy, ch_w - 1, label, fg, bg);
+        tk_text(1, (int)iy, ch_w - 1, label, fg, bg);
     }
 
     /* Messages panel (title = channel, or the open overlay). */
@@ -832,7 +785,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
         snprintf(mt, sizeof mt, "@%s", pn[0] ? pn : "dm");
     } else if (fc)               snprintf(mt, sizeof mt, "#%s", fc->name ? fc->name : "…");
     else                         snprintf(mt, sizeof mt, "no channel");
-    draw_panel(msg_x, panels_top, msg_w, panels_h, mt, msg_act);
+    tk_panel(msg_x, panels_top, msg_w, panels_h, mt, msg_act);
     {
         int ix = msg_x + 1, iy = panels_top + 1, iw = msg_w - 2, ih = panels_h - 2;
         int normal = !(m->thread_open || m->search_open || m->roster_open || m->reactlist_open || m->prefs_open || m->weblist_open);
@@ -863,8 +816,8 @@ static void render(oc_client *cl, size_t focus, const char *composer,
             for (int i = start; i < end; i++, y++) {
                 int selrow = (panel == 2 && normal && rows.v[i].mi >= 0 && rows.v[i].mi == msg_sel);
                 uintattr_t bg = selrow ? TB_BLUE : TB_DEFAULT;
-                if (selrow) fill_row(y, ix, ix + iw, bg);
-                draw_clip(ix, y, ix + iw, rows.v[i].s, selrow ? (TB_WHITE | TB_BOLD) : rows.v[i].fg, bg);
+                if (selrow) tk_fill(y, ix, ix + iw, bg);
+                tk_text(ix, y, ix + iw, rows.v[i].s, selrow ? (TB_WHITE | TB_BOLD) : rows.v[i].fg, bg);
             }
             rows_free(&rows);
         }
@@ -873,7 +826,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     /* Members panel (roster + presence), on wide terminals. */
     if (mem_w) {
         int mx = msg_x + msg_w;
-        draw_panel(mx, panels_top, mem_w, panels_h, "Members", mem_act);
+        tk_panel(mx, panels_top, mem_w, panels_h, "Members", mem_act);
         for (size_t i = 0, iy = panels_top + 1; i < m->n_users && (int)iy < panels_top + panels_h - 1; i++, iy++) {
             const oc_member *u = &m->users[i];
             uint8_t p = oc_model_presence_of(m, u->user_id);
@@ -885,48 +838,48 @@ static void render(oc_client *cl, size_t focus, const char *composer,
                            : p == OC_PRESENCE_ONLINE ? TB_GREEN : p == OC_PRESENCE_AWAY ? TB_YELLOW : TB_DEFAULT;
             const char *role = u->role == OC_ROLE_OWNER ? " *" : u->role == OC_ROLE_ADMIN ? " +" : "";
             char line[80]; snprintf(line, sizeof line, "%s %s%s", d, u->name[0] ? u->name : "?", role);
-            if (sel) fill_row((int)iy, mx + 1, mx + mem_w - 1, bg);
-            draw_clip(mx + 1, (int)iy, mx + mem_w - 1, line, col, bg);
+            if (sel) tk_fill((int)iy, mx + 1, mx + mem_w - 1, bg);
+            tk_text(mx + 1, (int)iy, mx + mem_w - 1, line, col, bg);
         }
     }
 
     /* Row H-3: the autocomplete suggestion strip when completing, else the status
      * line (last status/error + typing indicator). */
-    fill_row(H - 3, 0, W, TB_DEFAULT);
+    tk_fill(H - 3, 0, W, TB_DEFAULT);
     ac_cand cands[16]; int rs, nc = 0;
     if (clen > 0) nc = ac_candidates(m, composer, cands, 16, &rs);
     if (nc > 0) {
         int active = ((ac_idx % nc) + nc) % nc;
-        int cx = draw_clip(0, H - 3, W, " \xe2\x96\xb8 ", TB_CYAN | TB_BOLD, TB_DEFAULT);   /* ▸ */
+        int cx = tk_text(0, H - 3, W, " \xe2\x96\xb8 ", TB_CYAN | TB_BOLD, TB_DEFAULT);   /* ▸ */
         for (int i = 0; i < nc && cx < W - 2; i++) {
             char item[110]; snprintf(item, sizeof item, "%s", cands[i].disp);
             uintattr_t fg = (i == active) ? TB_BLACK : TB_WHITE | TB_BOLD;
             uintattr_t bg = (i == active) ? TB_CYAN : TB_DEFAULT;
             if (i == active) tb_set_cell(cx - 1, H - 3, ' ', fg, bg);
-            cx = draw_clip(cx, H - 3, W, item, fg, bg);
+            cx = tk_text(cx, H - 3, W, item, fg, bg);
             if (i == active && cx < W) tb_set_cell(cx, H - 3, ' ', fg, bg);
-            cx = draw_clip(cx, H - 3, W, "  ", TB_DEFAULT, TB_DEFAULT);
+            cx = tk_text(cx, H - 3, W, "  ", TB_DEFAULT, TB_DEFAULT);
         }
-        draw_clip(cx, H - 3, W, nc > 1 ? "(Tab cycles)" : "(Tab)", TB_BLACK | TB_BOLD, TB_DEFAULT);
+        tk_text(cx, H - 3, W, nc > 1 ? "(Tab cycles)" : "(Tab)", TB_BLACK | TB_BOLD, TB_DEFAULT);
     } else {
         char st[220]; snprintf(st, sizeof st, " %s%s", m->status[0] ? m->status : "", scroll > 0 ? "   [scrolled]" : "");
-        int sx = draw_clip(0, H - 3, W, st, TB_YELLOW, TB_DEFAULT);
+        int sx = tk_text(0, H - 3, W, st, TB_YELLOW, TB_DEFAULT);
         if (fc) {
             uint64_t tp[8]; size_t nt = oc_model_typing(m, fc->channel_id, m->user_id, tp, 8);
             if (nt) {
                 char tl[140];
                 if (nt == 1) snprintf(tl, sizeof tl, "  ✎ %s is typing…", name_for(fc, tp[0]));
                 else         snprintf(tl, sizeof tl, "  ✎ %zu people are typing…", nt);
-                draw_clip(sx, H - 3, W, tl, TB_CYAN, TB_DEFAULT);
+                tk_text(sx, H - 3, W, tl, TB_CYAN, TB_DEFAULT);
             }
         }
     }
 
     /* Composer (row H-2). Editing an existing message shows a distinct prompt. */
-    fill_row(H - 2, 0, W, TB_DEFAULT);
-    int cx = editing ? draw_clip(0, H - 2, W, "\xe2\x9c\x8e edit \xe2\x80\xba ", TB_YELLOW | TB_BOLD, TB_DEFAULT)
-                     : draw_clip(0, H - 2, W, "\xe2\x80\xba ", TB_GREEN | TB_BOLD, TB_DEFAULT);   /* › */
-    cx = draw_clip(cx, H - 2, W, composer, TB_DEFAULT, TB_DEFAULT);
+    tk_fill(H - 2, 0, W, TB_DEFAULT);
+    int cx = editing ? tk_text(0, H - 2, W, "\xe2\x9c\x8e edit \xe2\x80\xba ", TB_YELLOW | TB_BOLD, TB_DEFAULT)
+                     : tk_text(0, H - 2, W, "\xe2\x80\xba ", TB_GREEN | TB_BOLD, TB_DEFAULT);   /* › */
+    cx = tk_text(cx, H - 2, W, composer, TB_DEFAULT, TB_DEFAULT);
     if (cx < W) tb_set_cell(cx, H - 2, ' ', TB_DEFAULT, TB_REVERSE);   /* cursor */
 
     /* Context keybinding hint bar (row H-1), per focused panel. */
@@ -936,8 +889,8 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     else if (panel == 2)  hint = " Messages  ·  j/k select  ·  Enter/t thread  r react  e edit  x delete  w reactions  ·  Tab panel  ·  Esc composer ";
     else if (panel == 3)  hint = " Members  ·  j/k select  ·  Enter DM  ·  Tab panel  ·  Esc composer ";
     else                  hint = " Enter: send   Tab: complete   Esc: navigate   /: command   ?: help   ^Q: quit ";
-    fill_row(H - 1, 0, W, TB_BLACK | TB_BOLD);
-    draw_clip(0, H - 1, W, hint, TB_WHITE, TB_BLACK | TB_BOLD);
+    tk_fill(H - 1, 0, W, TB_BLACK | TB_BOLD);
+    tk_text(0, H - 1, W, hint, TB_WHITE, TB_BLACK | TB_BOLD);
 
     if (help_open) draw_help(W, H);
     tb_present();
@@ -1009,20 +962,20 @@ static void draw_palette(const oc_model *m, const char *q, int psel) {
     int bw = 64; if (bw > W - 4) bw = W - 4; if (bw < 24) bw = 24;
     int bh = show + 4; if (bh > H - 2) bh = H - 2;
     int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
-    for (int j = 0; j < bh; j++) fill_row(y + j, x, x + bw, TB_DEFAULT);
-    draw_panel(x, y, bw, bh, "Command palette  \xc2\xb7  Esc to close", 1);
+    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, TB_DEFAULT);
+    tk_panel(x, y, bw, bh, "Command palette  \xc2\xb7  Esc to close", 1);
     char ql[128]; snprintf(ql, sizeof ql, "\xe2\x80\xba %s", q);
-    draw_clip(x + 2, y + 1, x + bw - 1, ql, TB_GREEN | TB_BOLD, TB_DEFAULT);
+    tk_text(x + 2, y + 1, x + bw - 1, ql, TB_GREEN | TB_BOLD, TB_DEFAULT);
     int cxq = x + 4 + (int)strlen(q);
     if (cxq < x + bw - 1) tb_set_cell(cxq, y + 1, ' ', TB_DEFAULT, TB_REVERSE);
     int top = (psel >= show) ? psel - show + 1 : 0;
     for (int i = 0; i < show && top + i < n; i++) {
         int idx = top + i, sel = (idx == psel);
         uintattr_t bg = sel ? TB_BLUE : TB_DEFAULT, fg = sel ? TB_WHITE | TB_BOLD : TB_DEFAULT;
-        if (sel) fill_row(y + 2 + i, x + 1, x + bw - 1, bg);
-        draw_clip(x + 2, y + 2 + i, x + bw - 1, items[idx].label, fg, bg);
+        if (sel) tk_fill(y + 2 + i, x + 1, x + bw - 1, bg);
+        tk_text(x + 2, y + 2 + i, x + bw - 1, items[idx].label, fg, bg);
     }
-    if (n == 0) draw_clip(x + 2, y + 2, x + bw - 1, "(no matches)", TB_BLACK | TB_BOLD, TB_DEFAULT);
+    if (n == 0) tk_text(x + 2, y + 2, x + bw - 1, "(no matches)", TB_BLACK | TB_BOLD, TB_DEFAULT);
     tb_present();
 }
 
@@ -1034,13 +987,13 @@ static void draw_storage(const oc_model *m, int W, int H) {
     int bw = 62; if (bw > W - 4) bw = W - 4; if (bw < 30) bw = 30;
     int bh = 15; if (bh > H - 2) bh = H - 2;
     int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
-    for (int j = 0; j < bh; j++) fill_row(y + j, x, x + bw, TB_DEFAULT);
-    draw_panel(x, y, bw, bh, "Storage  \xc2\xb7  any key to close", 1);
+    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, TB_DEFAULT);
+    tk_panel(x, y, bw, bh, "Storage  \xc2\xb7  any key to close", 1);
 
     char l[160];
     int row = y + 1;
     if (!m->storage_have) {
-        draw_clip(x + 2, row, x + bw - 1, "(no report yet — owner/admin only)",
+        tk_text(x + 2, row, x + bw - 1, "(no report yet — owner/admin only)",
                   TB_BLACK | TB_BOLD, TB_DEFAULT);
         tb_present();
         return;
@@ -1051,35 +1004,35 @@ static void draw_storage(const oc_model *m, int W, int H) {
     snprintf(l, sizeof l, "Disk        %llu MB free of %llu MB",
              (unsigned long long)(s->avail_bytes / MBv),
              (unsigned long long)(s->total_bytes / MBv));
-    draw_clip(x + 2, row++, x + bw - 1, l,
+    tk_text(x + 2, row++, x + bw - 1, l,
               s->under_pressure ? (TB_RED | TB_BOLD) : TB_DEFAULT, TB_DEFAULT);
 
     snprintf(l, sizeof l, "Attachments %llu file(s), %llu MB",
              (unsigned long long)s->attach_count,
              (unsigned long long)(s->attach_bytes / MBv));
-    draw_clip(x + 2, row++, x + bw - 1, l, TB_DEFAULT, TB_DEFAULT);
+    tk_text(x + 2, row++, x + bw - 1, l, TB_DEFAULT, TB_DEFAULT);
 
     if (s->under_pressure)
-        draw_clip(x + 2, row++, x + bw - 1,
+        tk_text(x + 2, row++, x + bw - 1,
                   "UNDER PRESSURE — reclaiming storage", TB_RED | TB_BOLD, TB_DEFAULT);
     row++;
 
-    draw_clip(x + 2, row++, x + bw - 1, "Policy", TB_YELLOW | TB_BOLD, TB_DEFAULT);
+    tk_text(x + 2, row++, x + bw - 1, "Policy", TB_YELLOW | TB_BOLD, TB_DEFAULT);
     if (s->max_age_days)
         snprintf(l, sizeof l, "  attachments expire after %llu day(s)",
                  (unsigned long long)s->max_age_days);
     else
         snprintf(l, sizeof l, "  attachments kept indefinitely");
-    draw_clip(x + 2, row++, x + bw - 1, l, TB_DEFAULT, TB_DEFAULT);
+    tk_text(x + 2, row++, x + bw - 1, l, TB_DEFAULT, TB_DEFAULT);
     snprintf(l, sizeof l, "  eviction under pressure: %s",
              s->evict_enabled ? "on (oldest first)" : "off");
-    draw_clip(x + 2, row++, x + bw - 1, l, TB_DEFAULT, TB_DEFAULT);
+    tk_text(x + 2, row++, x + bw - 1, l, TB_DEFAULT, TB_DEFAULT);
     snprintf(l, sizeof l, "  database reserve: %llu MB",
              (unsigned long long)(s->reserve_bytes / MBv));
-    draw_clip(x + 2, row++, x + bw - 1, l, TB_DEFAULT, TB_DEFAULT);
+    tk_text(x + 2, row++, x + bw - 1, l, TB_DEFAULT, TB_DEFAULT);
     row++;
 
-    draw_clip(x + 2, row++, x + bw - 1, "Reclaimed so far", TB_YELLOW | TB_BOLD, TB_DEFAULT);
+    tk_text(x + 2, row++, x + bw - 1, "Reclaimed so far", TB_YELLOW | TB_BOLD, TB_DEFAULT);
     snprintf(l, sizeof l, "  %llu abandoned  %llu expired  %llu evicted",
              (unsigned long long)s->rec_orphan,
              (unsigned long long)s->rec_expired,
@@ -1087,7 +1040,7 @@ static void draw_storage(const oc_model *m, int W, int H) {
     /* Evictions are the destructive ones, so they are called out in red when
      * any have happened — an operator should not have to read carefully to
      * notice that the daemon deleted files nobody approved individually. */
-    draw_clip(x + 2, row++, x + bw - 1, l,
+    tk_text(x + 2, row++, x + bw - 1, l,
               s->rec_evicted ? (TB_RED | TB_BOLD) : TB_DEFAULT, TB_DEFAULT);
     tb_present();
 }
@@ -1101,11 +1054,11 @@ static void draw_audit(const oc_model *m, int W, int H) {
     int bw = 92; if (bw > W - 4) bw = W - 4; if (bw < 40) bw = 40;
     int bh = H - 4; if (bh < 8) bh = 8; if (bh > H - 2) bh = H - 2;
     int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
-    for (int j = 0; j < bh; j++) fill_row(y + j, x, x + bw, TB_DEFAULT);
-    draw_panel(x, y, bw, bh, "Audit log  \xc2\xb7  newest first  \xc2\xb7  any key to close", 1);
+    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, TB_DEFAULT);
+    tk_panel(x, y, bw, bh, "Audit log  \xc2\xb7  newest first  \xc2\xb7  any key to close", 1);
 
     if (!m->n_audit) {
-        draw_clip(x + 2, y + 1, x + bw - 1,
+        tk_text(x + 2, y + 1, x + bw - 1,
                   m->audit_open ? "(no entries, or you are not an admin)" : "",
                   TB_BLACK | TB_BOLD, TB_DEFAULT);
         tb_present();
@@ -1129,7 +1082,7 @@ static void draw_audit(const oc_model *m, int W, int H) {
                  a->target[0] ? a->target : "-",
                  a->detail);
         /* A denial or failure is the interesting case; make it findable. */
-        draw_clip(x + 2, y + 1 + i, x + bw - 1, line,
+        tk_text(x + 2, y + 1 + i, x + bw - 1, line,
                   a->outcome ? TB_DEFAULT : (TB_RED | TB_BOLD), TB_DEFAULT);
     }
     tb_present();
@@ -1190,20 +1143,20 @@ static void draw_switcher(int sel) {
     int bw = 60; if (bw > W - 4) bw = W - 4; if (bw < 28) bw = 28;
     int bh = show + 4; if (bh > H - 2) bh = H - 2;
     int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
-    for (int j = 0; j < bh; j++) fill_row(y + j, x, x + bw, TB_DEFAULT);
-    draw_panel(x, y, bw, bh, "Workspaces  \xc2\xb7  Enter switch  \xc2\xb7  Esc close", 1);
+    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, TB_DEFAULT);
+    tk_panel(x, y, bw, bh, "Workspaces  \xc2\xb7  Enter switch  \xc2\xb7  Esc close", 1);
 
     int top = (sel >= show) ? sel - show + 1 : 0;
     for (int i = 0; i < show && top + i < rows; i++) {
         int idx = top + i, is_sel = (idx == sel);
         uintattr_t bg = is_sel ? TB_BLUE : TB_DEFAULT;
         uintattr_t fg = is_sel ? TB_WHITE | TB_BOLD : TB_DEFAULT;
-        if (is_sel) fill_row(y + 1 + i, x + 1, x + bw - 1, bg);
+        if (is_sel) tk_fill(y + 1 + i, x + 1, x + bw - 1, bg);
 
         char line[320];
         if (idx == g_nsw) {                      /* the always-present last row */
             snprintf(line, sizeof line, "+ Log in to new workspace");
-            draw_clip(x + 2, y + 1 + i, x + bw - 1, line,
+            tk_text(x + 2, y + 1 + i, x + bw - 1, line,
                       is_sel ? fg : (TB_GREEN | TB_BOLD), bg);
             continue;
         }
@@ -1223,10 +1176,10 @@ static void draw_switcher(int sel) {
             snprintf(line, sizeof line, "%s   %-28.28s %-14.14s signed out",
                      mark, e->label, e->user);
         }
-        draw_clip(x + 2, y + 1 + i, x + bw - 1, line,
+        tk_text(x + 2, y + 1 + i, x + bw - 1, line,
                   is_sel ? fg : (e->session >= 0 ? TB_DEFAULT : (TB_BLACK | TB_BOLD)), bg);
     }
-    draw_clip(x + 2, y + bh - 1, x + bw - 1,
+    tk_text(x + 2, y + bh - 1, x + bw - 1,
               " ^W switch \xc2\xb7 d forget \xc2\xb7 Esc close ", TB_BLACK | TB_BOLD, TB_DEFAULT);
     tb_present();
 }
@@ -1247,10 +1200,10 @@ static void draw_picker(const char *q, int esel) {
     int bw = 40; if (bw > W - 4) bw = W - 4; if (bw < 20) bw = 20;
     int bh = show + 4; if (bh > H - 2) bh = H - 2;
     int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
-    for (int j = 0; j < bh; j++) fill_row(y + j, x, x + bw, TB_DEFAULT);
-    draw_panel(x, y, bw, bh, "React  \xc2\xb7  Esc to close", 1);
+    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, TB_DEFAULT);
+    tk_panel(x, y, bw, bh, "React  \xc2\xb7  Esc to close", 1);
     char ql[64]; snprintf(ql, sizeof ql, "\xe2\x80\xba %s", q);
-    draw_clip(x + 2, y + 1, x + bw - 1, ql, TB_GREEN | TB_BOLD, TB_DEFAULT);
+    tk_text(x + 2, y + 1, x + bw - 1, ql, TB_GREEN | TB_BOLD, TB_DEFAULT);
     int cxq = x + 4 + (int)strlen(q);
     if (cxq < x + bw - 1) tb_set_cell(cxq, y + 1, ' ', TB_DEFAULT, TB_REVERSE);
     int top = (esel >= show) ? esel - show + 1 : 0;
@@ -1258,10 +1211,10 @@ static void draw_picker(const char *q, int esel) {
         int idx = top + i, sel = (idx == esel);
         uintattr_t bg = sel ? TB_BLUE : TB_DEFAULT, fg = sel ? TB_WHITE | TB_BOLD : TB_DEFAULT;
         char line[64]; snprintf(line, sizeof line, "%s  :%s:", em[idx], nm[idx]);
-        if (sel) fill_row(y + 2 + i, x + 1, x + bw - 1, bg);
-        draw_clip(x + 2, y + 2 + i, x + bw - 1, line, fg, bg);
+        if (sel) tk_fill(y + 2 + i, x + 1, x + bw - 1, bg);
+        tk_text(x + 2, y + 2 + i, x + bw - 1, line, fg, bg);
     }
-    if (n == 0) draw_clip(x + 2, y + 2, x + bw - 1, "(no matches)", TB_BLACK | TB_BOLD, TB_DEFAULT);
+    if (n == 0) tk_text(x + 2, y + 2, x + bw - 1, "(no matches)", TB_BLACK | TB_BOLD, TB_DEFAULT);
     tb_present();
 }
 
@@ -1580,38 +1533,21 @@ typedef struct {
     oc_endpoint ep;                       /* filled by oc_resolve on submit */
 } login_form;
 
-/* Draw a single-line box border and clear its interior. */
-static void draw_frame(int x, int y, int w, int h) {
-    for (int j = 1; j < h - 1; j++)
-        for (int i = 1; i < w - 1; i++) tb_set_cell(x + i, y + j, ' ', TB_DEFAULT, TB_DEFAULT);
-    for (int i = 1; i < w - 1; i++) {
-        tb_set_cell(x + i, y,         0x2500, TB_WHITE, TB_DEFAULT);
-        tb_set_cell(x + i, y + h - 1, 0x2500, TB_WHITE, TB_DEFAULT);
-    }
-    for (int j = 1; j < h - 1; j++) {
-        tb_set_cell(x,         y + j, 0x2502, TB_WHITE, TB_DEFAULT);
-        tb_set_cell(x + w - 1, y + j, 0x2502, TB_WHITE, TB_DEFAULT);
-    }
-    tb_set_cell(x,         y,         0x250c, TB_WHITE, TB_DEFAULT);
-    tb_set_cell(x + w - 1, y,         0x2510, TB_WHITE, TB_DEFAULT);
-    tb_set_cell(x,         y + h - 1, 0x2514, TB_WHITE, TB_DEFAULT);
-    tb_set_cell(x + w - 1, y + h - 1, 0x2518, TB_WHITE, TB_DEFAULT);
-}
 
 /* A labeled input row; `focused` highlights the field, `mask` renders dots. */
 static void draw_field(int x, int y, int w, const char *label, const char *val,
                        int focused, int mask) {
-    draw_clip(x, y, x + 11, label, TB_DEFAULT, TB_DEFAULT);
+    tk_text(x, y, x + 11, label, TB_DEFAULT, TB_DEFAULT);
     int fx = x + 11, fw = w - 11;
     uintattr_t bg = focused ? TB_BLUE : (TB_BLACK | TB_BOLD);
-    fill_row(y, fx, fx + fw, bg);
+    tk_fill(y, fx, fx + fw, bg);
     if (mask) {
         char dots[130]; size_t n = strlen(val);
         if (n > sizeof dots - 1) n = sizeof dots - 1;
         memset(dots, '*', n); dots[n] = '\0';
-        draw_clip(fx + 1, y, fx + fw, dots, TB_WHITE, bg);
+        tk_text(fx + 1, y, fx + fw, dots, TB_WHITE, bg);
     } else {
-        draw_clip(fx + 1, y, fx + fw, val, TB_WHITE | (focused ? TB_BOLD : 0), bg);
+        tk_text(fx + 1, y, fx + fw, val, TB_WHITE | (focused ? TB_BOLD : 0), bg);
     }
 }
 
@@ -1629,17 +1565,17 @@ static int login_dialog(login_form *f, const char *err) {
         int bw = 56; if (bw > W - 2) bw = W - 2; if (bw < 24) bw = 24;
         int bh = 12;
         int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
-        draw_frame(x, y, bw, bh);
-        draw_clip(x + 2, y, x + bw - 1, " Sign in to OpenChime ", TB_CYAN | TB_BOLD, TB_DEFAULT);
+        tk_box(x, y, bw, bh);
+        tk_text(x + 2, y, x + bw - 1, " Sign in to OpenChime ", TB_CYAN | TB_BOLD, TB_DEFAULT);
         int ix = x + 2, iw = bw - 4;
         draw_field(ix, y + 2, iw, "Workspace", f->workspace, focus == 0, 0);
         draw_field(ix, y + 4, iw, "Username", f->user, focus == 1, 0);
         draw_field(ix, y + 5, iw, "Password", f->pass, focus == 2, 1);
         char rem[40]; snprintf(rem, sizeof rem, "[%c] Remember me", f->remember ? 'x' : ' ');
-        draw_clip(ix, y + 7, ix + iw, rem, focus == 3 ? TB_CYAN | TB_BOLD : TB_DEFAULT, TB_DEFAULT);
+        tk_text(ix, y + 7, ix + iw, rem, focus == 3 ? TB_CYAN | TB_BOLD : TB_DEFAULT, TB_DEFAULT);
         const char *e = inl[0] ? inl : err;
-        if (e) draw_clip(ix, y + 9, ix + iw, e, TB_RED | TB_BOLD, TB_DEFAULT);
-        draw_clip(ix, y + bh - 1, ix + iw, " Enter connect · Tab next · Esc quit ",
+        if (e) tk_text(ix, y + 9, ix + iw, e, TB_RED | TB_BOLD, TB_DEFAULT);
+        tk_text(ix, y + bh - 1, ix + iw, " Enter connect · Tab next · Esc quit ",
                   TB_BLACK | TB_BOLD, TB_DEFAULT);
         tb_present();
 
@@ -1687,7 +1623,7 @@ static int await_auth(oc_client *cl, const char *host) {
         int W = tb_width(), H = tb_height();
         tb_clear();
         char msg[320]; snprintf(msg, sizeof msg, "Connecting to %s …   (Esc to cancel)", host);
-        draw_clip((W - (int)strlen(msg)) / 2, H / 2, W, msg, TB_WHITE | TB_BOLD, TB_DEFAULT);
+        tk_text((W - (int)strlen(msg)) / 2, H / 2, W, msg, TB_WHITE | TB_BOLD, TB_DEFAULT);
         tb_present();
         struct tb_event ev;
         if (tb_peek_event(&ev, 15) == TB_OK && ev.type == TB_EVENT_KEY &&
