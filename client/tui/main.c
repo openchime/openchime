@@ -735,6 +735,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
                    size_t clen, int scroll, int help_open, int ac_idx,
                    int panel, int msg_sel, int mem_sel, uint64_t editing) {
     const oc_model *m = oc_client_model(cl);
+    const tk_theme *th = tk_theme_active();
     int ch_act = (panel == 1), msg_act = (panel == 0 || panel == 2), mem_act = (panel == 3);
     int W = tb_width(), H = tb_height();
     tb_clear();
@@ -752,8 +753,8 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     char hdr[256];
     snprintf(hdr, sizeof hdr, " OpenChime · %.120s · %.48s %s · %s",
              active_label(), me[0] ? me : "…", dot, conn);
-    tk_fill(0, 0, W, TB_BLUE);
-    tk_text(0, 0, W, hdr, TB_WHITE | TB_BOLD, TB_BLUE);
+    tk_fill(0, 0, W, th->header_bg);
+    tk_text(0, 0, W, hdr, th->fg | TB_BOLD, th->header_bg);
     /* Unread here, and — so a background workspace isn't invisible — a count of
      * what's waiting in the others (REQ-014). */
     int other = 0;
@@ -763,7 +764,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     else if (unread)       snprintf(u, sizeof u, "%d unread ", unread);
     else if (other)        snprintf(u, sizeof u, "%d elsewhere ", other);
     else                   u[0] = '\0';
-    if (u[0]) tk_text(W - (int)strlen(u) - 1, 0, W, u, TB_YELLOW | TB_BOLD, TB_BLUE);
+    if (u[0]) tk_text(W - (int)strlen(u) - 1, 0, W, u, th->accent2 | TB_BOLD, th->header_bg);
 
     /* Rows: header=0; panels=[1, H-3); status=H-3; composer=H-2; hint=H-1. */
     int panels_top = 1, panels_h = H - 4;
@@ -776,8 +777,8 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     for (size_t i = 0, iy = panels_top + 1; i < m->n_channels && (int)iy < panels_top + panels_h - 1; i++, iy++) {
         const oc_channel *c = &m->channels[i];
         int sel = (i == focus);
-        uintattr_t bg = sel ? TB_BLUE : TB_DEFAULT;
-        uintattr_t fg = sel ? TB_WHITE | TB_BOLD : c->joined ? TB_DEFAULT : TB_BLACK | TB_BOLD;
+        uintattr_t bg = sel ? th->sel_bg : th->bg;
+        uintattr_t fg = sel ? (th->sel_fg | TB_BOLD) : c->joined ? th->fg : th->muted;
         tk_fill((int)iy, 1, ch_w - 1, bg);
         char title[96];
         if (c->kind == OC_CHANNEL_KIND_DM) {
@@ -835,9 +836,9 @@ static void render(oc_client *cl, size_t focus, const char *composer,
             int y = iy + (ih - (end - start));
             for (int i = start; i < end; i++, y++) {
                 int selrow = (panel == 2 && normal && rows.v[i].mi >= 0 && rows.v[i].mi == msg_sel);
-                uintattr_t bg = selrow ? TB_BLUE : TB_DEFAULT;
+                uintattr_t bg = selrow ? th->sel_bg : th->bg;
                 if (selrow) tk_fill(y, ix, ix + iw, bg);
-                tk_text(ix, y, ix + iw, rows.v[i].s, selrow ? (TB_WHITE | TB_BOLD) : rows.v[i].fg, bg);
+                tk_text(ix, y, ix + iw, rows.v[i].s, selrow ? (th->sel_fg | TB_BOLD) : rows.v[i].fg, bg);
             }
             rows_free(&rows);
         }
@@ -852,10 +853,10 @@ static void render(oc_client *cl, size_t focus, const char *composer,
             uint8_t p = oc_model_presence_of(m, u->user_id);
             const char *d = p == OC_PRESENCE_ONLINE ? "\xe2\x97\x8f" : p == OC_PRESENCE_AWAY ? "\xe2\x97\x90" : "\xe2\x97\x8b";
             int sel = (mem_act && (int)i == mem_sel);
-            uintattr_t bg = sel ? TB_BLUE : TB_DEFAULT;
-            uintattr_t col = sel ? (TB_WHITE | TB_BOLD)
-                           : u->disabled ? (TB_BLACK | TB_BOLD)
-                           : p == OC_PRESENCE_ONLINE ? TB_GREEN : p == OC_PRESENCE_AWAY ? TB_YELLOW : TB_DEFAULT;
+            uintattr_t bg = sel ? th->sel_bg : th->bg;
+            uintattr_t col = sel ? (th->sel_fg | TB_BOLD)
+                           : u->disabled ? th->muted
+                           : p == OC_PRESENCE_ONLINE ? th->presence_on : p == OC_PRESENCE_AWAY ? th->presence_away : th->fg;
             const char *role = u->role == OC_ROLE_OWNER ? " *" : u->role == OC_ROLE_ADMIN ? " +" : "";
             char line[80]; snprintf(line, sizeof line, "%s %s%s", d, u->name[0] ? u->name : "?", role);
             if (sel) tk_fill((int)iy, mx + 1, mx + mem_w - 1, bg);
@@ -883,14 +884,14 @@ static void render(oc_client *cl, size_t focus, const char *composer,
         tk_text(cx, H - 3, W, nc > 1 ? "(Tab cycles)" : "(Tab)", TB_BLACK | TB_BOLD, TB_DEFAULT);
     } else {
         char st[220]; snprintf(st, sizeof st, " %s%s", m->status[0] ? m->status : "", scroll > 0 ? "   [scrolled]" : "");
-        int sx = tk_text(0, H - 3, W, st, TB_YELLOW, TB_DEFAULT);
+        int sx = tk_text(0, H - 3, W, st, th->muted, TB_DEFAULT);
         if (fc) {
             uint64_t tp[8]; size_t nt = oc_model_typing(m, fc->channel_id, m->user_id, tp, 8);
             if (nt) {
                 char tl[140];
                 if (nt == 1) snprintf(tl, sizeof tl, "  ✎ %s is typing…", name_for(fc, tp[0]));
                 else         snprintf(tl, sizeof tl, "  ✎ %zu people are typing…", nt);
-                tk_text(sx, H - 3, W, tl, TB_CYAN, TB_DEFAULT);
+                tk_text(sx, H - 3, W, tl, th->accent, TB_DEFAULT);
             }
         }
     }
@@ -925,17 +926,17 @@ static void render(oc_client *cl, size_t focus, const char *composer,
         { 0, 'n', "n", "new DM", 1 }, { TB_KEY_TAB, 0, "Tab", "panel", 1 },
         { TB_KEY_ESC, 0, "Esc", "composer", 1 },
     };
-    tk_fill(H - 1, 0, W, TB_BLACK | TB_BOLD);
+    tk_fill(H - 1, 0, W, th->footer_bg);
     if (help_open) {
-        tk_text(0, H - 1, W, " press ? or Esc to close help ", TB_WHITE, TB_BLACK | TB_BOLD);
+        tk_text(0, H - 1, W, " press ? or Esc to close help ", th->fg, th->footer_bg);
     } else {
         const char *label; const tk_binding *kb; int kn;
         if      (panel == 1) { label = " Channels"; kb = KB_CHANNELS; kn = (int)(sizeof KB_CHANNELS / sizeof *KB_CHANNELS); }
         else if (panel == 2) { label = " Messages"; kb = KB_MESSAGES; kn = (int)(sizeof KB_MESSAGES / sizeof *KB_MESSAGES); }
         else if (panel == 3) { label = " Members";  kb = KB_MEMBERS;  kn = (int)(sizeof KB_MEMBERS  / sizeof *KB_MEMBERS);  }
         else                 { label = "";          kb = KB_COMPOSER; kn = (int)(sizeof KB_COMPOSER / sizeof *KB_COMPOSER); }
-        int hx = label[0] ? tk_text(0, H - 1, W, label, TB_CYAN | TB_BOLD, TB_BLACK | TB_BOLD) : 0;
-        tk_help_footer(H - 1, hx, W, kb, kn, TB_WHITE, TB_BLACK | TB_BOLD);
+        int hx = label[0] ? tk_text(0, H - 1, W, label, th->accent | TB_BOLD, th->footer_bg) : 0;
+        tk_help_footer(H - 1, hx, W, kb, kn, th->muted, th->footer_bg);
     }
 
     if (help_open) draw_help(W, H);
