@@ -88,7 +88,10 @@ model; translate input to intents }, stop.
   **notcurses was rejected on licensing** — it hard-depends on libunistring
   (LGPL); termbox2 + utf8proc keep the whole client permissive. **The TUI is
   text-only and never renders graphics — no images, ever.** Built on the host
-  like the daemon (`make tui`), zero transitive dependencies.
+  like the daemon (`make tui`), zero transitive dependencies. The widget/
+  formatting layer above termbox2 is being extracted into a reusable in-tree
+  toolbox, **`tuikit`** (ARCH-83, [TUIKIT.md](./TUIKIT.md)) — the foundation for
+  the menu/screen-driven redesign that replaces the slash-command UX.
 
   **Interaction model — modeless (weechat/irssi/Slack), not modal.** The input
   line is always ready to type a message (Enter sends); actions are
