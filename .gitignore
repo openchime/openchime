@@ -10,6 +10,7 @@ build/
 !/third_party/termbox2/
 !/third_party/utf8proc/
 !/third_party/sqlite/
+!/third_party/clay/
 *.o
 *.db
 *.db-shm

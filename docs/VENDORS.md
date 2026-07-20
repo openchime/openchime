@@ -139,7 +139,8 @@ client plan was superseded by the shared-core + native-UI-per-platform model
 | **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
 | **Public Domain** | SQLite | System-linked |
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
-| **zlib/libpng** | raylib | Vestigial, unused |
+| **zlib/libpng** | raylib | GUI (ARCH-80): window + GPU + text. Static-linked. Built by scripts/build_raylib_{linux,windows}.sh; source + built lib gitignored |
+| **zlib** | Clay | GUI layout engine (single-header). Vendored + committed at third_party/clay/ (clay.h + clay_renderer_raylib.c) |
 | **AGPL-3.0** | MinIO, mc | **Dev/test infra only — never linked into a shipped binary** |
 | **Unicode license** | utf8proc bundled data tables | Alongside utf8proc's MIT code |
 
