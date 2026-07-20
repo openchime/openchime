@@ -159,16 +159,16 @@ carrying the identity claims:
   "iat": ..., "exp": ... }
 ```
 
-**The audience is an opaque, daemon-generated random id — not the DNS name.**
-The `aud` value is a random identifier (≥128-bit) the **daemon generates once at
-enrollment** and central **ratifies** into its workspace registry (§3.6): the
-daemon proposes it, central enforces uniqueness (rejecting the astronomically
-unlikely collision), binds it to that workspace, and thereafter refuses to mint a
-token for any audience not in the registry. It is deliberately **decoupled from
-the workspace address** — a workspace can change its domain or add a vanity name
+**The audience is an opaque random id — not the DNS name.** The `aud` value is a
+random identifier (≥128-bit) established when the workspace **enrolls** with
+central and recorded in central's workspace registry (§3.6); central mints a
+token only for a **registered** audience. It is deliberately **decoupled from the
+workspace address** — a workspace can change its domain or add a vanity name
 (ARCH-14) without invalidating its OIDC identity, and the audience registry is
 never consulted for discovery. This **supersedes the earlier `aud = acme.example`
-illustration**, which conflated the audience with the hostname.
+illustration**, which conflated the audience with the hostname. (The enrollment
+flow itself — how the id is proposed and bound — is a control-plane concern,
+out of scope for this doc.)
 
 The daemon validates it by **pinning both the key and the algorithm**:
 
@@ -193,10 +193,9 @@ targets the high-frequency message path, not the auth bootstrap.)
 
 - The daemon config (ARCH-26) carries **central's public key** (bundled/pinned
   in the OpenChime distribution — central is maintainer-controlled and stable)
-  and this workspace's **`audience` id** — the opaque, daemon-generated random id
-  described in §3.3. A self-hoster enabling relay-OIDC enrolls once: the daemon
-  generates the id (and its own keypair) and central ratifies the binding, after
-  which central will mint tokens for that audience.
+  and this workspace's **`audience` id** — the opaque registered id described in
+  §3.3. A self-hoster enabling relay-OIDC enrolls their workspace with central
+  once, after which central will mint tokens for that audience.
 - **Dependency is login-time only.** Once the daemon issues a session (§4), it
   never contacts central again; existing sessions survive a central outage. Only
   *new logins* need central up, and the message path never does. Local mode has
@@ -233,12 +232,10 @@ daemon — and are built independently. Its contract with the daemon is narrow:
 - run the Authorization-Code-+-PKCE flow against the configured providers;
 - mint ES256 JWTs (§3.3) signed by the key the daemon pins, audience-scoped to
   the requesting workspace;
-- maintain the workspace registry (which `audience` ids are valid). The audience
-  id is **daemon-proposed, central-ratified** (§3.3): at enrollment the daemon
-  generates a random id and central binds it — enforcing uniqueness and refusing
-  to mint a token for any audience not in the registry. This registry is part of
-  the OIDC function and is never consulted for workspace discovery, which is plain
-  DNS in every model (ARCH-14).
+- maintain the workspace registry (which `audience` ids are valid), binding each
+  workspace's opaque id at enrollment (§3.3) and minting a token only for a
+  registered audience. This registry is part of the OIDC function and is never
+  consulted for workspace discovery, which is plain DNS in every model (ARCH-14).
 
 Until it exists, the daemon's OIDC path is tested with a **test issuer**:
 generate an ECDSA-P256 keypair in the test, mint central-style ES256 JWTs, and
