@@ -716,9 +716,13 @@ static int ac_candidates(const oc_model *m, const char *s, ac_cand *out, int max
  * commands. One generic menu holds {label,id} items; the SELECT handler
  * dispatches on the ACT_* id. Enter on a selected message/member opens it. */
 enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS,
-       ACT_DM, ACT_ROLE_ADMIN, ACT_ROLE_MEMBER, ACT_REMOVE };
+       ACT_DM, ACT_ROLE_ADMIN, ACT_ROLE_MEMBER, ACT_REMOVE,
+       /* global action launcher (Ctrl-K) — replaces the remaining slash commands */
+       ACT_NEWCHAN, ACT_NEWDM, ACT_SEARCH, ACT_NICK, ACT_AWAY, ACT_ONLINE,
+       ACT_PREFS, ACT_WEBHOOKS, ACT_LEAVE, ACT_INVITE, ACT_PROFILE,
+       ACT_STORAGE, ACT_AUDIT, ACT_WORKSPACES, ACT_HELP, ACT_LOGOUT };
 typedef struct { const char *label; int id; } menuitem;
-static menuitem g_menu[8];
+static menuitem g_menu[28];
 static int      g_nmenu;
 static int  menu_count(void *ud) { (void)ud; return g_nmenu; }
 static void menu_text(int i, void *ud, char *buf, size_t cap, uintattr_t *fg) {
@@ -738,6 +742,26 @@ static void menu_build_member(int is_self) {
     g_menu[g_nmenu++] = (menuitem){ "Make admin",  ACT_ROLE_ADMIN };
     g_menu[g_nmenu++] = (menuitem){ "Make member", ACT_ROLE_MEMBER };
     if (!is_self) g_menu[g_nmenu++] = (menuitem){ "Remove",      ACT_REMOVE };
+}
+/* The global action launcher — every action reachable without typing a command. */
+static void menu_build_global(void) {
+    g_nmenu = 0;
+    g_menu[g_nmenu++] = (menuitem){ "New channel",         ACT_NEWCHAN };
+    g_menu[g_nmenu++] = (menuitem){ "New direct message",  ACT_NEWDM };
+    g_menu[g_nmenu++] = (menuitem){ "Search messages",     ACT_SEARCH };
+    g_menu[g_nmenu++] = (menuitem){ "Notifications",       ACT_PREFS };
+    g_menu[g_nmenu++] = (menuitem){ "Leave this channel",  ACT_LEAVE };
+    g_menu[g_nmenu++] = (menuitem){ "Channel webhooks",    ACT_WEBHOOKS };
+    g_menu[g_nmenu++] = (menuitem){ "Set away",            ACT_AWAY };
+    g_menu[g_nmenu++] = (menuitem){ "Set online",          ACT_ONLINE };
+    g_menu[g_nmenu++] = (menuitem){ "Change display name", ACT_NICK };
+    g_menu[g_nmenu++] = (menuitem){ "Your profile",        ACT_PROFILE };
+    g_menu[g_nmenu++] = (menuitem){ "Invite a user",       ACT_INVITE };
+    g_menu[g_nmenu++] = (menuitem){ "Storage usage",       ACT_STORAGE };
+    g_menu[g_nmenu++] = (menuitem){ "Audit log",           ACT_AUDIT };
+    g_menu[g_nmenu++] = (menuitem){ "Switch workspace",    ACT_WORKSPACES };
+    g_menu[g_nmenu++] = (menuitem){ "Help",                ACT_HELP };
+    g_menu[g_nmenu++] = (menuitem){ "Log out",             ACT_LOGOUT };
 }
 
 static void render(oc_client *cl, size_t focus, const char *composer,
@@ -1906,10 +1930,12 @@ int main(int argc, char **argv) {
     time_t last_typing = 0;                   /* throttle outbound TYPING signals */
     int running = 1, logging_out = 0;
 
-    /* Action menu (tuikit, menu-driven) — messages + members. */
+    /* Action menu (tuikit, menu-driven) — messages, members, and the global
+     * launcher (Ctrl-K). Filterable so the launcher is a fuzzy action finder. */
     int action_open = 0; uint64_t act_cid = 0, act_mid = 0, act_uid = 0;
+    const char *act_title = "Actions";
     tk_list action_menu;
-    tk_list_opts action_opts = { NULL, menu_count, menu_text, NULL, 0 };
+    tk_list_opts action_opts = { NULL, menu_count, menu_text, NULL, 1 };
     tk_list_init(&action_menu, &action_opts);
 
     /* Prompt dialog (tuikit tk_input in a modal) — replaces /create /search /dm
@@ -1971,8 +1997,8 @@ int main(int argc, char **argv) {
 
         render(cl, focus, composer, clen, scroll, help_open, ac_idx, panel, msg_sel, mem_sel, editing);
         if (action_open) {
-            tk_rect in = tk_modal_begin(tb_width(), tb_height(), 30, g_nmenu + 2,
-                                        act_uid ? "Member" : "Message");
+            int mh = g_nmenu + 3; if (mh > tb_height() - 2) mh = tb_height() - 2;
+            tk_rect in = tk_modal_begin(tb_width(), tb_height(), 34, mh, act_title);
             tk_list_draw(&action_menu, in);
             tb_present();
         }
@@ -2125,6 +2151,23 @@ int main(int argc, char **argv) {
                                 clen = strlen(composer); panel = 0; break;
                             }
                     }
+                    /* global launcher actions */
+                    else if (id == ACT_NEWCHAN) { prompt_kind = PROMPT_NEWCHAN; prompt_title = "New channel"; tk_input_init(&prompt_input, 0, "name"); }
+                    else if (id == ACT_NEWDM)   { prompt_kind = PROMPT_DM; prompt_title = "New direct message"; tk_input_init(&prompt_input, 0, "username"); }
+                    else if (id == ACT_SEARCH)  { prompt_kind = PROMPT_SEARCH; prompt_title = "Search messages"; tk_input_init(&prompt_input, 0, "query"); }
+                    else if (id == ACT_NICK)    { prompt_kind = PROMPT_NICK; prompt_title = "Change display name"; tk_input_init(&prompt_input, 0, "new name"); }
+                    else if (id == ACT_AWAY)    oc_client_set_presence(cl, OC_PRESENCE_AWAY);
+                    else if (id == ACT_ONLINE)  oc_client_set_presence(cl, OC_PRESENCE_ONLINE);
+                    else if (id == ACT_PREFS)   { oc_client_toggle_prefs(cl, 1); }
+                    else if (id == ACT_LEAVE)   { if (act_cid) oc_client_leave_channel(cl, act_cid); }
+                    else if (id == ACT_WEBHOOKS){ if (act_cid) oc_client_webhooks(cl, act_cid); }
+                    else if (id == ACT_INVITE)  oc_client_invite_user(cl, OC_ROLE_MEMBER);
+                    else if (id == ACT_PROFILE) profile_open = 1;
+                    else if (id == ACT_STORAGE) { oc_client_storage_status(cl); storage_open = 1; }
+                    else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }
+                    else if (id == ACT_WORKSPACES) { sw_build(); wsel = (g_active < g_nsw) ? g_active : 0; switcher_open = 1; }
+                    else if (id == ACT_HELP)    help_open = 1;
+                    else if (id == ACT_LOGOUT)  { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
                 }
             }
             continue;
@@ -2185,8 +2228,12 @@ int main(int argc, char **argv) {
             }
             continue;
         }
-        if (ev.key == TB_KEY_CTRL_K) {         /* open the palette from any mode */
-            palette_open = 1; pq[0] = '\0'; pqlen = 0; psel = 0;
+        if (ev.key == TB_KEY_CTRL_K) {         /* global action launcher (tuikit) */
+            const oc_model *mm = oc_client_model(cl);
+            menu_build_global();
+            act_cid = focus < mm->n_channels ? mm->channels[focus].channel_id : 0;
+            act_uid = 0; act_mid = 0; act_title = "Actions";
+            action_open = 1; tk_list_reset_filter(&action_menu);
             continue;
         }
         if (ev.key == TB_KEY_CTRL_F) {         /* search dialog (tuikit) — replaces /search */
@@ -2236,8 +2283,8 @@ int main(int argc, char **argv) {
                     /* discoverable member action menu (Message / role / remove) */
                     uint64_t uid = mm->users[mem_sel].user_id;
                     menu_build_member(uid == mm->user_id);
-                    act_uid = uid; act_cid = 0; act_mid = 0; action_open = 1;
-                    tk_list_reset_filter(&action_menu);
+                    act_uid = uid; act_cid = 0; act_mid = 0; act_title = "Member";
+                    action_open = 1; tk_list_reset_filter(&action_menu);
                 }
             }
             else if (panel == 2 && ch) {                                    /* messages */
@@ -2250,8 +2297,8 @@ int main(int argc, char **argv) {
                     int own = (sel->author_id == mm->user_id) && !sel->deleted;
                     if (ev.key == TB_KEY_ENTER) {   /* open the discoverable action menu */
                         menu_build_msg(own, sel->deleted);
-                        act_cid = cid; act_mid = mid; act_uid = 0; action_open = 1;
-                        tk_list_reset_filter(&action_menu);
+                        act_cid = cid; act_mid = mid; act_uid = 0; act_title = "Message";
+                        action_open = 1; tk_list_reset_filter(&action_menu);
                     }
                     else if (ev.ch == 't') oc_client_open_thread(cl, cid, mid);
                     else if (ev.ch == 'w') oc_client_list_reactions(cl, cid, mid);
@@ -2281,28 +2328,14 @@ int main(int argc, char **argv) {
                 if (clen > 0 && focus < nch) oc_client_edit(cl, m->channels[focus].channel_id, editing, composer);
                 editing = 0; clen = 0; composer[0] = '\0'; scroll = 0;
             } else if (clen > 0 && focus < nch) {
+                /* Menu-driven: the composer only SENDS (or replies in a thread) —
+                 * it no longer parses slash commands. All actions are reachable
+                 * via the pane action menus, the dialogs, and the Ctrl-K launcher. */
                 const oc_model *mm = oc_client_model(cl);
                 uint64_t cid = mm->channels[focus].channel_id;
-                if (strcmp(composer, "/help") == 0)           { help_open = 1; }
-                else if (strcmp(composer, "/profile") == 0)   { profile_open = 1; }
-                else if (strcmp(composer, "/audit") == 0) {
-                    oc_client_audit_query(cl, 0);   /* newest page; refused for a member */
-                    audit_open = 1;
-                }
-                else if (strcmp(composer, "/storage") == 0) {
-                    oc_client_storage_status(cl);   /* refuses for a member */
-                    storage_open = 1;
-                }
-                else if (strcmp(composer, "/workspaces") == 0 || strcmp(composer, "/workspace") == 0) {
-                    sw_build();
-                    wsel = (g_active < g_nsw) ? g_active : 0;
-                    switcher_open = 1;
-                }
-                else if (strcmp(composer, "/logout") == 0)    { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
-                else if (composer[0] == '/')                  handle_command(cl, cid, composer);
-                else if (mm->search_open || mm->roster_open || mm->reactlist_open || mm->prefs_open || mm->weblist_open) { /* read-only overlay: ignore */ }
-                else if (mm->thread_open)                     oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
-                else                                          oc_client_send(cl, cid, composer);
+                if (mm->search_open || mm->roster_open || mm->reactlist_open || mm->prefs_open || mm->weblist_open) { /* read-only overlay: ignore */ }
+                else if (mm->thread_open) oc_client_reply(cl, mm->thread_channel, mm->thread_parent, composer);
+                else                      oc_client_send(cl, cid, composer);
                 clen = 0; composer[0] = '\0'; scroll = 0;
             }
         } else if (ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2) {
@@ -2333,8 +2366,12 @@ int main(int argc, char **argv) {
             if (scroll < 0) scroll = 0;
         } else if (ev.ch == '?' && clen == 0) {
             help_open = 1;                     /* ? on an empty composer opens help */
-        } else if (ev.ch == ':' && clen == 0) {
-            palette_open = 1; pq[0] = '\0'; pqlen = 0; psel = 0;   /* : opens the palette */
+        } else if (ev.ch == ':' && clen == 0) {   /* : opens the action launcher */
+            const oc_model *mm = oc_client_model(cl);
+            menu_build_global();
+            act_cid = focus < mm->n_channels ? mm->channels[focus].channel_id : 0;
+            act_uid = 0; act_mid = 0; act_title = "Actions";
+            action_open = 1; tk_list_reset_filter(&action_menu);
         } else if (ev.ch != 0) {
             /* A typed codepoint: append its UTF-8 encoding to the composer. */
             utf8proc_uint8_t enc[4];
