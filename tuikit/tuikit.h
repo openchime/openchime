@@ -19,5 +19,6 @@
 #include "tk_textarea.h"
 #include "tk_viewport.h"
 #include "tk_modal.h"
+#include "tk_palette.h"
 
 #endif /* TUIKIT_H */

@@ -696,26 +696,26 @@ static void menu_build_member(int is_self) {
     g_menu[g_nmenu++] = (menuitem){ "Make member", ACT_ROLE_MEMBER };
     if (!is_self) g_menu[g_nmenu++] = (menuitem){ "Remove",      ACT_REMOVE };
 }
-/* The global action launcher — every action reachable without typing a command. */
-static void menu_build_global(void) {
-    g_nmenu = 0;
-    g_menu[g_nmenu++] = (menuitem){ "New channel",         ACT_NEWCHAN };
-    g_menu[g_nmenu++] = (menuitem){ "New direct message",  ACT_NEWDM };
-    g_menu[g_nmenu++] = (menuitem){ "Search messages",     ACT_SEARCH };
-    g_menu[g_nmenu++] = (menuitem){ "Notifications",       ACT_PREFS };
-    g_menu[g_nmenu++] = (menuitem){ "Leave this channel",  ACT_LEAVE };
-    g_menu[g_nmenu++] = (menuitem){ "Channel webhooks",    ACT_WEBHOOKS };
-    g_menu[g_nmenu++] = (menuitem){ "Set away",            ACT_AWAY };
-    g_menu[g_nmenu++] = (menuitem){ "Set online",          ACT_ONLINE };
-    g_menu[g_nmenu++] = (menuitem){ "Change display name", ACT_NICK };
-    g_menu[g_nmenu++] = (menuitem){ "Your profile",        ACT_PROFILE };
-    g_menu[g_nmenu++] = (menuitem){ "Invite a user",       ACT_INVITE };
-    g_menu[g_nmenu++] = (menuitem){ "Storage usage",       ACT_STORAGE };
-    g_menu[g_nmenu++] = (menuitem){ "Audit log",           ACT_AUDIT };
-    g_menu[g_nmenu++] = (menuitem){ "Switch workspace",    ACT_WORKSPACES };
-    g_menu[g_nmenu++] = (menuitem){ "Help",                ACT_HELP };
-    g_menu[g_nmenu++] = (menuitem){ "Log out",             ACT_LOGOUT };
-}
+/* The global action launcher (Ctrl-K / ':') — a tk_palette: incremental search,
+ * sections, right-aligned key hints. Every action reachable without a command. */
+static const tk_pal_item g_launcher_items[] = {
+    { "Channel", "New channel",         NULL, "n",  ACT_NEWCHAN },
+    { "Channel", "Leave this channel",  NULL, NULL, ACT_LEAVE },
+    { "Channel", "Notifications",       NULL, NULL, ACT_PREFS },
+    { "Channel", "Channel webhooks",    NULL, NULL, ACT_WEBHOOKS },
+    { "Messages","Search messages",     NULL, "^F", ACT_SEARCH },
+    { "You",     "New direct message",  NULL, NULL, ACT_NEWDM },
+    { "You",     "Set away",            NULL, NULL, ACT_AWAY },
+    { "You",     "Set online",          NULL, NULL, ACT_ONLINE },
+    { "You",     "Change display name", NULL, NULL, ACT_NICK },
+    { "You",     "Your profile",        NULL, NULL, ACT_PROFILE },
+    { "Admin",   "Invite a user",       NULL, NULL, ACT_INVITE },
+    { "Admin",   "Storage usage",       NULL, NULL, ACT_STORAGE },
+    { "Admin",   "Audit log",           NULL, NULL, ACT_AUDIT },
+    { "Workspace","Switch workspace",   NULL, "^W", ACT_WORKSPACES },
+    { "Session", "Help",                NULL, "?",  ACT_HELP },
+    { "Session", "Log out",             NULL, NULL, ACT_LOGOUT },
+};
 
 static void render(oc_client *cl, size_t focus, const char *composer,
                    size_t clen, int scroll, int help_open, int ac_idx,
@@ -1625,6 +1625,10 @@ int main(int argc, char **argv) {
     int prompt_kind = PROMPT_NONE; const char *prompt_title = "";
     tk_input prompt_input; tk_input_init(&prompt_input, 0, "");
 
+    /* Global action launcher (tuikit tk_palette, Ctrl-K / ':'). */
+    int launcher_open = 0;
+    tk_palette launcher; tk_palette_init(&launcher, "Commands");
+
     while (running) {
         /* Tick EVERY workspace, not just the visible one: a background session
          * has to keep receiving so its unread count is live in the switcher
@@ -1688,6 +1692,7 @@ int main(int argc, char **argv) {
             tk_input_draw(&prompt_input, (tk_rect){ in.x, in.y, in.w, 1 }, 1);
             tb_present();
         }
+        if (launcher_open) { tk_palette_draw(&launcher, tb_width(), tb_height()); tb_present(); }
         if (picker_open) draw_picker(eq, esel);
         if (profile_open) draw_profile(oc_client_model(cl), tb_width(), tb_height());
         if (switcher_open) draw_switcher(wsel);
@@ -1701,7 +1706,7 @@ int main(int argc, char **argv) {
         if (ev.type == TB_EVENT_MOUSE) {       /* wheel scrolls; click focuses a channel/member */
             if (ev.key == TB_KEY_MOUSE_WHEEL_UP) scroll += 3;
             else if (ev.key == TB_KEY_MOUSE_WHEEL_DOWN) { scroll -= 3; if (scroll < 0) scroll = 0; }
-            else if (ev.key == TB_KEY_MOUSE_LEFT && !help_open && !action_open && !prompt_kind && !picker_open) {
+            else if (ev.key == TB_KEY_MOUSE_LEFT && !help_open && !action_open && !prompt_kind && !launcher_open && !picker_open) {
                 int Wm = tb_width(); int chw, memw, msgx, msgw;
                 layout(Wm, &chw, &memw, &msgx, &msgw);
                 int prow = ev.y - 2;           /* first panel content row */
@@ -1806,6 +1811,31 @@ int main(int argc, char **argv) {
             }
             continue;
         }
+        if (launcher_open) {                   /* global action launcher (tk_palette) */
+            tk_result lr = tk_palette_handle(&launcher, &ev);
+            if (lr == TK_CANCEL) launcher_open = 0;
+            else if (lr == TK_SELECT) {
+                int id = tk_palette_selected_id(&launcher);
+                launcher_open = 0;
+                if      (id == ACT_NEWCHAN) { prompt_kind = PROMPT_NEWCHAN; prompt_title = "New channel"; tk_input_init(&prompt_input, 0, "name"); }
+                else if (id == ACT_NEWDM)   { prompt_kind = PROMPT_DM; prompt_title = "New direct message"; tk_input_init(&prompt_input, 0, "username"); }
+                else if (id == ACT_SEARCH)  { prompt_kind = PROMPT_SEARCH; prompt_title = "Search messages"; tk_input_init(&prompt_input, 0, "query"); }
+                else if (id == ACT_NICK)    { prompt_kind = PROMPT_NICK; prompt_title = "Change display name"; tk_input_init(&prompt_input, 0, "new name"); }
+                else if (id == ACT_AWAY)    oc_client_set_presence(cl, OC_PRESENCE_AWAY);
+                else if (id == ACT_ONLINE)  oc_client_set_presence(cl, OC_PRESENCE_ONLINE);
+                else if (id == ACT_PREFS)   oc_client_toggle_prefs(cl, 1);
+                else if (id == ACT_LEAVE)   { if (act_cid) oc_client_leave_channel(cl, act_cid); }
+                else if (id == ACT_WEBHOOKS){ if (act_cid) oc_client_webhooks(cl, act_cid); }
+                else if (id == ACT_INVITE)  oc_client_invite_user(cl, OC_ROLE_MEMBER);
+                else if (id == ACT_PROFILE) profile_open = 1;
+                else if (id == ACT_STORAGE) { oc_client_storage_status(cl); storage_open = 1; }
+                else if (id == ACT_AUDIT)   { oc_client_audit_query(cl, 0); audit_open = 1; }
+                else if (id == ACT_WORKSPACES) { sw_build(); wsel = (g_active < g_nsw) ? g_active : 0; switcher_open = 1; }
+                else if (id == ACT_HELP)    help_open = 1;
+                else if (id == ACT_LOGOUT)  { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
+            }
+            continue;
+        }
         if (action_open) {                     /* message action menu (tuikit) */
             tk_result ar = tk_list_handle(&action_menu, &ev);
             if (ar == TK_CANCEL) action_open = 0;
@@ -1872,12 +1902,11 @@ int main(int argc, char **argv) {
             }
             continue;
         }
-        if (ev.key == TB_KEY_CTRL_K) {         /* global action launcher (tuikit) */
+        if (ev.key == TB_KEY_CTRL_K) {         /* global action launcher (tuikit tk_palette) */
             const oc_model *mm = oc_client_model(cl);
-            menu_build_global();
             act_cid = focus < mm->n_channels ? mm->channels[focus].channel_id : 0;
-            act_uid = 0; act_mid = 0; act_title = "Actions";
-            action_open = 1; tk_list_reset_filter(&action_menu);
+            tk_palette_set(&launcher, g_launcher_items, (int)(sizeof g_launcher_items / sizeof *g_launcher_items));
+            launcher_open = 1;
             continue;
         }
         if (ev.key == TB_KEY_CTRL_F) {         /* search dialog (tuikit) — replaces /search */
@@ -2012,10 +2041,9 @@ int main(int argc, char **argv) {
             help_open = 1;                     /* ? on an empty composer opens help */
         } else if (ev.ch == ':' && clen == 0) {   /* : opens the action launcher */
             const oc_model *mm = oc_client_model(cl);
-            menu_build_global();
             act_cid = focus < mm->n_channels ? mm->channels[focus].channel_id : 0;
-            act_uid = 0; act_mid = 0; act_title = "Actions";
-            action_open = 1; tk_list_reset_filter(&action_menu);
+            tk_palette_set(&launcher, g_launcher_items, (int)(sizeof g_launcher_items / sizeof *g_launcher_items));
+            launcher_open = 1;
         } else if (ev.ch != 0) {
             /* A typed codepoint: append its UTF-8 encoding to the composer. */
             utf8proc_uint8_t enc[4];
@@ -2035,6 +2063,8 @@ int main(int argc, char **argv) {
     }
 
     tb_shutdown();
+    tk_list_free(&action_menu);
+    tk_palette_free(&launcher);
     for (int i = 0; i < g_nws; i++) oc_client_stop(g_ws[i].cl);
     g_nws = 0;
     oc_secret_free(secret);
