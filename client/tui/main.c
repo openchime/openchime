@@ -13,7 +13,7 @@
  * **Multiple workspaces (REQ-012/013/014/015).** The TUI holds one oc_client per
  * signed-in workspace (g_ws, up to MAX_WS), ticks them all every frame so a
  * background workspace keeps receiving and counting unread, and renders only the
- * active one. ^W opens the switcher: remembered workspaces with their unread +
+ * active one. Ctrl+W opens the switcher: remembered workspaces with their unread +
  * connection state, and an always-present "Log in to new workspace" row. Each
  * session carries its own focused channel, scroll, and half-typed message, so
  * switching away and back doesn't lose work.
@@ -531,9 +531,9 @@ static void draw_help(int W, int H) {
     static const char *L[] = {
         "type + Enter   send a message",
         "Tab / Esc      move between panes and the composer",
-        "^K  or  :      action menu — everything (new channel, search, prefs, …)",
-        "^F             search messages",
-        "^W             switch workspace   ·   ^R reconnect   ·   ^Q quit",
+        "Ctrl+K  or  :      action menu — everything (new channel, search, prefs, …)",
+        "Ctrl+F             search messages",
+        "Ctrl+W             switch workspace   ·   Ctrl+R reconnect   ·   Ctrl+Q quit",
         "",
         "Channels pane:",
         "  ↑/↓ select   ·   Enter open   ·   n new channel",
@@ -544,7 +544,7 @@ static void draw_help(int W, int H) {
         "  accelerators: t thread  ·  r react  ·  e edit  ·  x delete  ·  w reactions",
         "",
         "Everything is menus and dialogs — no commands to type. Open the action",
-        "menu (^K) to reach notifications, DND, invites, webhooks, storage, audit,",
+        "menu (Ctrl+K) to reach notifications, DND, invites, webhooks, storage, audit,",
         "profile, display name, presence, upload, workspaces, and logout.",
     };
     int n = (int)(sizeof L / sizeof L[0]);
@@ -718,7 +718,7 @@ static const tk_pal_item g_launcher_items[] = {
     { "Channel", "Notifications",       NULL, NULL, ACT_PREFS },
     { "Channel", "Channel webhooks",    NULL, NULL, ACT_WEBHOOKS },
     { "Channel", "Upload a file",       NULL, NULL, ACT_UPLOAD },
-    { "Messages","Search messages",     NULL, "^F", ACT_SEARCH },
+    { "Messages","Search messages",     NULL, "Ctrl+F", ACT_SEARCH },
     { "You",     "New direct message",  NULL, NULL, ACT_NEWDM },
     { "You",     "Set away",            NULL, NULL, ACT_AWAY },
     { "You",     "Set online",          NULL, NULL, ACT_ONLINE },
@@ -729,7 +729,7 @@ static const tk_pal_item g_launcher_items[] = {
     { "Admin",   "Invite a user",       NULL, NULL, ACT_INVITE },
     { "Admin",   "Storage usage",       NULL, NULL, ACT_STORAGE },
     { "Admin",   "Audit log",           NULL, NULL, ACT_AUDIT },
-    { "Workspace","Switch workspace",   NULL, "^W", ACT_WORKSPACES },
+    { "Workspace","Switch workspace",   NULL, "Ctrl+W", ACT_WORKSPACES },
     { "Session", "Help",                NULL, "?",  ACT_HELP },
     { "Session", "Log out",             NULL, NULL, ACT_LOGOUT },
 };
@@ -911,8 +911,8 @@ static void render(oc_client *cl, size_t focus, const char *composer,
      * keys. Phase 4 wires input matching to these same tables. */
     static const tk_binding KB_COMPOSER[] = {
         { TB_KEY_ENTER, 0, "Enter", "send", 1 }, { TB_KEY_ESC, 0, "Esc", "navigate", 1 },
-        { TB_KEY_CTRL_F, 0, "^F", "search", 1 }, { TB_KEY_CTRL_K, 0, "^K", "actions", 1 },
-        { 0, '?', "?", "help", 1 }, { TB_KEY_CTRL_Q, 0, "^Q", "quit", 1 },
+        { TB_KEY_CTRL_F, 0, "Ctrl+F", "search", 1 }, { TB_KEY_CTRL_K, 0, "Ctrl+K", "actions", 1 },
+        { 0, '?', "?", "help", 1 }, { TB_KEY_CTRL_Q, 0, "Ctrl+Q", "quit", 1 },
     };
     static const tk_binding KB_CHANNELS[] = {
         { TB_KEY_ARROW_DOWN, 0, "↑↓", "select", 1 }, { TB_KEY_ENTER, 0, "Enter", "open", 1 },
@@ -1163,7 +1163,7 @@ static void draw_switcher(int sel) {
                   is_sel ? fg : (e->session >= 0 ? th->fg : th->muted), bg);
     }
     tk_text(x + 2, y + bh - 1, x + bw - 1,
-              " ^W switch \xc2\xb7 d forget \xc2\xb7 Esc close ", th->muted, th->bg);
+              " Ctrl+W switch \xc2\xb7 d forget \xc2\xb7 Esc close ", th->muted, th->bg);
     tb_present();
 }
 
@@ -1617,7 +1617,7 @@ int main(int argc, char **argv) {
     composer[0] = '\0';
     size_t focus = 0;
     int scroll = 0;
-    int switcher_open = 0, wsel = 0;          /* workspace switcher (^W) */
+    int switcher_open = 0, wsel = 0;          /* workspace switcher (Ctrl+W) */
     int storage_open = 0;                     /* /storage overlay (REQ-214) */
     int audit_open = 0;                       /* /audit overlay (REQ-251) */
     int help_open = 0;

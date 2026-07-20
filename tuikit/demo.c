@@ -53,7 +53,7 @@ int main(void) {
 
     static const tk_binding FOOTER[] = {
         { TB_KEY_TAB, 0, "Tab", "focus", 1 }, { 0, 0, "type", "edit", 1 },
-        { TB_KEY_CTRL_O, 0, "^O", "menu", 1 }, { TB_KEY_CTRL_Q, 0, "^Q", "quit", 1 },
+        { TB_KEY_CTRL_O, 0, "Ctrl+O", "menu", 1 }, { TB_KEY_CTRL_Q, 0, "Ctrl+Q", "quit", 1 },
     };
 
     int focus = 0, modal = 0, running = 1;
