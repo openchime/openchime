@@ -711,25 +711,33 @@ static int ac_candidates(const oc_model *m, const char *s, ac_cand *out, int max
     return 0;
 }
 
-/* ---- message action menu (menu-driven; ARCH-83) --------------------------- *
- * Replaces the cryptic r/e/x/w/t nav keys and the /react //thread //edit
- * //delete //reactions commands with a discoverable tk_list-in-a-modal. Enter on
- * a selected message opens it; the direct keys remain as accelerators. */
-enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS };
-typedef struct { const char *label; int id; } msgact;
-static msgact g_msgacts[6];
-static int    g_nmsgact;
-static int  msgact_count(void *ud) { (void)ud; return g_nmsgact; }
-static void msgact_text(int i, void *ud, char *buf, size_t cap, uintattr_t *fg) {
-    (void)ud; *fg = TB_DEFAULT; snprintf(buf, cap, "%s", g_msgacts[i].label);
+/* ---- action menus (menu-driven; ARCH-83) ---------------------------------- *
+ * A discoverable tk_list-in-a-modal that replaces cryptic nav keys and slash
+ * commands. One generic menu holds {label,id} items; the SELECT handler
+ * dispatches on the ACT_* id. Enter on a selected message/member opens it. */
+enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS,
+       ACT_DM, ACT_ROLE_ADMIN, ACT_ROLE_MEMBER, ACT_REMOVE };
+typedef struct { const char *label; int id; } menuitem;
+static menuitem g_menu[8];
+static int      g_nmenu;
+static int  menu_count(void *ud) { (void)ud; return g_nmenu; }
+static void menu_text(int i, void *ud, char *buf, size_t cap, uintattr_t *fg) {
+    (void)ud; *fg = TB_DEFAULT; snprintf(buf, cap, "%s", g_menu[i].label);
 }
-static void msgact_build(int own, int deleted) {
-    g_nmsgact = 0;
-    if (!deleted) g_msgacts[g_nmsgact++] = (msgact){ "Reply in thread", ACT_THREAD };
-    if (!deleted) g_msgacts[g_nmsgact++] = (msgact){ "Add reaction",    ACT_REACT };
-    if (own)      g_msgacts[g_nmsgact++] = (msgact){ "Edit",            ACT_EDIT };
-    if (own)      g_msgacts[g_nmsgact++] = (msgact){ "Delete",          ACT_DELETE };
-                  g_msgacts[g_nmsgact++] = (msgact){ "Who reacted",     ACT_REACTORS };
+static void menu_build_msg(int own, int deleted) {
+    g_nmenu = 0;
+    if (!deleted) g_menu[g_nmenu++] = (menuitem){ "Reply in thread", ACT_THREAD };
+    if (!deleted) g_menu[g_nmenu++] = (menuitem){ "Add reaction",    ACT_REACT };
+    if (own)      g_menu[g_nmenu++] = (menuitem){ "Edit",            ACT_EDIT };
+    if (own)      g_menu[g_nmenu++] = (menuitem){ "Delete",          ACT_DELETE };
+                  g_menu[g_nmenu++] = (menuitem){ "Who reacted",     ACT_REACTORS };
+}
+static void menu_build_member(int is_self) {
+    g_nmenu = 0;
+    if (!is_self) g_menu[g_nmenu++] = (menuitem){ "Message",     ACT_DM };
+    g_menu[g_nmenu++] = (menuitem){ "Make admin",  ACT_ROLE_ADMIN };
+    g_menu[g_nmenu++] = (menuitem){ "Make member", ACT_ROLE_MEMBER };
+    if (!is_self) g_menu[g_nmenu++] = (menuitem){ "Remove",      ACT_REMOVE };
 }
 
 static void render(oc_client *cl, size_t focus, const char *composer,
@@ -1897,10 +1905,10 @@ int main(int argc, char **argv) {
     time_t last_typing = 0;                   /* throttle outbound TYPING signals */
     int running = 1, logging_out = 0;
 
-    /* Message action menu (tuikit, menu-driven). */
-    int action_open = 0; uint64_t act_cid = 0, act_mid = 0;
+    /* Action menu (tuikit, menu-driven) — messages + members. */
+    int action_open = 0; uint64_t act_cid = 0, act_mid = 0, act_uid = 0;
     tk_list action_menu;
-    tk_list_opts action_opts = { NULL, msgact_count, msgact_text, NULL, 0 };
+    tk_list_opts action_opts = { NULL, menu_count, menu_text, NULL, 0 };
     tk_list_init(&action_menu, &action_opts);
 
     while (running) {
@@ -1956,7 +1964,8 @@ int main(int argc, char **argv) {
 
         render(cl, focus, composer, clen, scroll, help_open, ac_idx, panel, msg_sel, mem_sel, editing);
         if (action_open) {
-            tk_rect in = tk_modal_begin(tb_width(), tb_height(), 30, g_nmsgact + 2, "Message");
+            tk_rect in = tk_modal_begin(tb_width(), tb_height(), 30, g_nmenu + 2,
+                                        act_uid ? "Member" : "Message");
             tk_list_draw(&action_menu, in);
             tb_present();
         }
@@ -2068,11 +2077,15 @@ int main(int argc, char **argv) {
                 int ai = tk_list_selected(&action_menu);
                 action_open = 0;
                 if (ai >= 0) {
-                    int id = g_msgacts[ai].id;
-                    if      (id == ACT_THREAD)   oc_client_open_thread(cl, act_cid, act_mid);
-                    else if (id == ACT_REACTORS) oc_client_list_reactions(cl, act_cid, act_mid);
-                    else if (id == ACT_DELETE)   oc_client_delete(cl, act_cid, act_mid);
-                    else if (id == ACT_REACT)    { picker_open = 1; eq[0] = '\0'; eqlen = 0; esel = 0; picker_cid = act_cid; picker_mid = act_mid; }
+                    int id = g_menu[ai].id;
+                    if      (id == ACT_THREAD)      oc_client_open_thread(cl, act_cid, act_mid);
+                    else if (id == ACT_REACTORS)    oc_client_list_reactions(cl, act_cid, act_mid);
+                    else if (id == ACT_DELETE)      oc_client_delete(cl, act_cid, act_mid);
+                    else if (id == ACT_DM)          { oc_client_open_dm(cl, act_uid); panel = 0; }
+                    else if (id == ACT_ROLE_ADMIN)  oc_client_set_role(cl, act_uid, OC_ROLE_ADMIN);
+                    else if (id == ACT_ROLE_MEMBER) oc_client_set_role(cl, act_uid, OC_ROLE_MEMBER);
+                    else if (id == ACT_REMOVE)      oc_client_remove_user(cl, act_uid);
+                    else if (id == ACT_REACT)       { picker_open = 1; eq[0] = '\0'; eqlen = 0; esel = 0; picker_cid = act_cid; picker_mid = act_mid; }
                     else if (id == ACT_EDIT) {
                         const oc_channel *ec = focused_channel(oc_client_model(cl), act_cid);
                         if (ec) for (size_t k = 0; k < ec->n_msgs; k++)
@@ -2183,7 +2196,11 @@ int main(int argc, char **argv) {
                 if (up && mem_sel > 0) mem_sel--;
                 else if (down && mem_sel + 1 < (int)mm->n_users) mem_sel++;
                 else if (ev.key == TB_KEY_ENTER && mem_sel < (int)mm->n_users) {
-                    oc_client_open_dm(cl, mm->users[mem_sel].user_id); panel = 0;
+                    /* discoverable member action menu (Message / role / remove) */
+                    uint64_t uid = mm->users[mem_sel].user_id;
+                    menu_build_member(uid == mm->user_id);
+                    act_uid = uid; act_cid = 0; act_mid = 0; action_open = 1;
+                    tk_list_reset_filter(&action_menu);
                 }
             }
             else if (panel == 2 && ch) {                                    /* messages */
@@ -2195,8 +2212,8 @@ int main(int argc, char **argv) {
                     uint64_t mid = sel->message_id;
                     int own = (sel->author_id == mm->user_id) && !sel->deleted;
                     if (ev.key == TB_KEY_ENTER) {   /* open the discoverable action menu */
-                        msgact_build(own, sel->deleted);
-                        act_cid = cid; act_mid = mid; action_open = 1;
+                        menu_build_msg(own, sel->deleted);
+                        act_cid = cid; act_mid = mid; act_uid = 0; action_open = 1;
                         tk_list_reset_filter(&action_menu);
                     }
                     else if (ev.ch == 't') oc_client_open_thread(cl, cid, mid);
