@@ -609,13 +609,6 @@ static int ci_prefix(const char *s, const char *pre) {
     return 1;
 }
 
-static const char *AC_COMMANDS[] = {
-    "/react", "/reactions", "/edit", "/delete", "/thread", "/search", "/close",
-    "/create", "/join", "/leave", "/list", "/dm", "/who", "/away", "/online",
-    "/prefs", "/notify", "/dnd", "/set", "/profile", "/nick", "/passwd", "/workspaces", "/storage", "/audit",
-    "/role", "/invite", "/remove", "/webhook",
-    "/upload", "/download", "/logout", "/help",
-};
 
 static const struct { const char *name; const char *emoji; } AC_EMOJI[] = {
     {"+1","\xf0\x9f\x91\x8d"}, {"-1","\xf0\x9f\x91\x8e"}, {"thumbsup","\xf0\x9f\x91\x8d"},
@@ -645,16 +638,8 @@ static int ac_candidates(const oc_model *m, const char *s, ac_cand *out, int max
     int n = 0;
     *repl_start = ws;
 
-    if (ws == 0 && tok[0] == '/') {                          /* slash command */
-        *repl_start = 0;
-        for (size_t i = 0; i < sizeof AC_COMMANDS / sizeof *AC_COMMANDS && n < max; i++)
-            if (ci_prefix(AC_COMMANDS[i] + 1, tok + 1)) {
-                snprintf(out[n].repl, sizeof out[n].repl, "%s", AC_COMMANDS[i]);
-                snprintf(out[n].disp, sizeof out[n].disp, "%s", AC_COMMANDS[i]);
-                n++;
-            }
-        return n;
-    }
+    /* No slash-command completion: the composer is menu-driven and doesn't run
+     * commands. Tab still completes content — @mentions, #channels, :emoji:. */
     if (tok[0] == ':' && !strchr(tok + 1, ':')) {            /* :emoji: shortcode */
         for (size_t i = 0; i < sizeof AC_EMOJI / sizeof *AC_EMOJI && n < max; i++)
             if (ci_prefix(AC_EMOJI[i].name, tok + 1)) {
@@ -682,30 +667,6 @@ static int ac_candidates(const oc_model *m, const char *s, ac_cand *out, int max
                 n++;
             }
         }
-        return n;
-    }
-    if (s[0] == '/') {                                       /* command argument */
-        char cmd[24]; int ci = 0;
-        for (; s[ci] && s[ci] != ' ' && ci < (int)sizeof cmd - 1; ci++) cmd[ci] = s[ci];
-        cmd[ci] = '\0';
-        int chan = (strcmp(cmd, "/join") == 0 || strcmp(cmd, "/leave") == 0);
-        int usr  = (strcmp(cmd, "/dm") == 0 || strcmp(cmd, "/role") == 0 || strcmp(cmd, "/remove") == 0);
-        if (chan)
-            for (size_t i = 0; i < m->n_channels && n < max; i++) {
-                const oc_channel *c = &m->channels[i];
-                if (c->kind != OC_CHANNEL_KIND_DM && c->name && ci_prefix(c->name, tok)) {
-                    snprintf(out[n].repl, sizeof out[n].repl, "%s", c->name);
-                    snprintf(out[n].disp, sizeof out[n].disp, "%s", c->name);
-                    n++;
-                }
-            }
-        else if (usr)
-            for (size_t i = 0; i < m->n_users && n < max; i++)
-                if (m->users[i].name[0] && ci_prefix(m->users[i].name, tok)) {
-                    snprintf(out[n].repl, sizeof out[n].repl, "%s", m->users[i].name);
-                    snprintf(out[n].disp, sizeof out[n].disp, "%s", m->users[i].name);
-                    n++;
-                }
         return n;
     }
     return 0;
