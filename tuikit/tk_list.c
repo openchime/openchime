@@ -68,33 +68,27 @@ tk_result tk_list_handle(tk_list *l, const struct tb_event *ev) {
     rebuild(l);
     if (ev->type != TB_EVENT_KEY) return TK_NONE;
 
-    if (l->filtering) {
-        if (ev->key == TB_KEY_ESC)   { l->filtering = 0; l->filter[0] = '\0'; return TK_CHANGED; }
-        if (ev->key == TB_KEY_ENTER) { l->filtering = 0; return TK_NONE; }
-        if (ev->key == TB_KEY_BACKSPACE || ev->key == TB_KEY_BACKSPACE2) {
-            size_t n = strlen(l->filter); if (n) l->filter[n - 1] = '\0';
-            l->sel = 0; return TK_CHANGED;
-        }
-        if (ev->ch >= 0x20 && ev->ch < 0x7f) {
-            size_t n = strlen(l->filter);
-            if (n + 1 < sizeof l->filter) { l->filter[n] = (char)ev->ch; l->filter[n + 1] = '\0'; l->sel = 0; }
-            return TK_CHANGED;
-        }
-        return TK_USED;
-    }
-
+    /* Single-mode: arrows navigate, typing filters live (no j/k, no '/' gate). */
     switch (ev->key) {
-        case TB_KEY_ARROW_UP:                     l->sel--; break;
-        case TB_KEY_ARROW_DOWN:                   l->sel++; break;
-        case TB_KEY_MOUSE_WHEEL_UP:               l->sel--; break;
-        case TB_KEY_MOUSE_WHEEL_DOWN:             l->sel++; break;
-        case TB_KEY_ENTER:                        return l->nview ? TK_SELECT : TK_USED;
-        case TB_KEY_ESC:                          return TK_CANCEL;
+        case TB_KEY_ARROW_UP:   case TB_KEY_MOUSE_WHEEL_UP:   l->sel--; break;
+        case TB_KEY_ARROW_DOWN: case TB_KEY_MOUSE_WHEEL_DOWN: l->sel++; break;
+        case TB_KEY_ENTER:      return l->nview ? TK_SELECT : TK_USED;
+        case TB_KEY_ESC:
+            if (l->opts.filterable && l->filter[0]) { l->filter[0] = '\0'; l->sel = 0; return TK_CHANGED; }
+            return TK_CANCEL;
+        case TB_KEY_BACKSPACE: case TB_KEY_BACKSPACE2:
+            if (l->opts.filterable) {
+                size_t n = strlen(l->filter); if (n) { l->filter[n - 1] = '\0'; l->sel = 0; }
+                return TK_CHANGED;
+            }
+            return TK_NONE;
         default:
-            if (ev->ch == 'j')                    l->sel++;
-            else if (ev->ch == 'k')               l->sel--;
-            else if (l->opts.filterable && ev->ch == '/') { l->filtering = 1; return TK_USED; }
-            else return TK_NONE;
+            if (l->opts.filterable && ev->ch >= 0x20 && ev->ch < 0x7f) {
+                size_t n = strlen(l->filter);
+                if (n + 1 < sizeof l->filter) { l->filter[n] = (char)ev->ch; l->filter[n + 1] = '\0'; l->sel = 0; }
+                return TK_CHANGED;
+            }
+            return TK_NONE;
     }
     if (l->sel < 0) l->sel = 0;
     if (l->sel >= l->nview) l->sel = l->nview ? l->nview - 1 : 0;
@@ -105,9 +99,9 @@ void tk_list_draw(tk_list *l, tk_rect r) {
     const tk_theme *th = tk_theme_active();
     rebuild(l);
     int y = r.y, rows = r.h;
-    /* filter query line at the top when filtering */
-    if (l->filtering && rows > 0) {
-        char q[80]; snprintf(q, sizeof q, "/%s", l->filter);
+    /* live filter query line at the top once the user starts typing */
+    if (l->opts.filterable && l->filter[0] && rows > 0) {
+        char q[80]; snprintf(q, sizeof q, "%s", l->filter);
         tk_fill(y, r.x, r.x + r.w, th->bg);
         int cx = tk_text(r.x, y, r.x + r.w, q, th->accent | TB_BOLD, th->bg);
         if (cx < r.x + r.w) tb_set_cell(cx, y, ' ', TB_DEFAULT, TB_REVERSE);

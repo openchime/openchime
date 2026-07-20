@@ -26,7 +26,7 @@
  *       #channels, @users, :emoji:) or, on an empty composer, enters navigation
  *       mode · ↑/↓ + PgUp/PgDn scroll · ? help · Ctrl-Q quit. **Navigation mode**
  *       (Esc from the composer): a panel is focused — Tab cycles Channels /
- *       Messages / Members, j/k select, Esc returns to the composer. On the
+ *       Messages / Members, ↑/↓ select, Esc returns to the composer. On the
  *       Messages panel single keys act on the selected message: Enter/t thread ·
  *       r react (opens a filterable emoji picker) · e edit · x delete · w
  *       who-reacted. Members: Enter opens a DM. **Command palette** (`:` on an empty composer, or Ctrl-K anywhere):
@@ -536,11 +536,11 @@ static void draw_help(int W, int H) {
         "^W             switch workspace   ·   ^R reconnect   ·   ^Q quit",
         "",
         "Channels pane:",
-        "  j/k select   ·   Enter open   ·   n new channel",
+        "  ↑/↓ select   ·   Enter open   ·   n new channel",
         "Members pane:",
-        "  j/k select   ·   Enter actions (message / role / remove)   ·   n new DM",
+        "  ↑/↓ select   ·   Enter actions (message / role / remove)   ·   n new DM",
         "Messages pane:",
-        "  j/k select   ·   Enter actions (thread / react / edit / delete / reactions)",
+        "  ↑/↓ select   ·   Enter actions (thread / react / edit / delete / reactions)",
         "  accelerators: t thread  ·  r react  ·  e edit  ·  x delete  ·  w reactions",
         "",
         "Everything is menus and dialogs — no commands to type. Open the action",
@@ -897,17 +897,17 @@ static void render(oc_client *cl, size_t focus, const char *composer,
         { 0, '?', "?", "help", 1 }, { TB_KEY_CTRL_Q, 0, "^Q", "quit", 1 },
     };
     static const tk_binding KB_CHANNELS[] = {
-        { 0, 'j', "j/k", "select", 1 }, { TB_KEY_ENTER, 0, "Enter", "open", 1 },
+        { TB_KEY_ARROW_DOWN, 0, "↑↓", "select", 1 }, { TB_KEY_ENTER, 0, "Enter", "open", 1 },
         { 0, 'n', "n", "new", 1 }, { TB_KEY_TAB, 0, "Tab", "panel", 1 },
         { TB_KEY_ESC, 0, "Esc", "composer", 1 },
     };
     static const tk_binding KB_MESSAGES[] = {
-        { 0, 'j', "j/k", "select", 1 }, { TB_KEY_ENTER, 0, "Enter", "actions", 1 },
+        { TB_KEY_ARROW_DOWN, 0, "↑↓", "select", 1 }, { TB_KEY_ENTER, 0, "Enter", "actions", 1 },
         { 0, 't', "t", "thread", 1 }, { 0, 'r', "r", "react", 1 }, { 0, 'e', "e", "edit", 1 },
         { TB_KEY_TAB, 0, "Tab", "panel", 1 }, { TB_KEY_ESC, 0, "Esc", "composer", 1 },
     };
     static const tk_binding KB_MEMBERS[] = {
-        { 0, 'j', "j/k", "select", 1 }, { TB_KEY_ENTER, 0, "Enter", "actions", 1 },
+        { TB_KEY_ARROW_DOWN, 0, "↑↓", "select", 1 }, { TB_KEY_ENTER, 0, "Enter", "actions", 1 },
         { 0, 'n', "n", "new DM", 1 }, { TB_KEY_TAB, 0, "Tab", "panel", 1 },
         { TB_KEY_ESC, 0, "Esc", "composer", 1 },
     };
@@ -1931,10 +1931,10 @@ int main(int argc, char **argv) {
             const oc_model *mm = oc_client_model(cl);
             const oc_channel *ch = (focus < mm->n_channels) ? &mm->channels[focus] : NULL;
             uint64_t cid = ch ? ch->channel_id : 0;
-            int up   = (ev.ch == 'k' || ev.key == TB_KEY_ARROW_UP);
-            int down = (ev.ch == 'j' || ev.key == TB_KEY_ARROW_DOWN);
+            int up   = (ev.key == TB_KEY_ARROW_UP);
+            int down = (ev.key == TB_KEY_ARROW_DOWN);
             if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) { running = 0; }
-            else if (ev.key == TB_KEY_ESC || ev.ch == 'i') { panel = 0; }   /* back to composing */
+            else if (ev.key == TB_KEY_ESC) { panel = 0; }   /* back to composing */
             else if (ev.key == TB_KEY_TAB) {                                /* cycle panels 1→2→3 */
                 panel = (panel == 1) ? 2 : (panel == 2) ? 3 : 1;
                 if (panel == 2 && ch && (msg_sel < 0 || msg_sel >= (int)ch->n_msgs))
