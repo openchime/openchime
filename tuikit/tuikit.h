@@ -12,5 +12,11 @@
 #include "tk_draw.h"
 #include "tk_style.h"
 #include "tk_key.h"
+#include "tk_common.h"
+#include "tk_list.h"
+#include "tk_input.h"
+#include "tk_textarea.h"
+#include "tk_viewport.h"
+#include "tk_modal.h"
 
 #endif /* TUIKIT_H */

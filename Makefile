@@ -45,7 +45,7 @@ TUI_SRC   := $(wildcard client/tui/*.c)
 # tuikit — the in-tree TUI toolbox (terminal layer + widgets + formatting). Owns
 # the termbox2 instantiation + the Windows console backend (ARCH-83). Linked into
 # both the POSIX and Windows TUI.
-TUIKIT_SRC := $(wildcard tuikit/*.c)
+TUIKIT_SRC := $(filter-out tuikit/demo.c,$(wildcard tuikit/*.c))
 TUIKIT_INC := -Ituikit
 UTF8PROC  := third_party/utf8proc/utf8proc.c
 # The core's local store (client/core/store.c) reuses the daemon's migration
@@ -65,7 +65,7 @@ endif
 TUI_INC   := $(CORE_INC) -Iclient/tui -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
-.PHONY: all test integration core tui bench clean s3-smoke windows-tui
+.PHONY: all test integration core tui bench clean s3-smoke windows-tui tuikit-demo
 
 all: $(BIN)
 
@@ -153,6 +153,14 @@ $(WIN_TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $
 # ARCH-82) is not yet built; its target lands with that client. Two first-draft
 # GUIs (a comctl32 Win32 client and a self-rendered Clay+raylib client) were
 # removed — see ARCH-82 / docs/VENDORS.md.
+
+# --- tuikit demo (ARCH-83) ----------------------------------------------------
+# Standalone harness exercising every tuikit widget — no core, no daemon, no TLS.
+# The toolbox's own smoke test.
+tuikit-demo: build/tuikit-demo
+build/tuikit-demo: $(TUIKIT_SRC) tuikit/demo.c $(UTF8PROC) $(wildcard tuikit/*.h) | build
+	$(CC) $(CFLAGS) -Wno-unused-result $(TUIKIT_INC) -Ithird_party/termbox2 -Ithird_party/utf8proc \
+	    $(TUIKIT_SRC) tuikit/demo.c $(UTF8PROC) -o $@
 
 build:
 	mkdir -p build
