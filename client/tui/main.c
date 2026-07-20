@@ -529,31 +529,23 @@ static void layout(int W, int *ch_w, int *mem_w, int *msg_x, int *msg_w) {
 /* The ? help overlay: a centered popup listing keys + commands. */
 static void draw_help(int W, int H) {
     static const char *L[] = {
-        "Tab            next channel",
-        "↑ ↓ PgUp PgDn  scroll the message pane",
         "type + Enter   send a message",
-        "/command       run a command (below)   ·   ^K palette   ^R reconnect   ^Q quit",
-        "^W             switch workspace (or add one)",
+        "Tab / Esc      move between panes and the composer",
+        "^K  or  :      action menu — everything (new channel, search, prefs, …)",
+        "^F             search messages",
+        "^W             switch workspace   ·   ^R reconnect   ·   ^Q quit",
         "",
-        "Channels & DMs:",
-        "  /join <name>  /leave  /create <name>  /list  /dm <name>",
-        "Messages (last message):",
-        "  /react <emoji>  /reactions  /edit <text>  /delete  /thread",
-        "  /search <query>  /close",
-        "People & notifications:",
-        "  /who  /away  /online  /prefs  /notify <lvl>  /dnd <win|off>",
-        "Profile (yourself):",
-        "  /profile  /nick <name>  /passwd <old> <new>",
-        "Preferences (synced):",
-        "  /set mouse|members|time|channels-width|members-width <value>",
-        "Files, webhooks, admin:",
-        "  /upload <path>  /download <id>  /webhook  /invite  /role  /remove",
-        "  /storage — disk usage, retention policy, what was reclaimed (admin)",
-        "  /audit — role changes, invites, revocations, failed logins (admin)",
-        "Workspaces:",
-        "  ^W or /workspaces — switch, add, or forget (d) a workspace",
-        "Session:",
-        "  /logout",
+        "Channels pane:",
+        "  j/k select   ·   Enter open   ·   n new channel",
+        "Members pane:",
+        "  j/k select   ·   Enter actions (message / role / remove)   ·   n new DM",
+        "Messages pane:",
+        "  j/k select   ·   Enter actions (thread / react / edit / delete / reactions)",
+        "  accelerators: t thread  ·  r react  ·  e edit  ·  x delete  ·  w reactions",
+        "",
+        "Everything is menus and dialogs — no commands to type. Open the action",
+        "menu (^K) to reach notifications, DND, invites, webhooks, storage, audit,",
+        "profile, display name, presence, upload, workspaces, and logout.",
     };
     int n = (int)(sizeof L / sizeof L[0]);
     int bw = 64; if (bw > W - 4) bw = W - 4; if (bw < 24) bw = 24;
@@ -936,28 +928,6 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     tb_present();
 }
 
-/* ---- command palette (:  or Ctrl-K) --------------------------------------- */
-
-enum { PAL_CMD, PAL_CHAN, PAL_DM };
-typedef struct { char label[96]; int kind; uint64_t id; const char *cmd; int needs_arg; } pal_item;
-
-static const struct { const char *cmd; const char *desc; int arg; } PAL_CMDS[] = {
-    {"/join","join a channel",1}, {"/leave","leave this channel",0}, {"/create","create a channel",1},
-    {"/list","refresh channel list",0}, {"/dm","open a direct message",1}, {"/who","member roster",0},
-    {"/away","set yourself away",0}, {"/online","set yourself online",0}, {"/search","search messages",1},
-    {"/thread","open last message's thread",0}, {"/reactions","who reacted (last)",0}, {"/react","react to last",1},
-    {"/edit","edit your last message",1}, {"/delete","delete your last message",0}, {"/prefs","notification settings",0},
-    {"/notify","set channel notify level",1}, {"/dnd","do-not-disturb window",1},
-    {"/set","synced pref (mouse/members/time/…)",1},
-    {"/workspaces","switch workspace (^W)",0},
-    {"/storage","server storage usage (admin)",0},
-    {"/audit","admin + security audit log",0},
-    {"/profile","your identity (name/role/id)",0}, {"/nick","change your display name",1},
-    {"/passwd","change your password",1}, {"/role","set a user's role",1},
-    {"/invite","mint an invite token",0}, {"/remove","remove a user",1}, {"/webhook","channel webhooks",0},
-    {"/upload","upload a file",1}, {"/download","download an attachment",1}, {"/help","keys & commands",0},
-    {"/logout","sign out",0}, {"/close","close the open overlay",0},
-};
 
 /* Case-insensitive subsequence ("fuzzy") match: do needle's chars appear in
  * order within hay? An empty needle matches everything. */
@@ -971,53 +941,6 @@ static int fuzzy(const char *hay, const char *needle) {
     return 0;
 }
 
-/* Build the filtered palette list from commands, channels, and members. */
-static int palette_build(const oc_model *m, const char *q, pal_item *out, int max) {
-    int n = 0;
-    for (size_t i = 0; i < sizeof PAL_CMDS / sizeof *PAL_CMDS && n < max; i++)
-        if (fuzzy(PAL_CMDS[i].cmd, q) || fuzzy(PAL_CMDS[i].desc, q)) {
-            snprintf(out[n].label, sizeof out[n].label, "%-11s %s", PAL_CMDS[i].cmd, PAL_CMDS[i].desc);
-            out[n].kind = PAL_CMD; out[n].cmd = PAL_CMDS[i].cmd; out[n].needs_arg = PAL_CMDS[i].arg; n++;
-        }
-    for (size_t i = 0; i < m->n_channels && n < max; i++) {
-        const oc_channel *c = &m->channels[i];
-        if (c->kind != OC_CHANNEL_KIND_DM && c->name && fuzzy(c->name, q)) {
-            snprintf(out[n].label, sizeof out[n].label, "# %-16s jump to channel", c->name);
-            out[n].kind = PAL_CHAN; out[n].id = c->channel_id; n++;
-        }
-    }
-    for (size_t i = 0; i < m->n_users && n < max; i++)
-        if (m->users[i].name[0] && fuzzy(m->users[i].name, q)) {
-            snprintf(out[n].label, sizeof out[n].label, "@ %-16s direct message", m->users[i].name);
-            out[n].kind = PAL_DM; out[n].id = m->users[i].user_id; n++;
-        }
-    return n;
-}
-
-/* Draw the palette popup (query line + filtered list, selection highlighted). */
-static void draw_palette(const oc_model *m, const char *q, int psel) {
-    int W = tb_width(), H = tb_height();
-    pal_item items[64]; int n = palette_build(m, q, items, 64);
-    int show = n > 12 ? 12 : (n < 1 ? 1 : n);
-    int bw = 64; if (bw > W - 4) bw = W - 4; if (bw < 24) bw = 24;
-    int bh = show + 4; if (bh > H - 2) bh = H - 2;
-    int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
-    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, TB_DEFAULT);
-    tk_panel(x, y, bw, bh, "Command palette  \xc2\xb7  Esc to close", 1);
-    char ql[128]; snprintf(ql, sizeof ql, "\xe2\x80\xba %s", q);
-    tk_text(x + 2, y + 1, x + bw - 1, ql, TB_GREEN | TB_BOLD, TB_DEFAULT);
-    int cxq = x + 4 + (int)strlen(q);
-    if (cxq < x + bw - 1) tb_set_cell(cxq, y + 1, ' ', TB_DEFAULT, TB_REVERSE);
-    int top = (psel >= show) ? psel - show + 1 : 0;
-    for (int i = 0; i < show && top + i < n; i++) {
-        int idx = top + i, sel = (idx == psel);
-        uintattr_t bg = sel ? TB_BLUE : TB_DEFAULT, fg = sel ? TB_WHITE | TB_BOLD : TB_DEFAULT;
-        if (sel) tk_fill(y + 2 + i, x + 1, x + bw - 1, bg);
-        tk_text(x + 2, y + 2 + i, x + bw - 1, items[idx].label, fg, bg);
-    }
-    if (n == 0) tk_text(x + 2, y + 2, x + bw - 1, "(no matches)", TB_BLACK | TB_BOLD, TB_DEFAULT);
-    tb_present();
-}
 
 
 /* The /storage overlay (REQ-214): usage, the active policy, and what
@@ -1329,208 +1252,6 @@ static int setting_onoff(const char *v) {
                  strcmp(v, "true") == 0 || strcmp(v, "yes") == 0);
 }
 
-static void handle_command(oc_client *cl, uint64_t cid, const char *line) {
-    const oc_model *m = oc_client_model(cl);
-    if (strcmp(line, "/close") == 0) {
-        oc_client_close_thread(cl); oc_client_close_search(cl);
-        oc_client_close_reactions(cl); oc_client_toggle_roster(cl, 0);
-        oc_client_toggle_prefs(cl, 0); oc_client_close_webhooks(cl);
-        return;
-    }
-    if (strncmp(line, "/webhook", 8) == 0) {   /* /webhook | /webhook create <label> | /webhook rm <id> */
-        const char *a = line + 8;
-        while (*a == ' ') a++;
-        if (strncmp(a, "create ", 7) == 0) {
-            const char *lb = a + 7;
-            while (*lb == ' ') lb++;
-            if (*lb) oc_client_create_webhook(cl, cid, lb);
-        } else if (strncmp(a, "rm ", 3) == 0 || strncmp(a, "delete ", 7) == 0) {
-            const char *id = a + (a[0] == 'r' ? 3 : 7);
-            while (*id == ' ') id++;
-            unsigned long long wid = strtoull(id, NULL, 10);
-            if (wid) oc_client_delete_webhook(cl, wid);
-        } else {
-            oc_client_webhooks(cl, cid);   /* open the overlay + refresh */
-        }
-        return;
-    }
-    if (strncmp(line, "/upload ", 8) == 0) {   /* /upload <path> — post a file here */
-        const char *path = line + 8;
-        while (*path == ' ') path++;
-        if (*path) oc_client_upload(cl, cid, path);
-        return;
-    }
-    if (strncmp(line, "/download ", 10) == 0) {  /* /download <id> [dest path] */
-        const char *a = line + 10;
-        while (*a == ' ') a++;
-        char *end = NULL;
-        unsigned long long id = strtoull(a, &end, 10);
-        if (!id) return;
-        while (end && *end == ' ') end++;
-        char dest[512];
-        if (end && *end) {
-            snprintf(dest, sizeof dest, "%s", end);   /* explicit destination */
-        } else {
-            const char *fn = attach_filename(m, id);   /* default to the filename in cwd */
-            if (fn[0]) snprintf(dest, sizeof dest, "%s", fn);
-            else       snprintf(dest, sizeof dest, "attachment-%llu", id);
-        }
-        oc_client_download(cl, id, dest);
-        return;
-    }
-    if (strcmp(line, "/prefs") == 0) { oc_client_toggle_prefs(cl, 1); return; }
-    if (strncmp(line, "/notify ", 8) == 0) {   /* set the focused channel's level */
-        const char *lv = line + 8;
-        while (*lv == ' ') lv++;
-        uint8_t level;
-        if      (strcmp(lv, "all") == 0)      level = OC_NOTIFY_ALL;
-        else if (strcmp(lv, "mentions") == 0) level = OC_NOTIFY_MENTIONS;
-        else if (strcmp(lv, "none") == 0)     level = OC_NOTIFY_NONE;
-        else return;
-        oc_client_set_notify_pref(cl, cid, level);
-        return;
-    }
-    if (strncmp(line, "/dnd", 4) == 0) {       /* /dnd off | /dnd HH:MM HH:MM */
-        const char *a = line + 4;
-        while (*a == ' ') a++;
-        if (strcmp(a, "off") == 0 || *a == '\0') { oc_client_set_dnd(cl, 0, 0, 0); return; }
-        char s1[16] = {0}, s2[16] = {0};
-        if (sscanf(a, "%15s %15s", s1, s2) != 2) return;
-        int start = parse_hhmm(s1), end = parse_hhmm(s2);
-        if (start < 0 || end < 0) return;
-        oc_client_set_dnd(cl, 1, (uint16_t)start, (uint16_t)end);
-        return;
-    }
-    if (strcmp(line, "/who") == 0)    { oc_client_toggle_roster(cl, 1); return; }
-    if (strcmp(line, "/away") == 0)   { oc_client_set_presence(cl, OC_PRESENCE_AWAY); return; }
-    if (strcmp(line, "/online") == 0) { oc_client_set_presence(cl, OC_PRESENCE_ONLINE); return; }
-    if (strncmp(line, "/search ", 8) == 0) {
-        const char *q = line + 8;
-        while (*q == ' ') q++;
-        if (*q) oc_client_search(cl, q);
-        return;
-    }
-    if (strncmp(line, "/create ", 8) == 0) {
-        const char *nm = line + 8;
-        while (*nm == ' ') nm++;
-        if (*nm) oc_client_create_channel(cl, nm);
-        return;
-    }
-    if (strncmp(line, "/join ", 6) == 0) {
-        const char *nm = line + 6;
-        while (*nm == ' ') nm++;
-        for (size_t i = 0; i < m->n_channels; i++)   /* resolve id by name */
-            if (m->channels[i].name && strcmp(m->channels[i].name, nm) == 0) {
-                oc_client_join_channel(cl, m->channels[i].channel_id); break;
-            }
-        return;
-    }
-    if (strcmp(line, "/leave") == 0) { oc_client_leave_channel(cl, cid); return; }
-    if (strcmp(line, "/list") == 0)  { oc_client_list_channels(cl); return; }
-    if (strncmp(line, "/dm ", 4) == 0) {          /* open a DM with a user by name */
-        const char *nm = line + 4;
-        while (*nm == ' ') nm++;
-        uint64_t uid = oc_model_user_id(m, nm);
-        if (uid) oc_client_open_dm(cl, uid);
-        return;
-    }
-    if (strncmp(line, "/role ", 6) == 0) {        /* /role <name> owner|admin|member */
-        char nm[64] = {0}, rl[16] = {0};
-        if (sscanf(line + 6, "%63s %15s", nm, rl) != 2) return;
-        uint8_t role;
-        if      (strcmp(rl, "owner") == 0)  role = OC_ROLE_OWNER;
-        else if (strcmp(rl, "admin") == 0)  role = OC_ROLE_ADMIN;
-        else if (strcmp(rl, "member") == 0) role = OC_ROLE_MEMBER;
-        else return;
-        uint64_t uid = oc_model_user_id(m, nm);
-        if (uid) oc_client_set_role(cl, uid, role);
-        return;
-    }
-    if (strncmp(line, "/invite", 7) == 0) {       /* /invite [admin|member] (default member) */
-        const char *rl = line + 7;
-        while (*rl == ' ') rl++;
-        uint8_t role = strcmp(rl, "admin") == 0 ? OC_ROLE_ADMIN : OC_ROLE_MEMBER;
-        oc_client_invite_user(cl, role);
-        return;
-    }
-    if (strncmp(line, "/remove ", 8) == 0) {      /* /remove <name> */
-        const char *nm = line + 8;
-        while (*nm == ' ') nm++;
-        uint64_t uid = oc_model_user_id(m, nm);
-        if (uid) oc_client_remove_user(cl, uid);
-        return;
-    }
-    if (strncmp(line, "/nick ", 6) == 0) {        /* rename yourself (REQ-020) */
-        const char *nm = line + 6;
-        while (*nm == ' ') nm++;
-        if (*nm) oc_client_set_display_name(cl, nm);
-        return;
-    }
-    if (strncmp(line, "/passwd ", 8) == 0) {      /* /passwd <old> <new> — rotate password */
-        char oldp[128] = {0}, newp[128] = {0};
-        if (sscanf(line + 8, "%127s %127s", oldp, newp) == 2 && newp[0])
-            oc_client_change_password(cl, oldp, newp);
-        return;
-    }
-    if (strncmp(line, "/set", 4) == 0 && (line[4] == '\0' || line[4] == ' ')) {
-        /* Portable prefs that sync via the daemon bucket (see apply_synced_settings).
-         *   /set mouse on|off · /set members off|on|auto · /set time 12h|24h
-         *   /set channels-width N · /set members-width N · /set reset <key> */
-        char key[24] = {0}, val[32] = {0};
-        sscanf(line + 4, "%23s %31s", key, val);
-        char num[8];
-        if (strcmp(key, "mouse") == 0) {
-            oc_client_set_setting(cl, OC_SYNC_KEY_MOUSE, setting_onoff(val) ? "1" : "0");
-        } else if (strcmp(key, "members") == 0) {
-            int v = strcmp(val, "auto") == 0 ? 2 : (setting_onoff(val) ? 1 : 0);
-            snprintf(num, sizeof num, "%d", v);
-            oc_client_set_setting(cl, OC_SYNC_KEY_MEMBERS, num);
-        } else if (strcmp(key, "time") == 0) {
-            oc_client_set_setting(cl, OC_SYNC_KEY_TIME24, strcmp(val, "24h") == 0 ? "1" : "0");
-        } else if (strcmp(key, "channels-width") == 0 || strcmp(key, "members-width") == 0) {
-            int n = atoi(val);
-            if (n >= 10 && n <= 60) {
-                snprintf(num, sizeof num, "%d", n);
-                oc_client_set_setting(cl, key[0] == 'c' ? OC_SYNC_KEY_CHWIDTH : OC_SYNC_KEY_MEMWIDTH, num);
-            }
-        } else if (strcmp(key, "reset") == 0) {
-            /* Delete a synced key (empty value) so the file default takes over. */
-            if      (strcmp(val, "mouse") == 0)          oc_client_set_setting(cl, OC_SYNC_KEY_MOUSE, "");
-            else if (strcmp(val, "members") == 0)        oc_client_set_setting(cl, OC_SYNC_KEY_MEMBERS, "");
-            else if (strcmp(val, "time") == 0)           oc_client_set_setting(cl, OC_SYNC_KEY_TIME24, "");
-            else if (strcmp(val, "channels-width") == 0) oc_client_set_setting(cl, OC_SYNC_KEY_CHWIDTH, "");
-            else if (strcmp(val, "members-width") == 0)  oc_client_set_setting(cl, OC_SYNC_KEY_MEMWIDTH, "");
-        }
-        return;
-    }
-
-    const oc_channel *ch = focused_channel(m, cid);
-    if (!ch || ch->n_msgs == 0) return;
-
-    if (strcmp(line, "/thread") == 0) {       /* open the last message's thread */
-        oc_client_open_thread(cl, cid, ch->msgs[ch->n_msgs - 1].message_id);
-    } else if (strcmp(line, "/reactions") == 0) {   /* who reacted to the last message */
-        oc_client_list_reactions(cl, cid, ch->msgs[ch->n_msgs - 1].message_id);
-    } else if (strncmp(line, "/react ", 7) == 0) {
-        const char *emoji = line + 7;
-        while (*emoji == ' ') emoji++;
-        if (!*emoji) return;
-        const oc_msg *last = &ch->msgs[ch->n_msgs - 1];
-        uint8_t op = 1;                       /* add, unless we already reacted */
-        for (uint8_t k = 0; k < last->n_reactions; k++)
-            if (strcmp(last->reactions[k].emoji, emoji) == 0 && last->reactions[k].mine) { op = 0; break; }
-        oc_client_react(cl, cid, last->message_id, emoji, op);
-    } else if (strncmp(line, "/edit ", 6) == 0) {
-        const char *text = line + 6;
-        while (*text == ' ') text++;
-        if (!*text) return;
-        const oc_msg *mine = my_last_message(ch, m->user_id);
-        if (mine) oc_client_edit(cl, cid, mine->message_id, text);
-    } else if (strcmp(line, "/delete") == 0) {
-        const oc_msg *mine = my_last_message(ch, m->user_id);
-        if (mine) oc_client_delete(cl, cid, mine->message_id);
-    }
-}
 
 /* Resolve the local store path (session token + TOFU pin persistence): the
  * explicit $OPENCHIME_STATE if set, else $HOME/.local/state/openchime/state.db
@@ -1882,8 +1603,6 @@ int main(int argc, char **argv) {
     int panel = 0;                            /* 0 composer · 1 channels · 2 messages · 3 members */
     int msg_sel = -1, mem_sel = 0;            /* selection within the messages / members panel */
     uint64_t editing = 0;                     /* message id being edited (0 = none) */
-    int palette_open = 0, psel = 0;           /* command palette (: or Ctrl-K) */
-    char pq[64] = ""; size_t pqlen = 0;       /* palette query */
     int picker_open = 0, esel = 0;            /* emoji picker (r on a message) */
     char eq[32] = ""; size_t eqlen = 0;       /* picker query */
     uint64_t picker_cid = 0, picker_mid = 0;  /* message being reacted to */
@@ -1968,7 +1687,6 @@ int main(int argc, char **argv) {
             tk_input_draw(&prompt_input, (tk_rect){ in.x, in.y, in.w, 1 }, 1);
             tb_present();
         }
-        if (palette_open) draw_palette(oc_client_model(cl), pq, psel);
         if (picker_open) draw_picker(eq, esel);
         if (profile_open) draw_profile(oc_client_model(cl), tb_width(), tb_height());
         if (switcher_open) draw_switcher(wsel);
@@ -1982,7 +1700,7 @@ int main(int argc, char **argv) {
         if (ev.type == TB_EVENT_MOUSE) {       /* wheel scrolls; click focuses a channel/member */
             if (ev.key == TB_KEY_MOUSE_WHEEL_UP) scroll += 3;
             else if (ev.key == TB_KEY_MOUSE_WHEEL_DOWN) { scroll -= 3; if (scroll < 0) scroll = 0; }
-            else if (ev.key == TB_KEY_MOUSE_LEFT && !help_open && !palette_open && !picker_open) {
+            else if (ev.key == TB_KEY_MOUSE_LEFT && !help_open && !action_open && !prompt_kind && !picker_open) {
                 int Wm = tb_width(); int chw, memw, msgx, msgw;
                 layout(Wm, &chw, &memw, &msgx, &msgw);
                 int prow = ev.y - 2;           /* first panel content row */
@@ -2130,42 +1848,6 @@ int main(int argc, char **argv) {
                     else if (id == ACT_HELP)    help_open = 1;
                     else if (id == ACT_LOGOUT)  { oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1; }
                 }
-            }
-            continue;
-        }
-        if (palette_open) {                    /* command palette: type to filter */
-            const oc_model *mm = oc_client_model(cl);
-            pal_item items[64]; int n = palette_build(mm, pq, items, 64);
-            if (ev.key == TB_KEY_ESC || ev.key == TB_KEY_CTRL_C || ev.key == TB_KEY_CTRL_Q) {
-                palette_open = 0;
-            } else if (ev.key == TB_KEY_ARROW_DOWN) { if (psel + 1 < n) psel++; }
-            else if (ev.key == TB_KEY_ARROW_UP)     { if (psel > 0) psel--; }
-            else if (ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2) {
-                if (pqlen) pq[--pqlen] = '\0';
-                psel = 0;
-            } else if (ev.key == TB_KEY_ENTER) {
-                if (n > 0 && psel < n) {
-                    pal_item *it = &items[psel];
-                    uint64_t cid = (focus < mm->n_channels) ? mm->channels[focus].channel_id : 0;
-                    if (it->kind == PAL_CHAN) {
-                        for (size_t z = 0; z < mm->n_channels; z++)
-                            if (mm->channels[z].channel_id == it->id) { focus = z; break; }
-                    } else if (it->kind == PAL_DM) {
-                        oc_client_open_dm(cl, it->id);
-                    } else if (strcmp(it->cmd, "/logout") == 0) {
-                        oc_client_logout(cl, OC_LOGOUT_THIS); logging_out = 1;
-                    } else if (strcmp(it->cmd, "/help") == 0) {
-                        help_open = 1;
-                    } else if (!it->needs_arg) {
-                        handle_command(cl, cid, it->cmd);
-                    } else {                   /* command needs an argument: prefill composer */
-                        snprintf(composer, sizeof composer, "%s ", it->cmd);
-                        clen = strlen(composer); panel = 0;
-                    }
-                }
-                palette_open = 0;
-            } else if (ev.ch >= 0x20 && ev.ch <= 0x7e && pqlen + 1 < sizeof pq) {
-                pq[pqlen++] = (char)ev.ch; pq[pqlen] = '\0'; psel = 0;
             }
             continue;
         }
