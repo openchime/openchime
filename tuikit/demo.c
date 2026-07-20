@@ -32,6 +32,7 @@ static void act_text(int i, void *ud, char *buf, size_t cap, uintattr_t *fg) {
 int main(void) {
     if (tb_init() != TB_OK) { fprintf(stderr, "need a tty\n"); return 1; }
     tb_set_input_mode(TB_INPUT_ESC | TB_INPUT_MOUSE);
+    tb_set_output_mode(TB_OUTPUT_256);
 
     tk_list chans; tk_list_opts co = { NULL, chan_count, chan_text, chan_filter, 1 };
     tk_list_init(&chans, &co);

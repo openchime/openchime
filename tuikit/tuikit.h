@@ -9,6 +9,7 @@
 #define TUIKIT_H
 
 #include "tk_term.h"
+#include "tk_theme.h"
 #include "tk_draw.h"
 #include "tk_style.h"
 #include "tk_key.h"

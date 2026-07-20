@@ -3,6 +3,7 @@
  */
 
 #include "tk_list.h"
+#include "tk_theme.h"
 #include "tk_draw.h"
 
 #include <ctype.h>
@@ -101,13 +102,14 @@ tk_result tk_list_handle(tk_list *l, const struct tb_event *ev) {
 }
 
 void tk_list_draw(tk_list *l, tk_rect r) {
+    const tk_theme *th = tk_theme_active();
     rebuild(l);
     int y = r.y, rows = r.h;
     /* filter query line at the top when filtering */
     if (l->filtering && rows > 0) {
         char q[80]; snprintf(q, sizeof q, "/%s", l->filter);
-        tk_fill(y, r.x, r.x + r.w, TB_DEFAULT);
-        int cx = tk_text(r.x, y, r.x + r.w, q, TB_CYAN | TB_BOLD, TB_DEFAULT);
+        tk_fill(y, r.x, r.x + r.w, th->bg);
+        int cx = tk_text(r.x, y, r.x + r.w, q, th->accent | TB_BOLD, th->bg);
         if (cx < r.x + r.w) tb_set_cell(cx, y, ' ', TB_DEFAULT, TB_REVERSE);
         y++; rows--;
     }
@@ -118,10 +120,10 @@ void tk_list_draw(tk_list *l, tk_rect r) {
 
     for (int k = l->top; k < l->nview && k < l->top + rows; k++, y++) {
         int sel = (k == l->sel);
-        uintattr_t fg = TB_DEFAULT, bg = sel ? TB_BLUE : TB_DEFAULT;
+        uintattr_t fg = th->fg, bg = sel ? th->sel_bg : th->bg;
         char buf[256];
         l->opts.item_text(l->view[k], l->opts.ud, buf, sizeof buf, &fg);
-        if (sel) { fg = TB_WHITE | TB_BOLD; tk_fill(y, r.x, r.x + r.w, bg); }
+        if (sel) { fg = th->sel_fg | TB_BOLD; tk_fill(y, r.x, r.x + r.w, bg); }
         tk_text(r.x, y, r.x + r.w, buf, fg, bg);
     }
 }

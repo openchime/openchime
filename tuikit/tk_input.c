@@ -5,6 +5,7 @@
  */
 
 #include "tk_input.h"
+#include "tk_theme.h"
 #include "tk_draw.h"
 
 #include "utf8proc.h"
@@ -55,8 +56,9 @@ tk_result tk_input_handle(tk_input *in, const struct tb_event *ev) {
 }
 
 void tk_input_draw(tk_input *in, tk_rect r, int focused) {
+    const tk_theme *th = tk_theme_active();
     int xmax = r.x + r.w;
-    tk_fill(r.y, r.x, xmax, TB_DEFAULT);
+    tk_fill(r.y, r.x, xmax, th->bg);
     int cx;
     if (in->buf[0]) {
         if (in->mask) {
@@ -64,13 +66,13 @@ void tk_input_draw(tk_input *in, tk_rect r, int focused) {
             for (const char *p = in->buf; *p && j < sizeof dots - 1; p++)
                 if ((*p & 0xC0) != 0x80) dots[j++] = '*';
             dots[j] = '\0';
-            cx = tk_text(r.x, r.y, xmax, dots, TB_WHITE, TB_DEFAULT);
+            cx = tk_text(r.x, r.y, xmax, dots, th->fg, th->bg);
         } else {
-            cx = tk_text(r.x, r.y, xmax, in->buf, TB_WHITE, TB_DEFAULT);
+            cx = tk_text(r.x, r.y, xmax, in->buf, th->fg, th->bg);
         }
     } else {
-        cx = in->placeholder ? tk_text(r.x, r.y, xmax, in->placeholder, TB_BLACK | TB_BOLD, TB_DEFAULT) : r.x;
-        if (in->placeholder) cx = r.x;   /* cursor sits at start when empty */
+        if (in->placeholder) tk_text(r.x, r.y, xmax, in->placeholder, th->muted, th->bg);
+        cx = r.x;   /* cursor sits at start when empty */
     }
     if (focused && cx < xmax) tb_set_cell(cx, r.y, ' ', TB_DEFAULT, TB_REVERSE);
 }

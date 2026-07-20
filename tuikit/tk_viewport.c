@@ -3,6 +3,7 @@
  */
 
 #include "tk_viewport.h"
+#include "tk_theme.h"
 #include "tk_draw.h"
 
 void tk_viewport_init(tk_viewport *v, int follow) {

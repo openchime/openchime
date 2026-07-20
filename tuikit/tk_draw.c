@@ -3,6 +3,7 @@
  */
 
 #include "tk_draw.h"
+#include "tk_theme.h"
 
 #include "utf8proc.h"
 #include <string.h>
@@ -44,4 +45,12 @@ int tk_text(int x, int y, int xmax, const char *s, uintattr_t fg, uintattr_t bg)
 
 void tk_fill(int y, int x0, int x1, uintattr_t bg) {
     for (int x = x0; x < x1; x++) tb_set_cell(x, y, ' ', TB_DEFAULT, bg);
+}
+
+int tk_text_right(int y, int x0, int x1, const char *s, uintattr_t fg, uintattr_t bg) {
+    int w = tk_str_width(s);
+    int start = x1 - w;
+    if (start < x0) start = x0;   /* too wide: left-clip */
+    tk_text(start, y, x1, s, fg, bg);
+    return start;
 }

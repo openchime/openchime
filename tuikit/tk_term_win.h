@@ -86,7 +86,12 @@ struct tb_event {
 #define TB_BOLD     0x0100
 #define TB_REVERSE  0x0400
 
-/* The 10 functions client/tui/main.c calls. */
+/* Output modes (termbox2 values): 8-color vs xterm-256. */
+#define TB_OUTPUT_CURRENT 0
+#define TB_OUTPUT_NORMAL  1
+#define TB_OUTPUT_256     2
+
+/* The functions client/tui/main.c + tuikit call. */
 int tb_init(void);
 int tb_shutdown(void);
 int tb_width(void);
@@ -95,6 +100,7 @@ int tb_clear(void);
 int tb_present(void);
 int tb_set_cell(int x, int y, uint32_t ch, uintattr_t fg, uintattr_t bg);
 int tb_set_input_mode(int mode);
+int tb_set_output_mode(int mode);
 int tb_poll_event(struct tb_event *event);
 int tb_peek_event(struct tb_event *event, int timeout_ms);
 

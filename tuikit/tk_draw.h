@@ -25,4 +25,8 @@ int  tk_text(int x, int y, int xmax, const char *s, uintattr_t fg, uintattr_t bg
 /* Fill columns [x0, x1) on row y with spaces in the given background. */
 void tk_fill(int y, int x0, int x1, uintattr_t bg);
 
+/* Draw `s` right-aligned within [x0, x1) on row y: its last glyph sits at x1-1.
+ * Clipped to x0 on the left. Returns the starting column. */
+int  tk_text_right(int y, int x0, int x1, const char *s, uintattr_t fg, uintattr_t bg);
+
 #endif /* TK_DRAW_H */

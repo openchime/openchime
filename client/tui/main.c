@@ -1556,6 +1556,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     tb_set_input_mode(TB_INPUT_ESC | (cfg.mouse ? TB_INPUT_MOUSE : 0));
+    tb_set_output_mode(TB_OUTPUT_256);   /* 256-color theme (tuikit tk_theme) */
 
     /* The first session. Everything after this point works through g_ws, so the
      * command line is just one more way to open a workspace. */

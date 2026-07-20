@@ -59,6 +59,7 @@ static struct {
     tb_cell *back;      /* what tb_set_cell writes */
     tb_cell *front;     /* what is currently on screen (for the diff) */
     int      mouse;     /* TB_INPUT_MOUSE enabled */
+    int      omode;     /* output mode: TB_OUTPUT_NORMAL (8) or TB_OUTPUT_256 */
     uint32_t pending_resize_w, pending_resize_h;
     int      have_resize;
 } T;
@@ -126,15 +127,23 @@ static int cell_width(uint32_t cp) {
     return w <= 0 ? 1 : w;   /* treat zero/neg-width as 1 so layout never desyncs */
 }
 
-/* Append the SGR sequence for (fg,bg) to buf. termbox color 1..8 → ANSI 30..37;
- * TB_DEFAULT(0) → 39/49; TB_BOLD → 1; TB_REVERSE → 7. */
+/* Append the SGR sequence for (fg,bg) to buf. In 8-color mode (TB_OUTPUT_NORMAL)
+ * termbox color 1..8 → ANSI 30..37, TB_DEFAULT(0) → 39/49. In 256-color mode the
+ * low byte is an xterm-256 index → 38;5;N / 48;5;N (0 = default → 39/49). TB_BOLD
+ * → 1; TB_REVERSE → 7. */
 static size_t sgr(char *buf, uintattr_t fg, uintattr_t bg) {
     int fcol = fg & 0x00FF, bcol = bg & 0x00FF;
-    int fansi = fcol ? (30 + (fcol - 1)) : 39;
-    int bansi = bcol ? (40 + (bcol - 1)) : 49;
     const char *bold = (fg & TB_BOLD) ? ";1" : "";
     const char *rev  = (fg & TB_REVERSE) ? ";7" : "";
-    return (size_t)snprintf(buf, 32, "\x1b[0;%d;%d%s%sm", fansi, bansi, bold, rev);
+    if (T.omode == TB_OUTPUT_256) {
+        char fpart[16], bpart[16];
+        if (fcol) snprintf(fpart, sizeof fpart, ";38;5;%d", fcol); else snprintf(fpart, sizeof fpart, ";39");
+        if (bcol) snprintf(bpart, sizeof bpart, ";48;5;%d", bcol); else snprintf(bpart, sizeof bpart, ";49");
+        return (size_t)snprintf(buf, 40, "\x1b[0%s%s%s%sm", fpart, bpart, bold, rev);
+    }
+    int fansi = fcol ? (30 + (fcol - 1)) : 39;
+    int bansi = bcol ? (40 + (bcol - 1)) : 49;
+    return (size_t)snprintf(buf, 40, "\x1b[0;%d;%d%s%sm", fansi, bansi, bold, rev);
 }
 
 /* --- lifecycle ------------------------------------------------------------ */
@@ -180,6 +189,7 @@ int tb_init(void) {
     outs("\x1b[?1049h");   /* alternate screen buffer */
     outs("\x1b[?25l");     /* hide cursor */
     outs("\x1b[2J");       /* clear */
+    T.omode = TB_OUTPUT_NORMAL;
     T.inited = 1;
     return TB_OK;
 }
@@ -229,6 +239,13 @@ int tb_set_input_mode(int mode) {
     return TB_OK;
 }
 
+int tb_set_output_mode(int mode) {
+    /* We support NORMAL (8-color) and 256. sgr() switches on T.omode. */
+    if (mode == TB_OUTPUT_CURRENT) return T.omode ? T.omode : TB_OUTPUT_NORMAL;
+    T.omode = (mode == TB_OUTPUT_256) ? TB_OUTPUT_256 : TB_OUTPUT_NORMAL;
+    return T.omode;
+}
+
 /* --- present (diff) ------------------------------------------------------- */
 
 int tb_present(void) {
@@ -237,7 +254,7 @@ int tb_present(void) {
      * SGR once. Wide glyphs consume the following cell. */
     static char *fb = NULL;
     static size_t fbcap = 0;
-    size_t need = (size_t)T.w * T.h * 24 + 64;   /* generous upper bound */
+    size_t need = (size_t)T.w * T.h * 48 + 64;   /* generous upper bound (256-color SGR is longer) */
     if (need > fbcap) { char *n = realloc(fb, need); if (!n) return TB_ERR; fb = n; fbcap = need; }
     size_t p = 0;
 

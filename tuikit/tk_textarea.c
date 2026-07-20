@@ -3,6 +3,7 @@
  */
 
 #include "tk_textarea.h"
+#include "tk_theme.h"
 #include "tk_draw.h"
 
 #include "utf8proc.h"
