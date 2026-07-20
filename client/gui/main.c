@@ -114,6 +114,52 @@ static char *login_focused_buf(size_t *cap) {
     *cap = sizeof f_pass; return f_pass;
 }
 
+/* Map a raylib key code to its ASCII character (US-QWERTY), honouring shift.
+ * Used as a fallback when the platform's character callback doesn't fire — under
+ * WSLg/XWayland GetCharPressed is dead but raw key events still arrive. Returns 0
+ * for non-text keys. */
+static int key_to_char(int key, int shift) {
+    if (key >= KEY_A && key <= KEY_Z) return shift ? key : key + 32;       /* 'A'..'Z' / 'a'..'z' */
+    if (key >= KEY_ZERO && key <= KEY_NINE) {
+        static const char sh[] = ")!@#$%^&*(";
+        return shift ? sh[key - KEY_ZERO] : key;                            /* '0'..'9' / shifted */
+    }
+    if (key >= KEY_KP_0 && key <= KEY_KP_9) return '0' + (key - KEY_KP_0);
+    switch (key) {
+        case KEY_SPACE:         return ' ';
+        case KEY_APOSTROPHE:    return shift ? '"' : '\'';
+        case KEY_COMMA:         return shift ? '<' : ',';
+        case KEY_MINUS:         return shift ? '_' : '-';
+        case KEY_PERIOD:        return shift ? '>' : '.';
+        case KEY_SLASH:         return shift ? '?' : '/';
+        case KEY_SEMICOLON:     return shift ? ':' : ';';
+        case KEY_EQUAL:         return shift ? '+' : '=';
+        case KEY_LEFT_BRACKET:  return shift ? '{' : '[';
+        case KEY_BACKSLASH:     return shift ? '|' : '\\';
+        case KEY_RIGHT_BRACKET: return shift ? '}' : ']';
+        case KEY_GRAVE:         return shift ? '~' : '`';
+        case KEY_KP_DECIMAL:    return '.';
+    }
+    return 0;
+}
+
+/* Feed typed text into `buf`. Prefers the character callback (correct for layouts
+ * + IME on normal platforms); if it produced nothing this frame, falls back to
+ * key→char translation (WSLg). Returns the number of characters added. */
+static int feed_text_input(char *buf, size_t cap) {
+    int added = 0, cp;
+    while ((cp = GetCharPressed())) { if (cp >= 0x20) { buf_append_cp(buf, cap, cp); added++; } }
+    if (!added) {
+        int shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+        int key;
+        while ((key = GetKeyPressed())) {
+            int c = key_to_char(key, shift);
+            if (c) { buf_append_cp(buf, cap, c); added++; }
+        }
+    }
+    return added;
+}
+
 /* ---- model helpers -------------------------------------------------------- */
 static const oc_channel *find_chan(const oc_model *m, uint64_t cid) {
     for (size_t i = 0; i < m->n_channels; i++)
@@ -248,11 +294,8 @@ static void login_input(void) {
     if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
         size_t cap; buf_backspace(login_focused_buf(&cap)); if (g_phase == PH_ERROR) g_phase = PH_FORM;
     }
-    int cp;
-    while ((cp = GetCharPressed())) {
-        if (cp < 0x20) continue;
-        size_t cap; buf_append_cp(login_focused_buf(&cap), cap, cp); if (g_phase == PH_ERROR) g_phase = PH_FORM;
-    }
+    size_t cap; char *buf = login_focused_buf(&cap);
+    if (feed_text_input(buf, cap) && g_phase == PH_ERROR) g_phase = PH_FORM;
 }
 
 /* ---- chat input ----------------------------------------------------------- */
@@ -268,8 +311,7 @@ static void chat_input(void) {
     }
     if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) { compose_submit(); return; }
     if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) buf_backspace(g_compose);
-    int cp;
-    while ((cp = GetCharPressed())) { if (cp >= 0x20) buf_append_cp(g_compose, sizeof g_compose, cp); }
+    feed_text_input(g_compose, sizeof g_compose);
     if (GetMouseWheelMove() != 0) g_pin_bottom = 0;   /* user took over scrolling */
 }
 
