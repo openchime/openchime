@@ -11,7 +11,7 @@ dropped; there is no shared rendering layer, because each platform's OS shapes
 its own text and provides its own widgets.
 
 **Status.** Building the app-core + a **TUI** frontend first (the fastest usable,
-CI-testable client). Native GUIs (Win32/WinUI, AppKit, Android, a web DOM UI)
+CI-testable client). Native GUIs (Win32, GTK, AppKit, Android, a web DOM UI)
 and mobile follow.
 
 ---
@@ -89,14 +89,18 @@ model; translate input to intents }, stop.
   (LGPL); termbox2 + utf8proc keep the whole client permissive. **The TUI is
   text-only and never renders graphics — no images, ever.** Built on the host
   like the daemon (`make tui`), zero transitive dependencies. The widget/
-  formatting layer above termbox2 is being extracted into a reusable in-tree
-  toolbox, **`tuikit`** (ARCH-83, [TUIKIT.md](./TUIKIT.md)) — the foundation for
-  the menu/screen-driven redesign that replaces the slash-command UX.
+  formatting layer above termbox2 is the in-tree **`tuikit`** toolbox (ARCH-83,
+  [TUIKIT.md](./TUIKIT.md)): panels, modal lists, a command palette, text
+  prompts, and a 256-color theme. The menu/screen-driven redesign built on it
+  has shipped and replaced the slash-command UX.
 
-  **Interaction model — modeless (weechat/irssi/Slack), not modal.** The input
-  line is always ready to type a message (Enter sends); actions are
-  `/`-commands (`/join`, `/dm`, `/react`, `/thread`, `/search`, …) and
-  navigation is Ctrl/Alt chords (switch buffer, scroll, quick-jump). A chat app's
+  **Interaction model — modeless and menu-driven, not slash-command-driven.**
+  The input line is always ready to type a message (Enter sends only); every
+  action is reached through discoverable UI — pane action menus (Enter on a
+  selected message/member/channel), modal prompt dialogs, and a global action
+  launcher (Ctrl+K or `:`). Navigation is Esc/Tab between the composer and the
+  panels plus a few Ctrl chords (Ctrl+F search, Ctrl+W workspaces, Ctrl+R
+  reconnect, Ctrl+Q quit). There are no slash commands. A chat app's
   reflex is "type and hit Enter"; a modal/vim scheme taxes every message with an
   `i` first, so it's rejected. **Loop:** termbox2 on the main thread, draining
   `oc_client` events each iteration and polling input with a short timeout
@@ -105,19 +109,24 @@ model; translate input to intents }, stop.
   the lazygit/k9s idiom):** a header bar (workspace · you · presence · connection ·
   unread), three **bordered, titled panels** — Channels │ Messages │ Members
   (the active one drawn in a bright border) — a status line, the always-ready
-  composer, and a **context keybinding hint bar**; `?` (or `/help`) opens a full
+  composer, and a **context keybinding hint bar**; `?` opens a full
   help overlay. Read-only overlays (thread, search, roster, who-reacted,
   notification prefs, webhooks) render inside the Messages panel. Everything is
   drawn cell-by-cell, re-laid-out on resize, measuring glyph width with utf8proc.
   **Navigation mode** (Esc from the composer, or Tab on an empty composer): a
   panel is focused (bright border); Tab cycles Channels / Messages / Members,
   j/k move a highlighted selection, Esc returns to the composer. On the Messages
-  panel single keys act on the *selected* message — Enter/`t` thread, `r` react
-  (👍; the picker comes later), `e` edit (prefills the composer), `x` delete,
-  `w` who-reacted; on Members, Enter opens a DM. **Command palette** (`:` on an
-  empty composer, or Ctrl-K): a fuzzy-filtered popup over every command plus
-  jump-to-channel / open-DM entries — Enter runs a parameterless command, prefills
-  the composer for one needing an argument (autocomplete then helps), or jumps.
+  panel, Enter opens an action menu (Reply in thread / Add reaction / Download /
+  Edit / Delete / Who reacted); single-key accelerators act directly: `t`
+  thread, `r` react (opens a filterable emoji picker), `e` edit (prefills the
+  composer), `x` (or `d`) delete, `w` who-reacted. On Members, Enter opens a
+  member menu (Message / Make admin / Make member / Remove); `n` starts a new
+  DM. **Action launcher** (`:` on an empty composer, or Ctrl+K): a
+  fuzzy-filtered, sectioned list of every action — New channel, Leave,
+  Notifications, Webhooks, Upload, Search, New DM, Set away/online, Change
+  display name/password, DND, Profile, Invite, Storage usage, Audit log, Switch
+  workspace, Help, Log out. Enter runs a parameterless action immediately, or
+  opens a modal prompt dialog for one needing an argument.
   **Emoji picker:** `r` on a selected message opens a filterable emoji popup
   (type a shortcode name, Enter reacts with the real Unicode emoji, toggling).
   This completes the v2 redesign — panels + focus, navigation mode, autocomplete,
@@ -134,13 +143,14 @@ model; translate input to intents }, stop.
   file default stands. The core exposes it as `oc_client_set_setting` /
   `oc_client_list_settings`, folding each snapshot into the model
   (`oc_model_setting`); the `tui` bucket is separate from a future `gui` one, so
-  frontends never step on each other. `/set <key>
-  <value>` (`mouse on|off`, `members off|on|auto`, `time 12h|24h`,
-  `channels-width N`, `members-width N`, `reset <key>`) writes a key, which
-  round-trips back and applies live; the daemon fans the change to your other
-  logged-in TUIs so they update in place. Which server you connect to
+  frontends never step on each other. Synced prefs are read-only from the TUI: it
+  pulls the daemon bucket on connect and layers it over the machine-local
+  `~/.config/openchime/config` file, but the interactive `/set` writer was
+  removed with the slash-command UX. Edit the config file to change local prefs.
+  (The core still exposes `oc_client_set_setting`; no frontend surface currently
+  calls it.) Which server you connect to
   (`workspace`) is deliberately machine-local and never synced.
-  **Storage report (REQ-214):** `/storage` opens an admin overlay showing free
+  **Storage report (REQ-214):** the launcher's "Storage usage" opens an admin overlay showing free
   space, live attachment usage, the active retention/eviction policy, and how
   much maintenance has reclaimed by reason — with pressure and any evictions
   called out in red, since an operator should not have to read carefully to
@@ -152,11 +162,14 @@ model; translate input to intents }, stop.
   the attachment metadata carries a `reclaimed` flag, so a tombstoned file
   renders dimmed as `📎 name — no longer available` with no download id, instead
   of offering a fetch that is guaranteed to fail.
+  **Audit log (REQ-251):** the launcher's "Audit log" opens an admin overlay of
+  administrative/security actions, newest first, with denials/failures in red;
+  owner/admin only.
   **Multiple workspaces (REQ-012–015):** the TUI holds **one `oc_client` per
   signed-in workspace** (`g_ws`, capped at `MAX_WS`) and ticks *all* of them every
   frame, rendering only the active one — so a workspace you aren't looking at
   keeps receiving and counting unread, and the header shows an "N elsewhere"
-  badge. `^W` (or `/workspaces`) opens the **switcher**: each remembered
+  badge. `Ctrl+W` (or launcher "Switch workspace") opens the **switcher**: each remembered
   workspace with its connection dot, account, and unread count, plus an
   always-present **"+ Log in to new workspace"** row; `d` forgets a closed one.
   The list comes from the store's **workspace book** (§5) unioned with the open
@@ -166,67 +179,69 @@ model; translate input to intents }, stop.
   and half-typed message, restored on switch-back, and nothing crosses between
   workspaces: separate connection, credentials, model, and cached history.
   **Composer autocomplete:** as you type, a live suggestion strip offers
-  context-aware completions — slash commands, `#channel` and `@user` names (from
-  the model's channel list + roster), command arguments (channels for
-  `/join`/`/leave`, users for `/dm`/`/role`/`/remove`), and `:emoji:` shortcodes
-  from a bundled table (inserting the real Unicode emoji). **Tab** accepts the
-  first candidate and cycles the rest; on an empty composer Tab still switches
-  channel.
+  context-aware completions — `#channel` names, `@user` names, and `:emoji:`
+  shortcodes (inserting the real Unicode emoji). Tab accepts the first and
+  cycles; on an empty composer Tab enters navigation mode.
   **Build order:** the lean core loop landed first (sidebar, focus/switch, history
   backfill on open, live messages + display names, send, unread, scrollback,
   reflow, per-nick colors), then each of the following surfaced one engine feature
   already on the wire —
-  - **reactions** — emoji aggregates with a `[n]` "you reacted" marker; `/react
-    <emoji>` toggles on the last message (exercising the wide-char/emoji
-    correctness that justified the toolkit).
-  - **edit/delete** — `/edit`, `/delete`; an `(edited)` marker + `[message
-    deleted]` tombstone.
+  - **reactions** — emoji aggregates with a `[n]` "you reacted" marker; `r` on a
+    selected message (the emoji picker) or the message menu's "Add reaction"
+    toggles a reaction (exercising the wide-char/emoji correctness that justified
+    the toolkit).
+  - **edit/delete** — the message menu (or `e`/`x` on a selected message); an
+    `(edited)` marker + `[message deleted]` tombstone.
   - **typing indicators** — throttled `TYPING` while composing; `✎ X is typing…`
     on the status line.
-  - **threads** — `/thread` opens a message's thread in place of the channel
-    (Enter then posts a reply), with a `↳ N replies` marker on the parent;
-    `/close` exits.
-  - **search** — `/search <query>` overlays matching messages (channel, author,
-    snippet).
-  - **channel management** — `/create`, `/join`, `/leave`, `/list`; non-joined
-    public channels show dimmed with a `+`.
-  - **roster + presence** — `/who` overlays the tenant roster with
-    online/away/offline dots + roles; `/away` and `/online` set your own presence.
-  - **direct messages** — `/dm <name>` opens a 1:1 DM, titled `@peer` in the
-    sidebar (the daemon reports the DM peer in `CHANNEL_INFO` — a small protocol
-    addition).
-  - **logout** — `/logout` revokes this session server-side and quits once the
-    connection drops.
-  - **who-reacted** — `/reactions` overlays the full reactor list of the last
-    message, each reactor paired with the emoji they used (REQ-071).
-  - **notification prefs + DND** — `/prefs` overlays the DND window + per-channel
-    levels; `/notify all|mentions|none` sets the focused channel; `/dnd HH:MM
-    HH:MM | off` sets the do-not-disturb window (REQ-130/131; each SET returns a
-    full sync that the model folds in).
+  - **threads** — the message menu's "Reply in thread" (or `t`) opens a message's
+    thread in place of the channel (Enter then posts a reply), with a `↳ N
+    replies` marker on the parent; Esc exits.
+  - **search** — Ctrl+F (or the launcher's "Search messages") overlays matching
+    messages (channel, author, snippet).
+  - **channel management** — `n` in the Channels pane creates a channel; the
+    channel menu's Join/Open/Leave manage membership; non-joined public channels
+    show dimmed with a `+`.
+  - **roster + presence** — the Members panel lists the tenant roster with
+    online/away/offline dots + roles; the launcher's "Set away/online" sets your
+    own presence.
+  - **direct messages** — `n` in the Members pane (or a member menu's "Message")
+    opens a 1:1 DM, titled `@peer` in the sidebar (the daemon reports the DM peer
+    in `CHANNEL_INFO` — a small protocol addition).
+  - **logout** — the launcher's "Log out" revokes this session server-side and
+    quits once the connection drops.
+  - **who-reacted** — `w` on a selected message (or the message menu's "Who
+    reacted") overlays the full reactor list, each reactor paired with the emoji
+    they used (REQ-071).
+  - **notification prefs + DND** — the launcher's "Notifications" overlays the DND
+    window + per-channel levels; the channel menu's "Notify: all|mentions|none"
+    sets the focused channel; the launcher's "Do not disturb" sets the
+    do-not-disturb window (REQ-130/131; each SET returns a full sync that the
+    model folds in).
   - **read receipts / seen-by (REQ-090)** — the core now sends a `CLIENT_ACK`
     whenever the focused channel's read marker advances; the daemon fans each
     member's read cursor to the others as `READ_CURSOR`, and the TUI renders a
     dim "✓ seen by …" footer under the last message naming everyone (bar you)
     who has read up to it.
-  - **self-service profile (REQ-020)** — `/profile` opens a modal with your name,
-    role, id, and presence; `/nick <name>` renames you (the daemon fans a
-    `PROFILE_UPDATED` so every roster — and your own header — updates live);
-    `/passwd <old> <new>` rotates your local password (the server verifies the old
-    one, and a wrong one shows an error).
-  - **admin / user management** — `/role <name> owner|admin|member`, `/invite
-    [admin|member]` (mints a tenant token, shown once atop the roster), `/remove
-    <name>` disables a user (REQ-030/033, owner/admin only; a `USER_UPDATED` folds
-    each change into the roster).
-  - **webhook management** — `/webhook` overlays the focused channel's incoming
-    webhooks; `/webhook create <label>` mints one (the 32-byte token is shown
-    once atop the overlay, like `/invite`); `/webhook rm <id>` deletes one
+  - **self-service profile (REQ-020)** — the launcher's "Your profile" opens a
+    modal with your name, role, id, and presence; "Change display name" renames
+    you (the daemon fans a `PROFILE_UPDATED` so every roster — and your own header
+    — updates live); "Change password" rotates your local password (the server
+    verifies the old one, and a wrong one shows an error).
+  - **admin / user management** — a member menu's "Make admin/Make member/Remove"
+    (or the launcher's "Invite a user", which mints a tenant token shown once atop
+    the roster) manage users (REQ-030/033, owner/admin only; a `USER_UPDATED`
+    folds each change into the roster).
+  - **webhook management** — the channel menu's "Webhooks" overlays the focused
+    channel's incoming webhooks; "Create webhook" mints one (the 32-byte token is
+    shown once atop the overlay, like an invite); removing a row deletes one
     (REQ-170; CREATE/LIST/DELETE_WEBHOOK, a WEBHOOK_DELETED drops the row).
-  - **attachments** — `/upload <path>` streams a local file through the daemon
-    (UPLOAD_BEGIN → CHUNKs within the advertised window → END → OK) and links it
-    into a message; `/download <id> [path]` saves an attachment by id. The net
-    thread runs one transfer at a time as a state machine over the frame stream;
-    received messages carry attachment metadata (id, filename, mime, size),
-    rendered as a `📎 name (size) #id` line — the id is what you `/download`.
+  - **attachments** — the launcher's "Upload a file" streams a local file through
+    the daemon (UPLOAD_BEGIN → CHUNKs within the advertised window → END → OK) and
+    links it into a message; the message menu's "Download file" saves an
+    attachment by id. The net thread runs one transfer at a time as a state
+    machine over the frame stream; received messages carry attachment metadata
+    (id, filename, mime, size), rendered as a `📎 name (size) #id` line.
     Text-only, so files are never rendered inline (REQ-140/141).
 
   With attachments surfaced, **every engine feature now on the wire is reachable
@@ -330,19 +345,19 @@ connection after another in a loop: it captures the `session_token` from
 `BACKFILL_REQUEST`s each known channel from its last-seen message id to recover
 anything missed while offline. The in-memory model is preserved across the blip
 (replays dedup on the high-water mark), so a reconnect is invisible beyond a
-brief status line. A graceful `/logout` or a fatal reject (bad version, expired
-session) ends the loop instead of retrying. The net thread tracks its own
+brief status line. A graceful logout (the launcher's "Log out") or a fatal
+reject (bad version, expired session) ends the loop instead of retrying. The net thread tracks its own
 per-channel high-water for the reconnect cursors; a headless test bounces the
 daemon and asserts the client re-auths, keeps its history, and can send again.
 While backing off, the status line counts the wait down (`connection lost —
 reconnecting in Ns… (^R to retry now)`), and `oc_client_reconnect` (bound to
-`^R` in the TUI) cuts the current sleep short to retry immediately.
+`Ctrl+R` in the TUI) cuts the current sleep short to retry immediately.
 
 **Cross-restart reconnect is built too (via the §5 store).** The net thread
 pre-loads a still-valid stored token and pins the stored fingerprint, so the
 *first* connect after a relaunch already uses `OC_AUTH_SESSION` — no password
 prompt. A rejected token (expired/revoked) is dropped and, if a password is
-still held, retried once with it; `/logout` clears the stored token.
+still held, retried once with it; logging out clears the stored token.
 
 **The offline outbox (REQ-102) is built** (see §5): the net thread records each
 send in the store before delivery, resends the outbox on reconnect, and clears a
@@ -392,7 +407,8 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
   (sidebar, backfill on open, send, display names, unread, scrollback), the TUI
   surfaces: reactions, edit/delete, typing, threads, search, channel management,
   roster + presence, DMs, logout, who-reacted, notification prefs/DND, admin,
-  webhook management, and attachments (see §3 for the commands). **Every engine
+  webhook management, attachments, and audit log (see §3 for where each lives).
+  **Every engine
   feature on the wire is now reachable from the TUI.**
 - **Next:** store + reconnect/offline; auth completeness (local + OIDC); and the
   **audio client** (Opus encode/decode + UDP to the sidecar — the deferred half

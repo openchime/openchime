@@ -22,35 +22,21 @@
  *        openchime-tui <host> <port> [user:pass]   (dev/local direct connect)
  *        (credentials also read from $OPENCHIME_CRED = "user:pass")
  *
- * Keys: type + Enter to send · Tab autocompletes the trailing token (commands,
- *       #channels, @users, :emoji:) or, on an empty composer, enters navigation
- *       mode · ↑/↓ + PgUp/PgDn scroll · ? help · Ctrl-Q quit. **Navigation mode**
+ * Keys: everything is menus, dialogs, and screens — no commands to type. The
+ *       composer only sends: Enter posts your message (or, inside a thread, posts
+ *       a reply). Tab completes only the trailing token — @mentions, #channels,
+ *       :emoji: — or, on an empty composer, enters navigation mode; ↑/↓ + PgUp/PgDn
+ *       scroll; ? help. Navigation is Esc/Tab plus Ctrl chords: Ctrl+F search ·
+ *       Ctrl+W workspaces · Ctrl+R reconnect · Ctrl+Q quit. **Navigation mode**
  *       (Esc from the composer): a panel is focused — Tab cycles Channels /
- *       Messages / Members, ↑/↓ select, Esc returns to the composer. On the
- *       Messages panel single keys act on the selected message: Enter/t thread ·
- *       r react (opens a filterable emoji picker) · e edit · x delete · w
- *       who-reacted. Members: Enter opens a DM. **Command palette** (`:` on an empty composer, or Ctrl-K anywhere):
- *       fuzzy-filter every command + jump to any channel/DM; Enter runs it (or
- *       prefills the composer for commands needing an argument). A live
- *       autocomplete strip shows candidates as you type. Commands (on the last
- *       message in the focused channel):
- *       /react <emoji> · /reactions (who reacted to it) · /edit <text> ·
- *       /delete · /thread (open its thread; then Enter posts a reply) ·
- *       /search <query> · /close (leave a thread/search/roster/reactions
- *       overlay) · /create <name> · /join <name> · /leave ·
- *       /who (member roster + presence) · /away · /online · /dm <name> (open a
- *       direct message) · /prefs (notification settings) · /notify
- *       all|mentions|none (this channel's level) · /dnd HH:MM HH:MM | off
- *       (do-not-disturb window) · /set <key> <value> (a synced pref: mouse,
- *       members, time, channels-width, members-width, reset) ·
- *       /profile (your identity modal) · /nick <name> (rename yourself) ·
- *       /passwd <old> <new> (change your password) ·
- *       /role <name> owner|admin|member ·
- *       /invite [admin|member] (mint a token) · /remove <name> (owner/admin) ·
- *       /webhook (list this channel's incoming webhooks) · /webhook create
- *       <label> (mint one; token shown once) · /webhook rm <id> (delete one) ·
- *       /upload <path> (post a file here) · /download <id> [path] (save an
- *       attachment) · /logout (revoke this session and quit).
+ *       Messages / Members, ↑/↓ select, Esc returns to the composer. Every action
+ *       lives on a pane action menu: Enter on the selected message, member, or
+ *       channel opens the menu of things you can do to it (react via a filterable
+ *       emoji picker, edit, delete, open a thread, who-reacted, open a DM, and so
+ *       on); anything needing input opens a modal prompt dialog. **Command
+ *       launcher** (Ctrl+K anywhere, or `:` on an empty composer): fuzzy-filter
+ *       every action + jump to any channel/DM; Enter runs it (or opens its dialog).
+ *       On-screen key hints are written in "Ctrl+X" form.
  */
 
 #include "tuikit.h"      /* terminal layer + width-correct draw/style primitives (tuikit) */

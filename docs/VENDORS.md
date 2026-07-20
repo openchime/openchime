@@ -29,9 +29,13 @@ CI builds share byte-identical sources with zero transitive dependencies
 
 | Package | Version | Purpose | Used by | Source | License |
 |---------|---------|---------|---------|--------|---------|
-| **termbox2** | v2.5.0 | Terminal cell grid + input | TUI (`client/tui`) | https://github.com/termbox/termbox2 | MIT |
-| **utf8proc** | v2.11.3 | Unicode width + grapheme segmentation (correct emoji/CJK width) | TUI | https://github.com/JuliaStrings/utf8proc | MIT (bundled Unicode data under the Unicode license) |
+| **termbox2** | v2.5.0 | Terminal cell grid + input | tuikit (→ TUI) | https://github.com/termbox/termbox2 | MIT |
+| **utf8proc** | v2.11.3 | Unicode width + grapheme segmentation (correct emoji/CJK width) | tuikit (→ TUI) | https://github.com/JuliaStrings/utf8proc | MIT (bundled Unicode data under the Unicode license) |
 | **jsmn** | commit-pinned (upstream has no release tags) | Minimal JSON tokenizer | Daemon (OIDC/webhook JSON) | https://github.com/zserge/jsmn | MIT |
+
+Since **ARCH-83**, `tuikit/` is the in-tree toolbox wrapping termbox2 + utf8proc
+(terminal layer + width handling), which the TUI builds on — `client/tui`
+consumes them through tuikit, not directly.
 
 Committed files: `third_party/{termbox2/termbox2.h, utf8proc/utf8proc.{c,h},
 utf8proc/utf8proc_data.c, jsmn/jsmn.h}` (+ each project's LICENSE). These three
