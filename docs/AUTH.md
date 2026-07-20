@@ -123,7 +123,7 @@ carries the token from center to daemon. This preserves the island model
       │                                    ▼
       │                            ┌───────────────┐
       │  4. ES256 JWT              │   central     │  exchanges code (secret),
-      │◀───(aud=acme.example)──────│   service      │  verifies, mints JWT
+      │◀──(aud=<opaque ws id>)─────│   service      │  verifies, mints JWT
       │                            └───────────────┘
       │  5. AUTH{method=oidc, token}
       ▼
@@ -141,7 +141,8 @@ carries the token from center to daemon. This preserves the island model
 3. The provider redirects to central's callback with an auth code.
 4. Central exchanges the code (with its client secret), verifies the provider
    token, extracts identity (subject, email, name), and mints an **ES256 JWT
-   scoped to that workspace** (`aud = acme.example`), returned to the *client*.
+   scoped to that workspace** (`aud = <the workspace's opaque id>`, not its DNS
+   name — see §3.3), returned to the *client*.
 5. The client presents that token to the `acme.example` daemon in `AUTH`
    (method `oidc`). The daemon verifies it (§3.3) and mints a session.
 
@@ -152,11 +153,22 @@ carrying the identity claims:
 
 ```
 { "iss": "https://auth.openchime.io",   // the central service
-  "aud": "acme.example",                 // the target workspace
+  "aud": "ws_7f3a…9c21",                 // the target workspace's opaque id
   "sub": "<provider issuer>|<subject>",  // stable identity
   "email": "...", "name": "...",
   "iat": ..., "exp": ... }
 ```
+
+**The audience is an opaque, daemon-generated random id — not the DNS name.**
+The `aud` value is a random identifier (≥128-bit) the **daemon generates once at
+enrollment** and central **ratifies** into its workspace registry (§3.6): the
+daemon proposes it, central enforces uniqueness (rejecting the astronomically
+unlikely collision), binds it to that workspace, and thereafter refuses to mint a
+token for any audience not in the registry. It is deliberately **decoupled from
+the workspace address** — a workspace can change its domain or add a vanity name
+(ARCH-14) without invalidating its OIDC identity, and the audience registry is
+never consulted for discovery. This **supersedes the earlier `aud = acme.example`
+illustration**, which conflated the audience with the hostname.
 
 The daemon validates it by **pinning both the key and the algorithm**:
 
@@ -164,8 +176,9 @@ The daemon validates it by **pinning both the key and the algorithm**:
   footguns (`alg=none`, RS256/HS256 confusion) up front;
 - it verifies the signature with mbedTLS (ES256 = ECDSA-P256, which mbedTLS
   supports directly; EdDSA/Ed25519 is not supported, so ES256 is the choice);
-- it checks `iss` (central), `aud` (== this workspace's configured id, so a token
-  minted for one workspace cannot be replayed at another), and `exp`.
+- it checks `iss` (central), `aud` (== this workspace's configured opaque id — not
+  its hostname — so a token minted for one workspace cannot be replayed at
+  another), and `exp`.
 
 The JWT payload is JSON, so the daemon vendors a single-file JSON tokenizer
 (**jsmn** — MIT, zero-allocation, ~300 lines, in the same spirit as
@@ -180,8 +193,10 @@ targets the high-frequency message path, not the auth bootstrap.)
 
 - The daemon config (ARCH-26) carries **central's public key** (bundled/pinned
   in the OpenChime distribution — central is maintainer-controlled and stable)
-  and this workspace's **`audience` id**. A self-hoster enabling relay-OIDC
-  registers their workspace with central once to obtain that id.
+  and this workspace's **`audience` id** — the opaque, daemon-generated random id
+  described in §3.3. A self-hoster enabling relay-OIDC enrolls once: the daemon
+  generates the id (and its own keypair) and central ratifies the binding, after
+  which central will mint tokens for that audience.
 - **Dependency is login-time only.** Once the daemon issues a session (§4), it
   never contacts central again; existing sessions survive a central outage. Only
   *new logins* need central up, and the message path never does. Local mode has
@@ -218,9 +233,11 @@ daemon — and are built independently. Its contract with the daemon is narrow:
 - run the Authorization-Code-+-PKCE flow against the configured providers;
 - mint ES256 JWTs (§3.3) signed by the key the daemon pins, audience-scoped to
   the requesting workspace;
-- maintain the workspace registry (which `audience` ids are valid) — a federated
-  self-hoster registers once to obtain an id (§3.4). This registry is part of the
-  OIDC function and is never consulted for workspace discovery, which is plain
+- maintain the workspace registry (which `audience` ids are valid). The audience
+  id is **daemon-proposed, central-ratified** (§3.3): at enrollment the daemon
+  generates a random id and central binds it — enforcing uniqueness and refusing
+  to mint a token for any audience not in the registry. This registry is part of
+  the OIDC function and is never consulted for workspace discovery, which is plain
   DNS in every model (ARCH-14).
 
 Until it exists, the daemon's OIDC path is tested with a **test issuer**:
