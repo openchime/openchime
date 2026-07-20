@@ -943,7 +943,6 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     }
 
     if (help_open) draw_help(W, H);
-    tb_present();
 }
 
 
@@ -1705,24 +1704,26 @@ int main(int argc, char **argv) {
             if (cid != last_focus_cid) { scroll = 0; msg_sel = -1; last_focus_cid = cid; }
         }
 
+        /* One present per frame: render() and the overlays all draw into the back
+         * buffer, then a single tb_present() below diffs it to the screen. (Two
+         * presents per frame — base then overlay — flicker the overlay.) */
         render(cl, focus, composer, clen, scroll, help_open, ac_idx, panel, msg_sel, mem_sel, editing);
         if (action_open) {
             int mh = g_nmenu + 3; if (mh > tb_height() - 2) mh = tb_height() - 2;
             tk_rect in = tk_modal_begin(tb_width(), tb_height(), 34, mh, act_title);
             tk_list_draw(&action_menu, in);
-            tb_present();
         }
         if (prompt_kind) {
             tk_rect in = tk_modal_begin(tb_width(), tb_height(), 46, 3, prompt_title);
             tk_input_draw(&prompt_input, (tk_rect){ in.x, in.y, in.w, 1 }, 1);
-            tb_present();
         }
-        if (launcher_open) { tk_palette_draw(&launcher, tb_width(), tb_height()); tb_present(); }
+        if (launcher_open) tk_palette_draw(&launcher, tb_width(), tb_height());
         if (picker_open) draw_picker(eq, esel);
         if (profile_open) draw_profile(oc_client_model(cl), tb_width(), tb_height());
         if (switcher_open) draw_switcher(wsel);
         if (storage_open) draw_storage(oc_client_model(cl), tb_width(), tb_height());
         if (audit_open) draw_audit(oc_client_model(cl), tb_width(), tb_height());
+        tb_present();
 
         struct tb_event ev;
         int rc = tb_peek_event(&ev, 30);
