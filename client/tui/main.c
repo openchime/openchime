@@ -668,11 +668,13 @@ static int ac_candidates(const oc_model *m, const char *s, ac_cand *out, int max
  * A discoverable tk_list-in-a-modal that replaces cryptic nav keys and slash
  * commands. One generic menu holds {label,id} items; the SELECT handler
  * dispatches on the ACT_* id. Enter on a selected message/member opens it. */
-enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS,
+enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS, ACT_DOWNLOAD,
        ACT_DM, ACT_ROLE_ADMIN, ACT_ROLE_MEMBER, ACT_REMOVE,
+       /* channel menu */
+       ACT_OPEN, ACT_JOIN, ACT_NOTIFY_ALL, ACT_NOTIFY_MENTIONS, ACT_NOTIFY_NONE,
        /* global action launcher (Ctrl-K) — replaces the remaining slash commands */
        ACT_NEWCHAN, ACT_NEWDM, ACT_SEARCH, ACT_NICK, ACT_AWAY, ACT_ONLINE,
-       ACT_PREFS, ACT_WEBHOOKS, ACT_LEAVE, ACT_INVITE, ACT_PROFILE,
+       ACT_PREFS, ACT_WEBHOOKS, ACT_LEAVE, ACT_INVITE, ACT_PROFILE, ACT_UPLOAD,
        ACT_STORAGE, ACT_AUDIT, ACT_WORKSPACES, ACT_HELP, ACT_LOGOUT };
 typedef struct { const char *label; int id; } menuitem;
 static menuitem g_menu[28];
@@ -681,10 +683,11 @@ static int  menu_count(void *ud) { (void)ud; return g_nmenu; }
 static void menu_text(int i, void *ud, char *buf, size_t cap, uintattr_t *fg) {
     (void)ud; *fg = TB_DEFAULT; snprintf(buf, cap, "%s", g_menu[i].label);
 }
-static void menu_build_msg(int own, int deleted) {
+static void menu_build_msg(int own, int deleted, int has_attach) {
     g_nmenu = 0;
     if (!deleted) g_menu[g_nmenu++] = (menuitem){ "Reply in thread", ACT_THREAD };
     if (!deleted) g_menu[g_nmenu++] = (menuitem){ "Add reaction",    ACT_REACT };
+    if (has_attach) g_menu[g_nmenu++] = (menuitem){ "Download file", ACT_DOWNLOAD };
     if (own)      g_menu[g_nmenu++] = (menuitem){ "Edit",            ACT_EDIT };
     if (own)      g_menu[g_nmenu++] = (menuitem){ "Delete",          ACT_DELETE };
                   g_menu[g_nmenu++] = (menuitem){ "Who reacted",     ACT_REACTORS };
@@ -696,6 +699,16 @@ static void menu_build_member(int is_self) {
     g_menu[g_nmenu++] = (menuitem){ "Make member", ACT_ROLE_MEMBER };
     if (!is_self) g_menu[g_nmenu++] = (menuitem){ "Remove",      ACT_REMOVE };
 }
+static void menu_build_channel(int joined) {
+    g_nmenu = 0;
+    if (!joined) g_menu[g_nmenu++] = (menuitem){ "Join",              ACT_JOIN };
+    g_menu[g_nmenu++] = (menuitem){ "Open",                ACT_OPEN };
+    g_menu[g_nmenu++] = (menuitem){ "Notify: all",         ACT_NOTIFY_ALL };
+    g_menu[g_nmenu++] = (menuitem){ "Notify: mentions",    ACT_NOTIFY_MENTIONS };
+    g_menu[g_nmenu++] = (menuitem){ "Notify: none",        ACT_NOTIFY_NONE };
+    g_menu[g_nmenu++] = (menuitem){ "Webhooks",            ACT_WEBHOOKS };
+    if (joined)  g_menu[g_nmenu++] = (menuitem){ "Leave",  ACT_LEAVE };
+}
 /* The global action launcher (Ctrl-K / ':') — a tk_palette: incremental search,
  * sections, right-aligned key hints. Every action reachable without a command. */
 static const tk_pal_item g_launcher_items[] = {
@@ -703,6 +716,7 @@ static const tk_pal_item g_launcher_items[] = {
     { "Channel", "Leave this channel",  NULL, NULL, ACT_LEAVE },
     { "Channel", "Notifications",       NULL, NULL, ACT_PREFS },
     { "Channel", "Channel webhooks",    NULL, NULL, ACT_WEBHOOKS },
+    { "Channel", "Upload a file",       NULL, NULL, ACT_UPLOAD },
     { "Messages","Search messages",     NULL, "^F", ACT_SEARCH },
     { "You",     "New direct message",  NULL, NULL, ACT_NEWDM },
     { "You",     "Set away",            NULL, NULL, ACT_AWAY },
@@ -1621,7 +1635,7 @@ int main(int argc, char **argv) {
 
     /* Prompt dialog (tuikit tk_input in a modal) — replaces /create /search /dm
      * /nick with a discoverable text prompt. */
-    enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_DM, PROMPT_NICK };
+    enum { PROMPT_NONE = 0, PROMPT_NEWCHAN, PROMPT_SEARCH, PROMPT_DM, PROMPT_NICK, PROMPT_UPLOAD };
     int prompt_kind = PROMPT_NONE; const char *prompt_title = "";
     tk_input prompt_input; tk_input_init(&prompt_input, 0, "");
 
@@ -1721,6 +1735,24 @@ int main(int argc, char **argv) {
         }
         if (ev.type != TB_EVENT_KEY) continue;
 
+        /* Global quit — works from any context (was re-implemented per-overlay). */
+        if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) { running = 0; continue; }
+
+        /* Esc closes an open read-only overlay (thread/search/reactions/prefs/
+         * webhooks/roster). Without this the old /close is gone and you get stuck. */
+        {
+            const oc_model *om = oc_client_model(cl);
+            if (ev.key == TB_KEY_ESC && !switcher_open && !action_open && !launcher_open &&
+                !prompt_kind && !picker_open && !help_open && !profile_open &&
+                (om->thread_open || om->search_open || om->reactlist_open ||
+                 om->prefs_open || om->weblist_open || om->roster_open)) {
+                oc_client_close_thread(cl);  oc_client_close_search(cl);
+                oc_client_close_reactions(cl); oc_client_toggle_prefs(cl, 0);
+                oc_client_close_webhooks(cl); oc_client_toggle_roster(cl, 0);
+                continue;
+            }
+        }
+
         size_t nch = oc_client_model(cl)->n_channels;
         if (switcher_open) {                   /* workspace switcher (REQ-013) */
             int rows = g_nsw + 1;              /* + the "log in to new" row */
@@ -1802,6 +1834,10 @@ int main(int argc, char **argv) {
                     if      (prompt_kind == PROMPT_NEWCHAN) oc_client_create_channel(cl, v);
                     else if (prompt_kind == PROMPT_SEARCH)  oc_client_search(cl, v);
                     else if (prompt_kind == PROMPT_NICK)    oc_client_set_display_name(cl, v);
+                    else if (prompt_kind == PROMPT_UPLOAD) {
+                        const oc_model *pm = oc_client_model(cl);
+                        if (focus < pm->n_channels) oc_client_upload(cl, pm->channels[focus].channel_id, v);
+                    }
                     else if (prompt_kind == PROMPT_DM) {
                         uint64_t u = oc_model_user_id(oc_client_model(cl), v);
                         if (u) oc_client_open_dm(cl, u);
@@ -1821,6 +1857,7 @@ int main(int argc, char **argv) {
                 else if (id == ACT_NEWDM)   { prompt_kind = PROMPT_DM; prompt_title = "New direct message"; tk_input_init(&prompt_input, 0, "username"); }
                 else if (id == ACT_SEARCH)  { prompt_kind = PROMPT_SEARCH; prompt_title = "Search messages"; tk_input_init(&prompt_input, 0, "query"); }
                 else if (id == ACT_NICK)    { prompt_kind = PROMPT_NICK; prompt_title = "Change display name"; tk_input_init(&prompt_input, 0, "new name"); }
+                else if (id == ACT_UPLOAD)  { prompt_kind = PROMPT_UPLOAD; prompt_title = "Upload a file"; tk_input_init(&prompt_input, 0, "path"); }
                 else if (id == ACT_AWAY)    oc_client_set_presence(cl, OC_PRESENCE_AWAY);
                 else if (id == ACT_ONLINE)  oc_client_set_presence(cl, OC_PRESENCE_ONLINE);
                 else if (id == ACT_PREFS)   oc_client_toggle_prefs(cl, 1);
@@ -1861,6 +1898,24 @@ int main(int argc, char **argv) {
                                 clen = strlen(composer); panel = 0; break;
                             }
                     }
+                    else if (id == ACT_DOWNLOAD) {   /* first live attachment -> its filename in cwd */
+                        const oc_channel *ec = focused_channel(oc_client_model(cl), act_cid);
+                        if (ec) for (size_t k = 0; k < ec->n_msgs; k++)
+                            if (ec->msgs[k].message_id == act_mid) {
+                                for (uint8_t ak = 0; ak < ec->msgs[k].n_attach; ak++)
+                                    if (!ec->msgs[k].attach[ak].reclaimed) {
+                                        oc_client_download(cl, ec->msgs[k].attach[ak].id, ec->msgs[k].attach[ak].filename);
+                                        break;
+                                    }
+                                break;
+                            }
+                    }
+                    /* channel menu actions */
+                    else if (id == ACT_OPEN)  panel = 0;
+                    else if (id == ACT_JOIN)  { oc_client_join_channel(cl, act_cid); panel = 0; }
+                    else if (id == ACT_NOTIFY_ALL)      oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_ALL);
+                    else if (id == ACT_NOTIFY_MENTIONS) oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_MENTIONS);
+                    else if (id == ACT_NOTIFY_NONE)     oc_client_set_notify_pref(cl, act_cid, OC_NOTIFY_NONE);
                     /* global launcher actions */
                     else if (id == ACT_NEWCHAN) { prompt_kind = PROMPT_NEWCHAN; prompt_title = "New channel"; tk_input_init(&prompt_input, 0, "name"); }
                     else if (id == ACT_NEWDM)   { prompt_kind = PROMPT_DM; prompt_title = "New direct message"; tk_input_init(&prompt_input, 0, "username"); }
@@ -1946,7 +2001,11 @@ int main(int argc, char **argv) {
                 if (up && focus > 0) focus--;
                 else if (down && focus + 1 < mm->n_channels) focus++;
                 else if (ev.ch == 'n') { prompt_kind = PROMPT_NEWCHAN; prompt_title = "New channel"; tk_input_init(&prompt_input, 0, "name"); }
-                else if (ev.key == TB_KEY_ENTER) panel = 0;   /* it's already focused; compose */
+                else if (ev.key == TB_KEY_ENTER && focus < mm->n_channels) {   /* channel action menu */
+                    menu_build_channel(mm->channels[focus].joined);
+                    act_cid = mm->channels[focus].channel_id; act_uid = 0; act_mid = 0; act_title = "Channel";
+                    action_open = 1; tk_list_reset_filter(&action_menu);
+                }
             }
             else if (panel == 3) {                                          /* members */
                 if (up && mem_sel > 0) mem_sel--;
@@ -1968,8 +2027,11 @@ int main(int argc, char **argv) {
                     const oc_msg *sel = &ch->msgs[msg_sel];
                     uint64_t mid = sel->message_id;
                     int own = (sel->author_id == mm->user_id) && !sel->deleted;
+                    int has_attach = 0;
+                    for (uint8_t ak = 0; ak < sel->n_attach; ak++)
+                        if (!sel->attach[ak].reclaimed) { has_attach = 1; break; }
                     if (ev.key == TB_KEY_ENTER) {   /* open the discoverable action menu */
-                        menu_build_msg(own, sel->deleted);
+                        menu_build_msg(own, sel->deleted, has_attach);
                         act_cid = cid; act_mid = mid; act_uid = 0; act_title = "Message";
                         action_open = 1; tk_list_reset_filter(&action_menu);
                     }
