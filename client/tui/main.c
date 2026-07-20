@@ -1124,21 +1124,24 @@ static void draw_switcher(int sel) {
     int bw = 60; if (bw > W - 4) bw = W - 4; if (bw < 28) bw = 28;
     int bh = show + 4; if (bh > H - 2) bh = H - 2;
     int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
-    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, TB_DEFAULT);
-    tk_panel(x, y, bw, bh, "Workspaces  \xc2\xb7  Enter switch  \xc2\xb7  Esc close", 1);
+    const tk_theme *th = tk_theme_active();
+    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, th->bg);
+    tk_box(x, y, bw, bh);
+    tk_text(x + 2, y, x + bw - 1, " Workspaces ", th->accent | TB_BOLD, th->bg);
+    tk_text_right(y, x + 2, x + bw - 2, "esc", th->faint, th->bg);
 
     int top = (sel >= show) ? sel - show + 1 : 0;
     for (int i = 0; i < show && top + i < rows; i++) {
         int idx = top + i, is_sel = (idx == sel);
-        uintattr_t bg = is_sel ? TB_BLUE : TB_DEFAULT;
-        uintattr_t fg = is_sel ? TB_WHITE | TB_BOLD : TB_DEFAULT;
+        uintattr_t bg = is_sel ? th->sel_bg : th->bg;
+        uintattr_t fg = is_sel ? (th->sel_fg | TB_BOLD) : th->fg;
         if (is_sel) tk_fill(y + 1 + i, x + 1, x + bw - 1, bg);
 
         char line[320];
         if (idx == g_nsw) {                      /* the always-present last row */
             snprintf(line, sizeof line, "+ Log in to new workspace");
             tk_text(x + 2, y + 1 + i, x + bw - 1, line,
-                      is_sel ? fg : (TB_GREEN | TB_BOLD), bg);
+                      is_sel ? fg : (th->ok | TB_BOLD), bg);
             continue;
         }
         const sw_entry *e = &g_sw[idx];
@@ -1158,10 +1161,10 @@ static void draw_switcher(int sel) {
                      mark, e->label, e->user);
         }
         tk_text(x + 2, y + 1 + i, x + bw - 1, line,
-                  is_sel ? fg : (e->session >= 0 ? TB_DEFAULT : (TB_BLACK | TB_BOLD)), bg);
+                  is_sel ? fg : (e->session >= 0 ? th->fg : th->muted), bg);
     }
     tk_text(x + 2, y + bh - 1, x + bw - 1,
-              " ^W switch \xc2\xb7 d forget \xc2\xb7 Esc close ", TB_BLACK | TB_BOLD, TB_DEFAULT);
+              " ^W switch \xc2\xb7 d forget \xc2\xb7 Esc close ", th->muted, th->bg);
     tb_present();
 }
 
@@ -1181,21 +1184,23 @@ static void draw_picker(const char *q, int esel) {
     int bw = 40; if (bw > W - 4) bw = W - 4; if (bw < 20) bw = 20;
     int bh = show + 4; if (bh > H - 2) bh = H - 2;
     int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
-    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, TB_DEFAULT);
-    tk_panel(x, y, bw, bh, "React  \xc2\xb7  Esc to close", 1);
-    char ql[64]; snprintf(ql, sizeof ql, "\xe2\x80\xba %s", q);
-    tk_text(x + 2, y + 1, x + bw - 1, ql, TB_GREEN | TB_BOLD, TB_DEFAULT);
-    int cxq = x + 4 + (int)strlen(q);
-    if (cxq < x + bw - 1) tb_set_cell(cxq, y + 1, ' ', TB_DEFAULT, TB_REVERSE);
+    const tk_theme *th = tk_theme_active();
+    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, th->bg);
+    tk_box(x, y, bw, bh);
+    tk_text(x + 2, y, x + bw - 1, " React ", th->accent | TB_BOLD, th->bg);
+    tk_text_right(y, x + 2, x + bw - 2, "esc", th->faint, th->bg);
+    tk_text(x + 2, y + 1, x + bw - 1, q, th->fg, th->bg);
+    if (!q[0]) tk_text(x + 2, y + 1, x + bw - 2, "Search", th->muted, th->bg);
+    else { int cxq = x + 2 + (int)strlen(q); if (cxq < x + bw - 1) tb_set_cell(cxq, y + 1, ' ', TB_DEFAULT, TB_REVERSE); }
     int top = (esel >= show) ? esel - show + 1 : 0;
     for (int i = 0; i < show && top + i < n; i++) {
         int idx = top + i, sel = (idx == esel);
-        uintattr_t bg = sel ? TB_BLUE : TB_DEFAULT, fg = sel ? TB_WHITE | TB_BOLD : TB_DEFAULT;
+        uintattr_t bg = sel ? th->sel_bg : th->bg, fg = sel ? (th->sel_fg | TB_BOLD) : th->fg;
         char line[64]; snprintf(line, sizeof line, "%s  :%s:", em[idx], nm[idx]);
         if (sel) tk_fill(y + 2 + i, x + 1, x + bw - 1, bg);
         tk_text(x + 2, y + 2 + i, x + bw - 1, line, fg, bg);
     }
-    if (n == 0) tk_text(x + 2, y + 2, x + bw - 1, "(no matches)", TB_BLACK | TB_BOLD, TB_DEFAULT);
+    if (n == 0) tk_text(x + 2, y + 2, x + bw - 1, "(no matches)", th->muted, th->bg);
     tb_present();
 }
 
