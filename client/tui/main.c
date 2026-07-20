@@ -882,15 +882,40 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     cx = tk_text(cx, H - 2, W, composer, TB_DEFAULT, TB_DEFAULT);
     if (cx < W) tb_set_cell(cx, H - 2, ' ', TB_DEFAULT, TB_REVERSE);   /* cursor */
 
-    /* Context keybinding hint bar (row H-1), per focused panel. */
-    const char *hint;
-    if (help_open)        hint = " press ? or Esc to close help ";
-    else if (panel == 1)  hint = " Channels  ·  j/k select  ·  Enter open  ·  Tab panel  ·  Esc composer ";
-    else if (panel == 2)  hint = " Messages  ·  j/k select  ·  Enter/t thread  r react  e edit  x delete  w reactions  ·  Tab panel  ·  Esc composer ";
-    else if (panel == 3)  hint = " Members  ·  j/k select  ·  Enter DM  ·  Tab panel  ·  Esc composer ";
-    else                  hint = " Enter: send   Tab: complete   Esc: navigate   /: command   ?: help   ^Q: quit ";
+    /* Context keybinding hint bar (row H-1), per focused panel — generated from
+     * tuikit tk_binding tables (tk_help_footer) so the hints can't drift from the
+     * keys. Phase 4 wires input matching to these same tables. */
+    static const tk_binding KB_COMPOSER[] = {
+        { TB_KEY_ENTER, 0, "Enter", "send", 1 }, { TB_KEY_TAB, 0, "Tab", "complete", 1 },
+        { TB_KEY_ESC, 0, "Esc", "navigate", 1 }, { 0, '/', "/", "command", 1 },
+        { 0, '?', "?", "help", 1 }, { TB_KEY_CTRL_Q, 0, "^Q", "quit", 1 },
+    };
+    static const tk_binding KB_CHANNELS[] = {
+        { 0, 'j', "j/k", "select", 1 }, { TB_KEY_ENTER, 0, "Enter", "open", 1 },
+        { TB_KEY_TAB, 0, "Tab", "panel", 1 }, { TB_KEY_ESC, 0, "Esc", "composer", 1 },
+    };
+    static const tk_binding KB_MESSAGES[] = {
+        { 0, 'j', "j/k", "select", 1 }, { 0, 't', "Enter/t", "thread", 1 },
+        { 0, 'r', "r", "react", 1 }, { 0, 'e', "e", "edit", 1 }, { 0, 'x', "x", "delete", 1 },
+        { 0, 'w', "w", "reactions", 1 }, { TB_KEY_TAB, 0, "Tab", "panel", 1 },
+        { TB_KEY_ESC, 0, "Esc", "composer", 1 },
+    };
+    static const tk_binding KB_MEMBERS[] = {
+        { 0, 'j', "j/k", "select", 1 }, { TB_KEY_ENTER, 0, "Enter", "DM", 1 },
+        { TB_KEY_TAB, 0, "Tab", "panel", 1 }, { TB_KEY_ESC, 0, "Esc", "composer", 1 },
+    };
     tk_fill(H - 1, 0, W, TB_BLACK | TB_BOLD);
-    tk_text(0, H - 1, W, hint, TB_WHITE, TB_BLACK | TB_BOLD);
+    if (help_open) {
+        tk_text(0, H - 1, W, " press ? or Esc to close help ", TB_WHITE, TB_BLACK | TB_BOLD);
+    } else {
+        const char *label; const tk_binding *kb; int kn;
+        if      (panel == 1) { label = " Channels"; kb = KB_CHANNELS; kn = (int)(sizeof KB_CHANNELS / sizeof *KB_CHANNELS); }
+        else if (panel == 2) { label = " Messages"; kb = KB_MESSAGES; kn = (int)(sizeof KB_MESSAGES / sizeof *KB_MESSAGES); }
+        else if (panel == 3) { label = " Members";  kb = KB_MEMBERS;  kn = (int)(sizeof KB_MEMBERS  / sizeof *KB_MEMBERS);  }
+        else                 { label = "";          kb = KB_COMPOSER; kn = (int)(sizeof KB_COMPOSER / sizeof *KB_COMPOSER); }
+        int hx = label[0] ? tk_text(0, H - 1, W, label, TB_CYAN | TB_BOLD, TB_BLACK | TB_BOLD) : 0;
+        tk_help_footer(H - 1, hx, W, kb, kn, TB_WHITE, TB_BLACK | TB_BOLD);
+    }
 
     if (help_open) draw_help(W, H);
     tb_present();

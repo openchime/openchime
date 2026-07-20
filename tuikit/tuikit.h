@@ -11,5 +11,6 @@
 #include "tk_term.h"
 #include "tk_draw.h"
 #include "tk_style.h"
+#include "tk_key.h"
 
 #endif /* TUIKIT_H */
