@@ -711,6 +711,27 @@ static int ac_candidates(const oc_model *m, const char *s, ac_cand *out, int max
     return 0;
 }
 
+/* ---- message action menu (menu-driven; ARCH-83) --------------------------- *
+ * Replaces the cryptic r/e/x/w/t nav keys and the /react //thread //edit
+ * //delete //reactions commands with a discoverable tk_list-in-a-modal. Enter on
+ * a selected message opens it; the direct keys remain as accelerators. */
+enum { ACT_THREAD = 1, ACT_REACT, ACT_EDIT, ACT_DELETE, ACT_REACTORS };
+typedef struct { const char *label; int id; } msgact;
+static msgact g_msgacts[6];
+static int    g_nmsgact;
+static int  msgact_count(void *ud) { (void)ud; return g_nmsgact; }
+static void msgact_text(int i, void *ud, char *buf, size_t cap, uintattr_t *fg) {
+    (void)ud; *fg = TB_DEFAULT; snprintf(buf, cap, "%s", g_msgacts[i].label);
+}
+static void msgact_build(int own, int deleted) {
+    g_nmsgact = 0;
+    if (!deleted) g_msgacts[g_nmsgact++] = (msgact){ "Reply in thread", ACT_THREAD };
+    if (!deleted) g_msgacts[g_nmsgact++] = (msgact){ "Add reaction",    ACT_REACT };
+    if (own)      g_msgacts[g_nmsgact++] = (msgact){ "Edit",            ACT_EDIT };
+    if (own)      g_msgacts[g_nmsgact++] = (msgact){ "Delete",          ACT_DELETE };
+                  g_msgacts[g_nmsgact++] = (msgact){ "Who reacted",     ACT_REACTORS };
+}
+
 static void render(oc_client *cl, size_t focus, const char *composer,
                    size_t clen, int scroll, int help_open, int ac_idx,
                    int panel, int msg_sel, int mem_sel, uint64_t editing) {
@@ -1876,6 +1897,12 @@ int main(int argc, char **argv) {
     time_t last_typing = 0;                   /* throttle outbound TYPING signals */
     int running = 1, logging_out = 0;
 
+    /* Message action menu (tuikit, menu-driven). */
+    int action_open = 0; uint64_t act_cid = 0, act_mid = 0;
+    tk_list action_menu;
+    tk_list_opts action_opts = { NULL, msgact_count, msgact_text, NULL, 0 };
+    tk_list_init(&action_menu, &action_opts);
+
     while (running) {
         /* Tick EVERY workspace, not just the visible one: a background session
          * has to keep receiving so its unread count is live in the switcher
@@ -1928,6 +1955,11 @@ int main(int argc, char **argv) {
         }
 
         render(cl, focus, composer, clen, scroll, help_open, ac_idx, panel, msg_sel, mem_sel, editing);
+        if (action_open) {
+            tk_rect in = tk_modal_begin(tb_width(), tb_height(), 30, g_nmsgact + 2, "Message");
+            tk_list_draw(&action_menu, in);
+            tb_present();
+        }
         if (palette_open) draw_palette(oc_client_model(cl), pq, psel);
         if (picker_open) draw_picker(eq, esel);
         if (profile_open) draw_profile(oc_client_model(cl), tb_width(), tb_height());
@@ -2027,6 +2059,31 @@ int main(int argc, char **argv) {
         if (profile_open) {                    /* profile modal: any key closes it */
             if (ev.key == TB_KEY_CTRL_Q || ev.key == TB_KEY_CTRL_C) running = 0;
             else profile_open = 0;
+            continue;
+        }
+        if (action_open) {                     /* message action menu (tuikit) */
+            tk_result ar = tk_list_handle(&action_menu, &ev);
+            if (ar == TK_CANCEL) action_open = 0;
+            else if (ar == TK_SELECT) {
+                int ai = tk_list_selected(&action_menu);
+                action_open = 0;
+                if (ai >= 0) {
+                    int id = g_msgacts[ai].id;
+                    if      (id == ACT_THREAD)   oc_client_open_thread(cl, act_cid, act_mid);
+                    else if (id == ACT_REACTORS) oc_client_list_reactions(cl, act_cid, act_mid);
+                    else if (id == ACT_DELETE)   oc_client_delete(cl, act_cid, act_mid);
+                    else if (id == ACT_REACT)    { picker_open = 1; eq[0] = '\0'; eqlen = 0; esel = 0; picker_cid = act_cid; picker_mid = act_mid; }
+                    else if (id == ACT_EDIT) {
+                        const oc_channel *ec = focused_channel(oc_client_model(cl), act_cid);
+                        if (ec) for (size_t k = 0; k < ec->n_msgs; k++)
+                            if (ec->msgs[k].message_id == act_mid) {
+                                editing = act_mid;
+                                snprintf(composer, sizeof composer, "%s", ec->msgs[k].body ? ec->msgs[k].body : "");
+                                clen = strlen(composer); panel = 0; break;
+                            }
+                    }
+                }
+            }
             continue;
         }
         if (palette_open) {                    /* command palette: type to filter */
@@ -2137,7 +2194,12 @@ int main(int argc, char **argv) {
                     const oc_msg *sel = &ch->msgs[msg_sel];
                     uint64_t mid = sel->message_id;
                     int own = (sel->author_id == mm->user_id) && !sel->deleted;
-                    if (ev.key == TB_KEY_ENTER || ev.ch == 't') oc_client_open_thread(cl, cid, mid);
+                    if (ev.key == TB_KEY_ENTER) {   /* open the discoverable action menu */
+                        msgact_build(own, sel->deleted);
+                        act_cid = cid; act_mid = mid; action_open = 1;
+                        tk_list_reset_filter(&action_menu);
+                    }
+                    else if (ev.ch == 't') oc_client_open_thread(cl, cid, mid);
                     else if (ev.ch == 'w') oc_client_list_reactions(cl, cid, mid);
                     else if ((ev.ch == 'x' || ev.ch == 'd') && own) oc_client_delete(cl, cid, mid);
                     else if (ev.ch == 'r' && !sel->deleted) {   /* open the emoji picker */
