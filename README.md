@@ -33,7 +33,8 @@ path, and echo cancellation), [docs/CLIENT.md](docs/CLIENT.md) (the native clien
 architecture), [docs/TESTING.md](docs/TESTING.md) (the unit +
 integration test strategy), and [docs/VENDORS.md](docs/VENDORS.md) (every
 third-party dependency, with source, version pinning, and license) for the
-project's design.
+project's design. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for the branch,
+commit, and CI workflow.
 
 The daemon is an **early skeleton**. It has the real foundations —
 the v1 wire-protocol frame codec (PROTOCOL.md), the two-thread model
