@@ -1,6 +1,7 @@
 name: ci
 
-# Runs on pushes to main and on every PR targeting main. Three jobs:
+# Runs on every branch push (so the branch gate is real — see CONTRIBUTING.md)
+# and on PRs targeting main. Three jobs:
 #   - build:       native gcc build of the daemon, plus unit tests (make test),
 #                  which include the headless client app-core test.
 #   - integration: the deployed image end-to-end on the Docker Compose stack —
@@ -10,7 +11,6 @@ name: ci
 
 on:
   push:
-    branches: [main]
     paths-ignore:
       - '**.md'
       - '.gitignore'
