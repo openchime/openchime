@@ -1003,6 +1003,21 @@ rest), but the **call persists as long as one participant remains**; the dropped
 user simply re-`CALL_JOIN`s (minting a fresh token). The media-side silence
 timeout that mirrors this lives in the sidecar.
 
+### Push device tokens (REQ-132/133, ARCH-85)
+
+**`REGISTER_DEVICE_TOKEN` (C → S), `0x00B0`** `{ platform: u8, token: str }` —
+register the caller's mobile push token (`platform` 0 = APNs, 1 = FCM). Upserts on
+`(user, token)`. The daemon owns this registry; the control-plane gateway stores
+nothing (REQ-041). Answered with `DEVICE_TOKEN_ACK`.
+
+**`UNREGISTER_DEVICE_TOKEN` (C → S), `0x00B1`** `{ token: str }` — drop the caller's
+registration of a token (logout / token rotation). Answered with `DEVICE_TOKEN_ACK`.
+
+**`DEVICE_TOKEN_ACK` (S → C), `0x00B2`** `{ ok: u8, code: u16 }` — `ok=1` on success;
+on failure `code` is the reason (`OC_ERR_INVALID_DEVICE_TOKEN` for an empty token or
+unknown platform). A committed SEND then drives contentless APNs/FCM delivery to
+registered tokens via the emitter (ARCH-85), gated by each recipient's level + DND.
+
 ---
 
 ## 6. Reconnect backfill (resolves REQ-101)

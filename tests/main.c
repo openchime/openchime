@@ -27,6 +27,7 @@ int run_tls_tests(void);
 int run_netloop_tests(void);
 int run_client_core_tests(void);
 int run_enroll_tests(void);
+int run_push_tests(void);
 
 int main(void) {
     int total = 0;
@@ -50,6 +51,7 @@ int main(void) {
     total += run_netloop_tests();
     total += run_client_core_tests();
     total += run_enroll_tests();
+    total += run_push_tests();
 
     if (total == 0) { printf("\nOK: all suites passed\n"); return 0; }
     printf("\nFAILED: %d check(s) across all suites\n", total);

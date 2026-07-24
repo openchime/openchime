@@ -415,6 +415,22 @@ user's live connections; each client folds only the snapshot whose `client_type`
 matches its own, so a change on one device reaches the user's other same-type
 devices.
 
+## 3l. Migration 0018 — push device tokens (REQ-132/133, ARCH-85)
+
+The daemon owns the mobile-push device registry — the control-plane gateway is a
+stateless relay that stores nothing (REQ-041). A client registers its APNs/FCM token
+over its authenticated connection (`REGISTER_DEVICE_TOKEN`), the emitter reads it to
+decide who to notify, and prunes it when the gateway reports it stale.
+
+### `device_tokens`
+- `id` (INTEGER PK, AUTOINCREMENT).
+- `user_id` (INTEGER → `users.id`) — the owner; a removed member's rows go with them.
+- `platform` (TEXT) — `apns` | `fcm`.
+- `token` (TEXT) — the provider device token (an opaque device handle, not identity).
+- `created_at_ms` / `last_seen_ms` (INTEGER) — first registration / last refresh.
+- `UNIQUE(user_id, token)` — re-registering the same token upserts `last_seen_ms`;
+  index on `user_id` for the recipient join.
+
 ---
 
 ## 4. Deferred to later migrations

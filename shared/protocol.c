@@ -643,6 +643,43 @@ oc_result oc_decode_set_dnd(oc_rbuf *p, oc_set_dnd *m) {
     return r_done(p);
 }
 
+oc_result oc_encode_register_device_token(oc_wbuf *w, uint16_t version, const oc_register_device_token *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_REGISTER_DEVICE_TOKEN);
+    oc_w_u8(w, m->platform);
+    oc_w_str(w, m->token);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_register_device_token(oc_rbuf *p, oc_register_device_token *m) {
+    m->platform = oc_r_u8(p);
+    m->token = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_unregister_device_token(oc_wbuf *w, uint16_t version, oc_slice token) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_UNREGISTER_DEVICE_TOKEN);
+    oc_w_str(w, token);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_unregister_device_token(oc_rbuf *p, oc_slice *token) {
+    *token = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_device_token_ack(oc_wbuf *w, uint16_t version, const oc_device_token_ack *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_DEVICE_TOKEN_ACK);
+    oc_w_u8(w, m->ok);
+    oc_w_u16(w, m->code);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_device_token_ack(oc_rbuf *p, oc_device_token_ack *m) {
+    m->ok = oc_r_u8(p);
+    m->code = oc_r_u16(p);
+    return r_done(p);
+}
+
 oc_result oc_decode_list_notify_prefs(oc_rbuf *p) {
     return r_done(p);   /* empty payload */
 }

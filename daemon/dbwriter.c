@@ -199,6 +199,7 @@ static void job_free(oc_job *j) {
     free(j->pf_name);
     free(j->pf_old_pw);
     free(j->pf_new_pw);
+    free(j->device_token);
     free(j);
 }
 
@@ -2581,6 +2582,66 @@ static oc_dbres *process_set_dnd(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Register a push device token (ARCH-85). Upsert on (user, token): re-registering
+ * the same token just refreshes last_seen + platform. Write. */
+static oc_dbres *process_register_device_token(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    const char *platform = j->device_platform == OC_PUSH_FCM ? "fcm" : "apns";
+    if (j->device_platform > OC_PUSH_FCM || !j->device_token || !*j->device_token) {
+        r->type = OC_RES_DEVICE_TOKEN_ERR; r->err_code = OC_ERR_INVALID_DEVICE_TOKEN; return r;
+    }
+    uint64_t now = dbw_now_ms();
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO device_tokens(user_id, platform, token, created_at_ms, last_seen_ms) "
+        "VALUES(?,?,?,?,?) "
+        "ON CONFLICT(user_id, token) DO UPDATE SET platform=excluded.platform, "
+        "last_seen_ms=excluded.last_seen_ms;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_text (st, 2, platform, -1, SQLITE_STATIC);
+    sqlite3_bind_text (st, 3, j->device_token, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)now);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)now);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    r->type = (rc == SQLITE_DONE) ? OC_RES_DEVICE_TOKEN_OK : OC_RES_DEVICE_TOKEN_ERR;
+    if (rc != SQLITE_DONE) r->err_code = OC_ERR_INTERNAL;
+    return r;
+}
+
+/* Drop the caller's registration of a token (logout / token rotation). Write. */
+static oc_dbres *process_unregister_device_token(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    if (!j->device_token || !*j->device_token) {
+        r->type = OC_RES_DEVICE_TOKEN_ERR; r->err_code = OC_ERR_INVALID_DEVICE_TOKEN; return r;
+    }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "DELETE FROM device_tokens WHERE user_id=? AND token=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_text (st, 2, j->device_token, -1, SQLITE_TRANSIENT);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    r->type = OC_RES_DEVICE_TOKEN_OK;
+    return r;
+}
+
+/* Prune a token central reported stale — across all users (a device token is
+ * globally unique to a device). Fire-and-forget: no result. Write. */
+static oc_dbres *process_prune_device_token(sqlite3 *db, const oc_job *j) {
+    if (j->device_token && *j->device_token) {
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(db, "DELETE FROM device_tokens WHERE token=?;", -1, &st, NULL);
+        sqlite3_bind_text(st, 1, j->device_token, -1, SQLITE_TRANSIENT);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+    return NULL;   /* push_result ignores NULL */
+}
+
 /* The caller's full notification settings (REQ-130/131). Read. */
 static oc_dbres *process_list_notify_prefs(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
@@ -2824,6 +2885,9 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_DELETE_WEBHOOK)  return process_delete_webhook(w->db, j);
     if (j->type == OC_JOB_SET_NOTIFY_PREF) return process_set_notify_pref(w->db, j);
     if (j->type == OC_JOB_SET_DND)         return process_set_dnd(w->db, j);
+    if (j->type == OC_JOB_REGISTER_DEVICE_TOKEN)   return process_register_device_token(w->db, j);
+    if (j->type == OC_JOB_UNREGISTER_DEVICE_TOKEN) return process_unregister_device_token(w->db, j);
+    if (j->type == OC_JOB_PRUNE_DEVICE_TOKEN)      return process_prune_device_token(w->db, j);
     if (j->type == OC_JOB_SET_CLIENT_SETTING) return process_set_client_setting(w->db, j);
     if (j->type == OC_JOB_SET_DISPLAY_NAME)   return process_set_display_name(w->db, j);
     if (j->type == OC_JOB_CHANGE_PASSWORD)    return process_change_password(w->db, j);
@@ -3211,6 +3275,42 @@ uint64_t oc_dbwriter_register_local(oc_dbwriter *w, const char *username,
         usleep(1000);
     }
     return 0;
+}
+
+/* Register a push device token (ARCH-85). Submit + block for the ack — setup/test
+ * helper (drains one result), not the live path (the net loop submits the job from
+ * the client frame and consumes the ack via the normal result dispatch). */
+int oc_dbwriter_register_device_token(oc_dbwriter *w, uint64_t user_id,
+                                      uint8_t platform, const char *token) {
+    if (!token || !*token) return 0;
+    oc_job *j = oc_job_new(OC_JOB_REGISTER_DEVICE_TOKEN, 0);
+    if (!j) return 0;
+    j->user_id = user_id;
+    j->device_platform = platform;
+    j->device_token = strdup(token);
+    if (!j->device_token) { job_free(j); return 0; }
+    oc_dbwriter_submit(w, j);
+    for (int i = 0; i < 3000; i++) {
+        oc_dbres *r = oc_dbwriter_next_result(w);
+        if (r) {
+            int ok = (r->type == OC_RES_DEVICE_TOKEN_OK);
+            oc_dbres_free(r);
+            return ok;
+        }
+        usleep(1000);
+    }
+    return 0;
+}
+
+/* Prune a stale token — fire-and-forget (the job returns no result, so this is
+ * safe to call from the push worker thread while the net loop consumes results). */
+void oc_dbwriter_prune_device_token(oc_dbwriter *w, const char *token) {
+    if (!token || !*token) return;
+    oc_job *j = oc_job_new(OC_JOB_PRUNE_DEVICE_TOKEN, 0);
+    if (!j) return;
+    j->device_token = strdup(token);
+    if (!j->device_token) { job_free(j); return; }
+    oc_dbwriter_submit(w, j);
 }
 
 /* Setup-time helper (REQ-024): if the tenant has no owner, mint a one-time owner

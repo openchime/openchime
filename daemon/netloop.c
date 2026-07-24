@@ -6,6 +6,7 @@
 #include "audio.h"
 #include "auth.h"
 #include "blobstore.h"
+#include "push.h"
 #include "xferpool.h"
 #include "storage.h"
 #include "framebuf.h"
@@ -396,6 +397,13 @@ static uint16_t g_audio_udp_port;
 void oc_netloop_set_audio(int ipc_fd, uint16_t udp_port) {
     g_audio_ipc = ipc_fd;
     g_audio_udp_port = udp_port;
+}
+
+/* Outbound push emitter (ARCH-85), NULL = push disabled. Set before the loop. */
+static oc_push *g_push;
+
+void oc_netloop_set_push(struct oc_push *push) {
+    g_push = push;
 }
 
 /* Send one length-prefixed IPC message (type + payload) to the sidecar. */
@@ -1026,6 +1034,31 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_REGISTER_DEVICE_TOKEN) {
+            oc_register_device_token rd;
+            if (oc_decode_register_device_token(&p, &rd) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_REGISTER_DEVICE_TOKEN, c->conn_id);
+            if (!j) return -1;
+            size_t tl = rd.token.len < OC_DEVICE_TOKEN_MAX - 1 ? rd.token.len : OC_DEVICE_TOKEN_MAX - 1;
+            j->user_id = c->user_id;
+            j->device_platform = rd.platform;
+            j->device_token = strndup((const char *)rd.token.ptr, tl);
+            if (!j->device_token) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_UNREGISTER_DEVICE_TOKEN) {
+            oc_slice tok;
+            if (oc_decode_unregister_device_token(&p, &tok) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_UNREGISTER_DEVICE_TOKEN, c->conn_id);
+            if (!j) return -1;
+            size_t tl = tok.len < OC_DEVICE_TOKEN_MAX - 1 ? tok.len : OC_DEVICE_TOKEN_MAX - 1;
+            j->user_id = c->user_id;
+            j->device_token = strndup((const char *)tok.ptr, tl);
+            if (!j->device_token) return -1;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_LIST_NOTIFY_PREFS) {
             if (oc_decode_list_notify_prefs(&p) != OC_OK) return -1;
             oc_job *j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, c->conn_id);
@@ -1480,6 +1513,10 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
                 if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
                     send_bytes(ep, conns, fd, g_enc, blen);
             }
+            /* Offline mobile delivery (ARCH-85): hand the notify decision to the
+             * push emitter — members minus author, level/DND-gated, off this
+             * thread. Fire-and-forget; a no-op when push is unconfigured. */
+            oc_push_notify(g_push, r->channel_id, r->author_id);
         }
         break;
     }
@@ -1490,6 +1527,16 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         oc_slice ctx = { r->idem, OC_IDEM_LEN };
         oc_error e = { r->err_code, 0, ctx, oc_slice_str("send rejected") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_DEVICE_TOKEN_OK:
+    case OC_RES_DEVICE_TOKEN_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_device_token_ack ack = { (uint8_t)(r->type == OC_RES_DEVICE_TOKEN_OK ? 1 : 0), r->err_code };
+        oc_encode_device_token_ack(&w, OC_PROTOCOL_VERSION, &ack);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }

@@ -30,4 +30,10 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
  * default) calls still form but carry no media endpoint. */
 void oc_netloop_set_audio(int ipc_fd, uint16_t udp_port);
 
+/* Wire the outbound push emitter (ARCH-85). When set, a committed SEND fans a
+ * contentless notify decision to it for offline mobile delivery. Call before
+ * oc_netloop_run; NULL (the default) disables push. */
+struct oc_push;
+void oc_netloop_set_push(struct oc_push *push);
+
 #endif /* OPENCHIME_NETLOOP_H */

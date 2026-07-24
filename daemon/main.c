@@ -15,6 +15,7 @@
 #include "dbwriter.h"
 #include "enroll.h"
 #include "netloop.h"
+#include "push.h"
 #include "tls.h"
 
 #include <arpa/inet.h>
@@ -293,6 +294,24 @@ int main(void) {
         free(pem);
         fprintf(stderr, "openchimed: OIDC mode (issuer=%s audience=%s)\n", iss, aud);
     }
+
+    /* Outbound push emitter (ARCH-85). Only when the box is enrolled (holds an
+     * active audience + key) and OC_PUSH_URL points at the control-plane push
+     * gateway. It signs with the enrollment key and delivers offline mobile
+     * notifications; absent in self-hosted stand-alone. */
+    oc_push *push = NULL;
+    const char *push_url = getenv("OC_PUSH_URL");
+    if (enroll_active && enroll_audience && enroll_privkey && push_url && *push_url) {
+        push = oc_push_start(db_path, db, push_url, getenv("OC_PUSH_CA_BUNDLE"),
+                             enroll_audience, enroll_privkey);
+        if (push) {
+            oc_netloop_set_push(push);
+            fprintf(stderr, "openchimed: push emitter enabled (audience=%s)\n", enroll_audience);
+        } else {
+            fprintf(stderr, "openchimed: push emitter failed to start\n");
+        }
+    }
+
     free(enroll_privkey);
     free(enroll_audience);
 
@@ -375,6 +394,7 @@ int main(void) {
     /* Serve the binary protocol until a shutdown signal. */
     oc_netloop_run(proto_port, &tls, db, &g_stop);
 
+    oc_push_stop(push);
     oc_tls_server_free(&tls);
     oc_dbwriter_stop(db);
     fprintf(stderr, "openchimed: shutdown complete\n");

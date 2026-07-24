@@ -312,6 +312,22 @@ static const char MIGRATION_0017[] =
     "  created_at_ms   INTEGER NOT NULL"
     ");";
 
+/* Push device tokens (ARCH-85, REQ-132/133). The daemon owns the device registry
+ * — the control-plane push gateway is a stateless relay that stores nothing
+ * (CP-13). One row per (user, provider device token); a removed member's rows go
+ * with the user. `platform` is 'apns' | 'fcm'. */
+static const char MIGRATION_0018[] =
+    "CREATE TABLE device_tokens ("
+    "  id            INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  user_id       INTEGER NOT NULL REFERENCES users(id),"
+    "  platform      TEXT NOT NULL,"
+    "  token         TEXT NOT NULL,"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  last_seen_ms  INTEGER NOT NULL,"
+    "  UNIQUE(user_id, token)"
+    ");"
+    "CREATE INDEX idx_device_tokens_user ON device_tokens(user_id);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -330,6 +346,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 15, MIGRATION_0015 },
     { 16, MIGRATION_0016 },
     { 17, MIGRATION_0017 },
+    { 18, MIGRATION_0018 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

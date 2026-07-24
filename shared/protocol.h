@@ -112,6 +112,9 @@ typedef enum {
     OC_MSG_CALL_LEAVE       = 0x00A1, /* C->S, leave the call */
     OC_MSG_CALL_JOINED      = 0x00A2, /* S->C, to the joiner: call id + UDP endpoint/token + roster */
     OC_MSG_CALL_ROSTER      = 0x00A3, /* S->C, to participants: roster changed */
+    OC_MSG_REGISTER_DEVICE_TOKEN   = 0x00B0, /* C->S, register a mobile push token (REQ-132) */
+    OC_MSG_UNREGISTER_DEVICE_TOKEN = 0x00B1, /* C->S, drop a push token (logout / token change) */
+    OC_MSG_DEVICE_TOKEN_ACK        = 0x00B2, /* S->C, register/unregister acknowledged */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -157,6 +160,7 @@ typedef enum {
     OC_ERR_ATTACHMENT_GONE     = 3013, /* reclaimed by age or storage pressure (REQ-215/217) */
     OC_ERR_TRANSFER_PROTOCOL   = 3012, /* out-of-order/oversized chunk or bad transfer state */
     OC_ERR_UNKNOWN_WEBHOOK     = 3013, /* no such (or disabled) incoming webhook token (REQ-170) */
+    OC_ERR_INVALID_DEVICE_TOKEN = 3014, /* empty token or unknown platform on REGISTER_DEVICE_TOKEN */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 
@@ -384,6 +388,13 @@ typedef struct { uint64_t channel_id; uint64_t user_id; } oc_typing_update;
 /* Notification preferences (REQ-130/131). */
 typedef struct { uint64_t channel_id; uint8_t level; } oc_set_notify_pref;
 typedef struct { uint8_t enabled; uint16_t start_min; uint16_t end_min; } oc_set_dnd;
+
+/* Push device-token registration (REQ-132). platform: OC_PUSH_APNS / OC_PUSH_FCM. */
+#define OC_PUSH_APNS        0u
+#define OC_PUSH_FCM         1u
+#define OC_DEVICE_TOKEN_MAX 512u
+typedef struct { uint8_t platform; oc_slice token; } oc_register_device_token;
+typedef struct { uint8_t ok; uint16_t code; } oc_device_token_ack;
 typedef struct { uint64_t channel_id; uint8_t level; } oc_notify_pref_entry;
 typedef struct { uint8_t dnd_enabled; uint16_t dnd_start_min; uint16_t dnd_end_min;
                  uint16_t count; const oc_notify_pref_entry *entries; } oc_notify_prefs;
@@ -533,6 +544,9 @@ oc_result oc_encode_typing(oc_wbuf *w, uint16_t version, const oc_typing *m);
 oc_result oc_encode_typing_update(oc_wbuf *w, uint16_t version, const oc_typing_update *m);
 oc_result oc_encode_set_notify_pref(oc_wbuf *w, uint16_t version, const oc_set_notify_pref *m);
 oc_result oc_encode_set_dnd(oc_wbuf *w, uint16_t version, const oc_set_dnd *m);
+oc_result oc_encode_register_device_token(oc_wbuf *w, uint16_t version, const oc_register_device_token *m);
+oc_result oc_encode_unregister_device_token(oc_wbuf *w, uint16_t version, oc_slice token);
+oc_result oc_encode_device_token_ack(oc_wbuf *w, uint16_t version, const oc_device_token_ack *m);
 oc_result oc_encode_list_notify_prefs(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_notify_prefs(oc_wbuf *w, uint16_t version, const oc_notify_prefs *m);
 oc_result oc_encode_set_client_setting(oc_wbuf *w, uint16_t version, const oc_set_client_setting *m);
@@ -633,6 +647,9 @@ oc_result oc_decode_typing(oc_rbuf *p, oc_typing *m);
 oc_result oc_decode_typing_update(oc_rbuf *p, oc_typing_update *m);
 oc_result oc_decode_set_notify_pref(oc_rbuf *p, oc_set_notify_pref *m);
 oc_result oc_decode_set_dnd(oc_rbuf *p, oc_set_dnd *m);
+oc_result oc_decode_register_device_token(oc_rbuf *p, oc_register_device_token *m);
+oc_result oc_decode_unregister_device_token(oc_rbuf *p, oc_slice *token);
+oc_result oc_decode_device_token_ack(oc_rbuf *p, oc_device_token_ack *m);
 oc_result oc_decode_list_notify_prefs(oc_rbuf *p);
 oc_result oc_decode_notify_prefs(oc_rbuf *p, oc_notify_pref_entry *entries, uint16_t cap,
                                  uint16_t *out_count, oc_set_dnd *dnd_out);

@@ -87,8 +87,8 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 121 typing indicator | ✅ | Member-scoped `TYPING`/`TYPING_UPDATE` relay; ~6s client-side expiry resolves the window (ARCH-68). |
 | 130 per-channel notification level | ✅ | `SET_NOTIFY_PREF`/`LIST_NOTIFY_PREFS` → `NOTIFY_PREFS`; server-authoritative level (all/mentions/none) in `notification_prefs` (migration 0012), synced to all the user's devices (ARCH-72). |
 | 131 do-not-disturb schedule | ✅ | `SET_DND` stores a daily UTC minutes-of-day window on `users`; governs push, not in-app unread (ARCH-72). |
-| 132 APNs/FCM push | ⛔ | Deferred mobile-push milestone: needs the push transport + per-message notify decision. Settings (REQ-130/131) that gate it are built. |
-| 133 push is a federated function | ⛔ | Tied to REQ-132. Push requires the project's gateway (the mobile clients are signed under the project's developer accounts), so it is available in the self-hosted federated and hosted models and **absent in self-hosted stand-alone** (ARCH-76/ARCH-16). |
+| 132 APNs/FCM push | ✅ (daemon emitter) | **Built (ARCH-85, `daemon/push.c`):** the daemon owns a `device_tokens` registry (migration 0018, `REGISTER_DEVICE_TOKEN` frame); a committed SEND fans a notify decision to an off-hot-path worker that selects recipients (members − author, level=ALL, not DND, with a token), signs the batch with the enrollment key (CP-12-style request signature), and POSTs a **contentless** ping to the control-plane gateway, pruning stale tokens it returns. Tested (`tests/test_push.c`, incl. a fake-gateway round-trip). APNs/FCM transport + creds are the gateway's (control-plane repo). **MENTIONS level deferred** (needs REQ-221). |
+| 133 push is a federated function | ✅ | Emitter is gated on `OC_PUSH_URL` **and** an active enrollment (ARCH-85), so push is available in the self-hosted federated and hosted models and **absent in self-hosted stand-alone** (ARCH-76/ARCH-16). The gateway holds the project's Apple/Google credentials; the daemon never does. |
 | 140 file attachments (object storage) | 🟡 | **Built + tested end-to-end:** proxied chunked upload/download over the wire (ARCH-69), `attachments` migration 0009, frames §5.14, and **message-linking** — a SEND references uploaded attachments (self-describing optional list), the BROADCAST carries their metadata inline, and backfill re-attaches them on reconnect. Thread replies carry attachments too (SEND_REPLY/THREAD_REPLY + LIST_THREAD). Two blob backends behind the ARCH-70 vtable: local-FS (default) and S3-compatible, now selected by whether `OPENCHIME_S3_*` credentials are configured rather than an explicit flag. The S3 backend speaks **HTTPS with CA + hostname verification** and is **verified against a real provider (Tigris)** — multi-chunk streaming round-trips byte-for-byte, sizes and delete semantics correct, and bad certificates (expired / self-signed / untrusted-root / wrong-host) rejected. Previously it was plain-HTTP only, so it could not reach any public provider. Blob I/O now runs on the **ARCH-69 transfer worker pool** (`daemon/xferpool.c`), off the net thread, so a slow S3 endpoint no longer stalls the event loop. One job per transfer in flight gives chunk ordering and backpressure (the connection stops being read while a job is out); the handle travels with the job so a client disconnecting mid-transfer cannot leak or double-free it. Covered by test_xferpool (ordering, concurrency, cleanup; clean under TSan and ASan) and an itest that abandons uploads mid-stream. **Surfaced in the TUI** (upload via the action launcher's 'Upload a file'; download via the message action menu): the net thread runs one transfer at a time as a state machine over the frame stream, respecting the upload window; the headless test round-trips a multi-chunk blob. |
 | 141 attachment access control | ✅ | Proxied bytes → download authorized by the ordinary channel-read check on the attachment's channel; no signed URLs (ARCH-69). Verified over the wire (cross-user fetch allowed; non-member refused) and in dbwriter units. |
 | 150–152 server-relayed audio | ✅ (server) / ⛔ (client) | **Server built + tested end-to-end** (ARCH-73): `CALL_JOIN`/`CALL_LEAVE` + per-channel ephemeral roster, per-join tokens, forked UDP relay sidecar, disconnect/rejoin (REQ-152). **The client half does not exist** — no `CALL_*` in `client/core`, no Opus, no UDP media path, no audio device layer, no echo cancellation. Designed in [AUDIO.md](./AUDIO.md): huddle model (1:1 is the degenerate case), client-side mixing of N streams (forced by the server never decoding), duplex audio engine at 16 kHz/20 ms, and AEC behind a processor vtable with an ERLE test harness. |
@@ -200,8 +200,11 @@ relaunch), a persisted TOFU pin, cached history that shows instantly + seeds the
 backfill cursor, and an **offline outbox** that resends messages composed while
 disconnected — i.e. the reconnect/offline requirements (REQ-100/101/102) are now
 met client-side. The remaining client work is the later native GUIs and the
-fuller auth UX (OIDC, DNS resolution). The remaining server-side gap is **mobile
-push transport** (REQ-132/133). **Server-relayed audio** (REQ-150–152) is now
+fuller auth UX (OIDC, DNS resolution). **Mobile push** (REQ-132/133) is now built
+on the daemon side (ARCH-85): a device-token registry + an off-hot-path emitter that
+signs and POSTs contentless notifications to the control-plane gateway; the remaining
+push work is the shipping mobile clients + the MENTIONS level (needs REQ-221).
+**Server-relayed audio** (REQ-150–152) is now
 built end-to-end — call signaling + a forked UDP relay sidecar — with only the
 client-side Opus/UDP left (Phase-2 client work). Presence/typing (REQ-120/121) is
 built and tested end-to-end, as are **notification settings** (REQ-130/131:
@@ -216,8 +219,8 @@ rate limiting, the per-connection output-buffer cap, idempotency-map pruning,
 reads decoupled onto a read-only connection, server-side delivery accounting, a
 per-IP connection throttle, TLS-identity persistence across restore, truncation
 signals, the first-owner setup token, and a codec fuzzer + concurrency load
-test. What remains is **not** hardening but **scope**: a real client and the
-unbuilt server surface (mobile push transport; audio's server side is now built).
+test. What remains is **not** hardening but **scope**: a real client (and its mobile
+push registration); the daemon's server surface — including the push emitter — is built.
 The capacity profile
 (REQ-210/211) is now benchmarked — see [BENCHMARK.md](./BENCHMARK.md)
 (`Scripts/bench.sh`). Incoming webhooks

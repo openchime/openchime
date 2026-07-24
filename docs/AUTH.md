@@ -260,6 +260,16 @@ The enrolled audience then feeds the OIDC configuration above (§3.4) automatica
 so an enrolled box need not be given `OC_OIDC_AUDIENCE` by hand. The enrollment
 *flow/registry* remains a control-plane concern; only the client half is here.
 
+**The daemon's push emitter (ARCH-85).** An enrolled box additionally set with
+`OC_PUSH_URL` (the control-plane push gateway; `OC_PUSH_CA_BUNDLE` optional) delivers
+mobile push (REQ-132/133). The daemon owns a device-token registry
+(`REGISTER_DEVICE_TOKEN`); a committed SEND drives an off-hot-path worker that selects
+recipients (members − author, level=ALL, not in DND, holding a token), signs a
+**contentless** batch with the enrollment key — the same request-signature scheme
+central verifies (`openchime-machine-v1|<aud>|<ts>|<sha256(body)>`) — and POSTs it to
+the gateway, which relays to APNs/FCM and returns stale tokens to prune. Absent in
+self-hosted stand-alone (no enrollment / no `OC_PUSH_URL`).
+
 ---
 
 ## 4. Sessions — the convergence point (ARCH-58)

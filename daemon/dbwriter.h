@@ -64,7 +64,12 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* Storage usage report for an owner/admin (REQ-214). Read-only. */
        OC_JOB_STORAGE_STATUS = 46,
        OC_JOB_AUDIT_QUERY = 47,
-       OC_JOB_LOAD_ENROLLMENT = 48, OC_JOB_STORE_ENROLLMENT = 49 };
+       OC_JOB_LOAD_ENROLLMENT = 48, OC_JOB_STORE_ENROLLMENT = 49,
+       /* Push device tokens (ARCH-85, REQ-132). REGISTER/UNREGISTER are client
+        * writes; PRUNE is submitted by the push worker when central reports a
+        * token stale (fire-and-forget, no result). */
+       OC_JOB_REGISTER_DEVICE_TOKEN = 50, OC_JOB_UNREGISTER_DEVICE_TOKEN = 51,
+       OC_JOB_PRUNE_DEVICE_TOKEN = 52 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -103,6 +108,10 @@ typedef struct oc_job {
     char          *enroll_privkey;   /* heap */
     char          *enroll_audience;  /* heap */
     int            enroll_active;
+
+    /* REGISTER/UNREGISTER/PRUNE_DEVICE_TOKEN (ARCH-85). */
+    char          *device_token;     /* heap */
+    uint8_t        device_platform;  /* OC_PUSH_APNS / OC_PUSH_FCM */
 
     /* REACT (channel_id + message_id above); emoji is heap, op is add/remove. */
     char          *emoji;      /* heap */
@@ -210,7 +219,9 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_AUDIT_PAGE = 54, OC_RES_AUDIT_ERR = 55,
        /* A read cursor advanced (REQ-090 seen-by): fan the acker's new cursor to
         * the channel's members + backfill the acker with the others' cursors. */
-       OC_RES_READ_CURSOR = 50, OC_RES_ENROLLMENT = 56 };
+       OC_RES_READ_CURSOR = 50, OC_RES_ENROLLMENT = 56,
+       /* Device-token register/unregister acknowledged / rejected (ARCH-85). */
+       OC_RES_DEVICE_TOKEN_OK = 57, OC_RES_DEVICE_TOKEN_ERR = 58 };
 
 /* One row in a REACTIONS result (a distinct emoji + one reacting user). */
 typedef struct { char *emoji; uint64_t user_id; } oc_reaction_row;
@@ -503,6 +514,13 @@ int oc_dbwriter_store_identity(oc_dbwriter *w, const char *cert_pem, const char 
  * success. */
 int oc_dbwriter_load_enrollment(oc_dbwriter *w, char **privkey_out, char **audience_out, int *active_out);
 int oc_dbwriter_store_enrollment(oc_dbwriter *w, const char *privkey_pem, const char *audience, int active);
+
+/* Register a push device token (ARCH-85): submits + blocks for the ack; returns 1
+ * on success, 0 on a bad platform/empty token. */
+int oc_dbwriter_register_device_token(oc_dbwriter *w, uint64_t user_id, uint8_t platform, const char *token);
+/* Drop a device token across all users — fire-and-forget. Called by the push
+ * worker from its own thread when central reports the token stale. */
+void oc_dbwriter_prune_device_token(oc_dbwriter *w, const char *token);
 
 /* Hand a job to the writer (transfers ownership; the writer frees it). */
 void       oc_dbwriter_submit(oc_dbwriter *w, oc_job *j);
