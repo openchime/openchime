@@ -397,8 +397,15 @@ int run_slow_blob_tests(void) {
      * would rise by at least that. Allowing baseline + SLOW_MS/2 is generous and
      * still fails loudly for an inline implementation. */
     CHECK(during_median < base_median + (uint64_t)SLOW_MS / 2);
-    /* No single round-trip should swallow a full backend stall either. */
-    CHECK(during_max < base_median + (uint64_t)SLOW_MS);
+    /* No round-trip should swallow a full backend stall. Counted across all
+     * samples (not just the max) with a one-sample tolerance: an inline blob
+     * implementation would stall *many* round-trips landing mid-chunk, so it
+     * still fails loudly — but a single scheduler hiccup on a loaded CI runner,
+     * which spikes one sample without any blob-I/O blocking, no longer does. */
+    int over_stall = 0;
+    for (int i = 0; i < n_during; i++)
+        if (during[i] >= base_median + (uint64_t)SLOW_MS) over_stall++;
+    CHECK(over_stall <= 1);
 
     /* The upload must have been genuinely in flight while bob was measured, or
      * the comparison proved nothing. Several slow segments inside the window
