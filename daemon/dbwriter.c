@@ -310,11 +310,11 @@ static void ensure_default_membership(sqlite3 *db, uint64_t user_id) {
  * OPENCHIME_MAX_USERS). max_users <= 0 is unlimited; an already-existing subject is
  * never capped (idempotent bootstrap / re-login). Counts active users only — a
  * removed member (disabled=1) frees a seat. */
-static int user_slots_full(sqlite3 *db, const char *subject, int max_users) {
+static int user_slots_full(sqlite3 *db, const char *subject, size_t sublen, int max_users) {
     if (max_users <= 0) return 0;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db, "SELECT 1 FROM users WHERE subject=?;", -1, &st, NULL);
-    sqlite3_bind_text(st, 1, subject, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 1, subject, (int)sublen, SQLITE_TRANSIENT);
     int exists = (sqlite3_step(st) == SQLITE_ROW);
     sqlite3_finalize(st);
     if (exists) return 0;
@@ -551,7 +551,7 @@ static oc_dbres *process_register(oc_dbwriter *w, const oc_job *j) {
         char subject[256];
         const char *uname = j->username ? j->username : "";
         size_t sublen = local_subject(subject, sizeof subject, uname, strlen(uname));
-        if (sublen > 0 && user_slots_full(db, subject, w->max_users)) {
+        if (sublen > 0 && user_slots_full(db, subject, sublen, w->max_users)) {
             r->type = OC_RES_REGISTER_ERR; r->err_code = OC_ERR_USER_LIMIT; return r;
         }
     }
@@ -637,7 +637,7 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         snprintf(subject, sizeof subject, "oidc:%s|%s", claims.iss, claims.sub);
         /* Registered-user cap (CP-7): a first-time OIDC login can't provision a new
          * user past the workspace limit (an existing user still logs in). */
-        if (user_slots_full(db, subject, w->max_users)) {
+        if (user_slots_full(db, subject, strlen(subject), w->max_users)) {
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_USER_LIMIT; return r;
         }
         uid = upsert_oidc_user(db, subject, claims.email, claims.name);
@@ -908,7 +908,7 @@ static oc_dbres *process_redeem(oc_dbwriter *w, const oc_job *j) {
 
     /* Registered-user cap (CP-7): a redeem that would create a new member is
      * refused once the workspace is at its limit. */
-    if (user_slots_full(db, subject, w->max_users)) {
+    if (user_slots_full(db, subject, sublen, w->max_users)) {
         r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_USER_LIMIT; return r;
     }
 
