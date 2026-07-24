@@ -27,7 +27,7 @@ INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_INC)
 APP_SRC   := $(SHARED_SRC) $(filter-out daemon/main.c,$(DAEMON_SRC))
 # e2e_client is a standalone black-box tool (its own main), not part of the
 # single in-process test binary.
-TEST_SRC  := $(filter-out tests/e2e_client.c tests/bench_load.c,$(wildcard tests/*.c))
+TEST_SRC  := $(filter-out tests/e2e_client.c tests/demo_client.c tests/bench_load.c,$(wildcard tests/*.c))
 TEST_BIN  := build/tests
 
 # --- Client app-core (ARCH-74) ------------------------------------------------
@@ -65,7 +65,7 @@ endif
 TUI_INC   := $(CORE_INC) -Iclient/tui -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
-.PHONY: all test integration core tui bench clean s3-smoke windows-tui tuikit-demo
+.PHONY: all test integration core tui bench clean s3-smoke windows-tui tuikit-demo demo-client
 
 all: $(BIN)
 
@@ -92,6 +92,13 @@ integration: build/e2e_client
 build/e2e_client: tests/e2e_client.c $(SHARED_SRC) $(wildcard shared/*.h) $(MBEDTLS_A) | build
 	$(CC) $(CFLAGS) -O0 -g -Ishared -I$(MBEDTLS_INC) \
 	    tests/e2e_client.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
+
+# Flexible black-box client for the local federated demo (register a device token /
+# send a message against a running daemon). Same shared-only linkage as e2e_client.
+demo-client: build/demo_client
+build/demo_client: tests/demo_client.c $(SHARED_SRC) $(wildcard shared/*.h) $(MBEDTLS_A) | build
+	$(CC) $(CFLAGS) -O0 -g -Ishared -I$(MBEDTLS_INC) \
+	    tests/demo_client.c $(SHARED_SRC) $(MBEDTLS_LIBS) -o $@
 
 # Capacity benchmark load client (REQ-210/211); driven by Scripts/bench.sh.
 # Links only the shared wire modules, like the e2e client.
