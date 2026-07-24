@@ -1,0 +1,89 @@
+# One-command local FEDERATED stack: Postgres + the control plane (openchime-saas,
+# the sibling repo) + a daemon enrolled against it, with push wired. Proves the
+# whole federated system on one machine (ARCH-84 enrollment + ARCH-85 push).
+#
+#   docker compose -f docker-compose.federated.yml up --build
+#
+# Then drive a client against the daemon on localhost:8443:
+#   make demo-client
+#   build/demo_client 127.0.0.1 8443 bob   pw token apns tok-bob-demo
+#   build/demo_client 127.0.0.1 8443 alice pw send  1 "hello from the federated stack"
+# Watch the control-plane log for:  push[Apns] would notify token tok-bob-demo ...
+#
+# Assumes the sibling layout ../openchime-saas. Dev-only: the control plane runs
+# with a log push provider + the dev enrollment-reserve shortcut, never for prod.
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: openchime
+      POSTGRES_PASSWORD: openchime_dev
+      POSTGRES_DB: openchime_cp
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openchime -d openchime_cp"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  control-plane:
+    build:
+      context: ../openchime-saas
+      dockerfile: src/OpenChime.ControlPlane.Web/Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ConnectionStrings__ControlPlane: "Host=db;Port=5432;Database=openchime_cp;Username=openchime;Password=openchime_dev"
+      Database__MigrateOnStartup: "true"
+      Push__Log__Enabled: "true"                 # dev: log notifications instead of calling APNs/FCM
+      Enrollment__DevReserveEnabled: "true"      # dev: reserve a couriered code without the console
+      ASPNETCORE_ENVIRONMENT: Development
+    ports:
+      - "5176:8080"    # console + machine API (http://localhost:5176)
+
+  # Reserves the daemon's enrollment code (written to the shared volume) via the
+  # dev-only reserve endpoint, so the daemon activates hands-off.
+  enroll-init:
+    image: curlimages/curl:latest
+    depends_on:
+      - control-plane
+    volumes:
+      - enroll-shared:/shared
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        until [ -f /shared/enroll-code ]; do sleep 1; done
+        CODE=$$(cat /shared/enroll-code)
+        echo "enroll-init: reserving $${CODE%.*}..."
+        until curl -sf -X POST http://control-plane:8080/api/dev/enroll/reserve \
+              -H 'Content-Type: application/json' -d "{\"code\":\"$$CODE\"}"; do
+          echo "enroll-init: control plane not ready, retrying"; sleep 2
+        done
+        echo "enroll-init: reserved."
+
+  daemon:
+    build: .
+    depends_on:
+      - control-plane
+    environment:
+      OPENCHIME_DB_PATH: /data/openchime.db
+      OPENCHIME_BLOB_DIR: /data/blobs
+      OC_BOOTSTRAP_USERS: "alice:pw:owner,bob:pw:member"
+      OC_ENROLL_URL: "http://control-plane:8080"
+      OC_PUSH_URL: "http://control-plane:8080"
+      OC_ENROLL_CODE_FILE: /shared/enroll-code
+      OC_ENROLL_WAIT_SECS: "180"                 # wait for enroll-init to reserve, then activate
+    entrypoint: ["/bin/sh", "-c", "mkdir -p /data/blobs && exec /entrypoint.sh"]
+    volumes:
+      - daemon-data:/data
+      - enroll-shared:/shared
+    ports:
+      - "8443:8443"    # binary protocol (TLS) — point a client here
+      - "18080:8080"   # daemon /healthz
+    mem_limit: 256m
+    cpus: "1"
+
+volumes:
+  daemon-data:
+  enroll-shared:

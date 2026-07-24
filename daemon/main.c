@@ -27,6 +27,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t g_stop = 0;
@@ -252,25 +253,47 @@ int main(void) {
                 oc_dbwriter_store_enrollment(db, pk, aud, 0)) {
                 enroll_privkey = strdup(pk);
                 enroll_audience = strdup(aud);
-                if (oc_enroll_build_code(pk, aud, code, sizeof code) == 0)
+                if (oc_enroll_build_code(pk, aud, code, sizeof code) == 0) {
                     fprintf(stderr, "openchimed: enrollment code (courier into your "
                                     "control-plane console): %s\n", code);
+                    /* Also write it to OC_ENROLL_CODE_FILE (if set) so orchestration
+                     * — e.g. the local federated demo's enroll-init — can reserve it
+                     * without scraping the log. */
+                    const char *cf = getenv("OC_ENROLL_CODE_FILE");
+                    if (cf && *cf) {
+                        FILE *f = fopen(cf, "w");
+                        if (f) { fprintf(f, "%s\n", code); fclose(f); }
+                    }
+                }
             } else {
                 fprintf(stderr, "openchimed: enrollment key generation failed\n");
             }
         }
+        /* Try to activate. If the operator hasn't reserved the code yet (PENDING),
+         * retry every 3s for up to OC_ENROLL_WAIT_SECS before serving — so a box
+         * can come up already-Active (and with push enabled) once the reserve
+         * lands, no restart needed. Default 0 = one attempt (retry next boot). */
+        int wait_secs = atoi(env_or("OC_ENROLL_WAIT_SECS", "0"));
         if (enroll_audience && enroll_privkey && !enroll_active) {
-            oc_enroll_result er = oc_enroll_activate(enroll_url, getenv("OC_ENROLL_CA_BUNDLE"),
-                                                     enroll_audience, enroll_privkey);
-            if (er == OC_ENROLL_ACTIVE) {
-                oc_dbwriter_store_enrollment(db, enroll_privkey, enroll_audience, 1);
-                enroll_active = 1;
-                fprintf(stderr, "openchimed: enrollment activated (audience=%s)\n", enroll_audience);
-            } else if (er == OC_ENROLL_PENDING) {
-                fprintf(stderr, "openchimed: enrollment pending — reserve the code in the "
-                                "console; activation retries on next boot\n");
-            } else {
-                fprintf(stderr, "openchimed: enrollment activation failed (central unreachable?)\n");
+            time_t deadline = time(NULL) + wait_secs;
+            for (;;) {
+                oc_enroll_result er = oc_enroll_activate(enroll_url, getenv("OC_ENROLL_CA_BUNDLE"),
+                                                         enroll_audience, enroll_privkey);
+                if (er == OC_ENROLL_ACTIVE) {
+                    oc_dbwriter_store_enrollment(db, enroll_privkey, enroll_audience, 1);
+                    enroll_active = 1;
+                    fprintf(stderr, "openchimed: enrollment activated (audience=%s)\n", enroll_audience);
+                    break;
+                }
+                if (time(NULL) >= deadline) {
+                    if (er == OC_ENROLL_PENDING)
+                        fprintf(stderr, "openchimed: enrollment pending — reserve the code in the "
+                                        "console; activation retries on next boot\n");
+                    else
+                        fprintf(stderr, "openchimed: enrollment activation failed (central unreachable?)\n");
+                    break;
+                }
+                sleep(3);   /* waiting for the operator to reserve the code */
             }
         }
     }

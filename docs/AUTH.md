@@ -259,6 +259,11 @@ reverse, ARCH-56) to prove possession of the private key and activate the bindin
 The enrolled audience then feeds the OIDC configuration above (§3.4) automatically,
 so an enrolled box need not be given `OC_OIDC_AUDIENCE` by hand. The enrollment
 *flow/registry* remains a control-plane concern; only the client half is here.
+Two optional knobs support unattended bring-up (see [DEMO.md](./DEMO.md)):
+`OC_ENROLL_CODE_FILE` also writes the `oce1.` code to a file (so orchestration can
+reserve it without scraping the log), and `OC_ENROLL_WAIT_SECS` retries activation for
+that many seconds before serving (default 0 = one attempt, retry next boot), so a box
+can come up already-Active once the operator reserves the code.
 
 **The daemon's push emitter (ARCH-85).** An enrolled box additionally set with
 `OC_PUSH_URL` (the control-plane push gateway; `OC_PUSH_CA_BUNDLE` optional) delivers

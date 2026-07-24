@@ -14,32 +14,41 @@ outbound wires (enrollment, ARCH-84; push, ARCH-85). Verified end to end.
    control-plane gateway, which verifies the signature (CP-12) and relays it (ARCH-85 ↔
    CP-13). The cross-language crypto (mbedTLS sign ↔ .NET verify) matches by construction.
 
-## Run it
+## Run it — one command (recommended)
 
-1. Start the control plane (from the `openchime-saas` repo) with the dev log push
-   provider and Postgres reachable:
+Assuming the sibling layout `../openchime-saas`:
 
-   ```sh
-   docker compose up -d db
-   ConnectionStrings__ControlPlane="Host=localhost;Port=5432;Database=openchime_cp;Username=openchime;Password=openchime_dev" \
-   Database__MigrateOnStartup=true Push__Log__Enabled=true \
-   ASPNETCORE_URLS=http://localhost:5176 \
-   dotnet run --project src/OpenChime.ControlPlane.Web
-   ```
+```sh
+docker compose -f docker-compose.federated.yml up --build
+```
 
-2. From this repo:
+That stands up Postgres + the control plane (with the dev log push provider + the dev
+enrollment-reserve shortcut) + a daemon that **enrolls hands-off**: the daemon writes its
+`oce1` code to a shared volume (`OC_ENROLL_CODE_FILE`), an `enroll-init` step reserves it
+via the dev endpoint, and the daemon activates (`OC_ENROLL_WAIT_SECS` lets it wait for the
+reserve, then come up Active with push enabled). The daemon serves on `localhost:8443`.
 
-   ```sh
-   scripts/demo-federated.sh http://localhost:5176
-   ```
+Then drive a client against it:
 
-   It builds the daemon + `demo_client`, boots the daemon federated, scripts the console
-   reserve, re-boots to activate, then registers a token and sends a message. Watch the
-   control-plane log for:
+```sh
+make demo-client
+build/demo_client 127.0.0.1 8443 bob   pw token apns tok-bob-demo
+build/demo_client 127.0.0.1 8443 alice pw send  1 "hello from the federated stack"
+```
 
-   ```
-   push[Apns] would notify token tok-bob-demo (channel 1, ...)
-   ```
+Watch the control-plane log for:
+
+```
+push[Apns] would notify token tok-bob-demo (channel 1, ...)
+```
+
+That is the daemon→central push wire firing end to end (signed CP-12, contentless).
+
+## Run it — scripted, against a control plane you started yourself
+
+If you're running the control plane directly (e.g. `dotnet run` with
+`Push:Log:Enabled=true`), `scripts/demo-federated.sh http://localhost:5176` does the same
+flow against it (it scripts the real console reserve, no dev endpoint needed).
 
 ## Notes / gotchas
 
