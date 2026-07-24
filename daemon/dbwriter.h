@@ -451,6 +451,10 @@ int  oc_dbwriter_eventfd(oc_dbwriter *w);
  * session (local is disabled — v1 is one mode per tenant). Copies its args;
  * call once before serving traffic. `pubkey_pem` is a PEM SubjectPublicKeyInfo;
  * `oidc_params` is the opaque blob advertised to clients. Returns 0 / -1. */
+/* Set the registered-user cap (CP-7, OPENCHIME_MAX_USERS); <=0 = unlimited. Call
+ * once before serving. */
+void oc_dbwriter_set_max_users(oc_dbwriter *w, int max_users);
+
 int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
                                const char *audience, const char *pubkey_pem,
                                const char *oidc_params);

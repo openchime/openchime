@@ -1871,6 +1871,33 @@ static void test_dm(void) {
     cleanup_db(path);
 }
 
+/* CP-7: the registered-user cap (OPENCHIME_MAX_USERS). */
+static void test_max_users(void) {
+    const char *path = "build/test_dbwriter_cap.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    oc_dbwriter_set_max_users(w, 2);
+
+    uint64_t u1 = reg(w, "alice", "pw", OC_ROLE_OWNER);
+    uint64_t u2 = reg(w, "bob", "pw", OC_ROLE_MEMBER);
+    CHECK(u1 != 0);
+    CHECK(u2 != 0);
+
+    /* A third new user is refused at the cap. */
+    CHECK(reg(w, "carol", "pw", OC_ROLE_MEMBER) == 0);
+
+    /* Re-registering an existing user is idempotent, never capped. */
+    CHECK(reg(w, "alice", "pw", OC_ROLE_OWNER) == u1);
+
+    /* Lifting the cap (0 = unlimited) lets the new user in. */
+    oc_dbwriter_set_max_users(w, 0);
+    CHECK(reg(w, "carol", "pw", OC_ROLE_MEMBER) != 0);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 int run_dbwriter_tests(void) {
     printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill\n");
     test_start_migrates_and_stops();
@@ -1895,5 +1922,6 @@ int run_dbwriter_tests(void) {
     test_delivery_cursor();
     test_idem_pruning();
     test_backfill();
+    test_max_users();
     return failures;
 }

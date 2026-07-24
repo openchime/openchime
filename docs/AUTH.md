@@ -81,6 +81,13 @@ authority.
 - **Adding users:** an owner/admin creates an account and issues an **invite
   token**; the invitee sets their password by presenting the token. Email
   magic-link delivery is an optional future enhancement, never required.
+- **Registered-user cap (CP-7):** the daemon honors `OPENCHIME_MAX_USERS` (0/unset
+  = unlimited). Creating a *new* user past the cap — via invite redeem, direct
+  register, bootstrap, or a first-time OIDC login — is refused with
+  `ERROR USER_LIMIT`; an existing user still logs in, and a removed member
+  (`disabled=1`) frees a seat (the count is active users only). This enforces the
+  hosted plan's per-workspace seat limit, written into the box config at provision
+  time; only the daemon can enforce it since only it holds the users table.
 - **Brute-force protection (REQ-191):** the daemon rate-limits failed local-auth
   attempts per account **and** per source IP (`daemon/ratelimit.c`, fixed-window
   counters checked before PBKDF2 so a flood can't burn CPU), answering excess

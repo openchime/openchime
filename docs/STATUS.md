@@ -39,7 +39,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 021 Entra/Google providers | ➖ | Lives in the central relay service (out of this repo); the daemon only verifies the re-issued token. |
 | 022 Apple Sign-In / no Facebook | ➖ | Central service concern. |
 | 023 verified credential per mode | ✅ | ES256 pinned (alg+iss+aud+exp), or PBKDF2 password. |
-| 024 local accounts | ✅ | PBKDF2, invite-token creation + redeem, failed-auth rate-limit, and a first-run one-time owner setup token (or `OC_BOOTSTRAP_USERS`). |
+| 024 local accounts | ✅ | PBKDF2, invite-token creation + redeem, failed-auth rate-limit, and a first-run one-time owner setup token (or `OC_BOOTSTRAP_USERS`). **Registered-user cap enforced** (CP-7, `OPENCHIME_MAX_USERS`): new-user creation refused at the cap across redeem/register/bootstrap/OIDC-JIT with `ERROR USER_LIMIT`; active-user count (removed members free a seat). |
 | 025 OIDC central relay | ➖ / ✅ | Relay is out-of-repo; daemon trusts the re-issued token. **Enrollment client built** (ARCH-84, `daemon/enroll.c`): the daemon generates its keypair + audience, emits an `oce1.` code, and calls out to activate; the enrolled audience feeds OIDC. Tested (`tests/test_enroll.c`). |
 | 030 roles + ≥1-owner invariant | ✅ | |
 | 031 channel membership, public/private read-post | ✅ | Public auto-joins the poster; private is members-only. |

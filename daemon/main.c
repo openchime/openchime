@@ -229,6 +229,10 @@ int main(void) {
     oc_dbwriter *db = oc_dbwriter_start(db_path);
     if (!db) { fprintf(stderr, "openchimed: DB init failed\n"); return 1; }
 
+    /* Registered-user cap (CP-7, hosted plan CP-4): OPENCHIME_MAX_USERS; 0/unset =
+     * unlimited (self-hosted). Written into hosted-box config at provision time. */
+    oc_dbwriter_set_max_users(db, atoi(env_or("OPENCHIME_MAX_USERS", "0")));
+
     /* Optionally provision local accounts before serving (AUTH.md §2). */
     bootstrap_users(db, getenv("OC_BOOTSTRAP_USERS"));
 

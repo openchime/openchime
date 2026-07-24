@@ -141,6 +141,7 @@ typedef enum {
     OC_ERR_AUTH_REQUIRED       = 2001,
     OC_ERR_AUTH_INVALID_TOKEN  = 2002,
     OC_ERR_AUTH_RATE_LIMITED   = 2003,
+    OC_ERR_USER_LIMIT          = 2004, /* workspace at its registered-user cap (CP-7, OPENCHIME_MAX_USERS) */
     OC_ERR_BODY_TOO_LARGE      = 3001,
     OC_ERR_NOT_A_MEMBER        = 3002,
     OC_ERR_UNKNOWN_CHANNEL     = 3003,

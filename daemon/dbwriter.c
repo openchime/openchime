@@ -47,6 +47,7 @@ struct oc_dbwriter {
     char           *oidc_audience;
     char           *oidc_pubkey_pem;
     char           *oidc_params;             /* advertised blob ("" if none) */
+    int             max_users;               /* registered-user cap (CP-7); 0 = unlimited */
     oc_ratelimit   *auth_rl;                 /* failed local-auth per account */
     oc_ratelimit   *source_rl;               /* failed local-auth per source IP */
 
@@ -305,6 +306,25 @@ static void ensure_default_membership(sqlite3 *db, uint64_t user_id) {
     sqlite3_finalize(st);
 }
 
+/* True when adding a NEW user `subject` would exceed the cap (CP-7,
+ * OPENCHIME_MAX_USERS). max_users <= 0 is unlimited; an already-existing subject is
+ * never capped (idempotent bootstrap / re-login). Counts active users only — a
+ * removed member (disabled=1) frees a seat. */
+static int user_slots_full(sqlite3 *db, const char *subject, int max_users) {
+    if (max_users <= 0) return 0;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT 1 FROM users WHERE subject=?;", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, subject, -1, SQLITE_TRANSIENT);
+    int exists = (sqlite3_step(st) == SQLITE_ROW);
+    sqlite3_finalize(st);
+    if (exists) return 0;
+    int count = 0;
+    sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM users WHERE disabled=0;", -1, &st, NULL);
+    if (sqlite3_step(st) == SQLITE_ROW) count = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return count >= max_users;
+}
+
 /* Create a local account: `local:<username>` user + PBKDF2 credential (AUTH.md
  * §2). Idempotent — INSERT OR IGNORE means re-running bootstrap never clobbers
  * an existing password. Returns the user id, or 0 on error. */
@@ -521,10 +541,20 @@ static uint64_t upsert_oidc_user(sqlite3 *db, const char *subject,
     return uid;
 }
 
-static oc_dbres *process_register(sqlite3 *db, const oc_job *j) {
+static oc_dbres *process_register(oc_dbwriter *w, const oc_job *j) {
+    sqlite3 *db = w->db;
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
+    /* Registered-user cap (CP-7): refuse a new account at the workspace limit. */
+    if (w->max_users > 0) {
+        char subject[256];
+        const char *uname = j->username ? j->username : "";
+        size_t sublen = local_subject(subject, sizeof subject, uname, strlen(uname));
+        if (sublen > 0 && user_slots_full(db, subject, w->max_users)) {
+            r->type = OC_RES_REGISTER_ERR; r->err_code = OC_ERR_USER_LIMIT; return r;
+        }
+    }
     uint64_t uid = register_local(db,
         j->username ? j->username : "", j->username ? strlen(j->username) : 0,
         j->password ? j->password : "", j->password ? strlen(j->password) : 0,
@@ -605,6 +635,11 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         /* Namespace by source: "oidc:<central issuer>|<provider sub>" (AUTH.md §4). */
         char subject[OC_JWT_MAX_FIELD * 2 + 8];
         snprintf(subject, sizeof subject, "oidc:%s|%s", claims.iss, claims.sub);
+        /* Registered-user cap (CP-7): a first-time OIDC login can't provision a new
+         * user past the workspace limit (an existing user still logs in). */
+        if (user_slots_full(db, subject, w->max_users)) {
+            r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_USER_LIMIT; return r;
+        }
         uid = upsert_oidc_user(db, subject, claims.email, claims.name);
         if (uid) role = get_role(db, uid);   /* membership ensured on the common path */
     } else if (j->method == OC_AUTH_SESSION) {
@@ -825,7 +860,8 @@ static oc_dbres *process_setup_invite(sqlite3 *db, const oc_job *j) {
  * single-use-consume the token, and mint a session — the redeeming client is now
  * authenticated (result is an AUTH_OK). Any failure is a non-disclosing
  * AUTH_INVALID_TOKEN. */
-static oc_dbres *process_redeem(sqlite3 *db, const oc_job *j) {
+static oc_dbres *process_redeem(oc_dbwriter *w, const oc_job *j) {
+    sqlite3 *db = w->db;
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
@@ -869,6 +905,12 @@ static oc_dbres *process_redeem(sqlite3 *db, const oc_job *j) {
     int taken = (sqlite3_step(st) == SQLITE_ROW);
     sqlite3_finalize(st);
     if (taken) { r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_INVALID_TOKEN; return r; }
+
+    /* Registered-user cap (CP-7): a redeem that would create a new member is
+     * refused once the workspace is at its limit. */
+    if (user_slots_full(db, subject, w->max_users)) {
+        r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_USER_LIMIT; return r;
+    }
 
     uint64_t uid = register_local(db, user, strlen(user), pass, strlen(pass), role, j->iterations);
     if (uid == 0) { r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
@@ -2753,7 +2795,7 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j);
 static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_AUTH)          return process_auth(w, j);
     if (j->type == OC_JOB_SEND)          return process_send(w->db, j);
-    if (j->type == OC_JOB_REGISTER)      return process_register(w->db, j);
+    if (j->type == OC_JOB_REGISTER)      return process_register(w, j);
     if (j->type == OC_JOB_SET_ROLE)      return process_set_role(w->db, j);
     if (j->type == OC_JOB_LOGOUT)        return process_logout(w->db, j);
     if (j->type == OC_JOB_EDIT)          return process_edit(w->db, j);
@@ -2766,7 +2808,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_OPEN_DM)        return process_open_dm(w->db, j);
     if (j->type == OC_JOB_INVITE_USER)    return process_invite_user(w->db, j);
     if (j->type == OC_JOB_REMOVE_USER)    return process_remove_user(w->db, j);
-    if (j->type == OC_JOB_REDEEM)         return process_redeem(w->db, j);
+    if (j->type == OC_JOB_REDEEM)         return process_redeem(w, j);
     if (j->type == OC_JOB_REACT)          return process_react(w->db, j);
     if (j->type == OC_JOB_SEND_REPLY)     return process_send_reply(w->db, j);
     if (j->type == OC_JOB_SETUP_INVITE)   return process_setup_invite(w->db, j);
@@ -3124,6 +3166,12 @@ int oc_dbwriter_configure_oidc(oc_dbwriter *w, const char *issuer,
     /* v1 is one mode per tenant: OIDC replaces local, session stays. */
     w->auth_methods = OC_AUTH_OIDC | OC_AUTH_SESSION;
     return 0;
+}
+
+/* Registered-user cap (CP-7, OPENCHIME_MAX_USERS). <=0 means unlimited. Set before
+ * serving; read only on the writer thread. */
+void oc_dbwriter_set_max_users(oc_dbwriter *w, int max_users) {
+    w->max_users = max_users > 0 ? max_users : 0;
 }
 
 uint8_t oc_dbwriter_auth_methods(oc_dbwriter *w) { return w->auth_methods; }
