@@ -296,6 +296,22 @@ static const char MIGRATION_0016[] =
     "CREATE INDEX idx_audit_family_time ON audit_log(family, at_ms);"
     "CREATE INDEX idx_audit_time ON audit_log(at_ms);";
 
+/* 0017: the daemon's federated-enrollment identity (CP-8). Generated once on
+ * first boot and persisted so the keypair + audience survive restarts (like
+ * server_identity, migration 0008): a new key would need a fresh operator courier
+ * + re-activation. Single row (id=1). `privkey_pem` is the ECDSA P-256 private
+ * key; `audience` is the opaque id central ratifies; `state` is 'pending' until
+ * central acks activation, then 'active'. */
+static const char MIGRATION_0017[] =
+    "CREATE TABLE enrollment ("
+    "  id              INTEGER PRIMARY KEY CHECK (id = 1),"
+    "  privkey_pem     TEXT NOT NULL,"
+    "  audience        TEXT NOT NULL,"
+    "  state           TEXT NOT NULL,"
+    "  activated_at_ms INTEGER,"
+    "  created_at_ms   INTEGER NOT NULL"
+    ");";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -313,6 +329,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 14, MIGRATION_0014 },
     { 15, MIGRATION_0015 },
     { 16, MIGRATION_0016 },
+    { 17, MIGRATION_0017 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

@@ -188,6 +188,8 @@ static void job_free(oc_job *j) {
     free(j->emoji);
     free(j->cert_pem);
     free(j->key_pem);
+    free(j->enroll_privkey);
+    free(j->enroll_audience);
     free(j->filename);
     free(j->mime);
     free(j->cs_client_type);
@@ -226,6 +228,8 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->search);
     free(r->cert_pem);
     free(r->key_pem);
+    free(r->enroll_privkey);
+    free(r->enroll_audience);
     free(r->storage_key);
     for (size_t i = 0; i < r->n_reclaim; i++) free(r->reclaim[i].storage_key);
     free(r->reclaim);
@@ -920,6 +924,48 @@ static oc_dbres *process_store_identity(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_text(st, 1, j->cert_pem ? j->cert_pem : "", -1, SQLITE_STATIC);
     sqlite3_bind_text(st, 2, j->key_pem ? j->key_pem : "", -1, SQLITE_STATIC);
     sqlite3_bind_int64(st, 3, (sqlite3_int64)dbw_now_ms());
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc == SQLITE_DONE) r->type = OC_RES_OK;
+    else { r->err_code = OC_ERR_INTERNAL; }
+    return r;
+}
+
+/* Load the persisted federated-enrollment identity (CP-8); enroll_present=0 when
+ * none is stored yet (first run). */
+static oc_dbres *process_load_enrollment(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_ENROLLMENT;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT privkey_pem, audience, state FROM enrollment WHERE id=1;", -1, &st, NULL);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        r->enroll_privkey  = strdup((const char *)sqlite3_column_text(st, 0));
+        r->enroll_audience = strdup((const char *)sqlite3_column_text(st, 1));
+        const char *state  = (const char *)sqlite3_column_text(st, 2);
+        r->enroll_active   = (state && strcmp(state, "active") == 0);
+        r->enroll_present  = 1;
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+/* Persist the enrollment keypair + audience + state (CP-8). */
+static oc_dbres *process_store_enrollment(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT OR REPLACE INTO enrollment(id,privkey_pem,audience,state,activated_at_ms,created_at_ms) "
+        "VALUES(1,?,?,?,?,?);", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, j->enroll_privkey  ? j->enroll_privkey  : "", -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, j->enroll_audience ? j->enroll_audience : "", -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 3, j->enroll_active ? "active" : "pending", -1, SQLITE_STATIC);
+    if (j->enroll_active) sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+    else sqlite3_bind_null(st, 4);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)dbw_now_ms());
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc == SQLITE_DONE) r->type = OC_RES_OK;
@@ -2727,6 +2773,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_CLIENT_ACK)     return process_client_ack(w->db, j);
     if (j->type == OC_JOB_LOAD_IDENTITY)  return process_load_identity(w->db, j);
     if (j->type == OC_JOB_STORE_IDENTITY) return process_store_identity(w->db, j);
+    if (j->type == OC_JOB_LOAD_ENROLLMENT)  return process_load_enrollment(w->db, j);
+    if (j->type == OC_JOB_STORE_ENROLLMENT) return process_store_enrollment(w->db, j);
     if (j->type == OC_JOB_ATTACH_CREATE)   return process_attach_create(w->db, j);
     if (j->type == OC_JOB_ATTACH_FINALIZE) return process_attach_finalize(w->db, j);
     if (j->type == OC_JOB_CREATE_WEBHOOK)  return process_create_webhook(w->db, j);
@@ -3174,6 +3222,54 @@ int oc_dbwriter_store_identity(oc_dbwriter *w, const char *cert_pem, const char 
     j->cert_pem = strdup(cert_pem);
     j->key_pem  = strdup(key_pem);
     if (!j->cert_pem || !j->key_pem) { job_free(j); return 0; }
+    oc_dbwriter_submit(w, j);
+    for (int i = 0; i < 3000; i++) {
+        oc_dbres *r = oc_dbwriter_next_result(w);
+        if (r) {
+            int ok = (r->type == OC_RES_OK);
+            oc_dbres_free(r);
+            return ok;
+        }
+        usleep(1000);
+    }
+    return 0;
+}
+
+/* Load the persisted federated-enrollment identity (CP-8). Returns 1 (+ heap
+ * privkey/audience/active) if a row exists, else 0. Setup-time only. */
+int oc_dbwriter_load_enrollment(oc_dbwriter *w, char **privkey_out, char **audience_out, int *active_out) {
+    *privkey_out = NULL; *audience_out = NULL; *active_out = 0;
+    oc_job *j = oc_job_new(OC_JOB_LOAD_ENROLLMENT, 0);
+    if (!j) return 0;
+    oc_dbwriter_submit(w, j);
+    for (int i = 0; i < 3000; i++) {
+        oc_dbres *r = oc_dbwriter_next_result(w);
+        if (r) {
+            int have = 0;
+            if (r->type == OC_RES_ENROLLMENT && r->enroll_present &&
+                r->enroll_privkey && r->enroll_audience) {
+                *privkey_out  = strdup(r->enroll_privkey);
+                *audience_out = strdup(r->enroll_audience);
+                *active_out   = r->enroll_active;
+                have = (*privkey_out && *audience_out);
+            }
+            oc_dbres_free(r);
+            return have;
+        }
+        usleep(1000);
+    }
+    return 0;
+}
+
+/* Persist the enrollment keypair + audience + state (CP-8). Returns 1 on success.
+ * Setup-time only. */
+int oc_dbwriter_store_enrollment(oc_dbwriter *w, const char *privkey_pem, const char *audience, int active) {
+    oc_job *j = oc_job_new(OC_JOB_STORE_ENROLLMENT, 0);
+    if (!j) return 0;
+    j->enroll_privkey  = strdup(privkey_pem);
+    j->enroll_audience = strdup(audience);
+    j->enroll_active   = active;
+    if (!j->enroll_privkey || !j->enroll_audience) { job_free(j); return 0; }
     oc_dbwriter_submit(w, j);
     for (int i = 0; i < 3000; i++) {
         oc_dbres *r = oc_dbwriter_next_result(w);

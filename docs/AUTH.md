@@ -242,6 +242,17 @@ generate an ECDSA-P256 keypair in the test, mint central-style ES256 JWTs, and
 configure the daemon with the test public key — the same faking approach as the
 existing TLS/netloop integration tests.
 
+**The daemon's enrollment client (ARCH-84).** How a federated box *obtains* its
+audience id is now implemented daemon-side in `daemon/enroll.c`, gated on
+`OC_ENROLL_URL`. On first boot the daemon generates its own ECDSA-P256 keypair +
+a random `audience` (`ws_…`), persists them (so they survive restarts), and prints
+an `oce1.` **enrollment code** the operator couriers into the control-plane
+console. The daemon then calls out (CA-verified HTTPS — it dials central, never the
+reverse, ARCH-56) to prove possession of the private key and activate the binding.
+The enrolled audience then feeds the OIDC configuration above (§3.4) automatically,
+so an enrolled box need not be given `OC_OIDC_AUDIENCE` by hand. The enrollment
+*flow/registry* remains a control-plane concern; only the client half is here.
+
 ---
 
 ## 4. Sessions — the convergence point (ARCH-58)

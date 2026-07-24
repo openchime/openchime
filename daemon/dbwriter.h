@@ -63,7 +63,8 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_STORAGE_MAINT = 45,
        /* Storage usage report for an owner/admin (REQ-214). Read-only. */
        OC_JOB_STORAGE_STATUS = 46,
-       OC_JOB_AUDIT_QUERY = 47 };
+       OC_JOB_AUDIT_QUERY = 47,
+       OC_JOB_LOAD_ENROLLMENT = 48, OC_JOB_STORE_ENROLLMENT = 49 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -97,6 +98,11 @@ typedef struct oc_job {
     /* STORE_IDENTITY (persist the TLS cert+key PEM) */
     char          *cert_pem;   /* heap */
     char          *key_pem;    /* heap */
+
+    /* STORE_ENROLLMENT (CP-8): the federated keypair + audience + state. */
+    char          *enroll_privkey;   /* heap */
+    char          *enroll_audience;  /* heap */
+    int            enroll_active;
 
     /* REACT (channel_id + message_id above); emoji is heap, op is add/remove. */
     char          *emoji;      /* heap */
@@ -204,7 +210,7 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_AUDIT_PAGE = 54, OC_RES_AUDIT_ERR = 55,
        /* A read cursor advanced (REQ-090 seen-by): fan the acker's new cursor to
         * the channel's members + backfill the acker with the others' cursors. */
-       OC_RES_READ_CURSOR = 50 };
+       OC_RES_READ_CURSOR = 50, OC_RES_ENROLLMENT = 56 };
 
 /* One row in a REACTIONS result (a distinct emoji + one reacting user). */
 typedef struct { char *emoji; uint64_t user_id; } oc_reaction_row;
@@ -374,6 +380,12 @@ typedef struct oc_dbres {
     char           *cert_pem;
     char           *key_pem;
 
+    /* ENROLLMENT (load, CP-8): the persisted keypair + audience + state. */
+    char           *enroll_privkey;
+    char           *enroll_audience;
+    int             enroll_active;
+    int             enroll_present;
+
     /* Attachments (REQ-140/141). CREATED: attachment_id (above) + storage_key.
      * META (download): attachment_id + channel_id (above) + storage_key +
      * filename + mime + att_size + att_sha256. */
@@ -480,6 +492,13 @@ int oc_dbwriter_setup_invite(oc_dbwriter *w, uint8_t token_out[OC_INVITE_TOKEN_L
  * returns 1 on success. Setup-time only (each drains one result). */
 int oc_dbwriter_load_identity(oc_dbwriter *w, char **cert_out, char **key_out);
 int oc_dbwriter_store_identity(oc_dbwriter *w, const char *cert_pem, const char *key_pem);
+
+/* Federated enrollment persistence (CP-8), setup-time only. Load returns 1 and
+ * heap-allocates privkey_pem + audience (caller frees) + *active when a row
+ * exists, else 0. Store persists the keypair + audience + state; returns 1 on
+ * success. */
+int oc_dbwriter_load_enrollment(oc_dbwriter *w, char **privkey_out, char **audience_out, int *active_out);
+int oc_dbwriter_store_enrollment(oc_dbwriter *w, const char *privkey_pem, const char *audience, int active);
 
 /* Hand a job to the writer (transfers ownership; the writer frees it). */
 void       oc_dbwriter_submit(oc_dbwriter *w, oc_job *j);

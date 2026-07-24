@@ -13,6 +13,7 @@
 
 #include "audio.h"
 #include "dbwriter.h"
+#include "enroll.h"
 #include "netloop.h"
 #include "tls.h"
 
@@ -231,11 +232,50 @@ int main(void) {
     /* Optionally provision local accounts before serving (AUTH.md §2). */
     bootstrap_users(db, getenv("OC_BOOTSTRAP_USERS"));
 
+    /* Federated enrollment (CP-8, AUTH.md §3.6). Gated on OC_ENROLL_URL — the
+     * operator opting this box into the control plane. On first boot: generate a
+     * keypair + opaque audience, persist them, and print an enrollment code to
+     * courier into the console. Then (if pending) call out to central to prove
+     * possession and activate. The daemon-generated audience feeds OIDC below. */
+    char *enroll_privkey = NULL, *enroll_audience = NULL;
+    int enroll_active = 0;
+    const char *enroll_url = getenv("OC_ENROLL_URL");
+    if (enroll_url && *enroll_url) {
+        if (!oc_dbwriter_load_enrollment(db, &enroll_privkey, &enroll_audience, &enroll_active)) {
+            char pk[1024], aud[128], code[2048];
+            if (oc_enroll_generate(pk, sizeof pk, aud, sizeof aud) == 0 &&
+                oc_dbwriter_store_enrollment(db, pk, aud, 0)) {
+                enroll_privkey = strdup(pk);
+                enroll_audience = strdup(aud);
+                if (oc_enroll_build_code(pk, aud, code, sizeof code) == 0)
+                    fprintf(stderr, "openchimed: enrollment code (courier into your "
+                                    "control-plane console): %s\n", code);
+            } else {
+                fprintf(stderr, "openchimed: enrollment key generation failed\n");
+            }
+        }
+        if (enroll_audience && enroll_privkey && !enroll_active) {
+            oc_enroll_result er = oc_enroll_activate(enroll_url, getenv("OC_ENROLL_CA_BUNDLE"),
+                                                     enroll_audience, enroll_privkey);
+            if (er == OC_ENROLL_ACTIVE) {
+                oc_dbwriter_store_enrollment(db, enroll_privkey, enroll_audience, 1);
+                enroll_active = 1;
+                fprintf(stderr, "openchimed: enrollment activated (audience=%s)\n", enroll_audience);
+            } else if (er == OC_ENROLL_PENDING) {
+                fprintf(stderr, "openchimed: enrollment pending — reserve the code in the "
+                                "console; activation retries on next boot\n");
+            } else {
+                fprintf(stderr, "openchimed: enrollment activation failed (central unreachable?)\n");
+            }
+        }
+    }
+
     /* OIDC mode (AUTH.md §3): pin central's ES256 key + issuer/audience. When
-     * set, AUTH_CHALLENGE advertises oidc+session instead of local+session. */
+     * set, AUTH_CHALLENGE advertises oidc+session instead of local+session. An
+     * enrolled box (CP-8) uses its daemon-generated audience automatically. */
     if (strcmp(env_or("OC_AUTH_MODE", "local"), "oidc") == 0) {
         const char *iss = getenv("OC_OIDC_ISSUER");
-        const char *aud = getenv("OC_OIDC_AUDIENCE");
+        const char *aud = enroll_audience ? enroll_audience : getenv("OC_OIDC_AUDIENCE");
         char *pem = load_oidc_pubkey();
         if (!iss || !aud || !pem) {
             fprintf(stderr, "openchimed: OIDC mode needs OC_OIDC_ISSUER, "
@@ -249,6 +289,8 @@ int main(void) {
         free(pem);
         fprintf(stderr, "openchimed: OIDC mode (issuer=%s audience=%s)\n", iss, aud);
     }
+    free(enroll_privkey);
+    free(enroll_audience);
 
     /* First-run bootstrap (REQ-024, local mode only): if there is no owner yet
      * and none was provisioned via OC_BOOTSTRAP_USERS, mint a one-time owner
