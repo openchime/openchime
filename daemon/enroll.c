@@ -259,47 +259,58 @@ static int post_json(enroll_ctx *ctx, const char *path, const char *body,
         return -1;
     }
 
-    /* Response head: status line + Content-Length + any spilled body bytes. */
-    char hdr[8192];
-    size_t hlen = 0;
-    const char *term = NULL;
-    while (hlen < sizeof hdr - 1) {
-        long r = conn_read(&c, hdr + hlen, sizeof hdr - 1 - hlen);
-        if (r <= 0) { conn_close(&c); return -1; }
-        hlen += (size_t)r;
-        hdr[hlen] = '\0';
-        term = strstr(hdr, "\r\n\r\n");
-        if (term) break;
+    /* Read the whole response (Connection: close → until EOF), then split head/body
+     * and de-chunk if Transfer-Encoding: chunked. Kestrel and HTTP proxies use
+     * chunked for dynamic JSON, so there is no Content-Length to rely on. */
+    char raw[16384];
+    size_t total = 0;
+    for (;;) {
+        if (total >= sizeof raw - 1) break;
+        long r = conn_read(&c, raw + total, sizeof raw - 1 - total);
+        if (r < 0) { conn_close(&c); return -1; }
+        if (r == 0) break;   /* EOF */
+        total += (size_t)r;
     }
-    if (!term || strncmp(hdr, "HTTP/1.", 7) != 0) { conn_close(&c); return -1; }
-    *status = atoi(hdr + 9);
+    conn_close(&c);
+    raw[total] = '\0';
 
-    long long content_length = -1;
-    for (const char *p = hdr; p && p < term; ) {
-        const char *eol = strstr(p, "\r\n");
+    char *term = strstr(raw, "\r\n\r\n");
+    if (!term || strncmp(raw, "HTTP/1.", 7) != 0) return -1;
+    *status = atoi(raw + 9);
+
+    int chunked = 0;
+    for (char *p = raw; p < term; ) {
+        char *eol = strstr(p, "\r\n");
         if (!eol || eol > term) break;
-        if (strncasecmp(p, "Content-Length:", 15) == 0) content_length = atoll(p + 15);
+        if (strncasecmp(p, "Transfer-Encoding:", 18) == 0 && strcasestr(p, "chunked")) chunked = 1;
         p = eol + 2;
     }
 
-    size_t got = 0;
-    const char *body_start = term + 4;
-    size_t spilled = hlen - (size_t)(body_start - hdr);
-    if (spilled > resp_cap - 1) spilled = resp_cap - 1;
-    memcpy(resp, body_start, spilled);
-    got = spilled;
-
-    for (;;) {
-        if (content_length >= 0 && (long long)got >= content_length) break;
-        if (got >= resp_cap - 1) break;
-        long r = conn_read(&c, resp + got, resp_cap - 1 - got);
-        if (r < 0) { conn_close(&c); return -1; }
-        if (r == 0) break;   /* EOF — Connection: close */
-        got += (size_t)r;
+    char *respbody = term + 4;
+    char *end = raw + total;
+    size_t out = 0;
+    if (chunked) {
+        char *p = respbody;
+        while (p < end) {
+            char *nl = memchr(p, '\n', (size_t)(end - p));
+            if (!nl) break;
+            long sz = strtol(p, NULL, 16);   /* chunk size line (hex) */
+            p = nl + 1;
+            if (sz <= 0) break;              /* terminating 0-size chunk */
+            if (p + sz > end) sz = (long)(end - p);
+            if (out + (size_t)sz < resp_cap - 1) { memcpy(resp + out, p, (size_t)sz); out += (size_t)sz; }
+            p += sz;
+            if (p < end && *p == '\r') p++;
+            if (p < end && *p == '\n') p++;  /* CRLF after chunk data */
+        }
+    } else {
+        size_t blen = (size_t)(end - respbody);
+        if (blen > resp_cap - 1) blen = resp_cap - 1;
+        memcpy(resp, respbody, blen);
+        out = blen;
     }
-    resp[got] = '\0';
-    *resp_len = got;
-    conn_close(&c);
+    resp[out] = '\0';
+    *resp_len = out;
     return 0;
 }
 
