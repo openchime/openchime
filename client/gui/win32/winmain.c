@@ -107,6 +107,10 @@ static int g_n_msgrows;
 static struct { float top, bot; uint64_t uid; } g_memrows[256];
 static int g_n_memrows;
 
+/* Search-overlay result hit-boxes (row -> its channel). */
+static struct { float top, bot; uint64_t cid; } g_searchrows[128];
+static int g_n_searchrows;
+
 static int      g_show_members = 1;     /* members pane visible */
 static D2D1_RECT_F g_members_btn;       /* header toggle hit-box */
 static D2D1_RECT_F g_rail_btn;          /* workspace-avatar hit-box (app menu) */
@@ -219,6 +223,8 @@ static void d2d_resize(HWND hwnd) {
 
 static const oc_model *model(void) { return g_client ? oc_client_model(g_client) : NULL; }
 
+static const oc_msg *find_msg(const oc_channel *c, uint64_t mid);   /* defined below */
+
 /* Our own tenant role (for gating admin actions); OC_ROLE_MEMBER if unknown. */
 static uint8_t self_role(const oc_model *m) {
     for (size_t i = 0; i < m->n_users; i++)
@@ -235,8 +241,17 @@ static int already_backfilled(uint64_t cid) {
     return 0;
 }
 
+static void close_overlays(void) {
+    const oc_model *mm = model();
+    if (!mm) return;
+    if (mm->thread_open)    oc_client_close_thread(g_client);
+    if (mm->search_open)    oc_client_close_search(g_client);
+    if (mm->reactlist_open) oc_client_close_reactions(g_client);
+}
+
 static void select_channel(uint64_t cid) {
     if (!g_client || !cid) return;
+    close_overlays();
     g_sel = cid;
     g_scroll = 0;
     if (!already_backfilled(cid)) {
@@ -439,42 +454,26 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
     }
 }
 
-static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
-    const oc_channel *c = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
-
-    if (!m->authed || !c) {
-        const char *msg = !m->connected ? (m->last_error[0] ? m->last_error : "connecting…")
-                        : !m->authed    ? "signing in…"
-                                        : "Select a channel to start reading.";
-        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, msg, g_ui, reg, OC_COL_MUTED);
-        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
-        return;
-    }
-    if (c->n_msgs == 0) {
-        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, "No messages yet — say hello.", g_ui, reg, OC_COL_MUTED);
-        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
-        return;
-    }
-
+/* Bottom-pinned, wheel-scrolled render of a message array into `reg`. When
+ * `capture` is set, records per-message hit-boxes for the context menu. */
+static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
+                         const oc_msg *msgs, size_t nmsgs, D2D1_RECT_F reg, int capture) {
     float pad = 20.0f;
     float x0 = reg.left + pad;
     float content_w = (reg.right - pad) - (x0 + AVA + 12);
     if (content_w < 80) content_w = 80;
 
-    /* Render at most the most recent N messages (bounds the per-frame layouts). */
-    size_t n = c->n_msgs, first = 0;
+    size_t n = nmsgs, first = 0;
     enum { CAP = 600 };
     static IDWriteTextLayout *layouts[CAP];
     static float heights[CAP];
+    static uint8_t grouped[CAP];
     if (n > CAP) { first = n - CAP; n = CAP; }
 
-    static uint8_t grouped[CAP];
     float total = 0;
     for (size_t i = 0; i < n; i++) {
-        grouped[i] = (uint8_t)(i > 0 && groups_with(&c->msgs[first + i - 1], &c->msgs[first + i]));
-        heights[i] = msg_height(&c->msgs[first + i], content_w, grouped[i], &layouts[i]);
+        grouped[i] = (uint8_t)(i > 0 && groups_with(&msgs[first + i - 1], &msgs[first + i]));
+        heights[i] = msg_height(&msgs[first + i], content_w, grouped[i], &layouts[i]);
         total += heights[i];
     }
 
@@ -486,14 +485,14 @@ static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
     float y = (reg.bottom - total) + g_scroll;     /* g_scroll 0 => newest pinned to bottom */
 
     ID2D1RenderTarget_PushAxisAlignedClip(rt, &reg, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-    g_n_msgrows = 0;
+    if (capture) g_n_msgrows = 0;
     for (size_t i = 0; i < n; i++) {
         if (y + heights[i] >= reg.top && y <= reg.bottom) {
-            draw_message(rt, m, &c->msgs[first + i], layouts[i], x0, y, content_w, grouped[i]);
-            if (g_n_msgrows < (int)(sizeof g_msgrows / sizeof g_msgrows[0])) {
+            draw_message(rt, m, &msgs[first + i], layouts[i], x0, y, content_w, grouped[i]);
+            if (capture && g_n_msgrows < (int)(sizeof g_msgrows / sizeof g_msgrows[0])) {
                 g_msgrows[g_n_msgrows].top = y;
                 g_msgrows[g_n_msgrows].bot = y + heights[i];
-                g_msgrows[g_n_msgrows].mid = c->msgs[first + i].message_id;
+                g_msgrows[g_n_msgrows].mid = msgs[first + i].message_id;
                 g_n_msgrows++;
             }
         }
@@ -502,6 +501,125 @@ static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
         layouts[i] = NULL;
     }
     ID2D1RenderTarget_PopAxisAlignedClip(rt);
+}
+
+/* An overlay title bar; returns the region below it for the overlay body. */
+static D2D1_RECT_F overlay_header(ID2D1RenderTarget *rt, D2D1_RECT_F reg, const char *title) {
+    fill(rt, rf(reg.left, reg.top, reg.right, reg.top + 34), OC_COL_HEADER);
+    draw_text(rt, title, g_name, rf(reg.left + 20, reg.top, reg.right - 130, reg.top + 34), OC_COL_TEXT);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    draw_text(rt, "Esc to close", g_small, rf(reg.left + 20, reg.top, reg.right - 16, reg.top + 34), OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    fill(rt, rf(reg.left, reg.top + 33, reg.right, reg.top + 34), OC_COL_BORDER);
+    return rf(reg.left, reg.top + 34, reg.right, reg.bottom);
+}
+
+static void overlay_empty(ID2D1RenderTarget *rt, D2D1_RECT_F body, const char *text) {
+    IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, text, g_ui, body, OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+}
+
+static void draw_thread(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    D2D1_RECT_F body = overlay_header(rt, reg, "Thread");
+    const oc_channel *pc = oc_model_channel((oc_model *)m, m->thread_channel);
+    const oc_msg *parent = find_msg(pc, m->thread_parent);
+    float top = body.top + 6;
+    if (parent) {
+        float pad = 20.0f, x0 = body.left + pad;
+        float cw = (body.right - pad) - (x0 + AVA + 12); if (cw < 80) cw = 80;
+        IDWriteTextLayout *pl = NULL;
+        float ph = msg_height(parent, cw, 0, &pl);
+        if (ph > 120) ph = 120;
+        D2D1_RECT_F pband = rf(body.left, top, body.right, top + ph);
+        ID2D1RenderTarget_PushAxisAlignedClip(rt, &pband, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        draw_message(rt, m, parent, pl, x0, top, cw, 0);
+        ID2D1RenderTarget_PopAxisAlignedClip(rt);
+        if (pl) IDWriteTextLayout_Release(pl);
+        top += ph + 4;
+    }
+    char rc[48];
+    snprintf(rc, sizeof rc, "%zu %s", m->n_thread_msgs, m->n_thread_msgs == 1 ? "reply" : "replies");
+    fill(rt, rf(body.left, top, body.right, top + 1), OC_COL_BORDER);
+    draw_text(rt, rc, g_small, rf(body.left + 20, top + 2, body.right - 16, top + 22), OC_COL_FAINT);
+    D2D1_RECT_F replies = rf(body.left, top + 24, body.right, body.bottom);
+    if (m->n_thread_msgs == 0) overlay_empty(rt, replies, "No replies yet — reply below.");
+    else draw_msglist(rt, m, m->thread_msgs, m->n_thread_msgs, replies, 0);
+}
+
+static void draw_search(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    char title[192];
+    snprintf(title, sizeof title, "Search: %s", m->search_query);
+    D2D1_RECT_F body = overlay_header(rt, reg, title);
+    g_n_searchrows = 0;
+    if (m->n_search == 0) { overlay_empty(rt, body, "No matches."); return; }
+
+    ID2D1RenderTarget_PushAxisAlignedClip(rt, &body, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    float y = body.top + 6, rowh = 54;
+    for (size_t i = 0; i < m->n_search && y < body.bottom; i++) {
+        const oc_search_result *r = &m->search_results[i];
+        const char *au = oc_model_user_name(m, r->author_id);
+        const oc_channel *ch = oc_model_channel((oc_model *)m, r->channel_id);
+        char head[160];
+        char when[16] = "";
+        if (r->server_time) { time_t t = (time_t)(r->server_time / 1000); struct tm tv;
+            if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%Y-%m-%d %H:%M", &tv); }
+        snprintf(head, sizeof head, "%s  ·  %s  ·  %s",
+                 (au && au[0]) ? au : "user", (ch && ch->name) ? ch->name : "channel", when);
+        draw_text(rt, head, g_small, rf(body.left + 20, y, body.right - 16, y + 20), OC_COL_MUTED);
+        draw_text(rt, r->snippet ? r->snippet : "", g_ui,
+                  rf(body.left + 20, y + 20, body.right - 16, y + 46), OC_COL_TEXT);
+        fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 16, y + rowh), OC_COL_BORDER);
+        if (g_n_searchrows < (int)(sizeof g_searchrows / sizeof g_searchrows[0])) {
+            g_searchrows[g_n_searchrows].top = y; g_searchrows[g_n_searchrows].bot = y + rowh;
+            g_searchrows[g_n_searchrows].cid = r->channel_id; g_n_searchrows++;
+        }
+        y += rowh;
+    }
+    ID2D1RenderTarget_PopAxisAlignedClip(rt);
+}
+
+static void draw_reactlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    D2D1_RECT_F body = overlay_header(rt, reg, "Who reacted");
+    if (m->n_reactors == 0) { overlay_empty(rt, body, "No reactions."); return; }
+    float y = body.top + 6;
+    for (size_t i = 0; i < m->n_reactors && y < body.bottom; i++) {
+        const oc_reactor_row *rr = &m->reactors[i];
+        draw_text(rt, rr->emoji, g_ui, rf(body.left + 20, y, body.left + 60, y + 30), OC_COL_TEXT);
+        const char *nm = oc_model_user_name(m, rr->user_id);
+        draw_text(rt, (nm && nm[0]) ? nm : "user", g_ui,
+                  rf(body.left + 64, y, body.right - 16, y + 30), OC_COL_TEXT);
+        y += 30;
+    }
+}
+
+static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    if (!m->authed) {
+        const char *msg = !m->connected ? (m->last_error[0] ? m->last_error : "connecting…")
+                                        : "signing in…";
+        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, msg, g_ui, reg, OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+        return;
+    }
+    if (m->thread_open)    { draw_thread(rt, m, reg);    return; }
+    if (m->search_open)    { draw_search(rt, m, reg);    return; }
+    if (m->reactlist_open) { draw_reactlist(rt, m, reg); return; }
+
+    const oc_channel *c = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+    if (!c) {
+        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Select a channel to start reading.", g_ui, reg, OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+        return;
+    }
+    if (c->n_msgs == 0) {
+        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "No messages yet — say hello.", g_ui, reg, OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+        return;
+    }
+    draw_msglist(rt, m, c->msgs, c->n_msgs, reg, 1);
 }
 
 /* ---- header + composer --------------------------------------------------- */
@@ -622,8 +740,13 @@ static void composer_send(void) {
         int nonspace = 0;
         for (char *p = b; *p; p++) if (*p != '\r' && *p != '\n' && *p != ' ' && *p != '\t') { nonspace = 1; break; }
         if (nonspace) {
-            if (g_edit_msg) oc_client_edit(g_client, g_sel, g_edit_msg, b);
-            else            oc_client_send(g_client, g_sel, b);
+            const oc_model *mm = model();
+            if (g_edit_msg)
+                oc_client_edit(g_client, g_sel, g_edit_msg, b);
+            else if (mm && mm->thread_open)
+                oc_client_reply(g_client, mm->thread_channel, mm->thread_parent, b);
+            else
+                oc_client_send(g_client, g_sel, b);
             g_scroll = 0;
         }
         free(b);
@@ -655,9 +778,13 @@ static LRESULT CALLBACK re_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (msg == WM_KEYDOWN) composer_send();
         return 0;                                   /* eat both so no newline/bell */
     }
-    if ((msg == WM_KEYDOWN || msg == WM_CHAR) && wp == VK_ESCAPE && g_edit_msg) {
-        if (msg == WM_KEYDOWN) composer_cancel_edit();
-        return 0;
+    if ((msg == WM_KEYDOWN || msg == WM_CHAR) && wp == VK_ESCAPE) {
+        const oc_model *mm = model();
+        if (mm && (mm->thread_open || mm->search_open || mm->reactlist_open)) {
+            if (msg == WM_KEYDOWN) close_overlays();
+            return 0;
+        }
+        if (g_edit_msg) { if (msg == WM_KEYDOWN) composer_cancel_edit(); return 0; }
     }
     return CallWindowProcW(g_re_oldproc, hwnd, msg, wp, lp);
 }
@@ -760,6 +887,9 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
                     (UINT_PTR)(30 + i), wmenu(lbl, wb, 128));
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    if (!msg->deleted)
+        AppendMenuW(menu, MF_STRING, 100, msg->reply_count ? L"Open thread" : L"Reply in thread");
+    if (msg->n_reactions) AppendMenuW(menu, MF_STRING, 102, L"Who reacted");
     AppendMenuW(menu, MF_STRING, 20, L"Copy text");
     int own = (msg->author_id == m->user_id);
     int canmod = own || self_role(m) >= OC_ROLE_ADMIN;
@@ -777,6 +907,10 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
         composer_begin_edit(msg);
     } else if (cmd == 22) {
         oc_client_delete(g_client, g_sel, mid);
+    } else if (cmd == 100) {
+        g_scroll = 0; oc_client_open_thread(g_client, g_sel, mid);
+    } else if (cmd == 102) {
+        g_scroll = 0; oc_client_list_reactions(g_client, g_sel, mid);
     } else if (cmd >= 30 && cmd - 30 < msg->n_attach) {
         download_attachment(hwnd, &msg->attach[cmd - 30]);
     }
@@ -829,6 +963,16 @@ static void on_click(HWND hwnd, int x, int y) {
         g_show_members = !g_show_members;
         layout_composer(hwnd);
         return;
+    }
+    /* Search result rows (main area only) -> jump to that channel. */
+    {
+        const oc_model *mm = model();
+        if (mm && mm->search_open && x > RAIL_W + SIDEBAR_W)
+            for (int i = 0; i < g_n_searchrows; i++)
+                if ((float)y >= g_searchrows[i].top && (float)y < g_searchrows[i].bot) {
+                    select_channel(g_searchrows[i].cid);   /* also closes the overlay */
+                    return;
+                }
     }
     /* Sidebar channel rows. */
     if (x >= RAIL_W && x <= RAIL_W + SIDEBAR_W) {
@@ -1074,6 +1218,7 @@ static int g_logging_out;
 static void show_app_menu(HWND hwnd, int sx, int sy) {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, 1, L"New channel…");
+    AppendMenuW(menu, MF_STRING, 4, L"Search messages…");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     HMENU status = CreatePopupMenu();
     AppendMenuW(status, MF_STRING, 10, L"Online");
@@ -1093,6 +1238,13 @@ static void show_app_menu(HWND hwnd, int sx, int sy) {
     }
     case 2:  oc_client_reconnect(g_client); break;
     case 3:  oc_client_logout(g_client, OC_LOGOUT_THIS); g_logging_out = 1; break;
+    case 4: {
+        char q[128];
+        if (text_prompt(hwnd, "Search", "Search messages:", "", q, sizeof q, 0) && q[0]) {
+            g_scroll = 0; oc_client_search(g_client, q);
+        }
+        break;
+    }
     case 10: oc_client_set_presence(g_client, OC_PRESENCE_ONLINE); break;
     case 11: oc_client_set_presence(g_client, OC_PRESENCE_AWAY); break;
     default: break;
