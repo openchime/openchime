@@ -113,6 +113,20 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *uid)
     return 0;
 }
 
+/* Authenticate with a central-issued ES256 JWT (OC_AUTH_OIDC) — the credential is
+ * the raw token; the daemon verifies it against its pinned central key. */
+static int do_auth_oidc(client *c, const char *jwt, uint64_t *uid) {
+    uint8_t buf[8192]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_auth a = { OC_AUTH_OIDC, { (const uint8_t *)jwt, strlen(jwt) } };
+    if (oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a) != 0 || write_all(&c->conn, buf, w.len) != 0) return -1;
+    oc_header hdr; oc_rbuf p;
+    if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_AUTH_OK) return -1;
+    oc_auth_ok ok;
+    if (oc_decode_auth_ok(&p, &ok) != OC_OK) return -1;
+    *uid = ok.user_id;
+    return 0;
+}
+
 static int cmd_token(client *c, const char *platform, const char *token) {
     uint8_t plat = (strcmp(platform, "fcm") == 0) ? OC_PUSH_FCM : OC_PUSH_APNS;
     uint8_t buf[1024]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
@@ -157,21 +171,33 @@ int main(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr,
             "usage: %s <host> <port> <user> <pass> token <apns|fcm> <device-token>\n"
-            "       %s <host> <port> <user> <pass> send  <channel_id> <text...>\n",
-            argv[0], argv[0]);
+            "       %s <host> <port> <user> <pass> send  <channel_id> <text...>\n"
+            "       %s <host> <port> --oidc <jwt>   whoami\n"
+            "       %s <host> <port> --oidc <jwt>   send <channel_id> <text...>\n",
+            argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
     const char *host = argv[1]; int port = atoi(argv[2]);
-    const char *user = argv[3], *pass = argv[4], *cmd = argv[5];
+    int oidc = (strcmp(argv[3], "--oidc") == 0);
+    const char *jwt = oidc ? argv[4] : NULL;
+    const char *user = argv[3], *pass = argv[4];
+    const char *cmd = argv[5];
 
     client c;
     if (client_open(&c, host, port) != 0) { fprintf(stderr, "demo_client: FAIL connect\n"); return 1; }
     uint64_t uid = 0;
     if (do_handshake(&c) != 0) { fprintf(stderr, "demo_client: FAIL handshake\n"); return 1; }
-    if (do_auth(&c, user, pass, &uid) != 0) { fprintf(stderr, "demo_client: FAIL auth\n"); return 1; }
+    if (oidc) {
+        if (do_auth_oidc(&c, jwt, &uid) != 0) { fprintf(stderr, "demo_client: FAIL oidc auth\n"); return 1; }
+    } else {
+        if (do_auth(&c, user, pass, &uid) != 0) { fprintf(stderr, "demo_client: FAIL auth\n"); return 1; }
+    }
 
     int rc;
-    if (strcmp(cmd, "token") == 0 && argc >= 8) {
+    if (strcmp(cmd, "whoami") == 0) {
+        printf("demo_client: authenticated as uid %llu\n", (unsigned long long)uid);
+        rc = 0;
+    } else if (strcmp(cmd, "token") == 0 && argc >= 8) {
         rc = cmd_token(&c, argv[6], argv[7]);
     } else if (strcmp(cmd, "send") == 0 && argc >= 8) {
         rc = cmd_send(&c, strtoull(argv[6], NULL, 10), argv[7]);

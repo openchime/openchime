@@ -50,6 +50,23 @@ If you're running the control plane directly (e.g. `dotnet run` with
 `Push:Log:Enabled=true`), `scripts/demo-federated.sh http://localhost:5176` does the same
 flow against it (it scripts the real console reserve, no dev endpoint needed).
 
+## OIDC-relay login (the identity wire)
+
+`scripts/demo-oidc.sh` proves the other daemon↔central wire (ARCH-56/57): the control
+plane **mints** an ES256 identity token and a daemon in **OIDC mode verifies** it against
+the central key it pins. It generates an ES256 keypair (private → the control plane's
+signing key, public → the daemon), starts both, mints a token via the dev endpoint
+`POST /api/dev/oidc/token` (gated on `Oidc:DevMintEnabled` — never in prod), and runs:
+
+```sh
+build/demo_client 127.0.0.1 18444 --oidc "$JWT" whoami
+# -> demo_client: authenticated as uid 1
+```
+
+The browser upstream-IdP flow (Google) is bypassed on purpose — this exercises the
+daemon's *verification*, the untested half. A real deployment supplies real Google
+credentials to the relay instead of the dev mint endpoint.
+
 ## Notes / gotchas
 
 - **`OPENCHIME_BLOB_DIR`** must point at a writable directory. Outside the container the
