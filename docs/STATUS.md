@@ -141,26 +141,26 @@ Legend: ✅ done · 🔨 in progress · ⛔ not started.
 | Send | `send` | ✅ | RichEdit composer, Enter sends / Shift+Enter newline. |
 | Edit / delete | `edit`, `delete` | ✅ | Message right-click; inline edit in the composer. |
 | Reactions (toggle) | `react` | ✅ | Right-click → React (emoji submenu). |
-| Who reacted | `list_reactions` / `close_reactions` | ⛔ | Needs a reactor overlay. |
+| Who reacted | `list_reactions` / `close_reactions` | ✅ | Message menu → Who reacted; reactor overlay. |
 | Typing indicator | `typing` | 🔨 | GUI *sends* typing; does not yet *render* others typing. |
 | Direct messages | `open_dm` | ✅ | Left-click a member. |
 | Roster + presence | `list_users`, `toggle_roster` | ✅ | Members pane with presence dots + roles. |
-| Set own presence | `set_presence` | ⛔ | Online/away toggle. |
+| Set own presence | `set_presence` | ✅ | App menu → Set status → Online/Away. |
 | Admin: roles / remove | `set_role`, `remove_user` | ✅ | Member right-click, role-gated. |
 | Admin: invite | `invite_user` | ⛔ | Mint a tenant invite token. |
-| Threads | `open_thread`, `reply`, `close_thread` | ⛔ | Needs a thread pane. |
-| Search | `search`, `close_search` | ⛔ | Global search bar + results. |
-| Channel management | `create_channel`, `join_channel`, `leave_channel` | ⛔ | Create/join/leave affordances. |
+| Threads | `open_thread`, `reply`, `close_thread` | ✅ | Message menu → Reply/Open thread; overlay + reply composer. |
+| Search | `search`, `close_search` | ✅ | App menu → Search messages…; results jump to channel. |
+| Channel management | `create_channel`, `join_channel`, `leave_channel` | ✅ | App menu New channel; sidebar right-click Join/Leave. |
 | Attachments: download | `download` | ✅ | Right-click → Download (native Save dialog). |
 | Attachments: upload | `upload` | ⛔ | Attach button + drag-drop. |
-| Notifications / DND | `set_notify_pref`, `set_dnd`, `list_notify_prefs` | ⛔ | Channel + workspace prefs dialog. |
+| Notifications / DND | `set_notify_pref`, `set_dnd`, `list_notify_prefs` | 🔨 | Per-channel level done (channel menu); DND dialog pending. |
 | Self-service profile | `set_display_name`, `change_password` | ⛔ | Profile dialog. |
 | Webhooks | `webhooks`, `create_webhook`, `delete_webhook` | ⛔ | Channel webhook overlay. |
 | Storage / audit (admin) | `storage_status`, `audit_query` | ⛔ | Owner/admin overlays. |
 | Settings sync | `set_client_type`, `set_setting`, `list_settings` | ⛔ | The `gui` bucket (separate from `tui`). |
 | Read receipts (seen-by) | model `readers[]` | ⛔ | Render "seen by …" under the last read message. |
-| Logout | `logout` | ⛔ | Menu action; quit on drop. |
-| Manual reconnect | `reconnect` | ⛔ | "Reconnect now" while backing off. |
+| Logout | `logout` | ✅ | App menu → Log out; window closes on the drop. |
+| Manual reconnect | `reconnect` | ✅ | App menu → Reconnect now. |
 | Multiple workspaces | one `oc_client` per ws + switcher | ⛔ | Rail workspace switcher (TUI holds N clients). |
 
 **Polish backlog** (deferred to the end per the agreed sequencing): transcript
