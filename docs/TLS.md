@@ -45,6 +45,16 @@ likewise vendored — as committed single-file source, both MIT (ARCH-75).
   SHA-256 fingerprint; thereafter it requires an exact match. Because trust is
   the pin, not a CA chain, a cert under any hostname "just works" — which is what
   makes the free self-hoster vanity CNAME (ARCH-14) cost nothing to support.
+  **Exception — loopback is not pinned.** TOFU defends against a network
+  man-in-the-middle substituting the server's cert; a `127.0.0.1` / `localhost`
+  connection never leaves the host, so there is no MITM vector and pinning it only
+  causes false alarms across local daemon restarts (each fresh daemon self-signs a
+  new cert). The client therefore does not enforce the pin for loopback
+  (`client/core/net.c:is_loopback`), matching how tools skip TLS verification for
+  localhost. Remote workspaces are always pinned; if a remote cert genuinely
+  changes, the client now reports that distinctly ("the server's security
+  certificate has changed") rather than "could not reach the server", so the user
+  can forget the workspace to re-pin.
 - **Fingerprint** = SHA-256 of the certificate DER; it may be published
   out-of-band in `.well-known` metadata for verification (ARCH-10/14).
 

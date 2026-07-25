@@ -722,7 +722,17 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
 
 /* ---- the thread ---- */
 
-enum { RC_STOP = 0, RC_LOST = 1, RC_FATAL = 2 };
+enum { RC_STOP = 0, RC_LOST = 1, RC_FATAL = 2, RC_CERT_CHANGED = 3 };
+
+/* TOFU pinning defends against a network man-in-the-middle substituting the
+ * server's certificate. A loopback connection never leaves the host, so there is
+ * no MITM vector and pinning it only causes false alarms across local daemon
+ * restarts (each fresh daemon self-signs a new cert). So we do not enforce the
+ * pin for loopback — matching how tools skip TLS verification for localhost. */
+static int is_loopback(const char *host) {
+    return strcmp(host, "127.0.0.1") == 0 || strcmp(host, "::1") == 0 ||
+           strcmp(host, "localhost") == 0;
+}
 
 /* One connection lifecycle: dial → TLS → handshake → auth → serve, then clean up.
  * `reconnecting` selects session-token auth (OC_AUTH_SESSION) over password; the
@@ -756,7 +766,8 @@ static int run_connection(oc_net *n, int reconnecting,
      * the presented cert this once and capture its fingerprint below. Multiple
      * oc_clients in one process (the headless test) set up TLS concurrently; safe
      * because the vendored mbedTLS is built with MBEDTLS_THREADING. */
-    if (oc_tls_client_init(&cli, cs && cs->have_pin ? cs->pin : NULL) != 0 ||
+    int enforce_pin = cs && cs->have_pin && !is_loopback(n->host);
+    if (oc_tls_client_init(&cli, enforce_pin ? cs->pin : NULL) != 0 ||
         oc_tls_conn_init(&conn, &cli.conf, fd) != 0) {
         oc_closesock(fd); return RC_LOST;
     }
@@ -764,7 +775,13 @@ static int run_connection(oc_net *n, int reconnecting,
     /* Attachment transfer state, valid from here to `drop:` (which may reset it). */
     oc_xfer xfer; memset(&xfer, 0, sizeof xfer);
 
-    if (do_handshake(&conn, fd, &n->stop) != 0) goto drop;
+    if (do_handshake(&conn, fd, &n->stop) != 0) {
+        /* A pinned handshake that fails on peer verification means the server's
+         * certificate changed (TOFU mismatch) — report that distinctly, not as a
+         * generic "unreachable". */
+        if (enforce_pin && oc_tls_conn_cert_rejected(&conn)) rc = RC_CERT_CHANGED;
+        goto drop;
+    }
 
     /* First contact with this workspace: remember the cert fingerprint so every
      * later connection pins it (TOFU first-use, ARCH-10). */
@@ -1259,6 +1276,12 @@ static void *net_thread(void *arg) {
         /* Distinguish "unreachable" from "login failed" (REQ-011): a drop before
          * ever serving, without a fatal auth reject, is a connectivity problem. */
         if (served) reach_notified = 0;
+        else if (rc == RC_CERT_CHANGED && !reach_notified) {
+            push_err(n->to_ui, "the server's security certificate has changed since you "
+                               "last connected — if unexpected this may be a security risk; "
+                               "forget this workspace (switcher: d) to trust the new one");
+            reach_notified = 1;
+        }
         else if (rc == RC_LOST && !reach_notified) {
             push_err(n->to_ui, "could not reach the server");
             reach_notified = 1;

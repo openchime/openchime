@@ -297,6 +297,12 @@ void oc_tls_conn_free(oc_tls_conn *c) {
     mbedtls_ssl_free(&c->ssl);
 }
 
+int oc_tls_conn_cert_rejected(const oc_tls_conn *c) {
+    uint32_t vr = mbedtls_ssl_get_verify_result(&c->ssl);
+    vr &= ~(uint32_t)MBEDTLS_X509_BADCERT_SKIP_VERIFY;
+    return vr != 0;
+}
+
 oc_tls_status oc_tls_handshake(oc_tls_conn *c) {
     int rc = mbedtls_ssl_handshake(&c->ssl);
     if (rc != 0) return status_of(rc);
