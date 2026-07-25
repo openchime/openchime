@@ -730,6 +730,27 @@ static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
         IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
         return;
     }
+
+    /* Seen-by footer (REQ-090): who (besides us) has read the last message. */
+    uint64_t seen[8];
+    size_t ns = oc_model_seen_by(m, g_sel, c->msgs[c->n_msgs - 1].message_id,
+                                 m->user_id, seen, 8);
+    if (ns > 0) {
+        char line[224];
+        int off = snprintf(line, sizeof line, "\xE2\x9C\x93 Seen by ");
+        size_t show = ns < 3 ? ns : 3;
+        for (size_t i = 0; i < show && off < (int)sizeof line - 32; i++) {
+            const char *nm = oc_model_user_name(m, seen[i]);
+            off += snprintf(line + off, sizeof line - off, "%s%s",
+                            i ? ", " : "", (nm && nm[0]) ? nm : "someone");
+        }
+        if (ns > show) off += snprintf(line + off, sizeof line - off, " +%zu", ns - show);
+        D2D1_RECT_F lr = reg; lr.bottom -= 20;
+        draw_msglist(rt, m, c->msgs, c->n_msgs, lr, 1);
+        draw_text(rt, line, g_small, rf(reg.left + 72, reg.bottom - 20, reg.right - 20, reg.bottom),
+                  OC_COL_FAINT);
+        return;
+    }
     draw_msglist(rt, m, c->msgs, c->n_msgs, reg, 1);
 }
 
@@ -1534,7 +1555,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == TIMER_TICK && g_client) {
             oc_client_tick(g_client);
             const oc_model *m = oc_client_model(g_client);
-            if (m->authed && !g_post_auth) {          /* one-shot: pull roster + channels */
+            if (m->authed && !g_post_auth) {          /* one-shot: identify the bucket + pull state */
+                oc_client_set_client_type(g_client, "gui");   /* our own settings bucket, not tui's */
+                oc_client_list_settings(g_client);
                 oc_client_list_users(g_client);
                 oc_client_list_channels(g_client);
                 g_post_auth = 1;
