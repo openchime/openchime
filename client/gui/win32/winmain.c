@@ -876,6 +876,94 @@ static void connect_start(const char *ws, const char *cred) {
     g_client = oc_client_start_secure(g_host, g_port, g_cred, store_path(), NULL);
 }
 
+/* ---- login dialog -------------------------------------------------------- */
+
+static HWND g_lg_ws, g_lg_user, g_lg_pass;
+static int  g_lg_result;                 /* -1 pending, 0 cancel, 1 connect */
+
+static void lg_set_font(HWND w) {
+    SendMessageW(w, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+}
+
+static HWND lg_edit(HWND parent, HINSTANCE inst, int x, int y, int w, const WCHAR *init, DWORD extra) {
+    HWND e = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", init,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | extra,
+        x, y, w, 24, parent, NULL, inst, NULL);
+    lg_set_font(e);
+    return e;
+}
+
+static LRESULT CALLBACK login_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK)     { g_lg_result = 1; DestroyWindow(hwnd); return 0; }
+        if (LOWORD(wp) == IDCANCEL) { g_lg_result = 0; DestroyWindow(hwnd); return 0; }
+        return 0;
+    case WM_CLOSE:   g_lg_result = 0; DestroyWindow(hwnd); return 0;
+    case WM_DESTROY: PostQuitMessage(0); return 0;
+    default: return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+}
+
+/* Modal-ish login window (runs its own pump). Returns 1 with ws/cred filled on
+ * Connect, 0 on Cancel. */
+static int login_dialog(HINSTANCE inst, char *ws, size_t wscap, char *cred, size_t credcap) {
+    WNDCLASSW wc; memset(&wc, 0, sizeof wc);
+    wc.lpfnWndProc   = login_proc;
+    wc.hInstance     = inst;
+    wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = L"OpenChimeLogin";
+    RegisterClassW(&wc);
+
+    int W = 360, H = 224;
+    int sx = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
+    int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 2;
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"OpenChimeLogin", L"Sign in to OpenChime",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, sx, sy, W, H, NULL, NULL, inst, NULL);
+    if (!dlg) return 0;
+
+    struct { const WCHAR *label; int y; } rows[3] = {
+        { L"Workspace", 16 }, { L"Username", 54 }, { L"Password", 92 } };
+    for (int i = 0; i < 3; i++) {
+        HWND s = CreateWindowExW(0, L"STATIC", rows[i].label, WS_CHILD | WS_VISIBLE,
+            18, rows[i].y + 4, 90, 20, dlg, NULL, inst, NULL);
+        lg_set_font(s);
+    }
+    g_lg_ws   = lg_edit(dlg, inst, 112, 14, 226, L"127.0.0.1:8443", 0);
+    g_lg_user = lg_edit(dlg, inst, 112, 52, 226, L"alice", 0);
+    g_lg_pass = lg_edit(dlg, inst, 112, 90, 226, L"", ES_PASSWORD);
+
+    HWND ok = CreateWindowExW(0, L"BUTTON", L"Connect",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 158, 138, 84, 28,
+        dlg, (HMENU)IDOK, inst, NULL);
+    HWND cancel = CreateWindowExW(0, L"BUTTON", L"Cancel",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP, 252, 138, 84, 28,
+        dlg, (HMENU)IDCANCEL, inst, NULL);
+    lg_set_font(ok); lg_set_font(cancel);
+
+    ShowWindow(dlg, SW_SHOW);
+    SetFocus(g_lg_pass);
+    g_lg_result = -1;
+
+    MSG m;
+    while (GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+    }
+    if (g_lg_result != 1) return 0;
+
+    WCHAR wws[256], wu[128], wp[128];
+    GetWindowTextW(g_lg_ws, wws, 256);
+    GetWindowTextW(g_lg_user, wu, 128);
+    GetWindowTextW(g_lg_pass, wp, 128);
+    char u[192], p[192];
+    WideCharToMultiByte(CP_UTF8, 0, wws, -1, ws, (int)wscap, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wu, -1, u, sizeof u, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wp, -1, p, sizeof p, NULL, NULL);
+    snprintf(cred, credcap, "%s:%s", u, p);
+    return ws[0] != 0;
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
@@ -945,13 +1033,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     (void)prev; (void)cmdline;
 
-    const char *ws = "127.0.0.1:8443", *cred = "alice:pw";
-    int argc = 0; LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    /* Dev quick-launch: `openchime.exe <workspace> <user:pass>` skips the dialog.
+     * Otherwise ask for credentials in a native login window. */
     static char aws[256], acred[264];
+    const char *ws = aws, *cred = acred;
+    int argc = 0; LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv && argc >= 3) {
         WideCharToMultiByte(CP_UTF8, 0, argv[1], -1, aws, sizeof aws, NULL, NULL);
         WideCharToMultiByte(CP_UTF8, 0, argv[2], -1, acred, sizeof acred, NULL, NULL);
-        ws = aws; cred = acred;
+    } else {
+        if (!login_dialog(inst, aws, sizeof aws, acred, sizeof acred)) {
+            if (argv) LocalFree(argv);
+            return 0;                     /* cancelled */
+        }
     }
     if (argv) LocalFree(argv);
 
