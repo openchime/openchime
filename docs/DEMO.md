@@ -67,6 +67,19 @@ The browser upstream-IdP flow (Google) is bypassed on purpose — this exercises
 daemon's *verification*, the untested half. A real deployment supplies real Google
 credentials to the relay instead of the dev mint endpoint.
 
+## TUI runtime smoke (the interactive client)
+
+`scripts/demo-tui.sh` runtime-verifies the **TUI** (ARCH-75) against a live daemon — the
+headless check the project lacked (it was only ever build-verified). It drives the real
+interactive client in a **tmux** pane: connect + auto-login as alice, send a message from
+the composer, receive a broadcast from bob (via `demo_client`), and assert both render in
+the transcript. Requires `tmux`. To connect the TUI by hand instead:
+
+```sh
+make tui
+build/openchime-tui 127.0.0.1 8443 alice:pw    # <host> <port> [user:pass] direct connect
+```
+
 ## Notes / gotchas
 
 - **`OPENCHIME_BLOB_DIR`** must point at a writable directory. Outside the container the
