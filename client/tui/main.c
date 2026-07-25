@@ -512,6 +512,26 @@ static void layout(int W, int *ch_w, int *mem_w, int *msg_x, int *msg_w) {
 
 /* A bordered, titled panel; content is drawn inside by the caller. An active
  * panel gets a bright (cyan) border, matching the lazygit/k9s idiom. */
+/* Center a modal sized to `cw` content columns × `rows` content lines, fill and
+ * frame it with a consistent title, and return the inner content region. Every
+ * overlay uses this so padding, sizing, and the title style stay uniform, and the
+ * box grows to fit its content (no truncation). */
+static tk_rect modal_frame(int W, int H, int cw, int rows, const char *title) {
+    int bw = cw + 6;                     /* 2-col padding inside the border */
+    if (bw > W - 4) bw = W - 4;
+    if (bw < 24) bw = 24;
+    int bh = rows + 4;                   /* border + a blank pad top & bottom */
+    if (bh > H - 2) bh = H - 2;
+    if (bh < 5) bh = 5;
+    int x = (W - bw) / 2, y = (H - bh) / 2;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    const tk_theme *th = tk_theme_active();
+    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, th->bg);
+    tk_panel(x, y, bw, bh, title, 1);
+    return (tk_rect){ x + 3, y + 2, bw - 6, bh - 4 };
+}
+
 /* The ? help overlay: a clean, centered two-column key reference. A row with a
  * NULL key is a section heading; a row with both fields NULL is a blank spacer.
  * The box is sized to its content so nothing is ever truncated. */
@@ -581,23 +601,30 @@ static void draw_profile(const oc_model *m, int W, int H) {
     uint8_t pr = oc_model_presence_of(m, m->user_id);
     const char *rn = role == OC_ROLE_OWNER ? "owner" : role == OC_ROLE_ADMIN ? "admin" : "member";
     const char *pn = pr == OC_PRESENCE_ONLINE ? "online" : pr == OC_PRESENCE_AWAY ? "away" : "offline";
-    char L[6][96];
-    snprintf(L[0], sizeof L[0], "Name      %s", me[0] ? me : "(unknown)");
-    snprintf(L[1], sizeof L[1], "User ID   %llu", (unsigned long long)m->user_id);
-    snprintf(L[2], sizeof L[2], "Role      %s", rn);
-    snprintf(L[3], sizeof L[3], "Presence  %s", pn);
-    snprintf(L[4], sizeof L[4], "%s", "");
-    snprintf(L[5], sizeof L[5], "%s", "/nick <name>   ·   /passwd <old> <new>");
-    int n = 6;
-    int bw = 52; if (bw > W - 4) bw = W - 4; if (bw < 24) bw = 24;
-    int bh = n + 2; if (bh > H - 2) bh = H - 2; if (bh < 4) bh = 4;
-    int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
-    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, TB_DEFAULT);
-    tk_panel(x, y, bw, bh, "Profile  ·  any key to close", 1);
-    for (int i = 0; i < n && i + 1 < bh - 1; i++) {
-        uintattr_t col = L[i][0] == '/' ? TB_CYAN : (TB_WHITE | TB_BOLD);
-        tk_text(x + 2, y + 1 + i, x + bw - 1, L[i], col, TB_DEFAULT);
+    const tk_theme *th = tk_theme_active();
+    char idbuf[32];
+    snprintf(idbuf, sizeof idbuf, "%llu", (unsigned long long)m->user_id);
+    struct { const char *label, *value; } R[] = {
+        { "Name",     me[0] ? me : "(unknown)" },
+        { "User ID",  idbuf },
+        { "Role",     rn },
+        { "Presence", pn },
+    };
+    int n = (int)(sizeof R / sizeof R[0]);
+    const char *hint = "Change your name or password from the action menu (Ctrl+K).";
+
+    int labelw = 0, cw = tk_str_width(hint);
+    for (int i = 0; i < n; i++) { int w = tk_str_width(R[i].label); if (w > labelw) labelw = w; }
+    for (int i = 0; i < n; i++) {
+        int w = labelw + 2 + tk_str_width(R[i].value);
+        if (w > cw) cw = w;
     }
+    tk_rect r = modal_frame(W, H, cw, n + 2, "Profile  ·  Esc closes");
+    for (int i = 0; i < n; i++) {
+        tk_text(r.x, r.y + i, r.x + r.w, R[i].label, th->muted, th->bg);
+        tk_text(r.x + labelw + 2, r.y + i, r.x + r.w, R[i].value, th->fg | TB_BOLD, th->bg);
+    }
+    tk_text(r.x, r.y + n + 1, r.x + r.w, hint, th->faint, th->bg);
     tb_present();
 }
 
@@ -1049,64 +1076,43 @@ static int fuzzy(const char *hay, const char *needle) {
  * maintenance has reclaimed. Owner/admin only — a member's request is refused
  * server-side, which surfaces as an error line rather than an empty panel. */
 static void draw_storage(const oc_model *m, int W, int H) {
-    int bw = 62; if (bw > W - 4) bw = W - 4; if (bw < 30) bw = 30;
-    int bh = 15; if (bh > H - 2) bh = H - 2;
-    int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
-    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, TB_DEFAULT);
-    tk_panel(x, y, bw, bh, "Storage  \xc2\xb7  any key to close", 1);
-
-    char l[160];
-    int row = y + 1;
+    const tk_theme *th = tk_theme_active();
     if (!m->storage_have) {
-        tk_text(x + 2, row, x + bw - 1, "(no report yet — owner/admin only)",
-                  TB_BLACK | TB_BOLD, TB_DEFAULT);
+        const char *e = "No report yet — owner/admin only.";
+        tk_rect r = modal_frame(W, H, tk_str_width(e), 1, "Storage  ·  Esc closes");
+        tk_text(r.x, r.y, r.x + r.w, e, th->muted, th->bg);
         tb_present();
         return;
     }
     const oc_storage_view *s = &m->storage;
     const uint64_t MBv = 1024 * 1024;
 
-    snprintf(l, sizeof l, "Disk        %llu MB free of %llu MB",
-             (unsigned long long)(s->avail_bytes / MBv),
-             (unsigned long long)(s->total_bytes / MBv));
-    tk_text(x + 2, row++, x + bw - 1, l,
-              s->under_pressure ? (TB_RED | TB_BOLD) : TB_DEFAULT, TB_DEFAULT);
+    struct { char t[128]; uintattr_t c; } L[16];
+    int n = 0;
+#define SROW(col, ...) do { snprintf(L[n].t, sizeof L[n].t, __VA_ARGS__); L[n].c = (col); n++; } while (0)
+    SROW(s->under_pressure ? (TB_RED | TB_BOLD) : th->fg, "Disk         %llu MB free of %llu MB",
+         (unsigned long long)(s->avail_bytes / MBv), (unsigned long long)(s->total_bytes / MBv));
+    SROW(th->fg, "Attachments  %llu file(s), %llu MB",
+         (unsigned long long)s->attach_count, (unsigned long long)(s->attach_bytes / MBv));
+    if (s->under_pressure) SROW(TB_RED | TB_BOLD, "under pressure — reclaiming storage");
+    SROW(th->bg, "%s", "");
+    SROW(th->accent2 | TB_BOLD, "%s", "Policy");
+    if (s->max_age_days) SROW(th->fg, "  attachments expire after %llu day(s)", (unsigned long long)s->max_age_days);
+    else                 SROW(th->fg, "%s", "  attachments kept indefinitely");
+    SROW(th->fg, "  eviction under pressure: %s", s->evict_enabled ? "on (oldest first)" : "off");
+    SROW(th->fg, "  database reserve: %llu MB", (unsigned long long)(s->reserve_bytes / MBv));
+    SROW(th->bg, "%s", "");
+    SROW(th->accent2 | TB_BOLD, "%s", "Reclaimed so far");
+    /* Evictions are the destructive reclaims; flag them in red once any happen. */
+    SROW(s->rec_evicted ? (TB_RED | TB_BOLD) : th->fg, "  %llu abandoned   %llu expired   %llu evicted",
+         (unsigned long long)s->rec_orphan, (unsigned long long)s->rec_expired, (unsigned long long)s->rec_evicted);
+#undef SROW
 
-    snprintf(l, sizeof l, "Attachments %llu file(s), %llu MB",
-             (unsigned long long)s->attach_count,
-             (unsigned long long)(s->attach_bytes / MBv));
-    tk_text(x + 2, row++, x + bw - 1, l, TB_DEFAULT, TB_DEFAULT);
-
-    if (s->under_pressure)
-        tk_text(x + 2, row++, x + bw - 1,
-                  "UNDER PRESSURE — reclaiming storage", TB_RED | TB_BOLD, TB_DEFAULT);
-    row++;
-
-    tk_text(x + 2, row++, x + bw - 1, "Policy", TB_YELLOW | TB_BOLD, TB_DEFAULT);
-    if (s->max_age_days)
-        snprintf(l, sizeof l, "  attachments expire after %llu day(s)",
-                 (unsigned long long)s->max_age_days);
-    else
-        snprintf(l, sizeof l, "  attachments kept indefinitely");
-    tk_text(x + 2, row++, x + bw - 1, l, TB_DEFAULT, TB_DEFAULT);
-    snprintf(l, sizeof l, "  eviction under pressure: %s",
-             s->evict_enabled ? "on (oldest first)" : "off");
-    tk_text(x + 2, row++, x + bw - 1, l, TB_DEFAULT, TB_DEFAULT);
-    snprintf(l, sizeof l, "  database reserve: %llu MB",
-             (unsigned long long)(s->reserve_bytes / MBv));
-    tk_text(x + 2, row++, x + bw - 1, l, TB_DEFAULT, TB_DEFAULT);
-    row++;
-
-    tk_text(x + 2, row++, x + bw - 1, "Reclaimed so far", TB_YELLOW | TB_BOLD, TB_DEFAULT);
-    snprintf(l, sizeof l, "  %llu abandoned  %llu expired  %llu evicted",
-             (unsigned long long)s->rec_orphan,
-             (unsigned long long)s->rec_expired,
-             (unsigned long long)s->rec_evicted);
-    /* Evictions are the destructive ones, so they are called out in red when
-     * any have happened — an operator should not have to read carefully to
-     * notice that the daemon deleted files nobody approved individually. */
-    tk_text(x + 2, row++, x + bw - 1, l,
-              s->rec_evicted ? (TB_RED | TB_BOLD) : TB_DEFAULT, TB_DEFAULT);
+    int cw = 0;
+    for (int i = 0; i < n; i++) { int w = tk_str_width(L[i].t); if (w > cw) cw = w; }
+    tk_rect r = modal_frame(W, H, cw, n, "Storage  ·  Esc closes");
+    for (int i = 0; i < n && i < r.h; i++)
+        tk_text(r.x, r.y + i, r.x + r.w, L[i].t, L[i].c, th->bg);
     tb_present();
 }
 
@@ -1116,21 +1122,26 @@ static void draw_storage(const oc_model *m, int W, int H) {
  * Denied and failed entries are drawn in red, since those are what an operator
  * is usually scanning for. */
 static void draw_audit(const oc_model *m, int W, int H) {
-    int bw = 92; if (bw > W - 4) bw = W - 4; if (bw < 40) bw = 40;
-    int bh = H - 4; if (bh < 8) bh = 8; if (bh > H - 2) bh = H - 2;
-    int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
-    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, TB_DEFAULT);
-    tk_panel(x, y, bw, bh, "Audit log  \xc2\xb7  newest first  \xc2\xb7  any key to close", 1);
-
+    const tk_theme *th = tk_theme_active();
     if (!m->n_audit) {
-        tk_text(x + 2, y + 1, x + bw - 1,
-                  m->audit_open ? "(no entries, or you are not an admin)" : "",
-                  TB_BLACK | TB_BOLD, TB_DEFAULT);
+        const char *e = m->audit_open ? "No entries, or you are not an admin." : "";
+        tk_rect r = modal_frame(W, H, tk_str_width("No entries, or you are not an admin."),
+                                1, "Audit log  ·  Esc closes");
+        tk_text(r.x, r.y, r.x + r.w, e, th->muted, th->bg);
         tb_present();
         return;
     }
     static const char *FAM[] = { "?", "admin", "account", "security", "moder" };
-    int rows = bh - 2;
+    int want = (int)m->n_audit + 1;                       /* + a header row */
+    tk_rect r = modal_frame(W, H, W, want > 22 ? 22 : want,
+                            "Audit log  ·  newest first  ·  Esc closes");
+
+    char hdr[256];
+    snprintf(hdr, sizeof hdr, "%-12s %-8s %-22s %-14s %-16s %s",
+             "when", "family", "action", "actor", "target", "detail");
+    tk_text(r.x, r.y, r.x + r.w, hdr, th->accent2 | TB_BOLD, th->bg);
+
+    int rows = r.h - 1;
     for (int i = 0; i < rows && (size_t)i < m->n_audit; i++) {
         const oc_audit_view *a = &m->audit[i];
         char when[32];
@@ -1146,9 +1157,9 @@ static void draw_audit(const oc_model *m, int W, int H) {
                  a->actor_name[0] ? a->actor_name : "-",
                  a->target[0] ? a->target : "-",
                  a->detail);
-        /* A denial or failure is the interesting case; make it findable. */
-        tk_text(x + 2, y + 1 + i, x + bw - 1, line,
-                  a->outcome ? TB_DEFAULT : (TB_RED | TB_BOLD), TB_DEFAULT);
+        /* A denial or failure is what an operator scans for — make it findable. */
+        tk_text(r.x, r.y + 1 + i, r.x + r.w, line,
+                a->outcome ? th->fg : (TB_RED | TB_BOLD), th->bg);
     }
     tb_present();
 }
