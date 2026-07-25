@@ -880,6 +880,7 @@ static void connect_start(const char *ws, const char *cred) {
 
 static HWND g_lg_ws, g_lg_user, g_lg_pass;
 static int  g_lg_result;                 /* -1 pending, 0 cancel, 1 connect */
+static int  g_lg_done;                    /* ends the modal pump (no WM_QUIT) */
 
 static void lg_set_font(HWND w) {
     SendMessageW(w, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
@@ -896,11 +897,12 @@ static HWND lg_edit(HWND parent, HINSTANCE inst, int x, int y, int w, const WCHA
 static LRESULT CALLBACK login_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_COMMAND:
-        if (LOWORD(wp) == IDOK)     { g_lg_result = 1; DestroyWindow(hwnd); return 0; }
-        if (LOWORD(wp) == IDCANCEL) { g_lg_result = 0; DestroyWindow(hwnd); return 0; }
+        /* Ends the pump via g_lg_done — never PostQuitMessage here, or the
+         * WM_QUIT would also kill the main window loop that runs next. */
+        if (LOWORD(wp) == IDOK)     { g_lg_result = 1; g_lg_done = 1; return 0; }
+        if (LOWORD(wp) == IDCANCEL) { g_lg_result = 0; g_lg_done = 1; return 0; }
         return 0;
-    case WM_CLOSE:   g_lg_result = 0; DestroyWindow(hwnd); return 0;
-    case WM_DESTROY: PostQuitMessage(0); return 0;
+    case WM_CLOSE:   g_lg_result = 0; g_lg_done = 1; return 0;
     default: return DefWindowProcW(hwnd, msg, wp, lp);
     }
 }
@@ -945,12 +947,14 @@ static int login_dialog(HINSTANCE inst, char *ws, size_t wscap, char *cred, size
     ShowWindow(dlg, SW_SHOW);
     SetFocus(g_lg_pass);
     g_lg_result = -1;
+    g_lg_done = 0;
 
+    /* Flag-terminated modal pump — no WM_QUIT, so the main loop survives. */
     MSG m;
-    while (GetMessageW(&m, NULL, 0, 0) > 0) {
+    while (!g_lg_done && GetMessageW(&m, NULL, 0, 0) > 0) {
         if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
     }
-    if (g_lg_result != 1) return 0;
+    if (g_lg_result != 1) { if (IsWindow(dlg)) DestroyWindow(dlg); return 0; }
 
     WCHAR wws[256], wu[128], wp[128];
     GetWindowTextW(g_lg_ws, wws, 256);
@@ -961,6 +965,7 @@ static int login_dialog(HINSTANCE inst, char *ws, size_t wscap, char *cred, size
     WideCharToMultiByte(CP_UTF8, 0, wu, -1, u, sizeof u, NULL, NULL);
     WideCharToMultiByte(CP_UTF8, 0, wp, -1, p, sizeof p, NULL, NULL);
     snprintf(cred, credcap, "%s:%s", u, p);
+    if (IsWindow(dlg)) DestroyWindow(dlg);
     return ws[0] != 0;
 }
 
