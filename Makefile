@@ -65,9 +65,21 @@ endif
 TUI_INC   := $(CORE_INC) -Iclient/tui -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
-.PHONY: all test integration core tui bench clean s3-smoke windows-tui tuikit-demo demo-client
+.PHONY: all run test integration core tui bench clean s3-smoke windows-tui tuikit-demo demo-client
 
 all: $(BIN)
+
+# One-shot local dev server: builds the daemon + TUI and runs the daemon on
+# 127.0.0.1:8443 with sane paths + bootstrap users (alice/pw, bob/pw). Connect
+# from another terminal: build/openchime-tui 127.0.0.1 8443 alice:pw
+run: $(BIN) $(TUI_BIN)
+	@mkdir -p /tmp/openchime-dev/blobs
+	@echo "openchime dev daemon -> 127.0.0.1:8443  (users: alice/pw, bob/pw)"
+	@echo "connect: build/openchime-tui 127.0.0.1 8443 alice:pw"
+	@OPENCHIME_DB_PATH=/tmp/openchime-dev/db OPENCHIME_BLOB_DIR=/tmp/openchime-dev/blobs \
+	 OPENCHIME_TLS_CERT=/tmp/openchime-dev/cert.pem OPENCHIME_TLS_KEY=/tmp/openchime-dev/key.pem \
+	 OPENCHIME_PROTO_PORT=8443 OPENCHIME_HEALTH_PORT=8080 \
+	 OC_BOOTSTRAP_USERS="alice:pw:owner,bob:pw:member" ./$(BIN)
 
 $(BIN): $(SRC) $(MBEDTLS_A) $(HDRS)
 	$(CC) $(CFLAGS) $(INC) -o $@ $(SRC) $(MBEDTLS_LIBS) $(LDFLAGS)
