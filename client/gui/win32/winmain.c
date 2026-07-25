@@ -1263,6 +1263,7 @@ static int text_prompt(HWND owner, const char *title, const char *label,
 /* ---- app menu (workspace avatar) + channel menu -------------------------- */
 
 static int g_logging_out;
+static int g_await_invite;      /* show the minted invite token once it arrives */
 
 static void show_app_menu(HWND hwnd, int sx, int sy) {
     HMENU menu = CreatePopupMenu();
@@ -1273,6 +1274,19 @@ static void show_app_menu(HWND hwnd, int sx, int sy) {
     AppendMenuW(status, MF_STRING, 10, L"Online");
     AppendMenuW(status, MF_STRING, 11, L"Away");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)status, L"Set status");
+    AppendMenuW(menu, MF_STRING, 50, L"Do not disturb…");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    HMENU profile = CreatePopupMenu();
+    AppendMenuW(profile, MF_STRING, 30, L"Change display name…");
+    AppendMenuW(profile, MF_STRING, 31, L"Change password…");
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)profile, L"Your profile");
+    const oc_model *m = model();
+    if (m && self_role(m) >= OC_ROLE_ADMIN) {
+        HMENU invite = CreatePopupMenu();
+        AppendMenuW(invite, MF_STRING, 40, L"as Member");
+        AppendMenuW(invite, MF_STRING, 41, L"as Admin");
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)invite, L"Invite people");
+    }
     AppendMenuW(menu, MF_STRING, 2, L"Reconnect now");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, 3, L"Log out");
@@ -1296,6 +1310,35 @@ static void show_app_menu(HWND hwnd, int sx, int sy) {
     }
     case 10: oc_client_set_presence(g_client, OC_PRESENCE_ONLINE); break;
     case 11: oc_client_set_presence(g_client, OC_PRESENCE_AWAY); break;
+    case 30: {
+        char name[64];
+        const char *cur = m ? oc_model_user_name(m, m->user_id) : "";
+        if (text_prompt(hwnd, "Display name", "New display name:", cur ? cur : "",
+                        name, sizeof name, 0) && name[0])
+            oc_client_set_display_name(g_client, name);
+        break;
+    }
+    case 31: {
+        char oldp[128], newp[128];
+        if (text_prompt(hwnd, "Change password", "Current password:", "", oldp, sizeof oldp, 1) &&
+            text_prompt(hwnd, "Change password", "New password:", "", newp, sizeof newp, 1) && newp[0])
+            oc_client_change_password(g_client, oldp, newp);
+        break;
+    }
+    case 40: oc_client_invite_user(g_client, OC_ROLE_MEMBER); g_await_invite = 1; break;
+    case 41: oc_client_invite_user(g_client, OC_ROLE_ADMIN);  g_await_invite = 1; break;
+    case 50: {
+        char win[32];
+        if (text_prompt(hwnd, "Do not disturb", "Window HH:MM-HH:MM (blank = off):", "",
+                        win, sizeof win, 0)) {
+            int sh, sm, eh, em;
+            if (win[0] && sscanf(win, "%d:%d-%d:%d", &sh, &sm, &eh, &em) == 4)
+                oc_client_set_dnd(g_client, 1, (uint16_t)(sh * 60 + sm), (uint16_t)(eh * 60 + em));
+            else
+                oc_client_set_dnd(g_client, 0, 0, 0);
+        }
+        break;
+    }
     default: break;
     }
 }
@@ -1364,6 +1407,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_logging_out && !m->connected) {     /* logout frame sent + server dropped us */
                 PostMessageW(hwnd, WM_CLOSE, 0, 0);
                 g_logging_out = 0;
+            }
+            if (g_await_invite && m->invite_token[0]) {   /* show the minted token once */
+                WCHAR msgw[256]; char line[256];
+                snprintf(line, sizeof line,
+                         "Invite token (share once — it is not shown again):\n\n%s", m->invite_token);
+                to_w(line, msgw, 256);
+                g_await_invite = 0;
+                MessageBoxW(hwnd, msgw, L"Invite created", MB_OK | MB_ICONINFORMATION);
             }
             InvalidateRect(hwnd, NULL, FALSE);
         }
