@@ -21,6 +21,7 @@
 #include <windowsx.h>         /* GET_X_LPARAM / GET_Y_LPARAM */
 #include <shellapi.h>         /* CommandLineToArgvW */
 #include <richedit.h>         /* MSFTEDIT_CLASS composer */
+#include <commdlg.h>          /* GetSaveFileNameW (attachment download) */
 #include <d2d1.h>
 #include <dwrite.h>
 
@@ -51,6 +52,13 @@ static const GUID OC_IID_IDWriteFactory =
 #define ROW_H       32.0f     /* a sidebar channel row */
 #define AVA         36.0f     /* transcript avatar diameter */
 #define LINE_H      19.0f     /* an extra (reaction/attach/thread) line */
+#define MEMBERS_W   220.0f    /* the (toggleable) right-hand members pane */
+
+/* Common reactions offered by the message context menu. */
+static const char *REACT_EMO[6] = {
+    "\xF0\x9F\x91\x8D", "\xE2\x9D\xA4\xEF\xB8\x8F", "\xF0\x9F\x98\x82",
+    "\xF0\x9F\x8E\x89", "\xF0\x9F\x98\xAE", "\xF0\x9F\x98\xA2"
+};
 
 /* ---- app state ----------------------------------------------------------- */
 
@@ -90,6 +98,18 @@ static DWORD    g_last_typing;
 /* Sidebar row hit-boxes, captured during paint for WM_LBUTTONDOWN. */
 static struct { float top, bot; uint64_t cid; } g_rows[512];
 static int g_n_rows;
+
+/* Transcript message hit-boxes (for the right-click context menu). */
+static struct { float top, bot; uint64_t mid; } g_msgrows[600];
+static int g_n_msgrows;
+
+/* Members-pane row hit-boxes. */
+static struct { float top, bot; uint64_t uid; } g_memrows[256];
+static int g_n_memrows;
+
+static int      g_show_members = 1;     /* members pane visible */
+static D2D1_RECT_F g_members_btn;       /* header toggle hit-box */
+static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
 
 /* ---- small helpers ------------------------------------------------------- */
 
@@ -197,6 +217,17 @@ static void d2d_resize(HWND hwnd) {
 /* ---- model access + intents ---------------------------------------------- */
 
 static const oc_model *model(void) { return g_client ? oc_client_model(g_client) : NULL; }
+
+/* Our own tenant role (for gating admin actions); OC_ROLE_MEMBER if unknown. */
+static uint8_t self_role(const oc_model *m) {
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == m->user_id) return m->users[i].role;
+    return OC_ROLE_MEMBER;
+}
+
+static const char *role_label(uint8_t role) {
+    return role == OC_ROLE_OWNER ? "owner" : role == OC_ROLE_ADMIN ? "admin" : "";
+}
 
 static int already_backfilled(uint64_t cid) {
     for (int i = 0; i < g_n_backfilled; i++) if (g_backfilled[i] == cid) return 1;
@@ -452,9 +483,17 @@ static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
     float y = (reg.bottom - total) + g_scroll;     /* g_scroll 0 => newest pinned to bottom */
 
     ID2D1RenderTarget_PushAxisAlignedClip(rt, &reg, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    g_n_msgrows = 0;
     for (size_t i = 0; i < n; i++) {
-        if (y + heights[i] >= reg.top && y <= reg.bottom)
+        if (y + heights[i] >= reg.top && y <= reg.bottom) {
             draw_message(rt, m, &c->msgs[first + i], layouts[i], x0, y, content_w, grouped[i]);
+            if (g_n_msgrows < (int)(sizeof g_msgrows / sizeof g_msgrows[0])) {
+                g_msgrows[g_n_msgrows].top = y;
+                g_msgrows[g_n_msgrows].bot = y + heights[i];
+                g_msgrows[g_n_msgrows].mid = c->msgs[first + i].message_id;
+                g_n_msgrows++;
+            }
+        }
         y += heights[i];
         if (layouts[i]) IDWriteTextLayout_Release(layouts[i]);
         layouts[i] = NULL;
@@ -470,13 +509,53 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
     const oc_channel *c = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
     char title[160] = "OpenChime";
     if (c) channel_label(m, c, title, sizeof title);
-    draw_text(rt, title, g_hdr, rf(x0 + 20, 0, x0 + w - 160, HEADER_H), OC_COL_TEXT);
+    draw_text(rt, title, g_hdr, rf(x0 + 20, 0, x0 + w - 240, HEADER_H), OC_COL_TEXT);
+
+    /* Members toggle (right). */
+    g_members_btn = rf(x0 + w - 16 - 96, 12, x0 + w - 16, HEADER_H - 12);
+    if (g_show_members) fill_round(rt, g_members_btn, 6.0f, OC_COL_SELECT);
+    IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, "Members", g_ui, g_members_btn, g_show_members ? OC_COL_TEXT : OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
 
     const char *status = !m->connected ? "offline" : !m->authed ? "signing in" : "connected";
     IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    draw_text(rt, status, g_small, rf(x0 + 20, 0, x0 + w - 20, HEADER_H),
+    draw_text(rt, status, g_small, rf(x0 + 20, 0, g_members_btn.left - 12, HEADER_H),
               m->authed ? OC_COL_ONLINE : OC_COL_MUTED);
     IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+}
+
+static void draw_members(ID2D1RenderTarget *rt, const oc_model *m, float W, float H) {
+    float x0 = W - MEMBERS_W;
+    fill(rt, rf(x0, 0, W, H), OC_COL_SIDEBAR);
+    fill(rt, rf(x0, 0, x0 + 1, H), OC_COL_BORDER);
+
+    draw_text(rt, "MEMBERS", g_small, rf(x0 + 16, 10, W - 12, 34), OC_COL_FAINT);
+    float y = 40;
+    g_n_memrows = 0;
+    for (size_t i = 0; i < m->n_users; i++) {
+        const oc_member *u = &m->users[i];
+        if (u->disabled) continue;
+        if (y > H) break;
+        uint8_t pr = oc_model_presence_of(m, u->user_id);
+        uint32_t dot = pr == OC_PRESENCE_ONLINE ? OC_COL_ONLINE
+                     : pr == OC_PRESENCE_AWAY   ? OC_COL_AWAY : OC_COL_FAINT;
+        D2D1_ELLIPSE e = { { x0 + 22, y + ROW_H / 2 }, 4.5f, 4.5f };
+        ID2D1RenderTarget_FillEllipse(rt, &e, paint_with(dot));
+        draw_text(rt, u->name[0] ? u->name : "user", g_ui,
+                  rf(x0 + 34, y, W - 60, y + ROW_H), OC_COL_TEXT);
+        const char *rl = role_label(u->role);
+        if (rl[0]) {
+            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
+            draw_text(rt, rl, g_small, rf(x0 + 34, y, W - 14, y + ROW_H), OC_COL_FAINT);
+            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
+        if (g_n_memrows < (int)(sizeof g_memrows / sizeof g_memrows[0])) {
+            g_memrows[g_n_memrows].top = y; g_memrows[g_n_memrows].bot = y + ROW_H;
+            g_memrows[g_n_memrows].uid = u->user_id; g_n_memrows++;
+        }
+        y += ROW_H;
+    }
 }
 
 /* The composer region behind the RichEdit child (which paints its own box). */
@@ -502,12 +581,16 @@ static void paint(HWND hwnd) {
 
     if (m) {
         ensure_selection(m);
-        float main_x = RAIL_W + SIDEBAR_W, main_w = W - main_x;
+        float main_x = RAIL_W + SIDEBAR_W;
+        float members = (g_show_members && m->authed) ? MEMBERS_W : 0;
+        float main_r = W - members, main_w = main_r - main_x;
         draw_rail(rt, H);
         draw_sidebar(rt, m, H);
         draw_header(rt, m, main_x, main_w);
-        draw_transcript(rt, m, rf(main_x, HEADER_H, W, H - COMPOSER_H));
+        draw_transcript(rt, m, rf(main_x, HEADER_H, main_r, H - COMPOSER_H));
         draw_composer(rt, main_x, main_w, H);
+        if (members > 0) draw_members(rt, m, W, H);
+        else g_n_memrows = 0;
     }
 
     HRESULT hr = ID2D1RenderTarget_EndDraw(rt, NULL, NULL);
@@ -535,11 +618,31 @@ static void composer_send(void) {
         /* Drop a trailing newline the RichEdit may append; skip empty/whitespace. */
         int nonspace = 0;
         for (char *p = b; *p; p++) if (*p != '\r' && *p != '\n' && *p != ' ' && *p != '\t') { nonspace = 1; break; }
-        if (nonspace) { oc_client_send(g_client, g_sel, b); g_scroll = 0; }
+        if (nonspace) {
+            if (g_edit_msg) oc_client_edit(g_client, g_sel, g_edit_msg, b);
+            else            oc_client_send(g_client, g_sel, b);
+            g_scroll = 0;
+        }
         free(b);
     }
     free(w);
+    g_edit_msg = 0;
     SetWindowTextW(g_re, L"");
+}
+
+static void composer_begin_edit(const oc_msg *msg) {
+    if (!g_re || !msg || msg->deleted) return;
+    g_edit_msg = msg->message_id;
+    WCHAR w[2048];
+    to_w(msg->body ? msg->body : "", w, 2048);
+    SetWindowTextW(g_re, w);
+    SendMessageW(g_re, EM_SETSEL, (WPARAM)-2, -1);      /* caret to end */
+    SetFocus(g_re);
+}
+
+static void composer_cancel_edit(void) {
+    g_edit_msg = 0;
+    if (g_re) SetWindowTextW(g_re, L"");
 }
 
 /* Subclass proc: Enter sends, Shift+Enter inserts a newline. */
@@ -549,6 +652,10 @@ static LRESULT CALLBACK re_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (msg == WM_KEYDOWN) composer_send();
         return 0;                                   /* eat both so no newline/bell */
     }
+    if ((msg == WM_KEYDOWN || msg == WM_CHAR) && wp == VK_ESCAPE && g_edit_msg) {
+        if (msg == WM_KEYDOWN) composer_cancel_edit();
+        return 0;
+    }
     return CallWindowProcW(g_re_oldproc, hwnd, msg, wp, lp);
 }
 
@@ -556,8 +663,10 @@ static LRESULT CALLBACK re_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 static void layout_composer(HWND hwnd) {
     if (!g_re) return;
     RECT rc; GetClientRect(hwnd, &rc);
+    const oc_model *m = model();
+    float members = (g_show_members && m && m->authed) ? MEMBERS_W : 0;
     float main_x = RAIL_W + SIDEBAR_W;
-    int x = (int)main_x + 16, r = rc.right - 16;
+    int x = (int)main_x + 16, r = (int)(rc.right - members) - 16;
     int top = rc.bottom - (int)COMPOSER_H + 12, bot = rc.bottom - 14;
     MoveWindow(g_re, x, top, r - x, bot - top, TRUE);
 }
@@ -583,13 +692,160 @@ static void composer_create(HWND parent) {
     SetFocus(g_re);
 }
 
+/* ---- context menus + actions --------------------------------------------- */
+
+static const oc_msg *find_msg(const oc_channel *c, uint64_t mid) {
+    if (!c) return NULL;
+    for (size_t i = 0; i < c->n_msgs; i++)
+        if (c->msgs[i].message_id == mid) return &c->msgs[i];
+    return NULL;
+}
+
+/* Is `emoji` one of our own reactions on this message? (drives react toggle) */
+static int reaction_is_mine(const oc_msg *msg, const char *emoji) {
+    for (int i = 0; i < msg->n_reactions; i++)
+        if (msg->reactions[i].mine && strcmp(msg->reactions[i].emoji, emoji) == 0) return 1;
+    return 0;
+}
+
+static void copy_to_clipboard(HWND hwnd, const char *utf8) {
+    if (!utf8 || !OpenClipboard(hwnd)) return;
+    EmptyClipboard();
+    int wl = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (size_t)wl * sizeof(WCHAR));
+    if (h) {
+        WCHAR *p = (WCHAR *)GlobalLock(h);
+        MultiByteToWideChar(CP_UTF8, 0, utf8, -1, p, wl);
+        GlobalUnlock(h);
+        SetClipboardData(CF_UNICODETEXT, h);
+    }
+    CloseClipboard();
+}
+
+static void download_attachment(HWND hwnd, const oc_attachment *a) {
+    WCHAR file[MAX_PATH]; file[0] = 0;
+    MultiByteToWideChar(CP_UTF8, 0, a->filename, -1, file, MAX_PATH);
+    OPENFILENAMEW ofn; ZeroMemory(&ofn, sizeof ofn);
+    ofn.lStructSize = sizeof ofn;
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
+    if (GetSaveFileNameW(&ofn)) {
+        char path[1024];
+        WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL);
+        oc_client_download(g_client, a->id, path);
+    }
+}
+
+static WCHAR *wmenu(const char *utf8, WCHAR *buf, int cap) { to_w(utf8, buf, cap); return buf; }
+
+static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, int sy) {
+    const oc_channel *c = oc_model_channel((oc_model *)m, g_sel);
+    const oc_msg *msg = find_msg(c, mid);
+    if (!msg) return;
+    WCHAR wb[128];
+    HMENU menu = CreatePopupMenu();
+    HMENU react = CreatePopupMenu();
+    for (int i = 0; i < 6; i++)
+        AppendMenuW(react, MF_STRING, (UINT_PTR)(1 + i), wmenu(REACT_EMO[i], wb, 128));
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)react, L"React");
+    for (int i = 0; i < msg->n_attach; i++) {
+        char lbl[200];
+        snprintf(lbl, sizeof lbl, "Download %s", msg->attach[i].filename);
+        AppendMenuW(menu, MF_STRING | (msg->attach[i].reclaimed ? MF_GRAYED : 0),
+                    (UINT_PTR)(30 + i), wmenu(lbl, wb, 128));
+    }
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, 20, L"Copy text");
+    int own = (msg->author_id == m->user_id);
+    int canmod = own || self_role(m) >= OC_ROLE_ADMIN;
+    if (own && !msg->deleted)    AppendMenuW(menu, MF_STRING, 21, L"Edit");
+    if (canmod && !msg->deleted) AppendMenuW(menu, MF_STRING, 22, L"Delete");
+
+    int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, sx, sy, 0, hwnd, NULL);
+    DestroyMenu(menu);
+    if (cmd >= 1 && cmd <= 6) {
+        const char *e = REACT_EMO[cmd - 1];
+        oc_client_react(g_client, g_sel, mid, e, reaction_is_mine(msg, e) ? 0 : 1);
+    } else if (cmd == 20) {
+        copy_to_clipboard(hwnd, msg->body ? msg->body : "");
+    } else if (cmd == 21) {
+        composer_begin_edit(msg);
+    } else if (cmd == 22) {
+        oc_client_delete(g_client, g_sel, mid);
+    } else if (cmd >= 30 && cmd - 30 < msg->n_attach) {
+        download_attachment(hwnd, &msg->attach[cmd - 30]);
+    }
+}
+
+static void show_member_menu(HWND hwnd, const oc_model *m, uint64_t uid, int sx, int sy) {
+    if (uid == m->user_id) return;
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, 1, L"Message");
+    uint8_t me = self_role(m);
+    if (me >= OC_ROLE_ADMIN) {
+        HMENU roles = CreatePopupMenu();
+        AppendMenuW(roles, MF_STRING, 10, L"Member");
+        AppendMenuW(roles, MF_STRING, 11, L"Admin");
+        if (me >= OC_ROLE_OWNER) AppendMenuW(roles, MF_STRING, 12, L"Owner");
+        AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)roles, L"Set role");
+        AppendMenuW(menu, MF_STRING, 13, L"Remove from workspace");
+    }
+    int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, sx, sy, 0, hwnd, NULL);
+    DestroyMenu(menu);
+    switch (cmd) {
+    case 1:  oc_client_open_dm(g_client, uid); break;
+    case 10: oc_client_set_role(g_client, uid, OC_ROLE_MEMBER); break;
+    case 11: oc_client_set_role(g_client, uid, OC_ROLE_ADMIN); break;
+    case 12: oc_client_set_role(g_client, uid, OC_ROLE_OWNER); break;
+    case 13: oc_client_remove_user(g_client, uid); break;
+    default: break;
+    }
+}
+
 /* ---- input --------------------------------------------------------------- */
 
-static void on_click(int x, int y) {
-    if (x < RAIL_W || x > RAIL_W + SIDEBAR_W) return;
-    for (int i = 0; i < g_n_rows; i++)
-        if ((float)y >= g_rows[i].top && (float)y < g_rows[i].bot) {
-            if (g_rows[i].cid != g_sel) select_channel(g_rows[i].cid);
+static void on_click(HWND hwnd, int x, int y) {
+    /* Members toggle. */
+    if ((float)x >= g_members_btn.left && (float)x <= g_members_btn.right &&
+        (float)y >= g_members_btn.top && (float)y <= g_members_btn.bottom) {
+        g_show_members = !g_show_members;
+        layout_composer(hwnd);
+        return;
+    }
+    /* Sidebar channel rows. */
+    if (x >= RAIL_W && x <= RAIL_W + SIDEBAR_W) {
+        for (int i = 0; i < g_n_rows; i++)
+            if ((float)y >= g_rows[i].top && (float)y < g_rows[i].bot) {
+                if (g_rows[i].cid != g_sel) select_channel(g_rows[i].cid);
+                return;
+            }
+        return;
+    }
+    /* Members-pane rows: click opens a DM. */
+    for (int i = 0; i < g_n_memrows; i++)
+        if ((float)y >= g_memrows[i].top && (float)y < g_memrows[i].bot) {
+            oc_client_open_dm(g_client, g_memrows[i].uid);
+            return;
+        }
+}
+
+static void on_rclick(HWND hwnd, int x, int y) {
+    const oc_model *m = model();
+    if (!m) return;
+    POINT pt = { x, y };
+    ClientToScreen(hwnd, &pt);
+    /* Members pane first (it overlaps the right edge). */
+    for (int i = 0; i < g_n_memrows; i++)
+        if ((float)y >= g_memrows[i].top && (float)y < g_memrows[i].bot) {
+            show_member_menu(hwnd, m, g_memrows[i].uid, pt.x, pt.y);
+            return;
+        }
+    for (int i = 0; i < g_n_msgrows; i++)
+        if ((float)y >= g_msgrows[i].top && (float)y < g_msgrows[i].bot) {
+            show_msg_menu(hwnd, m, g_msgrows[i].mid, pt.x, pt.y);
             return;
         }
 }
@@ -667,7 +923,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     case WM_LBUTTONDOWN:
-        on_click(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        on_click(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    case WM_RBUTTONDOWN:
+        on_rclick(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     case WM_ERASEBKGND:

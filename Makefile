@@ -183,7 +183,7 @@ $(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(SQLITE_SRC)
                 $(wildcard client/gui/win32/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) | build
 	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result -municode -mwindows $(WIN_GUI_INC) \
 	    $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(SQLITE_SRC) \
-	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -lshell32 \
+	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -lshell32 -lcomdlg32 \
 	    -ld2d1 -ldwrite -lwindowscodecs -luuid -static -o $@
 
 # --- tuikit demo (ARCH-83) ----------------------------------------------------
