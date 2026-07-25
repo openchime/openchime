@@ -114,6 +114,7 @@ static int g_n_searchrows;
 static int      g_show_members = 1;     /* members pane visible */
 static D2D1_RECT_F g_members_btn;       /* header toggle hit-box */
 static D2D1_RECT_F g_rail_btn;          /* workspace-avatar hit-box (app menu) */
+static D2D1_RECT_F g_attach_btn;        /* composer attach (+) hit-box */
 static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
 
 /* ---- small helpers ------------------------------------------------------- */
@@ -630,7 +631,29 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
     const oc_channel *c = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
     char title[160] = "OpenChime";
     if (c) channel_label(m, c, title, sizeof title);
-    draw_text(rt, title, g_hdr, rf(x0 + 20, 0, x0 + w - 240, HEADER_H), OC_COL_TEXT);
+
+    /* Someone typing in this channel? -> a subtitle under the title. */
+    char typing[192] = "";
+    if (c) {
+        uint64_t who[4];
+        size_t nt = oc_model_typing(m, g_sel, m->user_id, who, 4);
+        if (nt == 1) {
+            const char *n1 = oc_model_user_name(m, who[0]);
+            snprintf(typing, sizeof typing, "%s is typing…", (n1 && n1[0]) ? n1 : "someone");
+        } else if (nt == 2) {
+            const char *n1 = oc_model_user_name(m, who[0]), *n2 = oc_model_user_name(m, who[1]);
+            snprintf(typing, sizeof typing, "%s and %s are typing…",
+                     (n1 && n1[0]) ? n1 : "someone", (n2 && n2[0]) ? n2 : "someone");
+        } else if (nt > 2) {
+            snprintf(typing, sizeof typing, "several people are typing…");
+        }
+    }
+    if (typing[0]) {
+        draw_text(rt, title, g_hdr, rf(x0 + 20, 6, x0 + w - 240, 34), OC_COL_TEXT);
+        draw_text(rt, typing, g_small, rf(x0 + 20, 32, x0 + w - 240, HEADER_H - 6), OC_COL_ACCENT);
+    } else {
+        draw_text(rt, title, g_hdr, rf(x0 + 20, 0, x0 + w - 240, HEADER_H), OC_COL_TEXT);
+    }
 
     /* Members toggle (right). */
     g_members_btn = rf(x0 + w - 16 - 96, 12, x0 + w - 16, HEADER_H - 12);
@@ -679,11 +702,18 @@ static void draw_members(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
     }
 }
 
-/* The composer region behind the RichEdit child (which paints its own box). */
+/* The composer region behind the RichEdit child (which paints its own box),
+ * plus an attach (+) button to the left of the input. */
 static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     float top = h - COMPOSER_H;
     fill(rt, rf(x0, top, x0 + w, h), OC_COL_BASE);
     fill(rt, rf(x0, top, x0 + w, top + 1), OC_COL_BORDER);   /* hairline divider */
+
+    g_attach_btn = rf(x0 + 16, top + 15, x0 + 16 + 40, h - 17);
+    fill_round(rt, g_attach_btn, 8.0f, OC_COL_SIDEBAR);
+    IDWriteTextFormat_SetTextAlignment(g_hdr, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, "+", g_hdr, g_attach_btn, OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_hdr, DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 
 /* ---- paint --------------------------------------------------------------- */
@@ -796,7 +826,7 @@ static void layout_composer(HWND hwnd) {
     const oc_model *m = model();
     float members = (g_show_members && m && m->authed) ? MEMBERS_W : 0;
     float main_x = RAIL_W + SIDEBAR_W;
-    int x = (int)main_x + 16, r = (int)(rc.right - members) - 16;
+    int x = (int)main_x + 16 + 48, r = (int)(rc.right - members) - 16;   /* +48 clears the attach button */
     int top = rc.bottom - (int)COMPOSER_H + 12, bot = rc.bottom - 14;
     MoveWindow(g_re, x, top, r - x, bot - top, TRUE);
 }
@@ -869,6 +899,23 @@ static void download_attachment(HWND hwnd, const oc_attachment *a) {
 }
 
 static WCHAR *wmenu(const char *utf8, WCHAR *buf, int cap) { to_w(utf8, buf, cap); return buf; }
+
+/* Pick a local file and upload it to the selected channel. */
+static void upload_file(HWND hwnd) {
+    if (!g_client || !g_sel) return;
+    WCHAR file[MAX_PATH]; file[0] = 0;
+    OPENFILENAMEW ofn; ZeroMemory(&ofn, sizeof ofn);
+    ofn.lStructSize = sizeof ofn;
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    if (GetOpenFileNameW(&ofn)) {
+        char path[1024];
+        WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL);
+        oc_client_upload(g_client, g_sel, path);
+    }
+}
 
 static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, int sy) {
     const oc_channel *c = oc_model_channel((oc_model *)m, g_sel);
@@ -964,6 +1011,8 @@ static void on_click(HWND hwnd, int x, int y) {
         layout_composer(hwnd);
         return;
     }
+    /* Composer attach (+) button. */
+    if (in_rect(g_attach_btn, x, y)) { upload_file(hwnd); return; }
     /* Search result rows (main area only) -> jump to that channel. */
     {
         const oc_model *mm = model();
@@ -1286,8 +1335,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
         composer_create(hwnd);
+        DragAcceptFiles(hwnd, TRUE);              /* drop files anywhere to upload */
         SetTimer(hwnd, TIMER_TICK, 30, NULL);
         return 0;
+    case WM_DROPFILES: {
+        HDROP drop = (HDROP)wp;
+        UINT nf = DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0);
+        for (UINT i = 0; i < nf && g_client && g_sel; i++) {
+            WCHAR wf[MAX_PATH];
+            if (DragQueryFileW(drop, i, wf, MAX_PATH)) {
+                char path[1024];
+                WideCharToMultiByte(CP_UTF8, 0, wf, -1, path, sizeof path, NULL, NULL);
+                oc_client_upload(g_client, g_sel, path);
+            }
+        }
+        DragFinish(drop);
+        return 0;
+    }
     case WM_TIMER:
         if (wp == TIMER_TICK && g_client) {
             oc_client_tick(g_client);
