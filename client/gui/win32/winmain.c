@@ -111,6 +111,10 @@ static int g_n_memrows;
 static struct { float top, bot; uint64_t cid; } g_searchrows[128];
 static int g_n_searchrows;
 
+/* Webhook-overlay row hit-boxes (row -> webhook id, for delete). */
+static struct { float top, bot; uint64_t wid; } g_webrows[64];
+static int g_n_webrows;
+
 static int      g_show_members = 1;     /* members pane visible */
 static D2D1_RECT_F g_members_btn;       /* header toggle hit-box */
 static D2D1_RECT_F g_rail_btn;          /* workspace-avatar hit-box (app menu) */
@@ -248,6 +252,14 @@ static void close_overlays(void) {
     if (mm->thread_open)    oc_client_close_thread(g_client);
     if (mm->search_open)    oc_client_close_search(g_client);
     if (mm->reactlist_open) oc_client_close_reactions(g_client);
+    if (mm->weblist_open)   oc_client_close_webhooks(g_client);
+    if (mm->storage_open)   oc_client_toggle_storage(g_client, 0);
+    if (mm->audit_open)     oc_client_toggle_audit(g_client, 0);
+}
+
+static int any_overlay(const oc_model *m) {
+    return m && (m->thread_open || m->search_open || m->reactlist_open ||
+                 m->weblist_open || m->storage_open || m->audit_open);
 }
 
 static void select_channel(uint64_t cid) {
@@ -580,6 +592,101 @@ static void draw_search(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
     ID2D1RenderTarget_PopAxisAlignedClip(rt);
 }
 
+static void human_bytes(uint64_t b, char *out, size_t cap) {
+    const char *u[] = { "B", "KB", "MB", "GB", "TB" };
+    double v = (double)b; int i = 0;
+    while (v >= 1024.0 && i < 4) { v /= 1024.0; i++; }
+    snprintf(out, cap, i == 0 ? "%.0f %s" : "%.1f %s", v, u[i]);
+}
+
+static void draw_kv(ID2D1RenderTarget *rt, D2D1_RECT_F body, float *y,
+                    const char *k, const char *v, uint32_t vcol) {
+    draw_text(rt, k, g_ui, rf(body.left + 24, *y, body.left + 240, *y + 26), OC_COL_MUTED);
+    draw_text(rt, v, g_ui, rf(body.left + 240, *y, body.right - 20, *y + 26), vcol);
+    *y += 28;
+}
+
+static void draw_storage(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    D2D1_RECT_F body = overlay_header(rt, reg, "Storage usage");
+    if (!m->storage_have) { overlay_empty(rt, body, "Loading…"); return; }
+    const oc_storage_view *s = &m->storage;
+    char v[64]; float y = body.top + 12;
+    human_bytes(s->total_bytes, v, sizeof v);   draw_kv(rt, body, &y, "Total disk", v, OC_COL_TEXT);
+    human_bytes(s->avail_bytes, v, sizeof v);
+    draw_kv(rt, body, &y, "Available", v, s->under_pressure ? OC_COL_DANGER : OC_COL_TEXT);
+    human_bytes(s->attach_bytes, v, sizeof v);  draw_kv(rt, body, &y, "Attachments", v, OC_COL_TEXT);
+    snprintf(v, sizeof v, "%llu", (unsigned long long)s->attach_count);
+    draw_kv(rt, body, &y, "Attachment count", v, OC_COL_TEXT);
+    human_bytes(s->reserve_bytes, v, sizeof v);  draw_kv(rt, body, &y, "DB reserve", v, OC_COL_TEXT);
+    snprintf(v, sizeof v, "%s%s", s->evict_enabled ? "on" : "off",
+             s->max_age_days ? "" : "");
+    draw_kv(rt, body, &y, "Eviction", v, OC_COL_TEXT);
+    snprintf(v, sizeof v, "%llu orphan · %llu expired · %llu evicted",
+             (unsigned long long)s->rec_orphan, (unsigned long long)s->rec_expired,
+             (unsigned long long)s->rec_evicted);
+    draw_kv(rt, body, &y, "Reclaimed", v, OC_COL_TEXT);
+    if (s->under_pressure)
+        draw_text(rt, "⚠ Under storage pressure — uploads may be refused.", g_ui,
+                  rf(body.left + 24, y + 6, body.right - 20, y + 34), OC_COL_DANGER);
+}
+
+static const char *audit_family(uint8_t f) {
+    return f == 1 ? "admin" : f == 2 ? "account" : f == 3 ? "security" : f == 4 ? "moderation" : "";
+}
+
+static void draw_audit(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    D2D1_RECT_F body = overlay_header(rt, reg, "Audit log");
+    if (m->n_audit == 0) { overlay_empty(rt, body, "No audit entries."); return; }
+    ID2D1RenderTarget_PushAxisAlignedClip(rt, &body, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    float y = body.top + 6, rowh = 46;
+    for (size_t i = 0; i < m->n_audit && y < body.bottom; i++) {
+        const oc_audit_view *a = &m->audit[i];
+        char when[20] = "";
+        if (a->at_ms) { time_t t = (time_t)(a->at_ms / 1000); struct tm tv;
+            if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%Y-%m-%d %H:%M", &tv); }
+        char head[220];
+        snprintf(head, sizeof head, "%s  ·  %s  ·  %s%s%s", when,
+                 a->actor_name[0] ? a->actor_name : "system", a->action,
+                 a->target[0] ? " → " : "", a->target);
+        draw_text(rt, head, g_ui, rf(body.left + 20, y, body.right - 90, y + 24),
+                  a->outcome ? OC_COL_TEXT : OC_COL_DANGER);
+        char meta[160];
+        snprintf(meta, sizeof meta, "%s%s%s", audit_family(a->family),
+                 a->detail[0] ? " · " : "", a->detail);
+        draw_text(rt, meta, g_small, rf(body.left + 20, y + 24, body.right - 20, y + 44), OC_COL_MUTED);
+        fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 20, y + rowh), OC_COL_BORDER);
+        y += rowh;
+    }
+    ID2D1RenderTarget_PopAxisAlignedClip(rt);
+}
+
+static void draw_weblist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    const oc_channel *c = oc_model_channel((oc_model *)m, m->weblist_channel);
+    char title[160];
+    snprintf(title, sizeof title, "Webhooks — %s", (c && c->name) ? c->name : "channel");
+    D2D1_RECT_F body = overlay_header(rt, reg, title);
+    g_n_webrows = 0;
+    if (m->n_webhooks == 0) {
+        overlay_empty(rt, body, "No webhooks. Right-click the channel → Create webhook.");
+        return;
+    }
+    draw_text(rt, "Click a webhook to delete it.", g_small,
+              rf(body.left + 20, body.top + 4, body.right - 16, body.top + 24), OC_COL_FAINT);
+    float y = body.top + 28;
+    for (size_t i = 0; i < m->n_webhooks && y < body.bottom; i++) {
+        const oc_webhook_view *wv = &m->webhooks[i];
+        char row[160];
+        snprintf(row, sizeof row, "%s%s", wv->label, wv->disabled ? "  (disabled)" : "");
+        draw_text(rt, row, g_ui, rf(body.left + 20, y, body.right - 16, y + 30),
+                  wv->disabled ? OC_COL_MUTED : OC_COL_TEXT);
+        if (g_n_webrows < (int)(sizeof g_webrows / sizeof g_webrows[0])) {
+            g_webrows[g_n_webrows].top = y; g_webrows[g_n_webrows].bot = y + 30;
+            g_webrows[g_n_webrows].wid = wv->webhook_id; g_n_webrows++;
+        }
+        y += 32;
+    }
+}
+
 static void draw_reactlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
     D2D1_RECT_F body = overlay_header(rt, reg, "Who reacted");
     if (m->n_reactors == 0) { overlay_empty(rt, body, "No reactions."); return; }
@@ -606,6 +713,9 @@ static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
     if (m->thread_open)    { draw_thread(rt, m, reg);    return; }
     if (m->search_open)    { draw_search(rt, m, reg);    return; }
     if (m->reactlist_open) { draw_reactlist(rt, m, reg); return; }
+    if (m->weblist_open)   { draw_weblist(rt, m, reg);   return; }
+    if (m->storage_open)   { draw_storage(rt, m, reg);   return; }
+    if (m->audit_open)     { draw_audit(rt, m, reg);     return; }
 
     const oc_channel *c = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
     if (!c) {
@@ -809,8 +919,7 @@ static LRESULT CALLBACK re_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;                                   /* eat both so no newline/bell */
     }
     if ((msg == WM_KEYDOWN || msg == WM_CHAR) && wp == VK_ESCAPE) {
-        const oc_model *mm = model();
-        if (mm && (mm->thread_open || mm->search_open || mm->reactlist_open)) {
+        if (any_overlay(model())) {
             if (msg == WM_KEYDOWN) close_overlays();
             return 0;
         }
@@ -1013,15 +1122,25 @@ static void on_click(HWND hwnd, int x, int y) {
     }
     /* Composer attach (+) button. */
     if (in_rect(g_attach_btn, x, y)) { upload_file(hwnd); return; }
-    /* Search result rows (main area only) -> jump to that channel. */
+    /* Overlay row clicks (main area only). */
     {
         const oc_model *mm = model();
-        if (mm && mm->search_open && x > RAIL_W + SIDEBAR_W)
-            for (int i = 0; i < g_n_searchrows; i++)
-                if ((float)y >= g_searchrows[i].top && (float)y < g_searchrows[i].bot) {
-                    select_channel(g_searchrows[i].cid);   /* also closes the overlay */
-                    return;
-                }
+        if (mm && x > RAIL_W + SIDEBAR_W) {
+            if (mm->search_open)
+                for (int i = 0; i < g_n_searchrows; i++)
+                    if ((float)y >= g_searchrows[i].top && (float)y < g_searchrows[i].bot) {
+                        select_channel(g_searchrows[i].cid);   /* also closes the overlay */
+                        return;
+                    }
+            if (mm->weblist_open)
+                for (int i = 0; i < g_n_webrows; i++)
+                    if ((float)y >= g_webrows[i].top && (float)y < g_webrows[i].bot) {
+                        if (MessageBoxW(hwnd, L"Delete this webhook?", L"Confirm",
+                                        MB_YESNO | MB_ICONWARNING) == IDYES)
+                            oc_client_delete_webhook(g_client, g_webrows[i].wid);
+                        return;
+                    }
+        }
     }
     /* Sidebar channel rows. */
     if (x >= RAIL_W && x <= RAIL_W + SIDEBAR_W) {
@@ -1264,6 +1383,7 @@ static int text_prompt(HWND owner, const char *title, const char *label,
 
 static int g_logging_out;
 static int g_await_invite;      /* show the minted invite token once it arrives */
+static int g_await_webhook;     /* show the minted webhook token once it arrives */
 
 static void show_app_menu(HWND hwnd, int sx, int sy) {
     HMENU menu = CreatePopupMenu();
@@ -1286,6 +1406,8 @@ static void show_app_menu(HWND hwnd, int sx, int sy) {
         AppendMenuW(invite, MF_STRING, 40, L"as Member");
         AppendMenuW(invite, MF_STRING, 41, L"as Admin");
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)invite, L"Invite people");
+        AppendMenuW(menu, MF_STRING, 60, L"Storage usage");
+        AppendMenuW(menu, MF_STRING, 61, L"Audit log");
     }
     AppendMenuW(menu, MF_STRING, 2, L"Reconnect now");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
@@ -1327,6 +1449,8 @@ static void show_app_menu(HWND hwnd, int sx, int sy) {
     }
     case 40: oc_client_invite_user(g_client, OC_ROLE_MEMBER); g_await_invite = 1; break;
     case 41: oc_client_invite_user(g_client, OC_ROLE_ADMIN);  g_await_invite = 1; break;
+    case 60: close_overlays(); oc_client_toggle_storage(g_client, 1); oc_client_storage_status(g_client); break;
+    case 61: close_overlays(); oc_client_toggle_audit(g_client, 1);   oc_client_audit_query(g_client, 0); break;
     case 50: {
         char win[32];
         if (text_prompt(hwnd, "Do not disturb", "Window HH:MM-HH:MM (blank = off):", "",
@@ -1358,6 +1482,8 @@ static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, int sx
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)notify, L"Notifications");
         if (c->kind != OC_CHANNEL_KIND_DM) {
             AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(menu, MF_STRING, 4, L"Webhooks…");
+            AppendMenuW(menu, MF_STRING, 5, L"Create webhook…");
             AppendMenuW(menu, MF_STRING, 3, L"Leave channel");
         }
     }
@@ -1367,6 +1493,15 @@ static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, int sx
     case 1:  oc_client_join_channel(g_client, cid); break;
     case 2:  oc_client_mark_read(g_client, cid); break;
     case 3:  oc_client_leave_channel(g_client, cid); break;
+    case 4:  close_overlays(); oc_client_webhooks(g_client, cid); break;
+    case 5: {
+        char label[64];
+        if (text_prompt(hwnd, "Create webhook", "Webhook label:", "", label, sizeof label, 0) && label[0]) {
+            oc_client_create_webhook(g_client, cid, label);
+            g_await_webhook = 1;
+        }
+        break;
+    }
     case 20: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_ALL); break;
     case 21: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_MENTIONS); break;
     case 22: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_NONE); break;
@@ -1415,6 +1550,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 to_w(line, msgw, 256);
                 g_await_invite = 0;
                 MessageBoxW(hwnd, msgw, L"Invite created", MB_OK | MB_ICONINFORMATION);
+            }
+            if (g_await_webhook && m->webhook_token[0]) {  /* show the minted webhook token once */
+                WCHAR msgw[256]; char line[256];
+                snprintf(line, sizeof line,
+                         "Webhook token (shown once — POST to /webhook/<token>):\n\n%s", m->webhook_token);
+                to_w(line, msgw, 256);
+                g_await_webhook = 0;
+                MessageBoxW(hwnd, msgw, L"Webhook created", MB_OK | MB_ICONINFORMATION);
             }
             InvalidateRect(hwnd, NULL, FALSE);
         }
