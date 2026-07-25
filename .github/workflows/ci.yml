@@ -7,6 +7,9 @@ name: ci
 #   - integration: the deployed image end-to-end on the Docker Compose stack —
 #                  health check plus the protocol vertical over TLS.
 #   - core:        standalone compile check of the client app-core (ARCH-74).
+#   - windows:     mingw cross-compile check of the Windows front-ends (TUI + the
+#                  native Direct2D/DirectWrite GUI, ARCH-82) — the running window
+#                  can't be headless-screenshotted, so this guards build breaks.
 # Doc-only changes skip CI. See docs/TESTING.md for the full strategy.
 
 on:
@@ -84,3 +87,23 @@ jobs:
           sudo apt-get install -y --no-install-recommends bzip2
       - name: Compile the app-core
         run: make core
+
+  windows:
+    name: windows cross-compile (TUI + GUI)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      # mingw-w64 for the cross-compile; bzip2 + curl for the vendored mbedTLS
+      # tarball that build_mbedtls_windows.sh fetches and cross-builds.
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-x86-64 bzip2 curl
+      - name: Cross-build the vendored Windows mbedTLS
+        run: scripts/build_mbedtls_windows.sh
+      # Both Windows front-ends share the app-core + shared wire code; a clean
+      # link proves the pure-C Win32 (incl. Direct2D/DirectWrite-from-C, ARCH-82)
+      # builds under mingw.
+      - name: Compile the Windows front-ends
+        run: make windows-tui windows-gui

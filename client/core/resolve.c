@@ -82,11 +82,16 @@ static int srv_lookup(const char *domain, char *host, size_t hostcap, int *port)
     if ((size_t)snprintf(qname, sizeof qname, "_openchime._tcp.%s", domain) >= sizeof qname)
         return -1;
 #ifdef _WIN32
-    PDNS_RECORD recs = NULL;
-    if (DnsQuery_A(qname, DNS_TYPE_SRV, DNS_QUERY_STANDARD, NULL, &recs, NULL) != 0)
+    /* Explicit ANSI types (PDNS_RECORDA), not the generic DNS_RECORD: under a
+     * UNICODE build (the GUI links -municode) the generic maps to the wide
+     * variant, but DnsQuery_A fills ANSI records — the fields must be read as
+     * ANSI regardless of the UNICODE macro. */
+    PDNS_RECORDA recs = NULL;
+    if (DnsQuery_A(qname, DNS_TYPE_SRV, DNS_QUERY_STANDARD, NULL,
+                   (PDNS_RECORD *)&recs, NULL) != 0)
         return -1;
     int found = 0; unsigned best_prio = 0;
-    for (PDNS_RECORD r = recs; r; r = r->pNext) {
+    for (PDNS_RECORDA r = recs; r; r = r->pNext) {
         if (r->wType != DNS_TYPE_SRV) continue;
         const char *tgt = r->Data.SRV.pNameTarget;
         if (!tgt || tgt[0] == '\0' || (tgt[0] == '.' && tgt[1] == '\0')) continue;
@@ -96,7 +101,7 @@ static int srv_lookup(const char *domain, char *host, size_t hostcap, int *port)
             *port = r->Data.SRV.wPort;
         }
     }
-    if (recs) DnsRecordListFree(recs, DnsFreeRecordList);
+    if (recs) DnsFree(recs, DnsFreeRecordList);
     return found ? 0 : -1;
 #else
     unsigned char ans[NS_PACKETSZ];

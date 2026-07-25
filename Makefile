@@ -65,7 +65,7 @@ endif
 TUI_INC   := $(CORE_INC) -Iclient/tui -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
-.PHONY: all run test integration core tui bench clean s3-smoke windows-tui tuikit-demo demo-client
+.PHONY: all run test integration core tui bench clean s3-smoke windows-tui windows-gui tuikit-demo demo-client
 
 all: $(BIN)
 
@@ -168,10 +168,23 @@ $(WIN_TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $
 	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -static -o $@
 
 
-# The native Windows GUI (Win32 + Direct2D/DirectWrite + RichEdit, pure C —
-# ARCH-82) is not yet built; its target lands with that client. Two first-draft
-# GUIs (a comctl32 Win32 client and a self-rendered Clay+raylib client) were
-# removed — see ARCH-82 / docs/VENDORS.md.
+# The native Windows GUI (Win32 + Direct2D/DirectWrite/WIC, pure C — ARCH-80/82)
+# over the same shared app-core. Mirrors windows-tui (core+shared+migrate+bundled
+# sqlite+mbedtls-win) but compiles the client/gui/win32 sources instead of the
+# TUI/tuikit stack and links the Direct2D stack. -municode gives the wWinMain
+# Unicode entry point; -mwindows selects the GUI subsystem (no console).
+WIN_GUI_BIN := build/openchime.exe
+GUI_SRC := $(wildcard client/gui/win32/*.c)
+WIN_GUI_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
+               $(CORE_INC) -Iclient/gui/win32 -Ithird_party/sqlite
+
+windows-gui: $(WIN_GUI_BIN)
+$(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(SQLITE_SRC) \
+                $(wildcard client/gui/win32/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) | build
+	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result -municode -mwindows $(WIN_GUI_INC) \
+	    $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(SQLITE_SRC) \
+	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -lshell32 \
+	    -ld2d1 -ldwrite -lwindowscodecs -luuid -static -o $@
 
 # --- tuikit demo (ARCH-83) ----------------------------------------------------
 # Standalone harness exercising every tuikit widget — no core, no daemon, no TLS.
