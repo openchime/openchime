@@ -8,11 +8,11 @@ outbound wires (enrollment, ARCH-84; push, ARCH-85). Verified end to end.
 
 1. **Enrollment** — the daemon generates a keypair + opaque audience, prints an `oce1.`
    code, the operator reserves it in the console, and the daemon proves possession and
-   activates (ARCH-84 ↔ control-plane CP-5).
+   activates (ARCH-84; the control plane ratifies).
 2. **Push** — a client registers a device token; a message send drives the daemon's push
    emitter, which signs a contentless batch with the enrollment key and POSTs it to the
-   control-plane gateway, which verifies the signature (CP-12) and relays it (ARCH-85 ↔
-   CP-13). The cross-language crypto (mbedTLS sign ↔ .NET verify) matches by construction.
+   control-plane gateway, which verifies the request signature and relays it (ARCH-85;
+   control-plane side). The cross-language crypto (mbedTLS sign ↔ .NET verify) matches by construction.
 
 ## Run it — one command (recommended)
 
@@ -42,7 +42,7 @@ Watch the control-plane log for:
 push[Apns] would notify token tok-bob-demo (channel 1, ...)
 ```
 
-That is the daemon→central push wire firing end to end (signed CP-12, contentless).
+That is the daemon→central push wire firing end to end (signed, contentless).
 
 ## Run it — scripted, against a control plane you started yourself
 

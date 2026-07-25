@@ -415,7 +415,36 @@ user's live connections; each client folds only the snapshot whose `client_type`
 matches its own, so a change on one device reaches the user's other same-type
 devices.
 
-## 3l. Migration 0018 — push device tokens (REQ-132/133, ARCH-85)
+## 3l. Migration 0016 — audit log (REQ-251, ARCH-79)
+
+A bounded, queryable record of security-sensitive events (auth failures, admin and
+moderation actions, account changes) for owner/admin review — never message content.
+
+### `audit_log`
+- `id` (INTEGER PK, AUTOINCREMENT); `at_ms` (event time).
+- `family` (INTEGER) — 1 admin, 2 account, 3 security, 4 moderation.
+- `action` (TEXT) — e.g. `auth.failed`, `webhook.create`.
+- `actor_id` / `actor_name` — the actor (NULL id for an unauthenticated event; the name
+  is denormalized so a later-removed actor is still legible).
+- `target_id` / `target`; `outcome` (1 ok, 0 denied/failed); `detail` (TEXT).
+- Indexes on `(family, at_ms)` and `(at_ms)`. Per-family flood cap + paging are applied
+  by the query path, not the schema.
+
+## 3m. Migration 0017 — federated enrollment (ARCH-84)
+
+A single-row table holding the box's enrollment identity, so an enrolled/federated box
+keeps its audience + key across restarts (the same key-survival pattern as the TLS
+identity, ARCH-66b).
+
+### `enrollment`
+- `id` (INTEGER PK, `CHECK (id = 1)`) — one row.
+- `privkey_pem` (TEXT) — the daemon's ECDSA-P256 enrollment private key (the public half
+  lives only in the control plane).
+- `audience` (TEXT) — the opaque `ws_…` audience id (also the OIDC `aud`).
+- `state` (TEXT) — `pending` | `active`.
+- `activated_at_ms` (nullable) / `created_at_ms`.
+
+## 3n. Migration 0018 — push device tokens (REQ-132/133, ARCH-85)
 
 The daemon owns the mobile-push device registry — the control-plane gateway is a
 stateless relay that stores nothing (REQ-041). A client registers its APNs/FCM token

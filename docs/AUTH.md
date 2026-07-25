@@ -81,7 +81,7 @@ authority.
 - **Adding users:** an owner/admin creates an account and issues an **invite
   token**; the invitee sets their password by presenting the token. Email
   magic-link delivery is an optional future enhancement, never required.
-- **Registered-user cap (CP-7):** the daemon honors `OPENCHIME_MAX_USERS` (0/unset
+- **Registered-user cap:** the daemon honors `OPENCHIME_MAX_USERS` (0/unset
   = unlimited). Creating a *new* user past the cap — via invite redeem, direct
   register, bootstrap, or a first-time OIDC login — is refused with
   `ERROR USER_LIMIT`; an existing user still logs in, and a removed member

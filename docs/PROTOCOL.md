@@ -897,9 +897,8 @@ endpoint is not yet implemented — it currently uses the daemon's TOFU cert.
 
 A user's notification settings are **server-authoritative and synced across their
 devices**. Two settings: a per-channel **level** (REQ-130) and a **do-not-disturb
-window** (REQ-131). They are the config that clients honor and that the future
-push gateway (REQ-132/133, deferred) will consult; DND suppresses *push*, not
-in-app unread (REQ-131).
+window** (REQ-131). They are the config that clients honor and that the push emitter
+(REQ-132/133, ARCH-85) consults; DND suppresses *push*, not in-app unread (REQ-131).
 
 **`SET_NOTIFY_PREF` (C → S), `0x0090`** `{ channel_id: u64, level: u8 }` — set the
 level for a channel the caller can read: `0` all, `1` mentions-only, `2` none. An
@@ -1116,6 +1115,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `2001` | `AUTH_REQUIRED`       | post-hello | yes   | A messaging frame arrived before successful `AUTH`.            |
 | `2002` | `AUTH_INVALID_TOKEN`  | auth       | yes   | JWT failed signature/audience/expiry validation (REQ-023).     |
 | `2003` | `AUTH_RATE_LIMITED`   | auth       | yes   | Too many auth attempts for this tenant (REQ-191).              |
+| `2004` | `USER_LIMIT`          | auth       | yes   | Workspace at its registered-user cap (`OPENCHIME_MAX_USERS`); a new user cannot be created. An existing user still logs in. |
 | `3001` | `BODY_TOO_LARGE`      | messaging  | no    | `SEND` body exceeded `MAX_BODY_SIZE`.                           |
 | `3002` | `NOT_A_MEMBER`        | messaging  | no    | Sender is not a member of the target channel (REQ-031).        |
 | `3003` | `UNKNOWN_CHANNEL`     | messaging  | no    | `channel_id` does not exist in this tenant.                    |
@@ -1125,6 +1125,13 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3007` | `UNKNOWN_MESSAGE`     | messaging  | no    | `EDIT`/`DELETE` names a message not in the channel, or already tombstoned (§5.5/5.6). |
 | `3008` | `INVALID_CHANNEL`     | messaging  | no    | `CREATE_CHANNEL` name empty or over 64 bytes (§5.7). |
 | `3009` | `INVALID_REACTION`    | messaging  | no    | `REACT` emoji empty or over 32 bytes (§5.9). |
+| `3010` | `ATTACHMENT_TOO_LARGE`| messaging  | no    | Upload exceeds `MAX_ATTACHMENT_SIZE` (REQ-140). |
+| `3011` | `UNKNOWN_ATTACHMENT`  | messaging  | no    | No such attachment, or not finalized (REQ-141). |
+| `3012` | `STORAGE_FULL`        | messaging  | no    | Upload refused: below the DB reserve (REQ-216). |
+| `3013` | `ATTACHMENT_GONE`     | messaging  | no    | Reclaimed by age or storage pressure (REQ-215/217). |
+| `3014` | `INVALID_DEVICE_TOKEN`| messaging  | no    | `REGISTER_DEVICE_TOKEN` had an empty token or unknown platform (REQ-132). |
+| `3015` | `TRANSFER_PROTOCOL`   | messaging  | no    | Out-of-order/oversized chunk or bad transfer state. |
+| `3016` | `UNKNOWN_WEBHOOK`     | webhook    | no    | No such (or disabled) incoming webhook token (REQ-170). |
 | `9001` | `INTERNAL_ERROR`      | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage version codes (`1001`/`1002`) are delivered via `REJECT`, which
@@ -1151,7 +1158,6 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0045` | `USER_UPDATED`     | S → C     | no        | §5.8    |
 | `0x0046` | `INVITE_CREATED`   | S → C     | no        | §5.8    |
 | `0x0047` | `REDEEM_INVITE`    | C → S     | no        | §5.8    |
-| `0x0048` | `UPDATE_PROFILE`   | C → S     | no        | (reserved — profile edit) |
 | `0x0060` | `SEARCH`           | C → S     | no        | §5.11   |
 | `0x0061` | `SEARCH_RESULTS`   | S → C     | no        | §5.11   |
 | `0x0020` | `SEND`             | C → S     | no        | §5.1    |
@@ -1209,6 +1215,9 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x00A1` | `CALL_LEAVE`       | C → S     | no        | §5.17   |
 | `0x00A2` | `CALL_JOINED`      | S → C     | no        | §5.17   |
 | `0x00A3` | `CALL_ROSTER`      | S → C     | no        | §5.17   |
+| `0x00B0` | `REGISTER_DEVICE_TOKEN`   | C → S | no    | Push device-token registry (REQ-132). |
+| `0x00B1` | `UNREGISTER_DEVICE_TOKEN` | C → S | no    | Drop a push token (logout / rotation). |
+| `0x00B2` | `DEVICE_TOKEN_ACK`        | S → C | no    | Register/unregister acknowledged. |
 | `0x0080` | `UPLOAD_BEGIN`     | C → S     | no        | §5.14   |
 | `0x0081` | `UPLOAD_READY`     | S → C     | no        | §5.14   |
 | `0x0082` | `UPLOAD_CHUNK`     | C → S     | no        | §5.14   |
@@ -1227,11 +1236,11 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 Ranges are left sparse (`0x0001–` handshake, `0x0010–` auth/session, `0x0020–`
 messaging, `0x0030–` reconnect, `0x0040–` users/profiles, `0x0050–` channel
 management, `0x0060–` search, `0x0070–` presence/typing, `0x0080–` attachment
-transfer, `0x0090–` notification prefs, `0x00FF` error) so later revisions can
-slot in audio signaling without renumbering. The `0x0040–0x0047`
-management frames (user enumeration, roles, tenant invite/remove; §5.8) are
-defined; `0x0048` `UPDATE_PROFILE` (avatar/display-name edit) remains **reserved**
-until that milestone lands.
+transfer, `0x0090–` notification prefs / client settings / storage / audit,
+`0x00A0–` audio calls, `0x00B0–` push device tokens, `0x00FF` error) so later
+revisions can slot in without renumbering. The `0x0040–0x0048` users/profile
+frames (user enumeration, roles, tenant invite/remove, and `SET_DISPLAY_NAME`;
+§5.8/§5.16b) are all defined.
 
 ---
 

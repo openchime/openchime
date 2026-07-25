@@ -407,8 +407,8 @@ the requirement says so explicitly rather than implying one.
   schedule that has suppressed push notification delivery without altering
   in-app unread state (badges/counts have still updated). Built (ARCH-72):
   `SET_DND` stores a daily UTC minutes-of-day window on `users`; it governs push
-  only. The push *delivery* it gates (REQ-132/133) is the deferred mobile-push
-  milestone.
+  only. The push *delivery* it gates (REQ-132/133) is built as the daemon push
+  emitter (ARCH-85), which honors the DND window.
 - **REQ-132.** Push notifications have been delivered via APNs on iOS/macOS
   and FCM on Android (ARCH-16), at no per-notification cost, per the
   providers' free tiers as of this writing.
