@@ -676,7 +676,7 @@ static void menu_build_msg(int own, int deleted, int has_attach) {
     if (has_attach) g_menu[g_nmenu++] = (menuitem){ "Download file", ACT_DOWNLOAD };
     if (own)      g_menu[g_nmenu++] = (menuitem){ "Edit",            ACT_EDIT };
     if (own)      g_menu[g_nmenu++] = (menuitem){ "Delete",          ACT_DELETE };
-                  g_menu[g_nmenu++] = (menuitem){ "Who reacted",     ACT_REACTORS };
+    g_menu[g_nmenu++] = (menuitem){ "Who reacted", ACT_REACTORS };
 }
 static void menu_build_member(int is_self) {
     g_nmenu = 0;
@@ -1295,27 +1295,6 @@ static const oc_channel *focused_channel(const oc_model *m, uint64_t cid) {
     return NULL;
 }
 
-/* The filename of an attachment by id (searching every channel's messages), or
- * "" if unknown. Used to pick a default download path. */
-static const char *attach_filename(const oc_model *m, uint64_t id) {
-    for (size_t ci = 0; ci < m->n_channels; ci++)
-        for (size_t i = 0; i < m->channels[ci].n_msgs; i++) {
-            const oc_msg *msg = &m->channels[ci].msgs[i];
-            for (uint8_t k = 0; k < msg->n_attach; k++)
-                if (msg->attach[k].id == id) return msg->attach[k].filename;
-        }
-    return "";
-}
-
-/* Our own most recent, non-deleted message in a channel (for /edit, /delete). */
-static const oc_msg *my_last_message(const oc_channel *ch, uint64_t me) {
-    for (size_t i = ch->n_msgs; i > 0; i--) {
-        const oc_msg *msg = &ch->msgs[i - 1];
-        if (msg->author_id == me && !msg->deleted) return msg;
-    }
-    return NULL;
-}
-
 /* Parse "HH:MM" into minutes-since-midnight, or -1 if malformed. */
 static int parse_hhmm(const char *s) {
     int h = 0, mi = 0;
@@ -1329,13 +1308,6 @@ static int parse_hhmm(const char *s) {
  *   /edit  <text>   replace the text of your last message
  *   /delete         tombstone your last message
  */
-/* Parse an on/off token (on/1/true/yes = 1; anything else = 0). */
-static int setting_onoff(const char *v) {
-    return v && (strcmp(v, "on") == 0 || strcmp(v, "1") == 0 ||
-                 strcmp(v, "true") == 0 || strcmp(v, "yes") == 0);
-}
-
-
 /* Resolve the local store path (session token + TOFU pin persistence): the
  * explicit $OPENCHIME_STATE if set, else $HOME/.local/state/openchime/state.db
  * (creating the dirs). Returns NULL when there is nowhere to put it (persistence

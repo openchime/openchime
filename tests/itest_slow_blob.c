@@ -239,7 +239,7 @@ static void *alice_thread(void *unused) {
         int _ok = 0;                                                           \
         for (int _i = 0; _i < (ms) / 5; _i++) {                                \
             oc_client_tick((cl));                                              \
-            const oc_model *m = oc_client_model((cl));                         \
+            const oc_model *m = oc_client_model((cl)); (void)m;                         \
             if (cond) { _ok = 1; break; }                                      \
             ms_sleep(5);                                                       \
         }                                                                      \

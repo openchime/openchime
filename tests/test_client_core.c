@@ -68,7 +68,7 @@ static void wait_port_ready(int port) {
         int _ok = 0;                                                           \
         for (int _i = 0; _i < 500; _i++) {                                     \
             oc_client_tick((cl));                                              \
-            const oc_model *m = oc_client_model((cl));                         \
+            const oc_model *m = oc_client_model((cl)); (void)m;                         \
             if (cond) { _ok = 1; break; }                                      \
             struct timespec _ts = { 0, 10 * 1000 * 1000 };                     \
             nanosleep(&_ts, NULL);                                             \
@@ -328,7 +328,7 @@ static void test_store_workspace_upgrade(void) {
     CHECK(sqlite3_exec(raw, v3, NULL, NULL, NULL) == SQLITE_OK);
 
     uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN];
-    for (int i = 0; i < OC_SESSION_TOKEN_LEN; i++)    tok[i] = (uint8_t)(i + 7);
+    for (unsigned i = 0; i < OC_SESSION_TOKEN_LEN; i++)    tok[i] = (uint8_t)(i + 7);
     for (int i = 0; i < OC_TLS_FINGERPRINT_LEN; i++)  pin[i] = (uint8_t)(i + 3);
 
     sqlite3_stmt *st = NULL;
@@ -411,7 +411,7 @@ static void test_workspace_book(void) {
 
     /* Forgetting a workspace takes its session token and cached history with it. */
     uint8_t tok[OC_SESSION_TOKEN_LEN];
-    for (int i = 0; i < OC_SESSION_TOKEN_LEN; i++) tok[i] = (uint8_t)(i + 1);
+    for (unsigned i = 0; i < OC_SESSION_TOKEN_LEN; i++) tok[i] = (uint8_t)(i + 1);
     oc_store_save_session(s, "acme:443", tok, 0);
     oc_store_save_message(s, "acme:443", 9, 42, 5, "dana", 1000, "hello", 0, 0);
     CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1);
@@ -438,7 +438,7 @@ static void test_secret_routing(void) {
     unlink(sp); unlink("build/itest_core_secret.db-wal"); unlink("build/itest_core_secret.db-shm");
 
     uint8_t tok[OC_SESSION_TOKEN_LEN];
-    for (int i = 0; i < OC_SESSION_TOKEN_LEN; i++) tok[i] = (uint8_t)(i + 1);
+    for (unsigned i = 0; i < OC_SESSION_TOKEN_LEN; i++) tok[i] = (uint8_t)(i + 1);
 
     oc_store *s = oc_store_open(sp);
     CHECK(s != NULL);

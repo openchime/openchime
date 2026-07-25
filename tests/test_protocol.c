@@ -169,7 +169,7 @@ static void test_messaging_frames(void) {
         CHECK(out.server_time == 1751200500000ull);
     }
     {
-        oc_broadcast in = { 1001, 7, 42, 1751200500000ull, oc_slice_str("hello channel") };
+        oc_broadcast in = { 1001, 7, 42, 1751200500000ull, oc_slice_str("hello channel"), 0, {{0}}, {0} };
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
         CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
@@ -317,7 +317,7 @@ static void test_channel_frames(void) {
         CHECK(slice_eq_str(out.name, "engineering") && out.is_public == 0);
     }
     {
-        oc_channel_info in = { 5, OC_CHANNEL_KIND, oc_slice_str("engineering"), 0, 1, 1751200500000ull };
+        oc_channel_info in = { 5, OC_CHANNEL_KIND, oc_slice_str("engineering"), 0, 1, 1751200500000ull, 0 };
         ROUNDTRIP(oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANNEL_INFO, h, p);
         oc_channel_info out;
         CHECK(oc_decode_channel_info(&p, &out) == OC_OK);
@@ -794,7 +794,7 @@ static void test_attachment_frames(void) {
     }
     /* BROADCAST carrying attachment metadata AND a display-name override. */
     {
-        oc_broadcast in = { 5, 3, 42, 999, oc_slice_str("here"), 0, {{0}} };
+        oc_broadcast in = { 5, 3, 42, 999, oc_slice_str("here"), 0, {{0}}, {0} };
         in.n_attach = 1;
         in.attach[0].id = 77; in.attach[0].filename = oc_slice_str("a.png");
         in.attach[0].mime = oc_slice_str("image/png"); in.attach[0].size = 4096;
@@ -809,7 +809,7 @@ static void test_attachment_frames(void) {
     /* Author name with NO attachments: a zero attachment count precedes the name
      * (REQ-170 display-name override, ARCH-71). */
     {
-        oc_broadcast in = { 6, 3, 42, 999, oc_slice_str("hi"), 0, {{0}} };
+        oc_broadcast in = { 6, 3, 42, 999, oc_slice_str("hi"), 0, {{0}}, {0} };
         in.author_name = oc_slice_str("Zapier");
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
@@ -819,7 +819,7 @@ static void test_attachment_frames(void) {
     }
     /* No attachments and no name -> byte-identical to the original layout. */
     {
-        oc_broadcast in = { 7, 3, 42, 999, oc_slice_str("plain"), 0, {{0}} };
+        oc_broadcast in = { 7, 3, 42, 999, oc_slice_str("plain"), 0, {{0}}, {0} };
         ROUNDTRIP(oc_encode_broadcast(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_BROADCAST, h, p);
         oc_broadcast out;
         CHECK(oc_decode_broadcast(&p, &out) == OC_OK);
