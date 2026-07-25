@@ -99,9 +99,17 @@ static DWORD    g_last_typing;
 static struct { float top, bot; uint64_t cid; } g_rows[512];
 static int g_n_rows;
 
-/* Transcript message hit-boxes (for the right-click context menu). */
-static struct { float top, bot; uint64_t mid; } g_msgrows[600];
+/* Transcript message hit-boxes (context menu + text selection). bx/by = the body
+ * layout's top-left; cw = its wrap width — enough to re-hit-test on mouse events. */
+static struct { float top, bot, bx, by, cw; uint64_t mid; } g_msgrows[600];
 static int g_n_msgrows;
+
+/* Transcript text selection (DirectWrite hit-testing over the custom surface).
+ * Anchor/focus are (message id, UTF-16 offset); order is resolved at draw time. */
+static uint64_t g_sel_a_mid, g_sel_f_mid;
+static uint32_t g_sel_a_pos, g_sel_f_pos;
+static int      g_has_sel;      /* a (possibly empty) selection exists */
+static int      g_selecting;    /* left button held, dragging a selection */
 
 /* Members-pane row hit-boxes. */
 static struct { float top, bot; uint64_t uid; } g_memrows[256];
@@ -134,6 +142,12 @@ static D2D1_COLOR_F col(uint32_t rgb) {
 
 static ID2D1Brush *paint_with(uint32_t rgb) {
     D2D1_COLOR_F c = col(rgb);
+    ID2D1SolidColorBrush_SetColor(g_brush, &c);
+    return (ID2D1Brush *)g_brush;
+}
+
+static ID2D1Brush *paint_alpha(uint32_t rgb, float a) {
+    D2D1_COLOR_F c = col(rgb); c.a = a;
     ID2D1SolidColorBrush_SetColor(g_brush, &c);
     return (ID2D1Brush *)g_brush;
 }
@@ -265,6 +279,7 @@ static int any_overlay(const oc_model *m) {
 static void select_channel(uint64_t cid) {
     if (!g_client || !cid) return;
     close_overlays();
+    g_has_sel = 0;                       /* drop any transcript text selection */
     g_sel = cid;
     g_scroll = 0;
     if (!already_backfilled(cid)) {
@@ -373,17 +388,29 @@ static int groups_with(const oc_msg *prev, const oc_msg *cur) {
     return dt <= 5u * 60u * 1000u;                     /* within 5 minutes */
 }
 
-/* A message's rendered height for a given content width (creates + returns the
- * body layout so the draw pass can reuse it). */
-static float msg_height(const oc_msg *msg, float content_w, int grouped,
-                        IDWriteTextLayout **out_body) {
-    const char *body = msg->deleted ? "(message deleted)"
-                     : (msg->body && msg->body[0]) ? msg->body : " ";
+/* The literal text of a message body (tombstone / empty handled). */
+static const char *body_text(const oc_msg *msg) {
+    return msg->deleted ? "(message deleted)"
+         : (msg->body && msg->body[0]) ? msg->body : " ";
+}
+
+/* A DirectWrite layout for a message body wrapped to `cw`; *wlen (optional) gets
+ * the UTF-16 length — the unit HitTest positions are expressed in. */
+static IDWriteTextLayout *body_layout(const oc_msg *msg, float cw, UINT32 *wlen) {
     WCHAR w[2048];
-    int n = to_w(body, w, 2048);
+    int n = to_w(body_text(msg), w, 2048);
+    if (n < 1) n = 1;
+    if (wlen) *wlen = (UINT32)n;
     IDWriteTextLayout *layout = NULL;
-    IDWriteFactory_CreateTextLayout(g_dwrite, w, (UINT32)(n > 0 ? n : 1), g_body,
-                                    content_w, 4000.0f, &layout);
+    IDWriteFactory_CreateTextLayout(g_dwrite, w, (UINT32)n, g_body, cw, 4000.0f, &layout);
+    return layout;
+}
+
+/* A message's rendered height for a given content width (creates + returns the
+ * body layout so the draw pass can reuse it; *wlen gets its UTF-16 length). */
+static float msg_height(const oc_msg *msg, float content_w, int grouped,
+                        IDWriteTextLayout **out_body, UINT32 *wlen) {
+    IDWriteTextLayout *layout = body_layout(msg, content_w, wlen);
     float body_h = 18.0f;
     if (layout) {
         DWRITE_TEXT_METRICS tm;
@@ -480,13 +507,14 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
     enum { CAP = 600 };
     static IDWriteTextLayout *layouts[CAP];
     static float heights[CAP];
+    static uint32_t wlens[CAP];
     static uint8_t grouped[CAP];
     if (n > CAP) { first = n - CAP; n = CAP; }
 
     float total = 0;
     for (size_t i = 0; i < n; i++) {
         grouped[i] = (uint8_t)(i > 0 && groups_with(&msgs[first + i - 1], &msgs[first + i]));
-        heights[i] = msg_height(&msgs[first + i], content_w, grouped[i], &layouts[i]);
+        heights[i] = msg_height(&msgs[first + i], content_w, grouped[i], &layouts[i], &wlens[i]);
         total += heights[i];
     }
 
@@ -495,16 +523,52 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
     if (g_scroll > g_scroll_max) g_scroll = g_scroll_max;
     if (g_scroll < 0) g_scroll = 0;
 
+    /* Resolve the selection into an ordered index range within this list. */
+    long sel_lo = -1, sel_hi = -1; uint32_t sel_lo_pos = 0, sel_hi_pos = 0;
+    if (capture && g_has_sel) {
+        long ai = -1, fi = -1;
+        for (size_t i = 0; i < n; i++) {
+            if (msgs[first + i].message_id == g_sel_a_mid) ai = (long)i;
+            if (msgs[first + i].message_id == g_sel_f_mid) fi = (long)i;
+        }
+        if (ai >= 0 && fi >= 0) {
+            if (ai < fi || (ai == fi && g_sel_a_pos <= g_sel_f_pos)) {
+                sel_lo = ai; sel_lo_pos = g_sel_a_pos; sel_hi = fi; sel_hi_pos = g_sel_f_pos;
+            } else {
+                sel_lo = fi; sel_lo_pos = g_sel_f_pos; sel_hi = ai; sel_hi_pos = g_sel_a_pos;
+            }
+        }
+    }
+
     float y = (reg.bottom - total) + g_scroll;     /* g_scroll 0 => newest pinned to bottom */
 
     ID2D1RenderTarget_PushAxisAlignedClip(rt, &reg, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     if (capture) g_n_msgrows = 0;
     for (size_t i = 0; i < n; i++) {
         if (y + heights[i] >= reg.top && y <= reg.bottom) {
+            float bx = x0 + AVA + 12, by = y + (grouped[i] ? 2.0f : 22.0f);
+            /* Selection highlight — drawn under the text so it stays readable. */
+            if (sel_lo >= 0 && (long)i >= sel_lo && (long)i <= sel_hi && layouts[i]) {
+                uint32_t s = ((long)i == sel_lo) ? sel_lo_pos : 0;
+                uint32_t e = ((long)i == sel_hi) ? sel_hi_pos : wlens[i];
+                if (e > s) {
+                    DWRITE_HIT_TEST_METRICS hm[64]; UINT32 got = 0;
+                    if (SUCCEEDED(IDWriteTextLayout_HitTestTextRange(
+                            layouts[i], s, e - s, bx, by, hm, 64, &got)))
+                        for (UINT32 r = 0; r < got; r++) {
+                            D2D1_RECT_F hr = rf(hm[r].left, hm[r].top,
+                                                hm[r].left + hm[r].width, hm[r].top + hm[r].height);
+                            ID2D1RenderTarget_FillRectangle(rt, &hr, paint_alpha(OC_COL_ACCENT, 0.32f));
+                        }
+                }
+            }
             draw_message(rt, m, &msgs[first + i], layouts[i], x0, y, content_w, grouped[i]);
             if (capture && g_n_msgrows < (int)(sizeof g_msgrows / sizeof g_msgrows[0])) {
                 g_msgrows[g_n_msgrows].top = y;
                 g_msgrows[g_n_msgrows].bot = y + heights[i];
+                g_msgrows[g_n_msgrows].bx = bx;
+                g_msgrows[g_n_msgrows].by = by;
+                g_msgrows[g_n_msgrows].cw = content_w;
                 g_msgrows[g_n_msgrows].mid = msgs[first + i].message_id;
                 g_n_msgrows++;
             }
@@ -542,7 +606,7 @@ static void draw_thread(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
         float pad = 20.0f, x0 = body.left + pad;
         float cw = (body.right - pad) - (x0 + AVA + 12); if (cw < 80) cw = 80;
         IDWriteTextLayout *pl = NULL;
-        float ph = msg_height(parent, cw, 0, &pl);
+        float ph = msg_height(parent, cw, 0, &pl, NULL);
         if (ph > 120) ph = 120;
         D2D1_RECT_F pband = rf(body.left, top, body.right, top + ph);
         ID2D1RenderTarget_PushAxisAlignedClip(rt, &pband, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
@@ -1128,21 +1192,23 @@ static int in_rect(D2D1_RECT_F r, int x, int y) {
     return (float)x >= r.left && (float)x <= r.right && (float)y >= r.top && (float)y <= r.bottom;
 }
 
-static void on_click(HWND hwnd, int x, int y) {
+/* Returns 1 if the click hit a control/row (so the caller won't start a text
+ * selection), 0 if it fell through to the transcript. */
+static int on_click(HWND hwnd, int x, int y) {
     /* Workspace avatar -> app menu. */
     if (in_rect(g_rail_btn, x, y)) {
         POINT pt = { x, y }; ClientToScreen(hwnd, &pt);
         show_app_menu(hwnd, pt.x, pt.y);
-        return;
+        return 1;
     }
     /* Members toggle. */
     if (in_rect(g_members_btn, x, y)) {
         g_show_members = !g_show_members;
         layout_composer(hwnd);
-        return;
+        return 1;
     }
     /* Composer attach (+) button. */
-    if (in_rect(g_attach_btn, x, y)) { upload_file(hwnd); return; }
+    if (in_rect(g_attach_btn, x, y)) { upload_file(hwnd); return 1; }
     /* Overlay row clicks (main area only). */
     {
         const oc_model *mm = model();
@@ -1151,7 +1217,7 @@ static void on_click(HWND hwnd, int x, int y) {
                 for (int i = 0; i < g_n_searchrows; i++)
                     if ((float)y >= g_searchrows[i].top && (float)y < g_searchrows[i].bot) {
                         select_channel(g_searchrows[i].cid);   /* also closes the overlay */
-                        return;
+                        return 1;
                     }
             if (mm->weblist_open)
                 for (int i = 0; i < g_n_webrows; i++)
@@ -1159,7 +1225,7 @@ static void on_click(HWND hwnd, int x, int y) {
                         if (MessageBoxW(hwnd, L"Delete this webhook?", L"Confirm",
                                         MB_YESNO | MB_ICONWARNING) == IDYES)
                             oc_client_delete_webhook(g_client, g_webrows[i].wid);
-                        return;
+                        return 1;
                     }
         }
     }
@@ -1168,16 +1234,117 @@ static void on_click(HWND hwnd, int x, int y) {
         for (int i = 0; i < g_n_rows; i++)
             if ((float)y >= g_rows[i].top && (float)y < g_rows[i].bot) {
                 if (g_rows[i].cid != g_sel) select_channel(g_rows[i].cid);
-                return;
+                return 1;
             }
-        return;
+        return 1;
     }
     /* Members-pane rows: click opens a DM. */
     for (int i = 0; i < g_n_memrows; i++)
         if ((float)y >= g_memrows[i].top && (float)y < g_memrows[i].bot) {
             oc_client_open_dm(g_client, g_memrows[i].uid);
-            return;
+            return 1;
         }
+    return 0;
+}
+
+/* ---- transcript text selection (DirectWrite hit-testing) ----------------- */
+
+static int msgrow_at(int y) {
+    for (int i = 0; i < g_n_msgrows; i++)
+        if ((float)y >= g_msgrows[i].top && (float)y < g_msgrows[i].bot) return i;
+    return -1;
+}
+
+static int msgrow_clamp(int y) {
+    int r = msgrow_at(y);
+    if (r >= 0 || g_n_msgrows == 0) return r;
+    return (float)y < g_msgrows[0].top ? 0 : g_n_msgrows - 1;
+}
+
+/* Map a client point over row `ri` to a UTF-16 offset in that message's body. */
+static uint32_t hit_pos(int ri, int x, int y) {
+    const oc_model *m = model();
+    if (!m || !g_sel) return 0;
+    const oc_channel *c = oc_model_channel((oc_model *)m, g_sel);
+    const oc_msg *msg = find_msg(c, g_msgrows[ri].mid);
+    if (!msg) return 0;
+    IDWriteTextLayout *l = body_layout(msg, g_msgrows[ri].cw, NULL);
+    if (!l) return 0;
+    float lx = (float)x - g_msgrows[ri].bx, ly = (float)y - g_msgrows[ri].by;
+    if (lx < 0) lx = 0;
+    if (ly < 0) ly = 0;
+    BOOL trailing = FALSE, inside = FALSE; DWRITE_HIT_TEST_METRICS htm;
+    IDWriteTextLayout_HitTestPoint(l, lx, ly, &trailing, &inside, &htm);
+    uint32_t pos = htm.textPosition + (trailing ? 1u : 0u);
+    IDWriteTextLayout_Release(l);
+    return pos;
+}
+
+static int selection_start(HWND hwnd, int x, int y) {
+    int r = msgrow_at(y);
+    if (r < 0) { g_has_sel = 0; return 0; }
+    uint32_t pos = hit_pos(r, x, y);
+    g_sel_a_mid = g_sel_f_mid = g_msgrows[r].mid;
+    g_sel_a_pos = g_sel_f_pos = pos;
+    g_has_sel = 1; g_selecting = 1;
+    SetCapture(hwnd); SetFocus(hwnd);      /* take focus so Ctrl+C reaches us */
+    return 1;
+}
+
+static void selection_update(int x, int y) {
+    if (!g_selecting) return;
+    int r = msgrow_clamp(y);
+    if (r < 0) return;
+    g_sel_f_mid = g_msgrows[r].mid;
+    g_sel_f_pos = hit_pos(r, x, y);
+}
+
+static void selection_end(void) {
+    if (!g_selecting) return;
+    g_selecting = 0;
+    ReleaseCapture();
+    if (g_sel_a_mid == g_sel_f_mid && g_sel_a_pos == g_sel_f_pos) g_has_sel = 0;
+}
+
+/* Copy the current transcript selection to the clipboard as Unicode text. */
+static void copy_selection(HWND hwnd) {
+    const oc_model *m = model();
+    if (!m || !g_has_sel || !g_sel) return;
+    const oc_channel *c = oc_model_channel((oc_model *)m, g_sel);
+    if (!c) return;
+    long ai = -1, fi = -1;
+    for (size_t k = 0; k < c->n_msgs; k++) {
+        if (c->msgs[k].message_id == g_sel_a_mid) ai = (long)k;
+        if (c->msgs[k].message_id == g_sel_f_mid) fi = (long)k;
+    }
+    if (ai < 0 || fi < 0) return;
+    long lo, hi; uint32_t lop, hip;
+    if (ai < fi || (ai == fi && g_sel_a_pos <= g_sel_f_pos)) { lo = ai; lop = g_sel_a_pos; hi = fi; hip = g_sel_f_pos; }
+    else                                                     { lo = fi; lop = g_sel_f_pos; hi = ai; hip = g_sel_a_pos; }
+
+    static WCHAR buf[16384]; size_t bl = 0;
+    for (long gi = lo; gi <= hi && bl < 16350; gi++) {
+        WCHAR w[2048];
+        int wn = to_w(body_text(&c->msgs[gi]), w, 2048);
+        if (wn < 0) wn = 0;
+        uint32_t s = (gi == lo) ? lop : 0;
+        uint32_t e = (gi == hi) ? hip : (uint32_t)wn;
+        if (e > (uint32_t)wn) e = (uint32_t)wn;
+        if (s > e) s = e;
+        if (gi > lo && bl + 2 < 16350) { buf[bl++] = L'\r'; buf[bl++] = L'\n'; }
+        for (uint32_t k = s; k < e && bl < 16350; k++) buf[bl++] = w[k];
+    }
+    buf[bl] = 0;
+    if (bl == 0 || !OpenClipboard(hwnd)) return;
+    EmptyClipboard();
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (bl + 1) * sizeof(WCHAR));
+    if (h) {
+        WCHAR *p = (WCHAR *)GlobalLock(h);
+        memcpy(p, buf, (bl + 1) * sizeof(WCHAR));
+        GlobalUnlock(h);
+        SetClipboardData(CF_UNICODETEXT, h);
+    }
+    CloseClipboard();
 }
 
 static void on_rclick(HWND hwnd, int x, int y) {
@@ -1604,9 +1771,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         return 0;
-    case WM_SETFOCUS:
-        if (g_re) SetFocus(g_re);
-        return 0;
     case WM_MOUSEWHEEL:
         g_scroll += (float)GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 48.0f;
         if (g_scroll < 0) g_scroll = 0;
@@ -1614,8 +1778,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     case WM_LBUTTONDOWN:
-        on_click(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        if (!on_click(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp)) && !any_overlay(model()))
+            selection_start(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
         InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    case WM_MOUSEMOVE:
+        if (g_selecting) {
+            selection_update(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (g_selecting) { selection_end(); InvalidateRect(hwnd, NULL, FALSE); }
+        return 0;
+    case WM_KEYDOWN:
+        if (wp == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)) { copy_selection(hwnd); return 0; }
+        if (wp == VK_ESCAPE && g_has_sel) { g_has_sel = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         return 0;
     case WM_RBUTTONDOWN:
         on_rclick(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
