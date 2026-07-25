@@ -20,6 +20,7 @@
 #include <windows.h>
 #include <windowsx.h>         /* GET_X_LPARAM / GET_Y_LPARAM */
 #include <shellapi.h>         /* CommandLineToArgvW */
+#include <richedit.h>         /* MSFTEDIT_CLASS composer */
 #include <d2d1.h>
 #include <dwrite.h>
 
@@ -80,10 +81,10 @@ static uint8_t  g_post_auth;        /* one-shot post-auth roster/channel refresh
 static uint64_t g_backfilled[512];  /* channels we've already asked history for */
 static int      g_n_backfilled;
 
-/* Composer input (UTF-8) + a pending UTF-16 high surrogate from WM_CHAR. */
-static char     g_input[4000];
-static size_t   g_inlen;
-static WCHAR    g_hi_surrogate;
+/* The composer is a native RichEdit child (IME / selection / clipboard / undo);
+ * we subclass it to make Enter send and Shift+Enter insert a newline. */
+static HWND     g_re;
+static WNDPROC  g_re_oldproc;
 static DWORD    g_last_typing;
 
 /* Sidebar row hit-boxes, captured during paint for WM_LBUTTONDOWN. */
@@ -299,9 +300,21 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
 
 /* ---- transcript ---------------------------------------------------------- */
 
+/* Two messages group (Slack-style) when same author, close in time, and neither
+ * is a tombstone — the follow-up drops its avatar + name/time header. */
+static int groups_with(const oc_msg *prev, const oc_msg *cur) {
+    if (!prev) return 0;
+    if (prev->author_id != cur->author_id) return 0;
+    if (prev->deleted || cur->deleted) return 0;
+    uint64_t dt = cur->server_time > prev->server_time
+                ? cur->server_time - prev->server_time : 0;
+    return dt <= 5u * 60u * 1000u;                     /* within 5 minutes */
+}
+
 /* A message's rendered height for a given content width (creates + returns the
  * body layout so the draw pass can reuse it). */
-static float msg_height(const oc_msg *msg, float content_w, IDWriteTextLayout **out_body) {
+static float msg_height(const oc_msg *msg, float content_w, int grouped,
+                        IDWriteTextLayout **out_body) {
     const char *body = msg->deleted ? "(message deleted)"
                      : (msg->body && msg->body[0]) ? msg->body : " ";
     WCHAR w[2048];
@@ -320,35 +333,40 @@ static float msg_height(const oc_msg *msg, float content_w, IDWriteTextLayout **
     if (msg->n_reactions) extra++;
     extra += msg->n_attach;
     if (msg->reply_count) extra++;
-    return 22.0f + body_h + (float)extra * LINE_H + 12.0f;   /* header + body + meta + pad */
+    float head = grouped ? 2.0f : 22.0f;               /* header line only when ungrouped */
+    float pad  = grouped ? 4.0f : 12.0f;
+    return head + body_h + (float)extra * LINE_H + pad;
 }
 
 static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg *msg,
-                         IDWriteTextLayout *body, float x0, float y, float content_w) {
+                         IDWriteTextLayout *body, float x0, float y, float content_w,
+                         int grouped) {
     static const uint32_t AVPAL[6] =
         { 0x2563EB, 0x3BA55D, 0xD9A441, 0xB05CCB, 0xE0725A, 0x2FA5A5 };
     float ax = x0, tx = x0 + AVA + 12;
 
-    /* Avatar: colored circle with the author's initial. */
-    const char *nm = msg->author_name[0] ? msg->author_name : oc_model_user_name(m, msg->author_id);
-    if (!nm || !nm[0]) nm = "user";
-    D2D1_ELLIPSE e = { { ax + AVA / 2, y + AVA / 2 }, AVA / 2, AVA / 2 };
-    ID2D1RenderTarget_FillEllipse(rt, &e, paint_with(AVPAL[msg->author_id % 6]));
-    char ini[2] = { (char)(nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]), 0 };
-    draw_text(rt, ini, g_ava, rf(ax, y, ax + AVA, y + AVA), 0xFFFFFF);
+    if (!grouped) {
+        /* Avatar: colored circle with the author's initial. */
+        const char *nm = msg->author_name[0] ? msg->author_name : oc_model_user_name(m, msg->author_id);
+        if (!nm || !nm[0]) nm = "user";
+        D2D1_ELLIPSE e = { { ax + AVA / 2, y + AVA / 2 }, AVA / 2, AVA / 2 };
+        ID2D1RenderTarget_FillEllipse(rt, &e, paint_with(AVPAL[msg->author_id % 6]));
+        char ini[2] = { (char)(nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]), 0 };
+        draw_text(rt, ini, g_ava, rf(ax, y, ax + AVA, y + AVA), 0xFFFFFF);
 
-    /* Author + timestamp on the header line. */
-    D2D1_RECT_F hl = rf(tx, y, x0 + content_w + AVA + 12, y + 20);
-    draw_text(rt, nm, g_name, hl, OC_COL_TEXT);
-    if (msg->server_time) {
-        time_t t = (time_t)(msg->server_time / 1000);
-        struct tm tv; char when[16] = "";
-        if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%H:%M", &tv);
-        draw_text(rt, when, g_time, hl, OC_COL_FAINT);
+        /* Author + timestamp on the header line. */
+        D2D1_RECT_F hl = rf(tx, y, x0 + content_w + AVA + 12, y + 20);
+        draw_text(rt, nm, g_name, hl, OC_COL_TEXT);
+        if (msg->server_time) {
+            time_t t = (time_t)(msg->server_time / 1000);
+            struct tm tv; char when[16] = "";
+            if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%H:%M", &tv);
+            draw_text(rt, when, g_time, hl, OC_COL_FAINT);
+        }
     }
 
     /* Body. */
-    float by = y + 22;
+    float by = y + (grouped ? 2.0f : 22.0f);
     if (body) {
         D2D1_POINT_2F org = { tx, by };
         uint32_t bcol = msg->deleted ? OC_COL_FAINT : OC_COL_TEXT;
@@ -418,9 +436,11 @@ static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
     static float heights[CAP];
     if (n > CAP) { first = n - CAP; n = CAP; }
 
+    static uint8_t grouped[CAP];
     float total = 0;
     for (size_t i = 0; i < n; i++) {
-        heights[i] = msg_height(&c->msgs[first + i], content_w, &layouts[i]);
+        grouped[i] = (uint8_t)(i > 0 && groups_with(&c->msgs[first + i - 1], &c->msgs[first + i]));
+        heights[i] = msg_height(&c->msgs[first + i], content_w, grouped[i], &layouts[i]);
         total += heights[i];
     }
 
@@ -434,7 +454,7 @@ static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
     ID2D1RenderTarget_PushAxisAlignedClip(rt, &reg, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     for (size_t i = 0; i < n; i++) {
         if (y + heights[i] >= reg.top && y <= reg.bottom)
-            draw_message(rt, m, &c->msgs[first + i], layouts[i], x0, y, content_w);
+            draw_message(rt, m, &c->msgs[first + i], layouts[i], x0, y, content_w, grouped[i]);
         y += heights[i];
         if (layouts[i]) IDWriteTextLayout_Release(layouts[i]);
         layouts[i] = NULL;
@@ -459,24 +479,11 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
     IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 
-static void draw_composer(ID2D1RenderTarget *rt, const oc_model *m, float x0, float w, float h) {
+/* The composer region behind the RichEdit child (which paints its own box). */
+static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     float top = h - COMPOSER_H;
     fill(rt, rf(x0, top, x0 + w, h), OC_COL_BASE);
-    D2D1_RECT_F box = rf(x0 + 16, top + 12, x0 + w - 16, h - 14);
-    fill_round(rt, box, 8.0f, OC_COL_SIDEBAR);
-    D2D1_RECT_F inner = rf(box.left + 14, box.top, box.right - 14, box.bottom);
-
-    int can = m->authed && g_sel;
-    if (g_inlen == 0) {
-        draw_text(rt, can ? "Message… (Enter to send)" : "Connect to a channel to chat",
-                  g_ui, inner, OC_COL_FAINT);
-    } else {
-        /* Text + a simple blinking block caret. */
-        char shown[4008];
-        int caret = (GetTickCount() / 500) % 2;
-        snprintf(shown, sizeof shown, "%s%s", g_input, caret ? "\xE2\x96\x8F" : "");
-        draw_text(rt, shown, g_ui, inner, OC_COL_TEXT);
-    }
+    fill(rt, rf(x0, top, x0 + w, top + 1), OC_COL_BORDER);   /* hairline divider */
 }
 
 /* ---- paint --------------------------------------------------------------- */
@@ -500,7 +507,7 @@ static void paint(HWND hwnd) {
         draw_sidebar(rt, m, H);
         draw_header(rt, m, main_x, main_w);
         draw_transcript(rt, m, rf(main_x, HEADER_H, W, H - COMPOSER_H));
-        draw_composer(rt, m, main_x, main_w, H);
+        draw_composer(rt, main_x, main_w, H);
     }
 
     HRESULT hr = ID2D1RenderTarget_EndDraw(rt, NULL, NULL);
@@ -511,55 +518,72 @@ static void paint(HWND hwnd) {
     }
 }
 
-/* ---- input --------------------------------------------------------------- */
+/* ---- composer (native RichEdit) ------------------------------------------ */
 
-static void input_append_cp(unsigned cp) {
-    char b[4]; int n;
-    if (cp < 0x80)            { b[0] = (char)cp; n = 1; }
-    else if (cp < 0x800)      { b[0] = (char)(0xC0 | (cp >> 6)); b[1] = (char)(0x80 | (cp & 0x3F)); n = 2; }
-    else if (cp < 0x10000)    { b[0] = (char)(0xE0 | (cp >> 12)); b[1] = (char)(0x80 | ((cp >> 6) & 0x3F)); b[2] = (char)(0x80 | (cp & 0x3F)); n = 3; }
-    else                      { b[0] = (char)(0xF0 | (cp >> 18)); b[1] = (char)(0x80 | ((cp >> 12) & 0x3F)); b[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); b[3] = (char)(0x80 | (cp & 0x3F)); n = 4; }
-    if (g_inlen + (size_t)n >= sizeof g_input) return;
-    memcpy(g_input + g_inlen, b, (size_t)n);
-    g_inlen += (size_t)n;
-    g_input[g_inlen] = 0;
-}
-
-static void input_backspace(void) {
-    if (g_inlen == 0) return;
-    size_t i = g_inlen - 1;
-    while (i > 0 && (g_input[i] & 0xC0) == 0x80) i--;   /* back over UTF-8 continuation bytes */
-    g_inlen = i;
-    g_input[g_inlen] = 0;
-}
-
-static void input_send(void) {
-    if (!g_client || !g_sel || g_inlen == 0) return;
-    oc_client_send(g_client, g_sel, g_input);
-    g_inlen = 0; g_input[0] = 0; g_scroll = 0;
-}
-
-static void on_char(WPARAM wp) {
-    WCHAR u = (WCHAR)wp;
-    unsigned cp;
-    if (u >= 0xD800 && u <= 0xDBFF) { g_hi_surrogate = u; return; }   /* await low surrogate */
-    if (u >= 0xDC00 && u <= 0xDFFF && g_hi_surrogate) {
-        cp = 0x10000u + (((unsigned)g_hi_surrogate - 0xD800u) << 10) + ((unsigned)u - 0xDC00u);
-        g_hi_surrogate = 0;
-    } else { cp = u; g_hi_surrogate = 0; }
-
-    if (cp == 0x0D)      input_send();          /* Enter */
-    else if (cp == 0x08) input_backspace();     /* Backspace */
-    else if (cp == 0x1B) { g_inlen = 0; g_input[0] = 0; }  /* Esc clears */
-    else if (cp >= 0x20) {
-        input_append_cp(cp);
-        DWORD now = GetTickCount();
-        if (g_client && g_sel && now - g_last_typing > 2000) {
-            oc_client_typing(g_client, g_sel);
-            g_last_typing = now;
-        }
+/* Send the composer's text to the selected channel and clear it. */
+static void composer_send(void) {
+    if (!g_re || !g_client || !g_sel) return;
+    int wlen = GetWindowTextLengthW(g_re);
+    if (wlen <= 0) return;
+    WCHAR *w = (WCHAR *)malloc((size_t)(wlen + 1) * sizeof(WCHAR));
+    if (!w) return;
+    GetWindowTextW(g_re, w, wlen + 1);
+    int blen = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    char *b = (char *)malloc((size_t)(blen > 0 ? blen : 1));
+    if (b) {
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, b, blen, NULL, NULL);
+        /* Drop a trailing newline the RichEdit may append; skip empty/whitespace. */
+        int nonspace = 0;
+        for (char *p = b; *p; p++) if (*p != '\r' && *p != '\n' && *p != ' ' && *p != '\t') { nonspace = 1; break; }
+        if (nonspace) { oc_client_send(g_client, g_sel, b); g_scroll = 0; }
+        free(b);
     }
+    free(w);
+    SetWindowTextW(g_re, L"");
 }
+
+/* Subclass proc: Enter sends, Shift+Enter inserts a newline. */
+static LRESULT CALLBACK re_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if ((msg == WM_KEYDOWN || msg == WM_CHAR) && wp == VK_RETURN
+        && !(GetKeyState(VK_SHIFT) & 0x8000)) {
+        if (msg == WM_KEYDOWN) composer_send();
+        return 0;                                   /* eat both so no newline/bell */
+    }
+    return CallWindowProcW(g_re_oldproc, hwnd, msg, wp, lp);
+}
+
+/* Position the RichEdit over the composer region for the current window size. */
+static void layout_composer(HWND hwnd) {
+    if (!g_re) return;
+    RECT rc; GetClientRect(hwnd, &rc);
+    float main_x = RAIL_W + SIDEBAR_W;
+    int x = (int)main_x + 16, r = rc.right - 16;
+    int top = rc.bottom - (int)COMPOSER_H + 12, bot = rc.bottom - 14;
+    MoveWindow(g_re, x, top, r - x, bot - top, TRUE);
+}
+
+static void composer_create(HWND parent) {
+    g_re = CreateWindowExW(0, MSFTEDIT_CLASS, L"",
+        WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL,
+        0, 0, 10, 10, parent, NULL, GetModuleHandleW(NULL), NULL);
+    if (!g_re) return;
+    SendMessageW(g_re, EM_SETBKGNDCOLOR, 0, (LPARAM)RGB(0x1A, 0x1D, 0x21));   /* OC_COL_SIDEBAR */
+    CHARFORMAT2W cf; ZeroMemory(&cf, sizeof cf);
+    cf.cbSize = sizeof cf;
+    cf.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE;
+    cf.crTextColor = RGB(0xE8, 0xEA, 0xED);        /* OC_COL_TEXT */
+    cf.yHeight = 15 * 20;                           /* 15pt in twips */
+    lstrcpynW(cf.szFaceName, L"Segoe UI", LF_FACESIZE);
+    SendMessageW(g_re, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
+    SendMessageW(g_re, EM_SETEVENTMASK, 0, ENM_CHANGE);
+    /* A little inner margin so text isn't jammed against the edge. */
+    SendMessageW(g_re, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(12, 12));
+    g_re_oldproc = (WNDPROC)SetWindowLongPtrW(g_re, GWLP_WNDPROC, (LONG_PTR)re_proc);
+    layout_composer(parent);
+    SetFocus(g_re);
+}
+
+/* ---- input --------------------------------------------------------------- */
 
 static void on_click(int x, int y) {
     if (x < RAIL_W || x > RAIL_W + SIDEBAR_W) return;
@@ -599,6 +623,7 @@ static void connect_start(const char *ws, const char *cred) {
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
+        composer_create(hwnd);
         SetTimer(hwnd, TIMER_TICK, 30, NULL);
         return 0;
     case WM_TIMER:
@@ -621,6 +646,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_SIZE:
         d2d_resize(hwnd);
+        layout_composer(hwnd);
+        return 0;
+    case WM_COMMAND:
+        if (g_re && (HWND)lp == g_re && HIWORD(wp) == EN_CHANGE) {
+            DWORD now = GetTickCount();
+            if (g_client && g_sel && now - g_last_typing > 2000) {
+                oc_client_typing(g_client, g_sel);
+                g_last_typing = now;
+            }
+        }
+        return 0;
+    case WM_SETFOCUS:
+        if (g_re) SetFocus(g_re);
         return 0;
     case WM_MOUSEWHEEL:
         g_scroll += (float)GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 48.0f;
@@ -630,10 +668,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_LBUTTONDOWN:
         on_click(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
-        InvalidateRect(hwnd, NULL, FALSE);
-        return 0;
-    case WM_CHAR:
-        on_char(wp);
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     case WM_ERASEBKGND:
@@ -661,6 +695,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     }
     if (argv) LocalFree(argv);
 
+    LoadLibraryW(L"Msftedit.dll");        /* registers MSFTEDIT_CLASS (RICHEDIT50W) */
     d2d_init();
     connect_start(ws, cred);
 
@@ -673,8 +708,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     if (!RegisterClassW(&wc)) return 1;
 
     HWND hwnd = CreateWindowExW(0, L"OpenChimeWin", L"OpenChime",
-                    WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1080, 720,
-                    NULL, NULL, inst, NULL);
+                    WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
+                    1080, 720, NULL, NULL, inst, NULL);
     if (!hwnd) return 1;
     ShowWindow(hwnd, show);
     UpdateWindow(hwnd);
