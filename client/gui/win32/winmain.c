@@ -109,6 +109,7 @@ static int g_n_memrows;
 
 static int      g_show_members = 1;     /* members pane visible */
 static D2D1_RECT_F g_members_btn;       /* header toggle hit-box */
+static D2D1_RECT_F g_rail_btn;          /* workspace-avatar hit-box (app menu) */
 static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
 
 /* ---- small helpers ------------------------------------------------------- */
@@ -274,8 +275,10 @@ static void ensure_selection(const oc_model *m) {
 
 static void draw_rail(ID2D1RenderTarget *rt, float h) {
     fill(rt, rf(0, 0, RAIL_W, h), OC_COL_RAIL);
-    /* Workspace avatar: an accent rounded square with the host's initial. */
+    /* Workspace avatar: an accent rounded square with the host's initial.
+     * Clicking it opens the app menu. */
     D2D1_RECT_F av = rf(14, 16, RAIL_W - 14, 16 + (RAIL_W - 28));
+    g_rail_btn = av;
     fill_round(rt, av, 12.0f, OC_COL_ACCENT);
     char init[2] = { (char)(g_host[0] ? (g_host[0] >= 'a' && g_host[0] <= 'z'
                         ? g_host[0] - 32 : g_host[0]) : 'O'), 0 };
@@ -807,10 +810,22 @@ static void show_member_menu(HWND hwnd, const oc_model *m, uint64_t uid, int sx,
 
 /* ---- input --------------------------------------------------------------- */
 
+static void show_app_menu(HWND hwnd, int sx, int sy);
+static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, int sx, int sy);
+
+static int in_rect(D2D1_RECT_F r, int x, int y) {
+    return (float)x >= r.left && (float)x <= r.right && (float)y >= r.top && (float)y <= r.bottom;
+}
+
 static void on_click(HWND hwnd, int x, int y) {
+    /* Workspace avatar -> app menu. */
+    if (in_rect(g_rail_btn, x, y)) {
+        POINT pt = { x, y }; ClientToScreen(hwnd, &pt);
+        show_app_menu(hwnd, pt.x, pt.y);
+        return;
+    }
     /* Members toggle. */
-    if ((float)x >= g_members_btn.left && (float)x <= g_members_btn.right &&
-        (float)y >= g_members_btn.top && (float)y <= g_members_btn.bottom) {
+    if (in_rect(g_members_btn, x, y)) {
         g_show_members = !g_show_members;
         layout_composer(hwnd);
         return;
@@ -837,6 +852,15 @@ static void on_rclick(HWND hwnd, int x, int y) {
     if (!m) return;
     POINT pt = { x, y };
     ClientToScreen(hwnd, &pt);
+    /* Sidebar channel rows -> channel menu. */
+    if (x >= RAIL_W && x <= RAIL_W + SIDEBAR_W) {
+        for (int i = 0; i < g_n_rows; i++)
+            if ((float)y >= g_rows[i].top && (float)y < g_rows[i].bot) {
+                show_channel_menu(hwnd, m, g_rows[i].cid, pt.x, pt.y);
+                return;
+            }
+        return;
+    }
     /* Members pane first (it overlaps the right edge). */
     for (int i = 0; i < g_n_memrows; i++)
         if ((float)y >= g_memrows[i].top && (float)y < g_memrows[i].bot) {
@@ -969,6 +993,143 @@ static int login_dialog(HINSTANCE inst, char *ws, size_t wscap, char *cred, size
     return ws[0] != 0;
 }
 
+/* ---- generic single-field modal prompt ----------------------------------- */
+
+static HWND g_pr_edit;
+static int  g_pr_result, g_pr_done;
+
+static LRESULT CALLBACK prompt_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK)     { g_pr_result = 1; g_pr_done = 1; return 0; }
+        if (LOWORD(wp) == IDCANCEL) { g_pr_result = 0; g_pr_done = 1; return 0; }
+        return 0;
+    case WM_CLOSE: g_pr_result = 0; g_pr_done = 1; return 0;
+    default: return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+}
+
+/* Modal one-line input. Returns 1 with `out` filled on OK, 0 on Cancel. */
+static int text_prompt(HWND owner, const char *title, const char *label,
+                       const char *initial, char *out, size_t cap, int password) {
+    HINSTANCE inst = GetModuleHandleW(NULL);
+    static int registered;
+    if (!registered) {
+        WNDCLASSW wc; memset(&wc, 0, sizeof wc);
+        wc.lpfnWndProc = prompt_proc; wc.hInstance = inst;
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"OcPrompt";
+        RegisterClassW(&wc); registered = 1;
+    }
+    WCHAR wtitle[128], wlabel[128], winit[512];
+    to_w(title, wtitle, 128); to_w(label, wlabel, 128); to_w(initial ? initial : "", winit, 512);
+
+    int W = 380, H = 176;
+    RECT orc; GetWindowRect(owner, &orc);
+    int sx = orc.left + ((orc.right - orc.left) - W) / 2;
+    int sy = orc.top + ((orc.bottom - orc.top) - H) / 2;
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"OcPrompt", wtitle,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, sx, sy, W, H, owner, NULL, inst, NULL);
+    if (!dlg) return 0;
+
+    HWND s = CreateWindowExW(0, L"STATIC", wlabel, WS_CHILD | WS_VISIBLE,
+        18, 16, 344, 20, dlg, NULL, inst, NULL);
+    lg_set_font(s);
+    g_pr_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", winit,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | (password ? ES_PASSWORD : 0),
+        18, 42, 344, 24, dlg, NULL, inst, NULL);
+    lg_set_font(g_pr_edit);
+    HWND ok = CreateWindowExW(0, L"BUTTON", L"OK",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 178, 92, 84, 28,
+        dlg, (HMENU)IDOK, inst, NULL);
+    HWND cancel = CreateWindowExW(0, L"BUTTON", L"Cancel",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP, 272, 92, 84, 28, dlg, (HMENU)IDCANCEL, inst, NULL);
+    lg_set_font(ok); lg_set_font(cancel);
+
+    EnableWindow(owner, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    SetFocus(g_pr_edit);
+    SendMessageW(g_pr_edit, EM_SETSEL, 0, -1);
+    g_pr_result = -1; g_pr_done = 0;
+
+    MSG m;
+    while (!g_pr_done && GetMessageW(&m, NULL, 0, 0) > 0)
+        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+
+    if (g_pr_result == 1) {
+        WCHAR w[512]; GetWindowTextW(g_pr_edit, w, 512);
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL);
+    }
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+    if (IsWindow(dlg)) DestroyWindow(dlg);
+    return g_pr_result == 1;
+}
+
+/* ---- app menu (workspace avatar) + channel menu -------------------------- */
+
+static int g_logging_out;
+
+static void show_app_menu(HWND hwnd, int sx, int sy) {
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, 1, L"New channel…");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    HMENU status = CreatePopupMenu();
+    AppendMenuW(status, MF_STRING, 10, L"Online");
+    AppendMenuW(status, MF_STRING, 11, L"Away");
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)status, L"Set status");
+    AppendMenuW(menu, MF_STRING, 2, L"Reconnect now");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, 3, L"Log out");
+    int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTBUTTON, sx, sy, 0, hwnd, NULL);
+    DestroyMenu(menu);
+    switch (cmd) {
+    case 1: {
+        char name[80];
+        if (text_prompt(hwnd, "New channel", "Channel name:", "", name, sizeof name, 0) && name[0])
+            oc_client_create_channel(g_client, name);
+        break;
+    }
+    case 2:  oc_client_reconnect(g_client); break;
+    case 3:  oc_client_logout(g_client, OC_LOGOUT_THIS); g_logging_out = 1; break;
+    case 10: oc_client_set_presence(g_client, OC_PRESENCE_ONLINE); break;
+    case 11: oc_client_set_presence(g_client, OC_PRESENCE_AWAY); break;
+    default: break;
+    }
+}
+
+static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, int sx, int sy) {
+    const oc_channel *c = oc_model_channel((oc_model *)m, cid);
+    if (!c) return;
+    HMENU menu = CreatePopupMenu();
+    if (!c->joined && c->is_public) {
+        AppendMenuW(menu, MF_STRING, 1, L"Join channel");
+    } else {
+        AppendMenuW(menu, MF_STRING, 2, L"Mark as read");
+        HMENU notify = CreatePopupMenu();
+        AppendMenuW(notify, MF_STRING | (c->notify_level == OC_NOTIFY_ALL ? MF_CHECKED : 0),      20, L"All messages");
+        AppendMenuW(notify, MF_STRING | (c->notify_level == OC_NOTIFY_MENTIONS ? MF_CHECKED : 0), 21, L"Mentions only");
+        AppendMenuW(notify, MF_STRING | (c->notify_level == OC_NOTIFY_NONE ? MF_CHECKED : 0),     22, L"Nothing");
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)notify, L"Notifications");
+        if (c->kind != OC_CHANNEL_KIND_DM) {
+            AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(menu, MF_STRING, 3, L"Leave channel");
+        }
+    }
+    int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, sx, sy, 0, hwnd, NULL);
+    DestroyMenu(menu);
+    switch (cmd) {
+    case 1:  oc_client_join_channel(g_client, cid); break;
+    case 2:  oc_client_mark_read(g_client, cid); break;
+    case 3:  oc_client_leave_channel(g_client, cid); break;
+    case 20: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_ALL); break;
+    case 21: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_MENTIONS); break;
+    case 22: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_NONE); break;
+    default: break;
+    }
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
@@ -983,6 +1144,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 oc_client_list_users(g_client);
                 oc_client_list_channels(g_client);
                 g_post_auth = 1;
+            }
+            if (g_logging_out && !m->connected) {     /* logout frame sent + server dropped us */
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                g_logging_out = 0;
             }
             InvalidateRect(hwnd, NULL, FALSE);
         }
