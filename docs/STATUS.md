@@ -124,6 +124,51 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 
 ---
 
+## Windows GUI feature parity (ARCH-82)
+
+The **TUI is the reference client** — "every engine feature on the wire is
+reachable from the TUI" ([CLIENT.md](./CLIENT.md) §3). This table tracks the
+native Win32 GUI (`client/gui/win32/`) toward the same bar. The contract is the
+`oc_client_*` facade (`client/core/client.h`): each row is a feature the GUI must
+surface as an **affordance** (button / menu / dialog — never a slash command).
+Legend: ✅ done · 🔨 in progress · ⛔ not started.
+
+| Feature | Core intent(s) | GUI | Notes |
+|---|---|---|---|
+| Connect + local login | `start_secure` | ✅ | Native login dialog (workspace/user/pass); dev args skip it. |
+| Channel list + switch | `list_channels`, `backfill`, `mark_read` | ✅ | Sidebar, click to switch, auto-select first. |
+| Live messages + history | model render | ✅ | Grouped transcript, avatars, times, wheel scroll. |
+| Send | `send` | ✅ | RichEdit composer, Enter sends / Shift+Enter newline. |
+| Edit / delete | `edit`, `delete` | ✅ | Message right-click; inline edit in the composer. |
+| Reactions (toggle) | `react` | ✅ | Right-click → React (emoji submenu). |
+| Who reacted | `list_reactions` / `close_reactions` | ⛔ | Needs a reactor overlay. |
+| Typing indicator | `typing` | 🔨 | GUI *sends* typing; does not yet *render* others typing. |
+| Direct messages | `open_dm` | ✅ | Left-click a member. |
+| Roster + presence | `list_users`, `toggle_roster` | ✅ | Members pane with presence dots + roles. |
+| Set own presence | `set_presence` | ⛔ | Online/away toggle. |
+| Admin: roles / remove | `set_role`, `remove_user` | ✅ | Member right-click, role-gated. |
+| Admin: invite | `invite_user` | ⛔ | Mint a tenant invite token. |
+| Threads | `open_thread`, `reply`, `close_thread` | ⛔ | Needs a thread pane. |
+| Search | `search`, `close_search` | ⛔ | Global search bar + results. |
+| Channel management | `create_channel`, `join_channel`, `leave_channel` | ⛔ | Create/join/leave affordances. |
+| Attachments: download | `download` | ✅ | Right-click → Download (native Save dialog). |
+| Attachments: upload | `upload` | ⛔ | Attach button + drag-drop. |
+| Notifications / DND | `set_notify_pref`, `set_dnd`, `list_notify_prefs` | ⛔ | Channel + workspace prefs dialog. |
+| Self-service profile | `set_display_name`, `change_password` | ⛔ | Profile dialog. |
+| Webhooks | `webhooks`, `create_webhook`, `delete_webhook` | ⛔ | Channel webhook overlay. |
+| Storage / audit (admin) | `storage_status`, `audit_query` | ⛔ | Owner/admin overlays. |
+| Settings sync | `set_client_type`, `set_setting`, `list_settings` | ⛔ | The `gui` bucket (separate from `tui`). |
+| Read receipts (seen-by) | model `readers[]` | ⛔ | Render "seen by …" under the last read message. |
+| Logout | `logout` | ⛔ | Menu action; quit on drop. |
+| Manual reconnect | `reconnect` | ⛔ | "Reconnect now" while backing off. |
+| Multiple workspaces | one `oc_client` per ws + switcher | ⛔ | Rail workspace switcher (TUI holds N clients). |
+
+**Polish backlog** (deferred to the end per the agreed sequencing): transcript
+density/date-separators/real-scrollbar/hover, sidebar+header spacing, a
+theme-matched login dialog, and a global colors/fonts/spacing pass.
+
+---
+
 ## Server-robustness backlog
 
 Correctness/hardening gaps **in already-shipped features** — the work to make
