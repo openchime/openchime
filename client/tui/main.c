@@ -512,38 +512,62 @@ static void layout(int W, int *ch_w, int *mem_w, int *msg_x, int *msg_w) {
 
 /* A bordered, titled panel; content is drawn inside by the caller. An active
  * panel gets a bright (cyan) border, matching the lazygit/k9s idiom. */
-/* The ? help overlay: a centered popup listing keys + commands. */
+/* The ? help overlay: a clean, centered two-column key reference. A row with a
+ * NULL key is a section heading; a row with both fields NULL is a blank spacer.
+ * The box is sized to its content so nothing is ever truncated. */
 static void draw_help(int W, int H) {
-    static const char *L[] = {
-        "type + Enter   send a message",
-        "Tab / Esc      move between panes and the composer",
-        "Ctrl+K  or  :      action menu — everything (new channel, search, prefs, …)",
-        "Ctrl+F             search messages",
-        "Ctrl+W             switch workspace   ·   Ctrl+R reconnect   ·   Ctrl+Q quit",
-        "",
-        "Channels pane:",
-        "  ↑/↓ select   ·   Enter open   ·   n new channel",
-        "Members pane:",
-        "  ↑/↓ select   ·   Enter actions (message / role / remove)   ·   n new DM",
-        "Messages pane:",
-        "  ↑/↓ select   ·   Enter actions (thread / react / edit / delete / reactions)",
-        "  accelerators: t thread  ·  r react  ·  e edit  ·  x delete  ·  w reactions",
-        "",
-        "Everything is menus and dialogs — no commands to type. Open the action",
-        "menu (Ctrl+K) to reach notifications, DND, invites, webhooks, storage, audit,",
-        "profile, display name, presence, upload, workspaces, and logout.",
+    typedef struct { const char *key, *desc; } hrow;
+    static const hrow R[] = {
+        { NULL, "Basics" },
+        { "Enter",      "send the typed message" },
+        { "Tab · Esc",  "move between the panes and the composer" },
+        { "Ctrl+K · :", "action menu — reach everything" },
+        { "Ctrl+F",     "search messages" },
+        { "Ctrl+W",     "switch workspace" },
+        { "Ctrl+R",     "reconnect" },
+        { "Ctrl+Q",     "quit" },
+        { NULL, NULL },
+        { NULL, "Lists   ↑/↓ move · Enter opens or acts" },
+        { "Channels",   "n  new channel" },
+        { "Members",    "n  new DM · Enter for message / role / remove" },
+        { "Messages",   "t thread · r react · e edit · x delete" },
+        { NULL, NULL },
+        { NULL, "Everything else" },
+        { "Ctrl+K",     "notifications, invites, webhooks, profile, upload, logout…" },
     };
-    int n = (int)(sizeof L / sizeof L[0]);
-    int bw = 64; if (bw > W - 4) bw = W - 4; if (bw < 24) bw = 24;
-    int bh = n + 2; if (bh > H - 2) bh = H - 2; if (bh < 4) bh = 4;
-    int x = (W - bw) / 2, y = (H - bh) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
-    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, TB_DEFAULT);   /* clear */
-    tk_panel(x, y, bw, bh, "Help  ·  ? or Esc to close", 1);
-    for (int i = 0; i < n && i + 1 < bh - 1; i++) {
-        size_t len = strlen(L[i]);
-        uintattr_t col = (len && L[i][len - 1] == ':') ? (TB_YELLOW | TB_BOLD)
-                       : (L[i][0] == '/' || L[i][0] == ' ') ? TB_DEFAULT : (TB_WHITE | TB_BOLD);
-        tk_text(x + 2, y + 1 + i, x + bw - 1, L[i], col, TB_DEFAULT);
+    int n = (int)(sizeof R / sizeof R[0]);
+    const tk_theme *th = tk_theme_active();
+
+    /* Column widths, and the widest rendered row — size the box to fit them. */
+    int keyw = 0, bodyw = 0;
+    for (int i = 0; i < n; i++)
+        if (R[i].key) { int kw = tk_str_width(R[i].key); if (kw > keyw) keyw = kw; }
+    for (int i = 0; i < n; i++) {
+        int w = R[i].key ? keyw + 2 + tk_str_width(R[i].desc)
+              : R[i].desc ? tk_str_width(R[i].desc) : 0;
+        if (w > bodyw) bodyw = w;
+    }
+
+    int bw = bodyw + 6;                       /* 2-col padding inside the border */
+    if (bw > W - 4) bw = W - 4;
+    int bh = n + 4;                           /* border + a blank pad top & bottom */
+    if (bh > H - 2) bh = H - 2;
+    int x = (W - bw) / 2, y = (H - bh) / 2;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+
+    for (int j = 0; j < bh; j++) tk_fill(y + j, x, x + bw, th->bg);
+    tk_panel(x, y, bw, bh, "Help  ·  Esc closes", 1);
+
+    int cx = x + 3, xmax = x + bw - 3, ry = y + 2;
+    for (int i = 0; i < n && ry < y + bh - 1; i++, ry++) {
+        if (!R[i].key && !R[i].desc) continue;                 /* spacer */
+        if (!R[i].key) {                                       /* section heading */
+            tk_text(cx, ry, xmax, R[i].desc, th->accent2 | TB_BOLD, th->bg);
+        } else {
+            tk_text(cx, ry, xmax, R[i].key, th->accent | TB_BOLD, th->bg);
+            tk_text(cx + keyw + 2, ry, xmax, R[i].desc, th->fg, th->bg);
+        }
     }
 }
 
