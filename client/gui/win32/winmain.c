@@ -143,6 +143,11 @@ static D2D1_RECT_F g_attach_btn;        /* composer attach (+) hit-box */
 static D2D1_RECT_F g_send_btn;          /* composer send-button hit-box */
 static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
 
+/* Test/automation hook: when OPENCHIME_TEST_DIR is set, the app polls <dir>/cmd
+ * each tick and can render itself to a file — a display-independent way to drive
+ * and screenshot the client from WSL/CI without screen-scraping. */
+static char g_test_dir[512];
+
 /* ---- small helpers ------------------------------------------------------- */
 
 static D2D1_COLOR_F col(uint32_t rgb) {
@@ -1071,18 +1076,11 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
 
 /* ---- paint --------------------------------------------------------------- */
 
-static void paint(HWND hwnd) {
-    d2d_ensure_rt(hwnd);
-    if (!g_rt || !g_brush) return;
-    ID2D1RenderTarget *rt = (ID2D1RenderTarget *)g_rt;
-    RECT rc; GetClientRect(hwnd, &rc);
-    float W = (float)(rc.right - rc.left), H = (float)(rc.bottom - rc.top);
-    const oc_model *m = model();
-
-    ID2D1RenderTarget_BeginDraw(rt);
+/* Draw the whole UI into `rt` (window RT for painting, or a DC RT for test
+ * shots). Caller wraps this in BeginDraw/EndDraw; brushes must belong to `rt`. */
+static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, float H) {
     D2D1_COLOR_F base = col(OC_COL_BASE);
     ID2D1RenderTarget_Clear(rt, &base);
-
     if (m) {
         ensure_selection(m);
         float main_x = RAIL_W + SIDEBAR_W;
@@ -1096,6 +1094,18 @@ static void paint(HWND hwnd) {
         if (members > 0) draw_members(rt, m, W, H);
         else g_n_memrows = 0;
     }
+}
+
+static void paint(HWND hwnd) {
+    d2d_ensure_rt(hwnd);
+    if (!g_rt || !g_brush) return;
+    ID2D1RenderTarget *rt = (ID2D1RenderTarget *)g_rt;
+    RECT rc; GetClientRect(hwnd, &rc);
+    float W = (float)(rc.right - rc.left), H = (float)(rc.bottom - rc.top);
+    const oc_model *m = model();
+
+    ID2D1RenderTarget_BeginDraw(rt);
+    render_scene(rt, m, W, H);
 
     HRESULT hr = ID2D1RenderTarget_EndDraw(rt, NULL, NULL);
     if (hr == (HRESULT)D2DERR_RECREATE_TARGET) {
@@ -1970,6 +1980,146 @@ static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, int sx
     }
 }
 
+/* ---- test/automation hook ------------------------------------------------ */
+
+/* Write a top-down 32bpp BGRA buffer as a BMP (no encoder deps; PIL reads it). */
+static int write_bmp(const char *path, int w, int h, const void *bgra) {
+    uint32_t rowbytes = (uint32_t)w * 4, imgsize = rowbytes * (uint32_t)h, off = 54;
+    uint8_t fh[14] = {0}, ih[40] = {0};
+    uint32_t total = off + imgsize; int32_t bw = w, bh = -h; uint16_t planes = 1, bpp = 32;
+    fh[0] = 'B'; fh[1] = 'M';
+    memcpy(fh + 2, &total, 4); memcpy(fh + 10, &off, 4);
+    uint32_t hsz = 40; memcpy(ih, &hsz, 4);
+    memcpy(ih + 4, &bw, 4); memcpy(ih + 8, &bh, 4);
+    memcpy(ih + 12, &planes, 2); memcpy(ih + 14, &bpp, 2);
+    memcpy(ih + 20, &imgsize, 4);
+    FILE *f = fopen(path, "wb"); if (!f) return 0;
+    fwrite(fh, 1, 14, f); fwrite(ih, 1, 40, f); fwrite(bgra, 1, imgsize, f);
+    fclose(f); return 1;
+}
+
+/* Render the whole UI to a BMP via a Direct2D DC render target — independent of
+ * the display being awake/unlocked (the whole point). The RichEdit composer is a
+ * native child and won't appear; everything D2D-drawn does. */
+static int test_shot(HWND hwnd, const char *path) {
+    RECT rc; GetClientRect(hwnd, &rc);
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) return 0;
+    HDC screen = GetDC(NULL), mem = CreateCompatibleDC(screen);
+    BITMAPINFO bi; ZeroMemory(&bi, sizeof bi);
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;   /* top-down */
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    void *bits = NULL;
+    HBITMAP dib = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    int ok = 0;
+    if (dib && bits) {
+        HGDIOBJ old = SelectObject(mem, dib);
+        D2D1_RENDER_TARGET_PROPERTIES props; ZeroMemory(&props, sizeof props);
+        props.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
+        props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_IGNORE;
+        props.dpiX = 96; props.dpiY = 96;
+        props.usage = D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE;
+        ID2D1DCRenderTarget *dcrt = NULL;
+        if (SUCCEEDED(ID2D1Factory_CreateDCRenderTarget(g_factory, &props, &dcrt)) && dcrt) {
+            RECT bind = { 0, 0, w, h };
+            ID2D1DCRenderTarget_BindDC(dcrt, mem, &bind);
+            ID2D1RenderTarget *rt = (ID2D1RenderTarget *)dcrt;
+            /* Brushes are RT-specific; swap the globals to ones on this RT. */
+            ID2D1SolidColorBrush *sb = g_brush, *sb2 = g_brush2;
+            D2D1_COLOR_F white = col(0xFFFFFF), faint = col(OC_COL_FAINT);
+            g_brush = NULL; g_brush2 = NULL;
+            ID2D1RenderTarget_CreateSolidColorBrush(rt, &white, NULL, &g_brush);
+            ID2D1RenderTarget_CreateSolidColorBrush(rt, &faint, NULL, &g_brush2);
+            ID2D1RenderTarget_BeginDraw(rt);
+            render_scene(rt, model(), (float)w, (float)h);
+            if (SUCCEEDED(ID2D1RenderTarget_EndDraw(rt, NULL, NULL))) ok = 1;
+            if (g_brush) ID2D1SolidColorBrush_Release(g_brush);
+            if (g_brush2) ID2D1SolidColorBrush_Release(g_brush2);
+            g_brush = sb; g_brush2 = sb2;
+            ID2D1DCRenderTarget_Release(dcrt);
+            GdiFlush();
+            if (ok) ok = write_bmp(path, w, h, bits);
+        }
+        SelectObject(mem, old);
+    }
+    if (dib) DeleteObject(dib);
+    DeleteDC(mem); ReleaseDC(NULL, screen);
+    return ok;
+}
+
+static void test_ack(const char *msg) {
+    char p[600]; snprintf(p, sizeof p, "%s\\ack", g_test_dir);
+    FILE *f = fopen(p, "wb"); if (f) { fputs(msg ? msg : "ok", f); fclose(f); }
+}
+
+static void test_dump(const char *path) {
+    const oc_model *m = model();
+    FILE *f = fopen(path, "wb"); if (!f) return;
+    if (!m) { fprintf(f, "no model\n"); fclose(f); return; }
+    fprintf(f, "authed=%d connected=%d sel=%llu members=%d\n",
+            m->authed, m->connected, (unsigned long long)g_sel, g_show_members);
+    fprintf(f, "channels=%zu\n", m->n_channels);
+    for (size_t i = 0; i < m->n_channels; i++) {
+        const oc_channel *c = &m->channels[i];
+        if (!c->name || !c->name[0]) continue;
+        fprintf(f, "  ch %llu \"%s\" unread=%d msgs=%zu%s\n",
+                (unsigned long long)c->channel_id, c->name, c->unread,
+                c->n_msgs, c->channel_id == g_sel ? " *" : "");
+    }
+    fclose(f);
+}
+
+/* Poll <OPENCHIME_TEST_DIR>/cmd for one command per tick; write <dir>/ack. */
+static void test_poll(HWND hwnd) {
+    if (!g_test_dir[0]) return;
+    char cmdpath[600]; snprintf(cmdpath, sizeof cmdpath, "%s\\cmd", g_test_dir);
+    FILE *f = fopen(cmdpath, "rb"); if (!f) return;
+    char buf[1024]; size_t n = fread(buf, 1, sizeof buf - 1, f); buf[n] = 0; fclose(f);
+    remove(cmdpath);
+    while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
+
+    char verb[32] = {0}; size_t i = 0;
+    while (buf[i] && buf[i] != ' ' && i < sizeof verb - 1) { verb[i] = buf[i]; i++; }
+    verb[i] = 0;
+    const char *arg = (buf[i] == ' ') ? buf + i + 1 : "";
+    const oc_model *m = model();
+
+    if (!strcmp(verb, "shot")) {
+        test_ack(test_shot(hwnd, arg) ? "ok" : "err");
+    } else if (!strcmp(verb, "send")) {
+        if (g_re) { WCHAR w[1024]; to_w(arg, w, 1024); SetWindowTextW(g_re, w); composer_send(); }
+        test_ack("ok");
+    } else if (!strcmp(verb, "channel")) {
+        if (m) for (size_t k = 0; k < m->n_channels; k++)
+            if (m->channels[k].name && !strcmp(m->channels[k].name, arg)) {
+                select_channel(m->channels[k].channel_id); break;
+            }
+        test_ack("ok");
+    } else if (!strcmp(verb, "click")) {
+        int x = 0, y = 0; sscanf(arg, "%d %d", &x, &y); on_click(hwnd, x, y); test_ack("ok");
+    } else if (!strcmp(verb, "rclick")) {
+        int x = 0, y = 0; sscanf(arg, "%d %d", &x, &y); on_rclick(hwnd, x, y); test_ack("ok");
+    } else if (!strcmp(verb, "members")) {
+        g_show_members = !g_show_members; layout_composer(hwnd); test_ack("ok");
+    } else if (!strcmp(verb, "scroll")) {
+        int d = 0; sscanf(arg, "%d", &d); g_scroll += (float)d;
+        if (g_scroll < 0) g_scroll = 0;
+        if (g_scroll > g_scroll_max) g_scroll = g_scroll_max;
+        test_ack("ok");
+    } else if (!strcmp(verb, "size")) {
+        int w = 0, h = 0; sscanf(arg, "%d %d", &w, &h);
+        if (w > 0 && h > 0) SetWindowPos(hwnd, NULL, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
+        test_ack("ok");
+    } else if (!strcmp(verb, "dump")) {
+        test_dump(arg); test_ack("ok");
+    } else {
+        test_ack("unknown");
+    }
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
@@ -2025,6 +2175,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             InvalidateRect(hwnd, NULL, FALSE);
         }
+        if (wp == TIMER_TICK) test_poll(hwnd);   /* automation channel (no-op unless enabled) */
         return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps; BeginPaint(hwnd, &ps);
@@ -2108,6 +2259,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     (void)prev; (void)cmdline;
+
+    /* Automation hook: OPENCHIME_TEST_DIR enables the file command channel. */
+    { const char *td = getenv("OPENCHIME_TEST_DIR");
+      if (td && td[0]) snprintf(g_test_dir, sizeof g_test_dir, "%s", td); }
 
     /* Credential resolution, uniform with the TUI:
      *   1. Dev quick-launch `openchime.exe <workspace> <user:pass>` — connect directly.
