@@ -55,6 +55,7 @@ static const GUID OC_IID_IDWriteFactory =
 #define AVA         36.0f     /* transcript avatar diameter */
 #define LINE_H      19.0f     /* an extra (reaction/attach/thread) line */
 #define MEMBERS_W   220.0f    /* the (toggleable) right-hand members pane */
+#define BODY_DIP    15.0f     /* message + composer text size (shared, so they match) */
 
 /* Common reactions offered by the message context menu. */
 static const char *REACT_EMO[6] = {
@@ -73,6 +74,7 @@ static ID2D1Factory          *g_factory;
 static IDWriteFactory        *g_dwrite;
 static ID2D1HwndRenderTarget *g_rt;
 static ID2D1SolidColorBrush  *g_brush;      /* one reusable brush; recolored per draw */
+static ID2D1SolidColorBrush  *g_brush2;     /* faint brush for inline "(edited)" effect */
 
 static IDWriteTextFormat *g_hdr;    /* channel title */
 static IDWriteTextFormat *g_name;   /* message author (semibold) */
@@ -237,7 +239,7 @@ static void d2d_init(void) {
     g_hdr   = mk_fmt(UI, 17.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
     g_name  = mk_fmt(UI, 15.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
     g_time  = mk_fmt(UI, 12.0f, DWRITE_FONT_WEIGHT_NORMAL,    DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
-    g_body  = mk_fmt(UI, 15.0f, DWRITE_FONT_WEIGHT_NORMAL,    DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_NEAR,   1);
+    g_body  = mk_fmt(UI, BODY_DIP, DWRITE_FONT_WEIGHT_NORMAL,  DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_NEAR,   1);
     g_ui    = mk_fmt(UI, 14.5f, DWRITE_FONT_WEIGHT_NORMAL,    DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
     g_ui_b  = mk_fmt(UI, 14.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
     g_small = mk_fmt(UI, 12.5f, DWRITE_FONT_WEIGHT_NORMAL,    DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
@@ -260,6 +262,8 @@ static void d2d_ensure_rt(HWND hwnd) {
     if (SUCCEEDED(ID2D1Factory_CreateHwndRenderTarget(g_factory, &rtp, &hp, &g_rt))) {
         D2D1_COLOR_F white = col(0xFFFFFF);
         ID2D1RenderTarget_CreateSolidColorBrush((ID2D1RenderTarget *)g_rt, &white, NULL, &g_brush);
+        D2D1_COLOR_F faint = col(OC_COL_FAINT);
+        ID2D1RenderTarget_CreateSolidColorBrush((ID2D1RenderTarget *)g_rt, &faint, NULL, &g_brush2);
     }
 }
 
@@ -432,11 +436,32 @@ static IDWriteTextLayout *body_layout(const oc_msg *msg, float cw, UINT32 *wlen)
     WCHAR w[2048];
     int n = to_w(body_text(msg), w, 2048);
     if (n < 1) n = 1;
-    if (wlen) *wlen = (UINT32)n;
+    if (wlen) *wlen = (UINT32)n;             /* selection/copy span the body only */
+
+    /* Append a faint inline "(edited)" so it flows after the last word instead of
+     * colliding with a header line that grouped messages don't have. */
+    UINT32 edit_at = (UINT32)n, edit_len = 0;
+    if (msg->edited && !msg->deleted) {
+        const WCHAR *suf = L"  (edited)";
+        int sl = lstrlenW(suf);
+        if (n + sl < 2048) { memcpy(w + n, suf, (size_t)sl * sizeof(WCHAR)); n += sl; edit_len = (UINT32)sl; }
+    }
     IDWriteTextLayout *layout = NULL;
     IDWriteFactory_CreateTextLayout(g_dwrite, w, (UINT32)n, g_body, cw, 4000.0f, &layout);
+    if (layout && edit_len && g_brush2) {
+        DWRITE_TEXT_RANGE tr = { edit_at, edit_len };
+        IDWriteTextLayout_SetDrawingEffect(layout, (IUnknown *)g_brush2, tr);
+    }
     return layout;
 }
+
+/* Vertical layout of a message block. An ungrouped message gets an even top
+ * margin (so the avatar/name isn't jammed against the block top) matching the
+ * bottom pad; grouped continuations stay tight. */
+#define MSG_TOP(g)   ((g) ? 4.0f  : 12.0f)   /* margin above avatar/name */
+#define MSG_NAME(g)  ((g) ? 0.0f  : 20.0f)   /* header (name/time) line height */
+#define MSG_BOT(g)   ((g) ? 6.0f  : 12.0f)   /* margin below the block */
+#define MSG_BODY_DY(g) (MSG_TOP(g) + MSG_NAME(g))   /* block top -> body top */
 
 /* A message's rendered height for a given content width (creates + returns the
  * body layout so the draw pass can reuse it; *wlen gets its UTF-16 length). */
@@ -454,9 +479,7 @@ static float msg_height(const oc_msg *msg, float content_w, int grouped,
     if (msg->n_reactions) extra++;
     extra += msg->n_attach;
     if (msg->reply_count) extra++;
-    float head = grouped ? 3.0f : 24.0f;               /* header line only when ungrouped */
-    float pad  = grouped ? 7.0f : 16.0f;               /* inter-message breathing room */
-    return head + body_h + (float)extra * LINE_H + pad;
+    return MSG_BODY_DY(grouped) + body_h + (float)extra * LINE_H + MSG_BOT(grouped);
 }
 
 static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg *msg,
@@ -467,16 +490,17 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
     float ax = x0, tx = x0 + AVA + 12;
 
     if (!grouped) {
+        float ty = y + MSG_TOP(grouped);        /* content sits below the top margin */
         /* Avatar: colored circle with the author's initial. */
         const char *nm = msg->author_name[0] ? msg->author_name : oc_model_user_name(m, msg->author_id);
         if (!nm || !nm[0]) nm = "user";
-        D2D1_ELLIPSE e = { { ax + AVA / 2, y + AVA / 2 }, AVA / 2, AVA / 2 };
+        D2D1_ELLIPSE e = { { ax + AVA / 2, ty + AVA / 2 }, AVA / 2, AVA / 2 };
         ID2D1RenderTarget_FillEllipse(rt, &e, paint_with(AVPAL[msg->author_id % 6]));
         char ini[2] = { (char)(nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]), 0 };
-        draw_text(rt, ini, g_ava, rf(ax, y, ax + AVA, y + AVA), 0xFFFFFF);
+        draw_text(rt, ini, g_ava, rf(ax, ty, ax + AVA, ty + AVA), 0xFFFFFF);
 
         /* Author + timestamp on the header line. */
-        D2D1_RECT_F hl = rf(tx, y, x0 + content_w + AVA + 12, y + 20);
+        D2D1_RECT_F hl = rf(tx, ty, x0 + content_w + AVA + 12, ty + 20);
         draw_text(rt, nm, g_name, hl, OC_COL_TEXT);
         if (msg->server_time) {
             time_t t = (time_t)(msg->server_time / 1000);
@@ -487,7 +511,7 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
     }
 
     /* Body. */
-    float by = y + (grouped ? 3.0f : 24.0f);
+    float by = y + MSG_BODY_DY(grouped);
     if (body) {
         D2D1_POINT_2F org = { tx, by };
         uint32_t bcol = msg->deleted ? OC_COL_FAINT : OC_COL_TEXT;
@@ -497,8 +521,7 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
         if (SUCCEEDED(IDWriteTextLayout_GetMetrics(body, &tm))) by += tm.height;
         else by += 18;
     }
-    if (msg->edited && !msg->deleted)
-        draw_text(rt, " (edited)", g_time, rf(tx, y, x0 + content_w + AVA + 12, y + 20), OC_COL_FAINT);
+    /* "(edited)" is drawn inline by body_layout (faint, after the last word). */
 
     /* Meta lines: reactions, attachments, thread. */
     if (msg->n_reactions) {
@@ -642,7 +665,7 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
             y += SEP_H;
         }
         if (y + heights[i] >= reg.top && y <= reg.bottom) {
-            float bx = x0 + AVA + 12, by = y + (grouped[i] ? 3.0f : 24.0f);
+            float bx = x0 + AVA + 12, by = y + MSG_BODY_DY(grouped[i]);
             /* Hover highlight behind the whole row (main transcript only). */
             if (capture && !g_selecting && g_hover_mid == msgs[first + i].message_id)
                 fill(rt, rf(reg.left, y, reg.right, y + heights[i]), OC_COL_HOVER);
@@ -1077,6 +1100,7 @@ static void paint(HWND hwnd) {
     HRESULT hr = ID2D1RenderTarget_EndDraw(rt, NULL, NULL);
     if (hr == (HRESULT)D2DERR_RECREATE_TARGET) {
         if (g_brush) { ID2D1SolidColorBrush_Release(g_brush); g_brush = NULL; }
+        if (g_brush2) { ID2D1SolidColorBrush_Release(g_brush2); g_brush2 = NULL; }
         ID2D1HwndRenderTarget_Release(g_rt);
         g_rt = NULL;
     }
@@ -1173,7 +1197,8 @@ static void composer_create(HWND parent) {
     cf.cbSize = sizeof cf;
     cf.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE;
     cf.crTextColor = OCRGB(OC_COL_TEXT);
-    cf.yHeight = 15 * 20;                           /* 15pt in twips */
+    /* Match g_body exactly: DIP -> twips is x15 (72/96 pt-per-DIP, 20 twips/pt). */
+    cf.yHeight = (LONG)(BODY_DIP * 15.0f);
     lstrcpynW(cf.szFaceName, L"Segoe UI", LF_FACESIZE);
     SendMessageW(g_re, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
     SendMessageW(g_re, EM_SETEVENTMASK, 0, ENM_CHANGE);
@@ -2143,6 +2168,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     if (g_small) IDWriteTextFormat_Release(g_small);
     if (g_ava)   IDWriteTextFormat_Release(g_ava);
     if (g_brush) ID2D1SolidColorBrush_Release(g_brush);
+    if (g_brush2) ID2D1SolidColorBrush_Release(g_brush2);
     if (g_rt)     ID2D1HwndRenderTarget_Release(g_rt);
     if (g_dwrite) IDWriteFactory_Release(g_dwrite);
     if (g_factory) ID2D1Factory_Release(g_factory);
