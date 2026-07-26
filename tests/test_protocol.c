@@ -132,6 +132,24 @@ static void test_auth_frames(void) {
         CHECK(memcmp(out.session_token.ptr, token, sizeof token) == 0);
     }
     {
+        /* WORKSPACE_INFO — deployment mode + user cap + (optional) name. */
+        oc_workspace_info in = { 2 /* managed */, 500, oc_slice_str("Acme HQ") };
+        ROUNDTRIP(oc_encode_workspace_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WORKSPACE_INFO, h, p);
+        oc_workspace_info out;
+        CHECK(oc_decode_workspace_info(&p, &out) == OC_OK);
+        CHECK(out.deployment_mode == 2 && out.max_users == 500);
+        CHECK(slice_eq_str(out.workspace_name, "Acme HQ"));
+    }
+    {
+        /* WORKSPACE_INFO — empty name (client derives from the host subdomain). */
+        oc_workspace_info in = { 0, 0, oc_slice_str("") };
+        ROUNDTRIP(oc_encode_workspace_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_WORKSPACE_INFO, h, p);
+        oc_workspace_info out;
+        CHECK(oc_decode_workspace_info(&p, &out) == OC_OK);
+        CHECK(out.deployment_mode == 0 && out.max_users == 0);
+        CHECK(slice_eq_str(out.workspace_name, ""));
+    }
+    {
         /* LOGOUT — scope + the session token to revoke. */
         uint8_t token[OC_SESSION_TOKEN_LEN];
         memset(token, 0x3C, sizeof token);

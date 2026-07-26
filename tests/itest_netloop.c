@@ -185,7 +185,11 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
     for (;;) {
         int r = read_frame_raw(c, hdr, payload);
         if (r != 0) return r;
-        if (hdr->msg_type != OC_MSG_PRESENCE_UPDATE && hdr->msg_type != OC_MSG_TYPING_UPDATE)
+        /* Also skip the post-AUTH_OK WORKSPACE_INFO push (like presence/typing,
+         * it arrives unsolicited and would desync a fixed expected-frame stream). */
+        if (hdr->msg_type != OC_MSG_PRESENCE_UPDATE &&
+            hdr->msg_type != OC_MSG_TYPING_UPDATE &&
+            hdr->msg_type != OC_MSG_WORKSPACE_INFO)
             return 0;
     }
 }
@@ -222,6 +226,10 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
     oc_auth_ok ok;
     if (oc_decode_auth_ok(&p, &ok) != OC_OK) return -1;
     *user_id = ok.user_id;
+    /* The daemon pushes WORKSPACE_INFO immediately after AUTH_OK (before the
+     * presence snapshot). Consume it here so both read_frame and the raw
+     * presence/typing test start from a clean stream. */
+    if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_WORKSPACE_INFO) return -1;
     return 0;
 }
 

@@ -259,6 +259,14 @@ oc_result oc_encode_auth_ok(oc_wbuf *w, uint16_t version, const oc_auth_ok *m) {
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_workspace_info(oc_wbuf *w, uint16_t version, const oc_workspace_info *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_WORKSPACE_INFO);
+    oc_w_u8(w, m->deployment_mode);
+    oc_w_u32(w, m->max_users);
+    oc_w_str(w, m->workspace_name);        /* u16 length + bytes */
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_logout(oc_wbuf *w, uint16_t version, const oc_logout *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_LOGOUT);
     oc_w_u8(w, m->scope);
@@ -1187,6 +1195,13 @@ oc_result oc_decode_auth_ok(oc_rbuf *p, oc_auth_ok *m) {
     m->role = oc_r_u8(p);
     m->session_expiry = oc_r_u64(p);
     m->session_token = oc_r_bytes(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_workspace_info(oc_rbuf *p, oc_workspace_info *m) {
+    m->deployment_mode = oc_r_u8(p);
+    m->max_users = oc_r_u32(p);
+    m->workspace_name = oc_r_str(p);
     return r_done(p);
 }
 

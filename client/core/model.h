@@ -96,6 +96,10 @@ typedef struct {
     bool     connected;
     bool     authed;
     uint64_t user_id;                 /* our own id, from AUTH_OK */
+    /* Workspace facts from WORKSPACE_INFO (infra config the daemon serves). */
+    uint8_t  deployment_mode;         /* 0 standalone · 1 federated · 2 managed */
+    uint32_t max_users;               /* 0 = unlimited */
+    char     workspace_name[64];      /* "" ⇒ frontend derives from the host subdomain */
     oc_channel      *channels;
     size_t           n_channels, cap_channels;
     oc_presence_row *presence;
@@ -222,6 +226,13 @@ void oc_model_note_presence(oc_model *m, uint64_t user_id, uint8_t status);
 /* Roster lookups: a user's display name ("" if unknown), or an id by name (0). */
 const char *oc_model_user_name(const oc_model *m, uint64_t user_id);
 uint64_t    oc_model_user_id(const oc_model *m, const char *name);
+
+/* Workspace facts (WORKSPACE_INFO). deployment mode name: "standalone" /
+ * "federated" / "managed". workspace_name is "" until a name is configured. */
+uint8_t     oc_model_deployment_mode(const oc_model *m);
+const char *oc_model_deployment_name(const oc_model *m);
+const char *oc_model_workspace_name(const oc_model *m);
+uint32_t    oc_model_max_users(const oc_model *m);
 
 /* User ids currently typing in `channel_id` (last seen within the timeout),
  * excluding `exclude` (typically self). Fills `out` up to `cap`; returns count. */

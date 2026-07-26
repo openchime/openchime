@@ -2060,6 +2060,8 @@ static void test_dump(const char *path) {
     if (!m) { fprintf(f, "no model\n"); fclose(f); return; }
     fprintf(f, "authed=%d connected=%d sel=%llu members=%d\n",
             m->authed, m->connected, (unsigned long long)g_sel, g_show_members);
+    fprintf(f, "workspace name=\"%s\" deployment=%s max_users=%u\n",
+            oc_model_workspace_name(m), oc_model_deployment_name(m), oc_model_max_users(m));
     fprintf(f, "channels=%zu\n", m->n_channels);
     for (size_t i = 0; i < m->n_channels; i++) {
         const oc_channel *c = &m->channels[i];

@@ -1453,6 +1453,19 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         send_bytes(ep, conns, fd, g_enc, w.len);
         if (!conns[fd]) break;   /* dropped on the AUTH_OK write */
 
+        /* Workspace facts from static config (deployment mode / user cap / name),
+         * so the client can render a branded header instead of a bare host. */
+        {
+            const oc_config *cfg = oc_config_get();
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_workspace_info wi = { (uint8_t)cfg->deployment_mode,
+                                     (uint32_t)(cfg->max_users > 0 ? cfg->max_users : 0),
+                                     oc_slice_str(cfg->workspace_name ? cfg->workspace_name : "") };
+            oc_encode_workspace_info(&w, OC_PROTOCOL_VERSION, &wi);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+            if (!conns[fd]) break;   /* dropped on the WORKSPACE_INFO write */
+        }
+
         /* Presence (REQ-120): send the new client a snapshot of who is currently
          * online/away, then — if this is the user's first connection — announce
          * them online to everyone. */

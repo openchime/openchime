@@ -164,6 +164,17 @@ const char *oc_model_user_name(const oc_model *m, uint64_t user_id) {
     return "";
 }
 
+uint8_t     oc_model_deployment_mode(const oc_model *m) { return m->deployment_mode; }
+uint32_t    oc_model_max_users(const oc_model *m)       { return m->max_users; }
+const char *oc_model_workspace_name(const oc_model *m)  { return m->workspace_name; }
+const char *oc_model_deployment_name(const oc_model *m) {
+    switch (m->deployment_mode) {
+        case 1:  return "federated";
+        case 2:  return "managed";
+        default: return "standalone";
+    }
+}
+
 uint64_t oc_model_user_id(const oc_model *m, const char *name) {
     if (!name) return 0;
     for (size_t i = 0; i < m->n_users; i++)
@@ -498,6 +509,11 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->last_error[0] = '\0';
         presence_set(m, e->user_id, OC_PRESENCE_ONLINE);   /* self: the server won't tell us */
         set_status(m, "authenticated");
+        break;
+    case OC_EV_WORKSPACE_INFO:
+        m->deployment_mode = e->status;
+        m->max_users = e->count;
+        snprintf(m->workspace_name, sizeof m->workspace_name, "%s", e->body ? e->body : "");
         break;
     case OC_EV_CHANNEL: {
         oc_channel *c = channel_ensure(m, e->channel_id);
