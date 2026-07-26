@@ -1976,6 +1976,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 oc_client_list_users(g_client);
                 oc_client_list_channels(g_client);
                 g_post_auth = 1;
+                layout_composer(hwnd);   /* members pane now shows — re-fit the composer */
             }
             if (g_logging_out && !m->connected) {     /* logout frame sent + server dropped us */
                 PostMessageW(hwnd, WM_CLOSE, 0, 0);
