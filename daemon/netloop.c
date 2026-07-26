@@ -6,6 +6,7 @@
 #include "audio.h"
 #include "auth.h"
 #include "blobstore.h"
+#include "config.h"
 #include "push.h"
 #include "xferpool.h"
 #include "storage.h"
@@ -2518,23 +2519,19 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     /* Attachment blob store (ARCH-70) + upload size cap (REQ-140). Bytes are
      * proxied through this loop to/from the store; keep it beside the daemon. */
     {
-        const char *bd = getenv("OPENCHIME_BLOB_DIR");
-        if (!bd || !*bd) bd = "/data/blobs";
+        const oc_config *cfg = oc_config_get();
+        const char *bd = cfg->blob_dir;
         g_blobs = oc_blobstore_open(bd);
         if (!g_blobs) { close(ep); close(lfd); free(conns); return -1; }
-        const char *cap = getenv("OPENCHIME_MAX_ATTACHMENT_SIZE");
-        g_max_attach = OC_MAX_ATTACHMENT_SIZE;
-        if (cap && *cap) { unsigned long long v = strtoull(cap, NULL, 10); if (v) g_max_attach = v; }
+        g_max_attach = cfg->max_attach_size;
 
-        /* Blob I/O runs here, off the net thread (ARCH-69). Two workers by
-         * default: each in-flight transfer holds a TLS session plus a chunk
-         * buffer, which has to stay modest against the 256MB lean profile
-         * (REQ-210). */
-        int nw = 2;
-        const char *nws = getenv("OPENCHIME_XFER_WORKERS");
-        if (nws && *nws) { int v = atoi(nws); if (v > 0 && v <= 16) nw = v; }
+        /* Blob I/O runs here, off the net thread (ARCH-69). Worker count from
+         * config (default 2, clamped 1..16): each in-flight transfer holds a TLS
+         * session plus a chunk buffer, which has to stay modest against the 256MB
+         * lean profile (REQ-210). */
+        int nw = cfg->xfer_workers;
         snprintf(g_blob_dir, sizeof g_blob_dir, "%s", bd);
-        oc_storage_policy_load(&g_spol);
+        g_spol = cfg->storage;
         oc_storage_sample(g_blob_dir, now_ms(), &g_sstat);
         fprintf(stderr, "openchimed: storage maintenance every %llus, "
                         "max attachment age %llud, eviction %s, %llu MB free\n",
@@ -2558,11 +2555,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
      * connection-exhaustion flood from one host while staying generous enough
      * for a large office behind one NAT; operators tune it. The global cap is
      * OC_NETLOOP_MAX_FD. */
-    int max_per_ip = 256;
-    {
-        const char *v = getenv("OPENCHIME_MAX_CONNS_PER_IP");
-        if (v) { int n = atoi(v); if (n >= 0) max_per_ip = n; }
-    }
+    int max_per_ip = oc_config_get()->max_conns_per_ip;
 
     struct epoll_event ev;
     memset(&ev, 0, sizeof ev);

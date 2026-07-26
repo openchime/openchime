@@ -23,6 +23,7 @@
 #include "client.h"
 #include "model.h"
 #include "netloop.h"
+#include "config.h"
 #include "dbwriter.h"
 #include "protocol.h"
 #include "tls.h"
@@ -202,6 +203,8 @@ struct sb_loop_arg {
 
 static void *sb_loop_thread(void *p) {
     struct sb_loop_arg *a = p;
+    char cfgerr[128];
+    oc_config_load(cfgerr, sizeof cfgerr);   /* load after the test's setenv() */
     oc_netloop_run(a->port, a->srv, a->dbw, &a->stop);
     return NULL;
 }

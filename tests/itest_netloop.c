@@ -6,6 +6,7 @@
 
 #include "netloop.h"
 #include "audio.h"
+#include "config.h"
 #include "dbwriter.h"
 #include "framebuf.h"
 #include "protocol.h"
@@ -67,6 +68,10 @@ static int mk_udp_client(void) {
 
 static void *loop_thread(void *p) {
     struct loop_arg *a = (struct loop_arg *)p;
+    /* The daemon loads config once in main() before serving; here the test is the
+     * startup owner, so load it after the test's setenv() and before the loop. */
+    char cfgerr[128];
+    oc_config_load(cfgerr, sizeof cfgerr);
     oc_netloop_run(a->port, a->srv, a->dbw, &a->stop);
     return NULL;
 }

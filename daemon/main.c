@@ -12,6 +12,7 @@
  */
 
 #include "audio.h"
+#include "config.h"
 #include "dbwriter.h"
 #include "enroll.h"
 #include "netloop.h"
@@ -32,16 +33,6 @@
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
-
-static const char *env_or(const char *name, const char *dflt) {
-    const char *v = getenv(name);
-    return v ? v : dflt;
-}
-
-static int env_port(const char *name, int dflt) {
-    const char *v = getenv(name);
-    return v ? atoi(v) : dflt;
-}
 
 /* Read a whole file into a malloc'd NUL-terminated buffer, or NULL. */
 static char *read_file(const char *path) {
@@ -69,16 +60,7 @@ static int write_file(const char *path, const char *data) {
     return 0;
 }
 
-/* The pinned central public key (AUTH.md §3.4): OC_OIDC_PUBKEY_FILE (a path) or
- * OC_OIDC_PUBKEY (inline PEM). Caller frees. */
-static char *load_oidc_pubkey(void) {
-    const char *path = getenv("OC_OIDC_PUBKEY_FILE");
-    if (path) return read_file(path);
-    const char *inl = getenv("OC_OIDC_PUBKEY");
-    return inl ? strdup(inl) : NULL;
-}
-
-/* Provision local accounts from OC_BOOTSTRAP_USERS="user:pass[:role],..."
+/* Provision local accounts from OPENCHIME_BOOTSTRAP_USERS="user:pass[:role],..."
  * (AUTH.md §2 — the owner bootstrap / air-gapped account setup). Idempotent:
  * re-running never clobbers an existing password. role ∈ owner|admin|member
  * (default member). Runs before the loop serves traffic, so registering through
@@ -220,23 +202,32 @@ int main(void) {
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN); /* a peer vanishing mid-write must not kill us */
 
-    const char *db_path   = env_or("OPENCHIME_DB_PATH", "/data/openchime.db");
-    const char *cert_path = env_or("OPENCHIME_TLS_CERT", "/data/cert.pem");
-    const char *key_path  = env_or("OPENCHIME_TLS_KEY",  "/data/key.pem");
-    int health_port = env_port("OPENCHIME_HEALTH_PORT", 8080);
-    int proto_port  = env_port("OPENCHIME_PROTO_PORT", 8443);
+    /* All daemon config is read once, here, into the process-global oc_config
+     * (config.c). Subsystems read it via oc_config_get(); nothing else touches
+     * the environment. A fatal misconfiguration aborts before we open anything. */
+    char cfgerr[256];
+    if (oc_config_load(cfgerr, sizeof cfgerr) != 0) {
+        fprintf(stderr, "openchimed: config error: %s\n", cfgerr);
+        return 1;
+    }
+    const oc_config *cfg = oc_config_get();
+    const char *db_path = cfg->db_path, *cert_path = cfg->tls_cert, *key_path = cfg->tls_key;
+    int health_port = cfg->health_port, proto_port = cfg->proto_port;
+    fprintf(stderr, "openchimed: deployment=%s workspace=\"%s\"\n",
+            oc_deploy_mode_name(cfg->deployment_mode),
+            cfg->workspace_name && cfg->workspace_name[0] ? cfg->workspace_name : "(unset)");
 
     /* DB-writer thread: opens the connection and applies migrations before we
      * serve any traffic (ARCH-27). Fatal if it can't. */
     oc_dbwriter *db = oc_dbwriter_start(db_path);
     if (!db) { fprintf(stderr, "openchimed: DB init failed\n"); return 1; }
 
-    /* Registered-user cap (CP-7, hosted plan CP-4): OPENCHIME_MAX_USERS; 0/unset =
-     * unlimited (self-hosted). Written into hosted-box config at provision time. */
-    oc_dbwriter_set_max_users(db, atoi(env_or("OPENCHIME_MAX_USERS", "0")));
+    /* Registered-user cap (CP-7, hosted plan CP-4): 0/unset = unlimited
+     * (self-hosted). Injected into managed-box config at provision time. */
+    oc_dbwriter_set_max_users(db, cfg->max_users);
 
     /* Optionally provision local accounts before serving (AUTH.md §2). */
-    bootstrap_users(db, getenv("OC_BOOTSTRAP_USERS"));
+    bootstrap_users(db, cfg->bootstrap_users);
 
     /* Federated enrollment (CP-8, AUTH.md §3.6). Gated on OC_ENROLL_URL — the
      * operator opting this box into the control plane. On first boot: generate a
@@ -245,7 +236,7 @@ int main(void) {
      * possession and activate. The daemon-generated audience feeds OIDC below. */
     char *enroll_privkey = NULL, *enroll_audience = NULL;
     int enroll_active = 0;
-    const char *enroll_url = getenv("OC_ENROLL_URL");
+    const char *enroll_url = cfg->enroll.url;
     if (enroll_url && *enroll_url) {
         if (!oc_dbwriter_load_enrollment(db, &enroll_privkey, &enroll_audience, &enroll_active)) {
             char pk[1024], aud[128], code[2048];
@@ -256,10 +247,10 @@ int main(void) {
                 if (oc_enroll_build_code(pk, aud, code, sizeof code) == 0) {
                     fprintf(stderr, "openchimed: enrollment code (courier into your "
                                     "control-plane console): %s\n", code);
-                    /* Also write it to OC_ENROLL_CODE_FILE (if set) so orchestration
-                     * — e.g. the local federated demo's enroll-init — can reserve it
-                     * without scraping the log. */
-                    const char *cf = getenv("OC_ENROLL_CODE_FILE");
+                    /* Also write it to the enrollment code file (if set) so
+                     * orchestration — e.g. the local federated demo's enroll-init —
+                     * can reserve it without scraping the log. */
+                    const char *cf = cfg->enroll.code_file;
                     if (cf && *cf) {
                         FILE *f = fopen(cf, "w");
                         if (f) { fprintf(f, "%s\n", code); fclose(f); }
@@ -273,11 +264,11 @@ int main(void) {
          * retry every 3s for up to OC_ENROLL_WAIT_SECS before serving — so a box
          * can come up already-Active (and with push enabled) once the reserve
          * lands, no restart needed. Default 0 = one attempt (retry next boot). */
-        int wait_secs = atoi(env_or("OC_ENROLL_WAIT_SECS", "0"));
+        int wait_secs = cfg->enroll.wait_secs;
         if (enroll_audience && enroll_privkey && !enroll_active) {
             time_t deadline = time(NULL) + wait_secs;
             for (;;) {
-                oc_enroll_result er = oc_enroll_activate(enroll_url, getenv("OC_ENROLL_CA_BUNDLE"),
+                oc_enroll_result er = oc_enroll_activate(enroll_url, cfg->enroll.ca_bundle,
                                                          enroll_audience, enroll_privkey);
                 if (er == OC_ENROLL_ACTIVE) {
                     oc_dbwriter_store_enrollment(db, enroll_privkey, enroll_audience, 1);
@@ -301,20 +292,19 @@ int main(void) {
     /* OIDC mode (AUTH.md §3): pin central's ES256 key + issuer/audience. When
      * set, AUTH_CHALLENGE advertises oidc+session instead of local+session. An
      * enrolled box (CP-8) uses its daemon-generated audience automatically. */
-    if (strcmp(env_or("OC_AUTH_MODE", "local"), "oidc") == 0) {
-        const char *iss = getenv("OC_OIDC_ISSUER");
-        const char *aud = enroll_audience ? enroll_audience : getenv("OC_OIDC_AUDIENCE");
-        char *pem = load_oidc_pubkey();
+    if (strcmp(cfg->auth_mode, "oidc") == 0) {
+        const char *iss = cfg->oidc.issuer;
+        const char *aud = enroll_audience ? enroll_audience : cfg->oidc.audience;
+        const char *pem = cfg->oidc.pubkey;   /* resolved in oc_config_load; owned by config */
         if (!iss || !aud || !pem) {
-            fprintf(stderr, "openchimed: OIDC mode needs OC_OIDC_ISSUER, "
-                            "OC_OIDC_AUDIENCE, and OC_OIDC_PUBKEY[_FILE]\n");
-            free(pem); oc_dbwriter_stop(db); return 1;
+            fprintf(stderr, "openchimed: OIDC mode needs OPENCHIME_OIDC_ISSUER, "
+                            "OPENCHIME_OIDC_AUDIENCE, and OPENCHIME_OIDC_PUBKEY[_FILE]\n");
+            oc_dbwriter_stop(db); return 1;
         }
-        if (oc_dbwriter_configure_oidc(db, iss, aud, pem, env_or("OC_OIDC_PARAMS", "")) != 0) {
+        if (oc_dbwriter_configure_oidc(db, iss, aud, pem, cfg->oidc.params) != 0) {
             fprintf(stderr, "openchimed: OIDC configuration failed\n");
-            free(pem); oc_dbwriter_stop(db); return 1;
+            oc_dbwriter_stop(db); return 1;
         }
-        free(pem);
         fprintf(stderr, "openchimed: OIDC mode (issuer=%s audience=%s)\n", iss, aud);
     }
 
@@ -323,9 +313,9 @@ int main(void) {
      * gateway. It signs with the enrollment key and delivers offline mobile
      * notifications; absent in self-hosted stand-alone. */
     oc_push *push = NULL;
-    const char *push_url = getenv("OC_PUSH_URL");
+    const char *push_url = cfg->push.url;
     if (enroll_active && enroll_audience && enroll_privkey && push_url && *push_url) {
-        push = oc_push_start(db_path, db, push_url, getenv("OC_PUSH_CA_BUNDLE"),
+        push = oc_push_start(db_path, db, push_url, cfg->push.ca_bundle,
                              enroll_audience, enroll_privkey);
         if (push) {
             oc_netloop_set_push(push);
@@ -391,7 +381,7 @@ int main(void) {
      * IPC, and fork. The child runs the relay and exits when this daemon closes
      * its IPC end (EOF); a fork failure just disables media (calls still form). */
     {
-        int uport = env_port("OPENCHIME_AUDIO_PORT", 0);   /* 0 = ephemeral */
+        int uport = cfg->audio_port;   /* 0 = ephemeral */
         int udp = socket(AF_INET, SOCK_DGRAM, 0);
         struct sockaddr_in ua; memset(&ua, 0, sizeof ua);
         ua.sin_family = AF_INET; ua.sin_addr.s_addr = htonl(INADDR_ANY);

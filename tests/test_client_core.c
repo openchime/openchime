@@ -12,6 +12,7 @@
 #include "resolve.h"     /* workspace resolution (REQ-010/011) */
 
 #include "netloop.h"
+#include "config.h"
 #include "dbwriter.h"
 #include "protocol.h"
 #include "tls.h"
@@ -38,6 +39,8 @@ struct core_loop_arg {
 
 static void *core_loop_thread(void *p) {
     struct core_loop_arg *a = (struct core_loop_arg *)p;
+    char cfgerr[128];
+    oc_config_load(cfgerr, sizeof cfgerr);   /* daemon config (blob dir, storage, …) */
     oc_netloop_run(a->port, a->srv, a->dbw, &a->stop);
     return NULL;
 }
