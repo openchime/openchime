@@ -45,7 +45,7 @@
 | Who-reacted list | ✅ | 🔸 read-only | 🔸 read-only overlay | Read-only both. **P2** |
 | Quick/one-click reactions | ✅ top-3 inline | ❌ | ❌ | **P2** |
 | Copy link / permalink | ✅ | ❌ | ❌ no copy-link | **P1** |
-| Copy text | ✅ | 🔸 (via selection?) | ✅ text-select + Ctrl+C | TUI has click-drag select+copy (recent). Win32 has it. **P2** |
+| Copy text | ✅ | 🔸 terminal-native only | ✅ in-app text-select + Ctrl+C | TUI has **no** in-app copy — relies on the terminal emulator's mouse selection (no clipboard code). Win32 has real in-app selection+copy (ARCH-82). **P2** |
 | Forward / share message | ✅ | ❌ | ❌ no forward | **P2** |
 | Pin message | ✅ | ❌ | ❌ no pin | **P1** |
 | Save for later / bookmark | ✅ | ❌ | ❌ | Later hub out; see Navigation. **P2** |
@@ -406,3 +406,20 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 10. **Command palette (Ctrl+K)** + inline image/thumbnail rendering (D2D makes this a strong differentiator). **P1**
 
 *Follow-ups just behind the top 10: full webhook CRUD, paged audit log, richer invite dialog, per-reply thread actions, real profile editor, multi-workspace switcher (last remaining TUI-vs-Win32 delta), reconnect banner/countdown, and replacing the six-forms-in-one-prompt pattern with purpose-built dialogs.*
+---
+
+## 6. Where OpenChime Exceeds / Differs Favorably from Slack
+
+This analysis is Slack-centric (what Slack has that we lack). For balance, the places OpenChime is **ahead of or deliberately different from** Slack:
+
+| Area | OpenChime | Slack | Notes |
+|---|---|---|---|
+| **Read receipts (seen-by)** | ✅ per-message "✓ Seen by …" from per-member read cursors (REQ-090, `readers[]`) | ❌ none (deliberately) | Genuine capability Slack does not offer. Surfaced in both TUI and Win32. |
+| **Self-hosting / data ownership** | ✅ run your own daemon; data in your SQLite/blob store | ❌ SaaS-only | Data sovereignty, air-gap, no third-party custody. |
+| **Deployment models** | ✅ stand-alone / federated / hosted (ARCH-76) | ❌ single cloud | Cross-instance federation is not the same as Slack Connect (which is within Slack's cloud). |
+| **Native, lightweight clients** | ✅ pure-C native per platform — TUI + Win32 GUI (~3 MB, Direct2D), no Electron | ❌ Electron desktop (heavy) | Lower footprint/latency; and a real **terminal client**, which Slack has no equivalent of. |
+| **Full history on the free tier** | ✅ self-hosted = unlimited retention (you set policy) | ❌ free tier caps history | Retention is an owner policy, not a paywall. |
+| **Pricing model** | ✅ self-hosted free; hosted flat $99 / 100 users | ❌ per-user seat pricing | Flat/self-host economics vs per-seat. |
+| **Affordance-only interaction** | ✅ menus/dialogs/drag-drop, no slash-command sprawl (design choice) | mixed (heavy slash-command surface) | Debatable as "better," but a deliberate simplicity choice. |
+
+> Caveat: federation and the hosted flat-pricing plan are architectural/product commitments (ARCH-76 / SaaS control plane) — mature to varying degrees — whereas read-receipts, self-hosting, native clients, and retention control are shipped today.
