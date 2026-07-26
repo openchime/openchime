@@ -8,22 +8,24 @@
 #define OC_GUI_THEME_H
 
 /* Accent — deep blue (selection, unread dot, links, focus, send button). */
-#define OC_COL_ACCENT      0x2563EB
-#define OC_COL_ACCENT_DIM  0x1E40AF
+#define OC_COL_ACCENT      0x3B82F6   /* brighter blue — pops on the dark shell */
+#define OC_COL_ACCENT_DIM  0x2563EB
 
-/* Shell neutrals (darkest rail -> base transcript). */
-#define OC_COL_RAIL        0x15181C
-#define OC_COL_SIDEBAR     0x1A1D21
-#define OC_COL_BASE        0x1E2227   /* transcript / main pane */
-#define OC_COL_HEADER      0x1A1D21
-#define OC_COL_SELECT      0x2A3138   /* selected row fill */
-#define OC_COL_HOVER       0x262D35   /* row hover — perceptible but below SELECT */
-#define OC_COL_BORDER      0x2C3238
+/* Shell neutrals, with real elevation steps (darkest rail -> lightest canvas).
+ * A wider spread than before so the panes read as distinct layers. */
+#define OC_COL_RAIL        0x121519   /* left rail — deepest */
+#define OC_COL_SIDEBAR     0x181B21   /* channel sidebar + header */
+#define OC_COL_BASE        0x1F242B   /* transcript / main canvas — lightest */
+#define OC_COL_HEADER      0x181B21
+#define OC_COL_INPUT       0x262B33   /* composer field — a raised surface */
+#define OC_COL_SELECT      0x2B4067   /* selected row — blue-tinted toward accent */
+#define OC_COL_HOVER       0x272C34   /* row hover — perceptible, below SELECT */
+#define OC_COL_BORDER      0x2E333B
 
 /* Text. */
-#define OC_COL_TEXT        0xE8EAED
-#define OC_COL_MUTED       0x9AA0A6
-#define OC_COL_FAINT       0x6B7178
+#define OC_COL_TEXT        0xEBEDF0
+#define OC_COL_MUTED       0x9BA2AD
+#define OC_COL_FAINT       0x6A7079
 
 /* Semantic. */
 #define OC_COL_DANGER      0xE05252

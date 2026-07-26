@@ -50,7 +50,7 @@ static const GUID OC_IID_IDWriteFactory =
 #define RAIL_W      64.0f
 #define SIDEBAR_W   250.0f
 #define HEADER_H    56.0f
-#define COMPOSER_H  72.0f
+#define COMPOSER_H  86.0f
 #define ROW_H       32.0f     /* a sidebar channel row */
 #define AVA         36.0f     /* transcript avatar diameter */
 #define LINE_H      19.0f     /* an extra (reaction/attach/thread) line */
@@ -138,6 +138,7 @@ static int      g_show_members = 1;     /* members pane visible */
 static D2D1_RECT_F g_members_btn;       /* header toggle hit-box */
 static D2D1_RECT_F g_rail_btn;          /* workspace-avatar hit-box (app menu) */
 static D2D1_RECT_F g_attach_btn;        /* composer attach (+) hit-box */
+static D2D1_RECT_F g_send_btn;          /* composer send-button hit-box */
 static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
 
 /* ---- small helpers ------------------------------------------------------- */
@@ -185,6 +186,12 @@ static void fill(ID2D1RenderTarget *rt, D2D1_RECT_F r, uint32_t rgb) {
 static void fill_round(ID2D1RenderTarget *rt, D2D1_RECT_F r, float rad, uint32_t rgb) {
     D2D1_ROUNDED_RECT rr = { r, rad, rad };
     ID2D1RenderTarget_FillRoundedRectangle(rt, &rr, paint_with(rgb));
+}
+
+static void stroke_round(ID2D1RenderTarget *rt, D2D1_RECT_F r, float rad,
+                         uint32_t rgb, float w) {
+    D2D1_ROUNDED_RECT rr = { r, rad, rad };
+    ID2D1RenderTarget_DrawRoundedRectangle(rt, &rr, paint_with(rgb), w, NULL);
 }
 
 /* UTF-8 -> UTF-16 into caller buffer; returns character count (no NUL). */
@@ -235,6 +242,9 @@ static void d2d_init(void) {
     g_ui_b  = mk_fmt(UI, 14.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
     g_small = mk_fmt(UI, 12.5f, DWRITE_FONT_WEIGHT_NORMAL,    DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
     g_ava   = mk_fmt(UI, 15.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER,   DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
+    /* Roomier line height on message bodies for readability (Slack-like). */
+    if (g_body)
+        IDWriteTextFormat_SetLineSpacing(g_body, DWRITE_LINE_SPACING_METHOD_UNIFORM, 22.0f, 16.5f);
 }
 
 static void d2d_ensure_rt(HWND hwnd) {
@@ -444,8 +454,8 @@ static float msg_height(const oc_msg *msg, float content_w, int grouped,
     if (msg->n_reactions) extra++;
     extra += msg->n_attach;
     if (msg->reply_count) extra++;
-    float head = grouped ? 2.0f : 22.0f;               /* header line only when ungrouped */
-    float pad  = grouped ? 4.0f : 12.0f;
+    float head = grouped ? 3.0f : 24.0f;               /* header line only when ungrouped */
+    float pad  = grouped ? 7.0f : 16.0f;               /* inter-message breathing room */
     return head + body_h + (float)extra * LINE_H + pad;
 }
 
@@ -477,7 +487,7 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
     }
 
     /* Body. */
-    float by = y + (grouped ? 2.0f : 22.0f);
+    float by = y + (grouped ? 3.0f : 24.0f);
     if (body) {
         D2D1_POINT_2F org = { tx, by };
         uint32_t bcol = msg->deleted ? OC_COL_FAINT : OC_COL_TEXT;
@@ -632,7 +642,7 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
             y += SEP_H;
         }
         if (y + heights[i] >= reg.top && y <= reg.bottom) {
-            float bx = x0 + AVA + 12, by = y + (grouped[i] ? 2.0f : 22.0f);
+            float bx = x0 + AVA + 12, by = y + (grouped[i] ? 3.0f : 24.0f);
             /* Hover highlight behind the whole row (main transcript only). */
             if (capture && !g_selecting && g_hover_mid == msgs[first + i].message_id)
                 fill(rt, rf(reg.left, y, reg.right, y + heights[i]), OC_COL_HOVER);
@@ -1010,12 +1020,29 @@ static void draw_members(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
 static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     float top = h - COMPOSER_H;
     fill(rt, rf(x0, top, x0 + w, h), OC_COL_BASE);
-    fill(rt, rf(x0, top, x0 + w, top + 1), OC_COL_BORDER);   /* hairline divider */
 
-    g_attach_btn = rf(x0 + 16, top + 15, x0 + 16 + 40, h - 17);
-    fill_round(rt, g_attach_btn, 8.0f, OC_COL_SIDEBAR);
+    /* A bordered, rounded input container the composer lives inside (Slack-style),
+     * so the field reads as a real control rather than a naked line of text. */
+    float bx0 = x0 + 20, bx1 = x0 + w - 20, by0 = top + 12, by1 = h - 16;
+    fill_round(rt, rf(bx0, by0, bx1, by1), 10.0f, OC_COL_INPUT);
+    stroke_round(rt, rf(bx0, by0, bx1, by1), 10.0f, OC_COL_BORDER, 1.0f);
+
+    float boxh = by1 - by0, sq = 34.0f, cy = by0 + (boxh - sq) / 2;
+
+    /* Attach (+) on the left. */
+    g_attach_btn = rf(bx0 + 6, cy, bx0 + 6 + sq, cy + sq);
     IDWriteTextFormat_SetTextAlignment(g_hdr, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, "+", g_hdr, g_attach_btn, OC_COL_MUTED);
+    draw_text(rt, "+", g_hdr, rf(g_attach_btn.left, g_attach_btn.top - 2,
+                                 g_attach_btn.right, g_attach_btn.bottom), OC_COL_MUTED);
+
+    /* Send on the right — accent when there's text to send, muted when empty. */
+    int has_text = g_re && GetWindowTextLengthW(g_re) > 0;
+    g_send_btn = rf(bx1 - 6 - sq, cy, bx1 - 6, cy + sq);
+    fill_round(rt, g_send_btn, 8.0f, has_text ? OC_COL_ACCENT : OC_COL_INPUT);
+    if (!has_text) stroke_round(rt, g_send_btn, 8.0f, OC_COL_BORDER, 1.0f);
+    draw_text(rt, "\xE2\x86\x91", g_hdr, rf(g_send_btn.left, g_send_btn.top - 2,
+                                 g_send_btn.right, g_send_btn.bottom),
+              has_text ? 0xFFFFFF : OC_COL_FAINT);
     IDWriteTextFormat_SetTextAlignment(g_hdr, DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 
@@ -1128,9 +1155,12 @@ static void layout_composer(HWND hwnd) {
     const oc_model *m = model();
     float members = (g_show_members && m && m->authed) ? MEMBERS_W : 0;
     float main_x = RAIL_W + SIDEBAR_W;
-    int x = (int)main_x + 16 + 48, r = (int)(rc.right - members) - 16;   /* +48 clears the attach button */
-    int top = rc.bottom - (int)COMPOSER_H + 12, bot = rc.bottom - 14;
-    MoveWindow(g_re, x, top, r - x, bot - top, TRUE);
+    /* Inside the composer box, between the attach (+) and send buttons. */
+    float bx0 = main_x + 20, bx1 = (rc.right - members) - 20;
+    float by0 = rc.bottom - COMPOSER_H + 12, by1 = rc.bottom - 16, boxh = by1 - by0;
+    int x = (int)(bx0 + 48), r = (int)(bx1 - 48);
+    int reh = 24, top = (int)(by0 + (boxh - reh) / 2);
+    MoveWindow(g_re, x, top, r - x, reh, TRUE);
 }
 
 static void composer_create(HWND parent) {
@@ -1138,7 +1168,7 @@ static void composer_create(HWND parent) {
         WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL,
         0, 0, 10, 10, parent, NULL, GetModuleHandleW(NULL), NULL);
     if (!g_re) return;
-    SendMessageW(g_re, EM_SETBKGNDCOLOR, 0, (LPARAM)RGB(0x1A, 0x1D, 0x21));   /* OC_COL_SIDEBAR */
+    SendMessageW(g_re, EM_SETBKGNDCOLOR, 0, (LPARAM)RGB(0x26, 0x2B, 0x33));   /* OC_COL_INPUT */
     CHARFORMAT2W cf; ZeroMemory(&cf, sizeof cf);
     cf.cbSize = sizeof cf;
     cf.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE;
@@ -1315,8 +1345,9 @@ static int on_click(HWND hwnd, int x, int y) {
         layout_composer(hwnd);
         return 1;
     }
-    /* Composer attach (+) button. */
+    /* Composer attach (+) and send buttons. */
     if (in_rect(g_attach_btn, x, y)) { upload_file(hwnd); return 1; }
+    if (in_rect(g_send_btn, x, y))   { composer_send(); return 1; }
     /* Overlay row clicks (main area only). */
     {
         const oc_model *mm = model();
