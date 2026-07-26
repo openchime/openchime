@@ -84,6 +84,15 @@ static IDWriteTextFormat *g_ava;    /* avatar initial (centered) */
 static uint64_t g_sel;              /* selected channel id (0 = none) */
 static float    g_scroll;           /* px scrolled up from the bottom of the transcript */
 static float    g_scroll_max;       /* recomputed each paint, for input clamping */
+static uint64_t g_hover_mid;        /* transcript message under the cursor (0 = none) */
+
+/* Custom transcript scrollbar (drawn over the D2D surface). Geometry is captured
+ * each paint so the mouse handlers can hit-test and drag the thumb. */
+static D2D1_RECT_F g_sbar_thumb;    /* thumb hit-box (empty when not scrollable) */
+static float    g_sbar_track_top;   /* track origin + travel range, for drag mapping */
+static float    g_sbar_travel;
+static int      g_sbar_drag;        /* dragging the scrollbar thumb */
+static float    g_sbar_grab;        /* cursor offset within the thumb at grab */
 static uint8_t  g_post_auth;        /* one-shot post-auth roster/channel refresh */
 
 static uint64_t g_backfilled[512];  /* channels we've already asked history for */
@@ -494,6 +503,60 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
     }
 }
 
+#define SEP_H 30.0f     /* a date-divider row */
+
+static int pt_in(D2D1_RECT_F r, int x, int y) {
+    return (float)x >= r.left && (float)x < r.right &&
+           (float)y >= r.top  && (float)y < r.bottom;
+}
+
+/* Two messages fall on the same local calendar day? */
+static int same_day(uint64_t a_ms, uint64_t b_ms) {
+    time_t ta = (time_t)(a_ms / 1000), tb = (time_t)(b_ms / 1000);
+    struct tm va, vb;
+    if (!oc_localtime_r(&ta, &va) || !oc_localtime_r(&tb, &vb)) return 1;
+    return va.tm_year == vb.tm_year && va.tm_yday == vb.tm_yday;
+}
+
+/* "Today" / "Yesterday" / "Friday, July 25" for a date divider. */
+static void day_label(uint64_t ms, char *out, size_t cap) {
+    time_t t = (time_t)(ms / 1000), now = time(NULL), yst = now - 86400;
+    struct tm tv, nv, yv;
+    if (!oc_localtime_r(&t, &tv)) { if (cap) out[0] = 0; return; }
+    if (oc_localtime_r(&now, &nv) &&
+        tv.tm_year == nv.tm_year && tv.tm_yday == nv.tm_yday) {
+        snprintf(out, cap, "Today"); return;
+    }
+    if (oc_localtime_r(&yst, &yv) &&
+        tv.tm_year == yv.tm_year && tv.tm_yday == yv.tm_yday) {
+        snprintf(out, cap, "Yesterday"); return;
+    }
+    strftime(out, cap, "%A, %B %d", &tv);
+}
+
+/* A centered date label flanked by hairlines, filling a SEP_H band at `y`. */
+static void draw_day_sep(ID2D1RenderTarget *rt, uint64_t ms, D2D1_RECT_F reg, float y) {
+    char lbl[64]; day_label(ms, lbl, sizeof lbl);
+    if (!lbl[0]) return;
+    float cy = y + SEP_H / 2, cx = (reg.left + reg.right) / 2;
+    WCHAR w[64]; int n = to_w(lbl, w, 64);
+    IDWriteTextLayout *l = NULL; float tw = 60;
+    IDWriteFactory_CreateTextLayout(g_dwrite, w, (UINT32)n, g_small,
+                                    reg.right - reg.left, SEP_H, &l);
+    if (l) {
+        DWRITE_TEXT_METRICS tm;
+        if (SUCCEEDED(IDWriteTextLayout_GetMetrics(l, &tm)))
+            tw = tm.widthIncludingTrailingWhitespace;
+        IDWriteTextLayout_Release(l);
+    }
+    float gap = tw / 2 + 14;
+    fill(rt, rf(reg.left + 40, cy, cx - gap, cy + 1), OC_COL_BORDER);
+    fill(rt, rf(cx + gap, cy, reg.right - 40, cy + 1), OC_COL_BORDER);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, lbl, g_small, rf(reg.left, y + 5, reg.right, y + SEP_H - 3), OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+}
+
 /* Bottom-pinned, wheel-scrolled render of a message array into `reg`. When
  * `capture` is set, records per-message hit-boxes for the context menu. */
 static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
@@ -509,13 +572,18 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
     static float heights[CAP];
     static uint32_t wlens[CAP];
     static uint8_t grouped[CAP];
+    static uint8_t sep[CAP];       /* a date divider precedes this message */
     if (n > CAP) { first = n - CAP; n = CAP; }
 
     float total = 0;
     for (size_t i = 0; i < n; i++) {
-        grouped[i] = (uint8_t)(i > 0 && groups_with(&msgs[first + i - 1], &msgs[first + i]));
+        /* Date dividers only in the main transcript, not the thread/search panes. */
+        sep[i] = (uint8_t)(capture && (i == 0 ||
+                 !same_day(msgs[first + i - 1].server_time, msgs[first + i].server_time)));
+        grouped[i] = (uint8_t)(!sep[i] && i > 0 &&
+                     groups_with(&msgs[first + i - 1], &msgs[first + i]));
         heights[i] = msg_height(&msgs[first + i], content_w, grouped[i], &layouts[i], &wlens[i]);
-        total += heights[i];
+        total += heights[i] + (sep[i] ? SEP_H : 0);
     }
 
     float visible = reg.bottom - reg.top;
@@ -545,8 +613,16 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
     ID2D1RenderTarget_PushAxisAlignedClip(rt, &reg, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     if (capture) g_n_msgrows = 0;
     for (size_t i = 0; i < n; i++) {
+        if (sep[i]) {
+            if (y + SEP_H >= reg.top && y <= reg.bottom)
+                draw_day_sep(rt, msgs[first + i].server_time, reg, y);
+            y += SEP_H;
+        }
         if (y + heights[i] >= reg.top && y <= reg.bottom) {
             float bx = x0 + AVA + 12, by = y + (grouped[i] ? 2.0f : 22.0f);
+            /* Hover highlight behind the whole row (main transcript only). */
+            if (capture && !g_selecting && g_hover_mid == msgs[first + i].message_id)
+                fill(rt, rf(reg.left, y, reg.right, y + heights[i]), OC_COL_HOVER);
             /* Selection highlight — drawn under the text so it stays readable. */
             if (sel_lo >= 0 && (long)i >= sel_lo && (long)i <= sel_hi && layouts[i]) {
                 uint32_t s = ((long)i == sel_lo) ? sel_lo_pos : 0;
@@ -576,6 +652,25 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
         y += heights[i];
         if (layouts[i]) IDWriteTextLayout_Release(layouts[i]);
         layouts[i] = NULL;
+    }
+
+    /* Custom scrollbar for the main transcript. g_scroll 0 => pinned bottom => thumb
+     * at the bottom of the track; g_scroll_max => scrolled to top => thumb at top. */
+    if (capture) {
+        if (g_scroll_max > 0.5f && total > 0) {
+            float track_top = reg.top + 4, track_h = visible - 8;
+            float thumb_h = visible / total * track_h;
+            if (thumb_h < 30) thumb_h = 30;
+            if (thumb_h > track_h) thumb_h = track_h;
+            float travel = track_h - thumb_h;
+            float thumb_top = track_top + (1.0f - g_scroll / g_scroll_max) * travel;
+            float sx = reg.right - 10;
+            g_sbar_track_top = track_top; g_sbar_travel = travel;
+            g_sbar_thumb = rf(sx, thumb_top, sx + 6, thumb_top + thumb_h);
+            fill_round(rt, g_sbar_thumb, 3.0f, OC_COL_FAINT);
+        } else {
+            g_sbar_thumb = rf(0, 0, 0, 0);
+        }
     }
     ID2D1RenderTarget_PopAxisAlignedClip(rt);
 }
@@ -1286,7 +1381,7 @@ static int selection_start(HWND hwnd, int x, int y) {
     uint32_t pos = hit_pos(r, x, y);
     g_sel_a_mid = g_sel_f_mid = g_msgrows[r].mid;
     g_sel_a_pos = g_sel_f_pos = pos;
-    g_has_sel = 1; g_selecting = 1;
+    g_has_sel = 1; g_selecting = 1; g_hover_mid = 0;
     SetCapture(hwnd); SetFocus(hwnd);      /* take focus so Ctrl+C reaches us */
     return 1;
 }
@@ -1777,19 +1872,40 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_scroll > g_scroll_max) g_scroll = g_scroll_max;
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
-    case WM_LBUTTONDOWN:
-        if (!on_click(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp)) && !any_overlay(model()))
-            selection_start(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+    case WM_LBUTTONDOWN: {
+        int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+        if (!any_overlay(model()) && pt_in(g_sbar_thumb, mx, my)) {
+            g_sbar_drag = 1; g_sbar_grab = (float)my - g_sbar_thumb.top;
+            SetCapture(hwnd);
+        } else if (!on_click(hwnd, mx, my) && !any_overlay(model())) {
+            selection_start(hwnd, mx, my);
+        }
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
-    case WM_MOUSEMOVE:
-        if (g_selecting) {
-            selection_update(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+    }
+    case WM_MOUSEMOVE: {
+        int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+        if (g_sbar_drag) {
+            if (g_sbar_travel > 0) {
+                float off = (float)my - g_sbar_grab - g_sbar_track_top;
+                if (off < 0) off = 0;
+                if (off > g_sbar_travel) off = g_sbar_travel;
+                g_scroll = (1.0f - off / g_sbar_travel) * g_scroll_max;
+            }
             InvalidateRect(hwnd, NULL, FALSE);
+        } else if (g_selecting) {
+            selection_update(mx, my);
+            InvalidateRect(hwnd, NULL, FALSE);
+        } else {
+            int r = any_overlay(model()) ? -1 : msgrow_at(my);
+            uint64_t h = r >= 0 ? g_msgrows[r].mid : 0;
+            if (h != g_hover_mid) { g_hover_mid = h; InvalidateRect(hwnd, NULL, FALSE); }
         }
         return 0;
+    }
     case WM_LBUTTONUP:
-        if (g_selecting) { selection_end(); InvalidateRect(hwnd, NULL, FALSE); }
+        if (g_sbar_drag) { g_sbar_drag = 0; ReleaseCapture(); InvalidateRect(hwnd, NULL, FALSE); }
+        else if (g_selecting) { selection_end(); InvalidateRect(hwnd, NULL, FALSE); }
         return 0;
     case WM_KEYDOWN:
         if (wp == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)) { copy_selection(hwnd); return 0; }
