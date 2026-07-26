@@ -22,6 +22,7 @@
 #include <shellapi.h>         /* CommandLineToArgvW */
 #include <richedit.h>         /* MSFTEDIT_CLASS composer */
 #include <commdlg.h>          /* GetSaveFileNameW (attachment download) */
+#include <dwmapi.h>           /* DwmSetWindowAttribute (dark title bar) */
 #include <d2d1.h>
 #include <dwrite.h>
 
@@ -33,6 +34,7 @@
 #include "client.h"
 #include "model.h"
 #include "resolve.h"
+#include "store.h"            /* peek a stored session token (skip the login box) */
 #include "oc_port.h"          /* oc_mkdir, oc_localtime_r */
 #include "protocol.h"         /* OC_CHANNEL_KIND_DM, OC_PRESENCE_* */
 #include "theme.h"
@@ -163,6 +165,17 @@ static ID2D1Brush *paint_alpha(uint32_t rgb, float a) {
 
 static D2D1_RECT_F rf(float l, float t, float r, float b) {
     D2D1_RECT_F x = { l, t, r, b }; return x;
+}
+
+/* theme.h stores 0xRRGGBB; GDI/Win32 want a COLORREF (0x00BBGGRR). */
+#define OCRGB(x) RGB(((x) >> 16) & 0xff, ((x) >> 8) & 0xff, (x) & 0xff)
+
+/* Ask DWM for a dark window caption (native title bar matching the shell).
+ * Attr 20 = DWMWA_USE_IMMERSIVE_DARK_MODE on Win10 1903+, 19 on 1809. */
+static void apply_dark_titlebar(HWND h) {
+    BOOL dark = TRUE;
+    if (FAILED(DwmSetWindowAttribute(h, 20, &dark, sizeof dark)))
+        DwmSetWindowAttribute(h, 19, &dark, sizeof dark);
 }
 
 static void fill(ID2D1RenderTarget *rt, D2D1_RECT_F r, uint32_t rgb) {
@@ -1483,6 +1496,55 @@ static const char *store_path(void) {
     return path;
 }
 
+/* Most-recently-used workspace from the book — for silent reconnect + prefill. */
+struct last_ws { char ws[256], user[128]; uint64_t at; int found; };
+static void last_ws_cb(void *ctx, const char *workspace, const char *label,
+                       const char *username, uint64_t last_used_ms) {
+    (void)label;
+    struct last_ws *l = ctx;
+    if (l->found && last_used_ms < l->at) return;
+    l->found = 1; l->at = last_used_ms;
+    snprintf(l->ws,   sizeof l->ws,   "%s", workspace ? workspace : "");
+    snprintf(l->user, sizeof l->user, "%s", username  ? username  : "");
+}
+static int pick_last_workspace(char *ws, size_t wscap, char *user, size_t ucap) {
+    const char *sp = store_path();
+    oc_store *s = sp ? oc_store_open(sp) : NULL;
+    if (!s) return 0;
+    struct last_ws l; memset(&l, 0, sizeof l);
+    oc_store_workspace_each(s, last_ws_cb, &l);
+    oc_store_close(s);
+    if (!l.found || !l.ws[0]) return 0;
+    snprintf(ws, wscap, "%s", l.ws);
+    if (user) snprintf(user, ucap, "%s", l.user);
+    return 1;
+}
+
+/* A still-valid session token stored for `ws`? Then the net thread can reconnect
+ * silently and we skip the login dialog entirely (uniform with the TUI). */
+static int have_stored_token(const char *ws) {
+    oc_endpoint ep;
+    if (oc_resolve(ws, getenv("OPENCHIME_SUFFIX"), &ep) != OC_RESOLVE_OK) return 0;
+    const char *sp = store_path();
+    oc_store *s = sp ? oc_store_open(sp) : NULL;
+    if (!s) return 0;
+    char inst[288]; snprintf(inst, sizeof inst, "%s:%d", ep.host, ep.port);
+    uint8_t tok[OC_SESSION_TOKEN_LEN];
+    int has = oc_store_load_session(s, inst, tok, NULL, (uint64_t)time(NULL) * 1000);
+    oc_store_close(s);
+    return has;
+}
+
+/* Record a workspace in the book so the next launch can reconnect to it. A NULL
+ * username preserves the stored one (a silent reconnect carries no credential). */
+static void remember_workspace(const char *ws, const char *user) {
+    const char *sp = store_path();
+    oc_store *s = sp ? oc_store_open(sp) : NULL;
+    if (!s) return;
+    oc_store_workspace_remember(s, ws, ws, user, (uint64_t)time(NULL) * 1000);
+    oc_store_close(s);
+}
+
 static void connect_start(const char *ws, const char *cred) {
     oc_endpoint ep;
     if (oc_resolve(ws, getenv("OPENCHIME_SUFFIX"), &ep) != OC_RESOLVE_OK) {
@@ -1493,6 +1555,15 @@ static void connect_start(const char *ws, const char *cred) {
     g_port = ep.port;
     snprintf(g_cred, sizeof g_cred, "%s", cred);
     g_client = oc_client_start_secure(g_host, g_port, g_cred, store_path(), NULL);
+
+    /* Remember this workspace (+ the username, parsed off "user:pass") so the next
+     * launch reconnects silently via the stored session token. */
+    char user[128] = ""; const char *colon = strchr(cred, ':');
+    if (colon && colon > cred) {
+        size_t n = (size_t)(colon - cred); if (n >= sizeof user) n = sizeof user - 1;
+        memcpy(user, cred, n); user[n] = 0;
+    }
+    remember_workspace(ws, user[0] ? user : NULL);
 }
 
 /* ---- login dialog -------------------------------------------------------- */
@@ -1500,17 +1571,40 @@ static void connect_start(const char *ws, const char *cred) {
 static HWND g_lg_ws, g_lg_user, g_lg_pass;
 static int  g_lg_result;                 /* -1 pending, 0 cancel, 1 connect */
 static int  g_lg_done;                    /* ends the modal pump (no WM_QUIT) */
+static HBRUSH g_lg_bg, g_lg_input;        /* dark-theme brushes (freed after pump) */
 
 static void lg_set_font(HWND w) {
     SendMessageW(w, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
 }
 
 static HWND lg_edit(HWND parent, HINSTANCE inst, int x, int y, int w, const WCHAR *init, DWORD extra) {
-    HWND e = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", init,
+    /* Borderless flat field — the lighter input brush delineates it on the
+     * dark backdrop (WS_EX_CLIENTEDGE draws a white sunken border, which jars). */
+    HWND e = CreateWindowExW(0, L"EDIT", init,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | extra,
-        x, y, w, 24, parent, NULL, inst, NULL);
+        x, y, w, 26, parent, NULL, inst, NULL);
     lg_set_font(e);
     return e;
+}
+
+/* Owner-draw a rounded, themed push button (accent for the default action). */
+static void lg_draw_button(LPDRAWITEMSTRUCT d) {
+    int pressed = (d->itemState & ODS_SELECTED) != 0;
+    int accent  = (d->CtlID == IDOK);
+    COLORREF bg = accent ? OCRGB(pressed ? OC_COL_ACCENT_DIM : OC_COL_ACCENT)
+                         : OCRGB(pressed ? OC_COL_BORDER     : OC_COL_HOVER);
+    COLORREF edge = accent ? bg : OCRGB(OC_COL_BORDER);
+    HBRUSH b = CreateSolidBrush(bg);
+    HPEN  pen = CreatePen(PS_SOLID, 1, edge);
+    HGDIOBJ ob = SelectObject(d->hDC, b), op = SelectObject(d->hDC, pen);
+    RoundRect(d->hDC, d->rcItem.left, d->rcItem.top, d->rcItem.right, d->rcItem.bottom, 8, 8);
+    SelectObject(d->hDC, GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(d->hDC, TRANSPARENT);
+    SetTextColor(d->hDC, accent ? RGB(255, 255, 255) : OCRGB(OC_COL_TEXT));
+    WCHAR t[32]; GetWindowTextW(d->hwndItem, t, 32);
+    DrawTextW(d->hDC, t, -1, &d->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(d->hDC, ob); SelectObject(d->hDC, op);
+    DeleteObject(b); DeleteObject(pen);
 }
 
 static LRESULT CALLBACK login_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1521,6 +1615,17 @@ static LRESULT CALLBACK login_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (LOWORD(wp) == IDOK)     { g_lg_result = 1; g_lg_done = 1; return 0; }
         if (LOWORD(wp) == IDCANCEL) { g_lg_result = 0; g_lg_done = 1; return 0; }
         return 0;
+    case WM_DRAWITEM:
+        lg_draw_button((LPDRAWITEMSTRUCT)lp);
+        return TRUE;
+    case WM_CTLCOLORSTATIC:
+        SetBkColor((HDC)wp, OCRGB(OC_COL_BASE));
+        SetTextColor((HDC)wp, OCRGB(OC_COL_MUTED));
+        return (LRESULT)g_lg_bg;
+    case WM_CTLCOLOREDIT:
+        SetBkColor((HDC)wp, OCRGB(OC_COL_HOVER));
+        SetTextColor((HDC)wp, OCRGB(OC_COL_TEXT));
+        return (LRESULT)g_lg_input;
     case WM_CLOSE:   g_lg_result = 0; g_lg_done = 1; return 0;
     default: return DefWindowProcW(hwnd, msg, wp, lp);
     }
@@ -1528,38 +1633,52 @@ static LRESULT CALLBACK login_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 /* Modal-ish login window (runs its own pump). Returns 1 with ws/cred filled on
  * Connect, 0 on Cancel. */
-static int login_dialog(HINSTANCE inst, char *ws, size_t wscap, char *cred, size_t credcap) {
+static int login_dialog(HINSTANCE inst, char *ws, size_t wscap, char *cred, size_t credcap,
+                        const char *pre_ws, const char *pre_user) {
+    g_lg_bg    = CreateSolidBrush(OCRGB(OC_COL_BASE));
+    g_lg_input = CreateSolidBrush(OCRGB(OC_COL_HOVER));
+    WCHAR w_ws[256], w_user[128];
+    to_w((pre_ws && pre_ws[0]) ? pre_ws : "127.0.0.1:8443", w_ws, 256);
+    to_w((pre_user && pre_user[0]) ? pre_user : "alice", w_user, 128);
+
     WNDCLASSW wc; memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc   = login_proc;
     wc.hInstance     = inst;
     wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hbrBackground = g_lg_bg;
     wc.lpszClassName = L"OpenChimeLogin";
     RegisterClassW(&wc);
 
-    int W = 360, H = 224;
+    int W = 380, H = 268;
     int sx = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
     int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 2;
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"OpenChimeLogin", L"Sign in to OpenChime",
         WS_POPUP | WS_CAPTION | WS_SYSMENU, sx, sy, W, H, NULL, NULL, inst, NULL);
     if (!dlg) return 0;
+    apply_dark_titlebar(dlg);
+
+    HWND title = CreateWindowExW(0, L"STATIC", L"OpenChime", WS_CHILD | WS_VISIBLE,
+        26, 20, 300, 26, dlg, NULL, inst, NULL);
+    SendMessageW(title, WM_SETFONT, (WPARAM)CreateFontW(
+        22, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+        CLEARTYPE_QUALITY, 0, L"Segoe UI"), TRUE);
 
     struct { const WCHAR *label; int y; } rows[3] = {
-        { L"Workspace", 16 }, { L"Username", 54 }, { L"Password", 92 } };
+        { L"Workspace", 62 }, { L"Username", 104 }, { L"Password", 146 } };
     for (int i = 0; i < 3; i++) {
         HWND s = CreateWindowExW(0, L"STATIC", rows[i].label, WS_CHILD | WS_VISIBLE,
-            18, rows[i].y + 4, 90, 20, dlg, NULL, inst, NULL);
+            26, rows[i].y + 5, 96, 20, dlg, NULL, inst, NULL);
         lg_set_font(s);
     }
-    g_lg_ws   = lg_edit(dlg, inst, 112, 14, 226, L"127.0.0.1:8443", 0);
-    g_lg_user = lg_edit(dlg, inst, 112, 52, 226, L"alice", 0);
-    g_lg_pass = lg_edit(dlg, inst, 112, 90, 226, L"", ES_PASSWORD);
+    g_lg_ws   = lg_edit(dlg, inst, 128, 62,  226, w_ws, 0);
+    g_lg_user = lg_edit(dlg, inst, 128, 104, 226, w_user, 0);
+    g_lg_pass = lg_edit(dlg, inst, 128, 146, 226, L"", ES_PASSWORD);
 
     HWND ok = CreateWindowExW(0, L"BUTTON", L"Connect",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 158, 138, 84, 28,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON | BS_OWNERDRAW, 176, 196, 84, 32,
         dlg, (HMENU)IDOK, inst, NULL);
     HWND cancel = CreateWindowExW(0, L"BUTTON", L"Cancel",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP, 252, 138, 84, 28,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 270, 196, 84, 32,
         dlg, (HMENU)IDCANCEL, inst, NULL);
     lg_set_font(ok); lg_set_font(cancel);
 
@@ -1573,19 +1692,22 @@ static int login_dialog(HINSTANCE inst, char *ws, size_t wscap, char *cred, size
     while (!g_lg_done && GetMessageW(&m, NULL, 0, 0) > 0) {
         if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
     }
-    if (g_lg_result != 1) { if (IsWindow(dlg)) DestroyWindow(dlg); return 0; }
-
-    WCHAR wws[256], wu[128], wp[128];
-    GetWindowTextW(g_lg_ws, wws, 256);
-    GetWindowTextW(g_lg_user, wu, 128);
-    GetWindowTextW(g_lg_pass, wp, 128);
-    char u[192], p[192];
-    WideCharToMultiByte(CP_UTF8, 0, wws, -1, ws, (int)wscap, NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, wu, -1, u, sizeof u, NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, wp, -1, p, sizeof p, NULL, NULL);
-    snprintf(cred, credcap, "%s:%s", u, p);
+    int ok_pressed = (g_lg_result == 1);
+    if (ok_pressed) {
+        WCHAR wws[256], wu[128], wp[128];
+        GetWindowTextW(g_lg_ws, wws, 256);
+        GetWindowTextW(g_lg_user, wu, 128);
+        GetWindowTextW(g_lg_pass, wp, 128);
+        char u[192], p[192];
+        WideCharToMultiByte(CP_UTF8, 0, wws, -1, ws, (int)wscap, NULL, NULL);
+        WideCharToMultiByte(CP_UTF8, 0, wu, -1, u, sizeof u, NULL, NULL);
+        WideCharToMultiByte(CP_UTF8, 0, wp, -1, p, sizeof p, NULL, NULL);
+        snprintf(cred, credcap, "%s:%s", u, p);
+    }
     if (IsWindow(dlg)) DestroyWindow(dlg);
-    return ws[0] != 0;
+    DeleteObject(g_lg_bg);    g_lg_bg = NULL;
+    DeleteObject(g_lg_input); g_lg_input = NULL;
+    return ok_pressed && ws[0] != 0;
 }
 
 /* ---- generic single-field modal prompt ----------------------------------- */
@@ -1930,8 +2052,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     (void)prev; (void)cmdline;
 
-    /* Dev quick-launch: `openchime.exe <workspace> <user:pass>` skips the dialog.
-     * Otherwise ask for credentials in a native login window. */
+    /* Credential resolution, uniform with the TUI:
+     *   1. Dev quick-launch `openchime.exe <workspace> <user:pass>` — connect directly.
+     *   2. A remembered workspace with a still-valid session token — reconnect
+     *      silently (no dialog); the net thread reuses the stored token.
+     *   3. Otherwise the login dialog, pre-filled with the last workspace + user. */
     static char aws[256], acred[264];
     const char *ws = aws, *cred = acred;
     int argc = 0; LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -1939,7 +2064,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         WideCharToMultiByte(CP_UTF8, 0, argv[1], -1, aws, sizeof aws, NULL, NULL);
         WideCharToMultiByte(CP_UTF8, 0, argv[2], -1, acred, sizeof acred, NULL, NULL);
     } else {
-        if (!login_dialog(inst, aws, sizeof aws, acred, sizeof acred)) {
+        char last_ws[256] = "", last_user[128] = "";
+        int have_last = pick_last_workspace(last_ws, sizeof last_ws, last_user, sizeof last_user);
+        if (have_last && have_stored_token(last_ws)) {
+            snprintf(aws, sizeof aws, "%s", last_ws);   /* silent reconnect: cred stays "" */
+        } else if (!login_dialog(inst, aws, sizeof aws, acred, sizeof acred,
+                                 have_last ? last_ws : NULL, have_last ? last_user : NULL)) {
             if (argv) LocalFree(argv);
             return 0;                     /* cancelled */
         }
@@ -1962,6 +2092,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
                     WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                     1080, 720, NULL, NULL, inst, NULL);
     if (!hwnd) return 1;
+    apply_dark_titlebar(hwnd);
     ShowWindow(hwnd, show);
     UpdateWindow(hwnd);
 
