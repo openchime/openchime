@@ -163,6 +163,8 @@ Legend: ✅ done · 🔨 in progress · ⛔ not started.
 | Manual reconnect | `reconnect` | ✅ | App menu → Reconnect now. |
 | Multiple workspaces | one `oc_client` per ws + switcher | ⛔ | Rail workspace switcher (TUI holds N clients) — the one remaining feature. |
 
+> **Depth caveat:** this table tracks whether each engine feature is *reachable*; it does **not** measure how developed each screen/dialog is. For the full three-way (Slack vs TUI vs Win32) surface-depth gap analysis — including underdeveloped screens and a recommended build order — see [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md).
+
 **Feature parity is essentially complete** — 26 of 27 features surfaced; only the
 multi-workspace switcher (an architectural change: N `oc_client`s + a rail
 switcher, as the TUI does) remains. Next per the agreed sequencing is the
