@@ -1168,11 +1168,11 @@ static void composer_create(HWND parent) {
         WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL,
         0, 0, 10, 10, parent, NULL, GetModuleHandleW(NULL), NULL);
     if (!g_re) return;
-    SendMessageW(g_re, EM_SETBKGNDCOLOR, 0, (LPARAM)RGB(0x26, 0x2B, 0x33));   /* OC_COL_INPUT */
+    SendMessageW(g_re, EM_SETBKGNDCOLOR, 0, (LPARAM)OCRGB(OC_COL_INPUT));
     CHARFORMAT2W cf; ZeroMemory(&cf, sizeof cf);
     cf.cbSize = sizeof cf;
     cf.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE;
-    cf.crTextColor = RGB(0xE8, 0xEA, 0xED);        /* OC_COL_TEXT */
+    cf.crTextColor = OCRGB(OC_COL_TEXT);
     cf.yHeight = 15 * 20;                           /* 15pt in twips */
     lstrcpynW(cf.szFaceName, L"Segoe UI", LF_FACESIZE);
     SendMessageW(g_re, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
