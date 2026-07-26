@@ -79,7 +79,8 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
              * inject into any connection (a peer coming online, a member typing);
              * this black-box test doesn't exercise them, so skip them rather than
              * let a broadcast desync the expected stream. */
-            if (hdr->msg_type == OC_MSG_PRESENCE_UPDATE || hdr->msg_type == OC_MSG_TYPING_UPDATE)
+            if (hdr->msg_type == OC_MSG_PRESENCE_UPDATE || hdr->msg_type == OC_MSG_TYPING_UPDATE ||
+                hdr->msg_type == OC_MSG_WORKSPACE_INFO)   /* post-AUTH_OK push; not exercised here */
                 continue;
             return 0;
         }
