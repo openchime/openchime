@@ -55,6 +55,13 @@ static const GUID OC_IID_IDWriteFactory =
 #define AVA         36.0f     /* transcript avatar diameter */
 #define LINE_H      19.0f     /* an extra (reaction/attach/thread) line */
 #define MEMBERS_W   220.0f    /* the (toggleable) right-hand members pane */
+
+/* Primary views selected by the left-nav rail (Slack-style). HOME/DMS/ADMIN are
+ * real today; ACTIVITY/FILES/LATER/NOTIFICATIONS are stubs until their features
+ * land. Rail item `act` values <0 are special (switcher / new / profile / more). */
+enum { VIEW_HOME = 0, VIEW_DMS, VIEW_ACTIVITY, VIEW_FILES, VIEW_LATER,
+       VIEW_ADMIN, VIEW_NOTIFICATIONS, VIEW_COUNT };
+enum { NAV_SWITCHER = -2, NAV_NEW = -3, NAV_PROFILE = -4, NAV_MORE = -5 };
 #define BODY_DIP    15.0f     /* message + composer text size (shared, so they match) */
 
 /* Common reactions offered by the message context menu. */
@@ -84,6 +91,8 @@ static IDWriteTextFormat *g_ui;     /* sidebar rows / composer */
 static IDWriteTextFormat *g_ui_b;   /* unread sidebar rows (semibold) */
 static IDWriteTextFormat *g_small;  /* subtitles / meta lines */
 static IDWriteTextFormat *g_ava;    /* avatar initial (centered) */
+static IDWriteTextFormat *g_icon;   /* Segoe MDL2 rail glyphs (monochrome, centered) */
+static IDWriteTextFormat *g_rail;   /* tiny rail item labels (centered) */
 
 static uint64_t g_sel;              /* selected channel id (0 = none) */
 static float    g_scroll;           /* px scrolled up from the bottom of the transcript */
@@ -139,6 +148,11 @@ static int g_n_webrows;
 static int      g_show_members = 1;     /* members pane visible */
 static D2D1_RECT_F g_members_btn;       /* header toggle hit-box */
 static D2D1_RECT_F g_rail_btn;          /* workspace-avatar hit-box (app menu) */
+static int g_view = VIEW_HOME;          /* current primary view (rail selection) */
+static int g_nav_hover = -100;          /* rail item under the cursor (act value) */
+/* Rail item hit-boxes, captured during paint. `act` >=0 is a VIEW_*, <0 a NAV_*. */
+static struct { float top, bot; int act; } g_navrows[16];
+static int g_n_navrows;
 static D2D1_RECT_F g_attach_btn;        /* composer attach (+) hit-box */
 static D2D1_RECT_F g_send_btn;          /* composer send-button hit-box */
 static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
@@ -217,6 +231,12 @@ static void draw_text(ID2D1RenderTarget *rt, const char *s, IDWriteTextFormat *f
                                D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
 }
 
+/* Draw a single icon-font (Segoe MDL2) glyph centered in `r`. */
+static void draw_icon(ID2D1RenderTarget *rt, WCHAR cp, D2D1_RECT_F r, uint32_t rgb) {
+    ID2D1RenderTarget_DrawText(rt, &cp, 1, g_icon, &r, paint_with(rgb),
+                               D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+}
+
 /* ---- Direct2D / DirectWrite setup ---------------------------------------- */
 
 static IDWriteTextFormat *mk_fmt(const WCHAR *family, float size, DWRITE_FONT_WEIGHT wt,
@@ -249,6 +269,8 @@ static void d2d_init(void) {
     g_ui_b  = mk_fmt(UI, 14.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
     g_small = mk_fmt(UI, 12.5f, DWRITE_FONT_WEIGHT_NORMAL,    DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
     g_ava   = mk_fmt(UI, 15.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER,   DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
+    g_icon  = mk_fmt(L"Segoe MDL2 Assets", 19.0f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
+    g_rail  = mk_fmt(UI, 10.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
     /* Roomier line height on message bodies for readability (Slack-like). */
     if (g_body)
         IDWriteTextFormat_SetLineSpacing(g_body, DWRITE_LINE_SPACING_METHOD_UNIFORM, 22.0f, 16.5f);
@@ -357,16 +379,73 @@ static void ensure_selection(const oc_model *m) {
 
 /* ---- rail + sidebar ------------------------------------------------------ */
 
-static void draw_rail(ID2D1RenderTarget *rt, float h) {
+/* One rail item: MDL2 glyph + tiny label, with selection + hover states. Records
+ * a hit-box carrying `act` (a VIEW_* when >=0, else a NAV_* sentinel). */
+static void rail_item(ID2D1RenderTarget *rt, float y, float ih, WCHAR glyph,
+                      const char *label, int act) {
+    int selected = (act >= 0 && act == g_view);
+    int hovered  = (act == g_nav_hover);
+    if (selected) fill_round(rt, rf(10, y + 2, RAIL_W - 10, y + ih - 8), 10.0f, OC_COL_SELECT);
+    else if (hovered) fill_round(rt, rf(10, y + 2, RAIL_W - 10, y + ih - 8), 10.0f, OC_COL_HOVER);
+    uint32_t fg = selected ? OC_COL_TEXT : OC_COL_MUTED;
+    draw_icon(rt, glyph, rf(0, y, RAIL_W, y + ih - 22), fg);
+    if (label) draw_text(rt, label, g_rail, rf(0, y + ih - 22, RAIL_W, y + ih - 6), fg);
+    if (g_n_navrows < (int)(sizeof g_navrows / sizeof g_navrows[0])) {
+        g_navrows[g_n_navrows].top = y; g_navrows[g_n_navrows].bot = y + ih;
+        g_navrows[g_n_navrows].act = act; g_n_navrows++;
+    }
+}
+
+static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     fill(rt, rf(0, 0, RAIL_W, h), OC_COL_RAIL);
-    /* Workspace avatar: an accent rounded square with the host's initial.
-     * Clicking it opens the app menu. */
-    D2D1_RECT_F av = rf(14, 16, RAIL_W - 14, 16 + (RAIL_W - 28));
+    g_n_navrows = 0;
+
+    /* Top: workspace-switcher icon — accent rounded square with the host initial. */
+    D2D1_RECT_F av = rf(14, 14, RAIL_W - 14, 14 + (RAIL_W - 28));
     g_rail_btn = av;
     fill_round(rt, av, 12.0f, OC_COL_ACCENT);
     char init[2] = { (char)(g_host[0] ? (g_host[0] >= 'a' && g_host[0] <= 'z'
                         ? g_host[0] - 32 : g_host[0]) : 'O'), 0 };
     draw_text(rt, init, g_ava, av, 0xFFFFFF);
+    if (g_n_navrows < 16) { g_navrows[g_n_navrows].top = av.top; g_navrows[g_n_navrows].bot = av.bottom;
+                            g_navrows[g_n_navrows].act = NAV_SWITCHER; g_n_navrows++; }
+    fill(rt, rf(12, RAIL_W + 2, RAIL_W - 12, RAIL_W + 3), OC_COL_BORDER);  /* divider */
+
+    /* Main nav items. */
+    static const struct { int act; WCHAR glyph; const char *label; int admin; } ITEMS[] = {
+        { VIEW_HOME,     0xE80F, "Home",     0 },
+        { VIEW_DMS,      0xE8BD, "DMs",      0 },
+        { VIEW_ACTIVITY, 0xE7E7, "Activity", 0 },
+        { VIEW_FILES,    0xE838, "Files",    0 },
+        { VIEW_LATER,    0xE734, "Later",    0 },
+        { NAV_MORE,      0xE712, "More",     0 },
+        { VIEW_ADMIN,    0xE713, "Admin",    1 },
+    };
+    float ih = 48.0f, y = RAIL_W + 10;
+    for (size_t i = 0; i < sizeof ITEMS / sizeof ITEMS[0]; i++) {
+        if (ITEMS[i].admin && !(m && self_role(m) >= OC_ROLE_ADMIN)) continue;
+        rail_item(rt, y, ih, ITEMS[i].glyph, ITEMS[i].label, ITEMS[i].act);
+        y += ih;
+    }
+
+    /* Bottom cluster (elastic spacer above): New, Notifications, Profile. */
+    float by = h - 3 * ih - 8;
+    rail_item(rt, by,           ih, 0xE710, "New",   NAV_NEW);
+    rail_item(rt, by + ih,      ih, 0xE7E7, "Alerts", VIEW_NOTIFICATIONS);
+    /* Profile: a colored initial avatar for the signed-in user. */
+    {
+        float py = by + 2 * ih;
+        int selected = (NAV_PROFILE == g_nav_hover);
+        if (selected) fill_round(rt, rf(10, py + 2, RAIL_W - 10, py + ih - 8), 10.0f, OC_COL_HOVER);
+        const char *nm = m ? oc_model_user_name(m, m->user_id) : "";
+        char pi[2] = { (char)((nm && nm[0]) ? (nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]) : 'U'), 0 };
+        D2D1_ELLIPSE e = { { RAIL_W / 2, py + 16 }, 15, 15 };
+        ID2D1RenderTarget_FillEllipse(rt, &e, paint_with(OC_COL_ACCENT_DIM));
+        draw_text(rt, pi, g_ava, rf(0, py + 1, RAIL_W, py + 31), 0xFFFFFF);
+        draw_text(rt, "You", g_rail, rf(0, py + ih - 22, RAIL_W, py + ih - 6), OC_COL_MUTED);
+        if (g_n_navrows < 16) { g_navrows[g_n_navrows].top = py; g_navrows[g_n_navrows].bot = py + ih;
+                                g_navrows[g_n_navrows].act = NAV_PROFILE; g_n_navrows++; }
+    }
 }
 
 static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
@@ -1078,21 +1157,49 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
 
 /* Draw the whole UI into `rt` (window RT for painting, or a DC RT for test
  * shots). Caller wraps this in BeginDraw/EndDraw; brushes must belong to `rt`. */
+/* Views that show the channel sidebar + transcript + composer. */
+static int view_has_sidebar(void) { return g_view == VIEW_HOME || g_view == VIEW_DMS; }
+
+/* A full-pane placeholder for views whose backing feature isn't built yet. */
+static void draw_stub_view(ID2D1RenderTarget *rt, D2D1_RECT_F reg,
+                           const char *title, const char *sub) {
+    fill(rt, rf(reg.left, reg.top, reg.right, reg.top + HEADER_H), OC_COL_HEADER);
+    draw_text(rt, title, g_hdr, rf(reg.left + 20, reg.top, reg.right - 20, reg.top + HEADER_H), OC_COL_TEXT);
+    fill(rt, rf(reg.left, reg.top + HEADER_H - 1, reg.right, reg.top + HEADER_H), OC_COL_BORDER);
+    float cy = (reg.top + HEADER_H + reg.bottom) / 2;
+    IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, sub, g_ui, rf(reg.left, cy - 12, reg.right, cy + 14), OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+}
+
 static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, float H) {
     D2D1_COLOR_F base = col(OC_COL_BASE);
     ID2D1RenderTarget_Clear(rt, &base);
-    if (m) {
-        ensure_selection(m);
+    if (!m) return;
+    ensure_selection(m);
+    draw_rail(rt, m, H);
+
+    if (view_has_sidebar()) {
         float main_x = RAIL_W + SIDEBAR_W;
         float members = (g_show_members && m->authed) ? MEMBERS_W : 0;
         float main_r = W - members, main_w = main_r - main_x;
-        draw_rail(rt, H);
         draw_sidebar(rt, m, H);
         draw_header(rt, m, main_x, main_w);
         draw_transcript(rt, m, rf(main_x, HEADER_H, main_r, H - COMPOSER_H));
         draw_composer(rt, main_x, main_w, H);
         if (members > 0) draw_members(rt, m, W, H);
         else g_n_memrows = 0;
+    } else {
+        D2D1_RECT_F reg = rf(RAIL_W, 0, W, H);
+        switch (g_view) {
+            case VIEW_ACTIVITY:      draw_stub_view(rt, reg, "Activity", "Activity feed \xE2\x80\x94 coming soon"); break;
+            case VIEW_FILES:         draw_stub_view(rt, reg, "Files", "File browser \xE2\x80\x94 coming soon"); break;
+            case VIEW_LATER:         draw_stub_view(rt, reg, "Later", "Saved items \xE2\x80\x94 coming soon"); break;
+            case VIEW_NOTIFICATIONS: draw_stub_view(rt, reg, "Notifications", "Notifications \xE2\x80\x94 coming soon"); break;
+            case VIEW_ADMIN:         draw_stub_view(rt, reg, "Admin", "Storage & audit \xE2\x80\x94 open from the workspace menu"); break;
+            default:                 draw_stub_view(rt, reg, "OpenChime", ""); break;
+        }
+        g_n_memrows = 0;
     }
 }
 
@@ -1185,6 +1292,9 @@ static LRESULT CALLBACK re_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 /* Position the RichEdit over the composer region for the current window size. */
 static void layout_composer(HWND hwnd) {
     if (!g_re) return;
+    /* The composer only belongs to transcript views; hide it elsewhere. */
+    if (!view_has_sidebar()) { ShowWindow(g_re, SW_HIDE); return; }
+    ShowWindow(g_re, SW_SHOW);
     RECT rc; GetClientRect(hwnd, &rc);
     const oc_model *m = model();
     float members = (g_show_members && m && m->authed) ? MEMBERS_W : 0;
@@ -1368,12 +1478,23 @@ static int in_rect(D2D1_RECT_F r, int x, int y) {
 /* Returns 1 if the click hit a control/row (so the caller won't start a text
  * selection), 0 if it fell through to the transcript. */
 static int on_click(HWND hwnd, int x, int y) {
-    /* Workspace avatar -> app menu. */
-    if (in_rect(g_rail_btn, x, y)) {
-        POINT pt = { x, y }; ClientToScreen(hwnd, &pt);
-        show_app_menu(hwnd, pt.x, pt.y);
-        return 1;
+    /* Left-nav rail: switch the primary view, or (Phase 1) open the app menu for
+     * the special icons (switcher / new / profile / more) — a temporary single
+     * home for actions until Phases 2-3 give them dedicated menus. */
+    if ((float)x < RAIL_W) {
+        for (int i = 0; i < g_n_navrows; i++)
+            if ((float)y >= g_navrows[i].top && (float)y < g_navrows[i].bot) {
+                int act = g_navrows[i].act;
+                if (act >= 0) { g_view = act; layout_composer(hwnd); }
+                else { POINT pt = { x, y }; ClientToScreen(hwnd, &pt);
+                       show_app_menu(hwnd, pt.x, pt.y); }
+                return 1;
+            }
+        return 1;   /* clicks in the rail gutter do nothing, but are swallowed */
     }
+    /* Everything below is only meaningful in the transcript views. */
+    if (!view_has_sidebar()) return 1;
+
     /* Members toggle. */
     if (in_rect(g_members_btn, x, y)) {
         g_show_members = !g_show_members;
@@ -2228,8 +2349,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (g_selecting) {
             selection_update(mx, my);
             InvalidateRect(hwnd, NULL, FALSE);
+        } else if ((float)mx < RAIL_W) {
+            /* Rail hover. */
+            int a = -100;
+            for (int i = 0; i < g_n_navrows; i++)
+                if ((float)my >= g_navrows[i].top && (float)my < g_navrows[i].bot) { a = g_navrows[i].act; break; }
+            if (a != g_nav_hover) { g_nav_hover = a; InvalidateRect(hwnd, NULL, FALSE); }
         } else {
-            int r = any_overlay(model()) ? -1 : msgrow_at(my);
+            if (g_nav_hover != -100) { g_nav_hover = -100; InvalidateRect(hwnd, NULL, FALSE); }
+            int r = (any_overlay(model()) || !view_has_sidebar()) ? -1 : msgrow_at(my);
             uint64_t h = r >= 0 ? g_msgrows[r].mid : 0;
             if (h != g_hover_mid) { g_hover_mid = h; InvalidateRect(hwnd, NULL, FALSE); }
         }
@@ -2324,6 +2452,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     if (g_ui_b)  IDWriteTextFormat_Release(g_ui_b);
     if (g_small) IDWriteTextFormat_Release(g_small);
     if (g_ava)   IDWriteTextFormat_Release(g_ava);
+    if (g_icon)  IDWriteTextFormat_Release(g_icon);
+    if (g_rail)  IDWriteTextFormat_Release(g_rail);
     if (g_brush) ID2D1SolidColorBrush_Release(g_brush);
     if (g_brush2) ID2D1SolidColorBrush_Release(g_brush2);
     if (g_rt)     ID2D1HwndRenderTarget_Release(g_rt);
