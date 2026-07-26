@@ -17,7 +17,7 @@
 #define OC_COL_BASE        0x1E2227   /* transcript / main pane */
 #define OC_COL_HEADER      0x1A1D21
 #define OC_COL_SELECT      0x2A3138   /* selected row fill */
-#define OC_COL_HOVER       0x242A30
+#define OC_COL_HOVER       0x262D35   /* row hover — perceptible but below SELECT */
 #define OC_COL_BORDER      0x2C3238
 
 /* Text. */
