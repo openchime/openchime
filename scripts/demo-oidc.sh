@@ -45,7 +45,7 @@ say "Start a daemon in OIDC mode, pinned to the central public key"
 ( cd "$ROOT" && make openchimed >/dev/null && make demo-client >/dev/null )
 OPENCHIME_DB_PATH="$WORK/oidc.db" OPENCHIME_TLS_CERT="$WORK/cert.pem" OPENCHIME_TLS_KEY="$WORK/key.pem" \
 OPENCHIME_BLOB_DIR="$WORK/blobs" OPENCHIME_PROTO_PORT="$PROTO" OPENCHIME_HEALTH_PORT="$HEALTH" \
-OC_AUTH_MODE=oidc OC_OIDC_ISSUER="$ISS" OC_OIDC_AUDIENCE="$AUD" OC_OIDC_PUBKEY_FILE="$WORK/pub.pem" \
+OPENCHIME_AUTH_MODE=oidc OPENCHIME_OIDC_ISSUER="$ISS" OPENCHIME_OIDC_AUDIENCE="$AUD" OPENCHIME_OIDC_PUBKEY_FILE="$WORK/pub.pem" \
 "$ROOT/openchimed" >"$WORK/daemon.log" 2>&1 &
 D_PID=$!
 for _ in $(seq 1 40); do curl -sf "http://localhost:$HEALTH/healthz" >/dev/null 2>&1 && break; sleep 0.3; done

@@ -24,8 +24,8 @@ docker compose -f docker-compose.federated.yml up --build
 
 That stands up Postgres + the control plane (with the dev log push provider + the dev
 enrollment-reserve shortcut) + a daemon that **enrolls hands-off**: the daemon writes its
-`oce1` code to a shared volume (`OC_ENROLL_CODE_FILE`), an `enroll-init` step reserves it
-via the dev endpoint, and the daemon activates (`OC_ENROLL_WAIT_SECS` lets it wait for the
+`oce1` code to a shared volume (`OPENCHIME_ENROLL_CODE_FILE`), an `enroll-init` step reserves it
+via the dev endpoint, and the daemon activates (`OPENCHIME_ENROLL_WAIT_SECS` lets it wait for the
 reserve, then come up Active with push enabled). The daemon serves on `localhost:8443`.
 
 Then drive a client against it:
@@ -87,7 +87,7 @@ build/openchime-tui 127.0.0.1 8443 alice:pw    # <host> <port> [user:pass] direc
   usable blob store — the daemon logs `blob storage = local disk` then exits before
   `netloop: listening`. The script sets it to a temp dir.
 - The demo uses **local auth** for the client (bootstrap users), independent of push.
-  Push only needs the box **enrolled** (active audience + key) and `OC_PUSH_URL` set.
+  Push only needs the box **enrolled** (active audience + key) and `OPENCHIME_PUSH_URL` set.
 - **OIDC-relay login** against a live daemon is *not* covered here — it needs real Google
   credentials on the control plane. The mint↔verify contract is unit-tested on both sides.
 - `demo_client` (`make demo-client`) is the flexible black-box tool: `token <apns|fcm>

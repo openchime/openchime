@@ -11,9 +11,9 @@ verifies a central-issued ES256 JWT against a pinned key (`daemon/jwt.c`, jsmn
 for the claims) and JIT-provisions the user. Both converge on a daemon-issued
 session (§4) and accept session tokens on reconnect (`process_auth` in
 `daemon/dbwriter.c`, crypto in `daemon/auth.c`, wire frames in PROTOCOL.md §4).
-The mode is chosen at boot: default local (`OC_BOOTSTRAP_USERS` provisions the
-owner, §2), or `OC_AUTH_MODE=oidc` with `OC_OIDC_ISSUER` / `OC_OIDC_AUDIENCE` /
-`OC_OIDC_PUBKEY[_FILE]` — `AUTH_CHALLENGE` then advertises the matching methods
+The mode is chosen at boot: default local (`OPENCHIME_BOOTSTRAP_USERS` provisions the
+owner, §2), or `OPENCHIME_AUTH_MODE=oidc` with `OPENCHIME_OIDC_ISSUER` / `OPENCHIME_OIDC_AUDIENCE` /
+`OPENCHIME_OIDC_PUBKEY[_FILE]` — `AUTH_CHALLENGE` then advertises the matching methods
 bitset (`local|session` or `oidc|session`). Failed local-auth is **rate-limited
 per account** (REQ-191, `daemon/ratelimit.c`): after a burst of failures the
 account is refused with `AUTH_RATE_LIMITED`, checked before the expensive PBKDF2.
@@ -251,29 +251,29 @@ existing TLS/netloop integration tests.
 
 **The daemon's enrollment client (ARCH-84).** How a federated box *obtains* its
 audience id is now implemented daemon-side in `daemon/enroll.c`, gated on
-`OC_ENROLL_URL`. On first boot the daemon generates its own ECDSA-P256 keypair +
+`OPENCHIME_ENROLL_URL`. On first boot the daemon generates its own ECDSA-P256 keypair +
 a random `audience` (`ws_…`), persists them (so they survive restarts), and prints
 an `oce1.` **enrollment code** the operator couriers into the control-plane
 console. The daemon then calls out (CA-verified HTTPS — it dials central, never the
 reverse, ARCH-56) to prove possession of the private key and activate the binding.
 The enrolled audience then feeds the OIDC configuration above (§3.4) automatically,
-so an enrolled box need not be given `OC_OIDC_AUDIENCE` by hand. The enrollment
+so an enrolled box need not be given `OPENCHIME_OIDC_AUDIENCE` by hand. The enrollment
 *flow/registry* remains a control-plane concern; only the client half is here.
 Two optional knobs support unattended bring-up (see [DEMO.md](./DEMO.md)):
-`OC_ENROLL_CODE_FILE` also writes the `oce1.` code to a file (so orchestration can
-reserve it without scraping the log), and `OC_ENROLL_WAIT_SECS` retries activation for
+`OPENCHIME_ENROLL_CODE_FILE` also writes the `oce1.` code to a file (so orchestration can
+reserve it without scraping the log), and `OPENCHIME_ENROLL_WAIT_SECS` retries activation for
 that many seconds before serving (default 0 = one attempt, retry next boot), so a box
 can come up already-Active once the operator reserves the code.
 
 **The daemon's push emitter (ARCH-85).** An enrolled box additionally set with
-`OC_PUSH_URL` (the control-plane push gateway; `OC_PUSH_CA_BUNDLE` optional) delivers
+`OPENCHIME_PUSH_URL` (the control-plane push gateway; `OPENCHIME_PUSH_CA_BUNDLE` optional) delivers
 mobile push (REQ-132/133). The daemon owns a device-token registry
 (`REGISTER_DEVICE_TOKEN`); a committed SEND drives an off-hot-path worker that selects
 recipients (members − author, level=ALL, not in DND, holding a token), signs a
 **contentless** batch with the enrollment key — the same request-signature scheme
 central verifies (`openchime-machine-v1|<aud>|<ts>|<sha256(body)>`) — and POSTs it to
 the gateway, which relays to APNs/FCM and returns stale tokens to prune. Absent in
-self-hosted stand-alone (no enrollment / no `OC_PUSH_URL`).
+self-hosted stand-alone (no enrollment / no `OPENCHIME_PUSH_URL`).
 
 ---
 

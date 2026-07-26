@@ -32,8 +32,8 @@ say "Building daemon + demo client"
 daemon_env=(
   OPENCHIME_DB_PATH="$WORK/demo.db" OPENCHIME_TLS_CERT="$WORK/cert.pem" OPENCHIME_TLS_KEY="$WORK/key.pem"
   OPENCHIME_BLOB_DIR="$WORK/blobs" OPENCHIME_PROTO_PORT="$PROTO" OPENCHIME_HEALTH_PORT="$HEALTH"
-  OC_BOOTSTRAP_USERS="alice:pw:owner,bob:pw:member"
-  OC_ENROLL_URL="$CP" OC_PUSH_URL="$CP"
+  OPENCHIME_BOOTSTRAP_USERS="alice:pw:owner,bob:pw:member"
+  OPENCHIME_ENROLL_URL="$CP" OPENCHIME_PUSH_URL="$CP"
 )
 mkdir -p "$WORK/blobs"
 

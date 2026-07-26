@@ -269,6 +269,19 @@ On success the daemon mints a session (ARCH-58) and returns:
 A freshly-authenticated client typically follows `AUTH_OK` with a
 `BACKFILL_REQUEST` (§6) to catch up on anything missed while disconnected.
 
+### 4.3a `WORKSPACE_INFO` (server → client), msg_type `0x0014`
+
+Pushed immediately after `AUTH_OK` (before the presence snapshot). Carries the
+daemon's static workspace facts, sourced from infra config (env, read once at
+boot — see `daemon/config.h`), so a client can render a branded header instead of
+a bare host address. Clients that don't recognize the frame ignore it.
+
+| Field             | Type | Notes                                                       |
+|-------------------|------|-------------------------------------------------------------|
+| `deployment_mode` | u8   | `0` standalone, `1` federated, `2` managed (ARCH-76).       |
+| `max_users`       | u32  | Registered-user cap; `0` = unlimited.                       |
+| `workspace_name`  | str  | Admin-set display name; **empty** ⇒ the client falls back to the connection host's subdomain (e.g. `acme.openchime.io` → "acme"). |
+
 ### 4.4 `LOGOUT` (client → server), msg_type `0x0013`
 
 Revokes daemon-issued sessions (REQ-182) — the local revocation a stateless

@@ -27,7 +27,7 @@ say "Start a local daemon (bootstrap users alice/bob)"
 mkdir -p "$WORK/blobs"
 OPENCHIME_DB_PATH="$WORK/tui.db" OPENCHIME_TLS_CERT="$WORK/cert.pem" OPENCHIME_TLS_KEY="$WORK/key.pem" \
 OPENCHIME_BLOB_DIR="$WORK/blobs" OPENCHIME_PROTO_PORT="$PROTO" OPENCHIME_HEALTH_PORT="$HEALTH" \
-OC_BOOTSTRAP_USERS="alice:pw:owner,bob:pw:member" \
+OPENCHIME_BOOTSTRAP_USERS="alice:pw:owner,bob:pw:member" \
 "$ROOT/openchimed" >"$WORK/daemon.log" 2>&1 &
 D_PID=$!
 for _ in $(seq 1 40); do curl -sf "http://localhost:$HEALTH/healthz" >/dev/null 2>&1 && break; sleep 0.3; done
