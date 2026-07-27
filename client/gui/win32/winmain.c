@@ -153,6 +153,10 @@ static int g_n_webrows;
 static int      g_show_members = 1;     /* members pane visible */
 static D2D1_RECT_F g_members_btn;       /* header toggle hit-box */
 static D2D1_RECT_F g_ws_hdr_btn;        /* channel-column workspace header (opens ws menu) */
+static D2D1_RECT_F g_hdr_gear, g_hdr_compose;   /* header settings + compose buttons */
+static HWND     g_find;                 /* "Find a conversation" filter box (native EDIT) */
+static char     g_find_filter[64];      /* current filter text (lowercased) */
+static HBRUSH   g_find_brush;           /* dark bg for the find box */
 static D2D1_RECT_F g_rail_btn;          /* workspace-avatar hit-box (app menu) */
 static int g_view = VIEW_HOME;          /* current primary view (rail selection) */
 static int g_nav_hover = -100;          /* rail item under the cursor (act value) */
@@ -686,25 +690,43 @@ static void draw_menu(ID2D1RenderTarget *rt) {
 static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     fill(rt, rf(RAIL_W, 0, RAIL_W + SIDEBAR_W, h), OC_COL_SIDEBAR);
 
-    /* Workspace header — the display name + a chevron; click opens the workspace
-     * menu (Invite / Preferences / Tools & settings / Sign out). */
-    g_ws_hdr_btn = rf(RAIL_W, 0, RAIL_W + SIDEBAR_W, HEADER_H);
+    float x1 = RAIL_W + SIDEBAR_W - 12;
+    /* Header: workspace name + chevron (opens ws menu), with settings + compose
+     * icon buttons on the right (Slack channel-column header). */
+    g_hdr_compose = rf(x1 - 24, 16, x1, 40);
+    g_hdr_gear    = rf(x1 - 54, 16, x1 - 30, 40);
+    draw_lucide(rt, OC_ICON_SQUARE_PEN, g_hdr_compose, OC_COL_MUTED);
+    draw_lucide(rt, OC_ICON_SETTINGS,   g_hdr_gear,    OC_COL_MUTED);
+    g_ws_hdr_btn = rf(RAIL_W, 0, g_hdr_gear.left - 4, HEADER_H);
     char wsname[80]; ws_display_name(m, wsname, sizeof wsname);
-    draw_text(rt, wsname, g_hdr, rf(RAIL_W + 16, 0, RAIL_W + SIDEBAR_W - 30, HEADER_H), OC_COL_TEXT);
+    draw_text(rt, wsname, g_hdr, rf(RAIL_W + 16, 0, g_hdr_gear.left - 22, HEADER_H), OC_COL_TEXT);
     IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    draw_text(rt, "\xE2\x96\xBE", g_small, rf(RAIL_W + 16, 2, RAIL_W + SIDEBAR_W - 14, HEADER_H),
-              OC_COL_MUTED);   /* chevron */
+    draw_text(rt, "\xE2\x96\xBE", g_small, rf(RAIL_W + 16, 2, g_hdr_gear.left - 8, HEADER_H), OC_COL_MUTED);
     IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
 
+    /* "Find a conversation" box — a rounded container with a search glyph; the
+     * native EDIT child (g_find) sits inside and live-filters the list. */
+    D2D1_RECT_F fb = rf(RAIL_W + 10, HEADER_H + 6, RAIL_W + SIDEBAR_W - 10, HEADER_H + 36);
+    fill_round(rt, fb, 8.0f, OC_COL_INPUT);
+    stroke_round(rt, fb, 8.0f, OC_COL_BORDER, 1.0f);
+    draw_lucide(rt, OC_ICON_SEARCH, rf(fb.left + 8, fb.top + 7, fb.left + 24, fb.top + 23), OC_COL_MUTED);
+
     /* "Channels" section label. */
-    D2D1_RECT_F sec = rf(RAIL_W + 16, HEADER_H, RAIL_W + SIDEBAR_W - 12, HEADER_H + 24);
+    D2D1_RECT_F sec = rf(RAIL_W + 16, HEADER_H + 46, RAIL_W + SIDEBAR_W - 12, HEADER_H + 68);
     draw_text(rt, "CHANNELS", g_small, sec, OC_COL_FAINT);
 
-    float y = HEADER_H + 26;
+    float y = HEADER_H + 72;
     g_n_rows = 0;
     for (size_t i = 0; i < m->n_channels; i++) {
         const oc_channel *c = &m->channels[i];
         if (!c->name || !c->name[0]) continue;             /* unnamed = not listed yet */
+        if (g_find_filter[0]) {                            /* live filter */
+            char low[160]; size_t k = 0;
+            for (; c->name[k] && k < sizeof low - 1; k++)
+                low[k] = (char)(c->name[k] >= 'A' && c->name[k] <= 'Z' ? c->name[k] + 32 : c->name[k]);
+            low[k] = 0;
+            if (!strstr(low, g_find_filter)) continue;
+        }
         if (y > h) break;
         float x0 = RAIL_W + 8, x1 = RAIL_W + SIDEBAR_W - 8;
         int selected = (c->channel_id == g_sel);
@@ -1536,7 +1558,10 @@ static LRESULT CALLBACK re_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 /* Position the RichEdit over the composer region for the current window size. */
+static void layout_find(HWND hwnd);   /* fwd */
+
 static void layout_composer(HWND hwnd) {
+    layout_find(hwnd);
     if (!g_re) return;
     /* The composer only belongs to transcript views; hide it elsewhere. */
     if (!view_has_sidebar()) { ShowWindow(g_re, SW_HIDE); return; }
@@ -1551,6 +1576,28 @@ static void layout_composer(HWND hwnd) {
     int x = (int)(bx0 + 48), r = (int)(bx1 - 48);
     int reh = 24, top = (int)(by0 + (boxh - reh) / 2);
     MoveWindow(g_re, x, top, r - x, reh, TRUE);
+}
+
+/* Position the "Find a conversation" EDIT inside its sidebar box (transcript
+ * views only). */
+static void layout_find(HWND hwnd) {
+    (void)hwnd;   /* the sidebar has a fixed width; geometry is constant */
+    if (!g_find) return;
+    if (!view_has_sidebar()) { ShowWindow(g_find, SW_HIDE); return; }
+    ShowWindow(g_find, SW_SHOW);
+    int x = (int)(RAIL_W + 10 + 28), r = (int)(RAIL_W + SIDEBAR_W - 10 - 8);
+    int top = (int)(HEADER_H + 6 + 6), hgt = 18;
+    MoveWindow(g_find, x, top, r - x, hgt, TRUE);
+}
+
+static void find_create(HWND parent) {
+    g_find = CreateWindowExW(0, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 10, 10, parent,
+        (HMENU)(INT_PTR)0xF1, GetModuleHandleW(NULL), NULL);
+    if (!g_find) return;
+    SendMessageW(g_find, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    SendMessageW(g_find, EM_SETCUEBANNER, TRUE, (LPARAM)L"Find a conversation…");
+    layout_find(parent);
 }
 
 static void composer_create(HWND parent) {
@@ -1768,8 +1815,10 @@ static int on_click(HWND hwnd, int x, int y) {
     /* Everything below is only meaningful in the transcript views. */
     if (!view_has_sidebar()) return 1;
 
-    /* Channel-column workspace header -> workspace menu. */
-    if (in_rect(g_ws_hdr_btn, x, y)) { open_ws_menu(hwnd); return 1; }
+    /* Header buttons + workspace header. */
+    if (in_rect(g_hdr_gear, x, y))    { open_ws_menu(hwnd); return 1; }
+    if (in_rect(g_hdr_compose, x, y)) { open_new_menu(hwnd); return 1; }
+    if (in_rect(g_ws_hdr_btn, x, y))  { open_ws_menu(hwnd); return 1; }
     /* Members toggle. */
     if (in_rect(g_members_btn, x, y)) {
         g_show_members = !g_show_members;
@@ -2575,6 +2624,10 @@ static void test_poll(HWND hwnd) {
         int w = 0, h = 0; sscanf(arg, "%d %d", &w, &h);
         if (w > 0 && h > 0) SetWindowPos(hwnd, NULL, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
         test_ack("ok");
+    } else if (!strcmp(verb, "find")) {
+        snprintf(g_find_filter, sizeof g_find_filter, "%s", arg);
+        for (char *p = g_find_filter; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
+        test_ack("ok");
     } else if (!strcmp(verb, "dump")) {
         test_dump(arg); test_ack("ok");
     } else {
@@ -2587,6 +2640,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
         composer_create(hwnd);
+        find_create(hwnd);
         DragAcceptFiles(hwnd, TRUE);              /* drop files anywhere to upload */
         SetTimer(hwnd, TIMER_TICK, 30, NULL);
         return 0;
@@ -2658,7 +2712,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_last_typing = now;
             }
         }
+        if (g_find && (HWND)lp == g_find && HIWORD(wp) == EN_CHANGE) {
+            WCHAR w[64]; GetWindowTextW(g_find, w, 64);
+            char b[128]; WideCharToMultiByte(CP_UTF8, 0, w, -1, b, sizeof b, NULL, NULL);
+            for (char *p = b; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
+            snprintf(g_find_filter, sizeof g_find_filter, "%s", b);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
         return 0;
+    case WM_CTLCOLOREDIT:
+        if ((HWND)lp == g_find) {
+            SetBkColor((HDC)wp, OCRGB(OC_COL_INPUT));
+            SetTextColor((HDC)wp, OCRGB(OC_COL_TEXT));
+            if (!g_find_brush) g_find_brush = CreateSolidBrush(OCRGB(OC_COL_INPUT));
+            return (LRESULT)g_find_brush;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_MOUSEWHEEL:
         g_scroll += (float)GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 48.0f;
         if (g_scroll < 0) g_scroll = 0;

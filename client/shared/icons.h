@@ -20,6 +20,8 @@ enum {
     OC_ICON_PLUS,
     OC_ICON_BELL,
     OC_ICON_USER,
+    OC_ICON_SQUARE_PEN,
+    OC_ICON_SEARCH,
     OC_ICON_COUNT
 };
 

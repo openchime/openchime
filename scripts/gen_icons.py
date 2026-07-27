@@ -24,6 +24,8 @@ ICONS = [
     ("PLUS",     "plus"),
     ("BELL",     "bell"),
     ("USER",     "circle-user"),
+    ("SQUARE_PEN","square-pen"),
+    ("SEARCH",   "search"),
 ]
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SVGDIR = os.path.join(ROOT, "third_party", "lucide", "icons")
