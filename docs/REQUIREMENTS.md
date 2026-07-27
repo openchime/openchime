@@ -437,10 +437,11 @@ the requirement says so explicitly rather than implying one.
   `BACKFILL_REQUEST` carrying per-channel `after_message_id` cursors answered
   with replayed messages and a `BACKFILL_DONE` marker (ARCH-46).
 - **REQ-102.** A message composed while the client is disconnected has been
-  queued locally in the client's **offline outbox** (a table in its SQLite
-  store, ARCH-64) and sent automatically on reconnect, in the order composed,
-  each with its original idempotency token (REQ-093), without requiring the user
-  to resend it manually.
+  queued locally in the client's **offline outbox** and sent automatically on
+  reconnect, in the order composed, each with its original idempotency token
+  (REQ-093), without requiring the user to resend it manually. The outbox is a
+  plain file in the client's state directory (ARCH-88); **no client has embedded
+  a database engine** — see REQ-201.
 
 ### 3.3 Protocol Versioning and Compatibility
 
@@ -775,6 +776,17 @@ the requirement says so explicitly rather than implying one.
   be. **[needs ARCH decision — explicit platform commitment, including
   whether Android/macOS packaging follows the Linux/Windows model in
   ARCH-20/ARCH-21]**
+
+- **REQ-201.** **No client has embedded a database engine.** Every client's local
+  state — the session token, the TOFU pin (REQ-183), the remembered-workspace book
+  (REQ-012), the cached history (REQ-101) and the offline outbox (REQ-102) — has
+  been held in the **operating system's credential store** (for the credential,
+  the pin, and the workspace book) and in **plain files** (for the bulk cache and
+  the outbox), never in SQLite or any equivalent (ARCH-88). A client is a cache
+  with a credential attached, not a datastore: it has one writer, reads its cache
+  whole at startup, and issues no queries, so it has required no query engine,
+  indexes, transactions, or schema migrations. This is a client-side rule only —
+  the daemon's own store is SQLite by ARCH-2 and is unaffected.
 
 ---
 
