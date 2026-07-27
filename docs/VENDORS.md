@@ -138,11 +138,26 @@ not the GUI.
 
 ---
 
+## Lucide (icons, ISC)
+
+The graphical clients' left-nav rail icons come from [Lucide](https://lucide.dev)
+(ISC License). We vendor **only the handful of SVGs we use**
+(`third_party/lucide/icons/*.svg`) plus the license (`third_party/lucide/LICENSE`).
+A dev-time script (`scripts/gen_icons.py`, uses `svgelements`) flattens those SVGs
+into platform-agnostic cubic-bezier path data baked into `client/shared/icons.{h,c}`
+— so there is **no icon-font dependency** and each native client strokes the same
+geometry with its own 2D API (Win32 uses Direct2D `ID2D1PathGeometry`). The
+generated `icons.c` carries the ISC attribution in its header. Only the baked
+paths ship; nothing is fetched at runtime.
+
+---
+
 ## License summary
 
 | License | Packages | Notes |
 |---------|----------|-------|
 | **MIT** | termbox2, utf8proc, jsmn | Vendored, committed |
+| **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; SVGs + LICENSE vendored |
 | **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
 | **Public Domain** | SQLite | System-linked |
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |

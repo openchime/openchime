@@ -174,9 +174,9 @@ $(WIN_TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $
 # TUI/tuikit stack and links the Direct2D stack. -municode gives the wWinMain
 # Unicode entry point; -mwindows selects the GUI subsystem (no console).
 WIN_GUI_BIN := build/openchime.exe
-GUI_SRC := $(wildcard client/gui/win32/*.c)
+GUI_SRC := $(wildcard client/gui/win32/*.c) client/shared/icons.c
 WIN_GUI_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
-               $(CORE_INC) -Iclient/gui/win32 -Ithird_party/sqlite
+               $(CORE_INC) -Iclient/gui/win32 -Iclient/shared -Ithird_party/sqlite
 
 windows-gui: $(WIN_GUI_BIN)
 $(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(SQLITE_SRC) \

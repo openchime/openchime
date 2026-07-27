@@ -38,6 +38,7 @@
 #include "oc_port.h"          /* oc_mkdir, oc_localtime_r */
 #include "protocol.h"         /* OC_CHANNEL_KIND_DM, OC_PRESENCE_* */
 #include "theme.h"
+#include "icons.h"            /* baked Lucide vector icons (cross-platform) */
 
 /* mingw ships IID_ID2D1Factory in libuuid but not IID_IDWriteFactory; define it
  * locally so we don't depend on the toolchain's GUID table for DWrite. */
@@ -47,7 +48,7 @@ static const GUID OC_IID_IDWriteFactory =
 #define TIMER_TICK 1
 
 /* Layout metrics (device pixels; per-monitor DPI is a later phase). */
-#define RAIL_W      64.0f
+#define RAIL_W      70.0f     /* pixel-matched to the Slack rail reference */
 #define SIDEBAR_W   250.0f
 #define HEADER_H    56.0f
 #define COMPOSER_H  86.0f
@@ -91,8 +92,11 @@ static IDWriteTextFormat *g_ui;     /* sidebar rows / composer */
 static IDWriteTextFormat *g_ui_b;   /* unread sidebar rows (semibold) */
 static IDWriteTextFormat *g_small;  /* subtitles / meta lines */
 static IDWriteTextFormat *g_ava;    /* avatar initial (centered) */
-static IDWriteTextFormat *g_icon;   /* Segoe MDL2 rail glyphs (monochrome, centered) */
 static IDWriteTextFormat *g_rail;   /* tiny rail item labels (centered) */
+/* Lucide vector icons: geometry cached once (device-independent, from the factory,
+ * so it survives render-target recreation and works for both paint and shots). */
+static ID2D1PathGeometry *g_icon_geo[OC_ICON_COUNT];
+static ID2D1StrokeStyle  *g_icon_stroke;   /* round cap/join, matching Lucide */
 
 static uint64_t g_sel;              /* selected channel id (0 = none) */
 static float    g_scroll;           /* px scrolled up from the bottom of the transcript */
@@ -153,6 +157,13 @@ static int g_nav_hover = -100;          /* rail item under the cursor (act value
 /* Rail item hit-boxes, captured during paint. `act` >=0 is a VIEW_*, <0 a NAV_*. */
 static struct { float top, bot; int act; } g_navrows[16];
 static int g_n_navrows;
+/* Overflow "More": items that didn't fit, revealed in a flyout. */
+static int g_more_open;
+static float g_more_y;                   /* the More item's top, to anchor the flyout */
+static struct { int act, icon; const char *label; } g_more[8];
+static int g_n_more;
+static struct { float top, bot; int act; } g_moreflyrows[8];
+static int g_n_moreflyrows;
 static D2D1_RECT_F g_attach_btn;        /* composer attach (+) hit-box */
 static D2D1_RECT_F g_send_btn;          /* composer send-button hit-box */
 static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
@@ -209,6 +220,12 @@ static void fill_round(ID2D1RenderTarget *rt, D2D1_RECT_F r, float rad, uint32_t
     ID2D1RenderTarget_FillRoundedRectangle(rt, &rr, paint_with(rgb));
 }
 
+/* Rounded fill with alpha — for translucent overlays (Slack-style selection). */
+static void fill_round_a(ID2D1RenderTarget *rt, D2D1_RECT_F r, float rad, uint32_t rgb, float a) {
+    D2D1_ROUNDED_RECT rr = { r, rad, rad };
+    ID2D1RenderTarget_FillRoundedRectangle(rt, &rr, paint_alpha(rgb, a));
+}
+
 static void stroke_round(ID2D1RenderTarget *rt, D2D1_RECT_F r, float rad,
                          uint32_t rgb, float w) {
     D2D1_ROUNDED_RECT rr = { r, rad, rad };
@@ -231,10 +248,54 @@ static void draw_text(ID2D1RenderTarget *rt, const char *s, IDWriteTextFormat *f
                                D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
 }
 
-/* Draw a single icon-font (Segoe MDL2) glyph centered in `r`. */
-static void draw_icon(ID2D1RenderTarget *rt, WCHAR cp, D2D1_RECT_F r, uint32_t rgb) {
-    ID2D1RenderTarget_DrawText(rt, &cp, 1, g_icon, &r, paint_with(rgb),
-                               D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+/* Build (once) a stroked path geometry for a Lucide icon in its 24x24 space. */
+static ID2D1PathGeometry *icon_geo(int id) {
+    if (id < 0 || id >= OC_ICON_COUNT) return NULL;
+    if (g_icon_geo[id]) return g_icon_geo[id];
+    ID2D1PathGeometry *geo = NULL;
+    if (FAILED(ID2D1Factory_CreatePathGeometry(g_factory, &geo)) || !geo) return NULL;
+    ID2D1GeometrySink *sink = NULL;
+    if (FAILED(ID2D1PathGeometry_Open(geo, &sink)) || !sink) {
+        ID2D1PathGeometry_Release(geo); return NULL;
+    }
+    const oc_icon *ic = &OC_ICONS[id];
+    int open = 0;
+    for (int i = 0; i < ic->n; i++) {
+        const oc_icon_seg *s = &ic->segs[i];
+        if (s->op == 'M') {
+            if (open) ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_OPEN);
+            D2D1_POINT_2F p = { s->x0, s->y0 };
+            ID2D1GeometrySink_BeginFigure(sink, p, D2D1_FIGURE_BEGIN_HOLLOW);   /* stroked */
+            open = 1;
+        } else if (s->op == 'L') {
+            D2D1_POINT_2F p = { s->x0, s->y0 };
+            ID2D1GeometrySink_AddLine(sink, p);
+        } else if (s->op == 'C') {
+            D2D1_BEZIER_SEGMENT b = { { s->x0, s->y0 }, { s->x1, s->y1 }, { s->x2, s->y2 } };
+            ID2D1GeometrySink_AddBezier(sink, &b);
+        } else if (s->op == 'Z') {
+            if (open) { ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED); open = 0; }
+        }
+    }
+    if (open) ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_OPEN);
+    ID2D1GeometrySink_Close(sink);
+    ID2D1GeometrySink_Release(sink);
+    g_icon_geo[id] = geo;
+    return geo;
+}
+
+/* Draw a Lucide icon stroked (2px, round caps) fitted + centered in `box`. */
+static void draw_lucide(ID2D1RenderTarget *rt, int id, D2D1_RECT_F box, uint32_t rgb) {
+    ID2D1PathGeometry *geo = icon_geo(id);
+    if (!geo) return;
+    float bw = box.right - box.left, bh = box.bottom - box.top;
+    float side = bw < bh ? bw : bh, s = side / OC_ICON_VIEWBOX;
+    D2D1_MATRIX_3X2_F m = {{{ s, 0, 0, s,
+                           box.left + (bw - side) / 2, box.top + (bh - side) / 2 }}};
+    ID2D1RenderTarget_SetTransform(rt, &m);
+    ID2D1RenderTarget_DrawGeometry(rt, (ID2D1Geometry *)geo, paint_with(rgb), 2.0f, g_icon_stroke);
+    D2D1_MATRIX_3X2_F ident = {{{ 1, 0, 0, 1, 0, 0 }}};
+    ID2D1RenderTarget_SetTransform(rt, &ident);
 }
 
 /* ---- Direct2D / DirectWrite setup ---------------------------------------- */
@@ -269,8 +330,14 @@ static void d2d_init(void) {
     g_ui_b  = mk_fmt(UI, 14.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
     g_small = mk_fmt(UI, 12.5f, DWRITE_FONT_WEIGHT_NORMAL,    DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
     g_ava   = mk_fmt(UI, 15.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER,   DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
-    g_icon  = mk_fmt(L"Segoe MDL2 Assets", 19.0f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
-    g_rail  = mk_fmt(UI, 10.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
+    g_rail  = mk_fmt(UI, 9.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
+    /* Round-capped stroke style for the Lucide line icons. */
+    D2D1_STROKE_STYLE_PROPERTIES ssp;
+    ZeroMemory(&ssp, sizeof ssp);
+    ssp.startCap = ssp.endCap = ssp.dashCap = D2D1_CAP_STYLE_ROUND;
+    ssp.lineJoin = D2D1_LINE_JOIN_ROUND;
+    ssp.miterLimit = 10.0f; ssp.dashStyle = D2D1_DASH_STYLE_SOLID;
+    ID2D1Factory_CreateStrokeStyle(g_factory, &ssp, NULL, 0, &g_icon_stroke);
     /* Roomier line height on message bodies for readability (Slack-like). */
     if (g_body)
         IDWriteTextFormat_SetLineSpacing(g_body, DWRITE_LINE_SPACING_METHOD_UNIFORM, 22.0f, 16.5f);
@@ -379,72 +446,134 @@ static void ensure_selection(const oc_model *m) {
 
 /* ---- rail + sidebar ------------------------------------------------------ */
 
-/* One rail item: MDL2 glyph + tiny label, with selection + hover states. Records
- * a hit-box carrying `act` (a VIEW_* when >=0, else a NAV_* sentinel). */
-static void rail_item(ID2D1RenderTarget *rt, float y, float ih, WCHAR glyph,
-                      const char *label, int act) {
-    int selected = (act >= 0 && act == g_view);
-    int hovered  = (act == g_nav_hover);
-    if (selected) fill_round(rt, rf(10, y + 2, RAIL_W - 10, y + ih - 8), 10.0f, OC_COL_SELECT);
-    else if (hovered) fill_round(rt, rf(10, y + 2, RAIL_W - 10, y + ih - 8), 10.0f, OC_COL_HOVER);
-    uint32_t fg = selected ? OC_COL_TEXT : OC_COL_MUTED;
-    draw_icon(rt, glyph, rf(0, y, RAIL_W, y + ih - 22), fg);
-    if (label) draw_text(rt, label, g_rail, rf(0, y + ih - 22, RAIL_W, y + ih - 6), fg);
+#define RAIL_IH 68.0f     /* rail item pitch — pixel-matched to Slack (center-to-center) */
+
+static void rail_hit(float top, float bot, int act) {
     if (g_n_navrows < (int)(sizeof g_navrows / sizeof g_navrows[0])) {
-        g_navrows[g_n_navrows].top = y; g_navrows[g_n_navrows].bot = y + ih;
+        g_navrows[g_n_navrows].top = top; g_navrows[g_n_navrows].bot = bot;
         g_navrows[g_n_navrows].act = act; g_n_navrows++;
     }
 }
+
+/* One rail item: a Lucide icon + tiny label. Matches Slack: selected is a
+ * subtle translucent-white rounded square with a WHITE icon; unselected icons +
+ * labels are bright (not muted); hover is a fainter overlay. */
+static void rail_item(ID2D1RenderTarget *rt, float y, int icon, const char *label, int act) {
+    int selected = (act >= 0 && act == g_view);
+    int hovered  = (act == g_nav_hover);
+    /* Slack spec: 36x36 rounded square (radius ~10), 20px icon centered, label
+     * below; item pitch RAIL_IH. */
+    float cx = RAIL_W / 2;
+    D2D1_RECT_F sq = rf(cx - 18, y + 6, cx + 18, y + 42);          /* 36x36 */
+    uint32_t icon_col = OC_COL_RAIL_ICON;
+    if (selected)     { fill_round_a(rt, sq, 10.0f, 0xFFFFFF, 0.16f); icon_col = 0xFFFFFF; }
+    else if (hovered) { fill_round_a(rt, sq, 10.0f, 0xFFFFFF, 0.08f); icon_col = 0xFFFFFF; }
+    draw_lucide(rt, icon, rf(cx - 10, y + 14, cx + 10, y + 34), icon_col);   /* 20px */
+    if (label) draw_text(rt, label, g_rail, rf(0, y + 45, RAIL_W, y + 61),
+                         selected ? 0xFFFFFF : OC_COL_RAIL_ICON);
+    rail_hit(y, y + RAIL_IH, act);
+}
+
+/* The main nav items (the user's list). "More" is synthesized only on overflow. */
+static const struct { int act; int icon; const char *label; int admin; } RAIL_ITEMS[] = {
+    { VIEW_HOME,     OC_ICON_HOME,     "Home",     0 },
+    { VIEW_DMS,      OC_ICON_DMS,      "DMs",      0 },
+    { VIEW_ACTIVITY, OC_ICON_ACTIVITY, "Activity", 0 },
+    { VIEW_FILES,    OC_ICON_FILE,     "Files",    0 },
+    { VIEW_LATER,    OC_ICON_BOOKMARK, "Later",    0 },
+    { VIEW_ADMIN,    OC_ICON_SETTINGS, "Admin",    1 },
+};
+#define RAIL_N_ITEMS ((int)(sizeof RAIL_ITEMS / sizeof RAIL_ITEMS[0]))
 
 static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     fill(rt, rf(0, 0, RAIL_W, h), OC_COL_RAIL);
     g_n_navrows = 0;
 
-    /* Top: workspace-switcher icon — accent rounded square with the host initial. */
-    D2D1_RECT_F av = rf(14, 14, RAIL_W - 14, 14 + (RAIL_W - 28));
+    /* Top: workspace-switcher — a 36x36 rounded square (Slack spec) with the host
+     * initial. */
+    float cx = RAIL_W / 2;
+    D2D1_RECT_F av = rf(cx - 18, 14, cx + 18, 50);
     g_rail_btn = av;
     fill_round(rt, av, 12.0f, OC_COL_ACCENT);
     char init[2] = { (char)(g_host[0] ? (g_host[0] >= 'a' && g_host[0] <= 'z'
                         ? g_host[0] - 32 : g_host[0]) : 'O'), 0 };
     draw_text(rt, init, g_ava, av, 0xFFFFFF);
-    if (g_n_navrows < 16) { g_navrows[g_n_navrows].top = av.top; g_navrows[g_n_navrows].bot = av.bottom;
-                            g_navrows[g_n_navrows].act = NAV_SWITCHER; g_n_navrows++; }
-    fill(rt, rf(12, RAIL_W + 2, RAIL_W - 12, RAIL_W + 3), OC_COL_BORDER);  /* divider */
+    rail_hit(av.top - 6, av.bottom + 6, NAV_SWITCHER);
+    fill(rt, rf(14, 58, RAIL_W - 14, 59), OC_COL_BORDER);   /* divider */
 
-    /* Main nav items. */
-    static const struct { int act; WCHAR glyph; const char *label; int admin; } ITEMS[] = {
-        { VIEW_HOME,     0xE80F, "Home",     0 },
-        { VIEW_DMS,      0xE8BD, "DMs",      0 },
-        { VIEW_ACTIVITY, 0xE7E7, "Activity", 0 },
-        { VIEW_FILES,    0xE838, "Files",    0 },
-        { VIEW_LATER,    0xE734, "Later",    0 },
-        { NAV_MORE,      0xE712, "More",     0 },
-        { VIEW_ADMIN,    0xE713, "Admin",    1 },
-    };
-    float ih = 48.0f, y = RAIL_W + 10;
-    for (size_t i = 0; i < sizeof ITEMS / sizeof ITEMS[0]; i++) {
-        if (ITEMS[i].admin && !(m && self_role(m) >= OC_ROLE_ADMIN)) continue;
-        rail_item(rt, y, ih, ITEMS[i].glyph, ITEMS[i].label, ITEMS[i].act);
-        y += ih;
+    /* Gate admin-only items, then overflow the tail into "More" when there isn't
+     * enough vertical space (fold Admin first, up toward Home; Home never folds). */
+    int vis[RAIL_N_ITEMS], nv = 0;
+    for (int i = 0; i < RAIL_N_ITEMS; i++)
+        if (!RAIL_ITEMS[i].admin || (m && self_role(m) >= OC_ROLE_ADMIN)) vis[nv++] = i;
+
+    float y = 64;                                   /* below the workspace + divider */
+    float by = h - 3 * RAIL_IH - 6;                 /* bottom cluster top */
+    int maxfit = (int)((by - y) / RAIL_IH);
+    if (maxfit < 1) maxfit = 1;
+    int shown = nv, overflow = 0;
+    if (nv > maxfit) { shown = maxfit - 1; if (shown < 1) shown = 1; overflow = 1; }
+
+    g_n_more = 0;
+    for (int k = 0; k < shown; k++) {
+        rail_item(rt, y, RAIL_ITEMS[vis[k]].icon, RAIL_ITEMS[vis[k]].label, RAIL_ITEMS[vis[k]].act);
+        y += RAIL_IH;
+    }
+    if (overflow) {
+        for (int k = shown; k < nv && g_n_more < (int)(sizeof g_more / sizeof g_more[0]); k++) {
+            g_more[g_n_more].act = RAIL_ITEMS[vis[k]].act;
+            g_more[g_n_more].icon = RAIL_ITEMS[vis[k]].icon;
+            g_more[g_n_more].label = RAIL_ITEMS[vis[k]].label;
+            g_n_more++;
+        }
+        g_more_y = y;
+        rail_item(rt, y, OC_ICON_ELLIPSIS, "More", NAV_MORE);
+        y += RAIL_IH;
+    } else {
+        g_more_open = 0;   /* nothing folded — no flyout */
     }
 
-    /* Bottom cluster (elastic spacer above): New, Notifications, Profile. */
-    float by = h - 3 * ih - 8;
-    rail_item(rt, by,           ih, 0xE710, "New",   NAV_NEW);
-    rail_item(rt, by + ih,      ih, 0xE7E7, "Alerts", VIEW_NOTIFICATIONS);
+    /* Bottom cluster (elastic spacer above): New, Alerts, Profile. */
+    rail_item(rt, by,               OC_ICON_PLUS, "New",    NAV_NEW);
+    rail_item(rt, by + RAIL_IH,     OC_ICON_BELL, "Alerts", VIEW_NOTIFICATIONS);
     /* Profile: a colored initial avatar for the signed-in user. */
     {
-        float py = by + 2 * ih;
-        int selected = (NAV_PROFILE == g_nav_hover);
-        if (selected) fill_round(rt, rf(10, py + 2, RAIL_W - 10, py + ih - 8), 10.0f, OC_COL_HOVER);
+        float py = by + 2 * RAIL_IH;
+        if (NAV_PROFILE == g_nav_hover)
+            fill_round_a(rt, rf(cx - 18, py + 6, cx + 18, py + 42), 10.0f, 0xFFFFFF, 0.08f);
         const char *nm = m ? oc_model_user_name(m, m->user_id) : "";
         char pi[2] = { (char)((nm && nm[0]) ? (nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]) : 'U'), 0 };
-        D2D1_ELLIPSE e = { { RAIL_W / 2, py + 16 }, 15, 15 };
+        D2D1_ELLIPSE e = { { cx, py + 24 }, 15, 15 };
         ID2D1RenderTarget_FillEllipse(rt, &e, paint_with(OC_COL_ACCENT_DIM));
-        draw_text(rt, pi, g_ava, rf(0, py + 1, RAIL_W, py + 31), 0xFFFFFF);
-        draw_text(rt, "You", g_rail, rf(0, py + ih - 22, RAIL_W, py + ih - 6), OC_COL_MUTED);
-        if (g_n_navrows < 16) { g_navrows[g_n_navrows].top = py; g_navrows[g_n_navrows].bot = py + ih;
-                                g_navrows[g_n_navrows].act = NAV_PROFILE; g_n_navrows++; }
+        draw_text(rt, pi, g_ava, rf(0, py + 9, RAIL_W, py + 39), 0xFFFFFF);
+        draw_text(rt, "You", g_rail, rf(0, py + 45, RAIL_W, py + 61), OC_COL_RAIL_ICON);
+        rail_hit(py, py + RAIL_IH, NAV_PROFILE);
+    }
+}
+
+/* The "More" overflow flyout: a floating list of the folded rail items, anchored
+ * beside the More icon. Drawn last so it floats over the pane. */
+static void draw_more_flyout(ID2D1RenderTarget *rt) {
+    g_n_moreflyrows = 0;
+    if (!g_more_open || g_n_more == 0) return;
+    float rowh = 40, w = 196, pad = 6;
+    float x0 = RAIL_W + 6, y0 = g_more_y;
+    D2D1_RECT_F panel = rf(x0, y0, x0 + w, y0 + g_n_more * rowh + 2 * pad);
+    fill_round(rt, rf(panel.left + 2, panel.top + 3, panel.right + 2, panel.bottom + 3), 12.0f,
+               OC_COL_RAIL);                                  /* soft shadow */
+    fill_round(rt, panel, 12.0f, OC_COL_INPUT);
+    stroke_round(rt, panel, 12.0f, OC_COL_BORDER, 1.0f);
+    float y = y0 + pad;
+    for (int i = 0; i < g_n_more; i++) {
+        int hovered = (g_more[i].act == g_nav_hover);
+        if (hovered) fill_round(rt, rf(x0 + 4, y + 2, panel.right - 4, y + rowh - 2), 8.0f, OC_COL_HOVER);
+        draw_lucide(rt, g_more[i].icon, rf(x0 + 12, y + 9, x0 + 34, y + 31), OC_COL_TEXT);
+        draw_text(rt, g_more[i].label, g_ui, rf(x0 + 44, y, panel.right - 8, y + rowh), OC_COL_TEXT);
+        g_moreflyrows[g_n_moreflyrows].top = y;
+        g_moreflyrows[g_n_moreflyrows].bot = y + rowh;
+        g_moreflyrows[g_n_moreflyrows].act = g_more[i].act;
+        g_n_moreflyrows++;
+        y += rowh;
     }
 }
 
@@ -1173,6 +1302,9 @@ static void draw_stub_view(ID2D1RenderTarget *rt, D2D1_RECT_F reg,
 }
 
 static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, float H) {
+    /* Grayscale AA: on a dark UI, ClearType subpixel fringing tints thin text
+     * (visible color speckle on the rail labels); grayscale is cleaner. */
+    ID2D1RenderTarget_SetTextAntialiasMode(rt, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     D2D1_COLOR_F base = col(OC_COL_BASE);
     ID2D1RenderTarget_Clear(rt, &base);
     if (!m) return;
@@ -1201,6 +1333,7 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         }
         g_n_memrows = 0;
     }
+    draw_more_flyout(rt);   /* floats over the pane when open */
 }
 
 static void paint(HWND hwnd) {
@@ -1478,14 +1611,27 @@ static int in_rect(D2D1_RECT_F r, int x, int y) {
 /* Returns 1 if the click hit a control/row (so the caller won't start a text
  * selection), 0 if it fell through to the transcript. */
 static int on_click(HWND hwnd, int x, int y) {
-    /* Left-nav rail: switch the primary view, or (Phase 1) open the app menu for
-     * the special icons (switcher / new / profile / more) — a temporary single
-     * home for actions until Phases 2-3 give them dedicated menus. */
+    /* The "More" overflow flyout takes clicks first: a row selects that view; a
+     * click anywhere else just dismisses it. */
+    if (g_more_open) {
+        for (int i = 0; i < g_n_moreflyrows; i++)
+            if ((float)y >= g_moreflyrows[i].top && (float)y < g_moreflyrows[i].bot &&
+                (float)x >= RAIL_W && (float)x < RAIL_W + 6 + 196) {
+                g_view = g_moreflyrows[i].act; g_more_open = 0; layout_composer(hwnd);
+                return 1;
+            }
+        g_more_open = 0;
+        return 1;
+    }
+    /* Left-nav rail: switch the primary view (VIEW_*), toggle the More flyout, or
+     * (Phase 1) open the app menu for the other special icons (switcher / new /
+     * profile) — a temporary home for actions until Phases 2-3 give them menus. */
     if ((float)x < RAIL_W) {
         for (int i = 0; i < g_n_navrows; i++)
             if ((float)y >= g_navrows[i].top && (float)y < g_navrows[i].bot) {
                 int act = g_navrows[i].act;
-                if (act >= 0) { g_view = act; layout_composer(hwnd); }
+                if (act >= 0)             { g_view = act; layout_composer(hwnd); }
+                else if (act == NAV_MORE) { g_more_open = !g_more_open; }
                 else { POINT pt = { x, y }; ClientToScreen(hwnd, &pt);
                        show_app_menu(hwnd, pt.x, pt.y); }
                 return 1;
@@ -2369,8 +2515,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_KEYDOWN:
         if (wp == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)) { copy_selection(hwnd); return 0; }
+        if (wp == VK_ESCAPE && g_more_open) { g_more_open = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_ESCAPE && g_has_sel) { g_has_sel = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         return 0;
+    case WM_GETMINMAXINFO: {
+        /* Item 4: never shrink below fitting the workspace icon + Home + More +
+         * New + Alerts + Profile (the overflow floor). */
+        MINMAXINFO *mmi = (MINMAXINFO *)lp;
+        RECT wr, cr; GetWindowRect(hwnd, &wr); GetClientRect(hwnd, &cr);
+        int frameH = (int)((wr.bottom - wr.top) - (cr.bottom - cr.top));
+        int frameW = (int)((wr.right - wr.left) - (cr.right - cr.left));
+        if (frameH < 0 || frameH > 200) frameH = 40;
+        if (frameW < 0 || frameW > 200) frameW = 16;
+        int minClientH = (int)(64 + 2 * RAIL_IH + 3 * RAIL_IH + 12);  /* start+Home+More+cluster */
+        mmi->ptMinTrackSize.y = minClientH + frameH;
+        mmi->ptMinTrackSize.x = 640 + frameW;
+        return 0;
+    }
     case WM_RBUTTONDOWN:
         on_rclick(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
         InvalidateRect(hwnd, NULL, FALSE);
@@ -2432,7 +2593,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
 
     HWND hwnd = CreateWindowExW(0, L"OpenChimeWin", L"OpenChime",
                     WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
-                    1080, 720, NULL, NULL, inst, NULL);
+                    1120, 820, NULL, NULL, inst, NULL);
     if (!hwnd) return 1;
     apply_dark_titlebar(hwnd);
     ShowWindow(hwnd, show);
@@ -2452,8 +2613,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     if (g_ui_b)  IDWriteTextFormat_Release(g_ui_b);
     if (g_small) IDWriteTextFormat_Release(g_small);
     if (g_ava)   IDWriteTextFormat_Release(g_ava);
-    if (g_icon)  IDWriteTextFormat_Release(g_icon);
     if (g_rail)  IDWriteTextFormat_Release(g_rail);
+    for (int i = 0; i < OC_ICON_COUNT; i++)
+        if (g_icon_geo[i]) ID2D1PathGeometry_Release(g_icon_geo[i]);
+    if (g_icon_stroke) ID2D1StrokeStyle_Release(g_icon_stroke);
     if (g_brush) ID2D1SolidColorBrush_Release(g_brush);
     if (g_brush2) ID2D1SolidColorBrush_Release(g_brush2);
     if (g_rt)     ID2D1HwndRenderTarget_Release(g_rt);

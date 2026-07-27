@@ -22,6 +22,10 @@
 #define OC_COL_HOVER       0x1D2C48   /* row hover — perceptible, below SELECT */
 #define OC_COL_BORDER      0x27395C
 
+/* Rail (left-nav) icon/label when unselected — bright, matching Slack's ~78%
+ * white (selected uses pure white on a translucent-white square). */
+#define OC_COL_RAIL_ICON   0xC4C9D3
+
 /* Text. */
 #define OC_COL_TEXT        0xE9EDF5
 #define OC_COL_MUTED       0x93A1BC
