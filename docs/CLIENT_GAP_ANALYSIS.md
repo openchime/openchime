@@ -462,21 +462,21 @@ This analysis is reference-centric (what Slack and Pumble have that we lack). Fo
 
 **What it is.** A Slack-shaped SaaS team chat product from **COING** (Clockify, Plaky), positioned explicitly as the cheap Slack alternative. Deliberately narrower than Slack: no Canvas, no Lists, no Enterprise-Grid equivalent, no cross-org federation, and ~10 named integrations against Slack's 2,600+. Within *core chat*, it is close to Slack parity and ahead of both OpenChime clients on almost every row in §2.
 
-**Plan gating is the story.** Pumble's headline price is not the price of a comparable product:
+**Plan gating is the story.** Pumble's cheapest tier is not a comparable product — what each vendor gates behind which tier is the real difference (specific per-seat pricing is out of scope for this repo; see the control-plane repo):
 
-| Capability | Cheapest Pumble plan | Slack plan that includes it |
+| Capability | Cheapest Pumble tier | Cheapest Slack tier |
 |---|---|---|
-| Unlimited message history + unlimited users | **Free** | Pro ($7.25) |
-| Group video meetings, screen share | Pro ($2.49) | Free (limited) / Pro |
-| Guests, roles & permissions, unlimited integrations | Business ($3.99) | Pro ($7.25) |
-| **SSO (SAML2/OAuth2)** | **Enterprise ($6.99)** | **Pro ($7.25)** |
-| **Data-retention policy** | **Enterprise ($6.99)** | Business+ ($15) |
+| Unlimited message history + unlimited users | **Free** | Pro (lowest paid) |
+| Group video meetings, screen share | Pro | Free (limited) / Pro |
+| Guests, roles & permissions, unlimited integrations | Business | Pro |
+| **SSO (SAML2/OAuth2)** | **Enterprise (top tier)** | **Pro (lowest paid)** |
+| **Data-retention policy** | **Enterprise (top tier)** | Business+ |
 
 So the like-for-like comparison depends entirely on whether you need SSO — see §8.
 
 **Two corrections to Pumble's own comparison marketing** (its blog vs its help centre / Slack's site):
 
-1. Its comparison page shows **SSO as a flat ✓ for Pumble**, implying parity. Its pricing page confirms SSO is **Enterprise-only** — the top tier, ~2.8× the entry price. Slack includes SAML SSO from **Pro**, its *lowest paid* tier.
+1. Its comparison page shows **SSO as a flat ✓ for Pumble**, implying parity. Its pricing page confirms SSO is **Enterprise-only** — its top tier. Slack includes SAML SSO from **Pro**, its *lowest paid* tier.
 2. It claims **voice/video messages as a Pumble-only feature (✗ for Slack)**. Slack has shipped Clips for years. Treat that page as marketing, not evidence.
 
 **Also worth recording:** Pumble has **no read receipts** (confirmed in its own FAQ — *"seeing who viewed the message is not supported"*), which preserves REQ-090's seen-by as a genuine differentiator against both references; and Pumble **matches our unlimited-history wedge on its free tier**, which retires that argument (see §6).
@@ -516,4 +516,4 @@ Researched 2026-07-26. Vendor-authored comparison content was treated as claim, 
 
 **Vendor comparison (claims, cross-checked):** [Pumble vs Slack](https://pumble.com/blog/pumble-vs-slack/)
 
-**Independent / third-party:** [Cloudwards Pumble review](https://www.cloudwards.net/pumble-review/) · [Capterra](https://www.capterra.com/p/218055/Pumble/pricing/) · [GetApp Slack vs Pumble](https://www.getapp.com/collaboration-software/a/slack/compare/pumble/) · [TrustRadius Pumble pricing](https://www.trustradius.com/products/pumble/pricing) · [Vendr: Slack enterprise pricing data](https://www.vendr.com/blog/slack-pricing-what-it-costs-in-2026-real-enterprise-data)
+**Independent / third-party:** [Cloudwards Pumble review](https://www.cloudwards.net/pumble-review/) · [Capterra](https://www.capterra.com/p/218055/Pumble/pricing/) · [GetApp Slack vs Pumble](https://www.getapp.com/collaboration-software/a/slack/compare/pumble/) · [TrustRadius Pumble](https://www.trustradius.com/products/pumble/pricing)
