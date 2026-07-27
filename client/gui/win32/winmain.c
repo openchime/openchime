@@ -77,6 +77,7 @@ static oc_client *g_client;
 static char       g_cred[264];
 static char       g_host[256];
 static int        g_port;
+static char       g_cur_ws[256];        /* the workspace string we connected with */
 
 static ID2D1Factory          *g_factory;
 static IDWriteFactory        *g_dwrite;
@@ -151,6 +152,7 @@ static int g_n_webrows;
 
 static int      g_show_members = 1;     /* members pane visible */
 static D2D1_RECT_F g_members_btn;       /* header toggle hit-box */
+static D2D1_RECT_F g_ws_hdr_btn;        /* channel-column workspace header (opens ws menu) */
 static D2D1_RECT_F g_rail_btn;          /* workspace-avatar hit-box (app menu) */
 static int g_view = VIEW_HOME;          /* current primary view (rail selection) */
 static int g_nav_hover = -100;          /* rail item under the cursor (act value) */
@@ -164,6 +166,27 @@ static struct { int act, icon; const char *label; } g_more[8];
 static int g_n_more;
 static struct { float top, bot; int act; } g_moreflyrows[8];
 static int g_n_moreflyrows;
+
+/* ---- custom D2D dropdown menus (workspace / profile / new / switcher) -------
+ * One reusable floating menu replaces the old TrackPopupMenu. An opener fills
+ * g_mi[] + anchor; draw_menu() renders it last so it floats; on_click routes to
+ * menu_dispatch(). Item kinds: ITEM (icon+label+cmd), SECTION (faint header),
+ * SEP. MENU_WS/MENU_SWITCHER also draw a workspace header block on top. */
+enum { MENU_NONE = 0, MENU_WS, MENU_PROFILE, MENU_NEW, MENU_SWITCHER };
+enum { MK_ITEM = 0, MK_SECTION, MK_SEP };
+struct menuitem { int kind, cmd, icon, danger; char label[72]; };
+static int   g_menu;                     /* which menu is open (MENU_NONE = none) */
+static struct menuitem g_mi[28];
+static int   g_n_mi;
+static float g_menu_x, g_menu_y, g_menu_w;   /* panel top-left + width */
+static int   g_menu_hover = -1;              /* hovered item index */
+static int   g_menu_headerblock;             /* draw the workspace header on top */
+static struct { float top, bot; int cmd; } g_mirows[28];
+static int   g_n_mirows;
+/* Workspace switcher list (built from the store book at open time). */
+static struct { char ws[256], label[80]; int current; } g_sw[16];
+static int   g_n_sw;
+
 static D2D1_RECT_F g_attach_btn;        /* composer attach (+) hit-box */
 static D2D1_RECT_F g_send_btn;          /* composer send-button hit-box */
 static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
@@ -577,12 +600,101 @@ static void draw_more_flyout(ID2D1RenderTarget *rt) {
     }
 }
 
+/* ---- custom dropdown menus ----------------------------------------------- */
+
+static void mi_add(int kind, int cmd, const char *label, int danger) {
+    if (g_n_mi >= (int)(sizeof g_mi / sizeof g_mi[0])) return;
+    struct menuitem *it = &g_mi[g_n_mi++];
+    it->kind = kind; it->cmd = cmd; it->icon = -1; it->danger = danger;
+    it->label[0] = 0;
+    if (label) snprintf(it->label, sizeof it->label, "%s", label);
+}
+#define mi_item(cmd, label)    mi_add(MK_ITEM, (cmd), (label), 0)
+#define mi_item_d(cmd, label)  mi_add(MK_ITEM, (cmd), (label), 1)
+#define mi_section(label)      mi_add(MK_SECTION, 0, (label), 0)
+#define mi_sep()               mi_add(MK_SEP, 0, NULL, 0)
+
+/* Workspace display name, or the host's leading label as a fallback. */
+static void ws_display_name(const oc_model *m, char *out, size_t cap) {
+    const char *nm = m ? oc_model_workspace_name(m) : "";
+    if (nm && nm[0]) { snprintf(out, cap, "%s", nm); return; }
+    size_t i = 0;
+    while (g_host[i] && g_host[i] != '.' && g_host[i] != ':' && i < cap - 1) { out[i] = g_host[i]; i++; }
+    out[i] = 0;
+    if (!out[0]) snprintf(out, cap, "OpenChime");
+}
+
+static void ws_mode_line(const oc_model *m, char *out, size_t cap) {
+    const char *dn = m ? oc_model_deployment_name(m) : "standalone";
+    char cap_dn[24]; snprintf(cap_dn, sizeof cap_dn, "%s", dn);
+    if (cap_dn[0] >= 'a' && cap_dn[0] <= 'z') cap_dn[0] -= 32;
+    uint32_t mu = m ? oc_model_max_users(m) : 0;
+    if (mu > 0) snprintf(out, cap, "%s \xC2\xB7 %u users", cap_dn, mu);
+    else        snprintf(out, cap, "%s", cap_dn);
+}
+
+static float menu_item_h(int kind) { return kind == MK_ITEM ? 36.0f : kind == MK_SECTION ? 24.0f : 11.0f; }
+
+static void draw_menu(ID2D1RenderTarget *rt) {
+    g_n_mirows = 0;
+    if (!g_menu) return;
+    const oc_model *m = model();
+    float pad = 6, x = g_menu_x, y = g_menu_y, w = g_menu_w;
+    float hh = g_menu_headerblock ? 66.0f : 0.0f;
+    float total = pad * 2 + hh;
+    for (int i = 0; i < g_n_mi; i++) total += menu_item_h(g_mi[i].kind);
+    D2D1_RECT_F panel = rf(x, y, x + w, y + total);
+    fill_round(rt, rf(panel.left + 2, panel.top + 4, panel.right + 2, panel.bottom + 4), 12.0f, OC_COL_RAIL);
+    fill_round(rt, panel, 12.0f, OC_COL_INPUT);
+    stroke_round(rt, panel, 12.0f, OC_COL_BORDER, 1.0f);
+
+    float cy = y + pad;
+    if (g_menu_headerblock) {
+        D2D1_RECT_F av = rf(x + 14, cy + 10, x + 54, cy + 50);
+        fill_round(rt, av, 10.0f, OC_COL_ACCENT);
+        char init[2] = { (char)(g_host[0] ? (g_host[0] >= 'a' && g_host[0] <= 'z' ? g_host[0] - 32 : g_host[0]) : 'O'), 0 };
+        draw_text(rt, init, g_ava, av, 0xFFFFFF);
+        char nm[80]; ws_display_name(m, nm, sizeof nm);
+        draw_text(rt, nm, g_name, rf(x + 64, cy + 9, panel.right - 12, cy + 30), OC_COL_TEXT);
+        char hostline[288]; snprintf(hostline, sizeof hostline, "%s:%d", g_host, g_port);
+        draw_text(rt, hostline, g_small, rf(x + 64, cy + 28, panel.right - 12, cy + 45), OC_COL_MUTED);
+        char mode[64]; ws_mode_line(m, mode, sizeof mode);
+        draw_text(rt, mode, g_small, rf(x + 64, cy + 44, panel.right - 12, cy + 61), OC_COL_FAINT);
+        cy += hh;
+        fill(rt, rf(x + 8, cy, panel.right - 8, cy + 1), OC_COL_BORDER);
+    }
+    for (int i = 0; i < g_n_mi; i++) {
+        float ih = menu_item_h(g_mi[i].kind);
+        if (g_mi[i].kind == MK_SEP) {
+            fill(rt, rf(x + 10, cy + ih / 2, panel.right - 10, cy + ih / 2 + 1), OC_COL_BORDER);
+        } else if (g_mi[i].kind == MK_SECTION) {
+            draw_text(rt, g_mi[i].label, g_small, rf(x + 16, cy + 5, panel.right - 10, cy + ih), OC_COL_FAINT);
+        } else {
+            if (g_menu_hover == i)
+                fill_round(rt, rf(x + 5, cy + 2, panel.right - 5, cy + ih - 2), 7.0f, OC_COL_HOVER);
+            uint32_t col = g_mi[i].danger ? OC_COL_DANGER : OC_COL_TEXT;
+            draw_text(rt, g_mi[i].label, g_ui, rf(x + 16, cy, panel.right - 12, cy + ih), col);
+            if (g_n_mirows < (int)(sizeof g_mirows / sizeof g_mirows[0])) {
+                g_mirows[g_n_mirows].top = cy; g_mirows[g_n_mirows].bot = cy + ih;
+                g_mirows[g_n_mirows].cmd = g_mi[i].cmd; g_n_mirows++;
+            }
+        }
+        cy += ih;
+    }
+}
+
 static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     fill(rt, rf(RAIL_W, 0, RAIL_W + SIDEBAR_W, h), OC_COL_SIDEBAR);
 
-    /* Workspace header. */
-    D2D1_RECT_F hdr = rf(RAIL_W + 16, 0, RAIL_W + SIDEBAR_W - 12, HEADER_H);
-    draw_text(rt, g_host[0] ? g_host : "OpenChime", g_hdr, hdr, OC_COL_TEXT);
+    /* Workspace header — the display name + a chevron; click opens the workspace
+     * menu (Invite / Preferences / Tools & settings / Sign out). */
+    g_ws_hdr_btn = rf(RAIL_W, 0, RAIL_W + SIDEBAR_W, HEADER_H);
+    char wsname[80]; ws_display_name(m, wsname, sizeof wsname);
+    draw_text(rt, wsname, g_hdr, rf(RAIL_W + 16, 0, RAIL_W + SIDEBAR_W - 30, HEADER_H), OC_COL_TEXT);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    draw_text(rt, "\xE2\x96\xBE", g_small, rf(RAIL_W + 16, 2, RAIL_W + SIDEBAR_W - 14, HEADER_H),
+              OC_COL_MUTED);   /* chevron */
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
 
     /* "Channels" section label. */
     D2D1_RECT_F sec = rf(RAIL_W + 16, HEADER_H, RAIL_W + SIDEBAR_W - 12, HEADER_H + 24);
@@ -1334,6 +1446,7 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         g_n_memrows = 0;
     }
     draw_more_flyout(rt);   /* floats over the pane when open */
+    draw_menu(rt);          /* dropdown menus float on top of everything */
 }
 
 static void paint(HWND hwnd) {
@@ -1601,8 +1714,12 @@ static void show_member_menu(HWND hwnd, const oc_model *m, uint64_t uid, int sx,
 
 /* ---- input --------------------------------------------------------------- */
 
-static void show_app_menu(HWND hwnd, int sx, int sy);
 static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, int sx, int sy);
+static void open_ws_menu(HWND hwnd);
+static void open_profile_menu(HWND hwnd);
+static void open_new_menu(HWND hwnd);
+static void open_switcher(HWND hwnd);
+static void menu_dispatch(HWND hwnd, int cmd);
 
 static int in_rect(D2D1_RECT_F r, int x, int y) {
     return (float)x >= r.left && (float)x <= r.right && (float)y >= r.top && (float)y <= r.bottom;
@@ -1611,8 +1728,18 @@ static int in_rect(D2D1_RECT_F r, int x, int y) {
 /* Returns 1 if the click hit a control/row (so the caller won't start a text
  * selection), 0 if it fell through to the transcript. */
 static int on_click(HWND hwnd, int x, int y) {
-    /* The "More" overflow flyout takes clicks first: a row selects that view; a
-     * click anywhere else just dismisses it. */
+    /* An open dropdown menu takes clicks first: a row runs its command; a click
+     * anywhere else dismisses it. */
+    if (g_menu) {
+        for (int i = 0; i < g_n_mirows; i++)
+            if ((float)y >= g_mirows[i].top && (float)y < g_mirows[i].bot &&
+                (float)x >= g_menu_x && (float)x < g_menu_x + g_menu_w) {
+                int cmd = g_mirows[i].cmd; g_menu = MENU_NONE; g_menu_hover = -1;
+                menu_dispatch(hwnd, cmd); return 1;
+            }
+        g_menu = MENU_NONE; g_menu_hover = -1; return 1;
+    }
+    /* The "More" overflow flyout takes clicks next. */
     if (g_more_open) {
         for (int i = 0; i < g_n_moreflyrows; i++)
             if ((float)y >= g_moreflyrows[i].top && (float)y < g_moreflyrows[i].bot &&
@@ -1623,17 +1750,17 @@ static int on_click(HWND hwnd, int x, int y) {
         g_more_open = 0;
         return 1;
     }
-    /* Left-nav rail: switch the primary view (VIEW_*), toggle the More flyout, or
-     * (Phase 1) open the app menu for the other special icons (switcher / new /
-     * profile) — a temporary home for actions until Phases 2-3 give them menus. */
+    /* Left-nav rail: switch the primary view (VIEW_*), or open a dropdown for the
+     * special icons (switcher / new / profile) / the More overflow. */
     if ((float)x < RAIL_W) {
         for (int i = 0; i < g_n_navrows; i++)
             if ((float)y >= g_navrows[i].top && (float)y < g_navrows[i].bot) {
                 int act = g_navrows[i].act;
-                if (act >= 0)             { g_view = act; layout_composer(hwnd); }
-                else if (act == NAV_MORE) { g_more_open = !g_more_open; }
-                else { POINT pt = { x, y }; ClientToScreen(hwnd, &pt);
-                       show_app_menu(hwnd, pt.x, pt.y); }
+                if (act >= 0)                  { g_view = act; layout_composer(hwnd); }
+                else if (act == NAV_MORE)      { g_more_open = !g_more_open; }
+                else if (act == NAV_SWITCHER)  { open_switcher(hwnd); }
+                else if (act == NAV_NEW)       { open_new_menu(hwnd); }
+                else if (act == NAV_PROFILE)   { open_profile_menu(hwnd); }
                 return 1;
             }
         return 1;   /* clicks in the rail gutter do nothing, but are swallowed */
@@ -1641,6 +1768,8 @@ static int on_click(HWND hwnd, int x, int y) {
     /* Everything below is only meaningful in the transcript views. */
     if (!view_has_sidebar()) return 1;
 
+    /* Channel-column workspace header -> workspace menu. */
+    if (in_rect(g_ws_hdr_btn, x, y)) { open_ws_menu(hwnd); return 1; }
     /* Members toggle. */
     if (in_rect(g_members_btn, x, y)) {
         g_show_members = !g_show_members;
@@ -1886,6 +2015,7 @@ static void connect_start(const char *ws, const char *cred) {
     }
     snprintf(g_host, sizeof g_host, "%s", ep.host);
     g_port = ep.port;
+    snprintf(g_cur_ws, sizeof g_cur_ws, "%s", ws);
     snprintf(g_cred, sizeof g_cred, "%s", cred);
     g_client = oc_client_start_secure(g_host, g_port, g_cred, store_path(), NULL);
 
@@ -2123,86 +2253,150 @@ static int g_logging_out;
 static int g_await_invite;      /* show the minted invite token once it arrives */
 static int g_await_webhook;     /* show the minted webhook token once it arrives */
 
-static void show_app_menu(HWND hwnd, int sx, int sy) {
-    HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, 1, L"New channel…");
-    AppendMenuW(menu, MF_STRING, 4, L"Search messages…");
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    HMENU status = CreatePopupMenu();
-    AppendMenuW(status, MF_STRING, 10, L"Online");
-    AppendMenuW(status, MF_STRING, 11, L"Away");
-    AppendMenuW(menu, MF_POPUP, (UINT_PTR)status, L"Set status");
-    AppendMenuW(menu, MF_STRING, 50, L"Do not disturb…");
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    HMENU profile = CreatePopupMenu();
-    AppendMenuW(profile, MF_STRING, 30, L"Change display name…");
-    AppendMenuW(profile, MF_STRING, 31, L"Change password…");
-    AppendMenuW(menu, MF_POPUP, (UINT_PTR)profile, L"Your profile");
+static float menu_total_height(void) {
+    float t = 12 + (g_menu_headerblock ? 66 : 0);
+    for (int i = 0; i < g_n_mi; i++) t += menu_item_h(g_mi[i].kind);
+    return t;
+}
+
+/* Re-point the single client at another workspace (true N-hosting is a later
+ * phase). Empty cred = silent reconnect via the stored session token. */
+static void switch_workspace(HWND hwnd, const char *ws, const char *cred) {
+    if (g_client) { oc_client_stop(g_client); g_client = NULL; }
+    g_sel = 0; g_view = VIEW_HOME; g_scroll = 0; g_post_auth = 0;
+    g_n_backfilled = 0; g_has_sel = 0; g_more_open = 0; g_menu = MENU_NONE;
+    connect_start(ws, cred ? cred : "");
+    layout_composer(hwnd);
+}
+
+static void sw_book_cb(void *ctx, const char *workspace, const char *label,
+                       const char *username, uint64_t last) {
+    (void)ctx; (void)username; (void)last;
+    if (g_n_sw >= (int)(sizeof g_sw / sizeof g_sw[0])) return;
+    snprintf(g_sw[g_n_sw].ws, sizeof g_sw[g_n_sw].ws, "%s", workspace ? workspace : "");
+    snprintf(g_sw[g_n_sw].label, sizeof g_sw[g_n_sw].label, "%s",
+             (label && label[0]) ? label : (workspace ? workspace : "?"));
+    g_sw[g_n_sw].current = (strcmp(g_sw[g_n_sw].ws, g_cur_ws) == 0);
+    g_n_sw++;
+}
+
+static void open_ws_menu(HWND hwnd) {
+    (void)hwnd;
     const oc_model *m = model();
-    if (m && self_role(m) >= OC_ROLE_ADMIN) {
-        HMENU invite = CreatePopupMenu();
-        AppendMenuW(invite, MF_STRING, 40, L"as Member");
-        AppendMenuW(invite, MF_STRING, 41, L"as Admin");
-        AppendMenuW(menu, MF_POPUP, (UINT_PTR)invite, L"Invite people");
-        AppendMenuW(menu, MF_STRING, 60, L"Storage usage");
-        AppendMenuW(menu, MF_STRING, 61, L"Audit log");
+    int admin = m && self_role(m) >= OC_ROLE_ADMIN;
+    g_n_mi = 0;
+    if (admin) { mi_item(40, "Invite people as member"); mi_item(41, "Invite people as admin"); mi_sep(); }
+    mi_item(70, "Preferences");
+    if (admin) { mi_section("TOOLS & SETTINGS"); mi_item(60, "Storage usage"); mi_item(61, "Audit log"); }
+    mi_sep();
+    mi_item(2, "Reconnect now");
+    mi_item_d(3, "Sign out");
+    mi_item_d(5, "Sign out everywhere");
+    g_menu = MENU_WS; g_menu_headerblock = 1; g_menu_hover = -1;
+    g_menu_x = RAIL_W + 8; g_menu_y = HEADER_H - 6; g_menu_w = 268;
+}
+
+static void open_profile_menu(HWND hwnd) {
+    g_n_mi = 0;
+    mi_item(10, "Set status: Online");
+    mi_item(11, "Set status: Away");
+    mi_item(50, "Do not disturb\xE2\x80\xA6");
+    mi_sep();
+    mi_item(30, "Change display name\xE2\x80\xA6");
+    mi_item(31, "Change password\xE2\x80\xA6");
+    g_menu = MENU_PROFILE; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 224;
+    RECT rc; GetClientRect(hwnd, &rc);
+    float profile_top = rc.bottom - 3 * RAIL_IH - 6 + 2 * RAIL_IH;
+    g_menu_x = RAIL_W + 8;
+    g_menu_y = profile_top - menu_total_height();
+    if (g_menu_y < 8) g_menu_y = 8;
+}
+
+static void open_new_menu(HWND hwnd) {
+    g_n_mi = 0;
+    mi_item(1, "New channel\xE2\x80\xA6");
+    mi_item(6, "New direct message\xE2\x80\xA6");
+    mi_item(7, "Upload a file\xE2\x80\xA6");
+    mi_sep();
+    mi_item(4, "Search messages\xE2\x80\xA6");
+    g_menu = MENU_NEW; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 224;
+    RECT rc; GetClientRect(hwnd, &rc);
+    float new_top = rc.bottom - 3 * RAIL_IH - 6;
+    g_menu_x = RAIL_W + 8;
+    g_menu_y = new_top - menu_total_height();
+    if (g_menu_y < 8) g_menu_y = 8;
+}
+
+static void open_switcher(HWND hwnd) {
+    (void)hwnd;
+    g_n_sw = 0;
+    const char *sp = store_path();
+    oc_store *s = sp ? oc_store_open(sp) : NULL;
+    if (s) { oc_store_workspace_each(s, sw_book_cb, NULL); oc_store_close(s); }
+    g_n_mi = 0;
+    mi_section("WORKSPACES");
+    for (int i = 0; i < g_n_sw; i++) {
+        char lbl[110];
+        snprintf(lbl, sizeof lbl, "%s%s", g_sw[i].label, g_sw[i].current ? "  \xE2\x9C\x93" : "");
+        mi_item(100 + i, lbl);
     }
-    AppendMenuW(menu, MF_STRING, 2, L"Reconnect now");
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, 3, L"Log out");
-    int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTBUTTON, sx, sy, 0, hwnd, NULL);
-    DestroyMenu(menu);
+    if (g_n_sw == 0) mi_item(-1, "(no remembered workspaces)");
+    mi_sep();
+    mi_item(80, "Add a workspace\xE2\x80\xA6");
+    g_menu = MENU_SWITCHER; g_menu_headerblock = 0; g_menu_hover = -1;
+    g_menu_x = RAIL_W + 8; g_menu_y = 12; g_menu_w = 244;
+}
+
+static void menu_dispatch(HWND hwnd, int cmd) {
+    const oc_model *m = model();
     switch (cmd) {
-    case 1: {
-        char name[80];
+    case 1: { char name[80];
         if (text_prompt(hwnd, "New channel", "Channel name:", "", name, sizeof name, 0) && name[0])
             oc_client_create_channel(g_client, name);
-        break;
-    }
+        break; }
     case 2:  oc_client_reconnect(g_client); break;
     case 3:  oc_client_logout(g_client, OC_LOGOUT_THIS); g_logging_out = 1; break;
-    case 4: {
-        char q[128];
+    case 5:  oc_client_logout(g_client, OC_LOGOUT_ALL);  g_logging_out = 1; break;
+    case 4: { char q[128];
         if (text_prompt(hwnd, "Search", "Search messages:", "", q, sizeof q, 0) && q[0]) {
-            g_scroll = 0; oc_client_search(g_client, q);
-        }
-        break;
-    }
+            g_view = VIEW_HOME; g_scroll = 0; oc_client_search(g_client, q); } break; }
+    case 6: { char u[64];
+        if (m && text_prompt(hwnd, "New direct message", "Username:", "", u, sizeof u, 0) && u[0]) {
+            uint64_t id = oc_model_user_id(m, u);
+            if (id) { g_view = VIEW_HOME; oc_client_open_dm(g_client, id); } } break; }
+    case 7:  g_view = VIEW_HOME; upload_file(hwnd); break;
     case 10: oc_client_set_presence(g_client, OC_PRESENCE_ONLINE); break;
     case 11: oc_client_set_presence(g_client, OC_PRESENCE_AWAY); break;
-    case 30: {
-        char name[64];
-        const char *cur = m ? oc_model_user_name(m, m->user_id) : "";
-        if (text_prompt(hwnd, "Display name", "New display name:", cur ? cur : "",
-                        name, sizeof name, 0) && name[0])
+    case 30: { char name[64]; const char *cur = m ? oc_model_user_name(m, m->user_id) : "";
+        if (text_prompt(hwnd, "Display name", "New display name:", cur ? cur : "", name, sizeof name, 0) && name[0])
             oc_client_set_display_name(g_client, name);
-        break;
-    }
-    case 31: {
-        char oldp[128], newp[128];
+        break; }
+    case 31: { char oldp[128], newp[128];
         if (text_prompt(hwnd, "Change password", "Current password:", "", oldp, sizeof oldp, 1) &&
             text_prompt(hwnd, "Change password", "New password:", "", newp, sizeof newp, 1) && newp[0])
             oc_client_change_password(g_client, oldp, newp);
-        break;
-    }
+        break; }
     case 40: oc_client_invite_user(g_client, OC_ROLE_MEMBER); g_await_invite = 1; break;
     case 41: oc_client_invite_user(g_client, OC_ROLE_ADMIN);  g_await_invite = 1; break;
-    case 60: close_overlays(); oc_client_toggle_storage(g_client, 1); oc_client_storage_status(g_client); break;
-    case 61: close_overlays(); oc_client_toggle_audit(g_client, 1);   oc_client_audit_query(g_client, 0); break;
-    case 50: {
-        char win[32];
-        if (text_prompt(hwnd, "Do not disturb", "Window HH:MM-HH:MM (blank = off):", "",
-                        win, sizeof win, 0)) {
+    case 60: g_view = VIEW_HOME; close_overlays(); oc_client_toggle_storage(g_client, 1); oc_client_storage_status(g_client); break;
+    case 61: g_view = VIEW_HOME; close_overlays(); oc_client_toggle_audit(g_client, 1); oc_client_audit_query(g_client, 0); break;
+    case 50: { char win[32];
+        if (text_prompt(hwnd, "Do not disturb", "Window HH:MM-HH:MM (blank = off):", "", win, sizeof win, 0)) {
             int sh, sm, eh, em;
             if (win[0] && sscanf(win, "%d:%d-%d:%d", &sh, &sm, &eh, &em) == 4)
                 oc_client_set_dnd(g_client, 1, (uint16_t)(sh * 60 + sm), (uint16_t)(eh * 60 + em));
-            else
-                oc_client_set_dnd(g_client, 0, 0, 0);
-        }
+            else oc_client_set_dnd(g_client, 0, 0, 0); } break; }
+    case 70: MessageBoxW(hwnd, L"Preferences \xE2\x80\x94 coming soon.", L"Preferences", MB_OK | MB_ICONINFORMATION); break;
+    case 80: { HINSTANCE inst = GetModuleHandleW(NULL); char aws[256], acred[264];
+        if (login_dialog(inst, aws, sizeof aws, acred, sizeof acred, NULL, NULL))
+            switch_workspace(hwnd, aws, acred);
+        break; }
+    default:
+        if (cmd >= 100 && cmd - 100 < g_n_sw && !g_sw[cmd - 100].current)
+            switch_workspace(hwnd, g_sw[cmd - 100].ws, "");
         break;
     }
-    default: break;
-    }
+    InvalidateRect(hwnd, NULL, FALSE);
 }
 
 static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, int sx, int sy) {
@@ -2495,6 +2689,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (g_selecting) {
             selection_update(mx, my);
             InvalidateRect(hwnd, NULL, FALSE);
+        } else if (g_menu) {
+            /* Dropdown-menu hover. */
+            int h = -1;
+            for (int i = 0; i < g_n_mirows; i++)
+                if ((float)my >= g_mirows[i].top && (float)my < g_mirows[i].bot &&
+                    (float)mx >= g_menu_x && (float)mx < g_menu_x + g_menu_w) {
+                    /* map row index back to item index for hover highlight */
+                    h = i; break;
+                }
+            /* g_menu_hover indexes g_mi[]; approximate by matching the row's cmd. */
+            int hi = -1;
+            if (h >= 0) for (int i = 0, r = 0; i < g_n_mi; i++)
+                if (g_mi[i].kind == MK_ITEM) { if (r == h) { hi = i; break; } r++; }
+            if (hi != g_menu_hover) { g_menu_hover = hi; InvalidateRect(hwnd, NULL, FALSE); }
         } else if ((float)mx < RAIL_W) {
             /* Rail hover. */
             int a = -100;
@@ -2515,6 +2723,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_KEYDOWN:
         if (wp == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)) { copy_selection(hwnd); return 0; }
+        if (wp == VK_ESCAPE && g_menu) { g_menu = MENU_NONE; g_menu_hover = -1; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_ESCAPE && g_more_open) { g_more_open = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_ESCAPE && g_has_sel) { g_has_sel = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         return 0;
