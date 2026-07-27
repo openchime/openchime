@@ -71,16 +71,22 @@ order" belongs in integration.
   `#include` the `.c` under test directly (the openblocks technique) — but none
   currently do, so all link the public API instead.
 
-- Built and run by `make test`, compiled `-O0 -g` (debuggable, and cheap since
-  there is no window/GL/TLS to link). A non-zero exit fails the build and CI.
+- Built and run by `make test`, compiled `-O0 -g` (debuggable). A non-zero exit
+  fails the build and CI. One rule builds the single binary from every
+  `tests/*.c` plus the daemon and app-core objects it links:
 
   ```makefile
-  test: build/test_protocol
-  	./build/test_protocol
+  test: $(TEST_BIN)
+  	./$(TEST_BIN)
 
-  build/test_protocol: tests/test_protocol.c shared/protocol.c shared/protocol.h | build
-  	$(CC) $(CFLAGS) -O0 -g -Isrc tests/test_protocol.c -o $@
+  $(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(HDRS) $(MBEDTLS_A) | build
+  	$(CC) $(CFLAGS) -O0 -g $(INC) $(CORE_INC) -Itests \
+  	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MBEDTLS_LIBS) \
+  	    -lsqlite3 -lresolv -lpthread -o $@
   ```
+
+  Adding a suite is therefore two steps: drop in `tests/test_<subject>.c`
+  exposing `run_<subject>_tests()`, and call it from `tests/main.c`.
 
 No external test dependency is vendored. The projects that share this
 convention deliberately keep the harness to ~15 lines rather than pull in a
@@ -210,8 +216,8 @@ group to cancel superseded runs.
 
 Jobs:
 
-- **`build`** — installs `libsqlite3-dev`, runs `make` (and `make test` once the
-  first `tests/` TU exists). Fast feedback on compile + unit tests.
+- **`build`** — installs `libsqlite3-dev`, then runs `make` and `make test`.
+  Fast feedback on compile + unit tests.
 - **`integration`** — the deployed image end-to-end on the Compose stack:
   build the image, bring the stack up, wait for `/healthz`, then drive the
   protocol vertical over TLS with the e2e client. This is the automation of the

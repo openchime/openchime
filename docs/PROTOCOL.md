@@ -1228,6 +1228,7 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0011` | `AUTH_OK`          | S → C     | no        | §4.3    |
 | `0x0012` | `AUTH_CHALLENGE`   | S → C     | no        | §4.1    |
 | `0x0013` | `LOGOUT`           | C → S     | no        | §4.4    |
+| `0x0014` | `WORKSPACE_INFO`   | S → C     | no        | §4.3a   |
 | `0x0040` | `LIST_USERS`       | C → S     | no        | §5.8    |
 | `0x0041` | `USER_LIST`        | S → C     | no        | §5.8    |
 | `0x0042` | `SET_ROLE`         | C → S     | no        | §5.8    |

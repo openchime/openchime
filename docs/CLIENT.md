@@ -24,7 +24,9 @@ client/core/   the app-core — frontend-agnostic, headless-testable C:
                net thread + session + (later) SQLite store + the view-model
                (channels, messages, roster, presence, unread) + reducers
 client/tui/    terminal frontend over the core                (first frontend)
-[client/win, client/mac, ...]   native GUIs over the same core (later)
+client/gui/win32/  the native Win32 GUI over the same core    (in progress)
+client/shared/ assets shared by graphical frontends (baked Lucide icon paths)
+[client/gui/gtk, client/gui/mac, ...]  further native GUIs    (later)
 ```
 
 The **app-core is the one shared asset.** It holds *all* logic and state; a
@@ -142,7 +144,8 @@ model; translate input to intents }, stop.
   *over* the machine-local file — a value in the daemon bucket wins, else the
   file default stands. The core exposes it as `oc_client_set_setting` /
   `oc_client_list_settings`, folding each snapshot into the model
-  (`oc_model_setting`); the `tui` bucket is separate from a future `gui` one, so
+  (`oc_model_setting`); the `tui` bucket is separate from the `gui` one the
+  Win32 client identifies as, so
   frontends never step on each other. Synced prefs are read-only from the TUI: it
   pulls the daemon bucket on connect and layers it over the machine-local
   `~/.config/openchime/config` file, but the interactive `/set` writer was

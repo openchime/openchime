@@ -31,7 +31,7 @@ Representative figures (they vary a few KB/ms run to run):
 | Metric | Value |
 |--------|-------|
 | Baseline daemon RSS (0 connections) | **~5 MB** |
-| RSS per idle authenticated connection | **~50 KB** |
+| RSS per idle authenticated connection | **~50–60 KB** |
 | 100 idle connections | ~10–12 MB total |
 | 200 idle connections | ~15–18 MB total |
 | Message round-trip (persist + `SEND_ACK`), 32 concurrent senders | **p50 ~2–3 ms, p90 ~80 ms, p99 ~130 ms** |
@@ -103,7 +103,8 @@ login), not to add RAM. It is a non-issue at the low-hundreds target scale
 - Idle-connection memory; active fan-out uses more (bounded by the 1 MiB
   per-connection output cap and recoverable via reconnect + backfill).
 - Localhost measurement — excludes real network RTT (which would dominate the
-  ~4 ms local figure) and NIC/kernel socket-buffer memory under real load.
+  low-single-millisecond local p50) and NIC/kernel socket-buffer memory under
+  real load.
 - No periodic large-scale soak test yet; these are point-in-time measurements.
 
 ## Slow-backend isolation (ARCH-69)

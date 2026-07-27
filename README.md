@@ -32,7 +32,8 @@ authentication design), [docs/AUDIO.md](docs/AUDIO.md) (the huddle model, media
 path, and echo cancellation), [docs/VIDEO.md](docs/VIDEO.md) (screenshare — the
 codec-as-wire-contract decision and why it is sequenced behind
 audio), [docs/CLIENT.md](docs/CLIENT.md) (the native client
-architecture), [docs/TESTING.md](docs/TESTING.md) (the unit +
+architecture), [docs/CONFIG.md](docs/CONFIG.md) (every environment variable the
+daemon reads), [docs/TESTING.md](docs/TESTING.md) (the unit +
 integration test strategy), and [docs/VENDORS.md](docs/VENDORS.md) (every
 third-party dependency, with source, version pinning, and license) for the
 project's design. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for the branch,

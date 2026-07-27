@@ -326,6 +326,14 @@ STATUS.md. A `delivery_cursors` row per `(user, channel)` advanced by
 Persists the daemon's TLS identity across restart/restore so the TOFU
 fingerprint clients pinned (ARCH-10) survives a redeploy.
 
+### `server_identity`
+- `id` (INTEGER PK, `CHECK (id = 1)`) — a single-row table; the daemon has one
+  identity.
+- `cert_pem` / `key_pem` (TEXT) — the self-signed certificate and its private
+  key, PEM-encoded. This is the one private key in the daemon's database; it is
+  what makes the pin survive a restore onto a new box (ARCH-66b).
+- `created_at_ms` (INTEGER) — when the identity was generated.
+
 ---
 
 ## 3g. Migration 0009 — attachments (REQ-140, ARCH-17/69/70)
@@ -348,12 +356,12 @@ only the pointer and metadata. Bytes are proxied through the daemon in chunks
 - `size` (INTEGER) — byte length, verified against the streamed total on
   `UPLOAD_END`.
 - `sha256` (BLOB) — content digest, returned in `UPLOAD_OK` / `DOWNLOAD_INFO`.
-- `created_at` (INTEGER) — upload time; drives the orphan sweep of pending rows
+- `created_at_ms` (INTEGER) — upload time; drives the orphan sweep of pending rows
   whose blob was never finalized/linked (time-gated, like `sent_messages`
   pruning, ARCH-44/70).
 
 Indexed by `message_id` (fetch a message's attachments for delivery/backfill)
-and by `(uploader_id, created_at)` (sweep abandoned pending uploads). A committed
+and by `(uploader_id, created_at_ms)` (sweep abandoned pending uploads). A committed
 attachment's lifetime is tied to its message: a tombstoned/deleted message's
 attachment blob is eligible for removal (REQ-141, "as long as the message
 exists").
@@ -419,7 +427,7 @@ meaning (PROTOCOL.md: `SET_CLIENT_SETTING` / `LIST_CLIENT_SETTINGS` /
 
 ### `client_settings`
 - `(user_id, client_type, key)` (PK) — one value per user, per frontend bucket,
-  per key. `client_type` (e.g. `tui`, a future `gui`) partitions the store so
+  per key. `client_type` (`tui` and `gui` today) partitions the store so
   one frontend's prefs never collide with another's.
 - `value` (TEXT) — the setting value; an empty value on `SET` deletes the row, so
   the bucket stays sparse and a deleted key falls back to the client's file

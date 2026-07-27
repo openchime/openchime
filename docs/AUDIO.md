@@ -239,7 +239,9 @@ always-send costs ten times the bandwidth for nine streams of silence.
 ## 5. Call signaling in the app-core
 
 Signaling is ordinary TCP protocol work and is independent of media, so it is
-built and demonstrable first (§7).
+the first thing to build and the first thing that can be demonstrated (§7).
+**None of this section exists yet** — `client/core` has no `CALL_*` support at
+all; the daemon side (signaling + the forked UDP relay) is built (ARCH-73).
 
 - **Commands:** `OC_CMD_CALL_JOIN` / `OC_CMD_CALL_LEAVE`.
 - **Events:** `OC_EV_CALL_JOINED` (roster + media endpoint + token),
