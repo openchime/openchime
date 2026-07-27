@@ -482,12 +482,32 @@ the requirement says so explicitly rather than implying one.
   silence timeout in the sidecar. **Signaling built (PROTOCOL.md §5.17); the UDP
   relay + timeout land in the sidecar milestone.**
 
-### 6.3 Video (Out of Scope)
+### 6.3 Video — camera video excluded, screenshare admitted
 
-- **REQ-160.** Video calling and video streaming or playback beyond generic
-  file-attachment handling (REQ-140) have not been supported. This is a
+*Design: [VIDEO.md](./VIDEO.md).*
+
+- **REQ-160.** **Camera video** calling, and video streaming or playback beyond
+  generic file-attachment handling (REQ-140), have not been supported. This is a
   deliberate scope exclusion, not a deferred feature pending an architecture
-  decision.
+  decision. **Amended (ARCH-86):** this exclusion is now scoped to *camera* video
+  and general playback; **screenshare** is admitted separately as REQ-161, whose
+  content profile (mostly static, low frame rate, a single sender) is
+  fundamentally cheaper and whose use case is concrete. The exclusion is narrowed,
+  not repealed.
+- **REQ-161.** A participant in a call has been able to **share a screen or
+  window** to the other participants, view-only. Screenshare has ridden the
+  existing server-relay media path unchanged (ARCH-73/86): the sidecar forwards
+  the encoded payload opaquely exactly as it forwards Opus, so no server-side
+  codec has existed and no transcoding has been possible. Consequently **all
+  clients have spoken one mandatory codec — VP9 via libvpx (ARCH-87)** — since a
+  call may hold clients on different platforms simultaneously and a codec
+  disagreement would break the call outright; the codec has therefore been
+  negotiated on the wire (PROTOCOL.md §5.17) rather than chosen per frontend.
+  Remote control, recording, screen-audio capture, simultaneous sharers, and
+  camera video have all been out of scope (REQ-160). A **text-only frontend has
+  been permanently exempt** (ARCH-75 — the TUI renders no graphics), showing only
+  that a share is in progress and by whom. **Not started; sequenced behind the
+  audio client** (REQ-150–152), whose media transport it builds on.
 
 ---
 

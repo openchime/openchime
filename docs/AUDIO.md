@@ -5,6 +5,12 @@ engine, and acoustic echo cancellation. This is the authoritative design; it is
 cross-referenced from ARCHITECTURE.md (ARCH-18, ARCH-28, ARCH-31, ARCH-73),
 REQUIREMENTS.md (§6.2, REQ-150–152), PROTOCOL.md (§5.17), and CLIENT.md.
 
+**This document is audio only.** **Screenshare is [VIDEO.md](./VIDEO.md)**
+(REQ-161, ARCH-86/87) — it rides this same call, sidecar, and UDP path, and is
+**sequenced behind everything here**: the media transport, jitter buffer, and
+device layer of §§2–4 are its prerequisites, so building it first would build the
+media stack twice. Camera video remains out of scope (REQ-160).
+
 **Status.** **The server half is built and tested; the client half does not
 exist.** `CALL_JOIN` / `CALL_LEAVE` / `CALL_JOINED` / `CALL_ROSTER` signaling,
 the per-channel ephemeral roster, per-join bearer tokens, and the forked UDP

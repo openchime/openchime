@@ -1015,6 +1015,35 @@ rest), but the **call persists as long as one participant remains**; the dropped
 user simply re-`CALL_JOIN`s (minting a fresh token). The media-side silence
 timeout that mirrors this lives in the sidecar.
 
+**Screenshare — reserved wire additions (REQ-161, ARCH-86/87; not built).**
+Screenshare rides this same call and relay unchanged: the sidecar forwards an
+encoded video payload opaquely exactly as it forwards Opus, so there is no
+server-side codec. That has one consequence the wire must carry, recorded here
+while the frames are still cheap to extend — **the server cannot transcode**
+(ARCH-18/73 forbid it decoding anything), and a call may hold clients on
+different platforms at once, so a codec disagreement breaks the call outright.
+The codec is therefore a **wire contract**, not a frontend build choice, and
+`CALL_JOINED` **carries no codec field today**. Adding video without one would
+break every older client on the first codec change — the failure ARCH-41 exists
+to prevent for frames. The reserved additions, none implemented:
+
+- a **codec identifier** on `CALL_JOINED`, so the ARCH-87 baseline (VP9) can be
+  succeeded (by AV1) without a flag day;
+- **share start/stop signaling** — who is sharing, so clients render the right
+  surface and the roster reflects it;
+- a **fragment header** in the sidecar's UDP framing — `OC_AUDIO_MAX_PACKET` is
+  1400 bytes, correct for an ~80-byte Opus frame and useless for a keyframe of
+  tens of KB;
+- a **keyframe-request** path from receiver to sharer, since a lost video packet
+  corrupts the picture until the next IDR (Opus conceals loss with PLC; video
+  does not).
+
+The last two are relay-*visible* but not relay-*interpreted* — the sidecar keeps
+forwarding opaque payloads behind a larger header — so ARCH-18/73 hold. Note also
+that `seq` is `u16`, which wraps in roughly a minute at video packet rates, so
+reassembly must tolerate wrap or the field widens. Full design in
+[VIDEO.md](./VIDEO.md).
+
 ### Push device tokens (REQ-132/133, ARCH-85)
 
 **`REGISTER_DEVICE_TOKEN` (C → S), `0x00B0`** `{ platform: u8, token: str }` —

@@ -135,6 +135,21 @@ not the GUI.
   audio client, BSD-3-Clause, behind the processor vtable in AUDIO.md §3.3 so it
   is swappable. Not yet vendored. See AUDIO.md §6.2 for why it is preferred over
   WebRTC AEC3 as a first implementation despite being the weaker canceller.
+- **libvpx** — planned **VP9** encode/decode for **screenshare** (REQ-161,
+  ARCH-87), **BSD-3-Clause**, with screen-content tuning
+  (`VP9E_SET_TUNE_CONTENT`). Not yet fetched. It belongs in the **fetched at
+  build** class (§2) beside mbedTLS, *not* the committed-single-file class — it is
+  the **first genuinely large dependency** in the tree and does not fit the
+  jsmn/termbox2/utf8proc pattern. **Licence note:** BSD-3-Clause is not on the
+  §"License summary" list today because nothing has needed it; it is squarely
+  within this repo's *permissive* rule (mbedTLS is already Apache-2.0, not MIT),
+  so this is a policy addition rather than an exception. **Patent note:** the
+  reason it is preferred to the alternatives is as much patent as copyright —
+  **openh264** is BSD-licensed but Cisco's royalty arrangement covers only the
+  binaries *Cisco itself distributes*, so building from source leaves us exposed;
+  **x264/x265** are GPL; **AV1** (SVT-AV1 + dav1d, BSD) is the designated
+  successor once realtime software encode is cheaper. Client-side only — the
+  daemon links no video codec, exactly as it links no libopus (ARCH-73/86).
 
 ---
 
@@ -159,6 +174,7 @@ paths ship; nothing is fetched at runtime.
 | **MIT** | termbox2, utf8proc, jsmn | Vendored, committed |
 | **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; SVGs + LICENSE vendored |
 | **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
+| **BSD-3-Clause** | libvpx (VP9) — **planned, not yet fetched** | Screenshare codec (REQ-161, ARCH-87). Client-side only; the daemon links no codec. Permissive, within this repo's posture — see §7 |
 | **Public Domain** | SQLite | System-linked |
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
 | **zlib/libpng** | raylib | Dropped self-rendered-GUI toolkit (ARCH-82); unused, not linked |
