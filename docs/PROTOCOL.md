@@ -10,11 +10,15 @@ resolves the protocol-shaped `[needs ARCH decision]` items in
 negotiation, authentication, the message send/broadcast/ack cycle, message
 edit/delete (§5.5/5.6), reactions (§5.9), threads (§5.10), search (§5.11),
 direct messages (§5.12), channel management (§5.7), tenant administration (§5.8),
-and reconnect backfill, plus the error frame. Presence (REQ-120/121), typing indicators, thread notifications
-(REQ-061/130), and audio-call signaling (REQ-150–152) are deliberately out of
-scope here and will be added in later revisions of this document, reusing the
-framing and encoding rules defined below. New message types are additive; the
-header format and the frozen handshake frames (§3) do not change.
+and reconnect backfill, plus the error frame. It **also now covers** presence and
+typing (§5.13, REQ-120/121), attachments (§5.14), incoming webhooks (§5.15),
+notification preferences (§5.16), synced client settings (§5.16a), self-service
+profile (§5.16b), audio-call signaling (§5.17, REQ-150–152), and push device
+tokens — all of which earlier revisions of this document deferred. The remaining
+deferrals are **thread notifications** (REQ-061, which needs @mentions) and the
+**screenshare** additions reserved in §5.17 (REQ-161, unbuilt). New message types
+are additive; the header format and the frozen handshake frames (§3) do not
+change.
 
 **Status.** Implemented. The frames in this document are realized in
 `shared/protocol.c` (codec), `daemon/dbwriter.c` (handlers), and
@@ -980,6 +984,32 @@ place; the originator reads its own as the operation's success ack.
 
 ---
 
+### 5.16c Storage report and audit log (REQ-214, REQ-251)
+
+Two owner/admin-only read surfaces. Both are authorized in the **writer against
+the user's current role**, so a demotion takes effect mid-session rather than at
+next login (ARCH-77/79).
+
+**`STORAGE_STATUS_REQ` (C → S), `0x0097`** — empty payload. Requests the storage
+usage report (REQ-214). A member's request is refused with `ERROR FORBIDDEN`
+rather than answered with zeros.
+
+**`STORAGE_STATUS` (S → C), `0x0098`** — current usage, free space, the active
+retention/eviction policy, and cumulative reclamation counts **by reason** (orphan
+/ aged out / evicted under pressure, migration 0015). Fields are fixed-width, so a
+later revision may append without a version bump.
+
+**`AUDIT_QUERY` (C → S), `0x0099`** — pages the audit log (REQ-251). `before_ms`
+pages **backwards from a timestamp** rather than by offset, so a page boundary
+stays stable as new entries arrive; `0` asks for the newest page.
+
+**`AUDIT_PAGE` (S → C), `0x009A`** — a page of entries, newest first: time,
+family (admin / account / security / moderation), action, actor, target, outcome,
+detail. It **never carries the secret involved** — that a password changed, never
+the password; that an invite was redeemed, never the token (ARCH-79).
+
+---
+
 ### 5.17 Audio call signaling (REQ-150, REQ-152)
 
 Audio is **server-relayed** (no P2P/ICE, ARCH-18): the media itself flows over a
@@ -1246,10 +1276,10 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0094` | `SET_CLIENT_SETTING`   | C → S | no        | §5.16a  |
 | `0x0095` | `LIST_CLIENT_SETTINGS` | C → S | no        | §5.16a  |
 | `0x0096` | `CLIENT_SETTINGS`      | S → C | no        | §5.16a  |
-| `0x0097` | `STORAGE_STATUS_REQ` | C→S | Owner/admin: request the storage usage report (REQ-214). No body. |
-| `0x0098` | `STORAGE_STATUS` | S→C | Usage, the active retention/eviction policy, and cumulative reclamation counts by reason. Fixed-width fields, so a later version may append without a version bump. |
-| `0x0099` | `AUDIT_QUERY` | C→S | Owner/admin: page the audit log (REQ-251). `before_ms` pages backwards from a timestamp rather than by offset, so a boundary stays stable as entries arrive; 0 asks for the newest page. |
-| `0x009A` | `AUDIT_PAGE` | S→C | A page of entries, newest first: time, family, action, actor, target, outcome, detail. Never carries the secret involved. |
+| `0x0097` | `STORAGE_STATUS_REQ` | C → S | no | §5.16c |
+| `0x0098` | `STORAGE_STATUS` | S → C | no | §5.16c |
+| `0x0099` | `AUDIT_QUERY` | C → S | no | §5.16c |
+| `0x009A` | `AUDIT_PAGE` | S → C | no | §5.16c |
 | `0x0048` | `SET_DISPLAY_NAME` | C → S     | no        | §5.16b  |
 | `0x0049` | `CHANGE_PASSWORD`  | C → S     | no        | §5.16b  |
 | `0x004A` | `PROFILE_UPDATED`  | S → C     | no        | §5.16b  |

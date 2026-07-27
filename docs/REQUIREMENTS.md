@@ -5,12 +5,16 @@ descriptive, present-perfect tense ("the system has supported X") as a
 target-state contract — the form the finished system is required to take. It is
 **not** a record of what is built; for that, see
 [STATUS.md](./STATUS.md), which reconciles each `REQ-NNN` below against the
-current tree. As of this writing the daemon's messaging/auth/roles/channels/
-reactions/threads/search/presence/typing/notification-settings/attachments/
-webhooks core is implemented, along with a shared C client app-core and a
-termbox2 TUI (ARCH-74/75); mobile push (REQ-132/133), the client-side audio codec
-(REQ-150–152), the full multi-platform client, and all of Sections 11–14 are
-forward scope. This present-perfect style mirrors the reproduction-grade style of
+current tree. As of this writing the daemon is a feature-complete v1 chat core —
+messaging/auth/roles/channels/reactions/threads/search/presence/typing/
+notification-settings/attachments/webhooks, plus the storage-maintenance tiers
+(§10.1), the audit log (REQ-251), federated enrollment (ARCH-84) and the mobile-push
+emitter (ARCH-85) — alongside a shared C client app-core with a local store, and a
+`tuikit`-based TUI (ARCH-74/83) on Linux and Windows from which every engine
+feature on the wire is reachable. Forward scope: the **client** halves of audio
+(REQ-150–152) and push (a shipping mobile client), **screenshare** (REQ-161), the
+OIDC browser flow, the remaining native GUIs, and most of Sections 11–14 — of
+which REQ-251/251a/251b are built and the rest are not. This present-perfect style mirrors the reproduction-grade style of
 OpenChime's sibling projects; here it functions as a forward specification, with
 STATUS.md tracking progress against it.
 

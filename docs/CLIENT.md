@@ -77,7 +77,7 @@ Each frontend is thin: create a client, loop { `oc_client_tick`; render the
 model; translate input to intents }, stop.
 
 - **TUI (`client/tui/`, first):** a terminal cell grid — a channel sidebar (with
-  unread counts; presence dots planned), a scrolling wrapped message pane, and an
+  unread counts and presence dots), a scrolling wrapped message pane, and an
   input line — built on
   **termbox2** (the cell grid + input) and **utf8proc** (Unicode width +
   grapheme breaking), both **MIT**, both vendored as committed single-file source
@@ -272,9 +272,14 @@ model; translate input to intents }, stop.
 The core links `shared/protocol.c` (every `oc_encode_*`/`oc_decode_*` for both
 directions exists), `shared/tls.c` (client TLS + TOFU), `shared/framebuf.c`
 (reassembly), and `shared/sock.h` (POSIX/Winsock shim). The wire sequence is
-PROTOCOL.md §3–§6 and the §10 state machine. **TOFU pinning (ARCH-10):** Phase 1
-trusts the presented cert (`pin=NULL`); persisting + pinning the fingerprint
-arrives with the store phase.
+PROTOCOL.md §3–§6 and the §10 state machine. **TOFU pinning (ARCH-10) is built:**
+the first connect to a remote workspace records the cert's SHA-256 in the client
+store (`workspace_state.tls_pin`, §5) and every later connect enforces an exact
+match; a genuine change is reported distinctly ("the server's security certificate
+has changed") rather than as an unreachable host. **Loopback is deliberately not
+pinned** — a `127.0.0.1` connection has no MITM vector, and pinning it only fires
+false alarms as local dev daemons re-self-sign (`client/core/net.c:is_loopback`,
+[TLS.md](./TLS.md)).
 
 ## 5. Local store
 
@@ -410,7 +415,18 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
   webhook management, attachments, and audit log (see §3 for where each lives).
   **Every engine
   feature on the wire is now reachable from the TUI.**
-- **Next:** store + reconnect/offline; auth completeness (local + OIDC); and the
-  **audio client** (Opus encode/decode + UDP to the sidecar — the deferred half
-  of REQ-150/151).
-- **Then:** native desktop GUIs (Windows/macOS), a web DOM UI, and mobile.
+- **Also shipped since:** the **local store** and reconnect/offline (REQ-100/101/102
+  — silent session-token reconnect across restarts, persisted TOFU pin, cached
+  history, offline outbox, workspace book), **multiple workspaces** (REQ-012–015),
+  DNS workspace resolution (REQ-010/011), the local **Sign in** dialog, and the
+  **Windows TUI** (ARCH-81). See §5–§6.
+- **Next:** the **Windows GUI** depth backlog (ARCH-82 — 26 of 27 engine features
+  surfaced; the multi-workspace switcher plus the P0 polish gaps in
+  [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5); **auth completeness** —
+  the OIDC browser flow + PKCE + loopback courier, which is the one remaining
+  piece of REQ-020 and is what makes SSO usable at all; and the **audio client**
+  (Opus encode/decode + UDP to the sidecar — the deferred half of REQ-150/151,
+  [AUDIO.md](./AUDIO.md)).
+- **Then:** the remaining native GUIs (GTK, AppKit), a web DOM UI, mobile — and,
+  gated behind the audio client, **screenshare** (REQ-161,
+  [VIDEO.md](./VIDEO.md)).

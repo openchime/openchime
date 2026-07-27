@@ -38,22 +38,26 @@ third-party dependency, with source, version pinning, and license) for the
 project's design. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for the branch,
 commit, and CI workflow.
 
-The daemon is an **early skeleton**. It has the real foundations —
-the v1 wire-protocol frame codec (PROTOCOL.md), the two-thread model
-(ARCH-5: an epoll network loop + a single DB-writer thread), TLS termination
-with self-signed TOFU certs (ARCH-10, mbedTLS), and schema migrations applied
-on boot (ARCH-27) — plus the build/container pipeline (ARCH-35–39).
-The network loop completes the TLS handshake, negotiates the protocol version
-(`HELLO`→`WELCOME`/`REJECT`), authenticates a session, and runs the core
-messaging path — a `SEND` is persisted (with a server-assigned monotonic id and
-idempotent-retry dedup) and delivered to the channel's connected members as a
-`BROADCAST`, with the sender acked; a reconnecting client can `BACKFILL_REQUEST`
-the messages it missed and have them replayed. **Authentication is currently
-stubbed** (any token is accepted and mapped to a user); the real design — two
-modes (local accounts, or OIDC brokered by a central service) converging on a
-daemon-issued session — is specified in [docs/AUTH.md](docs/AUTH.md) and is the
-next implementation milestone. Channel management is a single auto-provisioned
-default channel for now.
+The daemon is a **feature-complete v1 chat core**. On the foundations — the v1
+wire-protocol frame codec (PROTOCOL.md), the two-thread model (ARCH-5: an epoll
+network loop + a single DB-writer thread, refined by ARCH-66 into a third
+read-only query thread), TLS termination with self-signed TOFU certs (ARCH-10,
+mbedTLS), and schema migrations applied on boot (ARCH-27) — it runs the whole
+messaging path end to end: **two-mode authentication** (local PBKDF2 accounts or
+an OIDC token re-issued by the central relay, converging on a daemon-issued
+session, [docs/AUTH.md](docs/AUTH.md)), roles and full tenant administration,
+public/private channels and DMs, edit/delete, reactions, threads, FTS5 search,
+presence and typing, notification preferences and DND, attachments proxied to
+object storage, incoming webhooks, an audit log, and reconnect backfill. The
+daemon also emits **mobile push** to the control-plane gateway (ARCH-85) and
+**enrolls** with it for federated deployments (ARCH-84). Server-relayed **audio**
+signaling and the UDP sidecar are built; the client-side codec is not
+([docs/AUDIO.md](docs/AUDIO.md)).
+
+For exactly what is built vs specified — including the gaps — see
+**[docs/STATUS.md](docs/STATUS.md)**. Known remaining server-side work: a
+CA-signed certificate for the webhook endpoint (REQ-171) and the `MENTIONS`
+notification level, which waits on @mentions (REQ-221).
 
 ## Local build (daemon)
 
@@ -76,12 +80,23 @@ by `make test` (`tests/test_client_core.c`). A standalone compile check:
 make core
 ```
 
-The first frontend is a **TUI** (`make tui`, termbox2 + utf8proc), built on the
-host like the daemon. It covers live messaging with history backfill, reactions,
-edit/delete, typing, threads, search, channel + DM management, roster + presence,
-who-reacted, notification prefs + DND, admin (roles/invite/remove), and logout;
-only attachments and webhook management remain to surface. Native GUIs
-(Windows/macOS), a web DOM UI, and mobile follow.
+The first frontend is a **TUI** (`make tui`, built on the in-tree `tuikit`
+toolbox over termbox2 + utf8proc, ARCH-83), built on the host like the daemon and
+also shipping on Windows (ARCH-81). It is menu- and screen-driven — panels, context
+menus, dialogs, and a Ctrl+K command palette; there are no slash commands. It
+covers live messaging with history backfill, reactions, edit/delete, typing,
+threads, search, channel + DM management, roster + presence, who-reacted,
+notification prefs + DND, admin (roles/invite/remove), webhooks, attachments,
+storage and audit overlays, multiple workspaces, and logout — **every engine
+feature on the wire is reachable from the TUI**. The app-core also has a local
+SQLite store, so it reconnects silently across restarts, shows cached history
+offline, and queues sends made while disconnected (REQ-100/101/102).
+
+A native **Windows GUI** (Win32 + Direct2D/DirectWrite, pure C — ARCH-82) is in
+progress: 26 of 27 engine features are surfaced, with the multi-workspace
+switcher outstanding and a depth/polish backlog tracked in
+[docs/CLIENT_GAP_ANALYSIS.md](docs/CLIENT_GAP_ANALYSIS.md). GTK (Linux), AppKit
+(macOS), a web DOM UI, and mobile follow.
 
 ## Local Docker environment
 

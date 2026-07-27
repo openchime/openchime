@@ -352,7 +352,7 @@ late — after the seams that make it replaceable exist.
 | **4** | UDP media with one peer, jitter buffer, PLC | **1:1 audio works** |
 | **5** | Per-sender decoders + mixer | **huddles work** |
 | **6** | ERLE harness, then speexdsp behind the vtable | echo cancellation, measured |
-| **7** | TUI: `/call`, `/hangup`, roster, mute, push-to-talk, device pick | usable |
+| **7** | TUI: join/leave via the command palette + menus, roster, mute, push-to-talk, device pick | usable |
 
 Phase 6 lands after Phase 5 because a mixer produces a single far-end reference
 (§1.1), and because there is no real echo to cancel until real audio is playing
@@ -366,10 +366,15 @@ the canceller unchanged.
 
 ## 8. TUI surface
 
-`/call` joins the focused channel's huddle, `/hangup` leaves. The roster renders
-in the Members panel or a dedicated overlay, showing per-participant *speaking*
-and *muted* state. Mute is a key binding, not a command — it is used mid-
-sentence.
+**Corrected: there are no slash commands.** An earlier revision of this section
+specified `/call` and `/hangup`; the slash-command dispatcher was **deleted** in
+the TUI redesign (ARCH-83), and the TUI is now menu- and screen-driven. Joining
+and leaving a huddle are therefore actions in the **Ctrl+K command palette** and
+the channel action menu, exactly like every other TUI action.
+
+The roster renders in the Members panel or a dedicated overlay, showing
+per-participant *speaking* and *muted* state. Mute is a key binding, not a menu
+item — it is used mid-sentence.
 
 **Push-to-talk is a first-class control, not an echo workaround.** It is the
 natural terminal idiom, it is what users of a keyboard-driven client expect, and

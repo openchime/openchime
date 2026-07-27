@@ -5,11 +5,20 @@ a decision in [ARCHITECTURE.md](./ARCHITECTURE.md) (ARCH-48) and consistent
 with the sibling C project openblocks, whose hand-rolled test convention this
 mirrors.
 
-**Status.** Strategy defined before implementation. As of this writing the
-only code is the placeholder daemon (`daemon/main.c`); the unit tier below has no
-tests yet, and the integration tier exercises the placeholder's
-build → replicate → restore pipeline (ARCH-35–39). Both tiers grow as the real
-daemon lands, starting with the frame codec.
+**Status.** **Both tiers are built and green in CI.** The unit tier below is
+implemented across the codec, framebuf, migrations, auth/JWT/roles/rate-limiting,
+the DB-writer handlers, storage/maintenance, enrollment, and push, plus in-process
+integration suites that drive the real epoll server over TLS (`itest_netloop`,
+`itest_tls`, `itest_slow_blob`) and the headless client app-core
+(`test_client_core.c`) — all compiled into one `build/tests` binary by `make test`.
+The integration tier drives the deployed container over the compose stack
+(`make integration`). A deterministic codec fuzzer (180k iterations, clean under
+ASan/UBSan) and a concurrency load test (`tests/bench_load.c`, driven by
+`Scripts/bench.sh`) round it out.
+
+*Note: the replication/restore pipeline this document once exercised is gone —
+ARCH-3 withdrew replication from this repo entirely; off-box durability is a
+deployment concern (hosted lives in `openchime-saas`).*
 
 ---
 
@@ -164,12 +173,12 @@ wrappers (ARCH-40).
 
 ### 3.3 Scenarios
 
-Grouped by what they prove. The starred (★) ones are reachable **today** with
-the placeholder daemon and are what CI runs now; the rest come online with the
-real protocol.
+Grouped by what they prove. **All of the below are implemented and run in CI**;
+the ★ marks that once distinguished "reachable against the placeholder daemon"
+are gone, because the placeholder is gone.
 
 - **Liveness:**
-  - ★ health check: `/healthz` returns `200 OK` (ARCH-25).
+  - health check: `/healthz` returns `200 OK` (ARCH-25).
 - **Handshake/versioning:** a client advertising an unsupported range gets a
   `REJECT` with the right `VERSION_TOO_OLD`/`VERSION_TOO_NEW` code and a closed
   connection (REQ-110/111).

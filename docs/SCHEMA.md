@@ -4,16 +4,28 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Status.** Migration 0001 establishes the foundational tables for the core
-messaging path — the frames the v1 codec already supports (send / broadcast /
-ack / backfill). **Migration 0002** (§3) adds the authentication data model
-(sessions, local credentials, invites, and `users` role/avatar) for the two-mode
-auth design ([AUTH.md](./AUTH.md)). **Migration 0003** (§3a) adds a
-`users.disabled` lockout flag for tenant member removal (REQ-033). **Migration
-0004** (§3b) adds emoji reactions (REQ-070/071) and **migration 0005** (§3c) adds
-message threads (REQ-060) and **migration 0006** (§3d) adds FTS5 full-text search
-(REQ-080). Presence, notification config, and attachments are intentionally
-**not** here yet; each is a future migration once its own requirement is settled.
+**Status.** **Migrations 0001–0018 are applied.** 0001 establishes the core
+messaging tables; **0002** (§3) the authentication data model (sessions, local
+credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
+`users.disabled` lockout flag; **0004** (§3b) reactions; **0005** (§3c) threads;
+**0006** (§3d) FTS5 search; **0007** (§3e) delivery cursors; **0008** (§3f) the
+persisted server TLS identity; **0009** (§3g) attachments; **0010–0011** (§3h/§3i)
+incoming webhooks and the message display-name override; **0012** (§3j)
+notification preferences and the DND window; **0013** (§3k) synced client
+settings; **0014–0015** attachment tombstones and reclaim reason; **0016** (§3l)
+the audit log; **0017** (§3m) federated enrollment; **0018** (§3n) push device
+tokens.
+
+*Corrected: an earlier revision of this line said presence, notification config,
+and attachments were "intentionally not here yet." Notification config landed in
+0012 and attachments in 0009. **Presence and typing remain deliberately
+schema-less** — they are ephemeral in-memory net-thread state by design
+(ARCH-67/68) and will never get a table.*
+
+Section ordering note: §3 onward is numbered by the migration's *documentation*
+section rather than strictly by migration number, so the attachment-tombstone
+entries (0014/0015) appear before §3's 0002. The list above is the authoritative
+order.
 
 ---
 
@@ -51,8 +63,13 @@ Foreign keys are declared for integrity; the daemon runs with
 `PRAGMA foreign_keys = ON`.
 
 ### `users`
-Identity resolved from the OIDC token (REQ-023). `id` is the tenant-local
-`user_id` carried in `AUTH_OK` and `BROADCAST.author_id`.
+A tenant user, provisioned by **either** auth mode (REQ-023) — `subject` is the
+unique identity key, namespaced by source: `local:<username>` or
+`oidc:<issuer>|<sub>` (ARCH-19; an earlier revision of this line said "resolved
+from the OIDC token," which predates local mode). `id` is the tenant-local
+`user_id` carried in `AUTH_OK` and `BROADCAST.author_id`. Columns added by later
+migrations — `role`/`avatar_key` (0002), `disabled` (0003), and the DND window
+(0012) — are documented in their own sections below.
 
 | column          | type    | notes                                            |
 |-----------------|---------|--------------------------------------------------|
@@ -466,12 +483,19 @@ decide who to notify, and prunes it when the gateway reports it stale.
 
 Tracked here so the omissions are deliberate, not forgotten:
 
-- **Thread notifications** (REQ-061) — needs notification config (REQ-130).
-- **Push delivery** state (REQ-132/133) — device tokens for APNs/FCM; the
-  notification *settings* (REQ-130/131) are now in migration 0012 above.
-- **Audio** call state (REQ-150–152) — likely a UDP sidecar, not schema (ARCH-18).
+- **Thread notifications** (REQ-061) — still deferred; needs @mentions (REQ-221),
+  which is the same dependency blocking the `MENTIONS` notification level
+  (ARCH-72/85).
+- **Rich text, pins, saved items, permalinks, profiles, retention policy**
+  (REQ-220–234, REQ-240/241, REQ-250) — forward scope, none yet backed by an ARCH
+  decision.
+- **Screenshare** (REQ-161) — needs no schema; it is ephemeral media state on the
+  same relay path as audio (ARCH-86, [VIDEO.md](./VIDEO.md)).
 
-(Roles, sessions/revocation, local credentials, delivery cursors, server
-identity, and attachment metadata — previously deferred — are now defined in
-migrations 0002 and 0007–0009 above. Presence/typing (REQ-120/121) stayed
-in-memory by design, ARCH-67/68, and needs no schema.)
+(Previously listed here and **now built**: roles, sessions/revocation, local
+credentials, delivery cursors, server identity, and attachment metadata
+(migrations 0002, 0007–0009); **push device tokens** for APNs/FCM (migration 0018,
+ARCH-85) — the notification *settings* they are gated by are migration 0012.
+**Audio** call state (REQ-150–152) was correctly predicted to need no schema: the
+roster is ephemeral net-thread state (ARCH-73). **Presence/typing** (REQ-120/121)
+likewise stayed in-memory by design, ARCH-67/68.)

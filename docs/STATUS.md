@@ -114,7 +114,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 |-----|--------|-------|
 | 200 Linux/Win/macOS/iOS/Android clients | 🟡 | Client pivoted to **one shared C app-core + native UI per platform** (ARCH-74, tdlib model — supersedes the raylib/Windows-cross-compile plan). The app-core (`client/core/`: net thread, queues, view-model + reducers, `oc_client` facade) is **built and headless-tested** (`tests/test_client_core.c` drives it against an in-process daemon; `make core` compile-check, linked into `make test`). First frontend is a **TUI** — rebuilt menu/screen-driven on the in-tree `tuikit` toolbox (ARCH-83) with a 256-color theme and a Ctrl+K command palette; the slash-command UX (ARCH-75) is gone — with: connect + local auth, channel sidebar + unread, live messages + history backfill, display names, per-nick colors, scrollback, send, with reactions, edit/delete, typing indicators, threads, search, channel + DM management, presence + roster, who-reacted, notification prefs + DND, admin (roles/invite/remove), webhook management, attachments, and logout — all reached through context menus and the command palette (Ctrl+K). Every engine feature on the wire is now reachable from the TUI; native GUIs pending. The **Windows GUI** rendering stack is settled — **Win32 + Direct2D/DirectWrite + RichEdit**, pure C (ARCH-82); two first-draft GUIs (comctl32, and a self-rendered Clay+raylib) were built, rejected as dated / non-native, and **have been removed** (client/gui and the vendored Clay/raylib deleted). Native AppKit/Android/DOM/WASM frontends still pending. Daemon is Linux-only (epoll/eventfd). |
 | 210 lean/standard memory profile | ✅ | **Measured** (`Scripts/bench.sh`): ~5 MB baseline + **~50 KB RSS per idle connection**, so a few hundred connections sit in ~15–30 MB and low-thousands stay within the 256 MB lean profile. Message round-trip p50 ~4 ms, p99 ~20–40 ms under concurrency. |
-| 211 low-hundreds concurrent connections | ✅ | **Measured**: hundreds of concurrent pinned-TLS connections held in a small fraction of the lean profile. Connection *setup* is bounded by the 600k-iteration PBKDF2 auth on the single writer (~6–7 logins/s), so a burst of simultaneous logins queues there; steady-state is cheap. `OC_NETLOOP_MAX_FD=4096`. |
+| 211 low-hundreds concurrent connections | ✅ | **Measured**: hundreds of concurrent pinned-TLS connections held in a small fraction of the lean profile. Connection *setup* is bounded by the 600k-iteration PBKDF2 auth on the single writer at **~2 logins/s** (≈500 ms each), so a burst of simultaneous logins queues there; steady-state is cheap. `OC_NETLOOP_MAX_FD=4096`. See [BENCHMARK.md](./BENCHMARK.md) — an earlier ~6–7 logins/s figure was a harness artifact (a 10 s read timeout silently dropping most connections) and was corrected 2026-07-19. |
 | 212 messaging survives storage exhaustion | ✅ | **Built** (`daemon/storage.c`): a configured reserve (`OPENCHIME_DB_RESERVE_MB`, default 256) belongs to SQLite and is never spent on attachments; past it uploads are refused (216) while messaging is untouched. |
 | 213 reclaim orphaned/aborted blobs | ✅ | **Built** — this closes the leak where `oc_blob_delete` had no caller and blob storage grew monotonically. The maintenance pass sweeps attachments never linked to a message (past a grace window) and hands their keys to the transfer pool. Verified on a live daemon: seeded orphan row + blob, pass fired on its timer, row tombstoned and the bytes gone from disk. |
 | 214 surface storage usage to admins | ✅ | **Built**: `STORAGE_STATUS_REQ`/`STORAGE_STATUS` (0x0097/0x0098) carry usage, the active policy, and cumulative reclamation counts; the TUI's Storage action (Ctrl+K → Storage usage) renders them, flagging pressure and any evictions in red. Owner/admin only, checked in the writer against the user's **current** role so a demotion takes effect mid-session. PTY-smoke verified: an owner sees real numbers, a member is refused. |
@@ -222,10 +222,13 @@ ordering, not a commitment.
 None — the robustness backlog is clear. REQ-210/211 are now benchmarked
 (`Scripts/bench.sh` + `tests/bench_load.c`): ~50 KB RSS per idle connection, so
 low-hundreds of connections fit in tens of MB of the 256 MB lean profile, at
-p50 ~4 ms message round-trip. The one measured bottleneck is connection *setup*
-throughput (600k-iteration PBKDF2 auth on the single writer, ~6–7 logins/s) — a
-correctness-preserving cost, not a memory limit. There is no periodic
-large-scale soak yet.
+p50 ~2–3 ms message round-trip (p99 ~130 ms at 32 concurrent senders). The one
+measured bottleneck is connection *setup* throughput — the 600k-iteration PBKDF2
+auth on the single writer, at **~2 logins/s** — a correctness-preserving cost,
+not a memory limit; session-token reconnect (ARCH-58) skips PBKDF2 entirely,
+which is what makes a thundering-herd reconnect tolerable. There is no periodic
+large-scale soak yet. Both figures here were corrected on 2026-07-19 after the
+harness itself proved to be the limit; see [BENCHMARK.md](./BENCHMARK.md).
 
 ---
 
