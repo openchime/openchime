@@ -203,10 +203,11 @@ of them fully; two are 🔨:
   receive or accrue unread ("N elsewhere"). This is the one genuinely unbuilt
   *capability* versus the TUI's N-concurrent-client model.
 
-Next per the agreed sequencing is the **depth pass** —
-[CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5 has the prioritized order,
-led by the error/toast surface (REQ-263), navigable search (REQ-080), and the
-sidebar overhaul (REQ-267).
+Next per the agreed sequencing is the **depth pass**. The numbered work list is
+[WIN32_BACKLOG.md](./WIN32_BACKLOG.md) (`WIN-1`…`WIN-54`); its ordering rationale
+is [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5. It leads with the
+error/toast surface (REQ-263), navigable search (REQ-080), and the sidebar
+overhaul (REQ-267).
 
 ---
 

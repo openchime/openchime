@@ -32,8 +32,9 @@ authentication design), [docs/AUDIO.md](docs/AUDIO.md) (the huddle model, media
 path, and echo cancellation), [docs/VIDEO.md](docs/VIDEO.md) (screenshare — the
 codec-as-wire-contract decision and why it is sequenced behind
 audio), [docs/CLIENT.md](docs/CLIENT.md) (the native client
-architecture), [docs/CONFIG.md](docs/CONFIG.md) (every environment variable the
-daemon reads), [docs/TESTING.md](docs/TESTING.md) (the unit +
+architecture), [docs/WIN32_BACKLOG.md](docs/WIN32_BACKLOG.md) (the numbered
+Windows GUI work list), [docs/CONFIG.md](docs/CONFIG.md) (every environment
+variable the daemon reads), [docs/TESTING.md](docs/TESTING.md) (the unit +
 integration test strategy), and [docs/VENDORS.md](docs/VENDORS.md) (every
 third-party dependency, with source, version pinning, and license) for the
 project's design. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for the branch,
@@ -99,8 +100,10 @@ offline, and queues sends made while disconnected (REQ-100/101/102).
 A native **Windows GUI** (Win32 + Direct2D/DirectWrite, pure C — ARCH-82) is in
 progress: all 27 tracked engine features are reachable, 25 of them fully — the
 two partials are notification prefs (no review screen) and multiple workspaces
-(the rail switcher is built; holding N clients at once is not). A depth/polish
-backlog is tracked in
+(the rail switcher is built; holding N clients at once is not). The depth work is
+a numbered backlog in
+[docs/WIN32_BACKLOG.md](docs/WIN32_BACKLOG.md), with the four-way surface
+analysis behind it in
 [docs/CLIENT_GAP_ANALYSIS.md](docs/CLIENT_GAP_ANALYSIS.md). GTK (Linux), AppKit
 (macOS), a web DOM UI, and mobile follow.
 
