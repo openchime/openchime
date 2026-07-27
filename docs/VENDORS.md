@@ -32,7 +32,7 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **termbox2** | v2.5.0 | Terminal cell grid + input | tuikit (→ TUI) | https://github.com/termbox/termbox2 | MIT |
 | **utf8proc** | v2.11.3 | Unicode width + grapheme segmentation (correct emoji/CJK width) | tuikit (→ TUI) | https://github.com/JuliaStrings/utf8proc | MIT (bundled Unicode data under the Unicode license) |
 | **jsmn** | commit-pinned (upstream has no release tags) | Minimal JSON tokenizer | Daemon (OIDC/webhook JSON) | https://github.com/zserge/jsmn | MIT |
-| **SQLite (amalgamation)** | v3.46.1 | `sqlite3.{c,h}` — the client store for the **Windows client** build (mingw has no system `-lsqlite3`; Linux/daemon builds keep using system `-lsqlite3`, the same library) | Windows TUI + GUI (`client/core/store.c`) | https://sqlite.org | Public Domain |
+| ~~**SQLite (amalgamation)**~~ | — | **Removed (ARCH-88).** It was vendored so the Windows *client* could have a store; no client embeds a database engine any more, and `third_party/sqlite` is deleted. The daemon still uses system SQLite. | — | — | — |
 
 Since **ARCH-83**, `tuikit/` is the in-tree toolbox wrapping termbox2 + utf8proc
 (terminal layer + width handling), which the TUI builds on — `client/tui`
@@ -64,7 +64,7 @@ Provided by the host toolchain (local dev / CI) or the Alpine base image
 
 | Package | Purpose | Used by | Link | Source | License |
 |---------|---------|---------|------|--------|---------|
-| **SQLite** (`libsqlite3`) | The daemon DB and the client store (schema + migrations) | Daemon + client | `-lsqlite3` | https://sqlite.org | Public Domain |
+| **SQLite** (`libsqlite3`) | The daemon's database (ARCH-2). **Not linked by any client** (ARCH-88) | Daemon only | `-lsqlite3` | https://sqlite.org | Public Domain |
 | **glibc `resolv`** (`libresolv`) | DNS **SRV** lookup for workspace resolution (REQ-010) | TUI only (Linux) | `-lresolv` | glibc | LGPL-2.1 (glibc) |
 | **pthreads** | Threads (net thread, queues, dbwriter) | Daemon + client | `-lpthread` | glibc / musl | LGPL-2.1 / MIT |
 | **libsecret** *(optional)* | OS keyring (Secret Service) backend for the session token on Linux (`client/shared/secret_libsecret.c`); Windows uses Credential Manager via `advapi32`, no vendored dependency | Linux TUI/GUI credential store | `pkg-config libsecret-1`, gated by `-DOC_HAVE_LIBSECRET` | https://gitlab.gnome.org/GNOME/libsecret | LGPL-2.1 |
@@ -72,7 +72,7 @@ Provided by the host toolchain (local dev / CI) or the Alpine base image
 
 `libsecret`/`glib` are **optional and dynamically linked**: `make tui` detects
 libsecret via `pkg-config` and compiles the keyring backend, else compiles a stub
-and the client falls back to the SQLite store (headless / no D-Bus). They are
+and that machine then persists no credential at all (headless / no D-Bus). They are
 *not* linked into the daemon, the test binary, or `make core`.
 
 - **Local build headers:** `libsqlite3-dev` (Ubuntu) / `sqlite-dev` (Alpine), and
@@ -177,7 +177,7 @@ paths ship; nothing is fetched at runtime.
 | **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; SVGs + LICENSE vendored |
 | **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
 | **BSD-3-Clause** | libvpx (VP9) — **planned, not yet fetched** | Screenshare codec (REQ-161, ARCH-87). Client-side only; the daemon links no codec. Permissive, within this repo's posture — see §7 |
-| **Public Domain** | SQLite | System-linked (Linux/daemon); amalgamation vendored for the Windows client |
+| **Public Domain** | SQLite | System-linked, **daemon only** — no client links it (ARCH-88) |
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
 | **zlib/libpng** | raylib | Dropped self-rendered-GUI toolkit (ARCH-82); unused, not linked |
 | **zlib** | Clay | Dropped GUI layout engine (ARCH-82); unused, not linked |

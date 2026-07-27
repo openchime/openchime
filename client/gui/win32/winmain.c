@@ -2425,7 +2425,16 @@ static const char *store_path(void) {
     char dir[900];
     snprintf(dir, sizeof dir, "%s\\openchime", base);
     oc_mkdir(dir);
-    snprintf(path, sizeof path, "%s\\state.db", dir);
+    /* A directory now, not a database file (ARCH-88). An orphaned state.db from
+     * an older build has no reader left, so delete it rather than leave a stale
+     * cache — and a stale token — lying about. */
+    char old[1024];
+    snprintf(old, sizeof old, "%s\\state.db", dir);
+    remove(old);
+    snprintf(old, sizeof old, "%s\\state.db-wal", dir); remove(old);
+    snprintf(old, sizeof old, "%s\\state.db-shm", dir); remove(old);
+    snprintf(path, sizeof path, "%s\\state", dir);
+    oc_mkdir(path);
     return path;
 }
 

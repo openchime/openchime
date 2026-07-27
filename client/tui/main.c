@@ -1344,9 +1344,10 @@ static int parse_hhmm(const char *s) {
  *   /delete         tombstone your last message
  */
 /* Resolve the local store path (session token + TOFU pin persistence): the
- * explicit $OPENCHIME_STATE if set, else $HOME/.local/state/openchime/state.db
- * (creating the dirs). Returns NULL when there is nowhere to put it (persistence
- * then disabled — the client still runs, just in-memory). */
+ * explicit $OPENCHIME_STATE if set, else $HOME/.local/state/openchime/state
+ * (creating the dirs). This is a DIRECTORY now, not a database file (ARCH-88).
+ * Returns NULL when there is nowhere to put it (persistence then disabled — the
+ * client still runs, just in-memory). */
 static const char *resolve_store_path(void) {
     const char *explicit = getenv("OPENCHIME_STATE");
     if (explicit && explicit[0]) return explicit;
@@ -1357,7 +1358,14 @@ static const char *resolve_store_path(void) {
     snprintf(dir, sizeof dir, "%s/.local", home);            oc_mkdir(dir);
     snprintf(dir, sizeof dir, "%s/.local/state", home);      oc_mkdir(dir);
     snprintf(dir, sizeof dir, "%s/.local/state/openchime", home); oc_mkdir(dir);
-    snprintf(path, sizeof path, "%s/state.db", dir);
+    /* An orphaned state.db from a pre-ARCH-88 build has no reader left; delete it
+     * rather than leave a stale cache — and a stale token — on disk. */
+    char old[1200];
+    snprintf(old, sizeof old, "%s/state.db", dir);     remove(old);
+    snprintf(old, sizeof old, "%s/state.db-wal", dir); remove(old);
+    snprintf(old, sizeof old, "%s/state.db-shm", dir); remove(old);
+    snprintf(path, sizeof path, "%s/state", dir);
+    oc_mkdir(path);
     return path;
 }
 

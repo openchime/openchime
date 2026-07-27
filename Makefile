@@ -48,9 +48,10 @@ TUI_SRC   := $(wildcard client/tui/*.c) $(wildcard client/shared/secret_*.c)
 TUIKIT_SRC := $(filter-out tuikit/demo.c,$(wildcard tuikit/*.c))
 TUIKIT_INC := -Ituikit
 UTF8PROC  := third_party/utf8proc/utf8proc.c
-# The core's local store (client/core/store.c) reuses the daemon's migration
-# runner and SQLite, so the frontend links migrate.c + libsqlite3.
-STORE_DEPS := daemon/migrate.c
+# The core's local store (client/core/store.c) embeds NO database engine
+# (ARCH-88/REQ-201): the credential store holds the token + pin, and the cache,
+# outbox and workspace book are plain files. So a client links no sqlite and no
+# migration runner — STORE_DEPS is gone with them.
 # The platform credential backend (client/shared/secret_*.c, one entry point in
 # secret_os.h): libsecret on Linux when the dev package is present, Windows
 # Credential Manager on the Windows builds. Without libsecret it compiles a stub
@@ -142,48 +143,47 @@ tui: $(TUI_BIN)
 $(TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) \
             $(wildcard client/tui/*.h tuikit/*.h client/core/*.h shared/*.h) $(MBEDTLS_A) | build
 	$(CC) $(CFLAGS) -Wno-unused-result $(INC) $(TUI_INC) $(TUIKIT_INC) $(SECRET_CFLAGS) \
-	    $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(UTF8PROC) $(MBEDTLS_LIBS) -lsqlite3 -lresolv -lpthread $(SECRET_LIBS) -o $@
+	    $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(MBEDTLS_LIBS) -lresolv -lpthread $(SECRET_LIBS) -o $@
 
 
 # --- Windows TUI (ARCH-81) ----------------------------------------------------
 # Cross-compiled with mingw-w64 to a standalone .exe. Uses the Windows mbedTLS
-# (third_party/mbedtls-3.6.2-win) and the vendored SQLite amalgamation (mingw has
-# no system sqlite). The termbox2 backend is tuikit/tk_term.c (Console API); the
+# (third_party/mbedtls-3.6.2-win). No sqlite: a client embeds no database engine
+# (ARCH-88). The termbox2 backend is tuikit/tk_term.c (Console API); the
 # core seams (threads/DNS/RNG) are in shared/oc_thread.h + resolve.c + net.c.
 WINCC     ?= x86_64-w64-mingw32-gcc
 MBEDTLS_WIN := third_party/mbedtls-3.6.2-win
 WIN_MBEDLIBS := $(MBEDTLS_WIN)/library/libmbedtls.a \
                 $(MBEDTLS_WIN)/library/libmbedx509.a \
                 $(MBEDTLS_WIN)/library/libmbedcrypto.a
-SQLITE_SRC := third_party/sqlite/sqlite3.c
 WIN_TUI_BIN := build/openchime-tui.exe
-WIN_CFLAGS := -std=c99 -Wall -Wextra -O2 -D_WIN32_WINNT=0x0601 -DSQLITE_OMIT_LOAD_EXTENSION -DUTF8PROC_STATIC
+WIN_CFLAGS := -std=c99 -Wall -Wextra -O2 -D_WIN32_WINNT=0x0601 -DUTF8PROC_STATIC
 WIN_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
-           $(CORE_INC) -Iclient/tui -Iclient/shared -Ituikit -Ithird_party/termbox2 -Ithird_party/utf8proc -Ithird_party/sqlite
+           $(CORE_INC) -Iclient/tui -Iclient/shared -Ituikit -Ithird_party/termbox2 -Ithird_party/utf8proc
 
 windows-tui: $(WIN_TUI_BIN)
-$(WIN_TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(STORE_DEPS) $(SQLITE_SRC) \
+$(WIN_TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) \
                 $(wildcard client/tui/*.h tuikit/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) | build
 	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result $(WIN_INC) \
-	    $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(UTF8PROC) $(SQLITE_SRC) \
+	    $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) \
 	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -ladvapi32 -static -o $@
 
 
 # The native Windows GUI (Win32 + Direct2D/DirectWrite/WIC, pure C — ARCH-80/82)
-# over the same shared app-core. Mirrors windows-tui (core+shared+migrate+bundled
-# sqlite+mbedtls-win) but compiles the client/gui/win32 sources instead of the
+# over the same shared app-core. Mirrors windows-tui (core+shared+mbedtls-win)
+# but compiles the client/gui/win32 sources instead of the
 # TUI/tuikit stack and links the Direct2D stack. -municode gives the wWinMain
 # Unicode entry point; -mwindows selects the GUI subsystem (no console).
 WIN_GUI_BIN := build/openchime.exe
 GUI_SRC := $(wildcard client/gui/win32/*.c) client/shared/icons.c client/shared/secret_win.c
 WIN_GUI_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
-               $(CORE_INC) -Iclient/gui/win32 -Iclient/shared -Ithird_party/sqlite
+               $(CORE_INC) -Iclient/gui/win32 -Iclient/shared
 
 windows-gui: $(WIN_GUI_BIN)
-$(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(SQLITE_SRC) \
+$(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) \
                 $(wildcard client/gui/win32/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) | build
 	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result -municode -mwindows $(WIN_GUI_INC) \
-	    $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(SQLITE_SRC) \
+	    $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) \
 	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -lshell32 -lcomdlg32 -lgdi32 -ladvapi32 \
 	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -luuid -static -o $@
 

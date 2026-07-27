@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -267,7 +268,7 @@ static void test_last_error(void) {
 }
 
 /* A mock oc_secret (in-memory keyring) for the credential-cache routing test. */
-static struct { char account[64]; uint8_t val[64]; size_t len; int used; } g_mock[8];
+static struct { char account[64]; uint8_t val[128]; size_t len; int used; } g_mock[8];
 static int mock_get(void *ctx, const char *a, uint8_t *out, size_t cap, size_t *len) {
     (void)ctx;
     for (int i = 0; i < 8; i++)
@@ -304,71 +305,105 @@ static void count_outbox_cb(void *ctx, const uint8_t idem[OC_IDEM_SIZE],
     (*(int *)ctx)++;
 }
 
-/* A store written before the instance->workspace rename (client schema v3) must
- * upgrade in place: migration 4 renames the table + columns, and every row —
- * session token, TOFU pin, cached history, outbox — survives. Losing these would
- * silently log the user out and re-pin on upgrade, so pin the whole path. */
-static void test_store_workspace_upgrade(void) {
-    const char *sp = "build/itest_core_upgrade.db";
-    unlink(sp); unlink("build/itest_core_upgrade.db-wal"); unlink("build/itest_core_upgrade.db-shm");
+/* Capturing variants, for asserting the folded content and not just the count. */
+struct msg_capture { int n; uint64_t id[8]; char body[8][64]; int edited[8], deleted[8]; };
+static void msg_cb(void *ctx, uint64_t ch, uint64_t id, uint64_t aid,
+                   const char *an, uint64_t t, const char *body, int e, int d) {
+    (void)ch; (void)aid; (void)an; (void)t;
+    struct msg_capture *c = ctx;
+    if (c->n >= 8) return;
+    c->id[c->n] = id;
+    snprintf(c->body[c->n], sizeof c->body[0], "%s", body ? body : "");
+    c->edited[c->n] = e; c->deleted[c->n] = d; c->n++;
+}
+struct out_capture { int n; char body[8][64]; };
+static void out_cb(void *ctx, const uint8_t idem[OC_IDEM_SIZE], uint64_t ch, const char *body) {
+    (void)idem; (void)ch;
+    struct out_capture *c = ctx;
+    if (c->n >= 8) return;
+    snprintf(c->body[c->n], sizeof c->body[0], "%s", body ? body : "");
+    c->n++;
+}
+/* The store names its per-workspace files by a hash we do not export; find the
+ * one .log in the state dir instead of recomputing it. */
+static int find_log_file(const char *dir, char *out, size_t cap) {
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *e; int found = 0;
+    while ((e = readdir(d)) != NULL) {
+        size_t n = strlen(e->d_name);
+        if (n > 4 && strcmp(e->d_name + n - 4, ".log") == 0) {
+            snprintf(out, cap, "%s/%s", dir, e->d_name); found = 1; break;
+        }
+    }
+    closedir(d);
+    return found;
+}
 
-    /* Hand-build the exact v3 schema (pre-rename), with one row in each table. */
-    sqlite3 *raw = NULL;
-    CHECK(sqlite3_open(sp, &raw) == SQLITE_OK);
-    const char *v3 =
-        "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER);"
-        "INSERT INTO schema_version VALUES (1,0),(2,0),(3,0);"
-        "CREATE TABLE instance_state ("
-        "  instance TEXT PRIMARY KEY, session_token BLOB, session_expiry INTEGER, tls_pin BLOB);"
-        "CREATE TABLE cached_message ("
-        "  instance TEXT NOT NULL, channel_id INTEGER NOT NULL, message_id INTEGER NOT NULL,"
-        "  author_id INTEGER, author_name TEXT, server_time INTEGER, body TEXT,"
-        "  edited INTEGER NOT NULL DEFAULT 0, deleted INTEGER NOT NULL DEFAULT 0,"
-        "  PRIMARY KEY (instance, message_id));"
-        "CREATE TABLE outbox ("
-        "  instance TEXT NOT NULL, idem BLOB NOT NULL, channel_id INTEGER NOT NULL,"
-        "  body TEXT, created INTEGER, PRIMARY KEY (instance, idem));";
-    CHECK(sqlite3_exec(raw, v3, NULL, NULL, NULL) == SQLITE_OK);
-
-    uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN];
-    for (unsigned i = 0; i < OC_SESSION_TOKEN_LEN; i++)    tok[i] = (uint8_t)(i + 7);
-    for (int i = 0; i < OC_TLS_FINGERPRINT_LEN; i++)  pin[i] = (uint8_t)(i + 3);
-
-    sqlite3_stmt *st = NULL;
-    sqlite3_prepare_v2(raw, "INSERT INTO instance_state VALUES ('acme:443', ?1, 0, ?2);", -1, &st, NULL);
-    sqlite3_bind_blob(st, 1, tok, OC_SESSION_TOKEN_LEN, SQLITE_TRANSIENT);
-    sqlite3_bind_blob(st, 2, pin, OC_TLS_FINGERPRINT_LEN, SQLITE_TRANSIENT);
-    CHECK(sqlite3_step(st) == SQLITE_DONE);
-    sqlite3_finalize(st);
-    CHECK(sqlite3_exec(raw,
-        "INSERT INTO cached_message VALUES ('acme:443',9,42,5,'dana',1000,'hello',0,0);"
-        "INSERT INTO outbox VALUES ('acme:443', x'0102030405060708090a0b0c0d0e0f10', 9, 'queued', 1);",
-        NULL, NULL, NULL) == SQLITE_OK);
-    sqlite3_close(raw);
-
-    /* Opening with the current code applies migration 4 and reads through the
-     * new `workspace` spelling. */
+/* ARCH-88: a client embeds no database engine, so there is no in-place upgrade
+ * from the old SQLite store — the frontends delete the orphaned state.db and the
+ * user re-signs in once. What this test pins instead is the replacement: the
+ * cache and outbox round-trip through plain files, and a torn tail (a crash
+ * mid-append) costs only the records after the tear. */
+static void test_store_files_roundtrip(void) {
+    const char *sp = "build/itest_core_files";
+    {   /* start clean: remove any files a previous run left */
+        DIR *d = opendir(sp);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                if (e->d_name[0] == '.') continue;
+                char f[600]; snprintf(f, sizeof f, "%s/%s", sp, e->d_name); unlink(f);
+            }
+            closedir(d);
+        }
+    }
     oc_store *s = oc_store_open(sp);
     CHECK(s != NULL);
-    if (s) {
-        uint8_t gp[OC_TLS_FINGERPRINT_LEN];
-        /* The v3 store held its session token in plaintext. Opening it now ERASES
-         * that token (tokens live only in the OS credential store), so the
-         * upgrade deliberately costs one re-sign-in — while the pin and the
-         * cached history, which are not credentials, survive untouched. */
-        uint8_t gt[OC_SESSION_TOKEN_LEN];
-        CHECK(oc_store_load_session(s, "acme:443", gt, NULL, 0) == 0);
-        CHECK(oc_store_load_pin(s, "acme:443", gp) == 1 &&
-              memcmp(gp, pin, OC_TLS_FINGERPRINT_LEN) == 0);
+    if (!s) return;
 
-        int msgs = 0, out = 0;
-        oc_store_each_message(s, "acme:443", count_msg_cb, &msgs);
-        oc_store_outbox_each(s, "acme:443", count_outbox_cb, &out);
-        CHECK(msgs == 1);
-        CHECK(out == 1);
+    oc_store_save_message(s, "acme:443", 9, 42, 5, "dana", 1000, "hello", 0, 0);
+    oc_store_save_message(s, "acme:443", 9, 43, 5, "dana", 1001, "second", 0, 0);
+    oc_store_edit_message(s, "acme:443", 42, "hello (edited)");
+    oc_store_delete_message(s, "acme:443", 43);
+    uint8_t idem[OC_IDEM_SIZE];
+    for (unsigned i = 0; i < OC_IDEM_SIZE; i++) idem[i] = (uint8_t)(i + 1);
+    oc_store_outbox_add(s, "acme:443", idem, 9, "queued");
+    oc_store_close(s);
+
+    /* Reopened in a fresh handle: the edit and the tombstone are folded in. */
+    s = oc_store_open(sp);
+    CHECK(s != NULL);
+    if (s) {
+        struct msg_capture mc; memset(&mc, 0, sizeof mc);
+        oc_store_each_message(s, "acme:443", msg_cb, &mc);
+        CHECK(mc.n == 2);
+        CHECK(mc.id[0] == 42 && strcmp(mc.body[0], "hello (edited)") == 0 && mc.edited[0] == 1);
+        CHECK(mc.id[1] == 43 && mc.deleted[1] == 1);
+
+        struct out_capture oc; memset(&oc, 0, sizeof oc);
+        oc_store_outbox_each(s, "acme:443", out_cb, &oc);
+        CHECK(oc.n == 1 && strcmp(oc.body[0], "queued") == 0);
         oc_store_close(s);
     }
-    unlink(sp); unlink("build/itest_core_upgrade.db-wal"); unlink("build/itest_core_upgrade.db-shm");
+
+    /* Append garbage to the log: the records before the tear survive, the torn
+     * tail is dropped rather than corrupting the load. */
+    {
+        char path[600];
+        CHECK(find_log_file(sp, path, sizeof path) == 1);
+        FILE *f = fopen(path, "ab");
+        /* A plausible-looking header with a bogus length + a bad CRC: exactly the
+         * shape of a write interrupted by a crash. */
+        if (f) { fwrite("\x20\x00\x00\x00\x00\x00\x00\x00garbage", 1, 15, f); fclose(f); }
+        s = oc_store_open(sp);
+        if (s) {
+            struct msg_capture mc; memset(&mc, 0, sizeof mc);
+            oc_store_each_message(s, "acme:443", msg_cb, &mc);
+            CHECK(mc.n == 2);            /* the good prefix still reads */
+            oc_store_close(s);
+        }
+    }
 }
 
 /* Collect the workspace book into a fixed buffer, in the order it is returned. */
@@ -486,7 +521,7 @@ int run_client_core_tests(void) {
     test_resolve();
     test_last_error();
     test_secret_routing();
-    test_store_workspace_upgrade();
+    test_store_files_roundtrip();
     test_workspace_book();
 
     /* The daemon opens its blob store at netloop startup; point it at a build-local

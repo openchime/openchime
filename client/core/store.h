@@ -1,14 +1,15 @@
 /*
- * OpenChime client — the local SQLite store (ARCH-58, CLIENT.md §5). Persists
- * across process restarts the bits a silent relaunch needs: the session token
- * (so we reconnect with OC_AUTH_SESSION instead of a password) and the per-host
- * TOFU pin (so the pinned cert survives a restart). Keyed by `workspace`
- * ("host:port"), so one store file can hold several servers' state.
+ * OpenChime client — the local store (ARCH-58/88, CLIENT.md §5). Persists across
+ * process restarts the bits a silent relaunch needs: the session token (so we
+ * reconnect with OC_AUTH_SESSION instead of a password), the per-host TOFU pin,
+ * the cached history, the offline outbox, and the workspace book. Keyed by
+ * `workspace` ("host:port"), so one store holds several servers' state.
  *
- * The store reuses the daemon's migration runner (oc_migrate) with its own
- * client migration set. It is owned and used by the net thread only — a single
- * sqlite connection on one thread, no cross-thread access. When the store cannot
- * be opened the client still runs, just without persistence (in-memory only).
+ * **No database engine (ARCH-88).** The token and pin live in the OS credential
+ * store via the oc_secret seam; the cache, outbox and book are plain files under
+ * `path`, which is a DIRECTORY. It is owned by the net thread (the three book
+ * calls excepted, below); when the store cannot be opened the client still runs,
+ * just without persistence.
  */
 
 #ifndef OC_STORE_H
@@ -22,14 +23,15 @@
 
 typedef struct oc_store oc_store;
 
-/* Open (creating + migrating) the store at `path`, or NULL on any failure (the
- * caller then runs without persistence). The parent directory must exist. */
+/* Open the store rooted at directory `path`, creating it if needed; NULL on any
+ * failure (the caller then runs without persistence). */
 oc_store *oc_store_open(const char *path);
 void      oc_store_close(oc_store *s);
 
-/* Route the session token through an OS secret store (borrowed; NULL = keep it in
- * SQLite). When set, save/load/clear_session use the keyring; the pin + cache
- * stay in SQLite regardless. Set once, right after open. */
+/* Attach the OS credential store (borrowed). The session token AND the TOFU pin
+ * live there and NOWHERE else, so with NULL neither is persisted — the user signs
+ * in again next launch and the next connect re-TOFUs. Set once, right after
+ * open, and before any load_session/load_pin probe. */
 void      oc_store_set_secret(oc_store *s, oc_secret *secret);
 
 /* Session token (ARCH-58). load returns 1 and fills `token`/`expiry` iff a
@@ -92,10 +94,11 @@ void oc_store_outbox_each(oc_store *s, const char *workspace,
  * in as, ordered most-recently-used first.
  *
  * Unlike the rest of this header these three are safe to call from a SECOND
- * oc_store handle on the same file, opened by the frontend outside the net
- * thread — the book is written at login/logout, not on the message path, and
- * SQLite's WAL + busy timeout cover the overlap. That is how the switcher lists
- * workspaces that have no running client.
+ * oc_store handle on the same directory, opened by the frontend outside the net
+ * thread — the book is written at login/logout, not on the message path, and it
+ * is rewritten whole under an atomic rename, so a concurrent reader sees either
+ * the old file or the new one. That is how the switcher lists workspaces that
+ * have no running client.
  *
  * remember() upserts and stamps last-used; a NULL label/username preserves the
  * stored one, so re-login never blanks the switcher. forget() removes the entry

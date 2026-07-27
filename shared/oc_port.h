@@ -13,6 +13,7 @@
 #  include <direct.h>
    /* mingw's mkdir takes no mode argument. */
 #  define oc_mkdir(path) _mkdir(path)
+#  define OC_PATH_SEP '\\'
    /* localtime_s has reversed argument order and returns errno_t. */
 static inline struct tm *oc_localtime_r(const time_t *t, struct tm *out) {
     return localtime_s(out, t) == 0 ? out : (struct tm *)0;
@@ -26,6 +27,7 @@ static inline int oc_nanosleep(long ns) {
 #else
 #  include <sys/stat.h>
 #  define oc_mkdir(path) mkdir((path), 0700)
+#  define OC_PATH_SEP '/'
 #  define oc_localtime_r(t, out) localtime_r((t), (out))
    static inline int oc_nanosleep(long ns) {
        struct timespec ts = { ns / 1000000000L, ns % 1000000000L };

@@ -318,21 +318,16 @@ false alarms as local dev daemons re-self-sign (`client/core/net.c:is_loopback`,
 
 ## 5. Local store
 
-The core bundles SQLite (`client/core/store.c`) and reuses the daemon's
-migration-runner (`oc_migrate`) with its own client migration set. **Built so
-far:**
-- `workspace_state` (one row per `"host:port"`) — the **session token + expiry**
-  (ARCH-58) and the **per-workspace TOFU pin** (ARCH-10), so a relaunched client
-  reconnects silently with the token — no password — against the pinned cert.
-  **The session token lives ONLY in the OS credential store — never in SQLite.**
-  The core exposes an abstract `oc_secret` get/put/del vtable
-  (`client/core/secret.h`, no keyring library in the core), and every frontend
-  opens its platform backend through one entry point,
-  `oc_secret_open_os()` (`client/shared/secret_os.h`): **libsecret** on Linux
-  (`secret_libsecret.c`, Secret Service → GNOME Keyring/KWallet) and **Windows
-  Credential Manager** on both Windows front-ends (`secret_win.c`, one generic
-  credential per workspace: target `openchime:<host:port>`, the token+expiry blob,
-  `CRED_PERSIST_LOCAL_MACHINE` so it does not roam).
+The core embeds **no database engine** (ARCH-88/REQ-201). `client/core/store.c`
+splits its four concerns by what they are: the **session token and TOFU pin** go
+to the OS credential store (`oc_secret`), and the **cached history**, **offline
+outbox** and **workspace book** are plain files under the state *directory*. The
+cache is an append-only log of length-prefixed CRC'd records — one writer, read
+whole at startup, never queried — with edits/deletes appended as tombstones,
+folded on load, and the file compacted past its record budget; a tail torn by a
+crash fails its checksum and is dropped. The outbox and book are small enough to
+rewrite whole under an atomic rename, which is what makes the switcher's
+second-handle contract hold with no locking.
 
   **There is no plaintext fallback.** Where no store exists — headless, no D-Bus,
   a locked keychain — `oc_store_save_session`/`load_session` simply do nothing, so
