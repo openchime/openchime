@@ -112,8 +112,8 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 
 | REQ | Status | Notes |
 |-----|--------|-------|
-| 200 Linux/Win/macOS/iOS/Android clients | 🟡 | Client pivoted to **one shared C app-core + native UI per platform** (ARCH-74, tdlib model — supersedes the raylib/Windows-cross-compile plan). The app-core (`client/core/`: net thread, queues, view-model + reducers, `oc_client` facade) is **built and headless-tested** (`tests/test_client_core.c` drives it against an in-process daemon; `make core` compile-check, linked into `make test`). First frontend is a **TUI** — rebuilt menu/screen-driven on the in-tree `tuikit` toolbox (ARCH-83) with a 256-color theme and a Ctrl+K command palette; the slash-command UX (ARCH-75) is gone — with: connect + local auth, channel sidebar + unread, live messages + history backfill, display names, per-nick colors, scrollback, send, with reactions, edit/delete, typing indicators, threads, search, channel + DM management, presence + roster, who-reacted, notification prefs + DND, admin (roles/invite/remove), webhook management, attachments, and logout — all reached through context menus and the command palette (Ctrl+K). Every engine feature on the wire is now reachable from the TUI; native GUIs pending. The **Windows GUI** rendering stack is settled — **Win32 + Direct2D/DirectWrite + RichEdit**, pure C (ARCH-82); two first-draft GUIs (comctl32, and a self-rendered Clay+raylib) were built, rejected as dated / non-native, and **have been removed** (client/gui and the vendored Clay/raylib deleted). Native AppKit/Android/DOM/WASM frontends still pending. Daemon is Linux-only (epoll/eventfd). |
-| 210 lean/standard memory profile | ✅ | **Measured** (`Scripts/bench.sh`): ~5 MB baseline + **~50 KB RSS per idle connection**, so a few hundred connections sit in ~15–30 MB and low-thousands stay within the 256 MB lean profile. Message round-trip p50 ~4 ms, p99 ~20–40 ms under concurrency. |
+| 200 Linux/Win/macOS/iOS/Android clients | 🟡 | Client pivoted to **one shared C app-core + native UI per platform** (ARCH-74, tdlib model — supersedes the raylib/Windows-cross-compile plan). The app-core (`client/core/`: net thread, queues, view-model + reducers, `oc_client` facade) is **built and headless-tested** (`tests/test_client_core.c` drives it against an in-process daemon; `make core` compile-check, linked into `make test`). First frontend is a **TUI** — rebuilt menu/screen-driven on the in-tree `tuikit` toolbox (ARCH-83) with a 256-color theme and a Ctrl+K command palette; the slash-command UX (ARCH-75) is gone — with: connect + local auth, channel sidebar + unread, live messages + history backfill, display names, per-nick colors, scrollback, send, with reactions, edit/delete, typing indicators, threads, search, channel + DM management, presence + roster, who-reacted, notification prefs + DND, admin (roles/invite/remove), webhook management, attachments, and logout — all reached through context menus and the command palette (Ctrl+K). Nearly every capability the app-core exposes is reachable from the TUI — the exceptions (webhook delete, log-out-everywhere) and the daemon frames no client reaches yet are listed in [CLIENT.md](./CLIENT.md) §3; native GUIs pending. The **Windows GUI** rendering stack is settled — **Win32 + Direct2D/DirectWrite + RichEdit**, pure C (ARCH-82); two first-draft GUIs (comctl32, and a self-rendered Clay+raylib) were built, rejected as dated / non-native, and **have been removed** (the old self-rendered `client/gui` tree and the vendored Clay/raylib are deleted — the current native GUI lives at `client/gui/win32/` and is unrelated). Native AppKit/Android/DOM/WASM frontends still pending. Daemon is Linux-only (epoll/eventfd). |
+| 210 lean/standard memory profile | ✅ | **Measured** (`Scripts/bench.sh`): ~5 MB baseline + **~50 KB RSS per idle connection**, so a few hundred connections sit in ~15–30 MB and low-thousands stay within the 256 MB lean profile. Message round-trip **p50 ~2–3 ms, p90 ~80 ms, p99 ~130 ms** at 32 concurrent senders. (An earlier *p99 ~20–40 ms* was a harness artifact and was corrected 2026-07-19 — see [BENCHMARK.md](./BENCHMARK.md).) |
 | 211 low-hundreds concurrent connections | ✅ | **Measured**: hundreds of concurrent pinned-TLS connections held in a small fraction of the lean profile. Connection *setup* is bounded by the 600k-iteration PBKDF2 auth on the single writer at **~2 logins/s** (≈500 ms each), so a burst of simultaneous logins queues there; steady-state is cheap. `OC_NETLOOP_MAX_FD=4096`. See [BENCHMARK.md](./BENCHMARK.md) — an earlier ~6–7 logins/s figure was a harness artifact (a 10 s read timeout silently dropping most connections) and was corrected 2026-07-19. |
 | 212 messaging survives storage exhaustion | ✅ | **Built** (`daemon/storage.c`): a configured reserve (`OPENCHIME_DB_RESERVE_MB`, default 256) belongs to SQLite and is never spent on attachments; past it uploads are refused (216) while messaging is untouched. |
 | 213 reclaim orphaned/aborted blobs | ✅ | **Built** — this closes the leak where `oc_blob_delete` had no caller and blob storage grew monotonically. The maintenance pass sweeps attachments never linked to a message (past a grace window) and hands their keys to the transfer pool. Verified on a live daemon: seeded orphan row + blob, pass fired on its timer, row tombstoned and the bytes gone from disk. |
@@ -127,8 +127,9 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 
 ## Windows GUI feature parity (ARCH-82)
 
-The **TUI is the reference client** — "every engine feature on the wire is
-reachable from the TUI" ([CLIENT.md](./CLIENT.md) §3). This table tracks the
+The **TUI is the reference client** — nearly every capability the app-core
+exposes is reachable from it ([CLIENT.md](./CLIENT.md) §3, which also lists the
+two that are not). This table tracks the
 native Win32 GUI (`client/gui/win32/`) toward the same bar. The contract is the
 `oc_client_*` facade (`client/core/client.h`): each row is a feature the GUI must
 surface as an **affordance** (button / menu / dialog — never a slash command).
@@ -154,7 +155,7 @@ Legend: ✅ done · 🔨 in progress · ⛔ not started.
 | Channel management | `create_channel`, `join_channel`, `leave_channel` | ✅ | App menu New channel; sidebar right-click Join/Leave. |
 | Attachments: download | `download` | ✅ | Right-click → Download (native Save dialog). |
 | Attachments: upload | `upload` | ✅ | Composer "+" button + drag-drop anywhere. |
-| Notifications / DND | `set_notify_pref`, `set_dnd`, `list_notify_prefs` | ✅ | Channel menu level + app-menu DND window. |
+| Notifications / DND | `set_notify_pref`, `set_dnd` | 🔨 | Channel menu level + a DND window prompt on the profile menu. **`list_notify_prefs` is not wired** — there is no review screen for the synced prefs (the TUI has one). |
 | Self-service profile | `set_display_name`, `change_password` | ✅ | App menu → Your profile ▸ name / password. |
 | Webhooks | `webhooks`, `create_webhook`, `delete_webhook` | ✅ | Channel menu → Webhooks…/Create; overlay, click-to-delete. |
 | Storage / audit (admin) | `storage_status`, `audit_query` | ✅ | App menu (owner/admin) → Storage usage / Audit log overlays. |
@@ -166,14 +167,21 @@ Legend: ✅ done · 🔨 in progress · ⛔ not started.
 
 > **Depth caveat:** this table tracks whether each engine feature is *reachable*; it does **not** measure how developed each screen/dialog is. For the full four-way (Slack vs Pumble vs TUI vs Win32) surface-depth gap analysis — including underdeveloped screens and a recommended build order — see [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md).
 
-**Feature parity is essentially complete** — all 27 features are surfaced (the
-rail workspace switcher UI now exists too). The one genuinely unbuilt *capability*
-is the TUI's **N-concurrent-client** multi-workspace model: Win32 switches by
-stop/reconnecting a single `oc_client`, so a background workspace does not receive
-or accrue unread ("N elsewhere"). Next per the agreed sequencing is the **polish
-pass**: transcript density / date-separators / real-scrollbar / hover, sidebar +
-header spacing, a theme-matched login dialog, and a global colors/fonts/spacing
-sweep.
+**Feature parity is essentially complete** — all 27 features are reachable, 25
+of them fully; two are 🔨:
+
+- **Notification prefs** — the per-channel level and the DND window are settable,
+  but `list_notify_prefs` is never called, so there is no review screen for the
+  server-synced prefs.
+- **Multiple workspaces** — the rail switcher UI exists, but Win32 switches by
+  stop/reconnecting a single `oc_client`, so a background workspace does not
+  receive or accrue unread ("N elsewhere"). This is the one genuinely unbuilt
+  *capability* versus the TUI's N-concurrent-client model.
+
+Next per the agreed sequencing is the **depth pass** —
+[CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5 has the prioritized order,
+led by the error/toast surface (REQ-263), navigable search (REQ-080), and the
+sidebar overhaul (REQ-267).
 
 ---
 
@@ -214,8 +222,10 @@ ordering, not a commitment.
 - ✅ **First-owner setup token (REQ-024).** First run in local mode with no owner
   mints a one-time owner invite and logs its token (redeemed to create the
   owner); reuses the invite path. Tested.
-- ✅ **Codec fuzzer + concurrency load test.** A deterministic fuzzer runs 180k
-  iterations of random/framed bytes through `oc_parse_frame` + every decoder
+- ✅ **Codec fuzzer + concurrency load test.** A deterministic fuzzer runs 45k
+  iterations by default (30k random + 15k framed, overridable via
+  `OC_FUZZ_RANDOM_ITERS`/`OC_FUZZ_FRAMED_ITERS`) of random/framed bytes through
+  `oc_parse_frame` + every decoder
   (clean under ASan/UBSan); an 8-client concurrent-send load test exercises the
   accept path, writer, and fan-out under contention.
 

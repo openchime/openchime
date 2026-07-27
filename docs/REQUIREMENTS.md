@@ -10,8 +10,9 @@ messaging/auth/roles/channels/reactions/threads/search/presence/typing/
 notification-settings/attachments/webhooks, plus the storage-maintenance tiers
 (§10.1), the audit log (REQ-251), federated enrollment (ARCH-84) and the mobile-push
 emitter (ARCH-85) — alongside a shared C client app-core with a local store, and a
-`tuikit`-based TUI (ARCH-74/83) on Linux and Windows from which every engine
-feature on the wire is reachable. Forward scope: the **client** halves of audio
+`tuikit`-based TUI (ARCH-74/83) on Linux and Windows from which nearly every
+capability the app-core exposes is reachable (the exceptions are listed in
+[CLIENT.md](./CLIENT.md) §3). Forward scope: the **client** halves of audio
 (REQ-150–152) and push (a shipping mobile client), **screenshare** (REQ-161), the
 OIDC browser flow, the remaining native GUIs, and most of Sections 11–16 — of
 which REQ-251/251a/251b are built and the rest are not. Section 15 collects the

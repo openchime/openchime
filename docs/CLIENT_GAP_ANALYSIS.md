@@ -247,7 +247,7 @@
 | SSO — **SAML 2.0** | ✅ ᴾ (Pro) | ✅ **ᴱ Enterprise only** | ⛔ **not supported at all** | ⛔ | **No SAML anywhere in the product** — not built, not designed (ARCH-55 has no SAML path; recorded as REQ-027). Disqualifying in SAML-mandatory RFPs. See §8. |
 | SSO — **OIDC / social login** | ✅ ᴾ | ✅ OAuth2 ᴱ | ❌ client half unbuilt (Google-only upstream) | ❌ | Daemon verification built; browser flow + PKCE + courier ⛔ (REQ-020). **P1** — see §8. |
 | SCIM / JIT provisioning | ✅ | ❔ | ⛔ | ⛔ | Out of scope for client (ours is REQ-253, federated). |
-| Session mgmt / forced sign-out | ✅ | ❔ | 🟡 logout | 🟡 logout, no log-out-everywhere | No revoke-all-sessions surfaced (the daemon supports it, REQ-182). **P2** |
+| Session mgmt / forced sign-out | ✅ | ❔ | 🟡 logout only | 🟡 logout **+ "Sign out everywhere"** | Win32 surfaces revoke-all (`OC_LOGOUT_ALL`); the TUI does not. Neither lists active sessions. **P2** |
 | IP allowlist / domain restrict | ✅ | ❔ | ⛔ | ⛔ | Server-side, out of client scope. |
 | Encryption at rest / in transit | ✅ + EKM | ✅ (256-bit TLS; no EKM) | ⛔ | ⛔ | Out of scope. |
 | DLP (native/3rd-party) | ✅ | ❌ | ⛔ | ⛔ | Out of scope. |
@@ -314,7 +314,7 @@
 | Workspace switch by number | ✅ Cmd+1..9 | ❔ | 🟡 | ❌ | **P2** |
 | Reconnect / auto-reconnect | ✅ | ✅ | ⚪ stub | 🟡 works, no countdown/banner | **P1** |
 | Connection status indicator | ✅ | ✅ | 🟡 status line | 🔸 no toast/banner/countdown | **P1** |
-| Logout | ✅ | ✅ | 🟡 | 🟡 no log-out-everywhere | Present. — |
+| Logout | ✅ | ✅ | 🟡 no log-out-everywhere | ✅ Sign out / Sign out everywhere | Present; TUI lacks revoke-all. — |
 | Quit | ✅ | ✅ | 🟡 | 🟡 | Present. — |
 
 ### 2.15 Calls / Huddles / Canvas / Lists / Clips
@@ -391,7 +391,8 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 - **Inline image/thumbnail rendering; open-in-place.** **P1**
 - **Signup / first-owner UI; remember-me surfaced; login error display.** **P0**
 - **Avatar / rich profile editor; custom status; email/timezone.** **P1**
-- **Log-out-everywhere / revoke sessions.** **P2**
+- **Active-session list** (revoke-all *is* built — "Sign out everywhere"; listing sessions is not). **P2**
+- **Notification-prefs review screen** (`list_notify_prefs` never called). **P1**
 - **Keyboard shortcut reference/help overlay.** **P2**
 - **Search paging, filters, term highlight, in-overlay input, jump-to-message.** **P0**
 - **Draft persistence; scheduled send; drafts hub.** **P2**
@@ -399,6 +400,7 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 
 ### TUI — missing
 - **Delete webhook** (core supports it; not surfaced). **P1**
+- **Log-out-everywhere / revoke sessions** (core supports `OC_LOGOUT_ALL`; Win32 surfaces it, the TUI does not). **P2**
 - **In-app settings / config editor** (file-only; no theme/12-24h/panel toggles). **P0**
 - **Invite-as-admin / invite roles + expiry / pending-invite list.** **P1**
 - **Destructive confirmations** (delete message, remove user have none). **P1**

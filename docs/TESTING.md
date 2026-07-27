@@ -12,7 +12,8 @@ integration suites that drive the real epoll server over TLS (`itest_netloop`,
 `itest_tls`, `itest_slow_blob`) and the headless client app-core
 (`test_client_core.c`) — all compiled into one `build/tests` binary by `make test`.
 The integration tier drives the deployed container over the compose stack
-(`make integration`). A deterministic codec fuzzer (180k iterations, clean under
+(`make integration`). A deterministic codec fuzzer (45k iterations by default —
+30k random + 15k framed; clean under
 ASan/UBSan) and a concurrency load test (`tests/bench_load.c`, driven by
 `Scripts/bench.sh`) round it out.
 

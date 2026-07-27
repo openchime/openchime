@@ -87,14 +87,19 @@ menus, dialogs, and a Ctrl+K command palette; there are no slash commands. It
 covers live messaging with history backfill, reactions, edit/delete, typing,
 threads, search, channel + DM management, roster + presence, who-reacted,
 notification prefs + DND, admin (roles/invite/remove), webhooks, attachments,
-storage and audit overlays, multiple workspaces, and logout — **every engine
-feature on the wire is reachable from the TUI**. The app-core also has a local
+storage and audit overlays, multiple workspaces, and logout — **nearly every
+capability the app-core (`oc_client`) exposes is reachable from the TUI**, the
+exceptions being webhook *deletion* and log-out-everywhere. Some frames the
+daemon speaks reach no client at all yet — see [docs/CLIENT.md](docs/CLIENT.md)
+§3. The app-core also has a local
 SQLite store, so it reconnects silently across restarts, shows cached history
 offline, and queues sends made while disconnected (REQ-100/101/102).
 
 A native **Windows GUI** (Win32 + Direct2D/DirectWrite, pure C — ARCH-82) is in
-progress: 26 of 27 engine features are surfaced, with the multi-workspace
-switcher outstanding and a depth/polish backlog tracked in
+progress: all 27 tracked engine features are reachable, 25 of them fully — the
+two partials are notification prefs (no review screen) and multiple workspaces
+(the rail switcher is built; holding N clients at once is not). A depth/polish
+backlog is tracked in
 [docs/CLIENT_GAP_ANALYSIS.md](docs/CLIENT_GAP_ANALYSIS.md). GTK (Linux), AppKit
 (macOS), a web DOM UI, and mobile follow.
 

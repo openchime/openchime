@@ -234,8 +234,12 @@ model; translate input to intents }, stop.
     folds each change into the roster).
   - **webhook management** — the channel menu's "Webhooks" overlays the focused
     channel's incoming webhooks; "Create webhook" mints one (the 32-byte token is
-    shown once atop the overlay, like an invite); removing a row deletes one
-    (REQ-170; CREATE/LIST/DELETE_WEBHOOK, a WEBHOOK_DELETED drops the row).
+    shown once atop the overlay, like an invite) — REQ-170, CREATE/LIST_WEBHOOK.
+    **Deleting a webhook is not surfaced**: the core exposes
+    `oc_client_delete_webhook` and the daemon handles `DELETE_WEBHOOK`, but the
+    overlay is read-only and its header still shows a stale `/webhook` slash-command
+    hint left over from the removed slash UX (both are known bugs —
+    [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §3.6).
   - **attachments** — the launcher's "Upload a file" streams a local file through
     the daemon (UPLOAD_BEGIN → CHUNKs within the advertised window → END → OK) and
     links it into a message; the message menu's "Download file" saves an
@@ -244,8 +248,18 @@ model; translate input to intents }, stop.
     (id, filename, mime, size), rendered as a `📎 name (size) #id` line.
     Text-only, so files are never rendered inline (REQ-140/141).
 
-  With attachments surfaced, **every engine feature now on the wire is reachable
-  from the TUI**; the remaining client work is the later native GUIs.
+  With attachments surfaced, **nearly every capability the app-core exposes is
+  reachable from the TUI** — the two `oc_client_*` calls with no TUI surface are
+  `delete_webhook` (above) and `logout(OC_LOGOUT_ALL)` (the TUI only revokes its
+  own session). `oc_client_set_setting` also has no caller in any frontend.
+
+  Separately, several frames the **daemon** speaks reach **no client** yet:
+  `CALL_JOIN`/`CALL_LEAVE` (the audio client, REQ-150–152),
+  `REGISTER_DEVICE_TOKEN`/`UNREGISTER_DEVICE_TOKEN` (exercised only by
+  `tests/demo_client.c`, so no shipped client can populate the push registry —
+  ARCH-85), `INVITE_TO_CHANNEL`, `REMOVE_FROM_CHANNEL`, `REDEEM_INVITE` (the
+  missing signup/first-owner flow, REQ-268), and `TRANSFER_CANCEL`. None is
+  implemented in `client/core`, so this is core work, not frontend work.
 - **Windows (next):** **Win32 in pure C** over the core — **Direct2D/DirectWrite
   (+ WIC)** for the custom surfaces (message transcript, sidebar, rails) and
   **native controls for the hard bits** (RichEdit composer, EDIT search, Win32
@@ -413,8 +427,9 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
   surfaces: reactions, edit/delete, typing, threads, search, channel management,
   roster + presence, DMs, logout, who-reacted, notification prefs/DND, admin,
   webhook management, attachments, and audit log (see §3 for where each lives).
-  **Every engine
-  feature on the wire is now reachable from the TUI.**
+  **Nearly every capability the app-core exposes is reachable from the TUI** —
+  §3 lists the two that are not (webhook delete, log-out-everywhere) and the
+  daemon frames no client reaches yet.
 - **Also shipped since:** the **local store** and reconnect/offline (REQ-100/101/102
   — silent session-token reconnect across restarts, persisted TOFU pin, cached
   history, offline outbox, workspace book), **multiple workspaces** (REQ-012–015),
