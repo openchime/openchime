@@ -105,9 +105,9 @@
 | Posting/management permissions | ✅ | ✅ ᴮ | ❌ | ❌ | **P2** |
 | Channel bookmarks | ✅ | ❔ | ❌ | ❌ | **P2** |
 | Channel canvas | ✅ | ❌ | ⛔ | ⛔ | Canvas out of scope for us; Pumble has no equivalent either. |
-| Leave channel | ✅ | ✅ | 🟡 in channel action menu | 🟡 (verify) | TUI has Leave; Win32 context menu lacks it? **P1** |
+| Leave channel | ✅ | ✅ | 🟡 in channel action menu | 🟡 sidebar right-click → Leave channel | Verified present in both (winmain.c channel menu). — |
 | Join / open channel | ✅ | ✅ | 🟡 Join/Open menu | 🟡 | Present. — |
-| Browse channels directory | ✅ searchable/filter/sort | ✅ (Channels tab in search) | ❌ | ❌ no sidebar search | No channel browser/search. **P1** |
+| Browse channels directory | ✅ searchable/filter/sort | ✅ (Channels tab in search) | ❌ | 🔸 sidebar filter only | Win32 has a "Find a conversation" box that substring-filters *joined* channels; neither client can browse/join undiscovered ones. **P1** |
 | Default channels | ✅ | ❔ | ❌ (admin) | ❌ | Admin — **P2** |
 | Slack Connect (shared/external) | ✅ | 🔸 guest access ᴮ only | ⛔ | ⛔ | Out of scope; Pumble has no cross-org federation either. |
 | Channel context/action menu | ✅ | ✅ | 🟡 Join/Open/Notify/Webhooks/Leave | 🟡 no rename/topic/archive/delete/details | Win32 menu very shallow. **P1** |
@@ -283,15 +283,15 @@
 
 | Feature / Surface | Slack | Pumble | TUI | Win32 | Gap notes & priority |
 |---|---|---|---|---|---|
-| Header bar | ✅ | ✅ | 🟡 | 🟡 no member count/header actions | **P2** |
-| Sidebar channel/DM list | ✅ | ✅ | ✅ grouped, unreads, badges, lock/@ markers | 🟡 flat, hides unnamed, 512 cap, no DM/sections/search/starred/muted | Win32 sidebar much weaker. **P0** |
+| Header bar | ✅ | ✅ | 🟡 | 🟡 channel name + typing line; no member count/header actions (the channel-column header has settings/compose buttons) | **P2** |
+| Sidebar channel/DM list | ✅ | ✅ | ✅ grouped, unreads, badges, lock/@ markers | 🟡 flat single "CHANNELS" group + a filter box; hides unnamed, 512-row cap, no scroll, no DM section/grouping/collapse/starred/muted | Win32 gained the filter (nav epic) but is still flat and unscrollable. **P0** |
 | Custom sidebar sections | ✅ | ✅ ᴾ | 🟡 fixed groups | ❌ | **P2** |
 | Unreads-only sidebar mode | ✅ | ✅ | ❌ | ❌ | **P2** |
-| Quick switcher / command palette | ✅ Cmd+K | ✅ quick search | ✅ Ctrl+K ~19 fuzzy actions | ❌ app menu only, NO Ctrl+K/keyboard palette | Win32 lacks a command palette. **P1** |
+| Quick switcher / command palette | ✅ Cmd+K | ✅ quick search | ✅ Ctrl+K ~19 fuzzy actions | ❌ rail menus + a name filter; NO Ctrl+K/keyboard palette | Win32 actions are mouse-driven off the rail; no keyboard-driven action surface. **P1** |
 | Global search bar | ✅ | ✅ | 🟡 prompt | 🔸 modal | See Search. **P1** |
 | Channel browser / add channels | ✅ | ✅ | ❌ | ❌ | **P1** |
 | New message / compose (Cmd+N) | ✅ | ✅ | 🟡 new-DM/new-channel prompts | 🟡 | Present. — |
-| Profile/account menu | ✅ | ✅ | 🟡 via launcher | 🟡 app menu off avatar | Present. — |
+| Profile/account menu | ✅ | ✅ | 🟡 via launcher | 🟡 profile menu off the rail avatar | Present. — |
 | Preferences hub | ✅ | ✅ | ❌ | ❌ | **P0** (settings screen) |
 | Themes/appearance | ✅ | ✅ | ❌ | ❌ | **P2** |
 | Keyboard shortcuts reference | ✅ | ✅ | ✅ help overlay RICH | ❌ | Win32 has no shortcut help. **P2** |
@@ -377,14 +377,14 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 
 ### Win32 GUI — missing
 - **N-concurrent-workspace model** — the rail switcher UI exists, but Win32 stop/reconnects a single client; no holding N clients at once with background unread ("N elsewhere"), as the TUI does. **P1**
-- **Settings/Preferences screen** — no in-app config at all. **P0**
+- **Settings/Preferences screen** — the workspace menu has a **Preferences** item, but it opens a "coming soon" `MessageBox`; no in-app config exists. **P0**
 - **@-mention / #channel / :emoji autocomplete** in composer. **P0**
 - **Composer emoji picker** (none; only 6 hardcoded reaction emoji). **P1**
 - **Error/toast surface** for any failure (login, send, rate-limit). **P0**
-- **Command palette / Ctrl+K** (app menu only). **P1**
-- **DM section/list** in sidebar; **sidebar sections/collapsing/search/starred/muted**. **P0**
+- **Command palette / Ctrl+K** (rail menus only; no keyboard-driven action surface). **P1**
+- **DM section/list** in sidebar; **sidebar sections/collapsing/starred/muted** and sidebar **scrolling** past the visible rows. The rail's **DMs** view exists but renders the same flat channel sidebar as Home — it has no DM-specific behaviour. **P0**
 - **View other-user profile.** **P0**
-- **Notification inbox / Activity feed; OS toast; global notify prefs; list_notify_prefs review.** **P1**
+- **Notification inbox / Activity feed; OS toast; global notify prefs; `list_notify_prefs` review** — the rail's **Activity** and **Alerts** entries are "coming soon" stubs. **P1**
 - **Channel rename / topic / archive / delete / details pane.** **P1**
 - **Jump-to-unread / new-message divider / mark-unread.** **P1**
 - **Copy-link / permalink, pin, forward** on messages. **P1**
@@ -397,6 +397,7 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 - **Search paging, filters, term highlight, in-overlay input, jump-to-message.** **P0**
 - **Draft persistence; scheduled send; drafts hub.** **P2**
 - **Reconnect countdown/banner.** **P1**
+- **Stub rail views** — **Activity** (REQ-139), **Files** (REQ-143), **Later** (REQ-231) and **Notifications** are reachable placeholders rendering "coming soon", not built surfaces. **P1**
 
 ### TUI — missing
 - **Delete webhook** (core supports it; not surfaced). **P1**
@@ -425,16 +426,23 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 
 ## 5. Recommended Build Order for Win32 (current focus) — top 10 by impact
 
+> **The nav epic changed where several of these land.** The left-nav rail
+> (STATUS.md §"The shell") already ships the *destinations* for items 5, 7 and 8
+> — Preferences, Later, Activity/Alerts and Files are all rail entries rendering
+> "coming soon". So those items are now "fill in a stub view", not "invent a
+> surface", which lowers their cost. Item 3's sidebar filter box also exists;
+> what remains there is grouping, a DM section, scrolling, and mute/star.
+
 1. **Global error/toast + login error display.** Failures are currently silent — highest trust/usability risk, small surface. **P0**
 2. **Search that works** — navigable results, jump-to-matched-message (not channel), name resolution, in-overlay query + paging + highlight. **P0**
-3. **Sidebar overhaul** — DM section + Public/Private grouping (TUI parity), collapsing, search, mute/star, load-more past 512. **P0**
+3. **Sidebar overhaul** — DM section + Public/Private grouping (TUI parity), collapsing, scrolling, mute/star, load-more past 512; the filter box already exists, and the rail's **DMs** view needs real DM-only behaviour. **P0**
 4. **Composer autocomplete + emoji picker** — @mention/#channel/:emoji popover and a real emoji picker (drop the 6 hardcoded). Core chat affordance. **P0**
-5. **Settings / Preferences screen** — writing through existing config; time format, notifications, appearance. **P0**
+5. **Settings / Preferences screen** — replace the workspace menu's "coming soon" Preferences box; write through existing config (time format, notifications, appearance). **P0**
 6. **View other-user profile** — clickable avatar/name → profile pane. **P0**
 7. **Message actions depth** — copy-link/permalink, pin, forward, mark-unread; jump-to-unread + new-message divider. **P1**
-8. **Notifications: OS toast + Activity/notification inbox + editable global prefs; DND with pickers.** **P1**
+8. **Notifications: OS toast + Activity/notification inbox (fills the rail's Activity + Alerts stubs) + a `list_notify_prefs` review screen + editable global prefs; DND with pickers.** **P1**
 9. **Channel management** — rename/topic/archive/details pane + a real create-channel dialog (privacy/topic/members). **P1**
-10. **Command palette (Ctrl+K)** + inline image/thumbnail rendering (D2D makes this a strong differentiator). **P1**
+10. **Command palette (Ctrl+K)** + inline image/thumbnail rendering (D2D makes this a strong differentiator); the **Files** and **Later** rail stubs are the natural follow-on. **P1**
 
 *Follow-ups just behind the top 10: full webhook CRUD, paged audit log, richer invite dialog, per-reply thread actions, real profile editor, the N-concurrent-workspace model (the rail switcher UI is already built; the delta is holding N clients at once), reconnect banner/countdown, and replacing the six-forms-in-one-prompt pattern with purpose-built dialogs.*
 ---

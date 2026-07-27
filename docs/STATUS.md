@@ -147,25 +147,50 @@ Legend: ✅ done · 🔨 in progress · ⛔ not started.
 | Typing indicator | `typing` | ✅ | Sends while composing; renders "X is typing…" in the header. |
 | Direct messages | `open_dm` | ✅ | Left-click a member. |
 | Roster + presence | `list_users`, `toggle_roster` | ✅ | Members pane with presence dots + roles. |
-| Set own presence | `set_presence` | ✅ | App menu → Set status → Online/Away. |
+| Set own presence | `set_presence` | ✅ | Rail → profile avatar → Set status: Online / Away. |
 | Admin: roles / remove | `set_role`, `remove_user` | ✅ | Member right-click, role-gated. |
-| Admin: invite | `invite_user` | ✅ | App menu → Invite people (token shown once). |
+| Admin: invite | `invite_user` | ✅ | Rail → workspace menu → Invite people as member / as admin (token shown once, owner/admin only). |
 | Threads | `open_thread`, `reply`, `close_thread` | ✅ | Message menu → Reply/Open thread; overlay + reply composer. |
-| Search | `search`, `close_search` | ✅ | App menu → Search messages…; results jump to channel. |
-| Channel management | `create_channel`, `join_channel`, `leave_channel` | ✅ | App menu New channel; sidebar right-click Join/Leave. |
+| Search | `search`, `close_search` | ✅ | Rail → New (+) → Search messages…; results jump to the channel, not the matched message. |
+| Channel management | `create_channel`, `join_channel`, `leave_channel` | ✅ | Rail → New (+) → New channel (name only); sidebar right-click Join / Leave / Mark as read. |
 | Attachments: download | `download` | ✅ | Right-click → Download (native Save dialog). |
 | Attachments: upload | `upload` | ✅ | Composer "+" button + drag-drop anywhere. |
-| Notifications / DND | `set_notify_pref`, `set_dnd` | 🔨 | Channel menu level + a DND window prompt on the profile menu. **`list_notify_prefs` is not wired** — there is no review screen for the synced prefs (the TUI has one). |
-| Self-service profile | `set_display_name`, `change_password` | ✅ | App menu → Your profile ▸ name / password. |
-| Webhooks | `webhooks`, `create_webhook`, `delete_webhook` | ✅ | Channel menu → Webhooks…/Create; overlay, click-to-delete. |
-| Storage / audit (admin) | `storage_status`, `audit_query` | ✅ | App menu (owner/admin) → Storage usage / Audit log overlays. |
+| Notifications / DND | `set_notify_pref`, `set_dnd` | 🔨 | Channel menu level + rail → profile avatar → Do not disturb… (raw `HH:MM-HH:MM` prompt). **`list_notify_prefs` is not wired** — there is no review screen for the synced prefs (the TUI has one). |
+| Self-service profile | `set_display_name`, `change_password` | ✅ | Rail → profile avatar → Change display name… / Change password… (one-line prompts; no confirm field). |
+| Webhooks | `webhooks`, `create_webhook`, `delete_webhook` | ✅ | Channel menu → Webhooks… / Create webhook…; overlay, click-to-delete. |
+| Storage / audit (admin) | `storage_status`, `audit_query` | ✅ | Rail → workspace menu → Storage usage / Audit log overlays (owner/admin only). |
 | Settings sync | `set_client_type`, `set_setting`, `list_settings` | ✅ | Identifies the `gui` bucket + lists on connect. |
 | Read receipts (seen-by) | model `readers[]` | ✅ | "✓ Seen by …" footer under the transcript. |
-| Logout | `logout` | ✅ | App menu → Log out; window closes on the drop. |
-| Manual reconnect | `reconnect` | ✅ | App menu → Reconnect now. |
-| Multiple workspaces | one `oc_client` per ws + switcher | 🔨 | **Rail switcher UI built** (`open_switcher`/`switch_workspace`, winmain.c) — remembered workspaces + "Add a workspace…". It **stop/reconnects a single `oc_client`**, so the remaining piece is the TUI's **N-concurrent-client** model (background receive + "N elsewhere" unread), not the switcher affordance. |
+| Logout | `logout` | ✅ | Rail → workspace menu → Sign out / Sign out everywhere; window closes on the drop. |
+| Manual reconnect | `reconnect` | ✅ | Rail → workspace menu → Reconnect now (no banner or countdown). |
+| Multiple workspaces | one `oc_client` per ws + switcher | 🔨 | **Rail switcher UI built** — the workspace avatar at the top of the rail (`open_switcher`/`switch_workspace`, winmain.c) — remembered workspaces + "Add a workspace…". It **stop/reconnects a single `oc_client`**, so the remaining piece is the TUI's **N-concurrent-client** model (background receive + "N elsewhere" unread), not the switcher affordance. |
 
 > **Depth caveat:** this table tracks whether each engine feature is *reachable*; it does **not** measure how developed each screen/dialog is. For the full four-way (Slack vs Pumble vs TUI vs Win32) surface-depth gap analysis — including underdeveloped screens and a recommended build order — see [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md).
+
+### The shell (the "nav epic")
+
+The app menu that once hung off the window is gone; the GUI is now organized
+around a **global left-nav rail** (Slack-shaped, Lucide icons stroked as Direct2D
+path geometry — VENDORS.md). Reading top to bottom:
+
+- the **workspace avatar** (its initial) — opens the workspace switcher;
+- six **primary views** — Home, DMs, Activity, Files, Later, and Admin
+  (owner/admin only), overflowing into a "More" flyout when the window is short;
+- a bottom cluster — **New (+)**, **Alerts**, and the **profile avatar**.
+
+Three custom Direct2D dropdowns replace the old native app menu: the **workspace
+menu** (invite, preferences, storage/audit, reconnect, sign out), the **profile
+menu** (presence, DND, display name, password), and the **New menu** (channel,
+DM, upload, search). The channel column gained a header with settings + compose
+buttons and a **"Find a conversation"** filter box (a native `EDIT` that
+substring-filters channel names).
+
+**Only Home and DMs render the chat shell**, and they render it identically —
+`VIEW_DMS` has no DM-specific behaviour yet. **Activity, Files, Later, and
+Notifications are `draw_stub_view` placeholders** ("coming soon"), as is the
+workspace menu's **Preferences** item (a `MessageBox`). They are reachable dead
+ends, and they map onto REQ-139 (activity feed), REQ-143 (files browser),
+REQ-231 (saved items), and REQ-261 (preferences hub) respectively.
 
 **Feature parity is essentially complete** — all 27 features are reachable, 25
 of them fully; two are 🔨:
@@ -332,7 +357,7 @@ CLIENT_GAP_ANALYSIS.md §5 and the CLIENT.md §8 roadmap, not here.
 | 237 all-unreads / unreads-only views | ⛔ | Per-channel unread tracked (REQ-014); no aggregate view. |
 | 238 mark-all-read / catch-up | ⛔ | No bulk cursor-advance. |
 | 254 data import / migration | ⛔ | No importer; distinct from compliance export (REQ-252). |
-| 260 command palette / quick switcher | 🔵 ✅ TUI / ⛔ GUI | TUI has Ctrl+K (ARCH-83); Win32 has app menu only. |
+| 260 command palette / quick switcher | 🔵 ✅ TUI / ⛔ GUI | TUI has Ctrl+K (ARCH-83); Win32 has only mouse-driven rail menus and a channel-name filter — no keyboard-driven action surface. |
 | 261 in-app settings/preferences hub | ⛔ | Config is file-only (TUI) / absent (Win32); no in-app editor. |
 | 262 theme/appearance selection | 🔵 ⛔ | TUI ships a 256-color theme but no in-app toggle; GUIs honor OS dark mode only. |
 | 263 error/toast + connection-status surface | 🔵 ⛔ | TUI partial (status line); Win32 has no error/toast surface (P0). |

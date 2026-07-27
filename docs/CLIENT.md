@@ -260,7 +260,8 @@ model; translate input to intents }, stop.
   ARCH-85), `INVITE_TO_CHANNEL`, `REMOVE_FROM_CHANNEL`, `REDEEM_INVITE` (the
   missing signup/first-owner flow, REQ-268), and `TRANSFER_CANCEL`. None is
   implemented in `client/core`, so this is core work, not frontend work.
-- **Windows (next):** **Win32 in pure C** over the core — **Direct2D/DirectWrite
+- **Windows (`client/gui/win32/`, in progress):** **Win32 in pure C** over the
+  core — **Direct2D/DirectWrite
   (+ WIC)** for the custom surfaces (message transcript, sidebar, rails) and
   **native controls for the hard bits** (RichEdit composer, EDIT search, Win32
   menus, dialogs). No WinUI, no .NET, no C++, no cross-platform toolkit
@@ -271,6 +272,23 @@ model; translate input to intents }, stop.
   self-rendered Clay+raylib GUI (non-native, perpetually lags). **The GUI is
   affordance-driven — buttons/menus/dialogs/drag-drop, never slash commands**
   (those belong to the TUI).
+
+  **Shell layout.** A **global left-nav rail** (Lucide icons stroked as D2D path
+  geometry) holds the workspace avatar → switcher, six primary views (Home, DMs,
+  Activity, Files, Later, Admin — the last owner/admin-gated, with a "More"
+  overflow flyout), and a bottom cluster of New (+) / Alerts / profile avatar.
+  Three custom D2D dropdowns replace the old native app menu — **workspace**
+  (invite, preferences, storage/audit, reconnect, sign out / sign out
+  everywhere), **profile** (presence, DND, display name, password), and **New**
+  (channel, DM, upload, search). Right of the rail sits the channel column
+  (header with settings + compose buttons, a "Find a conversation" filter, then
+  the channel list), the transcript, the RichEdit composer, and an optional
+  members pane. Only **Home** and **DMs** render that chat shell — and today they
+  render it identically. **Activity, Files, Later and Notifications are
+  "coming soon" placeholders**, as is Preferences; they correspond to REQ-139,
+  REQ-143, REQ-231 and REQ-261. Per-feature status is
+  [STATUS.md](./STATUS.md)'s parity table; the depth backlog is
+  [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5.
 - **Linux GUI (later):** **GTK in pure C** — GTK is the native Linux toolkit and
   a C library (ARCH-80). Distributed as an AppImage/Flatpak, not a static binary
   (GTK cannot cleanly static-link).
