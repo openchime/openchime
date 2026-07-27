@@ -24,6 +24,18 @@ typedef enum {
 
 typedef struct { char host[256]; int port; } oc_endpoint;
 
+/* The service's own DNS suffix (ARCH-14). A hosted tenant is reached by bare
+ * name — `acme` -> `acme.openchime.io` — which is what REQ-010 means by "the
+ * client appends the service's known DNS suffix as a pure client-side string
+ * convention". Self-hosted tenants type a full domain instead, which passes
+ * through untouched. */
+#define OC_SERVICE_SUFFIX "openchime.io"
+
+/* The suffix a frontend should hand to oc_resolve(): $OPENCHIME_SUFFIX when set
+ * (the dev/self-host override), else OC_SERVICE_SUFFIX. Exists so every frontend
+ * agrees on the default instead of each calling getenv() and getting NULL. */
+const char *oc_default_suffix(void);
+
 /* Normalize a workspace to a DNS domain: strip a leading scheme (`x://`) and any
  * trailing `:port`/path; a bare name (no dot) gets `.<suffix>` appended when a
  * non-empty suffix is given (`acme` -> `acme.openchime.example`), while a name

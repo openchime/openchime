@@ -61,7 +61,10 @@ static const GUID OC_IID_IDWriteFactory =
  * real today; ACTIVITY/FILES/LATER/NOTIFICATIONS are stubs until their features
  * land. Rail item `act` values <0 are special (switcher / new / profile / more). */
 enum { VIEW_HOME = 0, VIEW_DMS, VIEW_ACTIVITY, VIEW_FILES, VIEW_LATER,
-       VIEW_ADMIN, VIEW_NOTIFICATIONS, VIEW_COUNT };
+       VIEW_ADMIN, VIEW_NOTIFICATIONS, VIEW_COUNT,
+       /* Not a rail destination: the sign-in screen, which owns the whole window
+        * (no rail, no sidebar, no composer) until there is a session. */
+       VIEW_SIGNIN = 100 };
 enum { NAV_SWITCHER = -2, NAV_NEW = -3, NAV_PROFILE = -4, NAV_MORE = -5 };
 #define BODY_DIP    15.0f     /* message + composer text size (shared, so they match) */
 
@@ -194,6 +197,50 @@ static int   g_n_sw;
 static D2D1_RECT_F g_attach_btn;        /* composer attach (+) hit-box */
 static D2D1_RECT_F g_send_btn;          /* composer send-button hit-box */
 static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
+
+/* ---- sign-in view (WIN-2, REQ-263/020) -------------------------------------
+ * Slack signs in in two steps — workspace address first, credentials once the
+ * workspace is known — and does it *in the app window*. We match that shape,
+ * not Slack's credential mechanism: their email/magic-code/SSO path has no
+ * OpenChime equivalent (no mail path; local auth is username+password, ARCH-59;
+ * no SAML by design, REQ-027). The step-1 field is exactly OpenChime's DNS
+ * workspace resolution (REQ-010/011), which is why the split fits so naturally.
+ *
+ * This replaces a pre-window GDI popup that could not show an error, could not
+ * retry, and could not be returned to after sign-out. The behaviour mirrors the
+ * TUI's proven run_login() loop (client/tui/main.c) so the two clients agree on
+ * wording and on what happens after a failure — but the TUI can block in
+ * await_auth() and a Win32 UI thread cannot, so the wait is a state machine
+ * driven from the WM_TIMER tick instead. */
+#define SI_W        380.0f        /* card width */
+#define SI_TIMEOUT  20000         /* ms before we stop waiting for auth */
+static int   g_si_step = 1;       /* 1 = workspace, 2 = credentials */
+static char  g_si_ws[256];        /* the workspace string as typed */
+static char  g_si_host[256];      /* resolved host (step 1 output) */
+static int   g_si_port;
+static char  g_si_err[192];       /* inline error under the active field */
+static int   g_si_remember = 1;   /* gates whether the session token is persisted */
+/* Step 1 has two modes. The default is the hosted case — type just `acme` and
+ * the field shows a fixed `.openchime.io` suffix, exactly as Slack shows
+ * `.slack.com` — because nearly every workspace is a managed one. "Advanced
+ * options" reveals the self-hosted case: a full domain, host:port, or an IP.
+ * Both end up in the same oc_resolve() call; only the chrome differs, since a
+ * dotted name or an explicit :port passes through suffixing untouched. */
+static int   g_si_advanced;
+static D2D1_RECT_F g_si_adv_link;
+static int   g_si_connecting;     /* awaiting auth: fields hidden, spinner text */
+static ULONGLONG g_si_started;    /* GetTickCount64 when the attempt began */
+static HWND  g_si_e_ws, g_si_e_user, g_si_e_pass;   /* native EDIT children */
+static D2D1_RECT_F g_si_btn, g_si_remember_box, g_si_back;   /* hit-boxes */
+/* Defined with the rest of the flow, below the core wiring they depend on. */
+static void signin_submit(HWND hwnd);
+static void signin_back(HWND hwnd);
+static void signin_set_advanced(HWND hwnd, int on);
+static void signin_begin(HWND hwnd, const char *ws, const char *user);
+static void signin_poll(HWND hwnd);
+static void layout_signin(HWND hwnd);
+typedef struct { float x0, y0, w, h, fx, fw, fields_y; } si_geom;
+static si_geom si_layout(float W, float H);
 
 /* ---- failure surface: toasts + connection banner (WIN-1, REQ-263) ----------
  * Until now the only way a failure reached the user was `last_error` drawn into
@@ -1517,6 +1564,147 @@ static void draw_members(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
 
 /* The composer region behind the RichEdit child (which paints its own box),
  * plus an attach (+) button to the left of the input. */
+/* Card geometry, derived once so draw_signin() and layout_signin() cannot drift
+ * (they must agree on the field rects to the pixel — the EDITs sit on top of the
+ * chrome the painter draws). Height grows with the error row and the step, so an
+ * error can never overlap the button below it. */
+static si_geom si_layout(float W, float H) {
+    si_geom g;
+    g.w  = SI_W;
+    g.x0 = W / 2 - SI_W / 2;
+    float pad = 28;
+    g.fx = g.x0 + pad;
+    g.fw = SI_W - 2 * pad;
+
+    float head = 26 + 52 + 30 + 30;              /* mark + heading + subheading */
+    int   nfields = (g_si_step == 1) ? 1 : 2;
+    float body = g_si_connecting ? 76.0f
+               : (float)nfields * 62.0f
+                 + (g_si_err[0] ? 34.0f : 0.0f)
+                 + (g_si_step == 1 ? 26.0f : 0.0f)   /* advanced-options link */
+                 + (g_si_step == 2 ? 30.0f : 0.0f)   /* remember-me row */
+                 + 40.0f + 24.0f                      /* button + bottom pad */
+                 + (g_si_step == 2 ? 26.0f : 0.0f);   /* back link */
+    g.h  = head + body;
+    g.y0 = (H - g.h) / 2; if (g.y0 < 24) g.y0 = 24;
+    g.fields_y = g.y0 + head;
+    return g;
+}
+
+/* One centred sign-in card, both steps. Field *chrome* is drawn here; the text
+ * itself lives in native EDIT children positioned over it by layout_signin(),
+ * so we get IME, selection, clipboard and password masking for free rather than
+ * hand-rolling a text editor (the same trade the composer and find box make). */
+static void draw_signin(ID2D1RenderTarget *rt, float W, float H) {
+    si_geom g = si_layout(W, H);
+    float cx = W / 2, x0 = g.x0, y0 = g.y0;
+
+    D2D1_RECT_F card = rf(x0, y0, x0 + SI_W, y0 + g.h);
+    fill_round(rt, rf(card.left + 2, card.top + 4, card.right + 2, card.bottom + 4), 14.0f, OC_COL_RAIL);
+    fill_round(rt, card, 14.0f, OC_COL_SIDEBAR);
+    stroke_round(rt, card, 14.0f, OC_COL_BORDER, 1.0f);
+
+    float fx = g.fx, fw = g.fw, y = y0 + 26;
+
+    /* Mark: the accent rounded square the rail uses for the workspace avatar. */
+    D2D1_RECT_F mark = rf(cx - 18, y, cx + 18, y + 36);
+    fill_round(rt, mark, 11.0f, OC_COL_ACCENT);
+    draw_text(rt, "O", g_ava, mark, 0xFFFFFF);
+    y += 52;
+
+    IDWriteTextFormat_SetTextAlignment(g_hdr,   DWRITE_TEXT_ALIGNMENT_CENTER);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+    char head[288];
+    if (g_si_step == 1) snprintf(head, sizeof head, "Sign in to OpenChime");
+    else                snprintf(head, sizeof head, "Sign in to %s", g_si_ws);
+    draw_text(rt, head, g_hdr, rf(x0 + 12, y, x0 + SI_W - 12, y + 30), OC_COL_TEXT);
+    y += 30;
+    if (g_si_step == 2) {
+        char sub[300]; snprintf(sub, sizeof sub, "%s:%d", g_si_host, g_si_port);
+        draw_text(rt, sub, g_small, rf(x0 + 12, y, x0 + SI_W - 12, y + 20), OC_COL_MUTED);
+    } else {
+        draw_text(rt, "Enter your workspace address", g_small,
+                  rf(x0 + 12, y, x0 + SI_W - 12, y + 20), OC_COL_MUTED);
+    }
+    IDWriteTextFormat_SetTextAlignment(g_hdr,   DWRITE_TEXT_ALIGNMENT_LEADING);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    y += 30;
+
+    /* While connecting the fields are hidden and the card says so — the wait is
+     * the whole content, so there is nothing to mis-click. */
+    if (g_si_connecting) {
+        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Signing in\xE2\x80\xA6", g_ui, rf(x0, y + 24, x0 + SI_W, y + 52), OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_si_btn = g_si_remember_box = g_si_back = g_si_adv_link = rf(0, 0, 0, 0);
+        return;
+    }
+
+    /* Field chrome. The EDITs are placed on these same rects by layout_signin. */
+    const char *labels[2]; int nfields;
+    if (g_si_step == 1) { labels[0] = "Workspace"; nfields = 1; }
+    else                { labels[0] = "Username"; labels[1] = "Password"; nfields = 2; }
+    for (int i = 0; i < nfields; i++) {
+        draw_text(rt, labels[i], g_small, rf(fx, y, fx + fw, y + 18), OC_COL_MUTED);
+        D2D1_RECT_F box = rf(fx, y + 20, fx + fw, y + 52);
+        fill_round(rt, box, 8.0f, OC_COL_INPUT);
+        stroke_round(rt, box, 8.0f, g_si_err[0] ? OC_COL_DANGER : OC_COL_BORDER, 1.0f);
+        /* Hosted mode: the service suffix is chrome, not something to type. */
+        if (g_si_step == 1 && !g_si_advanced) {
+            char suf[80]; snprintf(suf, sizeof suf, ".%s", oc_default_suffix());
+            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
+            draw_text(rt, suf, g_small, rf(fx, y + 20, fx + fw - 12, y + 52), OC_COL_MUTED);
+            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
+        y += 62;
+    }
+
+    if (g_si_err[0]) {
+        char line[208]; snprintf(line, sizeof line, "\xE2\x9A\xA0 %s", g_si_err);
+        draw_text(rt, line, g_small, rf(fx, y, fx + fw, y + 34), OC_COL_DANGER);
+        y += 34;
+    }
+
+    if (g_si_step == 1) {
+        g_si_adv_link = rf(fx, y, fx + fw, y + 20);
+        draw_text(rt, g_si_advanced ? "\xE2\x86\x90 Use a workspace name"
+                                    : "Advanced options\xE2\x80\xA6",
+                  g_small, g_si_adv_link, OC_COL_ACCENT);
+        y += 26;
+    } else {
+        g_si_adv_link = rf(0, 0, 0, 0);
+    }
+
+    if (g_si_step == 2) {
+        /* Remember me — a drawn checkbox, matching the rest of the shell rather
+         * than dropping a native BUTTON into an otherwise D2D card. */
+        g_si_remember_box = rf(fx, y + 2, fx + 16, y + 18);
+        fill_round(rt, g_si_remember_box, 4.0f, g_si_remember ? OC_COL_ACCENT : OC_COL_INPUT);
+        stroke_round(rt, g_si_remember_box, 4.0f,
+                     g_si_remember ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
+        if (g_si_remember)
+            draw_text(rt, "\xE2\x9C\x93", g_small, rf(fx + 2, y, fx + 18, y + 20), 0xFFFFFF);
+        draw_text(rt, "Remember me", g_small, rf(fx + 24, y, fx + fw, y + 20), OC_COL_MUTED);
+        y += 30;
+    }
+
+    g_si_btn = rf(fx, y, fx + fw, y + 40);
+    fill_round(rt, g_si_btn, 8.0f, OC_COL_ACCENT);
+    IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, g_si_step == 1 ? "Continue" : "Sign in", g_ui, g_si_btn, 0xFFFFFF);
+    IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+    y += 50;
+
+    if (g_si_step == 2) {
+        g_si_back = rf(fx, y, fx + fw, y + 20);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "\xE2\x86\x90 Use a different workspace", g_small, g_si_back, OC_COL_ACCENT);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    } else {
+        g_si_back = rf(0, 0, 0, 0);
+    }
+}
+
 static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     float top = h - COMPOSER_H;
     fill(rt, rf(x0, top, x0 + w, h), OC_COL_BASE);
@@ -1577,6 +1765,9 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
     ID2D1RenderTarget_SetTextAntialiasMode(rt, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     D2D1_COLOR_F base = col(OC_COL_BASE);
     ID2D1RenderTarget_Clear(rt, &base);
+    /* Sign-in owns the whole window: no rail, no sidebar, no composer, and it
+     * runs with no client at all (m == NULL) until an attempt is in flight. */
+    if (g_view == VIEW_SIGNIN) { draw_signin(rt, W, H); return; }
     if (!m) return;
     ensure_selection(m);
     draw_rail(rt, m, H);
@@ -1737,6 +1928,68 @@ static void find_create(HWND parent) {
     SendMessageW(g_find, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
     SendMessageW(g_find, EM_SETCUEBANNER, TRUE, (LPARAM)L"Find a conversation…");
     layout_find(parent);
+}
+
+/* Place the sign-in EDITs over the field chrome draw_signin() paints. The two
+ * must agree on geometry, so both derive it from the same card maths — keep the
+ * pad/step offsets here in step with that function. */
+static void layout_signin(HWND hwnd) {
+    if (!g_si_e_ws) return;
+    int on = (g_view == VIEW_SIGNIN && !g_si_connecting);
+    ShowWindow(g_si_e_ws,   (on && g_si_step == 1) ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_si_e_user, (on && g_si_step == 2) ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_si_e_pass, (on && g_si_step == 2) ? SW_SHOW : SW_HIDE);
+    if (!on) return;
+
+    RECT rc; GetClientRect(hwnd, &rc);
+    si_geom g = si_layout((float)rc.right, (float)rc.bottom);
+    float y = g.fields_y;
+
+    /* Inset inside the drawn 32px-tall rounded box. */
+    int ex = (int)(g.fx + 12), ew = (int)(g.fw - 24), eh = 20;
+    if (g_si_step == 1) {
+        /* Leave room for the ".openchime.io" chip the painter draws at the right
+         * edge of the box, so typed text can never run under it. */
+        int sw = g_si_advanced ? 0 : (int)(8 + 7.0 * (double)(strlen(oc_default_suffix()) + 1));
+        MoveWindow(g_si_e_ws, ex, (int)(y + 20 + 6), ew - sw, eh, TRUE);
+    } else {
+        MoveWindow(g_si_e_user, ex, (int)(y + 20 + 6), ew, eh, TRUE);
+        MoveWindow(g_si_e_pass, ex, (int)(y + 62 + 20 + 6), ew, eh, TRUE);
+    }
+}
+
+/* Enter submits from any sign-in field. Subclassed rather than left to
+ * IsDialogMessage's default-button handling, which we have no default button
+ * for (the buttons are D2D-drawn) — and eating WM_CHAR too silences the EDIT's
+ * beep on Enter, exactly as re_proc does for the composer. */
+static WNDPROC g_si_oldproc;
+static LRESULT CALLBACK si_edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if ((msg == WM_KEYDOWN || msg == WM_CHAR) && wp == VK_RETURN) {
+        if (msg == WM_KEYDOWN) signin_submit(GetParent(hwnd));
+        return 0;
+    }
+    return CallWindowProcW(g_si_oldproc, hwnd, msg, wp, lp);
+}
+
+static void signin_create(HWND parent) {
+    HINSTANCE inst = GetModuleHandleW(NULL);
+    DWORD base = WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL;
+    g_si_e_ws   = CreateWindowExW(0, L"EDIT", L"", base, 0, 0, 10, 10, parent,
+                                  (HMENU)(INT_PTR)0xF2, inst, NULL);
+    g_si_e_user = CreateWindowExW(0, L"EDIT", L"", base, 0, 0, 10, 10, parent,
+                                  (HMENU)(INT_PTR)0xF3, inst, NULL);
+    g_si_e_pass = CreateWindowExW(0, L"EDIT", L"", base | ES_PASSWORD, 0, 0, 10, 10, parent,
+                                  (HMENU)(INT_PTR)0xF4, inst, NULL);
+    HWND all[3] = { g_si_e_ws, g_si_e_user, g_si_e_pass };
+    for (int i = 0; i < 3; i++)
+        if (all[i]) SendMessageW(all[i], WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    if (g_si_e_ws)
+        SendMessageW(g_si_e_ws, EM_SETCUEBANNER, TRUE, (LPARAM)L"your-workspace");
+    for (int i = 0; i < 3; i++) {
+        if (!all[i]) continue;
+        g_si_oldproc = (WNDPROC)SetWindowLongPtrW(all[i], GWLP_WNDPROC, (LONG_PTR)si_edit_proc);
+    }
+    layout_signin(parent);
 }
 
 static void composer_create(HWND parent) {
@@ -1914,6 +2167,20 @@ static int in_rect(D2D1_RECT_F r, int x, int y) {
 /* Returns 1 if the click hit a control/row (so the caller won't start a text
  * selection), 0 if it fell through to the transcript. */
 static int on_click(HWND hwnd, int x, int y) {
+    /* The sign-in view owns the window; nothing else is on screen. */
+    if (g_view == VIEW_SIGNIN) {
+        if (g_si_connecting) return 1;
+        if (pt_in(g_si_btn, x, y))           { signin_submit(hwnd); return 1; }
+        if (pt_in(g_si_back, x, y))          { signin_back(hwnd);   return 1; }
+        if (pt_in(g_si_adv_link, x, y))      { signin_set_advanced(hwnd, !g_si_advanced); return 1; }
+        if (pt_in(g_si_remember_box, x, y) ||
+            (g_si_step == 2 && y >= (int)g_si_remember_box.top &&
+             y <= (int)g_si_remember_box.bottom &&
+             x >= (int)g_si_remember_box.left && x < (int)g_si_remember_box.left + 140)) {
+            g_si_remember = !g_si_remember; InvalidateRect(hwnd, NULL, FALSE); return 1;
+        }
+        return 1;
+    }
     /* Toasts are painted above everything, so they must be hit-tested above
      * everything too — otherwise a toast over the composer eats a click it
      * appears to own. Clicking one dismisses it. */
@@ -2185,7 +2452,7 @@ static int pick_last_workspace(char *ws, size_t wscap, char *user, size_t ucap) 
  * silently and we skip the login dialog entirely (uniform with the TUI). */
 static int have_stored_token(const char *ws) {
     oc_endpoint ep;
-    if (oc_resolve(ws, getenv("OPENCHIME_SUFFIX"), &ep) != OC_RESOLVE_OK) return 0;
+    if (oc_resolve(ws, oc_default_suffix(), &ep) != OC_RESOLVE_OK) return 0;
     const char *sp = store_path();
     oc_store *s = sp ? oc_store_open(sp) : NULL;
     if (!s) return 0;
@@ -2208,7 +2475,7 @@ static void remember_workspace(const char *ws, const char *user) {
 
 static void connect_start(const char *ws, const char *cred) {
     oc_endpoint ep;
-    if (oc_resolve(ws, getenv("OPENCHIME_SUFFIX"), &ep) != OC_RESOLVE_OK) {
+    if (oc_resolve(ws, oc_default_suffix(), &ep) != OC_RESOLVE_OK) {
         snprintf(g_host, sizeof g_host, "%s", "?");
         return;
     }
@@ -2228,151 +2495,176 @@ static void connect_start(const char *ws, const char *cred) {
     remember_workspace(ws, user[0] ? user : NULL);
 }
 
-/* ---- login dialog -------------------------------------------------------- */
+/* ---- sign-in flow (WIN-2) -------------------------------------------------- */
 
-static HWND g_lg_ws, g_lg_user, g_lg_pass;
-static int  g_lg_result;                 /* -1 pending, 0 cancel, 1 connect */
-static int  g_lg_done;                    /* ends the modal pump (no WM_QUIT) */
-static HBRUSH g_lg_bg, g_lg_input;        /* dark-theme brushes (freed after pump) */
+/* Read a native EDIT's text as UTF-8. */
+static void si_get(HWND e, char *out, size_t cap) {
+    WCHAR w[320]; out[0] = '\0';
+    if (!e) return;
+    GetWindowTextW(e, w, (int)(sizeof w / sizeof w[0]));
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL);
+}
+
+/* Tear a session down to the state a fresh sign-in expects. Shared by the
+ * workspace switcher and sign-out so the two can never drift. */
+static void reset_session(void) {
+    if (g_client) { oc_client_stop(g_client); g_client = NULL; }
+    g_sel = 0; g_scroll = 0; g_post_auth = 0; g_has_sel = 0;
+    g_n_backfilled = 0; g_more_open = 0; g_menu = MENU_NONE;
+    g_edit_msg = 0; g_n_toast = 0; g_err_seen[0] = '\0';
+}
+
+/* Enter the sign-in view at step 1, pre-filled with `ws`/`user` when known. */
+static void signin_begin(HWND hwnd, const char *ws, const char *user) {
+    g_view = VIEW_SIGNIN;
+    g_si_step = 1; g_si_connecting = 0; g_si_err[0] = '\0';
+    snprintf(g_si_ws, sizeof g_si_ws, "%s", ws ? ws : "");
+    /* A remembered "chat.acme.com" or "127.0.0.1:8443" is a self-hosted address,
+     * so open on the field that can actually hold it. */
+    g_si_advanced = (g_si_ws[0] && (strchr(g_si_ws, '.') || strchr(g_si_ws, ':'))) ? 1 : 0;
+    if (g_si_e_ws)
+        SendMessageW(g_si_e_ws, EM_SETCUEBANNER, TRUE,
+                     (LPARAM)(g_si_advanced ? L"chat.example.com or host:port" : L"your-workspace"));
+    WCHAR w[320];
+    if (g_si_e_ws)   { to_w(g_si_ws, w, 320);              SetWindowTextW(g_si_e_ws, w); }
+    if (g_si_e_user) { to_w(user ? user : "", w, 320);     SetWindowTextW(g_si_e_user, w); }
+    if (g_si_e_pass) SetWindowTextW(g_si_e_pass, L"");
+    layout_signin(hwnd);
+    layout_composer(hwnd);        /* hides the composer + find box for this view */
+    if (g_si_e_ws) SetFocus(g_si_e_ws);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* Back to step 1 from step 2 (or from a failure), keeping what was typed. */
+static void signin_back(HWND hwnd) {
+    g_si_step = 1; g_si_connecting = 0; g_si_err[0] = '\0';
+    layout_signin(hwnd);
+    if (g_si_e_ws) SetFocus(g_si_e_ws);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* Switch step 1 between the hosted short-name field and the full-address field.
+ * The cue banner and the field width change with it; what was typed is kept, so
+ * flipping modes to correct a mistake never costs the user their input. */
+static void signin_set_advanced(HWND hwnd, int on) {
+    g_si_advanced = on;
+    g_si_err[0] = '\0';
+    if (g_si_e_ws)
+        SendMessageW(g_si_e_ws, EM_SETCUEBANNER, TRUE,
+                     (LPARAM)(on ? L"chat.example.com or host:port" : L"your-workspace"));
+    layout_signin(hwnd);
+    if (g_si_e_ws) SetFocus(g_si_e_ws);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* Fail the in-flight attempt: drop the client, return to the credential step
+ * with `why`, and clear the password — the field that needs re-entering. */
+static void signin_fail(HWND hwnd, const char *why) {
+    /* Copy the reason BEFORE stopping the client: callers pass m->last_error,
+     * which lives in the model that oc_client_stop() frees (oc_model_free +
+     * free(c)). Reading it afterwards is a use-after-free — it silently produced
+     * an empty error, which is exactly the silence this item exists to remove. */
+    char tmp[192];
+    snprintf(tmp, sizeof tmp, "%s", (why && why[0]) ? why : "sign-in failed");
+    /* The core reports a rejected credential as the terse "auth failed"; say what
+     * the TUI says, since that is the wording a user can act on. */
+    if (strstr(tmp, "auth failed"))
+        snprintf(tmp, sizeof tmp, "sign-in failed — check your username and password");
+
+    if (g_client) { oc_client_stop(g_client); g_client = NULL; }
+    g_si_connecting = 0; g_si_step = 2;
+    snprintf(g_si_err, sizeof g_si_err, "%s", tmp);
+    if (g_si_e_pass) SetWindowTextW(g_si_e_pass, L"");
+    layout_signin(hwnd);
+    if (g_si_e_pass) SetFocus(g_si_e_pass);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* The primary button / Enter. Step 1 resolves the workspace (REQ-010/011) and
+ * advances; step 2 starts the client and hands off to the tick, which watches
+ * the model for the outcome (signin_poll). */
+static void signin_submit(HWND hwnd) {
+    g_si_err[0] = '\0';
+    if (g_si_step == 1) {
+        si_get(g_si_e_ws, g_si_ws, sizeof g_si_ws);
+        if (!g_si_ws[0]) { snprintf(g_si_err, sizeof g_si_err,
+                                    "enter a workspace (domain or name)"); goto redraw; }
+        oc_endpoint ep;
+        /* Same statuses and wording as the TUI's login box, so the two clients
+         * describe an unresolvable workspace identically. */
+        oc_resolve_status st = oc_resolve(g_si_ws, oc_default_suffix(), &ep);
+        if (st == OC_RESOLVE_BAD_WORKSPACE) {
+            snprintf(g_si_err, sizeof g_si_err, "invalid workspace '%s'", g_si_ws); goto redraw;
+        }
+        if (st != OC_RESOLVE_OK) {
+            snprintf(g_si_err, sizeof g_si_err,
+                     "'%s' not found — does not resolve in DNS", g_si_ws); goto redraw;
+        }
+        snprintf(g_si_host, sizeof g_si_host, "%s", ep.host);
+        g_si_port = ep.port;
+        g_si_step = 2;
+        layout_signin(hwnd);
+        if (g_si_e_user) SetFocus(g_si_e_user);
+        goto redraw;
+    }
+
+    char user[128], pass[192];
+    si_get(g_si_e_user, user, sizeof user);
+    si_get(g_si_e_pass, pass, sizeof pass);
+    if (!user[0]) {
+        snprintf(g_si_err, sizeof g_si_err, "enter a username");
+        if (g_si_e_user) SetFocus(g_si_e_user);
+        goto redraw;
+    }
+
+    snprintf(g_host, sizeof g_host, "%s", g_si_host);
+    g_port = g_si_port;
+    snprintf(g_cur_ws, sizeof g_cur_ws, "%s", g_si_ws);
+    snprintf(g_cred, sizeof g_cred, "%s:%s", user, pass);
+    /* "Remember me" off means leave no trace: passing a NULL store path keeps
+     * the session token out of the store entirely (the TUI's mechanism). */
+    g_client = oc_client_start_secure(g_host, g_port, g_cred,
+                                      g_si_remember ? store_path() : NULL, NULL);
+    if (!g_client) { snprintf(g_si_err, sizeof g_si_err, "could not start the client"); goto redraw; }
+    g_si_connecting = 1;
+    g_si_started = GetTickCount64();
+    layout_signin(hwnd);
+redraw:
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* Called each tick while an attempt is in flight. Mirrors the TUI's await_auth:
+ * authed wins; a sticky last_error with no connection is the failure; and a
+ * deadline stops us waiting forever on a black-hole endpoint. */
+static void signin_poll(HWND hwnd) {
+    const oc_model *m = model();
+    if (!m) return;
+    if (m->authed) {
+        g_si_connecting = 0;
+        g_si_err[0] = '\0';
+        g_view = VIEW_HOME;
+        if (g_si_remember) {
+            char user[128]; si_get(g_si_e_user, user, sizeof user);
+            remember_workspace(g_si_ws, user[0] ? user : NULL);
+        }
+        if (g_si_e_pass) SetWindowTextW(g_si_e_pass, L"");   /* don't keep it in a control */
+        layout_signin(hwnd);
+        layout_composer(hwnd);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return;
+    }
+    if (m->last_error[0] && !m->connected) { signin_fail(hwnd, m->last_error); return; }
+    if (GetTickCount64() - g_si_started > SI_TIMEOUT) {
+        char why[224]; snprintf(why, sizeof why, "timed out reaching %s", g_si_host);
+        signin_fail(hwnd, why);
+    }
+}
+
+/* ---- generic single-field modal prompt ----------------------------------- */
 
 static void lg_set_font(HWND w) {
     SendMessageW(w, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
 }
-
-static HWND lg_edit(HWND parent, HINSTANCE inst, int x, int y, int w, const WCHAR *init, DWORD extra) {
-    /* Borderless flat field — the lighter input brush delineates it on the
-     * dark backdrop (WS_EX_CLIENTEDGE draws a white sunken border, which jars). */
-    HWND e = CreateWindowExW(0, L"EDIT", init,
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | extra,
-        x, y, w, 26, parent, NULL, inst, NULL);
-    lg_set_font(e);
-    return e;
-}
-
-/* Owner-draw a rounded, themed push button (accent for the default action). */
-static void lg_draw_button(LPDRAWITEMSTRUCT d) {
-    int pressed = (d->itemState & ODS_SELECTED) != 0;
-    int accent  = (d->CtlID == IDOK);
-    COLORREF bg = accent ? OCRGB(pressed ? OC_COL_ACCENT_DIM : OC_COL_ACCENT)
-                         : OCRGB(pressed ? OC_COL_BORDER     : OC_COL_HOVER);
-    COLORREF edge = accent ? bg : OCRGB(OC_COL_BORDER);
-    HBRUSH b = CreateSolidBrush(bg);
-    HPEN  pen = CreatePen(PS_SOLID, 1, edge);
-    HGDIOBJ ob = SelectObject(d->hDC, b), op = SelectObject(d->hDC, pen);
-    RoundRect(d->hDC, d->rcItem.left, d->rcItem.top, d->rcItem.right, d->rcItem.bottom, 8, 8);
-    SelectObject(d->hDC, GetStockObject(DEFAULT_GUI_FONT));
-    SetBkMode(d->hDC, TRANSPARENT);
-    SetTextColor(d->hDC, accent ? RGB(255, 255, 255) : OCRGB(OC_COL_TEXT));
-    WCHAR t[32]; GetWindowTextW(d->hwndItem, t, 32);
-    DrawTextW(d->hDC, t, -1, &d->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(d->hDC, ob); SelectObject(d->hDC, op);
-    DeleteObject(b); DeleteObject(pen);
-}
-
-static LRESULT CALLBACK login_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-    case WM_COMMAND:
-        /* Ends the pump via g_lg_done — never PostQuitMessage here, or the
-         * WM_QUIT would also kill the main window loop that runs next. */
-        if (LOWORD(wp) == IDOK)     { g_lg_result = 1; g_lg_done = 1; return 0; }
-        if (LOWORD(wp) == IDCANCEL) { g_lg_result = 0; g_lg_done = 1; return 0; }
-        return 0;
-    case WM_DRAWITEM:
-        lg_draw_button((LPDRAWITEMSTRUCT)lp);
-        return TRUE;
-    case WM_CTLCOLORSTATIC:
-        SetBkColor((HDC)wp, OCRGB(OC_COL_BASE));
-        SetTextColor((HDC)wp, OCRGB(OC_COL_MUTED));
-        return (LRESULT)g_lg_bg;
-    case WM_CTLCOLOREDIT:
-        SetBkColor((HDC)wp, OCRGB(OC_COL_HOVER));
-        SetTextColor((HDC)wp, OCRGB(OC_COL_TEXT));
-        return (LRESULT)g_lg_input;
-    case WM_CLOSE:   g_lg_result = 0; g_lg_done = 1; return 0;
-    default: return DefWindowProcW(hwnd, msg, wp, lp);
-    }
-}
-
-/* Modal-ish login window (runs its own pump). Returns 1 with ws/cred filled on
- * Connect, 0 on Cancel. */
-static int login_dialog(HINSTANCE inst, char *ws, size_t wscap, char *cred, size_t credcap,
-                        const char *pre_ws, const char *pre_user) {
-    g_lg_bg    = CreateSolidBrush(OCRGB(OC_COL_BASE));
-    g_lg_input = CreateSolidBrush(OCRGB(OC_COL_HOVER));
-    WCHAR w_ws[256], w_user[128];
-    to_w((pre_ws && pre_ws[0]) ? pre_ws : "127.0.0.1:8443", w_ws, 256);
-    to_w((pre_user && pre_user[0]) ? pre_user : "alice", w_user, 128);
-
-    WNDCLASSW wc; memset(&wc, 0, sizeof wc);
-    wc.lpfnWndProc   = login_proc;
-    wc.hInstance     = inst;
-    wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
-    wc.hbrBackground = g_lg_bg;
-    wc.lpszClassName = L"OpenChimeLogin";
-    RegisterClassW(&wc);
-
-    int W = 380, H = 268;
-    int sx = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
-    int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 2;
-    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"OpenChimeLogin", L"Sign in to OpenChime",
-        WS_POPUP | WS_CAPTION | WS_SYSMENU, sx, sy, W, H, NULL, NULL, inst, NULL);
-    if (!dlg) return 0;
-    apply_dark_titlebar(dlg);
-
-    HWND title = CreateWindowExW(0, L"STATIC", L"OpenChime", WS_CHILD | WS_VISIBLE,
-        26, 20, 300, 26, dlg, NULL, inst, NULL);
-    SendMessageW(title, WM_SETFONT, (WPARAM)CreateFontW(
-        22, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
-        CLEARTYPE_QUALITY, 0, L"Segoe UI"), TRUE);
-
-    struct { const WCHAR *label; int y; } rows[3] = {
-        { L"Workspace", 62 }, { L"Username", 104 }, { L"Password", 146 } };
-    for (int i = 0; i < 3; i++) {
-        HWND s = CreateWindowExW(0, L"STATIC", rows[i].label, WS_CHILD | WS_VISIBLE,
-            26, rows[i].y + 5, 96, 20, dlg, NULL, inst, NULL);
-        lg_set_font(s);
-    }
-    g_lg_ws   = lg_edit(dlg, inst, 128, 62,  226, w_ws, 0);
-    g_lg_user = lg_edit(dlg, inst, 128, 104, 226, w_user, 0);
-    g_lg_pass = lg_edit(dlg, inst, 128, 146, 226, L"", ES_PASSWORD);
-
-    HWND ok = CreateWindowExW(0, L"BUTTON", L"Connect",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON | BS_OWNERDRAW, 176, 196, 84, 32,
-        dlg, (HMENU)IDOK, inst, NULL);
-    HWND cancel = CreateWindowExW(0, L"BUTTON", L"Cancel",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 270, 196, 84, 32,
-        dlg, (HMENU)IDCANCEL, inst, NULL);
-    lg_set_font(ok); lg_set_font(cancel);
-
-    ShowWindow(dlg, SW_SHOW);
-    SetFocus(g_lg_pass);
-    g_lg_result = -1;
-    g_lg_done = 0;
-
-    /* Flag-terminated modal pump — no WM_QUIT, so the main loop survives. */
-    MSG m;
-    while (!g_lg_done && GetMessageW(&m, NULL, 0, 0) > 0) {
-        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
-    }
-    int ok_pressed = (g_lg_result == 1);
-    if (ok_pressed) {
-        WCHAR wws[256], wu[128], wp[128];
-        GetWindowTextW(g_lg_ws, wws, 256);
-        GetWindowTextW(g_lg_user, wu, 128);
-        GetWindowTextW(g_lg_pass, wp, 128);
-        char u[192], p[192];
-        WideCharToMultiByte(CP_UTF8, 0, wws, -1, ws, (int)wscap, NULL, NULL);
-        WideCharToMultiByte(CP_UTF8, 0, wu, -1, u, sizeof u, NULL, NULL);
-        WideCharToMultiByte(CP_UTF8, 0, wp, -1, p, sizeof p, NULL, NULL);
-        snprintf(cred, credcap, "%s:%s", u, p);
-    }
-    if (IsWindow(dlg)) DestroyWindow(dlg);
-    DeleteObject(g_lg_bg);    g_lg_bg = NULL;
-    DeleteObject(g_lg_input); g_lg_input = NULL;
-    return ok_pressed && ws[0] != 0;
-}
-
-/* ---- generic single-field modal prompt ----------------------------------- */
 
 static HWND g_pr_edit;
 static int  g_pr_result, g_pr_done;
@@ -2461,10 +2753,10 @@ static float menu_total_height(void) {
 /* Re-point the single client at another workspace (true N-hosting is a later
  * phase). Empty cred = silent reconnect via the stored session token. */
 static void switch_workspace(HWND hwnd, const char *ws, const char *cred) {
-    if (g_client) { oc_client_stop(g_client); g_client = NULL; }
-    g_sel = 0; g_view = VIEW_HOME; g_scroll = 0; g_post_auth = 0;
-    g_n_backfilled = 0; g_has_sel = 0; g_more_open = 0; g_menu = MENU_NONE;
+    reset_session();
+    g_view = VIEW_HOME;
     connect_start(ws, cred ? cred : "");
+    layout_signin(hwnd);
     layout_composer(hwnd);
 }
 
@@ -2586,10 +2878,9 @@ static void menu_dispatch(HWND hwnd, int cmd) {
                 oc_client_set_dnd(g_client, 1, (uint16_t)(sh * 60 + sm), (uint16_t)(eh * 60 + em));
             else oc_client_set_dnd(g_client, 0, 0, 0); } break; }
     case 70: MessageBoxW(hwnd, L"Preferences \xE2\x80\x94 coming soon.", L"Preferences", MB_OK | MB_ICONINFORMATION); break;
-    case 80: { HINSTANCE inst = GetModuleHandleW(NULL); char aws[256], acred[264];
-        if (login_dialog(inst, aws, sizeof aws, acred, sizeof acred, NULL, NULL))
-            switch_workspace(hwnd, aws, acred);
-        break; }
+    /* "Add a workspace…" drops the current session and goes to the same sign-in
+     * view the app starts on — one sign-in implementation, not two. */
+    case 80: reset_session(); signin_begin(hwnd, NULL, NULL); break;
     default:
         if (cmd >= 100 && cmd - 100 < g_n_sw && !g_sw[cmd - 100].current)
             switch_workspace(hwnd, g_sw[cmd - 100].ws, "");
@@ -2780,6 +3071,20 @@ static void test_poll(HWND hwnd) {
         test_ack("ok");
     } else if (!strcmp(verb, "dump")) {
         test_dump(arg); test_ack("ok");
+    /* Sign-in drivers. Setting the EDIT text directly is deterministic, where
+     * synthesised keystrokes depend on the window being foreground — which it
+     * is not when the harness drives it from WSL. */
+    } else if (!strcmp(verb, "siws") || !strcmp(verb, "siuser") || !strcmp(verb, "sipass")) {
+        HWND e = !strcmp(verb, "siws")  ? g_si_e_ws
+               : !strcmp(verb, "siuser") ? g_si_e_user : g_si_e_pass;
+        if (e) { WCHAR w[320]; to_w(arg, w, 320); SetWindowTextW(e, w); test_ack("ok"); }
+        else test_ack("err");
+    } else if (!strcmp(verb, "siadv")) {
+        signin_set_advanced(hwnd, !g_si_advanced); test_ack("ok");
+    } else if (!strcmp(verb, "sisubmit")) {
+        signin_submit(hwnd); test_ack("ok");
+    } else if (!strcmp(verb, "siremember")) {
+        g_si_remember = atoi(arg); test_ack("ok");
     } else {
         test_ack("unknown");
     }
@@ -2791,6 +3096,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE:
         composer_create(hwnd);
         find_create(hwnd);
+        signin_create(hwnd);
         DragAcceptFiles(hwnd, TRUE);              /* drop files anywhere to upload */
         SetTimer(hwnd, TIMER_TICK, 30, NULL);
         return 0;
@@ -2812,7 +3118,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == TIMER_TICK && g_client) {
             oc_client_tick(g_client);
             const oc_model *m = oc_client_model(g_client);
-            toast_tick(m);   /* expire old notices; raise one for a new model error */
+            /* A sign-in failure belongs in the card, not a toast — suppress the
+             * toast channel while the sign-in view owns the window. */
+            if (g_view == VIEW_SIGNIN) { if (g_si_connecting) signin_poll(hwnd); }
+            else toast_tick(m);
             if (m->authed && !g_post_auth) {          /* one-shot: identify the bucket + pull state */
                 oc_client_set_client_type(g_client, "gui");   /* our own settings bucket, not tui's */
                 oc_client_list_settings(g_client);
@@ -2821,9 +3130,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_post_auth = 1;
                 layout_composer(hwnd);   /* members pane now shows — re-fit the composer */
             }
+            /* Sign-out returns to the sign-in view rather than quitting the
+             * app (Slack's behaviour), so signing back in — as the same user or
+             * a different one — needs no restart. */
             if (g_logging_out && !m->connected) {     /* logout frame sent + server dropped us */
-                PostMessageW(hwnd, WM_CLOSE, 0, 0);
                 g_logging_out = 0;
+                char ws[256]; snprintf(ws, sizeof ws, "%s", g_cur_ws);
+                reset_session();
+                signin_begin(hwnd, ws, NULL);
+                return 0;
             }
             if (g_await_invite && m->invite_token[0]) {   /* show the minted token once */
                 WCHAR msgw[256]; char line[256];
@@ -2854,6 +3169,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE:
         d2d_resize(hwnd);
         layout_composer(hwnd);
+        layout_signin(hwnd);      /* the card is centred, so it moves with the window */
         return 0;
     case WM_COMMAND:
         if (g_re && (HWND)lp == g_re && HIWORD(wp) == EN_CHANGE) {
@@ -2872,7 +3188,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_CTLCOLOREDIT:
-        if ((HWND)lp == g_find) {
+        /* The find box and the sign-in fields both sit on the OC_COL_INPUT
+         * surface the D2D chrome paints under them, so they share a brush. */
+        if ((HWND)lp == g_find || (HWND)lp == g_si_e_ws ||
+            (HWND)lp == g_si_e_user || (HWND)lp == g_si_e_pass) {
             SetBkColor((HDC)wp, OCRGB(OC_COL_INPUT));
             SetTextColor((HDC)wp, OCRGB(OC_COL_TEXT));
             if (!g_find_brush) g_find_brush = CreateSolidBrush(OCRGB(OC_COL_INPUT));
@@ -2987,30 +3306,31 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     /* Credential resolution, uniform with the TUI:
      *   1. Dev quick-launch `openchime.exe <workspace> <user:pass>` — connect directly.
      *   2. A remembered workspace with a still-valid session token — reconnect
-     *      silently (no dialog); the net thread reuses the stored token.
-     *   3. Otherwise the login dialog, pre-filled with the last workspace + user. */
+     *      silently; the net thread reuses the stored token.
+     *   3. Otherwise the in-window sign-in view, pre-filled from the book.
+     * Only case 3 needs the window up first, but the window is now created
+     * before any of them so the sign-in view has somewhere to live (WIN-2). */
     static char aws[256], acred[264];
-    const char *ws = aws, *cred = acred;
+    static char pre_ws[256], pre_user[128];
+    int direct = 0;
     int argc = 0; LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv && argc >= 3) {
         WideCharToMultiByte(CP_UTF8, 0, argv[1], -1, aws, sizeof aws, NULL, NULL);
         WideCharToMultiByte(CP_UTF8, 0, argv[2], -1, acred, sizeof acred, NULL, NULL);
+        direct = 1;
     } else {
-        char last_ws[256] = "", last_user[128] = "";
-        int have_last = pick_last_workspace(last_ws, sizeof last_ws, last_user, sizeof last_user);
-        if (have_last && have_stored_token(last_ws)) {
-            snprintf(aws, sizeof aws, "%s", last_ws);   /* silent reconnect: cred stays "" */
-        } else if (!login_dialog(inst, aws, sizeof aws, acred, sizeof acred,
-                                 have_last ? last_ws : NULL, have_last ? last_user : NULL)) {
-            if (argv) LocalFree(argv);
-            return 0;                     /* cancelled */
+        int have_last = pick_last_workspace(pre_ws, sizeof pre_ws, pre_user, sizeof pre_user);
+        if (have_last && have_stored_token(pre_ws)) {
+            snprintf(aws, sizeof aws, "%s", pre_ws);   /* silent reconnect: cred stays "" */
+            direct = 1;
         }
     }
     if (argv) LocalFree(argv);
 
     LoadLibraryW(L"Msftedit.dll");        /* registers MSFTEDIT_CLASS (RICHEDIT50W) */
-    d2d_init();
-    connect_start(ws, cred);
+    d2d_init();                           /* factory only; the RT is made per-hwnd in paint */
+    if (direct) connect_start(aws, acred);
+    else        g_view = VIEW_SIGNIN;
 
     WNDCLASSW wc;
     memset(&wc, 0, sizeof wc);
@@ -3027,9 +3347,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     apply_dark_titlebar(hwnd);
     ShowWindow(hwnd, show);
     UpdateWindow(hwnd);
+    /* After ShowWindow: SetFocus on a child of a not-yet-shown window does not
+     * stick, which left the workspace field unfocused and swallowed typing. */
+    if (!direct) signin_begin(hwnd, pre_ws[0] ? pre_ws : NULL, pre_user[0] ? pre_user : NULL);
 
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0) > 0) {
+        /* Give the sign-in view a dialog manager so Tab moves between its fields
+         * and Enter submits. Gated to that view so the RichEdit composer keeps
+         * its own Tab/Enter handling (re_proc) everywhere else. */
+        if (g_view == VIEW_SIGNIN && IsDialogMessageW(hwnd, &m)) continue;
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }

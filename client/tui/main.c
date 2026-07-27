@@ -1441,7 +1441,7 @@ static int login_dialog(login_form *f, const char *err) {
         if (ev.key == TB_KEY_ENTER) {
             if (!f->workspace[0]) { snprintf(inl, sizeof inl, "enter a workspace (domain or name)"); focus = 0; continue; }
             if (!f->user[0])     { snprintf(inl, sizeof inl, "enter a username"); focus = 1; continue; }
-            oc_resolve_status st = oc_resolve(f->workspace, getenv("OPENCHIME_SUFFIX"), &f->ep);
+            oc_resolve_status st = oc_resolve(f->workspace, oc_default_suffix(), &f->ep);
             if (st == OC_RESOLVE_BAD_WORKSPACE) { snprintf(inl, sizeof inl, "invalid workspace '%s'", f->workspace); focus = 0; continue; }
             if (st == OC_RESOLVE_NOT_FOUND)    { snprintf(inl, sizeof inl, "'%s' not found — does not resolve in DNS", f->workspace); focus = 0; continue; }
             return LOGIN_SUBMIT;
@@ -1630,7 +1630,7 @@ int main(int argc, char **argv) {
         const char *inst = (argc >= 2) ? argv[1] : cfg.workspace;
         const char *cli_cred = argc >= 3 ? argv[2] : getenv("OPENCHIME_CRED");
         oc_endpoint ep;
-        oc_resolve_status st = oc_resolve(inst, getenv("OPENCHIME_SUFFIX"), &ep);
+        oc_resolve_status st = oc_resolve(inst, oc_default_suffix(), &ep);
         if (st == OC_RESOLVE_BAD_WORKSPACE) { fprintf(stderr, "openchime: invalid workspace '%s'\n", inst); return 2; }
         if (st == OC_RESOLVE_NOT_FOUND)    { fprintf(stderr, "openchime: workspace '%s' not found — it does not resolve in DNS\n", inst); return 3; }
         snprintf(host, sizeof host, "%s", ep.host);

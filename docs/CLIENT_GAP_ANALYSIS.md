@@ -203,7 +203,7 @@
 
 | Feature / Surface | Slack | Pumble | TUI | Win32 | Gap notes & priority |
 |---|---|---|---|---|---|
-| Login dialog | ✅ | ✅ | ✅ fields+remember-me+validation+retry | ✅ themed native, prefilled; NO error display on fail, no remember-me surfaced | Win32 login shows no error on bad login. **P0** |
+| Login dialog | ✅ | ✅ | ✅ fields+remember-me+validation+retry | ✅ two-step in-window view (workspace→credentials), inline errors, retry, remember-me | Win32 rebuilt Slack-shaped (WIN-2); hosted `.openchime.io` default + Advanced for self-hosted. — |
 | Signup / first-owner UI | ✅ | ✅ self-serve | ❌ | ❌ | Neither client has signup/first-owner flow. **P1** |
 | Profile viewer (self) | ✅ editor | ✅ editor | 🟡 READ-ONLY viewer | ⚪ name+password only, chained prompts | Neither of ours is a real editor. **P1** |
 | Change display name | ✅ | ✅ | 🟡 | 🟡 (chained prompt) | Present. — |
@@ -314,7 +314,7 @@
 | Workspace switch by number | ✅ Cmd+1..9 | ❔ | 🟡 | ❌ | **P2** |
 | Reconnect / auto-reconnect | ✅ | ✅ | ⚪ stub | 🟡 works; banner + Retry now (WIN-1), countdown is static text (WIN-55) | **P1** |
 | Connection status indicator | ✅ | ✅ | 🟡 status line | 🟡 header state + connection banner (WIN-1) | **P1** |
-| Logout | ✅ | ✅ | 🟡 no log-out-everywhere | ✅ Sign out / Sign out everywhere | Present; TUI lacks revoke-all. — |
+| Logout | ✅ | ✅ | 🟡 no log-out-everywhere; quits | ✅ Sign out / Sign out everywhere, returns to sign-in | Win32 returns to the sign-in view rather than quitting (WIN-2); TUI lacks revoke-all. — |
 | Quit | ✅ | ✅ | 🟡 | 🟡 | Present. — |
 
 ### 2.15 Calls / Huddles / Canvas / Lists / Clips
@@ -343,7 +343,7 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 
 1. **Search results (both clients)** — *Today:* read-only, non-navigable list; TUI shows raw `userNNN` instead of names; Win32 click jumps to the CHANNEL not the matched message, no highlight, no scroll, 128-result cap ignoring truncation. *Done:* navigable results (arrow/click to the exact message), resolved display names, term highlighting, in-overlay query box + refine, paging/load-more, filter tabs. **P0**
 
-2. **Win32 error/failure surface** — **mostly closed (WIN-1).** A toast stack now carries in-session failures (verified against a live `send rate exceeded`) and a connection banner carries the reason plus a Retry-now button; the transcript no longer duplicates them. *Remaining:* the **login dialog still shows nothing on auth failure** (WIN-2), and the banner's countdown is static text rather than ticking (WIN-55). **P0**
+2. **Win32 error/failure surface** — **closed (WIN-1 + WIN-2).** A toast stack carries in-session failures (verified against a live `send rate exceeded`), a connection banner carries the reason plus Retry now, and the rebuilt sign-in view reports DNS and auth failures inline and retryably. *Remaining:* the banner's countdown is static text rather than ticking (WIN-55). —
 
 3. **Settings / Preferences (missing in both)** — *Today:* config is file-only; no in-app `set_setting` surface, no theme/12-24h/panel toggles. *Done:* a Preferences hub (notifications, appearance, time format, sidebar behavior) writing through the existing config. **P0**
 
@@ -389,7 +389,7 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 - **Jump-to-unread / new-message divider / mark-unread.** **P1**
 - **Copy-link / permalink, pin, forward** on messages. **P1**
 - **Inline image/thumbnail rendering; open-in-place.** **P1**
-- **Signup / first-owner UI; remember-me surfaced; login error display.** **P0**
+- **Signup / first-owner UI** (WIN-32; needs `REDEEM_INVITE` in the core). ~~remember-me surfaced; login error display~~ — **done (WIN-2)**. **P1**
 - **Avatar / rich profile editor; custom status; email/timezone.** **P1**
 - **Active-session list** (revoke-all *is* built — "Sign out everywhere"; listing sessions is not). **P2**
 - **Notification-prefs review screen** (`list_notify_prefs` never called). **P1**

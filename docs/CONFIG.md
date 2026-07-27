@@ -110,7 +110,7 @@ client_type)` settings bucket — see [CLIENT.md](./CLIENT.md) §3.
 | Variable | Used by | Meaning |
 |---|---|---|
 | `OPENCHIME_STATE` | core store | Overrides the client store path (default `$HOME/.local/state/openchime/state.db`; `%LOCALAPPDATA%` on Windows). |
-| `OPENCHIME_SUFFIX` | `resolve.c` | DNS suffix appended to a bare workspace name (`acme` → `acme.<suffix>`), ARCH-14. |
+| `OPENCHIME_SUFFIX` | `resolve.c` | Overrides the DNS suffix appended to a bare workspace name (`acme` → `acme.<suffix>`), ARCH-14. **Defaults to `openchime.io`** (`OC_SERVICE_SUFFIX` in `client/core/resolve.h`, returned by `oc_default_suffix()`) — the hosted case is the common one, so a bare name resolves under the service domain unless this says otherwise. A dotted domain or an explicit `:port` bypasses suffixing entirely. |
 | `OPENCHIME_CRED` | TUI | Credential passed as `user:password`, so a password never lands in the process arguments. |
 | `OPENCHIME_TEST_DIR` | Win32 GUI | Enables the in-app automation hook (screenshot / state-dump drop directory) used by `scripts/gui_snap.sh`. Dev only. |
 

@@ -3,6 +3,8 @@
  */
 
 #include "resolve.h"
+
+#include <stdlib.h>   /* getenv */
 #include "sock.h"      /* oc_sock_startup: getaddrinfo needs WSAStartup on Windows */
 
 #ifdef _WIN32
@@ -22,6 +24,11 @@
 
 #include <stdio.h>
 #include <string.h>
+
+const char *oc_default_suffix(void) {
+    const char *env = getenv("OPENCHIME_SUFFIX");
+    return (env && *env) ? env : OC_SERVICE_SUFFIX;
+}
 
 int oc_resolve_domain(const char *workspace, const char *suffix, char *out, size_t cap) {
     if (!workspace || !out || cap == 0) return -1;
