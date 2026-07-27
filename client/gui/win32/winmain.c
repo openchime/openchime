@@ -482,6 +482,8 @@ static void rail_hit(float top, float bot, int act) {
     }
 }
 
+static void ws_display_name(const oc_model *m, char *out, size_t cap);   /* fwd */
+
 /* One rail item: a Lucide icon + tiny label. Matches Slack: selected is a
  * subtle translucent-white rounded square with a WHITE icon; unselected icons +
  * labels are bright (not muted); hover is a fainter overlay. */
@@ -516,14 +518,14 @@ static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     fill(rt, rf(0, 0, RAIL_W, h), OC_COL_RAIL);
     g_n_navrows = 0;
 
-    /* Top: workspace-switcher — a 36x36 rounded square (Slack spec) with the host
-     * initial. */
+    /* Top: workspace-switcher — a 36x36 rounded square (Slack spec) with the
+     * workspace's initial (its display name, not the host). */
     float cx = RAIL_W / 2;
     D2D1_RECT_F av = rf(cx - 18, 14, cx + 18, 50);
     g_rail_btn = av;
     fill_round(rt, av, 12.0f, OC_COL_ACCENT);
-    char init[2] = { (char)(g_host[0] ? (g_host[0] >= 'a' && g_host[0] <= 'z'
-                        ? g_host[0] - 32 : g_host[0]) : 'O'), 0 };
+    char wsn[80]; ws_display_name(m, wsn, sizeof wsn);
+    char init[2] = { (char)(wsn[0] ? (wsn[0] >= 'a' && wsn[0] <= 'z' ? wsn[0] - 32 : wsn[0]) : 'O'), 0 };
     draw_text(rt, init, g_ava, av, 0xFFFFFF);
     rail_hit(av.top - 6, av.bottom + 6, NAV_SWITCHER);
     fill(rt, rf(14, 58, RAIL_W - 14, 59), OC_COL_BORDER);   /* divider */
@@ -656,9 +658,9 @@ static void draw_menu(ID2D1RenderTarget *rt) {
     if (g_menu_headerblock) {
         D2D1_RECT_F av = rf(x + 14, cy + 10, x + 54, cy + 50);
         fill_round(rt, av, 10.0f, OC_COL_ACCENT);
-        char init[2] = { (char)(g_host[0] ? (g_host[0] >= 'a' && g_host[0] <= 'z' ? g_host[0] - 32 : g_host[0]) : 'O'), 0 };
-        draw_text(rt, init, g_ava, av, 0xFFFFFF);
         char nm[80]; ws_display_name(m, nm, sizeof nm);
+        char init[2] = { (char)(nm[0] ? (nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]) : 'O'), 0 };
+        draw_text(rt, init, g_ava, av, 0xFFFFFF);
         draw_text(rt, nm, g_name, rf(x + 64, cy + 9, panel.right - 12, cy + 30), OC_COL_TEXT);
         char hostline[288]; snprintf(hostline, sizeof hostline, "%s:%d", g_host, g_port);
         draw_text(rt, hostline, g_small, rf(x + 64, cy + 28, panel.right - 12, cy + 45), OC_COL_MUTED);
@@ -1436,6 +1438,12 @@ static void draw_stub_view(ID2D1RenderTarget *rt, D2D1_RECT_F reg,
 }
 
 static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, float H) {
+    /* Start from a known identity transform — draw_lucide sets a scale/translate
+     * transform per icon and resets it, but reset defensively here so a leaked
+     * transform can never distort the menu/avatar chrome (guards the malformed
+     * workspace-avatar glitch). */
+    D2D1_MATRIX_3X2_F ident = {{{ 1, 0, 0, 1, 0, 0 }}};
+    ID2D1RenderTarget_SetTransform(rt, &ident);
     /* Grayscale AA: on a dark UI, ClearType subpixel fringing tints thin text
      * (visible color speckle on the rail labels); grayscale is cleaner. */
     ID2D1RenderTarget_SetTextAntialiasMode(rt, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
