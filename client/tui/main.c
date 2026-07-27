@@ -48,7 +48,7 @@
 #include "model.h"
 #include "resolve.h"    /* workspace -> host:port (REQ-010/011) */
 #include "store.h"      /* peek a stored session token (skip the login box) */
-#include "secret_backend.h" /* OS keyring for the session token */
+#include "secret_os.h" /* OS keyring for the session token */
 #include "config.h"     /* machine-local prefs (mouse, panels, time) */
 #include "protocol.h"   /* OC_PRESENCE_*, OC_SESSION_TOKEN_LEN */
 
@@ -1606,7 +1606,7 @@ int main(int argc, char **argv) {
     const char *store_path = resolve_store_path();
     /* Prefer the OS keyring for the session token; NULL (headless / no keyring)
      * falls back to the SQLite store. Owned here, freed after the client stops. */
-    oc_secret *secret = oc_tui_secret_open("openchime");
+    oc_secret *secret = oc_secret_open_os("openchime");
     g_store_path = store_path;    /* the switcher reads the book from here */
     g_secret = secret;
 

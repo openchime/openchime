@@ -1,12 +1,15 @@
 /*
- * OpenChime TUI — libsecret credential backend (Linux). Stores the session token
- * in the Secret Service (GNOME Keyring / KWallet) via a hex-encoded password
- * entry keyed by (service, account). When libsecret isn't compiled in, or no
- * Secret Service is reachable (headless / no D-Bus), oc_tui_secret_open returns
- * NULL and the core falls back to the SQLite store.
+ * OpenChime — libsecret credential backend (Linux), behind the shared
+ * oc_secret_open_os() entry point (secret_os.h). Stores the session token in the
+ * Secret Service (GNOME Keyring / KWallet) as a hex-encoded password entry keyed
+ * by (service, account). When libsecret isn't compiled in, or no Secret Service
+ * is reachable (headless / no D-Bus), it returns NULL — and the core then
+ * persists no credential at all, rather than falling back to plaintext.
  */
 
-#include "secret_backend.h"
+#include "secret_os.h"
+
+#ifndef _WIN32   /* Windows uses secret_win.c */
 
 #ifdef OC_HAVE_LIBSECRET
 
@@ -93,7 +96,7 @@ static void ls_del(void *ctx, const char *account) {
 
 static void ls_close(void *ctx) { free(ctx); }
 
-oc_secret *oc_tui_secret_open(const char *service) {
+oc_secret *oc_secret_open_os(const char *service) {
     /* Probe for a running Secret Service; without one (headless / no D-Bus) fall
      * back to SQLite by returning NULL. */
     GError *err = NULL;
@@ -110,8 +113,10 @@ oc_secret *oc_tui_secret_open(const char *service) {
     return s;
 }
 
-#else /* no libsecret: no OS keyring, use the SQLite fallback */
+#else /* no libsecret: no OS keyring on this build */
 
-oc_secret *oc_tui_secret_open(const char *service) { (void)service; return NULL; }
+oc_secret *oc_secret_open_os(const char *service) { (void)service; return NULL; }
 
 #endif
+
+#endif /* !_WIN32 */

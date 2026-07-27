@@ -16,6 +16,7 @@ void oc_store_set_secret(oc_store *s, oc_secret *secret) {
     if (s) s->secret = secret;
 }
 
+
 /* The client migration set (independent of the daemon's OC_MIGRATIONS). One row
  * per workspace holds the reconnect state.
  *
@@ -86,6 +87,12 @@ oc_store *oc_store_open(const char *path) {
     oc_store *s = calloc(1, sizeof *s);
     if (!s) { sqlite3_close(db); return NULL; }
     s->db = db;
+    /* Tokens now live only in the OS credential store, so a plaintext copy left
+     * by an older build is a liability with no reader — erase it on open. Costs
+     * one extra sign-in the first time after upgrading, which is the honest
+     * price of "a credential is never written to a plaintext file". */
+    sqlite3_exec(db, "UPDATE workspace_state SET session_token=NULL, session_expiry=0 "
+                     "WHERE session_token IS NOT NULL;", NULL, NULL, NULL);
     return s;
 }
 
@@ -126,53 +133,34 @@ int oc_store_load_session(oc_store *s, const char *workspace,
                           uint8_t token[OC_SESSION_TOKEN_LEN], uint64_t *expiry,
                           uint64_t now_ms) {
     if (!s || !workspace) return 0;
-    if (s->secret) {   /* keyring-backed: one token+expiry blob per workspace */
-        uint8_t blob[OC_SECRET_BLOB]; size_t got = 0;
-        if (!oc_secret_get(s->secret, workspace, blob, sizeof blob, &got) || got != OC_SECRET_BLOB)
-            return 0;
-        uint64_t exp = secret_unpack_expiry(blob);
-        if (now_ms != 0 && exp != 0 && exp <= now_ms) return 0;   /* expired */
-        memcpy(token, blob, OC_SESSION_TOKEN_LEN);
-        if (expiry) *expiry = exp;
-        return 1;
-    }
-    if (!s->db) return 0;
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(s->db,
-            "SELECT session_token, session_expiry FROM workspace_state WHERE workspace=?1;",
-            -1, &st, NULL) != SQLITE_OK) return 0;
-    sqlite3_bind_text(st, 1, workspace, -1, SQLITE_TRANSIENT);
-    int found = 0;
-    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) == SQLITE_BLOB &&
-        sqlite3_column_bytes(st, 0) == OC_SESSION_TOKEN_LEN) {
-        uint64_t exp = (uint64_t)sqlite3_column_int64(st, 1);
-        if (now_ms == 0 || exp == 0 || exp > now_ms) {
-            memcpy(token, sqlite3_column_blob(st, 0), OC_SESSION_TOKEN_LEN);
-            if (expiry) *expiry = exp;
-            found = 1;
-        }
-    }
-    sqlite3_finalize(st);
-    return found;
+    /* A credential is never read from, or written to, the plaintext store: with
+     * no OS keyring there is simply no persisted session (secret_os.h). The user
+     * signs in again next launch. */
+    if (!s->secret) return 0;
+    /* keyring-backed: one token+expiry blob per workspace */
+    uint8_t blob[OC_SECRET_BLOB]; size_t got = 0;
+    if (!oc_secret_get(s->secret, workspace, blob, sizeof blob, &got) || got != OC_SECRET_BLOB)
+        return 0;
+    uint64_t exp = secret_unpack_expiry(blob);
+    if (now_ms != 0 && exp != 0 && exp <= now_ms) return 0;   /* expired */
+    memcpy(token, blob, OC_SESSION_TOKEN_LEN);
+    if (expiry) *expiry = exp;
+    return 1;
 }
 
 void oc_store_save_session(oc_store *s, const char *workspace,
                            const uint8_t token[OC_SESSION_TOKEN_LEN], uint64_t expiry) {
-    if (s && s->secret) {
-        uint8_t blob[OC_SECRET_BLOB];
-        secret_pack(token, expiry, blob);
-        oc_secret_put(s->secret, workspace, blob, sizeof blob);
-        return;
-    }
-    upsert(s, workspace,
-           "INSERT INTO workspace_state (workspace, session_token, session_expiry) VALUES (?1, ?2, ?3) "
-           "ON CONFLICT(workspace) DO UPDATE SET session_token=?2, session_expiry=?3;",
-           token, OC_SESSION_TOKEN_LEN, (int64_t)expiry, 1);
+    if (!s || !s->secret) return;   /* no keyring -> the token is not persisted */
+    uint8_t blob[OC_SECRET_BLOB];
+    secret_pack(token, expiry, blob);
+    oc_secret_put(s->secret, workspace, blob, sizeof blob);
 }
 
 void oc_store_clear_session(oc_store *s, const char *workspace) {
     if (!s || !workspace) return;
-    if (s->secret) { oc_secret_del(s->secret, workspace); return; }
+    if (s->secret) oc_secret_del(s->secret, workspace);
+    /* Clear the column too: an upgraded store may still carry an old plaintext
+     * token for this workspace, and "forget" must leave nothing behind. */
     if (!s->db) return;
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db,

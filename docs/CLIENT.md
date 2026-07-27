@@ -324,15 +324,23 @@ far:**
 - `workspace_state` (one row per `"host:port"`) — the **session token + expiry**
   (ARCH-58) and the **per-workspace TOFU pin** (ARCH-10), so a relaunched client
   reconnects silently with the token — no password — against the pinned cert.
-  **The session token prefers the OS keyring:** the core exposes an abstract
-  `oc_secret` get/put/del vtable (`client/core/secret.h`, no keyring library in
-  the core), and the store routes the token through it when set — so on a desktop
-  the token lives in the platform secret store, not the plaintext SQLite file.
-  The TUI supplies a **libsecret** backend (`client/tui/secret_backend.c`, Secret
-  Service → GNOME Keyring/KWallet); when there's no keyring (headless / no D-Bus)
-  the backend returns NULL and the token falls back to the SQLite column. Only the
-  token goes to the keyring — the (public) pin + cache stay in SQLite. Windows'
-  Credential Manager / macOS Keychain slot behind the same vtable later.
+  **The session token lives ONLY in the OS credential store — never in SQLite.**
+  The core exposes an abstract `oc_secret` get/put/del vtable
+  (`client/core/secret.h`, no keyring library in the core), and every frontend
+  opens its platform backend through one entry point,
+  `oc_secret_open_os()` (`client/shared/secret_os.h`): **libsecret** on Linux
+  (`secret_libsecret.c`, Secret Service → GNOME Keyring/KWallet) and **Windows
+  Credential Manager** on both Windows front-ends (`secret_win.c`, one generic
+  credential per workspace: target `openchime:<host:port>`, the token+expiry blob,
+  `CRED_PERSIST_LOCAL_MACHINE` so it does not roam).
+
+  **There is no plaintext fallback.** Where no store exists — headless, no D-Bus,
+  a locked keychain — `oc_store_save_session`/`load_session` simply do nothing, so
+  that machine keeps no session and the user signs in again next launch. Opening a
+  store also **erases any token an older build left in the file**, so upgrading
+  costs one re-sign-in rather than leaving a plaintext credential behind. Only the
+  *token* is a credential: the (public) TOFU pin, the message cache, and the
+  workspace book stay in SQLite. macOS Keychain slots behind the same vtable.
 - `cached_message` — **cached history** per channel (ARCH-45/46). Every BROADCAST
   is written through as it arrives (edits/deletes update the row); on startup the
   net thread replays the cache into the model *before connecting*, so history

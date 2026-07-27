@@ -351,9 +351,13 @@ static void test_store_workspace_upgrade(void) {
     oc_store *s = oc_store_open(sp);
     CHECK(s != NULL);
     if (s) {
-        uint8_t gt[OC_SESSION_TOKEN_LEN], gp[OC_TLS_FINGERPRINT_LEN];
-        CHECK(oc_store_load_session(s, "acme:443", gt, NULL, 0) == 1 &&
-              memcmp(gt, tok, OC_SESSION_TOKEN_LEN) == 0);
+        uint8_t gp[OC_TLS_FINGERPRINT_LEN];
+        /* The v3 store held its session token in plaintext. Opening it now ERASES
+         * that token (tokens live only in the OS credential store), so the
+         * upgrade deliberately costs one re-sign-in — while the pin and the
+         * cached history, which are not credentials, survive untouched. */
+        uint8_t gt[OC_SESSION_TOKEN_LEN];
+        CHECK(oc_store_load_session(s, "acme:443", gt, NULL, 0) == 0);
         CHECK(oc_store_load_pin(s, "acme:443", gp) == 1 &&
               memcmp(gp, pin, OC_TLS_FINGERPRINT_LEN) == 0);
 
@@ -412,7 +416,10 @@ static void test_workspace_book(void) {
     CHECK(strcmp(b2.label[0], "acme.example.com") == 0);
     CHECK(strcmp(b2.user[0], "dana") == 0);
 
-    /* Forgetting a workspace takes its session token and cached history with it. */
+    /* Forgetting a workspace takes its session token and cached history with it.
+     * A token only persists with a keyring attached, so give the store one. */
+    oc_secret book_sec = { mock_get, mock_put, mock_del, NULL, NULL };
+    oc_store_set_secret(s, &book_sec);
     uint8_t tok[OC_SESSION_TOKEN_LEN];
     for (unsigned i = 0; i < OC_SESSION_TOKEN_LEN; i++) tok[i] = (uint8_t)(i + 1);
     oc_store_save_session(s, "acme:443", tok, 0);
@@ -814,7 +821,11 @@ int run_client_core_tests(void) {
             unlink(sp); unlink("build/itest_core_store.db-wal"); unlink("build/itest_core_store.db-shm");
             char inst[64]; snprintf(inst, sizeof inst, "127.0.0.1:%d", arg.port);
 
-            oc_client *s1 = oc_client_start_stored("127.0.0.1", arg.port, "faye:pw-faye", sp);
+            /* A session token persists only into a credential store, so this
+             * round-trip needs one (the in-memory mock stands in for the OS). */
+            oc_secret store_sec = { mock_get, mock_put, mock_del, NULL, NULL };
+            oc_client *s1 = oc_client_start_secure("127.0.0.1", arg.port, "faye:pw-faye",
+                                                   sp, &store_sec);
             CHECK(s1 != NULL);
             if (s1) {
                 CHECK(WAIT_FOR(s1, m->authed && m->user_id != 0));
@@ -825,12 +836,14 @@ int run_client_core_tests(void) {
             CHECK(chk != NULL);
             if (chk) {
                 uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN];
+                oc_store_set_secret(chk, &store_sec);
                 CHECK(oc_store_load_session(chk, inst, tok, NULL, 0) == 1);
                 CHECK(oc_store_load_pin(chk, inst, pin) == 1);
                 oc_store_close(chk);
             }
             /* Wrong password, but the stored token authenticates it anyway. */
-            oc_client *s2 = oc_client_start_stored("127.0.0.1", arg.port, "faye:WRONG-pw", sp);
+            oc_client *s2 = oc_client_start_secure("127.0.0.1", arg.port, "faye:WRONG-pw",
+                                                   sp, &store_sec);
             CHECK(s2 != NULL);
             if (s2) {
                 CHECK(WAIT_FOR(s2, m->authed && m->user_id != 0));

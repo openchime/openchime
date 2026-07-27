@@ -67,7 +67,7 @@ Provided by the host toolchain (local dev / CI) or the Alpine base image
 | **SQLite** (`libsqlite3`) | The daemon DB and the client store (schema + migrations) | Daemon + client | `-lsqlite3` | https://sqlite.org | Public Domain |
 | **glibc `resolv`** (`libresolv`) | DNS **SRV** lookup for workspace resolution (REQ-010) | TUI only (Linux) | `-lresolv` | glibc | LGPL-2.1 (glibc) |
 | **pthreads** | Threads (net thread, queues, dbwriter) | Daemon + client | `-lpthread` | glibc / musl | LGPL-2.1 / MIT |
-| **libsecret** *(optional)* | OS keyring (Secret Service) backend for the session token | TUI credential cache | `pkg-config libsecret-1`, gated by `-DOC_HAVE_LIBSECRET` | https://gitlab.gnome.org/GNOME/libsecret | LGPL-2.1 |
+| **libsecret** *(optional)* | OS keyring (Secret Service) backend for the session token on Linux (`client/shared/secret_libsecret.c`); Windows uses Credential Manager via `advapi32`, no vendored dependency | Linux TUI/GUI credential store | `pkg-config libsecret-1`, gated by `-DOC_HAVE_LIBSECRET` | https://gitlab.gnome.org/GNOME/libsecret | LGPL-2.1 |
 | **GLib** *(optional)* | Pulled in transitively by libsecret | TUI (only when libsecret present) | via libsecret | https://gitlab.gnome.org/GNOME/glib | LGPL-2.1 |
 
 `libsecret`/`glib` are **optional and dynamically linked**: `make tui` detects

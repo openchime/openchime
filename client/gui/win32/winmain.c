@@ -32,6 +32,7 @@
 #include <time.h>
 
 #include "client.h"
+#include "secret_os.h"
 #include "model.h"
 #include "resolve.h"
 #include "store.h"            /* peek a stored session token (skip the login box) */
@@ -77,6 +78,10 @@ static const char *REACT_EMO[6] = {
 /* ---- app state ----------------------------------------------------------- */
 
 static oc_client *g_client;
+/* The OS credential store (Windows Credential Manager), opened once at startup.
+ * NULL means this machine has none — the core then persists no session token at
+ * all rather than writing one to the plaintext SQLite file (secret_os.h). */
+static oc_secret *g_secret;
 static char       g_cred[264];
 static char       g_host[256];
 static int        g_port;
@@ -2456,6 +2461,11 @@ static int have_stored_token(const char *ws) {
     const char *sp = store_path();
     oc_store *s = sp ? oc_store_open(sp) : NULL;
     if (!s) return 0;
+    /* The token lives in the OS credential store, so this probe has to look
+     * there too — without the secret attached, oc_store_load_session() correctly
+     * reports "no persisted session" and we would show the sign-in screen to a
+     * user who is still signed in. */
+    oc_store_set_secret(s, g_secret);
     char inst[288]; snprintf(inst, sizeof inst, "%s:%d", ep.host, ep.port);
     uint8_t tok[OC_SESSION_TOKEN_LEN];
     int has = oc_store_load_session(s, inst, tok, NULL, (uint64_t)time(NULL) * 1000);
@@ -2483,7 +2493,7 @@ static void connect_start(const char *ws, const char *cred) {
     g_port = ep.port;
     snprintf(g_cur_ws, sizeof g_cur_ws, "%s", ws);
     snprintf(g_cred, sizeof g_cred, "%s", cred);
-    g_client = oc_client_start_secure(g_host, g_port, g_cred, store_path(), NULL);
+    g_client = oc_client_start_secure(g_host, g_port, g_cred, store_path(), g_secret);
 
     /* Remember this workspace (+ the username, parsed off "user:pass") so the next
      * launch reconnects silently via the stored session token. */
@@ -2624,7 +2634,8 @@ static void signin_submit(HWND hwnd) {
     /* "Remember me" off means leave no trace: passing a NULL store path keeps
      * the session token out of the store entirely (the TUI's mechanism). */
     g_client = oc_client_start_secure(g_host, g_port, g_cred,
-                                      g_si_remember ? store_path() : NULL, NULL);
+                                      g_si_remember ? store_path() : NULL,
+                                      g_si_remember ? g_secret : NULL);
     if (!g_client) { snprintf(g_si_err, sizeof g_si_err, "could not start the client"); goto redraw; }
     g_si_connecting = 1;
     g_si_started = GetTickCount64();
@@ -3303,6 +3314,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     { const char *td = getenv("OPENCHIME_TEST_DIR");
       if (td && td[0]) snprintf(g_test_dir, sizeof g_test_dir, "%s", td); }
 
+    /* Open the OS credential store first: the "do we have a session?" probe
+     * below reads through it. */
+    g_secret = oc_secret_open_os("openchime");
+
     /* Credential resolution, uniform with the TUI:
      *   1. Dev quick-launch `openchime.exe <workspace> <user:pass>` — connect directly.
      *   2. A remembered workspace with a still-valid session token — reconnect
@@ -3378,5 +3393,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     if (g_rt)     ID2D1HwndRenderTarget_Release(g_rt);
     if (g_dwrite) IDWriteFactory_Release(g_dwrite);
     if (g_factory) ID2D1Factory_Release(g_factory);
+    oc_secret_free(g_secret);
     return 0;
 }

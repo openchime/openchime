@@ -41,7 +41,7 @@ CORE_INC := -Iclient/core
 # --- Client TUI frontend (ARCH-75) --------------------------------------------
 # termbox2 (cell grid + input) + utf8proc (Unicode width/grapheme), both vendored
 # as committed MIT single-file source. Builds on the host like the daemon.
-TUI_SRC   := $(wildcard client/tui/*.c)
+TUI_SRC   := $(wildcard client/tui/*.c) $(wildcard client/shared/secret_*.c)
 # tuikit — the in-tree TUI toolbox (terminal layer + widgets + formatting). Owns
 # the termbox2 instantiation + the Windows console backend (ARCH-83). Linked into
 # both the POSIX and Windows TUI.
@@ -51,10 +51,11 @@ UTF8PROC  := third_party/utf8proc/utf8proc.c
 # The core's local store (client/core/store.c) reuses the daemon's migration
 # runner and SQLite, so the frontend links migrate.c + libsqlite3.
 STORE_DEPS := daemon/migrate.c
-# The TUI's credential backend (client/tui/secret_backend.c, already in TUI_SRC)
-# uses the OS keyring via libsecret when the dev package is present; otherwise it
-# compiles a stub and the core falls back to the SQLite store — so `make tui`
-# works with or without libsecret installed.
+# The platform credential backend (client/shared/secret_*.c, one entry point in
+# secret_os.h): libsecret on Linux when the dev package is present, Windows
+# Credential Manager on the Windows builds. Without libsecret it compiles a stub
+# that reports "no keyring" — `make tui` still builds, but that machine then
+# persists no session token at all (a credential is never written to plaintext).
 ifeq ($(shell pkg-config --exists libsecret-1 && echo yes),yes)
   SECRET_CFLAGS := $(shell pkg-config --cflags libsecret-1) -DOC_HAVE_LIBSECRET
   SECRET_LIBS   := $(shell pkg-config --libs libsecret-1)
@@ -62,7 +63,7 @@ else
   SECRET_CFLAGS :=
   SECRET_LIBS   :=
 endif
-TUI_INC   := $(CORE_INC) -Iclient/tui -Ithird_party/termbox2 -Ithird_party/utf8proc
+TUI_INC   := $(CORE_INC) -Iclient/tui -Iclient/shared -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
 .PHONY: all run test integration core tui bench clean s3-smoke windows-tui windows-gui tuikit-demo demo-client
@@ -158,14 +159,14 @@ SQLITE_SRC := third_party/sqlite/sqlite3.c
 WIN_TUI_BIN := build/openchime-tui.exe
 WIN_CFLAGS := -std=c99 -Wall -Wextra -O2 -D_WIN32_WINNT=0x0601 -DSQLITE_OMIT_LOAD_EXTENSION -DUTF8PROC_STATIC
 WIN_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
-           $(CORE_INC) -Iclient/tui -Ituikit -Ithird_party/termbox2 -Ithird_party/utf8proc -Ithird_party/sqlite
+           $(CORE_INC) -Iclient/tui -Iclient/shared -Ituikit -Ithird_party/termbox2 -Ithird_party/utf8proc -Ithird_party/sqlite
 
 windows-tui: $(WIN_TUI_BIN)
 $(WIN_TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(STORE_DEPS) $(SQLITE_SRC) \
                 $(wildcard client/tui/*.h tuikit/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) | build
 	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result $(WIN_INC) \
 	    $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(UTF8PROC) $(SQLITE_SRC) \
-	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -static -o $@
+	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -ladvapi32 -static -o $@
 
 
 # The native Windows GUI (Win32 + Direct2D/DirectWrite/WIC, pure C — ARCH-80/82)
@@ -174,7 +175,7 @@ $(WIN_TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $
 # TUI/tuikit stack and links the Direct2D stack. -municode gives the wWinMain
 # Unicode entry point; -mwindows selects the GUI subsystem (no console).
 WIN_GUI_BIN := build/openchime.exe
-GUI_SRC := $(wildcard client/gui/win32/*.c) client/shared/icons.c
+GUI_SRC := $(wildcard client/gui/win32/*.c) client/shared/icons.c client/shared/secret_win.c
 WIN_GUI_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
                $(CORE_INC) -Iclient/gui/win32 -Iclient/shared -Ithird_party/sqlite
 
@@ -183,7 +184,7 @@ $(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(SQLITE_SRC)
                 $(wildcard client/gui/win32/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) | build
 	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result -municode -mwindows $(WIN_GUI_INC) \
 	    $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(STORE_DEPS) $(SQLITE_SRC) \
-	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -lshell32 -lcomdlg32 -lgdi32 \
+	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -lshell32 -lcomdlg32 -lgdi32 -ladvapi32 \
 	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -luuid -static -o $@
 
 # --- tuikit demo (ARCH-83) ----------------------------------------------------

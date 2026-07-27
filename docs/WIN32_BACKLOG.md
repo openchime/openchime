@@ -9,7 +9,7 @@ clients, or a `REQ-NNN`.
 parity table is the *feature reachability* tracker. This document is the *work
 list* derived from both — one row per shippable branch.
 
-**Ids.** Items are `WIN-1` … `WIN-57`, numbered once and **stable**: an id is
+**Ids.** Items are `WIN-1` … `WIN-58`, numbered once and **stable**: an id is
 never renumbered or reused, so a commit or branch can cite it. Ordering is *not*
 priority — the **Pri** column is, and it may change. Section membership may also
 change as blockers clear (an item moves from §3 to §1 without changing its id).
@@ -100,8 +100,9 @@ Not startable in this client. Each names what must land first.
 | **WIN-53** | Custom status (emoji + text + expiry) | REQ-241 / REQ-122 |
 | **WIN-54** | Per-channel roster, global notify default, browse-channels directory, group DMs, custom emoji, active-session list | REQ-031 listing op · REQ-134 · REQ-038 · REQ-056 · REQ-072 · REQ-182 has revoke but no list |
 | **WIN-55** | Live reconnect countdown in the banner | Core gap: the net thread pushes `reconnecting in Ns…` once per backoff as sticky text; a ticking countdown needs a retry-deadline field on `oc_model` |
-| **WIN-56** | **Store the session token in Windows Credential Manager** | Nothing — this is buildable now, listed here only because it is a *core-seam* job rather than a screen. `oc_secret` (client/core/secret.h) exists and the TUI supplies a libsecret backend; **Win32 passes NULL at both `oc_client_start_secure` call sites**, so the token falls back to the plaintext `workspace_state.session_token` column in `%LOCALAPPDATA%\openchime\state.db`. Needs a `CredWriteW`/`CredReadW`/`CredDeleteW` backend mirroring `client/tui/secret_backend.c`. **P1** |
+| ~~**WIN-56**~~ | ~~**Store the session token in Windows Credential Manager**~~ **DONE.** `client/shared/secret_win.c` implements the `oc_secret` seam over `CredWriteW`/`CredReadW`/`CredDeleteW` (one generic credential per workspace, `CRED_PERSIST_LOCAL_MACHINE`), wired into both Windows front-ends via the new shared `oc_secret_open_os()`. **The core now refuses to persist a token to SQLite at all** and erases any left by an older build, so there is no plaintext fallback anywhere. Verified on Windows: the credential appears in `cmdkey /list`, `workspace_state.session_token` is NULL, and silent reconnect reads from the OS store. |
 | **WIN-57** | Sign in to *every* remembered workspace at boot | WIN-29 — Win32 holds one `oc_client`, so boot connects only the most-recently-used workspace that has a token, not all of them |
+| **WIN-58** | Move the **workspace book** (address, username, label, last-used) out of SQLite into the credential store | Nothing blocks it — the token moved in WIN-56, but the non-secret workspace list still lives in `workspace_book`. Keeping the {address, username, token} triple in one store removes the two-store desync on "forget workspace"; Credential Manager enumeration (`CredEnumerateW`) and libsecret attribute search both support it. **P2** |
 
 ## §4 Not planned for this client
 
