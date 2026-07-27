@@ -213,7 +213,7 @@
 | Timezone | ✅ | ✅ | ❌ | ❌ | **P2** |
 | Custom status set | ✅ | ✅ | ❌ | ❌ | See Presence. **P1** |
 | Job title / pronouns / custom fields | ✅ | 🟡 profile fields | ❌ | ❌ | **P2** |
-| Connecting/reconnect screen | ✅ | ✅ | ⚪ stub | 🟡 reconnect ok, 🔸 no toast/banner/countdown | **P1** |
+| Connecting/reconnect screen | ✅ | ✅ | ⚪ stub | 🟡 reconnect ok + banner with reason/retry (WIN-1); no live countdown | **P1** |
 | Preferences dialog (hub) | ✅ | ✅ | ❌ (file-only config) | ❌ no settings screen | No in-app settings editor in either of ours. **P0** |
 | Themes / appearance | ✅ | ✅ | ❌ no in-app toggle | ❌ | **P2** |
 | 12/24h & panel toggles in-app | ✅ | ✅ | ❌ (file-only) | ❌ | **P2** |
@@ -301,7 +301,7 @@
 | Star/favorite conversations | ✅ | ✅ | ❌ | ❌ | **P2** |
 | Autocomplete strip (@/#/:emoji) | ✅ | ✅ | 🟡 | ❌ | Win32 missing. **P1** |
 | Keybinding hint bar | ✅ | ❌ | 🟡 | ❌ | **P2** |
-| Error / toast surface (send fail, rate-limit, bad login) | ✅ | ✅ | 🔸 partial | 🔸 only `last_error` in the empty transcript; no toast/banner, login shows no auth error | Win32 has no transient toast/banner and the login dialog surfaces no error. **P0** |
+| Error / toast surface (send fail, rate-limit, bad login) | ✅ | ✅ | 🔸 partial | 🟡 toast stack + connection banner (WIN-1); login dialog still shows no auth error | Win32 in-app failures now surface; the login dialog is the remaining hole (WIN-2). **P0** |
 | Terminal / TUI client | ❌ | ❌ | ✅ **the only one of the four** | — | Genuine category differentiator. — |
 | Slackbot conversation | ✅ | ✅ Pumblebot | ⛔ | ⛔ | Out of scope. |
 
@@ -312,8 +312,8 @@
 | Multi-workspace switcher rail | ✅ | ✅ | ✅ remembered+open, unread, per-ws state | 🟡 rail switcher built (single-client stop/reconnect; no N-concurrent, no background unread) | Win32 has the switcher UI; the remaining delta is the TUI's N-concurrent-client model. **P1** |
 | Add workspace | ✅ | ✅ | 🟡 | 🟡 "Add a workspace…" in the switcher | **P1** |
 | Workspace switch by number | ✅ Cmd+1..9 | ❔ | 🟡 | ❌ | **P2** |
-| Reconnect / auto-reconnect | ✅ | ✅ | ⚪ stub | 🟡 works, no countdown/banner | **P1** |
-| Connection status indicator | ✅ | ✅ | 🟡 status line | 🔸 no toast/banner/countdown | **P1** |
+| Reconnect / auto-reconnect | ✅ | ✅ | ⚪ stub | 🟡 works; banner + Retry now (WIN-1), countdown is static text (WIN-55) | **P1** |
+| Connection status indicator | ✅ | ✅ | 🟡 status line | 🟡 header state + connection banner (WIN-1) | **P1** |
 | Logout | ✅ | ✅ | 🟡 no log-out-everywhere | ✅ Sign out / Sign out everywhere | Present; TUI lacks revoke-all. — |
 | Quit | ✅ | ✅ | 🟡 | 🟡 | Present. — |
 
@@ -343,7 +343,7 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 
 1. **Search results (both clients)** — *Today:* read-only, non-navigable list; TUI shows raw `userNNN` instead of names; Win32 click jumps to the CHANNEL not the matched message, no highlight, no scroll, 128-result cap ignoring truncation. *Done:* navigable results (arrow/click to the exact message), resolved display names, term highlighting, in-overlay query box + refine, paging/load-more, filter tabs. **P0**
 
-2. **Win32 error/failure surface (near-absent)** — *Today:* no transient toast/banner for send failure, rate-limit, or storage pressure, and the login dialog shows nothing on auth failure; the only failure surface is `last_error` text rendered in an empty transcript (winmain.c). *Done:* inline login error text + a global toast/banner channel for transient failures with retry affordance. **P0**
+2. **Win32 error/failure surface** — **mostly closed (WIN-1).** A toast stack now carries in-session failures (verified against a live `send rate exceeded`) and a connection banner carries the reason plus a Retry-now button; the transcript no longer duplicates them. *Remaining:* the **login dialog still shows nothing on auth failure** (WIN-2), and the banner's countdown is static text rather than ticking (WIN-55). **P0**
 
 3. **Settings / Preferences (missing in both)** — *Today:* config is file-only; no in-app `set_setting` surface, no theme/12-24h/panel toggles. *Done:* a Preferences hub (notifications, appearance, time format, sidebar behavior) writing through the existing config. **P0**
 
@@ -380,7 +380,7 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 - **Settings/Preferences screen** — the workspace menu has a **Preferences** item, but it opens a "coming soon" `MessageBox`; no in-app config exists. **P0**
 - **@-mention / #channel / :emoji autocomplete** in composer. **P0**
 - **Composer emoji picker** (none; only 6 hardcoded reaction emoji). **P1**
-- **Error/toast surface** for any failure (login, send, rate-limit). **P0**
+- ~~Error/toast surface for in-app failures~~ — **done (WIN-1)**; the login dialog is still silent (WIN-2). **P0**
 - **Command palette / Ctrl+K** (rail menus only; no keyboard-driven action surface). **P1**
 - **DM section/list** in sidebar; **sidebar sections/collapsing/starred/muted** and sidebar **scrolling** past the visible rows. The rail's **DMs** view exists but renders the same flat channel sidebar as Home — it has no DM-specific behaviour. **P0**
 - **View other-user profile.** **P0**

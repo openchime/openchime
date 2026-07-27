@@ -195,6 +195,76 @@ static D2D1_RECT_F g_attach_btn;        /* composer attach (+) hit-box */
 static D2D1_RECT_F g_send_btn;          /* composer send-button hit-box */
 static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
 
+/* ---- failure surface: toasts + connection banner (WIN-1, REQ-263) ----------
+ * Until now the only way a failure reached the user was `last_error` drawn into
+ * an *empty* transcript — so a failed send, a rate-limit, or a storage refusal
+ * on a working connection was silent. Two surfaces fix that:
+ *
+ *   toast   — transient, bottom-right of the main pane, auto-expiring, click to
+ *             dismiss. For things that just happened.
+ *   banner  — persistent strip under the header while the connection is down,
+ *             carrying the reason and a Retry now button. For a state.
+ *
+ * The core has no "an error occurred" callback, so we detect errors by watching
+ * the model's sticky `last_error` change between ticks. Known limit: the same
+ * text arriving twice in a row is one toast (we refresh its timer instead of
+ * stacking a duplicate), because there is nothing in the model to tell the two
+ * apart. A monotonic error counter in oc_model would remove that; it is a core
+ * change, deliberately out of this item's scope. */
+#define TOAST_MAX      4
+#define TOAST_MS       6000       /* long enough to read a sentence, short enough not to nag */
+#define TOAST_W        340.0f
+#define TOAST_H        52.0f
+#define TOAST_GAP      10.0f
+#define BANNER_H       34.0f
+static struct {
+    char      text[192];
+    ULONGLONG born;               /* GetTickCount64 at push */
+    int       danger;             /* 1 = failure (red), 0 = neutral notice */
+} g_toast[TOAST_MAX];
+static int  g_n_toast;
+static D2D1_RECT_F g_toast_box[TOAST_MAX];   /* hit-boxes, captured during paint */
+static char g_err_seen[160];                 /* last `last_error` we turned into a toast */
+static D2D1_RECT_F g_retry_btn;              /* banner Retry-now hit-box */
+static int  g_banner_on;                     /* banner drawn this frame (arms the hit-box) */
+
+/* Drop toast `i`, sliding the rest down. */
+static void toast_drop(int i) {
+    for (int k = i; k < g_n_toast - 1; k++) g_toast[k] = g_toast[k + 1];
+    if (g_n_toast > 0) g_n_toast--;
+}
+
+/* Show a toast. A repeat of the text currently showing refreshes its timer
+ * rather than stacking, so a burst of identical failures reads as one event. */
+static void toast_push(const char *text, int danger) {
+    if (!text || !text[0]) return;
+    for (int i = 0; i < g_n_toast; i++) {
+        if (strcmp(g_toast[i].text, text) == 0) { g_toast[i].born = GetTickCount64(); return; }
+    }
+    if (g_n_toast == TOAST_MAX) toast_drop(0);      /* oldest falls off the top */
+    snprintf(g_toast[g_n_toast].text, sizeof g_toast[g_n_toast].text, "%s", text);
+    g_toast[g_n_toast].born   = GetTickCount64();
+    g_toast[g_n_toast].danger = danger;
+    g_n_toast++;
+}
+
+/* Expire elapsed toasts, and turn a *new* model error into one. Called each tick
+ * before painting (the tick repaints unconditionally, so nothing is returned). */
+static void toast_tick(const oc_model *m) {
+    ULONGLONG now = GetTickCount64();
+    for (int i = g_n_toast - 1; i >= 0; i--)
+        if (now - g_toast[i].born >= TOAST_MS) toast_drop(i);
+    if (m && strcmp(m->last_error, g_err_seen) != 0) {
+        snprintf(g_err_seen, sizeof g_err_seen, "%s", m->last_error);
+        /* Divide the two surfaces by what the failure *is*, so the same sentence
+         * never appears twice: a connection problem is a persistent state and
+         * belongs to the banner (which is on screen exactly when !authed), while
+         * anything that goes wrong mid-session — a refused send, a rate limit, a
+         * storage refusal — has no persistent home and needs the toast. */
+        if (g_err_seen[0] && m->authed) toast_push(g_err_seen, 1);
+    }
+}
+
 /* Test/automation hook: when OPENCHIME_TEST_DIR is set, the app polls <dir>/cmd
  * each tick and can render itself to a file — a display-independent way to drive
  * and screenshot the client from WSL/CI without screen-scraping. */
@@ -1257,10 +1327,10 @@ static void draw_reactlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
 
 static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
     if (!m->authed) {
-        const char *msg = !m->connected ? (m->last_error[0] ? m->last_error : "connecting…")
-                                        : "signing in…";
+        /* The reason lives in the banner above (draw_banner) — repeating it here
+         * put the same sentence on screen twice. This is just the empty state. */
         IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, msg, g_ui, reg, OC_COL_MUTED);
+        draw_text(rt, "No conversation to show while you are offline.", g_ui, reg, OC_COL_FAINT);
         IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
         return;
     }
@@ -1352,6 +1422,64 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
     draw_text(rt, status, g_small, rf(x0 + 20, 0, g_members_btn.left - 12, HEADER_H),
               m->authed ? OC_COL_ONLINE : OC_COL_MUTED);
     IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+}
+
+/* The connection banner (REQ-263): a strip under the header whenever we are not
+ * authenticated, naming the state and offering an immediate retry. `last_error`
+ * carries the specific reason when the net thread has one ("could not reach the
+ * server", the reconnect countdown, a changed certificate); without one we fall
+ * back to the phase. Returns its height so the caller can push content down. */
+static float draw_banner(ID2D1RenderTarget *rt, const oc_model *m, float x0, float w) {
+    g_banner_on = 0;
+    if (!m || m->authed) return 0;
+
+    const char *why = m->last_error[0] ? m->last_error
+                    : !m->connected    ? "Connecting…"
+                                       : "Signing in…";
+    /* Amber while a connection is plausibly coming back, red once the core has
+     * told us something concrete went wrong — the distinction the user acts on. */
+    uint32_t accent = m->last_error[0] ? OC_COL_DANGER : OC_COL_AWAY;
+
+    D2D1_RECT_F r = rf(x0, HEADER_H, x0 + w, HEADER_H + BANNER_H);
+    fill(rt, r, OC_COL_SIDEBAR);
+    fill(rt, rf(x0, HEADER_H, x0 + 3, r.bottom), accent);          /* status edge */
+    fill(rt, rf(x0, r.bottom - 1, x0 + w, r.bottom), OC_COL_BORDER);
+
+    g_retry_btn = rf(x0 + w - 104, HEADER_H + 5, x0 + w - 14, r.bottom - 5);
+    fill_round(rt, g_retry_btn, 6.0f, OC_COL_INPUT);
+    stroke_round(rt, g_retry_btn, 6.0f, OC_COL_BORDER, 1.0f);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, "Retry now", g_small, g_retry_btn, OC_COL_TEXT);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+    draw_text(rt, why, g_small, rf(x0 + 16, HEADER_H, g_retry_btn.left - 12, r.bottom), accent);
+    g_banner_on = 1;
+    return BANNER_H;
+}
+
+/* Toasts, bottom-right of the window, newest nearest the composer. Drawn last so
+ * nothing can hide them, and clipped to nothing else — they are the surface of
+ * last resort for telling the user something failed. */
+static void draw_toasts(ID2D1RenderTarget *rt, float W, float H) {
+    /* Clear every hit-box first: in a short window the loop below stops early,
+     * and a box left over from a taller frame would let a click dismiss a toast
+     * that isn't on screen. */
+    for (int i = 0; i < TOAST_MAX; i++) g_toast_box[i] = rf(0, 0, 0, 0);
+    float y = H - COMPOSER_H - TOAST_GAP;
+    for (int i = g_n_toast - 1; i >= 0; i--) {
+        D2D1_RECT_F r = rf(W - TOAST_W - 20, y - TOAST_H, W - 20, y);
+        g_toast_box[i] = r;
+        /* A shadow lifts it off the transcript, which is otherwise the same tone. */
+        fill_round(rt, rf(r.left + 2, r.top + 3, r.right + 2, r.bottom + 3), 10.0f, OC_COL_RAIL);
+        fill_round(rt, r, 10.0f, OC_COL_INPUT);
+        stroke_round(rt, r, 10.0f, g_toast[i].danger ? OC_COL_DANGER : OC_COL_BORDER, 1.0f);
+        fill_round(rt, rf(r.left, r.top + 8, r.left + 3, r.bottom - 8), 2.0f,
+                   g_toast[i].danger ? OC_COL_DANGER : OC_COL_ACCENT);
+        draw_text(rt, g_toast[i].text, g_small,
+                  rf(r.left + 14, r.top + 6, r.right - 12, r.bottom - 6), OC_COL_TEXT);
+        y -= TOAST_H + TOAST_GAP;
+        if (y < HEADER_H + TOAST_H) break;     /* never climb into the header */
+    }
 }
 
 static void draw_members(ID2D1RenderTarget *rt, const oc_model *m, float W, float H) {
@@ -1459,11 +1587,13 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         float main_r = W - members, main_w = main_r - main_x;
         draw_sidebar(rt, m, H);
         draw_header(rt, m, main_x, main_w);
-        draw_transcript(rt, m, rf(main_x, HEADER_H, main_r, H - COMPOSER_H));
+        float bh = draw_banner(rt, m, main_x, main_w);   /* pushes the transcript down */
+        draw_transcript(rt, m, rf(main_x, HEADER_H + bh, main_r, H - COMPOSER_H));
         draw_composer(rt, main_x, main_w, H);
         if (members > 0) draw_members(rt, m, W, H);
         else g_n_memrows = 0;
     } else {
+        g_banner_on = 0;
         D2D1_RECT_F reg = rf(RAIL_W, 0, W, H);
         switch (g_view) {
             case VIEW_ACTIVITY:      draw_stub_view(rt, reg, "Activity", "Activity feed \xE2\x80\x94 coming soon"); break;
@@ -1477,6 +1607,7 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
     }
     draw_more_flyout(rt);   /* floats over the pane when open */
     draw_menu(rt);          /* dropdown menus float on top of everything */
+    draw_toasts(rt, W, H);  /* …and failure notices float above even those */
 }
 
 static void paint(HWND hwnd) {
@@ -1783,6 +1914,17 @@ static int in_rect(D2D1_RECT_F r, int x, int y) {
 /* Returns 1 if the click hit a control/row (so the caller won't start a text
  * selection), 0 if it fell through to the transcript. */
 static int on_click(HWND hwnd, int x, int y) {
+    /* Toasts are painted above everything, so they must be hit-tested above
+     * everything too — otherwise a toast over the composer eats a click it
+     * appears to own. Clicking one dismisses it. */
+    for (int i = g_n_toast - 1; i >= 0; i--)
+        if (pt_in(g_toast_box[i], x, y)) { toast_drop(i); return 1; }
+    /* Banner "Retry now": cut short the net thread's backoff sleep. */
+    if (g_banner_on && pt_in(g_retry_btn, x, y)) {
+        if (g_client) oc_client_reconnect(g_client);
+        toast_push("Reconnecting\xE2\x80\xA6", 0);
+        return 1;
+    }
     /* An open dropdown menu takes clicks first: a row runs its command; a click
      * anywhere else dismisses it. */
     if (g_menu) {
@@ -2670,6 +2812,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == TIMER_TICK && g_client) {
             oc_client_tick(g_client);
             const oc_model *m = oc_client_model(g_client);
+            toast_tick(m);   /* expire old notices; raise one for a new model error */
             if (m->authed && !g_post_auth) {          /* one-shot: identify the bucket + pull state */
                 oc_client_set_client_type(g_client, "gui");   /* our own settings bucket, not tui's */
                 oc_client_list_settings(g_client);

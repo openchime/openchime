@@ -9,7 +9,7 @@ clients, or a `REQ-NNN`.
 parity table is the *feature reachability* tracker. This document is the *work
 list* derived from both — one row per shippable branch.
 
-**Ids.** Items are `WIN-1` … `WIN-54`, numbered once and **stable**: an id is
+**Ids.** Items are `WIN-1` … `WIN-55`, numbered once and **stable**: an id is
 never renumbered or reused, so a commit or branch can cite it. Ordering is *not*
 priority — the **Pri** column is, and it may change. Section membership may also
 change as blockers clear (an item moves from §3 to §1 without changing its id).
@@ -31,7 +31,7 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 
 | # | Item | Pri | Size |
 |---|---|---|---|
-| **WIN-1** | **Global error/toast + connection banner (REQ-263).** *Today:* the only failure surface is `last_error` drawn into an empty transcript — a failed send, `SEND_RATE_LIMITED`, or storage pressure is silent, and reconnect shows no banner or countdown though the model carries the state. *Done:* a transient toast channel plus a persistent connection banner with the retry countdown and a "retry now" affordance. | P0 | M |
+| ~~**WIN-1**~~ | ~~**Global error/toast + connection banner (REQ-263).**~~ **DONE.** A toast stack (bottom-right, 6 s, click to dismiss) for in-session failures, and a connection banner under the header — reason + **Retry now** — while unauthenticated. The two are split by kind so no message appears twice, and the transcript's centred `last_error` is gone. Runtime-verified on Windows: the banner against a dead endpoint, and a live `send rate exceeded` toast driven against a real daemon. **Caveat:** the banner shows the core's `reconnecting in Ns…` text, which the net thread emits *once per backoff* — it is not a ticking countdown. A live one needs the core to expose a retry deadline; filed as WIN-55. | P0 | M |
 | **WIN-2** | **Login dialog error display + remember-me (REQ-263/020).** *Today:* a bad password closes back to a dialog showing nothing; the TUI's *Remember me* has no Win32 equivalent. *Done:* inline error text under the field, focus returned to the password, and a remember-me checkbox gating token persistence. | P0 | S |
 | **WIN-3** | **Search results that navigate (REQ-080).** *Today:* clicking a result switches to the *channel*, not the message; authors render as ids; no term highlight. `oc_search_result` already carries `message_id` + `channel_id`. *Done:* scroll-to-and-flash the matched message, resolved display names, highlighted terms. | P0 | M |
 | **WIN-4** | **Search overlay input + truncation notice.** *Today:* a modal one-line prompt, then a read-only list capped at 128 that silently ignores the `truncated` flag. *Done:* an in-overlay query box that refines without reopening, scrolling, and an honest "more results exist" line. (True paging is WIN-38.) | P1 | M |
@@ -99,6 +99,7 @@ Not startable in this client. Each names what must land first.
 | **WIN-52** | Mark a message or conversation unread | REQ-235 |
 | **WIN-53** | Custom status (emoji + text + expiry) | REQ-241 / REQ-122 |
 | **WIN-54** | Per-channel roster, global notify default, browse-channels directory, group DMs, custom emoji, active-session list | REQ-031 listing op · REQ-134 · REQ-038 · REQ-056 · REQ-072 · REQ-182 has revoke but no list |
+| **WIN-55** | Live reconnect countdown in the banner | Core gap: the net thread pushes `reconnecting in Ns…` once per backoff as sticky text; a ticking countdown needs a retry-deadline field on `oc_model` |
 
 ## §4 Not planned for this client
 
@@ -114,8 +115,8 @@ Not startable in this client. Each names what must land first.
 The first six are [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5's top
 items, re-expressed as ids and re-checked against the tree:
 
-**WIN-1 → WIN-2** (failures stop being silent — smallest surface, largest trust
-gain) → **WIN-3** (search stops lying about where a hit is) → **WIN-5 + WIN-6**
+~~WIN-1~~ (done) **→ WIN-2** (finish the job: the login dialog is the one
+failure surface the banner does not cover) → **WIN-3** (search stops lying about where a hit is) → **WIN-5 + WIN-6**
 (the sidebar becomes navigable) → **WIN-7** (the core chat affordance) →
 **WIN-9** (settings, replacing the "coming soon" box) → **WIN-10**.
 

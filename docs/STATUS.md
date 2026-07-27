@@ -361,7 +361,7 @@ CLIENT_GAP_ANALYSIS.md §5 and the CLIENT.md §8 roadmap, not here.
 | 260 command palette / quick switcher | 🔵 ✅ TUI / ⛔ GUI | TUI has Ctrl+K (ARCH-83); Win32 has only mouse-driven rail menus and a channel-name filter — no keyboard-driven action surface. |
 | 261 in-app settings/preferences hub | ⛔ | Config is file-only (TUI) / absent (Win32); no in-app editor. |
 | 262 theme/appearance selection | 🔵 ⛔ | TUI ships a 256-color theme but no in-app toggle; GUIs honor OS dark mode only. |
-| 263 error/toast + connection-status surface | 🔵 ⛔ | TUI partial (status line); Win32 has no error/toast surface (P0). |
+| 263 error/toast + connection-status surface | 🔵 🟡 | TUI partial (status line). **Win32 built** (WIN-1): a transient toast stack for in-session failures + a connection banner (reason + Retry now); runtime-verified. Remaining there: the login dialog shows no auth error (WIN-2) and the reconnect countdown is static text (WIN-55). |
 | 264 keyboard-shortcut reference | 🔵 ✅ TUI / ⛔ GUI | TUI `?` help overlay; Win32 none. |
 | 265 composer autocomplete + emoji picker | 🔵 ⛔ | TUI has @/#/:emoji autocomplete; Win32 has neither. |
 | 266 other-user profile viewer | ⛔ | Neither client can open a peer's profile. |
