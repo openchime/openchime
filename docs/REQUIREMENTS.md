@@ -13,8 +13,11 @@ emitter (ARCH-85) — alongside a shared C client app-core with a local store, a
 `tuikit`-based TUI (ARCH-74/83) on Linux and Windows from which every engine
 feature on the wire is reachable. Forward scope: the **client** halves of audio
 (REQ-150–152) and push (a shipping mobile client), **screenshare** (REQ-161), the
-OIDC browser flow, the remaining native GUIs, and most of Sections 11–14 — of
-which REQ-251/251a/251b are built and the rest are not. This present-perfect style mirrors the reproduction-grade style of
+OIDC browser flow, the remaining native GUIs, and most of Sections 11–16 — of
+which REQ-251/251a/251b are built and the rest are not. Section 15 collects the
+cross-client UI-parity requirements the competitive analysis
+([CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md)) surfaced, and Section 16
+records the features OpenChime deliberately excludes. This present-perfect style mirrors the reproduction-grade style of
 OpenChime's sibling projects; here it functions as a forward specification, with
 STATUS.md tracking progress against it.
 
@@ -71,6 +74,8 @@ the requirement says so explicitly rather than implying one.
 12. [Message Organization and Retrieval](#12-message-organization-and-retrieval)
 13. [User Profiles](#13-user-profiles)
 14. [Compliance and Data Governance](#14-compliance-and-data-governance)
+15. [Client Experience and UI Shell](#15-client-experience-and-ui-shell)
+16. [Explicitly Out of Scope](#16-explicitly-out-of-scope)
 
 ---
 
@@ -158,6 +163,25 @@ the requirement says so explicitly rather than implying one.
   the daemon trusts; self-hosted deployments have reached it through a relay so
   their users get social login without registering provider apps, and the client
   (not the central service) has carried the token to the daemon (ARCH-56).
+- **REQ-026.** An owner/admin has been able to create a **shareable invite link**
+  — a multi-use, expirable invite URL — in addition to the single-use per-user
+  invite token (REQ-024/033), and has managed outstanding invites: listing
+  pending ones, setting an expiry and a target role, and revoking one before it
+  is redeemed. The link has resolved to the same account-creation path as a token
+  (ARCH-59), so it has granted no capability a token does not. **[needs ARCH
+  decision — invite-link token model (multi-use vs. per-redeem), expiry, and
+  revocation storage.]**
+- **REQ-027.** The system's only single-sign-on has been **OIDC brokered through
+  the project's central service** (REQ-020, ARCH-55/56); it has supported neither
+  **SAML 2.0** nor a **bring-your-own-IdP** mode pointing the daemon directly at
+  an organization's identity provider. This is a deliberate exclusion, not a
+  deferred feature: ARCH-55 routes all OIDC through central to keep the daemon
+  free of JWKS fetching and multi-provider handling, and SAML has never been
+  built, designed, or scheduled — so an organization whose procurement mandates
+  SAML is unserved. The ARCH-55-consistent path, were it ever wanted, is central
+  terminating SAML and re-issuing the same ES256 JWT (a control-plane concern in
+  `openchime-saas`, not a daemon one). See
+  [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §8.
 
 ### 1.3 Authorization and Roles
 
@@ -192,6 +216,24 @@ the requirement says so explicitly rather than implying one.
   been restorable. Archiving (reversible) is distinct from deletion, which is not
   offered for channels holding history. **[needs ARCH decision — archive flag +
   read-only enforcement.]**
+- **REQ-036.** A channel has been **renamable** by an owner/admin (or the
+  channel's creator per a deployment setting), the rename applying everywhere the
+  channel is shown without breaking membership, history, or permalinks (REQ-232).
+  The name is distinct from the topic (REQ-034). **[needs ARCH decision — rename
+  authority + whether a name-history is kept so old permalinks still resolve.]**
+- **REQ-037.** A deployment has been able to admit **guest accounts** — users
+  restricted to one channel (single-channel guest) or an explicit set
+  (multi-channel guest) rather than the whole tenant — created and scoped by an
+  owner/admin. A guest has been an ordinary user (REQ-030) whose channel
+  membership (REQ-031) is the whole of their reach: they have seen no channel they
+  were not added to and have not browsed the directory (REQ-038). **[needs ARCH
+  decision — guest as a distinct role vs. a membership-scoped flag, and its
+  interaction with the role model (REQ-030).]**
+- **REQ-038.** A user has been able to **browse the tenant's public channels** —
+  a searchable directory of joinable channels they are not yet a member of — and
+  join one directly, so discovering a channel has not required an invitation.
+  Private channels (REQ-031) have never appeared in the directory. **[needs ARCH
+  decision — directory listing query + join authorization for public channels.]**
 
 ### 1.4 Multi-Tenant Data Isolation
 
@@ -233,6 +275,21 @@ the requirement says so explicitly rather than implying one.
   models; what has varied between them is only which non-message functions a
   deployment has delegated.
 
+### 1.5 Workspace Administration
+
+- **REQ-042.** An owner/admin has been able to set **workspace-level settings and
+  branding** — the workspace display name and icon, a set of default channels new
+  members auto-join, and the tenant's join/invite policy — stored on the tenant
+  and shown wherever the workspace is presented (the switcher, REQ-013; the
+  client header). **[needs ARCH decision — workspace-settings storage + which
+  settings are owner-only vs. admin-settable.]**
+- **REQ-043.** An owner/admin has had an **administration console** distinct from
+  the ordinary chat surface: a sortable member table with bulk actions (role
+  change, remove — REQ-030/033), a channel-management view (archive/rename/delete
+  — REQ-035/036), and workspace usage figures building on the storage and audit
+  surfaces already present (REQ-214/251). **[needs ARCH decision — admin-console
+  surface + which operations are bulk-capable.]**
+
 ---
 
 ## 2. Messaging
@@ -267,6 +324,12 @@ the requirement says so explicitly rather than implying one.
   govern membership on. It has ridden the same message model as a 1:1 or self-DM
   (REQ-050/055), extended to N participants. **[needs ARCH decision — group-DM
   identity/membership model vs. reusing a private channel.]**
+- **REQ-057.** A user has been able to **forward (share) a message** to another
+  channel or DM they can post to, carrying a reference to the original — its
+  author and a quoted excerpt — rather than copying the text opaquely, so a
+  forwarded message has stayed attributable to its source. **[needs ARCH decision
+  — forward encoding (quote reference vs. embedded copy) and whether the
+  original's attachments travel with it.]**
 
 ### 2.2 Threads
 
@@ -278,6 +341,13 @@ the requirement says so explicitly rather than implying one.
   (message author plus prior repliers) according to their per-channel
   notification setting (REQ-130), independent of whether they were
   `@mentioned`.
+- **REQ-062.** A user has been able to **follow or unfollow a thread**
+  independently of having replied to it, and has had a **followed-threads view**
+  aggregating every thread they participate in or follow across channels, with
+  unread reply counts — so keeping up with threads has not required revisiting
+  each parent channel. A reply has optionally also been **posted to the channel's
+  main scroll** rather than only the thread. **[needs ARCH decision —
+  thread-follow storage + the aggregated cross-channel thread query.]**
 
 ### 2.3 Reactions
 
@@ -295,6 +365,11 @@ the requirement says so explicitly rather than implying one.
   tenant custom-emoji asset; a text-only client (the TUI) shows the shortcode
   rather than the image. **[needs ARCH decision — custom-emoji asset storage
   (object store, ARCH-17) + shortcode namespace.]**
+- **REQ-073.** A user has had **one-click quick reactions** — a small,
+  per-user-configurable set of frequently-used emoji offered inline on a message
+  as a shortcut over the full picker (REQ-070/265). The set has been a per-user
+  preference synced across their devices. **[needs ARCH decision — quick-reaction
+  set storage (per-user) + the default set.]**
 
 ### 2.4 Search
 
@@ -397,6 +472,13 @@ the requirement says so explicitly rather than implying one.
   typing never leaks to non-members; the server keeps no expiry timer. Resolved:
   the indicator expires **client-side after ~6 seconds**, refreshed by each new
   `TYPING` signal — no "stopped typing" frame is sent.
+- **REQ-122.** A user's **do-not-disturb, out-of-office, or custom status**
+  (REQ-131/241) has been surfaced to other users alongside their presence
+  (REQ-120) — a distinct indicator on the presence dot plus a status line in the
+  roster — so a colleague has known someone was unavailable before messaging
+  them. This has been display only: it has not changed delivery, which DND
+  governs separately (REQ-131). **[needs ARCH decision — how DND/OOO/custom-status
+  is projected into the `PRESENCE_UPDATE` surface (ARCH-67).]**
 
 ---
 
@@ -429,6 +511,40 @@ the requirement says so explicitly rather than implying one.
   An operator unwilling to depend on the gateway and unwilling to lose push has
   had one remaining option: build and sign their own mobile clients under their
   own developer accounts, which is outside what this project distributes.
+- **REQ-134.** Each user has had a **global (workspace-default) notification
+  level** — all / mentions / none — applying to every channel lacking an explicit
+  per-channel override (REQ-130), so a user has not had to set each channel
+  individually. Where a per-channel level was set, it has won. **[needs ARCH
+  decision — default-level storage + precedence over REQ-130.]**
+- **REQ-135.** A user has been able to define **keyword (highlight-word)
+  notifications** — terms that notify them regardless of a channel's level
+  (REQ-130/134) — and to designate **priority people** whose messages always
+  notify. Both have driven notification like a mention (REQ-221). **[needs ARCH
+  decision — keyword/priority storage + the match→notify decision, adjacent to
+  ARCH-72/REQ-221.]**
+- **REQ-136.** A user has been able to configure a **notification schedule /
+  quiet hours** richer than the single daily DND window (REQ-131) — for example
+  different windows per weekday — suppressing push during scheduled quiet periods
+  without altering in-app unread state. **[needs ARCH decision — schedule model
+  (per-day windows) extending the ARCH-72 DND column.]**
+- **REQ-137.** A user has been able to **mute a channel or DM**: muting has
+  suppressed its notifications **and de-emphasized it in the sidebar** (dimmed,
+  excluded from the unread badge) without the user leaving it — distinct from
+  setting its level to `none` (REQ-130), which governs notification only. **[needs
+  ARCH decision — mute storage (per-user, per-conversation) + its interaction with
+  unread accounting.]**
+- **REQ-138.** A client has surfaced **OS-native desktop notifications** (a system
+  toast) for messages due under the user's notification settings (REQ-130/134),
+  with a content-preview toggle, plus optional **notification sounds and unread
+  badges** on the app icon. These are per-client rendering of the server's notify
+  decision (ARCH-72), not a new server surface. **[needs ARCH decision —
+  per-platform notification API mapping + preview/privacy toggle.]**
+- **REQ-139.** A client has offered an **activity feed / notification inbox** — an
+  aggregated, filterable view of @mentions (REQ-221), reactions to the user's
+  messages (REQ-070), and thread replies (REQ-060/061) across all channels — so a
+  user has caught up on what involved them without scanning every channel. **[needs
+  ARCH decision — a client-side fold over existing events vs. a server-maintained
+  per-user activity list.]**
 
 ---
 
@@ -461,6 +577,18 @@ the requirement says so explicitly rather than implying one.
   there is no signed-URL scheme, TTL, or object-store ACL. Proxying (not
   presigned URLs) is forced by TOFU pinning (ARCH-10, one trusted cert, no CA
   bundle) and the island model (ARCH-4/26, the tenant's object store stays private).
+- **REQ-142.** A graphical client has **rendered image attachments inline** — a
+  thumbnail in the transcript, expandable to a preview — rather than showing only
+  a filename line, for the common image types. This is a graphical-frontend
+  capability; the **text-only TUI is exempt** (ARCH-75, no graphics), continuing
+  to show the attachment line. Non-image types have shown a typed placeholder.
+  **[needs ARCH decision — inline-render type set + thumbnail generation/caching
+  (client vs. server).]**
+- **REQ-143.** A user has been able to browse a channel's **files** — a view
+  listing the attachments shared in a channel (and, per-user, files they shared or
+  that were shared with them) with filter by type — building on the attachment
+  metadata already stored (REQ-140, SCHEMA.md migration 0009). **[needs ARCH
+  decision — files-listing query + scope (per-channel vs. per-user).]**
 
 ### 6.2 Audio Conferencing
 
@@ -565,6 +693,21 @@ the requirement says so explicitly rather than implying one.
   stand-alone deployment has installed integrations by direct configuration
   instead of browsing a curated catalog. **[needs ARCH decision — directory
   hosting + per-tenant install/permission model.]**
+- **REQ-176.** The system has offered a **third-party API / SDK** — a documented
+  programmatic surface for external tools to read and post on a user's or bot's
+  (REQ-172) behalf — as the general-purpose complement to the single-purpose
+  incoming/outgoing webhooks (REQ-170/173). Because the client-daemon wire is a
+  custom binary protocol (ARCH-6), an external API has been an additional surface
+  (likely HTTP over the ALPN-demuxed listener, ARCH-32/54), not the wire itself.
+  **[needs ARCH decision — API transport + shape (REST vs. exposing the binary
+  protocol), auth, and rate limiting.]**
+- **REQ-177.** A channel has been able to receive posts by **email-to-channel
+  ingestion** — a per-channel address that turns an inbound email into a channel
+  message — the inbound-email complement to incoming webhooks (REQ-170). Delivery
+  has required inbound email reception, a deployment capability separate from the
+  daemon's request handling (cf. the webhook CA-cert note, REQ-171). **[needs ARCH
+  decision — inbound-mail placement (out-of-daemon helper), address→channel
+  mapping, and spam/authorization controls.]**
 
 ---
 
@@ -592,6 +735,12 @@ the requirement says so explicitly rather than implying one.
   The one exception has been the incoming-webhooks endpoint (REQ-171), which
   uses a real CA-signed certificate because its clients are uncontrolled
   third parties.
+- **REQ-184.** In local mode (REQ-024) the daemon has supported optional
+  **multi-factor authentication** — a second factor (TOTP) enrolled per account
+  and required after the password check (ARCH-59) — so a compromised password
+  alone has not granted a session. OIDC mode (REQ-020) has inherited whatever MFA
+  the provider enforced, so this requirement targets local accounts. **[needs ARCH
+  decision — second-factor type (TOTP), enrollment/recovery flow, and storage.]**
 
 ### 8.2 Abuse Prevention and Rate Limiting
 
@@ -605,6 +754,13 @@ the requirement says so explicitly rather than implying one.
   `AUTH_RATE_LIMITED` (ARCH-59). (OIDC-mode credential checking is a signature
   verification against a pinned key, not a guessable secret, so the local-auth
   path is the meaningful target.)
+- **REQ-192.** A deployment has optionally restricted access by **source
+  network** — an IP allowlist / CIDR restriction enforced at connection accept,
+  refusing a connection from outside the permitted ranges before authentication —
+  for organizations requiring network-level access control. The default has been
+  unrestricted. **[needs ARCH decision — allowlist config + accept-time
+  enforcement, adjacent to the per-IP connection throttle already in the accept
+  loop.]**
 
 ---
 
@@ -751,6 +907,15 @@ None are yet backed by an architecture decision.*
   delivered through the ordinary path (REQ-090), and cancelable before it fired.
   **[needs ARCH decision — where a scheduled message is held (a server-side queue)
   and its interaction with idempotency (REQ-093).]**
+- **REQ-225.** A user has been able to post a **poll** — a question with options
+  other members vote on, results tallied and shown live — as a first-class message
+  type rather than via an external app. **[needs ARCH decision — poll storage
+  (message-linked), vote model (one-per-user, changeable), and result delivery.]**
+- **REQ-226.** A user has been able to share a **snippet** — a named, multi-line
+  block of text or code with optional syntax highlighting — as a first-class
+  object distinct from an inline fenced code block (REQ-220), so a long paste has
+  not flooded the transcript. **[needs ARCH decision — snippet storage (a
+  message-linked text blob vs. an attachment, ARCH-70) + rendering.]**
 
 ---
 
@@ -779,6 +944,29 @@ architecture decision.*
   organize their sidebar into **custom sections** — per-user view state that has
   synced across their devices without affecting other users. **[needs ARCH
   decision — per-user sidebar state storage: client-local vs. synced.]**
+- **REQ-235.** A user has been able to **mark a message (or a whole conversation)
+  as unread**, moving their read marker back so the conversation re-surfaces as
+  unread for later attention, without altering anyone else's state. This has been
+  a per-user adjustment of the read cursor the daemon already maintains
+  (REQ-090/095, `CLIENT_ACK`). **[needs ARCH decision — mark-unread as a client-set
+  cursor position vs. a distinct flag.]**
+- **REQ-236.** A client has shown a **new-message divider** marking where unread
+  messages begin in a conversation, and offered **jump-to-unread** (and moving
+  between unread conversations by keyboard), so a returning user has found the
+  first thing they had not seen without scrolling. This has been derived
+  client-side from the per-user read cursor (REQ-090/235); no server change is
+  required.
+- **REQ-237.** A client has offered **aggregate unread views** — an "all unreads"
+  surface showing unread messages across every conversation in one place, and an
+  **unreads-only** sidebar mode hiding read conversations — so triaging a backlog
+  has not meant opening each channel. **[needs ARCH decision — a client-side fold
+  over per-channel unread state (REQ-014) vs. a server-side unread summary for
+  efficiency at scale.]**
+- **REQ-238.** A user has been able to **mark all as read** — clearing unread
+  state across the workspace, or catching up channel-by-channel — advancing every
+  read cursor to the latest message in one action (REQ-090/235). **[needs ARCH
+  decision — a single bulk cursor-advance operation vs. per-channel
+  `CLIENT_ACK`s.]**
 
 ---
 
@@ -848,3 +1036,102 @@ None are yet backed by an architecture decision.*
   ARCH-56), not the daemon — available to self-hosted federated and hosted
   deployments, with no local-mode or stand-alone applicability. **[needs ARCH decision — SCIM endpoint placement
   (central service).]**
+- **REQ-254.** A tenant has been able to **import** message and channel history
+  from another system (e.g. a Slack export, or a CSV of direct messages) and to
+  **migrate** an existing workspace's data in, so adopting OpenChime has not meant
+  abandoning history. Import has been an owner/admin operation that maps foreign
+  users onto tenant accounts (REQ-030), distinct from the compliance **export** of
+  REQ-252. **[needs ARCH decision — import format(s), user-identity mapping, and
+  idempotent re-runs.]**
+
+---
+
+## 15. Client Experience and UI Shell
+
+*Cross-client UX-parity requirements the competitive analysis
+([CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md)) surfaced — capabilities every
+graphical client is expected to have, largely independent of the daemon. "The
+client" here means each native frontend (ARCH-74); the TUI already satisfies most
+of these and is the reference (CLIENT.md §3). None are yet backed by an
+architecture decision.*
+
+- **REQ-260.** Every client has offered a **command palette / quick switcher** —
+  a keyboard-driven surface (the TUI's Ctrl+K, ARCH-83) to jump to any channel/DM
+  or run any action by fuzzy search — so navigation and actions have not required
+  hunting through menus. **[needs ARCH decision — per-GUI command-palette surface;
+  the action catalog already exists in the TUI.]**
+- **REQ-261.** Every client has exposed an **in-app Settings/Preferences hub** —
+  notifications, appearance, time format, and sidebar behavior editable in the app
+  rather than only via a config file — writing through the client's existing
+  settings mechanism (the daemon's per-`(user, client_type)` bucket plus the local
+  config file, CLIENT.md §3). **[needs ARCH decision — per-GUI preferences surface
+  over the existing settings layer.]**
+- **REQ-262.** Every client has offered **theme/appearance selection** — at least
+  light, dark, and follow-system — applied in-app. The TUI ships a 256-color theme
+  (ARCH-83); the GUIs honor the OS dark-mode signal (ARCH-80). **[needs ARCH
+  decision — theme model + whether the preference is client-local or synced.]**
+- **REQ-263.** Every client has presented a **transient error/toast and
+  connection-status surface** — a visible, non-blocking channel for failures
+  (failed send, rate-limit REQ-190, bad login, storage pressure REQ-214) and for
+  connection state (reconnecting with a countdown, REQ-100) — so a failure or a
+  dropped connection has never been silent. **[needs ARCH decision — per-GUI
+  toast/status surface; the model already carries `last_error` and connection
+  state (CLIENT.md §6).]**
+- **REQ-264.** Every client has provided a **keyboard-shortcut reference** — a
+  discoverable list of its shortcuts (the TUI's `?` help overlay, ARCH-83).
+  **[needs ARCH decision — per-GUI shortcut-reference surface.]**
+- **REQ-265.** A client's composer has offered **input aids** — inline
+  autocomplete for `@user`, `#channel`, and `:emoji:` (REQ-221/072) and a full,
+  searchable **emoji picker** (beyond a hardcoded set) — so mentioning, linking a
+  channel, or reacting has not required typing exact names. **[needs ARCH decision
+  — per-GUI autocomplete/picker surface over the model's roster/channel/emoji
+  data.]**
+- **REQ-266.** A client has let a user **view another user's profile** — opening a
+  profile pane from a name or avatar anywhere the user appears — showing the fields
+  of REQ-240 (display name, avatar, title, timezone, status). **[needs ARCH
+  decision — per-GUI profile-viewer surface over the roster/profile data.]**
+- **REQ-267.** A client's **sidebar** has organized conversations to parity with
+  the reference clients — a dedicated **direct-message section**, collapsible
+  Public/Private/DM groups, per-user custom sections and starred/favorite
+  conversations (whose storage is REQ-234), and a **sidebar search/filter** —
+  rather than a flat, unsearchable list. **[needs ARCH decision — per-GUI sidebar
+  rendering; the per-user section/star state is REQ-234.]**
+- **REQ-268.** A client has provided **first-run onboarding** — a signup /
+  first-owner setup UI that redeems the one-time owner setup token or an invite
+  (REQ-024/026) into a working account — so bringing up a new tenant, or joining
+  one, has not required a command line. **[needs ARCH decision — per-GUI
+  onboarding flow over the existing bootstrap/invite path.]**
+
+---
+
+## 16. Explicitly Out of Scope
+
+*Features present in the reference products (Slack, Pumble) that OpenChime
+deliberately does not implement, recorded so each omission is on the record rather
+than merely absent — the same intent as REQ-160's camera-video exclusion. Each may
+be revisited, but none is planned; several are reachable by a third party through
+the app platform (REQ-172) or webhooks (REQ-170/173) without being a first-party
+feature.*
+
+- **REQ-270.** **GIF/Giphy and sticker pickers** have not been a first-party
+  feature. In the reference products these are app-provided; an integration
+  (REQ-172) could add one. Out of scope for the core client.
+- **REQ-271.** **Canvas / collaborative documents** (in-workspace rich documents
+  with embedded media and comments) have not been supported — a document-editing
+  product adjacent to chat, out of scope for a messaging system.
+- **REQ-272.** **Lists / tables / project boards** (structured task/records
+  surfaces) have not been supported — project-management territory (the space
+  Pumble's sibling product Plaky occupies), out of scope.
+- **REQ-273.** **Clips / asynchronous voice and video messages** (recording a
+  short audio or video clip posted into a conversation) have not been supported.
+  Live audio is REQ-150–152 and screenshare REQ-161; *recorded* async media is a
+  separate capability and is excluded, consistent with the camera-video exclusion
+  (REQ-160).
+- **REQ-274.** **Slack-Connect-style cross-organization shared channels and
+  external DMs** have not been supported. Cross-tenant messaging is precluded by
+  the island model (ARCH-4/REQ-040); federation between tenants is a separate
+  deployment concern (ARCH-76), not an in-product shared-channel feature.
+- **REQ-275.** A **first-party bot/assistant and an MCP (Model Context Protocol)
+  server surface** have not been provided beyond the third-party app platform
+  (REQ-172). OpenChime ships no built-in assistant and exposes no MCP server; such
+  a thing could be built as an installed app, but is not a core feature.

@@ -420,13 +420,31 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
   history, offline outbox, workspace book), **multiple workspaces** (REQ-012–015),
   DNS workspace resolution (REQ-010/011), the local **Sign in** dialog, and the
   **Windows TUI** (ARCH-81). See §5–§6.
-- **Next:** the **Windows GUI** depth backlog (ARCH-82 — 26 of 27 engine features
-  surfaced; the multi-workspace switcher plus the P0 polish gaps in
-  [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5); **auth completeness** —
-  the OIDC browser flow + PKCE + loopback courier, which is the one remaining
-  piece of REQ-020 and is what makes SSO usable at all; and the **audio client**
-  (Opus encode/decode + UDP to the sidecar — the deferred half of REQ-150/151,
-  [AUDIO.md](./AUDIO.md)).
-- **Then:** the remaining native GUIs (GTK, AppKit), a web DOM UI, mobile — and,
-  gated behind the audio client, **screenshare** (REQ-161,
-  [VIDEO.md](./VIDEO.md)).
+- **Next — Windows GUI depth (P0).** The Win32 GUI reaches 26 of 27 engine
+  features (ARCH-82) but many surfaces are thin; the prioritized gaps are
+  [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5, now each carrying a REQ:
+  the global error/toast + connection-status surface (**REQ-263**), search that
+  navigates to the matched message (REQ-080), the sidebar overhaul — DM section +
+  grouping + search (**REQ-267**), composer autocomplete + emoji picker
+  (**REQ-265**), the in-app settings/preferences hub (**REQ-261**), the
+  other-user profile viewer (**REQ-266**), a command palette (**REQ-260**), and
+  the multi-workspace switcher (REQ-012–015). Inline image rendering (**REQ-142**)
+  is a D2D-native win once those land.
+- **Next — auth completeness.** The **OIDC browser flow + PKCE + loopback
+  courier** — the one remaining piece of REQ-020 and what makes SSO usable at all
+  (there is no SAML by design, **REQ-027**); plus first-run onboarding
+  (**REQ-268**).
+- **Next — audio client.** Opus encode/decode + UDP to the sidecar — the deferred
+  half of REQ-150/151 ([AUDIO.md](./AUDIO.md)).
+- **Then — broader competitor parity (non-video).** The rest of the parity
+  backlog now specced in REQUIREMENTS.md §§1–16 and tracked in
+  [STATUS.md](./STATUS.md): message actions (forward **REQ-057**, mark-unread
+  **REQ-235**, unread nav **REQ-236**, mute **REQ-137**), notification depth
+  (global level **REQ-134**, keywords **REQ-135**, OS toast **REQ-138**, activity
+  feed **REQ-139**), channel management (rename **REQ-036**, browse/join
+  **REQ-038**, files browser **REQ-143**), workspace admin (**REQ-042/043**),
+  themes (**REQ-262**), polls (**REQ-225**), and the rest. Priorities are
+  CLIENT_GAP_ANALYSIS.md §5.
+- **Then — remaining platforms + screenshare.** The other native GUIs (GTK,
+  AppKit), a web DOM UI, and mobile — and, gated behind the audio client,
+  **screenshare** (REQ-161, [VIDEO.md](./VIDEO.md)).

@@ -164,7 +164,7 @@ Legend: ✅ done · 🔨 in progress · ⛔ not started.
 | Manual reconnect | `reconnect` | ✅ | App menu → Reconnect now. |
 | Multiple workspaces | one `oc_client` per ws + switcher | ⛔ | Rail workspace switcher (TUI holds N clients) — the one remaining feature. |
 
-> **Depth caveat:** this table tracks whether each engine feature is *reachable*; it does **not** measure how developed each screen/dialog is. For the full three-way (Slack vs TUI vs Win32) surface-depth gap analysis — including underdeveloped screens and a recommended build order — see [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md).
+> **Depth caveat:** this table tracks whether each engine feature is *reachable*; it does **not** measure how developed each screen/dialog is. For the full four-way (Slack vs Pumble vs TUI vs Win32) surface-depth gap analysis — including underdeveloped screens and a recommended build order — see [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md).
 
 **Feature parity is essentially complete** — 26 of 27 features surfaced; only the
 multi-workspace switcher (an architectural change: N `oc_client`s + a rail
@@ -234,54 +234,32 @@ harness itself proved to be the limit; see [BENCHMARK.md](./BENCHMARK.md).
 
 ## Summary
 
-The **daemon is a feature-complete v1 chat core**: two-mode auth with
-daemon-owned sessions and revocation, roles + full tenant administration,
-public/private channels, messaging with edit/delete, reactions, threads, and
-full-text search — all reachable over the wire and tested end-to-end.
+The **daemon is a feature-complete v1 chat core**, all reachable over the wire
+and tested end-to-end: two-mode auth with daemon-owned sessions and revocation,
+roles + full tenant administration, public/private channels and DMs, messaging
+with edit/delete, reactions, threads, full-text search, presence/typing,
+notification settings (level + DND), attachments (proxied chunked transfer + both
+blob backends), incoming webhooks, the storage-maintenance tiers, the audit log,
+federated enrollment, and the mobile-push emitter (ARCH-85). Server-relayed audio
+(REQ-150–152) is built server-side (signaling + forked UDP relay sidecar). The
+**server-robustness backlog is cleared** (see Resolved above) and the capacity
+profile (REQ-210/211) is benchmarked ([BENCHMARK.md](./BENCHMARK.md)). What remains
+on the daemon is not hardening but the follow-ups noted per-REQ above (e.g. the
+webhook CA cert REQ-171, the MENTIONS push level pending REQ-221).
 
-The **client** is a shared, frontend-agnostic **C app-core** (ARCH-74) — network
-thread, view-model, and reducers, driven headlessly against the in-process daemon
-in CI — with a **termbox2 + utf8proc TUI** (ARCH-75) as the first frontend. The
-TUI does live messaging with history backfill, display names, unread, reactions,
-edit/delete, typing, threads, search, channel/DM management, presence + roster,
-who-reacted, notification prefs + DND, admin (roles/invite/remove), webhook
-management, attachments, and logout — all reached through context menus and the
-command palette (Ctrl+K), and **every engine feature on the wire is now reachable
-from the TUI**. The app-core also has a
-**local SQLite store** (`client/core/store.c`) that makes it durable across
-restarts: silent session-token reconnect (auto after a drop, and after a
-relaunch), a persisted TOFU pin, cached history that shows instantly + seeds the
-backfill cursor, and an **offline outbox** that resends messages composed while
-disconnected — i.e. the reconnect/offline requirements (REQ-100/101/102) are now
-met client-side. The remaining client work is the later native GUIs and the
-fuller auth UX (OIDC, DNS resolution). **Mobile push** (REQ-132/133) is now built
-on the daemon side (ARCH-85): a device-token registry + an off-hot-path emitter that
-signs and POSTs contentless notifications to the control-plane gateway; the remaining
-push work is the shipping mobile clients + the MENTIONS level (needs REQ-221).
-**Server-relayed audio** (REQ-150–152) is now
-built end-to-end — call signaling + a forked UDP relay sidecar — with only the
-client-side Opus/UDP left (Phase-2 client work). Presence/typing (REQ-120/121) is
-built and tested end-to-end, as are **notification settings** (REQ-130/131:
-per-channel level + DND, server-authoritative and device-synced; the push
-delivery they gate is now built — the daemon emitter, ARCH-85). **Attachments** (REQ-140/141) are
-built end-to-end — proxied chunked transfer, access control, message-linking, and
-both blob backends — and now **surfaced in the TUI** (upload/download via menus
-and the command palette), so there is no attachment work left on either side.
+The **client** is a shared, frontend-agnostic **C app-core** (ARCH-74) with a
+**termbox2 + utf8proc TUI** (ARCH-75) as the reference frontend — **every engine
+feature on the wire is reachable from it** — plus a **local SQLite store** giving
+silent session-token reconnect, a persisted TOFU pin, cached history, and an
+offline outbox (REQ-100/101/102 met client-side). The remaining client work is
+scope, not hardening: the incomplete **Windows GUI** depth pass, the later native
+GUIs (GTK/AppKit) + web/mobile, the **OIDC browser flow**, the **audio client**
+(Opus/UDP), and **screenshare** (REQ-161).
 
-The **server-robustness backlog is cleared** (see Resolved above): SEND-flood
-rate limiting, the per-connection output-buffer cap, idempotency-map pruning,
-reads decoupled onto a read-only connection, server-side delivery accounting, a
-per-IP connection throttle, TLS-identity persistence across restore, truncation
-signals, the first-owner setup token, and a codec fuzzer + concurrency load
-test. What remains is **not** hardening but **scope**: a real client (and its mobile
-push registration); the daemon's server surface — including the push emitter — is built.
-The capacity profile
-(REQ-210/211) is now benchmarked — see [BENCHMARK.md](./BENCHMARK.md)
-(`Scripts/bench.sh`). Incoming webhooks
-(REQ-170) are built end-to-end
-(ARCH-71), pending only the CA-signed cert (REQ-171). Attachments (REQ-140/141)
-are built end-to-end — proxied chunked transfer, access control, and message-linking
-— including thread-reply attachments and both the local-FS and S3/MinIO blob backends.
+The forward feature scope is the Sections 11–14 table and the **Non-video
+competitor-parity backlog** table below (REQ-026…275), reconciled
+against [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md); the prioritized client
+build order lives in that document's §5 and the [CLIENT.md](./CLIENT.md) §8 roadmap.
 
 ### 11–14. Rich Text, Retrieval, Profiles, Compliance
 
@@ -297,3 +275,63 @@ are built end-to-end — proxied chunked transfer, access control, and message-l
 | 251b per-family cap | ✅ | **The cap is applied per family**, so a flood of attacker-controlled `auth.failed` entries cannot age out administrative history — without this the audit log becomes an evidence-shredder. Rate-limited attempts are dropped silently rather than audited, so a throttled spray produces no rows at all. Regression-tested with a 200-entry security flood against a surviving admin entry. |
 | 252 legal hold + export | ⛔ | Forward scope; `[needs ARCH decision]`. |
 | 253 SCIM provisioning | ⛔ | Federated function (ARCH-76); central-service concern. |
+
+---
+
+## Non-video competitor-parity backlog (REQ-026…275)
+
+The non-video features Slack/Pumble ship that OpenChime lacked a requirement for
+are now specced (REQUIREMENTS.md §§1–16, added from
+[CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md)). All are **forward scope** —
+none is built beyond what its cross-referenced note says — and most still need an
+ARCH decision. Tracked here so the target-state contract and the reality stay
+reconciled. The **prioritized build order** (which of these to do first) lives in
+CLIENT_GAP_ANALYSIS.md §5 and the CLIENT.md §8 roadmap, not here.
+
+| REQ | Status | Notes |
+|-----|--------|-------|
+| 026 shareable invite links + invite mgmt | ⛔ | Daemon has single-use invite tokens (REQ-024/033); link/expiry/revoke/pending-list unbuilt. |
+| 027 SSO scope (OIDC-via-central only; no SAML) | ➖ | Design exclusion (ARCH-55); recorded, not code. The daemon already only verifies the central ES256 JWT. |
+| 036 rename channel | ⛔ | No rename op; channels have a fixed name today. |
+| 037 guest accounts | ⛔ | Role model is owner/admin/member (REQ-030); no channel-scoped guest. |
+| 038 browse/join public-channel directory | ⛔ | No directory listing; joining needs a known channel. |
+| 042 workspace settings + branding | ⛔ | No tenant name/icon/default-channels/join-policy surface. |
+| 043 admin console (member table, bulk, analytics) | ⛔ | Admin ops exist per-action (roles/invite/remove/storage/audit); no console. |
+| 057 forward / quote-share a message | ⛔ | Not on the wire. |
+| 062 followed-threads view + follow/unfollow | ⛔ | Threads work (REQ-060); no follow-state or aggregated view. |
+| 073 configurable quick reactions | 🔵 ⛔ | Reactions built (REQ-070); quick-set is a per-user client pref, unbuilt. |
+| 122 surface DND/OOO/custom-status in presence | ⛔ | Presence built (REQ-120); status not projected into it. |
+| 134 global (default) notification level | ⛔ | Per-channel level built (REQ-130); no workspace default. |
+| 135 keyword / priority-people alerts | ⛔ | Depends on the mention→notify path (REQ-221, unbuilt). |
+| 136 notification schedule / quiet hours | ⛔ | Single daily DND window built (REQ-131); richer schedule unbuilt. |
+| 137 mute channel/DM (suppress + de-emphasize) | ⛔ | Distinct from level=none; sidebar de-emphasis + unread exclusion unbuilt. |
+| 138 OS toast + sounds + badges | 🔵 ⛔ | Per-client rendering of the notify decision (ARCH-72); no client does OS toast yet. |
+| 139 activity feed / notification inbox | ⛔ | No aggregated mentions/reactions/replies view in any client. |
+| 142 inline image/thumbnail rendering | 🔵 ⛔ | Graphical-frontend only (TUI exempt, ARCH-75); Win32 shows attachment lines only. |
+| 143 files browser (channel Files tab) | ⛔ | Attachment metadata exists (migration 0009); no files-listing view. |
+| 176 third-party API / SDK | ⛔ | No public programmatic surface; wire is the custom binary protocol (ARCH-6). |
+| 177 email-to-channel ingestion | ⛔ | Needs out-of-daemon inbound-mail; unbuilt. |
+| 184 MFA / 2FA (local mode) | ⛔ | Local auth is password-only (ARCH-59); no second factor. |
+| 192 IP allowlist / access restriction | ⛔ | Per-IP throttle exists in the accept loop; no allowlist. |
+| 225 native polls | ⛔ | Not a message type today. |
+| 226 code/text snippets | ⛔ | Fenced code blocks pending (REQ-220); no first-class snippet object. |
+| 235 mark message/conversation unread | ⛔ | Read cursor exists (REQ-090/095); no mark-unback op. |
+| 236 new-message divider + jump-to-unread | 🔵 ⛔ | Client-side over the read cursor; TUI has unread markers, no divider/jump. |
+| 237 all-unreads / unreads-only views | ⛔ | Per-channel unread tracked (REQ-014); no aggregate view. |
+| 238 mark-all-read / catch-up | ⛔ | No bulk cursor-advance. |
+| 254 data import / migration | ⛔ | No importer; distinct from compliance export (REQ-252). |
+| 260 command palette / quick switcher | 🔵 ✅ TUI / ⛔ GUI | TUI has Ctrl+K (ARCH-83); Win32 has app menu only. |
+| 261 in-app settings/preferences hub | ⛔ | Config is file-only (TUI) / absent (Win32); no in-app editor. |
+| 262 theme/appearance selection | 🔵 ⛔ | TUI ships a 256-color theme but no in-app toggle; GUIs honor OS dark mode only. |
+| 263 error/toast + connection-status surface | 🔵 ⛔ | TUI partial (status line); Win32 has no error/toast surface (P0). |
+| 264 keyboard-shortcut reference | 🔵 ✅ TUI / ⛔ GUI | TUI `?` help overlay; Win32 none. |
+| 265 composer autocomplete + emoji picker | 🔵 ⛔ | TUI has @/#/:emoji autocomplete; Win32 has neither. |
+| 266 other-user profile viewer | ⛔ | Neither client can open a peer's profile. |
+| 267 sidebar org parity (DM section, sections, search) | 🔵 ⛔ | TUI has fixed groups; Win32 sidebar is flat, no DM section/search. |
+| 268 first-run onboarding (signup/first-owner UI) | ⛔ | No signup/first-owner flow in any client. |
+| 270 GIF/sticker pickers | ➖ | Explicit exclusion (app/webhook territory). |
+| 271 Canvas / collaborative docs | ➖ | Explicit exclusion. |
+| 272 Lists / tables / boards | ➖ | Explicit exclusion. |
+| 273 Clips / async voice-video messages | ➖ | Explicit exclusion (cf. REQ-160). |
+| 274 Slack Connect / cross-org shared channels | ➖ | Explicit exclusion (island model, ARCH-4/REQ-040). |
+| 275 first-party bot / MCP server | ➖ | Explicit exclusion beyond the app platform (REQ-172). |

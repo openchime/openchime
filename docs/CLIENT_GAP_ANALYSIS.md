@@ -244,8 +244,8 @@
 | Feature / Surface | Slack | Pumble | TUI | Win32 | Gap notes & priority |
 |---|---|---|---|---|---|
 | 2FA / MFA | ✅ | ✅ | ❌ | ❌ | Likely server/roadmap. **P2** |
-| SSO — **SAML 2.0** | ✅ ᴾ (Pro) | ✅ **ᴱ Enterprise only** | ⛔ **not supported at all** | ⛔ | **No SAML anywhere in the product** — not built, not designed (ARCH-55 has no SAML path). Disqualifying in SAML-mandatory RFPs. See §8.4. |
-| SSO — **OIDC / social login** | ✅ ᴾ | ✅ OAuth2 ᴱ | ❌ client half unbuilt (Google-only upstream) | ❌ | Daemon verification built; browser flow + PKCE + courier ⛔. **P1** — see §8.4. Pumble gates SSO three tiers up, the crux of §8.2. |
+| SSO — **SAML 2.0** | ✅ ᴾ (Pro) | ✅ **ᴱ Enterprise only** | ⛔ **not supported at all** | ⛔ | **No SAML anywhere in the product** — not built, not designed (ARCH-55 has no SAML path; recorded as REQ-027). Disqualifying in SAML-mandatory RFPs. See §8. |
+| SSO — **OIDC / social login** | ✅ ᴾ | ✅ OAuth2 ᴱ | ❌ client half unbuilt (Google-only upstream) | ❌ | Daemon verification built; browser flow + PKCE + courier ⛔ (REQ-020). **P1** — see §8. |
 | SCIM / JIT provisioning | ✅ | ❔ | ⛔ | ⛔ | Out of scope for client (ours is REQ-253, federated). |
 | Session mgmt / forced sign-out | ✅ | ❔ | 🟡 logout | 🟡 logout, no log-out-everywhere | No revoke-all-sessions surfaced (the daemon supports it, REQ-182). **P2** |
 | IP allowlist / domain restrict | ✅ | ❔ | ⛔ | ⛔ | Server-side, out of client scope. |
@@ -450,7 +450,7 @@ This analysis is reference-centric (what Slack and Pumble have that we lack). Fo
 | **Terminal client** | ✅ full-featured TUI (every engine feature reachable) | ❌ | ❌ | **Holds against both** — no mainstream competitor ships one. |
 | **Native, lightweight clients** | ✅ pure-C native per platform — TUI + Win32 GUI (~3 MB, Direct2D), no Electron | ❌ Electron desktop (heavy) | ❌ web-tech desktop app (Win/mac/Linux `.deb`/`.rpm`) | **Holds on footprint** — but see the caveat below: Pumble *ships* Linux/macOS/mobile clients today and we do not. |
 | **Full history on the free tier** | ✅ self-hosted = unlimited retention (you set policy) | ❌ free tier caps at 90 days | ✅ **unlimited history on the free plan** | ⚠️ **No longer a differentiator.** This was our stated wedge against Slack (ARCH-15 calls FTS5 "a competitive wedge against Slack's history caps"). Pumble gives it away free. Against Pumble the wedge must be restated as *ownership*, not *retention*. |
-| **Pricing model** | ✅ self-hosted free; hosted flat $99 / 100 users | ❌ per-user seat pricing | 🟡 free tier w/ unlimited users; cheap per-seat above it | ⚠️ **Weakened but survives.** See §8 — we beat Pumble on price only at ≥~25 seats, and Pumble's *free* tier undercuts our hosted plan outright for small teams. |
+| **Pricing model** | ✅ self-hosted free; hosted flat plan | ❌ per-user seat pricing | 🟡 free tier w/ unlimited users; cheap per-seat above it | ⚠️ **Weakened but survives.** Detailed price analysis is out of scope for this repo and now lives in the control-plane repo (`openchime-saas`, CP-4); the durable argument against both is *ownership*, not headline price. |
 | **Affordance-only interaction** | ✅ menus/dialogs/drag-drop, no slash-command sprawl (design choice) | mixed (heavy slash surface) | mixed (native `/`-commands: `/status`, `/clear-status`, …) | Unchanged — a deliberate simplicity choice, not a capability claim. |
 | **Audit log** | ✅ built, four families, per-family flood cap (ARCH-79) | ✅ paid tiers | ❔ not publicly documented | Likely holds vs Pumble, but ❔ — do not assert publicly without a harder source. |
 
@@ -483,81 +483,28 @@ So the like-for-like comparison depends entirely on whether you need SSO — see
 
 ---
 
-## 8. Price at seat count — Slack vs Pumble (vs OpenChime)
+## 8. SSO — what OpenChime supports and does not
 
-All figures are **annual-billing list price, per user per month**, from the vendors' own pricing pages on 2026-07-26, multiplied out to **annual total cost**. Slack Pro $7.25 · Business+ $15 · Enterprise+ custom (Vendr-observed median $26.18/user/mo). Pumble Pro $2.49 · Business $3.99 · Enterprise $6.99. Monthly billing costs roughly 20% more on both (Slack Pro $8.75, Business+ $18; Pumble $2.99/$4.99/$7.99).
+*Pricing/seat-cost analysis has been removed from this document — pricing is out of scope for this repo (REQUIREMENTS.md preamble) and lives in the control-plane repo (`openchime-saas`, CP-4). What remains here is the one **capability** row that decides the Slack-vs-Pumble comparison for an enterprise buyer, because our position on it (REQ-027) has to be stated exactly rather than implied by a ✅.*
 
-### 8.1 Annual total cost by seat count
-
-| Seats | Slack Pro | Slack Business+ | Slack Enterprise+ ~ | Pumble Free | Pumble Pro | Pumble Business | Pumble Enterprise |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 10 | $870 | $1,800 | *(min. not met)* | **$0** | $299 | $479 | $839 |
-| 25 | $2,175 | $4,500 | *(min. not met)* | **$0** | $747 | $1,197 | $2,097 |
-| 50 | $4,350 | $9,000 | *(min. not met)* | **$0** | $1,494 | $2,394 | $4,194 |
-| 100 | $8,700 | $18,000 | ~$31,400 | **$0** | $2,988 | $4,788 | $8,388 |
-| 250 | $21,750 | $45,000 | ~$78,500 | **$0** | $7,470 | $11,970 | $20,970 |
-| 500 | $43,500 | $90,000 | ~$157,100 | **$0** | $14,940 | $23,940 | $41,940 |
-| 1,000 | $87,000 | $180,000 | ~$314,200 | **$0** | $29,880 | $47,880 | $83,880 |
-
-*Enterprise+ is unpublished; the column uses Vendr's observed median and typically carries a 500-seat minimum, so small-seat cells are marked not-applicable rather than extrapolated. Real Slack enterprise deals commonly land 10–20% under list.*
-
-### 8.2 The comparison that actually matters — matched on capability
-
-Comparing $2.49 to $7.25 flatters Pumble, because those tiers do not contain the same product. Matched on what a buyer actually needs:
-
-| Buyer need | Slack | Pumble | Pumble's real advantage |
-|---|---|---|---|
-| Basic chat, unlimited history, unlimited users | Pro **$7.25** | **Free $0** | **Infinite** — Slack has no free unlimited-history tier at all |
-| + group video, screen share | Pro **$7.25** | Pro **$2.49** | **2.9× cheaper** |
-| + guests, roles/permissions, unlimited integrations | Pro **$7.25** | Business **$3.99** | **1.8× cheaper** |
-| **+ SSO/SAML** | Pro **$7.25** | Enterprise **$6.99** | **1.04× — essentially a wash** |
-| + retention policy, compliance depth | Business+ **$15** | Enterprise **$6.99** | 2.1× cheaper |
-
-**The finding:** Pumble's 3× price advantage is real for teams that do **not** need SSO, and **evaporates entirely** for teams that do — at $6.99 vs $7.25 the products cost the same, and at that point Slack's 2,600 integrations, Enterprise Grid, and compliance depth make it the stronger buy. Pumble's genuine, unassailable win is its **free tier**: unlimited users and unlimited history at $0 is something neither Slack nor OpenChime-hosted can match on price.
-
-### 8.3 Where OpenChime lands
-
-Hosted OpenChime is **$99/month flat, up to 100 users, hard-capped at 100** (CP-4) = **$1,188/year regardless of seat count**; self-hosted (stand-alone or federated) is **free**, and the operator pays only for the box (ARCH-4's target is a 256 MB instance — benchmarked at ~5 MB + ~50 KB/connection, so the 50–100-user case is nowhere near the hardware limit).
-
-| Seats | Slack Pro | Pumble Business | **OpenChime hosted** | **OpenChime self-hosted** |
-|---:|---:|---:|---:|---:|
-| 10 | $870 | $479 | $1,188 | ~$0 + box |
-| 25 | $2,175 | $1,197 | $1,188 | ~$0 + box |
-| 50 | $4,350 | $2,394 | $1,188 | ~$0 + box |
-| 100 | $8,700 | $4,788 | **$1,188** | ~$0 + box |
-| 250 | $21,750 | $11,970 | ✗ capped at 100 | ~$0 + box |
-| 1,000 | $87,000 | $47,880 | ✗ capped at 100 | ~$0 + box |
-
-Read across that table honestly:
-
-- **At 100 users the hosted plan is extremely strong on price** — $1,188/yr against Pumble Business' $4,788 and Slack Pro's $8,700, i.e. **$0.99/user/month**, with no capability gated behind a higher tier (there is only one tier).
-- **But not on SSO. We do not support SAML at all** — see §8.4. The price-per-seat win does not extend to the enterprise-identity row that §8.2 shows is the decisive one.
-- **Below ~25 seats the flat $99 is a liability**: a 10-person team pays more for OpenChime hosted ($1,188) than for Slack Pro ($870) and far more than Pumble Free ($0). The flat plan is priced for the top of its own cap.
-- **Above 100 the hosted plan simply does not compete** — the cap is hard (CP-4/CP-7, enforced by the daemon via `OPENCHIME_MAX_USERS`). Those buyers get self-hosting or nothing.
-- **Self-hosted is the only column that stays flat to 1,000 seats**, which is the real economic argument and the one the §6 caveats say we should be making — *ownership*, not retention and not headline price.
-
-### 8.4 SSO: what we actually support (and what we do not)
-
-§8.2 identifies SSO as the row that decides the Slack-vs-Pumble comparison, so our own position on it has to be stated exactly rather than implied by a ✅.
+SSO is the capability that most often decides an enterprise deal, so our own position on it has to be exact:
 
 | | Slack | Pumble | **OpenChime** |
 |---|---|---|---|
-| SAML 2.0 | ✅ from Pro ($7.25) | ✅ Enterprise only ($6.99) | ❌ **not supported — not built, not designed, not on any roadmap** |
-| OIDC / social login | ✅ | ✅ OAuth2 ᴱ | 🟡 **designed + daemon-side built**, brokered by the central relay (ARCH-56/57) |
+| SAML 2.0 | ✅ from its lowest paid tier | ✅ top tier only | ❌ **not supported — not built, not designed, not on any roadmap** |
+| OIDC / social login | ✅ | ✅ OAuth2 (top tier) | 🟡 **designed + daemon-side built**, brokered by the central relay (ARCH-56/57) |
 | Bring-your-own IdP direct to the server | ✅ | ✅ | ⛔ **excluded by design** (ARCH-55) — OIDC always routes through central |
 | Providers reachable today | Any SAML/OIDC IdP | Any SAML2/OAuth2 IdP | **Google only** (Entra/Apple deferred on the `IUpstreamIdp` seam) |
-| End-to-end login working today | ✅ | ✅ | ❌ **client half unbuilt** — browser flow + PKCE + loopback redirect are ⛔ (STATUS.md REQ-020, CLIENT.md §6, AUTH.md §7) |
+| End-to-end login working today | ✅ | ✅ | ❌ **client half unbuilt** — browser flow + PKCE + loopback redirect are ⛔ (STATUS.md REQ-020/027, CLIENT.md §6, AUTH.md §7) |
 
 **Consequences to be honest about:**
 
-- **An RFP that says "SAML 2.0 required" disqualifies us outright.** SAML remains the enterprise default for Okta/Entra/Ping estates; ARCH-55's "no direct-to-IdP mode" was chosen to keep the C daemon lean (no JWKS fetching, no multi-provider handling) and that tradeoff is sound — but its cost is exactly this row, and it has not been written down anywhere until now.
+- **An RFP that says "SAML 2.0 required" disqualifies us outright.** SAML remains the enterprise default for Okta/Entra/Ping estates; ARCH-55's "no direct-to-IdP mode" was chosen to keep the C daemon lean (no JWKS fetching, no multi-provider handling) and that tradeoff is sound — but its cost is exactly this row. Now recorded in the spec as REQ-027.
 - **Our OIDC is not equivalent to their SSO.** ARCH-55 routes every OIDC login through the project's central relay. For a self-hoster that means social login costs a runtime dependency on us at login time (AUTH.md §3.4) and gives the project visibility into *who signs into which workspace* (§3.4's stated privacy tradeoff). A stand-alone deployment declining that is on **local accounts only** — no SSO of any kind.
 - **Nobody can complete an OIDC login today**, in any deployment model, because the client courier path does not exist. The daemon verifies (`daemon/jwt.c`, tested) and the control plane mints (M5, Google), but nothing carries the token between them. `scripts/demo-oidc.sh` proves the mint↔verify contract with a dev endpoint, deliberately bypassing the browser flow.
-- **Where this actually leaves us competitively:** against a buyer who needs SSO, we are not cheaper-than-Pumble, we are *absent*. The credible pitch at 100 seats is self-hosting, data residency, and read receipts — not identity.
+- **Where this actually leaves us competitively:** against a buyer who needs SSO, we are *absent*. The credible pitch at the 50–100-seat target is self-hosting, data residency, and read receipts — not identity.
 
-> Recorded here as a gap, not a proposal. If SAML is ever wanted, the ARCH-55-consistent shape is almost certainly **central terminating SAML and continuing to re-issue the same ES256 JWT** (the daemon's verification contract, and its leanness, would not change) — that is a control-plane decision (`openchime-saas`, a CP-N item), not a daemon one. The nearer-term and much cheaper item is finishing the **client OIDC courier path**, which turns a designed capability into a real one.
-
-> **Product implication worth surfacing (not a decision):** the two soft spots are the small-team end of the hosted plan and the absence of a free hosted tier, in a market where Pumble's free tier is unlimited-users/unlimited-history. Pricing is explicitly out of scope for this repo (REQUIREMENTS.md preamble); recorded here as competitive input for the control-plane repo's CP-4, not as a proposal.
+> Recorded here as a gap, not a proposal. If SAML is ever wanted, the ARCH-55-consistent shape is almost certainly **central terminating SAML and continuing to re-issue the same ES256 JWT** (the daemon's verification contract, and its leanness, would not change) — that is a control-plane decision (`openchime-saas`, a CP-N item), not a daemon one. The nearer-term and much cheaper item is finishing the **client OIDC courier path** (REQ-020), which turns a designed capability into a real one.
 
 ---
 

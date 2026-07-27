@@ -179,7 +179,6 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
   *Read path.* `AUDIT_QUERY` / `AUDIT_PAGE` (PROTOCOL.md), owner/admin only, authorized in the **writer against the user's current role** — the same shape as ARCH-77's storage report, so a demotion takes effect mid-session. The TUI renders it as an Audit log overlay (the Ctrl+K launcher's "Audit log"), newest first, paged. Reads are ordinary queries on the read connection (ARCH-66); writes go through the writer like every other mutation, so the log inherits the same single-writer ordering as the data it describes.
 
 ## Feature Implementation
-## Feature Implementation
 
 - **ARCH-15 (Search):** FTS5 full-text search, positioned as a competitive wedge against Slack's history caps.
 - **ARCH-16 (Notifications delivery):** Push via APNs/FCM. The published mobile clients are signed under the project's Apple/Google developer accounts, so only the project can mint valid APNs/FCM credentials for them — which makes push delivery a **federated service** (ARCH-76) rather than something a self-hoster can stand up alone. Consequently **push is available in the self-hosted federated and hosted models and is absent in self-hosted stand-alone**, where mobile clients fall back to in-app/foreground notification. The gateway learns *that* a notification is due and for whom, never message content (the ARCH-76 invariant). Concrete design is **built**: the daemon-side emitter is ARCH-85 (`daemon/push.c`); the APNs/FCM transport is the control-plane gateway. REQ-132/133.
