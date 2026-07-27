@@ -149,8 +149,8 @@ from the C encoder, so a bug that affects both in the same way would pass. One
 source of truth for the frames means the integration tests also dogfood the
 codec the real client will ship.
 
-The test client lives under `tests/` (e.g. `tests/itest_client.c` plus a
-scenario driver) and is built by a dedicated make target. It speaks real
+The test client lives under `tests/` (`tests/e2e_client.c`, the black-box client
+built as `build/e2e_client` and driven by `make integration`). It speaks real
 frames: `HELLO`/`WELCOME`, `AUTH`, `SEND`/`SEND_ACK`/`BROADCAST`/`CLIENT_ACK`,
 `BACKFILL_REQUEST`/`BACKFILL_DONE`.
 
@@ -215,6 +215,9 @@ Jobs:
   build the image, bring the stack up, wait for `/healthz`, then drive the
   protocol vertical over TLS with the e2e client. This is the automation of the
   manual steps in the README's "Verify" section.
+- **`core`** — a standalone compile-check of the client app-core (ARCH-74).
+- **`windows`** — the Windows cross-compile of the TUI and GUI
+  (`make windows-tui windows-gui`), so the ported client stays building.
 
 Everything runs non-interactively and communicates pass/fail purely through
 exit codes, so no scenario depends on a human reading output.
@@ -253,7 +256,12 @@ Makefile
   integration:           # Scripts/test-integration.sh (containerized daemon)
 ```
 
-All unit and in-process integration suites compile into a **single** binary
+The list above is **representative, not exhaustive** — the tree also holds
+`test_auth`, `test_jwt`, `test_roles`, `test_ratelimit`, `test_http`,
+`test_sigv4`, `test_blob_s3`, `test_xferpool`, `test_storage`, `test_fuzz`,
+`test_audio`, `test_client_core`, `test_push`, `test_enroll`, and
+`itest_slow_blob`, plus the `demo_client`/`bench_load` tools (filtered out of the
+suite). All unit and in-process integration suites compile into a **single** binary
 (`build/tests`): each `tests/*.c` links the module's public API (no per-test
 binary, no unity `#include` of a `.c`) and exposes `run_<suite>_tests()`, which
 `tests/main.c` aggregates. The only separate artifact is `e2e_client`, which by

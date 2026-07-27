@@ -38,6 +38,7 @@ The branch, commit, and CI policy for this repo. The private control-plane repo
 - **`integration`** — the deployed image end-to-end on the Docker Compose stack
   (health check + the protocol vertical over TLS).
 - **`core`** — standalone compile check of the client app-core (ARCH-74).
+- **`windows`** — cross-compiles the Windows TUI + GUI (`make windows-tui windows-gui`).
 - **`attribution-guard`** — runs on every push.
 - Docs-only pushes skip the build jobs (`paths-ignore: ['**.md', ...]`).
 

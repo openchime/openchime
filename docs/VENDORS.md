@@ -32,6 +32,7 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **termbox2** | v2.5.0 | Terminal cell grid + input | tuikit (→ TUI) | https://github.com/termbox/termbox2 | MIT |
 | **utf8proc** | v2.11.3 | Unicode width + grapheme segmentation (correct emoji/CJK width) | tuikit (→ TUI) | https://github.com/JuliaStrings/utf8proc | MIT (bundled Unicode data under the Unicode license) |
 | **jsmn** | commit-pinned (upstream has no release tags) | Minimal JSON tokenizer | Daemon (OIDC/webhook JSON) | https://github.com/zserge/jsmn | MIT |
+| **SQLite (amalgamation)** | v3.46.1 | `sqlite3.{c,h}` — the client store for the **Windows client** build (mingw has no system `-lsqlite3`; Linux/daemon builds keep using system `-lsqlite3`, the same library) | Windows TUI + GUI (`client/core/store.c`) | https://sqlite.org | Public Domain |
 
 Since **ARCH-83**, `tuikit/` is the in-tree toolbox wrapping termbox2 + utf8proc
 (terminal layer + width handling), which the TUI builds on — `client/tui`
@@ -112,20 +113,21 @@ The self-rendered GUI direction (Clay layout + raylib/OpenGL) was tried and
 rejected in favour of native per-platform UIs (**ARCH-82**): a self-rendered UI
 is non-native and perpetually lags. **raylib and Clay have been removed** — the
 `clay/`, `raylib-6.0-win`, `raylib-install-*` trees, the `build_raylib_*.sh`
-scripts, and the `client/gui` + comctl32 `client/win32` clients are all deleted.
-Retained Windows artifacts below are for the **Windows TUI** (ARCH-81, shipped),
-not the GUI.
+scripts, the **old self-rendered `client/gui` (Clay+raylib)**, and the comctl32
+`client/win32` client are all deleted. (The **current** native Win32 GUI lives at
+`client/gui/win32/` — ARCH-82, pure Win32 + Direct2D — and is unrelated to the
+removed self-rendered `client/gui`.) Retained Windows artifacts below are for the
+**Windows TUI and GUI** cross-compile (ARCH-81/82).
 
 | Item | Version | Note | License |
 |------|---------|------|---------|
-| `scripts/build_mbedtls_windows.sh`, `third_party/mbedtls-3.6.2-win` | 3.6.2 | Windows TUI cross-compile (mingw); still used by `make windows-tui` | Apache-2.0 |
+| `scripts/build_mbedtls_windows.sh`, `third_party/mbedtls-3.6.2-win` | 3.6.2 | Windows cross-compile (mingw); used by `make windows-tui` and `make windows-gui` | Apache-2.0 |
 
 ## 7. Planned — not yet a dependency
 
 - **libopus** — Opus encode/decode for the **audio client** (REQ-150/151).
   BSD-3-Clause. Not yet linked; the server-relayed audio path carries opaque
   Opus payloads and does not link libopus (ARCH-73). Client-side only.
-- **SQLite (amalgamation)** — vendored `third_party/sqlite/sqlite3.{c,h}` (v3.46.1, public domain) for the **Windows client build only**: the client store (`client/core/store.c`) needs SQLite and mingw has no system `-lsqlite3`. The Linux/daemon builds keep using system `-lsqlite3`; this is the same library, amalgamated. Fetched from sqlite.org, committed like the other single-file vendored deps (jsmn/termbox2/utf8proc).
 - **miniaudio** — planned single-header device I/O (capture + playback) for the
   audio client, wrapping ALSA/PulseAudio/PipeWire/CoreAudio/WASAPI.
   MIT-0/public-domain, vendored like termbox2/utf8proc/jsmn (ARCH-75). Chosen
@@ -175,7 +177,7 @@ paths ship; nothing is fetched at runtime.
 | **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; SVGs + LICENSE vendored |
 | **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
 | **BSD-3-Clause** | libvpx (VP9) — **planned, not yet fetched** | Screenshare codec (REQ-161, ARCH-87). Client-side only; the daemon links no codec. Permissive, within this repo's posture — see §7 |
-| **Public Domain** | SQLite | System-linked |
+| **Public Domain** | SQLite | System-linked (Linux/daemon); amalgamation vendored for the Windows client |
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
 | **zlib/libpng** | raylib | Dropped self-rendered-GUI toolkit (ARCH-82); unused, not linked |
 | **zlib** | Clay | Dropped GUI layout engine (ARCH-82); unused, not linked |

@@ -147,7 +147,7 @@ $(TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) \
 # --- Windows TUI (ARCH-81) ----------------------------------------------------
 # Cross-compiled with mingw-w64 to a standalone .exe. Uses the Windows mbedTLS
 # (third_party/mbedtls-3.6.2-win) and the vendored SQLite amalgamation (mingw has
-# no system sqlite). The termbox2 backend is termbox2_win.c (Console API); the
+# no system sqlite). The termbox2 backend is tuikit/tk_term.c (Console API); the
 # core seams (threads/DNS/RNG) are in shared/oc_thread.h + resolve.c + net.c.
 WINCC     ?= x86_64-w64-mingw32-gcc
 MBEDTLS_WIN := third_party/mbedtls-3.6.2-win

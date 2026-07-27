@@ -335,10 +335,11 @@ unit-tested in `daemon/roles.c`.
   promote/keep members — refusing with `FORBIDDEN`.
 - **≥1 owner invariant (implemented):** demoting the tenant's last owner is
   refused with `LAST_OWNER` (REQ-030), checked against a live `COUNT(*)` of owners.
-- **Moderation delete (REQ-032, pending):** an admin/owner may delete (not edit)
-  others' messages in a channel they belong to; the existing `messages.deleted_by`
-  column records that it was a non-author deletion. (`oc_role_can_moderate` is in
-  place; the delete operation itself is future work.)
+- **Moderation delete (REQ-032, implemented):** an admin/owner who belongs to the
+  channel may delete (not edit) others' messages; `process_delete` performs the
+  tombstone after an `oc_role_can_moderate` check for a non-author and records it
+  as a moderator deletion via `messages.deleted_by` (and in the audit log). (This
+  matches the AUTH.md intro, ARCH-60, and STATUS.md row 032.)
 - **Invite/remove (REQ-033, implemented):** only owner/admin may invite or remove
   tenant members (`oc_role_can_manage_members`), and only an owner may invite at
   or remove an admin/owner. Invite mints a single-use token (`invites`);

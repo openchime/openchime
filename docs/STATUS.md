@@ -162,16 +162,18 @@ Legend: ✅ done · 🔨 in progress · ⛔ not started.
 | Read receipts (seen-by) | model `readers[]` | ✅ | "✓ Seen by …" footer under the transcript. |
 | Logout | `logout` | ✅ | App menu → Log out; window closes on the drop. |
 | Manual reconnect | `reconnect` | ✅ | App menu → Reconnect now. |
-| Multiple workspaces | one `oc_client` per ws + switcher | ⛔ | Rail workspace switcher (TUI holds N clients) — the one remaining feature. |
+| Multiple workspaces | one `oc_client` per ws + switcher | 🔨 | **Rail switcher UI built** (`open_switcher`/`switch_workspace`, winmain.c) — remembered workspaces + "Add a workspace…". It **stop/reconnects a single `oc_client`**, so the remaining piece is the TUI's **N-concurrent-client** model (background receive + "N elsewhere" unread), not the switcher affordance. |
 
 > **Depth caveat:** this table tracks whether each engine feature is *reachable*; it does **not** measure how developed each screen/dialog is. For the full four-way (Slack vs Pumble vs TUI vs Win32) surface-depth gap analysis — including underdeveloped screens and a recommended build order — see [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md).
 
-**Feature parity is essentially complete** — 26 of 27 features surfaced; only the
-multi-workspace switcher (an architectural change: N `oc_client`s + a rail
-switcher, as the TUI does) remains. Next per the agreed sequencing is the
-**polish pass**: transcript density / date-separators / real-scrollbar / hover,
-sidebar + header spacing, a theme-matched login dialog, and a global
-colors/fonts/spacing sweep.
+**Feature parity is essentially complete** — all 27 features are surfaced (the
+rail workspace switcher UI now exists too). The one genuinely unbuilt *capability*
+is the TUI's **N-concurrent-client** multi-workspace model: Win32 switches by
+stop/reconnecting a single `oc_client`, so a background workspace does not receive
+or accrue unread ("N elsewhere"). Next per the agreed sequencing is the **polish
+pass**: transcript density / date-separators / real-scrollbar / hover, sidebar +
+header spacing, a theme-matched login dialog, and a global colors/fonts/spacing
+sweep.
 
 ---
 

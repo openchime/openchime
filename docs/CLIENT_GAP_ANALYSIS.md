@@ -301,7 +301,7 @@
 | Star/favorite conversations | ✅ | ✅ | ❌ | ❌ | **P2** |
 | Autocomplete strip (@/#/:emoji) | ✅ | ✅ | 🟡 | ❌ | Win32 missing. **P1** |
 | Keybinding hint bar | ✅ | ❌ | 🟡 | ❌ | **P2** |
-| Error / toast surface (send fail, rate-limit, bad login) | ✅ | ✅ | 🔸 partial | ❌ NO error/toast surface anywhere | Win32 silently swallows failures. **P0** |
+| Error / toast surface (send fail, rate-limit, bad login) | ✅ | ✅ | 🔸 partial | 🔸 only `last_error` in the empty transcript; no toast/banner, login shows no auth error | Win32 has no transient toast/banner and the login dialog surfaces no error. **P0** |
 | Terminal / TUI client | ❌ | ❌ | ✅ **the only one of the four** | — | Genuine category differentiator. — |
 | Slackbot conversation | ✅ | ✅ Pumblebot | ⛔ | ⛔ | Out of scope. |
 
@@ -309,8 +309,8 @@
 
 | Feature / Surface | Slack | Pumble | TUI | Win32 | Gap notes & priority |
 |---|---|---|---|---|---|
-| Multi-workspace switcher rail | ✅ | ✅ | ✅ remembered+open, unread, per-ws state | ❌ single workspace avatar only — MISSING | The last big TUI-vs-Win32 delta. **P1** |
-| Add workspace | ✅ | ✅ | 🟡 | ❌ | **P1** |
+| Multi-workspace switcher rail | ✅ | ✅ | ✅ remembered+open, unread, per-ws state | 🟡 rail switcher built (single-client stop/reconnect; no N-concurrent, no background unread) | Win32 has the switcher UI; the remaining delta is the TUI's N-concurrent-client model. **P1** |
+| Add workspace | ✅ | ✅ | 🟡 | 🟡 "Add a workspace…" in the switcher | **P1** |
 | Workspace switch by number | ✅ Cmd+1..9 | ❔ | 🟡 | ❌ | **P2** |
 | Reconnect / auto-reconnect | ✅ | ✅ | ⚪ stub | 🟡 works, no countdown/banner | **P1** |
 | Connection status indicator | ✅ | ✅ | 🟡 status line | 🔸 no toast/banner/countdown | **P1** |
@@ -343,7 +343,7 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 
 1. **Search results (both clients)** — *Today:* read-only, non-navigable list; TUI shows raw `userNNN` instead of names; Win32 click jumps to the CHANNEL not the matched message, no highlight, no scroll, 128-result cap ignoring truncation. *Done:* navigable results (arrow/click to the exact message), resolved display names, term highlighting, in-overlay query box + refine, paging/load-more, filter tabs. **P0**
 
-2. **Win32 error/failure surface (missing entirely)** — *Today:* no toast/banner for bad login, send failure, rate-limit, or storage pressure; login dialog shows nothing on auth failure. *Done:* inline login error text + a global toast/banner channel for transient failures with retry affordance. **P0**
+2. **Win32 error/failure surface (near-absent)** — *Today:* no transient toast/banner for send failure, rate-limit, or storage pressure, and the login dialog shows nothing on auth failure; the only failure surface is `last_error` text rendered in an empty transcript (winmain.c). *Done:* inline login error text + a global toast/banner channel for transient failures with retry affordance. **P0**
 
 3. **Settings / Preferences (missing in both)** — *Today:* config is file-only; no in-app `set_setting` surface, no theme/12-24h/panel toggles. *Done:* a Preferences hub (notifications, appearance, time format, sidebar behavior) writing through the existing config. **P0**
 
@@ -376,7 +376,7 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 ## 4. Missing Entirely (per client)
 
 ### Win32 GUI — missing
-- **Multi-workspace switcher** — single global client, no rail. **P1**
+- **N-concurrent-workspace model** — the rail switcher UI exists, but Win32 stop/reconnects a single client; no holding N clients at once with background unread ("N elsewhere"), as the TUI does. **P1**
 - **Settings/Preferences screen** — no in-app config at all. **P0**
 - **@-mention / #channel / :emoji autocomplete** in composer. **P0**
 - **Composer emoji picker** (none; only 6 hardcoded reaction emoji). **P1**
@@ -434,7 +434,7 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 9. **Channel management** — rename/topic/archive/details pane + a real create-channel dialog (privacy/topic/members). **P1**
 10. **Command palette (Ctrl+K)** + inline image/thumbnail rendering (D2D makes this a strong differentiator). **P1**
 
-*Follow-ups just behind the top 10: full webhook CRUD, paged audit log, richer invite dialog, per-reply thread actions, real profile editor, multi-workspace switcher (last remaining TUI-vs-Win32 delta), reconnect banner/countdown, and replacing the six-forms-in-one-prompt pattern with purpose-built dialogs.*
+*Follow-ups just behind the top 10: full webhook CRUD, paged audit log, richer invite dialog, per-reply thread actions, real profile editor, the N-concurrent-workspace model (the rail switcher UI is already built; the delta is holding N clients at once), reconnect banner/countdown, and replacing the six-forms-in-one-prompt pattern with purpose-built dialogs.*
 ---
 
 ## 6. Where OpenChime Exceeds / Differs Favorably — now tested against *both* references

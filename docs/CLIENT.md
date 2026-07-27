@@ -420,7 +420,7 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
   history, offline outbox, workspace book), **multiple workspaces** (REQ-012–015),
   DNS workspace resolution (REQ-010/011), the local **Sign in** dialog, and the
   **Windows TUI** (ARCH-81). See §5–§6.
-- **Next — Windows GUI depth (P0).** The Win32 GUI reaches 26 of 27 engine
+- **Next — Windows GUI depth (P0).** The Win32 GUI surfaces all 27 engine
   features (ARCH-82) but many surfaces are thin; the prioritized gaps are
   [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5, now each carrying a REQ:
   the global error/toast + connection-status surface (**REQ-263**), search that
@@ -428,8 +428,10 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
   grouping + search (**REQ-267**), composer autocomplete + emoji picker
   (**REQ-265**), the in-app settings/preferences hub (**REQ-261**), the
   other-user profile viewer (**REQ-266**), a command palette (**REQ-260**), and
-  the multi-workspace switcher (REQ-012–015). Inline image rendering (**REQ-142**)
-  is a D2D-native win once those land.
+  the **N-concurrent-workspace model** (REQ-012–015 — the rail switcher UI is
+  already built; what's missing is holding N clients at once with background
+  unread, as the TUI does). Inline image rendering (**REQ-142**) is a D2D-native
+  win once those land.
 - **Next — auth completeness.** The **OIDC browser flow + PKCE + loopback
   courier** — the one remaining piece of REQ-020 and what makes SSO usable at all
   (there is no SAML by design, **REQ-027**); plus first-run onboarding

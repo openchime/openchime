@@ -3,7 +3,7 @@
  * Windows the TUI is built against this instead: the exact subset of the
  * termbox2 v2.5.0 public API that client/tui/main.c uses, with values copied
  * verbatim so the two backends are semantically identical. The implementation
- * is termbox2_win.c, over the Windows Console API.
+ * is tk_term.c, over the Windows Console API.
  *
  * Attribute model matches the termbox2 default build (TB_OPT_ATTR_W unset → 16):
  * uintattr_t is 16-bit, colors are 0..8, TB_BOLD/TB_REVERSE are the 0x0100/0x0400

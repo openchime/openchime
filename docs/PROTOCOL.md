@@ -677,6 +677,7 @@ body is fine — then closes with a **`THREAD` (server → client), msg_type
 |-------------|------|----------------------------------------------|
 | `parent_id` | u64  | The thread root.                             |
 | `count`     | u32  | Number of replies streamed.                  |
+| `truncated` | u8   | 1 if the reply stream was capped (more replies exist than were streamed). |
 
 On reconnect backfill (§6) the main scroll replays only top-level messages; a
 parent that has replies is followed by a **`THREAD_META` (server → client),
@@ -719,6 +720,7 @@ first:
 |-------------|-----------------|------------------------------------------------------|
 | `count`     | u16             | Number of entries.                                   |
 | `entries[]` | `count` × entry | Each: `message_id` (u64), `channel_id` (u64), `author_id` (u64), `server_time` (u64), `snippet` (str — an FTS5 excerpt around the match). |
+| `truncated` | u8              | 1 if more matches exist past the cap (`limit`).      |
 
 Tombstoned messages (§5.6) are excluded, and an edit (§5.5) re-indexes the
 message. An empty or all-punctuation query returns zero results (never an error).
@@ -839,7 +841,10 @@ needed** (client and daemon share this codec, so there is no older peer to
 negotiate against). The server links each id that is a finalized, still-unlinked
 attachment the caller uploaded to this same channel (others are ignored, i.e.
 simply not shared) and sets its `message_id`. `BROADCAST` correspondingly carries
-a trailing attachment list of `{ attachment_id, filename, mime, size }`, so every
+a trailing attachment list of `{ attachment_id, filename, mime, size, reclaimed }`
+— the `reclaimed` field is a `u8`, 1 when the blob has been reclaimed by age or
+storage pressure so the row is a tombstone (REQ-215) and no download id is offered
+— so every
 reader — live or via backfill (§6) — sees the attachment through the one message
 model, with no attachment-specific delivery path. Thread replies work the same
 way: `SEND_REPLY` carries the id list and `THREAD_REPLY` the metadata, live and
@@ -1126,6 +1131,7 @@ to mark the catch-up complete.
 | Field         | Type | Notes                                                         |
 |---------------|------|---------------------------------------------------------------|
 | `high_water`  | u64  | Highest `message_id` in the tenant at the moment backfill completed. Purely informational (progress/consistency check); the client's authoritative state remains its per-channel high-water marks. |
+| `more`        | u8   | 1 if the replay hit the per-response cap; the client issues a follow-up `BACKFILL_REQUEST` with an advanced cursor. |
 
 Replay volume is bounded per response; if a channel's backlog exceeds the
 per-response cap, the server replays up to the cap and the client issues a
