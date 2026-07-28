@@ -1121,6 +1121,25 @@ architecture decision.*
   (REQ-024/026) into a working account — so bringing up a new tenant, or joining
   one, has not required a command line. **[needs ARCH decision — per-GUI
   onboarding flow over the existing bootstrap/invite path.]**
+- **REQ-269.** Every graphical client has been **operable without a mouse and
+  legible to assistive technology**. Concretely: every action reachable by
+  pointer has had a keyboard route; focus has been visible and has moved in a
+  predictable order; and the client has exposed its structure — conversation
+  list, transcript, message authorship and timestamps, composer, unread state —
+  to the platform's accessibility layer, so a screen reader can convey a
+  conversation rather than an unlabelled rectangle.
+
+  *Status: unimplemented, and deliberately recorded rather than left implicit.*
+  The Win32 client is keyboard-operable in the ordinary paths (composer,
+  completion, conversation movement, command palette, shortcut sheet) but
+  exposes **no accessibility surface at all** — it draws its own UI with
+  Direct2D and answers no `WM_GETOBJECT`, so a screen reader sees one blank
+  window. A self-drawn UI gets nothing for free here, which is exactly why this
+  is a requirement and not an assumption: the cost grows with every pane added.
+
+  **[needs ARCH decision — UI Automation provider vs. IAccessible, and whether
+  the accessible tree is built per-frontend or described once in the core
+  (ARCH-74) and projected by each.]**
 
 ---
 

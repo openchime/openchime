@@ -294,6 +294,34 @@ static int g_pref_time24    = 1;   /* 24-hour timestamps */
 static int g_pref_members   = 1;   /* members pane shown by default */
 static int g_pref_daysep    = 1;   /* date dividers in the transcript */
 static int g_prefs_pending;        /* fold the synced values in once they land */
+/* Window placement, remembered across runs. It rides in the same synced bucket
+ * as the other preferences because a client writes no files (ARCH-88) — which
+ * does mean it is stored per workspace rather than per machine. Acceptable: the
+ * alternative is not remembering it at all.
+ *
+ * Stored in DEVICE pixels, since that is what SetWindowPos takes; a move to a
+ * differently-scaled monitor is handled by WM_DPICHANGED afterwards. */
+static int g_win_x = -1, g_win_y, g_win_w, g_win_h, g_win_max;
+static int g_geom_applied;         /* only restore once per run */
+static ULONGLONG g_geom_deadline;  /* show anyway if the bucket never lands */
+static ULONGLONG g_geom_dirty_at;  /* geometry changed; save once it settles */
+
+/* Read the window's placement into the globals. Returns 1 if it changed.
+ * Separate from saving because WM_EXITSIZEMOVE only fires for INTERACTIVE
+ * drags — a programmatic move never sends it, and the geometry would then be
+ * whatever it was at the last drag. */
+static int geom_capture(HWND hwnd) {
+    WINDOWPLACEMENT wp; wp.length = sizeof wp;
+    if (!GetWindowPlacement(hwnd, &wp)) return 0;
+    if (wp.showCmd == SW_SHOWMINIMIZED) return 0;   /* never persist minimised */
+    int mx = (wp.showCmd == SW_SHOWMAXIMIZED);
+    RECT *n = &wp.rcNormalPosition;
+    int w = n->right - n->left, h = n->bottom - n->top;
+    if (mx == g_win_max && n->left == g_win_x && n->top == g_win_y &&
+        w == g_win_w && h == g_win_h) return 0;
+    g_win_max = mx; g_win_x = n->left; g_win_y = n->top; g_win_w = w; g_win_h = h;
+    return 1;
+}
 static struct { D2D1_RECT_F r; int row, val; } g_pref_hits[16];
 static int g_n_pref_hits;
 static int g_n_rows;
@@ -421,6 +449,13 @@ static int g_thumbs_off;
 static uint64_t g_thumb_missing[THUMB_CACHE];   /* asked for, nothing came back */
 static int      g_n_thumb_missing;
 static uint64_t g_thumb_pending;                /* one fetch in flight */
+/* Click-to-expand: the thumbnails on screen, and the one being viewed full
+ * size. The bitmap is already decoded at native resolution — the transcript
+ * merely draws it small — so expanding costs nothing but a bigger destination
+ * rect. */
+static struct { D2D1_RECT_F r; uint64_t id; } g_thumb_hits[32];
+static int      g_n_thumb_hits;
+static uint64_t g_lightbox;
 static ULONGLONG g_thumb_deadline;
 static IWICImagingFactory *g_wic;
 
@@ -615,6 +650,7 @@ static int   g_n_sw;
 static D2D1_RECT_F g_attach_btn;        /* composer attach (+) hit-box */
 static D2D1_RECT_F g_send_btn;          /* composer send-button hit-box */
 static D2D1_RECT_F g_emoji_btn;         /* composer emoji-picker hit-box (WIN-8) */
+static D2D1_RECT_F g_at_btn;            /* composer mention button */
 static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
 
 /* ---- sign-in view (WIN-2, REQ-263/020) -------------------------------------
@@ -1455,8 +1491,18 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     oc_sidebar_opts o = g_sb;
     snprintf(o.find, sizeof o.find, "%s", g_find_filter);
     if (g_view == VIEW_DMS) o.collapsed[OC_SB_CHANNELS] = 1;
-    oc_sidebar_row rows[512];
-    size_t nrows = oc_model_sidebar(m, &o, rows, 512);
+    /* Sized to what the model actually holds — a fixed 512 was a silent cap on
+     * how many conversations could appear, which a busy workspace would hit
+     * with no indication that rows were missing. Grown once and kept. */
+    static oc_sidebar_row *rows;
+    static size_t rows_cap;
+    size_t need = m->n_channels + OC_SB_SECTIONS + 2;
+    if (need > rows_cap) {
+        oc_sidebar_row *g = realloc(rows, need * sizeof *g);
+        if (g) { rows = g; rows_cap = need; }
+    }
+    if (!rows) return;
+    size_t nrows = oc_model_sidebar(m, &o, rows, rows_cap);
 
     float top = HEADER_H + 46, bot = h;
     g_sb_view = bot - top;
@@ -1714,6 +1760,11 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
                 ID2D1RenderTarget_DrawBitmap(rt, bmp, &dst, 1.0f,
                                              D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, NULL);
                 stroke_round(rt, dst, 6.0f, OC_COL_BORDER, 1.0f);
+                if (g_n_thumb_hits < 32) {
+                    g_thumb_hits[g_n_thumb_hits].r = dst;
+                    g_thumb_hits[g_n_thumb_hits].id = at->id;
+                    g_n_thumb_hits++;
+                }
             } else {
                 D2D1_RECT_F ph = rf(tx, by + 3, tx + bw, by + 3 + bh);
                 fill_round(rt, ph, 6.0f, OC_COL_INPUT);
@@ -1728,8 +1779,12 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
                     draw_text(rt, "loading\u2026", g_small,
                               rf(ph.left, ph.top + bh / 2, ph.right, ph.top + bh / 2 + 20), OC_COL_FAINT);
                 IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
-                /* Ask for it — one at a time, and only for what is on screen. */
-                if (!thumb_failed(at->id) && !g_thumb_pending && g_client) {
+                /* Ask for it — one at a time, and only for what is on screen.
+                 * Never while thumbnails are suppressed for the screenshot
+                 * harness: that render is not the user's screen, and treating
+                 * its forced miss as "not fetched yet" re-requested every image
+                 * on every shot. */
+                if (!g_thumbs_off && !thumb_failed(at->id) && !g_thumb_pending && g_client) {
                     g_thumb_pending = at->id;
                     g_thumb_deadline = GetTickCount64() + 8000;
                     oc_client_fetch_attachment(g_client, at->id);
@@ -1897,7 +1952,7 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
     float y = (reg.bottom - total) + *scroll;     /* g_scroll 0 => newest pinned to bottom */
 
     ID2D1RenderTarget_PushAxisAlignedClip(rt, &reg, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-    if (capture) g_n_msgrows = 0; else if (hits) g_n_thrrows = 0;
+    if (capture) { g_n_msgrows = 0; g_n_thumb_hits = 0; } else if (hits) g_n_thrrows = 0;
     for (size_t i = 0; i < n; i++) {
         if (sep[i]) {
             if (y + SEP_H >= reg.top && y <= reg.bottom)
@@ -2390,19 +2445,62 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
     ovl_end(rt, body);
 }
 
+static void layout_composer(HWND hwnd);   /* fwd */
+
+/* Move `delta` conversations through the sidebar as it is currently shown, so
+ * the order matches what the eye sees — the section order, sort and filter all
+ * apply. `unread_only` skips everything already read, which is the "next thing
+ * that wants me" move rather than plain next.
+ *
+ * Reuses the same core helper the sidebar draws from; walking m->channels
+ * directly would drift from the visible order the moment a sort changed. */
+static void nav_conversation(HWND hwnd, int delta, int unread_only) {
+    const oc_model *m = model();
+    if (!m || !m->n_channels) return;
+    oc_sidebar_opts o = g_sb;
+    if (g_view == VIEW_DMS) o.collapsed[OC_SB_CHANNELS] = 1;
+    snprintf(o.find, sizeof o.find, "%s", g_find_filter);
+    size_t cap = m->n_channels + OC_SB_SECTIONS + 2;
+    oc_sidebar_row *rows = malloc(cap * sizeof *rows);
+    if (!rows) return;
+    size_t n = oc_model_sidebar(m, &o, rows, cap);
+
+    /* Collapse to selectable rows only: headers are not destinations. */
+    uint64_t ids[256]; int nids = 0, cur = -1;
+    for (size_t i = 0; i < n && nids < 256; i++) {
+        if (rows[i].is_header || !rows[i].channel_id) continue;
+        if (unread_only && rows[i].unread <= 0 && rows[i].channel_id != g_sel) continue;
+        if (rows[i].channel_id == g_sel) cur = nids;
+        ids[nids++] = rows[i].channel_id;
+    }
+    free(rows);
+    if (nids == 0) return;
+
+    int next;
+    if (cur < 0) next = (delta > 0) ? 0 : nids - 1;
+    else         next = ((cur + delta) % nids + nids) % nids;   /* wrap */
+    if (ids[next] == g_sel && nids == 1) return;
+    select_channel(ids[next]);
+    layout_composer(hwnd);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
 /* WIN-25: the shortcut sheet, generated from one table so it cannot drift from
  * what the key handlers actually do. */
 static const struct { const char *keys, *what; } KEYMAP[] = {
-    { "Enter",            "Send the message" },
-    { "Shift+Enter",      "New line" },
-    { "Esc",              "Close the open pane, popover or picker" },
-    { "Tab",              "Insert the highlighted completion" },
-    { "Up / Down",        "Move through completions" },
-    { "Ctrl+K",           "Command palette" },
-    { "Ctrl+F",           "Search messages" },
-    { "Ctrl+/",           "This list" },
-    { "Mouse wheel",      "Scroll the transcript, sidebar or open pane" },
-    { "Right-click",      "Actions for a message, member or channel" },
+    { "Enter",              "Send the message" },
+    { "Shift+Enter",        "New line" },
+    { "Esc",                "Close the open pane, popover or picker" },
+    { "Tab",                "Insert the highlighted completion" },
+    { "Up / Down",          "Move through completions" },
+    { "Alt+Up / Alt+Down",  "Previous / next conversation" },
+    { "Alt+Shift+Up / Down","Previous / next UNREAD conversation" },
+    { "Ctrl+K",             "Command palette" },
+    { "Ctrl+F",             "Search messages" },
+    { "Ctrl+/",             "This list" },
+    { "F6",                 "Move focus between the composer and the filter box" },
+    { "Mouse wheel",        "Scroll the transcript, sidebar or open pane" },
+    { "Right-click",        "Actions for a message, member or channel" },
 };
 
 static void draw_keys(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
@@ -3298,6 +3396,12 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
                                       g_emoji_btn.right - 8, g_emoji_btn.bottom - 8),
                 OC_COL_MUTED);
 
+    /* Mention. The '@' trigger already worked when typed; ARCH-82 says the GUI
+     * is affordance-driven, so it needs to be visible too. */
+    g_at_btn = rf(bx0 + 6 + sq * 2, cy, bx0 + 6 + sq * 3, cy + sq);
+    draw_lucide(rt, OC_ICON_AT, rf(g_at_btn.left + 8, g_at_btn.top + 8,
+                                   g_at_btn.right - 8, g_at_btn.bottom - 8), OC_COL_MUTED);
+
     /* Send on the right — accent when there is something to send. A paper
      * plane rather than an up-arrow, which read as "scroll" more than "send". */
     int has_text = g_re && GetWindowTextLengthW(g_re) > 0;
@@ -3340,6 +3444,8 @@ static void draw_stub_view(ID2D1RenderTarget *rt, D2D1_RECT_F reg,
     draw_text(rt, sub, g_ui, rf(reg.left, cy - 12, reg.right, cy + 14), OC_COL_MUTED);
     IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
 }
+
+static void draw_lightbox(ID2D1RenderTarget *rt, float W, float H);   /* fwd */
 
 static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, float H) {
     /* Start from a known identity transform — draw_lucide sets a scale/translate
@@ -3398,6 +3504,7 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         ID2D1RenderTarget_FillRectangle(rt, &all, paint_alpha(0x000000, 0.55f));
         draw_signin(rt, W, H);
     }
+    draw_lightbox(rt, W, H);   /* the expanded image covers everything */
     draw_toasts(rt, W, H);  /* …and failure notices float above even those */
 }
 
@@ -3613,6 +3720,8 @@ static void composer_draw_placeholder(HWND hwnd) {
  * autocomplete popover is open it takes Up/Down/Tab/Enter/Esc first — Enter
  * accepting a candidate rather than sending is what makes the popover feel like
  * part of the composer instead of a thing floating over it. */
+static void nav_conversation(HWND hwnd, int delta, int unread_only);   /* fwd */
+
 static LRESULT CALLBACK re_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_PAINT) {
         /* Let the control paint, then overlay the cue on the empty field. */
@@ -3631,6 +3740,18 @@ static LRESULT CALLBACK re_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         default: handled = 0;
         }
         if (handled) { InvalidateRect(GetParent(hwnd), NULL, FALSE); return 0; }
+    }
+    /* Conversation movement while typing: the composer holds focus almost
+     * always, so these have to work from here or they do not work at all. */
+    if (msg == WM_KEYDOWN && (GetKeyState(VK_MENU) & 0x8000) &&
+        (wp == VK_UP || wp == VK_DOWN)) {
+        nav_conversation(GetParent(hwnd), wp == VK_DOWN ? 1 : -1,
+                         (GetKeyState(VK_SHIFT) & 0x8000) != 0);
+        return 0;
+    }
+    if (msg == WM_KEYDOWN && wp == VK_F6) {
+        SetFocus(g_find ? g_find : hwnd);
+        return 0;
     }
     if ((msg == WM_KEYDOWN || msg == WM_CHAR) && wp == VK_RETURN
         && !(GetKeyState(VK_SHIFT) & 0x8000)) {
@@ -3689,7 +3810,7 @@ static void layout_composer(HWND hwnd) {
      * top-aligned once the box is taller than one line so growth reads
      * downward; at rest it is centred against the buttons. */
     float sq = COMPOSER_BTN;
-    float tx = bx0 + 6 + sq * 2 + 8, tr = bx1 - 6 - sq - 8;
+    float tx = bx0 + 6 + sq * 3 + 8, tr = bx1 - 6 - sq - 8;
     float inner = composer_inner_h();
     float texth = inner > COMPOSER_BTN ? inner : COMPOSER_LINE;
     float ty = by0 + COMPOSER_PAD + (inner > COMPOSER_BTN ? 0.0f : (COMPOSER_BTN - COMPOSER_LINE) / 2);
@@ -3728,6 +3849,26 @@ static void layout_find(HWND hwnd) {
     ShowWindow(g_find, SW_SHOW);
 }
 
+static WNDPROC g_find_oldproc;
+static void nav_conversation(HWND hwnd, int delta, int unread_only);   /* fwd */
+
+/* F6 has to work in both directions, or moving focus to the filter box strands
+ * the keyboard there. Esc returns as well, since that is the reflex. */
+static LRESULT CALLBACK find_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_KEYDOWN && (wp == VK_F6 || wp == VK_ESCAPE)) {
+        SetFocus(g_re ? g_re : GetParent(hwnd));
+        return 0;
+    }
+    if (msg == WM_CHAR && wp == VK_ESCAPE) return 0;    /* no MessageBeep */
+    if (msg == WM_KEYDOWN && (GetKeyState(VK_MENU) & 0x8000) &&
+        (wp == VK_UP || wp == VK_DOWN)) {
+        nav_conversation(GetParent(hwnd), wp == VK_DOWN ? 1 : -1,
+                         (GetKeyState(VK_SHIFT) & 0x8000) != 0);
+        return 0;
+    }
+    return CallWindowProcW(g_find_oldproc, hwnd, msg, wp, lp);
+}
+
 static void find_create(HWND parent) {
     g_find = CreateWindowExW(0, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 10, 10, parent,
@@ -3735,6 +3876,7 @@ static void find_create(HWND parent) {
     if (!g_find) return;
     SendMessageW(g_find, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
     SendMessageW(g_find, EM_SETCUEBANNER, TRUE, (LPARAM)L"Find a conversation…");
+    g_find_oldproc = (WNDPROC)SetWindowLongPtrW(g_find, GWLP_WNDPROC, (LONG_PTR)find_proc);
     layout_find(parent);
 }
 
@@ -3798,6 +3940,35 @@ static void palette_accept(HWND hwnd) {
 
 static LRESULT CALLBACK pal_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static WNDPROC g_pal_prev;
+
+/* The expanded image: the full bitmap fitted to the window over a dimmed
+ * backdrop. Drawn last so nothing overlaps it. */
+static ID2D1Bitmap *thumb_get(ID2D1RenderTarget *rt, uint64_t id, UINT *w, UINT *h);  /* fwd */
+
+static void draw_lightbox(ID2D1RenderTarget *rt, float W, float H) {
+    if (!g_lightbox) return;
+    UINT iw = 0, ih = 0;
+    ID2D1Bitmap *bmp = thumb_get(rt, g_lightbox, &iw, &ih);
+    if (!bmp || !iw || !ih) { return; }
+
+    D2D1_RECT_F all = rf(0, 0, W, H);
+    ID2D1RenderTarget_FillRectangle(rt, &all, paint_alpha(0x000000, 0.82f));
+
+    /* Fit inside a margin, and never enlarge past 1:1 — blowing a small image
+     * up to fill the window makes it look broken rather than bigger. */
+    float mw = W - 96, mh = H - 96;
+    float sc = mw / (float)iw;
+    if (mh / (float)ih < sc) sc = mh / (float)ih;
+    if (sc > 1.0f) sc = 1.0f;
+    float dw = (float)iw * sc, dh = (float)ih * sc;
+    D2D1_RECT_F dst = rf((W - dw) / 2, (H - dh) / 2, (W + dw) / 2, (H + dh) / 2);
+    ID2D1RenderTarget_DrawBitmap(rt, bmp, &dst, 1.0f,
+                                 D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, NULL);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, "Click anywhere or press Esc to close", g_small,
+              rf(0, dst.bottom + 10, W, dst.bottom + 32), OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+}
 
 /* Decode `len` bytes into an RT bitmap and cache it under `id`. WIC works from
  * an IStream, so the buffer is wrapped rather than copied to disk. */
@@ -4190,6 +4361,7 @@ static void prefs_save(void);          /* fwd */
 static void prefs_load(const oc_model *m);   /* fwd */
 
 static int on_click(HWND hwnd, int x, int y) {
+    if (g_lightbox) { g_lightbox = 0; return 1; }   /* any click dismisses it */
     if (g_pal_open) {
         for (int i = 0; i < g_n_pal_rows; i++)
             if (in_rect(g_pal_rows[i].r, x, y)) { g_pal_sel = i; palette_accept(hwnd); return 1; }
@@ -4429,6 +4601,8 @@ static int on_click(HWND hwnd, int x, int y) {
         return 1;
     }
     /* Composer attach (+) and send buttons. */
+    for (int i = 0; i < g_n_thumb_hits; i++)
+        if (in_rect(g_thumb_hits[i].r, x, y)) { g_lightbox = g_thumb_hits[i].id; return 1; }
     if (in_rect(g_unread_jump, x, y)) {
         /* Jump to the first message past the marker, reusing the search-hit
          * machinery: same scroll-into-view and flash. */
@@ -4444,6 +4618,17 @@ static int on_click(HWND hwnd, int x, int y) {
     }
     if (in_rect(g_attach_btn, x, y)) { upload_file(hwnd); return 1; }
     if (in_rect(g_emoji_btn, x, y))  { picker_open(hwnd, 0); return 1; }
+    if (in_rect(g_at_btn, x, y)) {
+        /* Insert the trigger at the caret and let the normal completion path
+         * take over, so the button and typing "@" behave identically. */
+        if (g_re) {
+            SetFocus(g_re);
+            SendMessageW(g_re, EM_REPLACESEL, TRUE, (LPARAM)L"@");
+            ac_rebuild();
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 1;
+    }
     if (in_rect(g_send_btn, x, y))   { composer_send(); return 1; }
     /* Overlay row clicks (main area only). */
     {
@@ -5443,10 +5628,11 @@ static void open_new_menu(HWND hwnd) {
  * so a terminal and a window can keep different sidebar shapes. */
 static void prefs_save(void) {
     if (!g_client) return;
-    char enc[288];
-    snprintf(enc, sizeof enc, "t:%d;h:%d;m:%d;d:%d;n:%d;q:%s",
+    char enc[352];
+    snprintf(enc, sizeof enc, "t:%d;h:%d;m:%d;d:%d;n:%d;w:%d,%d,%d,%d,%d;q:%s",
              oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep,
-             g_pref_notify, g_quick_names);
+             g_pref_notify, g_win_x, g_win_y, g_win_w, g_win_h, g_win_max,
+             g_quick_names);
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
 }
 
@@ -5463,6 +5649,12 @@ static void prefs_load(const oc_model *m) {
             if (k == 't') t = val; else if (k == 'h') h = val;
             else if (k == 'm') mm = val; else if (k == 'd') d = val;
             else if (k == 'n') g_pref_notify = (val < 0 || val > 2) ? NOTIFY_FULL : val;
+            else if (k == 'w') {
+                int a, b2, c2, d2, e2;
+                if (sscanf(p + 2, "%d,%d,%d,%d,%d", &a, &b2, &c2, &d2, &e2) == 5 && c2 > 200 && d2 > 150) {
+                    g_win_x = a; g_win_y = b2; g_win_w = c2; g_win_h = d2; g_win_max = e2;
+                }
+            }
             else if (k == 'q') {
                 size_t n2 = 0;
                 for (const char *q = p + 2; *q && *q != ';' && n2 + 1 < sizeof g_quick_names; q++)
@@ -5853,6 +6045,13 @@ static void test_dump(const char *path) {
     }
     fprintf(f, "tray_live=%d notify_pref=%d toasts_raised=%d dnd=%d\n",
             g_tray_live, g_pref_notify, g_toasts_raised, dnd_active(m));
+    fprintf(f, "lightbox=%llu thumb_hits=%d\n", (unsigned long long)g_lightbox, g_n_thumb_hits);
+    for (int i = 0; i < g_n_thumb_hits; i++)
+        fprintf(f, "  thumbhit[%d] id=%llu %.0f,%.0f %.0fx%.0f\n", i,
+                (unsigned long long)g_thumb_hits[i].id,
+                g_thumb_hits[i].r.left, g_thumb_hits[i].r.top,
+                g_thumb_hits[i].r.right - g_thumb_hits[i].r.left,
+                g_thumb_hits[i].r.bottom - g_thumb_hits[i].r.top);
     fprintf(f, "thumb_pending=%llu n_thumbs=%d n_missing=%d off=%d\n",
             (unsigned long long)g_thumb_pending, g_n_thumbs, g_n_thumb_missing, g_thumbs_off);
     for (int i = 0; i < g_n_thumbs; i++)
@@ -5944,6 +6143,9 @@ static void test_poll(HWND hwnd) {
         char ws[256] = "", cred[256] = "";
         sscanf(arg, "%255s %255s", ws, cred);
         if (ws[0]) { switch_workspace(hwnd, ws, cred); test_ack("ok"); } else test_ack("err");
+    } else if (!strcmp(verb, "nav")) {
+        int d = 0, u = 0; sscanf(arg, "%d %d", &d, &u);
+        nav_conversation(hwnd, d, u); test_ack("ok");
     } else if (!strcmp(verb, "dpi")) {
         /* Force a scale factor so the layout can be checked without a scaled
          * display attached. Same path WM_DPICHANGED takes. */
@@ -6084,6 +6286,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * toast channel while the sign-in view owns the window. */
             if (g_view == VIEW_SIGNIN) { if (g_si_connecting) signin_poll(hwnd); }
             else toast_tick(m);
+            /* Persist a settled move. WM_EXITSIZEMOVE covers a drag, but not a
+             * programmatic move, and nothing covers being killed — a debounce
+             * means the placement survives without waiting for a clean exit. */
+            if (g_geom_dirty_at && g_geom_applied &&
+                GetTickCount64() - g_geom_dirty_at > 1200) {
+                g_geom_dirty_at = 0;
+                prefs_save();
+            }
+            if (!g_geom_applied && g_geom_deadline && GetTickCount64() > g_geom_deadline) {
+                g_geom_applied = 1;                 /* settings never came */
+                if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOW);
+            }
             /* OS notifications (WIN-18). Raised for messages that arrive while
              * the window is not in front, subject to the channel's level and the
              * DND window. The first pass after connecting only records the
@@ -6199,6 +6413,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_prefs_pending && oc_model_setting(m, PREFS_SETTING_KEY)) {
                 prefs_load(m);
                 g_prefs_pending = 0;
+                /* Place the window where it was left. The settings arrive after
+                 * auth, so the window is created hidden and shown here — moving
+                 * a visible window would flash it at the default size first. */
+                if (!g_geom_applied) {
+                    g_geom_applied = 1;
+                    if (g_win_x != -1) {
+                        WINDOWPLACEMENT wp2; wp2.length = sizeof wp2;
+                        wp2.flags = 0;
+                        wp2.showCmd = g_win_max ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+                        wp2.ptMinPosition.x = wp2.ptMinPosition.y = 0;
+                        wp2.ptMaxPosition.x = wp2.ptMaxPosition.y = 0;
+                        wp2.rcNormalPosition.left = g_win_x;
+                        wp2.rcNormalPosition.top = g_win_y;
+                        wp2.rcNormalPosition.right = g_win_x + g_win_w;
+                        wp2.rcNormalPosition.bottom = g_win_y + g_win_h;
+                        SetWindowPlacement(hwnd, &wp2);
+                    }
+                    if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOW);
+                }
                 layout_composer(hwnd);
                 InvalidateRect(hwnd, NULL, FALSE);
             }
@@ -6284,7 +6517,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, NULL, TRUE);
         return 0;
     }
+    case WM_MOVE:
+        if (geom_capture(hwnd)) g_geom_dirty_at = GetTickCount64();
+        return 0;
+    case WM_EXITSIZEMOVE:
+        /* Persist when a drag ENDS, not on every WM_SIZE: the bucket is a
+         * network round trip and a resize emits dozens of those. */
+        if (geom_capture(hwnd) && g_geom_applied) prefs_save();
+        return 0;
     case WM_SIZE:
+        if (geom_capture(hwnd)) g_geom_dirty_at = GetTickCount64();
         d2d_resize(hwnd);
         layout_composer(hwnd);
         layout_signin(hwnd);      /* the card is centred, so it moves with the window */
@@ -6441,6 +6683,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_KEYDOWN:
         if (wp == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)) { copy_selection(hwnd); return 0; }
+        if (wp == VK_ESCAPE && g_lightbox) { g_lightbox = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_ESCAPE && g_menu) { g_menu = MENU_NONE; g_menu_hover = -1; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_ESCAPE && g_more_open) { g_more_open = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_ESCAPE && g_has_sel) { g_has_sel = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
@@ -6453,6 +6696,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (wp == 'F' && (GetKeyState(VK_CONTROL) & 0x8000)) { search_open(hwnd); return 0; }
         if (wp == 'K' && (GetKeyState(VK_CONTROL) & 0x8000)) { palette_open(hwnd); return 0; }
+        if ((GetKeyState(VK_MENU) & 0x8000) && (wp == VK_UP || wp == VK_DOWN)) {
+            nav_conversation(hwnd, wp == VK_DOWN ? 1 : -1,
+                             (GetKeyState(VK_SHIFT) & 0x8000) != 0);
+            return 0;
+        }
+        if (wp == VK_F6) { SetFocus(g_re ? g_re : hwnd); return 0; }
         return 0;
     case WM_GETMINMAXINFO: {
         /* Item 4: never shrink below fitting the workspace icon + Home + More +
@@ -6477,6 +6726,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CLOSE:
         /* WIN-59: the outbox is in memory now (ARCH-88), so quitting with a send
          * still queued loses it. Make that a choice rather than a surprise. */
+        if (geom_capture(hwnd) && g_geom_applied) prefs_save();
         {
             /* Across EVERY workspace (WIN-29), not just the visible one: a
              * message stranded in a background workspace is the easiest of all
@@ -6592,7 +6842,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
                     1120, 820, NULL, NULL, inst, NULL);
     if (!hwnd) return 1;
     apply_dark_titlebar(hwnd);
-    ShowWindow(hwnd, show);
+    /* When we are auto-connecting, hold the window back until the settings
+     * bucket arrives so it can open where it was left rather than snapping
+     * there a second later. Shown regardless after a short grace period, and
+     * immediately when there is nothing to wait for (the sign-in view). */
+    if (direct) g_geom_deadline = GetTickCount64() + 1500;
+    else { g_geom_applied = 1; ShowWindow(hwnd, show); }
     UpdateWindow(hwnd);
     /* After ShowWindow: SetFocus on a child of a not-yet-shown window does not
      * stick, which left the workspace field unfocused and swallowed typing. */

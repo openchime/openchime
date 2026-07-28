@@ -136,6 +136,35 @@ there. Three concepts were collapsed into one menu item; they are now distinct:
   shell** with a Cancel, instead of blanking the app. This is also what stopped
   "Add a workspace…" from signing you out of the one you were in.
 
+## Beyond the numbered list
+
+Work done after §1/§2 closed, from reviewing the client against Slack rather
+than against the backlog:
+
+- **DPI awareness** — the process declared none and the render target was pinned
+  to 96, so it shipped blurry on any scaled display. Per-monitor-v2, with the
+  two boundaries that do not scale themselves (native children, mouse messages)
+  converted by hand.
+- **Application icon** — generated from the app's own mark plus the vendored
+  Lucide bell; there was no icon at all.
+- **Composer** — grows to four lines (Shift+Enter used to scroll out of sight),
+  a placeholder naming the target conversation, a paper-plane send, and an `@`
+  button so the mention trigger is an affordance and not just a keystroke.
+- **Emoji consistency** — colour is content, monochrome is chrome. Message
+  bodies never set `ENABLE_COLOR_FONT` while the picker did, so the same
+  character looked different in two places. **Known limit:** the composer's own
+  field renders emoji monochrome because RichEdit draws through GDI, which
+  cannot do colour fonts; fixing it means replacing the input with a custom
+  DirectWrite editor.
+- **Presence dots** — two avatar tints were byte-identical to the online and
+  away colours, so the dot vanished on those avatars. Palette split from the
+  semantic colours, and dots ringed in their surface.
+- **Window placement** remembered across runs, **click-to-expand** for inline
+  images, and **keyboard conversation movement** (Alt+Up/Down, Alt+Shift for
+  unread only, F6 between composer and filter).
+- **Accessibility is REQ-269**, recorded and deliberately unimplemented: the
+  client answers no `WM_GETOBJECT`, so a screen reader sees a blank window.
+
 ## Where this stands
 
 **§1 and §2 are complete** — every item that was buildable in `client/gui/win32/`

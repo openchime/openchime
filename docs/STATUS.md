@@ -362,15 +362,16 @@ CLIENT_GAP_ANALYSIS.md §5 and the CLIENT.md §8 roadmap, not here.
 | 237 all-unreads / unreads-only views | ⛔ | Per-channel unread tracked (REQ-014); no aggregate view. |
 | 238 mark-all-read / catch-up | ⛔ | No bulk cursor-advance. |
 | 254 data import / migration | ⛔ | No importer; distinct from compliance export (REQ-252). |
-| 260 command palette / quick switcher | 🔵 ✅ TUI / ⛔ GUI | TUI has Ctrl+K (ARCH-83); Win32 has only mouse-driven rail menus and a channel-name filter — no keyboard-driven action surface. |
-| 261 in-app settings/preferences hub | ⛔ | Config is file-only (TUI) / absent (Win32); no in-app editor. |
-| 262 theme/appearance selection | 🔵 ⛔ | TUI ships a 256-color theme but no in-app toggle; GUIs honor OS dark mode only. |
-| 263 error/toast + connection-status surface | 🔵 🟡 | TUI partial (status line). **Win32 built** (WIN-1): a transient toast stack for in-session failures + a connection banner (reason + Retry now); runtime-verified. **Win32 sign-in rebuilt** (WIN-2): a two-step in-window view reporting DNS and auth failures inline, retryable, with sign-out returning to it. Remaining there: the reconnect countdown is static text (WIN-55). |
-| 264 keyboard-shortcut reference | 🔵 ✅ TUI / ⛔ GUI | TUI `?` help overlay; Win32 none. |
-| 265 composer autocomplete + emoji picker | 🔵 ⛔ | TUI has @/#/:emoji autocomplete; Win32 has neither. |
-| 266 other-user profile viewer | ⛔ | Neither client can open a peer's profile. |
-| 267 sidebar org parity (DM section, sections, search) | 🔵 ⛔ | TUI has fixed groups; Win32 sidebar is flat, no DM section/search. |
-| 268 first-run onboarding (signup/first-owner UI) | ⛔ | No signup/first-owner flow in any client. |
+| 260 command palette / quick switcher | 🔵 ✅ | TUI Ctrl+K (ARCH-83); **Win32 built** (WIN-11): Ctrl+K subsequence palette over a 20-action catalogue plus every conversation as "Go to", dispatching through the same menu codes the menus use. |
+| 261 in-app settings/preferences hub | 🔵 ✅ GUI / ⛔ TUI | **Win32 built** (WIN-9): appearance, time format, members pane, date dividers, desktop notifications and quick reactions, applied live and synced through the `gui` settings bucket. TUI remains file-only. |
+| 262 theme/appearance selection | 🔵 ✅ GUI / ⛔ TUI | **Win32 built** (WIN-26): dark / light / match-system, applied on the next frame and persisted. TUI still has no in-app toggle. |
+| 263 error/toast + connection-status surface | 🔵 🟡 | TUI partial (status line). **Win32 built** (WIN-1): a transient toast stack for in-session failures + a connection banner (reason + Retry now); runtime-verified. **Win32 sign-in rebuilt** (WIN-2): a two-step in-window view reporting DNS and auth failures inline, retryable, with sign-out returning to it. The reconnect countdown now ticks (WIN-55). |
+| 264 keyboard-shortcut reference | ✅ | TUI `?` overlay; **Win32 built** (WIN-25): Ctrl+/ sheet generated from one KEYMAP table so it cannot drift from the handlers. |
+| 265 composer autocomplete + emoji picker | ✅ | **Win32 built** (WIN-7/8): @/#/:emoji popover plus a searchable category picker, both over a shared core catalogue (`client/core/complete.[ch]`) so the two frontends complete identically. |
+| 266 other-user profile viewer | 🔵 ✅ GUI / ⛔ TUI | **Win32 built** (WIN-10): avatar, name, live presence, role, and Message. Rich fields remain REQ-240. |
+| 267 sidebar org parity (DM section, sections, search) | ✅ | **Win32 built** (WIN-5/6): collapsible Channels/DMs with per-section sort+filter, scrolling, presence avatars, built from the shared `oc_model_sidebar` so TUI and GUI cannot drift. |
+| 268 first-run onboarding (signup/first-owner UI) | 🔵 ✅ GUI / ⛔ TUI | **Win32 built** (WIN-32): "Have an invite? Create an account" redeems an invite on the sign-in card, creating the account and signing in together. |
+| 269 keyboard-only operation + accessibility | 🟡 ⛔ | Win32 is keyboard-operable in the ordinary paths (composer, completion, Alt+Up/Down conversation movement, Ctrl+K, Ctrl+/, F6) but exposes **no accessibility surface**: it answers no `WM_GETOBJECT`, so a screen reader sees one blank window. A self-drawn UI gets nothing for free. |
 | 270 GIF/sticker pickers | ➖ | Explicit exclusion (app/webhook territory). |
 | 271 Canvas / collaborative docs | ➖ | Explicit exclusion. |
 | 272 Lists / tables / boards | ➖ | Explicit exclusion. |
