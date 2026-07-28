@@ -30,6 +30,13 @@ static void channel_free(oc_channel *c) {
     free(c->readers);
 }
 
+/* Apply a PIN event to one message, wherever it lives (REQ-230). */
+static void msg_set_pinned(oc_msg *msg, const oc_ev *e) {
+    msg->pinned    = (e->op == 1);
+    msg->pinned_by = (e->op == 1) ? e->user_id : 0;
+    msg->pinned_at = (e->op == 1) ? e->server_time : 0;
+}
+
 /* Fold a reaction aggregate (emoji now has `count` reactors) into a message. */
 static void msg_apply_reaction(oc_msg *msg, const char *emoji, uint32_t count,
                                uint8_t op, int is_me) {
@@ -628,16 +635,21 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
          * scroll) and is simply dropped — the flag rides along when that message
          * is eventually replayed. */
         oc_channel *c = oc_model_channel(m, e->channel_id);
-        if (c) {
-            for (size_t i = 0; i < c->n_msgs; i++) {
+        if (c)
+            for (size_t i = 0; i < c->n_msgs; i++)
                 if (c->msgs[i].message_id == e->message_id) {
-                    c->msgs[i].pinned    = (e->op == 1);
-                    c->msgs[i].pinned_by = (e->op == 1) ? e->user_id : 0;
-                    c->msgs[i].pinned_at = (e->op == 1) ? e->server_time : 0;
+                    msg_set_pinned(&c->msgs[i], e);
                     break;
                 }
+        /* A thread reply is NOT in the channel's message list, so marking only
+         * that list left a pinned reply looking unpinned in the thread pane —
+         * and its menu still offering "Pin", which made unpinning it from there
+         * impossible (a re-pin is a no-op). Same omission as WIN-15. */
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == e->message_id) {
+                msg_set_pinned(&m->thread_msgs[i], e);
+                break;
             }
-        }
         /* Keep an open pins overlay honest: an unpin from anywhere removes the
          * row rather than leaving a stale entry that 404s when clicked. */
         if (m->pinlist_open && m->pinlist_channel == e->channel_id && e->op != 1) {

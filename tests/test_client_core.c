@@ -301,6 +301,28 @@ static void test_pins(void) {
 
     oc_model_close_pinlist(&m);
     CHECK(!m.pinlist_open && m.n_pins == 0);
+
+    /* A thread reply lives outside the channel's message list, so a pin on one
+     * has to be applied there too — marking only the channel list left a pinned
+     * reply looking unpinned, with a menu that could not unpin it. */
+    m.thread_open = 1;
+    m.thread_channel = 10;
+    m.n_thread_msgs = 1;
+    m.cap_thread_msgs = 1;
+    m.thread_msgs = calloc(1, sizeof *m.thread_msgs);
+    CHECK(m.thread_msgs != NULL);
+    m.thread_msgs[0].message_id = 77;
+
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PIN; e.channel_id = 10; e.message_id = 77; e.user_id = 3;
+    e.op = 1; e.server_time = 4000; oc_model_apply(&m, &e);
+    CHECK(m.thread_msgs[0].pinned == 1 && m.thread_msgs[0].pinned_by == 3);
+
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PIN; e.channel_id = 10; e.message_id = 77; e.op = 0;
+    oc_model_apply(&m, &e);
+    CHECK(m.thread_msgs[0].pinned == 0);
+
     oc_model_free(&m);
 }
 
