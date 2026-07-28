@@ -25,6 +25,7 @@
 #include <dwmapi.h>           /* DwmSetWindowAttribute (dark title bar) */
 #include <d2d1.h>
 #include <dwrite.h>
+#include <wincodec.h>       /* WIC: decode an inline image from memory (WIN-17) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -234,6 +235,55 @@ static float g_thr_scroll, g_thr_scroll_max;
 enum { DRAFT_MAX = 24 };
 static struct { uint64_t cid; WCHAR text[1024]; } g_drafts[DRAFT_MAX];
 static int g_n_drafts;
+
+/* ---- inline image thumbnails (WIN-17) -------------------------------------
+ * Attachments rendered as text lines only. The bytes are fetched INTO MEMORY
+ * (oc_client_fetch_attachment) and decoded with WIC — no temp file, because a
+ * client stores nothing locally (ARCH-88) and a scratch file for rendering is
+ * exactly the cache that decision removed.
+ *
+ * The decoded bitmaps belong to the render target, so the cache is dropped
+ * whenever the RT is recreated. */
+#define THUMB_H 160.0f
+#define THUMB_W 260.0f
+enum { THUMB_CACHE = 32 };
+static struct { uint64_t id; ID2D1Bitmap *bmp; } g_thumbs[THUMB_CACHE];
+static int      g_n_thumbs;
+/* A D2D bitmap belongs to the render target that created it; drawing it into
+ * another one fails the whole frame. The test harness renders the same scene
+ * into a DC target, which is exactly that case — so remember the owner and fall
+ * back to the placeholder anywhere else. */
+static ID2D1RenderTarget *g_thumb_rt;
+static uint64_t g_thumb_missing[THUMB_CACHE];   /* asked for, nothing came back */
+static int      g_n_thumb_missing;
+static uint64_t g_thumb_pending;                /* one fetch in flight */
+static ULONGLONG g_thumb_deadline;
+static IWICImagingFactory *g_wic;
+
+/* Only what WIC will actually decode, and only from the server's declared mime —
+ * guessing from the filename would mean fetching whatever someone chose to call
+ * a .png. */
+static int mime_is_image(const char *mime) {
+    return mime && (strcmp(mime, "image/png") == 0 || strcmp(mime, "image/jpeg") == 0 ||
+                    strcmp(mime, "image/gif") == 0 || strcmp(mime, "image/bmp") == 0 ||
+                    strcmp(mime, "image/webp") == 0);
+}
+
+static ID2D1Bitmap *thumb_get(ID2D1RenderTarget *rt, uint64_t id) {
+    if (rt != g_thumb_rt) return NULL;
+    for (int i = 0; i < g_n_thumbs; i++) if (g_thumbs[i].id == id) return g_thumbs[i].bmp;
+    return NULL;
+}
+static int thumb_failed(uint64_t id) {
+    for (int i = 0; i < g_n_thumb_missing; i++) if (g_thumb_missing[i] == id) return 1;
+    return 0;
+}
+static void thumbs_drop(void) {
+    for (int i = 0; i < g_n_thumbs; i++)
+        if (g_thumbs[i].bmp) ID2D1Bitmap_Release(g_thumbs[i].bmp);
+    g_n_thumbs = 0;
+    g_thumb_rt = NULL;
+}
 
 /* WIN-16: paging older history. One request in flight at a time, and a
  * remembered "we reached the top" so we stop asking a channel that has no more. */
@@ -1331,10 +1381,19 @@ static float msg_height(const oc_msg *msg, float content_w, int grouped,
     *out_body = layout;
 
     int extra = 0;
+    float thumbs = 0;
     if (msg->n_reactions) extra++;
-    extra += msg->n_attach;
+    for (int i = 0; i < msg->n_attach; i++) {
+        /* An image gets a thumbnail box instead of a text line — and the space
+         * must be reserved whether or not the bitmap has arrived, or the
+         * transcript jumps under the reader the moment one decodes. */
+        if (!msg->attach[i].reclaimed && mime_is_image(msg->attach[i].mime))
+            thumbs += THUMB_H + 6.0f;
+        else
+            extra++;
+    }
     if (msg->reply_count) extra++;
-    return MSG_BODY_DY(grouped) + body_h + (float)extra * LINE_H + MSG_BOT(grouped);
+    return MSG_BODY_DY(grouped) + body_h + (float)extra * LINE_H + thumbs + MSG_BOT(grouped);
 }
 
 static int reaction_is_mine(const oc_msg *msg, const char *emoji);   /* fwd */
@@ -1402,11 +1461,55 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
         by += LINE_H;
     }
     for (int i = 0; i < msg->n_attach; i++) {
+        const oc_attachment *at = &msg->attach[i];
+        if (!at->reclaimed && mime_is_image(at->mime)) {
+            ID2D1Bitmap *bmp = thumb_get(rt, at->id);
+            float bw = THUMB_W, bh = THUMB_H;
+            if (bmp) {
+                /* Fit inside the box and never upscale: the box is a maximum,
+                 * not a target, and a 40px icon blown up to 260 looks broken. */
+                /* The C binding returns the struct rather than taking an out
+                 * pointer, unlike most of D2D's C surface. */
+                D2D1_SIZE_F sz = ID2D1Bitmap_GetSize(bmp);
+                if (sz.width > 0 && sz.height > 0) {
+                    float sc = THUMB_W / sz.width;
+                    if (THUMB_H / sz.height < sc) sc = THUMB_H / sz.height;
+                    if (sc > 1.0f) sc = 1.0f;
+                    bw = sz.width * sc; bh = sz.height * sc;
+                }
+                D2D1_RECT_F dst = rf(tx, by + 3, tx + bw, by + 3 + bh);
+                ID2D1RenderTarget_DrawBitmap(rt, bmp, &dst, 1.0f,
+                                             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, NULL);
+                stroke_round(rt, dst, 6.0f, OC_COL_BORDER, 1.0f);
+            } else {
+                D2D1_RECT_F ph = rf(tx, by + 3, tx + bw, by + 3 + bh);
+                fill_round(rt, ph, 6.0f, OC_COL_INPUT);
+                stroke_round(rt, ph, 6.0f, OC_COL_BORDER, 1.0f);
+                /* Always name the file, even while loading: an image whose
+                 * bytes never arrive must not leave a nameless grey box where a
+                 * clickable filename used to be. */
+                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+                draw_text(rt, at->filename, g_small,
+                          rf(ph.left, ph.top + bh / 2 - 20, ph.right, ph.top + bh / 2), OC_COL_ACCENT);
+                if (!thumb_failed(at->id))
+                    draw_text(rt, "loading\u2026", g_small,
+                              rf(ph.left, ph.top + bh / 2, ph.right, ph.top + bh / 2 + 20), OC_COL_FAINT);
+                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+                /* Ask for it — one at a time, and only for what is on screen. */
+                if (!thumb_failed(at->id) && !g_thumb_pending && g_client) {
+                    g_thumb_pending = at->id;
+                    g_thumb_deadline = GetTickCount64() + 8000;
+                    oc_client_fetch_attachment(g_client, at->id);
+                }
+            }
+            by += THUMB_H + 6.0f;
+            continue;
+        }
         char line[200];
-        if (msg->attach[i].reclaimed)
-            snprintf(line, sizeof line, "\xF0\x9F\x93\x8E %s (no longer available)", msg->attach[i].filename);
+        if (at->reclaimed)
+            snprintf(line, sizeof line, "\xF0\x9F\x93\x8E %s (no longer available)", at->filename);
         else
-            snprintf(line, sizeof line, "\xF0\x9F\x93\x8E %s", msg->attach[i].filename);
+            snprintf(line, sizeof line, "\xF0\x9F\x93\x8E %s", at->filename);
         draw_text(rt, line, g_small, rf(tx, by, x0 + content_w + AVA + 12, by + LINE_H), OC_COL_ACCENT);
         by += LINE_H;
     }
@@ -2991,6 +3094,7 @@ static void paint(HWND hwnd) {
 
     HRESULT hr = ID2D1RenderTarget_EndDraw(rt, NULL, NULL);
     if (hr == (HRESULT)D2DERR_RECREATE_TARGET) {
+        thumbs_drop();   /* the bitmaps belong to the target that just died */
         if (g_brush) { ID2D1SolidColorBrush_Release(g_brush); g_brush = NULL; }
         if (g_brush2) { ID2D1SolidColorBrush_Release(g_brush2); g_brush2 = NULL; }
         ID2D1HwndRenderTarget_Release(g_rt);
@@ -3252,6 +3356,55 @@ static void palette_accept(HWND hwnd) {
 
 static LRESULT CALLBACK pal_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static WNDPROC g_pal_prev;
+
+/* Decode `len` bytes into an RT bitmap and cache it under `id`. WIC works from
+ * an IStream, so the buffer is wrapped rather than copied to disk. */
+static void thumb_decode(uint64_t id, const uint8_t *data, size_t len) {
+    if (!g_rt || !data || !len) return;
+    if (!g_wic &&
+        FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                                &IID_IWICImagingFactory, (void **)&g_wic)))
+        return;
+
+    IWICStream *stream = NULL;
+    IWICBitmapDecoder *dec = NULL;
+    IWICBitmapFrameDecode *frame = NULL;
+    IWICFormatConverter *conv = NULL;
+    ID2D1Bitmap *bmp = NULL;
+
+    if (SUCCEEDED(IWICImagingFactory_CreateStream(g_wic, &stream)) &&
+        SUCCEEDED(IWICStream_InitializeFromMemory(stream, (BYTE *)data, (DWORD)len)) &&
+        SUCCEEDED(IWICImagingFactory_CreateDecoderFromStream(
+            g_wic, (IStream *)stream, NULL, WICDecodeMetadataCacheOnLoad, &dec)) &&
+        SUCCEEDED(IWICBitmapDecoder_GetFrame(dec, 0, &frame)) &&
+        SUCCEEDED(IWICImagingFactory_CreateFormatConverter(g_wic, &conv)) &&
+        /* D2D wants premultiplied BGRA whatever the source format was. */
+        SUCCEEDED(IWICFormatConverter_Initialize(conv, (IWICBitmapSource *)frame,
+                                                 &GUID_WICPixelFormat32bppPBGRA,
+                                                 WICBitmapDitherTypeNone, NULL, 0.0,
+                                                 WICBitmapPaletteTypeMedianCut))) {
+        ID2D1RenderTarget_CreateBitmapFromWicBitmap((ID2D1RenderTarget *)g_rt,
+                                                    (IWICBitmapSource *)conv, NULL, &bmp);
+    }
+    if (conv)   IWICFormatConverter_Release(conv);
+    if (frame)  IWICBitmapFrameDecode_Release(frame);
+    if (dec)    IWICBitmapDecoder_Release(dec);
+    if (stream) IWICStream_Release(stream);
+
+    if (!bmp) {   /* not decodable: remember, so we do not re-fetch every frame */
+        if (g_n_thumb_missing < THUMB_CACHE) g_thumb_missing[g_n_thumb_missing++] = id;
+        return;
+    }
+    if (g_n_thumbs == THUMB_CACHE) {          /* oldest out */
+        if (g_thumbs[0].bmp) ID2D1Bitmap_Release(g_thumbs[0].bmp);
+        memmove(&g_thumbs[0], &g_thumbs[1], (THUMB_CACHE - 1) * sizeof g_thumbs[0]);
+        g_n_thumbs--;
+    }
+    g_thumbs[g_n_thumbs].id = id;
+    g_thumbs[g_n_thumbs].bmp = bmp;
+    g_n_thumbs++;
+    g_thumb_rt = (ID2D1RenderTarget *)g_rt;
+}
 
 /* Run whatever is currently in the query box. */
 static void search_submit(void) {
@@ -4948,6 +5101,10 @@ static void test_poll(HWND hwnd) {
             ac_rebuild();
             test_ack("ok");
         } else test_ack("err");
+    } else if (!strcmp(verb, "upload")) {
+        /* Bypass the file dialog so an attachment can be posted from the harness. */
+        if (g_client && g_sel && arg[0]) { oc_client_upload(g_client, g_sel, arg); test_ack("ok"); }
+        else test_ack("err");
     } else if (!strcmp(verb, "palette")) {
         palette_open(hwnd);
         if (arg[0]) { WCHAR w[64]; to_w(arg, w, 64); SetWindowTextW(g_pal_edit, w); }
@@ -5044,6 +5201,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * toast channel while the sign-in view owns the window. */
             if (g_view == VIEW_SIGNIN) { if (g_si_connecting) signin_poll(hwnd); }
             else toast_tick(m);
+            /* An inline image arrived: decode and cache it (WIN-17). */
+            {
+                uint64_t fid = 0; size_t flen = 0;
+                uint8_t *fd = oc_model_take_attachment((oc_model *)m, &fid, &flen);
+                if (fd) {
+                    thumb_decode(fid, fd, flen);
+                    free(fd);
+                    if (g_thumb_pending == fid) g_thumb_pending = 0;
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
+            }
+            /* A fetch that never came back — a reclaimed or oversized image.
+             * Mark it so the transcript stops asking on every frame. */
+            if (g_thumb_pending && GetTickCount64() > g_thumb_deadline) {
+                if (g_n_thumb_missing < THUMB_CACHE) g_thumb_missing[g_n_thumb_missing++] = g_thumb_pending;
+                g_thumb_pending = 0;
+            }
             /* Resolve an in-flight history page. Older messages land ABOVE the
              * view, and g_scroll is measured from the bottom, so the reading
              * position stays put on its own — nothing to compensate for.

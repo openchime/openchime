@@ -22,6 +22,7 @@
 #endif
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 #include <time.h>
 
@@ -222,6 +223,12 @@ typedef struct {
     int      mode;        /* 0 idle, 1 upload, 2 download */
     uint64_t id;          /* attachment id (0 for an upload until UPLOAD_READY) */
     FILE    *fp;          /* the local file (source for upload, sink for download) */
+    /* An in-memory download (WIN-17): `fp` is NULL and chunks accumulate here
+     * instead. Inline image thumbnails must not write a file — a client stores
+     * nothing locally (ARCH-88) — and a temp file for rendering would be exactly
+     * the cache that decision removed. */
+    uint8_t *buf;
+    size_t   buf_len, buf_cap;
     uint64_t total;       /* declared/expected byte size */
     uint64_t done;        /* upload: bytes handed to chunks; download: bytes written */
     uint32_t chunk;       /* max data bytes per chunk (from UPLOAD_READY) */
@@ -282,8 +289,52 @@ static void xfer_notice(disp_ctx *ctx, uint8_t phase, const char *msg) {
 }
 
 /* Tear down the active transfer (closing the file), leaving it idle. */
+/* Cap on an in-memory download (WIN-17). Big enough for any screenshot someone
+ * pastes into chat, small enough that a hostile size cannot be used to grow the
+ * client without bound. Anything larger falls back to "download to a file". */
+#define OC_INLINE_MAX (8u * 1024u * 1024u)
+
+/* The last path component, splitting on EITHER separator. Splitting only on '/'
+ * meant a Windows upload declared its whole path as the filename. */
+static const char *path_basename(const char *path) {
+    const char *b = path;
+    for (const char *p = path; *p; p++)
+        if (*p == '/' || *p == '\\') b = p + 1;
+    return b;
+}
+
+/* The content type, from the extension. Every upload used to be declared
+ * application/octet-stream, so nothing downstream could tell an image from a
+ * zip — which makes inline rendering (REQ-142) impossible however good the
+ * client is. The server stores what we declare, so it has to be right here. */
+static const char *mime_for(const char *name) {
+    const char *dot = strrchr(name, '.');
+    if (!dot) return "application/octet-stream";
+    static const struct { const char *ext, *mime; } T[] = {
+        { "png", "image/png" },   { "jpg", "image/jpeg" }, { "jpeg", "image/jpeg" },
+        { "gif", "image/gif" },   { "bmp", "image/bmp" },  { "webp", "image/webp" },
+        { "svg", "image/svg+xml" },
+        { "pdf", "application/pdf" },
+        { "txt", "text/plain" },  { "md",  "text/markdown" }, { "csv", "text/csv" },
+        { "log", "text/plain" },
+        { "json", "application/json" }, { "xml", "application/xml" },
+        { "zip", "application/zip" },   { "gz",  "application/gzip" },
+        { "mp4", "video/mp4" },   { "webm", "video/webm" },
+        { "mp3", "audio/mpeg" },  { "wav",  "audio/wav" },  { "ogg", "audio/ogg" },
+    };
+    for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) {
+        const char *e = dot + 1;
+        const char *t = T[i].ext;
+        size_t k = 0;
+        while (t[k] && e[k] && tolower((unsigned char)e[k]) == t[k]) k++;
+        if (!t[k] && !e[k]) return T[i].mime;
+    }
+    return "application/octet-stream";
+}
+
 static void xfer_reset(oc_xfer *x) {
     if (x->fp) fclose(x->fp);
+    free(x->buf);
     memset(x, 0, sizeof *x);
 }
 
@@ -699,25 +750,61 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (oc_decode_download_chunk(&p, &dc) == OC_OK && ctx && ctx->xfer->mode == 2 &&
                 dc.attachment_id == ctx->xfer->id && dc.seq == ctx->xfer->next_seq) {
                 oc_xfer *x = ctx->xfer;
-                if (dc.data.len && fwrite(dc.data.ptr, 1, dc.data.len, x->fp) != dc.data.len) {
-                    xfer_notice(ctx, 2, "download: write error"); xfer_reset(x);
-                } else {
-                    x->done += dc.data.len; x->next_seq++;
+                int failed = 0;
+                if (dc.data.len) {
+                    if (x->fp) {
+                        failed = fwrite(dc.data.ptr, 1, dc.data.len, x->fp) != dc.data.len;
+                    } else {
+                        /* Bounded: an image we are about to decode, not a file. */
+                        if (x->buf_len + dc.data.len > OC_INLINE_MAX) failed = 1;
+                        else {
+                            if (x->buf_len + dc.data.len > x->buf_cap) {
+                                size_t want = x->buf_cap ? x->buf_cap * 2 : 65536;
+                                while (want < x->buf_len + dc.data.len) want *= 2;
+                                uint8_t *g = realloc(x->buf, want);
+                                if (!g) failed = 1; else { x->buf = g; x->buf_cap = want; }
+                            }
+                            if (!failed) {
+                                memcpy(x->buf + x->buf_len, dc.data.ptr, dc.data.len);
+                                x->buf_len += dc.data.len;
+                            }
+                        }
+                    }
                 }
+                if (failed) { xfer_notice(ctx, 2, "download: write error"); xfer_reset(x); }
+                else { x->done += dc.data.len; x->next_seq++; }
             }
         } else if (hdr.msg_type == OC_MSG_DOWNLOAD_END) {
             oc_download_end de;
             if (oc_decode_download_end(&p, &de) == OC_OK && ctx && ctx->xfer->mode == 2 &&
                 de.attachment_id == ctx->xfer->id) {
                 oc_xfer *x = ctx->xfer;
-                char msg[256];
-                if (x->total && x->done != x->total)
-                    snprintf(msg, sizeof msg, "download: size mismatch (%llu/%llu)",
-                             (unsigned long long)x->done, (unsigned long long)x->total);
-                else
-                    snprintf(msg, sizeof msg, "saved %s (%llu bytes)", x->name, (unsigned long long)x->done);
-                xfer_notice(ctx, x->total && x->done != x->total ? 2 : 1, msg);
-                xfer_reset(x);
+                int short_read = (x->total && x->done != x->total);
+                if (!x->fp) {
+                    /* In-memory: hand the bytes to the UI thread, which owns them
+                     * from here. No notice — an inline thumbnail is not an event
+                     * the user asked for and should not toast. */
+                    if (!short_read && x->buf_len) {
+                        oc_ev *e = oc_ev_new(OC_EV_ATTACHMENT_DATA);
+                        if (e) {
+                            e->message_id = x->id;
+                            e->count = (uint32_t)x->buf_len;
+                            e->body = (char *)x->buf;
+                            x->buf = NULL; x->buf_len = x->buf_cap = 0;
+                            oc_queue_push(ctx->to_ui, e);
+                        }
+                    }
+                    xfer_reset(x);
+                } else {
+                    char msg[256];
+                    if (short_read)
+                        snprintf(msg, sizeof msg, "download: size mismatch (%llu/%llu)",
+                                 (unsigned long long)x->done, (unsigned long long)x->total);
+                    else
+                        snprintf(msg, sizeof msg, "saved %s (%llu bytes)", x->name, (unsigned long long)x->done);
+                    xfer_notice(ctx, short_read ? 2 : 1, msg);
+                    xfer_reset(x);
+                }
             }
         } else if (hdr.msg_type == OC_MSG_WEBHOOK_INFO) {
             oc_webhook_info wi;
@@ -1210,14 +1297,13 @@ static int run_connection(oc_net *n, int reconnecting,
                             xfer.mode = 1; xfer.fp = fp; xfer.total = (uint64_t)sz;
                             xfer.chunk = OC_ATTACH_CHUNK_SIZE; xfer.win_chunks = 8;
                             xfer.channel = c->channel_id;
-                            const char *slash = strrchr(c->body, '/');
-                            snprintf(xfer.name, sizeof xfer.name, "%s", slash ? slash + 1 : c->body);
+                            snprintf(xfer.name, sizeof xfer.name, "%s", path_basename(c->body));
                             uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                             oc_upload_begin ub; memset(&ub, 0, sizeof ub);
                             ub.channel_id = c->channel_id;
                             gen_idem(ub.idem);
                             ub.filename = oc_slice_str(xfer.name);
-                            ub.mime = oc_slice_str("application/octet-stream");
+                            ub.mime = oc_slice_str(mime_for(xfer.name));
                             ub.total_size = (uint64_t)sz;
                             if (oc_encode_upload_begin(&w, OC_PROTOCOL_VERSION, &ub) == OC_OK &&
                                 write_all(&conn, fd, buf, w.len, &n->stop) == 0) {
@@ -1226,6 +1312,21 @@ static int run_connection(oc_net *n, int reconnecting,
                             } else { xfer_notice(&ctx, 2, "upload: begin failed"); xfer_reset(&xfer); }
                         }
                     }
+                }
+            }
+            if (c->type == OC_CMD_FETCH) {
+                /* Same DOWNLOAD_BEGIN, no file: the bytes come back as an event
+                 * (WIN-17). Silently skipped while another transfer is running —
+                 * a thumbnail must never interrupt a real download, and the
+                 * frontend simply re-requests on a later frame. */
+                if (xfer.mode == 0) {
+                    memset(&xfer, 0, sizeof xfer);
+                    xfer.mode = 2; xfer.fp = NULL; xfer.id = c->message_id;
+                    uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                    oc_download_begin db = { c->message_id };
+                    if (!(oc_encode_download_begin(&w, OC_PROTOCOL_VERSION, &db) == OC_OK &&
+                          write_all(&conn, fd, buf, w.len, &n->stop) == 0))
+                        xfer_reset(&xfer);
                 }
             }
             if (c->type == OC_CMD_DOWNLOAD && c->body) {

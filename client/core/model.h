@@ -181,6 +181,13 @@ typedef struct {
     /* The last hard error (auth failed, unreachable, …). Unlike `status` it is
      * NOT overwritten by the "disconnected" line, so a login flow can read the
      * reason after the connection drops; cleared on a successful connect. */
+    /* The most recent in-memory attachment fetch (WIN-17). The model holds the
+     * bytes until a frontend takes them; taking transfers ownership, so nothing
+     * accumulates if nobody asks. */
+    uint64_t fetched_attachment;
+    uint8_t *fetched_data;
+    size_t   fetched_len;
+
     char     last_error[160];
     /* Bumped every time an error arrives, even an identical one. A frontend that
      * notices only when the TEXT changes stays silent when you repeat a failing
@@ -280,6 +287,10 @@ size_t oc_model_seen_by(const oc_model *m, uint64_t channel_id, uint64_t message
 
 /* Open/close the notification-prefs overlay (frontend view state). */
 void oc_model_set_prefs_open(oc_model *m, int open);
+/* Take the last fetched attachment's bytes (WIN-17), transferring ownership to
+ * the caller, which must free() them. Returns NULL when nothing is waiting. */
+uint8_t *oc_model_take_attachment(oc_model *m, uint64_t *attachment_id, size_t *len);
+
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);
 /* Record a presence value (used for our own presence, which the server does not

@@ -175,6 +175,12 @@ void oc_client_delete_webhook(oc_client *c, uint64_t webhook_id);
 void oc_client_upload(oc_client *c, uint64_t channel_id, const char *path);
 void oc_client_download(oc_client *c, uint64_t attachment_id, const char *dest_path);
 
+/* Fetch an attachment INTO MEMORY (WIN-17): the bytes arrive as an
+ * OC_EV_ATTACHMENT_DATA the frontend consumes, with no file written anywhere
+ * (ARCH-88). For inline images; anything over the core's inline cap is dropped
+ * rather than buffered, so a caller should fall back to a real download. */
+void oc_client_fetch_attachment(oc_client *c, uint64_t attachment_id);
+
 /* Log out: revoke this session (scope OC_LOGOUT_THIS) or all of the user's
  * (OC_LOGOUT_ALL); the server closes the connection. */
 void oc_client_logout(oc_client *c, uint8_t scope);

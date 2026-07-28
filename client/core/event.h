@@ -58,6 +58,7 @@ enum {
     OC_EV_WEBHOOK,         /* a WEBHOOK_LIST entry: message_id=webhook_id + channel_id + body=label + op=disabled */
     OC_EV_WEBHOOK_DELETED, /* a WEBHOOK_DELETED: message_id=webhook_id */
     OC_EV_ATTACHMENT,      /* a message's attachment: channel_id + message_id + parent_id=attachment_id + server_time=size + body=filename + author_name=mime */
+    OC_EV_ATTACHMENT_DATA, /* in-memory download finished: message_id=attachment_id, count=bytes, body=the bytes (NOT a C string) */
     OC_EV_XFER,            /* a transfer notice: op=phase (0 progress, 1 done, 2 error), body=status text */
     OC_EV_READ_STATE,      /* channel_id: mark its currently-loaded messages read (replayed cache is not "unread") */
     OC_EV_SETTINGS_BEGIN,  /* a CLIENT_SETTINGS frame start: clears the synced bucket before its entries */
@@ -134,6 +135,7 @@ enum {
     OC_CMD_CHANNEL_INVITE,  /* add a user to a channel: channel_id + message_id = user id */
     OC_CMD_CHANNEL_KICK,    /* remove a user from a channel: same fields */
     OC_CMD_REDEEM_INVITE,   /* pre-auth: body = token, body2 = "user:pass" */
+    OC_CMD_FETCH,           /* download an attachment INTO MEMORY: message_id = attachment_id */
     OC_CMD_HISTORY,         /* page backwards: channel_id, message_id = before-id (0 = newest) */
     OC_CMD_QUIT
 };

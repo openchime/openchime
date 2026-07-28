@@ -445,6 +445,14 @@ void oc_client_download(oc_client *c, uint64_t attachment_id, const char *dest_p
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_fetch_attachment(oc_client *c, uint64_t attachment_id) {
+    if (!c || !attachment_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_FETCH);
+    if (!cmd) return;
+    cmd->message_id = attachment_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_logout(oc_client *c, uint8_t scope) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_LOGOUT);

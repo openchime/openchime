@@ -57,7 +57,19 @@ static void msg_apply_reaction(oc_msg *msg, const char *emoji, uint32_t count,
     if (is_me) msg->reactions[idx].mine = (op == 1 /* OC_REACT_ADD */) ? 1 : 0;
 }
 
+uint8_t *oc_model_take_attachment(oc_model *m, uint64_t *attachment_id, size_t *len) {
+    if (!m || !m->fetched_data) return NULL;
+    uint8_t *d = m->fetched_data;
+    if (attachment_id) *attachment_id = m->fetched_attachment;
+    if (len) *len = m->fetched_len;
+    m->fetched_data = NULL;
+    m->fetched_len = 0;
+    m->fetched_attachment = 0;
+    return d;
+}
+
 void oc_model_free(oc_model *m) {
+    free(m->fetched_data);
     for (size_t i = 0; i < m->n_channels; i++) channel_free(&m->channels[i]);
     free(m->channels);
     free(m->presence);
@@ -728,6 +740,15 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         webhook_remove(m, e->message_id);
         if (m->webhook_new_id == e->message_id) { m->webhook_token[0] = '\0'; m->webhook_new_id = 0; }
         set_status(m, "webhook deleted");
+        break;
+    case OC_EV_ATTACHMENT_DATA:
+        /* Only one in flight; a second replaces the first rather than queueing,
+         * because a frontend asks for what it is about to draw. */
+        free(m->fetched_data);
+        m->fetched_attachment = e->message_id;
+        m->fetched_data = (uint8_t *)e->body;
+        m->fetched_len = e->count;
+        e->body = NULL;                      /* the model owns the bytes now */
         break;
     case OC_EV_ATTACHMENT:
         /* parent_id = attachment id, server_time = size, body = filename,
