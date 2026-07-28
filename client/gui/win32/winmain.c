@@ -96,15 +96,26 @@ static UINT dpi_for_window(HWND hwnd) {
 #define RAIL_W      70.0f     /* pixel-matched to the Slack rail reference */
 #define SIDEBAR_W   250.0f
 #define HEADER_H    56.0f
-/* The composer's resting height. It GROWS with the message being typed, up to
- * COMPOSER_MAX_LINES — Shift+Enter inserted a newline into a field exactly one
- * line tall, so the result scrolled out of sight the moment you used it. */
-#define COMPOSER_H      86.0f
-#define COMPOSER_LINE   20.0f    /* one wrapped line inside the field */
-#define COMPOSER_MAX_LINES 7
+/* One row at rest: attach, emoji, the text field, and send on the right. The
+ * box grows downward as the message wraps, to COMPOSER_MAX_LINES, with the
+ * buttons staying on the bottom line — so a tall composer reads as the same
+ * control that grew, not a different arrangement.
+ *
+ *   margin-top | pad | max(text, button) | pad | margin-bottom
+ */
+#define COMPOSER_MT     12.0f    /* above the box */
+#define COMPOSER_MB     16.0f    /* below it */
+#define COMPOSER_PAD    12.0f    /* box inner */
+#define COMPOSER_BTN    34.0f    /* the square buttons */
+#define COMPOSER_LINE   20.0f    /* one wrapped line of text */
+#define COMPOSER_MAX_LINES 4
+#define COMPOSER_CHROME (COMPOSER_MT + COMPOSER_PAD * 2 + COMPOSER_MB)
+/* Resting height: one line, but never shorter than the buttons need. */
+#define COMPOSER_H      (COMPOSER_CHROME + COMPOSER_BTN)
 static float g_composer_h = COMPOSER_H;
 
-#define COMPOSER_H_MAX (COMPOSER_H + (COMPOSER_MAX_LINES - 1) * COMPOSER_LINE)
+/* The box's inner height — what the text and the buttons share. */
+static float composer_inner_h(void) { return g_composer_h - COMPOSER_CHROME; }
 #define ROW_H       32.0f     /* a sidebar channel row */
 #define AVA         36.0f     /* transcript avatar diameter */
 #define LINE_H      19.0f     /* an extra (reaction/attach/thread) line */
@@ -3239,35 +3250,33 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
 
     /* A bordered, rounded input container the composer lives inside (Slack-style),
      * so the field reads as a real control rather than a naked line of text. */
-    float bx0 = x0 + 20, bx1 = x0 + w - 20, by0 = top + 12, by1 = h - 16;
+    float bx0 = x0 + 20, bx1 = x0 + w - 20;
+    float by0 = top + COMPOSER_MT, by1 = h - COMPOSER_MB;
     fill_round(rt, rf(bx0, by0, bx1, by1), 10.0f, OC_COL_INPUT);
     stroke_round(rt, rf(bx0, by0, bx1, by1), 10.0f, OC_COL_BORDER, 1.0f);
 
-    /* Buttons sit at the BOTTOM of the box once it grows; centring them in a
-     * tall box leaves them floating in the middle of the text. */
-    float boxh = by1 - by0, sq = 34.0f;
-    float cy = (boxh > COMPOSER_H - 28.0f) ? (by1 - sq - 4) : (by0 + (boxh - sq) / 2);
+    /* Buttons sit on the box's bottom line. At rest that is also its middle,
+     * so a one-line composer reads as a single centred row. */
+    float sq = COMPOSER_BTN;
+    float cy = by1 - COMPOSER_PAD - sq;
 
-    /* Attach (+) on the left. */
     g_attach_btn = rf(bx0 + 6, cy, bx0 + 6 + sq, cy + sq);
-    IDWriteTextFormat_SetTextAlignment(g_hdr, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, "+", g_hdr, rf(g_attach_btn.left, g_attach_btn.top - 2,
-                                 g_attach_btn.right, g_attach_btn.bottom), OC_COL_MUTED);
+    draw_lucide(rt, OC_ICON_PLUS, rf(g_attach_btn.left + 8, g_attach_btn.top + 8,
+                                     g_attach_btn.right - 8, g_attach_btn.bottom - 8),
+                OC_COL_MUTED);
 
-    /* Emoji picker, immediately right of attach. */
     g_emoji_btn = rf(bx0 + 6 + sq, cy, bx0 + 6 + sq * 2, cy + sq);
     draw_emoji_glyph(rt, "\xF0\x9F\x99\x82", g_emoji_btn);
-    IDWriteTextFormat_SetTextAlignment(g_hdr, DWRITE_TEXT_ALIGNMENT_CENTER);
 
-    /* Send on the right — accent when there's text to send, muted when empty. */
+    /* Send on the right — accent when there is something to send. A paper
+     * plane rather than an up-arrow, which read as "scroll" more than "send". */
     int has_text = g_re && GetWindowTextLengthW(g_re) > 0;
     g_send_btn = rf(bx1 - 6 - sq, cy, bx1 - 6, cy + sq);
     fill_round(rt, g_send_btn, 8.0f, has_text ? OC_COL_ACCENT : OC_COL_INPUT);
     if (!has_text) stroke_round(rt, g_send_btn, 8.0f, OC_COL_BORDER, 1.0f);
-    draw_text(rt, "\xE2\x86\x91", g_hdr, rf(g_send_btn.left, g_send_btn.top - 2,
-                                 g_send_btn.right, g_send_btn.bottom),
-              has_text ? 0xFFFFFF : OC_COL_FAINT);
-    IDWriteTextFormat_SetTextAlignment(g_hdr, DWRITE_TEXT_ALIGNMENT_LEADING);
+    draw_lucide(rt, OC_ICON_SEND, rf(g_send_btn.left + 8, g_send_btn.top + 8,
+                                     g_send_btn.right - 8, g_send_btn.bottom - 8),
+                has_text ? 0xFFFFFF : OC_COL_FAINT);
 }
 
 /* ---- paint --------------------------------------------------------------- */
@@ -3565,7 +3574,7 @@ static void composer_draw_placeholder(HWND hwnd) {
     WCHAR w[160]; int n = to_w(g_ph, w, 160);
     RECT rc; GetClientRect(hwnd, &rc);
     /* Matches EM_SETMARGINS(12) and the control's own first-line origin. */
-    TextOutW(dc, PX(12), PX(1), w, n);
+    TextOutW(dc, 0, PX(1), w, n);
     SelectObject(dc, old);
     ReleaseDC(hwnd, dc);
 }
@@ -3620,7 +3629,8 @@ static int composer_remeasure(void) {
         int lines = (int)SendMessageW(g_re, EM_GETLINECOUNT, 0, 0);
         if (lines < 1) lines = 1;
         if (lines > COMPOSER_MAX_LINES) lines = COMPOSER_MAX_LINES;
-        want = COMPOSER_H + (float)(lines - 1) * COMPOSER_LINE;
+        float th = (float)lines * COMPOSER_LINE;
+        want = COMPOSER_CHROME + (th > COMPOSER_BTN ? th : COMPOSER_BTN);
     }
     if (want == g_composer_h) return 0;
     g_composer_h = want;
@@ -3643,16 +3653,17 @@ static void layout_composer(HWND hwnd) {
     float main_x = RAIL_W + SIDEBAR_W;
     /* Inside the composer box, between the attach (+) and send buttons. */
     float bx0 = main_x + 20, bx1 = (rc.right - members) - 20;
-    float by0 = rc.bottom - g_composer_h + 12, by1 = rc.bottom - 16, boxh = by1 - by0;
-    /* Clear BOTH left buttons (attach + emoji), or the native child window
-     * covers the one nearest the text and it renders as a clipped sliver. */
-    int x = (int)(bx0 + 84), r = (int)(bx1 - 48);
-    /* The field fills the grown box, less the padding the buttons sit in. A
-     * fixed 24 here is what hid every line after the first. */
-    float reh = boxh - 10;
-    if (reh < 24) reh = 24;
-    float top = by0 + 5;
-    MoveWindow(g_re, PX(x), PX(top), PX(r - x), PX(reh), TRUE);
+    float by0 = rc.bottom - g_composer_h + COMPOSER_MT;
+    float by1 = rc.bottom - COMPOSER_MB; (void)by1;
+    /* The field sits between the left buttons and Send. Its height is the text,
+     * top-aligned once the box is taller than one line so growth reads
+     * downward; at rest it is centred against the buttons. */
+    float sq = COMPOSER_BTN;
+    float tx = bx0 + 6 + sq * 2 + 8, tr = bx1 - 6 - sq - 8;
+    float inner = composer_inner_h();
+    float texth = inner > COMPOSER_BTN ? inner : COMPOSER_LINE;
+    float ty = by0 + COMPOSER_PAD + (inner > COMPOSER_BTN ? 0.0f : (COMPOSER_BTN - COMPOSER_LINE) / 2);
+    MoveWindow(g_re, PX(tx), PX(ty), PX(tr - tx), PX(texth), TRUE);
 }
 
 /* Position the "Find a conversation" EDIT inside its sidebar box (transcript
@@ -3965,7 +3976,9 @@ static void composer_create(HWND parent) {
     SendMessageW(g_re, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
     SendMessageW(g_re, EM_SETEVENTMASK, 0, ENM_CHANGE);
     /* A little inner margin so text isn't jammed against the edge. */
-    SendMessageW(g_re, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(12, 12));
+    /* No inner margin: the control is placed at the box's text inset already,
+     * and a second margin pushed the caret visibly off the left edge. */
+    SendMessageW(g_re, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(0, 0));
     g_re_oldproc = (WNDPROC)SetWindowLongPtrW(g_re, GWLP_WNDPROC, (LONG_PTR)re_proc);
     layout_composer(parent);
     SetFocus(g_re);

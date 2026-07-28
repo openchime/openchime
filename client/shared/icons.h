@@ -22,6 +22,7 @@ enum {
     OC_ICON_USER,
     OC_ICON_SQUARE_PEN,
     OC_ICON_SEARCH,
+    OC_ICON_SEND,
     OC_ICON_COUNT
 };
 

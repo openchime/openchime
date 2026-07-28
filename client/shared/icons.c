@@ -378,6 +378,15 @@ static const oc_icon_seg SEG_SEARCH[] = {
     { 67, 18.630f, 8.216f, 19.000f, 9.596f, 19.000f, 11.000f },
     { 90, 0.000f, 0.000f, 0.000f, 0.000f, 0.000f, 0.000f },
 };
+static const oc_icon_seg SEG_SEND[] = {
+    { 77, 2.500f, 3.200f, 0.000f, 0.000f, 0.000f, 0.000f },
+    { 76, 21.500f, 12.000f, 0.000f, 0.000f, 0.000f, 0.000f },
+    { 76, 2.500f, 20.800f, 0.000f, 0.000f, 0.000f, 0.000f },
+    { 76, 2.500f, 13.800f, 0.000f, 0.000f, 0.000f, 0.000f },
+    { 76, 15.000f, 12.000f, 0.000f, 0.000f, 0.000f, 0.000f },
+    { 76, 2.500f, 10.200f, 0.000f, 0.000f, 0.000f, 0.000f },
+    { 90, 0.000f, 0.000f, 0.000f, 0.000f, 0.000f, 0.000f },
+};
 
 const oc_icon OC_ICONS[OC_ICON_COUNT] = {
     [OC_ICON_HOME] = { SEG_HOME, 29 },
@@ -392,4 +401,5 @@ const oc_icon OC_ICONS[OC_ICON_COUNT] = {
     [OC_ICON_USER] = { SEG_USER, 38 },
     [OC_ICON_SQUARE_PEN] = { SEG_SQUARE_PEN, 32 },
     [OC_ICON_SEARCH] = { SEG_SEARCH, 16 },
+    [OC_ICON_SEND] = { SEG_SEND, 7 },
 };
