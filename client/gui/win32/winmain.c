@@ -812,16 +812,33 @@ static void draw_menu(ID2D1RenderTarget *rt) {
 
     float cy = y + pad;
     if (g_menu_headerblock) {
-        D2D1_RECT_F av = rf(x + 14, cy + 10, x + 54, cy + 50);
+        /* Reset the transform first: this block draws a glyph inside a filled
+         * square, and a scale/translate left behind by any earlier icon in the
+         * frame distorts it into the malformed-avatar artifact. */
+        D2D1_MATRIX_3X2_F mid = {{{ 1, 0, 0, 1, 0, 0 }}};
+        ID2D1RenderTarget_SetTransform(rt, &mid);
+
+        D2D1_RECT_F av = rf(x + 14, cy + 12, x + 50, cy + 48);   /* 36px, as the rail */
         fill_round(rt, av, 10.0f, OC_COL_ACCENT);
         char nm[80]; ws_display_name(m, nm, sizeof nm);
-        char init[2] = { (char)(nm[0] ? (nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]) : 'O'), 0 };
+        if (!nm[0]) snprintf(nm, sizeof nm, "OpenChime");        /* never a blank row */
+        /* Skip anything that is not a letter or digit, so a workspace typed as
+         * ":8443" or "-acme" still yields a sensible initial. */
+        char in0 = 'O';
+        for (const char *p = nm; *p; p++) {
+            if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9')) {
+                in0 = (*p >= 'a' && *p <= 'z') ? (char)(*p - 32) : *p;
+                break;
+            }
+        }
+        char init[2] = { in0, 0 };
         draw_text(rt, init, g_ava, av, 0xFFFFFF);
-        draw_text(rt, nm, g_name, rf(x + 64, cy + 9, panel.right - 12, cy + 30), OC_COL_TEXT);
+        /* Three rows, 18px apart and non-overlapping (they used to collide). */
+        draw_text(rt, nm, g_name, rf(x + 60, cy + 8, panel.right - 12, cy + 26), OC_COL_TEXT);
         char hostline[288]; snprintf(hostline, sizeof hostline, "%s:%d", g_host, g_port);
-        draw_text(rt, hostline, g_small, rf(x + 64, cy + 28, panel.right - 12, cy + 45), OC_COL_MUTED);
+        draw_text(rt, hostline, g_small, rf(x + 60, cy + 26, panel.right - 12, cy + 43), OC_COL_MUTED);
         char mode[64]; ws_mode_line(m, mode, sizeof mode);
-        draw_text(rt, mode, g_small, rf(x + 64, cy + 44, panel.right - 12, cy + 61), OC_COL_FAINT);
+        draw_text(rt, mode, g_small, rf(x + 60, cy + 42, panel.right - 12, cy + 59), OC_COL_FAINT);
         cy += hh;
         fill(rt, rf(x + 8, cy, panel.right - 8, cy + 1), OC_COL_BORDER);
     }
@@ -851,10 +868,16 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     float x1 = RAIL_W + SIDEBAR_W - 12;
     /* Header: workspace name + chevron (opens ws menu), with settings + compose
      * icon buttons on the right (Slack channel-column header). */
+    /* Hit-boxes stay 24px for a comfortable click target, but the GLYPH is drawn
+     * at 20px to match the rail — mixed icon sizes in one chrome read as a bug. */
     g_hdr_compose = rf(x1 - 24, 16, x1, 40);
     g_hdr_gear    = rf(x1 - 54, 16, x1 - 30, 40);
-    draw_lucide(rt, OC_ICON_SQUARE_PEN, g_hdr_compose, OC_COL_MUTED);
-    draw_lucide(rt, OC_ICON_SETTINGS,   g_hdr_gear,    OC_COL_MUTED);
+    D2D1_RECT_F ci = rf(g_hdr_compose.left + 2, g_hdr_compose.top + 2,
+                        g_hdr_compose.right - 2, g_hdr_compose.bottom - 2);
+    D2D1_RECT_F gi = rf(g_hdr_gear.left + 2, g_hdr_gear.top + 2,
+                        g_hdr_gear.right - 2, g_hdr_gear.bottom - 2);
+    draw_lucide(rt, OC_ICON_SQUARE_PEN, ci, OC_COL_MUTED);
+    draw_lucide(rt, OC_ICON_SETTINGS,   gi, OC_COL_MUTED);
     g_ws_hdr_btn = rf(RAIL_W, 0, g_hdr_gear.left - 4, HEADER_H);
     char wsname[80]; ws_display_name(m, wsname, sizeof wsname);
     draw_text(rt, wsname, g_hdr, rf(RAIL_W + 16, 0, g_hdr_gear.left - 22, HEADER_H), OC_COL_TEXT);

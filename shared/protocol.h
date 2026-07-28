@@ -161,6 +161,7 @@ typedef enum {
     OC_ERR_ATTACHMENT_GONE     = 3013, /* reclaimed by age or storage pressure (REQ-215/217) */
     OC_ERR_TRANSFER_PROTOCOL   = 3015, /* out-of-order/oversized chunk or bad transfer state */
     OC_ERR_UNKNOWN_WEBHOOK     = 3016, /* no such (or disabled) incoming webhook token (REQ-170) */
+    OC_ERR_CHANNEL_EXISTS      = 3017, /* a channel of that name already exists (names are unique, case-insensitively) */
     OC_ERR_INVALID_DEVICE_TOKEN = 3014, /* empty token or unknown platform on REGISTER_DEVICE_TOKEN */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;

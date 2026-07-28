@@ -1465,7 +1465,19 @@ static oc_dbres *process_create_channel(sqlite3 *db, const oc_job *j) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_INVALID_CHANNEL; return r;
     }
 
+    /* Names are unique case-insensitively (migration 0020). Check first so the
+     * caller gets a specific "that name is taken" rather than a generic internal
+     * error off the unique index — the index is the backstop, not the message. */
     sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT 1 FROM channels WHERE kind='channel' AND lower(name)=lower(?1);", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, j->ch_name, (int)nlen, SQLITE_STATIC);
+    int taken = (sqlite3_step(st) == SQLITE_ROW);
+    sqlite3_finalize(st);
+    if (taken) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_CHANNEL_EXISTS; return r;
+    }
+
     sqlite3_prepare_v2(db,
         "INSERT INTO channels(kind,name,is_public,created_at_ms) VALUES('channel',?,?,?);",
         -1, &st, NULL);

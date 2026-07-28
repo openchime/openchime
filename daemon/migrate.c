@@ -372,6 +372,45 @@ static const char MIGRATION_0019[] =
     /* Partial index: only DMs carry a key, so named channels stay unconstrained. */
     "CREATE UNIQUE INDEX idx_channels_dm_key ON channels(dm_key) WHERE dm_key IS NOT NULL;";
 
+/* 0020: a named channel's NAME is unique within the tenant, case-insensitively
+ * (REQ-031/036). CREATE_CHANNEL previously inserted unconditionally, so two
+ * channels could share a name — indistinguishable in every client's sidebar, and
+ * a coin-flip which one a member joined. Same shape as the DM fix (0019): make
+ * the duplicate unrepresentable rather than trusting each write path to check.
+ *
+ * The index is over lower(name) so "Test" cannot shadow "test", and partial on
+ * kind='channel' because DMs legitimately have a NULL name.
+ *
+ * As with 0019, pre-existing violations are deleted rather than merged (nothing
+ * is released yet): of each duplicated name only the oldest channel survives. */
+static const char MIGRATION_0020[] =
+    /* Deleting a channel means deleting everything that REFERENCES it, in
+     * dependency order — channels are pointed at by channel_members, messages,
+     * delivery_cursors, attachments, webhooks and notification_prefs, and
+     * messages in turn by sent_messages, reactions and attachments. Miss one and
+     * the whole migration aborts on a FOREIGN KEY constraint, which takes the
+     * daemon down at boot rather than degrading. */
+    "CREATE TEMP TABLE dup_ch AS SELECT id FROM channels WHERE kind='channel' AND id NOT IN"
+    "  (SELECT MIN(id) FROM channels WHERE kind='channel' GROUP BY lower(name));"
+    "CREATE TEMP TABLE dup_msg AS SELECT id FROM messages WHERE channel_id IN (SELECT id FROM dup_ch);"
+    /* message dependents first */
+    "DELETE FROM sent_messages WHERE message_id IN (SELECT id FROM dup_msg);"
+    "DELETE FROM reactions     WHERE message_id IN (SELECT id FROM dup_msg);"
+    "DELETE FROM attachments   WHERE message_id IN (SELECT id FROM dup_msg);"
+    /* then channel dependents */
+    "DELETE FROM attachments        WHERE channel_id IN (SELECT id FROM dup_ch);"
+    "DELETE FROM webhooks           WHERE channel_id IN (SELECT id FROM dup_ch);"
+    "DELETE FROM notification_prefs WHERE channel_id IN (SELECT id FROM dup_ch);"
+    "DELETE FROM delivery_cursors   WHERE channel_id IN (SELECT id FROM dup_ch);"
+    "DELETE FROM messages           WHERE channel_id IN (SELECT id FROM dup_ch);"
+    "DELETE FROM channel_members    WHERE channel_id IN (SELECT id FROM dup_ch);"
+    "DELETE FROM channels           WHERE id IN (SELECT id FROM dup_ch);"
+    "DROP TABLE dup_msg;"
+    "DROP TABLE dup_ch;"
+    /* Over lower(name) so "Test" cannot shadow "test"; partial on kind='channel'
+     * because a DM legitimately has a NULL name. */
+    "CREATE UNIQUE INDEX idx_channels_name ON channels(lower(name)) WHERE kind='channel';";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -392,6 +431,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 17, MIGRATION_0017 },
     { 18, MIGRATION_0018 },
     { 19, MIGRATION_0019 },
+    { 20, MIGRATION_0020 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

@@ -50,7 +50,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 19);
+    CHECK(oc_schema_version(db) == 20);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -689,6 +689,17 @@ static void test_channels(void) {
     /* An empty name is rejected. */
     r = create_channel(w, alice, "", 0);
     CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_INVALID_CHANNEL);
+    oc_dbres_free(r);
+
+    /* A name already in use is rejected, case-insensitively (migration 0020) —
+     * two #test channels are indistinguishable in a sidebar, and the caller gets
+     * CHANNEL_EXISTS rather than a constraint failure. The privacy flag and the
+     * creator do not make a name available again. */
+    r = create_channel(w, alice, "secret", 1);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_CHANNEL_EXISTS);
+    oc_dbres_free(r);
+    r = create_channel(w, bob, "SeCrEt", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_CHANNEL_EXISTS);
     oc_dbres_free(r);
 
     /* alice sees general + secret (joined); bob sees general but not secret. */

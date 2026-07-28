@@ -4,7 +4,7 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Status.** **Migrations 0001–0019 are applied.** 0001 establishes the core
+**Status.** **Migrations 0001–0020 are applied.** 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
 credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
 `users.disabled` lockout flag; **0004** (§3b) reactions; **0005** (§3c) threads;
@@ -14,7 +14,8 @@ incoming webhooks and the message display-name override; **0012** (§3j)
 notification preferences and the DND window; **0013** (§3k) synced client
 settings; **0014–0015** attachment tombstones and reclaim reason; **0016** (§3l)
 the audit log; **0017** (§3m) federated enrollment; **0018** (§3n) push device
-tokens; **0019** (§3o) the DM participant-set key.
+tokens; **0019** (§3o) the DM participant-set key; **0020** (§3p) the
+unique channel name.
 
 *Corrected: an earlier revision of this line said presence, notification config,
 and attachments were "intentionally not here yet." Notification config landed in
@@ -512,6 +513,30 @@ computes. DMs hold one or two participants (group DMs are REQ-056, unbuilt).
 release, and merging two conversations is a judgement no migration should make
 silently. Member-less DM channels go; where a participant set is duplicated only
 the oldest channel survives, with the others' messages and membership removed.
+
+---
+
+## 3p. Migration 0020 — a channel name is unique (REQ-040)
+
+Adds a **partial unique index** on `lower(name)` `WHERE kind='channel'`, so two
+`#test` channels cannot coexist and `#Test` cannot shadow `#test`. DMs are
+excluded because their `name` is legitimately NULL.
+
+*Why.* `process_create_channel` inserted unconditionally — there was no
+duplicate-name check anywhere — so the workspace accumulated same-named channels
+that were indistinguishable in the sidebar. This is the same defect class as
+§3o: the constraint belongs in the schema, where it cannot be forgotten, rather
+than in the one write path that happens to remember it. The daemon now also
+pre-checks and returns `CHANNEL_EXISTS` (3017) so the client gets a usable
+message instead of a constraint failure.
+
+*Pre-existing duplicates are deleted, keeping the lowest id* — the same
+pre-release reasoning as §3o. Deletion walks every table that references
+`channels` or the affected `messages` (`sent_messages`, `reactions`,
+`attachments`, `webhooks`, `notification_prefs`, `delivery_cursors`,
+`channel_members`) in dependency order: a missed reference aborts the migration
+on a foreign-key constraint, which fails the daemon at boot rather than
+degrading.
 
 ---
 
