@@ -97,6 +97,12 @@ static UINT dpi_for_window(HWND hwnd) {
 #define RAIL_W      70.0f     /* pixel-matched to the Slack rail reference */
 #define SIDEBAR_W   250.0f
 #define HEADER_H    56.0f
+/* The channel tab strip under the header (WIN-37). Slack's shape: the channel
+ * name and its controls on one row, and the channel's own sub-views on the next.
+ * It also fixes something structural — Pins and Files used to replace the
+ * transcript with only "Esc to close" as the way back, so there was no standing
+ * sense of where you were. */
+#define TABBAR_H    34.0f
 /* One row at rest: attach, emoji, the text field, and send on the right. The
  * box grows downward as the message wraps, to COMPOSER_MAX_LINES, with the
  * buttons staying on the bottom line — so a tall composer reads as the same
@@ -568,7 +574,14 @@ static int g_n_notify_hits;
 
 static int      g_show_members = 1;     /* members pane visible */
 static D2D1_RECT_F g_members_btn;       /* header toggle hit-box */
-static D2D1_RECT_F g_pins_btn;          /* header "Pinned" hit-box (REQ-230) */
+enum { TAB_MESSAGES = 0, TAB_FILES, TAB_PINS, TAB_COUNT };
+static int g_tab;                       /* the selected channel tab (WIN-37) */
+static D2D1_RECT_F g_tab_r[TAB_COUNT];  /* tab hit-boxes */
+static D2D1_RECT_F g_memchip;           /* header member-count chip */
+static int g_tab_hover = -1;
+static struct { D2D1_RECT_F row, dl; int ix; } g_filerows[64];
+static int g_n_filerows;
+static uint64_t g_hover_filerow;
 /* Rows of the open pins overlay: click jumps to the message, the trailing
  * button unpins it. */
 static struct { D2D1_RECT_F row, unpin; uint64_t mid; } g_pinrows[64];
@@ -1194,6 +1207,11 @@ static void select_channel(uint64_t cid) {
             g_backfilled[g_n_backfilled++] = cid;
     }
     oc_client_mark_read(g_client, cid);
+    /* This channel's own roster (REQ-031). Asked on every switch rather than
+     * cached: membership changes from other clients, a client stores nothing
+     * (ARCH-88), and the list is small. */
+    oc_client_list_members(g_client, cid);
+    g_tab = TAB_MESSAGES;                /* a new channel opens on its transcript */
     draft_restore(cid);
     ac_close();
 }
@@ -2640,7 +2658,9 @@ static void draw_reactlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
  * list is readable without jumping — and clicking still jumps, because a pin is
  * usually a pointer into a conversation rather than the whole of it. */
 static void draw_pinlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
-    D2D1_RECT_F body = overlay_header(rt, reg, "Pinned");
+    /* No overlay header: the tab strip above already says where you are, and
+     * two titles stacked read as a bug. */
+    D2D1_RECT_F body = reg;
     g_n_pinrows = 0;
     if (m->pinlist_loading) { overlay_empty(rt, body, "Loading\u2026"); return; }
     if (m->n_pins == 0) {
@@ -2666,7 +2686,13 @@ static void draw_pinlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
         }
         snprintf(head, sizeof head, "%s  %s", (who && who[0]) ? who : "user", when);
         draw_text(rt, head, g_name, rf(row.left + 10, y + 4, row.right - 90, y + 24), OC_COL_TEXT);
-        draw_text(rt, pr->body ? pr->body : "", g_ui,
+        /* An attachment-only message has no body; naming the file is the only
+         * thing that makes such a row mean anything. */
+        char prev[256];
+        if (pr->body && pr->body[0]) snprintf(prev, sizeof prev, "%s", pr->body);
+        else if (pr->attach_name[0]) snprintf(prev, sizeof prev, "\U0001F4CE %s", pr->attach_name);
+        else                         snprintf(prev, sizeof prev, "%s", "");
+        draw_text(rt, prev, g_ui,
                   rf(row.left + 10, y + 24, row.right - 90, y + 46), OC_COL_MUTED);
 
         /* Who pinned it, on the same line as the unpin — the attribution and
@@ -2692,6 +2718,63 @@ static void draw_pinlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
             g_n_pinrows++;
         }
         y += rh;
+    }
+}
+
+/* Files shared in this channel (REQ-143, ARCH-91). Deliberately a flat,
+ * newest-first list rather than a grid: most of what gets shared here is not an
+ * image, and a grid of generic file glyphs is worse than a line of names. */
+static void draw_filelist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    D2D1_RECT_F body = rf(reg.left, reg.top, reg.right, reg.bottom);
+    g_n_filerows = 0;
+    if (m->filelist_loading) { overlay_empty(rt, body, "Loading\u2026"); return; }
+    if (m->n_files == 0) {
+        overlay_empty(rt, body, "No files shared in this channel yet.");
+        return;
+    }
+    float y = body.top + 8;
+    for (size_t i = 0; i < m->n_files && y < body.bottom; i++) {
+        const oc_file_view *f = &m->files[i];
+        D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + 46);
+        if (g_hover_filerow == f->id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
+
+        draw_lucide(rt, OC_ICON_FILE, rf(row.left + 10, y + 12, row.left + 32, y + 34),
+                    f->reclaimed ? OC_COL_FAINT : OC_COL_MUTED);
+        draw_text(rt, f->filename, g_ui, rf(row.left + 40, y + 4, row.right - 100, y + 24),
+                  f->reclaimed ? OC_COL_FAINT : OC_COL_TEXT);
+
+        /* Uploader, size and date on the sub-line. A reclaimed row says so
+         * rather than offering a download that cannot work (REQ-215/217). */
+        const char *who = oc_model_user_name((oc_model *)m, f->uploader_id);
+        char sub[192], when[24] = "", sz[32];
+        if (f->created_at) {
+            time_t t = (time_t)(f->created_at / 1000);
+            struct tm tv;
+            if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%d %b", &tv);
+        }
+        if (f->size >= 1024 * 1024) snprintf(sz, sizeof sz, "%.1f MB", (double)f->size / (1024 * 1024));
+        else if (f->size >= 1024)   snprintf(sz, sizeof sz, "%.0f KB", (double)f->size / 1024);
+        else                        snprintf(sz, sizeof sz, "%llu B", (unsigned long long)f->size);
+        snprintf(sub, sizeof sub, "%s \u00B7 %s \u00B7 %s%s",
+                 (who && who[0]) ? who : "someone", sz, when,
+                 f->reclaimed ? "  \u00B7 no longer stored" : "");
+        draw_text(rt, sub, g_small, rf(row.left + 40, y + 24, row.right - 100, y + 42),
+                  OC_COL_FAINT);
+
+        if (!f->reclaimed) {
+            D2D1_RECT_F dl = rf(row.right - 86, y + 12, row.right - 12, y + 34);
+            stroke_round(rt, dl, 6.0f, OC_COL_BORDER, 1.0f);
+            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+            draw_text(rt, "Download", g_small, dl, OC_COL_MUTED);
+            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+            if (g_n_filerows < (int)(sizeof g_filerows / sizeof g_filerows[0])) {
+                g_filerows[g_n_filerows].row = row;
+                g_filerows[g_n_filerows].dl  = dl;
+                g_filerows[g_n_filerows].ix  = (int)i;
+                g_n_filerows++;
+            }
+        }
+        y += 50;
     }
 }
 
@@ -2883,6 +2966,7 @@ static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
     if (m->search_open)    { draw_search(rt, m, reg);    return; }
     if (m->reactlist_open) { draw_reactlist(rt, m, reg); return; }
     if (m->pinlist_open)   { draw_pinlist(rt, m, reg);   return; }
+    if (m->filelist_open)  { draw_filelist(rt, m, reg);  return; }
     if (m->weblist_open)   { draw_weblist(rt, m, reg);   return; }
     if (m->storage_open)   { draw_storage(rt, m, reg);   return; }
     if (m->audit_open)     { draw_audit(rt, m, reg);     return; }
@@ -2956,33 +3040,27 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
         draw_text(rt, title, g_hdr, rf(x0 + 20, 0, x0 + w - 240, HEADER_H), OC_COL_TEXT);
     }
 
-    /* Members toggle (right). */
-    g_members_btn = rf(x0 + w - 16 - 96, 12, x0 + w - 16, HEADER_H - 12);
-    if (g_show_members) fill_round(rt, g_members_btn, 6.0f, OC_COL_SELECT);
-    IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, "Members", g_ui, g_members_btn, g_show_members ? OC_COL_TEXT : OC_COL_MUTED);
-    IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
-
-    /* Pinned (REQ-230). Deliberately label-only: a count would have to come from
-     * the server, and showing one derived from loaded messages would be wrong
-     * more often than right. */
-    if (c) {
-        float pw = text_width("Pinned", g_ui) + 34;
-        g_pins_btn = rf(g_members_btn.left - 8 - pw, 12, g_members_btn.left - 8, HEADER_H - 12);
-        if (m->pinlist_open) fill_round(rt, g_pins_btn, 6.0f, OC_COL_SELECT);
-        draw_lucide(rt, OC_ICON_PIN, rf(g_pins_btn.left + 8, g_pins_btn.top + 6,
-                                        g_pins_btn.left + 22, g_pins_btn.bottom - 6),
-                    m->pinlist_open ? OC_COL_TEXT : OC_COL_MUTED);
-        draw_text(rt, "Pinned", g_ui,
-                  rf(g_pins_btn.left + 26, g_pins_btn.top, g_pins_btn.right, g_pins_btn.bottom),
-                  m->pinlist_open ? OC_COL_TEXT : OC_COL_MUTED);
-    } else {
-        g_pins_btn = rf(0, 0, 0, 0);
-    }
+    /* Member count chip (right), Slack's shape: an icon and a number rather than
+     * the word "Members". The count is the CHANNEL's roster (REQ-031), not the
+     * tenant's — which is what the pane beside it used to show. */
+    char mc[16] = "";
+    if (c && m->chanmem_channel == g_sel && !m->chanmem_loading)
+        snprintf(mc, sizeof mc, "%u", (unsigned)m->n_chanmem);
+    float cw = 30 + (mc[0] ? text_width(mc, g_small) + 4 : 0);
+    g_memchip = rf(x0 + w - 16 - cw, 13, x0 + w - 16, HEADER_H - 13);
+    if (g_show_members) fill_round(rt, g_memchip, 6.0f, OC_COL_SELECT);
+    else                stroke_round(rt, g_memchip, 6.0f, OC_COL_BORDER, 1.0f);
+    uint32_t mcol = g_show_members ? OC_COL_TEXT : OC_COL_MUTED;
+    draw_lucide(rt, OC_ICON_USER, rf(g_memchip.left + 5, g_memchip.top + 4,
+                                     g_memchip.left + 23, g_memchip.bottom - 4), mcol);
+    if (mc[0])
+        draw_text(rt, mc, g_small, rf(g_memchip.left + 25, g_memchip.top,
+                                      g_memchip.right, g_memchip.bottom), mcol);
+    g_members_btn = rf(0, 0, 0, 0);   /* superseded by the chip */
 
     /* Jump-to-unread (WIN-14): only while this channel actually has a divider to
      * jump to, so it is never a dead control. */
-    float statr = g_pins_btn.right > 0 ? g_pins_btn.left - 12 : g_members_btn.left - 12;
+    float statr = g_memchip.left - 12;
     if (g_unread_from && g_unread_chan == g_sel && g_unread_count > 0) {
         char lbl[40];
         snprintf(lbl, sizeof lbl, "%d new \u2191", g_unread_count);
@@ -3004,12 +3082,58 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
     IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 
+/* Switch channel tab (WIN-37). Each tab owns the sub-view it names, so entering
+ * one closes the others rather than stacking overlays — the state the tab strip
+ * displays and the state the transcript renders are the same variable. */
+static void select_tab(int t) {
+    if (t < 0 || t >= TAB_COUNT) return;
+    const oc_model *mm = model();
+    if (mm && mm->pinlist_open)  oc_client_close_pins(g_client);
+    if (mm && mm->filelist_open) oc_client_close_files(g_client);
+    g_tab = t;
+    if (!g_sel) { g_tab = TAB_MESSAGES; return; }
+    if (t == TAB_PINS)  oc_client_list_pins(g_client, g_sel);
+    if (t == TAB_FILES) oc_client_list_files(g_client, g_sel);
+}
+
+/* The channel tab strip. Returns its height so the caller can push content
+ * down; zero when there is no channel to have tabs for. */
+static float draw_tabbar(ID2D1RenderTarget *rt, const oc_model *m, float x0, float w) {
+    for (int i = 0; i < TAB_COUNT; i++) g_tab_r[i] = rf(0, 0, 0, 0);
+    if (!g_sel || !oc_model_channel((oc_model *)m, g_sel)) return 0;
+
+    fill(rt, rf(x0, HEADER_H, x0 + w, HEADER_H + TABBAR_H), OC_COL_HEADER);
+    fill(rt, rf(x0, HEADER_H + TABBAR_H - 1, x0 + w, HEADER_H + TABBAR_H), OC_COL_BORDER);
+
+    static const struct { const char *label; int icon; } TABS[TAB_COUNT] = {
+        { "Messages",      OC_ICON_DMS  },
+        { "Files & links", OC_ICON_FILE },
+        { "Pins",          OC_ICON_PIN  },
+    };
+    float tx = x0 + 16;
+    for (int i = 0; i < TAB_COUNT; i++) {
+        float tw = 26 + text_width(TABS[i].label, g_ui) + 16;
+        D2D1_RECT_F r = rf(tx, HEADER_H + 2, tx + tw, HEADER_H + TABBAR_H - 1);
+        int on = (g_tab == i);
+        uint32_t col = on ? OC_COL_TEXT : OC_COL_MUTED;
+        if (g_tab_hover == i && !on) fill_round(rt, r, 5.0f, OC_COL_HOVER);
+        draw_lucide(rt, TABS[i].icon, rf(r.left + 6, r.top + 8, r.left + 22, r.bottom - 8), col);
+        draw_text(rt, TABS[i].label, g_ui, rf(r.left + 26, r.top, r.right, r.bottom), col);
+        /* The selected tab is marked by an underline on the strip's own border,
+         * which is how a tab reads as a tab rather than as a button. */
+        if (on) fill(rt, rf(r.left + 4, r.bottom - 2, r.right - 4, r.bottom), OC_COL_ACCENT);
+        g_tab_r[i] = r;
+        tx = r.right + 4;
+    }
+    return TABBAR_H;
+}
+
 /* The connection banner (REQ-263): a strip under the header whenever we are not
  * authenticated, naming the state and offering an immediate retry. `last_error`
  * carries the specific reason when the net thread has one ("could not reach the
  * server", the reconnect countdown, a changed certificate); without one we fall
  * back to the phase. Returns its height so the caller can push content down. */
-static float draw_banner(ID2D1RenderTarget *rt, const oc_model *m, float x0, float w) {
+static float draw_banner(ID2D1RenderTarget *rt, const oc_model *m, float x0, float w, float top_off) {
     g_banner_on = 0;
     if (!m || m->authed) return 0;
 
@@ -3033,19 +3157,19 @@ static float draw_banner(ID2D1RenderTarget *rt, const oc_model *m, float x0, flo
      * told us something concrete went wrong — the distinction the user acts on. */
     uint32_t accent = m->last_error[0] ? OC_COL_DANGER : OC_COL_AWAY;
 
-    D2D1_RECT_F r = rf(x0, HEADER_H, x0 + w, HEADER_H + BANNER_H);
+    D2D1_RECT_F r = rf(x0, HEADER_H + top_off, x0 + w, HEADER_H + top_off + BANNER_H);
     fill(rt, r, OC_COL_SIDEBAR);
-    fill(rt, rf(x0, HEADER_H, x0 + 3, r.bottom), accent);          /* status edge */
+    fill(rt, rf(x0, r.top, x0 + 3, r.bottom), accent);          /* status edge */
     fill(rt, rf(x0, r.bottom - 1, x0 + w, r.bottom), OC_COL_BORDER);
 
-    g_retry_btn = rf(x0 + w - 104, HEADER_H + 5, x0 + w - 14, r.bottom - 5);
+    g_retry_btn = rf(x0 + w - 104, r.top + 5, x0 + w - 14, r.bottom - 5);
     fill_round(rt, g_retry_btn, 6.0f, OC_COL_INPUT);
     stroke_round(rt, g_retry_btn, 6.0f, OC_COL_BORDER, 1.0f);
     IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
     draw_text(rt, "Retry now", g_small, g_retry_btn, OC_COL_TEXT);
     IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
 
-    draw_text(rt, why, g_small, rf(x0 + 16, HEADER_H, g_retry_btn.left - 12, r.bottom), accent);
+    draw_text(rt, why, g_small, rf(x0 + 16, r.top, g_retry_btn.left - 12, r.bottom), accent);
     g_banner_on = 1;
     return BANNER_H;
 }
@@ -3197,15 +3321,24 @@ static void draw_members(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
     draw_text(rt, "MEMBERS", g_small, rf(x0 + 16, 10, W - 12, 34), OC_COL_FAINT);
     float y = 40;
     g_n_memrows = 0;
-    for (size_t i = 0; i < m->n_users; i++) {
-        const oc_member *u = &m->users[i];
-        if (u->disabled) continue;
+    /* This channel's members (REQ-031) — NOT the tenant roster, which is what
+     * this pane used to list. With two users the two are the same set, which is
+     * exactly why the bug survived: in any real workspace it showed people who
+     * cannot read the channel they were listed beside. */
+    if (m->chanmem_channel != g_sel || m->chanmem_loading) {
+        draw_text(rt, m->chanmem_loading ? "Loading\u2026" : "", g_small,
+                  rf(x0 + 16, 44, W - 12, 68), OC_COL_FAINT);
+        return;
+    }
+    for (size_t i = 0; i < m->n_chanmem; i++) {
+        const oc_chan_member *cm = &m->chanmem[i];
         if (y > H) break;
+        const char *nm = oc_model_user_name((oc_model *)m, cm->user_id);
         draw_presence_dot(rt, x0 + 22, y + ROW_H / 2, 4.5f,
-                          oc_model_presence_of(m, u->user_id), OC_COL_SIDEBAR);
-        draw_text(rt, u->name[0] ? u->name : "user", g_ui,
+                          oc_model_presence_of(m, cm->user_id), OC_COL_SIDEBAR);
+        draw_text(rt, (nm && nm[0]) ? nm : "user", g_ui,
                   rf(x0 + 34, y, W - 60, y + ROW_H), OC_COL_TEXT);
-        const char *rl = role_label(u->role);
+        const char *rl = role_label(cm->role);
         if (rl[0]) {
             IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
             draw_text(rt, rl, g_small, rf(x0 + 34, y, W - 14, y + ROW_H), OC_COL_FAINT);
@@ -3213,7 +3346,7 @@ static void draw_members(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         }
         if (g_n_memrows < (int)(sizeof g_memrows / sizeof g_memrows[0])) {
             g_memrows[g_n_memrows].top = y; g_memrows[g_n_memrows].bot = y + ROW_H;
-            g_memrows[g_n_memrows].uid = u->user_id; g_n_memrows++;
+            g_memrows[g_n_memrows].uid = cm->user_id; g_n_memrows++;
         }
         y += ROW_H;
     }
@@ -3655,8 +3788,9 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         float main_r = W - members, main_w = main_r - main_x;
         draw_sidebar(rt, m, H);
         draw_header(rt, m, main_x, main_w);
-        float bh = draw_banner(rt, m, main_x, main_w);   /* pushes the transcript down */
-        draw_transcript(rt, m, rf(main_x, HEADER_H + bh, main_r, H - g_composer_h));
+        float th = draw_tabbar(rt, m, main_x, main_w);
+        float bh = draw_banner(rt, m, main_x, main_w, th);  /* pushes the transcript down */
+        draw_transcript(rt, m, rf(main_x, HEADER_H + th + bh, main_r, H - g_composer_h));
         draw_composer(rt, main_x, main_w, H);
         draw_autocomplete(rt, main_x, main_w, H);
         draw_emoji_picker(rt, main_x, main_w, H);
@@ -4790,14 +4924,40 @@ static int on_click(HWND hwnd, int x, int y) {
         open_section_menu(hwnd, g_sb_hover_sec);
         return 1;
     }
-    /* Pinned toggle (REQ-230). Re-opening re-asks the server rather than showing
-     * a cached list: pins change from other clients and a stale list is worse
-     * than a moment's load. */
-    if (in_rect(g_pins_btn, x, y)) {
-        const oc_model *mm2 = g_client ? oc_client_model(g_client) : NULL;
-        if (mm2 && mm2->pinlist_open) oc_client_close_pins(g_client);
-        else if (g_sel)               oc_client_list_pins(g_client, g_sel);
+    /* The channel tabs (WIN-37). Selecting a tab re-asks the server rather than
+     * showing a cached list: pins and files change from other clients, and a
+     * stale list is worse than a moment's load. */
+    for (int t = 0; t < TAB_COUNT; t++)
+        if (in_rect(g_tab_r[t], x, y)) { select_tab(t); return 1; }
+    /* The member chip toggles the roster pane. */
+    if (in_rect(g_memchip, x, y)) {
+        g_show_members = !g_show_members;
+        layout_composer(hwnd);
         return 1;
+    }
+    /* Rows of the open files list. */
+    {
+        const oc_model *fm = model();
+        for (int i = 0; i < g_n_filerows && fm; i++) {
+            if ((size_t)g_filerows[i].ix >= fm->n_files) continue;
+            const oc_file_view *f = &fm->files[g_filerows[i].ix];
+            if (in_rect(g_filerows[i].dl, x, y)) {
+                oc_attachment at = { f->id, {0}, {0}, f->size, f->reclaimed };
+                snprintf(at.filename, sizeof at.filename, "%s", f->filename);
+                snprintf(at.mime, sizeof at.mime, "%s", f->mime);
+                download_attachment(hwnd, &at);
+                return 1;
+            }
+            if (in_rect(g_filerows[i].row, x, y)) {
+                /* Jump to the message it was shared with — a file is a thing
+                 * somebody said something about. */
+                if (f->message_id) {
+                    g_jump_mid = f->message_id;
+                    select_tab(TAB_MESSAGES);
+                }
+                return 1;
+            }
+        }
     }
     /* Rows of the open pins overlay. */
     for (int i = 0; i < g_n_pinrows; i++) {
@@ -6486,6 +6646,16 @@ static void test_poll(HWND hwnd) {
         const oc_msg *pmsg = find_msg(pc, mid);
         oc_client_pin(g_client, g_sel, mid, (pmsg && pmsg->pinned) ? OC_PIN_REMOVE : OC_PIN_ADD);
         test_ack("ok");
+    } else if (!strcmp(verb, "mkchan")) {
+        /* Bypass the modal New-channel dialog, as "upload" bypasses the file
+         * dialog: the harness cannot drive a modal. */
+        char nm[64] = {0}; int pub = 1;
+        sscanf(arg, "%63s %d", nm, &pub);
+        if (g_client && nm[0]) { oc_client_create_channel_ex(g_client, nm, pub == 0); test_ack("ok"); }
+        else test_ack("err");
+    } else if (!strcmp(verb, "tab")) {
+        select_tab(atoi(arg));
+        test_ack("ok");
     } else if (!strcmp(verb, "pins")) {
         const oc_model *pm = model();
         if (pm && pm->pinlist_open) oc_client_close_pins(g_client);
@@ -6978,6 +7148,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int r = (any_overlay(model()) || !view_has_sidebar()) ? -1 : msgrow_at(my);
             uint64_t h = r >= 0 ? g_msgrows[r].mid : 0;
             if (h != g_hover_mid) { g_hover_mid = h; InvalidateRect(hwnd, NULL, FALSE); }
+            /* Tab strip hover. */
+            int th2 = -1;
+            for (int i = 0; i < TAB_COUNT; i++)
+                if (in_rect(g_tab_r[i], (float)mx, (float)my)) { th2 = i; break; }
+            if (th2 != g_tab_hover) { g_tab_hover = th2; InvalidateRect(hwnd, NULL, FALSE); }
+            /* Files-list row hover. */
+            uint64_t fh = 0;
+            {
+                const oc_model *fm = model();
+                for (int i = 0; i < g_n_filerows && fm; i++)
+                    if (in_rect(g_filerows[i].row, (float)mx, (float)my) &&
+                        (size_t)g_filerows[i].ix < fm->n_files) {
+                        fh = fm->files[g_filerows[i].ix].id; break;
+                    }
+            }
+            if (fh != g_hover_filerow) { g_hover_filerow = fh; InvalidateRect(hwnd, NULL, FALSE); }
             /* Pins-overlay row hover, so a row reads as the clickable thing it is. */
             uint64_t ph = 0;
             for (int i = 0; i < g_n_pinrows; i++)

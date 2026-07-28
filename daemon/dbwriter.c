@@ -219,8 +219,11 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->replay);
     for (size_t i = 0; i < r->n_rreact; i++) free(r->rreact[i].emoji);
     free(r->rreact);
-    for (size_t i = 0; i < r->n_plist; i++) free(r->plist[i].body);
+    for (size_t i = 0; i < r->n_plist; i++) { free(r->plist[i].body); free(r->plist[i].attach_name); }
     free(r->plist);
+    free(r->cmlist);
+    for (size_t i = 0; i < r->n_flist; i++) { free(r->flist[i].filename); free(r->flist[i].mime); }
+    free(r->flist);
     free(r->ch_name);
     for (size_t i = 0; i < r->n_chlist; i++) free(r->chlist[i].name);
     free(r->chlist);
@@ -1796,6 +1799,107 @@ static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* A channel's member roster (REQ-031).
+ *
+ * The membership has always been stored; what was missing was any way for a
+ * client to READ it, so a frontend showed the tenant roster beside a channel
+ * name and called it "members" — wrong the moment a workspace holds more people
+ * than one channel does. */
+static oc_dbres *process_list_members(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+
+    /* You may only enumerate a channel you can read, or this becomes a way to
+     * discover who is in a private channel you were never invited to. */
+    if (!is_member(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+    r->type = OC_RES_MEMBER_LIST;
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT cm.user_id, cm.joined_at_ms, u.role FROM channel_members cm "
+        "  JOIN users u ON u.id = cm.user_id "
+        " WHERE cm.channel_id=? AND u.disabled=0 "
+        " ORDER BY cm.joined_at_ms LIMIT ?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)OC_MAX_MEMBER_LIST);
+
+    oc_chanmem_row *arr = calloc(OC_MAX_MEMBER_LIST, sizeof *arr);
+    size_t n = 0;
+    while (arr && n < OC_MAX_MEMBER_LIST && sqlite3_step(st) == SQLITE_ROW) {
+        arr[n].user_id   = (uint64_t)sqlite3_column_int64(st, 0);
+        arr[n].joined_at = (uint64_t)sqlite3_column_int64(st, 1);
+        arr[n].role      = role_to_u8((const char *)sqlite3_column_text(st, 2));
+        n++;
+    }
+    sqlite3_finalize(st);
+    r->cmlist = arr;
+    r->n_cmlist = n;
+    return r;
+}
+
+/* Files shared in a channel — or, with channel_id 0, across every channel the
+ * caller can read (REQ-143, ARCH-91).
+ *
+ * Pending uploads (message_id NULL) are excluded: an upload that never reached
+ * a message was never shared with anyone. Reclaimed rows are KEPT and flagged,
+ * because "this was here and the bytes are gone" (REQ-215/217) is information
+ * where a silently missing row is not. */
+static oc_dbres *process_list_files(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+
+    if (j->channel_id && !is_member(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+    r->type = OC_RES_FILE_LIST;
+
+    sqlite3_stmt *st = NULL;
+    /* One channel reads 0023's index directly; the workspace-wide form filters
+     * by membership instead, which is the same set a backfill would show. */
+    const char *sql = j->channel_id
+        ? "SELECT a.id, a.channel_id, a.message_id, a.uploader_id, a.size, "
+          "       a.created_at_ms, a.reclaimed_at_ms, a.filename, a.mime "
+          "  FROM attachments a "
+          " WHERE a.channel_id=?1 AND a.message_id IS NOT NULL "
+          " ORDER BY a.created_at_ms DESC LIMIT ?2;"
+        : "SELECT a.id, a.channel_id, a.message_id, a.uploader_id, a.size, "
+          "       a.created_at_ms, a.reclaimed_at_ms, a.filename, a.mime "
+          "  FROM attachments a "
+          " WHERE a.message_id IS NOT NULL AND a.channel_id IN "
+          "       (SELECT channel_id FROM channel_members WHERE user_id=?1) "
+          " ORDER BY a.created_at_ms DESC LIMIT ?2;";
+    sqlite3_prepare_v2(db, sql, -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)(j->channel_id ? j->channel_id : j->user_id));
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)OC_MAX_FILE_LIST);
+
+    oc_file_row *arr = calloc(OC_MAX_FILE_LIST, sizeof *arr);
+    size_t n = 0;
+    while (arr && n < OC_MAX_FILE_LIST && sqlite3_step(st) == SQLITE_ROW) {
+        arr[n].id          = (uint64_t)sqlite3_column_int64(st, 0);
+        arr[n].channel_id  = (uint64_t)sqlite3_column_int64(st, 1);
+        arr[n].message_id  = (uint64_t)sqlite3_column_int64(st, 2);
+        arr[n].uploader_id = (uint64_t)sqlite3_column_int64(st, 3);
+        arr[n].size        = (uint64_t)sqlite3_column_int64(st, 4);
+        arr[n].created_at  = (uint64_t)sqlite3_column_int64(st, 5);
+        arr[n].reclaimed   = sqlite3_column_int64(st, 6) != 0;
+        const unsigned char *fn = sqlite3_column_text(st, 7);
+        const unsigned char *mt = sqlite3_column_text(st, 8);
+        arr[n].filename = strdup(fn ? (const char *)fn : "");
+        arr[n].mime     = strdup(mt ? (const char *)mt : "");
+        n++;
+    }
+    sqlite3_finalize(st);
+    r->flist = arr;
+    r->n_flist = n;
+    return r;
+}
+
 /* Pin or unpin a message (REQ-230, ARCH-90).
  *
  * A pin belongs to the channel, so any member may place one and any member may
@@ -1898,7 +2002,11 @@ static oc_dbres *process_list_pins(sqlite3 *db, const oc_job *j) {
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
         "SELECT p.message_id, m.author_id, m.created_at_ms, "
-        "       COALESCE(p.pinned_by,0), p.created_at_ms, m.body "
+        "       COALESCE(p.pinned_by,0), p.created_at_ms, m.body, "
+        /* An attachment-only message has no body, so the list needs something
+         * to show for it or the row renders blank. */
+        "       (SELECT a.filename FROM attachments a WHERE a.message_id = m.id "
+        "         ORDER BY a.id LIMIT 1) "
         "  FROM pins p JOIN messages m ON m.id = p.message_id "
         " WHERE p.channel_id=? AND m.deleted_at_ms IS NULL "
         " ORDER BY p.created_at_ms DESC LIMIT ?;", -1, &st, NULL);
@@ -1915,6 +2023,8 @@ static oc_dbres *process_list_pins(sqlite3 *db, const oc_job *j) {
         arr[n].pinned_at     = (uint64_t)sqlite3_column_int64(st, 4);
         const unsigned char *b = sqlite3_column_text(st, 5);
         arr[n].body = b ? strdup((const char *)b) : NULL;
+        const unsigned char *an = sqlite3_column_text(st, 6);
+        arr[n].attach_name = an ? strdup((const char *)an) : NULL;
         n++;
     }
     sqlite3_finalize(st);
@@ -3244,7 +3354,8 @@ static oc_dbres *process_audit_query(sqlite3 *db, const oc_job *j);
 static int is_read_job(int type) {
     return type == OC_JOB_BACKFILL || type == OC_JOB_HISTORY || type == OC_JOB_SEARCH ||
            type == OC_JOB_LIST_CHANNELS || type == OC_JOB_LIST_USERS ||
-           type == OC_JOB_LIST_REACTIONS || type == OC_JOB_LIST_PINS || type == OC_JOB_LIST_THREAD ||
+           type == OC_JOB_LIST_REACTIONS || type == OC_JOB_LIST_PINS ||
+           type == OC_JOB_LIST_MEMBERS || type == OC_JOB_LIST_FILES || type == OC_JOB_LIST_THREAD ||
            type == OC_JOB_TYPING || type == OC_JOB_ATTACH_LOOKUP ||
            type == OC_JOB_LIST_WEBHOOKS || type == OC_JOB_LIST_NOTIFY_PREFS ||
            type == OC_JOB_LIST_CLIENT_SETTINGS ||
@@ -3262,6 +3373,8 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_LIST_USERS)     return process_list_users(rdb, j);
     if (j->type == OC_JOB_LIST_REACTIONS) return process_list_reactions(rdb, j);
     if (j->type == OC_JOB_LIST_PINS)      return process_list_pins(rdb, j);
+    if (j->type == OC_JOB_LIST_MEMBERS)   return process_list_members(rdb, j);
+    if (j->type == OC_JOB_LIST_FILES)     return process_list_files(rdb, j);
     if (j->type == OC_JOB_LIST_THREAD)    return process_list_thread(rdb, j);
     if (j->type == OC_JOB_TYPING)         return process_typing(rdb, j);
     if (j->type == OC_JOB_ATTACH_LOOKUP)  return process_attach_lookup(rdb, j);

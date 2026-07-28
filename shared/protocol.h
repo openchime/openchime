@@ -74,6 +74,12 @@ typedef enum {
     OC_MSG_LIST_PINS        = 0x0037, /* C->S, a channel's pinned messages */
     OC_MSG_PINNED_MSG       = 0x0038, /* S->C, one pinned message (streamed, body included) */
     OC_MSG_PINS             = 0x0039, /* S->C, terminator of a LIST_PINS response */
+    OC_MSG_LIST_MEMBERS     = 0x003A, /* C->S (REQ-031), a channel's members */
+    OC_MSG_MEMBER_ENTRY     = 0x003B, /* S->C, one channel member (streamed) */
+    OC_MSG_MEMBERS          = 0x003C, /* S->C, terminator of a LIST_MEMBERS response */
+    OC_MSG_LIST_FILES       = 0x003D, /* C->S (REQ-143), files in a channel (0 = everywhere) */
+    OC_MSG_FILE_ENTRY       = 0x003E, /* S->C, one shared file (streamed) */
+    OC_MSG_FILES            = 0x003F, /* S->C, terminator of a LIST_FILES response */
     OC_MSG_CREATE_CHANNEL     = 0x0050, /* C->S (REQ-050) */
     OC_MSG_CHANNEL_INFO       = 0x0051, /* S->C, ack for create/join/leave/invite/remove */
     OC_MSG_LIST_CHANNELS      = 0x0052, /* C->S */
@@ -319,6 +325,12 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_PIN_ADD    1u
 #define OC_MAX_PINS   100u
 
+/* Response caps for the two channel-details listings (REQ-031, REQ-143). Both
+ * are "show me this channel" views, not paged datasets: a bound keeps one frame
+ * burst bounded, and a client that wants an older file has search. */
+#define OC_MAX_MEMBER_LIST 500u
+#define OC_MAX_FILE_LIST   200u
+
 /* LOGOUT scope (PROTOCOL.md §4; REQ-182). */
 #define OC_LOGOUT_THIS 0u   /* revoke just the presented session token */
 #define OC_LOGOUT_ALL  1u   /* revoke every session of the authenticated user */
@@ -383,8 +395,31 @@ typedef struct { uint64_t channel_id; uint64_t message_id; uint8_t op; } oc_pin;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t user_id; uint8_t op; uint64_t pinned_at; } oc_pin_updated;
 typedef struct { uint64_t channel_id; } oc_list_pins;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time;
-                 uint64_t pinned_by; uint64_t pinned_at; oc_slice body; } oc_pinned_msg;
+                 uint64_t pinned_by; uint64_t pinned_at; oc_slice body;
+                 /* The first attachment's filename, or empty. An attachment-only
+                  * message has no body at all, so without this a pinned file
+                  * rendered as a blank row in the pins list. */
+                 oc_slice attach_name; } oc_pinned_msg;
 typedef struct { uint64_t channel_id; uint32_t count; } oc_pins;
+
+/* A channel's members (REQ-031) and its shared files (REQ-143, ARCH-91). Both
+ * follow the LIST_PINS shape — stream the entries, then a terminator — because
+ * both carry variable-length text and both are lists a client holds nothing on
+ * disk to reconstruct (ARCH-88). */
+typedef struct { uint64_t channel_id; } oc_list_members;
+typedef struct { uint64_t channel_id; uint64_t user_id; uint8_t role; uint64_t joined_at; } oc_member_entry;
+typedef struct { uint64_t channel_id; uint32_t count; } oc_members;
+
+/* channel_id 0 means "every channel I can read" — the same query with a wider
+ * WHERE, which is what makes a workspace-wide files view free. */
+typedef struct { uint64_t channel_id; } oc_list_files;
+typedef struct {
+    uint64_t attachment_id, channel_id, message_id, uploader_id;
+    uint64_t size, created_at;
+    uint8_t  reclaimed;          /* bytes gone (REQ-215/217); row kept, no download */
+    oc_slice filename, mime;
+} oc_file_entry;
+typedef struct { uint64_t channel_id; uint32_t count; } oc_files;
 
 typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; uint64_t parent_id; oc_slice body;
                  uint16_t n_attach; uint64_t attach_ids[OC_MAX_ATTACH]; } oc_send_reply;
@@ -565,6 +600,12 @@ oc_result oc_encode_pin_updated(oc_wbuf *w, uint16_t version, const oc_pin_updat
 oc_result oc_encode_list_pins(oc_wbuf *w, uint16_t version, const oc_list_pins *m);
 oc_result oc_encode_pinned_msg(oc_wbuf *w, uint16_t version, const oc_pinned_msg *m);
 oc_result oc_encode_pins(oc_wbuf *w, uint16_t version, const oc_pins *m);
+oc_result oc_encode_list_members(oc_wbuf *w, uint16_t version, const oc_list_members *m);
+oc_result oc_encode_member_entry(oc_wbuf *w, uint16_t version, const oc_member_entry *m);
+oc_result oc_encode_members(oc_wbuf *w, uint16_t version, const oc_members *m);
+oc_result oc_encode_list_files(oc_wbuf *w, uint16_t version, const oc_list_files *m);
+oc_result oc_encode_file_entry(oc_wbuf *w, uint16_t version, const oc_file_entry *m);
+oc_result oc_encode_files(oc_wbuf *w, uint16_t version, const oc_files *m);
 oc_result oc_encode_reactions(oc_wbuf *w, uint16_t version, const oc_reactions *m);
 oc_result oc_encode_send_reply(oc_wbuf *w, uint16_t version, const oc_send_reply *m);
 oc_result oc_encode_thread_reply(oc_wbuf *w, uint16_t version, const oc_thread_reply *m);
@@ -677,6 +718,12 @@ oc_result oc_decode_pin_updated(oc_rbuf *p, oc_pin_updated *m);
 oc_result oc_decode_list_pins(oc_rbuf *p, oc_list_pins *m);
 oc_result oc_decode_pinned_msg(oc_rbuf *p, oc_pinned_msg *m);
 oc_result oc_decode_pins(oc_rbuf *p, oc_pins *m);
+oc_result oc_decode_list_members(oc_rbuf *p, oc_list_members *m);
+oc_result oc_decode_member_entry(oc_rbuf *p, oc_member_entry *m);
+oc_result oc_decode_members(oc_rbuf *p, oc_members *m);
+oc_result oc_decode_list_files(oc_rbuf *p, oc_list_files *m);
+oc_result oc_decode_file_entry(oc_rbuf *p, oc_file_entry *m);
+oc_result oc_decode_files(oc_rbuf *p, oc_files *m);
 oc_result oc_decode_reactions(oc_rbuf *p, oc_reaction_entry *entries, uint16_t cap, uint16_t *out_count, uint64_t *out_message_id);
 oc_result oc_decode_send_reply(oc_rbuf *p, oc_send_reply *m);
 oc_result oc_decode_thread_reply(oc_rbuf *p, oc_thread_reply *m);

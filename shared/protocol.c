@@ -433,11 +433,61 @@ oc_result oc_encode_pinned_msg(oc_wbuf *w, uint16_t version, const oc_pinned_msg
     oc_w_u64(w, m->pinned_by);
     oc_w_u64(w, m->pinned_at);
     oc_w_str(w, m->body);
+    oc_w_str(w, m->attach_name);
     return oc_frame_end(w, off);
 }
 
 oc_result oc_encode_pins(oc_wbuf *w, uint16_t version, const oc_pins *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_PINS);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u32(w, m->count);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_list_members(oc_wbuf *w, uint16_t version, const oc_list_members *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_MEMBERS);
+    oc_w_u64(w, m->channel_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_member_entry(oc_wbuf *w, uint16_t version, const oc_member_entry *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_MEMBER_ENTRY);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->user_id);
+    oc_w_u8(w, m->role);
+    oc_w_u64(w, m->joined_at);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_members(oc_wbuf *w, uint16_t version, const oc_members *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_MEMBERS);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u32(w, m->count);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_list_files(oc_wbuf *w, uint16_t version, const oc_list_files *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_FILES);
+    oc_w_u64(w, m->channel_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_file_entry(oc_wbuf *w, uint16_t version, const oc_file_entry *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_FILE_ENTRY);
+    oc_w_u64(w, m->attachment_id);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->message_id);
+    oc_w_u64(w, m->uploader_id);
+    oc_w_u64(w, m->size);
+    oc_w_u64(w, m->created_at);
+    oc_w_u8(w, m->reclaimed);
+    oc_w_str(w, m->filename);
+    oc_w_str(w, m->mime);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_files(oc_wbuf *w, uint16_t version, const oc_files *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_FILES);
     oc_w_u64(w, m->channel_id);
     oc_w_u32(w, m->count);
     return oc_frame_end(w, off);
@@ -1412,12 +1462,56 @@ oc_result oc_decode_pinned_msg(oc_rbuf *p, oc_pinned_msg *m) {
     m->pinned_by   = oc_r_u64(p);
     m->pinned_at   = oc_r_u64(p);
     m->body        = oc_r_str(p);
+    m->attach_name = oc_r_str(p);
     return r_done(p);
 }
 
 oc_result oc_decode_pins(oc_rbuf *p, oc_pins *m) {
     m->channel_id = oc_r_u64(p);
     m->count = oc_r_u32(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_list_members(oc_rbuf *p, oc_list_members *m) {
+    m->channel_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_member_entry(oc_rbuf *p, oc_member_entry *m) {
+    m->channel_id = oc_r_u64(p);
+    m->user_id    = oc_r_u64(p);
+    m->role       = oc_r_u8(p);
+    m->joined_at  = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_members(oc_rbuf *p, oc_members *m) {
+    m->channel_id = oc_r_u64(p);
+    m->count      = oc_r_u32(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_list_files(oc_rbuf *p, oc_list_files *m) {
+    m->channel_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_file_entry(oc_rbuf *p, oc_file_entry *m) {
+    m->attachment_id = oc_r_u64(p);
+    m->channel_id    = oc_r_u64(p);
+    m->message_id    = oc_r_u64(p);
+    m->uploader_id   = oc_r_u64(p);
+    m->size          = oc_r_u64(p);
+    m->created_at    = oc_r_u64(p);
+    m->reclaimed     = oc_r_u8(p);
+    m->filename      = oc_r_str(p);
+    m->mime          = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_files(oc_rbuf *p, oc_files *m) {
+    m->channel_id = oc_r_u64(p);
+    m->count      = oc_r_u32(p);
     return r_done(p);
 }
 

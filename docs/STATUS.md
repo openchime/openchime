@@ -42,7 +42,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | 024 local accounts | ✅ | PBKDF2, invite-token creation + redeem, failed-auth rate-limit, and a first-run one-time owner setup token (or `OPENCHIME_BOOTSTRAP_USERS`). **Registered-user cap enforced** (`OPENCHIME_MAX_USERS`): new-user creation refused at the cap across redeem/register/bootstrap/OIDC-JIT with `ERROR USER_LIMIT`; active-user count (removed members free a seat). |
 | 025 OIDC central relay | ➖ / ✅ | Relay is out-of-repo; daemon trusts the re-issued token. **Enrollment client built** (ARCH-84, `daemon/enroll.c`): the daemon generates its keypair + audience, emits an `oce1.` code, and calls out to activate; the enrolled audience feeds OIDC. Tested (`tests/test_enroll.c`). |
 | 030 roles + ≥1-owner invariant | ✅ | |
-| 031 channel membership, public/private read-post | ✅ | Public auto-joins the poster; private is members-only. |
+| 031 channel membership, public/private read-post | ✅ | Public auto-joins the poster; private is members-only. `LIST_MEMBERS` (ARCH-91) now lets a client read a **channel's** roster — until it existed, frontends showed the tenant roster beside a channel name, which was wrong for any workspace with more than one channel. |
 | 032 edit/delete own + admin moderation delete | ✅ | `deleted_by` distinguishes self vs moderator. |
 | 033 tenant + channel invite/remove | ✅ | Tenant invite/remove owner/admin-gated; channel invite/remove any member. |
 | 040 per-tenant isolation | ➖ | One process + one DB per tenant; no shared query surface. Identical in all three deployment models (ARCH-76). |
@@ -353,7 +353,7 @@ CLIENT_GAP_ANALYSIS.md §5 and the CLIENT.md §8 roadmap, not here.
 | 138 OS toast + sounds + badges | 🔵 ⛔ | Per-client rendering of the notify decision (ARCH-72); no client does OS toast yet. |
 | 139 activity feed / notification inbox | ⛔ | No aggregated view in any client. Migration 0021 now indexes mentions by user, so the mentions half has a query behind it. |
 | 142 inline image/thumbnail rendering | 🔵 ⛔ | Graphical-frontend only (TUI exempt, ARCH-75); Win32 shows attachment lines only. |
-| 143 files browser (channel Files tab) | ⛔ | Attachment metadata exists (migration 0009); no files-listing view. |
+| 143 files browser (channel Files tab) | ✅ 🔵 | **Built (ARCH-91, migration 0023):** `LIST_FILES` streams a channel's shared files newest-first, or (channel 0) every channel the caller can read. Pending uploads excluded; reclaimed rows listed and flagged rather than hidden. Win32 surfaces it as the **Files & links** tab with per-row download. Type filtering is client-side over `mime`. **TUI has none of this.** |
 | 176 third-party API / SDK | ⛔ | No public programmatic surface; wire is the custom binary protocol (ARCH-6). |
 | 177 email-to-channel ingestion | ⛔ | Needs out-of-daemon inbound-mail; unbuilt. |
 | 184 MFA / 2FA (local mode) | ⛔ | Local auth is password-only (ARCH-59); no second factor. |

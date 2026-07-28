@@ -920,6 +920,26 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_LIST_MEMBERS) {
+            oc_list_members lm;
+            if (oc_decode_list_members(&p, &lm) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_MEMBERS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = lm.channel_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_FILES) {
+            oc_list_files lf;
+            if (oc_decode_list_files(&p, &lf) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_FILES, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = lf.channel_id;   /* 0 = every channel I can read */
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SEND_REPLY) {
             oc_send_reply sr = {0};
             if (oc_decode_send_reply(&p, &sr) != OC_OK) return -1;
@@ -1889,7 +1909,8 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
             oc_pinned_msg pm = { pr->message_id, r->channel_id, pr->author_id,
                                  pr->created_at_ms, pr->pinned_by, pr->pinned_at,
-                                 oc_slice_str(pr->body ? pr->body : "") };
+                                 oc_slice_str(pr->body ? pr->body : ""),
+                                 oc_slice_str(pr->attach_name ? pr->attach_name : "") };
             oc_encode_pinned_msg(&w, OC_PROTOCOL_VERSION, &pm);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
@@ -1897,6 +1918,53 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_pins term = { r->channel_id, (uint32_t)r->n_plist };
         oc_encode_pins(&w, OC_PROTOCOL_VERSION, &term);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_MEMBER_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        for (size_t i = 0; i < r->n_cmlist && conns[c->fd]; i++) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_member_entry me = { r->channel_id, r->cmlist[i].user_id,
+                                   r->cmlist[i].role, r->cmlist[i].joined_at };
+            oc_encode_member_entry(&w, OC_PROTOCOL_VERSION, &me);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        if (!conns[c->fd]) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_members term = { r->channel_id, (uint32_t)r->n_cmlist };
+        oc_encode_members(&w, OC_PROTOCOL_VERSION, &term);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_FILE_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        for (size_t i = 0; i < r->n_flist && conns[c->fd]; i++) {
+            const oc_file_row *fr = &r->flist[i];
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_file_entry fe = { fr->id, fr->channel_id, fr->message_id, fr->uploader_id,
+                                 fr->size, fr->created_at, fr->reclaimed,
+                                 oc_slice_str(fr->filename ? fr->filename : ""),
+                                 oc_slice_str(fr->mime ? fr->mime : "") };
+            oc_encode_file_entry(&w, OC_PROTOCOL_VERSION, &fe);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        if (!conns[c->fd]) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_files term = { r->channel_id, (uint32_t)r->n_flist };
+        oc_encode_files(&w, OC_PROTOCOL_VERSION, &term);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_LIST_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice none = { NULL, 0 };
+        oc_error e = { r->err_code, 0, none, oc_slice_str("listing refused") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }

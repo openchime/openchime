@@ -99,8 +99,21 @@ typedef struct { uint64_t user_id; char emoji[40]; } oc_reactor_row;
  * frontend can render the list without the message being in loaded history. */
 typedef struct {
     uint64_t message_id, author_id, server_time, pinned_by, pinned_at;
-    char    *body;   /* heap */
+    char    *body;                /* heap */
+    char     attach_name[128];    /* first attachment, "" if none */
 } oc_pinned_row;
+
+/* One member of a CHANNEL (REQ-031) — distinct from oc_member, which is the
+ * tenant roster. Keeping both is the point: showing the tenant's people beside a
+ * channel name was the bug this replaces. */
+typedef struct { uint64_t user_id, joined_at; uint8_t role; } oc_chan_member;
+
+/* One file shared in a channel (REQ-143, ARCH-91). */
+typedef struct {
+    uint64_t id, channel_id, message_id, uploader_id, size, created_at;
+    uint8_t  reclaimed;
+    char     filename[128], mime[64];
+} oc_file_view;
 
 /* One incoming-webhook entry (from LIST_WEBHOOKS -> WEBHOOK_LIST, REQ-170): the
  * webhook's id + label + disabled flag. Tokens are never listed (shown once at
@@ -151,6 +164,18 @@ typedef struct {
     uint8_t   pinlist_loading;   /* asked, terminator not yet seen */
     oc_pinned_row *pins;
     size_t    n_pins, cap_pins;
+    /* The selected channel's own member roster (REQ-031) and shared files
+     * (REQ-143). Both are per-channel views, refreshed on open rather than
+     * cached: a client stores nothing (ARCH-88) and a stale roster is worse
+     * than a moment's load. */
+    uint64_t  chanmem_channel;
+    uint8_t   chanmem_loading;
+    oc_chan_member *chanmem;
+    size_t    n_chanmem, cap_chanmem;
+    uint8_t   filelist_open, filelist_loading;
+    uint64_t  filelist_channel;      /* 0 = the workspace-wide view */
+    oc_file_view *files;
+    size_t    n_files, cap_files;
     /* The tenant roster (REQ, LIST_USERS) + whether the roster view is open. */
     uint8_t   roster_open;
     oc_member *users;
@@ -298,6 +323,11 @@ void oc_model_close_reactlist(oc_model *m);
  * list and marks it loading, so a frontend can tell "no pins yet" from "empty". */
 void oc_model_pinlist_begin(oc_model *m, uint64_t channel_id);
 void oc_model_close_pinlist(oc_model *m);
+
+/* A channel's own member roster (REQ-031) and shared files (REQ-143). */
+void oc_model_chanmem_begin(oc_model *m, uint64_t channel_id);
+void oc_model_filelist_begin(oc_model *m, uint64_t channel_id);
+void oc_model_close_filelist(oc_model *m);
 
 /* Begin listing a channel's incoming webhooks (clears prior entries + the
  * shown-once token, records the channel) / close the overlay. */

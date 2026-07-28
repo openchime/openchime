@@ -72,6 +72,13 @@ enum {
                               server_time=when it was pinned (REQ-230) */
     OC_EV_PINNED_MSG,      /* one entry of a pins list: message/author/body + pinner in user_id */
     OC_EV_PINS_END,        /* the pins list is complete: channel_id + count */
+    OC_EV_CHAN_MEMBER,     /* one channel member: channel_id + user_id + status=role,
+                              server_time=joined_at (REQ-031) */
+    OC_EV_CHAN_MEMBERS_END,/* the member list is complete: channel_id + count */
+    OC_EV_FILE,            /* one shared file (REQ-143): attach_id + its own channel_id +
+                              message_id it was posted with + author_id=uploader +
+                              size/reclaimed + body=filename, emoji=mime */
+    OC_EV_FILES_END,       /* the files list is complete: channel_id + count */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
     OC_EV_BACKOFF,         /* next reconnect attempt: server_time = deadline (ms), 0 = clear */
     OC_EV_ERROR            /* protocol/transport error; body = human message */
@@ -93,6 +100,9 @@ typedef struct {
     uint32_t count;        /* REACTION: running aggregate count for the emoji */
     uint64_t pinned_at;    /* PINNED_MSG: when it was pinned (REQ-230). Its own field
                               because a ms timestamp does not fit in `count`. */
+    uint64_t size;         /* FILE: byte size (REQ-143) */
+    uint64_t attach_id;    /* FILE: the attachment's own id */
+    uint8_t  reclaimed;    /* FILE: bytes reclaimed; the row is a tombstone */
     char     emoji[40];    /* REACTION: the emoji */
     char     author_name[64]; /* MESSAGE: author display name ("" = fall back to id) */
     char    *body;         /* heap; MESSAGE/ERROR/CHANNEL(name) only, else NULL */
@@ -121,6 +131,8 @@ enum {
     OC_CMD_OPEN_DM,         /* open/get a 1:1 DM with `channel_id` (reused as target user id) */
     OC_CMD_PIN,            /* pin/unpin `message_id` in `channel_id`: op = add/remove */
     OC_CMD_LIST_PINS,      /* list `channel_id`'s pinned messages */
+    OC_CMD_LIST_MEMBERS,   /* list `channel_id`'s members (REQ-031) */
+    OC_CMD_LIST_FILES,     /* list files in `channel_id` (0 = everywhere I can read) */
     OC_CMD_LIST_REACTIONS,  /* inspect who reacted to `message_id` in `channel_id` */
     OC_CMD_SET_NOTIFY_PREF, /* set `channel_id`'s notification level (op = level) */
     OC_CMD_SET_DND,         /* set the DND window: op = enabled, channel_id = start_min, message_id = end_min */

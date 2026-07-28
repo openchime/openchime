@@ -51,7 +51,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 22);
+    CHECK(oc_schema_version(db) == 23);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -1014,6 +1014,130 @@ static oc_dbres *chan_member(oc_dbwriter *w, int type, uint64_t actor, uint64_t 
     j->user_id = actor; j->channel_id = channel; j->target_user_id = target;
     oc_dbwriter_submit(w, j);
     return wait_result(w);
+}
+
+/* A channel's member roster (REQ-031) and its shared files (REQ-143, ARCH-91).
+ * Both are new READ ops over storage that already existed; what matters is that
+ * they are scoped to what the caller may see. */
+static oc_dbres *list_members(oc_dbwriter *w, uint64_t uid, uint64_t ch) {
+    oc_job *j = oc_job_new(OC_JOB_LIST_MEMBERS, 240);
+    j->user_id = uid; j->channel_id = ch;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *list_files(oc_dbwriter *w, uint64_t uid, uint64_t ch) {
+    oc_job *j = oc_job_new(OC_JOB_LIST_FILES, 241);
+    j->user_id = uid; j->channel_id = ch;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_channel_details(void) {
+    const char *path = "build/test_dbwriter_details.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t alice = reg(w, "alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "bob",   "pw", OC_ROLE_MEMBER);
+    uint64_t carol = reg(w, "carol", "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob && carol);
+
+    /* A PRIVATE channel with two of the three users in it. This is the case the
+     * old client got wrong: it showed the tenant roster, so carol appeared as a
+     * "member" of a channel she cannot even read. */
+    oc_dbres *r = create_channel(w, alice, "secret", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t secret = r->channel_id;
+    oc_dbres_free(r);
+    oc_dbres_free(chan_member(w, OC_JOB_INVITE_CHANNEL, alice, secret, bob));
+
+    r = list_members(w, alice, secret);
+    CHECK(r && r->type == OC_RES_MEMBER_LIST);
+    CHECK(r->n_cmlist == 2);
+    int saw_alice = 0, saw_bob = 0, saw_carol = 0;
+    for (size_t i = 0; i < r->n_cmlist; i++) {
+        if (r->cmlist[i].user_id == alice) { saw_alice = 1; CHECK(r->cmlist[i].role == OC_ROLE_OWNER); }
+        if (r->cmlist[i].user_id == bob)   saw_bob = 1;
+        if (r->cmlist[i].user_id == carol) saw_carol = 1;
+        CHECK(r->cmlist[i].joined_at != 0);
+    }
+    CHECK(saw_alice && saw_bob && !saw_carol);
+    oc_dbres_free(r);
+
+    /* A non-member cannot enumerate it, or this becomes a way to discover who
+     * is in a private channel you were never invited to. */
+    r = list_members(w, carol, secret);
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+
+    /* Files. Rows are written directly here because the upload path is a
+     * multi-frame protocol exercised in its own suite; what is under test is
+     * the LISTING — its scope, its ordering, and what it leaves out. */
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        const char *ins =
+            "INSERT INTO attachments(id,channel_id,message_id,uploader_id,storage_key,"
+            "  filename,mime,size,created_at_ms,reclaimed_at_ms) VALUES(?,?,?,?,'k',?,?,?,?,?);";
+        struct { int id; uint64_t ch; int mid; const char *fn; const char *mt; int ts; int rec; } rows[] = {
+            { 1, secret,  10, "old.pdf",   "application/pdf", 1000, 0 },
+            { 2, secret,  11, "new.png",   "image/png",       3000, 0 },
+            { 3, secret,  12, "gone.zip",  "application/zip", 2000, 9999 },
+            { 4, secret,   0, "pending.doc","application/msword", 4000, 0 },  /* never sent */
+            { 5, OC_DEFAULT_CHANNEL, 13, "elsewhere.txt", "text/plain", 5000, 0 },
+        };
+        for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++) {
+            sqlite3_stmt *st = NULL;
+            CHECK(sqlite3_prepare_v2(raw, ins, -1, &st, NULL) == SQLITE_OK);
+            sqlite3_bind_int64(st, 1, rows[i].id);
+            sqlite3_bind_int64(st, 2, (sqlite3_int64)rows[i].ch);
+            if (rows[i].mid) sqlite3_bind_int64(st, 3, rows[i].mid); else sqlite3_bind_null(st, 3);
+            sqlite3_bind_int64(st, 4, (sqlite3_int64)alice);
+            sqlite3_bind_text(st, 5, rows[i].fn, -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 6, rows[i].mt, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 7, 1234);
+            sqlite3_bind_int64(st, 8, rows[i].ts);
+            sqlite3_bind_int64(st, 9, rows[i].rec);
+            CHECK(sqlite3_step(st) == SQLITE_DONE);
+            sqlite3_finalize(st);
+        }
+        sqlite3_close(raw);
+    }
+
+    r = list_files(w, alice, secret);
+    CHECK(r && r->type == OC_RES_FILE_LIST);
+    /* Three: the pending upload is excluded (never shared with anyone) and the
+     * other channel's file is not this channel's. The reclaimed one IS listed —
+     * "this was here and the bytes are gone" is information. */
+    CHECK(r->n_flist == 3);
+    CHECK(r->flist[0].id == 2);                  /* newest first */
+    CHECK(strcmp(r->flist[0].filename, "new.png") == 0);
+    CHECK(strcmp(r->flist[0].mime, "image/png") == 0);
+    CHECK(r->flist[1].id == 3 && r->flist[1].reclaimed == 1);
+    CHECK(r->flist[2].id == 1 && r->flist[2].reclaimed == 0);
+    oc_dbres_free(r);
+
+    r = list_files(w, carol, secret);
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+
+    /* channel_id 0 = every channel I can read. Alice is in both, so she sees
+     * four; carol is in neither private channel, so the secret ones are absent
+     * from hers — the membership filter, not a channel filter. */
+    r = list_files(w, alice, 0);
+    CHECK(r && r->type == OC_RES_FILE_LIST && r->n_flist == 4);
+    CHECK(r->flist[0].id == 5);                  /* newest across channels */
+    oc_dbres_free(r);
+
+    r = list_files(w, carol, 0);
+    CHECK(r && r->type == OC_RES_FILE_LIST);
+    for (size_t i = 0; i < r->n_flist; i++) CHECK(r->flist[i].channel_id != secret);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
 }
 
 static uint8_t g_send_seq = 0;
@@ -2353,7 +2477,7 @@ static void test_max_users(void) {
 }
 
 int run_dbwriter_tests(void) {
-    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins\n");
+    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details\n");
     test_start_migrates_and_stops();
     test_auth_and_send();
     test_oidc_auth();
@@ -2379,6 +2503,7 @@ int run_dbwriter_tests(void) {
     test_history_paging();
     test_mentions_stored();
     test_pins();
+    test_channel_details();
     test_max_users();
     return failures;
 }

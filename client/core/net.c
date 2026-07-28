@@ -498,6 +498,53 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 oc_ev *e = oc_ev_new(OC_EV_PRESENCE);
                 if (e) { e->user_id = pu.user_id; e->status = pu.status; oc_queue_push(to_ui, e); }
             }
+        } else if (hdr.msg_type == OC_MSG_MEMBER_ENTRY) {
+            oc_member_entry me;
+            if (oc_decode_member_entry(&p, &me) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_CHAN_MEMBER);
+                if (e) {
+                    e->channel_id  = me.channel_id;
+                    e->user_id     = me.user_id;
+                    e->status      = me.role;
+                    e->server_time = me.joined_at;
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_MEMBERS) {
+            oc_members mm;
+            if (oc_decode_members(&p, &mm) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_CHAN_MEMBERS_END);
+                if (e) { e->channel_id = mm.channel_id; e->count = mm.count; oc_queue_push(to_ui, e); }
+            }
+        } else if (hdr.msg_type == OC_MSG_FILE_ENTRY) {
+            oc_file_entry fe;
+            if (oc_decode_file_entry(&p, &fe) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_FILE);
+                if (e) {
+                    e->attach_id   = fe.attachment_id;
+                    e->channel_id  = fe.channel_id;
+                    e->message_id  = fe.message_id;
+                    e->author_id   = fe.uploader_id;
+                    e->size        = fe.size;
+                    e->server_time = fe.created_at;
+                    e->reclaimed   = fe.reclaimed;
+                    size_t mn = fe.mime.len < sizeof e->emoji - 1 ? fe.mime.len : sizeof e->emoji - 1;
+                    memcpy(e->emoji, fe.mime.ptr, mn);
+                    e->emoji[mn] = '\0';
+                    e->body = malloc(fe.filename.len + 1);
+                    if (e->body) {
+                        if (fe.filename.len) memcpy(e->body, fe.filename.ptr, fe.filename.len);
+                        e->body[fe.filename.len] = '\0';
+                    }
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_FILES) {
+            oc_files ff;
+            if (oc_decode_files(&p, &ff) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_FILES_END);
+                if (e) { e->channel_id = ff.channel_id; e->count = ff.count; oc_queue_push(to_ui, e); }
+            }
         } else if (hdr.msg_type == OC_MSG_PIN_UPDATED) {
             oc_pin_updated pu;
             if (oc_decode_pin_updated(&p, &pu) == OC_OK) {
@@ -522,6 +569,10 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->server_time = pm.server_time;
                     e->user_id     = pm.pinned_by;
                     e->pinned_at   = pm.pinned_at;
+                    size_t an = pm.attach_name.len < sizeof e->author_name - 1
+                              ? pm.attach_name.len : sizeof e->author_name - 1;
+                    memcpy(e->author_name, pm.attach_name.ptr, an);
+                    e->author_name[an] = '\0';
                     e->body = malloc(pm.body.len + 1);
                     if (e->body) {
                         if (pm.body.len) memcpy(e->body, pm.body.ptr, pm.body.len);
@@ -1229,6 +1280,18 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_list_pins lp = { c->channel_id };
                 if (oc_encode_list_pins(&w, OC_PROTOCOL_VERSION, &lp) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_MEMBERS) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_list_members lm = { c->channel_id };
+                if (oc_encode_list_members(&w, OC_PROTOCOL_VERSION, &lm) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_FILES) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_list_files lf = { c->channel_id };
+                if (oc_encode_list_files(&w, OC_PROTOCOL_VERSION, &lf) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_LIST_REACTIONS) {

@@ -458,6 +458,19 @@ static const char MIGRATION_0022[] =
     ");"
     "CREATE INDEX idx_pins_channel ON pins(channel_id, created_at_ms DESC);";
 
+static const char MIGRATION_0023[] =
+    /* Listing a channel's shared files (REQ-143, ARCH-91). No new columns: 0009
+     * already puts channel_id on the attachment. What was missing is the index
+     * for reading them that way — 0009's indexes are by message and by
+     * uploader, so "this channel's files, newest first" was a full scan of
+     * every attachment in the workspace.
+     *
+     * Partial on message_id: a pending upload has no message yet and is not a
+     * shared file, so keeping those out of the index keeps it to what the query
+     * actually reads. */
+    "CREATE INDEX idx_attachments_channel ON attachments(channel_id, created_at_ms DESC) "
+    "  WHERE message_id IS NOT NULL;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -481,6 +494,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 20, MIGRATION_0020 },
     { 21, MIGRATION_0021 },
     { 22, MIGRATION_0022 },
+    { 23, MIGRATION_0023 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

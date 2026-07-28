@@ -284,6 +284,28 @@ void oc_client_list_pins(oc_client *c, uint64_t channel_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_list_members(oc_client *c, uint64_t channel_id) {
+    if (!c || !channel_id) return;
+    oc_model_chanmem_begin(&c->model, channel_id);
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_MEMBERS);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_files(oc_client *c, uint64_t channel_id) {
+    if (!c) return;
+    oc_model_filelist_begin(&c->model, channel_id);
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_FILES);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;      /* 0 = every channel I can read */
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_close_files(oc_client *c) {
+    if (c) oc_model_close_filelist(&c->model);
+}
+
 void oc_client_close_pins(oc_client *c) {
     if (c) oc_model_close_pinlist(&c->model);
 }

@@ -123,6 +123,16 @@ void oc_client_pin(oc_client *c, uint64_t channel_id, uint64_t message_id, uint8
 void oc_client_list_pins(oc_client *c, uint64_t channel_id);
 void oc_client_close_pins(oc_client *c);
 
+/* A channel's OWN member roster (REQ-031) — not the tenant roster, which is
+ * oc_client_list_users. Showing the latter beside a channel name was wrong the
+ * moment a workspace held more people than one channel did. */
+void oc_client_list_members(oc_client *c, uint64_t channel_id);
+
+/* Files shared in a channel, or (channel_id 0) across every channel the user
+ * can read (REQ-143, ARCH-91). */
+void oc_client_list_files(oc_client *c, uint64_t channel_id);
+void oc_client_close_files(oc_client *c);
+
 void oc_client_list_reactions(oc_client *c, uint64_t channel_id, uint64_t message_id);
 void oc_client_close_reactions(oc_client *c);
 

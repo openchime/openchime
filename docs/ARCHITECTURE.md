@@ -183,6 +183,18 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **No system message.** Slack posts "alice pinned a message to this channel" into the transcript; we do not, because there is no system-message type in the schema and adding one is a larger change than the feature. The inline "Pinned by" marker plus the pins list carries the same information without inventing a message that has no author.
 
+- **ARCH-91 (Channel details — the channel's own roster and its shared files):** Delivers REQ-143 and the client-facing half of REQ-031.
+
+  **A channel's members are read from the channel, not inferred from the tenant.** Membership has been stored since 0001, but nothing on the wire ever *listed* it, so a frontend showing "members" beside a channel name could only show the tenant roster — correct only while the workspace has exactly one channel that everybody is in. `LIST_MEMBERS` closes that, and enumerating a channel requires being in it: otherwise the op becomes a way to discover who is in a private channel you were never invited to.
+
+  **Files are a query, not a new store.** Migration 0009 already puts `channel_id` on every attachment, so REQ-143 needs no new state — only migration 0023's index, because reading attachments *by channel* was the one access pattern 0009 did not index and would otherwise scan every attachment in the workspace.
+
+  **`channel_id 0` means "every channel I can read".** The workspace-wide files view is the same query with a membership filter instead of a channel filter, which is why it costs nothing extra to serve and why the rail's Files view does not need a second op.
+
+  **Excluded: pending uploads.** An upload that never reached a message (`message_id IS NULL`) was never shared with anybody. **Included: reclaimed rows**, flagged — "this was here and the bytes are gone" (REQ-215/217) is information a user needs, where a silently absent row teaches them nothing.
+
+  **Both are capped and refreshed on open, never cached.** A client holds nothing on disk (ARCH-88), rosters and file lists change from other clients, and a stale list is worse than a moment's load. The caps (500 members, 200 files) bound one frame burst; a user looking for something older has search.
+
 ## Discovery
 
 - **ARCH-14 (Rule):** Workspace-address, resolved by plain DNS — **there is no resolution *service*, in any deployment model** (ARCH-76). At sign-in the client collects the **workspace** (the tenant's address) plus the user's **email** directly, the same model as Slack's "enter your workspace URL." The workspace is turned into a daemon address by ordinary DNS, with no shared, always-on, cross-tenant lookup component to run: consistent with the island model (ARCH-4) and the "no runtime configuration dependency" stance (ARCH-26). Note the DNS *records* under the service suffix (forms 2 and 3 below) are maintainer-provided and so are counted as a federated function in ARCH-76 — but they are static records, not a request-serving component, so no lookup traffic reaches the project. Three forms, one per deployment model:

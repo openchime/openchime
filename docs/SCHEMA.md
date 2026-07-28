@@ -4,7 +4,7 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Status.** **Migrations 0001–0022 are applied.** 0001 establishes the core
+**Status.** **Migrations 0001–0023 are applied.** 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
 credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
 `users.disabled` lockout flag; **0004** (§3b) reactions; **0005** (§3c) threads;
@@ -15,7 +15,7 @@ notification preferences and the DND window; **0013** (§3k) synced client
 settings; **0014–0015** attachment tombstones and reclaim reason; **0016** (§3l)
 the audit log; **0017** (§3m) federated enrollment; **0018** (§3n) push device
 tokens; **0019** (§3o) the DM participant-set key; **0020** (§3p) the
-unique channel name; **0021** (§3q) resolved @mentions; **0022** (§3r) pinned messages.
+unique channel name; **0021** (§3q) resolved @mentions; **0022** (§3r) pinned messages; **0023** (§3s) the channel-files index.
 
 *Corrected: an earlier revision of this line said presence, notification config,
 and attachments were "intentionally not here yet." Notification config landed in
@@ -603,6 +603,28 @@ see. The index is descending on time because the list is newest-pin-first.
 cannot express "at most N rows per group" without a trigger, and the check has
 to distinguish a new pin from a re-pin — which is application logic, and is
 tested as such.
+
+---
+
+## 3s. Migration 0023 — reading a channel's files (REQ-143, ARCH-91)
+
+```sql
+CREATE INDEX idx_attachments_channel ON attachments(channel_id, created_at_ms DESC)
+  WHERE message_id IS NOT NULL;
+```
+
+No new columns: §3g's `attachments` has carried `channel_id` since it was
+created. What was missing is an index for reading them *that* way — 0009 indexes
+by message and by uploader, so "this channel's files, newest first" was a full
+scan of every attachment in the workspace.
+
+*Partial on `message_id`*: a pending upload has no message yet and is not a
+shared file, so keeping those rows out of the index keeps it to exactly what the
+query reads.
+
+The member roster (REQ-031) needed no migration at all — `channel_members` is
+keyed `(channel_id, user_id)`, so listing one channel's members already reads a
+prefix of the primary key.
 
 ---
 

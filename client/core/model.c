@@ -111,6 +111,8 @@ void oc_model_free(oc_model *m) {
     free(m->reactors);
     for (size_t i = 0; i < m->n_pins; i++) free(m->pins[i].body);
     free(m->pins);
+    free(m->chanmem);
+    free(m->files);
     free(m->users);
     free(m->webhooks);
     free(m->settings);
@@ -271,6 +273,27 @@ void oc_model_pinlist_begin(oc_model *m, uint64_t channel_id) {
     m->pinlist_open = 1;
     m->pinlist_loading = 1;
     m->pinlist_channel = channel_id;
+}
+
+void oc_model_chanmem_begin(oc_model *m, uint64_t channel_id) {
+    m->n_chanmem = 0;                 /* keep the allocation, drop the rows */
+    m->chanmem_channel = channel_id;
+    m->chanmem_loading = 1;
+}
+
+void oc_model_close_filelist(oc_model *m) {
+    free(m->files);
+    m->files = NULL;
+    m->n_files = m->cap_files = 0;
+    m->filelist_open = m->filelist_loading = 0;
+    m->filelist_channel = 0;
+}
+
+void oc_model_filelist_begin(oc_model *m, uint64_t channel_id) {
+    oc_model_close_filelist(m);
+    m->filelist_open = 1;
+    m->filelist_loading = 1;
+    m->filelist_channel = channel_id;
 }
 
 void oc_model_close_weblist(oc_model *m) {
@@ -629,6 +652,53 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     case OC_EV_TYPING:
         typing_touch(m, e->channel_id, e->user_id);
         break;
+    case OC_EV_CHAN_MEMBER: {
+        /* Only for the roster currently being loaded — a late frame from a
+         * previous channel must not land in this one's list. */
+        if (m->chanmem_channel != e->channel_id) break;
+        if (m->n_chanmem == m->cap_chanmem) {
+            size_t nc = m->cap_chanmem ? m->cap_chanmem * 2 : 16;
+            oc_chan_member *g = realloc(m->chanmem, nc * sizeof *g);
+            if (!g) break;
+            m->chanmem = g; m->cap_chanmem = nc;
+        }
+        oc_chan_member *cm = &m->chanmem[m->n_chanmem++];
+        cm->user_id   = e->user_id;
+        cm->role      = e->status;
+        cm->joined_at = e->server_time;
+        break;
+    }
+    case OC_EV_CHAN_MEMBERS_END:
+        if (m->chanmem_channel == e->channel_id) m->chanmem_loading = 0;
+        break;
+    case OC_EV_FILE: {
+        /* Matched on "a list is in flight", not on the channel: in the
+         * workspace-wide view (channel 0) each entry names its OWN channel, so
+         * comparing against the requested one would drop every row. The
+         * terminator clears `loading`, which is what fences a late frame from a
+         * previous request. */
+        if (!m->filelist_open || !m->filelist_loading) break;
+        if (m->n_files == m->cap_files) {
+            size_t nc = m->cap_files ? m->cap_files * 2 : 32;
+            oc_file_view *g = realloc(m->files, nc * sizeof *g);
+            if (!g) break;
+            m->files = g; m->cap_files = nc;
+        }
+        oc_file_view *f = &m->files[m->n_files++];
+        f->id          = e->attach_id;
+        f->channel_id  = e->channel_id;      /* the file's own channel */
+        f->message_id  = e->message_id;
+        f->uploader_id = e->author_id;
+        f->size        = e->size;
+        f->created_at  = e->server_time;
+        f->reclaimed   = e->reclaimed;
+        snprintf(f->filename, sizeof f->filename, "%s", e->body ? e->body : "");
+        snprintf(f->mime, sizeof f->mime, "%s", e->emoji);
+        break;
+    }
+    case OC_EV_FILES_END:
+        if (m->filelist_open && m->filelist_channel == e->channel_id) m->filelist_loading = 0;
+        break;
     case OC_EV_PIN: {
         /* Mark the message in the transcript. Arriving for a message we have not
          * loaded is normal (backfill order, or another client's pin far up the
@@ -680,6 +750,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         pr->pinned_by   = e->user_id;
         pr->pinned_at   = e->pinned_at;
         pr->body        = e->body ? strdup(e->body) : NULL;
+        snprintf(pr->attach_name, sizeof pr->attach_name, "%s", e->author_name);
         break;
     }
     case OC_EV_PINS_END:

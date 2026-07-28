@@ -679,6 +679,7 @@ history — a list of bare ids would turn opening it into a fetch storm.
 | `pinned_by`   | u64  | Who pinned it (`0` if that account is gone).            |
 | `pinned_at`   | u64  | When it was pinned.                                     |
 | `body`        | str  | The message body.                                       |
+| `attach_name` | str  | The first attachment's filename, or empty. An attachment-only message has no body at all, so without this a pinned file rendered as a blank row. |
 
 **`PINS` (server → client), msg_type `0x0039`** `{ channel_id: u64, count: u32 }`
 terminates the response; `count` is how many `PINNED_MSG` frames preceded it.
@@ -696,6 +697,48 @@ big-endian) in `context`: `UNKNOWN_MESSAGE` (no such message in that channel, or
 it is tombstoned), `NOT_A_MEMBER`, or `TOO_MANY_PINS` (3018 — the channel
 already holds 100 pins). Unpinning something that is not pinned is **not** an
 error: two clients racing the same unpin must not produce a spurious failure.
+
+### 5.9b Channel details: members and files (REQ-031, REQ-143, ARCH-91)
+
+Both follow the `LIST_PINS` shape — stream the entries, then a terminator.
+
+**`LIST_MEMBERS` (client → server), msg_type `0x003A`** `{ channel_id: u64 }`
+streams **`MEMBER_ENTRY` (`0x003B`)** `{ channel_id, user_id, role: u8,
+joined_at: u64 }` in join order, then **`MEMBERS` (`0x003C`)**
+`{ channel_id, count: u32 }`. Capped at 500.
+
+Membership has been stored since migration 0001, but nothing on the wire listed
+it, so a client showing "members" beside a channel name could only show the
+**tenant** roster — right only while the workspace has one channel everyone is
+in. Enumerating a channel **requires being a member of it**; otherwise this is a
+way to discover who is in a private channel you were never invited to
+(`NOT_A_MEMBER`).
+
+**`LIST_FILES` (client → server), msg_type `0x003D`** `{ channel_id: u64 }`
+streams **`FILE_ENTRY` (`0x003E`)** newest-first, then **`FILES` (`0x003F`)**
+`{ channel_id, count: u32 }`. Capped at 200.
+
+| Field           | Type | Notes                                                 |
+|-----------------|------|-------------------------------------------------------|
+| `attachment_id` | u64  | Download it with the usual attachment path (§5.14).   |
+| `channel_id`    | u64  | The file's own channel — which differs per entry in the workspace-wide form. |
+| `message_id`    | u64  | The message it was shared with.                       |
+| `uploader_id`   | u64  | Who shared it.                                        |
+| `size`          | u64  | Bytes.                                                |
+| `created_at`    | u64  | When it was shared (ms).                              |
+| `reclaimed`     | u8   | `1` when the bytes are gone (REQ-215/217); the row is kept so the loss is visible, but there is nothing to download. |
+| `filename`      | str  | As uploaded.                                          |
+| `mime`          | str  | Declared type; **type filtering is client-side over this**. |
+
+**`channel_id` 0 means "every channel I can read"** — the same query with a
+membership filter instead of a channel filter, which is what makes a
+workspace-wide files view free rather than a second op.
+
+Pending uploads (`message_id` NULL, §5.14) are **excluded**: an upload that never
+reached a message was never shared with anyone.
+
+Both lists are refreshed on open and never cached — a client holds nothing on
+disk (ARCH-88), and both change from other clients.
 
 ### 5.10 Threads (REQ-060)
 

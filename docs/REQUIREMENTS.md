@@ -588,9 +588,12 @@ the requirement says so explicitly rather than implying one.
   (client vs. server).]**
 - **REQ-143.** A user has been able to browse a channel's **files** — a view
   listing the attachments shared in a channel (and, per-user, files they shared or
-  that were shared with them) with filter by type — building on the attachment
-  metadata already stored (REQ-140, SCHEMA.md migration 0009). **[needs ARCH
-  decision — files-listing query + scope (per-channel vs. per-user).]**
+  that were shared with them) — building on the attachment metadata already
+  stored (REQ-140, SCHEMA.md migration 0009). **Built (ARCH-91):** `LIST_FILES`
+  streams a channel's shared files newest-first, or (channel 0) every channel the
+  caller can read; migration 0023 adds the one index that access pattern needed.
+  Pending uploads are excluded, reclaimed rows are listed and flagged. Filtering
+  by type is client-side over the returned `mime`.
 
 ### 6.2 Audio Conferencing
 
