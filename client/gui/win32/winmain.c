@@ -155,6 +155,20 @@ static void open_section_menu(HWND hwnd, int sec);
 static void sidebar_opts_save(void);
 static void sidebar_opts_load(const oc_model *m);
 #define SB_SETTING_KEY "sidebar"
+#define PREFS_SETTING_KEY "prefs"
+
+/* Preferences (WIN-9, REQ-261). Client-side display choices, synced through the
+ * daemon's `gui` settings bucket so they follow the account to another machine —
+ * a client writes no files (ARCH-88), so this bucket is the only place they can
+ * live. Server-side behaviour (per-channel notification level, DND) stays on its
+ * own surfaces; this pane is deliberately only what the client itself decides. */
+static int g_prefs_open;
+static int g_pref_time24    = 1;   /* 24-hour timestamps */
+static int g_pref_members   = 1;   /* members pane shown by default */
+static int g_pref_daysep    = 1;   /* date dividers in the transcript */
+static int g_prefs_pending;        /* fold the synced values in once they land */
+static struct { D2D1_RECT_F r; int row, val; } g_pref_hits[16];
+static int g_n_pref_hits;
 static int g_n_rows;
 
 /* Transcript message hit-boxes (context menu + text selection). bx/by = the body
@@ -686,6 +700,7 @@ static int already_backfilled(uint64_t cid) {
 
 static void close_overlays(void) {
     const oc_model *mm = model();
+    g_prefs_open = 0;
     if (!mm) return;
     if (mm->thread_open)    oc_client_close_thread(g_client);
     if (mm->search_open)    oc_client_close_search(g_client);
@@ -696,8 +711,9 @@ static void close_overlays(void) {
 }
 
 static int any_overlay(const oc_model *m) {
-    return m && (m->thread_open || m->search_open || m->reactlist_open ||
-                 m->weblist_open || m->storage_open || m->audit_open);
+    return g_prefs_open ||
+           (m && (m->thread_open || m->search_open || m->reactlist_open ||
+                  m->weblist_open || m->storage_open || m->audit_open));
 }
 
 static void select_channel(uint64_t cid) {
@@ -1196,8 +1212,9 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
         draw_text(rt, nm, g_name, hl, OC_COL_TEXT);
         if (msg->server_time) {
             time_t t = (time_t)(msg->server_time / 1000);
-            struct tm tv; char when[16] = "";
-            if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%H:%M", &tv);
+            struct tm tv; char when[24] = "";
+            if (oc_localtime_r(&t, &tv))
+                strftime(when, sizeof when, g_pref_time24 ? "%H:%M" : "%I:%M %p", &tv);
             draw_text(rt, when, g_time, hl, OC_COL_FAINT);
         }
     }
@@ -1330,7 +1347,7 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
     long jump_i = -1; float jump_off = 0;
     for (size_t i = 0; i < n; i++) {
         /* Date dividers only in the main transcript, not the thread/search panes. */
-        sep[i] = (uint8_t)(capture && (i == 0 ||
+        sep[i] = (uint8_t)(capture && g_pref_daysep && (i == 0 ||
                  !same_day(msgs[first + i - 1].server_time, msgs[first + i].server_time)));
         grouped[i] = (uint8_t)(!sep[i] && i > 0 &&
                      groups_with(&msgs[first + i - 1], &msgs[first + i]));
@@ -1682,6 +1699,61 @@ static void draw_reactlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
     }
 }
 
+/* One preference row: a label, a sub-label, and a segmented set of choices on
+ * the right. Returns the y for the next row. */
+static float pref_row(ID2D1RenderTarget *rt, D2D1_RECT_F body, float y, int row,
+                      const char *label, const char *hint,
+                      const char *const *opts, int n_opts, int cur) {
+    draw_text(rt, label, g_ui_b, rf(body.left + 24, y, body.left + 320, y + 22), OC_COL_TEXT);
+    if (hint && hint[0])
+        draw_text(rt, hint, g_small, rf(body.left + 24, y + 20, body.left + 340, y + 40), OC_COL_FAINT);
+
+    float bx = body.right - 24;
+    for (int i = n_opts - 1; i >= 0; i--) {
+        float w = text_width(opts[i], g_small) + 26;
+        D2D1_RECT_F b = rf(bx - w, y + 2, bx, y + 28);
+        int on = (i == cur);
+        fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
+        if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, opts[i], g_small, b, on ? 0xFFFFFF : OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        if (g_n_pref_hits < 16) {
+            g_pref_hits[g_n_pref_hits].r = b;
+            g_pref_hits[g_n_pref_hits].row = row;
+            g_pref_hits[g_n_pref_hits].val = i;
+            g_n_pref_hits++;
+        }
+        bx = b.left - 6;
+    }
+    fill(rt, rf(body.left + 24, y + 46, body.right - 24, y + 47), OC_COL_BORDER);
+    return y + 62;
+}
+
+enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP };
+
+static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
+    D2D1_RECT_F body = overlay_header(rt, reg, "Preferences");
+    g_n_pref_hits = 0;
+    float y = body.top + 16;
+
+    static const char *THEMES[3] = { "Dark", "Light", "System" };
+    static const char *TIMES[2]  = { "12-hour", "24-hour" };
+    static const char *ONOFF[2]  = { "Off", "On" };
+
+    y = pref_row(rt, body, y, PREF_ROW_THEME, "Appearance",
+                 "System follows the Windows app theme.", THEMES, 3, oc_theme_mode());
+    y = pref_row(rt, body, y, PREF_ROW_TIME, "Time format",
+                 "How message timestamps are shown.", TIMES, 2, g_pref_time24);
+    y = pref_row(rt, body, y, PREF_ROW_MEMBERS, "Members pane",
+                 "Shown by default when you open a channel.", ONOFF, 2, g_pref_members);
+    y = pref_row(rt, body, y, PREF_ROW_DAYSEP, "Date dividers",
+                 "A separator between days in the transcript.", ONOFF, 2, g_pref_daysep);
+
+    draw_text(rt, "Saved to your account, so they follow you to another machine.",
+              g_small, rf(body.left + 24, y + 4, body.right - 24, y + 24), OC_COL_FAINT);
+}
+
 static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
     if (!m->authed) {
         /* The reason lives in the banner above (draw_banner) — repeating it here
@@ -1691,6 +1763,7 @@ static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
         IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
         return;
     }
+    if (g_prefs_open)      { draw_prefs(rt, reg);        return; }
     if (m->thread_open)    { draw_thread(rt, m, reg);    return; }
     if (m->search_open)    { draw_search(rt, m, reg);    return; }
     if (m->reactlist_open) { draw_reactlist(rt, m, reg); return; }
@@ -2630,6 +2703,27 @@ static void signin_create(HWND parent) {
     layout_signin(parent);
 }
 
+/* Re-skin the native children after a theme change. The D2D chrome repaints
+ * itself from oc_theme[] every frame, but a RichEdit keeps its own background
+ * and the EDIT brush is cached — leave them and the controls stay dark on a
+ * light shell. */
+static void theme_restyle_children(void) {
+    if (g_find_brush) { DeleteObject(g_find_brush); g_find_brush = NULL; }
+    if (!g_re) return;
+    SendMessageW(g_re, EM_SETBKGNDCOLOR, 0, (LPARAM)OCRGB(OC_COL_INPUT));
+    CHARFORMAT2W cf; ZeroMemory(&cf, sizeof cf);
+    cf.cbSize = sizeof cf;
+    cf.dwMask = CFM_COLOR;
+    cf.crTextColor = OCRGB(OC_COL_TEXT);
+    SendMessageW(g_re, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
+}
+
+/* Every theme switch goes through here so no caller can forget the children. */
+static void theme_set(int mode) {
+    oc_theme_apply(mode);
+    theme_restyle_children();
+}
+
 static void composer_create(HWND parent) {
     g_re = CreateWindowExW(0, MSFTEDIT_CLASS, L"",
         WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL,
@@ -2810,6 +2904,10 @@ static int in_rect(D2D1_RECT_F r, int x, int y) {
 
 /* Returns 1 if the click hit a control/row (so the caller won't start a text
  * selection), 0 if it fell through to the transcript. */
+static void theme_set(int mode);       /* fwd */
+static void prefs_save(void);          /* fwd */
+static void prefs_load(const oc_model *m);   /* fwd */
+
 static int on_click(HWND hwnd, int x, int y) {
     if (g_pick_open) {
         if (in_rect(g_pick_panel, x, y)) {
@@ -2819,6 +2917,22 @@ static int on_click(HWND hwnd, int x, int y) {
         }
         picker_close(hwnd);
         return 1;
+    }
+    if (g_prefs_open) {
+        for (int i = 0; i < g_n_pref_hits; i++) {
+            if (!in_rect(g_pref_hits[i].r, x, y)) continue;
+            int v = g_pref_hits[i].val;
+            switch (g_pref_hits[i].row) {
+            case PREF_ROW_THEME:   theme_set(v); break;
+            case PREF_ROW_TIME:    g_pref_time24 = v; break;
+            /* Applying it live as well as saving it: a preference you have to
+             * restart to see is indistinguishable from one that did nothing. */
+            case PREF_ROW_MEMBERS: g_pref_members = v; g_show_members = v; layout_composer(hwnd); break;
+            case PREF_ROW_DAYSEP:  g_pref_daysep = v; break;
+            }
+            prefs_save();
+            return 1;
+        }
     }
     /* The autocomplete popover floats over the transcript, so it claims clicks
      * inside it before anything underneath sees them. */
@@ -3521,6 +3635,37 @@ static void open_new_menu(HWND hwnd) {
  * bucket — the client itself stores nothing (ARCH-88). First caller of
  * oc_client_set_setting; the `gui` bucket is separate from the TUI's by design,
  * so a terminal and a window can keep different sidebar shapes. */
+static void prefs_save(void) {
+    if (!g_client) return;
+    char enc[96];
+    snprintf(enc, sizeof enc, "t:%d;h:%d;m:%d;d:%d",
+             oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep);
+    oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
+}
+
+static void prefs_load(const oc_model *m) {
+    const char *v = m ? oc_model_setting(m, PREFS_SETTING_KEY) : NULL;
+    if (!v || !v[0]) return;
+    int t = oc_theme_mode(), h = g_pref_time24, mm = g_pref_members, d = g_pref_daysep;
+    /* Tolerant of missing keys and of any order, so a value written by a newer
+     * build with extra fields still loads what this one understands. */
+    for (const char *p = v; *p; ) {
+        char k = *p;
+        if (p[1] == ':') {
+            int val = atoi(p + 2);
+            if (k == 't') t = val; else if (k == 'h') h = val;
+            else if (k == 'm') mm = val; else if (k == 'd') d = val;
+        }
+        while (*p && *p != ';') p++;
+        while (*p == ';') p++;
+    }
+    g_pref_time24  = h ? 1 : 0;
+    g_pref_members = mm ? 1 : 0;
+    g_pref_daysep  = d ? 1 : 0;
+    g_show_members = g_pref_members;
+    theme_set(t);
+}
+
 static void sidebar_opts_save(void) {
     if (!g_client) return;
     char enc[64];
@@ -3627,7 +3772,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
             if (win[0] && sscanf(win, "%d:%d-%d:%d", &sh, &sm, &eh, &em) == 4)
                 oc_client_set_dnd(g_client, 1, (uint16_t)(sh * 60 + sm), (uint16_t)(eh * 60 + em));
             else oc_client_set_dnd(g_client, 0, 0, 0); } break; }
-    case 70: MessageBoxW(hwnd, L"Preferences \xE2\x80\x94 coming soon.", L"Preferences", MB_OK | MB_ICONINFORMATION); break;
+    case 70: close_overlays(); g_prefs_open = 1; g_view = VIEW_HOME; break;
     /* "Add a workspace…" drops the current session and goes to the same sign-in
      * view the app starts on — one sign-in implementation, not two. */
     case 80: reset_session(); signin_begin(hwnd, NULL, NULL); break;
@@ -3839,6 +3984,10 @@ static void test_poll(HWND hwnd) {
             ac_rebuild();
             test_ack("ok");
         } else test_ack("err");
+    } else if (!strcmp(verb, "prefs")) {
+        close_overlays(); g_prefs_open = 1; g_view = VIEW_HOME; test_ack("ok");
+    } else if (!strcmp(verb, "theme")) {
+        theme_set(atoi(arg)); prefs_save(); test_ack("ok");
     } else if (!strcmp(verb, "emoji")) {
         picker_open(hwnd, (uint64_t)strtoull(arg, NULL, 10));
         test_ack("ok");
@@ -3921,6 +4070,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_sb_settings_pending = 0;
                 InvalidateRect(hwnd, NULL, FALSE);
             }
+            if (g_prefs_pending && oc_model_setting(m, PREFS_SETTING_KEY)) {
+                prefs_load(m);
+                g_prefs_pending = 0;
+                layout_composer(hwnd);
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
             if (m->authed && !g_post_auth) {          /* one-shot: identify the bucket + pull state */
                 oc_client_set_client_type(g_client, "gui");   /* our own settings bucket, not tui's */
                 oc_client_list_settings(g_client);
@@ -3928,6 +4083,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 oc_client_list_channels(g_client);
                 g_post_auth = 1;
                 g_sb_settings_pending = 1;   /* fold the synced sidebar prefs when they land */
+                g_prefs_pending = 1;
                 layout_composer(hwnd);   /* members pane now shows — re-fit the composer */
             }
             /* Sign-out returns to the sign-in view rather than quitting the
@@ -4190,6 +4346,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     if (argv) LocalFree(argv);
 
     LoadLibraryW(L"Msftedit.dll");        /* registers MSFTEDIT_CLASS (RICHEDIT50W) */
+    /* Before anything paints: the palette is runtime state now, and every
+     * OC_COL_* reads through it. */
+    oc_theme_apply(OC_THEME_DARK);
     d2d_init();                           /* factory only; the RT is made per-hwnd in paint */
     if (direct) connect_start(aws, acred);
     else        g_view = VIEW_SIGNIN;
