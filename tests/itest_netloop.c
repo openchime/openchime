@@ -1596,8 +1596,12 @@ static void test_out_buffer_cap(int port, const uint8_t *pin, oc_dbwriter *dbw, 
     int rb = 8192;    /* tiny receive window: TCP backpressure hits fast */
     setsockopt(v.fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof rb);
 
+    /* An EXPLICIT, non-zero cursor: "everything after message 1", which is all
+     * 480 of them. A cursor of 0 would mean "I hold no history, send me the
+     * tail" and yield only OC_BACKFILL_TAIL messages — far too few to reach the
+     * output cap this test is about. */
     uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_cursor cur = { 1, 0 };
+    oc_cursor cur = { 1, 1 };
     oc_backfill_request req = { 1, &cur };
     CHECK(oc_encode_backfill_request(&w, OC_PROTOCOL_VERSION, &req) == OC_OK);
     CHECK(write_all(&v.conn, buf, w.len) == 0);

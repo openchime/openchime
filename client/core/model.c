@@ -188,6 +188,7 @@ void oc_model_close_search(oc_model *m) {
     m->search_results = NULL;
     m->n_search = m->cap_search = 0;
     m->search_open = 0;
+    m->search_truncated = 0;
     m->search_query[0] = '\0';
 }
 
@@ -595,8 +596,10 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         bump_reply_count(m, e->message_id, e->count);
         break;
     case OC_EV_SEARCH_RESULT:
-        if (m->search_open)
+        if (m->search_open) {
             search_append(m, e->message_id, e->channel_id, e->author_id, e->server_time, &e->body);
+            if (e->status) m->search_truncated = 1;
+        }
         break;
     case OC_EV_REACTIONS:
         if (m->reactlist_open && e->message_id == m->reactlist_message)

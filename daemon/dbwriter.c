@@ -256,6 +256,10 @@ void oc_dbres_free(oc_dbres *r) {
 /* Replay is bounded per request; a client with more backlog issues a follow-up
  * BACKFILL_REQUEST with an advanced cursor (PROTOCOL.md §6.2). */
 #define OC_BACKFILL_MAX 500
+/* Per-channel tail handed to a client that holds no history. Big enough to
+ * fill a tall window and scroll a little; small enough that a cold client in
+ * many channels does not spend its whole OC_BACKFILL_MAX budget on the first. */
+#define OC_BACKFILL_TAIL 60
 
 /* --- Job processing (runs on the writer thread) ------------------------- */
 
@@ -2156,22 +2160,35 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
         uint64_t ch = curs[ci].channel_id;
         if (!channel_read_access(db, ch, j->user_id)) continue;
 
-        /* An explicit cursor of 0 means "I don't know where I was" — a client
-         * that keeps no local state (ARCH-88). Resume from this user's stored
-         * read position instead of replaying the channel from its very first
-         * message, which would hand a cold client the OLDEST page first. A
-         * member who has genuinely never read the channel has no cursor row, so
-         * this still yields 0 and they get its history from the start. */
+        /* A cursor of 0 means "I hold no history" — a client that keeps no local
+         * state (ARCH-88). Such a client wants the channel's NEWEST page, so
+         * replay the tail: the last OC_BACKFILL_TAIL top-level messages.
+         *
+         * It must NOT resume from the user's stored read cursor. That cursor is
+         * where they last read TO, so a caught-up user would be sent nothing at
+         * all and would stare at an empty channel on every launch — which is
+         * exactly what a cacheless client did before this. The read cursor still
+         * matters, but for placing the unread divider (REQ-236), not for choosing
+         * which messages exist. A user who is far behind likewise gets the newest
+         * page rather than the oldest unread one; older history is paged in by
+         * scrolling back.
+         *
+         * A non-zero cursor keeps its literal meaning — "strictly after this" —
+         * because a reconnecting client that still holds history wants only what
+         * it missed, with no duplicate replay. */
         uint64_t after = curs[ci].after_message_id;
         if (after == 0) {
             sqlite3_stmt *cst = NULL;
             if (sqlite3_prepare_v2(db,
-                    "SELECT message_id FROM delivery_cursors WHERE user_id=? AND channel_id=?;",
-                    -1, &cst, NULL) == SQLITE_OK) {
-                sqlite3_bind_int64(cst, 1, (sqlite3_int64)j->user_id);
-                sqlite3_bind_int64(cst, 2, (sqlite3_int64)ch);
-                if (sqlite3_step(cst) == SQLITE_ROW)
-                    after = (uint64_t)sqlite3_column_int64(cst, 0);
+                    "SELECT COALESCE(MIN(id),0) FROM "
+                    "  (SELECT id FROM messages WHERE channel_id=? AND parent_id IS NULL "
+                    "   ORDER BY id DESC LIMIT ?);", -1, &cst, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(cst, 1, (sqlite3_int64)ch);
+                sqlite3_bind_int64(cst, 2, (sqlite3_int64)OC_BACKFILL_TAIL);
+                if (sqlite3_step(cst) == SQLITE_ROW) {
+                    uint64_t first = (uint64_t)sqlite3_column_int64(cst, 0);
+                    if (first > 0) after = first - 1;   /* 0 stays 0: empty channel */
+                }
                 sqlite3_finalize(cst);
             }
         }

@@ -158,6 +158,13 @@ void oc_client_close_thread(oc_client *c) {
     oc_model_close_thread(&c->model);
 }
 
+/* Open the search view with no query. The overlay owns the input box (WIN-4),
+ * so it needs the pane on screen before there is anything to search for. */
+void oc_client_open_search(oc_client *c) {
+    if (!c) return;
+    oc_model_search_begin(&c->model, "");
+}
+
 void oc_client_search(oc_client *c, const char *query) {
     if (!c || !query || !query[0]) return;
     oc_model_search_begin(&c->model, query);      /* clears prior hits + records it */

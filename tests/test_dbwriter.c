@@ -233,6 +233,8 @@ static oc_dbres *backfill(oc_dbwriter *w, uint64_t uid, uint64_t channel, uint64
     return wait_result(w);
 }
 
+static void client_ack(oc_dbwriter *w, uint64_t uid, uint64_t channel, uint64_t mid);
+
 static void test_backfill(void) {
     const char *path = "build/test_dbwriter3.db";
     cleanup_db(path);
@@ -263,6 +265,40 @@ static void test_backfill(void) {
     /* A channel the user isn't a member of replays nothing. */
     r = backfill(w, u, 999, 0);
     CHECK(r && r->type == OC_RES_BACKFILL_OK && r->n_replay == 0);
+    oc_dbres_free(r);
+
+    /* A cursor of 0 means "I hold no history" and must yield the channel's
+     * NEWEST page, bounded by OC_BACKFILL_TAIL — never the oldest one, and never
+     * nothing. Push the channel well past the tail size to tell them apart. */
+    enum { BF_TAIL = 60 };
+    uint64_t last = m3;
+    for (int i = 0; i < BF_TAIL + 20; i++) {
+        char body[32]; snprintf(body, sizeof body, "bulk-%d", i);
+        memset(idem, 0, sizeof idem); idem[0] = (uint8_t)i; idem[1] = 0xB5;
+        last = send_msg(w, u, idem, body);
+        CHECK(last != 0);
+    }
+    r = backfill(w, u, OC_DEFAULT_CHANNEL, 0);
+    CHECK(r && r->n_replay == BF_TAIL);
+    CHECK(r->replay[BF_TAIL - 1].message_id == last);            /* ends at newest */
+    CHECK(r->replay[0].message_id > m3);                         /* not the oldest page */
+    oc_dbres_free(r);
+
+    /* And a user who is fully caught up STILL gets that page. Resuming from the
+     * stored read cursor would send them nothing, which is how a client that
+     * keeps no local history (ARCH-88) ended up showing an empty channel on
+     * every launch. The read cursor places the unread divider; it does not
+     * decide which messages exist. */
+    client_ack(w, u, OC_DEFAULT_CHANNEL, last);
+    r = backfill(w, u, OC_DEFAULT_CHANNEL, 0);
+    CHECK(r && r->n_replay == BF_TAIL);
+    CHECK(r->replay[BF_TAIL - 1].message_id == last);
+    oc_dbres_free(r);
+
+    /* A non-zero cursor keeps its literal meaning: only what came after it, so a
+     * reconnecting client that still holds history gets no duplicate replay. */
+    r = backfill(w, u, OC_DEFAULT_CHANNEL, last);
+    CHECK(r && r->n_replay == 0);
     oc_dbres_free(r);
 
     oc_dbwriter_stop(w);

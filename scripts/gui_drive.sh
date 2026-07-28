@@ -9,7 +9,8 @@
 #   scripts/gui_drive.sh kill
 #
 # Commands: shot <winpath> | send <text> | channel <name> | click x y |
-#           rclick x y | members | scroll <dy> | size w h | dump <winpath>
+#           rclick x y | members | scroll <dy> | size w h | dump <winpath> |
+#           search [query] | find <text>
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXE="$HERE/build/openchime.exe"
@@ -22,6 +23,11 @@ mkdir -p "$LIN_DIR" "$OUT"
 case "${1:-}" in
   launch)
     ws="${2:-127.0.0.1:8443}"; cred="${3:-alice:pw}"
+    # Exactly one instance, always. A leftover client reads the same command file
+    # and answers for the one under test — which once produced a "crash" that was
+    # really an orphan from an earlier run.
+    powershell.exe -NoProfile -Command "Get-Process openchime -EA SilentlyContinue|Stop-Process -Force" >/dev/null 2>&1 || true
+    sleep 1
     rm -f "$LIN_DIR"/cmd "$LIN_DIR"/ack
     # WSLENV is required for the env var to cross into the Windows process.
     WSLENV="${WSLENV:+$WSLENV:}OPENCHIME_TEST_DIR" OPENCHIME_TEST_DIR="$WIN_DIR" \

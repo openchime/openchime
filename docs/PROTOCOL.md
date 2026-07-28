@@ -1114,10 +1114,25 @@ a lower id in another, and a single global cursor would skip it.
 | `count`     | u16             | Number of channel cursors following.                         |
 | `cursors[]` | `count` × entry | Each entry: `channel_id` (u64) + `after_message_id` (u64).   |
 
-For a channel the client omits, the server treats the cursor as `0` (replay
-from the beginning of that channel's visible history) — a fresh client can send
-`count = 0` to get bootstrapped. The server only replays messages in channels
-the requesting user is a member of (REQ-031, REQ-080).
+**A cursor of `0` means "I hold no history", and the server answers with the
+channel's NEWEST page** — its last N top-level messages — not its oldest. A
+client that keeps nothing locally (ARCH-88) wants the bottom of the transcript,
+which is where it will be scrolled to; older history is paged in by scrolling
+back. For a channel the client omits entirely, and for `count = 0`, the same
+rule applies to every channel the user belongs to.
+
+The server does **not** resume a zero cursor from the user's stored delivery
+cursor (§5.4). That cursor is where they last read *to*, so a caught-up user
+would be sent nothing and would face an empty channel on every launch. The read
+cursor positions the unread divider (REQ-236); it does not decide which messages
+exist.
+
+A **non-zero** cursor keeps its literal meaning — strictly greater than
+`after_message_id` — so a reconnecting client that still holds history receives
+only what it missed, with no duplicate replay.
+
+The server only replays messages in channels the requesting user is a member of
+(REQ-031, REQ-080).
 
 ### 6.2 Replay and `BACKFILL_DONE` (server → client), msg_type `0x0031`
 

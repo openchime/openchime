@@ -123,6 +123,10 @@ typedef struct {
     char      search_query[128];
     oc_search_result *search_results;
     size_t    n_search, cap_search;
+    /* The server said it had more hits than it sent. There is no cursor on the
+     * wire to page with (WIN-38), so this exists to be honest about the cap
+     * rather than to drive a load-more. */
+    uint8_t   search_truncated;
     /* The open "who reacted" view (REQ-071): the inspected message + its full
      * reactor list. reactlist_open is 0 when no such overlay is open. */
     uint8_t   reactlist_open;

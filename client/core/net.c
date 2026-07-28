@@ -509,12 +509,15 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (e) { e->message_id = tm.message_id; e->count = tm.reply_count; oc_queue_push(to_ui, e); }
             }
         } else if (hdr.msg_type == OC_MSG_SEARCH_RESULTS) {
-            oc_search_result_entry se[64]; uint16_t count = 0;
-            if (oc_decode_search_results(&p, se, 64, &count, NULL) != OC_OK) return -1;
-            if (count > 64) count = 64;
+            oc_search_result_entry se[64]; uint16_t count = 0; uint8_t trunc = 0;
+            if (oc_decode_search_results(&p, se, 64, &count, &trunc) != OC_OK) return -1;
+            /* Our own 64-entry decode cap truncates just as surely as the
+             * server's does, so report either. */
+            if (count > 64) { count = 64; trunc = 1; }
             for (uint16_t i = 0; i < count; i++) {
                 oc_ev *e = oc_ev_new(OC_EV_SEARCH_RESULT);
                 if (!e) continue;
+                e->status = (i + 1 == count) ? trunc : 0;
                 e->channel_id = se[i].channel_id;
                 e->message_id = se[i].message_id;
                 e->author_id = se[i].author_id;

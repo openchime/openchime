@@ -30,6 +30,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <wchar.h>
+#include <wctype.h>
 
 #include "client.h"
 #include "secret_os.h"
@@ -168,10 +170,19 @@ static int      g_selecting;    /* left button held, dragging a selection */
 static struct { float top, bot; uint64_t uid; } g_memrows[256];
 static int g_n_memrows;
 
-/* Search-overlay result hit-boxes (row -> its channel). */
-static struct { float top, bot; uint64_t cid; } g_searchrows[128];
+/* Search-overlay result hit-boxes (row -> its channel AND message). */
+static struct { float top, bot; uint64_t cid, mid; } g_searchrows[128];
 static int g_n_searchrows;
 
+/* WIN-3: jump-to-message. A search hit names a message, not just a channel, so
+ * clicking one arms a jump: the transcript scrolls that message into view and
+ * flashes it. The jump survives a few frames because the channel's history is
+ * usually still in flight when the click lands — `g_jump_deadline` is what turns
+ * "not loaded yet" into an honest failure instead of a silent no-op. */
+static uint64_t  g_jump_mid;            /* message to scroll to, 0 = none */
+static ULONGLONG g_jump_deadline;       /* GetTickCount64 by which it must appear */
+static uint64_t  g_flash_mid;           /* message to tint */
+static ULONGLONG g_flash_until;
 /* Webhook-overlay row hit-boxes (row -> webhook id, for delete). */
 static struct { float top, bot; uint64_t wid; } g_webrows[64];
 static int g_n_webrows;
@@ -181,6 +192,10 @@ static D2D1_RECT_F g_members_btn;       /* header toggle hit-box */
 static D2D1_RECT_F g_ws_hdr_btn;        /* channel-column workspace header (opens ws menu) */
 static D2D1_RECT_F g_hdr_gear, g_hdr_compose;   /* header settings + compose buttons */
 static HWND     g_find;                 /* "Find a conversation" filter box (native EDIT) */
+static HWND     g_srch;                 /* search-overlay query box (WIN-4, native EDIT) */
+static float    g_srch_scroll;          /* search-results scroll offset, px */
+static float    g_srch_max;             /* its maximum, computed at paint */
+static D2D1_RECT_F g_srch_box;          /* the query field's chrome, for layout_search */
 static char     g_find_filter[64];      /* current filter text (lowercased) */
 static HBRUSH   g_find_brush;           /* dark bg for the find box */
 static D2D1_RECT_F g_rail_btn;          /* workspace-avatar hit-box (app menu) */
@@ -410,9 +425,9 @@ static int to_w(const char *s, WCHAR *out, int cap) {
 static float text_width(const char *s, IDWriteTextFormat *fmt) {
     WCHAR w[256];
     int n = to_w(s, w, 256);
-    if (n <= 1 || !g_dwrite) return 0;
+    if (n <= 0 || !g_dwrite) return 0;
     IDWriteTextLayout *tl = NULL;
-    if (FAILED(IDWriteFactory_CreateTextLayout(g_dwrite, w, (UINT32)(n - 1), fmt,
+    if (FAILED(IDWriteFactory_CreateTextLayout(g_dwrite, w, (UINT32)n, fmt,
                                                4000.0f, 100.0f, &tl)) || !tl)
         return 0;
     DWRITE_TEXT_METRICS tm;
@@ -429,6 +444,57 @@ static void draw_text(ID2D1RenderTarget *rt, const char *s, IDWriteTextFormat *f
     if (n <= 0) return;
     ID2D1RenderTarget_DrawText(rt, w, (UINT32)n, fmt, &r, paint_with(rgb),
                                D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+}
+
+/* Like draw_text, but tints every occurrence of a whitespace-separated term from
+ * `terms` (WIN-3). Matching is case-insensitive and substring-based, which is
+ * what the daemon's LIKE-based search does — highlighting on a stricter rule
+ * than the search itself would leave hits visibly unmarked. */
+static void draw_text_hl(ID2D1RenderTarget *rt, const char *s, IDWriteTextFormat *fmt,
+                         D2D1_RECT_F r, uint32_t rgb, const char *terms) {
+    WCHAR w[1024];
+    int n = to_w(s, w, 1024);
+    if (n <= 0) return;
+    IDWriteTextLayout *tl = NULL;
+    if (!g_dwrite || !terms || !terms[0] ||
+        FAILED(IDWriteFactory_CreateTextLayout(g_dwrite, w, (UINT32)n, fmt,
+                                               r.right - r.left, r.bottom - r.top, &tl)) || !tl) {
+        draw_text(rt, s, fmt, r, rgb);
+        return;
+    }
+    /* Fold once, then scan for each term over the folded copy so the offsets line
+     * up with the layout's own (unfolded) character indices. */
+    WCHAR low[1024];
+    for (int i = 0; i < n; i++) low[i] = (WCHAR)towlower(w[i]);
+    low[n] = 0;
+
+    const char *p = terms;
+    while (*p) {
+        while (*p == ' ') p++;
+        char term[64]; size_t tn = 0;
+        while (*p && *p != ' ' && tn + 1 < sizeof term) term[tn++] = *p++;
+        term[tn] = '\0';
+        if (tn == 0) continue;
+        WCHAR tw[64];
+        int twn = to_w(term, tw, 64);
+        if (twn <= 0) continue;
+        for (int i = 0; i < twn; i++) tw[i] = (WCHAR)towlower(tw[i]);
+        for (int i = 0; i + twn <= n; i++) {
+            if (wcsncmp(low + i, tw, (size_t)twn) != 0) continue;
+            DWRITE_HIT_TEST_METRICS hm[16]; UINT32 got = 0;
+            if (SUCCEEDED(IDWriteTextLayout_HitTestTextRange(tl, (UINT32)i, (UINT32)twn,
+                                                             r.left, r.top, hm, 16, &got)))
+                for (UINT32 k = 0; k < got; k++) {
+                    D2D1_RECT_F hr = rf(hm[k].left - 1, hm[k].top,
+                                        hm[k].left + hm[k].width + 1, hm[k].top + hm[k].height);
+                    fill_round_a(rt, hr, 2.0f, OC_COL_NOTICE, 0.34f);
+                }
+            i += twn - 1;
+        }
+    }
+    D2D1_POINT_2F org = { r.left, r.top };
+    ID2D1RenderTarget_DrawTextLayout(rt, org, tl, paint_with(rgb), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    IDWriteTextLayout_Release(tl);
 }
 
 /* Build (once) a stroked path geometry for a Lucide icon in its 24x24 space. */
@@ -962,7 +1028,7 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                  * still addressed by account name (Slack's treatment). */
                 float w = text_width(r->label, unread ? g_ui_b : g_ui);
                 draw_text(rt, "you", g_small,
-                          rf(sx0 + 34 + w + 14, ry, sx1 - 44, ry + ROW_H), OC_COL_FAINT);
+                          rf(sx0 + 34 + w + 8, ry, sx1 - 44, ry + ROW_H), OC_COL_FAINT);
             }
             if (unread) {
                 char badge[16]; snprintf(badge, sizeof badge, "%d", r->unread);
@@ -1201,6 +1267,7 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
     if (n > CAP) { first = n - CAP; n = CAP; }
 
     float total = 0;
+    long jump_i = -1; float jump_off = 0;
     for (size_t i = 0; i < n; i++) {
         /* Date dividers only in the main transcript, not the thread/search panes. */
         sep[i] = (uint8_t)(capture && (i == 0 ||
@@ -1208,11 +1275,28 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
         grouped[i] = (uint8_t)(!sep[i] && i > 0 &&
                      groups_with(&msgs[first + i - 1], &msgs[first + i]));
         heights[i] = msg_height(&msgs[first + i], content_w, grouped[i], &layouts[i], &wlens[i]);
-        total += heights[i] + (sep[i] ? SEP_H : 0);
+        total += (sep[i] ? SEP_H : 0);
+        if (capture && g_jump_mid && msgs[first + i].message_id == g_jump_mid) {
+            jump_i = (long)i; jump_off = total;      /* distance from content top */
+        }
+        total += heights[i];
     }
 
     float visible = reg.bottom - reg.top;
     g_scroll_max = total > visible ? total - visible : 0;
+
+    /* Resolve an armed jump (WIN-3). A message's top sits at
+     *   screen_y = (reg.bottom - total) + g_scroll + jump_off,
+     * so placing it a third of the way down the pane solves for g_scroll. The
+     * clamp is what keeps a hit in the newest or oldest screenful sensible
+     * rather than scrolling past the end. */
+    if (capture && jump_i >= 0) {
+        g_scroll = total - jump_off - visible * 0.66f;
+        g_flash_mid = g_jump_mid;
+        g_flash_until = GetTickCount64() + 1600;
+        g_jump_mid = 0;
+    }
+
     if (g_scroll > g_scroll_max) g_scroll = g_scroll_max;
     if (g_scroll < 0) g_scroll = 0;
 
@@ -1248,6 +1332,17 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
             /* Hover highlight behind the whole row (main transcript only). */
             if (capture && !g_selecting && g_hover_mid == msgs[first + i].message_id)
                 fill(rt, rf(reg.left, y, reg.right, y + heights[i]), OC_COL_HOVER);
+            /* Jump flash — fades out so it reads as "here it is", not as state. */
+            if (capture && g_flash_mid == msgs[first + i].message_id) {
+                ULONGLONG now = GetTickCount64();
+                if (now < g_flash_until) {
+                    float a = (float)(g_flash_until - now) / 1600.0f;
+                    D2D1_RECT_F fr = rf(reg.left, y, reg.right, y + heights[i]);
+                    ID2D1RenderTarget_FillRectangle(rt, &fr, paint_alpha(OC_COL_NOTICE, a * 0.30f));
+                } else {
+                    g_flash_mid = 0;
+                }
+            }
             /* Selection highlight — drawn under the text so it stays readable. */
             if (sel_lo >= 0 && (long)i >= sel_lo && (long)i <= sel_hi && layouts[i]) {
                 uint32_t s = ((long)i == sel_lo) ? sel_lo_pos : 0;
@@ -1345,33 +1440,75 @@ static void draw_thread(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
 }
 
 static void draw_search(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
-    char title[192];
-    snprintf(title, sizeof title, "Search: %s", m->search_query);
-    D2D1_RECT_F body = overlay_header(rt, reg, title);
+    D2D1_RECT_F body = overlay_header(rt, reg, "Search");
     g_n_searchrows = 0;
-    if (m->n_search == 0) { overlay_empty(rt, body, "No matches."); return; }
+
+    /* The query box lives IN the overlay (WIN-4), so refining a search never
+     * closes and reopens it. The native EDIT is placed over this chrome by
+     * layout_search(). */
+    g_srch_box = rf(body.left + 20, body.top + 10, body.right - 20, body.top + 42);
+    fill_round(rt, g_srch_box, 6.0f, OC_COL_INPUT);
+    stroke_round(rt, g_srch_box, 6.0f, OC_COL_BORDER, 1.0f);
+    draw_lucide(rt, OC_ICON_SEARCH, rf(g_srch_box.left + 8, g_srch_box.top + 8,
+                                       g_srch_box.left + 24, g_srch_box.top + 24), OC_COL_MUTED);
+    body.top += 52;
+
+    /* A count line, so "5 results" and "no matches" are told apart at a glance. */
+    char count[96];
+    if (!m->search_query[0])   snprintf(count, sizeof count, "Type a query and press Enter.");
+    else if (m->n_search == 0) snprintf(count, sizeof count, "No matches for \u201c%s\u201d.", m->search_query);
+    else snprintf(count, sizeof count, "%zu %s for \u201c%s\u201d%s",
+                  m->n_search, m->n_search == 1 ? "result" : "results", m->search_query,
+                  /* No cursor exists on the wire to page with (WIN-38), so say
+                   * that more exist rather than implying these are all of them. */
+                  m->search_truncated ? " \u2014 more exist; narrow the query to see them." : "");
+    draw_text(rt, count, g_small, rf(body.left + 20, body.top, body.right - 16, body.top + 18),
+              m->search_truncated ? OC_COL_NOTICE : OC_COL_MUTED);
+    body.top += 22;
+
+    if (m->n_search == 0) { g_srch_max = g_srch_scroll = 0; return; }
+
+    float rowh = 54;
+    float visible = body.bottom - body.top;
+    float total = (float)m->n_search * rowh + 12;
+    g_srch_max = total > visible ? total - visible : 0;
+    if (g_srch_scroll > g_srch_max) g_srch_scroll = g_srch_max;
+    if (g_srch_scroll < 0) g_srch_scroll = 0;
 
     ID2D1RenderTarget_PushAxisAlignedClip(rt, &body, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-    float y = body.top + 6, rowh = 54;
-    for (size_t i = 0; i < m->n_search && y < body.bottom; i++) {
+    float y = body.top + 6 - g_srch_scroll;
+    for (size_t i = 0; i < m->n_search; i++) {
+        if (y + rowh < body.top) { y += rowh; continue; }    /* above the fold */
+        if (y > body.bottom) break;
         const oc_search_result *r = &m->search_results[i];
         const char *au = oc_model_user_name(m, r->author_id);
         const oc_channel *ch = oc_model_channel((oc_model *)m, r->channel_id);
         char head[160];
-        char when[16] = "";
+        /* 17 bytes minimum for "YYYY-MM-DD HH:MM" plus the NUL — at 16 strftime
+         * silently writes nothing and every result showed a blank time. */
+        char when[32] = "";
         if (r->server_time) { time_t t = (time_t)(r->server_time / 1000); struct tm tv;
             if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%Y-%m-%d %H:%M", &tv); }
         snprintf(head, sizeof head, "%s  ·  %s  ·  %s",
                  (au && au[0]) ? au : "user", (ch && ch->name) ? ch->name : "channel", when);
         draw_text(rt, head, g_small, rf(body.left + 20, y, body.right - 16, y + 20), OC_COL_MUTED);
-        draw_text(rt, r->snippet ? r->snippet : "", g_ui,
-                  rf(body.left + 20, y + 20, body.right - 16, y + 46), OC_COL_TEXT);
+        draw_text_hl(rt, r->snippet ? r->snippet : "", g_ui,
+                     rf(body.left + 20, y + 20, body.right - 16, y + 46), OC_COL_TEXT,
+                     m->search_query);
         fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 16, y + rowh), OC_COL_BORDER);
         if (g_n_searchrows < (int)(sizeof g_searchrows / sizeof g_searchrows[0])) {
             g_searchrows[g_n_searchrows].top = y; g_searchrows[g_n_searchrows].bot = y + rowh;
-            g_searchrows[g_n_searchrows].cid = r->channel_id; g_n_searchrows++;
+            g_searchrows[g_n_searchrows].cid = r->channel_id;
+            g_searchrows[g_n_searchrows].mid = r->message_id; g_n_searchrows++;
         }
         y += rowh;
+    }
+    if (g_srch_max > 0.5f) {
+        float track_h = visible - 8, thumb_h = visible / total * track_h;
+        if (thumb_h < 30) thumb_h = 30;
+        float thumb_top = body.top + 4 + (g_srch_scroll / g_srch_max) * (track_h - thumb_h);
+        fill_round(rt, rf(body.right - 10, thumb_top, body.right - 4, thumb_top + thumb_h),
+                   3.0f, OC_COL_FAINT);
     }
     ID2D1RenderTarget_PopAxisAlignedClip(rt);
 }
@@ -1919,6 +2056,8 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
     draw_toasts(rt, W, H);  /* …and failure notices float above even those */
 }
 
+static void layout_search(HWND hwnd);
+
 static void paint(HWND hwnd) {
     d2d_ensure_rt(hwnd);
     if (!g_rt || !g_brush) return;
@@ -1929,6 +2068,9 @@ static void paint(HWND hwnd) {
 
     ID2D1RenderTarget_BeginDraw(rt);
     render_scene(rt, m, W, H);
+    /* The search box is placed against chrome the scene just measured, so it can
+     * only be positioned after the scene is laid out. */
+    layout_search(hwnd);
 
     HRESULT hr = ID2D1RenderTarget_EndDraw(rt, NULL, NULL);
     if (hr == (HRESULT)D2DERR_RECREATE_TARGET) {
@@ -2046,6 +2188,71 @@ static void find_create(HWND parent) {
     SendMessageW(g_find, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
     SendMessageW(g_find, EM_SETCUEBANNER, TRUE, (LPARAM)L"Find a conversation…");
     layout_find(parent);
+}
+
+/* Place the search-overlay query EDIT over the chrome draw_search() painted.
+ * g_srch_box is only valid after a paint, so this runs from the paint path as
+ * well as from WM_SIZE. */
+static void layout_search(HWND hwnd) {
+    const oc_model *m = model();
+    if (!g_srch) return;
+    if (!m || !m->search_open) { ShowWindow(g_srch, SW_HIDE); return; }
+    (void)hwnd;
+    ShowWindow(g_srch, SW_SHOW);
+    MoveWindow(g_srch, (int)(g_srch_box.left + 30), (int)(g_srch_box.top + 8),
+               (int)(g_srch_box.right - g_srch_box.left - 40), 20, TRUE);
+}
+
+/* Enter submits the query; Escape closes the overlay. An EDIT swallows both, so
+ * they are intercepted by a subclass rather than in the main key handler. */
+static LRESULT CALLBACK srch_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+static WNDPROC g_srch_prev;
+
+static void search_create(HWND parent) {
+    g_srch = CreateWindowExW(0, L"EDIT", L"",
+        WS_CHILD | ES_AUTOHSCROLL, 0, 0, 10, 10, parent,
+        (HMENU)(INT_PTR)0xF2, GetModuleHandleW(NULL), NULL);
+    if (!g_srch) return;
+    SendMessageW(g_srch, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    SendMessageW(g_srch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search messages…");
+    g_srch_prev = (WNDPROC)SetWindowLongPtrW(g_srch, GWLP_WNDPROC, (LONG_PTR)srch_proc);
+}
+
+/* Run whatever is currently in the query box. */
+static void search_submit(void) {
+    if (!g_srch || !g_client) return;
+    WCHAR w[256]; GetWindowTextW(g_srch, w, 256);
+    char q[256];
+    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, q, sizeof q, NULL, NULL) <= 0) return;
+    if (!q[0]) return;
+    g_srch_scroll = 0;
+    oc_client_search(g_client, q);
+}
+
+/* Open the overlay with the box focused and empty (WIN-4) — no modal prompt. */
+static void search_open(HWND hwnd) {
+    if (!g_client) return;
+    g_view = VIEW_HOME;
+    g_srch_scroll = 0;
+    oc_client_open_search(g_client);
+    SetWindowTextW(g_srch, L"");
+    layout_search(hwnd);
+    SetFocus(g_srch);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static LRESULT CALLBACK srch_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_KEYDOWN && wp == VK_RETURN) { search_submit(); return 0; }
+    if (msg == WM_CHAR && (wp == VK_RETURN || wp == VK_ESCAPE)) return 0;  /* no MessageBeep */
+    if (msg == WM_KEYDOWN && wp == VK_ESCAPE) {
+        HWND parent = GetParent(hwnd);
+        if (g_client) oc_client_close_search(g_client);
+        ShowWindow(hwnd, SW_HIDE);
+        SetFocus(g_re ? g_re : parent);
+        InvalidateRect(parent, NULL, FALSE);
+        return 0;
+    }
+    return CallWindowProcW(g_srch_prev, hwnd, msg, wp, lp);
 }
 
 /* Place the sign-in EDITs over the field chrome draw_signin() paints. The two
@@ -2377,6 +2584,10 @@ static int on_click(HWND hwnd, int x, int y) {
             if (mm->search_open)
                 for (int i = 0; i < g_n_searchrows; i++)
                     if ((float)y >= g_searchrows[i].top && (float)y < g_searchrows[i].bot) {
+                        /* Arm the jump BEFORE selecting: select_channel closes the
+                         * overlay and may fire the backfill this jump waits on. */
+                        g_jump_mid = g_searchrows[i].mid;
+                        g_jump_deadline = GetTickCount64() + 4000;
                         select_channel(g_searchrows[i].cid);   /* also closes the overlay */
                         return 1;
                     }
@@ -3050,9 +3261,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 2:  oc_client_reconnect(g_client); break;
     case 3:  oc_client_logout(g_client, OC_LOGOUT_THIS); g_logging_out = 1; break;
     case 5:  oc_client_logout(g_client, OC_LOGOUT_ALL);  g_logging_out = 1; break;
-    case 4: { char q[128];
-        if (text_prompt(hwnd, "Search", "Search messages:", "", q, sizeof q, 0) && q[0]) {
-            g_view = VIEW_HOME; g_scroll = 0; oc_client_search(g_client, q); } break; }
+    case 4:  search_open(hwnd); break;
     case 6: { char u[64];
         if (m && text_prompt(hwnd, "New direct message", "Username:", "", u, sizeof u, 0) && u[0]) {
             uint64_t id = oc_model_user_id(m, u);
@@ -3281,6 +3490,10 @@ static void test_poll(HWND hwnd) {
         snprintf(g_find_filter, sizeof g_find_filter, "%s", arg);
         for (char *p = g_find_filter; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
         test_ack("ok");
+    } else if (!strcmp(verb, "search")) {
+        search_open(hwnd);
+        if (arg[0]) { WCHAR w[256]; to_w(arg, w, 256); SetWindowTextW(g_srch, w); search_submit(); }
+        test_ack("ok");
     } else if (!strcmp(verb, "dump")) {
         test_dump(arg); test_ack("ok");
     /* Sign-in drivers. Setting the EDIT text directly is deterministic, where
@@ -3308,6 +3521,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE:
         composer_create(hwnd);
         find_create(hwnd);
+        search_create(hwnd);
         signin_create(hwnd);
         DragAcceptFiles(hwnd, TRUE);              /* drop files anywhere to upload */
         SetTimer(hwnd, TIMER_TICK, 30, NULL);
@@ -3334,6 +3548,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * toast channel while the sign-in view owns the window. */
             if (g_view == VIEW_SIGNIN) { if (g_si_connecting) signin_poll(hwnd); }
             else toast_tick(m);
+            /* An armed jump the transcript never resolved (WIN-3): the message is
+             * older than the backfill window, so say so rather than leaving the
+             * click looking like it did nothing. */
+            if (g_jump_mid && GetTickCount64() > g_jump_deadline) {
+                g_jump_mid = 0;
+                toast_push("That message is older than the loaded history.", 0);
+            }
             /* The settings bucket arrives a beat after auth; fold it in once. */
             if (g_sb_settings_pending && oc_model_setting(m, SB_SETTING_KEY)) {
                 sidebar_opts_load(m);
@@ -3409,7 +3630,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CTLCOLOREDIT:
         /* The find box and the sign-in fields both sit on the OC_COL_INPUT
          * surface the D2D chrome paints under them, so they share a brush. */
-        if ((HWND)lp == g_find || (HWND)lp == g_si_e_ws ||
+        if ((HWND)lp == g_find || (HWND)lp == g_srch || (HWND)lp == g_si_e_ws ||
             (HWND)lp == g_si_e_user || (HWND)lp == g_si_e_pass) {
             SetBkColor((HDC)wp, OCRGB(OC_COL_INPUT));
             SetTextColor((HDC)wp, OCRGB(OC_COL_TEXT));
@@ -3423,11 +3644,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         POINT wpt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         ScreenToClient(hwnd, &wpt);
         float dy = (float)GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 48.0f;
+        const oc_model *wm = model();
         if (view_has_sidebar() && wpt.x >= (int)RAIL_W && wpt.x < (int)(RAIL_W + SIDEBAR_W)) {
             float maxs = g_sb_content > g_sb_view ? g_sb_content - g_sb_view : 0;
             g_sb_scroll -= dy;
             if (g_sb_scroll < 0) g_sb_scroll = 0;
             if (g_sb_scroll > maxs) g_sb_scroll = maxs;
+        } else if (wm && wm->search_open) {
+            /* The results list scrolls top-down, unlike the bottom-pinned
+             * transcript, so the sign is the other way round. */
+            g_srch_scroll -= dy;
+            if (g_srch_scroll < 0) g_srch_scroll = 0;
+            if (g_srch_scroll > g_srch_max) g_srch_scroll = g_srch_max;
         } else {
             g_scroll += dy;
             if (g_scroll < 0) g_scroll = 0;
