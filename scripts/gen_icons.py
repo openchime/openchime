@@ -29,6 +29,7 @@ ICONS = [
     ("SEND",     "send"),
     ("SMILE",    "smile"),
     ("AT",       "at-sign"),
+    ("DOWNLOAD", "download"),
 ]
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SVGDIR = os.path.join(ROOT, "third_party", "lucide", "icons")

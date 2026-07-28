@@ -25,6 +25,7 @@ enum {
     OC_ICON_SEND,
     OC_ICON_SMILE,
     OC_ICON_AT,
+    OC_ICON_DOWNLOAD,
     OC_ICON_COUNT
 };
 

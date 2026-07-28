@@ -456,6 +456,12 @@ static uint64_t g_thumb_pending;                /* one fetch in flight */
 static struct { D2D1_RECT_F r; uint64_t id; } g_thumb_hits[32];
 static int      g_n_thumb_hits;
 static uint64_t g_lightbox;
+/* Slack's pattern: the image itself is the click target for a bigger view, and
+ * saving it is a button that appears on hover — so the affordance is there when
+ * you look for it and out of the way when you are reading. */
+static uint64_t g_thumb_hover;
+static struct { D2D1_RECT_F r; int attach_ix; uint64_t mid; } g_thumb_dl[32];
+static int      g_n_thumb_dl;
 static ULONGLONG g_thumb_deadline;
 static IWICImagingFactory *g_wic;
 
@@ -1665,7 +1671,7 @@ static float msg_height(const oc_msg *msg, float content_w, int grouped,
          * must be reserved whether or not the bitmap has arrived, or the
          * transcript jumps under the reader the moment one decodes. */
         if (!msg->attach[i].reclaimed && mime_is_image(msg->attach[i].mime))
-            thumbs += THUMB_H + 6.0f;
+            thumbs += THUMB_H + 6.0f + LINE_H;   /* + the filename line above it */
         else
             extra++;
     }
@@ -1744,6 +1750,12 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
     for (int i = 0; i < msg->n_attach; i++) {
         const oc_attachment *at = &msg->attach[i];
         if (!at->reclaimed && mime_is_image(at->mime)) {
+            /* Filename above the image, as Slack does: the thumbnail alone does
+             * not tell you what the file is called or whether it is the one you
+             * were sent. */
+            draw_text(rt, at->filename, g_small,
+                      rf(tx, by, x0 + content_w + AVA + 12, by + LINE_H), OC_COL_MUTED);
+            by += LINE_H;
             UINT iw = 0, ih = 0;
             ID2D1Bitmap *bmp = thumb_get(rt, at->id, &iw, &ih);
             float bw = THUMB_W, bh = THUMB_H;
@@ -1760,24 +1772,15 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
                 ID2D1RenderTarget_DrawBitmap(rt, bmp, &dst, 1.0f,
                                              D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, NULL);
                 stroke_round(rt, dst, 6.0f, OC_COL_BORDER, 1.0f);
-                if (g_n_thumb_hits < 32) {
-                    g_thumb_hits[g_n_thumb_hits].r = dst;
-                    g_thumb_hits[g_n_thumb_hits].id = at->id;
-                    g_n_thumb_hits++;
-                }
             } else {
                 D2D1_RECT_F ph = rf(tx, by + 3, tx + bw, by + 3 + bh);
                 fill_round(rt, ph, 6.0f, OC_COL_INPUT);
                 stroke_round(rt, ph, 6.0f, OC_COL_BORDER, 1.0f);
-                /* Always name the file, even while loading: an image whose
-                 * bytes never arrive must not leave a nameless grey box where a
-                 * clickable filename used to be. */
+                /* The filename is on the line above; this only says why there is
+                 * no picture yet. */
                 IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-                draw_text(rt, at->filename, g_small,
-                          rf(ph.left, ph.top + bh / 2 - 20, ph.right, ph.top + bh / 2), OC_COL_ACCENT);
-                if (!thumb_failed(at->id))
-                    draw_text(rt, "loading\u2026", g_small,
-                              rf(ph.left, ph.top + bh / 2, ph.right, ph.top + bh / 2 + 20), OC_COL_FAINT);
+                draw_text(rt, thumb_failed(at->id) ? "preview unavailable" : "loading\u2026",
+                          g_small, ph, OC_COL_FAINT);
                 IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
                 /* Ask for it — one at a time, and only for what is on screen.
                  * Never while thumbnails are suppressed for the screenshot
@@ -1789,6 +1792,38 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
                     g_thumb_deadline = GetTickCount64() + 8000;
                     oc_client_fetch_attachment(g_client, at->id);
                 }
+            }
+            /* One hit-box for the whole image area whether or not it decoded,
+             * so hover (and therefore the toolbar) works while it is loading. */
+            if (g_n_thumb_hits < 32) {
+                g_thumb_hits[g_n_thumb_hits].r = rf(tx, by + 3, tx + bw, by + 3 + bh);
+                g_thumb_hits[g_n_thumb_hits].id = at->id;
+                g_n_thumb_hits++;
+            }
+            /* Hover toolbar, top-right of the image: save, and a kebab for the
+             * rest. Outside the decoded-bitmap branch on purpose — it acts on
+             * the ATTACHMENT, so it should work while the thumbnail is still
+             * loading or failed to decode, not only once a picture exists. */
+            if (g_thumb_hover == at->id && g_n_thumb_dl + 1 < 32) {
+                float bs = 26, gap = 4;
+                D2D1_RECT_F area = rf(tx, by + 3, tx + bw, by + 3 + bh);
+                D2D1_RECT_F kb = rf(area.right - 6 - bs, area.top + 6,
+                                    area.right - 6, area.top + 6 + bs);
+                D2D1_RECT_F db = rf(kb.left - gap - bs, kb.top, kb.left - gap, kb.bottom);
+                fill_round_a(rt, db, 6.0f, 0x000000, 0.62f);
+                fill_round_a(rt, kb, 6.0f, 0x000000, 0.62f);
+                draw_lucide(rt, OC_ICON_DOWNLOAD, rf(db.left + 5, db.top + 5,
+                                                     db.right - 5, db.bottom - 5), 0xFFFFFF);
+                draw_lucide(rt, OC_ICON_ELLIPSIS, rf(kb.left + 4, kb.top + 4,
+                                                     kb.right - 4, kb.bottom - 4), 0xFFFFFF);
+                g_thumb_dl[g_n_thumb_dl].r = db;
+                g_thumb_dl[g_n_thumb_dl].attach_ix = i;
+                g_thumb_dl[g_n_thumb_dl].mid = msg->message_id;
+                g_n_thumb_dl++;
+                g_thumb_dl[g_n_thumb_dl].r = kb;
+                g_thumb_dl[g_n_thumb_dl].attach_ix = -(i + 1);   /* negative = kebab */
+                g_thumb_dl[g_n_thumb_dl].mid = msg->message_id;
+                g_n_thumb_dl++;
             }
             by += THUMB_H + 6.0f;
             continue;
@@ -1952,7 +1987,8 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
     float y = (reg.bottom - total) + *scroll;     /* g_scroll 0 => newest pinned to bottom */
 
     ID2D1RenderTarget_PushAxisAlignedClip(rt, &reg, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-    if (capture) { g_n_msgrows = 0; g_n_thumb_hits = 0; } else if (hits) g_n_thrrows = 0;
+    if (capture) { g_n_msgrows = 0; g_n_thumb_hits = 0; g_n_thumb_dl = 0; }
+    else if (hits) g_n_thrrows = 0;
     for (size_t i = 0; i < n; i++) {
         if (sep[i]) {
             if (y + SEP_H >= reg.top && y <= reg.bottom)
@@ -4601,6 +4637,38 @@ static int on_click(HWND hwnd, int x, int y) {
         return 1;
     }
     /* Composer attach (+) and send buttons. */
+    /* The hover toolbar is inside the image, so it must be tested first or the
+     * image's own click (expand) swallows it. */
+    for (int i = 0; i < g_n_thumb_dl; i++) {
+        if (!in_rect(g_thumb_dl[i].r, x, y)) continue;
+        const oc_model *tm = model();
+        const oc_channel *tc = tm ? oc_model_channel((oc_model *)tm, g_sel) : NULL;
+        const oc_msg *tmsg = find_msg(tc, g_thumb_dl[i].mid);
+        int ix = g_thumb_dl[i].attach_ix;
+        int kebab = ix < 0;
+        if (kebab) ix = -ix - 1;
+        if (!tmsg || ix < 0 || ix >= tmsg->n_attach) return 1;
+        const oc_attachment *at = &tmsg->attach[ix];
+        if (!kebab) { download_attachment(hwnd, at); return 1; }
+
+        /* Slack's menu here also offers copy-link, save-for-later and share.
+         * Those map to REQ-232, REQ-231 and REQ-057, none of which exist yet —
+         * offering them greyed out would be four dead entries, so the menu is
+         * only what actually works. */
+        POINT pt = { PX(x), PX(y) };
+        ClientToScreen(hwnd, &pt);
+        HMENU mnu = CreatePopupMenu();
+        AppendMenuW(mnu, MF_STRING, 1, L"View full size");
+        AppendMenuW(mnu, MF_STRING, 2, L"Save image as\u2026");
+        AppendMenuW(mnu, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(mnu, MF_STRING, 3, L"Copy filename");
+        int cmd = (int)TrackPopupMenu(mnu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+        DestroyMenu(mnu);
+        if (cmd == 1)      g_lightbox = at->id;
+        else if (cmd == 2) download_attachment(hwnd, at);
+        else if (cmd == 3) copy_to_clipboard(hwnd, at->filename);
+        return 1;
+    }
     for (int i = 0; i < g_n_thumb_hits; i++)
         if (in_rect(g_thumb_hits[i].r, x, y)) { g_lightbox = g_thumb_hits[i].id; return 1; }
     if (in_rect(g_unread_jump, x, y)) {
@@ -6046,6 +6114,13 @@ static void test_dump(const char *path) {
     fprintf(f, "tray_live=%d notify_pref=%d toasts_raised=%d dnd=%d\n",
             g_tray_live, g_pref_notify, g_toasts_raised, dnd_active(m));
     fprintf(f, "lightbox=%llu thumb_hits=%d\n", (unsigned long long)g_lightbox, g_n_thumb_hits);
+    fprintf(f, "thumb_hover=%llu thumb_tools=%d\n", (unsigned long long)g_thumb_hover, g_n_thumb_dl);
+    for (int i = 0; i < g_n_thumb_dl; i++)
+        fprintf(f, "  tool[%d] %s %.0f,%.0f %.0fx%.0f\n", i,
+                g_thumb_dl[i].attach_ix < 0 ? "kebab" : "download",
+                g_thumb_dl[i].r.left, g_thumb_dl[i].r.top,
+                g_thumb_dl[i].r.right - g_thumb_dl[i].r.left,
+                g_thumb_dl[i].r.bottom - g_thumb_dl[i].r.top);
     for (int i = 0; i < g_n_thumb_hits; i++)
         fprintf(f, "  thumbhit[%d] id=%llu %.0f,%.0f %.0fx%.0f\n", i,
                 (unsigned long long)g_thumb_hits[i].id,
@@ -6143,6 +6218,12 @@ static void test_poll(HWND hwnd) {
         char ws[256] = "", cred[256] = "";
         sscanf(arg, "%255s %255s", ws, cred);
         if (ws[0]) { switch_workspace(hwnd, ws, cred); test_ack("ok"); } else test_ack("err");
+    } else if (!strcmp(verb, "move")) {
+        /* A real WM_MOUSEMOVE, so hover goes through the same path the mouse
+         * does rather than a test-only shortcut that could drift from it. */
+        int x = 0, y = 0; sscanf(arg, "%d %d", &x, &y);
+        SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(PX(x), PX(y)));
+        test_ack("ok");
     } else if (!strcmp(verb, "nav")) {
         int d = 0, u = 0; sscanf(arg, "%d %d", &d, &u);
         nav_conversation(hwnd, d, u); test_ack("ok");
@@ -6662,7 +6743,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     sec = g_rows[i].sec; break;
                 }
             if (sec != g_sb_hover_sec) { g_sb_hover_sec = sec; InvalidateRect(hwnd, NULL, FALSE); }
-        } else if ((float)mx < RAIL_W) {
+        } else {
+            uint64_t th = 0;
+            for (int i = 0; i < g_n_thumb_hits; i++)
+                if (in_rect(g_thumb_hits[i].r, mx, my)) { th = g_thumb_hits[i].id; break; }
+            /* Keep the toolbar up while the cursor is on it, not just on the
+             * image — it sits inside the image bounds, so this is only about
+             * not flickering at the edges. */
+            if (!th) for (int i = 0; i < g_n_thumb_dl; i++)
+                if (in_rect(g_thumb_dl[i].r, mx, my)) { th = g_thumb_hover; break; }
+            if (th != g_thumb_hover) { g_thumb_hover = th; InvalidateRect(hwnd, NULL, FALSE); }
+        }
+        if ((float)mx < RAIL_W) {
             /* Rail hover. */
             int a = -100;
             for (int i = 0; i < g_n_navrows; i++)

@@ -159,6 +159,12 @@ than against the backlog:
 - **Presence dots** — two avatar tints were byte-identical to the online and
   away colours, so the dot vanished on those avatars. Palette split from the
   semantic colours, and dots ringed in their surface.
+- **Image affordances** to Slack's pattern: the filename above the thumbnail,
+  and a hover toolbar on the image with **save** and a **kebab** (view full
+  size / save as / copy filename). The menu is only what works — Slack's
+  copy-link, save-for-later and share map to REQ-232, REQ-231 and REQ-057,
+  none of which exist, and four greyed-out entries is worse than three real
+  ones.
 - **Window placement** remembered across runs, **click-to-expand** for inline
   images, and **keyboard conversation movement** (Alt+Up/Down, Alt+Shift for
   unread only, F6 between composer and filter).

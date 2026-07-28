@@ -1,0 +1,11 @@
+<!-- Hand-authored for OpenChime, not from Lucide — kept out of third_party so
+     the ISC attribution there stays accurate. Lucide conventions: 24x24 box,
+     2px stroke, round caps/joins. Arrow into a tray: the download affordance
+     on an image thumbnail. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+     fill="none" stroke="currentColor" stroke-width="2"
+     stroke-linecap="round" stroke-linejoin="round">
+  <path d="M12 3 L12 15" />
+  <path d="M7 10.5 L12 15.5 L17 10.5" />
+  <path d="M4 19.5 L20 19.5" />
+</svg>

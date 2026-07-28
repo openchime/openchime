@@ -457,6 +457,15 @@ static const oc_icon_seg SEG_AT[] = {
     { 67, 2.000f, 17.500f, 6.500f, 22.000f, 12.000f, 22.000f },
     { 67, 14.200f, 22.000f, 16.300f, 21.300f, 18.000f, 20.000f },
 };
+static const oc_icon_seg SEG_DOWNLOAD[] = {
+    { 77, 12.000f, 3.000f, 0.000f, 0.000f, 0.000f, 0.000f },
+    { 76, 12.000f, 15.000f, 0.000f, 0.000f, 0.000f, 0.000f },
+    { 77, 7.000f, 10.500f, 0.000f, 0.000f, 0.000f, 0.000f },
+    { 76, 12.000f, 15.500f, 0.000f, 0.000f, 0.000f, 0.000f },
+    { 76, 17.000f, 10.500f, 0.000f, 0.000f, 0.000f, 0.000f },
+    { 77, 4.000f, 19.500f, 0.000f, 0.000f, 0.000f, 0.000f },
+    { 76, 20.000f, 19.500f, 0.000f, 0.000f, 0.000f, 0.000f },
+};
 
 const oc_icon OC_ICONS[OC_ICON_COUNT] = {
     [OC_ICON_HOME] = { SEG_HOME, 29 },
@@ -474,4 +483,5 @@ const oc_icon OC_ICONS[OC_ICON_COUNT] = {
     [OC_ICON_SEND] = { SEG_SEND, 7 },
     [OC_ICON_SMILE] = { SEG_SMILE, 44 },
     [OC_ICON_AT] = { SEG_AT, 22 },
+    [OC_ICON_DOWNLOAD] = { SEG_DOWNLOAD, 7 },
 };
