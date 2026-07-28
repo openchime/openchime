@@ -1141,6 +1141,14 @@ message with `message_id > after_message_id` in each requested channel, in
 ascending `message_id` order per channel, then sends a single `BACKFILL_DONE`
 to mark the catch-up complete.
 
+The replay also carries the **reaction state** of the messages it sends: after
+the `BROADCAST` frames, the server emits one `REACTION_UPDATED` (§5) per
+(message, emoji) with the aggregate count. A `BROADCAST` has no room for
+reactions, so without this a client that keeps no local cache (ARCH-88) lost
+every reaction the moment it reloaded. The `user_id` on those frames is the
+requesting user whenever they are one of the reactors, so the client can render
+its own reactions as such without a second round trip.
+
 `BACKFILL_DONE` payload:
 
 | Field         | Type | Notes                                                         |

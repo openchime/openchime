@@ -349,6 +349,16 @@ typedef struct oc_dbres {
     /* BACKFILL_OK */
     oc_replay_msg *replay;    /* heap array, ascending message_id */
     size_t         n_replay;
+    /* Reaction aggregates for the replayed messages, one row per
+     * (message, emoji). A BROADCAST carries no reaction state, so without these
+     * every reaction disappeared from a client that reloaded — permanently,
+     * now that clients keep no local cache (ARCH-88). `user_id` is the
+     * requesting user when they are one of the reactors, else any other
+     * reactor, which is exactly what the client needs to render the "mine"
+     * state without a second round trip. */
+    struct oc_replay_react { uint64_t message_id, channel_id, user_id, count; char *emoji; }
+                  *rreact;
+    size_t         n_rreact;
     uint64_t       high_water;
     uint8_t        truncated;  /* results hit the per-response cap (backfill/search/thread) */
 

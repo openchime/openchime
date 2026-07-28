@@ -1067,6 +1067,32 @@ static void test_reactions(void) {
     CHECK(r && r->type == OC_RES_REACTION_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
     oc_dbres_free(r);
 
+    /* A backfill carries the reaction state of what it replays. A BROADCAST has
+     * no room for it, so without this every reaction disappeared the moment a
+     * client reloaded — permanently, since clients keep no local cache
+     * (ARCH-88). The aggregate's user_id must be the REQUESTING user whenever
+     * they are one of the reactors, because that is what marks the chip as
+     * theirs; for a reaction they did not make it is somebody else. */
+    {
+        oc_dbres *bf = backfill(w, alice, OC_DEFAULT_CHANNEL, 0);
+        CHECK(bf && bf->type == OC_RES_BACKFILL_OK);
+        int found_own = 0, found_other = 0;
+        for (size_t i = 0; i < bf->n_rreact; i++) {
+            if (bf->rreact[i].message_id != mid) continue;
+            if (strcmp(bf->rreact[i].emoji, ":+1:") == 0) {          /* alice's own */
+                found_own = 1;
+                CHECK(bf->rreact[i].count == 1);
+                CHECK(bf->rreact[i].user_id == alice);
+            } else if (strcmp(bf->rreact[i].emoji, ":tada:") == 0) {  /* carol's */
+                found_other = 1;
+                CHECK(bf->rreact[i].count == 1);
+                CHECK(bf->rreact[i].user_id == carol);
+            }
+        }
+        CHECK(found_own && found_other);
+        oc_dbres_free(bf);
+    }
+
     /* Deleting a message clears its reactions and blocks new ones (REQ-052). */
     r = do_delete(w, alice, OC_DEFAULT_CHANNEL, mid);
     CHECK(r && r->type == OC_RES_DELETE_OK);

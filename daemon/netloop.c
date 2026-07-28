@@ -2304,6 +2304,19 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
                 send_bytes(ep, conns, fd, g_enc, w.len);
             }
         }
+        /* Then the reaction state for those messages. A BROADCAST carries none,
+         * so without this every reaction vanished on reload. op=ADD with the
+         * aggregate count reconstructs the chip; user_id is the requester when
+         * they reacted, which is what marks the chip as theirs. */
+        for (size_t i = 0; i < r->n_rreact && conns[fd]; i++) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_reaction_updated ru = { r->rreact[i].message_id, r->rreact[i].channel_id,
+                                       r->rreact[i].user_id,
+                                       oc_slice_str(r->rreact[i].emoji ? r->rreact[i].emoji : ""),
+                                       OC_REACT_ADD, r->rreact[i].count };
+            oc_encode_reaction_updated(&w, OC_PROTOCOL_VERSION, &ru);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+        }
         if (!conns[fd]) return;
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_backfill_done done = { r->high_water, r->truncated };

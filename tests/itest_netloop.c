@@ -701,6 +701,10 @@ static void test_threads_vertical(int port, const uint8_t *pin) {
         else if (hdr.msg_type == OC_MSG_THREAD_META) {
             oc_thread_meta tm; CHECK(oc_decode_thread_meta(&p, &tm) == OC_OK);
             if (tm.message_id == mid) { saw_meta = 1; CHECK(tm.reply_count == 1); }
+        } else if (hdr.msg_type == OC_MSG_REACTION_UPDATED) {
+            /* A backfill also carries the reaction state of what it replays, so
+             * reactions survive a reload on a client that caches nothing. */
+            oc_reaction_updated ru; CHECK(oc_decode_reaction_updated(&p, &ru) == OC_OK);
         } else if (hdr.msg_type == OC_MSG_BACKFILL_DONE) break;
         else CHECK(0 /* unexpected frame during backfill */);
     }

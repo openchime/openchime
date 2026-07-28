@@ -216,6 +216,8 @@ void oc_dbres_free(oc_dbres *r) {
     free_attach_meta(r->attach, r->n_attach);
     for (size_t i = 0; i < r->n_replay; i++) { free(r->replay[i].body); free(r->replay[i].author_name); free_attach_meta(r->replay[i].attach, r->replay[i].n_attach); }
     free(r->replay);
+    for (size_t i = 0; i < r->n_rreact; i++) free(r->rreact[i].emoji);
+    free(r->rreact);
     free(r->ch_name);
     for (size_t i = 0; i < r->n_chlist; i++) free(r->chlist[i].name);
     free(r->chlist);
@@ -2244,6 +2246,44 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
     r->replay = arr;
     r->n_replay = n;
     r->truncated = (n >= OC_BACKFILL_MAX);   /* hit the per-response cap */
+
+    /* Reaction aggregates for what we just replayed. One statement per message
+     * rather than one big IN(...) because the id list is unbounded and building
+     * the SQL text for it would be the only place in this file that does. */
+    if (n > 0) {
+        size_t rcap = 16, rn = 0;
+        struct oc_replay_react *ra = malloc(rcap * sizeof *ra);
+        for (size_t i = 0; i < n && ra; i++) {
+            sqlite3_stmt *rst = NULL;
+            if (sqlite3_prepare_v2(db,
+                    "SELECT emoji, COUNT(*), "
+                    /* Prefer the requesting user's own id so the client can mark
+                     * the chip as theirs; MIN() just picks a stable stand-in. */
+                    "  COALESCE(MAX(CASE WHEN user_id=?2 THEN user_id END), MIN(user_id)) "
+                    "FROM reactions WHERE message_id=?1 GROUP BY emoji ORDER BY emoji;",
+                    -1, &rst, NULL) != SQLITE_OK) break;
+            sqlite3_bind_int64(rst, 1, (sqlite3_int64)arr[i].message_id);
+            sqlite3_bind_int64(rst, 2, (sqlite3_int64)j->user_id);
+            while (sqlite3_step(rst) == SQLITE_ROW) {
+                if (rn == rcap) {
+                    rcap *= 2;
+                    struct oc_replay_react *g = realloc(ra, rcap * sizeof *ra);
+                    if (!g) break;
+                    ra = g;
+                }
+                const char *em = (const char *)sqlite3_column_text(rst, 0);
+                ra[rn].message_id = arr[i].message_id;
+                ra[rn].channel_id = arr[i].channel_id;
+                ra[rn].count      = (uint64_t)sqlite3_column_int64(rst, 1);
+                ra[rn].user_id    = (uint64_t)sqlite3_column_int64(rst, 2);
+                ra[rn].emoji      = strdup(em ? em : "");
+                rn++;
+            }
+            sqlite3_finalize(rst);
+        }
+        r->rreact = ra;
+        r->n_rreact = rn;
+    }
     return r;
 }
 
