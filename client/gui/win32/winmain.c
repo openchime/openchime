@@ -69,6 +69,11 @@ enum { VIEW_HOME = 0, VIEW_DMS, VIEW_ACTIVITY, VIEW_FILES, VIEW_LATER,
 enum { NAV_SWITCHER = -2, NAV_NEW = -3, NAV_PROFILE = -4, NAV_MORE = -5 };
 #define BODY_DIP    15.0f     /* message + composer text size (shared, so they match) */
 
+/* Per-user avatar tints, shared by the transcript and the sidebar's DM rows so
+ * one person is the same colour everywhere. */
+static const uint32_t AVPAL[6] =
+    { 0x2563EB, 0x3BA55D, 0xD9A441, 0xB05CCB, 0xE0725A, 0x2FA5A5 };
+
 /* Common reactions offered by the message context menu. */
 static const char *REACT_EMO[6] = {
     "\xF0\x9F\x91\x8D", "\xE2\x9D\xA4\xEF\xB8\x8F", "\xF0\x9F\x98\x82",
@@ -401,6 +406,22 @@ static int to_w(const char *s, WCHAR *out, int cap) {
     return n > 0 ? n - 1 : 0;
 }
 
+/* Width of `s` in `fmt`, for placing something immediately after it. */
+static float text_width(const char *s, IDWriteTextFormat *fmt) {
+    WCHAR w[256];
+    int n = to_w(s, w, 256);
+    if (n <= 1 || !g_dwrite) return 0;
+    IDWriteTextLayout *tl = NULL;
+    if (FAILED(IDWriteFactory_CreateTextLayout(g_dwrite, w, (UINT32)(n - 1), fmt,
+                                               4000.0f, 100.0f, &tl)) || !tl)
+        return 0;
+    DWRITE_TEXT_METRICS tm;
+    float out = 0;
+    if (SUCCEEDED(IDWriteTextLayout_GetMetrics(tl, &tm))) out = tm.widthIncludingTrailingWhitespace;
+    IDWriteTextLayout_Release(tl);
+    return out;
+}
+
 static void draw_text(ID2D1RenderTarget *rt, const char *s, IDWriteTextFormat *fmt,
                       D2D1_RECT_F r, uint32_t rgb) {
     WCHAR w[1024];
@@ -585,7 +606,7 @@ static void select_channel(uint64_t cid) {
 /* A channel's display name into `out` ("# general" / "@ bob"). */
 static void channel_label(const oc_model *m, const oc_channel *c, char *out, size_t cap) {
     if (c->kind == OC_CHANNEL_KIND_DM) {
-        const char *pn = (c->peer_id == m->user_id) ? "you" : oc_model_user_name(m, c->peer_id);
+        const char *pn = oc_model_user_name(m, c->peer_id);
         snprintf(out, cap, "@ %s", (pn && pn[0]) ? pn : "dm");
     } else {
         snprintf(out, cap, "%s %s", c->is_public ? "#" : "\xF0\x9F\x94\x92", /* # or lock */
@@ -889,14 +910,37 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
             int selected = (r->channel_id == g_sel);
             int unread = r->unread > 0;
             if (selected) fill_round(rt, rf(sx0, ry + 2, sx1, ry + ROW_H - 2), 6.0f, OC_COL_SELECT);
-            /* # public, lock private, @ DM — Slack's marks. */
-            const char *mark = r->section == OC_SB_DMS ? "@"
-                             : r->is_private ? "\xF0\x9F\x94\x92" : "#";
-            draw_text(rt, mark, g_ui, rf(sx0 + 12, ry, sx0 + 34, ry + ROW_H),
-                      selected ? OC_COL_TEXT : OC_COL_FAINT);
+            if (r->section == OC_SB_DMS) {
+                /* A person gets an avatar and a presence dot, not an "@" glyph —
+                 * the marker in Slack's DM list is the human, not the sigil. */
+                D2D1_RECT_F av = rf(sx0 + 12, ry + (ROW_H - 18) / 2, sx0 + 30, ry + (ROW_H + 18) / 2);
+                uint32_t tint = AVPAL[r->peer_id % (sizeof AVPAL / sizeof AVPAL[0])];
+                fill_round(rt, av, 5.0f, tint);
+                char ini[2] = { (char)(r->label[0] >= 'a' && r->label[0] <= 'z'
+                                       ? r->label[0] - 32 : r->label[0]), 0 };
+                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+                draw_text(rt, ini, g_small, av, 0xFFFFFF);
+                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+                uint8_t pr = oc_model_presence_of(m, r->peer_id);
+                uint32_t dot = pr == OC_PRESENCE_ONLINE ? OC_COL_ONLINE
+                             : pr == OC_PRESENCE_AWAY   ? OC_COL_AWAY : OC_COL_FAINT;
+                D2D1_ELLIPSE pe = { { av.right - 1, av.bottom - 1 }, 3.5f, 3.5f };
+                ID2D1RenderTarget_FillEllipse(rt, &pe, paint_with(dot));
+            } else {
+                const char *mark = r->is_private ? "\xF0\x9F\x94\x92" : "#";
+                draw_text(rt, mark, g_ui, rf(sx0 + 12, ry, sx0 + 34, ry + ROW_H),
+                          selected ? OC_COL_TEXT : OC_COL_FAINT);
+            }
             uint32_t fg = (selected || unread) ? OC_COL_TEXT : OC_COL_MUTED;
             draw_text(rt, r->label, unread ? g_ui_b : g_ui,
                       rf(sx0 + 34, ry, sx1 - 44, ry + ROW_H), fg);
+            if (r->is_self) {
+                /* "you" sits right after the name, dimmed — so the self-DM is
+                 * still addressed by account name (Slack's treatment). */
+                float w = text_width(r->label, unread ? g_ui_b : g_ui);
+                draw_text(rt, "you", g_small,
+                          rf(sx0 + 34 + w + 14, ry, sx1 - 44, ry + ROW_H), OC_COL_FAINT);
+            }
             if (unread) {
                 char badge[16]; snprintf(badge, sizeof badge, "%d", r->unread);
                 D2D1_RECT_F br = rf(sx1 - 40, ry + 6, sx1 - 10, ry + ROW_H - 6);
@@ -999,8 +1043,6 @@ static float msg_height(const oc_msg *msg, float content_w, int grouped,
 static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg *msg,
                          IDWriteTextLayout *body, float x0, float y, float content_w,
                          int grouped) {
-    static const uint32_t AVPAL[6] =
-        { 0x2563EB, 0x3BA55D, 0xD9A441, 0xB05CCB, 0xE0725A, 0x2FA5A5 };
     float ax = x0, tx = x0 + AVA + 12;
 
     if (!grouped) {
@@ -1564,21 +1606,17 @@ static void draw_toasts(ID2D1RenderTarget *rt, float W, float H) {
     for (int i = g_n_toast - 1; i >= 0; i--) {
         D2D1_RECT_F r = rf(W - TOAST_W - 20, y - TOAST_H, W - 20, y);
         g_toast_box[i] = r;
-        /* A shadow lifts it off the transcript, which is otherwise the same tone. */
-        fill_round(rt, rf(r.left + 2, r.top + 3, r.right + 2, r.bottom + 3), 10.0f, OC_COL_RAIL);
-        fill_round(rt, r, 10.0f, OC_COL_INPUT);
-        stroke_round(rt, r, 10.0f, g_toast[i].danger ? OC_COL_DANGER : OC_COL_BORDER, 1.0f);
-        /* Square off the LEFT edge so the accent reads as a flush status stripe
-         * rather than a rounded pill floating inside the card: patch over the two
-         * rounded left corners, restore the border along that patch, then run the
-         * stripe the full height of the edge. The right corners stay rounded. */
-        uint32_t accent = g_toast[i].danger ? OC_COL_DANGER : OC_COL_ACCENT;
-        float rad = 10.0f, bar = 4.0f;
-        fill(rt, rf(r.left, r.top, r.left + rad, r.bottom), OC_COL_INPUT);
-        uint32_t edge = g_toast[i].danger ? OC_COL_DANGER : OC_COL_BORDER;
-        fill(rt, rf(r.left, r.top, r.left + rad, r.top + 1), edge);
-        fill(rt, rf(r.left, r.bottom - 1, r.left + rad, r.bottom), edge);
-        fill(rt, rf(r.left, r.top, r.left + bar, r.bottom), accent);
+        /* Squared on every corner — a toast is a rectangle, not a pill — with a
+         * full-height accent stripe flush to the left edge. */
+        uint32_t accent = g_toast[i].danger ? OC_COL_DANGER : OC_COL_NOTICE;
+        uint32_t edge   = g_toast[i].danger ? OC_COL_DANGER : OC_COL_BORDER;
+        float bar = 4.0f;
+        fill(rt, rf(r.left + 2, r.top + 3, r.right + 2, r.bottom + 3), OC_COL_RAIL);  /* shadow */
+        fill(rt, r, OC_COL_INPUT);
+        fill(rt, rf(r.left, r.top, r.right, r.top + 1), edge);            /* border */
+        fill(rt, rf(r.left, r.bottom - 1, r.right, r.bottom), edge);
+        fill(rt, rf(r.right - 1, r.top, r.right, r.bottom), edge);
+        fill(rt, rf(r.left, r.top, r.left + bar, r.bottom), accent);      /* stripe */
         draw_text(rt, g_toast[i].text, g_small,
                   rf(r.left + 14, r.top + 6, r.right - 12, r.bottom - 6), OC_COL_TEXT);
         y -= TOAST_H + TOAST_GAP;

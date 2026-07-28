@@ -771,42 +771,73 @@ static const tk_pal_item g_launcher_items[] = {
     { "Session", "Log out",             NULL, NULL, ACT_LOGOUT },
 };
 
-/* ---- sidebar grouping (public / DM / private, each collapsible) ------------ */
-enum { SBG_PUBLIC = 0, SBG_DM = 1, SBG_PRIVATE = 2, SBG_N = 3 };
-static const char *SBG_LABEL[SBG_N] = { "Public", "Direct messages", "Private" };
-static uint8_t g_grp_collapsed[SBG_N];   /* per-group fold state, persists across frames */
-static int g_sb_hdr = -1;                /* if >=0, a group header is the selection (else a channel) */
+/* ---- sidebar (shared with the GUI via the core) ----------------------------
+ * Grouping, filtering, sorting and collapse come from oc_model_sidebar so this
+ * frontend and the Win32 one cannot disagree about what belongs where (ARCH-74).
+ * Two sections, matching Slack and the GUI: Channels (public and private, the
+ * private ones marked) then Direct messages. */
+#define SBG_N OC_SB_SECTIONS
+static const char *SBG_LABEL[SBG_N] = { "Channels", "Direct messages" };
+static oc_sidebar_opts g_sb;             /* per-section sort/filter/collapse */
+static int g_sb_hdr = -1;                /* if >=0, a section header is the selection */
+static int g_sb_loaded;                  /* synced prefs folded in once */
+#define SB_SETTING_KEY "sidebar"
 
-static int chan_group(const oc_channel *c) {
-    if (c->kind == OC_CHANNEL_KIND_DM) return SBG_DM;
-    return c->is_public ? SBG_PUBLIC : SBG_PRIVATE;
+/* Sidebar prefs ride the daemon's per-(user, client_type) settings bucket, the
+ * same mechanism the GUI uses — separate buckets by design, so a terminal and a
+ * window can keep different sidebar shapes (CLIENT.md §3). */
+static void sidebar_opts_save(oc_client *cl) {
+    if (!cl) return;
+    char enc[64];
+    oc_sidebar_opts_encode(&g_sb, enc, sizeof enc);
+    oc_client_set_setting(cl, SB_SETTING_KEY, enc);
+}
+static void sidebar_opts_load(const oc_model *m) {
+    const char *v = m ? oc_model_setting(m, SB_SETTING_KEY) : NULL;
+    if (v && v[0]) oc_sidebar_opts_parse(&g_sb, v);
 }
 
-/* One visible sidebar row: a group header, or a channel (idx into m->channels). */
+static int chan_group(const oc_channel *c) {
+    return c->kind == OC_CHANNEL_KIND_DM ? OC_SB_DMS : OC_SB_CHANNELS;
+}
+
+/* One visible sidebar row: a section header, or a channel (idx into m->channels). */
 typedef struct { uint8_t header; uint8_t group; size_t idx; } sb_row;
 
-/* Build the ordered visible rows: for each non-empty group in fixed order, a
- * header, then (unless the group is collapsed) its channels in model order. */
+/* Ask the core for the ordered rows, then map each back to its model index so
+ * the rest of this file keeps working in terms of `idx`. */
 static int sidebar_build(const oc_model *m, sb_row *out, int cap) {
-    int n = 0;
-    for (int g = 0; g < SBG_N; g++) {
-        int has = 0;
-        for (size_t i = 0; i < m->n_channels; i++)
-            if (chan_group(&m->channels[i]) == g) { has = 1; break; }
-        if (!has) continue;
-        if (n < cap) out[n++] = (sb_row){ 1, (uint8_t)g, 0 };
-        if (g_grp_collapsed[g]) continue;
-        for (size_t i = 0; i < m->n_channels && n < cap; i++)
-            if (chan_group(&m->channels[i]) == g) out[n++] = (sb_row){ 0, (uint8_t)g, i };
+    oc_sidebar_row core[256];
+    size_t n = oc_model_sidebar(m, &g_sb, core, 256);
+    int k = 0;
+    for (size_t i = 0; i < n && k < cap; i++) {
+        if (core[i].is_header) {
+            out[k++] = (sb_row){ 1, core[i].section, 0 };
+            continue;
+        }
+        for (size_t j = 0; j < m->n_channels; j++)
+            if (m->channels[j].channel_id == core[i].channel_id) {
+                out[k++] = (sb_row){ 0, core[i].section, j };
+                break;
+            }
     }
-    return n;
+    return k;
 }
 
 /* Marker + name for a channel row, e.g. "# general", "@alice", "\U0001F512 secret". */
 static void sidebar_label(const oc_model *m, const oc_channel *c, char *buf, size_t cap) {
     if (c->kind == OC_CHANNEL_KIND_DM) {
-        const char *pn = (c->peer_id == m->user_id) ? "you" : oc_model_user_name(m, c->peer_id);
-        snprintf(buf, cap, "@%s", pn[0] ? pn : "dm");
+        const char *pn = oc_model_user_name(m, c->peer_id);
+        /* The self-DM keeps the account name and gains a dim "you" tag, as the
+         * GUI does — never "you" in place of the name. */
+        /* A presence glyph, not an "@": the marker for a person is the person's
+         * state, matching the GUI's avatar + presence dot. */
+        uint8_t pr = oc_model_presence_of(m, c->peer_id);
+        const char *dot = pr == OC_PRESENCE_ONLINE ? "\xe2\x97\x8f"       /* ● */
+                        : pr == OC_PRESENCE_AWAY   ? "\xe2\x97\x91"       /* ◑ */
+                                                   : "\xe2\x97\x8b";      /* ○ */
+        if (c->peer_id == m->user_id && pn[0]) snprintf(buf, cap, "%s %s  you", dot, pn);
+        else snprintf(buf, cap, "%s %s", dot, pn[0] ? pn : "dm");
     } else if (c->is_public) {
         snprintf(buf, cap, "# %s", c->name ? c->name : "…");
     } else {
@@ -889,8 +920,16 @@ static void render(oc_client *cl, size_t focus, const char *composer,
                 int gu = 0;
                 for (size_t i = 0; i < m->n_channels; i++)
                     if (chan_group(&m->channels[i]) == rows[r].group) gu += m->channels[i].unread;
-                const char *tri = g_grp_collapsed[rows[r].group] ? "\xe2\x96\xb8" : "\xe2\x96\xbe"; /* ▸ / ▾ */
-                if (gu) snprintf(label, sizeof label, "%s %s (%d)", tri, SBG_LABEL[rows[r].group], gu);
+                const char *tri = g_sb.collapsed[rows[r].group] ? "\xe2\x96\xb8" : "\xe2\x96\xbe"; /* ▸ / ▾ */
+                static const char *SORTC[3] = { "az", "recent", "unread" };
+                static const char *FILTC[3] = { "", " \xc2\xb7 unread", " \xc2\xb7 active" };
+                int gsel = (g_sb_hdr == rows[r].group);
+                /* The header shows its sort/filter only while selected, so the
+                 * modes are discoverable without cluttering every frame. */
+                if (gsel)
+                    snprintf(label, sizeof label, "%s %s  [%s%s]", tri, SBG_LABEL[rows[r].group],
+                             SORTC[g_sb.sort[rows[r].group]], FILTC[g_sb.filter[rows[r].group]]);
+                else if (gu) snprintf(label, sizeof label, "%s %s (%d)", tri, SBG_LABEL[rows[r].group], gu);
                 else    snprintf(label, sizeof label, "%s %s", tri, SBG_LABEL[rows[r].group]);
                 uintattr_t hfg = sel ? (th->sel_fg | TB_BOLD) : (th->accent | TB_BOLD);
                 tk_text(1, iy, ch_w - 1, label, hfg, bg);
@@ -915,7 +954,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     else if (m->weblist_open)    snprintf(mt, sizeof mt, "webhooks");
     else if (m->thread_open)     snprintf(mt, sizeof mt, "thread · #%s", fc && fc->name ? fc->name : "…");
     else if (fc && fc->kind == OC_CHANNEL_KIND_DM) {
-        const char *pn = (fc->peer_id == m->user_id) ? "you" : oc_model_user_name(m, fc->peer_id);
+        const char *pn = oc_model_user_name(m, fc->peer_id);
         snprintf(mt, sizeof mt, "@%s", pn[0] ? pn : "dm");
     } else if (fc && !fc->is_public)
         snprintf(mt, sizeof mt, "\xf0\x9f\x94\x92 %s", fc->name ? fc->name : "…");  /* 🔒 private */
@@ -1034,6 +1073,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
     };
     static const tk_binding KB_CHANNELS[] = {
         { TB_KEY_ARROW_DOWN, 0, "↑↓", "select", 1 }, { TB_KEY_ENTER, 0, "Enter", "open", 1 },
+        { 0, 's', "s", "sort", 1 }, { 0, 'f', "f", "filter", 1 },
         { 0, 'n', "n", "new", 1 }, { TB_KEY_TAB, 0, "Tab", "panel", 1 },
         { TB_KEY_ESC, 0, "Esc", "composer", 1 },
     };
@@ -1621,6 +1661,7 @@ int main(int argc, char **argv) {
     /* Prefer the OS keyring for the session token; NULL (headless / no keyring)
      * falls back to the SQLite store. Owned here, freed after the client stops. */
     oc_secret *secret = oc_secret_open_os("openchime");
+    oc_sidebar_opts_defaults(&g_sb);
     g_store_path = store_path;    /* the switcher reads the book from here */
     g_secret = secret;
 
@@ -1753,6 +1794,13 @@ int main(int argc, char **argv) {
         cl = g_ws[g_active].cl;
 
         const oc_model *m = oc_client_model(cl);
+        /* Fold the active workspace's synced sidebar prefs in once they land, so
+         * collapse/sort/filter survive a restart without the client storing
+         * anything locally (ARCH-88). */
+        if (!g_sb_loaded && oc_model_setting(m, SB_SETTING_KEY)) {
+            sidebar_opts_load(m);
+            g_sb_loaded = 1;
+        }
         if (focus >= m->n_channels) focus = m->n_channels ? m->n_channels - 1 : 0;
         /* Layer the active workspace's synced settings over the file defaults,
          * re-arming mouse input if that pref flipped. */
@@ -1824,7 +1872,8 @@ int main(int argc, char **argv) {
                     int nrows = sidebar_build(mm, rows, 256);
                     if (prow < nrows) {
                         if (rows[prow].header) {   /* click a header → fold/unfold */
-                            g_grp_collapsed[rows[prow].group] = !g_grp_collapsed[rows[prow].group];
+                            g_sb.collapsed[rows[prow].group] = !g_sb.collapsed[rows[prow].group];
+                            sidebar_opts_save(cl);
                             g_sb_hdr = rows[prow].group;
                         } else { g_sb_hdr = -1; focus = rows[prow].idx; panel = 0; }
                     }
@@ -2128,15 +2177,28 @@ int main(int argc, char **argv) {
                 else if (ev.key == TB_KEY_ARROW_LEFT) {                      /* collapse / go to header */
                     int g = g_sb_hdr >= 0 ? g_sb_hdr
                           : (focus < mm->n_channels ? chan_group(&mm->channels[focus]) : -1);
-                    if (g >= 0) { g_grp_collapsed[g] = 1; g_sb_hdr = g; }
+                    if (g >= 0) { g_sb.collapsed[g] = 1; g_sb_hdr = g; sidebar_opts_save(cl); }
                 }
                 else if (ev.key == TB_KEY_ARROW_RIGHT) {                     /* expand a folded group */
-                    if (g_sb_hdr >= 0 && g_grp_collapsed[g_sb_hdr]) g_grp_collapsed[g_sb_hdr] = 0;
+                    if (g_sb_hdr >= 0 && g_sb.collapsed[g_sb_hdr]) { g_sb.collapsed[g_sb_hdr] = 0; sidebar_opts_save(cl); }
+                }
+                else if (ev.ch == 's' || ev.ch == 'f') {
+                    /* Sort / filter the section under the cursor — the TUI's
+                     * equivalent of the GUI's per-section kebab menu. Cycles, so
+                     * one key covers all three modes without a submenu. */
+                    int g = g_sb_hdr >= 0 ? g_sb_hdr
+                          : (focus < mm->n_channels ? chan_group(&mm->channels[focus]) : -1);
+                    if (g >= 0) {
+                        if (ev.ch == 's') g_sb.sort[g]   = (uint8_t)((g_sb.sort[g] + 1) % 3);
+                        else              g_sb.filter[g] = (uint8_t)((g_sb.filter[g] + 1) % 3);
+                        sidebar_opts_save(cl);
+                    }
                 }
                 else if (ev.ch == 'n') { prompt_kind = PROMPT_NEWCHAN; prompt_title = "New channel"; tk_input_init(&prompt_input, 0, "name"); }
                 else if (ev.key == TB_KEY_ENTER) {
                     if (g_sb_hdr >= 0) {                                      /* toggle the group's fold */
-                        g_grp_collapsed[g_sb_hdr] = !g_grp_collapsed[g_sb_hdr];
+                        g_sb.collapsed[g_sb_hdr] = !g_sb.collapsed[g_sb_hdr];
+                        sidebar_opts_save(cl);
                     } else if (focus < mm->n_channels) {                     /* channel action menu */
                         menu_build_channel(mm->channels[focus].joined);
                         act_cid = mm->channels[focus].channel_id; act_uid = 0; act_mid = 0; act_title = "Channel";

@@ -774,7 +774,10 @@ void oc_sidebar_opts_parse(oc_sidebar_opts *o, const char *s) {
  * unnamed channels, showed no DMs at all. */
 static void sb_label(const oc_model *m, const oc_channel *c, char *out, size_t cap) {
     if (c->kind == OC_CHANNEL_KIND_DM) {
-        const char *pn = (c->peer_id == m->user_id) ? "you" : oc_model_user_name(m, c->peer_id);
+        /* Always the account name, never "you": a self-DM's peer_id IS the user's
+         * own id, so the ordinary lookup already yields the right name and the
+         * special case only served to hide it. */
+        const char *pn = oc_model_user_name(m, c->peer_id);
         snprintf(out, cap, "%s", (pn && pn[0]) ? pn : "direct message");
     } else {
         snprintf(out, cap, "%s", (c->name && c->name[0]) ? c->name : "channel");
@@ -843,6 +846,11 @@ size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
             tmp[tn].row.channel_id = c->channel_id;
             snprintf(tmp[tn].row.label, sizeof tmp[tn].row.label, "%s", label);
             tmp[tn].row.is_private = (uint8_t)(!is_dm && !c->is_public);
+            /* Slack renders the self-DM as "Danny Heskett  you" — the account
+             * name, with a dimmed tag after it. The core flags it; each frontend
+             * draws the tag in its own dim style. */
+            tmp[tn].row.is_self    = (uint8_t)(is_dm && c->peer_id == m->user_id);
+            tmp[tn].row.peer_id    = is_dm ? c->peer_id : 0;
             tmp[tn].row.joined     = c->joined;
             tmp[tn].row.unread     = c->unread;
             tn++;

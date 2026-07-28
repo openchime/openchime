@@ -33,6 +33,10 @@
 
 /* Semantic. */
 #define OC_COL_DANGER      0xE05252
+/* Toast accent — deliberately NOT OC_COL_ACCENT: the blue is the "primary /
+ * selected" colour everywhere else, so a transient notice wearing it reads as a
+ * control rather than a message. Teal is distinct at a glance on this navy. */
+#define OC_COL_NOTICE      0x14B8A6
 #define OC_COL_ONLINE      0x3BA55D
 #define OC_COL_AWAY        0xD9A441
 

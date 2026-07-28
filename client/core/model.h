@@ -217,6 +217,9 @@ typedef struct {
     uint64_t channel_id;     /* 0 on a header */
     char     label[96];      /* rendered: "general", or a DM peer's name */
     uint8_t  is_private;     /* draw a lock */
+    uint8_t  is_self;        /* the self-DM: render the name, then a dimmed "you" */
+    uint64_t peer_id;        /* DM only: lets a frontend draw an avatar + presence
+                              * instead of a bare "@" marker, as Slack does */
     uint8_t  joined;
     int      unread;
     int      section_total;  /* header rows: how many children (before collapse) */
