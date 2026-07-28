@@ -424,6 +424,14 @@ static D2D1_RECT_F g_pal_panel, g_pal_box;
 static struct { D2D1_RECT_F r; int cmd; uint64_t cid; } g_pal_rows[12];
 static int   g_n_pal_rows;
 
+/* Workspaces manager. The switcher is for going somewhere; this is for managing
+ * what is on the device — including the only way to REMOVE a workspace, which
+ * REQ-012 requires and the GUI had no surface for at all (the TUI had one). */
+static int g_wsmgr_open;
+static struct { D2D1_RECT_F r; int row, act; } g_wsmgr_hits[48];
+static int g_n_wsmgr_hits;
+enum { WSM_GO = 0, WSM_SIGNOUT, WSM_FORGET };
+
 /* Notification-prefs review (WIN-12) + the shortcut sheet (WIN-25). */
 static int g_notify_open, g_keys_open;
 static struct { D2D1_RECT_F r; uint64_t cid; uint8_t level; } g_notify_hits[128];
@@ -491,7 +499,31 @@ static int   g_menu_headerblock;             /* draw the workspace header on top
 static struct { float top, bot; int cmd; } g_mirows[28];
 static int   g_n_mirows;
 /* Workspace switcher list (built from the store book at open time). */
-static struct { char ws[256], label[80]; int current; } g_sw[16];
+enum { WS_MAX = 8 };
+typedef struct {
+    oc_client *client;
+    char     ws[256];
+    char     cred[320];
+    char     host[256];
+    int      port;
+    /* Per-workspace view state, swapped with the active globals. */
+    uint64_t sel;
+    float    scroll;
+    int      post_auth;
+    uint64_t backfilled[64];
+    int      n_backfilled;
+} oc_ws_slot;
+static oc_ws_slot g_wss[WS_MAX];
+static int g_n_wss, g_ws_active = -1;
+static int ws_find(const char *ws);   /* fwd */
+static int g_logging_out;            /* a LOGOUT is in flight */
+static int g_forget_after_logout;    /* remove the entry once that sign-out lands */
+static void switch_workspace(HWND hwnd, const char *ws, const char *cred);   /* fwd */
+static void signin_begin_known(HWND hwnd, const char *ws, const char *user); /* fwd */
+static void sw_book_load(void);      /* fwd */
+static void ws_forget(const char *ws);   /* fwd */
+
+static struct { char ws[256], label[80], user[80]; int current; } g_sw[16];
 static int   g_n_sw;
 
 static D2D1_RECT_F g_attach_btn;        /* composer attach (+) hit-box */
@@ -516,10 +548,20 @@ static uint64_t g_edit_msg;             /* non-zero => composer is editing this 
 #define SI_W        380.0f        /* card width */
 #define SI_TIMEOUT  20000         /* ms before we stop waiting for auth */
 static int   g_si_step = 1;       /* 1 = workspace, 2 = credentials */
+/* Render the card over the live shell rather than instead of it — true whenever
+ * signing in while another workspace is still connected. */
+static int   g_si_overlay;
+/* The client being signed in, kept SEPARATE from the active one. Signing in to
+ * an additional workspace must not disturb the one you are already in: it stays
+ * connected and on screen behind the card for the whole attempt, and is only
+ * parked once the new workspace actually authenticates. On failure or cancel
+ * nothing about it has changed. */
+static oc_client *g_si_client;
 /* An invite token entered on step 2 (WIN-32). Non-empty turns the next attempt
  * into a redeem: the account is created and signed in together. */
 static char  g_si_invite[128];
 static D2D1_RECT_F g_si_invite_link;
+static D2D1_RECT_F g_si_cancel;      /* overlay sign-in: back to the live workspace */
 static char  g_si_ws[256];        /* the workspace string as typed */
 static char  g_si_host[256];      /* resolved host (step 1 output) */
 static int   g_si_port;
@@ -539,6 +581,7 @@ static HWND  g_si_e_ws, g_si_e_user, g_si_e_pass;   /* native EDIT children */
 static D2D1_RECT_F g_si_btn, g_si_remember_box, g_si_back;   /* hit-boxes */
 /* Defined with the rest of the flow, below the core wiring they depend on. */
 static void signin_submit(HWND hwnd);
+static void signin_cancel(HWND hwnd);
 static void signin_back(HWND hwnd);
 static void signin_set_advanced(HWND hwnd, int on);
 static void signin_begin(HWND hwnd, const char *ws, const char *user);
@@ -937,6 +980,7 @@ static void close_overlays(void) {
     g_profile_uid = 0;
     g_notify_open = 0;
     g_keys_open = 0;
+    g_wsmgr_open = 0;
     if (!mm) return;
     if (mm->thread_open)    oc_client_close_thread(g_client);
     if (mm->search_open)    oc_client_close_search(g_client);
@@ -947,7 +991,7 @@ static void close_overlays(void) {
 }
 
 static int any_overlay(const oc_model *m) {
-    return g_prefs_open || g_profile_uid || g_notify_open || g_keys_open ||
+    return g_prefs_open || g_profile_uid || g_notify_open || g_keys_open || g_wsmgr_open ||
            (m && (m->thread_open || m->search_open || m->reactlist_open ||
                   m->weblist_open || m->storage_open || m->audit_open));
 }
@@ -2417,6 +2461,60 @@ static void draw_profile(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
     }
 }
 
+static void sw_book_load(void);       /* fwd */
+
+static void draw_wsmgr(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
+    D2D1_RECT_F body = overlay_header(rt, reg, "Workspaces");
+    g_n_wsmgr_hits = 0;
+    draw_text(rt, "Sign out keeps a workspace here; Remove deletes it from this device.",
+              g_small, rf(body.left + 24, body.top + 6, body.right - 24, body.top + 26), OC_COL_FAINT);
+    float y = body.top + 34, rowh = 54;
+
+    for (int i = 0; i < g_n_sw; i++) {
+        int slot = ws_find(g_sw[i].ws);
+        int live = (slot >= 0 && g_wss[slot].client);
+        draw_text(rt, g_sw[i].label, g_ui_b, rf(body.left + 24, y, body.left + 300, y + 22), OC_COL_TEXT);
+        /* State on the sub-line rather than its own column: as a column it
+         * collided with the buttons whenever the pane was narrow. */
+        const char *state = g_sw[i].current ? "current" : live ? "connected" : "signed out";
+        uint32_t sc = g_sw[i].current ? OC_COL_ACCENT : live ? OC_COL_ONLINE : OC_COL_FAINT;
+        draw_text(rt, state, g_small, rf(body.left + 24 + text_width(g_sw[i].label, g_ui_b) + 12,
+                                         y, body.left + 340, y + 22), sc);
+        char sub[320];
+        snprintf(sub, sizeof sub, "%s%s%s", g_sw[i].ws,
+                 g_sw[i].user[0] ? "  \u00b7  " : "", g_sw[i].user);
+        draw_text(rt, sub, g_small, rf(body.left + 24, y + 20, body.left + 340, y + 40), OC_COL_FAINT);
+
+        /* Buttons right-aligned, built right-to-left so widths can vary. */
+        float bx = body.right - 24;
+        struct { const char *lbl; int act; uint32_t col; } B[2];
+        int nb = 0;
+        B[nb].lbl = "Remove"; B[nb].act = WSM_FORGET; B[nb].col = OC_COL_DANGER; nb++;
+        if (live && !g_sw[i].current) { B[nb].lbl = "Switch to"; B[nb].act = WSM_GO; B[nb].col = OC_COL_MUTED; nb++; }
+        else if (live)                { B[nb].lbl = "Sign out";  B[nb].act = WSM_SIGNOUT; B[nb].col = OC_COL_MUTED; nb++; }
+        else                          { B[nb].lbl = "Sign in";   B[nb].act = WSM_GO; B[nb].col = OC_COL_MUTED; nb++; }
+        for (int k = 0; k < nb; k++) {
+            float bw = text_width(B[k].lbl, g_small) + 24;
+            D2D1_RECT_F b = rf(bx - bw, y + 8, bx, y + 34);
+            fill_round(rt, b, 6.0f, OC_COL_INPUT);
+            stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
+            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+            draw_text(rt, B[k].lbl, g_small, b, B[k].col);
+            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+            if (g_n_wsmgr_hits < 48) {
+                g_wsmgr_hits[g_n_wsmgr_hits].r = b;
+                g_wsmgr_hits[g_n_wsmgr_hits].row = i;
+                g_wsmgr_hits[g_n_wsmgr_hits].act = B[k].act;
+                g_n_wsmgr_hits++;
+            }
+            bx = b.left - 8;
+        }
+        fill(rt, rf(body.left + 24, y + rowh - 1, body.right - 24, y + rowh), OC_COL_BORDER);
+        y += rowh;
+    }
+    if (g_n_sw == 0) overlay_empty(rt, body, "No workspaces remembered on this device.");
+}
+
 static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
     if (!m->authed) {
         /* The reason lives in the banner above (draw_banner) — repeating it here
@@ -2428,6 +2526,7 @@ static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
     }
     if (g_prefs_open)      { draw_prefs(rt, reg);        return; }
     if (g_profile_uid)     { draw_profile(rt, m, reg);   return; }
+    if (g_wsmgr_open)      { draw_wsmgr(rt, reg);        return; }
     if (g_notify_open)     { draw_notify_prefs(rt, m, reg); return; }
     if (g_keys_open)       { draw_keys(rt, reg);         return; }
     if (m->thread_open)    { draw_thread(rt, m, reg);    return; }
@@ -2777,7 +2876,8 @@ static si_geom si_layout(float W, float H) {
                  + (g_si_step == 1 ? 26.0f : 0.0f)   /* advanced-options link */
                  + (g_si_step == 2 ? 30.0f : 0.0f)   /* remember-me row */
                  + 40.0f + 24.0f                      /* button + bottom pad */
-                 + (g_si_step == 2 ? 26.0f + 22.0f : 0.0f);   /* back + signup links */
+                 + (g_si_step == 2 ? 26.0f + 22.0f : 0.0f)   /* back + signup links */
+                 + (g_si_overlay ? 24.0f : 0.0f);            /* cancel row */
     g.h  = head + body;
     g.y0 = (H - g.h) / 2; if (g.y0 < 24) g.y0 = 24;
     g.fields_y = g.y0 + head;
@@ -2903,6 +3003,18 @@ static void draw_signin(ID2D1RenderTarget *rt, float W, float H) {
     } else {
         g_si_back = rf(0, 0, 0, 0);
         g_si_invite_link = rf(0, 0, 0, 0);
+    }
+
+    /* A way out, when there is somewhere to go back to. Esc does it too, but a
+     * modal card with no visible exit is a trap. Inside the card: below it the
+     * text landed on whatever the transcript happened to be showing. */
+    if (g_si_overlay) {
+        g_si_cancel = rf(fx, card.bottom - 28, fx + fw, card.bottom - 6);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Cancel  (Esc)", g_small, g_si_cancel, OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    } else {
+        g_si_cancel = rf(0, 0, 0, 0);
     }
 }
 
@@ -3105,8 +3217,21 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
 
 /* Draw the whole UI into `rt` (window RT for painting, or a DC RT for test
  * shots). Caller wraps this in BeginDraw/EndDraw; brushes must belong to `rt`. */
-/* Views that show the channel sidebar + transcript + composer. */
+/* Views that show the channel sidebar + transcript + composer.
+ *
+ * Deliberately FALSE during sign-in even when the shell is drawn behind the
+ * card (g_si_overlay): this gates the native children — composer, find box —
+ * and a native child composites above Direct2D, so leaving them shown would
+ * punch them straight through the sign-in card. `shell_visible` is the drawing
+ * question; this is the input/child-window question. */
 static int view_has_sidebar(void) { return g_view == VIEW_HOME || g_view == VIEW_DMS; }
+
+/* Whether to PAINT the shell chrome. During sign-in that is true only when a
+ * workspace is still live behind the card. */
+static int shell_visible(void) {
+    if (g_view == VIEW_SIGNIN) return g_si_overlay && g_client != NULL;
+    return g_view == VIEW_HOME || g_view == VIEW_DMS;
+}
 
 /* A full-pane placeholder for views whose backing feature isn't built yet. */
 static void draw_stub_view(ID2D1RenderTarget *rt, D2D1_RECT_F reg,
@@ -3132,14 +3257,16 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
     ID2D1RenderTarget_SetTextAntialiasMode(rt, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     D2D1_COLOR_F base = col(OC_COL_BASE);
     ID2D1RenderTarget_Clear(rt, &base);
-    /* Sign-in owns the whole window: no rail, no sidebar, no composer, and it
-     * runs with no client at all (m == NULL) until an attempt is in flight. */
-    if (g_view == VIEW_SIGNIN) { draw_signin(rt, W, H); return; }
+    /* Sign-in owns the whole window only when there is nothing behind it. With a
+     * workspace still connected the shell stays on screen, dimmed, so adding or
+     * re-entering a workspace never blanks an app you are already using. */
+    int si_over = (g_view == VIEW_SIGNIN) && shell_visible();
+    if (g_view == VIEW_SIGNIN && !si_over) { draw_signin(rt, W, H); return; }
     if (!m) return;
     ensure_selection(m);
     draw_rail(rt, m, H);
 
-    if (view_has_sidebar()) {
+    if (shell_visible()) {
         float main_x = RAIL_W + SIDEBAR_W;
         float members = (g_show_members && m->authed) ? MEMBERS_W : 0;
         float main_r = W - members, main_w = main_r - main_x;
@@ -3170,6 +3297,11 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
     draw_more_flyout(rt);   /* floats over the pane when open */
     draw_palette(rt, m, W, H);   /* the palette dims and covers the app */
     draw_menu(rt);          /* dropdown menus float on top of everything */
+    if (si_over) {          /* the sign-in card, over a dimmed live shell */
+        D2D1_RECT_F all = rf(0, 0, W, H);
+        ID2D1RenderTarget_FillRectangle(rt, &all, paint_alpha(0x000000, 0.55f));
+        draw_signin(rt, W, H);
+    }
     draw_toasts(rt, W, H);  /* …and failure notices float above even those */
 }
 
@@ -3634,6 +3766,10 @@ static LRESULT CALLBACK si_edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         if (msg == WM_KEYDOWN) signin_submit(GetParent(hwnd));
         return 0;
     }
+    if ((msg == WM_KEYDOWN || msg == WM_CHAR) && wp == VK_ESCAPE) {
+        if (msg == WM_KEYDOWN) signin_cancel(GetParent(hwnd));
+        return 0;
+    }
     return CallWindowProcW(g_si_oldproc, hwnd, msg, wp, lp);
 }
 
@@ -3919,6 +4055,63 @@ static int on_click(HWND hwnd, int x, int y) {
         oc_client_open_dm(g_client, uid);
         return 1;
     }
+    if (g_wsmgr_open) {
+        for (int i = 0; i < g_n_wsmgr_hits; i++) {
+            if (!in_rect(g_wsmgr_hits[i].r, x, y)) continue;
+            int row = g_wsmgr_hits[i].row;
+            if (row < 0 || row >= g_n_sw) return 1;
+            char ws[256], label[80], user[80];
+            snprintf(ws, sizeof ws, "%s", g_sw[row].ws);
+            snprintf(label, sizeof label, "%s", g_sw[row].label);
+            snprintf(user, sizeof user, "%s", g_sw[row].user);
+            int slot = ws_find(ws);
+            int live = (slot >= 0 && g_wss[slot].client);
+            switch (g_wsmgr_hits[i].act) {
+            case WSM_GO:
+                if (live) { close_overlays(); switch_workspace(hwnd, ws, ""); }
+                else        signin_begin_known(hwnd, ws, user);
+                break;
+            case WSM_SIGNOUT:
+                /* Route through the normal sign-out so the server revokes the
+                 * session — a local drop would leave it valid elsewhere. */
+                close_overlays();
+                oc_client_logout(g_client, OC_LOGOUT_THIS);
+                g_logging_out = 1;
+                break;
+            case WSM_FORGET: {
+                WCHAR w[400]; char line[400];
+                snprintf(line, sizeof line,
+                         "Remove %s from this device?\n\n"
+                         "Its saved sign-in is deleted. You can add it again by entering "
+                         "its address.%s",
+                         label[0] ? label : ws,
+                         live ? "\n\nYou are currently signed in; this signs you out first." : "");
+                to_w(line, w, 400);
+                if (MessageBoxW(hwnd, w, L"Remove workspace",
+                                MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK) return 1;
+                if (live && slot == g_ws_active) {
+                    close_overlays();
+                    oc_client_logout(g_client, OC_LOGOUT_THIS);
+                    g_logging_out = 1;
+                    g_forget_after_logout = 1;      /* delete the entry once it lands */
+                } else {
+                    if (live) {                     /* a background one: stop it here */
+                        oc_client_stop(g_wss[slot].client);
+                        for (int k = slot; k + 1 < g_n_wss; k++) g_wss[k] = g_wss[k + 1];
+                        g_n_wss--;
+                        if (g_ws_active > slot) g_ws_active--;
+                        g_n_notify_hw = 0;
+                    }
+                    ws_forget(ws);
+                    sw_book_load();
+                }
+                break;
+            }
+            }
+            return 1;
+        }
+        return 1;
+    }
     if (g_prefs_open) {
         for (int i = 0; i < g_n_pref_hits; i++) {
             if (!in_rect(g_pref_hits[i].r, x, y)) continue;
@@ -3959,6 +4152,7 @@ static int on_click(HWND hwnd, int x, int y) {
     if (g_view == VIEW_SIGNIN) {
         if (g_si_connecting) return 1;
         if (pt_in(g_si_btn, x, y))           { signin_submit(hwnd); return 1; }
+        if (pt_in(g_si_cancel, x, y))        { signin_cancel(hwnd); return 1; }
         if (pt_in(g_si_back, x, y))          { signin_back(hwnd);   return 1; }
         if (pt_in(g_si_adv_link, x, y))      { signin_set_advanced(hwnd, !g_si_advanced); return 1; }
         if (pt_in(g_si_invite_link, x, y)) {
@@ -4355,22 +4549,7 @@ static void remember_workspace(const char *ws, const char *user) {
  * and loads the target's. Every client is ticked each frame; only the active one
  * is rendered. The whole diff is then confined to switching and ticking, which
  * is where the behaviour actually lives. */
-enum { WS_MAX = 8 };
-typedef struct {
-    oc_client *client;
-    char     ws[256];
-    char     cred[320];
-    char     host[256];
-    int      port;
-    /* Per-workspace view state, swapped with the active globals. */
-    uint64_t sel;
-    float    scroll;
-    int      post_auth;
-    uint64_t backfilled[64];
-    int      n_backfilled;
-} oc_ws_slot;
-static oc_ws_slot g_wss[WS_MAX];
-static int g_n_wss, g_ws_active = -1;
+/* (oc_ws_slot / g_wss are declared with the other globals near the top.) */
 
 /* Unread across every workspace that is NOT the one on screen — the number the
  * rail badge exists to show. */
@@ -4389,6 +4568,60 @@ static int ws_find(const char *ws) {
     for (int i = 0; i < g_n_wss; i++)
         if (strcmp(g_wss[i].ws, ws) == 0) return i;
     return -1;
+}
+
+/* Give the workspace now in g_client/g_cur_ws a slot and make it active. Both
+ * entry points must call this — boot goes through connect_start, but the
+ * interactive sign-in builds its client itself and used to skip registration
+ * entirely, leaving a live client in no slot: invisible to the switcher, to the
+ * tick loop's "other workspaces" pass, and to the unread badge. */
+static void ws_register(void) {
+    int slot = ws_find(g_cur_ws);
+    if (slot < 0 && g_n_wss < WS_MAX) {
+        slot = g_n_wss++;
+        memset(&g_wss[slot], 0, sizeof g_wss[slot]);
+        snprintf(g_wss[slot].ws, sizeof g_wss[slot].ws, "%s", g_cur_ws);
+    }
+    if (slot < 0) return;
+    snprintf(g_wss[slot].cred, sizeof g_wss[slot].cred, "%s", g_cred);
+    snprintf(g_wss[slot].host, sizeof g_wss[slot].host, "%s", g_host);
+    g_wss[slot].port = g_port;
+    g_wss[slot].client = g_client;
+    g_wss[slot].sel = 0; g_wss[slot].scroll = 0;
+    g_wss[slot].post_auth = 0; g_wss[slot].n_backfilled = 0;
+    g_ws_active = slot;
+}
+
+/* The first workspace with a live client other than `except` (-1 for any) —
+ * where to land when the one you were in goes away. */
+static int ws_first_live(int except) {
+    for (int i = 0; i < g_n_wss; i++)
+        if (i != except && g_wss[i].client) return i;
+    return -1;
+}
+
+/* Drop a workspace's stored session token, keeping its book entry so it stays
+ * in the switcher. After a sign-out the server has revoked that token, so
+ * leaving it behind means the next launch tries a corpse and falls back to the
+ * sign-in view — which is what made returning feel worse than it should. */
+static void ws_clear_session(const char *ws) {
+    const char *sp = store_path();
+    oc_store *st = (sp && ws && ws[0]) ? oc_store_open(sp) : NULL;
+    if (!st) return;
+    oc_store_set_secret(st, g_secret);
+    oc_store_clear_session(st, ws);
+    oc_store_close(st);
+}
+
+/* Remove a workspace from this device entirely (REQ-012): credential, TOFU pin
+ * and book entry in one delete, so "forget" leaves nothing behind. */
+static void ws_forget(const char *ws) {
+    const char *sp = store_path();
+    oc_store *st = (sp && ws && ws[0]) ? oc_store_open(sp) : NULL;
+    if (!st) return;
+    oc_store_set_secret(st, g_secret);
+    oc_store_workspace_forget(st, ws);
+    oc_store_close(st);
 }
 
 /* Park the active globals in their slot. */
@@ -4445,23 +4678,7 @@ static void connect_start(const char *ws, const char *cred) {
     snprintf(g_cred, sizeof g_cred, "%s", cred);
     g_client = oc_client_start_secure(g_host, g_port, g_cred, store_path(), g_secret);
 
-    /* Register (or refresh) this workspace's slot so it keeps running when the
-     * user looks at another one. */
-    int slot = ws_find(g_cur_ws);
-    if (slot < 0 && g_n_wss < WS_MAX) {
-        slot = g_n_wss++;
-        memset(&g_wss[slot], 0, sizeof g_wss[slot]);
-        snprintf(g_wss[slot].ws, sizeof g_wss[slot].ws, "%s", g_cur_ws);
-    }
-    if (slot >= 0) {
-        snprintf(g_wss[slot].cred, sizeof g_wss[slot].cred, "%s", g_cred);
-        snprintf(g_wss[slot].host, sizeof g_wss[slot].host, "%s", g_host);
-        g_wss[slot].port = g_port;
-        g_wss[slot].client = g_client;
-        g_wss[slot].sel = 0; g_wss[slot].scroll = 0;
-        g_wss[slot].post_auth = 0; g_wss[slot].n_backfilled = 0;
-        g_ws_active = slot;
-    }
+    ws_register();
 
     /* Remember this workspace (+ the username, parsed off "user:pass") so the next
      * launch reconnects silently via the stored session token. */
@@ -4485,7 +4702,7 @@ static void boot_other_workspaces(const char *skip) {
     oc_store_workspace_each(s, boot_book_cb, &b);
     oc_store_close(s);
 
-    int keep = g_ws_active;
+    int keep = g_ws_active;      /* -1 when nothing is up yet; ws_load handles it */
     for (int i = 0; i < b.n && g_n_wss < WS_MAX; i++) {
         if (skip && strcmp(b.ws[i], skip) == 0) continue;
         if (ws_find(b.ws[i]) >= 0) continue;
@@ -4531,8 +4748,62 @@ static void reset_session(void) {
     g_edit_msg = 0; g_n_toast = 0; g_err_seen[0] = '\0'; g_err_seq = 0;
 }
 
+/* Sign back in to a workspace we already know: the book has its address and the
+ * account that used it, so the address step is answered already. Land straight
+ * on the password — which is the whole point of keeping the entry after a
+ * sign-out rather than forgetting it. */
+static void signin_begin_known(HWND hwnd, const char *ws, const char *user) {
+    oc_endpoint ep;
+    if (!ws || !ws[0] || oc_resolve(ws, oc_default_suffix(), &ep) != OC_RESOLVE_OK) {
+        signin_begin(hwnd, ws, user);       /* unresolvable: let step 1 say so */
+        return;
+    }
+    close_overlays();
+    signin_begin(hwnd, ws, user);
+    snprintf(g_si_host, sizeof g_si_host, "%s", ep.host);
+    g_si_port = ep.port;
+    g_si_step = 2;
+    layout_signin(hwnd);
+    /* Set the account AFTER the step-2 layout has shown the field. signin_begin
+     * fills it while step 1 still has it hidden, which did not stick. */
+    if (g_si_e_user && user && user[0]) {
+        WCHAR wu[320]; to_w(user, wu, 320);
+        SetWindowTextW(g_si_e_user, wu);
+    }
+    if (g_si_e_pass) SetFocus(g_si_e_pass);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* Abandon an overlay sign-in and go back to the workspace behind it. Only
+ * possible when there IS one — at cold start there is nowhere to return to. */
+static void signin_cancel(HWND hwnd) {
+    if (!g_si_overlay || !g_client) return;
+    if (g_si_client) { oc_client_stop(g_si_client); g_si_client = NULL; }
+    g_si_connecting = 0; g_si_err[0] = '\0'; g_si_invite[0] = '\0';
+    g_si_overlay = 0;
+    g_view = VIEW_HOME;
+    layout_signin(hwnd);
+    layout_composer(hwnd);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* Sign in to an ADDITIONAL workspace, leaving the current one connected. The
+ * card renders over the live shell (see g_si_overlay) so the app never blanks
+ * while you have somewhere to be. */
+static void signin_begin_add(HWND hwnd) {
+    close_overlays();
+    /* The current workspace is left completely alone — still connected, still
+     * rendered behind the card. It is parked only if the new sign-in succeeds. */
+    signin_begin(hwnd, NULL, NULL);
+}
+
 /* Enter the sign-in view at step 1, pre-filled with `ws`/`user` when known. */
 static void signin_begin(HWND hwnd, const char *ws, const char *user) {
+    /* Overlay exactly when there is something worth keeping on screen. Covers
+     * every caller: cold start and a last-workspace sign-out have no client and
+     * get the full-window card; adding or re-entering a workspace has one and
+     * gets the card over the live shell. */
+    g_si_overlay = (g_client != NULL);
     g_view = VIEW_SIGNIN;
     g_si_step = 1; g_si_connecting = 0; g_si_err[0] = '\0';
     snprintf(g_si_ws, sizeof g_si_ws, "%s", ws ? ws : "");
@@ -4588,7 +4859,7 @@ static void signin_fail(HWND hwnd, const char *why) {
     if (strstr(tmp, "auth failed"))
         snprintf(tmp, sizeof tmp, "sign-in failed — check your username and password");
 
-    if (g_client) { oc_client_stop(g_client); g_client = NULL; }
+    if (g_si_client) { oc_client_stop(g_si_client); g_si_client = NULL; }
     g_si_connecting = 0; g_si_step = 2;
     snprintf(g_si_err, sizeof g_si_err, "%s", tmp);
     if (g_si_e_pass) SetWindowTextW(g_si_e_pass, L"");
@@ -4640,15 +4911,15 @@ static void signin_submit(HWND hwnd) {
     snprintf(g_cred, sizeof g_cred, "%s:%s", user, pass);
     /* "Remember me" off means leave no trace: passing a NULL store path keeps
      * the session token out of the store entirely (the TUI's mechanism). */
-    g_client = oc_client_start_secure(g_host, g_port, g_cred,
-                                      g_si_remember ? store_path() : NULL,
-                                      g_si_remember ? g_secret : NULL);
-    if (!g_client) { snprintf(g_si_err, sizeof g_si_err, "could not start the client"); goto redraw; }
+    g_si_client = oc_client_start_secure(g_host, g_port, g_cred,
+                                         g_si_remember ? store_path() : NULL,
+                                         g_si_remember ? g_secret : NULL);
+    if (!g_si_client) { snprintf(g_si_err, sizeof g_si_err, "could not start the client"); goto redraw; }
     /* Signup (WIN-32): with an invite in hand this connection redeems it instead
      * of authenticating — one step that creates the account and signs in — so
      * bringing up a tenant no longer needs the command line. */
     if (g_si_invite[0]) {
-        oc_client_redeem_invite(g_client, g_si_invite);
+        oc_client_redeem_invite(g_si_client, g_si_invite);
         g_si_invite[0] = '\0';
     }
     g_si_connecting = 1;
@@ -4662,12 +4933,21 @@ redraw:
  * authed wins; a sticky last_error with no connection is the failure; and a
  * deadline stops us waiting forever on a black-hole endpoint. */
 static void signin_poll(HWND hwnd) {
-    const oc_model *m = model();
+    const oc_model *m = g_si_client ? oc_client_model(g_si_client) : NULL;
     if (!m) return;
     if (m->authed) {
+        /* Authenticated: NOW park whatever workspace was on screen and make this
+         * the active one. Doing it here rather than at submit is what let the
+         * previous workspace stay live and visible throughout. */
+        ws_save_active();
+        g_client = g_si_client; g_si_client = NULL;
+        g_sel = 0; g_scroll = 0; g_post_auth = 0; g_has_sel = 0;
+        g_n_backfilled = 0; g_edit_msg = 0; g_n_toast = 0; g_err_seen[0] = '\0';
+        g_si_overlay = 0;
         g_si_connecting = 0;
         g_si_err[0] = '\0';
         g_view = VIEW_HOME;
+        ws_register();               /* the client exists; give it a slot (WIN-29) */
         if (g_si_remember) {
             char user[128]; si_get(g_si_e_user, user, sizeof user);
             remember_workspace(g_si_ws, user[0] ? user : NULL);
@@ -4908,13 +5188,26 @@ static void switch_workspace(HWND hwnd, const char *ws, const char *cred) {
 
 static void sw_book_cb(void *ctx, const char *workspace, const char *label,
                        const char *username, uint64_t last) {
-    (void)ctx; (void)username; (void)last;
+    (void)ctx; (void)last;
     if (g_n_sw >= (int)(sizeof g_sw / sizeof g_sw[0])) return;
     snprintf(g_sw[g_n_sw].ws, sizeof g_sw[g_n_sw].ws, "%s", workspace ? workspace : "");
     snprintf(g_sw[g_n_sw].label, sizeof g_sw[g_n_sw].label, "%s",
              (label && label[0]) ? label : (workspace ? workspace : "?"));
-    g_sw[g_n_sw].current = (strcmp(g_sw[g_n_sw].ws, g_cur_ws) == 0);
+    /* Kept so a signed-out workspace can go straight to its password. */
+    snprintf(g_sw[g_n_sw].user, sizeof g_sw[g_n_sw].user, "%s", username ? username : "");
+    g_sw[g_n_sw].current = (g_client != NULL && strcmp(g_sw[g_n_sw].ws, g_cur_ws) == 0);
     g_n_sw++;
+}
+
+/* Refresh g_sw[] from the credential-store book. */
+static void sw_book_load(void) {
+    g_n_sw = 0;
+    const char *sp = store_path();
+    oc_store *st = sp ? oc_store_open(sp) : NULL;
+    if (!st) return;
+    oc_store_set_secret(st, g_secret);
+    oc_store_workspace_each(st, sw_book_cb, NULL);
+    oc_store_close(st);
 }
 
 static void open_ws_menu(HWND hwnd) {
@@ -5058,14 +5351,7 @@ static void open_section_menu(HWND hwnd, int sec) {
 
 static void open_switcher(HWND hwnd) {
     (void)hwnd;
-    g_n_sw = 0;
-    const char *sp = store_path();
-    oc_store *s = sp ? oc_store_open(sp) : NULL;
-    if (s) {
-        oc_store_set_secret(s, g_secret);   /* the book lives in the credential store */
-        oc_store_workspace_each(s, sw_book_cb, NULL);
-        oc_store_close(s);
-    }
+    sw_book_load();
     g_n_mi = 0;
     mi_section("WORKSPACES");
     for (int i = 0; i < g_n_sw; i++) {
@@ -5085,12 +5371,15 @@ static void open_switcher(HWND hwnd) {
         else if (slot >= 0 && g_wss[slot].client)
             snprintf(lbl, sizeof lbl, "%s  (connected)", g_sw[i].label);
         else
-            snprintf(lbl, sizeof lbl, "%s", g_sw[i].label);
+            /* Remembered but not signed in — the state a sign-out now leaves
+             * behind, and a click away from being live again. */
+            snprintf(lbl, sizeof lbl, "%s  \u2014 signed out", g_sw[i].label);
         mi_item(100 + i, lbl);
     }
     if (g_n_sw == 0) mi_item(-1, "(no remembered workspaces)");
     mi_sep();
     mi_item(80, "Add a workspace\xE2\x80\xA6");
+    mi_item(81, "Manage workspaces\xE2\x80\xA6");
     g_menu = MENU_SWITCHER; g_menu_headerblock = 0; g_menu_hover = -1;
     g_menu_x = RAIL_W + 8; g_menu_y = 12; g_menu_w = 244;
 }
@@ -5187,7 +5476,11 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 72: close_overlays(); g_keys_open = 1; g_view = VIEW_HOME; break;   /* WIN-25 */
     /* "Add a workspace…" drops the current session and goes to the same sign-in
      * view the app starts on — one sign-in implementation, not two. */
-    case 80: reset_session(); signin_begin(hwnd, NULL, NULL); break;
+    /* Adding a workspace must not sign you out of the one you are in — which is
+     * exactly what reset_session() here used to do. Park the current one and
+     * sign in alongside it. */
+    case 80: signin_begin_add(hwnd); break;
+    case 81: close_overlays(); sw_book_load(); g_wsmgr_open = 1; g_view = VIEW_HOME; break;
     default:
         /* Section Filter/Sort (see SEC_CMD). */
         if (cmd >= 200 && cmd < 200 + OC_SB_SECTIONS * 16) {
@@ -5199,8 +5492,12 @@ static void menu_dispatch(HWND hwnd, int cmd) {
             sidebar_opts_save();
             break;
         }
-        if (cmd >= 100 && cmd - 100 < g_n_sw && !g_sw[cmd - 100].current)
-            switch_workspace(hwnd, g_sw[cmd - 100].ws, "");
+        if (cmd >= 100 && cmd - 100 < g_n_sw && !g_sw[cmd - 100].current) {
+            int i = cmd - 100;
+            int slot = ws_find(g_sw[i].ws);
+            if (slot >= 0 && g_wss[slot].client) switch_workspace(hwnd, g_sw[i].ws, "");
+            else signin_begin_known(hwnd, g_sw[i].ws, g_sw[i].user);
+        }
         break;
     }
     InvalidateRect(hwnd, NULL, FALSE);
@@ -5365,6 +5662,7 @@ static void test_dump(const char *path) {
                         dc->msgs[i].attach[k].filename, dc->msgs[i].attach[k].mime,
                         dc->msgs[i].attach[k].reclaimed);
     }
+    fprintf(f, "view=%d si_overlay=%d wsmgr=%d\n", g_view, g_si_overlay, g_wsmgr_open);
     fprintf(f, "workspaces=%d active=%d elsewhere=%d\n", g_n_wss, g_ws_active, ws_unread_elsewhere());
     for (int i = 0; i < g_n_wss; i++) {
         int u = 0;
@@ -5466,6 +5764,20 @@ static void test_poll(HWND hwnd) {
         char ws[256] = "", cred[256] = "";
         sscanf(arg, "%255s %255s", ws, cred);
         if (ws[0]) { switch_workspace(hwnd, ws, cred); test_ack("ok"); } else test_ack("err");
+    } else if (!strcmp(verb, "wsforget")) {
+        /* The removal itself, minus the confirmation dialog a harness cannot
+         * dismiss reliably. Same code path the button takes after OK. */
+        int slot = ws_find(arg);
+        if (slot >= 0 && g_wss[slot].client && slot != g_ws_active) {
+            oc_client_stop(g_wss[slot].client);
+            for (int k = slot; k + 1 < g_n_wss; k++) g_wss[k] = g_wss[k + 1];
+            g_n_wss--;
+            if (g_ws_active > slot) g_ws_active--;
+            g_n_notify_hw = 0;
+        }
+        ws_forget(arg);
+        sw_book_load();
+        test_ack("ok");
     } else if (!strcmp(verb, "wsgo")) {
         int i = atoi(arg);
         if (i >= 0 && i < g_n_wss) { ws_save_active(); close_overlays(); ws_load(i);
@@ -5566,6 +5878,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             for (int wi = 0; wi < g_n_wss; wi++)
                 if (g_wss[wi].client && g_wss[wi].client != g_client)
                     oc_client_tick(g_wss[wi].client);
+            /* And the sign-in attempt, which is not in a slot yet. */
+            if (g_si_client) oc_client_tick(g_si_client);
         }
         if (wp == TIMER_TICK && g_client) {
             oc_client_tick(g_client);
@@ -5702,14 +6016,36 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_prefs_pending = 1;
                 layout_composer(hwnd);   /* members pane now shows — re-fit the composer */
             }
-            /* Sign-out returns to the sign-in view rather than quitting the
-             * app (Slack's behaviour), so signing back in — as the same user or
-             * a different one — needs no restart. */
+            /* Sign-out is scoped to ONE workspace, not the app. It used to drop
+             * the whole window into the sign-in view — while the other
+             * workspaces stayed connected and receiving, merely unreachable,
+             * because the rail is not drawn there. Now we leave the workspace
+             * and land in a surviving one; the sign-in view appears only when
+             * nothing is left to show. */
             if (g_logging_out && !m->connected) {     /* logout frame sent + server dropped us */
                 g_logging_out = 0;
                 char ws[256]; snprintf(ws, sizeof ws, "%s", g_cur_ws);
-                reset_session();
-                signin_begin(hwnd, ws, NULL);
+                char label[96]; ws_display_name(m, label, sizeof label);
+                /* The server has revoked this token; drop it but KEEP the book
+                 * entry, so the workspace stays in the switcher a password away
+                 * rather than vanishing from the device. */
+                /* Remove was chosen: delete the whole entry rather than just the
+                 * token, once the server has actually revoked the session. */
+                if (g_forget_after_logout) { g_forget_after_logout = 0; ws_forget(ws); }
+                else                        ws_clear_session(ws);
+                reset_session();                      /* stops the client, retires the slot */
+                int nxt = ws_first_live(-1);
+                if (nxt >= 0) {
+                    ws_load(nxt);
+                    g_view = VIEW_HOME;
+                    layout_composer(hwnd);
+                    char msg[160];
+                    snprintf(msg, sizeof msg, "Signed out of %s.", label[0] ? label : ws);
+                    toast_push(msg, 0);
+                } else {
+                    signin_begin(hwnd, ws, NULL);
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
             if (g_await_invite && m->invite_token[0]) {   /* show the minted token once */
@@ -6009,7 +6345,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
          * one stays active; the rest connect behind it. */
         if (!acred[0]) boot_other_workspaces(aws);
     } else {
-        g_view = VIEW_SIGNIN;
+        /* The most-recently-used workspace has no usable token — but another one
+         * may still have. Signing out of the last workspace you used must not
+         * strand the ones you are still signed in to. */
+        boot_other_workspaces(NULL);
+        int first = ws_first_live(-1);
+        if (first >= 0) { ws_load(first); g_view = VIEW_HOME; }
+        else            { g_view = VIEW_SIGNIN; }
     }
 
     WNDCLASSW wc;

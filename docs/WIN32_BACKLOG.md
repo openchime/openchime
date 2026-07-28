@@ -114,6 +114,28 @@ Not startable in this client. Each names what must land first.
 
 ---
 
+## Workspace lifecycle (post-WIN-29 refinement)
+
+Sign-out used to drop the **whole app** into the sign-in view while the other
+workspaces stayed connected and merely unreachable — the rail is not drawn
+there. Three concepts were collapsed into one menu item; they are now distinct:
+
+| | Server effect | Local effect | Cost to return |
+|---|---|---|---|
+| **Sign out** | revoke this device's session | drop the client, clear the stored token, **keep** the book entry | password |
+| **Sign out everywhere** | revoke every session for that user | same locally | password |
+| **Remove** | none | delete the credential *and* the book entry (REQ-012) | retype the address |
+
+- Signing out lands in a surviving workspace and stays in the chat UI; the
+  sign-in view appears only when nothing is left.
+- The switcher marks entries `— signed out`, and clicking one goes **straight to
+  the password** using the account stored in the book.
+- **Manage workspaces…** is the surface for Remove, which the GUI previously had
+  no way to do at all (the TUI did).
+- Signing in while a workspace is live renders the card **over the dimmed
+  shell** with a Cancel, instead of blanking the app. This is also what stopped
+  "Add a workspace…" from signing you out of the one you were in.
+
 ## Where this stands
 
 **§1 and §2 are complete** — every item that was buildable in `client/gui/win32/`
