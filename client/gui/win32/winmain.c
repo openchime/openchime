@@ -19,7 +19,7 @@
 #define COBJMACROS            /* C-style COM: Interface_Method(obj, ...) */
 #include <windows.h>
 #include <windowsx.h>         /* GET_X_LPARAM / GET_Y_LPARAM */
-#include <shellapi.h>         /* CommandLineToArgvW */
+#include <shellapi.h>         /* CommandLineToArgvW, Shell_NotifyIconW (WIN-18) */
 #include <richedit.h>         /* MSFTEDIT_CLASS composer */
 #include <commdlg.h>          /* GetSaveFileNameW (attachment download) */
 #include <dwmapi.h>           /* DwmSetWindowAttribute (dark title bar) */
@@ -235,6 +235,73 @@ static float g_thr_scroll, g_thr_scroll_max;
 enum { DRAFT_MAX = 24 };
 static struct { uint64_t cid; WCHAR text[1024]; } g_drafts[DRAFT_MAX];
 static int g_n_drafts;
+
+/* ---- OS notifications (WIN-18, REQ-138) ------------------------------------
+ * Shell_NotifyIconW with NIF_INFO rather than WinRT toasts: the client is pure C
+ * (ARCH-82), and WinRT's ToastNotificationManager needs a C++/WinRT projection
+ * plus a registered AppUserModelID. On Windows 10+ a balloon is rendered by the
+ * same toast system anyway, so the user-visible result is a real OS toast.
+ *
+ * The decision of WHETHER to notify is the server's model rendered locally
+ * (ARCH-72): the channel's notify level and the user's DND window, both already
+ * synced into oc_model. This adds no server surface.
+ *
+ * Nothing is raised while the window is foreground — a notification for a
+ * message you are looking at is noise. */
+static int to_w(const char *s, WCHAR *out, int cap);   /* fwd */
+
+enum { NOTIFY_OFF = 0, NOTIFY_COUNT = 1, NOTIFY_FULL = 2 };
+static int  g_pref_notify = NOTIFY_FULL;
+static int  g_tray_live;
+/* Per-channel high-water as of the last tick. A message is "new" when a
+ * channel's mark advances, which is the same signal the unread count uses —
+ * cheaper and less fragile than trying to intercept events on their way in. */
+static struct { uint64_t cid, seen; } g_notify_hw[64];
+static int  g_n_notify_hw;
+static int  g_notify_primed;   /* the first tick after auth only records */
+static NOTIFYICONDATAW g_tray;
+#define TRAY_UID 1
+
+/* Is `t` (minutes since midnight) inside the DND window? Windows may wrap past
+ * midnight, which is why this is not a plain range test. */
+static int in_dnd_window(uint16_t t, uint16_t start, uint16_t end) {
+    if (start == end) return 0;
+    return (start < end) ? (t >= start && t < end) : (t >= start || t < end);
+}
+
+static int dnd_active(const oc_model *m) {
+    if (!m || !m->dnd_enabled) return 0;
+    time_t now = time(NULL); struct tm tv;
+    if (!oc_localtime_r(&now, &tv)) return 0;
+    return in_dnd_window((uint16_t)(tv.tm_hour * 60 + tv.tm_min), m->dnd_start_min, m->dnd_end_min);
+}
+
+static void tray_init(HWND hwnd) {
+    memset(&g_tray, 0, sizeof g_tray);
+    g_tray.cbSize = sizeof g_tray;
+    g_tray.hWnd = hwnd;
+    g_tray.uID = TRAY_UID;
+    g_tray.uFlags = NIF_ICON | NIF_TIP;
+    g_tray.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    lstrcpynW(g_tray.szTip, L"OpenChime", 128);
+    g_tray_live = Shell_NotifyIconW(NIM_ADD, &g_tray) ? 1 : 0;
+}
+
+static void tray_done(void) {
+    if (g_tray_live) { Shell_NotifyIconW(NIM_DELETE, &g_tray); g_tray_live = 0; }
+}
+
+static int g_toasts_raised;      /* observable by the harness; see test_dump */
+
+static void notify_toast(const char *title, const char *body) {
+    if (!g_tray_live) return;
+    g_toasts_raised++;
+    g_tray.uFlags = NIF_INFO;
+    g_tray.dwInfoFlags = NIIF_NONE;
+    to_w(title, g_tray.szInfoTitle, 64);
+    to_w(body,  g_tray.szInfo, 256);
+    Shell_NotifyIconW(NIM_MODIFY, &g_tray);
+}
 
 /* ---- inline image thumbnails (WIN-17) -------------------------------------
  * Attachments rendered as text lines only. The bytes are fetched INTO MEMORY
@@ -2244,7 +2311,8 @@ static float pref_row(ID2D1RenderTarget *rt, D2D1_RECT_F body, float y, int row,
     return y + 62;
 }
 
-enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP, PREF_ROW_QUICK };
+enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
+       PREF_ROW_NOTIFY, PREF_ROW_QUICK };
 
 static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
     D2D1_RECT_F body = overlay_header(rt, reg, "Preferences");
@@ -2263,6 +2331,10 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
                  "Shown by default when you open a channel.", ONOFF, 2, g_pref_members);
     y = pref_row(rt, body, y, PREF_ROW_DAYSEP, "Date dividers",
                  "A separator between days in the transcript.", ONOFF, 2, g_pref_daysep);
+    static const char *NOTIF[3] = { "Off", "Count", "Preview" };
+    y = pref_row(rt, body, y, PREF_ROW_NOTIFY, "Desktop notifications",
+                 "When OpenChime is not in front, and outside Do Not Disturb.",
+                 NOTIF, 3, g_pref_notify);
 
     /* WIN-28: the quick reactions were six literals in the source. */
     {
@@ -3807,6 +3879,7 @@ static int on_click(HWND hwnd, int x, int y) {
              * restart to see is indistinguishable from one that did nothing. */
             case PREF_ROW_MEMBERS: g_pref_members = v; g_show_members = v; layout_composer(hwnd); break;
             case PREF_ROW_DAYSEP:  g_pref_daysep = v; break;
+            case PREF_ROW_NOTIFY:  g_pref_notify = v; break;
             case PREF_ROW_QUICK: {
                 oc_field f[1] = { { FF_TEXT, "Quick reactions",
                                     "Up to six emoji shortcodes, comma separated (e.g. +1, fire, tada).", "" } };
@@ -4684,8 +4757,9 @@ static void open_new_menu(HWND hwnd) {
 static void prefs_save(void) {
     if (!g_client) return;
     char enc[288];
-    snprintf(enc, sizeof enc, "t:%d;h:%d;m:%d;d:%d;q:%s",
-             oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep, g_quick_names);
+    snprintf(enc, sizeof enc, "t:%d;h:%d;m:%d;d:%d;n:%d;q:%s",
+             oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep,
+             g_pref_notify, g_quick_names);
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
 }
 
@@ -4701,6 +4775,7 @@ static void prefs_load(const oc_model *m) {
             int val = atoi(p + 2);
             if (k == 't') t = val; else if (k == 'h') h = val;
             else if (k == 'm') mm = val; else if (k == 'd') d = val;
+            else if (k == 'n') g_pref_notify = (val < 0 || val > 2) ? NOTIFY_FULL : val;
             else if (k == 'q') {
                 size_t n2 = 0;
                 for (const char *q = p + 2; *q && *q != ';' && n2 + 1 < sizeof g_quick_names; q++)
@@ -5058,6 +5133,8 @@ static void test_dump(const char *path) {
                         dc->msgs[i].attach[k].filename, dc->msgs[i].attach[k].mime,
                         dc->msgs[i].attach[k].reclaimed);
     }
+    fprintf(f, "tray_live=%d notify_pref=%d toasts_raised=%d dnd=%d\n",
+            g_tray_live, g_pref_notify, g_toasts_raised, dnd_active(m));
     fprintf(f, "thumb_pending=%llu n_thumbs=%d n_missing=%d off=%d\n",
             (unsigned long long)g_thumb_pending, g_n_thumbs, g_n_thumb_missing, g_thumbs_off);
     for (int i = 0; i < g_n_thumbs; i++)
@@ -5144,6 +5221,8 @@ static void test_poll(HWND hwnd) {
         palette_open(hwnd);
         if (arg[0]) { WCHAR w[64]; to_w(arg, w, 64); SetWindowTextW(g_pal_edit, w); }
         test_ack("ok");
+    } else if (!strcmp(verb, "toast")) {
+        notify_toast("OpenChime", arg[0] ? arg : "test notification"); test_ack("ok");
     } else if (!strcmp(verb, "notify")) {
         close_overlays(); g_notify_open = 1; g_view = VIEW_HOME;
         oc_client_list_notify_prefs(g_client); test_ack("ok");
@@ -5213,6 +5292,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         signin_create(hwnd);
         DragAcceptFiles(hwnd, TRUE);              /* drop files anywhere to upload */
         SetTimer(hwnd, TIMER_TICK, 30, NULL);
+        tray_init(hwnd);   /* WIN-18: the notification surface */
         return 0;
     case WM_DROPFILES: {
         HDROP drop = (HDROP)wp;
@@ -5236,6 +5316,52 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * toast channel while the sign-in view owns the window. */
             if (g_view == VIEW_SIGNIN) { if (g_si_connecting) signin_poll(hwnd); }
             else toast_tick(m);
+            /* OS notifications (WIN-18). Raised for messages that arrive while
+             * the window is not in front, subject to the channel's level and the
+             * DND window. The first pass after connecting only records the
+             * marks: the backfill is not "new mail". */
+            if (g_pref_notify != NOTIFY_OFF && m->authed) {
+                int fg = (GetForegroundWindow() == hwnd);
+                int quiet = dnd_active(m);
+                for (size_t ci = 0; ci < m->n_channels; ci++) {
+                    const oc_channel *c = &m->channels[ci];
+                    int slot = -1;
+                    for (int k = 0; k < g_n_notify_hw; k++)
+                        if (g_notify_hw[k].cid == c->channel_id) { slot = k; break; }
+                    if (slot < 0) {
+                        if (g_n_notify_hw >= 64) continue;
+                        slot = g_n_notify_hw++;
+                        g_notify_hw[slot].cid = c->channel_id;
+                        g_notify_hw[slot].seen = c->high_water;
+                        continue;                      /* first sighting: record only */
+                    }
+                    uint64_t prev = g_notify_hw[slot].seen;
+                    g_notify_hw[slot].seen = c->high_water;
+                    if (!g_notify_primed || c->high_water <= prev) continue;
+                    if (fg && c->channel_id == g_sel) continue;   /* you are reading it */
+                    if (quiet) continue;
+                    /* MENTIONS is treated as "nothing yet": real @mention
+                     * semantics are REQ-221 / WIN-45, and guessing here would
+                     * mean notifying for things that are not mentions. */
+                    if (c->notify_level != OC_NOTIFY_ALL) continue;
+
+                    const oc_msg *last = c->n_msgs ? &c->msgs[c->n_msgs - 1] : NULL;
+                    if (last && last->author_id == m->user_id) continue;   /* your own */
+                    char title[96], body[256];
+                    channel_label(m, c, title, sizeof title);
+                    if (g_pref_notify == NOTIFY_FULL && last && last->body) {
+                        const char *who = last->author_name[0] ? last->author_name
+                                        : oc_model_user_name(m, last->author_id);
+                        snprintf(body, sizeof body, "%s: %s", (who && who[0]) ? who : "someone",
+                                 last->body);
+                    } else {
+                        snprintf(body, sizeof body, "%d new message%s",
+                                 c->unread, c->unread == 1 ? "" : "s");
+                    }
+                    notify_toast(title, body);
+                }
+                g_notify_primed = 1;
+            }
             /* An inline image arrived: decode and cache it (WIN-17). */
             {
                 uint64_t fid = 0; size_t flen = 0;
@@ -5543,6 +5669,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return DefWindowProcW(hwnd, msg, wp, lp);   /* proceed with the close */
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_TICK);
+        tray_done();       /* or the icon lingers in the notification area */
         if (g_client) { oc_client_stop(g_client); g_client = NULL; }
         PostQuitMessage(0);
         return 0;
