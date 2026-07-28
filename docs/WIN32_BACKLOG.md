@@ -114,18 +114,27 @@ Not startable in this client. Each names what must land first.
 
 ---
 
-## Suggested order
+## Where this stands
 
-The first six are [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5's top
-items, re-expressed as ids and re-checked against the tree:
+**§1 and §2 are complete** — every item that was buildable in `client/gui/win32/`
+or needed only a small `client/core` change is done and was verified running on
+Windows, not merely compiled. So are the §3 items whose blocker turned out to be
+client-side rather than daemon-side: WIN-55 (a core field), WIN-56/58 (the
+credential store), WIN-57 (unblocked by WIN-29), and WIN-59.
 
-~~WIN-1~~, ~~WIN-2~~ (done — failures are no longer silent anywhere) **→ WIN-3** (search stops lying about where a hit is) → **WIN-5 + WIN-6**
-(the sidebar becomes navigable) → **WIN-7** (the core chat affordance) →
-**WIN-9** (settings, replacing the "coming soon" box) → **WIN-10**.
+**Everything still open is §3, and every one of them is blocked on a server
+feature that does not exist.** Not "hard" — absent: there is no rename op
+(REQ-036), no topic column (REQ-034), no archive flag (REQ-035), no search
+cursor on the wire, no per-user mute storage (REQ-137), no mention semantics
+(REQ-221), no pins (REQ-230), no permalinks (REQ-232). Each needs its REQ built
+in the daemon first; none is startable in this client. §4 remains deliberately
+out of scope.
 
-After that the cheap wins cluster — WIN-12, WIN-13, WIN-19, WIN-20, WIN-22 are
-all S and close visible 🔨/🔸 marks — with **WIN-29** as the one large piece worth
-scheduling deliberately rather than squeezing in.
+**So the next move is not in this document.** Picking up WIN-42, WIN-45 or
+WIN-49 means implementing REQ-230, REQ-221 or REQ-139 in the daemon; the Win32
+work that follows is small by comparison. The exception is WIN-48, which needs
+only a `created_at` field on `WEBHOOK_LIST` plus reveal/rotate ops — the
+cheapest remaining unblock.
 
 Update [STATUS.md](./STATUS.md)'s parity table when an item changes a ✅/🔨 mark,
 and strike the corresponding line in CLIENT_GAP_ANALYSIS.md §4 when one closes.
