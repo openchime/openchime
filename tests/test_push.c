@@ -184,12 +184,12 @@ static void test_collect(void) {
 
     /* At 10:30 (630): author excluded, carol muted, bob in DND → only dave. */
     oc_push_target t[8];
-    int n = oc_push_collect(rdb, 1, alice, 630, t, 8);
+    int n = oc_push_collect(rdb, 1, alice, 0, 630, t, 8);
     CHECK(n == 1);
     if (n == 1) CHECK(strcmp(t[0].token, "tok-dave") == 0);
 
     /* At 01:40 (100): bob no longer in DND → bob + dave (carol still muted). */
-    n = oc_push_collect(rdb, 1, alice, 100, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 0, 100, t, 8);
     CHECK(n == 2);
     int saw_bob = 0, saw_dave = 0, saw_carol = 0, saw_alice = 0;
     for (int i = 0; i < n; i++) {
@@ -202,6 +202,68 @@ static void test_collect(void) {
     CHECK(!saw_carol && !saw_alice);   /* muted / author never notified */
     sqlite3_close(rdb);
 
+    /* --- the MENTIONS level (REQ-221) — the deferred half of ARCH-72 ---------
+     * Level MENTIONS must deliver only when the message actually names the
+     * recipient. Before REQ-221 there was no way to answer that, so the level
+     * was accepted and then silently behaved as NONE. */
+    set_level(w, dave, 1, OC_NOTIFY_MENTIONS);
+    CHECK(oc_dbwriter_register_device_token(w, carol, OC_PUSH_FCM, "tok-carol"));  /* flush */
+
+    CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    /* A message that mentions nobody: dave is on MENTIONS, so he is out. */
+    n = oc_push_collect(rdb, 1, alice, 0, 100, t, 8);
+    int only_bob = (n == 1) && strcmp(t[0].token, "tok-bob") == 0;
+    CHECK(only_bob);
+
+    /* Now record a mention of dave on a message and collect against it. */
+    {
+        sqlite3 *wdb = NULL;
+        CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        char sql[256];
+        snprintf(sql, sizeof sql,
+                 "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms)"
+                 " VALUES(4242,1,%llu,0,0,5,1);", (unsigned long long)dave);
+        CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(wdb);
+    }
+    n = oc_push_collect(rdb, 1, alice, 4242, 100, t, 8);
+    int saw_d = 0, saw_b = 0;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(t[i].token, "tok-dave") == 0) saw_d = 1;
+        if (strcmp(t[i].token, "tok-bob") == 0)  saw_b = 1;
+    }
+    CHECK(saw_d && saw_b);          /* mentioned + level-ALL */
+
+    /* A DIFFERENT message still leaves him out: the gate is per message, not a
+     * sticky "dave gets mentions" flag. */
+    n = oc_push_collect(rdb, 1, alice, 4243, 100, t, 8);
+    saw_d = 0;
+    for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-dave") == 0) saw_d = 1;
+    CHECK(!saw_d);
+
+    /* A broadcast reaches him without naming him; carol stays muted, because
+     * NONE outranks a broadcast. */
+    {
+        sqlite3 *wdb = NULL;
+        CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        CHECK(sqlite3_exec(wdb,
+            "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms)"
+            " VALUES(4244,1,NULL,2,0,8,1);", NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(wdb);
+    }
+    n = oc_push_collect(rdb, 1, alice, 4244, 100, t, 8);
+    saw_d = 0; int saw_c = 0;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(t[i].token, "tok-dave") == 0)  saw_d = 1;
+        if (strcmp(t[i].token, "tok-carol") == 0) saw_c = 1;
+    }
+    CHECK(saw_d);
+    CHECK(!saw_c);
+    sqlite3_close(rdb);
+
+    set_level(w, dave, 1, OC_NOTIFY_ALL);        /* restore for the checks below */
+    CHECK(oc_dbwriter_register_device_token(w, carol, OC_PUSH_FCM, "tok-carol"));
+
     /* Prune dave's token; re-registering carol's (synchronous) flushes the FIFO
      * so the fire-and-forget prune has definitely applied. */
     oc_dbwriter_prune_device_token(w, "tok-dave");
@@ -209,7 +271,7 @@ static void test_collect(void) {
     CHECK(token_count(path, "tok-dave") == 0);
 
     CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
-    n = oc_push_collect(rdb, 1, alice, 100, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 0, 100, t, 8);
     CHECK(n == 1);   /* dave pruned → only bob */
     if (n == 1) CHECK(strcmp(t[0].token, "tok-bob") == 0);
     sqlite3_close(rdb);
@@ -308,7 +370,7 @@ static void test_notify_roundtrip(void) {
     oc_push *p = oc_push_start(path, w, url, NULL, aud, pk);
     CHECK(p != NULL);
     if (p) {
-        oc_push_notify(p, 1, alice);   /* alice sent → bob should be notified */
+        oc_push_notify(p, 1, alice, 0);   /* alice sent → bob should be notified */
         /* stop drains the in-flight notify: the worker completes do_notify (POST +
          * the fire-and-forget prune submit) before it exits — deterministic, no poll. */
         oc_push_stop(p);

@@ -7,6 +7,7 @@
  * the net thread via an eventfd.
  */
 
+#include "mention.h"      /* the shared @mention scanner (ARCH-89) */
 #include "dbwriter.h"
 #include "migrate.h"
 #include "protocol.h"
@@ -1058,6 +1059,11 @@ static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
      * DUPLICATE conversation; migration 0019's unique dm_key now forbids that
      * state, which makes removing the channel the only coherent option. */
     sqlite3_prepare_v2(db,
+        "DELETE FROM mentions WHERE channel_id IN (SELECT channel_id FROM channel_members "
+        "  WHERE user_id=?1 AND channel_id IN (SELECT id FROM channels WHERE kind='dm'));",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db,
         "DELETE FROM messages WHERE channel_id IN (SELECT channel_id FROM channel_members "
         "  WHERE user_id=?1 AND channel_id IN (SELECT id FROM channels WHERE kind='dm'));",
         -1, &st, NULL);
@@ -1205,6 +1211,61 @@ static void load_message_attachments(sqlite3 *db, uint64_t mid, oc_attach_meta *
     sqlite3_finalize(st);
 }
 
+/* Resolve the @mentions in a message body and record them (REQ-221, ARCH-89).
+ *
+ * The scan itself is shared/mention.c, which the client links too — the rule
+ * for "what is a mention" must be one implementation or the highlight a reader
+ * sees and the notification the server sends can disagree, and nobody would be
+ * able to tell from either side alone.
+ *
+ * Resolution happens HERE because only the daemon has the roster. An unmatched
+ * name is simply not a mention: it stays as text in the body and notifies
+ * nobody, which is the right outcome for a typo. */
+static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
+                           const void *body, size_t body_len, uint64_t ts) {
+    if (!body || !body_len) return;
+    oc_mention m[OC_MENTION_MAX];
+    size_t n = oc_mention_scan((const char *)body, body_len, m, OC_MENTION_MAX);
+    if (n > OC_MENTION_MAX) n = OC_MENTION_MAX;   /* the rest are ignored, not an error */
+
+    sqlite3_stmt *ins = NULL;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO mentions(message_id, channel_id, user_id, kind, "
+            "                     span_start, span_len, created_at_ms) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7);", -1, &ins, NULL) != SQLITE_OK)
+        return;
+
+    for (size_t i = 0; i < n; i++) {
+        int64_t uid = 0;
+        if (m[i].kind == OC_MENTION_USER) {
+            /* Match the display name case-insensitively, and only a member of
+             * this channel: mentioning someone who cannot read the channel
+             * would notify them about a message they can never open. */
+            sqlite3_stmt *q = NULL;
+            if (sqlite3_prepare_v2(db,
+                    "SELECT u.id FROM users u JOIN channel_members cm ON cm.user_id = u.id "
+                    "WHERE cm.channel_id = ?1 AND u.disabled = 0 "
+                    "  AND lower(u.display_name) = lower(?2) LIMIT 1;", -1, &q, NULL) != SQLITE_OK)
+                continue;
+            sqlite3_bind_int64(q, 1, (sqlite3_int64)channel_id);
+            sqlite3_bind_text(q, 2, m[i].name, -1, SQLITE_STATIC);
+            if (sqlite3_step(q) == SQLITE_ROW) uid = sqlite3_column_int64(q, 0);
+            sqlite3_finalize(q);
+            if (!uid) continue;                    /* no such member: just text */
+        }
+        sqlite3_reset(ins);
+        sqlite3_bind_int64(ins, 1, (sqlite3_int64)mid);
+        sqlite3_bind_int64(ins, 2, (sqlite3_int64)channel_id);
+        if (uid) sqlite3_bind_int64(ins, 3, uid); else sqlite3_bind_null(ins, 3);
+        sqlite3_bind_int(ins, 4, (int)m[i].kind);
+        sqlite3_bind_int64(ins, 5, (sqlite3_int64)m[i].start);
+        sqlite3_bind_int64(ins, 6, (sqlite3_int64)m[i].len);
+        sqlite3_bind_int64(ins, 7, (sqlite3_int64)ts);
+        sqlite3_step(ins);
+    }
+    sqlite3_finalize(ins);
+}
+
 /* Link the caller's pending attachments to message `mid` (REQ-140). An id links
  * only if it is a finalized, still-unlinked attachment the same user uploaded to
  * this same channel; any other id is silently ignored (it simply isn't shared). */
@@ -1290,6 +1351,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
         return r;
     }
     uint64_t mid = (uint64_t)sqlite3_last_insert_rowid(db);
+    store_mentions(db, mid, j->channel_id, j->body, j->body_len, ts);
 
     sqlite3_prepare_v2(db,
         "INSERT INTO sent_messages(channel_id, idempotency_token, message_id, created_at_ms) "

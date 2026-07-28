@@ -1567,7 +1567,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             /* Offline mobile delivery (ARCH-85): hand the notify decision to the
              * push emitter — members minus author, level/DND-gated, off this
              * thread. Fire-and-forget; a no-op when push is unconfigured. */
-            oc_push_notify(g_push, r->channel_id, r->author_id);
+            oc_push_notify(g_push, r->channel_id, r->author_id, r->message_id);
         }
         break;
     }

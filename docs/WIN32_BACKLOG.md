@@ -89,7 +89,7 @@ Not startable in this client. Each names what must land first.
 | **WIN-42** | Pin a message | REQ-230 |
 | **WIN-43** | Save for later / the **Later** rail stub | REQ-231 |
 | **WIN-44** | Copy link / permalink, jump-to-permalink | REQ-232 — needs a permalink form and fetch-around-an-id backfill |
-| **WIN-45** | Real `@mentions` (highlight + notify) | REQ-221 — also gates the `MENTIONS` notify level and REQ-135 |
+| ~~**WIN-45**~~ | ~~Real `@mentions` (highlight + notify)~~ **DONE.** REQ-221/ARCH-89 built in the daemon (migration 0021, `shared/mention.c`) and surfaced here: mention spans are accent-coloured and semi-bold in `body_layout`, a message naming you tints its row and gets an accent bar, and the in-app `MENTIONS` notify level is now evaluated with the same scanner instead of being silently skipped. | — |
 | **WIN-46** | Invite management: links, expiry, pending list, revoke | REQ-026 |
 | **WIN-47** | Rich profile fields — avatar, email, timezone, title | REQ-240 |
 | **WIN-48** | Webhook reveal / rotate / enable-disable | No such ops; only create/list/delete exist |
@@ -182,14 +182,16 @@ credential store), WIN-57 (unblocked by WIN-29), and WIN-59.
 **Everything still open is §3, and every one of them is blocked on a server
 feature that does not exist.** Not "hard" — absent: there is no rename op
 (REQ-036), no topic column (REQ-034), no archive flag (REQ-035), no search
-cursor on the wire, no per-user mute storage (REQ-137), no mention semantics
-(REQ-221), no pins (REQ-230), no permalinks (REQ-232). Each needs its REQ built
-in the daemon first; none is startable in this client. §4 remains deliberately
-out of scope.
+cursor on the wire, no per-user mute storage (REQ-137), no pins (REQ-230), no
+permalinks (REQ-232). Each needs its REQ built in the daemon first; none is
+startable in this client. §4 remains deliberately out of scope.
 
-**So the next move is not in this document.** Picking up WIN-42, WIN-45 or
-WIN-49 means implementing REQ-230, REQ-221 or REQ-139 in the daemon; the Win32
-work that follows is small by comparison. The exception is WIN-48, which needs
+**WIN-45 is the proof of that pattern, now closed:** REQ-221 was built in the
+daemon first (migration 0021 plus a scanner in `shared/` that both sides link),
+and the Win32 half — highlight, row tint, notify level — was a fraction of the
+work. **So the next move is still not in this document.** Picking up WIN-42 or
+WIN-49 means implementing REQ-230 or REQ-139 in the daemon; the Win32 work that
+follows is small by comparison. The exception is WIN-48, which needs
 only a `created_at` field on `WEBHOOK_LIST` plus reveal/rotate ops — the
 cheapest remaining unblock.
 

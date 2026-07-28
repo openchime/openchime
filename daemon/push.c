@@ -324,8 +324,18 @@ int oc_push_dnd_active(int enabled, int start_min, int end_min, int now_min) {
 }
 
 int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
-                    int now_min, oc_push_target *out, int max) {
+                    uint64_t message_id, int now_min, oc_push_target *out, int max) {
     sqlite3_stmt *st = NULL;
+    /* Level ALL (0) always; level MENTIONS (1) only when this message actually
+     * names the recipient — the deferred half of ARCH-72, which waited on
+     * REQ-221 because there was no way to answer "does it mention me".
+     *
+     * A broadcast (@here/@channel/@everyone) counts for everyone. @here means
+     * "people around right now", but presence lives in the net thread's memory,
+     * not the database, and the push worker holds its own read-only connection
+     * (ARCH-66) — so for the PUSH decision all three broadcasts are treated
+     * alike. Recorded rather than silently approximated: the cost is that
+     * @here may push someone who was already looking. */
     if (sqlite3_prepare_v2(db,
             "SELECT dt.platform, dt.token, u.dnd_enabled, u.dnd_start_min, u.dnd_end_min "
             "FROM channel_members cm "
@@ -333,12 +343,17 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
             "JOIN users u ON u.id = cm.user_id "
             "LEFT JOIN notification_prefs np "
             "  ON np.user_id = cm.user_id AND np.channel_id = cm.channel_id "
-            "WHERE cm.channel_id = ?1 AND cm.user_id <> ?2 "
-            "  AND u.disabled = 0 AND COALESCE(np.level, 0) = 0;", -1, &st, NULL) != SQLITE_OK) {
+            "WHERE cm.channel_id = ?1 AND cm.user_id <> ?2 AND u.disabled = 0 "
+            "  AND ( COALESCE(np.level, 0) = 0 "
+            "        OR ( COALESCE(np.level, 0) = 1 AND ?3 <> 0 AND EXISTS ("
+            "               SELECT 1 FROM mentions mn WHERE mn.message_id = ?3 "
+            "                 AND (mn.user_id = cm.user_id OR mn.kind <> 0)) ) );",
+            -1, &st, NULL) != SQLITE_OK) {
         return 0;
     }
     sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)author_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)message_id);
 
     int n = 0;
     while (n < max && sqlite3_step(st) == SQLITE_ROW) {
@@ -423,6 +438,7 @@ int oc_push_build_body(uint64_t channel_id, const oc_push_target *targets, int n
 typedef struct pnode {
     uint64_t channel_id;
     uint64_t author_id;
+    uint64_t message_id;   /* what makes the MENTIONS level answerable */
     struct pnode *next;
 } pnode;
 
@@ -447,12 +463,14 @@ static void prune_cb(void *ud, const char *token) {
     oc_dbwriter_prune_device_token(p->dbw, token);
 }
 
-static void do_notify(oc_push *p, uint64_t channel_id, uint64_t author_id) {
+static void do_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
+                      uint64_t message_id) {
     time_t nowsec = time(NULL);
     int now_min = (int)((nowsec / 60) % 1440);      /* minutes-of-day UTC */
 
     oc_push_target targets[OC_PUSH_MAX_TARGETS];
-    int n = oc_push_collect(p->rdb, channel_id, author_id, now_min, targets, OC_PUSH_MAX_TARGETS);
+    int n = oc_push_collect(p->rdb, channel_id, author_id, message_id, now_min,
+                            targets, OC_PUSH_MAX_TARGETS);
     if (n <= 0) return;
 
     size_t cap = (size_t)n * (OC_DEVICE_TOKEN_MAX + 96) + 64;
@@ -486,7 +504,7 @@ static void *worker(void *arg) {
         p->qlen--;
         pthread_mutex_unlock(&p->mu);
 
-        do_notify(p, node->channel_id, node->author_id);
+        do_notify(p, node->channel_id, node->author_id, node->message_id);
         free(node);
     }
     return NULL;
@@ -528,7 +546,8 @@ fail:
     return NULL;
 }
 
-void oc_push_notify(oc_push *p, uint64_t channel_id, uint64_t author_id) {
+void oc_push_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
+                    uint64_t message_id) {
     if (!p) return;
     pthread_mutex_lock(&p->mu);
     if (p->stopping || p->qlen >= OC_PUSH_MAX_QUEUE) { pthread_mutex_unlock(&p->mu); return; }
@@ -536,6 +555,7 @@ void oc_push_notify(oc_push *p, uint64_t channel_id, uint64_t author_id) {
     if (!node) { pthread_mutex_unlock(&p->mu); return; }
     node->channel_id = channel_id;
     node->author_id = author_id;
+    node->message_id = message_id;
     if (p->tail) p->tail->next = node; else p->head = node;
     p->tail = node;
     p->qlen++;

@@ -8,6 +8,7 @@
 #include "protocol.h"
 #include "issuer.h"
 #include "check.h"
+#include "mention.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -50,7 +51,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 20);
+    CHECK(oc_schema_version(db) == 21);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -384,6 +385,110 @@ static void test_history_paging(void) {
     r = history(w, outsider, 4242, 0, 10);
     CHECK(r && r->n_replay == 0);
     oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* @mentions resolved and stored on send (REQ-221, ARCH-89). The scanner itself
+ * is covered in test_mention; this is about RESOLUTION — which names become
+ * rows, which do not, and why. */
+static int mention_rows(const char *path, uint64_t mid, uint64_t user_id, int kind) {
+    sqlite3 *raw = NULL;
+    if (sqlite3_open(path, &raw) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(raw,
+        "SELECT COUNT(*) FROM mentions WHERE message_id=?1 "
+        "  AND (?2 = 0 OR user_id = ?2) AND (?3 < 0 OR kind = ?3);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
+    sqlite3_bind_int(st, 3, kind);
+    int n = (sqlite3_step(st) == SQLITE_ROW) ? sqlite3_column_int(st, 0) : -1;
+    sqlite3_finalize(st);
+    sqlite3_close(raw);
+    return n;
+}
+
+static oc_dbres *create_channel(oc_dbwriter *w, uint64_t uid, const char *name,
+                                uint8_t is_public);   /* fwd */
+
+static void test_mentions_stored(void) {
+    const char *path = "build/test_dbwriter_mentions.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t alice = reg(w, "alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "bob",   "pw", OC_ROLE_MEMBER);
+    uint64_t carol = reg(w, "carol", "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob && carol);
+
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0xA1, sizeof idem);
+    uint64_t m1 = send_msg(w, alice, idem, "hey @bob can you look");
+    CHECK(m1 != 0);
+    CHECK(mention_rows(path, m1, bob, OC_MENTION_USER) == 1);
+    CHECK(mention_rows(path, m1, 0, -1) == 1);            /* exactly one, not a stray */
+
+    /* Case-insensitive, and the author may mention themselves (the notify path
+     * excludes the author separately — that is not the scanner's job). */
+    memset(idem, 0xA2, sizeof idem);
+    uint64_t m2 = send_msg(w, alice, idem, "@BOB and @alice");
+    CHECK(mention_rows(path, m2, bob, OC_MENTION_USER) == 1);
+    CHECK(mention_rows(path, m2, alice, OC_MENTION_USER) == 1);
+
+    /* A name nobody has is just text: no row, no notification, no error. */
+    memset(idem, 0xA3, sizeof idem);
+    uint64_t m3 = send_msg(w, alice, idem, "ping @nobodyhere please");
+    CHECK(mention_rows(path, m3, 0, -1) == 0);
+
+    /* An email address is not a mention — the case that would otherwise notify
+     * whoever happens to be called "example". */
+    memset(idem, 0xA4, sizeof idem);
+    uint64_t m4 = send_msg(w, alice, idem, "write to bob@example.com");
+    CHECK(mention_rows(path, m4, 0, -1) == 0);
+
+    /* Broadcasts store a row with no user, so the notify decision can expand
+     * them without re-parsing the body. */
+    memset(idem, 0xA5, sizeof idem);
+    uint64_t m5 = send_msg(w, alice, idem, "@channel standup in 5");
+    CHECK(mention_rows(path, m5, 0, OC_MENTION_CHANNEL) == 1);
+
+    /* The stored body is untouched — plain UTF-8 with the literal "@bob", so
+     * search still finds it and any client can render it without knowing about
+     * mentions at all. */
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(raw, "SELECT body FROM messages WHERE id=?1;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)m1);
+        CHECK(sqlite3_step(st) == SQLITE_ROW);
+        const void *b = sqlite3_column_blob(st, 0);
+        int bl = sqlite3_column_bytes(st, 0);
+        CHECK(bl == (int)strlen("hey @bob can you look"));
+        CHECK(b && memcmp(b, "hey @bob can you look", (size_t)bl) == 0);
+        sqlite3_finalize(st);
+        sqlite3_close(raw);
+    }
+
+    /* Someone who cannot read the channel is not mentionable there: notifying
+     * them about a message they can never open would be worse than silence. */
+    oc_dbres *r = create_channel(w, alice, "private-room", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t priv = r->channel_id;
+    oc_dbres_free(r);
+    memset(idem, 0xA6, sizeof idem);
+    oc_job *j = oc_job_new(OC_JOB_SEND, 90);
+    j->user_id = alice; j->channel_id = priv;
+    memcpy(j->idem, idem, OC_IDEM_LEN);
+    oc_job_set_body(j, "@carol are you there", strlen("@carol are you there"));
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_SEND_OK);
+    uint64_t m6 = r->message_id;
+    oc_dbres_free(r);
+    CHECK(mention_rows(path, m6, carol, OC_MENTION_USER) == 0);
 
     oc_dbwriter_stop(w);
     cleanup_db(path);
@@ -2126,6 +2231,7 @@ int run_dbwriter_tests(void) {
     test_idem_pruning();
     test_backfill();
     test_history_paging();
+    test_mentions_stored();
     test_max_users();
     return failures;
 }

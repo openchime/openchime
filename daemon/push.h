@@ -28,7 +28,8 @@ oc_push *oc_push_start(const char *db_path, oc_dbwriter *dbw,
 
 /* Enqueue a notify decision for a just-committed message. Fire-and-forget; never
  * blocks the caller (the net loop). A no-op if p is NULL. */
-void oc_push_notify(oc_push *p, uint64_t channel_id, uint64_t author_id);
+void oc_push_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
+                    uint64_t message_id);
 
 void oc_push_stop(oc_push *p);
 
@@ -43,7 +44,10 @@ typedef struct { uint8_t platform; char token[OC_DEVICE_TOKEN_MAX]; } oc_push_ta
 /* Collect push recipients for a message in channel_id from author_id: members
  * minus the author, notification level ALL (absent==ALL; MENTIONS/NONE excluded),
  * not in DND at now_min, with a device token. Fills up to `max`; returns count. */
+/* `message_id` is what makes the MENTIONS level answerable; pass 0 to mean "no
+ * particular message", which then selects only level-ALL recipients. */
 int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
+                    uint64_t message_id,
                     int now_min, oc_push_target *out, int max);
 
 /* Sign the CP-12 canonical string for `body` with the enrollment key ->

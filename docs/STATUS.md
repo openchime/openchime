@@ -85,7 +85,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 |-----|--------|-------|
 | 120 presence | ✅ | In-memory net-thread state; `SET_PRESENCE`/`PRESENCE_UPDATE` + auth-time online snapshot (ARCH-67). |
 | 121 typing indicator | ✅ | Member-scoped `TYPING`/`TYPING_UPDATE` relay; ~6s client-side expiry resolves the window (ARCH-68). |
-| 130 per-channel notification level | ✅ | `SET_NOTIFY_PREF`/`LIST_NOTIFY_PREFS` → `NOTIFY_PREFS`; server-authoritative level (all/mentions/none) in `notification_prefs` (migration 0012), synced to all the user's devices (ARCH-72). |
+| 130 per-channel notification level | ✅ | `SET_NOTIFY_PREF`/`LIST_NOTIFY_PREFS` → `NOTIFY_PREFS`; server-authoritative level (all/mentions/none) in `notification_prefs` (migration 0012), synced to all the user's devices (ARCH-72). Since REQ-221 the `mentions` level is *honoured* on the push path, not merely stored. |
 | 131 do-not-disturb schedule | ✅ | `SET_DND` stores a daily UTC minutes-of-day window on `users`; governs push, not in-app unread (ARCH-72). |
 | 132 APNs/FCM push | ✅ (daemon emitter) | **Built (ARCH-85, `daemon/push.c`):** the daemon owns a `device_tokens` registry (migration 0018, `REGISTER_DEVICE_TOKEN` frame); a committed SEND fans a notify decision to an off-hot-path worker that selects recipients (members − author, level=ALL, not DND, with a token), signs the batch with the enrollment key (a freshness-windowed request signature the gateway verifies), and POSTs a **contentless** ping to the control-plane gateway, pruning stale tokens it returns. Tested (`tests/test_push.c`, incl. a fake-gateway round-trip). APNs/FCM transport + creds are the gateway's (control-plane repo). **MENTIONS level deferred** (needs REQ-221). |
 | 133 push is a federated function | ✅ | Emitter is gated on `OPENCHIME_PUSH_URL` **and** an active enrollment (ARCH-85), so push is available in the self-hosted federated and hosted models and **absent in self-hosted stand-alone** (ARCH-76/ARCH-16). The gateway holds the project's Apple/Google credentials; the daemon never does. |
@@ -286,7 +286,8 @@ federated enrollment, and the mobile-push emitter (ARCH-85). Server-relayed audi
 **server-robustness backlog is cleared** (see Resolved above) and the capacity
 profile (REQ-210/211) is benchmarked ([BENCHMARK.md](./BENCHMARK.md)). What remains
 on the daemon is not hardening but the follow-ups noted per-REQ above (e.g. the
-webhook CA cert REQ-171, the MENTIONS push level pending REQ-221).
+webhook CA cert REQ-171). The MENTIONS push level is no longer pending — REQ-221
+closed it.
 
 The **client** is a shared, frontend-agnostic **C app-core** (ARCH-74) with a
 **termbox2 + utf8proc TUI** (ARCH-75) as the reference frontend — **every engine
@@ -309,7 +310,8 @@ build order lives in that document's §5 and the [CLIENT.md](./CLIENT.md) §8 ro
 
 | REQ | Status | Notes |
 |-----|--------|-------|
-| 220–231 rich text, threads-in-place, pins, saved items | ⛔ | Forward scope; none backed by an ARCH decision yet. |
+| 221 @mentions | ✅ | **Built (ARCH-89, migration 0021):** the body stays plain UTF-8 with the literal `@name`; `shared/mention.c` is the single scanner both daemon and client link, so highlight and notify cannot drift. The daemon resolves each name against the *channel's* membership and stores `(message, user, kind, span)` in `mentions`; `@here`/`@channel`/`@everyone` are broadcasts. The Win32 client accent-colours mention spans and tints a row that names you. Limitation: `@here` is treated as a plain broadcast for push, because presence is not visible to the push worker's read-only connection (ARCH-66). |
+| 220, 222–231 rich text, threads-in-place, pins, saved items | ⛔ | Forward scope; none backed by an ARCH decision yet. |
 | 240–242 profiles, timezone, status text | ⛔ | Forward scope. |
 | 250 opt-in retention policy | ⛔ | Distinct from REQ-217's max attachment age (built) — 250 also ages out *messages*, which nothing does today. Still `[needs ARCH decision]`. |
 | 251 audit log | ✅ | **Built** (ARCH-79, migration 0016): four families — admin, account, security, moderation — recorded on the writer, read via `AUDIT_QUERY`/`AUDIT_PAGE` (0x0099/0x009A) and the TUI's Audit log action (Ctrl+K → Audit log), owner/admin gated against the user's *current* role. Never records the secret involved. Verified live: role change, invite, and password change all appear with the acting user, and a member promoted mid-session immediately gains access. |
@@ -344,11 +346,11 @@ CLIENT_GAP_ANALYSIS.md §5 and the CLIENT.md §8 roadmap, not here.
 | 073 configurable quick reactions | 🔵 ⛔ | Reactions built (REQ-070); quick-set is a per-user client pref, unbuilt. |
 | 122 surface DND/OOO/custom-status in presence | ⛔ | Presence built (REQ-120); status not projected into it. |
 | 134 global (default) notification level | ⛔ | Per-channel level built (REQ-130); no workspace default. |
-| 135 keyword / priority-people alerts | ⛔ | Depends on the mention→notify path (REQ-221, unbuilt). |
+| 135 keyword / priority-people alerts | ⛔ | The mention→notify path it extends is now built (REQ-221/ARCH-89); keyword and priority-people matching itself is not. |
 | 136 notification schedule / quiet hours | ⛔ | Single daily DND window built (REQ-131); richer schedule unbuilt. |
 | 137 mute channel/DM (suppress + de-emphasize) | ⛔ | Distinct from level=none; sidebar de-emphasis + unread exclusion unbuilt. |
 | 138 OS toast + sounds + badges | 🔵 ⛔ | Per-client rendering of the notify decision (ARCH-72); no client does OS toast yet. |
-| 139 activity feed / notification inbox | ⛔ | No aggregated mentions/reactions/replies view in any client. |
+| 139 activity feed / notification inbox | ⛔ | No aggregated view in any client. Migration 0021 now indexes mentions by user, so the mentions half has a query behind it. |
 | 142 inline image/thumbnail rendering | 🔵 ⛔ | Graphical-frontend only (TUI exempt, ARCH-75); Win32 shows attachment lines only. |
 | 143 files browser (channel Files tab) | ⛔ | Attachment metadata exists (migration 0009); no files-listing view. |
 | 176 third-party API / SDK | ⛔ | No public programmatic surface; wire is the custom binary protocol (ARCH-6). |

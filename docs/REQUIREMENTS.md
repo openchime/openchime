@@ -903,14 +903,16 @@ None are yet backed by an architecture decision.*
   in-band, so no schema change is required, and a client that does not render a
   construct has shown its literal source legibly. **[needs ARCH decision — the
   markup dialect + whether it is parsed server-side or purely client-side.]**
-- **REQ-221.** A message has been able to **@mention** a user or channel, and the
-  broadcast audiences `@here` / `@channel` / `@everyone`. A mention has been
-  stored as a stable reference (user/channel id) that survives display-name
-  changes, has highlighted for the mentioned party, and has driven notification
-  delivery under the recipient's per-channel level (REQ-130) — the "mentions"
-  notification level *depends* on this feature. **[needs ARCH decision — mention
-  encoding in the body + resolution, and the mention→notify decision, which is
-  the deferred half of ARCH-72.]**
+- **REQ-221.** A message has been able to **@mention** a user, and the broadcast
+  audiences `@here` / `@channel` / `@everyone`. A mention has been stored as a
+  stable reference (user id) that survives display-name changes, has highlighted
+  for the mentioned party, and has driven notification delivery under the
+  recipient's per-channel level (REQ-130) — the "mentions" notification level
+  *depends* on this feature. **Built (ARCH-89):** the body stays plain UTF-8 with
+  the literal `@name`; migration 0021's `mentions` table carries the resolved id,
+  kind and byte span; `shared/mention.c` is the one scanner both sides link, so
+  highlight and notify cannot disagree. Known limitation: `@here` is treated as a
+  broadcast for *push*, because presence is not visible to the push worker.
 - **REQ-222.** A URL in a message has optionally been **unfurled** into a preview
   (title, description, thumbnail) fetched from the linked page. The fetch has been
   performed **server-side by the daemon or an isolated helper** — never by pushing

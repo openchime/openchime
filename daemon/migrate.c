@@ -411,6 +411,30 @@ static const char MIGRATION_0020[] =
      * because a DM legitimately has a NULL name. */
     "CREATE UNIQUE INDEX idx_channels_name ON channels(lower(name)) WHERE kind='channel';";
 
+static const char MIGRATION_0021[] =
+    /* Resolved @mentions, one row per (message, target). The BODY still holds
+     * the literal "@alice" — plain UTF-8 (REQ-054), so FTS5 still matches a
+     * search for the name and a webhook or log line stays readable. This table
+     * is the STABLE reference REQ-221 asks for: an id that survives a display
+     * name change, alongside the byte span so a client can re-render the
+     * current name over the original text.
+     *
+     * channel_id is denormalised from the message on purpose: the mentions
+     * feed (REQ-139) filters by what the reader can see, and doing that without
+     * joining messages keeps the hot query to one index. */
+    "CREATE TABLE mentions ("
+    "  message_id    INTEGER NOT NULL REFERENCES messages(id),"
+    "  channel_id    INTEGER NOT NULL REFERENCES channels(id),"
+    "  user_id       INTEGER REFERENCES users(id),"   /* NULL for a broadcast */
+    "  kind          INTEGER NOT NULL,"               /* 0 user, 1 here, 2 channel, 3 everyone */
+    "  span_start    INTEGER NOT NULL,"
+    "  span_len      INTEGER NOT NULL,"
+    "  created_at_ms INTEGER NOT NULL"
+    ");"
+    "CREATE INDEX idx_mentions_user ON mentions(user_id, message_id);"
+    "CREATE INDEX idx_mentions_msg  ON mentions(message_id);"
+    "CREATE INDEX idx_mentions_chan ON mentions(channel_id, message_id);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -432,6 +456,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 18, MIGRATION_0018 },
     { 19, MIGRATION_0019 },
     { 20, MIGRATION_0020 },
+    { 21, MIGRATION_0021 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

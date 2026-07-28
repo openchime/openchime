@@ -38,6 +38,7 @@
 #include "secret_os.h"
 #include "model.h"
 #include "complete.h"   /* shared @user / #channel / :emoji: completion */
+#include "mention.h"    /* the same @mention scanner the daemon resolves with */
 #include "resolve.h"
 #include "store.h"            /* peek a stored session token (skip the login box) */
 #include "oc_port.h"          /* oc_mkdir, oc_localtime_r */
@@ -221,6 +222,7 @@ static IDWriteFactory        *g_dwrite;
 static ID2D1HwndRenderTarget *g_rt;
 static ID2D1SolidColorBrush  *g_brush;      /* one reusable brush; recolored per draw */
 static ID2D1SolidColorBrush  *g_brush2;     /* faint brush for inline "(edited)" effect */
+static ID2D1SolidColorBrush  *g_brush3;     /* accent brush for @mention spans */
 
 static IDWriteTextFormat *g_hdr;    /* channel title */
 static IDWriteTextFormat *g_name;   /* message author (semibold) */
@@ -1074,6 +1076,8 @@ static void d2d_ensure_rt(HWND hwnd) {
         ID2D1RenderTarget_CreateSolidColorBrush((ID2D1RenderTarget *)g_rt, &white, NULL, &g_brush);
         D2D1_COLOR_F faint = col(OC_COL_FAINT);
         ID2D1RenderTarget_CreateSolidColorBrush((ID2D1RenderTarget *)g_rt, &faint, NULL, &g_brush2);
+        D2D1_COLOR_F acc = col(OC_COL_ACCENT);
+        ID2D1RenderTarget_CreateSolidColorBrush((ID2D1RenderTarget *)g_rt, &acc, NULL, &g_brush3);
     }
 }
 
@@ -1640,6 +1644,27 @@ static IDWriteTextLayout *body_layout(const oc_msg *msg, float cw, UINT32 *wlen)
         DWRITE_TEXT_RANGE tr = { edit_at, edit_len };
         IDWriteTextLayout_SetDrawingEffect(layout, (IUnknown *)g_brush2, tr);
     }
+    /* Mark the @mentions (REQ-221). The scanner is the one the daemon resolves
+     * with, so what is highlighted is exactly what the server acted on — a
+     * second implementation would drift and nobody could tell which was right.
+     * Spans arrive as BYTE offsets into UTF-8 and the layout indexes UTF-16, so
+     * each is re-measured rather than assumed equal. */
+    if (layout && !msg->deleted && g_brush3) {
+        const char *utf8 = body_text(msg);
+        size_t blen = utf8 ? strlen(utf8) : 0;
+        oc_mention mm[OC_MENTION_MAX];
+        size_t nm = oc_mention_scan(utf8, blen, mm, OC_MENTION_MAX);
+        if (nm > OC_MENTION_MAX) nm = OC_MENTION_MAX;
+        for (size_t i = 0; i < nm; i++) {
+            int u16_start = MultiByteToWideChar(CP_UTF8, 0, utf8, (int)mm[i].start, NULL, 0);
+            int u16_len   = MultiByteToWideChar(CP_UTF8, 0, utf8 + mm[i].start,
+                                                (int)mm[i].len, NULL, 0);
+            if (u16_start < 0 || u16_len <= 0) continue;
+            DWRITE_TEXT_RANGE tr = { (UINT32)u16_start, (UINT32)u16_len };
+            IDWriteTextLayout_SetDrawingEffect(layout, (IUnknown *)g_brush3, tr);
+            IDWriteTextLayout_SetFontWeight(layout, DWRITE_FONT_WEIGHT_SEMI_BOLD, tr);
+        }
+    }
     return layout;
 }
 
@@ -2014,6 +2039,20 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
             /* Hover highlight behind the whole row (main transcript only). */
             if (capture && !g_selecting && g_hover_mid == msgs[first + i].message_id)
                 fill(rt, rf(reg.left, y, reg.right, y + heights[i]), OC_COL_HOVER);
+            /* A message that names YOU gets the row tinted, which is the
+             * "highlighted for the mentioned party" half of REQ-221 — a
+             * coloured word alone is easy to scroll past. Same scanner as the
+             * notification, so the two always agree about what counted. */
+            if (capture && !msgs[first + i].deleted && msgs[first + i].body) {
+                const char *me = oc_model_user_name(m, m->user_id);
+                if (msgs[first + i].author_id != m->user_id &&
+                    oc_mention_targets(msgs[first + i].body,
+                                       strlen(msgs[first + i].body), me)) {
+                    D2D1_RECT_F mr = rf(reg.left, y, reg.right, y + heights[i]);
+                    ID2D1RenderTarget_FillRectangle(rt, &mr, paint_alpha(OC_COL_ACCENT, 0.10f));
+                    fill(rt, rf(reg.left, y, reg.left + 3, y + heights[i]), OC_COL_ACCENT);
+                }
+            }
             /* Jump flash — fades out so it reads as "here it is", not as state. */
             if (capture && g_flash_mid == msgs[first + i].message_id) {
                 ULONGLONG now = GetTickCount64();
@@ -3557,6 +3596,12 @@ static void paint(HWND hwnd) {
     float W = DIPF(rc.right - rc.left), H = DIPF(rc.bottom - rc.top);
     const oc_model *m = model();
 
+    /* Both are created with the target but coloured from the theme, which can
+     * change without the target being recreated. Cheaper to re-set them each
+     * frame than to remember every place a theme switch can happen. */
+    if (g_brush2) { D2D1_COLOR_F c2 = col(OC_COL_FAINT);  ID2D1SolidColorBrush_SetColor(g_brush2, &c2); }
+    if (g_brush3) { D2D1_COLOR_F c3 = col(OC_COL_ACCENT); ID2D1SolidColorBrush_SetColor(g_brush3, &c3); }
+
     ID2D1RenderTarget_BeginDraw(rt);
     render_scene(rt, m, W, H);
     /* Boxes placed against chrome the scene just measured, so they can only be
@@ -3589,6 +3634,7 @@ static void paint(HWND hwnd) {
         thumbs_drop();   /* the bitmaps belong to the target that just died */
         if (g_brush) { ID2D1SolidColorBrush_Release(g_brush); g_brush = NULL; }
         if (g_brush2) { ID2D1SolidColorBrush_Release(g_brush2); g_brush2 = NULL; }
+        if (g_brush3) { ID2D1SolidColorBrush_Release(g_brush3); g_brush3 = NULL; }
         ID2D1HwndRenderTarget_Release(g_rt);
         g_rt = NULL;
     }
@@ -6055,11 +6101,15 @@ static int test_shot(HWND hwnd, const char *path) {
             ID2D1DCRenderTarget_BindDC(dcrt, mem, &bind);
             ID2D1RenderTarget *rt = (ID2D1RenderTarget *)dcrt;
             /* Brushes are RT-specific; swap the globals to ones on this RT. */
-            ID2D1SolidColorBrush *sb = g_brush, *sb2 = g_brush2;
+            ID2D1SolidColorBrush *sb = g_brush, *sb2 = g_brush2, *sb3 = g_brush3;
             D2D1_COLOR_F white = col(0xFFFFFF), faint = col(OC_COL_FAINT);
-            g_brush = NULL; g_brush2 = NULL;
+            D2D1_COLOR_F acc = col(OC_COL_ACCENT);
+            g_brush = NULL; g_brush2 = NULL; g_brush3 = NULL;
             ID2D1RenderTarget_CreateSolidColorBrush(rt, &white, NULL, &g_brush);
             ID2D1RenderTarget_CreateSolidColorBrush(rt, &faint, NULL, &g_brush2);
+            /* g_brush3 too, or the mention spans carry a brush from the window's
+             * target into this one and the whole frame fails to draw. */
+            ID2D1RenderTarget_CreateSolidColorBrush(rt, &acc, NULL, &g_brush3);
             ID2D1RenderTarget_BeginDraw(rt);
             g_thumbs_off = 1;
             render_scene(rt, model(), DIPF(w), DIPF(h));
@@ -6067,7 +6117,8 @@ static int test_shot(HWND hwnd, const char *path) {
             if (SUCCEEDED(ID2D1RenderTarget_EndDraw(rt, NULL, NULL))) ok = 1;
             if (g_brush) ID2D1SolidColorBrush_Release(g_brush);
             if (g_brush2) ID2D1SolidColorBrush_Release(g_brush2);
-            g_brush = sb; g_brush2 = sb2;
+            if (g_brush3) ID2D1SolidColorBrush_Release(g_brush3);
+            g_brush = sb; g_brush2 = sb2; g_brush3 = sb3;
             ID2D1DCRenderTarget_Release(dcrt);
             GdiFlush();
             if (ok) ok = write_bmp(path, w, h, bits);
@@ -6235,6 +6286,7 @@ static void test_poll(HWND hwnd) {
             g_dpi = (UINT)d;
             if (g_brush)  { ID2D1SolidColorBrush_Release(g_brush);  g_brush = NULL; }
             if (g_brush2) { ID2D1SolidColorBrush_Release(g_brush2); g_brush2 = NULL; }
+        if (g_brush3) { ID2D1SolidColorBrush_Release(g_brush3); g_brush3 = NULL; }
             thumbs_drop();
             if (g_rt) { ID2D1HwndRenderTarget_Release(g_rt); g_rt = NULL; }
             layout_composer(hwnd);
@@ -6411,10 +6463,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (!g_notify_primed || c->high_water <= prev) continue;
                     if (fg && is_active && c->channel_id == g_sel) continue;   /* you are reading it */
                     if (quiet) continue;
-                    /* MENTIONS is treated as "nothing yet": real @mention
-                     * semantics are REQ-221 / WIN-45, and guessing here would
-                     * mean notifying for things that are not mentions. */
-                    if (c->notify_level != OC_NOTIFY_ALL) continue;
+                    /* MENTIONS now has an answer (REQ-221): the same scanner
+                     * the daemon resolves with, so the toast a client raises and
+                     * the push the server sends agree by construction. */
+                    if (c->notify_level == OC_NOTIFY_NONE) continue;
+                    if (c->notify_level == OC_NOTIFY_MENTIONS) {
+                        const oc_msg *lm = c->n_msgs ? &c->msgs[c->n_msgs - 1] : NULL;
+                        const char *me = oc_model_user_name(wm, wm->user_id);
+                        if (!lm || !lm->body ||
+                            !oc_mention_targets(lm->body, strlen(lm->body), me))
+                            continue;
+                    }
 
                     const oc_msg *last = c->n_msgs ? &c->msgs[c->n_msgs - 1] : NULL;
                     if (last && last->author_id == wm->user_id) continue;   /* your own */
@@ -6591,6 +6650,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                          SWP_NOZORDER | SWP_NOACTIVATE);
         if (g_brush)  { ID2D1SolidColorBrush_Release(g_brush);  g_brush = NULL; }
         if (g_brush2) { ID2D1SolidColorBrush_Release(g_brush2); g_brush2 = NULL; }
+        if (g_brush3) { ID2D1SolidColorBrush_Release(g_brush3); g_brush3 = NULL; }
         thumbs_drop();
         if (g_rt) { ID2D1HwndRenderTarget_Release(g_rt); g_rt = NULL; }
         layout_composer(hwnd);

@@ -4,7 +4,7 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Status.** **Migrations 0001–0020 are applied.** 0001 establishes the core
+**Status.** **Migrations 0001–0021 are applied.** 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
 credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
 `users.disabled` lockout flag; **0004** (§3b) reactions; **0005** (§3c) threads;
@@ -15,7 +15,7 @@ notification preferences and the DND window; **0013** (§3k) synced client
 settings; **0014–0015** attachment tombstones and reclaim reason; **0016** (§3l)
 the audit log; **0017** (§3m) federated enrollment; **0018** (§3n) push device
 tokens; **0019** (§3o) the DM participant-set key; **0020** (§3p) the
-unique channel name.
+unique channel name; **0021** (§3q) resolved @mentions.
 
 *Corrected: an earlier revision of this line said presence, notification config,
 and attachments were "intentionally not here yet." Notification config landed in
@@ -537,6 +537,37 @@ pre-release reasoning as §3o. Deletion walks every table that references
 `channel_members`) in dependency order: a missed reference aborts the migration
 on a foreign-key constraint, which fails the daemon at boot rather than
 degrading.
+
+---
+
+## 3q. Migration 0021 — resolved @mentions (REQ-221, ARCH-89)
+
+```sql
+CREATE TABLE mentions (
+  message_id INTEGER NOT NULL REFERENCES messages(id),
+  channel_id INTEGER NOT NULL REFERENCES channels(id),
+  user_id    INTEGER REFERENCES users(id),   -- NULL for a broadcast audience
+  kind       INTEGER NOT NULL,               -- 0 user, 1 here, 2 channel, 3 everyone
+  span_start INTEGER NOT NULL,               -- byte offset of '@' in the body
+  span_len   INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL);
+```
+
+with indexes on `(user_id, message_id)` (a user's mention feed, REQ-139),
+`(message_id)` (the push gate) and `(channel_id, message_id)`.
+
+*Why a table and not a body encoding.* The body stays plain UTF-8 (REQ-054) with
+the literal `@alice`, so it remains readable in the database, in a webhook
+payload, in a log line, and to FTS5 (§3d). The resolved id — the part that must
+survive a display-name change — lives here beside it, which is what ARCH-89
+records. `user_id` is NULL for `@here`/`@channel`/`@everyone`: the audience is
+the channel's membership, which is already a table.
+
+*Rows are written by the daemon at send time*, resolving each name
+case-insensitively against `users JOIN channel_members` for that channel — a name
+that is not a member of the channel is not a mention, so nobody is notified about
+a message they cannot open. `remove_user` (REQ-025) deletes a departing user's
+mention rows before their messages, in the dependency order §3p established.
 
 ---
 
