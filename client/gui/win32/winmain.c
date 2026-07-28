@@ -77,11 +77,46 @@ enum { NAV_SWITCHER = -2, NAV_NEW = -3, NAV_PROFILE = -4, NAV_MORE = -5 };
 static const uint32_t AVPAL[6] =
     { 0x2563EB, 0x3BA55D, 0xD9A441, 0xB05CCB, 0xE0725A, 0x2FA5A5 };
 
-/* Common reactions offered by the message context menu. */
-static const char *REACT_EMO[6] = {
-    "\xF0\x9F\x91\x8D", "\xE2\x9D\xA4\xEF\xB8\x8F", "\xF0\x9F\x98\x82",
-    "\xF0\x9F\x8E\x89", "\xF0\x9F\x98\xAE", "\xF0\x9F\x98\xA2"
-};
+/* Typed modal form fields (WIN-21); form_dialog() is defined further down. */
+enum { FF_TEXT = 0, FF_PASSWORD, FF_CHECK, FF_CHOICE };
+
+typedef struct {
+    int         kind;
+    const char *label;
+    const char *hint;              /* FF_CHOICE: "a|b|c"; else an optional sub-label */
+    char        value[192];        /* in: initial; out: the result (FF_CHECK/CHOICE: "0".."n") */
+} oc_field;
+static int form_dialog(HWND owner, const char *title, oc_field *f, int n);
+
+/* The quick reactions offered inline by the message menu (WIN-28). Shortcodes,
+ * not literals, because they are stored as a preference and a shortcode is what
+ * a user can reasonably be asked to type; oc_emoji_by_name() resolves them
+ * through the same catalogue the picker uses, so an unknown name simply drops
+ * out instead of writing a broken glyph. */
+#define QUICK_DEFAULT "+1,heart,joy,tada,eyes,cry"
+static char  g_quick_names[160] = QUICK_DEFAULT;
+static const char *REACT_EMO[6];
+static int   g_n_quick;
+
+static void quick_rebuild(void) {
+    g_n_quick = 0;
+    const char *p = g_quick_names;
+    while (*p && g_n_quick < 6) {
+        char name[40]; size_t n = 0;
+        while (*p == ' ' || *p == ',') p++;
+        while (*p && *p != ',' && n + 1 < sizeof name) name[n++] = *p++;
+        name[n] = '\0';
+        while (n && name[n - 1] == ' ') name[--n] = '\0';
+        if (!n) continue;
+        const char *e = oc_emoji_by_name(name);
+        if (e) REACT_EMO[g_n_quick++] = e;
+    }
+    if (g_n_quick == 0) {          /* never leave the menu with no reactions */
+        snprintf(g_quick_names, sizeof g_quick_names, "%s", QUICK_DEFAULT);
+        const char *d[6] = { "+1", "heart", "joy", "tada", "eyes", "cry" };
+        for (int i = 0; i < 6; i++) REACT_EMO[g_n_quick++] = oc_emoji_by_name(d[i]);
+    }
+}
 
 /* ---- app state ----------------------------------------------------------- */
 
@@ -209,6 +244,27 @@ static ULONGLONG g_flash_until;
 /* Webhook-overlay row hit-boxes (row -> webhook id, for delete). */
 static struct { float top, bot; uint64_t wid; } g_webrows[64];
 static int g_n_webrows;
+
+/* Audit family filter (WIN-19): 0 = all, else the OC audit family id. */
+static int g_audit_family;
+static D2D1_RECT_F g_audit_filters[5];
+static int g_n_audit_filters;
+static uint64_t g_audit_oldest;     /* the oldest entry paged in, for load-older */
+
+/* Command palette (WIN-11). Every action on the rail and in the menus is
+ * mouse-only today; this is the same catalogue reached by keyboard, plus
+ * channel and DM quick-switch so Ctrl+K also answers "take me to X". */
+static int   g_pal_open, g_pal_sel;
+static HWND  g_pal_edit;
+static D2D1_RECT_F g_pal_panel, g_pal_box;
+/* A palette hit is either a menu command or a channel to select, never both. */
+static struct { D2D1_RECT_F r; int cmd; uint64_t cid; } g_pal_rows[12];
+static int   g_n_pal_rows;
+
+/* Notification-prefs review (WIN-12) + the shortcut sheet (WIN-25). */
+static int g_notify_open, g_keys_open;
+static struct { D2D1_RECT_F r; uint64_t cid; uint8_t level; } g_notify_hits[128];
+static int g_n_notify_hits;
 
 static int      g_show_members = 1;     /* members pane visible */
 static D2D1_RECT_F g_members_btn;       /* header toggle hit-box */
@@ -712,6 +768,8 @@ static void close_overlays(void) {
     const oc_model *mm = model();
     g_prefs_open = 0;
     g_profile_uid = 0;
+    g_notify_open = 0;
+    g_keys_open = 0;
     if (!mm) return;
     if (mm->thread_open)    oc_client_close_thread(g_client);
     if (mm->search_open)    oc_client_close_search(g_client);
@@ -722,7 +780,7 @@ static void close_overlays(void) {
 }
 
 static int any_overlay(const oc_model *m) {
-    return g_prefs_open || g_profile_uid ||
+    return g_prefs_open || g_profile_uid || g_notify_open || g_keys_open ||
            (m && (m->thread_open || m->search_open || m->reactlist_open ||
                   m->weblist_open || m->storage_open || m->audit_open));
 }
@@ -1483,6 +1541,41 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
     ID2D1RenderTarget_PopAxisAlignedClip(rt);
 }
 
+/* ---- shared overlay scrolling ---------------------------------------------
+ * Every list overlay used to stop drawing at the pane bottom, so anything past
+ * the fold was unreachable. One scroll offset serves them all: only one overlay
+ * is ever open, and switching overlays resets it. */
+static float g_ovl_scroll, g_ovl_max;
+static int   g_ovl_kind;          /* which overlay the offset belongs to */
+
+static void ovl_use(int kind) {
+    if (g_ovl_kind != kind) { g_ovl_kind = kind; g_ovl_scroll = 0; }
+}
+
+/* Clip to `body`, clamp the offset for `content_h`, and return the first row's
+ * y. Pair with ovl_end(). */
+static float ovl_begin(ID2D1RenderTarget *rt, D2D1_RECT_F body, float content_h) {
+    float visible = body.bottom - body.top;
+    g_ovl_max = content_h > visible ? content_h - visible : 0;
+    if (g_ovl_scroll > g_ovl_max) g_ovl_scroll = g_ovl_max;
+    if (g_ovl_scroll < 0) g_ovl_scroll = 0;
+    ID2D1RenderTarget_PushAxisAlignedClip(rt, &body, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    return body.top + 6 - g_ovl_scroll;
+}
+
+static void ovl_end(ID2D1RenderTarget *rt, D2D1_RECT_F body) {
+    if (g_ovl_max > 0.5f) {
+        float visible = body.bottom - body.top;
+        float track = visible - 8, thumb = visible / (visible + g_ovl_max) * track;
+        if (thumb < 30) thumb = 30;
+        float top = body.top + 4 + (g_ovl_scroll / g_ovl_max) * (track - thumb);
+        fill_round(rt, rf(body.right - 10, top, body.right - 4, top + thumb), 3.0f, OC_COL_FAINT);
+    }
+    ID2D1RenderTarget_PopAxisAlignedClip(rt);
+}
+
+enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS };
+
 /* An overlay title bar; returns the region below it for the overlay body. */
 static D2D1_RECT_F overlay_header(ID2D1RenderTarget *rt, D2D1_RECT_F reg, const char *title) {
     fill(rt, rf(reg.left, reg.top, reg.right, reg.top + 34), OC_COL_HEADER);
@@ -1615,28 +1708,57 @@ static void draw_kv(ID2D1RenderTarget *rt, D2D1_RECT_F body, float *y,
     *y += 28;
 }
 
+/* WIN-24: TUI parity plus a refresh. The TUI's version groups the numbers into
+ * Disk / Policy / Reclaimed and flags pressure and evictions in red; this was a
+ * flat key/value dump with no way to ask again. */
+static D2D1_RECT_F g_storage_refresh;
+
 static void draw_storage(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
     D2D1_RECT_F body = overlay_header(rt, reg, "Storage usage");
-    if (!m->storage_have) { overlay_empty(rt, body, "Loading…"); return; }
+
+    g_storage_refresh = rf(body.right - 116, body.top + 8, body.right - 20, body.top + 36);
+    fill_round(rt, g_storage_refresh, 6.0f, OC_COL_INPUT);
+    stroke_round(rt, g_storage_refresh, 6.0f, OC_COL_BORDER, 1.0f);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, "Refresh", g_small, g_storage_refresh, OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+    if (!m->storage_have) { overlay_empty(rt, body, "Loading\u2026"); return; }
     const oc_storage_view *s = &m->storage;
-    char v[64]; float y = body.top + 12;
-    human_bytes(s->total_bytes, v, sizeof v);   draw_kv(rt, body, &y, "Total disk", v, OC_COL_TEXT);
+    char v[96]; float y = body.top + 12;
+
+    draw_text(rt, "DISK", g_small, rf(body.left + 24, y, body.right - 20, y + 18), OC_COL_FAINT);
+    y += 22;
     human_bytes(s->avail_bytes, v, sizeof v);
-    draw_kv(rt, body, &y, "Available", v, s->under_pressure ? OC_COL_DANGER : OC_COL_TEXT);
-    human_bytes(s->attach_bytes, v, sizeof v);  draw_kv(rt, body, &y, "Attachments", v, OC_COL_TEXT);
-    snprintf(v, sizeof v, "%llu", (unsigned long long)s->attach_count);
-    draw_kv(rt, body, &y, "Attachment count", v, OC_COL_TEXT);
-    human_bytes(s->reserve_bytes, v, sizeof v);  draw_kv(rt, body, &y, "DB reserve", v, OC_COL_TEXT);
-    snprintf(v, sizeof v, "%s%s", s->evict_enabled ? "on" : "off",
-             s->max_age_days ? "" : "");
-    draw_kv(rt, body, &y, "Eviction", v, OC_COL_TEXT);
-    snprintf(v, sizeof v, "%llu orphan · %llu expired · %llu evicted",
+    char both[96]; char tot[64];
+    human_bytes(s->total_bytes, tot, sizeof tot);
+    snprintf(both, sizeof both, "%s free of %s", v, tot);
+    draw_kv(rt, body, &y, "Free", both, s->under_pressure ? OC_COL_DANGER : OC_COL_TEXT);
+    human_bytes(s->attach_bytes, v, sizeof v);
+    snprintf(both, sizeof both, "%llu file(s), %s", (unsigned long long)s->attach_count, v);
+    draw_kv(rt, body, &y, "Attachments", both, OC_COL_TEXT);
+    if (s->under_pressure)
+        draw_kv(rt, body, &y, "State", "under pressure \u2014 uploads may be refused", OC_COL_DANGER);
+
+    y += 10;
+    draw_text(rt, "POLICY", g_small, rf(body.left + 24, y, body.right - 20, y + 18), OC_COL_FAINT);
+    y += 22;
+    if (s->max_age_days) snprintf(v, sizeof v, "expire after %llu day(s)", (unsigned long long)s->max_age_days);
+    else                 snprintf(v, sizeof v, "kept indefinitely");
+    draw_kv(rt, body, &y, "Attachments", v, OC_COL_TEXT);
+    draw_kv(rt, body, &y, "Eviction under pressure",
+            s->evict_enabled ? "on (oldest first)" : "off", OC_COL_TEXT);
+    human_bytes(s->reserve_bytes, v, sizeof v);
+    draw_kv(rt, body, &y, "Database reserve", v, OC_COL_TEXT);
+
+    y += 10;
+    draw_text(rt, "RECLAIMED SO FAR", g_small, rf(body.left + 24, y, body.right - 20, y + 18), OC_COL_FAINT);
+    y += 22;
+    snprintf(v, sizeof v, "%llu abandoned \u00b7 %llu expired \u00b7 %llu evicted",
              (unsigned long long)s->rec_orphan, (unsigned long long)s->rec_expired,
              (unsigned long long)s->rec_evicted);
-    draw_kv(rt, body, &y, "Reclaimed", v, OC_COL_TEXT);
-    if (s->under_pressure)
-        draw_text(rt, "⚠ Under storage pressure — uploads may be refused.", g_ui,
-                  rf(body.left + 24, y + 6, body.right - 20, y + 34), OC_COL_DANGER);
+    /* Evictions are the destructive reclaims — flagged once any have happened. */
+    draw_kv(rt, body, &y, "Attachments", v, s->rec_evicted ? OC_COL_DANGER : OC_COL_TEXT);
 }
 
 static const char *audit_family(uint8_t f) {
@@ -1645,11 +1767,40 @@ static const char *audit_family(uint8_t f) {
 
 static void draw_audit(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
     D2D1_RECT_F body = overlay_header(rt, reg, "Audit log");
+    ovl_use(OVL_AUDIT);
     if (m->n_audit == 0) { overlay_empty(rt, body, "No audit entries."); return; }
-    ID2D1RenderTarget_PushAxisAlignedClip(rt, &body, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-    float y = body.top + 6, rowh = 46;
-    for (size_t i = 0; i < m->n_audit && y < body.bottom; i++) {
+
+    /* Family filter (WIN-19). Client-side over what has been paged in, which is
+     * honest: it narrows what you are looking at, it does not re-query. */
+    static const char *FAMS[5] = { "All", "Admin", "Account", "Security", "Moderation" };
+    float fx = body.left + 20;
+    g_n_audit_filters = 0;
+    for (int f = 0; f < 5; f++) {
+        float fw = text_width(FAMS[f], g_small) + 22;
+        D2D1_RECT_F b = rf(fx, body.top + 6, fx + fw, body.top + 30);
+        int on = (g_audit_family == f);
+        fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
+        if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, FAMS[f], g_small, b, on ? 0xFFFFFF : OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        if (g_n_audit_filters < 5) g_audit_filters[g_n_audit_filters++] = b;
+        fx += fw + 6;
+    }
+    body.top += 36;
+
+    size_t shown = 0;
+    for (size_t i = 0; i < m->n_audit; i++)
+        if (!g_audit_family || m->audit[i].family == g_audit_family) shown++;
+    if (shown == 0) { overlay_empty(rt, body, "Nothing in that category yet."); return; }
+
+    float rowh = 46;
+    float y = ovl_begin(rt, body, (float)shown * rowh + 34);
+    for (size_t i = 0; i < m->n_audit; i++) {
         const oc_audit_view *a = &m->audit[i];
+        if (g_audit_family && a->family != g_audit_family) continue;
+        if (y + rowh < body.top) { y += rowh; continue; }
+        if (y > body.bottom) break;
         char when[20] = "";
         if (a->at_ms) { time_t t = (time_t)(a->at_ms / 1000); struct tm tv;
             if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%Y-%m-%d %H:%M", &tv); }
@@ -1666,7 +1817,12 @@ static void draw_audit(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
         fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 20, y + rowh), OC_COL_BORDER);
         y += rowh;
     }
-    ID2D1RenderTarget_PopAxisAlignedClip(rt);
+    /* Scrolling to the bottom pages older entries: the frame is timestamp-cursor
+     * paged, but oc_client_audit_query(c, 0) was called once and never again. */
+    if (g_ovl_max > 0.5f && g_ovl_scroll >= g_ovl_max - 1.0f)
+        draw_text(rt, "Loading older entries\u2026", g_small,
+                  rf(body.left + 20, y + 4, body.right - 20, y + 26), OC_COL_FAINT);
+    ovl_end(rt, body);
 }
 
 static void draw_weblist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
@@ -1679,21 +1835,121 @@ static void draw_weblist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
         overlay_empty(rt, body, "No webhooks. Right-click the channel → Create webhook.");
         return;
     }
-    draw_text(rt, "Click a webhook to delete it.", g_small,
+    draw_text(rt, "Click a webhook to delete it \u2014 you will be asked to confirm.", g_small,
               rf(body.left + 20, body.top + 4, body.right - 16, body.top + 24), OC_COL_FAINT);
-    float y = body.top + 28;
-    for (size_t i = 0; i < m->n_webhooks && y < body.bottom; i++) {
+    body.top += 28;
+    ovl_use(OVL_WEB);
+    float rowh = 40;
+    float y = ovl_begin(rt, body, (float)m->n_webhooks * rowh);
+    for (size_t i = 0; i < m->n_webhooks; i++) {
         const oc_webhook_view *wv = &m->webhooks[i];
-        char row[160];
-        snprintf(row, sizeof row, "%s%s", wv->label, wv->disabled ? "  (disabled)" : "");
-        draw_text(rt, row, g_ui, rf(body.left + 20, y, body.right - 16, y + 30),
+        if (y + rowh < body.top) { y += rowh; continue; }
+        if (y > body.bottom) break;
+        draw_text(rt, wv->label, g_ui, rf(body.left + 20, y, body.right - 120, y + 24),
                   wv->disabled ? OC_COL_MUTED : OC_COL_TEXT);
+        /* State as a chip rather than a "(disabled)" suffix, so an enabled hook
+         * is positively marked instead of merely lacking a word. */
+        const char *st = wv->disabled ? "disabled" : "active";
+        float cw = text_width(st, g_small) + 18;
+        D2D1_RECT_F chip = rf(body.right - 24 - cw, y + 2, body.right - 24, y + 24);
+        fill_round(rt, chip, 10.0f, OC_COL_INPUT);
+        stroke_round(rt, chip, 10.0f, wv->disabled ? OC_COL_BORDER : OC_COL_ONLINE, 1.0f);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, st, g_small, chip, wv->disabled ? OC_COL_FAINT : OC_COL_ONLINE);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        /* No created-date column: WEBHOOK_LIST carries id/channel/label/disabled
+         * and nothing else, so there is no date to show without a wire change. */
+        fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 20, y + rowh), OC_COL_BORDER);
         if (g_n_webrows < (int)(sizeof g_webrows / sizeof g_webrows[0])) {
-            g_webrows[g_n_webrows].top = y; g_webrows[g_n_webrows].bot = y + 30;
+            g_webrows[g_n_webrows].top = y; g_webrows[g_n_webrows].bot = y + rowh;
             g_webrows[g_n_webrows].wid = wv->webhook_id; g_n_webrows++;
         }
-        y += 32;
+        y += rowh;
     }
+    ovl_end(rt, body);
+}
+
+/* WIN-12: every channel's notification level, editable in place. The prefs are
+ * server-synced (REQ-130/131) and were reachable only one channel at a time from
+ * a context menu, so there was no way to review them. */
+static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    D2D1_RECT_F body = overlay_header(rt, reg, "Notifications");
+    ovl_use(OVL_NOTIFY);
+    g_n_notify_hits = 0;
+
+    char dnd[96];
+    if (m->dnd_enabled)
+        snprintf(dnd, sizeof dnd, "Do not disturb %02u:%02u \u2013 %02u:%02u",
+                 m->dnd_start_min / 60, m->dnd_start_min % 60,
+                 m->dnd_end_min / 60, m->dnd_end_min % 60);
+    else
+        snprintf(dnd, sizeof dnd, "Do not disturb is off");
+    draw_text(rt, dnd, g_small, rf(body.left + 20, body.top + 4, body.right - 20, body.top + 26),
+              m->dnd_enabled ? OC_COL_NOTICE : OC_COL_FAINT);
+    body.top += 30;
+
+    static const char *LEVELS[3] = { "All", "Mentions", "None" };
+    float rowh = 38;
+    float y = ovl_begin(rt, body, (float)m->n_channels * rowh);
+    for (size_t i = 0; i < m->n_channels; i++) {
+        const oc_channel *c = &m->channels[i];
+        if (y + rowh < body.top) { y += rowh; continue; }
+        if (y > body.bottom) break;
+        char label[128];
+        channel_label(m, c, label, sizeof label);
+        draw_text(rt, label, g_ui, rf(body.left + 20, y, body.right - 260, y + rowh), OC_COL_TEXT);
+        float bx = body.right - 24;
+        for (int L = 2; L >= 0; L--) {
+            float bw = text_width(LEVELS[L], g_small) + 20;
+            D2D1_RECT_F b = rf(bx - bw, y + 5, bx, y + 29);
+            int on = (c->notify_level == L);
+            fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
+            if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
+            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+            draw_text(rt, LEVELS[L], g_small, b, on ? 0xFFFFFF : OC_COL_MUTED);
+            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+            if (g_n_notify_hits < 128) {
+                g_notify_hits[g_n_notify_hits].r = b;
+                g_notify_hits[g_n_notify_hits].cid = c->channel_id;
+                g_notify_hits[g_n_notify_hits].level = (uint8_t)L;
+                g_n_notify_hits++;
+            }
+            bx = b.left - 6;
+        }
+        fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 20, y + rowh), OC_COL_BORDER);
+        y += rowh;
+    }
+    ovl_end(rt, body);
+}
+
+/* WIN-25: the shortcut sheet, generated from one table so it cannot drift from
+ * what the key handlers actually do. */
+static const struct { const char *keys, *what; } KEYMAP[] = {
+    { "Enter",            "Send the message" },
+    { "Shift+Enter",      "New line" },
+    { "Esc",              "Close the open pane, popover or picker" },
+    { "Tab",              "Insert the highlighted completion" },
+    { "Up / Down",        "Move through completions" },
+    { "Ctrl+K",           "Command palette" },
+    { "Ctrl+F",           "Search messages" },
+    { "Ctrl+/",           "This list" },
+    { "Mouse wheel",      "Scroll the transcript, sidebar or open pane" },
+    { "Right-click",      "Actions for a message, member or channel" },
+};
+
+static void draw_keys(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
+    D2D1_RECT_F body = overlay_header(rt, reg, "Keyboard shortcuts");
+    ovl_use(OVL_KEYS);
+    int n = (int)(sizeof KEYMAP / sizeof KEYMAP[0]);
+    float rowh = 32;
+    float y = ovl_begin(rt, body, (float)n * rowh + 12);
+    for (int i = 0; i < n; i++) {
+        if (y > body.bottom) break;
+        draw_text(rt, KEYMAP[i].keys, g_ui_b, rf(body.left + 24, y, body.left + 200, y + rowh), OC_COL_TEXT);
+        draw_text(rt, KEYMAP[i].what, g_ui, rf(body.left + 210, y, body.right - 24, y + rowh), OC_COL_MUTED);
+        y += rowh;
+    }
+    ovl_end(rt, body);
 }
 
 static void draw_reactlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
@@ -1741,7 +1997,7 @@ static float pref_row(ID2D1RenderTarget *rt, D2D1_RECT_F body, float y, int row,
     return y + 62;
 }
 
-enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP };
+enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP, PREF_ROW_QUICK };
 
 static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
     D2D1_RECT_F body = overlay_header(rt, reg, "Preferences");
@@ -1760,6 +2016,18 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
                  "Shown by default when you open a channel.", ONOFF, 2, g_pref_members);
     y = pref_row(rt, body, y, PREF_ROW_DAYSEP, "Date dividers",
                  "A separator between days in the transcript.", ONOFF, 2, g_pref_daysep);
+
+    /* WIN-28: the quick reactions were six literals in the source. */
+    {
+        static const char *EDIT1[1] = { "Change\u2026" };
+        char cur[128] = "";
+        for (int i = 0; i < g_n_quick; i++)
+            snprintf(cur + strlen(cur), sizeof cur - strlen(cur), "%s ", REACT_EMO[i]);
+        draw_text(rt, "Quick reactions", g_ui_b, rf(body.left + 24, y, body.left + 320, y + 22), OC_COL_TEXT);
+        draw_emoji_fmt(rt, "", rf(0, 0, 0, 0), g_emoji_s);      /* keep the format warm */
+        draw_text(rt, cur, g_emoji_s, rf(body.left + 24, y + 20, body.left + 340, y + 42), OC_COL_TEXT);
+        y = pref_row(rt, body, y, PREF_ROW_QUICK, "", "", EDIT1, 1, -1);
+    }
 
     draw_text(rt, "Saved to your account, so they follow you to another machine.",
               g_small, rf(body.left + 24, y + 4, body.right - 24, y + 24), OC_COL_FAINT);
@@ -1823,6 +2091,8 @@ static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
     }
     if (g_prefs_open)      { draw_prefs(rt, reg);        return; }
     if (g_profile_uid)     { draw_profile(rt, m, reg);   return; }
+    if (g_notify_open)     { draw_notify_prefs(rt, m, reg); return; }
+    if (g_keys_open)       { draw_keys(rt, reg);         return; }
     if (m->thread_open)    { draw_thread(rt, m, reg);    return; }
     if (m->search_open)    { draw_search(rt, m, reg);    return; }
     if (m->reactlist_open) { draw_reactlist(rt, m, reg); return; }
@@ -1949,6 +2219,115 @@ static float draw_banner(ID2D1RenderTarget *rt, const oc_model *m, float x0, flo
 /* Toasts, bottom-right of the window, newest nearest the composer. Drawn last so
  * nothing can hide them, and clipped to nothing else — they are the surface of
  * last resort for telling the user something failed. */
+/* One action catalogue, shared by the palette. The `cmd` values are the same
+ * menu_dispatch codes the menus use, so the palette can never offer an action
+ * the menus do not have or dispatch it differently. */
+static const struct { const char *label; int cmd; } PALETTE[] = {
+    { "Create a channel",        1  },
+    { "New direct message",      6  },
+    { "Search messages",         4  },
+    { "Upload a file",           7  },
+    { "Preferences",             70 },
+    { "Notifications",           71 },
+    { "Keyboard shortcuts",      72 },
+    { "Mark all as read",        73 },
+    { "Edit display name",       30 },
+    { "Change password",         31 },
+    { "Do not disturb",          50 },
+    { "Set yourself active",     10 },
+    { "Set yourself away",       11 },
+    { "Invite people as member", 40 },
+    { "Invite people as admin",  41 },
+    { "Storage usage",           60 },
+    { "Audit log",               61 },
+    { "Reconnect now",           2  },
+    { "Add a workspace",         80 },
+    { "Sign out",                3  },
+};
+
+/* Subsequence match, so "cp" finds "Change password" — the usual palette
+ * behaviour, and cheap enough to run over the whole catalogue every frame. */
+static int pal_match(const char *hay, const char *needle) {
+    if (!needle || !needle[0]) return 1;
+    const char *n = needle;
+    for (const char *h = hay; *h; h++) {
+        if (tolower((unsigned char)*h) == tolower((unsigned char)*n)) { n++; if (!*n) return 1; }
+    }
+    return 0;
+}
+
+static void draw_palette(ID2D1RenderTarget *rt, const oc_model *m, float W, float H) {
+    g_n_pal_rows = 0;
+    if (!g_pal_open) { g_pal_panel = rf(0, 0, 0, 0); return; }
+
+    /* Dim the app behind it: the palette takes the keyboard, and saying so is
+     * cheaper than having the user discover it by typing into nothing. */
+    D2D1_RECT_F all = rf(0, 0, W, H);
+    ID2D1RenderTarget_FillRectangle(rt, &all, paint_alpha(0x000000, 0.35f));
+
+    float pw = 520; if (pw > W - 80) pw = W - 80;
+    float px = (W - pw) / 2, py = 96;
+    float rowh = 32, maxrows = 10;
+
+    char q[64] = "";
+    if (g_pal_edit) {
+        WCHAR wq[64]; GetWindowTextW(g_pal_edit, wq, 64);
+        WideCharToMultiByte(CP_UTF8, 0, wq, -1, q, sizeof q, NULL, NULL);
+    }
+
+    /* Collect matches first so the panel can be sized to them. */
+    struct { const char *label, *kind; int cmd; uint64_t cid; } hit[12];
+    int nh = 0;
+    for (size_t i = 0; i < sizeof PALETTE / sizeof PALETTE[0] && nh < 12; i++)
+        if (pal_match(PALETTE[i].label, q)) {
+            hit[nh].label = PALETTE[i].label; hit[nh].kind = "Action";
+            hit[nh].cmd = PALETTE[i].cmd; hit[nh].cid = 0; nh++;
+        }
+    static char names[12][96];
+    if (m) for (size_t i = 0; i < m->n_channels && nh < 12; i++) {
+        channel_label(m, &m->channels[i], names[nh], sizeof names[nh]);
+        if (!pal_match(names[nh], q)) continue;
+        hit[nh].label = names[nh]; hit[nh].kind = "Go to";
+        hit[nh].cmd = 0; hit[nh].cid = m->channels[i].channel_id; nh++;
+    }
+    if (nh > (int)maxrows) nh = (int)maxrows;
+    if (g_pal_sel >= nh) g_pal_sel = nh ? nh - 1 : 0;
+    if (g_pal_sel < 0) g_pal_sel = 0;
+
+    float ph = 58 + (nh ? nh * rowh : rowh) + 10;
+    g_pal_panel = rf(px, py, px + pw, py + ph);
+    fill_round(rt, rf(px + 3, py + 5, px + pw + 3, py + ph + 5), 12.0f, 0x000000);
+    fill_round(rt, g_pal_panel, 12.0f, OC_COL_INPUT);
+    stroke_round(rt, g_pal_panel, 12.0f, OC_COL_BORDER, 1.0f);
+
+    g_pal_box = rf(px + 12, py + 12, px + pw - 12, py + 46);
+    fill_round(rt, g_pal_box, 7.0f, OC_COL_BASE);
+    draw_lucide(rt, OC_ICON_SEARCH, rf(g_pal_box.left + 9, g_pal_box.top + 9,
+                                       g_pal_box.left + 25, g_pal_box.top + 25), OC_COL_MUTED);
+
+    float y = py + 54;
+    if (nh == 0) {
+        draw_text(rt, "No matching action or conversation.", g_ui,
+                  rf(px + 20, y, px + pw - 20, y + rowh), OC_COL_FAINT);
+        return;
+    }
+    for (int i = 0; i < nh; i++) {
+        D2D1_RECT_F r = rf(px + 6, y, px + pw - 6, y + rowh);
+        if (i == g_pal_sel) fill_round(rt, r, 6.0f, OC_COL_ACCENT);
+        draw_text(rt, hit[i].label, g_ui, rf(px + 18, y, px + pw - 90, y + rowh),
+                  i == g_pal_sel ? 0xFFFFFF : OC_COL_TEXT);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        draw_text(rt, hit[i].kind, g_small, rf(px + 18, y, px + pw - 18, y + rowh),
+                  i == g_pal_sel ? 0xFFFFFF : OC_COL_FAINT);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_pal_rows[g_n_pal_rows].r = r;
+        g_pal_rows[g_n_pal_rows].cmd = hit[i].cmd;
+        g_pal_rows[g_n_pal_rows].cid = hit[i].cid;
+        g_n_pal_rows++;
+        y += rowh;
+    }
+}
+
 static void draw_toasts(ID2D1RenderTarget *rt, float W, float H) {
     /* Clear every hit-box first: in a short window the loop below stops early,
      * and a box left over from a taller frame would let a click dismiss a toast
@@ -2408,6 +2787,7 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         g_n_memrows = 0;
     }
     draw_more_flyout(rt);   /* floats over the pane when open */
+    draw_palette(rt, m, W, H);   /* the palette dims and covers the app */
     draw_menu(rt);          /* dropdown menus float on top of everything */
     draw_toasts(rt, W, H);  /* …and failure notices float above even those */
 }
@@ -2427,6 +2807,15 @@ static void paint(HWND hwnd) {
     /* Boxes placed against chrome the scene just measured, so they can only be
      * positioned after the scene is laid out. */
     layout_search(hwnd);
+    if (g_pal_edit) {
+        if (g_pal_open) {
+            ShowWindow(g_pal_edit, SW_SHOW);
+            MoveWindow(g_pal_edit, (int)(g_pal_box.left + 32), (int)(g_pal_box.top + 8),
+                       (int)(g_pal_box.right - g_pal_box.left - 44), 20, TRUE);
+        } else {
+            ShowWindow(g_pal_edit, SW_HIDE);
+        }
+    }
     if (g_pick_edit) {
         if (g_pick_open) {
             ShowWindow(g_pick_edit, SW_SHOW);
@@ -2663,6 +3052,39 @@ static void search_create(HWND parent) {
     g_srch_prev = (WNDPROC)SetWindowLongPtrW(g_srch, GWLP_WNDPROC, (LONG_PTR)srch_proc);
 }
 
+static void menu_dispatch(HWND hwnd, int cmd);   /* fwd */
+
+static void palette_close(HWND hwnd) {
+    g_pal_open = 0; g_pal_sel = 0;
+    if (g_pal_edit) ShowWindow(g_pal_edit, SW_HIDE);
+    if (g_re) SetFocus(g_re);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static void palette_open(HWND hwnd) {
+    g_pal_open = 1; g_pal_sel = 0;
+    if (g_pal_edit) {
+        SetWindowTextW(g_pal_edit, L"");
+        ShowWindow(g_pal_edit, SW_SHOW);
+        SetFocus(g_pal_edit);
+    }
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* Run the highlighted row. Closing FIRST matters: several commands open a modal
+ * form, and the palette must not still be on screen behind it. */
+static void palette_accept(HWND hwnd) {
+    if (g_pal_sel < 0 || g_pal_sel >= g_n_pal_rows) { palette_close(hwnd); return; }
+    int cmd = g_pal_rows[g_pal_sel].cmd;
+    uint64_t cid = g_pal_rows[g_pal_sel].cid;
+    palette_close(hwnd);
+    if (cid) { g_view = VIEW_HOME; close_overlays(); select_channel(cid); }
+    else if (cmd) menu_dispatch(hwnd, cmd);
+}
+
+static LRESULT CALLBACK pal_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+static WNDPROC g_pal_prev;
+
 /* Run whatever is currently in the query box. */
 static void search_submit(void) {
     if (!g_srch || !g_client) return;
@@ -2684,6 +3106,21 @@ static void search_open(HWND hwnd) {
     layout_search(hwnd);
     SetFocus(g_srch);
     InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static LRESULT CALLBACK pal_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    HWND parent = GetParent(hwnd);
+    if (msg == WM_KEYDOWN) {
+        switch (wp) {
+        case VK_ESCAPE: palette_close(parent); return 0;
+        case VK_RETURN: palette_accept(parent); return 0;
+        case VK_UP:     g_pal_sel--; InvalidateRect(parent, NULL, FALSE); return 0;
+        case VK_DOWN:   g_pal_sel++; InvalidateRect(parent, NULL, FALSE); return 0;
+        default: break;
+        }
+    }
+    if (msg == WM_CHAR && (wp == VK_RETURN || wp == VK_ESCAPE)) return 0;   /* no bell */
+    return CallWindowProcW(g_pal_prev, hwnd, msg, wp, lp);
 }
 
 static LRESULT CALLBACK srch_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -2879,7 +3316,7 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
     /* The six quick reactions stay inline as one-click affordances, with the
      * full catalogue behind "More…" (WIN-8) rather than being the only choice. */
     HMENU react = CreatePopupMenu();
-    for (int i = 0; i < 6; i++)
+    for (int i = 0; i < g_n_quick; i++)
         AppendMenuW(react, MF_STRING, (UINT_PTR)(1 + i), wmenu(REACT_EMO[i], wb, 128));
     AppendMenuW(react, MF_SEPARATOR, 0, NULL);
     AppendMenuW(react, MF_STRING, 7, L"More\u2026");
@@ -2902,7 +3339,7 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
 
     int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, sx, sy, 0, hwnd, NULL);
     DestroyMenu(menu);
-    if (cmd >= 1 && cmd <= 6) {
+    if (cmd >= 1 && cmd <= g_n_quick) {
         const char *e = REACT_EMO[cmd - 1];
         oc_client_react(g_client, g_sel, mid, e, reaction_is_mine(msg, e) ? 0 : 1);
     } else if (cmd == 7) {
@@ -2970,6 +3407,12 @@ static void prefs_save(void);          /* fwd */
 static void prefs_load(const oc_model *m);   /* fwd */
 
 static int on_click(HWND hwnd, int x, int y) {
+    if (g_pal_open) {
+        for (int i = 0; i < g_n_pal_rows; i++)
+            if (in_rect(g_pal_rows[i].r, x, y)) { g_pal_sel = i; palette_accept(hwnd); return 1; }
+        if (!in_rect(g_pal_panel, x, y)) palette_close(hwnd);
+        return 1;
+    }
     if (g_pick_open) {
         if (in_rect(g_pick_panel, x, y)) {
             for (int i = 0; i < g_n_pick_cells; i++)
@@ -2978,6 +3421,27 @@ static int on_click(HWND hwnd, int x, int y) {
         }
         picker_close(hwnd);
         return 1;
+    }
+    {
+        const oc_model *om = model();
+        if (om && om->storage_open && in_rect(g_storage_refresh, x, y)) {
+            oc_client_storage_status(g_client);
+            return 1;
+        }
+        if (om && om->audit_open) {
+            for (int i = 0; i < g_n_audit_filters; i++)
+                if (in_rect(g_audit_filters[i], x, y)) {
+                    g_audit_family = i; g_ovl_scroll = 0; return 1;
+                }
+        }
+        if (g_notify_open) {
+            for (int i = 0; i < g_n_notify_hits; i++)
+                if (in_rect(g_notify_hits[i].r, x, y)) {
+                    oc_client_set_notify_pref(g_client, g_notify_hits[i].cid,
+                                              g_notify_hits[i].level);
+                    return 1;
+                }
+        }
     }
     if (g_profile_uid && in_rect(g_prof_dm_btn, x, y)) {
         uint64_t uid = g_profile_uid;
@@ -2996,6 +3460,15 @@ static int on_click(HWND hwnd, int x, int y) {
              * restart to see is indistinguishable from one that did nothing. */
             case PREF_ROW_MEMBERS: g_pref_members = v; g_show_members = v; layout_composer(hwnd); break;
             case PREF_ROW_DAYSEP:  g_pref_daysep = v; break;
+            case PREF_ROW_QUICK: {
+                oc_field f[1] = { { FF_TEXT, "Quick reactions",
+                                    "Up to six emoji shortcodes, comma separated (e.g. +1, fire, tada).", "" } };
+                snprintf(f[0].value, sizeof f[0].value, "%s", g_quick_names);
+                if (!form_dialog(hwnd, "Quick reactions", f, 1)) return 1;
+                snprintf(g_quick_names, sizeof g_quick_names, "%s", f[0].value);
+                quick_rebuild();
+                break;
+            }
             }
             prefs_save();
             return 1;
@@ -3550,7 +4023,6 @@ static void lg_set_font(HWND w) {
     SendMessageW(w, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
 }
 
-static HWND g_pr_edit;
 static int  g_pr_result, g_pr_done;
 
 static LRESULT CALLBACK prompt_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -3573,14 +4045,8 @@ static LRESULT CALLBACK prompt_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
  * Deliberately still native Win32 controls rather than D2D chrome — these are
  * short-lived modals, and the platform's own focus, tab order and IME handling
  * are worth more here than matching the shell's palette. */
-enum { FF_TEXT = 0, FF_PASSWORD, FF_CHECK, FF_CHOICE };
-
-typedef struct {
-    int         kind;
-    const char *label;
-    const char *hint;              /* FF_CHOICE: "a|b|c"; else an optional sub-label */
-    char        value[192];        /* in: initial; out: the result (FF_CHECK/CHOICE: "0".."n") */
-} oc_field;
+/* oc_field / FF_* are declared near the top of the file so earlier code can
+ * build forms; form_dialog() itself lives here. */
 
 #define FORM_MAX_FIELDS 6
 static HWND g_ff_ctl[FORM_MAX_FIELDS][4];   /* per field: up to 4 controls (choice radios) */
@@ -3727,63 +4193,8 @@ static void show_secret(HWND owner, const char *title, const char *what,
     form_dialog(owner, title, f, 1);
 }
 
-/* Modal one-line input. Returns 1 with `out` filled on OK, 0 on Cancel. */
-static int text_prompt(HWND owner, const char *title, const char *label,
-                       const char *initial, char *out, size_t cap, int password) {
-    HINSTANCE inst = GetModuleHandleW(NULL);
-    static int registered;
-    if (!registered) {
-        WNDCLASSW wc; memset(&wc, 0, sizeof wc);
-        wc.lpfnWndProc = prompt_proc; wc.hInstance = inst;
-        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-        wc.lpszClassName = L"OcPrompt";
-        RegisterClassW(&wc); registered = 1;
-    }
-    WCHAR wtitle[128], wlabel[128], winit[512];
-    to_w(title, wtitle, 128); to_w(label, wlabel, 128); to_w(initial ? initial : "", winit, 512);
-
-    int W = 380, H = 176;
-    RECT orc; GetWindowRect(owner, &orc);
-    int sx = orc.left + ((orc.right - orc.left) - W) / 2;
-    int sy = orc.top + ((orc.bottom - orc.top) - H) / 2;
-    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"OcPrompt", wtitle,
-        WS_POPUP | WS_CAPTION | WS_SYSMENU, sx, sy, W, H, owner, NULL, inst, NULL);
-    if (!dlg) return 0;
-
-    HWND s = CreateWindowExW(0, L"STATIC", wlabel, WS_CHILD | WS_VISIBLE,
-        18, 16, 344, 20, dlg, NULL, inst, NULL);
-    lg_set_font(s);
-    g_pr_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", winit,
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | (password ? ES_PASSWORD : 0),
-        18, 42, 344, 24, dlg, NULL, inst, NULL);
-    lg_set_font(g_pr_edit);
-    HWND ok = CreateWindowExW(0, L"BUTTON", L"OK",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 178, 92, 84, 28,
-        dlg, (HMENU)IDOK, inst, NULL);
-    HWND cancel = CreateWindowExW(0, L"BUTTON", L"Cancel",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP, 272, 92, 84, 28, dlg, (HMENU)IDCANCEL, inst, NULL);
-    lg_set_font(ok); lg_set_font(cancel);
-
-    EnableWindow(owner, FALSE);
-    ShowWindow(dlg, SW_SHOW);
-    SetFocus(g_pr_edit);
-    SendMessageW(g_pr_edit, EM_SETSEL, 0, -1);
-    g_pr_result = -1; g_pr_done = 0;
-
-    MSG m;
-    while (!g_pr_done && GetMessageW(&m, NULL, 0, 0) > 0)
-        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
-
-    if (g_pr_result == 1) {
-        WCHAR w[512]; GetWindowTextW(g_pr_edit, w, 512);
-        WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL);
-    }
-    EnableWindow(owner, TRUE);
-    SetForegroundWindow(owner);
-    if (IsWindow(dlg)) DestroyWindow(dlg);
-    return g_pr_result == 1;
-}
+/* text_prompt() is gone (WIN-21): every flow that used it now has a form
+ * describing its actual shape. */
 
 /* ---- app menu (workspace avatar) + channel menu -------------------------- */
 
@@ -3825,6 +4236,9 @@ static void open_ws_menu(HWND hwnd) {
     g_n_mi = 0;
     if (admin) { mi_item(40, "Invite people as member"); mi_item(41, "Invite people as admin"); mi_sep(); }
     mi_item(70, "Preferences");
+    mi_item(71, "Notifications\u2026");
+    mi_item(73, "Mark all as read");
+    mi_item(72, "Keyboard shortcuts");
     if (admin) { mi_section("TOOLS & SETTINGS"); mi_item(60, "Storage usage"); mi_item(61, "Audit log"); }
     mi_sep();
     mi_item(2, "Reconnect now");
@@ -3871,9 +4285,9 @@ static void open_new_menu(HWND hwnd) {
  * so a terminal and a window can keep different sidebar shapes. */
 static void prefs_save(void) {
     if (!g_client) return;
-    char enc[96];
-    snprintf(enc, sizeof enc, "t:%d;h:%d;m:%d;d:%d",
-             oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep);
+    char enc[288];
+    snprintf(enc, sizeof enc, "t:%d;h:%d;m:%d;d:%d;q:%s",
+             oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep, g_quick_names);
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
 }
 
@@ -3889,6 +4303,13 @@ static void prefs_load(const oc_model *m) {
             int val = atoi(p + 2);
             if (k == 't') t = val; else if (k == 'h') h = val;
             else if (k == 'm') mm = val; else if (k == 'd') d = val;
+            else if (k == 'q') {
+                size_t n2 = 0;
+                for (const char *q = p + 2; *q && *q != ';' && n2 + 1 < sizeof g_quick_names; q++)
+                    g_quick_names[n2++] = *q;
+                g_quick_names[n2] = '\0';
+                quick_rebuild();
+            }
         }
         while (*p && *p != ';') p++;
         while (*p == ';') p++;
@@ -3984,10 +4405,16 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 3:  oc_client_logout(g_client, OC_LOGOUT_THIS); g_logging_out = 1; break;
     case 5:  oc_client_logout(g_client, OC_LOGOUT_ALL);  g_logging_out = 1; break;
     case 4:  search_open(hwnd); break;
-    case 6: { char u[64];
-        if (m && text_prompt(hwnd, "New direct message", "Username:", "", u, sizeof u, 0) && u[0]) {
-            uint64_t id = oc_model_user_id(m, u);
-            if (id) { g_view = VIEW_HOME; oc_client_open_dm(g_client, id); } } break; }
+    case 6: {
+        oc_field f[1] = { { FF_TEXT, "Username",
+                            "Who to open a direct message with.", "" } };
+        if (!m || !form_dialog(hwnd, "New direct message", f, 1) || !f[0].value[0]) break;
+        uint64_t id = oc_model_user_id(m, f[0].value);
+        /* An unknown name used to do nothing at all, which looked like a bug. */
+        if (!id) { toast_push("No such user in this workspace.", 1); break; }
+        g_view = VIEW_HOME;
+        oc_client_open_dm(g_client, id);
+        break; }
     case 7:  g_view = VIEW_HOME; upload_file(hwnd); break;
     case 10: oc_client_set_presence(g_client, OC_PRESENCE_ONLINE); break;
     case 11: oc_client_set_presence(g_client, OC_PRESENCE_AWAY); break;
@@ -4036,6 +4463,23 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         oc_client_set_dnd(g_client, 1, (uint16_t)(sh * 60 + sm), (uint16_t)(eh * 60 + em));
         break; }
     case 70: close_overlays(); g_prefs_open = 1; g_view = VIEW_HOME; break;
+    case 73: {   /* WIN-33: catch-up, as a loop over the existing CLIENT_ACK.
+                  * REQ-238 may later add a true bulk op; this needs no wire
+                  * change and the acks are cumulative per channel anyway. */
+        if (!m) break;
+        int n = 0;
+        for (size_t i = 0; i < m->n_channels; i++) {
+            const oc_channel *c = &m->channels[i];
+            if (c->high_water > c->read_marker) { oc_client_mark_read(g_client, c->channel_id); n++; }
+        }
+        char msg[64];
+        snprintf(msg, sizeof msg, n ? "Marked %d conversation%s read." : "Nothing unread.",
+                 n, n == 1 ? "" : "s");
+        toast_push(msg, 0);
+        break; }
+    case 71: close_overlays(); g_notify_open = 1; g_view = VIEW_HOME;
+             oc_client_list_notify_prefs(g_client); break;   /* WIN-12 */
+    case 72: close_overlays(); g_keys_open = 1; g_view = VIEW_HOME; break;   /* WIN-25 */
     /* "Add a workspace…" drops the current session and goes to the same sign-in
      * view the app starts on — one sign-in implementation, not two. */
     case 80: reset_session(); signin_begin(hwnd, NULL, NULL); break;
@@ -4085,9 +4529,10 @@ static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, int sx
     case 3:  oc_client_leave_channel(g_client, cid); break;
     case 4:  close_overlays(); oc_client_webhooks(g_client, cid); break;
     case 5: {
-        char label[64];
-        if (text_prompt(hwnd, "Create webhook", "Webhook label:", "", label, sizeof label, 0) && label[0]) {
-            oc_client_create_webhook(g_client, cid, label);
+        oc_field f[1] = { { FF_TEXT, "Webhook label",
+                            "Shown as the sender for messages posted through it.", "" } };
+        if (form_dialog(hwnd, "Create webhook", f, 1) && f[0].value[0]) {
+            oc_client_create_webhook(g_client, cid, f[0].value);
             g_await_webhook = 1;
         }
         break;
@@ -4247,6 +4692,15 @@ static void test_poll(HWND hwnd) {
             ac_rebuild();
             test_ack("ok");
         } else test_ack("err");
+    } else if (!strcmp(verb, "palette")) {
+        palette_open(hwnd);
+        if (arg[0]) { WCHAR w[64]; to_w(arg, w, 64); SetWindowTextW(g_pal_edit, w); }
+        test_ack("ok");
+    } else if (!strcmp(verb, "notify")) {
+        close_overlays(); g_notify_open = 1; g_view = VIEW_HOME;
+        oc_client_list_notify_prefs(g_client); test_ack("ok");
+    } else if (!strcmp(verb, "keys")) {
+        close_overlays(); g_keys_open = 1; g_view = VIEW_HOME; test_ack("ok");
     } else if (!strcmp(verb, "menu")) {
         /* Drive a workspace/new-menu command directly. Modal forms block this
          * poll loop until dismissed, so the ack lands after the dialog closes. */
@@ -4294,6 +4748,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         composer_create(hwnd);
         find_create(hwnd);
         search_create(hwnd);
+        g_pal_edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL,
+            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)0xF4, GetModuleHandleW(NULL), NULL);
+        if (g_pal_edit) {
+            SendMessageW(g_pal_edit, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+            SendMessageW(g_pal_edit, EM_SETCUEBANNER, TRUE,
+                         (LPARAM)L"Run an action or jump to a conversation\u2026");
+            g_pal_prev = (WNDPROC)SetWindowLongPtrW(g_pal_edit, GWLP_WNDPROC, (LONG_PTR)pal_proc);
+        }
         g_pick_edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL,
             0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)0xF3, GetModuleHandleW(NULL), NULL);
         if (g_pick_edit) {
@@ -4338,6 +4800,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 sidebar_opts_load(m);
                 g_sb_settings_pending = 0;
                 InvalidateRect(hwnd, NULL, FALSE);
+            }
+            /* The oldest entry paged in is the cursor for loading older ones. */
+            if (m->n_audit) {
+                uint64_t oldest = m->audit[0].at_ms;
+                for (size_t i = 1; i < m->n_audit; i++)
+                    if (m->audit[i].at_ms && m->audit[i].at_ms < oldest) oldest = m->audit[i].at_ms;
+                g_audit_oldest = oldest;
             }
             if (g_prefs_pending && oc_model_setting(m, PREFS_SETTING_KEY)) {
                 prefs_load(m);
@@ -4400,6 +4869,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ac_rebuild();                       /* WIN-7: candidates track the caret */
             InvalidateRect(hwnd, NULL, FALSE);
         }
+        if (g_pal_edit && (HWND)lp == g_pal_edit && HIWORD(wp) == EN_CHANGE) {
+            g_pal_sel = 0;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
         if (g_pick_edit && (HWND)lp == g_pick_edit && HIWORD(wp) == EN_CHANGE) {
             g_pick_scroll = 0;
             InvalidateRect(hwnd, NULL, FALSE);
@@ -4416,6 +4889,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         /* The find box and the sign-in fields both sit on the OC_COL_INPUT
          * surface the D2D chrome paints under them, so they share a brush. */
         if ((HWND)lp == g_find || (HWND)lp == g_srch || (HWND)lp == g_pick_edit ||
+            (HWND)lp == g_pal_edit ||
             (HWND)lp == g_si_e_ws ||
             (HWND)lp == g_si_e_user || (HWND)lp == g_si_e_pass) {
             SetBkColor((HDC)wp, OCRGB(OC_COL_INPUT));
@@ -4436,6 +4910,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_sb_scroll -= dy;
             if (g_sb_scroll < 0) g_sb_scroll = 0;
             if (g_sb_scroll > maxs) g_sb_scroll = maxs;
+        } else if (wm && (wm->audit_open || wm->weblist_open || wm->reactlist_open)
+                   && !wm->search_open) {
+            g_ovl_scroll -= dy;
+            if (g_ovl_scroll < 0) g_ovl_scroll = 0;
+            if (g_ovl_scroll > g_ovl_max) g_ovl_scroll = g_ovl_max;
+            /* At the bottom of the audit log, page older entries in (WIN-19). */
+            if (wm->audit_open && g_ovl_scroll >= g_ovl_max - 0.5f && g_audit_oldest > 1)
+                oc_client_audit_query(g_client, g_audit_oldest - 1);
+        } else if (g_notify_open || g_keys_open) {
+            g_ovl_scroll -= dy;
+            if (g_ovl_scroll < 0) g_ovl_scroll = 0;
+            if (g_ovl_scroll > g_ovl_max) g_ovl_scroll = g_ovl_max;
         } else if (wm && wm->search_open) {
             /* The results list scrolls top-down, unlike the bottom-pinned
              * transcript, so the sign is the other way round. */
@@ -4522,6 +5008,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == VK_ESCAPE && g_menu) { g_menu = MENU_NONE; g_menu_hover = -1; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_ESCAPE && g_more_open) { g_more_open = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_ESCAPE && g_has_sel) { g_has_sel = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
+        if (wp == VK_OEM_2 && (GetKeyState(VK_CONTROL) & 0x8000)) {   /* Ctrl+/ */
+            int on = !g_keys_open;
+            close_overlays();
+            g_keys_open = on; g_view = VIEW_HOME;
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        if (wp == 'F' && (GetKeyState(VK_CONTROL) & 0x8000)) { search_open(hwnd); return 0; }
+        if (wp == 'K' && (GetKeyState(VK_CONTROL) & 0x8000)) { palette_open(hwnd); return 0; }
         return 0;
     case WM_GETMINMAXINFO: {
         /* Item 4: never shrink below fitting the workspace icon + Home + More +

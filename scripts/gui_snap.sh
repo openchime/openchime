@@ -6,6 +6,12 @@
 #   scripts/gui_snap.sh kill                       # close the running client
 #
 # The PNG lands in the scratchpad path echoed on stdout (readable from Linux).
+#
+# NOTE: this is a WINDOW capture (PrintWindow), so its pixels include the title
+# bar and border — roughly (8, 31) larger than the client area. Coordinates read
+# off one of these PNGs are NOT client coordinates and must not be fed to
+# `gui_drive.sh click`. Measure clicks from a `gui_drive.sh shot` instead, which
+# renders the client area only.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
