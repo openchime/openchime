@@ -250,10 +250,12 @@ enum { THUMB_CACHE = 32 };
 static struct { uint64_t id; ID2D1Bitmap *bmp; } g_thumbs[THUMB_CACHE];
 static int      g_n_thumbs;
 /* A D2D bitmap belongs to the render target that created it; drawing it into
- * another one fails the whole frame. The test harness renders the same scene
- * into a DC target, which is exactly that case — so remember the owner and fall
- * back to the placeholder anywhere else. */
-static ID2D1RenderTarget *g_thumb_rt;
+ * another one fails the whole frame, and the test harness renders the same scene
+ * into a DC target. An explicit flag rather than comparing render-target
+ * pointers: the comparison silently missed on the real window target too, which
+ * turned every cache lookup into a miss and every miss into another fetch — a
+ * decode loop that filled the cache with copies of the same image. */
+static int g_thumbs_off;
 static uint64_t g_thumb_missing[THUMB_CACHE];   /* asked for, nothing came back */
 static int      g_n_thumb_missing;
 static uint64_t g_thumb_pending;                /* one fetch in flight */
@@ -270,7 +272,8 @@ static int mime_is_image(const char *mime) {
 }
 
 static ID2D1Bitmap *thumb_get(ID2D1RenderTarget *rt, uint64_t id) {
-    if (rt != g_thumb_rt) return NULL;
+    (void)rt;
+    if (g_thumbs_off) return NULL;
     for (int i = 0; i < g_n_thumbs; i++) if (g_thumbs[i].id == id) return g_thumbs[i].bmp;
     return NULL;
 }
@@ -282,7 +285,6 @@ static void thumbs_drop(void) {
     for (int i = 0; i < g_n_thumbs; i++)
         if (g_thumbs[i].bmp) ID2D1Bitmap_Release(g_thumbs[i].bmp);
     g_n_thumbs = 0;
-    g_thumb_rt = NULL;
 }
 
 /* WIN-16: paging older history. One request in flight at a time, and a
@@ -3403,7 +3405,6 @@ static void thumb_decode(uint64_t id, const uint8_t *data, size_t len) {
     g_thumbs[g_n_thumbs].id = id;
     g_thumbs[g_n_thumbs].bmp = bmp;
     g_n_thumbs++;
-    g_thumb_rt = (ID2D1RenderTarget *)g_rt;
 }
 
 /* Run whatever is currently in the query box. */
@@ -4967,6 +4968,9 @@ static int write_bmp(const char *path, int w, int h, const void *bgra) {
 /* Render the whole UI to a BMP via a Direct2D DC render target — independent of
  * the display being awake/unlocked (the whole point). The RichEdit composer is a
  * native child and won't appear; everything D2D-drawn does. */
+/* Renders the scene into a DC target for the harness. Thumbnails are suppressed
+ * for the duration: their bitmaps belong to the window's target and drawing one
+ * here would fail the whole frame. */
 static int test_shot(HWND hwnd, const char *path) {
     RECT rc; GetClientRect(hwnd, &rc);
     int w = rc.right - rc.left, h = rc.bottom - rc.top;
@@ -4999,7 +5003,9 @@ static int test_shot(HWND hwnd, const char *path) {
             ID2D1RenderTarget_CreateSolidColorBrush(rt, &white, NULL, &g_brush);
             ID2D1RenderTarget_CreateSolidColorBrush(rt, &faint, NULL, &g_brush2);
             ID2D1RenderTarget_BeginDraw(rt);
+            g_thumbs_off = 1;
             render_scene(rt, model(), (float)w, (float)h);
+            g_thumbs_off = 0;
             if (SUCCEEDED(ID2D1RenderTarget_EndDraw(rt, NULL, NULL))) ok = 1;
             if (g_brush) ID2D1SolidColorBrush_Release(g_brush);
             if (g_brush2) ID2D1SolidColorBrush_Release(g_brush2);
@@ -5028,6 +5034,18 @@ static void test_dump(const char *path) {
             m->authed, m->connected, (unsigned long long)g_sel, g_show_members);
     fprintf(f, "workspace name=\"%s\" deployment=%s max_users=%u\n",
             oc_model_workspace_name(m), oc_model_deployment_name(m), oc_model_max_users(m));
+    {
+        const oc_channel *dc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+        if (dc) for (size_t i = 0; i < dc->n_msgs; i++)
+            for (int k = 0; k < dc->msgs[i].n_attach; k++)
+                fprintf(f, "  attach msg=%llu id=%llu name=\"%s\" mime=\"%s\" recl=%d\n",
+                        (unsigned long long)dc->msgs[i].message_id,
+                        (unsigned long long)dc->msgs[i].attach[k].id,
+                        dc->msgs[i].attach[k].filename, dc->msgs[i].attach[k].mime,
+                        dc->msgs[i].attach[k].reclaimed);
+    }
+    fprintf(f, "thumb_pending=%llu n_thumbs=%d n_missing=%d\n",
+            (unsigned long long)g_thumb_pending, g_n_thumbs, g_n_thumb_missing);
     fprintf(f, "unread_from=%llu unread_chan=%llu unread_count=%d\n",
             (unsigned long long)g_unread_from, (unsigned long long)g_unread_chan, g_unread_count);
     for (size_t i = 0; i < m->n_channels; i++)
