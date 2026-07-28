@@ -882,7 +882,9 @@ static void draw_text_hl(ID2D1RenderTarget *rt, const char *s, IDWriteTextFormat
         }
     }
     D2D1_POINT_2F org = { r.left, r.top };
-    ID2D1RenderTarget_DrawTextLayout(rt, org, tl, paint_with(rgb), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    ID2D1RenderTarget_DrawTextLayout(rt, org, tl, paint_with(rgb),
+                                     D2D1_DRAW_TEXT_OPTIONS_CLIP |
+                                     D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
     IDWriteTextLayout_Release(tl);
 }
 
@@ -1635,8 +1637,12 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
     if (body) {
         D2D1_POINT_2F org = { tx, by };
         uint32_t bcol = msg->deleted ? OC_COL_FAINT : OC_COL_TEXT;
+        /* Colour emoji in message text. Without ENABLE_COLOR_FONT DirectWrite
+         * falls back to the monochrome outline glyphs, so a posted emoji looked
+         * washed out next to the very same character in the picker or on a
+         * reaction chip — which do set the flag. */
         ID2D1RenderTarget_DrawTextLayout(rt, org, body, paint_with(bcol),
-                                         D2D1_DRAW_TEXT_OPTIONS_NONE);
+                                         D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
         DWRITE_TEXT_METRICS tm;
         if (SUCCEEDED(IDWriteTextLayout_GetMetrics(body, &tm))) by += tm.height;
         else by += 18;
@@ -3265,8 +3271,14 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
                                      g_attach_btn.right - 8, g_attach_btn.bottom - 8),
                 OC_COL_MUTED);
 
+    /* A monochrome line icon, not a colour glyph: this is chrome, and it sat
+     * next to a grey "+" and a grey paper plane as the only coloured control in
+     * the whole shell. Colour is for content — messages, reactions, and the
+     * glyphs you pick in the picker. */
     g_emoji_btn = rf(bx0 + 6 + sq, cy, bx0 + 6 + sq * 2, cy + sq);
-    draw_emoji_glyph(rt, "\xF0\x9F\x99\x82", g_emoji_btn);
+    draw_lucide(rt, OC_ICON_SMILE, rf(g_emoji_btn.left + 8, g_emoji_btn.top + 8,
+                                      g_emoji_btn.right - 8, g_emoji_btn.bottom - 8),
+                OC_COL_MUTED);
 
     /* Send on the right — accent when there is something to send. A paper
      * plane rather than an up-arrow, which read as "scroll" more than "send". */
