@@ -214,8 +214,31 @@ static int g_n_rows;
 
 /* Transcript message hit-boxes (context menu + text selection). bx/by = the body
  * layout's top-left; cw = its wrap width — enough to re-hit-test on mouse events. */
-static struct { float top, bot, bx, by, cw; uint64_t mid; } g_msgrows[600];
+typedef struct { float top, bot, bx, by, cw; uint64_t mid; } oc_msgrow;
+static oc_msgrow g_msgrows[600];
 static int g_n_msgrows;
+/* The same, for the thread pane (WIN-15) — replies were read-only because the
+ * pane recorded no hit-boxes at all. Its own scroll offset, so opening a thread
+ * does not disturb where the transcript was. */
+static oc_msgrow g_thrrows[200];
+static int g_n_thrrows;
+static float g_thr_scroll, g_thr_scroll_max;
+
+/* WIN-14: the read marker as it stood when this channel was opened. It has to be
+ * snapshotted, because entering a channel acks it — read live, the divider would
+ * vanish in the same frame it appeared. Cleared when you leave or send. */
+/* WIN-27: per-channel drafts, in memory for the life of the process. ARCH-88
+ * leaves two options — memory-only, or server-synced through the settings
+ * bucket — and this is the cheap half: a half-typed message survives a channel
+ * switch, not a restart. Cross-restart drafts need the synced route. */
+enum { DRAFT_MAX = 24 };
+static struct { uint64_t cid; WCHAR text[1024]; } g_drafts[DRAFT_MAX];
+static int g_n_drafts;
+
+static uint64_t g_unread_from;
+static uint64_t g_unread_chan;
+static D2D1_RECT_F g_unread_jump;      /* "N new" affordance in the header */
+static int g_unread_count;
 
 /* Transcript text selection (DirectWrite hit-testing over the custom surface).
  * Anchor/focus are (message id, UTF-16 offset); order is resolved at draw time. */
@@ -785,10 +808,52 @@ static int any_overlay(const oc_model *m) {
                   m->weblist_open || m->storage_open || m->audit_open));
 }
 
+static void ac_close(void);   /* fwd */
+
+/* Stash whatever is in the composer under `cid`; an empty composer clears it. */
+static void draft_save(uint64_t cid) {
+    if (!g_re || !cid || g_edit_msg) return;      /* an edit-in-progress is not a draft */
+    WCHAR w[1024];
+    int n = GetWindowTextW(g_re, w, 1024);
+    int slot = -1;
+    for (int i = 0; i < g_n_drafts; i++) if (g_drafts[i].cid == cid) { slot = i; break; }
+    if (n <= 0) {                                  /* drop it, keeping the array dense */
+        if (slot >= 0) g_drafts[slot] = g_drafts[--g_n_drafts];
+        return;
+    }
+    if (slot < 0) {
+        if (g_n_drafts == DRAFT_MAX) g_drafts[0] = g_drafts[--g_n_drafts];   /* oldest out */
+        slot = g_n_drafts++;
+        g_drafts[slot].cid = cid;
+    }
+    lstrcpynW(g_drafts[slot].text, w, 1024);
+}
+
+static void draft_restore(uint64_t cid) {
+    if (!g_re) return;
+    for (int i = 0; i < g_n_drafts; i++)
+        if (g_drafts[i].cid == cid) {
+            SetWindowTextW(g_re, g_drafts[i].text);
+            SendMessageW(g_re, EM_SETSEL, (WPARAM)-2, -1);   /* caret to end */
+            return;
+        }
+    SetWindowTextW(g_re, L"");
+}
+
 static void select_channel(uint64_t cid) {
     if (!g_client || !cid) return;
+    if (g_sel && g_sel != cid) draft_save(g_sel);
     close_overlays();
     g_has_sel = 0;                       /* drop any transcript text selection */
+
+    /* Snapshot where the read marker stood BEFORE the mark-read below, so the
+     * "New" divider survives entering the channel (WIN-14). */
+    const oc_model *sm = model();
+    const oc_channel *sc = sm ? oc_model_channel((oc_model *)sm, cid) : NULL;
+    g_unread_from  = (sc && sc->high_water > sc->read_marker) ? sc->read_marker : 0;
+    g_unread_chan  = cid;
+    g_unread_count = sc ? sc->unread : 0;
+
     g_sel = cid;
     g_scroll = 0;
     if (!already_backfilled(cid)) {
@@ -797,6 +862,8 @@ static void select_channel(uint64_t cid) {
             g_backfilled[g_n_backfilled++] = cid;
     }
     oc_client_mark_read(g_client, cid);
+    draft_restore(cid);
+    ac_close();
 }
 
 /* A channel's display name into `out` ("# general" / "@ bob"). */
@@ -1396,8 +1463,18 @@ static void draw_day_sep(ID2D1RenderTarget *rt, uint64_t ms, D2D1_RECT_F reg, fl
 
 /* Bottom-pinned, wheel-scrolled render of a message array into `reg`. When
  * `capture` is set, records per-message hit-boxes for the context menu. */
+/* mode: MSGLIST_MAIN for the transcript, MSGLIST_THREAD for the thread pane.
+ * The thread pane needs the same hit-boxes and scrollbar the main list has —
+ * without them its replies were read-only and it could not scroll (WIN-15) —
+ * but not the date dividers, which only make sense on a day-spanning scroll. */
+enum { MSGLIST_MAIN = 1, MSGLIST_THREAD = 2 };
+
 static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
-                         const oc_msg *msgs, size_t nmsgs, D2D1_RECT_F reg, int capture) {
+                         const oc_msg *msgs, size_t nmsgs, D2D1_RECT_F reg, int mode) {
+    int capture = (mode == MSGLIST_MAIN);
+    int hits    = (mode != 0);
+    float *scroll     = capture ? &g_scroll     : &g_thr_scroll;
+    float *scroll_max = capture ? &g_scroll_max : &g_thr_scroll_max;
     float pad = 20.0f;
     float x0 = reg.left + pad;
     float content_w = (reg.right - pad) - (x0 + AVA + 12);
@@ -1422,6 +1499,10 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
                      groups_with(&msgs[first + i - 1], &msgs[first + i]));
         heights[i] = msg_height(&msgs[first + i], content_w, grouped[i], &layouts[i], &wlens[i]);
         total += (sep[i] ? SEP_H : 0);
+        if (capture && g_unread_from && g_unread_chan == g_sel &&
+            msgs[first + i].message_id > g_unread_from &&
+            (i == 0 || msgs[first + i - 1].message_id <= g_unread_from))
+            total += SEP_H;
         if (capture && g_jump_mid && msgs[first + i].message_id == g_jump_mid) {
             jump_i = (long)i; jump_off = total;      /* distance from content top */
         }
@@ -1429,7 +1510,7 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
     }
 
     float visible = reg.bottom - reg.top;
-    g_scroll_max = total > visible ? total - visible : 0;
+    *scroll_max = total > visible ? total - visible : 0;
 
     /* Resolve an armed jump (WIN-3). A message's top sits at
      *   screen_y = (reg.bottom - total) + g_scroll + jump_off,
@@ -1437,14 +1518,14 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
      * clamp is what keeps a hit in the newest or oldest screenful sensible
      * rather than scrolling past the end. */
     if (capture && jump_i >= 0) {
-        g_scroll = total - jump_off - visible * 0.66f;
+        *scroll = total - jump_off - visible * 0.66f;
         g_flash_mid = g_jump_mid;
         g_flash_until = GetTickCount64() + 1600;
         g_jump_mid = 0;
     }
 
-    if (g_scroll > g_scroll_max) g_scroll = g_scroll_max;
-    if (g_scroll < 0) g_scroll = 0;
+    if (*scroll > *scroll_max) *scroll = *scroll_max;
+    if (*scroll < 0) *scroll = 0;
 
     /* Resolve the selection into an ordered index range within this list. */
     long sel_lo = -1, sel_hi = -1; uint32_t sel_lo_pos = 0, sel_hi_pos = 0;
@@ -1463,14 +1544,28 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
         }
     }
 
-    float y = (reg.bottom - total) + g_scroll;     /* g_scroll 0 => newest pinned to bottom */
+    float y = (reg.bottom - total) + *scroll;     /* g_scroll 0 => newest pinned to bottom */
 
     ID2D1RenderTarget_PushAxisAlignedClip(rt, &reg, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-    if (capture) g_n_msgrows = 0;
+    if (capture) g_n_msgrows = 0; else if (hits) g_n_thrrows = 0;
     for (size_t i = 0; i < n; i++) {
         if (sep[i]) {
             if (y + SEP_H >= reg.top && y <= reg.bottom)
                 draw_day_sep(rt, msgs[first + i].server_time, reg, y);
+            y += SEP_H;
+        }
+        /* The "New" divider sits above the first message past the marker. */
+        if (capture && g_unread_from && g_unread_chan == g_sel &&
+            msgs[first + i].message_id > g_unread_from &&
+            (i == 0 || msgs[first + i - 1].message_id <= g_unread_from)) {
+            if (y + SEP_H >= reg.top && y <= reg.bottom) {
+                float my = y + SEP_H / 2;
+                fill(rt, rf(reg.left + 20, my, reg.right - 70, my + 1), OC_COL_DANGER);
+                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
+                draw_text(rt, "New", g_small,
+                          rf(reg.left + 20, y, reg.right - 20, y + SEP_H), OC_COL_DANGER);
+                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+            }
             y += SEP_H;
         }
         if (y + heights[i] >= reg.top && y <= reg.bottom) {
@@ -1505,14 +1600,17 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
                 }
             }
             draw_message(rt, m, &msgs[first + i], layouts[i], x0, y, content_w, grouped[i]);
-            if (capture && g_n_msgrows < (int)(sizeof g_msgrows / sizeof g_msgrows[0])) {
-                g_msgrows[g_n_msgrows].top = y;
-                g_msgrows[g_n_msgrows].bot = y + heights[i];
-                g_msgrows[g_n_msgrows].bx = bx;
-                g_msgrows[g_n_msgrows].by = by;
-                g_msgrows[g_n_msgrows].cw = content_w;
-                g_msgrows[g_n_msgrows].mid = msgs[first + i].message_id;
-                g_n_msgrows++;
+            if (hits) {
+                int *n = capture ? &g_n_msgrows : &g_n_thrrows;
+                int cap = capture ? (int)(sizeof g_msgrows / sizeof g_msgrows[0])
+                                  : (int)(sizeof g_thrrows / sizeof g_thrrows[0]);
+                if (*n < cap) {
+                    oc_msgrow *row = capture ? &g_msgrows[*n] : &g_thrrows[*n];
+                    row->top = y; row->bot = y + heights[i];
+                    row->bx = bx; row->by = by; row->cw = content_w;
+                    row->mid = msgs[first + i].message_id;
+                    (*n)++;
+                }
             }
         }
         y += heights[i];
@@ -1520,21 +1618,23 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
         layouts[i] = NULL;
     }
 
-    /* Custom scrollbar for the main transcript. g_scroll 0 => pinned bottom => thumb
-     * at the bottom of the track; g_scroll_max => scrolled to top => thumb at top. */
-    if (capture) {
-        if (g_scroll_max > 0.5f && total > 0) {
+    /* Scrollbar. scroll 0 => pinned bottom => thumb at the bottom of the track;
+     * scroll_max => scrolled to top => thumb at top. */
+    if (hits) {
+        if (*scroll_max > 0.5f && total > 0) {
             float track_top = reg.top + 4, track_h = visible - 8;
             float thumb_h = visible / total * track_h;
             if (thumb_h < 30) thumb_h = 30;
             if (thumb_h > track_h) thumb_h = track_h;
             float travel = track_h - thumb_h;
-            float thumb_top = track_top + (1.0f - g_scroll / g_scroll_max) * travel;
+            float thumb_top = track_top + (1.0f - *scroll / *scroll_max) * travel;
             float sx = reg.right - 10;
-            g_sbar_track_top = track_top; g_sbar_travel = travel;
-            g_sbar_thumb = rf(sx, thumb_top, sx + 6, thumb_top + thumb_h);
-            fill_round(rt, g_sbar_thumb, 3.0f, OC_COL_FAINT);
-        } else {
+            D2D1_RECT_F th = rf(sx, thumb_top, sx + 6, thumb_top + thumb_h);
+            /* Only the main transcript's thumb is draggable; the thread pane
+             * scrolls by wheel, so it must not claim the drag hit-box. */
+            if (capture) { g_sbar_track_top = track_top; g_sbar_travel = travel; g_sbar_thumb = th; }
+            fill_round(rt, th, 3.0f, OC_COL_FAINT);
+        } else if (capture) {
             g_sbar_thumb = rf(0, 0, 0, 0);
         }
     }
@@ -1617,7 +1717,7 @@ static void draw_thread(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
     draw_text(rt, rc, g_small, rf(body.left + 20, top + 2, body.right - 16, top + 22), OC_COL_FAINT);
     D2D1_RECT_F replies = rf(body.left, top + 24, body.right, body.bottom);
     if (m->n_thread_msgs == 0) overlay_empty(rt, replies, "No replies yet — reply below.");
-    else draw_msglist(rt, m, m->thread_msgs, m->n_thread_msgs, replies, 0);
+    else draw_msglist(rt, m, m->thread_msgs, m->n_thread_msgs, replies, MSGLIST_THREAD);
 }
 
 static void draw_search(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
@@ -2129,12 +2229,12 @@ static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
         }
         if (ns > show) off += snprintf(line + off, sizeof line - off, " +%zu", ns - show);
         D2D1_RECT_F lr = reg; lr.bottom -= 20;
-        draw_msglist(rt, m, c->msgs, c->n_msgs, lr, 1);
+        draw_msglist(rt, m, c->msgs, c->n_msgs, lr, MSGLIST_MAIN);
         draw_text(rt, line, g_small, rf(reg.left + 72, reg.bottom - 20, reg.right - 20, reg.bottom),
                   OC_COL_FAINT);
         return;
     }
-    draw_msglist(rt, m, c->msgs, c->n_msgs, reg, 1);
+    draw_msglist(rt, m, c->msgs, c->n_msgs, reg, MSGLIST_MAIN);
 }
 
 /* ---- header + composer --------------------------------------------------- */
@@ -2176,9 +2276,26 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
     draw_text(rt, "Members", g_ui, g_members_btn, g_show_members ? OC_COL_TEXT : OC_COL_MUTED);
     IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
 
+    /* Jump-to-unread (WIN-14): only while this channel actually has a divider to
+     * jump to, so it is never a dead control. */
+    float statr = g_members_btn.left - 12;
+    if (g_unread_from && g_unread_chan == g_sel && g_unread_count > 0) {
+        char lbl[40];
+        snprintf(lbl, sizeof lbl, "%d new \u2191", g_unread_count);
+        float bw = text_width(lbl, g_small) + 22;
+        g_unread_jump = rf(statr - bw, 14, statr, HEADER_H - 14);
+        fill_round(rt, g_unread_jump, 12.0f, OC_COL_DANGER);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, lbl, g_small, g_unread_jump, 0xFFFFFF);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        statr = g_unread_jump.left - 12;
+    } else {
+        g_unread_jump = rf(0, 0, 0, 0);
+    }
+
     const char *status = !m->connected ? "offline" : !m->authed ? "signing in" : "connected";
     IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    draw_text(rt, status, g_small, rf(x0 + 20, 0, g_members_btn.left - 12, HEADER_H),
+    draw_text(rt, status, g_small, rf(x0 + 20, 0, statr, HEADER_H),
               m->authed ? OC_COL_ONLINE : OC_COL_MUTED);
     IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
 }
@@ -2674,7 +2791,13 @@ static void picker_choose(HWND hwnd, const char *emoji) {
         const oc_model *m = model();
         const oc_channel *c = m ? oc_model_channel((oc_model *)m, g_sel) : NULL;
         const oc_msg *msg = find_msg(c, g_pick_mid);
-        oc_client_react(g_client, g_sel, g_pick_mid, emoji,
+        uint64_t chan = g_sel;
+        if (!msg && m && m->thread_open)          /* the target may be a reply */
+            for (size_t i = 0; i < m->n_thread_msgs; i++)
+                if (m->thread_msgs[i].message_id == g_pick_mid) {
+                    msg = &m->thread_msgs[i]; chan = m->thread_channel; break;
+                }
+        oc_client_react(g_client, chan, g_pick_mid, emoji,
                         (msg && reaction_is_mine(msg, emoji)) ? 0 : 1);
     } else if (g_re) {
         WCHAR w[16];
@@ -2928,6 +3051,11 @@ static void composer_send(void) {
     free(w);
     g_edit_msg = 0;
     ac_close();
+    /* Your own message ends the unread run; leaving the divider above it would
+     * claim there is still something new to read. */
+    g_unread_from = 0; g_unread_count = 0;
+    for (int i = 0; i < g_n_drafts; i++)          /* it is sent; not a draft any more */
+        if (g_drafts[i].cid == g_sel) { g_drafts[i] = g_drafts[--g_n_drafts]; break; }
     SetWindowTextW(g_re, L"");
 }
 
@@ -3310,6 +3438,16 @@ static void upload_file(HWND hwnd) {
 static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, int sy) {
     const oc_channel *c = oc_model_channel((oc_model *)m, g_sel);
     const oc_msg *msg = find_msg(c, mid);
+    /* A thread reply is not in the channel's message list, so look there too —
+     * otherwise the menu simply never appeared for replies (WIN-15). */
+    int is_reply = 0;
+    uint64_t chan = g_sel;
+    if (!msg && m->thread_open) {
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == mid) {
+                msg = &m->thread_msgs[i]; is_reply = 1; chan = m->thread_channel; break;
+            }
+    }
     if (!msg) return;
     WCHAR wb[128];
     HMENU menu = CreatePopupMenu();
@@ -3328,7 +3466,8 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
                     (UINT_PTR)(30 + i), wmenu(lbl, wb, 128));
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    if (!msg->deleted)
+    /* No nested threads (REQ-060), so a reply offers no thread item. */
+    if (!msg->deleted && !is_reply)
         AppendMenuW(menu, MF_STRING, 100, msg->reply_count ? L"Open thread" : L"Reply in thread");
     if (msg->n_reactions) AppendMenuW(menu, MF_STRING, 102, L"Who reacted");
     AppendMenuW(menu, MF_STRING, 20, L"Copy text");
@@ -3341,7 +3480,7 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
     DestroyMenu(menu);
     if (cmd >= 1 && cmd <= g_n_quick) {
         const char *e = REACT_EMO[cmd - 1];
-        oc_client_react(g_client, g_sel, mid, e, reaction_is_mine(msg, e) ? 0 : 1);
+        oc_client_react(g_client, chan, mid, e, reaction_is_mine(msg, e) ? 0 : 1);
     } else if (cmd == 7) {
         picker_open(hwnd, mid);
     } else if (cmd == 20) {
@@ -3349,11 +3488,11 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
     } else if (cmd == 21) {
         composer_begin_edit(msg);
     } else if (cmd == 22) {
-        oc_client_delete(g_client, g_sel, mid);
+        oc_client_delete(g_client, chan, mid);
     } else if (cmd == 100) {
         g_scroll = 0; oc_client_open_thread(g_client, g_sel, mid);
     } else if (cmd == 102) {
-        g_scroll = 0; oc_client_list_reactions(g_client, g_sel, mid);
+        g_scroll = 0; oc_client_list_reactions(g_client, chan, mid);
     } else if (cmd >= 30 && cmd - 30 < msg->n_attach) {
         download_attachment(hwnd, &msg->attach[cmd - 30]);
     }
@@ -3567,6 +3706,19 @@ static int on_click(HWND hwnd, int x, int y) {
         return 1;
     }
     /* Composer attach (+) and send buttons. */
+    if (in_rect(g_unread_jump, x, y)) {
+        /* Jump to the first message past the marker, reusing the search-hit
+         * machinery: same scroll-into-view and flash. */
+        const oc_model *jm = model();
+        const oc_channel *jc = jm ? oc_model_channel((oc_model *)jm, g_sel) : NULL;
+        if (jc) for (size_t i = 0; i < jc->n_msgs; i++)
+            if (jc->msgs[i].message_id > g_unread_from) {
+                g_jump_mid = jc->msgs[i].message_id;
+                g_jump_deadline = GetTickCount64() + 2000;
+                break;
+            }
+        return 1;
+    }
     if (in_rect(g_attach_btn, x, y)) { upload_file(hwnd); return 1; }
     if (in_rect(g_emoji_btn, x, y))  { picker_open(hwnd, 0); return 1; }
     if (in_rect(g_send_btn, x, y))   { composer_send(); return 1; }
@@ -3743,6 +3895,17 @@ static void on_rclick(HWND hwnd, int x, int y) {
             show_member_menu(hwnd, m, g_memrows[i].uid, pt.x, pt.y);
             return;
         }
+    /* Inside an open thread the replies own the region, so their rows are
+     * checked first — and the same message menu applies, since a reply is an
+     * ordinary message with an id (WIN-15). */
+    if (m->thread_open) {
+        for (int i = 0; i < g_n_thrrows; i++)
+            if ((float)y >= g_thrrows[i].top && (float)y < g_thrrows[i].bot) {
+                show_msg_menu(hwnd, m, g_thrrows[i].mid, pt.x, pt.y);
+                return;
+            }
+        return;
+    }
     for (int i = 0; i < g_n_msgrows; i++)
         if ((float)y >= g_msgrows[i].top && (float)y < g_msgrows[i].bot) {
             show_msg_menu(hwnd, m, g_msgrows[i].mid, pt.x, pt.y);
@@ -4626,6 +4789,13 @@ static void test_dump(const char *path) {
             m->authed, m->connected, (unsigned long long)g_sel, g_show_members);
     fprintf(f, "workspace name=\"%s\" deployment=%s max_users=%u\n",
             oc_model_workspace_name(m), oc_model_deployment_name(m), oc_model_max_users(m));
+    fprintf(f, "unread_from=%llu unread_chan=%llu unread_count=%d\n",
+            (unsigned long long)g_unread_from, (unsigned long long)g_unread_chan, g_unread_count);
+    for (size_t i = 0; i < m->n_channels; i++)
+        fprintf(f, "  marks ch %llu hw=%llu rm=%llu unread=%d\n",
+                (unsigned long long)m->channels[i].channel_id,
+                (unsigned long long)m->channels[i].high_water,
+                (unsigned long long)m->channels[i].read_marker, m->channels[i].unread);
     fprintf(f, "channels=%zu\n", m->n_channels);
     for (size_t i = 0; i < m->n_channels; i++) {
         const oc_channel *c = &m->channels[i];
@@ -4910,6 +5080,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_sb_scroll -= dy;
             if (g_sb_scroll < 0) g_sb_scroll = 0;
             if (g_sb_scroll > maxs) g_sb_scroll = maxs;
+        } else if (wm && wm->thread_open) {
+            g_thr_scroll += dy;
+            if (g_thr_scroll < 0) g_thr_scroll = 0;
+            if (g_thr_scroll > g_thr_scroll_max) g_thr_scroll = g_thr_scroll_max;
         } else if (wm && (wm->audit_open || wm->weblist_open || wm->reactlist_open)
                    && !wm->search_open) {
             g_ovl_scroll -= dy;

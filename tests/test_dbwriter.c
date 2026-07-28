@@ -301,6 +301,23 @@ static void test_backfill(void) {
     CHECK(r && r->n_replay == 0);
     oc_dbres_free(r);
 
+    /* And the CURSORLESS form — the one a cold client actually sends — must
+     * behave the same. It derives one cursor per member channel, and those must
+     * be 0 rather than the stored delivery cursor: seeding them from the read
+     * position is the same "caught-up user sees nothing" bug one level up. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_BACKFILL, 300);
+        j->user_id = u;
+        j->n_cursors = 0;
+        j->cursors = NULL;
+        oc_dbwriter_submit(w, j);
+        oc_dbres *bf = wait_result(w);
+        CHECK(bf && bf->type == OC_RES_BACKFILL_OK);
+        CHECK(bf->n_replay == BF_TAIL);
+        CHECK(bf->replay[BF_TAIL - 1].message_id == last);
+        oc_dbres_free(bf);
+    }
+
     oc_dbwriter_stop(w);
     cleanup_db(path);
 }
@@ -1429,7 +1446,7 @@ static void test_delivery_cursor(void) {
     memset(idem, 3, sizeof idem); uint64_t m3 = send_msg(w, alice, idem, "three");
     CHECK(m1 && m2 > m1 && m3 > m2);
 
-    /* No prior ack: a cursorless backfill replays the whole channel from 0. */
+    /* No prior ack: a cursorless backfill replays the channel (3 < the tail). */
     oc_dbres *r = backfill0(w, bob);
     CHECK(r && r->type == OC_RES_BACKFILL_OK && r->n_replay == 3);
     oc_dbres_free(r);
@@ -1440,18 +1457,35 @@ static void test_delivery_cursor(void) {
     memset(idem, 4, sizeof idem); uint64_t m4 = send_msg(w, alice, idem, "four");
     CHECK(m4 > m3);
 
-    /* Now a cursorless backfill resumes after m2 -> only m3 and m4. */
+    /* The stored cursor must NOT narrow the replay. A cursorless request comes
+     * from a client holding no history, so it still gets the channel's newest
+     * page — all four here. Resuming from the read position instead is how a
+     * caught-up user ended up with an empty channel on every launch; the cursor
+     * places the unread divider (REQ-236), it does not decide what exists. */
     r = backfill0(w, bob);
-    CHECK(r && r->type == OC_RES_BACKFILL_OK && r->n_replay == 2);
-    CHECK(r->replay[0].message_id == m3 && r->replay[1].message_id == m4);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK && r->n_replay == 4);
+    CHECK(r->replay[0].message_id == m1 && r->replay[3].message_id == m4);
     oc_dbres_free(r);
 
-    /* The cursor only advances: acking an older id does not rewind it. */
+    /* The cursor itself still advances only forward — acking an older id does
+     * not rewind it — which is what read-receipts depend on. */
     client_ack(w, bob, OC_DEFAULT_CHANNEL, m1);
-    memset(idem, 5, sizeof idem); (void)send_msg(w, alice, idem, "five");   /* barrier */
+    memset(idem, 5, sizeof idem); uint64_t m5 = send_msg(w, alice, idem, "five");
     r = backfill0(w, bob);
-    CHECK(r && r->n_replay == 3);   /* still resuming after m2: m3, m4, m5 */
+    CHECK(r && r->n_replay == 5 && r->replay[4].message_id == m5);
     oc_dbres_free(r);
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(raw, "SELECT message_id FROM delivery_cursors WHERE user_id=?;",
+                           -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)bob);
+        CHECK(sqlite3_step(st) == SQLITE_ROW);
+        CHECK((uint64_t)sqlite3_column_int64(st, 0) == m2);   /* not rewound to m1 */
+        sqlite3_finalize(st);
+        sqlite3_close(raw);
+    }
 
     oc_dbwriter_stop(w);
     cleanup_db(path);

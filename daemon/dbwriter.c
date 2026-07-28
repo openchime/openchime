@@ -2141,9 +2141,14 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
     size_t ncurs = j->n_cursors;
     oc_bf_cursor *derived = NULL;
     if (ncurs == 0) {
+        /* Every member channel, each with a cursor of 0 — "I hold no history".
+         * The per-channel loop below turns that into the channel's newest page.
+         *
+         * These must NOT be seeded from delivery_cursors. A cursorless request
+         * comes from a client that has nothing (ARCH-88), and resuming a
+         * caught-up user from where they last read sends them nothing at all. */
         sqlite3_prepare_v2(db,
-            "SELECT cm.channel_id, COALESCE(dc.message_id,0) FROM channel_members cm "
-            "LEFT JOIN delivery_cursors dc ON dc.user_id=cm.user_id AND dc.channel_id=cm.channel_id "
+            "SELECT cm.channel_id, 0 FROM channel_members cm "
             "WHERE cm.user_id=? ORDER BY cm.channel_id;", -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
         size_t dcap = 8, dn = 0;
