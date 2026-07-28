@@ -53,6 +53,45 @@ static const GUID OC_IID_IDWriteFactory =
 #define TIMER_TICK 1
 
 /* Layout metrics (device pixels; per-monitor DPI is a later phase). */
+/* ---- DPI ------------------------------------------------------------------
+ * Every layout constant and hit-box below is in DIPs (1/96"), not device pixels.
+ * Direct2D and DirectWrite already work that way, so telling the render target
+ * the window's DPI scales the entire drawn UI for free. Two boundaries do NOT
+ * scale themselves and must be converted by hand:
+ *
+ *   native children  positioned with MoveWindow, which takes device pixels
+ *   mouse messages   delivered in device pixels
+ *
+ * Without any of this the process is DPI-unaware and Windows bitmap-stretches
+ * the whole window on a scaled display — the app shipped blurry on any modern
+ * laptop. */
+static UINT g_dpi = 96;
+/* Loaded dynamically: both are Windows 10 1607/1703, newer than the _WIN32_WINNT
+ * this builds against, and neither is worth raising the floor for. Missing them
+ * simply means the older SetProcessDPIAware path and a fixed 96. */
+static void dpi_declare_awareness(void) {
+    HMODULE u32 = GetModuleHandleW(L"user32.dll");
+    typedef BOOL (WINAPI *setctx_t)(HANDLE);
+    setctx_t setctx = u32 ? (setctx_t)(void *)GetProcAddress(u32, "SetProcessDpiAwarenessContext") : NULL;
+    /* -4 == DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: per-monitor, and the
+     * system scales the non-client area (title bar) to match. */
+    if (setctx && setctx((HANDLE)-4)) return;
+    SetProcessDPIAware();          /* system-DPI aware: right on one monitor */
+}
+
+static UINT dpi_for_window(HWND hwnd) {
+    HMODULE u32 = GetModuleHandleW(L"user32.dll");
+    typedef UINT (WINAPI *getdpi_t)(HWND);
+    getdpi_t getdpi = u32 ? (getdpi_t)(void *)GetProcAddress(u32, "GetDpiForWindow") : NULL;
+    if (getdpi) { UINT d = getdpi(hwnd); if (d >= 48 && d <= 480) return d; }
+    HDC dc = GetDC(hwnd);
+    UINT d = dc ? (UINT)GetDeviceCaps(dc, LOGPIXELSX) : 96;
+    if (dc) ReleaseDC(hwnd, dc);
+    return (d >= 48 && d <= 480) ? d : 96;
+}
+#define PX(v)   ((int)((float)(v) * (float)g_dpi / 96.0f + 0.5f))   /* DIP -> device */
+#define DIPF(v) ((float)(v) * 96.0f / (float)g_dpi)                 /* device -> DIP */
+
 #define RAIL_W      70.0f     /* pixel-matched to the Slack rail reference */
 #define SIDEBAR_W   250.0f
 #define HEADER_H    56.0f
@@ -932,6 +971,8 @@ static void d2d_ensure_rt(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
     D2D1_RENDER_TARGET_PROPERTIES rtp;
     ZeroMemory(&rtp, sizeof rtp);
+    /* The whole scene is authored in DIPs; this is what makes it scale. */
+    rtp.dpiX = rtp.dpiY = (float)g_dpi;
     D2D1_HWND_RENDER_TARGET_PROPERTIES hp;
     hp.hwnd = hwnd;
     hp.pixelSize.width  = (UINT32)(rc.right - rc.left);
@@ -3313,7 +3354,9 @@ static void paint(HWND hwnd) {
     if (!g_rt || !g_brush) return;
     ID2D1RenderTarget *rt = (ID2D1RenderTarget *)g_rt;
     RECT rc; GetClientRect(hwnd, &rc);
-    float W = (float)(rc.right - rc.left), H = (float)(rc.bottom - rc.top);
+    /* DIPs, not pixels — the drawing coordinate space now that the target
+     * carries the window's DPI. */
+    float W = DIPF(rc.right - rc.left), H = DIPF(rc.bottom - rc.top);
     const oc_model *m = model();
 
     ID2D1RenderTarget_BeginDraw(rt);
@@ -3327,8 +3370,8 @@ static void paint(HWND hwnd) {
     if (g_pal_edit) {
         if (g_pal_open) {
             ShowWindow(g_pal_edit, SW_SHOW);
-            MoveWindow(g_pal_edit, (int)(g_pal_box.left + 32), (int)(g_pal_box.top + 8),
-                       (int)(g_pal_box.right - g_pal_box.left - 44), 20, TRUE);
+            MoveWindow(g_pal_edit, PX(g_pal_box.left + 32), PX(g_pal_box.top + 8),
+                       PX(g_pal_box.right - g_pal_box.left - 44), PX(20), TRUE);
         } else {
             ShowWindow(g_pal_edit, SW_HIDE);
         }
@@ -3336,8 +3379,8 @@ static void paint(HWND hwnd) {
     if (g_pick_edit) {
         if (g_pick_open) {
             ShowWindow(g_pick_edit, SW_SHOW);
-            MoveWindow(g_pick_edit, (int)(g_pick_box.left + 30), (int)(g_pick_box.top + 6),
-                       (int)(g_pick_box.right - g_pick_box.left - 40), 18, TRUE);
+            MoveWindow(g_pick_edit, PX(g_pick_box.left + 30), PX(g_pick_box.top + 6),
+                       PX(g_pick_box.right - g_pick_box.left - 40), PX(18), TRUE);
         } else {
             ShowWindow(g_pick_edit, SW_HIDE);
         }
@@ -3512,6 +3555,7 @@ static void layout_composer(HWND hwnd) {
     if (!view_has_sidebar()) { ShowWindow(g_re, SW_HIDE); return; }
     ShowWindow(g_re, SW_SHOW);
     RECT rc; GetClientRect(hwnd, &rc);
+    rc.right = (LONG)DIPF(rc.right); rc.bottom = (LONG)DIPF(rc.bottom);
     const oc_model *m = model();
     float members = (g_show_members && m && m->authed) ? MEMBERS_W : 0;
     float main_x = RAIL_W + SIDEBAR_W;
@@ -3522,7 +3566,7 @@ static void layout_composer(HWND hwnd) {
      * covers the one nearest the text and it renders as a clipped sliver. */
     int x = (int)(bx0 + 84), r = (int)(bx1 - 48);
     int reh = 24, top = (int)(by0 + (boxh - reh) / 2);
-    MoveWindow(g_re, x, top, r - x, reh, TRUE);
+    MoveWindow(g_re, PX(x), PX(top), PX(r - x), PX(reh), TRUE);
 }
 
 /* Position the "Find a conversation" EDIT inside its sidebar box (transcript
@@ -3542,14 +3586,18 @@ static void layout_find(HWND hwnd) {
     int want = view_has_sidebar() && !g_menu && !g_more_open && !g_pal_open;
 
     /* Only act on a change: this runs every frame, and a redundant MoveWindow
-     * still churns WM_WINDOWPOSCHANGED and can flicker the control. */
+     * still churns WM_WINDOWPOSCHANGED and can flicker the control. The DPI is
+     * part of "changed" — the box is placed in device pixels, so a scale change
+     * has to re-place it even though its visibility did not move. */
     static int shown = -1;
-    if (want == shown) return;
+    static UINT laid_at_dpi = 0;
+    if (want == shown && laid_at_dpi == g_dpi) return;
     shown = want;
+    laid_at_dpi = g_dpi;
     if (!want) { ShowWindow(g_find, SW_HIDE); return; }
     int x = (int)(RAIL_W + 10 + 28), r = (int)(RAIL_W + SIDEBAR_W - 10 - 8);
     int top = (int)(HEADER_H + 6 + 6), hgt = 18;
-    MoveWindow(g_find, x, top, r - x, hgt, TRUE);
+    MoveWindow(g_find, PX(x), PX(top), PX(r - x), PX(hgt), TRUE);
     ShowWindow(g_find, SW_SHOW);
 }
 
@@ -3572,8 +3620,8 @@ static void layout_search(HWND hwnd) {
     if (!m || !m->search_open) { ShowWindow(g_srch, SW_HIDE); return; }
     (void)hwnd;
     ShowWindow(g_srch, SW_SHOW);
-    MoveWindow(g_srch, (int)(g_srch_box.left + 30), (int)(g_srch_box.top + 8),
-               (int)(g_srch_box.right - g_srch_box.left - 40), 20, TRUE);
+    MoveWindow(g_srch, PX(g_srch_box.left + 30), PX(g_srch_box.top + 8),
+               PX(g_srch_box.right - g_srch_box.left - 40), PX(20), TRUE);
 }
 
 /* Enter submits the query; Escape closes the overlay. An EDIT swallows both, so
@@ -3740,7 +3788,7 @@ static void layout_signin(HWND hwnd) {
     if (!on) return;
 
     RECT rc; GetClientRect(hwnd, &rc);
-    si_geom g = si_layout((float)rc.right, (float)rc.bottom);
+    si_geom g = si_layout(DIPF(rc.right), DIPF(rc.bottom));
     float y = g.fields_y;
 
     /* Inset inside the drawn 32px-tall rounded box. */
@@ -3749,10 +3797,10 @@ static void layout_signin(HWND hwnd) {
         /* Leave room for the ".openchime.io" chip the painter draws at the right
          * edge of the box, so typed text can never run under it. */
         int sw = g_si_advanced ? 0 : (int)(8 + 7.0 * (double)(strlen(oc_default_suffix()) + 1));
-        MoveWindow(g_si_e_ws, ex, (int)(y + 20 + 6), ew - sw, eh, TRUE);
+        MoveWindow(g_si_e_ws, PX(ex), PX(y + 20 + 6), PX(ew - sw), PX(eh), TRUE);
     } else {
-        MoveWindow(g_si_e_user, ex, (int)(y + 20 + 6), ew, eh, TRUE);
-        MoveWindow(g_si_e_pass, ex, (int)(y + 62 + 20 + 6), ew, eh, TRUE);
+        MoveWindow(g_si_e_user, PX(ex), PX(y + 20 + 6), PX(ew), PX(eh), TRUE);
+        MoveWindow(g_si_e_pass, PX(ex), PX(y + 62 + 20 + 6), PX(ew), PX(eh), TRUE);
     }
 }
 
@@ -4422,7 +4470,7 @@ static void copy_selection(HWND hwnd) {
 static void on_rclick(HWND hwnd, int x, int y) {
     const oc_model *m = model();
     if (!m) return;
-    POINT pt = { x, y };
+    POINT pt = { PX(x), PX(y) };   /* back to device pixels for the popup */
     ClientToScreen(hwnd, &pt);
     /* Sidebar channel rows -> channel menu. */
     if (x >= RAIL_W && x <= RAIL_W + SIDEBAR_W) {
@@ -5607,7 +5655,10 @@ static int test_shot(HWND hwnd, const char *path) {
         props.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
         props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
         props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_IGNORE;
-        props.dpiX = 96; props.dpiY = 96;
+        /* Match the window, or the harness renders an unscaled UI into a
+         * device-sized bitmap and silently reports the wrong thing at any DPI
+         * other than 100%. */
+        props.dpiX = props.dpiY = (float)g_dpi;
         props.usage = D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE;
         ID2D1DCRenderTarget *dcrt = NULL;
         if (SUCCEEDED(ID2D1Factory_CreateDCRenderTarget(g_factory, &props, &dcrt)) && dcrt) {
@@ -5622,7 +5673,7 @@ static int test_shot(HWND hwnd, const char *path) {
             ID2D1RenderTarget_CreateSolidColorBrush(rt, &faint, NULL, &g_brush2);
             ID2D1RenderTarget_BeginDraw(rt);
             g_thumbs_off = 1;
-            render_scene(rt, model(), (float)w, (float)h);
+            render_scene(rt, model(), DIPF(w), DIPF(h));
             g_thumbs_off = 0;
             if (SUCCEEDED(ID2D1RenderTarget_EndDraw(rt, NULL, NULL))) ok = 1;
             if (g_brush) ID2D1SolidColorBrush_Release(g_brush);
@@ -5764,6 +5815,21 @@ static void test_poll(HWND hwnd) {
         char ws[256] = "", cred[256] = "";
         sscanf(arg, "%255s %255s", ws, cred);
         if (ws[0]) { switch_workspace(hwnd, ws, cred); test_ack("ok"); } else test_ack("err");
+    } else if (!strcmp(verb, "dpi")) {
+        /* Force a scale factor so the layout can be checked without a scaled
+         * display attached. Same path WM_DPICHANGED takes. */
+        int d = atoi(arg);
+        if (d >= 48 && d <= 480) {
+            g_dpi = (UINT)d;
+            if (g_brush)  { ID2D1SolidColorBrush_Release(g_brush);  g_brush = NULL; }
+            if (g_brush2) { ID2D1SolidColorBrush_Release(g_brush2); g_brush2 = NULL; }
+            thumbs_drop();
+            if (g_rt) { ID2D1HwndRenderTarget_Release(g_rt); g_rt = NULL; }
+            layout_composer(hwnd);
+            layout_signin(hwnd);
+            InvalidateRect(hwnd, NULL, TRUE);
+            test_ack("ok");
+        } else test_ack("err");
     } else if (!strcmp(verb, "wsforget")) {
         /* The removal itself, minus the confirmation dialog a harness cannot
          * dismiss reliably. Same code path the button takes after OK. */
@@ -5853,6 +5919,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         signin_create(hwnd);
         DragAcceptFiles(hwnd, TRUE);              /* drop files anywhere to upload */
+        g_dpi = dpi_for_window(hwnd);
         SetTimer(hwnd, TIMER_TICK, 30, NULL);
         tray_init(hwnd);   /* WIN-18: the notification surface */
         return 0;
@@ -6068,6 +6135,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         EndPaint(hwnd, &ps);
         return 0;
     }
+    case WM_DPICHANGED: {
+        /* Dragged to a differently-scaled monitor, or the display setting
+         * changed. Windows hands us the rect the window should occupy there;
+         * honouring it is what stops the window jumping size. The render target
+         * is rebuilt because its DPI is fixed at creation. */
+        g_dpi = HIWORD(wp);
+        RECT *sug = (RECT *)lp;
+        if (sug)
+            SetWindowPos(hwnd, NULL, sug->left, sug->top,
+                         sug->right - sug->left, sug->bottom - sug->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        if (g_brush)  { ID2D1SolidColorBrush_Release(g_brush);  g_brush = NULL; }
+        if (g_brush2) { ID2D1SolidColorBrush_Release(g_brush2); g_brush2 = NULL; }
+        thumbs_drop();
+        if (g_rt) { ID2D1HwndRenderTarget_Release(g_rt); g_rt = NULL; }
+        layout_composer(hwnd);
+        layout_signin(hwnd);
+        InvalidateRect(hwnd, NULL, TRUE);
+        return 0;
+    }
     case WM_SIZE:
         d2d_resize(hwnd);
         layout_composer(hwnd);
@@ -6117,6 +6204,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * the sidebar or the transcript scrolls. */
         POINT wpt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         ScreenToClient(hwnd, &wpt);
+        wpt.x = (LONG)DIPF(wpt.x); wpt.y = (LONG)DIPF(wpt.y);
         float dy = (float)GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 48.0f;
         const oc_model *wm = model();
         if (view_has_sidebar() && wpt.x >= (int)RAIL_W && wpt.x < (int)(RAIL_W + SIDEBAR_W)) {
@@ -6155,7 +6243,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_LBUTTONDOWN: {
-        int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+        int mx = (int)DIPF(GET_X_LPARAM(lp)), my = (int)DIPF(GET_Y_LPARAM(lp));
         if (!any_overlay(model()) && pt_in(g_sbar_thumb, mx, my)) {
             g_sbar_drag = 1; g_sbar_grab = (float)my - g_sbar_thumb.top;
             SetCapture(hwnd);
@@ -6166,7 +6254,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSEMOVE: {
-        int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+        int mx = (int)DIPF(GET_X_LPARAM(lp)), my = (int)DIPF(GET_Y_LPARAM(lp));
         if (g_sbar_drag) {
             if (g_sbar_travel > 0) {
                 float off = (float)my - g_sbar_grab - g_sbar_track_top;
@@ -6245,13 +6333,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int frameW = (int)((wr.right - wr.left) - (cr.right - cr.left));
         if (frameH < 0 || frameH > 200) frameH = 40;
         if (frameW < 0 || frameW > 200) frameW = 16;
-        int minClientH = (int)(64 + 2 * RAIL_IH + 3 * RAIL_IH + 12);  /* start+Home+More+cluster */
+        int minClientH = PX(64 + 2 * RAIL_IH + 3 * RAIL_IH + 12);  /* start+Home+More+cluster */
         mmi->ptMinTrackSize.y = minClientH + frameH;
-        mmi->ptMinTrackSize.x = 640 + frameW;
+        mmi->ptMinTrackSize.x = PX(640) + frameW;
         return 0;
     }
     case WM_RBUTTONDOWN:
-        on_rclick(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        on_rclick(hwnd, (int)DIPF(GET_X_LPARAM(lp)), (int)DIPF(GET_Y_LPARAM(lp)));
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     case WM_ERASEBKGND:
@@ -6331,6 +6419,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     }
     if (argv) LocalFree(argv);
 
+    /* Before the window exists: awareness is a process-wide, one-shot decision. */
+    dpi_declare_awareness();
     LoadLibraryW(L"Msftedit.dll");        /* registers MSFTEDIT_CLASS (RICHEDIT50W) */
     /* Before anything paints: the palette is runtime state now, and every
      * OC_COL_* reads through it. */
