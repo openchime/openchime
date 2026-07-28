@@ -256,7 +256,9 @@ static int  g_tray_live;
 /* Per-channel high-water as of the last tick. A message is "new" when a
  * channel's mark advances, which is the same signal the unread count uses —
  * cheaper and less fragile than trying to intercept events on their way in. */
-static struct { uint64_t cid, seen; } g_notify_hw[64];
+/* Keyed by (workspace slot, channel) — channel ids are per-workspace, so with
+ * several connected they collide and one workspace would mask another's mail. */
+static struct { int slot; uint64_t cid, seen; } g_notify_hw[128];
 static int  g_n_notify_hw;
 static int  g_notify_primed;   /* the first tick after auth only records */
 static NOTIFYICONDATAW g_tray;
@@ -1075,6 +1077,8 @@ static const struct { int act; int icon; const char *label; int admin; } RAIL_IT
 };
 #define RAIL_N_ITEMS ((int)(sizeof RAIL_ITEMS / sizeof RAIL_ITEMS[0]))
 
+static int ws_unread_elsewhere(void);   /* fwd */
+
 static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     fill(rt, rf(0, 0, RAIL_W, h), OC_COL_RAIL);
     g_n_navrows = 0;
@@ -1088,6 +1092,20 @@ static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     char wsn[80]; ws_display_name(m, wsn, sizeof wsn);
     char init[2] = { (char)(wsn[0] ? (wsn[0] >= 'a' && wsn[0] <= 'z' ? wsn[0] - 32 : wsn[0]) : 'O'), 0 };
     draw_text(rt, init, g_ava, av, 0xFFFFFF);
+    /* "N elsewhere" (WIN-29): unread sitting in the workspaces you are not
+     * looking at. Without it, holding several clients would be invisible. */
+    int elsewhere = ws_unread_elsewhere();
+    if (elsewhere > 0) {
+        char badge[8];
+        snprintf(badge, sizeof badge, "%d", elsewhere > 99 ? 99 : elsewhere);
+        float bw = text_width(badge, g_small) + 12;
+        if (bw < 18) bw = 18;
+        D2D1_RECT_F b = rf(av.right - bw + 6, av.top - 6, av.right + 6, av.top + 12);
+        fill_round(rt, b, 9.0f, OC_COL_DANGER);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, badge, g_small, b, 0xFFFFFF);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    }
     rail_hit(av.top - 6, av.bottom + 6, NAV_SWITCHER);
     fill(rt, rf(14, 58, RAIL_W - 14, 59), OC_COL_BORDER);   /* divider */
 
@@ -4293,6 +4311,95 @@ static void remember_workspace(const char *ws, const char *user) {
     oc_store_close(s);
 }
 
+/* ---- N concurrent workspaces (WIN-29, REQ-012–015) -------------------------
+ * The rail switcher used to stop the single client and start another, so a
+ * background workspace received nothing and accrued no unread — you only found
+ * out you had messages by switching to look.
+ *
+ * Rather than thread a workspace handle through the ~100 sites that use
+ * g_client / g_sel / g_scroll, those stay as the ACTIVE workspace's state and a
+ * slot array holds the rest. Switching saves the active globals into their slot
+ * and loads the target's. Every client is ticked each frame; only the active one
+ * is rendered. The whole diff is then confined to switching and ticking, which
+ * is where the behaviour actually lives. */
+enum { WS_MAX = 8 };
+typedef struct {
+    oc_client *client;
+    char     ws[256];
+    char     cred[320];
+    char     host[256];
+    int      port;
+    /* Per-workspace view state, swapped with the active globals. */
+    uint64_t sel;
+    float    scroll;
+    int      post_auth;
+    uint64_t backfilled[64];
+    int      n_backfilled;
+} oc_ws_slot;
+static oc_ws_slot g_wss[WS_MAX];
+static int g_n_wss, g_ws_active = -1;
+
+/* Unread across every workspace that is NOT the one on screen — the number the
+ * rail badge exists to show. */
+static int ws_unread_elsewhere(void) {
+    int total = 0;
+    for (int i = 0; i < g_n_wss; i++) {
+        if (i == g_ws_active || !g_wss[i].client) continue;
+        const oc_model *m = oc_client_model(g_wss[i].client);
+        if (!m) continue;
+        for (size_t c = 0; c < m->n_channels; c++) total += m->channels[c].unread;
+    }
+    return total;
+}
+
+static int ws_find(const char *ws) {
+    for (int i = 0; i < g_n_wss; i++)
+        if (strcmp(g_wss[i].ws, ws) == 0) return i;
+    return -1;
+}
+
+/* Park the active globals in their slot. */
+static void ws_save_active(void) {
+    if (g_ws_active < 0 || g_ws_active >= g_n_wss) return;
+    oc_ws_slot *w = &g_wss[g_ws_active];
+    w->client = g_client;
+    w->sel = g_sel; w->scroll = g_scroll; w->post_auth = g_post_auth;
+    w->n_backfilled = g_n_backfilled;
+    for (int i = 0; i < g_n_backfilled && i < 64; i++) w->backfilled[i] = g_backfilled[i];
+    snprintf(w->host, sizeof w->host, "%s", g_host);
+    w->port = g_port;
+}
+
+/* Make slot `i` the one on screen. */
+static void ws_load(int i) {
+    if (i < 0 || i >= g_n_wss) return;
+    oc_ws_slot *w = &g_wss[i];
+    g_ws_active = i;
+    g_client = w->client;
+    g_sel = w->sel; g_scroll = w->scroll; g_post_auth = w->post_auth;
+    g_n_backfilled = w->n_backfilled;
+    for (int k = 0; k < w->n_backfilled && k < 64; k++) g_backfilled[k] = w->backfilled[k];
+    snprintf(g_cur_ws, sizeof g_cur_ws, "%s", w->ws);
+    snprintf(g_cred, sizeof g_cred, "%s", w->cred);
+    snprintf(g_host, sizeof g_host, "%s", w->host);
+    g_port = w->port;
+    /* Cross-workspace leftovers: a selection, an edit or a toast from the other
+     * workspace means nothing here. */
+    g_has_sel = 0; g_edit_msg = 0; g_n_toast = 0; g_err_seen[0] = '\0';
+    g_menu = MENU_NONE; g_more_open = 0;
+}
+
+/* Collect the remembered workspaces, so boot can connect them all. */
+typedef struct { char ws[WS_MAX][256]; int n; } ws_book;
+
+static void boot_book_cb(void *ctx, const char *workspace, const char *label,
+                         const char *username, uint64_t last) {
+    (void)label; (void)username; (void)last;
+    ws_book *b = ctx;
+    if (!workspace || !workspace[0] || b->n >= WS_MAX) return;
+    snprintf(b->ws[b->n++], 256, "%s", workspace);
+}
+
 static void connect_start(const char *ws, const char *cred) {
     oc_endpoint ep;
     if (oc_resolve(ws, oc_default_suffix(), &ep) != OC_RESOLVE_OK) {
@@ -4305,6 +4412,24 @@ static void connect_start(const char *ws, const char *cred) {
     snprintf(g_cred, sizeof g_cred, "%s", cred);
     g_client = oc_client_start_secure(g_host, g_port, g_cred, store_path(), g_secret);
 
+    /* Register (or refresh) this workspace's slot so it keeps running when the
+     * user looks at another one. */
+    int slot = ws_find(g_cur_ws);
+    if (slot < 0 && g_n_wss < WS_MAX) {
+        slot = g_n_wss++;
+        memset(&g_wss[slot], 0, sizeof g_wss[slot]);
+        snprintf(g_wss[slot].ws, sizeof g_wss[slot].ws, "%s", g_cur_ws);
+    }
+    if (slot >= 0) {
+        snprintf(g_wss[slot].cred, sizeof g_wss[slot].cred, "%s", g_cred);
+        snprintf(g_wss[slot].host, sizeof g_wss[slot].host, "%s", g_host);
+        g_wss[slot].port = g_port;
+        g_wss[slot].client = g_client;
+        g_wss[slot].sel = 0; g_wss[slot].scroll = 0;
+        g_wss[slot].post_auth = 0; g_wss[slot].n_backfilled = 0;
+        g_ws_active = slot;
+    }
+
     /* Remember this workspace (+ the username, parsed off "user:pass") so the next
      * launch reconnects silently via the stored session token. */
     char user[128] = ""; const char *colon = strchr(cred, ':');
@@ -4313,6 +4438,32 @@ static void connect_start(const char *ws, const char *cred) {
         memcpy(user, cred, n); user[n] = 0;
     }
     remember_workspace(ws, user[0] ? user : NULL);
+}
+
+/* Connect every remembered workspace except `skip`, which is already up. Only
+ * those with a stored session token: one without a credential would sit at a
+ * failed connection with nothing to offer, and boot is not the place to ask. */
+static void boot_other_workspaces(const char *skip) {
+    const char *sp = store_path();
+    oc_store *s = sp ? oc_store_open(sp) : NULL;
+    if (!s) return;
+    oc_store_set_secret(s, g_secret);
+    ws_book b; b.n = 0;
+    oc_store_workspace_each(s, boot_book_cb, &b);
+    oc_store_close(s);
+
+    int keep = g_ws_active;
+    for (int i = 0; i < b.n && g_n_wss < WS_MAX; i++) {
+        if (skip && strcmp(b.ws[i], skip) == 0) continue;
+        if (ws_find(b.ws[i]) >= 0) continue;
+        if (!have_stored_token(b.ws[i])) continue;
+        ws_save_active();
+        g_client = NULL; g_sel = 0; g_scroll = 0; g_post_auth = 0; g_n_backfilled = 0;
+        connect_start(b.ws[i], "");
+    }
+    /* Back to the one the user last used: the extras are background. */
+    ws_save_active();
+    if (keep >= 0) ws_load(keep);
 }
 
 /* ---- sign-in flow (WIN-2) -------------------------------------------------- */
@@ -4328,7 +4479,20 @@ static void si_get(HWND e, char *out, size_t cap) {
 /* Tear a session down to the state a fresh sign-in expects. Shared by the
  * workspace switcher and sign-out so the two can never drift. */
 static void reset_session(void) {
-    if (g_client) { oc_client_stop(g_client); g_client = NULL; }
+    if (g_client) {
+        /* Retire this workspace's slot as well: leaving it behind would keep a
+         * freed client in the array for the switcher and the tick loop. */
+        for (int i = 0; i < g_n_wss; i++)
+            if (g_wss[i].client == g_client) {
+                for (int k = i; k + 1 < g_n_wss; k++) g_wss[k] = g_wss[k + 1];
+                g_n_wss--;
+                break;
+            }
+        g_ws_active = -1;
+        g_n_notify_hw = 0;      /* slot indices just shifted */
+        oc_client_stop(g_client);
+        g_client = NULL;
+    }
     g_sel = 0; g_scroll = 0; g_post_auth = 0; g_has_sel = 0;
     g_n_backfilled = 0; g_more_open = 0; g_menu = MENU_NONE;
     g_edit_msg = 0; g_n_toast = 0; g_err_seen[0] = '\0'; g_err_seq = 0;
@@ -4681,12 +4845,32 @@ static float menu_total_height(void) {
 
 /* Re-point the single client at another workspace (true N-hosting is a later
  * phase). Empty cred = silent reconnect via the stored session token. */
+/* Switch to `ws`. Already connected -> instant, and the one we leave keeps
+ * running (WIN-29). Otherwise connect it as an additional client; only when
+ * there is no credential to connect with do we fall back to sign-in. */
 static void switch_workspace(HWND hwnd, const char *ws, const char *cred) {
-    reset_session();
+    if (!ws || !ws[0]) return;
+    int existing = ws_find(ws);
+    if (existing >= 0 && g_wss[existing].client) {
+        ws_save_active();
+        close_overlays();
+        ws_load(existing);
+        g_view = VIEW_HOME;
+        layout_signin(hwnd);
+        layout_composer(hwnd);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return;
+    }
+    ws_save_active();          /* keep the current one running */
+    close_overlays();
+    g_client = NULL;           /* not a stop: the old client lives on in its slot */
+    g_sel = 0; g_scroll = 0; g_post_auth = 0; g_has_sel = 0;
+    g_n_backfilled = 0; g_edit_msg = 0; g_n_toast = 0; g_err_seen[0] = '\0';
     g_view = VIEW_HOME;
     connect_start(ws, cred ? cred : "");
     layout_signin(hwnd);
     layout_composer(hwnd);
+    InvalidateRect(hwnd, NULL, FALSE);
 }
 
 static void sw_book_cb(void *ctx, const char *workspace, const char *label,
@@ -4852,8 +5036,23 @@ static void open_switcher(HWND hwnd) {
     g_n_mi = 0;
     mi_section("WORKSPACES");
     for (int i = 0; i < g_n_sw; i++) {
-        char lbl[110];
-        snprintf(lbl, sizeof lbl, "%s%s", g_sw[i].label, g_sw[i].current ? "  \xE2\x9C\x93" : "");
+        /* Say which are actually connected and what is waiting in them — the
+         * point of holding N clients is that you can see it without switching. */
+        int slot = ws_find(g_sw[i].ws);
+        int unread = 0;
+        if (slot >= 0 && g_wss[slot].client) {
+            const oc_model *wm = oc_client_model(g_wss[slot].client);
+            if (wm) for (size_t c = 0; c < wm->n_channels; c++) unread += wm->channels[c].unread;
+        }
+        char lbl[140];
+        if (g_sw[i].current)
+            snprintf(lbl, sizeof lbl, "%s  \xE2\x9C\x93", g_sw[i].label);
+        else if (unread > 0)
+            snprintf(lbl, sizeof lbl, "%s  \xE2\x80\xA2 %d", g_sw[i].label, unread);
+        else if (slot >= 0 && g_wss[slot].client)
+            snprintf(lbl, sizeof lbl, "%s  (connected)", g_sw[i].label);
+        else
+            snprintf(lbl, sizeof lbl, "%s", g_sw[i].label);
         mi_item(100 + i, lbl);
     }
     if (g_n_sw == 0) mi_item(-1, "(no remembered workspaces)");
@@ -5133,6 +5332,14 @@ static void test_dump(const char *path) {
                         dc->msgs[i].attach[k].filename, dc->msgs[i].attach[k].mime,
                         dc->msgs[i].attach[k].reclaimed);
     }
+    fprintf(f, "workspaces=%d active=%d elsewhere=%d\n", g_n_wss, g_ws_active, ws_unread_elsewhere());
+    for (int i = 0; i < g_n_wss; i++) {
+        int u = 0;
+        const oc_model *wm = g_wss[i].client ? oc_client_model(g_wss[i].client) : NULL;
+        if (wm) for (size_t c = 0; c < wm->n_channels; c++) u += wm->channels[c].unread;
+        fprintf(f, "  ws[%d] %s client=%p authed=%d unread=%d\n", i, g_wss[i].ws,
+                (void *)g_wss[i].client, wm ? wm->authed : 0, u);
+    }
     fprintf(f, "tray_live=%d notify_pref=%d toasts_raised=%d dnd=%d\n",
             g_tray_live, g_pref_notify, g_toasts_raised, dnd_active(m));
     fprintf(f, "thumb_pending=%llu n_thumbs=%d n_missing=%d off=%d\n",
@@ -5221,6 +5428,16 @@ static void test_poll(HWND hwnd) {
         palette_open(hwnd);
         if (arg[0]) { WCHAR w[64]; to_w(arg, w, 64); SetWindowTextW(g_pal_edit, w); }
         test_ack("ok");
+    } else if (!strcmp(verb, "wsadd")) {
+        /* "<workspace> <user:pass>" — connect an ADDITIONAL workspace. */
+        char ws[256] = "", cred[256] = "";
+        sscanf(arg, "%255s %255s", ws, cred);
+        if (ws[0]) { switch_workspace(hwnd, ws, cred); test_ack("ok"); } else test_ack("err");
+    } else if (!strcmp(verb, "wsgo")) {
+        int i = atoi(arg);
+        if (i >= 0 && i < g_n_wss) { ws_save_active(); close_overlays(); ws_load(i);
+                                     layout_composer(hwnd); test_ack("ok"); }
+        else test_ack("err");
     } else if (!strcmp(verb, "toast")) {
         notify_toast("OpenChime", arg[0] ? arg : "test notification"); test_ack("ok");
     } else if (!strcmp(verb, "notify")) {
@@ -5309,6 +5526,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_TIMER:
+        if (wp == TIMER_TICK) {
+            /* Every workspace is ticked, not just the one on screen — that is
+             * the whole point of WIN-29. A background workspace drains its
+             * events, accrues unread, and can raise a notification. */
+            for (int wi = 0; wi < g_n_wss; wi++)
+                if (g_wss[wi].client && g_wss[wi].client != g_client)
+                    oc_client_tick(g_wss[wi].client);
+        }
         if (wp == TIMER_TICK && g_client) {
             oc_client_tick(g_client);
             const oc_model *m = oc_client_model(g_client);
@@ -5320,17 +5545,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * the window is not in front, subject to the channel's level and the
              * DND window. The first pass after connecting only records the
              * marks: the backfill is not "new mail". */
-            if (g_pref_notify != NOTIFY_OFF && m->authed) {
+            if (g_pref_notify != NOTIFY_OFF) {
                 int fg = (GetForegroundWindow() == hwnd);
                 int quiet = dnd_active(m);
-                for (size_t ci = 0; ci < m->n_channels; ci++) {
-                    const oc_channel *c = &m->channels[ci];
+                /* Every workspace, not just the visible one — a background
+                 * workspace's mail is exactly what you cannot otherwise see. */
+                for (int wi = 0; wi < (g_n_wss > 0 ? g_n_wss : 1); wi++) {
+                  const oc_model *wm = (g_n_wss > 0)
+                      ? (g_wss[wi].client ? oc_client_model(g_wss[wi].client) : NULL) : m;
+                  if (!wm || !wm->authed) continue;
+                  int is_active = (g_n_wss == 0) || (wi == g_ws_active);
+                  for (size_t ci = 0; ci < wm->n_channels; ci++) {
+                    const oc_channel *c = &wm->channels[ci];
                     int slot = -1;
                     for (int k = 0; k < g_n_notify_hw; k++)
-                        if (g_notify_hw[k].cid == c->channel_id) { slot = k; break; }
+                        if (g_notify_hw[k].slot == wi && g_notify_hw[k].cid == c->channel_id) { slot = k; break; }
                     if (slot < 0) {
-                        if (g_n_notify_hw >= 64) continue;
+                        if (g_n_notify_hw >= 128) continue;
                         slot = g_n_notify_hw++;
+                        g_notify_hw[slot].slot = wi;
                         g_notify_hw[slot].cid = c->channel_id;
                         g_notify_hw[slot].seen = c->high_water;
                         continue;                      /* first sighting: record only */
@@ -5338,7 +5571,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     uint64_t prev = g_notify_hw[slot].seen;
                     g_notify_hw[slot].seen = c->high_water;
                     if (!g_notify_primed || c->high_water <= prev) continue;
-                    if (fg && c->channel_id == g_sel) continue;   /* you are reading it */
+                    if (fg && is_active && c->channel_id == g_sel) continue;   /* you are reading it */
                     if (quiet) continue;
                     /* MENTIONS is treated as "nothing yet": real @mention
                      * semantics are REQ-221 / WIN-45, and guessing here would
@@ -5346,12 +5579,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (c->notify_level != OC_NOTIFY_ALL) continue;
 
                     const oc_msg *last = c->n_msgs ? &c->msgs[c->n_msgs - 1] : NULL;
-                    if (last && last->author_id == m->user_id) continue;   /* your own */
-                    char title[96], body[256];
-                    channel_label(m, c, title, sizeof title);
+                    if (last && last->author_id == wm->user_id) continue;   /* your own */
+                    char label[96], title[160], body[256];
+                    channel_label(wm, c, label, sizeof label);
+                    /* Name the workspace when it is not the one on screen, or
+                     * "#general" alone is ambiguous across several of them. */
+                    if (is_active) snprintf(title, sizeof title, "%s", label);
+                    else snprintf(title, sizeof title, "%s \u2014 %s",
+                                  oc_model_workspace_name(wm), label);
                     if (g_pref_notify == NOTIFY_FULL && last && last->body) {
                         const char *who = last->author_name[0] ? last->author_name
-                                        : oc_model_user_name(m, last->author_id);
+                                        : oc_model_user_name(wm, last->author_id);
                         snprintf(body, sizeof body, "%s: %s", (who && who[0]) ? who : "someone",
                                  last->body);
                     } else {
@@ -5359,6 +5597,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                  c->unread, c->unread == 1 ? "" : "s");
                     }
                     notify_toast(title, body);
+                  }
                 }
                 g_notify_primed = 1;
             }
@@ -5651,8 +5890,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CLOSE:
         /* WIN-59: the outbox is in memory now (ARCH-88), so quitting with a send
          * still queued loses it. Make that a choice rather than a surprise. */
-        if (g_client) {
-            int pending = oc_client_outbox_pending(g_client);
+        {
+            /* Across EVERY workspace (WIN-29), not just the visible one: a
+             * message stranded in a background workspace is the easiest of all
+             * to lose, because you cannot see it. */
+            int pending = g_client ? oc_client_outbox_pending(g_client) : 0;
+            for (int i = 0; i < g_n_wss; i++)
+                if (g_wss[i].client && g_wss[i].client != g_client)
+                    pending += oc_client_outbox_pending(g_wss[i].client);
             if (pending > 0) {
                 WCHAR w[320]; char line[320];
                 snprintf(line, sizeof line,
@@ -5670,6 +5915,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_TICK);
         tray_done();       /* or the icon lingers in the notification area */
+        for (int i = 0; i < g_n_wss; i++)
+            if (g_wss[i].client && g_wss[i].client != g_client) oc_client_stop(g_wss[i].client);
+        g_n_wss = 0;
         if (g_client) { oc_client_stop(g_client); g_client = NULL; }
         PostQuitMessage(0);
         return 0;
@@ -5719,8 +5967,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
      * OC_COL_* reads through it. */
     oc_theme_apply(OC_THEME_DARK);
     d2d_init();                           /* factory only; the RT is made per-hwnd in paint */
-    if (direct) connect_start(aws, acred);
-    else        g_view = VIEW_SIGNIN;
+    if (direct) {
+        connect_start(aws, acred);
+        /* WIN-57: bring up EVERY other remembered workspace that has a stored
+         * token, not just the one you used last. This was blocked purely on
+         * WIN-29 — with one client there was nowhere to put them, so unread
+         * elsewhere was invisible until you went looking. The most-recently-used
+         * one stays active; the rest connect behind it. */
+        if (!acred[0]) boot_other_workspaces(aws);
+    } else {
+        g_view = VIEW_SIGNIN;
+    }
 
     WNDCLASSW wc;
     memset(&wc, 0, sizeof wc);
