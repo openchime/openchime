@@ -4,7 +4,7 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Status.** **Migrations 0001–0018 are applied.** 0001 establishes the core
+**Status.** **Migrations 0001–0019 are applied.** 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
 credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
 `users.disabled` lockout flag; **0004** (§3b) reactions; **0005** (§3c) threads;
@@ -14,7 +14,7 @@ incoming webhooks and the message display-name override; **0012** (§3j)
 notification preferences and the DND window; **0013** (§3k) synced client
 settings; **0014–0015** attachment tombstones and reclaim reason; **0016** (§3l)
 the audit log; **0017** (§3m) federated enrollment; **0018** (§3n) push device
-tokens.
+tokens; **0019** (§3o) the DM participant-set key.
 
 *Corrected: an earlier revision of this line said presence, notification config,
 and attachments were "intentionally not here yet." Notification config landed in
@@ -484,6 +484,34 @@ decide who to notify, and prunes it when the gateway reports it stale.
 - `created_at_ms` / `last_seen_ms` (INTEGER) — first registration / last refresh.
 - `UNIQUE(user_id, token)` — re-registering the same token upserts `last_seen_ms`;
   index on `user_id` for the recipient join.
+
+---
+
+## 3o. Migration 0019 — a DM's participant set is its identity (REQ-050/055)
+
+Adds `channels.dm_key` and a **partial unique index** over it
+(`WHERE dm_key IS NOT NULL`, so named channels are unconstrained).
+
+- `dm_key` (TEXT) — the participant ids, sorted, as `"1"` for a self-DM or
+  `"1,2"` for a pair. Written by `process_open_dm` and matched with one indexed
+  probe.
+
+*Why.* A DM used to be identified by its membership rows — a count-join asserting
+"exactly these participants". That was correct but fragile: **anything that
+deleted a membership row left a DM the lookup could no longer match**, so the next
+`OPEN_DM` created a *duplicate conversation*. `remove_user` did exactly that, for
+DMs as well as named channels. Making the participant set a unique key means the
+duplicate state cannot be represented at all, rather than being prevented by
+every write path remembering to.
+
+The backfill uses `MIN`/`MAX` rather than `group_concat`, whose ordering SQLite
+does not guarantee — the key must be byte-identical to the one the daemon
+computes. DMs hold one or two participants (group DMs are REQ-056, unbuilt).
+
+*Pre-existing violations are deleted, not merged* — this shipped before any
+release, and merging two conversations is a judgement no migration should make
+silently. Member-less DM channels go; where a participant set is duplicated only
+the oldest channel survives, with the others' messages and membership removed.
 
 ---
 

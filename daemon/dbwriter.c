@@ -1046,8 +1046,28 @@ static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_prepare_v2(db, "DELETE FROM sessions WHERE user_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
+    /* Their DM conversations go entirely — messages, membership and the channel
+     * itself. Deleting only the membership row (what this used to do) left a
+     * half-membered DM that no OPEN_DM could match, so the next attempt created a
+     * DUPLICATE conversation; migration 0019's unique dm_key now forbids that
+     * state, which makes removing the channel the only coherent option. */
+    sqlite3_prepare_v2(db,
+        "DELETE FROM messages WHERE channel_id IN (SELECT channel_id FROM channel_members "
+        "  WHERE user_id=?1 AND channel_id IN (SELECT id FROM channels WHERE kind='dm'));",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db,
+        "DELETE FROM channels WHERE kind='dm' AND id IN "
+        "  (SELECT channel_id FROM channel_members WHERE user_id=?1);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
+    /* Now the ordinary channel memberships (the DM rows went with their channels,
+     * but any stragglers are swept here too). */
     sqlite3_prepare_v2(db, "DELETE FROM channel_members WHERE user_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db,
+        "DELETE FROM channel_members WHERE channel_id NOT IN (SELECT id FROM channels);",
+        -1, &st, NULL);
+    sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_prepare_v2(db, "DELETE FROM local_credentials WHERE user_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
@@ -1634,38 +1654,37 @@ static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
         r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
     }
 
-    /* An existing DM is a kind='dm' channel whose membership is exactly the
-     * participants: {self} for a self-DM, else {self, other}. */
+    /* A DM's IDENTITY is its participant set, stored as `dm_key` under a unique
+     * index (migration 0019) — not its membership rows, which anything that
+     * removes a user could delete out from under us, stranding the channel and
+     * letting the next OPEN_DM create a duplicate. One indexed probe. */
+    char key[48];
+    if (self_dm) snprintf(key, sizeof key, "%llu", (unsigned long long)self);
+    else snprintf(key, sizeof key, "%llu,%llu",
+                  (unsigned long long)(self < other ? self : other),
+                  (unsigned long long)(self < other ? other : self));
+
     uint64_t cid = 0;
     sqlite3_stmt *st = NULL;
-    if (self_dm) {
-        sqlite3_prepare_v2(db,
-            "SELECT c.id FROM channels c "
-            "JOIN channel_members a ON a.channel_id=c.id AND a.user_id=?1 "
-            "WHERE c.kind='dm' "
-            "  AND (SELECT COUNT(*) FROM channel_members m WHERE m.channel_id=c.id)=1 "
-            "LIMIT 1;", -1, &st, NULL);
-        sqlite3_bind_int64(st, 1, (sqlite3_int64)self);
-    } else {
-        sqlite3_prepare_v2(db,
-            "SELECT c.id FROM channels c "
-            "JOIN channel_members a ON a.channel_id=c.id AND a.user_id=?1 "
-            "JOIN channel_members b ON b.channel_id=c.id AND b.user_id=?2 "
-            "WHERE c.kind='dm' "
-            "  AND (SELECT COUNT(*) FROM channel_members m WHERE m.channel_id=c.id)=2 "
-            "LIMIT 1;", -1, &st, NULL);
-        sqlite3_bind_int64(st, 1, (sqlite3_int64)self);
-        sqlite3_bind_int64(st, 2, (sqlite3_int64)other);
-    }
+    sqlite3_prepare_v2(db, "SELECT id FROM channels WHERE kind='dm' AND dm_key=?1;", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
     if (sqlite3_step(st) == SQLITE_ROW) cid = (uint64_t)sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
+
+    /* Membership may have been damaged by an older build; re-assert it so the
+     * conversation stays reachable rather than silently empty. */
+    if (cid != 0) {
+        add_membership(db, cid, self);
+        if (!self_dm) add_membership(db, cid, other);
+    }
 
     if (cid == 0) {
         sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
         sqlite3_prepare_v2(db,
-            "INSERT INTO channels(kind,name,is_public,created_at_ms) VALUES('dm',NULL,0,?);",
-            -1, &st, NULL);
+            "INSERT INTO channels(kind,name,is_public,created_at_ms,dm_key) "
+            "VALUES('dm',NULL,0,?1,?2);", -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+        sqlite3_bind_text(st, 2, key, -1, SQLITE_TRANSIENT);
         int rc = sqlite3_step(st);
         sqlite3_finalize(st);
         if (rc != SQLITE_DONE) {

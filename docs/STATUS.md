@@ -53,7 +53,7 @@ over TLS) plus a compose-based black-box e2e (`make integration`).
 | REQ | Status | Notes |
 |-----|--------|-------|
 | 050 message → channel/DM, author, server time | ✅ | Channel messaging + **direct messages** (`OPEN_DM`, `kind='dm'` channels; messaging/backfill/search via the membership path). |
-| 055 self-DM (notes to self) | ✅ | `OPEN_DM` with self as target -> a single-participant DM; idempotent, members-only. |
+| 055 self-DM (notes to self) | ✅ | `OPEN_DM` with self as target -> a single-participant DM; idempotent, members-only. **Idempotency is now structural** (migration 0019): a DM's participant set is a unique `dm_key`, so a duplicate conversation cannot be represented — previously any deletion of a membership row (as `remove_user` did) stranded the DM and the next open created a second one. `remove_user` now deletes a departing user's DM channels outright. |
 | 051 edit + "edited" marker | ✅ | `edited_at_ms`; original time/position kept. Marker rendering is client-side. |
 | 052 delete tombstone | ✅ | Body nulled; id/author/timestamps kept; reactions cleared. |
 | 053 no retention cutoff | ✅ | No message pruning of any kind. |

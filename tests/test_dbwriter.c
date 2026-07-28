@@ -50,7 +50,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 18);
+    CHECK(oc_schema_version(db) == 19);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -1833,6 +1833,35 @@ static void test_dm(void) {
     r = backfill(w, bob, selfdm, 0);
     CHECK(r && r->n_replay == 0);
     oc_dbres_free(r);
+
+    /* A DM's identity is its participant set (migration 0019), not its membership
+     * rows — so even after the membership is destroyed (which remove_user used to
+     * do), re-opening returns the SAME channel instead of silently creating a
+     * duplicate conversation. This is the defect the unique dm_key forbids. */
+    {
+        /* Damage the membership behind the writer's back, the way an older
+         * remove_user did, using a second connection to the same file. */
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        char sql[128];
+        snprintf(sql, sizeof sql,
+                 "DELETE FROM channel_members WHERE channel_id=%llu;",
+                 (unsigned long long)selfdm);
+        CHECK(sqlite3_exec(raw, sql, NULL, NULL, NULL) == SQLITE_OK);
+        r = open_dm(w, alice, alice);
+        CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->channel_id == selfdm);
+        CHECK(r->ch_joined == 1);          /* membership re-asserted, not orphaned */
+        oc_dbres_free(r);
+
+        /* And the unique index means a second row for that set cannot exist. */
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(raw,
+            "SELECT COUNT(*) FROM channels WHERE kind='dm' AND dm_key IS NOT NULL "
+            "GROUP BY dm_key HAVING COUNT(*) > 1;", -1, &st, NULL);
+        CHECK(sqlite3_step(st) == SQLITE_DONE);   /* no participant set duplicated */
+        sqlite3_finalize(st);
+        sqlite3_close(raw);
+    }
 
     /* Opening a DM with an unknown user is still refused. */
     r = open_dm(w, alice, 99999);

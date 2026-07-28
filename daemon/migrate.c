@@ -328,6 +328,50 @@ static const char MIGRATION_0018[] =
     ");"
     "CREATE INDEX idx_device_tokens_user ON device_tokens(user_id);";
 
+/* 0019: make a DM's participant set its IDENTITY (REQ-050/055). Matching a DM by
+ * membership was correct but fragile — anything that deleted a membership row
+ * (remove_user did, for DMs as well as channels) left a half-membered channel
+ * that the lookup could no longer match, so the next OPEN_DM created a DUPLICATE
+ * conversation. A `dm_key` of the sorted participant ids under a UNIQUE index
+ * makes that impossible to represent, and turns the lookup into one indexed
+ * probe instead of a count-join.
+ *
+ * The backfill uses MIN/MAX rather than group_concat because SQLite does not
+ * guarantee group_concat's ordering, and this key must be byte-identical to the
+ * one the daemon computes. DMs have one or two participants (group DMs are
+ * REQ-056, unbuilt), so MIN/MAX covers every case.
+ *
+ * Pre-existing violations are DELETED, not merged: this ships before any release
+ * (the operator decision on record), and merging conversations is a judgement no
+ * migration should make silently. Member-less DM channels go, and where a
+ * participant set has duplicates only the oldest channel survives. */
+static const char MIGRATION_0019[] =
+    "ALTER TABLE channels ADD COLUMN dm_key TEXT;"
+    /* Key every DM that has a sane participant set. */
+    "UPDATE channels SET dm_key = ("
+    "  SELECT CASE WHEN COUNT(*)=1 THEN CAST(MIN(user_id) AS TEXT)"
+    "              ELSE CAST(MIN(user_id) AS TEXT)||','||CAST(MAX(user_id) AS TEXT) END"
+    "  FROM channel_members WHERE channel_id=channels.id)"
+    " WHERE kind='dm'"
+    "   AND (SELECT COUNT(*) FROM channel_members WHERE channel_id=channels.id) BETWEEN 1 AND 2;"
+    /* Drop DMs with no usable participant set (nothing can reach them). */
+    "DELETE FROM messages WHERE channel_id IN"
+    "  (SELECT id FROM channels WHERE kind='dm' AND dm_key IS NULL);"
+    "DELETE FROM channel_members WHERE channel_id IN"
+    "  (SELECT id FROM channels WHERE kind='dm' AND dm_key IS NULL);"
+    "DELETE FROM channels WHERE kind='dm' AND dm_key IS NULL;"
+    /* Of each duplicated participant set, keep only the oldest channel. */
+    "DELETE FROM messages WHERE channel_id IN"
+    "  (SELECT id FROM channels WHERE kind='dm' AND id NOT IN"
+    "     (SELECT MIN(id) FROM channels WHERE kind='dm' GROUP BY dm_key));"
+    "DELETE FROM channel_members WHERE channel_id IN"
+    "  (SELECT id FROM channels WHERE kind='dm' AND id NOT IN"
+    "     (SELECT MIN(id) FROM channels WHERE kind='dm' GROUP BY dm_key));"
+    "DELETE FROM channels WHERE kind='dm' AND id NOT IN"
+    "  (SELECT MIN(id) FROM channels WHERE kind='dm' GROUP BY dm_key);"
+    /* Partial index: only DMs carry a key, so named channels stay unconstrained. */
+    "CREATE UNIQUE INDEX idx_channels_dm_key ON channels(dm_key) WHERE dm_key IS NOT NULL;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -347,6 +391,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 16, MIGRATION_0016 },
     { 17, MIGRATION_0017 },
     { 18, MIGRATION_0018 },
+    { 19, MIGRATION_0019 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 
