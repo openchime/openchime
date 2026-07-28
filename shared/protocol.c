@@ -1134,6 +1134,21 @@ oc_result oc_encode_search_results(oc_wbuf *w, uint16_t version, const oc_search
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_history_request(oc_wbuf *w, uint16_t version, const oc_history_request *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_HISTORY_REQUEST);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->before_message_id);
+    oc_w_u16(w, m->limit);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_history_request(oc_rbuf *p, oc_history_request *m) {
+    m->channel_id        = oc_r_u64(p);
+    m->before_message_id = oc_r_u64(p);
+    m->limit             = oc_r_u16(p);
+    return r_done(p);
+}
+
 oc_result oc_encode_backfill_request(oc_wbuf *w, uint16_t version, const oc_backfill_request *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_BACKFILL_REQUEST);
     oc_w_u16(w, m->count);

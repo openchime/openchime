@@ -1161,6 +1161,33 @@ per-response cap, the server replays up to the cap and the client issues a
 follow-up `BACKFILL_REQUEST` with an advanced cursor. (The exact cap is an
 implementation tuning value, not a wire-format constant.)
 
+### 6.3 `HISTORY_REQUEST` (client → server), msg_type `0x0034`
+
+Pages **backwards** through one channel: the newest `limit` top-level messages
+**strictly older than** `before_message_id`.
+
+| Field               | Type | Notes                                                        |
+|---------------------|------|--------------------------------------------------------------|
+| `channel_id`        | u64  | The channel to page.                                          |
+| `before_message_id` | u64  | Return only ids strictly below this. `0` means "from the newest". |
+| `limit`             | u16  | Page size; `0` means the server's default. Clamped server-side. |
+
+*Why a separate frame.* A `BACKFILL_REQUEST` cursor only points forward, and
+§6.1 makes a zero cursor mean "send the newest page". Neither can express "give
+me what came before this", so a client could reach the newest page of a channel
+and no further — permanently, since clients keep no local history (ARCH-88).
+Adding a field to the existing cursor entry would have changed a frame already
+in use; a new opcode is additive.
+
+The response reuses §6.2 exactly: `BROADCAST` frames in **ascending** id order
+(the order the client's high-water dedup expects), the matching
+`REACTION_UPDATED` frames, then `BACKFILL_DONE`. On this path `more` means
+**"older messages exist above this page"**, which is how a client knows to stop
+asking rather than retrying at the top of a channel forever.
+
+Read access is checked as everywhere else; a channel the user cannot read
+returns an empty page rather than an error.
+
 Messages composed while offline are re-sent by the client on reconnect using
 their original `idempotency_token` (REQ-102), which the idempotency mapping
 (§5.1) de-duplicates against anything the server already accepted.
@@ -1333,6 +1360,7 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0089` | `DOWNLOAD_END`     | S → C     | no        | §5.14   |
 | `0x008A` | `TRANSFER_CANCEL`  | C → S     | no        | §5.14   |
 | `0x0030` | `BACKFILL_REQUEST` | C → S     | no        | §6.1    |
+| `0x0034` | `HISTORY_REQUEST`  | C → S     | no        | §6.3    |
 | `0x0031` | `BACKFILL_DONE`    | S → C     | no        | §6.2    |
 | `0x00FF` | `ERROR`            | S → C     | no        | §8.1    |
 

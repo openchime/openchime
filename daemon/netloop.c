@@ -965,6 +965,18 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_HISTORY_REQUEST) {
+            oc_history_request hr;
+            if (oc_decode_history_request(&p, &hr) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_HISTORY, c->conn_id);
+            if (!j) return -1;
+            j->user_id      = c->user_id;
+            j->channel_id   = hr.channel_id;
+            j->message_id   = hr.before_message_id;
+            j->search_limit = hr.limit;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_BACKFILL_REQUEST) {
             oc_cursor cursors[256];
             uint16_t count = 0;

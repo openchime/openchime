@@ -322,6 +322,73 @@ static void test_backfill(void) {
     cleanup_db(path);
 }
 
+/* Paging BACKWARDS (§6.3, WIN-16). A cursorless backfill only ever hands out the
+ * newest page, so without this a client could never reach older history at all. */
+static oc_dbres *history(oc_dbwriter *w, uint64_t uid, uint64_t ch,
+                         uint64_t before, uint16_t limit) {
+    oc_job *j = oc_job_new(OC_JOB_HISTORY, 310);
+    j->user_id = uid; j->channel_id = ch; j->message_id = before; j->search_limit = limit;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_history_paging(void) {
+    const char *path = "build/test_dbwriter_history.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t u = reg(w, "hp-user", "pw", OC_ROLE_MEMBER);
+    uint64_t outsider = reg(w, "hp-out", "pw", OC_ROLE_MEMBER);
+    CHECK(u && outsider);
+
+    uint64_t ids[25];
+    uint8_t idem[OC_IDEM_LEN];
+    for (int i = 0; i < 25; i++) {
+        char body[32]; snprintf(body, sizeof body, "h%d", i);
+        memset(idem, 0, sizeof idem); idem[0] = (uint8_t)i; idem[1] = 0x7A;
+        ids[i] = send_msg(w, u, idem, body);
+        CHECK(ids[i] != 0);
+    }
+
+    /* before = 0 means "from the newest": the last 10, ascending. */
+    oc_dbres *r = history(w, u, OC_DEFAULT_CHANNEL, 0, 10);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK && r->n_replay == 10);
+    CHECK(r->replay[0].message_id == ids[15] && r->replay[9].message_id == ids[24]);
+    CHECK(r->truncated == 1);            /* more exists above */
+    uint64_t oldest = r->replay[0].message_id;
+    oc_dbres_free(r);
+
+    /* The next page up is strictly older, and still ascending. */
+    r = history(w, u, OC_DEFAULT_CHANNEL, oldest, 10);
+    CHECK(r && r->n_replay == 10);
+    CHECK(r->replay[0].message_id == ids[5] && r->replay[9].message_id == ids[14]);
+    CHECK(r->truncated == 1);
+    oldest = r->replay[0].message_id;
+    oc_dbres_free(r);
+
+    /* The last page is short and reports nothing above it, which is how a client
+     * knows to stop asking. */
+    r = history(w, u, OC_DEFAULT_CHANNEL, oldest, 10);
+    CHECK(r && r->n_replay == 5);
+    CHECK(r->replay[0].message_id == ids[0]);
+    CHECK(r->truncated == 0);
+    oc_dbres_free(r);
+
+    /* Past the top: empty, not an error. */
+    r = history(w, u, OC_DEFAULT_CHANNEL, ids[0], 10);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK && r->n_replay == 0);
+    oc_dbres_free(r);
+
+    /* Read access is enforced here as everywhere else. */
+    r = history(w, outsider, 4242, 0, 10);
+    CHECK(r && r->n_replay == 0);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* OIDC-mode auth: a test issuer stands in for the central service (AUTH.md
  * §3.6). Proves the wiring — configure -> JWT verify -> JIT-provision -> session
  * -> reconnect — on top of the crypto that test_jwt covers in isolation. */
@@ -2058,6 +2125,7 @@ int run_dbwriter_tests(void) {
     test_delivery_cursor();
     test_idem_pruning();
     test_backfill();
+    test_history_paging();
     test_max_users();
     return failures;
 }

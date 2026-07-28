@@ -47,6 +47,10 @@ void oc_client_send(oc_client *c, uint64_t channel_id, const char *body);
 /* Request history for `channel_id` (once per channel — a frontend calls this the
  * first time a channel is opened). Replayed messages fold into the model. */
 void oc_client_backfill(oc_client *c, uint64_t channel_id);
+/* Page BACKWARDS through a channel (WIN-16): the newest page strictly older
+ * than `before_message_id`. Replies arrive as ordinary messages, so the model
+ * folds them in exactly like a forward replay. */
+void oc_client_history(oc_client *c, uint64_t channel_id, uint64_t before_message_id);
 
 /* Mark `channel_id` read (clear its unread count). A frontend calls this for the
  * focused channel. */

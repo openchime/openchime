@@ -68,6 +68,7 @@ typedef enum {
     OC_MSG_THREAD           = 0x002F, /* S->C, a thread's replies */
     OC_MSG_THREAD_META      = 0x0032, /* S->C, a parent's reply count (backfill) */
     OC_MSG_READ_CURSOR      = 0x0033, /* S->C, a member's read cursor advanced (REQ-090 seen-by) */
+    OC_MSG_HISTORY_REQUEST  = 0x0034, /* C->S, page BACKWARDS through a channel (§6.3) */
     OC_MSG_CREATE_CHANNEL     = 0x0050, /* C->S (REQ-050) */
     OC_MSG_CHANNEL_INFO       = 0x0051, /* S->C, ack for create/join/leave/invite/remove */
     OC_MSG_LIST_CHANNELS      = 0x0052, /* C->S */
@@ -499,6 +500,11 @@ typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; u
 typedef struct { uint16_t count; const oc_search_result_entry *entries; uint8_t truncated; } oc_search_results;
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_cursor;
 typedef struct { uint16_t count; const oc_cursor *cursors; } oc_backfill_request;
+/* Page backwards: the newest `limit` messages STRICTLY OLDER than
+ * `before_message_id`. BACKFILL_REQUEST's cursor only points forward, so
+ * scrolling into older history needed its own request rather than a new field
+ * on an existing frame. `before_message_id` of 0 means "from the newest". */
+typedef struct { uint64_t channel_id; uint64_t before_message_id; uint16_t limit; } oc_history_request;
 typedef struct { uint64_t high_water; uint8_t more; } oc_backfill_done;
 typedef struct { uint16_t code; uint8_t fatal; oc_slice context; oc_slice message; } oc_error;
 
@@ -604,6 +610,7 @@ oc_result oc_encode_profile_updated(oc_wbuf *w, uint16_t version, const oc_profi
 oc_result oc_encode_search(oc_wbuf *w, uint16_t version, const oc_search *m);
 oc_result oc_encode_search_results(oc_wbuf *w, uint16_t version, const oc_search_results *m);
 oc_result oc_encode_backfill_request(oc_wbuf *w, uint16_t version, const oc_backfill_request *m);
+oc_result oc_encode_history_request(oc_wbuf *w, uint16_t version, const oc_history_request *m);
 oc_result oc_encode_backfill_done(oc_wbuf *w, uint16_t version, const oc_backfill_done *m);
 oc_result oc_encode_error(oc_wbuf *w, uint16_t version, const oc_error *m);
 
@@ -703,6 +710,7 @@ oc_result oc_decode_change_password(oc_rbuf *p, oc_change_password *m);
 oc_result oc_decode_profile_updated(oc_rbuf *p, oc_profile_updated *m);
 oc_result oc_decode_search(oc_rbuf *p, oc_search *m);
 oc_result oc_decode_search_results(oc_rbuf *p, oc_search_result_entry *entries, uint16_t cap, uint16_t *out_count, uint8_t *out_truncated);
+oc_result oc_decode_history_request(oc_rbuf *p, oc_history_request *m);
 oc_result oc_decode_backfill_request(oc_rbuf *p, oc_cursor *cursors, uint16_t cap, uint16_t *out_count);
 oc_result oc_decode_backfill_done(oc_rbuf *p, oc_backfill_done *m);
 oc_result oc_decode_error(oc_rbuf *p, oc_error *m);

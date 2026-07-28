@@ -235,6 +235,13 @@ enum { DRAFT_MAX = 24 };
 static struct { uint64_t cid; WCHAR text[1024]; } g_drafts[DRAFT_MAX];
 static int g_n_drafts;
 
+/* WIN-16: paging older history. One request in flight at a time, and a
+ * remembered "we reached the top" so we stop asking a channel that has no more. */
+static uint64_t g_hist_pending_chan, g_hist_before;
+static ULONGLONG g_hist_deadline;
+static uint64_t g_hist_exhausted[32];
+static int g_n_hist_exhausted;
+
 static uint64_t g_unread_from;
 static uint64_t g_unread_chan;
 static D2D1_RECT_F g_unread_jump;      /* "N new" affordance in the header */
@@ -1481,7 +1488,10 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
     if (content_w < 80) content_w = 80;
 
     size_t n = nmsgs, first = 0;
-    enum { CAP = 600 };
+    /* The render window, not a history limit: with paging (WIN-16) a channel can
+     * hold far more than this, and only the newest CAP are laid out. Raised from
+     * 600 so several pages stay reachable by scrolling without re-requesting. */
+    enum { CAP = 2000 };
     static IDWriteTextLayout *layouts[CAP];
     static float heights[CAP];
     static uint32_t wlens[CAP];
@@ -1617,6 +1627,24 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
         if (layouts[i]) IDWriteTextLayout_Release(layouts[i]);
         layouts[i] = NULL;
     }
+
+    /* At the top of what we hold, pull the previous page (WIN-16). Guarded by a
+     * single in-flight request and by a per-channel "no more" mark, so this
+     * cannot turn a scroll into a request storm. */
+    if (capture && *scroll_max > 0.5f && *scroll >= *scroll_max - 1.0f &&
+        nmsgs > 0 && g_sel && !g_hist_pending_chan) {
+        int done = 0;
+        for (int k = 0; k < g_n_hist_exhausted; k++) if (g_hist_exhausted[k] == g_sel) done = 1;
+        if (!done) {
+            g_hist_pending_chan = g_sel;
+            g_hist_deadline = GetTickCount64() + 5000;
+            g_hist_before = msgs[0].message_id;
+            oc_client_history(g_client, g_sel, msgs[0].message_id);
+        }
+    }
+    if (capture && g_hist_pending_chan == g_sel)
+        draw_text(rt, "Loading older messages\u2026", g_small,
+                  rf(reg.left + 20, reg.top + 4, reg.right - 20, reg.top + 24), OC_COL_FAINT);
 
     /* Scrollbar. scroll 0 => pinned bottom => thumb at the bottom of the track;
      * scroll_max => scrolled to top => thumb at top. */
@@ -4958,6 +4986,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * toast channel while the sign-in view owns the window. */
             if (g_view == VIEW_SIGNIN) { if (g_si_connecting) signin_poll(hwnd); }
             else toast_tick(m);
+            /* Resolve an in-flight history page. Older messages land ABOVE the
+             * view, and g_scroll is measured from the bottom, so the reading
+             * position stays put on its own — nothing to compensate for.
+             *
+             * A page that never arrives means we are at the top of the channel:
+             * mark it so, or every scroll to the top asks again forever. */
+            if (g_hist_pending_chan) {
+                const oc_channel *hc = oc_model_channel((oc_model *)m, g_hist_pending_chan);
+                if (hc && hc->n_msgs && hc->msgs[0].message_id < g_hist_before) {
+                    g_hist_pending_chan = 0;
+                } else if (GetTickCount64() > g_hist_deadline) {
+                    if (g_n_hist_exhausted < 32) g_hist_exhausted[g_n_hist_exhausted++] = g_hist_pending_chan;
+                    g_hist_pending_chan = 0;
+                }
+            }
             /* An armed jump the transcript never resolved (WIN-3): the message is
              * older than the backfill window, so say so rather than leaving the
              * click looking like it did nothing. */

@@ -131,6 +131,7 @@ enum {
     OC_CMD_UPLOAD,          /* upload+post a file to `channel_id`: body = local path */
     OC_CMD_DOWNLOAD,        /* download an attachment: message_id = attachment_id, body = dest path */
     OC_CMD_LOGOUT,          /* revoke this session (op = scope) and close the connection */
+    OC_CMD_HISTORY,         /* page backwards: channel_id, message_id = before-id (0 = newest) */
     OC_CMD_QUIT
 };
 

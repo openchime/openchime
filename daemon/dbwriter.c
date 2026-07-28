@@ -2292,6 +2292,93 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Page backwards through one channel (§6.3, WIN-16): the newest `search_limit`
+ * top-level messages strictly older than `message_id`. Answers with the same
+ * BACKFILL_OK shape as the forward replay, so the net thread needs no new
+ * emit path and the client folds the rows in the same way.
+ *
+ * `truncated` here means "there is more above this page", which is what lets a
+ * client stop asking at the top of the channel instead of retrying forever. */
+static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_BACKFILL_OK;
+    r->channel_id = j->channel_id;
+    if (!channel_read_access(db, j->channel_id, j->user_id)) return r;
+
+    uint16_t lim = j->search_limit;
+    if (lim == 0 || lim > OC_BACKFILL_TAIL) lim = OC_BACKFILL_TAIL;
+    uint64_t before = j->message_id ? j->message_id : (uint64_t)INT64_MAX;
+
+    sqlite3_stmt *st = NULL;
+    /* Innermost query walks DESC to take the page nearest `before`; the outer
+     * one flips it back to ascending, which is the order a replay must arrive
+     * in for the client's high-water dedup to behave. */
+    if (sqlite3_prepare_v2(db,
+            "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name FROM ("
+            "  SELECT m.id AS id, m.author_id AS author_id, m.created_at_ms AS created_at_ms,"
+            "         m.body AS body,"
+            "         (SELECT COUNT(*) FROM messages c WHERE c.parent_id=m.id) AS reply_count,"
+            "         (SELECT COALESCE(MAX(c.created_at_ms),0) FROM messages c WHERE c.parent_id=m.id) AS last_reply,"
+            "         COALESCE(NULLIF(m.author_name,''), u.display_name, '') AS author_name"
+            "    FROM messages m LEFT JOIN users u ON u.id = m.author_id"
+            "   WHERE m.channel_id=?1 AND m.id<?2 AND m.parent_id IS NULL"
+            "   ORDER BY m.id DESC LIMIT ?3"
+            ") ORDER BY id;", -1, &st, NULL) != SQLITE_OK)
+        return r;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)before);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)lim);
+
+    size_t cap = 16, n = 0;
+    oc_replay_msg *arr = malloc(cap * sizeof *arr);
+    while (arr && sqlite3_step(st) == SQLITE_ROW) {
+        if (n == cap) {
+            cap *= 2;
+            oc_replay_msg *g = realloc(arr, cap * sizeof *arr);
+            if (!g) break;
+            arr = g;
+        }
+        oc_replay_msg *m = &arr[n];
+        memset(m, 0, sizeof *m);
+        m->message_id  = (uint64_t)sqlite3_column_int64(st, 0);
+        m->channel_id  = j->channel_id;
+        m->author_id   = (uint64_t)sqlite3_column_int64(st, 1);
+        m->server_time = (uint64_t)sqlite3_column_int64(st, 2);
+        const void *b = sqlite3_column_blob(st, 3);
+        int blen = sqlite3_column_bytes(st, 3);
+        if (b && blen > 0) {
+            m->body = malloc((size_t)blen);
+            if (m->body) { memcpy(m->body, b, (size_t)blen); m->body_len = (size_t)blen; }
+        }
+        m->reply_count   = (uint32_t)sqlite3_column_int64(st, 4);
+        m->last_reply_at = (uint64_t)sqlite3_column_int64(st, 5);
+        const char *an = (const char *)sqlite3_column_text(st, 6);
+        if (an && an[0]) m->author_name = strdup(an);
+        load_message_attachments(db, m->message_id, m->attach, &m->n_attach);
+        n++;
+    }
+    sqlite3_finalize(st);
+    r->replay = arr;
+    r->n_replay = n;
+
+    /* Anything older still? Answered from the oldest row we just took. */
+    if (n > 0) {
+        sqlite3_stmt *mt = NULL;
+        if (sqlite3_prepare_v2(db,
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE channel_id=?1 AND id<?2 "
+                "AND parent_id IS NULL);", -1, &mt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(mt, 1, (sqlite3_int64)j->channel_id);
+            sqlite3_bind_int64(mt, 2, (sqlite3_int64)arr[0].message_id);
+            if (sqlite3_step(mt) == SQLITE_ROW)
+                r->truncated = (uint8_t)sqlite3_column_int(mt, 0);
+            sqlite3_finalize(mt);
+        }
+    }
+    return r;
+}
+
 /* --- Queue plumbing ----------------------------------------------------- */
 
 static void push_result(oc_dbwriter *w, oc_dbres *r) {
@@ -2948,7 +3035,7 @@ static oc_dbres *process_storage_status(sqlite3 *db, const oc_job *j);
 static oc_dbres *process_audit_query(sqlite3 *db, const oc_job *j);
 
 static int is_read_job(int type) {
-    return type == OC_JOB_BACKFILL || type == OC_JOB_SEARCH ||
+    return type == OC_JOB_BACKFILL || type == OC_JOB_HISTORY || type == OC_JOB_SEARCH ||
            type == OC_JOB_LIST_CHANNELS || type == OC_JOB_LIST_USERS ||
            type == OC_JOB_LIST_REACTIONS || type == OC_JOB_LIST_THREAD ||
            type == OC_JOB_TYPING || type == OC_JOB_ATTACH_LOOKUP ||
@@ -2962,6 +3049,7 @@ static int is_read_job(int type) {
 /* Dispatch a read-only job against `rdb`. */
 static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_BACKFILL)       return process_backfill(rdb, j);
+    if (j->type == OC_JOB_HISTORY)        return process_history(rdb, j);
     if (j->type == OC_JOB_SEARCH)         return process_search(rdb, j);
     if (j->type == OC_JOB_LIST_CHANNELS)  return process_list_channels(rdb, j);
     if (j->type == OC_JOB_LIST_USERS)     return process_list_users(rdb, j);

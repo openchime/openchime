@@ -69,7 +69,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * writes; PRUNE is submitted by the push worker when central reports a
         * token stale (fire-and-forget, no result). */
        OC_JOB_REGISTER_DEVICE_TOKEN = 50, OC_JOB_UNREGISTER_DEVICE_TOKEN = 51,
-       OC_JOB_PRUNE_DEVICE_TOKEN = 52 };
+       OC_JOB_PRUNE_DEVICE_TOKEN = 52,
+       /* Page backwards through one channel's history (§6.3). Read-only; it
+        * answers with the same BACKFILL_OK shape the forward replay uses. */
+       OC_JOB_HISTORY = 53 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;

@@ -977,6 +977,15 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_backfill_request(&w, OC_PROTOCOL_VERSION, &req) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_HISTORY) {
+                /* Older messages, so nothing here touches the high-water mark:
+                 * hw tracks the NEWEST id seen and a backwards page is all
+                 * below it. The model dedups by id either way. */
+                uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_history_request hr = { c->channel_id, c->message_id, 0 };
+                if (oc_encode_history_request(&w, OC_PROTOCOL_VERSION, &hr) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_SEND && c->body) {
                 /* Record in the outbox before sending (REQ-102): a drop before the
                  * SEND_ACK leaves it there to be resent, deduped by the idem. */

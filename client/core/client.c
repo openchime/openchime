@@ -194,6 +194,15 @@ void oc_client_create_channel(oc_client *c, const char *name) {
     oc_client_create_channel_ex(c, name, 1);
 }
 
+void oc_client_history(oc_client *c, uint64_t channel_id, uint64_t before_message_id) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_HISTORY);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = before_message_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 static void channel_op(oc_client *c, int type, uint64_t channel_id) {
     if (!c || !channel_id) return;
     oc_cmd *cmd = oc_cmd_new(type);

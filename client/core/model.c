@@ -445,8 +445,18 @@ static oc_channel *channel_ensure(oc_model *m, uint64_t channel_id) {
 static int channel_append(oc_channel *c, uint64_t author_id, const char *author_name,
                           uint64_t message_id, uint64_t server_time, char **body) {
     /* Dedup on the per-channel high-water mark (ARCH-45). message_id 0 means the
-     * server did not assign one (shouldn't happen for a BROADCAST) — keep it. */
-    if (message_id && message_id <= c->high_water) return 0;
+     * server did not assign one (shouldn't happen for a BROADCAST) — keep it.
+     *
+     * An id at or below the mark is USUALLY a redelivery, but it is also what a
+     * backwards history page looks like (WIN-16). So instead of rejecting it
+     * outright, check whether we actually hold it: if not, it is older history
+     * and belongs at its sorted position. Rejecting on the mark alone silently
+     * discarded every paged-in message. */
+    int older = (message_id && message_id <= c->high_water);
+    if (older) {
+        for (size_t i = 0; i < c->n_msgs; i++)
+            if (c->msgs[i].message_id == message_id) return 0;   /* genuine redelivery */
+    }
     if (c->n_msgs == c->cap_msgs) {
         size_t cap = c->cap_msgs ? c->cap_msgs * 2 : 32;
         oc_msg *nm = realloc(c->msgs, cap * sizeof *nm);
@@ -454,7 +464,15 @@ static int channel_append(oc_channel *c, uint64_t author_id, const char *author_
         c->msgs = nm;
         c->cap_msgs = cap;
     }
-    oc_msg *msg = &c->msgs[c->n_msgs++];
+    /* Keep the array ordered by id: the renderer walks it as the transcript, and
+     * grouping/date dividers assume ascending time. */
+    size_t at = c->n_msgs;
+    if (older) {
+        while (at > 0 && c->msgs[at - 1].message_id > message_id) at--;
+        memmove(&c->msgs[at + 1], &c->msgs[at], (c->n_msgs - at) * sizeof *c->msgs);
+    }
+    c->n_msgs++;
+    oc_msg *msg = &c->msgs[at];
     memset(msg, 0, sizeof *msg);   /* clear reactions et al. before we populate */
     msg->body = *body;
     snprintf(msg->author_name, sizeof msg->author_name, "%s", author_name ? author_name : "");
