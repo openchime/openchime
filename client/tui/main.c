@@ -46,6 +46,7 @@
 
 #include "client.h"
 #include "model.h"
+#include "complete.h"
 #include "resolve.h"    /* workspace -> host:port (REQ-010/011) */
 #include "store.h"      /* peek a stored session token (skip the login box) */
 #include "secret_os.h" /* OS keyring for the session token */
@@ -630,76 +631,14 @@ static void draw_profile(const oc_model *m, int W, int H) {
 
 /* ---- composer autocomplete (commands, channels, @users, :emoji:) ----------- */
 
-typedef struct { char repl[80]; char disp[96]; } ac_cand;
-
-static int ci_prefix(const char *s, const char *pre) {
-    for (; *pre; s++, pre++)
-        if (!*s || tolower((unsigned char)*s) != tolower((unsigned char)*pre)) return 0;
-    return 1;
-}
+/* ac_cand is oc_completion from the core; keep the short local spelling. */
+typedef oc_completion ac_cand;
 
 
-static const struct { const char *name; const char *emoji; } AC_EMOJI[] = {
-    {"+1","\xf0\x9f\x91\x8d"}, {"-1","\xf0\x9f\x91\x8e"}, {"thumbsup","\xf0\x9f\x91\x8d"},
-    {"heart","\xe2\x9d\xa4\xef\xb8\x8f"}, {"fire","\xf0\x9f\x94\xa5"}, {"tada","\xf0\x9f\x8e\x89"},
-    {"smile","\xf0\x9f\x98\x84"}, {"laughing","\xf0\x9f\x98\x86"}, {"joy","\xf0\x9f\x98\x82"},
-    {"grin","\xf0\x9f\x98\x81"}, {"wink","\xf0\x9f\x98\x89"}, {"thinking","\xf0\x9f\xa4\x94"},
-    {"eyes","\xf0\x9f\x91\x80"}, {"100","\xf0\x9f\x92\xaf"}, {"clap","\xf0\x9f\x91\x8f"},
-    {"pray","\xf0\x9f\x99\x8f"}, {"rocket","\xf0\x9f\x9a\x80"}, {"star","\xe2\xad\x90"},
-    {"sparkles","\xe2\x9c\xa8"}, {"check","\xe2\x9c\x85"}, {"x","\xe2\x9d\x8c"},
-    {"warning","\xe2\x9a\xa0\xef\xb8\x8f"}, {"bulb","\xf0\x9f\x92\xa1"}, {"bug","\xf0\x9f\x90\x9b"},
-    {"wave","\xf0\x9f\x91\x8b"}, {"ok","\xf0\x9f\x91\x8c"}, {"muscle","\xf0\x9f\x92\xaa"},
-    {"cry","\xf0\x9f\x98\xa2"}, {"sob","\xf0\x9f\x98\xad"}, {"sweat","\xf0\x9f\x98\x85"},
-    {"sunglasses","\xf0\x9f\x98\x8e"}, {"ghost","\xf0\x9f\x91\xbb"}, {"skull","\xf0\x9f\x92\x80"},
-    {"coffee","\xe2\x98\x95"}, {"pizza","\xf0\x9f\x8d\x95"}, {"beer","\xf0\x9f\x8d\xba"},
-    {"cake","\xf0\x9f\x8e\x82"}, {"gift","\xf0\x9f\x8e\x81"}, {"zap","\xe2\x9a\xa1"},
-    {"question","\xe2\x9d\x93"},
-};
 
-/* Context-aware completions for the current (trailing) composer token. Returns
- * the candidate count, fills out[], and sets *repl_start to the byte offset where
- * the replacement begins. Recomputed live each frame and on Tab. */
-static int ac_candidates(const oc_model *m, const char *s, ac_cand *out, int max, int *repl_start) {
-    size_t len = strlen(s);
-    int ws = 0;
-    for (int i = (int)len - 1; i >= 0; i--) if (s[i] == ' ') { ws = i + 1; break; }
-    const char *tok = s + ws;
-    int n = 0;
-    *repl_start = ws;
-
-    /* No slash-command completion: the composer is menu-driven and doesn't run
-     * commands. Tab still completes content — @mentions, #channels, :emoji:. */
-    if (tok[0] == ':' && !strchr(tok + 1, ':')) {            /* :emoji: shortcode */
-        for (size_t i = 0; i < sizeof AC_EMOJI / sizeof *AC_EMOJI && n < max; i++)
-            if (ci_prefix(AC_EMOJI[i].name, tok + 1)) {
-                snprintf(out[n].repl, sizeof out[n].repl, "%s", AC_EMOJI[i].emoji);
-                snprintf(out[n].disp, sizeof out[n].disp, ":%s: %s", AC_EMOJI[i].name, AC_EMOJI[i].emoji);
-                n++;
-            }
-        return n;
-    }
-    if (tok[0] == '@') {                                     /* @mention */
-        for (size_t i = 0; i < m->n_users && n < max; i++)
-            if (m->users[i].name[0] && ci_prefix(m->users[i].name, tok + 1)) {
-                snprintf(out[n].repl, sizeof out[n].repl, "@%s", m->users[i].name);
-                snprintf(out[n].disp, sizeof out[n].disp, "%s", m->users[i].name);
-                n++;
-            }
-        return n;
-    }
-    if (tok[0] == '#') {                                     /* #channel in a message */
-        for (size_t i = 0; i < m->n_channels && n < max; i++) {
-            const oc_channel *c = &m->channels[i];
-            if (c->kind != OC_CHANNEL_KIND_DM && c->name && ci_prefix(c->name, tok + 1)) {
-                snprintf(out[n].repl, sizeof out[n].repl, "#%s", c->name);
-                snprintf(out[n].disp, sizeof out[n].disp, "%s", c->name);
-                n++;
-            }
-        }
-        return n;
-    }
-    return 0;
-}
+/* The emoji catalogue and the completion rules live in the core
+ * (client/core/complete.[ch]) so the TUI and the Win32 GUI complete a token
+ * identically — same shortcodes, same match order (ARCH-74). */
 
 /* ---- action menus (menu-driven; ARCH-83) ---------------------------------- *
  * A discoverable tk_list-in-a-modal that replaces cryptic nav keys and slash
@@ -1022,7 +961,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
      * line (last status/error + typing indicator). */
     tk_fill(H - 3, 0, W, TB_DEFAULT);
     ac_cand cands[16]; int rs, nc = 0;
-    if (clen > 0) nc = ac_candidates(m, composer, cands, 16, &rs);
+    if (clen > 0) nc = (int)oc_complete(m, composer, cands, 16, &rs, NULL);
     if (nc > 0) {
         int active = ((ac_idx % nc) + nc) % nc;
         int cx = tk_text(0, H - 3, W, " \xe2\x96\xb8 ", TB_CYAN | TB_BOLD, TB_DEFAULT);   /* ▸ */
@@ -1104,17 +1043,6 @@ static void render(oc_client *cl, size_t focus, const char *composer,
 }
 
 
-/* Case-insensitive subsequence ("fuzzy") match: do needle's chars appear in
- * order within hay? An empty needle matches everything. */
-static int fuzzy(const char *hay, const char *needle) {
-    if (!*needle) return 1;
-    for (; *hay; hay++)
-        if (tolower((unsigned char)*hay) == tolower((unsigned char)*needle)) {
-            needle++;
-            if (!*needle) return 1;
-        }
-    return 0;
-}
 
 
 
@@ -1312,10 +1240,10 @@ static void draw_switcher(int sel) {
 /* ---- emoji picker (r on a selected message) ------------------------------- */
 
 static int picker_build(const char *q, const char **emoji, const char **name, int max) {
-    int n = 0;
-    for (size_t i = 0; i < sizeof AC_EMOJI / sizeof *AC_EMOJI && n < max; i++)
-        if (fuzzy(AC_EMOJI[i].name, q)) { emoji[n] = AC_EMOJI[i].emoji; name[n] = AC_EMOJI[i].name; n++; }
-    return n;
+    const oc_emoji *hits[128];
+    size_t nh = oc_emoji_search(q, hits, (size_t)max < 128 ? (size_t)max : 128);
+    for (size_t i = 0; i < nh; i++) { emoji[i] = hits[i]->emoji; name[i] = hits[i]->name; }
+    return (int)nh;
 }
 
 static void draw_picker(const char *q, int esel) {
@@ -2277,7 +2205,7 @@ int main(int argc, char **argv) {
         } else if (ev.key == TB_KEY_TAB) {
             if (clen > 0) {                    /* autocomplete the trailing token */
                 ac_cand cands[16]; int rs;
-                int n = ac_candidates(oc_client_model(cl), composer, cands, 16, &rs);
+                int n = (int)oc_complete(oc_client_model(cl), composer, cands, 16, &rs, NULL);
                 if (n > 0) {
                     const char *repl = cands[((ac_idx % n) + n) % n].repl;
                     char nb[COMPOSER_CAP];

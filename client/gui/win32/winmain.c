@@ -36,6 +36,7 @@
 #include "client.h"
 #include "secret_os.h"
 #include "model.h"
+#include "complete.h"   /* shared @user / #channel / :emoji: completion */
 #include "resolve.h"
 #include "store.h"            /* peek a stored session token (skip the login box) */
 #include "oc_port.h"          /* oc_mkdir, oc_localtime_r */
@@ -109,6 +110,8 @@ static IDWriteTextFormat *g_ui_b;   /* unread sidebar rows (semibold) */
 static IDWriteTextFormat *g_small;  /* subtitles / meta lines */
 static IDWriteTextFormat *g_ava;    /* avatar initial (centered) */
 static IDWriteTextFormat *g_rail;   /* tiny rail item labels (centered) */
+static IDWriteTextFormat *g_emoji;   /* Segoe UI Emoji, picker cells (22px) */
+static IDWriteTextFormat *g_emoji_s; /* the same, sized for reaction chips */
 /* Lucide vector icons: geometry cached once (device-independent, from the factory,
  * so it survives render-target recreation and works for both paint and shots). */
 static ID2D1PathGeometry *g_icon_geo[OC_ICON_COUNT];
@@ -193,6 +196,26 @@ static D2D1_RECT_F g_ws_hdr_btn;        /* channel-column workspace header (open
 static D2D1_RECT_F g_hdr_gear, g_hdr_compose;   /* header settings + compose buttons */
 static HWND     g_find;                 /* "Find a conversation" filter box (native EDIT) */
 static HWND     g_srch;                 /* search-overlay query box (WIN-4, native EDIT) */
+
+/* Composer autocomplete (WIN-7). The candidate list is rebuilt from the text up
+ * to the caret on every change; the popover renders above the composer and the
+ * RichEdit subclass steals the navigation keys while it is open. */
+/* Emoji picker (WIN-8). One panel serves two callers: with g_pick_mid == 0 it
+ * inserts into the composer, otherwise it reacts to that message — the same
+ * catalogue either way, so the reaction set is no longer six hardcoded glyphs. */
+static int      g_pick_open;
+static uint64_t g_pick_mid;
+static HWND     g_pick_edit;        /* native search box */
+static float    g_pick_scroll;
+static D2D1_RECT_F g_pick_panel, g_pick_box;
+static struct { D2D1_RECT_F r; const char *emoji; } g_pick_cells[256];
+static int      g_n_pick_cells;
+
+enum { AC_MAX = 8 };
+static oc_completion g_ac[AC_MAX];
+static int   g_n_ac, g_ac_sel, g_ac_kind;
+static D2D1_RECT_F g_ac_rows[AC_MAX];   /* hit-boxes, captured at paint */
+static D2D1_RECT_F g_ac_panel;
 static float    g_srch_scroll;          /* search-results scroll offset, px */
 static float    g_srch_max;             /* its maximum, computed at paint */
 static D2D1_RECT_F g_srch_box;          /* the query field's chrome, for layout_search */
@@ -234,6 +257,7 @@ static int   g_n_sw;
 
 static D2D1_RECT_F g_attach_btn;        /* composer attach (+) hit-box */
 static D2D1_RECT_F g_send_btn;          /* composer send-button hit-box */
+static D2D1_RECT_F g_emoji_btn;         /* composer emoji-picker hit-box (WIN-8) */
 static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
 
 /* ---- sign-in view (WIN-2, REQ-263/020) -------------------------------------
@@ -437,6 +461,21 @@ static float text_width(const char *s, IDWriteTextFormat *fmt) {
     return out;
 }
 
+/* Colour emoji need both the emoji font and ENABLE_COLOR_FONT; without the flag
+ * D2D renders the COLR layers as a single flat glyph. */
+static void draw_emoji_fmt(ID2D1RenderTarget *rt, const char *s, D2D1_RECT_F r,
+                           IDWriteTextFormat *fmt) {
+    WCHAR w[16];
+    int n = to_w(s, w, 16);
+    if (n <= 0 || !fmt) return;
+    ID2D1RenderTarget_DrawText(rt, w, (UINT32)n, fmt, &r, paint_with(OC_COL_TEXT),
+                               D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+                               DWRITE_MEASURING_MODE_NATURAL);
+}
+static void draw_emoji_glyph(ID2D1RenderTarget *rt, const char *s, D2D1_RECT_F r) {
+    draw_emoji_fmt(rt, s, r, g_emoji);
+}
+
 static void draw_text(ID2D1RenderTarget *rt, const char *s, IDWriteTextFormat *fmt,
                       D2D1_RECT_F r, uint32_t rgb) {
     WCHAR w[1024];
@@ -580,6 +619,12 @@ static void d2d_init(void) {
     g_small = mk_fmt(UI, 12.5f, DWRITE_FONT_WEIGHT_NORMAL,    DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
     g_ava   = mk_fmt(UI, 15.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER,   DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
     g_rail  = mk_fmt(UI, 9.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
+    /* Named explicitly, because falling back from "Segoe UI" reaches the
+     * monochrome Segoe UI Symbol glyphs first — the picker rendered as outlines. */
+    g_emoji = mk_fmt(L"Segoe UI Emoji", 22.0f, DWRITE_FONT_WEIGHT_NORMAL,
+                     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
+    g_emoji_s = mk_fmt(L"Segoe UI Emoji", 13.0f, DWRITE_FONT_WEIGHT_NORMAL,
+                       DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
     /* Round-capped stroke style for the Lucide line icons. */
     D2D1_STROKE_STYLE_PROPERTIES ssp;
     ZeroMemory(&ssp, sizeof ssp);
@@ -1129,6 +1174,8 @@ static float msg_height(const oc_msg *msg, float content_w, int grouped,
     return MSG_BODY_DY(grouped) + body_h + (float)extra * LINE_H + MSG_BOT(grouped);
 }
 
+static int reaction_is_mine(const oc_msg *msg, const char *emoji);   /* fwd */
+
 static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg *msg,
                          IDWriteTextLayout *body, float x0, float y, float content_w,
                          int grouped) {
@@ -1170,11 +1217,24 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
 
     /* Meta lines: reactions, attachments, thread. */
     if (msg->n_reactions) {
-        char line[256] = ""; size_t off = 0;
-        for (int i = 0; i < msg->n_reactions && off < sizeof line - 32; i++)
-            off += (size_t)snprintf(line + off, sizeof line - off, "%s %u   ",
-                                    msg->reactions[i].emoji, msg->reactions[i].count);
-        draw_text(rt, line, g_small, rf(tx, by, x0 + content_w + AVA + 12, by + LINE_H), OC_COL_MUTED);
+        /* Chips rather than one grey text run: the emoji needs the colour-font
+         * path anyway, and a bordered count reads as the clickable thing it is. */
+        float cx = tx, ch = 22, top = by + 1;
+        for (int i = 0; i < msg->n_reactions; i++) {
+            char cnt[16];
+            snprintf(cnt, sizeof cnt, "%u", msg->reactions[i].count);
+            float cw = 34 + text_width(cnt, g_small);
+            if (cx + cw > x0 + content_w + AVA + 12) break;
+            D2D1_RECT_F chip = rf(cx, top, cx + cw, top + ch);
+            int mine = reaction_is_mine(msg, msg->reactions[i].emoji);
+            fill_round(rt, chip, 11.0f, mine ? OC_COL_SELECT : OC_COL_INPUT);
+            stroke_round(rt, chip, 11.0f, mine ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
+            draw_emoji_fmt(rt, msg->reactions[i].emoji,
+                           rf(cx + 4, top, cx + 22, top + ch), g_emoji_s);
+            draw_text(rt, cnt, g_small, rf(cx + 24, top, chip.right - 4, top + ch),
+                      mine ? OC_COL_TEXT : OC_COL_MUTED);
+            cx += cw + 5;
+        }
         by += LINE_H;
     }
     for (int i = 0; i < msg->n_attach; i++) {
@@ -1960,6 +2020,161 @@ static void draw_signin(ID2D1RenderTarget *rt, float W, float H) {
     }
 }
 
+/* The candidate popover, anchored to the composer's top edge and growing
+ * upwards. Drawn last so it sits over the transcript. */
+static void draw_autocomplete(ID2D1RenderTarget *rt, float x0, float w, float h) {
+    if (g_n_ac <= 0) { g_ac_panel = rf(0, 0, 0, 0); return; }
+    /* Height = header band + rows + hint band. Each band is accounted for once,
+     * or the hint lands on top of the last row. */
+    float rowh = 26, hdr_h = 22, hint_h = 22;
+    float pw = 320; if (pw > w - 40) pw = w - 40;
+    float ph = hdr_h + g_n_ac * rowh + hint_h;
+    float px = x0 + 20, py = h - COMPOSER_H - ph - 6;
+    if (py < HEADER_H + 6) py = HEADER_H + 6;
+    g_ac_panel = rf(px, py, px + pw, py + ph);
+
+    /* Same surface + drop shadow as the dropdown menus, so the popover reads as
+     * one of the app's floating panels rather than a new kind of thing. */
+    fill_round(rt, rf(g_ac_panel.left + 2, g_ac_panel.top + 4,
+                      g_ac_panel.right + 2, g_ac_panel.bottom + 4), 8.0f, OC_COL_RAIL);
+    fill_round(rt, g_ac_panel, 8.0f, OC_COL_INPUT);
+    stroke_round(rt, g_ac_panel, 8.0f, OC_COL_BORDER, 1.0f);
+
+    const char *hdr = g_ac_kind == OC_AC_MENTION ? "PEOPLE"
+                    : g_ac_kind == OC_AC_CHANNEL ? "CHANNELS" : "EMOJI";
+    draw_text(rt, hdr, g_small, rf(px + 12, py + 5, px + pw - 12, py + hdr_h), OC_COL_FAINT);
+
+    float y = py + hdr_h;
+    for (int i = 0; i < g_n_ac; i++) {
+        D2D1_RECT_F r = rf(px + 4, y, px + pw - 4, y + rowh);
+        g_ac_rows[i] = r;
+        if (i == g_ac_sel) fill_round(rt, r, 5.0f, OC_COL_ACCENT);
+        draw_text(rt, g_ac[i].disp, g_ui, rf(px + 12, y + 3, px + pw - 12, y + rowh),
+                  i == g_ac_sel ? 0xFFFFFF : OC_COL_TEXT);
+        y += rowh;
+    }
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    draw_text(rt, "Tab or Enter to insert", g_small,
+              rf(px + 12, py + ph - hint_h + 3, px + pw - 12, py + ph - 2), OC_COL_FAINT);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+}
+
+/* The emoji picker: a search box over a category-sectioned grid. Anchored above
+ * the composer like the autocomplete popover, so both "insert an emoji" paths
+ * appear in the same place. */
+static void draw_emoji_picker(ID2D1RenderTarget *rt, float x0, float w, float h) {
+    g_n_pick_cells = 0;
+    if (!g_pick_open) { g_pick_panel = rf(0, 0, 0, 0); return; }
+
+    float pw = 360; if (pw > w - 40) pw = w - 40;
+    float ph = 300; if (ph > h - HEADER_H - COMPOSER_H - 20) ph = h - HEADER_H - COMPOSER_H - 20;
+    float px = x0 + 20, py = h - COMPOSER_H - ph - 6;
+    if (py < HEADER_H + 6) py = HEADER_H + 6;
+    g_pick_panel = rf(px, py, px + pw, py + ph);
+
+    fill_round(rt, rf(px + 2, py + 4, px + pw + 2, py + ph + 4), 10.0f, OC_COL_RAIL);
+    fill_round(rt, g_pick_panel, 10.0f, OC_COL_INPUT);
+    stroke_round(rt, g_pick_panel, 10.0f, OC_COL_BORDER, 1.0f);
+
+    draw_text(rt, g_pick_mid ? "Add reaction" : "Emoji", g_name,
+              rf(px + 14, py + 8, px + pw - 14, py + 30), OC_COL_TEXT);
+
+    g_pick_box = rf(px + 12, py + 32, px + pw - 12, py + 62);
+    fill_round(rt, g_pick_box, 6.0f, OC_COL_BASE);
+    stroke_round(rt, g_pick_box, 6.0f, OC_COL_BORDER, 1.0f);
+    draw_lucide(rt, OC_ICON_SEARCH, rf(g_pick_box.left + 8, g_pick_box.top + 7,
+                                       g_pick_box.left + 24, g_pick_box.top + 23), OC_COL_MUTED);
+
+    char q[64] = "";
+    if (g_pick_edit) {
+        WCHAR wq[64]; GetWindowTextW(g_pick_edit, wq, 64);
+        WideCharToMultiByte(CP_UTF8, 0, wq, -1, q, sizeof q, NULL, NULL);
+    }
+
+    D2D1_RECT_F body = rf(px + 8, py + 68, px + pw - 8, py + ph - 8);
+    ID2D1RenderTarget_PushAxisAlignedClip(rt, &body, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+    const oc_emoji *hits[256];
+    size_t nh = oc_emoji_search(q[0] ? q : NULL, hits, 256);
+
+    float cell = 34, cols = (float)(int)((body.right - body.left) / cell);
+    if (cols < 1) cols = 1;
+    float y = body.top - g_pick_scroll, x = body.left;
+    int col = 0, last_cat = -1;
+    for (size_t i = 0; i < nh; i++) {
+        /* Category headings only when browsing; a filtered list is already the
+         * answer to a question and section breaks just fragment it. */
+        if (!q[0] && hits[i]->category != last_cat) {
+            if (col != 0) { y += cell; col = 0; x = body.left; }
+            if (y + 18 >= body.top && y <= body.bottom)
+                draw_text(rt, oc_emoji_category_name(hits[i]->category), g_small,
+                          rf(body.left + 4, y, body.right, y + 18), OC_COL_FAINT);
+            y += 20;
+            last_cat = hits[i]->category;
+        }
+        if (y + cell >= body.top && y <= body.bottom) {
+            D2D1_RECT_F r = rf(x, y, x + cell, y + cell);
+            if (g_n_pick_cells < 256) {
+                g_pick_cells[g_n_pick_cells].r = r;
+                g_pick_cells[g_n_pick_cells].emoji = hits[i]->emoji;
+                g_n_pick_cells++;
+            }
+            draw_emoji_glyph(rt, hits[i]->emoji, r);
+        }
+        x += cell;
+        if (++col >= (int)cols) { col = 0; x = body.left; y += cell; }
+    }
+    if (col != 0) y += cell;
+
+    float content = (y + g_pick_scroll) - body.top, visible = body.bottom - body.top;
+    float maxs = content > visible ? content - visible : 0;
+    if (g_pick_scroll > maxs) g_pick_scroll = maxs;
+    if (g_pick_scroll < 0) g_pick_scroll = 0;
+    if (nh == 0) overlay_empty(rt, body, "No emoji match that.");
+    ID2D1RenderTarget_PopAxisAlignedClip(rt);
+}
+
+static void ac_close(void);                                   /* fwd */
+static int  reaction_is_mine(const oc_msg *msg, const char *emoji);   /* fwd */
+
+/* Open the picker for the composer (mid == 0) or for reacting to a message. */
+static void picker_open(HWND hwnd, uint64_t mid) {
+    g_pick_open = 1; g_pick_mid = mid; g_pick_scroll = 0;
+    ac_close();
+    if (g_pick_edit) {
+        SetWindowTextW(g_pick_edit, L"");
+        ShowWindow(g_pick_edit, SW_SHOW);
+        SetFocus(g_pick_edit);
+    }
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static void picker_close(HWND hwnd) {
+    g_pick_open = 0; g_pick_mid = 0;
+    if (g_pick_edit) ShowWindow(g_pick_edit, SW_HIDE);
+    if (g_re) SetFocus(g_re);
+    if (hwnd) InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* Apply the chosen emoji to whichever caller opened the picker. */
+static void picker_choose(HWND hwnd, const char *emoji) {
+    if (!emoji || !g_client) { picker_close(hwnd); return; }
+    if (g_pick_mid) {
+        const oc_model *m = model();
+        const oc_channel *c = m ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+        const oc_msg *msg = find_msg(c, g_pick_mid);
+        oc_client_react(g_client, g_sel, g_pick_mid, emoji,
+                        (msg && reaction_is_mine(msg, emoji)) ? 0 : 1);
+    } else if (g_re) {
+        WCHAR w[16];
+        if (MultiByteToWideChar(CP_UTF8, 0, emoji, -1, w, 16) > 0) {
+            SendMessageW(g_re, EM_SETSEL, (WPARAM)-1, -1);   /* caret to end */
+            SendMessageW(g_re, EM_REPLACESEL, TRUE, (LPARAM)w);
+        }
+    }
+    picker_close(hwnd);
+}
+
 static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     float top = h - COMPOSER_H;
     fill(rt, rf(x0, top, x0 + w, h), OC_COL_BASE);
@@ -1977,6 +2192,11 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     IDWriteTextFormat_SetTextAlignment(g_hdr, DWRITE_TEXT_ALIGNMENT_CENTER);
     draw_text(rt, "+", g_hdr, rf(g_attach_btn.left, g_attach_btn.top - 2,
                                  g_attach_btn.right, g_attach_btn.bottom), OC_COL_MUTED);
+
+    /* Emoji picker, immediately right of attach. */
+    g_emoji_btn = rf(bx0 + 6 + sq, cy, bx0 + 6 + sq * 2, cy + sq);
+    draw_emoji_glyph(rt, "\xF0\x9F\x99\x82", g_emoji_btn);
+    IDWriteTextFormat_SetTextAlignment(g_hdr, DWRITE_TEXT_ALIGNMENT_CENTER);
 
     /* Send on the right — accent when there's text to send, muted when empty. */
     int has_text = g_re && GetWindowTextLengthW(g_re) > 0;
@@ -2036,9 +2256,13 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         float bh = draw_banner(rt, m, main_x, main_w);   /* pushes the transcript down */
         draw_transcript(rt, m, rf(main_x, HEADER_H + bh, main_r, H - COMPOSER_H));
         draw_composer(rt, main_x, main_w, H);
+        draw_autocomplete(rt, main_x, main_w, H);
+        draw_emoji_picker(rt, main_x, main_w, H);
         if (members > 0) draw_members(rt, m, W, H);
         else g_n_memrows = 0;
     } else {
+        g_n_ac = 0;
+        g_pick_open = 0;
         g_banner_on = 0;
         D2D1_RECT_F reg = rf(RAIL_W, 0, W, H);
         switch (g_view) {
@@ -2068,9 +2292,18 @@ static void paint(HWND hwnd) {
 
     ID2D1RenderTarget_BeginDraw(rt);
     render_scene(rt, m, W, H);
-    /* The search box is placed against chrome the scene just measured, so it can
-     * only be positioned after the scene is laid out. */
+    /* Boxes placed against chrome the scene just measured, so they can only be
+     * positioned after the scene is laid out. */
     layout_search(hwnd);
+    if (g_pick_edit) {
+        if (g_pick_open) {
+            ShowWindow(g_pick_edit, SW_SHOW);
+            MoveWindow(g_pick_edit, (int)(g_pick_box.left + 30), (int)(g_pick_box.top + 6),
+                       (int)(g_pick_box.right - g_pick_box.left - 40), 18, TRUE);
+        } else {
+            ShowWindow(g_pick_edit, SW_HIDE);
+        }
+    }
 
     HRESULT hr = ID2D1RenderTarget_EndDraw(rt, NULL, NULL);
     if (hr == (HRESULT)D2DERR_RECREATE_TARGET) {
@@ -2084,6 +2317,67 @@ static void paint(HWND hwnd) {
 /* ---- composer (native RichEdit) ------------------------------------------ */
 
 /* Send the composer's text to the selected channel and clear it. */
+/* ---- composer autocomplete (WIN-7) ---------------------------------------
+ * Everything works in UTF-16 for the RichEdit and UTF-8 for the core: the text
+ * up to the caret is converted once for oc_complete(), while the replacement
+ * range is found by scanning the UTF-16 buffer back to the token's whitespace
+ * boundary. Keeping the two independent avoids converting offsets between the
+ * encodings, which is where this kind of code usually goes wrong. */
+
+/* The caret, and the start of the token it sits in, as UTF-16 indices. */
+static int ac_token_range(WCHAR *buf, int cap, int *tok_start) {
+    if (!g_re) return -1;
+    DWORD sels = 0, sele = 0;
+    SendMessageW(g_re, EM_GETSEL, (WPARAM)&sels, (LPARAM)&sele);
+    if (sels != sele) return -1;                 /* a live selection: not completing */
+    int len = GetWindowTextLengthW(g_re);
+    if (len <= 0 || len >= cap) return -1;
+    GetWindowTextW(g_re, buf, cap);
+    int caret = (int)sele;
+    if (caret > len) caret = len;
+    int ts = 0;
+    for (int i = caret - 1; i >= 0; i--)
+        if (buf[i] == L' ' || buf[i] == L'\t' || buf[i] == L'\n' || buf[i] == L'\r') { ts = i + 1; break; }
+    *tok_start = ts;
+    return caret;
+}
+
+static void ac_close(void) { g_n_ac = 0; g_ac_sel = 0; }
+
+static void ac_rebuild(void) {
+    const oc_model *m = model();
+    WCHAR buf[4096]; int ts = 0;
+    int caret = m ? ac_token_range(buf, 4096, &ts) : -1;
+    if (caret < 0 || caret == ts) { ac_close(); return; }
+
+    /* Only the text up to the caret is a completion context — what follows is
+     * already-typed content the user moved back past. */
+    buf[caret] = 0;
+    char u8[4096];
+    if (WideCharToMultiByte(CP_UTF8, 0, buf, -1, u8, sizeof u8, NULL, NULL) <= 0) { ac_close(); return; }
+
+    g_n_ac = (int)oc_complete(m, u8, g_ac, AC_MAX, NULL, &g_ac_kind);
+    if (g_ac_sel >= g_n_ac) g_ac_sel = 0;
+}
+
+/* Replace the trailing token with the selected candidate, plus a trailing space
+ * so the next word starts cleanly. */
+static void ac_accept(void) {
+    if (g_n_ac <= 0 || !g_re) return;
+    WCHAR buf[4096]; int ts = 0;
+    int caret = ac_token_range(buf, 4096, &ts);
+    if (caret < 0) { ac_close(); return; }
+
+    WCHAR repl[128];
+    int n = MultiByteToWideChar(CP_UTF8, 0, g_ac[g_ac_sel].repl, -1, repl, 126);
+    if (n <= 0) { ac_close(); return; }
+    repl[n - 1] = L' '; repl[n] = 0;             /* overwrite the NUL with a space */
+
+    SendMessageW(g_re, EM_SETSEL, (WPARAM)ts, (LPARAM)caret);
+    SendMessageW(g_re, EM_REPLACESEL, TRUE, (LPARAM)repl);
+    ac_close();
+}
+
 static void composer_send(void) {
     if (!g_re || !g_client || !g_sel) return;
     int wlen = GetWindowTextLengthW(g_re);
@@ -2112,6 +2406,7 @@ static void composer_send(void) {
     }
     free(w);
     g_edit_msg = 0;
+    ac_close();
     SetWindowTextW(g_re, L"");
 }
 
@@ -2130,14 +2425,30 @@ static void composer_cancel_edit(void) {
     if (g_re) SetWindowTextW(g_re, L"");
 }
 
-/* Subclass proc: Enter sends, Shift+Enter inserts a newline. */
+/* Subclass proc: Enter sends, Shift+Enter inserts a newline. While the
+ * autocomplete popover is open it takes Up/Down/Tab/Enter/Esc first — Enter
+ * accepting a candidate rather than sending is what makes the popover feel like
+ * part of the composer instead of a thing floating over it. */
 static LRESULT CALLBACK re_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (g_n_ac > 0 && (msg == WM_KEYDOWN || msg == WM_CHAR)) {
+        int handled = 1;
+        switch (wp) {
+        case VK_UP:     if (msg == WM_KEYDOWN) g_ac_sel = (g_ac_sel + g_n_ac - 1) % g_n_ac; break;
+        case VK_DOWN:   if (msg == WM_KEYDOWN) g_ac_sel = (g_ac_sel + 1) % g_n_ac; break;
+        case VK_TAB:
+        case VK_RETURN: if (msg == WM_KEYDOWN) ac_accept(); break;
+        case VK_ESCAPE: if (msg == WM_KEYDOWN) ac_close(); break;
+        default: handled = 0;
+        }
+        if (handled) { InvalidateRect(GetParent(hwnd), NULL, FALSE); return 0; }
+    }
     if ((msg == WM_KEYDOWN || msg == WM_CHAR) && wp == VK_RETURN
         && !(GetKeyState(VK_SHIFT) & 0x8000)) {
         if (msg == WM_KEYDOWN) composer_send();
         return 0;                                   /* eat both so no newline/bell */
     }
     if ((msg == WM_KEYDOWN || msg == WM_CHAR) && wp == VK_ESCAPE) {
+        if (g_pick_open) { if (msg == WM_KEYDOWN) picker_close(GetParent(hwnd)); return 0; }
         if (any_overlay(model())) {
             if (msg == WM_KEYDOWN) close_overlays();
             return 0;
@@ -2163,7 +2474,9 @@ static void layout_composer(HWND hwnd) {
     /* Inside the composer box, between the attach (+) and send buttons. */
     float bx0 = main_x + 20, bx1 = (rc.right - members) - 20;
     float by0 = rc.bottom - COMPOSER_H + 12, by1 = rc.bottom - 16, boxh = by1 - by0;
-    int x = (int)(bx0 + 48), r = (int)(bx1 - 48);
+    /* Clear BOTH left buttons (attach + emoji), or the native child window
+     * covers the one nearest the text and it renders as a clipped sliver. */
+    int x = (int)(bx0 + 84), r = (int)(bx1 - 48);
     int reh = 24, top = (int)(by0 + (boxh - reh) / 2);
     MoveWindow(g_re, x, top, r - x, reh, TRUE);
 }
@@ -2410,9 +2723,13 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
     if (!msg) return;
     WCHAR wb[128];
     HMENU menu = CreatePopupMenu();
+    /* The six quick reactions stay inline as one-click affordances, with the
+     * full catalogue behind "More…" (WIN-8) rather than being the only choice. */
     HMENU react = CreatePopupMenu();
     for (int i = 0; i < 6; i++)
         AppendMenuW(react, MF_STRING, (UINT_PTR)(1 + i), wmenu(REACT_EMO[i], wb, 128));
+    AppendMenuW(react, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(react, MF_STRING, 7, L"More\u2026");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)react, L"React");
     for (int i = 0; i < msg->n_attach; i++) {
         char lbl[200];
@@ -2435,6 +2752,8 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
     if (cmd >= 1 && cmd <= 6) {
         const char *e = REACT_EMO[cmd - 1];
         oc_client_react(g_client, g_sel, mid, e, reaction_is_mine(msg, e) ? 0 : 1);
+    } else if (cmd == 7) {
+        picker_open(hwnd, mid);
     } else if (cmd == 20) {
         copy_to_clipboard(hwnd, msg->body ? msg->body : "");
     } else if (cmd == 21) {
@@ -2492,6 +2811,25 @@ static int in_rect(D2D1_RECT_F r, int x, int y) {
 /* Returns 1 if the click hit a control/row (so the caller won't start a text
  * selection), 0 if it fell through to the transcript. */
 static int on_click(HWND hwnd, int x, int y) {
+    if (g_pick_open) {
+        if (in_rect(g_pick_panel, x, y)) {
+            for (int i = 0; i < g_n_pick_cells; i++)
+                if (in_rect(g_pick_cells[i].r, x, y)) { picker_choose(hwnd, g_pick_cells[i].emoji); return 1; }
+            return 1;   /* inside the panel but not on a cell: stay open */
+        }
+        picker_close(hwnd);
+        return 1;
+    }
+    /* The autocomplete popover floats over the transcript, so it claims clicks
+     * inside it before anything underneath sees them. */
+    if (g_n_ac > 0) {
+        if (in_rect(g_ac_panel, x, y)) {
+            for (int i = 0; i < g_n_ac; i++)
+                if (in_rect(g_ac_rows[i], x, y)) { g_ac_sel = i; ac_accept(); SetFocus(g_re); break; }
+            return 1;
+        }
+        ac_close();     /* a click anywhere else dismisses it, then falls through */
+    }
     /* The sign-in view owns the window; nothing else is on screen. */
     if (g_view == VIEW_SIGNIN) {
         if (g_si_connecting) return 1;
@@ -2576,6 +2914,7 @@ static int on_click(HWND hwnd, int x, int y) {
     }
     /* Composer attach (+) and send buttons. */
     if (in_rect(g_attach_btn, x, y)) { upload_file(hwnd); return 1; }
+    if (in_rect(g_emoji_btn, x, y))  { picker_open(hwnd, 0); return 1; }
     if (in_rect(g_send_btn, x, y))   { composer_send(); return 1; }
     /* Overlay row clicks (main area only). */
     {
@@ -3490,6 +3829,21 @@ static void test_poll(HWND hwnd) {
         snprintf(g_find_filter, sizeof g_find_filter, "%s", arg);
         for (char *p = g_find_filter; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
         test_ack("ok");
+    } else if (!strcmp(verb, "type")) {
+        /* Put text in the composer WITHOUT sending, caret at the end, so the
+         * autocomplete popover sees the same state as live typing. */
+        if (g_re) {
+            WCHAR w[1024]; to_w(arg, w, 1024);
+            SetWindowTextW(g_re, w);
+            SendMessageW(g_re, EM_SETSEL, (WPARAM)-2, -1);
+            ac_rebuild();
+            test_ack("ok");
+        } else test_ack("err");
+    } else if (!strcmp(verb, "emoji")) {
+        picker_open(hwnd, (uint64_t)strtoull(arg, NULL, 10));
+        test_ack("ok");
+    } else if (!strcmp(verb, "actab")) {
+        ac_accept(); test_ack("ok");
     } else if (!strcmp(verb, "search")) {
         search_open(hwnd);
         if (arg[0]) { WCHAR w[256]; to_w(arg, w, 256); SetWindowTextW(g_srch, w); search_submit(); }
@@ -3522,6 +3876,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         composer_create(hwnd);
         find_create(hwnd);
         search_create(hwnd);
+        g_pick_edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL,
+            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)0xF3, GetModuleHandleW(NULL), NULL);
+        if (g_pick_edit) {
+            SendMessageW(g_pick_edit, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+            SendMessageW(g_pick_edit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search emoji\u2026");
+        }
         signin_create(hwnd);
         DragAcceptFiles(hwnd, TRUE);              /* drop files anywhere to upload */
         SetTimer(hwnd, TIMER_TICK, 30, NULL);
@@ -3618,6 +3978,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 oc_client_typing(g_client, g_sel);
                 g_last_typing = now;
             }
+            ac_rebuild();                       /* WIN-7: candidates track the caret */
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        if (g_pick_edit && (HWND)lp == g_pick_edit && HIWORD(wp) == EN_CHANGE) {
+            g_pick_scroll = 0;
+            InvalidateRect(hwnd, NULL, FALSE);
         }
         if (g_find && (HWND)lp == g_find && HIWORD(wp) == EN_CHANGE) {
             WCHAR w[64]; GetWindowTextW(g_find, w, 64);
@@ -3630,7 +3996,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CTLCOLOREDIT:
         /* The find box and the sign-in fields both sit on the OC_COL_INPUT
          * surface the D2D chrome paints under them, so they share a brush. */
-        if ((HWND)lp == g_find || (HWND)lp == g_srch || (HWND)lp == g_si_e_ws ||
+        if ((HWND)lp == g_find || (HWND)lp == g_srch || (HWND)lp == g_pick_edit ||
+            (HWND)lp == g_si_e_ws ||
             (HWND)lp == g_si_e_user || (HWND)lp == g_si_e_pass) {
             SetBkColor((HDC)wp, OCRGB(OC_COL_INPUT));
             SetTextColor((HDC)wp, OCRGB(OC_COL_TEXT));
