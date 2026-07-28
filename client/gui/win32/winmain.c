@@ -3174,6 +3174,7 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
 }
 
 static void layout_search(HWND hwnd);
+static void layout_find(HWND hwnd);    /* fwd */
 
 static void paint(HWND hwnd) {
     d2d_ensure_rt(hwnd);
@@ -3186,7 +3187,10 @@ static void paint(HWND hwnd) {
     ID2D1RenderTarget_BeginDraw(rt);
     render_scene(rt, m, W, H);
     /* Boxes placed against chrome the scene just measured, so they can only be
-     * positioned after the scene is laid out. */
+     * positioned after the scene is laid out. `layout_find` is here for a
+     * different reason: it has to react to a menu opening, which is not a
+     * relayout and so never reached it. */
+    layout_find(hwnd);
     layout_search(hwnd);
     if (g_pal_edit) {
         if (g_pal_open) {
@@ -3394,11 +3398,27 @@ static void layout_composer(HWND hwnd) {
 static void layout_find(HWND hwnd) {
     (void)hwnd;   /* the sidebar has a fixed width; geometry is constant */
     if (!g_find) return;
-    if (!view_has_sidebar()) { ShowWindow(g_find, SW_HIDE); return; }
-    ShowWindow(g_find, SW_SHOW);
+
+    /* A native child window composites ABOVE the parent's Direct2D output, so
+     * this box punches a hole through anything the shell floats over the
+     * sidebar — it was cutting the workspace menu's header block in half, which
+     * read as a corrupt avatar and a missing workspace name. The D2D panels
+     * cannot draw over it, so it has to get out of the way.
+     *
+     * The search and emoji boxes never showed this because each is already
+     * gated on its own pane's open flag; the find box had no such guard. */
+    int want = view_has_sidebar() && !g_menu && !g_more_open && !g_pal_open;
+
+    /* Only act on a change: this runs every frame, and a redundant MoveWindow
+     * still churns WM_WINDOWPOSCHANGED and can flicker the control. */
+    static int shown = -1;
+    if (want == shown) return;
+    shown = want;
+    if (!want) { ShowWindow(g_find, SW_HIDE); return; }
     int x = (int)(RAIL_W + 10 + 28), r = (int)(RAIL_W + SIDEBAR_W - 10 - 8);
     int top = (int)(HEADER_H + 6 + 6), hgt = 18;
     MoveWindow(g_find, x, top, r - x, hgt, TRUE);
+    ShowWindow(g_find, SW_SHOW);
 }
 
 static void find_create(HWND parent) {
