@@ -134,8 +134,34 @@ enum { NAV_SWITCHER = -2, NAV_NEW = -3, NAV_PROFILE = -4, NAV_MORE = -5 };
 
 /* Per-user avatar tints, shared by the transcript and the sidebar's DM rows so
  * one person is the same colour everywhere. */
+/* Avatar tints. Deliberately contains NO green and NO amber: those are the
+ * presence colours, and two entries here used to be byte-identical to them
+ * (0x3BA55D == online, 0xD9A441 == away). A user whose id hashed to one got an
+ * avatar the exact colour of the status dot drawn on its corner, so the dot
+ * vanished. Colour means one thing at a time. */
 static const uint32_t AVPAL[6] =
-    { 0x2563EB, 0x3BA55D, 0xD9A441, 0xB05CCB, 0xE0725A, 0x2FA5A5 };
+    { 0x2563EB, 0x8B5CF6, 0xEC4899, 0xE0725A, 0x0EA5E9, 0x64748B };
+
+static ID2D1Brush *paint_with(uint32_t rgb);   /* fwd */
+
+/* A presence dot with a ring in whatever surface it sits on. The ring is what
+ * makes it legible against ANY avatar colour rather than just the ones we
+ * happened to pick — a tint close to the status colour would otherwise swallow
+ * it again the moment the palette changed. */
+static void draw_presence_dot(ID2D1RenderTarget *rt, float cx, float cy, float r,
+                              uint8_t presence, uint32_t surface) {
+    uint32_t c = presence == OC_PRESENCE_ONLINE ? OC_COL_ONLINE
+               : presence == OC_PRESENCE_AWAY   ? OC_COL_AWAY : OC_COL_FAINT;
+    D2D1_ELLIPSE ring = { { cx, cy }, r + 1.6f, r + 1.6f };
+    ID2D1RenderTarget_FillEllipse(rt, &ring, paint_with(surface));
+    D2D1_ELLIPSE dot = { { cx, cy }, r, r };
+    ID2D1RenderTarget_FillEllipse(rt, &dot, paint_with(c));
+    /* Offline reads as an outline, so "not here" is not just a dim fill. */
+    if (presence != OC_PRESENCE_ONLINE && presence != OC_PRESENCE_AWAY) {
+        D2D1_ELLIPSE in = { { cx, cy }, r - 1.3f, r - 1.3f };
+        ID2D1RenderTarget_FillEllipse(rt, &in, paint_with(surface));
+    }
+}
 
 /* Typed modal form fields (WIN-21); form_dialog() is defined further down. */
 enum { FF_TEXT = 0, FF_PASSWORD, FF_CHECK, FF_CHOICE };
@@ -1475,11 +1501,9 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                 IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
                 draw_text(rt, ini, g_small, av, 0xFFFFFF);
                 IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
-                uint8_t pr = oc_model_presence_of(m, r->peer_id);
-                uint32_t dot = pr == OC_PRESENCE_ONLINE ? OC_COL_ONLINE
-                             : pr == OC_PRESENCE_AWAY   ? OC_COL_AWAY : OC_COL_FAINT;
-                D2D1_ELLIPSE pe = { { av.right - 1, av.bottom - 1 }, 3.5f, 3.5f };
-                ID2D1RenderTarget_FillEllipse(rt, &pe, paint_with(dot));
+                draw_presence_dot(rt, av.right - 1, av.bottom - 1, 3.5f,
+                                  oc_model_presence_of(m, r->peer_id),
+                                  selected ? OC_COL_SELECT : OC_COL_SIDEBAR);
             } else {
                 const char *mark = r->is_private ? "\xF0\x9F\x94\x92" : "#";
                 draw_text(rt, mark, g_ui, rf(sx0 + 12, ry, sx0 + 34, ry + ROW_H),
@@ -2501,10 +2525,7 @@ static void draw_profile(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
     uint8_t pres = oc_model_presence_of(m, g_profile_uid);
     const char *pl = pres == OC_PRESENCE_ONLINE ? "Active"
                    : pres == OC_PRESENCE_AWAY   ? "Away" : "Offline";
-    uint32_t pc = pres == OC_PRESENCE_ONLINE ? OC_COL_ONLINE
-                : pres == OC_PRESENCE_AWAY   ? OC_COL_AWAY : OC_COL_FAINT;
-    D2D1_ELLIPSE dot = { { tx + 5, cy + 42 }, 5, 5 };
-    ID2D1RenderTarget_FillEllipse(rt, &dot, paint_with(pc));
+    draw_presence_dot(rt, tx + 5, cy + 42, 5, pres, OC_COL_BASE);
     draw_text(rt, pl, g_small, rf(tx + 16, cy + 32, body.right - 24, cy + 52), OC_COL_MUTED);
 
     uint8_t role = OC_ROLE_MEMBER;
@@ -2901,11 +2922,8 @@ static void draw_members(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         const oc_member *u = &m->users[i];
         if (u->disabled) continue;
         if (y > H) break;
-        uint8_t pr = oc_model_presence_of(m, u->user_id);
-        uint32_t dot = pr == OC_PRESENCE_ONLINE ? OC_COL_ONLINE
-                     : pr == OC_PRESENCE_AWAY   ? OC_COL_AWAY : OC_COL_FAINT;
-        D2D1_ELLIPSE e = { { x0 + 22, y + ROW_H / 2 }, 4.5f, 4.5f };
-        ID2D1RenderTarget_FillEllipse(rt, &e, paint_with(dot));
+        draw_presence_dot(rt, x0 + 22, y + ROW_H / 2, 4.5f,
+                          oc_model_presence_of(m, u->user_id), OC_COL_SIDEBAR);
         draw_text(rt, u->name[0] ? u->name : "user", g_ui,
                   rf(x0 + 34, y, W - 60, y + ROW_H), OC_COL_TEXT);
         const char *rl = role_label(u->role);
