@@ -42,6 +42,7 @@
 #include "store.h"            /* peek a stored session token (skip the login box) */
 #include "oc_port.h"          /* oc_mkdir, oc_localtime_r */
 #include "protocol.h"         /* OC_CHANNEL_KIND_DM, OC_PRESENCE_* */
+#include "openchime_res.h"    /* IDI_APPICON */
 #include "theme.h"
 #include "icons.h"            /* baked Lucide vector icons (cross-platform) */
 
@@ -95,7 +96,15 @@ static UINT dpi_for_window(HWND hwnd) {
 #define RAIL_W      70.0f     /* pixel-matched to the Slack rail reference */
 #define SIDEBAR_W   250.0f
 #define HEADER_H    56.0f
-#define COMPOSER_H  86.0f
+/* The composer's resting height. It GROWS with the message being typed, up to
+ * COMPOSER_MAX_LINES — Shift+Enter inserted a newline into a field exactly one
+ * line tall, so the result scrolled out of sight the moment you used it. */
+#define COMPOSER_H      86.0f
+#define COMPOSER_LINE   20.0f    /* one wrapped line inside the field */
+#define COMPOSER_MAX_LINES 7
+static float g_composer_h = COMPOSER_H;
+
+#define COMPOSER_H_MAX (COMPOSER_H + (COMPOSER_MAX_LINES - 1) * COMPOSER_LINE)
 #define ROW_H       32.0f     /* a sidebar channel row */
 #define AVA         36.0f     /* transcript avatar diameter */
 #define LINE_H      19.0f     /* an extra (reaction/attach/thread) line */
@@ -323,7 +332,8 @@ static void tray_init(HWND hwnd) {
     g_tray.hWnd = hwnd;
     g_tray.uID = TRAY_UID;
     g_tray.uFlags = NIF_ICON | NIF_TIP;
-    g_tray.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    g_tray.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_APPICON));
+    if (!g_tray.hIcon) g_tray.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     lstrcpynW(g_tray.szTip, L"OpenChime", 128);
     g_tray_live = Shell_NotifyIconW(NIM_ADD, &g_tray) ? 1 : 0;
 }
@@ -2840,7 +2850,7 @@ static void draw_toasts(ID2D1RenderTarget *rt, float W, float H) {
      * and a box left over from a taller frame would let a click dismiss a toast
      * that isn't on screen. */
     for (int i = 0; i < TOAST_MAX; i++) g_toast_box[i] = rf(0, 0, 0, 0);
-    float y = H - COMPOSER_H - TOAST_GAP;
+    float y = H - g_composer_h - TOAST_GAP;
     for (int i = g_n_toast - 1; i >= 0; i--) {
         D2D1_RECT_F r = rf(W - TOAST_W - 20, y - TOAST_H, W - 20, y);
         g_toast_box[i] = r;
@@ -3068,7 +3078,7 @@ static void draw_autocomplete(ID2D1RenderTarget *rt, float x0, float w, float h)
     float rowh = 26, hdr_h = 22, hint_h = 22;
     float pw = 320; if (pw > w - 40) pw = w - 40;
     float ph = hdr_h + g_n_ac * rowh + hint_h;
-    float px = x0 + 20, py = h - COMPOSER_H - ph - 6;
+    float px = x0 + 20, py = h - g_composer_h - ph - 6;
     if (py < HEADER_H + 6) py = HEADER_H + 6;
     g_ac_panel = rf(px, py, px + pw, py + ph);
 
@@ -3106,8 +3116,8 @@ static void draw_emoji_picker(ID2D1RenderTarget *rt, float x0, float w, float h)
     if (!g_pick_open) { g_pick_panel = rf(0, 0, 0, 0); return; }
 
     float pw = 360; if (pw > w - 40) pw = w - 40;
-    float ph = 300; if (ph > h - HEADER_H - COMPOSER_H - 20) ph = h - HEADER_H - COMPOSER_H - 20;
-    float px = x0 + 20, py = h - COMPOSER_H - ph - 6;
+    float ph = 300; if (ph > h - HEADER_H - g_composer_h - 20) ph = h - HEADER_H - g_composer_h - 20;
+    float px = x0 + 20, py = h - g_composer_h - ph - 6;
     if (py < HEADER_H + 6) py = HEADER_H + 6;
     g_pick_panel = rf(px, py, px + pw, py + ph);
 
@@ -3220,8 +3230,11 @@ static void picker_choose(HWND hwnd, const char *emoji) {
     picker_close(hwnd);
 }
 
+static void composer_placeholder(const oc_model *m);   /* fwd */
+
 static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
-    float top = h - COMPOSER_H;
+    composer_placeholder(model());   /* the cue tracks the open conversation */
+    float top = h - g_composer_h;
     fill(rt, rf(x0, top, x0 + w, h), OC_COL_BASE);
 
     /* A bordered, rounded input container the composer lives inside (Slack-style),
@@ -3230,7 +3243,10 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     fill_round(rt, rf(bx0, by0, bx1, by1), 10.0f, OC_COL_INPUT);
     stroke_round(rt, rf(bx0, by0, bx1, by1), 10.0f, OC_COL_BORDER, 1.0f);
 
-    float boxh = by1 - by0, sq = 34.0f, cy = by0 + (boxh - sq) / 2;
+    /* Buttons sit at the BOTTOM of the box once it grows; centring them in a
+     * tall box leaves them floating in the middle of the text. */
+    float boxh = by1 - by0, sq = 34.0f;
+    float cy = (boxh > COMPOSER_H - 28.0f) ? (by1 - sq - 4) : (by0 + (boxh - sq) / 2);
 
     /* Attach (+) on the left. */
     g_attach_btn = rf(bx0 + 6, cy, bx0 + 6 + sq, cy + sq);
@@ -3314,7 +3330,7 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         draw_sidebar(rt, m, H);
         draw_header(rt, m, main_x, main_w);
         float bh = draw_banner(rt, m, main_x, main_w);   /* pushes the transcript down */
-        draw_transcript(rt, m, rf(main_x, HEADER_H + bh, main_r, H - COMPOSER_H));
+        draw_transcript(rt, m, rf(main_x, HEADER_H + bh, main_r, H - g_composer_h));
         draw_composer(rt, main_x, main_w, H);
         draw_autocomplete(rt, main_x, main_w, H);
         draw_emoji_picker(rt, main_x, main_w, H);
@@ -3512,11 +3528,59 @@ static void composer_cancel_edit(void) {
     if (g_re) SetWindowTextW(g_re, L"");
 }
 
+/* The composer's placeholder. It has to be painted INSIDE the control: the
+ * RichEdit is opaque and composites above the Direct2D chrome, so anything the
+ * scene draws behind it is hidden. RichEdit also ignores EM_SETCUEBANNER, which
+ * is what the other boxes use.
+ *
+ * Worth the trouble because the composer said nothing about where the message
+ * was going — and with several workspaces open (WIN-29) "which conversation is
+ * this?" is a real question. */
+static char g_ph[160];
+static HFONT g_ph_font;
+
+static void composer_placeholder(const oc_model *m) {
+    const oc_channel *c = (m && g_sel) ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+    if (g_edit_msg)            snprintf(g_ph, sizeof g_ph, "Edit this message \u2014 Esc to cancel");
+    else if (m && m->thread_open) snprintf(g_ph, sizeof g_ph, "Reply\u2026");
+    else if (!c)               snprintf(g_ph, sizeof g_ph, "Message");
+    else if (c->kind == OC_CHANNEL_KIND_DM) {
+        const char *pn = oc_model_user_name(m, c->peer_id);
+        snprintf(g_ph, sizeof g_ph, "Message %s", (pn && pn[0]) ? pn : "them");
+    } else
+        snprintf(g_ph, sizeof g_ph, "Message #%s", c->name ? c->name : "channel");
+}
+
+static void composer_draw_placeholder(HWND hwnd) {
+    if (!g_ph[0] || GetWindowTextLengthW(hwnd) > 0) return;
+    HDC dc = GetDC(hwnd);
+    if (!dc) return;
+    if (!g_ph_font)
+        g_ph_font = CreateFontW(-PX(BODY_DIP), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
+    HFONT old = (HFONT)SelectObject(dc, g_ph_font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, OCRGB(OC_COL_FAINT));
+    WCHAR w[160]; int n = to_w(g_ph, w, 160);
+    RECT rc; GetClientRect(hwnd, &rc);
+    /* Matches EM_SETMARGINS(12) and the control's own first-line origin. */
+    TextOutW(dc, PX(12), PX(1), w, n);
+    SelectObject(dc, old);
+    ReleaseDC(hwnd, dc);
+}
+
 /* Subclass proc: Enter sends, Shift+Enter inserts a newline. While the
  * autocomplete popover is open it takes Up/Down/Tab/Enter/Esc first — Enter
  * accepting a candidate rather than sending is what makes the popover feel like
  * part of the composer instead of a thing floating over it. */
 static LRESULT CALLBACK re_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_PAINT) {
+        /* Let the control paint, then overlay the cue on the empty field. */
+        LRESULT r = CallWindowProcW(g_re_oldproc, hwnd, msg, wp, lp);
+        composer_draw_placeholder(hwnd);
+        return r;
+    }
     if (g_n_ac > 0 && (msg == WM_KEYDOWN || msg == WM_CHAR)) {
         int handled = 1;
         switch (wp) {
@@ -3545,6 +3609,24 @@ static LRESULT CALLBACK re_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return CallWindowProcW(g_re_oldproc, hwnd, msg, wp, lp);
 }
 
+/* Recompute the composer's height from what is actually in it. EM_GETLINECOUNT
+ * counts WRAPPED lines on a multiline control, so a long single paragraph grows
+ * the box too — which is the case that made the old fixed height worst. Returns
+ * 1 when the height changed, so the caller can re-lay-out rather than doing it
+ * on every keystroke. */
+static int composer_remeasure(void) {
+    float want = COMPOSER_H;
+    if (g_re) {
+        int lines = (int)SendMessageW(g_re, EM_GETLINECOUNT, 0, 0);
+        if (lines < 1) lines = 1;
+        if (lines > COMPOSER_MAX_LINES) lines = COMPOSER_MAX_LINES;
+        want = COMPOSER_H + (float)(lines - 1) * COMPOSER_LINE;
+    }
+    if (want == g_composer_h) return 0;
+    g_composer_h = want;
+    return 1;
+}
+
 /* Position the RichEdit over the composer region for the current window size. */
 static void layout_find(HWND hwnd);   /* fwd */
 
@@ -3561,11 +3643,15 @@ static void layout_composer(HWND hwnd) {
     float main_x = RAIL_W + SIDEBAR_W;
     /* Inside the composer box, between the attach (+) and send buttons. */
     float bx0 = main_x + 20, bx1 = (rc.right - members) - 20;
-    float by0 = rc.bottom - COMPOSER_H + 12, by1 = rc.bottom - 16, boxh = by1 - by0;
+    float by0 = rc.bottom - g_composer_h + 12, by1 = rc.bottom - 16, boxh = by1 - by0;
     /* Clear BOTH left buttons (attach + emoji), or the native child window
      * covers the one nearest the text and it renders as a clipped sliver. */
     int x = (int)(bx0 + 84), r = (int)(bx1 - 48);
-    int reh = 24, top = (int)(by0 + (boxh - reh) / 2);
+    /* The field fills the grown box, less the padding the buttons sit in. A
+     * fixed 24 here is what hid every line after the first. */
+    float reh = boxh - 10;
+    if (reh < 24) reh = 24;
+    float top = by0 + 5;
     MoveWindow(g_re, PX(x), PX(top), PX(r - x), PX(reh), TRUE);
 }
 
@@ -6168,6 +6254,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_last_typing = now;
             }
             ac_rebuild();                       /* WIN-7: candidates track the caret */
+            if (composer_remeasure()) layout_composer(hwnd);
             InvalidateRect(hwnd, NULL, FALSE);
         }
         if (g_pal_edit && (HWND)lp == g_pal_edit && HIWORD(wp) == EN_CHANGE) {
@@ -6444,13 +6531,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         else            { g_view = VIEW_SIGNIN; }
     }
 
-    WNDCLASSW wc;
+    WNDCLASSEXW wc;
     memset(&wc, 0, sizeof wc);
+    wc.cbSize        = sizeof wc;
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = inst;
     wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+    /* Taskbar, Alt-Tab and the window corner all read these; without them the
+     * app showed the generic Windows default everywhere. */
+    wc.hIcon   = LoadIconW(inst, MAKEINTRESOURCEW(IDI_APPICON));
+    wc.hIconSm = LoadIconW(inst, MAKEINTRESOURCEW(IDI_APPICON));
     wc.lpszClassName = L"OpenChimeWin";
-    if (!RegisterClassW(&wc)) return 1;
+    if (!RegisterClassExW(&wc)) return 1;
 
     HWND hwnd = CreateWindowExW(0, L"OpenChimeWin", L"OpenChime",
                     WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,

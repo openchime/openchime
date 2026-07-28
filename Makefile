@@ -152,6 +152,7 @@ $(TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) \
 # (ARCH-88). The termbox2 backend is tuikit/tk_term.c (Console API); the
 # core seams (threads/DNS/RNG) are in shared/oc_thread.h + resolve.c + net.c.
 WINCC     ?= x86_64-w64-mingw32-gcc
+WINDRES   ?= x86_64-w64-mingw32-windres
 MBEDTLS_WIN := third_party/mbedtls-3.6.2-win
 WIN_MBEDLIBS := $(MBEDTLS_WIN)/library/libmbedtls.a \
                 $(MBEDTLS_WIN)/library/libmbedx509.a \
@@ -179,11 +180,17 @@ GUI_SRC := $(wildcard client/gui/win32/*.c) client/shared/icons.c client/shared/
 WIN_GUI_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
                $(CORE_INC) -Iclient/gui/win32 -Iclient/shared
 
+# Resources (app icon). Regenerate the .ico with scripts/gen_appicon.py.
+WIN_GUI_RES := build/openchime_res.o
+$(WIN_GUI_RES): client/gui/win32/res/openchime.rc client/gui/win32/res/openchime.ico \
+                client/gui/win32/res/openchime_res.h | build
+	$(WINDRES) -I client/gui/win32/res $< -O coff -o $@
+
 windows-gui: $(WIN_GUI_BIN)
-$(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) \
+$(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
                 $(wildcard client/gui/win32/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) | build
-	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result -municode -mwindows $(WIN_GUI_INC) \
-	    $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) \
+	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result -municode -mwindows $(WIN_GUI_INC) -Iclient/gui/win32/res \
+	    $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
 	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -lshell32 -lcomdlg32 -lgdi32 -ladvapi32 \
 	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -luuid -static -o $@
 
