@@ -188,6 +188,12 @@ typedef struct {
     uint8_t *fetched_data;
     size_t   fetched_len;
 
+    /* When the net thread will next attempt a reconnect, as a monotonic
+     * millisecond stamp (0 = not backing off). The error text carries the delay
+     * once per backoff, which cannot tick; a frontend that wants a live
+     * countdown needs the deadline itself (WIN-55). */
+    uint64_t reconnect_at_ms;
+
     char     last_error[160];
     /* Bumped every time an error arrives, even an identical one. A frontend that
      * notices only when the TEXT changes stays silent when you repeat a failing
@@ -287,6 +293,15 @@ size_t oc_model_seen_by(const oc_model *m, uint64_t channel_id, uint64_t message
 
 /* Open/close the notification-prefs overlay (frontend view state). */
 void oc_model_set_prefs_open(oc_model *m, int open);
+/* Milliseconds until the next reconnect attempt, 0 when not backing off. Pass
+ * the frontend's current monotonic clock — the core does not own a clock. */
+uint64_t oc_model_reconnect_in(const oc_model *m, uint64_t now_ms);
+
+/* The clock the core stamps that deadline with. A frontend must read the time
+ * from HERE rather than its own source, or the two disagree and the countdown
+ * jumps. */
+uint64_t oc_model_now_ms(void);
+
 /* Take the last fetched attachment's bytes (WIN-17), transferring ownership to
  * the caller, which must free() them. Returns NULL when nothing is waiting. */
 uint8_t *oc_model_take_attachment(oc_model *m, uint64_t *attachment_id, size_t *len);

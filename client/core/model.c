@@ -10,6 +10,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#endif
 
 #define OC_TYPING_TIMEOUT 6   /* seconds a typing mark stays live without refresh */
 
@@ -55,6 +59,25 @@ static void msg_apply_reaction(oc_msg *msg, const char *emoji, uint32_t count,
     }
     msg->reactions[idx].count = count;
     if (is_me) msg->reactions[idx].mine = (op == 1 /* OC_REACT_ADD */) ? 1 : 0;
+}
+
+/* One monotonic millisecond clock, owned by the core so a frontend and the net
+ * thread cannot read different ones. mingw has no clock_gettime without linking
+ * winpthread, and GetTickCount64 is the platform's monotonic tick anyway. */
+uint64_t oc_model_now_ms(void) {
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+    return (uint64_t)time(NULL) * 1000u;
+#endif
+}
+
+uint64_t oc_model_reconnect_in(const oc_model *m, uint64_t now_ms) {
+    if (!m || !m->reconnect_at_ms || m->reconnect_at_ms <= now_ms) return 0;
+    return m->reconnect_at_ms - now_ms;
 }
 
 uint8_t *oc_model_take_attachment(oc_model *m, uint64_t *attachment_id, size_t *len) {
@@ -764,6 +787,9 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
          * relaunch doesn't show every replayed message as unread. Genuinely new
          * messages (backfilled past this mark) still count. */
         oc_model_mark_read(m, e->channel_id);
+        break;
+    case OC_EV_BACKOFF:
+        m->reconnect_at_ms = e->server_time;
         break;
     case OC_EV_DISCONNECTED:
         m->connected = false;

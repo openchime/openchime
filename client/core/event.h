@@ -69,6 +69,7 @@ enum {
     OC_EV_AUDIT_BEGIN,     /* an AUDIT_PAGE starts: clears the model's page */
     OC_EV_AUDIT,           /* one audit entry (REQ-251) */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
+    OC_EV_BACKOFF,         /* next reconnect attempt: server_time = deadline (ms), 0 = clear */
     OC_EV_ERROR            /* protocol/transport error; body = human message */
 };
 

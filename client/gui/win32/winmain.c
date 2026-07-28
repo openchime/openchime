@@ -2546,9 +2546,22 @@ static float draw_banner(ID2D1RenderTarget *rt, const oc_model *m, float x0, flo
     g_banner_on = 0;
     if (!m || m->authed) return 0;
 
+    /* A LIVE countdown (WIN-55). The core's error string states the delay once
+     * per backoff, so the number in it never moved — it read as a hung client.
+     * The deadline ticks because the model now carries it, and the same clock
+     * source is used on both sides so the two cannot disagree. */
+    char live[192];
     const char *why = m->last_error[0] ? m->last_error
                     : !m->connected    ? "Connecting…"
                                        : "Signing in…";
+    uint64_t left = oc_model_reconnect_in(m, oc_model_now_ms());
+    if (left > 0) {
+        snprintf(live, sizeof live, "Connection lost — reconnecting in %llus…",
+                 (unsigned long long)((left + 999) / 1000));
+        why = live;
+    } else if (m->reconnect_at_ms) {
+        why = "Reconnecting…";
+    }
     /* Amber while a connection is plausibly coming back, red once the core has
      * told us something concrete went wrong — the distinction the user acts on. */
     uint32_t accent = m->last_error[0] ? OC_COL_DANGER : OC_COL_AWAY;

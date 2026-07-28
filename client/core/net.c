@@ -4,6 +4,7 @@
 
 #include "net.h"
 #include "event.h"
+#include "model.h"        /* oc_model_now_ms: one clock for the backoff deadline */
 #include "store.h"
 
 #include "protocol.h"
@@ -1471,11 +1472,20 @@ static void *net_thread(void *arg) {
                      (backoff_ms + 999) / 1000);
             push_err(n->to_ui, msg);
         }
+        /* Publish the deadline so a frontend can tick it down (WIN-55). The
+         * error string can only say the delay once, which is why the GUI banner
+         * showed a number that never moved. */
+        {
+            oc_ev *e = oc_ev_new(OC_EV_BACKOFF);
+            if (e) { e->server_time = oc_model_now_ms() + (uint64_t)backoff_ms; oc_queue_push(n->to_ui, e); }
+        }
         n->reconnect_now = 0;
         for (int s = 0; s < backoff_ms && !n->stop && !n->reconnect_now; s += 50) {
             oc_nanosleep(50 * 1000 * 1000);
         }
         n->reconnect_now = 0;
+        { oc_ev *e = oc_ev_new(OC_EV_BACKOFF);      /* attempting now */
+          if (e) { e->server_time = 0; oc_queue_push(n->to_ui, e); } }
         reconnecting = 1;
     }
 
