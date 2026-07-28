@@ -68,6 +68,10 @@ enum {
     OC_EV_STORAGE,         /* a STORAGE_STATUS: usage + policy report (REQ-214) */
     OC_EV_AUDIT_BEGIN,     /* an AUDIT_PAGE starts: clears the model's page */
     OC_EV_AUDIT,           /* one audit entry (REQ-251) */
+    OC_EV_PIN,             /* a PIN_UPDATED: channel/message + user_id=pinner, op=add/remove,
+                              server_time=when it was pinned (REQ-230) */
+    OC_EV_PINNED_MSG,      /* one entry of a pins list: message/author/body + pinner in user_id */
+    OC_EV_PINS_END,        /* the pins list is complete: channel_id + count */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
     OC_EV_BACKOFF,         /* next reconnect attempt: server_time = deadline (ms), 0 = clear */
     OC_EV_ERROR            /* protocol/transport error; body = human message */
@@ -87,6 +91,8 @@ typedef struct {
     oc_audit_view   audit;    /* OC_EV_AUDIT */
     uint8_t  op;           /* REACTION: add/remove */
     uint32_t count;        /* REACTION: running aggregate count for the emoji */
+    uint64_t pinned_at;    /* PINNED_MSG: when it was pinned (REQ-230). Its own field
+                              because a ms timestamp does not fit in `count`. */
     char     emoji[40];    /* REACTION: the emoji */
     char     author_name[64]; /* MESSAGE: author display name ("" = fall back to id) */
     char    *body;         /* heap; MESSAGE/ERROR/CHANNEL(name) only, else NULL */
@@ -113,6 +119,8 @@ enum {
     OC_CMD_LIST_USERS,      /* request the tenant roster */
     OC_CMD_SET_PRESENCE,    /* set own presence: op = OC_PRESENCE_ONLINE / _AWAY */
     OC_CMD_OPEN_DM,         /* open/get a 1:1 DM with `channel_id` (reused as target user id) */
+    OC_CMD_PIN,            /* pin/unpin `message_id` in `channel_id`: op = add/remove */
+    OC_CMD_LIST_PINS,      /* list `channel_id`'s pinned messages */
     OC_CMD_LIST_REACTIONS,  /* inspect who reacted to `message_id` in `channel_id` */
     OC_CMD_SET_NOTIFY_PREF, /* set `channel_id`'s notification level (op = level) */
     OC_CMD_SET_DND,         /* set the DND window: op = enabled, channel_id = start_min, message_id = end_min */

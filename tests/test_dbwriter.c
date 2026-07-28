@@ -51,7 +51,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 21);
+    CHECK(oc_schema_version(db) == 22);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -384,6 +384,152 @@ static void test_history_paging(void) {
     /* Read access is enforced here as everywhere else. */
     r = history(w, outsider, 4242, 0, 10);
     CHECK(r && r->n_replay == 0);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* Pins (REQ-230, ARCH-90). The interesting cases are the ones where a pin is
+ * NOT simply a row: the per-channel cap, a repeat pin, another member removing
+ * someone else's pin, and a pin surviving a reload. */
+static oc_dbres *pin(oc_dbwriter *w, uint64_t uid, uint64_t ch, uint64_t mid, uint8_t op) {
+    oc_job *j = oc_job_new(OC_JOB_PIN, 230);
+    j->user_id = uid; j->channel_id = ch; j->message_id = mid; j->pin_op = op;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *list_pins(oc_dbwriter *w, uint64_t uid, uint64_t ch) {
+    oc_job *j = oc_job_new(OC_JOB_LIST_PINS, 231);
+    j->user_id = uid; j->channel_id = ch;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_pins(void) {
+    const char *path = "build/test_dbwriter_pins.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t alice = reg(w, "alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0xB1, sizeof idem);
+    uint64_t m1 = send_msg(w, alice, idem, "the deploy runbook");
+    memset(idem, 0xB2, sizeof idem);
+    uint64_t m2 = send_msg(w, bob, idem, "and the rollback steps");
+    CHECK(m1 && m2);
+
+    oc_dbres *r = pin(w, alice, OC_DEFAULT_CHANNEL, m1, OC_PIN_ADD);
+    CHECK(r && r->type == OC_RES_PIN_OK && r->pin_op == OC_PIN_ADD);
+    CHECK(r->user_id == alice && r->pinned_at != 0);
+    /* The fan-out must reach every member, not just the pinner: a pin is
+     * channel state. */
+    CHECK(r->n_members >= 2);
+    oc_dbres_free(r);
+
+    /* Pinning again is a no-op, and critically reports the ORIGINAL pinner and
+     * time — if it reported the re-pinner, two clients would disagree with what
+     * a later LIST_PINS says. */
+    r = pin(w, bob, OC_DEFAULT_CHANNEL, m1, OC_PIN_ADD);
+    CHECK(r && r->type == OC_RES_PIN_OK && r->user_id == alice);
+    oc_dbres_free(r);
+
+    r = list_pins(w, bob, OC_DEFAULT_CHANNEL);
+    CHECK(r && r->type == OC_RES_PINS && r->n_plist == 1);
+    CHECK(r->plist[0].message_id == m1 && r->plist[0].pinned_by == alice);
+    /* The body travels with the pin, so opening the list is one round trip
+     * even when the message is far out of the loaded history. */
+    CHECK(r->plist[0].body && strcmp(r->plist[0].body, "the deploy runbook") == 0);
+    oc_dbres_free(r);
+
+    /* Anyone may unpin, including someone else's pin — Slack's default, and the
+     * reason is that a pin only its author can remove outlives them. */
+    r = pin(w, bob, OC_DEFAULT_CHANNEL, m1, OC_PIN_REMOVE);
+    CHECK(r && r->type == OC_RES_PIN_OK && r->pin_op == OC_PIN_REMOVE);
+    oc_dbres_free(r);
+    r = list_pins(w, alice, OC_DEFAULT_CHANNEL);
+    CHECK(r && r->n_plist == 0);
+    oc_dbres_free(r);
+
+    /* Unpinning something that is not pinned is a no-op, not an error: two
+     * clients racing the same unpin must not produce a spurious failure. */
+    r = pin(w, alice, OC_DEFAULT_CHANNEL, m1, OC_PIN_REMOVE);
+    CHECK(r && r->type == OC_RES_PIN_OK);
+    oc_dbres_free(r);
+
+    /* A message that does not exist, and a non-member, are both refused. */
+    r = pin(w, alice, OC_DEFAULT_CHANNEL, 999999, OC_PIN_ADD);
+    CHECK(r && r->type == OC_RES_PIN_ERR && r->err_code == OC_ERR_UNKNOWN_MESSAGE);
+    oc_dbres_free(r);
+
+    /* Pin state must survive a reload. A BROADCAST has no field for it, so the
+     * backfill carries it — without this every pin silently vanished when a
+     * client reconnected. */
+    r = pin(w, alice, OC_DEFAULT_CHANNEL, m2, OC_PIN_ADD);
+    CHECK(r && r->type == OC_RES_PIN_OK);
+    oc_dbres_free(r);
+    r = backfill(w, alice, OC_DEFAULT_CHANNEL, 0);
+    CHECK(r && r->n_replay >= 2);
+    int seen_pinned = 0;
+    for (size_t i = 0; i < r->n_replay; i++)
+        if (r->replay[i].message_id == m2) {
+            seen_pinned = 1;
+            CHECK(r->replay[i].pinned_by == alice && r->replay[i].pinned_at != 0);
+        } else if (r->replay[i].message_id == m1) {
+            CHECK(r->replay[i].pinned_by == 0);   /* unpinned above, stays unpinned */
+        }
+    CHECK(seen_pinned);
+    oc_dbres_free(r);
+
+    /* A deleted message cannot stay pinned: there is no body left to pin to. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_DELETE, 232);
+        j->user_id = bob; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = m2;
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
+    r = list_pins(w, alice, OC_DEFAULT_CHANNEL);
+    CHECK(r && r->n_plist == 0);
+    oc_dbres_free(r);
+
+    /* The per-channel cap. Pin OC_MAX_PINS distinct messages, then one more. */
+    uint64_t last = 0;
+    for (unsigned i = 0; i < OC_MAX_PINS; i++) {
+        uint8_t id2[OC_IDEM_LEN];
+        memset(id2, 0, sizeof id2);
+        id2[0] = 0xC0; id2[1] = (uint8_t)(i & 0xFF); id2[2] = (uint8_t)(i >> 8);
+        char body[32];
+        snprintf(body, sizeof body, "pin me %u", i);
+        uint64_t mid = send_msg(w, alice, id2, body);
+        CHECK(mid != 0);
+        r = pin(w, alice, OC_DEFAULT_CHANNEL, mid, OC_PIN_ADD);
+        CHECK(r && r->type == OC_RES_PIN_OK);
+        oc_dbres_free(r);
+        last = mid;
+    }
+    CHECK(last != 0);
+    {
+        uint8_t id3[OC_IDEM_LEN];
+        memset(id3, 0xD1, sizeof id3);
+        uint64_t over = send_msg(w, alice, id3, "one too many");
+        r = pin(w, alice, OC_DEFAULT_CHANNEL, over, OC_PIN_ADD);
+        CHECK(r && r->type == OC_RES_PIN_ERR && r->err_code == OC_ERR_TOO_MANY_PINS);
+        oc_dbres_free(r);
+    }
+    /* But re-pinning something already in the set is still fine at the cap —
+     * it adds nothing, so refusing it would be a false failure. */
+    r = pin(w, alice, OC_DEFAULT_CHANNEL, last, OC_PIN_ADD);
+    CHECK(r && r->type == OC_RES_PIN_OK);
+    oc_dbres_free(r);
+
+    /* The list is capped and newest-pin-first. */
+    r = list_pins(w, alice, OC_DEFAULT_CHANNEL);
+    CHECK(r && r->n_plist == OC_MAX_PINS);
     oc_dbres_free(r);
 
     oc_dbwriter_stop(w);
@@ -2207,7 +2353,7 @@ static void test_max_users(void) {
 }
 
 int run_dbwriter_tests(void) {
-    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill\n");
+    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins\n");
     test_start_migrates_and_stops();
     test_auth_and_send();
     test_oidc_auth();
@@ -2232,6 +2378,7 @@ int run_dbwriter_tests(void) {
     test_backfill();
     test_history_paging();
     test_mentions_stored();
+    test_pins();
     test_max_users();
     return failures;
 }

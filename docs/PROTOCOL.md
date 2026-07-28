@@ -637,6 +637,66 @@ big-endian) in `context`: `UNKNOWN_MESSAGE` (no such message, or it is
 tombstoned — a tombstone's reactions are cleared, §5.6), `NOT_A_MEMBER` (cannot
 read the channel), or `INVALID_REACTION` (empty/oversized emoji).
 
+### 5.9a Pins (REQ-230, ARCH-90)
+
+A pin belongs to the **channel**, not to the person who placed it: every member
+sees the same set. Any member may pin, and any member may unpin — including
+someone else's pin. Pinning an already-pinned message is a no-op, so a pin is
+never stacked. A channel holds at most **100** pins.
+
+**`PIN` (client → server), msg_type `0x0035`:**
+
+| Field        | Type | Notes                                                    |
+|--------------|------|----------------------------------------------------------|
+| `channel_id` | u64  | The message's channel (for the membership check).        |
+| `message_id` | u64  | The message being pinned.                                |
+| `op`         | u8   | `1` pin, `0` unpin.                                      |
+
+On success the daemon fans a **`PIN_UPDATED` (server → client), msg_type
+`0x0036`** out to every connected member:
+
+| Field        | Type | Notes                                                    |
+|--------------|------|----------------------------------------------------------|
+| `message_id` | u64  | The pinned message.                                      |
+| `channel_id` | u64  | Its channel.                                             |
+| `user_id`    | u64  | Who placed the pin. On a repeat pin this is the **original** pinner, not the repeater, so every client agrees with a later `PINS`. |
+| `op`         | u8   | `1` pinned, `0` unpinned.                                |
+| `pinned_at`  | u64  | When it was pinned (ms since epoch).                     |
+
+**`LIST_PINS` (client → server), msg_type `0x0037`** `{ channel_id: u64 }`. The
+daemon streams one **`PINNED_MSG` (server → client), msg_type `0x0038`** per
+pin, newest pin first, then a terminator. This is the `LIST_THREAD` shape (§5.10)
+rather than the `REACTIONS` one: each pinned message carries its **body**, which
+needs its own frame, and a pin is usually far outside the client's loaded
+history — a list of bare ids would turn opening it into a fetch storm.
+
+| Field         | Type | Notes                                                   |
+|---------------|------|---------------------------------------------------------|
+| `message_id`  | u64  | The pinned message.                                     |
+| `channel_id`  | u64  | Its channel.                                            |
+| `author_id`   | u64  | Who wrote it.                                           |
+| `server_time` | u64  | When it was sent.                                       |
+| `pinned_by`   | u64  | Who pinned it (`0` if that account is gone).            |
+| `pinned_at`   | u64  | When it was pinned.                                     |
+| `body`        | str  | The message body.                                       |
+
+**`PINS` (server → client), msg_type `0x0039`** `{ channel_id: u64, count: u32 }`
+terminates the response; `count` is how many `PINNED_MSG` frames preceded it.
+
+Tombstoned messages are excluded from the list and lose their pin outright
+(§5.6): there is nothing left to pin to.
+
+**Pin state is replayed on backfill.** A `BROADCAST` has no field for it, so
+after replaying a channel's messages the daemon emits a `PIN_UPDATED` for each
+pinned one (§6). Without this every pin silently vanished the moment a client
+reconnected — the same failure the reaction replay exists to prevent.
+
+Failures are non-fatal `ERROR` frames carrying the `message_id` (8 bytes,
+big-endian) in `context`: `UNKNOWN_MESSAGE` (no such message in that channel, or
+it is tombstoned), `NOT_A_MEMBER`, or `TOO_MANY_PINS` (3018 — the channel
+already holds 100 pins). Unpinning something that is not pinned is **not** an
+error: two clients racing the same unpin must not produce a spurious failure.
+
 ### 5.10 Threads (REQ-060)
 
 Any message can be replied to as a thread. A reply threads under a **top-level

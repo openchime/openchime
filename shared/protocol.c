@@ -400,6 +400,49 @@ oc_result oc_encode_reaction_updated(oc_wbuf *w, uint16_t version, const oc_reac
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_pin(oc_wbuf *w, uint16_t version, const oc_pin *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PIN);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->message_id);
+    oc_w_u8(w, m->op);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_pin_updated(oc_wbuf *w, uint16_t version, const oc_pin_updated *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PIN_UPDATED);
+    oc_w_u64(w, m->message_id);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->user_id);
+    oc_w_u8(w, m->op);
+    oc_w_u64(w, m->pinned_at);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_list_pins(oc_wbuf *w, uint16_t version, const oc_list_pins *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_PINS);
+    oc_w_u64(w, m->channel_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_pinned_msg(oc_wbuf *w, uint16_t version, const oc_pinned_msg *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PINNED_MSG);
+    oc_w_u64(w, m->message_id);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->author_id);
+    oc_w_u64(w, m->server_time);
+    oc_w_u64(w, m->pinned_by);
+    oc_w_u64(w, m->pinned_at);
+    oc_w_str(w, m->body);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_pins(oc_wbuf *w, uint16_t version, const oc_pins *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PINS);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u32(w, m->count);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_list_reactions(oc_wbuf *w, uint16_t version, const oc_list_reactions *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_LIST_REACTIONS);
     oc_w_u64(w, m->channel_id);
@@ -1337,6 +1380,44 @@ oc_result oc_decode_reaction_updated(oc_rbuf *p, oc_reaction_updated *m) {
     m->emoji = oc_r_str(p);
     m->op = oc_r_u8(p);
     m->count = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_pin(oc_rbuf *p, oc_pin *m) {
+    m->channel_id = oc_r_u64(p);
+    m->message_id = oc_r_u64(p);
+    m->op = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_pin_updated(oc_rbuf *p, oc_pin_updated *m) {
+    m->message_id = oc_r_u64(p);
+    m->channel_id = oc_r_u64(p);
+    m->user_id = oc_r_u64(p);
+    m->op = oc_r_u8(p);
+    m->pinned_at = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_list_pins(oc_rbuf *p, oc_list_pins *m) {
+    m->channel_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_pinned_msg(oc_rbuf *p, oc_pinned_msg *m) {
+    m->message_id  = oc_r_u64(p);
+    m->channel_id  = oc_r_u64(p);
+    m->author_id   = oc_r_u64(p);
+    m->server_time = oc_r_u64(p);
+    m->pinned_by   = oc_r_u64(p);
+    m->pinned_at   = oc_r_u64(p);
+    m->body        = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_pins(oc_rbuf *p, oc_pins *m) {
+    m->channel_id = oc_r_u64(p);
+    m->count = oc_r_u32(p);
     return r_done(p);
 }
 

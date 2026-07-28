@@ -69,6 +69,11 @@ typedef enum {
     OC_MSG_THREAD_META      = 0x0032, /* S->C, a parent's reply count (backfill) */
     OC_MSG_READ_CURSOR      = 0x0033, /* S->C, a member's read cursor advanced (REQ-090 seen-by) */
     OC_MSG_HISTORY_REQUEST  = 0x0034, /* C->S, page BACKWARDS through a channel (§6.3) */
+    OC_MSG_PIN              = 0x0035, /* C->S (REQ-230), pin/unpin a message */
+    OC_MSG_PIN_UPDATED      = 0x0036, /* S->C, pin fan-out to every channel member */
+    OC_MSG_LIST_PINS        = 0x0037, /* C->S, a channel's pinned messages */
+    OC_MSG_PINNED_MSG       = 0x0038, /* S->C, one pinned message (streamed, body included) */
+    OC_MSG_PINS             = 0x0039, /* S->C, terminator of a LIST_PINS response */
     OC_MSG_CREATE_CHANNEL     = 0x0050, /* C->S (REQ-050) */
     OC_MSG_CHANNEL_INFO       = 0x0051, /* S->C, ack for create/join/leave/invite/remove */
     OC_MSG_LIST_CHANNELS      = 0x0052, /* C->S */
@@ -163,6 +168,7 @@ typedef enum {
     OC_ERR_TRANSFER_PROTOCOL   = 3015, /* out-of-order/oversized chunk or bad transfer state */
     OC_ERR_UNKNOWN_WEBHOOK     = 3016, /* no such (or disabled) incoming webhook token (REQ-170) */
     OC_ERR_CHANNEL_EXISTS      = 3017, /* a channel of that name already exists (names are unique, case-insensitively) */
+    OC_ERR_TOO_MANY_PINS       = 3018, /* channel already holds OC_MAX_PINS pins (REQ-230) */
     OC_ERR_INVALID_DEVICE_TOKEN = 3014, /* empty token or unknown platform on REGISTER_DEVICE_TOKEN */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
@@ -305,6 +311,14 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_REACT_ADD    1u
 #define OC_MAX_EMOJI    32u
 
+/* Pin op (REQ-230, ARCH-90) and the per-channel cap. A pin belongs to the
+ * channel, not to the pinner: pinning an already-pinned message is a no-op
+ * rather than a second pin. The cap bounds both the list frame and the work of
+ * opening the pins view; Slack's is the same number. */
+#define OC_PIN_REMOVE 0u
+#define OC_PIN_ADD    1u
+#define OC_MAX_PINS   100u
+
 /* LOGOUT scope (PROTOCOL.md §4; REQ-182). */
 #define OC_LOGOUT_THIS 0u   /* revoke just the presented session token */
 #define OC_LOGOUT_ALL  1u   /* revoke every session of the authenticated user */
@@ -361,6 +375,17 @@ typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t user_id; oc_
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_list_reactions;
 typedef struct { oc_slice emoji; uint64_t user_id; } oc_reaction_entry;
 typedef struct { uint64_t message_id; uint16_t count; const oc_reaction_entry *entries; } oc_reactions;
+/* Pins (REQ-230). PIN carries the op; PIN_UPDATED is the fan-out every member
+ * receives. LIST_PINS streams PINNED_MSG frames — each self-framed, so a full
+ * body is fine — terminated by PINS, exactly as LIST_THREAD does, because a
+ * pinned message is often scrolled out of a client's loaded history. */
+typedef struct { uint64_t channel_id; uint64_t message_id; uint8_t op; } oc_pin;
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t user_id; uint8_t op; uint64_t pinned_at; } oc_pin_updated;
+typedef struct { uint64_t channel_id; } oc_list_pins;
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time;
+                 uint64_t pinned_by; uint64_t pinned_at; oc_slice body; } oc_pinned_msg;
+typedef struct { uint64_t channel_id; uint32_t count; } oc_pins;
+
 typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; uint64_t parent_id; oc_slice body;
                  uint16_t n_attach; uint64_t attach_ids[OC_MAX_ATTACH]; } oc_send_reply;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t parent_id; uint64_t author_id; uint64_t server_time; uint32_t reply_count; oc_slice body;
@@ -535,6 +560,11 @@ oc_result oc_encode_msg_deleted(oc_wbuf *w, uint16_t version, const oc_msg_delet
 oc_result oc_encode_react(oc_wbuf *w, uint16_t version, const oc_react *m);
 oc_result oc_encode_reaction_updated(oc_wbuf *w, uint16_t version, const oc_reaction_updated *m);
 oc_result oc_encode_list_reactions(oc_wbuf *w, uint16_t version, const oc_list_reactions *m);
+oc_result oc_encode_pin(oc_wbuf *w, uint16_t version, const oc_pin *m);
+oc_result oc_encode_pin_updated(oc_wbuf *w, uint16_t version, const oc_pin_updated *m);
+oc_result oc_encode_list_pins(oc_wbuf *w, uint16_t version, const oc_list_pins *m);
+oc_result oc_encode_pinned_msg(oc_wbuf *w, uint16_t version, const oc_pinned_msg *m);
+oc_result oc_encode_pins(oc_wbuf *w, uint16_t version, const oc_pins *m);
 oc_result oc_encode_reactions(oc_wbuf *w, uint16_t version, const oc_reactions *m);
 oc_result oc_encode_send_reply(oc_wbuf *w, uint16_t version, const oc_send_reply *m);
 oc_result oc_encode_thread_reply(oc_wbuf *w, uint16_t version, const oc_thread_reply *m);
@@ -642,6 +672,11 @@ oc_result oc_decode_msg_deleted(oc_rbuf *p, oc_msg_deleted *m);
 oc_result oc_decode_react(oc_rbuf *p, oc_react *m);
 oc_result oc_decode_reaction_updated(oc_rbuf *p, oc_reaction_updated *m);
 oc_result oc_decode_list_reactions(oc_rbuf *p, oc_list_reactions *m);
+oc_result oc_decode_pin(oc_rbuf *p, oc_pin *m);
+oc_result oc_decode_pin_updated(oc_rbuf *p, oc_pin_updated *m);
+oc_result oc_decode_list_pins(oc_rbuf *p, oc_list_pins *m);
+oc_result oc_decode_pinned_msg(oc_rbuf *p, oc_pinned_msg *m);
+oc_result oc_decode_pins(oc_rbuf *p, oc_pins *m);
 oc_result oc_decode_reactions(oc_rbuf *p, oc_reaction_entry *entries, uint16_t cap, uint16_t *out_count, uint64_t *out_message_id);
 oc_result oc_decode_send_reply(oc_rbuf *p, oc_send_reply *m);
 oc_result oc_decode_thread_reply(oc_rbuf *p, oc_thread_reply *m);

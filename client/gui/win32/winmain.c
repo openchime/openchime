@@ -568,6 +568,12 @@ static int g_n_notify_hits;
 
 static int      g_show_members = 1;     /* members pane visible */
 static D2D1_RECT_F g_members_btn;       /* header toggle hit-box */
+static D2D1_RECT_F g_pins_btn;          /* header "Pinned" hit-box (REQ-230) */
+/* Rows of the open pins overlay: click jumps to the message, the trailing
+ * button unpins it. */
+static struct { D2D1_RECT_F row, unpin; uint64_t mid; } g_pinrows[64];
+static int g_n_pinrows;
+static uint64_t g_hover_pinrow;
 static D2D1_RECT_F g_ws_hdr_btn;        /* channel-column workspace header (opens ws menu) */
 static D2D1_RECT_F g_hdr_gear, g_hdr_compose;   /* header settings + compose buttons */
 static HWND     g_find;                 /* "Find a conversation" filter box (native EDIT) */
@@ -1121,6 +1127,7 @@ static void close_overlays(void) {
     if (mm->thread_open)    oc_client_close_thread(g_client);
     if (mm->search_open)    oc_client_close_search(g_client);
     if (mm->reactlist_open) oc_client_close_reactions(g_client);
+    if (mm->pinlist_open)   oc_client_close_pins(g_client);
     if (mm->weblist_open)   oc_client_close_webhooks(g_client);
     if (mm->storage_open)   oc_client_toggle_storage(g_client, 0);
     if (mm->audit_open)     oc_client_toggle_audit(g_client, 0);
@@ -1129,7 +1136,8 @@ static void close_overlays(void) {
 static int any_overlay(const oc_model *m) {
     return g_prefs_open || g_profile_uid || g_notify_open || g_keys_open || g_wsmgr_open ||
            (m && (m->thread_open || m->search_open || m->reactlist_open ||
-                  m->weblist_open || m->storage_open || m->audit_open));
+                  m->pinlist_open || m->weblist_open || m->storage_open ||
+                  m->audit_open));
 }
 
 static void ac_close(void);   /* fwd */
@@ -1675,6 +1683,11 @@ static IDWriteTextLayout *body_layout(const oc_msg *msg, float cw, UINT32 *wlen)
 #define MSG_NAME(g)  ((g) ? 0.0f  : 20.0f)   /* header (name/time) line height */
 #define MSG_BOT(g)   ((g) ? 6.0f  : 12.0f)   /* margin below the block */
 #define MSG_BODY_DY(g) (MSG_TOP(g) + MSG_NAME(g))   /* block top -> body top */
+/* A pinned message gets a marker line above its header (REQ-230), the way
+ * Slack does — a pin you can only see by opening a list is a pin you forget.
+ * It sits ABOVE the block, so it costs height on grouped continuations too. */
+#define MSG_PIN_H 17.0f
+#define MSG_PIN(msg) ((msg)->pinned ? MSG_PIN_H : 0.0f)
 
 /* A message's rendered height for a given content width (creates + returns the
  * body layout so the draw pass can reuse it; *wlen gets its UTF-16 length). */
@@ -1701,7 +1714,8 @@ static float msg_height(const oc_msg *msg, float content_w, int grouped,
             extra++;
     }
     if (msg->reply_count) extra++;
-    return MSG_BODY_DY(grouped) + body_h + (float)extra * LINE_H + thumbs + MSG_BOT(grouped);
+    return MSG_PIN(msg) + MSG_BODY_DY(grouped) + body_h +
+           (float)extra * LINE_H + thumbs + MSG_BOT(grouped);
 }
 
 static int reaction_is_mine(const oc_msg *msg, const char *emoji);   /* fwd */
@@ -1710,6 +1724,20 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
                          IDWriteTextLayout *body, float x0, float y, float content_w,
                          int grouped) {
     float ax = x0, tx = x0 + AVA + 12;
+
+    /* The pin marker, in the body column so it lines up with the text rather
+     * than floating over the avatar gutter. */
+    if (msg->pinned) {
+        float py = y + 3;
+        draw_lucide(rt, OC_ICON_PIN, rf(tx, py, tx + 12, py + 12), OC_COL_MUTED);
+        char lbl[96];
+        const char *who = oc_model_user_name((oc_model *)m, msg->pinned_by);
+        if (who && who[0]) snprintf(lbl, sizeof lbl, "Pinned by %s", who);
+        else               snprintf(lbl, sizeof lbl, "Pinned");
+        draw_text(rt, lbl, g_small, rf(tx + 17, py - 2, x0 + content_w + AVA + 12, py + 14),
+                  OC_COL_MUTED);
+        y += MSG_PIN_H;          /* everything below shifts down by the marker */
+    }
 
     if (!grouped) {
         float ty = y + MSG_TOP(grouped);        /* content sits below the top margin */
@@ -2035,7 +2063,8 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
             y += SEP_H;
         }
         if (y + heights[i] >= reg.top && y <= reg.bottom) {
-            float bx = x0 + AVA + 12, by = y + MSG_BODY_DY(grouped[i]);
+            float bx = x0 + AVA + 12;
+            float by = y + MSG_PIN(&msgs[first + i]) + MSG_BODY_DY(grouped[i]);
             /* Hover highlight behind the whole row (main transcript only). */
             if (capture && !g_selecting && g_hover_mid == msgs[first + i].message_id)
                 fill(rt, rf(reg.left, y, reg.right, y + heights[i]), OC_COL_HOVER);
@@ -2607,6 +2636,65 @@ static void draw_reactlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
     }
 }
 
+/* A channel's pinned messages (REQ-230). Each row is the message itself, so the
+ * list is readable without jumping — and clicking still jumps, because a pin is
+ * usually a pointer into a conversation rather than the whole of it. */
+static void draw_pinlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    D2D1_RECT_F body = overlay_header(rt, reg, "Pinned");
+    g_n_pinrows = 0;
+    if (m->pinlist_loading) { overlay_empty(rt, body, "Loading\u2026"); return; }
+    if (m->n_pins == 0) {
+        overlay_empty(rt, body,
+                      "Nothing pinned yet. Pin a message from its \u22EF menu.");
+        return;
+    }
+    float y = body.top + 8;
+    for (size_t i = 0; i < m->n_pins && y < body.bottom; i++) {
+        const oc_pinned_row *pr = &m->pins[i];
+        float rh = 58;
+        D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + rh - 6);
+        if (g_hover_pinrow == pr->message_id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
+
+        const char *who = oc_model_user_name((oc_model *)m, pr->author_id);
+        char head[192];
+        char when[24] = "";
+        if (pr->server_time) {
+            time_t t = (time_t)(pr->server_time / 1000);
+            struct tm tv;
+            if (oc_localtime_r(&t, &tv))
+                strftime(when, sizeof when, g_pref_time24 ? "%H:%M" : "%I:%M %p", &tv);
+        }
+        snprintf(head, sizeof head, "%s  %s", (who && who[0]) ? who : "user", when);
+        draw_text(rt, head, g_name, rf(row.left + 10, y + 4, row.right - 90, y + 24), OC_COL_TEXT);
+        draw_text(rt, pr->body ? pr->body : "", g_ui,
+                  rf(row.left + 10, y + 24, row.right - 90, y + 46), OC_COL_MUTED);
+
+        /* Who pinned it, on the same line as the unpin — the attribution and
+         * the action that undoes it belong together. */
+        const char *pby = oc_model_user_name((oc_model *)m, pr->pinned_by);
+        if (pby && pby[0]) {
+            char lbl[96];
+            snprintf(lbl, sizeof lbl, "pinned by %s", pby);
+            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
+            draw_text(rt, lbl, g_small, rf(row.left, y + 4, row.right - 12, y + 22), OC_COL_FAINT);
+            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
+        D2D1_RECT_F un = rf(row.right - 74, y + 24, row.right - 12, y + 46);
+        stroke_round(rt, un, 6.0f, OC_COL_BORDER, 1.0f);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Unpin", g_small, un, OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+        if (g_n_pinrows < (int)(sizeof g_pinrows / sizeof g_pinrows[0])) {
+            g_pinrows[g_n_pinrows].row   = row;
+            g_pinrows[g_n_pinrows].unpin = un;
+            g_pinrows[g_n_pinrows].mid   = pr->message_id;
+            g_n_pinrows++;
+        }
+        y += rh;
+    }
+}
+
 /* One preference row: a label, a sub-label, and a segmented set of choices on
  * the right. Returns the y for the next row. */
 static float pref_row(ID2D1RenderTarget *rt, D2D1_RECT_F body, float y, int row,
@@ -2794,6 +2882,7 @@ static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
     if (m->thread_open)    { draw_thread(rt, m, reg);    return; }
     if (m->search_open)    { draw_search(rt, m, reg);    return; }
     if (m->reactlist_open) { draw_reactlist(rt, m, reg); return; }
+    if (m->pinlist_open)   { draw_pinlist(rt, m, reg);   return; }
     if (m->weblist_open)   { draw_weblist(rt, m, reg);   return; }
     if (m->storage_open)   { draw_storage(rt, m, reg);   return; }
     if (m->audit_open)     { draw_audit(rt, m, reg);     return; }
@@ -2874,9 +2963,26 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
     draw_text(rt, "Members", g_ui, g_members_btn, g_show_members ? OC_COL_TEXT : OC_COL_MUTED);
     IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
 
+    /* Pinned (REQ-230). Deliberately label-only: a count would have to come from
+     * the server, and showing one derived from loaded messages would be wrong
+     * more often than right. */
+    if (c) {
+        float pw = text_width("Pinned", g_ui) + 34;
+        g_pins_btn = rf(g_members_btn.left - 8 - pw, 12, g_members_btn.left - 8, HEADER_H - 12);
+        if (m->pinlist_open) fill_round(rt, g_pins_btn, 6.0f, OC_COL_SELECT);
+        draw_lucide(rt, OC_ICON_PIN, rf(g_pins_btn.left + 8, g_pins_btn.top + 6,
+                                        g_pins_btn.left + 22, g_pins_btn.bottom - 6),
+                    m->pinlist_open ? OC_COL_TEXT : OC_COL_MUTED);
+        draw_text(rt, "Pinned", g_ui,
+                  rf(g_pins_btn.left + 26, g_pins_btn.top, g_pins_btn.right, g_pins_btn.bottom),
+                  m->pinlist_open ? OC_COL_TEXT : OC_COL_MUTED);
+    } else {
+        g_pins_btn = rf(0, 0, 0, 0);
+    }
+
     /* Jump-to-unread (WIN-14): only while this channel actually has a divider to
      * jump to, so it is never a dead control. */
-    float statr = g_members_btn.left - 12;
+    float statr = g_pins_btn.right > 0 ? g_pins_btn.left - 12 : g_members_btn.left - 12;
     if (g_unread_from && g_unread_chan == g_sel && g_unread_count > 0) {
         char lbl[40];
         snprintf(lbl, sizeof lbl, "%d new \u2191", g_unread_count);
@@ -4367,6 +4473,12 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
     if (!msg->deleted && !is_reply)
         AppendMenuW(menu, MF_STRING, 100, msg->reply_count ? L"Open thread" : L"Reply in thread");
     if (msg->n_reactions) AppendMenuW(menu, MF_STRING, 102, L"Who reacted");
+    /* A pin belongs to the channel, so this reads the same for everyone —
+     * anyone may unpin, including someone else's pin (ARCH-90). A tombstone has
+     * nothing to pin to. */
+    if (!msg->deleted)
+        AppendMenuW(menu, MF_STRING, 103,
+                    msg->pinned ? L"Unpin from channel" : L"Pin to channel");
     AppendMenuW(menu, MF_STRING, 20, L"Copy text");
     int own = (msg->author_id == m->user_id);
     int canmod = own || self_role(m) >= OC_ROLE_ADMIN;
@@ -4390,6 +4502,8 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
         g_scroll = 0; oc_client_open_thread(g_client, g_sel, mid);
     } else if (cmd == 102) {
         g_scroll = 0; oc_client_list_reactions(g_client, chan, mid);
+    } else if (cmd == 103) {
+        oc_client_pin(g_client, chan, mid, msg->pinned ? OC_PIN_REMOVE : OC_PIN_ADD);
     } else if (cmd >= 30 && cmd - 30 < msg->n_attach) {
         download_attachment(hwnd, &msg->attach[cmd - 30]);
     }
@@ -4675,6 +4789,29 @@ static int on_click(HWND hwnd, int x, int y) {
     if (g_sb_hover_sec >= 0 && in_rect(g_sb_kebab, x, y)) {
         open_section_menu(hwnd, g_sb_hover_sec);
         return 1;
+    }
+    /* Pinned toggle (REQ-230). Re-opening re-asks the server rather than showing
+     * a cached list: pins change from other clients and a stale list is worse
+     * than a moment's load. */
+    if (in_rect(g_pins_btn, x, y)) {
+        const oc_model *mm2 = g_client ? oc_client_model(g_client) : NULL;
+        if (mm2 && mm2->pinlist_open) oc_client_close_pins(g_client);
+        else if (g_sel)               oc_client_list_pins(g_client, g_sel);
+        return 1;
+    }
+    /* Rows of the open pins overlay. */
+    for (int i = 0; i < g_n_pinrows; i++) {
+        if (in_rect(g_pinrows[i].unpin, x, y)) {
+            oc_client_pin(g_client, g_sel, g_pinrows[i].mid, OC_PIN_REMOVE);
+            return 1;
+        }
+        if (in_rect(g_pinrows[i].row, x, y)) {
+            /* Jump to it in the transcript — a pin is a pointer into the
+             * conversation, so landing on it in context is the point. */
+            g_jump_mid = g_pinrows[i].mid;
+            oc_client_close_pins(g_client);
+            return 1;
+        }
     }
     /* Members toggle. */
     if (in_rect(g_members_btn, x, y)) {
@@ -6339,6 +6476,21 @@ static void test_poll(HWND hwnd) {
         search_open(hwnd);
         if (arg[0]) { WCHAR w[256]; to_w(arg, w, 256); SetWindowTextW(g_srch, w); search_submit(); }
         test_ack("ok");
+    } else if (!strcmp(verb, "pin")) {
+        /* The kebab's Pin item goes through a modal TrackPopupMenu the harness
+         * cannot navigate, so this drives the same client call directly. */
+        uint64_t mid = strtoull(arg, NULL, 10);
+        const oc_model *pm = model();
+        const oc_channel *pc = pm && g_sel ? oc_model_channel((oc_model *)pm, g_sel) : NULL;
+        if (!mid && pc && pc->n_msgs) mid = pc->msgs[pc->n_msgs - 1].message_id;
+        const oc_msg *pmsg = find_msg(pc, mid);
+        oc_client_pin(g_client, g_sel, mid, (pmsg && pmsg->pinned) ? OC_PIN_REMOVE : OC_PIN_ADD);
+        test_ack("ok");
+    } else if (!strcmp(verb, "pins")) {
+        const oc_model *pm = model();
+        if (pm && pm->pinlist_open) oc_client_close_pins(g_client);
+        else if (g_sel)             oc_client_list_pins(g_client, g_sel);
+        test_ack("ok");
     } else if (!strcmp(verb, "dump")) {
         test_dump(arg); test_ack("ok");
     /* Sign-in drivers. Setting the EDIT text directly is deterministic, where
@@ -6826,6 +6978,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int r = (any_overlay(model()) || !view_has_sidebar()) ? -1 : msgrow_at(my);
             uint64_t h = r >= 0 ? g_msgrows[r].mid : 0;
             if (h != g_hover_mid) { g_hover_mid = h; InvalidateRect(hwnd, NULL, FALSE); }
+            /* Pins-overlay row hover, so a row reads as the clickable thing it is. */
+            uint64_t ph = 0;
+            for (int i = 0; i < g_n_pinrows; i++)
+                if (in_rect(g_pinrows[i].row, (float)mx, (float)my)) { ph = g_pinrows[i].mid; break; }
+            if (ph != g_hover_pinrow) { g_hover_pinrow = ph; InvalidateRect(hwnd, NULL, FALSE); }
         }
         return 0;
     }

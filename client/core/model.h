@@ -50,6 +50,9 @@ typedef struct {
     uint8_t      edited;      /* body was edited (REQ-051) */
     uint8_t      deleted;     /* tombstoned (REQ-052) */
     uint32_t     reply_count; /* thread replies to this message (REQ-060) */
+    uint8_t      pinned;      /* pinned to its channel (REQ-230) */
+    uint64_t     pinned_by;   /* who pinned it (0 = unknown) */
+    uint64_t     pinned_at;
 } oc_msg;
 
 typedef struct {
@@ -92,6 +95,13 @@ typedef struct { uint64_t message_id, channel_id, author_id, server_time; char *
  * with which emoji on the inspected message. */
 typedef struct { uint64_t user_id; char emoji[40]; } oc_reactor_row;
 
+/* One entry of a channel's pins list (REQ-230). The body travels with it, so a
+ * frontend can render the list without the message being in loaded history. */
+typedef struct {
+    uint64_t message_id, author_id, server_time, pinned_by, pinned_at;
+    char    *body;   /* heap */
+} oc_pinned_row;
+
 /* One incoming-webhook entry (from LIST_WEBHOOKS -> WEBHOOK_LIST, REQ-170): the
  * webhook's id + label + disabled flag. Tokens are never listed (shown once at
  * creation, in webhook_token). */
@@ -133,6 +143,14 @@ typedef struct {
     uint64_t  reactlist_message;
     oc_reactor_row *reactors;
     size_t    n_reactors, cap_reactors;
+    /* The open pins view (REQ-230): a channel's pinned messages. pinlist_open
+     * is 0 when no such overlay is open. Distinct from the per-message `pinned`
+     * flag, which is what marks a pin inline in the transcript. */
+    uint8_t   pinlist_open;
+    uint64_t  pinlist_channel;
+    uint8_t   pinlist_loading;   /* asked, terminator not yet seen */
+    oc_pinned_row *pins;
+    size_t    n_pins, cap_pins;
     /* The tenant roster (REQ, LIST_USERS) + whether the roster view is open. */
     uint8_t   roster_open;
     oc_member *users;
@@ -275,6 +293,11 @@ void oc_model_close_search(oc_model *m);
  * / close the overlay. */
 void oc_model_reactlist_begin(oc_model *m, uint64_t message_id);
 void oc_model_close_reactlist(oc_model *m);
+
+/* Begin / end a pins inspection for a channel (REQ-230). Begin clears any prior
+ * list and marks it loading, so a frontend can tell "no pins yet" from "empty". */
+void oc_model_pinlist_begin(oc_model *m, uint64_t channel_id);
+void oc_model_close_pinlist(oc_model *m);
 
 /* Begin listing a channel's incoming webhooks (clears prior entries + the
  * shown-once token, records the channel) / close the overlay. */

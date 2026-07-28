@@ -498,6 +498,44 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 oc_ev *e = oc_ev_new(OC_EV_PRESENCE);
                 if (e) { e->user_id = pu.user_id; e->status = pu.status; oc_queue_push(to_ui, e); }
             }
+        } else if (hdr.msg_type == OC_MSG_PIN_UPDATED) {
+            oc_pin_updated pu;
+            if (oc_decode_pin_updated(&p, &pu) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_PIN);
+                if (e) {
+                    e->channel_id  = pu.channel_id;
+                    e->message_id  = pu.message_id;
+                    e->user_id     = pu.user_id;      /* the pinner */
+                    e->op          = pu.op;
+                    e->server_time = pu.pinned_at;
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_PINNED_MSG) {
+            oc_pinned_msg pm;
+            if (oc_decode_pinned_msg(&p, &pm) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_PINNED_MSG);
+                if (e) {
+                    e->channel_id  = pm.channel_id;
+                    e->message_id  = pm.message_id;
+                    e->author_id   = pm.author_id;
+                    e->server_time = pm.server_time;
+                    e->user_id     = pm.pinned_by;
+                    e->pinned_at   = pm.pinned_at;
+                    e->body = malloc(pm.body.len + 1);
+                    if (e->body) {
+                        if (pm.body.len) memcpy(e->body, pm.body.ptr, pm.body.len);
+                        e->body[pm.body.len] = '\0';
+                    }
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_PINS) {
+            oc_pins pn;
+            if (oc_decode_pins(&p, &pn) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_PINS_END);
+                if (e) { e->channel_id = pn.channel_id; e->count = pn.count; oc_queue_push(to_ui, e); }
+            }
         } else if (hdr.msg_type == OC_MSG_REACTION_UPDATED) {
             oc_reaction_updated ru;
             if (oc_decode_reaction_updated(&p, &ru) == OC_OK) {
@@ -1179,6 +1217,18 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_set_presence sp = { c->op };
                 if (oc_encode_set_presence(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_PIN) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_pin pn = { c->channel_id, c->message_id, c->op };
+                if (oc_encode_pin(&w, OC_PROTOCOL_VERSION, &pn) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_PINS) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_list_pins lp = { c->channel_id };
+                if (oc_encode_list_pins(&w, OC_PROTOCOL_VERSION, &lp) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_LIST_REACTIONS) {

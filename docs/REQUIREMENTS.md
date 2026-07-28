@@ -948,8 +948,11 @@ architecture decision.*
 
 - **REQ-230.** Any channel member has been able to **pin** a message to its
   channel; pinned messages have been listed for the channel, visible to all
-  members, and unpinnable by a member or an admin. **[needs ARCH decision — pin
-  storage + who may pin/unpin.]**
+  members, and unpinnable by a member or an admin. **Built (ARCH-90):** migration
+  0022's `pins` table is keyed on the message, so a pin is channel state rather
+  than per-user; any member may pin or unpin (including someone else's pin), a
+  channel holds at most 100, and the list streams each pinned message with its
+  body. Pin state is replayed on backfill, so it survives a reconnect.
 - **REQ-231.** A user has been able to **save (bookmark)** any message they can
   read into a private, personal list for later retrieval, visible only to them.
   **[needs ARCH decision — per-user saved-item storage.]**

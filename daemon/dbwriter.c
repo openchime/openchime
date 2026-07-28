@@ -219,6 +219,8 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->replay);
     for (size_t i = 0; i < r->n_rreact; i++) free(r->rreact[i].emoji);
     free(r->rreact);
+    for (size_t i = 0; i < r->n_plist; i++) free(r->plist[i].body);
+    free(r->plist);
     free(r->ch_name);
     for (size_t i = 0; i < r->n_chlist; i++) free(r->chlist[i].name);
     free(r->chlist);
@@ -1059,6 +1061,11 @@ static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
      * DUPLICATE conversation; migration 0019's unique dm_key now forbids that
      * state, which makes removing the channel the only coherent option. */
     sqlite3_prepare_v2(db,
+        "DELETE FROM pins WHERE channel_id IN (SELECT channel_id FROM channel_members "
+        "  WHERE user_id=?1 AND channel_id IN (SELECT id FROM channels WHERE kind='dm'));",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db,
         "DELETE FROM mentions WHERE channel_id IN (SELECT channel_id FROM channel_members "
         "  WHERE user_id=?1 AND channel_id IN (SELECT id FROM channels WHERE kind='dm'));",
         -1, &st, NULL);
@@ -1477,6 +1484,11 @@ static oc_dbres *process_delete(sqlite3 *db, const oc_job *j) {
     if (rc != SQLITE_DONE) {
         r->type = OC_RES_DELETE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
+    /* A tombstone has nothing to pin to either (REQ-052/230). Dropped before the
+     * reactions so the order matches the table dependencies. */
+    sqlite3_prepare_v2(db, "DELETE FROM pins WHERE message_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
+
     /* A tombstone has no body to react to; drop its reactions (REQ-052/070). */
     sqlite3_prepare_v2(db, "DELETE FROM reactions WHERE message_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
@@ -1781,6 +1793,133 @@ static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
     load_channel_info(db, cid, self, r);
     r->ch_peer = other;                      /* the DM's other participant (self for a self-DM) */
     r->push_user_id = self_dm ? 0 : other;   /* no peer to push a self-DM to */
+    return r;
+}
+
+/* Pin or unpin a message (REQ-230, ARCH-90).
+ *
+ * A pin belongs to the channel, so any member may place one and any member may
+ * remove one — including someone else's. That is Slack's default, and the
+ * alternative fails worse: a pin only its author can remove outlives its
+ * usefulness the moment that person leaves.
+ *
+ * Pinning an already-pinned message is a no-op, not an error, matching how
+ * REACT treats a repeat add. The cap is checked before the insert so a channel
+ * cannot grow an unbounded pin list. */
+static oc_dbres *process_pin(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+    r->message_id = j->message_id;
+    r->user_id = j->user_id;
+    r->pin_op = j->pin_op;
+
+    /* The message must exist, live in this channel, and not be a tombstone:
+     * there is nothing to pin to a message whose body is gone (REQ-052). */
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT 1 FROM messages WHERE id=? AND channel_id=? AND deleted_at_ms IS NULL;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+    int exists = (sqlite3_step(st) == SQLITE_ROW);
+    sqlite3_finalize(st);
+    if (!exists) { r->type = OC_RES_PIN_ERR; r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r; }
+    if (!is_member(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_PIN_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+
+    uint64_t now = dbw_now_ms();
+    if (j->pin_op == OC_PIN_ADD) {
+        /* The cap is per channel and excludes a re-pin of something already
+         * pinned, which is why the count is taken before the insert but only
+         * blocks when this message is not already in the set. */
+        sqlite3_prepare_v2(db,
+            "SELECT COUNT(*), SUM(message_id=?2) FROM pins WHERE channel_id=?1;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->message_id);
+        uint64_t n = 0; int already = 0;
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            n = (uint64_t)sqlite3_column_int64(st, 0);
+            already = sqlite3_column_int(st, 1) > 0;
+        }
+        sqlite3_finalize(st);
+        if (!already && n >= OC_MAX_PINS) {
+            r->type = OC_RES_PIN_ERR; r->err_code = OC_ERR_TOO_MANY_PINS; return r;
+        }
+        sqlite3_prepare_v2(db,
+            "INSERT OR IGNORE INTO pins(message_id,channel_id,pinned_by,created_at_ms) "
+            "VALUES(?,?,?,?);", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)now);
+        sqlite3_step(st); sqlite3_finalize(st);
+        /* Report the pin's real time and pinner, which for a re-pin are the
+         * original ones — the fan-out must agree with what a later LIST_PINS
+         * will say, or two clients disagree about who pinned it. */
+        sqlite3_prepare_v2(db, "SELECT pinned_by, created_at_ms FROM pins WHERE message_id=?;",
+                           -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            r->user_id   = (uint64_t)sqlite3_column_int64(st, 0);
+            r->pinned_at = (uint64_t)sqlite3_column_int64(st, 1);
+        }
+        sqlite3_finalize(st);
+    } else {
+        sqlite3_prepare_v2(db, "DELETE FROM pins WHERE message_id=? AND channel_id=?;",
+                           -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+        sqlite3_step(st); sqlite3_finalize(st);
+        r->pinned_at = now;
+    }
+
+    r->type = OC_RES_PIN_OK;
+    load_members(db, j->channel_id, r);
+    return r;
+}
+
+/* A channel's pinned messages, newest pin first (REQ-230). The body travels
+ * with each row: a pin is usually old enough to be outside the client's loaded
+ * history, so returning ids alone would make opening the list a fetch storm. */
+static oc_dbres *process_list_pins(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+
+    if (!is_member(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_PIN_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+    r->type = OC_RES_PINS;
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT p.message_id, m.author_id, m.created_at_ms, "
+        "       COALESCE(p.pinned_by,0), p.created_at_ms, m.body "
+        "  FROM pins p JOIN messages m ON m.id = p.message_id "
+        " WHERE p.channel_id=? AND m.deleted_at_ms IS NULL "
+        " ORDER BY p.created_at_ms DESC LIMIT ?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)OC_MAX_PINS);
+
+    oc_pin_row *arr = calloc(OC_MAX_PINS, sizeof *arr);
+    size_t n = 0;
+    while (arr && n < OC_MAX_PINS && sqlite3_step(st) == SQLITE_ROW) {
+        arr[n].message_id    = (uint64_t)sqlite3_column_int64(st, 0);
+        arr[n].author_id     = (uint64_t)sqlite3_column_int64(st, 1);
+        arr[n].created_at_ms = (uint64_t)sqlite3_column_int64(st, 2);
+        arr[n].pinned_by     = (uint64_t)sqlite3_column_int64(st, 3);
+        arr[n].pinned_at     = (uint64_t)sqlite3_column_int64(st, 4);
+        const unsigned char *b = sqlite3_column_text(st, 5);
+        arr[n].body = b ? strdup((const char *)b) : NULL;
+        n++;
+    }
+    sqlite3_finalize(st);
+    r->plist = arr;
+    r->n_plist = n;
     return r;
 }
 
@@ -2272,8 +2411,12 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             "  (SELECT COALESCE(MAX(c.created_at_ms),0) FROM messages c WHERE c.parent_id=m.id), "
             /* The display name to show: a webhook label overrides (REQ-170),
              * else the author's display_name (ARCH-74 client shows names). */
-            "  COALESCE(NULLIF(m.author_name,''), u.display_name, '') "
+            "  COALESCE(NULLIF(m.author_name,''), u.display_name, ''), "
+            /* Pin state travels with the message: a BROADCAST has no field for
+             * it, so a reconnecting client would otherwise lose every pin. */
+            "  COALESCE(p.pinned_by,0), COALESCE(p.created_at_ms,0) "
             "FROM messages m LEFT JOIN users u ON u.id = m.author_id "
+            "                LEFT JOIN pins  p ON p.message_id = m.id "
             "WHERE m.channel_id=? AND m.id>? AND m.parent_id IS NULL "
             "ORDER BY m.id LIMIT ?;", -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)ch);
@@ -2302,6 +2445,8 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             m->last_reply_at = (uint64_t)sqlite3_column_int64(st, 5);
             const char *an = (const char *)sqlite3_column_text(st, 6);
             if (an && an[0]) m->author_name = strdup(an);   /* webhook display name (REQ-170) */
+            m->pinned_by = (uint64_t)sqlite3_column_int64(st, 7);
+            m->pinned_at = (uint64_t)sqlite3_column_int64(st, 8);
             /* Re-attach the message's linked attachments so a reconnecting client
              * sees them inline, not just live members (REQ-140). */
             load_message_attachments(db, m->message_id, m->attach, &m->n_attach);
@@ -3099,7 +3244,7 @@ static oc_dbres *process_audit_query(sqlite3 *db, const oc_job *j);
 static int is_read_job(int type) {
     return type == OC_JOB_BACKFILL || type == OC_JOB_HISTORY || type == OC_JOB_SEARCH ||
            type == OC_JOB_LIST_CHANNELS || type == OC_JOB_LIST_USERS ||
-           type == OC_JOB_LIST_REACTIONS || type == OC_JOB_LIST_THREAD ||
+           type == OC_JOB_LIST_REACTIONS || type == OC_JOB_LIST_PINS || type == OC_JOB_LIST_THREAD ||
            type == OC_JOB_TYPING || type == OC_JOB_ATTACH_LOOKUP ||
            type == OC_JOB_LIST_WEBHOOKS || type == OC_JOB_LIST_NOTIFY_PREFS ||
            type == OC_JOB_LIST_CLIENT_SETTINGS ||
@@ -3116,6 +3261,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_LIST_CHANNELS)  return process_list_channels(rdb, j);
     if (j->type == OC_JOB_LIST_USERS)     return process_list_users(rdb, j);
     if (j->type == OC_JOB_LIST_REACTIONS) return process_list_reactions(rdb, j);
+    if (j->type == OC_JOB_LIST_PINS)      return process_list_pins(rdb, j);
     if (j->type == OC_JOB_LIST_THREAD)    return process_list_thread(rdb, j);
     if (j->type == OC_JOB_TYPING)         return process_typing(rdb, j);
     if (j->type == OC_JOB_ATTACH_LOOKUP)  return process_attach_lookup(rdb, j);
@@ -3149,6 +3295,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_REMOVE_USER)    return process_remove_user(w->db, j);
     if (j->type == OC_JOB_REDEEM)         return process_redeem(w, j);
     if (j->type == OC_JOB_REACT)          return process_react(w->db, j);
+    if (j->type == OC_JOB_PIN)            return process_pin(w->db, j);
     if (j->type == OC_JOB_SEND_REPLY)     return process_send_reply(w->db, j);
     if (j->type == OC_JOB_SETUP_INVITE)   return process_setup_invite(w->db, j);
     if (j->type == OC_JOB_CLIENT_ACK)     return process_client_ack(w->db, j);

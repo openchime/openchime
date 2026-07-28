@@ -898,6 +898,28 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_PIN) {
+            oc_pin pn;
+            if (oc_decode_pin(&p, &pn) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_PIN, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = pn.channel_id;
+            j->message_id = pn.message_id;
+            j->pin_op = pn.op;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_PINS) {
+            oc_list_pins lp;
+            if (oc_decode_list_pins(&p, &lp) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_PINS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = lp.channel_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SEND_REPLY) {
             oc_send_reply sr = {0};
             if (oc_decode_send_reply(&p, &sr) != OC_OK) return -1;
@@ -1830,6 +1852,54 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         free(ents);
         break;
     }
+    case OC_RES_PIN_OK: {
+        /* A pin is channel state, so every connected member learns of it —
+         * the same fan-out shape as a reaction (REQ-230). */
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_pin_updated m = { r->message_id, r->channel_id, r->user_id,
+                             r->pin_op, r->pinned_at };
+        oc_encode_pin_updated(&w, OC_PROTOCOL_VERSION, &m);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_PIN_ERR: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        uint8_t ctx[8];
+        for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->message_id >> (56 - 8 * i));
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_slice cs = { ctx, sizeof ctx };
+        oc_error e = { r->err_code, 0, cs, oc_slice_str("pin rejected") };
+        oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_PINS: {
+        /* Stream each pinned message, then the terminator — the LIST_THREAD
+         * shape, chosen because each body needs its own frame. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        for (size_t i = 0; i < r->n_plist && conns[c->fd]; i++) {
+            const oc_pin_row *pr = &r->plist[i];
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_pinned_msg pm = { pr->message_id, r->channel_id, pr->author_id,
+                                 pr->created_at_ms, pr->pinned_by, pr->pinned_at,
+                                 oc_slice_str(pr->body ? pr->body : "") };
+            oc_encode_pinned_msg(&w, OC_PROTOCOL_VERSION, &pm);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        if (!conns[c->fd]) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_pins term = { r->channel_id, (uint32_t)r->n_plist };
+        oc_encode_pins(&w, OC_PROTOCOL_VERSION, &term);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
     case OC_RES_REPLY_OK: {
         /* Ack the sender; then, unless it was an idempotent replay, fan the reply
          * out as a THREAD_REPLY (never to the main scroll, REQ-060). */
@@ -2355,6 +2425,19 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
                 send_bytes(ep, conns, fd, g_enc, w.len);
             }
         }
+        /* Pin state for what we just replayed, for the same reason as the
+         * reactions below: a BROADCAST has no field for it, so without this a
+         * reload silently loses every pin (REQ-230). */
+        for (size_t i = 0; i < r->n_replay && conns[fd]; i++) {
+            if (!r->replay[i].pinned_by && !r->replay[i].pinned_at) continue;
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_pin_updated pu = { r->replay[i].message_id, r->replay[i].channel_id,
+                                  r->replay[i].pinned_by, OC_PIN_ADD,
+                                  r->replay[i].pinned_at };
+            oc_encode_pin_updated(&w, OC_PROTOCOL_VERSION, &pu);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+        }
+
         /* Then the reaction state for those messages. A BROADCAST carries none,
          * so without this every reaction vanished on reload. op=ADD with the
          * aggregate count reconstructs the chip; user_id is the requester when

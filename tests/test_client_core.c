@@ -230,6 +230,80 @@ static const unsigned char SRV_ANSWER[] = {
 /* The sidebar helper (WIN-5/6): grouping, filter, sort, collapse — shared by
  * every frontend so the TUI and the GUI cannot disagree about what belongs
  * where. Built against a hand-made model, no daemon needed. */
+/* Pins folded into the model (REQ-230, ARCH-90): the inline flag on a message
+ * and the standalone pins overlay, which is fed by its own frames because a
+ * pinned message is usually outside loaded history. */
+static void test_pins(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 5; e.author_id = 2;
+    e.server_time = 1000; e.body = strdup("the runbook"); oc_model_apply(&m, &e);
+
+    oc_channel *c = oc_model_channel(&m, 10);
+    CHECK(c && c->n_msgs == 1 && c->msgs[0].pinned == 0);
+
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PIN; e.channel_id = 10; e.message_id = 5; e.user_id = 7;
+    e.op = 1; e.server_time = 2000; oc_model_apply(&m, &e);
+    CHECK(c->msgs[0].pinned == 1 && c->msgs[0].pinned_by == 7 && c->msgs[0].pinned_at == 2000);
+
+    /* An unpin clears the attribution too, so a frontend cannot render a stale
+     * "pinned by" on an unpinned message. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PIN; e.channel_id = 10; e.message_id = 5; e.user_id = 7; e.op = 0;
+    oc_model_apply(&m, &e);
+    CHECK(c->msgs[0].pinned == 0 && c->msgs[0].pinned_by == 0);
+
+    /* A pin for a message we have not loaded is dropped, not a crash: it is the
+     * normal case when another member pins far up the scroll. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PIN; e.channel_id = 10; e.message_id = 9999; e.op = 1;
+    oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PIN; e.channel_id = 404; e.message_id = 5; e.op = 1;
+    oc_model_apply(&m, &e);
+
+    /* The overlay. Entries only land while it is open and for its channel — a
+     * late frame from a previous open must not pollute the current one. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PINNED_MSG; e.channel_id = 10; e.message_id = 5;
+    e.body = strdup("ignored"); oc_model_apply(&m, &e);
+    CHECK(m.n_pins == 0);
+
+    oc_model_pinlist_begin(&m, 10);
+    CHECK(m.pinlist_open && m.pinlist_loading && m.pinlist_channel == 10);
+
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PINNED_MSG; e.channel_id = 10; e.message_id = 5; e.author_id = 2;
+    e.server_time = 1000; e.user_id = 7; e.pinned_at = 2000;
+    e.body = strdup("the runbook"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PINNED_MSG; e.channel_id = 99; e.message_id = 6;
+    e.body = strdup("other channel"); oc_model_apply(&m, &e);
+    CHECK(m.n_pins == 1);
+    CHECK(m.pins[0].message_id == 5 && m.pins[0].pinned_by == 7);
+    CHECK(m.pins[0].pinned_at == 2000);       /* a ms stamp, not truncated to 32 bits */
+    CHECK(m.pins[0].body && strcmp(m.pins[0].body, "the runbook") == 0);
+
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PINS_END; e.channel_id = 10; oc_model_apply(&m, &e);
+    CHECK(m.pinlist_open && !m.pinlist_loading);   /* open, done loading, one row */
+
+    /* Someone else unpinning drops the row from the open list, rather than
+     * leaving an entry that does nothing when clicked. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_PIN; e.channel_id = 10; e.message_id = 5; e.op = 0;
+    oc_model_apply(&m, &e);
+    CHECK(m.n_pins == 0);
+
+    oc_model_close_pinlist(&m);
+    CHECK(!m.pinlist_open && m.n_pins == 0);
+    oc_model_free(&m);
+}
+
 static void test_sidebar(void) {
     oc_model m; oc_model_init(&m);
     m.user_id = 1;
@@ -538,6 +612,7 @@ int run_client_core_tests(void) {
     printf("test_client_core: sidebar, resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, client-settings, profile, seen-by, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox\n");
 
     test_sidebar();
+    test_pins();
     test_resolve();
     test_last_error();
     test_secret_routing();

@@ -36,6 +36,9 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_SETUP_INVITE = 24, OC_JOB_CLIENT_ACK = 25,
        OC_JOB_LOAD_IDENTITY = 26, OC_JOB_STORE_IDENTITY = 27, OC_JOB_OPEN_DM = 28,
        OC_JOB_TYPING = 29,
+       /* Pins (REQ-230, ARCH-90). PIN is a write (add/remove); LIST_PINS is a
+        * read served on the reader connection. */
+       OC_JOB_PIN = 62, OC_JOB_LIST_PINS = 63,
        /* Attachments (REQ-140/141, ARCH-69/70). CREATE mints a pending row + a
         * storage key on UPLOAD_BEGIN (write); FINALIZE records the streamed
         * size + digest on UPLOAD_END (write); LOOKUP authorizes + fetches the
@@ -119,6 +122,9 @@ typedef struct oc_job {
     /* REACT (channel_id + message_id above); emoji is heap, op is add/remove. */
     char          *emoji;      /* heap */
     uint8_t        react_op;
+
+    /* PIN (channel_id + message_id above); op is add/remove (REQ-230). */
+    uint8_t        pin_op;
 
     /* SEARCH: query text is carried in body/body_len; this bounds the result. */
     uint16_t       search_limit;
@@ -224,7 +230,18 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
         * the channel's members + backfill the acker with the others' cursors. */
        OC_RES_READ_CURSOR = 50, OC_RES_ENROLLMENT = 56,
        /* Device-token register/unregister acknowledged / rejected (ARCH-85). */
-       OC_RES_DEVICE_TOKEN_OK = 57, OC_RES_DEVICE_TOKEN_ERR = 58 };
+       OC_RES_DEVICE_TOKEN_OK = 57, OC_RES_DEVICE_TOKEN_ERR = 58,
+       /* Pins (REQ-230). PIN_OK fans out to the channel's members; PINS is the
+        * channel's pinned-message list; PIN_ERR carries err_code. */
+       OC_RES_PIN_OK = 59, OC_RES_PIN_ERR = 60, OC_RES_PINS = 61 };
+
+/* One row in a PINS result. The body travels with it because a pinned message
+ * is usually scrolled out of the client's loaded history — a list of bare ids
+ * would force the client to fetch each one. */
+typedef struct {
+    uint64_t message_id, author_id, created_at_ms, pinned_by, pinned_at;
+    char    *body;   /* heap; NULL for a tombstoned message */
+} oc_pin_row;
 
 /* One row in a REACTIONS result (a distinct emoji + one reacting user). */
 typedef struct { char *emoji; uint64_t user_id; } oc_reaction_row;
@@ -319,6 +336,11 @@ typedef struct {
     oc_attach_meta attach[OC_MAX_ATTACH];  /* linked attachments (REQ-140) */
     size_t         n_attach;
     char    *author_name;  /* heap; override display name (webhooks), else NULL */
+    /* Pin state (REQ-230). A BROADCAST carries none, so without this every pin
+     * vanished the moment a client reloaded — the same defect the reaction
+     * replay above exists to prevent. */
+    uint64_t pinned_by;    /* 0 when not pinned */
+    uint64_t pinned_at;
 } oc_replay_msg;
 
 typedef struct oc_dbres {
@@ -392,6 +414,14 @@ typedef struct oc_dbres {
     uint64_t        react_count;
     oc_reaction_row *rlist;         /* heap array; REACTIONS */
     size_t           n_rlist;
+
+    /* Pins (REQ-230). PIN_OK reuses message_id/channel_id/user_id/members above
+     * for the fan-out; pin_op says which way and pinned_at when. PINS carries
+     * the channel's list. */
+    uint8_t          pin_op;
+    uint64_t         pinned_at;
+    oc_pin_row      *plist;         /* heap array; PINS */
+    size_t           n_plist;
 
     /* Threads (REQ-060). REPLY_OK reuses message_id/channel_id/author_id/
      * server_time/body/idem/members/duplicate above, plus parent_id + reply_count.

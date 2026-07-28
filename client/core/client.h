@@ -113,6 +113,16 @@ void oc_client_open_dm(oc_client *c, uint64_t user_id);
 
 /* Inspect who reacted to a message (REQ-071): the reactors stream into the
  * model's reactor list (a "who reacted" overlay) / close that overlay. */
+/* Pin or unpin a message (REQ-230, ARCH-90). Any member may do either, so a
+ * frontend does not need to check who placed the pin. op is OC_PIN_ADD/REMOVE;
+ * the resulting PIN_UPDATED reaches every member and folds into the model. */
+void oc_client_pin(oc_client *c, uint64_t channel_id, uint64_t message_id, uint8_t op);
+
+/* Open / close a channel's pins list. The entries carry their bodies, so the
+ * list renders without those messages being in loaded history. */
+void oc_client_list_pins(oc_client *c, uint64_t channel_id);
+void oc_client_close_pins(oc_client *c);
+
 void oc_client_list_reactions(oc_client *c, uint64_t channel_id, uint64_t message_id);
 void oc_client_close_reactions(oc_client *c);
 

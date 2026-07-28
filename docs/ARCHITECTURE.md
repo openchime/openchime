@@ -169,6 +169,20 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **One approximation, recorded rather than hidden:** `@here` should mean "people around right now", but presence lives in the net thread's memory and the push worker holds its own read-only connection (ARCH-66). For the push decision all three broadcasts are therefore treated alike, so `@here` may push someone who was already looking. In-app notification, where the client knows its own state, does not have this problem.
 
+- **ARCH-90 (Pins — channel state, one row per message, listed with bodies):** Delivers REQ-230.
+
+  **A pin is a property of the channel, not of a user.** Migration 0022's `pins` table is keyed on `message_id` alone: a message is pinned or it is not, and pinning it twice is a no-op rather than a second row. This is exactly what distinguishes a pin from a **saved item** (REQ-231), which will be per-user and private when it is built — the two look similar in a menu and are opposite in the schema, so the distinction is recorded here rather than left to be rediscovered.
+
+  **Any member may pin; any member may unpin, including someone else's pin.** That is Slack's default, and the alternative fails worse: a pin only its author can remove outlives its usefulness the moment that person leaves the channel. Attribution is kept (`pinned_by`, shown as "pinned by alice") so the action is visible without being restricted, and `pinned_by` is nullable because the pin belongs to the channel and must outlive the account that placed it.
+
+  **A cap of 100 per channel**, matching Slack, refused with `TOO_MANY_PINS`. It bounds the list frame and the cost of opening the view; a re-pin of something already in the set is still allowed at the cap, because it adds nothing and refusing it would be a false failure.
+
+  **The list carries bodies, not ids.** `LIST_PINS` streams a frame per pin in the `LIST_THREAD` shape. A pinned message is usually far outside a client's loaded history — that is largely the point of pinning it — so returning ids alone would make opening the list a fetch storm. Under ARCH-88 a client holds nothing on disk to resolve them from either.
+
+  **Pin state is replayed on backfill.** A `BROADCAST` has no field for it, so the daemon re-emits `PIN_UPDATED` for the messages it replays. This is the same defect class the reaction replay exists to prevent: state that only ever travels on a live fan-out disappears on reload, and does so silently.
+
+  **No system message.** Slack posts "alice pinned a message to this channel" into the transcript; we do not, because there is no system-message type in the schema and adding one is a larger change than the feature. The inline "Pinned by" marker plus the pins list carries the same information without inventing a message that has no author.
+
 ## Discovery
 
 - **ARCH-14 (Rule):** Workspace-address, resolved by plain DNS — **there is no resolution *service*, in any deployment model** (ARCH-76). At sign-in the client collects the **workspace** (the tenant's address) plus the user's **email** directly, the same model as Slack's "enter your workspace URL." The workspace is turned into a daemon address by ordinary DNS, with no shared, always-on, cross-tenant lookup component to run: consistent with the island model (ARCH-4) and the "no runtime configuration dependency" stance (ARCH-26). Note the DNS *records* under the service suffix (forms 2 and 3 below) are maintainer-provided and so are counted as a federated function in ARCH-76 — but they are static records, not a request-serving component, so no lookup traffic reaches the project. Three forms, one per deployment model:

@@ -435,6 +435,29 @@ static const char MIGRATION_0021[] =
     "CREATE INDEX idx_mentions_msg  ON mentions(message_id);"
     "CREATE INDEX idx_mentions_chan ON mentions(channel_id, message_id);";
 
+static const char MIGRATION_0022[] =
+    /* Pinned messages (REQ-230, ARCH-90). A pin belongs to the CHANNEL, not to
+     * the person who pinned it: every member sees the same set, so message_id
+     * is the primary key and pinning twice is a no-op rather than a second row.
+     * That is precisely what separates a pin from a saved item (REQ-231), which
+     * will be per-user and private when it is built.
+     *
+     * pinned_by is kept for attribution ("pinned by alice") and is nullable so
+     * that removing a user (REQ-025) does not have to delete the channel's
+     * pins — the pin outlives whoever placed it, because it belongs to the
+     * channel.
+     *
+     * channel_id is denormalised from the message for the same reason as
+     * mentions (§3q): listing a channel's pins is the hot path and should not
+     * need a join to know what it can see. */
+    "CREATE TABLE pins ("
+    "  message_id    INTEGER PRIMARY KEY REFERENCES messages(id),"
+    "  channel_id    INTEGER NOT NULL REFERENCES channels(id),"
+    "  pinned_by     INTEGER REFERENCES users(id),"
+    "  created_at_ms INTEGER NOT NULL"
+    ");"
+    "CREATE INDEX idx_pins_channel ON pins(channel_id, created_at_ms DESC);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -457,6 +480,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 19, MIGRATION_0019 },
     { 20, MIGRATION_0020 },
     { 21, MIGRATION_0021 },
+    { 22, MIGRATION_0022 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

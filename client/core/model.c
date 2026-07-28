@@ -102,6 +102,8 @@ void oc_model_free(oc_model *m) {
     for (size_t i = 0; i < m->n_search; i++) free(m->search_results[i].snippet);
     free(m->search_results);
     free(m->reactors);
+    for (size_t i = 0; i < m->n_pins; i++) free(m->pins[i].body);
+    free(m->pins);
     free(m->users);
     free(m->webhooks);
     free(m->settings);
@@ -245,6 +247,23 @@ void oc_model_reactlist_begin(oc_model *m, uint64_t message_id) {
     oc_model_close_reactlist(m);   /* drop any prior reactors */
     m->reactlist_open = 1;
     m->reactlist_message = message_id;
+}
+
+void oc_model_close_pinlist(oc_model *m) {
+    for (size_t i = 0; i < m->n_pins; i++) free(m->pins[i].body);
+    free(m->pins);
+    m->pins = NULL;
+    m->n_pins = m->cap_pins = 0;
+    m->pinlist_open = 0;
+    m->pinlist_loading = 0;
+    m->pinlist_channel = 0;
+}
+
+void oc_model_pinlist_begin(oc_model *m, uint64_t channel_id) {
+    oc_model_close_pinlist(m);     /* drop any prior list */
+    m->pinlist_open = 1;
+    m->pinlist_loading = 1;
+    m->pinlist_channel = channel_id;
 }
 
 void oc_model_close_weblist(oc_model *m) {
@@ -602,6 +621,58 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         break;
     case OC_EV_TYPING:
         typing_touch(m, e->channel_id, e->user_id);
+        break;
+    case OC_EV_PIN: {
+        /* Mark the message in the transcript. Arriving for a message we have not
+         * loaded is normal (backfill order, or another client's pin far up the
+         * scroll) and is simply dropped — the flag rides along when that message
+         * is eventually replayed. */
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (c) {
+            for (size_t i = 0; i < c->n_msgs; i++) {
+                if (c->msgs[i].message_id == e->message_id) {
+                    c->msgs[i].pinned    = (e->op == 1);
+                    c->msgs[i].pinned_by = (e->op == 1) ? e->user_id : 0;
+                    c->msgs[i].pinned_at = (e->op == 1) ? e->server_time : 0;
+                    break;
+                }
+            }
+        }
+        /* Keep an open pins overlay honest: an unpin from anywhere removes the
+         * row rather than leaving a stale entry that 404s when clicked. */
+        if (m->pinlist_open && m->pinlist_channel == e->channel_id && e->op != 1) {
+            for (size_t i = 0; i < m->n_pins; i++) {
+                if (m->pins[i].message_id == e->message_id) {
+                    free(m->pins[i].body);
+                    memmove(&m->pins[i], &m->pins[i + 1],
+                            (m->n_pins - i - 1) * sizeof *m->pins);
+                    m->n_pins--;
+                    break;
+                }
+            }
+        }
+        break;
+    }
+    case OC_EV_PINNED_MSG: {
+        if (!m->pinlist_open || m->pinlist_channel != e->channel_id) break;
+        if (m->n_pins == m->cap_pins) {
+            size_t nc = m->cap_pins ? m->cap_pins * 2 : 16;
+            oc_pinned_row *g = realloc(m->pins, nc * sizeof *g);
+            if (!g) break;
+            m->pins = g; m->cap_pins = nc;
+        }
+        oc_pinned_row *pr = &m->pins[m->n_pins++];
+        pr->message_id  = e->message_id;
+        pr->author_id   = e->author_id;
+        pr->server_time = e->server_time;
+        pr->pinned_by   = e->user_id;
+        pr->pinned_at   = e->pinned_at;
+        pr->body        = e->body ? strdup(e->body) : NULL;
+        break;
+    }
+    case OC_EV_PINS_END:
+        if (m->pinlist_open && m->pinlist_channel == e->channel_id)
+            m->pinlist_loading = 0;
         break;
     case OC_EV_REACTION: {
         oc_channel *c = oc_model_channel(m, e->channel_id);

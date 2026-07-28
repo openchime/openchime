@@ -265,6 +265,29 @@ void oc_client_open_dm(oc_client *c, uint64_t user_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_pin(oc_client *c, uint64_t channel_id, uint64_t message_id, uint8_t op) {
+    if (!c || !message_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_PIN);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = message_id;
+    cmd->op = op;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_pins(oc_client *c, uint64_t channel_id) {
+    if (!c || !channel_id) return;
+    oc_model_pinlist_begin(&c->model, channel_id);   /* clears prior + marks loading */
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_PINS);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_close_pins(oc_client *c) {
+    if (c) oc_model_close_pinlist(&c->model);
+}
+
 void oc_client_list_reactions(oc_client *c, uint64_t channel_id, uint64_t message_id) {
     if (!c || !message_id) return;
     oc_model_reactlist_begin(&c->model, message_id);   /* clears prior + records it */

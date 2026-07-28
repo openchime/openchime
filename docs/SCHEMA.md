@@ -4,7 +4,7 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Status.** **Migrations 0001–0021 are applied.** 0001 establishes the core
+**Status.** **Migrations 0001–0022 are applied.** 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
 credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
 `users.disabled` lockout flag; **0004** (§3b) reactions; **0005** (§3c) threads;
@@ -15,7 +15,7 @@ notification preferences and the DND window; **0013** (§3k) synced client
 settings; **0014–0015** attachment tombstones and reclaim reason; **0016** (§3l)
 the audit log; **0017** (§3m) federated enrollment; **0018** (§3n) push device
 tokens; **0019** (§3o) the DM participant-set key; **0020** (§3p) the
-unique channel name; **0021** (§3q) resolved @mentions.
+unique channel name; **0021** (§3q) resolved @mentions; **0022** (§3r) pinned messages.
 
 *Corrected: an earlier revision of this line said presence, notification config,
 and attachments were "intentionally not here yet." Notification config landed in
@@ -568,6 +568,41 @@ case-insensitively against `users JOIN channel_members` for that channel — a n
 that is not a member of the channel is not a mention, so nobody is notified about
 a message they cannot open. `remove_user` (REQ-025) deletes a departing user's
 mention rows before their messages, in the dependency order §3p established.
+
+---
+
+## 3r. Migration 0022 — pinned messages (REQ-230, ARCH-90)
+
+```sql
+CREATE TABLE pins (
+  message_id    INTEGER PRIMARY KEY REFERENCES messages(id),
+  channel_id    INTEGER NOT NULL REFERENCES channels(id),
+  pinned_by     INTEGER REFERENCES users(id),   -- nullable: the pin outlives the pinner
+  created_at_ms INTEGER NOT NULL);
+CREATE INDEX idx_pins_channel ON pins(channel_id, created_at_ms DESC);
+```
+
+*Why `message_id` is the primary key.* A pin belongs to the **channel**, not to
+the person who placed it — every member sees the same set — so a message is
+pinned or it is not. Pinning twice is a no-op rather than a second row. This is
+precisely what will separate a pin from a **saved item** (REQ-231), which is
+per-user and private; the two read alike in a menu and are opposite in the
+schema.
+
+*`pinned_by` is nullable* for the same reason: it is attribution, not ownership,
+and the pin must survive the account that placed it. Removing a user (REQ-025)
+disables rather than deletes the row (§3), so this does not dangle in practice —
+but a DM's pins are deleted along with its messages, in the dependency order
+§3p established.
+
+*`channel_id` is denormalised* from the message exactly as in §3q: listing a
+channel's pins is the hot path and should not need a join to know what it can
+see. The index is descending on time because the list is newest-pin-first.
+
+*The 100-per-channel cap lives in the daemon*, not in a constraint: SQLite
+cannot express "at most N rows per group" without a trigger, and the check has
+to distinguish a new pin from a re-pin — which is application logic, and is
+tested as such.
 
 ---
 
