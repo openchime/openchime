@@ -103,9 +103,14 @@ exactly the self-hosted stand-alone model (ARCH-76).
 
 ## Client-side
 
-The clients read a small, separate set. Machine-local preferences otherwise live
-in `~/.config/openchime/config` (TUI), layered under the daemon's per-`(user,
-client_type)` settings bucket — see [CLIENT.md](./CLIENT.md) §3.
+The clients read a small, separate set. Machine-local TUI preferences otherwise
+live in a hand-edited config file — `$XDG_CONFIG_HOME/openchime/config` (else
+`~/.config/openchime/config`) on Linux/macOS, `%LOCALAPPDATA%\openchime\config`
+on Windows — layered under the daemon's per-`(user, client_type)` settings bucket
+(see [CLIENT.md](./CLIENT.md) §3). It holds only display preferences (`mouse`,
+`members_panel`, `channels_width`, `members_width`, `time`) plus a default
+`workspace`; it is the one file a client writes, and it is the *user's* document
+rather than client state (ARCH-88/REQ-201).
 
 | Variable | Used by | Meaning |
 |---|---|---|

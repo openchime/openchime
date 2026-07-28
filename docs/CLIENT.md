@@ -134,9 +134,12 @@ model; translate input to intents }, stop.
   This completes the v2 redesign — panels + focus, navigation mode, autocomplete,
   command palette, and the picker — all frontend-only over the unchanged app-core.
   **Mouse + config:** the TUI enables mouse input (click a channel/member to
-  select, wheel to scroll) and reads machine-local prefs from
-  `~/.config/openchime/config` (`client/tui/config.c`, XDG, created with commented
-  defaults on first run): `mouse`, `members_panel` (off/on/auto), panel widths,
+  select, wheel to scroll) and reads machine-local prefs from a
+  hand-edited config file (`client/tui/config.c`, created with commented defaults
+  on first run): `$XDG_CONFIG_HOME/openchime/config` — else
+  `~/.config/openchime/config` — on Linux/macOS, and
+  `%LOCALAPPDATA%\openchime\config` on Windows, so each platform uses its own
+  convention and the two TUI builds share one code path: `mouse`, `members_panel` (off/on/auto), panel widths,
   `time` (12/24h), and a default `workspace`. **Layered config:** the portable
   prefs (everything but `workspace`) also sync through the daemon's per-`(user,
   client_type)` settings bucket (a `client_settings` key/value table; wire

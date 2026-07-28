@@ -57,7 +57,7 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 | **WIN-24** | **Storage overlay refresh + TUI parity.** *Today:* a read-only key/value dump with no refresh; the TUI's version is materially richer and flags pressure in red. *Done:* match the TUI, add refresh. | P2 | S |
 | **WIN-25** | **Keyboard-shortcut reference (REQ-264).** *Today:* none; the TUI has a `?` overlay. *Done:* a discoverable shortcut list, generated from one binding table so it cannot drift. | P2 | S |
 | **WIN-26** | **Theme / appearance selection (REQ-262).** *Today:* one hardcoded dark palette in `theme.h`; no in-app control. *Done:* light / dark / follow-system, applied live, persisted via WIN-9. | P2 | M |
-| **WIN-27** | **Draft persistence (REQ-223).** *Today:* switching channels discards a half-typed message. *Done:* per-channel drafts kept across switches and restarts (client-local; cross-device sync needs REQ-223's ARCH decision). | P2 | M |
+| **WIN-27** | **Draft persistence (REQ-223).** *Today:* switching channels discards a half-typed message. **ARCH-88 narrows the options**: a client writes no files, so a draft is either in-memory only (survives a channel switch, not a restart) or server-synced via the `client_settings` bucket. In-memory is the cheap half and needs no ARCH decision; cross-restart drafts now *require* the synced route. | P2 | M |
 | **WIN-28** | **Configurable quick reactions (REQ-073).** *Today:* 6 hardcoded emoji. The `gui` settings bucket can hold a per-user set without any daemon change. *Done:* a user-chosen quick set, offered inline on hover. | P2 | S |
 | **WIN-29** | **N-concurrent-workspace model (REQ-012–015).** *Today:* the rail switcher stop/reconnects a **single** `oc_client`, so a background workspace receives nothing and accrues no unread. *Done:* hold N clients, tick all, render one — the TUI's model — with per-row unread and an "N elsewhere" badge. The largest single item here. | P1 | L |
 
@@ -85,7 +85,7 @@ Not startable in this client. Each names what must land first.
 | **WIN-38** | Search paging | Wire gap: `SEARCH_RESULTS` carries `truncated` but **no cursor or offset**, so load-more is impossible today |
 | **WIN-39** | Search operators (`from:` / `in:` / `has:` / dates) | REQ-081 — no operator grammar |
 | **WIN-40** | Mute channel/DM (suppress + de-emphasize) | REQ-137 — distinct from level=none; needs per-user mute storage |
-| **WIN-41** | Starred/favourite conversations + custom sidebar sections | REQ-234 — per-user sidebar state storage |
+| **WIN-41** | Starred/favourite conversations + custom sidebar sections | REQ-234 — per-user sidebar state storage. **ARCH-88 settles the open question by elimination**: with no client-local storage it must be server-side, and the `client_settings` bucket already exists for exactly this |
 | **WIN-42** | Pin a message | REQ-230 |
 | **WIN-43** | Save for later / the **Later** rail stub | REQ-231 |
 | **WIN-44** | Copy link / permalink, jump-to-permalink | REQ-232 — needs a permalink form and fetch-around-an-id backfill |
@@ -103,7 +103,7 @@ Not startable in this client. Each names what must land first.
 | ~~**WIN-56**~~ | ~~**Store the session token in Windows Credential Manager**~~ **DONE.** `client/shared/secret_win.c` implements the `oc_secret` seam over `CredWriteW`/`CredReadW`/`CredDeleteW` (one generic credential per workspace, `CRED_PERSIST_LOCAL_MACHINE`), wired into both Windows front-ends via the new shared `oc_secret_open_os()`. **The core now refuses to persist a token to SQLite at all** and erases any left by an older build, so there is no plaintext fallback anywhere. Verified on Windows: the credential appears in `cmdkey /list`, `workspace_state.session_token` is NULL, and silent reconnect reads from the OS store. |
 | **WIN-57** | Sign in to *every* remembered workspace at boot | WIN-29 — Win32 holds one `oc_client`, so boot connects only the most-recently-used workspace that has a token, not all of them |
 | **WIN-59** | Warn on quit while the in-memory outbox is non-empty | Nothing — the outbox is no longer persisted (ARCH-88), so a message composed offline and never sent dies with the process. A confirm-on-quit turns silent loss into an informed choice at no storage cost. **P1** |
-| **WIN-58** | Move the **workspace book** (address, username, label, last-used) out of SQLite into the credential store | Nothing blocks it — the token moved in WIN-56, but the non-secret workspace list still lives in `workspace_book`. Keeping the {address, username, token} triple in one store removes the two-store desync on "forget workspace"; Credential Manager enumeration (`CredEnumerateW`) and libsecret attribute search both support it. **P2** |
+| ~~**WIN-58**~~ | ~~Move the workspace book out of SQLite~~ **DONE** with ARCH-88 — it lives in the credential store, found by enumeration, so the book needs no storage of its own. |
 
 ## §4 Not planned for this client
 

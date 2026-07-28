@@ -20,10 +20,30 @@ void oc_config_defaults(oc_config *c) {
 }
 
 /* Resolve the config file path into `out`; returns 0 on success. Ensures the
- * parent directory exists. */
+ * parent directory exists.
+ *
+ * Each platform's own convention, because a Unix path on Windows is nobody's
+ * idea of where settings live — and `HOME`/`XDG_CONFIG_HOME` are normally unset
+ * there, so the Windows TUI previously got no config file at all (or, under Git
+ * Bash, one buried in an MSYS home). Both TUIs share this one function, so the
+ * Windows and Linux builds cannot drift.
+ *
+ *   Linux/macOS   $XDG_CONFIG_HOME/openchime/config, else ~/.config/openchime/config
+ *   Windows       %LOCALAPPDATA%\openchime\config
+ *
+ * LOCALAPPDATA rather than APPDATA on purpose: these preferences are deliberately
+ * machine-local — the `workspace` key names the server *this box* connects to —
+ * and APPDATA roams with a domain profile. It is also where the Win32 GUI looks,
+ * so one machine has one openchime directory rather than two. */
 static int config_path(char *out, size_t cap) {
-    const char *xdg = getenv("XDG_CONFIG_HOME");
     char dir[900];
+#ifdef _WIN32
+    const char *base = getenv("LOCALAPPDATA");
+    if (!base || !base[0]) base = getenv("APPDATA");
+    if (!base || !base[0]) return -1;
+    snprintf(dir, sizeof dir, "%s\\openchime", base);
+#else
+    const char *xdg = getenv("XDG_CONFIG_HOME");
     if (xdg && xdg[0]) {
         oc_mkdir(xdg);                              /* ensure the base exists */
         snprintf(dir, sizeof dir, "%s/openchime", xdg);
@@ -34,8 +54,9 @@ static int config_path(char *out, size_t cap) {
         snprintf(base, sizeof base, "%s/.config", home);   oc_mkdir(base);
         snprintf(dir, sizeof dir, "%s/.config/openchime", home);
     }
+#endif
     oc_mkdir(dir);
-    if ((size_t)snprintf(out, cap, "%s/config", dir) >= cap) return -1;
+    if ((size_t)snprintf(out, cap, "%s%cconfig", dir, OC_PATH_SEP) >= cap) return -1;
     return 0;
 }
 

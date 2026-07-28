@@ -789,6 +789,12 @@ the requirement says so explicitly rather than implying one.
   user has signed in again. This is a client-side rule only — the daemon's own
   store is SQLite by ARCH-2 and is unaffected.
 
+  The rule governs **state the client maintains about itself**, not configuration
+  the **user** authors: a hand-editable preferences file (the TUI's
+  `~/.config/openchime/config`, CLIENT.md §3) is the user's document, in the same
+  sense as a shell rc file, and is deliberately machine-local. What the rule
+  forbids is the client keeping its own cache, queue, or credential on disk.
+
 ---
 
 ## 10. Infrastructure and Resource Constraints
