@@ -163,6 +163,12 @@ static void sidebar_opts_load(const oc_model *m);
  * live. Server-side behaviour (per-channel notification level, DND) stays on its
  * own surfaces; this pane is deliberately only what the client itself decides. */
 static int g_prefs_open;
+/* Profile pane (WIN-10). Viewing a person was impossible from anywhere: clicking
+ * a member opened a DM and that was the whole interaction. Richer fields (avatar
+ * image, email, timezone, title) are REQ-240 / WIN-47; this shows what the
+ * roster actually knows today rather than inventing placeholders for them. */
+static uint64_t g_profile_uid;
+static D2D1_RECT_F g_prof_dm_btn;
 static int g_pref_time24    = 1;   /* 24-hour timestamps */
 static int g_pref_members   = 1;   /* members pane shown by default */
 static int g_pref_daysep    = 1;   /* date dividers in the transcript */
@@ -347,6 +353,7 @@ static struct {
 } g_toast[TOAST_MAX];
 static int  g_n_toast;
 static D2D1_RECT_F g_toast_box[TOAST_MAX];   /* hit-boxes, captured during paint */
+static uint32_t g_err_seq;
 static char g_err_seen[160];                 /* last `last_error` we turned into a toast */
 static D2D1_RECT_F g_retry_btn;              /* banner Retry-now hit-box */
 static int  g_banner_on;                     /* banner drawn this frame (arms the hit-box) */
@@ -377,7 +384,10 @@ static void toast_tick(const oc_model *m) {
     ULONGLONG now = GetTickCount64();
     for (int i = g_n_toast - 1; i >= 0; i--)
         if (now - g_toast[i].born >= TOAST_MS) toast_drop(i);
-    if (m && strcmp(m->last_error, g_err_seen) != 0) {
+    /* Keyed on the sequence, not the text: repeating a failing action must
+     * notify again, or the second attempt reads as having worked. */
+    if (m && m->error_seq != g_err_seq) {
+        g_err_seq = m->error_seq;
         snprintf(g_err_seen, sizeof g_err_seen, "%s", m->last_error);
         /* Divide the two surfaces by what the failure *is*, so the same sentence
          * never appears twice: a connection problem is a persistent state and
@@ -701,6 +711,7 @@ static int already_backfilled(uint64_t cid) {
 static void close_overlays(void) {
     const oc_model *mm = model();
     g_prefs_open = 0;
+    g_profile_uid = 0;
     if (!mm) return;
     if (mm->thread_open)    oc_client_close_thread(g_client);
     if (mm->search_open)    oc_client_close_search(g_client);
@@ -711,7 +722,7 @@ static void close_overlays(void) {
 }
 
 static int any_overlay(const oc_model *m) {
-    return g_prefs_open ||
+    return g_prefs_open || g_profile_uid ||
            (m && (m->thread_open || m->search_open || m->reactlist_open ||
                   m->weblist_open || m->storage_open || m->audit_open));
 }
@@ -1754,6 +1765,53 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
               g_small, rf(body.left + 24, y + 4, body.right - 24, y + 24), OC_COL_FAINT);
 }
 
+static void draw_profile(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    D2D1_RECT_F body = overlay_header(rt, reg, "Profile");
+    const char *nm = oc_model_user_name(m, g_profile_uid);
+    if (!nm || !nm[0]) nm = "user";
+
+    float cx = body.left + 40, cy = body.top + 32;
+    D2D1_ELLIPSE av = { { cx + 36, cy + 36 }, 36, 36 };
+    ID2D1RenderTarget_FillEllipse(rt, &av, paint_with(AVPAL[g_profile_uid % 6]));
+    char ini[2] = { (char)(nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]), 0 };
+    IDWriteTextFormat_SetTextAlignment(g_hdr, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, ini, g_hdr, rf(cx, cy, cx + 72, cy + 72), 0xFFFFFF);
+    IDWriteTextFormat_SetTextAlignment(g_hdr, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+    float tx = cx + 92;
+    draw_text(rt, nm, g_hdr, rf(tx, cy + 4, body.right - 24, cy + 30), OC_COL_TEXT);
+
+    uint8_t pres = oc_model_presence_of(m, g_profile_uid);
+    const char *pl = pres == OC_PRESENCE_ONLINE ? "Active"
+                   : pres == OC_PRESENCE_AWAY   ? "Away" : "Offline";
+    uint32_t pc = pres == OC_PRESENCE_ONLINE ? OC_COL_ONLINE
+                : pres == OC_PRESENCE_AWAY   ? OC_COL_AWAY : OC_COL_FAINT;
+    D2D1_ELLIPSE dot = { { tx + 5, cy + 42 }, 5, 5 };
+    ID2D1RenderTarget_FillEllipse(rt, &dot, paint_with(pc));
+    draw_text(rt, pl, g_small, rf(tx + 16, cy + 32, body.right - 24, cy + 52), OC_COL_MUTED);
+
+    uint8_t role = OC_ROLE_MEMBER;
+    int known = 0;
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == g_profile_uid) { role = m->users[i].role; known = 1; break; }
+    const char *rl = role_label(role);
+    if (known && rl[0])
+        draw_text(rt, rl, g_small, rf(tx, cy + 52, body.right - 24, cy + 72), OC_COL_FAINT);
+
+    float by = cy + 96;
+    if (g_profile_uid != m->user_id) {
+        g_prof_dm_btn = rf(tx, by, tx + 140, by + 32);
+        fill_round(rt, g_prof_dm_btn, 7.0f, OC_COL_ACCENT);
+        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Message", g_ui, g_prof_dm_btn, 0xFFFFFF);
+        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+    } else {
+        g_prof_dm_btn = rf(0, 0, 0, 0);
+        draw_text(rt, "This is you \u2014 edit your display name from the profile menu.",
+                  g_small, rf(tx, by + 6, body.right - 24, by + 26), OC_COL_FAINT);
+    }
+}
+
 static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
     if (!m->authed) {
         /* The reason lives in the banner above (draw_banner) — repeating it here
@@ -1764,6 +1822,7 @@ static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
         return;
     }
     if (g_prefs_open)      { draw_prefs(rt, reg);        return; }
+    if (g_profile_uid)     { draw_profile(rt, m, reg);   return; }
     if (m->thread_open)    { draw_thread(rt, m, reg);    return; }
     if (m->search_open)    { draw_search(rt, m, reg);    return; }
     if (m->reactlist_open) { draw_reactlist(rt, m, reg); return; }
@@ -2864,11 +2923,12 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
 }
 
 static void show_member_menu(HWND hwnd, const oc_model *m, uint64_t uid, int sx, int sy) {
-    if (uid == m->user_id) return;
+    int self = (uid == m->user_id);
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, 1, L"Message");
+    AppendMenuW(menu, MF_STRING, 2, L"View profile");
+    if (!self) AppendMenuW(menu, MF_STRING, 1, L"Message");
     uint8_t me = self_role(m);
-    if (me >= OC_ROLE_ADMIN) {
+    if (me >= OC_ROLE_ADMIN && !self) {
         HMENU roles = CreatePopupMenu();
         AppendMenuW(roles, MF_STRING, 10, L"Member");
         AppendMenuW(roles, MF_STRING, 11, L"Admin");
@@ -2881,6 +2941,7 @@ static void show_member_menu(HWND hwnd, const oc_model *m, uint64_t uid, int sx,
     DestroyMenu(menu);
     switch (cmd) {
     case 1:  oc_client_open_dm(g_client, uid); break;
+    case 2:  close_overlays(); g_profile_uid = uid; g_view = VIEW_HOME; break;
     case 10: oc_client_set_role(g_client, uid, OC_ROLE_MEMBER); break;
     case 11: oc_client_set_role(g_client, uid, OC_ROLE_ADMIN); break;
     case 12: oc_client_set_role(g_client, uid, OC_ROLE_OWNER); break;
@@ -2916,6 +2977,12 @@ static int on_click(HWND hwnd, int x, int y) {
             return 1;   /* inside the panel but not on a cell: stay open */
         }
         picker_close(hwnd);
+        return 1;
+    }
+    if (g_profile_uid && in_rect(g_prof_dm_btn, x, y)) {
+        uint64_t uid = g_profile_uid;
+        close_overlays();
+        oc_client_open_dm(g_client, uid);
         return 1;
     }
     if (g_prefs_open) {
@@ -3068,10 +3135,14 @@ static int on_click(HWND hwnd, int x, int y) {
             }
         return 1;
     }
-    /* Members-pane rows: click opens a DM. */
+    /* Members-pane rows: click opens the person's profile (WIN-10), which is
+     * where "Message" now lives. Jumping straight into a DM made viewing someone
+     * impossible, and it is the more destructive of the two actions. */
     for (int i = 0; i < g_n_memrows; i++)
         if ((float)y >= g_memrows[i].top && (float)y < g_memrows[i].bot) {
-            oc_client_open_dm(g_client, g_memrows[i].uid);
+            close_overlays();
+            g_profile_uid = g_memrows[i].uid;
+            g_view = VIEW_HOME;
             return 1;
         }
     return 0;
@@ -3323,7 +3394,7 @@ static void reset_session(void) {
     if (g_client) { oc_client_stop(g_client); g_client = NULL; }
     g_sel = 0; g_scroll = 0; g_post_auth = 0; g_has_sel = 0;
     g_n_backfilled = 0; g_more_open = 0; g_menu = MENU_NONE;
-    g_edit_msg = 0; g_n_toast = 0; g_err_seen[0] = '\0';
+    g_edit_msg = 0; g_n_toast = 0; g_err_seen[0] = '\0'; g_err_seq = 0;
 }
 
 /* Enter the sign-in view at step 1, pre-filled with `ws`/`user` when known. */
@@ -3491,6 +3562,169 @@ static LRESULT CALLBACK prompt_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CLOSE: g_pr_result = 0; g_pr_done = 1; return 0;
     default: return DefWindowProcW(hwnd, msg, wp, lp);
     }
+}
+
+/* ---- generic multi-field modal form (WIN-21) ------------------------------
+ * Six flows used to collapse into one single-line prompt, which is why the
+ * password change had no confirm field and the DND window was an HH:MM-HH:MM
+ * string parsed with sscanf. One form definition with typed fields replaces the
+ * lot: each caller describes its fields and gets them back validated.
+ *
+ * Deliberately still native Win32 controls rather than D2D chrome — these are
+ * short-lived modals, and the platform's own focus, tab order and IME handling
+ * are worth more here than matching the shell's palette. */
+enum { FF_TEXT = 0, FF_PASSWORD, FF_CHECK, FF_CHOICE };
+
+typedef struct {
+    int         kind;
+    const char *label;
+    const char *hint;              /* FF_CHOICE: "a|b|c"; else an optional sub-label */
+    char        value[192];        /* in: initial; out: the result (FF_CHECK/CHOICE: "0".."n") */
+} oc_field;
+
+#define FORM_MAX_FIELDS 6
+static HWND g_ff_ctl[FORM_MAX_FIELDS][4];   /* per field: up to 4 controls (choice radios) */
+
+/* Returns 1 on OK with every field's `value` updated, 0 on Cancel. */
+static int form_dialog(HWND owner, const char *title, oc_field *f, int n) {
+    if (n > FORM_MAX_FIELDS) n = FORM_MAX_FIELDS;
+    HINSTANCE inst = GetModuleHandleW(NULL);
+    static int registered;
+    if (!registered) {
+        WNDCLASSW wc; memset(&wc, 0, sizeof wc);
+        wc.lpfnWndProc = prompt_proc; wc.hInstance = inst;
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"OcForm";
+        RegisterClassW(&wc); registered = 1;
+    }
+
+    /* Height is computed from the fields, so a two-field form is not padded out
+     * to the size of a six-field one. */
+    int y = 16, W = 420;
+    int rowh[FORM_MAX_FIELDS];
+    for (int i = 0; i < n; i++) {
+        rowh[i] = (f[i].kind == FF_CHECK) ? 30 : (f[i].hint && f[i].hint[0] && f[i].kind != FF_CHOICE ? 68 : 52);
+        y += rowh[i];
+    }
+    int H = y + 54 + 40;
+
+    WCHAR wt[128]; to_w(title, wt, 128);
+    RECT orc; GetWindowRect(owner, &orc);
+    int sx = orc.left + ((orc.right - orc.left) - W) / 2;
+    int sy = orc.top + ((orc.bottom - orc.top) - H) / 2;
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"OcForm", wt,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, sx, sy, W, H, owner, NULL, inst, NULL);
+    if (!dlg) return 0;
+
+    memset(g_ff_ctl, 0, sizeof g_ff_ctl);
+    y = 12;
+    for (int i = 0; i < n; i++) {
+        WCHAR wl[192]; to_w(f[i].label, wl, 192);
+        if (f[i].kind == FF_CHECK) {
+            HWND c = CreateWindowExW(0, L"BUTTON", wl,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                18, y + 4, W - 50, 22, dlg, NULL, inst, NULL);
+            lg_set_font(c);
+            SendMessageW(c, BM_SETCHECK, atoi(f[i].value) ? BST_CHECKED : BST_UNCHECKED, 0);
+            g_ff_ctl[i][0] = c;
+        } else if (f[i].kind == FF_CHOICE) {
+            HWND s2 = CreateWindowExW(0, L"STATIC", wl, WS_CHILD | WS_VISIBLE,
+                                      18, y, W - 50, 18, dlg, NULL, inst, NULL);
+            lg_set_font(s2);
+            int cur = atoi(f[i].value), k = 0, x = 18;
+            const char *p2 = f[i].hint ? f[i].hint : "";
+            while (*p2 && k < 4) {
+                char opt[48]; int oi = 0;
+                while (*p2 && *p2 != '|' && oi + 1 < (int)sizeof opt) opt[oi++] = *p2++;
+                opt[oi] = 0;
+                if (*p2 == '|') p2++;
+                WCHAR wo[48]; to_w(opt, wo, 48);
+                HWND rb = CreateWindowExW(0, L"BUTTON", wo,
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON | (k == 0 ? WS_GROUP : 0),
+                    x, y + 20, 130, 22, dlg, NULL, inst, NULL);
+                lg_set_font(rb);
+                if (k == cur) SendMessageW(rb, BM_SETCHECK, BST_CHECKED, 0);
+                g_ff_ctl[i][k] = rb;
+                x += 135; k++;
+            }
+        } else {
+            HWND s2 = CreateWindowExW(0, L"STATIC", wl, WS_CHILD | WS_VISIBLE,
+                                      18, y, W - 50, 18, dlg, NULL, inst, NULL);
+            lg_set_font(s2);
+            WCHAR wv[192]; to_w(f[i].value, wv, 192);
+            HWND e = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", wv,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL |
+                (f[i].kind == FF_PASSWORD ? ES_PASSWORD : 0),
+                18, y + 20, W - 54, 24, dlg, NULL, inst, NULL);
+            lg_set_font(e);
+            g_ff_ctl[i][0] = e;
+            if (f[i].hint && f[i].hint[0]) {
+                WCHAR wh[192]; to_w(f[i].hint, wh, 192);
+                HWND h2 = CreateWindowExW(0, L"STATIC", wh, WS_CHILD | WS_VISIBLE,
+                                          18, y + 46, W - 50, 18, dlg, NULL, inst, NULL);
+                lg_set_font(h2);
+            }
+        }
+        y += rowh[i];
+    }
+
+    HWND ok = CreateWindowExW(0, L"BUTTON", L"OK",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, W - 200, y + 8, 84, 28,
+        dlg, (HMENU)IDOK, inst, NULL);
+    HWND cancel = CreateWindowExW(0, L"BUTTON", L"Cancel",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP, W - 108, y + 8, 84, 28, dlg, (HMENU)IDCANCEL, inst, NULL);
+    lg_set_font(ok); lg_set_font(cancel);
+
+    EnableWindow(owner, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    if (g_ff_ctl[0][0]) { SetFocus(g_ff_ctl[0][0]); SendMessageW(g_ff_ctl[0][0], EM_SETSEL, 0, -1); }
+    g_pr_result = -1; g_pr_done = 0;
+
+    MSG m;
+    while (!g_pr_done && GetMessageW(&m, NULL, 0, 0) > 0)
+        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+
+    if (g_pr_result == 1) {
+        for (int i = 0; i < n; i++) {
+            if (f[i].kind == FF_CHECK) {
+                snprintf(f[i].value, sizeof f[i].value, "%d",
+                         SendMessageW(g_ff_ctl[i][0], BM_GETCHECK, 0, 0) == BST_CHECKED);
+            } else if (f[i].kind == FF_CHOICE) {
+                int pick = 0;
+                for (int k = 0; k < 4; k++)
+                    if (g_ff_ctl[i][k] && SendMessageW(g_ff_ctl[i][k], BM_GETCHECK, 0, 0) == BST_CHECKED)
+                        pick = k;
+                snprintf(f[i].value, sizeof f[i].value, "%d", pick);
+            } else {
+                WCHAR w[192]; GetWindowTextW(g_ff_ctl[i][0], w, 192);
+                WideCharToMultiByte(CP_UTF8, 0, w, -1, f[i].value, (int)sizeof f[i].value, NULL, NULL);
+            }
+        }
+    }
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+    if (IsWindow(dlg)) DestroyWindow(dlg);
+    return g_pr_result == 1;
+}
+
+static void copy_to_clipboard(HWND hwnd, const char *utf8);   /* fwd */
+
+/* A one-time secret (invite / webhook token). A MessageBox cannot be selected
+ * from, so the token was easy to lose the moment it was dismissed — the one
+ * thing that must not happen to a value shown exactly once (WIN-22). This gives
+ * it a read-only-ish field, puts it on the clipboard immediately, and says
+ * plainly that it will not be shown again. */
+static void show_secret(HWND owner, const char *title, const char *what,
+                        const char *token, const char *note) {
+    static char label[192];
+    oc_field f[1] = { { FF_TEXT, "", "", "" } };
+    snprintf(f[0].value, sizeof f[0].value, "%s", token ? token : "");
+    copy_to_clipboard(owner, token ? token : "");
+    snprintf(label, sizeof label, "%s \u2014 copied to your clipboard", what);
+    f[0].label = label;
+    f[0].hint  = note;
+    form_dialog(owner, title, f, 1);
 }
 
 /* Modal one-line input. Returns 1 with `out` filled on OK, 0 on Cancel. */
@@ -3738,9 +3972,13 @@ static void open_switcher(HWND hwnd) {
 static void menu_dispatch(HWND hwnd, int cmd) {
     const oc_model *m = model();
     switch (cmd) {
-    case 1: { char name[80];
-        if (text_prompt(hwnd, "New channel", "Channel name:", "", name, sizeof name, 0) && name[0])
-            oc_client_create_channel(g_client, name);
+    case 1: {   /* WIN-30: the wire has always carried is_public; now so does the UI. */
+        oc_field f[2] = {
+            { FF_TEXT,   "Channel name", "Lower-case, no spaces. Names are unique.", "" },
+            { FF_CHOICE, "Visibility",   "Public|Private",                            "0" },
+        };
+        if (form_dialog(hwnd, "Create a channel", f, 2) && f[0].value[0])
+            oc_client_create_channel_ex(g_client, f[0].value, atoi(f[1].value) == 0);
         break; }
     case 2:  oc_client_reconnect(g_client); break;
     case 3:  oc_client_logout(g_client, OC_LOGOUT_THIS); g_logging_out = 1; break;
@@ -3753,25 +3991,50 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 7:  g_view = VIEW_HOME; upload_file(hwnd); break;
     case 10: oc_client_set_presence(g_client, OC_PRESENCE_ONLINE); break;
     case 11: oc_client_set_presence(g_client, OC_PRESENCE_AWAY); break;
-    case 30: { char name[64]; const char *cur = m ? oc_model_user_name(m, m->user_id) : "";
-        if (text_prompt(hwnd, "Display name", "New display name:", cur ? cur : "", name, sizeof name, 0) && name[0])
-            oc_client_set_display_name(g_client, name);
+    case 30: {
+        const char *cur = m ? oc_model_user_name(m, m->user_id) : "";
+        oc_field f[1] = { { FF_TEXT, "Display name",
+                            "How you appear to everyone in this workspace.", "" } };
+        snprintf(f[0].value, sizeof f[0].value, "%s", cur ? cur : "");
+        if (form_dialog(hwnd, "Edit profile", f, 1) && f[0].value[0])
+            oc_client_set_display_name(g_client, f[0].value);
         break; }
-    case 31: { char oldp[128], newp[128];
-        if (text_prompt(hwnd, "Change password", "Current password:", "", oldp, sizeof oldp, 1) &&
-            text_prompt(hwnd, "Change password", "New password:", "", newp, sizeof newp, 1) && newp[0])
-            oc_client_change_password(g_client, oldp, newp);
+    case 31: {   /* WIN-20: a confirm field, which the chained prompts had none of. */
+        oc_field f[3] = {
+            { FF_PASSWORD, "Current password", "", "" },
+            { FF_PASSWORD, "New password",     "", "" },
+            { FF_PASSWORD, "Confirm new password", "", "" },
+        };
+        if (!form_dialog(hwnd, "Change password", f, 3)) break;
+        if (!f[1].value[0])                        toast_push("Enter a new password.", 1);
+        else if (strcmp(f[1].value, f[2].value))   toast_push("The new passwords do not match.", 1);
+        else                                       oc_client_change_password(g_client, f[0].value, f[1].value);
         break; }
     case 40: oc_client_invite_user(g_client, OC_ROLE_MEMBER); g_await_invite = 1; break;
     case 41: oc_client_invite_user(g_client, OC_ROLE_ADMIN);  g_await_invite = 1; break;
     case 60: g_view = VIEW_HOME; close_overlays(); oc_client_toggle_storage(g_client, 1); oc_client_storage_status(g_client); break;
     case 61: g_view = VIEW_HOME; close_overlays(); oc_client_toggle_audit(g_client, 1); oc_client_audit_query(g_client, 0); break;
-    case 50: { char win[32];
-        if (text_prompt(hwnd, "Do not disturb", "Window HH:MM-HH:MM (blank = off):", "", win, sizeof win, 0)) {
-            int sh, sm, eh, em;
-            if (win[0] && sscanf(win, "%d:%d-%d:%d", &sh, &sm, &eh, &em) == 4)
-                oc_client_set_dnd(g_client, 1, (uint16_t)(sh * 60 + sm), (uint16_t)(eh * 60 + em));
-            else oc_client_set_dnd(g_client, 0, 0, 0); } break; }
+    case 50: {   /* WIN-13: separate fields and an explicit on/off, not one parsed string. */
+        oc_field f[3] = {
+            { FF_CHECK, "Do not disturb during these hours", "", "0" },
+            { FF_TEXT,  "From (HH:MM)", "", "22:00" },
+            { FF_TEXT,  "To (HH:MM)",   "A window may cross midnight.", "08:00" },
+        };
+        if (m && m->dnd_enabled) {
+            snprintf(f[0].value, sizeof f[0].value, "1");
+            snprintf(f[1].value, sizeof f[1].value, "%02u:%02u", m->dnd_start_min / 60, m->dnd_start_min % 60);
+            snprintf(f[2].value, sizeof f[2].value, "%02u:%02u", m->dnd_end_min / 60, m->dnd_end_min % 60);
+        }
+        if (!form_dialog(hwnd, "Do not disturb", f, 3)) break;
+        if (!atoi(f[0].value)) { oc_client_set_dnd(g_client, 0, 0, 0); toast_push("Do not disturb is off.", 0); break; }
+        int sh = 0, sm = 0, eh = 0, em = 0;
+        if (sscanf(f[1].value, "%d:%d", &sh, &sm) != 2 || sscanf(f[2].value, "%d:%d", &eh, &em) != 2 ||
+            sh < 0 || sh > 23 || eh < 0 || eh > 23 || sm < 0 || sm > 59 || em < 0 || em > 59) {
+            toast_push("Use HH:MM, 00:00 to 23:59.", 1);
+            break;
+        }
+        oc_client_set_dnd(g_client, 1, (uint16_t)(sh * 60 + sm), (uint16_t)(eh * 60 + em));
+        break; }
     case 70: close_overlays(); g_prefs_open = 1; g_view = VIEW_HOME; break;
     /* "Add a workspace…" drops the current session and goes to the same sign-in
      * view the app starts on — one sign-in implementation, not two. */
@@ -3984,6 +4247,12 @@ static void test_poll(HWND hwnd) {
             ac_rebuild();
             test_ack("ok");
         } else test_ack("err");
+    } else if (!strcmp(verb, "menu")) {
+        /* Drive a workspace/new-menu command directly. Modal forms block this
+         * poll loop until dismissed, so the ack lands after the dialog closes. */
+        menu_dispatch(hwnd, atoi(arg)); test_ack("ok");
+    } else if (!strcmp(verb, "profile")) {
+        close_overlays(); g_profile_uid = strtoull(arg, NULL, 10); g_view = VIEW_HOME; test_ack("ok");
     } else if (!strcmp(verb, "prefs")) {
         close_overlays(); g_prefs_open = 1; g_view = VIEW_HOME; test_ack("ok");
     } else if (!strcmp(verb, "theme")) {
@@ -4097,20 +4366,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (g_await_invite && m->invite_token[0]) {   /* show the minted token once */
-                WCHAR msgw[256]; char line[256];
-                snprintf(line, sizeof line,
-                         "Invite token (share once — it is not shown again):\n\n%s", m->invite_token);
-                to_w(line, msgw, 256);
                 g_await_invite = 0;
-                MessageBoxW(hwnd, msgw, L"Invite created", MB_OK | MB_ICONINFORMATION);
+                show_secret(hwnd, "Invite created", "Invite token", m->invite_token,
+                            "Share it once. It is not shown again \u2014 mint a new invite if you lose it.");
             }
             if (g_await_webhook && m->webhook_token[0]) {  /* show the minted webhook token once */
-                WCHAR msgw[256]; char line[256];
-                snprintf(line, sizeof line,
-                         "Webhook token (shown once — POST to /webhook/<token>):\n\n%s", m->webhook_token);
-                to_w(line, msgw, 256);
                 g_await_webhook = 0;
-                MessageBoxW(hwnd, msgw, L"Webhook created", MB_OK | MB_ICONINFORMATION);
+                show_secret(hwnd, "Webhook created", "Webhook token", m->webhook_token,
+                            "POST to /webhook/<token>. Shown once; delete and recreate if you lose it.");
             }
             InvalidateRect(hwnd, NULL, FALSE);
         }

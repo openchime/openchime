@@ -182,6 +182,10 @@ typedef struct {
      * NOT overwritten by the "disconnected" line, so a login flow can read the
      * reason after the connection drops; cleared on a successful connect. */
     char     last_error[160];
+    /* Bumped every time an error arrives, even an identical one. A frontend that
+     * notices only when the TEXT changes stays silent when you repeat a failing
+     * action — the second attempt looks like it worked. */
+    uint32_t error_seq;
 } oc_model;
 
 void oc_model_init(oc_model *m);

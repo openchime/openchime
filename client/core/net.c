@@ -1033,7 +1033,7 @@ static int run_connection(oc_net *n, int reconnecting,
             }
             if (c->type == OC_CMD_CREATE_CHANNEL && c->body) {
                 uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                oc_create_channel cc = { oc_slice_str(c->body), 1 };   /* public */
+                oc_create_channel cc = { oc_slice_str(c->body), c->op };
                 if (oc_encode_create_channel(&w, OC_PROTOCOL_VERSION, &cc) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }

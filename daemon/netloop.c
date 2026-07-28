@@ -1635,7 +1635,16 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         for (int i = 0; i < 8; i++) ctx[i] = (uint8_t)(r->channel_id >> (56 - 8 * i));
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_slice cs = { ctx, sizeof ctx };
-        oc_error e = { r->err_code, 0, cs, oc_slice_str("channel op rejected") };
+        /* Name the actual problem. "channel op rejected" told a user nothing
+         * they could act on, and REQ-263 is about failures being legible. */
+        const char *why =
+            r->err_code == OC_ERR_CHANNEL_EXISTS   ? "a channel with that name already exists"
+          : r->err_code == OC_ERR_INVALID_CHANNEL  ? "that channel name is not valid"
+          : r->err_code == OC_ERR_UNKNOWN_CHANNEL  ? "no such channel"
+          : r->err_code == OC_ERR_NOT_A_MEMBER     ? "you are not a member of that channel"
+          : r->err_code == OC_ERR_FORBIDDEN        ? "you do not have permission to do that"
+          :                                          "channel op rejected";
+        oc_error e = { r->err_code, 0, cs, oc_slice_str(why) };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;

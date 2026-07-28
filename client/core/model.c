@@ -735,6 +735,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         if (e->body) {
             set_status(m, e->body);
             snprintf(m->last_error, sizeof m->last_error, "%s", e->body);
+            m->error_seq++;
         }
         break;
     default:

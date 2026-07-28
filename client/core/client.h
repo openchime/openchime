@@ -80,7 +80,8 @@ void oc_client_close_search(oc_client *c);
 
 /* Channel management: create a public channel, join / leave one. The server
  * answers with a CHANNEL_INFO that folds into the channel list. */
-void oc_client_create_channel(oc_client *c, const char *name);
+void oc_client_create_channel(oc_client *c, const char *name);          /* public */
+void oc_client_create_channel_ex(oc_client *c, const char *name, int is_public);
 void oc_client_join_channel(oc_client *c, uint64_t channel_id);
 void oc_client_leave_channel(oc_client *c, uint64_t channel_id);
 /* Refresh the channel list (to discover channels created since login). */

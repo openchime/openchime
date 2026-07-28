@@ -179,12 +179,19 @@ void oc_client_close_search(oc_client *c) {
     oc_model_close_search(&c->model);
 }
 
-void oc_client_create_channel(oc_client *c, const char *name) {
+void oc_client_create_channel_ex(oc_client *c, const char *name, int is_public) {
     if (!c || !name || !name[0]) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_CREATE_CHANNEL);
     if (!cmd) return;
     cmd->body = strdup(name);
+    cmd->op = (uint8_t)(is_public ? 1 : 0);
     oc_queue_push(&c->cmds, cmd);
+}
+
+/* CREATE_CHANNEL has always carried is_public on the wire; this facade dropped
+ * it and hardcoded public (WIN-30). Kept as the public-channel shorthand. */
+void oc_client_create_channel(oc_client *c, const char *name) {
+    oc_client_create_channel_ex(c, name, 1);
 }
 
 static void channel_op(oc_client *c, int type, uint64_t channel_id) {
