@@ -39,6 +39,44 @@ struct oc_net {
     oc_queue     *from_ui;
 };
 
+/* ---- the offline outbox, in memory (REQ-102, ARCH-88) ----------------------
+ * A send is recorded here before it goes out and removed on its SEND_ACK, so a
+ * drop mid-flight leaves it to be resent on reconnect — deduped by the daemon on
+ * the idempotency token. It lives for the life of the process and no longer: the
+ * requirement is "queued locally, sent automatically on reconnect", and a client
+ * that writes nothing to disk cannot honour more than that. A message still
+ * queued when the app exits is lost, which is why a frontend should warn on quit
+ * while oc_net_outbox_pending() is non-zero. */
+typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; char *body; } obox_row;
+typedef struct { obox_row *v; size_t n, cap; } obox;
+
+static void obox_add(obox *o, const uint8_t idem[OC_IDEM_SIZE], uint64_t cid, const char *body) {
+    for (size_t i = 0; i < o->n; i++)
+        if (memcmp(o->v[i].idem, idem, OC_IDEM_SIZE) == 0) return;
+    if (o->n == o->cap) {
+        size_t want = o->cap ? o->cap * 2 : 16;
+        obox_row *q = realloc(o->v, want * sizeof *q);
+        if (!q) return;
+        o->v = q; o->cap = want;
+    }
+    memcpy(o->v[o->n].idem, idem, OC_IDEM_SIZE);
+    o->v[o->n].channel_id = cid;
+    o->v[o->n].body = body ? strdup(body) : NULL;
+    o->n++;
+}
+static void obox_remove(obox *o, const uint8_t idem[OC_IDEM_SIZE]) {
+    size_t w = 0;
+    for (size_t i = 0; i < o->n; i++) {
+        if (memcmp(o->v[i].idem, idem, OC_IDEM_SIZE) == 0) { free(o->v[i].body); continue; }
+        o->v[w++] = o->v[i];
+    }
+    o->n = w;
+}
+static void obox_free(obox *o) {
+    for (size_t i = 0; i < o->n; i++) free(o->v[i].body);
+    free(o->v); o->v = NULL; o->n = o->cap = 0;
+}
+
 /* The store-backed connection context (session token + TOFU pin persistence),
  * threaded through run_connection so the net thread persists across restarts. */
 typedef struct {
@@ -47,6 +85,7 @@ typedef struct {
     uint8_t     pin[OC_TLS_FINGERPRINT_LEN];
     int         have_pin;                       /* pin loaded/captured this run */
     int         logged_out;                     /* set on /logout: drop the stored token */
+    obox       *obox;                           /* in-memory outbox (REQ-102) */
 } conn_store;
 
 /* ---- helpers ---- */
@@ -219,7 +258,8 @@ typedef struct {
     volatile int *stop;
     oc_xfer     *xfer;
     oc_hwtab    *hw;
-    oc_store    *store;      /* cache messages as they arrive (NULL = no store) */
+    oc_store    *store;      /* token/pin persistence (NULL = none) */
+    obox        *obox;       /* in-memory outbox, cleared on each SEND_ACK */
     const char  *workspace;
     const char  *client_type; /* which settings bucket this frontend syncs */
 } disp_ctx;
@@ -327,8 +367,6 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 char *cb = malloc(b.body.len + 1);
                 if (cb) {
                     memcpy(cb, b.body.ptr, b.body.len); cb[b.body.len] = '\0';
-                    oc_store_save_message(ctx->store, ctx->workspace, b.channel_id, b.message_id,
-                                          b.author_id, an, b.server_time, cb, 0, 0);
                     free(cb);
                 }
             }
@@ -425,8 +463,6 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->body = malloc(me.body.len + 1);
                     if (e->body) { memcpy(e->body, me.body.ptr, me.body.len); e->body[me.body.len] = '\0'; }
                     oc_queue_push(to_ui, e);
-                    if (ctx && ctx->store && e->body)   /* keep the cache current */
-                        oc_store_edit_message(ctx->store, ctx->workspace, me.message_id, e->body);
                 }
             }
         } else if (hdr.msg_type == OC_MSG_MSG_DELETED) {
@@ -434,8 +470,6 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (oc_decode_msg_deleted(&p, &md) == OC_OK) {
                 oc_ev *e = oc_ev_new(OC_EV_DELETE);
                 if (e) { e->channel_id = md.channel_id; e->message_id = md.message_id; oc_queue_push(to_ui, e); }
-                if (ctx && ctx->store)
-                    oc_store_delete_message(ctx->store, ctx->workspace, md.message_id);
             }
         } else if (hdr.msg_type == OC_MSG_THREAD_REPLY) {
             oc_thread_reply tr;
@@ -703,7 +737,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
              * into the model. */
             oc_send_ack ack;
             if (oc_decode_send_ack(&p, &ack) == OC_OK && ctx && ctx->store)
-                oc_store_outbox_remove(ctx->store, ctx->workspace, ack.idem);
+                if (ctx->obox) obox_remove(ctx->obox, ack.idem);
         } else if (hdr.msg_type == OC_MSG_ERROR) {
             oc_error err;
             if (oc_decode_error(&p, &err) == OC_OK) {
@@ -752,15 +786,6 @@ static int is_loopback(const char *host) {
  * (graceful quit/logout), RC_LOST (dropped — a session reconnect may follow), or
  * RC_FATAL (version/auth reject — do not retry). `*served` is set once the serve
  * loop is entered, so the caller can shorten the backoff after a live session. */
-/* Resend every pending outbox message (REQ-102), reusing each stored idem so the
- * daemon dedups anything already delivered. Runs once per successful auth. */
-struct flush_ctx { oc_tls_conn *conn; int fd; volatile int *stop; };
-static void flush_outbox_cb(void *v, const uint8_t idem[OC_IDEM_SIZE],
-                            uint64_t channel_id, const char *body) {
-    struct flush_ctx *f = (struct flush_ctx *)v;
-    send_message(f->conn, f->fd, f->stop, channel_id, idem, body);
-}
-
 static int run_connection(oc_net *n, int reconnecting,
                           uint8_t sess[OC_SESSION_TOKEN_LEN], int *have_sess,
                           oc_hwtab *hw, int *served, conn_store *cs) {
@@ -876,6 +901,19 @@ static int run_connection(oc_net *n, int reconnecting,
         /* On a reconnect, recover anything missed while offline: backfill each
          * known channel from its last-seen message id (REQ-101). Replays dedup on
          * the model's high-water mark. */
+        /* A cold start (nothing seen yet) sends a CURSORLESS backfill: the daemon
+         * then resumes every member channel from that user's server-side read
+         * position (REQ-090), which is what lets the client keep no local
+         * history at all (ARCH-88). This is the FIRST connect as much as a
+         * reconnect — a client with no stored state has no cursor either way.
+         * Once a high-water table exists we send it, so a mid-session reconnect
+         * fetches only the gap. */
+        if (hw->n == 0) {
+            uint8_t bb[64]; oc_wbuf bw; oc_wbuf_init(&bw, bb, sizeof bb);
+            oc_backfill_request req = { 0, NULL };
+            if (oc_encode_backfill_request(&bw, OC_PROTOCOL_VERSION, &req) == OC_OK)
+                (void)write_all(&conn, fd, bb, bw.len, &n->stop);
+        }
         if (reconnecting && hw->n > 0) {
             oc_cursor *curs = malloc(hw->n * sizeof *curs);
             if (curs) {
@@ -892,10 +930,12 @@ static int run_connection(oc_net *n, int reconnecting,
         }
 
         /* Flush the offline outbox (REQ-102): resend anything composed while
-         * disconnected (this run or a prior one), reusing each stored idem. */
-        if (cs && cs->store) {
-            struct flush_ctx fc = { &conn, fd, &n->stop };
-            oc_store_outbox_each(cs->store, cs->workspace, flush_outbox_cb, &fc);
+         * disconnected earlier in this process, reusing each idem so the daemon
+         * dedups a partial delivery. */
+        if (cs && cs->obox) {
+            for (size_t i = 0; i < cs->obox->n; i++)
+                send_message(&conn, fd, &n->stop, cs->obox->v[i].channel_id,
+                             cs->obox->v[i].idem, cs->obox->v[i].body ? cs->obox->v[i].body : "");
         }
     }
 
@@ -903,7 +943,8 @@ static int run_connection(oc_net *n, int reconnecting,
      * An in-flight attachment transfer (upload/download) is driven by both. */
     *served = 1;
     disp_ctx ctx = { n->to_ui, &conn, fd, &n->stop, &xfer, hw,
-                     cs ? cs->store : NULL, cs ? cs->workspace : NULL, n->client_type };
+                     cs ? cs->store : NULL, cs ? cs->obox : NULL,
+                     cs ? cs->workspace : NULL, n->client_type };
     while (!n->stop) {
         oc_cmd *c;
         while ((c = oc_queue_try_pop(n->from_ui)) != NULL) {
@@ -924,7 +965,7 @@ static int run_connection(oc_net *n, int reconnecting,
                  * SEND_ACK leaves it there to be resent, deduped by the idem. */
                 uint8_t idem[OC_IDEM_SIZE]; gen_idem(idem);
                 uint64_t cid = c->channel_id ? c->channel_id : 1;
-                if (ctx.store) oc_store_outbox_add(ctx.store, ctx.workspace, idem, cid, c->body);
+                if (ctx.obox) obox_add(ctx.obox, idem, cid, c->body);
                 send_message(&conn, fd, &n->stop, cid, idem, c->body);
             }
             if (c->type == OC_CMD_REACT && c->body) {
@@ -1207,46 +1248,6 @@ drop:
  * OC_EV_MESSAGE (folded + deduped by the reducer), plus an OC_EV_EDIT/_DELETE so
  * the "(edited)" marker / tombstone survives a relaunch, and seed the backfill
  * cursor. */
-struct replay_ctx { oc_queue *to_ui; oc_hwtab *hw; };
-static void replay_msg_cb(void *vctx, uint64_t channel_id, uint64_t message_id,
-                          uint64_t author_id, const char *author_name,
-                          uint64_t server_time, const char *body,
-                          int edited, int deleted) {
-    struct replay_ctx *r = (struct replay_ctx *)vctx;
-    oc_ev *e = oc_ev_new(OC_EV_MESSAGE);
-    if (e) {
-        e->channel_id = channel_id;
-        e->author_id = author_id;
-        e->message_id = message_id;
-        e->server_time = server_time;
-        if (author_name) snprintf(e->author_name, sizeof e->author_name, "%s", author_name);
-        e->body = strdup(body ? body : "");
-        oc_queue_push(r->to_ui, e);
-    }
-    if (deleted) {
-        oc_ev *d = oc_ev_new(OC_EV_DELETE);
-        if (d) { d->channel_id = channel_id; d->message_id = message_id; oc_queue_push(r->to_ui, d); }
-    } else if (edited) {
-        oc_ev *ed = oc_ev_new(OC_EV_EDIT);
-        if (ed) { ed->channel_id = channel_id; ed->message_id = message_id;
-                  ed->body = strdup(body ? body : ""); oc_queue_push(r->to_ui, ed); }
-    }
-    hwtab_note(r->hw, channel_id, message_id);
-}
-
-/* Load cached history into the model before the first connect (ARCH-45/46), then
- * mark each channel's replayed messages read so a relaunch shows history without
- * everything reading as unread. Seeds `hw` so the first backfill resumes from the
- * last cached id rather than refetching from 0. */
-static void replay_cache(oc_queue *to_ui, oc_store *store, const char *workspace, oc_hwtab *hw) {
-    struct replay_ctx r = { to_ui, hw };
-    oc_store_each_message(store, workspace, replay_msg_cb, &r);
-    for (size_t i = 0; i < hw->n; i++) {
-        oc_ev *e = oc_ev_new(OC_EV_READ_STATE);
-        if (e) { e->channel_id = hw->v[i].channel_id; oc_queue_push(to_ui, e); }
-    }
-}
-
 /* The net thread: run one connection after another, silently reconnecting with
  * the session token after an unexpected drop (REQ-100). The model is preserved
  * across reconnects (dedup on high-water), so a blip is invisible beyond a brief
@@ -1255,6 +1256,7 @@ static void replay_cache(oc_queue *to_ui, oc_store *store, const char *workspace
 static void *net_thread(void *arg) {
     oc_net *n = (oc_net *)arg;
     oc_hwtab hw; memset(&hw, 0, sizeof hw);
+    obox outbox; memset(&outbox, 0, sizeof outbox);
     uint8_t sess[OC_SESSION_TOKEN_LEN];
     int have_sess = 0, reconnecting = 0, backoff_ms = 0;
 
@@ -1265,6 +1267,7 @@ static void *net_thread(void *arg) {
     char workspace[288];
     snprintf(workspace, sizeof workspace, "%s:%d", n->host, n->port);
     cs.workspace = workspace;
+    cs.obox = &outbox;
     cs.store = n->store_path ? oc_store_open(n->store_path) : NULL;
     if (cs.store) {
         oc_store_set_secret(cs.store, n->secret);   /* token -> keyring if available */
@@ -1274,8 +1277,6 @@ static void *net_thread(void *arg) {
             have_sess = 1;
             reconnecting = 1;   /* use OC_AUTH_SESSION on the very first connect */
         }
-        /* Show cached history immediately + seed the backfill cursor (ARCH-45/46). */
-        replay_cache(n->to_ui, cs.store, workspace, &hw);
     }
 
     int reach_notified = 0;   /* latch so "unreachable" isn't repeated each retry */
@@ -1327,21 +1328,8 @@ static void *net_thread(void *arg) {
         reconnecting = 1;
     }
 
-    /* Closing while offline: persist any sends still queued (composed but never
-     * connected to deliver) so they go out on the next run (REQ-102). */
-    if (cs.store) {
-        oc_cmd *c;
-        while ((c = oc_queue_try_pop(n->from_ui)) != NULL) {
-            if (c->type == OC_CMD_SEND && c->body) {
-                uint8_t idem[OC_IDEM_SIZE]; gen_idem(idem);
-                oc_store_outbox_add(cs.store, workspace, idem,
-                                    c->channel_id ? c->channel_id : 1, c->body);
-            }
-            oc_cmd_free(c);
-        }
-    }
-
     oc_store_close(cs.store);
+    obox_free(&outbox);
     hwtab_free(&hw);
     return NULL;
 }

@@ -318,16 +318,14 @@ false alarms as local dev daemons re-self-sign (`client/core/net.c:is_loopback`,
 
 ## 5. Local store
 
-The core embeds **no database engine** (ARCH-88/REQ-201). `client/core/store.c`
-splits its four concerns by what they are: the **session token and TOFU pin** go
-to the OS credential store (`oc_secret`), and the **cached history**, **offline
-outbox** and **workspace book** are plain files under the state *directory*. The
-cache is an append-only log of length-prefixed CRC'd records — one writer, read
-whole at startup, never queried — with edits/deletes appended as tombstones,
-folded on load, and the file compacted past its record budget; a tail torn by a
-crash fails its checksum and is dropped. The outbox and book are small enough to
-rewrite whole under an atomic rename, which is what makes the switcher's
-second-handle contract hold with no locking.
+The core **stores nothing locally beyond credentials** (ARCH-88/REQ-201). There is
+no database and no file: `client/core/store.c` is a thin front for the OS
+credential store, holding one entry per workspace with the session token, the
+TOFU pin, and the book fields (typed address, account, last-used). Because there
+is one credential per workspace, **enumerating the credential store is the
+workspace book** (`oc_secret_each`), and "forget" is a single delete. Cached
+history is gone and the offline outbox lives in memory on the net thread. With no
+OS credential store, nothing persists at all.
 
   **There is no plaintext fallback.** Where no store exists — headless, no D-Bus,
   a locked keychain — `oc_store_save_session`/`load_session` simply do nothing, so

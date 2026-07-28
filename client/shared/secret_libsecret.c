@@ -73,7 +73,7 @@ static int ls_get(void *ctx, const char *account, uint8_t *out, size_t cap, size
 
 static int ls_put(void *ctx, const char *account, const uint8_t *val, size_t n) {
     ls_ctx *c = (ls_ctx *)ctx;
-    char hex[256];
+    char hex[1024];
     if (2 * n + 1 > sizeof hex) return 0;
     hex_enc(val, n, hex);
     char label[160];
@@ -84,6 +84,29 @@ static int ls_put(void *ctx, const char *account, const uint8_t *val, size_t n) 
                                              "service", c->service, "account", account, NULL);
     if (err) g_error_free(err);
     return ok ? 1 : 0;
+}
+
+/* Every account stored under this service — the workspace book (see secret.h). */
+static void ls_each_free(gpointer p, gpointer u) { (void)u; g_object_unref(p); }
+static int ls_each(void *ctx, oc_secret_each_cb cb, void *ud) {
+    ls_ctx *c = (ls_ctx *)ctx;
+    GHashTable *attrs = g_hash_table_new(g_str_hash, g_str_equal);
+    g_hash_table_insert(attrs, (gpointer)"service", (gpointer)c->service);
+    GError *err = NULL;
+    GList *items = secret_service_search_sync(NULL, &OC_TOKEN_SCHEMA, attrs,
+                                              SECRET_SEARCH_ALL, NULL, &err);
+    g_hash_table_unref(attrs);
+    if (err) { g_error_free(err); return 0; }
+    for (GList *l = items; l; l = l->next) {
+        GHashTable *a = secret_item_get_attributes(SECRET_ITEM(l->data));
+        if (!a) continue;
+        const char *acct = g_hash_table_lookup(a, "account");
+        if (acct) cb(ud, acct);
+        g_hash_table_unref(a);
+    }
+    g_list_foreach(items, ls_each_free, NULL);
+    g_list_free(items);
+    return 1;
 }
 
 static void ls_del(void *ctx, const char *account) {
@@ -109,7 +132,8 @@ oc_secret *oc_secret_open_os(const char *service) {
     snprintf(c->service, sizeof c->service, "%s", (service && service[0]) ? service : "openchime");
     oc_secret *s = calloc(1, sizeof *s);
     if (!s) { free(c); return NULL; }
-    s->get = ls_get; s->put = ls_put; s->del = ls_del; s->close = ls_close; s->ctx = c;
+    s->get = ls_get; s->put = ls_put; s->del = ls_del; s->each = ls_each;
+    s->close = ls_close; s->ctx = c;
     return s;
 }
 

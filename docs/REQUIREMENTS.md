@@ -777,16 +777,17 @@ the requirement says so explicitly rather than implying one.
   whether Android/macOS packaging follows the Linux/Windows model in
   ARCH-20/ARCH-21]**
 
-- **REQ-201.** **No client has embedded a database engine.** Every client's local
-  state — the session token, the TOFU pin (REQ-183), the remembered-workspace book
-  (REQ-012), the cached history (REQ-101) and the offline outbox (REQ-102) — has
-  been held in the **operating system's credential store** (for the credential,
-  the pin, and the workspace book) and in **plain files** (for the bulk cache and
-  the outbox), never in SQLite or any equivalent (ARCH-88). A client is a cache
-  with a credential attached, not a datastore: it has one writer, reads its cache
-  whole at startup, and issues no queries, so it has required no query engine,
-  indexes, transactions, or schema migrations. This is a client-side rule only —
-  the daemon's own store is SQLite by ARCH-2 and is unaffected.
+- **REQ-201.** **No client has stored anything locally beyond its credentials.**
+  Every client's durable state — the session token, the TOFU pin (REQ-183) and the
+  remembered-workspace book (REQ-012) — has lived in the **operating system's
+  credential store**, one entry per workspace, and a client has embedded no
+  database engine and written **no files** (ARCH-88). Cached history has not been
+  kept at all, and the offline outbox (REQ-102) has lived in memory for the life
+  of the process. This has been possible because the **read position is
+  server-side** (REQ-090): a client that remembers nothing asks the daemon where
+  it was. Where no OS credential store exists, nothing has been persisted and the
+  user has signed in again. This is a client-side rule only — the daemon's own
+  store is SQLite by ARCH-2 and is unaffected.
 
 ---
 

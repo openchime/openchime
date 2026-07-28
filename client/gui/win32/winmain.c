@@ -2424,17 +2424,16 @@ static const char *store_path(void) {
     static char path[1024];
     char dir[900];
     snprintf(dir, sizeof dir, "%s\\openchime", base);
-    oc_mkdir(dir);
-    /* A directory now, not a database file (ARCH-88). An orphaned state.db from
-     * an older build has no reader left, so delete it rather than leave a stale
-     * cache — and a stale token — lying about. */
+    /* The client writes NOTHING to disk (ARCH-88), so this directory is never
+     * created — the path exists only so a caller can distinguish "persistence
+     * on" from NULL. We do still clear anything a pre-ARCH-88 build left, since
+     * a stale state.db holds a cache and a plaintext token nobody reads now. */
     char old[1024];
-    snprintf(old, sizeof old, "%s\\state.db", dir);
-    remove(old);
+    snprintf(old, sizeof old, "%s\\state.db", dir);     remove(old);
     snprintf(old, sizeof old, "%s\\state.db-wal", dir); remove(old);
     snprintf(old, sizeof old, "%s\\state.db-shm", dir); remove(old);
+    _rmdir(dir);                                  /* only succeeds if now empty */
     snprintf(path, sizeof path, "%s\\state", dir);
-    oc_mkdir(path);
     return path;
 }
 
@@ -2453,6 +2452,7 @@ static int pick_last_workspace(char *ws, size_t wscap, char *user, size_t ucap) 
     const char *sp = store_path();
     oc_store *s = sp ? oc_store_open(sp) : NULL;
     if (!s) return 0;
+    oc_store_set_secret(s, g_secret);   /* the book + token live in the credential store */
     struct last_ws l; memset(&l, 0, sizeof l);
     oc_store_workspace_each(s, last_ws_cb, &l);
     oc_store_close(s);
@@ -2470,6 +2470,7 @@ static int have_stored_token(const char *ws) {
     const char *sp = store_path();
     oc_store *s = sp ? oc_store_open(sp) : NULL;
     if (!s) return 0;
+    oc_store_set_secret(s, g_secret);   /* the book + token live in the credential store */
     /* The token lives in the OS credential store, so this probe has to look
      * there too — without the secret attached, oc_store_load_session() correctly
      * reports "no persisted session" and we would show the sign-in screen to a
@@ -2488,6 +2489,7 @@ static void remember_workspace(const char *ws, const char *user) {
     const char *sp = store_path();
     oc_store *s = sp ? oc_store_open(sp) : NULL;
     if (!s) return;
+    oc_store_set_secret(s, g_secret);   /* the book + token live in the credential store */
     oc_store_workspace_remember(s, ws, ws, user, (uint64_t)time(NULL) * 1000);
     oc_store_close(s);
 }
@@ -2843,7 +2845,11 @@ static void open_switcher(HWND hwnd) {
     g_n_sw = 0;
     const char *sp = store_path();
     oc_store *s = sp ? oc_store_open(sp) : NULL;
-    if (s) { oc_store_workspace_each(s, sw_book_cb, NULL); oc_store_close(s); }
+    if (s) {
+        oc_store_set_secret(s, g_secret);   /* the book lives in the credential store */
+        oc_store_workspace_each(s, sw_book_cb, NULL);
+        oc_store_close(s);
+    }
     g_n_mi = 0;
     mi_section("WORKSPACES");
     for (int i = 0; i < g_n_sw; i++) {

@@ -5,11 +5,12 @@
  * the cached history, the offline outbox, and the workspace book. Keyed by
  * `workspace` ("host:port"), so one store holds several servers' state.
  *
- * **No database engine (ARCH-88).** The token and pin live in the OS credential
- * store via the oc_secret seam; the cache, outbox and book are plain files under
- * `path`, which is a DIRECTORY. It is owned by the net thread (the three book
- * calls excepted, below); when the store cannot be opened the client still runs,
- * just without persistence.
+ * **No local storage at all (ARCH-88).** Everything durable is one credential per
+ * workspace in the OS credential store: session token, TOFU pin, and the book
+ * fields. There is no database and no file. Cached history is gone — the daemon
+ * is the source of truth and remembers each user's read position server-side
+ * (REQ-090) — and the offline outbox lives in RAM on the net thread. With no OS
+ * credential store nothing is persisted and the client runs in-memory only.
  */
 
 #ifndef OC_STORE_H
@@ -23,8 +24,9 @@
 
 typedef struct oc_store oc_store;
 
-/* Open the store rooted at directory `path`, creating it if needed; NULL on any
- * failure (the caller then runs without persistence). */
+/* Create a store handle. `path` is vestigial — nothing is written to disk — and
+ * only distinguishes "persistence on" from NULL ("off", which the sign-in
+ * screen's Remember-me uses). NULL on failure. */
 oc_store *oc_store_open(const char *path);
 void      oc_store_close(oc_store *s);
 
@@ -51,58 +53,21 @@ int  oc_store_load_pin(oc_store *s, const char *workspace,
 void oc_store_save_pin(oc_store *s, const char *workspace,
                        const uint8_t pin[OC_TLS_FINGERPRINT_LEN]);
 
-/* Cached message history (ARCH-45/46), so a relaunch shows history instantly and
- * backfills only from the last cached id. save upserts one message; edit/delete
- * update an existing row's body/flags. All keyed by (workspace, message_id). */
-void oc_store_save_message(oc_store *s, const char *workspace, uint64_t channel_id,
-                           uint64_t message_id, uint64_t author_id,
-                           const char *author_name, uint64_t server_time,
-                           const char *body, int edited, int deleted);
-void oc_store_edit_message(oc_store *s, const char *workspace, uint64_t message_id,
-                           const char *body);
-void oc_store_delete_message(oc_store *s, const char *workspace, uint64_t message_id);
-
-/* Replay cached messages for `workspace` in ascending message-id order, invoking
- * `cb` for each. `body` may be NULL (deleted). The store owns the strings for the
- * duration of the callback only. */
-typedef void (*oc_store_msg_cb)(void *ctx, uint64_t channel_id, uint64_t message_id,
-                                uint64_t author_id, const char *author_name,
-                                uint64_t server_time, const char *body,
-                                int edited, int deleted);
-void oc_store_each_message(oc_store *s, const char *workspace,
-                           oc_store_msg_cb cb, void *ctx);
-
-/* Offline outbox (REQ-102). A message is added here (with its idempotency token)
- * before it is sent, removed when the server acks it, and re-sent from here on
- * reconnect — so a send survives a drop or an app restart, and the daemon's
- * idempotency dedups any partial delivery. Keyed by (workspace, idem). */
-void oc_store_outbox_add(oc_store *s, const char *workspace,
-                         const uint8_t idem[OC_IDEM_SIZE], uint64_t channel_id,
-                         const char *body);
-void oc_store_outbox_remove(oc_store *s, const char *workspace,
-                            const uint8_t idem[OC_IDEM_SIZE]);
-/* Replay pending outbox messages in insertion order (oldest first). */
-typedef void (*oc_store_outbox_cb)(void *ctx, const uint8_t idem[OC_IDEM_SIZE],
-                                   uint64_t channel_id, const char *body);
-void oc_store_outbox_each(oc_store *s, const char *workspace,
-                          oc_store_outbox_cb cb, void *ctx);
-
 /* The workspace book (REQ-012): the list of workspaces this machine knows about,
  * so a frontend can offer a switcher without the user retyping an address. One
  * row per workspace, holding the `label` the user typed (`acme.example.com` —
  * friendlier than the resolved "host:port" key) and the `username` they signed
  * in as, ordered most-recently-used first.
  *
- * Unlike the rest of this header these three are safe to call from a SECOND
- * oc_store handle on the same directory, opened by the frontend outside the net
- * thread — the book is written at login/logout, not on the message path, and it
- * is rewritten whole under an atomic rename, so a concurrent reader sees either
- * the old file or the new one. That is how the switcher lists workspaces that
- * have no running client.
+ * The book is not stored separately: there is one credential per workspace, so
+ * enumerating the credential store IS the book (oc_secret_each). These three are
+ * safe from a SECOND oc_store handle outside the net thread — the OS credential
+ * store serializes its own access — which is how the switcher lists workspaces
+ * that have no running client.
  *
  * remember() upserts and stamps last-used; a NULL label/username preserves the
- * stored one, so re-login never blanks the switcher. forget() removes the entry
- * AND that workspace's session token, TOFU pin, cached history, and outbox. */
+ * stored one, so re-login never blanks the switcher. forget() deletes the whole
+ * credential — token, pin and book entry in one go, leaving nothing behind. */
 void oc_store_workspace_remember(oc_store *s, const char *workspace,
                                  const char *label, const char *username,
                                  uint64_t now_ms);

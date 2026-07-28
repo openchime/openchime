@@ -2110,6 +2110,26 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
         uint64_t ch = curs[ci].channel_id;
         if (!channel_read_access(db, ch, j->user_id)) continue;
 
+        /* An explicit cursor of 0 means "I don't know where I was" — a client
+         * that keeps no local state (ARCH-88). Resume from this user's stored
+         * read position instead of replaying the channel from its very first
+         * message, which would hand a cold client the OLDEST page first. A
+         * member who has genuinely never read the channel has no cursor row, so
+         * this still yields 0 and they get its history from the start. */
+        uint64_t after = curs[ci].after_message_id;
+        if (after == 0) {
+            sqlite3_stmt *cst = NULL;
+            if (sqlite3_prepare_v2(db,
+                    "SELECT message_id FROM delivery_cursors WHERE user_id=? AND channel_id=?;",
+                    -1, &cst, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(cst, 1, (sqlite3_int64)j->user_id);
+                sqlite3_bind_int64(cst, 2, (sqlite3_int64)ch);
+                if (sqlite3_step(cst) == SQLITE_ROW)
+                    after = (uint64_t)sqlite3_column_int64(cst, 0);
+                sqlite3_finalize(cst);
+            }
+        }
+
         /* Only top-level messages are replayed to the main scroll (REQ-060);
          * thread replies (parent_id set) are fetched per-thread via LIST_THREAD.
          * Each row also carries its thread reply count + latest-reply time so the
@@ -2125,7 +2145,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             "WHERE m.channel_id=? AND m.id>? AND m.parent_id IS NULL "
             "ORDER BY m.id LIMIT ?;", -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)ch);
-        sqlite3_bind_int64(st, 2, (sqlite3_int64)curs[ci].after_message_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)after);   /* resolved above */
         sqlite3_bind_int64(st, 3, (sqlite3_int64)(OC_BACKFILL_MAX - n));
         while (sqlite3_step(st) == SQLITE_ROW && n < OC_BACKFILL_MAX) {
             if (n == cap) {

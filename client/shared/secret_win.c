@@ -83,6 +83,29 @@ static void cm_del(void *ctx, const char *account) {
     if (cm_target(c, account, target, 600)) CredDeleteW(target, CRED_TYPE_GENERIC, 0);
 }
 
+/* Every credential we own, by stripping the "<service>:" target prefix. This is
+ * the workspace book: one credential per workspace means the list of workspaces
+ * needs no separate storage. */
+static int cm_each(void *ctx, oc_secret_each_cb cb, void *ud) {
+    cm_ctx *c = ctx;
+    WCHAR filter[80];
+    char pat[80];
+    snprintf(pat, sizeof pat, "%s:*", c->service);
+    if (MultiByteToWideChar(CP_UTF8, 0, pat, -1, filter, 80) <= 0) return 0;
+    DWORD n = 0; PCREDENTIALW *list = NULL;
+    if (!CredEnumerateW(filter, 0, &n, &list)) return GetLastError() == ERROR_NOT_FOUND ? 1 : 0;
+    size_t skip = strlen(c->service) + 1;
+    for (DWORD i = 0; i < n; i++) {
+        if (!list[i] || !list[i]->TargetName) continue;
+        char target[600];
+        if (WideCharToMultiByte(CP_UTF8, 0, list[i]->TargetName, -1, target, sizeof target,
+                                NULL, NULL) <= 0) continue;
+        if (strlen(target) > skip) cb(ud, target + skip);
+    }
+    CredFree(list);
+    return 1;
+}
+
 static void cm_close(void *ctx) { free(ctx); }
 
 oc_secret *oc_secret_open_os(const char *service) {
@@ -102,7 +125,8 @@ oc_secret *oc_secret_open_os(const char *service) {
     snprintf(c->service, sizeof c->service, "%s", (service && service[0]) ? service : "openchime");
     oc_secret *s = calloc(1, sizeof *s);
     if (!s) { free(c); return NULL; }
-    s->get = cm_get; s->put = cm_put; s->del = cm_del; s->close = cm_close; s->ctx = c;
+    s->get = cm_get; s->put = cm_put; s->del = cm_del; s->each = cm_each;
+    s->close = cm_close; s->ctx = c;
     return s;
 }
 

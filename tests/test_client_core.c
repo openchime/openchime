@@ -268,7 +268,7 @@ static void test_last_error(void) {
 }
 
 /* A mock oc_secret (in-memory keyring) for the credential-cache routing test. */
-static struct { char account[64]; uint8_t val[128]; size_t len; int used; } g_mock[8];
+static struct { char account[64]; uint8_t val[512]; size_t len; int used; } g_mock[8];
 static int mock_get(void *ctx, const char *a, uint8_t *out, size_t cap, size_t *len) {
     (void)ctx;
     for (int i = 0; i < 8; i++)
@@ -288,6 +288,12 @@ static int mock_put(void *ctx, const char *a, const uint8_t *v, size_t n) {
         }
     return 0;
 }
+static int mock_each(void *ctx, oc_secret_each_cb cb, void *ud) {
+    (void)ctx;
+    for (int i = 0; i < 8; i++) if (g_mock[i].used) cb(ud, g_mock[i].account);
+    return 1;
+}
+static void mock_reset(void) { memset(g_mock, 0, sizeof g_mock); }
 static void mock_del(void *ctx, const char *a) {
     (void)ctx;
     for (int i = 0; i < 8; i++)
@@ -340,101 +346,54 @@ static int find_log_file(const char *dir, char *out, size_t cap) {
     return found;
 }
 
-/* ARCH-88: a client embeds no database engine, so there is no in-place upgrade
- * from the old SQLite store — the frontends delete the orphaned state.db and the
- * user re-signs in once. What this test pins instead is the replacement: the
- * cache and outbox round-trip through plain files, and a torn tail (a crash
- * mid-append) costs only the records after the tear. */
-static void test_store_files_roundtrip(void) {
-    const char *sp = "build/itest_core_files";
-    {   /* start clean: remove any files a previous run left */
-        DIR *d = opendir(sp);
-        if (d) {
-            struct dirent *e;
-            while ((e = readdir(d)) != NULL) {
-                if (e->d_name[0] == '.') continue;
-                char f[600]; snprintf(f, sizeof f, "%s/%s", sp, e->d_name); unlink(f);
-            }
-            closedir(d);
-        }
-    }
-    oc_store *s = oc_store_open(sp);
-    CHECK(s != NULL);
-    if (!s) return;
-
-    oc_store_save_message(s, "acme:443", 9, 42, 5, "dana", 1000, "hello", 0, 0);
-    oc_store_save_message(s, "acme:443", 9, 43, 5, "dana", 1001, "second", 0, 0);
-    oc_store_edit_message(s, "acme:443", 42, "hello (edited)");
-    oc_store_delete_message(s, "acme:443", 43);
-    uint8_t idem[OC_IDEM_SIZE];
-    for (unsigned i = 0; i < OC_IDEM_SIZE; i++) idem[i] = (uint8_t)(i + 1);
-    oc_store_outbox_add(s, "acme:443", idem, 9, "queued");
-    oc_store_close(s);
-
-    /* Reopened in a fresh handle: the edit and the tombstone are folded in. */
-    s = oc_store_open(sp);
-    CHECK(s != NULL);
-    if (s) {
-        struct msg_capture mc; memset(&mc, 0, sizeof mc);
-        oc_store_each_message(s, "acme:443", msg_cb, &mc);
-        CHECK(mc.n == 2);
-        CHECK(mc.id[0] == 42 && strcmp(mc.body[0], "hello (edited)") == 0 && mc.edited[0] == 1);
-        CHECK(mc.id[1] == 43 && mc.deleted[1] == 1);
-
-        struct out_capture oc; memset(&oc, 0, sizeof oc);
-        oc_store_outbox_each(s, "acme:443", out_cb, &oc);
-        CHECK(oc.n == 1 && strcmp(oc.body[0], "queued") == 0);
-        oc_store_close(s);
-    }
-
-    /* Append garbage to the log: the records before the tear survive, the torn
-     * tail is dropped rather than corrupting the load. */
-    {
-        char path[600];
-        CHECK(find_log_file(sp, path, sizeof path) == 1);
-        FILE *f = fopen(path, "ab");
-        /* A plausible-looking header with a bogus length + a bad CRC: exactly the
-         * shape of a write interrupted by a crash. */
-        if (f) { fwrite("\x20\x00\x00\x00\x00\x00\x00\x00garbage", 1, 15, f); fclose(f); }
-        s = oc_store_open(sp);
-        if (s) {
-            struct msg_capture mc; memset(&mc, 0, sizeof mc);
-            oc_store_each_message(s, "acme:443", msg_cb, &mc);
-            CHECK(mc.n == 2);            /* the good prefix still reads */
-            oc_store_close(s);
-        }
-    }
-}
-
-/* Collect the workspace book into a fixed buffer, in the order it is returned. */
-struct book_capture { int n; char ws[8][64]; char label[8][64]; char user[8][64]; };
-static void book_cb(void *ctx, const char *ws, const char *label,
-                    const char *user, uint64_t last_used) {
-    struct book_capture *b = (struct book_capture *)ctx;
-    (void)last_used;
-    if (b->n >= 8) return;
-    snprintf(b->ws[b->n],    sizeof b->ws[0],    "%s", ws    ? ws    : "");
-    snprintf(b->label[b->n], sizeof b->label[0], "%s", label ? label : "");
-    snprintf(b->user[b->n],  sizeof b->user[0],  "%s", user  ? user  : "");
+/* Capture the workspace book in call order (most-recently-used first). */
+struct book_capture { int n; char ws[4][64]; char label[4][64]; char user[4][64]; };
+static void book_cb(void *ctx, const char *workspace, const char *label,
+                    const char *username, uint64_t last_used_ms) {
+    (void)last_used_ms;
+    struct book_capture *b = ctx;
+    if (b->n >= 4) return;
+    snprintf(b->ws[b->n],    sizeof b->ws[0],    "%s", workspace ? workspace : "");
+    snprintf(b->label[b->n], sizeof b->label[0], "%s", label     ? label     : "");
+    snprintf(b->user[b->n],  sizeof b->user[0],  "%s", username  ? username  : "");
     b->n++;
 }
 
-/* The workspace book (REQ-012) backs the switcher: it lists remembered
- * workspaces most-recently-used first, a re-login preserves the label/username,
- * and forgetting one erases its credentials and cached history too. */
-static void test_workspace_book(void) {
-    const char *sp = "build/itest_core_book.db";
-    unlink(sp); unlink("build/itest_core_book.db-wal"); unlink("build/itest_core_book.db-shm");
-
-    oc_store *s = oc_store_open(sp);
+/* ARCH-88: the client writes NOTHING to disk. The store is a thin front for the
+ * OS credential store, so with no keyring attached nothing persists at all —
+ * which is the contract the sign-in screen's "Remember me = off" relies on. */
+static void test_store_no_persistence_without_keyring(void) {
+    oc_store *s = oc_store_open("build/itest_core_nostore");
     CHECK(s != NULL);
     if (!s) return;
+    uint8_t tok[OC_SESSION_TOKEN_LEN], pin[OC_TLS_FINGERPRINT_LEN], got[OC_SESSION_TOKEN_LEN];
+    memset(tok, 0xAB, sizeof tok); memset(pin, 0xCD, sizeof pin);
+    oc_store_save_session(s, "acme:443", tok, 0);
+    oc_store_save_pin(s, "acme:443", pin);
+    oc_store_workspace_remember(s, "acme:443", "acme.example.com", "dana", 1000);
+    CHECK(oc_store_load_session(s, "acme:443", got, NULL, 0) == 0);
+    CHECK(oc_store_load_pin(s, "acme:443", got) == 0);
+    struct book_capture b; memset(&b, 0, sizeof b);
+    oc_store_workspace_each(s, book_cb, &b);
+    CHECK(b.n == 0);
+    oc_store_close(s);
+}
+
+static void test_workspace_book(void) {
+    /* The book IS the credential store's contents now (one entry per workspace),
+     * so it needs the keyring attached from the start. */
+    mock_reset();
+    oc_secret book_sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
+    oc_store *s = oc_store_open("build/itest_core_book");
+    CHECK(s != NULL);
+    if (!s) return;
+    oc_store_set_secret(s, &book_sec);
 
     oc_store_workspace_remember(s, "acme:443",   "acme.example.com",   "dana", 1000);
     oc_store_workspace_remember(s, "globex:443", "globex.example.com", "dana", 2000);
 
     /* Most-recently-used first: globex (2000) before acme (1000). */
-    struct book_capture b = { 0, {{0}}, {{0}}, {{0}} };
+    struct book_capture b; memset(&b, 0, sizeof b);
     oc_store_workspace_each(s, book_cb, &b);
     CHECK(b.n == 2);
     CHECK(strcmp(b.ws[0], "globex:443") == 0);
@@ -444,41 +403,33 @@ static void test_workspace_book(void) {
     /* Re-touching acme moves it to the front, and a NULL label/username keeps
      * what was stored rather than blanking the switcher entry. */
     oc_store_workspace_remember(s, "acme:443", NULL, NULL, 3000);
-    struct book_capture b2 = { 0, {{0}}, {{0}}, {{0}} };
+    struct book_capture b2; memset(&b2, 0, sizeof b2);
     oc_store_workspace_each(s, book_cb, &b2);
     CHECK(b2.n == 2);
     CHECK(strcmp(b2.ws[0], "acme:443") == 0);
     CHECK(strcmp(b2.label[0], "acme.example.com") == 0);
     CHECK(strcmp(b2.user[0], "dana") == 0);
 
-    /* Forgetting a workspace takes its session token and cached history with it.
-     * A token only persists with a keyring attached, so give the store one. */
-    oc_secret book_sec = { mock_get, mock_put, mock_del, NULL, NULL };
-    oc_store_set_secret(s, &book_sec);
+    /* Forgetting a workspace deletes its whole credential — book entry AND token
+     * — in one go, leaving nothing behind. */
     uint8_t tok[OC_SESSION_TOKEN_LEN];
     for (unsigned i = 0; i < OC_SESSION_TOKEN_LEN; i++) tok[i] = (uint8_t)(i + 1);
     oc_store_save_session(s, "acme:443", tok, 0);
-    oc_store_save_message(s, "acme:443", 9, 42, 5, "dana", 1000, "hello", 0, 0);
     CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 1);
 
     oc_store_workspace_forget(s, "acme:443");
-    struct book_capture b3 = { 0, {{0}}, {{0}}, {{0}} };
+    struct book_capture b3; memset(&b3, 0, sizeof b3);
     oc_store_workspace_each(s, book_cb, &b3);
     CHECK(b3.n == 1 && strcmp(b3.ws[0], "globex:443") == 0);
     CHECK(oc_store_load_session(s, "acme:443", tok, NULL, 0) == 0);
-    int left = 0;
-    oc_store_each_message(s, "acme:443", count_msg_cb, &left);
-    CHECK(left == 0);
-
     oc_store_close(s);
-    unlink(sp); unlink("build/itest_core_book.db-wal"); unlink("build/itest_core_book.db-shm");
 }
 
 /* With a secret set, the session token round-trips through the keyring vtable and
  * does NOT land in the SQLite column; clearing goes through the vtable too. */
 static void test_secret_routing(void) {
     memset(g_mock, 0, sizeof g_mock);
-    oc_secret sec = { mock_get, mock_put, mock_del, NULL, NULL };
+    oc_secret sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
     const char *sp = "build/itest_core_secret.db";
     unlink(sp); unlink("build/itest_core_secret.db-wal"); unlink("build/itest_core_secret.db-shm");
 
@@ -521,7 +472,7 @@ int run_client_core_tests(void) {
     test_resolve();
     test_last_error();
     test_secret_routing();
-    test_store_files_roundtrip();
+    test_store_no_persistence_without_keyring();
     test_workspace_book();
 
     /* The daemon opens its blob store at netloop startup; point it at a build-local
@@ -543,6 +494,7 @@ int run_client_core_tests(void) {
     CHECK(oc_dbwriter_register_local(dbw, "dana", "pw-dana", OC_ROLE_OWNER,  2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw, "erik", "pw-erik", OC_ROLE_MEMBER, 2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw, "faye", "pw-faye", OC_ROLE_MEMBER, 2048) != 0);
+    CHECK(oc_dbwriter_register_local(dbw, "gil",  "pw-gil",  OC_ROLE_MEMBER, 2048) != 0);
 
     struct core_loop_arg arg;
     arg.port = 19000 + (int)(getpid() % 2000);
@@ -858,7 +810,7 @@ int run_client_core_tests(void) {
 
             /* A session token persists only into a credential store, so this
              * round-trip needs one (the in-memory mock stands in for the OS). */
-            oc_secret store_sec = { mock_get, mock_put, mock_del, NULL, NULL };
+            oc_secret store_sec = { mock_get, mock_put, mock_del, mock_each, NULL, NULL };
             oc_client *s1 = oc_client_start_secure("127.0.0.1", arg.port, "faye:pw-faye",
                                                    sp, &store_sec);
             CHECK(s1 != NULL);
@@ -919,68 +871,64 @@ int run_client_core_tests(void) {
             oc_client_stop(rc);
         }
 
-        /* cached history (ARCH-45/46): a client with a store caches what it sees;
-         * a relaunch shows that history *from the cache alone* — proven by loading
-         * it while the daemon is down, so it cannot have come over the wire. */
+        /* ARCH-88: a client keeps NO local history, so a cold one must still land
+         * on what it missed. It sends a cursorless BACKFILL_REQUEST and the daemon
+         * resumes from that user's server-side read position (REQ-090) — the thing
+         * that makes a stateless client possible. Proven by posting while faye is
+         * away and asserting a brand-new client (no store at all) receives it. */
         {
-            const char *hp = "build/itest_core_hist.db";
-            unlink(hp); unlink("build/itest_core_hist.db-wal"); unlink("build/itest_core_hist.db-shm");
-            oc_client *h1 = oc_client_start_stored("127.0.0.1", arg.port, "faye:pw-faye", hp);
-            CHECK(h1 != NULL);
-            if (h1) {
-                CHECK(WAIT_FOR(h1, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
-                oc_client_send(h1, 1, "line to cache for relaunch");
-                CHECK(WAIT_FOR(h1, channel_has_body(m, 1, "line to cache for relaunch")));
-                oc_client_stop(h1);   /* the message is now in the store */
+            oc_client *c1 = oc_client_start("127.0.0.1", arg.port, "faye:pw-faye");
+            CHECK(c1 != NULL);
+            if (c1) {
+                CHECK(WAIT_FOR(c1, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
+                oc_client_backfill(c1, 1);
+                oc_client_send(c1, 1, "read before going away");
+                CHECK(WAIT_FOR(c1, channel_has_body(m, 1, "read before going away")));
+                oc_client_mark_read(c1, 1);      /* advances the server-side cursor */
+                for (int k = 0; k < 40; k++) oc_client_tick(c1);
+                oc_client_stop(c1);
             }
-            /* Take the daemon down, then relaunch against the same store. */
-            arg.stop = 1;
-            pthread_join(th, NULL);
-            oc_client *h2 = oc_client_start_stored("127.0.0.1", arg.port, "faye:pw-faye", hp);
-            CHECK(h2 != NULL);
-            if (h2) {
-                /* No server is up, so this can only be the cached copy. */
-                CHECK(WAIT_FOR(h2, channel_has_body(m, 1, "line to cache for relaunch")));
-                oc_client_stop(h2);
+            /* Posted while faye has no client running at all. */
+            oc_client *other = oc_client_start("127.0.0.1", arg.port, "gil:pw-gil");
+            if (other) {
+                CHECK(WAIT_FOR(other, m->authed));
+                oc_client_send(other, 1, "arrived while away");
+                CHECK(WAIT_FOR(other, channel_has_body(m, 1, "arrived while away")));
+                oc_client_stop(other);
             }
-            /* Restart the netloop so the trailing cleanup joins a live thread. */
-            arg.stop = 0;
-            CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
-            wait_port_ready(arg.port);
-            unlink(hp); unlink("build/itest_core_hist.db-wal"); unlink("build/itest_core_hist.db-shm");
+            /* A cold client: no store, no cursor, nothing remembered. */
+            oc_client *c2 = oc_client_start("127.0.0.1", arg.port, "faye:pw-faye");
+            CHECK(c2 != NULL);
+            if (c2) {
+                CHECK(WAIT_FOR(c2, m->authed));
+                CHECK(WAIT_FOR(c2, channel_has_body(m, 1, "arrived while away")));
+                oc_client_stop(c2);
+            }
         }
 
-        /* offline outbox (REQ-102): a message composed while the daemon is down is
-         * persisted to the store and resent on reconnect. o1 authenticates, then
-         * — with the daemon torn down — composes a message and is closed; the send
-         * lands in the store's outbox. A fresh o2 against the same store reconnects
-         * and flushes it, so the message finally round-trips. */
+        /* offline outbox (REQ-102), now in memory: a message composed while the
+         * daemon is down is held by the net thread and resent when the connection
+         * comes back — within the life of the process, which is what REQ-102 asks
+         * for ("queued locally, sent automatically on reconnect"). */
         {
-            const char *op = "build/itest_core_outbox.db";
-            unlink(op); unlink("build/itest_core_outbox.db-wal"); unlink("build/itest_core_outbox.db-shm");
-            oc_client *o1 = oc_client_start_stored("127.0.0.1", arg.port, "faye:pw-faye", op);
+            oc_client *o1 = oc_client_start("127.0.0.1", arg.port, "faye:pw-faye");
             CHECK(o1 != NULL);
             if (o1) {
                 CHECK(WAIT_FOR(o1, m->authed && oc_model_channel((oc_model *)m, 1) != NULL));
-                /* Take the daemon down, wait for the client to notice, then compose. */
                 arg.stop = 1;
                 pthread_join(th, NULL);
                 CHECK(WAIT_FOR(o1, !m->connected));
-                oc_client_send(o1, 1, "queued while offline");
-                oc_client_stop(o1);   /* the send is flushed to the outbox on close */
+                oc_client_send(o1, 1, "queued while offline");   /* -> in-memory outbox */
+
+                /* Bring the daemon back; the same client reconnects and flushes. */
+                arg.stop = 0;
+                CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
+                wait_port_ready(arg.port);
+                oc_client_reconnect(o1);
+                CHECK(WAIT_FOR(o1, m->authed));
+                CHECK(WAIT_FOR(o1, channel_has_body(m, 1, "queued while offline")));
+                oc_client_stop(o1);
             }
-            /* Bring the daemon back and relaunch: the outbox flush delivers it. */
-            arg.stop = 0;
-            CHECK(pthread_create(&th, NULL, core_loop_thread, &arg) == 0);
-            wait_port_ready(arg.port);
-            oc_client *o2 = oc_client_start_stored("127.0.0.1", arg.port, "faye:pw-faye", op);
-            CHECK(o2 != NULL);
-            if (o2) {
-                CHECK(WAIT_FOR(o2, m->authed));
-                CHECK(WAIT_FOR(o2, channel_has_body(m, 1, "queued while offline")));
-                oc_client_stop(o2);
-            }
-            unlink(op); unlink("build/itest_core_outbox.db-wal"); unlink("build/itest_core_outbox.db-shm");
         }
     } else {
         if (a) oc_client_stop(a);

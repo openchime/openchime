@@ -17,12 +17,20 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/* Enumeration callback: one `account` per stored entry for this service. */
+typedef void (*oc_secret_each_cb)(void *ud, const char *account);
+
 typedef struct oc_secret {
     /* Fill `out` (up to `cap`) with the secret bytes for `account`, set *len, and
      * return 1 if found; return 0 if absent or on error. */
     int  (*get)(void *ctx, const char *account, uint8_t *out, size_t cap, size_t *len);
     int  (*put)(void *ctx, const char *account, const uint8_t *val, size_t len);
     void (*del)(void *ctx, const char *account);
+    /* List every account this service has stored. Optional (NULL = the backend
+     * cannot enumerate); returns 1 if it did. This is what lets the workspace
+     * book live in the credential store rather than a file — the list of
+     * workspaces IS the list of credentials. */
+    int  (*each)(void *ctx, oc_secret_each_cb cb, void *ud);
     void (*close)(void *ctx);
     void *ctx;
 } oc_secret;
@@ -36,6 +44,9 @@ static inline int oc_secret_put(oc_secret *s, const char *a, const uint8_t *v, s
 }
 static inline void oc_secret_del(oc_secret *s, const char *a) {
     if (s && s->del) s->del(s->ctx, a);
+}
+static inline int oc_secret_each(oc_secret *s, oc_secret_each_cb cb, void *ud) {
+    return (s && s->each) ? s->each(s->ctx, cb, ud) : 0;
 }
 static inline void oc_secret_free(oc_secret *s) {
     if (s) { if (s->close) s->close(s->ctx); free(s); }

@@ -1355,17 +1355,16 @@ static const char *resolve_store_path(void) {
     if (!home || !home[0]) return NULL;
     static char path[1200];
     char dir[1024];
-    snprintf(dir, sizeof dir, "%s/.local", home);            oc_mkdir(dir);
-    snprintf(dir, sizeof dir, "%s/.local/state", home);      oc_mkdir(dir);
-    snprintf(dir, sizeof dir, "%s/.local/state/openchime", home); oc_mkdir(dir);
+    /* Not created: the client writes nothing to disk (ARCH-88). */
+    snprintf(dir, sizeof dir, "%s/.local/state/openchime", home);
     /* An orphaned state.db from a pre-ARCH-88 build has no reader left; delete it
      * rather than leave a stale cache — and a stale token — on disk. */
     char old[1200];
     snprintf(old, sizeof old, "%s/state.db", dir);     remove(old);
     snprintf(old, sizeof old, "%s/state.db-wal", dir); remove(old);
     snprintf(old, sizeof old, "%s/state.db-shm", dir); remove(old);
+    /* Vestigial: nothing is written here any more (ARCH-88). */
     snprintf(path, sizeof path, "%s/state", dir);
-    oc_mkdir(path);
     return path;
 }
 
@@ -1501,6 +1500,7 @@ static void remember_workspace(const char *key, const char *label, const char *u
     if (!g_store_path) return;
     oc_store *s = oc_store_open(g_store_path);
     if (!s) return;
+    oc_store_set_secret(s, g_secret);
     oc_store_workspace_remember(s, key, label, user, (uint64_t)time(NULL) * 1000);
     oc_store_close(s);
 }
