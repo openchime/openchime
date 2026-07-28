@@ -247,7 +247,14 @@ static int g_n_drafts;
 #define THUMB_H 160.0f
 #define THUMB_W 260.0f
 enum { THUMB_CACHE = 32 };
-static struct { uint64_t id; ID2D1Bitmap *bmp; } g_thumbs[THUMB_CACHE];
+/* Dimensions are captured at decode time from WIC rather than read back with
+ * ID2D1Bitmap_GetSize(). That method returns a struct by value and mingw's C
+ * binding disagrees with the callee about how: the size is written through a
+ * bogus hidden return pointer, which landed inside THIS array and clobbered an
+ * id. Every lookup then missed, and every miss triggered another fetch — the
+ * image rendered once and then flickered back to "loading" for good.
+ * IWICBitmapSource_GetSize takes explicit out-params and has no such hazard. */
+static struct { uint64_t id; ID2D1Bitmap *bmp; UINT w, h; } g_thumbs[THUMB_CACHE];
 static int      g_n_thumbs;
 /* A D2D bitmap belongs to the render target that created it; drawing it into
  * another one fails the whole frame, and the test harness renders the same scene
@@ -271,10 +278,15 @@ static int mime_is_image(const char *mime) {
                     strcmp(mime, "image/webp") == 0);
 }
 
-static ID2D1Bitmap *thumb_get(ID2D1RenderTarget *rt, uint64_t id) {
+static ID2D1Bitmap *thumb_get(ID2D1RenderTarget *rt, uint64_t id, UINT *w, UINT *h) {
     (void)rt;
     if (g_thumbs_off) return NULL;
-    for (int i = 0; i < g_n_thumbs; i++) if (g_thumbs[i].id == id) return g_thumbs[i].bmp;
+    for (int i = 0; i < g_n_thumbs; i++)
+        if (g_thumbs[i].id == id) {
+            if (w) *w = g_thumbs[i].w;
+            if (h) *h = g_thumbs[i].h;
+            return g_thumbs[i].bmp;
+        }
     return NULL;
 }
 static int thumb_failed(uint64_t id) {
@@ -1465,19 +1477,17 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
     for (int i = 0; i < msg->n_attach; i++) {
         const oc_attachment *at = &msg->attach[i];
         if (!at->reclaimed && mime_is_image(at->mime)) {
-            ID2D1Bitmap *bmp = thumb_get(rt, at->id);
+            UINT iw = 0, ih = 0;
+            ID2D1Bitmap *bmp = thumb_get(rt, at->id, &iw, &ih);
             float bw = THUMB_W, bh = THUMB_H;
             if (bmp) {
                 /* Fit inside the box and never upscale: the box is a maximum,
                  * not a target, and a 40px icon blown up to 260 looks broken. */
-                /* The C binding returns the struct rather than taking an out
-                 * pointer, unlike most of D2D's C surface. */
-                D2D1_SIZE_F sz = ID2D1Bitmap_GetSize(bmp);
-                if (sz.width > 0 && sz.height > 0) {
-                    float sc = THUMB_W / sz.width;
-                    if (THUMB_H / sz.height < sc) sc = THUMB_H / sz.height;
+                if (iw > 0 && ih > 0) {
+                    float sc = THUMB_W / (float)iw;
+                    if (THUMB_H / (float)ih < sc) sc = THUMB_H / (float)ih;
                     if (sc > 1.0f) sc = 1.0f;
-                    bw = sz.width * sc; bh = sz.height * sc;
+                    bw = (float)iw * sc; bh = (float)ih * sc;
                 }
                 D2D1_RECT_F dst = rf(tx, by + 3, tx + bw, by + 3 + bh);
                 ID2D1RenderTarget_DrawBitmap(rt, bmp, &dst, 1.0f,
@@ -3368,6 +3378,7 @@ static void thumb_decode(uint64_t id, const uint8_t *data, size_t len) {
                                 &IID_IWICImagingFactory, (void **)&g_wic)))
         return;
 
+    UINT iw = 0, ih = 0;
     IWICStream *stream = NULL;
     IWICBitmapDecoder *dec = NULL;
     IWICBitmapFrameDecode *frame = NULL;
@@ -3385,6 +3396,7 @@ static void thumb_decode(uint64_t id, const uint8_t *data, size_t len) {
                                                  &GUID_WICPixelFormat32bppPBGRA,
                                                  WICBitmapDitherTypeNone, NULL, 0.0,
                                                  WICBitmapPaletteTypeMedianCut))) {
+        IWICBitmapSource_GetSize((IWICBitmapSource *)conv, &iw, &ih);
         ID2D1RenderTarget_CreateBitmapFromWicBitmap((ID2D1RenderTarget *)g_rt,
                                                     (IWICBitmapSource *)conv, NULL, &bmp);
     }
@@ -3404,6 +3416,8 @@ static void thumb_decode(uint64_t id, const uint8_t *data, size_t len) {
     }
     g_thumbs[g_n_thumbs].id = id;
     g_thumbs[g_n_thumbs].bmp = bmp;
+    g_thumbs[g_n_thumbs].w = iw;
+    g_thumbs[g_n_thumbs].h = ih;
     g_n_thumbs++;
 }
 
@@ -5044,8 +5058,11 @@ static void test_dump(const char *path) {
                         dc->msgs[i].attach[k].filename, dc->msgs[i].attach[k].mime,
                         dc->msgs[i].attach[k].reclaimed);
     }
-    fprintf(f, "thumb_pending=%llu n_thumbs=%d n_missing=%d\n",
-            (unsigned long long)g_thumb_pending, g_n_thumbs, g_n_thumb_missing);
+    fprintf(f, "thumb_pending=%llu n_thumbs=%d n_missing=%d off=%d\n",
+            (unsigned long long)g_thumb_pending, g_n_thumbs, g_n_thumb_missing, g_thumbs_off);
+    for (int i = 0; i < g_n_thumbs; i++)
+        fprintf(f, "  thumb[%d] id=%llu bmp=%p\n", i,
+                (unsigned long long)g_thumbs[i].id, (void *)g_thumbs[i].bmp);
     fprintf(f, "unread_from=%llu unread_chan=%llu unread_count=%d\n",
             (unsigned long long)g_unread_from, (unsigned long long)g_unread_chan, g_unread_count);
     for (size_t i = 0; i < m->n_channels; i++)
