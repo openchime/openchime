@@ -1652,6 +1652,9 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             ents[i].is_public = r->chlist[i].is_public;
             ents[i].joined = r->chlist[i].joined;
             ents[i].kind = r->chlist[i].kind;
+            ents[i].last_message_at = r->chlist[i].last_message_at;
+            ents[i].unread = r->chlist[i].unread;
+            ents[i].peer_id = r->chlist[i].peer_id;
         }
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_channel_list cl = { (uint16_t)n, ents };

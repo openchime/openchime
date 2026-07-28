@@ -60,6 +60,11 @@ typedef struct {
     uint64_t high_water;   /* dedup mark: ignore message_id <= this (ARCH-45) */
     uint64_t read_marker;  /* high_water as of the last mark-read; drives unread */
     int      unread;       /* messages from others since the last mark-read */
+    /* Server-reported, from CHANNEL_LIST — the only activity a cache-less client
+     * (ARCH-88) knows about a channel it has not opened. `srv_unread` seeds the
+     * badge before any backfill; `last_message_at` drives Recency sorting. */
+    uint64_t last_message_at;
+    uint32_t srv_unread;
     uint8_t  joined;
     uint8_t  history_requested; /* a backfill has been asked for (once per open) */
     uint8_t  kind;             /* OC_CHANNEL_KIND / _DM */
@@ -184,6 +189,53 @@ void oc_model_apply(oc_model *m, oc_ev *e);
 
 /* Find a channel by id, or NULL. */
 oc_channel *oc_model_channel(oc_model *m, uint64_t channel_id);
+
+/* ---- the sidebar (WIN-5/6) --------------------------------------------------
+ * Grouping, filtering, sorting and collapse are IDENTICAL in every frontend, so
+ * they live here rather than being written twice (ARCH-74: the core holds the
+ * logic, a frontend is view + input). A frontend asks for the rows and draws
+ * them; it does not decide what belongs where.
+ *
+ * Two sections, matching Slack: Channels (public and private together, the
+ * private ones marked) and Direct messages. A DM has no name on the wire — the
+ * daemon stores NULL (kind='dm') — so a row carries a rendered `label` and a
+ * frontend must never filter on `name`. */
+enum { OC_SB_CHANNELS = 0, OC_SB_DMS = 1, OC_SB_SECTIONS = 2 };
+enum { OC_SB_SORT_AZ = 0, OC_SB_SORT_RECENT, OC_SB_SORT_UNREAD };
+enum { OC_SB_FILTER_ALL = 0, OC_SB_FILTER_UNREAD, OC_SB_FILTER_ACTIVE };
+
+typedef struct {
+    uint8_t  sort[OC_SB_SECTIONS];       /* OC_SB_SORT_*   , per section */
+    uint8_t  filter[OC_SB_SECTIONS];     /* OC_SB_FILTER_* , per section */
+    uint8_t  collapsed[OC_SB_SECTIONS];  /* 1 = show the header only */
+    char     find[64];                   /* "Find a conversation" text, lowercased */
+} oc_sidebar_opts;
+
+typedef struct {
+    uint8_t  is_header;      /* a section header row */
+    uint8_t  section;        /* OC_SB_CHANNELS / OC_SB_DMS */
+    uint64_t channel_id;     /* 0 on a header */
+    char     label[96];      /* rendered: "general", or a DM peer's name */
+    uint8_t  is_private;     /* draw a lock */
+    uint8_t  joined;
+    int      unread;
+    int      section_total;  /* header rows: how many children (before collapse) */
+} oc_sidebar_row;
+
+/* Build the sidebar. Returns the row count written to `out` (capped by `cap`).
+ * Headers are emitted even when a section is empty or collapsed, so the user can
+ * always expand it again. */
+size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
+                        oc_sidebar_row *out, size_t cap);
+
+/* Default options: both sections open, A-Z, unfiltered. */
+void oc_sidebar_opts_defaults(oc_sidebar_opts *o);
+
+/* Serialize/parse the options for the daemon's client_settings bucket, so the
+ * choice survives a restart without the client storing anything (ARCH-88).
+ * Format is a compact "c:s,f,x;d:s,f,x" so one setting key carries all of it. */
+void oc_sidebar_opts_encode(const oc_sidebar_opts *o, char *out, size_t cap);
+void oc_sidebar_opts_parse(oc_sidebar_opts *o, const char *s);
 /* Clear a channel's unread count and advance its read marker to high_water. */
 void oc_model_mark_read(oc_model *m, uint64_t channel_id);
 

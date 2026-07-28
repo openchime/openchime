@@ -394,7 +394,9 @@ reject (bad version, expired session) ends the loop instead of retrying. The net
 per-channel high-water for the reconnect cursors; a headless test bounces the
 daemon and asserts the client re-auths, keeps its history, and can send again.
 While backing off, the status line counts the wait down (`connection lost —
-reconnecting in Ns… (^R to retry now)`), and `oc_client_reconnect` (bound to
+reconnecting in Ns…`; the TUI appends its own `(Ctrl+R to retry now)`, since a
+keybinding belongs to a frontend and not the shared core), and
+`oc_client_reconnect` (bound to
 `Ctrl+R` in the TUI) cuts the current sleep short to retry immediately.
 
 **Cross-restart reconnect is built too (via the §5 store).** The net thread

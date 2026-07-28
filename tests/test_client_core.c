@@ -227,6 +227,74 @@ static const unsigned char SRV_ANSWER[] = {
     0x03,'s','r','v', 0x04,'a','c','m','e', 0x03,'c','o','m', 0x00       /* target srv.acme.com */
 };
 
+/* The sidebar helper (WIN-5/6): grouping, filter, sort, collapse — shared by
+ * every frontend so the TUI and the GUI cannot disagree about what belongs
+ * where. Built against a hand-made model, no daemon needed. */
+static void test_sidebar(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+
+    /* Two named channels (one private), plus a DM — which has NO name on the
+     * wire, the case that made DMs invisible in the Win32 sidebar. */
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 10; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("zulu");   e.server_time = 100; oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 11; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 0; e.body = strdup("alpha");  e.server_time = 300; oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 12; e.status = 1; e.op = OC_CHANNEL_KIND_DM;
+    e.user_id = 2; e.server_time = 200; e.count = 3; oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob"); oc_model_apply(&m, &e);
+
+    oc_sidebar_opts o; oc_sidebar_opts_defaults(&o);
+    oc_sidebar_row rows[16];
+
+    /* Two headers; channels A-Z; the DM titled by its peer, not skipped. */
+    size_t n = oc_model_sidebar(&m, &o, rows, 16);
+    CHECK(n == 5);
+    CHECK(rows[0].is_header && rows[0].section == OC_SB_CHANNELS && rows[0].section_total == 2);
+    CHECK(strcmp(rows[1].label, "alpha") == 0 && rows[1].is_private == 1);
+    CHECK(strcmp(rows[2].label, "zulu") == 0  && rows[2].is_private == 0);
+    CHECK(rows[3].is_header && rows[3].section == OC_SB_DMS);
+    CHECK(strcmp(rows[4].label, "bob") == 0 && rows[4].unread == 3);
+
+    /* Recency uses the server-reported last_message_at: alpha(300) before zulu(100). */
+    o.sort[OC_SB_CHANNELS] = OC_SB_SORT_RECENT;
+    n = oc_model_sidebar(&m, &o, rows, 16);
+    CHECK(strcmp(rows[1].label, "alpha") == 0 && strcmp(rows[2].label, "zulu") == 0);
+
+    /* Collapsing keeps the header (so it can be reopened) and drops the children. */
+    o.collapsed[OC_SB_CHANNELS] = 1;
+    n = oc_model_sidebar(&m, &o, rows, 16);
+    CHECK(n == 3 && rows[0].is_header && rows[0].section_total == 2);
+    o.collapsed[OC_SB_CHANNELS] = 0;
+
+    /* Unread-only hides the read channels but keeps the unread DM. */
+    o.filter[OC_SB_CHANNELS] = OC_SB_FILTER_UNREAD;
+    n = oc_model_sidebar(&m, &o, rows, 16);
+    CHECK(n == 3 && rows[1].is_header && strcmp(rows[2].label, "bob") == 0);
+    o.filter[OC_SB_CHANNELS] = OC_SB_FILTER_ALL;
+
+    /* Find matches the rendered LABEL, so a DM (which has no name) is findable. */
+    snprintf(o.find, sizeof o.find, "bo");
+    n = oc_model_sidebar(&m, &o, rows, 16);
+    CHECK(n == 3 && strcmp(rows[2].label, "bob") == 0);
+    o.find[0] = '\0';
+
+    /* Options round-trip through the settings bucket (ARCH-88: no local file). */
+    o.sort[OC_SB_DMS] = OC_SB_SORT_UNREAD; o.collapsed[OC_SB_DMS] = 1;
+    char enc[64]; oc_sidebar_opts_encode(&o, enc, sizeof enc);
+    oc_sidebar_opts p2; oc_sidebar_opts_defaults(&p2);
+    oc_sidebar_opts_parse(&p2, enc);
+    CHECK(p2.sort[OC_SB_DMS] == OC_SB_SORT_UNREAD && p2.collapsed[OC_SB_DMS] == 1);
+    CHECK(p2.sort[OC_SB_CHANNELS] == OC_SB_SORT_RECENT);
+
+    oc_model_free(&m);
+}
+
 static void test_resolve(void) {
     char d[256];
     /* Bare name gets the suffix; a dotted name passes through; no suffix = as-is. */
@@ -467,8 +535,9 @@ static void test_secret_routing(void) {
 }
 
 int run_client_core_tests(void) {
-    printf("test_client_core: resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, client-settings, profile, seen-by, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox\n");
+    printf("test_client_core: sidebar, resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, client-settings, profile, seen-by, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox\n");
 
+    test_sidebar();
     test_resolve();
     test_last_error();
     test_secret_routing();

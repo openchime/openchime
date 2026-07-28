@@ -409,6 +409,10 @@ void oc_client_logout(oc_client *c, uint8_t scope) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+int oc_client_outbox_pending(oc_client *c) {
+    return c ? oc_net_outbox_pending(c->net) : 0;
+}
+
 void oc_client_reconnect(oc_client *c) {
     if (c) oc_net_reconnect(c->net);
 }

@@ -522,6 +522,13 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             c->kind = e->op;                     /* channel vs DM */
             c->is_public = e->is_public;         /* public vs private (REQ-031) */
             if (e->user_id) c->peer_id = e->user_id;   /* DM peer (CHANNEL_INFO only) */
+            if (e->server_time) c->last_message_at = e->server_time;
+            if (e->count) {
+                c->srv_unread = e->count;
+                /* Before any backfill the server's count is all we know, so let
+                 * it seed the badge; live BROADCASTs take over from there. */
+                if (c->unread == 0) c->unread = (int)e->count;
+            }
             if (e->body) { free(c->name); c->name = e->body; e->body = NULL; }
         }
         break;
@@ -730,4 +737,132 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     default:
         break;
     }
+}
+
+/* ---- the sidebar (WIN-5/6, see model.h) ------------------------------------ */
+
+void oc_sidebar_opts_defaults(oc_sidebar_opts *o) {
+    memset(o, 0, sizeof *o);
+    for (int i = 0; i < OC_SB_SECTIONS; i++) {
+        o->sort[i] = OC_SB_SORT_AZ;
+        o->filter[i] = OC_SB_FILTER_ALL;
+        o->collapsed[i] = 0;
+    }
+}
+
+void oc_sidebar_opts_encode(const oc_sidebar_opts *o, char *out, size_t cap) {
+    snprintf(out, cap, "c:%u,%u,%u;d:%u,%u,%u",
+             o->sort[OC_SB_CHANNELS], o->filter[OC_SB_CHANNELS], o->collapsed[OC_SB_CHANNELS],
+             o->sort[OC_SB_DMS],      o->filter[OC_SB_DMS],      o->collapsed[OC_SB_DMS]);
+}
+
+void oc_sidebar_opts_parse(oc_sidebar_opts *o, const char *s) {
+    unsigned cs, cf, cc, ds, df, dc;
+    if (!s || !*s) return;
+    if (sscanf(s, "c:%u,%u,%u;d:%u,%u,%u", &cs, &cf, &cc, &ds, &df, &dc) != 6) return;
+    /* Clamp: a bucket value can come from a newer client that knows more modes. */
+    o->sort[OC_SB_CHANNELS]      = (uint8_t)(cs <= OC_SB_SORT_UNREAD ? cs : OC_SB_SORT_AZ);
+    o->filter[OC_SB_CHANNELS]    = (uint8_t)(cf <= OC_SB_FILTER_ACTIVE ? cf : OC_SB_FILTER_ALL);
+    o->collapsed[OC_SB_CHANNELS] = (uint8_t)(cc ? 1 : 0);
+    o->sort[OC_SB_DMS]           = (uint8_t)(ds <= OC_SB_SORT_UNREAD ? ds : OC_SB_SORT_AZ);
+    o->filter[OC_SB_DMS]         = (uint8_t)(df <= OC_SB_FILTER_ACTIVE ? df : OC_SB_FILTER_ALL);
+    o->collapsed[OC_SB_DMS]      = (uint8_t)(dc ? 1 : 0);
+}
+
+/* Render a channel's sidebar label. A DM has no name on the wire, so it is
+ * titled by its peer — which is exactly why the old Win32 sidebar, which skipped
+ * unnamed channels, showed no DMs at all. */
+static void sb_label(const oc_model *m, const oc_channel *c, char *out, size_t cap) {
+    if (c->kind == OC_CHANNEL_KIND_DM) {
+        const char *pn = (c->peer_id == m->user_id) ? "you" : oc_model_user_name(m, c->peer_id);
+        snprintf(out, cap, "%s", (pn && pn[0]) ? pn : "direct message");
+    } else {
+        snprintf(out, cap, "%s", (c->name && c->name[0]) ? c->name : "channel");
+    }
+}
+
+static void sb_lower(const char *in, char *out, size_t cap) {
+    size_t i = 0;
+    for (; in[i] && i < cap - 1; i++)
+        out[i] = (char)(in[i] >= 'A' && in[i] <= 'Z' ? in[i] + 32 : in[i]);
+    out[i] = '\0';
+}
+
+/* Sorting works over (timestamp, row) pairs so Recency has the field it needs;
+ * the active mode is file-static because C99 qsort passes no context. */
+typedef struct { uint64_t at; oc_sidebar_row row; } sb_tmp;
+static uint8_t g_sb_sort;
+static int sb_cmp(const void *va, const void *vb) {
+    const sb_tmp *a = va, *b = vb;
+    if (g_sb_sort == OC_SB_SORT_RECENT) {
+        /* Newest first; a channel the server reports no activity for (0) sinks to
+         * the bottom rather than jumbling in with the rest. */
+        if (a->at != b->at) return a->at > b->at ? -1 : 1;
+    } else if (g_sb_sort == OC_SB_SORT_UNREAD) {
+        int au = a->row.unread > 0, bu = b->row.unread > 0;
+        if (au != bu) return bu - au;
+    }
+    return strcmp(a->row.label, b->row.label);   /* A-Z, and the tiebreak for both */
+}
+
+size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
+                        oc_sidebar_row *out, size_t cap) {
+    if (!m || !o || !out || cap == 0) return 0;
+    size_t n = 0;
+
+    for (int sec = 0; sec < OC_SB_SECTIONS; sec++) {
+        /* Collect this section's rows, with the timestamp alongside for sorting. */
+        sb_tmp *tmp = calloc(m->n_channels + 1, sizeof *tmp);
+        size_t tn = 0, total = 0;
+        for (size_t i = 0; tmp && i < m->n_channels; i++) {
+            const oc_channel *c = &m->channels[i];
+            int is_dm = (c->kind == OC_CHANNEL_KIND_DM);
+            if ((sec == OC_SB_DMS) != is_dm) continue;
+            /* A named channel the user has not joined is browsable, not listed. */
+            if (!is_dm && (!c->name || !c->name[0])) continue;
+            total++;
+
+            char label[96];
+            sb_label(m, c, label, sizeof label);
+
+            if (o->find[0]) {                     /* match the LABEL, not the name */
+                char low[96]; sb_lower(label, low, sizeof low);
+                if (!strstr(low, o->find)) continue;
+            }
+            if (o->filter[sec] == OC_SB_FILTER_UNREAD && c->unread <= 0) continue;
+            if (o->filter[sec] == OC_SB_FILTER_ACTIVE) {
+                /* Channels: joined ones. DMs: a peer who is not offline. */
+                if (is_dm) {
+                    if (oc_model_presence_of(m, c->peer_id) == OC_PRESENCE_OFFLINE) continue;
+                } else if (!c->joined) continue;
+            }
+
+            tmp[tn].at = c->last_message_at;
+            tmp[tn].row.is_header  = 0;
+            tmp[tn].row.section    = (uint8_t)sec;
+            tmp[tn].row.channel_id = c->channel_id;
+            snprintf(tmp[tn].row.label, sizeof tmp[tn].row.label, "%s", label);
+            tmp[tn].row.is_private = (uint8_t)(!is_dm && !c->is_public);
+            tmp[tn].row.joined     = c->joined;
+            tmp[tn].row.unread     = c->unread;
+            tn++;
+        }
+
+        if (tn > 1) { g_sb_sort = o->sort[sec]; qsort(tmp, tn, sizeof *tmp, sb_cmp); }
+
+        /* Header first, always — a collapsed or empty section must stay openable. */
+        if (n < cap) {
+            oc_sidebar_row *h = &out[n++];
+            memset(h, 0, sizeof *h);
+            h->is_header = 1;
+            h->section = (uint8_t)sec;
+            snprintf(h->label, sizeof h->label, "%s",
+                     sec == OC_SB_CHANNELS ? "Channels" : "Direct messages");
+            h->section_total = (int)total;
+        }
+        if (!o->collapsed[sec])
+            for (size_t i = 0; i < tn && n < cap; i++) out[n++] = tmp[i].row;
+        free(tmp);
+    }
+    return n;
 }

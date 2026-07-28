@@ -37,4 +37,8 @@ void oc_net_set_client_type(oc_net *n, const char *client_type);
 /* Signal the thread to stop, join it, and free. */
 void oc_net_stop(oc_net *n);
 
+/* Sends queued in the in-memory outbox but not yet acked (REQ-102/ARCH-88).
+ * Safe from the UI thread: the net thread only ever publishes a count here. */
+int oc_net_outbox_pending(oc_net *n);
+
 #endif /* OC_NET_H */

@@ -1479,7 +1479,19 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
         "SELECT c.id, c.name, c.is_public, "
-        "  EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1), c.kind "
+        "  EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1), c.kind, "
+        /* Newest top-level message, and how many the user has not acked (REQ-090)
+         * — so a cache-less client can sort and badge the sidebar immediately. */
+        "  (SELECT COALESCE(MAX(x.created_at_ms),0) FROM messages x "
+        "     WHERE x.channel_id=c.id AND x.parent_id IS NULL), "
+        "  (SELECT COUNT(*) FROM messages x "
+        "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.author_id<>?1 "
+        "       AND x.id > COALESCE((SELECT dc.message_id FROM delivery_cursors dc "
+        "                             WHERE dc.user_id=?1 AND dc.channel_id=c.id),0)), "
+        /* A DM has no name; the client titles it by its peer, so send that too —
+         * otherwise a cache-less client shows "direct message" until it opens one. */
+        "  COALESCE((SELECT m2.user_id FROM channel_members m2 "
+        "              WHERE m2.channel_id=c.id AND m2.user_id<>?1 LIMIT 1), ?1) "
         "FROM channels c WHERE "
         "  (c.kind='channel' AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1))) "
         "  OR (c.kind='dm' AND EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1)) "
@@ -1497,6 +1509,9 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         arr[n].is_public  = (uint8_t)(sqlite3_column_int(st, 2) != 0);
         arr[n].joined     = (uint8_t)(sqlite3_column_int(st, 3) != 0);
         arr[n].kind       = (kn && strcmp((const char *)kn, "dm") == 0) ? OC_CHANNEL_KIND_DM : OC_CHANNEL_KIND;
+        arr[n].last_message_at = (uint64_t)sqlite3_column_int64(st, 5);
+        arr[n].unread          = (uint32_t)sqlite3_column_int64(st, 6);
+        arr[n].peer_id         = (uint64_t)sqlite3_column_int64(st, 7);
         n++;
     }
     sqlite3_finalize(st);

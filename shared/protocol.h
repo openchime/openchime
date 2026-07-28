@@ -374,7 +374,14 @@ typedef struct { uint64_t channel_id; uint8_t kind; oc_slice name; uint8_t is_pu
                  uint64_t peer_id; } oc_channel_info;  /* peer_id: for a DM (kind=1), the other participant; optional trailing */
 typedef struct { uint64_t channel_id; } oc_channel_ref;                       /* JOIN / LEAVE */
 typedef struct { uint64_t channel_id; uint64_t user_id; } oc_channel_member_op; /* INVITE / REMOVE */
-typedef struct { uint64_t channel_id; oc_slice name; uint8_t is_public; uint8_t joined; uint8_t kind; } oc_channel_list_entry;
+/* CHANNEL_LIST entry. `last_message_at`/`unread` were added 2026-07-27 so a
+ * client that keeps no local cache (ARCH-88) can order and badge the sidebar on
+ * first paint rather than only after backfill. This amends the v1 layout in
+ * place rather than riding a trailing block, because the entries are packed
+ * sequentially and r_done() rejects leftover bytes — and client and daemon ship
+ * from this one file (ARCH-61), so they change together. */
+typedef struct { uint64_t channel_id; oc_slice name; uint8_t is_public; uint8_t joined; uint8_t kind;
+                 uint64_t last_message_at; uint32_t unread; uint64_t peer_id; } oc_channel_list_entry;
 typedef struct { uint64_t user_id; } oc_open_dm;
 /* Incoming-webhook management (REQ-170). CREATE_WEBHOOK asks for a token scoped
  * to a channel; WEBHOOK_INFO returns the id + the raw 32-byte token (shown once,

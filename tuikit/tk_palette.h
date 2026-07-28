@@ -17,7 +17,7 @@ typedef struct {
     const char *section;   /* group label; consecutive items sharing it are grouped */
     const char *label;
     const char *desc;      /* optional gray secondary text */
-    const char *keyhint;   /* optional right-aligned accelerator, e.g. "^F" */
+    const char *keyhint;   /* optional right-aligned accelerator, e.g. "Ctrl+F" */
     int         id;        /* returned on select */
 } tk_pal_item;
 

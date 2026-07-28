@@ -522,6 +522,9 @@ oc_result oc_encode_channel_list(oc_wbuf *w, uint16_t version, const oc_channel_
         oc_w_u8(w, m->entries[i].is_public);
         oc_w_u8(w, m->entries[i].joined);
         oc_w_u8(w, m->entries[i].kind);
+        oc_w_u64(w, m->entries[i].last_message_at);
+        oc_w_u32(w, m->entries[i].unread);
+        oc_w_u64(w, m->entries[i].peer_id);
     }
     return oc_frame_end(w, off);
 }
@@ -1431,12 +1434,18 @@ oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries,
         uint8_t is_public = oc_r_u8(p);
         uint8_t joined = oc_r_u8(p);
         uint8_t kind = oc_r_u8(p);
+        uint64_t last_at = oc_r_u64(p);
+        uint32_t unread = oc_r_u32(p);
+        uint64_t peer = oc_r_u64(p);
         if (i < cap) {
             entries[i].channel_id = id;
             entries[i].name = name;
             entries[i].is_public = is_public;
             entries[i].joined = joined;
             entries[i].kind = kind;
+            entries[i].last_message_at = last_at;
+            entries[i].unread = unread;
+            entries[i].peer_id = peer;
         }
     }
     return r_done(p);

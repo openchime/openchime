@@ -233,6 +233,12 @@ typedef struct {
     uint8_t  is_public;
     uint8_t  joined;     /* 1 if the requesting user is a member */
     uint8_t  kind;       /* OC_CHANNEL_KIND / OC_CHANNEL_KIND_DM */
+    /* Sidebar ordering + badging for a client that caches nothing (ARCH-88):
+     * the newest top-level message's time, and how many of them sit past this
+     * user's delivery cursor (REQ-090). Both are 0 for an empty channel. */
+    uint64_t last_message_at;
+    uint32_t unread;
+    uint64_t peer_id;    /* DM: the other participant, so a client can name it */
 } oc_channel_row;
 
 /* One row in a NOTIFY_PREFS result (REQ-130): a channel and its level. */

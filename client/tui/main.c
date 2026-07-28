@@ -998,7 +998,13 @@ static void render(oc_client *cl, size_t focus, const char *composer,
         }
         tk_text(cx, H - 3, W, nc > 1 ? "(Tab cycles)" : "(Tab)", TB_BLACK | TB_BOLD, TB_DEFAULT);
     } else {
-        char st[220]; snprintf(st, sizeof st, " %s%s", m->status[0] ? m->status : "", scroll > 0 ? "   [scrolled]" : "");
+        /* The core reports the state; the TUI appends its own retry chord, since
+         * the binding belongs to this frontend and not to the shared core. */
+        const char *retry = (!m->connected && strstr(m->status, "reconnecting"))
+                            ? "  (Ctrl+R to retry now)" : "";
+        char st[260];
+        snprintf(st, sizeof st, " %s%s%s", m->status[0] ? m->status : "", retry,
+                 scroll > 0 ? "   [scrolled]" : "");
         int sx = tk_text(0, H - 3, W, st, th->muted, TB_DEFAULT);
         if (fc) {
             uint64_t tp[8]; size_t nt = oc_model_typing(m, fc->channel_id, m->user_id, tp, 8);

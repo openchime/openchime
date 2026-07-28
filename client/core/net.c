@@ -50,6 +50,13 @@ struct oc_net {
 typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; char *body; } obox_row;
 typedef struct { obox_row *v; size_t n, cap; } obox;
 
+/* The UI thread must not walk the outbox (net-thread-owned), so the net thread
+ * publishes just its size here. A stale-by-one-tick read is fine: this drives a
+ * confirm-on-quit prompt, not a correctness decision. */
+static volatile int g_obox_pending;
+static void obox_publish(const obox *o) { g_obox_pending = (int)o->n; }
+int oc_net_outbox_pending(oc_net *n) { (void)n; return g_obox_pending; }
+
 static void obox_add(obox *o, const uint8_t idem[OC_IDEM_SIZE], uint64_t cid, const char *body) {
     for (size_t i = 0; i < o->n; i++)
         if (memcmp(o->v[i].idem, idem, OC_IDEM_SIZE) == 0) return;
@@ -63,6 +70,7 @@ static void obox_add(obox *o, const uint8_t idem[OC_IDEM_SIZE], uint64_t cid, co
     o->v[o->n].channel_id = cid;
     o->v[o->n].body = body ? strdup(body) : NULL;
     o->n++;
+    obox_publish(o);
 }
 static void obox_remove(obox *o, const uint8_t idem[OC_IDEM_SIZE]) {
     size_t w = 0;
@@ -71,10 +79,12 @@ static void obox_remove(obox *o, const uint8_t idem[OC_IDEM_SIZE]) {
         o->v[w++] = o->v[i];
     }
     o->n = w;
+    obox_publish(o);
 }
 static void obox_free(obox *o) {
     for (size_t i = 0; i < o->n; i++) free(o->v[i].body);
     free(o->v); o->v = NULL; o->n = o->cap = 0;
+    obox_publish(o);
 }
 
 /* The store-backed connection context (session token + TOFU pin persistence),
@@ -381,6 +391,10 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->status = ents[i].joined;
                 e->op = ents[i].kind;
                 e->is_public = ents[i].is_public;
+                /* Sidebar ordering + badging without a local cache (ARCH-88). */
+                e->server_time = ents[i].last_message_at;
+                e->count = ents[i].unread;
+                if (ents[i].kind == OC_CHANNEL_KIND_DM) e->user_id = ents[i].peer_id;
                 e->body = malloc(ents[i].name.len + 1);
                 if (e->body) { memcpy(e->body, ents[i].name.ptr, ents[i].name.len); e->body[ents[i].name.len] = '\0'; }
                 oc_queue_push(to_ui, e);
@@ -1316,7 +1330,11 @@ static void *net_thread(void *arg) {
         backoff_ms = served ? 500 : (backoff_ms ? (backoff_ms < 4000 ? backoff_ms * 2 : 4000) : 500);
         {
             char msg[96];
-            snprintf(msg, sizeof msg, "connection lost — reconnecting in %ds… (^R to retry now)",
+            /* State only, no keybinding: the core is frontend-agnostic, so each
+             * UI adds its own affordance (the TUI a Ctrl+R hint, the GUI its
+             * "Retry now" button). A TUI chord leaking into the GUI banner is
+             * what this used to do. */
+            snprintf(msg, sizeof msg, "connection lost — reconnecting in %ds…",
                      (backoff_ms + 999) / 1000);
             push_err(n->to_ui, msg);
         }

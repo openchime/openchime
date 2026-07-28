@@ -131,7 +131,20 @@ static WNDPROC  g_re_oldproc;
 static DWORD    g_last_typing;
 
 /* Sidebar row hit-boxes, captured during paint for WM_LBUTTONDOWN. */
-static struct { float top, bot; uint64_t cid; } g_rows[512];
+/* Sidebar rows come from the shared core helper (oc_model_sidebar), so the GUI
+ * and the TUI group, filter and sort identically. A row is either a section
+ * header or a conversation. */
+static struct { float top, bot; uint64_t cid; int header; int sec; } g_rows[512];
+static oc_sidebar_opts g_sb;          /* per-section sort/filter/collapse */
+static float g_sb_scroll, g_sb_content, g_sb_view;
+static int   g_sb_hover_sec = -1;     /* header hovered -> reveal its kebab */
+static D2D1_RECT_F g_sb_kebab;
+static int   g_sb_menu_sec = -1;
+static int   g_sb_settings_pending;   /* waiting for the synced prefs after auth */
+static void open_section_menu(HWND hwnd, int sec);
+static void sidebar_opts_save(void);
+static void sidebar_opts_load(const oc_model *m);
+#define SB_SETTING_KEY "sidebar"
 static int g_n_rows;
 
 /* Transcript message hit-boxes (context menu + text selection). bx/by = the body
@@ -184,7 +197,7 @@ static int g_n_moreflyrows;
  * g_mi[] + anchor; draw_menu() renders it last so it floats; on_click routes to
  * menu_dispatch(). Item kinds: ITEM (icon+label+cmd), SECTION (faint header),
  * SEP. MENU_WS/MENU_SWITCHER also draw a workspace header block on top. */
-enum { MENU_NONE = 0, MENU_WS, MENU_PROFILE, MENU_NEW, MENU_SWITCHER };
+enum { MENU_NONE = 0, MENU_WS, MENU_PROFILE, MENU_NEW, MENU_SWITCHER, MENU_SECTION };
 enum { MK_ITEM = 0, MK_SECTION, MK_SEP };
 struct menuitem { int kind, cmd, icon, danger; char label[72]; };
 static int   g_menu;                     /* which menu is open (MENU_NONE = none) */
@@ -835,50 +848,80 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     stroke_round(rt, fb, 8.0f, OC_COL_BORDER, 1.0f);
     draw_lucide(rt, OC_ICON_SEARCH, rf(fb.left + 8, fb.top + 7, fb.left + 24, fb.top + 23), OC_COL_MUTED);
 
-    /* "Channels" section label. */
-    D2D1_RECT_F sec = rf(RAIL_W + 16, HEADER_H + 46, RAIL_W + SIDEBAR_W - 12, HEADER_H + 68);
-    draw_text(rt, "CHANNELS", g_small, sec, OC_COL_FAINT);
+    /* Rows come from the core (oc_model_sidebar): grouping, filtering, sorting
+     * and collapse are decided there so both frontends agree. The DMs rail view
+     * shows only that section; Home shows both. */
+    oc_sidebar_opts o = g_sb;
+    snprintf(o.find, sizeof o.find, "%s", g_find_filter);
+    if (g_view == VIEW_DMS) o.collapsed[OC_SB_CHANNELS] = 1;
+    oc_sidebar_row rows[512];
+    size_t nrows = oc_model_sidebar(m, &o, rows, 512);
 
-    float y = HEADER_H + 72;
+    float top = HEADER_H + 46, bot = h;
+    g_sb_view = bot - top;
+    g_sb_content = (float)nrows * ROW_H;
+    /* Clamp before drawing, so a resize or a collapse cannot strand the list. */
+    float maxscroll = g_sb_content > g_sb_view ? g_sb_content - g_sb_view : 0;
+    if (g_sb_scroll > maxscroll) g_sb_scroll = maxscroll;
+    if (g_sb_scroll < 0) g_sb_scroll = 0;
+
+    float sx0 = RAIL_W + 8, sx1 = RAIL_W + SIDEBAR_W - 8;
+    float y = top - g_sb_scroll;
     g_n_rows = 0;
-    for (size_t i = 0; i < m->n_channels; i++) {
-        const oc_channel *c = &m->channels[i];
-        if (!c->name || !c->name[0]) continue;             /* unnamed = not listed yet */
-        if (g_find_filter[0]) {                            /* live filter */
-            char low[160]; size_t k = 0;
-            for (; c->name[k] && k < sizeof low - 1; k++)
-                low[k] = (char)(c->name[k] >= 'A' && c->name[k] <= 'Z' ? c->name[k] + 32 : c->name[k]);
-            low[k] = 0;
-            if (!strstr(low, g_find_filter)) continue;
+    g_sb_kebab = rf(0, 0, 0, 0);
+
+    for (size_t ri = 0; ri < nrows; ri++) {
+        const oc_sidebar_row *r = &rows[ri];
+        float ry = y; y += ROW_H;
+        if (ry + ROW_H < top || ry > bot) continue;          /* virtualized */
+
+        if (r->is_header) {
+            const char *chev = g_sb.collapsed[r->section] ? "\xE2\x96\xB8" : "\xE2\x96\xBE";
+            draw_text(rt, chev, g_small, rf(sx0 + 6, ry, sx0 + 22, ry + ROW_H), OC_COL_MUTED);
+            draw_text(rt, r->label, g_small, rf(sx0 + 22, ry, sx1 - 30, ry + ROW_H), OC_COL_FAINT);
+            if (g_sb_hover_sec == r->section || g_sb_menu_sec == r->section) {
+                g_sb_kebab = rf(sx1 - 26, ry + 4, sx1 - 6, ry + ROW_H - 4);
+                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+                draw_text(rt, "\xE2\x8B\xAF", g_small, g_sb_kebab, OC_COL_MUTED);
+                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+            }
+        } else {
+            int selected = (r->channel_id == g_sel);
+            int unread = r->unread > 0;
+            if (selected) fill_round(rt, rf(sx0, ry + 2, sx1, ry + ROW_H - 2), 6.0f, OC_COL_SELECT);
+            /* # public, lock private, @ DM — Slack's marks. */
+            const char *mark = r->section == OC_SB_DMS ? "@"
+                             : r->is_private ? "\xF0\x9F\x94\x92" : "#";
+            draw_text(rt, mark, g_ui, rf(sx0 + 12, ry, sx0 + 34, ry + ROW_H),
+                      selected ? OC_COL_TEXT : OC_COL_FAINT);
+            uint32_t fg = (selected || unread) ? OC_COL_TEXT : OC_COL_MUTED;
+            draw_text(rt, r->label, unread ? g_ui_b : g_ui,
+                      rf(sx0 + 34, ry, sx1 - 44, ry + ROW_H), fg);
+            if (unread) {
+                char badge[16]; snprintf(badge, sizeof badge, "%d", r->unread);
+                D2D1_RECT_F br = rf(sx1 - 40, ry + 6, sx1 - 10, ry + ROW_H - 6);
+                fill_round(rt, br, 9.0f, OC_COL_ACCENT);
+                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+                draw_text(rt, badge, g_small, br, 0xFFFFFF);
+                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+            }
         }
-        if (y > h) break;
-        float x0 = RAIL_W + 8, x1 = RAIL_W + SIDEBAR_W - 8;
-        int selected = (c->channel_id == g_sel);
-        int unread = c->unread > 0;
-
-        if (selected)
-            fill_round(rt, rf(x0, y + 2, x1, y + ROW_H - 2), 6.0f, OC_COL_SELECT);
-
-        char label[160];
-        channel_label(m, c, label, sizeof label);
-        D2D1_RECT_F lr = rf(x0 + 10, y, x1 - 44, y + ROW_H);
-        uint32_t fg = selected ? OC_COL_TEXT : (unread ? OC_COL_TEXT : OC_COL_MUTED);
-        draw_text(rt, label, unread ? g_ui_b : g_ui, lr, fg);
-
-        if (unread) {
-            char badge[16]; snprintf(badge, sizeof badge, "%d", c->unread);
-            D2D1_RECT_F br = rf(x1 - 40, y + 6, x1 - 10, y + ROW_H - 6);
-            fill_round(rt, br, 9.0f, OC_COL_ACCENT);
-            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-            draw_text(rt, badge, g_small, br, 0xFFFFFF);
-            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
-        }
-
         if (g_n_rows < (int)(sizeof g_rows / sizeof g_rows[0])) {
-            g_rows[g_n_rows].top = y; g_rows[g_n_rows].bot = y + ROW_H;
-            g_rows[g_n_rows].cid = c->channel_id; g_n_rows++;
+            g_rows[g_n_rows].top = ry; g_rows[g_n_rows].bot = ry + ROW_H;
+            g_rows[g_n_rows].cid = r->channel_id;
+            g_rows[g_n_rows].header = r->is_header;
+            g_rows[g_n_rows].sec = r->section;
+            g_n_rows++;
         }
-        y += ROW_H;
+    }
+
+    /* Scrollbar, only when there is overflow — the reason channels past the fold
+     * used to be unreachable (WIN-6). */
+    if (maxscroll > 0) {
+        float trackh = bot - top;
+        float th = trackh * (g_sb_view / g_sb_content); if (th < 24) th = 24;
+        float ty = top + (trackh - th) * (g_sb_scroll / maxscroll);
+        fill_round(rt, rf(sx1 + 2, ty, sx1 + 5, ty + th), 1.5f, OC_COL_BORDER);
     }
 }
 
@@ -1525,8 +1568,17 @@ static void draw_toasts(ID2D1RenderTarget *rt, float W, float H) {
         fill_round(rt, rf(r.left + 2, r.top + 3, r.right + 2, r.bottom + 3), 10.0f, OC_COL_RAIL);
         fill_round(rt, r, 10.0f, OC_COL_INPUT);
         stroke_round(rt, r, 10.0f, g_toast[i].danger ? OC_COL_DANGER : OC_COL_BORDER, 1.0f);
-        fill_round(rt, rf(r.left, r.top + 8, r.left + 3, r.bottom - 8), 2.0f,
-                   g_toast[i].danger ? OC_COL_DANGER : OC_COL_ACCENT);
+        /* Square off the LEFT edge so the accent reads as a flush status stripe
+         * rather than a rounded pill floating inside the card: patch over the two
+         * rounded left corners, restore the border along that patch, then run the
+         * stripe the full height of the edge. The right corners stay rounded. */
+        uint32_t accent = g_toast[i].danger ? OC_COL_DANGER : OC_COL_ACCENT;
+        float rad = 10.0f, bar = 4.0f;
+        fill(rt, rf(r.left, r.top, r.left + rad, r.bottom), OC_COL_INPUT);
+        uint32_t edge = g_toast[i].danger ? OC_COL_DANGER : OC_COL_BORDER;
+        fill(rt, rf(r.left, r.top, r.left + rad, r.top + 1), edge);
+        fill(rt, rf(r.left, r.bottom - 1, r.left + rad, r.bottom), edge);
+        fill(rt, rf(r.left, r.top, r.left + bar, r.bottom), accent);
         draw_text(rt, g_toast[i].text, g_small,
                   rf(r.left + 14, r.top + 6, r.right - 12, r.bottom - 6), OC_COL_TEXT);
         y -= TOAST_H + TOAST_GAP;
@@ -2241,6 +2293,13 @@ static int on_click(HWND hwnd, int x, int y) {
     if (in_rect(g_hdr_gear, x, y))    { open_ws_menu(hwnd); return 1; }
     if (in_rect(g_hdr_compose, x, y)) { open_new_menu(hwnd); return 1; }
     if (in_rect(g_ws_hdr_btn, x, y))  { open_ws_menu(hwnd); return 1; }
+    /* Section kebab -> that section's Filter/Sort menu. Slack's placement, and
+     * the right one: these are PER-SECTION settings, so a single header gear
+     * would have to ask which section you meant. */
+    if (g_sb_hover_sec >= 0 && in_rect(g_sb_kebab, x, y)) {
+        open_section_menu(hwnd, g_sb_hover_sec);
+        return 1;
+    }
     /* Members toggle. */
     if (in_rect(g_members_btn, x, y)) {
         g_show_members = !g_show_members;
@@ -2274,7 +2333,12 @@ static int on_click(HWND hwnd, int x, int y) {
     if (x >= RAIL_W && x <= RAIL_W + SIDEBAR_W) {
         for (int i = 0; i < g_n_rows; i++)
             if ((float)y >= g_rows[i].top && (float)y < g_rows[i].bot) {
-                if (g_rows[i].cid != g_sel) select_channel(g_rows[i].cid);
+                if (g_rows[i].header) {
+                    g_sb.collapsed[g_rows[i].sec] = (uint8_t)!g_sb.collapsed[g_rows[i].sec];
+                    sidebar_opts_save();
+                } else if (g_rows[i].cid != g_sel) {
+                    select_channel(g_rows[i].cid);
+                }
                 return 1;
             }
         return 1;
@@ -2397,7 +2461,9 @@ static void on_rclick(HWND hwnd, int x, int y) {
     if (x >= RAIL_W && x <= RAIL_W + SIDEBAR_W) {
         for (int i = 0; i < g_n_rows; i++)
             if ((float)y >= g_rows[i].top && (float)y < g_rows[i].bot) {
-                show_channel_menu(hwnd, m, g_rows[i].cid, pt.x, pt.y);
+                /* Right-clicking a header opens the same menu as its kebab. */
+                if (g_rows[i].header) open_section_menu(hwnd, g_rows[i].sec);
+                else show_channel_menu(hwnd, m, g_rows[i].cid, pt.x, pt.y);
                 return;
             }
         return;
@@ -2840,6 +2906,55 @@ static void open_new_menu(HWND hwnd) {
     if (g_menu_y < 8) g_menu_y = 8;
 }
 
+/* Sidebar prefs persist through the daemon's per-(user, client_type) settings
+ * bucket — the client itself stores nothing (ARCH-88). First caller of
+ * oc_client_set_setting; the `gui` bucket is separate from the TUI's by design,
+ * so a terminal and a window can keep different sidebar shapes. */
+static void sidebar_opts_save(void) {
+    if (!g_client) return;
+    char enc[64];
+    oc_sidebar_opts_encode(&g_sb, enc, sizeof enc);
+    oc_client_set_setting(g_client, SB_SETTING_KEY, enc);
+}
+static void sidebar_opts_load(const oc_model *m) {
+    const char *v = m ? oc_model_setting(m, SB_SETTING_KEY) : NULL;
+    if (v && v[0]) oc_sidebar_opts_parse(&g_sb, v);
+}
+
+/* A section's Filter/Sort menu (Slack's "Section settings"). Flat rather than
+ * nested submenus: three sorts and three filters fit one panel, and a checkmark
+ * shows the active choice — the very thing a submenu would hide a level down.
+ * Commands encode as 200 + section*16 + slot so one dispatcher serves both. */
+#define SEC_CMD(sec, slot) (200 + (sec) * 16 + (slot))
+static void open_section_menu(HWND hwnd, int sec) {
+    (void)hwnd;
+    if (sec < 0 || sec >= OC_SB_SECTIONS) return;
+    g_sb_menu_sec = sec;
+    g_n_mi = 0;
+    mi_section(sec == OC_SB_CHANNELS ? "CHANNELS" : "DIRECT MESSAGES");
+    mi_item(SEC_CMD(sec, 0), g_sb.collapsed[sec] ? "Expand" : "Collapse");
+    mi_sep();
+    mi_section("SORT");
+    static const char *SORTS[3] = { "A\xE2\x80\x93Z", "Recent activity", "Unread first" };
+    for (int i = 0; i < 3; i++) {
+        char lbl[72];
+        snprintf(lbl, sizeof lbl, "%s%s", g_sb.sort[sec] == i ? "\xE2\x9C\x93 " : "    ", SORTS[i]);
+        mi_item(SEC_CMD(sec, 1 + i), lbl);
+    }
+    mi_sep();
+    mi_section("FILTER");
+    /* "Active only" means different things per section, so name what it does. */
+    const char *FILTERS[3] = { "All", "Unread only",
+                               sec == OC_SB_DMS ? "Online only" : "Joined only" };
+    for (int i = 0; i < 3; i++) {
+        char lbl[72];
+        snprintf(lbl, sizeof lbl, "%s%s", g_sb.filter[sec] == i ? "\xE2\x9C\x93 " : "    ", FILTERS[i]);
+        mi_item(SEC_CMD(sec, 4 + i), lbl);
+    }
+    g_menu = MENU_SECTION; g_menu_headerblock = 0; g_menu_hover = -1;
+    g_menu_x = RAIL_W + 24; g_menu_y = HEADER_H + 60; g_menu_w = 236;
+}
+
 static void open_switcher(HWND hwnd) {
     (void)hwnd;
     g_n_sw = 0;
@@ -2908,6 +3023,16 @@ static void menu_dispatch(HWND hwnd, int cmd) {
      * view the app starts on — one sign-in implementation, not two. */
     case 80: reset_session(); signin_begin(hwnd, NULL, NULL); break;
     default:
+        /* Section Filter/Sort (see SEC_CMD). */
+        if (cmd >= 200 && cmd < 200 + OC_SB_SECTIONS * 16) {
+            int sec = (cmd - 200) / 16, slot = (cmd - 200) % 16;
+            if (slot == 0)                   g_sb.collapsed[sec] = (uint8_t)!g_sb.collapsed[sec];
+            else if (slot >= 1 && slot <= 3) g_sb.sort[sec]      = (uint8_t)(slot - 1);
+            else if (slot >= 4 && slot <= 6) g_sb.filter[sec]    = (uint8_t)(slot - 4);
+            g_sb_menu_sec = -1;
+            sidebar_opts_save();
+            break;
+        }
         if (cmd >= 100 && cmd - 100 < g_n_sw && !g_sw[cmd - 100].current)
             switch_workspace(hwnd, g_sw[cmd - 100].ws, "");
         break;
@@ -3148,12 +3273,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * toast channel while the sign-in view owns the window. */
             if (g_view == VIEW_SIGNIN) { if (g_si_connecting) signin_poll(hwnd); }
             else toast_tick(m);
+            /* The settings bucket arrives a beat after auth; fold it in once. */
+            if (g_sb_settings_pending && oc_model_setting(m, SB_SETTING_KEY)) {
+                sidebar_opts_load(m);
+                g_sb_settings_pending = 0;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
             if (m->authed && !g_post_auth) {          /* one-shot: identify the bucket + pull state */
                 oc_client_set_client_type(g_client, "gui");   /* our own settings bucket, not tui's */
                 oc_client_list_settings(g_client);
                 oc_client_list_users(g_client);
                 oc_client_list_channels(g_client);
                 g_post_auth = 1;
+                g_sb_settings_pending = 1;   /* fold the synced sidebar prefs when they land */
                 layout_composer(hwnd);   /* members pane now shows — re-fit the composer */
             }
             /* Sign-out returns to the sign-in view rather than quitting the
@@ -3224,12 +3356,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return (LRESULT)g_find_brush;
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
-    case WM_MOUSEWHEEL:
-        g_scroll += (float)GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 48.0f;
-        if (g_scroll < 0) g_scroll = 0;
-        if (g_scroll > g_scroll_max) g_scroll = g_scroll_max;
+    case WM_MOUSEWHEEL: {
+        /* WM_MOUSEWHEEL carries SCREEN coordinates; map them to decide whether
+         * the sidebar or the transcript scrolls. */
+        POINT wpt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        ScreenToClient(hwnd, &wpt);
+        float dy = (float)GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 48.0f;
+        if (view_has_sidebar() && wpt.x >= (int)RAIL_W && wpt.x < (int)(RAIL_W + SIDEBAR_W)) {
+            float maxs = g_sb_content > g_sb_view ? g_sb_content - g_sb_view : 0;
+            g_sb_scroll -= dy;
+            if (g_sb_scroll < 0) g_sb_scroll = 0;
+            if (g_sb_scroll > maxs) g_sb_scroll = maxs;
+        } else {
+            g_scroll += dy;
+            if (g_scroll < 0) g_scroll = 0;
+            if (g_scroll > g_scroll_max) g_scroll = g_scroll_max;
+        }
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
+    }
     case WM_LBUTTONDOWN: {
         int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
         if (!any_overlay(model()) && pt_in(g_sbar_thumb, mx, my)) {
@@ -3268,6 +3413,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (h >= 0) for (int i = 0, r = 0; i < g_n_mi; i++)
                 if (g_mi[i].kind == MK_ITEM) { if (r == h) { hi = i; break; } r++; }
             if (hi != g_menu_hover) { g_menu_hover = hi; InvalidateRect(hwnd, NULL, FALSE); }
+        } else if (view_has_sidebar() && (float)mx >= RAIL_W &&
+                   (float)mx < RAIL_W + SIDEBAR_W) {
+            /* Reveal a header's kebab while the cursor is on its row, as Slack
+             * does: there when you look for it, out of the way when you don't. */
+            int sec = -1;
+            for (int i = 0; i < g_n_rows; i++)
+                if (g_rows[i].header && (float)my >= g_rows[i].top && (float)my < g_rows[i].bot) {
+                    sec = g_rows[i].sec; break;
+                }
+            if (sec != g_sb_hover_sec) { g_sb_hover_sec = sec; InvalidateRect(hwnd, NULL, FALSE); }
         } else if ((float)mx < RAIL_W) {
             /* Rail hover. */
             int a = -100;
@@ -3276,6 +3431,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (a != g_nav_hover) { g_nav_hover = a; InvalidateRect(hwnd, NULL, FALSE); }
         } else {
             if (g_nav_hover != -100) { g_nav_hover = -100; InvalidateRect(hwnd, NULL, FALSE); }
+            if (g_sb_hover_sec != -1)  { g_sb_hover_sec = -1;  InvalidateRect(hwnd, NULL, FALSE); }
             int r = (any_overlay(model()) || !view_has_sidebar()) ? -1 : msgrow_at(my);
             uint64_t h = r >= 0 ? g_msgrows[r].mid : 0;
             if (h != g_hover_mid) { g_hover_mid = h; InvalidateRect(hwnd, NULL, FALSE); }
@@ -3312,6 +3468,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_ERASEBKGND:
         return 1;
+    case WM_CLOSE:
+        /* WIN-59: the outbox is in memory now (ARCH-88), so quitting with a send
+         * still queued loses it. Make that a choice rather than a surprise. */
+        if (g_client) {
+            int pending = oc_client_outbox_pending(g_client);
+            if (pending > 0) {
+                WCHAR w[320]; char line[320];
+                snprintf(line, sizeof line,
+                         "%d message%s composed while offline %s not been sent yet.\n\n"
+                         "Quitting now will discard %s.",
+                         pending, pending == 1 ? "" : "s", pending == 1 ? "has" : "have",
+                         pending == 1 ? "it" : "them");
+                to_w(line, w, 320);
+                if (MessageBoxW(hwnd, w, L"Unsent messages",
+                                MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK)
+                    return 0;
+            }
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);   /* proceed with the close */
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_TICK);
         if (g_client) { oc_client_stop(g_client); g_client = NULL; }
@@ -3332,6 +3507,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     /* Open the OS credential store first: the "do we have a session?" probe
      * below reads through it. */
     g_secret = oc_secret_open_os("openchime");
+    oc_sidebar_opts_defaults(&g_sb);
 
     /* Credential resolution, uniform with the TUI:
      *   1. Dev quick-launch `openchime.exe <workspace> <user:pass>` — connect directly.
