@@ -52,6 +52,16 @@ void oc_client_backfill(oc_client *c, uint64_t channel_id);
  * folds them in exactly like a forward replay. */
 void oc_client_history(oc_client *c, uint64_t channel_id, uint64_t before_message_id);
 
+/* Channel membership (REQ-033, WIN-31). Both frames have always existed on the
+ * wire; nothing exposed them. */
+void oc_client_channel_invite(oc_client *c, uint64_t channel_id, uint64_t user_id);
+void oc_client_channel_kick(oc_client *c, uint64_t channel_id, uint64_t user_id);
+
+/* Signup (WIN-32, REQ-268): redeem an invite on this connection instead of
+ * authenticating. Call immediately after a start_* with `cred` = "user:password"
+ * — the pair the new account will have. */
+void oc_client_redeem_invite(oc_client *c, const char *invite_token);
+
 /* Mark `channel_id` read (clear its unread count). A frontend calls this for the
  * focused channel. */
 void oc_client_mark_read(oc_client *c, uint64_t channel_id);

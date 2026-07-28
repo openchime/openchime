@@ -27,6 +27,13 @@ oc_net *oc_net_start(const char *host, int port, const char *token,
 
 /* Cut short the reconnect backoff so the next attempt happens immediately (no-op
  * if not currently backing off). */
+/* Redeem an invite on the FIRST connect instead of authenticating (WIN-32,
+ * REQ-268): REDEEM_INVITE creates the account and authenticates in one step, so
+ * the reply is an ordinary AUTH_OK and everything after is unchanged. Call right
+ * after oc_net_start; cleared once used, so a later reconnect re-auths normally
+ * with the session token rather than replaying a spent invite. */
+void oc_net_set_invite(oc_net *n, const char *token);
+
 void oc_net_reconnect(oc_net *n);
 
 /* Set the synced-settings bucket id for this client (default "tui"). Call once

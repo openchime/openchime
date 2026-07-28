@@ -68,8 +68,8 @@ The wire already carries these; `client/core` is the only thing in the way.
 | # | Item | Core change needed | Pri | Size |
 |---|---|---|---|---|
 | ~~**WIN-30**~~ | ~~**Create-channel dialog with visibility.**~~ **DONE.** `oc_client_create_channel_ex(c, name, is_public)` added and the dialog offers Public/Private. Verified end-to-end: a private channel lands with `is_public=0` and renders with the lock in the sidebar. | Done | P1 | S |
-| **WIN-31** | **Channel member management.** `INVITE_TO_CHANNEL` / `REMOVE_FROM_CHANNEL` exist on the wire but in no client. | Add both intents | P1 | M |
-| **WIN-32** | **Signup / first-owner onboarding (REQ-268).** `REDEEM_INVITE` exists on the wire but in no client, so bringing up a tenant still needs a command line. | Add the redeem intent | P1 | M |
+| ~~**WIN-31**~~ | ~~**Channel member management.**~~ **DONE.** `oc_client_channel_invite` / `oc_client_channel_kick` added, offered as "Add someone…" / "Remove someone…" on the channel menu. Without these a private channel could be created but never populated. | Done | P1 | M |
+| ~~**WIN-32**~~ | ~~**Signup / first-owner onboarding (REQ-268).**~~ **DONE.** "Have an invite? Create an account" on sign-in step 2 takes a token, username and password; the connection redeems instead of authenticating, which creates the account and signs in together. Verified end-to-end: a minted invite produced a real member who landed in the workspace. **This also exposed a defect that made invites unusable at all** — see the commit: tokens were random bytes sent to clients verbatim. | Done | P1 | M |
 | ~~**WIN-33**~~ | ~~**Mark-all-read / catch-up (REQ-238).**~~ **DONE** client-side: a loop of `oc_client_mark_read` over every channel with unread, reporting how many it caught up. Acks are cumulative per channel so no wire change was needed; REQ-238 may still add a true bulk op. | Done | P2 | S |
 
 ## §3 Blocked — needs daemon or protocol work first

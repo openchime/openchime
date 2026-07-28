@@ -1124,9 +1124,13 @@ static void test_webhook_vertical(int port, const uint8_t *pin) {
     CHECK(send_frame(&a, buf, w.len) == 0);
     CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_WEBHOOK_INFO);
     oc_webhook_info wi; CHECK(oc_decode_webhook_info(&p, &wi) == OC_OK);
-    CHECK(wi.channel_id == OC_DEFAULT_CHANNEL && wi.token.len == 32);
+    /* Hex, and usable in the URL as-is: /webhook/<hex-token> is what the HTTP
+     * endpoint has always parsed, so handing a client raw bytes meant the value
+     * it showed could never have worked. This test used to do the conversion
+     * itself, which is precisely the step no real frontend performed. */
+    CHECK(wi.channel_id == OC_DEFAULT_CHANNEL && wi.token.len == 64);
     char hex[65];
-    for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", wi.token.ptr[i]);
+    memcpy(hex, wi.token.ptr, 64); hex[64] = '\0';
 
     /* POST to the webhook over a non-oc/1 (HTTP) connection. */
     client h;
@@ -1461,15 +1465,21 @@ static void test_admin_vertical(int port, const uint8_t *pin) {
     CHECK(send_frame(&owner, buf, w.len) == 0);
     CHECK(read_frame(&owner, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_INVITE_CREATED);
     oc_invite_created ic; CHECK(oc_decode_invite_created(&p, &ic) == OC_OK);
-    CHECK(ic.token.len == OC_INVITE_TOKEN_LEN && ic.role == OC_ROLE_MEMBER);
-    uint8_t token[OC_INVITE_TOKEN_LEN]; memcpy(token, ic.token.ptr, OC_INVITE_TOKEN_LEN);
+    /* The token reaches a client as HEX: it gets shared in a message, so it has
+     * to be text. (It is still random bytes on the daemon's side.) */
+    CHECK(ic.token.len == 2 * OC_INVITE_TOKEN_LEN && ic.role == OC_ROLE_MEMBER);
+    char token[2 * OC_INVITE_TOKEN_LEN + 1];
+    memcpy(token, ic.token.ptr, ic.token.len);
+    token[ic.token.len] = '\0';
+    for (size_t ti = 0; ti < ic.token.len; ti++)
+        CHECK((token[ti] >= '0' && token[ti] <= '9') || (token[ti] >= 'a' && token[ti] <= 'f'));
 
     /* A fresh client redeems the invite: pre-auth account creation -> AUTH_OK. */
     client nh;
     CHECK(client_open(&nh, port, pin) == 0);
     CHECK(do_handshake(&nh) == 0);
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_redeem_invite ri = { { token, OC_INVITE_TOKEN_LEN }, oc_slice_str("newhire"), oc_slice_str("nhpw") };
+    oc_redeem_invite ri = { oc_slice_str(token), oc_slice_str("newhire"), oc_slice_str("nhpw") };
     CHECK(oc_encode_redeem_invite(&w, OC_PROTOCOL_VERSION, &ri) == OC_OK);
     CHECK(send_frame(&nh, buf, w.len) == 0);
     CHECK(read_frame(&nh, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_AUTH_OK);

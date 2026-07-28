@@ -383,6 +383,10 @@ static uint64_t g_edit_msg;             /* non-zero => composer is editing this 
 #define SI_W        380.0f        /* card width */
 #define SI_TIMEOUT  20000         /* ms before we stop waiting for auth */
 static int   g_si_step = 1;       /* 1 = workspace, 2 = credentials */
+/* An invite token entered on step 2 (WIN-32). Non-empty turns the next attempt
+ * into a redeem: the account is created and signed in together. */
+static char  g_si_invite[128];
+static D2D1_RECT_F g_si_invite_link;
 static char  g_si_ws[256];        /* the workspace string as typed */
 static char  g_si_host[256];      /* resolved host (step 1 output) */
 static int   g_si_port;
@@ -2555,7 +2559,7 @@ static si_geom si_layout(float W, float H) {
                  + (g_si_step == 1 ? 26.0f : 0.0f)   /* advanced-options link */
                  + (g_si_step == 2 ? 30.0f : 0.0f)   /* remember-me row */
                  + 40.0f + 24.0f                      /* button + bottom pad */
-                 + (g_si_step == 2 ? 26.0f : 0.0f);   /* back link */
+                 + (g_si_step == 2 ? 26.0f + 22.0f : 0.0f);   /* back + signup links */
     g.h  = head + body;
     g.y0 = (H - g.h) / 2; if (g.y0 < 24) g.y0 = 24;
     g.fields_y = g.y0 + head;
@@ -2670,9 +2674,17 @@ static void draw_signin(ID2D1RenderTarget *rt, float W, float H) {
         g_si_back = rf(fx, y, fx + fw, y + 20);
         IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
         draw_text(rt, "\xE2\x86\x90 Use a different workspace", g_small, g_si_back, OC_COL_ACCENT);
+        /* WIN-32: the only way to turn an invite into an account used to be the
+         * command line. Signup is its own small form rather than three more
+         * fields on this card, which would push the layout around for a path
+         * most people take once. */
+        g_si_invite_link = rf(fx, y + 22, fx + fw, y + 42);
+        draw_text(rt, "Have an invite? Create an account", g_small,
+                  g_si_invite_link, OC_COL_MUTED);
         IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
     } else {
         g_si_back = rf(0, 0, 0, 0);
+        g_si_invite_link = rf(0, 0, 0, 0);
     }
 }
 
@@ -3657,6 +3669,26 @@ static int on_click(HWND hwnd, int x, int y) {
         if (pt_in(g_si_btn, x, y))           { signin_submit(hwnd); return 1; }
         if (pt_in(g_si_back, x, y))          { signin_back(hwnd);   return 1; }
         if (pt_in(g_si_adv_link, x, y))      { signin_set_advanced(hwnd, !g_si_advanced); return 1; }
+        if (pt_in(g_si_invite_link, x, y)) {
+            oc_field f[3] = {
+                { FF_TEXT,     "Invite token", "The one-time token you were sent.", "" },
+                { FF_TEXT,     "Choose a username", "", "" },
+                { FF_PASSWORD, "Choose a password", "", "" },
+            };
+            if (!form_dialog(hwnd, "Create your account", f, 3)) return 1;
+            if (!f[0].value[0] || !f[1].value[0] || !f[2].value[0]) {
+                snprintf(g_si_err, sizeof g_si_err, "invite token, username and password are all required");
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 1;
+            }
+            snprintf(g_si_invite, sizeof g_si_invite, "%s", f[0].value);
+            WCHAR wu[192], wp[192];
+            to_w(f[1].value, wu, 192); to_w(f[2].value, wp, 192);
+            if (g_si_e_user) SetWindowTextW(g_si_e_user, wu);
+            if (g_si_e_pass) SetWindowTextW(g_si_e_pass, wp);
+            signin_submit(hwnd);      /* redeems, because g_si_invite is set */
+            return 1;
+        }
         if (pt_in(g_si_remember_box, x, y) ||
             (g_si_step == 2 && y >= (int)g_si_remember_box.top &&
              y <= (int)g_si_remember_box.bottom &&
@@ -4174,6 +4206,13 @@ static void signin_submit(HWND hwnd) {
                                       g_si_remember ? store_path() : NULL,
                                       g_si_remember ? g_secret : NULL);
     if (!g_client) { snprintf(g_si_err, sizeof g_si_err, "could not start the client"); goto redraw; }
+    /* Signup (WIN-32): with an invite in hand this connection redeems it instead
+     * of authenticating — one step that creates the account and signs in — so
+     * bringing up a tenant no longer needs the command line. */
+    if (g_si_invite[0]) {
+        oc_client_redeem_invite(g_client, g_si_invite);
+        g_si_invite[0] = '\0';
+    }
     g_si_connecting = 1;
     g_si_started = GetTickCount64();
     layout_signin(hwnd);
@@ -4707,6 +4746,11 @@ static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, int sx
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)notify, L"Notifications");
         if (c->kind != OC_CHANNEL_KIND_DM) {
             AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+            /* WIN-31: both frames have always existed on the wire and reached no
+             * client, so a private channel could be created but never populated. */
+            AppendMenuW(menu, MF_STRING, 6, L"Add someone…");
+            AppendMenuW(menu, MF_STRING, 7, L"Remove someone…");
+            AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(menu, MF_STRING, 4, L"Webhooks…");
             AppendMenuW(menu, MF_STRING, 5, L"Create webhook…");
             AppendMenuW(menu, MF_STRING, 3, L"Leave channel");
@@ -4726,6 +4770,20 @@ static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, int sx
             oc_client_create_webhook(g_client, cid, f[0].value);
             g_await_webhook = 1;
         }
+        break;
+    }
+    case 6:
+    case 7: {
+        int add = (cmd == 6);
+        oc_field f[1] = { { FF_TEXT, "Username",
+                            add ? "Who to add to this channel."
+                                : "Who to remove from this channel.", "" } };
+        if (!form_dialog(hwnd, add ? "Add to channel" : "Remove from channel", f, 1) ||
+            !f[0].value[0]) break;
+        uint64_t uid = oc_model_user_id(m, f[0].value);
+        if (!uid) { toast_push("No such user in this workspace.", 1); break; }
+        if (add) oc_client_channel_invite(g_client, cid, uid);
+        else     oc_client_channel_kick(g_client, cid, uid);
         break;
     }
     case 20: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_ALL); break;

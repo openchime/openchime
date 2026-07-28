@@ -665,6 +665,9 @@ static void download_pump(conn *c) {
 /* Dispatch every buffered frame. Returns 0 to keep the connection, -1 to close.
  * AUTH/SEND become jobs for the DB writer; their replies arrive asynchronously
  * via deliver_result. */
+/* Defined below with the HTTP webhook path; declared here for the redeem path. */
+static int hex_decode(const char *hex, size_t hexlen, uint8_t *out, size_t outcap);
+
 static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
     const uint8_t *frame; size_t flen;
     for (;;) {
@@ -707,9 +710,19 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
                 if (!j) return -1;
                 char *u = strndup((const char *)ri.username.ptr, ri.username.len);
                 char *pw = strndup((const char *)ri.password.ptr, ri.password.len);
+                /* The client holds the hex form (see hex_encode above); accept
+                 * the raw bytes too, so a token captured before this change, or
+                 * pasted from the daemon's own bootstrap log, still redeems. */
+                uint8_t raw[OC_INVITE_TOKEN_LEN];
+                const uint8_t *tokp = ri.token.ptr;
+                size_t toklen = ri.token.len;
+                if (hex_decode((const char *)ri.token.ptr, ri.token.len,
+                               raw, sizeof raw) == (int)sizeof raw) {
+                    tokp = raw; toklen = sizeof raw;
+                }
                 int ok = u && pw &&
                          oc_job_set_register(j, u, pw, 0, 0) == 0 &&
-                         oc_job_set_token(j, ri.token.ptr, ri.token.len) == 0;
+                         oc_job_set_token(j, tokp, toklen) == 0;
                 free(u); free(pw);
                 if (!ok) return -1;
                 oc_dbwriter_submit(dbw, j);
@@ -1311,6 +1324,18 @@ static int hexval(char ch) {
     return -1;
 }
 
+/* Tokens are random BYTES on the daemon side but must reach a human as text:
+ * an invite gets shared in a message, and a webhook token goes into a URL —
+ * /webhook/<hex-token> already assumed hex at the HTTP end. Both were being sent
+ * to clients verbatim, so what the UI displayed was unreadable and, for
+ * webhooks, would never have matched the endpoint. Encode on the way out and
+ * decode on the way back in. */
+static void hex_encode(const uint8_t *in, size_t n, char *out) {
+    static const char H[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) { out[2 * i] = H[in[i] >> 4]; out[2 * i + 1] = H[in[i] & 15]; }
+    out[2 * n] = '\0';
+}
+
 static int hex_decode(const char *hex, size_t hexlen, uint8_t *out, size_t outcap) {
     if (hexlen % 2 != 0 || hexlen / 2 > outcap) return -1;
     for (size_t i = 0; i < hexlen; i += 2) {
@@ -1707,7 +1732,9 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
     case OC_RES_INVITE_OK: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
-        oc_slice tok = { r->session_token, OC_INVITE_TOKEN_LEN };
+        char tokhex[2 * OC_INVITE_TOKEN_LEN + 1];
+        hex_encode(r->session_token, OC_INVITE_TOKEN_LEN, tokhex);
+        oc_slice tok = { (const uint8_t *)tokhex, strlen(tokhex) };
         oc_invite_created ic = { tok, r->role, r->session_expiry };
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_encode_invite_created(&w, OC_PROTOCOL_VERSION, &ic);
@@ -2085,7 +2112,10 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         /* Hand the minted token back to the client that asked (shown once). */
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) break;
-        oc_webhook_info wi = { r->message_id, r->channel_id, { r->session_token, OC_SESSION_TOKEN_LEN } };
+        char whhex[2 * OC_SESSION_TOKEN_LEN + 1];
+        hex_encode(r->session_token, OC_SESSION_TOKEN_LEN, whhex);
+        oc_webhook_info wi = { r->message_id, r->channel_id,
+                               { (const uint8_t *)whhex, strlen(whhex) } };
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_encode_webhook_info(&w, OC_PROTOCOL_VERSION, &wi);
         send_bytes(ep, conns, c->fd, g_enc, w.len);

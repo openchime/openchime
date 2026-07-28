@@ -203,6 +203,23 @@ void oc_client_history(oc_client *c, uint64_t channel_id, uint64_t before_messag
     oc_queue_push(&c->cmds, cmd);
 }
 
+static void chan_member_op(oc_client *c, int type, uint64_t channel_id, uint64_t user_id) {
+    if (!c || !channel_id || !user_id) return;
+    oc_cmd *cmd = oc_cmd_new(type);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = user_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_channel_invite(oc_client *c, uint64_t channel_id, uint64_t user_id) {
+    chan_member_op(c, OC_CMD_CHANNEL_INVITE, channel_id, user_id);
+}
+
+void oc_client_channel_kick(oc_client *c, uint64_t channel_id, uint64_t user_id) {
+    chan_member_op(c, OC_CMD_CHANNEL_KICK, channel_id, user_id);
+}
+
 static void channel_op(oc_client *c, int type, uint64_t channel_id) {
     if (!c || !channel_id) return;
     oc_cmd *cmd = oc_cmd_new(type);
@@ -292,6 +309,10 @@ void oc_client_toggle_prefs(oc_client *c, int open) {
     if (!c) return;
     oc_model_set_prefs_open(&c->model, open);
     if (open) oc_client_list_notify_prefs(c);   /* refresh on open */
+}
+
+void oc_client_redeem_invite(oc_client *c, const char *invite_token) {
+    if (c) oc_net_set_invite(c->net, invite_token);
 }
 
 void oc_client_set_client_type(oc_client *c, const char *client_type) {

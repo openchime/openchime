@@ -32,6 +32,7 @@ struct oc_net {
     char          host[256];
     int           port;
     char         *token;
+    char         *invite;       /* one-shot signup token (WIN-32), else NULL */
     char         *store_path;   /* local store for token/pin persistence, or NULL */
     oc_secret    *secret;       /* borrowed OS keyring for the session token, or NULL */
     char          client_type[32]; /* synced-settings bucket id (default "tui") */
@@ -881,10 +882,21 @@ static int run_connection(oc_net *n, int reconnecting,
             oc_slice user = sep ? (oc_slice){ (const uint8_t *)cred, (size_t)(sep - cred) }
                                 : oc_slice_str(cred);
             oc_slice pass = sep ? oc_slice_str(sep + 1) : (oc_slice){ (const uint8_t *)"", 0 };
-            uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
-            if (oc_encode_local_credential(&cw, user, pass) != OC_OK) goto drop;
-            oc_auth a = { OC_AUTH_LOCAL, { cbuf, cw.len } };
-            er = oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a);
+            if (n->invite && n->invite[0]) {
+                /* Signup (WIN-32): creates the account AND authenticates, so the
+                 * reply below is the same AUTH_OK. Spent once — clearing it here
+                 * means a later reconnect re-auths with the session token rather
+                 * than replaying an invite the server has already consumed. */
+                oc_redeem_invite ri = { oc_slice_str(n->invite), user, pass };
+                er = oc_encode_redeem_invite(&w, OC_PROTOCOL_VERSION, &ri);
+                free(n->invite);
+                n->invite = NULL;
+            } else {
+                uint8_t cbuf[512]; oc_wbuf cw; oc_wbuf_init(&cw, cbuf, sizeof cbuf);
+                if (oc_encode_local_credential(&cw, user, pass) != OC_OK) goto drop;
+                oc_auth a = { OC_AUTH_LOCAL, { cbuf, cw.len } };
+                er = oc_encode_auth(&w, OC_PROTOCOL_VERSION, &a);
+            }
         }
         if (er != OC_OK || write_all(&conn, fd, buf, w.len, &n->stop) != 0) goto drop;
         oc_header hdr; oc_rbuf p;
@@ -1138,6 +1150,14 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_change_password(&w, OC_PROTOCOL_VERSION, &cp) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_CHANNEL_INVITE || c->type == OC_CMD_CHANNEL_KICK) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_channel_member_op mo = { c->channel_id, c->message_id };
+                oc_result rr = (c->type == OC_CMD_CHANNEL_INVITE)
+                    ? oc_encode_invite_to_channel(&w, OC_PROTOCOL_VERSION, &mo)
+                    : oc_encode_remove_from_channel(&w, OC_PROTOCOL_VERSION, &mo);
+                if (rr == OC_OK) (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_SET_ROLE) {
                 uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_set_role sr = { c->channel_id, c->op };   /* channel_id reused as user id, op = role */
@@ -1380,9 +1400,15 @@ oc_net *oc_net_start(const char *host, int port, const char *token,
     n->to_ui = to_ui;
     n->from_ui = from_ui;
     if (oc_thread_create(&n->thread, net_thread, n) != 0) {
-        free(n->token); free(n->store_path); free(n); return NULL;
+        free(n->token); free(n->invite); free(n->store_path); free(n); return NULL;
     }
     return n;
+}
+
+void oc_net_set_invite(oc_net *n, const char *token) {
+    if (!n) return;
+    free(n->invite);
+    n->invite = (token && token[0]) ? strdup(token) : NULL;
 }
 
 void oc_net_reconnect(oc_net *n) {
