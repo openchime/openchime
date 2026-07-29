@@ -1,0 +1,22 @@
+authed=1 connected=1 sel=1 members=1
+workspace name="Acme HQ" deployment=managed max_users=100
+view=3 si_overlay=0 wsmgr=0
+workspaces=1 active=0 elsewhere=0
+  ws[0] 127.0.0.1:8443 client=000001bf2dbe7fb0 authed=1 unread=0
+natives re=0 find=0 ffind=1 srch=0 pick=0 pal=0 si_ws=0 sbkind=4 conv=0 covered=0
+tray_live=1 notify_pref=2 toasts_raised=0 dnd=0
+lightbox=0 thumb_hits=0
+thumb_hover=0 thumb_tools=0
+thumb_pending=0 n_thumbs=0 n_missing=0 off=0
+unread_from=0 unread_chan=1 unread_count=0
+  marks ch 1 hw=76 rm=76 unread=0
+  marks ch 2 hw=12 rm=0 unread=0
+  marks ch 3 hw=8 rm=0 unread=0
+  marks ch 4 hw=78 rm=0 unread=0
+  marks ch 5 hw=79 rm=0 unread=0
+channels=5
+  ch 1 "general" unread=0 msgs=60 prev="filler 60" prevby=1 *
+  ch 2 DM "" unread=0 msgs=5 prev="are we still on for 3pm?" prevby=1
+  ch 3 "design" unread=0 msgs=2 prev="spec notes" prevby=1
+  ch 4 DM "" unread=0 msgs=2 prev="😭" prevby=1
+  ch 5 DM "" unread=0 msgs=1 prev="hey babe" prevby=1

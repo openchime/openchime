@@ -630,6 +630,7 @@ static uint64_t g_hover_pinrow;
 static D2D1_RECT_F g_ws_hdr_btn;        /* channel-column workspace header (opens ws menu) */
 static D2D1_RECT_F g_hdr_gear, g_hdr_compose;   /* header settings + compose buttons */
 static HWND     g_find;                 /* "Find a conversation" filter box (native EDIT) */
+static HWND     g_ffind;                /* "Search files" box, Files view only (native EDIT) */
 static HWND     g_srch;                 /* search-overlay query box (WIN-4, native EDIT) */
 
 /* Composer autocomplete (WIN-7). The candidate list is rebuilt from the text up
@@ -2906,6 +2907,37 @@ enum { FS_ALL = 0, FS_MINE, FS_THEIRS, FS_SCOPES };
 static int g_file_scope;
 static D2D1_RECT_F g_file_scopes[FS_SCOPES];
 
+/* The Files view's left column (WIN-67). Slack separates the three filter axes
+ * by POSITION — collection on the left, ownership top-left, type and sort
+ * top-right — because they are different questions and stacking them in one
+ * chip row makes the user read all of them to find the one they want.
+ *
+ * Ours answers "which channel" on the left, because that is the axis our data
+ * really has: Slack's Canvases and Lists do not exist here, and its Starred
+ * holds messages, not files. It is also the only one the SERVER can narrow —
+ * LIST_FILES already takes a channel id (daemon/dbwriter.c), so picking a
+ * channel is an exact refetch rather than a slice of the page we hold. */
+static uint64_t g_file_chan;                 /* 0 = everywhere I can see */
+/* The VIEW and the channel Files TAB share one model flag (filelist_open), so
+ * whoever opened it has to close it. Leaving the view by any route — rail, More
+ * flyout, palette, a menu command, clicking a file — used to leave the flag set,
+ * and Home then rendered the FILE LIST where the transcript belongs, with no
+ * composer. Recorded here and released in one place (files_view_sync) rather
+ * than at each of the two dozen sites that assign g_view. */
+static int g_filelist_from_view;
+/* Sort and the name filter are client-side over that page, which is honest:
+ * they reorder and narrow what was returned, they do not re-query. */
+enum { FSORT_RECENT = 0, FSORT_NAME, FSORT_LARGEST, FSORT_SORTS };
+static int  g_file_sort;
+static char g_file_q[64];
+static D2D1_RECT_F g_file_type_btn, g_file_sort_btn, g_file_scope_btn;
+static D2D1_RECT_F g_file_up_btn, g_file_search_box;
+/* The channel census, built only while showing everything — see files_index. */
+static struct { uint64_t id; int n; } g_fchan[64];
+static int g_n_fchan;
+static D2D1_RECT_F g_fchan_rows[65];         /* [0] is "All files" */
+static int g_n_fchan_rows;
+
 static int file_kind(const char *mime) {
     if (mime_is_image(mime)) return FF_IMAGES;
     if (!mime) return FF_OTHER;
@@ -2938,43 +2970,168 @@ static void file_badge(ID2D1RenderTarget *rt, const oc_file_view *f, D2D1_RECT_F
     IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 
+/* Case-insensitive substring, for the name box. */
+static char ascii_lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
+static int istrstr(const char *hay, const char *needle) {
+    if (!needle[0]) return 1;
+    for (const char *h = hay; *h; h++) {
+        const char *a = h, *b = needle;
+        while (*a && *b && ascii_lower(*a) == ascii_lower(*b)) { a++; b++; }
+        if (!*b) return 1;
+    }
+    return 0;
+}
+
 static int file_passes(const oc_model *m, const oc_file_view *f) {
     if (g_file_filter != FF_ALL && file_kind(f->mime) != g_file_filter) return 0;
     if (g_file_scope == FS_MINE   && f->uploader_id != m->user_id) return 0;
     if (g_file_scope == FS_THEIRS && f->uploader_id == m->user_id) return 0;
+    /* Belt and braces with the refetch: the model still holds the previous
+     * channel's page for the frame between the click and the reply, and a list
+     * that briefly shows the wrong channel's files is a bug the user sees. */
+    if (g_file_chan && f->channel_id != g_file_chan) return 0;
+    if (!istrstr(f->filename, g_file_q)) return 0;
     return 1;
 }
 
-/* The filter chips. Returns the y below them. */
-static float draw_file_filters(ID2D1RenderTarget *rt, D2D1_RECT_F body) {
-    static const char *L[FF_KINDS] = { "All", "Images", "Documents", "Other" };
-    float fx = body.left + 20, y = body.top + 8;
-    for (int i = 0; i < FF_KINDS; i++) {
-        float fw = text_width(L[i], g_small) + 22;
-        D2D1_RECT_F b = rf(fx, y, fx + fw, y + 24);
-        int on = (g_file_filter == i);
-        fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
-        if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, L[i], g_small, b, on ? 0xFFFFFF : OC_COL_MUTED);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
-        g_file_filters[i] = b;
-        fx = b.right + 6;
+/* Which files to draw, in which order. Built per frame because every input to
+ * it (the filters, the sort, the model) can change between frames; bounded by
+ * the wire's own page size, so there is no growth to manage. */
+static int g_forder[OC_MAX_FILE_LIST];
+static int g_n_forder;
+static const oc_model *g_fsortm;
+
+static int file_cmp(const void *pa, const void *pb) {
+    const oc_file_view *a = &g_fsortm->files[*(const int *)pa];
+    const oc_file_view *b = &g_fsortm->files[*(const int *)pb];
+    if (g_file_sort == FSORT_NAME)    return _stricmp(a->filename, b->filename);
+    if (g_file_sort == FSORT_LARGEST) return a->size == b->size ? 0 : (a->size < b->size ? 1 : -1);
+    return a->created_at == b->created_at ? 0 : (a->created_at < b->created_at ? 1 : -1);
+}
+
+static void files_build_order(const oc_model *m) {
+    g_n_forder = 0;
+    for (size_t i = 0; i < m->n_files && g_n_forder < (int)OC_MAX_FILE_LIST; i++)
+        if (file_passes(m, &m->files[i])) g_forder[g_n_forder++] = (int)i;
+    /* RECENT is already the server's order; re-sorting it would only risk
+     * disagreeing with the daemon about ties. */
+    if (g_file_sort != FSORT_RECENT && g_n_forder > 1) {
+        g_fsortm = m;
+        qsort(g_forder, (size_t)g_n_forder, sizeof g_forder[0], file_cmp);
     }
-    /* Scope on the same row, right-aligned: a different question from type. */
-    static const char *SC[FS_SCOPES] = { "Everyone", "Shared by you", "Shared with you" };
-    float rx = body.right - 20;
-    for (int i = FS_SCOPES - 1; i >= 0; i--) {
-        float fw = text_width(SC[i], g_small) + 22;
-        D2D1_RECT_F b = rf(rx - fw, y, rx, y + 24);
-        int on = (g_file_scope == i);
-        fill_round(rt, b, 6.0f, on ? OC_COL_SELECT : OC_COL_INPUT);
-        if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, SC[i], g_small, b, on ? OC_COL_TEXT : OC_COL_MUTED);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
-        g_file_scopes[i] = b;
-        rx = b.left - 6;
+}
+
+/* The channel census behind the left column. Counted ONLY while we are showing
+ * everything: once a channel is picked the model holds just that channel's
+ * files, and recounting there would collapse the column to the one row you are
+ * standing on — the list you navigate by would vanish as you used it. */
+static void files_index(const oc_model *m) {
+    if (g_file_chan) return;
+    g_n_fchan = 0;
+    for (size_t i = 0; i < m->n_files; i++) {
+        uint64_t cid = m->files[i].channel_id;
+        if (!cid) continue;
+        int at = -1;
+        for (int j = 0; j < g_n_fchan; j++) if (g_fchan[j].id == cid) { at = j; break; }
+        if (at < 0) {
+            if (g_n_fchan >= (int)(sizeof g_fchan / sizeof g_fchan[0])) continue;
+            at = g_n_fchan++;
+            g_fchan[at].id = cid; g_fchan[at].n = 0;
+        }
+        g_fchan[at].n++;
+    }
+}
+
+/* A chip. Returns its rect so the caller can record a hit-box. */
+static D2D1_RECT_F chip(ID2D1RenderTarget *rt, float x, float y, const char *label,
+                        int on, uint32_t on_col) {
+    D2D1_RECT_F b = rf(x, y, x + text_width(label, g_small) + 22, y + 24);
+    fill_round(rt, b, 6.0f, on ? on_col : OC_COL_INPUT);
+    if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, label, g_small, b, on ? 0xFFFFFF : OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    return b;
+}
+
+/* A dropdown button: "Types ▾", showing the current choice rather than the
+ * axis name when one is set, so the row states the filter instead of hiding it
+ * behind a click. */
+static D2D1_RECT_F drop_btn(ID2D1RenderTarget *rt, float right, float y, const char *label,
+                            int active) {
+    char txt[64];
+    snprintf(txt, sizeof txt, "%s \xE2\x96\xBE", label);
+    D2D1_RECT_F b = rf(right - (text_width(txt, g_small) + 22), y, right, y + 24);
+    fill_round(rt, b, 6.0f, OC_COL_INPUT);
+    stroke_round(rt, b, 6.0f, active ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, txt, g_small, b, active ? OC_COL_TEXT : OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    return b;
+}
+
+static const char *FF_LABEL[FF_KINDS] = { "All", "Images", "Documents", "Other" };
+/* Slack's wording, because these say exactly what they mean and we had a vaguer
+ * set ("Everyone") saying the same thing. */
+static const char *FS_LABEL[FS_SCOPES] = { "All", "Shared by you", "Shared with you" };
+static const char *FSORT_LABEL[FSORT_SORTS] = { "Recently shared", "Name", "Largest" };
+
+/* The filter chips. Returns the y below them.
+ *
+ * `full` is the workspace Files view, which gets the search box and the two
+ * dropdowns; a channel's Files TAB gets the plain chip row it always had. The
+ * tab is 300px of a middle column that already has a search of its own, and
+ * three filter surfaces stacked in it would be chrome outweighing content. */
+static float draw_file_filters(ID2D1RenderTarget *rt, D2D1_RECT_F body, int full) {
+    float y = body.top + 8;
+
+    if (full) {
+        /* Name search: a rounded container with the glyph, the native EDIT
+         * placed over it by layout_files_find(). */
+        g_file_search_box = rf(body.left + 20, y, body.right - 20, y + 32);
+        fill_round(rt, g_file_search_box, 8.0f, OC_COL_INPUT);
+        stroke_round(rt, g_file_search_box, 8.0f, OC_COL_BORDER, 1.0f);
+        draw_lucide(rt, OC_ICON_SEARCH,
+                    rf(g_file_search_box.left + 9, y + 8, g_file_search_box.left + 25, y + 24),
+                    OC_COL_MUTED);
+        y += 44;
+    } else {
+        g_file_search_box = rf(0, 0, 0, 0);
+    }
+
+    for (int i = 0; i < FS_SCOPES; i++) g_file_scopes[i] = rf(0, 0, 0, 0);
+    for (int i = 0; i < FF_KINDS;  i++) g_file_filters[i] = rf(0, 0, 0, 0);
+
+    if (full) {
+        /* Left: ownership, the axis you switch most often, so it stays one
+         * click. Right: type and sort, folded into dropdowns — as four
+         * always-visible chips, type cost the width the filename column wanted
+         * to state an axis most users leave on "All". */
+        float fx = body.left + 20;
+        for (int i = 0; i < FS_SCOPES; i++) {
+            g_file_scopes[i] = chip(rt, fx, y, FS_LABEL[i], g_file_scope == i, OC_COL_ACCENT);
+            fx = g_file_scopes[i].right + 6;
+        }
+        g_file_sort_btn  = drop_btn(rt, body.right - 20, y, FSORT_LABEL[g_file_sort],
+                                    g_file_sort != FSORT_RECENT);
+        g_file_type_btn  = drop_btn(rt, g_file_sort_btn.left - 8, y,
+                                    g_file_filter == FF_ALL ? "Types" : FF_LABEL[g_file_filter],
+                                    g_file_filter != FF_ALL);
+        g_file_scope_btn = rf(0, 0, 0, 0);
+    } else {
+        /* The channel TAB is ~300px of a middle column. Chips do not fit there:
+         * scope alone measures nearly the full width, and drawing both axes as
+         * chips overlapped them into an unreadable smear. Both fold into
+         * dropdowns, which is also the arrangement that leaves the pane to its
+         * content. Sort stays out — inside one channel, newest-first is the
+         * order people expect and the list is short. */
+        g_file_scope_btn = drop_btn(rt, body.right - 20, y,
+                                    g_file_scope == FS_ALL ? "Anyone" : FS_LABEL[g_file_scope],
+                                    g_file_scope != FS_ALL);
+        g_file_type_btn  = drop_btn(rt, g_file_scope_btn.left - 8, y,
+                                    g_file_filter == FF_ALL ? "Types" : FF_LABEL[g_file_filter],
+                                    g_file_filter != FF_ALL);
+        g_file_sort_btn  = rf(0, 0, 0, 0);
     }
     return y + 32;
 }
@@ -2984,11 +3141,12 @@ static float draw_file_filters(ID2D1RenderTarget *rt, D2D1_RECT_F body) {
  * across channels, noise inside one. */
 static void draw_file_rows(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F body,
                            float y, int show_channel) {
+    files_build_order(m);
     g_n_filerows = 0;
     int shown = 0;
-    for (size_t i = 0; i < m->n_files && y < body.bottom; i++) {
+    for (int oi = 0; oi < g_n_forder && y < body.bottom; oi++) {
+        size_t i = (size_t)g_forder[oi];
         const oc_file_view *f = &m->files[i];
-        if (!file_passes(m, f)) continue;
         shown++;
         D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + 46);
         if (g_hover_filerow == f->id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
@@ -3035,9 +3193,22 @@ static void draw_file_rows(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
         }
         y += 50;
     }
-    if (!shown && m->n_files)
-        draw_text(rt, "Nothing of that type here.", g_small,
+    if (!g_n_forder && m->n_files) {
+        char none[160];
+        if (g_file_q[0]) snprintf(none, sizeof none, "No file here is named like “%s”.", g_file_q);
+        else            snprintf(none, sizeof none, "Nothing of that type here.");
+        draw_text(rt, none, g_small,
                   rf(body.left + 20, y + 6, body.right - 20, y + 26), OC_COL_FAINT);
+    }
+    /* The pane ran out before the list did. Say so: a list that just stops at
+     * the window edge reads as "that is all of them". */
+    if (shown < g_n_forder) {
+        char more[80];
+        snprintf(more, sizeof more, "%d more — narrow the filters to see them.",
+                 g_n_forder - shown);
+        draw_text(rt, more, g_small, rf(body.left + 20, body.bottom - 24, body.right - 20,
+                  body.bottom - 4), OC_COL_FAINT);
+    }
     /* The server caps the response; saying so beats a list that silently stops. */
     if (m->n_files >= OC_MAX_FILE_LIST && y < body.bottom)
         draw_text(rt, "Showing the most recent 200. Older files are in search.", g_small,
@@ -3052,28 +3223,103 @@ static void draw_filelist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F 
         overlay_empty(rt, body, "No files shared in this channel yet.");
         return;
     }
-    float y = draw_file_filters(rt, body);
+    float y = draw_file_filters(rt, body, 0);
     draw_file_rows(rt, m, body, y, 0);
+}
+
+/* The Files view's left column: "All files", then the channels that have any,
+ * each with its count. */
+static void draw_files_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
+    fill(rt, rf(RAIL_W, 0, RAIL_W + SIDEBAR_W, h), OC_COL_SIDEBAR);
+    draw_text(rt, "Files", g_hdr, rf(RAIL_W + 16, 0, RAIL_W + SIDEBAR_W - 12, HEADER_H),
+              OC_COL_TEXT);
+
+    files_index(m);
+    g_n_fchan_rows = 0;
+    float y = HEADER_H + 6;
+
+    /* "All files" is a row like any other, and selected by default, so the
+     * column always shows you where you are. */
+    {
+        D2D1_RECT_F r = rf(RAIL_W + 8, y, RAIL_W + SIDEBAR_W - 8, y + 30);
+        if (!g_file_chan) fill_round(rt, r, 6.0f, OC_COL_SELECT);
+        draw_lucide(rt, OC_ICON_FILE, rf(r.left + 8, y + 7, r.left + 24, y + 23),
+                    g_file_chan ? OC_COL_MUTED : OC_COL_TEXT);
+        draw_text(rt, "All files", g_ui, rf(r.left + 32, y + 4, r.right - 8, y + 26),
+                  g_file_chan ? OC_COL_MUTED : OC_COL_TEXT);
+        g_fchan_rows[g_n_fchan_rows++] = r;
+        y = r.bottom + 8;
+    }
+
+    draw_text(rt, "CHANNELS", g_small, rf(RAIL_W + 16, y, RAIL_W + SIDEBAR_W - 12, y + 20),
+              OC_COL_FAINT);
+    y += 22;
+
+    for (int i = 0; i < g_n_fchan && y < h - 40 &&
+                    g_n_fchan_rows < (int)(sizeof g_fchan_rows / sizeof g_fchan_rows[0]); i++) {
+        const oc_channel *c = oc_model_channel((oc_model *)m, g_fchan[i].id);
+        char label[96];
+        snprintf(label, sizeof label, "#%s", (c && c->name[0]) ? c->name : "channel");
+        D2D1_RECT_F r = rf(RAIL_W + 8, y, RAIL_W + SIDEBAR_W - 8, y + 28);
+        int on = (g_file_chan == g_fchan[i].id);
+        if (on) fill_round(rt, r, 6.0f, OC_COL_SELECT);
+        draw_text(rt, label, g_ui, rf(r.left + 12, y + 3, r.right - 44, y + 25),
+                  on ? OC_COL_TEXT : OC_COL_MUTED);
+        char cnt[16]; snprintf(cnt, sizeof cnt, "%d", g_fchan[i].n);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        draw_text(rt, cnt, g_small, rf(r.right - 40, y + 5, r.right - 10, y + 25), OC_COL_FAINT);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_fchan_rows[g_n_fchan_rows++] = r;
+        y = r.bottom + 2;
+    }
+
+    if (!g_n_fchan)
+        draw_text(rt, "Channels appear here once something is shared in them.", g_small,
+                  rf(RAIL_W + 16, y + 2, RAIL_W + SIDEBAR_W - 12, y + 60), OC_COL_FAINT);
+    else
+        /* The census comes from the page the server returned, so it is the
+         * channels among the most recent 200 files — not every channel that has
+         * ever held one. Saying which is cheaper than being asked. */
+        draw_text(rt, "From the 200 most recent files.", g_small,
+                  rf(RAIL_W + 16, h - 26, RAIL_W + SIDEBAR_W - 12, h - 6), OC_COL_FAINT);
 }
 
 /* The workspace-wide Files view (rail). The same list with `channel_id 0`, which
  * the daemon already answers as "every channel I can read" — so this view cost a
- * fetch and a header, not a protocol change. */
+ * fetch and a header, not a protocol change. Picking a channel in the left
+ * column re-asks with that id, which is exact. */
 static void draw_files_view(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
     fill(rt, rf(reg.left, reg.top, reg.right, reg.top + HEADER_H), OC_COL_HEADER);
-    draw_text(rt, "Files", g_hdr, rf(reg.left + 20, reg.top, reg.right - 20, reg.top + HEADER_H),
+    char title[96] = "All files";
+    if (g_file_chan) {
+        const oc_channel *c = oc_model_channel((oc_model *)m, g_file_chan);
+        snprintf(title, sizeof title, "Files in #%s", (c && c->name[0]) ? c->name : "channel");
+    }
+    draw_text(rt, title, g_hdr, rf(reg.left + 20, reg.top, reg.right - 130, reg.top + HEADER_H),
               OC_COL_TEXT);
+    /* Slack's "+ New" is an upload for us, and this is the one screen where that
+     * is the obvious next thing to do. */
+    g_file_up_btn = rf(reg.right - 116, reg.top + 14, reg.right - 20, reg.top + 42);
+    fill_round(rt, g_file_up_btn, 6.0f, OC_COL_ACCENT);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, "Upload\u2026", g_small, g_file_up_btn, 0xFFFFFF);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
     fill(rt, rf(reg.left, reg.top + HEADER_H - 1, reg.right, reg.top + HEADER_H), OC_COL_BORDER);
     D2D1_RECT_F body = rf(reg.left, reg.top + HEADER_H, reg.right, reg.bottom);
 
     g_n_filerows = 0;
     if (m->filelist_loading) { overlay_empty(rt, body, "Loading\u2026"); return; }
+    /* The filter row is drawn even with nothing to show: it is how you get BACK
+     * from a filter that matched nothing, and hiding it strands the user. */
+    float y = draw_file_filters(rt, body, 1);
     if (m->n_files == 0) {
-        overlay_empty(rt, body, "No files shared anywhere you can see yet.");
+        overlay_empty(rt, rf(body.left, y, body.right, body.bottom),
+                      g_file_chan ? "Nothing shared in this channel yet."
+                                  : "No files shared anywhere you can see yet.");
+        g_n_forder = 0;
         return;
     }
-    float y = draw_file_filters(rt, body);
-    draw_file_rows(rt, m, body, y, 1);
+    draw_file_rows(rt, m, body, y, !g_file_chan);
 }
 
 /* One preference row: a label, a sub-label, and a segmented set of choices on
@@ -3427,7 +3673,7 @@ static void select_tab(int t) {
     g_tab = t;
     if (!g_sel) { g_tab = TAB_MESSAGES; return; }
     if (t == TAB_PINS)  oc_client_list_pins(g_client, g_sel);
-    if (t == TAB_FILES) oc_client_list_files(g_client, g_sel);
+    if (t == TAB_FILES) { g_filelist_from_view = 0; oc_client_list_files(g_client, g_sel); }
     if (t == TAB_ABOUT) oc_client_list_members(g_client, g_sel);   /* refresh the count */
 }
 
@@ -4054,6 +4300,8 @@ static void picker_choose(HWND hwnd, const char *emoji) {
 
 static void composer_placeholder(const oc_model *m);   /* fwd */
 
+static int main_is_conversation(void);   /* fwd — decides the composer, chrome and child alike */
+
 static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     composer_placeholder(model());   /* the cue tracks the open conversation */
     float top = h - g_composer_h;
@@ -4168,9 +4416,12 @@ static void draw_modal(ID2D1RenderTarget *rt, const oc_model *m, float W, float 
  * and all but the last two also yield to `window_is_covered()`. A new view or a
  * new overlay has to be named in one of those predicates; it cannot silently
  * inherit somebody else's children. */
+static void layout_files_find(HWND hwnd);   /* fwd */
+
 static void layout_natives(HWND hwnd) {
     layout_composer(hwnd);     /* also does layout_find */
     layout_search(hwnd);
+    layout_files_find(hwnd);
 
     int covered = window_is_covered();
     if (g_pal_edit) {
@@ -4208,7 +4459,11 @@ static void layout_natives(HWND hwnd) {
 /* Activity joins Home and DMs: its list is the second column and the middle one
  * stays the conversation (ARCH-94), so clicking an item shows you the thread
  * from that point rather than replacing the transcript with a page. */
-static int view_has_sidebar(void) {
+/* Renamed from view_has_sidebar(): once Files grew a column of its own, "has a
+ * sidebar" and "is the transcript shell" stopped being the same question, and
+ * every caller below means the second one — the channel list, the header
+ * buttons, the message rows. Ask sidebar_kind() for the first. */
+static int transcript_shell(void) {
     return g_view == VIEW_HOME || g_view == VIEW_DMS || g_view == VIEW_ACTIVITY;
 }
 
@@ -4224,17 +4479,20 @@ static int view_has_sidebar(void) {
  * So anything that depends on the column's CONTENT asks this, and a new tenant
  * has to name itself here rather than silently inheriting the last one's chrome.
  * The painter switches on the same function, so the two cannot disagree. */
-enum { SBK_NONE = 0, SBK_CHANNELS, SBK_DMS, SBK_ACTIVITY };
+enum { SBK_NONE = 0, SBK_CHANNELS, SBK_DMS, SBK_ACTIVITY, SBK_FILES };
 static int sidebar_kind(void) {
-    /* NONE first, and it is the reason this enum starts there: Files, Later and
-     * Admin have no second column at all, and defaulting them to CHANNELS put
-     * the find box straight over the Files view's filter chips. A predicate
-     * whose default is a real answer will hand that answer to every case its
-     * author forgot. */
-    if (!view_has_sidebar())     return SBK_NONE;
-    if (g_view == VIEW_DMS)      return SBK_DMS;
-    if (g_view == VIEW_ACTIVITY) return SBK_ACTIVITY;
-    return SBK_CHANNELS;
+    /* NONE first, and it is the reason this enum starts there: Later and Admin
+     * have no second column at all, and defaulting them to CHANNELS put the
+     * find box straight over the Files view's filter chips. A predicate whose
+     * default is a real answer will hand that answer to every case its author
+     * forgot — so this switches on the view and names every tenant. */
+    switch (g_view) {
+    case VIEW_HOME:     return SBK_CHANNELS;
+    case VIEW_DMS:      return SBK_DMS;
+    case VIEW_ACTIVITY: return SBK_ACTIVITY;
+    case VIEW_FILES:    return SBK_FILES;
+    default:            return SBK_NONE;
+    }
 }
 
 /* Whether to PAINT the shell chrome. During sign-in that is true only when a
@@ -4703,7 +4961,12 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
              * index — an input you cannot type into is worse than none. */
             g_dm_index_now = dm_index;
         }
-        if (!g_dm_index_now) draw_composer(rt, main_x, main_w, H);
+        /* main_is_conversation(), not just the DM index: the RichEdit already
+         * hid itself under the Files/Pins/About tabs and search, but the box,
+         * its buttons and the send arrow were still PAINTED there — an input
+         * you cannot type into, which is what hiding the child was meant to
+         * prevent. One predicate now decides both. */
+        if (main_is_conversation()) draw_composer(rt, main_x, main_w, H);
         draw_autocomplete(rt, main_x, main_w, H);
         draw_emoji_picker(rt, main_x, main_w, H);
         if (members > 0) draw_members(rt, m, W, H);
@@ -4714,7 +4977,13 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         g_banner_on = 0;
         D2D1_RECT_F reg = rf(RAIL_W, 0, W, H);
         switch (g_view) {
-            case VIEW_FILES:         draw_files_view(rt, m, reg); break;
+            /* Files is the one non-transcript view with a second column of its
+             * own (WIN-67), so it narrows the region rather than taking the
+             * whole width — sidebar_kind() says SBK_FILES to match. */
+            case VIEW_FILES:
+                draw_files_sidebar(rt, m, H);
+                draw_files_view(rt, m, rf(RAIL_W + SIDEBAR_W, 0, W, H));
+                break;
             case VIEW_LATER:         draw_later(rt, m, reg); break;
             case VIEW_ADMIN:         draw_admin(rt, m, reg); break;
             default:                 draw_stub_view(rt, reg, "OpenChime", ""); break;
@@ -5027,7 +5296,7 @@ static void layout_find(HWND hwnd);   /* fwd */
  * Not the same as "this view has a sidebar": the DMs view has one, but its
  * middle column is the index (or the compose picker) until you pick someone. */
 static int main_is_conversation(void) {
-    if (!view_has_sidebar()) return 0;
+    if (!transcript_shell()) return 0;
     const oc_model *m = model();
     /* A middle-column surface that is not a conversation: search results, the
      * Pins/Files/About tabs, the admin reports. You cannot type into any of
@@ -5133,6 +5402,33 @@ static LRESULT CALLBACK find_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     return CallWindowProcW(g_find_oldproc, hwnd, msg, wp, lp);
+}
+
+/* The Files view's "Search files" box. Native child number seven, and written
+ * with the last six in mind: it is gated on its OWN view rather than on any
+ * predicate that happens to be true there today, and it reports itself in the
+ * test dump, because `shot` renders Direct2D only and cannot see it.
+ *
+ * g_file_search_box is measured during paint, so this runs from the paint path
+ * (layout_natives) as well as on resize. */
+static void layout_files_find(HWND hwnd) {
+    (void)hwnd;
+    if (!g_ffind) return;
+    int want = (g_view == VIEW_FILES) && !window_is_covered() &&
+               g_file_search_box.right > g_file_search_box.left;
+    if (!want) { ShowWindow(g_ffind, SW_HIDE); return; }
+    MoveWindow(g_ffind, PX(g_file_search_box.left + 30), PX(g_file_search_box.top + 7),
+               PX(g_file_search_box.right - g_file_search_box.left - 42), PX(18), TRUE);
+    ShowWindow(g_ffind, SW_SHOW);
+}
+
+static void files_find_create(HWND parent) {
+    g_ffind = CreateWindowExW(0, L"EDIT", L"",
+        WS_CHILD | ES_AUTOHSCROLL, 0, 0, 10, 10, parent,
+        (HMENU)(INT_PTR)0xF2, GetModuleHandleW(NULL), NULL);
+    if (!g_ffind) return;
+    SendMessageW(g_ffind, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    SendMessageW(g_ffind, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search files…");
 }
 
 static void find_create(HWND parent) {
@@ -5655,11 +5951,43 @@ static void prefs_load(const oc_model *m);   /* fwd */
 
 /* Clicks on the file list — shared by the channel's Files tab and the
  * workspace-wide Files view, which draw the same rows from the same model. */
+static void open_files_menu(int which);   /* fwd — the Types / sort dropdowns */
+
+/* Called every tick: release the shared file list when we are no longer the
+ * Files view. One guard beats remembering at every exit. */
+static void files_view_sync(void) {
+    if (g_view == VIEW_FILES || !g_filelist_from_view) return;
+    g_filelist_from_view = 0;
+    const oc_model *m = model();
+    if (m && m->filelist_open && g_client) oc_client_close_files(g_client);
+}
+
 static int files_click(HWND hwnd, int x, int y) {
     for (int i = 0; i < FF_KINDS; i++)
         if (in_rect(g_file_filters[i], (float)x, (float)y)) { g_file_filter = i; return 1; }
     for (int i = 0; i < FS_SCOPES; i++)
         if (in_rect(g_file_scopes[i], (float)x, (float)y)) { g_file_scope = i; return 1; }
+    /* Each button is a zero rect where it is not drawn, so these need no view
+     * gate — in_rect on an empty rect is false for every point. */
+    if (in_rect(g_file_type_btn,  (float)x, (float)y)) { open_files_menu(0); return 1; }
+    if (in_rect(g_file_sort_btn,  (float)x, (float)y)) { open_files_menu(1); return 1; }
+    if (in_rect(g_file_scope_btn, (float)x, (float)y)) { open_files_menu(2); return 1; }
+    if (g_view == VIEW_FILES) {
+        if (in_rect(g_file_up_btn, (float)x, (float)y)) { menu_dispatch(hwnd, 7); return 1; }
+        /* The left column. "All files" and a channel are the same kind of
+         * click: both re-ask the daemon, which is why the count and the list
+         * can never drift from each other. */
+        for (int i = 0; i < g_n_fchan_rows; i++)
+            if (in_rect(g_fchan_rows[i], (float)x, (float)y)) {
+                uint64_t want = (i == 0) ? 0 : g_fchan[i - 1].id;
+                if (want != g_file_chan) {
+                    g_file_chan = want;
+                    g_filelist_from_view = 1;
+                    if (g_client) oc_client_list_files(g_client, want);
+                }
+                return 1;
+            }
+    }
     const oc_model *fm = model();
     for (int i = 0; i < g_n_filerows && fm; i++) {
         if ((size_t)g_filerows[i].ix >= fm->n_files) continue;
@@ -5898,6 +6226,10 @@ static int on_click(HWND hwnd, int x, int y) {
             if ((float)y >= g_moreflyrows[i].top && (float)y < g_moreflyrows[i].bot &&
                 (float)x >= RAIL_W && (float)x < RAIL_W + 6 + 196) {
                 g_view = g_moreflyrows[i].act; g_more_open = 0; layout_composer(hwnd);
+                if (g_view == VIEW_FILES) {
+                    g_file_chan = 0; g_filelist_from_view = 1;
+                    oc_client_list_files(g_client, 0);
+                }
                 return 1;
             }
         g_more_open = 0;
@@ -5914,7 +6246,8 @@ static int on_click(HWND hwnd, int x, int y) {
                     /* Entering a report view fetches it: both are point-in-time
                      * and a stale one is worse than a moment's wait. */
                     if (act == VIEW_ADMIN) admin_select(g_adm_tab);
-                    if (act == VIEW_FILES) oc_client_list_files(g_client, 0);   /* 0 = everywhere */
+                    if (act == VIEW_FILES) { g_file_chan = 0; g_filelist_from_view = 1;
+                                             oc_client_list_files(g_client, 0); }
                     if (act == VIEW_ACTIVITY) oc_client_list_activity(g_client);
                     if (act == VIEW_LATER)    oc_client_list_saved(g_client);
                 }
@@ -5985,7 +6318,7 @@ static int on_click(HWND hwnd, int x, int y) {
             }
     }
     /* Everything below is only meaningful in the transcript views. */
-    if (!view_has_sidebar()) return 1;
+    if (!transcript_shell()) return 1;
 
     /* Header buttons + workspace header. */
     if (in_rect(g_hdr_gear, x, y))    { open_ws_menu(hwnd); return 1; }
@@ -7249,6 +7582,48 @@ static void open_section_menu(HWND hwnd, int sec) {
     g_menu_x = RAIL_W + 24; g_menu_y = HEADER_H + 60; g_menu_w = 236;
 }
 
+/* The Files view's two dropdowns. Ticks mark the current choice, so the menu
+ * states the filter rather than only setting it. Commands live at 900+, clear of
+ * the switcher's 100+ and the sidebar sections' 200+. */
+static void open_files_menu(int which) {
+    g_n_mi = 0;
+    char lbl[80];
+    if (which == 0) {
+        mi_section("FILE TYPE");
+        for (int i = 0; i < FF_KINDS; i++) {
+            snprintf(lbl, sizeof lbl, "%s%s", g_file_filter == i ? "\xE2\x9C\x93 " : "    ",
+                     FF_LABEL[i]);
+            mi_item(900 + i, lbl);
+        }
+        g_menu_x = g_file_type_btn.left;
+        g_menu_y = g_file_type_btn.bottom + 4;
+    } else if (which == 1) {
+        mi_section("SORT BY");
+        for (int i = 0; i < FSORT_SORTS; i++) {
+            snprintf(lbl, sizeof lbl, "%s%s", g_file_sort == i ? "\xE2\x9C\x93 " : "    ",
+                     FSORT_LABEL[i]);
+            mi_item(910 + i, lbl);
+        }
+        g_menu_x = g_file_sort_btn.left;
+        g_menu_y = g_file_sort_btn.bottom + 4;
+    } else {
+        mi_section("SHARED BY");
+        for (int i = 0; i < FS_SCOPES; i++) {
+            snprintf(lbl, sizeof lbl, "%s%s", g_file_scope == i ? "\xE2\x9C\x93 " : "    ",
+                     i == FS_ALL ? "Anyone" : FS_LABEL[i]);
+            mi_item(920 + i, lbl);
+        }
+        g_menu_x = g_file_scope_btn.left;
+        g_menu_y = g_file_scope_btn.bottom + 4;
+    }
+    g_menu = MENU_SECTION; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 200;
+    /* Opened from a right-aligned button, so it would otherwise hang off the
+     * pane; pull it back under its own right edge. */
+    float rightof = which == 0 ? g_file_type_btn.right
+                  : which == 1 ? g_file_sort_btn.right : g_file_scope_btn.right;
+    if (g_menu_x + g_menu_w > rightof) g_menu_x = rightof - g_menu_w;
+}
+
 static void open_switcher(HWND hwnd) {
     (void)hwnd;
     sw_book_load();
@@ -7295,6 +7670,9 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         if (form_dialog(hwnd, "Create a channel", f, 2) && f[0].value[0])
             oc_client_create_channel_ex(g_client, f[0].value, atoi(f[1].value) == 0);
         break; }
+    case 900: case 901: case 902: case 903: g_file_filter = cmd - 900; break;
+    case 910: case 911: case 912:           g_file_sort   = cmd - 910; break;
+    case 920: case 921: case 922:           g_file_scope  = cmd - 920; break;
     case 2:  oc_client_reconnect(g_client); break;
     case 3:  oc_client_logout(g_client, OC_LOGOUT_THIS); g_logging_out = 1; break;
     case 5:  oc_client_logout(g_client, OC_LOGOUT_ALL);  g_logging_out = 1; break;
@@ -7582,8 +7960,9 @@ static void test_dump(const char *path) {
     /* Native children are invisible to `shot` (that renders Direct2D only), so
      * they are reported here instead — otherwise the one class of bug the
      * harness cannot see is the one that reaches the user. */
-    fprintf(f, "natives re=%d find=%d srch=%d pick=%d pal=%d si_ws=%d sbkind=%d conv=%d covered=%d\n",
+    fprintf(f, "natives re=%d find=%d ffind=%d srch=%d pick=%d pal=%d si_ws=%d sbkind=%d conv=%d covered=%d\n",
             g_re && IsWindowVisible(g_re), g_find && IsWindowVisible(g_find),
+            g_ffind && IsWindowVisible(g_ffind),
             g_srch && IsWindowVisible(g_srch), g_pick_edit && IsWindowVisible(g_pick_edit),
             g_pal_edit && IsWindowVisible(g_pal_edit),
             g_si_e_ws && IsWindowVisible(g_si_e_ws),
@@ -7820,7 +8199,8 @@ static void test_poll(HWND hwnd) {
             g_view = v; layout_composer(hwnd);
             if (v == VIEW_ACTIVITY) oc_client_list_activity(g_client);
             if (v == VIEW_LATER)    oc_client_list_saved(g_client);
-            if (v == VIEW_FILES)    oc_client_list_files(g_client, 0);
+            if (v == VIEW_FILES)  { g_file_chan = 0; g_filelist_from_view = 1;
+                                    oc_client_list_files(g_client, 0); }
             if (v == VIEW_ADMIN)    admin_select(g_adm_tab);
             test_ack("ok");
         } else test_ack("err");
@@ -7865,6 +8245,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE:
         composer_create(hwnd);
         find_create(hwnd);
+        files_find_create(hwnd);
         search_create(hwnd);
         g_pal_edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL,
             0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)0xF4, GetModuleHandleW(NULL), NULL);
@@ -7913,6 +8294,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (wp == TIMER_TICK && g_client) {
             oc_client_tick(g_client);
+            files_view_sync();
             const oc_model *m = oc_client_model(g_client);
             /* A sign-in failure belongs in the card, not a toast — suppress the
              * toast channel while the sign-in view owns the window. */
@@ -8209,6 +8591,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_pick_scroll = 0;
             InvalidateRect(hwnd, NULL, FALSE);
         }
+        if (g_ffind && (HWND)lp == g_ffind && HIWORD(wp) == EN_CHANGE) {
+            WCHAR w[64]; GetWindowTextW(g_ffind, w, 64);
+            WideCharToMultiByte(CP_UTF8, 0, w, -1, g_file_q, sizeof g_file_q, NULL, NULL);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         if (g_find && (HWND)lp == g_find && HIWORD(wp) == EN_CHANGE) {
             WCHAR w[64]; GetWindowTextW(g_find, w, 64);
             char b[128]; WideCharToMultiByte(CP_UTF8, 0, w, -1, b, sizeof b, NULL, NULL);
@@ -8221,6 +8609,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         /* The find box and the sign-in fields both sit on the OC_COL_INPUT
          * surface the D2D chrome paints under them, so they share a brush. */
         if ((HWND)lp == g_find || (HWND)lp == g_srch || (HWND)lp == g_pick_edit ||
+            (HWND)lp == g_ffind ||
             (HWND)lp == g_pal_edit ||
             (HWND)lp == g_si_e_ws ||
             (HWND)lp == g_si_e_user || (HWND)lp == g_si_e_pass) {
@@ -8238,7 +8627,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         wpt.x = (LONG)DIPF(wpt.x); wpt.y = (LONG)DIPF(wpt.y);
         float dy = (float)GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 48.0f;
         const oc_model *wm = model();
-        if (view_has_sidebar() && wpt.x >= (int)RAIL_W && wpt.x < (int)(RAIL_W + SIDEBAR_W)) {
+        if (transcript_shell() && wpt.x >= (int)RAIL_W && wpt.x < (int)(RAIL_W + SIDEBAR_W)) {
             float maxs = g_sb_content > g_sb_view ? g_sb_content - g_sb_view : 0;
             g_sb_scroll -= dy;
             if (g_sb_scroll < 0) g_sb_scroll = 0;
@@ -8311,7 +8700,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (h >= 0) for (int i = 0, r = 0; i < g_n_mi; i++)
                 if (g_mi[i].kind == MK_ITEM) { if (r == h) { hi = i; break; } r++; }
             if (hi != g_menu_hover) { g_menu_hover = hi; InvalidateRect(hwnd, NULL, FALSE); }
-        } else if (view_has_sidebar() && (float)mx >= RAIL_W &&
+        } else if (transcript_shell() && (float)mx >= RAIL_W &&
                    (float)mx < RAIL_W + SIDEBAR_W) {
             /* Reveal a header's kebab while the cursor is on its row, as Slack
              * does: there when you look for it, out of the way when you don't. */
@@ -8341,7 +8730,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else {
             if (g_nav_hover != -100) { g_nav_hover = -100; InvalidateRect(hwnd, NULL, FALSE); }
             if (g_sb_hover_sec != -1)  { g_sb_hover_sec = -1;  InvalidateRect(hwnd, NULL, FALSE); }
-            int r = (any_overlay(model()) || !view_has_sidebar()) ? -1 : msgrow_at(my);
+            int r = (any_overlay(model()) || !transcript_shell()) ? -1 : msgrow_at(my);
             uint64_t h = r >= 0 ? g_msgrows[r].mid : 0;
             if (h != g_hover_mid) { g_hover_mid = h; InvalidateRect(hwnd, NULL, FALSE); }
             /* Activity / Later row hover. */

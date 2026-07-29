@@ -490,8 +490,18 @@ reports each child's `IsWindowVisible` alongside the three predicates, so every
 view can be checked without a screenshot:
 
 ```
-natives re=1 find=1 srch=0 pick=0 pal=0 si_ws=0 sbkind=1 conv=1 covered=0
+natives re=1 find=1 ffind=0 srch=0 pick=0 pal=0 si_ws=0 sbkind=1 conv=1 covered=0
 ```
+
+The rule earned its keep immediately: the Files view's own "Search files" box
+(`g_ffind`) was added next, gated on `g_view == VIEW_FILES` rather than on any
+predicate that merely happened to be true there, and checked across all six
+views from the dump before it was shown to anybody.
+
+**And the same principle applies to painted chrome.** Hiding the RichEdit under
+the Files/Pins/About tabs still left the composer's box, buttons and send arrow
+DRAWN there — an input you cannot type into, which is the thing hiding the child
+was meant to prevent. `main_is_conversation()` now decides both.
 
 ## 8. Roadmap
 

@@ -11,6 +11,9 @@
 # Commands: shot <winpath> | send <text> | channel <name> | click x y |
 #           rclick x y | members | scroll <dy> | size w h | dump <winpath> |
 #           search [query] | find <text>
+#
+# `shot <name>` and `dump <name>` take a bare name; every other path is a
+# Windows path.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXE="$HERE/build/openchime.exe"
@@ -93,6 +96,12 @@ esac
 # Convenience: `shot foo` -> render into the scratch dir and copy back as PNG-able BMP.
 if [ "$1" = "shot" ] && [ $# -eq 2 ]; then
   name="$2"; cmd="shot ${WIN_DIR}\\${name}.bmp"
+elif [ "$1" = "dump" ] && [ $# -eq 2 ]; then
+  # Same convenience as `shot`. Without it a bare name is written relative to the
+  # exe's cwd, the command still acks "ok", and you read a STALE file from an
+  # earlier run without ever being told — which is exactly the kind of silent
+  # wrong answer this harness exists to prevent.
+  name="$2"; cmd="dump ${WIN_DIR}\\${name}.txt"
 else
   cmd="$*"
 fi
@@ -107,4 +116,7 @@ echo "ack: $ack"
 
 if [ "$1" = "shot" ] && [ $# -eq 2 ]; then
   cp "$LIN_DIR/${2}.bmp" "$OUT/${2}.bmp" 2>/dev/null && echo "$OUT/${2}.bmp"
+fi
+if [ "$1" = "dump" ] && [ $# -eq 2 ]; then
+  cat "$LIN_DIR/${2}.txt" 2>/dev/null
 fi
