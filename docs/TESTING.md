@@ -245,45 +245,24 @@ integration scenarios join the `integration` job once the client-TLS decision
 
 ## Known flakiness
 
-- **`test_client_core`'s live two-client section** (`tests/test_client_core.c`,
-  the profile/password block around the `WAIT_FOR` on `last_error`) fails
-  intermittently — roughly one run in five on a loaded machine, green on the
-  retry. Every assertion there is a `WAIT_FOR` against a *real* daemon over TLS,
-  so it is a timing race in the test, not in the code under test: the assertion
-  polls for a fan-out that has not arrived within its budget. Recorded rather
-  than left as folklore. **If you see it, re-run before investigating** — but if
-  it starts failing consistently, or fails on a different assertion, that is new
-  and worth chasing.
+*None currently known.*
 
-## 5. Layout summary
+**Resolved 2026-07-29 — the one intermittent assertion.** `test_client_core`'s
+live two-client section failed occasionally on
+`WAIT_FOR(a, m->last_error[0] != '\0')` after a deliberately-rejected password
+change, and passed on the retry.
 
-```
-tests/
-  check.h                # shared CHECK macro
-  main.c                 # calls each run_<suite>_tests(), sums failures
-  test_protocol.c        # frame codec
-  test_framebuf.c        # incremental frame reassembler
-  test_migrate.c         # migration runner
-  test_dbwriter.c        # DB-writer thread: migrate-on-boot, AUTH/SEND jobs
-  itest_tls.c            # in-process: TLS handshake + TOFU pinning
-  itest_netloop.c        # in-process: two-client AUTH + SEND + BROADCAST
-  e2e_client.c           # black-box client for the harness (standalone binary)
-Scripts/
-  test-integration.sh    # brings up compose, runs the 4 e2e checks, tears down
-.github/workflows/
-  ci.yml                 # build + `make test`, and the compose e2e harness
-Makefile
-  test:                  # one binary (build/tests): unit + in-process integration
-  integration:           # Scripts/test-integration.sh (containerized daemon)
-```
+The cause is a **fragile assertion, not a slow one**: `last_error` is *cleared*
+on `OC_EV_CONNECTED` and `OC_EV_AUTH_OK`, so any reconnect between the rejection
+arriving and the check erases the evidence the test is waiting for. The wait is
+5 s (500 × 10 ms), which was never the problem.
 
-The list above is **representative, not exhaustive** — the tree also holds
-`test_auth`, `test_jwt`, `test_roles`, `test_ratelimit`, `test_http`,
-`test_sigv4`, `test_blob_s3`, `test_xferpool`, `test_storage`, `test_fuzz`,
-`test_audio`, `test_client_core`, `test_push`, `test_enroll`, `test_mention`, and
-`itest_slow_blob`, plus the `demo_client`/`bench_load` tools (filtered out of the
-suite). All unit and in-process integration suites compile into a **single** binary
-(`build/tests`): each `tests/*.c` links the module's public API (no per-test
-binary, no unity `#include` of a `.c`) and exposes `run_<suite>_tests()`, which
-`tests/main.c` aggregates. The only separate artifact is `e2e_client`, which by
-definition talks to a *deployed* daemon rather than in-process modules.
+It now asserts on **`error_seq`**, which only ever increments — the model's own
+comment says that field exists precisely so a repeated failure cannot be
+un-observed. An assertion on monotonic state cannot be raced by a clear.
+
+**Honesty about the diagnosis:** this was not reproduced on demand — 12
+consecutive runs stayed green, including six under 8-way CPU load — so the
+*trigger* for the reconnect is unproven. What is proven is that the old
+assertion could be defeated by one, and the new one cannot. If something in this
+area fails again, that is new information and worth chasing rather than retrying.

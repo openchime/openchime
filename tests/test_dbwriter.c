@@ -1151,6 +1151,101 @@ static oc_dbres *chan_update(oc_dbwriter *w, uint64_t uid, uint64_t ch, uint8_t 
     return wait_result(w);
 }
 
+/* A tombstone drops everything that hung off the body (REQ-052). The reactions
+ * and pins were already dropped; the attachments were not, which leaked a blob
+ * per deleted message and left clients rendering a file the message no longer
+ * had. */
+static void test_delete_clears_message_extras(void) {
+    const char *path = "build/test_dbwriter_tomb.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t alice = reg(w, "alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0xF1, sizeof idem);
+    uint64_t mid = send_msg(w, alice, idem, "delete me");
+    CHECK(mid != 0);
+
+    /* An attachment on the message, and a pin, and reactions from both users. */
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        char sql[512];
+        snprintf(sql, sizeof sql,
+                 "INSERT INTO attachments(id,channel_id,message_id,uploader_id,storage_key,"
+                 "filename,mime,size,created_at_ms,reclaimed_at_ms) "
+                 "VALUES(1,%llu,%llu,%llu,'k','notes.txt','text/plain',13,1000,0);",
+                 (unsigned long long)OC_DEFAULT_CHANNEL, (unsigned long long)mid,
+                 (unsigned long long)alice);
+        CHECK(sqlite3_exec(raw, sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+    oc_dbres_free(chan_member(w, OC_JOB_INVITE_CHANNEL, alice, OC_DEFAULT_CHANNEL, bob));
+    {
+        oc_job *j = oc_job_new(OC_JOB_REACT, 520);
+        j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = mid;
+        j->react_op = OC_REACT_ADD; j->emoji = strdup("\xF0\x9F\x91\x8D");
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
+    oc_dbres_free(pin(w, alice, OC_DEFAULT_CHANNEL, mid, OC_PIN_ADD));
+
+    {
+        oc_job *j = oc_job_new(OC_JOB_DELETE, 521);
+        j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = mid;
+        oc_dbwriter_submit(w, j);
+        oc_dbres *r = wait_result(w);
+        CHECK(r && r->type == OC_RES_DELETE_OK);
+        oc_dbres_free(r);
+    }
+
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        sqlite3_stmt *st = NULL;
+        /* The message row survives as a tombstone (thread linkage, REQ-052)... */
+        sqlite3_prepare_v2(raw, "SELECT body IS NULL, deleted_at_ms IS NOT NULL "
+                                "FROM messages WHERE id=?;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+        CHECK(sqlite3_step(st) == SQLITE_ROW);
+        CHECK(sqlite3_column_int(st, 0) == 1 && sqlite3_column_int(st, 1) == 1);
+        sqlite3_finalize(st);
+
+        /* ...but nothing that hung off the body does. */
+        sqlite3_prepare_v2(raw, "SELECT COUNT(*) FROM reactions WHERE message_id=?;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+        CHECK(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 0);
+        sqlite3_finalize(st);
+
+        sqlite3_prepare_v2(raw, "SELECT COUNT(*) FROM pins WHERE message_id=?;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+        CHECK(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 0);
+        sqlite3_finalize(st);
+
+        /* The attachment is DETACHED, not deleted: message_id NULL is exactly the
+         * "orphan" state the storage-maintenance sweep already collects, so the
+         * blob is reclaimed by a path that is already written and tested. */
+        sqlite3_prepare_v2(raw, "SELECT message_id IS NULL FROM attachments WHERE id=1;", -1, &st, NULL);
+        CHECK(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 1);
+        sqlite3_finalize(st);
+        sqlite3_close(raw);
+    }
+
+    /* And the backfill no longer offers the file with the tombstone. */
+    oc_dbres *r = backfill(w, alice, OC_DEFAULT_CHANNEL, 0);
+    CHECK(r);
+    for (size_t i = 0; i < r->n_replay; i++)
+        if (r->replay[i].message_id == mid) CHECK(r->replay[i].n_attach == 0);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_channel_mutability(void) {
     const char *path = "build/test_dbwriter_chanmut.db";
     cleanup_db(path);
@@ -2637,7 +2732,7 @@ static void test_max_users(void) {
 }
 
 int run_dbwriter_tests(void) {
-    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability\n");
+    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup\n");
     test_start_migrates_and_stops();
     test_auth_and_send();
     test_oidc_auth();
@@ -2665,6 +2760,7 @@ int run_dbwriter_tests(void) {
     test_pins();
     test_channel_details();
     test_channel_mutability();
+    test_delete_clears_message_extras();
     test_max_users();
     return failures;
 }

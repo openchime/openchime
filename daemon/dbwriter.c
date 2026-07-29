@@ -1504,6 +1504,17 @@ static oc_dbres *process_delete(sqlite3 *db, const oc_job *j) {
     if (rc != SQLITE_DONE) {
         r->type = OC_RES_DELETE_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
+    /* Detach the attachments (REQ-052). The row is not deleted and the blob is
+     * not deleted here: setting message_id NULL makes them *orphans*, which is
+     * exactly the state the storage-maintenance orphan sweep already collects
+     * (ARCH-78) — so the bytes are reclaimed by a path that is already written
+     * and tested, on its own schedule, off the writer thread. What matters for
+     * correctness is that they leave the message immediately: a tombstone that
+     * still lists a file is offering something it no longer has. */
+    sqlite3_prepare_v2(db, "UPDATE attachments SET message_id=NULL WHERE message_id=?;",
+                       -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
+
     /* A tombstone has nothing to pin to either (REQ-052/230). Dropped before the
      * reactions so the order matches the table dependencies. */
     sqlite3_prepare_v2(db, "DELETE FROM pins WHERE message_id=?;", -1, &st, NULL);

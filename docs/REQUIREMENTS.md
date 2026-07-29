@@ -320,9 +320,11 @@ the requirement says so explicitly rather than implying one.
   and thread linkage preserved; body removed) rather than removing the row,
   so that thread reply counts and quoted references have not broken.
   A tombstone has also dropped everything that hung off the body — its
-  reactions, its pins, and **its attachments** (rows and blobs). *Partially
-  built:* reactions and pins are dropped; attachments are **not**, which leaks a
-  blob per deleted message (WIN-61 in the Win32 backlog records the observation).
+  reactions, its pins, and **its attachments**. **Built:** reactions and pins are
+  deleted outright; an attachment is *detached* (`message_id` set NULL), which is
+  the orphan state the storage-maintenance sweep (ARCH-78) already reclaims — so
+  it leaves the message immediately and its blob is collected by an existing,
+  tested path rather than a second deletion mechanism.
 
 - **REQ-053.** Full message history has had no retention cutoff or paid-tier
   history cap of the kind Slack's free tier imposes.

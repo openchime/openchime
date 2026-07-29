@@ -803,8 +803,14 @@ int run_client_core_tests(void) {
         CHECK(WAIT_FOR(b, strcmp(oc_model_user_name(m, danaid), "Dana Q") == 0));
         oc_client_change_password(a, "pw-dana", "pw-dana-2");
         CHECK(WAIT_FOR(a, strstr(m->status, "profile updated") != NULL));
+        /* Assert on error_seq, not on last_error's text. `last_error` is CLEARED
+         * on OC_EV_CONNECTED/AUTH_OK, so any reconnect between the rejection
+         * arriving and this check wipes the evidence — a race that made this the
+         * one intermittently-failing assertion in the suite. `error_seq` only
+         * ever increments, so it cannot be un-observed. */
+        uint32_t errs_before = oc_client_model(a)->error_seq;
         oc_client_change_password(a, "wrong-old", "irrelevant");   /* rejected */
-        CHECK(WAIT_FOR(a, m->last_error[0] != '\0'));
+        CHECK(WAIT_FOR(a, m->error_seq > errs_before));
         oc_client_change_password(a, "pw-dana-2", "pw-dana");       /* restore password */
         oc_client_set_display_name(a, "dana");                      /* restore name */
         CHECK(WAIT_FOR(a, strcmp(oc_model_user_name(m, danaid), "dana") == 0));

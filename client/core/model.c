@@ -31,6 +31,23 @@ static void channel_free(oc_channel *c) {
     free(c->readers);
 }
 
+/* Turn a message into a tombstone (REQ-052). The body is not the only thing that
+ * goes: reactions, attachments and any pin hung off a body that no longer
+ * exists. The daemon drops the same state server-side, so leaving it here left
+ * the client showing rows the server had already deleted — a live view that
+ * disagreed with what a reload would produce. */
+static void msg_tombstone(oc_msg *msg) {
+    msg->deleted = 1;
+    free(msg->reactions);
+    msg->reactions = NULL;
+    msg->n_reactions = msg->cap_reactions = 0;
+    free(msg->attach);
+    msg->attach = NULL;
+    msg->n_attach = msg->cap_attach = 0;
+    msg->pinned = 0;
+    msg->pinned_by = msg->pinned_at = 0;
+}
+
 /* Apply a PIN event to one message, wherever it lives (REQ-230). */
 static void msg_set_pinned(oc_msg *msg, const oc_ev *e) {
     msg->pinned    = (e->op == 1);
@@ -797,9 +814,16 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         oc_channel *c = oc_model_channel(m, e->channel_id);
         if (c) {
             for (size_t i = 0; i < c->n_msgs; i++) {
-                if (c->msgs[i].message_id == e->message_id) { c->msgs[i].deleted = 1; break; }
+                if (c->msgs[i].message_id == e->message_id) { msg_tombstone(&c->msgs[i]); break; }
             }
         }
+        /* A deleted thread reply lives in the open thread, not the channel list
+         * — the same omission that hid a pinned reply (WIN-15's lesson, twice). */
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == e->message_id) {
+                msg_tombstone(&m->thread_msgs[i]);
+                break;
+            }
         break;
     }
     case OC_EV_THREAD_REPLY:

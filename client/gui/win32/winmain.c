@@ -582,6 +582,9 @@ static int g_tab;                       /* the selected channel tab (WIN-37) */
 static D2D1_RECT_F g_tab_r[TAB_COUNT];  /* tab hit-boxes */
 static D2D1_RECT_F g_memchip;           /* header member-count chip */
 static int g_tab_hover = -1;
+/* Reaction-chip hit-boxes, rebuilt every frame like the thumbnail ones. */
+static struct { D2D1_RECT_F r; uint64_t mid; char emoji[40]; uint8_t mine; } g_chips[128];
+static int g_n_chips;
 static D2D1_RECT_F g_about_topic, g_about_rename, g_about_archive;
 static struct { D2D1_RECT_F row, dl; int ix; } g_filerows[64];
 static int g_n_filerows;
@@ -1801,28 +1804,7 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
     }
     /* "(edited)" is drawn inline by body_layout (faint, after the last word). */
 
-    /* Meta lines: reactions, attachments, thread. */
-    if (msg->n_reactions) {
-        /* Chips rather than one grey text run: the emoji needs the colour-font
-         * path anyway, and a bordered count reads as the clickable thing it is. */
-        float cx = tx, ch = 22, top = by + 1;
-        for (int i = 0; i < msg->n_reactions; i++) {
-            char cnt[16];
-            snprintf(cnt, sizeof cnt, "%u", msg->reactions[i].count);
-            float cw = 34 + text_width(cnt, g_small);
-            if (cx + cw > x0 + content_w + AVA + 12) break;
-            D2D1_RECT_F chip = rf(cx, top, cx + cw, top + ch);
-            int mine = reaction_is_mine(msg, msg->reactions[i].emoji);
-            fill_round(rt, chip, 11.0f, mine ? OC_COL_SELECT : OC_COL_INPUT);
-            stroke_round(rt, chip, 11.0f, mine ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
-            draw_emoji_fmt(rt, msg->reactions[i].emoji,
-                           rf(cx + 4, top, cx + 22, top + ch), g_emoji_s);
-            draw_text(rt, cnt, g_small, rf(cx + 24, top, chip.right - 4, top + ch),
-                      mine ? OC_COL_TEXT : OC_COL_MUTED);
-            cx += cw + 5;
-        }
-        by += LINE_H;
-    }
+    /* Meta lines: attachments, thread, then reactions LAST — see below. */
     for (int i = 0; i < msg->n_attach; i++) {
         const oc_attachment *at = &msg->attach[i];
         if (!at->reclaimed && mime_is_image(at->mime)) {
@@ -1917,6 +1899,43 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
         snprintf(line, sizeof line, "\xE2\x86\xB3 %u %s", msg->reply_count,
                  msg->reply_count == 1 ? "reply" : "replies");
         draw_text(rt, line, g_small, rf(tx, by, x0 + content_w + AVA + 12, by + LINE_H), OC_COL_ACCENT);
+        by += LINE_H;
+    }
+
+    /* Reactions LAST, under everything the message carries. Drawn between the
+     * body and the attachments they were stranded mid-block on any message with
+     * an image; they are the footer of a message, not part of its text.
+     *
+     * Chips rather than one grey run: the emoji needs the colour-font path
+     * anyway, and a bordered count reads as the clickable thing it now is. */
+    if (msg->n_reactions) {
+        float cx = tx, ch = 22, top = by + 1;
+        for (int i = 0; i < msg->n_reactions; i++) {
+            char cnt[16];
+            snprintf(cnt, sizeof cnt, "%u", msg->reactions[i].count);
+            float cw = 34 + text_width(cnt, g_small);
+            if (cx + cw > x0 + content_w + AVA + 12) break;
+            D2D1_RECT_F chip = rf(cx, top, cx + cw, top + ch);
+            int mine = reaction_is_mine(msg, msg->reactions[i].emoji);
+            fill_round(rt, chip, 11.0f, mine ? OC_COL_SELECT : OC_COL_INPUT);
+            stroke_round(rt, chip, 11.0f, mine ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
+            draw_emoji_fmt(rt, msg->reactions[i].emoji,
+                           rf(cx + 4, top, cx + 22, top + ch), g_emoji_s);
+            draw_text(rt, cnt, g_small, rf(cx + 24, top, chip.right - 4, top + ch),
+                      mine ? OC_COL_TEXT : OC_COL_MUTED);
+            /* Hit-box so a chip can be clicked: +1, or undo if it is already
+               yours. The direction is `mine`, exactly as the message menu
+               computes it — one rule, two entry points. */
+            if (g_n_chips < (int)(sizeof g_chips / sizeof g_chips[0])) {
+                g_chips[g_n_chips].r = chip;
+                g_chips[g_n_chips].mid = msg->message_id;
+                g_chips[g_n_chips].mine = (uint8_t)mine;
+                snprintf(g_chips[g_n_chips].emoji, sizeof g_chips[g_n_chips].emoji,
+                         "%s", msg->reactions[i].emoji);
+                g_n_chips++;
+            }
+            cx += cw + 5;
+        }
     }
 }
 
@@ -2063,6 +2082,10 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
     float y = (reg.bottom - total) + *scroll;     /* g_scroll 0 => newest pinned to bottom */
 
     ID2D1RenderTarget_PushAxisAlignedClip(rt, &reg, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    /* Chip hit-boxes reset unconditionally: the thread pane draws chips too, and
+     * only one of the two lists is drawn per frame — resetting only on `capture`
+     * would leave the thread's chips pointing at stale rectangles. */
+    g_n_chips = 0;
     if (capture) { g_n_msgrows = 0; g_n_thumb_hits = 0; g_n_thumb_dl = 0; }
     else if (hits) g_n_thrrows = 0;
     for (size_t i = 0; i < n; i++) {
@@ -5091,6 +5114,21 @@ static int on_click(HWND hwnd, int x, int y) {
             return 1;
         }
     }
+    /* A reaction chip: +1 it, or undo it if it is already yours (REQ-070).
+     * Tested before the message rows, which cover the same pixels. */
+    for (int i = 0; i < g_n_chips; i++)
+        if (in_rect(g_chips[i].r, x, y)) {
+            /* A reply's chips belong to the thread's channel, not the selected
+             * one — the same lookup the message menu does (WIN-15's lesson). */
+            const oc_model *rm = model();
+            uint64_t rch = g_sel;
+            if (rm && rm->thread_open && !find_msg(oc_model_channel((oc_model *)rm, g_sel),
+                                                   g_chips[i].mid))
+                rch = rm->thread_channel;
+            oc_client_react(g_client, rch, g_chips[i].mid, g_chips[i].emoji,
+                            g_chips[i].mine ? OC_REACT_REMOVE : OC_REACT_ADD);
+            return 1;
+        }
     /* Rows of the open files list. */
     {
         const oc_model *fm = model();
@@ -6809,6 +6847,27 @@ static void test_poll(HWND hwnd) {
         sscanf(arg, "%63s %d", nm, &pub);
         if (g_client && nm[0]) { oc_client_create_channel_ex(g_client, nm, pub == 0); test_ack("ok"); }
         else test_ack("err");
+    } else if (!strcmp(verb, "del")) {
+        /* Delete a message without the modal menu; mid 0 = the newest. */
+        unsigned long long mid = strtoull(arg, NULL, 10);
+        const oc_model *dm = model();
+        const oc_channel *dc = dm && g_sel ? oc_model_channel((oc_model *)dm, g_sel) : NULL;
+        if (!mid && dc && dc->n_msgs) mid = dc->msgs[dc->n_msgs - 1].message_id;
+        if (g_client && mid) { oc_client_delete(g_client, g_sel, (uint64_t)mid); test_ack("ok"); }
+        else test_ack("err");
+    } else if (!strcmp(verb, "react")) {
+        /* "<mid> <emoji>"; mid 0 = the newest message. Bypasses the modal menu. */
+        unsigned long long mid = 0; char emo[40] = {0};
+        sscanf(arg, "%llu %39s", &mid, emo);
+        const oc_model *rm = model();
+        const oc_channel *rc = rm && g_sel ? oc_model_channel((oc_model *)rm, g_sel) : NULL;
+        if (!mid && rc && rc->n_msgs) mid = rc->msgs[rc->n_msgs - 1].message_id;
+        const oc_msg *rmsg = find_msg(rc, (uint64_t)mid);
+        if (g_client && mid && emo[0]) {
+            oc_client_react(g_client, g_sel, (uint64_t)mid, emo,
+                            (rmsg && reaction_is_mine(rmsg, emo)) ? OC_REACT_REMOVE : OC_REACT_ADD);
+            test_ack("ok");
+        } else test_ack("err");
     } else if (!strcmp(verb, "chup")) {
         /* Bypass the modal form, as "mkchan" and "upload" do. */
         int op = 0; char val[256] = {0};

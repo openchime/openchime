@@ -9,7 +9,7 @@ clients, or a `REQ-NNN`.
 parity table is the *feature reachability* tracker. This document is the *work
 list* derived from both — one row per shippable branch.
 
-**Ids.** Items are `WIN-1` … `WIN-63`, numbered once and **stable**: an id is
+**Ids.** Items are `WIN-1` … `WIN-65`, numbered once and **stable**: an id is
 never renumbered or reused, so a commit or branch can cite it. Ordering is *not*
 priority — the **Pri** column is, and it may change. Section membership may also
 change as blockers clear (an item moves from §3 to §1 without changing its id).
@@ -60,6 +60,8 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 | ~~**WIN-27**~~ | ~~**Draft persistence (REQ-223).**~~ **DONE, in-memory half.** Up to 24 per-channel drafts survive a channel switch for the life of the process; sending clears the one for that channel, and an edit-in-progress is not treated as a draft. **Cross-restart drafts are not done** and need the server-synced `client_settings` route (ARCH-88 leaves no third option) — a separate decision, not an oversight. | P2 | M |
 | ~~**WIN-28**~~ | ~~**Configurable quick reactions (REQ-073).**~~ **DONE.** The six literals became a preference holding **shortcodes**, resolved through the shared catalogue (`oc_emoji_by_name`) so an unknown name drops out rather than writing a broken glyph, with a fallback if the set ends up empty. Edited from Preferences, persisted in the `gui` bucket. Offered in the message menu; inline-on-hover is not done. | P2 | S |
 | ~~**WIN-29**~~ | ~~**N-concurrent-workspace model (REQ-012–015).**~~ **DONE.** Up to 8 clients are held and **all are ticked every frame**; only the active one renders. Rather than thread a workspace handle through the ~100 sites using `g_client`/`g_sel`/`g_scroll`, those stay as the *active* workspace's state and a slot array holds the rest — switching saves the active globals into their slot and loads the target's, so the diff is confined to switching and ticking. A red "N elsewhere" badge on the rail avatar, per-row unread in the switcher, notifications that name the originating workspace, and a quit guard that counts unsent messages across all of them. Verified against **two real daemons**: both authed at once, the backgrounded workspace received a new message live (22→23 unread) and raised its notification, and switching back was instant with selection, unread and reactions intact. | P1 | L |
+| **WIN-64** | **Move the connection indicator to the workspace, where it belongs.** "connected" currently sits in the *channel* header, which reads as a property of the channel; it is workspace state. Replace it with a small dot beside the workspace name (**Acme HQ**) — filled when connected, hollow when not — and make clicking it retry when disconnected. *Design notes:* it needs a **third state**, because "connecting/backing off" is not the same as "down" — reuse `draw_presence_dot`'s filled/hollow plus an accent ring rather than inventing a widget. It coexists with the WIN-1 banner rather than replacing it: the banner is the loud, explaining affordance with the countdown, the dot is the ambient one, and only the banner should carry the countdown text. Design it as a reusable widget: with N workspaces on the rail (REQ-012–015) each avatar eventually wants the same dot. | P1 | S |
+| **WIN-65** | **Member panel: role as a second indicator column, not a text label.** Replace the trailing "owner"/"admin" words with a small glyph in a column beside the presence dot. *Design notes:* show it **only** for owner/admin — a marker on every row is noise, and "member" is the default. A bare glyph is not self-describing, so it is an at-a-glance hint whose *answer* is the profile pane (WIN-10), which already names the role; a tooltip would be better still. Worth remembering that role is **tenant-wide**, not per-channel, so in a channel roster it is genuinely secondary information — which is the argument for demoting it from text to an indicator in the first place. | P2 | S |
 
 ## §2 Ready now, with a small app-core change
 
@@ -175,7 +177,15 @@ than against the backlog:
 
 Recorded because a defect nobody wrote down is a defect nobody fixes.
 
-- **WIN-61 — a deleted message keeps its reaction chips and its attachment.**
+- ~~**WIN-61 — a deleted message keeps its reaction chips and its attachment.**~~
+  **FIXED 2026-07-29** on both sides: the client tombstones the message in the
+  model (clearing reactions, attachments and any pin, in the thread list as well
+  as the channel list), and the daemon detaches the attachments — `message_id`
+  NULL, which is the *orphan* state its storage-maintenance sweep already
+  collects, so the blob is reclaimed by a path already written and tested.
+  Regression-tested on both sides. Original report kept below.
+
+  ~~Original report:~~
   Observed 2026-07-28: a tombstone rendered "(message deleted)" with 👍1 😮1 still
   under it and `notes.txt` still attached. Three distinct faults behind one
   screenshot:
@@ -190,7 +200,13 @@ Recorded because a defect nobody wrote down is a defect nobody fixes.
      and reaction cleanups already fix beside it.
   3. **A tombstone should also lose its thread replies' claim on it** — worth
      checking while in there; not yet verified either way.
-- **WIN-63 — reaction chips sit above the attachments, not below them.**
+- ~~**WIN-63 — reaction chips sit above the attachments, not below them.**~~
+  **FIXED 2026-07-29** — chips are drawn last, under everything the message
+  carries. Only `draw_message` needed changing: `msg_height` counts the meta
+  lines, and reordering them does not change the total, which is why the
+  backlog's original note about "one reordering applied twice" was wrong.
+
+  ~~Original report:~~
   `draw_message` lays a block out as body → chips → attachments/thumbnails →
   thread line, so on a message with an image the reactions are stranded in the
   middle. They belong at the **bottom of the block**, under everything the
@@ -199,7 +215,12 @@ Recorded because a defect nobody wrote down is a defect nobody fixes.
   order the meta lines the same way, so the fix is one reordering applied twice —
   and they must stay in step or the transcript's hit-boxes drift from what is
   drawn.
-- **WIN-62 — reaction chips are not clickable.** The chips render but have no
+- ~~**WIN-62 — reaction chips are not clickable.**~~ **FIXED 2026-07-29.**
+  Clicking a chip +1s it, clicking one that is already yours undoes it —
+  direction from `reaction_is_mine`, the same rule the message menu uses, so the
+  two entry points cannot disagree. Verified live in both directions.
+
+  ~~Original report:~~ The chips render but have no
   hit-boxes, so the only way to react is the message menu. Clicking a chip should
   **+1 it**, and clicking one you are already part of should **undo** your
   reaction. The app-core already supports both (`oc_client_react` with
