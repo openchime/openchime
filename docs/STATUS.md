@@ -161,8 +161,8 @@ Legend: ✅ done · 🔨 in progress · ⛔ not started.
 | Attachments: upload | `upload` | ✅ | Composer "+" button + drag-drop anywhere. |
 | Notifications / DND | `set_notify_pref`, `set_dnd`, `list_notify_prefs` | ✅ | Channel menu level + rail → profile avatar → Do not disturb… (raw `HH:MM-HH:MM` prompt, no picker) + a **Notifications pane** (WIN-12) that calls `list_notify_prefs` and edits the per-channel level. |
 | Self-service profile | `set_display_name`, `change_password` | ✅ | Rail → profile avatar → Change display name… / Change password… (one dialog each; the password form has a confirm field, WIN-20). |
-| Webhooks | `webhooks`, `create_webhook`, `delete_webhook` | ✅ | Channel menu → Webhooks… / Create webhook…; overlay, click-to-delete. |
-| Storage / audit (admin) | `storage_status`, `audit_query` | ✅ | Rail → workspace menu → Storage usage / Audit log overlays (owner/admin only). |
+| Webhooks | `webhooks`, `create_webhook`, `delete_webhook` | ✅ | Channel **About** tab → Webhooks… (channel-scoped admin belongs with the channel, ARCH-94); also the channel menu. Overlay, click-to-delete. |
+| Storage / audit (admin) | `storage_status`, `audit_query` | ✅ | Rail → **Admin** (Storage · Audit log tabs, refetched on entry, owner/admin only); also on the workspace menu. |
 | Settings sync | `set_client_type`, `set_setting`, `list_settings` | ✅ | Identifies the `gui` bucket + lists on connect. |
 | Read receipts (seen-by) | model `readers[]` | ✅ | "✓ Seen by …" footer under the transcript. |
 | Logout | `logout` | ✅ | Rail → workspace menu → Sign out / Sign out everywhere; window closes on the drop. |

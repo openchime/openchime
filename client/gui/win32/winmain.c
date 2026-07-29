@@ -617,7 +617,7 @@ static int g_tab_hover = -1;
 /* Reaction-chip hit-boxes, rebuilt every frame like the thumbnail ones. */
 static struct { D2D1_RECT_F r; uint64_t mid; char emoji[40]; uint8_t mine; } g_chips[128];
 static int g_n_chips;
-static D2D1_RECT_F g_about_topic, g_about_rename, g_about_archive;
+static D2D1_RECT_F g_about_topic, g_about_rename, g_about_archive, g_about_hooks;
 static struct { D2D1_RECT_F row, dl; int ix; } g_filerows[64];
 static int g_n_filerows;
 static uint64_t g_hover_filerow;
@@ -2444,8 +2444,11 @@ static void draw_kv(ID2D1RenderTarget *rt, D2D1_RECT_F body, float *y,
  * flat key/value dump with no way to ask again. */
 static D2D1_RECT_F g_storage_refresh;
 
-static void draw_storage(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
-    D2D1_RECT_F body = overlay_header(rt, reg, "Storage usage");
+/* `embedded` = drawn inside another surface that already has a header (the Admin
+ * view). Two stacked titles, the inner one offering "Esc to close" for something
+ * Esc does not close, is worse than no title. */
+static void draw_storage(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg, int embedded) {
+    D2D1_RECT_F body = embedded ? reg : overlay_header(rt, reg, "Storage usage");
 
     g_storage_refresh = rf(body.right - 116, body.top + 8, body.right - 20, body.top + 36);
     fill_round(rt, g_storage_refresh, 6.0f, OC_COL_INPUT);
@@ -2496,8 +2499,8 @@ static const char *audit_family(uint8_t f) {
     return f == 1 ? "admin" : f == 2 ? "account" : f == 3 ? "security" : f == 4 ? "moderation" : "";
 }
 
-static void draw_audit(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
-    D2D1_RECT_F body = overlay_header(rt, reg, "Audit log");
+static void draw_audit(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg, int embedded) {
+    D2D1_RECT_F body = embedded ? reg : overlay_header(rt, reg, "Audit log");
     ovl_use(OVL_AUDIT);
     if (m->n_audit == 0) { overlay_empty(rt, body, "No audit entries."); return; }
 
@@ -2736,7 +2739,7 @@ static void draw_keys(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
  * are not allowed to use is worse than no affordance — but the daemon enforces
  * it regardless, so hiding is courtesy, not security. */
 static void draw_about(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
-    g_about_topic = g_about_rename = g_about_archive = rf(0, 0, 0, 0);
+    g_about_topic = g_about_rename = g_about_archive = g_about_hooks = rf(0, 0, 0, 0);
     const oc_channel *c = oc_model_channel((oc_model *)m, g_sel);
     if (!c) { overlay_empty(rt, reg, "No channel."); return; }
 
@@ -2793,6 +2796,15 @@ static void draw_about(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
         y += 18;
         draw_text(rt, "ADMIN", g_small, rf(x, y, x + w, y + 20), OC_COL_FAINT);
         y += 24;
+        /* Webhooks are channel-scoped admin, so the channel's own settings page
+         * is where they belong — they were reachable only from a right-click
+         * menu, which is not somewhere anyone looks for configuration. */
+        g_about_hooks = rf(x + 320, y, x + 440, y + 28);
+        stroke_round(rt, g_about_hooks, 6.0f, OC_COL_BORDER, 1.0f);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Webhooks\u2026", g_small, g_about_hooks, OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+
         g_about_rename = rf(x, y, x + 150, y + 28);
         stroke_round(rt, g_about_rename, 6.0f, OC_COL_BORDER, 1.0f);
         IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -3148,8 +3160,8 @@ static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
     if (m->filelist_open)  { draw_filelist(rt, m, reg);  return; }
     if (g_tab == TAB_ABOUT) { draw_about(rt, m, reg);    return; }
     if (m->weblist_open)   { draw_weblist(rt, m, reg);   return; }
-    if (m->storage_open)   { draw_storage(rt, m, reg);   return; }
-    if (m->audit_open)     { draw_audit(rt, m, reg);     return; }
+    if (m->storage_open)   { draw_storage(rt, m, reg, 0);   return; }
+    if (m->audit_open)     { draw_audit(rt, m, reg, 0);     return; }
 
     const oc_channel *c = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
     if (!c) {
@@ -4018,6 +4030,58 @@ static int shell_visible(void) {
     return g_view == VIEW_HOME || g_view == VIEW_DMS;
 }
 
+/* The Admin view (rail). Workspace-scoped, so it lives in the MIDDLE column by
+ * ARCH-94 — but it used to be a stub whose entire content was an instruction to
+ * open the workspace menu instead, which is a dead end wearing a signpost. Both
+ * reports were already built; this just puts them where the rail already
+ * promised they were. */
+enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_COUNT };
+static int g_adm_tab;
+static D2D1_RECT_F g_adm_tabs[ADM_COUNT];
+
+static void admin_select(int t) {
+    g_adm_tab = t;
+    if (!g_client) return;
+    /* Ask on entry: these are point-in-time reports, and a stale one is worse
+     * than a moment's wait. */
+    if (t == ADM_STORAGE) { oc_client_toggle_storage(g_client, 1); oc_client_storage_status(g_client); }
+    else                  { oc_client_toggle_audit(g_client, 1);   oc_client_audit_query(g_client, 0); }
+}
+
+static void draw_admin(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    fill(rt, rf(reg.left, reg.top, reg.right, reg.top + HEADER_H), OC_COL_HEADER);
+    draw_text(rt, "Admin", g_hdr, rf(reg.left + 20, reg.top, reg.right - 20, reg.top + HEADER_H),
+              OC_COL_TEXT);
+    fill(rt, rf(reg.left, reg.top + HEADER_H, reg.right, reg.top + HEADER_H + TABBAR_H), OC_COL_HEADER);
+    fill(rt, rf(reg.left, reg.top + HEADER_H + TABBAR_H - 1, reg.right,
+                reg.top + HEADER_H + TABBAR_H), OC_COL_BORDER);
+
+    static const struct { const char *label; int icon; } T[ADM_COUNT] = {
+        { "Storage",   OC_ICON_FILE },
+        { "Audit log", OC_ICON_SETTINGS },
+    };
+    float tx = reg.left + 16, ty = reg.top + HEADER_H;
+    for (int i = 0; i < ADM_COUNT; i++) {
+        float tw = 26 + text_width(T[i].label, g_ui) + 16;
+        D2D1_RECT_F r = rf(tx, ty + 2, tx + tw, ty + TABBAR_H - 1);
+        int on = (g_adm_tab == i);
+        uint32_t col = on ? OC_COL_TEXT : OC_COL_MUTED;
+        draw_lucide(rt, T[i].icon, rf(r.left + 6, r.top + 8, r.left + 22, r.bottom - 8), col);
+        draw_text(rt, T[i].label, g_ui, rf(r.left + 26, r.top, r.right, r.bottom), col);
+        if (on) fill(rt, rf(r.left + 4, r.bottom - 2, r.right - 4, r.bottom), OC_COL_ACCENT);
+        g_adm_tabs[i] = r;
+        tx = r.right + 4;
+    }
+
+    D2D1_RECT_F body = rf(reg.left, ty + TABBAR_H, reg.right, reg.bottom);
+    if (self_role(m) < OC_ROLE_ADMIN) {
+        overlay_empty(rt, body, "Admin only.");
+        return;
+    }
+    if (g_adm_tab == ADM_STORAGE) draw_storage(rt, m, body, 1);
+    else                          draw_audit(rt, m, body, 1);
+}
+
 /* A full-pane placeholder for views whose backing feature isn't built yet. */
 static void draw_stub_view(ID2D1RenderTarget *rt, D2D1_RECT_F reg,
                            const char *title, const char *sub) {
@@ -4076,7 +4140,7 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
             case VIEW_ACTIVITY:      draw_stub_view(rt, reg, "Activity", "Activity feed \xE2\x80\x94 coming soon"); break;
             case VIEW_FILES:         draw_stub_view(rt, reg, "Files", "File browser \xE2\x80\x94 coming soon"); break;
             case VIEW_LATER:         draw_stub_view(rt, reg, "Later", "Saved items \xE2\x80\x94 coming soon"); break;
-            case VIEW_ADMIN:         draw_stub_view(rt, reg, "Admin", "Storage & audit \xE2\x80\x94 open from the workspace menu"); break;
+            case VIEW_ADMIN:         draw_admin(rt, m, reg); break;
             default:                 draw_stub_view(rt, reg, "OpenChime", ""); break;
         }
         g_n_memrows = 0;
@@ -5195,7 +5259,11 @@ static int on_click(HWND hwnd, int x, int y) {
         for (int i = 0; i < g_n_navrows; i++)
             if ((float)y >= g_navrows[i].top && (float)y < g_navrows[i].bot) {
                 int act = g_navrows[i].act;
-                if (act >= 0)                  { g_view = act; layout_composer(hwnd); }
+                if (act >= 0)                  {
+                    g_view = act; layout_composer(hwnd);
+                    /* Entering Admin fetches its current tab's report. */
+                    if (act == VIEW_ADMIN) admin_select(g_adm_tab);
+                }
                 else if (act == NAV_MORE)      { g_more_open = !g_more_open; }
                 else if (act == NAV_SWITCHER)  { open_switcher(hwnd); }
                 else if (act == NAV_NEW)       { open_new_menu(hwnd); }
@@ -5204,6 +5272,9 @@ static int on_click(HWND hwnd, int x, int y) {
             }
         return 1;   /* clicks in the rail gutter do nothing, but are swallowed */
     }
+    if (g_view == VIEW_ADMIN)
+        for (int i = 0; i < ADM_COUNT; i++)
+            if (in_rect(g_adm_tabs[i], x, y)) { admin_select(i); return 1; }
     /* Everything below is only meaningful in the transcript views. */
     if (!view_has_sidebar()) return 1;
 
@@ -5253,6 +5324,11 @@ static int on_click(HWND hwnd, int x, int y) {
             snprintf(f[0].value, sizeof f[0].value, "%s", ac->name ? ac->name : "");
             if (form_dialog(hwnd, "Rename channel", f, 1))
                 oc_client_update_channel(g_client, g_sel, OC_CHUP_RENAME, f[0].value);
+            return 1;
+        }
+        if (ac && in_rect(g_about_hooks, x, y)) {
+            close_overlays();
+            oc_client_webhooks(g_client, g_sel);
             return 1;
         }
         if (ac && in_rect(g_about_archive, x, y)) {

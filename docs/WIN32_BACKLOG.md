@@ -9,7 +9,7 @@ clients, or a `REQ-NNN`.
 parity table is the *feature reachability* tracker. This document is the *work
 list* derived from both — one row per shippable branch.
 
-**Ids.** Items are `WIN-1` … `WIN-67`, numbered once and **stable**: an id is
+**Ids.** Items are `WIN-1` … `WIN-68`, numbered once and **stable**: an id is
 never renumbered or reused, so a commit or branch can cite it. Ordering is *not*
 priority — the **Pri** column is, and it may change. Section membership may also
 change as blockers clear (an item moves from §3 to §1 without changing its id).
@@ -215,6 +215,15 @@ Recorded because a defect nobody wrote down is a defect nobody fixes.
   order the meta lines the same way, so the fix is one reordering applied twice —
   and they must stay in step or the transcript's hit-boxes drift from what is
   drawn.
+- ~~**WIN-68 — the Admin rail item was a signpost to somewhere else.**~~
+  **FIXED 2026-07-29.** It rendered "Storage & audit — open from the workspace
+  menu": a destination whose entire content was directions. Both reports were
+  already built, so Admin is now a real view with **Storage** and **Audit log**
+  tabs, refetched on entry because a stale point-in-time report is worse than a
+  moment's wait. The reports gained an `embedded` mode so they do not draw a
+  second header offering "Esc to close" for something Esc does not close.
+  Webhooks moved to the channel's **About** tab at the same time — channel-scoped
+  admin belongs with the channel, not behind a right-click.
 - ~~**WIN-67 — surfaces opened in whichever pane happened to be handy.**~~
   **FIXED 2026-07-29 (ARCH-94).** A person's profile replaced the *conversation*,
   which cost you your scroll position and closed any open thread, and your own
