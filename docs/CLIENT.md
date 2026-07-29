@@ -506,6 +506,19 @@ the Files/Pins/About tabs still left the composer's box, buttons and send arrow
 DRAWN there — an input you cannot type into, which is the thing hiding the child
 was meant to prevent. `main_is_conversation()` now decides both.
 
+## Check CI after pushing
+
+Both workflows run on every push. `ci` includes a black-box end-to-end run against
+the containerised daemon, and it is the only thing that proves the wire actually
+works end to end — the unit suite links the shared modules directly and never
+performs a handshake.
+
+It went red for **eleven consecutive pushes** on 2026-07-29 because
+`tests/e2e_client.c` sent a hard-coded HELLO range of `{1, 1}` while
+`OC_PROTOCOL_VERSION` had been bumped to 2, and nobody looked. `make test` was
+green the whole time, which is exactly why a green local suite is not a substitute
+for reading the run. Push, then check.
+
 ## Seeing the whole window (Win32 harness)
 
 `scripts/gui_drive.sh shot <name>` produces one image of the entire application,

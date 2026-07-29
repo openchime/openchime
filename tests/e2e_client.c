@@ -93,7 +93,12 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
 
 static int do_handshake(client *c) {
     uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_hello h = { 1, 1, oc_slice_str("e2e") };
+    /* min = max = OC_PROTOCOL_VERSION, the same rule both real peers follow
+     * (shared/protocol.h). This was a literal `1, 1` and duly broke the moment
+     * the version was bumped — a hard-coded version number in the one test that
+     * proves the wire works is the exact drift the invariant exists to prevent,
+     * and it is why CI went red for eleven pushes without anyone noticing. */
+    oc_hello h = { OC_PROTOCOL_VERSION, OC_PROTOCOL_VERSION, oc_slice_str("e2e") };
     if (oc_encode_hello(&w, &h) != OC_OK || write_all(&c->conn, buf, w.len) != 0) return -1;
     oc_header hdr; oc_rbuf p;
     if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_WELCOME) return -1;
