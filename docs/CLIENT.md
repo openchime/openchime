@@ -475,6 +475,24 @@ you could not type into, which is its own defect.
 A new view or overlay has to name itself in one of those predicates. It cannot
 silently inherit another surface's children.
 
+**Two traps this fix walked into itself, both worth keeping in mind.**
+
+*A predicate whose default is a real answer.* `sidebar_kind()` first returned
+`CHANNELS` as its fallback, which handed that answer to every view its author had
+not thought about — so the find box appeared over the Files view's filter chips.
+It now returns `NONE` for a view with no second column, and `NONE` is the enum's
+zero.
+
+*The harness could not see the bug.* `gui_drive.sh shot` renders Direct2D only,
+so a stray native child is **invisible to it** — which is why this class kept
+reaching the user rather than being caught in verification. The test dump now
+reports each child's `IsWindowVisible` alongside the three predicates, so every
+view can be checked without a screenshot:
+
+```
+natives re=1 find=1 srch=0 pick=0 pal=0 si_ws=0 sbkind=1 conv=1 covered=0
+```
+
 ## 8. Roadmap
 
 - **Now:** app-core + termbox2 TUI shipped. On top of the lean core loop

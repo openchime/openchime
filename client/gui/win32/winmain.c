@@ -4224,8 +4224,14 @@ static int view_has_sidebar(void) {
  * So anything that depends on the column's CONTENT asks this, and a new tenant
  * has to name itself here rather than silently inheriting the last one's chrome.
  * The painter switches on the same function, so the two cannot disagree. */
-enum { SBK_CHANNELS = 0, SBK_DMS, SBK_ACTIVITY };
+enum { SBK_NONE = 0, SBK_CHANNELS, SBK_DMS, SBK_ACTIVITY };
 static int sidebar_kind(void) {
+    /* NONE first, and it is the reason this enum starts there: Files, Later and
+     * Admin have no second column at all, and defaulting them to CHANNELS put
+     * the find box straight over the Files view's filter chips. A predicate
+     * whose default is a real answer will hand that answer to every case its
+     * author forgot. */
+    if (!view_has_sidebar())     return SBK_NONE;
     if (g_view == VIEW_DMS)      return SBK_DMS;
     if (g_view == VIEW_ACTIVITY) return SBK_ACTIVITY;
     return SBK_CHANNELS;
@@ -5022,9 +5028,20 @@ static void layout_find(HWND hwnd);   /* fwd */
  * middle column is the index (or the compose picker) until you pick someone. */
 static int main_is_conversation(void) {
     if (!view_has_sidebar()) return 0;
+    const oc_model *m = model();
+    /* A middle-column surface that is not a conversation: search results, the
+     * Pins/Files/About tabs, the admin reports. You cannot type into any of
+     * them, so a composer sitting under them is an input with nothing behind it.
+     *
+     * A THREAD is the exception and must stay: its pane is a conversation and
+     * the composer is how you reply to it. */
+    if (m && !m->thread_open &&
+        (m->search_open || m->pinlist_open || m->filelist_open || m->weblist_open ||
+         m->storage_open || m->audit_open))
+        return 0;
+    if (g_tab == TAB_ABOUT) return 0;
     if (g_view != VIEW_DMS) return 1;
     if (g_dm_compose) return 0;
-    const oc_model *m = model();
     const oc_channel *c = (m && g_sel) ? oc_model_channel((oc_model *)m, g_sel) : NULL;
     return c && c->kind == OC_CHANNEL_KIND_DM;
 }
@@ -7562,6 +7579,15 @@ static void test_dump(const char *path) {
         fprintf(f, "  ws[%d] %s client=%p authed=%d unread=%d\n", i, g_wss[i].ws,
                 (void *)g_wss[i].client, wm ? wm->authed : 0, u);
     }
+    /* Native children are invisible to `shot` (that renders Direct2D only), so
+     * they are reported here instead — otherwise the one class of bug the
+     * harness cannot see is the one that reaches the user. */
+    fprintf(f, "natives re=%d find=%d srch=%d pick=%d pal=%d si_ws=%d sbkind=%d conv=%d covered=%d\n",
+            g_re && IsWindowVisible(g_re), g_find && IsWindowVisible(g_find),
+            g_srch && IsWindowVisible(g_srch), g_pick_edit && IsWindowVisible(g_pick_edit),
+            g_pal_edit && IsWindowVisible(g_pal_edit),
+            g_si_e_ws && IsWindowVisible(g_si_e_ws),
+            sidebar_kind(), main_is_conversation(), window_is_covered());
     fprintf(f, "tray_live=%d notify_pref=%d toasts_raised=%d dnd=%d\n",
             g_tray_live, g_pref_notify, g_toasts_raised, dnd_active(m));
     fprintf(f, "lightbox=%llu thumb_hits=%d\n", (unsigned long long)g_lightbox, g_n_thumb_hits);
