@@ -2896,6 +2896,11 @@ static void draw_pinlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
 enum { FF_ALL = 0, FF_IMAGES, FF_DOCS, FF_OTHER, FF_KINDS };
 static int g_file_filter;
 static D2D1_RECT_F g_file_filters[FF_KINDS];
+/* Scope is a separate axis from type — Slack splits them the same way, because
+ * "spreadsheets" and "things I shared" are different questions. */
+enum { FS_ALL = 0, FS_MINE, FS_THEIRS, FS_SCOPES };
+static int g_file_scope;
+static D2D1_RECT_F g_file_scopes[FS_SCOPES];
 
 static int file_kind(const char *mime) {
     if (mime_is_image(mime)) return FF_IMAGES;
@@ -2906,8 +2911,34 @@ static int file_kind(const char *mime) {
     return FF_OTHER;
 }
 
-static int file_passes(const oc_file_view *f) {
-    return g_file_filter == FF_ALL || file_kind(f->mime) == g_file_filter;
+/* A coloured badge per family, the way every file browser worth using does it:
+ * the extension is the fastest thing to scan for, so give it colour and a shape
+ * rather than making every row the same grey page glyph. */
+static void file_badge(ID2D1RenderTarget *rt, const oc_file_view *f, D2D1_RECT_F r) {
+    const char *ext = strrchr(f->filename, '.');
+    char tag[6] = "FILE";
+    uint32_t col = 0x5B6270;                       /* generic */
+    if (mime_is_image(f->mime))                     { col = 0x8B5CF6; snprintf(tag, sizeof tag, "IMG"); }
+    else if (ext && !_stricmp(ext, ".pdf"))       { col = 0xD64545; snprintf(tag, sizeof tag, "PDF"); }
+    else if (ext && (!_stricmp(ext, ".doc") || !_stricmp(ext, ".docx")))
+                                                    { col = 0x2B5CE6; snprintf(tag, sizeof tag, "DOC"); }
+    else if (ext && (!_stricmp(ext, ".xls") || !_stricmp(ext, ".xlsx") || !_stricmp(ext, ".csv")))
+                                                    { col = 0x1E8E4E; snprintf(tag, sizeof tag, "XLS"); }
+    else if (ext && (!_stricmp(ext, ".zip") || !_stricmp(ext, ".gz") || !_stricmp(ext, ".7z")))
+                                                    { col = 0xB2802E; snprintf(tag, sizeof tag, "ZIP"); }
+    else if (ext && !_stricmp(ext, ".txt"))       { col = 0x4B7A9B; snprintf(tag, sizeof tag, "TXT"); }
+    if (f->reclaimed) col = OC_COL_FAINT;
+    fill_round(rt, r, 6.0f, col);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, tag, g_small, rf(r.left, r.top + 2, r.right, r.bottom), 0xFFFFFF);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+}
+
+static int file_passes(const oc_model *m, const oc_file_view *f) {
+    if (g_file_filter != FF_ALL && file_kind(f->mime) != g_file_filter) return 0;
+    if (g_file_scope == FS_MINE   && f->uploader_id != m->user_id) return 0;
+    if (g_file_scope == FS_THEIRS && f->uploader_id == m->user_id) return 0;
+    return 1;
 }
 
 /* The filter chips. Returns the y below them. */
@@ -2926,6 +2957,21 @@ static float draw_file_filters(ID2D1RenderTarget *rt, D2D1_RECT_F body) {
         g_file_filters[i] = b;
         fx = b.right + 6;
     }
+    /* Scope on the same row, right-aligned: a different question from type. */
+    static const char *SC[FS_SCOPES] = { "Everyone", "Shared by you", "Shared with you" };
+    float rx = body.right - 20;
+    for (int i = FS_SCOPES - 1; i >= 0; i--) {
+        float fw = text_width(SC[i], g_small) + 22;
+        D2D1_RECT_F b = rf(rx - fw, y, rx, y + 24);
+        int on = (g_file_scope == i);
+        fill_round(rt, b, 6.0f, on ? OC_COL_SELECT : OC_COL_INPUT);
+        if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, SC[i], g_small, b, on ? OC_COL_TEXT : OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_file_scopes[i] = b;
+        rx = b.left - 6;
+    }
     return y + 32;
 }
 
@@ -2938,14 +2984,13 @@ static void draw_file_rows(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
     int shown = 0;
     for (size_t i = 0; i < m->n_files && y < body.bottom; i++) {
         const oc_file_view *f = &m->files[i];
-        if (!file_passes(f)) continue;
+        if (!file_passes(m, f)) continue;
         shown++;
         D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + 46);
         if (g_hover_filerow == f->id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
 
-        draw_lucide(rt, OC_ICON_FILE, rf(row.left + 10, y + 12, row.left + 32, y + 34),
-                    f->reclaimed ? OC_COL_FAINT : OC_COL_MUTED);
-        draw_text(rt, f->filename, g_ui, rf(row.left + 40, y + 4, row.right - 100, y + 24),
+        file_badge(rt, f, rf(row.left + 8, y + 8, row.left + 42, y + 38));
+        draw_text(rt, f->filename, g_ui, rf(row.left + 52, y + 4, row.right - 100, y + 24),
                   f->reclaimed ? OC_COL_FAINT : OC_COL_TEXT);
 
         /* Uploader, size, date — and the channel when this list spans them. A
@@ -2968,7 +3013,7 @@ static void draw_file_rows(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
         snprintf(sub, sizeof sub, "%s%s \u00B7 %s \u00B7 %s%s", chan,
                  (who && who[0]) ? who : "someone", sz, when,
                  f->reclaimed ? "  \u00B7 no longer stored" : "");
-        draw_text(rt, sub, g_small, rf(row.left + 40, y + 24, row.right - 100, y + 42),
+        draw_text(rt, sub, g_small, rf(row.left + 52, y + 24, row.right - 100, y + 42),
                   OC_COL_FAINT);
 
         if (!f->reclaimed) {
@@ -5244,6 +5289,8 @@ static void prefs_load(const oc_model *m);   /* fwd */
 static int files_click(HWND hwnd, int x, int y) {
     for (int i = 0; i < FF_KINDS; i++)
         if (in_rect(g_file_filters[i], (float)x, (float)y)) { g_file_filter = i; return 1; }
+    for (int i = 0; i < FS_SCOPES; i++)
+        if (in_rect(g_file_scopes[i], (float)x, (float)y)) { g_file_scope = i; return 1; }
     const oc_model *fm = model();
     for (int i = 0; i < g_n_filerows && fm; i++) {
         if ((size_t)g_filerows[i].ix >= fm->n_files) continue;
