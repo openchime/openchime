@@ -155,6 +155,29 @@ static ID2D1Brush *paint_with(uint32_t rgb);   /* fwd */
  * makes it legible against ANY avatar colour rather than just the ones we
  * happened to pick — a tint close to the status colour would otherwise swallow
  * it again the moment the palette changed. */
+/* Connection state as a dot (WIN-64): filled when live, hollow when not.
+ *
+ * This started as THREE states — live / reconnecting / down — which sounded
+ * better than it rendered. Measured against a killed daemon, the dot flickered:
+ * the model reports a scheduled retry most of the time but nothing at all during
+ * each dial attempt, so a "reconnecting" tint blinked to "down" every few
+ * seconds. A 9px dot that blinks reads as broken, and the distinction was never
+ * worth much anyway — the client retries forever, so "down" and "reconnecting"
+ * are the same situation seen at different instants.
+ *
+ * The hollow ring is drawn in the ACCENT rather than a dead grey because it is
+ * the honest reading: we are always trying. The detail — why, and how long until
+ * the next attempt — belongs to the connection banner (WIN-1), which has room
+ * for words and a Retry button.
+ *
+ * A widget rather than an inline blob because the rail's per-workspace avatars
+ * want exactly this once N workspaces are held at once (REQ-012-015). */
+static void draw_conn_dot(ID2D1RenderTarget *rt, float cx, float cy, float r, int live) {
+    D2D1_ELLIPSE e = { { cx, cy }, r, r };
+    if (live) ID2D1RenderTarget_FillEllipse(rt, &e, paint_with(OC_COL_ONLINE));
+    else      ID2D1RenderTarget_DrawEllipse(rt, &e, paint_with(OC_COL_ACCENT), 1.8f, NULL);
+}
+
 static void draw_presence_dot(ID2D1RenderTarget *rt, float cx, float cy, float r,
                               uint8_t presence, uint32_t surface) {
     uint32_t c = presence == OC_PRESENCE_ONLINE ? OC_COL_ONLINE
@@ -581,6 +604,7 @@ enum { TAB_MESSAGES = 0, TAB_FILES, TAB_PINS, TAB_ABOUT, TAB_COUNT };
 static int g_tab;                       /* the selected channel tab (WIN-37) */
 static D2D1_RECT_F g_tab_r[TAB_COUNT];  /* tab hit-boxes */
 static D2D1_RECT_F g_memchip;           /* header member-count chip */
+static D2D1_RECT_F g_ws_dot;            /* workspace connection dot (WIN-64) */
 static int g_tab_hover = -1;
 /* Reaction-chip hit-boxes, rebuilt every frame like the thumbnail ones. */
 static struct { D2D1_RECT_F r; uint64_t mid; char emoji[40]; uint8_t mine; } g_chips[128];
@@ -1518,6 +1542,20 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     g_ws_hdr_btn = rf(RAIL_W, 0, g_hdr_gear.left - 4, HEADER_H);
     char wsname[80]; ws_display_name(m, wsname, sizeof wsname);
     draw_text(rt, wsname, g_hdr, rf(RAIL_W + 16, 0, g_hdr_gear.left - 22, HEADER_H), OC_COL_TEXT);
+    /* Connection state belongs to the WORKSPACE, so it lives on the workspace's
+     * name — not in the channel header, where it read as a property of the
+     * channel (WIN-64). Clicking it retries when we are not live. */
+    {
+        float dx = RAIL_W + 16 + text_width(wsname, g_hdr) + 10;
+        float lim = g_hdr_gear.left - 26;
+        if (dx > lim) dx = lim;
+        int live = m->authed ? 1 : 0;
+        draw_conn_dot(rt, dx + 5, HEADER_H / 2, 4.5f, live);
+        /* Only a hit-box when it would DO something: a control that silently
+         * does nothing is worse than no control. */
+        g_ws_dot = live ? rf(0, 0, 0, 0)
+                        : rf(dx - 5, HEADER_H / 2 - 12, dx + 15, HEADER_H / 2 + 12);
+    }
     IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
     draw_text(rt, "\xE2\x96\xBE", g_small, rf(RAIL_W + 16, 2, g_hdr_gear.left - 8, HEADER_H), OC_COL_MUTED);
     IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
@@ -3196,11 +3234,10 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
         g_unread_jump = rf(0, 0, 0, 0);
     }
 
-    const char *status = !m->connected ? "offline" : !m->authed ? "signing in" : "connected";
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    draw_text(rt, status, g_small, rf(x0 + 20, 0, statr, HEADER_H),
-              m->authed ? OC_COL_ONLINE : OC_COL_MUTED);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    /* No connection text here any more (WIN-64): it is workspace state, shown on
+     * the workspace name, and the banner below carries the detail when it
+     * matters. `statr` survives because the unread-jump pill positions off it. */
+    (void)statr;
 }
 
 /* Switch channel tab (WIN-37). Each tab owns the sub-view it names, so entering
@@ -3459,14 +3496,18 @@ static void draw_members(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         const char *nm = oc_model_user_name((oc_model *)m, cm->user_id);
         draw_presence_dot(rt, x0 + 22, y + ROW_H / 2, 4.5f,
                           oc_model_presence_of(m, cm->user_id), OC_COL_SIDEBAR);
-        draw_text(rt, (nm && nm[0]) ? nm : "user", g_ui,
-                  rf(x0 + 34, y, W - 60, y + ROW_H), OC_COL_TEXT);
-        const char *rl = role_label(cm->role);
-        if (rl[0]) {
-            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
-            draw_text(rt, rl, g_small, rf(x0 + 34, y, W - 14, y + ROW_H), OC_COL_FAINT);
-            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        /* Role as a second indicator column rather than a trailing word (WIN-65)
+         * — and ONLY for owner/admin: a marker on every row is noise, and
+         * "member" is the default that needs no saying. A glyph is not
+         * self-describing on its own, so it is an at-a-glance hint whose answer
+         * is the profile pane (WIN-10), which names the role in words. */
+        if (cm->role >= OC_ROLE_ADMIN) {
+            D2D1_RECT_F ri = rf(x0 + 32, y + ROW_H / 2 - 7, x0 + 46, y + ROW_H / 2 + 7);
+            draw_lucide(rt, cm->role == OC_ROLE_OWNER ? OC_ICON_CROWN : OC_ICON_SHIELD,
+                        ri, OC_COL_FAINT);
         }
+        draw_text(rt, (nm && nm[0]) ? nm : "user", g_ui,
+                  rf(x0 + 52, y, W - 14, y + ROW_H), OC_COL_TEXT);
         if (g_n_memrows < (int)(sizeof g_memrows / sizeof g_memrows[0])) {
             g_memrows[g_n_memrows].top = y; g_memrows[g_n_memrows].bot = y + ROW_H;
             g_memrows[g_n_memrows].uid = cm->user_id; g_n_memrows++;
@@ -5059,6 +5100,14 @@ static int on_click(HWND hwnd, int x, int y) {
     /* Header buttons + workspace header. */
     if (in_rect(g_hdr_gear, x, y))    { open_ws_menu(hwnd); return 1; }
     if (in_rect(g_hdr_compose, x, y)) { open_new_menu(hwnd); return 1; }
+    /* The dot sits inside the workspace-header button, so it must be tested
+     * first or the menu swallows it (WIN-64). It only exists while retrying is
+     * meaningful — see draw_sidebar. */
+    if (in_rect(g_ws_dot, x, y)) {
+        oc_client_reconnect(g_client);
+        toast_push("Reconnecting\u2026", 0);
+        return 1;
+    }
     if (in_rect(g_ws_hdr_btn, x, y))  { open_ws_menu(hwnd); return 1; }
     /* Section kebab -> that section's Filter/Sort menu. Slack's placement, and
      * the right one: these are PER-SECTION settings, so a single header gear

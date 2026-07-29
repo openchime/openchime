@@ -27,6 +27,8 @@ enum {
     OC_ICON_AT,
     OC_ICON_DOWNLOAD,
     OC_ICON_PIN,
+    OC_ICON_CROWN,
+    OC_ICON_SHIELD,
     OC_ICON_COUNT
 };
 

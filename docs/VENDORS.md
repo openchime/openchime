@@ -159,7 +159,7 @@ removed self-rendered `client/gui`.) Retained Windows artifacts below are for th
 
 Most of the graphical clients' icons come from [Lucide](https://lucide.dev)
 (ISC License). We vendor **only the handful of SVGs we use**
-(`third_party/lucide/icons/*.svg` — 13 of them) plus the license
+(`third_party/lucide/icons/*.svg` — 15 of them) plus the license
 (`third_party/lucide/LICENSE`).
 
 **Four icons are ours, not Lucide's**, and live outside `third_party/` for exactly
@@ -181,7 +181,7 @@ paths ship; nothing is fetched at runtime.
 | License | Packages | Notes |
 |---------|----------|-------|
 | **MIT** | termbox2, utf8proc, jsmn | Vendored, committed |
-| **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; 13 SVGs + LICENSE vendored. The other 4 icons in that file are our own work (`client/shared/icons_src/`), not ISC-licensed material |
+| **ISC** | Lucide (icon path data) | Baked into client/shared/icons.c; 15 SVGs + LICENSE vendored. The other 4 icons in that file are our own work (`client/shared/icons_src/`), not ISC-licensed material |
 | **Apache-2.0** | Mbed TLS (chosen from its dual license) | Static-linked |
 | **BSD-3-Clause** | libvpx (VP9) — **planned, not yet fetched** | Screenshare codec (REQ-161, ARCH-87). Client-side only; the daemon links no codec. Permissive, within this repo's posture — see §7 |
 | **Public Domain** | SQLite | System-linked, **daemon only** — no client links it (ARCH-88) |

@@ -166,7 +166,7 @@ Legend: ✅ done · 🔨 in progress · ⛔ not started.
 | Settings sync | `set_client_type`, `set_setting`, `list_settings` | ✅ | Identifies the `gui` bucket + lists on connect. |
 | Read receipts (seen-by) | model `readers[]` | ✅ | "✓ Seen by …" footer under the transcript. |
 | Logout | `logout` | ✅ | Rail → workspace menu → Sign out / Sign out everywhere; window closes on the drop. |
-| Manual reconnect | `reconnect` | ✅ | Rail → workspace menu → Reconnect now, plus a connection banner with the reason, a live countdown and "Retry now" (WIN-1/WIN-55). |
+| Manual reconnect | `reconnect` | ✅ | Three ways: the **connection dot** beside the workspace name (filled = live, hollow = not; click to retry, WIN-64), the connection banner with the reason, a live countdown and "Retry now" (WIN-1/WIN-55), and the workspace menu's Reconnect now. |
 | Multiple workspaces | one `oc_client` per ws + switcher | 🔨 | **Rail switcher UI built** — the workspace avatar at the top of the rail (`open_switcher`/`switch_workspace`, winmain.c) — remembered workspaces + "Add a workspace…". It **stop/reconnects a single `oc_client`**, so the remaining piece is the TUI's **N-concurrent-client** model (background receive + "N elsewhere" unread), not the switcher affordance. |
 
 > **Depth caveat:** this table tracks whether each engine feature is *reachable*; it does **not** measure how developed each screen/dialog is. For the full four-way (Slack vs Pumble vs TUI vs Win32) surface-depth gap analysis — including underdeveloped screens and a recommended build order — see [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md).
