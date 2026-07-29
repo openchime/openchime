@@ -152,18 +152,21 @@ Legend: ✅ done · 🔨 in progress · ⛔ not started.
 | Admin: roles / remove | `set_role`, `remove_user` | ✅ | Member right-click, role-gated. |
 | Admin: invite | `invite_user` | ✅ | Rail → workspace menu → Invite people as member / as admin (token shown once, owner/admin only). |
 | Threads | `open_thread`, `reply`, `close_thread` | ✅ | Message menu → Reply/Open thread; overlay + reply composer. |
-| Search | `search`, `close_search` | ✅ | Rail → New (+) → Search messages…; results jump to the channel, not the matched message. |
-| Channel management | `create_channel`, `join_channel`, `leave_channel` | ✅ | Rail → New (+) → New channel (name only); sidebar right-click Join / Leave / Mark as read. |
-| Attachments: download | `download` | ✅ | Right-click → Download (native Save dialog). |
+| Search | `search`, `close_search` | ✅ | Rail → New (+) → Search messages… or Ctrl+F; a result jumps to the matched message and flashes it (WIN-3). No paging — the wire has no cursor (WIN-38). |
+| Channel management | `create_channel`, `join_channel`, `leave_channel`, `list_members` | ✅ | Rail → New (+) → New channel (name + public/private); sidebar right-click Join / Leave / Mark as read; the members pane lists the **channel's** roster (REQ-031). Rename/topic/archive do not exist on the engine (REQ-034/035/036). |
+| @mentions | shared `oc_mention_scan` + notify level | ✅ | Accent-coloured, semi-bold spans; a message naming you tints its row and gets an accent bar; the `mentions` notify level is evaluated with the same scanner the daemon resolves with (REQ-221). |
+| Pins | `pin`, `list_pins`, `close_pins` | ✅ | Message menu → Pin/Unpin to channel; a "Pinned by …" marker above the message; the **Pins** tab lists them, jumps to one, or unpins (REQ-230). |
+| Channel files | `list_files`, `close_files` | ✅ | The **Files & links** tab: name, uploader, size, date, download, jump-to-message (REQ-143). The workspace-wide form (`channel_id 0`) is on the wire but the rail's Files view is still a stub. |
+| Attachments: download | `download` | ✅ | Right-click → Download (native Save dialog), or the Files tab. |
 | Attachments: upload | `upload` | ✅ | Composer "+" button + drag-drop anywhere. |
-| Notifications / DND | `set_notify_pref`, `set_dnd` | 🔨 | Channel menu level + rail → profile avatar → Do not disturb… (raw `HH:MM-HH:MM` prompt). **`list_notify_prefs` is not wired** — there is no review screen for the synced prefs (the TUI has one). |
-| Self-service profile | `set_display_name`, `change_password` | ✅ | Rail → profile avatar → Change display name… / Change password… (one-line prompts; no confirm field). |
+| Notifications / DND | `set_notify_pref`, `set_dnd`, `list_notify_prefs` | ✅ | Channel menu level + rail → profile avatar → Do not disturb… (raw `HH:MM-HH:MM` prompt, no picker) + a **Notifications pane** (WIN-12) that calls `list_notify_prefs` and edits the per-channel level. |
+| Self-service profile | `set_display_name`, `change_password` | ✅ | Rail → profile avatar → Change display name… / Change password… (one dialog each; the password form has a confirm field, WIN-20). |
 | Webhooks | `webhooks`, `create_webhook`, `delete_webhook` | ✅ | Channel menu → Webhooks… / Create webhook…; overlay, click-to-delete. |
 | Storage / audit (admin) | `storage_status`, `audit_query` | ✅ | Rail → workspace menu → Storage usage / Audit log overlays (owner/admin only). |
 | Settings sync | `set_client_type`, `set_setting`, `list_settings` | ✅ | Identifies the `gui` bucket + lists on connect. |
 | Read receipts (seen-by) | model `readers[]` | ✅ | "✓ Seen by …" footer under the transcript. |
 | Logout | `logout` | ✅ | Rail → workspace menu → Sign out / Sign out everywhere; window closes on the drop. |
-| Manual reconnect | `reconnect` | ✅ | Rail → workspace menu → Reconnect now (no banner or countdown). |
+| Manual reconnect | `reconnect` | ✅ | Rail → workspace menu → Reconnect now, plus a connection banner with the reason, a live countdown and "Retry now" (WIN-1/WIN-55). |
 | Multiple workspaces | one `oc_client` per ws + switcher | 🔨 | **Rail switcher UI built** — the workspace avatar at the top of the rail (`open_switcher`/`switch_workspace`, winmain.c) — remembered workspaces + "Add a workspace…". It **stop/reconnects a single `oc_client`**, so the remaining piece is the TUI's **N-concurrent-client** model (background receive + "N elsewhere" unread), not the switcher affordance. |
 
 > **Depth caveat:** this table tracks whether each engine feature is *reachable*; it does **not** measure how developed each screen/dialog is. For the full four-way (Slack vs Pumble vs TUI vs Win32) surface-depth gap analysis — including underdeveloped screens and a recommended build order — see [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md).
@@ -187,20 +190,24 @@ buttons and a **"Find a conversation"** filter box (a native `EDIT` that
 substring-filters channel names).
 
 **Only Home and DMs render the chat shell**, and they render it identically —
-`VIEW_DMS` has no DM-specific behaviour yet. **Activity, Files, Later, and
-Notifications are `draw_stub_view` placeholders** ("coming soon"), as is the
-workspace menu's **Preferences** item (a `MessageBox`). They are reachable dead
-ends, and they map onto REQ-139 (activity feed), REQ-143 (files browser),
-REQ-231 (saved items), and REQ-261 (preferences hub) respectively.
+`VIEW_DMS` has no DM-specific behaviour yet. **Activity, Files, Later and
+Notifications are still `draw_stub_view` placeholders** ("coming soon"), mapping
+onto REQ-139 (activity feed), REQ-143 (a *workspace-wide* files view), REQ-231
+(saved items) and REQ-138 respectively. Two notes on that list: **Preferences is
+no longer a stub** (WIN-9), and the **Files** stub is now the cheapest of them to
+fill — `LIST_FILES` already accepts `channel_id 0` for "every channel I can
+read", and the per-channel Files tab is built.
 
-**Feature parity is essentially complete** — all 27 features are reachable, 25
-of them fully; two are 🔨. Since this table was written, sign-in was rebuilt
-(WIN-2), the failure surface landed (WIN-1), and the client became stateless
-(ARCH-88) — so the depth backlog below is the live picture:
+**Every tracked engine feature is reachable**, and since this table was written
+the Win32 GUI has moved from trailing the TUI to leading it: sign-in was rebuilt
+(WIN-2), the failure surface landed (WIN-1), the client became stateless
+(ARCH-88), and @mentions, pins, the channel Files tab and the per-channel roster
+(REQ-221/230/143/031) shipped here first. The depth backlog below is the live
+picture:
 
-- **Notification prefs** — the per-channel level and the DND window are settable,
-  but `list_notify_prefs` is never called, so there is no review screen for the
-  server-synced prefs.
+- **DND configuration** — the window is settable and displayed, but only through
+  a raw `HH:MM-HH:MM` prompt: no picker, no schedule. (The prefs *review* screen
+  it used to lack is built — WIN-12.)
 - **Multiple workspaces** — the rail switcher UI exists, but Win32 switches by
   stop/reconnecting a single `oc_client`, so a background workspace does not
   receive or accrue unread ("N elsewhere"). This is the one genuinely unbuilt
@@ -290,11 +297,16 @@ webhook CA cert REQ-171). The MENTIONS push level is no longer pending — REQ-2
 closed it.
 
 The **client** is a shared, frontend-agnostic **C app-core** (ARCH-74) with a
-**termbox2 + utf8proc TUI** (ARCH-75) as the reference frontend — **every engine
-feature on the wire is reachable from it** — plus a **local store** (SQLite today;
-being removed from all clients per ARCH-88/REQ-201) giving
-silent session-token reconnect, a persisted TOFU pin, cached history, and an
-offline outbox (REQ-100/101/102 met client-side). The remaining client work is
+**termbox2 + utf8proc TUI** (ARCH-75) as the reference frontend. It reached
+*every* engine feature on the wire until this week's daemon work; **it is now
+behind by four** — @mentions (REQ-221), pins (REQ-230), the channel files listing
+(REQ-143) and the channel member listing (REQ-031), all of which exist on the
+wire and are surfaced only in the Win32 GUI. Closing that gap is TUI work only —
+the app-core already carries all four.
+
+The core also has a **local store** (SQLite today; being removed from all clients
+per ARCH-88/REQ-201) giving silent session-token reconnect, a persisted TOFU pin,
+cached history, and an offline outbox (REQ-100/101/102 met client-side). The remaining client work is
 scope, not hardening: the incomplete **Windows GUI** depth pass, the later native
 GUIs (GTK/AppKit) + web/mobile, the **OIDC browser flow**, the **audio client**
 (Opus/UDP), and **screenshare** (REQ-161).

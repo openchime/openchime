@@ -632,18 +632,22 @@ prefix of the primary key.
 
 Tracked here so the omissions are deliberate, not forgotten:
 
-- **Thread notifications** (REQ-061) — still deferred; needs @mentions (REQ-221),
-  which is the same dependency blocking the `MENTIONS` notification level
-  (ARCH-72/85).
-- **Rich text, pins, saved items, permalinks, profiles, retention policy**
-  (REQ-220–234, REQ-240/241, REQ-250) — forward scope, none yet backed by an ARCH
-  decision.
+- **Thread notifications** (REQ-061) — still deferred. Its dependency, @mentions
+  (REQ-221), is now built (§3q), so what remains is deciding *when a reply
+  notifies a thread's participants*, not the mention machinery underneath it.
+- **Rich text, saved items, permalinks, profiles, retention policy**
+  (REQ-220, REQ-222–229, REQ-231–234, REQ-240/241, REQ-250) — forward scope, none
+  yet backed by an ARCH decision.
 - **Screenshare** (REQ-161) — needs no schema; it is ephemeral media state on the
   same relay path as audio (ARCH-86, [VIDEO.md](./VIDEO.md)).
 
 (Previously listed here and **now built**: roles, sessions/revocation, local
 credentials, delivery cursors, server identity, and attachment metadata
-(migrations 0002, 0007–0009); **push device tokens** for APNs/FCM (migration 0018,
+(migrations 0002, 0007–0009); **@mentions** (migration 0021, ARCH-89) and
+**pins** (migration 0022, ARCH-90), both of which were "forward scope, no ARCH
+decision" above until this week; the **channel files listing** (REQ-143) needed
+only an index (migration 0023) and the **channel member listing** (REQ-031) no
+migration at all; **push device tokens** for APNs/FCM (migration 0018,
 ARCH-85) — the notification *settings* they are gated by are migration 0012.
 **Audio** call state (REQ-150–152) was correctly predicted to need no schema: the
 roster is ephemeral net-thread state (ARCH-73). **Presence/typing** (REQ-120/121)

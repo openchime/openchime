@@ -751,8 +751,13 @@ the requirement says so explicitly rather than implying one.
 
 - **REQ-190.** The daemon has rate-limited message-send frequency
   per-connection, rejecting excess sends with a distinct error rather than
-  silently dropping them. **[needs ARCH decision — limit values and
-  algorithm]**
+  silently dropping them. **Built:** a fixed-window counter in the net loop —
+  **30 sends per 3 s per connection** (`OC_SEND_RATE_MAX` /
+  `OC_SEND_RATE_WINDOW_MS`, `daemon/netloop.c`) — over the limit returns the
+  non-fatal `SEND_RATE_LIMITED` (3004). A fixed window rather than a token bucket
+  because the check runs per frame on the hot path and the window is short enough
+  that the boundary burst it permits is irrelevant at these numbers. The values
+  are compile-time, not configurable: nothing has yet needed to tune them.
 - **REQ-191.** The daemon has rate-limited failed authentication attempts,
   per account and per source, to blunt credential-stuffing and brute-force
   against local-mode passwords, answering excess attempts with
@@ -1079,21 +1084,23 @@ None are yet backed by an architecture decision.*
 *Cross-client UX-parity requirements the competitive analysis
 ([CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md)) surfaced — capabilities every
 graphical client is expected to have, largely independent of the daemon. "The
-client" here means each native frontend (ARCH-74); the TUI already satisfies most
-of these and is the reference (CLIENT.md §3). None are yet backed by an
-architecture decision.*
+client" here means each native frontend (ARCH-74); the TUI was the reference for
+most of these (CLIENT.md §3), though the Win32 GUI now leads on several.
+**ARCH-92 settles how they are decided:** these are per-frontend renderings of
+state the shared core already holds, so there is no cross-client architecture to
+choose — which makes each one a per-frontend *obligation*, tracked per client in
+[STATUS.md](./STATUS.md) rather than as a single tick. The lone exception is
+REQ-269, whose accessibility half is a real open decision.*
 
 - **REQ-260.** Every client has offered a **command palette / quick switcher** —
   a keyboard-driven surface (the TUI's Ctrl+K, ARCH-83) to jump to any channel/DM
   or run any action by fuzzy search — so navigation and actions have not required
-  hunting through menus. **[needs ARCH decision — per-GUI command-palette surface;
-  the action catalog already exists in the TUI.]**
+  hunting through menus. (ARCH-92: per-frontend.)
 - **REQ-261.** Every client has exposed an **in-app Settings/Preferences hub** —
   notifications, appearance, time format, and sidebar behavior editable in the app
   rather than only via a config file — writing through the client's existing
   settings mechanism (the daemon's per-`(user, client_type)` bucket plus the local
-  config file, CLIENT.md §3). **[needs ARCH decision — per-GUI preferences surface
-  over the existing settings layer.]**
+  config file, CLIENT.md §3). (ARCH-92: per-frontend.)
 - **REQ-262.** Every client has offered **theme/appearance selection** — at least
   light, dark, and follow-system — applied in-app. The TUI ships a 256-color theme
   (ARCH-83); the GUIs honor the OS dark-mode signal (ARCH-80). **[needs ARCH
@@ -1102,18 +1109,14 @@ architecture decision.*
   connection-status surface** — a visible, non-blocking channel for failures
   (failed send, rate-limit REQ-190, bad login, storage pressure REQ-214) and for
   connection state (reconnecting with a countdown, REQ-100) — so a failure or a
-  dropped connection has never been silent. **[needs ARCH decision — per-GUI
-  toast/status surface; the model already carries `last_error` and connection
-  state (CLIENT.md §6).]**
+  dropped connection has never been silent. (ARCH-92: per-frontend.)
 - **REQ-264.** Every client has provided a **keyboard-shortcut reference** — a
-  discoverable list of its shortcuts (the TUI's `?` help overlay, ARCH-83).
-  **[needs ARCH decision — per-GUI shortcut-reference surface.]**
+  discoverable list of its shortcuts (the TUI's `?` help overlay, ARCH-83). (ARCH-92: per-frontend.)
 - **REQ-265.** A client's composer has offered **input aids** — inline
   autocomplete for `@user`, `#channel`, and `:emoji:` (REQ-221/072) and a full,
   searchable **emoji picker** (beyond a hardcoded set) — so mentioning, linking a
-  channel, or reacting has not required typing exact names. **[needs ARCH decision
-  — per-GUI autocomplete/picker surface over the model's roster/channel/emoji
-  data.]**
+  channel, or reacting has not required typing exact names. (ARCH-92:
+  per-frontend, over the shared `client/core/complete.c` catalogue.)
 - **REQ-266.** A client has let a user **view another user's profile** — opening a
   profile pane from a name or avatar anywhere the user appears — showing the fields
   of REQ-240 (display name, avatar, title, timezone, status). **[needs ARCH
@@ -1122,13 +1125,11 @@ architecture decision.*
   the reference clients — a dedicated **direct-message section**, collapsible
   Public/Private/DM groups, per-user custom sections and starred/favorite
   conversations (whose storage is REQ-234), and a **sidebar search/filter** —
-  rather than a flat, unsearchable list. **[needs ARCH decision — per-GUI sidebar
-  rendering; the per-user section/star state is REQ-234.]**
+  rather than a flat, unsearchable list. (ARCH-92: per-frontend.)
 - **REQ-268.** A client has provided **first-run onboarding** — a signup /
   first-owner setup UI that redeems the one-time owner setup token or an invite
   (REQ-024/026) into a working account — so bringing up a new tenant, or joining
-  one, has not required a command line. **[needs ARCH decision — per-GUI
-  onboarding flow over the existing bootstrap/invite path.]**
+  one, has not required a command line. (ARCH-92: per-frontend.)
 - **REQ-269.** Every graphical client has been **operable without a mouse and
   legible to assistive technology**. Concretely: every action reachable by
   pointer has had a keyboard route; focus has been visible and has moved in a

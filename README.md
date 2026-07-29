@@ -49,8 +49,9 @@ messaging path end to end: **two-mode authentication** (local PBKDF2 accounts or
 an OIDC token re-issued by the central relay, converging on a daemon-issued
 session, [docs/AUTH.md](docs/AUTH.md)), roles and full tenant administration,
 public/private channels and DMs, edit/delete, reactions, threads, FTS5 search,
-presence and typing, notification preferences and DND, attachments proxied to
-object storage, incoming webhooks, an audit log, and reconnect backfill. The
+presence and typing, notification preferences and DND, **@mentions** and
+**pinned messages**, attachments proxied to object storage with per-channel file
+and member listings, incoming webhooks, an audit log, and reconnect backfill. The
 daemon also emits **mobile push** to the control-plane gateway (ARCH-85) and
 **enrolls** with it for federated deployments (ARCH-84). Server-relayed **audio**
 signaling and the UDP sidecar are built; the client-side codec is not
@@ -58,8 +59,8 @@ signaling and the UDP sidecar are built; the client-side codec is not
 
 For exactly what is built vs specified — including the gaps — see
 **[docs/STATUS.md](docs/STATUS.md)**. Known remaining server-side work: a
-CA-signed certificate for the webhook endpoint (REQ-171) and the `MENTIONS`
-notification level, which waits on @mentions (REQ-221).
+CA-signed certificate for the webhook endpoint (REQ-171). The `MENTIONS`
+notification level is no longer pending — @mentions (REQ-221) built it.
 
 ## Local build (daemon)
 
@@ -89,18 +90,21 @@ menus, dialogs, and a Ctrl+K command palette; there are no slash commands. It
 covers live messaging with history backfill, reactions, edit/delete, typing,
 threads, search, channel + DM management, roster + presence, who-reacted,
 notification prefs + DND, admin (roles/invite/remove), webhooks, attachments,
-storage and audit overlays, multiple workspaces, and logout — **nearly every
-capability the app-core (`oc_client`) exposes is reachable from the TUI**, the
-exceptions being webhook *deletion* and log-out-everywhere. Some frames the
+storage and audit overlays, multiple workspaces, and logout. It reached nearly
+every capability the app-core exposes until the July 2026 engine work; the
+exceptions are now webhook *deletion*, log-out-everywhere, and the four features
+added since — **@mentions, pins, the channel files listing and the per-channel
+member roster** — which are surfaced only in the Windows GUI. Some frames the
 daemon speaks reach no client at all yet — see [docs/CLIENT.md](docs/CLIENT.md)
 §3. The app-core also has a local
 SQLite store, so it reconnects silently across restarts, shows cached history
 offline, and queues sends made while disconnected (REQ-100/101/102).
 
 A native **Windows GUI** (Win32 + Direct2D/DirectWrite, pure C — ARCH-82) is in
-progress: all 27 tracked engine features are reachable, 25 of them fully — the
-two partials are notification prefs (no review screen) and multiple workspaces
-(the rail switcher is built; holding N clients at once is not). The depth work is
+progress: every tracked engine feature is reachable, and it now *leads* the TUI
+on @mentions, pins, the channel Files tab and the per-channel roster. The one
+partial is multiple workspaces (the rail switcher is built; holding N clients at
+once is not). The depth work is
 a numbered backlog in
 [docs/WIN32_BACKLOG.md](docs/WIN32_BACKLOG.md), with the four-way surface
 analysis behind it in

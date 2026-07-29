@@ -7,7 +7,9 @@ mirrors.
 
 **Status.** **Both tiers are built and green in CI.** The unit tier below is
 implemented across the codec, framebuf, migrations, auth/JWT/roles/rate-limiting,
-the DB-writer handlers, storage/maintenance, enrollment, and push, plus in-process
+the DB-writer handlers, storage/maintenance, enrollment, push, and the shared
+@mention scanner (`test_mention` — deliberately its own suite because the daemon
+and every client link that one implementation, ARCH-89), plus in-process
 integration suites that drive the real epoll server over TLS (`itest_netloop`,
 `itest_tls`, `itest_slow_blob`) and the headless client app-core
 (`test_client_core.c`) — all compiled into one `build/tests` binary by `make test`.
@@ -266,7 +268,7 @@ Makefile
 The list above is **representative, not exhaustive** — the tree also holds
 `test_auth`, `test_jwt`, `test_roles`, `test_ratelimit`, `test_http`,
 `test_sigv4`, `test_blob_s3`, `test_xferpool`, `test_storage`, `test_fuzz`,
-`test_audio`, `test_client_core`, `test_push`, `test_enroll`, and
+`test_audio`, `test_client_core`, `test_push`, `test_enroll`, `test_mention`, and
 `itest_slow_blob`, plus the `demo_client`/`bench_load` tools (filtered out of the
 suite). All unit and in-process integration suites compile into a **single** binary
 (`build/tests`): each `tests/*.c` links the module's public API (no per-test

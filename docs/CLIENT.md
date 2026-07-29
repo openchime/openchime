@@ -462,18 +462,25 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
   history, offline outbox, workspace book), **multiple workspaces** (REQ-012–015),
   DNS workspace resolution (REQ-010/011), the local **Sign in** dialog, and the
   **Windows TUI** (ARCH-81). See §5–§6.
-- **Next — Windows GUI depth (P0).** The Win32 GUI surfaces all 27 engine
-  features (ARCH-82) but many surfaces are thin; the prioritized gaps are
-  [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5, now each carrying a REQ:
-  the global error/toast + connection-status surface (**REQ-263**), search that
-  navigates to the matched message (REQ-080), the sidebar overhaul — DM section +
-  grouping + search (**REQ-267**), composer autocomplete + emoji picker
-  (**REQ-265**), the in-app settings/preferences hub (**REQ-261**), the
-  other-user profile viewer (**REQ-266**), a command palette (**REQ-260**), and
-  the **N-concurrent-workspace model** (REQ-012–015 — the rail switcher UI is
-  already built; what's missing is holding N clients at once with background
-  unread, as the TUI does). Inline image rendering (**REQ-142**) is a D2D-native
-  win once those land.
+- **Next — Windows GUI depth (P0).** The Win32 GUI surfaces every engine feature
+  (ARCH-82), and the original depth list is now largely spent: the error/toast +
+  connection surface (**REQ-263**), search-to-matched-message (REQ-080), the
+  sidebar overhaul (**REQ-267**), composer autocomplete + emoji picker
+  (**REQ-265**), the preferences hub (**REQ-261**), the other-user profile viewer
+  (**REQ-266**), the command palette (**REQ-260**) and inline image rendering
+  (**REQ-142**) are all built. What remains, in
+  [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5 order: channel
+  rename/topic/archive (REQ-034/035/036), the activity feed (**REQ-139**),
+  permalinks and jump-in-context (**REQ-232**), search paging (blocked on a wire
+  cursor), mark-unread/mute/star (REQ-235/137/234), profile depth (REQ-240/241),
+  notification depth (REQ-134/135/136), rich text (**REQ-220**), accessibility
+  (**REQ-269**), and the **N-concurrent-workspace model** (REQ-012–015 — the rail
+  switcher UI is built; holding N clients at once with background unread is not,
+  as the TUI does).
+- **Next — TUI catch-up (P1).** For the first time the TUI is *behind*: @mentions
+  (REQ-221), pins (REQ-230), the channel files listing (REQ-143) and the
+  per-channel member roster (REQ-031) are all on the wire and in the app-core, and
+  none is surfaced in the terminal client.
 - **Next — auth completeness.** The **OIDC browser flow + PKCE + loopback
   courier** — the one remaining piece of REQ-020 and what makes SSO usable at all
   (there is no SAML by design, **REQ-027**); plus first-run onboarding
