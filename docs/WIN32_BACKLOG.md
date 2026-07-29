@@ -96,7 +96,7 @@ Not startable in this client. Each names what must land first.
 | **WIN-47** | Rich profile fields — avatar, email, timezone, title | REQ-240 |
 | **WIN-48** | Webhook reveal / rotate / enable-disable | No such ops; only create/list/delete exist |
 | **WIN-49** | Activity feed — the **Activity** rail stub (now carrying the bell; the duplicate "Alerts" entry was removed) | REQ-139 |
-| **WIN-50** | Files browser — the **Files** rail stub | REQ-143 |
+| ~~**WIN-50**~~ | ~~Files browser — the **Files** rail stub~~ **DONE.** The workspace-wide view over `LIST_FILES` with `channel_id 0`, which the daemon already answered — so this was a fetch and a header, not a protocol change. Each row names the channel it came from (the point of a cross-channel list) and clicking one switches channel and jumps to the message. Type filter (All / Images / Documents / Other) on both this and the channel tab, and the 200-row cap is stated rather than silently truncating. | — |
 | **WIN-51** | Forward / quote-share a message | REQ-057 |
 | **WIN-52** | Mark a message or conversation unread | REQ-235 |
 | **WIN-53** | Custom status (emoji + text + expiry) | REQ-241 / REQ-122 |

@@ -2890,17 +2890,56 @@ static void draw_pinlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
 /* Files shared in this channel (REQ-143, ARCH-91). Deliberately a flat,
  * newest-first list rather than a grid: most of what gets shared here is not an
  * image, and a grid of generic file glyphs is worse than a line of names. */
-static void draw_filelist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
-    D2D1_RECT_F body = rf(reg.left, reg.top, reg.right, reg.bottom);
-    g_n_filerows = 0;
-    if (m->filelist_loading) { overlay_empty(rt, body, "Loading\u2026"); return; }
-    if (m->n_files == 0) {
-        overlay_empty(rt, body, "No files shared in this channel yet.");
-        return;
+/* File-type filter (REQ-143). Client-side over the `mime` the wire already
+ * carries — the server returns the newest 200 and the user narrows what they are
+ * looking at, which is honest: it filters the page, it does not re-query. */
+enum { FF_ALL = 0, FF_IMAGES, FF_DOCS, FF_OTHER, FF_KINDS };
+static int g_file_filter;
+static D2D1_RECT_F g_file_filters[FF_KINDS];
+
+static int file_kind(const char *mime) {
+    if (mime_is_image(mime)) return FF_IMAGES;
+    if (!mime) return FF_OTHER;
+    if (!strncmp(mime, "text/", 5) || strstr(mime, "pdf") || strstr(mime, "word") ||
+        strstr(mime, "sheet") || strstr(mime, "presentation") || strstr(mime, "document"))
+        return FF_DOCS;
+    return FF_OTHER;
+}
+
+static int file_passes(const oc_file_view *f) {
+    return g_file_filter == FF_ALL || file_kind(f->mime) == g_file_filter;
+}
+
+/* The filter chips. Returns the y below them. */
+static float draw_file_filters(ID2D1RenderTarget *rt, D2D1_RECT_F body) {
+    static const char *L[FF_KINDS] = { "All", "Images", "Documents", "Other" };
+    float fx = body.left + 20, y = body.top + 8;
+    for (int i = 0; i < FF_KINDS; i++) {
+        float fw = text_width(L[i], g_small) + 22;
+        D2D1_RECT_F b = rf(fx, y, fx + fw, y + 24);
+        int on = (g_file_filter == i);
+        fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
+        if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, L[i], g_small, b, on ? 0xFFFFFF : OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_file_filters[i] = b;
+        fx = b.right + 6;
     }
-    float y = body.top + 8;
+    return y + 32;
+}
+
+/* One list of files, used by both the channel's Files tab and the workspace-wide
+ * Files view. `show_channel` adds which channel each file came from — essential
+ * across channels, noise inside one. */
+static void draw_file_rows(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F body,
+                           float y, int show_channel) {
+    g_n_filerows = 0;
+    int shown = 0;
     for (size_t i = 0; i < m->n_files && y < body.bottom; i++) {
         const oc_file_view *f = &m->files[i];
+        if (!file_passes(f)) continue;
+        shown++;
         D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + 46);
         if (g_hover_filerow == f->id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
 
@@ -2909,10 +2948,11 @@ static void draw_filelist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F 
         draw_text(rt, f->filename, g_ui, rf(row.left + 40, y + 4, row.right - 100, y + 24),
                   f->reclaimed ? OC_COL_FAINT : OC_COL_TEXT);
 
-        /* Uploader, size and date on the sub-line. A reclaimed row says so
-         * rather than offering a download that cannot work (REQ-215/217). */
+        /* Uploader, size, date — and the channel when this list spans them. A
+         * reclaimed row says so rather than offering a download that cannot
+         * work (REQ-215/217). */
         const char *who = oc_model_user_name((oc_model *)m, f->uploader_id);
-        char sub[192], when[24] = "", sz[32];
+        char sub[256], when[24] = "", sz[32], chan[80] = "";
         if (f->created_at) {
             time_t t = (time_t)(f->created_at / 1000);
             struct tm tv;
@@ -2921,7 +2961,11 @@ static void draw_filelist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F 
         if (f->size >= 1024 * 1024) snprintf(sz, sizeof sz, "%.1f MB", (double)f->size / (1024 * 1024));
         else if (f->size >= 1024)   snprintf(sz, sizeof sz, "%.0f KB", (double)f->size / 1024);
         else                        snprintf(sz, sizeof sz, "%llu B", (unsigned long long)f->size);
-        snprintf(sub, sizeof sub, "%s \u00B7 %s \u00B7 %s%s",
+        if (show_channel) {
+            const oc_channel *fc = oc_model_channel((oc_model *)m, f->channel_id);
+            if (fc && fc->name && fc->name[0]) snprintf(chan, sizeof chan, "#%s \u00B7 ", fc->name);
+        }
+        snprintf(sub, sizeof sub, "%s%s \u00B7 %s \u00B7 %s%s", chan,
                  (who && who[0]) ? who : "someone", sz, when,
                  f->reclaimed ? "  \u00B7 no longer stored" : "");
         draw_text(rt, sub, g_small, rf(row.left + 40, y + 24, row.right - 100, y + 42),
@@ -2942,6 +2986,45 @@ static void draw_filelist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F 
         }
         y += 50;
     }
+    if (!shown && m->n_files)
+        draw_text(rt, "Nothing of that type here.", g_small,
+                  rf(body.left + 20, y + 6, body.right - 20, y + 26), OC_COL_FAINT);
+    /* The server caps the response; saying so beats a list that silently stops. */
+    if (m->n_files >= OC_MAX_FILE_LIST && y < body.bottom)
+        draw_text(rt, "Showing the most recent 200. Older files are in search.", g_small,
+                  rf(body.left + 20, y + 8, body.right - 20, y + 28), OC_COL_FAINT);
+}
+
+static void draw_filelist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    D2D1_RECT_F body = reg;
+    g_n_filerows = 0;
+    if (m->filelist_loading) { overlay_empty(rt, body, "Loading\u2026"); return; }
+    if (m->n_files == 0) {
+        overlay_empty(rt, body, "No files shared in this channel yet.");
+        return;
+    }
+    float y = draw_file_filters(rt, body);
+    draw_file_rows(rt, m, body, y, 0);
+}
+
+/* The workspace-wide Files view (rail). The same list with `channel_id 0`, which
+ * the daemon already answers as "every channel I can read" — so this view cost a
+ * fetch and a header, not a protocol change. */
+static void draw_files_view(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    fill(rt, rf(reg.left, reg.top, reg.right, reg.top + HEADER_H), OC_COL_HEADER);
+    draw_text(rt, "Files", g_hdr, rf(reg.left + 20, reg.top, reg.right - 20, reg.top + HEADER_H),
+              OC_COL_TEXT);
+    fill(rt, rf(reg.left, reg.top + HEADER_H - 1, reg.right, reg.top + HEADER_H), OC_COL_BORDER);
+    D2D1_RECT_F body = rf(reg.left, reg.top + HEADER_H, reg.right, reg.bottom);
+
+    g_n_filerows = 0;
+    if (m->filelist_loading) { overlay_empty(rt, body, "Loading\u2026"); return; }
+    if (m->n_files == 0) {
+        overlay_empty(rt, body, "No files shared anywhere you can see yet.");
+        return;
+    }
+    float y = draw_file_filters(rt, body);
+    draw_file_rows(rt, m, body, y, 1);
 }
 
 /* One preference row: a label, a sub-label, and a segmented set of choices on
@@ -4138,7 +4221,7 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         D2D1_RECT_F reg = rf(RAIL_W, 0, W, H);
         switch (g_view) {
             case VIEW_ACTIVITY:      draw_stub_view(rt, reg, "Activity", "Activity feed \xE2\x80\x94 coming soon"); break;
-            case VIEW_FILES:         draw_stub_view(rt, reg, "Files", "File browser \xE2\x80\x94 coming soon"); break;
+            case VIEW_FILES:         draw_files_view(rt, m, reg); break;
             case VIEW_LATER:         draw_stub_view(rt, reg, "Later", "Saved items \xE2\x80\x94 coming soon"); break;
             case VIEW_ADMIN:         draw_admin(rt, m, reg); break;
             default:                 draw_stub_view(rt, reg, "OpenChime", ""); break;
@@ -5042,6 +5125,42 @@ static void theme_set(int mode);       /* fwd */
 static void prefs_save(void);          /* fwd */
 static void prefs_load(const oc_model *m);   /* fwd */
 
+/* Clicks on the file list — shared by the channel's Files tab and the
+ * workspace-wide Files view, which draw the same rows from the same model. */
+static int files_click(HWND hwnd, int x, int y) {
+    for (int i = 0; i < FF_KINDS; i++)
+        if (in_rect(g_file_filters[i], (float)x, (float)y)) { g_file_filter = i; return 1; }
+    const oc_model *fm = model();
+    for (int i = 0; i < g_n_filerows && fm; i++) {
+        if ((size_t)g_filerows[i].ix >= fm->n_files) continue;
+        const oc_file_view *f = &fm->files[g_filerows[i].ix];
+        if (in_rect(g_filerows[i].dl, (float)x, (float)y)) {
+            oc_attachment at = { f->id, {0}, {0}, f->size, f->reclaimed };
+            snprintf(at.filename, sizeof at.filename, "%s", f->filename);
+            snprintf(at.mime, sizeof at.mime, "%s", f->mime);
+            download_attachment(hwnd, &at);
+            return 1;
+        }
+        if (in_rect(g_filerows[i].row, (float)x, (float)y)) {
+            /* Jump to the message it was shared with — a file is a thing
+             * somebody said something about. From the workspace view that means
+             * changing channel first, which is the point of showing which one. */
+            if (f->message_id) {
+                /* Always leave the Files VIEW, even when the file is in the
+                 * channel already selected: otherwise select_tab closes the list
+                 * we are standing in and leaves an empty page behind. */
+                int from_view = (g_view == VIEW_FILES);
+                if (f->channel_id && f->channel_id != g_sel) select_channel(f->channel_id);
+                if (from_view) { g_view = VIEW_HOME; layout_composer(hwnd); }
+                g_jump_mid = f->message_id;
+                select_tab(TAB_MESSAGES);
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int on_click(HWND hwnd, int x, int y) {
     /* A modal owns the window while it is up: a click outside the card dismisses
      * it, and nothing behind it is reachable. Tested first for that reason. */
@@ -5261,8 +5380,10 @@ static int on_click(HWND hwnd, int x, int y) {
                 int act = g_navrows[i].act;
                 if (act >= 0)                  {
                     g_view = act; layout_composer(hwnd);
-                    /* Entering Admin fetches its current tab's report. */
+                    /* Entering a report view fetches it: both are point-in-time
+                     * and a stale one is worse than a moment's wait. */
                     if (act == VIEW_ADMIN) admin_select(g_adm_tab);
+                    if (act == VIEW_FILES) oc_client_list_files(g_client, 0);   /* 0 = everywhere */
                 }
                 else if (act == NAV_MORE)      { g_more_open = !g_more_open; }
                 else if (act == NAV_SWITCHER)  { open_switcher(hwnd); }
@@ -5275,6 +5396,9 @@ static int on_click(HWND hwnd, int x, int y) {
     if (g_view == VIEW_ADMIN)
         for (int i = 0; i < ADM_COUNT; i++)
             if (in_rect(g_adm_tabs[i], x, y)) { admin_select(i); return 1; }
+    /* The Files view has no sidebar, so its clicks must be served before the
+     * transcript-only guard below. */
+    if (g_view == VIEW_FILES && files_click(hwnd, x, y)) return 1;
     /* Everything below is only meaningful in the transcript views. */
     if (!view_has_sidebar()) return 1;
 
@@ -5364,30 +5488,7 @@ static int on_click(HWND hwnd, int x, int y) {
                             g_chips[i].mine ? OC_REACT_REMOVE : OC_REACT_ADD);
             return 1;
         }
-    /* Rows of the open files list. */
-    {
-        const oc_model *fm = model();
-        for (int i = 0; i < g_n_filerows && fm; i++) {
-            if ((size_t)g_filerows[i].ix >= fm->n_files) continue;
-            const oc_file_view *f = &fm->files[g_filerows[i].ix];
-            if (in_rect(g_filerows[i].dl, x, y)) {
-                oc_attachment at = { f->id, {0}, {0}, f->size, f->reclaimed };
-                snprintf(at.filename, sizeof at.filename, "%s", f->filename);
-                snprintf(at.mime, sizeof at.mime, "%s", f->mime);
-                download_attachment(hwnd, &at);
-                return 1;
-            }
-            if (in_rect(g_filerows[i].row, x, y)) {
-                /* Jump to the message it was shared with — a file is a thing
-                 * somebody said something about. */
-                if (f->message_id) {
-                    g_jump_mid = f->message_id;
-                    select_tab(TAB_MESSAGES);
-                }
-                return 1;
-            }
-        }
-    }
+    if (files_click(hwnd, x, y)) return 1;
     /* Rows of the open pins overlay. */
     for (int i = 0; i < g_n_pinrows; i++) {
         if (in_rect(g_pinrows[i].unpin, x, y)) {

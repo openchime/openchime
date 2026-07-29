@@ -200,7 +200,7 @@ Vendor-facing rows are inherently perishable — a competitor can change a plan 
 | Inline video/audio playback | ✅ | ✅ | ⛔ | ⛔ | Media playback out of scope. |
 | Inline PDF/doc preview | ✅ | ✅ clickable previews | ❌ | ❌ open-in-place missing | **P2** |
 | Code/text snippets | ✅ | ❔ | ❌ | ❌ | **P2** |
-| Files browser / channel Files tab | ✅ | ✅ (Files tab in search) | ❌ | ✅ Files & links tab: name, uploader, size, date, download, jump-to-message | Built (REQ-143/ARCH-91). Newest-first, 200 cap, reclaimed files listed and flagged. No type filter UI yet (the `mime` is on the wire). **P1 (TUI)** |
+| Files browser / channel Files tab | ✅ | ✅ (Files tab in search) | ❌ | ✅ channel **Files & links** tab **and** a workspace-wide **Files** view, both with a type filter | Built (REQ-143/ARCH-91). Newest-first, 200 cap, reclaimed files listed and flagged. No type filter UI yet (the `mime` is on the wire). **P1 (TUI)** |
 | File comments/sharing/permissions | ✅ | ❔ | ❌ | ❌ | **P2** |
 | External file services (Drive/Dropbox) | ✅ | ✅ Google Drive | ⛔ | ⛔ | Out of scope. |
 | Upload progress / preview | ✅ | ✅ | ❌ | ❌ | **P2** |
@@ -390,7 +390,6 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 - **N-concurrent-workspace model** — the rail switcher UI exists, but Win32 stop/reconnects a **single** client; no holding N clients at once with background unread. **P1**
 - **Activity feed / notification inbox** (REQ-139) — the rail's **Activity** entry is still a "coming soon" stub. Migration 0021 now indexes mentions by user, so the mentions half has a query behind it. **P1**
 - **Saved items / Later** (REQ-231) — rail stub. **P2**
-- **Workspace-wide Files view** — the rail's **Files** entry is still a stub, even though `LIST_FILES` already accepts `channel_id 0` for exactly this. The **per-channel** Files tab is built. **P2**
 - **Mark-unread** (REQ-235); **mute channel/DM** (REQ-137); **star/favourite** (REQ-234). **P1**
 - **Copy-link / permalink and forward** on messages — permalinks are REQ-232, unbuilt. **P1**
 - **Search paging, filters, term highlight** — paging is blocked on the wire: `SEARCH_RESULTS` carries `truncated` but no cursor (WIN-38). In-overlay input and jump-to-message are built. **P1**
