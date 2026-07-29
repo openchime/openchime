@@ -132,7 +132,7 @@ static float composer_inner_h(void) { return g_composer_h - COMPOSER_CHROME; }
  * real today; ACTIVITY/FILES/LATER/NOTIFICATIONS are stubs until their features
  * land. Rail item `act` values <0 are special (switcher / new / profile / more). */
 enum { VIEW_HOME = 0, VIEW_DMS, VIEW_ACTIVITY, VIEW_FILES, VIEW_LATER,
-       VIEW_ADMIN, VIEW_NOTIFICATIONS, VIEW_COUNT,
+       VIEW_ADMIN, VIEW_COUNT,
        /* Not a rail destination: the sign-in screen, which owns the whole window
         * (no rail, no sidebar, no composer) until there is a session. */
        VIEW_SIGNIN = 100 };
@@ -548,8 +548,10 @@ static uint32_t g_sel_a_pos, g_sel_f_pos;
 static int      g_has_sel;      /* a (possibly empty) selection exists */
 static int      g_selecting;    /* left button held, dragging a selection */
 
-/* Members-pane row hit-boxes. */
-static struct { float top, bot; uint64_t uid; } g_memrows[256];
+/* Members-pane row hit-boxes. The full rect, not just top/bot: testing y alone
+ * made every click at that height — right across the transcript — open a
+ * profile, which is how the profile pane kept appearing unbidden. */
+static struct { D2D1_RECT_F r; uint64_t uid; } g_memrows[256];
 static int g_n_memrows;
 
 /* Search-overlay result hit-boxes (row -> its channel AND message). */
@@ -1308,7 +1310,7 @@ static void rail_item(ID2D1RenderTarget *rt, float y, int icon, const char *labe
 static const struct { int act; int icon; const char *label; int admin; } RAIL_ITEMS[] = {
     { VIEW_HOME,     OC_ICON_HOME,     "Home",     0 },
     { VIEW_DMS,      OC_ICON_DMS,      "DMs",      0 },
-    { VIEW_ACTIVITY, OC_ICON_ACTIVITY, "Activity", 0 },
+    { VIEW_ACTIVITY, OC_ICON_BELL,     "Activity", 0 },
     { VIEW_FILES,    OC_ICON_FILE,     "Files",    0 },
     { VIEW_LATER,    OC_ICON_BOOKMARK, "Later",    0 },
     { VIEW_ADMIN,    OC_ICON_SETTINGS, "Admin",    1 },
@@ -1354,7 +1356,7 @@ static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
         if (!RAIL_ITEMS[i].admin || (m && self_role(m) >= OC_ROLE_ADMIN)) vis[nv++] = i;
 
     float y = 64;                                   /* below the workspace + divider */
-    float by = h - 3 * RAIL_IH - 6;                 /* bottom cluster top */
+    float by = h - 2 * RAIL_IH - 6;                 /* bottom cluster top */
     int maxfit = (int)((by - y) / RAIL_IH);
     if (maxfit < 1) maxfit = 1;
     int shown = nv, overflow = 0;
@@ -1379,12 +1381,18 @@ static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
         g_more_open = 0;   /* nothing folded — no flyout */
     }
 
-    /* Bottom cluster (elastic spacer above): New, Alerts, Profile. */
+    /* Bottom cluster (elastic spacer above): New, Profile.
+     *
+     * "Alerts" used to sit here with a bell, beside an "Activity" item carrying
+     * a heartbeat line — two entries for one idea, both dead ends. Notification
+     * *settings* already have a real home (the Notifications pane, WIN-12), so
+     * Alerts was redundant as well as empty. It is gone, and Activity inherits
+     * the bell: a pulse-line glyph reads as a system monitor, not as "things
+     * that happened to you". */
     rail_item(rt, by,               OC_ICON_PLUS, "New",    NAV_NEW);
-    rail_item(rt, by + RAIL_IH,     OC_ICON_BELL, "Alerts", VIEW_NOTIFICATIONS);
     /* Profile: a colored initial avatar for the signed-in user. */
     {
-        float py = by + 2 * RAIL_IH;
+        float py = by + RAIL_IH;
         if (NAV_PROFILE == g_nav_hover)
             fill_round_a(rt, rf(cx - 18, py + 6, cx + 18, py + 42), 10.0f, 0xFFFFFF, 0.08f);
         const char *nm = m ? oc_model_user_name(m, m->user_id) : "";
@@ -3512,7 +3520,7 @@ static void draw_members(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
                             rf(gx, y + ROW_H / 2 - 7, gx + 14, y + ROW_H / 2 + 7), OC_COL_FAINT);
         }
         if (g_n_memrows < (int)(sizeof g_memrows / sizeof g_memrows[0])) {
-            g_memrows[g_n_memrows].top = y; g_memrows[g_n_memrows].bot = y + ROW_H;
+            g_memrows[g_n_memrows].r = rf(x0, y, W, y + ROW_H);
             g_memrows[g_n_memrows].uid = cm->user_id; g_n_memrows++;
         }
         y += ROW_H;
@@ -3977,7 +3985,6 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
             case VIEW_ACTIVITY:      draw_stub_view(rt, reg, "Activity", "Activity feed \xE2\x80\x94 coming soon"); break;
             case VIEW_FILES:         draw_stub_view(rt, reg, "Files", "File browser \xE2\x80\x94 coming soon"); break;
             case VIEW_LATER:         draw_stub_view(rt, reg, "Later", "Saved items \xE2\x80\x94 coming soon"); break;
-            case VIEW_NOTIFICATIONS: draw_stub_view(rt, reg, "Notifications", "Notifications \xE2\x80\x94 coming soon"); break;
             case VIEW_ADMIN:         draw_stub_view(rt, reg, "Admin", "Storage & audit \xE2\x80\x94 open from the workspace menu"); break;
             default:                 draw_stub_view(rt, reg, "OpenChime", ""); break;
         }
@@ -5329,7 +5336,7 @@ static int on_click(HWND hwnd, int x, int y) {
      * where "Message" now lives. Jumping straight into a DM made viewing someone
      * impossible, and it is the more destructive of the two actions. */
     for (int i = 0; i < g_n_memrows; i++)
-        if ((float)y >= g_memrows[i].top && (float)y < g_memrows[i].bot) {
+        if (in_rect(g_memrows[i].r, x, y)) {
             close_overlays();
             g_profile_uid = g_memrows[i].uid;
             g_view = VIEW_HOME;
@@ -5456,7 +5463,7 @@ static void on_rclick(HWND hwnd, int x, int y) {
     }
     /* Members pane first (it overlaps the right edge). */
     for (int i = 0; i < g_n_memrows; i++)
-        if ((float)y >= g_memrows[i].top && (float)y < g_memrows[i].bot) {
+        if (in_rect(g_memrows[i].r, (float)x, (float)y)) {
             show_member_menu(hwnd, m, g_memrows[i].uid, pt.x, pt.y);
             return;
         }

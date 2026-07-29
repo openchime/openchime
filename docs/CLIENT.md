@@ -282,7 +282,7 @@ model; translate input to intents }, stop.
   **Shell layout.** A **global left-nav rail** (Lucide icons stroked as D2D path
   geometry) holds the workspace avatar → switcher, six primary views (Home, DMs,
   Activity, Files, Later, Admin — the last owner/admin-gated, with a "More"
-  overflow flyout), and a bottom cluster of New (+) / Alerts / profile avatar.
+  overflow flyout), and a bottom cluster of New (+) / profile avatar.
   Three custom D2D dropdowns replace the old native app menu — **workspace**
   (invite, preferences, storage/audit, reconnect, sign out / sign out
   everywhere), **profile** (presence, DND, display name, password), and **New**
@@ -290,7 +290,7 @@ model; translate input to intents }, stop.
   (header with settings + compose buttons, a "Find a conversation" filter, then
   the channel list), the transcript, the RichEdit composer, and an optional
   members pane. Only **Home** and **DMs** render that chat shell — and today they
-  render it identically. **Activity, Files, Later and Notifications are
+  render it identically. **Activity, Files and Later are
   "coming soon" placeholders**, as is Preferences; they correspond to REQ-139,
   REQ-143, REQ-231 and REQ-261. Per-feature status is
   [STATUS.md](./STATUS.md)'s parity table; the depth backlog is

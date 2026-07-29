@@ -9,7 +9,7 @@ clients, or a `REQ-NNN`.
 parity table is the *feature reachability* tracker. This document is the *work
 list* derived from both — one row per shippable branch.
 
-**Ids.** Items are `WIN-1` … `WIN-65`, numbered once and **stable**: an id is
+**Ids.** Items are `WIN-1` … `WIN-66`, numbered once and **stable**: an id is
 never renumbered or reused, so a commit or branch can cite it. Ordering is *not*
 priority — the **Pri** column is, and it may change. Section membership may also
 change as blockers clear (an item moves from §3 to §1 without changing its id).
@@ -95,7 +95,7 @@ Not startable in this client. Each names what must land first.
 | **WIN-46** | Invite management: links, expiry, pending list, revoke | REQ-026 |
 | **WIN-47** | Rich profile fields — avatar, email, timezone, title | REQ-240 |
 | **WIN-48** | Webhook reveal / rotate / enable-disable | No such ops; only create/list/delete exist |
-| **WIN-49** | Activity feed — the **Activity** and **Alerts** rail stubs | REQ-139 |
+| **WIN-49** | Activity feed — the **Activity** rail stub (now carrying the bell; the duplicate "Alerts" entry was removed) | REQ-139 |
 | **WIN-50** | Files browser — the **Files** rail stub | REQ-143 |
 | **WIN-51** | Forward / quote-share a message | REQ-057 |
 | **WIN-52** | Mark a message or conversation unread | REQ-235 |
@@ -215,6 +215,15 @@ Recorded because a defect nobody wrote down is a defect nobody fixes.
   order the meta lines the same way, so the fix is one reordering applied twice —
   and they must stay in step or the transcript's hit-boxes drift from what is
   drawn.
+- ~~**WIN-66 — the profile pane opened by itself.**~~ **FIXED 2026-07-29.** The
+  members-pane hit test compared **y only** — `g_memrows` stored `top`/`bot` and
+  no x — so a click anywhere across the window at a member row's height opened
+  that person's profile over the transcript. With three members that made the top
+  ~100px of the *whole* window a profile trap, which is why it seemed to happen
+  at random. The right-click handler had the identical defect and opened the
+  member menu the same way; the compiler found it when the struct changed. Rows
+  now store the full rect. The rail and sidebar were never affected — both guard
+  on x at the call site, so this was an inconsistency, not a pattern.
 - ~~**WIN-62 — reaction chips are not clickable.**~~ **FIXED 2026-07-29.**
   Clicking a chip +1s it, clicking one that is already yours undoes it —
   direction from `reaction_is_mine`, the same rule the message menu uses, so the

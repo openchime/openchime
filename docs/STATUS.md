@@ -180,7 +180,7 @@ path geometry — VENDORS.md). Reading top to bottom:
 - the **workspace avatar** (its initial) — opens the workspace switcher;
 - six **primary views** — Home, DMs, Activity, Files, Later, and Admin
   (owner/admin only), overflowing into a "More" flyout when the window is short;
-- a bottom cluster — **New (+)**, **Alerts**, and the **profile avatar**.
+- a bottom cluster — **New (+)** and the **profile avatar**.
 
 Three custom Direct2D dropdowns replace the old native app menu: the **workspace
 menu** (invite, preferences, storage/audit, reconnect, sign out), the **profile
@@ -190,8 +190,7 @@ buttons and a **"Find a conversation"** filter box (a native `EDIT` that
 substring-filters channel names).
 
 **Only Home and DMs render the chat shell**, and they render it identically —
-`VIEW_DMS` has no DM-specific behaviour yet. **Activity, Files, Later and
-Notifications are still `draw_stub_view` placeholders** ("coming soon"), mapping
+`VIEW_DMS` has no DM-specific behaviour yet. **Activity, Files and Later are still `draw_stub_view` placeholders** ("coming soon"), mapping
 onto REQ-139 (activity feed), REQ-143 (a *workspace-wide* files view), REQ-231
 (saved items) and REQ-138 respectively. Two notes on that list: **Preferences is
 no longer a stub** (WIN-9), and the **Files** stub is now the cheapest of them to
