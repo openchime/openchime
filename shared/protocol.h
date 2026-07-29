@@ -20,7 +20,25 @@
 
 /* --- Constants (PROTOCOL.md §2.1, §7) ----------------------------------- */
 
-#define OC_PROTOCOL_VERSION 1u     /* the only version this codec speaks */
+/* The only version this codec speaks. Both sides send it as min AND max, so a
+ * mismatched pair is rejected at the handshake with VERSION_TOO_OLD/TOO_NEW
+ * rather than discovering the disagreement halfway through a frame.
+ *
+ * **Bump this whenever a frame's LAYOUT changes** — a new field, a reordering, a
+ * field that stops being optional — not only when a frame is added. Adding a
+ * frame is safe (an old peer never sends or expects it); changing a layout is
+ * not, because both sides still claim the same number while disagreeing about
+ * what it means. That is not hypothetical: version 1 was left alone while
+ * CHANNEL_INFO and CHANNEL_LIST both grew fields, and the result was a client
+ * and daemon that connected happily and then dropped the link on a decode
+ * failure, reported as "connection lost — reconnecting" with nothing pointing at
+ * the real cause.
+ *
+ * v2 (2026-07-29): CHANNEL_INFO gained topic/archived and made peer_id
+ * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
+ * preview_author. Shipping client and daemon together (ARCH-61) means there is
+ * no compatibility window to preserve — only a mismatch to detect loudly. */
+#define OC_PROTOCOL_VERSION 2u
 
 /* Transport conventions (see PROTOCOL.md §1). The binary protocol shares TLS
  * port 443 with the future HTTP/webhook surface, demultiplexed by ALPN: a

@@ -4812,7 +4812,13 @@ static void layout_find(HWND hwnd) {
      *
      * The search and emoji boxes never showed this because each is already
      * gated on its own pane's open flag; the find box had no such guard. */
-    int want = view_has_sidebar() && !g_menu && !g_more_open && !g_pal_open;
+    /* Also hidden in the DMs view: that column is the DM list, not the channel
+     * sidebar, so the box has nothing to filter and — being a native child that
+     * composites ABOVE the D2D output — it floated over the first row as a bare
+     * white rectangle. Same class of bug as the workspace menu it already
+     * guards against, and the same fix: get out of the way. */
+    int want = view_has_sidebar() && g_view != VIEW_DMS &&
+               !g_menu && !g_more_open && !g_pal_open;
 
     /* Only act on a change: this runs every frame, and a redundant MoveWindow
      * still churns WM_WINDOWPOSCHANGED and can flicker the control. The DPI is
@@ -7270,10 +7276,14 @@ static void test_dump(const char *path) {
     fprintf(f, "channels=%zu\n", m->n_channels);
     for (size_t i = 0; i < m->n_channels; i++) {
         const oc_channel *c = &m->channels[i];
-        if (!c->name || !c->name[0]) continue;
-        fprintf(f, "  ch %llu \"%s\" unread=%d msgs=%zu%s\n",
-                (unsigned long long)c->channel_id, c->name, c->unread,
-                c->n_msgs, c->channel_id == g_sel ? " *" : "");
+        /* DMs have no name, so the old `continue` hid every one of them from the
+         * dump — which is why a DM-list bug could not be diagnosed from it. */
+        fprintf(f, "  ch %llu %s\"%s\" unread=%d msgs=%zu prev=\"%s\" prevby=%llu%s\n",
+                (unsigned long long)c->channel_id,
+                c->kind == OC_CHANNEL_KIND_DM ? "DM " : "",
+                c->name ? c->name : "", c->unread,
+                c->n_msgs, c->preview, (unsigned long long)c->preview_author,
+                c->channel_id == g_sel ? " *" : "");
     }
     fclose(f);
 }

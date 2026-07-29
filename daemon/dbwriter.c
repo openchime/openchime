@@ -1753,6 +1753,10 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         "       OR EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1)) "
         "ORDER BY c.id;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    /* ?2 is the preview length. An unbound parameter is NULL, and
+     * substr(x, 1, NULL) is NULL — so forgetting this bind does not fail, it
+     * silently returns an empty preview for every channel. */
+    sqlite3_bind_int(st, 2, (int)OC_MAX_PREVIEW);
 
     size_t cap = 8, n = 0;
     oc_channel_row *arr = malloc(cap * sizeof *arr);

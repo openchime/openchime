@@ -243,6 +243,19 @@ integration scenarios join the `integration` job once the client-TLS decision
 
 ---
 
+## Driving the Win32 GUI
+
+`scripts/gui_drive.sh launch` **builds both sides and restarts the daemon if the
+running one predates the binary it just built.** That is not convenience: the
+client and daemon share a wire and ship together (ARCH-61), so a client built
+from source N against a daemon still running N-1 decodes garbage and reports only
+"connection lost — reconnecting", which points nowhere near the cause. It cost
+real time three times in a single day before the guard existed.
+
+`make` is incremental, so it is free when nothing changed. `OC_DRIVE_NO_BUILD=1`
+skips the build and `OC_DRIVE_NO_DAEMON=1` leaves the daemon alone — for when a
+mismatched pair is the thing under test, such as the version-reject path.
+
 ## Known flakiness
 
 *None currently known.*

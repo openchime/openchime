@@ -17,12 +17,63 @@ EXE="$HERE/build/openchime.exe"
 WIN_DIR='C:\Windows\Temp\octest'
 LIN_DIR='/mnt/c/Windows/Temp/octest'
 OUT="${GUI_DRIVE_OUT:-/tmp/ocshot}"
+OC_DEV_DIR="${OC_DEV_DIR:-/tmp/openchime-dev}"
+OC_DEV_PORT="${OC_DEV_PORT:-8443}"
 
 mkdir -p "$LIN_DIR" "$OUT"
 
 case "${1:-}" in
   launch)
     ws="${2:-127.0.0.1:8443}"; cred="${3:-alice:pw}"
+
+    # --- Build BOTH sides, then restart the daemon on the new binary. ---------
+    #
+    # The client and the daemon share a wire (ARCH-61 ships them together), so a
+    # client built from source N talking to a daemon still running binary N-1 is
+    # not a test, it is a trap: frames decode into garbage and the only symptom
+    # is "connection lost — reconnecting", which points nowhere near the cause.
+    # That cost real time three times in one day before this guard existed.
+    #
+    # `make` is incremental, so this is free when nothing changed. Skip with
+    # OC_DRIVE_NO_BUILD=1 when you deliberately want a mismatched pair (testing
+    # the version-reject path, say).
+    if [ "${OC_DRIVE_NO_BUILD:-0}" != "1" ]; then
+      make -C "$HERE" >/dev/null || { echo "daemon build FAILED" >&2; exit 1; }
+      make -C "$HERE" windows-gui >/dev/null || { echo "gui build FAILED" >&2; exit 1; }
+    fi
+
+    # Restart the daemon unless it is already running the binary we just built.
+    # Comparing start time to the binary's mtime is enough and avoids bouncing a
+    # daemon (and its in-memory presence) on every launch.
+    if [ "${OC_DRIVE_NO_DAEMON:-0}" != "1" ]; then
+      dpid=$(pgrep -x openchimed | head -1 || true)
+      stale=1
+      if [ -n "$dpid" ]; then
+        started=$(stat -c %Y "/proc/$dpid" 2>/dev/null || echo 0)
+        built=$(stat -c %Y "$HERE/openchimed" 2>/dev/null || echo 0)
+        [ "$started" -ge "$built" ] && stale=0
+      fi
+      if [ "$stale" = "1" ]; then
+        [ -n "$dpid" ] && { kill "$dpid" 2>/dev/null || true; sleep 1; }
+        mkdir -p "$OC_DEV_DIR"
+        env OPENCHIME_DB_PATH="$OC_DEV_DIR/db" \
+            OPENCHIME_TLS_CERT="$OC_DEV_DIR/cert.pem" OPENCHIME_TLS_KEY="$OC_DEV_DIR/key.pem" \
+            OPENCHIME_BLOB_DIR="$OC_DEV_DIR/blobs" \
+            OPENCHIME_PROTO_PORT="${OC_DEV_PORT}" OPENCHIME_HEALTH_PORT=8080 \
+            OPENCHIME_WORKSPACE_NAME="${OC_DEV_WS:-Acme HQ}" \
+            OPENCHIME_BOOTSTRAP_USERS="${OC_DEV_USERS:-alice:pw:owner,bob:pw:member,carol:pw:member}" \
+            OPENCHIME_DEPLOYMENT_MODE=managed OPENCHIME_MAX_USERS=100 \
+            setsid "$HERE/openchimed" > "$OC_DEV_DIR/daemon.log" 2>&1 < /dev/null &
+        disown
+        # Wait for the listener rather than sleeping a guess.
+        for _ in $(seq 1 40); do
+          (exec 3<>/dev/tcp/127.0.0.1/$OC_DEV_PORT) 2>/dev/null && { exec 3<&- 3>&-; break; }
+          sleep 0.25
+        done
+        echo "daemon restarted (was stale or absent)" >&2
+      fi
+    fi
+
     # Exactly one instance, always. A leftover client reads the same command file
     # and answers for the one under test — which once produced a "crash" that was
     # really an orphan from an earlier run.

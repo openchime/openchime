@@ -202,7 +202,9 @@ static int send_hello(client *c, uint16_t mn, uint16_t mx) {
 }
 
 static int do_handshake(client *c) {
-    if (send_hello(c, 1, 1) != 0) return -1;
+    /* Track the codec, not a literal: hardcoding 1 here meant a protocol bump
+     * failed this test rather than the mismatch it is supposed to detect. */
+    if (send_hello(c, OC_PROTOCOL_VERSION, OC_PROTOCOL_VERSION) != 0) return -1;
     oc_header hdr; oc_rbuf p;
     if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_WELCOME) return -1;
     oc_welcome wel;
@@ -236,7 +238,7 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
 static void test_version_reject(int port, const uint8_t *pin) {
     client c;
     CHECK(client_open(&c, port, pin) == 0);
-    CHECK(send_hello(&c, 5, 5) == 0);            /* too new */
+    CHECK(send_hello(&c, OC_PROTOCOL_VERSION + 1, OC_PROTOCOL_VERSION + 1) == 0);  /* too new */
     oc_header hdr; oc_rbuf p;
     CHECK(read_frame(&c, &hdr, &p) == 0);
     CHECK(hdr.msg_type == OC_MSG_REJECT);

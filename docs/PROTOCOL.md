@@ -125,6 +125,27 @@ type-specific payload. All multi-byte integers are **network byte order**
   version 1 forever** (§3), so version negotiation itself never has a version
   mismatch problem.
 
+> **Bump `OC_PROTOCOL_VERSION` whenever a frame's LAYOUT changes** — a new field,
+> a reordering, a field that stops being optional — and not only when a frame is
+> *added*. Adding a frame is safe: a peer that does not know it never sends it and
+> never expects it. Changing a layout is not, because both sides still claim the
+> same version number while disagreeing about what it means, and the failure
+> surfaces as a decode error mid-session rather than a clean rejection.
+>
+> This is written down because it was learned the hard way: `CHANNEL_INFO` and
+> `CHANNEL_LIST` both grew fields while the version stayed at 1, and a client
+> built from the new source talking to a daemon still running the old binary
+> connected happily and then dropped the link, reporting only "connection lost —
+> reconnecting". Both sides send the version as `min` **and** `max`, so a bump
+> turns exactly that situation into a `REJECT` carrying `VERSION_TOO_OLD` /
+> `VERSION_TOO_NEW`, which says what is wrong.
+>
+> **Current version: 2** (2026-07-29). v2 = v1 plus `CHANNEL_INFO`'s topic and
+> archived (and `peer_id` no longer optional) and `CHANNEL_LIST`'s topic,
+> archived, created_at, preview and preview_author. Since the client and daemon
+> ship together (ARCH-61) there is no compatibility window to preserve — only a
+> mismatch to detect loudly.
+
 ### 2.1 Size limits (ARCH-30, REQ-054)
 
 - `MAX_FRAME_SIZE` = **66,560 bytes** (65 KiB) total on the wire
