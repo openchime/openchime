@@ -503,6 +503,39 @@ the Files/Pins/About tabs still left the composer's box, buttons and send arrow
 DRAWN there — an input you cannot type into, which is the thing hiding the child
 was meant to prevent. `main_is_conversation()` now decides both.
 
+## Typography (graphical clients) — ARCH-97
+
+The platform owns the **family**, we own the **scale**. Full reasoning is in
+ARCH-97; what a frontend author needs is the table and two rules.
+
+| Token | DIP | Weight | Used for |
+|---|---|---|---|
+| `display` | 17 | 600 | view + workspace titles |
+| `title` | 15 | 600 | channel header, author names |
+| `body` | 15 | 400 | message text **and** the composer |
+| `ui` | 14 | 400 / 600 | controls, list rows, buttons |
+| `meta` | 12.5 | 400 | timestamps, sublabels, chips, counts |
+| `micro` | 10 | 600 | rail labels |
+
+**Rule one: name the role, never the size.** The Win32 client's formats were
+`g_hdr`, `g_small`, `g_time`, `g_ava`, `g_rail` — five names describing a size or
+a single call site, which is why `g_small` accumulated 208 uses covering
+timestamps, chips, counts, hints and section headers with no way to change one
+without changing all of them. They are now `g_display`, `g_title`, `g_body`,
+`g_ui`/`g_ui_b`, `g_meta`/`g_meta_w`/`g_meta_r`, `g_avatar`, `g_micro` — the same
+tokens the other graphical clients will declare, so a reviewer moving between
+them reads one vocabulary.
+
+**Rule two: two weights.** Regular 400 and Semibold 600 in all chrome. Bold 700
+belongs to markdown `**strong**` in message bodies and nowhere else, so weight
+carries one meaning in the UI and a different, deliberate one in content.
+
+Sizes are DIPs and are multiplied by the user's **text size** factor when the
+formats are built (`fonts_build`); system DPI and window zoom are applied
+separately, for the reasons ARCH-97 gives. Rebuilding the formats is the only way
+to change a DirectWrite size, so any preference that moves the scale must call
+`fonts_build` and then force a relayout.
+
 ## 8. Roadmap
 
 - **Now:** app-core + termbox2 TUI shipped. On top of the lean core loop

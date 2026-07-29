@@ -242,6 +242,31 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **The cost, stated plainly:** a query cannot cheaply carry per-item read state the way a materialised list can. So v1 does not have it. Instead `users.activity_seen_ms` is a **watermark** — one timestamp, stamped when the feed is opened — which is enough to badge "there is something new" and nothing more. If per-item read/dismiss is ever wanted, that is the point at which a table earns its place, and the query becomes its seed.
 
+- **ARCH-97 (Typography — the platform owns the family, we own the scale):** Applies to every graphical client (ARCH-74's native front-ends); the TUI is exempt, since a terminal's font is the user's business.
+
+  **The family comes from the OS.** Segoe UI Variable Text on Windows 11 falling back to Segoe UI, the desktop's `system-ui` on GTK, SF on macOS. Bundling a typeface is the most visible way to look foreign in a window — it is a large part of why Slack's own desktop client reads as not-quite-native — and it adds a licensing and shipping cost for a negative. A client that looks like it belongs on the platform is the whole point of not using a toolkit (ARCH-82).
+
+  **The size scale is ours, and is identical in every graphical client.** The roles must not drift between the Windows, GTK and AppKit front-ends, or "the same product" stops being true — and the sizes are the one part of typography that carries product meaning rather than platform convention. Six tokens, named for their ROLE rather than their size, because `small` is a measurement and `meta` is a decision:
+
+  | Token | DIP | Weight | Used for |
+  |---|---|---|---|
+  | `display` | 17 | 600 | view + workspace titles |
+  | `title` | 15 | 600 | channel header, author names |
+  | `body` | 15 | 400 | message text and the composer — one constant, so they cannot disagree |
+  | `ui` | 14 | 400 / 600 | controls, list rows, buttons |
+  | `meta` | 12.5 | 400 | timestamps, sublabels, chips, counts |
+  | `micro` | 10 | 600 | rail labels |
+
+  **Two weights only: Regular 400 and Semibold 600.** Bold 700 is reserved for markdown `**strong**` inside message bodies, so weight means exactly one thing in chrome and a different, deliberate thing in content — never both at once.
+
+  **Three multipliers, kept separate**, because they answer three different questions and blending them is how an app ends up rendering 11.5px text nobody chose:
+
+  - **System DPI** — the OS's answer, applied by the platform layer (Win32 already does this per-monitor).
+  - **Text size** — the *user's* answer, an accessibility preference (REQ-269). A factor on the token scale, not a per-token override.
+  - **Zoom** — *this window's* answer, on Ctrl+`+`/`-`/`0` as every other application does it.
+
+  **Text size is stated as following the user, not the machine.** Preferences live in the daemon's per-(user, client_type) bucket and a client stores nothing locally (ARCH-88), so a text size chosen on a 4K laptop also arrives on a 1080p desktop. That is the wrong answer for a screen-shaped setting and is accepted deliberately rather than by accident: giving it a per-device answer means inventing a device identity for one preference, which is a larger commitment than the problem justifies. Zoom is the per-window escape hatch in the meantime.
+
 - **ARCH-96 (Permalinks — an id pair, and a fetch-around-an-id history mode):** Delivers REQ-232.
 
   **A permalink is the ids, not the names.** `openchime://<workspace-host>/c/<channel_id>/m/<message_id>`. Channel *names* are mutable (REQ-036) and message ordering is not stable across anything but the id, so a link built from names would break the first time someone renamed a channel — which is precisely the question REQ-036 asked and ARCH-93 answered by refusing a name-history table. The ids are the durable reference; the workspace host is what makes a link portable between people rather than only meaningful inside one client.

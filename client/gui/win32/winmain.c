@@ -143,7 +143,16 @@ enum { VIEW_HOME = 0, VIEW_DMS, VIEW_ACTIVITY, VIEW_FILES, VIEW_LATER,
         * (no rail, no sidebar, no composer) until there is a session. */
        VIEW_SIGNIN = 100 };
 enum { NAV_SWITCHER = -2, NAV_NEW = -3, NAV_PROFILE = -4, NAV_MORE = -5 };
-#define BODY_DIP    15.0f     /* message + composer text size (shared, so they match) */
+/* Typography tokens (ARCH-97), in DIPs. Named for their ROLE; the family comes
+ * from the platform (ui_family()). One table, so a size is stated once and every
+ * format sharing it cannot drift. */
+#define FONT_DISPLAY  17.0f       /* view + workspace titles */
+#define FONT_TITLE    15.0f       /* channel header, author names */
+#define FONT_BODY     15.0f       /* message text AND the composer — one constant,
+                                   * so the two can never disagree */
+#define FONT_UI       14.0f       /* controls, list rows */
+#define FONT_META     12.5f       /* timestamps, sublabels, chips, counts */
+#define FONT_MICRO    10.0f       /* rail labels */
 
 /* Per-user avatar tints, shared by the transcript and the sidebar's DM rows so
  * one person is the same colour everywhere. */
@@ -261,16 +270,23 @@ static ID2D1SolidColorBrush  *g_brush;      /* one reusable brush; recolored per
 static ID2D1SolidColorBrush  *g_brush2;     /* faint brush for inline "(edited)" effect */
 static ID2D1SolidColorBrush  *g_brush3;     /* accent brush for @mention spans */
 
-static IDWriteTextFormat *g_hdr;    /* channel title */
-static IDWriteTextFormat *g_name;   /* message author (semibold) */
-static IDWriteTextFormat *g_time;   /* timestamp (trailing-aligned) */
-static IDWriteTextFormat *g_body;   /* message body (wrapping) */
-static IDWriteTextFormat *g_ui;     /* sidebar rows / composer */
-static IDWriteTextFormat *g_ui_b;   /* unread sidebar rows (semibold) */
-static IDWriteTextFormat *g_small;  /* subtitles / meta lines (no wrap) */
-static IDWriteTextFormat *g_small_w;/* the same, wrapping — for paragraphs of explanation */
-static IDWriteTextFormat *g_ava;    /* avatar initial (centered) */
-static IDWriteTextFormat *g_rail;   /* tiny rail item labels (centered) */
+/* Typography (ARCH-97). The platform owns the FAMILY, we own the SCALE, and
+ * these names are the scale's tokens — the same six every graphical client
+ * declares. They are named for their ROLE, not their size: the previous set
+ * (g_hdr, g_small, g_time, g_ava, g_rail) described a measurement or a single
+ * call site, and g_small duly grew to 208 uses spanning timestamps, chips,
+ * counts, hints and section headers with no way to change one without changing
+ * all of them. Sizes live in FONT_TOKENS; see docs/CLIENT.md. */
+static IDWriteTextFormat *g_display;  /* 17/600 — view + workspace titles */
+static IDWriteTextFormat *g_title;    /* 15/600 — channel header, author names */
+static IDWriteTextFormat *g_body;     /* 15/400 — message text (wrapping) */
+static IDWriteTextFormat *g_ui;       /* 14/400 — controls, list rows */
+static IDWriteTextFormat *g_ui_b;     /* 14/600 — the same, emphasised */
+static IDWriteTextFormat *g_meta;     /* 12.5/400 — timestamps, sublabels, chips */
+static IDWriteTextFormat *g_meta_w;   /* the same, wrapping — paragraphs of explanation */
+static IDWriteTextFormat *g_meta_r;   /* the same, trailing-aligned — timestamps */
+static IDWriteTextFormat *g_avatar;   /* title weight, centred in the disc */
+static IDWriteTextFormat *g_micro;    /* 10/600 — rail labels */
 static IDWriteTextFormat *g_emoji;   /* Segoe UI Emoji, picker cells (22px) */
 static IDWriteTextFormat *g_emoji_s; /* the same, sized for reaction chips */
 /* Lucide vector icons: geometry cached once (device-independent, from the factory,
@@ -1092,23 +1108,78 @@ static IDWriteTextFormat *mk_fmt(const WCHAR *family, float size, DWRITE_FONT_WE
     return f;
 }
 
+/* ---- typography (ARCH-97) ------------------------------------------------- */
+
+/* The user's text-size preference (REQ-269), NOT system DPI and NOT window zoom
+ * — ARCH-97 keeps the three separate on purpose. A DirectWrite format's size is
+ * immutable, so changing this means rebuilding all of them. */
+static float g_text_scale = 1.0f;
+
+/* Is a family actually installed? DirectWrite silently substitutes for a missing
+ * one, and its substitute for "Segoe UI Variable Text" is not necessarily Segoe
+ * UI — so ask rather than hope. */
+static int family_present(const WCHAR *family) {
+    IDWriteFontCollection *fc = NULL;
+    if (FAILED(IDWriteFactory_GetSystemFontCollection(g_dwrite, &fc, FALSE)) || !fc) return 0;
+    UINT32 ix = 0; BOOL found = FALSE;
+    IDWriteFontCollection_FindFamilyName(fc, family, &ix, &found);
+    IDWriteFontCollection_Release(fc);
+    return found ? 1 : 0;
+}
+
+/* The platform's UI face: Windows 11's variable Segoe, else Windows 10's Segoe.
+ * Resolved once — the answer cannot change while we run. */
+static const WCHAR *ui_family(void) {
+    static const WCHAR *cached;
+    if (!cached)
+        cached = family_present(L"Segoe UI Variable Text") ? L"Segoe UI Variable Text"
+                                                          : L"Segoe UI";
+    return cached;
+}
+
+static void fmt_release(IDWriteTextFormat **f) {
+    if (*f) { IDWriteTextFormat_Release(*f); *f = NULL; }
+}
+
+/* Build (or rebuild) every text format. Safe to call again: releases first, so a
+ * text-size change is one call plus a relayout. */
+static void fonts_build(void) {
+    const WCHAR *UI = ui_family();
+    const float k = g_text_scale;
+    IDWriteTextFormat **all[] = { &g_display, &g_title, &g_body, &g_ui, &g_ui_b,
+                                  &g_meta, &g_meta_w, &g_meta_r, &g_avatar, &g_micro };
+    for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) fmt_release(all[i]);
+
+    /* Two weights in all chrome (ARCH-97). Bold 700 is markdown's, applied to a
+     * range inside a body layout, and appears nowhere in this table. */
+    const DWRITE_FONT_WEIGHT REG = DWRITE_FONT_WEIGHT_NORMAL;
+    const DWRITE_FONT_WEIGHT SEM = DWRITE_FONT_WEIGHT_SEMI_BOLD;
+    const DWRITE_TEXT_ALIGNMENT L = DWRITE_TEXT_ALIGNMENT_LEADING;
+    const DWRITE_TEXT_ALIGNMENT C = DWRITE_TEXT_ALIGNMENT_CENTER;
+    const DWRITE_TEXT_ALIGNMENT R = DWRITE_TEXT_ALIGNMENT_TRAILING;
+    const DWRITE_PARAGRAPH_ALIGNMENT MID = DWRITE_PARAGRAPH_ALIGNMENT_CENTER;
+    const DWRITE_PARAGRAPH_ALIGNMENT TOP = DWRITE_PARAGRAPH_ALIGNMENT_NEAR;
+
+    g_display = mk_fmt(UI, FONT_DISPLAY * k, SEM, L, MID, 0);
+    g_title   = mk_fmt(UI, FONT_TITLE   * k, SEM, L, MID, 0);
+    g_body    = mk_fmt(UI, FONT_BODY    * k, REG, L, TOP, 1);
+    g_ui      = mk_fmt(UI, FONT_UI      * k, REG, L, MID, 0);
+    g_ui_b    = mk_fmt(UI, FONT_UI      * k, SEM, L, MID, 0);
+    g_meta    = mk_fmt(UI, FONT_META    * k, REG, L, MID, 0);
+    g_meta_w  = mk_fmt(UI, FONT_META    * k, REG, L, TOP, 1);
+    g_meta_r  = mk_fmt(UI, FONT_META    * k, REG, R, MID, 0);
+    /* The avatar initial is title-sized and centred in its disc, both axes. */
+    g_avatar  = mk_fmt(UI, FONT_TITLE   * k, SEM, C, MID, 0);
+    g_micro   = mk_fmt(UI, FONT_MICRO   * k, SEM, C, MID, 0);
+}
+
 static void d2d_init(void) {
     D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &IID_ID2D1Factory, NULL,
                       (void **)&g_factory);
     DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, &OC_IID_IDWriteFactory,
                         (IUnknown **)&g_dwrite);
     if (!g_dwrite) return;
-    const WCHAR *UI = L"Segoe UI";
-    g_hdr   = mk_fmt(UI, 17.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
-    g_name  = mk_fmt(UI, 15.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
-    g_time  = mk_fmt(UI, 12.0f, DWRITE_FONT_WEIGHT_NORMAL,    DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
-    g_body  = mk_fmt(UI, BODY_DIP, DWRITE_FONT_WEIGHT_NORMAL,  DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_NEAR,   1);
-    g_ui    = mk_fmt(UI, 14.5f, DWRITE_FONT_WEIGHT_NORMAL,    DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
-    g_ui_b  = mk_fmt(UI, 14.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
-    g_small = mk_fmt(UI, 12.5f, DWRITE_FONT_WEIGHT_NORMAL,    DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
-    g_small_w = mk_fmt(UI, 12.5f, DWRITE_FONT_WEIGHT_NORMAL,  DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_NEAR, 1);
-    g_ava   = mk_fmt(UI, 15.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER,   DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
-    g_rail  = mk_fmt(UI, 9.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
+    fonts_build();
     /* Named explicitly, because falling back from "Segoe UI" reaches the
      * monochrome Segoe UI Symbol glyphs first — the picker rendered as outlines. */
     g_emoji = mk_fmt(L"Segoe UI Emoji", 22.0f, DWRITE_FONT_WEIGHT_NORMAL,
@@ -1320,7 +1391,7 @@ static void rail_item(ID2D1RenderTarget *rt, float y, int icon, const char *labe
     if (selected)     { fill_round_a(rt, sq, 10.0f, 0xFFFFFF, 0.16f); icon_col = 0xFFFFFF; }
     else if (hovered) { fill_round_a(rt, sq, 10.0f, 0xFFFFFF, 0.08f); icon_col = 0xFFFFFF; }
     draw_lucide(rt, icon, rf(cx - 10, y + 14, cx + 10, y + 34), icon_col);   /* 20px */
-    if (label) draw_text(rt, label, g_rail, rf(0, y + 45, RAIL_W, y + 61),
+    if (label) draw_text(rt, label, g_micro, rf(0, y + 45, RAIL_W, y + 61),
                          selected ? 0xFFFFFF : OC_COL_RAIL_ICON);
     rail_hit(y, y + RAIL_IH, act);
 }
@@ -1350,20 +1421,20 @@ static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     fill_round(rt, av, 12.0f, OC_COL_ACCENT);
     char wsn[80]; ws_display_name(m, wsn, sizeof wsn);
     char init[2] = { (char)(wsn[0] ? (wsn[0] >= 'a' && wsn[0] <= 'z' ? wsn[0] - 32 : wsn[0]) : 'O'), 0 };
-    draw_text(rt, init, g_ava, av, 0xFFFFFF);
+    draw_text(rt, init, g_avatar, av, 0xFFFFFF);
     /* "N elsewhere" (WIN-29): unread sitting in the workspaces you are not
      * looking at. Without it, holding several clients would be invisible. */
     int elsewhere = ws_unread_elsewhere();
     if (elsewhere > 0) {
         char badge[8];
         snprintf(badge, sizeof badge, "%d", elsewhere > 99 ? 99 : elsewhere);
-        float bw = text_width(badge, g_small) + 12;
+        float bw = text_width(badge, g_meta) + 12;
         if (bw < 18) bw = 18;
         D2D1_RECT_F b = rf(av.right - bw + 6, av.top - 6, av.right + 6, av.top + 12);
         fill_round(rt, b, 9.0f, OC_COL_DANGER);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, badge, g_small, b, 0xFFFFFF);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, badge, g_meta, b, 0xFFFFFF);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
     }
     rail_hit(av.top - 6, av.bottom + 6, NAV_SWITCHER);
     fill(rt, rf(14, 58, RAIL_W - 14, 59), OC_COL_BORDER);   /* divider */
@@ -1418,8 +1489,8 @@ static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
         char pi[2] = { (char)((nm && nm[0]) ? (nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]) : 'U'), 0 };
         D2D1_ELLIPSE e = { { cx, py + 24 }, 15, 15 };
         ID2D1RenderTarget_FillEllipse(rt, &e, paint_with(OC_COL_ACCENT_DIM));
-        draw_text(rt, pi, g_ava, rf(0, py + 9, RAIL_W, py + 39), 0xFFFFFF);
-        draw_text(rt, "You", g_rail, rf(0, py + 45, RAIL_W, py + 61), OC_COL_RAIL_ICON);
+        draw_text(rt, pi, g_avatar, rf(0, py + 9, RAIL_W, py + 39), 0xFFFFFF);
+        draw_text(rt, "You", g_micro, rf(0, py + 45, RAIL_W, py + 61), OC_COL_RAIL_ICON);
         rail_hit(py, py + RAIL_IH, NAV_PROFILE);
     }
 }
@@ -1520,13 +1591,13 @@ static void draw_menu(ID2D1RenderTarget *rt) {
             }
         }
         char init[2] = { in0, 0 };
-        draw_text(rt, init, g_ava, av, 0xFFFFFF);
+        draw_text(rt, init, g_avatar, av, 0xFFFFFF);
         /* Three rows, 18px apart and non-overlapping (they used to collide). */
-        draw_text(rt, nm, g_name, rf(x + 60, cy + 8, panel.right - 12, cy + 26), OC_COL_TEXT);
+        draw_text(rt, nm, g_title, rf(x + 60, cy + 8, panel.right - 12, cy + 26), OC_COL_TEXT);
         char hostline[288]; snprintf(hostline, sizeof hostline, "%s:%d", g_host, g_port);
-        draw_text(rt, hostline, g_small, rf(x + 60, cy + 26, panel.right - 12, cy + 43), OC_COL_MUTED);
+        draw_text(rt, hostline, g_meta, rf(x + 60, cy + 26, panel.right - 12, cy + 43), OC_COL_MUTED);
         char mode[64]; ws_mode_line(m, mode, sizeof mode);
-        draw_text(rt, mode, g_small, rf(x + 60, cy + 42, panel.right - 12, cy + 59), OC_COL_FAINT);
+        draw_text(rt, mode, g_meta, rf(x + 60, cy + 42, panel.right - 12, cy + 59), OC_COL_FAINT);
         cy += hh;
         fill(rt, rf(x + 8, cy, panel.right - 8, cy + 1), OC_COL_BORDER);
     }
@@ -1535,7 +1606,7 @@ static void draw_menu(ID2D1RenderTarget *rt) {
         if (g_mi[i].kind == MK_SEP) {
             fill(rt, rf(x + 10, cy + ih / 2, panel.right - 10, cy + ih / 2 + 1), OC_COL_BORDER);
         } else if (g_mi[i].kind == MK_SECTION) {
-            draw_text(rt, g_mi[i].label, g_small, rf(x + 16, cy + 5, panel.right - 10, cy + ih), OC_COL_FAINT);
+            draw_text(rt, g_mi[i].label, g_meta, rf(x + 16, cy + 5, panel.right - 10, cy + ih), OC_COL_FAINT);
         } else {
             if (g_menu_hover == i)
                 fill_round(rt, rf(x + 5, cy + 2, panel.right - 5, cy + ih - 2), 7.0f, OC_COL_HOVER);
@@ -1568,16 +1639,16 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     draw_lucide(rt, OC_ICON_SETTINGS,   gi, OC_COL_MUTED);
     g_ws_hdr_btn = rf(RAIL_W, 0, g_hdr_gear.left - 4, HEADER_H);
     char wsname[80]; ws_display_name(m, wsname, sizeof wsname);
-    draw_text(rt, wsname, g_hdr, rf(RAIL_W + 16, 0, g_hdr_gear.left - 22, HEADER_H), OC_COL_TEXT);
+    draw_text(rt, wsname, g_display, rf(RAIL_W + 16, 0, g_hdr_gear.left - 22, HEADER_H), OC_COL_TEXT);
     /* Chevron and connection dot both hug the NAME, in that order — the chevron
      * belongs to the name (it opens the workspace menu), and the dot is a status
      * on the workspace, so both travel with the text rather than sitting at the
      * far edge where they read as unrelated chrome. */
     {
-        float nx  = RAIL_W + 16 + text_width(wsname, g_hdr);
+        float nx  = RAIL_W + 16 + text_width(wsname, g_display);
         float lim = g_hdr_gear.left - 30;              /* never crowd the gear */
         if (nx > lim) nx = lim;
-        draw_text(rt, "\xE2\x96\xBE", g_small, rf(nx + 6, 2, nx + 22, HEADER_H), OC_COL_MUTED);
+        draw_text(rt, "\xE2\x96\xBE", g_meta, rf(nx + 6, 2, nx + 22, HEADER_H), OC_COL_MUTED);
 
         float dx = nx + 22;
         if (dx > g_hdr_gear.left - 20) dx = g_hdr_gear.left - 20;
@@ -1635,13 +1706,13 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
 
         if (r->is_header) {
             const char *chev = g_sb.collapsed[r->section] ? "\xE2\x96\xB8" : "\xE2\x96\xBE";
-            draw_text(rt, chev, g_small, rf(sx0 + 6, ry, sx0 + 22, ry + ROW_H), OC_COL_MUTED);
-            draw_text(rt, r->label, g_small, rf(sx0 + 22, ry, sx1 - 30, ry + ROW_H), OC_COL_FAINT);
+            draw_text(rt, chev, g_meta, rf(sx0 + 6, ry, sx0 + 22, ry + ROW_H), OC_COL_MUTED);
+            draw_text(rt, r->label, g_meta, rf(sx0 + 22, ry, sx1 - 30, ry + ROW_H), OC_COL_FAINT);
             if (g_sb_hover_sec == r->section || g_sb_menu_sec == r->section) {
                 g_sb_kebab = rf(sx1 - 26, ry + 4, sx1 - 6, ry + ROW_H - 4);
-                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-                draw_text(rt, "\xE2\x8B\xAF", g_small, g_sb_kebab, OC_COL_MUTED);
-                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+                draw_text(rt, "\xE2\x8B\xAF", g_meta, g_sb_kebab, OC_COL_MUTED);
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
             }
         } else {
             int selected = (r->channel_id == g_sel);
@@ -1655,9 +1726,9 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                 fill_round(rt, av, 5.0f, tint);
                 char ini[2] = { (char)(r->label[0] >= 'a' && r->label[0] <= 'z'
                                        ? r->label[0] - 32 : r->label[0]), 0 };
-                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-                draw_text(rt, ini, g_small, av, 0xFFFFFF);
-                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+                draw_text(rt, ini, g_meta, av, 0xFFFFFF);
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
                 draw_presence_dot(rt, av.right - 1, av.bottom - 1, 3.5f,
                                   oc_model_presence_of(m, r->peer_id),
                                   selected ? OC_COL_SELECT : OC_COL_SIDEBAR);
@@ -1673,16 +1744,16 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                 /* "you" sits right after the name, dimmed — so the self-DM is
                  * still addressed by account name (Slack's treatment). */
                 float w = text_width(r->label, unread ? g_ui_b : g_ui);
-                draw_text(rt, "you", g_small,
+                draw_text(rt, "you", g_meta,
                           rf(sx0 + 34 + w + 8, ry, sx1 - 44, ry + ROW_H), OC_COL_FAINT);
             }
             if (unread) {
                 char badge[16]; snprintf(badge, sizeof badge, "%d", r->unread);
                 D2D1_RECT_F br = rf(sx1 - 40, ry + 6, sx1 - 10, ry + ROW_H - 6);
                 fill_round(rt, br, 9.0f, OC_COL_ACCENT);
-                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-                draw_text(rt, badge, g_small, br, 0xFFFFFF);
-                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+                draw_text(rt, badge, g_meta, br, 0xFFFFFF);
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
             }
         }
         if (g_n_rows < (int)(sizeof g_rows / sizeof g_rows[0])) {
@@ -1827,7 +1898,7 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
         const char *who = oc_model_user_name((oc_model *)m, msg->pinned_by);
         if (who && who[0]) snprintf(lbl, sizeof lbl, "Pinned by %s", who);
         else               snprintf(lbl, sizeof lbl, "Pinned");
-        draw_text(rt, lbl, g_small, rf(tx + 17, py - 2, x0 + content_w + AVA + 12, py + 14),
+        draw_text(rt, lbl, g_meta, rf(tx + 17, py - 2, x0 + content_w + AVA + 12, py + 14),
                   OC_COL_MUTED);
         y += MSG_PIN_H;          /* everything below shifts down by the marker */
     }
@@ -1840,17 +1911,17 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
         D2D1_ELLIPSE e = { { ax + AVA / 2, ty + AVA / 2 }, AVA / 2, AVA / 2 };
         ID2D1RenderTarget_FillEllipse(rt, &e, paint_with(AVPAL[msg->author_id % 6]));
         char ini[2] = { (char)(nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]), 0 };
-        draw_text(rt, ini, g_ava, rf(ax, ty, ax + AVA, ty + AVA), 0xFFFFFF);
+        draw_text(rt, ini, g_avatar, rf(ax, ty, ax + AVA, ty + AVA), 0xFFFFFF);
 
         /* Author + timestamp on the header line. */
         D2D1_RECT_F hl = rf(tx, ty, x0 + content_w + AVA + 12, ty + 20);
-        draw_text(rt, nm, g_name, hl, OC_COL_TEXT);
+        draw_text(rt, nm, g_title, hl, OC_COL_TEXT);
         if (msg->server_time) {
             time_t t = (time_t)(msg->server_time / 1000);
             struct tm tv; char when[24] = "";
             if (oc_localtime_r(&t, &tv))
                 strftime(when, sizeof when, g_pref_time24 ? "%H:%M" : "%I:%M %p", &tv);
-            draw_text(rt, when, g_time, hl, OC_COL_FAINT);
+            draw_text(rt, when, g_meta_r, hl, OC_COL_FAINT);
         }
     }
 
@@ -1878,7 +1949,7 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
             /* Filename above the image, as Slack does: the thumbnail alone does
              * not tell you what the file is called or whether it is the one you
              * were sent. */
-            draw_text(rt, at->filename, g_small,
+            draw_text(rt, at->filename, g_meta,
                       rf(tx, by, x0 + content_w + AVA + 12, by + LINE_H), OC_COL_MUTED);
             by += LINE_H;
             UINT iw = 0, ih = 0;
@@ -1903,10 +1974,10 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
                 stroke_round(rt, ph, 6.0f, OC_COL_BORDER, 1.0f);
                 /* The filename is on the line above; this only says why there is
                  * no picture yet. */
-                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
                 draw_text(rt, thumb_failed(at->id) ? "preview unavailable" : "loading\u2026",
-                          g_small, ph, OC_COL_FAINT);
-                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+                          g_meta, ph, OC_COL_FAINT);
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
                 /* Ask for it — one at a time, and only for what is on screen.
                  * Never while thumbnails are suppressed for the screenshot
                  * harness: that render is not the user's screen, and treating
@@ -1958,14 +2029,14 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
             snprintf(line, sizeof line, "\xF0\x9F\x93\x8E %s (no longer available)", at->filename);
         else
             snprintf(line, sizeof line, "\xF0\x9F\x93\x8E %s", at->filename);
-        draw_text(rt, line, g_small, rf(tx, by, x0 + content_w + AVA + 12, by + LINE_H), OC_COL_ACCENT);
+        draw_text(rt, line, g_meta, rf(tx, by, x0 + content_w + AVA + 12, by + LINE_H), OC_COL_ACCENT);
         by += LINE_H;
     }
     if (msg->reply_count) {
         char line[64];
         snprintf(line, sizeof line, "\xE2\x86\xB3 %u %s", msg->reply_count,
                  msg->reply_count == 1 ? "reply" : "replies");
-        draw_text(rt, line, g_small, rf(tx, by, x0 + content_w + AVA + 12, by + LINE_H), OC_COL_ACCENT);
+        draw_text(rt, line, g_meta, rf(tx, by, x0 + content_w + AVA + 12, by + LINE_H), OC_COL_ACCENT);
         by += LINE_H;
     }
 
@@ -1980,7 +2051,7 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
         for (int i = 0; i < msg->n_reactions; i++) {
             char cnt[16];
             snprintf(cnt, sizeof cnt, "%u", msg->reactions[i].count);
-            float cw = 34 + text_width(cnt, g_small);
+            float cw = 34 + text_width(cnt, g_meta);
             if (cx + cw > x0 + content_w + AVA + 12) break;
             D2D1_RECT_F chip = rf(cx, top, cx + cw, top + ch);
             int mine = reaction_is_mine(msg, msg->reactions[i].emoji);
@@ -1988,7 +2059,7 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
             stroke_round(rt, chip, 11.0f, mine ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
             draw_emoji_fmt(rt, msg->reactions[i].emoji,
                            rf(cx + 4, top, cx + 22, top + ch), g_emoji_s);
-            draw_text(rt, cnt, g_small, rf(cx + 24, top, chip.right - 4, top + ch),
+            draw_text(rt, cnt, g_meta, rf(cx + 24, top, chip.right - 4, top + ch),
                       mine ? OC_COL_TEXT : OC_COL_MUTED);
             /* Hit-box so a chip can be clicked: +1, or undo if it is already
                yours. The direction is `mine`, exactly as the message menu
@@ -2044,7 +2115,7 @@ static void draw_day_sep(ID2D1RenderTarget *rt, uint64_t ms, D2D1_RECT_F reg, fl
     float cy = y + SEP_H / 2, cx = (reg.left + reg.right) / 2;
     WCHAR w[64]; int n = to_w(lbl, w, 64);
     IDWriteTextLayout *l = NULL; float tw = 60;
-    IDWriteFactory_CreateTextLayout(g_dwrite, w, (UINT32)n, g_small,
+    IDWriteFactory_CreateTextLayout(g_dwrite, w, (UINT32)n, g_meta,
                                     reg.right - reg.left, SEP_H, &l);
     if (l) {
         DWRITE_TEXT_METRICS tm;
@@ -2055,9 +2126,9 @@ static void draw_day_sep(ID2D1RenderTarget *rt, uint64_t ms, D2D1_RECT_F reg, fl
     float gap = tw / 2 + 14;
     fill(rt, rf(reg.left + 40, cy, cx - gap, cy + 1), OC_COL_BORDER);
     fill(rt, rf(cx + gap, cy, reg.right - 40, cy + 1), OC_COL_BORDER);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, lbl, g_small, rf(reg.left, y + 5, reg.right, y + SEP_H - 3), OC_COL_MUTED);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, lbl, g_meta, rf(reg.left, y + 5, reg.right, y + SEP_H - 3), OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 
 /* Bottom-pinned, wheel-scrolled render of a message array into `reg`. When
@@ -2168,10 +2239,10 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
             if (y + SEP_H >= reg.top && y <= reg.bottom) {
                 float my = y + SEP_H / 2;
                 fill(rt, rf(reg.left + 20, my, reg.right - 70, my + 1), OC_COL_DANGER);
-                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
-                draw_text(rt, "New", g_small,
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
+                draw_text(rt, "New", g_meta,
                           rf(reg.left + 20, y, reg.right - 20, y + SEP_H), OC_COL_DANGER);
-                IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
             }
             y += SEP_H;
         }
@@ -2256,7 +2327,7 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
         }
     }
     if (capture && g_hist_pending_chan == g_sel)
-        draw_text(rt, "Loading older messages\u2026", g_small,
+        draw_text(rt, "Loading older messages\u2026", g_meta,
                   rf(reg.left + 20, reg.top + 4, reg.right - 20, reg.top + 24), OC_COL_FAINT);
 
     /* Scrollbar. scroll 0 => pinned bottom => thumb at the bottom of the track;
@@ -2320,10 +2391,10 @@ enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS };
 /* An overlay title bar; returns the region below it for the overlay body. */
 static D2D1_RECT_F overlay_header(ID2D1RenderTarget *rt, D2D1_RECT_F reg, const char *title) {
     fill(rt, rf(reg.left, reg.top, reg.right, reg.top + 34), OC_COL_HEADER);
-    draw_text(rt, title, g_name, rf(reg.left + 20, reg.top, reg.right - 130, reg.top + 34), OC_COL_TEXT);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    draw_text(rt, "Esc to close", g_small, rf(reg.left + 20, reg.top, reg.right - 16, reg.top + 34), OC_COL_MUTED);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    draw_text(rt, title, g_title, rf(reg.left + 20, reg.top, reg.right - 130, reg.top + 34), OC_COL_TEXT);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    draw_text(rt, "Esc to close", g_meta, rf(reg.left + 20, reg.top, reg.right - 16, reg.top + 34), OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
     fill(rt, rf(reg.left, reg.top + 33, reg.right, reg.top + 34), OC_COL_BORDER);
     return rf(reg.left, reg.top + 34, reg.right, reg.bottom);
 }
@@ -2355,7 +2426,7 @@ static void draw_thread(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
     char rc[48];
     snprintf(rc, sizeof rc, "%zu %s", m->n_thread_msgs, m->n_thread_msgs == 1 ? "reply" : "replies");
     fill(rt, rf(body.left, top, body.right, top + 1), OC_COL_BORDER);
-    draw_text(rt, rc, g_small, rf(body.left + 20, top + 2, body.right - 16, top + 22), OC_COL_FAINT);
+    draw_text(rt, rc, g_meta, rf(body.left + 20, top + 2, body.right - 16, top + 22), OC_COL_FAINT);
     D2D1_RECT_F replies = rf(body.left, top + 24, body.right, body.bottom);
     if (m->n_thread_msgs == 0) overlay_empty(rt, replies, "No replies yet — reply below.");
     else draw_msglist(rt, m, m->thread_msgs, m->n_thread_msgs, replies, MSGLIST_THREAD);
@@ -2384,7 +2455,7 @@ static void draw_search(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
                   /* No cursor exists on the wire to page with (WIN-38), so say
                    * that more exist rather than implying these are all of them. */
                   m->search_truncated ? " \u2014 more exist; narrow the query to see them." : "");
-    draw_text(rt, count, g_small, rf(body.left + 20, body.top, body.right - 16, body.top + 18),
+    draw_text(rt, count, g_meta, rf(body.left + 20, body.top, body.right - 16, body.top + 18),
               m->search_truncated ? OC_COL_NOTICE : OC_COL_MUTED);
     body.top += 22;
 
@@ -2413,7 +2484,7 @@ static void draw_search(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
             if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%Y-%m-%d %H:%M", &tv); }
         snprintf(head, sizeof head, "%s  ·  %s  ·  %s",
                  (au && au[0]) ? au : "user", (ch && ch->name) ? ch->name : "channel", when);
-        draw_text(rt, head, g_small, rf(body.left + 20, y, body.right - 16, y + 20), OC_COL_MUTED);
+        draw_text(rt, head, g_meta, rf(body.left + 20, y, body.right - 16, y + 20), OC_COL_MUTED);
         draw_text_hl(rt, r->snippet ? r->snippet : "", g_ui,
                      rf(body.left + 20, y + 20, body.right - 16, y + 46), OC_COL_TEXT,
                      m->search_query);
@@ -2463,15 +2534,15 @@ static void draw_storage(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
     g_storage_refresh = rf(body.right - 116, body.top + 8, body.right - 20, body.top + 36);
     fill_round(rt, g_storage_refresh, 6.0f, OC_COL_INPUT);
     stroke_round(rt, g_storage_refresh, 6.0f, OC_COL_BORDER, 1.0f);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, "Refresh", g_small, g_storage_refresh, OC_COL_MUTED);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, "Refresh", g_meta, g_storage_refresh, OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
 
     if (!m->storage_have) { overlay_empty(rt, body, "Loading\u2026"); return; }
     const oc_storage_view *s = &m->storage;
     char v[96]; float y = body.top + 12;
 
-    draw_text(rt, "DISK", g_small, rf(body.left + 24, y, body.right - 20, y + 18), OC_COL_FAINT);
+    draw_text(rt, "DISK", g_meta, rf(body.left + 24, y, body.right - 20, y + 18), OC_COL_FAINT);
     y += 22;
     human_bytes(s->avail_bytes, v, sizeof v);
     char both[96]; char tot[64];
@@ -2485,7 +2556,7 @@ static void draw_storage(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
         draw_kv(rt, body, &y, "State", "under pressure \u2014 uploads may be refused", OC_COL_DANGER);
 
     y += 10;
-    draw_text(rt, "POLICY", g_small, rf(body.left + 24, y, body.right - 20, y + 18), OC_COL_FAINT);
+    draw_text(rt, "POLICY", g_meta, rf(body.left + 24, y, body.right - 20, y + 18), OC_COL_FAINT);
     y += 22;
     if (s->max_age_days) snprintf(v, sizeof v, "expire after %llu day(s)", (unsigned long long)s->max_age_days);
     else                 snprintf(v, sizeof v, "kept indefinitely");
@@ -2496,7 +2567,7 @@ static void draw_storage(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
     draw_kv(rt, body, &y, "Database reserve", v, OC_COL_TEXT);
 
     y += 10;
-    draw_text(rt, "RECLAIMED SO FAR", g_small, rf(body.left + 24, y, body.right - 20, y + 18), OC_COL_FAINT);
+    draw_text(rt, "RECLAIMED SO FAR", g_meta, rf(body.left + 24, y, body.right - 20, y + 18), OC_COL_FAINT);
     y += 22;
     snprintf(v, sizeof v, "%llu abandoned \u00b7 %llu expired \u00b7 %llu evicted",
              (unsigned long long)s->rec_orphan, (unsigned long long)s->rec_expired,
@@ -2520,14 +2591,14 @@ static void draw_audit(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
     float fx = body.left + 20;
     g_n_audit_filters = 0;
     for (int f = 0; f < 5; f++) {
-        float fw = text_width(FAMS[f], g_small) + 22;
+        float fw = text_width(FAMS[f], g_meta) + 22;
         D2D1_RECT_F b = rf(fx, body.top + 6, fx + fw, body.top + 30);
         int on = (g_audit_family == f);
         fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
         if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, FAMS[f], g_small, b, on ? 0xFFFFFF : OC_COL_MUTED);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, FAMS[f], g_meta, b, on ? 0xFFFFFF : OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
         if (g_n_audit_filters < 5) g_audit_filters[g_n_audit_filters++] = b;
         fx += fw + 6;
     }
@@ -2557,14 +2628,14 @@ static void draw_audit(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
         char meta[160];
         snprintf(meta, sizeof meta, "%s%s%s", audit_family(a->family),
                  a->detail[0] ? " · " : "", a->detail);
-        draw_text(rt, meta, g_small, rf(body.left + 20, y + 24, body.right - 20, y + 44), OC_COL_MUTED);
+        draw_text(rt, meta, g_meta, rf(body.left + 20, y + 24, body.right - 20, y + 44), OC_COL_MUTED);
         fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 20, y + rowh), OC_COL_BORDER);
         y += rowh;
     }
     /* Scrolling to the bottom pages older entries: the frame is timestamp-cursor
      * paged, but oc_client_audit_query(c, 0) was called once and never again. */
     if (g_ovl_max > 0.5f && g_ovl_scroll >= g_ovl_max - 1.0f)
-        draw_text(rt, "Loading older entries\u2026", g_small,
+        draw_text(rt, "Loading older entries\u2026", g_meta,
                   rf(body.left + 20, y + 4, body.right - 20, y + 26), OC_COL_FAINT);
     ovl_end(rt, body);
 }
@@ -2579,7 +2650,7 @@ static void draw_weblist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
         overlay_empty(rt, body, "No webhooks. Right-click the channel → Create webhook.");
         return;
     }
-    draw_text(rt, "Click a webhook to delete it \u2014 you will be asked to confirm.", g_small,
+    draw_text(rt, "Click a webhook to delete it \u2014 you will be asked to confirm.", g_meta,
               rf(body.left + 20, body.top + 4, body.right - 16, body.top + 24), OC_COL_FAINT);
     body.top += 28;
     ovl_use(OVL_WEB);
@@ -2594,13 +2665,13 @@ static void draw_weblist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
         /* State as a chip rather than a "(disabled)" suffix, so an enabled hook
          * is positively marked instead of merely lacking a word. */
         const char *st = wv->disabled ? "disabled" : "active";
-        float cw = text_width(st, g_small) + 18;
+        float cw = text_width(st, g_meta) + 18;
         D2D1_RECT_F chip = rf(body.right - 24 - cw, y + 2, body.right - 24, y + 24);
         fill_round(rt, chip, 10.0f, OC_COL_INPUT);
         stroke_round(rt, chip, 10.0f, wv->disabled ? OC_COL_BORDER : OC_COL_ONLINE, 1.0f);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, st, g_small, chip, wv->disabled ? OC_COL_FAINT : OC_COL_ONLINE);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, st, g_meta, chip, wv->disabled ? OC_COL_FAINT : OC_COL_ONLINE);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
         /* No created-date column: WEBHOOK_LIST carries id/channel/label/disabled
          * and nothing else, so there is no date to show without a wire change. */
         fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 20, y + rowh), OC_COL_BORDER);
@@ -2628,7 +2699,7 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
                  m->dnd_end_min / 60, m->dnd_end_min % 60);
     else
         snprintf(dnd, sizeof dnd, "Do not disturb is off");
-    draw_text(rt, dnd, g_small, rf(body.left + 20, body.top + 4, body.right - 20, body.top + 26),
+    draw_text(rt, dnd, g_meta, rf(body.left + 20, body.top + 4, body.right - 20, body.top + 26),
               m->dnd_enabled ? OC_COL_NOTICE : OC_COL_FAINT);
     body.top += 30;
 
@@ -2644,14 +2715,14 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
         draw_text(rt, label, g_ui, rf(body.left + 20, y, body.right - 260, y + rowh), OC_COL_TEXT);
         float bx = body.right - 24;
         for (int L = 2; L >= 0; L--) {
-            float bw = text_width(LEVELS[L], g_small) + 20;
+            float bw = text_width(LEVELS[L], g_meta) + 20;
             D2D1_RECT_F b = rf(bx - bw, y + 5, bx, y + 29);
             int on = (c->notify_level == L);
             fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
             if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
-            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-            draw_text(rt, LEVELS[L], g_small, b, on ? 0xFFFFFF : OC_COL_MUTED);
-            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+            draw_text(rt, LEVELS[L], g_meta, b, on ? 0xFFFFFF : OC_COL_MUTED);
+            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
             if (g_n_notify_hits < 128) {
                 g_notify_hits[g_n_notify_hits].r = b;
                 g_notify_hits[g_n_notify_hits].cid = c->channel_id;
@@ -2761,29 +2832,29 @@ static void draw_about(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
 
     snprintf(line, sizeof line, "%s%s", c->kind == OC_CHANNEL_KIND_DM ? "@ " :
              (c->is_public ? "# " : "\U0001F512 "), c->name ? c->name : "");
-    draw_text(rt, line, g_hdr, rf(x, y, x + w, y + 30), OC_COL_TEXT);
+    draw_text(rt, line, g_display, rf(x, y, x + w, y + 30), OC_COL_TEXT);
     y += 34;
 
     if (c->archived) {
-        D2D1_RECT_F badge = rf(x, y, x + text_width("Archived \u00B7 read-only", g_small) + 22, y + 24);
+        D2D1_RECT_F badge = rf(x, y, x + text_width("Archived \u00B7 read-only", g_meta) + 22, y + 24);
         fill_round(rt, badge, 6.0f, OC_COL_INPUT);
         stroke_round(rt, badge, 6.0f, OC_COL_BORDER, 1.0f);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, "Archived \u00B7 read-only", g_small, badge, OC_COL_AWAY);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Archived \u00B7 read-only", g_meta, badge, OC_COL_AWAY);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
         y += 32;
     }
 
-    draw_text(rt, "TOPIC", g_small, rf(x, y, x + w, y + 20), OC_COL_FAINT);
+    draw_text(rt, "TOPIC", g_meta, rf(x, y, x + w, y + 20), OC_COL_FAINT);
     y += 22;
     draw_text(rt, (c->topic && c->topic[0]) ? c->topic : "No topic set.", g_ui,
               rf(x, y, x + w - 120, y + 44),
               (c->topic && c->topic[0]) ? OC_COL_TEXT : OC_COL_FAINT);
     g_about_topic = rf(reg.right - 24 - 110, y - 4, reg.right - 24, y + 24);
     stroke_round(rt, g_about_topic, 6.0f, OC_COL_BORDER, 1.0f);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, "Set topic\u2026", g_small, g_about_topic, OC_COL_MUTED);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, "Set topic\u2026", g_meta, g_about_topic, OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
     y += 56;
 
     /* Facts worth having in one place, none of which needed a new query. */
@@ -2791,7 +2862,7 @@ static void draw_about(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
     (void)nm;
     if (m->chanmem_channel == g_sel && !m->chanmem_loading) {
         snprintf(line, sizeof line, "%zu member%s", m->n_chanmem, m->n_chanmem == 1 ? "" : "s");
-        draw_text(rt, line, g_small, rf(x, y, x + w, y + 20), OC_COL_MUTED);
+        draw_text(rt, line, g_meta, rf(x, y, x + w, y + 20), OC_COL_MUTED);
         y += 22;
     }
     if (c->created_at) {
@@ -2799,7 +2870,7 @@ static void draw_about(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
         struct tm tv; char when[40] = "";
         if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%d %b %Y", &tv);
         snprintf(line, sizeof line, "Created %s", when);
-        draw_text(rt, line, g_small, rf(x, y, x + w, y + 20), OC_COL_MUTED);
+        draw_text(rt, line, g_meta, rf(x, y, x + w, y + 20), OC_COL_MUTED);
         y += 22;
     }
     y += 16;
@@ -2807,32 +2878,32 @@ static void draw_about(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
     if (c->kind != OC_CHANNEL_KIND_DM && self_role(m) >= OC_ROLE_ADMIN) {
         fill(rt, rf(x, y, x + w, y + 1), OC_COL_BORDER);
         y += 18;
-        draw_text(rt, "ADMIN", g_small, rf(x, y, x + w, y + 20), OC_COL_FAINT);
+        draw_text(rt, "ADMIN", g_meta, rf(x, y, x + w, y + 20), OC_COL_FAINT);
         y += 24;
         /* Webhooks are channel-scoped admin, so the channel's own settings page
          * is where they belong — they were reachable only from a right-click
          * menu, which is not somewhere anyone looks for configuration. */
         g_about_hooks = rf(x + 320, y, x + 440, y + 28);
         stroke_round(rt, g_about_hooks, 6.0f, OC_COL_BORDER, 1.0f);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, "Webhooks\u2026", g_small, g_about_hooks, OC_COL_MUTED);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Webhooks\u2026", g_meta, g_about_hooks, OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
 
         g_about_rename = rf(x, y, x + 150, y + 28);
         stroke_round(rt, g_about_rename, 6.0f, OC_COL_BORDER, 1.0f);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, "Rename channel\u2026", g_small, g_about_rename, OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Rename channel\u2026", g_meta, g_about_rename, OC_COL_MUTED);
         g_about_archive = rf(x + 160, y, x + 310, y + 28);
         stroke_round(rt, g_about_archive, 6.0f, OC_COL_BORDER, 1.0f);
-        draw_text(rt, c->archived ? "Unarchive" : "Archive channel", g_small,
+        draw_text(rt, c->archived ? "Unarchive" : "Archive channel", g_meta,
                   g_about_archive, c->archived ? OC_COL_NOTICE : OC_COL_DANGER);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
         y += 36;
         draw_text(rt, c->archived
                       ? "Unarchiving makes the channel writable again."
                       : "Archiving makes it read-only and hides it from people who are not in it. "
                         "History stays searchable, and it can be undone.",
-                  g_small_w, rf(x, y, x + w, y + 56), OC_COL_FAINT);
+                  g_meta_w, rf(x, y, x + w, y + 56), OC_COL_FAINT);
     }
 }
 
@@ -2864,7 +2935,7 @@ static void draw_pinlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
                 strftime(when, sizeof when, g_pref_time24 ? "%H:%M" : "%I:%M %p", &tv);
         }
         snprintf(head, sizeof head, "%s  %s", (who && who[0]) ? who : "user", when);
-        draw_text(rt, head, g_name, rf(row.left + 10, y + 4, row.right - 90, y + 24), OC_COL_TEXT);
+        draw_text(rt, head, g_title, rf(row.left + 10, y + 4, row.right - 90, y + 24), OC_COL_TEXT);
         /* An attachment-only message has no body; naming the file is the only
          * thing that makes such a row mean anything. */
         char prev[256];
@@ -2880,15 +2951,15 @@ static void draw_pinlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
         if (pby && pby[0]) {
             char lbl[96];
             snprintf(lbl, sizeof lbl, "pinned by %s", pby);
-            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
-            draw_text(rt, lbl, g_small, rf(row.left, y + 4, row.right - 12, y + 22), OC_COL_FAINT);
-            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
+            draw_text(rt, lbl, g_meta, rf(row.left, y + 4, row.right - 12, y + 22), OC_COL_FAINT);
+            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
         }
         D2D1_RECT_F un = rf(row.right - 74, y + 24, row.right - 12, y + 46);
         stroke_round(rt, un, 6.0f, OC_COL_BORDER, 1.0f);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, "Unpin", g_small, un, OC_COL_MUTED);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Unpin", g_meta, un, OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
 
         if (g_n_pinrows < (int)(sizeof g_pinrows / sizeof g_pinrows[0])) {
             g_pinrows[g_n_pinrows].row   = row;
@@ -2973,9 +3044,9 @@ static void file_badge(ID2D1RenderTarget *rt, const oc_file_view *f, D2D1_RECT_F
     else if (ext && !_stricmp(ext, ".txt"))       { col = 0x4B7A9B; snprintf(tag, sizeof tag, "TXT"); }
     if (f->reclaimed) col = OC_COL_FAINT;
     fill_round(rt, r, 6.0f, col);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, tag, g_small, rf(r.left, r.top + 2, r.right, r.bottom), 0xFFFFFF);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, tag, g_meta, rf(r.left, r.top + 2, r.right, r.bottom), 0xFFFFFF);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 
 /* Case-insensitive substring, for the name box. */
@@ -3053,12 +3124,12 @@ static void files_index(const oc_model *m) {
 /* A chip. Returns its rect so the caller can record a hit-box. */
 static D2D1_RECT_F chip(ID2D1RenderTarget *rt, float x, float y, const char *label,
                         int on, uint32_t on_col) {
-    D2D1_RECT_F b = rf(x, y, x + text_width(label, g_small) + 22, y + 24);
+    D2D1_RECT_F b = rf(x, y, x + text_width(label, g_meta) + 22, y + 24);
     fill_round(rt, b, 6.0f, on ? on_col : OC_COL_INPUT);
     if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, label, g_small, b, on ? 0xFFFFFF : OC_COL_MUTED);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, label, g_meta, b, on ? 0xFFFFFF : OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
     return b;
 }
 
@@ -3069,12 +3140,12 @@ static D2D1_RECT_F drop_btn(ID2D1RenderTarget *rt, float right, float y, const c
                             int active) {
     char txt[64];
     snprintf(txt, sizeof txt, "%s \xE2\x96\xBE", label);
-    D2D1_RECT_F b = rf(right - (text_width(txt, g_small) + 22), y, right, y + 24);
+    D2D1_RECT_F b = rf(right - (text_width(txt, g_meta) + 22), y, right, y + 24);
     fill_round(rt, b, 6.0f, OC_COL_INPUT);
     stroke_round(rt, b, 6.0f, active ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, txt, g_small, b, active ? OC_COL_TEXT : OC_COL_MUTED);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, txt, g_meta, b, active ? OC_COL_TEXT : OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
     return b;
 }
 
@@ -3183,15 +3254,15 @@ static void draw_file_rows(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
         snprintf(sub, sizeof sub, "%s%s \u00B7 %s \u00B7 %s%s", chan,
                  (who && who[0]) ? who : "someone", sz, when,
                  f->reclaimed ? "  \u00B7 no longer stored" : "");
-        draw_text(rt, sub, g_small, rf(row.left + 52, y + 24, row.right - 100, y + 42),
+        draw_text(rt, sub, g_meta, rf(row.left + 52, y + 24, row.right - 100, y + 42),
                   OC_COL_FAINT);
 
         if (!f->reclaimed) {
             D2D1_RECT_F dl = rf(row.right - 86, y + 12, row.right - 12, y + 34);
             stroke_round(rt, dl, 6.0f, OC_COL_BORDER, 1.0f);
-            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-            draw_text(rt, "Download", g_small, dl, OC_COL_MUTED);
-            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+            draw_text(rt, "Download", g_meta, dl, OC_COL_MUTED);
+            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
             if (g_n_filerows < (int)(sizeof g_filerows / sizeof g_filerows[0])) {
                 g_filerows[g_n_filerows].row = row;
                 g_filerows[g_n_filerows].dl  = dl;
@@ -3205,7 +3276,7 @@ static void draw_file_rows(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
         char none[160];
         if (g_file_q[0]) snprintf(none, sizeof none, "No file here is named like “%s”.", g_file_q);
         else            snprintf(none, sizeof none, "Nothing of that type here.");
-        draw_text(rt, none, g_small,
+        draw_text(rt, none, g_meta,
                   rf(body.left + 20, y + 6, body.right - 20, y + 26), OC_COL_FAINT);
     }
     /* The pane ran out before the list did. Say so: a list that just stops at
@@ -3214,12 +3285,12 @@ static void draw_file_rows(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
         char more[80];
         snprintf(more, sizeof more, "%d more — narrow the filters to see them.",
                  g_n_forder - shown);
-        draw_text(rt, more, g_small, rf(body.left + 20, body.bottom - 24, body.right - 20,
+        draw_text(rt, more, g_meta, rf(body.left + 20, body.bottom - 24, body.right - 20,
                   body.bottom - 4), OC_COL_FAINT);
     }
     /* The server caps the response; saying so beats a list that silently stops. */
     if (m->n_files >= OC_MAX_FILE_LIST && y < body.bottom)
-        draw_text(rt, "Showing the most recent 200. Older files are in search.", g_small,
+        draw_text(rt, "Showing the most recent 200. Older files are in search.", g_meta,
                   rf(body.left + 20, y + 8, body.right - 20, y + 28), OC_COL_FAINT);
 }
 
@@ -3239,7 +3310,7 @@ static void draw_filelist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F 
  * each with its count. */
 static void draw_files_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     fill(rt, rf(RAIL_W, 0, RAIL_W + SIDEBAR_W, h), OC_COL_SIDEBAR);
-    draw_text(rt, "Files", g_hdr, rf(RAIL_W + 16, 0, RAIL_W + SIDEBAR_W - 12, HEADER_H),
+    draw_text(rt, "Files", g_display, rf(RAIL_W + 16, 0, RAIL_W + SIDEBAR_W - 12, HEADER_H),
               OC_COL_TEXT);
 
     files_index(m);
@@ -3259,7 +3330,7 @@ static void draw_files_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h
         y = r.bottom + 8;
     }
 
-    draw_text(rt, "CHANNELS", g_small, rf(RAIL_W + 16, y, RAIL_W + SIDEBAR_W - 12, y + 20),
+    draw_text(rt, "CHANNELS", g_meta, rf(RAIL_W + 16, y, RAIL_W + SIDEBAR_W - 12, y + 20),
               OC_COL_FAINT);
     y += 22;
 
@@ -3274,21 +3345,21 @@ static void draw_files_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h
         draw_text(rt, label, g_ui, rf(r.left + 12, y + 3, r.right - 44, y + 25),
                   on ? OC_COL_TEXT : OC_COL_MUTED);
         char cnt[16]; snprintf(cnt, sizeof cnt, "%d", g_fchan[i].n);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
-        draw_text(rt, cnt, g_small, rf(r.right - 40, y + 5, r.right - 10, y + 25), OC_COL_FAINT);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        draw_text(rt, cnt, g_meta, rf(r.right - 40, y + 5, r.right - 10, y + 25), OC_COL_FAINT);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
         g_fchan_rows[g_n_fchan_rows++] = r;
         y = r.bottom + 2;
     }
 
     if (!g_n_fchan)
-        draw_text(rt, "Channels appear here once something is shared in them.", g_small,
+        draw_text(rt, "Channels appear here once something is shared in them.", g_meta,
                   rf(RAIL_W + 16, y + 2, RAIL_W + SIDEBAR_W - 12, y + 60), OC_COL_FAINT);
     else
         /* The census comes from the page the server returned, so it is the
          * channels among the most recent 200 files — not every channel that has
          * ever held one. Saying which is cheaper than being asked. */
-        draw_text(rt, "From the 200 most recent files.", g_small,
+        draw_text(rt, "From the 200 most recent files.", g_meta,
                   rf(RAIL_W + 16, h - 26, RAIL_W + SIDEBAR_W - 12, h - 6), OC_COL_FAINT);
 }
 
@@ -3303,15 +3374,15 @@ static void draw_files_view(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
         const oc_channel *c = oc_model_channel((oc_model *)m, g_file_chan);
         snprintf(title, sizeof title, "Files in #%s", (c && c->name[0]) ? c->name : "channel");
     }
-    draw_text(rt, title, g_hdr, rf(reg.left + 20, reg.top, reg.right - 130, reg.top + HEADER_H),
+    draw_text(rt, title, g_display, rf(reg.left + 20, reg.top, reg.right - 130, reg.top + HEADER_H),
               OC_COL_TEXT);
     /* Slack's "+ New" is an upload for us, and this is the one screen where that
      * is the obvious next thing to do. */
     g_file_up_btn = rf(reg.right - 116, reg.top + 14, reg.right - 20, reg.top + 42);
     fill_round(rt, g_file_up_btn, 6.0f, OC_COL_ACCENT);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, "Upload\u2026", g_small, g_file_up_btn, 0xFFFFFF);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, "Upload\u2026", g_meta, g_file_up_btn, 0xFFFFFF);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
     fill(rt, rf(reg.left, reg.top + HEADER_H - 1, reg.right, reg.top + HEADER_H), OC_COL_BORDER);
     D2D1_RECT_F body = rf(reg.left, reg.top + HEADER_H, reg.right, reg.bottom);
 
@@ -3339,18 +3410,18 @@ static float pref_row(ID2D1RenderTarget *rt, D2D1_RECT_F body, float y, int row,
     if (hint && hint[0])
         /* Run to where the choice buttons start, not a magic 340: the hint was
          * clipped mid-word ("outside Do Not Dis…") at any pane width. */
-        draw_text(rt, hint, g_small, rf(body.left + 24, y + 20, body.right - 210, y + 40), OC_COL_FAINT);
+        draw_text(rt, hint, g_meta, rf(body.left + 24, y + 20, body.right - 210, y + 40), OC_COL_FAINT);
 
     float bx = body.right - 24;
     for (int i = n_opts - 1; i >= 0; i--) {
-        float w = text_width(opts[i], g_small) + 26;
+        float w = text_width(opts[i], g_meta) + 26;
         D2D1_RECT_F b = rf(bx - w, y + 2, bx, y + 28);
         int on = (i == cur);
         fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
         if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, opts[i], g_small, b, on ? 0xFFFFFF : OC_COL_MUTED);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, opts[i], g_meta, b, on ? 0xFFFFFF : OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
         if (g_n_pref_hits < 16) {
             g_pref_hits[g_n_pref_hits].r = b;
             g_pref_hits[g_n_pref_hits].row = row;
@@ -3401,7 +3472,7 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
     }
 
     draw_text(rt, "Saved to your account, so they follow you to another machine.",
-              g_small, rf(body.left + 24, y + 4, body.right - 24, y + 24), OC_COL_FAINT);
+              g_meta, rf(body.left + 24, y + 4, body.right - 24, y + 24), OC_COL_FAINT);
 }
 
 /* A person's card, in the context pane (right). Laid out VERTICALLY: the old
@@ -3415,12 +3486,12 @@ static void draw_profile_card(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
     D2D1_ELLIPSE av = { { cx, y + 36 }, 36, 36 };
     ID2D1RenderTarget_FillEllipse(rt, &av, paint_with(AVPAL[g_profile_uid % 6]));
     char ini[2] = { (char)(nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]), 0 };
-    IDWriteTextFormat_SetTextAlignment(g_hdr, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, ini, g_hdr, rf(cx - 36, y, cx + 36, y + 72), 0xFFFFFF);
+    IDWriteTextFormat_SetTextAlignment(g_display, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, ini, g_display, rf(cx - 36, y, cx + 36, y + 72), 0xFFFFFF);
     y += 84;
 
-    draw_text(rt, nm, g_hdr, rf(reg.left + 12, y, reg.right - 12, y + 28), OC_COL_TEXT);
-    IDWriteTextFormat_SetTextAlignment(g_hdr, DWRITE_TEXT_ALIGNMENT_LEADING);
+    draw_text(rt, nm, g_display, rf(reg.left + 12, y, reg.right - 12, y + 28), OC_COL_TEXT);
+    IDWriteTextFormat_SetTextAlignment(g_display, DWRITE_TEXT_ALIGNMENT_LEADING);
     y += 30;
 
     uint8_t pres = oc_model_presence_of(m, g_profile_uid);
@@ -3434,9 +3505,9 @@ static void draw_profile_card(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
     const char *rl = role_label(role);
     if (known && rl[0]) snprintf(sub, sizeof sub, "%s \u00B7 %s", pl, rl);
     else                snprintf(sub, sizeof sub, "%s", pl);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, sub, g_small, rf(reg.left + 12, y, reg.right - 12, y + 20), OC_COL_MUTED);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, sub, g_meta, rf(reg.left + 12, y, reg.right - 12, y + 20), OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
     y += 34;
 
     if (g_profile_uid != m->user_id) {
@@ -3448,21 +3519,21 @@ static void draw_profile_card(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
         y += 44;
     } else {
         g_prof_dm_btn = rf(0, 0, 0, 0);
-        draw_text(rt, "This is you.", g_small,
+        draw_text(rt, "This is you.", g_meta,
                   rf(reg.left + 24, y, reg.right - 12, y + 20), OC_COL_FAINT);
         y += 28;
     }
     /* The fields a real profile wants (REQ-240/241) do not exist yet; saying so
      * is better than a card that looks finished and is not. */
     draw_text(rt, "No title, timezone or email yet \u2014 those fields are not built.",
-              g_small_w, rf(reg.left + 16, y + 6, reg.right - 16, y + 56), OC_COL_FAINT);
+              g_meta_w, rf(reg.left + 16, y + 6, reg.right - 16, y + 56), OC_COL_FAINT);
 }
 
 /* Who reacted (REQ-071) — a list of PEOPLE, so it belongs in the context pane
  * beside the conversation rather than replacing it. */
 static void draw_reactors_list(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
     if (m->n_reactors == 0) {
-        draw_text(rt, "No reactions.", g_small,
+        draw_text(rt, "No reactions.", g_meta,
                   rf(reg.left + 16, reg.top + 8, reg.right - 12, reg.top + 30), OC_COL_FAINT);
         return;
     }
@@ -3483,7 +3554,7 @@ static void draw_wsmgr(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
     D2D1_RECT_F body = overlay_header(rt, reg, "Workspaces");
     g_n_wsmgr_hits = 0;
     draw_text(rt, "Sign out keeps a workspace here; Remove deletes it from this device.",
-              g_small, rf(body.left + 24, body.top + 6, body.right - 24, body.top + 26), OC_COL_FAINT);
+              g_meta, rf(body.left + 24, body.top + 6, body.right - 24, body.top + 26), OC_COL_FAINT);
     float y = body.top + 34, rowh = 54;
 
     for (int i = 0; i < g_n_sw; i++) {
@@ -3494,12 +3565,12 @@ static void draw_wsmgr(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
          * collided with the buttons whenever the pane was narrow. */
         const char *state = g_sw[i].current ? "current" : live ? "connected" : "signed out";
         uint32_t sc = g_sw[i].current ? OC_COL_ACCENT : live ? OC_COL_ONLINE : OC_COL_FAINT;
-        draw_text(rt, state, g_small, rf(body.left + 24 + text_width(g_sw[i].label, g_ui_b) + 12,
+        draw_text(rt, state, g_meta, rf(body.left + 24 + text_width(g_sw[i].label, g_ui_b) + 12,
                                          y, body.left + 340, y + 22), sc);
         char sub[320];
         snprintf(sub, sizeof sub, "%s%s%s", g_sw[i].ws,
                  g_sw[i].user[0] ? "  \u00b7  " : "", g_sw[i].user);
-        draw_text(rt, sub, g_small, rf(body.left + 24, y + 20, body.left + 340, y + 40), OC_COL_FAINT);
+        draw_text(rt, sub, g_meta, rf(body.left + 24, y + 20, body.left + 340, y + 40), OC_COL_FAINT);
 
         /* Buttons right-aligned, built right-to-left so widths can vary. */
         float bx = body.right - 24;
@@ -3510,13 +3581,13 @@ static void draw_wsmgr(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
         else if (live)                { B[nb].lbl = "Sign out";  B[nb].act = WSM_SIGNOUT; B[nb].col = OC_COL_MUTED; nb++; }
         else                          { B[nb].lbl = "Sign in";   B[nb].act = WSM_GO; B[nb].col = OC_COL_MUTED; nb++; }
         for (int k = 0; k < nb; k++) {
-            float bw = text_width(B[k].lbl, g_small) + 24;
+            float bw = text_width(B[k].lbl, g_meta) + 24;
             D2D1_RECT_F b = rf(bx - bw, y + 8, bx, y + 34);
             fill_round(rt, b, 6.0f, OC_COL_INPUT);
             stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
-            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-            draw_text(rt, B[k].lbl, g_small, b, B[k].col);
-            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+            draw_text(rt, B[k].lbl, g_meta, b, B[k].col);
+            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
             if (g_n_wsmgr_hits < 48) {
                 g_wsmgr_hits[g_n_wsmgr_hits].r = b;
                 g_wsmgr_hits[g_n_wsmgr_hits].row = i;
@@ -3579,7 +3650,7 @@ static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
         if (ns > show) off += snprintf(line + off, sizeof line - off, " +%zu", ns - show);
         D2D1_RECT_F lr = reg; lr.bottom -= 20;
         draw_msglist(rt, m, c->msgs, c->n_msgs, lr, MSGLIST_MAIN);
-        draw_text(rt, line, g_small, rf(reg.left + 72, reg.bottom - 20, reg.right - 20, reg.bottom),
+        draw_text(rt, line, g_meta, rf(reg.left + 72, reg.bottom - 20, reg.right - 20, reg.bottom),
                   OC_COL_FAINT);
         return;
     }
@@ -3620,13 +3691,13 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
         snprintf(title, sizeof title, "%s", t2);
     }
     if (typing[0]) {
-        draw_text(rt, title, g_hdr, rf(x0 + 20, 6, x0 + w - 240, 34), OC_COL_TEXT);
-        draw_text(rt, typing, g_small, rf(x0 + 20, 32, x0 + w - 240, HEADER_H - 6), OC_COL_ACCENT);
+        draw_text(rt, title, g_display, rf(x0 + 20, 6, x0 + w - 240, 34), OC_COL_TEXT);
+        draw_text(rt, typing, g_meta, rf(x0 + 20, 32, x0 + w - 240, HEADER_H - 6), OC_COL_ACCENT);
     } else if (topic) {
-        draw_text(rt, title, g_hdr, rf(x0 + 20, 6, x0 + w - 240, 34), OC_COL_TEXT);
-        draw_text(rt, topic, g_small, rf(x0 + 20, 32, x0 + w - 240, HEADER_H - 6), OC_COL_MUTED);
+        draw_text(rt, title, g_display, rf(x0 + 20, 6, x0 + w - 240, 34), OC_COL_TEXT);
+        draw_text(rt, topic, g_meta, rf(x0 + 20, 32, x0 + w - 240, HEADER_H - 6), OC_COL_MUTED);
     } else {
-        draw_text(rt, title, g_hdr, rf(x0 + 20, 0, x0 + w - 240, HEADER_H), OC_COL_TEXT);
+        draw_text(rt, title, g_display, rf(x0 + 20, 0, x0 + w - 240, HEADER_H), OC_COL_TEXT);
     }
 
     /* Member count chip (right), Slack's shape: an icon and a number rather than
@@ -3635,7 +3706,7 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
     char mc[16] = "";
     if (c && m->chanmem_channel == g_sel && !m->chanmem_loading)
         snprintf(mc, sizeof mc, "%u", (unsigned)m->n_chanmem);
-    float cw = 30 + (mc[0] ? text_width(mc, g_small) + 4 : 0);
+    float cw = 30 + (mc[0] ? text_width(mc, g_meta) + 4 : 0);
     g_memchip = rf(x0 + w - 16 - cw, 13, x0 + w - 16, HEADER_H - 13);
     if (g_show_members) fill_round(rt, g_memchip, 6.0f, OC_COL_SELECT);
     else                stroke_round(rt, g_memchip, 6.0f, OC_COL_BORDER, 1.0f);
@@ -3643,7 +3714,7 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
     draw_lucide(rt, OC_ICON_USER, rf(g_memchip.left + 5, g_memchip.top + 4,
                                      g_memchip.left + 23, g_memchip.bottom - 4), mcol);
     if (mc[0])
-        draw_text(rt, mc, g_small, rf(g_memchip.left + 25, g_memchip.top,
+        draw_text(rt, mc, g_meta, rf(g_memchip.left + 25, g_memchip.top,
                                       g_memchip.right, g_memchip.bottom), mcol);
     g_members_btn = rf(0, 0, 0, 0);   /* superseded by the chip */
 
@@ -3653,12 +3724,12 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
     if (g_unread_from && g_unread_chan == g_sel && g_unread_count > 0) {
         char lbl[40];
         snprintf(lbl, sizeof lbl, "%d new \u2191", g_unread_count);
-        float bw = text_width(lbl, g_small) + 22;
+        float bw = text_width(lbl, g_meta) + 22;
         g_unread_jump = rf(statr - bw, 14, statr, HEADER_H - 14);
         fill_round(rt, g_unread_jump, 12.0f, OC_COL_DANGER);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, lbl, g_small, g_unread_jump, 0xFFFFFF);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, lbl, g_meta, g_unread_jump, 0xFFFFFF);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
         statr = g_unread_jump.left - 12;
     } else {
         g_unread_jump = rf(0, 0, 0, 0);
@@ -3755,11 +3826,11 @@ static float draw_banner(ID2D1RenderTarget *rt, const oc_model *m, float x0, flo
     g_retry_btn = rf(x0 + w - 104, r.top + 5, x0 + w - 14, r.bottom - 5);
     fill_round(rt, g_retry_btn, 6.0f, OC_COL_INPUT);
     stroke_round(rt, g_retry_btn, 6.0f, OC_COL_BORDER, 1.0f);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, "Retry now", g_small, g_retry_btn, OC_COL_TEXT);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, "Retry now", g_meta, g_retry_btn, OC_COL_TEXT);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
 
-    draw_text(rt, why, g_small, rf(x0 + 16, r.top, g_retry_btn.left - 12, r.bottom), accent);
+    draw_text(rt, why, g_meta, rf(x0 + 16, r.top, g_retry_btn.left - 12, r.bottom), accent);
     g_banner_on = 1;
     return BANNER_H;
 }
@@ -3864,10 +3935,10 @@ static void draw_palette(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         if (i == g_pal_sel) fill_round(rt, r, 6.0f, OC_COL_ACCENT);
         draw_text(rt, hit[i].label, g_ui, rf(px + 18, y, px + pw - 90, y + rowh),
                   i == g_pal_sel ? 0xFFFFFF : OC_COL_TEXT);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
-        draw_text(rt, hit[i].kind, g_small, rf(px + 18, y, px + pw - 18, y + rowh),
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        draw_text(rt, hit[i].kind, g_meta, rf(px + 18, y, px + pw - 18, y + rowh),
                   i == g_pal_sel ? 0xFFFFFF : OC_COL_FAINT);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
         g_pal_rows[g_n_pal_rows].r = r;
         g_pal_rows[g_n_pal_rows].cmd = hit[i].cmd;
         g_pal_rows[g_n_pal_rows].cid = hit[i].cid;
@@ -3896,7 +3967,7 @@ static void draw_toasts(ID2D1RenderTarget *rt, float W, float H) {
         fill(rt, rf(r.left, r.bottom - 1, r.right, r.bottom), edge);
         fill(rt, rf(r.right - 1, r.top, r.right, r.bottom), edge);
         fill(rt, rf(r.left, r.top, r.left + bar, r.bottom), accent);      /* stripe */
-        draw_text(rt, g_toast[i].text, g_small,
+        draw_text(rt, g_toast[i].text, g_meta,
                   rf(r.left + 14, r.top + 6, r.right - 12, r.bottom - 6), OC_COL_TEXT);
         y -= TOAST_H + TOAST_GAP;
         if (y < HEADER_H + TOAST_H) break;     /* never climb into the header */
@@ -3931,12 +4002,12 @@ static void draw_members(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         draw_text(rt, "\xE2\x80\xB9", g_ui, g_rp_back, OC_COL_MUTED);
         IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
     }
-    draw_text(rt, title, g_small,
+    draw_text(rt, title, g_meta,
               rf(x0 + (g_rp_mode == RP_MEMBERS ? 16 : 34), 10, W - 34, 34), OC_COL_FAINT);
     g_rp_close = rf(W - 30, 8, W - 8, 30);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, "\xC3\x97", g_small, g_rp_close, OC_COL_MUTED);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, "\xC3\x97", g_meta, g_rp_close, OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
 
     if (g_rp_mode == RP_PROFILE)  { g_n_memrows = 0; draw_profile_card(rt, m, rf(x0, 40, W, H)); return; }
     if (g_rp_mode == RP_REACTORS) { g_n_memrows = 0; draw_reactors_list(rt, m, rf(x0, 40, W, H)); return; }
@@ -3948,7 +4019,7 @@ static void draw_members(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
      * exactly why the bug survived: in any real workspace it showed people who
      * cannot read the channel they were listed beside. */
     if (m->chanmem_channel != g_sel || m->chanmem_loading) {
-        draw_text(rt, m->chanmem_loading ? "Loading\u2026" : "", g_small,
+        draw_text(rt, m->chanmem_loading ? "Loading\u2026" : "", g_meta,
                   rf(x0 + 16, 44, W - 12, 68), OC_COL_FAINT);
         return;
     }
@@ -4029,25 +4100,25 @@ static void draw_signin(ID2D1RenderTarget *rt, float W, float H) {
     /* Mark: the accent rounded square the rail uses for the workspace avatar. */
     D2D1_RECT_F mark = rf(cx - 18, y, cx + 18, y + 36);
     fill_round(rt, mark, 11.0f, OC_COL_ACCENT);
-    draw_text(rt, "O", g_ava, mark, 0xFFFFFF);
+    draw_text(rt, "O", g_avatar, mark, 0xFFFFFF);
     y += 52;
 
-    IDWriteTextFormat_SetTextAlignment(g_hdr,   DWRITE_TEXT_ALIGNMENT_CENTER);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+    IDWriteTextFormat_SetTextAlignment(g_display,   DWRITE_TEXT_ALIGNMENT_CENTER);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
     char head[288];
     if (g_si_step == 1) snprintf(head, sizeof head, "Sign in to OpenChime");
     else                snprintf(head, sizeof head, "Sign in to %s", g_si_ws);
-    draw_text(rt, head, g_hdr, rf(x0 + 12, y, x0 + SI_W - 12, y + 30), OC_COL_TEXT);
+    draw_text(rt, head, g_display, rf(x0 + 12, y, x0 + SI_W - 12, y + 30), OC_COL_TEXT);
     y += 30;
     if (g_si_step == 2) {
         char sub[300]; snprintf(sub, sizeof sub, "%s:%d", g_si_host, g_si_port);
-        draw_text(rt, sub, g_small, rf(x0 + 12, y, x0 + SI_W - 12, y + 20), OC_COL_MUTED);
+        draw_text(rt, sub, g_meta, rf(x0 + 12, y, x0 + SI_W - 12, y + 20), OC_COL_MUTED);
     } else {
-        draw_text(rt, "Enter your workspace address", g_small,
+        draw_text(rt, "Enter your workspace address", g_meta,
                   rf(x0 + 12, y, x0 + SI_W - 12, y + 20), OC_COL_MUTED);
     }
-    IDWriteTextFormat_SetTextAlignment(g_hdr,   DWRITE_TEXT_ALIGNMENT_LEADING);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    IDWriteTextFormat_SetTextAlignment(g_display,   DWRITE_TEXT_ALIGNMENT_LEADING);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
     y += 30;
 
     /* While connecting the fields are hidden and the card says so — the wait is
@@ -4065,23 +4136,23 @@ static void draw_signin(ID2D1RenderTarget *rt, float W, float H) {
     if (g_si_step == 1) { labels[0] = "Workspace"; nfields = 1; }
     else                { labels[0] = "Username"; labels[1] = "Password"; nfields = 2; }
     for (int i = 0; i < nfields; i++) {
-        draw_text(rt, labels[i], g_small, rf(fx, y, fx + fw, y + 18), OC_COL_MUTED);
+        draw_text(rt, labels[i], g_meta, rf(fx, y, fx + fw, y + 18), OC_COL_MUTED);
         D2D1_RECT_F box = rf(fx, y + 20, fx + fw, y + 52);
         fill_round(rt, box, 8.0f, OC_COL_INPUT);
         stroke_round(rt, box, 8.0f, g_si_err[0] ? OC_COL_DANGER : OC_COL_BORDER, 1.0f);
         /* Hosted mode: the service suffix is chrome, not something to type. */
         if (g_si_step == 1 && !g_si_advanced) {
             char suf[80]; snprintf(suf, sizeof suf, ".%s", oc_default_suffix());
-            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
-            draw_text(rt, suf, g_small, rf(fx, y + 20, fx + fw - 12, y + 52), OC_COL_MUTED);
-            IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
+            draw_text(rt, suf, g_meta, rf(fx, y + 20, fx + fw - 12, y + 52), OC_COL_MUTED);
+            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
         }
         y += 62;
     }
 
     if (g_si_err[0]) {
         char line[208]; snprintf(line, sizeof line, "\xE2\x9A\xA0 %s", g_si_err);
-        draw_text(rt, line, g_small, rf(fx, y, fx + fw, y + 34), OC_COL_DANGER);
+        draw_text(rt, line, g_meta, rf(fx, y, fx + fw, y + 34), OC_COL_DANGER);
         y += 34;
     }
 
@@ -4089,7 +4160,7 @@ static void draw_signin(ID2D1RenderTarget *rt, float W, float H) {
         g_si_adv_link = rf(fx, y, fx + fw, y + 20);
         draw_text(rt, g_si_advanced ? "\xE2\x86\x90 Use a workspace name"
                                     : "Advanced options\xE2\x80\xA6",
-                  g_small, g_si_adv_link, OC_COL_ACCENT);
+                  g_meta, g_si_adv_link, OC_COL_ACCENT);
         y += 26;
     } else {
         g_si_adv_link = rf(0, 0, 0, 0);
@@ -4103,8 +4174,8 @@ static void draw_signin(ID2D1RenderTarget *rt, float W, float H) {
         stroke_round(rt, g_si_remember_box, 4.0f,
                      g_si_remember ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
         if (g_si_remember)
-            draw_text(rt, "\xE2\x9C\x93", g_small, rf(fx + 2, y, fx + 18, y + 20), 0xFFFFFF);
-        draw_text(rt, "Remember me", g_small, rf(fx + 24, y, fx + fw, y + 20), OC_COL_MUTED);
+            draw_text(rt, "\xE2\x9C\x93", g_meta, rf(fx + 2, y, fx + 18, y + 20), 0xFFFFFF);
+        draw_text(rt, "Remember me", g_meta, rf(fx + 24, y, fx + fw, y + 20), OC_COL_MUTED);
         y += 30;
     }
 
@@ -4117,16 +4188,16 @@ static void draw_signin(ID2D1RenderTarget *rt, float W, float H) {
 
     if (g_si_step == 2) {
         g_si_back = rf(fx, y, fx + fw, y + 20);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, "\xE2\x86\x90 Use a different workspace", g_small, g_si_back, OC_COL_ACCENT);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "\xE2\x86\x90 Use a different workspace", g_meta, g_si_back, OC_COL_ACCENT);
         /* WIN-32: the only way to turn an invite into an account used to be the
          * command line. Signup is its own small form rather than three more
          * fields on this card, which would push the layout around for a path
          * most people take once. */
         g_si_invite_link = rf(fx, y + 22, fx + fw, y + 42);
-        draw_text(rt, "Have an invite? Create an account", g_small,
+        draw_text(rt, "Have an invite? Create an account", g_meta,
                   g_si_invite_link, OC_COL_MUTED);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
     } else {
         g_si_back = rf(0, 0, 0, 0);
         g_si_invite_link = rf(0, 0, 0, 0);
@@ -4137,9 +4208,9 @@ static void draw_signin(ID2D1RenderTarget *rt, float W, float H) {
      * text landed on whatever the transcript happened to be showing. */
     if (g_si_overlay) {
         g_si_cancel = rf(fx, card.bottom - 28, fx + fw, card.bottom - 6);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, "Cancel  (Esc)", g_small, g_si_cancel, OC_COL_MUTED);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Cancel  (Esc)", g_meta, g_si_cancel, OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
     } else {
         g_si_cancel = rf(0, 0, 0, 0);
     }
@@ -4167,7 +4238,7 @@ static void draw_autocomplete(ID2D1RenderTarget *rt, float x0, float w, float h)
 
     const char *hdr = g_ac_kind == OC_AC_MENTION ? "PEOPLE"
                     : g_ac_kind == OC_AC_CHANNEL ? "CHANNELS" : "EMOJI";
-    draw_text(rt, hdr, g_small, rf(px + 12, py + 5, px + pw - 12, py + hdr_h), OC_COL_FAINT);
+    draw_text(rt, hdr, g_meta, rf(px + 12, py + 5, px + pw - 12, py + hdr_h), OC_COL_FAINT);
 
     float y = py + hdr_h;
     for (int i = 0; i < g_n_ac; i++) {
@@ -4178,10 +4249,10 @@ static void draw_autocomplete(ID2D1RenderTarget *rt, float x0, float w, float h)
                   i == g_ac_sel ? 0xFFFFFF : OC_COL_TEXT);
         y += rowh;
     }
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    draw_text(rt, "Tab or Enter to insert", g_small,
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    draw_text(rt, "Tab or Enter to insert", g_meta,
               rf(px + 12, py + ph - hint_h + 3, px + pw - 12, py + ph - 2), OC_COL_FAINT);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 
 /* The emoji picker: a search box over a category-sectioned grid. Anchored above
@@ -4201,7 +4272,7 @@ static void draw_emoji_picker(ID2D1RenderTarget *rt, float x0, float w, float h)
     fill_round(rt, g_pick_panel, 10.0f, OC_COL_INPUT);
     stroke_round(rt, g_pick_panel, 10.0f, OC_COL_BORDER, 1.0f);
 
-    draw_text(rt, g_pick_mid ? "Add reaction" : "Emoji", g_name,
+    draw_text(rt, g_pick_mid ? "Add reaction" : "Emoji", g_title,
               rf(px + 14, py + 8, px + pw - 14, py + 30), OC_COL_TEXT);
 
     g_pick_box = rf(px + 12, py + 32, px + pw - 12, py + 62);
@@ -4232,7 +4303,7 @@ static void draw_emoji_picker(ID2D1RenderTarget *rt, float x0, float w, float h)
         if (!q[0] && hits[i]->category != last_cat) {
             if (col != 0) { y += cell; col = 0; x = body.left; }
             if (y + 18 >= body.top && y <= body.bottom)
-                draw_text(rt, oc_emoji_category_name(hits[i]->category), g_small,
+                draw_text(rt, oc_emoji_category_name(hits[i]->category), g_meta,
                           rf(body.left + 4, y, body.right, y + 18), OC_COL_FAINT);
             y += 20;
             last_cat = hits[i]->category;
@@ -4530,7 +4601,7 @@ static void admin_select(int t) {
 
 static void draw_admin(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
     fill(rt, rf(reg.left, reg.top, reg.right, reg.top + HEADER_H), OC_COL_HEADER);
-    draw_text(rt, "Admin", g_hdr, rf(reg.left + 20, reg.top, reg.right - 20, reg.top + HEADER_H),
+    draw_text(rt, "Admin", g_display, rf(reg.left + 20, reg.top, reg.right - 20, reg.top + HEADER_H),
               OC_COL_TEXT);
     fill(rt, rf(reg.left, reg.top + HEADER_H, reg.right, reg.top + HEADER_H + TABBAR_H), OC_COL_HEADER);
     fill(rt, rf(reg.left, reg.top + HEADER_H + TABBAR_H - 1, reg.right,
@@ -4613,7 +4684,7 @@ static void draw_dm_list(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     float x0 = RAIL_W, x1 = RAIL_W + SIDEBAR_W;
     fill(rt, rf(x0, 0, x1, h), OC_COL_SIDEBAR);
 
-    draw_text(rt, "Direct messages", g_hdr, rf(x0 + 16, 0, x1 - 40, HEADER_H), OC_COL_TEXT);
+    draw_text(rt, "Direct messages", g_display, rf(x0 + 16, 0, x1 - 40, HEADER_H), OC_COL_TEXT);
     g_dm_compose_btn = rf(x1 - 36, 16, x1 - 12, 40);
     draw_lucide(rt, OC_ICON_SQUARE_PEN, rf(g_dm_compose_btn.left + 2, g_dm_compose_btn.top + 2,
                                            g_dm_compose_btn.right - 2, g_dm_compose_btn.bottom - 2),
@@ -4660,10 +4731,10 @@ static void draw_dm_list(ID2D1RenderTarget *rt, const oc_model *m, float h) {
 
         char when[24];
         rel_time(best->last_message_at, when, sizeof when);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
-        draw_text(rt, when, g_small, rf(row.left + 48, y + 6, row.right - 10, y + 24),
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        draw_text(rt, when, g_meta, rf(row.left + 48, y + 6, row.right - 10, y + 24),
                   unread ? OC_COL_ACCENT : OC_COL_FAINT);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
 
         /* The preview, prefixed the way the reference does it so you can tell
          * whose turn it is at a glance. */
@@ -4671,7 +4742,7 @@ static void draw_dm_list(ID2D1RenderTarget *rt, const oc_model *m, float h) {
         if (best->preview[0])
             snprintf(prev, sizeof prev, "%s%s",
                      best->preview_author == m->user_id ? "You: " : "", best->preview);
-        draw_text(rt, prev[0] ? prev : "No messages yet", g_small,
+        draw_text(rt, prev[0] ? prev : "No messages yet", g_meta,
                   rf(row.left + 48, y + 25, row.right - 10, y + 45),
                   unread ? OC_COL_TEXT : OC_COL_FAINT);
 
@@ -4683,7 +4754,7 @@ static void draw_dm_list(ID2D1RenderTarget *rt, const oc_model *m, float h) {
         y += 56;
     }
     if (!any)
-        draw_text(rt, "No conversations yet \u2014 use the compose button.", g_small_w,
+        draw_text(rt, "No conversations yet \u2014 use the compose button.", g_meta_w,
                   rf(x0 + 16, HEADER_H + 12, x1 - 16, HEADER_H + 60), OC_COL_FAINT);
 }
 
@@ -4715,7 +4786,7 @@ static void draw_dm_compose(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
         draw_text(rt, u->user_id == m->user_id
                       ? "Message yourself \u2014 notes, links, reminders"
                       : (dm_with(m, u->user_id) ? "Open the conversation" : "Start a conversation"),
-                  g_small, rf(row.left + 56, y + 23, row.right - 20, y + 41), OC_COL_FAINT);
+                  g_meta, rf(row.left + 56, y + 23, row.right - 20, y + 41), OC_COL_FAINT);
         if (g_n_pickrows < (int)(sizeof g_pickrows / sizeof g_pickrows[0])) {
             g_pickrows[g_n_pickrows].r = row;
             g_pickrows[g_n_pickrows].uid = u->user_id;
@@ -4734,10 +4805,10 @@ static uint64_t g_listrow_hover;
 static D2D1_RECT_F view_header(ID2D1RenderTarget *rt, D2D1_RECT_F reg, const char *title,
                                const char *sub) {
     fill(rt, rf(reg.left, reg.top, reg.right, reg.top + HEADER_H), OC_COL_HEADER);
-    draw_text(rt, title, g_hdr, rf(reg.left + 20, reg.top, reg.right - 20,
+    draw_text(rt, title, g_display, rf(reg.left + 20, reg.top, reg.right - 20,
                                    reg.top + (sub ? 34.0f : HEADER_H)), OC_COL_TEXT);
     if (sub)
-        draw_text(rt, sub, g_small, rf(reg.left + 20, reg.top + 30, reg.right - 20,
+        draw_text(rt, sub, g_meta, rf(reg.left + 20, reg.top + 30, reg.right - 20,
                                        reg.top + HEADER_H - 4), OC_COL_FAINT);
     fill(rt, rf(reg.left, reg.top + HEADER_H - 1, reg.right, reg.top + HEADER_H), OC_COL_BORDER);
     return rf(reg.left, reg.top + HEADER_H, reg.right, reg.bottom);
@@ -4768,18 +4839,18 @@ static int act_passes(const oc_activity_view *a) {
 static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     float x0 = RAIL_W, x1 = RAIL_W + SIDEBAR_W;
     fill(rt, rf(x0, 0, x1, h), OC_COL_SIDEBAR);
-    draw_text(rt, "Activity", g_hdr, rf(x0 + 16, 0, x1 - 12, HEADER_H), OC_COL_TEXT);
+    draw_text(rt, "Activity", g_display, rf(x0 + 16, 0, x1 - 12, HEADER_H), OC_COL_TEXT);
 
     static const char *L[AF_COUNT] = { "All", "Mentions", "Reactions", "Threads" };
     float fx = x0 + 12, fy = HEADER_H - 2;
     for (int i = 0; i < AF_COUNT; i++) {
-        float fw = text_width(L[i], g_small) + 16;
+        float fw = text_width(L[i], g_meta) + 16;
         D2D1_RECT_F b = rf(fx, fy, fx + fw, fy + 22);
         int on = (g_act_filter == i);
         if (on) fill_round(rt, b, 6.0f, OC_COL_ACCENT);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, L[i], g_small, b, on ? 0xFFFFFF : OC_COL_MUTED);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, L[i], g_meta, b, on ? 0xFFFFFF : OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
         g_act_filters[i] = b;
         fx = b.right + 4;
     }
@@ -4787,7 +4858,7 @@ static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h
     g_n_listrows = 0;
     float y = fy + 30;
     if (m->activity_loading) {
-        draw_text(rt, "Loading\u2026", g_small, rf(x0 + 16, y + 8, x1 - 12, y + 30), OC_COL_FAINT);
+        draw_text(rt, "Loading\u2026", g_meta, rf(x0 + 16, y + 8, x1 - 12, y + 30), OC_COL_FAINT);
         return;
     }
     int shown = 0;
@@ -4807,16 +4878,16 @@ static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h
         ID2D1RenderTarget_FillEllipse(rt, &av, paint_with(AVPAL[a->actor_id % 6]));
         char ini[2] = { (char)((who && who[0] >= 'a' && who[0] <= 'z') ? who[0] - 32
                                : (who && who[0]) ? who[0] : '?'), 0 };
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, ini, g_small, rf(row.left + 13, y + 8, row.left + 39, y + 34), 0xFFFFFF);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, ini, g_meta, rf(row.left + 13, y + 8, row.left + 39, y + 34), 0xFFFFFF);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
 
         char when[24]; rel_time(a->at, when, sizeof when);
         draw_text(rt, (who && who[0]) ? who : "someone", g_ui_b,
                   rf(row.left + 46, y + 4, row.right - 56, y + 24), OC_COL_TEXT);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
-        draw_text(rt, when, g_small, rf(row.left + 46, y + 5, row.right - 8, y + 23), OC_COL_FAINT);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        draw_text(rt, when, g_meta, rf(row.left + 46, y + 5, row.right - 8, y + 23), OC_COL_FAINT);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
 
         /* What kind, and where — the line Slack puts under the name. */
         const oc_channel *ch = oc_model_channel((oc_model *)m, a->channel_id);
@@ -4829,9 +4900,9 @@ static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h
                  a->kind == OC_ACT_REACTION ? "Reaction" : "Thread",
                  (ch && ch->name && ch->name[0]) ? "#" : "",
                  (ch && ch->name && ch->name[0]) ? ch->name : "a conversation");
-        draw_text(rt, whereline, g_small, rf(row.left + 64, y + 24, row.right - 8, y + 42),
+        draw_text(rt, whereline, g_meta, rf(row.left + 64, y + 24, row.right - 8, y + 42),
                   OC_COL_FAINT);
-        draw_text(rt, a->text ? a->text : "", g_small_w,
+        draw_text(rt, a->text ? a->text : "", g_meta_w,
                   rf(row.left + 12, y + 44, row.right - 8, y + 72), OC_COL_MUTED);
 
         if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
@@ -4847,7 +4918,7 @@ static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h
         draw_text(rt, m->n_activity ? "Nothing of that kind."
                                     : "Nothing yet. Mentions, reactions to your messages "
                                       "and replies to your threads land here.",
-                  g_small_w, rf(x0 + 16, y + 8, x1 - 12, y + 80), OC_COL_FAINT);
+                  g_meta_w, rf(x0 + 16, y + 8, x1 - 12, y + 80), OC_COL_FAINT);
 }
 
 /* Saved items — the Later view (REQ-231). */
@@ -4880,14 +4951,14 @@ static void draw_later(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
         if (sv->body && sv->body[0])       snprintf(prev, sizeof prev, "%s", sv->body);
         else if (sv->attach_name[0])       snprintf(prev, sizeof prev, "\U0001F4CE %s", sv->attach_name);
         else                               prev[0] = '\0';
-        draw_text(rt, prev, g_small, rf(row.left + 40, y + 24, row.right - 110, y + 46),
+        draw_text(rt, prev, g_meta, rf(row.left + 40, y + 24, row.right - 110, y + 46),
                   OC_COL_FAINT);
 
         D2D1_RECT_F rm = rf(row.right - 96, y + 14, row.right - 16, y + 38);
         stroke_round(rt, rm, 6.0f, OC_COL_BORDER, 1.0f);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, "Remove", g_small, rm, OC_COL_MUTED);
-        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Remove", g_meta, rm, OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
 
         if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
             g_listrows[g_n_listrows].row = row;
@@ -4904,7 +4975,7 @@ static void draw_later(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
 static void draw_stub_view(ID2D1RenderTarget *rt, D2D1_RECT_F reg,
                            const char *title, const char *sub) {
     fill(rt, rf(reg.left, reg.top, reg.right, reg.top + HEADER_H), OC_COL_HEADER);
-    draw_text(rt, title, g_hdr, rf(reg.left + 20, reg.top, reg.right - 20, reg.top + HEADER_H), OC_COL_TEXT);
+    draw_text(rt, title, g_display, rf(reg.left + 20, reg.top, reg.right - 20, reg.top + HEADER_H), OC_COL_TEXT);
     fill(rt, rf(reg.left, reg.top + HEADER_H - 1, reg.right, reg.top + HEADER_H), OC_COL_BORDER);
     float cy = (reg.top + HEADER_H + reg.bottom) / 2;
     IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -5208,9 +5279,11 @@ static void composer_draw_placeholder(HWND hwnd) {
     HDC dc = GetDC(hwnd);
     if (!dc) return;
     if (!g_ph_font)
-        g_ph_font = CreateFontW(-PX(BODY_DIP), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+        /* The placeholder has to match the RichEdit's own text exactly, so it
+         * takes the same family and the same body token. */
+        g_ph_font = CreateFontW(-PX(FONT_BODY * g_text_scale), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                                VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
+                                VARIABLE_PITCH | FF_SWISS, ui_family());
     HFONT old = (HFONT)SelectObject(dc, g_ph_font);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, OCRGB(OC_COL_FAINT));
@@ -5537,10 +5610,10 @@ static void draw_lightbox(ID2D1RenderTarget *rt, float W, float H) {
     D2D1_RECT_F dst = rf((W - dw) / 2, (H - dh) / 2, (W + dw) / 2, (H + dh) / 2);
     ID2D1RenderTarget_DrawBitmap(rt, bmp, &dst, 1.0f,
                                  D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, NULL);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, "Click anywhere or press Esc to close", g_small,
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, "Click anywhere or press Esc to close", g_meta,
               rf(0, dst.bottom + 10, W, dst.bottom + 32), OC_COL_MUTED);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 
 /* Decode `len` bytes into an RT bitmap and cache it under `id`. WIC works from
@@ -5745,8 +5818,8 @@ static void composer_create(HWND parent) {
     cf.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE;
     cf.crTextColor = OCRGB(OC_COL_TEXT);
     /* Match g_body exactly: DIP -> twips is x15 (72/96 pt-per-DIP, 20 twips/pt). */
-    cf.yHeight = (LONG)(BODY_DIP * 15.0f);
-    lstrcpynW(cf.szFaceName, L"Segoe UI", LF_FACESIZE);
+    cf.yHeight = (LONG)(FONT_BODY * g_text_scale * 15.0f);   /* twips */
+    lstrcpynW(cf.szFaceName, ui_family(), LF_FACESIZE);
     SendMessageW(g_re, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
     SendMessageW(g_re, EM_SETEVENTMASK, 0, ENM_CHANGE);
     /* A little inner margin so text isn't jammed against the edge. */
@@ -8986,16 +9059,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         DispatchMessageW(&m);
     }
 
-    if (g_hdr)   IDWriteTextFormat_Release(g_hdr);
-    if (g_name)  IDWriteTextFormat_Release(g_name);
-    if (g_time)  IDWriteTextFormat_Release(g_time);
+    if (g_display)   IDWriteTextFormat_Release(g_display);
+    if (g_title)  IDWriteTextFormat_Release(g_title);
+    if (g_meta_r)  IDWriteTextFormat_Release(g_meta_r);
     if (g_body)  IDWriteTextFormat_Release(g_body);
     if (g_ui)    IDWriteTextFormat_Release(g_ui);
     if (g_ui_b)  IDWriteTextFormat_Release(g_ui_b);
-    if (g_small) IDWriteTextFormat_Release(g_small);
-    if (g_small_w) IDWriteTextFormat_Release(g_small_w);
-    if (g_ava)   IDWriteTextFormat_Release(g_ava);
-    if (g_rail)  IDWriteTextFormat_Release(g_rail);
+    if (g_meta) IDWriteTextFormat_Release(g_meta);
+    if (g_meta_w) IDWriteTextFormat_Release(g_meta_w);
+    if (g_avatar)   IDWriteTextFormat_Release(g_avatar);
+    if (g_micro)  IDWriteTextFormat_Release(g_micro);
     for (int i = 0; i < OC_ICON_COUNT; i++)
         if (g_icon_geo[i]) ID2D1PathGeometry_Release(g_icon_geo[i]);
     if (g_icon_stroke) ID2D1StrokeStyle_Release(g_icon_stroke);
