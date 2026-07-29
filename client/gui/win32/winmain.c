@@ -1621,8 +1621,23 @@ static void draw_menu(ID2D1RenderTarget *rt) {
     }
 }
 
-static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
+/* The second column's surface: its background AND the 1px edge against the
+ * middle column.
+ *
+ * One call, because the edge is not decoration — the members pane on the right
+ * has always drawn its own (draw_members), so the window was symmetrical in
+ * layout and asymmetrical in weight: a rule on one side of the transcript and
+ * nothing on the other. And it is one call rather than four lines because there
+ * are FOUR painters for this column (channels, DMs, activity, files) and a fifth
+ * will be added; a border every tenant has to remember is a border some tenant
+ * will forget, which is the same failure as sidebar_kind()'s default. */
+static void sidebar_surface(ID2D1RenderTarget *rt, float h) {
     fill(rt, rf(RAIL_W, 0, RAIL_W + SIDEBAR_W, h), OC_COL_SIDEBAR);
+    fill(rt, rf(RAIL_W + SIDEBAR_W - 1, 0, RAIL_W + SIDEBAR_W, h), OC_COL_BORDER);
+}
+
+static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
+    sidebar_surface(rt, h);
 
     float x1 = RAIL_W + SIDEBAR_W - 12;
     /* Header: workspace name + chevron (opens ws menu), with settings + compose
@@ -3309,7 +3324,7 @@ static void draw_filelist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F 
 /* The Files view's left column: "All files", then the channels that have any,
  * each with its count. */
 static void draw_files_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
-    fill(rt, rf(RAIL_W, 0, RAIL_W + SIDEBAR_W, h), OC_COL_SIDEBAR);
+    sidebar_surface(rt, h);
     draw_text(rt, "Files", g_display, rf(RAIL_W + 16, 0, RAIL_W + SIDEBAR_W - 12, HEADER_H),
               OC_COL_TEXT);
 
@@ -4377,12 +4392,11 @@ static void picker_choose(HWND hwnd, const char *emoji) {
     picker_close(hwnd);
 }
 
-static void composer_placeholder(const oc_model *m);   /* fwd */
+static void composer_cue(const oc_model *m, char *out, size_t cap);   /* fwd */
 
 static int main_is_conversation(void);   /* fwd — decides the composer, chrome and child alike */
 
 static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
-    composer_placeholder(model());   /* the cue tracks the open conversation */
     float top = h - g_composer_h;
     fill(rt, rf(x0, top, x0 + w, h), OC_COL_BASE);
 
@@ -4682,7 +4696,7 @@ static void rel_time(uint64_t ms, char *out, size_t cap) {
 
 static void draw_dm_list(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     float x0 = RAIL_W, x1 = RAIL_W + SIDEBAR_W;
-    fill(rt, rf(x0, 0, x1, h), OC_COL_SIDEBAR);
+    sidebar_surface(rt, h);
 
     draw_text(rt, "Direct messages", g_display, rf(x0 + 16, 0, x1 - 40, HEADER_H), OC_COL_TEXT);
     g_dm_compose_btn = rf(x1 - 36, 16, x1 - 12, 40);
@@ -4838,7 +4852,7 @@ static int act_passes(const oc_activity_view *a) {
 
 static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     float x0 = RAIL_W, x1 = RAIL_W + SIDEBAR_W;
-    fill(rt, rf(x0, 0, x1, h), OC_COL_SIDEBAR);
+    sidebar_surface(rt, h);
     draw_text(rt, "Activity", g_display, rf(x0 + 16, 0, x1 - 12, HEADER_H), OC_COL_TEXT);
 
     static const char *L[AF_COUNT] = { "All", "Mentions", "Reactions", "Threads" };
@@ -5255,28 +5269,42 @@ static void composer_cancel_edit(void) {
  * Worth the trouble because the composer said nothing about where the message
  * was going — and with several workspaces open (WIN-29) "which conversation is
  * this?" is a real question. */
-static char g_ph[160];
 static HFONT g_ph_font;
 
-static void composer_placeholder(const oc_model *m) {
+/* The composer's cue text, derived from the open conversation.
+ *
+ * A pure function of the model, deliberately: it was a cached global set only
+ * from layout_composer, which does not run on a channel switch — so the cue kept
+ * the PREVIOUS conversation's name ("Message bob" while you were reading alice)
+ * until something unrelated forced a relayout. Caching a derived string means
+ * every site that changes the inputs has to remember to refresh it, and one
+ * never did. It is also why the value could not be trusted in the test dump.
+ * Computed where it is used, it cannot be stale anywhere. */
+static void composer_cue(const oc_model *m, char *out, size_t cap) {
     const oc_channel *c = (m && g_sel) ? oc_model_channel((oc_model *)m, g_sel) : NULL;
-    if (g_edit_msg)            snprintf(g_ph, sizeof g_ph, "Edit this message \u2014 Esc to cancel");
+    if (g_edit_msg)            snprintf(out, cap, "Edit this message \u2014 Esc to cancel");
     /* Say why, not just that it is disabled (REQ-035). */
-    else if (c && c->archived) snprintf(g_ph, sizeof g_ph,
-                                        "#%s is archived \u2014 read-only",
+    else if (c && c->archived) snprintf(out, cap, "#%s is archived \u2014 read-only",
                                         c->name ? c->name : "this channel");
-    else if (m && m->thread_open) snprintf(g_ph, sizeof g_ph, "Reply\u2026");
-    else if (!c)               snprintf(g_ph, sizeof g_ph, "Message");
+    else if (m && m->thread_open) snprintf(out, cap, "Reply\u2026");
+    else if (!c)               snprintf(out, cap, "Message");
     else if (c->kind == OC_CHANNEL_KIND_DM) {
         const char *pn = oc_model_user_name(m, c->peer_id);
-        snprintf(g_ph, sizeof g_ph, "Message %s", (pn && pn[0]) ? pn : "them");
+        snprintf(out, cap, "Message %s", (pn && pn[0]) ? pn : "them");
     } else
-        snprintf(g_ph, sizeof g_ph, "Message #%s", c->name ? c->name : "channel");
+        snprintf(out, cap, "Message #%s", c->name ? c->name : "channel");
 }
 
-static void composer_draw_placeholder(HWND hwnd) {
-    if (!g_ph[0] || GetWindowTextLengthW(hwnd) > 0) return;
-    HDC dc = GetDC(hwnd);
+/* `into` is NULL for an ordinary repaint (we fetch the control's own DC) and a
+ * caller's DC when the control is being rendered into a bitmap — which is how
+ * the cue reaches a screenshot at all. Painting only to GetDC(hwnd) meant the
+ * cue existed on screen and nowhere else: invisible to every capture route, so
+ * the one string in the composer that users read could not be checked. */
+static void composer_draw_placeholder(HWND hwnd, HDC into) {
+    char ph[160];
+    composer_cue(model(), ph, sizeof ph);
+    if (!ph[0] || GetWindowTextLengthW(hwnd) > 0) return;
+    HDC dc = into ? into : GetDC(hwnd);
     if (!dc) return;
     if (!g_ph_font)
         /* The placeholder has to match the RichEdit's own text exactly, so it
@@ -5287,12 +5315,12 @@ static void composer_draw_placeholder(HWND hwnd) {
     HFONT old = (HFONT)SelectObject(dc, g_ph_font);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, OCRGB(OC_COL_FAINT));
-    WCHAR w[160]; int n = to_w(g_ph, w, 160);
+    WCHAR w[160]; int n = to_w(ph, w, 160);
     RECT rc; GetClientRect(hwnd, &rc);
     /* Matches EM_SETMARGINS(12) and the control's own first-line origin. */
     TextOutW(dc, 0, PX(1), w, n);
     SelectObject(dc, old);
-    ReleaseDC(hwnd, dc);
+    if (!into) ReleaseDC(hwnd, dc);
 }
 
 /* Subclass proc: Enter sends, Shift+Enter inserts a newline. While the
@@ -5305,7 +5333,15 @@ static LRESULT CALLBACK re_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_PAINT) {
         /* Let the control paint, then overlay the cue on the empty field. */
         LRESULT r = CallWindowProcW(g_re_oldproc, hwnd, msg, wp, lp);
-        composer_draw_placeholder(hwnd);
+        composer_draw_placeholder(hwnd, NULL);
+        return r;
+    }
+    /* The same overlay when the control is asked to render into someone's DC —
+     * the screenshot path. Without this arm a capture shows an empty composer
+     * however correct the cue is. */
+    if (msg == WM_PRINTCLIENT) {
+        LRESULT r = CallWindowProcW(g_re_oldproc, hwnd, msg, wp, lp);
+        composer_draw_placeholder(hwnd, (HDC)wp);
         return r;
     }
     if (g_n_ac > 0 && (msg == WM_KEYDOWN || msg == WM_CHAR)) {
@@ -7960,6 +7996,64 @@ static int write_bmp(const char *path, int w, int h, const void *bgra) {
 /* Renders the scene into a DC target for the harness. Thumbnails are suppressed
  * for the duration: their bitmaps belong to the window's target and drawing one
  * here would fail the whole frame. */
+/* ---- composited snapshots ------------------------------------------------ */
+
+/* Blit every visible native child onto `mem`, over the Direct2D scene already
+ * rendered there, at the position it really occupies.
+ *
+ * This exists because NEITHER capture route is complete on its own, which cost
+ * real time to discover:
+ *
+ *   - Re-rendering the scene into a DC target (test_shot) draws only what WE
+ *     draw. The composer's RichEdit, the find/search/files boxes, the emoji
+ *     picker and the sign-in fields are child windows, so they are invisible to
+ *     it — and that is exactly the class of bug that kept reaching the user
+ *     (WIN-70), plus anything the RichEdit paints itself, like the composer cue.
+ *   - PrintWindow(PW_RENDERFULLCONTENT) captures the children and the window
+ *     chrome but returns a BLANK client area, because our WM_PAINT renders
+ *     through a D2D HWND target straight to the screen and never touches the HDC
+ *     Windows hands it. Measured, not assumed: the capture showed white with the
+ *     RichEdit's placeholder floating in it.
+ *
+ * So we composite exactly as the window does: our scene underneath, children on
+ * top. EnumChildWindows rather than a list of the six handles, because a list is
+ * one more thing a seventh child has to be added to — and forgetting is the
+ * failure mode this whole area keeps repeating. */
+static BOOL CALLBACK snap_child(HWND ch, LPARAM lp) {
+    HDC mem = (HDC)lp;
+    if (!IsWindowVisible(ch)) return TRUE;
+    HWND parent = GetParent(ch);
+    RECT wr; GetWindowRect(ch, &wr);
+    POINT tl = { wr.left, wr.top };
+    ScreenToClient(parent, &tl);
+    int cw = wr.right - wr.left, chh = wr.bottom - wr.top;
+    if (cw <= 0 || chh <= 0) return TRUE;
+
+    HDC tmp = CreateCompatibleDC(mem);
+    HBITMAP bm = CreateCompatibleBitmap(mem, cw, chh);
+    if (tmp && bm) {
+        HGDIOBJ o = SelectObject(tmp, bm);
+        /* Both, in this order, because neither is reliable alone and this was
+         * established by measurement rather than documentation: PrintWindow on a
+         * CHILD returned an empty box for the RichEdit (the send arrow went
+         * primary, proving text was there, while the capture stayed blank), and
+         * WM_PRINTCLIENT is what a control implements for exactly this purpose.
+         * Whichever fills the bitmap wins; running both costs nothing at
+         * screenshot rate. */
+        SendMessageW(ch, WM_ERASEBKGND, (WPARAM)tmp, 0);
+        if (!PrintWindow(ch, tmp, 0))
+            SendMessageW(ch, WM_PRINTCLIENT, (WPARAM)tmp,
+                         PRF_CLIENT | PRF_CHILDREN | PRF_ERASEBKGND);
+        else
+            SendMessageW(ch, WM_PRINTCLIENT, (WPARAM)tmp, PRF_CLIENT | PRF_CHILDREN);
+        BitBlt(mem, tl.x, tl.y, cw, chh, tmp, 0, 0, SRCCOPY);
+        SelectObject(tmp, o);
+    }
+    if (bm) DeleteObject(bm);
+    if (tmp) DeleteDC(tmp);
+    return TRUE;
+}
+
 static int test_shot(HWND hwnd, const char *path) {
     RECT rc; GetClientRect(hwnd, &rc);
     int w = rc.right - rc.left, h = rc.bottom - rc.top;
@@ -8009,6 +8103,10 @@ static int test_shot(HWND hwnd, const char *path) {
             g_brush = sb; g_brush2 = sb2; g_brush3 = sb3;
             ID2D1DCRenderTarget_Release(dcrt);
             GdiFlush();
+            /* Children last, over the scene — one snapshot that shows the whole
+             * application, so there is no second command to remember and no
+             * blind spot to forget about. */
+            if (ok) { EnumChildWindows(hwnd, snap_child, (LPARAM)mem); GdiFlush(); }
             if (ok) ok = write_bmp(path, w, h, bits);
         }
         SelectObject(mem, old);
@@ -8062,6 +8160,10 @@ static void test_dump(const char *path) {
             sidebar_kind(), main_is_conversation(), window_is_covered());
     /* Hit-box geometry, because a hit test that silently matches nothing looks
      * exactly like a hit test that is never called. */
+    /* The composer cue is painted by the native RichEdit, so `shot` cannot see
+     * it either — same reason as the natives line above. */
+    { char cue[160]; composer_cue(m, cue, sizeof cue);
+      fprintf(f, "composer_cue=\"%s\"\n", cue); }
     fprintf(f, "msgrows n=%d x=%.0f..%.0f hover=%llu listrows=%d\n", g_n_msgrows,
             g_n_msgrows ? g_msgrows[0].left : -1.0f, g_n_msgrows ? g_msgrows[0].right : -1.0f,
             (unsigned long long)g_hover_mid, g_n_listrows);
@@ -8176,6 +8278,10 @@ static void test_poll(HWND hwnd) {
         char ws[256] = "", cred[256] = "";
         sscanf(arg, "%255s %255s", ws, cred);
         if (ws[0]) { switch_workspace(hwnd, ws, cred); test_ack("ok"); } else test_ack("err");
+    } else if (!strcmp(verb, "shotfull")) {
+        /* Kept as an alias: `shot` is now the composited capture, so there is
+         * exactly one way to take a picture and it is the complete one. */
+        test_ack(test_shot(hwnd, arg) ? "ok" : "err");
     } else if (!strcmp(verb, "move")) {
         /* A real WM_MOUSEMOVE, so hover goes through the same path the mouse
          * does rather than a test-only shortcut that could drift from it. */

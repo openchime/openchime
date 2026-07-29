@@ -483,11 +483,14 @@ not thought about — so the find box appeared over the Files view's filter chip
 It now returns `NONE` for a view with no second column, and `NONE` is the enum's
 zero.
 
-*The harness could not see the bug.* `gui_drive.sh shot` renders Direct2D only,
-so a stray native child is **invisible to it** — which is why this class kept
-reaching the user rather than being caught in verification. The test dump now
-reports each child's `IsWindowVisible` alongside the three predicates, so every
-view can be checked without a screenshot:
+*The harness could not see the bug.* `gui_drive.sh shot` used to render Direct2D
+only, so a stray native child was **invisible to it** — which is why this class
+kept reaching the user rather than being caught in verification. **That is fixed:
+`shot` now composites the children on top of the scene** (see "Seeing the whole
+window" below), so a screenshot shows what the user sees. The dump reports each
+child's `IsWindowVisible` alongside the three predicates as well, because a
+boolean is a better assertion than an image when what you want to know is
+*whether* a control is shown:
 
 ```
 natives re=1 find=1 ffind=0 srch=0 pick=0 pal=0 si_ws=0 sbkind=1 conv=1 covered=0
@@ -502,6 +505,37 @@ views from the dump before it was shown to anybody.
 the Files/Pins/About tabs still left the composer's box, buttons and send arrow
 DRAWN there — an input you cannot type into, which is the thing hiding the child
 was meant to prevent. `main_is_conversation()` now decides both.
+
+## Seeing the whole window (Win32 harness)
+
+`scripts/gui_drive.sh shot <name>` produces one image of the entire application,
+Direct2D surface **and** native children. Getting there took two dead ends, both
+worth recording so nobody re-walks them:
+
+| Route | D2D content | Native children |
+|---|---|---|
+| Re-render the scene into a DC target | ✓ | **✗** |
+| `PrintWindow(PW_RENDERFULLCONTENT)` | **✗ — blank** | ✓ |
+
+The first misses children because they are separate windows. The second returns a
+blank client area because our `WM_PAINT` renders through a D2D **HWND** target
+straight to the screen and never touches the HDC Windows supplies — measured, not
+assumed: the capture was white with the RichEdit's placeholder floating in it.
+
+So `test_shot` does what the window does: render the scene, then walk
+`EnumChildWindows` and blit each visible child on top, at its real position.
+`EnumChildWindows` rather than a list of handles, because a list is one more place
+a seventh child must be registered, and forgetting is this area's recurring
+failure. Each child is asked twice — `PrintWindow` first, then `WM_PRINTCLIENT` —
+because neither works for every control class: `PrintWindow` on a *child* returned
+an empty box for the RichEdit, while `WM_PRINTCLIENT` is what a control
+implements for this purpose.
+
+**A control that paints itself must handle `WM_PRINTCLIENT` too.** The composer's
+cue text was drawn only to `GetDC(hwnd)`, so it existed on screen and nowhere
+else — the one string in the composer that users read could not be checked by any
+capture. `re_proc` now overlays it on both `WM_PAINT` and `WM_PRINTCLIENT`. Any
+future self-painted control needs the same pair.
 
 ## Typography (graphical clients) — ARCH-97
 

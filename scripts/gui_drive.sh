@@ -5,7 +5,8 @@
 #
 #   scripts/gui_drive.sh launch [ws] [user:pass]   # start the client with the hook on
 #   scripts/gui_drive.sh <cmd...>                  # send one command, wait for ack
-#   scripts/gui_drive.sh shot <name>               # render to <scratch>/<name>.bmp
+#   scripts/gui_drive.sh shotfull <name>           # WHOLE window, children included
+#   scripts/gui_drive.sh shot <name>               # D2D scene only (no children)
 #   scripts/gui_drive.sh kill
 #
 # Commands: shot <winpath> | send <text> | channel <name> | click x y |
@@ -96,6 +97,11 @@ esac
 # Convenience: `shot foo` -> render into the scratch dir and copy back as PNG-able BMP.
 if [ "$1" = "shot" ] && [ $# -eq 2 ]; then
   name="$2"; cmd="shot ${WIN_DIR}\\${name}.bmp"
+elif [ "$1" = "shotfull" ] && [ $# -eq 2 ]; then
+  # The whole window, native children included (PrintWindow/DWM). Use this by
+  # default: `shot` re-renders the D2D scene only and cannot see the composer,
+  # the find/search boxes, the sign-in fields or the emoji picker.
+  name="$2"; cmd="shotfull ${WIN_DIR}\\${name}.bmp"
 elif [ "$1" = "dump" ] && [ $# -eq 2 ]; then
   # Same convenience as `shot`. Without it a bare name is written relative to the
   # exe's cwd, the command still acks "ok", and you read a STALE file from an
@@ -114,7 +120,7 @@ for _ in $(seq 1 100); do [ -f "$LIN_DIR/ack" ] && break; sleep 0.1; done
 ack="$(cat "$LIN_DIR/ack" 2>/dev/null || echo TIMEOUT)"
 echo "ack: $ack"
 
-if [ "$1" = "shot" ] && [ $# -eq 2 ]; then
+if { [ "$1" = "shot" ] || [ "$1" = "shotfull" ]; } && [ $# -eq 2 ]; then
   cp "$LIN_DIR/${2}.bmp" "$OUT/${2}.bmp" 2>/dev/null && echo "$OUT/${2}.bmp"
 fi
 if [ "$1" = "dump" ] && [ $# -eq 2 ]; then
