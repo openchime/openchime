@@ -656,6 +656,10 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
              * one arm keeps the sidebar and the header honest for all three. */
             c->archived = e->archived;
             if (e->created_at) c->created_at = e->created_at;
+            if (e->preview) {
+                snprintf(c->preview, sizeof c->preview, "%s", e->preview);
+                c->preview_author = e->preview_author;
+            }
             free(c->topic);
             c->topic = (e->topic && e->topic[0]) ? strdup(e->topic) : NULL;
         }
@@ -663,6 +667,14 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     }
     case OC_EV_MESSAGE: {
         oc_channel *c = channel_ensure(m, e->channel_id);
+        /* Keep the list preview live. Taken BEFORE channel_append, which takes
+         * ownership of the body — after it, e->body is gone. Only for messages
+         * newer than what we last previewed, so a backfill replaying older
+         * history cannot rewind the sidebar to an old line. */
+        if (c && e->body && e->message_id >= c->high_water) {
+            snprintf(c->preview, sizeof c->preview, "%s", e->body);
+            c->preview_author = e->author_id;
+        }
         if (c && channel_append(c, e->author_id, e->author_name, e->message_id, e->server_time, &e->body)) {
             /* Count as unread only messages from others past the read marker; a
              * frontend clears this by marking the focused channel read. */

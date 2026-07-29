@@ -226,7 +226,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->flist);
     free(r->ch_name);
     free(r->ch_topic);
-    for (size_t i = 0; i < r->n_chlist; i++) { free(r->chlist[i].name); free(r->chlist[i].topic); }
+    for (size_t i = 0; i < r->n_chlist; i++) { free(r->chlist[i].name); free(r->chlist[i].topic); free(r->chlist[i].preview); }
     free(r->chlist);
     for (size_t i = 0; i < r->n_ulist; i++) { free(r->ulist[i].email); free(r->ulist[i].display_name); }
     free(r->ulist);
@@ -1732,7 +1732,16 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
          * otherwise a cache-less client shows "direct message" until it opens one. */
         "  COALESCE((SELECT m2.user_id FROM channel_members m2 "
         "              WHERE m2.channel_id=c.id AND m2.user_id<>?1 LIMIT 1), ?1), "
-        "  c.topic, c.archived_at_ms, c.created_at_ms "
+        "  c.topic, c.archived_at_ms, c.created_at_ms, "
+        /* The newest top-level message, for the list preview. Tombstones are
+         * skipped: "(deleted)" is not a useful thing to show as the latest
+         * activity, and the row below it usually is. */
+        "  (SELECT substr(COALESCE(x.body,''),1,?2) FROM messages x "
+        "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.deleted_at_ms IS NULL "
+        "     ORDER BY x.id DESC LIMIT 1), "
+        "  COALESCE((SELECT x.author_id FROM messages x "
+        "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.deleted_at_ms IS NULL "
+        "     ORDER BY x.id DESC LIMIT 1),0) "
         "FROM channels c WHERE "
         "  (c.kind='channel' AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1))) "
         "  OR (c.kind='dm' AND EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1)) "
@@ -1763,6 +1772,9 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         arr[n].topic           = (tp && tp[0]) ? strdup((const char *)tp) : NULL;
         arr[n].archived        = (uint8_t)(sqlite3_column_type(st, 9) != SQLITE_NULL);
         arr[n].created_at      = (uint64_t)sqlite3_column_int64(st, 10);
+        const unsigned char *pv = sqlite3_column_text(st, 11);
+        arr[n].preview         = (pv && pv[0]) ? strdup((const char *)pv) : NULL;
+        arr[n].preview_author  = (uint64_t)sqlite3_column_int64(st, 12);
         n++;
     }
     sqlite3_finalize(st);

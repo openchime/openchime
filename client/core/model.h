@@ -63,6 +63,10 @@ typedef struct {
     char    *topic;        /* heap; NULL = none (REQ-034) */
     uint8_t  archived;     /* read-only; hidden from the default list (REQ-035) */
     uint64_t created_at;   /* from CHANNEL_INFO; shown in the About surface */
+    /* The newest message, for a scannable list. Seeded by CHANNEL_LIST and kept
+     * live by BROADCAST — otherwise it would be right only at connect. */
+    char     preview[128];
+    uint64_t preview_author;
     uint64_t high_water;   /* dedup mark: ignore message_id <= this (ARCH-45) */
     uint64_t read_marker;  /* high_water as of the last mark-read; drives unread */
     int      unread;       /* messages from others since the last mark-read */

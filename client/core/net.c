@@ -452,6 +452,12 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (e->body) { memcpy(e->body, ents[i].name.ptr, ents[i].name.len); e->body[ents[i].name.len] = '\0'; }
                 e->archived = ents[i].archived;
                 e->created_at = ents[i].created_at;
+                e->preview_author = ents[i].preview_author;
+                e->preview = malloc(ents[i].preview.len + 1);
+                if (e->preview) {
+                    if (ents[i].preview.len) memcpy(e->preview, ents[i].preview.ptr, ents[i].preview.len);
+                    e->preview[ents[i].preview.len] = '\0';
+                }
                 e->topic = malloc(ents[i].topic.len + 1);
                 if (e->topic) { memcpy(e->topic, ents[i].topic.ptr, ents[i].topic.len); e->topic[ents[i].topic.len] = '\0'; }
                 oc_queue_push(to_ui, e);

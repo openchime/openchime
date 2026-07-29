@@ -11,6 +11,7 @@ void oc_ev_free(oc_ev *e) {
     if (!e) return;
     free(e->body);
     free(e->topic);
+    free(e->preview);
     free(e);
 }
 

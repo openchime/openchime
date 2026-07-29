@@ -327,6 +327,7 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_CHUP_ARCHIVE   2u   /* owner/admin */
 #define OC_CHUP_UNARCHIVE 3u   /* owner/admin */
 #define OC_MAX_TOPIC      250u /* bytes; Slack's cap, and a topic is one header line */
+#define OC_MAX_PREVIEW    120u /* bytes of last-message preview in CHANNEL_LIST */
 
 /* Pin op (REQ-230, ARCH-90) and the per-channel cap. A pin belongs to the
  * channel, not to the pinner: pinning an already-pinned message is a no-op
@@ -461,7 +462,10 @@ typedef struct { uint64_t channel_id; uint64_t user_id; } oc_channel_member_op; 
  * from this one file (ARCH-61), so they change together. */
 typedef struct { uint64_t channel_id; oc_slice name; uint8_t is_public; uint8_t joined; uint8_t kind;
                  uint64_t last_message_at; uint32_t unread; uint64_t peer_id;
-                 oc_slice topic; uint8_t archived; uint64_t created_at; } oc_channel_list_entry;
+                 oc_slice topic; uint8_t archived; uint64_t created_at;
+                 /* The newest top-level message, for a scannable list: a client
+                  * that caches nothing (ARCH-88) has no other way to show one. */
+                 oc_slice preview; uint64_t preview_author; } oc_channel_list_entry;
 typedef struct { uint64_t user_id; } oc_open_dm;
 /* Incoming-webhook management (REQ-170). CREATE_WEBHOOK asks for a token scoped
  * to a channel; WEBHOOK_INFO returns the id + the raw 32-byte token (shown once,

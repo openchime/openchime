@@ -553,6 +553,11 @@ On success the daemon replies **`CHANNEL_INFO`** to the actor and **fans the sam
 frame to every other member** — a rename or archive changes what everyone's
 sidebar should say. `CHANNEL_INFO` therefore carries `topic` and `archived`:
 
+`CHANNEL_LIST` entries also carry a **`preview`** (the newest top-level message,
+truncated to 120 bytes, tombstones skipped) and its **`preview_author`**. A client
+that caches nothing (ARCH-88) has no other way to show a conversation list you can
+skim — and it is per *channel*, not per DM, so the ordinary sidebar can use it too.
+
 > **Layout note.** `CHANNEL_INFO`'s `peer_id` used to be an *optional trailing*
 > field, written only for DMs. That trick does not survive a second optional
 > field, so as of this change the layout is **fixed**: `peer_id` is always

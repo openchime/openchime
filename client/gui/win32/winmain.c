@@ -4210,26 +4210,26 @@ static void draw_admin(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
     else                          draw_audit(rt, m, body, 1);
 }
 
-/* The DMs view (rail). It used to be Home with the Channels section folded — one
- * line of difference, which is a bookmark, not a destination.
+/* The DMs list (second column, in the DMs view).
  *
- * Slack's earns its place by being a different KIND of list: person-centric,
- * every row a human, including people you have never messaged — so it doubles as
- * the "start a conversation" surface. This does the same over the roster we
- * already hold: existing conversations first (most recent), then everyone else.
- * Picking anyone opens the DM, creating it if it did not exist, which is the
- * only discoverable way to start one that does not require knowing a name to
- * type into a prompt.
+ * Keyed on the DM **channel**, not on a person. That distinction is invisible
+ * today — every DM has exactly one peer — and decisive the moment group DMs land
+ * (REQ-056): a three-person conversation has no single person to hang a row off,
+ * which is why Slack's rows carry several names. Our schema already agrees:
+ * migration 0019 keys a DM on `dm_key`, the sorted participant SET, so a
+ * person-keyed list would have been a dead end against our own storage.
  *
- * The sidebar still shows the DM section beside it, so switching between open
- * conversations does not mean coming back here. */
-static struct { D2D1_RECT_F r; uint64_t uid; } g_dmrows[256];
+ * Starting a new conversation is the compose button, not a row per human — the
+ * reference lists conversations only. */
+static struct { D2D1_RECT_F r; uint64_t cid; } g_dmrows[256];
 static int g_n_dmrows;
 static uint64_t g_dm_hover;
 /* A DM we asked the server to open; selected as soon as it appears. Without
  * this, picking someone created the conversation and left you looking at the
  * list, with the new row somewhere in the sidebar. */
 static uint64_t g_dm_pending;
+static int g_dm_compose;              /* the "start a conversation" picker is up */
+static D2D1_RECT_F g_dm_compose_btn;
 
 /* The DM channel with `uid`, or NULL. */
 static const oc_channel *dm_with(const oc_model *m, uint64_t uid) {
@@ -4239,77 +4239,136 @@ static const oc_channel *dm_with(const oc_model *m, uint64_t uid) {
     return NULL;
 }
 
-static void draw_dms_view(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
-    fill(rt, rf(reg.left, reg.top, reg.right, reg.top + HEADER_H), OC_COL_HEADER);
-    draw_text(rt, "Direct messages", g_hdr,
-              rf(reg.left + 20, reg.top, reg.right - 20, reg.top + HEADER_H), OC_COL_TEXT);
-    fill(rt, rf(reg.left, reg.top + HEADER_H - 1, reg.right, reg.top + HEADER_H), OC_COL_BORDER);
+/* "15 mins" / "Yesterday" / "12 Jul" — a DM list is scanned, and an absolute
+ * timestamp on every row makes it a table to read rather than a list to skim. */
+static void rel_time(uint64_t ms, char *out, size_t cap) {
+    out[0] = '\0';
+    if (!ms) return;
+    time_t t = (time_t)(ms / 1000), now = time(NULL);
+    double d = difftime(now, t);
+    if (d < 60)         snprintf(out, cap, "now");
+    else if (d < 3600)  snprintf(out, cap, "%d min", (int)(d / 60));
+    else if (d < 86400) snprintf(out, cap, "%dh", (int)(d / 3600));
+    else if (d < 172800) snprintf(out, cap, "Yesterday");
+    else {
+        struct tm tv;
+        if (oc_localtime_r(&t, &tv)) strftime(out, cap, "%d %b", &tv);
+    }
+}
 
-    D2D1_RECT_F body = rf(reg.left, reg.top + HEADER_H, reg.right, reg.bottom);
+static void draw_dm_list(ID2D1RenderTarget *rt, const oc_model *m, float h) {
+    float x0 = RAIL_W, x1 = RAIL_W + SIDEBAR_W;
+    fill(rt, rf(x0, 0, x1, h), OC_COL_SIDEBAR);
+
+    draw_text(rt, "Direct messages", g_hdr, rf(x0 + 16, 0, x1 - 40, HEADER_H), OC_COL_TEXT);
+    g_dm_compose_btn = rf(x1 - 36, 16, x1 - 12, 40);
+    draw_lucide(rt, OC_ICON_SQUARE_PEN, rf(g_dm_compose_btn.left + 2, g_dm_compose_btn.top + 2,
+                                           g_dm_compose_btn.right - 2, g_dm_compose_btn.bottom - 2),
+                OC_COL_MUTED);
+
     g_n_dmrows = 0;
-    if (m->n_users == 0) { overlay_empty(rt, body, "Loading people\u2026"); return; }
-
-    /* Two passes so people you already talk to come first, each pass in the
-     * order the roster gives — recency for the first, which is what a DM inbox
-     * is sorted by. */
-    float y = body.top + 8;
-    for (int pass = 0; pass < 2; pass++) {
-        int wrote_header = 0;
-        for (size_t i = 0; i < m->n_users && y < body.bottom; i++) {
-            const oc_member *u = &m->users[i];
-            if (u->disabled) continue;
-            const oc_channel *dm = dm_with(m, u->user_id);
-            int have = (dm != NULL);
-            if ((pass == 0) != have) continue;
-            if (!wrote_header) {
-                draw_text(rt, pass == 0 ? "CONVERSATIONS" : "EVERYONE ELSE", g_small,
-                          rf(body.left + 20, y + 4, body.right - 20, y + 24), OC_COL_FAINT);
-                y += 26;
-                wrote_header = 1;
-            }
-            D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + 44);
-            if (g_dm_hover == u->user_id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
-
-            D2D1_ELLIPSE av = { { row.left + 28, y + 22 }, 16, 16 };
-            ID2D1RenderTarget_FillEllipse(rt, &av, paint_with(AVPAL[u->user_id % 6]));
-            char ini[2] = { (char)(u->name[0] >= 'a' && u->name[0] <= 'z' ? u->name[0] - 32 : u->name[0]), 0 };
-            IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
-            draw_text(rt, ini, g_ui, rf(row.left + 12, y + 6, row.left + 44, y + 38), 0xFFFFFF);
-            IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
-            draw_presence_dot(rt, row.left + 40, y + 34, 4.5f,
-                              oc_model_presence_of(m, u->user_id), OC_COL_BASE);
-
-            char nm[80];
-            snprintf(nm, sizeof nm, "%s%s", u->name[0] ? u->name : "user",
-                     u->user_id == m->user_id ? " (you)" : "");
-            draw_text(rt, nm, g_ui, rf(row.left + 56, y + 3, row.right - 90, y + 25), OC_COL_TEXT);
-
-            /* What the row is FOR: unread if any, else the last activity, else an
-             * invitation. A row that says nothing is a row you cannot act on. */
-            char sub[96] = "";
-            if (have && dm->unread > 0)
-                snprintf(sub, sizeof sub, "%d unread", dm->unread);
-            else if (have && dm->last_message_at) {
-                time_t t = (time_t)(dm->last_message_at / 1000);
-                struct tm tv; char w[24] = "";
-                if (oc_localtime_r(&t, &tv)) strftime(w, sizeof w, "%d %b", &tv);
-                snprintf(sub, sizeof sub, "Last message %s", w);
-            } else if (!have) {
-                snprintf(sub, sizeof sub, "%s", u->user_id == m->user_id
-                         ? "Message yourself \u2014 notes, links, reminders"
-                         : "Start a conversation");
-            }
-            if (sub[0])
-                draw_text(rt, sub, g_small, rf(row.left + 56, y + 23, row.right - 90, y + 41),
-                          (have && dm->unread > 0) ? OC_COL_ACCENT : OC_COL_FAINT);
-
-            if (g_n_dmrows < (int)(sizeof g_dmrows / sizeof g_dmrows[0])) {
-                g_dmrows[g_n_dmrows].r = row;
-                g_dmrows[g_n_dmrows].uid = u->user_id;
-                g_n_dmrows++;
-            }
-            y += 48;
+    float y = HEADER_H + 6;
+    int any = 0;
+    /* Newest first: a DM list is ordered by when you last spoke, not by name. */
+    for (;;) {
+        const oc_channel *best = NULL;
+        for (size_t i = 0; i < m->n_channels; i++) {
+            const oc_channel *c = &m->channels[i];
+            if (c->kind != OC_CHANNEL_KIND_DM) continue;
+            int taken = 0;
+            for (int k = 0; k < g_n_dmrows; k++) if (g_dmrows[k].cid == c->channel_id) taken = 1;
+            if (taken) continue;
+            if (!best || c->last_message_at > best->last_message_at) best = c;
         }
+        if (!best || y > h - 40) break;
+        any = 1;
+
+        D2D1_RECT_F row = rf(x0 + 6, y, x1 - 6, y + 52);
+        if (g_dm_hover == best->channel_id || g_sel == best->channel_id)
+            fill_round(rt, row, 6.0f, g_sel == best->channel_id ? OC_COL_SELECT : OC_COL_HOVER);
+
+        const char *nm = oc_model_user_name((oc_model *)m, best->peer_id);
+        if (!nm || !nm[0]) nm = "user";
+        D2D1_ELLIPSE av = { { row.left + 24, y + 26 }, 15, 15 };
+        ID2D1RenderTarget_FillEllipse(rt, &av, paint_with(AVPAL[best->peer_id % 6]));
+        char ini[2] = { (char)(nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]), 0 };
+        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, ini, g_ui, rf(row.left + 9, y + 11, row.left + 39, y + 41), 0xFFFFFF);
+        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+        draw_presence_dot(rt, row.left + 35, y + 37, 4.5f,
+                          oc_model_presence_of(m, best->peer_id), OC_COL_SIDEBAR);
+
+        int unread = best->unread > 0;
+        char label[80];
+        snprintf(label, sizeof label, "%s%s", nm,
+                 best->peer_id == m->user_id ? " (you)" : "");
+        draw_text(rt, label, unread ? g_ui_b : g_ui,
+                  rf(row.left + 48, y + 5, row.right - 60, y + 25), OC_COL_TEXT);
+
+        char when[24];
+        rel_time(best->last_message_at, when, sizeof when);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        draw_text(rt, when, g_small, rf(row.left + 48, y + 6, row.right - 10, y + 24),
+                  unread ? OC_COL_ACCENT : OC_COL_FAINT);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+        /* The preview, prefixed the way the reference does it so you can tell
+         * whose turn it is at a glance. */
+        char prev[160] = "";
+        if (best->preview[0])
+            snprintf(prev, sizeof prev, "%s%s",
+                     best->preview_author == m->user_id ? "You: " : "", best->preview);
+        draw_text(rt, prev[0] ? prev : "No messages yet", g_small,
+                  rf(row.left + 48, y + 25, row.right - 10, y + 45),
+                  unread ? OC_COL_TEXT : OC_COL_FAINT);
+
+        if (g_n_dmrows < (int)(sizeof g_dmrows / sizeof g_dmrows[0])) {
+            g_dmrows[g_n_dmrows].r = row;
+            g_dmrows[g_n_dmrows].cid = best->channel_id;
+            g_n_dmrows++;
+        }
+        y += 56;
+    }
+    if (!any)
+        draw_text(rt, "No conversations yet \u2014 use the compose button.", g_small_w,
+                  rf(x0 + 16, HEADER_H + 12, x1 - 16, HEADER_H + 60), OC_COL_FAINT);
+}
+
+/* The "start a conversation" picker: every person, which is what the compose
+ * button is FOR. Not the resting state of the DMs view — the reference lists
+ * conversations, and a roster masquerading as an inbox was my mistake. */
+static struct { D2D1_RECT_F r; uint64_t uid; } g_pickrows[256];
+static int g_n_pickrows;
+
+static void draw_dm_compose(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    D2D1_RECT_F body = overlay_header(rt, reg, "New direct message");
+    g_n_pickrows = 0;
+    float y = body.top + 8;
+    for (size_t i = 0; i < m->n_users && y < body.bottom; i++) {
+        const oc_member *u = &m->users[i];
+        if (u->disabled) continue;
+        D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + 44);
+        if (g_dm_hover == u->user_id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
+        D2D1_ELLIPSE av = { { row.left + 28, y + 22 }, 16, 16 };
+        ID2D1RenderTarget_FillEllipse(rt, &av, paint_with(AVPAL[u->user_id % 6]));
+        char ini[2] = { (char)(u->name[0] >= 'a' && u->name[0] <= 'z' ? u->name[0] - 32 : u->name[0]), 0 };
+        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, ini, g_ui, rf(row.left + 12, y + 6, row.left + 44, y + 38), 0xFFFFFF);
+        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+        char nm[96];
+        snprintf(nm, sizeof nm, "%s%s", u->name[0] ? u->name : "user",
+                 u->user_id == m->user_id ? " (you)" : "");
+        draw_text(rt, nm, g_ui, rf(row.left + 56, y + 3, row.right - 20, y + 25), OC_COL_TEXT);
+        draw_text(rt, u->user_id == m->user_id
+                      ? "Message yourself \u2014 notes, links, reminders"
+                      : (dm_with(m, u->user_id) ? "Open the conversation" : "Start a conversation"),
+                  g_small, rf(row.left + 56, y + 23, row.right - 20, y + 41), OC_COL_FAINT);
+        if (g_n_pickrows < (int)(sizeof g_pickrows / sizeof g_pickrows[0])) {
+            g_pickrows[g_n_pickrows].r = row;
+            g_pickrows[g_n_pickrows].uid = u->user_id;
+            g_n_pickrows++;
+        }
+        y += 48;
     }
 }
 
@@ -4352,9 +4411,10 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         float main_x = RAIL_W + SIDEBAR_W;
         float members = (g_show_members && m->authed) ? MEMBERS_W : 0;
         float main_r = W - members, main_w = main_r - main_x;
-        draw_sidebar(rt, m, H);
+        if (g_view == VIEW_DMS) draw_dm_list(rt, m, H); else draw_sidebar(rt, m, H);
         const oc_channel *selc0 = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
-        int dm_index0 = (g_view == VIEW_DMS && !(selc0 && selc0->kind == OC_CHANNEL_KIND_DM));
+        int dm_index0 = (g_view == VIEW_DMS &&
+                         (g_dm_compose || !(selc0 && selc0->kind == OC_CHANNEL_KIND_DM)));
         if (!dm_index0) draw_header(rt, m, main_x, main_w);
         float th = dm_index0 ? 0 : draw_tabbar(rt, m, main_x, main_w);
         float bh = draw_banner(rt, m, main_x, main_w, th);  /* pushes the transcript down */
@@ -4364,9 +4424,14 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
              * rather than Home with a section folded. */
             const oc_channel *selc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
             int dm_index = (g_view == VIEW_DMS &&
-                            !(selc && selc->kind == OC_CHANNEL_KIND_DM));
-            if (dm_index) draw_dms_view(rt, m, rf(main_x, 0, main_r, H - g_composer_h));
-            else draw_transcript(rt, m, rf(main_x, HEADER_H + th + bh, main_r, H - g_composer_h));
+                            (g_dm_compose || !(selc && selc->kind == OC_CHANNEL_KIND_DM)));
+            if (dm_index) {
+                if (g_dm_compose) draw_dm_compose(rt, m, rf(main_x, 0, main_r, H - g_composer_h));
+                else overlay_empty(rt, rf(main_x, 0, main_r, H - g_composer_h),
+                                   "Pick a conversation, or start a new one.");
+            } else {
+                draw_transcript(rt, m, rf(main_x, HEADER_H + th + bh, main_r, H - g_composer_h));
+            }
         }
         draw_composer(rt, main_x, main_w, H);
         draw_autocomplete(rt, main_x, main_w, H);
@@ -5560,15 +5625,26 @@ static int on_click(HWND hwnd, int x, int y) {
     /* The Files view has no sidebar, so its clicks must be served before the
      * transcript-only guard below. */
     if (g_view == VIEW_FILES && files_click(hwnd, x, y)) return 1;
-    /* A person in the DMs index: open the conversation, creating it if needed. */
-    for (int i = 0; i < g_n_dmrows; i++)
-        if (in_rect(g_dmrows[i].r, x, y)) {
-            const oc_model *dm_m = model();
-            const oc_channel *ex = dm_m ? dm_with(dm_m, g_dmrows[i].uid) : NULL;
-            if (ex) select_channel(ex->channel_id);
-            else { g_dm_pending = g_dmrows[i].uid; oc_client_open_dm(g_client, g_dmrows[i].uid); }
-            return 1;
-        }
+    if (g_view == VIEW_DMS) {
+        if (in_rect(g_dm_compose_btn, x, y)) { g_dm_compose = !g_dm_compose; return 1; }
+        for (int i = 0; i < g_n_dmrows; i++)
+            if (in_rect(g_dmrows[i].r, x, y)) {
+                g_dm_compose = 0;
+                select_channel(g_dmrows[i].cid);
+                return 1;
+            }
+        /* A person in the compose picker: open the conversation, creating it if
+         * it does not exist yet. */
+        for (int i = 0; i < g_n_pickrows; i++)
+            if (in_rect(g_pickrows[i].r, x, y)) {
+                const oc_model *dm_m = model();
+                const oc_channel *ex = dm_m ? dm_with(dm_m, g_pickrows[i].uid) : NULL;
+                g_dm_compose = 0;
+                if (ex) select_channel(ex->channel_id);
+                else { g_dm_pending = g_pickrows[i].uid; oc_client_open_dm(g_client, g_pickrows[i].uid); }
+                return 1;
+            }
+    }
     /* Everything below is only meaningful in the transcript views. */
     if (!view_has_sidebar()) return 1;
 
@@ -7477,7 +7553,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * somewhere in the sidebar. */
             if (g_dm_pending) {
                 const oc_channel *nd = dm_with(m, g_dm_pending);
-                if (nd) { g_dm_pending = 0; select_channel(nd->channel_id); InvalidateRect(hwnd, NULL, FALSE); }
+                if (nd) { g_dm_pending = 0; g_dm_compose = 0; select_channel(nd->channel_id);
+                          InvalidateRect(hwnd, NULL, FALSE); }
             }
             /* Persist a settled move. WM_EXITSIZEMOVE covers a drag, but not a
              * programmatic move, and nothing covers being killed — a debounce
@@ -7889,7 +7966,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             /* DMs-index row hover. */
             uint64_t dh = 0;
             for (int i = 0; i < g_n_dmrows; i++)
-                if (in_rect(g_dmrows[i].r, (float)mx, (float)my)) { dh = g_dmrows[i].uid; break; }
+                if (in_rect(g_dmrows[i].r, (float)mx, (float)my)) { dh = g_dmrows[i].cid; break; }
+            for (int i = 0; i < g_n_pickrows && !dh; i++)
+                if (in_rect(g_pickrows[i].r, (float)mx, (float)my)) { dh = g_pickrows[i].uid; break; }
             if (dh != g_dm_hover) { g_dm_hover = dh; InvalidateRect(hwnd, NULL, FALSE); }
             /* Tab strip hover. */
             int th2 = -1;

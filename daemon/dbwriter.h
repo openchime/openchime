@@ -282,6 +282,8 @@ typedef struct {
     uint64_t last_message_at;
     uint32_t unread;
     uint64_t peer_id;    /* DM: the other participant, so a client can name it */
+    char    *preview;       /* heap; newest top-level body, truncated */
+    uint64_t preview_author;
 } oc_channel_row;
 
 /* One row in a NOTIFY_PREFS result (REQ-130): a channel and its level. */

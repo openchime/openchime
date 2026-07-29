@@ -106,6 +106,8 @@ typedef struct {
                               every fixed buffer here is smaller. */
     uint8_t  archived;     /* CHANNEL: the channel is archived (REQ-035) */
     uint64_t created_at;   /* CHANNEL (from CHANNEL_INFO): when it was created */
+    char    *preview;      /* heap; CHANNEL: newest message text (REQ-050 sidebar) */
+    uint64_t preview_author;
     uint64_t size;         /* FILE: byte size (REQ-143) */
     uint64_t attach_id;    /* FILE: the attachment's own id */
     uint8_t  reclaimed;    /* FILE: bytes reclaimed; the row is a tombstone */

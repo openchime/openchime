@@ -1780,6 +1780,8 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             ents[i].topic = oc_slice_str(r->chlist[i].topic ? r->chlist[i].topic : "");
             ents[i].archived = r->chlist[i].archived;
             ents[i].created_at = r->chlist[i].created_at;
+            ents[i].preview = oc_slice_str(r->chlist[i].preview ? r->chlist[i].preview : "");
+            ents[i].preview_author = r->chlist[i].preview_author;
         }
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_channel_list cl = { (uint16_t)n, ents };
