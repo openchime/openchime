@@ -4150,13 +4150,18 @@ static void draw_modal(ID2D1RenderTarget *rt, const oc_model *m, float W, float 
  * and a native child composites above Direct2D, so leaving them shown would
  * punch them straight through the sign-in card. `shell_visible` is the drawing
  * question; this is the input/child-window question. */
-static int view_has_sidebar(void) { return g_view == VIEW_HOME || g_view == VIEW_DMS; }
+/* Activity joins Home and DMs: its list is the second column and the middle one
+ * stays the conversation (ARCH-94), so clicking an item shows you the thread
+ * from that point rather than replacing the transcript with a page. */
+static int view_has_sidebar(void) {
+    return g_view == VIEW_HOME || g_view == VIEW_DMS || g_view == VIEW_ACTIVITY;
+}
 
 /* Whether to PAINT the shell chrome. During sign-in that is true only when a
  * workspace is still live behind the card. */
 static int shell_visible(void) {
     if (g_view == VIEW_SIGNIN) return g_si_overlay && g_client != NULL;
-    return g_view == VIEW_HOME || g_view == VIEW_DMS;
+    return g_view == VIEW_HOME || g_view == VIEW_DMS || g_view == VIEW_ACTIVITY;
 }
 
 /* The Admin view (rail). Workspace-scoped, so it lives in the MIDDLE column by
@@ -4391,46 +4396,96 @@ static D2D1_RECT_F view_header(ID2D1RenderTarget *rt, D2D1_RECT_F reg, const cha
     return rf(reg.left, reg.top + HEADER_H, reg.right, reg.bottom);
 }
 
-/* The Activity feed (REQ-139): what involved you, across every channel. */
-static void draw_activity(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
-    D2D1_RECT_F body = view_header(rt, reg, "Activity",
-                                   "Mentions, reactions to your messages, and replies to your threads");
+/* Activity lives in the SECOND column and the conversation stays in the main one
+ * (ARCH-94): the list is navigation, and clicking an item should show you the
+ * conversation from that point — not replace it with a page you then have to
+ * leave. Same shape as the DM list, for the same reason.
+ *
+ * The filter is over `kind`, which is all the wire carries; Slack additionally
+ * splits DMs out, which for us is a property of the channel rather than of the
+ * activity, and is left until it earns its place. */
+enum { AF_ALL = 0, AF_MENTIONS, AF_REACTIONS, AF_THREADS, AF_COUNT };
+static int g_act_filter;
+static D2D1_RECT_F g_act_filters[AF_COUNT];
+static uint64_t g_act_selected;
+
+static int act_passes(const oc_activity_view *a) {
+    switch (g_act_filter) {
+        case AF_MENTIONS:  return a->kind == OC_ACT_MENTION;
+        case AF_REACTIONS: return a->kind == OC_ACT_REACTION;
+        case AF_THREADS:   return a->kind == OC_ACT_REPLY;
+        default:           return 1;
+    }
+}
+
+static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h) {
+    float x0 = RAIL_W, x1 = RAIL_W + SIDEBAR_W;
+    fill(rt, rf(x0, 0, x1, h), OC_COL_SIDEBAR);
+    draw_text(rt, "Activity", g_hdr, rf(x0 + 16, 0, x1 - 12, HEADER_H), OC_COL_TEXT);
+
+    static const char *L[AF_COUNT] = { "All", "Mentions", "Reactions", "Threads" };
+    float fx = x0 + 12, fy = HEADER_H - 2;
+    for (int i = 0; i < AF_COUNT; i++) {
+        float fw = text_width(L[i], g_small) + 16;
+        D2D1_RECT_F b = rf(fx, fy, fx + fw, fy + 22);
+        int on = (g_act_filter == i);
+        if (on) fill_round(rt, b, 6.0f, OC_COL_ACCENT);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, L[i], g_small, b, on ? 0xFFFFFF : OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_act_filters[i] = b;
+        fx = b.right + 4;
+    }
+
     g_n_listrows = 0;
-    if (m->activity_loading) { overlay_empty(rt, body, "Loading\u2026"); return; }
-    if (m->n_activity == 0) {
-        overlay_empty(rt, body, "Nothing yet. When someone mentions you, reacts to "
-                                "your message or replies to your thread, it lands here.");
+    float y = fy + 30;
+    if (m->activity_loading) {
+        draw_text(rt, "Loading\u2026", g_small, rf(x0 + 16, y + 8, x1 - 12, y + 30), OC_COL_FAINT);
         return;
     }
-    float y = body.top + 8;
-    for (size_t i = 0; i < m->n_activity && y < body.bottom; i++) {
+    int shown = 0;
+    for (size_t i = 0; i < m->n_activity && y < h - 40; i++) {
         const oc_activity_view *a = &m->activity[i];
-        D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + 52);
-        if (g_listrow_hover == a->message_id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
-        /* Newer than the last time this view was opened — the whole of what the
-         * watermark buys us (ARCH-95). */
+        if (!act_passes(a)) continue;
+        shown++;
+        D2D1_RECT_F row = rf(x0 + 6, y, x1 - 6, y + 74);
+        if (g_act_selected == a->message_id)      fill_round(rt, row, 6.0f, OC_COL_SELECT);
+        else if (g_listrow_hover == a->message_id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
+        /* Arrived since you last opened the feed — all the watermark buys us. */
         if (a->at > m->activity_seen)
-            fill(rt, rf(row.left, row.top + 4, row.left + 3, row.bottom - 4), OC_COL_ACCENT);
-
-        int icon = a->kind == OC_ACT_MENTION ? OC_ICON_AT
-                 : a->kind == OC_ACT_REACTION ? OC_ICON_SMILE : OC_ICON_DMS;
-        draw_lucide(rt, icon, rf(row.left + 12, y + 8, row.left + 32, y + 28), OC_COL_MUTED);
+            fill(rt, rf(row.left, row.top + 6, row.left + 3, row.bottom - 6), OC_COL_ACCENT);
 
         const char *who = oc_model_user_name((oc_model *)m, a->actor_id);
+        D2D1_ELLIPSE av = { { row.left + 26, y + 20 }, 13, 13 };
+        ID2D1RenderTarget_FillEllipse(rt, &av, paint_with(AVPAL[a->actor_id % 6]));
+        char ini[2] = { (char)((who && who[0] >= 'a' && who[0] <= 'z') ? who[0] - 32
+                               : (who && who[0]) ? who[0] : '?'), 0 };
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, ini, g_small, rf(row.left + 13, y + 8, row.left + 39, y + 34), 0xFFFFFF);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+        char when[24]; rel_time(a->at, when, sizeof when);
+        draw_text(rt, (who && who[0]) ? who : "someone", g_ui_b,
+                  rf(row.left + 46, y + 4, row.right - 56, y + 24), OC_COL_TEXT);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        draw_text(rt, when, g_small, rf(row.left + 46, y + 5, row.right - 8, y + 23), OC_COL_FAINT);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+        /* What kind, and where — the line Slack puts under the name. */
         const oc_channel *ch = oc_model_channel((oc_model *)m, a->channel_id);
-        char head[220], when[24];
-        rel_time(a->at, when, sizeof when);
-        snprintf(head, sizeof head, "%s %s%s%s \u00B7 %s",
-                 (who && who[0]) ? who : "someone",
-                 a->kind == OC_ACT_MENTION  ? "mentioned you"
-                 : a->kind == OC_ACT_REACTION ? "reacted to your message"
-                                              : "replied to your thread",
-                 (ch && ch->name && ch->name[0]) ? " in #" : "",
-                 (ch && ch->name && ch->name[0]) ? ch->name : "",
-                 when);
-        draw_text(rt, head, g_ui, rf(row.left + 40, y + 4, row.right - 20, y + 24), OC_COL_TEXT);
-        draw_text(rt, a->text ? a->text : "", g_small,
-                  rf(row.left + 40, y + 24, row.right - 20, y + 46), OC_COL_FAINT);
+        int icon = a->kind == OC_ACT_MENTION ? OC_ICON_AT
+                 : a->kind == OC_ACT_REACTION ? OC_ICON_SMILE : OC_ICON_DMS;
+        draw_lucide(rt, icon, rf(row.left + 46, y + 25, row.left + 60, y + 39), OC_COL_FAINT);
+        char whereline[128];
+        snprintf(whereline, sizeof whereline, "%s in %s%s",
+                 a->kind == OC_ACT_MENTION ? "Mention" :
+                 a->kind == OC_ACT_REACTION ? "Reaction" : "Thread",
+                 (ch && ch->name && ch->name[0]) ? "#" : "",
+                 (ch && ch->name && ch->name[0]) ? ch->name : "a conversation");
+        draw_text(rt, whereline, g_small, rf(row.left + 64, y + 24, row.right - 8, y + 42),
+                  OC_COL_FAINT);
+        draw_text(rt, a->text ? a->text : "", g_small_w,
+                  rf(row.left + 12, y + 44, row.right - 8, y + 72), OC_COL_MUTED);
 
         if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
             g_listrows[g_n_listrows].row = row;
@@ -4439,8 +4494,13 @@ static void draw_activity(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F 
             g_listrows[g_n_listrows].cid = a->channel_id;
             g_n_listrows++;
         }
-        y += 56;
+        y += 78;
     }
+    if (!shown)
+        draw_text(rt, m->n_activity ? "Nothing of that kind."
+                                    : "Nothing yet. Mentions, reactions to your messages "
+                                      "and replies to your threads land here.",
+                  g_small_w, rf(x0 + 16, y + 8, x1 - 12, y + 80), OC_COL_FAINT);
 }
 
 /* Saved items — the Later view (REQ-231). */
@@ -4532,7 +4592,9 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         float main_x = RAIL_W + SIDEBAR_W;
         float members = (g_show_members && m->authed) ? MEMBERS_W : 0;
         float main_r = W - members, main_w = main_r - main_x;
-        if (g_view == VIEW_DMS) draw_dm_list(rt, m, H); else draw_sidebar(rt, m, H);
+        if (g_view == VIEW_DMS)           draw_dm_list(rt, m, H);
+        else if (g_view == VIEW_ACTIVITY) draw_activity_list(rt, m, H);
+        else                              draw_sidebar(rt, m, H);
         const oc_channel *selc0 = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
         int dm_index0 = (g_view == VIEW_DMS &&
                          (g_dm_compose || !(selc0 && selc0->kind == OC_CHANNEL_KIND_DM)));
@@ -4565,7 +4627,6 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         g_banner_on = 0;
         D2D1_RECT_F reg = rf(RAIL_W, 0, W, H);
         switch (g_view) {
-            case VIEW_ACTIVITY:      draw_activity(rt, m, reg); break;
             case VIEW_FILES:         draw_files_view(rt, m, reg); break;
             case VIEW_LATER:         draw_later(rt, m, reg); break;
             case VIEW_ADMIN:         draw_admin(rt, m, reg); break;
@@ -5771,9 +5832,23 @@ static int on_click(HWND hwnd, int x, int y) {
     /* The Files view has no sidebar, so its clicks must be served before the
      * transcript-only guard below. */
     if (g_view == VIEW_FILES && files_click(hwnd, x, y)) return 1;
-    /* Activity / Later rows: the action button first, then the row itself, which
-     * takes you to the message in its channel — the point of both views. */
-    if (g_view == VIEW_ACTIVITY || g_view == VIEW_LATER)
+    if (g_view == VIEW_ACTIVITY) {
+        for (int i = 0; i < AF_COUNT; i++)
+            if (in_rect(g_act_filters[i], x, y)) { g_act_filter = i; return 1; }
+        for (int i = 0; i < g_n_listrows; i++)
+            if (in_rect(g_listrows[i].row, x, y)) {
+                /* Stay in Activity: the list is navigation, so you can walk it.
+                 * The conversation opens beside it, jumped to that message —
+                 * fetch-around (ARCH-96) reaches it even years back. */
+                g_act_selected = g_listrows[i].mid;
+                if (g_listrows[i].cid) select_channel(g_listrows[i].cid);
+                g_jump_mid = g_listrows[i].mid;
+                g_jump_deadline = GetTickCount64() + 1500;
+                return 1;
+            }
+    }
+    /* Later rows: the action button first, then the row itself. */
+    if (g_view == VIEW_LATER)
         for (int i = 0; i < g_n_listrows; i++) {
             if (in_rect(g_listrows[i].act, x, y)) {
                 oc_client_save_item(g_client, g_listrows[i].mid, OC_SAVE_REMOVE);

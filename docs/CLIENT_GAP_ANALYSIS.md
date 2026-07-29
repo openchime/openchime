@@ -164,7 +164,7 @@ Vendor-facing rows are inherently perishable — a competitor can change a plan 
 | Notification schedule (quiet hours) | ✅ | ✅ custom schedules | 🔸 DND raw text | 🔸 one daily DND window only | Richer schedules are REQ-136, unbuilt on the engine. **P1** |
 | DND config surface | ✅ | ✅ | 🔸 | 🟡 dialog + state shown in the Notifications pane | **P1 (TUI)** |
 | Activity feed (mentions/reactions/replies) | ✅ | ✅ | ❌ | ✅ Activity view: all three kinds, newest first, new-since marker, click to jump | Built (REQ-139/ARCH-95) as a union of three queries — no maintained list. **P1 (TUI)** |
-| Activity filters / saved views | ✅ | ❔ | ❌ | ❌ | **P2** |
+| Activity filters / saved views | ✅ | ❔ | ❌ | 🟡 All / Mentions / Reactions / Threads | No saved views, and no DMs facet — that is a property of the channel, not of the activity. **P2** |
 | All-unreads view | ✅ | ✅ | ❌ | ❌ | **P2** |
 | Desktop/OS toast + preview toggle | ✅ | ✅ | ❌ | ✅ tray balloon (`Shell_NotifyIconW` + `NIF_INFO`) + in-app toasts, honouring the notify level | Win32 built (WIN-18) — `ToastNotification` needs WinRT/C++ and the client is pure C (ARCH-82). The API path is verified (`tray_live=1` — the shell accepted the icon; `toasts_raised` increments on the call); only the **rendering** is unobserved, because this dev host has no attached display surface — a full-screen capture throws and returns blank, which is why a control test with .NET's own NotifyIcon was equally invisible. No preview on/off toggle. **P2** |
 | Notification sounds & badges | ✅ | ✅ | ❌ | ❌ | **P2** |
