@@ -3496,18 +3496,21 @@ static void draw_members(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         const char *nm = oc_model_user_name((oc_model *)m, cm->user_id);
         draw_presence_dot(rt, x0 + 22, y + ROW_H / 2, 4.5f,
                           oc_model_presence_of(m, cm->user_id), OC_COL_SIDEBAR);
-        /* Role as a second indicator column rather than a trailing word (WIN-65)
-         * — and ONLY for owner/admin: a marker on every row is noise, and
-         * "member" is the default that needs no saying. A glyph is not
-         * self-describing on its own, so it is an at-a-glance hint whose answer
-         * is the profile pane (WIN-10), which names the role in words. */
+        const char *disp = (nm && nm[0]) ? nm : "user";
+        draw_text(rt, disp, g_ui, rf(x0 + 34, y, W - 14, y + ROW_H), OC_COL_TEXT);
+        /* Role glyph INLINE, immediately after the name — not in a column of its
+         * own. Almost nobody is an owner or an admin, so a reserved column spends
+         * horizontal space on every row to serve the rare one, in a pane only
+         * 220px wide. Owner gets a crown, admin a shield, member nothing: a
+         * marker on every row is noise, and "member" is the default that needs no
+         * saying. The glyph is an at-a-glance hint; the profile pane (WIN-10)
+         * remains the answer, in words. */
         if (cm->role >= OC_ROLE_ADMIN) {
-            D2D1_RECT_F ri = rf(x0 + 32, y + ROW_H / 2 - 7, x0 + 46, y + ROW_H / 2 + 7);
-            draw_lucide(rt, cm->role == OC_ROLE_OWNER ? OC_ICON_CROWN : OC_ICON_SHIELD,
-                        ri, OC_COL_FAINT);
+            float gx = x0 + 34 + text_width(disp, g_ui) + 6;
+            if (gx + 14 < W - 14)          /* skip it rather than collide with a long name */
+                draw_lucide(rt, cm->role == OC_ROLE_OWNER ? OC_ICON_CROWN : OC_ICON_SHIELD,
+                            rf(gx, y + ROW_H / 2 - 7, gx + 14, y + ROW_H / 2 + 7), OC_COL_FAINT);
         }
-        draw_text(rt, (nm && nm[0]) ? nm : "user", g_ui,
-                  rf(x0 + 52, y, W - 14, y + ROW_H), OC_COL_TEXT);
         if (g_n_memrows < (int)(sizeof g_memrows / sizeof g_memrows[0])) {
             g_memrows[g_n_memrows].top = y; g_memrows[g_n_memrows].bot = y + ROW_H;
             g_memrows[g_n_memrows].uid = cm->user_id; g_n_memrows++;

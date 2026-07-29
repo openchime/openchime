@@ -128,7 +128,7 @@ Vendor-facing rows are inherently perishable — a competitor can change a plan 
 | Group DMs (multi-person) | ✅ up to 8 | ✅ | ❌ | ❌ | Verify wire support. **P2** |
 | Message yourself / self-DM | ✅ | ✅ | ❌ | ❌ | Note: the **engine** supports self-DM (REQ-055); neither frontend surfaces it. **P2** |
 | New DM start | ✅ | ✅ | 🟡 new-DM prompt | 🟡 (via member) | Present. — |
-| Members / roster panel | ✅ | ✅ | 🟡 click-to-DM, **workspace** roster | 🟡 **channel** roster + header count chip + presence and role columns (crown/shield); no search/scroll | Win32 fixed (REQ-031/ARCH-91): it listed the *tenant* roster beside a channel name, which was wrong for any workspace with more people than one channel. TUI still shows the workspace roster. Server cap 500. **P1 (TUI)** |
+| Members / roster panel | ✅ | ✅ | 🟡 click-to-DM, **workspace** roster | 🟡 **channel** roster + header count chip + presence dot and an inline role glyph (crown/shield); no search/scroll | Win32 fixed (REQ-031/ARCH-91): it listed the *tenant* roster beside a channel name, which was wrong for any workspace with more people than one channel. TUI still shows the workspace roster. Server cap 500. **P1 (TUI)** |
 | View other-user profile | ✅ rich profile pane | ✅ | ❌ (its `/profile` modal is your OWN identity) | 🟡 profile pane: avatar, name, live presence, role, message/DM | Win32 built (WIN-10). Thin next to Slack's — no title, timezone, email or custom fields (REQ-240/241, unbuilt). TUI still cannot view a peer. **P1 (TUI)** |
 | Member action menu (message/role/remove) | ✅ | ✅ | 🟡 | 🟡 no profile/deactivate | Present, shallow. **P1** |
 | Add people to DM / convert to channel | ✅ | ❔ | ❌ | ❌ | **P2** |
