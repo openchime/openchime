@@ -447,6 +447,34 @@ v2.5.0 / utf8proc v2.11.3), both MIT, so local and CI share identical sources wi
 zero transitive dependencies (ARCH-75). Native GUIs build with their platform
 toolchains over the core; release artifacts come from CI/CD, never a dev machine.
 
+## Native children over Direct2D (Win32)
+
+A native child window — the composer's RichEdit, the find/search/picker/palette
+boxes, the sign-in fields — composites **above** the Direct2D output. There is no
+z-order to lose and nothing can be drawn over one. A child left visible while the
+surface it belongs to is not drawn therefore appears as a bare control floating
+over whatever *is* drawn, which reads as corruption rather than as a bug.
+
+This recurred four times before it was fixed as a class, so the rule is written
+down: **every native child's visibility is decided in `layout_natives()`**, from
+three shared predicates —
+
+- `sidebar_kind()` — what the second column currently holds (channels · DMs ·
+  activity). Anything that depends on the column's *content* asks this, not
+  `view_has_sidebar()`, which only says whether a column exists. Conflating the
+  two is what let the find box leak into three separate views.
+- `main_is_conversation()` — whether the middle column is something you can type
+  into. The DMs view has a sidebar but shows an index until you pick someone.
+- `window_is_covered()` — whether a modal, the palette, the lightbox, a menu or
+  the sign-in card owns the whole window.
+
+**And the drawing must ask the same question as the control.** Hiding the
+composer's RichEdit while still painting its box and buttons produced an input
+you could not type into, which is its own defect.
+
+A new view or overlay has to name itself in one of those predicates. It cannot
+silently inherit another surface's children.
+
 ## 8. Roadmap
 
 - **Now:** app-core + termbox2 TUI shipped. On top of the lean core loop

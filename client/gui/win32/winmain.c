@@ -2658,6 +2658,9 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
 }
 
 static void layout_composer(HWND hwnd);   /* fwd */
+static void layout_natives(HWND hwnd);    /* fwd — owns every native child */
+static void layout_search(HWND hwnd);     /* fwd */
+static int  window_is_covered(void);      /* fwd */
 
 /* Move `delta` conversations through the sidebar as it is currently shown, so
  * the order matches what the eye sees — the section order, sort and filter all
@@ -4139,6 +4142,58 @@ static void draw_modal(ID2D1RenderTarget *rt, const oc_model *m, float W, float 
     else if (g_notify_open) draw_notify_prefs(rt, m, card);
 }
 
+/* EVERY native child's visibility, decided in one place.
+ *
+ * A native child window composites **above** the Direct2D output. There is no
+ * z-order to lose and no way to draw over one — so a child left visible while
+ * the thing it belongs to is not drawn appears as a bare control floating over
+ * whatever IS drawn. That is not a cosmetic class of bug: it looks like
+ * corruption.
+ *
+ * Deciding it per-control, at each control's own site, is what made this recur.
+ * The find box leaked three times as the second column gained new tenants
+ * (WIN-70), and the composer stayed live in the DMs index, where there is no
+ * conversation to type into. Every one of those was a different file location
+ * asking a slightly different question.
+ *
+ * So all six are decided here, from the same state the painter uses:
+ *
+ *   composer     — only where the middle column is a conversation
+ *   find box     — only where the second column is the channel list
+ *   search box   — only while the search overlay is open
+ *   emoji picker — only while the picker is open
+ *   palette box  — only while the palette is open (it IS the cover)
+ *   sign-in      — only in the sign-in view (it IS the cover)
+ *
+ * and all but the last two also yield to `window_is_covered()`. A new view or a
+ * new overlay has to be named in one of those predicates; it cannot silently
+ * inherit somebody else's children. */
+static void layout_natives(HWND hwnd) {
+    layout_composer(hwnd);     /* also does layout_find */
+    layout_search(hwnd);
+
+    int covered = window_is_covered();
+    if (g_pal_edit) {
+        /* The palette is itself the cover, so it does not consult `covered`. */
+        if (g_pal_open) {
+            ShowWindow(g_pal_edit, SW_SHOW);
+            MoveWindow(g_pal_edit, PX(g_pal_box.left + 32), PX(g_pal_box.top + 8),
+                       PX(g_pal_box.right - g_pal_box.left - 44), PX(20), TRUE);
+        } else {
+            ShowWindow(g_pal_edit, SW_HIDE);
+        }
+    }
+    if (g_pick_edit) {
+        if (g_pick_open && !covered) {
+            ShowWindow(g_pick_edit, SW_SHOW);
+            MoveWindow(g_pick_edit, PX(g_pick_box.left + 30), PX(g_pick_box.top + 6),
+                       PX(g_pick_box.right - g_pick_box.left - 40), PX(18), TRUE);
+        } else {
+            ShowWindow(g_pick_edit, SW_HIDE);
+        }
+    }
+}
+
 /* ---- paint --------------------------------------------------------------- */
 
 /* Draw the whole UI into `rt` (window RT for painting, or a DC RT for test
@@ -4254,6 +4309,7 @@ static uint64_t g_dm_hover;
  * list, with the new row somewhere in the sidebar. */
 static uint64_t g_dm_pending;
 static int g_dm_compose;              /* the "start a conversation" picker is up */
+static int g_dm_index_now;            /* this frame's middle column is the DM index */
 static D2D1_RECT_F g_dm_compose_btn;
 
 /* The DM channel with `uid`, or NULL. */
@@ -4636,8 +4692,12 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
             } else {
                 draw_transcript(rt, m, rf(main_x, HEADER_H + th + bh, main_r, H - g_composer_h));
             }
+            /* The composer is chrome for a conversation. Hiding only the native
+             * RichEdit left its box, buttons and send arrow painted over the DM
+             * index — an input you cannot type into is worse than none. */
+            g_dm_index_now = dm_index;
         }
-        draw_composer(rt, main_x, main_w, H);
+        if (!g_dm_index_now) draw_composer(rt, main_x, main_w, H);
         draw_autocomplete(rt, main_x, main_w, H);
         draw_emoji_picker(rt, main_x, main_w, H);
         if (members > 0) draw_members(rt, m, W, H);
@@ -4693,26 +4753,7 @@ static void paint(HWND hwnd) {
      * positioned after the scene is laid out. `layout_find` is here for a
      * different reason: it has to react to a menu opening, which is not a
      * relayout and so never reached it. */
-    layout_find(hwnd);
-    layout_search(hwnd);
-    if (g_pal_edit) {
-        if (g_pal_open) {
-            ShowWindow(g_pal_edit, SW_SHOW);
-            MoveWindow(g_pal_edit, PX(g_pal_box.left + 32), PX(g_pal_box.top + 8),
-                       PX(g_pal_box.right - g_pal_box.left - 44), PX(20), TRUE);
-        } else {
-            ShowWindow(g_pal_edit, SW_HIDE);
-        }
-    }
-    if (g_pick_edit) {
-        if (g_pick_open) {
-            ShowWindow(g_pick_edit, SW_SHOW);
-            MoveWindow(g_pick_edit, PX(g_pick_box.left + 30), PX(g_pick_box.top + 6),
-                       PX(g_pick_box.right - g_pick_box.left - 40), PX(18), TRUE);
-        } else {
-            ShowWindow(g_pick_edit, SW_HIDE);
-        }
-    }
+    layout_natives(hwnd);
 
     HRESULT hr = ID2D1RenderTarget_EndDraw(rt, NULL, NULL);
     if (hr == (HRESULT)D2DERR_RECREATE_TARGET) {
@@ -4975,11 +5016,32 @@ static int composer_remeasure(void) {
 /* Position the RichEdit over the composer region for the current window size. */
 static void layout_find(HWND hwnd);   /* fwd */
 
+/* Is the MIDDLE column currently a conversation you could type into?
+ *
+ * Not the same as "this view has a sidebar": the DMs view has one, but its
+ * middle column is the index (or the compose picker) until you pick someone. */
+static int main_is_conversation(void) {
+    if (!view_has_sidebar()) return 0;
+    if (g_view != VIEW_DMS) return 1;
+    if (g_dm_compose) return 0;
+    const oc_model *m = model();
+    const oc_channel *c = (m && g_sel) ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+    return c && c->kind == OC_CHANNEL_KIND_DM;
+}
+
+/* Does something own the whole window right now? A native child underneath it
+ * must be hidden, because there is no z-order to lose — see layout_natives. */
+static int window_is_covered(void) {
+    return modal_open() || g_pal_open || g_lightbox || g_menu || g_more_open ||
+           g_view == VIEW_SIGNIN;
+}
+
 static void layout_composer(HWND hwnd) {
     layout_find(hwnd);
     if (!g_re) return;
-    /* The composer only belongs to transcript views; hide it elsewhere. */
-    if (!view_has_sidebar()) { ShowWindow(g_re, SW_HIDE); return; }
+    /* Only where there is a conversation to type into, and only when nothing
+     * covers the window (layout_natives explains why both matter). */
+    if (!main_is_conversation() || window_is_covered()) { ShowWindow(g_re, SW_HIDE); return; }
     ShowWindow(g_re, SW_SHOW);
     RECT rc; GetClientRect(hwnd, &rc);
     rc.right = (LONG)DIPF(rc.right); rc.bottom = (LONG)DIPF(rc.bottom);
@@ -5018,8 +5080,7 @@ static void layout_find(HWND hwnd) {
     /* Shown only when the column actually holds the channel list this box
      * filters — see sidebar_kind(). Asking "does this view have a sidebar" is
      * what let it leak into the DMs and Activity lists. */
-    int want = sidebar_kind() == SBK_CHANNELS &&
-               !g_menu && !g_more_open && !g_pal_open;
+    int want = sidebar_kind() == SBK_CHANNELS && !window_is_covered();
 
     /* Only act on a change: this runs every frame, and a redundant MoveWindow
      * still churns WM_WINDOWPOSCHANGED and can flicker the control. The DPI is
@@ -5074,7 +5135,10 @@ static void find_create(HWND parent) {
 static void layout_search(HWND hwnd) {
     const oc_model *m = model();
     if (!g_srch) return;
-    if (!m || !m->search_open) { ShowWindow(g_srch, SW_HIDE); return; }
+    /* `covered` matters here too: the search box is a middle-column overlay, and
+     * a modal drawn over it would otherwise have this control punched through
+     * its card. */
+    if (!m || !m->search_open || window_is_covered()) { ShowWindow(g_srch, SW_HIDE); return; }
     (void)hwnd;
     ShowWindow(g_srch, SW_SHOW);
     MoveWindow(g_srch, PX(g_srch_box.left + 30), PX(g_srch_box.top + 8),

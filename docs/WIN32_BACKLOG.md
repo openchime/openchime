@@ -177,8 +177,21 @@ than against the backlog:
 
 Recorded because a defect nobody wrote down is a defect nobody fixes.
 
-- ~~**WIN-70 — the find box kept leaking into views that are not the channel
-  list.**~~ **FIXED 2026-07-29 — the class, not the instance.** The "Find a
+- ~~**WIN-70 — native children leaked into views they do not belong to.**~~
+  **FIXED 2026-07-29 — audited globally, not patched again.** After the third
+  occurrence the whole family was reviewed: six native children (composer, find
+  box, search box, emoji-picker box, palette box, sign-in fields), each deciding
+  its own visibility at its own site, each asking a slightly different question.
+  The audit found a **second** live instance nobody had reported — the composer
+  stayed usable in the DMs index, where there is no conversation to type into —
+  and one latent one, the search box being a middle-column overlay that a modal
+  would have punched through. All six are now decided in `layout_natives()` from
+  the same state the painter uses, against three shared predicates:
+  `sidebar_kind()` (what is in the second column), `main_is_conversation()` (is
+  the middle column something you can type into) and `window_is_covered()`
+  (does something own the whole window). A fourth fix came with it: hiding the
+  composer's native child had left its box and buttons still *painted*, so the
+  drawing now asks the same question the control does. Original report: The "Find a
   conversation" EDIT is a native child, so it composites **above** the Direct2D
   output: any view where it is not hidden shows a bare rectangle over whatever is
   really drawn there. Its visibility asked `view_has_sidebar()` — "does this view
