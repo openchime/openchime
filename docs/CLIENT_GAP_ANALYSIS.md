@@ -2,7 +2,13 @@
 
 *Definitive inventory of every user-facing screen/dialog/panel/surface and feature across the clients. Ground truth for TUI/Win32 is the code inventories; **Slack** and **Pumble** are the researched reference surfaces.*
 
-**Re-verification (2026-07-28).** The OpenChime columns were re-certified against the code in full (see the commit trail). The two *reference* claims this document's positioning rests on were re-checked against vendor documentation on the same date and both hold: Slack's free plan shows 90 days and permanently deletes data over a year old, and Pumble's free plan carries unlimited history and unlimited users. Slack's pin behaviour (channel-scoped, 100/channel, any member may unpin) was verified against its help centre and API reference while building REQ-230. **The remaining Slack/Pumble cells are as researched on 2026-07-26 and have not been individually re-checked** — they are reference material, not statements about this system, and a vendor can change them without notice.
+**Re-verification (2026-07-28).** The OpenChime columns were re-certified against the code in full (see the commit trail). The **reference columns were re-checked too**, category by category, against Slack's help centre and API reference and Pumble's help centre, feature list and pricing page:
+
+- **Confirmed unchanged:** Slack's messaging actions (mark unread, save for later, remind me, scheduled send, forward), channel management (topic/description, rename, archive, custom sidebar sections, bookmarks), the tabbed channel layout, custom-status expiry, DND defaults and notification schedules, keyword notifications, the `from:`/`in:`/`has:` search grammar with its four result tabs, SAML SSO with Google Workspace SSO (and that Google Auth is unavailable in Enterprise orgs), and Enterprise audit logs. On Pumble: threads, pins (also 100/channel), guest access with channel scoping and time limits, SSO via SAML2/OAuth2, customizable sections, data retention, and the search filter set.
+- **Corrected:** three factual errors. (1) Slack's free tier does not merely cap history at 90 days — it **permanently deletes** anything over a year old. (2) **Slack's SAML starts at Business+, not Pro** — this document had it one tier too low in three places, including inside §7's correction of *Pumble's* marketing, so our correction needed correcting. (3) Pumble's search **sorts** by relevancy/newest/oldest, moving that cell from ❔ to ✅. Pumble's plan gating re-verified exactly against its pricing page: SSO and data retention at Enterprise, guests and user groups at Business (with the "5 free single-channel guests per paid seat" allowance), screen share at Pro.
+- **The remaining ❔ cells were re-checked and stay ❔.** That is a finding, not an omission: Pumble's public documentation does not describe them, which is precisely what ❔ means in the legend above. They should not be read as "Pumble lacks this."
+
+Vendor-facing rows are inherently perishable — a competitor can change a plan the day after this is written — so each carries the date it was checked rather than an implied "current".
 
 **Pumble sourcing (researched 2026-07-26).** Pumble is a Slack-shaped SaaS team chat product from COING (the makers of Clockify and Plaky, sold together as the CAKE.com bundle). Its column below is built from Pumble's own pricing page, feature pages, and help centre, cross-checked against independent reviews (Cloudwards) and comparison directories (Capterra, GetApp, TrustRadius). **Vendor-authored comparison content was treated as a claim, not evidence** — where Pumble's marketing and its own help centre disagreed, the help centre won. Two such corrections are recorded in §7.
 
@@ -54,7 +60,7 @@
 | Copy link / permalink | ✅ | ❔ | ❌ | ❌ no copy-link | **P1** |
 | Copy text | ✅ | ✅ | 🔸 terminal-native only | ✅ in-app text-select + Ctrl+C | TUI has **no** in-app copy — relies on the terminal emulator's mouse selection (no clipboard code). Win32 has real in-app selection+copy (ARCH-82). **P2** |
 | Forward / share message | ✅ | ✅ quote message | ❌ | ❌ no forward | **P2** |
-| Pin message | ✅ | ✅ | ❌ | ✅ pin/unpin + inline "Pinned by" marker + Pins tab | Built (REQ-230/ARCH-90): channel-scoped, any member may pin or unpin, 100/channel, survives reconnect. **P1 (TUI)** |
+| Pin message | ✅ 100/channel | ✅ 100/channel | ❌ | ✅ pin/unpin + inline "Pinned by" marker + Pins tab, 100/channel | Built (REQ-230/ARCH-90): channel-scoped, any member may pin or unpin, 100/channel, survives reconnect. **P1 (TUI)** |
 | Save for later / bookmark | ✅ | ✅ Saved Items (sidebar bookmark) | ❌ | ❌ | Later hub out; see Navigation. **P2** |
 | Mark unread | ✅ | ✅ | ❌ | ❌ no mark-unread | **P1** |
 | Remind me about this | ✅ | ✅ reminders | ❌ | ❌ | **P2** |
@@ -176,7 +182,7 @@
 | Search modifiers (from:/in:/has:…) | ✅ full grammar | 🟡 `from:` + checkbox filters | ❌ | ❌ | **P2** |
 | Search filters panel | ✅ | ✅ date, channel, has-file/reaction/link, exclude webhooks | ❌ | ❌ | **P2** |
 | Result tabs (Messages/Files/Channels/People) | ✅ | ✅ (+ Apps) | ❌ | ❌ | **P2** |
-| Sort (relevance/newest) | ✅ | ❔ | ❌ | ❌ | **P2** |
+| Sort (relevance/newest) | ✅ | ✅ relevancy / newest / oldest | ❌ | ❌ | Confirmed on Pumble's side 2026-07-28 (was ❔). **P2** |
 | Term highlight in results | ✅ | ✅ | ❌ | ❌ | **P1** |
 | Paging / load-more | ✅ | ✅ | ❌ | ❌ (128 cap, ignores truncation) | **P1** |
 | Full history searchable on the free tier | ❌ 90 days visible, **and anything over a year is permanently deleted** | ✅ unlimited | ✅ (no cap, ever) | ✅ | **Pumble matches our "no history cap" wedge** — it is no longer a Slack-only differentiator. Slack's free tier is harsher than "a cap" though: it *deletes*. — |
@@ -246,7 +252,7 @@
 | Feature / Surface | Slack | Pumble | TUI | Win32 | Gap notes & priority |
 |---|---|---|---|---|---|
 | 2FA / MFA | ✅ | ✅ | ❌ | ❌ | Likely server/roadmap. **P2** |
-| SSO — **SAML 2.0** | ✅ ᴾ (Pro) | ✅ **ᴱ Enterprise only** | ⛔ **not supported at all** | ⛔ | **No SAML anywhere in the product** — not built, not designed (ARCH-55 has no SAML path; recorded as REQ-027). Disqualifying in SAML-mandatory RFPs. See §8. |
+| SSO — **SAML 2.0** | ✅ **Business+ and Enterprise** | ✅ **ᴱ Enterprise only** | ⛔ **not supported at all** | ⛔ | **No SAML anywhere in the product** — not built, not designed (ARCH-55 has no SAML path; recorded as REQ-027). Disqualifying in SAML-mandatory RFPs. See §8. |
 | SSO — **OIDC / social login** | ✅ ᴾ | ✅ OAuth2 ᴱ | ❌ client half unbuilt (Google-only upstream) | ❌ | Daemon verification built; browser flow + PKCE + courier ⛔ (REQ-020). **P1** — see §8. |
 | SCIM / JIT provisioning | ✅ | ❔ | ⛔ | ⛔ | Out of scope for client (ours is REQ-253, federated). |
 | Session mgmt / forced sign-out | ✅ | ❔ | 🟡 logout only | 🟡 logout **+ "Sign out everywhere"** | Win32 surfaces revoke-all (`OC_LOGOUT_ALL`); the TUI does not. Neither lists active sessions. **P2** |
@@ -525,14 +531,14 @@ This analysis is reference-centric (what Slack and Pumble have that we lack). Fo
 | Unlimited message history + unlimited users | **Free** | Pro (lowest paid) |
 | Group video meetings, screen share | Pro | Free (limited) / Pro |
 | Guests, roles & permissions, unlimited integrations | Business | Pro |
-| **SSO (SAML2/OAuth2)** | **Enterprise (top tier)** | **Pro (lowest paid)** |
+| **SSO (SAML2/OAuth2)** | **Enterprise (top tier)** | **Business+** (its middle paid tier) |
 | **Data-retention policy** | **Enterprise (top tier)** | Business+ |
 
 So the like-for-like comparison depends entirely on whether you need SSO — see §8.
 
 **Two corrections to Pumble's own comparison marketing** (its blog vs its help centre / Slack's site):
 
-1. Its comparison page shows **SSO as a flat ✓ for Pumble**, implying parity. Its pricing page confirms SSO is **Enterprise-only** — its top tier. Slack includes SAML SSO from **Pro**, its *lowest paid* tier.
+1. Its comparison page shows **SSO as a flat ✓ for Pumble**, implying parity. Its pricing page confirms SSO is **Enterprise-only** — its top tier, where Slack's SAML starts at **Business+**, its middle paid tier. *(Corrected 2026-07-28: this line previously said Slack included SAML from Pro, its lowest paid tier. Slack's own help page says Business+ and Enterprise. The point survives — Pumble gates SSO one rung higher on its ladder — but it is narrower than first written, and our own correction of a vendor's marketing had to be corrected in turn.)*
 2. It claims **voice/video messages as a Pumble-only feature (✗ for Slack)**. Slack has shipped Clips for years. Treat that page as marketing, not evidence.
 
 **Also worth recording:** Pumble has **no read receipts** (confirmed in its own FAQ — *"seeing who viewed the message is not supported"*), which preserves REQ-090's seen-by as a genuine differentiator against both references; and Pumble **matches our unlimited-history wedge on its free tier**, which retires that argument (see §6).
@@ -547,7 +553,7 @@ SSO is the capability that most often decides an enterprise deal, so our own pos
 
 | | Slack | Pumble | **OpenChime** |
 |---|---|---|---|
-| SAML 2.0 | ✅ from its lowest paid tier | ✅ top tier only | ❌ **not supported — not built, not designed, not on any roadmap** |
+| SAML 2.0 | ✅ from Business+ (its middle paid tier) | ✅ top tier only | ❌ **not supported — not built, not designed, not on any roadmap** |
 | OIDC / social login | ✅ | ✅ OAuth2 (top tier) | 🟡 **designed + daemon-side built**, brokered by the central relay (ARCH-56/57) |
 | Bring-your-own IdP direct to the server | ✅ | ✅ | ⛔ **excluded by design** (ARCH-55) — OIDC always routes through central |
 | Providers reachable today | Any SAML/OIDC IdP | Any SAML2/OAuth2 IdP | **Google only** (Entra/Apple deferred on the `IUpstreamIdp` seam) |
