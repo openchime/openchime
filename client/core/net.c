@@ -1354,6 +1354,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_update_channel(&w, OC_PROTOCOL_VERSION, &uc) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_HISTORY_AROUND) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_history_around ha = { c->channel_id, c->message_id, (uint16_t)c->op };
+                if (oc_encode_history_around(&w, OC_PROTOCOL_VERSION, &ha) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_SAVE_ITEM) {
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_save_item si = { c->message_id, c->op };

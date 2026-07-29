@@ -570,6 +570,7 @@ static int g_n_searchrows;
  * usually still in flight when the click lands — `g_jump_deadline` is what turns
  * "not loaded yet" into an honest failure instead of a silent no-op. */
 static uint64_t  g_jump_mid;            /* message to scroll to, 0 = none */
+static uint64_t  g_jump_fetched;        /* the id we already fetched around, so we ask once */
 static ULONGLONG g_jump_deadline;       /* GetTickCount64 by which it must appear */
 static uint64_t  g_flash_mid;           /* message to tint */
 static ULONGLONG g_flash_until;
@@ -5398,6 +5399,7 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
     if (!msg->deleted)
         AppendMenuW(menu, MF_STRING, 103,
                     msg->pinned ? L"Unpin from channel" : L"Pin to channel");
+    AppendMenuW(menu, MF_STRING, 105, L"Copy link");
     AppendMenuW(menu, MF_STRING, 104, L"Save for later");
     AppendMenuW(menu, MF_STRING, 20, L"Copy text");
     int own = (msg->author_id == m->user_id);
@@ -5422,6 +5424,15 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
         g_scroll = 0; oc_client_open_thread(g_client, g_sel, mid);
     } else if (cmd == 102) {
         oc_client_list_reactions(g_client, chan, mid); rp_push(RP_REACTORS);
+    } else if (cmd == 105) {
+        /* Ids, not names: a channel can be renamed (REQ-036) and a link built
+         * from a name would rot the moment it was (ARCH-96). */
+        char link[256];
+        snprintf(link, sizeof link, "openchime://%s/c/%llu/m/%llu",
+                 g_host[0] ? g_host : "workspace",
+                 (unsigned long long)chan, (unsigned long long)mid);
+        copy_to_clipboard(hwnd, link);
+        toast_push("Link copied.", 0);
     } else if (cmd == 104) {
         /* Private, so there is no "unsave" state to reflect in the menu here —
          * the Later view is where you remove one. */
@@ -5511,6 +5522,7 @@ static int files_click(HWND hwnd, int x, int y) {
                 if (f->channel_id && f->channel_id != g_sel) select_channel(f->channel_id);
                 if (from_view) { g_view = VIEW_HOME; layout_composer(hwnd); }
                 g_jump_mid = f->message_id;
+            g_jump_deadline = GetTickCount64() + 1500;
                 select_tab(TAB_MESSAGES);
             }
             return 1;
@@ -5771,6 +5783,7 @@ static int on_click(HWND hwnd, int x, int y) {
                 g_view = VIEW_HOME;
                 if (g_listrows[i].cid) select_channel(g_listrows[i].cid);
                 g_jump_mid = g_listrows[i].mid;
+            g_jump_deadline = GetTickCount64() + 1500;
                 select_tab(TAB_MESSAGES);
                 layout_composer(hwnd);
                 return 1;
@@ -5896,6 +5909,7 @@ static int on_click(HWND hwnd, int x, int y) {
             /* Jump to it in the transcript — a pin is a pointer into the
              * conversation, so landing on it in context is the point. */
             g_jump_mid = g_pinrows[i].mid;
+            g_jump_deadline = GetTickCount64() + 1500;
             oc_client_close_pins(g_client);
             return 1;
         }
@@ -7839,13 +7853,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_hist_pending_chan = 0;
                 }
             }
-            /* An armed jump the transcript never resolved (WIN-3): the message is
-             * older than the backfill window, so say so rather than leaving the
-             * click looking like it did nothing. */
+            /* An armed jump the transcript could not resolve: the message is
+             * outside the loaded window. Ask for the messages AROUND it once
+             * (REQ-232/ARCH-96) and give it another window to land — every
+             * surface that points at a message (pins, files, activity, saved,
+             * search) used to dead-end here with an apology. */
             if (g_jump_mid && GetTickCount64() > g_jump_deadline) {
-                g_jump_mid = 0;
-                toast_push("That message is older than the loaded history.", 0);
+                if (!g_jump_fetched && g_sel) {
+                    g_jump_fetched = g_jump_mid;
+                    oc_client_history_around(g_client, g_sel, g_jump_mid, 40);
+                    g_jump_deadline = GetTickCount64() + 4000;
+                } else {
+                    /* Asked and it still did not arrive: it is not in a channel
+                     * we can read, or it is gone. */
+                    g_jump_mid = 0; g_jump_fetched = 0;
+                    toast_push("Could not find that message.", 1);
+                }
             }
+            if (!g_jump_mid) g_jump_fetched = 0;
             /* The settings bucket arrives a beat after auth; fold it in once. */
             if (g_sb_settings_pending && oc_model_setting(m, SB_SETTING_KEY)) {
                 sidebar_opts_load(m);

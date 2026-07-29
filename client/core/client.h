@@ -135,6 +135,11 @@ void oc_client_update_channel(oc_client *c, uint64_t channel_id, uint8_t op, con
 
 /* Save/unsave a message (REQ-231, ARCH-95). Private: only you ever sees it, so
  * nothing is fanned out and the ack comes back to you alone. */
+/* Fetch the messages AROUND one (REQ-232, ARCH-96) — what a permalink, a pin, a
+ * file or an activity item needs to reach something outside the loaded window.
+ * Arrives as an ordinary backfill replay. */
+void oc_client_history_around(oc_client *c, uint64_t channel_id, uint64_t message_id, uint16_t limit);
+
 void oc_client_save_item(oc_client *c, uint64_t message_id, uint8_t op);
 void oc_client_list_saved(oc_client *c);
 void oc_client_close_saved(oc_client *c);

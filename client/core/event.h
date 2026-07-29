@@ -149,6 +149,7 @@ enum {
     OC_CMD_SAVE_ITEM,      /* save/unsave `message_id`: op = add/remove (REQ-231) */
     OC_CMD_LIST_SAVED,     /* my saved items */
     OC_CMD_LIST_ACTIVITY,  /* what involved me (REQ-139) */
+    OC_CMD_HISTORY_AROUND, /* the messages around `message_id` in `channel_id` (REQ-232) */
     OC_CMD_LIST_MEMBERS,   /* list `channel_id`'s members (REQ-031) */
     OC_CMD_LIST_FILES,     /* list files in `channel_id` (0 = everywhere I can read) */
     OC_CMD_LIST_REACTIONS,  /* inspect who reacted to `message_id` in `channel_id` */

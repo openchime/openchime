@@ -242,6 +242,16 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **The cost, stated plainly:** a query cannot cheaply carry per-item read state the way a materialised list can. So v1 does not have it. Instead `users.activity_seen_ms` is a **watermark** — one timestamp, stamped when the feed is opened — which is enough to badge "there is something new" and nothing more. If per-item read/dismiss is ever wanted, that is the point at which a table earns its place, and the query becomes its seed.
 
+- **ARCH-96 (Permalinks — an id pair, and a fetch-around-an-id history mode):** Delivers REQ-232.
+
+  **A permalink is the ids, not the names.** `openchime://<workspace-host>/c/<channel_id>/m/<message_id>`. Channel *names* are mutable (REQ-036) and message ordering is not stable across anything but the id, so a link built from names would break the first time someone renamed a channel — which is precisely the question REQ-036 asked and ARCH-93 answered by refusing a name-history table. The ids are the durable reference; the workspace host is what makes a link portable between people rather than only meaningful inside one client.
+
+  **The client does not register a URL scheme.** Copying a link puts that text on the clipboard, and pasting one into the app jumps to it. Registering `openchime://` with the shell is a machine-wide registry write, and doing that as a side effect of a chat client running is not something to slip in — it is a deliberate install-time act, and is recorded as unbuilt rather than done quietly.
+
+  **The half that matters is `HISTORY_AROUND`.** Every surface that points at a message — pins, the files list, the activity feed, saved items, search — could already only reach messages inside the loaded window, and reported "that message is older than the loaded history" otherwise. Honest, and useless. So history gains a second mode beside the backwards paging of §6.3: *give me the messages surrounding this id*, half before and half after, in ascending order like every other replay so the client's high-water dedup (ARCH-45) behaves unchanged.
+
+  **Why a mode and not a new listing:** the rows, the access check, the replay encoding and the client's fold are all identical to a backfill — only the WHERE differs. A second frame that returned messages in a different shape would be a second thing to keep in step with attachments, reply counts and author-name overrides, every one of which has already been a bug in the replay path once.
+
 ## Discovery
 
 - **ARCH-14 (Rule):** Workspace-address, resolved by plain DNS — **there is no resolution *service*, in any deployment model** (ARCH-76). At sign-in the client collects the **workspace** (the tenant's address) plus the user's **email** directly, the same model as Slack's "enter your workspace URL." The workspace is turned into a daemon address by ordinary DNS, with no shared, always-on, cross-tenant lookup component to run: consistent with the island model (ARCH-4) and the "no runtime configuration dependency" stance (ARCH-26). Note the DNS *records* under the service suffix (forms 2 and 3 below) are maintainer-provided and so are counted as a federated function in ARCH-76 — but they are static records, not a request-serving component, so no lookup traffic reaches the project. Three forms, one per deployment model:

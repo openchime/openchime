@@ -294,6 +294,16 @@ void oc_client_update_channel(oc_client *c, uint64_t channel_id, uint8_t op, con
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_history_around(oc_client *c, uint64_t channel_id, uint64_t message_id, uint16_t limit) {
+    if (!c || !channel_id || !message_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_HISTORY_AROUND);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = message_id;
+    cmd->op = (uint8_t)(limit > 255 ? 255 : limit);
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_save_item(oc_client *c, uint64_t message_id, uint8_t op) {
     if (!c || !message_id) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SAVE_ITEM);

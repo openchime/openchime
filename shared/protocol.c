@@ -632,6 +632,12 @@ oc_result oc_encode_activity(oc_wbuf *w, uint16_t version, const oc_activity *m)
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_history_around(oc_wbuf *w, uint16_t version, const oc_history_around *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_HISTORY_AROUND);
+    oc_w_u64(w, m->channel_id); oc_w_u64(w, m->message_id); oc_w_u16(w, m->limit);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_info *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CHANNEL_INFO);
     oc_w_u64(w, m->channel_id);
@@ -1686,6 +1692,11 @@ oc_result oc_decode_activity_entry(oc_rbuf *p, oc_activity_entry *m) {
 }
 oc_result oc_decode_activity(oc_rbuf *p, oc_activity *m) {
     m->count = oc_r_u32(p); m->seen_at = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_history_around(oc_rbuf *p, oc_history_around *m) {
+    m->channel_id = oc_r_u64(p); m->message_id = oc_r_u64(p); m->limit = oc_r_u16(p);
     return r_done(p);
 }
 

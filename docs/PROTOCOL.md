@@ -843,6 +843,19 @@ server stamps the current time as part of answering, so a client compares each
 `at` against it to mark what is new. That is deliberately coarser than per-item
 read state, which would require the table ARCH-95 argues against.
 
+### 5.9d Fetch-around, for permalinks (REQ-232, ARCH-96)
+
+**`HISTORY_AROUND` (client → server), msg_type `0x006A`**
+`{ channel_id: u64, message_id: u64, limit: u16 }` — the messages *surrounding*
+an id, `limit/2` either side, so a jump target lands mid-screen with context
+rather than pinned to an edge.
+
+It replies as an ordinary **backfill replay** (§6): same rows, same ascending
+order, same attachments and reply counts, so the client's high-water dedup
+(ARCH-45) and every downstream fold work unchanged — only the `WHERE` differs
+from the backwards paging of §6.3. Read access is checked exactly as it is there:
+a permalink is not a way around membership.
+
 ### 5.10 Threads (REQ-060)
 
 Any message can be replied to as a thread. A reply threads under a **top-level

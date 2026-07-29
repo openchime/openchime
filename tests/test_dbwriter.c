@@ -1268,6 +1268,72 @@ static oc_dbres *list_activity(oc_dbwriter *w, uint64_t uid) {
     return wait_result(w);
 }
 
+/* Fetch-around (REQ-232, ARCH-96): the window a permalink needs. */
+static oc_dbres *history_around(oc_dbwriter *w, uint64_t uid, uint64_t ch,
+                                uint64_t mid, uint16_t limit) {
+    oc_job *j = oc_job_new(OC_JOB_HISTORY, 700);
+    j->user_id = uid; j->channel_id = ch; j->message_id = mid;
+    j->search_limit = limit; j->hist_around = 1;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_history_around(void) {
+    const char *path = "build/test_dbwriter_around.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    uint64_t u = reg(w, "alice", "pw", OC_ROLE_OWNER);
+    CHECK(u != 0);
+
+    uint64_t ids[41];
+    for (int i = 0; i < 41; i++) {
+        uint8_t idem[OC_IDEM_LEN];
+        memset(idem, 0, sizeof idem);
+        idem[0] = 0x70; idem[1] = (uint8_t)i;
+        char body[32]; snprintf(body, sizeof body, "m%d", i);
+        ids[i] = send_msg(w, u, idem, body);
+        CHECK(ids[i] != 0);
+    }
+
+    /* Around the middle: context on BOTH sides, ascending, target included. */
+    oc_dbres *r = history_around(w, u, OC_DEFAULT_CHANNEL, ids[20], 10);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK);
+    CHECK(r->n_replay == 10);                       /* 5 either side */
+    int has_target = 0, before = 0, after = 0;
+    for (size_t i = 0; i < r->n_replay; i++) {
+        if (r->replay[i].message_id == ids[20]) has_target = 1;
+        if (r->replay[i].message_id < ids[20]) before++;
+        if (r->replay[i].message_id > ids[20]) after++;
+        if (i) CHECK(r->replay[i - 1].message_id < r->replay[i].message_id);  /* ascending */
+    }
+    CHECK(has_target && before > 0 && after > 0);
+    oc_dbres_free(r);
+
+    /* At the very start there is nothing before it, and the window does not
+     * silently shrink to nothing. */
+    r = history_around(w, u, OC_DEFAULT_CHANNEL, ids[0], 10);
+    CHECK(r && r->n_replay > 0);
+    CHECK(r->replay[0].message_id == ids[0]);
+    oc_dbres_free(r);
+
+    /* At the end, likewise. */
+    r = history_around(w, u, OC_DEFAULT_CHANNEL, ids[40], 10);
+    CHECK(r && r->n_replay > 0);
+    CHECK(r->replay[r->n_replay - 1].message_id == ids[40]);
+    oc_dbres_free(r);
+
+    /* Read access still gates it — a permalink is not a way around membership. */
+    uint64_t outsider = reg(w, "mallory", "pw", OC_ROLE_MEMBER);
+    oc_dbres_free(create_channel(w, u, "secret", 0));
+    r = history_around(w, outsider, 4242, ids[20], 10);
+    CHECK(r && r->n_replay == 0);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_saved_and_activity(void) {
     const char *path = "build/test_dbwriter_saved.db";
     cleanup_db(path);
@@ -2893,6 +2959,7 @@ int run_dbwriter_tests(void) {
     test_channel_details();
     test_channel_mutability();
     test_saved_and_activity();
+    test_history_around();
     test_delete_clears_message_extras();
     test_max_users();
     return failures;

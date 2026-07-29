@@ -139,6 +139,9 @@ typedef struct oc_job {
     /* SAVE_ITEM (message_id above): add/remove. */
     uint8_t        save_op;
 
+    /* HISTORY: 0 pages backwards from message_id, 1 fetches AROUND it (ARCH-96). */
+    uint8_t        hist_around;
+
     /* SEARCH: query text is carried in body/body_len; this bounds the result. */
     uint16_t       search_limit;
 

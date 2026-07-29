@@ -2962,22 +2962,46 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
     uint16_t lim = j->search_limit;
     if (lim == 0 || lim > OC_BACKFILL_TAIL) lim = OC_BACKFILL_TAIL;
     uint64_t before = j->message_id ? j->message_id : (uint64_t)INT64_MAX;
+    /* `around` splits the budget either side of the target, so ?3 is half. */
+    if (j->hist_around) { before = j->message_id; if (lim > 1) lim = (uint16_t)(lim / 2); }
 
     sqlite3_stmt *st = NULL;
-    /* Innermost query walks DESC to take the page nearest `before`; the outer
-     * one flips it back to ascending, which is the order a replay must arrive
-     * in for the client's high-water dedup to behave. */
-    if (sqlite3_prepare_v2(db,
-            "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name FROM ("
-            "  SELECT m.id AS id, m.author_id AS author_id, m.created_at_ms AS created_at_ms,"
-            "         m.body AS body,"
-            "         (SELECT COUNT(*) FROM messages c WHERE c.parent_id=m.id) AS reply_count,"
-            "         (SELECT COALESCE(MAX(c.created_at_ms),0) FROM messages c WHERE c.parent_id=m.id) AS last_reply,"
-            "         COALESCE(NULLIF(m.author_name,''), u.display_name, '') AS author_name"
-            "    FROM messages m LEFT JOIN users u ON u.id = m.author_id"
-            "   WHERE m.channel_id=?1 AND m.id<?2 AND m.parent_id IS NULL"
-            "   ORDER BY m.id DESC LIMIT ?3"
-            ") ORDER BY id;", -1, &st, NULL) != SQLITE_OK)
+    /* Two modes, one replay (ARCH-96). Both select the same columns and both end
+     * ascending, which is the order a replay must arrive in for the client's
+     * high-water dedup to behave — only the window differs:
+     *
+     *   page   — the newest `limit` messages OLDER than `before` (§6.3).
+     *   around — half either side of an id, so a permalink lands mid-screen
+     *            with context rather than pinned to an edge (REQ-232).
+     *
+     * The projection is spelled once and shared, because every field in it —
+     * reply counts, the webhook author-name override, attachments loaded below —
+     * has been a bug in the replay path at least once, and a second copy is a
+     * second place to forget one. */
+#define OC_HIST_COLS \
+    "  SELECT m.id AS id, m.author_id AS author_id, m.created_at_ms AS created_at_ms," \
+    "         m.body AS body," \
+    "         (SELECT COUNT(*) FROM messages c WHERE c.parent_id=m.id) AS reply_count," \
+    "         (SELECT COALESCE(MAX(c.created_at_ms),0) FROM messages c WHERE c.parent_id=m.id) AS last_reply," \
+    "         COALESCE(NULLIF(m.author_name,''), u.display_name, '') AS author_name" \
+    "    FROM messages m LEFT JOIN users u ON u.id = m.author_id"
+
+    const char *sql = j->hist_around
+        ? "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name FROM ("
+          "  SELECT * FROM (" OC_HIST_COLS
+          "   WHERE m.channel_id=?1 AND m.parent_id IS NULL AND m.id<=?2"
+          "   ORDER BY m.id DESC LIMIT ?3)"
+          "  UNION ALL"
+          "  SELECT * FROM (" OC_HIST_COLS
+          "   WHERE m.channel_id=?1 AND m.parent_id IS NULL AND m.id>?2"
+          "   ORDER BY m.id ASC LIMIT ?3)"
+          ") ORDER BY id;"
+        : "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name FROM ("
+          OC_HIST_COLS
+          "   WHERE m.channel_id=?1 AND m.id<?2 AND m.parent_id IS NULL"
+          "   ORDER BY m.id DESC LIMIT ?3"
+          ") ORDER BY id;";
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK)
         return r;
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)before);

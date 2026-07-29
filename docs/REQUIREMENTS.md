@@ -995,8 +995,15 @@ architecture decision.*
 - **REQ-232.** Every message has had a stable **permalink** — an addressable
   reference resolving to the message in its channel/thread — that a client could
   follow to **jump to that message** in context, loading surrounding history as
-  needed. **[needs ARCH decision — permalink form + a fetch-around-an-id backfill
-  mode, cf. ARCH-46's cursor replay.]**
+  needed. **Built (ARCH-96):** the link is `openchime://<host>/c/<channel>/m/<id>`
+  — **ids, not names**, because a channel can be renamed (REQ-036) and a link
+  built from a name would rot the moment it was. The half that matters is
+  `HISTORY_AROUND`, a second mode on the history read that returns the messages
+  surrounding an id: every surface that points at a message (pins, files,
+  activity, saved items, search) previously dead-ended with "that message is
+  older than the loaded history". *Not built:* registering the `openchime://`
+  scheme with the OS — a machine-wide registry write is an install-time act, not
+  something a chat client should do as a side effect.
 - **REQ-233.** A user has been able to set a **reminder** on a message or a
   free-text note for a chosen time, delivered to them (typically as a bot DM) when
   due. **[needs ARCH decision — reminder storage + delivery, cf. the scheduled-
