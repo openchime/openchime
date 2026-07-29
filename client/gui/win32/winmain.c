@@ -1550,23 +1550,25 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     g_ws_hdr_btn = rf(RAIL_W, 0, g_hdr_gear.left - 4, HEADER_H);
     char wsname[80]; ws_display_name(m, wsname, sizeof wsname);
     draw_text(rt, wsname, g_hdr, rf(RAIL_W + 16, 0, g_hdr_gear.left - 22, HEADER_H), OC_COL_TEXT);
-    /* Connection state belongs to the WORKSPACE, so it lives on the workspace's
-     * name — not in the channel header, where it read as a property of the
-     * channel (WIN-64). Clicking it retries when we are not live. */
+    /* Chevron and connection dot both hug the NAME, in that order — the chevron
+     * belongs to the name (it opens the workspace menu), and the dot is a status
+     * on the workspace, so both travel with the text rather than sitting at the
+     * far edge where they read as unrelated chrome. */
     {
-        float dx = RAIL_W + 16 + text_width(wsname, g_hdr) + 10;
-        float lim = g_hdr_gear.left - 26;
-        if (dx > lim) dx = lim;
+        float nx  = RAIL_W + 16 + text_width(wsname, g_hdr);
+        float lim = g_hdr_gear.left - 30;              /* never crowd the gear */
+        if (nx > lim) nx = lim;
+        draw_text(rt, "\xE2\x96\xBE", g_small, rf(nx + 6, 2, nx + 22, HEADER_H), OC_COL_MUTED);
+
+        float dx = nx + 22;
+        if (dx > g_hdr_gear.left - 20) dx = g_hdr_gear.left - 20;
         int live = m->authed ? 1 : 0;
         draw_conn_dot(rt, dx + 5, HEADER_H / 2, 4.5f, live);
         /* Only a hit-box when it would DO something: a control that silently
          * does nothing is worse than no control. */
         g_ws_dot = live ? rf(0, 0, 0, 0)
-                        : rf(dx - 5, HEADER_H / 2 - 12, dx + 15, HEADER_H / 2 + 12);
+                        : rf(dx - 4, HEADER_H / 2 - 12, dx + 14, HEADER_H / 2 + 12);
     }
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    draw_text(rt, "\xE2\x96\xBE", g_small, rf(RAIL_W + 16, 2, g_hdr_gear.left - 8, HEADER_H), OC_COL_MUTED);
-    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
 
     /* "Find a conversation" box — a rounded container with a search glyph; the
      * native EDIT child (g_find) sits inside and live-filters the list. */
