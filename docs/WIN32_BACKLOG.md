@@ -9,7 +9,7 @@ clients, or a `REQ-NNN`.
 parity table is the *feature reachability* tracker. This document is the *work
 list* derived from both — one row per shippable branch.
 
-**Ids.** Items are `WIN-1` … `WIN-68`, numbered once and **stable**: an id is
+**Ids.** Items are `WIN-1` … `WIN-69`, numbered once and **stable**: an id is
 never renumbered or reused, so a commit or branch can cite it. Ordering is *not*
 priority — the **Pri** column is, and it may change. Section membership may also
 change as blockers clear (an item moves from §3 to §1 without changing its id).
@@ -215,6 +215,14 @@ Recorded because a defect nobody wrote down is a defect nobody fixes.
   order the meta lines the same way, so the fix is one reordering applied twice —
   and they must stay in step or the transcript's hit-boxes drift from what is
   drawn.
+- ~~**WIN-69 — the DMs rail item was Home with a section folded.**~~ **FIXED
+  2026-07-29.** `VIEW_DMS` differed from Home by one line (`collapsed[CHANNELS]`),
+  which is a bookmark, not a destination. Slack's earns its place by being a
+  different *kind* of list — person-centric, every row a human, including people
+  you have never messaged, so it doubles as the start-a-conversation surface.
+  Ours now does the same over the roster we already hold: conversations first,
+  everyone else below, picking anyone opens or creates the DM and lands you in
+  it. It also gives **self-DM** (REQ-055) its first surface in any client.
 - ~~**WIN-68 — the Admin rail item was a signpost to somewhere else.**~~
   **FIXED 2026-07-29.** It rendered "Storage & audit — open from the workspace
   menu": a destination whose entire content was directions. Both reports were

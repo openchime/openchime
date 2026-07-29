@@ -126,8 +126,8 @@ Vendor-facing rows are inherently perishable — a competitor can change a plan 
 |---|---|---|---|---|---|
 | Direct messages (1:1) | ✅ | ✅ | ✅ DM group in sidebar | 🟡 no dedicated DM list/section | Win32 lacks a DM section. **P0** |
 | Group DMs (multi-person) | ✅ up to 8 | ✅ | ❌ | ❌ | Verify wire support. **P2** |
-| Message yourself / self-DM | ✅ | ✅ | ❌ | ❌ | Note: the **engine** supports self-DM (REQ-055); neither frontend surfaces it. **P2** |
-| New DM start | ✅ | ✅ | 🟡 new-DM prompt | 🟡 (via member) | Present. — |
+| Message yourself / self-DM | ✅ | ✅ | ❌ | ✅ a row in the DMs index | REQ-055 was built on the engine and unreachable in every client until the DMs index gave it a row. **P2 (TUI)** |
+| New DM start | ✅ | ✅ | 🟡 new-DM prompt | ✅ the DMs index lists everyone, including people you have never messaged | Slack's shape: the DM destination doubles as the start-a-conversation surface. — |
 | Members / roster panel | ✅ | ✅ | 🟡 click-to-DM, **workspace** roster | 🟡 **channel** roster + header count chip + presence dot and an inline role glyph (crown/shield); no search/scroll | Win32 fixed (REQ-031/ARCH-91): it listed the *tenant* roster beside a channel name, which was wrong for any workspace with more people than one channel. TUI still shows the workspace roster. Server cap 500. **P1 (TUI)** |
 | View other-user profile | ✅ rich profile pane | ✅ | ❌ (its `/profile` modal is your OWN identity) | 🟡 profile card in the right-hand **context pane** (ARCH-94): avatar, name, live presence, role, Message | Win32 built (WIN-10). Thin next to Slack's — no title, timezone, email or custom fields (REQ-240/241, unbuilt). TUI still cannot view a peer. **P1 (TUI)** |
 | Member action menu (message/role/remove) | ✅ | ✅ | 🟡 | 🟡 no profile/deactivate | Present, shallow. **P1** |
@@ -444,7 +444,7 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 ## 5. Recommended Build Order for Win32 (current focus) — top 10 by impact
 
 > **The execution list lives in [WIN32_BACKLOG.md](./WIN32_BACKLOG.md)** — every
-> gap below, numbered `WIN-1`…`WIN-68`, split by whether it is buildable today or
+> gap below, numbered `WIN-1`…`WIN-69`, split by whether it is buildable today or
 > blocked on daemon work. This section stays the *rationale* for the ordering.
 
 **Rewritten 2026-07-28.** The original top 10 is essentially spent: items 1, 4, 5,

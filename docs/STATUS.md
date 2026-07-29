@@ -189,8 +189,11 @@ DM, upload, search). The channel column gained a header with settings + compose
 buttons and a **"Find a conversation"** filter box (a native `EDIT` that
 substring-filters channel names).
 
-**Only Home and DMs render the chat shell**, and they render it identically —
-`VIEW_DMS` has no DM-specific behaviour yet. **Activity, Files and Later are still `draw_stub_view` placeholders** ("coming soon"), mapping
+**Home and DMs both render the chat shell**, but they are no longer the same
+thing: **DMs is a person-centric index** — every workspace member as a row, with
+existing conversations first and everyone else below, picking one opening (or
+creating) the DM. It also surfaces **self-DM** (REQ-055), which the engine has
+supported all along with no client able to reach it. **Activity, Files and Later are still `draw_stub_view` placeholders** ("coming soon"), mapping
 onto REQ-139 (activity feed), REQ-143 (a *workspace-wide* files view), REQ-231
 (saved items) and REQ-138 respectively. Two notes on that list: **Preferences is
 no longer a stub** (WIN-9), and the **Files** stub is now the cheapest of them to
