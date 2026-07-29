@@ -215,6 +215,20 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **Archive is a tombstone with a date, not a delete.** `archived_at_ms` non-NULL means archived, which makes "when" free and makes unarchive a single `NULL` write. The daemon refuses **sends** to an archived channel (a new `CHANNEL_ARCHIVED` error) and hides it from the default channel list, while history, search and membership stay intact — REQ-035's whole point is that archiving is the reversible alternative to a deletion we do not offer for channels holding history. Enforcement is server-side: a client that forgets to grey its composer is a cosmetic bug, not a data one.
 
+- **ARCH-94 (Where a surface goes: three columns and a modal):** A rule for the graphical clients, because "which pane does this open in" was being answered case by case and the answers had stopped agreeing.
+
+  **Left is navigation. Middle is the conversation. Right is the people in it. Anything about *your own account* is a modal.**
+
+  - **Middle** — the transcript and everything scoped to *this channel*: its tabs (Messages · Files & links · Pins · About), search results, the admin reports. These are content; they belong where content is.
+  - **Right — the context pane.** Who is here, and who someone is: the member roster, a person's card, the list of who reacted. It sits **beside** the transcript, not over it, so looking someone up does not cost you your place. It carries one level of back, because opening a person's card from the roster must be undoable.
+  - **Modal** — preferences, keyboard shortcuts, workspace management, your notification settings. These *interrupt*: they are not context for what you are reading, and they should not be reachable by accident. A dimmed shell and a centred card says so, and dismissing returns you exactly where you were. Editing your own name or password was already a modal form; this makes the rest consistent with it.
+
+  **What this rules out, deliberately:** a person's profile replacing the conversation (it did, and every profile view cost you your scroll position and closed any open thread), and settings living in the same slot as messages.
+
+  **Threads stay in the middle column** and are expected to become *inline* rather than a pane. Slack puts threads in its right-hand pane; we are not copying that, because a thread is a conversation — the middle column's job — and the right pane is for people. Recorded so the omission reads as a decision rather than an oversight.
+
+  **The pane is 300px, not 220.** A profile did not fit in 220 and will fit less as REQ-240/241 add fields. It is not yet resizable; that is the obvious next ask.
+
 ## Discovery
 
 - **ARCH-14 (Rule):** Workspace-address, resolved by plain DNS — **there is no resolution *service*, in any deployment model** (ARCH-76). At sign-in the client collects the **workspace** (the tenant's address) plus the user's **email** directly, the same model as Slack's "enter your workspace URL." The workspace is turned into a daemon address by ordinary DNS, with no shared, always-on, cross-tenant lookup component to run: consistent with the island model (ARCH-4) and the "no runtime configuration dependency" stance (ARCH-26). Note the DNS *records* under the service suffix (forms 2 and 3 below) are maintainer-provided and so are counted as a federated function in ARCH-76 — but they are static records, not a request-serving component, so no lookup traffic reaches the project. Three forms, one per deployment model:

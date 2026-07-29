@@ -9,7 +9,7 @@ clients, or a `REQ-NNN`.
 parity table is the *feature reachability* tracker. This document is the *work
 list* derived from both — one row per shippable branch.
 
-**Ids.** Items are `WIN-1` … `WIN-66`, numbered once and **stable**: an id is
+**Ids.** Items are `WIN-1` … `WIN-67`, numbered once and **stable**: an id is
 never renumbered or reused, so a commit or branch can cite it. Ordering is *not*
 priority — the **Pri** column is, and it may change. Section membership may also
 change as blockers clear (an item moves from §3 to §1 without changing its id).
@@ -215,6 +215,15 @@ Recorded because a defect nobody wrote down is a defect nobody fixes.
   order the meta lines the same way, so the fix is one reordering applied twice —
   and they must stay in step or the transcript's hit-boxes drift from what is
   drawn.
+- ~~**WIN-67 — surfaces opened in whichever pane happened to be handy.**~~
+  **FIXED 2026-07-29 (ARCH-94).** A person's profile replaced the *conversation*,
+  which cost you your scroll position and closed any open thread, and your own
+  preferences opened in the same slot as messages. Now: middle = the
+  conversation and everything channel-scoped, right = the **context pane**
+  (members · a person's card · who reacted, with one level of back), and your own
+  account (preferences, shortcuts, workspaces, notification settings) is a
+  **modal** over a dimmed shell. The pane widened 220 → 300 because a profile did
+  not fit; the profile card was relaid out vertically for it.
 - ~~**WIN-66 — the profile pane opened by itself.**~~ **FIXED 2026-07-29.** The
   members-pane hit test compared **y only** — `g_memrows` stored `top`/`bot` and
   no x — so a click anywhere across the window at a member row's height opened

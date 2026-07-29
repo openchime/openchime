@@ -126,7 +126,13 @@ static float composer_inner_h(void) { return g_composer_h - COMPOSER_CHROME; }
 #define ROW_H       32.0f     /* a sidebar channel row */
 #define AVA         36.0f     /* transcript avatar diameter */
 #define LINE_H      19.0f     /* an extra (reaction/attach/thread) line */
-#define MEMBERS_W   220.0f    /* the (toggleable) right-hand members pane */
+/* The right-hand CONTEXT pane. It holds what is true about *people* in this
+ * conversation — the member list, and a person's card when you open one. Your
+ * OWN account (preferences, shortcuts, workspaces, notification settings) is a
+ * modal instead: those interrupt, they are not context for what you are reading.
+ * 300 rather than the original 220 because a profile does not fit in 220 and
+ * will fit less as REQ-240/241 add fields. */
+#define MEMBERS_W   300.0f
 
 /* Primary views selected by the left-nav rail (Slack-style). HOME/DMS/ADMIN are
  * real today; ACTIVITY/FILES/LATER/NOTIFICATIONS are stubs until their features
@@ -1180,9 +1186,13 @@ static void close_overlays(void) {
     if (mm->audit_open)     oc_client_toggle_audit(g_client, 0);
 }
 
+/* Something is covering the MIDDLE column. Modals are not here: they cover the
+ * whole window and are handled ahead of everything (see draw_modal). Nor is the
+ * context pane (profile, reactors) — it sits BESIDE the transcript rather than
+ * over it, so the transcript stays live and hoverable while it is open. */
 static int any_overlay(const oc_model *m) {
-    return g_prefs_open || g_profile_uid || g_notify_open || g_keys_open || g_wsmgr_open ||
-           (m && (m->thread_open || m->search_open || m->reactlist_open ||
+    return
+           (m && (m->thread_open || m->search_open ||
                   m->pinlist_open || m->weblist_open || m->storage_open ||
                   m->audit_open));
 }
@@ -2716,19 +2726,6 @@ static void draw_keys(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
     ovl_end(rt, body);
 }
 
-static void draw_reactlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
-    D2D1_RECT_F body = overlay_header(rt, reg, "Who reacted");
-    if (m->n_reactors == 0) { overlay_empty(rt, body, "No reactions."); return; }
-    float y = body.top + 6;
-    for (size_t i = 0; i < m->n_reactors && y < body.bottom; i++) {
-        const oc_reactor_row *rr = &m->reactors[i];
-        draw_text(rt, rr->emoji, g_ui, rf(body.left + 20, y, body.left + 60, y + 30), OC_COL_TEXT);
-        const char *nm = oc_model_user_name(m, rr->user_id);
-        draw_text(rt, (nm && nm[0]) ? nm : "user", g_ui,
-                  rf(body.left + 64, y, body.right - 16, y + 30), OC_COL_TEXT);
-        y += 30;
-    }
-}
 
 /* A channel's pinned messages (REQ-230). Each row is the message itself, so the
  * list is readable without jumping — and clicking still jumps, because a pin is
@@ -2942,7 +2939,9 @@ static float pref_row(ID2D1RenderTarget *rt, D2D1_RECT_F body, float y, int row,
                       const char *const *opts, int n_opts, int cur) {
     draw_text(rt, label, g_ui_b, rf(body.left + 24, y, body.left + 320, y + 22), OC_COL_TEXT);
     if (hint && hint[0])
-        draw_text(rt, hint, g_small, rf(body.left + 24, y + 20, body.left + 340, y + 40), OC_COL_FAINT);
+        /* Run to where the choice buttons start, not a magic 340: the hint was
+         * clipped mid-word ("outside Do Not Dis…") at any pane width. */
+        draw_text(rt, hint, g_small, rf(body.left + 24, y + 20, body.right - 210, y + 40), OC_COL_FAINT);
 
     float bx = body.right - 24;
     for (int i = n_opts - 1; i >= 0; i--) {
@@ -3007,47 +3006,76 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
               g_small, rf(body.left + 24, y + 4, body.right - 24, y + 24), OC_COL_FAINT);
 }
 
-static void draw_profile(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
-    D2D1_RECT_F body = overlay_header(rt, reg, "Profile");
+/* A person's card, in the context pane (right). Laid out VERTICALLY: the old
+ * version was a wide avatar-beside-text block built for the full middle column,
+ * which does not fit 300px and would fit less as REQ-240/241 add fields. */
+static void draw_profile_card(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
     const char *nm = oc_model_user_name(m, g_profile_uid);
     if (!nm || !nm[0]) nm = "user";
+    float cx = (reg.left + reg.right) / 2, y = reg.top + 18;
 
-    float cx = body.left + 40, cy = body.top + 32;
-    D2D1_ELLIPSE av = { { cx + 36, cy + 36 }, 36, 36 };
+    D2D1_ELLIPSE av = { { cx, y + 36 }, 36, 36 };
     ID2D1RenderTarget_FillEllipse(rt, &av, paint_with(AVPAL[g_profile_uid % 6]));
     char ini[2] = { (char)(nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]), 0 };
     IDWriteTextFormat_SetTextAlignment(g_hdr, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, ini, g_hdr, rf(cx, cy, cx + 72, cy + 72), 0xFFFFFF);
-    IDWriteTextFormat_SetTextAlignment(g_hdr, DWRITE_TEXT_ALIGNMENT_LEADING);
+    draw_text(rt, ini, g_hdr, rf(cx - 36, y, cx + 36, y + 72), 0xFFFFFF);
+    y += 84;
 
-    float tx = cx + 92;
-    draw_text(rt, nm, g_hdr, rf(tx, cy + 4, body.right - 24, cy + 30), OC_COL_TEXT);
+    draw_text(rt, nm, g_hdr, rf(reg.left + 12, y, reg.right - 12, y + 28), OC_COL_TEXT);
+    IDWriteTextFormat_SetTextAlignment(g_hdr, DWRITE_TEXT_ALIGNMENT_LEADING);
+    y += 30;
 
     uint8_t pres = oc_model_presence_of(m, g_profile_uid);
     const char *pl = pres == OC_PRESENCE_ONLINE ? "Active"
                    : pres == OC_PRESENCE_AWAY   ? "Away" : "Offline";
-    draw_presence_dot(rt, tx + 5, cy + 42, 5, pres, OC_COL_BASE);
-    draw_text(rt, pl, g_small, rf(tx + 16, cy + 32, body.right - 24, cy + 52), OC_COL_MUTED);
-
     uint8_t role = OC_ROLE_MEMBER;
     int known = 0;
     for (size_t i = 0; i < m->n_users; i++)
         if (m->users[i].user_id == g_profile_uid) { role = m->users[i].role; known = 1; break; }
+    char sub[96];
     const char *rl = role_label(role);
-    if (known && rl[0])
-        draw_text(rt, rl, g_small, rf(tx, cy + 52, body.right - 24, cy + 72), OC_COL_FAINT);
+    if (known && rl[0]) snprintf(sub, sizeof sub, "%s \u00B7 %s", pl, rl);
+    else                snprintf(sub, sizeof sub, "%s", pl);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, sub, g_small, rf(reg.left + 12, y, reg.right - 12, y + 20), OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    y += 34;
 
-    float by = cy + 96;
     if (g_profile_uid != m->user_id) {
-        g_prof_dm_btn = rf(tx, by, tx + 140, by + 32);
+        g_prof_dm_btn = rf(reg.left + 24, y, reg.right - 24, y + 32);
         fill_round(rt, g_prof_dm_btn, 7.0f, OC_COL_ACCENT);
         IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
         draw_text(rt, "Message", g_ui, g_prof_dm_btn, 0xFFFFFF);
         IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+        y += 44;
     } else {
         g_prof_dm_btn = rf(0, 0, 0, 0);
-        draw_text(rt, "This is you \u2014 edit your display name from the profile menu.",
-                  g_small, rf(tx, by + 6, body.right - 24, by + 26), OC_COL_FAINT);
+        draw_text(rt, "This is you.", g_small,
+                  rf(reg.left + 24, y, reg.right - 12, y + 20), OC_COL_FAINT);
+        y += 28;
+    }
+    /* The fields a real profile wants (REQ-240/241) do not exist yet; saying so
+     * is better than a card that looks finished and is not. */
+    draw_text(rt, "No title, timezone or email yet \u2014 those fields are not built.",
+              g_small_w, rf(reg.left + 16, y + 6, reg.right - 16, y + 56), OC_COL_FAINT);
+}
+
+/* Who reacted (REQ-071) — a list of PEOPLE, so it belongs in the context pane
+ * beside the conversation rather than replacing it. */
+static void draw_reactors_list(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    if (m->n_reactors == 0) {
+        draw_text(rt, "No reactions.", g_small,
+                  rf(reg.left + 16, reg.top + 8, reg.right - 12, reg.top + 30), OC_COL_FAINT);
+        return;
+    }
+    float y = reg.top + 6;
+    for (size_t i = 0; i < m->n_reactors && y < reg.bottom; i++) {
+        const oc_reactor_row *rr = &m->reactors[i];
+        draw_emoji_fmt(rt, rr->emoji, rf(reg.left + 14, y, reg.left + 38, y + ROW_H), g_emoji_s);
+        const char *nm = oc_model_user_name(m, rr->user_id);
+        draw_text(rt, (nm && nm[0]) ? nm : "user", g_ui,
+                  rf(reg.left + 44, y, reg.right - 12, y + ROW_H), OC_COL_TEXT);
+        y += ROW_H;
     }
 }
 
@@ -3114,14 +3142,8 @@ static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
         IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
         return;
     }
-    if (g_prefs_open)      { draw_prefs(rt, reg);        return; }
-    if (g_profile_uid)     { draw_profile(rt, m, reg);   return; }
-    if (g_wsmgr_open)      { draw_wsmgr(rt, reg);        return; }
-    if (g_notify_open)     { draw_notify_prefs(rt, m, reg); return; }
-    if (g_keys_open)       { draw_keys(rt, reg);         return; }
     if (m->thread_open)    { draw_thread(rt, m, reg);    return; }
     if (m->search_open)    { draw_search(rt, m, reg);    return; }
-    if (m->reactlist_open) { draw_reactlist(rt, m, reg); return; }
     if (m->pinlist_open)   { draw_pinlist(rt, m, reg);   return; }
     if (m->filelist_open)  { draw_filelist(rt, m, reg);  return; }
     if (g_tab == TAB_ABOUT) { draw_about(rt, m, reg);    return; }
@@ -3483,12 +3505,44 @@ static void draw_toasts(ID2D1RenderTarget *rt, float W, float H) {
     }
 }
 
+/* What the context pane is currently showing. MEMBERS is the resting state; the
+ * others are pushed on top of it and pop back with the header's back arrow. */
+enum { RP_MEMBERS = 0, RP_PROFILE, RP_REACTORS };
+static int      g_rp_mode;
+static D2D1_RECT_F g_rp_back, g_rp_close;
+
+static void rp_push(int mode) { g_rp_mode = mode; g_show_members = 1; }
+static void rp_pop(void) { g_rp_mode = RP_MEMBERS; g_profile_uid = 0; }
+
+static void draw_profile_card(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg);
+static void draw_reactors_list(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg);
+
 static void draw_members(ID2D1RenderTarget *rt, const oc_model *m, float W, float H) {
     float x0 = W - MEMBERS_W;
     fill(rt, rf(x0, 0, W, H), OC_COL_SIDEBAR);
     fill(rt, rf(x0, 0, x0 + 1, H), OC_COL_BORDER);
 
-    draw_text(rt, "MEMBERS", g_small, rf(x0 + 16, 10, W - 12, 34), OC_COL_FAINT);
+    /* One header for every mode: a title, a back arrow when there is somewhere
+     * to go back to, and a close. Without the back arrow, opening a person's
+     * card stranded you — the list you came from was gone. */
+    const char *title = g_rp_mode == RP_PROFILE  ? "PROFILE"
+                      : g_rp_mode == RP_REACTORS ? "REACTIONS" : "MEMBERS";
+    g_rp_back = g_rp_mode == RP_MEMBERS ? rf(0, 0, 0, 0) : rf(x0 + 8, 8, x0 + 30, 30);
+    if (g_rp_mode != RP_MEMBERS) {
+        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "\xE2\x80\xB9", g_ui, g_rp_back, OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+    }
+    draw_text(rt, title, g_small,
+              rf(x0 + (g_rp_mode == RP_MEMBERS ? 16 : 34), 10, W - 34, 34), OC_COL_FAINT);
+    g_rp_close = rf(W - 30, 8, W - 8, 30);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, "\xC3\x97", g_small, g_rp_close, OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+    if (g_rp_mode == RP_PROFILE)  { g_n_memrows = 0; draw_profile_card(rt, m, rf(x0, 40, W, H)); return; }
+    if (g_rp_mode == RP_REACTORS) { g_n_memrows = 0; draw_reactors_list(rt, m, rf(x0, 40, W, H)); return; }
+
     float y = 40;
     g_n_memrows = 0;
     /* This channel's members (REQ-031) — NOT the tenant roster, which is what
@@ -3909,6 +3963,41 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
                 has_text ? 0xFFFFFF : OC_COL_FAINT);
 }
 
+/* Your-account surfaces are MODALS, not panes (the three-column rule): the left
+ * column is navigation, the middle is the conversation, the right is people. Your
+ * own preferences, shortcuts, workspaces and notification settings are none of
+ * those — they interrupt, they are not context for what you are reading — so they
+ * dim the shell and sit in a centred card you dismiss.
+ *
+ * They used to replace the transcript, which made "change a setting" cost you
+ * your place in the conversation. */
+static int modal_open(void) {
+    return g_prefs_open || g_keys_open || g_wsmgr_open || g_notify_open;
+}
+
+static D2D1_RECT_F g_modal_card;
+
+static void draw_modal(ID2D1RenderTarget *rt, const oc_model *m, float W, float H) {
+    if (!modal_open()) { g_modal_card = rf(0, 0, 0, 0); return; }
+    D2D1_RECT_F all = rf(0, 0, W, H);
+    ID2D1RenderTarget_FillRectangle(rt, &all, paint_alpha(0x000000, 0.50f));
+
+    float cw = W - 160, ch = H - 120;
+    if (cw > 720) cw = 720;
+    if (ch > 620) ch = 620;
+    if (cw < 320) cw = W;
+    if (ch < 240) ch = H;
+    D2D1_RECT_F card = rf((W - cw) / 2, (H - ch) / 2, (W + cw) / 2, (H + ch) / 2);
+    g_modal_card = card;
+    fill_round(rt, card, 10.0f, OC_COL_BASE);
+    stroke_round(rt, card, 10.0f, OC_COL_BORDER, 1.0f);
+
+    if (g_prefs_open)       draw_prefs(rt, card);
+    else if (g_keys_open)   draw_keys(rt, card);
+    else if (g_wsmgr_open)  draw_wsmgr(rt, card);
+    else if (g_notify_open) draw_notify_prefs(rt, m, card);
+}
+
 /* ---- paint --------------------------------------------------------------- */
 
 /* Draw the whole UI into `rt` (window RT for painting, or a DC RT for test
@@ -3992,6 +4081,7 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         }
         g_n_memrows = 0;
     }
+    draw_modal(rt, m, W, H);  /* your-account surfaces, over a dimmed shell */
     draw_more_flyout(rt);   /* floats over the pane when open */
     draw_palette(rt, m, W, H);   /* the palette dims and covers the app */
     draw_menu(rt);          /* dropdown menus float on top of everything */
@@ -4278,7 +4368,9 @@ static LRESULT CALLBACK re_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     if ((msg == WM_KEYDOWN || msg == WM_CHAR) && wp == VK_ESCAPE) {
         if (g_pick_open) { if (msg == WM_KEYDOWN) picker_close(GetParent(hwnd)); return 0; }
-        if (any_overlay(model())) {
+        /* modal_open() explicitly: a modal is not an `any_overlay` (it covers the
+         * whole window, not the middle column), but Esc must still dismiss it. */
+        if (modal_open() || any_overlay(model())) {
             if (msg == WM_KEYDOWN) close_overlays();
             return 0;
         }
@@ -4831,7 +4923,7 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
     } else if (cmd == 100) {
         g_scroll = 0; oc_client_open_thread(g_client, g_sel, mid);
     } else if (cmd == 102) {
-        g_scroll = 0; oc_client_list_reactions(g_client, chan, mid);
+        oc_client_list_reactions(g_client, chan, mid); rp_push(RP_REACTORS);
     } else if (cmd == 103) {
         oc_client_pin(g_client, chan, mid, msg->pinned ? OC_PIN_REMOVE : OC_PIN_ADD);
     } else if (cmd >= 30 && cmd - 30 < msg->n_attach) {
@@ -4858,7 +4950,7 @@ static void show_member_menu(HWND hwnd, const oc_model *m, uint64_t uid, int sx,
     DestroyMenu(menu);
     switch (cmd) {
     case 1:  oc_client_open_dm(g_client, uid); break;
-    case 2:  close_overlays(); g_profile_uid = uid; g_view = VIEW_HOME; break;
+    case 2:  g_profile_uid = uid; rp_push(RP_PROFILE); break;
     case 10: oc_client_set_role(g_client, uid, OC_ROLE_MEMBER); break;
     case 11: oc_client_set_role(g_client, uid, OC_ROLE_ADMIN); break;
     case 12: oc_client_set_role(g_client, uid, OC_ROLE_OWNER); break;
@@ -4887,6 +4979,12 @@ static void prefs_save(void);          /* fwd */
 static void prefs_load(const oc_model *m);   /* fwd */
 
 static int on_click(HWND hwnd, int x, int y) {
+    /* A modal owns the window while it is up: a click outside the card dismisses
+     * it, and nothing behind it is reachable. Tested first for that reason. */
+    if (modal_open() && !in_rect(g_modal_card, (float)x, (float)y)) {
+        close_overlays();
+        return 1;
+    }
     if (g_lightbox) { g_lightbox = 0; return 1; }   /* any click dismisses it */
     if (g_pal_open) {
         for (int i = 0; i < g_n_pal_rows; i++)
@@ -5334,14 +5432,18 @@ static int on_click(HWND hwnd, int x, int y) {
             }
         return 1;
     }
+    /* Context-pane header: back pops to the member list, close hides the pane. */
+    if (g_show_members && in_rect(g_rp_back, x, y))  { rp_pop(); return 1; }
+    if (g_show_members && in_rect(g_rp_close, x, y)) {
+        rp_pop(); g_show_members = 0; layout_composer(hwnd); return 1;
+    }
     /* Members-pane rows: click opens the person's profile (WIN-10), which is
      * where "Message" now lives. Jumping straight into a DM made viewing someone
      * impossible, and it is the more destructive of the two actions. */
     for (int i = 0; i < g_n_memrows; i++)
         if (in_rect(g_memrows[i].r, x, y)) {
-            close_overlays();
             g_profile_uid = g_memrows[i].uid;
-            g_view = VIEW_HOME;
+            rp_push(RP_PROFILE);
             return 1;
         }
     return 0;
@@ -7461,7 +7563,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
         if (wp == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)) { copy_selection(hwnd); return 0; }
         if (wp == VK_ESCAPE && g_lightbox) { g_lightbox = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
+        /* Esc pops the context pane back to the member list before it reaches
+         * the middle column's overlays — the pane is what you just opened. */
+        if (wp == VK_ESCAPE && g_rp_mode != RP_MEMBERS) {
+            rp_pop(); InvalidateRect(hwnd, NULL, FALSE); return 0;
+        }
         if (wp == VK_ESCAPE && g_menu) { g_menu = MENU_NONE; g_menu_hover = -1; InvalidateRect(hwnd, NULL, FALSE); return 0; }
+        if (wp == VK_ESCAPE && modal_open()) { close_overlays(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_ESCAPE && g_more_open) { g_more_open = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_ESCAPE && g_has_sel) { g_has_sel = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_OEM_2 && (GetKeyState(VK_CONTROL) & 0x8000)) {   /* Ctrl+/ */
