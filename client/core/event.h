@@ -39,7 +39,8 @@ enum {
     OC_EV_AUTH_OK,         /* authenticated; user_id set */
     OC_EV_WORKSPACE_INFO,  /* a WORKSPACE_INFO: status=deployment_mode, count=max_users, body=name */
     OC_EV_MESSAGE,         /* a BROADCAST: channel/author/message_id/time + body */
-    OC_EV_CHANNEL,         /* a CHANNEL_LIST entry: channel_id + name(body) + status */
+    OC_EV_CHANNEL,         /* a CHANNEL_LIST entry / CHANNEL_INFO: channel_id + name(body)
+                              + status, plus topic (author_name) and archived (REQ-034/035) */
     OC_EV_PRESENCE,        /* a PRESENCE_UPDATE: user_id + status */
     OC_EV_REACTION,        /* a REACTION_UPDATED: channel/message/user + emoji/op/count */
     OC_EV_EDIT,            /* a MSG_EDITED: channel/message + new body */
@@ -100,6 +101,11 @@ typedef struct {
     uint32_t count;        /* REACTION: running aggregate count for the emoji */
     uint64_t pinned_at;    /* PINNED_MSG: when it was pinned (REQ-230). Its own field
                               because a ms timestamp does not fit in `count`. */
+    char    *topic;        /* heap; CHANNEL: the channel topic, NULL = none (REQ-034).
+                              Its own field because a topic is up to 250 bytes and
+                              every fixed buffer here is smaller. */
+    uint8_t  archived;     /* CHANNEL: the channel is archived (REQ-035) */
+    uint64_t created_at;   /* CHANNEL (from CHANNEL_INFO): when it was created */
     uint64_t size;         /* FILE: byte size (REQ-143) */
     uint64_t attach_id;    /* FILE: the attachment's own id */
     uint8_t  reclaimed;    /* FILE: bytes reclaimed; the row is a tombstone */
@@ -131,6 +137,8 @@ enum {
     OC_CMD_OPEN_DM,         /* open/get a 1:1 DM with `channel_id` (reused as target user id) */
     OC_CMD_PIN,            /* pin/unpin `message_id` in `channel_id`: op = add/remove */
     OC_CMD_LIST_PINS,      /* list `channel_id`'s pinned messages */
+    OC_CMD_UPDATE_CHANNEL, /* set topic / rename / archive / unarchive `channel_id`:
+                              op = OC_CHUP_*, body = the new topic or name (REQ-034/035/036) */
     OC_CMD_LIST_MEMBERS,   /* list `channel_id`'s members (REQ-031) */
     OC_CMD_LIST_FILES,     /* list files in `channel_id` (0 = everywhere I can read) */
     OC_CMD_LIST_REACTIONS,  /* inspect who reacted to `message_id` in `channel_id` */

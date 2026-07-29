@@ -78,10 +78,10 @@ Not startable in this client. Each names what must land first.
 
 | # | Item | Blocked on |
 |---|---|---|
-| **WIN-34** | Channel rename | REQ-036 — no rename op exists |
-| **WIN-35** | Channel topic / description | REQ-034 — no topic column |
-| **WIN-36** | Channel archive | REQ-035 — no archive flag or read-only enforcement |
-| ~~**WIN-37**~~ | ~~Channel details pane (members / pinned / files tabs)~~ **DONE** (the tabs half). A Slack-shaped channel tab strip under the header — **Messages · Files & links · Pins** — replacing the ad-hoc "Pinned"/"Members" header buttons, plus a compact member-count chip. The members pane now lists the **channel's** roster (REQ-031's new `LIST_MEMBERS`), not the tenant's. Channel rename/topic/archive (WIN-34–36) remain unbuilt and would add a settings tab later. | — |
+| ~~**WIN-34**~~ | ~~Channel rename~~ **DONE.** REQ-036/ARCH-93: owner/admin, from the **About** tab. The id is untouched, so membership and history follow the rename; a collision reports `CHANNEL_EXISTS`. | — |
+| ~~**WIN-35**~~ | ~~Channel topic / description~~ **DONE.** REQ-034/ARCH-93: any member sets it from the **About** tab; it renders on the channel header's second line, yielding to a typing indicator. | — |
+| ~~**WIN-36**~~ | ~~Channel archive~~ **DONE.** REQ-035/ARCH-93: owner/admin, confirmed, reversible. Header badge, read-only composer that says why, and the daemon refuses every write path regardless. | — |
+| ~~**WIN-37**~~ | ~~Channel details pane (members / pinned / files tabs)~~ **DONE.** A Slack-shaped channel tab strip under the header — **Messages · Files & links · Pins** — replacing the ad-hoc "Pinned"/"Members" header buttons, plus a compact member-count chip. The members pane now lists the **channel's** roster (REQ-031's new `LIST_MEMBERS`), not the tenant's. Completed by WIN-34–36, which added the fourth tab, **About**. | — |
 | **WIN-38** | Search paging | Wire gap: `SEARCH_RESULTS` carries `truncated` but **no cursor or offset**, so load-more is impossible today |
 | **WIN-39** | Search operators (`from:` / `in:` / `has:` / dates) | REQ-081 — no operator grammar |
 | **WIN-40** | Mute channel/DM (suppress + de-emphasize) | REQ-137 — distinct from level=none; needs per-user mute storage |

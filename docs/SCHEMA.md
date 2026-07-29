@@ -4,7 +4,7 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Status.** **Migrations 0001–0023 are applied.** 0001 establishes the core
+**Status.** **Migrations 0001–0024 are applied.** 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
 credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
 `users.disabled` lockout flag; **0004** (§3b) reactions; **0005** (§3c) threads;
@@ -15,7 +15,7 @@ notification preferences and the DND window; **0013** (§3k) synced client
 settings; **0014–0015** attachment tombstones and reclaim reason; **0016** (§3l)
 the audit log; **0017** (§3m) federated enrollment; **0018** (§3n) push device
 tokens; **0019** (§3o) the DM participant-set key; **0020** (§3p) the
-unique channel name; **0021** (§3q) resolved @mentions; **0022** (§3r) pinned messages; **0023** (§3s) the channel-files index.
+unique channel name; **0021** (§3q) resolved @mentions; **0022** (§3r) pinned messages; **0023** (§3s) the channel-files index; **0024** (§3t) channel topic + archive.
 
 *Corrected: an earlier revision of this line said presence, notification config,
 and attachments were "intentionally not here yet." Notification config landed in
@@ -625,6 +625,31 @@ query reads.
 The member roster (REQ-031) needed no migration at all — `channel_members` is
 keyed `(channel_id, user_id)`, so listing one channel's members already reads a
 prefix of the primary key.
+
+---
+
+## 3t. Migration 0024 — channel topic and archive (REQ-034/035/036, ARCH-93)
+
+```sql
+ALTER TABLE channels ADD COLUMN topic TEXT;
+ALTER TABLE channels ADD COLUMN archived_at_ms INTEGER;
+CREATE INDEX idx_channels_archived ON channels(archived_at_ms);
+```
+
+*Two columns for three features.* **Rename needs no column at all** — the name
+was always mutable and everything durable keys on `channels.id`, so a rename is
+an `UPDATE`. There is deliberately **no name-history table**: ARCH-93 records why
+(permalinks must key on ids).
+
+*`archived_at_ms` non-NULL is the flag*, rather than a boolean beside a date. One
+column cannot disagree with itself, "when was this archived" comes free, and
+unarchive is a single NULL write.
+
+*`topic`* is NULL or `''` for "none" — the writer stores NULL when given an empty
+string, so the two spellings do not both end up in the table.
+
+The index is on `archived_at_ms` because the sidebar's default query is "channels
+I can see that are **not** archived".
 
 ---
 

@@ -10,6 +10,7 @@ oc_ev *oc_ev_new(int type) {
 void oc_ev_free(oc_ev *e) {
     if (!e) return;
     free(e->body);
+    free(e->topic);
     free(e);
 }
 

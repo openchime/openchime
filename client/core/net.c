@@ -450,6 +450,10 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (ents[i].kind == OC_CHANNEL_KIND_DM) e->user_id = ents[i].peer_id;
                 e->body = malloc(ents[i].name.len + 1);
                 if (e->body) { memcpy(e->body, ents[i].name.ptr, ents[i].name.len); e->body[ents[i].name.len] = '\0'; }
+                e->archived = ents[i].archived;
+                e->created_at = ents[i].created_at;
+                e->topic = malloc(ents[i].topic.len + 1);
+                if (e->topic) { memcpy(e->topic, ents[i].topic.ptr, ents[i].topic.len); e->topic[ents[i].topic.len] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_WORKSPACE_INFO) {
@@ -475,6 +479,10 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->user_id = ci.peer_id;           /* DM peer, if any */
                     e->body = malloc(ci.name.len + 1);
                     if (e->body) { memcpy(e->body, ci.name.ptr, ci.name.len); e->body[ci.name.len] = '\0'; }
+                    e->archived = ci.archived;
+                    e->created_at = ci.created_at;
+                    e->topic = malloc(ci.topic.len + 1);
+                    if (e->topic) { memcpy(e->topic, ci.topic.ptr, ci.topic.len); e->topic[ci.topic.len] = '\0'; }
                     oc_queue_push(to_ui, e);
                 }
             }
@@ -1280,6 +1288,13 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_list_pins lp = { c->channel_id };
                 if (oc_encode_list_pins(&w, OC_PROTOCOL_VERSION, &lp) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_UPDATE_CHANNEL) {
+                uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_update_channel uc = { c->channel_id, c->op,
+                                         oc_slice_str(c->body ? c->body : "") };
+                if (oc_encode_update_channel(&w, OC_PROTOCOL_VERSION, &uc) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_LIST_MEMBERS) {

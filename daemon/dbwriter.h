@@ -275,6 +275,7 @@ typedef struct {
     uint8_t  kind;       /* OC_CHANNEL_KIND / OC_CHANNEL_KIND_DM */
     char    *topic;      /* heap; NULL = none (REQ-034) */
     uint8_t  archived;   /* REQ-035 */
+    uint64_t created_at;
     /* Sidebar ordering + badging for a client that caches nothing (ARCH-88):
      * the newest top-level message's time, and how many of them sit past this
      * user's delivery cursor (REQ-090). Both are 0 for an empty channel. */

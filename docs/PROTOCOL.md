@@ -532,6 +532,48 @@ Every tenant has one auto-provisioned public **`general`** channel (id `1`) that
 every user joins at authentication, so the messaging path always has a channel
 to deliver to.
 
+### 5.7a Changing a channel: topic, rename, archive (REQ-034/035/036, ARCH-93)
+
+**`UPDATE_CHANNEL` (client → server), msg_type `0x005F`:**
+
+| Field        | Type | Notes                                                    |
+|--------------|------|----------------------------------------------------------|
+| `channel_id` | u64  | The channel to change.                                   |
+| `op`         | u8   | `0` set-topic · `1` rename · `2` archive · `3` unarchive. |
+| `value`      | str  | The new topic (≤250 bytes, empty clears it) or name (≤64). Ignored for archive/unarchive. |
+
+One frame for four verbs because they all mutate one row and all fan out the same
+state — the op *is* the difference.
+
+**Authority** splits on blast radius: **any member may set the topic** (already
+visible to the channel, corrected in seconds); **owner/admin only** for rename,
+archive and unarchive, which change what people *not* looking at the channel see.
+
+On success the daemon replies **`CHANNEL_INFO`** to the actor and **fans the same
+frame to every other member** — a rename or archive changes what everyone's
+sidebar should say. `CHANNEL_INFO` therefore carries `topic` and `archived`:
+
+> **Layout note.** `CHANNEL_INFO`'s `peer_id` used to be an *optional trailing*
+> field, written only for DMs. That trick does not survive a second optional
+> field, so as of this change the layout is **fixed**: `peer_id` is always
+> written (0 when not a DM), followed by `topic` and `archived`. `CHANNEL_LIST`
+> entries gained `topic`, `archived` and `created_at` for the same reason — a
+> client that caches nothing (ARCH-88) must be able to render the sidebar and the
+> channel's About surface from the list alone.
+
+**An archived channel is read-only**, enforced in one place so every write path
+inherits it: `SEND`, `SEND_REPLY`, `UPLOAD_BEGIN` and an incoming webhook post all
+return `CHANNEL_ARCHIVED` (3019). It is hidden from `CHANNEL_LIST` for
+non-members; members keep it, flagged, so they can find their way back in.
+History, search and membership are untouched — archiving is the reversible
+alternative to a deletion that is not offered for channels holding history.
+
+Failures are non-fatal `ERROR` frames: `UNKNOWN_CHANNEL`, `NOT_A_MEMBER`,
+`FORBIDDEN` (rename/archive by a non-admin), `CHANNEL_EXISTS` (the new name is
+taken — the same unique-name rule as create, §5.7), or `INVALID_CHANNEL` (empty
+or oversized name, oversized topic, or **any of these attempted on a DM** — a DM
+has no name to rename and archiving one is a different feature).
+
 ### 5.8 Tenant administration (REQ-030, REQ-033)
 
 Managing the tenant's people: enumerating them, changing roles, and adding or

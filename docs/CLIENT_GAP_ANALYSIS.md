@@ -98,8 +98,8 @@ Vendor-facing rows are inherently perishable — a competitor can change a plan 
 | Public channels | ✅ | ✅ | ✅ grouped Public section | 🟡 flat list | Win32 has no sectioning. **P1** |
 | Private channels | ✅ | ✅ | ✅ Private group + lock marker | 🟡 flat, lock unclear | **P1** |
 | Create channel | ✅ name+desc+visibility+members | ✅ | 🟡 NAME ONLY prompt | 🟡 name + public/private | Win32 sets visibility (`oc_client_create_channel_ex`); neither sets a topic (REQ-034 unbuilt) or an initial member list. **P1** |
-| Channel topic | ✅ | ✅ | ❌ | ❌ | No topic edit/display. **P1** |
-| Channel description/About pane | ✅ | ✅ edit-channel pane | ❌ | ❌ no details pane | **P1** |
+| Channel topic | ✅ | ✅ | ❌ | ✅ header line + About-tab editor | Built (REQ-034/ARCH-93); any member may set it. **P1 (TUI)** |
+| Channel description/About pane | ✅ | ✅ edit-channel pane | ❌ | 🟡 **About** tab: name, topic, member count, created date, admin actions | No separate long-form description — REQ-034 is one topic line. **P2** |
 | Channel details (Members/Pinned/Files tabs) | ✅ | ✅ | ❌ | ✅ tab strip: Messages · Files & links · Pins, + members pane | Built (WIN-37). No settings/About tab — that needs channel topic/rename/archive (REQ-034/035/036), all unbuilt. **P1 (TUI)** |
 | Member management (add/remove) | ✅ | ✅ | 🟡 via member menu | 🟡 via member menu, over the channel's own roster | The roster is now channel-scoped (REQ-031 `LIST_MEMBERS`); add/remove is still a menu action rather than a management surface. **P2** |
 | Per-channel notification prefs | ✅ | ✅ | 🟡 notify level | 🟡 per-channel level | Present. — |
@@ -107,9 +107,9 @@ Vendor-facing rows are inherently perishable — a competitor can change a plan 
 | Star/favorite channel | ✅ | ✅ | ❌ | ❌ no starred | **P2** |
 | Custom sidebar sections | ✅ | ✅ ᴾ customizable sections | 🟡 fixed groups (Public/DM/Private) | 🟡 fixed groups (Channels / Direct messages), collapsible, per-section filter/sort menu | **User-defined** sections absent in both; both group by kind. **P2** |
 | Sidebar sort/display options | ✅ | ✅ | 🟡 fold/unfold | ❌ | **P2** |
-| Archive channel | ✅ | ✅ (reversible, data preserved) | ❌ | ❌ | **P1** |
-| Delete channel | ✅ | ✅ | ❌ | ❌ | **P2** |
-| Rename channel | ✅ | 🔸 creator only | ❌ | ❌ | **P1** |
+| Archive channel | ✅ | ✅ (reversible, data preserved) | ❌ | ✅ reversible, confirmed, read-only enforced server-side | Built (REQ-035/ARCH-93). **P1 (TUI)** |
+| Delete channel | ✅ | ✅ | ❌ | ⛔ | **Deliberate:** we offer archive (reversible) instead — deletion is not offered for channels holding history (REQ-035). — |
+| Rename channel | ✅ | 🔸 creator only | ❌ | ✅ owner/admin, id-stable | Built (REQ-036/ARCH-93). **P1 (TUI)** |
 | Posting/management permissions | ✅ | ✅ ᴮ | ❌ | ❌ | **P2** |
 | Channel bookmarks | ✅ | ❔ | ❌ | ❌ | **P2** |
 | Channel canvas | ✅ | ❌ | ⛔ | ⛔ | Canvas out of scope for us; Pumble has no equivalent either. |
@@ -388,7 +388,6 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 *Rewritten 2026-07-28 against the code; entries closed since the original audit are listed at the end rather than deleted, so the record stays honest.*
 
 - **N-concurrent-workspace model** — the rail switcher UI exists, but Win32 stop/reconnects a **single** client; no holding N clients at once with background unread. **P1**
-- **Channel rename / topic / archive / delete**, and therefore no channel **About/settings** tab beside Messages/Files/Pins. All four need engine work first (REQ-034/035/036). **P1**
 - **Activity feed / notification inbox** (REQ-139) — the rail's **Activity** entry is still a "coming soon" stub. Migration 0021 now indexes mentions by user, so the mentions half has a query behind it. **P1**
 - **Saved items / Later** (REQ-231) — rail stub. **P2**
 - **Workspace-wide Files view** — the rail's **Files** entry is still a stub, even though `LIST_FILES` already accepts `channel_id 0` for exactly this. The **per-channel** Files tab is built. **P2**
@@ -409,7 +408,7 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 - **Group DMs** (REQ-056), **self-DM surface** (REQ-055 exists on the engine, unsurfaced), **browse-channels directory** (REQ-038). **P2**
 - **Accessibility / keyboard-only operation** (REQ-269) — recorded, unimplemented, needs an ARCH decision. **P1**
 
-**Closed since the original audit** (kept for the record): error/toast surface and the connection banner with a live countdown (WIN-1/WIN-55) · sign-in rebuilt in-window with inline errors, remember-me and retry (WIN-2) · Preferences hub with theme / 12-24h / panel toggles (WIN-9/WIN-26) · view another user's profile (WIN-10) · composer emoji picker over the shared ~179-emoji catalogue (WIN-8) · `@`/`#`/`:` autocomplete (`oc_complete`) · Ctrl+K command palette · sidebar sections, collapsing, scrolling and a "Find a conversation" filter · DM section and rail DMs view · OS tray balloon (WIN-18, delivery still visually unconfirmed) · notification-prefs review/edit pane · jump-to-unread and the "New" divider (WIN-14) · inline image thumbnails + lightbox · signup / invite redeem (WIN-32) · keyboard-shortcut reference · display-name and password dialogs (WIN-20) · channel member management (WIN-31) · **@mentions** (REQ-221) · **pins** (REQ-230) · **channel Files tab and per-channel roster** (REQ-143/031, WIN-37).
+**Closed since the original audit** (kept for the record): **channel topic, rename and archive** with the About tab (REQ-034/035/036, WIN-34–36) · error/toast surface and the connection banner with a live countdown (WIN-1/WIN-55) · sign-in rebuilt in-window with inline errors, remember-me and retry (WIN-2) · Preferences hub with theme / 12-24h / panel toggles (WIN-9/WIN-26) · view another user's profile (WIN-10) · composer emoji picker over the shared ~179-emoji catalogue (WIN-8) · `@`/`#`/`:` autocomplete (`oc_complete`) · Ctrl+K command palette · sidebar sections, collapsing, scrolling and a "Find a conversation" filter · DM section and rail DMs view · OS tray balloon (WIN-18, delivery still visually unconfirmed) · notification-prefs review/edit pane · jump-to-unread and the "New" divider (WIN-14) · inline image thumbnails + lightbox · signup / invite redeem (WIN-32) · keyboard-shortcut reference · display-name and password dialogs (WIN-20) · channel member management (WIN-31) · **@mentions** (REQ-221) · **pins** (REQ-230) · **channel Files tab and per-channel roster** (REQ-143/031, WIN-37).
 
 ### TUI — missing
 
@@ -460,9 +459,8 @@ What follows replaces it.
 a fraction of that in the GUI. Anything below that says "needs REQ-x" should be
 read as "build the engine feature; the Win32 work is the easy part."
 
-1. **Channel management — rename, topic, archive** (REQ-034/035/036, all unbuilt).
-   The channel surface now has Messages/Files/Pins tabs and no way to *change* the
-   channel. This is the largest structural hole left and it adds the About tab. **P1**
+1. ~~**Channel management — rename, topic, archive**~~ **Done** (REQ-034/035/036,
+   ARCH-93) — and it added the **About** tab, completing the channel surface.
 2. **Activity feed / notification inbox** (REQ-139). Fills the rail's Activity
    stub, and mentions finally make it meaningful — a mention you can only see by
    already looking at the channel is half a feature. Migration 0021 indexes

@@ -628,6 +628,7 @@ oc_result oc_encode_channel_list(oc_wbuf *w, uint16_t version, const oc_channel_
         oc_w_u64(w, m->entries[i].peer_id);
         oc_w_str(w, m->entries[i].topic);
         oc_w_u8(w, m->entries[i].archived);
+        oc_w_u64(w, m->entries[i].created_at);
     }
     return oc_frame_end(w, off);
 }
@@ -1648,6 +1649,7 @@ oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries,
         uint64_t peer = oc_r_u64(p);
         oc_slice topic = oc_r_str(p);
         uint8_t archived = oc_r_u8(p);
+        uint64_t created = oc_r_u64(p);
         if (i < cap) {
             entries[i].channel_id = id;
             entries[i].name = name;
@@ -1659,6 +1661,7 @@ oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries,
             entries[i].peer_id = peer;
             entries[i].topic = topic;
             entries[i].archived = archived;
+            entries[i].created_at = created;
         }
     }
     return r_done(p);

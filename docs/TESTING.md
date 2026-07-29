@@ -243,6 +243,18 @@ integration scenarios join the `integration` job once the client-TLS decision
 
 ---
 
+## Known flakiness
+
+- **`test_client_core`'s live two-client section** (`tests/test_client_core.c`,
+  the profile/password block around the `WAIT_FOR` on `last_error`) fails
+  intermittently — roughly one run in five on a loaded machine, green on the
+  retry. Every assertion there is a `WAIT_FOR` against a *real* daemon over TLS,
+  so it is a timing race in the test, not in the code under test: the assertion
+  polls for a fan-out that has not arrived within its budget. Recorded rather
+  than left as folklore. **If you see it, re-run before investigating** — but if
+  it starts failing consistently, or fails on a different assertion, that is new
+  and worth chasing.
+
 ## 5. Layout summary
 
 ```

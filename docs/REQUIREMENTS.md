@@ -208,20 +208,32 @@ the requirement says so explicitly rather than implying one.
   admins. Both gates have been enforced in the DB-writer handlers (ARCH-60).
 - **REQ-034.** Each channel has carried an optional human-set **topic/
   description** — a short line shown in the channel header — set by a channel
-  member (or restricted to admins per a deployment setting). It is metadata on
-  the channel, distinct from the channel name. **[needs ARCH decision — who may
-  set a topic + storage column.]**
+  member. It is metadata on the channel, distinct from the channel name.
+  **Built (ARCH-93, migration 0024):** a `topic` column, set with
+  `UPDATE_CHANNEL`; **any member may set it** — it is already visible to the
+  channel and a wrong one is corrected in seconds. An empty value clears it.
+  Capped at 250 bytes and shown on the channel header's second line.
 - **REQ-035.** A channel has been **archivable** by an owner or admin: an
   archived channel has become read-only and hidden from the default channel list
   while its history remained searchable and retrievable (REQ-031/080), and it has
   been restorable. Archiving (reversible) is distinct from deletion, which is not
-  offered for channels holding history. **[needs ARCH decision — archive flag +
-  read-only enforcement.]**
+  offered for channels holding history. **Built (ARCH-93, migration 0024):**
+  `archived_at_ms` non-NULL *is* the flag, so "when" is free and unarchive is one
+  NULL write. Read-only is enforced in `channel_post_access`, so **every** write
+  path inherits it — send, threaded reply, attachment upload and webhook post all
+  return `CHANNEL_ARCHIVED`. Hidden from the channel list for non-members; a
+  member keeps it (and the way back). Owner/admin only.
 - **REQ-036.** A channel has been **renamable** by an owner/admin (or the
   channel's creator per a deployment setting), the rename applying everywhere the
   channel is shown without breaking membership, history, or permalinks (REQ-232).
-  The name is distinct from the topic (REQ-034). **[needs ARCH decision — rename
-  authority + whether a name-history is kept so old permalinks still resolve.]**
+  The name is distinct from the topic (REQ-034). **Built (ARCH-93):** owner/admin
+  only, and the channel **id is untouched**, so membership, history and delivery
+  cursors follow the rename with no work — verified against a live daemon by
+  renaming a channel with 13 messages and 3 members and finding both intact.
+  Migration 0020's unique-name index applies exactly as it does to a create, so a
+  collision returns `CHANNEL_EXISTS`. **Deliberately no name-history table** — a
+  permalink (REQ-232) must key on the id, not on a name that was always mutable
+  (ARCH-93).
 - **REQ-037.** A deployment has been able to admit **guest accounts** — users
   restricted to one channel (single-channel guest) or an explicit set
   (multi-channel guest) rather than the whole tenant — created and scoped by an

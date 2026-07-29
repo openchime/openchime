@@ -126,6 +126,13 @@ void oc_client_close_pins(oc_client *c);
 /* A channel's OWN member roster (REQ-031) — not the tenant roster, which is
  * oc_client_list_users. Showing the latter beside a channel name was wrong the
  * moment a workspace held more people than one channel did. */
+/* Change a channel (REQ-034/035/036, ARCH-93): op is OC_CHUP_TOPIC / _RENAME /
+ * _ARCHIVE / _UNARCHIVE, `value` the new topic or name (ignored for archive).
+ * Any member may set a topic; rename and archive are owner/admin and the daemon
+ * enforces that — a frontend may hide the item, but must not rely on hiding it.
+ * The result arrives as a CHANNEL_INFO fanned to every member. */
+void oc_client_update_channel(oc_client *c, uint64_t channel_id, uint8_t op, const char *value);
+
 void oc_client_list_members(oc_client *c, uint64_t channel_id);
 
 /* Files shared in a channel, or (channel_id 0) across every channel the user

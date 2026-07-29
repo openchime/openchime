@@ -284,6 +284,16 @@ void oc_client_list_pins(oc_client *c, uint64_t channel_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_update_channel(oc_client *c, uint64_t channel_id, uint8_t op, const char *value) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_UPDATE_CHANNEL);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->op = op;
+    cmd->body = strdup(value ? value : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_list_members(oc_client *c, uint64_t channel_id) {
     if (!c || !channel_id) return;
     oc_model_chanmem_begin(&c->model, channel_id);

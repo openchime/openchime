@@ -153,7 +153,7 @@ Legend: ✅ done · 🔨 in progress · ⛔ not started.
 | Admin: invite | `invite_user` | ✅ | Rail → workspace menu → Invite people as member / as admin (token shown once, owner/admin only). |
 | Threads | `open_thread`, `reply`, `close_thread` | ✅ | Message menu → Reply/Open thread; overlay + reply composer. |
 | Search | `search`, `close_search` | ✅ | Rail → New (+) → Search messages… or Ctrl+F; a result jumps to the matched message and flashes it (WIN-3). No paging — the wire has no cursor (WIN-38). |
-| Channel management | `create_channel`, `join_channel`, `leave_channel`, `list_members` | ✅ | Rail → New (+) → New channel (name + public/private); sidebar right-click Join / Leave / Mark as read; the members pane lists the **channel's** roster (REQ-031). Rename/topic/archive do not exist on the engine (REQ-034/035/036). |
+| Channel management | `create_channel`, `join_channel`, `leave_channel`, `list_members`, `update_channel` | ✅ | Rail → New (+) → New channel (name + public/private); sidebar right-click Join / Leave / Mark as read; the members pane lists the **channel's** roster (REQ-031). The **About** tab sets the topic (any member) and renames or archives (owner/admin) — REQ-034/035/036. |
 | @mentions | shared `oc_mention_scan` + notify level | ✅ | Accent-coloured, semi-bold spans; a message naming you tints its row and gets an accent bar; the `mentions` notify level is evaluated with the same scanner the daemon resolves with (REQ-221). |
 | Pins | `pin`, `list_pins`, `close_pins` | ✅ | Message menu → Pin/Unpin to channel; a "Pinned by …" marker above the message; the **Pins** tab lists them, jumps to one, or unpins (REQ-230). |
 | Channel files | `list_files`, `close_files` | ✅ | The **Files & links** tab: name, uploader, size, date, download, jump-to-message (REQ-143). The workspace-wide form (`channel_id 0`) is on the wire but the rail's Files view is still a stub. |
@@ -351,7 +351,9 @@ CLIENT_GAP_ANALYSIS.md §5 and the CLIENT.md §8 roadmap, not here.
 |-----|--------|-------|
 | 026 shareable invite links + invite mgmt | ⛔ | Daemon has single-use invite tokens (REQ-024/033); link/expiry/revoke/pending-list unbuilt. |
 | 027 SSO scope (OIDC-via-central only; no SAML) | ➖ | Design exclusion (ARCH-55); recorded, not code. The daemon already only verifies the central ES256 JWT. |
-| 036 rename channel | ⛔ | No rename op; channels have a fixed name today. |
+| 034 channel topic / description | ✅ 🔵 | **Built (ARCH-93, migration 0024):** a `topic` column set via `UPDATE_CHANNEL`; **any member** may set it, empty clears it, 250-byte cap. Win32 shows it on the header's second line and edits it in the About tab. **TUI has none of this.** |
+| 035 archive channel | ✅ 🔵 | **Built (ARCH-93, migration 0024):** `archived_at_ms` non-NULL is the flag. Read-only enforced in `channel_post_access`, so send, threaded reply, upload and webhook post all return `CHANNEL_ARCHIVED`; hidden from the list for non-members, kept (flagged) for members; reversible. Owner/admin. Win32: header badge, About-tab toggle with a confirm, read-only composer. **TUI: none.** |
+| 036 rename channel | ✅ 🔵 | **Built (ARCH-93):** owner/admin; the **id is untouched**, so membership, history and cursors follow it — verified live on a channel with 13 messages and 3 members. Unique-name index applies (`CHANNEL_EXISTS`). No name-history table by design. **TUI: none.** |
 | 037 guest accounts | ⛔ | Role model is owner/admin/member (REQ-030); no channel-scoped guest. |
 | 038 browse/join public-channel directory | ⛔ | No directory listing; joining needs a known channel. |
 | 042 workspace settings + branding | ⛔ | No tenant name/icon/default-channels/join-policy surface. |

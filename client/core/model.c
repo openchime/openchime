@@ -27,6 +27,7 @@ static void channel_free(oc_channel *c) {
     for (size_t i = 0; i < c->n_msgs; i++) msg_free(&c->msgs[i]);
     free(c->msgs);
     free(c->name);
+    free(c->topic);
     free(c->readers);
 }
 
@@ -633,6 +634,13 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                 if (c->unread == 0) c->unread = (int)e->count;
             }
             if (e->body) { free(c->name); c->name = e->body; e->body = NULL; }
+            /* Topic and archived ride on the same frame (ARCH-93): a rename, a
+             * topic change and an archive all arrive as CHANNEL_INFO, so this
+             * one arm keeps the sidebar and the header honest for all three. */
+            c->archived = e->archived;
+            if (e->created_at) c->created_at = e->created_at;
+            free(c->topic);
+            c->topic = (e->topic && e->topic[0]) ? strdup(e->topic) : NULL;
         }
         break;
     }

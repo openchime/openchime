@@ -177,7 +177,9 @@ typedef struct {
     int         kind;
     const char *label;
     const char *hint;              /* FF_CHOICE: "a|b|c"; else an optional sub-label */
-    char        value[192];        /* in: initial; out: the result (FF_CHECK/CHOICE: "0".."n") */
+    /* 256 so a full-length channel topic fits (OC_MAX_TOPIC is 250) — at 192 the
+     * dialog silently truncated the very value it was editing. */
+    char        value[256];        /* in: initial; out: the result (FF_CHECK/CHOICE: "0".."n") */
 } oc_field;
 static int form_dialog(HWND owner, const char *title, oc_field *f, int n);
 
@@ -236,7 +238,8 @@ static IDWriteTextFormat *g_time;   /* timestamp (trailing-aligned) */
 static IDWriteTextFormat *g_body;   /* message body (wrapping) */
 static IDWriteTextFormat *g_ui;     /* sidebar rows / composer */
 static IDWriteTextFormat *g_ui_b;   /* unread sidebar rows (semibold) */
-static IDWriteTextFormat *g_small;  /* subtitles / meta lines */
+static IDWriteTextFormat *g_small;  /* subtitles / meta lines (no wrap) */
+static IDWriteTextFormat *g_small_w;/* the same, wrapping — for paragraphs of explanation */
 static IDWriteTextFormat *g_ava;    /* avatar initial (centered) */
 static IDWriteTextFormat *g_rail;   /* tiny rail item labels (centered) */
 static IDWriteTextFormat *g_emoji;   /* Segoe UI Emoji, picker cells (22px) */
@@ -574,11 +577,12 @@ static int g_n_notify_hits;
 
 static int      g_show_members = 1;     /* members pane visible */
 static D2D1_RECT_F g_members_btn;       /* header toggle hit-box */
-enum { TAB_MESSAGES = 0, TAB_FILES, TAB_PINS, TAB_COUNT };
+enum { TAB_MESSAGES = 0, TAB_FILES, TAB_PINS, TAB_ABOUT, TAB_COUNT };
 static int g_tab;                       /* the selected channel tab (WIN-37) */
 static D2D1_RECT_F g_tab_r[TAB_COUNT];  /* tab hit-boxes */
 static D2D1_RECT_F g_memchip;           /* header member-count chip */
 static int g_tab_hover = -1;
+static D2D1_RECT_F g_about_topic, g_about_rename, g_about_archive;
 static struct { D2D1_RECT_F row, dl; int ix; } g_filerows[64];
 static int g_n_filerows;
 static uint64_t g_hover_filerow;
@@ -1058,6 +1062,7 @@ static void d2d_init(void) {
     g_ui    = mk_fmt(UI, 14.5f, DWRITE_FONT_WEIGHT_NORMAL,    DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
     g_ui_b  = mk_fmt(UI, 14.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
     g_small = mk_fmt(UI, 12.5f, DWRITE_FONT_WEIGHT_NORMAL,    DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
+    g_small_w = mk_fmt(UI, 12.5f, DWRITE_FONT_WEIGHT_NORMAL,  DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_NEAR, 1);
     g_ava   = mk_fmt(UI, 15.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER,   DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
     g_rail  = mk_fmt(UI, 9.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
     /* Named explicitly, because falling back from "Segoe UI" reaches the
@@ -2657,6 +2662,87 @@ static void draw_reactlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
 /* A channel's pinned messages (REQ-230). Each row is the message itself, so the
  * list is readable without jumping — and clicking still jumps, because a pin is
  * usually a pointer into a conversation rather than the whole of it. */
+/* The About tab (REQ-034/035/036): what the channel *is*, and the three ways to
+ * change it. Rename and archive are owner/admin (ARCH-93); the buttons are
+ * hidden for a member rather than shown-and-refused, because an affordance you
+ * are not allowed to use is worse than no affordance — but the daemon enforces
+ * it regardless, so hiding is courtesy, not security. */
+static void draw_about(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    g_about_topic = g_about_rename = g_about_archive = rf(0, 0, 0, 0);
+    const oc_channel *c = oc_model_channel((oc_model *)m, g_sel);
+    if (!c) { overlay_empty(rt, reg, "No channel."); return; }
+
+    float x = reg.left + 24, w = reg.right - reg.left - 48, y = reg.top + 20;
+    char line[320];
+
+    snprintf(line, sizeof line, "%s%s", c->kind == OC_CHANNEL_KIND_DM ? "@ " :
+             (c->is_public ? "# " : "\U0001F512 "), c->name ? c->name : "");
+    draw_text(rt, line, g_hdr, rf(x, y, x + w, y + 30), OC_COL_TEXT);
+    y += 34;
+
+    if (c->archived) {
+        D2D1_RECT_F badge = rf(x, y, x + text_width("Archived \u00B7 read-only", g_small) + 22, y + 24);
+        fill_round(rt, badge, 6.0f, OC_COL_INPUT);
+        stroke_round(rt, badge, 6.0f, OC_COL_BORDER, 1.0f);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Archived \u00B7 read-only", g_small, badge, OC_COL_AWAY);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        y += 32;
+    }
+
+    draw_text(rt, "TOPIC", g_small, rf(x, y, x + w, y + 20), OC_COL_FAINT);
+    y += 22;
+    draw_text(rt, (c->topic && c->topic[0]) ? c->topic : "No topic set.", g_ui,
+              rf(x, y, x + w - 120, y + 44),
+              (c->topic && c->topic[0]) ? OC_COL_TEXT : OC_COL_FAINT);
+    g_about_topic = rf(reg.right - 24 - 110, y - 4, reg.right - 24, y + 24);
+    stroke_round(rt, g_about_topic, 6.0f, OC_COL_BORDER, 1.0f);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, "Set topic\u2026", g_small, g_about_topic, OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+    y += 56;
+
+    /* Facts worth having in one place, none of which needed a new query. */
+    const char *nm = oc_model_user_name((oc_model *)m, 0);
+    (void)nm;
+    if (m->chanmem_channel == g_sel && !m->chanmem_loading) {
+        snprintf(line, sizeof line, "%zu member%s", m->n_chanmem, m->n_chanmem == 1 ? "" : "s");
+        draw_text(rt, line, g_small, rf(x, y, x + w, y + 20), OC_COL_MUTED);
+        y += 22;
+    }
+    if (c->created_at) {
+        time_t t = (time_t)(c->created_at / 1000);
+        struct tm tv; char when[40] = "";
+        if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%d %b %Y", &tv);
+        snprintf(line, sizeof line, "Created %s", when);
+        draw_text(rt, line, g_small, rf(x, y, x + w, y + 20), OC_COL_MUTED);
+        y += 22;
+    }
+    y += 16;
+
+    if (c->kind != OC_CHANNEL_KIND_DM && self_role(m) >= OC_ROLE_ADMIN) {
+        fill(rt, rf(x, y, x + w, y + 1), OC_COL_BORDER);
+        y += 18;
+        draw_text(rt, "ADMIN", g_small, rf(x, y, x + w, y + 20), OC_COL_FAINT);
+        y += 24;
+        g_about_rename = rf(x, y, x + 150, y + 28);
+        stroke_round(rt, g_about_rename, 6.0f, OC_COL_BORDER, 1.0f);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Rename channel\u2026", g_small, g_about_rename, OC_COL_MUTED);
+        g_about_archive = rf(x + 160, y, x + 310, y + 28);
+        stroke_round(rt, g_about_archive, 6.0f, OC_COL_BORDER, 1.0f);
+        draw_text(rt, c->archived ? "Unarchive" : "Archive channel", g_small,
+                  g_about_archive, c->archived ? OC_COL_NOTICE : OC_COL_DANGER);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+        y += 36;
+        draw_text(rt, c->archived
+                      ? "Unarchiving makes the channel writable again."
+                      : "Archiving makes it read-only and hides it from people who are not in it. "
+                        "History stays searchable, and it can be undone.",
+                  g_small_w, rf(x, y, x + w, y + 56), OC_COL_FAINT);
+    }
+}
+
 static void draw_pinlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
     /* No overlay header: the tab strip above already says where you are, and
      * two titles stacked read as a bug. */
@@ -2967,6 +3053,7 @@ static void draw_transcript(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
     if (m->reactlist_open) { draw_reactlist(rt, m, reg); return; }
     if (m->pinlist_open)   { draw_pinlist(rt, m, reg);   return; }
     if (m->filelist_open)  { draw_filelist(rt, m, reg);  return; }
+    if (g_tab == TAB_ABOUT) { draw_about(rt, m, reg);    return; }
     if (m->weblist_open)   { draw_weblist(rt, m, reg);   return; }
     if (m->storage_open)   { draw_storage(rt, m, reg);   return; }
     if (m->audit_open)     { draw_audit(rt, m, reg);     return; }
@@ -3033,9 +3120,20 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
             snprintf(typing, sizeof typing, "several people are typing…");
         }
     }
+    /* The topic sits on the header's second line, where Slack puts it — and it
+     * yields to a typing indicator, which is transient and more urgent. */
+    const char *topic = (c && c->topic && c->topic[0]) ? c->topic : NULL;
+    if (c && c->archived) {
+        char t2[200];
+        snprintf(t2, sizeof t2, "%s  \u00B7  archived", title);
+        snprintf(title, sizeof title, "%s", t2);
+    }
     if (typing[0]) {
         draw_text(rt, title, g_hdr, rf(x0 + 20, 6, x0 + w - 240, 34), OC_COL_TEXT);
         draw_text(rt, typing, g_small, rf(x0 + 20, 32, x0 + w - 240, HEADER_H - 6), OC_COL_ACCENT);
+    } else if (topic) {
+        draw_text(rt, title, g_hdr, rf(x0 + 20, 6, x0 + w - 240, 34), OC_COL_TEXT);
+        draw_text(rt, topic, g_small, rf(x0 + 20, 32, x0 + w - 240, HEADER_H - 6), OC_COL_MUTED);
     } else {
         draw_text(rt, title, g_hdr, rf(x0 + 20, 0, x0 + w - 240, HEADER_H), OC_COL_TEXT);
     }
@@ -3094,6 +3192,7 @@ static void select_tab(int t) {
     if (!g_sel) { g_tab = TAB_MESSAGES; return; }
     if (t == TAB_PINS)  oc_client_list_pins(g_client, g_sel);
     if (t == TAB_FILES) oc_client_list_files(g_client, g_sel);
+    if (t == TAB_ABOUT) oc_client_list_members(g_client, g_sel);   /* refresh the count */
 }
 
 /* The channel tab strip. Returns its height so the caller can push content
@@ -3109,6 +3208,7 @@ static float draw_tabbar(ID2D1RenderTarget *rt, const oc_model *m, float x0, flo
         { "Messages",      OC_ICON_DMS  },
         { "Files & links", OC_ICON_FILE },
         { "Pins",          OC_ICON_PIN  },
+        { "About",         OC_ICON_SETTINGS },
     };
     float tx = x0 + 16;
     for (int i = 0; i < TAB_COUNT; i++) {
@@ -3718,7 +3818,12 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
 
     /* Send on the right — accent when there is something to send. A paper
      * plane rather than an up-arrow, which read as "scroll" more than "send". */
-    int has_text = g_re && GetWindowTextLengthW(g_re) > 0;
+    /* An archived channel is read-only (REQ-035). The daemon refuses the send
+     * regardless; this is so you can see why before you type it. */
+    const oc_model *cm = model();
+    const oc_channel *cc = cm && g_sel ? oc_model_channel((oc_model *)cm, g_sel) : NULL;
+    int ro = (cc && cc->archived);
+    int has_text = !ro && g_re && GetWindowTextLengthW(g_re) > 0;
     g_send_btn = rf(bx1 - 6 - sq, cy, bx1 - 6, cy + sq);
     fill_round(rt, g_send_btn, 8.0f, has_text ? OC_COL_ACCENT : OC_COL_INPUT);
     if (!has_text) stroke_round(rt, g_send_btn, 8.0f, OC_COL_BORDER, 1.0f);
@@ -3946,6 +4051,17 @@ static void ac_accept(void) {
 
 static void composer_send(void) {
     if (!g_re || !g_client || !g_sel) return;
+    /* Refuse locally in an archived channel so the text is not lost to a server
+     * rejection you have to read in a toast (REQ-035). The daemon refuses it
+     * too — this is the courteous half, not the enforcing one. */
+    {
+        const oc_model *m = model();
+        const oc_channel *c = m ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+        if (c && c->archived) {
+            toast_push("This channel is archived \u2014 it is read-only.", 1);
+            return;
+        }
+    }
     int wlen = GetWindowTextLengthW(g_re);
     if (wlen <= 0) return;
     WCHAR *w = (WCHAR *)malloc((size_t)(wlen + 1) * sizeof(WCHAR));
@@ -4010,6 +4126,10 @@ static HFONT g_ph_font;
 static void composer_placeholder(const oc_model *m) {
     const oc_channel *c = (m && g_sel) ? oc_model_channel((oc_model *)m, g_sel) : NULL;
     if (g_edit_msg)            snprintf(g_ph, sizeof g_ph, "Edit this message \u2014 Esc to cancel");
+    /* Say why, not just that it is disabled (REQ-035). */
+    else if (c && c->archived) snprintf(g_ph, sizeof g_ph,
+                                        "#%s is archived \u2014 read-only",
+                                        c->name ? c->name : "this channel");
     else if (m && m->thread_open) snprintf(g_ph, sizeof g_ph, "Reply\u2026");
     else if (!c)               snprintf(g_ph, sizeof g_ph, "Message");
     else if (c->kind == OC_CHANNEL_KIND_DM) {
@@ -4934,6 +5054,42 @@ static int on_click(HWND hwnd, int x, int y) {
         g_show_members = !g_show_members;
         layout_composer(hwnd);
         return 1;
+    }
+    /* About-tab actions (REQ-034/035/036). */
+    if (g_tab == TAB_ABOUT && g_sel) {
+        const oc_model *am = model();
+        const oc_channel *ac = am ? oc_model_channel((oc_model *)am, g_sel) : NULL;
+        if (ac && in_rect(g_about_topic, x, y)) {
+            oc_field f[1] = { { FF_TEXT, "Topic", "Shown in the channel header. Leave empty to clear it.", "" } };
+            if (ac->topic) snprintf(f[0].value, sizeof f[0].value, "%s", ac->topic);
+            if (form_dialog(hwnd, "Set channel topic", f, 1))
+                oc_client_update_channel(g_client, g_sel, OC_CHUP_TOPIC, f[0].value);
+            return 1;
+        }
+        if (ac && in_rect(g_about_rename, x, y)) {
+            oc_field f[1] = { { FF_TEXT, "Channel name", "Lowercase, no spaces. The id does not change, so history and membership follow.", "" } };
+            snprintf(f[0].value, sizeof f[0].value, "%s", ac->name ? ac->name : "");
+            if (form_dialog(hwnd, "Rename channel", f, 1))
+                oc_client_update_channel(g_client, g_sel, OC_CHUP_RENAME, f[0].value);
+            return 1;
+        }
+        if (ac && in_rect(g_about_archive, x, y)) {
+            if (ac->archived) {
+                oc_client_update_channel(g_client, g_sel, OC_CHUP_UNARCHIVE, "");
+            } else {
+                /* Reversible, but it changes the channel for everyone — worth a
+                 * confirm, unlike the topic. */
+                WCHAR q[320]; char t[240];
+                snprintf(t, sizeof t,
+                         "Archive #%s?\n\nIt becomes read-only and disappears from the sidebar of "
+                         "anyone who is not a member. History stays searchable, and you can "
+                         "unarchive it later.", ac->name ? ac->name : "");
+                to_w(t, q, 320);
+                if (MessageBoxW(hwnd, q, L"Archive channel", MB_OKCANCEL | MB_ICONWARNING) == IDOK)
+                    oc_client_update_channel(g_client, g_sel, OC_CHUP_ARCHIVE, "");
+            }
+            return 1;
+        }
     }
     /* Rows of the open files list. */
     {
@@ -6653,6 +6809,12 @@ static void test_poll(HWND hwnd) {
         sscanf(arg, "%63s %d", nm, &pub);
         if (g_client && nm[0]) { oc_client_create_channel_ex(g_client, nm, pub == 0); test_ack("ok"); }
         else test_ack("err");
+    } else if (!strcmp(verb, "chup")) {
+        /* Bypass the modal form, as "mkchan" and "upload" do. */
+        int op = 0; char val[256] = {0};
+        sscanf(arg, "%d %255[^\n]", &op, val);
+        if (g_client && g_sel) { oc_client_update_channel(g_client, g_sel, (uint8_t)op, val); test_ack("ok"); }
+        else test_ack("err");
     } else if (!strcmp(verb, "tab")) {
         select_tab(atoi(arg));
         test_ack("ok");
@@ -7365,6 +7527,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     if (g_ui)    IDWriteTextFormat_Release(g_ui);
     if (g_ui_b)  IDWriteTextFormat_Release(g_ui_b);
     if (g_small) IDWriteTextFormat_Release(g_small);
+    if (g_small_w) IDWriteTextFormat_Release(g_small_w);
     if (g_ava)   IDWriteTextFormat_Release(g_ava);
     if (g_rail)  IDWriteTextFormat_Release(g_rail);
     for (int i = 0; i < OC_ICON_COUNT; i++)

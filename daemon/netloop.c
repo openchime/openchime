@@ -1779,6 +1779,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             ents[i].peer_id = r->chlist[i].peer_id;
             ents[i].topic = oc_slice_str(r->chlist[i].topic ? r->chlist[i].topic : "");
             ents[i].archived = r->chlist[i].archived;
+            ents[i].created_at = r->chlist[i].created_at;
         }
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_channel_list cl = { (uint16_t)n, ents };

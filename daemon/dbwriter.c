@@ -1721,7 +1721,7 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
          * otherwise a cache-less client shows "direct message" until it opens one. */
         "  COALESCE((SELECT m2.user_id FROM channel_members m2 "
         "              WHERE m2.channel_id=c.id AND m2.user_id<>?1 LIMIT 1), ?1), "
-        "  c.topic, c.archived_at_ms "
+        "  c.topic, c.archived_at_ms, c.created_at_ms "
         "FROM channels c WHERE "
         "  (c.kind='channel' AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1))) "
         "  OR (c.kind='dm' AND EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1)) "
@@ -1751,6 +1751,7 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         const unsigned char *tp = sqlite3_column_text(st, 8);
         arr[n].topic           = (tp && tp[0]) ? strdup((const char *)tp) : NULL;
         arr[n].archived        = (uint8_t)(sqlite3_column_type(st, 9) != SQLITE_NULL);
+        arr[n].created_at      = (uint64_t)sqlite3_column_int64(st, 10);
         n++;
     }
     sqlite3_finalize(st);
