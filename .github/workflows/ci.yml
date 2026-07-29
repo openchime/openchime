@@ -1,7 +1,7 @@
 name: ci
 
 # Runs on every branch push (so the branch gate is real — see CONTRIBUTING.md)
-# and on PRs targeting main. Three jobs:
+# and on PRs targeting main. Four jobs:
 #   - build:       native gcc build of the daemon, plus unit tests (make test),
 #                  which include the headless client app-core test.
 #   - integration: the deployed image end-to-end on the Docker Compose stack —

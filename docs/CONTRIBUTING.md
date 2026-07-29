@@ -39,7 +39,12 @@ The branch, commit, and CI policy for this repo. The private control-plane repo
   (health check + the protocol vertical over TLS).
 - **`core`** — standalone compile check of the client app-core (ARCH-74).
 - **`windows`** — cross-compiles the Windows TUI + GUI (`make windows-tui windows-gui`).
-- **`attribution-guard`** — runs on every push.
+- **`guard`** — the job in the separate [`attribution-guard`](../.github/workflows/attribution-guard.yml)
+  workflow. Unlike the four above it has **no `paths-ignore`**, so it runs on
+  every push including docs-only ones — which is the point, since the thing it
+  rejects lives in commit messages and author lines. It is also the **required
+  status check** on `main`, so a direct docs push to `main` reports a bypass
+  until it reports green.
 - Docs-only pushes skip the build jobs (`paths-ignore: ['**.md', ...]`).
 
 See [TESTING.md](./TESTING.md) for the full test strategy.
