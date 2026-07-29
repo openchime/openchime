@@ -95,6 +95,7 @@ typedef enum {
     OC_MSG_WEBHOOK_LIST       = 0x005C, /* S->C, the webhook list (no tokens) */
     OC_MSG_DELETE_WEBHOOK     = 0x005D, /* C->S, remove a webhook */
     OC_MSG_WEBHOOK_DELETED    = 0x005E, /* S->C, ack for DELETE_WEBHOOK */
+    OC_MSG_UPDATE_CHANNEL     = 0x005F, /* C->S (REQ-034/035/036), mutate a channel */
     OC_MSG_SET_PRESENCE     = 0x0070, /* C->S, set own presence (REQ-120) */
     OC_MSG_PRESENCE_UPDATE  = 0x0071, /* S->C, a user's presence changed */
     OC_MSG_TYPING           = 0x0072, /* C->S, "I am typing" in a channel (REQ-121) */
@@ -175,6 +176,7 @@ typedef enum {
     OC_ERR_UNKNOWN_WEBHOOK     = 3016, /* no such (or disabled) incoming webhook token (REQ-170) */
     OC_ERR_CHANNEL_EXISTS      = 3017, /* a channel of that name already exists (names are unique, case-insensitively) */
     OC_ERR_TOO_MANY_PINS       = 3018, /* channel already holds OC_MAX_PINS pins (REQ-230) */
+    OC_ERR_CHANNEL_ARCHIVED    = 3019, /* channel is archived: read-only (REQ-035) */
     OC_ERR_INVALID_DEVICE_TOKEN = 3014, /* empty token or unknown platform on REGISTER_DEVICE_TOKEN */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
@@ -317,6 +319,15 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_REACT_ADD    1u
 #define OC_MAX_EMOJI    32u
 
+/* Channel mutation ops (REQ-034/035/036, ARCH-93). One frame carries all four
+ * because they all mutate one row and all fan out the same CHANNEL_INFO — the
+ * op IS the difference. `value` is the new topic or name; unused for archive. */
+#define OC_CHUP_TOPIC     0u   /* any member */
+#define OC_CHUP_RENAME    1u   /* owner/admin */
+#define OC_CHUP_ARCHIVE   2u   /* owner/admin */
+#define OC_CHUP_UNARCHIVE 3u   /* owner/admin */
+#define OC_MAX_TOPIC      250u /* bytes; Slack's cap, and a topic is one header line */
+
 /* Pin op (REQ-230, ARCH-90) and the per-channel cap. A pin belongs to the
  * channel, not to the pinner: pinning an already-pinned message is a no-op
  * rather than a second pin. The cap bounds both the list frame and the work of
@@ -432,8 +443,14 @@ typedef struct { uint64_t channel_id; uint64_t parent_id; } oc_list_thread;
 typedef struct { uint64_t parent_id; uint32_t count; uint8_t truncated; } oc_thread;
 typedef struct { uint64_t message_id; uint32_t reply_count; uint64_t last_reply_at; } oc_thread_meta;
 typedef struct { oc_slice name; uint8_t is_public; } oc_create_channel;
+typedef struct { uint64_t channel_id; uint8_t op; oc_slice value; } oc_update_channel;
+/* CHANNEL_INFO is the channel-state frame: the ack for create/join/leave/
+ * invite/remove, and (ARCH-93) the fan-out when a topic/name/archive changes.
+ * `peer_id` used to be an "optional trailing" field written only for DMs; that
+ * trick does not survive a SECOND optional field, so as of REQ-034/035/036 the
+ * layout is fixed and peer_id is always written (0 when not a DM). */
 typedef struct { uint64_t channel_id; uint8_t kind; oc_slice name; uint8_t is_public; uint8_t joined; uint64_t created_at;
-                 uint64_t peer_id; } oc_channel_info;  /* peer_id: for a DM (kind=1), the other participant; optional trailing */
+                 uint64_t peer_id; oc_slice topic; uint8_t archived; } oc_channel_info;
 typedef struct { uint64_t channel_id; } oc_channel_ref;                       /* JOIN / LEAVE */
 typedef struct { uint64_t channel_id; uint64_t user_id; } oc_channel_member_op; /* INVITE / REMOVE */
 /* CHANNEL_LIST entry. `last_message_at`/`unread` were added 2026-07-27 so a
@@ -443,7 +460,8 @@ typedef struct { uint64_t channel_id; uint64_t user_id; } oc_channel_member_op; 
  * sequentially and r_done() rejects leftover bytes — and client and daemon ship
  * from this one file (ARCH-61), so they change together. */
 typedef struct { uint64_t channel_id; oc_slice name; uint8_t is_public; uint8_t joined; uint8_t kind;
-                 uint64_t last_message_at; uint32_t unread; uint64_t peer_id; } oc_channel_list_entry;
+                 uint64_t last_message_at; uint32_t unread; uint64_t peer_id;
+                 oc_slice topic; uint8_t archived; } oc_channel_list_entry;
 typedef struct { uint64_t user_id; } oc_open_dm;
 /* Incoming-webhook management (REQ-170). CREATE_WEBHOOK asks for a token scoped
  * to a channel; WEBHOOK_INFO returns the id + the raw 32-byte token (shown once,
@@ -613,6 +631,7 @@ oc_result oc_encode_list_thread(oc_wbuf *w, uint16_t version, const oc_list_thre
 oc_result oc_encode_thread(oc_wbuf *w, uint16_t version, const oc_thread *m);
 oc_result oc_encode_thread_meta(oc_wbuf *w, uint16_t version, const oc_thread_meta *m);
 oc_result oc_encode_create_channel(oc_wbuf *w, uint16_t version, const oc_create_channel *m);
+oc_result oc_encode_update_channel(oc_wbuf *w, uint16_t version, const oc_update_channel *m);
 oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_info *m);
 oc_result oc_encode_list_channels(oc_wbuf *w, uint16_t version);
 /* Bodyless request for the storage report (REQ-214); owner/admin only. */
@@ -731,6 +750,7 @@ oc_result oc_decode_list_thread(oc_rbuf *p, oc_list_thread *m);
 oc_result oc_decode_thread(oc_rbuf *p, oc_thread *m);
 oc_result oc_decode_thread_meta(oc_rbuf *p, oc_thread_meta *m);
 oc_result oc_decode_create_channel(oc_rbuf *p, oc_create_channel *m);
+oc_result oc_decode_update_channel(oc_rbuf *p, oc_update_channel *m);
 oc_result oc_decode_channel_info(oc_rbuf *p, oc_channel_info *m);
 oc_result oc_decode_list_channels(oc_rbuf *p);
 oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries, uint16_t cap, uint16_t *out_count);

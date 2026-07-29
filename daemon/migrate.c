@@ -471,6 +471,26 @@ static const char MIGRATION_0023[] =
     "CREATE INDEX idx_attachments_channel ON attachments(channel_id, created_at_ms DESC) "
     "  WHERE message_id IS NOT NULL;";
 
+static const char MIGRATION_0024[] =
+    /* Channel mutability (REQ-034/035/036, ARCH-93). Two columns, because the
+     * three verbs are one row's state:
+     *
+     *   topic           — REQ-034. Metadata, distinct from the name; any member
+     *                     may set it. NULL and '' both mean "no topic".
+     *   archived_at_ms  — REQ-035. Non-NULL IS the archived flag, which makes
+     *                     "when was it archived" free and unarchive a single
+     *                     NULL write. A boolean column plus a date column would
+     *                     have let the two disagree.
+     *
+     * Rename (REQ-036) needs no column at all: the name is already mutable and
+     * everything durable keys on channels.id, so a rename is an UPDATE. There is
+     * deliberately no name-history table — see ARCH-93. */
+    "ALTER TABLE channels ADD COLUMN topic TEXT;"
+    "ALTER TABLE channels ADD COLUMN archived_at_ms INTEGER;"
+    /* The sidebar's default query is "channels I can see that are not archived",
+     * so that is the shape worth indexing. */
+    "CREATE INDEX idx_channels_archived ON channels(archived_at_ms);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -495,6 +515,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 21, MIGRATION_0021 },
     { 22, MIGRATION_0022 },
     { 23, MIGRATION_0023 },
+    { 24, MIGRATION_0024 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

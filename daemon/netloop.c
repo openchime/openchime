@@ -920,6 +920,21 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_UPDATE_CHANNEL) {
+            oc_update_channel uc;
+            if (oc_decode_update_channel(&p, &uc) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_UPDATE_CHANNEL, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->channel_id = uc.channel_id;
+            j->chup_op = uc.op;
+            j->ch_name = malloc(uc.value.len + 1);
+            if (!j->ch_name) return -1;
+            if (uc.value.len) memcpy(j->ch_name, uc.value.ptr, uc.value.len);
+            j->ch_name[uc.value.len] = '\0';
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_LIST_MEMBERS) {
             oc_list_members lm;
             if (oc_decode_list_members(&p, &lm) != OC_OK) return -1;
@@ -1684,9 +1699,27 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
             oc_channel_info ci = { r->channel_id, r->ch_kind,
                                    oc_slice_str(r->ch_name ? r->ch_name : ""),
-                                   r->ch_is_public, r->ch_joined, r->ch_created_at, r->ch_peer };
+                                   r->ch_is_public, r->ch_joined, r->ch_created_at, r->ch_peer,
+                                   oc_slice_str(r->ch_topic ? r->ch_topic : ""), r->ch_archived };
             oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        /* An UPDATE_CHANNEL (ARCH-93) changes what EVERY member's sidebar should
+         * say, so its CHANNEL_INFO fans out rather than only acking the actor. */
+        if (r->ch_fanout) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_channel_info ci = { r->channel_id, r->ch_kind,
+                                   oc_slice_str(r->ch_name ? r->ch_name : ""),
+                                   r->ch_is_public, 1, r->ch_created_at, 0,
+                                   oc_slice_str(r->ch_topic ? r->ch_topic : ""), r->ch_archived };
+            oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci);
+            size_t len = w.len;
+            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                conn *t = conns[fd];
+                if (t && t->authed && t->user_id != actor &&
+                    in_members(t->user_id, r->members, r->n_members))
+                    send_bytes(ep, conns, fd, g_enc, len);
+            }
         }
         /* Push the (now-member) channel to the target: an INVITE (regular channel)
          * or the peer of a new DM. For a DM the peer, from the target's view, is
@@ -1696,7 +1729,8 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
             oc_channel_info ci = { r->channel_id, r->ch_kind,
                                    oc_slice_str(r->ch_name ? r->ch_name : ""),
-                                   r->ch_is_public, 1, r->ch_created_at, push_peer };
+                                   r->ch_is_public, 1, r->ch_created_at, push_peer,
+                                   oc_slice_str(r->ch_topic ? r->ch_topic : ""), r->ch_archived };
             oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci);
             size_t len = w.len;
             for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
@@ -1743,6 +1777,8 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             ents[i].last_message_at = r->chlist[i].last_message_at;
             ents[i].unread = r->chlist[i].unread;
             ents[i].peer_id = r->chlist[i].peer_id;
+            ents[i].topic = oc_slice_str(r->chlist[i].topic ? r->chlist[i].topic : "");
+            ents[i].archived = r->chlist[i].archived;
         }
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_channel_list cl = { (uint16_t)n, ents };

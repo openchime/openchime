@@ -307,6 +307,11 @@ the requirement says so explicitly rather than implying one.
   sending it. Deletion has produced a tombstone record (author, timestamp,
   and thread linkage preserved; body removed) rather than removing the row,
   so that thread reply counts and quoted references have not broken.
+  A tombstone has also dropped everything that hung off the body — its
+  reactions, its pins, and **its attachments** (rows and blobs). *Partially
+  built:* reactions and pins are dropped; attachments are **not**, which leaks a
+  blob per deleted message (WIN-61 in the Win32 backlog records the observation).
+
 - **REQ-053.** Full message history has had no retention cutoff or paid-tier
   history cap of the kind Slack's free tier imposes.
 - **REQ-054.** A message body has been capped at approximately 64KB

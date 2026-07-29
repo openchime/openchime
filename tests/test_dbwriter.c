@@ -51,7 +51,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 23);
+    CHECK(oc_schema_version(db) == 24);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -1135,6 +1135,166 @@ static void test_channel_details(void) {
     CHECK(r && r->type == OC_RES_FILE_LIST);
     for (size_t i = 0; i < r->n_flist; i++) CHECK(r->flist[i].channel_id != secret);
     oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* Channel mutability (REQ-034/035/036, ARCH-93): topic, rename, archive. What
+ * matters is the authority split, that a rename keeps everything keyed on the
+ * id, and that archived really is read-only. */
+static oc_dbres *chan_update(oc_dbwriter *w, uint64_t uid, uint64_t ch, uint8_t op, const char *val) {
+    oc_job *j = oc_job_new(OC_JOB_UPDATE_CHANNEL, 340);
+    j->user_id = uid; j->channel_id = ch; j->chup_op = op;
+    j->ch_name = val ? strdup(val) : strdup("");
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_channel_mutability(void) {
+    const char *path = "build/test_dbwriter_chanmut.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t alice = reg(w, "alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    oc_dbres *r = create_channel(w, alice, "planning", 1);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t ch = r->channel_id;
+    oc_dbres_free(r);
+    oc_dbres_free(chan_member(w, OC_JOB_INVITE_CHANNEL, alice, ch, bob));
+
+    /* Topic: ANY member may set it — it is already visible to the channel and a
+     * wrong one is corrected in seconds. */
+    r = chan_update(w, bob, ch, OC_CHUP_TOPIC, "ship on friday");
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    CHECK(r->ch_topic && strcmp(r->ch_topic, "ship on friday") == 0);
+    /* The change fans out to everyone, not just the actor. */
+    CHECK(r->ch_fanout == 1 && r->n_members >= 2);
+    oc_dbres_free(r);
+
+    /* An empty topic clears it rather than storing "". */
+    r = chan_update(w, bob, ch, OC_CHUP_TOPIC, "");
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->ch_topic == NULL);
+    oc_dbres_free(r);
+
+    {
+        char big[OC_MAX_TOPIC + 20];
+        memset(big, 'x', sizeof big - 1); big[sizeof big - 1] = '\0';
+        r = chan_update(w, alice, ch, OC_CHUP_TOPIC, big);
+        CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_INVALID_CHANNEL);
+        oc_dbres_free(r);
+    }
+
+    /* Rename is owner/admin only — it moves a landmark for people who are not
+     * looking at the channel. */
+    r = chan_update(w, bob, ch, OC_CHUP_RENAME, "roadmap");
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    /* A rename keeps the id, so membership and history follow it for free —
+     * this is why there is no name-history table (ARCH-93). */
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0xE1, sizeof idem);
+    {
+        oc_job *sj = oc_job_new(OC_JOB_SEND, 341);
+        sj->user_id = alice; sj->channel_id = ch;
+        memcpy(sj->idem, idem, OC_IDEM_LEN);
+        oc_job_set_body(sj, "before the rename", 17);
+        oc_dbwriter_submit(w, sj);
+        oc_dbres *sr = wait_result(w);
+        CHECK(sr && sr->type == OC_RES_SEND_OK);
+        oc_dbres_free(sr);
+    }
+    r = chan_update(w, alice, ch, OC_CHUP_RENAME, "roadmap");
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    CHECK(r->channel_id == ch);                       /* same id */
+    CHECK(r->ch_name && strcmp(r->ch_name, "roadmap") == 0);
+    oc_dbres_free(r);
+    r = backfill(w, alice, ch, 0);
+    CHECK(r && r->n_replay == 1);                     /* history survived */
+    oc_dbres_free(r);
+
+    /* The unique-name index applies to a rename exactly as to a create. */
+    oc_dbres_free(create_channel(w, alice, "taken", 1));
+    r = chan_update(w, alice, ch, OC_CHUP_RENAME, "TAKEN");
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_CHANNEL_EXISTS);
+    oc_dbres_free(r);
+    /* But renaming to its own name (different case) is not a collision. */
+    r = chan_update(w, alice, ch, OC_CHUP_RENAME, "Roadmap");
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    oc_dbres_free(r);
+
+    r = chan_update(w, alice, ch, OC_CHUP_RENAME, "");
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_INVALID_CHANNEL);
+    oc_dbres_free(r);
+
+    /* Archive: owner/admin only, and then genuinely read-only. */
+    r = chan_update(w, bob, ch, OC_CHUP_ARCHIVE, "");
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    r = chan_update(w, alice, ch, OC_CHUP_ARCHIVE, "");
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->ch_archived == 1);
+    oc_dbres_free(r);
+
+    memset(idem, 0xE2, sizeof idem);
+    {
+        oc_job *sj = oc_job_new(OC_JOB_SEND, 342);
+        sj->user_id = alice; sj->channel_id = ch;
+        memcpy(sj->idem, idem, OC_IDEM_LEN);
+        oc_job_set_body(sj, "after archiving", 15);
+        oc_dbwriter_submit(w, sj);
+        oc_dbres *sr = wait_result(w);
+        CHECK(sr && sr->type == OC_RES_SEND_ERR && sr->err_code == OC_ERR_CHANNEL_ARCHIVED);
+        oc_dbres_free(sr);
+    }
+    /* Read-only, not gone: history is still retrievable (REQ-035). */
+    r = backfill(w, alice, ch, 0);
+    CHECK(r && r->n_replay == 1);
+    oc_dbres_free(r);
+
+    /* A member still sees it listed (they need the way back); the archived flag
+     * travels so a client can render it differently. */
+    r = list_channels(w, alice);
+    CHECK(r && r->type == OC_RES_CHANNEL_LIST);
+    int seen = 0;
+    for (size_t i = 0; i < r->n_chlist; i++)
+        if (r->chlist[i].channel_id == ch) { seen = 1; CHECK(r->chlist[i].archived == 1); }
+    CHECK(seen);
+    oc_dbres_free(r);
+
+    /* Unarchive restores writability. */
+    r = chan_update(w, alice, ch, OC_CHUP_UNARCHIVE, "");
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->ch_archived == 0);
+    oc_dbres_free(r);
+    {
+        oc_job *sj = oc_job_new(OC_JOB_SEND, 343);
+        sj->user_id = alice; sj->channel_id = ch;
+        memcpy(sj->idem, idem, OC_IDEM_LEN);
+        oc_job_set_body(sj, "after unarchiving", 17);
+        oc_dbwriter_submit(w, sj);
+        oc_dbres *sr = wait_result(w);
+        CHECK(sr && sr->type == OC_RES_SEND_OK);
+        oc_dbres_free(sr);
+    }
+
+    /* A DM has no name to rename and no topic worth setting. */
+    {
+        oc_job *dj = oc_job_new(OC_JOB_OPEN_DM, 344);
+        dj->user_id = alice; dj->target_user_id = bob;
+        oc_dbwriter_submit(w, dj);
+        oc_dbres *dr = wait_result(w);
+        CHECK(dr && dr->type == OC_RES_CHANNEL_INFO);
+        uint64_t dm = dr->channel_id;
+        oc_dbres_free(dr);
+        r = chan_update(w, alice, dm, OC_CHUP_TOPIC, "nope");
+        CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_INVALID_CHANNEL);
+        oc_dbres_free(r);
+    }
 
     oc_dbwriter_stop(w);
     cleanup_db(path);
@@ -2477,7 +2637,7 @@ static void test_max_users(void) {
 }
 
 int run_dbwriter_tests(void) {
-    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details\n");
+    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability\n");
     test_start_migrates_and_stops();
     test_auth_and_send();
     test_oidc_auth();
@@ -2504,6 +2664,7 @@ int run_dbwriter_tests(void) {
     test_mentions_stored();
     test_pins();
     test_channel_details();
+    test_channel_mutability();
     test_max_users();
     return failures;
 }

@@ -225,7 +225,8 @@ void oc_dbres_free(oc_dbres *r) {
     for (size_t i = 0; i < r->n_flist; i++) { free(r->flist[i].filename); free(r->flist[i].mime); }
     free(r->flist);
     free(r->ch_name);
-    for (size_t i = 0; i < r->n_chlist; i++) free(r->chlist[i].name);
+    free(r->ch_topic);
+    for (size_t i = 0; i < r->n_chlist; i++) { free(r->chlist[i].name); free(r->chlist[i].topic); }
     free(r->chlist);
     for (size_t i = 0; i < r->n_ulist; i++) { free(r->ulist[i].email); free(r->ulist[i].display_name); }
     free(r->ulist);
@@ -1184,13 +1185,28 @@ static int channel_read_access(sqlite3 *db, uint64_t channel_id, uint64_t user_i
     return is_public || is_member(db, channel_id, user_id);
 }
 
+/* Is this channel archived (REQ-035)? archived_at_ms non-NULL is the flag. */
+static int channel_is_archived(sqlite3 *db, uint64_t channel_id) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT archived_at_ms FROM channels WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
+    int archived = (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL);
+    sqlite3_finalize(st);
+    return archived;
+}
+
 /* Post access (REQ-031). CH_OK: allowed (a public channel auto-joins the poster
  * so broadcasts reach them); CH_UNKNOWN: no such channel; CH_DENIED: a private
  * channel the user does not belong to. */
-enum { CH_OK = 0, CH_UNKNOWN = 1, CH_DENIED = 2 };
+enum { CH_OK = 0, CH_UNKNOWN = 1, CH_DENIED = 2, CH_ARCHIVED = 3 };
 static int channel_post_access(sqlite3 *db, uint64_t channel_id, uint64_t user_id) {
     uint8_t is_public = 0;
     if (!channel_exists(db, channel_id, &is_public)) return CH_UNKNOWN;
+    /* Archived is read-only (REQ-035), enforced here so every write path — send,
+     * threaded reply, webhook post — inherits it rather than each remembering.
+     * Checked before membership so an archived channel refuses uniformly, and
+     * so a public one does not silently auto-join someone into a dead room. */
+    if (channel_is_archived(db, channel_id)) return CH_ARCHIVED;
     if (is_member(db, channel_id, user_id)) return CH_OK;
     if (is_public) { add_membership(db, channel_id, user_id); return CH_OK; }
     return CH_DENIED;
@@ -1342,6 +1358,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     int acc = channel_post_access(db, j->channel_id, j->user_id);
     if (acc == CH_UNKNOWN) { r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
     if (acc == CH_DENIED)  { r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;   return r; }
+    if (acc == CH_ARCHIVED){ r->type = OC_RES_SEND_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
 
     uint64_t ts = dbw_now_ms();
     sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
@@ -1519,7 +1536,8 @@ static int load_channel_info(sqlite3 *db, uint64_t channel_id, uint64_t actor, o
     sqlite3_stmt *st = NULL;
     int found = 0;
     sqlite3_prepare_v2(db,
-        "SELECT kind, name, is_public, created_at_ms FROM channels WHERE id=?;",
+        "SELECT kind, name, is_public, created_at_ms, topic, archived_at_ms "
+        "  FROM channels WHERE id=?;",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
     if (sqlite3_step(st) == SQLITE_ROW) {
@@ -1529,12 +1547,108 @@ static int load_channel_info(sqlite3 *db, uint64_t channel_id, uint64_t actor, o
         r->ch_name       = strdup(nm ? (const char *)nm : "");
         r->ch_is_public  = (uint8_t)(sqlite3_column_int(st, 2) != 0);
         r->ch_created_at = (uint64_t)sqlite3_column_int64(st, 3);
+        const unsigned char *tp = sqlite3_column_text(st, 4);
+        r->ch_topic      = (tp && tp[0]) ? strdup((const char *)tp) : NULL;
+        r->ch_archived   = (uint8_t)(sqlite3_column_type(st, 5) != SQLITE_NULL);
         r->channel_id    = channel_id;
         found = 1;
     }
     sqlite3_finalize(st);
     if (found) r->ch_joined = (uint8_t)(is_member(db, channel_id, actor) ? 1 : 0);
     return found;
+}
+
+/* Change a channel: topic, name, archive, unarchive (REQ-034/035/036, ARCH-93).
+ *
+ * One handler for four verbs because they are one row's state and one fan-out.
+ * Authority splits on blast radius: a topic is already visible to the channel
+ * and trivially corrected, so any member may set it; a rename or an archive
+ * changes what people who are NOT looking at the channel see, so both are
+ * owner/admin. */
+static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT kind FROM channels WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    int exists = 0, is_dm = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *kn = sqlite3_column_text(st, 0);
+        exists = 1; is_dm = (kn && strcmp((const char *)kn, "dm") == 0);
+    }
+    sqlite3_finalize(st);
+    if (!exists) { r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
+    /* A DM has no name to rename, no topic worth setting, and archiving one is
+     * "close the conversation" — a different feature (REQ-235-adjacent), not
+     * this one. */
+    if (is_dm) { r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_INVALID_CHANNEL; return r; }
+    if (!is_member(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+
+    uint8_t role = OC_ROLE_MEMBER;
+    user_role(db, j->user_id, &role);
+    size_t vlen = j->ch_name ? strlen(j->ch_name) : 0;
+
+    if (j->chup_op == OC_CHUP_TOPIC) {
+        if (vlen > OC_MAX_TOPIC) {
+            r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_INVALID_CHANNEL; return r;
+        }
+        sqlite3_prepare_v2(db, "UPDATE channels SET topic=? WHERE id=?;", -1, &st, NULL);
+        if (vlen) sqlite3_bind_text(st, 1, j->ch_name, (int)vlen, SQLITE_STATIC);
+        else      sqlite3_bind_null(st, 1);          /* "" clears the topic */
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+        sqlite3_step(st); sqlite3_finalize(st);
+        audit_actor(db, OC_AUDIT_ADMIN, "channel.topic", j->user_id, 0, NULL, 1, NULL);
+    } else if (j->chup_op == OC_CHUP_RENAME) {
+        if (!oc_role_can_moderate(role)) {
+            r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+        }
+        if (vlen == 0 || vlen > OC_MAX_CHANNEL_NAME) {
+            r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_INVALID_CHANNEL; return r;
+        }
+        /* Pre-check so the client gets a usable error instead of a constraint
+         * failure — the same shape migration 0020 established for create. */
+        sqlite3_prepare_v2(db,
+            "SELECT 1 FROM channels WHERE kind='channel' AND lower(name)=lower(?) AND id<>?;",
+            -1, &st, NULL);
+        sqlite3_bind_text(st, 1, j->ch_name, (int)vlen, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+        int taken = (sqlite3_step(st) == SQLITE_ROW);
+        sqlite3_finalize(st);
+        if (taken) { r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_CHANNEL_EXISTS; return r; }
+
+        sqlite3_prepare_v2(db, "UPDATE channels SET name=? WHERE id=?;", -1, &st, NULL);
+        sqlite3_bind_text(st, 1, j->ch_name, (int)vlen, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+        sqlite3_step(st); sqlite3_finalize(st);
+        /* The id is untouched, so membership, history and cursors all follow the
+         * rename for free — nothing durable was ever keyed on the name. */
+        audit_actor(db, OC_AUDIT_ADMIN, "channel.rename", j->user_id, 0, j->ch_name, 1, NULL);
+    } else if (j->chup_op == OC_CHUP_ARCHIVE || j->chup_op == OC_CHUP_UNARCHIVE) {
+        if (!oc_role_can_moderate(role)) {
+            r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+        }
+        int on = (j->chup_op == OC_CHUP_ARCHIVE);
+        sqlite3_prepare_v2(db, "UPDATE channels SET archived_at_ms=? WHERE id=?;", -1, &st, NULL);
+        if (on) sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+        else    sqlite3_bind_null(st, 1);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+        sqlite3_step(st); sqlite3_finalize(st);
+        audit_actor(db, OC_AUDIT_ADMIN, on ? "channel.archive" : "channel.unarchive",
+                    j->user_id, 0, NULL, 1, NULL);
+    } else {
+        r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_INVALID_CHANNEL; return r;
+    }
+
+    r->type = OC_RES_CHANNEL_INFO;
+    load_channel_info(db, j->channel_id, j->user_id, r);
+    r->ch_fanout = 1;              /* everyone's sidebar is affected, not just mine */
+    load_members(db, j->channel_id, r);
+    return r;
 }
 
 /* Create a named channel (REQ-050); the creator auto-joins. */
@@ -1606,10 +1720,17 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         /* A DM has no name; the client titles it by its peer, so send that too —
          * otherwise a cache-less client shows "direct message" until it opens one. */
         "  COALESCE((SELECT m2.user_id FROM channel_members m2 "
-        "              WHERE m2.channel_id=c.id AND m2.user_id<>?1 LIMIT 1), ?1) "
+        "              WHERE m2.channel_id=c.id AND m2.user_id<>?1 LIMIT 1), ?1), "
+        "  c.topic, c.archived_at_ms "
         "FROM channels c WHERE "
         "  (c.kind='channel' AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1))) "
         "  OR (c.kind='dm' AND EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1)) "
+        /* An archived channel is hidden from the default list unless you are a
+         * member of it (REQ-035) — hidden, not deleted: a member keeps the way
+         * back in, and its history stays searchable for everyone who could read
+         * it before. */
+        "  AND (c.archived_at_ms IS NULL "
+        "       OR EXISTS(SELECT 1 FROM channel_members m WHERE m.channel_id=c.id AND m.user_id=?1)) "
         "ORDER BY c.id;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
 
@@ -1627,6 +1748,9 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         arr[n].last_message_at = (uint64_t)sqlite3_column_int64(st, 5);
         arr[n].unread          = (uint32_t)sqlite3_column_int64(st, 6);
         arr[n].peer_id         = (uint64_t)sqlite3_column_int64(st, 7);
+        const unsigned char *tp = sqlite3_column_text(st, 8);
+        arr[n].topic           = (tp && tp[0]) ? strdup((const char *)tp) : NULL;
+        arr[n].archived        = (uint8_t)(sqlite3_column_type(st, 9) != SQLITE_NULL);
         n++;
     }
     sqlite3_finalize(st);
@@ -2188,6 +2312,7 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     int acc = channel_post_access(db, j->channel_id, j->user_id);
     if (acc == CH_UNKNOWN) { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
     if (acc == CH_DENIED)  { r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;   return r; }
+    if (acc == CH_ARCHIVED){ r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
 
     uint64_t ts = dbw_now_ms();
     sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
@@ -2760,6 +2885,7 @@ static oc_dbres *process_attach_create(sqlite3 *db, const oc_job *j) {
     int acc = channel_post_access(db, j->channel_id, j->user_id);
     if (acc == CH_UNKNOWN) { r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
     if (acc == CH_DENIED)  { r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;   return r; }
+    if (acc == CH_ARCHIVED){ r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
 
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
@@ -2897,6 +3023,7 @@ static oc_dbres *process_create_webhook(sqlite3 *db, const oc_job *j) {
     int acc = channel_post_access(db, j->channel_id, j->user_id);
     if (acc == CH_UNKNOWN) { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_UNKNOWN_CHANNEL; return r; }
     if (acc == CH_DENIED)  { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;   return r; }
+    if (acc == CH_ARCHIVED){ r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
 
     uint8_t token[OC_SESSION_TOKEN_LEN], hash[OC_SHA256_LEN];
     if (oc_rand_bytes(token, sizeof token) != 0 || oc_sha256(token, sizeof token, hash) != 0) {
@@ -3409,6 +3536,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_REDEEM)         return process_redeem(w, j);
     if (j->type == OC_JOB_REACT)          return process_react(w->db, j);
     if (j->type == OC_JOB_PIN)            return process_pin(w->db, j);
+    if (j->type == OC_JOB_UPDATE_CHANNEL) return process_update_channel(w->db, j);
     if (j->type == OC_JOB_SEND_REPLY)     return process_send_reply(w->db, j);
     if (j->type == OC_JOB_SETUP_INVITE)   return process_setup_invite(w->db, j);
     if (j->type == OC_JOB_CLIENT_ACK)     return process_client_ack(w->db, j);

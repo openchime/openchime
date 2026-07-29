@@ -9,7 +9,7 @@ clients, or a `REQ-NNN`.
 parity table is the *feature reachability* tracker. This document is the *work
 list* derived from both — one row per shippable branch.
 
-**Ids.** Items are `WIN-1` … `WIN-60`, numbered once and **stable**: an id is
+**Ids.** Items are `WIN-1` … `WIN-63`, numbered once and **stable**: an id is
 never renumbered or reused, so a commit or branch can cite it. Ordering is *not*
 priority — the **Pri** column is, and it may change. Section membership may also
 change as blockers clear (an item moves from §3 to §1 without changing its id).
@@ -174,6 +174,37 @@ than against the backlog:
 ## Known defects, unfixed
 
 Recorded because a defect nobody wrote down is a defect nobody fixes.
+
+- **WIN-61 — a deleted message keeps its reaction chips and its attachment.**
+  Observed 2026-07-28: a tombstone rendered "(message deleted)" with 👍1 😮1 still
+  under it and `notes.txt` still attached. Three distinct faults behind one
+  screenshot:
+  1. **Client (this repo, `client/core/model.c`).** `OC_EV_DELETE` sets
+     `deleted = 1` and nothing else, so the model keeps `reactions` and `attach`
+     for a message whose body is gone. The daemon *did* delete the reaction rows —
+     the client is showing state the server no longer has, which is worse than a
+     cosmetic bug because a reload would disagree with the live view.
+  2. **Daemon (REQ-052).** `process_delete` drops `pins` and `reactions` but
+     **not `attachments`** — so the row and its blob survive a tombstone. That is
+     a storage leak as well as a UI one, and it is the same class of miss the pin
+     and reaction cleanups already fix beside it.
+  3. **A tombstone should also lose its thread replies' claim on it** — worth
+     checking while in there; not yet verified either way.
+- **WIN-63 — reaction chips sit above the attachments, not below them.**
+  `draw_message` lays a block out as body → chips → attachments/thumbnails →
+  thread line, so on a message with an image the reactions are stranded in the
+  middle. They belong at the **bottom of the block**, under everything the
+  message carries, which is where every reference client puts them and where the
+  eye expects the "footer" of a message. Both `msg_height` and `draw_message`
+  order the meta lines the same way, so the fix is one reordering applied twice —
+  and they must stay in step or the transcript's hit-boxes drift from what is
+  drawn.
+- **WIN-62 — reaction chips are not clickable.** The chips render but have no
+  hit-boxes, so the only way to react is the message menu. Clicking a chip should
+  **+1 it**, and clicking one you are already part of should **undo** your
+  reaction. The app-core already supports both (`oc_client_react` with
+  add/remove, and `reaction_is_mine` picks the direction — the menu uses exactly
+  that); this is a hit-testing gap in the GUI, not a protocol one.
 
 - **WIN-60 — unreproduced crash while typing.** The client was seen to exit once
   during composer input. It has not reproduced since, there is no dump, and the

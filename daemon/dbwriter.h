@@ -41,6 +41,8 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_PIN = 62, OC_JOB_LIST_PINS = 63,
        /* Channel details (REQ-031, REQ-143). Both reads. */
        OC_JOB_LIST_MEMBERS = 64, OC_JOB_LIST_FILES = 65,
+       /* Channel mutability (REQ-034/035/036, ARCH-93). */
+       OC_JOB_UPDATE_CHANNEL = 66,
        /* Attachments (REQ-140/141, ARCH-69/70). CREATE mints a pending row + a
         * storage key on UPLOAD_BEGIN (write); FINALIZE records the streamed
         * size + digest on UPLOAD_END (write); LOOKUP authorizes + fetches the
@@ -127,6 +129,9 @@ typedef struct oc_job {
 
     /* PIN (channel_id + message_id above); op is add/remove (REQ-230). */
     uint8_t        pin_op;
+
+    /* UPDATE_CHANNEL (channel_id above): op + the new topic/name in ch_name. */
+    uint8_t        chup_op;
 
     /* SEARCH: query text is carried in body/body_len; this bounds the result. */
     uint16_t       search_limit;
@@ -268,6 +273,8 @@ typedef struct {
     uint8_t  is_public;
     uint8_t  joined;     /* 1 if the requesting user is a member */
     uint8_t  kind;       /* OC_CHANNEL_KIND / OC_CHANNEL_KIND_DM */
+    char    *topic;      /* heap; NULL = none (REQ-034) */
+    uint8_t  archived;   /* REQ-035 */
     /* Sidebar ordering + badging for a client that caches nothing (ARCH-88):
      * the newest top-level message's time, and how many of them sit past this
      * user's delivery cursor (REQ-090). Both are 0 for an empty channel. */
@@ -408,6 +415,11 @@ typedef struct oc_dbres {
     uint8_t        ch_is_public;
     uint8_t        ch_joined;       /* the actor's membership after the op */
     uint64_t       ch_created_at;
+    char          *ch_topic;        /* heap; NULL = none (REQ-034) */
+    uint8_t        ch_archived;     /* REQ-035 */
+    /* CHANNEL_INFO from an UPDATE_CHANNEL fans to every member, not just the
+     * actor: a rename or archive changes what everyone's sidebar should say. */
+    uint8_t        ch_fanout;
     uint64_t       ch_peer;         /* DM (ch_kind=1): the other participant's id (0 = not a DM) */
     uint64_t       push_user_id;    /* INVITE: also push CHANNEL_INFO to this user (0 = none) */
 

@@ -582,6 +582,14 @@ oc_result oc_encode_create_channel(oc_wbuf *w, uint16_t version, const oc_create
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_update_channel(oc_wbuf *w, uint16_t version, const oc_update_channel *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_UPDATE_CHANNEL);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u8(w, m->op);
+    oc_w_str(w, m->value);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_info *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CHANNEL_INFO);
     oc_w_u64(w, m->channel_id);
@@ -590,9 +598,9 @@ oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_
     oc_w_u8(w, m->is_public);
     oc_w_u8(w, m->joined);
     oc_w_u64(w, m->created_at);
-    /* Optional trailing (DMs): the other participant's id. Written only for a
-     * DM, so a named channel's CHANNEL_INFO is byte-identical to before. */
-    if (m->peer_id) oc_w_u64(w, m->peer_id);
+    oc_w_u64(w, m->peer_id);      /* 0 when not a DM; no longer optional (ARCH-93) */
+    oc_w_str(w, m->topic);
+    oc_w_u8(w, m->archived);
     return oc_frame_end(w, off);
 }
 
@@ -618,6 +626,8 @@ oc_result oc_encode_channel_list(oc_wbuf *w, uint16_t version, const oc_channel_
         oc_w_u64(w, m->entries[i].last_message_at);
         oc_w_u32(w, m->entries[i].unread);
         oc_w_u64(w, m->entries[i].peer_id);
+        oc_w_str(w, m->entries[i].topic);
+        oc_w_u8(w, m->entries[i].archived);
     }
     return oc_frame_end(w, off);
 }
@@ -1599,6 +1609,13 @@ oc_result oc_decode_create_channel(oc_rbuf *p, oc_create_channel *m) {
     return r_done(p);
 }
 
+oc_result oc_decode_update_channel(oc_rbuf *p, oc_update_channel *m) {
+    m->channel_id = oc_r_u64(p);
+    m->op         = oc_r_u8(p);
+    m->value      = oc_r_str(p);
+    return r_done(p);
+}
+
 oc_result oc_decode_channel_info(oc_rbuf *p, oc_channel_info *m) {
     m->channel_id = oc_r_u64(p);
     m->kind = oc_r_u8(p);
@@ -1606,7 +1623,9 @@ oc_result oc_decode_channel_info(oc_rbuf *p, oc_channel_info *m) {
     m->is_public = oc_r_u8(p);
     m->joined = oc_r_u8(p);
     m->created_at = oc_r_u64(p);
-    m->peer_id = (!p->underflow && p->pos < p->len) ? oc_r_u64(p) : 0;
+    m->peer_id  = oc_r_u64(p);
+    m->topic    = oc_r_str(p);
+    m->archived = oc_r_u8(p);
     return r_done(p);
 }
 
@@ -1627,6 +1646,8 @@ oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries,
         uint64_t last_at = oc_r_u64(p);
         uint32_t unread = oc_r_u32(p);
         uint64_t peer = oc_r_u64(p);
+        oc_slice topic = oc_r_str(p);
+        uint8_t archived = oc_r_u8(p);
         if (i < cap) {
             entries[i].channel_id = id;
             entries[i].name = name;
@@ -1636,6 +1657,8 @@ oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries,
             entries[i].last_message_at = last_at;
             entries[i].unread = unread;
             entries[i].peer_id = peer;
+            entries[i].topic = topic;
+            entries[i].archived = archived;
         }
     }
     return r_done(p);
