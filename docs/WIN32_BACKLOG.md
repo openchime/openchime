@@ -9,7 +9,7 @@ clients, or a `REQ-NNN`.
 parity table is the *feature reachability* tracker. This document is the *work
 list* derived from both — one row per shippable branch.
 
-**Ids.** Items are `WIN-1` … `WIN-59`, numbered once and **stable**: an id is
+**Ids.** Items are `WIN-1` … `WIN-60`, numbered once and **stable**: an id is
 never renumbered or reused, so a commit or branch can cite it. Ordering is *not*
 priority — the **Pri** column is, and it may change. Section membership may also
 change as blockers clear (an item moves from §3 to §1 without changing its id).
@@ -48,7 +48,7 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 | ~~**WIN-15**~~ | ~~**Per-reply actions inside threads + thread scrollbar.**~~ **DONE.** `draw_msglist` gained a mode so the thread pane records hit-boxes and scrolls with its own offset (opening a thread no longer disturbs where the transcript was). The full message menu works on a reply — `show_msg_menu` now resolves ids in `thread_msgs` as well as the channel, without which the menu simply never appeared, and it routes react/delete to the thread's channel. No thread item on a reply, since there are no nested threads (REQ-060). | P1 | M |
 | ~~**WIN-16**~~ | ~~**Transcript paging past the 600-message cap.**~~ **DONE**, and it needed a wire addition. `BACKFILL_REQUEST`'s cursor only points forward, and §6.1 makes a zero cursor mean "the newest page", so a client could reach the newest page of a channel and **no further, permanently** — there is no local history to fall back on (ARCH-88). New additive opcode `HISTORY_REQUEST` (0x0034, PROTOCOL.md §6.3) pages backwards; the response reuses the §6.2 shape. `channel_append` also had to stop rejecting ids at/below the high-water mark, which silently discarded every paged-in message; it now dedups by lookup and inserts older messages at their sorted position. Scroll-to-top requests the previous page, one in flight at a time, and stops when the server reports nothing above. Render cap raised 600→2000. Verified: 60 → all 243 messages by scrolling, then no further requests. | P1 | M |
 | ~~**WIN-17**~~ | ~~**Inline image thumbnails (REQ-142).**~~ **DONE.** Common image types render inline, scaled to fit and never upscaled, with the filename kept on the placeholder so an image whose bytes never arrive is not reduced to a nameless grey box. Two upstream defects had to be fixed first: every upload declared `application/octet-stream` (so nothing downstream could tell an image from a zip — REQ-142 was impossible regardless of client quality), and the basename split only on `/` (so a Windows upload declared its whole path as the filename). The bytes are fetched **into memory** (`oc_client_fetch_attachment` → `OC_EV_ATTACHMENT_DATA`, bounded at 8 MB) and decoded with WIC — no temp file, since a scratch file for rendering is exactly the cache ARCH-88 removed. **Click-to-expand is not implemented**; the message menu's Download is still how you get the full file. | P1 | M |
-| ~~**WIN-18**~~ | ~~**OS toast notifications (REQ-138).**~~ **DONE.** `Shell_NotifyIconW` with `NIF_INFO` rather than WinRT: the client is pure C (ARCH-82) and `ToastNotificationManager` needs a C++/WinRT projection plus a registered AppUserModelID, while on Windows 10+ a balloon is rendered by the same toast system. The decision is the server's model rendered locally (ARCH-72) — channel notify level plus the DND window, both already in `oc_model` — so this adds no server surface. Nothing is raised while the window is in front, for your own messages, or during the first pass after connecting (a backfill is not new mail). Preference: Off / Count / Preview. `MENTIONS` is deliberately treated as silent until REQ-221 gives mentions real semantics — guessing would notify for things that are not mentions. **Verification caveat:** the gating is verified mechanically (level `None` suppresses, `All` raises, DND suppresses, DND off resumes — via a toast counter in the test dump), but **the balloon was never seen on screen**: this desktop does not surface balloons to a screen capture, confirmed with a control test using .NET's own `NotifyIcon`. The tray registration succeeds (`NIM_ADD` returns true). | P1 | M |
+| ~~**WIN-18**~~ | ~~**OS toast notifications (REQ-138).**~~ **DONE.** `Shell_NotifyIconW` with `NIF_INFO` rather than WinRT: the client is pure C (ARCH-82) and `ToastNotificationManager` needs a C++/WinRT projection plus a registered AppUserModelID, while on Windows 10+ a balloon is rendered by the same toast system. The decision is the server's model rendered locally (ARCH-72) — channel notify level plus the DND window, both already in `oc_model` — so this adds no server surface. Nothing is raised while the window is in front, for your own messages, or during the first pass after connecting (a backfill is not new mail). Preference: Off / Count / Preview. `MENTIONS` was deliberately silent until REQ-221 gave mentions real semantics; **since REQ-221 it is evaluated properly** with the shared scanner. **Verification, stated exactly (re-tested 2026-07-28):** the gating is verified mechanically (level `None` suppresses, `All` raises, DND suppresses, DND off resumes — via the toast counter in the test dump). The API path is verified positively too: the dump reports `tray_live=1`, i.e. `Shell_NotifyIconW(NIM_ADD)` was **accepted by the shell**, and `toasts_raised=1` after driving the `toast` hook, i.e. the `NIM_MODIFY`/`NIF_INFO` call executed. What remains unobserved is only the **rendering**: a full-screen capture on this host throws `Win32Exception` and returns a blank bitmap, so the session has no attached display surface to draw a balloon into — which is also why a control test with .NET's own `NotifyIcon` was equally invisible. This is an environment limitation of the dev host, not an unverified code path; seeing it requires running the exe on a Windows desktop with an attached display. | P1 | M |
 | ~~**WIN-19**~~ | ~~**Audit-log paging + filters.**~~ **DONE.** The log scrolls, family filter chips (All / Admin / Account / Security / Moderation) narrow it, and reaching the bottom re-queries with the oldest paged-in timestamp as the cursor. **Caveat:** the filter is client-side over what has been paged in — it narrows what you are looking at, it does not re-query by family. Actor/action filters would need a server-side query parameter. | P1 | S |
 | ~~**WIN-20**~~ | ~~**Real profile editor.**~~ **DONE.** One dialog each: display name with a note on where it appears, and current/new/**confirm** password with a mismatch check. The chained prompts had no confirm field at all. | P1 | S |
 | ~~**WIN-21**~~ | ~~**Purpose-built dialogs, retiring `text_prompt`.**~~ **DONE.** All seven flows moved to the typed `form_dialog()` and **`text_prompt` is deleted**. New DM also now says "No such user in this workspace" instead of silently doing nothing on an unknown name. | P1 | S |
@@ -170,6 +170,23 @@ than against the backlog:
   unread only, F6 between composer and filter).
 - **Accessibility is REQ-269**, recorded and deliberately unimplemented: the
   client answers no `WM_GETOBJECT`, so a screen reader sees a blank window.
+
+## Known defects, unfixed
+
+Recorded because a defect nobody wrote down is a defect nobody fixes.
+
+- **WIN-60 — unreproduced crash while typing.** The client was seen to exit once
+  during composer input. It has not reproduced since, there is no dump, and the
+  build is warning-free, so there is nothing yet to point at. Left open
+  deliberately rather than closed as "could not reproduce": the composer is a
+  RichEdit child with hand-written subclassing, autocomplete and draft
+  save/restore all touching the same buffer, which is the most likely place for a
+  latent lifetime bug. **Next step when it recurs:** run under a debugger with
+  `gflags` page-heap on the exe, and capture the crash dump before restarting.
+- **WIN-18's balloon rendering is unobserved on this host** — not a defect, an
+  environment limit. The API path is verified positively (`tray_live=1`,
+  `toasts_raised` increments); the dev host has no attached display surface, so
+  nothing that draws to the shell can be seen or captured here. See WIN-18.
 
 ## Where this stands
 

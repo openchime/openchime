@@ -206,8 +206,10 @@ the Win32 GUI has moved from trailing the TUI to leading it: sign-in was rebuilt
 picture:
 
 - **DND configuration** — the window is settable and displayed, but only through
-  a raw `HH:MM-HH:MM` prompt: no picker, no schedule. (The prefs *review* screen
-  it used to lack is built — WIN-12.)
+  a typed `HH:MM` form: no picker, no weekday schedule (REQ-136). (The prefs
+  *review* screen it used to lack is built — WIN-12.)
+- **One unreproduced crash while typing** (WIN-60 in the backlog) — seen once,
+  never since, no dump. Tracked rather than forgotten.
 - **Multiple workspaces** — the rail switcher UI exists, but Win32 switches by
   stop/reconnecting a single `oc_client`, so a background workspace does not
   receive or accrue unread ("N elsewhere"). This is the one genuinely unbuilt

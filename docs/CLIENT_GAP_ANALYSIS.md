@@ -2,6 +2,8 @@
 
 *Definitive inventory of every user-facing screen/dialog/panel/surface and feature across the clients. Ground truth for TUI/Win32 is the code inventories; **Slack** and **Pumble** are the researched reference surfaces.*
 
+**Re-verification (2026-07-28).** The OpenChime columns were re-certified against the code in full (see the commit trail). The two *reference* claims this document's positioning rests on were re-checked against vendor documentation on the same date and both hold: Slack's free plan shows 90 days and permanently deletes data over a year old, and Pumble's free plan carries unlimited history and unlimited users. Slack's pin behaviour (channel-scoped, 100/channel, any member may unpin) was verified against its help centre and API reference while building REQ-230. **The remaining Slack/Pumble cells are as researched on 2026-07-26 and have not been individually re-checked** — they are reference material, not statements about this system, and a vendor can change them without notice.
+
 **Pumble sourcing (researched 2026-07-26).** Pumble is a Slack-shaped SaaS team chat product from COING (the makers of Clockify and Plaky, sold together as the CAKE.com bundle). Its column below is built from Pumble's own pricing page, feature pages, and help centre, cross-checked against independent reviews (Cloudwards) and comparison directories (Capterra, GetApp, TrustRadius). **Vendor-authored comparison content was treated as a claim, not evidence** — where Pumble's marketing and its own help centre disagreed, the help centre won. Two such corrections are recorded in §7.
 
 ## 1. Legend
@@ -158,7 +160,7 @@
 | Activity feed (mentions/reactions/replies) | ✅ | ✅ | ❌ | ❌ rail stub only | Unbuilt (REQ-139). The **mentions** half now has storage behind it — migration 0021 indexes mentions by user — so this is a query plus a view, not new state. **P1** |
 | Activity filters / saved views | ✅ | ❔ | ❌ | ❌ | **P2** |
 | All-unreads view | ✅ | ✅ | ❌ | ❌ | **P2** |
-| Desktop/OS toast + preview toggle | ✅ | ✅ | ❌ | ✅ tray balloon (`Shell_NotifyIconW` + `NIF_INFO`) + in-app toasts, honouring the notify level | Win32 built (WIN-18) — `ToastNotification` needs WinRT/C++ and the client is pure C (ARCH-82). **The balloon has never been visually confirmed** on this dev machine (a plain .NET NotifyIcon test was equally invisible), so treat delivery as unverified. No preview on/off toggle. **P2** |
+| Desktop/OS toast + preview toggle | ✅ | ✅ | ❌ | ✅ tray balloon (`Shell_NotifyIconW` + `NIF_INFO`) + in-app toasts, honouring the notify level | Win32 built (WIN-18) — `ToastNotification` needs WinRT/C++ and the client is pure C (ARCH-82). The API path is verified (`tray_live=1` — the shell accepted the icon; `toasts_raised` increments on the call); only the **rendering** is unobserved, because this dev host has no attached display surface — a full-screen capture throws and returns blank, which is why a control test with .NET's own NotifyIcon was equally invisible. No preview on/off toggle. **P2** |
 | Notification sounds & badges | ✅ | ✅ | ❌ | ❌ | **P2** |
 | Email notifications | ✅ | ✅ (email reminder after 24 h inactivity) | ⛔/❌ | ⛔/❌ | Server-side; not a client surface. — |
 | Mobile push | ✅ | ✅ | 🔗 daemon emitter built (ARCH-85); no mobile client | 🔗 same | Push is a **federated-only** function for us (REQ-133). — |
@@ -177,7 +179,7 @@
 | Sort (relevance/newest) | ✅ | ❔ | ❌ | ❌ | **P2** |
 | Term highlight in results | ✅ | ✅ | ❌ | ❌ | **P1** |
 | Paging / load-more | ✅ | ✅ | ❌ | ❌ (128 cap, ignores truncation) | **P1** |
-| Full history searchable on the free tier | ❌ 90-day cap | ✅ unlimited | ✅ (no cap, ever) | ✅ | **Pumble matches our "no history cap" wedge** — it is no longer a Slack-only differentiator. — |
+| Full history searchable on the free tier | ❌ 90 days visible, **and anything over a year is permanently deleted** | ✅ unlimited | ✅ (no cap, ever) | ✅ | **Pumble matches our "no history cap" wedge** — it is no longer a Slack-only differentiator. Slack's free tier is harsher than "a cap" though: it *deletes*. — |
 | Quick switcher search (people/channels) | ✅ | ✅ | ✅ Ctrl+K palette | ✅ Ctrl+K command palette + a "Find a conversation" sidebar filter | Both built. **—** |
 | AI/enterprise search | ✅ | 🟡 AI Assistant add-on | ⛔ | ⛔ | Out of scope. |
 
@@ -438,7 +440,7 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 ## 5. Recommended Build Order for Win32 (current focus) — top 10 by impact
 
 > **The execution list lives in [WIN32_BACKLOG.md](./WIN32_BACKLOG.md)** — every
-> gap below, numbered `WIN-1`…`WIN-59`, split by whether it is buildable today or
+> gap below, numbered `WIN-1`…`WIN-60`, split by whether it is buildable today or
 > blocked on daemon work. This section stays the *rationale* for the ordering.
 
 **Rewritten 2026-07-28.** The original top 10 is essentially spent: items 1, 4, 5,
@@ -503,7 +505,7 @@ This analysis is reference-centric (what Slack and Pumble have that we lack). Fo
 | **Deployment models** | ✅ stand-alone / federated / hosted (ARCH-76) | ❌ single cloud | ❌ single cloud | **Holds against both.** |
 | **Terminal client** | ✅ full-featured TUI | ❌ | ❌ | **Holds against both** — no mainstream competitor ships one. *Caveat as of 2026-07-28:* it no longer reaches **every** engine feature — @mentions, pins, the channel files listing and the per-channel roster are on the wire and unsurfaced there. |
 | **Native, lightweight clients** | ✅ pure-C native per platform — TUI + Win32 GUI (~3 MB, Direct2D), no Electron | ❌ Electron desktop (heavy) | ❌ web-tech desktop app (Win/mac/Linux `.deb`/`.rpm`) | **Holds on footprint** — but see the caveat below: Pumble *ships* Linux/macOS/mobile clients today and we do not. |
-| **Full history on the free tier** | ✅ self-hosted = unlimited retention (you set policy) | ❌ free tier caps at 90 days | ✅ **unlimited history on the free plan** | ⚠️ **No longer a differentiator.** This was our stated wedge against Slack (ARCH-15 calls FTS5 "a competitive wedge against Slack's history caps"). Pumble gives it away free. Against Pumble the wedge must be restated as *ownership*, not *retention*. |
+| **Full history on the free tier** | ✅ self-hosted = unlimited retention (you set policy) | ❌ free tier shows 90 days and permanently deletes past one year | ✅ **unlimited history on the free plan** | ⚠️ **No longer a differentiator.** This was our stated wedge against Slack (ARCH-15 calls FTS5 "a competitive wedge against Slack's history caps"). Pumble gives it away free. Against Pumble the wedge must be restated as *ownership*, not *retention*. |
 | **Pricing model** | ✅ self-hosted free; hosted flat plan | ❌ per-user seat pricing | 🟡 free tier w/ unlimited users; cheap per-seat above it | ⚠️ **Weakened but survives.** Detailed price analysis is out of scope for this repo and now lives in the control-plane repo (`openchime-saas`, CP-4); the durable argument against both is *ownership*, not headline price. |
 | **Affordance-only interaction** | ✅ menus/dialogs/drag-drop, no slash-command sprawl (design choice) | mixed (heavy slash surface) | mixed (native `/`-commands: `/status`, `/clear-status`, …) | Unchanged — a deliberate simplicity choice, not a capability claim. |
 | **Audit log** | ✅ built, four families, per-family flood cap (ARCH-79) | ✅ paid tiers | ❔ not publicly documented | Likely holds vs Pumble, but ❔ — do not assert publicly without a harder source. |
