@@ -9,7 +9,7 @@ clients, or a `REQ-NNN`.
 parity table is the *feature reachability* tracker. This document is the *work
 list* derived from both — one row per shippable branch.
 
-**Ids.** Items are `WIN-1` … `WIN-69`, numbered once and **stable**: an id is
+**Ids.** Items are `WIN-1` … `WIN-70`, numbered once and **stable**: an id is
 never renumbered or reused, so a commit or branch can cite it. Ordering is *not*
 priority — the **Pri** column is, and it may change. Section membership may also
 change as blockers clear (an item moves from §3 to §1 without changing its id).
@@ -176,6 +176,20 @@ than against the backlog:
 ## Known defects, unfixed
 
 Recorded because a defect nobody wrote down is a defect nobody fixes.
+
+- ~~**WIN-70 — the find box kept leaking into views that are not the channel
+  list.**~~ **FIXED 2026-07-29 — the class, not the instance.** The "Find a
+  conversation" EDIT is a native child, so it composites **above** the Direct2D
+  output: any view where it is not hidden shows a bare rectangle over whatever is
+  really drawn there. Its visibility asked `view_has_sidebar()` — "does this view
+  have a second column" — when the question it must answer is "is the **channel
+  list** what is in that column". Those were the same thing until that column
+  started hosting other lists, and the difference cost the same bug three times:
+  the workspace menu, then the DMs list, then Activity. Each was patched with
+  another `&& g_view != …`. It now asks `sidebar_kind()`, which names the
+  column's tenant, and the painter switches on the same function — so a new
+  tenant must declare itself in one place rather than silently inheriting the
+  previous one's chrome.
 
 - ~~**WIN-61 — a deleted message keeps its reaction chips and its attachment.**~~
   **FIXED 2026-07-29** on both sides: the client tombstones the message in the

@@ -4157,6 +4157,25 @@ static int view_has_sidebar(void) {
     return g_view == VIEW_HOME || g_view == VIEW_DMS || g_view == VIEW_ACTIVITY;
 }
 
+/* WHAT is in the second column — not merely whether there is one.
+ *
+ * These were the same question until that column started hosting lists other
+ * than the channel sidebar, and conflating them caused the same bug three times:
+ * the native "Find a conversation" EDIT is a child window, so it composites
+ * ABOVE the Direct2D output and shows up as a bare rectangle over whatever is
+ * really there. It was patched per-view twice (`!= VIEW_DMS`, and before that
+ * the workspace menu) and would have needed a third for Activity.
+ *
+ * So anything that depends on the column's CONTENT asks this, and a new tenant
+ * has to name itself here rather than silently inheriting the last one's chrome.
+ * The painter switches on the same function, so the two cannot disagree. */
+enum { SBK_CHANNELS = 0, SBK_DMS, SBK_ACTIVITY };
+static int sidebar_kind(void) {
+    if (g_view == VIEW_DMS)      return SBK_DMS;
+    if (g_view == VIEW_ACTIVITY) return SBK_ACTIVITY;
+    return SBK_CHANNELS;
+}
+
 /* Whether to PAINT the shell chrome. During sign-in that is true only when a
  * workspace is still live behind the card. */
 static int shell_visible(void) {
@@ -4592,9 +4611,11 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         float main_x = RAIL_W + SIDEBAR_W;
         float members = (g_show_members && m->authed) ? MEMBERS_W : 0;
         float main_r = W - members, main_w = main_r - main_x;
-        if (g_view == VIEW_DMS)           draw_dm_list(rt, m, H);
-        else if (g_view == VIEW_ACTIVITY) draw_activity_list(rt, m, H);
-        else                              draw_sidebar(rt, m, H);
+        switch (sidebar_kind()) {
+            case SBK_DMS:      draw_dm_list(rt, m, H);       break;
+            case SBK_ACTIVITY: draw_activity_list(rt, m, H); break;
+            default:           draw_sidebar(rt, m, H);       break;
+        }
         const oc_channel *selc0 = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
         int dm_index0 = (g_view == VIEW_DMS &&
                          (g_dm_compose || !(selc0 && selc0->kind == OC_CHANNEL_KIND_DM)));
@@ -4994,12 +5015,10 @@ static void layout_find(HWND hwnd) {
      *
      * The search and emoji boxes never showed this because each is already
      * gated on its own pane's open flag; the find box had no such guard. */
-    /* Also hidden in the DMs view: that column is the DM list, not the channel
-     * sidebar, so the box has nothing to filter and — being a native child that
-     * composites ABOVE the D2D output — it floated over the first row as a bare
-     * white rectangle. Same class of bug as the workspace menu it already
-     * guards against, and the same fix: get out of the way. */
-    int want = view_has_sidebar() && g_view != VIEW_DMS &&
+    /* Shown only when the column actually holds the channel list this box
+     * filters — see sidebar_kind(). Asking "does this view have a sidebar" is
+     * what let it leak into the DMs and Activity lists. */
+    int want = sidebar_kind() == SBK_CHANNELS &&
                !g_menu && !g_more_open && !g_pal_open;
 
     /* Only act on a change: this runs every frame, and a redundant MoveWindow

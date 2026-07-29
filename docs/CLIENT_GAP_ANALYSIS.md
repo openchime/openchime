@@ -442,7 +442,7 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 ## 5. Recommended Build Order for Win32 (current focus) — top 10 by impact
 
 > **The execution list lives in [WIN32_BACKLOG.md](./WIN32_BACKLOG.md)** — every
-> gap below, numbered `WIN-1`…`WIN-69`, split by whether it is buildable today or
+> gap below, numbered `WIN-1`…`WIN-70`, split by whether it is buildable today or
 > blocked on daemon work. This section stays the *rationale* for the ordering.
 
 **Rewritten 2026-07-28.** The original top 10 is essentially spent: items 1, 4, 5,
