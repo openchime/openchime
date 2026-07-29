@@ -294,6 +294,28 @@ void oc_client_update_channel(oc_client *c, uint64_t channel_id, uint8_t op, con
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_save_item(oc_client *c, uint64_t message_id, uint8_t op) {
+    if (!c || !message_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SAVE_ITEM);
+    if (!cmd) return;
+    cmd->message_id = message_id; cmd->op = op;
+    oc_queue_push(&c->cmds, cmd);
+}
+void oc_client_list_saved(oc_client *c) {
+    if (!c) return;
+    oc_model_saved_begin(&c->model);
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_SAVED);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+void oc_client_close_saved(oc_client *c) { if (c) oc_model_close_saved(&c->model); }
+void oc_client_list_activity(oc_client *c) {
+    if (!c) return;
+    oc_model_activity_begin(&c->model);
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_ACTIVITY);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+void oc_client_close_activity(oc_client *c) { if (c) oc_model_close_activity(&c->model); }
+
 void oc_client_list_members(oc_client *c, uint64_t channel_id) {
     if (!c || !channel_id) return;
     oc_model_chanmem_begin(&c->model, channel_id);

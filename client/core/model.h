@@ -122,6 +122,21 @@ typedef struct {
     char     filename[128], mime[64];
 } oc_file_view;
 
+/* One saved item (REQ-231) — private to this user. */
+typedef struct {
+    uint64_t message_id, channel_id, author_id, server_time, saved_at;
+    char    *body;                 /* heap */
+    char     attach_name[128];
+} oc_saved_view;
+
+/* One activity item (REQ-139): `text` is the message for a mention or reply and
+ * the emoji for a reaction. */
+typedef struct {
+    uint8_t  kind;
+    uint64_t message_id, channel_id, actor_id, at;
+    char    *text;                 /* heap */
+} oc_activity_view;
+
 /* One incoming-webhook entry (from LIST_WEBHOOKS -> WEBHOOK_LIST, REQ-170): the
  * webhook's id + label + disabled flag. Tokens are never listed (shown once at
  * creation, in webhook_token). */
@@ -183,6 +198,15 @@ typedef struct {
     uint64_t  filelist_channel;      /* 0 = the workspace-wide view */
     oc_file_view *files;
     size_t    n_files, cap_files;
+    /* Saved items (REQ-231) and the activity feed (REQ-139). Both are per-user
+     * lists refreshed on open — a client caches nothing (ARCH-88). */
+    uint8_t   saved_open, saved_loading;
+    oc_saved_view *saved;
+    size_t    n_saved, cap_saved;
+    uint8_t   activity_open, activity_loading;
+    oc_activity_view *activity;
+    size_t    n_activity, cap_activity;
+    uint64_t  activity_seen;      /* watermark from the last feed read */
     /* The tenant roster (REQ, LIST_USERS) + whether the roster view is open. */
     uint8_t   roster_open;
     oc_member *users;
@@ -335,6 +359,12 @@ void oc_model_close_pinlist(oc_model *m);
 void oc_model_chanmem_begin(oc_model *m, uint64_t channel_id);
 void oc_model_filelist_begin(oc_model *m, uint64_t channel_id);
 void oc_model_close_filelist(oc_model *m);
+
+/* Saved items / activity (REQ-231/139). */
+void oc_model_saved_begin(oc_model *m);
+void oc_model_close_saved(oc_model *m);
+void oc_model_activity_begin(oc_model *m);
+void oc_model_close_activity(oc_model *m);
 
 /* Begin listing a channel's incoming webhooks (clears prior entries + the
  * shown-once token, records the channel) / close the overlay. */

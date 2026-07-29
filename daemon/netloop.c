@@ -935,6 +935,29 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SAVE_ITEM) {
+            oc_save_item si;
+            if (oc_decode_save_item(&p, &si) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SAVE_ITEM, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->message_id = si.message_id; j->save_op = si.op;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_SAVED) {
+            oc_job *j = oc_job_new(OC_JOB_LIST_SAVED, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_ACTIVITY) {
+            oc_job *j = oc_job_new(OC_JOB_LIST_ACTIVITY, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_LIST_MEMBERS) {
             oc_list_members lm;
             if (oc_decode_list_members(&p, &lm) != OC_OK) return -1;
@@ -1957,6 +1980,56 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_pins term = { r->channel_id, (uint32_t)r->n_plist };
         oc_encode_pins(&w, OC_PROTOCOL_VERSION, &term);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_SAVED_OK: {
+        /* Private: the ack goes to the actor and stops. There is no one to fan
+         * a personal bookmark to. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_saved_updated su = { r->message_id, r->save_op, r->saved_at };
+        oc_encode_saved_updated(&w, OC_PROTOCOL_VERSION, &su);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_SAVED_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        for (size_t i = 0; i < r->n_slist && conns[c->fd]; i++) {
+            const oc_saved_row *sr = &r->slist[i];
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_saved_msg sm = { sr->message_id, sr->channel_id, sr->author_id,
+                                sr->created_at, sr->saved_at,
+                                oc_slice_str(sr->body ? sr->body : ""),
+                                oc_slice_str(sr->attach_name ? sr->attach_name : "") };
+            oc_encode_saved_msg(&w, OC_PROTOCOL_VERSION, &sm);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        if (!conns[c->fd]) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_saved term = { (uint32_t)r->n_slist };
+        oc_encode_saved(&w, OC_PROTOCOL_VERSION, &term);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_ACTIVITY: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        for (size_t i = 0; i < r->n_alist && conns[c->fd]; i++) {
+            const oc_activity_row *ar = &r->alist[i];
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_activity_entry ae = { ar->kind, ar->message_id, ar->channel_id,
+                                     ar->actor_id, ar->at,
+                                     oc_slice_str(ar->text ? ar->text : "") };
+            oc_encode_activity_entry(&w, OC_PROTOCOL_VERSION, &ae);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        if (!conns[c->fd]) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_activity term = { (uint32_t)r->n_alist, r->activity_seen };
+        oc_encode_activity(&w, OC_PROTOCOL_VERSION, &term);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }

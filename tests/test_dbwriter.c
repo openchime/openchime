@@ -51,7 +51,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 24);
+    CHECK(oc_schema_version(db) == 25);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -1240,6 +1240,138 @@ static void test_delete_clears_message_extras(void) {
     CHECK(r);
     for (size_t i = 0; i < r->n_replay; i++)
         if (r->replay[i].message_id == mid) CHECK(r->replay[i].n_attach == 0);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* Saved items (REQ-231) and the activity feed (REQ-139), ARCH-95. The point of
+ * both is WHOSE they are: a saved item is private to one person, and the feed
+ * shows what involved you and nothing you did yourself. */
+static oc_dbres *save_item(oc_dbwriter *w, uint64_t uid, uint64_t mid, uint8_t op) {
+    oc_job *j = oc_job_new(OC_JOB_SAVE_ITEM, 600);
+    j->user_id = uid; j->message_id = mid; j->save_op = op;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static oc_dbres *list_saved(oc_dbwriter *w, uint64_t uid) {
+    oc_job *j = oc_job_new(OC_JOB_LIST_SAVED, 601);
+    j->user_id = uid;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static oc_dbres *list_activity(oc_dbwriter *w, uint64_t uid) {
+    oc_job *j = oc_job_new(OC_JOB_LIST_ACTIVITY, 602);
+    j->user_id = uid;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_saved_and_activity(void) {
+    const char *path = "build/test_dbwriter_saved.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t alice = reg(w, "alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0x51, sizeof idem);
+    uint64_t am = send_msg(w, alice, idem, "alice wrote this");
+    memset(idem, 0x52, sizeof idem);
+    uint64_t bm = send_msg(w, bob, idem, "hey @alice look at this");
+    CHECK(am && bm);
+
+    /* --- saved items are PRIVATE --- */
+    oc_dbres *r = save_item(w, alice, bm, OC_SAVE_ADD);
+    CHECK(r && r->type == OC_RES_SAVED_OK && r->saved_at != 0);
+    uint64_t first_saved_at = r->saved_at;
+    oc_dbres_free(r);
+
+    /* Re-saving keeps the ORIGINAL time: a list ordered by when you saved should
+     * not reshuffle because you clicked twice. */
+    r = save_item(w, alice, bm, OC_SAVE_ADD);
+    CHECK(r && r->saved_at == first_saved_at);
+    oc_dbres_free(r);
+
+    r = list_saved(w, alice);
+    CHECK(r && r->type == OC_RES_SAVED_LIST && r->n_slist == 1);
+    CHECK(r->slist[0].message_id == bm);
+    CHECK(r->slist[0].body && strcmp(r->slist[0].body, "hey @alice look at this") == 0);
+    oc_dbres_free(r);
+
+    /* Bob saved nothing, and cannot see hers. */
+    r = list_saved(w, bob);
+    CHECK(r && r->n_slist == 0);
+    oc_dbres_free(r);
+
+    /* Both may save the same message independently. */
+    r = save_item(w, bob, bm, OC_SAVE_ADD); CHECK(r && r->type == OC_RES_SAVED_OK); oc_dbres_free(r);
+    r = list_saved(w, bob);  CHECK(r && r->n_slist == 1); oc_dbres_free(r);
+    r = list_saved(w, alice); CHECK(r && r->n_slist == 1); oc_dbres_free(r);
+
+    r = save_item(w, alice, bm, OC_SAVE_REMOVE); CHECK(r && r->type == OC_RES_SAVED_OK); oc_dbres_free(r);
+    r = list_saved(w, alice); CHECK(r && r->n_slist == 0); oc_dbres_free(r);
+    r = list_saved(w, bob);   CHECK(r && r->n_slist == 1); oc_dbres_free(r);   /* his survives */
+
+    /* A tombstone drops out of the list rather than showing an empty row. */
+    {
+        oc_job *dj = oc_job_new(OC_JOB_DELETE, 603);
+        dj->user_id = bob; dj->channel_id = OC_DEFAULT_CHANNEL; dj->message_id = bm;
+        oc_dbwriter_submit(w, dj);
+        oc_dbres_free(wait_result(w));
+    }
+    r = list_saved(w, bob); CHECK(r && r->n_slist == 0); oc_dbres_free(r);
+
+    /* --- activity --- */
+    /* bob reacts to alice's message and replies under it. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_REACT, 604);
+        j->user_id = bob; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = am;
+        j->react_op = OC_REACT_ADD; j->emoji = strdup("\xF0\x9F\x91\x8D");
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
+    {
+        oc_job *j = oc_job_new(OC_JOB_SEND_REPLY, 605);
+        j->user_id = bob; j->channel_id = OC_DEFAULT_CHANNEL; j->parent_id = am;
+        memset(j->idem, 0x53, OC_IDEM_LEN);
+        oc_job_set_body(j, "replying to you", 15);
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
+
+    r = list_activity(w, alice);
+    CHECK(r && r->type == OC_RES_ACTIVITY);
+    int saw_react = 0, saw_reply = 0, saw_mention = 0, saw_self = 0;
+    for (size_t i = 0; i < r->n_alist; i++) {
+        if (r->alist[i].kind == OC_ACT_REACTION && r->alist[i].message_id == am) saw_react = 1;
+        if (r->alist[i].kind == OC_ACT_REPLY) saw_reply = 1;
+        if (r->alist[i].kind == OC_ACT_MENTION) saw_mention = 1;
+        if (r->alist[i].actor_id == alice) saw_self = 1;
+    }
+    CHECK(saw_react && saw_reply);
+    /* The mention was in a message bob sent BEFORE it was deleted above, so it
+     * is gone with the tombstone — which is the behaviour we want. */
+    CHECK(!saw_mention);
+    /* An activity feed of your own doings is noise: nothing alice did appears. */
+    CHECK(!saw_self);
+
+    /* Opening the feed stamps the watermark: the first read reports 0 (never
+     * looked), the second reports the time of the first. */
+    uint64_t seen_first = r->activity_seen;
+    oc_dbres_free(r);
+    CHECK(seen_first == 0);
+    r = list_activity(w, alice);
+    CHECK(r && r->activity_seen > 0);
+    oc_dbres_free(r);
+
+    /* Bob's feed is his own: alice did nothing to him. */
+    r = list_activity(w, bob);
+    CHECK(r && r->n_alist == 0);
     oc_dbres_free(r);
 
     oc_dbwriter_stop(w);
@@ -2732,7 +2864,7 @@ static void test_max_users(void) {
 }
 
 int run_dbwriter_tests(void) {
-    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup\n");
+    printf("test_dbwriter: migrate-on-boot, register + local/session/oidc auth, rate-limit, roles, SEND persist/idempotency/members, backfill, mentions, pins, channel details, channel mutability, tombstone cleanup, saved items + activity\n");
     test_start_migrates_and_stops();
     test_auth_and_send();
     test_oidc_auth();
@@ -2760,6 +2892,7 @@ int run_dbwriter_tests(void) {
     test_pins();
     test_channel_details();
     test_channel_mutability();
+    test_saved_and_activity();
     test_delete_clears_message_extras();
     test_max_users();
     return failures;

@@ -43,6 +43,9 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_LIST_MEMBERS = 64, OC_JOB_LIST_FILES = 65,
        /* Channel mutability (REQ-034/035/036, ARCH-93). */
        OC_JOB_UPDATE_CHANNEL = 66,
+       /* Saved items + activity (REQ-231/139, ARCH-95). SAVE is a write; the
+        * two listings are reads. */
+       OC_JOB_SAVE_ITEM = 67, OC_JOB_LIST_SAVED = 68, OC_JOB_LIST_ACTIVITY = 69,
        /* Attachments (REQ-140/141, ARCH-69/70). CREATE mints a pending row + a
         * storage key on UPLOAD_BEGIN (write); FINALIZE records the streamed
         * size + digest on UPLOAD_END (write); LOOKUP authorizes + fetches the
@@ -132,6 +135,9 @@ typedef struct oc_job {
 
     /* UPDATE_CHANNEL (channel_id above): op + the new topic/name in ch_name. */
     uint8_t        chup_op;
+
+    /* SAVE_ITEM (message_id above): add/remove. */
+    uint8_t        save_op;
 
     /* SEARCH: query text is carried in body/body_len; this bounds the result. */
     uint16_t       search_limit;
@@ -242,7 +248,23 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
         * channel's pinned-message list; PIN_ERR carries err_code. */
        OC_RES_PIN_OK = 59, OC_RES_PIN_ERR = 60, OC_RES_PINS = 61,
        /* A channel's member roster / its shared files; ERR carries err_code. */
-       OC_RES_MEMBER_LIST = 66, OC_RES_FILE_LIST = 67, OC_RES_LIST_ERR = 68 };
+       OC_RES_MEMBER_LIST = 66, OC_RES_FILE_LIST = 67, OC_RES_LIST_ERR = 68,
+       OC_RES_SAVED_OK = 69, OC_RES_SAVED_LIST = 70, OC_RES_ACTIVITY = 71 };
+
+/* One saved message (REQ-231). Carries its body for the same reason a pin does:
+ * a saved message is usually far outside loaded history. */
+typedef struct {
+    uint64_t message_id, channel_id, author_id, created_at, saved_at;
+    char    *body, *attach_name;   /* heap */
+} oc_saved_row;
+
+/* One activity item (REQ-139). `text` is the message body for a mention or a
+ * reply, and the emoji for a reaction. */
+typedef struct {
+    uint8_t  kind;
+    uint64_t message_id, channel_id, actor_id, at;
+    char    *text;                 /* heap */
+} oc_activity_row;
 
 /* One row of a channel's member roster (REQ-031). */
 typedef struct { uint64_t user_id, joined_at; uint8_t role; } oc_chanmem_row;
@@ -458,6 +480,15 @@ typedef struct oc_dbres {
     size_t           n_cmlist;
     oc_file_row     *flist;         /* heap array; FILE_LIST */
     size_t           n_flist;
+
+    /* Saved items + activity (REQ-231/139). */
+    uint8_t          save_op;
+    uint64_t         saved_at;
+    oc_saved_row    *slist;
+    size_t           n_slist;
+    oc_activity_row *alist;
+    size_t           n_alist;
+    uint64_t         activity_seen;
 
     /* Threads (REQ-060). REPLY_OK reuses message_id/channel_id/author_id/
      * server_time/body/idem/members/duplicate above, plus parent_id + reply_count.

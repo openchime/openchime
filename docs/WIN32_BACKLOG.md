@@ -89,13 +89,13 @@ Not startable in this client. Each names what must land first.
 | **WIN-40** | Mute channel/DM (suppress + de-emphasize) | REQ-137 — distinct from level=none; needs per-user mute storage |
 | **WIN-41** | Starred/favourite conversations + custom sidebar sections | REQ-234 — per-user sidebar state storage. **ARCH-88 settles the open question by elimination**: with no client-local storage it must be server-side, and the `client_settings` bucket already exists for exactly this |
 | ~~**WIN-42**~~ | ~~Pin a message~~ **DONE.** REQ-230/ARCH-90 built in the daemon (migration 0022) and surfaced here: "Pin to channel" / "Unpin from channel" in the message kebab, a "Pinned by …" marker above the message inline, and a **Pinned** button in the channel header opening the list — each row jumps to the message in context, or unpins it. | — |
-| **WIN-43** | Save for later / the **Later** rail stub | REQ-231 |
+| ~~**WIN-43**~~ | ~~Save for later / the **Later** rail stub~~ **DONE.** REQ-231/ARCH-95: "Save for later" in the message menu, a **Later** view listing what you saved with Remove, and a click jumping to the message in its channel. Private — keyed (user, message), the mirror of a pin. | — |
 | **WIN-44** | Copy link / permalink, jump-to-permalink | REQ-232 — needs a permalink form and fetch-around-an-id backfill |
 | ~~**WIN-45**~~ | ~~Real `@mentions` (highlight + notify)~~ **DONE.** REQ-221/ARCH-89 built in the daemon (migration 0021, `shared/mention.c`) and surfaced here: mention spans are accent-coloured and semi-bold in `body_layout`, a message naming you tints its row and gets an accent bar, and the in-app `MENTIONS` notify level is now evaluated with the same scanner instead of being silently skipped. | — |
 | **WIN-46** | Invite management: links, expiry, pending list, revoke | REQ-026 |
 | **WIN-47** | Rich profile fields — avatar, email, timezone, title | REQ-240 |
 | **WIN-48** | Webhook reveal / rotate / enable-disable | No such ops; only create/list/delete exist |
-| **WIN-49** | Activity feed — the **Activity** rail stub (now carrying the bell; the duplicate "Alerts" entry was removed) | REQ-139 |
+| ~~**WIN-49**~~ | ~~Activity feed — the **Activity** rail stub~~ **DONE.** REQ-139/ARCH-95: mentions, reactions to your messages and replies under your threads, newest first, with a marker on what arrived since you last looked. A union of three queries — no maintained list to drift. | — |
 | ~~**WIN-50**~~ | ~~Files browser — the **Files** rail stub~~ **DONE.** The workspace-wide view over `LIST_FILES` with `channel_id 0`, which the daemon already answered — so this was a fetch and a header, not a protocol change. Each row names the channel it came from (the point of a cross-channel list) and clicking one switches channel and jumps to the message. Type filter (All / Images / Documents / Other) on both this and the channel tab, and the 200-row cap is stated rather than silently truncating. | — |
 | **WIN-51** | Forward / quote-share a message | REQ-057 |
 | **WIN-52** | Mark a message or conversation unread | REQ-235 |

@@ -808,6 +808,41 @@ reached a message was never shared with anyone.
 Both lists are refreshed on open and never cached — a client holds nothing on
 disk (ARCH-88), and both change from other clients.
 
+### 5.9c Saved items and the activity feed (REQ-231, REQ-139, ARCH-95)
+
+Both are **per-user** surfaces, and neither fans out to anyone else.
+
+**`SAVE_ITEM` (client → server), msg_type `0x0062`** `{ message_id: u64, op: u8 }`
+(`1` save, `0` unsave). You may save anything you can read; a tombstone cannot be
+saved. Replies **`SAVED_UPDATED` (`0x0063`)** `{ message_id, op, saved_at }` **to
+the actor only** — a personal bookmark has no one to announce it to. Saving twice
+is a no-op and reports the **original** `saved_at`, so a list ordered by when you
+saved does not reshuffle when you click again.
+
+**`LIST_SAVED` (`0x0064`)** (no body) streams **`SAVED_MSG` (`0x0065`)** newest
+save first, then **`SAVED` (`0x0066`)** `{ count: u32 }`. Each entry carries the
+message body and its first attachment's name, like a pin — a saved message is
+usually far outside loaded history. Entries whose channel you have since left are
+omitted: leaving a channel must stop it leaking through your saved list.
+
+**`LIST_ACTIVITY` (`0x0067`)** (no body) streams **`ACTIVITY_ENTRY` (`0x0068`)**
+newest first, then **`ACTIVITY` (`0x0069`)** `{ count: u32, seen_at: u64 }`.
+
+| Field        | Type | Notes                                                     |
+|--------------|------|------------------------------------------------------------|
+| `kind`       | u8   | `0` mention · `1` reaction to your message · `2` reply under your thread |
+| `message_id` | u64  | What to jump to.                                           |
+| `channel_id` | u64  | Where it happened.                                         |
+| `actor_id`   | u64  | Who did it — never you: a feed of your own doings is noise. |
+| `at`         | u64  | When.                                                      |
+| `text`       | str  | The message body for a mention or reply; the **emoji** for a reaction. |
+
+The feed is a **union of three queries** over existing rows, not a maintained
+list (ARCH-95). `seen_at` is the watermark **as it was before this call** — the
+server stamps the current time as part of answering, so a client compares each
+`at` against it to mark what is new. That is deliberately coarser than per-item
+read state, which would require the table ARCH-95 argues against.
+
 ### 5.10 Threads (REQ-060)
 
 Any message can be replied to as a thread. A reply threads under a **top-level

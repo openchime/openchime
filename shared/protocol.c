@@ -590,6 +590,48 @@ oc_result oc_encode_update_channel(oc_wbuf *w, uint16_t version, const oc_update
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_save_item(oc_wbuf *w, uint16_t version, const oc_save_item *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SAVE_ITEM);
+    oc_w_u64(w, m->message_id); oc_w_u8(w, m->op);
+    return oc_frame_end(w, off);
+}
+oc_result oc_encode_saved_updated(oc_wbuf *w, uint16_t version, const oc_saved_updated *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SAVED_UPDATED);
+    oc_w_u64(w, m->message_id); oc_w_u8(w, m->op); oc_w_u64(w, m->saved_at);
+    return oc_frame_end(w, off);
+}
+oc_result oc_encode_list_saved(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_SAVED);
+    return oc_frame_end(w, off);
+}
+oc_result oc_encode_saved_msg(oc_wbuf *w, uint16_t version, const oc_saved_msg *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SAVED_MSG);
+    oc_w_u64(w, m->message_id); oc_w_u64(w, m->channel_id); oc_w_u64(w, m->author_id);
+    oc_w_u64(w, m->server_time); oc_w_u64(w, m->saved_at);
+    oc_w_str(w, m->body); oc_w_str(w, m->attach_name);
+    return oc_frame_end(w, off);
+}
+oc_result oc_encode_saved(oc_wbuf *w, uint16_t version, const oc_saved *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SAVED);
+    oc_w_u32(w, m->count);
+    return oc_frame_end(w, off);
+}
+oc_result oc_encode_list_activity(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_ACTIVITY);
+    return oc_frame_end(w, off);
+}
+oc_result oc_encode_activity_entry(oc_wbuf *w, uint16_t version, const oc_activity_entry *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_ACTIVITY_ENTRY);
+    oc_w_u8(w, m->kind); oc_w_u64(w, m->message_id); oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->actor_id); oc_w_u64(w, m->at); oc_w_str(w, m->text);
+    return oc_frame_end(w, off);
+}
+oc_result oc_encode_activity(oc_wbuf *w, uint16_t version, const oc_activity *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_ACTIVITY);
+    oc_w_u32(w, m->count); oc_w_u64(w, m->seen_at);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_info *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_CHANNEL_INFO);
     oc_w_u64(w, m->channel_id);
@@ -1616,6 +1658,34 @@ oc_result oc_decode_update_channel(oc_rbuf *p, oc_update_channel *m) {
     m->channel_id = oc_r_u64(p);
     m->op         = oc_r_u8(p);
     m->value      = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_save_item(oc_rbuf *p, oc_save_item *m) {
+    m->message_id = oc_r_u64(p); m->op = oc_r_u8(p);
+    return r_done(p);
+}
+oc_result oc_decode_saved_updated(oc_rbuf *p, oc_saved_updated *m) {
+    m->message_id = oc_r_u64(p); m->op = oc_r_u8(p); m->saved_at = oc_r_u64(p);
+    return r_done(p);
+}
+oc_result oc_decode_saved_msg(oc_rbuf *p, oc_saved_msg *m) {
+    m->message_id = oc_r_u64(p); m->channel_id = oc_r_u64(p); m->author_id = oc_r_u64(p);
+    m->server_time = oc_r_u64(p); m->saved_at = oc_r_u64(p);
+    m->body = oc_r_str(p); m->attach_name = oc_r_str(p);
+    return r_done(p);
+}
+oc_result oc_decode_saved(oc_rbuf *p, oc_saved *m) {
+    m->count = oc_r_u32(p);
+    return r_done(p);
+}
+oc_result oc_decode_activity_entry(oc_rbuf *p, oc_activity_entry *m) {
+    m->kind = oc_r_u8(p); m->message_id = oc_r_u64(p); m->channel_id = oc_r_u64(p);
+    m->actor_id = oc_r_u64(p); m->at = oc_r_u64(p); m->text = oc_r_str(p);
+    return r_done(p);
+}
+oc_result oc_decode_activity(oc_rbuf *p, oc_activity *m) {
+    m->count = oc_r_u32(p); m->seen_at = oc_r_u64(p);
     return r_done(p);
 }
 

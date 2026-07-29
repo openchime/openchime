@@ -80,6 +80,11 @@ enum {
                               message_id it was posted with + author_id=uploader +
                               size/reclaimed + body=filename, emoji=mime */
     OC_EV_FILES_END,       /* the files list is complete: channel_id + count */
+    OC_EV_SAVED_UPDATED,   /* a message was saved/unsaved: message_id + op (REQ-231) */
+    OC_EV_SAVED_MSG,       /* one saved item (streamed) */
+    OC_EV_SAVED_END,       /* the saved list is complete: count */
+    OC_EV_ACTIVITY,        /* one activity item: status=kind, user_id=actor (REQ-139) */
+    OC_EV_ACTIVITY_END,    /* the feed is complete: count + pinned_at = seen watermark */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
     OC_EV_BACKOFF,         /* next reconnect attempt: server_time = deadline (ms), 0 = clear */
     OC_EV_ERROR            /* protocol/transport error; body = human message */
@@ -141,6 +146,9 @@ enum {
     OC_CMD_LIST_PINS,      /* list `channel_id`'s pinned messages */
     OC_CMD_UPDATE_CHANNEL, /* set topic / rename / archive / unarchive `channel_id`:
                               op = OC_CHUP_*, body = the new topic or name (REQ-034/035/036) */
+    OC_CMD_SAVE_ITEM,      /* save/unsave `message_id`: op = add/remove (REQ-231) */
+    OC_CMD_LIST_SAVED,     /* my saved items */
+    OC_CMD_LIST_ACTIVITY,  /* what involved me (REQ-139) */
     OC_CMD_LIST_MEMBERS,   /* list `channel_id`'s members (REQ-031) */
     OC_CMD_LIST_FILES,     /* list files in `channel_id` (0 = everywhere I can read) */
     OC_CMD_LIST_REACTIONS,  /* inspect who reacted to `message_id` in `channel_id` */

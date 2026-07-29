@@ -4,7 +4,7 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Status.** **Migrations 0001–0024 are applied.** 0001 establishes the core
+**Status.** **Migrations 0001–0025 are applied.** 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
 credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
 `users.disabled` lockout flag; **0004** (§3b) reactions; **0005** (§3c) threads;
@@ -15,7 +15,7 @@ notification preferences and the DND window; **0013** (§3k) synced client
 settings; **0014–0015** attachment tombstones and reclaim reason; **0016** (§3l)
 the audit log; **0017** (§3m) federated enrollment; **0018** (§3n) push device
 tokens; **0019** (§3o) the DM participant-set key; **0020** (§3p) the
-unique channel name; **0021** (§3q) resolved @mentions; **0022** (§3r) pinned messages; **0023** (§3s) the channel-files index; **0024** (§3t) channel topic + archive.
+unique channel name; **0021** (§3q) resolved @mentions; **0022** (§3r) pinned messages; **0023** (§3s) the channel-files index; **0024** (§3t) channel topic + archive; **0025** (§3u) saved items.
 
 *Corrected: an earlier revision of this line said presence, notification config,
 and attachments were "intentionally not here yet." Notification config landed in
@@ -650,6 +650,33 @@ string, so the two spellings do not both end up in the table.
 
 The index is on `archived_at_ms` because the sidebar's default query is "channels
 I can see that are **not** archived".
+
+---
+
+## 3u. Migration 0025 — saved items, and the activity watermark (REQ-231/139, ARCH-95)
+
+```sql
+CREATE TABLE saved_items (
+  user_id       INTEGER NOT NULL REFERENCES users(id),
+  message_id    INTEGER NOT NULL REFERENCES messages(id),
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (user_id, message_id));
+CREATE INDEX idx_saved_user ON saved_items(user_id, created_at_ms DESC);
+
+ALTER TABLE users ADD COLUMN activity_seen_ms INTEGER NOT NULL DEFAULT 0;
+```
+
+*The mirror of pins.* §3r keys a pin on the **message alone** because a pin
+belongs to the channel; a saved item is keyed on **(user, message)** because it
+belongs to a person. Same gesture, opposite ownership — and the reason ARCH-90
+wrote the distinction down before this table existed.
+
+*The activity feed has no table.* It is a query over rows that already exist and
+are already indexed (`idx_mentions_user` was built by §3q for exactly this read).
+What a query cannot cheaply carry is read state, so `activity_seen_ms` is the
+whole of it: one watermark per user, stamped when the feed is opened, enough to
+mark what is new. Per-item read/dismiss is the point at which a table would earn
+its place — see ARCH-95.
 
 ---
 

@@ -130,6 +130,10 @@ void oc_model_free(oc_model *m) {
     for (size_t i = 0; i < m->n_pins; i++) free(m->pins[i].body);
     free(m->pins);
     free(m->chanmem);
+    for (size_t i = 0; i < m->n_saved; i++) free(m->saved[i].body);
+    free(m->saved);
+    for (size_t i = 0; i < m->n_activity; i++) free(m->activity[i].text);
+    free(m->activity);
     free(m->files);
     free(m->users);
     free(m->webhooks);
@@ -312,6 +316,27 @@ void oc_model_filelist_begin(oc_model *m, uint64_t channel_id) {
     m->filelist_open = 1;
     m->filelist_loading = 1;
     m->filelist_channel = channel_id;
+}
+
+void oc_model_close_saved(oc_model *m) {
+    for (size_t i = 0; i < m->n_saved; i++) free(m->saved[i].body);
+    free(m->saved);
+    m->saved = NULL; m->n_saved = m->cap_saved = 0;
+    m->saved_open = m->saved_loading = 0;
+}
+void oc_model_saved_begin(oc_model *m) {
+    oc_model_close_saved(m);
+    m->saved_open = 1; m->saved_loading = 1;
+}
+void oc_model_close_activity(oc_model *m) {
+    for (size_t i = 0; i < m->n_activity; i++) free(m->activity[i].text);
+    free(m->activity);
+    m->activity = NULL; m->n_activity = m->cap_activity = 0;
+    m->activity_open = m->activity_loading = 0;
+}
+void oc_model_activity_begin(oc_model *m) {
+    oc_model_close_activity(m);
+    m->activity_open = 1; m->activity_loading = 1;
 }
 
 void oc_model_close_weblist(oc_model *m) {
@@ -735,6 +760,56 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     }
     case OC_EV_FILES_END:
         if (m->filelist_open && m->filelist_channel == e->channel_id) m->filelist_loading = 0;
+        break;
+    case OC_EV_SAVED_MSG: {
+        if (!m->saved_open || !m->saved_loading) break;
+        if (m->n_saved == m->cap_saved) {
+            size_t nc = m->cap_saved ? m->cap_saved * 2 : 16;
+            oc_saved_view *g = realloc(m->saved, nc * sizeof *g);
+            if (!g) break;
+            m->saved = g; m->cap_saved = nc;
+        }
+        oc_saved_view *sv = &m->saved[m->n_saved++];
+        sv->message_id = e->message_id; sv->channel_id = e->channel_id;
+        sv->author_id  = e->author_id;  sv->server_time = e->server_time;
+        sv->saved_at   = e->pinned_at;
+        sv->body = e->body ? strdup(e->body) : NULL;
+        snprintf(sv->attach_name, sizeof sv->attach_name, "%s", e->author_name);
+        break;
+    }
+    case OC_EV_SAVED_END:
+        if (m->saved_open) m->saved_loading = 0;
+        break;
+    case OC_EV_SAVED_UPDATED:
+        /* Drop it from an open list on unsave, so the view cannot show a row
+         * the server no longer has. */
+        if (m->saved_open && e->op == 0)
+            for (size_t i = 0; i < m->n_saved; i++)
+                if (m->saved[i].message_id == e->message_id) {
+                    free(m->saved[i].body);
+                    memmove(&m->saved[i], &m->saved[i + 1],
+                            (m->n_saved - i - 1) * sizeof *m->saved);
+                    m->n_saved--;
+                    break;
+                }
+        break;
+    case OC_EV_ACTIVITY: {
+        if (!m->activity_open || !m->activity_loading) break;
+        if (m->n_activity == m->cap_activity) {
+            size_t nc = m->cap_activity ? m->cap_activity * 2 : 32;
+            oc_activity_view *g = realloc(m->activity, nc * sizeof *g);
+            if (!g) break;
+            m->activity = g; m->cap_activity = nc;
+        }
+        oc_activity_view *av = &m->activity[m->n_activity++];
+        av->kind = e->status; av->message_id = e->message_id;
+        av->channel_id = e->channel_id; av->actor_id = e->user_id;
+        av->at = e->server_time;
+        av->text = e->body ? strdup(e->body) : NULL;
+        break;
+    }
+    case OC_EV_ACTIVITY_END:
+        if (m->activity_open) { m->activity_loading = 0; m->activity_seen = e->pinned_at; }
         break;
     case OC_EV_PIN: {
         /* Mark the message in the transcript. Arriving for a message we have not

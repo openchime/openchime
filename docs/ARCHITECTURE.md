@@ -229,6 +229,19 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **The pane is 300px, not 220.** A profile did not fit in 220 and will fit less as REQ-240/241 add fields. It is not yet resizable; that is the obvious next ask.
 
+- **ARCH-95 (Saved items and the activity feed — one per-user table, one per-user query):** Delivers REQ-231 and REQ-139. They arrive together because they are the two "things that are mine" surfaces, and they resolve in opposite directions.
+
+  **Saved items are a table, and the deliberate mirror of pins.** `saved_items` is keyed `(user_id, message_id)`: **per-user and private**, where a pin (ARCH-90) is keyed on the message alone because it belongs to the channel. Same gesture, opposite ownership — which is exactly why ARCH-90 recorded the distinction in advance. Two people may save the same message and neither can see the other's list; saving twice is a no-op. Nothing is fanned out, because there is no one to fan to.
+
+  **The activity feed is a query, not a table.** REQ-139 framed the choice as a client-side fold versus a server-maintained list. Both are wrong here:
+
+  - A **client-side fold** cannot work at all. A client stores nothing (ARCH-88) and backfill replays only recent messages per channel, so it could never show a reaction to something you wrote three weeks ago — the case the feature exists for.
+  - A **server-maintained list** means a new table written from at least three paths (mention resolution, reaction, threaded reply), each of which can forget. It duplicates rows already stored *and already indexed*: `idx_mentions_user` was built by ARCH-89 for precisely this read, reactions are indexed by message, and replies are messages with a `parent_id`.
+
+  So the feed is a **union of three bounded queries** — mentions of me, reactions by others on messages I wrote, replies by others to threads I started — ordered by time and capped. No new write path can drift out of sync with the truth, because there is no copy of the truth.
+
+  **The cost, stated plainly:** a query cannot cheaply carry per-item read state the way a materialised list can. So v1 does not have it. Instead `users.activity_seen_ms` is a **watermark** — one timestamp, stamped when the feed is opened — which is enough to badge "there is something new" and nothing more. If per-item read/dismiss is ever wanted, that is the point at which a table earns its place, and the query becomes its seed.
+
 ## Discovery
 
 - **ARCH-14 (Rule):** Workspace-address, resolved by plain DNS — **there is no resolution *service*, in any deployment model** (ARCH-76). At sign-in the client collects the **workspace** (the tenant's address) plus the user's **email** directly, the same model as Slack's "enter your workspace URL." The workspace is turned into a daemon address by ordinary DNS, with no shared, always-on, cross-tenant lookup component to run: consistent with the island model (ARCH-4) and the "no runtime configuration dependency" stance (ARCH-26). Note the DNS *records* under the service suffix (forms 2 and 3 below) are maintainer-provided and so are counted as a federated function in ARCH-76 — but they are static records, not a request-serving component, so no lookup traffic reaches the project. Three forms, one per deployment model:

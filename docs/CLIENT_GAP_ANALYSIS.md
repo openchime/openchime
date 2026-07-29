@@ -61,7 +61,7 @@ Vendor-facing rows are inherently perishable — a competitor can change a plan 
 | Copy text | ✅ | ✅ | 🔸 terminal-native only | ✅ in-app text-select + Ctrl+C | TUI has **no** in-app copy — relies on the terminal emulator's mouse selection (no clipboard code). Win32 has real in-app selection+copy (ARCH-82). **P2** |
 | Forward / share message | ✅ | ✅ quote message | ❌ | ❌ no forward | **P2** |
 | Pin message | ✅ 100/channel | ✅ 100/channel | ❌ | ✅ pin/unpin + inline "Pinned by" marker + Pins tab, 100/channel | Built (REQ-230/ARCH-90): channel-scoped, any member may pin or unpin, 100/channel, survives reconnect. **P1 (TUI)** |
-| Save for later / bookmark | ✅ | ✅ Saved Items (sidebar bookmark) | ❌ | ❌ | Later hub out; see Navigation. **P2** |
+| Save for later / bookmark | ✅ | ✅ Saved Items (sidebar bookmark) | ❌ | ✅ "Save for later" + the **Later** view | Built (REQ-231/ARCH-95): private, keyed (user, message) — the mirror of a pin. **P2 (TUI)** |
 | Mark unread | ✅ | ✅ | ❌ | ❌ no mark-unread | **P1** |
 | Remind me about this | ✅ | ✅ reminders | ❌ | ❌ | **P2** |
 | Message actions/shortcuts (app) | ✅ | 🟡 custom apps / MCP server | ⛔ | ⛔ | App shortcuts out of scope. |
@@ -163,7 +163,7 @@ Vendor-facing rows are inherently perishable — a competitor can change a plan 
 | Thread-reply notifications toggle | ✅ | ✅ | ❌ | ❌ | **P2** |
 | Notification schedule (quiet hours) | ✅ | ✅ custom schedules | 🔸 DND raw text | 🔸 one daily DND window only | Richer schedules are REQ-136, unbuilt on the engine. **P1** |
 | DND config surface | ✅ | ✅ | 🔸 | 🟡 dialog + state shown in the Notifications pane | **P1 (TUI)** |
-| Activity feed (mentions/reactions/replies) | ✅ | ✅ | ❌ | ❌ rail stub only | Unbuilt (REQ-139). The **mentions** half now has storage behind it — migration 0021 indexes mentions by user — so this is a query plus a view, not new state. **P1** |
+| Activity feed (mentions/reactions/replies) | ✅ | ✅ | ❌ | ✅ Activity view: all three kinds, newest first, new-since marker, click to jump | Built (REQ-139/ARCH-95) as a union of three queries — no maintained list. **P1 (TUI)** |
 | Activity filters / saved views | ✅ | ❔ | ❌ | ❌ | **P2** |
 | All-unreads view | ✅ | ✅ | ❌ | ❌ | **P2** |
 | Desktop/OS toast + preview toggle | ✅ | ✅ | ❌ | ✅ tray balloon (`Shell_NotifyIconW` + `NIF_INFO`) + in-app toasts, honouring the notify level | Win32 built (WIN-18) — `ToastNotification` needs WinRT/C++ and the client is pure C (ARCH-82). The API path is verified (`tray_live=1` — the shell accepted the icon; `toasts_raised` increments on the call); only the **rendering** is unobserved, because this dev host has no attached display surface — a full-screen capture throws and returns blank, which is why a control test with .NET's own NotifyIcon was equally invisible. No preview on/off toggle. **P2** |
@@ -388,8 +388,6 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 *Rewritten 2026-07-28 against the code; entries closed since the original audit are listed at the end rather than deleted, so the record stays honest.*
 
 - **N-concurrent-workspace model** — the rail switcher UI exists, but Win32 stop/reconnects a **single** client; no holding N clients at once with background unread. **P1**
-- **Activity feed / notification inbox** (REQ-139) — the rail's **Activity** entry is still a "coming soon" stub. Migration 0021 now indexes mentions by user, so the mentions half has a query behind it. **P1**
-- **Saved items / Later** (REQ-231) — rail stub. **P2**
 - **Mark-unread** (REQ-235); **mute channel/DM** (REQ-137); **star/favourite** (REQ-234). **P1**
 - **Copy-link / permalink and forward** on messages — permalinks are REQ-232, unbuilt. **P1**
 - **Search paging, filters, term highlight** — paging is blocked on the wire: `SEARCH_RESULTS` carries `truncated` but no cursor (WIN-38). In-overlay input and jump-to-message are built. **P1**
@@ -407,7 +405,7 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 - **Group DMs** (REQ-056), **self-DM surface** (REQ-055 exists on the engine, unsurfaced), **browse-channels directory** (REQ-038). **P2**
 - **Accessibility / keyboard-only operation** (REQ-269) — recorded, unimplemented, needs an ARCH decision. **P1**
 
-**Closed since the original audit** (kept for the record): **channel topic, rename and archive** with the About tab (REQ-034/035/036, WIN-34–36) · error/toast surface and the connection banner with a live countdown (WIN-1/WIN-55) · sign-in rebuilt in-window with inline errors, remember-me and retry (WIN-2) · Preferences hub with theme / 12-24h / panel toggles (WIN-9/WIN-26) · view another user's profile (WIN-10) · composer emoji picker over the shared ~179-emoji catalogue (WIN-8) · `@`/`#`/`:` autocomplete (`oc_complete`) · Ctrl+K command palette · sidebar sections, collapsing, scrolling and a "Find a conversation" filter · DM section and rail DMs view · OS tray balloon (WIN-18, delivery still visually unconfirmed) · notification-prefs review/edit pane · jump-to-unread and the "New" divider (WIN-14) · inline image thumbnails + lightbox · signup / invite redeem (WIN-32) · keyboard-shortcut reference · display-name and password dialogs (WIN-20) · channel member management (WIN-31) · **@mentions** (REQ-221) · **pins** (REQ-230) · **channel Files tab and per-channel roster** (REQ-143/031, WIN-37).
+**Closed since the original audit** (kept for the record): **activity feed** (REQ-139) and **saved items** (REQ-231), which were the last two rail stubs · **channel topic, rename and archive** with the About tab (REQ-034/035/036, WIN-34–36) · error/toast surface and the connection banner with a live countdown (WIN-1/WIN-55) · sign-in rebuilt in-window with inline errors, remember-me and retry (WIN-2) · Preferences hub with theme / 12-24h / panel toggles (WIN-9/WIN-26) · view another user's profile (WIN-10) · composer emoji picker over the shared ~179-emoji catalogue (WIN-8) · `@`/`#`/`:` autocomplete (`oc_complete`) · Ctrl+K command palette · sidebar sections, collapsing, scrolling and a "Find a conversation" filter · DM section and rail DMs view · OS tray balloon (WIN-18, delivery still visually unconfirmed) · notification-prefs review/edit pane · jump-to-unread and the "New" divider (WIN-14) · inline image thumbnails + lightbox · signup / invite redeem (WIN-32) · keyboard-shortcut reference · display-name and password dialogs (WIN-20) · channel member management (WIN-31) · **@mentions** (REQ-221) · **pins** (REQ-230) · **channel Files tab and per-channel roster** (REQ-143/031, WIN-37).
 
 ### TUI — missing
 

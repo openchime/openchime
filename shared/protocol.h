@@ -114,6 +114,16 @@ typedef enum {
     OC_MSG_DELETE_WEBHOOK     = 0x005D, /* C->S, remove a webhook */
     OC_MSG_WEBHOOK_DELETED    = 0x005E, /* S->C, ack for DELETE_WEBHOOK */
     OC_MSG_UPDATE_CHANNEL     = 0x005F, /* C->S (REQ-034/035/036), mutate a channel */
+    /* Saved items + activity feed (REQ-231/139, ARCH-95). 0x0060-0x0061 are
+     * taken; this family starts at the next free run. */
+    OC_MSG_SAVE_ITEM        = 0x0062, /* C->S, save/unsave a message (private) */
+    OC_MSG_SAVED_UPDATED    = 0x0063, /* S->C, ack to the actor only */
+    OC_MSG_LIST_SAVED       = 0x0064, /* C->S, my saved items */
+    OC_MSG_SAVED_MSG        = 0x0065, /* S->C, one saved message (streamed) */
+    OC_MSG_SAVED            = 0x0066, /* S->C, terminator */
+    OC_MSG_LIST_ACTIVITY    = 0x0067, /* C->S (REQ-139), what involved me */
+    OC_MSG_ACTIVITY_ENTRY   = 0x0068, /* S->C, one activity item (streamed) */
+    OC_MSG_ACTIVITY         = 0x0069, /* S->C, terminator + the seen watermark */
     OC_MSG_SET_PRESENCE     = 0x0070, /* C->S, set own presence (REQ-120) */
     OC_MSG_PRESENCE_UPDATE  = 0x0071, /* S->C, a user's presence changed */
     OC_MSG_TYPING           = 0x0072, /* C->S, "I am typing" in a channel (REQ-121) */
@@ -337,6 +347,15 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_REACT_ADD    1u
 #define OC_MAX_EMOJI    32u
 
+/* Saved-item op (REQ-231) and activity kinds (REQ-139), ARCH-95. */
+#define OC_SAVE_REMOVE 0u
+#define OC_SAVE_ADD    1u
+#define OC_ACT_MENTION  0u   /* someone named me */
+#define OC_ACT_REACTION 1u   /* someone reacted to something I wrote */
+#define OC_ACT_REPLY    2u   /* someone replied in a thread I started */
+#define OC_MAX_SAVED    200u
+#define OC_MAX_ACTIVITY 200u
+
 /* Channel mutation ops (REQ-034/035/036, ARCH-93). One frame carries all four
  * because they all mutate one row and all fan out the same CHANNEL_INFO — the
  * op IS the difference. `value` is the new topic or name; unused for archive. */
@@ -463,6 +482,20 @@ typedef struct { uint64_t parent_id; uint32_t count; uint8_t truncated; } oc_thr
 typedef struct { uint64_t message_id; uint32_t reply_count; uint64_t last_reply_at; } oc_thread_meta;
 typedef struct { oc_slice name; uint8_t is_public; } oc_create_channel;
 typedef struct { uint64_t channel_id; uint8_t op; oc_slice value; } oc_update_channel;
+
+/* Saved items (REQ-231) — private, so SAVED_UPDATED goes to the actor only. */
+typedef struct { uint64_t message_id; uint8_t op; } oc_save_item;
+typedef struct { uint64_t message_id; uint8_t op; uint64_t saved_at; } oc_saved_updated;
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id;
+                 uint64_t server_time; uint64_t saved_at; oc_slice body;
+                 oc_slice attach_name; } oc_saved_msg;
+typedef struct { uint32_t count; } oc_saved;
+
+/* Activity (REQ-139). `actor_id` is who did the thing; `text` is the message
+ * body for a mention or reply, and the emoji for a reaction. */
+typedef struct { uint8_t kind; uint64_t message_id; uint64_t channel_id;
+                 uint64_t actor_id; uint64_t at; oc_slice text; } oc_activity_entry;
+typedef struct { uint32_t count; uint64_t seen_at; } oc_activity;
 /* CHANNEL_INFO is the channel-state frame: the ack for create/join/leave/
  * invite/remove, and (ARCH-93) the fan-out when a topic/name/archive changes.
  * `peer_id` used to be an "optional trailing" field written only for DMs; that
@@ -654,6 +687,14 @@ oc_result oc_encode_thread(oc_wbuf *w, uint16_t version, const oc_thread *m);
 oc_result oc_encode_thread_meta(oc_wbuf *w, uint16_t version, const oc_thread_meta *m);
 oc_result oc_encode_create_channel(oc_wbuf *w, uint16_t version, const oc_create_channel *m);
 oc_result oc_encode_update_channel(oc_wbuf *w, uint16_t version, const oc_update_channel *m);
+oc_result oc_encode_save_item(oc_wbuf *w, uint16_t version, const oc_save_item *m);
+oc_result oc_encode_saved_updated(oc_wbuf *w, uint16_t version, const oc_saved_updated *m);
+oc_result oc_encode_list_saved(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_saved_msg(oc_wbuf *w, uint16_t version, const oc_saved_msg *m);
+oc_result oc_encode_saved(oc_wbuf *w, uint16_t version, const oc_saved *m);
+oc_result oc_encode_list_activity(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_activity_entry(oc_wbuf *w, uint16_t version, const oc_activity_entry *m);
+oc_result oc_encode_activity(oc_wbuf *w, uint16_t version, const oc_activity *m);
 oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_info *m);
 oc_result oc_encode_list_channels(oc_wbuf *w, uint16_t version);
 /* Bodyless request for the storage report (REQ-214); owner/admin only. */
@@ -773,6 +814,12 @@ oc_result oc_decode_thread(oc_rbuf *p, oc_thread *m);
 oc_result oc_decode_thread_meta(oc_rbuf *p, oc_thread_meta *m);
 oc_result oc_decode_create_channel(oc_rbuf *p, oc_create_channel *m);
 oc_result oc_decode_update_channel(oc_rbuf *p, oc_update_channel *m);
+oc_result oc_decode_save_item(oc_rbuf *p, oc_save_item *m);
+oc_result oc_decode_saved_updated(oc_rbuf *p, oc_saved_updated *m);
+oc_result oc_decode_saved_msg(oc_rbuf *p, oc_saved_msg *m);
+oc_result oc_decode_saved(oc_rbuf *p, oc_saved *m);
+oc_result oc_decode_activity_entry(oc_rbuf *p, oc_activity_entry *m);
+oc_result oc_decode_activity(oc_rbuf *p, oc_activity *m);
 oc_result oc_decode_channel_info(oc_rbuf *p, oc_channel_info *m);
 oc_result oc_decode_list_channels(oc_rbuf *p);
 oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries, uint16_t cap, uint16_t *out_count);

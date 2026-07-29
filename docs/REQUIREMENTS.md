@@ -563,9 +563,14 @@ the requirement says so explicitly rather than implying one.
 - **REQ-139.** A client has offered an **activity feed / notification inbox** — an
   aggregated, filterable view of @mentions (REQ-221), reactions to the user's
   messages (REQ-070), and thread replies (REQ-060/061) across all channels — so a
-  user has caught up on what involved them without scanning every channel. **[needs
-  ARCH decision — a client-side fold over existing events vs. a server-maintained
-  per-user activity list.]**
+  user has caught up on what involved them without scanning every channel.
+  **Built (ARCH-95):** neither of the two options this marker offered — a
+  client-side fold is impossible for a client that stores nothing (ARCH-88), and a
+  maintained list would duplicate rows already indexed and add three write paths
+  that can drift. It is a **union of three bounded queries** over `mentions`,
+  `reactions` and threaded `messages`, excluding your own actions and gated on
+  current membership. `users.activity_seen_ms` is a watermark — enough to mark
+  what is new, deliberately not per-item read state.
 
 ---
 
@@ -982,7 +987,11 @@ architecture decision.*
   body. Pin state is replayed on backfill, so it survives a reconnect.
 - **REQ-231.** A user has been able to **save (bookmark)** any message they can
   read into a private, personal list for later retrieval, visible only to them.
-  **[needs ARCH decision — per-user saved-item storage.]**
+  **Built (ARCH-95, migration 0025):** `saved_items` keyed `(user_id, message_id)`
+  — the deliberate mirror of a pin (ARCH-90), which is keyed on the message alone
+  because it belongs to the channel. Two people may save the same message and
+  neither sees the other's list; nothing is fanned out. Saving twice keeps the
+  original time, and leaving a channel stops its messages appearing in the list.
 - **REQ-232.** Every message has had a stable **permalink** — an addressable
   reference resolving to the message in its channel/thread — that a client could
   follow to **jump to that message** in context, loading surrounding history as

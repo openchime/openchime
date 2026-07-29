@@ -491,6 +491,27 @@ static const char MIGRATION_0024[] =
      * so that is the shape worth indexing. */
     "CREATE INDEX idx_channels_archived ON channels(archived_at_ms);";
 
+static const char MIGRATION_0025[] =
+    /* Saved items (REQ-231, ARCH-95) — the deliberate MIRROR of pins (§3r).
+     * A pin is keyed on the message alone because it belongs to the channel;
+     * a saved item is keyed on (user, message) because it belongs to a person.
+     * Same gesture, opposite ownership, and the reason ARCH-90 wrote the
+     * distinction down before this table existed. */
+    "CREATE TABLE saved_items ("
+    "  user_id       INTEGER NOT NULL REFERENCES users(id),"
+    "  message_id    INTEGER NOT NULL REFERENCES messages(id),"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  PRIMARY KEY (user_id, message_id)"
+    ");"
+    "CREATE INDEX idx_saved_user ON saved_items(user_id, created_at_ms DESC);"
+
+    /* The activity feed (REQ-139) is a QUERY, not a table (ARCH-95) — the rows
+     * it reads are already stored and already indexed. What a query cannot give
+     * cheaply is read state, so this one column is the whole of it: a watermark
+     * stamped when the feed is opened, enough to badge "something new" and
+     * nothing more. */
+    "ALTER TABLE users ADD COLUMN activity_seen_ms INTEGER NOT NULL DEFAULT 0;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -516,6 +537,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 22, MIGRATION_0022 },
     { 23, MIGRATION_0023 },
     { 24, MIGRATION_0024 },
+    { 25, MIGRATION_0025 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

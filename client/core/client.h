@@ -133,6 +133,17 @@ void oc_client_close_pins(oc_client *c);
  * The result arrives as a CHANNEL_INFO fanned to every member. */
 void oc_client_update_channel(oc_client *c, uint64_t channel_id, uint8_t op, const char *value);
 
+/* Save/unsave a message (REQ-231, ARCH-95). Private: only you ever sees it, so
+ * nothing is fanned out and the ack comes back to you alone. */
+void oc_client_save_item(oc_client *c, uint64_t message_id, uint8_t op);
+void oc_client_list_saved(oc_client *c);
+void oc_client_close_saved(oc_client *c);
+
+/* What involved you — mentions, reactions to your messages, replies under them
+ * (REQ-139). Opening it stamps the seen watermark server-side. */
+void oc_client_list_activity(oc_client *c);
+void oc_client_close_activity(oc_client *c);
+
 void oc_client_list_members(oc_client *c, uint64_t channel_id);
 
 /* Files shared in a channel, or (channel_id 0) across every channel the user

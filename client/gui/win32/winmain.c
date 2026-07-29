@@ -4372,6 +4372,126 @@ static void draw_dm_compose(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
     }
 }
 
+/* Rows of the two per-user views, so a click can jump to the message. */
+static struct { D2D1_RECT_F row, act; uint64_t mid, cid; } g_listrows[128];
+static int g_n_listrows;
+static uint64_t g_listrow_hover;
+
+/* Shared chrome for the Activity and Later views: a title bar, then rows. */
+static D2D1_RECT_F view_header(ID2D1RenderTarget *rt, D2D1_RECT_F reg, const char *title,
+                               const char *sub) {
+    fill(rt, rf(reg.left, reg.top, reg.right, reg.top + HEADER_H), OC_COL_HEADER);
+    draw_text(rt, title, g_hdr, rf(reg.left + 20, reg.top, reg.right - 20,
+                                   reg.top + (sub ? 34.0f : HEADER_H)), OC_COL_TEXT);
+    if (sub)
+        draw_text(rt, sub, g_small, rf(reg.left + 20, reg.top + 30, reg.right - 20,
+                                       reg.top + HEADER_H - 4), OC_COL_FAINT);
+    fill(rt, rf(reg.left, reg.top + HEADER_H - 1, reg.right, reg.top + HEADER_H), OC_COL_BORDER);
+    return rf(reg.left, reg.top + HEADER_H, reg.right, reg.bottom);
+}
+
+/* The Activity feed (REQ-139): what involved you, across every channel. */
+static void draw_activity(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    D2D1_RECT_F body = view_header(rt, reg, "Activity",
+                                   "Mentions, reactions to your messages, and replies to your threads");
+    g_n_listrows = 0;
+    if (m->activity_loading) { overlay_empty(rt, body, "Loading\u2026"); return; }
+    if (m->n_activity == 0) {
+        overlay_empty(rt, body, "Nothing yet. When someone mentions you, reacts to "
+                                "your message or replies to your thread, it lands here.");
+        return;
+    }
+    float y = body.top + 8;
+    for (size_t i = 0; i < m->n_activity && y < body.bottom; i++) {
+        const oc_activity_view *a = &m->activity[i];
+        D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + 52);
+        if (g_listrow_hover == a->message_id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
+        /* Newer than the last time this view was opened — the whole of what the
+         * watermark buys us (ARCH-95). */
+        if (a->at > m->activity_seen)
+            fill(rt, rf(row.left, row.top + 4, row.left + 3, row.bottom - 4), OC_COL_ACCENT);
+
+        int icon = a->kind == OC_ACT_MENTION ? OC_ICON_AT
+                 : a->kind == OC_ACT_REACTION ? OC_ICON_SMILE : OC_ICON_DMS;
+        draw_lucide(rt, icon, rf(row.left + 12, y + 8, row.left + 32, y + 28), OC_COL_MUTED);
+
+        const char *who = oc_model_user_name((oc_model *)m, a->actor_id);
+        const oc_channel *ch = oc_model_channel((oc_model *)m, a->channel_id);
+        char head[220], when[24];
+        rel_time(a->at, when, sizeof when);
+        snprintf(head, sizeof head, "%s %s%s%s \u00B7 %s",
+                 (who && who[0]) ? who : "someone",
+                 a->kind == OC_ACT_MENTION  ? "mentioned you"
+                 : a->kind == OC_ACT_REACTION ? "reacted to your message"
+                                              : "replied to your thread",
+                 (ch && ch->name && ch->name[0]) ? " in #" : "",
+                 (ch && ch->name && ch->name[0]) ? ch->name : "",
+                 when);
+        draw_text(rt, head, g_ui, rf(row.left + 40, y + 4, row.right - 20, y + 24), OC_COL_TEXT);
+        draw_text(rt, a->text ? a->text : "", g_small,
+                  rf(row.left + 40, y + 24, row.right - 20, y + 46), OC_COL_FAINT);
+
+        if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
+            g_listrows[g_n_listrows].row = row;
+            g_listrows[g_n_listrows].act = rf(0, 0, 0, 0);
+            g_listrows[g_n_listrows].mid = a->message_id;
+            g_listrows[g_n_listrows].cid = a->channel_id;
+            g_n_listrows++;
+        }
+        y += 56;
+    }
+}
+
+/* Saved items — the Later view (REQ-231). */
+static void draw_later(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    D2D1_RECT_F body = view_header(rt, reg, "Later", "Messages you saved. Only you can see this.");
+    g_n_listrows = 0;
+    if (m->saved_loading) { overlay_empty(rt, body, "Loading\u2026"); return; }
+    if (m->n_saved == 0) {
+        overlay_empty(rt, body, "Nothing saved. Use \u22EF \u2192 Save for later on any message.");
+        return;
+    }
+    float y = body.top + 8;
+    for (size_t i = 0; i < m->n_saved && y < body.bottom; i++) {
+        const oc_saved_view *sv = &m->saved[i];
+        D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + 52);
+        if (g_listrow_hover == sv->message_id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
+        draw_lucide(rt, OC_ICON_BOOKMARK, rf(row.left + 12, y + 8, row.left + 32, y + 28),
+                    OC_COL_MUTED);
+
+        const char *who = oc_model_user_name((oc_model *)m, sv->author_id);
+        const oc_channel *ch = oc_model_channel((oc_model *)m, sv->channel_id);
+        char head[220], when[24];
+        rel_time(sv->saved_at, when, sizeof when);
+        snprintf(head, sizeof head, "%s%s%s \u00B7 saved %s",
+                 (who && who[0]) ? who : "someone",
+                 (ch && ch->name && ch->name[0]) ? " in #" : "",
+                 (ch && ch->name && ch->name[0]) ? ch->name : "", when);
+        draw_text(rt, head, g_ui, rf(row.left + 40, y + 4, row.right - 110, y + 24), OC_COL_TEXT);
+        char prev[200];
+        if (sv->body && sv->body[0])       snprintf(prev, sizeof prev, "%s", sv->body);
+        else if (sv->attach_name[0])       snprintf(prev, sizeof prev, "\U0001F4CE %s", sv->attach_name);
+        else                               prev[0] = '\0';
+        draw_text(rt, prev, g_small, rf(row.left + 40, y + 24, row.right - 110, y + 46),
+                  OC_COL_FAINT);
+
+        D2D1_RECT_F rm = rf(row.right - 96, y + 14, row.right - 16, y + 38);
+        stroke_round(rt, rm, 6.0f, OC_COL_BORDER, 1.0f);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Remove", g_small, rm, OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_small, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+        if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
+            g_listrows[g_n_listrows].row = row;
+            g_listrows[g_n_listrows].act = rm;
+            g_listrows[g_n_listrows].mid = sv->message_id;
+            g_listrows[g_n_listrows].cid = sv->channel_id;
+            g_n_listrows++;
+        }
+        y += 56;
+    }
+}
+
 /* A full-pane placeholder for views whose backing feature isn't built yet. */
 static void draw_stub_view(ID2D1RenderTarget *rt, D2D1_RECT_F reg,
                            const char *title, const char *sub) {
@@ -4444,9 +4564,9 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         g_banner_on = 0;
         D2D1_RECT_F reg = rf(RAIL_W, 0, W, H);
         switch (g_view) {
-            case VIEW_ACTIVITY:      draw_stub_view(rt, reg, "Activity", "Activity feed \xE2\x80\x94 coming soon"); break;
+            case VIEW_ACTIVITY:      draw_activity(rt, m, reg); break;
             case VIEW_FILES:         draw_files_view(rt, m, reg); break;
-            case VIEW_LATER:         draw_stub_view(rt, reg, "Later", "Saved items \xE2\x80\x94 coming soon"); break;
+            case VIEW_LATER:         draw_later(rt, m, reg); break;
             case VIEW_ADMIN:         draw_admin(rt, m, reg); break;
             default:                 draw_stub_view(rt, reg, "OpenChime", ""); break;
         }
@@ -5278,6 +5398,7 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
     if (!msg->deleted)
         AppendMenuW(menu, MF_STRING, 103,
                     msg->pinned ? L"Unpin from channel" : L"Pin to channel");
+    AppendMenuW(menu, MF_STRING, 104, L"Save for later");
     AppendMenuW(menu, MF_STRING, 20, L"Copy text");
     int own = (msg->author_id == m->user_id);
     int canmod = own || self_role(m) >= OC_ROLE_ADMIN;
@@ -5301,6 +5422,11 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
         g_scroll = 0; oc_client_open_thread(g_client, g_sel, mid);
     } else if (cmd == 102) {
         oc_client_list_reactions(g_client, chan, mid); rp_push(RP_REACTORS);
+    } else if (cmd == 104) {
+        /* Private, so there is no "unsave" state to reflect in the menu here —
+         * the Later view is where you remove one. */
+        oc_client_save_item(g_client, mid, OC_SAVE_ADD);
+        toast_push("Saved to Later.", 0);
     } else if (cmd == 103) {
         oc_client_pin(g_client, chan, mid, msg->pinned ? OC_PIN_REMOVE : OC_PIN_ADD);
     } else if (cmd >= 30 && cmd - 30 < msg->n_attach) {
@@ -5616,6 +5742,8 @@ static int on_click(HWND hwnd, int x, int y) {
                      * and a stale one is worse than a moment's wait. */
                     if (act == VIEW_ADMIN) admin_select(g_adm_tab);
                     if (act == VIEW_FILES) oc_client_list_files(g_client, 0);   /* 0 = everywhere */
+                    if (act == VIEW_ACTIVITY) oc_client_list_activity(g_client);
+                    if (act == VIEW_LATER)    oc_client_list_saved(g_client);
                 }
                 else if (act == NAV_MORE)      { g_more_open = !g_more_open; }
                 else if (act == NAV_SWITCHER)  { open_switcher(hwnd); }
@@ -5631,6 +5759,23 @@ static int on_click(HWND hwnd, int x, int y) {
     /* The Files view has no sidebar, so its clicks must be served before the
      * transcript-only guard below. */
     if (g_view == VIEW_FILES && files_click(hwnd, x, y)) return 1;
+    /* Activity / Later rows: the action button first, then the row itself, which
+     * takes you to the message in its channel — the point of both views. */
+    if (g_view == VIEW_ACTIVITY || g_view == VIEW_LATER)
+        for (int i = 0; i < g_n_listrows; i++) {
+            if (in_rect(g_listrows[i].act, x, y)) {
+                oc_client_save_item(g_client, g_listrows[i].mid, OC_SAVE_REMOVE);
+                return 1;
+            }
+            if (in_rect(g_listrows[i].row, x, y)) {
+                g_view = VIEW_HOME;
+                if (g_listrows[i].cid) select_channel(g_listrows[i].cid);
+                g_jump_mid = g_listrows[i].mid;
+                select_tab(TAB_MESSAGES);
+                layout_composer(hwnd);
+                return 1;
+            }
+        }
     if (g_view == VIEW_DMS) {
         if (in_rect(g_dm_compose_btn, x, y)) { g_dm_compose = !g_dm_compose; return 1; }
         for (int i = 0; i < g_n_dmrows; i++)
@@ -7464,6 +7609,23 @@ static void test_poll(HWND hwnd) {
                             (rmsg && reaction_is_mine(rmsg, emo)) ? OC_REACT_REMOVE : OC_REACT_ADD);
             test_ack("ok");
         } else test_ack("err");
+    } else if (!strcmp(verb, "save")) {
+        unsigned long long mid = strtoull(arg, NULL, 10);
+        const oc_model *sm2 = model();
+        const oc_channel *sc2 = sm2 && g_sel ? oc_model_channel((oc_model *)sm2, g_sel) : NULL;
+        if (!mid && sc2 && sc2->n_msgs) mid = sc2->msgs[sc2->n_msgs - 1].message_id;
+        if (g_client && mid) { oc_client_save_item(g_client, (uint64_t)mid, OC_SAVE_ADD); test_ack("ok"); }
+        else test_ack("err");
+    } else if (!strcmp(verb, "view")) {
+        int v = atoi(arg);
+        if (v >= 0 && v < VIEW_COUNT) {
+            g_view = v; layout_composer(hwnd);
+            if (v == VIEW_ACTIVITY) oc_client_list_activity(g_client);
+            if (v == VIEW_LATER)    oc_client_list_saved(g_client);
+            if (v == VIEW_FILES)    oc_client_list_files(g_client, 0);
+            if (v == VIEW_ADMIN)    admin_select(g_adm_tab);
+            test_ack("ok");
+        } else test_ack("err");
     } else if (!strcmp(verb, "chup")) {
         /* Bypass the modal form, as "mkchan" and "upload" do. */
         int op = 0; char val[256] = {0};
@@ -7973,6 +8135,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int r = (any_overlay(model()) || !view_has_sidebar()) ? -1 : msgrow_at(my);
             uint64_t h = r >= 0 ? g_msgrows[r].mid : 0;
             if (h != g_hover_mid) { g_hover_mid = h; InvalidateRect(hwnd, NULL, FALSE); }
+            /* Activity / Later row hover. */
+            uint64_t lh = 0;
+            for (int i = 0; i < g_n_listrows; i++)
+                if (in_rect(g_listrows[i].row, (float)mx, (float)my)) { lh = g_listrows[i].mid; break; }
+            if (lh != g_listrow_hover) { g_listrow_hover = lh; InvalidateRect(hwnd, NULL, FALSE); }
             /* DMs-index row hover. */
             uint64_t dh = 0;
             for (int i = 0; i < g_n_dmrows; i++)

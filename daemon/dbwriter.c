@@ -222,6 +222,10 @@ void oc_dbres_free(oc_dbres *r) {
     for (size_t i = 0; i < r->n_plist; i++) { free(r->plist[i].body); free(r->plist[i].attach_name); }
     free(r->plist);
     free(r->cmlist);
+    for (size_t i = 0; i < r->n_slist; i++) { free(r->slist[i].body); free(r->slist[i].attach_name); }
+    free(r->slist);
+    for (size_t i = 0; i < r->n_alist; i++) free(r->alist[i].text);
+    free(r->alist);
     for (size_t i = 0; i < r->n_flist; i++) { free(r->flist[i].filename); free(r->flist[i].mime); }
     free(r->flist);
     free(r->ch_name);
@@ -2052,6 +2056,184 @@ static oc_dbres *process_list_files(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Save or unsave a message (REQ-231, ARCH-95).
+ *
+ * Private, so there is nothing to fan out — the ack goes to the actor and stops.
+ * Keyed (user, message), which is what makes it the mirror of a pin rather than
+ * another one: two people may save the same message and neither sees the other.
+ * Saving twice is a no-op, as re-pinning is. */
+static oc_dbres *process_save_item(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->message_id = j->message_id;
+    r->save_op = j->save_op;
+
+    /* You may save anything you can READ; the channel check is the same one that
+     * gates seeing it at all. A tombstone has nothing worth keeping. */
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT channel_id FROM messages WHERE id=? AND deleted_at_ms IS NULL;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+    uint64_t cid = (sqlite3_step(st) == SQLITE_ROW) ? (uint64_t)sqlite3_column_int64(st, 0) : 0;
+    sqlite3_finalize(st);
+    if (!cid) { r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r; }
+    if (!is_member(db, cid, j->user_id)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+
+    uint64_t now = dbw_now_ms();
+    if (j->save_op == OC_SAVE_ADD) {
+        sqlite3_prepare_v2(db,
+            "INSERT OR IGNORE INTO saved_items(user_id,message_id,created_at_ms) VALUES(?,?,?);",
+            -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->message_id);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)now);
+        sqlite3_step(st); sqlite3_finalize(st);
+        /* Report the ORIGINAL save time, so a re-save does not appear to move the
+         * item to the top of a list ordered by when you saved it. */
+        sqlite3_prepare_v2(db, "SELECT created_at_ms FROM saved_items WHERE user_id=? AND message_id=?;",
+                           -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->message_id);
+        if (sqlite3_step(st) == SQLITE_ROW) r->saved_at = (uint64_t)sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+    } else {
+        sqlite3_prepare_v2(db, "DELETE FROM saved_items WHERE user_id=? AND message_id=?;",
+                           -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->message_id);
+        sqlite3_step(st); sqlite3_finalize(st);
+    }
+    r->type = OC_RES_SAVED_OK;
+    return r;
+}
+
+/* My saved items, newest save first (REQ-231). Bodies travel with them, as with
+ * pins: a saved message is usually far outside loaded history. */
+static oc_dbres *process_list_saved(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_SAVED_LIST;
+
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT s.message_id, m.channel_id, m.author_id, m.created_at_ms, s.created_at_ms, m.body, "
+        "       (SELECT a.filename FROM attachments a WHERE a.message_id = m.id ORDER BY a.id LIMIT 1) "
+        "  FROM saved_items s JOIN messages m ON m.id = s.message_id "
+        " WHERE s.user_id=?1 AND m.deleted_at_ms IS NULL "
+        /* Still gated on membership: leaving a channel should not keep leaking
+         * its messages through your saved list. */
+        "   AND EXISTS(SELECT 1 FROM channel_members cm "
+        "               WHERE cm.channel_id=m.channel_id AND cm.user_id=?1) "
+        " ORDER BY s.created_at_ms DESC LIMIT ?2;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int(st, 2, (int)OC_MAX_SAVED);
+
+    oc_saved_row *arr = calloc(OC_MAX_SAVED, sizeof *arr);
+    size_t n = 0;
+    while (arr && n < OC_MAX_SAVED && sqlite3_step(st) == SQLITE_ROW) {
+        arr[n].message_id = (uint64_t)sqlite3_column_int64(st, 0);
+        arr[n].channel_id = (uint64_t)sqlite3_column_int64(st, 1);
+        arr[n].author_id  = (uint64_t)sqlite3_column_int64(st, 2);
+        arr[n].created_at = (uint64_t)sqlite3_column_int64(st, 3);
+        arr[n].saved_at   = (uint64_t)sqlite3_column_int64(st, 4);
+        const unsigned char *b = sqlite3_column_text(st, 5);
+        const unsigned char *an = sqlite3_column_text(st, 6);
+        arr[n].body = b ? strdup((const char *)b) : NULL;
+        arr[n].attach_name = an ? strdup((const char *)an) : NULL;
+        n++;
+    }
+    sqlite3_finalize(st);
+    r->slist = arr; r->n_slist = n;
+    return r;
+}
+
+/* What involved me (REQ-139, ARCH-95): a union of three bounded queries over
+ * rows that already exist and are already indexed — no maintained list to drift
+ * out of sync with the truth.
+ *
+ *   mentions  — `idx_mentions_user`, built by ARCH-89 for exactly this read.
+ *   reactions — someone else reacting to a message I wrote.
+ *   replies   — someone else replying under a top-level message I wrote.
+ *
+ * Each excludes the actor being me: an activity feed of my own doings is noise.
+ * Each is gated on my still being a member, so leaving a channel stops it
+ * leaking. Ordered newest-first and capped as one page. */
+static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_ACTIVITY;
+
+    /* Read the watermark BEFORE stamping it, so this response can tell the
+     * client what was already seen. */
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT activity_seen_ms FROM users WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    if (sqlite3_step(st) == SQLITE_ROW) r->activity_seen = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+
+    static const char *SQL =
+        "SELECT kind, message_id, channel_id, actor_id, at, text FROM ("
+        /* --- mentions of me --- */
+        "  SELECT 0 AS kind, mn.message_id AS message_id, mn.channel_id AS channel_id, "
+        "         m.author_id AS actor_id, m.created_at_ms AS at, "
+        "         substr(COALESCE(m.body,''),1,?2) AS text "
+        "    FROM mentions mn JOIN messages m ON m.id = mn.message_id "
+        "   WHERE (mn.user_id = ?1 OR mn.kind <> 0) AND m.author_id <> ?1 "
+        "     AND m.deleted_at_ms IS NULL "
+        "     AND EXISTS(SELECT 1 FROM channel_members cm "
+        "                 WHERE cm.channel_id = mn.channel_id AND cm.user_id = ?1) "
+        "  UNION ALL "
+        /* --- reactions to what I wrote --- */
+        "  SELECT 1, rx.message_id, m.channel_id, rx.user_id, rx.created_at_ms, rx.emoji "
+        "    FROM reactions rx JOIN messages m ON m.id = rx.message_id "
+        "   WHERE m.author_id = ?1 AND rx.user_id <> ?1 AND m.deleted_at_ms IS NULL "
+        "     AND EXISTS(SELECT 1 FROM channel_members cm "
+        "                 WHERE cm.channel_id = m.channel_id AND cm.user_id = ?1) "
+        "  UNION ALL "
+        /* --- replies under something I wrote --- */
+        "  SELECT 2, c.id, c.channel_id, c.author_id, c.created_at_ms, "
+        "         substr(COALESCE(c.body,''),1,?2) "
+        "    FROM messages c JOIN messages p ON p.id = c.parent_id "
+        "   WHERE p.author_id = ?1 AND c.author_id <> ?1 AND c.deleted_at_ms IS NULL "
+        "     AND EXISTS(SELECT 1 FROM channel_members cm "
+        "                 WHERE cm.channel_id = c.channel_id AND cm.user_id = ?1) "
+        ") ORDER BY at DESC LIMIT ?3;";
+
+    sqlite3_prepare_v2(db, SQL, -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int(st, 2, (int)OC_MAX_PREVIEW);
+    sqlite3_bind_int(st, 3, (int)OC_MAX_ACTIVITY);
+
+    oc_activity_row *arr = calloc(OC_MAX_ACTIVITY, sizeof *arr);
+    size_t n = 0;
+    while (arr && n < OC_MAX_ACTIVITY && sqlite3_step(st) == SQLITE_ROW) {
+        arr[n].kind       = (uint8_t)sqlite3_column_int(st, 0);
+        arr[n].message_id = (uint64_t)sqlite3_column_int64(st, 1);
+        arr[n].channel_id = (uint64_t)sqlite3_column_int64(st, 2);
+        arr[n].actor_id   = (uint64_t)sqlite3_column_int64(st, 3);
+        arr[n].at         = (uint64_t)sqlite3_column_int64(st, 4);
+        const unsigned char *t = sqlite3_column_text(st, 5);
+        arr[n].text = t ? strdup((const char *)t) : NULL;
+        n++;
+    }
+    sqlite3_finalize(st);
+    r->alist = arr; r->n_alist = n;
+
+    /* Stamp the watermark now that we have read it: opening the feed IS seeing
+     * it. Nothing finer, by ARCH-95 — per-item read state is what a table would
+     * be for, and there is no table. */
+    sqlite3_prepare_v2(db, "UPDATE users SET activity_seen_ms=? WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_step(st); sqlite3_finalize(st);
+    return r;
+}
+
 /* Pin or unpin a message (REQ-230, ARCH-90).
  *
  * A pin belongs to the channel, so any member may place one and any member may
@@ -3510,7 +3692,8 @@ static int is_read_job(int type) {
     return type == OC_JOB_BACKFILL || type == OC_JOB_HISTORY || type == OC_JOB_SEARCH ||
            type == OC_JOB_LIST_CHANNELS || type == OC_JOB_LIST_USERS ||
            type == OC_JOB_LIST_REACTIONS || type == OC_JOB_LIST_PINS ||
-           type == OC_JOB_LIST_MEMBERS || type == OC_JOB_LIST_FILES || type == OC_JOB_LIST_THREAD ||
+           type == OC_JOB_LIST_MEMBERS || type == OC_JOB_LIST_FILES ||
+           type == OC_JOB_LIST_SAVED || type == OC_JOB_LIST_THREAD ||
            type == OC_JOB_TYPING || type == OC_JOB_ATTACH_LOOKUP ||
            type == OC_JOB_LIST_WEBHOOKS || type == OC_JOB_LIST_NOTIFY_PREFS ||
            type == OC_JOB_LIST_CLIENT_SETTINGS ||
@@ -3530,6 +3713,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_LIST_PINS)      return process_list_pins(rdb, j);
     if (j->type == OC_JOB_LIST_MEMBERS)   return process_list_members(rdb, j);
     if (j->type == OC_JOB_LIST_FILES)     return process_list_files(rdb, j);
+    if (j->type == OC_JOB_LIST_SAVED)     return process_list_saved(rdb, j);
     if (j->type == OC_JOB_LIST_THREAD)    return process_list_thread(rdb, j);
     if (j->type == OC_JOB_TYPING)         return process_typing(rdb, j);
     if (j->type == OC_JOB_ATTACH_LOOKUP)  return process_attach_lookup(rdb, j);
@@ -3565,6 +3749,10 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_REACT)          return process_react(w->db, j);
     if (j->type == OC_JOB_PIN)            return process_pin(w->db, j);
     if (j->type == OC_JOB_UPDATE_CHANNEL) return process_update_channel(w->db, j);
+    if (j->type == OC_JOB_SAVE_ITEM)      return process_save_item(w->db, j);
+    /* On the WRITER because it stamps the seen watermark; the read half would
+     * otherwise be a reader job with a write in it. */
+    if (j->type == OC_JOB_LIST_ACTIVITY)  return process_list_activity(w->db, j);
     if (j->type == OC_JOB_SEND_REPLY)     return process_send_reply(w->db, j);
     if (j->type == OC_JOB_SETUP_INVITE)   return process_setup_invite(w->db, j);
     if (j->type == OC_JOB_CLIENT_ACK)     return process_client_ack(w->db, j);
