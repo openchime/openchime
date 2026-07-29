@@ -179,6 +179,20 @@ than against the backlog:
 
 Recorded because a defect nobody wrote down is a defect nobody fixes.
 
+- ~~**WIN-72 — hovering one column highlighted whatever shared its Y.**~~ **FIXED
+  2026-07-29.** Reported from a screenshot: the pointer on an Activity row lit up
+  the transcript message on the same line. `oc_msgrow` stored `top`/`bot` and no
+  x at all, so every test against it matched the full width of the window —
+  hover, right-click (a message menu from the members pane) and the start of a
+  text selection. **This is WIN-66 exactly, in a second place:** a hit-box that
+  records one axis will be asked about both. Rows now carry `left`/`right` from
+  the pane that drew them, `msgrow_at()` takes x, and the y-only variant is kept
+  only for drag-extend, where leaving the pane should still extend the selection.
+  Thread replies got the same treatment. Verified from the dump, which now
+  reports the row band and the live hover id — the screenshot that found it
+  could not have told me whether the fix worked, because hover does not survive
+  the round trip to a render.
+
 - ~~**WIN-70 — native children leaked into views they do not belong to.**~~
   **FIXED 2026-07-29 — audited globally, not patched again.** After the third
   occurrence the whole family was reviewed: six native children (composer, find

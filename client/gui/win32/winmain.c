@@ -367,8 +367,15 @@ static int g_n_pref_hits;
 static int g_n_rows;
 
 /* Transcript message hit-boxes (context menu + text selection). bx/by = the body
- * layout's top-left; cw = its wrap width — enough to re-hit-test on mouse events. */
-typedef struct { float top, bot, bx, by, cw; uint64_t mid; } oc_msgrow;
+ * layout's top-left; cw = its wrap width — enough to re-hit-test on mouse events.
+ *
+ * left/right are NOT decoration. A row used to be a y-band only, so every hit
+ * test against it matched the whole width of the window: hovering the Activity
+ * list, or the members pane, lit up whatever message happened to share that
+ * line, and right-clicking there opened that message's menu. Exactly the defect
+ * WIN-66 fixed in the members pane, in a second place. A hit-box that stores one
+ * axis will be asked about both. */
+typedef struct { float top, bot, left, right, bx, by, cw; uint64_t mid; } oc_msgrow;
 static oc_msgrow g_msgrows[600];
 static int g_n_msgrows;
 /* The same, for the thread pane (WIN-15) — replies were read-only because the
@@ -2222,6 +2229,7 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
                 if (*n < cap) {
                     oc_msgrow *row = capture ? &g_msgrows[*n] : &g_thrrows[*n];
                     row->top = y; row->bot = y + heights[i];
+                    row->left = reg.left; row->right = reg.right;
                     row->bx = bx; row->by = by; row->cw = content_w;
                     row->mid = msgs[first + i].message_id;
                     (*n)++;
@@ -6547,14 +6555,26 @@ static int on_click(HWND hwnd, int x, int y) {
 
 /* ---- transcript text selection (DirectWrite hit-testing) ----------------- */
 
-static int msgrow_at(int y) {
+/* Both axes. Every caller that means "the message under the pointer" wants this
+ * one — see the note on oc_msgrow. */
+static int msgrow_at(int x, int y) {
+    for (int i = 0; i < g_n_msgrows; i++)
+        if ((float)y >= g_msgrows[i].top && (float)y < g_msgrows[i].bot &&
+            (float)x >= g_msgrows[i].left && (float)x < g_msgrows[i].right) return i;
+    return -1;
+}
+
+/* Y only, deliberately: this is for dragging a selection. Once the drag has
+ * started, sliding the pointer out of the pane should keep extending it to the
+ * nearest row rather than dropping the selection. */
+static int msgrow_at_y(int y) {
     for (int i = 0; i < g_n_msgrows; i++)
         if ((float)y >= g_msgrows[i].top && (float)y < g_msgrows[i].bot) return i;
     return -1;
 }
 
 static int msgrow_clamp(int y) {
-    int r = msgrow_at(y);
+    int r = msgrow_at_y(y);
     if (r >= 0 || g_n_msgrows == 0) return r;
     return (float)y < g_msgrows[0].top ? 0 : g_n_msgrows - 1;
 }
@@ -6579,7 +6599,7 @@ static uint32_t hit_pos(int ri, int x, int y) {
 }
 
 static int selection_start(HWND hwnd, int x, int y) {
-    int r = msgrow_at(y);
+    int r = msgrow_at(x, y);
     if (r < 0) { g_has_sel = 0; return 0; }
     uint32_t pos = hit_pos(r, x, y);
     g_sel_a_mid = g_sel_f_mid = g_msgrows[r].mid;
@@ -6672,17 +6692,17 @@ static void on_rclick(HWND hwnd, int x, int y) {
      * ordinary message with an id (WIN-15). */
     if (m->thread_open) {
         for (int i = 0; i < g_n_thrrows; i++)
-            if ((float)y >= g_thrrows[i].top && (float)y < g_thrrows[i].bot) {
+            if ((float)y >= g_thrrows[i].top && (float)y < g_thrrows[i].bot &&
+                (float)x >= g_thrrows[i].left && (float)x < g_thrrows[i].right) {
                 show_msg_menu(hwnd, m, g_thrrows[i].mid, pt.x, pt.y);
                 return;
             }
         return;
     }
-    for (int i = 0; i < g_n_msgrows; i++)
-        if ((float)y >= g_msgrows[i].top && (float)y < g_msgrows[i].bot) {
-            show_msg_menu(hwnd, m, g_msgrows[i].mid, pt.x, pt.y);
-            return;
-        }
+    {
+        int r = msgrow_at(x, y);
+        if (r >= 0) { show_msg_menu(hwnd, m, g_msgrows[r].mid, pt.x, pt.y); return; }
+    }
 }
 
 /* ---- core wiring ---------------------------------------------------------- */
@@ -7967,6 +7987,11 @@ static void test_dump(const char *path) {
             g_pal_edit && IsWindowVisible(g_pal_edit),
             g_si_e_ws && IsWindowVisible(g_si_e_ws),
             sidebar_kind(), main_is_conversation(), window_is_covered());
+    /* Hit-box geometry, because a hit test that silently matches nothing looks
+     * exactly like a hit test that is never called. */
+    fprintf(f, "msgrows n=%d x=%.0f..%.0f hover=%llu listrows=%d\n", g_n_msgrows,
+            g_n_msgrows ? g_msgrows[0].left : -1.0f, g_n_msgrows ? g_msgrows[0].right : -1.0f,
+            (unsigned long long)g_hover_mid, g_n_listrows);
     fprintf(f, "tray_live=%d notify_pref=%d toasts_raised=%d dnd=%d\n",
             g_tray_live, g_pref_notify, g_toasts_raised, dnd_active(m));
     fprintf(f, "lightbox=%llu thumb_hits=%d\n", (unsigned long long)g_lightbox, g_n_thumb_hits);
@@ -8730,7 +8755,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else {
             if (g_nav_hover != -100) { g_nav_hover = -100; InvalidateRect(hwnd, NULL, FALSE); }
             if (g_sb_hover_sec != -1)  { g_sb_hover_sec = -1;  InvalidateRect(hwnd, NULL, FALSE); }
-            int r = (any_overlay(model()) || !transcript_shell()) ? -1 : msgrow_at(my);
+            int r = (any_overlay(model()) || !transcript_shell()) ? -1 : msgrow_at(mx, my);
             uint64_t h = r >= 0 ? g_msgrows[r].mid : 0;
             if (h != g_hover_mid) { g_hover_mid = h; InvalidateRect(hwnd, NULL, FALSE); }
             /* Activity / Later row hover. */
