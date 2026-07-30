@@ -684,6 +684,10 @@ static char     g_find_filter[64];      /* current filter text (lowercased) */
 static HBRUSH   g_find_brush;           /* dark bg for the find box */
 static D2D1_RECT_F g_rail_btn;          /* workspace-avatar hit-box (app menu) */
 static int g_view = VIEW_HOME;          /* current primary view (rail selection) */
+/* The pointer, in DIPs, updated from WM_MOUSEMOVE. The file tracked a dozen
+ * derived hover states (g_nav_hover, g_hover_mid, …) but never the position
+ * itself, so shared chrome — the modal frame's buttons — had nothing to ask. */
+static int g_mouse_x = -1, g_mouse_y = -1;
 static int g_nav_hover = -100;          /* rail item under the cursor (act value) */
 /* Rail item hit-boxes, captured during paint. `act` >=0 is a VIEW_*, <0 a NAV_*. */
 static struct { float top, bot; int act; } g_navrows[16];
@@ -1002,6 +1006,14 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
 }
 
 /* ---- small helpers ------------------------------------------------------- */
+
+/* Both axes, always. Declared up here because the modal frame hit-tests during
+ * paint; it used to live beside the click router, which is why the frame could not
+ * see it. */
+static int in_rect(D2D1_RECT_F r, int x, int y) {
+    return (float)x >= r.left && (float)x <= r.right && (float)y >= r.top && (float)y <= r.bottom;
+}
+
 
 static D2D1_COLOR_F col(uint32_t rgb) {
     D2D1_COLOR_F c;
@@ -2823,7 +2835,7 @@ static void draw_weblist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
  * server-synced (REQ-130/131) and were reachable only one channel at a time from
  * a context menu, so there was no way to review them. */
 static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
-    D2D1_RECT_F body = overlay_header(rt, reg, "Notifications");
+    D2D1_RECT_F body = reg;   /* the frame drew the title bar (modal_frame) */
     ovl_use(OVL_NOTIFY);
     g_n_notify_hits = 0;
 
@@ -2934,7 +2946,7 @@ static const struct { const char *keys, *what; } KEYMAP[] = {
 };
 
 static void draw_keys(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
-    D2D1_RECT_F body = overlay_header(rt, reg, "Keyboard shortcuts");
+    D2D1_RECT_F body = reg;   /* the frame drew the title bar (modal_frame) */
     ovl_use(OVL_KEYS);
     int n = (int)(sizeof KEYMAP / sizeof KEYMAP[0]);
     float rowh = 32;
@@ -3573,7 +3585,7 @@ enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
        PREF_ROW_NOTIFY, PREF_ROW_QUICK };
 
 static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
-    D2D1_RECT_F body = overlay_header(rt, reg, "Preferences");
+    D2D1_RECT_F body = reg;   /* the frame drew the title bar (modal_frame) */
     g_n_pref_hits = 0;
     float y = body.top + 16;
 
@@ -3606,8 +3618,6 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
         y = pref_row(rt, body, y, PREF_ROW_QUICK, "", "", EDIT1, 1, -1);
     }
 
-    draw_text(rt, "Saved to your account, so they follow you to another machine.",
-              g_meta, rf(body.left + 24, y + 4, body.right - 24, y + 24), OC_COL_FAINT);
 }
 
 /* A person's card, in the context pane (right). Laid out VERTICALLY: the old
@@ -3686,10 +3696,8 @@ static void draw_reactors_list(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RE
 static void sw_book_load(void);       /* fwd */
 
 static void draw_wsmgr(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
-    D2D1_RECT_F body = overlay_header(rt, reg, "Workspaces");
+    D2D1_RECT_F body = reg;   /* the frame drew the title bar (modal_frame) */
     g_n_wsmgr_hits = 0;
-    draw_text(rt, "Sign out keeps a workspace here; Remove deletes it from this device.",
-              g_meta, rf(body.left + 24, body.top + 6, body.right - 24, body.top + 26), OC_COL_FAINT);
     float y = body.top + 34, rowh = 54;
 
     for (int i = 0; i < g_n_sw; i++) {
@@ -4582,25 +4590,386 @@ static int modal_open(void) {
 
 static D2D1_RECT_F g_modal_card;
 
-static void draw_modal(ID2D1RenderTarget *rt, const oc_model *m, float W, float H) {
-    if (!modal_open()) { g_modal_card = rf(0, 0, 0, 0); return; }
+/* ---- the modal frame ------------------------------------------------------
+ *
+ * Every modal shares one frame, because before this they shared nothing: four
+ * D2D cards each computing its own geometry, six middle-column panes borrowing the
+ * modal header (and its "Esc to close" caption, which is not even a modal
+ * concept), sixteen native GDI popups, and four MessageBoxes. Same product, five
+ * dialog idioms.
+ *
+ * The frame owns the scrim, the card, the title bar with a real close button, the
+ * footer rule and the button row. A caller draws only its content and never
+ * decides where any of that goes.
+ *
+ * **Explicit commit, not live-apply.** A settings modal declares snapshot/restore,
+ * and the frame copies the values on open so Cancel can put them back. This is the
+ * whole reason to have a footer: with live-apply, "Cancel" either does nothing —
+ * so why is it there — or has to undo changes nobody recorded. The previous
+ * Preferences had no buttons at all and expected you to press Esc, which is the
+ * dead end that started this.
+ *
+ * Not every modal is a form. Workspaces performs immediate, irreversible actions
+ * (sign out, remove) and Shortcuts is read-only; both simply have no snapshot and
+ * a single dismissing button. The frame supports both rather than pretending
+ * everything is a settings sheet.
+ */
+enum { MB_NORMAL = 0, MB_PRIMARY, MB_DANGER };
+enum { MODAL_SM = 0, MODAL_LG };
+#define MODAL_MAX_BTNS 4
+
+typedef struct { const char *label; uint8_t kind; int cmd; } oc_mbtn;
+typedef struct {
+    const char *title;
+    const char *subtitle;                  /* optional; NULL or "" for none */
+    uint8_t     size;                       /* MODAL_SM | MODAL_LG */
+    oc_mbtn     buttons[MODAL_MAX_BTNS];    /* laid out right-to-left */
+    int         n_buttons;
+    void      (*snapshot)(void);            /* NULL when the modal is not a form */
+    void      (*restore)(void);
+    void      (*commit)(void);
+} oc_modal_spec;
+
+/* Frame-owned hit-boxes, valid after a paint. */
+static D2D1_RECT_F g_modal_close_btn;
+static struct { D2D1_RECT_F r; int cmd; uint8_t kind; } g_modal_btns[MODAL_MAX_BTNS];
+static int g_n_modal_btns;
+static int g_modal_primary_cmd = -1;        /* what Enter fires */
+
+/* MODAL_CANCEL / MODAL_OK are frame commands: the two every form needs, so a
+ * caller does not re-invent them. Anything else is dispatched to the modal. */
+enum { MODAL_CANCEL = -2, MODAL_OK = -1 };
+
+/* Content inset. One number, so no two modals disagree about their gutter. */
+#define MODAL_PAD    24.0f
+#define MODAL_TITLE_H 52.0f
+#define MODAL_FOOT_H  60.0f
+
+static float btn_width(const char *label) {
+    float w = text_width(label, g_ui) + 34;
+    return w < 88 ? 88 : w;      /* a floor, so "OK" is not a tiny target */
+}
+
+/* Draw the frame and return the CONTENT rect, already inset. */
+static D2D1_RECT_F modal_frame(ID2D1RenderTarget *rt, const oc_modal_spec *s,
+                               float W, float H) {
     D2D1_RECT_F all = rf(0, 0, W, H);
     ID2D1RenderTarget_FillRectangle(rt, &all, paint_alpha(0x000000, 0.50f));
 
-    float cw = W - 160, ch = H - 120;
-    if (cw > 720) cw = 720;
-    if (ch > 620) ch = 620;
-    if (cw < 320) cw = W;
-    if (ch < 240) ch = H;
+    /* Two sizes rather than free arithmetic: the old per-modal `cw = W - 160`
+     * gave a six-row settings list a 720px card. */
+    float want_w = (s->size == MODAL_LG) ? 720.0f : 460.0f;
+    float want_h = (s->size == MODAL_LG) ? 620.0f : 300.0f;
+    float cw = W - 96, ch = H - 96;
+    if (cw > want_w) cw = want_w;
+    if (ch > want_h) ch = want_h;
+    if (cw < 300) cw = W;                    /* a window too small to inset */
+    if (ch < 220) ch = H;
     D2D1_RECT_F card = rf((W - cw) / 2, (H - ch) / 2, (W + cw) / 2, (H + ch) / 2);
     g_modal_card = card;
     fill_round(rt, card, 10.0f, OC_COL_BASE);
     stroke_round(rt, card, 10.0f, OC_COL_BORDER, 1.0f);
 
-    if (g_prefs_open)       draw_prefs(rt, card);
-    else if (g_keys_open)   draw_keys(rt, card);
-    else if (g_wsmgr_open)  draw_wsmgr(rt, card);
-    else if (g_notify_open) draw_notify_prefs(rt, m, card);
+    /* Title bar. The close button is a D2D hit-box, not a native child: a child
+     * would composite above the card and punch through it. */
+    float ty = card.top + (s->subtitle && s->subtitle[0] ? 12.0f : 0.0f);
+    draw_text(rt, s->title, g_display,
+              rf(card.left + MODAL_PAD, card.top, card.right - 56, card.top + MODAL_TITLE_H - ty + card.top),
+              OC_COL_TEXT);
+    if (s->subtitle && s->subtitle[0])
+        draw_text(rt, s->subtitle, g_meta,
+                  rf(card.left + MODAL_PAD, card.top + 30, card.right - 56, card.top + 50),
+                  OC_COL_FAINT);
+    float title_h = MODAL_TITLE_H + (s->subtitle && s->subtitle[0] ? 14.0f : 0.0f);
+
+    g_modal_close_btn = rf(card.right - 44, card.top + 12, card.right - 16, card.top + 40);
+    if (in_rect(g_modal_close_btn, (float)g_mouse_x, (float)g_mouse_y))
+        fill_round(rt, g_modal_close_btn, 6.0f, OC_COL_HOVER);
+    /* The same glyph the members pane closes with (there is no Lucide X in the
+     * vendored set), centred so the 28px box is the target rather than the mark. */
+    IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, "\xC3\x97", g_ui, g_modal_close_btn, OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+    fill(rt, rf(card.left, card.top + title_h - 1, card.right, card.top + title_h), OC_COL_BORDER);
+
+    /* Footer: a rule, then buttons right-to-left. Order is fixed here so no modal
+     * invents its own: primary rightmost, danger pushed to the left edge. */
+    g_n_modal_btns = 0;
+    g_modal_primary_cmd = -1;
+    float foot_top = card.bottom - MODAL_FOOT_H;
+    if (s->n_buttons > 0) {
+        fill(rt, rf(card.left, foot_top, card.right, foot_top + 1), OC_COL_BORDER);
+        float bx = card.right - MODAL_PAD;
+        for (int i = s->n_buttons - 1; i >= 0; i--) {
+            const oc_mbtn *b = &s->buttons[i];
+            if (!b->label || !b->label[0]) continue;
+            if (b->kind == MB_DANGER) continue;      /* placed separately, left */
+            float bw = btn_width(b->label);
+            D2D1_RECT_F r = rf(bx - bw, foot_top + 14, bx, foot_top + 46);
+            int hot = in_rect(r, (float)g_mouse_x, (float)g_mouse_y);
+            if (b->kind == MB_PRIMARY) {
+                fill_round(rt, r, 6.0f, hot ? OC_COL_ACCENT_DIM : OC_COL_ACCENT);
+            } else {
+                fill_round(rt, r, 6.0f, hot ? OC_COL_HOVER : OC_COL_INPUT);
+                stroke_round(rt, r, 6.0f, OC_COL_BORDER, 1.0f);
+            }
+            IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+            draw_text(rt, b->label, g_ui, rf(r.left, r.top + 1, r.right, r.bottom),
+                      b->kind == MB_PRIMARY ? 0xFFFFFF : OC_COL_TEXT);
+            IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+            if (g_n_modal_btns < MODAL_MAX_BTNS) {
+                g_modal_btns[g_n_modal_btns].r = r;
+                g_modal_btns[g_n_modal_btns].cmd = b->cmd;
+                g_modal_btns[g_n_modal_btns].kind = b->kind;
+                g_n_modal_btns++;
+            }
+            if (b->kind == MB_PRIMARY) g_modal_primary_cmd = b->cmd;
+            bx = r.left - 10;
+        }
+        /* Danger on the far left, away from the primary — a destructive button
+         * beside "Save" is a misclick waiting to happen. */
+        float dx = card.left + MODAL_PAD;
+        for (int i = 0; i < s->n_buttons; i++) {
+            const oc_mbtn *b = &s->buttons[i];
+            if (b->kind != MB_DANGER || !b->label || !b->label[0]) continue;
+            float bw = btn_width(b->label);
+            D2D1_RECT_F r = rf(dx, foot_top + 14, dx + bw, foot_top + 46);
+            int hot = in_rect(r, (float)g_mouse_x, (float)g_mouse_y);
+            fill_round(rt, r, 6.0f, hot ? OC_COL_HOVER : OC_COL_INPUT);
+            stroke_round(rt, r, 6.0f, OC_COL_DANGER, 1.0f);
+            IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+            draw_text(rt, b->label, g_ui, rf(r.left, r.top + 1, r.right, r.bottom), OC_COL_DANGER);
+            IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+            if (g_n_modal_btns < MODAL_MAX_BTNS) {
+                g_modal_btns[g_n_modal_btns].r = r;
+                g_modal_btns[g_n_modal_btns].cmd = b->cmd;
+                g_modal_btns[g_n_modal_btns].kind = b->kind;
+                g_n_modal_btns++;
+            }
+            dx = r.right + 10;
+        }
+    }
+
+    return rf(card.left + MODAL_PAD, card.top + title_h,
+              card.right - MODAL_PAD, foot_top - 8);
+}
+
+/* The spec of whichever modal is open, so the click and key routers work from the
+ * same description the painter used. */
+static const oc_modal_spec *modal_current(void);
+
+static void draw_modal(ID2D1RenderTarget *rt, const oc_model *m, float W, float H) {
+    if (!modal_open()) {
+        g_modal_card = rf(0, 0, 0, 0);
+        g_n_modal_btns = 0;
+        g_modal_close_btn = rf(0, 0, 0, 0);
+        return;
+    }
+    const oc_modal_spec *s = modal_current();
+    D2D1_RECT_F body = modal_frame(rt, s, W, H);
+
+    if (g_prefs_open)       draw_prefs(rt, body);
+    else if (g_keys_open)   draw_keys(rt, body);
+    else if (g_wsmgr_open)  draw_wsmgr(rt, body);
+    else if (g_notify_open) draw_notify_prefs(rt, m, body);
+}
+
+static void prefs_save(void);                    /* fwd */
+static void palette_close(HWND hwnd);            /* fwd */
+static void picker_close(HWND hwnd);             /* fwd */
+static void menu_dispatch(HWND hwnd, int cmd);   /* fwd */
+static void close_overlays(void);                /* fwd */
+
+/* ---- the four modals, described once --------------------------------------
+ *
+ * Preferences and Notifications are FORMS: they snapshot on open and Cancel puts
+ * the values back. Workspaces performs immediate irreversible actions and
+ * Shortcuts is a reference sheet, so neither snapshots and both get a single
+ * dismissing button. Describing them here rather than inside each painter is what
+ * lets one click router and one key router serve all four.
+ */
+
+/* Preferences: everything pref_row() can change, plus the quick reactions. Theme
+ * is applied live while the sheet is open — it is its own preview, and you cannot
+ * judge a theme from a label — but it reverts with the rest on Cancel. */
+static struct {
+    int theme, time24, members, daysep, notify;
+    char quick[160];
+} g_prefs_snap;
+
+static void prefs_snapshot(void) {
+    g_prefs_snap.theme   = oc_theme_mode();
+    g_prefs_snap.time24  = g_pref_time24;
+    g_prefs_snap.members = g_pref_members;
+    g_prefs_snap.daysep  = g_pref_daysep;
+    g_prefs_snap.notify  = g_pref_notify;
+    snprintf(g_prefs_snap.quick, sizeof g_prefs_snap.quick, "%s", g_quick_names);
+}
+
+static void prefs_restore(void) {
+    if (oc_theme_mode() != g_prefs_snap.theme) oc_theme_apply(g_prefs_snap.theme);
+    g_pref_time24  = g_prefs_snap.time24;
+    g_pref_members = g_prefs_snap.members;
+    g_pref_daysep  = g_prefs_snap.daysep;
+    g_pref_notify  = g_prefs_snap.notify;
+    snprintf(g_quick_names, sizeof g_quick_names, "%s", g_prefs_snap.quick);
+    quick_rebuild();
+}
+
+/* Per-channel notification levels live on the SERVER, so a form over them cannot
+ * simply restore locals: Cancel has to re-send whatever it changed. The snapshot
+ * is the levels as they were when the sheet opened, and restore re-sends only the
+ * rows that differ — silence for the untouched ones. */
+static struct { uint64_t cid; uint8_t level; } g_notify_snap[64];
+static int g_n_notify_snap;
+
+static void notify_snapshot(void) {
+    const oc_model *m = model();
+    g_n_notify_snap = 0;
+    if (!m) return;
+    for (size_t i = 0; i < m->n_channels && g_n_notify_snap < 64; i++) {
+        g_notify_snap[g_n_notify_snap].cid   = m->channels[i].channel_id;
+        g_notify_snap[g_n_notify_snap].level = m->channels[i].notify_level;
+        g_n_notify_snap++;
+    }
+}
+
+static void notify_restore(void) {
+    const oc_model *m = model();
+    if (!m || !g_client) return;
+    for (int i = 0; i < g_n_notify_snap; i++) {
+        const oc_channel *c = oc_model_channel((oc_model *)m, g_notify_snap[i].cid);
+        if (c && c->notify_level != g_notify_snap[i].level)
+            oc_client_set_notify_pref(g_client, g_notify_snap[i].cid, g_notify_snap[i].level);
+    }
+}
+
+static const oc_modal_spec *modal_current(void) {
+    static oc_modal_spec sp;
+    memset(&sp, 0, sizeof sp);
+    if (g_prefs_open) {
+        sp.title = "Preferences";
+        sp.subtitle = "Saved to your account, so they follow you to another machine.";
+        sp.size = MODAL_LG;
+        sp.buttons[0] = (oc_mbtn){ "Cancel", MB_NORMAL,  MODAL_CANCEL };
+        sp.buttons[1] = (oc_mbtn){ "Save",   MB_PRIMARY, MODAL_OK };
+        sp.n_buttons = 2;
+        sp.snapshot = prefs_snapshot; sp.restore = prefs_restore; sp.commit = prefs_save;
+    } else if (g_notify_open) {
+        sp.title = "Notifications";
+        sp.subtitle = "Per conversation, plus quiet hours.";
+        sp.size = MODAL_LG;
+        sp.buttons[0] = (oc_mbtn){ "Cancel", MB_NORMAL,  MODAL_CANCEL };
+        sp.buttons[1] = (oc_mbtn){ "Save",   MB_PRIMARY, MODAL_OK };
+        sp.n_buttons = 2;
+        sp.snapshot = notify_snapshot; sp.restore = notify_restore; sp.commit = NULL;
+    } else if (g_keys_open) {
+        sp.title = "Keyboard shortcuts";
+        sp.size = MODAL_LG;
+        sp.buttons[0] = (oc_mbtn){ "Close", MB_PRIMARY, MODAL_OK };
+        sp.n_buttons = 1;
+    } else {   /* g_wsmgr_open */
+        sp.title = "Workspaces";
+        sp.subtitle = "Sign out keeps a workspace here; Remove deletes it from this device.";
+        sp.size = MODAL_LG;
+        sp.buttons[0] = (oc_mbtn){ "Done", MB_PRIMARY, MODAL_OK };
+        sp.n_buttons = 1;
+    }
+    return &sp;
+}
+
+/* Open a modal through here, so its snapshot is always taken. Forgetting that on
+ * one path is how Cancel would silently become a second Save. */
+static void modal_enter(HWND hwnd, int *flag) {
+    close_overlays();
+    /* The transient overlays too, and this was a real bug rather than tidiness:
+     * the command palette and the emoji picker each claim EVERY click while open
+     * (on_click returns early for them), and layout_natives hides their boxes
+     * whenever something covers the window — so a palette left open behind a modal
+     * was INVISIBLE and ate every click meant for the card. Found by the smoke,
+     * whose preamble happened to leave the palette open; a user reaches it by
+     * opening Preferences with the palette up. close_overlays() cannot do this
+     * itself: it has no window handle, and these three need one to restore focus
+     * and repaint. */
+    if (g_pal_open)  palette_close(hwnd);
+    if (g_pick_open) picker_close(hwnd);
+    g_menu = MENU_NONE; g_menu_hover = -1;
+    g_more_open = 0;
+    *flag = 1;
+    g_view = VIEW_HOME;
+    const oc_modal_spec *s = modal_current();
+    if (s->snapshot) s->snapshot();
+    /* Repaint NOW, so the frame's geometry exists before any click can arrive:
+     * the card rect is measured during paint, and the guard in modal_frame_click
+     * swallows clicks until it exists — correct, but it meant the first click after
+     * opening was silently lost. This was GetActiveWindow() at first, which is
+     * NULL whenever our window is not in the foreground, so the invalidate did
+     * nothing in exactly the case that needed it. Take the window as an argument
+     * and there is nothing to be wrong about. */
+    if (hwnd) { InvalidateRect(hwnd, NULL, FALSE); UpdateWindow(hwnd); }
+}
+
+/* Close it. `commit` decides which way: Save runs commit, Cancel runs restore. */
+static const char *g_modal_closed_by = "";   /* diagnosis only; see the dump */
+
+static void modal_finish(int save) {
+    const oc_modal_spec *s = modal_current();
+    if (save) { if (s->commit) s->commit(); }
+    else      { if (s->restore) s->restore(); }
+    g_prefs_open = g_keys_open = g_wsmgr_open = g_notify_open = 0;
+    g_modal_closed_by = save ? "save" : "cancel";
+}
+
+/* Clicks the FRAME owns, tested before any modal's own content. Returns 1 when it
+ * consumed the click. */
+/* The last click the frame saw, and what became of it. Kept because two of this
+ * work's three bugs were "the click went somewhere else" and no screenshot can
+ * show that. */
+static char g_modal_lastclick[128] = "";
+
+static int modal_frame_click(HWND hwnd, int x, int y) {
+    (void)hwnd;
+    if (!modal_open()) return 0;
+    snprintf(g_modal_lastclick, sizeof g_modal_lastclick,
+             "pt=%d,%d card=%.0f,%.0f,%.0f,%.0f", x, y,
+             g_modal_card.left, g_modal_card.top, g_modal_card.right, g_modal_card.bottom);
+    /* Nothing is dismissible until the frame has been PAINTED once: the card rect
+     * is measured during paint, and an unset one made every click "outside", so a
+     * modal opened from a menu or a keystroke and clicked before the next repaint
+     * dismissed itself. Found by driving it, not by reading it. */
+    if (g_modal_card.right <= g_modal_card.left) {
+        strncat(g_modal_lastclick, " SWALLOWED-unpainted",
+                sizeof g_modal_lastclick - strlen(g_modal_lastclick) - 1);
+        return 1;
+    }
+    if (in_rect(g_modal_close_btn, x, y)) { modal_finish(0); g_modal_closed_by = "x-button"; return 1; }
+    for (int i = 0; i < g_n_modal_btns; i++)
+        if (in_rect(g_modal_btns[i].r, x, y)) {
+            int cmd = g_modal_btns[i].cmd;
+            if (cmd == MODAL_OK)          { modal_finish(1); g_modal_closed_by = "footer-ok"; }
+            else if (cmd == MODAL_CANCEL) { modal_finish(0); g_modal_closed_by = "footer-cancel"; }
+            else                          menu_dispatch(hwnd, cmd);
+            return 1;
+        }
+    /* Outside the card dismisses, and dismiss means CANCEL — the same as ✕ and
+     * Esc. A click in the dark that silently saved would be the worst of the
+     * three. */
+    if (!in_rect(g_modal_card, x, y)) { modal_finish(0); g_modal_closed_by = "scrim"; return 1; }
+    return 0;
+}
+
+/* Esc cancels, Enter fires the primary. Both in one place so no modal has to
+ * remember, and so the two agree about what dismissal means. */
+static int modal_key(HWND hwnd, WPARAM vk) {
+    (void)hwnd;
+    if (!modal_open()) return 0;
+    if (vk == VK_ESCAPE) { modal_finish(0); g_modal_closed_by = "esc"; return 1; }
+    if (vk == VK_RETURN) {
+        if (g_modal_primary_cmd == MODAL_OK) modal_finish(1);
+        else if (g_modal_primary_cmd != -1)  menu_dispatch(hwnd, g_modal_primary_cmd);
+        return 1;
+    }
+    return 0;
 }
 
 /* EVERY native child's visibility, decided in one place.
@@ -6179,9 +6548,6 @@ static void open_new_menu(HWND hwnd);
 static void open_switcher(HWND hwnd);
 static void menu_dispatch(HWND hwnd, int cmd);
 
-static int in_rect(D2D1_RECT_F r, int x, int y) {
-    return (float)x >= r.left && (float)x <= r.right && (float)y >= r.top && (float)y <= r.bottom;
-}
 
 /* Returns 1 if the click hit a control/row (so the caller won't start a text
  * selection), 0 if it fell through to the transcript. */
@@ -6264,10 +6630,10 @@ static int on_click(HWND hwnd, int x, int y) {
     crumb("click %d %d view=%d", x, y, g_view);
     /* A modal owns the window while it is up: a click outside the card dismisses
      * it, and nothing behind it is reachable. Tested first for that reason. */
-    if (modal_open() && !in_rect(g_modal_card, (float)x, (float)y)) {
-        close_overlays();
-        return 1;
-    }
+    /* The frame owns ✕, the footer buttons and the scrim; a modal's own content
+     * never sees those clicks. Dismissal by any of the three means CANCEL, so the
+     * three cannot disagree. */
+    if (modal_frame_click(hwnd, x, y)) return 1;
     if (g_lightbox) { g_lightbox = 0; return 1; }   /* any click dismisses it */
     if (g_pal_open) {
         for (int i = 0; i < g_n_pal_rows; i++)
@@ -6390,9 +6756,17 @@ static int on_click(HWND hwnd, int x, int y) {
                 break;
             }
             }
-            prefs_save();
+            /* No prefs_save() here. The footer's Save commits (modal_finish ->
+             * spec->commit) and Cancel restores the snapshot; persisting on every
+             * click is live-apply wearing a Save button, which is how Cancel
+             * became a lie in the first place. */
             return 1;
         }
+        /* A click inside the card that matched no control STOPS here. It used to
+         * fall through to the shell underneath — the sidebar, the transcript, the
+         * autocomplete — which is how a stray click in a modal's empty space could
+         * change channel behind the dimmed card. */
+        if (in_rect(g_modal_card, x, y)) return 1;
     }
     /* The autocomplete popover floats over the transcript, so it claims clicks
      * inside it before anything underneath sees them. */
@@ -7987,7 +8361,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         }
         oc_client_set_dnd(g_client, 1, (uint16_t)(sh * 60 + sm), (uint16_t)(eh * 60 + em));
         break; }
-    case 70: close_overlays(); g_prefs_open = 1; g_view = VIEW_HOME; break;
+    case 70: modal_enter(hwnd, &g_prefs_open); break;
     case 73: {   /* WIN-33: catch-up, as a loop over the existing CLIENT_ACK.
                   * REQ-238 may later add a true bulk op; this needs no wire
                   * change and the acks are cumulative per channel anyway. */
@@ -8002,16 +8376,15 @@ static void menu_dispatch(HWND hwnd, int cmd) {
                  n, n == 1 ? "" : "s");
         toast_push(msg, 0);
         break; }
-    case 71: close_overlays(); g_notify_open = 1; g_view = VIEW_HOME;
-             oc_client_list_notify_prefs(g_client); break;   /* WIN-12 */
-    case 72: close_overlays(); g_keys_open = 1; g_view = VIEW_HOME; break;   /* WIN-25 */
+    case 71: oc_client_list_notify_prefs(g_client); modal_enter(hwnd, &g_notify_open); break;   /* WIN-12 */
+    case 72: modal_enter(hwnd, &g_keys_open); break;   /* WIN-25 */
     /* "Add a workspace…" drops the current session and goes to the same sign-in
      * view the app starts on — one sign-in implementation, not two. */
     /* Adding a workspace must not sign you out of the one you are in — which is
      * exactly what reset_session() here used to do. Park the current one and
      * sign in alongside it. */
     case 80: signin_begin_add(hwnd); break;
-    case 81: close_overlays(); sw_book_load(); g_wsmgr_open = 1; g_view = VIEW_HOME; break;
+    case 81: sw_book_load(); modal_enter(hwnd, &g_wsmgr_open); break;
     default:
         /* Section Filter/Sort (see SEC_CMD). */
         if (cmd >= 200 && cmd < 200 + OC_SB_SECTIONS * 16) {
@@ -8264,6 +8637,23 @@ static void test_dump(const char *path) {
                         dc->msgs[i].attach[k].reclaimed);
     }
     fprintf(f, "view=%d si_overlay=%d wsmgr=%d\n", g_view, g_si_overlay, g_wsmgr_open);
+    /* Modal + the settings a form modal can change, so snapshot/commit/restore is
+     * assertable rather than eyeballed — Cancel silently behaving like Save is
+     * exactly the bug this design exists to prevent. */
+    fprintf(f, "lastclick %s\n", g_modal_lastclick);
+    for (int i = 0; i < g_n_pref_hits; i++)
+        fprintf(f, "  prefhit row=%d val=%d r=%.0f,%.0f,%.0f,%.0f\n",
+                g_pref_hits[i].row, g_pref_hits[i].val, g_pref_hits[i].r.left,
+                g_pref_hits[i].r.top, g_pref_hits[i].r.right, g_pref_hits[i].r.bottom);
+    fprintf(f, "closed_by=%s card=%.0f,%.0f,%.0f,%.0f close=%.0f,%.0f,%.0f,%.0f nbtn=%d\n",
+            g_modal_closed_by, g_modal_card.left, g_modal_card.top,
+            g_modal_card.right, g_modal_card.bottom,
+            g_modal_close_btn.left, g_modal_close_btn.top,
+            g_modal_close_btn.right, g_modal_close_btn.bottom, g_n_modal_btns);
+    fprintf(f, "modal=%s theme=%d time24=%d members=%d daysep=%d notify=%d\n",
+            g_prefs_open ? "prefs" : g_keys_open ? "keys" :
+            g_wsmgr_open ? "wsmgr" : g_notify_open ? "notify" : "none",
+            oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep, g_pref_notify);
     fprintf(f, "workspaces=%d active=%d elsewhere=%d\n", g_n_wss, g_ws_active, ws_unread_elsewhere());
     for (int i = 0; i < g_n_wss; i++) {
         int u = 0;
@@ -8324,11 +8714,15 @@ static void test_dump(const char *path) {
         const oc_channel *c = &m->channels[i];
         /* DMs have no name, so the old `continue` hid every one of them from the
          * dump — which is why a DM-list bug could not be diagnosed from it. */
-        fprintf(f, "  ch %llu %s\"%s\" unread=%d msgs=%zu prev=\"%s\" prevby=%llu%s\n",
+        /* notify= so the Notifications form's Cancel is assertable: those levels
+         * live on the SERVER, so "restore" means re-sending them, and a revert
+         * that silently did nothing would look identical to one that worked. */
+        fprintf(f, "  ch %llu %s\"%s\" unread=%d msgs=%zu notify=%u prev=\"%s\" prevby=%llu%s\n",
                 (unsigned long long)c->channel_id,
                 c->kind == OC_CHANNEL_KIND_DM ? "DM " : "",
                 c->name ? c->name : "", c->unread,
-                c->n_msgs, c->preview, (unsigned long long)c->preview_author,
+                c->n_msgs, (unsigned)c->notify_level, c->preview,
+                (unsigned long long)c->preview_author,
                 c->channel_id == g_sel ? " *" : "");
     }
     fclose(f);
@@ -8414,6 +8808,16 @@ static void test_poll(HWND hwnd) {
         /* Kept as an alias: `shot` is now the composited capture, so there is
          * exactly one way to take a picture and it is the complete one. */
         test_ack(test_shot(hwnd, arg) ? "ok" : "err");
+    } else if (!strcmp(verb, "key")) {
+        /* A raw virtual key through the real WM_KEYDOWN path, so Esc/Enter/Tab
+         * behaviour is drivable at all — without this, every keyboard rule in the
+         * app was verifiable only by hand. Names for the ones used most, so a test
+         * reads `key esc` rather than `key 27`. */
+        int vk = !strcmp(arg, "esc")   ? VK_ESCAPE :
+                 !strcmp(arg, "enter") ? VK_RETURN :
+                 !strcmp(arg, "tab")   ? VK_TAB    : atoi(arg);
+        SendMessageW(hwnd, WM_KEYDOWN, (WPARAM)vk, 0);
+        test_ack("ok");
     } else if (!strcmp(verb, "move")) {
         /* A real WM_MOUSEMOVE, so hover goes through the same path the mouse
          * does rather than a test-only shortcut that could drift from it. */
@@ -8461,10 +8865,10 @@ static void test_poll(HWND hwnd) {
     } else if (!strcmp(verb, "toast")) {
         notify_toast("OpenChime", arg[0] ? arg : "test notification"); test_ack("ok");
     } else if (!strcmp(verb, "notify")) {
-        close_overlays(); g_notify_open = 1; g_view = VIEW_HOME;
+        modal_enter(hwnd, &g_notify_open);
         oc_client_list_notify_prefs(g_client); test_ack("ok");
     } else if (!strcmp(verb, "keys")) {
-        close_overlays(); g_keys_open = 1; g_view = VIEW_HOME; test_ack("ok");
+        modal_enter(hwnd, &g_keys_open); test_ack("ok");
     } else if (!strcmp(verb, "menu")) {
         /* Drive a workspace/new-menu command directly. Modal forms block this
          * poll loop until dismissed, so the ack lands after the dialog closes. */
@@ -8472,7 +8876,7 @@ static void test_poll(HWND hwnd) {
     } else if (!strcmp(verb, "profile")) {
         close_overlays(); g_profile_uid = strtoull(arg, NULL, 10); g_view = VIEW_HOME; test_ack("ok");
     } else if (!strcmp(verb, "prefs")) {
-        close_overlays(); g_prefs_open = 1; g_view = VIEW_HOME; test_ack("ok");
+        modal_enter(hwnd, &g_prefs_open); test_ack("ok");
     } else if (!strcmp(verb, "theme")) {
         theme_set(atoi(arg)); prefs_save(); test_ack("ok");
     } else if (!strcmp(verb, "emoji")) {
@@ -9011,6 +9415,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_MOUSEMOVE: {
         int mx = (int)DIPF(GET_X_LPARAM(lp)), my = (int)DIPF(GET_Y_LPARAM(lp));
+        /* Recorded before anything consumes the message, so shared chrome can ask
+         * where the pointer is without every widget tracking its own hover. */
+        if (mx != g_mouse_x || g_mouse_y != my) {
+            g_mouse_x = mx; g_mouse_y = my;
+            if (modal_open()) InvalidateRect(hwnd, NULL, FALSE);   /* frame hovers */
+        }
         if (g_sbar_drag) {
             if (g_sbar_travel > 0) {
                 float off = (float)my - g_sbar_grab - g_sbar_track_top;
@@ -9118,7 +9528,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             rp_pop(); InvalidateRect(hwnd, NULL, FALSE); return 0;
         }
         if (wp == VK_ESCAPE && g_menu) { g_menu = MENU_NONE; g_menu_hover = -1; InvalidateRect(hwnd, NULL, FALSE); return 0; }
-        if (wp == VK_ESCAPE && modal_open()) { close_overlays(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
+        /* Esc and Enter both go to modal_key, so cancel-vs-commit is decided in
+         * one place rather than by whichever handler saw the key first. */
+        if (modal_open() && (wp == VK_ESCAPE || wp == VK_RETURN) && modal_key(hwnd, wp)) {
+            InvalidateRect(hwnd, NULL, FALSE); return 0;
+        }
         if (wp == VK_ESCAPE && g_more_open) { g_more_open = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_ESCAPE && g_has_sel) { g_has_sel = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_OEM_2 && (GetKeyState(VK_CONTROL) & 0x8000)) {   /* Ctrl+/ */

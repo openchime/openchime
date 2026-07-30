@@ -57,7 +57,13 @@ case "$(snap)" in
   *"authed=1"*) say "   authed";;
   *) say "   NOT AUTHED — is the dev daemon up? (see gui_drive.sh launch)"; exit 1;;
 esac
+# Settle before asserting. `authed=1` means the model is live, not that the shell
+# has painted — and every `natives` value is measured during paint. A run started
+# immediately after a rebuild-and-relaunch failed 11 checks for this reason, then
+# passed twice; a test that is right most of the time is not one you can read.
+"$DRIVE" view 0 >/dev/null 2>&1
 "$DRIVE" channel general >/dev/null 2>&1
+sleep 1.5
 
 # --- the view matrix -------------------------------------------------------
 # view  sbkind  re  find  ffind  conv     what it is
@@ -119,6 +125,54 @@ d=$(snap)
 expect "$d" pal     1 "command palette: its box shown"
 expect "$d" covered 1 "command palette: window covered"
 "$DRIVE" palette >/dev/null 2>&1; sleep 0.4
+
+# --- the modal frame -------------------------------------------------------
+# Explicit commit is the whole design (ARCH-94 / docs/CLIENT.md): Save persists,
+# Cancel and Esc put the snapshot back. A Cancel that silently behaved like Save
+# would look identical on screen, so it is asserted rather than eyeballed. The
+# clicks are the frame's own footer, whose geometry the frame owns.
+say "== modal frame"
+
+# Click the centre of a preference chip, located from the dump rather than from a
+# screenshot. Hardcoded coordinates were wrong twice while writing this: the card
+# geometry shifted under the new frame, and a chip's width depends on its label.
+# The app already reports where it drew each hit-box, so ask it.
+click_pref() {                    # click_pref <row> <val>
+  local row="$1" val="$2" r
+  r=$(snap | grep -o "prefhit row=$row val=$val r=[0-9,]*" | head -1 | sed 's/.*r=//')
+  [ -n "$r" ] || { fail "no prefhit row=$row val=$val in the dump"; return 1; }
+  local l t rt b
+  IFS=, read -r l t rt b <<<"$r"
+  "$DRIVE" click $(( (l + rt) / 2 )) $(( (t + b) / 2 )) >/dev/null 2>&1
+}
+
+"$DRIVE" prefs >/dev/null 2>&1; sleep 0.7
+d=$(snap)
+expect "$d" modal prefs "preferences opens as a modal"
+before=$(printf '%s' "$d" | grep -o 'time24=[0-9]' | cut -d= -f2)
+other=$([ "$before" = "1" ] && echo 0 || echo 1)
+
+click_pref 1 "$other"; sleep 0.4
+expect "$(snap)" time24 "$other" "a change applies while the sheet is open"
+"$DRIVE" key esc >/dev/null 2>&1; sleep 0.5
+d=$(snap)
+expect "$d" closed_by esc       "Esc closes it"
+expect "$d" time24    "$before" "Esc RESTORES the snapshot"
+expect "$d" modal     none      "nothing left open"
+
+"$DRIVE" prefs >/dev/null 2>&1; sleep 0.7
+click_pref 1 "$other"; sleep 0.3
+"$DRIVE" key enter >/dev/null 2>&1; sleep 0.6
+d=$(snap)
+expect "$d" closed_by save     "Enter commits (primary is Save)"
+expect "$d" time24    "$other" "the change SURVIVES a commit"
+
+# Leave the preference as it was found: a smoke run that mutates settings is a
+# smoke run you stop trusting.
+"$DRIVE" prefs >/dev/null 2>&1; sleep 0.6
+click_pref 1 "$before"; sleep 0.3
+"$DRIVE" key enter >/dev/null 2>&1; sleep 0.5
+expect "$(snap)" time24 "$before" "the run left the setting as it found it"
 
 # --- the composer cue tracks the conversation ------------------------------
 # It was a cached global that went stale on a channel switch ("Message bob" while

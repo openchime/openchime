@@ -519,6 +519,40 @@ It went red for **eleven consecutive pushes** on 2026-07-29 because
 green the whole time, which is exactly why a green local suite is not a substitute
 for reading the run. Push, then check.
 
+## Modals: one frame, explicit commit
+
+Every modal is drawn by `modal_frame()` (winmain.c) from an `oc_modal_spec`. The
+frame owns the scrim, the card, the title bar with its close button, the footer
+rule and the button row; a caller draws only content and decides none of that.
+Before it there were **five** dialog idioms in one product: four D2D cards each
+computing its own geometry, six middle-column panes borrowing the modal header
+(including its "Esc to close" caption, which is not a modal concept), sixteen
+native GDI popups and four MessageBoxes.
+
+**Explicit commit, never live-apply.** A form modal declares `snapshot`/`restore`
+and the frame copies its values on open, so `Save` commits and `Cancel`/`✕`/`Esc`
+put them back — all three meaning the same thing. Live-apply makes Cancel a lie:
+it either does nothing, or has to undo changes nobody recorded. The old
+Preferences had no buttons at all and expected Esc, which is the dead end that
+prompted this.
+
+Not every modal is a form. Workspaces performs immediate irreversible actions and
+Shortcuts is a reference sheet, so neither snapshots and both carry one dismissing
+button. Where the setting lives on the SERVER — per-channel notification levels —
+`restore` re-sends the snapshot rather than writing a local, and only for rows
+that actually changed.
+
+**Two rules the frame cannot enforce for you:**
+
+- **Open through `modal_enter()`**, so the snapshot is always taken and the
+  transient overlays are closed. The command palette and emoji picker each claim
+  *every* click while open, and `layout_natives` hides their boxes whenever
+  something covers the window — so a palette left open behind a modal is invisible
+  and eats every click meant for the card. That was a live bug found by the smoke.
+- **A click inside the card that matches no control stops there.** It used to fall
+  through to the shell underneath, so a stray click in a modal's empty space could
+  change channel behind the dimmed card.
+
 ## Run the GUI smoke before pushing Win32 chrome
 
 `scripts/gui_smoke.sh` asserts **45 invariants** through the test hook: for each of
