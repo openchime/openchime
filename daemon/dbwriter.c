@@ -2789,8 +2789,16 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
                       " AND EXISTS(SELECT 1 FROM attachments a WHERE a.message_id=m.id "
                       "            AND a.mime LIKE 'image/%%') ");
     if (j->sq_has & 0x02u)   /* link: cheap and honest — a substring, not a parser */
+        /* CAST, because a message body is stored as a BLOB (sqlite3_bind_blob in
+         * process_send: the bytes are UTF-8 and we never let SQLite reinterpret
+         * them). LIKE on a BLOB is false for every pattern, so `has:link` matched
+         * NOTHING — silently, which is the worst way for a filter to be wrong.
+         * Found by fixing the test that was supposed to cover this: it asserted
+         * r->n_replay, a field search never fills, so every count was zero and
+         * every assertion passed. */
         k += snprintf(sql + k, sizeof sql - (size_t)k,
-                      " AND (m.body LIKE '%%http://%%' OR m.body LIKE '%%https://%%') ");
+                      " AND (CAST(m.body AS TEXT) LIKE '%%http://%%' OR "
+                      "      CAST(m.body AS TEXT) LIKE '%%https://%%') ");
     if (j->sq_after)  k += snprintf(sql + k, sizeof sql - (size_t)k, " AND m.created_at_ms >= ?7 ");
     if (j->sq_before) k += snprintf(sql + k, sizeof sql - (size_t)k, " AND m.created_at_ms <= ?8 ");
     snprintf(sql + k, sizeof sql - (size_t)k, " ORDER BY m.id DESC LIMIT ?3;");

@@ -69,14 +69,14 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 | ~~**WIN-74**~~ | ~~DM tabs: drop **About**~~ **DONE.** A DM shows Messages · Files & links · Pins. `tab_applies()` decides per channel kind, and it also guards `select_tab()` and a conversation switch — otherwise moving from a channel to a DM with About open left a pane whose tab did not exist. Pins and Files stay because the daemon genuinely allows both in a DM (membership is the only check). | — |
 | ~~**WIN-75**~~ | ~~The palette has no affordance~~ **DONE.** "Jump to…  (Ctrl+K)" in the **New** menu, beside "Search messages…" — the menu that already answers "do something". The shortcut is named in the label so the menu teaches the keystroke instead of replacing it. | — |
 | ~~**WIN-76**~~ | ~~Long lists do not scroll~~ **DONE** for Files and Later, both through the offset five other panes already shared (`ovl_use`/`ovl_begin`/`ovl_end`) rather than a sixth private one; the wheel routes to it for both views. The Files list's **"%d more — narrow the filters"** line is deleted: it existed only because the list could not scroll, and a count of unreachable rows is a worse answer than a scrollbar. The 200-row **server** cap notice stays — that one is a real limit. **Still open, split out as WIN-82:** the Files channel census is only as complete as that 200-row page. | — |
-| **WIN-77** | Modal frame: ~~`confirm()`~~ **(done)** · pane headers · `form_dialog`'s 16 sites | P1 | L |
+| ~~**WIN-77**~~ | ~~Modal frame: `confirm()` · pane headers · `form_dialog`'s 16 sites~~ **DONE** — see §1 | P1 | L |
 | ~~**WIN-78**~~ | ~~Preferences as two panes + appearance depth~~ **DONE** — see §1 | P2 | M |
 | ~~**WIN-79**~~ | ~~Replace the native context menus~~ **DONE** (ARCH-98). All four — message, member, channel, image kebab — are the app's own floating menu; `TrackPopupMenu`, `CreatePopupMenu` and `AppendMenuW` appear nowhere in the client. They keep **their own command numbers**, dispatched per kind, because the dropdowns' space was already crowded (a message's "Edit = 21" collides with a notification level). The three **submenus were flattened**: roles and notify levels became ticked sections, which shows the current value that a submenu hid behind a hover; the quick reactions became a new `MK_EMOJIROW` — one row, per-glyph hit-boxes, colour font like the picker. | — |
 | **WIN-80** | Custom DirectWrite composer, replacing RichEdit (ARCH-98) | P1 | XL |
 | **WIN-81** | The GUI smoke does not run in CI — needs a self-hosted Windows runner | P2 | M |
 | ~~**WIN-82**~~ | ~~Files' census only saw the 200-row page~~ **DONE.** `LIST_FILE_CHANNELS` — one `GROUP BY` over attachments with the same membership filter as `LIST_FILES`, over the index migration 0023 already added. The column is now exact, so the "From the 200 most recent files" caveat is deleted rather than reworded. Counts verified against the database directly (17 and 1). | — |
 | **WIN-83** | User-defined custom sidebar sections (the other half of REQ-234) | P3 | M |
-| **WIN-84** | In the unit-test harness, searches on the read connection see no rows | P2 | M |
+| ~~**WIN-84**~~ | ~~Searches on the read connection see no rows~~ **WRONG DIAGNOSIS — see §1**; the real bug was `has:link` | P2 | M |
 
 ### The items added 2026-07-30, in detail
 
@@ -175,21 +175,24 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
   Until then the pre-push gate is a human remembering, which is the same class of
   problem as everything else in this file.
 
-- **WIN-84 — the read connection sees nothing, in the test harness only.** While
-  building WIN-39's daemon test: six messages committed, then a search returns **0
-  rows** — and stays empty across 40 retries over a second. A **filters-only** search
-  (which never touches FTS) is empty too, so it is not an FTS problem: the read-only
-  connection (ARCH-66) is not seeing the writer's committed rows at all. The identical
-  generated SQL, captured from the running daemon and executed against the same
-  database by hand, returns all six.
-  **It does not reproduce against the live daemon** — the GUI's search returns 50
-  results with `from:` applied correctly — so this is specific to the in-process test
-  harness, where writer and reader share a process and a freshly created DB. Prime
-  suspects: a leaked prepared statement pinning a read snapshot, or the reader opening
-  before WAL is established. Recorded because a search that silently returns nothing
-  is the worst failure mode a search can have, and because `test_search_filters_and_paging`
-  had to be written around it — it asserts that filters build, execute and never widen
-  a result, not absolute counts.
+- ~~**WIN-84**~~ — **the diagnosis was wrong, and the real bug was worse.** The
+  filed symptom was "six messages committed, a search returns 0 rows, so the
+  read-only connection (ARCH-66) is not seeing the writer's commits". It sees them
+  fine: instrumenting the reader showed `COUNT(*) FROM messages` = 6 on that very
+  connection, in autocommit, with a moving `data_version`.
+  What was actually zero was **the field the test read**. Search results land in
+  `r->search` / `r->n_search` — which is what the netloop encodes — and the test
+  asserted `r->n_replay`, which `process_search` never fills. So every count was a
+  constant 0, "a filter narrows or holds" held vacuously, and the suite could not
+  have told a working search from a search that returned nothing at all. That is a
+  sharper warning than the bug it was mistaken for.
+  Rewriting it against `n_search` immediately found a REAL defect: **`has:link`
+  matched nothing**, because a message body is stored as a BLOB
+  (`sqlite3_bind_blob` in `process_send` — the bytes are UTF-8 and SQLite is never
+  allowed to reinterpret them) and `LIKE` on a BLOB is false for every pattern. It
+  is `CAST(m.body AS TEXT) LIKE …` now. The suite asserts absolute counts, that
+  filters AND rather than OR, both date directions, and that keyset paging covers
+  7 rows as 3 + 3 + 1 with no repeats.
 
 - **WIN-79 — two menu systems, one product.** Left-click dropdowns (workspace,
   profile, New, switcher, sidebar section) are drawn by the app. Right-click context

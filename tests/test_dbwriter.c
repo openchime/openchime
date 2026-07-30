@@ -2174,51 +2174,117 @@ static void test_search_filters_and_paging(void) {
     uint64_t bob   = reg(w, "sf-bob",   "pw", OC_ROLE_MEMBER);
     CHECK(alice && bob);
 
+    /* Six messages, alternating authors: alice gets ids 1,3,5 and bob 2,4,6 in the
+     * default channel, which both are members of. */
     uint8_t idem[OC_IDEM_LEN];
     for (int i = 0; i < 6; i++) {
         memset(idem, 0xC0 + i, sizeof idem);
         CHECK(send_msg(w, (i % 2) ? bob : alice, idem, "rollback plan detail"));
     }
 
-    /* Every combination executes and answers. A malformed statement would come back
-     * as an empty result of the RIGHT type too, which is why the hand-verification
-     * above matters — but a crash or a wrong result type would surface here. */
-    size_t base = 0;
+    /* This suite previously asserted r->n_replay and therefore asserted NOTHING:
+     * search results land in r->search / r->n_search (the netloop reads those), so
+     * every count was a constant zero and every "filter narrows" check passed
+     * vacuously. It was filed as WIN-84 — "the read connection sees no rows" — on
+     * that evidence. The read connection was fine; the test was reading the wrong
+     * field, which is a sharper warning than the bug it was mistaken for: a search
+     * test that cannot see results cannot tell a working search from a broken one. */
     oc_dbres *r = search_f(w, alice, "rollback", NULL, NULL, 0, 0, 0, 0, 50);
-    CHECK(r && r->type == OC_RES_SEARCH);
-    if (r) base = r->n_replay;
+    CHECK(r && r->type == OC_RES_SEARCH && r->n_search == 6);
+    uint64_t newest = (r && r->n_search) ? r->search[0].message_id : 0;
+    uint64_t oldest = (r && r->n_search) ? r->search[r->n_search - 1].message_id : 0;
+    CHECK(newest > oldest);                       /* ORDER BY m.id DESC */
     oc_dbres_free(r);
 
-    struct { const char *text, *from, *in; uint8_t has; uint64_t bid, aft, bef; } cases[] = {
-        { "rollback", "sf-bob", NULL,            0,     0, 0, 0 },
-        { NULL,       "sf-bob", NULL,            0,     0, 0, 0 },   /* filters only */
-        { "rollback", NULL,     "general",       0,     0, 0, 0 },
-        { "rollback", NULL,     "nosuchchannel", 0,     0, 0, 0 },
-        { "rollback", NULL,     NULL,            0x01u, 0, 0, 0 },   /* has:file */
-        { "rollback", NULL,     NULL,            0x02u, 0, 0, 0 },   /* has:link */
-        { "rollback", NULL,     NULL,            0x04u, 0, 0, 0 },   /* has:image */
-        { "rollback", NULL,     NULL,            0,     0, 0, 1000 },/* before 1970 */
-        { "rollback", NULL,     NULL,            0,     0, 1000, 0 },/* after 1970 */
-        { "rollback", NULL,     NULL,            0,     99999, 0, 0 },/* keyset cursor */
-    };
-    for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
-        r = search_f(w, alice, cases[k].text, cases[k].from, cases[k].in,
-                     cases[k].has, cases[k].bid, cases[k].aft, cases[k].bef, 50);
-        CHECK(r && r->type == OC_RES_SEARCH);
-        /* A filter narrows or holds; it can never widen. */
-        if (r) CHECK(r->n_replay <= base || base == 0);
-        oc_dbres_free(r);
+    /* from: — three of the six are bob's, matched case-insensitively on the display
+     * name, and a name nobody has matches nothing rather than everything. */
+    r = search_f(w, alice, "rollback", "sf-bob", NULL, 0, 0, 0, 0, 50);
+    CHECK(r && r->n_search == 3);
+    oc_dbres_free(r);
+    r = search_f(w, alice, "rollback", "SF-BOB", NULL, 0, 0, 0, 0, 50);
+    CHECK(r && r->n_search == 3);
+    oc_dbres_free(r);
+    r = search_f(w, alice, "rollback", "nobody", NULL, 0, 0, 0, 0, 50);
+    CHECK(r && r->n_search == 0);
+    oc_dbres_free(r);
+
+    /* Filters ALONE are a search (WIN-39): no text, so the FTS join disappears. */
+    r = search_f(w, alice, NULL, "sf-bob", NULL, 0, 0, 0, 0, 50);
+    CHECK(r && r->n_search == 3);
+    oc_dbres_free(r);
+
+    /* in: — the default channel by name, and an unknown channel is empty. */
+    r = search_f(w, alice, "rollback", NULL, "general", 0, 0, 0, 0, 50);
+    CHECK(r && r->n_search == 6);
+    oc_dbres_free(r);
+    r = search_f(w, alice, "rollback", NULL, "nosuchchannel", 0, 0, 0, 0, 50);
+    CHECK(r && r->n_search == 0);
+    oc_dbres_free(r);
+
+    /* has: — none of these six carries an attachment or a URL, so all three masks
+     * are empty. Asserted as zero rather than skipped: "has:file found everything"
+     * is exactly the failure a vacuous test hides. */
+    r = search_f(w, alice, "rollback", NULL, NULL, 0x01u, 0, 0, 0, 50);
+    CHECK(r && r->n_search == 0);
+    oc_dbres_free(r);
+    r = search_f(w, alice, "rollback", NULL, NULL, 0x02u, 0, 0, 0, 50);
+    CHECK(r && r->n_search == 0);
+    oc_dbres_free(r);
+    r = search_f(w, alice, "rollback", NULL, NULL, 0x04u, 0, 0, 0, 50);
+    CHECK(r && r->n_search == 0);
+    oc_dbres_free(r);
+
+    /* ... and one WITH a link is found by has:link, which is what makes the zeros
+     * above meaningful. */
+    memset(idem, 0xD0, sizeof idem);
+    CHECK(send_msg(w, alice, idem, "rollback notes https://example.com/x"));
+    r = search_f(w, alice, "rollback", NULL, NULL, 0x02u, 0, 0, 0, 50);
+    CHECK(r && r->n_search == 1);
+    oc_dbres_free(r);
+
+    /* Dates. Everything was written just now, so "since 1970" is all seven and
+     * "up to 1970" is none — the two directions cannot both be right by accident. */
+    r = search_f(w, alice, "rollback", NULL, NULL, 0, 0, 1000, 0, 50);
+    CHECK(r && r->n_search == 7);
+    oc_dbres_free(r);
+    r = search_f(w, alice, "rollback", NULL, NULL, 0, 0, 0, 1000, 50);
+    CHECK(r && r->n_search == 0);
+    oc_dbres_free(r);
+
+    /* The keyset cursor (WIN-38): id < before_id. Paging with it must cover every
+     * row exactly once — the property an OFFSET loses the moment someone posts. */
+    r = search_f(w, alice, "rollback", NULL, NULL, 0, 0, 0, 0, 3);
+    CHECK(r && r->n_search == 3 && r->truncated);
+    uint64_t cursor = (r && r->n_search) ? r->search[r->n_search - 1].message_id : 0;
+    uint64_t first_page[3] = { 0, 0, 0 };
+    if (r) for (size_t i = 0; i < r->n_search && i < 3; i++) first_page[i] = r->search[i].message_id;
+    oc_dbres_free(r);
+
+    r = search_f(w, alice, "rollback", NULL, NULL, 0, cursor, 0, 0, 3);
+    CHECK(r && r->n_search == 3);
+    if (r) for (size_t i = 0; i < r->n_search; i++) {
+        CHECK(r->search[i].message_id < cursor);          /* strictly older */
+        for (int k = 0; k < 3; k++) CHECK(r->search[i].message_id != first_page[k]);
     }
-
-    /* A query with neither text nor filters returns nothing rather than everything —
-     * this one IS absolute, because "empty means empty" does not depend on visibility. */
-    r = search_f(w, alice, NULL, NULL, NULL, 0, 0, 0, 0, 50);
-    CHECK(r && r->type == OC_RES_SEARCH && r->n_replay == 0);
+    uint64_t cursor2 = (r && r->n_search) ? r->search[r->n_search - 1].message_id : 0;
     oc_dbres_free(r);
 
-    /* And a limit is honoured as a ceiling. */
-    r = search_f(w, alice, "rollback", NULL, NULL, 0, 0, 0, 0, 2);
-    CHECK(r && r->n_replay <= 2);
+    r = search_f(w, alice, "rollback", NULL, NULL, 0, cursor2, 0, 0, 3);
+    CHECK(r && r->n_search == 1 && !r->truncated);        /* 7 = 3 + 3 + 1 */
+    oc_dbres_free(r);
+
+    /* A query with neither text nor filters returns nothing rather than everything. */
+    r = search_f(w, alice, NULL, NULL, NULL, 0, 0, 0, 0, 50);
+    CHECK(r && r->type == OC_RES_SEARCH && r->n_search == 0);
+    oc_dbres_free(r);
+
+    /* Filters COMBINE as AND, not OR: bob's messages in #general are three, and
+     * bob's messages in a channel that does not exist are none. */
+    r = search_f(w, alice, "rollback", "sf-bob", "general", 0, 0, 0, 0, 50);
+    CHECK(r && r->n_search == 3);
+    oc_dbres_free(r);
+    r = search_f(w, alice, "rollback", "sf-bob", "nosuchchannel", 0, 0, 0, 0, 50);
+    CHECK(r && r->n_search == 0);
     oc_dbres_free(r);
 
     oc_dbwriter_stop(w);
