@@ -224,6 +224,32 @@ typedef struct {
 } oc_field;
 static int form_dialog(HWND owner, const char *title, oc_field *f, int n);
 
+/* The form is drawn on the modal frame like every other sheet (WIN-77), so its
+ * state has to be visible to the painter, the click router and layout_natives —
+ * hence globals rather than locals inside form_dialog. At most one form is open:
+ * it runs a nested message loop, so a second one cannot start underneath it.
+ *
+ * The text fields are still native EDITs. They are children of the MAIN window
+ * now, positioned by layout_natives from rects the painter recorded, which is the
+ * same arrangement the sign-in card already uses successfully — the platform keeps
+ * caret, selection, IME and clipboard, and we stop shipping a grey GDI popup with
+ * a different font, different colours and a Windows 95 title bar. */
+#define FORM_MAX_FIELDS 6
+static int        g_form_open;                       /* a form is on the frame */
+/* What the last form returned, for the harness: a form's answer is consumed by its
+ * caller and leaves no trace on screen, so "Cancel did not commit" is otherwise
+ * unassertable. Diagnosis only. */
+static char       g_form_last[320];
+static int        g_form_done, g_form_result;         /* the nested loop's exit */
+static char       g_form_title[128];
+static oc_field  *g_form_f;                           /* the CALLER's array */
+static int        g_form_n;
+static HWND       g_form_edit[FORM_MAX_FIELDS];       /* FF_TEXT / FF_PASSWORD only */
+static D2D1_RECT_F g_form_erect[FORM_MAX_FIELDS];     /* where the painter put each */
+/* One hit-box per clickable non-text control: a checkbox, or one chip of a choice. */
+static struct { D2D1_RECT_F r; int field, val; } g_form_hits[FORM_MAX_FIELDS * 4];
+static int g_n_form_hits;
+
 /* The quick reactions offered inline by the message menu (WIN-28). Shortcodes,
  * not literals, because they are stored as a preference and a shortcode is what
  * a user can reasonably be asked to type; oc_emoji_by_name() resolves them
@@ -2704,13 +2730,30 @@ static void ovl_end(ID2D1RenderTarget *rt, D2D1_RECT_F body) {
 
 enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS };
 
-/* An overlay title bar; returns the region below it for the overlay body. */
-static D2D1_RECT_F overlay_header(ID2D1RenderTarget *rt, D2D1_RECT_F reg, const char *title) {
+/* A PANE title bar — Thread, Search, Pins, Storage, Audit, Webhooks, the DM picker.
+ *
+ * These are not modals. They fill the middle column, the rest of the app stays live
+ * beside them, and they used to wear modal furniture anyway: a right-aligned
+ * "Esc to close" caption in place of a control. A caption is not a close button. It
+ * told you a keystroke and then made you find it, while the obvious target — the ✕
+ * every other window in the OS puts there — did not exist. Esc still works and is
+ * listed in the shortcut sheet, where a keyboard fact belongs.
+ *
+ * The hit-box is a single global because at most one pane header is on screen: they
+ * all occupy the same column. */
+static D2D1_RECT_F g_pane_close;
+
+static D2D1_RECT_F pane_header(ID2D1RenderTarget *rt, D2D1_RECT_F reg, const char *title) {
     fill(rt, rf(reg.left, reg.top, reg.right, reg.top + 34), OC_COL_HEADER);
-    draw_text(rt, title, g_title, rf(reg.left + 20, reg.top, reg.right - 130, reg.top + 34), OC_COL_TEXT);
-    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    draw_text(rt, "Esc to close", g_meta, rf(reg.left + 20, reg.top, reg.right - 16, reg.top + 34), OC_COL_MUTED);
-    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+    draw_text(rt, title, g_title, rf(reg.left + 20, reg.top, reg.right - 60, reg.top + 34), OC_COL_TEXT);
+
+    g_pane_close = rf(reg.right - 42, reg.top + 5, reg.right - 18, reg.top + 29);
+    int hot = in_rect(g_pane_close, g_mouse_x, g_mouse_y);
+    if (hot) fill_round(rt, g_pane_close, 6.0f, OC_COL_HOVER);
+    IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, "\u2715", g_ui, g_pane_close, hot ? OC_COL_TEXT : OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+
     fill(rt, rf(reg.left, reg.top + 33, reg.right, reg.top + 34), OC_COL_BORDER);
     return rf(reg.left, reg.top + 34, reg.right, reg.bottom);
 }
@@ -2722,7 +2765,7 @@ static void overlay_empty(ID2D1RenderTarget *rt, D2D1_RECT_F body, const char *t
 }
 
 static void draw_thread(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
-    D2D1_RECT_F body = overlay_header(rt, reg, "Thread");
+    D2D1_RECT_F body = pane_header(rt, reg, "Thread");
     const oc_channel *pc = oc_model_channel((oc_model *)m, m->thread_channel);
     const oc_msg *parent = find_msg(pc, m->thread_parent);
     float top = body.top + 6;
@@ -2749,7 +2792,7 @@ static void draw_thread(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
 }
 
 static void draw_search(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
-    D2D1_RECT_F body = overlay_header(rt, reg, "Search");
+    D2D1_RECT_F body = pane_header(rt, reg, "Search");
     g_n_searchrows = 0;
 
     /* The query box lives IN the overlay (WIN-4), so refining a search never
@@ -2881,7 +2924,7 @@ static D2D1_RECT_F g_storage_refresh;
  * view). Two stacked titles, the inner one offering "Esc to close" for something
  * Esc does not close, is worse than no title. */
 static void draw_storage(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg, int embedded) {
-    D2D1_RECT_F body = embedded ? reg : overlay_header(rt, reg, "Storage usage");
+    D2D1_RECT_F body = embedded ? reg : pane_header(rt, reg, "Storage usage");
 
     g_storage_refresh = rf(body.right - 116, body.top + 8, body.right - 20, body.top + 36);
     fill_round(rt, g_storage_refresh, 6.0f, OC_COL_INPUT);
@@ -2933,7 +2976,7 @@ static const char *audit_family(uint8_t f) {
 }
 
 static void draw_audit(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg, int embedded) {
-    D2D1_RECT_F body = embedded ? reg : overlay_header(rt, reg, "Audit log");
+    D2D1_RECT_F body = embedded ? reg : pane_header(rt, reg, "Audit log");
     ovl_use(OVL_AUDIT);
     if (m->n_audit == 0) { overlay_empty(rt, body, "No audit entries."); return; }
 
@@ -2996,7 +3039,7 @@ static void draw_weblist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
     const oc_channel *c = oc_model_channel((oc_model *)m, m->weblist_channel);
     char title[160];
     snprintf(title, sizeof title, "Webhooks — %s", (c && c->name) ? c->name : "channel");
-    D2D1_RECT_F body = overlay_header(rt, reg, title);
+    D2D1_RECT_F body = pane_header(rt, reg, title);
     g_n_webrows = 0;
     g_n_webacts = 0;
     if (m->n_webhooks == 0) {
@@ -3117,8 +3160,8 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
         draw_text(rt, "Default for all channels", g_ui_b,
                   rf(body.left + 20, y0, body.right - 260, y0 + rowh0), OC_COL_TEXT);
         notify_chips(rt, body, y0, rowh0, 0, m->notify_default);
-        draw_text(rt, "Channels listed below override this.", g_micro,
-                  rf(body.left + 20, y0 + rowh0 - 14, body.right - 260, y0 + rowh0 + 2),
+        draw_text(rt, "Channels listed below override this.", g_meta,
+                  rf(body.left + 20, y0 + rowh0 - 16, body.right - 260, y0 + rowh0 + 4),
                   OC_COL_FAINT);
         fill(rt, rf(body.left + 20, y0 + rowh0 + 6, body.right - 20, y0 + rowh0 + 7), OC_COL_BORDER);
         body.top += rowh0 + 16;
@@ -5011,7 +5054,7 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
  * your place in the conversation. */
 static int modal_open(void) {
     return g_prefs_open || g_keys_open || g_wsmgr_open || g_notify_open ||
-           g_browse_open || g_confirm_open || g_sessions_open;
+           g_browse_open || g_confirm_open || g_sessions_open || g_form_open;
 }
 
 static D2D1_RECT_F g_modal_card;
@@ -5261,6 +5304,103 @@ static D2D1_RECT_F modal_frame(ID2D1RenderTarget *rt, const oc_modal_spec *s,
  * same description the painter used. */
 static const oc_modal_spec *modal_current(void);
 
+/* ---- the generic form, on the frame (WIN-77) -------------------------------
+ *
+ * Row heights are computed per field, so a one-field rename is not padded out to
+ * the size of a three-field sign-up. Checks and choices are drawn with the same
+ * chips the rest of the app uses rather than native BUTTONs: a radio button is
+ * fine, but two idioms on one card is what this whole item was about. */
+static float form_rowh(const oc_field *f) {
+    if (f->kind == FF_CHECK)  return 34;
+    if (f->kind == FF_CHOICE) return 54;
+    return (f->hint && f->hint[0]) ? 74.0f : 54.0f;
+}
+
+static void draw_form(ID2D1RenderTarget *rt, D2D1_RECT_F body) {
+    g_n_form_hits = 0;
+    if (!g_form_f) return;
+    float y = body.top + 4;
+    for (int i = 0; i < g_form_n; i++) {
+        const oc_field *f = &g_form_f[i];
+        float rh = form_rowh(f);
+        if (f->kind == FF_CHECK) {
+            D2D1_RECT_F box = rf(body.left, y + 4, body.left + 20, y + 24);
+            int on = atoi(f->value) != 0;
+            fill_round(rt, box, 4.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
+            if (!on) stroke_round(rt, box, 4.0f, OC_COL_BORDER, 1.0f);
+            if (on) {
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+                draw_text(rt, "\u2713", g_meta, box, 0xFFFFFF);
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+            }
+            draw_text(rt, f->label, g_ui, rf(body.left + 30, y + 2, body.right, y + 26), OC_COL_TEXT);
+            if (g_n_form_hits < (int)(sizeof g_form_hits / sizeof g_form_hits[0])) {
+                /* The label is part of the target: a 20px box is not a click. */
+                g_form_hits[g_n_form_hits].r = rf(body.left, y, body.right, y + 28);
+                g_form_hits[g_n_form_hits].field = i;
+                g_form_hits[g_n_form_hits].val = !on;
+                g_n_form_hits++;
+            }
+        } else if (f->kind == FF_CHOICE) {
+            draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + 20), OC_COL_TEXT);
+            int cur = atoi(f->value), k = 0;
+            float bx = body.left;
+            const char *p2 = f->hint ? f->hint : "";
+            while (*p2 && k < 4) {
+                char opt[48]; int oi = 0;
+                while (*p2 && *p2 != '|' && oi + 1 < (int)sizeof opt) opt[oi++] = *p2++;
+                opt[oi] = '\0';
+                if (*p2 == '|') p2++;
+                float bw = text_width(opt, g_meta) + 24;
+                D2D1_RECT_F b = rf(bx, y + 24, bx + bw, y + 52);
+                int on = (k == cur);
+                fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
+                if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+                draw_text(rt, opt, g_meta, rf(b.left, b.top + 4, b.right, b.bottom), on ? 0xFFFFFF : OC_COL_MUTED);
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+                if (g_n_form_hits < (int)(sizeof g_form_hits / sizeof g_form_hits[0])) {
+                    g_form_hits[g_n_form_hits].r = b;
+                    g_form_hits[g_n_form_hits].field = i;
+                    g_form_hits[g_n_form_hits].val = k;
+                    g_n_form_hits++;
+                }
+                bx = b.right + 8;
+                k++;
+            }
+        } else {
+            draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + 20), OC_COL_TEXT);
+            D2D1_RECT_F box = rf(body.left, y + 22, body.right, y + 50);
+            fill_round(rt, box, 6.0f, OC_COL_INPUT);
+            /* The focused field gets the accent ring, so tabbing is visible: the
+             * EDIT itself draws no border of ours. */
+            int focused = (g_form_edit[i] && GetFocus() == g_form_edit[i]);
+            stroke_round(rt, box, 6.0f, focused ? OC_COL_ACCENT : OC_COL_BORDER, focused ? 1.5f : 1.0f);
+            g_form_erect[i] = box;
+            if (f->hint && f->hint[0])
+                draw_text(rt, f->hint, g_meta, rf(body.left, y + 53, body.right, y + 73), OC_COL_FAINT);
+        }
+        y += rh;
+    }
+}
+
+/* Close the form: collect on OK, leave the caller's values alone on Cancel. Both
+ * paths go through modal_finish so ✕, the scrim, Esc and the footer cannot end up
+ * meaning three different things. */
+static void modal_finish(int save);              /* fwd */
+
+static void form_collect(int save) {
+    if (save && g_form_f)
+        for (int i = 0; i < g_form_n; i++) {
+            if (!g_form_edit[i]) continue;       /* checks/choices are written on click */
+            WCHAR w[256]; GetWindowTextW(g_form_edit[i], w, 256);
+            WideCharToMultiByte(CP_UTF8, 0, w, -1, g_form_f[i].value,
+                                (int)sizeof g_form_f[i].value, NULL, NULL);
+        }
+    g_form_result = save ? 1 : 0;
+    g_form_done = 1;
+}
+
 static void draw_browse(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F body);   /* fwd */
 static void draw_sessions(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F body); /* fwd */
 
@@ -5281,6 +5421,7 @@ static void draw_modal(ID2D1RenderTarget *rt, const oc_model *m, float W, float 
     else if (g_browse_open) draw_browse(rt, m, body);
     else if (g_confirm_open) draw_confirm(rt, body);
     else if (g_sessions_open) draw_sessions(rt, m, body);
+    else if (g_form_open)   draw_form(rt, body);
 }
 
 static void prefs_save(void);                    /* fwd */
@@ -5360,7 +5501,15 @@ static void notify_restore(void) {
 static const oc_modal_spec *modal_current(void) {
     static oc_modal_spec sp;
     memset(&sp, 0, sizeof sp);
-    if (g_confirm_open) {
+    if (g_form_open) {
+        /* A form is the one modal whose height depends on its content, so the size
+         * is chosen from the field count rather than fixed per surface. */
+        sp.title = g_form_title;
+        sp.size = (g_form_n > 3) ? MODAL_LG : MODAL_SM;
+        sp.buttons[0] = (oc_mbtn){ "Cancel", MB_NORMAL,  MODAL_CANCEL };
+        sp.buttons[1] = (oc_mbtn){ "OK",     MB_PRIMARY, MODAL_OK };
+        sp.n_buttons = 2;
+    } else if (g_confirm_open) {
         /* MODAL_SM with a danger primary: the one shape every destructive
          * confirmation shares, so none of them has to invent it. */
         sp.title = g_confirm_title;
@@ -5455,6 +5604,7 @@ static void modal_finish(int save) {
     const oc_modal_spec *s = modal_current();
     /* A confirmation's "commit" is its action. Handled here rather than through
      * spec->commit so the action can take the window handle. */
+    if (g_form_open) { form_collect(save); g_form_open = 0; }
     if (save && g_confirm_open) { g_confirm_open = 0; confirm_run(GetActiveWindow()); }
     if (save) { if (s->commit) s->commit(); }
     else      { if (s->restore) s->restore(); }
@@ -5558,6 +5708,17 @@ static void layout_natives(HWND hwnd) {
         } else {
             ShowWindow(g_pal_edit, SW_HIDE);
         }
+    }
+    /* The form's fields are part of the modal, so they do not consult `covered` —
+     * the modal IS what covers the window. Positioned inside the rect the painter
+     * recorded, inset so the box reads as the control's border. */
+    for (int i = 0; i < FORM_MAX_FIELDS; i++) {
+        if (!g_form_edit[i]) continue;
+        D2D1_RECT_F b = g_form_erect[i];
+        if (!g_form_open || b.right <= b.left) { ShowWindow(g_form_edit[i], SW_HIDE); continue; }
+        ShowWindow(g_form_edit[i], SW_SHOW);
+        MoveWindow(g_form_edit[i], PX(b.left + 9), PX(b.top + 5),
+                   PX(b.right - b.left - 18), PX(b.bottom - b.top - 10), TRUE);
     }
     if (g_pick_edit) {
         if (g_pick_open && !covered) {
@@ -5886,7 +6047,7 @@ static struct { D2D1_RECT_F r; uint64_t uid; } g_pickrows[256];
 static int g_n_pickrows;
 
 static void draw_dm_compose(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
-    D2D1_RECT_F body = overlay_header(rt, reg, "New direct message");
+    D2D1_RECT_F body = pane_header(rt, reg, "New direct message");
     g_n_pickrows = 0;
     float y = body.top + 8;
     for (size_t i = 0; i < m->n_users && y < body.bottom; i++) {
@@ -7662,6 +7823,20 @@ static int on_click(HWND hwnd, int x, int y) {
      * three cannot disagree. */
     if (modal_frame_click(hwnd, x, y)) return 1;
     if (g_lightbox) { g_lightbox = 0; return 1; }   /* any click dismisses it */
+    /* A pane's ✕ (WIN-77). One test for every pane, because there is one header:
+     * they all occupy the middle column and only one can be up. Gated on a pane
+     * ACTUALLY being open so a stale rect from the last one cannot swallow a click
+     * in the transcript. */
+    {
+        const oc_model *pm = model();
+        if ((g_dm_compose || (pm && any_overlay(pm))) && in_rect(g_pane_close, x, y)) {
+            if (g_dm_compose) g_dm_compose = 0;
+            else              close_overlays();
+            layout_composer(hwnd);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 1;
+        }
+    }
     if (g_pal_open) {
         for (int i = 0; i < g_n_pal_rows; i++)
             if (in_rect(g_pal_rows[i].r, x, y)) { g_pal_sel = i; palette_accept(hwnd); return 1; }
@@ -7781,6 +7956,23 @@ static int on_click(HWND hwnd, int x, int y) {
                 }
                 return 1;
             }
+    }
+    if (g_form_open) {
+        for (int i = 0; i < g_n_form_hits; i++)
+            if (in_rect(g_form_hits[i].r, x, y)) {
+                snprintf(g_form_f[g_form_hits[i].field].value,
+                         sizeof g_form_f[g_form_hits[i].field].value, "%d", g_form_hits[i].val);
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 1;
+            }
+        /* Clicking a field's box focuses it — the EDIT itself is only as tall as
+         * its text, and the visible target is the rounded box behind it. */
+        for (int i = 0; i < g_form_n; i++)
+            if (g_form_edit[i] && in_rect(g_form_erect[i], x, y)) {
+                SetFocus(g_form_edit[i]);
+                return 1;
+            }
+        if (in_rect(g_modal_card, x, y)) return 1;
     }
     if (g_prefs_open) {
         for (int i = 0; i < g_n_pref_hits; i++) {
@@ -8938,17 +9130,20 @@ static void lg_set_font(HWND w) {
     SendMessageW(w, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
 }
 
-static int  g_pr_result, g_pr_done;
-
-static LRESULT CALLBACK prompt_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-    case WM_COMMAND:
-        if (LOWORD(wp) == IDOK)     { g_pr_result = 1; g_pr_done = 1; return 0; }
-        if (LOWORD(wp) == IDCANCEL) { g_pr_result = 0; g_pr_done = 1; return 0; }
-        return 0;
-    case WM_CLOSE: g_pr_result = 0; g_pr_done = 1; return 0;
-    default: return DefWindowProcW(hwnd, msg, wp, lp);
-    }
+/* The form fields' font: the UI token at the UI family, so a native EDIT sitting
+ * on our card is not the one control in the app wearing the stock shell font
+ * (ARCH-97 — the platform owns the family, we own the scale). Rebuilt whenever the
+ * scale changes, which is why it is a function and not a one-shot global. */
+static HFONT g_form_font;
+static float g_form_font_scale;
+static HFONT form_font(void) {
+    if (g_form_font && g_form_font_scale == g_text_scale) return g_form_font;
+    if (g_form_font) DeleteObject(g_form_font);
+    g_form_font_scale = g_text_scale;
+    g_form_font = CreateFontW(-PX(FONT_UI * g_text_scale), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, ui_family());
+    return g_form_font;
 }
 
 /* ---- generic multi-field modal form (WIN-21) ------------------------------
@@ -8957,136 +9152,103 @@ static LRESULT CALLBACK prompt_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
  * string parsed with sscanf. One form definition with typed fields replaces the
  * lot: each caller describes its fields and gets them back validated.
  *
- * Deliberately still native Win32 controls rather than D2D chrome — these are
- * short-lived modals, and the platform's own focus, tab order and IME handling
- * are worth more here than matching the shell's palette. */
-/* oc_field / FF_* are declared near the top of the file so earlier code can
- * build forms; form_dialog() itself lives here. */
+ * It used to be a native GDI popup — its own window class, its own message loop,
+ * STATIC labels, BUTTONs, a WS_CAPTION title bar and the stock shell font. The
+ * reasoning was that the platform's focus, tab order and IME handling were worth
+ * more than matching the palette. Half of that holds: the TEXT FIELDS are still
+ * native EDITs and always will be. The chrome around them was never worth it —
+ * sixteen call sites meant sixteen grey Windows-95 boxes in the middle of a themed
+ * app, none of them dismissible the way every other sheet is, none of them
+ * screenshot-comparable, none of them reachable by the harness.
+ *
+ * So the frame is ours and the fields are the platform's.
+ *
+ * oc_field / FF_* are declared near the top of the file so earlier code can build
+ * forms; form_dialog() itself lives here. */
 
-#define FORM_MAX_FIELDS 6
-static HWND g_ff_ctl[FORM_MAX_FIELDS][4];   /* per field: up to 4 controls (choice radios) */
 
-/* Returns 1 on OK with every field's `value` updated, 0 on Cancel. */
+/* Returns 1 on OK with every field's `value` updated, 0 on Cancel.
+ *
+ * Synchronous, by a nested message loop, because all sixteen callers read the
+ * answer on the next line — `if (form_dialog(...)) oc_client_set_topic(...)`.
+ * Turning that into a callback per site was the alternative and it buys nothing:
+ * the loop is the same one the old GDI popup ran, and it already ran from inside
+ * on_click, so re-entrancy here is not new. What IS new is that the sheet is the
+ * app's own modal frame, so Esc, Enter, ✕, the scrim, the footer and the snapshot
+ * rule all come from the same place as every other modal. */
+/* Esc and Enter belong to the FRAME, but a single-line EDIT eats both, and the
+ * key never reaches the message loop when it is sent straight to the focused
+ * child — which is what a real keystroke does once the caret is in a field, and
+ * what the harness's `key` verb does deliberately. So the field itself answers
+ * them, the same way the composer's proc does. This was found by the smoke: Esc
+ * and Enter were dead in the one modal where you are always typing. */
+static WNDPROC g_form_edit_prev;
+
+static LRESULT CALLBACK form_edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_KEYDOWN && g_form_open) {
+        if (wp == VK_RETURN) { modal_finish(1); return 0; }
+        if (wp == VK_ESCAPE) { modal_finish(0); return 0; }
+    }
+    /* A lone Enter in a single-line EDIT otherwise beeps through WM_CHAR. */
+    if (msg == WM_CHAR && (wp == '\r' || wp == 27)) return 0;
+    return CallWindowProcW(g_form_edit_prev, hwnd, msg, wp, lp);
+}
+
 static int form_dialog(HWND owner, const char *title, oc_field *f, int n) {
+    if (!owner || !f || n <= 0) return 0;
     if (n > FORM_MAX_FIELDS) n = FORM_MAX_FIELDS;
+    if (g_form_open) return 0;              /* one at a time; see the header */
+
     HINSTANCE inst = GetModuleHandleW(NULL);
-    static int registered;
-    if (!registered) {
-        WNDCLASSW wc; memset(&wc, 0, sizeof wc);
-        wc.lpfnWndProc = prompt_proc; wc.hInstance = inst;
-        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-        wc.lpszClassName = L"OcForm";
-        RegisterClassW(&wc); registered = 1;
-    }
+    g_form_f = f; g_form_n = n;
+    snprintf(g_form_title, sizeof g_form_title, "%s", title ? title : "");
+    memset(g_form_edit, 0, sizeof g_form_edit);
+    for (int i = 0; i < FORM_MAX_FIELDS; i++) g_form_erect[i] = rf(0, 0, 0, 0);
 
-    /* Height is computed from the fields, so a two-field form is not padded out
-     * to the size of a six-field one. */
-    int y = 16, W = 420;
-    int rowh[FORM_MAX_FIELDS];
+    /* Create the EDITs hidden and unpositioned: the painter has not run yet, so
+     * nobody knows where they go. layout_natives moves and shows them from the
+     * rects the first paint records — the same order the composer follows. */
     for (int i = 0; i < n; i++) {
-        rowh[i] = (f[i].kind == FF_CHECK) ? 30 : (f[i].hint && f[i].hint[0] && f[i].kind != FF_CHOICE ? 68 : 52);
-        y += rowh[i];
-    }
-    int H = y + 54 + 40;
-
-    WCHAR wt[128]; to_w(title, wt, 128);
-    RECT orc; GetWindowRect(owner, &orc);
-    int sx = orc.left + ((orc.right - orc.left) - W) / 2;
-    int sy = orc.top + ((orc.bottom - orc.top) - H) / 2;
-    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"OcForm", wt,
-        WS_POPUP | WS_CAPTION | WS_SYSMENU, sx, sy, W, H, owner, NULL, inst, NULL);
-    if (!dlg) return 0;
-
-    memset(g_ff_ctl, 0, sizeof g_ff_ctl);
-    y = 12;
-    for (int i = 0; i < n; i++) {
-        WCHAR wl[192]; to_w(f[i].label, wl, 192);
-        if (f[i].kind == FF_CHECK) {
-            HWND c = CreateWindowExW(0, L"BUTTON", wl,
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                18, y + 4, W - 50, 22, dlg, NULL, inst, NULL);
-            lg_set_font(c);
-            SendMessageW(c, BM_SETCHECK, atoi(f[i].value) ? BST_CHECKED : BST_UNCHECKED, 0);
-            g_ff_ctl[i][0] = c;
-        } else if (f[i].kind == FF_CHOICE) {
-            HWND s2 = CreateWindowExW(0, L"STATIC", wl, WS_CHILD | WS_VISIBLE,
-                                      18, y, W - 50, 18, dlg, NULL, inst, NULL);
-            lg_set_font(s2);
-            int cur = atoi(f[i].value), k = 0, x = 18;
-            const char *p2 = f[i].hint ? f[i].hint : "";
-            while (*p2 && k < 4) {
-                char opt[48]; int oi = 0;
-                while (*p2 && *p2 != '|' && oi + 1 < (int)sizeof opt) opt[oi++] = *p2++;
-                opt[oi] = 0;
-                if (*p2 == '|') p2++;
-                WCHAR wo[48]; to_w(opt, wo, 48);
-                HWND rb = CreateWindowExW(0, L"BUTTON", wo,
-                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON | (k == 0 ? WS_GROUP : 0),
-                    x, y + 20, 130, 22, dlg, NULL, inst, NULL);
-                lg_set_font(rb);
-                if (k == cur) SendMessageW(rb, BM_SETCHECK, BST_CHECKED, 0);
-                g_ff_ctl[i][k] = rb;
-                x += 135; k++;
-            }
-        } else {
-            HWND s2 = CreateWindowExW(0, L"STATIC", wl, WS_CHILD | WS_VISIBLE,
-                                      18, y, W - 50, 18, dlg, NULL, inst, NULL);
-            lg_set_font(s2);
-            WCHAR wv[192]; to_w(f[i].value, wv, 192);
-            HWND e = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", wv,
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL |
-                (f[i].kind == FF_PASSWORD ? ES_PASSWORD : 0),
-                18, y + 20, W - 54, 24, dlg, NULL, inst, NULL);
-            lg_set_font(e);
-            g_ff_ctl[i][0] = e;
-            if (f[i].hint && f[i].hint[0]) {
-                WCHAR wh[192]; to_w(f[i].hint, wh, 192);
-                HWND h2 = CreateWindowExW(0, L"STATIC", wh, WS_CHILD | WS_VISIBLE,
-                                          18, y + 46, W - 50, 18, dlg, NULL, inst, NULL);
-                lg_set_font(h2);
-            }
+        if (f[i].kind != FF_TEXT && f[i].kind != FF_PASSWORD) continue;
+        WCHAR wv[256]; to_w(f[i].value, wv, 256);
+        g_form_edit[i] = CreateWindowExW(0, L"EDIT", wv,
+            WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL |
+            (f[i].kind == FF_PASSWORD ? ES_PASSWORD : 0),
+            0, 0, 10, 10, owner, NULL, inst, NULL);
+        if (g_form_edit[i]) {
+            SendMessageW(g_form_edit[i], EM_SETLIMITTEXT, sizeof f[i].value - 1, 0);
+            HFONT ff = form_font();
+            if (ff) SendMessageW(g_form_edit[i], WM_SETFONT, (WPARAM)ff, TRUE);
+            else    lg_set_font(g_form_edit[i]);
+            g_form_edit_prev = (WNDPROC)SetWindowLongPtrW(g_form_edit[i], GWLP_WNDPROC,
+                                                          (LONG_PTR)form_edit_proc);
         }
-        y += rowh[i];
     }
 
-    HWND ok = CreateWindowExW(0, L"BUTTON", L"OK",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, W - 200, y + 8, 84, 28,
-        dlg, (HMENU)IDOK, inst, NULL);
-    HWND cancel = CreateWindowExW(0, L"BUTTON", L"Cancel",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP, W - 108, y + 8, 84, 28, dlg, (HMENU)IDCANCEL, inst, NULL);
-    lg_set_font(ok); lg_set_font(cancel);
-
-    EnableWindow(owner, FALSE);
-    ShowWindow(dlg, SW_SHOW);
-    if (g_ff_ctl[0][0]) { SetFocus(g_ff_ctl[0][0]); SendMessageW(g_ff_ctl[0][0], EM_SETSEL, 0, -1); }
-    g_pr_result = -1; g_pr_done = 0;
+    g_form_done = 0; g_form_result = 0;
+    modal_enter(owner, &g_form_open);      /* paints once, so the rects exist */
+    layout_natives(owner);
+    for (int i = 0; i < n; i++)
+        if (g_form_edit[i]) { SetFocus(g_form_edit[i]); SendMessageW(g_form_edit[i], EM_SETSEL, 0, -1); break; }
 
     MSG m;
-    while (!g_pr_done && GetMessageW(&m, NULL, 0, 0) > 0)
-        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
-
-    if (g_pr_result == 1) {
-        for (int i = 0; i < n; i++) {
-            if (f[i].kind == FF_CHECK) {
-                snprintf(f[i].value, sizeof f[i].value, "%d",
-                         SendMessageW(g_ff_ctl[i][0], BM_GETCHECK, 0, 0) == BST_CHECKED);
-            } else if (f[i].kind == FF_CHOICE) {
-                int pick = 0;
-                for (int k = 0; k < 4; k++)
-                    if (g_ff_ctl[i][k] && SendMessageW(g_ff_ctl[i][k], BM_GETCHECK, 0, 0) == BST_CHECKED)
-                        pick = k;
-                snprintf(f[i].value, sizeof f[i].value, "%d", pick);
-            } else {
-                WCHAR w[192]; GetWindowTextW(g_ff_ctl[i][0], w, 192);
-                WideCharToMultiByte(CP_UTF8, 0, w, -1, f[i].value, (int)sizeof f[i].value, NULL, NULL);
-            }
-        }
+    while (!g_form_done && GetMessageW(&m, NULL, 0, 0) > 0) {
+        /* Enter and Esc are handled by the fields themselves (form_edit_proc) and by
+         * modal_key when focus is elsewhere, so the loop does not second-guess them.
+         * Tab between the fields: the dialog manager skips hidden and disabled
+         * children, and everything else of ours is hidden while a modal is up. */
+        if (IsDialogMessageW(owner, &m)) continue;
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
     }
-    EnableWindow(owner, TRUE);
-    SetForegroundWindow(owner);
-    if (IsWindow(dlg)) DestroyWindow(dlg);
-    return g_pr_result == 1;
+
+    for (int i = 0; i < n; i++)
+        if (g_form_edit[i]) { DestroyWindow(g_form_edit[i]); g_form_edit[i] = NULL; }
+    g_form_f = NULL; g_form_n = 0;
+    SetFocus(owner);
+    layout_natives(owner);
+    InvalidateRect(owner, NULL, FALSE);
+    return g_form_result;
 }
 
 static void copy_to_clipboard(HWND hwnd, const char *utf8);   /* fwd */
@@ -9895,8 +10057,25 @@ static void test_dump(const char *path) {
             g_prefs_open ? "prefs" : g_keys_open ? "keys" :
             g_wsmgr_open ? "wsmgr" : g_notify_open ? "notify" :
             g_browse_open ? "browse" : g_confirm_open ? "confirm" :
-            g_sessions_open ? "sessions" : "none",
+            g_sessions_open ? "sessions" : g_form_open ? "form" : "none",
             oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep, g_pref_notify);
+    /* The form's shape and its values, so a driven form is checkable: its EDITs
+     * are native children and a screenshot of one proves only that it is there. */
+    fprintf(f, "paneclose=%.0f,%.0f,%.0f,%.0f\n", g_pane_close.left, g_pane_close.top,
+            g_pane_close.right, g_pane_close.bottom);
+    fprintf(f, "form=%d nfields=%d title=\"%s\" last=%s\n",
+            g_form_open, g_form_n, g_form_title, g_form_last[0] ? g_form_last : "none");
+    for (int i = 0; i < g_form_n && g_form_f; i++) {
+        char cur[256]; snprintf(cur, sizeof cur, "%s", g_form_f[i].value);
+        if (g_form_edit[i]) {
+            WCHAR w[256]; GetWindowTextW(g_form_edit[i], w, 256);
+            WideCharToMultiByte(CP_UTF8, 0, w, -1, cur, (int)sizeof cur, NULL, NULL);
+        }
+        fprintf(f, "  formfield %d kind=%d edit=%d r=%.0f,%.0f,%.0f,%.0f value=\"%s\"\n",
+                i, g_form_f[i].kind, g_form_edit[i] ? 1 : 0,
+                g_form_erect[i].left, g_form_erect[i].top,
+                g_form_erect[i].right, g_form_erect[i].bottom, cur);
+    }
     fprintf(f, "workspaces=%d active=%d elsewhere=%d\n", g_n_wss, g_ws_active, ws_unread_elsewhere());
     for (int i = 0; i < g_n_wss; i++) {
         int u = 0;
@@ -10167,6 +10346,29 @@ static void test_poll(HWND hwnd) {
         menu_dispatch(hwnd, atoi(arg)); test_ack("ok");
     } else if (!strcmp(verb, "profile")) {
         close_overlays(); g_profile_uid = strtoull(arg, NULL, 10); g_view = VIEW_HOME; test_ack("ok");
+    } else if (!strcmp(verb, "form")) {
+        /* Drive the generic form (WIN-77). The ack goes FIRST, because the form runs
+         * a nested message loop: acking afterwards would make the harness wait for a
+         * dialog it has not been told about yet, which is the trap the `menu` verb
+         * documents above. The OUTCOME lands in the dump instead. */
+        test_ack("ok");
+        {
+            static const char *TITLES[3] = { "Test form", "Test form", "Test form" };
+            oc_field f[3] = {
+                { FF_TEXT,   "Text",   "A hint under the field.", "" },
+                { FF_CHECK,  "A checkbox", "", "" },
+                { FF_CHOICE, "A choice", "One|Two|Three", "" },
+            };
+            int nf = arg[0] ? atoi(arg) : 3;
+            if (nf < 1) nf = 1;
+            if (nf > 3) nf = 3;
+            snprintf(f[0].value, sizeof f[0].value, "initial");
+            snprintf(f[1].value, sizeof f[1].value, "0");
+            snprintf(f[2].value, sizeof f[2].value, "1");
+            int okp = form_dialog(hwnd, TITLES[0], f, nf);
+            snprintf(g_form_last, sizeof g_form_last, "%s text=\"%s\" check=%s choice=%s",
+                     okp ? "ok" : "cancel", f[0].value, f[1].value, f[2].value);
+        }
     } else if (!strcmp(verb, "prefs")) {
         modal_enter(hwnd, &g_prefs_open); test_ack("ok");
     } else if (!strcmp(verb, "theme")) {

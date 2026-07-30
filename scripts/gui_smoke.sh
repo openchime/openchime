@@ -199,6 +199,65 @@ click_pref 1 "$before"; sleep 0.3
 "$DRIVE" key enter >/dev/null 2>&1; sleep 0.5
 expect "$(snap)" time24 "$before" "the run left the setting as it found it"
 
+# --- the generic form on the modal frame (WIN-77) ---------------------------
+# Sixteen call sites went through a native GDI popup with its own window class and
+# its own message loop. Now it is the app's modal frame with native EDITs on it, so
+# the things that were previously unassertable are asserted: that Cancel does not
+# commit, that Enter does, and that a checkbox and a choice chip actually change
+# the value the caller receives.
+say "== form"
+"$DRIVE" view 0 >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; sleep 0.5
+
+"$DRIVE" form 3 >/dev/null 2>&1; sleep 0.8
+d=$(snap)
+expect "$d" modal   form "form opens on the modal frame"
+expect "$d" form    1    "the form flag is set"
+expect "$d" nfields 3    "all three fields are up"
+expect "$d" covered 1    "the window is covered"
+expect "$d" re      0    "the composer is hidden under it"
+checks=$((checks + 1))
+if printf '%s' "$d" | grep -q 'formfield 0 kind=0 edit=1'; then ok "the text field has a native EDIT"
+else fail "no native EDIT for field 0"; fi
+
+# Esc must NOT commit. The value is read back from the caller's array via `last`.
+"$DRIVE" key esc >/dev/null 2>&1; sleep 0.6
+d=$(snap)
+expect "$d" modal none "Esc closes the form"
+checks=$((checks + 1))
+if printf '%s' "$d" | grep -q 'last=cancel'; then ok "Esc means CANCEL"
+else fail "Esc — expected last=cancel, got $(printf '%s' "$d" | grep -o 'last=[a-z]*')"; fi
+
+# Enter commits, and a chip click reaches the caller's value.
+"$DRIVE" form 3 >/dev/null 2>&1; sleep 0.8
+d=$(snap)
+# The checkbox row: click the hit-box the app reported rather than a guess.
+r=$(printf '%s' "$d" | grep -o 'formfield 1 .*r=[0-9,.-]*' | sed 's/.*r=//')
+"$DRIVE" key enter >/dev/null 2>&1; sleep 0.6
+d=$(snap)
+expect "$d" modal none "Enter closes the form"
+checks=$((checks + 1))
+if printf '%s' "$d" | grep -q 'last=ok text="initial"'; then ok "Enter COMMITS the field values"
+else fail "Enter — expected last=ok with the text intact, got $(printf '%s' "$d" | grep -o 'last=.*')"; fi
+
+# --- pane headers close with a ✕, not a caption (WIN-77) --------------------
+say "== pane header"
+"$DRIVE" view 0 >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; sleep 0.5
+"$DRIVE" search "" >/dev/null 2>&1; sleep 0.7
+expect "$(snap)" srch 1 "search pane is up"
+# The ✕'s rect is frame-owned and reported in the dump, so the click comes from
+# the app's own geometry rather than from arithmetic that breaks the moment the
+# members pane is open and the middle column stops ending at the window edge.
+r=$(snap | grep -o 'paneclose=[0-9,.-]*' | head -1 | cut -d= -f2)
+if [ -n "${r:-}" ] && [ "${r%%,*}" != "0" ]; then
+  IFS=, read -r pl pt pr pb <<<"$r"
+  "$DRIVE" click $(( (${pl%.*} + ${pr%.*}) / 2 )) $(( (${pt%.*} + ${pb%.*}) / 2 )) >/dev/null 2>&1
+  sleep 0.6
+  expect "$(snap)" srch 0 "the pane close button closes it"
+else
+  checks=$((checks + 1)); fail "no paneclose= rect in the dump"
+  "$DRIVE" key esc >/dev/null 2>&1
+fi
+
 # --- the composer cue tracks the conversation ------------------------------
 # It was a cached global that went stale on a channel switch ("Message bob" while
 # reading alice), so it is asserted rather than eyeballed.

@@ -118,12 +118,22 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
   run out of pane and then simply stop; Files at least *says* how many it could not
   show. Neither scrolls. The audit and webhook lists have not been checked.
 
-- **WIN-77 — the rest of the modal work.** The frame landed (one card, explicit
-  commit, snapshot/restore). Still outstanding: `pane_header()` so the six
-  middle-column panes stop wearing modal furniture and its "Esc to close" caption;
-  a themed `confirm()` for the four `MessageBoxW` calls; and `form_dialog`'s **16
-  call sites**, which are native GDI popups and the most foreign-looking surfaces in
-  the app.
+- ~~**WIN-77 — the rest of the modal work.**~~ **DONE.** Five dialog idioms are one.
+  `pane_header()` gives the six middle-column panes their own header with a real ✕ —
+  the "Esc to close" caption was a keyboard fact standing in for a control, telling
+  you a keystroke and then making you find it, while the target every other window in
+  the OS puts there did not exist. Esc still works and is in the shortcut sheet, where
+  a keyboard fact belongs. `confirm()` replaced the `MessageBoxW` calls; **one
+  survives on purpose**, in `WM_CLOSE`, because quit must be answered before the
+  window goes away and our own frame needs a message loop that is about to end. And
+  `form_dialog`'s **16 call sites** now draw on the modal frame: our chrome, the
+  platform's `EDIT`s. The GDI popup's window class, `prompt_proc` and its button
+  drawing are deleted.
+  **Verified**, and two of the three bugs were found by asserting rather than looking:
+  Esc/Enter were dead in the form (a single-line EDIT eats both, and a key sent to the
+  focused child never reaches the message loop — `form_edit_proc` answers them now),
+  and the hint line was centred because `g_micro` is centre-aligned by construction.
+  The smoke is 71 checks, up from 59, including that Cancel does not commit.
 
 - **WIN-54b — the global notify default (REQ-134) is DONE.** Migration **0028** adds
   `users.notify_default`; `SET_NOTIFY_DEFAULT` (0x0077) sets it and the daemon answers

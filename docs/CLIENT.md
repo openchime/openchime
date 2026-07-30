@@ -552,7 +552,16 @@ rule and the button row; a caller draws only content and decides none of that.
 Before it there were **five** dialog idioms in one product: four D2D cards each
 computing its own geometry, six middle-column panes borrowing the modal header
 (including its "Esc to close" caption, which is not a modal concept), sixteen
-native GDI popups and four MessageBoxes.
+native GDI popups and four MessageBoxes. All five are now one:
+
+- the four cards are `oc_modal_spec`s,
+- the six panes use **`pane_header()`** instead — its own header with a real ✕ and
+  no modal furniture, because a pane is not a modal: it fills the middle column and
+  the rest of the app stays live beside it,
+- the sixteen GDI popups are `form_dialog()` **on the frame** (below),
+- and the MessageBoxes are `confirm()`. Exactly one native message box survives, in
+  `WM_CLOSE`: quit has to be answered before the window goes away, and our own
+  frame needs a message loop that is about to end.
 
 **Explicit commit, never live-apply.** A form modal declares `snapshot`/`restore`
 and the frame copies its values on open, so `Save` commits and `Cancel`/`✕`/`Esc`
@@ -567,6 +576,37 @@ button. Where the setting lives on the SERVER — per-channel notification level
 `restore` re-sends the snapshot rather than writing a local, and only for rows
 that actually changed.
 
+### `form_dialog()` — our frame, the platform's fields
+
+`form_dialog(owner, title, fields, n)` is the generic typed form (`FF_TEXT`,
+`FF_PASSWORD`, `FF_CHECK`, `FF_CHOICE`) behind sixteen call sites — topics, renames,
+webhooks, invites, the DND window, quick reactions, sign-up. It used to be a native
+popup with its own window class, STATIC labels, BUTTONs, a `WS_CAPTION` title bar
+and the stock shell font. The justification was that the platform's focus, tab order
+and IME handling beat matching the palette — and **half of that still holds**:
+
+- the **text fields are native `EDIT`s** and always will be, so caret, selection,
+  IME, clipboard and undo remain the platform's problem, not ours;
+- the **chrome is ours**, because sixteen grey Windows-95 boxes in the middle of a
+  themed app were never worth it — and none of them was dismissible the way every
+  other sheet is, screenshot-comparable, or reachable by the harness.
+
+The fields are children of the **main** window, positioned by `layout_natives()`
+from rects the painter recorded — the arrangement the sign-in card already uses.
+Two consequences worth knowing before touching it:
+
+- **The form's EDITs do not consult `window_is_covered()`.** They are part of the
+  modal; the modal is what covers the window.
+- **Esc and Enter are answered by the field**, in `form_edit_proc`. A single-line
+  EDIT eats both, and a key sent straight to the focused child never reaches the
+  message loop — so handling them in the loop left the frame's
+  Enter-commits/Esc-cancels dead in the one modal where you are always typing. The
+  smoke caught that.
+
+It stays **synchronous**, by a nested message loop, because all sixteen callers read
+the answer on the next line. That loop is the one the old popup ran and it already
+ran from inside `on_click`, so the re-entrancy is not new.
+
 **Two rules the frame cannot enforce for you:**
 
 - **Open through `modal_enter()`**, so the snapshot is always taken and the
@@ -580,12 +620,13 @@ that actually changed.
 
 ## Run the GUI smoke before pushing Win32 chrome
 
-`scripts/gui_smoke.sh` asserts **45 invariants** through the test hook: for each of
+`scripts/gui_smoke.sh` asserts **71 invariants** through the test hook: for each of
 the six views, what is in the second column (`sidebar_kind`), whether the middle
 one is typeable (`main_is_conversation`), which native children are shown, and
 whether anything covers the window — plus the search overlay, the Pins tab, the
-Preferences modal, the command palette, and that the composer cue names the open
-conversation.
+Preferences modal, the command palette, the generic form (including that Esc does
+**not** commit and Enter does), a pane header's ✕, and that the composer cue names
+the open conversation.
 
 Every one of those is a boolean, and booleans belong in a script. Three bugs
 reached the user in a day for want of this (WIN-70, WIN-71's regression, WIN-72),
