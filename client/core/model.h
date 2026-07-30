@@ -86,6 +86,11 @@ typedef struct {
     uint8_t  is_public;        /* 1 public, 0 private/DM (REQ-031) */
     uint64_t peer_id;          /* DM: the other participant (for the title) */
     uint8_t  notify_level;     /* OC_NOTIFY_ALL/_MENTIONS/_NONE (REQ-130) */
+    /* Muted (REQ-137, WIN-40) — NOT the same as level=NONE. Level decides whether
+     * the daemon notifies; muted also de-emphasises the row and suppresses its
+     * unread badge, so a conversation can be quiet but still countable, or
+     * countable but silent. */
+    uint8_t  muted;
     /* Per-member read cursors (REQ-090 seen-by): the highest message id each
      * member has read in this channel. Advance-only; drives "seen by …". */
     oc_read_cursor_view *readers;

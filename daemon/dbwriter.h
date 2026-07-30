@@ -86,7 +86,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* Invite management (REQ-026, WIN-46) and webhook lifecycle (WIN-48). Both
         * read/write tables that already had the columns; only the ops were missing. */
        OC_JOB_LIST_INVITES = 54, OC_JOB_REVOKE_INVITE = 55,
-       OC_JOB_SET_WEBHOOK_STATE = 56, OC_JOB_ROTATE_WEBHOOK = 57 };
+       OC_JOB_SET_WEBHOOK_STATE = 56, OC_JOB_ROTATE_WEBHOOK = 57,
+       /* Mute (REQ-137) and mark-unread (REQ-235). The latter is deliberately NOT
+        * OC_JOB_CLIENT_ACK: that one may only advance. */
+       OC_JOB_SET_MUTE = 58, OC_JOB_SET_READ_CURSOR = 59 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -321,7 +324,7 @@ typedef struct {
 } oc_channel_row;
 
 /* One row in a NOTIFY_PREFS result (REQ-130): a channel and its level. */
-typedef struct { uint64_t channel_id; uint8_t level; } oc_notify_pref_row;
+typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; } oc_notify_pref_row;
 
 /* One row in a CLIENT_SETTINGS result: a synced key/value. */
 typedef struct { char *key; char *value; } oc_client_setting_row;

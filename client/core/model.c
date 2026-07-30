@@ -1007,7 +1007,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         break;
     case OC_EV_NOTIFY_PREF: {
         oc_channel *c = oc_model_channel(m, e->channel_id);
-        if (c) c->notify_level = e->op;
+        if (c) { c->notify_level = e->op; c->muted = e->status; }
         break;
     }
     case OC_EV_SETTINGS_BEGIN:

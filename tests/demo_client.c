@@ -88,7 +88,10 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
 
 static int do_handshake(client *c) {
     uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-    oc_hello h = { 1, 1, oc_slice_str("demo") };
+    /* min = max = OC_PROTOCOL_VERSION, like every real peer (shared/protocol.h). A
+     * literal here is the same bug that broke the e2e client on the last bump and CI
+     * with it — the two other tools carried it too. */
+    oc_hello h = { OC_PROTOCOL_VERSION, OC_PROTOCOL_VERSION, oc_slice_str("demo") };
     if (oc_encode_hello(&w, &h) != OC_OK || write_all(&c->conn, buf, w.len) != 0) return -1;
     oc_header hdr; oc_rbuf p;
     if (read_frame(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_WELCOME) return -1;

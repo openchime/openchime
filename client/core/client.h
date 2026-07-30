@@ -217,6 +217,9 @@ void oc_client_list_invites(oc_client *c);
 void oc_client_revoke_invite(oc_client *c, uint64_t invite_id);
 void oc_client_set_webhook_state(oc_client *c, uint64_t webhook_id, int disabled);
 void oc_client_rotate_webhook(oc_client *c, uint64_t webhook_id);
+/* Mute a conversation (REQ-137) and mark it unread from a message (REQ-235). */
+void oc_client_set_mute(oc_client *c, uint64_t channel_id, int muted);
+void oc_client_set_read_cursor(oc_client *c, uint64_t channel_id, uint64_t message_id);
 
 /* Attachments (REQ-140/141). Upload a local file and post it to `channel_id`
  * (the core streams it, then links it into a message); download an attachment by

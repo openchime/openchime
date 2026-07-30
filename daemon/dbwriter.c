@@ -3431,7 +3431,8 @@ static void build_notify_prefs(sqlite3 *db, uint64_t user_id, oc_dbres *r) {
     sqlite3_finalize(st);
 
     sqlite3_prepare_v2(db,
-        "SELECT channel_id, level FROM notification_prefs WHERE user_id=? ORDER BY channel_id LIMIT ?;",
+        "SELECT channel_id, level, muted FROM notification_prefs WHERE user_id=? "
+        "ORDER BY channel_id LIMIT ?;",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)user_id);
     sqlite3_bind_int(st, 2, (int)OC_MAX_NOTIFY_PREFS);
@@ -3441,6 +3442,7 @@ static void build_notify_prefs(sqlite3 *db, uint64_t user_id, oc_dbres *r) {
         if (r->n_nprefs == cap) { cap *= 2; oc_notify_pref_row *g = realloc(r->nprefs, cap * sizeof *g); if (!g) break; r->nprefs = g; }
         r->nprefs[r->n_nprefs].channel_id = (uint64_t)sqlite3_column_int64(st, 0);
         r->nprefs[r->n_nprefs].level = (uint8_t)sqlite3_column_int(st, 1);
+        r->nprefs[r->n_nprefs].muted = (uint8_t)sqlite3_column_int(st, 2);
         r->n_nprefs++;
     }
     sqlite3_finalize(st);
@@ -3457,8 +3459,12 @@ static oc_dbres *process_set_notify_pref(sqlite3 *db, const oc_job *j) {
         r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; r->user_id = j->user_id; return r;
     }
     sqlite3_stmt *st = NULL;
+    /* UPSERT on the level ALONE, not INSERT OR REPLACE: replacing the row would
+     * reset `muted` to its default every time somebody changed the level, silently
+     * un-muting a conversation as a side effect of an unrelated setting (WIN-40). */
     sqlite3_prepare_v2(db,
-        "INSERT OR REPLACE INTO notification_prefs(user_id, channel_id, level) VALUES(?, ?, ?);",
+        "INSERT INTO notification_prefs(user_id, channel_id, level) VALUES(?1, ?2, ?3) "
+        "ON CONFLICT(user_id, channel_id) DO UPDATE SET level=excluded.level;",
         -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
@@ -3467,6 +3473,76 @@ static oc_dbres *process_set_notify_pref(sqlite3 *db, const oc_job *j) {
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) { r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_INTERNAL; r->user_id = j->user_id; return r; }
     build_notify_prefs(db, j->user_id, r);
+    return r;
+}
+
+/* Mute a conversation (REQ-137, WIN-40). Distinct from level=none: this one also
+ * de-emphasises the row and suppresses its badge, which the client does from the
+ * flag. Same upsert discipline as the level above — touch one column. */
+static oc_dbres *process_set_mute(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    if (!channel_read_access(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; r->user_id = j->user_id; return r;
+    }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO notification_prefs(user_id, channel_id, level, muted) "
+        "VALUES(?1, ?2, 0, ?3) "
+        "ON CONFLICT(user_id, channel_id) DO UPDATE SET muted=excluded.muted;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int  (st, 3, j->hook_disabled ? 1 : 0);   /* reused: the mute flag */
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_INTERNAL;
+                             r->user_id = j->user_id; return r; }
+    r->type = OC_RES_NOTIFY_PREFS;
+    r->user_id = j->user_id;
+    build_notify_prefs(db, j->user_id, r);
+    return r;
+}
+
+/* Mark unread (REQ-235, WIN-52): set the read cursor DELIBERATELY, including
+ * backwards, which the ack path must never do.
+ *
+ * process_client_ack upserts MAX(message_id, excluded.message_id) so a replayed ack
+ * cannot rewind anyone's cursor — a correctness property, not an oversight. This op
+ * exists precisely so marking unread does not require relaxing it.
+ *
+ * message_id 0 means "all unread": the cursor goes to 0 rather than being deleted, so
+ * the row keeps existing and the unread count query has something to compare against.
+ */
+static oc_dbres *process_set_read_cursor(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->channel_id = j->channel_id;
+    if (!channel_read_access(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; r->user_id = j->user_id; return r;
+    }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO delivery_cursors(user_id,channel_id,message_id,updated_at_ms) "
+        "VALUES(?1,?2,?3,?4) ON CONFLICT(user_id,channel_id) DO UPDATE SET "
+        "message_id=excluded.message_id, updated_at_ms=excluded.updated_at_ms;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->message_id);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_INTERNAL;
+                             r->user_id = j->user_id; return r; }
+    /* Answer with the channel list so the client's unread badge is recomputed by the
+     * SERVER rather than guessed locally — the count is a query over messages, and
+     * two implementations of it would drift. */
+    r->type = OC_RES_READ_CURSOR;
+    r->user_id = j->user_id;
+    r->message_id = j->message_id;
     return r;
 }
 
@@ -3954,6 +4030,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_WEBHOOK_POST)    return process_webhook_post(w->db, j);
     if (j->type == OC_JOB_DELETE_WEBHOOK)  return process_delete_webhook(w->db, j);
     if (j->type == OC_JOB_SET_NOTIFY_PREF) return process_set_notify_pref(w->db, j);
+    if (j->type == OC_JOB_SET_MUTE)        return process_set_mute(w->db, j);
+    if (j->type == OC_JOB_SET_READ_CURSOR) return process_set_read_cursor(w->db, j);
     if (j->type == OC_JOB_SET_DND)         return process_set_dnd(w->db, j);
     if (j->type == OC_JOB_REGISTER_DEVICE_TOKEN)   return process_register_device_token(w->db, j);
     if (j->type == OC_JOB_UNREGISTER_DEVICE_TOKEN) return process_unregister_device_token(w->db, j);

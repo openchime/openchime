@@ -1133,6 +1133,26 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_MUTE) {
+            oc_set_mute sm;
+            if (oc_decode_set_mute(&p, &sm) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_MUTE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->channel_id = sm.channel_id;
+            j->hook_disabled = sm.muted;      /* the flag field, reused */
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_READ_CURSOR) {
+            oc_set_read_cursor sc;
+            if (oc_decode_set_read_cursor(&p, &sc) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_READ_CURSOR, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->channel_id = sc.channel_id;
+            j->message_id = sc.message_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SET_WEBHOOK_STATE) {
             oc_set_webhook_state sw;
             if (oc_decode_set_webhook_state(&p, &sw) != OC_OK) return -1;
@@ -2520,6 +2540,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         for (size_t i = 0; i < r->n_nprefs && n < OC_MAX_NOTIFY_PREFS; i++) {
             ents[n].channel_id = r->nprefs[i].channel_id;
             ents[n].level = r->nprefs[i].level;
+            ents[n].muted = r->nprefs[i].muted;      /* WIN-40 */
             n++;
         }
         oc_notify_prefs np = { r->np_dnd_enabled, r->np_dnd_start_min, r->np_dnd_end_min, n, ents };

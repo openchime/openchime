@@ -38,7 +38,7 @@
  * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
  * preview_author. Shipping client and daemon together (ARCH-61) means there is
  * no compatibility window to preserve — only a mismatch to detect loudly. */
-#define OC_PROTOCOL_VERSION 2u
+#define OC_PROTOCOL_VERSION 3u
 
 /* Transport conventions (see PROTOCOL.md §1). The binary protocol shares TLS
  * port 443 with the future HTTP/webhook surface, demultiplexed by ALPN: a
@@ -119,6 +119,12 @@ typedef enum {
      * could set it. **Reveal is impossible and deliberately absent**: only the
      * token's SHA-256 is stored, so a lost token can be rotated but never shown
      * again — the UI has to say so rather than offer a button that cannot work. */
+    /* Mute (REQ-137, WIN-40) and mark-unread (REQ-235, WIN-52). SET_READ_CURSOR is
+     * deliberately NOT the ack path: CLIENT_ACK only ever advances (the daemon takes
+     * MAX), because a replayed ack must not rewind anyone's cursor. Marking unread is
+     * an explicit act and gets an explicit op. */
+    OC_MSG_SET_MUTE           = 0x006D, /* C->S, mute/unmute a conversation */
+    OC_MSG_SET_READ_CURSOR    = 0x006E, /* C->S, set the cursor (may move BACK) */
     OC_MSG_SET_WEBHOOK_STATE  = 0x006B, /* C->S, enable/disable one */
     OC_MSG_ROTATE_WEBHOOK     = 0x006C, /* C->S, mint a new token for it */
     /* Saved items + activity feed (REQ-231/139, ARCH-95). 0x0060-0x0061 are
@@ -546,6 +552,9 @@ typedef struct { uint16_t count; const oc_webhook_list_entry *entries; } oc_webh
  * shown-once frame CREATE uses, because it is the same situation. */
 typedef struct { uint64_t webhook_id; uint8_t disabled; } oc_set_webhook_state;
 typedef struct { uint64_t webhook_id; } oc_rotate_webhook;
+/* WIN-40 / WIN-52. `message_id` 0 in SET_READ_CURSOR means "everything unread". */
+typedef struct { uint64_t channel_id; uint8_t muted; } oc_set_mute;
+typedef struct { uint64_t channel_id; uint64_t message_id; } oc_set_read_cursor;
 typedef struct { uint64_t webhook_id; } oc_delete_webhook;
 typedef struct { uint64_t webhook_id; } oc_webhook_deleted;
 typedef struct { uint8_t status; } oc_set_presence;
@@ -562,7 +571,11 @@ typedef struct { uint8_t enabled; uint16_t start_min; uint16_t end_min; } oc_set
 #define OC_DEVICE_TOKEN_MAX 512u
 typedef struct { uint8_t platform; oc_slice token; } oc_register_device_token;
 typedef struct { uint8_t ok; uint16_t code; } oc_device_token_ack;
-typedef struct { uint64_t channel_id; uint8_t level; } oc_notify_pref_entry;
+/* `muted` appended per entry — which IS a layout change, not a compatible one: this
+ * is a repeated list, so an extra byte per entry shifts every entry after the first.
+ * My first note here claimed otherwise. Hence the bump to protocol 3, which WIN-38's
+ * search cursor needs regardless. */
+typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; } oc_notify_pref_entry;
 typedef struct { uint8_t dnd_enabled; uint16_t dnd_start_min; uint16_t dnd_end_min;
                  uint16_t count; const oc_notify_pref_entry *entries; } oc_notify_prefs;
 /* Synced client settings bucket (the daemon-side layer of the client config). */
@@ -743,6 +756,8 @@ oc_result oc_encode_webhook_list(oc_wbuf *w, uint16_t version, const oc_webhook_
 oc_result oc_encode_delete_webhook(oc_wbuf *w, uint16_t version, const oc_delete_webhook *m);
 oc_result oc_encode_set_webhook_state(oc_wbuf *w, uint16_t version, const oc_set_webhook_state *m);
 oc_result oc_encode_rotate_webhook(oc_wbuf *w, uint16_t version, const oc_rotate_webhook *m);
+oc_result oc_encode_set_mute(oc_wbuf *w, uint16_t version, const oc_set_mute *m);
+oc_result oc_encode_set_read_cursor(oc_wbuf *w, uint16_t version, const oc_set_read_cursor *m);
 oc_result oc_encode_list_invites(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_invite_list(oc_wbuf *w, uint16_t version, const oc_invite_list *m);
 oc_result oc_encode_revoke_invite(oc_wbuf *w, uint16_t version, const oc_revoke_invite *m);
@@ -870,6 +885,8 @@ oc_result oc_decode_create_webhook(oc_rbuf *p, oc_create_webhook *m);
 oc_result oc_decode_webhook_info(oc_rbuf *p, oc_webhook_info *m);
 oc_result oc_decode_set_webhook_state(oc_rbuf *p, oc_set_webhook_state *m);
 oc_result oc_decode_rotate_webhook(oc_rbuf *p, oc_rotate_webhook *m);
+oc_result oc_decode_set_mute(oc_rbuf *p, oc_set_mute *m);
+oc_result oc_decode_set_read_cursor(oc_rbuf *p, oc_set_read_cursor *m);
 oc_result oc_decode_invite_list(oc_rbuf *p, oc_invite_entry *entries, uint16_t cap, uint16_t *out_count);
 oc_result oc_decode_revoke_invite(oc_rbuf *p, oc_revoke_invite *m);
 oc_result oc_decode_invite_revoked(oc_rbuf *p, oc_revoke_invite *m);

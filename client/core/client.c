@@ -550,6 +550,29 @@ void oc_client_rotate_webhook(oc_client *c, uint64_t webhook_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+/* Mute (REQ-137, WIN-40). Independent of the notification level: the daemon keeps
+ * them in separate columns for the same reason. */
+void oc_client_set_mute(oc_client *c, uint64_t channel_id, int muted) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_MUTE);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->op = muted ? 1 : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* Mark unread (REQ-235, WIN-52). `message_id` is where reading resumes; 0 marks the
+ * whole conversation unread. Deliberately not oc_client_mark_read's path, which may
+ * only ever advance the cursor. */
+void oc_client_set_read_cursor(oc_client *c, uint64_t channel_id, uint64_t message_id) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_READ_CURSOR);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = message_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_upload(oc_client *c, uint64_t channel_id, const char *path) {
     if (!c || !channel_id || !path || !path[0]) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_UPLOAD);

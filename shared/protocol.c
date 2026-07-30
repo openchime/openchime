@@ -791,6 +791,7 @@ oc_result oc_encode_notify_prefs(oc_wbuf *w, uint16_t version, const oc_notify_p
     for (uint16_t i = 0; i < m->count; i++) {
         oc_w_u64(w, m->entries[i].channel_id);
         oc_w_u8(w, m->entries[i].level);
+        oc_w_u8(w, m->entries[i].muted);
     }
     return oc_frame_end(w, off);
 }
@@ -859,7 +860,9 @@ oc_result oc_decode_notify_prefs(oc_rbuf *p, oc_notify_pref_entry *entries, uint
     for (uint16_t i = 0; i < count && !p->underflow; i++) {
         uint64_t cid = oc_r_u64(p);
         uint8_t level = oc_r_u8(p);
-        if (i < cap) { entries[i].channel_id = cid; entries[i].level = level; }
+        uint8_t muted = oc_r_u8(p);
+        if (i < cap) { entries[i].channel_id = cid; entries[i].level = level;
+                       entries[i].muted = muted; }
     }
     return r_done(p);
 }
@@ -2160,5 +2163,33 @@ oc_result oc_encode_invite_revoked(oc_wbuf *w, uint16_t version, const oc_revoke
 
 oc_result oc_decode_invite_revoked(oc_rbuf *p, oc_revoke_invite *m) {
     m->invite_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+/* Mute (REQ-137, WIN-40) and mark-unread (REQ-235, WIN-52). */
+
+oc_result oc_encode_set_mute(oc_wbuf *w, uint16_t version, const oc_set_mute *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_MUTE);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u8(w, m->muted);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_mute(oc_rbuf *p, oc_set_mute *m) {
+    m->channel_id = oc_r_u64(p);
+    m->muted      = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_set_read_cursor(oc_wbuf *w, uint16_t version, const oc_set_read_cursor *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_READ_CURSOR);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->message_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_read_cursor(oc_rbuf *p, oc_set_read_cursor *m) {
+    m->channel_id = oc_r_u64(p);
+    m->message_id = oc_r_u64(p);
     return r_done(p);
 }

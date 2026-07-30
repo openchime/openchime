@@ -1968,7 +1968,14 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
             }
         } else {
             int selected = (r->channel_id == g_sel);
-            int unread = r->unread > 0;
+            /* MUTED (REQ-137, WIN-40): the row de-emphasises and its badge goes.
+             * This is what makes mute different from notification level "none" —
+             * level silences the notification, mute also stops the conversation
+             * competing for attention in the list. The unread COUNT still exists
+             * server-side; it is simply not shouted here. */
+            const oc_channel *rc = oc_model_channel((oc_model *)m, r->channel_id);
+            int muted = rc && rc->muted;
+            int unread = (r->unread > 0) && !muted;
             if (selected) fill_round(rt, rf(sx0, ry + 2, sx1, ry + ROW_H - 2), 6.0f, OC_COL_SELECT);
             if (r->section == OC_SB_DMS) {
                 /* A person gets an avatar and a presence dot, not an "@" glyph —
@@ -1989,7 +1996,8 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                 draw_text(rt, mark, g_ui, rf(sx0 + 12, ry, sx0 + 34, ry + ROW_H),
                           selected ? OC_COL_TEXT : OC_COL_FAINT);
             }
-            uint32_t fg = (selected || unread) ? OC_COL_TEXT : OC_COL_MUTED;
+            uint32_t fg = muted ? OC_COL_FAINT
+                        : (selected || unread) ? OC_COL_TEXT : OC_COL_MUTED;
             draw_text(rt, r->label, unread ? g_ui_b : g_ui,
                       rf(sx0 + 34, ry, sx1 - 44, ry + ROW_H), fg);
             if (r->is_self) {
@@ -7111,6 +7119,10 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, float cx, 
     /* A pin belongs to the channel, so this reads the same for everyone — anyone
      * may unpin, including someone else's pin (ARCH-90). */
     if (!msg->deleted) mi_item(103, msg->pinned ? "Unpin from channel" : "Pin to channel");
+    /* "Unread from here" rather than "mark unread": it names what actually happens —
+     * the read cursor moves to just BEFORE this message, so this one and everything
+     * after it are unread (REQ-235). */
+    mi_item(107, "Unread from here");
     mi_item(106, "Forward\u2026");
     mi_item(105, "Copy link");
     mi_item(104, "Save for later");
@@ -7193,6 +7205,23 @@ static void msg_menu_run(HWND hwnd, int cmd) {
                  (unsigned long long)chan, (unsigned long long)mid);
         copy_to_clipboard(hwnd, link);
         toast_push("Link copied.", 0);
+    } else if (cmd == 107) {
+        /* The cursor is exclusive — it names the last message READ — so marking this
+         * message unread means setting it to the id before it. Not mid - 1: ids are
+         * not dense, so we walk to the actual previous message and use 0 when this is
+         * the first, which marks the whole conversation unread. */
+        uint64_t prev = 0;
+        if (c) for (size_t i = 0; i < c->n_msgs; i++) {
+            if (c->msgs[i].message_id == mid) break;
+            prev = c->msgs[i].message_id;
+        }
+        oc_client_set_read_cursor(g_client, chan, prev);
+        /* Then ask the SERVER for the counts. The unread badge is a query over
+         * messages (process_list_channels computes it), and recomputing it here would
+         * be a second implementation of the same rule — the kind that drifts. One
+         * extra round trip buys a number that cannot disagree with the daemon's. */
+        oc_client_list_channels(g_client);
+        toast_push("Marked unread.", 0);
     } else if (cmd == 106) {
         /* The palette picks the destination: it already lists every conversation
          * with a filter, so a forward needs no picker of its own (WIN-51). */
@@ -9369,6 +9398,7 @@ static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, float 
     } else {
         mi_item(30, oc_sidebar_is_starred(&g_sb, cid) ? "Remove from Starred"
                                                       : "Add to Starred");
+        mi_item(31, c->muted ? "Unmute" : "Mute");
         mi_item(2, "Mark as read");
         /* Notification levels FLATTENED out of a submenu (WIN-79), with the current
          * one ticked — the same reasoning as the member role: the useful part of a
@@ -9414,6 +9444,10 @@ static void channel_menu_run(HWND hwnd, int cmd) {
     uint64_t cid = g_menu_target;
     if (!m || !cid) return;
     switch (cmd) {
+    case 31: {                                 /* WIN-40 */
+        const oc_channel *mc = oc_model_channel((oc_model *)m, cid);
+        oc_client_set_mute(g_client, cid, mc && mc->muted ? 0 : 1);
+        break; }
     case 30:                                   /* WIN-41 */
         if (oc_sidebar_toggle_star(&g_sb, cid)) sidebar_opts_save();
         else toast_push("Starred is full (32).", 1);

@@ -512,6 +512,24 @@ static const char MIGRATION_0025[] =
      * nothing more. */
     "ALTER TABLE users ADD COLUMN activity_seen_ms INTEGER NOT NULL DEFAULT 0;";
 
+static const char MIGRATION_0026[] =
+    /* Mute (REQ-137, WIN-40) is NOT the same as notification level "none", which is
+     * why it needs a column of its own rather than a fourth level. `level` decides
+     * whether the daemon NOTIFIES you; mute additionally de-emphasises the row and
+     * suppresses its unread badge. Slack keeps them separate for the same reason: you
+     * can want a channel quiet but still countable, or countable but silent. */
+    "ALTER TABLE notification_prefs ADD COLUMN muted INTEGER NOT NULL DEFAULT 0 "
+    "  CHECK (muted IN (0,1));"
+
+    /* Mark-unread (REQ-235, WIN-52). The read cursor is monotonic BY CONSTRUCTION —
+     * process_client_ack upserts MAX(message_id, excluded.message_id) — because a
+     * replayed ack must never be able to move it backwards. That is a correctness
+     * property worth keeping, so marking unread cannot reuse the ack path; it gets
+     * its own op which sets the cursor deliberately. No schema change is needed for
+     * the cursor itself; this index is what makes "unread from here" cheap to
+     * recompute afterwards. */
+    "CREATE INDEX IF NOT EXISTS idx_cursors_user ON delivery_cursors(user_id, channel_id);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -538,6 +556,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 23, MIGRATION_0023 },
     { 24, MIGRATION_0024 },
     { 25, MIGRATION_0025 },
+    { 26, MIGRATION_0026 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

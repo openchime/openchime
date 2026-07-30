@@ -181,6 +181,9 @@ enum {
     OC_CMD_REVOKE_INVITE,
     OC_CMD_SET_WEBHOOK_STATE,
     OC_CMD_ROTATE_WEBHOOK,
+    /* WIN-40 / WIN-52: channel_id + op (muted), and channel_id + message_id. */
+    OC_CMD_SET_MUTE,
+    OC_CMD_SET_READ_CURSOR,
     OC_CMD_UPLOAD,          /* upload+post a file to `channel_id`: body = local path */
     OC_CMD_DOWNLOAD,        /* download an attachment: message_id = attachment_id, body = dest path */
     OC_CMD_LOGOUT,          /* revoke this session (op = scope) and close the connection */

@@ -763,6 +763,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (!e) continue;
                 e->channel_id = ne[i].channel_id;
                 e->op = ne[i].level;
+                e->status = ne[i].muted;      /* WIN-40: distinct from the level */
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_CLIENT_SETTINGS) {
@@ -1532,6 +1533,18 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_rotate_webhook rw = { c->message_id };
                 if (oc_encode_rotate_webhook(&w, OC_PROTOCOL_VERSION, &rw) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_MUTE) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_mute sm = { c->channel_id, c->op };
+                if (oc_encode_set_mute(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_READ_CURSOR) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_read_cursor sc = { c->channel_id, c->message_id };
+                if (oc_encode_set_read_cursor(&w, OC_PROTOCOL_VERSION, &sc) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_UPLOAD && c->body) {
