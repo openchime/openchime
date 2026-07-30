@@ -80,6 +80,29 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 
 ### The items added 2026-07-30, in detail
 
+- ~~**WIN-54d — custom emoji (REQ-072).**~~ **DONE.** Migration **0029** (`custom_emoji`:
+  name primary key, attachment id, creator), three ops — `ADD_EMOJI` / `DELETE_EMOJI` /
+  `LIST_EMOJI` (0x007A–0x007C) answering `EMOJI_LIST` (0x007D) — and the catalogue is
+  **fanned to everyone** on any change: an emoji only half the workspace knows about is
+  one they cannot use, and a deleted one they would render as a broken image.
+  The image is an attachment, as an avatar is, so upload/caps/dedup/reclamation are the
+  existing paths — **including the reclaim exclusion**, which is the trap avatars just
+  taught us: an emoji's image is referenced by no message and would have been swept as
+  an orphan.
+  A duplicate name is **refused**, never an upsert: replacing the image changes what
+  every message already containing that shortcode means. Deleting is the creator or an
+  admin for the same reason.
+  In the client: `draw_emoji_fmt` tries the custom path first, so **every** surface that
+  draws an emoji — reaction chips, the picker, the reactor list — gets images with one
+  test; the workspace's own emoji sort FIRST in the picker, because burying them under
+  1800 standard glyphs makes the ones this workspace invented unfindable; and in a
+  message body the shortcode's range is drawn with a **transparent brush** and the image
+  painted over its hit-tested rect. **Accepted limitation:** the run keeps the
+  shortcode's width, so a short emoji sits in symmetric spacing — closing that needs an
+  `IDWriteInlineObject` per emoji. The text staying in the layout is deliberate, too: a
+  copied message yields `:shipit:`, which is what was typed and what another client can
+  render.
+
 - ~~**WIN-54c — group DMs (REQ-056).**~~ **DONE.** A group DM is a **DM with more than
   two participants**: the same `kind`, the same `dm_key` identity (the sorted
   participant ids under a unique index), the same membership and read-access code. So

@@ -140,7 +140,11 @@ typedef enum {
      * NOTIFY_PREFS frame back, so a client learns it with the rest. */
     OC_MSG_SET_NOTIFY_DEFAULT = 0x0077,
     OC_MSG_SET_AVATAR         = 0x0078, /* C->S, my avatar attachment id (WIN-47) */
-    OC_MSG_OPEN_GROUP_DM      = 0x0079, /* C->S, open/create a group DM (REQ-056) */ /* C->S */
+    OC_MSG_OPEN_GROUP_DM      = 0x0079, /* C->S, open/create a group DM (REQ-056) */
+    OC_MSG_ADD_EMOJI          = 0x007A, /* C->S, name + attachment id (REQ-072) */
+    OC_MSG_DELETE_EMOJI       = 0x007B, /* C->S, name */
+    OC_MSG_LIST_EMOJI         = 0x007C, /* C->S, ask for the catalogue */
+    OC_MSG_EMOJI_LIST         = 0x007D, /* S->C, the catalogue (also a push) */ /* C->S */
     OC_MSG_LIST_SESSIONS      = 0x0075, /* C->S */
     OC_MSG_SESSION_LIST       = 0x0076, /* S->C, never the tokens */
     OC_MSG_LIST_FILE_CHANNELS = 0x0073, /* C->S */
@@ -599,6 +603,16 @@ typedef struct { oc_slice title; oc_slice timezone; } oc_set_profile;
  * store all keep working. 0 clears the avatar. */
 typedef struct { uint64_t attachment_id; } oc_set_avatar;
 typedef struct { uint16_t count; uint64_t user_ids[OC_MAX_GROUP_DM]; } oc_open_group_dm;
+/* Custom emoji (REQ-072). The image is an attachment id for the same reason an
+ * avatar is: the store already handles upload, caps, dedup and reclamation. The
+ * NAME is the identity — `:shipit:` must mean one image workspace-wide, or every
+ * message containing it is ambiguous. */
+#define OC_EMOJI_NAME_MAX 48u
+#define OC_MAX_CUSTOM_EMOJI 512u
+typedef struct { oc_slice name; uint64_t attachment_id; } oc_add_emoji;
+typedef struct { oc_slice name; } oc_delete_emoji;
+typedef struct { oc_slice name; uint64_t attachment_id; uint64_t created_by; } oc_emoji_entry;
+typedef struct { uint16_t count; const oc_emoji_entry *entries; } oc_emoji_list;
 typedef struct { uint64_t user_id; oc_slice display_name; oc_slice email;
                  oc_slice status_emoji; oc_slice status_text; uint64_t status_expires;
                  oc_slice title; oc_slice timezone; uint64_t avatar_id;
@@ -843,9 +857,17 @@ oc_result oc_encode_rotate_webhook(oc_wbuf *w, uint16_t version, const oc_rotate
 oc_result oc_encode_set_notify_default(oc_wbuf *w, uint16_t version, const oc_set_notify_default *m);
 oc_result oc_encode_set_avatar(oc_wbuf *w, uint16_t version, const oc_set_avatar *m);
 oc_result oc_encode_open_group_dm(oc_wbuf *w, uint16_t version, const oc_open_group_dm *m);
+oc_result oc_encode_add_emoji(oc_wbuf *w, uint16_t version, const oc_add_emoji *m);
+oc_result oc_encode_delete_emoji(oc_wbuf *w, uint16_t version, const oc_delete_emoji *m);
+oc_result oc_encode_list_emoji(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_emoji_list(oc_wbuf *w, uint16_t version, const oc_emoji_list *m);
 oc_result oc_decode_set_notify_default(oc_rbuf *p, oc_set_notify_default *m);
 oc_result oc_decode_set_avatar(oc_rbuf *p, oc_set_avatar *m);
 oc_result oc_decode_open_group_dm(oc_rbuf *p, oc_open_group_dm *m);
+oc_result oc_decode_add_emoji(oc_rbuf *p, oc_add_emoji *m);
+oc_result oc_decode_delete_emoji(oc_rbuf *p, oc_delete_emoji *m);
+oc_result oc_decode_list_emoji(oc_rbuf *p);
+oc_result oc_decode_emoji_list(oc_rbuf *p, oc_emoji_entry *entries, uint16_t cap, uint16_t *out_count);
 oc_result oc_encode_list_sessions(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_session_list(oc_wbuf *w, uint16_t version, const oc_session_list *m);
 oc_result oc_decode_session_list(oc_rbuf *p, oc_session_entry *entries, uint16_t cap,

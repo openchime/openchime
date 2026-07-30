@@ -2019,6 +2019,135 @@ static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* Custom emoji (REQ-072).
+ *
+ * The catalogue is small and is answered whole: a partial one means a message whose
+ * emoji renders on one client and not another, which is worse than a slightly larger
+ * frame. The name is the identity (`:shipit:` must mean one image workspace-wide),
+ * lowercased and validated here rather than trusted — a name with a colon in it would
+ * be unparseable in a message body, and one with an uppercase letter would make
+ * `:Shipit:` and `:shipit:` two different emoji.
+ */
+static int emoji_name_ok(const char *n, char *out, size_t cap) {
+    if (!n || !n[0]) return 0;
+    size_t at = 0;
+    for (const char *p = n; *p; p++) {
+        char c = *p;
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        int ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '+';
+        if (!ok) return 0;
+        if (at + 1 >= cap) return 0;
+        out[at++] = c;
+    }
+    out[at] = '\0';
+    return at > 0;
+}
+
+static void build_emoji_list(sqlite3 *db, oc_dbres *r) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT name, attachment_id, created_by FROM custom_emoji ORDER BY name LIMIT ?;",
+        -1, &st, NULL);
+    sqlite3_bind_int(st, 1, (int)OC_MAX_CUSTOM_EMOJI);
+    size_t cap = 16, n = 0;
+    oc_emoji_row *arr = malloc(cap * sizeof *arr);
+    while (arr && sqlite3_step(st) == SQLITE_ROW) {
+        if (n == cap) { cap *= 2; oc_emoji_row *g = realloc(arr, cap * sizeof *arr); if (!g) break; arr = g; }
+        arr[n].name          = strdup((const char *)sqlite3_column_text(st, 0));
+        arr[n].attachment_id = (uint64_t)sqlite3_column_int64(st, 1);
+        arr[n].created_by    = (uint64_t)sqlite3_column_int64(st, 2);
+        n++;
+    }
+    sqlite3_finalize(st);
+    r->elist = arr;
+    r->n_elist = n;
+    r->type = OC_RES_EMOJI_LIST;
+}
+
+static oc_dbres *process_list_emoji(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    build_emoji_list(db, r);
+    return r;
+}
+
+static oc_dbres *process_add_emoji(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->user_id = j->user_id;
+
+    char name[OC_EMOJI_NAME_MAX];
+    if (!emoji_name_ok(j->ch_name, name, sizeof name)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_MALFORMED_FRAME; return r;
+    }
+    /* The image must exist, be finalized, be an image, and be one THIS user
+     * uploaded — the same rule as an avatar (WIN-47) and for the same reason: an
+     * emoji is readable workspace-wide, so the id has to be one the setter was
+     * entitled to. */
+    sqlite3_stmt *ck = NULL;
+    int ok = 0;
+    sqlite3_prepare_v2(db,
+        "SELECT 1 FROM attachments WHERE id=?1 AND uploader_id=?2 "
+        "  AND size > 0 AND mime LIKE 'image/%';", -1, &ck, NULL);
+    sqlite3_bind_int64(ck, 1, (sqlite3_int64)j->message_id);
+    sqlite3_bind_int64(ck, 2, (sqlite3_int64)j->user_id);
+    ok = (sqlite3_step(ck) == SQLITE_ROW);
+    sqlite3_finalize(ck);
+    if (!ok) { r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_UNKNOWN_ATTACHMENT; return r; }
+
+    sqlite3_stmt *st = NULL;
+    /* INSERT, not upsert: silently replacing an existing emoji changes what every
+     * message already containing that shortcode means. Renaming is delete then add,
+     * which is a decision somebody makes on purpose. */
+    sqlite3_prepare_v2(db,
+        "INSERT INTO custom_emoji(name, attachment_id, created_by, created_at_ms) "
+        "VALUES(?1, ?2, ?3, ?4);", -1, &st, NULL);
+    sqlite3_bind_text (st, 1, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->message_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_CHANNEL_EXISTS; return r;
+    }
+    build_emoji_list(db, r);
+    r->ch_fanout = 1;          /* everyone's picker should learn about it */
+    return r;
+}
+
+static oc_dbres *process_delete_emoji(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->user_id = j->user_id;
+    char name[OC_EMOJI_NAME_MAX];
+    if (!emoji_name_ok(j->ch_name, name, sizeof name)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_MALFORMED_FRAME; return r;
+    }
+    /* The creator or an admin. A shortcode is workspace-wide, so letting anyone
+     * delete one lets anyone break every message that used it. */
+    uint8_t role = OC_ROLE_MEMBER;
+    user_role(db, j->user_id, &role);
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "DELETE FROM custom_emoji WHERE name=?1 AND (?2 = 1 OR created_by=?3);",
+        -1, &st, NULL);
+    sqlite3_bind_text (st, 1, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int  (st, 2, role >= OC_ROLE_ADMIN ? 1 : 0);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (sqlite3_changes(db) == 0) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    build_emoji_list(db, r);
+    r->ch_fanout = 1;
+    return r;
+}
+
 /* A GROUP DM (REQ-056).
  *
  * Deliberately NOT a new `channels.kind`. A group DM is a DM with more than two
@@ -4411,6 +4540,7 @@ static int is_read_job(int type) {
             * list. Its three siblings — revoke, set-state, rotate — write. */
            type == OC_JOB_LIST_INVITES || type == OC_JOB_GET_PROFILE ||
            type == OC_JOB_LIST_FILE_CHANNELS || type == OC_JOB_LIST_SESSIONS ||
+           type == OC_JOB_LIST_EMOJI ||
            type == OC_JOB_LIST_CLIENT_SETTINGS ||
            type == OC_JOB_CALL_AUTH ||
            type == OC_JOB_STORAGE_STATUS ||
@@ -4439,6 +4569,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_GET_PROFILE)    return process_get_profile(rdb, j);
     if (j->type == OC_JOB_LIST_FILE_CHANNELS) return process_list_file_channels(rdb, j);
     if (j->type == OC_JOB_LIST_SESSIONS)  return process_list_sessions(rdb, j);
+    if (j->type == OC_JOB_LIST_EMOJI)     return process_list_emoji(rdb, j);
     if (j->type == OC_JOB_LIST_NOTIFY_PREFS) return process_list_notify_prefs(rdb, j);
     if (j->type == OC_JOB_LIST_CLIENT_SETTINGS) return process_list_client_settings(rdb, j);
     if (j->type == OC_JOB_CALL_AUTH)      return process_call_auth(rdb, j);
@@ -4463,6 +4594,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_REMOVE_CHANNEL) return process_remove_channel(w->db, j);
     if (j->type == OC_JOB_OPEN_DM)        return process_open_dm(w->db, j);
     if (j->type == OC_JOB_OPEN_GROUP_DM) return process_open_group_dm(w->db, j);
+    if (j->type == OC_JOB_ADD_EMOJI)      return process_add_emoji(w->db, j);
+    if (j->type == OC_JOB_DELETE_EMOJI)   return process_delete_emoji(w->db, j);
     if (j->type == OC_JOB_INVITE_USER)    return process_invite_user(w->db, j);
     if (j->type == OC_JOB_REMOVE_USER)    return process_remove_user(w->db, j);
     if (j->type == OC_JOB_REDEEM)         return process_redeem(w, j);
@@ -4698,6 +4831,7 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
              * from `messages`. */
             "  AND id NOT IN (SELECT avatar_attachment_id FROM users "
             "                  WHERE avatar_attachment_id IS NOT NULL) "
+            "  AND id NOT IN (SELECT attachment_id FROM custom_emoji) "
             "ORDER BY created_at_ms ASC LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
         uint64_t cutoff = (now > j->maint_grace_ms) ? now - j->maint_grace_ms : 0;
         sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
@@ -4719,6 +4853,9 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
                 "WHERE reclaimed_at_ms = 0 AND created_at_ms < ?1 "
                 "  AND id NOT IN (SELECT avatar_attachment_id FROM users "
                 "                  WHERE avatar_attachment_id IS NOT NULL) "
+                /* A custom emoji is in use for the same non-obvious reason an avatar
+                 * is: no message references it, so it looks like an orphan. */
+                "  AND id NOT IN (SELECT attachment_id FROM custom_emoji) "
                 "ORDER BY created_at_ms ASC LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
             uint64_t cutoff = (now > j->maint_max_age_ms) ? now - j->maint_max_age_ms : 0;
             sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
@@ -4745,6 +4882,9 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
                 "WHERE reclaimed_at_ms = 0 AND created_at_ms < ?1 "
                 "  AND id NOT IN (SELECT avatar_attachment_id FROM users "
                 "                  WHERE avatar_attachment_id IS NOT NULL) "
+                /* A custom emoji is in use for the same non-obvious reason an avatar
+                 * is: no message references it, so it looks like an orphan. */
+                "  AND id NOT IN (SELECT attachment_id FROM custom_emoji) "
                 "ORDER BY created_at_ms ASC LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
             uint64_t cutoff = (now > j->maint_grace_ms) ? now - j->maint_grace_ms : 0;
             sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);

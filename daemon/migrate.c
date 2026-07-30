@@ -558,6 +558,20 @@ static const char MIGRATION_0028[] =
     "ALTER TABLE users ADD COLUMN notify_default INTEGER NOT NULL DEFAULT 0 "
     "  CHECK (notify_default IN (0,1,2));";
 
+/* 0029: custom emoji (REQ-072). The image is an ATTACHMENT id, not a blob column —
+ * the attachment store already does upload, size caps, dedup and reclamation, and a
+ * second binary store in SQLite would be a second thing to back up and a second
+ * thing to get wrong. The name is the primary key because a shortcode IS the
+ * identity: `:shipit:` must mean one image workspace-wide or every message
+ * containing it becomes ambiguous. */
+static const char MIGRATION_0029[] =
+    "CREATE TABLE custom_emoji ("
+    "  name          TEXT PRIMARY KEY,"           /* lowercase, no colons */
+    "  attachment_id INTEGER NOT NULL REFERENCES attachments(id),"
+    "  created_by    INTEGER NOT NULL REFERENCES users(id),"
+    "  created_at_ms INTEGER NOT NULL"
+    ");";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -587,6 +601,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 26, MIGRATION_0026 },
     { 27, MIGRATION_0027 },
     { 28, MIGRATION_0028 },
+    { 29, MIGRATION_0029 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

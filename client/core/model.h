@@ -20,6 +20,10 @@ typedef struct { char emoji[40]; uint32_t count; uint8_t mine; } oc_reaction;
 /* One synced client setting (the daemon-side config bucket). key/value sizes
  * mirror OC_SETTING_KEY_MAX / OC_SETTING_VALUE_MAX (+1 for NUL). */
 typedef struct { char key[65]; char value[513]; } oc_setting;
+/* Custom emoji (REQ-072): the workspace catalogue, replaced wholesale by each
+ * EMOJI_LIST — a partial catalogue means a shortcode that renders on one client and
+ * not another. The image is an attachment id, which is what a frontend fetches. */
+typedef struct { char name[48]; uint64_t attachment_id; uint64_t created_by; } oc_custom_emoji;
 
 /* One member's read cursor in a channel (REQ-090 seen-by). */
 typedef struct { uint64_t user_id; uint64_t message_id; } oc_read_cursor_view;
@@ -270,6 +274,9 @@ typedef struct {
     /* Notification preferences (REQ-130/131): the DND window (minutes since
      * midnight, local) + whether the prefs overlay is open. Per-channel levels
      * live on each oc_channel.notify_level. A NOTIFY_PREFS frame is a full sync. */
+    /* The custom-emoji catalogue (REQ-072). */
+    oc_custom_emoji *cemoji;
+    size_t    n_cemoji, cap_cemoji;
     uint8_t   prefs_open;
     uint8_t   dnd_enabled;
     uint16_t  dnd_start_min, dnd_end_min;
@@ -452,6 +459,9 @@ typedef struct {
     int      unread;
     int      section_total;  /* header rows: how many children (before collapse) */
 } oc_sidebar_row;
+
+/* Look one up by shortcode (no colons). Returns the attachment id, or 0. */
+uint64_t oc_model_custom_emoji(const oc_model *m, const char *name);
 
 /* Render a DM's title — the peer's name for a 1:1, the participants for a group
  * (REQ-056). Exposed because a frontend needs the same string in its header as the

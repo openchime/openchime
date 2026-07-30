@@ -304,6 +304,12 @@ static ID2D1HwndRenderTarget *g_rt;
 static ID2D1SolidColorBrush  *g_brush;      /* one reusable brush; recolored per draw */
 static ID2D1SolidColorBrush  *g_brush2;     /* faint brush for inline "(edited)" effect */
 static ID2D1SolidColorBrush  *g_brush3;     /* accent brush for @mention spans */
+/* A FULLY TRANSPARENT brush. Custom emoji (REQ-072) are drawn as images over their
+ * shortcode's own text rect, and the shortcode must not show through underneath —
+ * DirectWrite has no "hide this range", but a per-range drawing effect with alpha 0
+ * is exactly that, and it keeps the run's metrics so the surrounding text still
+ * flows around a space the right size. */
+static ID2D1SolidColorBrush  *g_brush4;
 
 /* Typography (ARCH-97). The platform owns the FAMILY, we own the SCALE, and
  * these names are the scale's tokens — the same six every graphical client
@@ -1291,10 +1297,28 @@ static float text_width(const char *s, IDWriteTextFormat *fmt) {
     return out;
 }
 
+/* ":name:" -> "name", or 0 when it is not one. Deliberately strict about the shape:
+ * a bare colon in ordinary text must not be read as an emoji. */
+static int custom_emoji_id(const char *s, char *name, size_t cap) {
+    if (!s || s[0] != ':') return 0;
+    const char *e = strchr(s + 1, ':');
+    if (!e || e == s + 1) return 0;
+    if (e[1] != '\0') return 0;                 /* ":a:b" is text, not one emoji */
+    size_t L = (size_t)(e - s - 1);
+    if (L + 1 >= cap) return 0;
+    memcpy(name, s + 1, L); name[L] = '\0';
+    return 1;
+}
+
 /* Colour emoji need both the emoji font and ENABLE_COLOR_FONT; without the flag
  * D2D renders the COLR layers as a single flat glyph. */
+static int draw_custom_emoji(ID2D1RenderTarget *rt, const char *s, D2D1_RECT_F r);  /* fwd */
+
 static void draw_emoji_fmt(ID2D1RenderTarget *rt, const char *s, D2D1_RECT_F r,
                            IDWriteTextFormat *fmt) {
+    /* A custom emoji first (REQ-072): every reaction chip, picker cell and reactor
+     * row goes through here, so one test covers all of them. */
+    if (s && s[0] == ':' && draw_custom_emoji(rt, s, r)) return;
     WCHAR w[16];
     int n = to_w(s, w, 16);
     if (n <= 0 || !fmt) return;
@@ -1569,6 +1593,8 @@ static void d2d_ensure_rt(HWND hwnd) {
         ID2D1RenderTarget_CreateSolidColorBrush((ID2D1RenderTarget *)g_rt, &faint, NULL, &g_brush2);
         D2D1_COLOR_F acc = col(OC_COL_ACCENT);
         ID2D1RenderTarget_CreateSolidColorBrush((ID2D1RenderTarget *)g_rt, &acc, NULL, &g_brush3);
+        D2D1_COLOR_F clear = { 0, 0, 0, 0 };
+        ID2D1RenderTarget_CreateSolidColorBrush((ID2D1RenderTarget *)g_rt, &clear, NULL, &g_brush4);
     }
 }
 
@@ -2277,6 +2303,62 @@ static int msg_has_body(const oc_msg *msg) {
 
 /* A DirectWrite layout for a message body wrapped to `cw`; *wlen (optional) gets
  * the UTF-16 length — the unit HitTest positions are expressed in. */
+/* A CUSTOM emoji (REQ-072) is a `:shortcode:`, not a codepoint, so anything that
+ * draws "an emoji" has to be able to draw an image instead. Returns 0 when `s` is
+ * not a custom shortcode, so callers fall through to their normal glyph path.
+ * Defined next to draw_emoji_fmt because the two are the same decision. */
+static int custom_emoji_id(const char *s, char *name, size_t cap);   /* fwd */
+static int draw_avatar_image(ID2D1RenderTarget *rt, uint64_t aid, D2D1_RECT_F box,
+                             float radius, int square);               /* fwd */
+static void avatar_want(uint64_t aid);                                /* fwd */
+
+static int draw_custom_emoji(ID2D1RenderTarget *rt, const char *s, D2D1_RECT_F r) {
+    char nm[48];
+    if (!custom_emoji_id(s, nm, sizeof nm)) return 0;
+    const oc_model *m = model();
+    uint64_t aid = m ? oc_model_custom_emoji(m, nm) : 0;
+    if (!aid) return 0;
+    /* Square, inset a little, so it sits like a glyph rather than filling the cell. */
+    float side = (r.right - r.left) < (r.bottom - r.top) ? (r.right - r.left) : (r.bottom - r.top);
+    side -= 4; if (side < 8) side = 8;
+    float cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
+    D2D1_RECT_F box = rf(cx - side / 2, cy - side / 2, cx + side / 2, cy + side / 2);
+    if (draw_avatar_image(rt, aid, box, 3.0f, 1)) return 1;
+    avatar_want(aid);
+    draw_text(rt, ":\u2026:", g_meta, r, OC_COL_FAINT);
+    return 1;
+}
+
+/* Custom-emoji shortcodes in a body (REQ-072): where each one is, in UTF-16 units,
+ * and which image it names. Computed from the SAME text the layout is built from, so
+ * the transparent range and the image drawn over it cannot disagree. */
+typedef struct { UINT32 at, len; uint64_t aid; } oc_emoji_run;
+
+static int emoji_runs(const char *utf8, oc_emoji_run *out, int max) {
+    const oc_model *m = model();
+    if (!m || !utf8 || !out || max <= 0) return 0;
+    int n = 0;
+    for (const char *p = strchr(utf8, ':'); p && n < max; p = strchr(p + 1, ':')) {
+        const char *e = strchr(p + 1, ':');
+        if (!e) break;
+        size_t L = (size_t)(e - p - 1);
+        if (L == 0 || L >= 48) { p = e; continue; }
+        char name[48];
+        memcpy(name, p + 1, L); name[L] = '\0';
+        uint64_t aid = oc_model_custom_emoji(m, name);
+        if (!aid) continue;          /* not a custom one: leave the text alone */
+        int u16_at  = MultiByteToWideChar(CP_UTF8, 0, utf8, (int)(p - utf8), NULL, 0);
+        int u16_len = MultiByteToWideChar(CP_UTF8, 0, p, (int)(L + 2), NULL, 0);
+        if (u16_at < 0 || u16_len <= 0) { p = e; continue; }
+        out[n].at = (UINT32)u16_at;
+        out[n].len = (UINT32)u16_len;
+        out[n].aid = aid;
+        n++;
+        p = e;                        /* do not let one colon start two runs */
+    }
+    return n;
+}
+
 static IDWriteTextLayout *body_layout(const oc_msg *msg, float cw, UINT32 *wlen) {
     WCHAR w[2048];
     int n = to_w(body_text(msg), w, 2048);
@@ -2316,6 +2398,18 @@ static IDWriteTextLayout *body_layout(const oc_msg *msg, float cw, UINT32 *wlen)
             DWRITE_TEXT_RANGE tr = { (UINT32)u16_start, (UINT32)u16_len };
             IDWriteTextLayout_SetDrawingEffect(layout, (IUnknown *)g_brush3, tr);
             IDWriteTextLayout_SetFontWeight(layout, DWRITE_FONT_WEIGHT_SEMI_BOLD, tr);
+        }
+    }
+    /* Hide the custom-emoji shortcodes; draw_message paints the images over them.
+     * The text stays in the layout so it keeps its width, its hit-testing and its
+     * place in a copied selection — a user who copies a message gets `:shipit:`
+     * back, which is what they typed and what another client can render. */
+    if (layout && !msg->deleted && g_brush4) {
+        oc_emoji_run runs[16];
+        int nr = emoji_runs(body_text(msg), runs, 16);
+        for (int i = 0; i < nr; i++) {
+            DWRITE_TEXT_RANGE tr = { runs[i].at, runs[i].len };
+            IDWriteTextLayout_SetDrawingEffect(layout, (IUnknown *)g_brush4, tr);
         }
     }
     return layout;
@@ -2436,6 +2530,35 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
         if (msg_has_body(msg)) {
             ID2D1RenderTarget_DrawTextLayout(rt, org, body, paint_with(bcol),
                                              D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            /* Custom emoji (REQ-072) over their own hidden shortcodes. Hit-tested
+             * rather than measured by hand: the run's position depends on wrapping,
+             * and DirectWrite is the only thing that knows where it wrapped. */
+            if (!msg->deleted) {
+                oc_emoji_run runs[16];
+                int nr = emoji_runs(body_text(msg), runs, 16);
+                for (int i = 0; i < nr; i++) {
+                    DWRITE_HIT_TEST_METRICS hm[4];
+                    UINT32 got = 0;
+                    if (FAILED(IDWriteTextLayout_HitTestTextRange(body, runs[i].at, runs[i].len,
+                                                                  org.x, org.y, hm, 4, &got)) || !got)
+                        continue;
+                    /* Square at the line height, CENTRED in the run it replaces.
+                     * The run is as wide as `:shipit:` was and the image is not, and
+                     * there is no way to close that gap without an
+                     * IDWriteInlineObject — a custom COM object per emoji. Centring
+                     * turns the leftover into symmetric spacing, which reads as
+                     * deliberate; left-aligning it looked like a missing character. */
+                    float side = hm[0].height > 2 ? hm[0].height - 2 : hm[0].height;
+                    float mid = hm[0].left + hm[0].width / 2;
+                    D2D1_RECT_F box = rf(mid - side / 2, hm[0].top + 1, mid + side / 2, hm[0].top + 1 + side);
+                    if (!draw_avatar_image(rt, runs[i].aid, box, 3.0f, 1)) {
+                        avatar_want(runs[i].aid);
+                        /* Until the bytes arrive the shortcode is the honest
+                         * placeholder — a blank gap would look like a bug. */
+                        draw_text(rt, ":\u2026:", g_meta, box, OC_COL_FAINT);
+                    }
+                }
+            }
             DWRITE_TEXT_METRICS tm;
             if (SUCCEEDED(IDWriteTextLayout_GetMetrics(body, &tm))) by += tm.height;
             else by += 18;
@@ -5206,6 +5329,41 @@ static void draw_emoji_picker(ID2D1RenderTarget *rt, float x0, float w, float h)
     if (cols < 1) cols = 1;
     float y = body.top - g_pick_scroll, x = body.left;
     int col = 0, last_cat = -1;
+
+    /* The workspace's own emoji FIRST (REQ-072): they are the ones this workspace
+     * invented and the ones a stock catalogue cannot offer, so burying them under
+     * 1800 standard glyphs would make them unfindable. The cell stores a pointer, so
+     * the ":name:" strings live in a pool that outlives the frame. */
+    {
+        static char pool[64][52];
+        const oc_model *pm = model();
+        int np = 0;
+        if (pm) for (size_t i = 0; i < pm->n_cemoji && np < 64; i++) {
+            if (q[0] && !strstr(pm->cemoji[i].name, q)) continue;
+            snprintf(pool[np], sizeof pool[np], ":%s:", pm->cemoji[i].name);
+            np++;
+        }
+        if (np) {
+            if (!q[0])
+                draw_text(rt, "This workspace", g_meta,
+                          rf(body.left + 4, y, body.right, y + 18), OC_COL_FAINT);
+            if (!q[0]) y += 20;
+            for (int i = 0; i < np; i++) {
+                if (y + cell >= body.top && y <= body.bottom) {
+                    D2D1_RECT_F r = rf(x, y, x + cell, y + cell);
+                    if (g_n_pick_cells < 256) {
+                        g_pick_cells[g_n_pick_cells].r = r;
+                        g_pick_cells[g_n_pick_cells].emoji = pool[i];
+                        g_n_pick_cells++;
+                    }
+                    draw_emoji_glyph(rt, pool[i], r);
+                }
+                x += cell;
+                if (++col >= (int)cols) { col = 0; x = body.left; y += cell; }
+            }
+            if (col != 0) { y += cell; col = 0; x = body.left; }
+        }
+    }
     for (size_t i = 0; i < nh; i++) {
         /* Category headings only when browsing; a filtered list is already the
          * answer to a question and section breaks just fragment it. */
@@ -6863,6 +7021,7 @@ static void paint(HWND hwnd) {
         if (g_brush) { ID2D1SolidColorBrush_Release(g_brush); g_brush = NULL; }
         if (g_brush2) { ID2D1SolidColorBrush_Release(g_brush2); g_brush2 = NULL; }
         if (g_brush3) { ID2D1SolidColorBrush_Release(g_brush3); g_brush3 = NULL; }
+    if (g_brush4) { ID2D1SolidColorBrush_Release(g_brush4); g_brush4 = NULL; }
         ID2D1HwndRenderTarget_Release(g_rt);
         g_rt = NULL;
     }
@@ -7623,6 +7782,7 @@ static void dpi_set(HWND hwnd, UINT dpi) {
     if (g_brush)  { ID2D1SolidColorBrush_Release(g_brush);  g_brush = NULL; }
     if (g_brush2) { ID2D1SolidColorBrush_Release(g_brush2); g_brush2 = NULL; }
     if (g_brush3) { ID2D1SolidColorBrush_Release(g_brush3); g_brush3 = NULL; }
+    if (g_brush4) { ID2D1SolidColorBrush_Release(g_brush4); g_brush4 = NULL; }
     thumbs_drop();
     if (g_rt) { ID2D1HwndRenderTarget_Release(g_rt); g_rt = NULL; }
     if (g_ph_font) { DeleteObject(g_ph_font); g_ph_font = NULL; }
@@ -9840,6 +10000,7 @@ static void open_new_menu(HWND hwnd) {
     mi_item(8, "Jump to\xE2\x80\xA6  (Ctrl+K)");
     mi_item(9, "Browse channels\xE2\x80\xA6");
     mi_item(82, "New sidebar section\xE2\x80\xA6");   /* WIN-83 */
+    mi_item(84, "Add custom emoji\xE2\x80\xA6");      /* REQ-072 */
     g_menu = MENU_NEW; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 224;
     g_menu_x = RAIL_W + 8;
     /* Bottom-aligned to the New button, so the menu grows upward out of the thing
@@ -10243,6 +10404,36 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     /* Adding a workspace must not sign you out of the one you are in — which is
      * exactly what reset_session() here used to do. Park the current one and
      * sign in alongside it. */
+    case 84: {   /* REQ-072: upload an image and register it as :name: */
+        if (!g_client) break;
+        oc_field f[1] = { { FF_TEXT, "Shortcode",
+                            "Letters, digits, - and _ . Used as :name: in messages.", "" } };
+        if (!form_dialog(hwnd, "Add custom emoji", f, 1) || !f[0].value[0]) break;
+        char name[48];
+        snprintf(name, sizeof name, "%s", f[0].value);
+        for (char *q2 = name; *q2; q2++) if (*q2 >= 'A' && *q2 <= 'Z') *q2 += 32;
+        WCHAR file[MAX_PATH]; file[0] = 0;
+        OPENFILENAMEW ofn; ZeroMemory(&ofn, sizeof ofn);
+        ofn.lStructSize = sizeof ofn;
+        ofn.hwndOwner = hwnd;
+        ofn.lpstrFile = file;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.lpstrFilter = L"Images\0*.png;*.gif;*.jpg;*.jpeg;*.webp\0";
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+        if (!GetOpenFileNameW(&ofn)) break;
+        char path[1024];
+        WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL);
+        /* Uploaded into the self-DM for the same reason an avatar is: the bytes need
+         * a channel and that is the user's own space. Nothing is posted there. */
+        uint64_t up = 0;
+        const oc_model *em = model();
+        if (em) for (size_t i = 0; i < em->n_channels; i++)
+            if (em->channels[i].kind == OC_CHANNEL_KIND_DM &&
+                em->channels[i].peer_id == em->user_id) { up = em->channels[i].channel_id; break; }
+        if (!up) up = g_sel;
+        if (!up) { toast_push("Open a conversation first.", 1); break; }
+        oc_client_upload_emoji(g_client, up, name, path);
+        break; }
     case 83: {   /* REQ-056: a group DM */
         oc_field f[1] = { { FF_TEXT, "People",
                             "Two to eight usernames, comma separated.", "" } };
@@ -10541,15 +10732,17 @@ static int test_shot(HWND hwnd, const char *path) {
             ID2D1DCRenderTarget_BindDC(dcrt, mem, &bind);
             ID2D1RenderTarget *rt = (ID2D1RenderTarget *)dcrt;
             /* Brushes are RT-specific; swap the globals to ones on this RT. */
-            ID2D1SolidColorBrush *sb = g_brush, *sb2 = g_brush2, *sb3 = g_brush3;
+            ID2D1SolidColorBrush *sb = g_brush, *sb2 = g_brush2, *sb3 = g_brush3, *sb4 = g_brush4;
             D2D1_COLOR_F white = col(0xFFFFFF), faint = col(OC_COL_FAINT);
             D2D1_COLOR_F acc = col(OC_COL_ACCENT);
-            g_brush = NULL; g_brush2 = NULL; g_brush3 = NULL;
+            g_brush = NULL; g_brush2 = NULL; g_brush3 = NULL; g_brush4 = NULL;
             ID2D1RenderTarget_CreateSolidColorBrush(rt, &white, NULL, &g_brush);
             ID2D1RenderTarget_CreateSolidColorBrush(rt, &faint, NULL, &g_brush2);
             /* g_brush3 too, or the mention spans carry a brush from the window's
              * target into this one and the whole frame fails to draw. */
             ID2D1RenderTarget_CreateSolidColorBrush(rt, &acc, NULL, &g_brush3);
+            D2D1_COLOR_F clear = { 0, 0, 0, 0 };
+            ID2D1RenderTarget_CreateSolidColorBrush(rt, &clear, NULL, &g_brush4);
             ID2D1RenderTarget_BeginDraw(rt);
             g_thumbs_off = 1;      /* do not FETCH during a capture */
             g_shot_rt = rt;        /* ... but do draw what we already have */
@@ -10561,7 +10754,8 @@ static int test_shot(HWND hwnd, const char *path) {
             if (g_brush) ID2D1SolidColorBrush_Release(g_brush);
             if (g_brush2) ID2D1SolidColorBrush_Release(g_brush2);
             if (g_brush3) ID2D1SolidColorBrush_Release(g_brush3);
-            g_brush = sb; g_brush2 = sb2; g_brush3 = sb3;
+            if (g_brush4) ID2D1SolidColorBrush_Release(g_brush4);
+            g_brush = sb; g_brush2 = sb2; g_brush3 = sb3; g_brush4 = sb4;
             ID2D1DCRenderTarget_Release(dcrt);
             GdiFlush();
             /* Children last, over the scene — one snapshot that shows the whole
@@ -10621,6 +10815,10 @@ static void test_dump(const char *path) {
                 g_rows[i].sec, g_rows[i].header,
                 (unsigned long long)g_rows[i].cid, g_rows[i].label);
     fprintf(f, "myavatar=%llu\n", (unsigned long long)avatar_of(m, m->user_id));
+    fprintf(f, "cemoji=%zu\n", m->n_cemoji);
+    for (size_t i = 0; i < m->n_cemoji; i++)
+        fprintf(f, "  cemoji %s attach=%llu\n", m->cemoji[i].name,
+                (unsigned long long)m->cemoji[i].attachment_id);
     fprintf(f, "sections=%d\n", g_sb.n_custom);
     for (int i = 0; i < g_sb.n_custom; i++) {
         fprintf(f, "  section %d name=\"%s\" n=%u collapsed=%u ids=", i,
@@ -10967,6 +11165,23 @@ static void test_poll(HWND hwnd) {
             snprintf(g_form_last, sizeof g_form_last, "%s text=\"%s\" check=%s choice=%s",
                      okp ? "ok" : "cancel", f[0].value, f[1].value, f[2].value);
         }
+    } else if (!strcmp(verb, "emoji_add")) {
+        /* REQ-072. `emoji_add <name> <windows path>` — the menu path opens a form and
+         * an OS file dialog, neither of which a harness can drive. */
+        char nm[48] = ""; char pth[512] = "";
+        if (sscanf(arg, "%47s %511[^\n]", nm, pth) != 2 || !g_client) { test_ack("err"); }
+        else {
+            uint64_t up = 0;
+            const oc_model *em = model();
+            if (em) for (size_t i = 0; i < em->n_channels; i++)
+                if (em->channels[i].kind == OC_CHANNEL_KIND_DM &&
+                    em->channels[i].peer_id == em->user_id) { up = em->channels[i].channel_id; break; }
+            if (!up) up = g_sel;
+            if (!up) test_ack("err");
+            else { oc_client_upload_emoji(g_client, up, nm, pth); test_ack("ok"); }
+        }
+    } else if (!strcmp(verb, "emoji_del")) {
+        oc_client_delete_emoji(g_client, arg); test_ack("ok");
     } else if (!strcmp(verb, "groupdm")) {
         /* REQ-056. `groupdm <name>,<name>[,...]` — the menu item opens a form the
          * harness would have to type into and dismiss; this is the call underneath. */
@@ -11404,6 +11619,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 oc_client_list_settings(g_client);
                 oc_client_list_users(g_client);
                 oc_client_list_channels(g_client);
+                oc_client_list_emoji(g_client);      /* REQ-072: the custom catalogue */
                 g_post_auth = 1;
                 g_sb_settings_pending = 1;   /* fold the synced sidebar prefs when they land */
                 g_prefs_pending = 1;
@@ -11475,6 +11691,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_brush)  { ID2D1SolidColorBrush_Release(g_brush);  g_brush = NULL; }
         if (g_brush2) { ID2D1SolidColorBrush_Release(g_brush2); g_brush2 = NULL; }
         if (g_brush3) { ID2D1SolidColorBrush_Release(g_brush3); g_brush3 = NULL; }
+    if (g_brush4) { ID2D1SolidColorBrush_Release(g_brush4); g_brush4 = NULL; }
         thumbs_drop();
         if (g_rt) { ID2D1HwndRenderTarget_Release(g_rt); g_rt = NULL; }
         layout_composer(hwnd);

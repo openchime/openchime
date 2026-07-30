@@ -1092,6 +1092,23 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         if (c) { c->notify_level = e->op; c->muted = e->status; }
         break;
     }
+    case OC_EV_EMOJI_BEGIN:
+        m->n_cemoji = 0;                      /* the server's catalogue is the truth */
+        break;
+    case OC_EV_EMOJI: {
+        if (m->n_cemoji == m->cap_cemoji) {
+            size_t cap = m->cap_cemoji ? m->cap_cemoji * 2 : 32;
+            oc_custom_emoji *ne = realloc(m->cemoji, cap * sizeof *ne);
+            if (!ne) break;
+            m->cemoji = ne; m->cap_cemoji = cap;
+        }
+        oc_custom_emoji *ce = &m->cemoji[m->n_cemoji++];
+        memset(ce, 0, sizeof *ce);
+        snprintf(ce->name, sizeof ce->name, "%s", e->body ? e->body : "");
+        ce->attachment_id = e->message_id;
+        ce->created_by = e->user_id;
+        break;
+    }
     case OC_EV_SETTINGS_BEGIN:
         /* A CLIENT_SETTINGS frame start (solicited or a device-sync push): the
          * snapshot replaces the bucket wholesale, so clear it before the entries. */
@@ -1539,6 +1556,13 @@ int oc_sidebar_assign(oc_sidebar_opts *o, uint64_t channel_id, int idx) {
     if (o->custom[idx].n_ids >= OC_SB_CUSTOM_IDS) return changed;   /* full: refuse */
     o->custom[idx].ids[o->custom[idx].n_ids++] = channel_id;
     return 1;
+}
+
+uint64_t oc_model_custom_emoji(const oc_model *m, const char *name) {
+    if (!m || !name || !name[0]) return 0;
+    for (size_t i = 0; i < m->n_cemoji; i++)
+        if (strcmp(m->cemoji[i].name, name) == 0) return m->cemoji[i].attachment_id;
+    return 0;
 }
 
 void oc_model_dm_title(const oc_model *m, const oc_channel *c, char *out, size_t cap) {

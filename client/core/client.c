@@ -601,6 +601,41 @@ void oc_client_upload_avatar(oc_client *c, uint64_t channel_id, const char *path
     oc_queue_push(&c->cmds, cmd);
 }
 
+/* Custom emoji (REQ-072). */
+void oc_client_list_emoji(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_EMOJI);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_add_emoji(oc_client *c, const char *name, uint64_t attachment_id) {
+    if (!c || !name || !name[0] || !attachment_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_ADD_EMOJI);
+    if (!cmd) return;
+    cmd->body = strdup(name);
+    cmd->message_id = attachment_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_delete_emoji(oc_client *c, const char *name) {
+    if (!c || !name || !name[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_DELETE_EMOJI);
+    if (!cmd) return;
+    cmd->body = strdup(name);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_upload_emoji(oc_client *c, uint64_t channel_id, const char *name, const char *path) {
+    if (!c || !name || !name[0] || !path || !path[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_UPLOAD);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->op = 2;                       /* purpose: custom emoji */
+    cmd->body = strdup(path);
+    cmd->body2 = strdup(name);         /* claimed with this name when it lands */
+    oc_queue_push(&c->cmds, cmd);
+}
+
 /* A group DM (REQ-056). */
 void oc_client_open_group_dm(oc_client *c, const uint64_t *user_ids, int n) {
     if (!c || !user_ids || n < 2) return;

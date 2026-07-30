@@ -1141,6 +1141,35 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_LIST_EMOJI) {
+            if (oc_decode_list_emoji(&p) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_EMOJI, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_ADD_EMOJI) {
+            oc_add_emoji ae;
+            if (oc_decode_add_emoji(&p, &ae) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_ADD_EMOJI, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->message_id = ae.attachment_id;
+            j->ch_name = ae.name.len ? strndup((const char *)ae.name.ptr, ae.name.len) : strdup("");
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_DELETE_EMOJI) {
+            oc_delete_emoji de;
+            if (oc_decode_delete_emoji(&p, &de) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_DELETE_EMOJI, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->ch_name = de.name.len ? strndup((const char *)de.name.ptr, de.name.len) : strdup("");
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_OPEN_GROUP_DM) {
             oc_open_group_dm gd;
             if (oc_decode_open_group_dm(&p, &gd) != OC_OK) return -1;
@@ -2576,6 +2605,33 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("webhook error") };
             oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        break;
+    }
+    case OC_RES_EMOJI_LIST: {
+        /* To the asker, and — when the catalogue CHANGED (ch_fanout) — to everyone
+         * else too: an emoji nobody else's picker knows about is one they cannot use,
+         * and a deleted one they would render as a broken image. */
+        oc_emoji_entry ents[OC_MAX_CUSTOM_EMOJI];
+        uint16_t n = 0;
+        for (size_t i = 0; i < r->n_elist && n < OC_MAX_CUSTOM_EMOJI; i++) {
+            ents[n].name = oc_slice_str(r->elist[i].name ? r->elist[i].name : "");
+            ents[n].attachment_id = r->elist[i].attachment_id;
+            ents[n].created_by = r->elist[i].created_by;
+            n++;
+        }
+        oc_emoji_list el = { n, ents };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_emoji_list(&w, OC_PROTOCOL_VERSION, &el);
+        size_t len = w.len;
+        if (r->ch_fanout) {
+            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                conn *t = conns[fd];
+                if (t && t->authed) send_bytes(ep, conns, fd, g_enc, len);
+            }
+        } else {
+            conn *c = find_by_id(conns, r->conn_id);
+            if (c) send_bytes(ep, conns, c->fd, g_enc, len);
         }
         break;
     }

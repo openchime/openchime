@@ -432,6 +432,23 @@ int run_storage_tests(void) {
         CHECK(r != NULL);
         if (r) oc_dbres_free(r);
         CHECK(reclaimed(db, 200) == 1);
+
+        /* A CUSTOM EMOJI's image is in use for the same non-obvious reason: no
+         * message references it (REQ-072). */
+        insert_attachment(db, 201, 10 * DAY, 0, now);
+        sqlite3_exec(db, "INSERT INTO custom_emoji(name,attachment_id,created_by,created_at_ms) "
+                         "VALUES('shipit',201,1,1);", NULL, NULL, NULL);
+        oc_job *j2 = oc_job_new(OC_JOB_STORAGE_MAINT, 0);
+        j2->maint_grace_ms = 1 * HOUR;
+        j2->maint_batch = 64;
+        j2->maint_max_age_ms = 1 * DAY;
+        j2->maint_evict = 1;
+        oc_dbwriter_submit(w, j2);
+        r = NULL;
+        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        CHECK(r != NULL);
+        if (r) oc_dbres_free(r);
+        CHECK(reclaimed(db, 201) == 0);
     }
 
     /* Pass 4: idempotence. Everything reclaimable is already tombstoned, so a

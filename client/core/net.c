@@ -243,6 +243,7 @@ typedef struct {
      * every ordinary upload; 1 makes it the user's avatar and posts nothing. Without
      * this an avatar arrived in the transcript as a bare image nobody sent. */
     uint8_t  purpose;
+    char     ename[48];   /* purpose 2: the shortcode to claim it as (REQ-072) */
     char     name[128];   /* filename (upload src basename / download dest label) */
 } oc_xfer;
 
@@ -780,6 +781,21 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->status = ne[i].muted;      /* WIN-40: distinct from the level */
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_EMOJI_LIST) {
+            oc_emoji_entry ee[OC_MAX_CUSTOM_EMOJI]; uint16_t count = 0;
+            if (oc_decode_emoji_list(&p, ee, OC_MAX_CUSTOM_EMOJI, &count) != OC_OK) return -1;
+            if (count > OC_MAX_CUSTOM_EMOJI) count = OC_MAX_CUSTOM_EMOJI;
+            oc_ev *b = oc_ev_new(OC_EV_EMOJI_BEGIN);
+            if (b) oc_queue_push(to_ui, b);
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_EMOJI);
+                if (!e) continue;
+                e->message_id = ee[i].attachment_id;
+                e->user_id = ee[i].created_by;
+                e->body = malloc(ee[i].name.len + 1);
+                if (e->body) { memcpy(e->body, ee[i].name.ptr, ee[i].name.len); e->body[ee[i].name.len] = '\0'; }
+                oc_queue_push(to_ui, e);
+            }
         } else if (hdr.msg_type == OC_MSG_CLIENT_SETTINGS) {
             enum { CS_CAP = OC_MAX_CLIENT_SETTINGS };
             oc_client_setting_entry ce[CS_CAP];
@@ -895,6 +911,17 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (oc_decode_upload_ok(&p, &ok) == OC_OK && ctx && ctx->xfer->mode == 1 &&
                 ok.attachment_id == ctx->xfer->id) {
                 oc_xfer *x = ctx->xfer;
+                if (x->purpose == 2) {
+                    /* A custom emoji (REQ-072): claim the finished upload by name,
+                     * and post nothing — the same shape as an avatar. */
+                    uint8_t ef[128]; oc_wbuf ew; oc_wbuf_init(&ew, ef, sizeof ef);
+                    oc_add_emoji ae = { oc_slice_str(x->ename), x->id };
+                    if (oc_encode_add_emoji(&ew, OC_PROTOCOL_VERSION, &ae) == OC_OK)
+                        (void)write_all(ctx->conn, ctx->fd, ef, ew.len, ctx->stop);
+                    xfer_notice(ctx, 1, "emoji added");
+                    xfer_reset(x);
+                    continue;
+                }
                 if (x->purpose == 1) {
                     /* An avatar (WIN-47): claim it with SET_AVATAR instead of posting
                      * it. The daemon checks that the uploader is the setter, and its
@@ -1674,6 +1701,23 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_set_mute(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_LIST_EMOJI) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_emoji(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_ADD_EMOJI && c->body) {
+                uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_add_emoji ae = { oc_slice_str(c->body), c->message_id };
+                if (oc_encode_add_emoji(&w, OC_PROTOCOL_VERSION, &ae) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_DELETE_EMOJI && c->body) {
+                uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_delete_emoji de = { oc_slice_str(c->body) };
+                if (oc_encode_delete_emoji(&w, OC_PROTOCOL_VERSION, &de) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_OPEN_GROUP_DM) {
                 uint8_t buf[96]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_open_group_dm gd; memset(&gd, 0, sizeof gd);
@@ -1716,7 +1760,9 @@ static int run_connection(oc_net *n, int reconnecting,
                             xfer.mode = 1; xfer.fp = fp; xfer.total = (uint64_t)sz;
                             xfer.chunk = OC_ATTACH_CHUNK_SIZE; xfer.win_chunks = 8;
                             xfer.channel = c->channel_id;
-                            xfer.purpose = (uint8_t)(c->op == 1 ? 1 : 0);   /* WIN-47 */
+                            xfer.purpose = (uint8_t)(c->op == 1 ? 1 : c->op == 2 ? 2 : 0);
+                            if (xfer.purpose == 2 && c->body2)
+                                snprintf(xfer.ename, sizeof xfer.ename, "%s", c->body2);
                             snprintf(xfer.name, sizeof xfer.name, "%s", path_basename(c->body));
                             uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                             oc_upload_begin ub; memset(&ub, 0, sizeof ub);

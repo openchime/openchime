@@ -103,7 +103,9 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_LIST_SESSIONS = 74,        /* REQ-182 */
        OC_JOB_SET_NOTIFY_DEFAULT = 75,   /* REQ-134 */
        OC_JOB_SET_AVATAR = 76,           /* WIN-47 */
-       OC_JOB_OPEN_GROUP_DM = 77 };      /* REQ-056 */
+       OC_JOB_OPEN_GROUP_DM = 77,        /* REQ-056 */
+       /* Custom emoji (REQ-072). ADD carries ch_name + message_id (attachment). */
+       OC_JOB_ADD_EMOJI = 78, OC_JOB_DELETE_EMOJI = 79, OC_JOB_LIST_EMOJI = 80 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -292,7 +294,14 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_SAVED_OK = 69, OC_RES_SAVED_LIST = 70, OC_RES_ACTIVITY = 71,
        OC_RES_INVITE_LIST = 72, OC_RES_INVITE_REVOKED = 73,
        OC_RES_PROFILE_INFO = 74, OC_RES_FILE_CHANNELS = 75,
-       OC_RES_SESSION_LIST = 76 };
+       OC_RES_SESSION_LIST = 76, OC_RES_EMOJI_LIST = 77 };
+
+/* One custom emoji (REQ-072). */
+typedef struct oc_emoji_row {
+    char    *name;          /* heap; lowercase, no colons */
+    uint64_t attachment_id;
+    uint64_t created_by;
+} oc_emoji_row;
 
 /* One saved message (REQ-231). Carries its body for the same reason a pin does:
  * a saved message is usually far outside loaded history. */
@@ -526,6 +535,13 @@ typedef struct oc_dbres {
     uint64_t        react_count;
     oc_reaction_row *rlist;         /* heap array; REACTIONS */
     size_t           n_rlist;
+
+    /* EMOJI_LIST (REQ-072): the whole custom catalogue. Sent whole — a workspace
+     * has tens of these, and a partial catalogue means a message whose emoji renders
+     * on one client and not another. Named `elist` because `emoji` above is the
+     * reaction's shortcode and one letter of difference is not a distinction. */
+    oc_emoji_row   *elist;
+    size_t          n_elist;
 
     /* Pins (REQ-230). PIN_OK reuses message_id/channel_id/user_id/members above
      * for the fan-out; pin_op says which way and pinned_at when. PINS carries

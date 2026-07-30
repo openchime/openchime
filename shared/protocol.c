@@ -2408,3 +2408,63 @@ oc_result oc_decode_open_group_dm(oc_rbuf *p, oc_open_group_dm *m) {
     for (uint16_t i = 0; i < n; i++) m->user_ids[i] = oc_r_u64(p);
     return r_done(p);
 }
+
+/* Custom emoji (REQ-072). */
+oc_result oc_encode_add_emoji(oc_wbuf *w, uint16_t version, const oc_add_emoji *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_ADD_EMOJI);
+    oc_w_str(w, m->name);
+    oc_w_u64(w, m->attachment_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_add_emoji(oc_rbuf *p, oc_add_emoji *m) {
+    m->name = oc_r_str(p);
+    m->attachment_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_delete_emoji(oc_wbuf *w, uint16_t version, const oc_delete_emoji *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_DELETE_EMOJI);
+    oc_w_str(w, m->name);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_delete_emoji(oc_rbuf *p, oc_delete_emoji *m) {
+    m->name = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_list_emoji(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_EMOJI);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_list_emoji(oc_rbuf *p) { return r_done(p); }
+
+oc_result oc_encode_emoji_list(oc_wbuf *w, uint16_t version, const oc_emoji_list *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_EMOJI_LIST);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        oc_w_str(w, m->entries[i].name);
+        oc_w_u64(w, m->entries[i].attachment_id);
+        oc_w_u64(w, m->entries[i].created_by);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_emoji_list(oc_rbuf *p, oc_emoji_entry *entries, uint16_t cap,
+                               uint16_t *out_count) {
+    uint16_t count = oc_r_u16(p);
+    *out_count = count;
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
+        oc_slice nm = oc_r_str(p);
+        uint64_t aid = oc_r_u64(p);
+        uint64_t by = oc_r_u64(p);
+        if (i < cap) {
+            entries[i].name = nm;
+            entries[i].attachment_id = aid;
+            entries[i].created_by = by;
+        }
+    }
+    return r_done(p);
+}

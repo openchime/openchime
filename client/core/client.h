@@ -236,6 +236,15 @@ void oc_client_upload_avatar(oc_client *c, uint64_t channel_id, const char *path
  * set returns the same conversation. n must be >= 2 — two participants in total is a
  * 1:1 DM and belongs to oc_client_open_dm. */
 void oc_client_open_group_dm(oc_client *c, const uint64_t *user_ids, int n);
+
+/* Custom emoji (REQ-072). `add` claims an image the caller already uploaded, as an
+ * avatar does; the daemon answers with the whole catalogue and fans it to everyone,
+ * because an emoji only half the workspace knows about is one they cannot use. */
+void oc_client_list_emoji(oc_client *c);
+void oc_client_add_emoji(oc_client *c, const char *name, uint64_t attachment_id);
+void oc_client_delete_emoji(oc_client *c, const char *name);
+/* Upload an image and register it as `name` in one step. */
+void oc_client_upload_emoji(oc_client *c, uint64_t channel_id, const char *name, const char *path);
 /* Custom status (REQ-241/122) and profile fields (REQ-240). Empty status text clears
  * it; expiry 0 means "until changed", and the DAEMON enforces the lapse. */
 void oc_client_list_file_channels(oc_client *c);   /* WIN-82 */

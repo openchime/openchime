@@ -77,6 +77,11 @@ enum {
     OC_EV_ATTACHMENT_DATA, /* in-memory download finished: message_id=attachment_id, count=bytes, body=the bytes (NOT a C string) */
     OC_EV_XFER,            /* a transfer notice: op=phase (0 progress, 1 done, 2 error), body=status text */
     OC_EV_READ_STATE,      /* channel_id: mark its currently-loaded messages read (replayed cache is not "unread") */
+    /* Custom emoji (REQ-072): BEGIN clears the catalogue, then one per entry —
+     * the same shape as the settings snapshot below, and for the same reason: the
+     * server's list is the whole truth. */
+    OC_EV_EMOJI_BEGIN,
+    OC_EV_EMOJI,
     OC_EV_SETTINGS_BEGIN,  /* a CLIENT_SETTINGS frame start: clears the synced bucket before its entries */
     OC_EV_SETTING,         /* one synced setting: author_name=key, body=value */
     OC_EV_PROFILE,         /* a PROFILE_UPDATED: user_id + body=display_name (own = the change ack) */
@@ -207,6 +212,9 @@ enum {
     OC_CMD_SET_NOTIFY_DEFAULT,   /* REQ-134: op = level */
     OC_CMD_SET_AVATAR,           /* WIN-47: message_id = attachment id, 0 clears */
     OC_CMD_OPEN_GROUP_DM,        /* REQ-056: gids[0..n_gids) */
+    OC_CMD_ADD_EMOJI,            /* REQ-072: body = name, message_id = attachment */
+    OC_CMD_DELETE_EMOJI,         /* REQ-072: body = name */
+    OC_CMD_LIST_EMOJI,
     OC_CMD_UPLOAD,          /* upload+post a file to `channel_id`: body = local path */
     OC_CMD_DOWNLOAD,        /* download an attachment: message_id = attachment_id, body = dest path */
     OC_CMD_LOGOUT,          /* revoke this session (op = scope) and close the connection */

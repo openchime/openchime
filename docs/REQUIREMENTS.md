@@ -391,8 +391,21 @@ the requirement says so explicitly rather than implying one.
   under admin control of who may add them. A reaction (REQ-070) references an
   emoji by a stable shortcode that resolves to either a Unicode sequence or a
   tenant custom-emoji asset; a text-only client (the TUI) shows the shortcode
-  rather than the image. **[needs ARCH decision — custom-emoji asset storage
-  (object store, ARCH-17) + shortcode namespace.]**
+  rather than the image. **DONE** (2026-07-30), with one accepted limitation.
+  Storage: the image is an **attachment id** (migration 0029's `custom_emoji`), so the
+  existing store handles upload, the size cap, dedup and reclamation — a second binary
+  store in SQLite would be a second thing to back up and a second thing to get wrong.
+  Namespace: **flat and workspace-wide**, name as primary key, lowercased and
+  restricted to `[a-z0-9_+-]`. `:shipit:` has to mean one image or every message
+  containing it is ambiguous, so a duplicate is REFUSED rather than replacing the
+  image every existing message already refers to. Who may add: any member (adding one
+  is additive and cheap); **deleting** is the creator or an admin, because deletion
+  breaks every message that used the shortcode. The TUI shows the shortcode, as this
+  requirement always said it would.
+  **Limitation:** in the Win32 client the image is drawn over its hidden shortcode, so
+  the run keeps the shortcode's WIDTH — a short emoji leaves symmetric spacing around
+  it. Closing that gap needs an `IDWriteInlineObject` (a COM object per emoji);
+  recorded rather than pretended away.
 - **REQ-073.** A user has had **one-click quick reactions** — a small,
   per-user-configurable set of frequently-used emoji offered inline on a message
   as a shortcut over the full picker (REQ-070/265). The set has been a per-user

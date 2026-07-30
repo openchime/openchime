@@ -213,6 +213,35 @@ click_pref 1 "$before"; sleep 0.3
 "$DRIVE" key enter >/dev/null 2>&1; sleep 0.5
 expect "$(snap)" time24 "$before" "the run left the setting as it found it"
 
+# --- custom emoji (REQ-072) -------------------------------------------------
+# The claim is that the catalogue arrives and a shortcode becomes an IMAGE. The
+# image itself is checked by the thumb cache carrying its attachment id: a
+# screenshot proves the pixels, this proves the wiring on every run.
+say "== custom emoji"
+if [ -f "$LIN_DIR/shipit.png" ]; then
+  "$DRIVE" emoji_del smoketest >/dev/null 2>&1; sleep 0.5
+  "$DRIVE" emoji_add smoketest 'C:\Windows\Temp\octest\shipit.png' >/dev/null 2>&1; sleep 2.5
+  d=$(snap)
+  checks=$((checks + 1))
+  aid=$(printf '%s' "$d" | grep -oE '^  cemoji smoketest attach=[0-9]+' | grep -oE '[0-9]+$')
+  if [ -n "${aid:-}" ]; then ok ":smoketest: is in the catalogue (attach=$aid)"
+  else fail "no cemoji row for smoketest"; fi
+  # Post it and let the transcript ask for the image.
+  "$DRIVE" channel general >/dev/null 2>&1
+  "$DRIVE" send "smoke :smoketest: check" >/dev/null 2>&1; sleep 2
+  checks=$((checks + 1))
+  if [ -n "${aid:-}" ] && snap | grep -qE "^  thumb [0-9]+ id=$aid "; then
+    ok "its image decoded, so the shortcode renders as a picture"
+  else fail "no decoded bitmap for emoji attachment ${aid:-?}"; fi
+  # Leave the workspace as we found it.
+  "$DRIVE" emoji_del smoketest >/dev/null 2>&1; sleep 1
+  checks=$((checks + 1))
+  if ! snap | grep -q 'cemoji smoketest '; then ok "deleting it removes it everywhere"
+  else fail "smoketest survived a delete"; fi
+else
+  say "   (no $LIN_DIR/shipit.png — skipping; create one to cover REQ-072)"
+fi
+
 # --- group DMs (REQ-056) ----------------------------------------------------
 # A group DM is a DM with more than two participants, so the claims worth asserting
 # are that it appears ONCE with a computed title, and that reopening the same set

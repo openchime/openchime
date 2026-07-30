@@ -52,7 +52,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 28);
+    CHECK(oc_schema_version(db) == 29);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -3133,6 +3133,130 @@ static void test_webhooks(void) {
 
 /* Notification preferences (REQ-130/131): per-channel level + DND, persisted and
  * upserted, gated on channel access. */
+/* Custom emoji (REQ-072). The name IS the identity — `:shipit:` must mean one image
+ * workspace-wide — so the properties are: the name is validated and lowercased, the
+ * image must be one the caller uploaded (it becomes readable workspace-wide), a
+ * duplicate is refused rather than silently replacing what every existing message
+ * containing that shortcode means, and only the creator or an admin can delete one. */
+static void test_custom_emoji(void) {
+    const char *path = "build/test_dbwriter_emoji.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "ce-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "ce-bob",   "pw", OC_ROLE_MEMBER);
+    uint64_t carol = reg(w, "ce-carol", "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob && carol);
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        char sql[512];
+        snprintf(sql, sizeof sql,
+            "INSERT INTO attachments(id,channel_id,message_id,uploader_id,storage_key,"
+            "  filename,mime,size,sha256,created_at_ms) VALUES"
+            "  (1,1,NULL,%llu,'k1','a.png','image/png',10,x'00',1),"
+            "  (2,1,NULL,%llu,'k2','b.pdf','application/pdf',10,x'00',1),"
+            "  (3,1,NULL,%llu,'k3','c.png','image/png',10,x'00',1);",
+            (unsigned long long)bob, (unsigned long long)bob, (unsigned long long)carol);
+        CHECK(sqlite3_exec(raw, sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    /* Empty to begin with. */
+    oc_job *j = oc_job_new(OC_JOB_LIST_EMOJI, 1);
+    j->user_id = alice;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_EMOJI_LIST && r->n_elist == 0);
+    oc_dbres_free(r);
+
+    /* bob adds one, and the NAME is lowercased — `:Shipit:` and `:shipit:` must not
+     * be two different emoji. The answer is the whole catalogue, fanned out. */
+    j = oc_job_new(OC_JOB_ADD_EMOJI, 2);
+    j->user_id = bob; j->message_id = 1; j->ch_name = strdup("ShipIt");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_EMOJI_LIST && r->n_elist == 1 && r->ch_fanout);
+    if (r && r->n_elist == 1) {
+        CHECK(strcmp(r->elist[0].name, "shipit") == 0);
+        CHECK(r->elist[0].attachment_id == 1 && r->elist[0].created_by == bob);
+    }
+    oc_dbres_free(r);
+
+    /* A name with a colon in it is refused: it would be unparseable in a body. */
+    const char *bad_names[] = { "no:colon", "with space", "", "emoji!" };
+    for (size_t k = 0; k < sizeof bad_names / sizeof bad_names[0]; k++) {
+        j = oc_job_new(OC_JOB_ADD_EMOJI, 3);
+        j->user_id = bob; j->message_id = 1; j->ch_name = strdup(bad_names[k]);
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_LIST_ERR);
+        oc_dbres_free(r);
+    }
+
+    /* A non-image, and SOMEBODY ELSE'S attachment, are both refused — an emoji is
+     * readable workspace-wide, so the id must be one the caller was entitled to. */
+    j = oc_job_new(OC_JOB_ADD_EMOJI, 4);
+    j->user_id = bob; j->message_id = 2; j->ch_name = strdup("pdf");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_UNKNOWN_ATTACHMENT);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_ADD_EMOJI, 5);
+    j->user_id = bob; j->message_id = 3; j->ch_name = strdup("stolen");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_UNKNOWN_ATTACHMENT);
+    oc_dbres_free(r);
+
+    /* A duplicate name is refused rather than replacing the image, which would change
+     * what every message already containing `:shipit:` means. */
+    j = oc_job_new(OC_JOB_ADD_EMOJI, 6);
+    j->user_id = carol; j->message_id = 3; j->ch_name = strdup("shipit");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_LIST_ERR);
+    oc_dbres_free(r);
+
+    /* Anyone can READ it — an emoji only half the workspace can see is unusable. */
+    j = oc_job_new(OC_JOB_ATTACH_LOOKUP, 7);
+    j->user_id = carol; j->attachment_id = 1;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_META);
+    oc_dbres_free(r);
+
+    /* carol (neither creator nor admin) cannot delete it; bob can. */
+    j = oc_job_new(OC_JOB_DELETE_EMOJI, 8);
+    j->user_id = carol; j->ch_name = strdup("shipit");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_DELETE_EMOJI, 9);
+    j->user_id = bob; j->ch_name = strdup("shipit");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_EMOJI_LIST && r->n_elist == 0 && r->ch_fanout);
+    oc_dbres_free(r);
+
+    /* An OWNER can delete somebody else's: a shortcode is workspace-wide state. */
+    j = oc_job_new(OC_JOB_ADD_EMOJI, 10);
+    j->user_id = bob; j->message_id = 1; j->ch_name = strdup("again");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w); oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_DELETE_EMOJI, 11);
+    j->user_id = alice; j->ch_name = strdup("again");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_EMOJI_LIST && r->n_elist == 0);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* Group DMs (REQ-056). A group DM is a DM with more than two participants — the
  * same `kind`, identified by its participant set, which is what a DM has always
  * been. So the properties to prove are: it is created, reopening the same SET
@@ -3656,6 +3780,7 @@ int run_dbwriter_tests(void) {
     test_webhooks();
     test_invites_and_webhook_lifecycle();
     test_status_and_profile();
+    test_custom_emoji();
     test_group_dm();
     test_avatar();
     test_notify_prefs();
