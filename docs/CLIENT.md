@@ -618,9 +618,31 @@ ran from inside `on_click`, so the re-entrancy is not new.
   through to the shell underneath, so a stray click in a modal's empty space could
   change channel behind the dimmed card.
 
+## Preferences is two-paned, and appearance applies live
+
+Categories left (**Appearance / Messages / Notifications / Advanced**), one pane's
+rows right. A row's hit-boxes exist only while its category is showing — the click
+router and the painter share `g_pref_cat` so they cannot disagree — and the sheet
+reopens on the pane you left it on.
+
+**Appearance applies live and reverts on Cancel.** A colour, a text size and a
+density are their own preview; you cannot judge any of them from a label. The
+snapshot therefore covers the accent, the text size, the density, the zoom step and
+the DPI, and `prefs_restore` re-applies each through the one path that knows what it
+costs (`scale_apply` rebuilds every DirectWrite format; `dpi_set` drops the render
+target, the brushes and the thumbnail cache).
+
+**The three scale multipliers stay separate (ARCH-97).** Text size is a preference
+and follows the account. Zoom (Ctrl+`=` / Ctrl+`-` / Ctrl+`0`) is this window only
+and is deliberately **not** persisted — a temporary magnification following you to
+another machine is not what you asked for. DPI belongs to the display. `g_text_scale`
+is the product of the first two, so nothing downstream has to know there are two
+inputs; anything that caches a font size of its own (the RichEdit's CHARFORMAT, the
+placeholder HFONT, the form fields' HFONT) is rebuilt by `scale_apply`.
+
 ## Run the GUI smoke before pushing Win32 chrome
 
-`scripts/gui_smoke.sh` asserts **71 invariants** through the test hook: for each of
+`scripts/gui_smoke.sh` asserts **82 invariants** through the test hook: for each of
 the six views, what is in the second column (`sidebar_kind`), whether the middle
 one is typeable (`main_is_conversation`), which native children are shown, and
 whether anything covers the window — plus the search overlay, the Pins tab, the

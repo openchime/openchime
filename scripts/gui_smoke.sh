@@ -162,6 +162,17 @@ say "== modal frame"
 # screenshot. Hardcoded coordinates were wrong twice while writing this: the card
 # geometry shifted under the new frame, and a chip's width depends on its label.
 # The app already reports where it drew each hit-box, so ask it.
+# Preferences is two-paned (WIN-78), so a row only has hit-boxes while ITS category
+# is showing — and the sheet remembers the pane you left it on. Select the category
+# before reaching for a chip.
+click_cat() {                     # click_cat <index>
+  local i="$1" r l t rr b
+  r=$(snap | grep -oE "prefcat $i name=[A-Za-z]* r=[0-9,.-]*" | sed 's/.*r=//')
+  [ -n "$r" ] || { fail "no prefcat $i rect"; return 1; }
+  IFS=, read -r l t rr b <<<"$r"
+  "$DRIVE" click $(( (${l%.*} + ${rr%.*}) / 2 )) $(( (${t%.*} + ${b%.*}) / 2 )) >/dev/null 2>&1
+}
+
 click_pref() {                    # click_pref <row> <val>
   local row="$1" val="$2" r
   r=$(snap | grep -o "prefhit row=$row val=$val r=[0-9,]*" | head -1 | sed 's/.*r=//')
@@ -174,6 +185,7 @@ click_pref() {                    # click_pref <row> <val>
 "$DRIVE" prefs >/dev/null 2>&1; sleep 0.7
 d=$(snap)
 expect "$d" modal prefs "preferences opens as a modal"
+click_cat 1; sleep 0.5            # Messages — where the time format lives
 before=$(printf '%s' "$d" | grep -o 'time24=[0-9]' | cut -d= -f2)
 other=$([ "$before" = "1" ] && echo 0 || echo 1)
 
@@ -186,6 +198,7 @@ expect "$d" time24    "$before" "Esc RESTORES the snapshot"
 expect "$d" modal     none      "nothing left open"
 
 "$DRIVE" prefs >/dev/null 2>&1; sleep 0.7
+click_cat 1; sleep 0.5
 click_pref 1 "$other"; sleep 0.3
 "$DRIVE" key enter >/dev/null 2>&1; sleep 0.6
 d=$(snap)
@@ -195,9 +208,75 @@ expect "$d" time24    "$other" "the change SURVIVES a commit"
 # Leave the preference as it was found: a smoke run that mutates settings is a
 # smoke run you stop trusting.
 "$DRIVE" prefs >/dev/null 2>&1; sleep 0.6
+click_cat 1; sleep 0.5
 click_pref 1 "$before"; sleep 0.3
 "$DRIVE" key enter >/dev/null 2>&1; sleep 0.5
 expect "$(snap)" time24 "$before" "the run left the setting as it found it"
+
+# --- appearance: text size, zoom, accent, density (WIN-78) ------------------
+# Each of these rebuilds the DirectWrite table or the palette, so "it did not take
+# effect" is a real failure mode and none of it is visible in a boolean. The dump
+# reports the three scale inputs ARCH-97 keeps apart plus their product.
+say "== appearance"
+"$DRIVE" view 0 >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; sleep 0.5
+
+base=$(snap | grep -oE 'scale=[0-9.]+' | head -1 | cut -d= -f2)
+"$DRIVE" key ctrl+= >/dev/null 2>&1; sleep 0.5
+d=$(snap)
+expect "$d" zoom 1 "Ctrl+= zooms in"
+checks=$((checks + 1))
+got=$(printf '%s' "$d" | grep -oE 'scale=[0-9.]+' | head -1 | cut -d= -f2)
+if [ "$got" != "$base" ]; then ok "the font scale actually moved ($base -> $got)"
+else fail "scale unchanged at $got — the zoom did not reach fonts_build()"; fi
+"$DRIVE" key ctrl+0 >/dev/null 2>&1; sleep 0.5
+d=$(snap)
+expect "$d" zoom 0 "Ctrl+0 resets it"
+checks=$((checks + 1))
+got=$(printf '%s' "$d" | grep -oE 'scale=[0-9.]+' | head -1 | cut -d= -f2)
+if [ "$got" = "$base" ]; then ok "back to $base"
+else fail "scale did not return: $got vs $base"; fi
+
+# Ctrl+, opens Preferences, and it opens on a category rather than a flat list.
+"$DRIVE" key ctrl+, >/dev/null 2>&1; sleep 0.7
+d=$(snap)
+expect "$d" modal prefs "Ctrl+, opens Preferences"
+# It reopens on the pane you left it on, which is why this selects rather than
+# asserts a fixed category — an earlier section in this run leaves it on Messages.
+click_cat 0; sleep 0.5
+expect "$(snap)" prefcat 0 "the Appearance pane selects"
+
+# Switch to Advanced by clicking the row the app reported.
+r=$(printf '%s' "$d" | grep -oE 'prefcat 3 name=Advanced r=[0-9,.-]*' | sed 's/.*r=//')
+if [ -n "${r:-}" ]; then
+  IFS=, read -r l t rt2 b <<<"$r"
+  "$DRIVE" click $(( (${l%.*} + ${rt2%.*}) / 2 )) $(( (${t%.*} + ${b%.*}) / 2 )) >/dev/null 2>&1
+  sleep 0.5
+  expect "$(snap)" prefcat 3 "the category list switches panes"
+else
+  checks=$((checks + 1)); fail "no prefcat rects in the dump"
+fi
+
+# Text size and accent apply LIVE, and Cancel puts BOTH back — the whole point of
+# the snapshot rule, and neither is a local variable: one rebuilds every font, the
+# other re-resolves the palette.
+"$DRIVE" key esc >/dev/null 2>&1; sleep 0.5
+"$DRIVE" prefs >/dev/null 2>&1; sleep 0.7
+# Back to Appearance FIRST: the sheet remembers the pane you left it on (which is
+# right — you came back for the same thing), so the chips below are not on screen
+# after the Advanced check above.
+click_cat 0; sleep 0.5
+d=$(snap)
+ts0=$(printf '%s' "$d" | grep -oE 'textsize=[0-9]' | cut -d= -f2)
+ac0=$(printf '%s' "$d" | grep -oE 'accent=[0-9]' | cut -d= -f2)
+click_pref 7 2 && sleep 0.4      # Text size -> Large
+click_pref 6 2 && sleep 0.4      # Accent -> the third swatch
+d=$(snap)
+expect "$d" textsize 2 "a text size applies while the sheet is open"
+expect "$d" accent   2 "so does an accent"
+"$DRIVE" key esc >/dev/null 2>&1; sleep 0.6
+d=$(snap)
+expect "$d" textsize "$ts0" "Cancel RESTORES the text size"
+expect "$d" accent   "$ac0" "Cancel RESTORES the accent"
 
 # --- the generic form on the modal frame (WIN-77) ---------------------------
 # Sixteen call sites went through a native GDI popup with its own window class and

@@ -60,6 +60,17 @@ static const uint32_t LIGHT[TH_COUNT] = {
 
 uint32_t oc_theme[TH_COUNT];
 static int g_mode = -1;
+static int g_accent = OC_ACCENT_BLUE;
+
+/* name, dark accent, dark dim, light accent, light dim. The BLUE row is exactly
+ * what the two palettes above already carry, so the default is not a new colour
+ * scheme arriving with the feature. */
+static const struct { const char *name; uint32_t d, dd, l, ld; } ACCENTS[OC_ACCENT_COUNT] = {
+    { "Blue",   0x3D8BFF, 0x2563EB, 0x1264A3, 0x0B4C7F },
+    { "Indigo", 0x8B7CFF, 0x6D5AE0, 0x4F46B5, 0x3B3490 },
+    { "Teal",   0x2DD4BF, 0x14A99B, 0x0F766E, 0x0A5750 },
+    { "Plum",   0xE879C7, 0xC2569F, 0xA1367F, 0x7C2762 },
+};
 
 /* The user's app theme, from the same registry value the shell reads. Anything
  * unreadable means dark: this app was designed dark, so that is the safe miss. */
@@ -82,6 +93,31 @@ void oc_theme_apply(int mode) {
                 (mode == OC_THEME_SYSTEM && system_prefers_light());
     const uint32_t *src = light ? LIGHT : DARK;
     for (int i = 0; i < TH_COUNT; i++) oc_theme[i] = src[i];
+    /* The accent is applied AFTER the palette copy, not folded into the tables:
+     * otherwise every accent would need its own full palette and the two would
+     * drift the first time a neutral changed. */
+    oc_theme[TH_ACCENT]     = light ? ACCENTS[g_accent].l  : ACCENTS[g_accent].d;
+    oc_theme[TH_ACCENT_DIM] = light ? ACCENTS[g_accent].ld : ACCENTS[g_accent].dd;
+}
+
+void oc_theme_set_accent(int accent) {
+    if (accent < 0 || accent >= OC_ACCENT_COUNT) accent = OC_ACCENT_BLUE;
+    g_accent = accent;
+    oc_theme_apply(oc_theme_mode());      /* re-resolve; the mode decides which pair */
+}
+
+int oc_theme_accent(void) { return g_accent; }
+
+const char *oc_theme_accent_name(int accent) {
+    if (accent < 0 || accent >= OC_ACCENT_COUNT) accent = OC_ACCENT_BLUE;
+    return ACCENTS[accent].name;
+}
+
+uint32_t oc_theme_accent_swatch(int accent) {
+    if (accent < 0 || accent >= OC_ACCENT_COUNT) accent = OC_ACCENT_BLUE;
+    int light = (g_mode == OC_THEME_LIGHT) ||
+                (g_mode == OC_THEME_SYSTEM && system_prefers_light());
+    return light ? ACCENTS[accent].l : ACCENTS[accent].d;
 }
 
 int oc_theme_mode(void) { return g_mode < 0 ? OC_THEME_DARK : g_mode; }

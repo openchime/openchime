@@ -240,6 +240,12 @@ static int        g_form_open;                       /* a form is on the frame *
  * caller and leaves no trace on screen, so "Cancel did not commit" is otherwise
  * unassertable. Diagnosis only. */
 static char       g_form_last[320];
+/* The form fields' font: the UI token at the UI family, so a native EDIT sitting on
+ * our card is not the one control in the app wearing the stock shell font (ARCH-97
+ * — the platform owns the family, we own the scale). Rebuilt whenever the scale
+ * changes, which is why form_font() is a function and not a one-shot global. */
+static HFONT      g_form_font;
+static float      g_form_font_scale;
 static int        g_form_done, g_form_result;         /* the nested loop's exit */
 static char       g_form_title[128];
 static oc_field  *g_form_f;                           /* the CALLER's array */
@@ -407,7 +413,9 @@ static int geom_capture(HWND hwnd) {
     g_win_max = mx; g_win_x = n->left; g_win_y = n->top; g_win_w = w; g_win_h = h;
     return 1;
 }
-static struct { D2D1_RECT_F r; int row, val; } g_pref_hits[16];
+/* 24, not 16: Appearance alone is 3 + 4 + 4 + 2 + 2 = 15 chips, and a table that
+ * silently stops recording makes the last control on a pane simply not respond. */
+static struct { D2D1_RECT_F r; int row, val; } g_pref_hits[24];
 static int g_n_pref_hits;
 static int g_n_rows;
 
@@ -1328,12 +1336,37 @@ static IDWriteTextFormat *mk_fmt(const WCHAR *family, float size, DWRITE_FONT_WE
     return f;
 }
 
+/* Modal content inset. One number, so no two modals disagree about their gutter.
+ * Up here rather than beside the frame because the two-paned Preferences has to
+ * undo it to bleed its category column to the card edge. */
+#define MODAL_PAD    24.0f
+
 /* ---- typography (ARCH-97) ------------------------------------------------- */
 
 /* The user's text-size preference (REQ-269), NOT system DPI and NOT window zoom
  * — ARCH-97 keeps the three separate on purpose. A DirectWrite format's size is
  * immutable, so changing this means rebuilding all of them. */
 static float g_text_scale = 1.0f;
+
+/* ARCH-97 keeps three multipliers apart, and this is where two of them live: the
+ * user's TEXT SIZE (a preference, follows the account) and per-window ZOOM
+ * (Ctrl+= / Ctrl+- / Ctrl+0, transient, this window only). DPI is the third and
+ * belongs to the display, not to either of these. g_text_scale is their product —
+ * the one number the font table multiplies by — so nothing downstream has to know
+ * there are two inputs. */
+static int   g_pref_textsize = 1;      /* 0 Small … 3 Largest */
+static int   g_pref_density = 1;       /* 0 compact, 1 cozy */
+static int   g_zoom_step;              /* -2 … +4, per window, not persisted */
+
+static float textsize_mult(void) {
+    static const float M[4] = { 0.90f, 1.00f, 1.12f, 1.25f };
+    int i = (g_pref_textsize < 0) ? 0 : (g_pref_textsize > 3 ? 3 : g_pref_textsize);
+    return M[i];
+}
+static float zoom_mult(void) {
+    int z = g_zoom_step < -2 ? -2 : (g_zoom_step > 4 ? 4 : g_zoom_step);
+    return 1.0f + 0.08f * (float)z;
+}
 
 /* Is a family actually installed? DirectWrite silently substitutes for a missing
  * one, and its substitute for "Segoe UI Variable Text" is not necessarily Segoe
@@ -2144,7 +2177,12 @@ static IDWriteTextLayout *body_layout(const oc_msg *msg, float cw, UINT32 *wlen)
 /* Vertical layout of a message block. An ungrouped message gets an even top
  * margin (so the avatar/name isn't jammed against the block top) matching the
  * bottom pad; grouped continuations stay tight. */
-#define MSG_TOP(g)   ((g) ? 4.0f  : 12.0f)   /* margin above avatar/name */
+/* Message density (WIN-78). It scales the BLOCK MARGINS only — never the line
+ * height or the font — because "compact" means fitting more messages on screen,
+ * and shrinking the text to do that is a text-size preference wearing the wrong
+ * name. The two are separate settings for that reason. */
+static float g_density = 1.0f;         /* 0.6 compact, 1.0 cozy */
+#define MSG_TOP(g)   ((g) ? 4.0f * g_density : 12.0f * g_density)
 #define MSG_NAME(g)  ((g) ? 0.0f  : 20.0f)   /* header (name/time) line height */
 /* The margin BELOW a block is chosen by whether the NEXT message continues this
  * one — not by whether this one is a continuation.
@@ -2156,7 +2194,7 @@ static IDWriteTextLayout *body_layout(const oc_msg *msg, float cw, UINT32 *wlen)
  *
  * The space between two messages is a property of the BOUNDARY, not of either
  * message, and asking the wrong one of the pair is why it was uneven. */
-#define MSG_BOT(next_grouped)   ((next_grouped) ? 6.0f  : 12.0f)
+#define MSG_BOT(next_grouped)   ((next_grouped) ? 6.0f * g_density : 12.0f * g_density)
 #define MSG_BODY_DY(g) (MSG_TOP(g) + MSG_NAME(g))   /* block top -> body top */
 /* A pinned message gets a marker line above its header (REQ-230), the way
  * Slack does — a pin you can only see by opening a list is a pin you forget.
@@ -3185,6 +3223,8 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
 
 static void layout_composer(HWND hwnd);   /* fwd */
 static void layout_natives(HWND hwnd);    /* fwd — owns every native child */
+static void scale_apply(HWND hwnd);        /* fwd — text size / zoom (ARCH-97) */
+static void dpi_set(HWND hwnd, UINT dpi);  /* fwd */
 static void layout_search(HWND hwnd);     /* fwd */
 static int  window_is_covered(void);      /* fwd */
 
@@ -3250,7 +3290,7 @@ static void nav_conversation(HWND hwnd, int delta, int unread_only) {
  */
 enum { ACC_NONE = 0, ACC_PALETTE, ACC_SEARCH, ACC_KEYS,
        ACC_NAV_PREV, ACC_NAV_NEXT, ACC_NAV_PREV_UNREAD, ACC_NAV_NEXT_UNREAD,
-       ACC_FOCUS };
+       ACC_FOCUS, ACC_PREFS, ACC_ZOOM_IN, ACC_ZOOM_OUT, ACC_ZOOM_RESET };
 #define AM_CTRL  1u
 #define AM_ALT   2u
 #define AM_SHIFT 4u
@@ -3273,6 +3313,14 @@ static const struct {
     { AM_CTRL,            'K',        ACC_PALETTE, "Ctrl+K",           "Command palette" },
     { AM_CTRL,            'F',        ACC_SEARCH,  "Ctrl+F",           "Search messages" },
     { AM_CTRL,            VK_OEM_2,   ACC_KEYS,    "Ctrl+/",           "This list" },
+    { AM_CTRL,            VK_OEM_COMMA, ACC_PREFS,  "Ctrl+,",           "Preferences" },
+    { AM_CTRL,            VK_OEM_PLUS,  ACC_ZOOM_IN,  "Ctrl+= / Ctrl+- / Ctrl+0", "Zoom this window in / out / reset" },
+    { AM_CTRL,            VK_OEM_MINUS, ACC_ZOOM_OUT, NULL, NULL },
+    { AM_CTRL,            '0',          ACC_ZOOM_RESET, NULL, NULL },
+    /* The numeric keypad's +/- are different virtual keys and a user with a full
+     * keyboard will reach for them. */
+    { AM_CTRL,            VK_ADD,       ACC_ZOOM_IN,  NULL, NULL },
+    { AM_CTRL,            VK_SUBTRACT,  ACC_ZOOM_OUT, NULL, NULL },
     { 0,                  VK_F6,      ACC_FOCUS,   "F6",               "Move focus between the composer and the filter box" },
     { 0,                  0,          ACC_NONE,  "Mouse wheel",        "Scroll the transcript, sidebar or open pane" },
     { 0,                  0,          ACC_NONE,  "Right-click",        "Actions for a message, member or channel" },
@@ -3289,6 +3337,10 @@ static void accel_run(HWND hwnd, int action) {
     case ACC_PALETTE: palette_open(hwnd); break;
     case ACC_SEARCH:  search_open(hwnd);  break;
     case ACC_KEYS:    if (g_keys_open) modal_finish(0); else modal_enter(hwnd, &g_keys_open); break;
+    case ACC_PREFS:   if (g_prefs_open) modal_finish(0); else modal_enter(hwnd, &g_prefs_open); break;
+    case ACC_ZOOM_IN:    if (g_zoom_step < 4)  { g_zoom_step++; scale_apply(hwnd); } break;
+    case ACC_ZOOM_OUT:   if (g_zoom_step > -2) { g_zoom_step--; scale_apply(hwnd); } break;
+    case ACC_ZOOM_RESET: if (g_zoom_step) { g_zoom_step = 0; scale_apply(hwnd); } break;
     case ACC_NAV_PREV:        nav_conversation(hwnd, -1, 0); break;
     case ACC_NAV_NEXT:        nav_conversation(hwnd,  1, 0); break;
     case ACC_NAV_PREV_UNREAD: nav_conversation(hwnd, -1, 1); break;
@@ -3982,13 +4034,12 @@ static void draw_files_view(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
 static float pref_row(ID2D1RenderTarget *rt, D2D1_RECT_F body, float y, int row,
                       const char *label, const char *hint,
                       const char *const *opts, int n_opts, int cur) {
-    draw_text(rt, label, g_ui_b, rf(body.left + 24, y, body.left + 320, y + 22), OC_COL_TEXT);
-    if (hint && hint[0])
-        /* Run to where the choice buttons start, not a magic 340: the hint was
-         * clipped mid-word ("outside Do Not Dis…") at any pane width. */
-        draw_text(rt, hint, g_meta, rf(body.left + 24, y + 20, body.right - 210, y + 40), OC_COL_FAINT);
-
+    /* The CHIPS are measured first, and the label and hint then run to their left
+     * edge. A fixed inset (it was `body.right - 210`) clipped the hint mid-word the
+     * moment a row had four choices instead of two — "use zoom f", "not t". The
+     * chip row's width is knowable; a magic number is not. */
     float bx = body.right - 24;
+    float chips_left = body.right - 24;
     for (int i = n_opts - 1; i >= 0; i--) {
         float w = text_width(opts[i], g_meta) + 26;
         D2D1_RECT_F b = rf(bx - w, y + 2, bx, y + 28);
@@ -3998,55 +4049,160 @@ static float pref_row(ID2D1RenderTarget *rt, D2D1_RECT_F body, float y, int row,
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
         draw_text(rt, opts[i], g_meta, b, on ? 0xFFFFFF : OC_COL_MUTED);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
-        if (g_n_pref_hits < 16) {
+        if (g_n_pref_hits < 24) {
             g_pref_hits[g_n_pref_hits].r = b;
             g_pref_hits[g_n_pref_hits].row = row;
             g_pref_hits[g_n_pref_hits].val = i;
             g_n_pref_hits++;
         }
         bx = b.left - 6;
+        chips_left = b.left;
     }
+    draw_text(rt, label, g_ui_b, rf(body.left + 24, y, chips_left - 12, y + 22), OC_COL_TEXT);
+    if (hint && hint[0])
+        draw_text(rt, hint, g_meta, rf(body.left + 24, y + 20, chips_left - 12, y + 40), OC_COL_FAINT);
     fill(rt, rf(body.left + 24, y + 46, body.right - 24, y + 47), OC_COL_BORDER);
     return y + 62;
 }
 
 enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
-       PREF_ROW_NOTIFY, PREF_ROW_QUICK };
+       PREF_ROW_NOTIFY, PREF_ROW_QUICK, PREF_ROW_ACCENT, PREF_ROW_TEXTSIZE,
+       PREF_ROW_DENSITY, PREF_ROW_ZOOM, PREF_ROW_DPI, PREF_ROW_RESET };
+
+/* Preferences is two-paned (WIN-78): categories left, one category's rows right.
+ * A single scrolling list was fine at six rows and is not at fourteen — and the
+ * rows are not one subject: how the app LOOKS, how messages READ, when it
+ * INTERRUPTS you, and the machine-level escape hatches are four different
+ * questions, and a flat list makes you re-read all of them to find one.
+ *
+ * Categories are an enum rather than strings so the click router and the painter
+ * cannot disagree about which is showing. */
+enum { PC_APPEARANCE = 0, PC_MESSAGES, PC_NOTIFICATIONS, PC_ADVANCED, PC_COUNT };
+static const char *PC_NAME[PC_COUNT] = { "Appearance", "Messages", "Notifications", "Advanced" };
+static int g_pref_cat = PC_APPEARANCE;
+static D2D1_RECT_F g_pref_cats[PC_COUNT];
+
+/* The accent swatch row: colour discs rather than named chips, because the name
+ * of a colour is not the thing being chosen. */
+static float pref_accent_row(ID2D1RenderTarget *rt, D2D1_RECT_F body, float y) {
+    float bx = body.right - 24, swatch_left = body.right - 24;
+    for (int i = OC_ACCENT_COUNT - 1; i >= 0; i--) {
+        D2D1_RECT_F b = rf(bx - 26, y + 2, bx, y + 28);
+        float cx = (b.left + b.right) / 2, cy = (b.top + b.bottom) / 2;
+        D2D1_ELLIPSE e = { { cx, cy }, 10, 10 };
+        ID2D1RenderTarget_FillEllipse(rt, &e, paint_with(oc_theme_accent_swatch(i)));
+        if (i == oc_theme_accent()) {
+            /* A ring, not a tick: a tick in the accent colour on the accent
+             * colour is invisible, and one in white is invisible on the light
+             * swatches. */
+            D2D1_ELLIPSE r2 = { { cx, cy }, 13, 13 };
+            ID2D1RenderTarget_DrawEllipse(rt, &r2, paint_with(OC_COL_TEXT), 1.6f, NULL);
+        }
+        if (g_n_pref_hits < 24) {
+            g_pref_hits[g_n_pref_hits].r = b;
+            g_pref_hits[g_n_pref_hits].row = PREF_ROW_ACCENT;
+            g_pref_hits[g_n_pref_hits].val = i;
+            g_n_pref_hits++;
+        }
+        bx = b.left - 6;
+        swatch_left = b.left;
+    }
+    /* Same rule as pref_row: label and hint stop where the controls start, so
+     * neither can be clipped by a row whose controls are wider than a guess. */
+    draw_text(rt, "Accent colour", g_ui_b,
+              rf(body.left + 24, y, swatch_left - 12, y + 22), OC_COL_TEXT);
+    draw_text(rt, "Selection, links and buttons.", g_meta,
+              rf(body.left + 24, y + 20, swatch_left - 12, y + 40), OC_COL_FAINT);
+    fill(rt, rf(body.left + 24, y + 46, body.right - 24, y + 47), OC_COL_BORDER);
+    return y + 62;
+}
 
 static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
-    D2D1_RECT_F body = reg;   /* the frame drew the title bar (modal_frame) */
     g_n_pref_hits = 0;
-    float y = body.top + 16;
+
+    /* The category column. Inside the frame's content rect, with its own right
+     * edge — the same treatment every other second column in the app gets. */
+    float catw = 168;
+    D2D1_RECT_F cats = rf(reg.left - MODAL_PAD + 1, reg.top, reg.left - MODAL_PAD + catw, reg.bottom);
+    fill(rt, cats, OC_COL_SIDEBAR);
+    fill(rt, rf(cats.right - 1, cats.top, cats.right, cats.bottom), OC_COL_BORDER);
+    float cy = cats.top + 10;
+    for (int i = 0; i < PC_COUNT; i++) {
+        D2D1_RECT_F r = rf(cats.left + 8, cy, cats.right - 9, cy + 32);
+        int on = (i == g_pref_cat);
+        if (on) fill_round(rt, r, 6.0f, OC_COL_SELECT);
+        else if (in_rect(r, (float)g_mouse_x, (float)g_mouse_y)) fill_round(rt, r, 6.0f, OC_COL_HOVER);
+        draw_text(rt, PC_NAME[i], on ? g_ui_b : g_ui,
+                  rf(r.left + 12, r.top, r.right, r.bottom), on ? OC_COL_TEXT : OC_COL_MUTED);
+        g_pref_cats[i] = r;
+        cy = r.bottom + 2;
+    }
+
+    D2D1_RECT_F body = rf(cats.right + MODAL_PAD - 24, reg.top, reg.right, reg.bottom);
+    float y = body.top + 14;
 
     static const char *THEMES[3] = { "Dark", "Light", "System" };
     static const char *TIMES[2]  = { "12-hour", "24-hour" };
     static const char *ONOFF[2]  = { "Off", "On" };
+    static const char *SIZES[4]  = { "Small", "Default", "Large", "Larger" };
+    static const char *DENS[2]   = { "Compact", "Cozy" };
 
-    y = pref_row(rt, body, y, PREF_ROW_THEME, "Appearance",
-                 "System follows the Windows app theme.", THEMES, 3, oc_theme_mode());
-    y = pref_row(rt, body, y, PREF_ROW_TIME, "Time format",
-                 "How message timestamps are shown.", TIMES, 2, g_pref_time24);
-    y = pref_row(rt, body, y, PREF_ROW_MEMBERS, "Members pane",
-                 "Shown by default when you open a channel.", ONOFF, 2, g_pref_members);
-    y = pref_row(rt, body, y, PREF_ROW_DAYSEP, "Date dividers",
-                 "A separator between days in the transcript.", ONOFF, 2, g_pref_daysep);
-    static const char *NOTIF[3] = { "Off", "Count", "Preview" };
-    y = pref_row(rt, body, y, PREF_ROW_NOTIFY, "Desktop notifications",
-                 "When OpenChime is not in front, and outside Do Not Disturb.",
-                 NOTIF, 3, g_pref_notify);
+    if (g_pref_cat == PC_APPEARANCE) {
+        y = pref_row(rt, body, y, PREF_ROW_THEME, "Theme",
+                     "System follows the Windows theme.", THEMES, 3, oc_theme_mode());
+        y = pref_accent_row(rt, body, y);
+        y = pref_row(rt, body, y, PREF_ROW_TEXTSIZE, "Text size",
+                     "Follows your account, not this machine.",
+                     SIZES, 4, g_pref_textsize);
+        y = pref_row(rt, body, y, PREF_ROW_DENSITY, "Message density",
+                     "The space between messages, not the text size.",
+                     DENS, 2, g_pref_density);
+        y = pref_row(rt, body, y, PREF_ROW_MEMBERS, "Members pane",
+                     "Shown by default when you open a channel.", ONOFF, 2, g_pref_members);
+    } else if (g_pref_cat == PC_MESSAGES) {
+        y = pref_row(rt, body, y, PREF_ROW_TIME, "Time format",
+                     "How message timestamps are shown.", TIMES, 2, g_pref_time24);
+        y = pref_row(rt, body, y, PREF_ROW_DAYSEP, "Date dividers",
+                     "A separator between days in the transcript.", ONOFF, 2, g_pref_daysep);
+        /* WIN-28: the quick reactions were six literals in the source. */
+        {
+            static const char *EDIT1[1] = { "Change\u2026" };
+            char cur[128] = "";
+            for (int i = 0; i < g_n_quick; i++)
+                snprintf(cur + strlen(cur), sizeof cur - strlen(cur), "%s ", REACT_EMO[i]);
+            draw_text(rt, "Quick reactions", g_ui_b, rf(body.left + 24, y, body.left + 320, y + 22), OC_COL_TEXT);
+            draw_emoji_fmt(rt, "", rf(0, 0, 0, 0), g_emoji_s);      /* keep the format warm */
+            draw_text(rt, cur, g_emoji_s, rf(body.left + 24, y + 20, body.left + 340, y + 42), OC_COL_TEXT);
+            y = pref_row(rt, body, y, PREF_ROW_QUICK, "", "", EDIT1, 1, -1);
+        }
+    } else if (g_pref_cat == PC_NOTIFICATIONS) {
+        static const char *NOTIF[3] = { "Off", "Count", "Preview" };
+        y = pref_row(rt, body, y, PREF_ROW_NOTIFY, "Desktop notifications",
+                     "When OpenChime is not in front, and outside Do Not Disturb.",
+                     NOTIF, 3, g_pref_notify);
+        /* Levels, quiet hours and the global default live in their own sheet, and
+         * this points at it rather than duplicating it: two places to set the same
+         * value is how they end up disagreeing. */
+        static const char *OPEN1[1] = { "Open\u2026" };
+        y = pref_row(rt, body, y, PREF_ROW_NOTIFY + 100, "Per-conversation levels",
+                     "Mute, mention-only, quiet hours and the workspace default.",
+                     OPEN1, 1, -1);
+    } else {
+        static const char *ZOOMB[3] = { "\u2212", "Reset", "+" };
+        char zh[96];
+        snprintf(zh, sizeof zh, "Currently %d%%. This window only.",
+                 (int)(zoom_mult() * 100.0f + 0.5f));
+        y = pref_row(rt, body, y, PREF_ROW_ZOOM, "Zoom", zh, ZOOMB, 3, -1);
 
-    /* WIN-28: the quick reactions were six literals in the source. */
-    {
-        static const char *EDIT1[1] = { "Change\u2026" };
-        char cur[128] = "";
-        for (int i = 0; i < g_n_quick; i++)
-            snprintf(cur + strlen(cur), sizeof cur - strlen(cur), "%s ", REACT_EMO[i]);
-        draw_text(rt, "Quick reactions", g_ui_b, rf(body.left + 24, y, body.left + 320, y + 22), OC_COL_TEXT);
-        draw_emoji_fmt(rt, "", rf(0, 0, 0, 0), g_emoji_s);      /* keep the format warm */
-        draw_text(rt, cur, g_emoji_s, rf(body.left + 24, y + 20, body.left + 340, y + 42), OC_COL_TEXT);
-        y = pref_row(rt, body, y, PREF_ROW_QUICK, "", "", EDIT1, 1, -1);
+        static const char *DPIS[4] = { "96", "120", "144", "192" };
+        char dh[96];
+        snprintf(dh, sizeof dh, "Currently %d. For layout checks.", g_dpi);
+        y = pref_row(rt, body, y, PREF_ROW_DPI, "DPI override", dh, DPIS, 4, -1);
+
+        static const char *RESET1[1] = { "Reset\u2026" };
+        y = pref_row(rt, body, y, PREF_ROW_RESET, "Reset preferences",
+                     "Back to the defaults; applied on Save.", RESET1, 1, -1);
     }
-
 }
 
 /* A person's card, in the context pane (right). Laid out VERTICALLY: the old
@@ -5181,8 +5337,7 @@ static int g_modal_primary_cmd = -1;        /* what Enter fires */
  * caller does not re-invent them. Anything else is dispatched to the modal. */
 enum { MODAL_CANCEL = -2, MODAL_OK = -1 };
 
-/* Content inset. One number, so no two modals disagree about their gutter. */
-#define MODAL_PAD    24.0f
+
 #define MODAL_TITLE_H 52.0f
 #define MODAL_FOOT_H  60.0f
 
@@ -5444,6 +5599,8 @@ static void close_overlays(void);                /* fwd */
  * judge a theme from a label — but it reverts with the rest on Cancel. */
 static struct {
     int theme, time24, members, daysep, notify;
+    int accent, textsize, density, zoom;
+    unsigned dpi;
     char quick[160];
 } g_prefs_snap;
 
@@ -5453,6 +5610,11 @@ static void prefs_snapshot(void) {
     g_prefs_snap.members = g_pref_members;
     g_prefs_snap.daysep  = g_pref_daysep;
     g_prefs_snap.notify  = g_pref_notify;
+    g_prefs_snap.accent   = oc_theme_accent();
+    g_prefs_snap.textsize = g_pref_textsize;
+    g_prefs_snap.density  = g_pref_density;
+    g_prefs_snap.zoom     = g_zoom_step;
+    g_prefs_snap.dpi      = g_dpi;
     snprintf(g_prefs_snap.quick, sizeof g_prefs_snap.quick, "%s", g_quick_names);
 }
 
@@ -5462,8 +5624,19 @@ static void prefs_restore(void) {
     g_pref_members = g_prefs_snap.members;
     g_pref_daysep  = g_prefs_snap.daysep;
     g_pref_notify  = g_prefs_snap.notify;
+    if (oc_theme_accent() != g_prefs_snap.accent) oc_theme_set_accent(g_prefs_snap.accent);
+    g_pref_density = g_prefs_snap.density;
+    g_density      = g_prefs_snap.density ? 1.0f : 0.6f;
     snprintf(g_quick_names, sizeof g_quick_names, "%s", g_prefs_snap.quick);
     quick_rebuild();
+    /* Text size, zoom and DPI each cost a font-table rebuild, so restore them
+     * through the one path that knows that — and only when they actually moved. */
+    if (g_dpi != g_prefs_snap.dpi) dpi_set(GetActiveWindow(), g_prefs_snap.dpi);
+    if (g_pref_textsize != g_prefs_snap.textsize || g_zoom_step != g_prefs_snap.zoom) {
+        g_pref_textsize = g_prefs_snap.textsize;
+        g_zoom_step     = g_prefs_snap.zoom;
+        scale_apply(GetActiveWindow());
+    }
 }
 
 /* Per-channel notification levels live on the SERVER, so a form over them cannot
@@ -7277,10 +7450,60 @@ static void theme_restyle_children(void) {
     SendMessageW(g_re, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
 }
 
+static void composer_scale_font(void);    /* fwd */
+
+/* Force a scale factor. Shared by WM_DPICHANGED's path, the `dpi` test verb and
+ * the Advanced pane's override, because the render target, the brushes and every
+ * cached thumbnail all carry the old DPI and forgetting one of them leaves the
+ * window drawing at two scales at once. */
+static void dpi_set(HWND hwnd, UINT dpi) {
+    if (dpi < 48 || dpi > 480) return;
+    g_dpi = dpi;
+    if (g_brush)  { ID2D1SolidColorBrush_Release(g_brush);  g_brush = NULL; }
+    if (g_brush2) { ID2D1SolidColorBrush_Release(g_brush2); g_brush2 = NULL; }
+    if (g_brush3) { ID2D1SolidColorBrush_Release(g_brush3); g_brush3 = NULL; }
+    thumbs_drop();
+    if (g_rt) { ID2D1HwndRenderTarget_Release(g_rt); g_rt = NULL; }
+    if (g_ph_font) { DeleteObject(g_ph_font); g_ph_font = NULL; }
+    if (g_form_font) { DeleteObject(g_form_font); g_form_font = NULL; g_form_font_scale = -1; }
+    layout_natives(hwnd);
+    layout_signin(hwnd);
+    InvalidateRect(hwnd, NULL, TRUE);
+}
+
+/* Every text-size or zoom change goes through here. A DirectWrite format's size is
+ * immutable, so a scale change means rebuilding the whole table, restyling the
+ * native children that carry their own font, and relaying out — three steps that
+ * were each forgettable at each call site. */
+static void scale_apply(HWND hwnd) {
+    g_text_scale = textsize_mult() * zoom_mult();
+    fonts_build();
+    if (g_body)
+        IDWriteTextFormat_SetLineSpacing(g_body, DWRITE_LINE_SPACING_METHOD_UNIFORM,
+                                         22.0f * g_text_scale, 16.5f * g_text_scale);
+    if (g_ph_font) { DeleteObject(g_ph_font); g_ph_font = NULL; }   /* rebuilt on demand */
+    composer_scale_font();     /* the RichEdit carries its own size, in twips */
+    layout_natives(hwnd);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
 /* Every theme switch goes through here so no caller can forget the children. */
 static void theme_set(int mode) {
     oc_theme_apply(mode);
     theme_restyle_children();
+}
+
+/* The composer's text size. A RichEdit keeps its own CHARFORMAT, in twips, so it
+ * does not follow a DirectWrite rebuild — leave this out and the transcript scales
+ * while the box you type into does not. */
+static void composer_scale_font(void) {
+    if (!g_re) return;
+    CHARFORMAT2W cf; ZeroMemory(&cf, sizeof cf);
+    cf.cbSize = sizeof cf;
+    cf.dwMask = CFM_SIZE | CFM_FACE;
+    cf.yHeight = (LONG)(FONT_BODY * g_text_scale * 15.0f);
+    lstrcpynW(cf.szFaceName, ui_family(), LF_FACESIZE);
+    SendMessageW(g_re, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
 }
 
 static void composer_create(HWND parent) {
@@ -7975,6 +8198,8 @@ static int on_click(HWND hwnd, int x, int y) {
         if (in_rect(g_modal_card, x, y)) return 1;
     }
     if (g_prefs_open) {
+        for (int i = 0; i < PC_COUNT; i++)
+            if (in_rect(g_pref_cats[i], x, y)) { g_pref_cat = i; InvalidateRect(hwnd, NULL, FALSE); return 1; }
         for (int i = 0; i < g_n_pref_hits; i++) {
             if (!in_rect(g_pref_hits[i].r, x, y)) continue;
             int v = g_pref_hits[i].val;
@@ -7986,6 +8211,44 @@ static int on_click(HWND hwnd, int x, int y) {
             case PREF_ROW_MEMBERS: g_pref_members = v; g_show_members = v; layout_composer(hwnd); break;
             case PREF_ROW_DAYSEP:  g_pref_daysep = v; break;
             case PREF_ROW_NOTIFY:  g_pref_notify = v; break;
+            /* Appearance applies LIVE while the sheet is open — a colour, a text
+             * size and a density are their own preview and cannot be judged from a
+             * label — and reverts with everything else on Cancel. */
+            case PREF_ROW_ACCENT:   oc_theme_set_accent(v); break;
+            case PREF_ROW_TEXTSIZE: g_pref_textsize = v; scale_apply(hwnd); break;
+            case PREF_ROW_DENSITY:  g_pref_density = v; g_density = v ? 1.0f : 0.6f; break;
+            case PREF_ROW_ZOOM:
+                if (v == 0)      g_zoom_step--;
+                else if (v == 1) g_zoom_step = 0;
+                else             g_zoom_step++;
+                if (g_zoom_step < -2) g_zoom_step = -2;
+                if (g_zoom_step >  4) g_zoom_step =  4;
+                scale_apply(hwnd);
+                break;
+            case PREF_ROW_DPI: {
+                static const int DPIV[4] = { 96, 120, 144, 192 };
+                dpi_set(hwnd, (UINT)DPIV[v < 0 ? 0 : (v > 3 ? 3 : v)]);
+                break; }
+            case PREF_ROW_RESET:
+                /* Not persisted here: Save commits, like every other control on
+                 * this card. Cancel puts the old values back from the snapshot. */
+                theme_set(OC_THEME_DARK);
+                oc_theme_set_accent(OC_ACCENT_BLUE);
+                g_pref_time24 = 1; g_pref_members = 1; g_pref_daysep = 1;
+                g_pref_notify = NOTIFY_FULL;
+                g_pref_textsize = 1; g_pref_density = 1; g_density = 1.0f;
+                g_zoom_step = 0;
+                snprintf(g_quick_names, sizeof g_quick_names, "%s", QUICK_DEFAULT);
+                quick_rebuild();
+                scale_apply(hwnd);
+                break;
+            case PREF_ROW_NOTIFY + 100:
+                /* The notifications sheet, from here. modal_finish first, so this
+                 * card's snapshot is committed rather than left half-open behind
+                 * another modal. */
+                modal_finish(1);
+                modal_enter(hwnd, &g_notify_open);
+                return 1;
             case PREF_ROW_QUICK: {
                 oc_field f[1] = { { FF_TEXT, "Quick reactions",
                                     "Up to six emoji shortcodes, comma separated (e.g. +1, fire, tada).", "" } };
@@ -9130,12 +9393,6 @@ static void lg_set_font(HWND w) {
     SendMessageW(w, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
 }
 
-/* The form fields' font: the UI token at the UI family, so a native EDIT sitting
- * on our card is not the one control in the app wearing the stock shell font
- * (ARCH-97 — the platform owns the family, we own the scale). Rebuilt whenever the
- * scale changes, which is why it is a function and not a one-shot global. */
-static HFONT g_form_font;
-static float g_form_font_scale;
 static HFONT form_font(void) {
     if (g_form_font && g_form_font_scale == g_text_scale) return g_form_font;
     if (g_form_font) DeleteObject(g_form_font);
@@ -9383,6 +9640,11 @@ static void open_profile_menu(HWND hwnd) {
     }
     mi_item(53, "Edit profile\xE2\x80\xA6");
     mi_item(54, "Active sessions\xE2\x80\xA6");   /* REQ-182 */
+    /* Preferences hangs off YOU as well as off the workspace menu (WIN-78). It was
+     * only on the workspace menu, which is the same category error as the
+     * connection dot in the channel header: how the app looks to you is not a
+     * property of the workspace. */
+    mi_item(70, "Preferences\xE2\x80\xA6  (Ctrl+,)");
     mi_sep();
     mi_item(30, "Change display name\xE2\x80\xA6");
     mi_item(31, "Change password\xE2\x80\xA6");
@@ -9428,9 +9690,13 @@ static void open_new_menu(HWND hwnd) {
 static void prefs_save(void) {
     if (!g_client) return;
     char enc[352];
-    snprintf(enc, sizeof enc, "t:%d;h:%d;m:%d;d:%d;n:%d;w:%d,%d,%d,%d,%d;q:%s",
+    /* Zoom is deliberately absent: it is per window and transient (ARCH-97), so
+     * persisting it would make one window's temporary magnification follow the
+     * account to every other machine. */
+    snprintf(enc, sizeof enc, "t:%d;h:%d;m:%d;d:%d;n:%d;a:%d;s:%d;y:%d;w:%d,%d,%d,%d,%d;q:%s",
              oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep,
-             g_pref_notify, g_win_x, g_win_y, g_win_w, g_win_h, g_win_max,
+             g_pref_notify, oc_theme_accent(), g_pref_textsize, g_pref_density,
+             g_win_x, g_win_y, g_win_w, g_win_h, g_win_max,
              g_quick_names);
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
 }
@@ -9448,6 +9714,9 @@ static void prefs_load(const oc_model *m) {
             if (k == 't') t = val; else if (k == 'h') h = val;
             else if (k == 'm') mm = val; else if (k == 'd') d = val;
             else if (k == 'n') g_pref_notify = (val < 0 || val > 2) ? NOTIFY_FULL : val;
+            else if (k == 'a') oc_theme_set_accent(val);
+            else if (k == 's') g_pref_textsize = (val < 0 || val > 3) ? 1 : val;
+            else if (k == 'y') { g_pref_density = val ? 1 : 0; g_density = val ? 1.0f : 0.6f; }
             else if (k == 'w') {
                 int a, b2, c2, d2, e2;
                 if (sscanf(p + 2, "%d,%d,%d,%d,%d", &a, &b2, &c2, &d2, &e2) == 5 && c2 > 200 && d2 > 150) {
@@ -9470,6 +9739,11 @@ static void prefs_load(const oc_model *m) {
     g_pref_daysep  = d ? 1 : 0;
     g_show_members = g_pref_members;
     theme_set(t);
+    /* After theme_set: the accent pair is resolved per mode, so the mode has to be
+     * in force first. scale_apply needs a window and prefs_load runs before one is
+     * around on some paths, so the caller's next layout picks it up. */
+    g_text_scale = textsize_mult() * zoom_mult();
+    fonts_build();
 }
 
 static void sidebar_opts_save(void) {
@@ -10044,6 +10318,16 @@ static void test_dump(const char *path) {
     fprintf(f, "menu=%d more=%d lightbox=%llu\n", g_menu, g_more_open,
             (unsigned long long)g_lightbox);
     fprintf(f, "lastclick %s\n", g_modal_lastclick);
+    /* The three scale inputs ARCH-97 keeps apart, plus the product the font table
+     * actually uses — so "the text did not change size" is one line to check. */
+    fprintf(f, "textsize=%d zoom=%d scale=%.3f dpi=%u density=%d accent=%d\n",
+            g_pref_textsize, g_zoom_step, g_text_scale, g_dpi, g_pref_density,
+            oc_theme_accent());
+    fprintf(f, "prefcat=%d\n", g_pref_cat);
+    for (int i = 0; i < PC_COUNT; i++)
+        fprintf(f, "  prefcat %d name=%s r=%.0f,%.0f,%.0f,%.0f\n", i, PC_NAME[i],
+                g_pref_cats[i].left, g_pref_cats[i].top,
+                g_pref_cats[i].right, g_pref_cats[i].bottom);
     for (int i = 0; i < g_n_pref_hits; i++)
         fprintf(f, "  prefhit row=%d val=%d r=%.0f,%.0f,%.0f,%.0f\n",
                 g_pref_hits[i].row, g_pref_hits[i].val, g_pref_hits[i].r.left,
@@ -10265,6 +10549,14 @@ static void test_poll(HWND hwnd) {
                  !strcmp(k, "down")  ? VK_DOWN   :
                  !strcmp(k, "f6")    ? VK_F6     :
                  !strcmp(k, "slash") ? VK_OEM_2  :
+                 /* The OEM keys, by name: "=" and "-" are not letters and atoi()
+                  * quietly turned both into VK 0, so `key ctrl+=` was a no-op that
+                  * still acked "ok" — a harness lying in the one direction that
+                  * matters. */
+                 (!strcmp(k, "=") || !strcmp(k, "plus") || !strcmp(k, "equals")) ? VK_OEM_PLUS :
+                 (!strcmp(k, "-") || !strcmp(k, "minus")) ? VK_OEM_MINUS :
+                 (!strcmp(k, ",") || !strcmp(k, "comma")) ? VK_OEM_COMMA :
+                 (k[0] >= '0' && k[0] <= '9' && !k[1]) ? k[0] :   /* VK_0..VK_9 are ASCII */
                  (k[0] >= 'a' && k[0] <= 'z' && !k[1]) ? (k[0] - 32) : atoi(k);
         /* Modifiers are read with GetKeyState, so they have to be really held:
          * SetKeyboardState makes them so for this thread without moving the user's
@@ -10302,18 +10594,8 @@ static void test_poll(HWND hwnd) {
         /* Force a scale factor so the layout can be checked without a scaled
          * display attached. Same path WM_DPICHANGED takes. */
         int d = atoi(arg);
-        if (d >= 48 && d <= 480) {
-            g_dpi = (UINT)d;
-            if (g_brush)  { ID2D1SolidColorBrush_Release(g_brush);  g_brush = NULL; }
-            if (g_brush2) { ID2D1SolidColorBrush_Release(g_brush2); g_brush2 = NULL; }
-        if (g_brush3) { ID2D1SolidColorBrush_Release(g_brush3); g_brush3 = NULL; }
-            thumbs_drop();
-            if (g_rt) { ID2D1HwndRenderTarget_Release(g_rt); g_rt = NULL; }
-            layout_composer(hwnd);
-            layout_signin(hwnd);
-            InvalidateRect(hwnd, NULL, TRUE);
-            test_ack("ok");
-        } else test_ack("err");
+        if (d >= 48 && d <= 480) { dpi_set(hwnd, (UINT)d); test_ack("ok"); }
+        else test_ack("err");
     } else if (!strcmp(verb, "wsforget")) {
         /* The removal itself, minus the confirmation dialog a harness cannot
          * dismiss reliably. Same code path the button takes after OK. */

@@ -70,7 +70,7 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 | ~~**WIN-75**~~ | ~~The palette has no affordance~~ **DONE.** "Jump to…  (Ctrl+K)" in the **New** menu, beside "Search messages…" — the menu that already answers "do something". The shortcut is named in the label so the menu teaches the keystroke instead of replacing it. | — |
 | ~~**WIN-76**~~ | ~~Long lists do not scroll~~ **DONE** for Files and Later, both through the offset five other panes already shared (`ovl_use`/`ovl_begin`/`ovl_end`) rather than a sixth private one; the wheel routes to it for both views. The Files list's **"%d more — narrow the filters"** line is deleted: it existed only because the list could not scroll, and a count of unreachable rows is a worse answer than a scrollbar. The 200-row **server** cap notice stays — that one is a real limit. **Still open, split out as WIN-82:** the Files channel census is only as complete as that 200-row page. | — |
 | **WIN-77** | Modal frame: ~~`confirm()`~~ **(done)** · pane headers · `form_dialog`'s 16 sites | P1 | L |
-| **WIN-78** | Preferences as two panes + appearance depth (accent, text size, density, zoom) | P2 | M |
+| ~~**WIN-78**~~ | ~~Preferences as two panes + appearance depth~~ **DONE** — see §1 | P2 | M |
 | ~~**WIN-79**~~ | ~~Replace the native context menus~~ **DONE** (ARCH-98). All four — message, member, channel, image kebab — are the app's own floating menu; `TrackPopupMenu`, `CreatePopupMenu` and `AppendMenuW` appear nowhere in the client. They keep **their own command numbers**, dispatched per kind, because the dropdowns' space was already crowded (a message's "Edit = 21" collides with a notification level). The three **submenus were flattened**: roles and notify levels became ticked sections, which shows the current value that a submenu hid behind a hover; the quick reactions became a new `MK_EMOJIROW` — one row, per-glyph hit-boxes, colour font like the picker. | — |
 | **WIN-80** | Custom DirectWrite composer, replacing RichEdit (ARCH-98) | P1 | XL |
 | **WIN-81** | The GUI smoke does not run in CI — needs a self-hosted Windows runner | P2 | M |
@@ -215,12 +215,25 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
   probably right for notification levels and roles; the quick-reaction row wants to
   stay inline.
 
-- **WIN-78 — Preferences.** A two-pane card (categories left, panel right) carrying
-  accent colour, **text size** (the `g_text_scale` hook exists and is applied by
-  `fonts_build()`; nothing sets it yet), density, and zoom on Ctrl+`=`/`-`/`0` —
-  three separate multipliers by ARCH-97. Entry from the **You** avatar and Ctrl+`,`,
-  not only the workspace menu: settings about *you* hanging off the *workspace* menu
-  is the same category error as the connection dot in the channel header.
+- ~~**WIN-78 — Preferences.**~~ **DONE.** Two panes — **Appearance / Messages /
+  Notifications / Advanced** — because fourteen rows are not one subject: how the app
+  looks, how messages read, when it interrupts you and the machine-level escape
+  hatches are four questions, and a flat list makes you re-read all of them to find
+  one. New in Appearance: **accent colour** (four choices, each a dark/light PAIR —
+  the bright blue that pops on navy is unreadable on white, which is why the two
+  palettes differ in their accent at all, and picking a colour must not undo that),
+  **text size**, and **message density** (which scales the block MARGINS only —
+  shrinking the text to fit more messages is a text-size preference wearing the wrong
+  name). Advanced carries **zoom**, the DPI override and Reset. Entry from the **You**
+  menu and **Ctrl+,** as well as the workspace menu.
+  ARCH-97's three multipliers stay three: text size follows the account, zoom is this
+  window only and is deliberately NOT persisted, DPI belongs to the display.
+  **Two bugs found by asserting rather than looking:** `key ctrl+=` was a silent
+  no-op, because the verb's key parser fell through to `atoi("=")` = VK 0 and still
+  acked "ok" — a harness lying in the one direction that matters; and a preference
+  row's hint was clipped mid-word ("use zoom f") because the label ran to a fixed
+  `right - 210` while the chips are as wide as their labels. The chips are measured
+  first now and the text stops where they start.
 
 
 ## §2 Ready now, with a small app-core change
