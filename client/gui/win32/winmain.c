@@ -2007,7 +2007,17 @@ static IDWriteTextLayout *body_layout(const oc_msg *msg, float cw, UINT32 *wlen)
  * bottom pad; grouped continuations stay tight. */
 #define MSG_TOP(g)   ((g) ? 4.0f  : 12.0f)   /* margin above avatar/name */
 #define MSG_NAME(g)  ((g) ? 0.0f  : 20.0f)   /* header (name/time) line height */
-#define MSG_BOT(g)   ((g) ? 6.0f  : 12.0f)   /* margin below the block */
+/* The margin BELOW a block is chosen by whether the NEXT message continues this
+ * one — not by whether this one is a continuation.
+ *
+ * It used to ask about this message, and the first message of a group is by
+ * definition never grouped, so it always paid the wide 12px margin even when its
+ * own continuation followed. Every group of three or more therefore had one wide
+ * gap and then tight ones: 38px, then 32px, which is what the eye picks up.
+ *
+ * The space between two messages is a property of the BOUNDARY, not of either
+ * message, and asking the wrong one of the pair is why it was uneven. */
+#define MSG_BOT(next_grouped)   ((next_grouped) ? 6.0f  : 12.0f)
 #define MSG_BODY_DY(g) (MSG_TOP(g) + MSG_NAME(g))   /* block top -> body top */
 /* A pinned message gets a marker line above its header (REQ-230), the way
  * Slack does — a pin you can only see by opening a list is a pin you forget.
@@ -2018,6 +2028,7 @@ static IDWriteTextLayout *body_layout(const oc_msg *msg, float cw, UINT32 *wlen)
 /* A message's rendered height for a given content width (creates + returns the
  * body layout so the draw pass can reuse it; *wlen gets its UTF-16 length). */
 static float msg_height(const oc_msg *msg, float content_w, int grouped,
+                        int next_grouped,
                         IDWriteTextLayout **out_body, UINT32 *wlen) {
     IDWriteTextLayout *layout = body_layout(msg, content_w, wlen);
     float body_h = 18.0f;
@@ -2041,7 +2052,7 @@ static float msg_height(const oc_msg *msg, float content_w, int grouped,
     }
     if (msg->reply_count) extra++;
     return MSG_PIN(msg) + MSG_BODY_DY(grouped) + body_h +
-           (float)extra * LINE_H + thumbs + MSG_BOT(grouped);
+           (float)extra * LINE_H + thumbs + MSG_BOT(next_grouped);
 }
 
 static int reaction_is_mine(const oc_msg *msg, const char *emoji);   /* fwd */
@@ -2332,7 +2343,13 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
                  !same_day(msgs[first + i - 1].server_time, msgs[first + i].server_time)));
         grouped[i] = (uint8_t)(!sep[i] && i > 0 &&
                      groups_with(&msgs[first + i - 1], &msgs[first + i]));
-        heights[i] = msg_height(&msgs[first + i], content_w, grouped[i], &layouts[i], &wlens[i]);
+        /* Look ahead one: does the message after this one continue it? A date
+         * divider between them breaks the group, exactly as sep[] does above. */
+        int next_grouped = (i + 1 < n) &&
+                           same_day(msgs[first + i].server_time, msgs[first + i + 1].server_time) &&
+                           groups_with(&msgs[first + i], &msgs[first + i + 1]);
+        heights[i] = msg_height(&msgs[first + i], content_w, grouped[i], next_grouped,
+                                &layouts[i], &wlens[i]);
         total += (sep[i] ? SEP_H : 0);
         if (capture && g_unread_from && g_unread_chan == g_sel &&
             msgs[first + i].message_id > g_unread_from &&
@@ -2576,7 +2593,7 @@ static void draw_thread(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
         float pad = 20.0f, x0 = body.left + pad;
         float cw = (body.right - pad) - (x0 + AVA + 12); if (cw < 80) cw = 80;
         IDWriteTextLayout *pl = NULL;
-        float ph = msg_height(parent, cw, 0, &pl, NULL);
+        float ph = msg_height(parent, cw, 0, 0, &pl, NULL);   /* a thread parent stands alone */
         if (ph > 120) ph = 120;
         D2D1_RECT_F pband = rf(body.left, top, body.right, top + ph);
         ID2D1RenderTarget_PushAxisAlignedClip(rt, &pband, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
