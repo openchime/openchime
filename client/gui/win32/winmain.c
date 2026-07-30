@@ -4533,6 +4533,25 @@ static void draw_members(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
                 draw_lucide(rt, cm->role == OC_ROLE_OWNER ? OC_ICON_CROWN : OC_ICON_SHIELD,
                             rf(gx, y + ROW_H / 2 - 7, gx + 14, y + ROW_H / 2 + 7), OC_COL_FAINT);
         }
+        /* A custom status (REQ-241, WIN-53) sits after the name and role, dimmed —
+         * it is what somebody is DOING, so it must not compete with who they are.
+         * An expired one never arrives: the daemon suppresses it on read, so this
+         * needs no clock of its own. */
+        {
+            const oc_member *mu = NULL;
+            for (size_t k = 0; k < m->n_users; k++)
+                if (m->users[k].user_id == cm->user_id) { mu = &m->users[k]; break; }
+            if (mu && (mu->status_emoji[0] || mu->status_text[0])) {
+                float sx = x0 + 34 + text_width(disp, g_ui) + 8;
+                if (cm->role >= OC_ROLE_ADMIN) sx += 18;
+                char st[112];
+                snprintf(st, sizeof st, "%s%s%s", mu->status_emoji,
+                         mu->status_emoji[0] && mu->status_text[0] ? " " : "",
+                         mu->status_text);
+                if (sx + 20 < W - 14)
+                    draw_text(rt, st, g_meta, rf(sx, y, W - 14, y + ROW_H), OC_COL_FAINT);
+            }
+        }
         if (g_n_memrows < (int)(sizeof g_memrows / sizeof g_memrows[0])) {
             g_memrows[g_n_memrows].r = rf(x0, y, W, y + ROW_H);
             g_memrows[g_n_memrows].uid = cm->user_id; g_n_memrows++;
@@ -9054,6 +9073,26 @@ static void open_profile_menu(HWND hwnd) {
     mi_item(11, "Set status: Away");
     mi_item(50, "Do not disturb\xE2\x80\xA6");
     mi_sep();
+    /* Custom status (REQ-241/122, WIN-53) — distinct from presence above: presence is
+     * "am I here", status is "what am I doing", and Slack keeps both. */
+    {
+        const oc_model *pm = model();
+        const oc_member *me = NULL;
+        if (pm) for (size_t i = 0; i < pm->n_users; i++)
+            if (pm->users[i].user_id == pm->user_id) { me = &pm->users[i]; break; }
+        if (me && (me->status_text[0] || me->status_emoji[0])) {
+            char cur[96];
+            snprintf(cur, sizeof cur, "%s%s%s", me->status_emoji,
+                     me->status_emoji[0] ? "  " : "", me->status_text);
+            mi_section(cur);
+            mi_item(52, "Clear status");
+            mi_item(51, "Change status\xE2\x80\xA6");
+        } else {
+            mi_item(51, "Set a status\xE2\x80\xA6");
+        }
+    }
+    mi_item(53, "Edit profile\xE2\x80\xA6");
+    mi_sep();
     mi_item(30, "Change display name\xE2\x80\xA6");
     mi_item(31, "Change password\xE2\x80\xA6");
     g_menu = MENU_PROFILE; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 224;
@@ -9299,6 +9338,55 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 7:  g_view = VIEW_HOME; upload_file(hwnd); break;
     case 10: oc_client_set_presence(g_client, OC_PRESENCE_ONLINE); break;
     case 11: oc_client_set_presence(g_client, OC_PRESENCE_AWAY); break;
+    case 51: {   /* WIN-53 */
+        oc_field f[3] = {
+            { FF_TEXT,   "Emoji",  "A shortcode, e.g. :pizza: — or leave it empty.", "" },
+            { FF_TEXT,   "Status", "What you are doing. Empty clears it.",           "" },
+            { FF_CHOICE, "Clear after", "Never|30 minutes|1 hour|4 hours|Today",     "0" },
+        };
+        const oc_model *sm = model();
+        if (sm) for (size_t i = 0; i < sm->n_users; i++)
+            if (sm->users[i].user_id == sm->user_id) {
+                snprintf(f[0].value, sizeof f[0].value, "%s", sm->users[i].status_emoji);
+                snprintf(f[1].value, sizeof f[1].value, "%s", sm->users[i].status_text);
+                break;
+            }
+        if (!form_dialog(hwnd, "Status", f, 3)) break;
+        /* The expiry is computed HERE and sent as an absolute time, so the daemon
+         * does not have to know what "4 hours" meant or when the request was made. */
+        static const uint64_t MINS[5] = { 0, 30, 60, 240, 0 };
+        int pick = atoi(f[2].value);
+        uint64_t exp = 0;
+        if (pick >= 1 && pick <= 3) exp = (uint64_t)time(NULL) * 1000ull + MINS[pick] * 60000ull;
+        else if (pick == 4) {
+            /* "Today" = local midnight, which is a different instant per user and so
+             * cannot be a fixed offset. */
+            time_t now = time(NULL); struct tm tv;
+            if (oc_localtime_r(&now, &tv)) {
+                tv.tm_hour = 23; tv.tm_min = 59; tv.tm_sec = 59;
+                exp = (uint64_t)mktime(&tv) * 1000ull;
+            }
+        }
+        oc_client_set_status(g_client, f[0].value, f[1].value, exp);
+        break; }
+    case 52:     /* WIN-53: clear */
+        oc_client_set_status(g_client, "", "", 0);
+        break;
+    case 53: {   /* WIN-47 */
+        oc_field f[2] = {
+            { FF_TEXT, "Title",    "Your role, shown on your profile.", "" },
+            { FF_TEXT, "Timezone", "e.g. Europe/London.",               "" },
+        };
+        const oc_model *pm2 = model();
+        if (pm2) for (size_t i = 0; i < pm2->n_users; i++)
+            if (pm2->users[i].user_id == pm2->user_id) {
+                snprintf(f[0].value, sizeof f[0].value, "%s", pm2->users[i].title);
+                snprintf(f[1].value, sizeof f[1].value, "%s", pm2->users[i].timezone);
+                break;
+            }
+        if (!form_dialog(hwnd, "Edit profile", f, 2)) break;
+        oc_client_set_profile(g_client, f[0].value, f[1].value);
+        break; }
     case 30: {
         const char *cur = m ? oc_model_user_name(m, m->user_id) : "";
         oc_field f[1] = { { FF_TEXT, "Display name",
@@ -9980,6 +10068,30 @@ static void test_poll(HWND hwnd) {
         sscanf(arg, "%63s %d", nm, &pub);
         if (g_client && nm[0]) { oc_client_create_channel_ex(g_client, nm, pub != 0); test_ack("ok"); }
         else test_ack("err");
+    } else if (!strcmp(verb, "status")) {
+        /* `status <emoji> <text...>`, empty clears. Bypasses the modal form for the
+         * same reason mkchan and upload do. */
+        char emo[32] = {0}; const char *txt = "";
+        if (arg[0]) {
+            size_t k = 0;
+            while (arg[k] && arg[k] != ' ' && k + 1 < sizeof emo) { emo[k] = arg[k]; k++; }
+            emo[k] = 0;
+            txt = arg[k] == ' ' ? arg + k + 1 : "";
+        }
+        oc_client_set_status(g_client, emo, txt, 0);
+        test_ack("ok");
+    } else if (!strcmp(verb, "profile_set")) {
+        /* `profile_set <timezone> <title...>` — timezone first because it has no
+         * spaces, so one sscanf-free split is unambiguous. */
+        char tz[48] = {0}; const char *title = "";
+        if (arg[0]) {
+            size_t k = 0;
+            while (arg[k] && arg[k] != ' ' && k + 1 < sizeof tz) { tz[k] = arg[k]; k++; }
+            tz[k] = 0;
+            title = arg[k] == ' ' ? arg + k + 1 : "";
+        }
+        oc_client_set_profile(g_client, title, tz);
+        test_ack("ok");
     } else if (!strcmp(verb, "mkhook")) {
         /* Bypass the Create-webhook form, as mkchan and upload bypass theirs: the
          * harness cannot drive a modal form_dialog (that is WIN-77's job). */

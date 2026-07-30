@@ -51,7 +51,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 26);
+    CHECK(oc_schema_version(db) == 27);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -2790,6 +2790,81 @@ static void test_invites_and_webhook_lifecycle(void) {
     oc_dbwriter_stop(w);
 }
 
+
+/* Custom status (REQ-241/122, WIN-53) and profile fields (REQ-240, WIN-47).
+ *
+ * The interesting rule is EXPIRY: the daemon must stop reporting a status once it
+ * lapses, whether or not the client that set it is still running. */
+static void test_status_and_profile(void) {
+    const char *path = "build/test_dbwriter_status.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "st-alice", "pw", OC_ROLE_OWNER);
+    CHECK(alice);
+
+    /* No status to begin with. */
+    oc_job *j = oc_job_new(OC_JOB_GET_PROFILE, 1);
+    j->user_id = alice;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_PROFILE_INFO && r->user_id == alice);
+    CHECK(r->st_emoji && r->st_emoji[0] == '\0');
+    CHECK(r->st_text  && r->st_text[0]  == '\0');
+    oc_dbres_free(r);
+
+    /* Set one with an expiry well in the future: it comes back intact. */
+    j = oc_job_new(OC_JOB_SET_STATUS, 2);
+    j->user_id = alice;
+    oc_job_set_body(j, "\xF0\x9F\x8D\x95", 4);        /* pizza */
+    j->ch_name = strdup("out for lunch");
+    j->message_id = (uint64_t)time(NULL) * 1000ull + 3600000ull;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_PROFILE_INFO);
+    CHECK(r->st_text && strcmp(r->st_text, "out for lunch") == 0);
+    CHECK(r->st_expires != 0);
+    oc_dbres_free(r);
+
+    /* An expiry in the PAST reads as no status at all — the daemon applies the rule
+     * on read, so nobody sees a stale status even before any cleanup. */
+    j = oc_job_new(OC_JOB_SET_STATUS, 3);
+    j->user_id = alice;
+    oc_job_set_body(j, "\xF0\x9F\x8D\x95", 4);
+    j->ch_name = strdup("stale");
+    j->message_id = 1000ull;                            /* 1970 */
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_PROFILE_INFO);
+    CHECK(r->st_text && r->st_text[0] == '\0');          /* suppressed */
+    CHECK(r->st_expires == 0);
+    oc_dbres_free(r);
+
+    /* Clearing: empty text wipes the emoji and the expiry together. */
+    j = oc_job_new(OC_JOB_SET_STATUS, 4);
+    j->user_id = alice;
+    j->ch_name = strdup("");
+    j->message_id = 0;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->st_emoji[0] == '\0' && r->st_expires == 0);
+    oc_dbres_free(r);
+
+    /* Profile fields round-trip and do not disturb the status. */
+    j = oc_job_new(OC_JOB_SET_PROFILE, 5);
+    j->user_id = alice;
+    j->ch_name = strdup("Principal Engineer");
+    oc_job_set_body(j, "Europe/London", 13);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->pf_title && strcmp(r->pf_title, "Principal Engineer") == 0);
+    CHECK(r->pf_tz && strcmp(r->pf_tz, "Europe/London") == 0);
+    CHECK(r->role == OC_ROLE_OWNER);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+}
+
 static void test_webhooks(void) {
     const char *path = "build/test_dbwriter_webhook.db";
     cleanup_db(path);
@@ -3117,6 +3192,7 @@ int run_dbwriter_tests(void) {
     test_attachments();
     test_webhooks();
     test_invites_and_webhook_lifecycle();
+    test_status_and_profile();
     test_notify_prefs();
     test_admin_ops();
     test_reactions();

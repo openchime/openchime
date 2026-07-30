@@ -212,6 +212,8 @@ static void free_attach_meta(oc_attach_meta *a, size_t n) {
 void oc_dbres_free(oc_dbres *r) {
     if (!r) return;
     free(r->body);
+    /* WIN-47/53's profile strings, alongside every other heap field. */
+    free(r->st_emoji); free(r->st_text); free(r->pf_title); free(r->pf_tz);
     free(r->members);
     free(r->author_name);
     free_attach_meta(r->attach, r->n_attach);
@@ -3546,6 +3548,107 @@ static oc_dbres *process_set_read_cursor(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* ---- custom status + profile fields (REQ-241/122, REQ-240) -------------------
+ *
+ * Both live on `users`. Status carries an EXPIRY that the daemon enforces, because a
+ * client that is not running cannot clear its own status — "in a meeting until 3pm"
+ * has to stop being true whether or not you are online.
+ */
+
+/* Fill a PROFILE_INFO result for `uid`. Expired status reads as absent: the row is
+ * left alone (a lazy sweep beats a timer thread) and every reader applies the same
+ * rule, so nobody sees a stale status even before it is cleaned up. */
+static void build_profile(sqlite3 *db, uint64_t uid, oc_dbres *r) {
+    sqlite3_stmt *st = NULL;
+    r->type = OC_RES_PROFILE_INFO;
+    r->user_id = uid;
+    sqlite3_prepare_v2(db,
+        "SELECT COALESCE(display_name,''), COALESCE(email,''), COALESCE(status_emoji,''), "
+        "       COALESCE(status_text,''), status_expires_ms, COALESCE(title,''), "
+        "       COALESCE(timezone,''), COALESCE(avatar_attachment_id,0), role "
+        "  FROM users WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *dn = sqlite3_column_text(st, 0);
+        const unsigned char *em = sqlite3_column_text(st, 1);
+        const unsigned char *se = sqlite3_column_text(st, 2);
+        const unsigned char *sx = sqlite3_column_text(st, 3);
+        uint64_t exp = (uint64_t)sqlite3_column_int64(st, 4);
+        const unsigned char *ti = sqlite3_column_text(st, 5);
+        const unsigned char *tz = sqlite3_column_text(st, 6);
+        int expired = (exp != 0 && exp <= dbw_now_ms());
+        r->author_name = strdup(dn ? (const char *)dn : "");
+        /* r->body is the generic byte payload (uint8_t*), reused here for the email.
+         * Cast once and measure the source, rather than strlen on a uint8_t*. */
+        const char *emv = em ? (const char *)em : "";
+        r->body        = (uint8_t *)strdup(emv);
+        r->body_len    = strlen(emv);
+        r->st_emoji    = strdup(expired ? "" : (se ? (const char *)se : ""));
+        r->st_text     = strdup(expired ? "" : (sx ? (const char *)sx : ""));
+        r->st_expires  = expired ? 0 : exp;
+        r->pf_title    = strdup(ti ? (const char *)ti : "");
+        r->pf_tz       = strdup(tz ? (const char *)tz : "");
+        r->pf_avatar   = (uint64_t)sqlite3_column_int64(st, 7);
+        const unsigned char *rl = sqlite3_column_text(st, 8);
+        r->role = (rl && !strcmp((const char *)rl, "owner")) ? OC_ROLE_OWNER
+                : (rl && !strcmp((const char *)rl, "admin")) ? OC_ROLE_ADMIN
+                                                             : OC_ROLE_MEMBER;
+    }
+    sqlite3_finalize(st);
+}
+
+static oc_dbres *process_set_status(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    sqlite3_stmt *st = NULL;
+    /* Empty text clears it, including any expiry: "no status" is one state, not two. */
+    int clearing = !j->ch_name || !j->ch_name[0];
+    sqlite3_prepare_v2(db,
+        "UPDATE users SET status_emoji=?1, status_text=?2, status_expires_ms=?3 WHERE id=?4;",
+        -1, &st, NULL);
+    /* The LENGTH, not -1: oc_job_set_body copies exactly `len` bytes and does NOT
+     * NUL-terminate, so binding with -1 read past the end until it happened to find a
+     * zero — a real overread that stored a 4-byte emoji as 6 bytes of which 2 were
+     * whatever followed in the heap. Every bind of j->body must pass j->body_len. */
+    sqlite3_bind_text (st, 1, clearing ? "" : (j->body ? (const char *)j->body : ""),
+                       clearing ? 0 : (int)j->body_len, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 2, clearing ? "" : j->ch_name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)(clearing ? 0 : j->message_id));  /* expires_at */
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)j->user_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    audit_actor(db, OC_AUDIT_ADMIN, "user.status", j->user_id, j->user_id, NULL, 1, NULL);
+    build_profile(db, j->user_id, r);
+    return r;
+}
+
+static oc_dbres *process_set_profile(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "UPDATE users SET title=?1, timezone=?2 WHERE id=?3;", -1, &st, NULL);
+    sqlite3_bind_text (st, 1, j->ch_name ? j->ch_name : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 2, j->body ? (const char *)j->body : "",
+                       j->body ? (int)j->body_len : 0, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    build_profile(db, j->user_id, r);
+    return r;
+}
+
+static oc_dbres *process_get_profile(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    /* Any tenant member may read any member's profile — the roster is already
+     * visible to everyone (REQ-030), so this adds no exposure. */
+    build_profile(db, j->message_id ? j->message_id : j->user_id, r);
+    return r;
+}
+
 /* Set the caller's do-not-disturb window (REQ-131). Write. */
 static oc_dbres *process_set_dnd(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
@@ -3955,7 +4058,7 @@ static int is_read_job(int type) {
            type == OC_JOB_LIST_WEBHOOKS || type == OC_JOB_LIST_NOTIFY_PREFS ||
            /* Read-only, so it goes to the reader thread (ARCH-66) like every other
             * list. Its three siblings — revoke, set-state, rotate — write. */
-           type == OC_JOB_LIST_INVITES ||
+           type == OC_JOB_LIST_INVITES || type == OC_JOB_GET_PROFILE ||
            type == OC_JOB_LIST_CLIENT_SETTINGS ||
            type == OC_JOB_CALL_AUTH ||
            type == OC_JOB_STORAGE_STATUS ||
@@ -3981,6 +4084,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_AUDIT_QUERY)    return process_audit_query(rdb, j);
     if (j->type == OC_JOB_LIST_WEBHOOKS)  return process_list_webhooks(rdb, j);
     if (j->type == OC_JOB_LIST_INVITES)   return process_list_invites(rdb, j);
+    if (j->type == OC_JOB_GET_PROFILE)    return process_get_profile(rdb, j);
     if (j->type == OC_JOB_LIST_NOTIFY_PREFS) return process_list_notify_prefs(rdb, j);
     if (j->type == OC_JOB_LIST_CLIENT_SETTINGS) return process_list_client_settings(rdb, j);
     if (j->type == OC_JOB_CALL_AUTH)      return process_call_auth(rdb, j);
@@ -4031,6 +4135,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_DELETE_WEBHOOK)  return process_delete_webhook(w->db, j);
     if (j->type == OC_JOB_SET_NOTIFY_PREF) return process_set_notify_pref(w->db, j);
     if (j->type == OC_JOB_SET_MUTE)        return process_set_mute(w->db, j);
+    if (j->type == OC_JOB_SET_STATUS)      return process_set_status(w->db, j);
+    if (j->type == OC_JOB_SET_PROFILE)     return process_set_profile(w->db, j);
     if (j->type == OC_JOB_SET_READ_CURSOR) return process_set_read_cursor(w->db, j);
     if (j->type == OC_JOB_SET_DND)         return process_set_dnd(w->db, j);
     if (j->type == OC_JOB_REGISTER_DEVICE_TOKEN)   return process_register_device_token(w->db, j);

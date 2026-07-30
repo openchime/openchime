@@ -530,6 +530,26 @@ static const char MIGRATION_0026[] =
      * recompute afterwards. */
     "CREATE INDEX IF NOT EXISTS idx_cursors_user ON delivery_cursors(user_id, channel_id);";
 
+static const char MIGRATION_0027[] =
+    /* Custom status (REQ-241/122, WIN-53) and the richer profile fields
+     * (REQ-240, WIN-47). All on `users`, because they are facts about a person and
+     * there is exactly one row per person — a side table would buy nothing but a
+     * join.
+     *
+     * `status_expires_ms` is why status is not just two text columns: "in a meeting
+     * until 3pm" has to stop being true on its own, and a client cannot be trusted
+     * to clear it (it may not be running). 0 = no expiry.
+     *
+     * The avatar is an ATTACHMENT id, not a blob column: the attachment store
+     * already handles upload, size limits, dedup by hash and reclamation (REQ-215,
+     * ARCH-78), and a second image path would have to reimplement all of it. */
+    "ALTER TABLE users ADD COLUMN status_emoji TEXT;"
+    "ALTER TABLE users ADD COLUMN status_text TEXT;"
+    "ALTER TABLE users ADD COLUMN status_expires_ms INTEGER NOT NULL DEFAULT 0;"
+    "ALTER TABLE users ADD COLUMN title TEXT;"
+    "ALTER TABLE users ADD COLUMN timezone TEXT;"
+    "ALTER TABLE users ADD COLUMN avatar_attachment_id INTEGER;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -557,6 +577,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 24, MIGRATION_0024 },
     { 25, MIGRATION_0025 },
     { 26, MIGRATION_0026 },
+    { 27, MIGRATION_0027 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

@@ -60,6 +60,8 @@ enum {
     OC_EV_INVITE_ROW,
     OC_EV_INVITE_END,
     OC_EV_INVITE_REVOKED,
+    /* A PROFILE_INFO (WIN-47/53): user_id + the fields, carried in the ev's slices. */
+    OC_EV_PROFILE_INFO,
     OC_EV_USER,            /* a USER_LIST entry: user_id + name(body) + role(status) + disabled(op) */
     OC_EV_WEBHOOK_INFO,    /* a WEBHOOK_INFO: message_id=webhook_id + channel_id + body=token (shown once) */
     OC_EV_WEBHOOK,         /* a WEBHOOK_LIST entry: message_id=webhook_id + channel_id + body=label + op=disabled */
@@ -184,6 +186,11 @@ enum {
     /* WIN-40 / WIN-52: channel_id + op (muted), and channel_id + message_id. */
     OC_CMD_SET_MUTE,
     OC_CMD_SET_READ_CURSOR,
+    /* WIN-53 / WIN-47: body=emoji, body2=text, server_time=expiry / body=title,
+     * body2=timezone. */
+    OC_CMD_SET_STATUS,
+    OC_CMD_SET_PROFILE,
+    OC_CMD_GET_PROFILE,
     OC_CMD_UPLOAD,          /* upload+post a file to `channel_id`: body = local path */
     OC_CMD_DOWNLOAD,        /* download an attachment: message_id = attachment_id, body = dest path */
     OC_CMD_LOGOUT,          /* revoke this session (op = scope) and close the connection */

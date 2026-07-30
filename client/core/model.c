@@ -803,6 +803,30 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     case OC_EV_SAVED_END:
         if (m->saved_open) m->saved_loading = 0;
         break;
+    case OC_EV_PROFILE_INFO: {
+        /* Unpack the \x1f-separated fields packed in net.c — kept beside the struct
+         * being filled, so the two halves are read together. */
+        oc_member *mem = NULL;
+        for (size_t i = 0; i < m->n_users; i++)
+            if (m->users[i].user_id == e->user_id) { mem = &m->users[i]; break; }
+        if (!mem) break;                 /* not in the roster: nothing to attach to */
+        const char *f[5] = { "", "", "", "", "" };
+        char buf[512];
+        snprintf(buf, sizeof buf, "%s", e->body ? e->body : "");
+        int nf = 0;
+        f[nf++] = buf;
+        for (char *q = buf; *q && nf < 5; q++)
+            if (*q == '\x1f') { *q = '\0'; f[nf++] = q + 1; }
+        if (f[0][0]) snprintf(mem->name, sizeof mem->name, "%s", f[0]);
+        snprintf(mem->status_emoji, sizeof mem->status_emoji, "%s", f[1]);
+        snprintf(mem->status_text,  sizeof mem->status_text,  "%s", f[2]);
+        snprintf(mem->title,        sizeof mem->title,        "%s", f[3]);
+        snprintf(mem->timezone,     sizeof mem->timezone,     "%s", f[4]);
+        mem->status_expires = e->server_time;
+        mem->avatar_id      = e->message_id;
+        if (e->op) mem->role = e->op;
+        break;
+    }
     case OC_EV_INVITE_ROW: {
         if (!m->invites_open) break;
         if (m->n_invites == m->cap_invites) {

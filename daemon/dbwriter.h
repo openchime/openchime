@@ -89,7 +89,16 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_SET_WEBHOOK_STATE = 56, OC_JOB_ROTATE_WEBHOOK = 57,
        /* Mute (REQ-137) and mark-unread (REQ-235). The latter is deliberately NOT
         * OC_JOB_CLIENT_ACK: that one may only advance. */
-       OC_JOB_SET_MUTE = 58, OC_JOB_SET_READ_CURSOR = 59 };
+       OC_JOB_SET_MUTE = 58, OC_JOB_SET_READ_CURSOR = 59,
+       /* Custom status (REQ-241) and profile fields (REQ-240).
+        *
+        * Numbered from 70, PAST the current maximum, not into the gap at 54-61: this
+        * enum has gaps AND a later block (PIN..LIST_ACTIVITY at 62-69), so "the next
+        * free-looking number" collided GET_PROFILE with OC_JOB_PIN. The dispatcher
+        * then routed every pin to the profile handler, which the pin tests caught —
+        * reading the enum would not have, because the two declarations are 200 lines
+        * apart. New jobs go after the highest value, always. */
+       OC_JOB_SET_STATUS = 70, OC_JOB_SET_PROFILE = 71, OC_JOB_GET_PROFILE = 72 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -264,7 +273,8 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* A channel's member roster / its shared files; ERR carries err_code. */
        OC_RES_MEMBER_LIST = 66, OC_RES_FILE_LIST = 67, OC_RES_LIST_ERR = 68,
        OC_RES_SAVED_OK = 69, OC_RES_SAVED_LIST = 70, OC_RES_ACTIVITY = 71,
-       OC_RES_INVITE_LIST = 72, OC_RES_INVITE_REVOKED = 73 };
+       OC_RES_INVITE_LIST = 72, OC_RES_INVITE_REVOKED = 73,
+       OC_RES_PROFILE_INFO = 74 };
 
 /* One saved message (REQ-231). Carries its body for the same reason a pin does:
  * a saved message is usually far outside loaded history. */
@@ -564,6 +574,12 @@ typedef struct oc_dbres {
      * stored, and a list is not a place to hand credentials back. */
     oc_invite_entry        *invites;
     size_t                  n_invites;
+    /* OC_RES_PROFILE_INFO (WIN-47/53). Heap strings, freed with the result. Appended
+     * at the END rather than inserted mid-struct: the first attempt landed between
+     * `reclaim` and `n_reclaim`, splitting a pointer from its count, which is exactly
+     * the pairing a reader relies on. */
+    char                   *st_emoji, *st_text, *pf_title, *pf_tz;
+    uint64_t                st_expires, pf_avatar;
     size_t                  n_reclaim;
     uint64_t                maint_orphans;   /* counts, for the log line */
     uint64_t                maint_expired;

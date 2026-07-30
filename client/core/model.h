@@ -100,7 +100,23 @@ typedef struct {
 typedef struct { uint64_t user_id; uint8_t status; } oc_presence_row;
 
 /* A tenant roster entry (from LIST_USERS): id, display name, role, disabled. */
-typedef struct { uint64_t user_id; char name[64]; uint8_t role; uint8_t disabled; } oc_member;
+typedef struct {
+    uint64_t user_id;
+    char     name[64];
+    uint8_t  role;
+    uint8_t  disabled;
+    /* Custom status (REQ-241, WIN-53) and profile fields (REQ-240, WIN-47). Kept on
+     * the roster entry rather than in a side table so a member list can render a
+     * status without a second lookup — the roster is small and already in memory.
+     * An EXPIRED status arrives empty: the daemon applies that rule, so no client
+     * needs its own clock to decide. */
+    char     status_emoji[24];
+    char     status_text[80];
+    uint64_t status_expires;
+    char     title[64];
+    char     timezone[48];
+    uint64_t avatar_id;
+} oc_member;
 
 /* An ephemeral "user is typing in channel" mark, expiring on a timeout. */
 typedef struct { uint64_t channel_id; uint64_t user_id; long long seen; } oc_typing_row;

@@ -973,6 +973,32 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (e->body) { memcpy(e->body, wi.token.ptr, wi.token.len); e->body[wi.token.len] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_PROFILE_INFO) {
+            oc_profile_info pi;
+            if (oc_decode_profile_info(&p, &pi) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_PROFILE_INFO);
+            if (e) {
+                e->user_id     = pi.user_id;
+                e->server_time = pi.status_expires;
+                e->message_id  = pi.avatar_id;
+                e->op          = pi.role;
+                /* Four strings in two slots plus the roster's own name field: packed
+                 * with \x1f separators rather than growing oc_ev by four pointers for
+                 * one event. Unpacked in model.c, next to the struct it fills. */
+                size_t need = pi.display_name.len + pi.status_emoji.len +
+                              pi.status_text.len + pi.title.len + pi.timezone.len + 8;
+                e->body = malloc(need);
+                if (e->body) {
+                    int k = snprintf(e->body, need, "%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s",
+                                     (int)pi.display_name.len, (const char *)pi.display_name.ptr,
+                                     (int)pi.status_emoji.len, (const char *)pi.status_emoji.ptr,
+                                     (int)pi.status_text.len,  (const char *)pi.status_text.ptr,
+                                     (int)pi.title.len,        (const char *)pi.title.ptr,
+                                     (int)pi.timezone.len,     (const char *)pi.timezone.ptr);
+                    (void)k;
+                }
+                oc_queue_push(to_ui, e);
+            }
         } else if (hdr.msg_type == OC_MSG_INVITE_LIST) {
             /* WIN-46. Cap-safe like the webhook list above: the decoder drains the
              * whole frame and keeps what fits, so an over-long list cannot desync
@@ -1533,6 +1559,21 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_rotate_webhook rw = { c->message_id };
                 if (oc_encode_rotate_webhook(&w, OC_PROTOCOL_VERSION, &rw) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_STATUS) {
+                uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_status ss = { oc_slice_str(c->body ? c->body : ""),
+                                     oc_slice_str(c->body2 ? c->body2 : ""),
+                                     c->message_id };
+                if (oc_encode_set_status(&w, OC_PROTOCOL_VERSION, &ss) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_PROFILE) {
+                uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_profile sp = { oc_slice_str(c->body ? c->body : ""),
+                                      oc_slice_str(c->body2 ? c->body2 : "") };
+                if (oc_encode_set_profile(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SET_MUTE) {

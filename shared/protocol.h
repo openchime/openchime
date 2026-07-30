@@ -123,6 +123,12 @@ typedef enum {
      * deliberately NOT the ack path: CLIENT_ACK only ever advances (the daemon takes
      * MAX), because a replayed ack must not rewind anyone's cursor. Marking unread is
      * an explicit act and gets an explicit op. */
+    /* Custom status (REQ-241/122, WIN-53) and profile fields (REQ-240, WIN-47).
+     * PROFILE carries everything a client shows about a person, so a roster needs one
+     * frame per user rather than one per field. */
+    OC_MSG_SET_STATUS         = 0x006F, /* C->S, my custom status (empty text clears) */
+    OC_MSG_SET_PROFILE        = 0x0070, /* C->S, my title/timezone */
+    OC_MSG_PROFILE_INFO       = 0x0072, /* S->C, a user's full profile (also a push) */
     OC_MSG_SET_MUTE           = 0x006D, /* C->S, mute/unmute a conversation */
     OC_MSG_SET_READ_CURSOR    = 0x006E, /* C->S, set the cursor (may move BACK) */
     OC_MSG_SET_WEBHOOK_STATE  = 0x006B, /* C->S, enable/disable one */
@@ -553,6 +559,14 @@ typedef struct { uint16_t count; const oc_webhook_list_entry *entries; } oc_webh
 typedef struct { uint64_t webhook_id; uint8_t disabled; } oc_set_webhook_state;
 typedef struct { uint64_t webhook_id; } oc_rotate_webhook;
 /* WIN-40 / WIN-52. `message_id` 0 in SET_READ_CURSOR means "everything unread". */
+/* WIN-53 / WIN-47. `expires_at` 0 means "until I change it"; the DAEMON enforces the
+ * expiry, because a client that is not running cannot clear its own status. */
+typedef struct { oc_slice emoji; oc_slice text; uint64_t expires_at; } oc_set_status;
+typedef struct { oc_slice title; oc_slice timezone; } oc_set_profile;
+typedef struct { uint64_t user_id; oc_slice display_name; oc_slice email;
+                 oc_slice status_emoji; oc_slice status_text; uint64_t status_expires;
+                 oc_slice title; oc_slice timezone; uint64_t avatar_id;
+                 uint8_t role; } oc_profile_info;
 typedef struct { uint64_t channel_id; uint8_t muted; } oc_set_mute;
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_set_read_cursor;
 typedef struct { uint64_t webhook_id; } oc_delete_webhook;
@@ -756,6 +770,9 @@ oc_result oc_encode_webhook_list(oc_wbuf *w, uint16_t version, const oc_webhook_
 oc_result oc_encode_delete_webhook(oc_wbuf *w, uint16_t version, const oc_delete_webhook *m);
 oc_result oc_encode_set_webhook_state(oc_wbuf *w, uint16_t version, const oc_set_webhook_state *m);
 oc_result oc_encode_rotate_webhook(oc_wbuf *w, uint16_t version, const oc_rotate_webhook *m);
+oc_result oc_encode_set_status(oc_wbuf *w, uint16_t version, const oc_set_status *m);
+oc_result oc_encode_set_profile(oc_wbuf *w, uint16_t version, const oc_set_profile *m);
+oc_result oc_encode_profile_info(oc_wbuf *w, uint16_t version, const oc_profile_info *m);
 oc_result oc_encode_set_mute(oc_wbuf *w, uint16_t version, const oc_set_mute *m);
 oc_result oc_encode_set_read_cursor(oc_wbuf *w, uint16_t version, const oc_set_read_cursor *m);
 oc_result oc_encode_list_invites(oc_wbuf *w, uint16_t version);
@@ -885,6 +902,9 @@ oc_result oc_decode_create_webhook(oc_rbuf *p, oc_create_webhook *m);
 oc_result oc_decode_webhook_info(oc_rbuf *p, oc_webhook_info *m);
 oc_result oc_decode_set_webhook_state(oc_rbuf *p, oc_set_webhook_state *m);
 oc_result oc_decode_rotate_webhook(oc_rbuf *p, oc_rotate_webhook *m);
+oc_result oc_decode_set_status(oc_rbuf *p, oc_set_status *m);
+oc_result oc_decode_set_profile(oc_rbuf *p, oc_set_profile *m);
+oc_result oc_decode_profile_info(oc_rbuf *p, oc_profile_info *m);
 oc_result oc_decode_set_mute(oc_rbuf *p, oc_set_mute *m);
 oc_result oc_decode_set_read_cursor(oc_rbuf *p, oc_set_read_cursor *m);
 oc_result oc_decode_invite_list(oc_rbuf *p, oc_invite_entry *entries, uint16_t cap, uint16_t *out_count);

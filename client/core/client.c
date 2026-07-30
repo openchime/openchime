@@ -573,6 +573,30 @@ void oc_client_set_read_cursor(oc_client *c, uint64_t channel_id, uint64_t messa
     oc_queue_push(&c->cmds, cmd);
 }
 
+/* Custom status (REQ-241/122, WIN-53). Empty text clears it; `expires_at` 0 means
+ * "until I change it". The DAEMON enforces expiry — a client that is not running
+ * cannot clear its own status, so it must not be the thing that decides. */
+void oc_client_set_status(oc_client *c, const char *emoji, const char *text,
+                          uint64_t expires_at) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_STATUS);
+    if (!cmd) return;
+    cmd->body  = strdup(emoji ? emoji : "");
+    cmd->body2 = strdup(text ? text : "");
+    cmd->message_id = expires_at;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* Profile fields (REQ-240, WIN-47). */
+void oc_client_set_profile(oc_client *c, const char *title, const char *timezone) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_PROFILE);
+    if (!cmd) return;
+    cmd->body  = strdup(title ? title : "");
+    cmd->body2 = strdup(timezone ? timezone : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_upload(oc_client *c, uint64_t channel_id, const char *path) {
     if (!c || !channel_id || !path || !path[0]) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_UPLOAD);

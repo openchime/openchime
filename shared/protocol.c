@@ -2193,3 +2193,64 @@ oc_result oc_decode_set_read_cursor(oc_rbuf *p, oc_set_read_cursor *m) {
     m->message_id = oc_r_u64(p);
     return r_done(p);
 }
+
+/* Custom status (REQ-241/122, WIN-53) and profile fields (REQ-240, WIN-47). */
+
+oc_result oc_encode_set_status(oc_wbuf *w, uint16_t version, const oc_set_status *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_STATUS);
+    oc_w_str(w, m->emoji);
+    oc_w_str(w, m->text);
+    oc_w_u64(w, m->expires_at);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_status(oc_rbuf *p, oc_set_status *m) {
+    m->emoji      = oc_r_str(p);
+    m->text       = oc_r_str(p);
+    m->expires_at = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_set_profile(oc_wbuf *w, uint16_t version, const oc_set_profile *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_PROFILE);
+    oc_w_str(w, m->title);
+    oc_w_str(w, m->timezone);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_profile(oc_rbuf *p, oc_set_profile *m) {
+    m->title    = oc_r_str(p);
+    m->timezone = oc_r_str(p);
+    return r_done(p);
+}
+
+/* One frame per PERSON, not per field: a roster wants everything it shows about
+ * somebody in a single message, and it doubles as the push when any of it changes. */
+oc_result oc_encode_profile_info(oc_wbuf *w, uint16_t version, const oc_profile_info *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_PROFILE_INFO);
+    oc_w_u64(w, m->user_id);
+    oc_w_str(w, m->display_name);
+    oc_w_str(w, m->email);
+    oc_w_str(w, m->status_emoji);
+    oc_w_str(w, m->status_text);
+    oc_w_u64(w, m->status_expires);
+    oc_w_str(w, m->title);
+    oc_w_str(w, m->timezone);
+    oc_w_u64(w, m->avatar_id);
+    oc_w_u8(w, m->role);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_profile_info(oc_rbuf *p, oc_profile_info *m) {
+    m->user_id        = oc_r_u64(p);
+    m->display_name   = oc_r_str(p);
+    m->email          = oc_r_str(p);
+    m->status_emoji   = oc_r_str(p);
+    m->status_text    = oc_r_str(p);
+    m->status_expires = oc_r_u64(p);
+    m->title          = oc_r_str(p);
+    m->timezone       = oc_r_str(p);
+    m->avatar_id      = oc_r_u64(p);
+    m->role           = oc_r_u8(p);
+    return r_done(p);
+}

@@ -1133,6 +1133,33 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_STATUS) {
+            oc_set_status ss;
+            if (oc_decode_set_status(&p, &ss) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_STATUS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            /* body = emoji, ch_name = text, message_id = expiry: the job struct's
+             * generic slots, named at the point of use rather than grown per feature. */
+            oc_job_set_body(j, ss.emoji.ptr, ss.emoji.len);
+            j->ch_name = ss.text.len ? strndup((const char *)ss.text.ptr, ss.text.len)
+                                     : strdup("");
+            j->message_id = ss.expires_at;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_PROFILE) {
+            oc_set_profile sp;
+            if (oc_decode_set_profile(&p, &sp) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_PROFILE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->ch_name = sp.title.len ? strndup((const char *)sp.title.ptr, sp.title.len)
+                                      : strdup("");
+            oc_job_set_body(j, sp.timezone.ptr, sp.timezone.len);
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SET_MUTE) {
             oc_set_mute sm;
             if (oc_decode_set_mute(&p, &sm) != OC_OK) return -1;
@@ -2481,6 +2508,26 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
+        break;
+    }
+    case OC_RES_PROFILE_INFO: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_profile_info pi;
+        memset(&pi, 0, sizeof pi);
+        pi.user_id        = r->user_id;
+        pi.display_name   = oc_slice_str(r->author_name ? r->author_name : "");
+        pi.email          = oc_slice_str(r->body ? (const char *)r->body : "");
+        pi.status_emoji   = oc_slice_str(r->st_emoji ? r->st_emoji : "");
+        pi.status_text    = oc_slice_str(r->st_text ? r->st_text : "");
+        pi.status_expires = r->st_expires;
+        pi.title          = oc_slice_str(r->pf_title ? r->pf_title : "");
+        pi.timezone       = oc_slice_str(r->pf_tz ? r->pf_tz : "");
+        pi.avatar_id      = r->pf_avatar;
+        pi.role           = r->role;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_profile_info(&w, OC_PROTOCOL_VERSION, &pi);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
     case OC_RES_INVITE_LIST: {
