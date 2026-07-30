@@ -1956,6 +1956,17 @@ static const char *body_text(const oc_msg *msg) {
          : (msg->body && msg->body[0]) ? msg->body : " ";
 }
 
+/* Is there any text to show? An attachment-only message has none — body_text()
+ * hands back a single space so DirectWrite always has something to measure, and
+ * both the height calculation and the draw pass then advanced by a full line for
+ * it, leaving an empty row between the author name and the file. The layout is
+ * still built (selection and hit-testing want a span); it is just neither drawn
+ * nor reserved. A tombstone DOES have text — "(message deleted)" — so it keeps
+ * its line. */
+static int msg_has_body(const oc_msg *msg) {
+    return msg->deleted || (msg->body && msg->body[0]);
+}
+
 /* A DirectWrite layout for a message body wrapped to `cw`; *wlen (optional) gets
  * the UTF-16 length — the unit HitTest positions are expressed in. */
 static IDWriteTextLayout *body_layout(const oc_msg *msg, float cw, UINT32 *wlen) {
@@ -2036,6 +2047,7 @@ static float msg_height(const oc_msg *msg, float content_w, int grouped,
         DWRITE_TEXT_METRICS tm;
         if (SUCCEEDED(IDWriteTextLayout_GetMetrics(layout, &tm))) body_h = tm.height;
     }
+    if (!msg_has_body(msg)) body_h = 0.0f;   /* see msg_has_body */
     *out_body = layout;
 
     int extra = 0;
@@ -2107,11 +2119,16 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
          * falls back to the monochrome outline glyphs, so a posted emoji looked
          * washed out next to the very same character in the picker or on a
          * reaction chip — which do set the flag. */
-        ID2D1RenderTarget_DrawTextLayout(rt, org, body, paint_with(bcol),
-                                         D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-        DWRITE_TEXT_METRICS tm;
-        if (SUCCEEDED(IDWriteTextLayout_GetMetrics(body, &tm))) by += tm.height;
-        else by += 18;
+        /* Both halves of the pair have to agree with msg_height: draw nothing and
+         * advance nothing when there is no text, or the attachment lines below
+         * would sit a line lower than the space reserved for them. */
+        if (msg_has_body(msg)) {
+            ID2D1RenderTarget_DrawTextLayout(rt, org, body, paint_with(bcol),
+                                             D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            DWRITE_TEXT_METRICS tm;
+            if (SUCCEEDED(IDWriteTextLayout_GetMetrics(body, &tm))) by += tm.height;
+            else by += 18;
+        }
     }
     /* "(edited)" is drawn inline by body_layout (faint, after the last word). */
 
