@@ -7087,6 +7087,14 @@ static float g_ed_scroll;                  /* DIPs, vertical */
 static D2D1_RECT_F g_ed_box;               /* where the text is drawn (DIPs) */
 static IDWriteTextLayout *g_ed_layout;     /* cached; NULL = rebuild */
 static float g_ed_layout_w;
+/* WHICH render target the cached layout's drawing effects belong to. A brush belongs
+ * to the target that created it, and a layout carrying one cannot be drawn into a
+ * different target — it fails the WHOLE frame, silently. That is what broke the
+ * screenshot the moment the field started marking mentions with the accent brush: the
+ * capture renders the same scene into its own DC target, and the cached layout still
+ * held the window's brush. So the target is part of the cache key. */
+static ID2D1RenderTarget *g_ed_layout_rt;
+static ID2D1RenderTarget *g_ed_rt;         /* the target currently being drawn into */
 static ULONGLONG g_ed_blink;               /* caret phase reference */
 
 /* IME composition in progress: drawn inline at the caret, not yet in the text. */
@@ -7218,7 +7226,7 @@ static void ed_focus(HWND hwnd) {
  * string is spliced in at the caret so it wraps and measures like real text —
  * which is what makes the candidate window land in the right place. */
 static IDWriteTextLayout *ed_layout(float w) {
-    if (g_ed_layout && g_ed_layout_w == w) return g_ed_layout;
+    if (g_ed_layout && g_ed_layout_w == w && g_ed_layout_rt == g_ed_rt) return g_ed_layout;
     ed_invalidate_layout();
     WCHAR tmp[ED_MAX + 130];
     int n = 0;
@@ -7230,7 +7238,39 @@ static IDWriteTextLayout *ed_layout(float w) {
     if (FAILED(IDWriteFactory_CreateTextLayout(g_dwrite, tmp, (UINT32)(n ? n : 0), g_body,
                                                w, 10000.0f, &g_ed_layout)))
         return NULL;
+
+    /* Mark the @mentions AS YOU TYPE, with the same accent + semi-bold the transcript
+     * uses — through the same scanner the DAEMON resolves with, so what lights up in
+     * the field is exactly what will notify somebody. Two implementations of "is this
+     * a mention" would drift and nobody could tell which was right.
+     *
+     * Only a mention that RESOLVES is marked: a broadcast, or a name actually on the
+     * roster. Lighting up "@al" while you are still typing "alice" would promise a
+     * notification that is not going to happen, and the feedback is worth having
+     * precisely because it is honest about that. */
+    {
+        const oc_model *m = model();
+        static char u8[(ED_MAX + 130) * 3 + 1];   /* static: too big for the stack */
+        int bytes = WideCharToMultiByte(CP_UTF8, 0, tmp, n, u8, (int)sizeof u8 - 1, NULL, NULL);
+        if (m && bytes > 0 && g_brush3 && g_ed_rt) {
+            u8[bytes] = '\0';
+            oc_mention mm[OC_MENTION_MAX];
+            size_t nm = oc_mention_scan(u8, (size_t)bytes, mm, OC_MENTION_MAX);
+            if (nm > OC_MENTION_MAX) nm = OC_MENTION_MAX;
+            for (size_t i = 0; i < nm; i++) {
+                if (mm[i].kind == OC_MENTION_USER && !oc_model_user_id(m, mm[i].name)) continue;
+                int u16_start = MultiByteToWideChar(CP_UTF8, 0, u8, (int)mm[i].start, NULL, 0);
+                int u16_len   = MultiByteToWideChar(CP_UTF8, 0, u8 + mm[i].start,
+                                                   (int)mm[i].len, NULL, 0);
+                if (u16_start < 0 || u16_len <= 0) continue;
+                DWRITE_TEXT_RANGE tr = { (UINT32)u16_start, (UINT32)u16_len };
+                IDWriteTextLayout_SetDrawingEffect(g_ed_layout, (IUnknown *)g_brush3, tr);
+                IDWriteTextLayout_SetFontWeight(g_ed_layout, DWRITE_FONT_WEIGHT_SEMI_BOLD, tr);
+            }
+        }
+    }
     g_ed_layout_w = w;
+    g_ed_layout_rt = g_ed_rt;
     return g_ed_layout;
 }
 
@@ -7559,6 +7599,7 @@ static int ed_ime(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
  * `box` is the text area the composer chrome laid out. */
 static void ed_draw(ID2D1RenderTarget *rt, D2D1_RECT_F box) {
     g_ed_box = box;
+    g_ed_rt = rt;              /* the cache key: see g_ed_layout_rt */
     IDWriteTextLayout *tl = ed_layout(box.right - box.left);
     if (!tl) return;
 
@@ -12123,6 +12164,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 layout_composer(hwnd);
                 InvalidateRect(hwnd, NULL, FALSE);
             }
+            /* The field takes the keyboard as soon as there is a conversation to type
+             * into. Not at creation: SetFocus on a window that is not shown yet does
+             * not stick, and at that point there is no conversation anyway — so a
+             * freshly launched client sat with no caret and dropped every keystroke
+             * until you clicked. The guard is GetFocus(), so this can never steal the
+             * keyboard from the find box, the palette or a form field. */
+            if (!g_ed_focus && GetFocus() == hwnd &&
+                main_is_conversation() && !window_is_covered())
+                ed_focus(hwnd);
             if (m->authed && !g_post_auth) {          /* one-shot: identify the bucket + pull state */
                 oc_client_set_client_type(g_client, "gui");   /* our own settings bucket, not tui's */
                 oc_client_list_settings(g_client);

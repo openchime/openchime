@@ -521,8 +521,13 @@ else fail "completion: $(ed)"; fi
 checks=$((checks + 1))
 [ "$(edf len)" = "0" ] && ok "Enter sends and clears the field" || fail "after Enter: $(ed)"
 
+# A channel of its own for this check: asserting against whatever second channel a
+# workspace happens to have made the result depend on the fixture, and a test that
+# passes because of the fixture is a test that fails when someone gives you a clean
+# one — which is exactly what happened.
+"$DRIVE" mkchan smokedrafts 1 >/dev/null 2>&1; sleep 1
 "$DRIVE" chars "a draft" >/dev/null 2>&1; sleep 0.3
-"$DRIVE" channel design >/dev/null 2>&1; sleep 0.5
+"$DRIVE" channel smokedrafts >/dev/null 2>&1; sleep 0.6
 checks=$((checks + 1))
 [ "$(edf len)" = "0" ] && ok "the other channel starts empty" || fail "draft leaked: $(ed)"
 "$DRIVE" channel general >/dev/null 2>&1; sleep 0.5

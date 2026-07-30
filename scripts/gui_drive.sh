@@ -28,7 +28,10 @@ mkdir -p "$LIN_DIR" "$OUT"
 
 case "${1:-}" in
   launch)
-    ws="${2:-127.0.0.1:8443}"; cred="${3:-alice:pw}"
+    # The default follows OC_DEV_PORT, so pointing a run at a second dev daemon
+    # (a smoke run that must not touch the workspace you are using) does not also
+    # require repeating the address on the command line.
+    ws="${2:-127.0.0.1:$OC_DEV_PORT}"; cred="${3:-alice:pw}"
 
     # --- Build BOTH sides, then restart the daemon on the new binary. ---------
     #
