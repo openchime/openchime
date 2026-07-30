@@ -182,6 +182,8 @@ int oc_job_set_body(oc_job *j, const void *body, size_t len) {
 static void job_free(oc_job *j) {
     if (!j) return;
     free(j->token);
+    free(j->sq_from);
+    free(j->sq_in);
     free(j->username);
     free(j->password);
     free(j->body);
@@ -2691,28 +2693,69 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
     r->type = OC_RES_SEARCH;
 
     char fts[1024];
-    if (!j->body || j->body_len == 0) return r;   /* empty query -> no results */
-    if (build_fts_query((const char *)j->body, j->body_len, fts, sizeof fts) == 0) return r;
+    int have_text = (j->body && j->body_len > 0 &&
+                     build_fts_query((const char *)j->body, j->body_len, fts, sizeof fts) != 0);
+    /* WIN-39: filters alone are a valid search — "everything alice posted in #design"
+     * needs no words. Only a query with NEITHER text nor filters is empty. */
+    int have_filter = (j->sq_from && j->sq_from[0]) || (j->sq_in && j->sq_in[0]) ||
+                      j->sq_has || j->sq_after || j->sq_before;
+    if (!have_text && !have_filter) return r;
 
     uint16_t lim = j->search_limit;
     if (lim == 0 || lim > OC_SEARCH_MAX) lim = OC_SEARCH_MAX;
 
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db,
-        "SELECT m.id, m.channel_id, m.author_id, m.created_at_ms, "
-        "  snippet(messages_fts, 0, '', '', ' ... ', 12) "
-        "FROM messages_fts "
-        "JOIN messages m ON m.id = messages_fts.rowid "
+    /* Built up rather than one literal, because the FTS join must DISAPPEAR when there
+     * is no text: `messages_fts MATCH ''` matches nothing, so a filters-only search
+     * would silently return zero rows. */
+    char sql[2048];
+    int k = snprintf(sql, sizeof sql,
+        "SELECT m.id, m.channel_id, m.author_id, m.created_at_ms, %s "
+        "FROM %s messages m %s "
         "JOIN channels c ON c.id = m.channel_id "
-        "WHERE messages_fts MATCH ?1 AND m.deleted_at_ms IS NULL "
+        "WHERE m.deleted_at_ms IS NULL "
         "  AND (c.is_public=1 OR EXISTS(SELECT 1 FROM channel_members cm "
-        "       WHERE cm.channel_id=m.channel_id AND cm.user_id=?2)) "
-        "ORDER BY m.id DESC LIMIT ?3;", -1, &st, NULL) != SQLITE_OK) {
+        "       WHERE cm.channel_id=m.channel_id AND cm.user_id=?2)) ",
+        have_text ? "snippet(messages_fts, 0, '', '', ' ... ', 12)" : "substr(COALESCE(m.body,''),1,160)",
+        have_text ? "messages_fts JOIN" : "",
+        have_text ? "ON m.id = messages_fts.rowid" : "");
+    if (have_text) k += snprintf(sql + k, sizeof sql - (size_t)k, " AND messages_fts MATCH ?1 ");
+    /* Keyset cursor (WIN-38): id < before, which is stable while people keep posting —
+     * an OFFSET would skip or repeat rows as the table grows underneath. */
+    if (j->message_id) k += snprintf(sql + k, sizeof sql - (size_t)k, " AND m.id < ?4 ");
+    if (j->sq_from && j->sq_from[0])
+        k += snprintf(sql + k, sizeof sql - (size_t)k,
+                      " AND m.author_id IN (SELECT id FROM users WHERE "
+                      "     LOWER(COALESCE(display_name,''))=LOWER(?5) OR "
+                      "     LOWER(COALESCE(email,''))=LOWER(?5)) ");
+    if (j->sq_in && j->sq_in[0])
+        k += snprintf(sql + k, sizeof sql - (size_t)k,
+                      " AND LOWER(COALESCE(c.name,''))=LOWER(?6) ");
+    if (j->sq_has & 0x01u)   /* file: any attachment */
+        k += snprintf(sql + k, sizeof sql - (size_t)k,
+                      " AND EXISTS(SELECT 1 FROM attachments a WHERE a.message_id=m.id) ");
+    if (j->sq_has & 0x04u)   /* image */
+        k += snprintf(sql + k, sizeof sql - (size_t)k,
+                      " AND EXISTS(SELECT 1 FROM attachments a WHERE a.message_id=m.id "
+                      "            AND a.mime LIKE 'image/%%') ");
+    if (j->sq_has & 0x02u)   /* link: cheap and honest — a substring, not a parser */
+        k += snprintf(sql + k, sizeof sql - (size_t)k,
+                      " AND (m.body LIKE '%%http://%%' OR m.body LIKE '%%https://%%') ");
+    if (j->sq_after)  k += snprintf(sql + k, sizeof sql - (size_t)k, " AND m.created_at_ms >= ?7 ");
+    if (j->sq_before) k += snprintf(sql + k, sizeof sql - (size_t)k, " AND m.created_at_ms <= ?8 ");
+    snprintf(sql + k, sizeof sql - (size_t)k, " ORDER BY m.id DESC LIMIT ?3;");
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
         return r;   /* malformed FTS query -> empty results, never a fatal error */
     }
-    sqlite3_bind_text(st, 1, fts, -1, SQLITE_STATIC);
+    if (have_text) sqlite3_bind_text(st, 1, fts, -1, SQLITE_STATIC);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
     sqlite3_bind_int64(st, 3, (sqlite3_int64)lim);
+    if (j->message_id) sqlite3_bind_int64(st, 4, (sqlite3_int64)j->message_id);
+    if (j->sq_from && j->sq_from[0]) sqlite3_bind_text(st, 5, j->sq_from, -1, SQLITE_STATIC);
+    if (j->sq_in && j->sq_in[0])     sqlite3_bind_text(st, 6, j->sq_in, -1, SQLITE_STATIC);
+    if (j->sq_after)  sqlite3_bind_int64(st, 7, (sqlite3_int64)j->sq_after);
+    if (j->sq_before) sqlite3_bind_int64(st, 8, (sqlite3_int64)j->sq_before);
 
     size_t cap = 8, n = 0;
     oc_replay_msg *arr = malloc(cap * sizeof *arr);

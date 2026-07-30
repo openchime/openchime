@@ -692,7 +692,24 @@ typedef struct { oc_slice token; oc_slice username; oc_slice password; } oc_rede
 typedef struct { oc_slice name; } oc_set_display_name;
 typedef struct { oc_slice old_password; oc_slice new_password; } oc_change_password;
 typedef struct { uint64_t user_id; oc_slice display_name; } oc_profile_updated;
-typedef struct { oc_slice query; uint16_t limit; } oc_search;
+/* SEARCH carries the parsed FILTERS as fields and the leftover text as the FTS
+ * query (REQ-081, WIN-39): `from:`/`in:`/`has:`/dates are predicates on columns, and
+ * MATCHing them as literal text would find messages that merely mention them.
+ * Parsing lives in shared/searchq.c so both frontends mean the same thing.
+ *
+ * `before_id` is WIN-38's paging cursor: results come back newest-first ordered by
+ * id, so "give me the page before this id" is a keyset cursor — stable under
+ * concurrent posting, unlike an offset. 0 = the first page. */
+typedef struct {
+    oc_slice query;          /* free text for FTS; may be empty when filters carry it */
+    uint16_t limit;
+    uint64_t before_id;      /* WIN-38 */
+    oc_slice from_name;      /* WIN-39: author, as typed; "" = any */
+    oc_slice in_channel;     /* channel name, as typed; "" = any */
+    uint8_t  has_mask;       /* OC_SQ_HAS_* */
+    uint64_t after_ms, before_ms;   /* 0 = unbounded; resolved by the CLIENT, which
+                                     * knows the user's timezone */
+} oc_search;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time; oc_slice snippet; } oc_search_result_entry;
 typedef struct { uint16_t count; const oc_search_result_entry *entries; uint8_t truncated; } oc_search_results;
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_cursor;

@@ -1274,6 +1274,13 @@ oc_result oc_encode_search(oc_wbuf *w, uint16_t version, const oc_search *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_SEARCH);
     oc_w_str(w, m->query);
     oc_w_u16(w, m->limit);
+    /* WIN-38/39 fields. A layout change, hence protocol 3. */
+    oc_w_u64(w, m->before_id);
+    oc_w_str(w, m->from_name);
+    oc_w_str(w, m->in_channel);
+    oc_w_u8(w, m->has_mask);
+    oc_w_u64(w, m->after_ms);
+    oc_w_u64(w, m->before_ms);
     return oc_frame_end(w, off);
 }
 
@@ -2005,8 +2012,14 @@ oc_result oc_decode_profile_updated(oc_rbuf *p, oc_profile_updated *m) {
 }
 
 oc_result oc_decode_search(oc_rbuf *p, oc_search *m) {
-    m->query = oc_r_str(p);
-    m->limit = oc_r_u16(p);
+    m->query      = oc_r_str(p);
+    m->limit      = oc_r_u16(p);
+    m->before_id  = oc_r_u64(p);
+    m->from_name  = oc_r_str(p);
+    m->in_channel = oc_r_str(p);
+    m->has_mask   = oc_r_u8(p);
+    m->after_ms   = oc_r_u64(p);
+    m->before_ms  = oc_r_u64(p);
     return r_done(p);
 }
 

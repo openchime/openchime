@@ -3,6 +3,7 @@
  */
 
 #include "net.h"
+#include "searchq.h"
 #include "event.h"
 #include "model.h"        /* oc_model_now_ms: one clock for the backoff deadline */
 #include "store.h"
@@ -1350,8 +1351,28 @@ static int run_connection(oc_net *n, int reconnecting,
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SEARCH && c->body) {
-                uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                oc_search s = { oc_slice_str(c->body), 50 };
+                /* Parse HERE, in the core, with the shared parser (WIN-39): the wire
+                 * carries predicates, not a grammar, so the daemon never has to agree
+                 * with us about what "from:" means — and the TUI gets the same
+                 * behaviour for free because it calls the same function. */
+                oc_searchq sq;
+                oc_searchq_parse(c->body, &sq);
+                /* Dates are resolved to epoch-ms HERE too, because only the client
+                 * knows the user's timezone; "after:2026-01-01" means local midnight. */
+                uint64_t after_ms = 0, before_ms = 0;
+                if (sq.after[0])  after_ms  = oc_day_start_ms(sq.after);
+                if (sq.before[0]) before_ms = oc_day_end_ms(sq.before);
+                uint8_t buf[768]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_search s;
+                memset(&s, 0, sizeof s);
+                s.query      = oc_slice_str(sq.text);
+                s.limit      = 50;
+                s.before_id  = c->message_id;          /* WIN-38 paging cursor */
+                s.from_name  = oc_slice_str(sq.from);
+                s.in_channel = oc_slice_str(sq.in);
+                s.has_mask   = (uint8_t)sq.has;
+                s.after_ms   = after_ms;
+                s.before_ms  = before_ms;
                 if (oc_encode_search(&w, OC_PROTOCOL_VERSION, &s) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }

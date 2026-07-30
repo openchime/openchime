@@ -174,6 +174,22 @@ void oc_client_search(oc_client *c, const char *query) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+/* WIN-38: the next page of the CURRENT search. `before_id` is the oldest id already
+ * shown — a keyset cursor, so a message posted while you page cannot make a row
+ * repeat or vanish the way an OFFSET would. The query is re-sent verbatim because the
+ * server holds no search state; that is deliberate (a stateless server cannot leak a
+ * stale cursor).
+ *
+ * Appends rather than replacing: oc_model_search_begin is NOT called here. */
+void oc_client_search_more(oc_client *c, uint64_t before_id) {
+    if (!c || !before_id || !c->model.search_query[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SEARCH);
+    if (!cmd) return;
+    cmd->body = strdup(c->model.search_query);
+    cmd->message_id = before_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_close_search(oc_client *c) {
     if (!c) return;
     oc_model_close_search(&c->model);

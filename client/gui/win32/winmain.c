@@ -41,6 +41,7 @@
 #include "model.h"
 #include "complete.h"   /* shared @user / #channel / :emoji: completion */
 #include "mention.h"    /* the same @mention scanner the daemon resolves with */
+#include "searchq.h"    /* the same query parser the core sends to the daemon */
 #include "resolve.h"
 #include "store.h"            /* peek a stored session token (skip the login box) */
 #include "oc_port.h"          /* oc_mkdir, oc_localtime_r */
@@ -612,6 +613,7 @@ static uint64_t  g_flash_mid;           /* message to tint */
 static ULONGLONG g_flash_until;
 /* Webhook-overlay row hit-boxes (row -> webhook id, for delete). */
 /* Per-row action buttons (WIN-48): enable/disable, rotate, delete. */
+static D2D1_RECT_F g_srch_more_btn;   /* WIN-38: next page of search results */
 static int g_await_webhook;     /* show the minted webhook token once it arrives */
 static int      g_confirm_open;
 static int      g_confirm_act;
@@ -2764,18 +2766,37 @@ static void draw_search(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
     else if (m->n_search == 0) snprintf(count, sizeof count, "No matches for \u201c%s\u201d.", m->search_query);
     else snprintf(count, sizeof count, "%zu %s for \u201c%s\u201d%s",
                   m->n_search, m->n_search == 1 ? "result" : "results", m->search_query,
-                  /* No cursor exists on the wire to page with (WIN-38), so say
-                   * that more exist rather than implying these are all of them. */
-                  m->search_truncated ? " \u2014 more exist; narrow the query to see them." : "");
+                  /* WIN-38 gave the wire a cursor, so this stops apologising and the
+                   * footer offers the next page instead. */
+                  m->search_truncated ? " \u2014 more below" : "");
     draw_text(rt, count, g_meta, rf(body.left + 20, body.top, body.right - 16, body.top + 18),
               m->search_truncated ? OC_COL_NOTICE : OC_COL_MUTED);
     body.top += 22;
+
+    /* WIN-39: say what the query was UNDERSTOOD as, using the same parser that was
+     * sent to the server. A filter that was silently ignored — or silently applied —
+     * is the difference between a search you can trust and one you cannot. */
+    if (m->search_query[0]) {
+        oc_searchq sq;
+        oc_searchq_parse(m->search_query, &sq);
+        if (sq.n_filters > 0) {
+            char desc[256], line[300];
+            oc_searchq_describe(&sq, desc, sizeof desc);
+            snprintf(line, sizeof line, "Filters: %s", desc);
+            draw_text(rt, line, g_meta, rf(body.left + 20, body.top, body.right - 16,
+                      body.top + 18), OC_COL_ACCENT);
+            body.top += 20;
+        }
+    }
 
     if (m->n_search == 0) { g_srch_max = g_srch_scroll = 0; return; }
 
     float rowh = 54;
     float visible = body.bottom - body.top;
-    float total = (float)m->n_search * rowh + 12;
+    /* The "Load more" button is CONTENT, so its height belongs in the total: without
+     * it the scroll stopped at the last row and the button sat permanently just past
+     * the fold — drawn, and unreachable. */
+    float total = (float)m->n_search * rowh + 12 + (m->search_truncated ? 42.0f : 0.0f);
     g_srch_max = total > visible ? total - visible : 0;
     if (g_srch_scroll > g_srch_max) g_srch_scroll = g_srch_max;
     if (g_srch_scroll < 0) g_srch_scroll = 0;
@@ -2807,6 +2828,23 @@ static void draw_search(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
             g_searchrows[g_n_searchrows].mid = r->message_id; g_n_searchrows++;
         }
         y += rowh;
+    }
+    /* WIN-38: the next page. Only when the server SAID there is more — a button that
+     * fetches nothing teaches the user to distrust it. It sits after the last row, so
+     * paging is a continuation of reading rather than a control you hunt for. */
+    g_srch_more_btn = rf(0, 0, 0, 0);
+    if (m->search_truncated && m->n_search > 0 && y < body.bottom) {
+        float bw = 150, bh = 30;
+        D2D1_RECT_F b = rf(body.left + 20, y + 6, body.left + 20 + bw, y + 6 + bh);
+        int hot = in_rect(b, g_mouse_x, g_mouse_y);
+        fill_round(rt, b, 6.0f, hot ? OC_COL_HOVER : OC_COL_INPUT);
+        stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
+        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Load more results", g_ui, rf(b.left, b.top + 1, b.right, b.bottom),
+                  OC_COL_TEXT);
+        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_srch_more_btn = b;
+        y += bh + 12;
     }
     if (g_srch_max > 0.5f) {
         float track_h = visible - 8, thumb_h = visible / total * track_h;
@@ -8070,6 +8108,16 @@ static int on_click(HWND hwnd, int x, int y) {
     {
         const oc_model *mm = model();
         if (mm && x > RAIL_W + SIDEBAR_W) {
+            if (mm->search_open && in_rect(g_srch_more_btn, x, y)) {
+                /* The OLDEST id shown is the cursor: results are newest-first, so the
+                 * next page is everything before it. */
+                uint64_t oldest = 0;
+                for (size_t k = 0; k < mm->n_search; k++)
+                    if (!oldest || mm->search_results[k].message_id < oldest)
+                        oldest = mm->search_results[k].message_id;
+                if (oldest) oc_client_search_more(g_client, oldest);
+                return 1;
+            }
             if (mm->search_open)
                 for (int i = 0; i < g_n_searchrows; i++)
                     if ((float)y >= g_searchrows[i].top && (float)y < g_searchrows[i].bot) {

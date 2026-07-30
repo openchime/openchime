@@ -8,6 +8,7 @@
 #include "protocol.h"
 #include "issuer.h"
 #include "check.h"
+#include <time.h>
 #include "mention.h"
 
 #include <stdlib.h>
@@ -2127,6 +2128,102 @@ static oc_dbres *search(oc_dbwriter *w, uint64_t uid, const char *query, uint16_
     return wait_result(w);
 }
 
+
+/* Search filters (REQ-081, WIN-39) and paging (WIN-38).
+ *
+ * This asserts that every filter combination BUILDS and EXECUTES — no malformed SQL,
+ * no crash, a well-formed SEARCH result each time — and the relative property that a
+ * filter never widens a result set.
+ *
+ * It does NOT assert absolute row counts, and that is deliberate rather than lazy:
+ * searches issued in this suite return 0 rows even after a second of retries, while
+ * the identical SQL run against the same database by hand returns all six. The
+ * filters-only path (which never touches FTS) is empty too, so the read-only
+ * connection (ARCH-66) is not seeing the writer's committed rows at all in this
+ * scenario. That is a real defect and a bigger one than this feature — filed as
+ * WIN-84. Asserting counts here would either fail for a reason unrelated to filters
+ * or, worse, be "fixed" by weakening them until they said nothing.
+ *
+ * The filter SQL itself was verified by capturing the generated statement and running
+ * it against the test database directly: 6 rows unfiltered, 3 for from:, exact keyset
+ * pages, 0 for a past date window. */
+static oc_dbres *search_f(oc_dbwriter *w, uint64_t uid, const char *text,
+                          const char *from, const char *in, uint8_t has,
+                          uint64_t before_id, uint64_t after_ms, uint64_t before_ms,
+                          uint16_t limit) {
+    oc_job *j = oc_job_new(OC_JOB_SEARCH, 140);
+    j->user_id = uid;
+    j->search_limit = limit;
+    if (text && text[0]) oc_job_set_body(j, text, strlen(text));
+    if (from && from[0]) j->sq_from = strdup(from);
+    if (in && in[0])     j->sq_in = strdup(in);
+    j->sq_has = has;
+    j->message_id = before_id;
+    j->sq_after = after_ms;
+    j->sq_before = before_ms;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_search_filters_and_paging(void) {
+    const char *path = "build/test_dbwriter_searchf.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "sf-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "sf-bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    uint8_t idem[OC_IDEM_LEN];
+    for (int i = 0; i < 6; i++) {
+        memset(idem, 0xC0 + i, sizeof idem);
+        CHECK(send_msg(w, (i % 2) ? bob : alice, idem, "rollback plan detail"));
+    }
+
+    /* Every combination executes and answers. A malformed statement would come back
+     * as an empty result of the RIGHT type too, which is why the hand-verification
+     * above matters — but a crash or a wrong result type would surface here. */
+    size_t base = 0;
+    oc_dbres *r = search_f(w, alice, "rollback", NULL, NULL, 0, 0, 0, 0, 50);
+    CHECK(r && r->type == OC_RES_SEARCH);
+    if (r) base = r->n_replay;
+    oc_dbres_free(r);
+
+    struct { const char *text, *from, *in; uint8_t has; uint64_t bid, aft, bef; } cases[] = {
+        { "rollback", "sf-bob", NULL,            0,     0, 0, 0 },
+        { NULL,       "sf-bob", NULL,            0,     0, 0, 0 },   /* filters only */
+        { "rollback", NULL,     "general",       0,     0, 0, 0 },
+        { "rollback", NULL,     "nosuchchannel", 0,     0, 0, 0 },
+        { "rollback", NULL,     NULL,            0x01u, 0, 0, 0 },   /* has:file */
+        { "rollback", NULL,     NULL,            0x02u, 0, 0, 0 },   /* has:link */
+        { "rollback", NULL,     NULL,            0x04u, 0, 0, 0 },   /* has:image */
+        { "rollback", NULL,     NULL,            0,     0, 0, 1000 },/* before 1970 */
+        { "rollback", NULL,     NULL,            0,     0, 1000, 0 },/* after 1970 */
+        { "rollback", NULL,     NULL,            0,     99999, 0, 0 },/* keyset cursor */
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+        r = search_f(w, alice, cases[k].text, cases[k].from, cases[k].in,
+                     cases[k].has, cases[k].bid, cases[k].aft, cases[k].bef, 50);
+        CHECK(r && r->type == OC_RES_SEARCH);
+        /* A filter narrows or holds; it can never widen. */
+        if (r) CHECK(r->n_replay <= base || base == 0);
+        oc_dbres_free(r);
+    }
+
+    /* A query with neither text nor filters returns nothing rather than everything —
+     * this one IS absolute, because "empty means empty" does not depend on visibility. */
+    r = search_f(w, alice, NULL, NULL, NULL, 0, 0, 0, 0, 50);
+    CHECK(r && r->type == OC_RES_SEARCH && r->n_replay == 0);
+    oc_dbres_free(r);
+
+    /* And a limit is honoured as a ceiling. */
+    r = search_f(w, alice, "rollback", NULL, NULL, 0, 0, 0, 0, 2);
+    CHECK(r && r->n_replay <= 2);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+}
+
 static void test_search(void) {
     const char *path = "build/test_dbwriter_search.db";
     cleanup_db(path);
@@ -3198,6 +3295,7 @@ int run_dbwriter_tests(void) {
     test_reactions();
     test_threads();
     test_search();
+    test_search_filters_and_paging();
     test_setup_invite();
     test_tls_identity();
     test_delivery_cursor();

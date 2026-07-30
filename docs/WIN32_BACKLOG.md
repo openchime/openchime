@@ -9,7 +9,7 @@ clients, or a `REQ-NNN`.
 parity table is the *feature reachability* tracker. This document is the *work
 list* derived from both — one row per shippable branch.
 
-**Ids.** Items are `WIN-1` … `WIN-83`, numbered once and **stable**: an id is
+**Ids.** Items are `WIN-1` … `WIN-84`, numbered once and **stable**: an id is
 never renumbered or reused, so a commit or branch can cite it. Ordering is *not*
 priority — the **Pri** column is, and it may change. Section membership may also
 change as blockers clear (an item moves from §3 to §1 without changing its id).
@@ -76,6 +76,7 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 | **WIN-81** | The GUI smoke does not run in CI — needs a self-hosted Windows runner | P2 | M |
 | ~~**WIN-82**~~ | ~~Files' census only saw the 200-row page~~ **DONE.** `LIST_FILE_CHANNELS` — one `GROUP BY` over attachments with the same membership filter as `LIST_FILES`, over the index migration 0023 already added. The column is now exact, so the "From the 200 most recent files" caveat is deleted rather than reworded. Counts verified against the database directly (17 and 1). | — |
 | **WIN-83** | User-defined custom sidebar sections (the other half of REQ-234) | P3 | M |
+| **WIN-84** | In the unit-test harness, searches on the read connection see no rows | P2 | M |
 
 ### The items added 2026-07-30, in detail
 
@@ -152,6 +153,22 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
   Until then the pre-push gate is a human remembering, which is the same class of
   problem as everything else in this file.
 
+- **WIN-84 — the read connection sees nothing, in the test harness only.** While
+  building WIN-39's daemon test: six messages committed, then a search returns **0
+  rows** — and stays empty across 40 retries over a second. A **filters-only** search
+  (which never touches FTS) is empty too, so it is not an FTS problem: the read-only
+  connection (ARCH-66) is not seeing the writer's committed rows at all. The identical
+  generated SQL, captured from the running daemon and executed against the same
+  database by hand, returns all six.
+  **It does not reproduce against the live daemon** — the GUI's search returns 50
+  results with `from:` applied correctly — so this is specific to the in-process test
+  harness, where writer and reader share a process and a freshly created DB. Prime
+  suspects: a leaked prepared statement pinning a read snapshot, or the reader opening
+  before WAL is established. Recorded because a search that silently returns nothing
+  is the worst failure mode a search can have, and because `test_search_filters_and_paging`
+  had to be written around it — it asserts that filters build, execute and never widen
+  a result, not absolute counts.
+
 - **WIN-79 — two menu systems, one product.** Left-click dropdowns (workspace,
   profile, New, switcher, sidebar section) are drawn by the app. Right-click context
   menus are **native GDI popups**: four `TrackPopupMenu` sites — the message kebab,
@@ -205,8 +222,8 @@ Not startable in this client. Each names what must land first.
 | ~~**WIN-35**~~ | ~~Channel topic / description~~ **DONE.** REQ-034/ARCH-93: any member sets it from the **About** tab; it renders on the channel header's second line, yielding to a typing indicator. | — |
 | ~~**WIN-36**~~ | ~~Channel archive~~ **DONE.** REQ-035/ARCH-93: owner/admin, confirmed, reversible. Header badge, read-only composer that says why, and the daemon refuses every write path regardless. | — |
 | ~~**WIN-37**~~ | ~~Channel details pane (members / pinned / files tabs)~~ **DONE.** A Slack-shaped channel tab strip under the header — **Messages · Files & links · Pins** — replacing the ad-hoc "Pinned"/"Members" header buttons, plus a compact member-count chip. The members pane now lists the **channel's** roster (REQ-031's new `LIST_MEMBERS`), not the tenant's. Completed by WIN-34–36, which added the fourth tab, **About**. | — |
-| **WIN-38** | Search paging | Wire gap: `SEARCH_RESULTS` carries `truncated` but **no cursor or offset**, so load-more is impossible today |
-| **WIN-39** | Search operators (`from:` / `in:` / `has:` / dates) | REQ-081 — no operator grammar |
+| ~~**WIN-38**~~ | ~~Search paging~~ **DONE.** `SEARCH` gained `before_id` — a **keyset** cursor, not an offset, so a message posted while you page cannot make a row repeat or vanish. "Load more results" appears only when the server says there is more, sits after the last row, and appends. Its height counts toward the scroll total, because the first version drew it permanently just past the fold: reachable only in theory. Verified live: 50 results → 60 after one page. | — |
+| ~~**WIN-39**~~ | ~~Search operators~~ **DONE.** `from:` / `in:` / `has:file|link|image` / `after:` / `before:`, parsed in **`shared/searchq.c`** — the `shared/mention.c` precedent, so the client's "Filters:" line and the daemon's WHERE clause cannot disagree. The wire carries **predicates, not a grammar**: these are column filters, and MATCHing `from:alice` as text would find messages that merely mention it. Dates resolve to epoch-ms **in the client**, because only it knows the timezone. Filters alone are a valid search (no words needed); an unknown `has:` value stays as search text rather than being silently dropped. | — |
 | ~~**WIN-40**~~ | ~~Mute channel/DM~~ **DONE.** Migration 0026 adds `notification_prefs.muted` — a column, not a fourth level, because they answer different questions: `level` decides whether the daemon NOTIFIES you, mute also de-emphasises the row and drops its badge. The row dims and the count stops shouting; the count still exists server-side. Setting a level no longer wipes the mute: the upsert touches one column instead of `INSERT OR REPLACE`, which would have silently un-muted a conversation as a side effect. | — |
 | ~~**WIN-41**~~ | ~~Starred conversations~~ **DONE** (the favourites half of REQ-234). A third **Starred** section, first on screen, holding channels and DMs alike — and each appears **once**: a starred conversation is lifted OUT of its normal section, as Slack does. Star/unstar from the channel menu; the set persists in the `client_settings` bucket appended to the existing sidebar string, so a bucket written by an older client still parses and simply has no stars. Collapsed automatically in the DMs view, where a starred #channel would contradict the point of that view. **User-defined custom sections are split out as WIN-83** rather than claimed here. | — |
 | ~~**WIN-42**~~ | ~~Pin a message~~ **DONE.** REQ-230/ARCH-90 built in the daemon (migration 0022) and surfaced here: "Pin to channel" / "Unpin from channel" in the message kebab, a "Pinned by …" marker above the message inline, and a **Pinned** button in the channel header opening the list — each row jumps to the message in context, or unpins it. | — |

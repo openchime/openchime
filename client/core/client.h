@@ -90,6 +90,8 @@ void oc_client_close_thread(oc_client *c);
  * the search view. */
 void oc_client_open_search(oc_client *c);
 void oc_client_search(oc_client *c, const char *query);
+/* Next page of the current search (WIN-38): `before_id` is the oldest id shown. */
+void oc_client_search_more(oc_client *c, uint64_t before_id);
 void oc_client_close_search(oc_client *c);
 
 /* Channel management: create a public channel, join / leave one. The server

@@ -1014,6 +1014,13 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->user_id = c->user_id;
             j->search_limit = sq.limit;
             if (oc_job_set_body(j, sq.query.ptr, sq.query.len) != 0) return -1;
+            /* WIN-38/39: the cursor and the filters. */
+            j->message_id = sq.before_id;
+            j->sq_from   = sq.from_name.len  ? strndup((const char *)sq.from_name.ptr, sq.from_name.len)   : NULL;
+            j->sq_in     = sq.in_channel.len ? strndup((const char *)sq.in_channel.ptr, sq.in_channel.len) : NULL;
+            j->sq_has    = sq.has_mask;
+            j->sq_after  = sq.after_ms;
+            j->sq_before = sq.before_ms;
             oc_dbwriter_submit(dbw, j);
             continue;
         }

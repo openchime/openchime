@@ -159,6 +159,13 @@ typedef struct oc_job {
      * one of the *_op flags above: a reader should not have to know that "save_op"
      * secretly means "disabled" for a different job type. */
     uint8_t        hook_disabled;
+    /* Search filters (REQ-081, WIN-39) and the paging cursor (WIN-38; carried in
+     * message_id). Parsed by the CLIENT via shared/searchq.c — the daemon receives
+     * predicates, never a grammar to interpret. */
+    char          *sq_from;      /* heap; "" or NULL = any */
+    char          *sq_in;
+    uint8_t        sq_has;
+    uint64_t       sq_after, sq_before;
 
     /* HISTORY: 0 pages backwards from message_id, 1 fetches AROUND it (ARCH-96). */
     uint8_t        hist_around;

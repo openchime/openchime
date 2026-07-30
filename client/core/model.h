@@ -201,8 +201,9 @@ typedef struct {
     char      search_query[128];
     oc_search_result *search_results;
     size_t    n_search, cap_search;
-    /* The server said it had more hits than it sent. There is no cursor on the
-     * wire to page with (WIN-38), so this exists to be honest about the cap
+    /* The server said it had more hits than it sent. WIN-38 gave the wire a keyset
+     * cursor, so this now drives a "Load more" affordance rather than only an
+     * apology; it still exists to be honest about the cap
      * rather than to drive a load-more. */
     uint8_t   search_truncated;
     /* The open "who reacted" view (REQ-071): the inspected message + its full
