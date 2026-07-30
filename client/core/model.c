@@ -357,6 +357,19 @@ void oc_model_close_weblist(oc_model *m) {
     m->weblist_channel = 0;
 }
 
+void oc_model_close_invites(oc_model *m) {
+    free(m->invites);
+    m->invites = NULL;
+    m->n_invites = m->cap_invites = 0;
+    m->invites_open = m->invites_loading = 0;
+}
+
+void oc_model_invites_begin(oc_model *m) {
+    oc_model_close_invites(m);
+    m->invites_open = 1;
+    m->invites_loading = 1;
+}
+
 void oc_model_weblist_begin(oc_model *m, uint64_t channel_id) {
     oc_model_close_weblist(m);     /* drop any prior list */
     m->weblist_open = 1;
@@ -789,6 +802,34 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     }
     case OC_EV_SAVED_END:
         if (m->saved_open) m->saved_loading = 0;
+        break;
+    case OC_EV_INVITE_ROW: {
+        if (!m->invites_open) break;
+        if (m->n_invites == m->cap_invites) {
+            size_t nc = m->cap_invites ? m->cap_invites * 2 : 16;
+            oc_invite_row *g = realloc(m->invites, nc * sizeof *g);
+            if (!g) break;
+            m->invites = g; m->cap_invites = nc;
+        }
+        oc_invite_row *iv = &m->invites[m->n_invites++];
+        iv->invite_id  = e->message_id;
+        iv->role       = e->op;
+        iv->expires_at = e->server_time;
+        iv->created_by = e->user_id;
+        break;
+    }
+    case OC_EV_INVITE_END:
+        if (m->invites_open) m->invites_loading = 0;
+        break;
+    case OC_EV_INVITE_REVOKED:
+        /* Drop the row locally so the list does not need a second round trip. */
+        for (size_t i = 0; i < m->n_invites; i++)
+            if (m->invites[i].invite_id == e->message_id) {
+                memmove(&m->invites[i], &m->invites[i + 1],
+                        (m->n_invites - i - 1) * sizeof *m->invites);
+                m->n_invites--;
+                break;
+            }
         break;
     case OC_EV_SAVED_UPDATED:
         /* Mark the message itself, in every list that can hold it, so the

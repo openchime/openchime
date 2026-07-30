@@ -972,6 +972,28 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (e->body) { memcpy(e->body, wi.token.ptr, wi.token.len); e->body[wi.token.len] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_INVITE_LIST) {
+            /* WIN-46. Cap-safe like the webhook list above: the decoder drains the
+             * whole frame and keeps what fits, so an over-long list cannot desync
+             * the stream. */
+            oc_invite_entry iv[OC_MAX_INVITES]; uint16_t count = 0;
+            if (oc_decode_invite_list(&p, iv, OC_MAX_INVITES, &count) != OC_OK) return -1;
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_INVITE_ROW);
+                if (!e) continue;
+                e->message_id  = iv[i].invite_id;
+                e->op          = iv[i].role;
+                e->server_time = iv[i].expires_at;
+                e->user_id     = iv[i].created_by;
+                oc_queue_push(to_ui, e);
+            }
+            oc_ev *end = oc_ev_new(OC_EV_INVITE_END);
+            if (end) oc_queue_push(to_ui, end);
+        } else if (hdr.msg_type == OC_MSG_INVITE_REVOKED) {
+            oc_revoke_invite rv;
+            if (oc_decode_invite_revoked(&p, &rv) != OC_OK) return -1;
+            oc_ev *e = oc_ev_new(OC_EV_INVITE_REVOKED);
+            if (e) { e->message_id = rv.invite_id; oc_queue_push(to_ui, e); }
         } else if (hdr.msg_type == OC_MSG_WEBHOOK_LIST) {
             oc_webhook_list_entry we[256]; uint16_t count = 0;
             if (oc_decode_webhook_list(&p, we, 256, &count) != OC_OK) return -1;

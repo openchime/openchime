@@ -127,6 +127,10 @@ typedef struct {
     char     filename[128], mime[64];
 } oc_file_view;
 
+/* One outstanding invite (REQ-026, WIN-46). No token: only its SHA-256 is stored
+ * server-side, so there is nothing to carry. */
+typedef struct { uint64_t invite_id, expires_at, created_by; uint8_t role; } oc_invite_row;
+
 /* One saved item (REQ-231) — private to this user. */
 typedef struct {
     uint64_t message_id, channel_id, author_id, server_time, saved_at;
@@ -235,6 +239,11 @@ typedef struct {
     oc_webhook_view *webhooks;
     size_t    n_webhooks, cap_webhooks;
     char      webhook_token[80];
+    /* Outstanding invites (REQ-026, WIN-46). Refreshed on open, like every other
+     * admin report — a client caches nothing (ARCH-88). */
+    uint8_t   invites_open, invites_loading;
+    oc_invite_row *invites;
+    size_t    n_invites, cap_invites;
     uint64_t  webhook_new_id;
     /* The synced client-settings bucket (the daemon-side config layer). A
      * CLIENT_SETTINGS frame — solicited or a device-sync push — replaces it
@@ -375,6 +384,8 @@ void oc_model_close_activity(oc_model *m);
  * shown-once token, records the channel) / close the overlay. */
 void oc_model_weblist_begin(oc_model *m, uint64_t channel_id);
 void oc_model_close_weblist(oc_model *m);
+void oc_model_invites_begin(oc_model *m);
+void oc_model_close_invites(oc_model *m);
 
 /* A synced setting's value by key, or NULL if the bucket has no such key. Valid
  * until the next CLIENT_SETTINGS frame folds in. */

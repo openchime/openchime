@@ -54,6 +54,12 @@ enum {
     OC_EV_NOTIFY_PREF,     /* a NOTIFY_PREFS entry: channel_id + level(op) */
     OC_EV_USER_UPDATED,    /* a USER_UPDATED: user_id + role(status) + disabled(op) */
     OC_EV_INVITE,          /* an INVITE_CREATED: body=token, op=role, server_time=expires_at */
+    /* WIN-46. One outstanding invite (message_id=invite_id, op=role,
+     * server_time=expires_at, user_id=created_by); END terminates a list; REVOKED is
+     * the ack. No token: only its hash is stored, so a list cannot carry one. */
+    OC_EV_INVITE_ROW,
+    OC_EV_INVITE_END,
+    OC_EV_INVITE_REVOKED,
     OC_EV_USER,            /* a USER_LIST entry: user_id + name(body) + role(status) + disabled(op) */
     OC_EV_WEBHOOK_INFO,    /* a WEBHOOK_INFO: message_id=webhook_id + channel_id + body=token (shown once) */
     OC_EV_WEBHOOK,         /* a WEBHOOK_LIST entry: message_id=webhook_id + channel_id + body=label + op=disabled */

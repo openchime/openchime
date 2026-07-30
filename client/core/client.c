@@ -518,6 +518,7 @@ void oc_client_delete_webhook(oc_client *c, uint64_t webhook_id) {
  * means (not consumed, not expired) so two clients cannot disagree about it. */
 void oc_client_list_invites(oc_client *c) {
     if (!c) return;
+    oc_model_invites_begin(&c->model);   /* clears any prior list, marks it loading */
     oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_INVITES);
     if (cmd) oc_queue_push(&c->cmds, cmd);
 }

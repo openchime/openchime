@@ -613,6 +613,16 @@ static ULONGLONG g_flash_until;
 /* Webhook-overlay row hit-boxes (row -> webhook id, for delete). */
 /* Per-row action buttons (WIN-48): enable/disable, rotate, delete. */
 static int g_await_webhook;     /* show the minted webhook token once it arrives */
+static int      g_confirm_open;
+static int      g_confirm_act;
+static uint64_t g_confirm_id;
+static char     g_confirm_title[80];
+static char     g_confirm_body[320];
+static char     g_confirm_ok[32];
+static char     g_confirm_ws[160];   /* CONF_WS_FORGET's target, by address */
+
+static struct { D2D1_RECT_F r; uint64_t id; } g_invrows[64];   /* WIN-46 Revoke buttons */
+static int g_n_invrows;
 static struct { D2D1_RECT_F r; uint64_t wid; int act; int disabled; } g_webacts[48];
 static int g_n_webacts;
 static struct { float top, bot; uint64_t wid; } g_webrows[64];
@@ -2674,7 +2684,7 @@ static void ovl_end(ID2D1RenderTarget *rt, D2D1_RECT_F body) {
     ID2D1RenderTarget_PopAxisAlignedClip(rt);
 }
 
-enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE };
+enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES };
 
 /* An overlay title bar; returns the region below it for the overlay body. */
 static D2D1_RECT_F overlay_header(ID2D1RenderTarget *rt, D2D1_RECT_F reg, const char *title) {
@@ -4907,10 +4917,78 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
  * They used to replace the transcript, which made "change a setting" cost you
  * your place in the conversation. */
 static int modal_open(void) {
-    return g_prefs_open || g_keys_open || g_wsmgr_open || g_notify_open || g_browse_open;
+    return g_prefs_open || g_keys_open || g_wsmgr_open || g_notify_open ||
+           g_browse_open || g_confirm_open;
 }
 
 static D2D1_RECT_F g_modal_card;
+
+/* ---- confirm() : a themed confirmation on the modal frame (WIN-77) ----------
+ *
+ * Replaces MessageBoxW. Native message boxes cannot be themed, look foreign beside
+ * the rest of the app, and — the reason this moved up the list — **cannot be driven
+ * by the harness**, so every destructive action was unverifiable. Rotating a webhook
+ * and revoking an invite both landed unverified for exactly that reason.
+ *
+ * The pending action is an id plus a target rather than a function pointer, so the
+ * modal frame's generic dispatch can run it without a per-confirmation callback.
+ */
+enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVOKE,
+       CONF_CHANNEL_ARCHIVE, CONF_WS_FORGET };
+
+static void confirm_open(HWND hwnd, int act, uint64_t id, const char *title,
+                         const char *body, const char *ok_label) {
+    g_confirm_act = act; g_confirm_id = id;
+    snprintf(g_confirm_title, sizeof g_confirm_title, "%s", title);
+    snprintf(g_confirm_body,  sizeof g_confirm_body,  "%s", body);
+    snprintf(g_confirm_ok,    sizeof g_confirm_ok,    "%s", ok_label ? ok_label : "Confirm");
+    modal_enter(hwnd, &g_confirm_open);
+}
+
+static void confirm_run(HWND hwnd) {
+    (void)hwnd;
+    switch (g_confirm_act) {
+    case CONF_WEBHOOK_DELETE: oc_client_delete_webhook(g_client, g_confirm_id); break;
+    case CONF_WEBHOOK_ROTATE: oc_client_rotate_webhook(g_client, g_confirm_id);
+                              g_await_webhook = 1; break;
+    case CONF_INVITE_REVOKE:  oc_client_revoke_invite(g_client, g_confirm_id); break;
+    /* "" is what the original call passed and what the daemon expects for a toggle;
+     * "1" would have been a plausible-looking change of behaviour smuggled in with
+     * a refactor. */
+    case CONF_WS_FORGET: {
+        /* Re-resolve from the address, never from a remembered index. */
+        int slot = ws_find(g_confirm_ws);
+        int live = (slot >= 0 && g_wss[slot].client);
+        if (live && slot == g_ws_active) {
+            close_overlays();
+            oc_client_logout(g_client, OC_LOGOUT_THIS);
+            g_logging_out = 1;
+            g_forget_after_logout = 1;      /* delete the entry once it lands */
+        } else {
+            if (live) {                     /* a background one: stop it here */
+                oc_client_stop(g_wss[slot].client);
+                for (int k = slot; k + 1 < g_n_wss; k++) g_wss[k] = g_wss[k + 1];
+                g_n_wss--;
+                if (g_ws_active > slot) g_ws_active--;
+                g_n_notify_hw = 0;
+            }
+            ws_forget(g_confirm_ws);
+            sw_book_load();
+        }
+        break; }
+    case CONF_CHANNEL_ARCHIVE: oc_client_update_channel(g_client, g_confirm_id,
+                                                        OC_CHUP_ARCHIVE, ""); break;
+    default: break;
+    }
+    g_confirm_act = CONF_NONE; g_confirm_id = 0;
+}
+
+static void draw_confirm(ID2D1RenderTarget *rt, D2D1_RECT_F body) {
+    /* Wrapping text, because a confirmation that clips its own explanation is worse
+     * than one that does not explain. */
+    draw_text(rt, g_confirm_body, g_meta_w,
+              rf(body.left + 4, body.top + 8, body.right - 4, body.bottom - 4), OC_COL_TEXT);
+}
 
 /* ---- the modal frame ------------------------------------------------------
  *
@@ -4936,7 +5014,12 @@ static D2D1_RECT_F g_modal_card;
  * a single dismissing button. The frame supports both rather than pretending
  * everything is a settings sheet.
  */
-enum { MB_NORMAL = 0, MB_PRIMARY, MB_DANGER };
+/* MB_DANGER is pushed to the far LEFT, away from a form's Save — a destructive
+ * button beside the commit is a misclick waiting to happen. MB_DANGER_PRIMARY is for
+ * a CONFIRMATION, where the destructive action *is* the affirmative: it sits in the
+ * primary slot on the right, because putting Cancel there and "Revoke" on the far
+ * left reads as though Cancel were the thing being asked for. */
+enum { MB_NORMAL = 0, MB_PRIMARY, MB_DANGER, MB_DANGER_PRIMARY };
 enum { MODAL_SM = 0, MODAL_LG };
 #define MODAL_MAX_BTNS 4
 
@@ -5029,7 +5112,10 @@ static D2D1_RECT_F modal_frame(ID2D1RenderTarget *rt, const oc_modal_spec *s,
             float bw = btn_width(b->label);
             D2D1_RECT_F r = rf(bx - bw, foot_top + 14, bx, foot_top + 46);
             int hot = in_rect(r, (float)g_mouse_x, (float)g_mouse_y);
-            if (b->kind == MB_PRIMARY) {
+            if (b->kind == MB_DANGER_PRIMARY) {
+                fill_round(rt, r, 6.0f, OC_COL_DANGER);
+                if (hot) stroke_round(rt, r, 6.0f, OC_COL_TEXT, 1.0f);
+            } else if (b->kind == MB_PRIMARY) {
                 fill_round(rt, r, 6.0f, hot ? OC_COL_ACCENT_DIM : OC_COL_ACCENT);
             } else {
                 fill_round(rt, r, 6.0f, hot ? OC_COL_HOVER : OC_COL_INPUT);
@@ -5037,7 +5123,8 @@ static D2D1_RECT_F modal_frame(ID2D1RenderTarget *rt, const oc_modal_spec *s,
             }
             IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
             draw_text(rt, b->label, g_ui, rf(r.left, r.top + 1, r.right, r.bottom),
-                      b->kind == MB_PRIMARY ? 0xFFFFFF : OC_COL_TEXT);
+                      (b->kind == MB_PRIMARY || b->kind == MB_DANGER_PRIMARY) ? 0xFFFFFF
+                                                                             : OC_COL_TEXT);
             IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
             if (g_n_modal_btns < MODAL_MAX_BTNS) {
                 g_modal_btns[g_n_modal_btns].r = r;
@@ -5045,7 +5132,8 @@ static D2D1_RECT_F modal_frame(ID2D1RenderTarget *rt, const oc_modal_spec *s,
                 g_modal_btns[g_n_modal_btns].kind = b->kind;
                 g_n_modal_btns++;
             }
-            if (b->kind == MB_PRIMARY) g_modal_primary_cmd = b->cmd;
+            if (b->kind == MB_PRIMARY || b->kind == MB_DANGER_PRIMARY)
+                g_modal_primary_cmd = b->cmd;
             bx = r.left - 10;
         }
         /* Danger on the far left, away from the primary — a destructive button
@@ -5097,6 +5185,7 @@ static void draw_modal(ID2D1RenderTarget *rt, const oc_model *m, float W, float 
     else if (g_wsmgr_open)  draw_wsmgr(rt, body);
     else if (g_notify_open) draw_notify_prefs(rt, m, body);
     else if (g_browse_open) draw_browse(rt, m, body);
+    else if (g_confirm_open) draw_confirm(rt, body);
 }
 
 static void prefs_save(void);                    /* fwd */
@@ -5172,7 +5261,15 @@ static void notify_restore(void) {
 static const oc_modal_spec *modal_current(void) {
     static oc_modal_spec sp;
     memset(&sp, 0, sizeof sp);
-    if (g_prefs_open) {
+    if (g_confirm_open) {
+        /* MODAL_SM with a danger primary: the one shape every destructive
+         * confirmation shares, so none of them has to invent it. */
+        sp.title = g_confirm_title;
+        sp.size = MODAL_SM;
+        sp.buttons[0] = (oc_mbtn){ "Cancel",     MB_NORMAL,         MODAL_CANCEL };
+        sp.buttons[1] = (oc_mbtn){ g_confirm_ok, MB_DANGER_PRIMARY, MODAL_OK };
+        sp.n_buttons = 2;
+    } else if (g_prefs_open) {
         sp.title = "Preferences";
         sp.subtitle = "Saved to your account, so they follow you to another machine.";
         sp.size = MODAL_LG;
@@ -5212,6 +5309,12 @@ static const oc_modal_spec *modal_current(void) {
 /* Open a modal through here, so its snapshot is always taken. Forgetting that on
  * one path is how Cancel would silently become a second Save. */
 static void modal_enter(HWND hwnd, int *flag) {
+    /* A CONFIRMATION must not move you: it is a question about what you are looking
+     * at, and answering "Revoke" in Admin > Invites dumped you on Home, losing the
+     * list you were working in. The your-account modals below do set VIEW_HOME,
+     * because they are not about the current view at all. */
+    int keep_view = (flag == &g_confirm_open);
+    int prev_view = g_view;
     close_overlays();
     /* The transient overlays too, and this was a real bug rather than tidiness:
      * the command palette and the emoji picker each claim EVERY click while open
@@ -5227,7 +5330,7 @@ static void modal_enter(HWND hwnd, int *flag) {
     g_menu = MENU_NONE; g_menu_hover = -1;
     g_more_open = 0;
     *flag = 1;
-    g_view = VIEW_HOME;
+    g_view = keep_view ? prev_view : VIEW_HOME;
     const oc_modal_spec *s = modal_current();
     if (s->snapshot) s->snapshot();
     /* Repaint NOW, so the frame's geometry exists before any click can arrive:
@@ -5245,9 +5348,13 @@ static const char *g_modal_closed_by = "";   /* diagnosis only; see the dump */
 
 static void modal_finish(int save) {
     const oc_modal_spec *s = modal_current();
+    /* A confirmation's "commit" is its action. Handled here rather than through
+     * spec->commit so the action can take the window handle. */
+    if (save && g_confirm_open) { g_confirm_open = 0; confirm_run(GetActiveWindow()); }
     if (save) { if (s->commit) s->commit(); }
     else      { if (s->restore) s->restore(); }
     g_prefs_open = g_keys_open = g_wsmgr_open = g_notify_open = g_browse_open = 0;
+    g_confirm_open = 0;
     g_modal_closed_by = save ? "save" : "cancel";
 }
 
@@ -5421,7 +5528,9 @@ static int shell_visible(void) {
  * open the workspace menu instead, which is a dead end wearing a signpost. Both
  * reports were already built; this just puts them where the rail already
  * promised they were. */
-enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_COUNT };
+/* WIN-46 adds Invites: the `invites` table has always held role and expiry, and
+ * nothing could see them, so a minted invite was write-only. */
+enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_COUNT };
 static int g_adm_tab;
 static D2D1_RECT_F g_adm_tabs[ADM_COUNT];
 
@@ -5430,8 +5539,78 @@ static void admin_select(int t) {
     if (!g_client) return;
     /* Ask on entry: these are point-in-time reports, and a stale one is worse
      * than a moment's wait. */
-    if (t == ADM_STORAGE) { oc_client_toggle_storage(g_client, 1); oc_client_storage_status(g_client); }
-    else                  { oc_client_toggle_audit(g_client, 1);   oc_client_audit_query(g_client, 0); }
+    if (t == ADM_STORAGE)      { oc_client_toggle_storage(g_client, 1); oc_client_storage_status(g_client); }
+    else if (t == ADM_INVITES)  oc_client_list_invites(g_client);
+    else                       { oc_client_toggle_audit(g_client, 1);   oc_client_audit_query(g_client, 0); }
+}
+
+/* Outstanding invites (REQ-026, WIN-46). Soonest expiry first, because the useful
+ * question is "what is about to lapse" — the server sorts it that way. */
+static void draw_invites(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F body) {
+    g_n_invrows = 0;
+    if (m->invites_loading) { overlay_empty(rt, body, "Loading\u2026"); return; }
+    if (m->n_invites == 0) {
+        overlay_empty(rt, body, "No invites outstanding. Workspace menu \u2192 Invite people.");
+        return;
+    }
+    /* The token is deliberately absent and worth saying so: only its hash is
+     * stored, so an invite cannot be re-shown — it can only be revoked and
+     * re-minted. */
+    draw_text(rt, "A token is shown once when minted. If it is lost, revoke and invite again.",
+              g_meta, rf(body.left + 20, body.top + 4, body.right - 16, body.top + 24),
+              OC_COL_FAINT);
+    body.top += 28;
+    ovl_use(OVL_INVITES);
+    float rowh = 44;
+    float y = ovl_begin(rt, body, (float)m->n_invites * rowh + 8);
+    for (size_t i = 0; i < m->n_invites; i++) {
+        const oc_invite_row *iv = &m->invites[i];
+        if (y + rowh < body.top) { y += rowh; continue; }
+        if (y > body.bottom) break;
+        const char *role = iv->role >= OC_ROLE_OWNER ? "owner"
+                         : iv->role >= OC_ROLE_ADMIN ? "admin" : "member";
+        char head[160];
+        snprintf(head, sizeof head, "Invite as %s", role);
+        draw_text(rt, head, g_ui, rf(body.left + 20, y + 2, body.right - 130, y + 22), OC_COL_TEXT);
+
+        /* Expiry as a countdown, not a timestamp: "in 2 days" answers the question,
+         * an epoch does not. */
+        char sub[200], when[48] = "";
+        /* WALL CLOCK, not oc_model_now_ms(): that one is MONOTONIC (GetTickCount64 /
+         * CLOCK_MONOTONIC) because it exists for the reconnect countdown, while a
+         * server timestamp is epoch-ms. Comparing the two showed "expires in 20666d"
+         * — 56 years, which is the epoch offset, and it was only caught because the
+         * number was absurd rather than subtly wrong. */
+        uint64_t now = (uint64_t)time(NULL) * 1000u;
+        if (iv->expires_at > now) {
+            uint64_t left = (iv->expires_at - now) / 1000;
+            if (left >= 86400)     snprintf(when, sizeof when, "expires in %llud", (unsigned long long)(left / 86400));
+            else if (left >= 3600) snprintf(when, sizeof when, "expires in %lluh", (unsigned long long)(left / 3600));
+            else                   snprintf(when, sizeof when, "expires in %llum", (unsigned long long)(left / 60 + 1));
+        } else {
+            snprintf(when, sizeof when, "expired");
+        }
+        const char *by = oc_model_user_name((oc_model *)m, iv->created_by);
+        snprintf(sub, sizeof sub, "%s%s%s", when,
+                 (by && by[0]) ? "  \u00B7  from " : "", (by && by[0]) ? by : "");
+        draw_text(rt, sub, g_meta, rf(body.left + 20, y + 20, body.right - 130, y + 40), OC_COL_FAINT);
+
+        D2D1_RECT_F b = rf(body.right - 116, y + 8, body.right - 20, y + 34);
+        int hot = in_rect(b, g_mouse_x, g_mouse_y);
+        fill_round(rt, b, 6.0f, hot ? OC_COL_HOVER : OC_COL_INPUT);
+        stroke_round(rt, b, 6.0f, OC_COL_DANGER, 1.0f);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Revoke", g_meta, b, OC_COL_DANGER);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+        if (g_n_invrows < (int)(sizeof g_invrows / sizeof g_invrows[0])) {
+            g_invrows[g_n_invrows].r = b;
+            g_invrows[g_n_invrows].id = iv->invite_id;
+            g_n_invrows++;
+        }
+        fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 20, y + rowh), OC_COL_BORDER);
+        y += rowh;
+    }
+    ovl_end(rt, body);
 }
 
 static void draw_admin(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
@@ -5445,6 +5624,7 @@ static void draw_admin(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
     static const struct { const char *label; int icon; } T[ADM_COUNT] = {
         { "Storage",   OC_ICON_FILE },
         { "Audit log", OC_ICON_SETTINGS },
+        { "Invites",   OC_ICON_USER },
     };
     float tx = reg.left + 16, ty = reg.top + HEADER_H;
     for (int i = 0; i < ADM_COUNT; i++) {
@@ -5464,8 +5644,9 @@ static void draw_admin(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
         overlay_empty(rt, body, "Admin only.");
         return;
     }
-    if (g_adm_tab == ADM_STORAGE) draw_storage(rt, m, body, 1);
-    else                          draw_audit(rt, m, body, 1);
+    if (g_adm_tab == ADM_STORAGE)     draw_storage(rt, m, body, 1);
+    else if (g_adm_tab == ADM_INVITES) draw_invites(rt, m, body);
+    else                              draw_audit(rt, m, body, 1);
 }
 
 /* The DMs list (second column, in the DMs view).
@@ -7386,25 +7567,12 @@ static int on_click(HWND hwnd, int x, int y) {
                          "its address.%s",
                          label[0] ? label : ws,
                          live ? "\n\nYou are currently signed in; this signs you out first." : "");
-                to_w(line, w, 400);
-                if (MessageBoxW(hwnd, w, L"Remove workspace",
-                                MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK) return 1;
-                if (live && slot == g_ws_active) {
-                    close_overlays();
-                    oc_client_logout(g_client, OC_LOGOUT_THIS);
-                    g_logging_out = 1;
-                    g_forget_after_logout = 1;      /* delete the entry once it lands */
-                } else {
-                    if (live) {                     /* a background one: stop it here */
-                        oc_client_stop(g_wss[slot].client);
-                        for (int k = slot; k + 1 < g_n_wss; k++) g_wss[k] = g_wss[k + 1];
-                        g_n_wss--;
-                        if (g_ws_active > slot) g_ws_active--;
-                        g_n_notify_hw = 0;
-                    }
-                    ws_forget(ws);
-                    sw_book_load();
-                }
+                (void)w;
+                /* The workspace address travels with the confirmation, because the
+                 * list can be reloaded between asking and answering — a row INDEX
+                 * would then remove a different workspace. */
+                snprintf(g_confirm_ws, sizeof g_confirm_ws, "%s", ws);
+                confirm_open(hwnd, CONF_WS_FORGET, 0, "Remove workspace?", line, "Remove");
                 break;
             }
             }
@@ -7412,6 +7580,17 @@ static int on_click(HWND hwnd, int x, int y) {
         }
         return 1;
     }
+    /* Revoke, in the Admin > Invites tab (WIN-46). Confirmed: the invite stops
+     * working immediately and cannot be un-revoked, only re-minted. */
+    if (g_view == VIEW_ADMIN && g_adm_tab == ADM_INVITES)
+        for (int i = 0; i < g_n_invrows; i++)
+            if (in_rect(g_invrows[i].r, x, y)) {
+                confirm_open(hwnd, CONF_INVITE_REVOKE, g_invrows[i].id, "Revoke invite?",
+                             "Anyone holding this invite's token will no longer be able to "
+                             "use it. It cannot be un-revoked \u2014 mint a new one instead.",
+                             "Revoke");
+                return 1;
+            }
     if (g_browse_open) {
         for (int i = 0; i < g_n_browse_rows; i++)
             if (in_rect(g_browse_rows[i].r, x, y)) {
@@ -7724,9 +7903,8 @@ static int on_click(HWND hwnd, int x, int y) {
                          "Archive #%s?\n\nIt becomes read-only and disappears from the sidebar of "
                          "anyone who is not a member. History stays searchable, and you can "
                          "unarchive it later.", ac->name ? ac->name : "");
-                to_w(t, q, 320);
-                if (MessageBoxW(hwnd, q, L"Archive channel", MB_OKCANCEL | MB_ICONWARNING) == IDOK)
-                    oc_client_update_channel(g_client, g_sel, OC_CHUP_ARCHIVE, "");
+                (void)q;
+                confirm_open(hwnd, CONF_CHANNEL_ARCHIVE, g_sel, "Archive channel?", t, "Archive");
             }
             return 1;
         }
@@ -7860,26 +8038,25 @@ static int on_click(HWND hwnd, int x, int y) {
                         } else if (g_webacts[i].act == 2) {
                             /* Rotating invalidates the old token immediately, so it is
                              * confirmed like a delete rather than done on one click. */
-                            if (MessageBoxW(hwnd, L"Rotate this webhook's token?\n\n"
-                                                  L"The current token stops working immediately "
-                                                  L"and cannot be recovered.",
-                                            L"Confirm", MB_YESNO | MB_ICONWARNING) == IDYES) {
-                                oc_client_rotate_webhook(g_client, wid);
-                                g_await_webhook = 1;      /* show the new token once */
-                            }
+                            confirm_open(hwnd, CONF_WEBHOOK_ROTATE, wid,
+                                         "Rotate this token?",
+                                         "The current token stops working immediately and "
+                                         "cannot be recovered. The new one is shown once.",
+                                         "Rotate");
                         } else {
-                            if (MessageBoxW(hwnd, L"Delete this webhook?", L"Confirm",
-                                            MB_YESNO | MB_ICONWARNING) == IDYES)
-                                oc_client_delete_webhook(g_client, wid);
+                            confirm_open(hwnd, CONF_WEBHOOK_DELETE, wid, "Delete webhook?",
+                                         "Anything posting through this token stops working.",
+                                         "Delete");
                         }
                         return 1;
                     }
             if (mm->weblist_open)
                 for (int i = 0; i < g_n_webrows; i++)
                     if ((float)y >= g_webrows[i].top && (float)y < g_webrows[i].bot) {
-                        if (MessageBoxW(hwnd, L"Delete this webhook?", L"Confirm",
-                                        MB_YESNO | MB_ICONWARNING) == IDYES)
-                            oc_client_delete_webhook(g_client, g_webrows[i].wid);
+                        confirm_open(hwnd, CONF_WEBHOOK_DELETE, g_webrows[i].wid,
+                                     "Delete webhook?",
+                                     "Anything posting through this token stops working.",
+                                     "Delete");
                         return 1;
                     }
         }
@@ -9448,7 +9625,7 @@ static void test_dump(const char *path) {
     fprintf(f, "modal=%s theme=%d time24=%d members=%d daysep=%d notify=%d\n",
             g_prefs_open ? "prefs" : g_keys_open ? "keys" :
             g_wsmgr_open ? "wsmgr" : g_notify_open ? "notify" :
-            g_browse_open ? "browse" : "none",
+            g_browse_open ? "browse" : g_confirm_open ? "confirm" : "none",
             oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep, g_pref_notify);
     fprintf(f, "workspaces=%d active=%d elsewhere=%d\n", g_n_wss, g_ws_active, ws_unread_elsewhere());
     for (int i = 0; i < g_n_wss; i++) {
@@ -10448,6 +10625,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                          pending, pending == 1 ? "" : "s", pending == 1 ? "has" : "have",
                          pending == 1 ? "it" : "them");
                 to_w(line, w, 320);
+                /* The ONE MessageBoxW that stays (WIN-77): WM_CLOSE has to answer
+                 * "may I close?" before it returns, and the app's own modal is
+                 * non-blocking by design — it answers on a later click. A blocking
+                 * question needs a blocking dialog. */
                 if (MessageBoxW(hwnd, w, L"Unsent messages",
                                 MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK)
                     return 0;
