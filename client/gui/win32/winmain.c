@@ -5075,6 +5075,23 @@ static D2D1_RECT_F g_rp_back, g_rp_close;
 static void rp_push(int mode) { g_rp_mode = mode; g_show_members = 1; }
 static void rp_pop(void) { g_rp_mode = RP_MEMBERS; g_profile_uid = 0; }
 
+/* Open somebody's profile — the ONLY way the pane is opened, so an id we cannot
+ * resolve can never reach it. It used to be set directly at two call sites, and an
+ * id the roster does not know produced a card reading "user", "Offline", a blank
+ * avatar and a Message button that would have opened a DM with nothing. An empty
+ * profile is not a state to render nicely; it is one to refuse. */
+static int profile_open(uint64_t uid) {
+    const oc_model *m = model();
+    const char *nm = (m && uid) ? oc_model_user_name((oc_model *)m, uid) : NULL;
+    if (!nm || !nm[0]) {
+        toast_push("That person is not in this workspace.", 1);
+        return 0;
+    }
+    g_profile_uid = uid;
+    rp_push(RP_PROFILE);
+    return 1;
+}
+
 static void draw_profile_card(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg);
 static void draw_reactors_list(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg);
 
@@ -8730,7 +8747,7 @@ static void member_menu_run(HWND hwnd, int cmd) {
     uint64_t uid = g_menu_target;
     switch (cmd) {
     case 1:  oc_client_open_dm(g_client, uid); break;
-    case 2:  g_profile_uid = uid; rp_push(RP_PROFILE); break;
+    case 2:  profile_open(uid); break;
     case 10: oc_client_set_role(g_client, uid, OC_ROLE_MEMBER); break;
     case 11: oc_client_set_role(g_client, uid, OC_ROLE_ADMIN); break;
     case 12: oc_client_set_role(g_client, uid, OC_ROLE_OWNER); break;
@@ -9657,8 +9674,7 @@ static int on_click(HWND hwnd, int x, int y) {
      * impossible, and it is the more destructive of the two actions. */
     for (int i = 0; i < g_n_memrows; i++)
         if (in_rect(g_memrows[i].r, x, y)) {
-            g_profile_uid = g_memrows[i].uid;
-            rp_push(RP_PROFILE);
+            profile_open(g_memrows[i].uid);
             return 1;
         }
     return 0;
