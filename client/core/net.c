@@ -974,6 +974,29 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (e->body) { memcpy(e->body, wi.token.ptr, wi.token.len); e->body[wi.token.len] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_SESSION_LIST) {
+            oc_session_entry se[OC_MAX_SESSIONS]; uint16_t count = 0;
+            if (oc_decode_session_list(&p, se, OC_MAX_SESSIONS, &count) != OC_OK) return -1;
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_SESSION_ROW);
+                if (!e) continue;
+                e->message_id  = se[i].session_id;
+                e->server_time = se[i].created_at;
+                e->pinned_at   = se[i].last_seen;
+                /* channel_id, not count: `count` is an int and an epoch-ms expiry
+                 * truncates in it — the field was showing no expiry at all. A spare
+                 * 64-bit slot is right there. */
+                e->channel_id  = se[i].expires_at;
+                e->op          = se[i].current;
+                e->body = malloc(se[i].device_label.len + 1);
+                if (e->body) {
+                    memcpy(e->body, se[i].device_label.ptr, se[i].device_label.len);
+                    e->body[se[i].device_label.len] = '\0';
+                }
+                oc_queue_push(to_ui, e);
+            }
+            oc_ev *end = oc_ev_new(OC_EV_SESSIONS_END);
+            if (end) oc_queue_push(to_ui, end);
         } else if (hdr.msg_type == OC_MSG_FILE_CHANNELS) {
             oc_file_channel_entry fe[OC_MAX_FILE_CHANNELS]; uint16_t count = 0;
             if (oc_decode_file_channels(&p, fe, OC_MAX_FILE_CHANNELS, &count) != OC_OK) return -1;
@@ -1592,6 +1615,11 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_rotate_webhook rw = { c->message_id };
                 if (oc_encode_rotate_webhook(&w, OC_PROTOCOL_VERSION, &rw) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_SESSIONS) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_sessions(&w, OC_PROTOCOL_VERSION) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_LIST_FILE_CHANNELS) {

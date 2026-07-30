@@ -2296,3 +2296,42 @@ oc_result oc_decode_file_channels(oc_rbuf *p, oc_file_channel_entry *entries, ui
     }
     return r_done(p);
 }
+
+/* The caller's active sessions (REQ-182). Tokens are never listed: only their hashes
+ * are stored, and a list is not a place to hand credentials back. */
+
+oc_result oc_encode_list_sessions(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_SESSIONS);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_session_list(oc_wbuf *w, uint16_t version, const oc_session_list *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SESSION_LIST);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        oc_w_u64(w, m->entries[i].session_id);
+        oc_w_u64(w, m->entries[i].created_at);
+        oc_w_u64(w, m->entries[i].last_seen);
+        oc_w_u64(w, m->entries[i].expires_at);
+        oc_w_u8(w, m->entries[i].current);
+        oc_w_str(w, m->entries[i].device_label);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_session_list(oc_rbuf *p, oc_session_entry *entries, uint16_t cap,
+                                 uint16_t *out_count) {
+    uint16_t count = oc_r_u16(p);
+    if (out_count) *out_count = count < cap ? count : cap;
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
+        oc_session_entry e;
+        e.session_id   = oc_r_u64(p);
+        e.created_at   = oc_r_u64(p);
+        e.last_seen    = oc_r_u64(p);
+        e.expires_at   = oc_r_u64(p);
+        e.current      = oc_r_u8(p);
+        e.device_label = oc_r_str(p);
+        if (i < cap) entries[i] = e;
+    }
+    return r_done(p);
+}

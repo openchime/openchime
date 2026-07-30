@@ -63,6 +63,10 @@ enum {
     /* A PROFILE_INFO (WIN-47/53): user_id + the fields, carried in the ev's slices. */
     OC_EV_PROFILE_INFO,
     /* WIN-82: one census row (channel_id + count in `count`); BEGIN clears. */
+    /* REQ-182: one live session (message_id=id, server_time=created, pinned_at=last
+     * seen, channel_id=expiry, op=is-current, body=device label); END terminates. */
+    OC_EV_SESSION_ROW,
+    OC_EV_SESSIONS_END,
     OC_EV_FILE_CHANNELS_BEGIN,
     OC_EV_FILE_CHANNEL,
     OC_EV_USER,            /* a USER_LIST entry: user_id + name(body) + role(status) + disabled(op) */
@@ -195,6 +199,7 @@ enum {
     OC_CMD_SET_PROFILE,
     OC_CMD_GET_PROFILE,
     OC_CMD_LIST_FILE_CHANNELS,   /* WIN-82 */
+    OC_CMD_LIST_SESSIONS,        /* REQ-182 */
     OC_CMD_UPLOAD,          /* upload+post a file to `channel_id`: body = local path */
     OC_CMD_DOWNLOAD,        /* download an attachment: message_id = attachment_id, body = dest path */
     OC_CMD_LOGOUT,          /* revoke this session (op = scope) and close the connection */

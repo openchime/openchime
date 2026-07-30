@@ -364,6 +364,19 @@ void oc_model_close_invites(oc_model *m) {
     m->invites_open = m->invites_loading = 0;
 }
 
+void oc_model_close_sessions(oc_model *m) {
+    free(m->sessions);
+    m->sessions = NULL;
+    m->n_sessions = m->cap_sessions = 0;
+    m->sessions_open = m->sessions_loading = 0;
+}
+
+void oc_model_sessions_begin(oc_model *m) {
+    oc_model_close_sessions(m);
+    m->sessions_open = 1;
+    m->sessions_loading = 1;
+}
+
 void oc_model_invites_begin(oc_model *m) {
     oc_model_close_invites(m);
     m->invites_open = 1;
@@ -802,6 +815,26 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     }
     case OC_EV_SAVED_END:
         if (m->saved_open) m->saved_loading = 0;
+        break;
+    case OC_EV_SESSION_ROW: {
+        if (!m->sessions_open) break;
+        if (m->n_sessions == m->cap_sessions) {
+            size_t nc = m->cap_sessions ? m->cap_sessions * 2 : 8;
+            oc_session_row *g = realloc(m->sessions, nc * sizeof *g);
+            if (!g) break;
+            m->sessions = g; m->cap_sessions = nc;
+        }
+        oc_session_row *sr = &m->sessions[m->n_sessions++];
+        sr->session_id = e->message_id;
+        sr->created_at = e->server_time;
+        sr->last_seen  = e->pinned_at;      /* the ev's spare timestamp slot */
+        sr->expires_at = e->channel_id;    /* 64-bit slot; see net.c */
+        sr->current    = e->op;
+        snprintf(sr->device, sizeof sr->device, "%s", e->body ? e->body : "");
+        break;
+    }
+    case OC_EV_SESSIONS_END:
+        if (m->sessions_open) m->sessions_loading = 0;
         break;
     case OC_EV_FILE_CHANNELS_BEGIN:
         m->n_fchans = 0;

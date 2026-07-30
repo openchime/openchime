@@ -129,6 +129,11 @@ typedef enum {
     /* WIN-82: which channels hold files, and how many. The Files view's left column
      * was built from the 200-row page, so a channel whose last upload was older than
      * that simply did not appear. One aggregate query answers it exactly. */
+    /* REQ-182: the caller's own active sessions. `sessions` has carried device_label
+     * and last_seen_ms since migration 0001 and only REVOKE could reach them, so you
+     * could sign out everywhere without ever seeing what "everywhere" was. */
+    OC_MSG_LIST_SESSIONS      = 0x0075, /* C->S */
+    OC_MSG_SESSION_LIST       = 0x0076, /* S->C, never the tokens */
     OC_MSG_LIST_FILE_CHANNELS = 0x0073, /* C->S */
     OC_MSG_FILE_CHANNELS      = 0x0074, /* S->C, (channel_id, count) pairs */
     OC_MSG_SET_STATUS         = 0x006F, /* C->S, my custom status (empty text clears) */
@@ -361,6 +366,7 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_MAX_CLIENT_SETTINGS 128u /* cap on a CLIENT_SETTINGS snapshot */
 #define OC_MAX_INVITES     64u  /* cap on an INVITE_LIST (WIN-46) */
 #define OC_MAX_FILE_CHANNELS 128u /* cap on a FILE_CHANNELS list (WIN-82) */
+#define OC_MAX_SESSIONS      32u  /* cap on a SESSION_LIST (REQ-182) */
 #define OC_CLIENT_TYPE_MAX     32u  /* client_type string cap (bytes) */
 #define OC_SETTING_KEY_MAX     64u  /* setting key string cap (bytes) */
 #define OC_SETTING_VALUE_MAX   512u /* setting value string cap (bytes) */
@@ -575,6 +581,12 @@ typedef struct { uint64_t user_id; oc_slice display_name; oc_slice email;
                  uint8_t role; } oc_profile_info;
 /* WIN-82. Counts, not rows: the column shows "#design 12", so the wire carries
  * exactly that and nothing more. */
+/* REQ-182. `current` marks the connection asking — you should be able to tell which
+ * row is the machine in front of you before revoking one. No token, ever: only its
+ * hash is stored. */
+typedef struct { uint64_t session_id; uint64_t created_at; uint64_t last_seen;
+                 uint64_t expires_at; uint8_t current; oc_slice device_label; } oc_session_entry;
+typedef struct { uint16_t count; const oc_session_entry *entries; } oc_session_list;
 typedef struct { uint64_t channel_id; uint32_t count; } oc_file_channel_entry;
 typedef struct { uint16_t count; const oc_file_channel_entry *entries; } oc_file_channels;
 typedef struct { uint64_t channel_id; uint8_t muted; } oc_set_mute;
@@ -797,6 +809,10 @@ oc_result oc_encode_webhook_list(oc_wbuf *w, uint16_t version, const oc_webhook_
 oc_result oc_encode_delete_webhook(oc_wbuf *w, uint16_t version, const oc_delete_webhook *m);
 oc_result oc_encode_set_webhook_state(oc_wbuf *w, uint16_t version, const oc_set_webhook_state *m);
 oc_result oc_encode_rotate_webhook(oc_wbuf *w, uint16_t version, const oc_rotate_webhook *m);
+oc_result oc_encode_list_sessions(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_session_list(oc_wbuf *w, uint16_t version, const oc_session_list *m);
+oc_result oc_decode_session_list(oc_rbuf *p, oc_session_entry *entries, uint16_t cap,
+                                 uint16_t *out_count);
 oc_result oc_encode_list_file_channels(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_file_channels(oc_wbuf *w, uint16_t version, const oc_file_channels *m);
 oc_result oc_decode_file_channels(oc_rbuf *p, oc_file_channel_entry *entries, uint16_t cap,

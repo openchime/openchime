@@ -615,6 +615,7 @@ static ULONGLONG g_flash_until;
 /* Per-row action buttons (WIN-48): enable/disable, rotate, delete. */
 static D2D1_RECT_F g_srch_more_btn;   /* WIN-38: next page of search results */
 static int g_await_webhook;     /* show the minted webhook token once it arrives */
+static int      g_sessions_open;   /* REQ-182 */
 static int      g_confirm_open;
 static int      g_confirm_act;
 static uint64_t g_confirm_id;
@@ -1446,6 +1447,7 @@ static void close_overlays(void) {
     const oc_model *mm = model();
     g_prefs_open = 0;
     g_browse_open = 0;
+    g_sessions_open = 0;
     g_profile_uid = 0;
     g_notify_open = 0;
     g_keys_open = 0;
@@ -2700,7 +2702,7 @@ static void ovl_end(ID2D1RenderTarget *rt, D2D1_RECT_F body) {
     ID2D1RenderTarget_PopAxisAlignedClip(rt);
 }
 
-enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES };
+enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS };
 
 /* An overlay title bar; returns the region below it for the overlay body. */
 static D2D1_RECT_F overlay_header(ID2D1RenderTarget *rt, D2D1_RECT_F reg, const char *title) {
@@ -4985,7 +4987,7 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
  * your place in the conversation. */
 static int modal_open(void) {
     return g_prefs_open || g_keys_open || g_wsmgr_open || g_notify_open ||
-           g_browse_open || g_confirm_open;
+           g_browse_open || g_confirm_open || g_sessions_open;
 }
 
 static D2D1_RECT_F g_modal_card;
@@ -5235,7 +5237,8 @@ static D2D1_RECT_F modal_frame(ID2D1RenderTarget *rt, const oc_modal_spec *s,
  * same description the painter used. */
 static const oc_modal_spec *modal_current(void);
 
-static void draw_browse(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F body);  /* fwd */
+static void draw_browse(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F body);   /* fwd */
+static void draw_sessions(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F body); /* fwd */
 
 static void draw_modal(ID2D1RenderTarget *rt, const oc_model *m, float W, float H) {
     if (!modal_open()) {
@@ -5253,6 +5256,7 @@ static void draw_modal(ID2D1RenderTarget *rt, const oc_model *m, float W, float 
     else if (g_notify_open) draw_notify_prefs(rt, m, body);
     else if (g_browse_open) draw_browse(rt, m, body);
     else if (g_confirm_open) draw_confirm(rt, body);
+    else if (g_sessions_open) draw_sessions(rt, m, body);
 }
 
 static void prefs_save(void);                    /* fwd */
@@ -5352,6 +5356,12 @@ static const oc_modal_spec *modal_current(void) {
         sp.buttons[1] = (oc_mbtn){ "Save",   MB_PRIMARY, MODAL_OK };
         sp.n_buttons = 2;
         sp.snapshot = notify_snapshot; sp.restore = notify_restore; sp.commit = NULL;
+    } else if (g_sessions_open) {
+        sp.title = "Active sessions";
+        sp.subtitle = "Where you are signed in. Sign out everywhere revokes all of them.";
+        sp.size = MODAL_LG;
+        sp.buttons[0] = (oc_mbtn){ "Done", MB_PRIMARY, MODAL_OK };
+        sp.n_buttons = 1;
     } else if (g_browse_open) {
         sp.title = "Browse channels";
         sp.subtitle = "Every public channel in this workspace.";
@@ -5421,7 +5431,7 @@ static void modal_finish(int save) {
     if (save) { if (s->commit) s->commit(); }
     else      { if (s->restore) s->restore(); }
     g_prefs_open = g_keys_open = g_wsmgr_open = g_notify_open = g_browse_open = 0;
-    g_confirm_open = 0;
+    g_confirm_open = g_sessions_open = 0;
     g_modal_closed_by = save ? "save" : "cancel";
 }
 
@@ -6031,6 +6041,48 @@ static void draw_later_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h
                      g_lchan, g_n_lchan, g_later_chan,
                      g_lchan_rows, &g_n_lchan_rows,
                      "Channels appear here once you save something in them.", NULL);
+}
+
+/* The caller's live sessions (REQ-182). Read-only: revoking ONE session needs a
+ * per-session op the wire does not have — "Sign out everywhere" already exists and
+ * revokes all of them, so this shows what that would affect rather than offering a
+ * per-row button that cannot work. */
+static void draw_sessions(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F body) {
+    if (m->sessions_loading) { overlay_empty(rt, body, "Loading\u2026"); return; }
+    if (m->n_sessions == 0) {
+        overlay_empty(rt, body, "No other sessions.");
+        return;
+    }
+    float rowh = 52;
+    ovl_use(OVL_SESSIONS);
+    float y = ovl_begin(rt, body, (float)m->n_sessions * rowh + 12);
+    for (size_t i = 0; i < m->n_sessions; i++) {
+        const oc_session_row *sr = &m->sessions[i];
+        if (y + rowh < body.top) { y += rowh; continue; }
+        if (y > body.bottom) break;
+        char head[128];
+        snprintf(head, sizeof head, "%s%s",
+                 sr->device[0] ? sr->device : "Unnamed device",
+                 sr->current ? "   \u2014 this device" : "");
+        draw_text(rt, head, sr->current ? g_ui_b : g_ui,
+                  rf(body.left + 8, y + 4, body.right - 8, y + 26),
+                  sr->current ? OC_COL_TEXT : OC_COL_MUTED);
+        char sub[160], seen[48] = "", exp[48] = "";
+        if (sr->last_seen) rel_time(sr->last_seen, seen, sizeof seen);
+        uint64_t now = (uint64_t)time(NULL) * 1000ull;   /* wall clock, not the monotonic one */
+        if (sr->expires_at > now) {
+            uint64_t d = (sr->expires_at - now) / 86400000ull;
+            snprintf(exp, sizeof exp, "expires in %llud", (unsigned long long)d);
+        }
+        snprintf(sub, sizeof sub, "%s%s%s", seen[0] ? "last seen " : "", seen,
+                 exp[0] ? (seen[0] ? "  \u00B7  " : "") : "");
+        if (exp[0]) snprintf(sub + strlen(sub), sizeof sub - strlen(sub), "%s", exp);
+        draw_text(rt, sub, g_meta, rf(body.left + 8, y + 24, body.right - 8, y + 44),
+                  OC_COL_FAINT);
+        fill(rt, rf(body.left + 8, y + rowh - 1, body.right - 8, y + rowh), OC_COL_BORDER);
+        y += rowh;
+    }
+    ovl_end(rt, body);
 }
 
 /* The channel directory (REQ-038). Unjoined channels first: what you can act on is
@@ -9137,6 +9189,7 @@ static void open_profile_menu(HWND hwnd) {
         }
     }
     mi_item(53, "Edit profile\xE2\x80\xA6");
+    mi_item(54, "Active sessions\xE2\x80\xA6");   /* REQ-182 */
     mi_sep();
     mi_item(30, "Change display name\xE2\x80\xA6");
     mi_item(31, "Change password\xE2\x80\xA6");
@@ -9414,6 +9467,10 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         }
         oc_client_set_status(g_client, f[0].value, f[1].value, exp);
         break; }
+    case 54:     /* REQ-182 */
+        oc_client_list_sessions(g_client);
+        modal_enter(hwnd, &g_sessions_open);
+        break;
     case 52:     /* WIN-53: clear */
         oc_client_set_status(g_client, "", "", 0);
         break;
@@ -9806,7 +9863,8 @@ static void test_dump(const char *path) {
     fprintf(f, "modal=%s theme=%d time24=%d members=%d daysep=%d notify=%d\n",
             g_prefs_open ? "prefs" : g_keys_open ? "keys" :
             g_wsmgr_open ? "wsmgr" : g_notify_open ? "notify" :
-            g_browse_open ? "browse" : g_confirm_open ? "confirm" : "none",
+            g_browse_open ? "browse" : g_confirm_open ? "confirm" :
+            g_sessions_open ? "sessions" : "none",
             oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep, g_pref_notify);
     fprintf(f, "workspaces=%d active=%d elsewhere=%d\n", g_n_wss, g_ws_active, ws_unread_elsewhere());
     for (int i = 0; i < g_n_wss; i++) {

@@ -217,6 +217,8 @@ void oc_dbres_free(oc_dbres *r) {
     /* WIN-47/53's profile strings, alongside every other heap field. */
     free(r->st_emoji); free(r->st_text); free(r->pf_title); free(r->pf_tz);
     free(r->fchans);
+    for (size_t i = 0; i < r->n_sessions; i++) free((void *)r->sessions[i].device_label.ptr);
+    free(r->sessions);
     free(r->members);
     free(r->author_name);
     free_attach_meta(r->attach, r->n_attach);
@@ -438,8 +440,11 @@ static uint64_t verify_local(sqlite3 *db, const char *username, size_t ulen,
 
 /* Mint a session: random 32-byte token to the caller, only its SHA-256 stored
  * (AUTH.md §4). Returns 0 and fills token/expiry, or -1. */
+/* `out_session_id` (optional) reports the row created, so a SESSION_LIST can mark
+ * which entry is the connection asking (REQ-182). */
 static int mint_session(sqlite3 *db, uint64_t user_id,
-                        uint8_t token_out[OC_SESSION_TOKEN_LEN], uint64_t *expiry_out) {
+                        uint8_t token_out[OC_SESSION_TOKEN_LEN], uint64_t *expiry_out,
+                        uint64_t *out_session_id) {
     uint8_t token[OC_SESSION_TOKEN_LEN], hash[OC_SHA256_LEN];
     if (oc_rand_bytes(token, sizeof token) != 0) return -1;
     if (oc_sha256(token, sizeof token, hash) != 0) return -1;
@@ -455,6 +460,8 @@ static int mint_session(sqlite3 *db, uint64_t user_id,
     sqlite3_bind_int64(st, 4, (sqlite3_int64)expiry);
     sqlite3_bind_int64(st, 5, (sqlite3_int64)now);
     int rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE && out_session_id)
+        *out_session_id = (uint64_t)sqlite3_last_insert_rowid(db);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) return -1;
 
@@ -466,14 +473,15 @@ static int mint_session(sqlite3 *db, uint64_t user_id,
 /* Reconnect: hash the presented token, look up a live session, touch last_seen.
  * Returns user id + role + expiry, or 0 if unknown/expired (AUTH.md §4). */
 static uint64_t lookup_session(sqlite3 *db, const uint8_t *token, size_t tlen,
-                               uint8_t *role_out, uint64_t *expiry_out) {
+                               uint8_t *role_out, uint64_t *expiry_out,
+                               uint64_t *out_session_id) {
     if (tlen != OC_SESSION_TOKEN_LEN) return 0;
     uint8_t hash[OC_SHA256_LEN];
     if (oc_sha256(token, tlen, hash) != 0) return 0;
 
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT s.user_id, s.expires_at_ms, u.role FROM sessions s "
+        "SELECT s.user_id, s.expires_at_ms, u.role, s.id FROM sessions s "
         "JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?;", -1, &st, NULL);
     sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
     uint64_t uid = 0, exp = 0; uint8_t role = OC_ROLE_MEMBER;
@@ -481,6 +489,9 @@ static uint64_t lookup_session(sqlite3 *db, const uint8_t *token, size_t tlen,
         uid  = (uint64_t)sqlite3_column_int64(st, 0);
         exp  = (uint64_t)sqlite3_column_int64(st, 1);
         role = role_to_u8((const char *)sqlite3_column_text(st, 2));
+        /* The session's own id, so SESSION_LIST can mark which row is this device
+         * (REQ-182). Reported through the out-param below rather than a global. */
+        if (out_session_id) *out_session_id = (uint64_t)sqlite3_column_int64(st, 3);
     }
     sqlite3_finalize(st);
     if (uid == 0) return 0;
@@ -597,7 +608,7 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
     if (!r) return NULL;
     r->conn_id = j->conn_id;
 
-    uint64_t uid = 0, sess_exp = 0;
+    uint64_t uid = 0, sess_exp = 0, sess_id = 0;
     uint8_t role = OC_ROLE_MEMBER;
     int fresh = 1;   /* mint a new session unless this is a session re-auth */
 
@@ -666,7 +677,8 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         uid = upsert_oidc_user(db, subject, claims.email, claims.name);
         if (uid) role = get_role(db, uid);   /* membership ensured on the common path */
     } else if (j->method == OC_AUTH_SESSION) {
-        uid = lookup_session(db, (const uint8_t *)j->token, j->token_len, &role, &sess_exp);
+        uid = lookup_session(db, (const uint8_t *)j->token, j->token_len, &role, &sess_exp,
+                             &sess_id);
         fresh = 0;
     } else {
         r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_AUTH_REQUIRED; return r;
@@ -681,9 +693,10 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
     r->type = OC_RES_AUTH_OK;
     r->user_id = uid;
     r->role = role;
+    r->session_id = sess_id;   /* REQ-182: which row this connection is using */
     if (fresh) {
         uint8_t token[OC_SESSION_TOKEN_LEN]; uint64_t expiry = 0;
-        if (mint_session(db, uid, token, &expiry) != 0) {
+        if (mint_session(db, uid, token, &expiry, &sess_id) != 0) {
             r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_INTERNAL; return r;
         }
         memcpy(r->session_token, token, sizeof token);
@@ -946,11 +959,12 @@ static oc_dbres *process_redeem(oc_dbwriter *w, const oc_job *j) {
     sqlite3_step(st);
     sqlite3_finalize(st);
 
-    uint8_t token[OC_SESSION_TOKEN_LEN]; uint64_t sexp = 0;
-    if (mint_session(db, uid, token, &sexp) != 0) {
+    uint8_t token[OC_SESSION_TOKEN_LEN]; uint64_t sexp = 0, sid = 0;
+    if (mint_session(db, uid, token, &sexp, &sid) != 0) {
         r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
     r->type = OC_RES_AUTH_OK;
+    r->session_id = sid;
     r->user_id = uid;
     r->role = role;
     memcpy(r->session_token, token, sizeof token);
@@ -2015,6 +2029,43 @@ static oc_dbres *process_list_members(sqlite3 *db, const oc_job *j) {
  * newest upload fell outside that window was invisible in the Files column. One
  * GROUP BY answers it exactly, and it is cheap: the same membership filter as
  * LIST_FILES over an index that migration 0023 already added. */
+/* The caller's own live sessions (REQ-182). Expired rows are excluded: you cannot
+ * revoke what is already dead, and listing them would pad the view with rows that do
+ * nothing. Tokens are never selected — only their hashes exist. */
+static oc_dbres *process_list_sessions(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_SESSION_LIST;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT id, created_at_ms, COALESCE(last_seen_ms,0), expires_at_ms, "
+        "       COALESCE(device_label,'') FROM sessions "
+        " WHERE user_id=?1 AND expires_at_ms > ?2 "
+        " ORDER BY COALESCE(last_seen_ms, created_at_ms) DESC LIMIT ?3;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)dbw_now_ms());
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)OC_MAX_SESSIONS);
+    oc_session_entry *arr = calloc(OC_MAX_SESSIONS, sizeof *arr);
+    size_t n = 0;
+    while (arr && n < OC_MAX_SESSIONS && sqlite3_step(st) == SQLITE_ROW) {
+        arr[n].session_id = (uint64_t)sqlite3_column_int64(st, 0);
+        arr[n].created_at = (uint64_t)sqlite3_column_int64(st, 1);
+        arr[n].last_seen  = (uint64_t)sqlite3_column_int64(st, 2);
+        arr[n].expires_at = (uint64_t)sqlite3_column_int64(st, 3);
+        /* j->message_id carries the asking connection's session id. */
+        arr[n].current    = (arr[n].session_id == j->message_id) ? 1 : 0;
+        const unsigned char *lb = sqlite3_column_text(st, 4);
+        char *cp = strdup(lb ? (const char *)lb : "");
+        arr[n].device_label.ptr = (const uint8_t *)cp;
+        arr[n].device_label.len = cp ? strlen(cp) : 0;
+        n++;
+    }
+    sqlite3_finalize(st);
+    r->sessions = arr; r->n_sessions = n;
+    return r;
+}
+
 static oc_dbres *process_list_file_channels(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -4134,7 +4185,7 @@ static int is_read_job(int type) {
            /* Read-only, so it goes to the reader thread (ARCH-66) like every other
             * list. Its three siblings — revoke, set-state, rotate — write. */
            type == OC_JOB_LIST_INVITES || type == OC_JOB_GET_PROFILE ||
-           type == OC_JOB_LIST_FILE_CHANNELS ||
+           type == OC_JOB_LIST_FILE_CHANNELS || type == OC_JOB_LIST_SESSIONS ||
            type == OC_JOB_LIST_CLIENT_SETTINGS ||
            type == OC_JOB_CALL_AUTH ||
            type == OC_JOB_STORAGE_STATUS ||
@@ -4162,6 +4213,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_LIST_INVITES)   return process_list_invites(rdb, j);
     if (j->type == OC_JOB_GET_PROFILE)    return process_get_profile(rdb, j);
     if (j->type == OC_JOB_LIST_FILE_CHANNELS) return process_list_file_channels(rdb, j);
+    if (j->type == OC_JOB_LIST_SESSIONS)  return process_list_sessions(rdb, j);
     if (j->type == OC_JOB_LIST_NOTIFY_PREFS) return process_list_notify_prefs(rdb, j);
     if (j->type == OC_JOB_LIST_CLIENT_SETTINGS) return process_list_client_settings(rdb, j);
     if (j->type == OC_JOB_CALL_AUTH)      return process_call_auth(rdb, j);

@@ -141,6 +141,13 @@ typedef struct {
  * channel name was the bug this replaces. */
 typedef struct { uint64_t user_id, joined_at; uint8_t role; } oc_chan_member;
 
+/* One live session (REQ-182). No token: only its hash exists server-side. */
+typedef struct {
+    uint64_t session_id, created_at, last_seen, expires_at;
+    uint8_t  current;
+    char     device[64];
+} oc_session_row;
+
 /* (channel, count) — the shape of a census row (WIN-82). */
 typedef struct { uint64_t channel_id; uint32_t count; } oc_chan_count;
 
@@ -232,6 +239,11 @@ typedef struct {
     uint64_t  filelist_channel;      /* 0 = the workspace-wide view */
     oc_file_view *files;
     size_t    n_files, cap_files;
+    /* The caller's own live sessions (REQ-182). Refreshed on open like every other
+     * report; a client caches nothing (ARCH-88). */
+    uint8_t   sessions_open, sessions_loading;
+    oc_session_row *sessions;
+    size_t    n_sessions, cap_sessions;
     /* Which channels hold files, with counts (WIN-82). Server-computed, so the Files
      * column is complete rather than "whatever was in the newest 200". */
     oc_chan_count *fchans;
@@ -432,6 +444,8 @@ void oc_model_weblist_begin(oc_model *m, uint64_t channel_id);
 void oc_model_close_weblist(oc_model *m);
 void oc_model_invites_begin(oc_model *m);
 void oc_model_close_invites(oc_model *m);
+void oc_model_sessions_begin(oc_model *m);
+void oc_model_close_sessions(oc_model *m);
 
 /* A synced setting's value by key, or NULL if the bucket has no such key. Valid
  * until the next CLIENT_SETTINGS frame folds in. */

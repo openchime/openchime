@@ -99,7 +99,8 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * reading the enum would not have, because the two declarations are 200 lines
         * apart. New jobs go after the highest value, always. */
        OC_JOB_SET_STATUS = 70, OC_JOB_SET_PROFILE = 71, OC_JOB_GET_PROFILE = 72,
-       OC_JOB_LIST_FILE_CHANNELS = 73 };   /* WIN-82 */
+       OC_JOB_LIST_FILE_CHANNELS = 73,   /* WIN-82 */
+       OC_JOB_LIST_SESSIONS = 74 };      /* REQ-182 */
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -282,7 +283,8 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_MEMBER_LIST = 66, OC_RES_FILE_LIST = 67, OC_RES_LIST_ERR = 68,
        OC_RES_SAVED_OK = 69, OC_RES_SAVED_LIST = 70, OC_RES_ACTIVITY = 71,
        OC_RES_INVITE_LIST = 72, OC_RES_INVITE_REVOKED = 73,
-       OC_RES_PROFILE_INFO = 74, OC_RES_FILE_CHANNELS = 75 };
+       OC_RES_PROFILE_INFO = 74, OC_RES_FILE_CHANNELS = 75,
+       OC_RES_SESSION_LIST = 76 };
 
 /* One saved message (REQ-231). Carries its body for the same reason a pin does:
  * a saved message is usually far outside loaded history. */
@@ -591,6 +593,11 @@ typedef struct oc_dbres {
     /* OC_RES_FILE_CHANNELS (WIN-82). */
     oc_file_channel_entry  *fchans;
     size_t                  n_fchans;
+    /* OC_RES_SESSION_LIST (REQ-182). `session_id` also rides an AUTH_OK, to mark
+     * which row is the asking connection. */
+    oc_session_entry       *sessions;
+    size_t                  n_sessions;
+    uint64_t                session_id;
     size_t                  n_reclaim;
     uint64_t                maint_orphans;   /* counts, for the log line */
     uint64_t                maint_expired;

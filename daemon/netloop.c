@@ -110,6 +110,7 @@ typedef struct {
     int          did_hello;
     int          authed;
     uint64_t     user_id;
+    uint64_t     session_id;   /* REQ-182: which sessions row this conn uses */
     char         source[46]; /* peer IP string, for per-source rate limiting */
     uint8_t     *out;       /* growable pending-output buffer (capped, see out_append) */
     size_t       out_cap, out_len, out_sent;
@@ -1140,6 +1141,14 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_LIST_SESSIONS) {
+            oc_job *j = oc_job_new(OC_JOB_LIST_SESSIONS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->message_id = c->session_id;      /* so the list can mark "this device" */
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_LIST_FILE_CHANNELS) {
             oc_job *j = oc_job_new(OC_JOB_LIST_FILE_CHANNELS, c->conn_id);
             if (!j) return -1;
@@ -1666,6 +1675,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         if (!c) return;
         c->authed = 1;
         c->user_id = r->user_id;
+        c->session_id = r->session_id;   /* REQ-182 */
         c->presence = OC_PRESENCE_ONLINE;
         int fd = c->fd;
         uint64_t uid = r->user_id;
@@ -2522,6 +2532,18 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
+        break;
+    }
+    case OC_RES_SESSION_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_session_entry ents[OC_MAX_SESSIONS];
+        uint16_t n = 0;
+        for (size_t i = 0; i < r->n_sessions && n < OC_MAX_SESSIONS; i++) ents[n++] = r->sessions[i];
+        oc_session_list sl = { n, ents };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_session_list(&w, OC_PROTOCOL_VERSION, &sl);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
     case OC_RES_FILE_CHANNELS: {
