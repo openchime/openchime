@@ -635,6 +635,21 @@ static int g_n_notify_hits;
 static int      g_show_members = 1;     /* members pane visible */
 static D2D1_RECT_F g_members_btn;       /* header toggle hit-box */
 enum { TAB_MESSAGES = 0, TAB_FILES, TAB_PINS, TAB_ABOUT, TAB_COUNT };
+
+/* Does this tab exist for this conversation? (WIN-74)
+ *
+ * Pins and Files are genuinely right for a DM — the daemon's pin and file paths
+ * require only membership, and a DM's two participants are members. **About is
+ * not.** It draws a TOPIC row with a "Set topic…" button, while the daemon rejects
+ * every UPDATE_CHANNEL on a DM outright (OC_ERR_INVALID_CHANNEL, commented "a DM
+ * has no name to rename, no topic worth setting"), so that button's only possible
+ * outcome was an error. Only the admin block was gated on kind; the topic row was
+ * missed. A DM's "about" is the person, and a person is right-side coded already. */
+static int tab_applies(const oc_channel *c, int tab) {
+    if (!c) return 0;
+    if (tab == TAB_ABOUT && c->kind == OC_CHANNEL_KIND_DM) return 0;
+    return 1;
+}
 static int g_tab;                       /* the selected channel tab (WIN-37) */
 static D2D1_RECT_F g_tab_r[TAB_COUNT];  /* tab hit-boxes */
 static D2D1_RECT_F g_memchip;           /* header member-count chip */
@@ -1457,6 +1472,11 @@ static void select_channel(uint64_t cid) {
 
     g_sel = cid;
     g_scroll = 0;
+    {   /* The new conversation may not have the tab that was open (WIN-74). */
+        const oc_model *tm2 = model();
+        const oc_channel *tc2 = tm2 ? oc_model_channel((oc_model *)tm2, cid) : NULL;
+        if (tc2 && !tab_applies(tc2, g_tab)) g_tab = TAB_MESSAGES;
+    }
     if (!already_backfilled(cid)) {
         oc_client_backfill(g_client, cid);
         if (g_n_backfilled < (int)(sizeof g_backfilled / sizeof g_backfilled[0]))
@@ -4038,6 +4058,10 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
 static void select_tab(int t) {
     if (t < 0 || t >= TAB_COUNT) return;
     const oc_model *mm = model();
+    /* A tab that does not exist here cannot be selected — by click, by the palette,
+     * or by the test hook. Switching from a channel to a DM while About was open
+     * would otherwise leave the pane showing a surface with no tab (WIN-74). */
+    if (mm && g_sel && !tab_applies(oc_model_channel((oc_model *)mm, g_sel), t)) t = TAB_MESSAGES;
     if (mm && mm->pinlist_open)  oc_client_close_pins(g_client);
     if (mm && mm->filelist_open) oc_client_close_files(g_client);
     g_tab = t;
@@ -4062,8 +4086,10 @@ static float draw_tabbar(ID2D1RenderTarget *rt, const oc_model *m, float x0, flo
         { "Pins",          OC_ICON_PIN  },
         { "About",         OC_ICON_SETTINGS },
     };
+    const oc_channel *tc = oc_model_channel((oc_model *)m, g_sel);
     float tx = x0 + 16;
     for (int i = 0; i < TAB_COUNT; i++) {
+        if (!tab_applies(tc, i)) continue;      /* leaves g_tab_r[i] zeroed above */
         float tw = 26 + text_width(TABS[i].label, g_ui) + 16;
         D2D1_RECT_F r = rf(tx, HEADER_H + 2, tx + tw, HEADER_H + TABBAR_H - 1);
         int on = (g_tab == i);
@@ -8240,6 +8266,10 @@ static void open_new_menu(HWND hwnd) {
     mi_item(7, "Upload a file\xE2\x80\xA6");
     mi_sep();
     mi_item(4, "Search messages\xE2\x80\xA6");
+    /* WIN-75: the palette had exactly two callers — Ctrl+K and the test hook. No
+     * menu entry, no button, nothing. ARCH-82 says this GUI is affordance-driven,
+     * and the palette was the one surface reachable only by a keystroke. */
+    mi_item(8, "Jump to\xE2\x80\xA6  (Ctrl+K)");
     g_menu = MENU_NEW; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 224;
     g_menu_x = RAIL_W + 8;
     /* Bottom-aligned to the New button, so the menu grows upward out of the thing
@@ -8442,6 +8472,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 900: case 901: case 902: case 903: g_file_filter = cmd - 900; break;
     case 910: case 911: case 912:           g_file_sort   = cmd - 910; break;
     case 920: case 921: case 922:           g_file_scope  = cmd - 920; break;
+    case 8:  palette_open(hwnd); break;                    /* WIN-75 */
     case 2:  oc_client_reconnect(g_client); break;
     case 3:  oc_client_logout(g_client, OC_LOGOUT_THIS); g_logging_out = 1; break;
     case 5:  oc_client_logout(g_client, OC_LOGOUT_ALL);  g_logging_out = 1; break;
