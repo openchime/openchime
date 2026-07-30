@@ -859,7 +859,7 @@ static void render(oc_client *cl, size_t focus, const char *composer,
                 int gu = 0;
                 for (size_t i = 0; i < m->n_channels; i++)
                     if (chan_group(&m->channels[i]) == rows[r].group) gu += m->channels[i].unread;
-                const char *tri = g_sb.collapsed[rows[r].group] ? "\xe2\x96\xb8" : "\xe2\x96\xbe"; /* ▸ / ▾ */
+                const char *tri = oc_sb_collapsed_of(&g_sb, rows[r].group) ? "\xe2\x96\xb8" : "\xe2\x96\xbe"; /* ▸ / ▾ */
                 static const char *SORTC[3] = { "az", "recent", "unread" };
                 static const char *FILTC[3] = { "", " \xc2\xb7 unread", " \xc2\xb7 active" };
                 int gsel = (g_sb_hdr == rows[r].group);
@@ -867,7 +867,8 @@ static void render(oc_client *cl, size_t focus, const char *composer,
                  * modes are discoverable without cluttering every frame. */
                 if (gsel)
                     snprintf(label, sizeof label, "%s %s  [%s%s]", tri, SBG_LABEL[rows[r].group],
-                             SORTC[g_sb.sort[rows[r].group]], FILTC[g_sb.filter[rows[r].group]]);
+                             SORTC[oc_sb_sort_of(&g_sb, rows[r].group)],
+                             FILTC[oc_sb_filter_of(&g_sb, rows[r].group)]);
                 else if (gu) snprintf(label, sizeof label, "%s %s (%d)", tri, SBG_LABEL[rows[r].group], gu);
                 else    snprintf(label, sizeof label, "%s %s", tri, SBG_LABEL[rows[r].group]);
                 uintattr_t hfg = sel ? (th->sel_fg | TB_BOLD) : (th->accent | TB_BOLD);
@@ -1800,7 +1801,8 @@ int main(int argc, char **argv) {
                     int nrows = sidebar_build(mm, rows, 256);
                     if (prow < nrows) {
                         if (rows[prow].header) {   /* click a header → fold/unfold */
-                            g_sb.collapsed[rows[prow].group] = !g_sb.collapsed[rows[prow].group];
+                            oc_sb_set_collapsed(&g_sb, rows[prow].group,
+                                                (uint8_t)!oc_sb_collapsed_of(&g_sb, rows[prow].group));
                             sidebar_opts_save(cl);
                             g_sb_hdr = rows[prow].group;
                         } else { g_sb_hdr = -1; focus = rows[prow].idx; panel = 0; }
@@ -2105,10 +2107,10 @@ int main(int argc, char **argv) {
                 else if (ev.key == TB_KEY_ARROW_LEFT) {                      /* collapse / go to header */
                     int g = g_sb_hdr >= 0 ? g_sb_hdr
                           : (focus < mm->n_channels ? chan_group(&mm->channels[focus]) : -1);
-                    if (g >= 0) { g_sb.collapsed[g] = 1; g_sb_hdr = g; sidebar_opts_save(cl); }
+                    if (g >= 0) { oc_sb_set_collapsed(&g_sb, g, 1); g_sb_hdr = g; sidebar_opts_save(cl); }
                 }
                 else if (ev.key == TB_KEY_ARROW_RIGHT) {                     /* expand a folded group */
-                    if (g_sb_hdr >= 0 && g_sb.collapsed[g_sb_hdr]) { g_sb.collapsed[g_sb_hdr] = 0; sidebar_opts_save(cl); }
+                    if (g_sb_hdr >= 0 && oc_sb_collapsed_of(&g_sb, g_sb_hdr)) { oc_sb_set_collapsed(&g_sb, g_sb_hdr, 0); sidebar_opts_save(cl); }
                 }
                 else if (ev.ch == 's' || ev.ch == 'f') {
                     /* Sort / filter the section under the cursor — the TUI's
@@ -2117,15 +2119,15 @@ int main(int argc, char **argv) {
                     int g = g_sb_hdr >= 0 ? g_sb_hdr
                           : (focus < mm->n_channels ? chan_group(&mm->channels[focus]) : -1);
                     if (g >= 0) {
-                        if (ev.ch == 's') g_sb.sort[g]   = (uint8_t)((g_sb.sort[g] + 1) % 3);
-                        else              g_sb.filter[g] = (uint8_t)((g_sb.filter[g] + 1) % 3);
+                        if (ev.ch == 's') oc_sb_set_sort(&g_sb, g, (uint8_t)((oc_sb_sort_of(&g_sb, g) + 1) % 3));
+                        else              oc_sb_set_filter(&g_sb, g, (uint8_t)((oc_sb_filter_of(&g_sb, g) + 1) % 3));
                         sidebar_opts_save(cl);
                     }
                 }
                 else if (ev.ch == 'n') { prompt_kind = PROMPT_NEWCHAN; prompt_title = "New channel"; tk_input_init(&prompt_input, 0, "name"); }
                 else if (ev.key == TB_KEY_ENTER) {
                     if (g_sb_hdr >= 0) {                                      /* toggle the group's fold */
-                        g_sb.collapsed[g_sb_hdr] = !g_sb.collapsed[g_sb_hdr];
+                        oc_sb_set_collapsed(&g_sb, g_sb_hdr, (uint8_t)!oc_sb_collapsed_of(&g_sb, g_sb_hdr));
                         sidebar_opts_save(cl);
                     } else if (focus < mm->n_channels) {                     /* channel action menu */
                         menu_build_channel(mm->channels[focus].joined);

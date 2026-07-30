@@ -356,7 +356,7 @@ static DWORD    g_last_typing;
 /* Sidebar rows come from the shared core helper (oc_model_sidebar), so the GUI
  * and the TUI group, filter and sort identically. A row is either a section
  * header or a conversation. */
-static struct { float top, bot; uint64_t cid; int header; int sec; } g_rows[512];
+static struct { float top, bot; uint64_t cid; int header; int sec; char label[96]; } g_rows[512];
 static oc_sidebar_opts g_sb;          /* per-section sort/filter/collapse */
 static float g_sb_scroll, g_sb_content, g_sb_view;
 static int   g_sb_hover_sec = -1;     /* header hovered -> reveal its kebab */
@@ -2020,7 +2020,7 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
         if (ry + ROW_H < top || ry > bot) continue;          /* virtualized */
 
         if (r->is_header) {
-            const char *chev = g_sb.collapsed[r->section] ? "\xE2\x96\xB8" : "\xE2\x96\xBE";
+            const char *chev = oc_sb_collapsed_of(&g_sb, r->section) ? "\xE2\x96\xB8" : "\xE2\x96\xBE";
             draw_text(rt, chev, g_meta, rf(sx0 + 6, ry, sx0 + 22, ry + ROW_H), OC_COL_MUTED);
             draw_text(rt, r->label, g_meta, rf(sx0 + 22, ry, sx1 - 30, ry + ROW_H), OC_COL_FAINT);
             if (g_sb_hover_sec == r->section || g_sb_menu_sec == r->section) {
@@ -2084,6 +2084,7 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
             g_rows[g_n_rows].cid = r->channel_id;
             g_rows[g_n_rows].header = r->is_header;
             g_rows[g_n_rows].sec = r->section;
+            snprintf(g_rows[g_n_rows].label, sizeof g_rows[g_n_rows].label, "%s", r->label);
             g_n_rows++;
         }
     }
@@ -8703,7 +8704,8 @@ static int on_click(HWND hwnd, int x, int y) {
         for (int i = 0; i < g_n_rows; i++)
             if ((float)y >= g_rows[i].top && (float)y < g_rows[i].bot) {
                 if (g_rows[i].header) {
-                    g_sb.collapsed[g_rows[i].sec] = (uint8_t)!g_sb.collapsed[g_rows[i].sec];
+                    oc_sb_set_collapsed(&g_sb, g_rows[i].sec,
+                                        (uint8_t)!oc_sb_collapsed_of(&g_sb, g_rows[i].sec));
                     sidebar_opts_save();
                 } else if (g_rows[i].cid != g_sel) {
                     select_channel(g_rows[i].cid);
@@ -9668,6 +9670,7 @@ static void open_new_menu(HWND hwnd) {
      * and the palette was the one surface reachable only by a keystroke. */
     mi_item(8, "Jump to\xE2\x80\xA6  (Ctrl+K)");
     mi_item(9, "Browse channels\xE2\x80\xA6");
+    mi_item(82, "New sidebar section\xE2\x80\xA6");   /* WIN-83 */
     g_menu = MENU_NEW; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 224;
     g_menu_x = RAIL_W + 8;
     /* Bottom-aligned to the New button, so the menu grows upward out of the thing
@@ -9766,17 +9769,29 @@ static void sidebar_opts_load(const oc_model *m) {
 #define SEC_CMD(sec, slot) (200 + (sec) * 16 + (slot))
 static void open_section_menu(HWND hwnd, int sec) {
     (void)hwnd;
-    if (sec < 0 || sec >= OC_SB_SECTIONS) return;
+    int cust = oc_sb_custom_index(sec);
+    if (cust >= g_sb.n_custom) cust = -1;
+    if (sec < 0 || (cust < 0 && sec >= OC_SB_SECTIONS)) return;
     g_sb_menu_sec = sec;
     g_n_mi = 0;
-    mi_section(sec == OC_SB_CHANNELS ? "CHANNELS" : "DIRECT MESSAGES");
-    mi_item(SEC_CMD(sec, 0), g_sb.collapsed[sec] ? "Expand" : "Collapse");
+    /* The heading names the section you right-clicked, which for a custom one is
+     * the only way to tell two of them apart in an identical menu. */
+    if (cust >= 0) {
+        char up[OC_SB_NAME_MAX + 4];
+        snprintf(up, sizeof up, "%s", g_sb.custom[cust].name);
+        for (char *q = up; *q; q++) if (*q >= 'a' && *q <= 'z') *q -= 32;
+        mi_section(up);
+    } else {
+        mi_section(sec == OC_SB_CHANNELS ? "CHANNELS" :
+                   sec == OC_SB_DMS ? "DIRECT MESSAGES" : "STARRED");
+    }
+    mi_item(SEC_CMD(sec, 0), oc_sb_collapsed_of(&g_sb, sec) ? "Expand" : "Collapse");
     mi_sep();
     mi_section("SORT");
     static const char *SORTS[3] = { "A\xE2\x80\x93Z", "Recent activity", "Unread first" };
     for (int i = 0; i < 3; i++) {
         char lbl[72];
-        snprintf(lbl, sizeof lbl, "%s%s", g_sb.sort[sec] == i ? "\xE2\x9C\x93 " : "    ", SORTS[i]);
+        snprintf(lbl, sizeof lbl, "%s%s", oc_sb_sort_of(&g_sb, sec) == i ? "\xE2\x9C\x93 " : "    ", SORTS[i]);
         mi_item(SEC_CMD(sec, 1 + i), lbl);
     }
     mi_sep();
@@ -9786,8 +9801,15 @@ static void open_section_menu(HWND hwnd, int sec) {
                                sec == OC_SB_DMS ? "Online only" : "Joined only" };
     for (int i = 0; i < 3; i++) {
         char lbl[72];
-        snprintf(lbl, sizeof lbl, "%s%s", g_sb.filter[sec] == i ? "\xE2\x9C\x93 " : "    ", FILTERS[i]);
+        snprintf(lbl, sizeof lbl, "%s%s", oc_sb_filter_of(&g_sb, sec) == i ? "\xE2\x9C\x93 " : "    ", FILTERS[i]);
         mi_item(SEC_CMD(sec, 4 + i), lbl);
+    }
+    /* A user-defined section can be renamed and removed; the built-ins cannot,
+     * which is why these two live here rather than in the shared block above. */
+    if (cust >= 0) {
+        mi_sep();
+        mi_item(SEC_CMD(sec, 7), "Rename\u2026");
+        mi_item_d(SEC_CMD(sec, 8), "Remove section");
     }
     g_menu = MENU_SECTION; g_menu_headerblock = 0; g_menu_hover = -1;
     g_menu_x = RAIL_W + 24; g_menu_y = HEADER_H + 60; g_menu_w = 236;
@@ -10022,15 +10044,47 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     /* Adding a workspace must not sign you out of the one you are in — which is
      * exactly what reset_session() here used to do. Park the current one and
      * sign in alongside it. */
+    case 82: {   /* WIN-83 — 82 because 10 and 11 are the presence items */
+        if (g_sb.n_custom >= (int)OC_SB_CUSTOM_MAX) {
+            toast_push("You already have 8 sections.", 1);
+            break;
+        }
+        oc_field f[1] = { { FF_TEXT, "Section name",
+                            "A heading in your sidebar. Only you see it.", "" } };
+        if (!form_dialog(hwnd, "New section", f, 1) || !f[0].value[0]) break;
+        if (oc_sidebar_section_add(&g_sb, f[0].value) < 0)
+            toast_push("That name is not usable.", 1);
+        else
+            sidebar_opts_save();
+        break; }
     case 80: signin_begin_add(hwnd); break;
     case 81: sw_book_load(); modal_enter(hwnd, &g_wsmgr_open); break;
     default:
         /* Section Filter/Sort (see SEC_CMD). */
-        if (cmd >= 200 && cmd < 200 + OC_SB_SECTIONS * 16) {
+        /* The range covers the custom sections too (numbered from
+         * OC_SB_CUSTOM_BASE), which is why it is not OC_SB_SECTIONS * 16. */
+        if (cmd >= 200 && cmd < 200 + (OC_SB_CUSTOM_BASE + (int)OC_SB_CUSTOM_MAX) * 16) {
             int sec = (cmd - 200) / 16, slot = (cmd - 200) % 16;
-            if (slot == 0)                   g_sb.collapsed[sec] = (uint8_t)!g_sb.collapsed[sec];
-            else if (slot >= 1 && slot <= 3) g_sb.sort[sec]      = (uint8_t)(slot - 1);
-            else if (slot >= 4 && slot <= 6) g_sb.filter[sec]    = (uint8_t)(slot - 4);
+            if (slot == 0)                   oc_sb_set_collapsed(&g_sb, sec, (uint8_t)!oc_sb_collapsed_of(&g_sb, sec));
+            else if (slot >= 1 && slot <= 3) oc_sb_set_sort(&g_sb, sec, (uint8_t)(slot - 1));
+            else if (slot >= 4 && slot <= 6) oc_sb_set_filter(&g_sb, sec, (uint8_t)(slot - 4));
+            else if (slot == 7) {                       /* rename (WIN-83) */
+                int ci = oc_sb_custom_index(sec);
+                if (ci >= 0 && ci < g_sb.n_custom) {
+                    oc_field f[1] = { { FF_TEXT, "Section name",
+                                        "A heading in your sidebar. Only you see it.", "" } };
+                    snprintf(f[0].value, sizeof f[0].value, "%s", g_sb.custom[ci].name);
+                    g_sb_menu_sec = -1;
+                    if (form_dialog(hwnd, "Rename section", f, 1) && f[0].value[0])
+                        oc_sidebar_section_rename(&g_sb, ci, f[0].value);
+                }
+            } else if (slot == 8) {                     /* remove */
+                int ci = oc_sb_custom_index(sec);
+                /* No confirmation: a section is a view, its conversations return to
+                 * Channels/DMs, and nothing is lost. Confirming a reversible display
+                 * change teaches people to click through confirmations. */
+                if (ci >= 0) oc_sidebar_section_remove(&g_sb, ci);
+            }
             g_sb_menu_sec = -1;
             sidebar_opts_save();
             break;
@@ -10139,7 +10193,12 @@ static void channel_menu_run(HWND hwnd, int cmd) {
     case 20: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_ALL); break;
     case 21: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_MENTIONS); break;
     case 22: oc_client_set_notify_pref(g_client, cid, OC_NOTIFY_NONE); break;
-    default: break;
+    default:
+        if (cmd >= 300 && cmd < 300 + (int)OC_SB_CUSTOM_MAX) {
+            if (oc_sidebar_assign(&g_sb, cid, cmd - 300)) sidebar_opts_save();
+            else toast_push("That section is full (32).", 1);
+        }
+        break;
     }
 }
 
@@ -10323,6 +10382,21 @@ static void test_dump(const char *path) {
     fprintf(f, "textsize=%d zoom=%d scale=%.3f dpi=%u density=%d accent=%d\n",
             g_pref_textsize, g_zoom_step, g_text_scale, g_dpi, g_pref_density,
             oc_theme_accent());
+    /* The sidebar AS BUILT, which is where the appear-once rule lives: a
+     * conversation in a custom section leaves Channels, a starred one leaves both.
+     * Counting a label in this list is the only way to assert that. */
+    for (int i = 0; i < g_n_rows; i++)
+        fprintf(f, "  sbrow sec=%d header=%d cid=%llu label=\"%s\"\n",
+                g_rows[i].sec, g_rows[i].header,
+                (unsigned long long)g_rows[i].cid, g_rows[i].label);
+    fprintf(f, "sections=%d\n", g_sb.n_custom);
+    for (int i = 0; i < g_sb.n_custom; i++) {
+        fprintf(f, "  section %d name=\"%s\" n=%u collapsed=%u ids=", i,
+                g_sb.custom[i].name, g_sb.custom[i].n_ids, g_sb.custom[i].collapsed);
+        for (uint8_t k = 0; k < g_sb.custom[i].n_ids; k++)
+            fprintf(f, "%s%llu", k ? "," : "", (unsigned long long)g_sb.custom[i].ids[k]);
+        fprintf(f, "\n");
+    }
     fprintf(f, "prefcat=%d\n", g_pref_cat);
     for (int i = 0; i < PC_COUNT; i++)
         fprintf(f, "  prefcat %d name=%s r=%.0f,%.0f,%.0f,%.0f\n", i, PC_NAME[i],
@@ -10651,6 +10725,28 @@ static void test_poll(HWND hwnd) {
             snprintf(g_form_last, sizeof g_form_last, "%s text=\"%s\" check=%s choice=%s",
                      okp ? "ok" : "cancel", f[0].value, f[1].value, f[2].value);
         }
+    } else if (!strcmp(verb, "section")) {
+        /* WIN-83: `section add <name>` | `section put <cid> <idx>` | `section rm <idx>`
+         * | `section clear <cid>`. The menus that reach these open a modal form, and a
+         * form inside a menu inside the harness is three layers of driving for what is
+         * one call — so the verb goes at the model, and the smoke asserts the sidebar
+         * that comes out of it. */
+        char what[16] = ""; char rest[128] = "";
+        sscanf(arg, "%15s %127[^\n]", what, rest);
+        if (!strcmp(what, "add"))        { test_ack(oc_sidebar_section_add(&g_sb, rest) >= 0 ? "ok" : "err"); }
+        else if (!strcmp(what, "put"))   {
+            unsigned long long cid = 0; int idx = -1;
+            sscanf(rest, "%llu %d", &cid, &idx);
+            test_ack(oc_sidebar_assign(&g_sb, (uint64_t)cid, idx) ? "ok" : "err");
+        }
+        else if (!strcmp(what, "clear")) {
+            unsigned long long cid = strtoull(rest, NULL, 10);
+            oc_sidebar_assign(&g_sb, (uint64_t)cid, -1); test_ack("ok");
+        }
+        else if (!strcmp(what, "rm"))    { oc_sidebar_section_remove(&g_sb, atoi(rest)); test_ack("ok"); }
+        else                             { test_ack("err"); }
+        sidebar_opts_save();
+        InvalidateRect(hwnd, NULL, FALSE);
     } else if (!strcmp(verb, "prefs")) {
         modal_enter(hwnd, &g_prefs_open); test_ack("ok");
     } else if (!strcmp(verb, "theme")) {

@@ -419,6 +419,109 @@ static void test_sidebar(void) {
     oc_sidebar_opts p3; oc_sidebar_opts_defaults(&p3);
     oc_sidebar_opts_parse(&p3, "c:1,0,0;d:2,0,1");
     CHECK(p3.n_starred == 0 && p3.sort[OC_SB_DMS] == OC_SB_SORT_UNREAD);
+    CHECK(p3.n_custom == 0);
+
+    /* ---- user-defined sections (WIN-83, the other half of REQ-234) ---------- */
+    oc_sidebar_opts u; oc_sidebar_opts_defaults(&u);
+    int work = oc_sidebar_section_add(&u, "Work");
+    CHECK(work == 0 && u.n_custom == 1);
+
+    /* A named section sits between Starred and Channels, and a conversation in it
+     * is REMOVED from Channels — the same appear-once rule Starred follows. */
+    CHECK(oc_sidebar_assign(&u, 10, work) == 1);         /* zulu */
+    CHECK(oc_sidebar_section_of(&u, 10) == work);
+    n = oc_model_sidebar(&m, &u, rows, 16);
+    CHECK(n == 7);
+    CHECK(rows[0].is_header && rows[0].section == OC_SB_STARRED);
+    CHECK(rows[1].is_header && rows[1].section == OC_SB_CUSTOM_BASE);
+    CHECK(strcmp(rows[1].label, "Work") == 0 && rows[1].section_total == 1);
+    CHECK(strcmp(rows[2].label, "zulu") == 0 && rows[2].section == OC_SB_CUSTOM_BASE);
+    CHECK(rows[3].is_header && rows[3].section == OC_SB_CHANNELS && rows[3].section_total == 1);
+    CHECK(strcmp(rows[4].label, "alpha") == 0);           /* zulu is gone from here */
+
+    /* At most one section: assigning again MOVES rather than duplicating. */
+    int later = oc_sidebar_section_add(&u, "Later");
+    CHECK(later == 1);
+    CHECK(oc_sidebar_assign(&u, 10, later) == 1);
+    CHECK(oc_sidebar_section_of(&u, 10) == later);
+    CHECK(u.custom[work].n_ids == 0 && u.custom[later].n_ids == 1);
+
+    /* Starred WINS over a custom section: two lift-it-out rules need a precedence,
+     * and a conversation in both must still appear exactly once. */
+    CHECK(oc_sidebar_toggle_star(&u, 10) == 1);
+    n = oc_model_sidebar(&m, &u, rows, 16);
+    CHECK(rows[0].section_total == 1);                    /* in Starred */
+    {
+        int seen = 0;
+        for (size_t i = 0; i < n; i++)
+            if (!rows[i].is_header && rows[i].channel_id == 10) seen++;
+        CHECK(seen == 1);
+    }
+    CHECK(oc_sidebar_toggle_star(&u, 10) == 1);           /* back to Later */
+
+    /* Per-section sort/filter/collapse work through the accessors, which is what a
+     * frontend must use: a custom section's number is past the end of the built-in
+     * arrays, and indexing them directly would read off the end. */
+    CHECK(oc_sb_custom_index(OC_SB_CUSTOM_BASE + 1) == 1);
+    CHECK(oc_sb_custom_index(OC_SB_CHANNELS) == -1);
+    oc_sb_set_collapsed(&u, OC_SB_CUSTOM_BASE + later, 1);
+    CHECK(oc_sb_collapsed_of(&u, OC_SB_CUSTOM_BASE + later) == 1);
+    n = oc_model_sidebar(&m, &u, rows, 16);
+    CHECK(rows[2].is_header);                             /* its child is hidden */
+    oc_sb_set_collapsed(&u, OC_SB_CUSTOM_BASE + later, 0);
+    oc_sb_set_sort(&u, OC_SB_CUSTOM_BASE + later, OC_SB_SORT_RECENT);
+    CHECK(oc_sb_sort_of(&u, OC_SB_CUSTOM_BASE + later) == OC_SB_SORT_RECENT);
+    CHECK(u.sort[OC_SB_CHANNELS] == OC_SB_SORT_AZ);       /* did not touch a built-in */
+
+    /* The name is sanitised, because it round-trips through ONE flat setting string
+     * and the separators cannot survive inside it. Stripped, not rejected: the user
+     * asked for a section and should get one. */
+    int odd = oc_sidebar_section_add(&u, "A;b:c,d|e ");
+    CHECK(odd == 2 && strcmp(u.custom[odd].name, "Abcde") == 0);
+    CHECK(oc_sidebar_section_add(&u, ";;;") == -1);       /* nothing left = no section */
+    CHECK(oc_sidebar_section_add(&u, "") == -1);
+
+    /* Round-trip, with the ids and each section's own sort/filter/collapse. */
+    char e2[512]; oc_sidebar_opts_encode(&u, e2, sizeof e2);
+    oc_sidebar_opts p4; oc_sidebar_opts_defaults(&p4);
+    oc_sidebar_opts_parse(&p4, e2);
+    CHECK(p4.n_custom == 3);
+    CHECK(strcmp(p4.custom[0].name, "Work") == 0);
+    CHECK(strcmp(p4.custom[1].name, "Later") == 0);
+    CHECK(strcmp(p4.custom[2].name, "Abcde") == 0);
+    CHECK(p4.custom[1].n_ids == 1 && p4.custom[1].ids[0] == 10);
+    CHECK(oc_sb_sort_of(&p4, OC_SB_CUSTOM_BASE + 1) == OC_SB_SORT_RECENT);
+    CHECK(oc_sidebar_section_of(&p4, 10) == 1);
+
+    /* Removing a section returns its conversations to Channels rather than losing
+     * them: a section is a view, not a container. */
+    oc_sidebar_section_remove(&p4, 1);
+    CHECK(p4.n_custom == 2 && oc_sidebar_section_of(&p4, 10) == -1);
+    CHECK(strcmp(p4.custom[1].name, "Abcde") == 0);       /* the list closed up */
+    n = oc_model_sidebar(&m, &p4, rows, 16);
+    {
+        int in_channels = 0;
+        for (size_t i = 0; i < n; i++)
+            if (!rows[i].is_header && rows[i].channel_id == 10 &&
+                rows[i].section == OC_SB_CHANNELS) in_channels = 1;
+        CHECK(in_channels);
+    }
+
+    /* Rename keeps the members; an empty rename is refused rather than leaving an
+     * unclickable header. */
+    oc_sidebar_section_rename(&p4, 0, "Projects");
+    CHECK(strcmp(p4.custom[0].name, "Projects") == 0);
+    oc_sidebar_section_rename(&p4, 0, ";");
+    CHECK(strcmp(p4.custom[0].name, "Projects") == 0);
+
+    /* The cap refuses rather than evicting, like the starred list. */
+    oc_sidebar_opts f2; oc_sidebar_opts_defaults(&f2);
+    for (unsigned i = 0; i < OC_SB_CUSTOM_MAX; i++) {
+        char nm[16]; snprintf(nm, sizeof nm, "s%u", i);
+        CHECK(oc_sidebar_section_add(&f2, nm) == (int)i);
+    }
+    CHECK(oc_sidebar_section_add(&f2, "one more") == -1);
+    CHECK(f2.n_custom == (int)OC_SB_CUSTOM_MAX);
 
     oc_model_free(&m);
 }

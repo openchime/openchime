@@ -1014,8 +1014,13 @@ architecture decision.*
   delivery mechanism of REQ-224.]**
 - **REQ-234.** A user has been able to **star (favorite)** channels and DMs and
   organize their sidebar into **custom sections** — per-user view state that has
-  synced across their devices without affecting other users. **[needs ARCH
-  decision — per-user sidebar state storage: client-local vs. synced.]**
+  synced across their devices without affecting other users. **DONE** (2026-07-30):
+  both halves live in `oc_sidebar_opts` and persist through the daemon's
+  `client_settings` bucket, so the client stores nothing locally (ARCH-88) and the
+  state follows the account. A conversation appears exactly once — a section lifts it
+  out of Channels/DMs and a star lifts it out of everything, with the star taking
+  precedence. Caps refuse rather than evict: 32 stars, 8 sections, 32 conversations
+  per section.
 - **REQ-235.** A user has been able to **mark a message (or a whole conversation)
   as unread**, moving their read marker back so the conversation re-surfaces as
   unread for later attention, without altering anyone else's state. This has been

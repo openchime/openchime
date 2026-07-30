@@ -1251,6 +1251,18 @@ void oc_sidebar_opts_encode(const oc_sidebar_opts *o, char *out, size_t cap) {
         size_t at2 = strlen(out);
         if (at2 + 8 < cap) snprintf(out + at2, cap - at2, ";sc:%u", o->collapsed[OC_SB_STARRED]);
     }
+    /* Custom sections (WIN-83), one ";u:" run each: name|sort,filter,collapsed|ids.
+     * Appended for the same reason as everything above — an older client parses the
+     * prefix it knows and ignores this. */
+    for (int i = 0; i < o->n_custom; i++) {
+        size_t at = strlen(out);
+        if (at + strlen(o->custom[i].name) + 24 >= cap) break;
+        at += (size_t)snprintf(out + at, cap - at, ";u:%s|%u,%u,%u|", o->custom[i].name,
+                               o->custom[i].sort, o->custom[i].filter, o->custom[i].collapsed);
+        for (uint8_t k = 0; k < o->custom[i].n_ids && at + 24 < cap; k++)
+            at += (size_t)snprintf(out + at, cap - at, "%s%llu", k ? "," : "",
+                                   (unsigned long long)o->custom[i].ids[k]);
+    }
 }
 
 void oc_sidebar_opts_parse(oc_sidebar_opts *o, const char *s) {
@@ -1274,6 +1286,41 @@ void oc_sidebar_opts_parse(oc_sidebar_opts *o, const char *s) {
     }
     const char *cp = strstr(s, ";sc:");
     if (cp) o->collapsed[OC_SB_STARRED] = (uint8_t)(atoi(cp + 4) ? 1 : 0);
+    /* Custom sections. Parsed positionally within each ";u:" run; a malformed run is
+     * skipped rather than aborting the whole setting, so one bad section cannot cost
+     * the user their sort and filter choices as well. */
+    o->n_custom = 0;
+    for (const char *up = strstr(s, ";u:"); up; up = strstr(up, ";u:")) {
+        up += 3;
+        if (o->n_custom >= OC_SB_CUSTOM_MAX) break;
+        const char *bar = strchr(up, '|');
+        if (!bar) break;
+        int ci = o->n_custom;
+        memset(&o->custom[ci], 0, sizeof o->custom[ci]);
+        size_t nl = (size_t)(bar - up);
+        if (nl >= sizeof o->custom[ci].name) nl = sizeof o->custom[ci].name - 1;
+        memcpy(o->custom[ci].name, up, nl);
+        o->custom[ci].name[nl] = '\0';
+        unsigned cso = 0, cfl = 0, ccl = 0;
+        if (sscanf(bar + 1, "%u,%u,%u", &cso, &cfl, &ccl) != 3) { up = bar + 1; continue; }
+        o->custom[ci].sort      = (uint8_t)(cso <= OC_SB_SORT_UNREAD ? cso : OC_SB_SORT_AZ);
+        o->custom[ci].filter    = (uint8_t)(cfl <= OC_SB_FILTER_ACTIVE ? cfl : OC_SB_FILTER_ALL);
+        o->custom[ci].collapsed = (uint8_t)(ccl ? 1 : 0);
+        const char *ids = strchr(bar + 1, '|');
+        if (ids) {
+            ids++;
+            while (*ids && *ids != ';' && o->custom[ci].n_ids < OC_SB_CUSTOM_IDS) {
+                char *end = NULL;
+                unsigned long long v = strtoull(ids, &end, 10);
+                if (!end || end == ids) break;
+                if (v) o->custom[ci].ids[o->custom[ci].n_ids++] = (uint64_t)v;
+                if (*end != ',') break;
+                ids = end + 1;
+            }
+        }
+        if (o->custom[ci].name[0]) o->n_custom++;
+        up = bar + 1;
+    }
     /* Clamp: a bucket value can come from a newer client that knows more modes. */
     o->sort[OC_SB_CHANNELS]      = (uint8_t)(cs <= OC_SB_SORT_UNREAD ? cs : OC_SB_SORT_AZ);
     o->filter[OC_SB_CHANNELS]    = (uint8_t)(cf <= OC_SB_FILTER_ACTIVE ? cf : OC_SB_FILTER_ALL);
@@ -1343,6 +1390,120 @@ int oc_sidebar_toggle_star(oc_sidebar_opts *o, uint64_t channel_id) {
     return 1;
 }
 
+int oc_sb_custom_index(int section) {
+    if (section < OC_SB_CUSTOM_BASE) return -1;
+    int i = section - OC_SB_CUSTOM_BASE;
+    return (i < (int)OC_SB_CUSTOM_MAX) ? i : -1;
+}
+
+uint8_t oc_sb_sort_of(const oc_sidebar_opts *o, int section) {
+    if (!o) return OC_SB_SORT_AZ;
+    int ci = oc_sb_custom_index(section);
+    if (ci >= 0) return o->custom[ci].sort;
+    return (section >= 0 && section < OC_SB_SECTIONS) ? o->sort[section] : OC_SB_SORT_AZ;
+}
+uint8_t oc_sb_filter_of(const oc_sidebar_opts *o, int section) {
+    if (!o) return OC_SB_FILTER_ALL;
+    int ci = oc_sb_custom_index(section);
+    if (ci >= 0) return o->custom[ci].filter;
+    return (section >= 0 && section < OC_SB_SECTIONS) ? o->filter[section] : OC_SB_FILTER_ALL;
+}
+uint8_t oc_sb_collapsed_of(const oc_sidebar_opts *o, int section) {
+    if (!o) return 0;
+    int ci = oc_sb_custom_index(section);
+    if (ci >= 0) return o->custom[ci].collapsed;
+    return (section >= 0 && section < OC_SB_SECTIONS) ? o->collapsed[section] : 0;
+}
+void oc_sb_set_sort(oc_sidebar_opts *o, int section, uint8_t v) {
+    if (!o || v > OC_SB_SORT_UNREAD) return;
+    int ci = oc_sb_custom_index(section);
+    if (ci >= 0) { if (ci < o->n_custom) o->custom[ci].sort = v; return; }
+    if (section >= 0 && section < OC_SB_SECTIONS) o->sort[section] = v;
+}
+void oc_sb_set_filter(oc_sidebar_opts *o, int section, uint8_t v) {
+    if (!o || v > OC_SB_FILTER_ACTIVE) return;
+    int ci = oc_sb_custom_index(section);
+    if (ci >= 0) { if (ci < o->n_custom) o->custom[ci].filter = v; return; }
+    if (section >= 0 && section < OC_SB_SECTIONS) o->filter[section] = v;
+}
+void oc_sb_set_collapsed(oc_sidebar_opts *o, int section, uint8_t v) {
+    if (!o) return;
+    v = v ? 1 : 0;
+    int ci = oc_sb_custom_index(section);
+    if (ci >= 0) { if (ci < o->n_custom) o->custom[ci].collapsed = v; return; }
+    if (section >= 0 && section < OC_SB_SECTIONS) o->collapsed[section] = v;
+}
+
+/* Names round-trip through ONE flat setting string, so the separators that string
+ * uses cannot survive inside a name. Stripped rather than rejected: the user asked
+ * for a section called "Work; urgent" and should get one, not an error dialog about
+ * an encoding they cannot see. */
+static void sb_clean_name(const char *in, char *out, size_t cap) {
+    size_t n = 0;
+    for (; in && *in && n + 1 < cap; in++) {
+        unsigned char c = (unsigned char)*in;
+        if (c < 0x20 || c == ';' || c == ':' || c == ',' || c == '|') continue;
+        out[n++] = (char)c;
+    }
+    /* Trailing spaces would make two sections look identical. */
+    while (n && out[n - 1] == ' ') n--;
+    out[n] = '\0';
+}
+
+int oc_sidebar_section_add(oc_sidebar_opts *o, const char *name) {
+    if (!o || o->n_custom >= OC_SB_CUSTOM_MAX) return -1;
+    char clean[OC_SB_NAME_MAX];
+    sb_clean_name(name, clean, sizeof clean);
+    if (!clean[0]) return -1;
+    int i = o->n_custom++;
+    memset(&o->custom[i], 0, sizeof o->custom[i]);
+    snprintf(o->custom[i].name, sizeof o->custom[i].name, "%s", clean);
+    return i;
+}
+
+void oc_sidebar_section_rename(oc_sidebar_opts *o, int idx, const char *name) {
+    if (!o || idx < 0 || idx >= o->n_custom) return;
+    char clean[OC_SB_NAME_MAX];
+    sb_clean_name(name, clean, sizeof clean);
+    if (!clean[0]) return;                 /* a nameless section is unclickable */
+    snprintf(o->custom[idx].name, sizeof o->custom[idx].name, "%s", clean);
+}
+
+void oc_sidebar_section_remove(oc_sidebar_opts *o, int idx) {
+    if (!o || idx < 0 || idx >= o->n_custom) return;
+    for (int i = idx; i + 1 < o->n_custom; i++) o->custom[i] = o->custom[i + 1];
+    o->n_custom--;
+    memset(&o->custom[o->n_custom], 0, sizeof o->custom[0]);
+}
+
+int oc_sidebar_section_of(const oc_sidebar_opts *o, uint64_t channel_id) {
+    if (!o || !channel_id) return -1;
+    for (int i = 0; i < o->n_custom; i++)
+        for (uint8_t k = 0; k < o->custom[i].n_ids; k++)
+            if (o->custom[i].ids[k] == channel_id) return i;
+    return -1;
+}
+
+int oc_sidebar_assign(oc_sidebar_opts *o, uint64_t channel_id, int idx) {
+    if (!o || !channel_id) return 0;
+    int changed = 0, cur = oc_sidebar_section_of(o, channel_id);
+    if (cur == idx) return 0;
+    if (cur >= 0) {                        /* out of the old one first: at most one */
+        for (uint8_t k = 0; k < o->custom[cur].n_ids; k++)
+            if (o->custom[cur].ids[k] == channel_id) {
+                memmove(&o->custom[cur].ids[k], &o->custom[cur].ids[k + 1],
+                        (size_t)(o->custom[cur].n_ids - k - 1) * sizeof o->custom[cur].ids[0]);
+                o->custom[cur].n_ids--;
+                changed = 1;
+                break;
+            }
+    }
+    if (idx < 0 || idx >= o->n_custom) return changed;
+    if (o->custom[idx].n_ids >= OC_SB_CUSTOM_IDS) return changed;   /* full: refuse */
+    o->custom[idx].ids[o->custom[idx].n_ids++] = channel_id;
+    return 1;
+}
+
 size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
                         oc_sidebar_row *out, size_t cap) {
     if (!m || !o || !out || cap == 0) return 0;
@@ -1351,9 +1512,19 @@ size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
     /* STARRED first on screen, then Channels, then DMs — Slack's order. The enum
      * numbers the sections for storage; this array decides what the eye sees, so
      * adding a section does not renumber anyone's saved preferences. */
-    static const int ORDER[OC_SB_SECTIONS] = { OC_SB_STARRED, OC_SB_CHANNELS, OC_SB_DMS };
-    for (int oi = 0; oi < OC_SB_SECTIONS; oi++) {
-        int sec = ORDER[oi];
+    /* Starred, then the user's own sections in their order, then Channels, then
+     * DMs. Built as a list rather than a fixed array because the middle is now
+     * variable-length (WIN-83). */
+    int order[OC_SB_SECTIONS + OC_SB_CUSTOM_MAX];
+    int n_order = 0;
+    order[n_order++] = OC_SB_STARRED;
+    for (int i = 0; i < o->n_custom; i++) order[n_order++] = OC_SB_CUSTOM_BASE + i;
+    order[n_order++] = OC_SB_CHANNELS;
+    order[n_order++] = OC_SB_DMS;
+
+    for (int oi = 0; oi < n_order; oi++) {
+        int sec = order[oi];
+        int cidx = oc_sb_custom_index(sec);
         /* Collect this section's rows, with the timestamp alongside for sorting. */
         sb_tmp *tmp = calloc(m->n_channels + 1, sizeof *tmp);
         size_t tn = 0, total = 0;
@@ -1361,12 +1532,16 @@ size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
             const oc_channel *c = &m->channels[i];
             int is_dm = (c->kind == OC_CHANNEL_KIND_DM);
             int starred = oc_sidebar_is_starred(o, c->channel_id);
-            /* A starred conversation appears ONCE, in Starred: leaving it in its
-             * normal section too would show it twice, and Slack lifts it out. */
+            int inbox = oc_sidebar_section_of(o, c->channel_id);   /* custom, or -1 */
+            /* A conversation appears ONCE. Starred lifts it out of everything; a
+             * custom section lifts it out of Channels/DMs. Starred wins when it is
+             * in both, because two lift-it-out rules need a precedence. */
             if (sec == OC_SB_STARRED) {
                 if (!starred) continue;
+            } else if (cidx >= 0) {
+                if (starred || inbox != cidx) continue;
             } else {
-                if (starred) continue;
+                if (starred || inbox >= 0) continue;
                 if ((sec == OC_SB_DMS) != is_dm) continue;
             }
             /* A named channel the user has not joined is browsable, not listed. */
@@ -1380,8 +1555,8 @@ size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
                 char low[96]; sb_lower(label, low, sizeof low);
                 if (!strstr(low, o->find)) continue;
             }
-            if (o->filter[sec] == OC_SB_FILTER_UNREAD && c->unread <= 0) continue;
-            if (o->filter[sec] == OC_SB_FILTER_ACTIVE) {
+            if (oc_sb_filter_of(o, sec) == OC_SB_FILTER_UNREAD && c->unread <= 0) continue;
+            if (oc_sb_filter_of(o, sec) == OC_SB_FILTER_ACTIVE) {
                 /* Channels: joined ones. DMs: a peer who is not offline. */
                 if (is_dm) {
                     if (oc_model_presence_of(m, c->peer_id) == OC_PRESENCE_OFFLINE) continue;
@@ -1404,7 +1579,7 @@ size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
             tn++;
         }
 
-        if (tn > 1) { g_sb_sort = o->sort[sec]; qsort(tmp, tn, sizeof *tmp, sb_cmp); }
+        if (tn > 1) { g_sb_sort = oc_sb_sort_of(o, sec); qsort(tmp, tn, sizeof *tmp, sb_cmp); }
 
         /* Header first, always — a collapsed or empty section must stay openable. */
         if (n < cap) {
@@ -1413,11 +1588,12 @@ size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
             h->is_header = 1;
             h->section = (uint8_t)sec;
             snprintf(h->label, sizeof h->label, "%s",
+                     cidx >= 0             ? o->custom[cidx].name :
                      sec == OC_SB_STARRED  ? "Starred" :
                      sec == OC_SB_CHANNELS ? "Channels" : "Direct messages");
             h->section_total = (int)total;
         }
-        if (!o->collapsed[sec])
+        if (!oc_sb_collapsed_of(o, sec))
             for (size_t i = 0; i < tn && n < cap; i++) out[n++] = tmp[i].row;
         free(tmp);
     }

@@ -359,6 +359,22 @@ oc_channel *oc_model_channel(oc_model *m, uint64_t channel_id);
  * order on SCREEN is decided by the builder, not by this numbering. */
 enum { OC_SB_CHANNELS = 0, OC_SB_DMS = 1, OC_SB_STARRED = 2, OC_SB_SECTIONS = 3 };
 #define OC_SB_STARRED_MAX 32u
+
+/* User-defined sections (REQ-234's other half, WIN-83). A custom section is a NAME
+ * plus a set of conversation ids, and a conversation in one is removed from
+ * Channels/DMs so it still appears exactly once — the same rule Starred follows.
+ * Starred wins over a custom section when a conversation is in both: two "lift it
+ * out of its section" rules need a precedence and the explicit star is the one the
+ * user set most recently by hand.
+ *
+ * Sections are numbered from OC_SB_CUSTOM_BASE in a row's `section` field, which is
+ * why the built-in per-section arrays above are indexed through the accessors
+ * below rather than directly — a custom section's sort/filter/collapse live on the
+ * section itself, so adding one cannot renumber anyone's saved preferences. */
+#define OC_SB_CUSTOM_MAX   8u
+#define OC_SB_CUSTOM_IDS   32u
+#define OC_SB_CUSTOM_BASE  16
+#define OC_SB_NAME_MAX     32
 enum { OC_SB_SORT_AZ = 0, OC_SB_SORT_RECENT, OC_SB_SORT_UNREAD };
 enum { OC_SB_FILTER_ALL = 0, OC_SB_FILTER_UNREAD, OC_SB_FILTER_ACTIVE };
 
@@ -373,7 +389,43 @@ typedef struct {
      * and the frontend owns persisting it. */
     uint64_t starred[OC_SB_STARRED_MAX];
     uint8_t  n_starred;
+    /* Custom sections, in the order they appear on screen (between Starred and
+     * Channels). Ids, not names, for the same reason as `starred`. */
+    struct {
+        char     name[OC_SB_NAME_MAX];
+        uint64_t ids[OC_SB_CUSTOM_IDS];
+        uint8_t  n_ids;
+        uint8_t  sort, filter, collapsed;
+    } custom[OC_SB_CUSTOM_MAX];
+    uint8_t  n_custom;
 } oc_sidebar_opts;
+
+/* Per-section sort / filter / collapse, for BOTH kinds of section. A frontend must
+ * go through these rather than indexing o->sort[sec]: a custom section's number is
+ * >= OC_SB_CUSTOM_BASE and would run off the end of those arrays. */
+uint8_t oc_sb_sort_of(const oc_sidebar_opts *o, int section);
+uint8_t oc_sb_filter_of(const oc_sidebar_opts *o, int section);
+uint8_t oc_sb_collapsed_of(const oc_sidebar_opts *o, int section);
+void    oc_sb_set_sort(oc_sidebar_opts *o, int section, uint8_t v);
+void    oc_sb_set_filter(oc_sidebar_opts *o, int section, uint8_t v);
+void    oc_sb_set_collapsed(oc_sidebar_opts *o, int section, uint8_t v);
+/* Is this a user-defined section, and which one? -1 when it is a built-in. */
+int     oc_sb_custom_index(int section);
+
+/* Create a section. Returns its index, or -1 when the list is full or the name is
+ * empty. The name is SANITISED (the setting's separators are stripped) because it
+ * round-trips through one flat string in client_settings. */
+int  oc_sidebar_section_add(oc_sidebar_opts *o, const char *name);
+void oc_sidebar_section_rename(oc_sidebar_opts *o, int idx, const char *name);
+/* Delete a section. Its conversations return to Channels/DMs rather than
+ * disappearing — a section is a view, not a container. */
+void oc_sidebar_section_remove(oc_sidebar_opts *o, int idx);
+/* Which custom section holds `channel_id`, or -1. */
+int  oc_sidebar_section_of(const oc_sidebar_opts *o, uint64_t channel_id);
+/* Put `channel_id` in section `idx`, or take it out of every section with idx < 0.
+ * A conversation is in at most one section: assigning moves it. Returns 1 when
+ * something changed. */
+int  oc_sidebar_assign(oc_sidebar_opts *o, uint64_t channel_id, int idx);
 
 /* Is `channel_id` starred? Shared so a frontend's menu and the builder cannot
  * disagree about it. */

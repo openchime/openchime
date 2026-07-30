@@ -75,10 +75,29 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 | **WIN-80** | Custom DirectWrite composer, replacing RichEdit (ARCH-98) | P1 | XL |
 | **WIN-81** | The GUI smoke does not run in CI — needs a self-hosted Windows runner | P2 | M |
 | ~~**WIN-82**~~ | ~~Files' census only saw the 200-row page~~ **DONE.** `LIST_FILE_CHANNELS` — one `GROUP BY` over attachments with the same membership filter as `LIST_FILES`, over the index migration 0023 already added. The column is now exact, so the "From the 200 most recent files" caveat is deleted rather than reworded. Counts verified against the database directly (17 and 1). | — |
-| **WIN-83** | User-defined custom sidebar sections (the other half of REQ-234) | P3 | M |
+| ~~**WIN-83**~~ | ~~User-defined custom sidebar sections~~ **DONE** — see §1 | P3 | M |
 | ~~**WIN-84**~~ | ~~Searches on the read connection see no rows~~ **WRONG DIAGNOSIS — see §1**; the real bug was `has:link` | P2 | M |
 
 ### The items added 2026-07-30, in detail
+
+- ~~**WIN-83 — user-defined sidebar sections.**~~ **DONE** (REQ-234's other half). Up
+  to 8 named sections holding up to 32 conversations each, between Starred and
+  Channels. The rule that matters is **appear once**: a conversation in a section
+  leaves Channels/DMs, exactly as a starred one does, and **Starred wins** when a
+  conversation is in both — two lift-it-out rules need a precedence, and the star is
+  the one set most recently by hand. Sections live in `oc_sidebar_opts`, so the core
+  builds them and both frontends see the same shape; each carries its own sort,
+  filter and collapse.
+  **The trap this exposed:** both frontends indexed `o->sort[sec]` / `o->collapsed[sec]`
+  directly, and a custom section's number is past the end of those arrays — it would
+  have read off the end the first time anyone right-clicked one. All nine call sites
+  (six in the TUI) go through `oc_sb_sort_of` / `oc_sb_filter_of` /
+  `oc_sb_collapsed_of` and their setters now.
+  Affordances: "Section" in a conversation's context menu (flat, with a tick on the
+  current one), Rename and Remove on a custom section's header menu, "New sidebar
+  section…" in the New menu. Removing a section returns its conversations rather
+  than losing them, so there is deliberately **no confirmation** — confirming a
+  reversible display change teaches people to click through confirmations.
 
 - **WIN-73 — Later.** Two halves. (1) A message you saved shows a **bookmark glyph
   and a slightly inverse row tint** in the transcript, which it cannot do today

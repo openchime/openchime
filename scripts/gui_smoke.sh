@@ -213,6 +213,42 @@ click_pref 1 "$before"; sleep 0.3
 "$DRIVE" key enter >/dev/null 2>&1; sleep 0.5
 expect "$(snap)" time24 "$before" "the run left the setting as it found it"
 
+# --- user-defined sidebar sections (WIN-83) ---------------------------------
+# The interesting property is the appear-ONCE rule: a conversation in a custom
+# section leaves Channels, and a starred one leaves the custom section too. That is
+# a claim about the sidebar the core builds, so it is asserted from the row list
+# rather than from a screenshot.
+say "== sidebar sections"
+"$DRIVE" view 0 >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; sleep 0.5
+
+rows_have() {                     # rows_have <label> <count>
+  local want="$1" n="$2" got
+  checks=$((checks + 1))
+  got=$(snap | grep -cE "^  sbrow .*label=\"$want\"" || true)
+  if [ "$got" = "$n" ]; then ok "#$want appears $n time(s) in the sidebar"
+  else fail "#$want appears $got time(s), expected $n"; fi
+}
+
+"$DRIVE" section add SmokeSec >/dev/null 2>&1; sleep 0.4
+d=$(snap)
+expect "$d" sections 1 "a section is created"
+"$DRIVE" section put 1 0 >/dev/null 2>&1; sleep 0.5
+d=$(snap)
+checks=$((checks + 1))
+if printf '%s' "$d" | grep -q 'section 0 name="SmokeSec" n=1 collapsed=0 ids=1'; then
+  ok "the conversation is in it"
+else fail "assignment did not land: $(printf '%s' "$d" | grep -o 'section 0 .*')"; fi
+# ... and it is in the SECTION, not in Channels as well.
+rows_have SmokeSec 1
+rows_have general 1
+checks=$((checks + 1))
+if snap | grep -qE '^  sbrow sec=16 header=0 cid=1 '; then ok "#general sits under section 16"
+else fail "#general is not in the custom section's rows"; fi
+
+# Removing the section returns the conversation rather than losing it.
+"$DRIVE" section rm 0 >/dev/null 2>&1; sleep 0.4
+expect "$(snap)" sections 0 "removing the section leaves none"
+
 # --- appearance: text size, zoom, accent, density (WIN-78) ------------------
 # Each of these rebuilds the DirectWrite table or the palette, so "it did not take
 # effect" is a real failure mode and none of it is visible in a boolean. The dump

@@ -642,7 +642,7 @@ placeholder HFONT, the form fields' HFONT) is rebuilt by `scale_apply`.
 
 ## Run the GUI smoke before pushing Win32 chrome
 
-`scripts/gui_smoke.sh` asserts **82 invariants** through the test hook: for each of
+`scripts/gui_smoke.sh` asserts **88 invariants** through the test hook: for each of
 the six views, what is in the second column (`sidebar_kind`), whether the middle
 one is typeable (`main_is_conversation`), which native children are shown, and
 whether anything covers the window — plus the search overlay, the Pins tab, the
