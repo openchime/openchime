@@ -6375,7 +6375,23 @@ static void palette_open(HWND hwnd) {
 
 /* Run the highlighted row. Closing FIRST matters: several commands open a modal
  * form, and the palette must not still be on screen behind it. */
+static int permalink_follow(HWND hwnd, const char *text);   /* fwd (WIN-44) */
+
 static void palette_accept(HWND hwnd) {
+    /* A pasted permalink is accepted here rather than in the composer, and that is
+     * the deliberate half of WIN-44: pasting a link into the message box must keep
+     * INSERTING it, because sharing a link is the common case. The palette is the
+     * "jump to" surface, so following one there surprises nobody. */
+    {
+        char q[512] = "";
+        if (g_pal_edit) { WCHAR w[512]; GetWindowTextW(g_pal_edit, w, 512);
+                          WideCharToMultiByte(CP_UTF8, 0, w, -1, q, sizeof q, NULL, NULL); }
+        if (q[0] && !strncmp(q, "openchime://", 12)) {
+            palette_close(hwnd);
+            permalink_follow(hwnd, q);
+            return;
+        }
+    }
     if (g_pal_sel < 0 || g_pal_sel >= g_n_pal_rows) { palette_close(hwnd); return; }
     int cmd = g_pal_rows[g_pal_sel].cmd;
     uint64_t cid = g_pal_rows[g_pal_sel].cid;
@@ -6767,8 +6783,17 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
         /* Ids, not names: a channel can be renamed (REQ-036) and a link built
          * from a name would rot the moment it was (ARCH-96). */
         char link[256];
-        snprintf(link, sizeof link, "openchime://%s/c/%llu/m/%llu",
-                 g_host[0] ? g_host : "workspace",
+        /* The port belongs in the link when it is not the default: g_host holds the
+         * host alone, so a workspace on 8443 produced a link that pointed at 443 and
+         * could not be followed. Found while building the inbound half (WIN-44) —
+         * the two halves disagreeing about the format is exactly what having only
+         * one half hides. */
+        char linkhost[288];
+        if (g_port && g_port != OC_DEFAULT_PORT)
+            snprintf(linkhost, sizeof linkhost, "%s:%d", g_host[0] ? g_host : "workspace", g_port);
+        else
+            snprintf(linkhost, sizeof linkhost, "%s", g_host[0] ? g_host : "workspace");
+        snprintf(link, sizeof link, "openchime://%s/c/%llu/m/%llu", linkhost,
                  (unsigned long long)chan, (unsigned long long)mid);
         copy_to_clipboard(hwnd, link);
         toast_push("Link copied.", 0);
@@ -6897,6 +6922,75 @@ static int files_click(HWND hwnd, int x, int y) {
         }
     }
     return 0;
+}
+
+/* ---- inbound permalinks (WIN-44, ARCH-96) ---------------------------------
+ *
+ * Copying a link and HISTORY_AROUND both existed; PASTING one did nothing, so a
+ * link was write-only. This is the other half.
+ *
+ * `openchime://<host>/c/<channel_id>/m/<message_id>`. The ids are the durable
+ * reference (ARCH-96 chose them over names precisely because a channel can be
+ * renamed), so the host is only used to check you are pointed at the right
+ * workspace — following a link into a workspace you are not signed in to is not
+ * something to do silently, and it is recorded as unbuilt rather than half-done.
+ */
+static int permalink_parse(const char *text, char *host, size_t hostcap,
+                           uint64_t *chan, uint64_t *msg) {
+    const char *p = text;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (strncmp(p, "openchime://", 12) != 0) return 0;
+    p += 12;
+    size_t hn = 0;
+    while (*p && *p != '/' && hn + 1 < hostcap) host[hn++] = *p++;
+    host[hn] = 0;
+    if (strncmp(p, "/c/", 3) != 0) return 0;
+    p += 3;
+    char *end = NULL;
+    *chan = strtoull(p, &end, 10);
+    if (!end || end == p || strncmp(end, "/m/", 3) != 0) return 0;
+    p = end + 3;
+    *msg = strtoull(p, &end, 10);
+    return (*chan && *msg) ? 1 : 0;
+}
+
+/* Follow one. Returns 0 with a toast when it cannot, rather than failing quietly:
+ * a link that does nothing is indistinguishable from a broken app. */
+static int permalink_follow(HWND hwnd, const char *text) {
+    char host[256]; uint64_t chan = 0, mid = 0;
+    if (!permalink_parse(text, host, sizeof host, &chan, &mid)) return 0;
+    if (!g_client) { toast_push("Sign in to open a link.", 1); return 1; }
+    /* A different workspace is a real case and we do not guess: switching would
+     * drop what you are reading, and we may not even hold that workspace. */
+    char self[288];
+    if (g_port && g_port != OC_DEFAULT_PORT) snprintf(self, sizeof self, "%s:%d", g_host, g_port);
+    else                                     snprintf(self, sizeof self, "%s", g_host);
+    /* Compared against the same string the copy path builds, so the two halves
+     * cannot disagree about whether a port is part of the identity. A bare host is
+     * accepted too: a link written before the port was included is still ours. */
+    if (host[0] && self[0] && _stricmp(host, self) != 0 && _stricmp(host, g_host) != 0) {
+        char msg[256];
+        snprintf(msg, sizeof msg, "That link is for %s \u2014 switch workspace first.", host);
+        toast_push(msg, 1);
+        return 1;
+    }
+    const oc_model *m = model();
+    if (!m || !oc_model_channel((oc_model *)m, chan)) {
+        toast_push("That conversation is not one you can see.", 1);
+        return 1;
+    }
+    g_view = VIEW_HOME;
+    close_overlays();
+    select_channel(chan);
+    /* The same arming the Activity and Files rows use: if the message is outside
+     * the loaded window the tick fetches around it (ARCH-96) and the flash lands
+     * when it arrives. */
+    g_jump_mid = mid;
+    g_jump_deadline = GetTickCount64() + 4000;
+    select_tab(TAB_MESSAGES);
+    layout_composer(hwnd);
+    InvalidateRect(hwnd, NULL, FALSE);
+    return 1;
 }
 
 static int on_click(HWND hwnd, int x, int y) {
@@ -8936,6 +9030,7 @@ static void test_dump(const char *path) {
     /* Modal + the settings a form modal can change, so snapshot/commit/restore is
      * assertable rather than eyeballed — Cancel silently behaving like Save is
      * exactly the bug this design exists to prevent. */
+    fprintf(f, "host=\"%s\"\n", g_host);
     fprintf(f, "menu=%d more=%d lightbox=%llu\n", g_menu, g_more_open,
             (unsigned long long)g_lightbox);
     fprintf(f, "lastclick %s\n", g_modal_lastclick);
