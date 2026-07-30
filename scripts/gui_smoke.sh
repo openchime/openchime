@@ -71,7 +71,7 @@ sleep 1.5
 #  1    2       0   0     0      0        DMs: conversation list, index in the middle
 #  2    3       1   0     0      1        Activity: feed left, transcript stays
 #  3    4       0   0     1      0        Files: own column + its own search box
-#  4    0       0   0     0      0        Later: no second column
+#  4    5       0   0     0      0        Later: own column (WIN-73), Files-shaped
 #  5    0       0   0     0      0        Admin: no second column
 say "== views"
 while read -r v sbkind re find ffind conv name; do
@@ -91,7 +91,7 @@ done <<'MATRIX'
 1 2 0 0 0 0 DMs
 2 3 1 0 0 1 Activity
 3 4 0 0 1 0 Files
-4 0 0 0 0 0 Later
+4 5 0 0 0 0 Later
 5 0 0 0 0 0 Admin
 MATRIX
 

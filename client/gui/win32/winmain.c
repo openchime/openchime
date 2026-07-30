@@ -2482,6 +2482,24 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
                     fill(rt, rf(reg.left, y, reg.left + 3, y + heights[i]), OC_COL_ACCENT);
                 }
             }
+            /* Saved for later (REQ-231, WIN-73): a bookmark in the right margin and
+             * a faint inverse band. Deliberately NOT the accent used for a mention
+             * two blocks up — a message can be both, and if the two tints matched
+             * you could not tell which one you were looking at. OC_COL_SELECT is the
+             * theme's "this row is marked" colour, so it inverts correctly in light
+             * and dark without a second palette entry.
+             *
+             * Costs no height: the band reuses the row's rect and the glyph sits in
+             * the right margin, outside the body's wrap width. A marker that added a
+             * line would shift the transcript under the reader the moment a save
+             * landed. */
+            if (capture && msgs[first + i].saved) {
+                D2D1_RECT_F sr = rf(reg.left, y, reg.right, y + heights[i]);
+                ID2D1RenderTarget_FillRectangle(rt, &sr, paint_alpha(OC_COL_SELECT, 0.55f));
+                draw_lucide(rt, OC_ICON_BOOKMARK,
+                            rf(reg.right - 27, by + 1, reg.right - 11, by + 17),
+                            OC_COL_ACCENT);
+            }
             /* Jump flash — fades out so it reads as "here it is", not as state. */
             if (capture && g_flash_mid == msgs[first + i].message_id) {
                 ULONGLONG now = GetTickCount64();
@@ -2602,7 +2620,7 @@ static void ovl_end(ID2D1RenderTarget *rt, D2D1_RECT_F body) {
     ID2D1RenderTarget_PopAxisAlignedClip(rt);
 }
 
-enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS };
+enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES };
 
 /* An overlay title bar; returns the region below it for the overlay body. */
 static D2D1_RECT_F overlay_header(ID2D1RenderTarget *rt, D2D1_RECT_F reg, const char *title) {
@@ -3312,6 +3330,20 @@ static D2D1_RECT_F g_file_scopes[FS_SCOPES];
  * LIST_FILES already takes a channel id (daemon/dbwriter.c), so picking a
  * channel is an exact refetch rather than a slice of the page we hold. */
 static uint64_t g_file_chan;                 /* 0 = everywhere I can see */
+/* One row of a channel census: which channel, and how many of the thing. Named
+ * rather than anonymous because it crosses a function boundary now. */
+typedef struct { uint64_t id; int n; } oc_chan_count;
+
+/* The Later view's channel column (WIN-73). Same shape as the Files one above,
+ * with one honest difference: LIST_SAVED takes NO arguments, unlike LIST_FILES
+ * which takes a channel id — so picking a channel here filters the page we already
+ * hold instead of re-asking the server. At the 200-item cap that is the whole list
+ * for almost anyone; making it exact needs a channel argument on the wire. */
+static uint64_t g_later_chan;
+static oc_chan_count g_lchan[64];
+static int g_n_lchan;
+static D2D1_RECT_F g_lchan_rows[65];         /* [0] is "All channels" */
+static int g_n_lchan_rows;
 /* The VIEW and the channel Files TAB share one model flag (filelist_open), so
  * whoever opened it has to close it. Leaving the view by any route — rail, More
  * flyout, palette, a menu command, clicking a file — used to leave the flag set,
@@ -3327,7 +3359,7 @@ static char g_file_q[64];
 static D2D1_RECT_F g_file_type_btn, g_file_sort_btn, g_file_scope_btn;
 static D2D1_RECT_F g_file_up_btn, g_file_search_box;
 /* The channel census, built only while showing everything — see files_index. */
-static struct { uint64_t id; int n; } g_fchan[64];
+static oc_chan_count g_fchan[64];
 static int g_n_fchan;
 static D2D1_RECT_F g_fchan_rows[65];         /* [0] is "All files" */
 static int g_n_fchan_rows;
@@ -3623,59 +3655,75 @@ static void draw_filelist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F 
 
 /* The Files view's left column: "All files", then the channels that have any,
  * each with its count. */
-static void draw_files_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
+/* The channel column shared by the Files and Later views (WIN-71, WIN-73).
+ *
+ * One function for both, because they are the same widget with a different list
+ * behind them, and two copies would drift the first time one of them changed. The
+ * caller supplies the census (which channels, with counts) and the current
+ * selection; this draws and records the rows.
+ *
+ * `all_label` differs on purpose: "All files" reads naturally, "All channels" is
+ * what a list of saved messages is filtered BY. */
+static void draw_chan_column(ID2D1RenderTarget *rt, const oc_model *m, float h,
+                             const char *title, const char *all_label, int all_icon,
+                             const oc_chan_count *census, int n_census,
+                             uint64_t sel, D2D1_RECT_F *rows, int *n_rows,
+                             const char *empty_hint, const char *foot)
+{
     sidebar_surface(rt, h);
-    draw_text(rt, "Files", g_display, rf(RAIL_W + 16, 0, RAIL_W + SIDEBAR_W - 12, HEADER_H),
+    draw_text(rt, title, g_display, rf(RAIL_W + 16, 0, RAIL_W + SIDEBAR_W - 12, HEADER_H),
               OC_COL_TEXT);
-
-    files_index(m);
-    g_n_fchan_rows = 0;
+    *n_rows = 0;
     float y = HEADER_H + 6;
-
-    /* "All files" is a row like any other, and selected by default, so the
-     * column always shows you where you are. */
     {
         D2D1_RECT_F r = rf(RAIL_W + 8, y, RAIL_W + SIDEBAR_W - 8, y + 30);
-        if (!g_file_chan) fill_round(rt, r, 6.0f, OC_COL_SELECT);
-        draw_lucide(rt, OC_ICON_FILE, rf(r.left + 8, y + 7, r.left + 24, y + 23),
-                    g_file_chan ? OC_COL_MUTED : OC_COL_TEXT);
-        draw_text(rt, "All files", g_ui, rf(r.left + 32, y + 4, r.right - 8, y + 26),
-                  g_file_chan ? OC_COL_MUTED : OC_COL_TEXT);
-        g_fchan_rows[g_n_fchan_rows++] = r;
+        if (!sel) fill_round(rt, r, 6.0f, OC_COL_SELECT);
+        draw_lucide(rt, all_icon, rf(r.left + 8, y + 7, r.left + 24, y + 23),
+                    sel ? OC_COL_MUTED : OC_COL_TEXT);
+        draw_text(rt, all_label, g_ui, rf(r.left + 32, y + 4, r.right - 8, y + 26),
+                  sel ? OC_COL_MUTED : OC_COL_TEXT);
+        rows[(*n_rows)++] = r;
         y = r.bottom + 8;
     }
-
     draw_text(rt, "CHANNELS", g_meta, rf(RAIL_W + 16, y, RAIL_W + SIDEBAR_W - 12, y + 20),
               OC_COL_FAINT);
     y += 22;
-
-    for (int i = 0; i < g_n_fchan && y < h - 40 &&
-                    g_n_fchan_rows < (int)(sizeof g_fchan_rows / sizeof g_fchan_rows[0]); i++) {
-        const oc_channel *c = oc_model_channel((oc_model *)m, g_fchan[i].id);
+    for (int i = 0; i < n_census && y < h - 40 && *n_rows < 65; i++) {
+        const oc_channel *c = oc_model_channel((oc_model *)m, census[i].id);
         char label[96];
-        snprintf(label, sizeof label, "#%s", (c && c->name[0]) ? c->name : "channel");
+        if (c && c->kind == OC_CHANNEL_KIND_DM) {
+            const char *pn = oc_model_user_name((oc_model *)m, c->peer_id);
+            snprintf(label, sizeof label, "@ %s", (pn && pn[0]) ? pn : "dm");
+        } else {
+            snprintf(label, sizeof label, "#%s", (c && c->name[0]) ? c->name : "channel");
+        }
         D2D1_RECT_F r = rf(RAIL_W + 8, y, RAIL_W + SIDEBAR_W - 8, y + 28);
-        int on = (g_file_chan == g_fchan[i].id);
+        int on = (sel == census[i].id);
         if (on) fill_round(rt, r, 6.0f, OC_COL_SELECT);
         draw_text(rt, label, g_ui, rf(r.left + 12, y + 3, r.right - 44, y + 25),
                   on ? OC_COL_TEXT : OC_COL_MUTED);
-        char cnt[16]; snprintf(cnt, sizeof cnt, "%d", g_fchan[i].n);
+        char cnt[16]; snprintf(cnt, sizeof cnt, "%d", census[i].n);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
         draw_text(rt, cnt, g_meta, rf(r.right - 40, y + 5, r.right - 10, y + 25), OC_COL_FAINT);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
-        g_fchan_rows[g_n_fchan_rows++] = r;
+        rows[(*n_rows)++] = r;
         y = r.bottom + 2;
     }
-
-    if (!g_n_fchan)
-        draw_text(rt, "Channels appear here once something is shared in them.", g_meta,
+    if (!n_census)
+        draw_text(rt, empty_hint, g_meta,
                   rf(RAIL_W + 16, y + 2, RAIL_W + SIDEBAR_W - 12, y + 60), OC_COL_FAINT);
-    else
-        /* The census comes from the page the server returned, so it is the
-         * channels among the most recent 200 files — not every channel that has
-         * ever held one. Saying which is cheaper than being asked. */
-        draw_text(rt, "From the 200 most recent files.", g_meta,
-                  rf(RAIL_W + 16, h - 26, RAIL_W + SIDEBAR_W - 12, h - 6), OC_COL_FAINT);
+    else if (foot)
+        draw_text(rt, foot, g_meta, rf(RAIL_W + 16, h - 26, RAIL_W + SIDEBAR_W - 12, h - 6),
+                  OC_COL_FAINT);
+}
+
+static void draw_files_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
+    files_index(m);
+    draw_chan_column(rt, m, h, "Files", "All files", OC_ICON_FILE,
+                     g_fchan, g_n_fchan, g_file_chan,
+                     g_fchan_rows, &g_n_fchan_rows,
+                     "Channels appear here once something is shared in them.",
+                     "From the 200 most recent files.");
 }
 
 /* The workspace-wide Files view (rail). The same list with `channel_id 0`, which
@@ -5235,7 +5283,7 @@ static int transcript_shell(void) {
  * So anything that depends on the column's CONTENT asks this, and a new tenant
  * has to name itself here rather than silently inheriting the last one's chrome.
  * The painter switches on the same function, so the two cannot disagree. */
-enum { SBK_NONE = 0, SBK_CHANNELS, SBK_DMS, SBK_ACTIVITY, SBK_FILES };
+enum { SBK_NONE = 0, SBK_CHANNELS, SBK_DMS, SBK_ACTIVITY, SBK_FILES, SBK_LATER };
 static int sidebar_kind(void) {
     /* NONE first, and it is the reason this enum starts there: Later and Admin
      * have no second column at all, and defaulting them to CHANNELS put the
@@ -5247,6 +5295,7 @@ static int sidebar_kind(void) {
     case VIEW_DMS:      return SBK_DMS;
     case VIEW_ACTIVITY: return SBK_ACTIVITY;
     case VIEW_FILES:    return SBK_FILES;
+    case VIEW_LATER:    return SBK_LATER;
     default:            return SBK_NONE;
     }
 }
@@ -5599,17 +5648,70 @@ static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h
 }
 
 /* Saved items — the Later view (REQ-231). */
+/* Which channels hold saved items, newest-saved first — the list arrives in that
+ * order, so first-appearance order is already "most recently saved". Counted only
+ * while showing everything, for the reason files_index() gives. */
+static void later_index(const oc_model *m) {
+    if (g_later_chan) return;
+    g_n_lchan = 0;
+    for (size_t i = 0; i < m->n_saved; i++) {
+        uint64_t cid = m->saved[i].channel_id;
+        if (!cid) continue;
+        int at = -1;
+        for (int j = 0; j < g_n_lchan; j++) if (g_lchan[j].id == cid) { at = j; break; }
+        if (at < 0) {
+            if (g_n_lchan >= (int)(sizeof g_lchan / sizeof g_lchan[0])) continue;
+            at = g_n_lchan++;
+            g_lchan[at].id = cid; g_lchan[at].n = 0;
+        }
+        g_lchan[at].n++;
+    }
+}
+
+static void draw_later_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
+    later_index(m);
+    draw_chan_column(rt, m, h, "Later", "All channels", OC_ICON_BOOKMARK,
+                     g_lchan, g_n_lchan, g_later_chan,
+                     g_lchan_rows, &g_n_lchan_rows,
+                     "Channels appear here once you save something in them.", NULL);
+}
+
 static void draw_later(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
-    D2D1_RECT_F body = view_header(rt, reg, "Later", "Messages you saved. Only you can see this.");
+    char title[96] = "Later";
+    if (g_later_chan) {
+        const oc_channel *c = oc_model_channel((oc_model *)m, g_later_chan);
+        if (c && c->kind == OC_CHANNEL_KIND_DM) {
+            const char *pn = oc_model_user_name((oc_model *)m, c->peer_id);
+            snprintf(title, sizeof title, "Saved in @%s", (pn && pn[0]) ? pn : "dm");
+        } else {
+            snprintf(title, sizeof title, "Saved in #%s", (c && c->name[0]) ? c->name : "channel");
+        }
+    }
+    D2D1_RECT_F body = view_header(rt, reg, title, "Messages you saved. Only you can see this.");
     g_n_listrows = 0;
     if (m->saved_loading) { overlay_empty(rt, body, "Loading\u2026"); return; }
     if (m->n_saved == 0) {
         overlay_empty(rt, body, "Nothing saved. Use \u22EF \u2192 Save for later on any message.");
         return;
     }
-    float y = body.top + 8;
-    for (size_t i = 0; i < m->n_saved && y < body.bottom; i++) {
+    /* Scrolling via the shared overlay offset (WIN-76) — the same helper the audit,
+     * webhook, reaction, notify and shortcut panes use. A private offset here would
+     * have been a sixth copy of a solved problem. */
+    float rowh = 56.0f;
+    int shown_total = 0;
+    for (size_t i = 0; i < m->n_saved; i++)
+        if (!g_later_chan || m->saved[i].channel_id == g_later_chan) shown_total++;
+    if (shown_total == 0) {
+        overlay_empty(rt, body, "Nothing saved in this conversation.");
+        return;
+    }
+    ovl_use(OVL_LATER);
+    float y = ovl_begin(rt, body, (float)shown_total * rowh + 16);
+    for (size_t i = 0; i < m->n_saved; i++) {
         const oc_saved_view *sv = &m->saved[i];
+        if (g_later_chan && sv->channel_id != g_later_chan) continue;
+        if (y + rowh < body.top) { y += rowh; continue; }     /* above the view */
+        if (y > body.bottom) break;
         D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + 52);
         if (g_listrow_hover == sv->message_id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
         draw_lucide(rt, OC_ICON_BOOKMARK, rf(row.left + 12, y + 8, row.left + 32, y + 28),
@@ -5644,8 +5746,9 @@ static void draw_later(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
             g_listrows[g_n_listrows].cid = sv->channel_id;
             g_n_listrows++;
         }
-        y += 56;
+        y += rowh;
     }
+    ovl_end(rt, body);
 }
 
 /* A full-pane placeholder for views whose backing feature isn't built yet. */
@@ -5740,7 +5843,11 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
                 draw_files_sidebar(rt, m, H);
                 draw_files_view(rt, m, rf(RAIL_W + SIDEBAR_W, 0, W, H));
                 break;
-            case VIEW_LATER:         draw_later(rt, m, reg); break;
+            case VIEW_LATER:
+                /* Files-shaped (WIN-73): its own channel column, narrowed region. */
+                draw_later_sidebar(rt, m, H);
+                draw_later(rt, m, rf(RAIL_W + SIDEBAR_W, 0, W, H));
+                break;
             case VIEW_ADMIN:         draw_admin(rt, m, reg); break;
             default:                 draw_stub_view(rt, reg, "OpenChime", ""); break;
         }
@@ -7025,7 +7132,7 @@ static int on_click(HWND hwnd, int x, int y) {
                     if (act == VIEW_FILES) { g_file_chan = 0; g_filelist_from_view = 1;
                                              oc_client_list_files(g_client, 0); }
                     if (act == VIEW_ACTIVITY) oc_client_list_activity(g_client);
-                    if (act == VIEW_LATER)    oc_client_list_saved(g_client);
+                    if (act == VIEW_LATER)  { g_later_chan = 0; oc_client_list_saved(g_client); }
                 }
                 else if (act == NAV_MORE)      { g_more_open = !g_more_open; }
                 else if (act == NAV_SWITCHER)  { open_switcher(hwnd); }
@@ -7056,6 +7163,17 @@ static int on_click(HWND hwnd, int x, int y) {
                 return 1;
             }
     }
+    /* Later's channel column (WIN-73). A client-side filter, not a refetch:
+     * LIST_SAVED carries no channel argument, unlike LIST_FILES. The scroll offset
+     * resets with the filter, or a short list inherits a long one's offset and
+     * renders empty. */
+    if (g_view == VIEW_LATER)
+        for (int i = 0; i < g_n_lchan_rows; i++)
+            if (in_rect(g_lchan_rows[i], x, y)) {
+                uint64_t want = (i == 0) ? 0 : g_lchan[i - 1].id;
+                if (want != g_later_chan) { g_later_chan = want; g_ovl_scroll = 0; }
+                return 1;
+            }
     /* Later rows: the action button first, then the row itself. */
     if (g_view == VIEW_LATER)
         for (int i = 0; i < g_n_listrows; i++) {
@@ -9151,7 +9269,7 @@ static void test_poll(HWND hwnd) {
         if (v >= 0 && v < VIEW_COUNT) {
             g_view = v; layout_composer(hwnd);
             if (v == VIEW_ACTIVITY) oc_client_list_activity(g_client);
-            if (v == VIEW_LATER)    oc_client_list_saved(g_client);
+            if (v == VIEW_LATER)  { g_later_chan = 0; oc_client_list_saved(g_client); }
             if (v == VIEW_FILES)  { g_file_chan = 0; g_filelist_from_view = 1;
                                     oc_client_list_files(g_client, 0); }
             if (v == VIEW_ADMIN)    admin_select(g_adm_tab);
@@ -9589,6 +9707,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_thr_scroll += dy;
             if (g_thr_scroll < 0) g_thr_scroll = 0;
             if (g_thr_scroll > g_thr_scroll_max) g_thr_scroll = g_thr_scroll_max;
+        } else if (g_view == VIEW_LATER || g_view == VIEW_FILES) {
+            /* The Later and Files lists share the overlay offset (OVL_LATER /
+             * OVL_FILES), so the wheel has to reach it here or they scroll only by
+             * the keyboard — which is to say, not at all. */
+            g_ovl_scroll -= dy;
+            if (g_ovl_scroll < 0) g_ovl_scroll = 0;
+            if (g_ovl_scroll > g_ovl_max) g_ovl_scroll = g_ovl_max;
         } else if (wm && (wm->audit_open || wm->weblist_open || wm->reactlist_open)
                    && !wm->search_open) {
             g_ovl_scroll -= dy;
