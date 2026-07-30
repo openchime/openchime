@@ -9,7 +9,7 @@ clients, or a `REQ-NNN`.
 parity table is the *feature reachability* tracker. This document is the *work
 list* derived from both — one row per shippable branch.
 
-**Ids.** Items are `WIN-1` … `WIN-79`, numbered once and **stable**: an id is
+**Ids.** Items are `WIN-1` … `WIN-81`, numbered once and **stable**: an id is
 never renumbered or reused, so a commit or branch can cite it. Ordering is *not*
 priority — the **Pri** column is, and it may change. Section membership may also
 change as blockers clear (an item moves from §3 to §1 without changing its id).
@@ -68,10 +68,12 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 | **WIN-73** | **Later** reform: bookmark marker in the transcript + a Files-shaped panel | P1 | M |
 | **WIN-74** | DM tabs: drop **About**, keep Messages · Files & links · Pins | P2 | S |
 | **WIN-75** | The command palette has no affordance — Ctrl+K is its only route | P2 | S |
-| **WIN-76** | Long lists do not scroll: Files, Later (and audit/webhook rows unchecked) | P1 | M |
+| **WIN-76** | Long lists do not scroll: Files, Later (audit/webhook unchecked) · and the Files channel census is only as complete as the 200-row page (needs a distinct-channels query) | P1 | M |
 | **WIN-77** | Modal frame: the remaining conversions — pane headers, `confirm()`, `form_dialog`'s 16 sites | P1 | L |
 | **WIN-78** | Preferences as two panes + appearance depth (accent, text size, density, zoom) | P2 | M |
-| **WIN-79** | Replace the four remaining **native `TrackPopupMenu`** context menus with the app's own | P1 | M |
+| **WIN-79** | Replace the four remaining **native `TrackPopupMenu`** context menus with the app's own (ARCH-98) | P1 | M |
+| **WIN-80** | Custom DirectWrite composer, replacing RichEdit (ARCH-98) | P1 | XL |
+| **WIN-81** | The GUI smoke does not run in CI — needs a self-hosted Windows runner | P2 | M |
 
 ### The items added 2026-07-30, in detail
 
@@ -119,6 +121,23 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
   a themed `confirm()` for the four `MessageBoxW` calls; and `form_dialog`'s **16
   call sites**, which are native GDI popups and the most foreign-looking surfaces in
   the app.
+
+- **WIN-80 — the composer becomes ours.** Approved 2026-07-30 and recorded as
+  **ARCH-98**, which amends ARCH-82's LOCKED choice of RichEdit. RichEdit was chosen
+  for good reasons — editing, IME, selection, clipboard and undo for free — and all
+  of that has to be **written by hand** now. What it buys: colour emoji in the field
+  (RichEdit draws through GDI, so today the same character looks different in the
+  composer than in the picker or on a reaction chip), WYSIWYG for REQ-220, and a
+  surface we can make accessible for REQ-269. **The stated risk is IME**: it breaks
+  silently for CJK input on a machine where the author will not notice, and it is the
+  one part of this that cannot be self-verified. Lands behind the GUI smoke.
+
+- **WIN-81 — the smoke is not in CI.** `scripts/gui_smoke.sh` asserts 59 chrome
+  invariants and has caught a real regression, but it runs by hand: the daemon is
+  epoll-based so it is Linux-only, and GitHub's Windows runners cannot host it (no
+  Linux containers). Needs a self-hosted Windows box with the daemon reachable.
+  Until then the pre-push gate is a human remembering, which is the same class of
+  problem as everything else in this file.
 
 - **WIN-79 — two menu systems, one product.** Left-click dropdowns (workspace,
   profile, New, switcher, sidebar section) are drawn by the app. Right-click context
@@ -264,7 +283,41 @@ than against the backlog:
 
 ## Known defects, unfixed
 
-Recorded because a defect nobody wrote down is a defect nobody fixes.
+Recorded because a defect nobody wrote down is a defect nobody fixes — and a
+defect **fixed** but never written down loses its lesson and comes back. The 2026-07-30
+batch below was found and fixed inside one session; each is struck rather than
+omitted, because the pattern across them is worth more than any single fix: **four of
+the six asked the wrong question of the data.**
+
+- ~~**2026-07-30 batch — six defects, mostly one mistake wearing different clothes.**~~
+  **ALL FIXED.** No ids: each was found and closed the same day, and they are here for
+  the pattern.
+  - *Global shortcuts were dead while typing* (115fbde). Ctrl+K, Ctrl+F, Ctrl+/,
+    Alt+arrows and F6 were handled in the main window's `WM_KEYDOWN`, which almost
+    never has focus — the composer does, and a native child eats what it does not
+    recognise. The shortcut sheet advertised them anyway, its comment claiming it
+    "cannot drift from what the key handlers actually do". Now one `SHORTCUTS[]`
+    table drives both the sheet and a message-loop dispatcher.
+  - *Esc could not dismiss a menu, flyout or lightbox while typing* (55edb90) — same
+    cause, found while fixing the above.
+  - *The New menu floated mid-sidebar* (55edb90). It recomputed rail geometry from
+    the window height and was wrong by a whole item; it now anchors to the rect the
+    painter recorded.
+  - *Uneven gaps inside a message group* (0c815a1), 38px then 32px. `MSG_BOT` asked
+    "am I grouped?" when the space between two messages belongs to the **boundary** —
+    the first message of a group is never grouped, so it always paid the wide margin.
+  - *An attachment-only message reserved a line for a body it does not have*
+    (60b7ff2) — `body_text()` returns a space so DirectWrite has something to
+    measure, and both the height and the draw advanced by it.
+  - *Three modal-frame bugs* (25817eb): the command palette survived a modal opening
+    and **silently ate every click** (its box is hidden when covered, so it was
+    invisible); an in-card click that matched no control fell through to the shell
+    behind; and the first click after opening was swallowed because the repaint used
+    `GetActiveWindow()`, NULL whenever the window is not foreground.
+
+  **The pattern:** a hit-box that stored one axis, a margin that asked one message
+  about a pair, a reservation for text that does not exist, a menu that re-derived
+  geometry the painter already had. Ask the right thing, of the thing that knows.
 
 - ~~**WIN-72 — hovering one column highlighted whatever shared its Y.**~~ **FIXED
   2026-07-29.** Reported from a screenshot: the pointer on an Activity row lit up
