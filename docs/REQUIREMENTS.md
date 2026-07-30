@@ -1205,6 +1205,22 @@ None are yet backed by an architecture decision.*
   self-hosted operator who configures a destination rather than exposing a port.
   The pull API earns its place where a vendor wants live capture or where the
   operator cannot reach the destination.
+  **The concrete target (checked 2026-07-30): RFC-5322 email.** It is the one format
+  that turns up twice, independently, in publicly documented pipelines: it is Global
+  Relay's ingest, and it is what Microsoft **Purview**'s third-party connectors
+  convert into — the documented Slack path (17a-4's DataParser) maps users to
+  mailbox addresses, converts messages to email, imports them into user mailboxes,
+  and only then does litigation hold, retention and communication compliance apply.
+  So an emitter that produces correct `.eml` reaches Global Relay directly and
+  Purview through the connector pattern, **without a partner contract and without a
+  gated schema** — RFC 5322/2045 are public, and any mail parser validates the
+  output locally. That is the difference from Actiance XML, whose definition lives
+  behind Smarsh's Developers Program.
+  For contrast, **Pumble** (a reference product for this project) offers only a
+  workspace-owner ZIP of PUBLIC channels — no DMs, no private channels, no API, and
+  the export is deleted 10 days after download. Compliance capture is a
+  differentiator here, not table stakes.
+
   **Not yet verified:** the Actiance-XML and Global-Relay-EML schemas themselves.
   The vendor names and which format each consumes come from Mattermost's docs; the
   formats would have to be obtained from the vendors before anything is emitted
