@@ -2254,3 +2254,32 @@ oc_result oc_decode_profile_info(oc_rbuf *p, oc_profile_info *m) {
     m->role           = oc_r_u8(p);
     return r_done(p);
 }
+
+/* Which channels hold files (WIN-82). */
+
+oc_result oc_encode_list_file_channels(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_FILE_CHANNELS);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_file_channels(oc_wbuf *w, uint16_t version, const oc_file_channels *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_FILE_CHANNELS);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        oc_w_u64(w, m->entries[i].channel_id);
+        oc_w_u32(w, m->entries[i].count);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_file_channels(oc_rbuf *p, oc_file_channel_entry *entries, uint16_t cap,
+                                  uint16_t *out_count) {
+    uint16_t count = oc_r_u16(p);
+    if (out_count) *out_count = count < cap ? count : cap;
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
+        uint64_t cid = oc_r_u64(p);
+        uint32_t n   = oc_r_u32(p);
+        if (i < cap) { entries[i].channel_id = cid; entries[i].count = n; }
+    }
+    return r_done(p);
+}

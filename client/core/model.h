@@ -141,6 +141,9 @@ typedef struct {
  * channel name was the bug this replaces. */
 typedef struct { uint64_t user_id, joined_at; uint8_t role; } oc_chan_member;
 
+/* (channel, count) — the shape of a census row (WIN-82). */
+typedef struct { uint64_t channel_id; uint32_t count; } oc_chan_count;
+
 /* One file shared in a channel (REQ-143, ARCH-91). */
 typedef struct {
     uint64_t id, channel_id, message_id, uploader_id, size, created_at;
@@ -228,6 +231,10 @@ typedef struct {
     uint64_t  filelist_channel;      /* 0 = the workspace-wide view */
     oc_file_view *files;
     size_t    n_files, cap_files;
+    /* Which channels hold files, with counts (WIN-82). Server-computed, so the Files
+     * column is complete rather than "whatever was in the newest 200". */
+    oc_chan_count *fchans;
+    size_t    n_fchans, cap_fchans;
     /* Saved items (REQ-231) and the activity feed (REQ-139). Both are per-user
      * lists refreshed on open — a client caches nothing (ARCH-88). */
     uint8_t   saved_open, saved_loading;

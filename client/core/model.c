@@ -803,6 +803,21 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     case OC_EV_SAVED_END:
         if (m->saved_open) m->saved_loading = 0;
         break;
+    case OC_EV_FILE_CHANNELS_BEGIN:
+        m->n_fchans = 0;
+        break;
+    case OC_EV_FILE_CHANNEL: {
+        if (m->n_fchans == m->cap_fchans) {
+            size_t nc = m->cap_fchans ? m->cap_fchans * 2 : 16;
+            oc_chan_count *g = realloc(m->fchans, nc * sizeof *g);
+            if (!g) break;
+            m->fchans = g; m->cap_fchans = nc;
+        }
+        m->fchans[m->n_fchans].channel_id = e->channel_id;
+        m->fchans[m->n_fchans].count      = (uint32_t)e->count;
+        m->n_fchans++;
+        break;
+    }
     case OC_EV_PROFILE_INFO: {
         /* Unpack the \x1f-separated fields packed in net.c — kept beside the struct
          * being filled, so the two halves are read together. */

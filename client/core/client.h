@@ -221,6 +221,7 @@ void oc_client_rotate_webhook(oc_client *c, uint64_t webhook_id);
 void oc_client_set_mute(oc_client *c, uint64_t channel_id, int muted);
 /* Custom status (REQ-241/122) and profile fields (REQ-240). Empty status text clears
  * it; expiry 0 means "until changed", and the DAEMON enforces the lapse. */
+void oc_client_list_file_channels(oc_client *c);   /* WIN-82 */
 void oc_client_set_status(oc_client *c, const char *emoji, const char *text,
                           uint64_t expires_at);
 void oc_client_set_profile(oc_client *c, const char *title, const char *timezone);

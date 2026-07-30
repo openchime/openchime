@@ -126,6 +126,11 @@ typedef enum {
     /* Custom status (REQ-241/122, WIN-53) and profile fields (REQ-240, WIN-47).
      * PROFILE carries everything a client shows about a person, so a roster needs one
      * frame per user rather than one per field. */
+    /* WIN-82: which channels hold files, and how many. The Files view's left column
+     * was built from the 200-row page, so a channel whose last upload was older than
+     * that simply did not appear. One aggregate query answers it exactly. */
+    OC_MSG_LIST_FILE_CHANNELS = 0x0073, /* C->S */
+    OC_MSG_FILE_CHANNELS      = 0x0074, /* S->C, (channel_id, count) pairs */
     OC_MSG_SET_STATUS         = 0x006F, /* C->S, my custom status (empty text clears) */
     OC_MSG_SET_PROFILE        = 0x0070, /* C->S, my title/timezone */
     OC_MSG_PROFILE_INFO       = 0x0072, /* S->C, a user's full profile (also a push) */
@@ -355,6 +360,7 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 /* Synced client settings (the daemon-side settings bucket). */
 #define OC_MAX_CLIENT_SETTINGS 128u /* cap on a CLIENT_SETTINGS snapshot */
 #define OC_MAX_INVITES     64u  /* cap on an INVITE_LIST (WIN-46) */
+#define OC_MAX_FILE_CHANNELS 128u /* cap on a FILE_CHANNELS list (WIN-82) */
 #define OC_CLIENT_TYPE_MAX     32u  /* client_type string cap (bytes) */
 #define OC_SETTING_KEY_MAX     64u  /* setting key string cap (bytes) */
 #define OC_SETTING_VALUE_MAX   512u /* setting value string cap (bytes) */
@@ -567,6 +573,10 @@ typedef struct { uint64_t user_id; oc_slice display_name; oc_slice email;
                  oc_slice status_emoji; oc_slice status_text; uint64_t status_expires;
                  oc_slice title; oc_slice timezone; uint64_t avatar_id;
                  uint8_t role; } oc_profile_info;
+/* WIN-82. Counts, not rows: the column shows "#design 12", so the wire carries
+ * exactly that and nothing more. */
+typedef struct { uint64_t channel_id; uint32_t count; } oc_file_channel_entry;
+typedef struct { uint16_t count; const oc_file_channel_entry *entries; } oc_file_channels;
 typedef struct { uint64_t channel_id; uint8_t muted; } oc_set_mute;
 typedef struct { uint64_t channel_id; uint64_t message_id; } oc_set_read_cursor;
 typedef struct { uint64_t webhook_id; } oc_delete_webhook;
@@ -770,6 +780,10 @@ oc_result oc_encode_webhook_list(oc_wbuf *w, uint16_t version, const oc_webhook_
 oc_result oc_encode_delete_webhook(oc_wbuf *w, uint16_t version, const oc_delete_webhook *m);
 oc_result oc_encode_set_webhook_state(oc_wbuf *w, uint16_t version, const oc_set_webhook_state *m);
 oc_result oc_encode_rotate_webhook(oc_wbuf *w, uint16_t version, const oc_rotate_webhook *m);
+oc_result oc_encode_list_file_channels(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_file_channels(oc_wbuf *w, uint16_t version, const oc_file_channels *m);
+oc_result oc_decode_file_channels(oc_rbuf *p, oc_file_channel_entry *entries, uint16_t cap,
+                                  uint16_t *out_count);
 oc_result oc_encode_set_status(oc_wbuf *w, uint16_t version, const oc_set_status *m);
 oc_result oc_encode_set_profile(oc_wbuf *w, uint16_t version, const oc_set_profile *m);
 oc_result oc_encode_profile_info(oc_wbuf *w, uint16_t version, const oc_profile_info *m);

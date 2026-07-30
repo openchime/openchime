@@ -576,6 +576,13 @@ void oc_client_set_read_cursor(oc_client *c, uint64_t channel_id, uint64_t messa
 /* Custom status (REQ-241/122, WIN-53). Empty text clears it; `expires_at` 0 means
  * "until I change it". The DAEMON enforces expiry — a client that is not running
  * cannot clear its own status, so it must not be the thing that decides. */
+/* WIN-82: the exact channel census for the Files view. */
+void oc_client_list_file_channels(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_FILE_CHANNELS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_set_status(oc_client *c, const char *emoji, const char *text,
                           uint64_t expires_at) {
     if (!c) return;

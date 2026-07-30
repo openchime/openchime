@@ -3435,9 +3435,10 @@ static D2D1_RECT_F g_file_scopes[FS_SCOPES];
  * LIST_FILES already takes a channel id (daemon/dbwriter.c), so picking a
  * channel is an exact refetch rather than a slice of the page we hold. */
 static uint64_t g_file_chan;                 /* 0 = everywhere I can see */
-/* One row of a channel census: which channel, and how many of the thing. Named
- * rather than anonymous because it crosses a function boundary now. */
-typedef struct { uint64_t id; int n; } oc_chan_count;
+/* One row of a channel column: which channel, and how many of the thing. Distinct
+ * from the core's oc_chan_count (which the server fills for Files, WIN-82) because
+ * the Later census is still computed client-side from the saved list. */
+typedef struct { uint64_t id; int n; } oc_gui_chan_count;
 
 /* The Later view's channel column (WIN-73). Same shape as the Files one above,
  * with one honest difference: LIST_SAVED takes NO arguments, unlike LIST_FILES
@@ -3445,7 +3446,7 @@ typedef struct { uint64_t id; int n; } oc_chan_count;
  * hold instead of re-asking the server. At the 200-item cap that is the whole list
  * for almost anyone; making it exact needs a channel argument on the wire. */
 static uint64_t g_later_chan;
-static oc_chan_count g_lchan[64];
+static oc_gui_chan_count g_lchan[64];
 static int g_n_lchan;
 static D2D1_RECT_F g_lchan_rows[65];         /* [0] is "All channels" */
 static int g_n_lchan_rows;
@@ -3464,7 +3465,7 @@ static char g_file_q[64];
 static D2D1_RECT_F g_file_type_btn, g_file_sort_btn, g_file_scope_btn;
 static D2D1_RECT_F g_file_up_btn, g_file_search_box;
 /* The channel census, built only while showing everything — see files_index. */
-static oc_chan_count g_fchan[64];
+static oc_gui_chan_count g_fchan[64];
 static int g_n_fchan;
 static D2D1_RECT_F g_fchan_rows[65];         /* [0] is "All files" */
 static int g_n_fchan_rows;
@@ -3557,19 +3558,14 @@ static void files_build_order(const oc_model *m) {
  * files, and recounting there would collapse the column to the one row you are
  * standing on — the list you navigate by would vanish as you used it. */
 static void files_index(const oc_model *m) {
-    if (g_file_chan) return;
+    /* WIN-82: the SERVER computes this now (one GROUP BY over attachments), so the
+     * column is complete instead of "whatever channels appear in the newest 200
+     * files". Nothing here counts any more — it just copies the census across. */
     g_n_fchan = 0;
-    for (size_t i = 0; i < m->n_files; i++) {
-        uint64_t cid = m->files[i].channel_id;
-        if (!cid) continue;
-        int at = -1;
-        for (int j = 0; j < g_n_fchan; j++) if (g_fchan[j].id == cid) { at = j; break; }
-        if (at < 0) {
-            if (g_n_fchan >= (int)(sizeof g_fchan / sizeof g_fchan[0])) continue;
-            at = g_n_fchan++;
-            g_fchan[at].id = cid; g_fchan[at].n = 0;
-        }
-        g_fchan[at].n++;
+    for (size_t i = 0; i < m->n_fchans && g_n_fchan < (int)(sizeof g_fchan / sizeof g_fchan[0]); i++) {
+        g_fchan[g_n_fchan].id = m->fchans[i].channel_id;
+        g_fchan[g_n_fchan].n  = (int)m->fchans[i].count;
+        g_n_fchan++;
     }
 }
 
@@ -3776,7 +3772,7 @@ static void draw_filelist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F 
  * what a list of saved messages is filtered BY. */
 static void draw_chan_column(ID2D1RenderTarget *rt, const oc_model *m, float h,
                              const char *title, const char *all_label, int all_icon,
-                             const oc_chan_count *census, int n_census,
+                             const oc_gui_chan_count *census, int n_census,
                              uint64_t sel, D2D1_RECT_F *rows, int *n_rows,
                              const char *empty_hint, const char *foot)
 {
@@ -3833,7 +3829,7 @@ static void draw_files_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h
                      g_fchan, g_n_fchan, g_file_chan,
                      g_fchan_rows, &g_n_fchan_rows,
                      "Channels appear here once something is shared in them.",
-                     "From the 200 most recent files.");
+                     NULL);   /* WIN-82: the census is exact now, so no caveat to state */
 }
 
 /* The workspace-wide Files view (rail). The same list with `channel_id 0`, which
@@ -7809,7 +7805,8 @@ static int on_click(HWND hwnd, int x, int y) {
                      * and a stale one is worse than a moment's wait. */
                     if (act == VIEW_ADMIN) admin_select(g_adm_tab);
                     if (act == VIEW_FILES) { g_file_chan = 0; g_filelist_from_view = 1;
-                                             oc_client_list_files(g_client, 0); }
+                                             oc_client_list_files(g_client, 0);
+                                             oc_client_list_file_channels(g_client); }
                     if (act == VIEW_ACTIVITY) oc_client_list_activity(g_client);
                     if (act == VIEW_LATER)  { g_later_chan = 0; oc_client_list_saved(g_client); }
                 }
@@ -10139,7 +10136,8 @@ static void test_poll(HWND hwnd) {
             if (v == VIEW_ACTIVITY) oc_client_list_activity(g_client);
             if (v == VIEW_LATER)  { g_later_chan = 0; oc_client_list_saved(g_client); }
             if (v == VIEW_FILES)  { g_file_chan = 0; g_filelist_from_view = 1;
-                                    oc_client_list_files(g_client, 0); }
+                                    oc_client_list_files(g_client, 0);
+                                    oc_client_list_file_channels(g_client); }
             if (v == VIEW_ADMIN)    admin_select(g_adm_tab);
             test_ack("ok");
         } else test_ack("err");

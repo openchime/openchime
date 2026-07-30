@@ -214,6 +214,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->body);
     /* WIN-47/53's profile strings, alongside every other heap field. */
     free(r->st_emoji); free(r->st_text); free(r->pf_title); free(r->pf_tz);
+    free(r->fchans);
     free(r->members);
     free(r->author_name);
     free_attach_meta(r->attach, r->n_attach);
@@ -2006,6 +2007,37 @@ static oc_dbres *process_list_members(sqlite3 *db, const oc_job *j) {
  * a message was never shared with anyone. Reclaimed rows are KEPT and flagged,
  * because "this was here and the bytes are gone" (REQ-215/217) is information
  * where a silently missing row is not. */
+/* Which channels hold files, with counts (WIN-82).
+ *
+ * The client used to build this from the 200-row LIST_FILES page, so a channel whose
+ * newest upload fell outside that window was invisible in the Files column. One
+ * GROUP BY answers it exactly, and it is cheap: the same membership filter as
+ * LIST_FILES over an index that migration 0023 already added. */
+static oc_dbres *process_list_file_channels(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_FILE_CHANNELS;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT a.channel_id, COUNT(*) FROM attachments a "
+        " WHERE a.message_id IS NOT NULL AND a.channel_id IN "
+        "       (SELECT channel_id FROM channel_members WHERE user_id=?1) "
+        " GROUP BY a.channel_id ORDER BY COUNT(*) DESC LIMIT ?2;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)OC_MAX_FILE_CHANNELS);
+    oc_file_channel_entry *arr = calloc(OC_MAX_FILE_CHANNELS, sizeof *arr);
+    size_t n = 0;
+    while (arr && n < OC_MAX_FILE_CHANNELS && sqlite3_step(st) == SQLITE_ROW) {
+        arr[n].channel_id = (uint64_t)sqlite3_column_int64(st, 0);
+        arr[n].count      = (uint32_t)sqlite3_column_int64(st, 1);
+        n++;
+    }
+    sqlite3_finalize(st);
+    r->fchans = arr; r->n_fchans = n;
+    return r;
+}
+
 static oc_dbres *process_list_files(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -4059,6 +4091,7 @@ static int is_read_job(int type) {
            /* Read-only, so it goes to the reader thread (ARCH-66) like every other
             * list. Its three siblings — revoke, set-state, rotate — write. */
            type == OC_JOB_LIST_INVITES || type == OC_JOB_GET_PROFILE ||
+           type == OC_JOB_LIST_FILE_CHANNELS ||
            type == OC_JOB_LIST_CLIENT_SETTINGS ||
            type == OC_JOB_CALL_AUTH ||
            type == OC_JOB_STORAGE_STATUS ||
@@ -4085,6 +4118,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_LIST_WEBHOOKS)  return process_list_webhooks(rdb, j);
     if (j->type == OC_JOB_LIST_INVITES)   return process_list_invites(rdb, j);
     if (j->type == OC_JOB_GET_PROFILE)    return process_get_profile(rdb, j);
+    if (j->type == OC_JOB_LIST_FILE_CHANNELS) return process_list_file_channels(rdb, j);
     if (j->type == OC_JOB_LIST_NOTIFY_PREFS) return process_list_notify_prefs(rdb, j);
     if (j->type == OC_JOB_LIST_CLIENT_SETTINGS) return process_list_client_settings(rdb, j);
     if (j->type == OC_JOB_CALL_AUTH)      return process_call_auth(rdb, j);

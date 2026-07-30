@@ -973,6 +973,18 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (e->body) { memcpy(e->body, wi.token.ptr, wi.token.len); e->body[wi.token.len] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
+        } else if (hdr.msg_type == OC_MSG_FILE_CHANNELS) {
+            oc_file_channel_entry fe[OC_MAX_FILE_CHANNELS]; uint16_t count = 0;
+            if (oc_decode_file_channels(&p, fe, OC_MAX_FILE_CHANNELS, &count) != OC_OK) return -1;
+            oc_ev *b = oc_ev_new(OC_EV_FILE_CHANNELS_BEGIN);
+            if (b) oc_queue_push(to_ui, b);
+            for (uint16_t i = 0; i < count; i++) {
+                oc_ev *e = oc_ev_new(OC_EV_FILE_CHANNEL);
+                if (!e) continue;
+                e->channel_id = fe[i].channel_id;
+                e->count = (int)fe[i].count;
+                oc_queue_push(to_ui, e);
+            }
         } else if (hdr.msg_type == OC_MSG_PROFILE_INFO) {
             oc_profile_info pi;
             if (oc_decode_profile_info(&p, &pi) != OC_OK) return -1;
@@ -1559,6 +1571,11 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_rotate_webhook rw = { c->message_id };
                 if (oc_encode_rotate_webhook(&w, OC_PROTOCOL_VERSION, &rw) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_FILE_CHANNELS) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_file_channels(&w, OC_PROTOCOL_VERSION) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SET_STATUS) {

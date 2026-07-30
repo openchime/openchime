@@ -1133,6 +1133,13 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_LIST_FILE_CHANNELS) {
+            oc_job *j = oc_job_new(OC_JOB_LIST_FILE_CHANNELS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SET_STATUS) {
             oc_set_status ss;
             if (oc_decode_set_status(&p, &ss) != OC_OK) return -1;
@@ -2508,6 +2515,18 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
+        break;
+    }
+    case OC_RES_FILE_CHANNELS: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_file_channel_entry ents[OC_MAX_FILE_CHANNELS];
+        uint16_t n = 0;
+        for (size_t i = 0; i < r->n_fchans && n < OC_MAX_FILE_CHANNELS; i++) ents[n++] = r->fchans[i];
+        oc_file_channels fc = { n, ents };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_file_channels(&w, OC_PROTOCOL_VERSION, &fc);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
     case OC_RES_PROFILE_INFO: {

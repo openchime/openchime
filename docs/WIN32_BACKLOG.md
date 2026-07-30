@@ -74,7 +74,7 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 | ~~**WIN-79**~~ | ~~Replace the native context menus~~ **DONE** (ARCH-98). All four — message, member, channel, image kebab — are the app's own floating menu; `TrackPopupMenu`, `CreatePopupMenu` and `AppendMenuW` appear nowhere in the client. They keep **their own command numbers**, dispatched per kind, because the dropdowns' space was already crowded (a message's "Edit = 21" collides with a notification level). The three **submenus were flattened**: roles and notify levels became ticked sections, which shows the current value that a submenu hid behind a hover; the quick reactions became a new `MK_EMOJIROW` — one row, per-glyph hit-boxes, colour font like the picker. | — |
 | **WIN-80** | Custom DirectWrite composer, replacing RichEdit (ARCH-98) | P1 | XL |
 | **WIN-81** | The GUI smoke does not run in CI — needs a self-hosted Windows runner | P2 | M |
-| **WIN-82** | Files' channel census only sees the 200-row page — needs a distinct-channels query | P3 | S |
+| ~~**WIN-82**~~ | ~~Files' census only saw the 200-row page~~ **DONE.** `LIST_FILE_CHANNELS` — one `GROUP BY` over attachments with the same membership filter as `LIST_FILES`, over the index migration 0023 already added. The column is now exact, so the "From the 200 most recent files" caveat is deleted rather than reworded. Counts verified against the database directly (17 and 1). | — |
 | **WIN-83** | User-defined custom sidebar sections (the other half of REQ-234) | P3 | M |
 
 ### The items added 2026-07-30, in detail
