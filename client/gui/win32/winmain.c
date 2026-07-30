@@ -611,6 +611,10 @@ static ULONGLONG g_jump_deadline;       /* GetTickCount64 by which it must appea
 static uint64_t  g_flash_mid;           /* message to tint */
 static ULONGLONG g_flash_until;
 /* Webhook-overlay row hit-boxes (row -> webhook id, for delete). */
+/* Per-row action buttons (WIN-48): enable/disable, rotate, delete. */
+static int g_await_webhook;     /* show the minted webhook token once it arrives */
+static struct { D2D1_RECT_F r; uint64_t wid; int act; int disabled; } g_webacts[48];
+static int g_n_webacts;
 static struct { float top, bot; uint64_t wid; } g_webrows[64];
 static int g_n_webrows;
 
@@ -2930,12 +2934,16 @@ static void draw_weblist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
     snprintf(title, sizeof title, "Webhooks — %s", (c && c->name) ? c->name : "channel");
     D2D1_RECT_F body = overlay_header(rt, reg, title);
     g_n_webrows = 0;
+    g_n_webacts = 0;
     if (m->n_webhooks == 0) {
         overlay_empty(rt, body, "No webhooks. Right-click the channel → Create webhook.");
         return;
     }
-    draw_text(rt, "Click a webhook to delete it \u2014 you will be asked to confirm.", g_meta,
-              rf(body.left + 20, body.top + 4, body.right - 16, body.top + 24), OC_COL_FAINT);
+    /* Rotate is the answer to a leaked token, because REVEAL IS IMPOSSIBLE: only the
+     * SHA-256 is stored, so the token cannot be shown again (WIN-48). Saying that
+     * here is the difference between a missing feature and an explained one. */
+    draw_text(rt, "A token is shown once. If one leaks, rotate it \u2014 it cannot be shown again.",
+              g_meta, rf(body.left + 20, body.top + 4, body.right - 16, body.top + 24), OC_COL_FAINT);
     body.top += 28;
     ovl_use(OVL_WEB);
     float rowh = 40;
@@ -2950,7 +2958,30 @@ static void draw_weblist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
          * is positively marked instead of merely lacking a word. */
         const char *st = wv->disabled ? "disabled" : "active";
         float cw = text_width(st, g_meta) + 18;
-        D2D1_RECT_F chip = rf(body.right - 24 - cw, y + 2, body.right - 24, y + 24);
+        /* Three buttons on the right; the chip sits left of them. */
+        struct { const char *lbl; int act; } B[3] = {
+            { wv->disabled ? "Enable" : "Disable", 1 }, { "Rotate", 2 }, { "Delete", 3 }
+        };
+        float bx = body.right - 20;
+        for (int k = 2; k >= 0; k--) {
+            float bw = text_width(B[k].lbl, g_meta) + 22;
+            D2D1_RECT_F b = rf(bx - bw, y + 4, bx, y + 30);
+            int hot = in_rect(b, g_mouse_x, g_mouse_y);
+            fill_round(rt, b, 6.0f, hot ? OC_COL_HOVER : OC_COL_INPUT);
+            stroke_round(rt, b, 6.0f, B[k].act == 3 ? OC_COL_DANGER : OC_COL_BORDER, 1.0f);
+            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+            draw_text(rt, B[k].lbl, g_meta, b, B[k].act == 3 ? OC_COL_DANGER : OC_COL_MUTED);
+            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+            if (g_n_webacts < (int)(sizeof g_webacts / sizeof g_webacts[0])) {
+                g_webacts[g_n_webacts].r = b;
+                g_webacts[g_n_webacts].wid = wv->webhook_id;
+                g_webacts[g_n_webacts].act = B[k].act;
+                g_webacts[g_n_webacts].disabled = wv->disabled;
+                g_n_webacts++;
+            }
+            bx = b.left - 6;
+        }
+        D2D1_RECT_F chip = rf(bx - cw - 8, y + 2, bx - 8, y + 24);
         fill_round(rt, chip, 10.0f, OC_COL_INPUT);
         stroke_round(rt, chip, 10.0f, wv->disabled ? OC_COL_BORDER : OC_COL_ONLINE, 1.0f);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -7821,6 +7852,29 @@ static int on_click(HWND hwnd, int x, int y) {
                         return 1;
                     }
             if (mm->weblist_open)
+                for (int i = 0; i < g_n_webacts; i++)
+                    if (in_rect(g_webacts[i].r, x, y)) {
+                        uint64_t wid = g_webacts[i].wid;
+                        if (g_webacts[i].act == 1) {
+                            oc_client_set_webhook_state(g_client, wid, !g_webacts[i].disabled);
+                        } else if (g_webacts[i].act == 2) {
+                            /* Rotating invalidates the old token immediately, so it is
+                             * confirmed like a delete rather than done on one click. */
+                            if (MessageBoxW(hwnd, L"Rotate this webhook's token?\n\n"
+                                                  L"The current token stops working immediately "
+                                                  L"and cannot be recovered.",
+                                            L"Confirm", MB_YESNO | MB_ICONWARNING) == IDYES) {
+                                oc_client_rotate_webhook(g_client, wid);
+                                g_await_webhook = 1;      /* show the new token once */
+                            }
+                        } else {
+                            if (MessageBoxW(hwnd, L"Delete this webhook?", L"Confirm",
+                                            MB_YESNO | MB_ICONWARNING) == IDYES)
+                                oc_client_delete_webhook(g_client, wid);
+                        }
+                        return 1;
+                    }
+            if (mm->weblist_open)
                 for (int i = 0; i < g_n_webrows; i++)
                     if ((float)y >= g_webrows[i].top && (float)y < g_webrows[i].bot) {
                         if (MessageBoxW(hwnd, L"Delete this webhook?", L"Confirm",
@@ -8702,7 +8756,6 @@ static void show_secret(HWND owner, const char *title, const char *what,
 
 static int g_logging_out;
 static int g_await_invite;      /* show the minted invite token once it arrives */
-static int g_await_webhook;     /* show the minted webhook token once it arrives */
 
 static float menu_total_height(void) {
     float t = 12 + (g_menu_headerblock ? 66 : 0);
@@ -9701,6 +9754,18 @@ static void test_poll(HWND hwnd) {
         char nm[64] = {0}; int pub = 1;
         sscanf(arg, "%63s %d", nm, &pub);
         if (g_client && nm[0]) { oc_client_create_channel_ex(g_client, nm, pub != 0); test_ack("ok"); }
+        else test_ack("err");
+    } else if (!strcmp(verb, "mkhook")) {
+        /* Bypass the Create-webhook form, as mkchan and upload bypass theirs: the
+         * harness cannot drive a modal form_dialog (that is WIN-77's job). */
+        if (g_client && g_sel && arg[0]) {
+            oc_client_create_webhook(g_client, g_sel, arg);
+            g_await_webhook = 1;
+            test_ack("ok");
+        } else test_ack("err");
+    } else if (!strcmp(verb, "hooks")) {
+        /* Open the webhook list for the selected channel. */
+        if (g_client && g_sel) { close_overlays(); oc_client_webhooks(g_client, g_sel); test_ack("ok"); }
         else test_ack("err");
     } else if (!strcmp(verb, "del")) {
         /* Delete a message without the modal menu; mid 0 = the newest. */
