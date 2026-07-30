@@ -343,10 +343,12 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
   Notifications / Advanced** — because fourteen rows are not one subject: how the app
   looks, how messages read, when it interrupts you and the machine-level escape
   hatches are four questions, and a flat list makes you re-read all of them to find
-  one. New in Appearance: **accent colour** (four choices, each a dark/light PAIR —
-  the bright blue that pops on navy is unreadable on white, which is why the two
-  palettes differ in their accent at all, and picking a colour must not undo that),
-  **text size**, and **message density** (which scales the block MARGINS only —
+  one. New in Appearance: **colour scheme** — four choices, each of which is a PAIR:
+  the nav rail (the app's main branded surface) and the accent, carried for both light
+  and dark, because the bright blue that pops on navy is unreadable on white and
+  picking a scheme must not undo that. The selected-row tint derives from the accent
+  rather than staying a palette constant, so a plum scheme does not leave a blue
+  selection behind. Also **text size**, and **message density** (which scales the block MARGINS only —
   shrinking the text to fit more messages is a text-size preference wearing the wrong
   name). Advanced carries **zoom**, the DPI override and Reset. Entry from the **You**
   menu and **Ctrl+,** as well as the workspace menu.
