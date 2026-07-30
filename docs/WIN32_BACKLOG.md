@@ -9,7 +9,7 @@ clients, or a `REQ-NNN`.
 parity table is the *feature reachability* tracker. This document is the *work
 list* derived from both — one row per shippable branch.
 
-**Ids.** Items are `WIN-1` … `WIN-81`, numbered once and **stable**: an id is
+**Ids.** Items are `WIN-1` … `WIN-82`, numbered once and **stable**: an id is
 never renumbered or reused, so a commit or branch can cite it. Ordering is *not*
 priority — the **Pri** column is, and it may change. Section membership may also
 change as blockers clear (an item moves from §3 to §1 without changing its id).
@@ -68,12 +68,13 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 | ~~**WIN-73**~~ | ~~**Later** reform~~ **DONE.** A saved message shows a **bookmark in the right margin and a faint inverse band** — `OC_COL_SELECT`, deliberately *not* the accent a mention uses, because a message can be both and identical tints would be unreadable. It costs **no height**: the band reuses the row rect and the glyph sits outside the body's wrap width, so a save landing cannot shift the transcript under the reader. The marker survives a reconnect, which was the whole point of the daemon half — verified by relaunching the client against a live daemon. The view took the **Files shape**: a channel column defaulting to "All channels", newest-saved first with counts, and scrolling through the shared overlay offset. **Caveat:** `LIST_SAVED` takes no channel argument (unlike `LIST_FILES`), so picking a channel filters the page we hold rather than re-asking — the whole list, at the 200 cap, for almost anyone. | — |
 | ~~**WIN-74**~~ | ~~DM tabs: drop **About**~~ **DONE.** A DM shows Messages · Files & links · Pins. `tab_applies()` decides per channel kind, and it also guards `select_tab()` and a conversation switch — otherwise moving from a channel to a DM with About open left a pane whose tab did not exist. Pins and Files stay because the daemon genuinely allows both in a DM (membership is the only check). | — |
 | ~~**WIN-75**~~ | ~~The palette has no affordance~~ **DONE.** "Jump to…  (Ctrl+K)" in the **New** menu, beside "Search messages…" — the menu that already answers "do something". The shortcut is named in the label so the menu teaches the keystroke instead of replacing it. | — |
-| **WIN-76** | Long lists do not scroll: **Files** (Later done with WIN-73) · and the Files channel census is only as complete as the 200-row page (needs a distinct-channels query) | P1 | S |
+| ~~**WIN-76**~~ | ~~Long lists do not scroll~~ **DONE** for Files and Later, both through the offset five other panes already shared (`ovl_use`/`ovl_begin`/`ovl_end`) rather than a sixth private one; the wheel routes to it for both views. The Files list's **"%d more — narrow the filters"** line is deleted: it existed only because the list could not scroll, and a count of unreachable rows is a worse answer than a scrollbar. The 200-row **server** cap notice stays — that one is a real limit. **Still open, split out as WIN-82:** the Files channel census is only as complete as that 200-row page. | — |
 | **WIN-77** | Modal frame: the remaining conversions — pane headers, `confirm()`, `form_dialog`'s 16 sites | P1 | L |
 | **WIN-78** | Preferences as two panes + appearance depth (accent, text size, density, zoom) | P2 | M |
 | **WIN-79** | Replace the four remaining **native `TrackPopupMenu`** context menus with the app's own (ARCH-98) | P1 | M |
 | **WIN-80** | Custom DirectWrite composer, replacing RichEdit (ARCH-98) | P1 | XL |
 | **WIN-81** | The GUI smoke does not run in CI — needs a self-hosted Windows runner | P2 | M |
+| **WIN-82** | Files' channel census only sees the 200-row page — needs a distinct-channels query | P3 | S |
 
 ### The items added 2026-07-30, in detail
 

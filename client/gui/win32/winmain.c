@@ -3570,9 +3570,18 @@ static void draw_file_rows(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
     files_build_order(m);
     g_n_filerows = 0;
     int shown = 0;
-    for (int oi = 0; oi < g_n_forder && y < body.bottom; oi++) {
+    /* Scrolling (WIN-76), through the offset five other panes already share. The
+     * list used to stop at the pane edge and merely COUNT what it could not show,
+     * which told you the rows existed and still refused to reach them. */
+    float rowh = 50.0f;
+    D2D1_RECT_F list = rf(body.left, y, body.right, body.bottom);
+    ovl_use(OVL_FILES);
+    y = ovl_begin(rt, list, (float)g_n_forder * rowh + 16);
+    for (int oi = 0; oi < g_n_forder; oi++) {
         size_t i = (size_t)g_forder[oi];
         const oc_file_view *f = &m->files[i];
+        if (y + rowh < list.top) { y += rowh; continue; }   /* scrolled above */
+        if (y > list.bottom) break;
         shown++;
         D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + 46);
         if (g_hover_filerow == f->id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
@@ -3617,8 +3626,9 @@ static void draw_file_rows(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
                 g_n_filerows++;
             }
         }
-        y += 50;
+        y += rowh;
     }
+    ovl_end(rt, list);
     if (!g_n_forder && m->n_files) {
         char none[160];
         if (g_file_q[0]) snprintf(none, sizeof none, "No file here is named like “%s”.", g_file_q);
@@ -3626,15 +3636,10 @@ static void draw_file_rows(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
         draw_text(rt, none, g_meta,
                   rf(body.left + 20, y + 6, body.right - 20, y + 26), OC_COL_FAINT);
     }
-    /* The pane ran out before the list did. Say so: a list that just stops at
-     * the window edge reads as "that is all of them". */
-    if (shown < g_n_forder) {
-        char more[80];
-        snprintf(more, sizeof more, "%d more — narrow the filters to see them.",
-                 g_n_forder - shown);
-        draw_text(rt, more, g_meta, rf(body.left + 20, body.bottom - 24, body.right - 20,
-                  body.bottom - 4), OC_COL_FAINT);
-    }
+    /* The "%d more — narrow the filters" line is gone with WIN-76: it existed only
+     * because the list could not scroll, and a count of unreachable rows is a worse
+     * answer than a scrollbar. The 200-row SERVER cap below is different — that one
+     * is a real limit and still has to be said. */
     /* The server caps the response; saying so beats a list that silently stops. */
     if (m->n_files >= OC_MAX_FILE_LIST && y < body.bottom)
         draw_text(rt, "Showing the most recent 200. Older files are in search.", g_meta,
@@ -9101,6 +9106,17 @@ static void test_poll(HWND hwnd) {
         /* Kept as an alias: `shot` is now the composited capture, so there is
          * exactly one way to take a picture and it is the complete one. */
         test_ack(test_shot(hwnd, arg) ? "ok" : "err");
+    } else if (!strcmp(verb, "wheel")) {
+        /* A real WM_MOUSEWHEEL at a point, in SCREEN coordinates as the message
+         * carries them. The `scroll` verb only moves the transcript's own offset, so
+         * every other scrollable region — the sidebar, the overlay panes, and now
+         * Files and Later — had no way to be tested at all. */
+        int x = 0, y = 0, d = 0;
+        sscanf(arg, "%d %d %d", &x, &y, &d);
+        POINT sp = { PX(x), PX(y) };
+        ClientToScreen(hwnd, &sp);
+        SendMessageW(hwnd, WM_MOUSEWHEEL, (WPARAM)(d << 16), MAKELPARAM(sp.x, sp.y));
+        test_ack("ok");
     } else if (!strcmp(verb, "key")) {
         /* A raw virtual key through the real WM_KEYDOWN path, so Esc/Enter/Tab
          * behaviour is drivable at all — without this, every keyboard rule in the
