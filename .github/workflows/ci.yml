@@ -8,8 +8,15 @@ name: ci
 #                  health check plus the protocol vertical over TLS.
 #   - core:        standalone compile check of the client app-core (ARCH-74).
 #   - windows:     mingw cross-compile check of the Windows front-ends (TUI + the
-#                  native Direct2D/DirectWrite GUI, ARCH-82) — the running window
-#                  can't be headless-screenshotted, so this guards build breaks.
+#                  native Direct2D/DirectWrite GUI, ARCH-82). Build breaks only.
+#
+# The Win32 GUI's *behaviour* is NOT covered here, and that is a real gap rather
+# than an oversight: scripts/gui_smoke.sh asserts 45 chrome invariants through the
+# client's test hook, but it needs a Windows host with the daemon reachable, and
+# the daemon is epoll-based — Linux only. GitHub's Windows runners cannot host it
+# (no Linux containers), so until a self-hosted Windows box exists the smoke is a
+# pre-push gate run by hand. Three bugs reached the user for want of it (WIN-70,
+# WIN-71, WIN-72); it now catches all three.
 # Doc-only changes skip CI. See docs/TESTING.md for the full strategy.
 
 on:

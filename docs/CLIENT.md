@@ -519,6 +519,29 @@ It went red for **eleven consecutive pushes** on 2026-07-29 because
 green the whole time, which is exactly why a green local suite is not a substitute
 for reading the run. Push, then check.
 
+## Run the GUI smoke before pushing Win32 chrome
+
+`scripts/gui_smoke.sh` asserts **45 invariants** through the test hook: for each of
+the six views, what is in the second column (`sidebar_kind`), whether the middle
+one is typeable (`main_is_conversation`), which native children are shown, and
+whether anything covers the window — plus the search overlay, the Pins tab, the
+Preferences modal, the command palette, and that the composer cue names the open
+conversation.
+
+Every one of those is a boolean, and booleans belong in a script. Three bugs
+reached the user in a day for want of this (WIN-70, WIN-71's regression, WIN-72),
+all of them chrome. It is verified to catch them: reintroducing WIN-71 — Files
+returning `SBK_CHANNELS` — fails exactly two checks, the column kind and the leaked
+find box.
+
+**A new view or overlay is added to the matrix in that script as well as to the
+predicates in `winmain.c`.** That is the point of it.
+
+It is not in CI, and that gap is honest: the daemon is epoll-based so it is
+Linux-only, and GitHub's Windows runners cannot host it (no Linux containers). A
+hosted smoke needs a self-hosted Windows box. Until then, run it and read it — the
+same discipline as reading CI.
+
 ## Seeing the whole window (Win32 harness)
 
 `scripts/gui_drive.sh shot <name>` produces one image of the entire application,
