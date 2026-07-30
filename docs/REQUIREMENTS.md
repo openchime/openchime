@@ -1175,6 +1175,26 @@ None are yet backed by an architecture decision.*
     (ARCH-76), where they do not, and wherever a vendor connector is the actual
     requirement.
 
+  **What we can actually model it on (checked 2026-07-30, not assumed):** Slack
+  publishes **no machine-readable spec for Discovery**. `slackapi/slack-api-specs`
+  contains only the Web API and Events API — zero discovery entries;
+  `api.slack.com/admins/discovery` answers **403** to an unauthenticated fetch, and
+  there is no `docs.slack.dev` method page for `discovery.conversations.history`.
+  Every field-level description in circulation is secondary (Slack's help centre,
+  vendor blogs), so a promise of *wire compatibility* would partly be guesswork
+  about field names.
+  What IS specified, in OpenAPI, is Slack's **public Web API** — and the Discovery
+  methods are recognisably those shapes with an org-wide scope: the same
+  `{"ok":true,…}` envelope, the same `limit` + `response_metadata.next_cursor`
+  paging, the same message/channel/user objects. So the buildable answer is to
+  conform to the PUBLIC spec (verifiable, and a connector's parser expects those
+  shapes anyway) and follow Discovery's naming where it is known, rather than claim
+  bit-exactness with a document we cannot read.
+  **Mattermost's compliance export** is the other openly-documented model, and is
+  job-and-artifact oriented (Actiance XML, Global Relay EML, CSV) rather than an
+  API — closer to what a self-hosted operator actually runs, and worth considering
+  for the export FORMAT even if the interface follows Slack.
+
   **[needs ARCH decision — (a) wire-compatible with Slack's `discovery.*` URLs and
   JSON envelope so an existing connector works unmodified, versus our own shape;
   (b) where it is served: the daemon's existing admin/health HTTP listener is the
