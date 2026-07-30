@@ -1526,6 +1526,90 @@ static void test_channel_mutability(void) {
     CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_INVALID_CHANNEL);
     oc_dbres_free(r);
 
+    /* ---- visibility (REQ-031) ------------------------------------------------
+     * The two directions are not symmetric, so they are tested as two things:
+     * PRIVATE narrows the audience to the members, PUBLIC exposes the whole history
+     * to everyone. What must hold in both is that MEMBERSHIP and HISTORY are
+     * untouched — the flag is the only thing that moves. */
+    {
+        uint64_t carol = reg(w, "vis-carol", "pw", OC_ROLE_MEMBER);
+        CHECK(carol);
+        /* carol is not in it. While it is public she can read it; that IS public. */
+        oc_dbres *br = backfill(w, carol, ch, 0);
+        CHECK(br && br->type == OC_RES_BACKFILL_OK && br->n_replay == 1);
+        oc_dbres_free(br);
+
+        /* A plain member cannot change it: it decides what people OUTSIDE the
+         * channel can see, which is the moderator line this file draws. */
+        r = chan_update(w, bob, ch, OC_CHUP_PRIVATE, "");
+        CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+        oc_dbres_free(r);
+
+        r = chan_update(w, alice, ch, OC_CHUP_PRIVATE, "");
+        CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->ch_is_public == 0);
+        /* Members are untouched — the flag pins the audience, it does not rewrite it. */
+        CHECK(r->ch_fanout == 1 && r->n_members >= 2);
+        oc_dbres_free(r);
+
+        /* Now carol cannot read it, and bob (a member) still can. That is the whole
+         * point of the direction, and it is enforced by the SAME read-access rule
+         * everything else uses rather than by anything new. */
+        br = backfill(w, carol, ch, 0);
+        CHECK(br && (br->type != OC_RES_BACKFILL_OK || br->n_replay == 0));
+        oc_dbres_free(br);
+        br = backfill(w, bob, ch, 0);
+        CHECK(br && br->type == OC_RES_BACKFILL_OK && br->n_replay == 1);
+        oc_dbres_free(br);
+
+        /* It also leaves the directory: a private channel a non-member can still
+         * find by name is not private. */
+        r = list_channels(w, carol);
+        CHECK(r && r->type == OC_RES_CHANNEL_LIST);
+        if (r) {
+            int found = 0;
+            for (size_t i = 0; i < r->n_chlist; i++) if (r->chlist[i].channel_id == ch) found = 1;
+            CHECK(!found);
+        }
+        oc_dbres_free(r);
+
+        /* Idempotent: the ops name a TARGET STATE, so a second one changes nothing.
+         * A toggle would have flipped it back — which is exactly what two admins
+         * clicking at the same time would have done. */
+        r = chan_update(w, alice, ch, OC_CHUP_PRIVATE, "");
+        CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->ch_is_public == 0);
+        oc_dbres_free(r);
+
+        /* PUBLIC again: carol can read EVERYTHING, including what was said while it
+         * was private. This is the disclosure the client warns about, asserted here
+         * so nobody can later claim it was not the intended behaviour. */
+        r = chan_update(w, bob, ch, OC_CHUP_PUBLIC, "");
+        CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+        oc_dbres_free(r);
+        r = chan_update(w, alice, ch, OC_CHUP_PUBLIC, "");
+        CHECK(r && r->type == OC_RES_CHANNEL_INFO && r->ch_is_public == 1);
+        oc_dbres_free(r);
+        br = backfill(w, carol, ch, 0);
+        CHECK(br && br->type == OC_RES_BACKFILL_OK && br->n_replay == 1);
+        oc_dbres_free(br);
+
+        /* Both directions are audited, and as DISTINCT actions: an audit reader must
+         * not have to open the row to see which way it went. */
+        oc_job *aj = oc_job_new(OC_JOB_AUDIT_QUERY, 900);
+        aj->user_id = alice; aj->audit_limit = 50;
+        oc_dbwriter_submit(w, aj);
+        oc_dbres *ar = wait_result(w);
+        CHECK(ar && ar->type == OC_RES_AUDIT_PAGE);
+        if (ar) {
+            int saw_priv = 0, saw_pub = 0;
+            for (size_t i = 0; i < ar->n_audit; i++) {
+                if (ar->audit[i].action && !strcmp(ar->audit[i].action, "channel.private")) saw_priv = 1;
+                if (ar->audit[i].action && !strcmp(ar->audit[i].action, "channel.public"))  saw_pub = 1;
+            }
+            CHECK(saw_priv && saw_pub);
+        }
+        oc_dbres_free(ar);
+    }
+
     /* Archive: owner/admin only, and then genuinely read-only. */
     r = chan_update(w, bob, ch, OC_CHUP_ARCHIVE, "");
     CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);

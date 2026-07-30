@@ -1685,6 +1685,36 @@ static oc_dbres *process_update_channel(sqlite3 *db, const oc_job *j) {
         /* The id is untouched, so membership, history and cursors all follow the
          * rename for free — nothing durable was ever keyed on the name. */
         audit_actor(db, OC_AUDIT_ADMIN, "channel.rename", j->user_id, 0, j->ch_name, 1, NULL);
+    } else if (j->chup_op == OC_CHUP_PRIVATE || j->chup_op == OC_CHUP_PUBLIC) {
+        /* Visibility (REQ-031). Owner/admin, like a rename and an archive: it changes
+         * what people who are NOT in the channel can see, which is the line this
+         * codebase draws between "any member" and "moderator". */
+        if (!oc_role_can_moderate(role)) {
+            r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+        }
+        int pub = (j->chup_op == OC_CHUP_PUBLIC);
+        /* No membership surgery in either direction, and that is deliberate:
+         *
+         *   PUBLIC -> PRIVATE: read access is `is_public=1 OR is_member`, so the flag
+         *   alone pins the audience to the people who actually JOINED. Anyone who was
+         *   only browsing loses access, which is what "make it private" means.
+         *
+         *   PRIVATE -> PUBLIC: nobody is added, because membership is a subscription
+         *   (it drives the sidebar and delivery cursors), not permission. Everyone can
+         *   now READ it; the members are still the members.
+         *
+         * The history is untouched either way — a channel's messages have never been
+         * keyed on its visibility, so there is nothing to migrate and nothing that can
+         * be half-migrated. */
+        sqlite3_prepare_v2(db, "UPDATE channels SET is_public=? WHERE id=?;", -1, &st, NULL);
+        sqlite3_bind_int  (st, 1, pub ? 1 : 0);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+        sqlite3_step(st); sqlite3_finalize(st);
+        /* Audited as two distinct actions rather than one "visibility changed": going
+         * public is a disclosure of everything said in there while it was private, and
+         * an audit reader should not have to open the row to see which way it went. */
+        audit_actor(db, OC_AUDIT_ADMIN, pub ? "channel.public" : "channel.private",
+                    j->user_id, 0, NULL, 1, NULL);
     } else if (j->chup_op == OC_CHUP_ARCHIVE || j->chup_op == OC_CHUP_UNARCHIVE) {
         if (!oc_role_can_moderate(role)) {
             r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;

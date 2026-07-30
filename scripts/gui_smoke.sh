@@ -213,6 +213,44 @@ click_pref 1 "$before"; sleep 0.3
 "$DRIVE" key enter >/dev/null 2>&1; sleep 0.5
 expect "$(snap)" time24 "$before" "the run left the setting as it found it"
 
+# --- channel visibility (REQ-031) -------------------------------------------
+# The two directions are not symmetric — private narrows the audience, public
+# discloses the whole history — so both are driven, and the confirm is asserted to
+# be there: this is the one channel action that cannot be undone by repeating it.
+say "== channel visibility"
+"$DRIVE" view 0 >/dev/null 2>&1; sleep 0.4
+"$DRIVE" mkchan smokevis 0 >/dev/null 2>&1; sleep 1.2
+"$DRIVE" channel smokevis >/dev/null 2>&1; "$DRIVE" tab 3 >/dev/null 2>&1; sleep 0.8
+
+click_about() {                    # click_about <field>
+  local r l t rr b
+  r=$(snap | grep -oE "$1=[0-9,.-]+" | head -1 | cut -d= -f2)
+  [ -n "$r" ] || { fail "no $1 rect in the dump"; return 1; }
+  IFS=, read -r l t rr b <<<"$r"
+  [ "${rr%.*}" -gt "${l%.*}" ] || { fail "$1 is not drawn"; return 1; }
+  "$DRIVE" click $(( (${l%.*} + ${rr%.*}) / 2 )) $(( (${t%.*} + ${b%.*}) / 2 )) >/dev/null 2>&1
+}
+
+click_about aboutvis && sleep 0.8
+expect "$(snap)" modal confirm "making a channel public asks first"
+"$DRIVE" key enter >/dev/null 2>&1; sleep 1.2
+checks=$((checks + 1))
+if snap | grep -qE '^  ch [0-9]+ "smokevis".*'; then
+  # The lock is the sidebar's rendering of is_public; the row list carries it.
+  if snap | grep -qE '^  sbrow .*label="smokevis"'; then ok "it is public now (still listed)"
+  else fail "smokevis vanished from the sidebar"; fi
+else fail "no smokevis channel after the flip"; fi
+
+# ... and back. Private is the direction that changes who can READ it, so the
+# channel must still be there for a member afterwards.
+click_about aboutvis && sleep 0.8
+expect "$(snap)" modal confirm "making it private asks too"
+"$DRIVE" key enter >/dev/null 2>&1; sleep 1.2
+checks=$((checks + 1))
+if snap | grep -qE '^  sbrow .*label="smokevis"'; then ok "a member still sees it once private"
+else fail "the channel disappeared for its own member"; fi
+"$DRIVE" tab 0 >/dev/null 2>&1; sleep 0.4
+
 # --- custom emoji (REQ-072) -------------------------------------------------
 # The claim is that the catalogue arrives and a shortcode becomes an IMAGE. The
 # image itself is checked by the thumb cache carrying its attachment id: a

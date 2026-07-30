@@ -416,6 +416,19 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_CHUP_RENAME    1u   /* owner/admin */
 #define OC_CHUP_ARCHIVE   2u   /* owner/admin */
 #define OC_CHUP_UNARCHIVE 3u   /* owner/admin */
+/* Visibility (REQ-031). TWO ops, not one toggle, for the same reason ARCHIVE and
+ * UNARCHIVE are two: a toggle means "flip whatever it is now", so two admins acting
+ * at once flip it twice and land where neither intended. A target state is
+ * idempotent — the second one is a no-op.
+ *
+ * The directions are NOT symmetric, and that asymmetry is the whole design:
+ * PRIVATE only narrows the audience (non-member readers lose access, members keep
+ * it), while PUBLIC retroactively exposes the ENTIRE history of a private channel
+ * to everyone in the workspace. The second is a disclosure you cannot take back by
+ * flipping it again, so the client confirms it in those words and the daemon audits
+ * it as its own action. */
+#define OC_CHUP_PRIVATE   4u   /* owner/admin */
+#define OC_CHUP_PUBLIC    5u   /* owner/admin — see the asymmetry above */
 #define OC_MAX_TOPIC      250u /* bytes; Slack's cap, and a topic is one header line */
 #define OC_MAX_PREVIEW    120u /* bytes of last-message preview in CHANNEL_LIST */
 

@@ -840,6 +840,7 @@ static int g_tab_hover = -1;
 static struct { D2D1_RECT_F r; uint64_t mid; char emoji[40]; uint8_t mine; } g_chips[128];
 static int g_n_chips;
 static D2D1_RECT_F g_about_topic, g_about_rename, g_about_archive, g_about_hooks;
+static D2D1_RECT_F g_about_visibility;
 static struct { D2D1_RECT_F row, dl; int ix; } g_filerows[64];
 static int g_n_filerows;
 static uint64_t g_hover_filerow;
@@ -3702,6 +3703,7 @@ static void draw_keys(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
  * it regardless, so hiding is courtesy, not security. */
 static void draw_about(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
     g_about_topic = g_about_rename = g_about_archive = g_about_hooks = rf(0, 0, 0, 0);
+    g_about_visibility = rf(0, 0, 0, 0);
     const oc_channel *c = oc_model_channel((oc_model *)m, g_sel);
     if (!c) { overlay_empty(rt, reg, "No channel."); return; }
 
@@ -3761,7 +3763,7 @@ static void draw_about(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
         /* Webhooks are channel-scoped admin, so the channel's own settings page
          * is where they belong — they were reachable only from a right-click
          * menu, which is not somewhere anyone looks for configuration. */
-        g_about_hooks = rf(x + 320, y, x + 440, y + 28);
+        g_about_hooks = rf(x + 480, y, x + 600, y + 28);
         stroke_round(rt, g_about_hooks, 6.0f, OC_COL_BORDER, 1.0f);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
         draw_text(rt, "Webhooks\u2026", g_meta, g_about_hooks, OC_COL_MUTED);
@@ -3771,12 +3773,27 @@ static void draw_about(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
         stroke_round(rt, g_about_rename, 6.0f, OC_COL_BORDER, 1.0f);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
         draw_text(rt, "Rename channel\u2026", g_meta, g_about_rename, OC_COL_MUTED);
-        g_about_archive = rf(x + 160, y, x + 310, y + 28);
+        /* Visibility (REQ-031), beside the other two channel-shape actions. */
+        g_about_visibility = rf(x + 160, y, x + 310, y + 28);
+        stroke_round(rt, g_about_visibility, 6.0f, OC_COL_BORDER, 1.0f);
+        draw_text(rt, c->is_public ? "Make private\u2026" : "Make public\u2026", g_meta,
+                  g_about_visibility, OC_COL_MUTED);
+        g_about_archive = rf(x + 320, y, x + 470, y + 28);
         stroke_round(rt, g_about_archive, 6.0f, OC_COL_BORDER, 1.0f);
         draw_text(rt, c->archived ? "Unarchive" : "Archive channel", g_meta,
                   g_about_archive, c->archived ? OC_COL_NOTICE : OC_COL_DANGER);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
         y += 36;
+        /* The visibility line says what the NEXT click would do, and says the
+         * dangerous direction plainly: going public is not "a setting", it is
+         * publishing everything already said in here. */
+        draw_text(rt, c->is_public
+                      ? "Making it private keeps its history for members only; people who never "
+                        "joined lose access."
+                      : "Making it public shows this channel AND ITS WHOLE HISTORY to everyone in "
+                        "the workspace. Flipping it back does not un-show it.",
+                  g_meta_w, rf(x, y, x + w, y + 40), c->is_public ? OC_COL_FAINT : OC_COL_NOTICE);
+        y += 42;
         draw_text(rt, c->archived
                       ? "Unarchiving makes the channel writable again."
                       : "Archiving makes it read-only and hides it from people who are not in it. "
@@ -5560,7 +5577,8 @@ static D2D1_RECT_F g_modal_card;
  * modal frame's generic dispatch can run it without a per-confirmation callback.
  */
 enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVOKE,
-       CONF_CHANNEL_ARCHIVE, CONF_WS_FORGET };
+       CONF_CHANNEL_ARCHIVE, CONF_WS_FORGET,
+       CONF_CHANNEL_PRIVATE, CONF_CHANNEL_PUBLIC };
 
 static void confirm_open(HWND hwnd, int act, uint64_t id, const char *title,
                          const char *body, const char *ok_label) {
@@ -5604,6 +5622,10 @@ static void confirm_run(HWND hwnd) {
         break; }
     case CONF_CHANNEL_ARCHIVE: oc_client_update_channel(g_client, g_confirm_id,
                                                         OC_CHUP_ARCHIVE, ""); break;
+    case CONF_CHANNEL_PRIVATE: oc_client_update_channel(g_client, g_confirm_id,
+                                                        OC_CHUP_PRIVATE, ""); break;
+    case CONF_CHANNEL_PUBLIC:  oc_client_update_channel(g_client, g_confirm_id,
+                                                        OC_CHUP_PUBLIC, ""); break;
     default: break;
     }
     g_confirm_act = CONF_NONE; g_confirm_id = 0;
@@ -9369,6 +9391,27 @@ static int on_click(HWND hwnd, int x, int y) {
             oc_client_webhooks(g_client, g_sel);
             return 1;
         }
+        if (ac && in_rect(g_about_visibility, x, y)) {
+            char t[400];
+            if (ac->is_public) {
+                snprintf(t, sizeof t,
+                         "Make #%s private?\n\nOnly its members will be able to read it. Anyone "
+                         "who was browsing it without joining loses access, and it disappears "
+                         "from the channel directory. Nothing is deleted, and you can make it "
+                         "public again.", ac->name ? ac->name : "");
+                confirm_open(hwnd, CONF_CHANNEL_PRIVATE, g_sel, "Make private?", t, "Make private");
+            } else {
+                /* The dangerous direction gets the danger wording. "You can change it
+                 * back" is true and irrelevant: the history has been read by then. */
+                snprintf(t, sizeof t,
+                         "Make #%s public?\n\nEveryone in this workspace will be able to read it "
+                         "\u2014 INCLUDING EVERYTHING ALREADY SAID IN IT, from before it was "
+                         "public. Making it private again does not undo that.",
+                         ac->name ? ac->name : "");
+                confirm_open(hwnd, CONF_CHANNEL_PUBLIC, g_sel, "Make public?", t, "Make public");
+            }
+            return 1;
+        }
         if (ac && in_rect(g_about_archive, x, y)) {
             if (ac->archived) {
                 oc_client_update_channel(g_client, g_sel, OC_CHUP_UNARCHIVE, "");
@@ -11362,6 +11405,14 @@ static void test_dump(const char *path) {
                 g_ed_box.left, g_ed_box.top, g_ed_box.right, g_ed_box.bottom,
                 g_ed_comp_len, ed8);
     }
+    /* The About tab's admin buttons, so a test can click the one it means rather
+     * than arithmetic that breaks the next time a button is added between them —
+     * which is exactly what adding the visibility button just did. */
+    fprintf(f, "aboutvis=%.0f,%.0f,%.0f,%.0f aboutarch=%.0f,%.0f,%.0f,%.0f\n",
+            g_about_visibility.left, g_about_visibility.top,
+            g_about_visibility.right, g_about_visibility.bottom,
+            g_about_archive.left, g_about_archive.top,
+            g_about_archive.right, g_about_archive.bottom);
     fprintf(f, "cemoji=%zu\n", m->n_cemoji);
     for (size_t i = 0; i < m->n_cemoji; i++)
         fprintf(f, "  cemoji %s attach=%llu\n", m->cemoji[i].name,

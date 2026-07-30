@@ -223,6 +223,19 @@ the requirement says so explicitly rather than implying one.
   path inherits it — send, threaded reply, attachment upload and webhook post all
   return `CHANNEL_ARCHIVED`. Hidden from the channel list for non-members; a
   member keeps it (and the way back). Owner/admin only.
+- **REQ-036a.** A channel's **visibility has been changeable** by an owner/admin —
+  public to private and back — without touching its membership or its history.
+  **Built (2026-07-30, ARCH-93):** two ops (`OC_CHUP_PRIVATE` / `OC_CHUP_PUBLIC`)
+  rather than one toggle, so the request names a target state and two admins acting
+  at once cannot flip it twice. No membership surgery in either direction: read
+  access is already `is_public=1 OR is_member`, so **private** pins the audience to
+  the people who actually joined (browsers lose access, and it leaves the directory),
+  and **public** adds nobody — membership is a subscription, not permission.
+  **The directions are not symmetric, and the product says so.** Private only
+  narrows; public retroactively exposes everything said while the channel was
+  private, which flipping it back does not undo. The client confirms that in those
+  words, and the daemon audits the two as distinct actions so an audit reader can see
+  which way it went without opening the row.
 - **REQ-036.** A channel has been **renamable** by an owner/admin (or the
   channel's creator per a deployment setting), the rename applying everywhere the
   channel is shown without breaking membership, history, or permalinks (REQ-232).
