@@ -305,7 +305,25 @@ Recorded because a defect nobody wrote down is a defect nobody fixes.
   add/remove, and `reaction_is_mine` picks the direction — the menu uses exactly
   that); this is a hit-testing gap in the GUI, not a protocol one.
 
-- **WIN-60 — unreproduced crash while typing.** The client was seen to exit once
+- **WIN-60 — unreproduced crash while typing.** *Now diagnosable, 2026-07-29.*
+  It stayed unreproduced because a crash left **nothing behind** — no dump, no log,
+  no record of what the app was doing — and it happened twice more today while the
+  client was being driven, with "it exited" as the only evidence. That is an
+  anecdote, not a bug report.
+  The client now installs an unhandled-exception filter (`crash_filter`) that
+  writes `crash-<pid>.txt`: exception code, faulting address, module base and the
+  **RVA** between them, read/write and the target address for an access violation,
+  view/DPI/authed state, and the last 64 **breadcrumbs** with ms-before-crash
+  (hook commands, channel switches, clicks, sends, autocomplete accepts, uploads).
+  A minidump is written beside it when dbghelp is present — and the report *says*
+  whether one exists, because a zero-length `.dmp` looks like evidence and is not
+  (the first version produced exactly that). Reports land in the test dir while the
+  harness is driving, `%LOCALAPPDATA%\OpenChime` otherwise.
+  `scripts/crash_resolve.sh <report>` turns the RVA into a file and line;
+  `WIN_CFLAGS` gained `-g` for it. Verified with a deliberate fault behind the test
+  hook (`crashtest`), resolving to the exact line — an untested crash handler is
+  the one piece of code certain to run for the first time at the worst moment.
+  **Still unfixed**; the next occurrence will name itself. Original report: The client was seen to exit once
   during composer input. It has not reproduced since, there is no dump, and the
   build is warning-free, so there is nothing yet to point at. Left open
   deliberately rather than closed as "could not reproduce": the composer is a

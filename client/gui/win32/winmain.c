@@ -26,7 +26,9 @@
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wincodec.h>       /* WIC: decode an inline image from memory (WIN-17) */
+#include <dbghelp.h>        /* MINIDUMP_* types; the function is loaded at run time */
 
+#include <stdarg.h>          /* va_list — the crash breadcrumb ring */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -882,6 +884,123 @@ static void toast_tick(const oc_model *m) {
  * and screenshot the client from WSL/CI without screen-scraping. */
 static char g_test_dir[512];
 
+/* ---- crash diagnosis (WIN-60) --------------------------------------------- */
+
+/*
+ * WIN-60 has sat in the backlog as "unreproduced crash while typing" because a
+ * crash left nothing behind: no dump, no log, no idea what the app was doing. It
+ * happened twice more on 2026-07-29 while the client was being driven, and both
+ * times all I could say was "it exited" — which is not a bug report, it is an
+ * anecdote.
+ *
+ * So: a breadcrumb ring plus an unhandled-exception filter that writes a **text**
+ * report. A minidump is written too, when dbghelp is present, but the text file is
+ * the part that helps here — a .dmp needs a debugger on Windows, while the text
+ * lands somewhere WSL can read it immediately.
+ *
+ * The ring is deliberately dumb: fixed storage, no allocation, no locks. A crash
+ * handler that allocates can fault inside the fault, and a heap corruption is
+ * exactly the kind of bug this is trying to catch.
+ */
+#define OC_CRUMBS 64
+typedef struct { char text[96]; DWORD tick; } oc_crumb;
+static oc_crumb g_crumbs[OC_CRUMBS];
+static volatile LONG g_crumb_n;          /* monotonic; index = n % OC_CRUMBS */
+
+static void crumb(const char *fmt, ...) {
+    LONG slot = InterlockedIncrement(&g_crumb_n) - 1;
+    oc_crumb *c = &g_crumbs[slot % OC_CRUMBS];
+    va_list ap; va_start(ap, fmt);
+    _vsnprintf(c->text, sizeof c->text - 1, fmt, ap);
+    va_end(ap);
+    c->text[sizeof c->text - 1] = 0;
+    c->tick = GetTickCount();
+}
+
+/* Where a crash report goes. The test dir when the harness is driving, because
+ * then I can read it without going near the Windows file system by hand;
+ * %LOCALAPPDATA% for a real user. */
+static void crash_dir(char *out, size_t cap) {
+    if (g_test_dir[0]) { snprintf(out, cap, "%s", g_test_dir); return; }
+    const char *base = getenv("LOCALAPPDATA");
+    if (!base || !base[0]) base = getenv("TEMP");
+    snprintf(out, cap, "%s\\OpenChime", base ? base : ".");
+    CreateDirectoryA(out, NULL);
+}
+
+typedef BOOL (WINAPI *mdwd_fn)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
+                               const MINIDUMP_EXCEPTION_INFORMATION *, void *, void *);
+
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
+    char dir[600]; crash_dir(dir, sizeof dir);
+    DWORD pid = GetCurrentProcessId();
+
+    char txt[700]; snprintf(txt, sizeof txt, "%s\\crash-%lu.txt", dir, (unsigned long)pid);
+    FILE *f = fopen(txt, "wb");
+    if (f) {
+        EXCEPTION_RECORD *er = ep && ep->ExceptionRecord ? ep->ExceptionRecord : NULL;
+        void *base = (void *)GetModuleHandleW(NULL);
+        void *addr = er ? er->ExceptionAddress : NULL;
+        fprintf(f, "openchime crash\n");
+        fprintf(f, "code=0x%08lx addr=%p module=%p rva=0x%llx\n",
+                er ? (unsigned long)er->ExceptionCode : 0, addr, base,
+                (addr && base) ? (unsigned long long)((char *)addr - (char *)base) : 0ull);
+        /* An access violation says which address and whether it was a read or a
+         * write — often enough on its own to name the pointer. */
+        if (er && er->ExceptionCode == (DWORD)EXCEPTION_ACCESS_VIOLATION &&
+            er->NumberParameters >= 2)
+            fprintf(f, "access=%s at 0x%llx\n",
+                    er->ExceptionInformation[0] == 0 ? "read" :
+                    er->ExceptionInformation[0] == 1 ? "write" : "execute",
+                    (unsigned long long)er->ExceptionInformation[1]);
+        fprintf(f, "view=%d dpi=%u authed=%d\n", g_view, g_dpi,
+                g_client && oc_client_model(g_client) ? oc_client_model(g_client)->authed : 0);
+
+        /* The breadcrumbs, oldest first, with ms before the crash — the answer to
+         * "what was it doing", which is the question a bare stack cannot answer. */
+        LONG total = g_crumb_n;
+        LONG first = total > OC_CRUMBS ? total - OC_CRUMBS : 0;
+        DWORD now = GetTickCount();
+        fprintf(f, "-- last %ld of %ld breadcrumbs --\n", total - first, total);
+        for (LONG i = first; i < total; i++) {
+            oc_crumb *c = &g_crumbs[i % OC_CRUMBS];
+            fprintf(f, "  -%5lums %s\n", (unsigned long)(now - c->tick), c->text);
+        }
+        /* The dump is attempted here, while the report is still open, so the
+         * report can say whether one exists. A zero-length .dmp sitting beside a
+         * crash log is worse than no file: it looks like evidence. */
+        HMODULE dbg = LoadLibraryW(L"dbghelp.dll");
+        int dumped = 0; DWORD dump_err = 0;
+        char dmp[700]; snprintf(dmp, sizeof dmp, "%s\\crash-%lu.dmp", dir, (unsigned long)pid);
+        if (dbg) {
+            mdwd_fn mdwd = (mdwd_fn)(void *)GetProcAddress(dbg, "MiniDumpWriteDump");
+            if (mdwd) {
+                HANDLE h = CreateFileA(dmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                                       FILE_ATTRIBUTE_NORMAL, NULL);
+                if (h != INVALID_HANDLE_VALUE) {
+                    MINIDUMP_EXCEPTION_INFORMATION mei;
+                    mei.ThreadId = GetCurrentThreadId();
+                    mei.ExceptionPointers = ep;
+                    mei.ClientPointers = FALSE;
+                    dumped = mdwd(GetCurrentProcess(), pid, h,
+                                  MiniDumpWithIndirectlyReferencedMemory |
+                                  MiniDumpWithDataSegs | MiniDumpWithHandleData,
+                                  &mei, NULL, NULL) ? 1 : 0;
+                    if (!dumped) dump_err = GetLastError();
+                    CloseHandle(h);
+                }
+            } else dump_err = GetLastError();
+        } else dump_err = GetLastError();
+        if (!dumped) { DeleteFileA(dmp); fprintf(f, "minidump: FAILED (err=%lu)\n", (unsigned long)dump_err); }
+        else         fprintf(f, "minidump: %s\n", dmp);
+        fclose(f);
+    }
+
+    /* Let the process die: swallowing the fault would leave a client running on
+     * corrupt state, which is worse than an exit the user can see. */
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 /* ---- small helpers ------------------------------------------------------- */
 
 static D2D1_COLOR_F col(uint32_t rgb) {
@@ -1311,6 +1430,7 @@ static void draft_restore(uint64_t cid) {
 
 static void select_channel(uint64_t cid) {
     if (!g_client || !cid) return;
+    crumb("select_channel %llu", (unsigned long long)cid);
     if (g_sel && g_sel != cid) draft_save(g_sel);
     close_overlays();
     g_has_sel = 0;                       /* drop any transcript text selection */
@@ -5183,6 +5303,7 @@ static void ac_rebuild(void) {
 /* Replace the trailing token with the selected candidate, plus a trailing space
  * so the next word starts cleanly. */
 static void ac_accept(void) {
+    crumb("ac_accept sel=%d n=%d", g_ac_sel, g_n_ac);
     if (g_n_ac <= 0 || !g_re) return;
     WCHAR buf[4096]; int ts = 0;
     int caret = ac_token_range(buf, 4096, &ts);
@@ -5199,6 +5320,7 @@ static void ac_accept(void) {
 }
 
 static void composer_send(void) {
+    crumb("composer_send ch=%llu", (unsigned long long)g_sel);
     if (!g_re || !g_client || !g_sel) return;
     /* Refuse locally in an archived channel so the text is not lost to a server
      * rejection you have to read in a toast (REQ-035). The daemon refuses it
@@ -5917,6 +6039,7 @@ static WCHAR *wmenu(const char *utf8, WCHAR *buf, int cap) { to_w(utf8, buf, cap
 
 /* Pick a local file and upload it to the selected channel. */
 static void upload_file(HWND hwnd) {
+    crumb("upload_file");
     if (!g_client || !g_sel) return;
     WCHAR file[MAX_PATH]; file[0] = 0;
     OPENFILENAMEW ofn; ZeroMemory(&ofn, sizeof ofn);
@@ -6138,6 +6261,7 @@ static int files_click(HWND hwnd, int x, int y) {
 }
 
 static int on_click(HWND hwnd, int x, int y) {
+    crumb("click %d %d view=%d", x, y, g_view);
     /* A modal owns the window while it is up: a click outside the card dismisses
      * it, and nothing behind it is reachable. Tested first for that reason. */
     if (modal_open() && !in_rect(g_modal_card, (float)x, (float)y)) {
@@ -8223,9 +8347,17 @@ static void test_poll(HWND hwnd) {
     while (buf[i] && buf[i] != ' ' && i < sizeof verb - 1) { verb[i] = buf[i]; i++; }
     verb[i] = 0;
     const char *arg = (buf[i] == ' ') ? buf + i + 1 : "";
+    crumb("hook %s %.40s", verb, arg);
     const oc_model *m = model();
 
-    if (!strcmp(verb, "shot")) {
+    if (!strcmp(verb, "crashtest")) {
+        /* Prove the crash path works. An untested crash handler is the one piece
+         * of code guaranteed to be exercised for the first time at the worst
+         * possible moment. Only reachable via the hook. */
+        test_ack("ok");
+        crumb("crashtest — deliberate fault");
+        *(volatile int *)0 = 1;
+    } else if (!strcmp(verb, "shot")) {
         test_ack(test_shot(hwnd, arg) ? "ok" : "err");
     } else if (!strcmp(verb, "send")) {
         if (g_re) { WCHAR w[1024]; to_w(arg, w, 1024); SetWindowTextW(g_re, w); composer_send(); }
@@ -9067,6 +9199,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     (void)prev; (void)cmdline;
+
+    /* Before anything else, so a crash during startup is reported too. */
+    SetUnhandledExceptionFilter(crash_filter);
+    crumb("start");
 
     /* Automation hook: OPENCHIME_TEST_DIR enables the file command channel. */
     { const char *td = getenv("OPENCHIME_TEST_DIR");

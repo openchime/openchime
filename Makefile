@@ -158,7 +158,10 @@ WIN_MBEDLIBS := $(MBEDTLS_WIN)/library/libmbedtls.a \
                 $(MBEDTLS_WIN)/library/libmbedx509.a \
                 $(MBEDTLS_WIN)/library/libmbedcrypto.a
 WIN_TUI_BIN := build/openchime-tui.exe
-WIN_CFLAGS := -std=c99 -Wall -Wextra -O2 -D_WIN32_WINNT=0x0601 -DUTF8PROC_STATIC
+# -g: debug info, so a crash RVA from the report (see crash_filter) resolves to a
+# file and line via addr2line. Without it the report can only say "somewhere in
+# winmain.c", which is not a lead. No runtime cost; strip on release if size matters.
+WIN_CFLAGS := -std=c99 -Wall -Wextra -O2 -g -D_WIN32_WINNT=0x0601 -DUTF8PROC_STATIC
 WIN_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
            $(CORE_INC) -Iclient/tui -Iclient/shared -Ituikit -Ithird_party/termbox2 -Ithird_party/utf8proc
 
