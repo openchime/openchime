@@ -335,7 +335,9 @@ build order lives in that document's §5 and the [CLIENT.md](./CLIENT.md) §8 ro
 | 251 audit log | ✅ | **Built** (ARCH-79, migration 0016): four families — admin, account, security, moderation — recorded on the writer, read via `AUDIT_QUERY`/`AUDIT_PAGE` (0x0099/0x009A) and the TUI's Audit log action (Ctrl+K → Audit log), owner/admin gated against the user's *current* role. Never records the secret involved. Verified live: role change, invite, and password change all appear with the acting user, and a member promoted mid-session immediately gains access. |
 | 251a bounded audit log | ✅ | Aged out by the ARCH-78 maintenance pass, `OPENCHIME_AUDIT_MAX_DAYS` (default 365). |
 | 251b per-family cap | ✅ | **The cap is applied per family**, so a flood of attacker-controlled `auth.failed` entries cannot age out administrative history — without this the audit log becomes an evidence-shredder. Rate-limited attempts are dropped silently rather than audited, so a throttled spray produces no rows at all. Regression-tested with a 200-entry security flood against a surviving admin entry. |
-| 252 legal hold + export | ⛔ | Forward scope; `[needs ARCH decision]`. |
+| 252 legal hold | ⛔ | Narrowed 2026-07-30: export → REQ-276, DLP → REQ-277. `[needs ARCH decision]`. |
+| 276 compliance capture API (Discovery) | ⛔ | Scoped 2026-07-30. Read-only tenant-wide capture incl. edits/deletes, integration credential, keyset cursor. Open: Slack `discovery.*` wire-compat vs our own shape. `[needs ARCH decision]`. |
+| 277 DLP write-back (tombstone) | ⛔ | Scoped 2026-07-30. First path where a non-human mutates someone else's message; tombstone must hold in every view. `[needs ARCH decision]`. |
 | 253 SCIM provisioning | ⛔ | Federated function (ARCH-76); central-service concern. |
 
 ---

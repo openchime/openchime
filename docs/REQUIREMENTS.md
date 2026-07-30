@@ -1142,11 +1142,69 @@ None are yet backed by an architecture decision.*
   aged out against its own budget, and administrative history has survived a
   flood of security noise.
 - **REQ-252.** A tenant subject to legal/compliance obligations has been able to
-  place a **legal hold** and **export** message history (including DMs, subject to
-  authorization policy) for eDiscovery, and to apply data-loss-prevention scanning
-  to content. This is an enterprise concern and **may be explicitly out of scope**
-  for the self-hosted/small-team target. **[needs ARCH decision — export/hold
-  model, or a decision to exclude it.]**
+  place a **legal hold** on message history (including DMs, subject to
+  authorization policy), suspending retention (REQ-250) for the held scope.
+  **Narrowed 2026-07-30:** the *export* and *DLP* halves of this requirement are
+  now REQ-276 and REQ-277, because they are different features with different
+  risk — one reads, the other writes to other people's messages — and carrying
+  them as one line hid that. Legal hold stays here.
+  **[needs ARCH decision — hold model and its interaction with retention.]**
+
+- **REQ-276.** A tenant has been able to **capture its history through a
+  compliance API** — an authenticated, read-only interface returning messages,
+  threads, files, channels and users across the whole tenant, including **edits and
+  deletions** where retention preserved them, so an eDiscovery or archiving system
+  can hold a faithful record without a human exporting files by hand. Modelled on
+  Slack's Discovery API, which is the interface every vendor connector in this
+  space already speaks.
+
+  **Constraints that follow from the rest of this product:**
+
+  - **The caller is not a person.** A compliance exporter is an integration, so it
+    authenticates with an owner-minted, **scoped, revocable, audited** credential —
+    never a user session. Reusing a session would give an archiver every
+    user-facing operation as well, and would die whenever that owner signed out
+    everywhere (REQ-182).
+  - **Paging is a keyset cursor**, not an offset — the same reasoning as search
+    (WIN-38): a message posted mid-export must not make a row repeat or vanish.
+  - **DMs and private channels are the point and the danger.** Including them is
+    what makes it a compliance tool; it is therefore a deliberate, separately
+    audited act, not a side effect of holding a token.
+  - **The self-hosted operator already has the database.** For them this API is a
+    convenience over a documented read path; it earns its keep in the hosted model
+    (ARCH-76), where they do not, and wherever a vendor connector is the actual
+    requirement.
+
+  **[needs ARCH decision — (a) wire-compatible with Slack's `discovery.*` URLs and
+  JSON envelope so an existing connector works unmodified, versus our own shape;
+  (b) where it is served: the daemon's existing admin/health HTTP listener is the
+  obvious host, and it is a second surface next to the binary protocol either way;
+  (c) the integration-credential model, which nothing in the product has yet.]**
+
+- **REQ-277.** A tenant has been able to let an approved **DLP integration act on
+  content** — redacting a message or file **in place**, leaving a tombstone that
+  says a policy removed it, restorable within a retention window. Distinct from a
+  user deleting their own message (REQ-058): a different actor, a different audit
+  family, and a different reversibility.
+
+  **What makes this bigger than the API it rides on:** it is the first write path
+  in the product where a **non-human mutates somebody else's message**. Three
+  consequences, all of which are the work rather than incidental to it:
+
+  - **A tombstone must be visible everywhere the content was** — transcript,
+    thread, search results, pins, saved items, the file list and any export. A
+    redaction that only takes effect in the view the redactor was looking at is not
+    a redaction, and the daemon already learned this lesson once with archived
+    channels (REQ-035): enforce it where every path passes.
+  - **The actor is a policy, not a user.** The audit row has to name the
+    integration, and the client has to be able to say "removed by your
+    organisation's policy" rather than attributing it to whoever installed the app.
+  - **It is destructive and remotely triggered**, so the scope that permits it is
+    separate from the read scope of REQ-276 and is refused by default.
+
+  **[needs ARCH decision — tombstone representation (reuse `deleted_at_ms` plus a
+  reason, or a distinct state), the restore window, and whether this is offered at
+  all for the self-hosted target.]**
 - **REQ-253.** In OIDC/enterprise deployments, user provisioning and
   deprovisioning have been automatable via **SCIM** from the organization's
   identity provider, so account lifecycle matched the directory. Like OIDC this
