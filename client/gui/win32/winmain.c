@@ -595,6 +595,11 @@ static int g_n_searchrows;
  * usually still in flight when the click lands — `g_jump_deadline` is what turns
  * "not loaded yet" into an honest failure instead of a silent no-op. */
 static uint64_t  g_jump_mid;            /* message to scroll to, 0 = none */
+/* Forwarding (REQ-057, WIN-51): the message chosen in the kebab, waiting for a
+ * destination. The palette picks the destination — it already lists every
+ * conversation, so a forward needs no new picker. */
+static uint64_t  g_fwd_mid, g_fwd_cid;
+static int       g_pal_accepting;      /* inside palette_accept: see palette_close */
 static uint64_t  g_jump_fetched;        /* the id we already fetched around, so we ask once */
 static ULONGLONG g_jump_deadline;       /* GetTickCount64 by which it must appear */
 static uint64_t  g_flash_mid;           /* message to tint */
@@ -716,12 +721,28 @@ static struct { float top, bot; int act; } g_moreflyrows[8];
 static int g_n_moreflyrows;
 
 /* ---- custom D2D dropdown menus (workspace / profile / new / switcher) -------
- * One reusable floating menu replaces the old TrackPopupMenu. An opener fills
+ * One reusable floating menu. As of WIN-79 this is EVERY menu in the client — the
+ * four native context popups are gone, so the claim this comment used to make is
+ * finally true. An opener fills
  * g_mi[] + anchor; draw_menu() renders it last so it floats; on_click routes to
  * menu_dispatch(). Item kinds: ITEM (icon+label+cmd), SECTION (faint header),
  * SEP. MENU_WS/MENU_SWITCHER also draw a workspace header block on top. */
-enum { MENU_NONE = 0, MENU_WS, MENU_PROFILE, MENU_NEW, MENU_SWITCHER, MENU_SECTION };
-enum { MK_ITEM = 0, MK_SECTION, MK_SEP };
+/* MENU_MSG..MENU_THUMB are the CONTEXT menus (WIN-79, ARCH-98). They were native
+ * TrackPopupMenu popups, which meant: OS-themed rather than ours, a modal message
+ * loop that froze our tick and blocked the message-loop shortcuts, and — the part
+ * that mattered most — completely undrivable and unscreenshottable by the harness,
+ * so every context action was unverifiable except by hand.
+ *
+ * They keep their OWN command numbers, dispatched per kind, because the dropdown
+ * menus' `menu_dispatch` space is already crowded (1-8, 20-22, 40s, 70s, 100+,
+ * 200+, 900+) and a message's "Edit = 21" would have collided with a notification
+ * level. `g_menu_target` carries what the menu is about. */
+enum { MENU_NONE = 0, MENU_WS, MENU_PROFILE, MENU_NEW, MENU_SWITCHER, MENU_SECTION,
+       MENU_MSG, MENU_MEMBER, MENU_CHANNEL, MENU_THUMB };
+/* MK_EMOJIROW is one row holding the quick reactions side by side, each its own
+ * hit-box. The native menu had them as a submenu; the custom menu has no submenus,
+ * and six separate rows would bury the rest of the message actions. */
+enum { MK_ITEM = 0, MK_SECTION, MK_SEP, MK_EMOJIROW };
 struct menuitem { int kind, cmd, icon, danger; char label[72]; };
 static int   g_menu;                     /* which menu is open (MENU_NONE = none) */
 static struct menuitem g_mi[28];
@@ -729,6 +750,10 @@ static int   g_n_mi;
 static float g_menu_x, g_menu_y, g_menu_w;   /* panel top-left + width */
 static int   g_menu_hover = -1;              /* hovered item index */
 static int   g_menu_headerblock;             /* draw the workspace header on top */
+static uint64_t g_menu_target;               /* what a context menu is about */
+static uint64_t g_menu_target2;             /* its channel, for a message */
+static D2D1_RECT_F g_menu_emoji[8];         /* per-glyph hit-boxes in MK_EMOJIROW */
+static int   g_n_menu_emoji;
 static struct { float top, bot; int cmd; } g_mirows[28];
 static int   g_n_mirows;
 /* Workspace switcher list (built from the store book at open time). */
@@ -1701,6 +1726,7 @@ static void mi_add(int kind, int cmd, const char *label, int danger) {
 #define mi_item_d(cmd, label)  mi_add(MK_ITEM, (cmd), (label), 1)
 #define mi_section(label)      mi_add(MK_SECTION, 0, (label), 0)
 #define mi_sep()               mi_add(MK_SEP, 0, NULL, 0)
+#define mi_emojirow()          mi_add(MK_EMOJIROW, 0, NULL, 0)
 
 /* Workspace display name, or the host's leading label as a fallback. */
 static void ws_display_name(const oc_model *m, char *out, size_t cap) {
@@ -1721,7 +1747,10 @@ static void ws_mode_line(const oc_model *m, char *out, size_t cap) {
     else        snprintf(out, cap, "%s", cap_dn);
 }
 
-static float menu_item_h(int kind) { return kind == MK_ITEM ? 36.0f : kind == MK_SECTION ? 24.0f : 11.0f; }
+static float menu_item_h(int kind) {
+    return kind == MK_ITEM ? 36.0f : kind == MK_SECTION ? 24.0f
+         : kind == MK_EMOJIROW ? 40.0f : 11.0f;
+}
 
 static void draw_menu(ID2D1RenderTarget *rt) {
     g_n_mirows = 0;
@@ -1774,6 +1803,20 @@ static void draw_menu(ID2D1RenderTarget *rt) {
             fill(rt, rf(x + 10, cy + ih / 2, panel.right - 10, cy + ih / 2 + 1), OC_COL_BORDER);
         } else if (g_mi[i].kind == MK_SECTION) {
             draw_text(rt, g_mi[i].label, g_meta, rf(x + 16, cy + 5, panel.right - 10, cy + ih), OC_COL_FAINT);
+        } else if (g_mi[i].kind == MK_EMOJIROW) {
+            /* The quick reactions, one row, each glyph its own target. Colour font
+             * on, like the picker and the chips — the same character must not look
+             * different in two places. */
+            g_n_menu_emoji = 0;
+            float ex = x + 12;
+            for (int k = 0; k < g_n_quick && k < 8; k++) {
+                D2D1_RECT_F cell = rf(ex, cy + 4, ex + 32, cy + 36);
+                if (in_rect(cell, g_mouse_x, g_mouse_y))
+                    fill_round(rt, cell, 7.0f, OC_COL_HOVER);
+                draw_emoji_fmt(rt, REACT_EMO[k], cell, g_emoji_s);
+                g_menu_emoji[g_n_menu_emoji++] = cell;
+                ex = cell.right + 2;
+            }
         } else {
             if (g_menu_hover == i)
                 fill_round(rt, rf(x + 5, cy + 2, panel.right - 5, cy + ih - 2), 7.0f, OC_COL_HOVER);
@@ -4267,7 +4310,12 @@ static void draw_palette(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
     /* Collect matches first so the panel can be sized to them. */
     struct { const char *label, *kind; int cmd; uint64_t cid; } hit[12];
     int nh = 0;
-    for (size_t i = 0; i < sizeof PALETTE / sizeof PALETTE[0] && nh < 12; i++)
+    /* While a forward is pending the palette is a DESTINATION picker, so the action
+     * rows are left out entirely (WIN-51). They were listed first, which put "Create
+     * a channel" under the selection — and choosing an action mid-forward can only
+     * cancel it. A list whose top item undoes the thing you started is worse than a
+     * shorter list. */
+    for (size_t i = 0; !g_fwd_mid && i < sizeof PALETTE / sizeof PALETTE[0] && nh < 12; i++)
         if (pal_match(PALETTE[i].label, q)) {
             hit[nh].label = PALETTE[i].label; hit[nh].kind = "Action";
             hit[nh].cmd = PALETTE[i].cmd; hit[nh].cid = 0; nh++;
@@ -4276,14 +4324,17 @@ static void draw_palette(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
     if (m) for (size_t i = 0; i < m->n_channels && nh < 12; i++) {
         channel_label(m, &m->channels[i], names[nh], sizeof names[nh]);
         if (!pal_match(names[nh], q)) continue;
-        hit[nh].label = names[nh]; hit[nh].kind = "Go to";
+        hit[nh].label = names[nh]; hit[nh].kind = g_fwd_mid ? "Forward to" : "Go to";
         hit[nh].cmd = 0; hit[nh].cid = m->channels[i].channel_id; nh++;
     }
     if (nh > (int)maxrows) nh = (int)maxrows;
     if (g_pal_sel >= nh) g_pal_sel = nh ? nh - 1 : 0;
     if (g_pal_sel < 0) g_pal_sel = 0;
 
-    float ph = 58 + (nh ? nh * rowh : rowh) + 10;
+    /* The mode label needs its own band, or it collides with the first row — which
+     * it did. Panel height and row origin both account for it. */
+    float hint_h = g_fwd_mid ? 18.0f : 0.0f;
+    float ph = 58 + hint_h + (nh ? nh * rowh : rowh) + 10;
     g_pal_panel = rf(px, py, px + pw, py + ph);
     fill_round(rt, rf(px + 3, py + 5, px + pw + 3, py + ph + 5), 12.0f, 0x000000);
     fill_round(rt, g_pal_panel, 12.0f, OC_COL_INPUT);
@@ -4291,12 +4342,18 @@ static void draw_palette(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
 
     g_pal_box = rf(px + 12, py + 12, px + pw - 12, py + 46);
     fill_round(rt, g_pal_box, 7.0f, OC_COL_BASE);
+    /* Name the mode: the same panel means two things now, and a picker that does
+     * not say which is a trap. */
+    if (g_fwd_mid)
+        draw_text(rt, "Forward to\u2026", g_meta,
+                  rf(px + 16, py + 50, px + pw - 12, py + 68), OC_COL_ACCENT);
     draw_lucide(rt, OC_ICON_SEARCH, rf(g_pal_box.left + 9, g_pal_box.top + 9,
                                        g_pal_box.left + 25, g_pal_box.top + 25), OC_COL_MUTED);
 
-    float y = py + 54;
+    float y = py + 54 + hint_h;
     if (nh == 0) {
-        draw_text(rt, "No matching action or conversation.", g_ui,
+        draw_text(rt, g_fwd_mid ? "No matching conversation to forward to."
+                                : "No matching action or conversation.", g_ui,
                   rf(px + 20, y, px + pw - 20, y + rowh), OC_COL_FAINT);
         return;
     }
@@ -6357,6 +6414,9 @@ static void search_create(HWND parent) {
 static void menu_dispatch(HWND hwnd, int cmd);   /* fwd */
 
 static void palette_close(HWND hwnd) {
+    /* Dismissing the picker cancels the forward. Leaving g_fwd_mid set would turn
+     * the NEXT palette open — a plain jump-to — into a silent forward. */
+    if (g_fwd_mid && !g_pal_accepting) { g_fwd_mid = g_fwd_cid = 0; }
     g_pal_open = 0; g_pal_sel = 0;
     if (g_pal_edit) ShowWindow(g_pal_edit, SW_HIDE);
     if (g_re) SetFocus(g_re);
@@ -6375,9 +6435,11 @@ static void palette_open(HWND hwnd) {
 
 /* Run the highlighted row. Closing FIRST matters: several commands open a modal
  * form, and the palette must not still be on screen behind it. */
-static int permalink_follow(HWND hwnd, const char *text);   /* fwd (WIN-44) */
+static int  permalink_follow(HWND hwnd, const char *text);   /* fwd (WIN-44) */
+static void forward_send(HWND hwnd, uint64_t to_cid);        /* fwd (WIN-51) */
 
 static void palette_accept(HWND hwnd) {
+    g_pal_accepting = 1;
     /* A pasted permalink is accepted here rather than in the composer, and that is
      * the deliberate half of WIN-44: pasting a link into the message box must keep
      * INSERTING it, because sharing a link is the common case. The palette is the
@@ -6387,17 +6449,28 @@ static void palette_accept(HWND hwnd) {
         if (g_pal_edit) { WCHAR w[512]; GetWindowTextW(g_pal_edit, w, 512);
                           WideCharToMultiByte(CP_UTF8, 0, w, -1, q, sizeof q, NULL, NULL); }
         if (q[0] && !strncmp(q, "openchime://", 12)) {
+            g_pal_accepting = 0;
             palette_close(hwnd);
             permalink_follow(hwnd, q);
             return;
         }
     }
-    if (g_pal_sel < 0 || g_pal_sel >= g_n_pal_rows) { palette_close(hwnd); return; }
+    if (g_pal_sel < 0 || g_pal_sel >= g_n_pal_rows) { g_pal_accepting = 0; palette_close(hwnd); return; }
     int cmd = g_pal_rows[g_pal_sel].cmd;
     uint64_t cid = g_pal_rows[g_pal_sel].cid;
     palette_close(hwnd);
+    /* A pending forward makes the next conversation choice a destination rather
+     * than a navigation (WIN-51). Command rows are ignored while forwarding — a
+     * half-finished forward should not run "Upload a file…". */
+    if (g_fwd_mid) {
+        if (cid) forward_send(hwnd, cid);
+        else     { g_fwd_mid = g_fwd_cid = 0; toast_push("Forward cancelled.", 0); }
+        g_pal_accepting = 0;
+        return;
+    }
     if (cid) { g_view = VIEW_HOME; close_overlays(); select_channel(cid); }
     else if (cmd) menu_dispatch(hwnd, cmd);
+    g_pal_accepting = 0;
 }
 
 static LRESULT CALLBACK pal_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -6693,7 +6766,6 @@ static void download_attachment(HWND hwnd, const oc_attachment *a) {
     }
 }
 
-static WCHAR *wmenu(const char *utf8, WCHAR *buf, int cap) { to_w(utf8, buf, cap); return buf; }
 
 /* Pick a local file and upload it to the selected channel. */
 static void upload_file(HWND hwnd) {
@@ -6713,7 +6785,14 @@ static void upload_file(HWND hwnd) {
     }
 }
 
-static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, int sy) {
+/* The message context menu (WIN-79). Built into the app's own floating menu — see
+ * the MENU_* comment for why it stopped being a TrackPopupMenu.
+ *
+ * `cx`/`cy` are CLIENT DIPs, not screen pixels: the custom menu is drawn by us, in
+ * our own coordinate space. The native version needed ClientToScreen; passing those
+ * screen coordinates here would put the menu wherever the window happens to sit. */
+static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, float cx, float cy) {
+    (void)hwnd;
     const oc_channel *c = oc_model_channel((oc_model *)m, g_sel);
     const oc_msg *msg = find_msg(c, mid);
     /* A thread reply is not in the channel's message list, so look there too —
@@ -6727,47 +6806,84 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
             }
     }
     if (!msg) return;
-    WCHAR wb[128];
-    HMENU menu = CreatePopupMenu();
-    /* The six quick reactions stay inline as one-click affordances, with the
-     * full catalogue behind "More…" (WIN-8) rather than being the only choice. */
-    HMENU react = CreatePopupMenu();
-    for (int i = 0; i < g_n_quick; i++)
-        AppendMenuW(react, MF_STRING, (UINT_PTR)(1 + i), wmenu(REACT_EMO[i], wb, 128));
-    AppendMenuW(react, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(react, MF_STRING, 7, L"More\u2026");
-    AppendMenuW(menu, MF_POPUP, (UINT_PTR)react, L"React");
+
+    g_n_mi = 0;
+    if (g_n_quick > 0) { mi_emojirow(); mi_item(7, "More reactions\u2026"); mi_sep(); }
     for (int i = 0; i < msg->n_attach; i++) {
         char lbl[200];
         snprintf(lbl, sizeof lbl, "Download %s", msg->attach[i].filename);
-        AppendMenuW(menu, MF_STRING | (msg->attach[i].reclaimed ? MF_GRAYED : 0),
-                    (UINT_PTR)(30 + i), wmenu(lbl, wb, 128));
+        /* A reclaimed blob cannot be downloaded (REQ-215), and a dead entry is worse
+         * than none — the native menu greyed it; we omit it and say why. */
+        if (msg->attach[i].reclaimed) snprintf(lbl, sizeof lbl, "%s \u2014 no longer stored",
+                                               msg->attach[i].filename);
+        mi_item(msg->attach[i].reclaimed ? 0 : 30 + i, lbl);
     }
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    if (msg->n_attach) mi_sep();
     /* No nested threads (REQ-060), so a reply offers no thread item. */
     if (!msg->deleted && !is_reply)
-        AppendMenuW(menu, MF_STRING, 100, msg->reply_count ? L"Open thread" : L"Reply in thread");
-    if (msg->n_reactions) AppendMenuW(menu, MF_STRING, 102, L"Who reacted");
-    /* A pin belongs to the channel, so this reads the same for everyone —
-     * anyone may unpin, including someone else's pin (ARCH-90). A tombstone has
-     * nothing to pin to. */
-    if (!msg->deleted)
-        AppendMenuW(menu, MF_STRING, 103,
-                    msg->pinned ? L"Unpin from channel" : L"Pin to channel");
-    AppendMenuW(menu, MF_STRING, 105, L"Copy link");
-    AppendMenuW(menu, MF_STRING, 104, L"Save for later");
-    AppendMenuW(menu, MF_STRING, 20, L"Copy text");
+        mi_item(100, msg->reply_count ? "Open thread" : "Reply in thread");
+    if (msg->n_reactions) mi_item(102, "Who reacted");
+    /* A pin belongs to the channel, so this reads the same for everyone — anyone
+     * may unpin, including someone else's pin (ARCH-90). */
+    if (!msg->deleted) mi_item(103, msg->pinned ? "Unpin from channel" : "Pin to channel");
+    mi_item(106, "Forward\u2026");
+    mi_item(105, "Copy link");
+    mi_item(104, "Save for later");
+    mi_item(20,  "Copy text");
     int own = (msg->author_id == m->user_id);
     int canmod = own || self_role(m) >= OC_ROLE_ADMIN;
-    if (own && !msg->deleted)    AppendMenuW(menu, MF_STRING, 21, L"Edit");
-    if (canmod && !msg->deleted) AppendMenuW(menu, MF_STRING, 22, L"Delete");
+    if ((own || canmod) && !msg->deleted) mi_sep();
+    if (own && !msg->deleted)    mi_item(21, "Edit");
+    if (canmod && !msg->deleted) mi_item_d(22, "Delete");
 
-    int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, sx, sy, 0, hwnd, NULL);
-    DestroyMenu(menu);
-    if (cmd >= 1 && cmd <= g_n_quick) {
-        const char *e = REACT_EMO[cmd - 1];
-        oc_client_react(g_client, chan, mid, e, reaction_is_mine(msg, e) ? 0 : 1);
-    } else if (cmd == 7) {
+    g_menu = MENU_MSG; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 248;
+    g_menu_target = mid; g_menu_target2 = chan;
+    g_menu_x = cx; g_menu_y = cy;
+    /* Keep it on screen: a menu opened near the bottom used to run off it. */
+    {
+        float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
+        RECT rc; GetClientRect(hwnd, &rc);
+        float H = DIPF(rc.bottom), W = DIPF(rc.right);
+        if (g_menu_y + h > H - 8) g_menu_y = H - 8 - h;
+        if (g_menu_y < 8) g_menu_y = 8;
+        if (g_menu_x + g_menu_w > W - 8) g_menu_x = W - 8 - g_menu_w;
+    }
+}
+
+/* Run a message-menu command against g_menu_target. Split from the builder because
+ * the custom menu returns through the click router, not from a blocking call. */
+/* The thumbnail kebab's actions. `g_menu_target` is the attachment id; the entry
+ * is found again by id rather than held as a pointer, because the model can be
+ * rebuilt between opening the menu and clicking it. */
+static void thumb_menu_run(HWND hwnd, int cmd) {
+    const oc_model *m = model();
+    if (!m || !g_menu_target) return;
+    const oc_channel *c = oc_model_channel((oc_model *)m, g_sel);
+    const oc_attachment *at = NULL;
+    if (c) for (size_t i = 0; i < c->n_msgs && !at; i++)
+        for (int k = 0; k < c->msgs[i].n_attach; k++)
+            if (c->msgs[i].attach[k].id == g_menu_target) { at = &c->msgs[i].attach[k]; break; }
+    if (!at) return;
+    if (cmd == 1)      g_lightbox = at->id;
+    else if (cmd == 2) download_attachment(hwnd, (oc_attachment *)at);
+    else if (cmd == 3) copy_to_clipboard(hwnd, at->filename);
+}
+
+static void member_menu_run(HWND hwnd, int cmd);    /* fwd */
+static void channel_menu_run(HWND hwnd, int cmd);   /* fwd */
+
+static void msg_menu_run(HWND hwnd, int cmd) {
+    const oc_model *m = model();
+    if (!m || !cmd) return;
+    uint64_t mid = g_menu_target, chan = g_menu_target2;
+    const oc_channel *c = oc_model_channel((oc_model *)m, chan);
+    const oc_msg *msg = find_msg(c, mid);
+    if (!msg && m->thread_open)
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == mid) { msg = &m->thread_msgs[i]; break; }
+    if (!msg) return;
+
+    if (cmd == 7) {
         picker_open(hwnd, mid);
     } else if (cmd == 20) {
         copy_to_clipboard(hwnd, msg->body ? msg->body : "");
@@ -6780,15 +6896,10 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
     } else if (cmd == 102) {
         oc_client_list_reactions(g_client, chan, mid); rp_push(RP_REACTORS);
     } else if (cmd == 105) {
-        /* Ids, not names: a channel can be renamed (REQ-036) and a link built
-         * from a name would rot the moment it was (ARCH-96). */
-        char link[256];
-        /* The port belongs in the link when it is not the default: g_host holds the
-         * host alone, so a workspace on 8443 produced a link that pointed at 443 and
-         * could not be followed. Found while building the inbound half (WIN-44) —
-         * the two halves disagreeing about the format is exactly what having only
-         * one half hides. */
-        char linkhost[288];
+        /* Ids, not names: a channel can be renamed (REQ-036) and a link built from
+         * a name would rot the moment it was (ARCH-96). The port belongs in it when
+         * it is not the default — g_host holds the host alone (WIN-44). */
+        char linkhost[288], link[360];
         if (g_port && g_port != OC_DEFAULT_PORT)
             snprintf(linkhost, sizeof linkhost, "%s:%d", g_host[0] ? g_host : "workspace", g_port);
         else
@@ -6797,9 +6908,14 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
                  (unsigned long long)chan, (unsigned long long)mid);
         copy_to_clipboard(hwnd, link);
         toast_push("Link copied.", 0);
+    } else if (cmd == 106) {
+        /* The palette picks the destination: it already lists every conversation
+         * with a filter, so a forward needs no picker of its own (WIN-51). */
+        g_fwd_mid = mid; g_fwd_cid = chan;
+        palette_open(hwnd);
     } else if (cmd == 104) {
-        /* Private, so there is no "unsave" state to reflect in the menu here —
-         * the Later view is where you remove one. */
+        /* Private, so there is no "unsave" state to reflect here — the Later view
+         * is where you remove one. */
         oc_client_save_item(g_client, mid, OC_SAVE_ADD);
         toast_push("Saved to Later.", 0);
     } else if (cmd == 103) {
@@ -6809,23 +6925,65 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, int sx, in
     }
 }
 
-static void show_member_menu(HWND hwnd, const oc_model *m, uint64_t uid, int sx, int sy) {
+/* A click on the quick-reaction row. Separate from msg_menu_run because the row's
+ * cells are not menu commands — they are indices into the user's quick set. */
+static void msg_menu_react(int idx) {
+    const oc_model *m = model();
+    if (!m || idx < 0 || idx >= g_n_quick) return;
+    const oc_channel *c = oc_model_channel((oc_model *)m, g_menu_target2);
+    const oc_msg *msg = find_msg(c, g_menu_target);
+    if (!msg && m->thread_open)
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == g_menu_target) { msg = &m->thread_msgs[i]; break; }
+    if (!msg) return;
+    const char *e = REACT_EMO[idx];
+    oc_client_react(g_client, g_menu_target2, g_menu_target, e,
+                    reaction_is_mine(msg, e) ? 0 : 1);
+}
+
+static void show_member_menu(HWND hwnd, const oc_model *m, uint64_t uid, float cx, float cy) {
     int self = (uid == m->user_id);
-    HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, 2, L"View profile");
-    if (!self) AppendMenuW(menu, MF_STRING, 1, L"Message");
     uint8_t me = self_role(m);
+    g_n_mi = 0;
+    mi_item(2, "View profile");
+    if (!self) mi_item(1, "Message");
     if (me >= OC_ROLE_ADMIN && !self) {
-        HMENU roles = CreatePopupMenu();
-        AppendMenuW(roles, MF_STRING, 10, L"Member");
-        AppendMenuW(roles, MF_STRING, 11, L"Admin");
-        if (me >= OC_ROLE_OWNER) AppendMenuW(roles, MF_STRING, 12, L"Owner");
-        AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(menu, MF_POPUP, (UINT_PTR)roles, L"Set role");
-        AppendMenuW(menu, MF_STRING, 13, L"Remove from workspace");
+        /* The role submenu is FLATTENED into a checked section (WIN-79): the custom
+         * menu has no submenus, and "set role" is a three-way choice where showing
+         * the current one is the useful part — a submenu hid it behind a hover. */
+        mi_sep();
+        mi_section("ROLE");
+        uint8_t r = OC_ROLE_MEMBER;
+        for (size_t i = 0; i < m->n_users; i++)
+            if (m->users[i].user_id == uid) { r = m->users[i].role; break; }
+        char lbl[48];
+        snprintf(lbl, sizeof lbl, "%sMember", r == OC_ROLE_MEMBER ? "\xE2\x9C\x93 " : "    ");
+        mi_item(10, lbl);
+        snprintf(lbl, sizeof lbl, "%sAdmin",  r == OC_ROLE_ADMIN  ? "\xE2\x9C\x93 " : "    ");
+        mi_item(11, lbl);
+        if (me >= OC_ROLE_OWNER) {
+            snprintf(lbl, sizeof lbl, "%sOwner", r == OC_ROLE_OWNER ? "\xE2\x9C\x93 " : "    ");
+            mi_item(12, lbl);
+        }
+        mi_sep();
+        mi_item_d(13, "Remove from workspace");
     }
-    int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, sx, sy, 0, hwnd, NULL);
-    DestroyMenu(menu);
+    g_menu = MENU_MEMBER; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 236;
+    g_menu_target = uid; g_menu_target2 = 0;
+    g_menu_x = cx; g_menu_y = cy;
+    {
+        float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
+        RECT rc; GetClientRect(hwnd, &rc);
+        float H = DIPF(rc.bottom), W = DIPF(rc.right);
+        if (g_menu_y + h > H - 8) g_menu_y = H - 8 - h;
+        if (g_menu_y < 8) g_menu_y = 8;
+        if (g_menu_x + g_menu_w > W - 8) g_menu_x = W - 8 - g_menu_w;
+    }
+}
+
+static void member_menu_run(HWND hwnd, int cmd) {
+    (void)hwnd;
+    uint64_t uid = g_menu_target;
     switch (cmd) {
     case 1:  oc_client_open_dm(g_client, uid); break;
     case 2:  g_profile_uid = uid; rp_push(RP_PROFILE); break;
@@ -6839,7 +6997,7 @@ static void show_member_menu(HWND hwnd, const oc_model *m, uint64_t uid, int sx,
 
 /* ---- input --------------------------------------------------------------- */
 
-static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, int sx, int sy);
+static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, float cx, float cy);
 static void open_ws_menu(HWND hwnd);
 static void open_profile_menu(HWND hwnd);
 static void open_new_menu(HWND hwnd);
@@ -6956,6 +7114,61 @@ static int permalink_parse(const char *text, char *host, size_t hostcap,
 
 /* Follow one. Returns 0 with a toast when it cannot, rather than failing quietly:
  * a link that does nothing is indistinguishable from a broken app. */
+/* Send `mid` on to another conversation as a quote (REQ-057, WIN-51).
+ *
+ * A quote, not a copy of the attachment: `link_attachments` will only link a file
+ * whose `message_id IS NULL` and whose uploader and channel match the sender, so an
+ * existing attachment **cannot** be re-linked to a second message. That is a
+ * deliberate server-side guard (it is also why forwarding cannot leak a private
+ * channel's file), so the forward NAMES any attachment instead of pretending to
+ * carry it. Re-sharing the bytes needs a server-side copy op, which does not exist.
+ *
+ * The body is plain UTF-8 with the quote in-band, because that is all a body is
+ * until REQ-220 lands (ARCH: REQ-054). A permalink is appended so the reader can
+ * reach the original in its own context. */
+static void forward_send(HWND hwnd, uint64_t to_cid) {
+    const oc_model *m = model();
+    if (!m || !g_client || !g_fwd_mid || !to_cid) return;
+    const oc_channel *src = oc_model_channel((oc_model *)m, g_fwd_cid);
+    const oc_msg *msg = find_msg(src, g_fwd_mid);
+    if (!msg) { toast_push("That message is no longer loaded.", 1); g_fwd_mid = 0; return; }
+
+    const char *who = msg->author_name[0] ? msg->author_name
+                                          : oc_model_user_name((oc_model *)m, msg->author_id);
+    char where[96] = "";
+    if (src && src->kind != OC_CHANNEL_KIND_DM && src->name[0])
+        snprintf(where, sizeof where, " in #%s", src->name);
+
+    char linkhost[288];
+    if (g_port && g_port != OC_DEFAULT_PORT)
+        snprintf(linkhost, sizeof linkhost, "%s:%d", g_host[0] ? g_host : "workspace", g_port);
+    else
+        snprintf(linkhost, sizeof linkhost, "%s", g_host[0] ? g_host : "workspace");
+
+    char att[160] = "";
+    if (msg->n_attach > 0)
+        snprintf(att, sizeof att, "\n[attachment: %s]", msg->attach[0].filename);
+
+    char body[1400];
+    snprintf(body, sizeof body, "Forwarded from %s%s:\n> %s%s\nopenchime://%s/c/%llu/m/%llu",
+             (who && who[0]) ? who : "someone", where,
+             (msg->body && msg->body[0]) ? msg->body : "(no text)", att,
+             linkhost, (unsigned long long)g_fwd_cid, (unsigned long long)g_fwd_mid);
+    oc_client_send(g_client, to_cid, body);
+
+    const oc_channel *dst = oc_model_channel((oc_model *)m, to_cid);
+    char note[160];
+    if (dst && dst->kind == OC_CHANNEL_KIND_DM) {
+        const char *pn = oc_model_user_name((oc_model *)m, dst->peer_id);
+        snprintf(note, sizeof note, "Forwarded to @%s.", (pn && pn[0]) ? pn : "them");
+    } else {
+        snprintf(note, sizeof note, "Forwarded to #%s.", (dst && dst->name[0]) ? dst->name : "channel");
+    }
+    toast_push(note, 0);
+    g_fwd_mid = g_fwd_cid = 0;
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
 static int permalink_follow(HWND hwnd, const char *text) {
     char host[256]; uint64_t chan = 0, mid = 0;
     if (!permalink_parse(text, host, sizeof host, &chan, &mid)) return 0;
@@ -7197,9 +7410,25 @@ static int on_click(HWND hwnd, int x, int y) {
         for (int i = 0; i < g_n_mirows; i++)
             if ((float)y >= g_mirows[i].top && (float)y < g_mirows[i].bot &&
                 (float)x >= g_menu_x && (float)x < g_menu_x + g_menu_w) {
-                int cmd = g_mirows[i].cmd; g_menu = MENU_NONE; g_menu_hover = -1;
-                menu_dispatch(hwnd, cmd); return 1;
+                int cmd = g_mirows[i].cmd, kind = g_menu;
+                g_menu = MENU_NONE; g_menu_hover = -1;
+                /* Per-kind dispatch: a context menu's numbers are its own, so 21
+                 * means Edit on a message and a notification level in a dropdown. */
+                if (kind == MENU_MSG)          msg_menu_run(hwnd, cmd);
+                else if (kind == MENU_MEMBER)  member_menu_run(hwnd, cmd);
+                else if (kind == MENU_CHANNEL) channel_menu_run(hwnd, cmd);
+                else if (kind == MENU_THUMB)   thumb_menu_run(hwnd, cmd);
+                else                           menu_dispatch(hwnd, cmd);
+                return 1;
             }
+        /* The quick-reaction row is not a command row, so it is tested separately. */
+        if (g_menu == MENU_MSG)
+            for (int i = 0; i < g_n_menu_emoji; i++)
+                if (in_rect(g_menu_emoji[i], x, y)) {
+                    g_menu = MENU_NONE; g_menu_hover = -1;
+                    msg_menu_react(i);
+                    return 1;
+                }
         g_menu = MENU_NONE; g_menu_hover = -1; return 1;
     }
     /* The "More" overflow flyout takes clicks next. */
@@ -7442,16 +7671,23 @@ static int on_click(HWND hwnd, int x, int y) {
          * only what actually works. */
         POINT pt = { PX(x), PX(y) };
         ClientToScreen(hwnd, &pt);
-        HMENU mnu = CreatePopupMenu();
-        AppendMenuW(mnu, MF_STRING, 1, L"View full size");
-        AppendMenuW(mnu, MF_STRING, 2, L"Save image as\u2026");
-        AppendMenuW(mnu, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(mnu, MF_STRING, 3, L"Copy filename");
-        int cmd = (int)TrackPopupMenu(mnu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
-        DestroyMenu(mnu);
-        if (cmd == 1)      g_lightbox = at->id;
-        else if (cmd == 2) download_attachment(hwnd, at);
-        else if (cmd == 3) copy_to_clipboard(hwnd, at->filename);
+        /* The image kebab, on the app's own menu now (WIN-79). */
+        g_n_mi = 0;
+        mi_item(1, "View full size");
+        mi_item(2, "Save image as\u2026");
+        mi_sep();
+        mi_item(3, "Copy filename");
+        g_menu = MENU_THUMB; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 220;
+        g_menu_target = at->id; g_menu_target2 = 0;
+        g_menu_x = (float)x; g_menu_y = (float)y;
+        {
+            float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
+            RECT rc; GetClientRect(hwnd, &rc);
+            float H = DIPF(rc.bottom), W = DIPF(rc.right);
+            if (g_menu_y + h > H - 8) g_menu_y = H - 8 - h;
+            if (g_menu_y < 8) g_menu_y = 8;
+            if (g_menu_x + g_menu_w > W - 8) g_menu_x = W - 8 - g_menu_w;
+        }
         return 1;
     }
     for (int i = 0; i < g_n_thumb_hits; i++)
@@ -7661,7 +7897,7 @@ static void on_rclick(HWND hwnd, int x, int y) {
             if ((float)y >= g_rows[i].top && (float)y < g_rows[i].bot) {
                 /* Right-clicking a header opens the same menu as its kebab. */
                 if (g_rows[i].header) open_section_menu(hwnd, g_rows[i].sec);
-                else show_channel_menu(hwnd, m, g_rows[i].cid, pt.x, pt.y);
+                else show_channel_menu(hwnd, m, g_rows[i].cid, (float)x, (float)y);
                 return;
             }
         return;
@@ -7669,7 +7905,7 @@ static void on_rclick(HWND hwnd, int x, int y) {
     /* Members pane first (it overlaps the right edge). */
     for (int i = 0; i < g_n_memrows; i++)
         if (in_rect(g_memrows[i].r, (float)x, (float)y)) {
-            show_member_menu(hwnd, m, g_memrows[i].uid, pt.x, pt.y);
+            show_member_menu(hwnd, m, g_memrows[i].uid, (float)x, (float)y);
             return;
         }
     /* Inside an open thread the replies own the region, so their rows are
@@ -7679,14 +7915,14 @@ static void on_rclick(HWND hwnd, int x, int y) {
         for (int i = 0; i < g_n_thrrows; i++)
             if ((float)y >= g_thrrows[i].top && (float)y < g_thrrows[i].bot &&
                 (float)x >= g_thrrows[i].left && (float)x < g_thrrows[i].right) {
-                show_msg_menu(hwnd, m, g_thrrows[i].mid, pt.x, pt.y);
+                show_msg_menu(hwnd, m, g_thrrows[i].mid, (float)x, (float)y);
                 return;
             }
         return;
     }
     {
         int r = msgrow_at(x, y);
-        if (r >= 0) { show_msg_menu(hwnd, m, g_msgrows[r].mid, pt.x, pt.y); return; }
+        if (r >= 0) { show_msg_menu(hwnd, m, g_msgrows[r].mid, (float)x, (float)y); return; }
     }
 }
 
@@ -8797,33 +9033,57 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
-static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, int sx, int sy) {
+static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, float cx, float cy) {
     const oc_channel *c = oc_model_channel((oc_model *)m, cid);
     if (!c) return;
-    HMENU menu = CreatePopupMenu();
+    g_n_mi = 0;
     if (!c->joined && c->is_public) {
-        AppendMenuW(menu, MF_STRING, 1, L"Join channel");
+        mi_item(1, "Join channel");
     } else {
-        AppendMenuW(menu, MF_STRING, 2, L"Mark as read");
-        HMENU notify = CreatePopupMenu();
-        AppendMenuW(notify, MF_STRING | (c->notify_level == OC_NOTIFY_ALL ? MF_CHECKED : 0),      20, L"All messages");
-        AppendMenuW(notify, MF_STRING | (c->notify_level == OC_NOTIFY_MENTIONS ? MF_CHECKED : 0), 21, L"Mentions only");
-        AppendMenuW(notify, MF_STRING | (c->notify_level == OC_NOTIFY_NONE ? MF_CHECKED : 0),     22, L"Nothing");
-        AppendMenuW(menu, MF_POPUP, (UINT_PTR)notify, L"Notifications");
+        mi_item(2, "Mark as read");
+        /* Notification levels FLATTENED out of a submenu (WIN-79), with the current
+         * one ticked — the same reasoning as the member role: the useful part of a
+         * three-way choice is seeing which one is set. */
+        mi_section("NOTIFICATIONS");
+        char lbl[48];
+        snprintf(lbl, sizeof lbl, "%sAll messages",
+                 c->notify_level == OC_NOTIFY_ALL ? "\xE2\x9C\x93 " : "    ");
+        mi_item(20, lbl);
+        snprintf(lbl, sizeof lbl, "%sMentions only",
+                 c->notify_level == OC_NOTIFY_MENTIONS ? "\xE2\x9C\x93 " : "    ");
+        mi_item(21, lbl);
+        snprintf(lbl, sizeof lbl, "%sNothing",
+                 c->notify_level == OC_NOTIFY_NONE ? "\xE2\x9C\x93 " : "    ");
+        mi_item(22, lbl);
         if (c->kind != OC_CHANNEL_KIND_DM) {
-            AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-            /* WIN-31: both frames have always existed on the wire and reached no
+            mi_sep();
+            /* WIN-31: both frames had always existed on the wire and reached no
              * client, so a private channel could be created but never populated. */
-            AppendMenuW(menu, MF_STRING, 6, L"Add someone…");
-            AppendMenuW(menu, MF_STRING, 7, L"Remove someone…");
-            AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-            AppendMenuW(menu, MF_STRING, 4, L"Webhooks…");
-            AppendMenuW(menu, MF_STRING, 5, L"Create webhook…");
-            AppendMenuW(menu, MF_STRING, 3, L"Leave channel");
+            mi_item(6, "Add someone\u2026");
+            mi_item(7, "Remove someone\u2026");
+            mi_sep();
+            mi_item(4, "Webhooks\u2026");
+            mi_item(5, "Create webhook\u2026");
+            mi_item_d(3, "Leave channel");
         }
     }
-    int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, sx, sy, 0, hwnd, NULL);
-    DestroyMenu(menu);
+    g_menu = MENU_CHANNEL; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 244;
+    g_menu_target = cid; g_menu_target2 = 0;
+    g_menu_x = cx; g_menu_y = cy;
+    {
+        float h = 12; for (int i = 0; i < g_n_mi; i++) h += menu_item_h(g_mi[i].kind);
+        RECT rc; GetClientRect(hwnd, &rc);
+        float H = DIPF(rc.bottom), W = DIPF(rc.right);
+        if (g_menu_y + h > H - 8) g_menu_y = H - 8 - h;
+        if (g_menu_y < 8) g_menu_y = 8;
+        if (g_menu_x + g_menu_w > W - 8) g_menu_x = W - 8 - g_menu_w;
+    }
+}
+
+static void channel_menu_run(HWND hwnd, int cmd) {
+    const oc_model *m = model();
+    uint64_t cid = g_menu_target;
+    if (!m || !cid) return;
     switch (cmd) {
     case 1:  oc_client_join_channel(g_client, cid); break;
     case 2:  oc_client_mark_read(g_client, cid); break;
@@ -9331,8 +9591,9 @@ static void test_poll(HWND hwnd) {
         if (arg[0]) { WCHAR w[256]; to_w(arg, w, 256); SetWindowTextW(g_srch, w); search_submit(); }
         test_ack("ok");
     } else if (!strcmp(verb, "pin")) {
-        /* The kebab's Pin item goes through a modal TrackPopupMenu the harness
-         * cannot navigate, so this drives the same client call directly. */
+        /* Kept after WIN-79 made the kebab drivable: this exercises the client call
+         * without depending on menu geometry, which is the right level for a test
+         * that cares about pinning rather than about where the item sits. */
         uint64_t mid = strtoull(arg, NULL, 10);
         const oc_model *pm = model();
         const oc_channel *pc = pm && g_sel ? oc_model_channel((oc_model *)pm, g_sel) : NULL;
