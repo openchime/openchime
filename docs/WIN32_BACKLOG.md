@@ -9,7 +9,7 @@ clients, or a `REQ-NNN`.
 parity table is the *feature reachability* tracker. This document is the *work
 list* derived from both — one row per shippable branch.
 
-**Ids.** Items are `WIN-1` … `WIN-71`, numbered once and **stable**: an id is
+**Ids.** Items are `WIN-1` … `WIN-78`, numbered once and **stable**: an id is
 never renumbered or reused, so a commit or branch can cite it. Ordering is *not*
 priority — the **Pri** column is, and it may change. Section membership may also
 change as blockers clear (an item moves from §3 to §1 without changing its id).
@@ -65,6 +65,68 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 
 | ~~**WIN-71**~~ | ~~Files: filters crammed into one chip row, no left column, no name search.~~ **DONE.** Rebuilt on Slack's split — **collection on the left, ownership top-left, type and sort top-right, name search above all of it**. The left column lists "All files" then the channels that have any, with counts; picking one is a real **server-side refetch** (`LIST_FILES` already takes a channel id), not a slice of the page we hold, so the list is exact. Slack's other three collections were not copied: Canvases and Lists do not exist here and its Starred holds messages, so three of four rows would have been stubs. Type and sort became dropdowns — as four permanent chips, type spent the width the filename column wanted to state an axis most people leave on "All". **Two caveats, both stated in the UI:** the channel census comes from the 200-file page, so a channel whose last upload is older will not appear until you visit it (an exact list needs a distinct-channels query — not built); and the list does not scroll yet, so it says how many rows it could not show. | P2 | M |
 
+| **WIN-73** | **Later** reform: bookmark marker in the transcript + a Files-shaped panel | P1 | M |
+| **WIN-74** | DM tabs: drop **About**, keep Messages · Files & links · Pins | P2 | S |
+| **WIN-75** | The command palette has no affordance — Ctrl+K is its only route | P2 | S |
+| **WIN-76** | Long lists do not scroll: Files, Later (and audit/webhook rows unchecked) | P1 | M |
+| **WIN-77** | Modal frame: the remaining conversions — pane headers, `confirm()`, `form_dialog`'s 16 sites | P1 | L |
+| **WIN-78** | Preferences as two panes + appearance depth (accent, text size, density, zoom) | P2 | M |
+
+### The items added 2026-07-30, in detail
+
+- **WIN-73 — Later.** Two halves. (1) A message you saved shows a **bookmark glyph
+  and a slightly inverse row tint** in the transcript, which it cannot do today
+  because nothing told the client a message was saved: the list is fetched only when
+  the Later view opens. **The plumbing for this has landed** — `oc_replay_msg`
+  carries the requesting user's `saved`/`saved_at` (a `LEFT JOIN saved_items` keyed
+  to that user, since a save is private where a pin is channel-wide), the net thread
+  replays it as `SAVED_UPDATED` beside the existing pin loop, and `oc_msg.saved` is
+  applied to the channel list *and* any open thread. No protocol bump was needed:
+  the daemon already replays pin state the same way, which also corrects an earlier
+  claim of mine that pins were lost on reconnect — they are not
+  (`netloop.c` emits synthetic `PIN_UPDATED`). What remains is the drawing.
+  (2) The **Later view takes the Files shape** (WIN-71): a left column defaulting to
+  "All channels" then the channels holding bookmarks, newest-saved first, with
+  counts. One asymmetry to state plainly — `LIST_SAVED` takes **no arguments**,
+  unlike `LIST_FILES`, so picking a channel filters the fetched page client-side
+  rather than re-asking the server. At the 200-item cap that is the whole list for
+  almost everyone; making it exact means adding a channel argument, which is a wire
+  change and belongs with WIN-38's bump.
+
+- **WIN-74 — DM tabs.** Pins and Files & links are *correct* in a DM: `process_pin`
+  and `LIST_FILES` require only membership, and a DM's two participants are members.
+  **About is not.** It renders a TOPIC row with a "Set topic…" button, but
+  `process_update_channel` rejects every DM outright (`OC_ERR_INVALID_CHANNEL`,
+  commented "a DM has no name to rename, no topic worth setting") — so the button's
+  only possible outcome is an error. Only the ADMIN block is gated on
+  `kind != DM`; the topic row was missed. Drop the tab: a DM's "about" is the
+  peer's profile, which is right-side coded already.
+
+- **WIN-75 — the palette is invisible.** `palette_open()` has exactly two callers:
+  Ctrl+K and the test hook. No menu entry, no button, no rail item. That sits badly
+  with ARCH-82's affordance-driven rule — the palette is the one surface reachable
+  only by a keystroke. Slack's equivalent is also clickable, via its title-bar
+  search field.
+
+- **WIN-76 — lists that stop.** The Files view and Later both draw rows until they
+  run out of pane and then simply stop; Files at least *says* how many it could not
+  show. Neither scrolls. The audit and webhook lists have not been checked.
+
+- **WIN-77 — the rest of the modal work.** The frame landed (one card, explicit
+  commit, snapshot/restore). Still outstanding: `pane_header()` so the six
+  middle-column panes stop wearing modal furniture and its "Esc to close" caption;
+  a themed `confirm()` for the four `MessageBoxW` calls; and `form_dialog`'s **16
+  call sites**, which are native GDI popups and the most foreign-looking surfaces in
+  the app.
+
+- **WIN-78 — Preferences.** A two-pane card (categories left, panel right) carrying
+  accent colour, **text size** (the `g_text_scale` hook exists and is applied by
+  `fonts_build()`; nothing sets it yet), density, and zoom on Ctrl+`=`/`-`/`0` —
+  three separate multipliers by ARCH-97. Entry from the **You** avatar and Ctrl+`,`,
+  not only the workspace menu: settings about *you* hanging off the *workspace* menu
+  is the same category error as the connection dot in the channel header.
+
+
 ## §2 Ready now, with a small app-core change
 
 The wire already carries these; `client/core` is the only thing in the way.
@@ -92,7 +154,7 @@ Not startable in this client. Each names what must land first.
 | **WIN-41** | Starred/favourite conversations + custom sidebar sections | REQ-234 — per-user sidebar state storage. **ARCH-88 settles the open question by elimination**: with no client-local storage it must be server-side, and the `client_settings` bucket already exists for exactly this |
 | ~~**WIN-42**~~ | ~~Pin a message~~ **DONE.** REQ-230/ARCH-90 built in the daemon (migration 0022) and surfaced here: "Pin to channel" / "Unpin from channel" in the message kebab, a "Pinned by …" marker above the message inline, and a **Pinned** button in the channel header opening the list — each row jumps to the message in context, or unpins it. | — |
 | ~~**WIN-43**~~ | ~~Save for later / the **Later** rail stub~~ **DONE.** REQ-231/ARCH-95: "Save for later" in the message menu, a **Later** view listing what you saved with Remove, and a click jumping to the message in its channel. Private — keyed (user, message), the mirror of a pin. | — |
-| **WIN-44** | Copy link / permalink, jump-to-permalink | REQ-232 — needs a permalink form and fetch-around-an-id backfill |
+| **WIN-44** | ~~Copy link~~ **(done)** · jump-to-permalink | REQ-232 — **the note below was stale.** `HISTORY_AROUND` (0x006A) and `oc_client_history_around()` are built and "Copy link" is in the message menu; only the INBOUND half is missing — pasting a link does nothing |
 | ~~**WIN-45**~~ | ~~Real `@mentions` (highlight + notify)~~ **DONE.** REQ-221/ARCH-89 built in the daemon (migration 0021, `shared/mention.c`) and surfaced here: mention spans are accent-coloured and semi-bold in `body_layout`, a message naming you tints its row and gets an accent bar, and the in-app `MENTIONS` notify level is now evaluated with the same scanner instead of being silently skipped. | — |
 | **WIN-46** | Invite management: links, expiry, pending list, revoke | REQ-026 |
 | **WIN-47** | Rich profile fields — avatar, email, timezone, title | REQ-240 |
@@ -323,7 +385,11 @@ Recorded because a defect nobody wrote down is a defect nobody fixes.
   `WIN_CFLAGS` gained `-g` for it. Verified with a deliberate fault behind the test
   hook (`crashtest`), resolving to the exact line — an untested crash handler is
   the one piece of code certain to run for the first time at the worst moment.
-  **Still unfixed**; the next occurrence will name itself. Original report: The client was seen to exit once
+  **Still unfixed**, and there is one more sighting: on 2026-07-30 the client
+  exited during harness driving and wrote **no report at all**, which means either a
+  clean exit path triggered by accident or a fault that bypasses
+  `SetUnhandledExceptionFilter` (a stack overflow or a fail-fast, both of which do).
+  Worth knowing before trusting the instrumentation. Original report: The client was seen to exit once
   during composer input. It has not reproduced since, there is no dump, and the
   build is warning-free, so there is nothing yet to point at. Left open
   deliberately rather than closed as "could not reproduce": the composer is a
