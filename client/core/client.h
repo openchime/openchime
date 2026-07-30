@@ -225,6 +225,12 @@ void oc_client_set_mute(oc_client *c, uint64_t channel_id, int muted);
 /* The global notification default (REQ-134): the level for every channel without a
  * per-channel override. The daemon answers with a full NOTIFY_PREFS sync. */
 void oc_client_set_notify_default(oc_client *c, uint8_t level);
+
+/* Set (or clear, with 0) my avatar. The image must already have been uploaded as an
+ * attachment BY ME — the daemon refuses anything else, since an avatar is readable
+ * workspace-wide (WIN-47). */
+void oc_client_set_avatar(oc_client *c, uint64_t attachment_id);
+void oc_client_upload_avatar(oc_client *c, uint64_t channel_id, const char *path);
 /* Custom status (REQ-241/122) and profile fields (REQ-240). Empty status text clears
  * it; expiry 0 means "until changed", and the DAEMON enforces the lapse. */
 void oc_client_list_file_channels(oc_client *c);   /* WIN-82 */

@@ -640,9 +640,26 @@ is the product of the first two, so nothing downstream has to know there are two
 inputs; anything that caches a font size of its own (the RichEdit's CHARFORMAT, the
 placeholder HFONT, the form fields' HFONT) is rebuilt by `scale_apply`.
 
+## Screenshots can see images (and could not, until WIN-47)
+
+`test_shot` renders the scene into its own DC render target. A D2D bitmap belongs to
+the target that created it, so the capture used to switch images off entirely — which
+means **every screenshot ever taken of this app was a picture with the pictures
+missing**, including the inline-image feature (WIN-17) whose whole point is the
+picture. That cost an hour of diagnosing a working avatar as broken.
+
+The decoded PBGRA pixels are now kept beside each cached bitmap, and a capture creates
+its own bitmaps from them for its own target (released when the shot ends). Only the
+*fetch* is still suppressed during a capture, so driving the harness cannot generate
+transfer traffic.
+
+**If you add another cached GPU resource, keep the bytes too.** Anything that lives
+only as a render-target-owned object is invisible to every screenshot, and therefore
+unverifiable.
+
 ## Run the GUI smoke before pushing Win32 chrome
 
-`scripts/gui_smoke.sh` asserts **88 invariants** through the test hook: for each of
+`scripts/gui_smoke.sh` asserts **91 invariants** through the test hook: for each of
 the six views, what is in the second column (`sidebar_kind`), whether the middle
 one is typeable (`main_is_conversation`), which native children are shown, and
 whether anything covers the window — plus the search overlay, the Pins tab, the

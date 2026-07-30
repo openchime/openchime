@@ -1141,6 +1141,16 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_AVATAR) {
+            oc_set_avatar sa;
+            if (oc_decode_set_avatar(&p, &sa) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_AVATAR, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->message_id = sa.attachment_id;      /* 0 clears */
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SET_NOTIFY_DEFAULT) {
             oc_set_notify_default nd;
             if (oc_decode_set_notify_default(&p, &nd) != OC_OK) return -1;
@@ -1954,6 +1964,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             ents[i].disabled = r->ulist[i].disabled;
             ents[i].email = oc_slice_str(r->ulist[i].email ? r->ulist[i].email : "");
             ents[i].display_name = oc_slice_str(r->ulist[i].display_name ? r->ulist[i].display_name : "");
+            ents[i].avatar_id = r->ulist[i].avatar_id;      /* WIN-47 */
         }
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_user_list ul = { (uint16_t)n, ents };

@@ -38,7 +38,11 @@
  * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
  * preview_author. Shipping client and daemon together (ARCH-61) means there is
  * no compatibility window to preserve — only a mismatch to detect loudly. */
-#define OC_PROTOCOL_VERSION 3u
+/* 4: USER_LIST carries each user's avatar attachment id (WIN-47). A frame LAYOUT
+ * change, not merely a new frame, so the version must move — a v3 client decoding a
+ * v4 user list reads the next entry's fields shifted by eight bytes and reports only
+ * "connection lost" (ARCH-61 ships the two together). */
+#define OC_PROTOCOL_VERSION 4u
 
 /* Transport conventions (see PROTOCOL.md §1). The binary protocol shares TLS
  * port 443 with the future HTTP/webhook surface, demultiplexed by ALPN: a
@@ -134,7 +138,8 @@ typedef enum {
      * could sign out everywhere without ever seeing what "everywhere" was. */
     /* REQ-134: the level for channels with no per-channel override. Rides the
      * NOTIFY_PREFS frame back, so a client learns it with the rest. */
-    OC_MSG_SET_NOTIFY_DEFAULT = 0x0077, /* C->S */
+    OC_MSG_SET_NOTIFY_DEFAULT = 0x0077,
+    OC_MSG_SET_AVATAR         = 0x0078, /* C->S, my avatar attachment id (WIN-47) */ /* C->S */
     OC_MSG_LIST_SESSIONS      = 0x0075, /* C->S */
     OC_MSG_SESSION_LIST       = 0x0076, /* S->C, never the tokens */
     OC_MSG_LIST_FILE_CHANNELS = 0x0073, /* C->S */
@@ -578,6 +583,10 @@ typedef struct { uint64_t webhook_id; } oc_rotate_webhook;
  * expiry, because a client that is not running cannot clear its own status. */
 typedef struct { oc_slice emoji; oc_slice text; uint64_t expires_at; } oc_set_status;
 typedef struct { oc_slice title; oc_slice timezone; } oc_set_profile;
+/* WIN-47. An id, not bytes: the image goes up through the ordinary attachment
+ * upload (REQ-140) and this points at the result, so dedup, size caps and the blob
+ * store all keep working. 0 clears the avatar. */
+typedef struct { uint64_t attachment_id; } oc_set_avatar;
 typedef struct { uint64_t user_id; oc_slice display_name; oc_slice email;
                  oc_slice status_emoji; oc_slice status_text; uint64_t status_expires;
                  oc_slice title; oc_slice timezone; uint64_t avatar_id;
@@ -694,7 +703,8 @@ typedef struct { uint64_t attachment_id; uint32_t seq; oc_slice data; } oc_downl
 typedef struct { uint64_t attachment_id; } oc_download_end;
 typedef struct { uint64_t attachment_id; } oc_transfer_cancel;
 typedef struct { uint16_t count; const oc_channel_list_entry *entries; } oc_channel_list;
-typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; oc_slice email; oc_slice display_name; } oc_user_list_entry;
+typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; oc_slice email;
+                 oc_slice display_name; uint64_t avatar_id; } oc_user_list_entry;
 typedef struct { uint16_t count; const oc_user_list_entry *entries; } oc_user_list;
 typedef struct { uint64_t user_id; uint8_t role; } oc_set_role;
 typedef struct { uint8_t role; } oc_invite_user;
@@ -819,7 +829,9 @@ oc_result oc_encode_delete_webhook(oc_wbuf *w, uint16_t version, const oc_delete
 oc_result oc_encode_set_webhook_state(oc_wbuf *w, uint16_t version, const oc_set_webhook_state *m);
 oc_result oc_encode_rotate_webhook(oc_wbuf *w, uint16_t version, const oc_rotate_webhook *m);
 oc_result oc_encode_set_notify_default(oc_wbuf *w, uint16_t version, const oc_set_notify_default *m);
+oc_result oc_encode_set_avatar(oc_wbuf *w, uint16_t version, const oc_set_avatar *m);
 oc_result oc_decode_set_notify_default(oc_rbuf *p, oc_set_notify_default *m);
+oc_result oc_decode_set_avatar(oc_rbuf *p, oc_set_avatar *m);
 oc_result oc_encode_list_sessions(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_session_list(oc_wbuf *w, uint16_t version, const oc_session_list *m);
 oc_result oc_decode_session_list(oc_rbuf *p, oc_session_entry *entries, uint16_t cap,

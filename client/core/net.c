@@ -239,6 +239,10 @@ typedef struct {
     uint32_t acked_seq;   /* upload: chunks the server has acked */
     int      ended;       /* upload: UPLOAD_END has been sent */
     uint64_t channel;     /* upload: channel to link the finished attachment into */
+    /* What the finished upload is FOR (WIN-47). 0 posts it as a message, which is
+     * every ordinary upload; 1 makes it the user's avatar and posts nothing. Without
+     * this an avatar arrived in the transcript as a bare image nobody sent. */
+    uint8_t  purpose;
     char     name[128];   /* filename (upload src basename / download dest label) */
 } oc_xfer;
 
@@ -503,6 +507,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->user_id = ue[i].user_id;
                 e->status = ue[i].role;
                 e->op = ue[i].disabled;
+                e->message_id = ue[i].avatar_id;      /* WIN-47 */
                 e->body = malloc(ue[i].display_name.len + 1);
                 if (e->body) { memcpy(e->body, ue[i].display_name.ptr, ue[i].display_name.len); e->body[ue[i].display_name.len] = '\0'; }
                 oc_queue_push(to_ui, e);
@@ -884,6 +889,19 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (oc_decode_upload_ok(&p, &ok) == OC_OK && ctx && ctx->xfer->mode == 1 &&
                 ok.attachment_id == ctx->xfer->id) {
                 oc_xfer *x = ctx->xfer;
+                if (x->purpose == 1) {
+                    /* An avatar (WIN-47): claim it with SET_AVATAR instead of posting
+                     * it. The daemon checks that the uploader is the setter, and its
+                     * reclaim sweep excludes avatars — an attachment no message
+                     * references would otherwise be collected as an orphan. */
+                    uint8_t af[24]; oc_wbuf aw; oc_wbuf_init(&aw, af, sizeof af);
+                    oc_set_avatar sa = { x->id };
+                    if (oc_encode_set_avatar(&aw, OC_PROTOCOL_VERSION, &sa) == OC_OK)
+                        (void)write_all(ctx->conn, ctx->fd, af, aw.len, ctx->stop);
+                    xfer_notice(ctx, 1, "photo updated");
+                    xfer_reset(x);
+                    continue;
+                }
                 /* Publish the pending attachment by linking it into a SEND. */
                 uint8_t frame[256]; oc_wbuf w; oc_wbuf_init(&w, frame, sizeof frame);
                 oc_send s; memset(&s, 0, sizeof s);
@@ -1650,6 +1668,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_set_mute(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_SET_AVATAR) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_avatar sa = { c->message_id };
+                if (oc_encode_set_avatar(&w, OC_PROTOCOL_VERSION, &sa) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_SET_NOTIFY_DEFAULT) {
                 uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_set_notify_default sd = { c->op };
@@ -1678,6 +1702,7 @@ static int run_connection(oc_net *n, int reconnecting,
                             xfer.mode = 1; xfer.fp = fp; xfer.total = (uint64_t)sz;
                             xfer.chunk = OC_ATTACH_CHUNK_SIZE; xfer.win_chunks = 8;
                             xfer.channel = c->channel_id;
+                            xfer.purpose = (uint8_t)(c->op == 1 ? 1 : 0);   /* WIN-47 */
                             snprintf(xfer.name, sizeof xfer.name, "%s", path_basename(c->body));
                             uint8_t buf[512]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                             oc_upload_begin ub; memset(&ub, 0, sizeof ub);

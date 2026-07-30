@@ -1207,6 +1207,7 @@ oc_result oc_encode_user_list(oc_wbuf *w, uint16_t version, const oc_user_list *
         oc_w_u8(w, m->entries[i].disabled);
         oc_w_str(w, m->entries[i].email);
         oc_w_str(w, m->entries[i].display_name);
+        oc_w_u64(w, m->entries[i].avatar_id);      /* WIN-47; 0 = none */
     }
     return oc_frame_end(w, off);
 }
@@ -1950,12 +1951,14 @@ oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries,
         uint8_t disabled = oc_r_u8(p);
         oc_slice email = oc_r_str(p);
         oc_slice name = oc_r_str(p);
+        uint64_t avatar = oc_r_u64(p);
         if (i < cap) {
             entries[i].user_id = uid;
             entries[i].role = role;
             entries[i].disabled = disabled;
             entries[i].email = email;
             entries[i].display_name = name;
+            entries[i].avatar_id = avatar;
         }
     }
     return r_done(p);
@@ -2349,5 +2352,17 @@ oc_result oc_encode_set_notify_default(oc_wbuf *w, uint16_t version, const oc_se
 
 oc_result oc_decode_set_notify_default(oc_rbuf *p, oc_set_notify_default *m) {
     m->level = oc_r_u8(p);
+    return r_done(p);
+}
+
+/* The avatar (WIN-47). */
+oc_result oc_encode_set_avatar(oc_wbuf *w, uint16_t version, const oc_set_avatar *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_AVATAR);
+    oc_w_u64(w, m->attachment_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_avatar(oc_rbuf *p, oc_set_avatar *m) {
+    m->attachment_id = oc_r_u64(p);
     return r_done(p);
 }

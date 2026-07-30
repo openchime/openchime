@@ -587,6 +587,29 @@ void oc_client_set_notify_default(oc_client *c, uint8_t level) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+/* Upload an image and make it my avatar (WIN-47). Same transfer machinery as any
+ * upload — chunking, window, size cap — but the finished attachment is claimed with
+ * SET_AVATAR rather than posted. `channel_id` is where the bytes are uploaded (the
+ * wire requires one); nothing is posted there. */
+void oc_client_upload_avatar(oc_client *c, uint64_t channel_id, const char *path) {
+    if (!c || !path || !path[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_UPLOAD);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->op = 1;                       /* purpose: avatar */
+    cmd->body = strdup(path);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* The avatar (WIN-47). */
+void oc_client_set_avatar(oc_client *c, uint64_t attachment_id) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_AVATAR);
+    if (!cmd) return;
+    cmd->message_id = attachment_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 /* Mark unread (REQ-235, WIN-52). `message_id` is where reading resumes; 0 marks the
  * whole conversation unread. Deliberately not oc_client_mark_read's path, which may
  * only ever advance the cursor. */

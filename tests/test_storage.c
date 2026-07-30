@@ -397,6 +397,43 @@ int run_storage_tests(void) {
         CHECK(reclaimed(db, 11) == 0);
     }
 
+    /* An AVATAR is an attachment no message references (WIN-47), so it looks exactly
+     * like an orphan to tier 1 and like any other old file to tiers 2a and 2b. It
+     * must survive all three, or every profile picture in the workspace goes blank an
+     * hour after being set. */
+    {
+        insert_attachment(db, 200, 10 * DAY, 0, now);      /* orphan-shaped, and old */
+        sqlite3_exec(db, "UPDATE users SET avatar_attachment_id=200 WHERE id=1;",
+                     NULL, NULL, NULL);
+        oc_job *j = oc_job_new(OC_JOB_STORAGE_MAINT, 0);
+        CHECK(j != NULL);
+        j->maint_grace_ms = 1 * HOUR;
+        j->maint_batch = 64;
+        j->maint_max_age_ms = 1 * DAY;      /* tier 2a would take it on age alone */
+        j->maint_evict = 1;                 /* and tier 2b on pressure */
+        oc_dbwriter_submit(w, j);
+        oc_dbres *r = NULL;
+        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        CHECK(r != NULL);
+        if (r) oc_dbres_free(r);
+        CHECK(reclaimed(db, 200) == 0);
+        /* And once it is no longer anyone's avatar it becomes collectable again —
+         * the exclusion is about being IN USE, not about being special forever. */
+        sqlite3_exec(db, "UPDATE users SET avatar_attachment_id=NULL WHERE id=1;",
+                     NULL, NULL, NULL);
+        j = oc_job_new(OC_JOB_STORAGE_MAINT, 0);
+        j->maint_grace_ms = 1 * HOUR;
+        j->maint_batch = 64;
+        j->maint_max_age_ms = 0;
+        j->maint_evict = 0;
+        oc_dbwriter_submit(w, j);
+        r = NULL;
+        for (int i = 0; i < 200 && !r; i++) { r = oc_dbwriter_next_result(w); usleep(5000); }
+        CHECK(r != NULL);
+        if (r) oc_dbres_free(r);
+        CHECK(reclaimed(db, 200) == 1);
+    }
+
     /* Pass 4: idempotence. Everything reclaimable is already tombstoned, so a
      * further pass must find nothing rather than re-reclaiming (which would
      * re-queue blob deletes forever). */
@@ -452,9 +489,10 @@ int run_storage_tests(void) {
             /* Reclamation counts come from reclaim_reason, which is what makes
              * eviction auditable after the fact. Earlier passes reclaimed one
              * of each kind. */
-            /* 6 orphans: one from the first pass, plus the 5 the batch-cap
-             * step reclaimed. One expired and one evicted from their passes. */
-            CHECK(r->st_rec_orphan == 6);
+            /* 7 orphans: one from the first pass, the 5 the batch-cap step
+             * reclaimed, and the ex-avatar collected once it stopped being one.
+             * One expired and one evicted from their passes. */
+            CHECK(r->st_rec_orphan == 7);
             CHECK(r->st_rec_expired == 1);
             CHECK(r->st_rec_evicted == 1);
             CHECK(r->st_last_reclaim_ms > 0);

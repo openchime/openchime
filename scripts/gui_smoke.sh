@@ -213,6 +213,31 @@ click_pref 1 "$before"; sleep 0.3
 "$DRIVE" key enter >/dev/null 2>&1; sleep 0.5
 expect "$(snap)" time24 "$before" "the run left the setting as it found it"
 
+# --- avatars (WIN-47) -------------------------------------------------------
+# Two things are asserted, because the second was invisible for an hour: that the
+# avatar is set, AND that a screenshot can see an image at all. Every capture used
+# to suppress images (a D2D bitmap belongs to the target that made it), so the
+# avatars were drawing correctly on screen and no capture could show it.
+say "== avatars"
+"$DRIVE" view 0 >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; sleep 0.5
+if [ -f "$LIN_DIR/face.png" ]; then
+  "$DRIVE" avatar 'C:\Windows\Temp\octest\face.png' >/dev/null 2>&1; sleep 2.5
+  d=$(snap)
+  checks=$((checks + 1))
+  mine=$(printf '%s' "$d" | grep -oE 'myavatar=[0-9]+' | cut -d= -f2)
+  if [ -n "${mine:-}" ] && [ "$mine" != "0" ]; then ok "the avatar is set (id=$mine)"
+  else fail "myavatar is still 0 after an upload"; fi
+  # The bytes come back and decode: one cached thumbnail whose id is the avatar's.
+  sleep 1
+  checks=$((checks + 1))
+  if snap | grep -qE "^  thumb [0-9]+ id=$mine "; then ok "its image decoded into the cache"
+  else fail "no decoded bitmap for avatar $mine — the fetch or the decode failed"; fi
+  "$DRIVE" avatar 0 >/dev/null 2>&1; sleep 1
+  expect "$(snap)" myavatar 0 "clearing it works"
+else
+  say "   (no $LIN_DIR/face.png — skipping; create one to cover WIN-47)"
+fi
+
 # --- user-defined sidebar sections (WIN-83) ---------------------------------
 # The interesting property is the appear-ONCE rule: a conversation in a custom
 # section leaves Channels, and a starred one leaves the custom section too. That is

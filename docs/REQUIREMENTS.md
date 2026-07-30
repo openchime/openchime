@@ -1056,8 +1056,15 @@ messages (author name, ARCH-74). Not yet backed by an architecture decision.*
   title/role text, timezone, and pronouns — set by the user (some fields possibly
   admin-managed in a corporate deployment) and shown wherever the user appears.
   Avatars have been stored as image assets in object storage (ARCH-17), not
-  SQLite. **[needs ARCH decision — profile field set, edit authority, avatar asset
-  storage.]**
+  SQLite. **DONE** (2026-07-30) except **pronouns**, which is a field nobody has
+  asked for yet and would be added the same way: display name, title, timezone and
+  the avatar are all editable and carried on `PROFILE_INFO`. The avatar is an
+  ordinary attachment id (`users.avatar_attachment_id`), so it lands in the existing
+  blob store — object storage where one is configured — rather than inventing
+  storage; it is readable workspace-wide, and only an attachment the setter uploaded
+  can become one. Edit authority is the user's own: no admin-managed fields, which
+  is the simpler half of the choice and the one a self-hosted deployment can live
+  with.
 - **REQ-241.** A user has been able to set a transient **custom status** — a
   short text plus an emoji, with an optional expiry — shown alongside their name
   and presence (Section 4). **[needs ARCH decision — status storage + expiry and

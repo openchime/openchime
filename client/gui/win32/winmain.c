@@ -537,7 +537,10 @@ enum { THUMB_CACHE = 32 };
  * id. Every lookup then missed, and every miss triggered another fetch — the
  * image rendered once and then flickered back to "loading" for good.
  * IWICBitmapSource_GetSize takes explicit out-params and has no such hazard. */
-static struct { uint64_t id; ID2D1Bitmap *bmp; UINT w, h; } g_thumbs[THUMB_CACHE];
+/* `px` is the decoded PBGRA image, kept alongside the bitmap so one can be created
+ * for ANOTHER render target (the screenshot harness's DC target). Without it every
+ * capture had to suppress images entirely — see g_shot_rt below. */
+static struct { uint64_t id; ID2D1Bitmap *bmp; UINT w, h; uint8_t *px; UINT stride; } g_thumbs[THUMB_CACHE];
 static int      g_n_thumbs;
 /* A D2D bitmap belongs to the render target that created it; drawing it into
  * another one fails the whole frame, and the test harness renders the same scene
@@ -545,7 +548,16 @@ static int      g_n_thumbs;
  * pointers: the comparison silently missed on the real window target too, which
  * turned every cache lookup into a miss and every miss into another fetch — a
  * decode loop that filled the cache with copies of the same image. */
+/* Images in SCREENSHOTS (WIN-47's diagnosis). g_thumbs_off used to mean "this render
+ * is a capture, so draw no images and request none" — which made every screenshot of
+ * this app a picture with the pictures missing. That cost an hour here: the avatars
+ * were drawing correctly on screen the whole time and no capture could show it.
+ * Now only the FETCH is suppressed; the draw goes through a per-shot bitmap created
+ * from the kept pixels for the capture's own target, and released after it. */
 static int g_thumbs_off;
+static ID2D1RenderTarget *g_shot_rt;
+static struct { uint64_t id; ID2D1Bitmap *bmp; } g_shot_bmp[THUMB_CACHE];
+static int g_n_shot_bmp;
 static uint64_t g_thumb_missing[THUMB_CACHE];   /* asked for, nothing came back */
 static int      g_n_thumb_missing;
 static uint64_t g_thumb_pending;                /* one fetch in flight */
@@ -575,25 +587,112 @@ static int mime_is_image(const char *mime) {
 }
 
 static ID2D1Bitmap *thumb_get(ID2D1RenderTarget *rt, uint64_t id, UINT *w, UINT *h) {
-    (void)rt;
-    if (g_thumbs_off) return NULL;
-    for (int i = 0; i < g_n_thumbs; i++)
-        if (g_thumbs[i].id == id) {
-            if (w) *w = g_thumbs[i].w;
-            if (h) *h = g_thumbs[i].h;
-            return g_thumbs[i].bmp;
+    for (int i = 0; i < g_n_thumbs; i++) {
+        if (g_thumbs[i].id != id) continue;
+        if (w) *w = g_thumbs[i].w;
+        if (h) *h = g_thumbs[i].h;
+        /* Drawing another target's bitmap fails the WHOLE frame, so a capture gets
+         * its own, made from the pixels we kept. */
+        if (rt && g_shot_rt && rt == g_shot_rt) {
+            for (int k = 0; k < g_n_shot_bmp; k++)
+                if (g_shot_bmp[k].id == id) return g_shot_bmp[k].bmp;
+            if (!g_thumbs[i].px || g_n_shot_bmp >= THUMB_CACHE) return NULL;
+            D2D1_BITMAP_PROPERTIES bp;
+            bp.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            bp.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+            bp.dpiX = bp.dpiY = 96.0f;
+            D2D1_SIZE_U sz = { g_thumbs[i].w, g_thumbs[i].h };
+            ID2D1Bitmap *nb = NULL;
+            if (FAILED(ID2D1RenderTarget_CreateBitmap(rt, sz, g_thumbs[i].px,
+                                                      g_thumbs[i].stride, &bp, &nb)) || !nb)
+                return NULL;
+            g_shot_bmp[g_n_shot_bmp].id = id;
+            g_shot_bmp[g_n_shot_bmp].bmp = nb;
+            g_n_shot_bmp++;
+            return nb;
         }
+        return g_thumbs[i].bmp;
+    }
     return NULL;
+}
+
+static void shot_bmp_drop(void) {
+    for (int i = 0; i < g_n_shot_bmp; i++)
+        if (g_shot_bmp[i].bmp) ID2D1Bitmap_Release(g_shot_bmp[i].bmp);
+    g_n_shot_bmp = 0;
 }
 static int thumb_failed(uint64_t id) {
     for (int i = 0; i < g_n_thumb_missing; i++) if (g_thumb_missing[i] == id) return 1;
     return 0;
 }
 static void thumbs_drop(void) {
-    for (int i = 0; i < g_n_thumbs; i++)
+    for (int i = 0; i < g_n_thumbs; i++) {
         if (g_thumbs[i].bmp) ID2D1Bitmap_Release(g_thumbs[i].bmp);
+        free(g_thumbs[i].px);
+        g_thumbs[i].px = NULL;
+    }
     g_n_thumbs = 0;
 }
+
+/* A user's avatar id, or 0. Roster-carried (WIN-47), so no round trip per author. */
+static uint64_t avatar_of(const oc_model *m, uint64_t uid) {
+    if (!m || !uid) return 0;
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == uid) return m->users[i].avatar_id;
+    return 0;
+}
+
+/* Draw a user's avatar in `box`: their photo when we have the bytes, the coloured
+ * initial otherwise (WIN-47).
+ *
+ * The image is CIRCLE-CLIPPED by filling an ellipse with a bitmap brush rather than
+ * pushing a layer: a layer costs a render-target flush per avatar, and a transcript
+ * can hold dozens. The brush transform scales the shorter edge to the box and
+ * centres the overflow, so a non-square photo is cropped rather than squashed.
+ *
+ * It shares the thumbnail cache and its single-fetch-in-flight rule, so avatars and
+ * inline images cannot fight each other for the one transfer slot.
+ * `square` draws a rounded square instead (the sidebar's DM rows and the rail). */
+static ID2D1Bitmap *thumb_get(ID2D1RenderTarget *rt, uint64_t id, UINT *w, UINT *h);  /* fwd */
+static int thumb_failed(uint64_t id);                                                  /* fwd */
+
+static int draw_avatar_image(ID2D1RenderTarget *rt, uint64_t aid, D2D1_RECT_F box,
+                             float radius, int square) {
+    UINT iw = 0, ih = 0;
+    ID2D1Bitmap *bmp = aid ? thumb_get(rt, aid, &iw, &ih) : NULL;
+    if (!bmp || !iw || !ih) return 0;
+    float bw = box.right - box.left, bh = box.bottom - box.top;
+    float scale = (iw * bh > ih * bw) ? (bh / (float)ih) : (bw / (float)iw);
+    ID2D1BitmapBrush *br = NULL;
+    D2D1_BITMAP_BRUSH_PROPERTIES bp;
+    bp.extendModeX = bp.extendModeY = D2D1_EXTEND_MODE_CLAMP;
+    bp.interpolationMode = D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
+    D2D1_BRUSH_PROPERTIES gp;
+    gp.opacity = 1.0f;
+    gp.transform.m11 = scale; gp.transform.m12 = 0;
+    gp.transform.m21 = 0;     gp.transform.m22 = scale;
+    gp.transform.dx = box.left + (bw - iw * scale) / 2;
+    gp.transform.dy = box.top  + (bh - ih * scale) / 2;
+    /* Through the vtable, not the ID2D1RenderTarget_CreateBitmapBrush macro:
+     * mingw-w64's d2d1.h defines that one with three parameters while the interface
+     * takes four, so the convenience macro does not compile. */
+    if (FAILED(rt->lpVtbl->CreateBitmapBrush(rt, bmp, &bp, &gp, &br)) || !br) return 0;
+    if (square) {
+        D2D1_ROUNDED_RECT rr = { box, radius, radius };
+        ID2D1RenderTarget_FillRoundedRectangle(rt, &rr, (ID2D1Brush *)br);
+    } else {
+        D2D1_ELLIPSE e = { { (box.left + box.right) / 2, (box.top + box.bottom) / 2 },
+                           bw / 2, bh / 2 };
+        ID2D1RenderTarget_FillEllipse(rt, &e, (ID2D1Brush *)br);
+    }
+    ID2D1BitmapBrush_Release(br);
+    return 1;
+}
+
+/* Ask for an avatar's bytes if we do not have them. Deliberately the same one-at-a-
+ * time gate the inline images use — a roster of 200 people must not open 200
+ * transfers. */
+static void avatar_want(uint64_t aid);
 
 /* WIN-16: paging older history. One request in flight at a time, and a
  * remembered "we reached the top" so we stop asking a channel that has no more. */
@@ -1685,6 +1784,40 @@ static const struct { int act; int icon; const char *label; int admin; } RAIL_IT
 
 static int ws_unread_elsewhere(void);   /* fwd */
 
+static void avatar_want(uint64_t aid) {
+    if (!aid || g_thumbs_off || g_thumb_pending || !g_client) return;
+    if (thumb_get(NULL, aid, NULL, NULL) || thumb_failed(aid)) return;
+    g_thumb_pending = aid;
+    g_thumb_deadline = GetTickCount64() + 8000;
+    oc_client_fetch_attachment(g_client, aid);
+}
+
+/* One user avatar, wherever one is drawn: the photo when we have it, otherwise the
+ * coloured initial that has always been there. `tint` is the initial's disc colour,
+ * `fmt` the format its letter is drawn in. */
+static void draw_user_avatar(ID2D1RenderTarget *rt, const oc_model *m, uint64_t uid,
+                             const char *name, D2D1_RECT_F box, uint32_t tint,
+                             IDWriteTextFormat *fmt, int square, float radius) {
+    uint64_t aid = avatar_of(m, uid);
+    if (aid) {
+        if (draw_avatar_image(rt, aid, box, radius, square)) return;
+        avatar_want(aid);        /* not here yet: fall through to the initial */
+    }
+    if (square) {
+        fill_round(rt, box, radius, tint);
+    } else {
+        D2D1_ELLIPSE e = { { (box.left + box.right) / 2, (box.top + box.bottom) / 2 },
+                           (box.right - box.left) / 2, (box.bottom - box.top) / 2 };
+        ID2D1RenderTarget_FillEllipse(rt, &e, paint_with(tint));
+    }
+    const char *nm = (name && name[0]) ? name : "user";
+    char ini[2] = { (char)(nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]), 0 };
+    DWRITE_TEXT_ALIGNMENT prev = IDWriteTextFormat_GetTextAlignment(fmt);
+    IDWriteTextFormat_SetTextAlignment(fmt, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, ini, fmt, box, 0xFFFFFF);
+    IDWriteTextFormat_SetTextAlignment(fmt, prev);
+}
+
 static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     fill(rt, rf(0, 0, RAIL_W, h), OC_COL_RAIL);
     g_n_navrows = 0;
@@ -1762,10 +1895,9 @@ static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
         if (NAV_PROFILE == g_nav_hover)
             fill_round_a(rt, rf(cx - 18, py + 6, cx + 18, py + 42), 10.0f, 0xFFFFFF, 0.08f);
         const char *nm = m ? oc_model_user_name(m, m->user_id) : "";
-        char pi[2] = { (char)((nm && nm[0]) ? (nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]) : 'U'), 0 };
-        D2D1_ELLIPSE e = { { cx, py + 24 }, 15, 15 };
-        ID2D1RenderTarget_FillEllipse(rt, &e, paint_with(OC_COL_ACCENT_DIM));
-        draw_text(rt, pi, g_avatar, rf(0, py + 9, RAIL_W, py + 39), 0xFFFFFF);
+        draw_user_avatar(rt, m, m ? m->user_id : 0, (nm && nm[0]) ? nm : "U",
+                         rf(cx - 15, py + 9, cx + 15, py + 39), OC_COL_ACCENT_DIM,
+                         g_avatar, 0, 0);
         draw_text(rt, "You", g_micro, rf(0, py + 45, RAIL_W, py + 61), OC_COL_RAIL_ICON);
         rail_hit(py, py + RAIL_IH, NAV_PROFILE);
     }
@@ -2045,12 +2177,7 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                  * the marker in Slack's DM list is the human, not the sigil. */
                 D2D1_RECT_F av = rf(sx0 + 12, ry + (ROW_H - 18) / 2, sx0 + 30, ry + (ROW_H + 18) / 2);
                 uint32_t tint = AVPAL[r->peer_id % (sizeof AVPAL / sizeof AVPAL[0])];
-                fill_round(rt, av, 5.0f, tint);
-                char ini[2] = { (char)(r->label[0] >= 'a' && r->label[0] <= 'z'
-                                       ? r->label[0] - 32 : r->label[0]), 0 };
-                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
-                draw_text(rt, ini, g_meta, av, 0xFFFFFF);
-                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+                draw_user_avatar(rt, m, r->peer_id, r->label, av, tint, g_meta, 1, 5.0f);
                 draw_presence_dot(rt, av.right - 1, av.bottom - 1, 3.5f,
                                   oc_model_presence_of(m, r->peer_id),
                                   selected ? OC_COL_SELECT : OC_COL_SIDEBAR);
@@ -2260,10 +2387,8 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
         /* Avatar: colored circle with the author's initial. */
         const char *nm = msg->author_name[0] ? msg->author_name : oc_model_user_name(m, msg->author_id);
         if (!nm || !nm[0]) nm = "user";
-        D2D1_ELLIPSE e = { { ax + AVA / 2, ty + AVA / 2 }, AVA / 2, AVA / 2 };
-        ID2D1RenderTarget_FillEllipse(rt, &e, paint_with(AVPAL[msg->author_id % 6]));
-        char ini[2] = { (char)(nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]), 0 };
-        draw_text(rt, ini, g_avatar, rf(ax, ty, ax + AVA, ty + AVA), 0xFFFFFF);
+        draw_user_avatar(rt, m, msg->author_id, nm, rf(ax, ty, ax + AVA, ty + AVA),
+                         AVPAL[msg->author_id % 6], g_avatar, 0, 0);
 
         /* Author + timestamp on the header line. */
         D2D1_RECT_F hl = rf(tx, ty, x0 + content_w + AVA + 12, ty + 20);
@@ -4214,11 +4339,8 @@ static void draw_profile_card(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
     if (!nm || !nm[0]) nm = "user";
     float cx = (reg.left + reg.right) / 2, y = reg.top + 18;
 
-    D2D1_ELLIPSE av = { { cx, y + 36 }, 36, 36 };
-    ID2D1RenderTarget_FillEllipse(rt, &av, paint_with(AVPAL[g_profile_uid % 6]));
-    char ini[2] = { (char)(nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]), 0 };
-    IDWriteTextFormat_SetTextAlignment(g_display, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, ini, g_display, rf(cx - 36, y, cx + 36, y + 72), 0xFFFFFF);
+    draw_user_avatar(rt, m, g_profile_uid, nm, rf(cx - 36, y, cx + 36, y + 72),
+                     AVPAL[g_profile_uid % 6], g_display, 0, 0);
     y += 84;
 
     draw_text(rt, nm, g_display, rf(reg.left + 12, y, reg.right - 12, y + 28), OC_COL_TEXT);
@@ -7276,6 +7398,7 @@ static void thumb_decode(uint64_t id, const uint8_t *data, size_t len) {
         return;
 
     UINT iw = 0, ih = 0;
+    uint8_t *thumb_px = NULL; UINT thumb_stride = 0;
     IWICStream *stream = NULL;
     IWICBitmapDecoder *dec = NULL;
     IWICBitmapFrameDecode *frame = NULL;
@@ -7296,6 +7419,21 @@ static void thumb_decode(uint64_t id, const uint8_t *data, size_t len) {
         IWICBitmapSource_GetSize((IWICBitmapSource *)conv, &iw, &ih);
         ID2D1RenderTarget_CreateBitmapFromWicBitmap((ID2D1RenderTarget *)g_rt,
                                                     (IWICBitmapSource *)conv, NULL, &bmp);
+        /* Copy the pixels out too. A D2D bitmap belongs to the target that made it,
+         * and the harness renders the same scene into a DIFFERENT target — so a
+         * screenshot could not draw one at all, and every capture of this app has
+         * silently had no images in it. The bytes belong to nobody. */
+        if (bmp && iw && ih && (uint64_t)iw * ih <= 4096ull * 4096ull) {
+            UINT stride = iw * 4;
+            uint8_t *px = malloc((size_t)stride * ih);
+            if (px) {
+                WICRect all = { 0, 0, (INT)iw, (INT)ih };
+                if (SUCCEEDED(IWICBitmapSource_CopyPixels((IWICBitmapSource *)conv, &all,
+                                                          stride, stride * ih, px))) {
+                    thumb_px = px; thumb_stride = stride;
+                } else free(px);
+            }
+        }
     }
     if (conv)   IWICFormatConverter_Release(conv);
     if (frame)  IWICBitmapFrameDecode_Release(frame);
@@ -7308,9 +7446,12 @@ static void thumb_decode(uint64_t id, const uint8_t *data, size_t len) {
     }
     if (g_n_thumbs == THUMB_CACHE) {          /* oldest out */
         if (g_thumbs[0].bmp) ID2D1Bitmap_Release(g_thumbs[0].bmp);
+        free(g_thumbs[0].px);
         memmove(&g_thumbs[0], &g_thumbs[1], (THUMB_CACHE - 1) * sizeof g_thumbs[0]);
         g_n_thumbs--;
     }
+    g_thumbs[g_n_thumbs].px = thumb_px;
+    g_thumbs[g_n_thumbs].stride = thumb_stride;
     g_thumbs[g_n_thumbs].id = id;
     g_thumbs[g_n_thumbs].bmp = bmp;
     g_thumbs[g_n_thumbs].w = iw;
@@ -9641,6 +9782,14 @@ static void open_profile_menu(HWND hwnd) {
         }
     }
     mi_item(53, "Edit profile\xE2\x80\xA6");
+    /* WIN-47. Two items rather than a field in the profile form: choosing a file is
+     * an OS dialog, and burying it behind a text form would mean opening one modal to
+     * reach another. "Remove" only appears when there is a photo to remove. */
+    mi_item(55, "Change photo\xE2\x80\xA6");
+    {
+        const oc_model *am = model();
+        if (am && avatar_of(am, am->user_id)) mi_item(56, "Remove photo");
+    }
     mi_item(54, "Active sessions\xE2\x80\xA6");   /* REQ-182 */
     /* Preferences hangs off YOU as well as off the workspace menu (WIN-78). It was
      * only on the workspace menu, which is the same category error as the
@@ -9978,6 +10127,36 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         if (!form_dialog(hwnd, "Edit profile", f, 2)) break;
         oc_client_set_profile(g_client, f[0].value, f[1].value);
         break; }
+    case 55: {   /* WIN-47: choose an image, upload it, claim it as the avatar */
+        if (!g_client) break;
+        WCHAR file[MAX_PATH]; file[0] = 0;
+        OPENFILENAMEW ofn; ZeroMemory(&ofn, sizeof ofn);
+        ofn.lStructSize = sizeof ofn;
+        ofn.hwndOwner = hwnd;
+        ofn.lpstrFile = file;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.lpstrFilter = L"Images\0*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp\0";
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+        if (!GetOpenFileNameW(&ofn)) break;
+        char path[1024];
+        WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof path, NULL, NULL);
+        /* The bytes need A channel to be uploaded into (the wire requires one) and
+         * nothing is posted there. The SELF-DM is the honest choice: it is the one
+         * conversation that is unambiguously the user's own space. Falling back to
+         * the open conversation would put a stray attachment row in a shared
+         * channel's storage accounting. */
+        uint64_t up = 0;
+        const oc_model *um = model();
+        if (um) for (size_t i = 0; i < um->n_channels; i++)
+            if (um->channels[i].kind == OC_CHANNEL_KIND_DM &&
+                um->channels[i].peer_id == um->user_id) { up = um->channels[i].channel_id; break; }
+        if (!up) up = g_sel;
+        if (!up) { toast_push("Open a conversation first.", 1); break; }
+        oc_client_upload_avatar(g_client, up, path);
+        break; }
+    case 56:                                   /* WIN-47 */
+        oc_client_set_avatar(g_client, 0);
+        break;
     case 30: {
         const char *cur = m ? oc_model_user_name(m, m->user_id) : "";
         oc_field f[1] = { { FF_TEXT, "Display name",
@@ -10323,8 +10502,11 @@ static int test_shot(HWND hwnd, const char *path) {
              * target into this one and the whole frame fails to draw. */
             ID2D1RenderTarget_CreateSolidColorBrush(rt, &acc, NULL, &g_brush3);
             ID2D1RenderTarget_BeginDraw(rt);
-            g_thumbs_off = 1;
+            g_thumbs_off = 1;      /* do not FETCH during a capture */
+            g_shot_rt = rt;        /* ... but do draw what we already have */
             render_scene(rt, model(), DIPF(w), DIPF(h));
+            g_shot_rt = NULL;
+            shot_bmp_drop();
             g_thumbs_off = 0;
             if (SUCCEEDED(ID2D1RenderTarget_EndDraw(rt, NULL, NULL))) ok = 1;
             if (g_brush) ID2D1SolidColorBrush_Release(g_brush);
@@ -10389,6 +10571,7 @@ static void test_dump(const char *path) {
         fprintf(f, "  sbrow sec=%d header=%d cid=%llu label=\"%s\"\n",
                 g_rows[i].sec, g_rows[i].header,
                 (unsigned long long)g_rows[i].cid, g_rows[i].label);
+    fprintf(f, "myavatar=%llu\n", (unsigned long long)avatar_of(m, m->user_id));
     fprintf(f, "sections=%d\n", g_sb.n_custom);
     for (int i = 0; i < g_sb.n_custom; i++) {
         fprintf(f, "  section %d name=\"%s\" n=%u collapsed=%u ids=", i,
@@ -10477,6 +10660,11 @@ static void test_dump(const char *path) {
                 g_thumb_hits[i].r.left, g_thumb_hits[i].r.top,
                 g_thumb_hits[i].r.right - g_thumb_hits[i].r.left,
                 g_thumb_hits[i].r.bottom - g_thumb_hits[i].r.top);
+    for (int i = 0; i < g_n_thumbs; i++)
+        fprintf(f, "  thumb %d id=%llu %ux%u\n", i, (unsigned long long)g_thumbs[i].id,
+                g_thumbs[i].w, g_thumbs[i].h);
+    for (int i = 0; i < g_n_thumb_missing; i++)
+        fprintf(f, "  thumbmiss %llu\n", (unsigned long long)g_thumb_missing[i]);
     fprintf(f, "thumb_pending=%llu n_thumbs=%d n_missing=%d off=%d\n",
             (unsigned long long)g_thumb_pending, g_n_thumbs, g_n_thumb_missing, g_thumbs_off);
     for (int i = 0; i < g_n_thumbs; i++)
@@ -10724,6 +10912,21 @@ static void test_poll(HWND hwnd) {
             int okp = form_dialog(hwnd, TITLES[0], f, nf);
             snprintf(g_form_last, sizeof g_form_last, "%s text=\"%s\" check=%s choice=%s",
                      okp ? "ok" : "cancel", f[0].value, f[1].value, f[2].value);
+        }
+    } else if (!strcmp(verb, "avatar")) {
+        /* WIN-47. `avatar <windows path>` uploads and claims it; `avatar 0` clears.
+         * The menu item opens an OS file dialog, which a harness cannot drive at all,
+         * so the verb goes at the client call underneath it. */
+        if (!strcmp(arg, "0")) { oc_client_set_avatar(g_client, 0); test_ack("ok"); }
+        else {
+            uint64_t up = 0;
+            const oc_model *um = model();
+            if (um) for (size_t i = 0; i < um->n_channels; i++)
+                if (um->channels[i].kind == OC_CHANNEL_KIND_DM &&
+                    um->channels[i].peer_id == um->user_id) { up = um->channels[i].channel_id; break; }
+            if (!up) up = g_sel;
+            if (!up) { test_ack("err"); }
+            else { oc_client_upload_avatar(g_client, up, arg); test_ack("ok"); }
         }
     } else if (!strcmp(verb, "section")) {
         /* WIN-83: `section add <name>` | `section put <cid> <idx>` | `section rm <idx>`

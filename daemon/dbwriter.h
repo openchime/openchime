@@ -101,7 +101,8 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_SET_STATUS = 70, OC_JOB_SET_PROFILE = 71, OC_JOB_GET_PROFILE = 72,
        OC_JOB_LIST_FILE_CHANNELS = 73,   /* WIN-82 */
        OC_JOB_LIST_SESSIONS = 74,        /* REQ-182 */
-       OC_JOB_SET_NOTIFY_DEFAULT = 75 }; /* REQ-134 */
+       OC_JOB_SET_NOTIFY_DEFAULT = 75,   /* REQ-134 */
+       OC_JOB_SET_AVATAR = 76 };         /* WIN-47 */
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -395,6 +396,7 @@ typedef struct {
     uint8_t  disabled;
     char    *email;         /* heap; may be "" */
     char    *display_name;  /* heap; may be "" */
+    uint64_t avatar_id;     /* WIN-47: attachment id, 0 = none */
 } oc_user_row;
 
 /* One message to replay on reconnect (rendered as a BROADCAST by the net thread),

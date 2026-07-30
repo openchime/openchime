@@ -80,6 +80,44 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 
 ### The items added 2026-07-30, in detail
 
+- ~~**WIN-47 — avatar images.**~~ **DONE** (REQ-240's last piece). An avatar is an
+  ordinary attachment (REQ-140) claimed with a new `SET_AVATAR` (0x0078): the upload
+  path, the size cap and the blob store all keep working, and `users.avatar_attachment_id`
+  from migration 0027 finally has a writer. `USER_LIST` carries each user's avatar id
+  so a transcript draws every author's picture with **no PROFILE_INFO round trip per
+  author** — a frame layout change, so `OC_PROTOCOL_VERSION` moved 3 → 4.
+  **Three defects this exposed, all of them "the feature would have looked fine and
+  been wrong":**
+  1. `oc_push_collect`-style silence: the reclaim sweep would have **deleted every
+     avatar**. An avatar is an attachment no message references, which is precisely
+     what tier 1 collects as an orphan (and tiers 2a/2b by age and pressure) — every
+     profile picture in the workspace would have gone blank about an hour after being
+     set. All three tiers exclude anything that is currently somebody's avatar, and
+     `test_storage.c` asserts both halves: it survives an aggressive sweep, and it
+     becomes collectable again once it stops being an avatar.
+  2. An avatar has to be readable **workspace-wide** — the picture appears beside its
+     owner's messages in channels the viewer shares with them, which is not where the
+     file was uploaded. So `process_attach_lookup` grants any authenticated user
+     access to an attachment that IS someone's avatar. The exposure is bounded at the
+     other end: `process_set_avatar` only accepts an attachment the **setter**
+     uploaded, or a member could publish a private channel's file to everyone by
+     pointing their avatar at it. Both directions are tested.
+  3. **No screenshot of this app has ever contained an image.** `test_shot` set
+     `g_thumbs_off` because a D2D bitmap belongs to the render target that made it and
+     the capture uses its own. That cost an hour: the avatars were drawing correctly
+     on screen and every capture showed the fallback initials, so the evidence said
+     the feature did not work. The decoded pixels are kept beside each bitmap now, and
+     a capture creates its own bitmaps from them for its own target — inline images
+     (WIN-17) are visible in captures for the first time too.
+  Rendering: one `draw_user_avatar()` used by the transcript, the sidebar's DM rows,
+  the rail's You button and the profile card. The photo is circle-clipped by filling
+  an ellipse with a **bitmap brush** rather than pushing a layer — a layer costs a
+  render-target flush per avatar and a transcript holds dozens — with the shorter edge
+  scaled to the box so a non-square photo is cropped, not squashed. Set from
+  "Change photo…" in the You menu; "Remove photo" appears only when there is one.
+  **Known limitation:** other clients see a changed avatar on their next roster
+  refresh, not immediately — `SET_AVATAR` answers only the setter.
+
 - ~~**WIN-83 — user-defined sidebar sections.**~~ **DONE** (REQ-234's other half). Up
   to 8 named sections holding up to 32 conversations each, between Starred and
   Channels. The rule that matters is **appear once**: a conversation in a section
@@ -288,7 +326,7 @@ Not startable in this client. Each names what must land first.
 | ~~**WIN-44**~~ | ~~Copy link / jump-to-permalink~~ **DONE.** The inbound half was all that was missing — `HISTORY_AROUND` and Copy link already existed. A permalink pasted into the **command palette** navigates: switch channel, arm the jump, fetch around the id if it is outside the loaded window (ARCH-96). Deliberately **not** the composer, where pasting must keep inserting the text, because sharing a link is the common case. Every failure says why — not signed in, another workspace, a channel you cannot see — since a link that silently does nothing is indistinguishable from a broken app. **Found while building it:** the outbound format omitted the port (`g_host` holds the host alone), so a link from a workspace on 8443 pointed at 443 and could not be followed. Having only one half of a feature is what hid that. | — |
 | ~~**WIN-45**~~ | ~~Real `@mentions` (highlight + notify)~~ **DONE.** REQ-221/ARCH-89 built in the daemon (migration 0021, `shared/mention.c`) and surfaced here: mention spans are accent-coloured and semi-bold in `body_layout`, a message naming you tints its row and gets an accent bar, and the in-app `MENTIONS` notify level is now evaluated with the same scanner instead of being silently skipped. | — |
 | ~~**WIN-46**~~ | ~~Invite management: pending list, expiry, revoke~~ **DONE.** `LIST_INVITES`/`REVOKE_INVITE` over columns migration 0002 already had, surfaced as **Admin → Invites**: role, an expiry **countdown** ("expires in 6d" — an epoch stamp does not answer the question), who minted it, and Revoke behind a themed confirmation. The token is absent by necessity and the pane says so: only its SHA-256 is stored, so a lost invite is revoked and re-minted, never re-shown. | — |
-| **WIN-47** | Rich profile fields — ~~title, timezone~~ **(done)** · avatar image | REQ-240 — migration 0027 adds `title`, `timezone` and `avatar_attachment_id`; title and timezone are editable and carried in `PROFILE_INFO`. The **avatar image is not built**: the column and the design are there (an attachment id, so the existing store handles upload, dedup and reclamation) but the upload/render path is real work and is left honestly open |
+| ~~**WIN-47**~~ | ~~Rich profile fields — title, timezone, avatar image~~ **DONE** — see §1 | REQ-240 — migration 0027 adds `title`, `timezone` and `avatar_attachment_id`; title and timezone are editable and carried in `PROFILE_INFO`. The **avatar image is not built**: the column and the design are there (an attachment id, so the existing store handles upload, dedup and reclamation) but the upload/render path is real work and is left honestly open |
 | ~~**WIN-48**~~ | ~~Webhook rotate / enable-disable~~ **DONE.** Two opcodes (`SET_WEBHOOK_STATE`, `ROTATE_WEBHOOK`) over the `disabled` column that migration 0016 already had, and per-row **Disable/Enable · Rotate · Delete** buttons in the webhook list. Disable answers with the channel's list so the view cannot drift; rotate answers with the same shown-once frame create uses, and is **confirmed** because the old token dies immediately. Authorised by CHANNEL membership, not tenant role — a webhook belongs to a channel. **"Reveal" is struck from the item as impossible**: only the token's SHA-256 is stored, so the list says so in words rather than offering a button that cannot work. | — |
 | ~~**WIN-49**~~ | ~~Activity feed — the **Activity** rail stub~~ **DONE.** REQ-139/ARCH-95: mentions, reactions to your messages and replies under your threads, newest first, with a marker on what arrived since you last looked. A union of three queries — no maintained list to drift. **Structured list-and-detail** (ARCH-94): the feed is the *second column* and the conversation stays in the middle, so clicking an item shows the thread from that point instead of replacing the transcript with a page you then have to leave. Filter by All / Mentions / Reactions / Threads. | — |
 | ~~**WIN-50**~~ | ~~Files browser — the **Files** rail stub~~ **DONE.** The workspace-wide view over `LIST_FILES` with `channel_id 0`, which the daemon already answered — so this was a fetch and a header, not a protocol change. Each row names the channel it came from (the point of a cross-channel list) and clicking one switches channel and jumps to the message. Type filter (All / Images / Documents / Other) on both this and the channel tab, and the 200-row cap is stated rather than silently truncating. | — |

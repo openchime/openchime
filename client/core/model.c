@@ -208,11 +208,14 @@ size_t oc_model_seen_by(const oc_model *m, uint64_t channel_id, uint64_t message
 }
 
 /* Upsert a roster entry keyed on user_id. */
-static void user_upsert(oc_model *m, uint64_t user_id, const char *name, uint8_t role, uint8_t disabled) {
+static void user_upsert(oc_model *m, uint64_t user_id, const char *name, uint8_t role,
+                        uint8_t disabled, uint64_t avatar_id) {
     for (size_t i = 0; i < m->n_users; i++)
         if (m->users[i].user_id == user_id) {
             snprintf(m->users[i].name, sizeof m->users[i].name, "%s", name ? name : "");
-            m->users[i].role = role; m->users[i].disabled = disabled; return;
+            m->users[i].role = role; m->users[i].disabled = disabled;
+            m->users[i].avatar_id = avatar_id;                    /* WIN-47 */
+            return;
         }
     if (m->n_users == m->cap_users) {
         size_t cap = m->cap_users ? m->cap_users * 2 : 16;
@@ -223,6 +226,7 @@ static void user_upsert(oc_model *m, uint64_t user_id, const char *name, uint8_t
     oc_member *u = &m->users[m->n_users++];
     memset(u, 0, sizeof *u);
     u->user_id = user_id; u->role = role; u->disabled = disabled;
+    u->avatar_id = avatar_id;
     snprintf(u->name, sizeof u->name, "%s", name ? name : "");
 }
 
@@ -233,7 +237,7 @@ static void user_update_role(oc_model *m, uint64_t user_id, uint8_t role, uint8_
         if (m->users[i].user_id == user_id) {
             m->users[i].role = role; m->users[i].disabled = disabled; return;
         }
-    user_upsert(m, user_id, "", role, disabled);
+    user_upsert(m, user_id, "", role, disabled, 0);
 }
 
 const char *oc_model_user_name(const oc_model *m, uint64_t user_id) {
@@ -1149,7 +1153,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         }
         break;
     case OC_EV_USER:
-        user_upsert(m, e->user_id, e->body ? e->body : "", e->status, e->op);
+        user_upsert(m, e->user_id, e->body ? e->body : "", e->status, e->op, e->message_id);
         break;
     case OC_EV_WEBHOOK_INFO:
         /* A freshly-minted webhook: the token is shown once. Record it and, if the

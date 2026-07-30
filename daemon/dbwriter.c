@@ -798,7 +798,8 @@ static oc_dbres *process_list_users(sqlite3 *db, const oc_job *j) {
 
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT id, role, disabled, COALESCE(email,''), COALESCE(display_name,'') "
+        "SELECT id, role, disabled, COALESCE(email,''), COALESCE(display_name,''), "
+        "       COALESCE(avatar_attachment_id,0) "
         "FROM users ORDER BY id;", -1, &st, NULL);
     size_t cap = 8, n = 0;
     oc_user_row *arr = malloc(cap * sizeof *arr);
@@ -809,6 +810,9 @@ static oc_dbres *process_list_users(sqlite3 *db, const oc_job *j) {
         arr[n].disabled     = (uint8_t)(sqlite3_column_int(st, 2) != 0);
         arr[n].email        = strdup((const char *)sqlite3_column_text(st, 3));
         arr[n].display_name = strdup((const char *)sqlite3_column_text(st, 4));
+        /* The roster carries the avatar (WIN-47) so a transcript can draw every
+         * author's picture without a PROFILE_INFO round trip per author. */
+        arr[n].avatar_id    = (uint64_t)sqlite3_column_int64(st, 5);
         n++;
     }
     sqlite3_finalize(st);
@@ -3378,7 +3382,21 @@ static oc_dbres *process_attach_lookup(sqlite3 *db, const oc_job *j) {
     const void *dg  = sqlite3_column_blob(st, 5);
     int dglen       = sqlite3_column_bytes(st, 5);
 
-    if (!channel_read_access(db, cid, j->user_id)) {
+    /* An AVATAR is readable by every authenticated user (WIN-47), regardless of the
+     * channel the image was uploaded to. It has to be: a picture is drawn beside
+     * every message its owner wrote, in channels the viewer shares with them but the
+     * uploader's own upload channel is not. The exposure is bounded by
+     * process_set_avatar, which only accepts an attachment the SETTER uploaded — so
+     * this cannot be used to publish somebody else's private file. */
+    int is_avatar = 0;
+    {
+        sqlite3_stmt *av = NULL;
+        sqlite3_prepare_v2(db, "SELECT 1 FROM users WHERE avatar_attachment_id=?1;", -1, &av, NULL);
+        sqlite3_bind_int64(av, 1, (sqlite3_int64)j->attachment_id);
+        is_avatar = (sqlite3_step(av) == SQLITE_ROW);
+        sqlite3_finalize(av);
+    }
+    if (!is_avatar && !channel_read_access(db, cid, j->user_id)) {
         sqlite3_finalize(st);
         r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_FORBIDDEN;
         return r;
@@ -3791,6 +3809,44 @@ static oc_dbres *process_set_profile(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_text (st, 2, j->body ? (const char *)j->body : "",
                        j->body ? (int)j->body_len : 0, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    build_profile(db, j->user_id, r);
+    return r;
+}
+
+/* The avatar (WIN-47). An attachment id, validated here rather than trusted: it must
+ * exist, be finalized, be an image, and be one THIS user uploaded. Without the last
+ * check any member could point their avatar at somebody else's private-channel
+ * attachment and have the daemon serve it to the whole workspace — the relaxation in
+ * attachment_read_access() below makes an avatar readable by everyone, so the id has
+ * to be one the user was entitled to in the first place. */
+static oc_dbres *process_set_avatar(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    uint64_t aid = j->message_id;          /* 0 clears */
+    if (aid) {
+        sqlite3_stmt *ck = NULL;
+        int ok = 0;
+        sqlite3_prepare_v2(db,
+            "SELECT 1 FROM attachments WHERE id=?1 AND uploader_id=?2 "
+            "  AND size > 0 AND mime LIKE 'image/%';", -1, &ck, NULL);
+        sqlite3_bind_int64(ck, 1, (sqlite3_int64)aid);
+        sqlite3_bind_int64(ck, 2, (sqlite3_int64)j->user_id);
+        ok = (sqlite3_step(ck) == SQLITE_ROW);
+        sqlite3_finalize(ck);
+        if (!ok) {
+            r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_UNKNOWN_ATTACHMENT;
+            r->user_id = j->user_id;
+            return r;
+        }
+    }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "UPDATE users SET avatar_attachment_id=?1 WHERE id=?2;", -1, &st, NULL);
+    if (aid) sqlite3_bind_int64(st, 1, (sqlite3_int64)aid);
+    else     sqlite3_bind_null (st, 1);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
     sqlite3_step(st);
     sqlite3_finalize(st);
     build_profile(db, j->user_id, r);
@@ -4299,6 +4355,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_NOTIFY_DEFAULT) return process_set_notify_default(w->db, j);
     if (j->type == OC_JOB_SET_STATUS)      return process_set_status(w->db, j);
     if (j->type == OC_JOB_SET_PROFILE)     return process_set_profile(w->db, j);
+    if (j->type == OC_JOB_SET_AVATAR)      return process_set_avatar(w->db, j);
     if (j->type == OC_JOB_SET_READ_CURSOR) return process_set_read_cursor(w->db, j);
     if (j->type == OC_JOB_SET_DND)         return process_set_dnd(w->db, j);
     if (j->type == OC_JOB_REGISTER_DEVICE_TOKEN)   return process_register_device_token(w->db, j);
@@ -4495,6 +4552,14 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
     if (sqlite3_prepare_v2(db,
             "SELECT id, storage_key FROM attachments "
             "WHERE message_id IS NULL AND reclaimed_at_ms = 0 AND created_at_ms < ?1 "
+            /* An AVATAR is an attachment no message references (WIN-47), so it looks
+             * exactly like an orphan to this sweep — and would have been collected an
+             * hour after being set, leaving every profile picture in the workspace
+             * silently blank. The other two tiers below need the same exclusion for
+             * the same reason: an avatar is in use even though nothing points at it
+             * from `messages`. */
+            "  AND id NOT IN (SELECT avatar_attachment_id FROM users "
+            "                  WHERE avatar_attachment_id IS NOT NULL) "
             "ORDER BY created_at_ms ASC LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
         uint64_t cutoff = (now > j->maint_grace_ms) ? now - j->maint_grace_ms : 0;
         sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
@@ -4514,6 +4579,8 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
         if (sqlite3_prepare_v2(db,
                 "SELECT id, storage_key FROM attachments "
                 "WHERE reclaimed_at_ms = 0 AND created_at_ms < ?1 "
+                "  AND id NOT IN (SELECT avatar_attachment_id FROM users "
+                "                  WHERE avatar_attachment_id IS NOT NULL) "
                 "ORDER BY created_at_ms ASC LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
             uint64_t cutoff = (now > j->maint_max_age_ms) ? now - j->maint_max_age_ms : 0;
             sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
@@ -4538,6 +4605,8 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
         if (sqlite3_prepare_v2(db,
                 "SELECT id, storage_key FROM attachments "
                 "WHERE reclaimed_at_ms = 0 AND created_at_ms < ?1 "
+                "  AND id NOT IN (SELECT avatar_attachment_id FROM users "
+                "                  WHERE avatar_attachment_id IS NOT NULL) "
                 "ORDER BY created_at_ms ASC LIMIT ?2;", -1, &st, NULL) == SQLITE_OK) {
             uint64_t cutoff = (now > j->maint_grace_ms) ? now - j->maint_grace_ms : 0;
             sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);

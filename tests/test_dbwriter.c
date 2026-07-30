@@ -3133,6 +3133,129 @@ static void test_webhooks(void) {
 
 /* Notification preferences (REQ-130/131): per-channel level + DND, persisted and
  * upserted, gated on channel access. */
+/* The avatar (WIN-47). Three properties, and the second is the one that matters for
+ * security: an avatar is readable WORKSPACE-WIDE, so the id has to be one the setter
+ * was entitled to in the first place. */
+static void test_avatar(void) {
+    const char *path = "build/test_dbwriter_avatar.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "av-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "av-bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    /* A private channel bob cannot read, holding an image alice uploaded, plus a
+     * non-image and an unfinalized row to reject. */
+    oc_dbres *r = create_channel(w, alice, "avpriv", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t priv = r->channel_id;
+    oc_dbres_free(r);
+    {
+        sqlite3 *raw = NULL;
+        CHECK(sqlite3_open(path, &raw) == SQLITE_OK);
+        char sql[512];
+        snprintf(sql, sizeof sql,
+            "INSERT INTO attachments(id,channel_id,message_id,uploader_id,storage_key,"
+            "  filename,mime,size,sha256,created_at_ms) VALUES"
+            "  (1,%llu,NULL,%llu,'k1','face.png','image/png',10,x'00',1),"      /* alice's image */
+            "  (2,%llu,NULL,%llu,'k2','doc.pdf','application/pdf',10,x'00',1)," /* not an image */
+            "  (3,%llu,NULL,%llu,'k3','half.png','image/png',0,NULL,1);",       /* not finalized */
+            (unsigned long long)priv, (unsigned long long)alice,
+            (unsigned long long)priv, (unsigned long long)alice,
+            (unsigned long long)priv, (unsigned long long)alice);
+        CHECK(sqlite3_exec(raw, sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    /* Setting it works, and comes back on the profile. */
+    oc_job *j = oc_job_new(OC_JOB_SET_AVATAR, 1);
+    j->user_id = alice; j->message_id = 1;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_PROFILE_INFO && r->pf_avatar == 1);
+    oc_dbres_free(r);
+
+    /* A non-image, an unfinalized upload, an id that does not exist, and — the
+     * important one — SOMEBODY ELSE'S attachment are all refused. Without the last
+     * check any member could publish a private channel's file to the whole
+     * workspace by pointing their avatar at it. */
+    uint64_t bad[4] = { 2, 3, 999, 1 };
+    uint64_t who[4] = { alice, alice, alice, bob };
+    for (int k = 0; k < 4; k++) {
+        j = oc_job_new(OC_JOB_SET_AVATAR, 2);
+        j->user_id = who[k]; j->message_id = bad[k];
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_UNKNOWN_ATTACHMENT);
+        oc_dbres_free(r);
+    }
+
+    /* alice's avatar survived every rejection. */
+    j = oc_job_new(OC_JOB_GET_PROFILE, 3);
+    j->user_id = alice;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->pf_avatar == 1);
+    oc_dbres_free(r);
+
+    /* BOB can fetch it even though he cannot read the channel it lives in — a
+     * picture is drawn beside its owner's messages in channels the viewer shares
+     * with them, which is not where the file was uploaded. */
+    j = oc_job_new(OC_JOB_ATTACH_LOOKUP, 4);
+    j->user_id = bob; j->attachment_id = 1;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_META);
+    oc_dbres_free(r);
+
+    /* ... and the relaxation is EXACTLY that: the other private attachment in the
+     * same channel stays forbidden. */
+    j = oc_job_new(OC_JOB_ATTACH_LOOKUP, 5);
+    j->user_id = bob; j->attachment_id = 2;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    /* Clearing with 0, and then it is forbidden to bob again — the exception is
+     * tied to being an avatar right now, not to having once been one. */
+    j = oc_job_new(OC_JOB_SET_AVATAR, 6);
+    j->user_id = alice; j->message_id = 0;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_PROFILE_INFO && r->pf_avatar == 0);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_ATTACH_LOOKUP, 7);
+    j->user_id = bob; j->attachment_id = 1;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    /* The roster carries it, so a transcript needs no per-author round trip. */
+    j = oc_job_new(OC_JOB_SET_AVATAR, 8);
+    j->user_id = alice; j->message_id = 1;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w); oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_LIST_USERS, 9);
+    j->user_id = bob;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_USER_LIST);
+    if (r) {
+        int saw = 0;
+        for (size_t i = 0; i < r->n_ulist; i++)
+            if (r->ulist[i].user_id == alice) { CHECK(r->ulist[i].avatar_id == 1); saw = 1; }
+            else CHECK(r->ulist[i].avatar_id == 0);
+        CHECK(saw);
+    }
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_notify_prefs(void) {
     const char *path = "build/test_dbwriter_notify.db";
     cleanup_db(path);
@@ -3398,6 +3521,7 @@ int run_dbwriter_tests(void) {
     test_webhooks();
     test_invites_and_webhook_lifecycle();
     test_status_and_profile();
+    test_avatar();
     test_notify_prefs();
     test_admin_ops();
     test_reactions();
