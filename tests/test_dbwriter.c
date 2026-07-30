@@ -52,7 +52,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 27);
+    CHECK(oc_schema_version(db) == 28);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -3127,6 +3127,48 @@ static void test_notify_prefs(void) {
     oc_dbwriter_submit(w, j);
     r = wait_result(w);
     CHECK(r && r->type == OC_RES_NOTIFY_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+
+    /* REQ-134: the GLOBAL default. It is a separate column from the per-channel
+     * override, so setting it must not disturb the row set above, and it must come
+     * back on every prefs sync — a default the client has to guess is a default the
+     * two sides will eventually disagree about. */
+    j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 7);
+    j->user_id = alice;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_NOTIFY_PREFS && r->np_default == OC_NOTIFY_ALL);
+    oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_SET_NOTIFY_DEFAULT, 8);
+    j->user_id = alice; j->notify_level = OC_NOTIFY_MENTIONS;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_NOTIFY_PREFS && r->np_default == OC_NOTIFY_MENTIONS);
+    /* the per-channel override survives untouched */
+    CHECK(r && r->n_nprefs == 1 && r->nprefs[0].level == OC_NOTIFY_NONE);
+    oc_dbres_free(r);
+
+    /* It persists, and an out-of-range level is refused rather than clamped. */
+    j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 9);
+    j->user_id = alice;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->np_default == OC_NOTIFY_MENTIONS);
+    oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_SET_NOTIFY_DEFAULT, 10);
+    j->user_id = alice; j->notify_level = 9;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_NOTIFY_ERR);
+    oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 11);
+    j->user_id = alice;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->np_default == OC_NOTIFY_MENTIONS);   /* the reject changed nothing */
     oc_dbres_free(r);
 
     oc_dbwriter_stop(w);

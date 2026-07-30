@@ -267,6 +267,9 @@ typedef struct {
     uint8_t   prefs_open;
     uint8_t   dnd_enabled;
     uint16_t  dnd_start_min, dnd_end_min;
+    /* REQ-134: the level a channel takes when it has NO per-channel row. Server
+     * state, not a client guess — the daemon is what decides whether to push. */
+    uint8_t   notify_default;
     /* The last invite token minted this session (REQ-033, shown once): the
      * token is empty until an INVITE_CREATED arrives. */
     char      invite_token[96];

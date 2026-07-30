@@ -3066,6 +3066,32 @@ static void draw_weblist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
 /* WIN-12: every channel's notification level, editable in place. The prefs are
  * server-synced (REQ-130/131) and were reachable only one channel at a time from
  * a context menu, so there was no way to review them. */
+/* One right-aligned All/Mentions/None chip group, registering its own hit-boxes.
+ * Shared by the per-channel rows and the global default (cid 0) so the two cannot
+ * drift apart in either look or behaviour. */
+static void notify_chips(ID2D1RenderTarget *rt, D2D1_RECT_F body, float y, float rowh,
+                         uint64_t cid, uint8_t level) {
+    static const char *LEVELS[3] = { "All", "Mentions", "None" };
+    float bx = body.right - 24;
+    for (int L = 2; L >= 0; L--) {
+        float bw = text_width(LEVELS[L], g_meta) + 20;
+        D2D1_RECT_F b = rf(bx - bw, y + (rowh - 24) / 2, bx, y + (rowh - 24) / 2 + 24);
+        int on = (level == L);
+        fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
+        if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, LEVELS[L], g_meta, b, on ? 0xFFFFFF : OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+        if (g_n_notify_hits < 128) {
+            g_notify_hits[g_n_notify_hits].r = b;
+            g_notify_hits[g_n_notify_hits].cid = cid;
+            g_notify_hits[g_n_notify_hits].level = (uint8_t)L;
+            g_n_notify_hits++;
+        }
+        bx = b.left - 6;
+    }
+}
+
 static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
     D2D1_RECT_F body = reg;   /* the frame drew the title bar (modal_frame) */
     ovl_use(OVL_NOTIFY);
@@ -3082,7 +3108,22 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
               m->dnd_enabled ? OC_COL_NOTICE : OC_COL_FAINT);
     body.top += 30;
 
-    static const char *LEVELS[3] = { "All", "Mentions", "None" };
+    /* REQ-134: the level every channel WITHOUT its own row takes. It sits above
+     * the list, and outside the scroller, because it is the thing the rows below
+     * are exceptions to — a default you have to scroll to find reads as row zero
+     * of the list instead of as the rule. cid=0 marks it in the hit table. */
+    {
+        float rowh0 = 38, y0 = body.top;
+        draw_text(rt, "Default for all channels", g_ui_b,
+                  rf(body.left + 20, y0, body.right - 260, y0 + rowh0), OC_COL_TEXT);
+        notify_chips(rt, body, y0, rowh0, 0, m->notify_default);
+        draw_text(rt, "Channels listed below override this.", g_micro,
+                  rf(body.left + 20, y0 + rowh0 - 14, body.right - 260, y0 + rowh0 + 2),
+                  OC_COL_FAINT);
+        fill(rt, rf(body.left + 20, y0 + rowh0 + 6, body.right - 20, y0 + rowh0 + 7), OC_COL_BORDER);
+        body.top += rowh0 + 16;
+    }
+
     float rowh = 38;
     float y = ovl_begin(rt, body, (float)m->n_channels * rowh);
     for (size_t i = 0; i < m->n_channels; i++) {
@@ -3092,24 +3133,7 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
         char label[128];
         channel_label(m, c, label, sizeof label);
         draw_text(rt, label, g_ui, rf(body.left + 20, y, body.right - 260, y + rowh), OC_COL_TEXT);
-        float bx = body.right - 24;
-        for (int L = 2; L >= 0; L--) {
-            float bw = text_width(LEVELS[L], g_meta) + 20;
-            D2D1_RECT_F b = rf(bx - bw, y + 5, bx, y + 29);
-            int on = (c->notify_level == L);
-            fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
-            if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
-            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
-            draw_text(rt, LEVELS[L], g_meta, b, on ? 0xFFFFFF : OC_COL_MUTED);
-            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
-            if (g_n_notify_hits < 128) {
-                g_notify_hits[g_n_notify_hits].r = b;
-                g_notify_hits[g_n_notify_hits].cid = c->channel_id;
-                g_notify_hits[g_n_notify_hits].level = (uint8_t)L;
-                g_n_notify_hits++;
-            }
-            bx = b.left - 6;
-        }
+        notify_chips(rt, body, y, rowh, c->channel_id, c->notify_level);
         fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 20, y + rowh), OC_COL_BORDER);
         y += rowh;
     }
@@ -5307,11 +5331,13 @@ static void prefs_restore(void) {
  * rows that differ — silence for the untouched ones. */
 static struct { uint64_t cid; uint8_t level; } g_notify_snap[64];
 static int g_n_notify_snap;
+static uint8_t g_notify_snap_default;     /* REQ-134 */
 
 static void notify_snapshot(void) {
     const oc_model *m = model();
     g_n_notify_snap = 0;
     if (!m) return;
+    g_notify_snap_default = m->notify_default;
     for (size_t i = 0; i < m->n_channels && g_n_notify_snap < 64; i++) {
         g_notify_snap[g_n_notify_snap].cid   = m->channels[i].channel_id;
         g_notify_snap[g_n_notify_snap].level = m->channels[i].notify_level;
@@ -5327,6 +5353,8 @@ static void notify_restore(void) {
         if (c && c->notify_level != g_notify_snap[i].level)
             oc_client_set_notify_pref(g_client, g_notify_snap[i].cid, g_notify_snap[i].level);
     }
+    if (m->notify_default != g_notify_snap_default)
+        oc_client_set_notify_default(g_client, g_notify_snap_default);
 }
 
 static const oc_modal_spec *modal_current(void) {
@@ -7664,8 +7692,11 @@ static int on_click(HWND hwnd, int x, int y) {
         if (g_notify_open) {
             for (int i = 0; i < g_n_notify_hits; i++)
                 if (in_rect(g_notify_hits[i].r, x, y)) {
-                    oc_client_set_notify_pref(g_client, g_notify_hits[i].cid,
-                                              g_notify_hits[i].level);
+                    if (g_notify_hits[i].cid == 0)      /* REQ-134: the global default */
+                        oc_client_set_notify_default(g_client, g_notify_hits[i].level);
+                    else
+                        oc_client_set_notify_pref(g_client, g_notify_hits[i].cid,
+                                                  g_notify_hits[i].level);
                     return 1;
                 }
         }

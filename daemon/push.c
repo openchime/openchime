@@ -344,8 +344,17 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
             "LEFT JOIN notification_prefs np "
             "  ON np.user_id = cm.user_id AND np.channel_id = cm.channel_id "
             "WHERE cm.channel_id = ?1 AND cm.user_id <> ?2 AND u.disabled = 0 "
-            "  AND ( COALESCE(np.level, 0) = 0 "
-            "        OR ( COALESCE(np.level, 0) = 1 AND ?3 <> 0 AND EXISTS ("
+            /* The fallback is the user's GLOBAL default (REQ-134), not a hardcoded
+             * ALL: "notify me only when mentioned, everywhere" has to hold for the
+             * channels the user never opened a preference on — which is most of
+             * them, and the whole point of having a default.
+             *
+             * A MUTED channel never pushes (REQ-137, WIN-40). Mute was being
+             * honoured in the sidebar and ignored here, so a muted channel at level
+             * ALL still rang the phone. */
+            "  AND COALESCE(np.muted, 0) = 0 "
+            "  AND ( COALESCE(np.level, u.notify_default) = 0 "
+            "        OR ( COALESCE(np.level, u.notify_default) = 1 AND ?3 <> 0 AND EXISTS ("
             "               SELECT 1 FROM mentions mn WHERE mn.message_id = ?3 "
             "                 AND (mn.user_id = cm.user_id OR mn.kind <> 0)) ) );",
             -1, &st, NULL) != SQLITE_OK) {

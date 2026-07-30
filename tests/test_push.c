@@ -289,6 +289,95 @@ static void test_collect(void) {
     cleanup_db(path);
 }
 
+/* The GLOBAL default (REQ-134) and mute (REQ-137) as PUSH gates.
+ *
+ * Both were settings the daemon stored and then ignored when it decided whether to
+ * ring a phone: the fallback level was hardcoded to ALL, so "only mention me"
+ * applied to nothing but the channels you had touched individually, and a muted
+ * channel at level ALL still pushed. */
+static void test_default_and_mute(void) {
+    const char *path = "build/test_push_default.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    if (!w) return;
+
+    uint64_t alice = oc_dbwriter_register_local(w, "d-alice", "pw", OC_ROLE_OWNER, 2048);
+    uint64_t bob   = oc_dbwriter_register_local(w, "d-bob",   "pw", OC_ROLE_MEMBER, 2048);
+    uint64_t carol = oc_dbwriter_register_local(w, "d-carol", "pw", OC_ROLE_MEMBER, 2048);
+    CHECK(alice && bob && carol);
+    CHECK(oc_dbwriter_register_device_token(w, bob,   OC_PUSH_APNS, "tok-b"));
+    CHECK(oc_dbwriter_register_device_token(w, carol, OC_PUSH_APNS, "tok-c"));
+
+    oc_push_target t[8];
+    sqlite3 *rdb = NULL;
+    CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    CHECK(oc_push_collect(rdb, 1, alice, 0, 100, t, 8) == 2);   /* the default default is ALL */
+    sqlite3_close(rdb);
+
+    /* Bob sets his global default to MENTIONS, having no row for channel 1. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_SET_NOTIFY_DEFAULT, 0);
+        j->user_id = bob; j->notify_level = OC_NOTIFY_MENTIONS;
+        oc_dbwriter_submit(w, j);
+        oc_dbres *r = wait_result(w);
+        CHECK(r && r->type == OC_RES_NOTIFY_PREFS);
+        oc_dbres_free(r);
+    }
+    CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    int n = oc_push_collect(rdb, 1, alice, 0, 100, t, 8);
+    CHECK(n == 1 && strcmp(t[0].token, "tok-c") == 0);          /* bob is out */
+
+    /* ... and a message that names him is in, through the same default. */
+    {
+        sqlite3 *wdb = NULL;
+        CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        char sql[256];
+        snprintf(sql, sizeof sql,
+                 "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms)"
+                 " VALUES(9001,1,%llu,0,0,5,1);", (unsigned long long)bob);
+        CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(wdb);
+    }
+    CHECK(oc_push_collect(rdb, 1, alice, 9001, 100, t, 8) == 2);
+    sqlite3_close(rdb);
+
+    /* An explicit per-channel row still OVERRIDES the default, in both directions. */
+    set_level(w, bob, 1, OC_NOTIFY_ALL);
+    CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    CHECK(oc_push_collect(rdb, 1, alice, 0, 100, t, 8) == 2);
+    sqlite3_close(rdb);
+
+    /* Mute wins over the level: carol is at ALL and hears nothing. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_SET_MUTE, 0);
+        j->user_id = carol; j->channel_id = 1; j->hook_disabled = 1;   /* the mute flag */
+        oc_dbwriter_submit(w, j);
+        oc_dbres *r = wait_result(w);
+        oc_dbres_free(r);
+    }
+    CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    n = oc_push_collect(rdb, 1, alice, 0, 100, t, 8);
+    CHECK(n == 1 && strcmp(t[0].token, "tok-b") == 0);
+    /* ... not even for a message that names her: mute means mute. */
+    {
+        sqlite3 *wdb = NULL;
+        CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        char sql[256];
+        snprintf(sql, sizeof sql,
+                 "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms)"
+                 " VALUES(9002,1,%llu,0,0,5,1);", (unsigned long long)carol);
+        CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(wdb);
+    }
+    n = oc_push_collect(rdb, 1, alice, 9002, 100, t, 8);
+    CHECK(n == 1 && strcmp(t[0].token, "tok-b") == 0);
+    sqlite3_close(rdb);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* --- fake gateway: full notify -> relay -> prune round-trip ----------------- */
 
 typedef struct { int fd; int got_request; int had_signature; } fake_gw;
@@ -395,11 +484,13 @@ static void test_notify_roundtrip(void) {
 int run_push_tests(void) {
     printf("test_push: DND window (incl wrap-around), recipient collect "
            "(level/DND/author gating), CP-12 sign+verify, contentless body, "
+           "global default + mute as push gates, "
            "device-token register/unregister/prune, notify->relay->prune round-trip\n");
     test_dnd();
     test_build_body();
     test_sign_verify();
     test_collect();
+    test_default_and_mute();
     test_notify_roundtrip();
     return failures;
 }

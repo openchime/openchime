@@ -132,6 +132,9 @@ typedef enum {
     /* REQ-182: the caller's own active sessions. `sessions` has carried device_label
      * and last_seen_ms since migration 0001 and only REVOKE could reach them, so you
      * could sign out everywhere without ever seeing what "everywhere" was. */
+    /* REQ-134: the level for channels with no per-channel override. Rides the
+     * NOTIFY_PREFS frame back, so a client learns it with the rest. */
+    OC_MSG_SET_NOTIFY_DEFAULT = 0x0077, /* C->S */
     OC_MSG_LIST_SESSIONS      = 0x0075, /* C->S */
     OC_MSG_SESSION_LIST       = 0x0076, /* S->C, never the tokens */
     OC_MSG_LIST_FILE_CHANNELS = 0x0073, /* C->S */
@@ -612,7 +615,13 @@ typedef struct { uint8_t ok; uint16_t code; } oc_device_token_ack;
  * My first note here claimed otherwise. Hence the bump to protocol 3, which WIN-38's
  * search cursor needs regardless. */
 typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; } oc_notify_pref_entry;
+typedef struct { uint8_t level; } oc_set_notify_default;
+/* `notify_default` (REQ-134) rides here so a client learns the fallback with the rest
+ * of its notification state, rather than needing a second round trip. Appended at the
+ * END of the fixed fields, before the repeated list, which is a layout change — and
+ * the reason it lands in the same release as protocol 3. */
 typedef struct { uint8_t dnd_enabled; uint16_t dnd_start_min; uint16_t dnd_end_min;
+                 uint8_t notify_default;
                  uint16_t count; const oc_notify_pref_entry *entries; } oc_notify_prefs;
 /* Synced client settings bucket (the daemon-side layer of the client config). */
 typedef struct { oc_slice client_type; oc_slice key; oc_slice value; } oc_set_client_setting;
@@ -809,6 +818,8 @@ oc_result oc_encode_webhook_list(oc_wbuf *w, uint16_t version, const oc_webhook_
 oc_result oc_encode_delete_webhook(oc_wbuf *w, uint16_t version, const oc_delete_webhook *m);
 oc_result oc_encode_set_webhook_state(oc_wbuf *w, uint16_t version, const oc_set_webhook_state *m);
 oc_result oc_encode_rotate_webhook(oc_wbuf *w, uint16_t version, const oc_rotate_webhook *m);
+oc_result oc_encode_set_notify_default(oc_wbuf *w, uint16_t version, const oc_set_notify_default *m);
+oc_result oc_decode_set_notify_default(oc_rbuf *p, oc_set_notify_default *m);
 oc_result oc_encode_list_sessions(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_session_list(oc_wbuf *w, uint16_t version, const oc_session_list *m);
 oc_result oc_decode_session_list(oc_rbuf *p, oc_session_entry *entries, uint16_t cap,
@@ -972,7 +983,8 @@ oc_result oc_decode_unregister_device_token(oc_rbuf *p, oc_slice *token);
 oc_result oc_decode_device_token_ack(oc_rbuf *p, oc_device_token_ack *m);
 oc_result oc_decode_list_notify_prefs(oc_rbuf *p);
 oc_result oc_decode_notify_prefs(oc_rbuf *p, oc_notify_pref_entry *entries, uint16_t cap,
-                                 uint16_t *out_count, oc_set_dnd *dnd_out);
+                                 uint16_t *out_count, oc_set_dnd *dnd_out,
+                                 uint8_t *out_default);
 oc_result oc_decode_set_client_setting(oc_rbuf *p, oc_set_client_setting *m);
 oc_result oc_decode_list_client_settings(oc_rbuf *p, oc_list_client_settings *m);
 /* CLIENT_SETTINGS decodes the entries into a caller buffer; client_type stays a

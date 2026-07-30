@@ -200,6 +200,7 @@ enum {
     OC_CMD_GET_PROFILE,
     OC_CMD_LIST_FILE_CHANNELS,   /* WIN-82 */
     OC_CMD_LIST_SESSIONS,        /* REQ-182 */
+    OC_CMD_SET_NOTIFY_DEFAULT,   /* REQ-134: op = level */
     OC_CMD_UPLOAD,          /* upload+post a file to `channel_id`: body = local path */
     OC_CMD_DOWNLOAD,        /* download an attachment: message_id = attachment_id, body = dest path */
     OC_CMD_LOGOUT,          /* revoke this session (op = scope) and close the connection */

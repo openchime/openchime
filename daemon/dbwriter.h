@@ -100,7 +100,8 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * apart. New jobs go after the highest value, always. */
        OC_JOB_SET_STATUS = 70, OC_JOB_SET_PROFILE = 71, OC_JOB_GET_PROFILE = 72,
        OC_JOB_LIST_FILE_CHANNELS = 73,   /* WIN-82 */
-       OC_JOB_LIST_SESSIONS = 74 };      /* REQ-182 */
+       OC_JOB_LIST_SESSIONS = 74,        /* REQ-182 */
+       OC_JOB_SET_NOTIFY_DEFAULT = 75 }; /* REQ-134 */
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -571,6 +572,7 @@ typedef struct oc_dbres {
 
     /* NOTIFY_PREFS (REQ-130/131): the user's DND window + per-channel levels. */
     oc_notify_pref_row *nprefs;    /* heap array */
+    uint8_t            np_default;  /* REQ-134: the level for channels with no row */
     size_t              n_nprefs;
     uint8_t             np_dnd_enabled;
     uint16_t            np_dnd_start_min, np_dnd_end_min;

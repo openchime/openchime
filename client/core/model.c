@@ -1072,7 +1072,9 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
          * entries, so treat it as the sync boundary and reset every channel to
          * the default level; the following OC_EV_NOTIFY_PREF events set the
          * non-default ones. Works for both solicited and pushed syncs. */
-        for (size_t i = 0; i < m->n_channels; i++) m->channels[i].notify_level = OC_NOTIFY_ALL;
+        m->notify_default = e->op;                 /* REQ-134 */
+        for (size_t i = 0; i < m->n_channels; i++)
+            m->channels[i].notify_level = m->notify_default;
         m->dnd_enabled   = e->status;
         m->dnd_start_min = (uint16_t)(e->count >> 16);
         m->dnd_end_min   = (uint16_t)(e->count & 0xFFFF);

@@ -750,12 +750,14 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
         } else if (hdr.msg_type == OC_MSG_NOTIFY_PREFS) {
             enum { NPREF_CAP = 256 };
             oc_notify_pref_entry ne[NPREF_CAP]; uint16_t count = 0; oc_set_dnd dnd = {0,0,0};
-            if (oc_decode_notify_prefs(&p, ne, NPREF_CAP, &count, &dnd) != OC_OK) return -1;
+            uint8_t npdefault = 0;
+            if (oc_decode_notify_prefs(&p, ne, NPREF_CAP, &count, &dnd, &npdefault) != OC_OK) return -1;
             if (count > NPREF_CAP) count = NPREF_CAP;
             /* Header first (the sync boundary), then one event per channel. */
             oc_ev *h = oc_ev_new(OC_EV_DND);
             if (h) {
                 h->status = dnd.enabled;
+                h->op = npdefault;                /* REQ-134 */
                 h->count = ((uint32_t)dnd.start_min << 16) | dnd.end_min;
                 oc_queue_push(to_ui, h);
             }
@@ -1646,6 +1648,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_set_mute sm = { c->channel_id, c->op };
                 if (oc_encode_set_mute(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_NOTIFY_DEFAULT) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_notify_default sd = { c->op };
+                if (oc_encode_set_notify_default(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SET_READ_CURSOR) {

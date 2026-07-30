@@ -1141,6 +1141,15 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_NOTIFY_DEFAULT) {
+            oc_set_notify_default nd;
+            if (oc_decode_set_notify_default(&p, &nd) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_NOTIFY_DEFAULT, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->notify_level = nd.level;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_LIST_SESSIONS) {
             oc_job *j = oc_job_new(OC_JOB_LIST_SESSIONS, c->conn_id);
             if (!j) return -1;
@@ -2638,7 +2647,16 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             ents[n].muted = r->nprefs[i].muted;      /* WIN-40 */
             n++;
         }
-        oc_notify_prefs np = { r->np_dnd_enabled, r->np_dnd_start_min, r->np_dnd_end_min, n, ents };
+        /* Designated, not positional: adding `notify_default` before `count` silently
+         * assigned the count to the new field. A positional initializer turns "one new
+         * struct field" into a data corruption with no compiler error worth the name. */
+        oc_notify_prefs np;
+        np.dnd_enabled    = r->np_dnd_enabled;
+        np.dnd_start_min  = r->np_dnd_start_min;
+        np.dnd_end_min    = r->np_dnd_end_min;
+        np.notify_default = r->np_default;        /* REQ-134 */
+        np.count          = n;
+        np.entries        = ents;
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_encode_notify_prefs(&w, OC_PROTOCOL_VERSION, &np);
         size_t len = w.len;

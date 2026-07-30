@@ -7,6 +7,7 @@
 #include "event.h"
 #include "net.h"
 #include "queue.h"
+#include "protocol.h"   /* the OC_NOTIFY_* levels are wire constants */
 
 #include <stdlib.h>
 #include <string.h>
@@ -574,6 +575,15 @@ void oc_client_set_mute(oc_client *c, uint64_t channel_id, int muted) {
     if (!cmd) return;
     cmd->channel_id = channel_id;
     cmd->op = muted ? 1 : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* The global notification default (REQ-134). */
+void oc_client_set_notify_default(oc_client *c, uint8_t level) {
+    if (!c || level > OC_NOTIFY_NONE) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_NOTIFY_DEFAULT);
+    if (!cmd) return;
+    cmd->op = level;
     oc_queue_push(&c->cmds, cmd);
 }
 

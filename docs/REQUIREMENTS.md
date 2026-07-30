@@ -535,8 +535,12 @@ the requirement says so explicitly rather than implying one.
 - **REQ-134.** Each user has had a **global (workspace-default) notification
   level** — all / mentions / none — applying to every channel lacking an explicit
   per-channel override (REQ-130), so a user has not had to set each channel
-  individually. Where a per-channel level was set, it has won. **[needs ARCH
-  decision — default-level storage + precedence over REQ-130.]**
+  individually. Where a per-channel level was set, it has won. **DONE** (2026-07-30):
+  `users.notify_default` (migration 0028), `SET_NOTIFY_DEFAULT` (0x0077), carried on
+  every `NOTIFY_PREFS` snapshot so no client infers it, and honoured by the push
+  decision as `COALESCE(np.level, u.notify_default)`. Storage is on `users` rather
+  than a sentinel row in `notification_prefs`: a default is a property of the person,
+  and a channel_id of 0 in a table keyed by channel is a trap for every later query.
 - **REQ-135.** A user has been able to define **keyword (highlight-word)
   notifications** — terms that notify them regardless of a channel's level
   (REQ-130/134) — and to designate **priority people** whose messages always

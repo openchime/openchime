@@ -787,6 +787,7 @@ oc_result oc_encode_notify_prefs(oc_wbuf *w, uint16_t version, const oc_notify_p
     oc_w_u8(w, m->dnd_enabled);
     oc_w_u16(w, m->dnd_start_min);
     oc_w_u16(w, m->dnd_end_min);
+    oc_w_u8(w, m->notify_default);      /* REQ-134 */
     oc_w_u16(w, m->count);
     for (uint16_t i = 0; i < m->count; i++) {
         oc_w_u64(w, m->entries[i].channel_id);
@@ -851,10 +852,13 @@ oc_result oc_decode_list_notify_prefs(oc_rbuf *p) {
 }
 
 oc_result oc_decode_notify_prefs(oc_rbuf *p, oc_notify_pref_entry *entries, uint16_t cap,
-                                 uint16_t *out_count, oc_set_dnd *dnd_out) {
+                                 uint16_t *out_count, oc_set_dnd *dnd_out,
+                                 uint8_t *out_default) {
     dnd_out->enabled = oc_r_u8(p);
     dnd_out->start_min = oc_r_u16(p);
     dnd_out->end_min = oc_r_u16(p);
+    uint8_t dflt = oc_r_u8(p);                 /* REQ-134 */
+    if (out_default) *out_default = dflt;
     uint16_t count = oc_r_u16(p);
     *out_count = count;
     for (uint16_t i = 0; i < count && !p->underflow; i++) {
@@ -2333,5 +2337,17 @@ oc_result oc_decode_session_list(oc_rbuf *p, oc_session_entry *entries, uint16_t
         e.device_label = oc_r_str(p);
         if (i < cap) entries[i] = e;
     }
+    return r_done(p);
+}
+
+/* The global notification default (REQ-134). */
+oc_result oc_encode_set_notify_default(oc_wbuf *w, uint16_t version, const oc_set_notify_default *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_NOTIFY_DEFAULT);
+    oc_w_u8(w, m->level);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_notify_default(oc_rbuf *p, oc_set_notify_default *m) {
+    m->level = oc_r_u8(p);
     return r_done(p);
 }

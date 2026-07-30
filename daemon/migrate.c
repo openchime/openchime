@@ -550,6 +550,14 @@ static const char MIGRATION_0027[] =
     "ALTER TABLE users ADD COLUMN timezone TEXT;"
     "ALTER TABLE users ADD COLUMN avatar_attachment_id INTEGER;";
 
+static const char MIGRATION_0028[] =
+    /* Global notification default (REQ-134, WIN-54). `notification_prefs` is a
+     * PER-CHANNEL override, so there was no answer for "a channel I have never
+     * touched" other than a compiled-in constant — which meant the user could not
+     * change it. One column on `users`, and the per-channel rows keep overriding it. */
+    "ALTER TABLE users ADD COLUMN notify_default INTEGER NOT NULL DEFAULT 0 "
+    "  CHECK (notify_default IN (0,1,2));";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -578,6 +586,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 25, MIGRATION_0025 },
     { 26, MIGRATION_0026 },
     { 27, MIGRATION_0027 },
+    { 28, MIGRATION_0028 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

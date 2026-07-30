@@ -156,7 +156,7 @@ Vendor-facing rows are inherently perishable — a competitor can change a plan 
 
 | Feature / Surface | Slack | Pumble | TUI | Win32 | Gap notes & priority |
 |---|---|---|---|---|---|
-| Global notify-me level | ✅ | ✅ | 🔸 prefs overlay read-only | ❌ | Win32 has a Preferences hub and a Notifications pane, but a **workspace-default** level is REQ-134 and unbuilt on the engine — per-channel only. **P1** |
+| Global notify-me level | ✅ | ✅ | ✅ | ❌ | **DONE** (REQ-134): `users.notify_default` + `SET_NOTIFY_DEFAULT`, at the top of the Notifications sheet with the per-channel rows below it as overrides. TUI does not surface it. |
 | Per-channel/DM overrides | ✅ | ✅ | 🟡 notify level | 🟡 per-channel level | Present. — |
 | Mute channel/DM | ✅ | ✅ | 🔸 | ❌ | **P1** |
 | Keyword/highlight-word notifications | ✅ | ✅ | ❌ | ❌ | **P2** |
@@ -395,7 +395,7 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 - **Avatar upload, email, timezone, job title** in the profile editor (REQ-240/241). **P1**
 - **Custom status** (emoji + text, REQ-122/240) — presence is online/away only. **P1**
 - **Active-session list** — revoke-all *is* built ("Sign out everywhere"); enumerating sessions is not (REQ-182 has no list op). **P2**
-- **Global (workspace-default) notify level** (REQ-134); **keyword / priority-people alerts** (REQ-135); **notification schedule** richer than one daily DND window (REQ-136). All unbuilt on the engine. **P1**
+- ~~**Global (workspace-default) notify level** (REQ-134)~~ — **DONE**, engine and Win32. Still open: **keyword / priority-people alerts** (REQ-135) and a **notification schedule** richer than one daily DND window (REQ-136), both unbuilt on the engine. **P1**
 - **DND configuration surface** — the value is displayed, but it is set through a raw `HH:MM-HH:MM` prompt with no picker. **P1**
 - **Audit-log paging/filtering** — read-only, offset fixed at 0. **P2**
 - **Webhook enable/disable/rotate/reveal**, and dates in the list. **P2**
@@ -472,7 +472,7 @@ read as "build the engine feature; the Win32 work is the easy part."
    together make the sidebar behave the way people expect. **P1**
 6. **Profile depth + custom status** (REQ-240/241/122). Avatar, email, timezone,
    title; presence is still online/away only. **P1**
-7. **Notification depth** — workspace-default level (REQ-134), keyword and
+7. **Notification depth** — ~~workspace-default level (REQ-134, done)~~, keyword and
    priority-people alerts (REQ-135), a real schedule (REQ-136), and a DND picker
    instead of a raw `HH:MM-HH:MM` prompt. REQ-135 is cheap now: it is the same
    match→notify path @mentions built. **P1**

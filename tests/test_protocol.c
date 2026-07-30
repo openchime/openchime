@@ -544,11 +544,22 @@ static void test_notify_frames(void) {
         CHECK(oc_decode_list_notify_prefs(&p) == OC_OK);
     }
     {
+        oc_set_notify_default in = { OC_NOTIFY_NONE };            /* REQ-134 */
+        ROUNDTRIP(oc_encode_set_notify_default(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_SET_NOTIFY_DEFAULT, h, p);
+        oc_set_notify_default out;
+        CHECK(oc_decode_set_notify_default(&p, &out) == OC_OK && out.level == OC_NOTIFY_NONE);
+    }
+    {
         oc_notify_pref_entry ents[2] = { { 7, OC_NOTIFY_MENTIONS }, { 9, OC_NOTIFY_NONE } };
-        oc_notify_prefs in = { 1, 1320, 480, 2, ents };
+        oc_notify_prefs in;
+        in.dnd_enabled = 1; in.dnd_start_min = 1320; in.dnd_end_min = 480;
+        in.notify_default = OC_NOTIFY_MENTIONS;   /* REQ-134 */
+        in.count = 2; in.entries = ents;
         ROUNDTRIP(oc_encode_notify_prefs(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_NOTIFY_PREFS, h, p);
-        oc_notify_pref_entry got[4]; uint16_t n = 0; oc_set_dnd dnd;
-        CHECK(oc_decode_notify_prefs(&p, got, 4, &n, &dnd) == OC_OK && n == 2);
+        oc_notify_pref_entry got[4]; uint16_t n = 0; oc_set_dnd dnd; uint8_t dflt = 0xFF;
+        CHECK(oc_decode_notify_prefs(&p, got, 4, &n, &dnd, &dflt) == OC_OK && n == 2);
+        CHECK(dflt == OC_NOTIFY_MENTIONS);
         CHECK(dnd.enabled == 1 && dnd.start_min == 1320 && dnd.end_min == 480);
         CHECK(got[0].channel_id == 7 && got[0].level == OC_NOTIFY_MENTIONS);
         CHECK(got[1].channel_id == 9 && got[1].level == OC_NOTIFY_NONE);

@@ -1220,7 +1220,7 @@ static void test_notify_prefs_vertical(int port, const uint8_t *pin) {
     client *devs[2] = { &a1, &a2 };
     for (int d = 0; d < 2; d++) {
         CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_NOTIFY_PREFS);
-        CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, &dnd) == OC_OK && n == 1);
+        CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, &dnd, NULL) == OC_OK && n == 1);
         CHECK(ents[0].channel_id == OC_DEFAULT_CHANNEL && ents[0].level == OC_NOTIFY_MENTIONS);
     }
 
@@ -1231,8 +1231,23 @@ static void test_notify_prefs_vertical(int port, const uint8_t *pin) {
     CHECK(send_frame(&a2, buf, w.len) == 0);
     for (int d = 0; d < 2; d++) {
         CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_NOTIFY_PREFS);
-        CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, &dnd) == OC_OK);
+        CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, &dnd, NULL) == OC_OK);
         CHECK(dnd.enabled == 1 && dnd.start_min == 1320 && dnd.end_min == 480 && n == 1);
+    }
+
+    /* The global default (REQ-134) rides the same snapshot and syncs the same way:
+     * a client must never have to infer what "no per-channel row" means. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_notify_default nd = { OC_NOTIFY_NONE };
+    CHECK(oc_encode_set_notify_default(&w, OC_PROTOCOL_VERSION, &nd) == OC_OK);
+    CHECK(send_frame(&a1, buf, w.len) == 0);
+    for (int d = 0; d < 2; d++) {
+        uint8_t dflt = 0xFF;
+        CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_NOTIFY_PREFS);
+        CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, &dnd, &dflt) == OC_OK);
+        CHECK(dflt == OC_NOTIFY_NONE);
+        /* ... and the per-channel override is still there, untouched. */
+        CHECK(n == 1 && ents[0].level == OC_NOTIFY_MENTIONS);
     }
 
     client_close(&a1);

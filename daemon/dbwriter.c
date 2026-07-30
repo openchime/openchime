@@ -3549,12 +3549,14 @@ static void build_notify_prefs(sqlite3 *db, uint64_t user_id, oc_dbres *r) {
     r->user_id = user_id;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT dnd_enabled, dnd_start_min, dnd_end_min FROM users WHERE id=?;", -1, &st, NULL);
+        "SELECT dnd_enabled, dnd_start_min, dnd_end_min, notify_default "
+        "  FROM users WHERE id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)user_id);
     if (sqlite3_step(st) == SQLITE_ROW) {
         r->np_dnd_enabled   = (uint8_t)sqlite3_column_int(st, 0);
         r->np_dnd_start_min = (uint16_t)sqlite3_column_int(st, 1);
         r->np_dnd_end_min   = (uint16_t)sqlite3_column_int(st, 2);
+        r->np_default       = (uint8_t)sqlite3_column_int(st, 3);   /* REQ-134 */
     }
     sqlite3_finalize(st);
 
@@ -3600,6 +3602,28 @@ static oc_dbres *process_set_notify_pref(sqlite3 *db, const oc_job *j) {
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) { r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_ERR_INTERNAL; r->user_id = j->user_id; return r; }
+    build_notify_prefs(db, j->user_id, r);
+    return r;
+}
+
+/* The global notification default (REQ-134, WIN-54): the level for a channel with no
+ * per-channel row. Answers with the whole prefs snapshot, so a client's view of "what
+ * happens by default" cannot drift from the server's. */
+static oc_dbres *process_set_notify_default(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    if (j->notify_level > OC_NOTIFY_NONE) {
+        r->type = OC_RES_NOTIFY_ERR; r->err_code = OC_E_MALFORMED; r->user_id = j->user_id; return r;
+    }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "UPDATE users SET notify_default=? WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int(st, 1, (int)j->notify_level);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    r->type = OC_RES_NOTIFY_PREFS;
+    r->user_id = j->user_id;
     build_notify_prefs(db, j->user_id, r);
     return r;
 }
@@ -4264,6 +4288,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_DELETE_WEBHOOK)  return process_delete_webhook(w->db, j);
     if (j->type == OC_JOB_SET_NOTIFY_PREF) return process_set_notify_pref(w->db, j);
     if (j->type == OC_JOB_SET_MUTE)        return process_set_mute(w->db, j);
+    if (j->type == OC_JOB_SET_NOTIFY_DEFAULT) return process_set_notify_default(w->db, j);
     if (j->type == OC_JOB_SET_STATUS)      return process_set_status(w->db, j);
     if (j->type == OC_JOB_SET_PROFILE)     return process_set_profile(w->db, j);
     if (j->type == OC_JOB_SET_READ_CURSOR) return process_set_read_cursor(w->db, j);

@@ -221,6 +221,10 @@ void oc_client_set_webhook_state(oc_client *c, uint64_t webhook_id, int disabled
 void oc_client_rotate_webhook(oc_client *c, uint64_t webhook_id);
 /* Mute a conversation (REQ-137) and mark it unread from a message (REQ-235). */
 void oc_client_set_mute(oc_client *c, uint64_t channel_id, int muted);
+
+/* The global notification default (REQ-134): the level for every channel without a
+ * per-channel override. The daemon answers with a full NOTIFY_PREFS sync. */
+void oc_client_set_notify_default(oc_client *c, uint8_t level);
 /* Custom status (REQ-241/122) and profile fields (REQ-240). Empty status text clears
  * it; expiry 0 means "until changed", and the DAEMON enforces the lapse. */
 void oc_client_list_file_channels(oc_client *c);   /* WIN-82 */

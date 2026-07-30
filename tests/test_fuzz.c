@@ -85,7 +85,7 @@ static void decode_all(const uint8_t *buf, size_t len) {
     D(oc_decode_list_notify_prefs(&p));
     { oc_notify_pref_entry ne[4]; uint16_t nc = 0; oc_set_dnd dd;
       oc_rbuf_init(&p, buf, len);
-      rc = oc_decode_notify_prefs(&p, ne, 4, &nc, &dd);
+      rc = oc_decode_notify_prefs(&p, ne, 4, &nc, &dd, NULL);
       CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
     oc_call_join cj; D(oc_decode_call_join(&p, &cj));
     oc_call_leave cle; D(oc_decode_call_leave(&p, &cle));
