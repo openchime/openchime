@@ -50,9 +50,16 @@ case "${1:-}" in
     # Comparing start time to the binary's mtime is enough and avoids bouncing a
     # daemon (and its in-memory presence) on every launch.
     if [ "${OC_DRIVE_NO_DAEMON:-0}" != "1" ]; then
-      dpid=$(pgrep -x openchimed | head -1 || true)
+      # The PORT is the question, not whether any openchimed exists: a daemon
+      # started for something else (the e2e run uses 9443) satisfied a pgrep and
+      # left the client with nothing to connect to — "launched" with authed=0 and
+      # no explanation. Ask what the client will ask.
+      listening=0
+      (exec 3<>/dev/tcp/127.0.0.1/$OC_DEV_PORT) 2>/dev/null && { exec 3<&- 3>&-; listening=1; }
+      dpid=$(pgrep -f "OPENCHIME_PROTO_PORT=$OC_DEV_PORT" | head -1 || true)
+      [ -z "$dpid" ] && dpid=$(pgrep -x openchimed | head -1 || true)
       stale=1
-      if [ -n "$dpid" ]; then
+      if [ "$listening" = "1" ] && [ -n "$dpid" ]; then
         started=$(stat -c %Y "/proc/$dpid" 2>/dev/null || echo 0)
         built=$(stat -c %Y "$HERE/openchimed" 2>/dev/null || echo 0)
         [ "$started" -ge "$built" ] && stale=0
