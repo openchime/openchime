@@ -123,6 +123,17 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
   call sites**, which are native GDI popups and the most foreign-looking surfaces in
   the app.
 
+- **WIN-54a — the channel directory (REQ-038) is DONE.** No daemon work was needed,
+  which is worth recording: `process_list_channels` has always returned every PUBLIC
+  channel plus a `joined` flag, and the sidebar even lists the unjoined ones. What was
+  missing was a place to see them together. "Browse channels…" in the New menu opens a
+  `MODAL_LG` listing every public channel with its topic, **unjoined first** — what
+  you can act on is why you opened it — with a primary **Join** or a plain **Open**.
+  Joining does NOT close the sheet (a directory is somewhere you browse); Open does.
+  **Not built:** member counts, because the channel list carries none — a count needs
+  LIST_MEMBERS per channel — and a name filter, since the palette already searches
+  conversations by name.
+
 - **WIN-80 — the composer becomes ours.** Approved 2026-07-30 and recorded as
   **ARCH-98**, which amends ARCH-82's LOCKED choice of RichEdit. RichEdit was chosen
   for good reasons — editing, IME, selection, clipboard and undo for free — and all
@@ -209,7 +220,7 @@ Not startable in this client. Each names what must land first.
 | ~~**WIN-51**~~ | ~~Forward / quote-share~~ **DONE.** "Forward…" in the message menu; the **palette picks the destination**, since it already lists every conversation with a filter. While a forward is pending it shows conversations ONLY and labels itself "Forward to…" — the action rows were listed first, so "Create a channel" sat under the selection and choosing it could only cancel. It sends a **quote, not a copy of the file**: `link_attachments` will only link an attachment whose `message_id IS NULL` and whose uploader and channel match the sender, so re-linking is impossible by design — which is also why forwarding cannot leak a private channel's file. **No IDOR here**, contrary to the plan's worry. The quote names any attachment and appends a permalink. | — |
 | **WIN-52** | Mark a message or conversation unread | REQ-235 |
 | **WIN-53** | Custom status (emoji + text + expiry) | REQ-241 / REQ-122 |
-| **WIN-54** | ~~Per-channel roster~~ **(done, WIN-37)**, global notify default, browse-channels directory, group DMs, custom emoji, active-session list | REQ-031 listing op · REQ-134 · REQ-038 · REQ-056 · REQ-072 · REQ-182 has revoke but no list |
+| **WIN-54** | ~~Per-channel roster~~ **(done, WIN-37)**, ~~browse-channels directory~~ **(done — see below)**, global notify default, group DMs, custom emoji, active-session list | REQ-031 listing op · REQ-134 · REQ-038 · REQ-056 · REQ-072 · REQ-182 has revoke but no list |
 | ~~**WIN-55**~~ | ~~Live reconnect countdown in the banner~~ **DONE.** The blocker was a client-core gap, not daemon work: the net thread stated the delay once per backoff as sticky text, so the banner's number never moved and read as a hung client. `oc_model` now carries `reconnect_at_ms` and the banner ticks it down, then shows "Reconnecting…" once the deadline passes. The clock lives in the core (`oc_model_now_ms`) and both the net thread and the frontend read it — two clocks would drift and make the countdown jump. Verified by killing the daemon and watching it count down. |
 | ~~**WIN-56**~~ | ~~**Store the session token in Windows Credential Manager**~~ **DONE.** `client/shared/secret_win.c` implements the `oc_secret` seam over `CredWriteW`/`CredReadW`/`CredDeleteW` (one generic credential per workspace, `CRED_PERSIST_LOCAL_MACHINE`), wired into both Windows front-ends via the new shared `oc_secret_open_os()`. **The core now refuses to persist a token to SQLite at all** and erases any left by an older build, so there is no plaintext fallback anywhere. Verified on Windows: the credential appears in `cmdkey /list`, `workspace_state.session_token` is NULL, and silent reconnect reads from the OS store. |
 | ~~**WIN-57**~~ | ~~Sign in to *every* remembered workspace at boot~~ **DONE** — unblocked by WIN-29. A launch with no arguments now connects every remembered workspace that has a stored session token, keeping the most-recently-used one active and the rest in the background. Only ones with a token: a workspace without a credential would sit at a failed connection, and boot is not the place to ask. Verified: a no-argument launch brought up both remembered workspaces, one active and one background showing its unread. |

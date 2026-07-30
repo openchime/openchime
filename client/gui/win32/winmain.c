@@ -599,6 +599,12 @@ static uint64_t  g_jump_mid;            /* message to scroll to, 0 = none */
  * destination. The palette picks the destination — it already lists every
  * conversation, so a forward needs no new picker. */
 static uint64_t  g_fwd_mid, g_fwd_cid;
+/* The channel directory (REQ-038, WIN-54a). No daemon work: LIST_CHANNELS already
+ * returns every PUBLIC channel plus a `joined` flag — the client simply never gave
+ * you a place to see them together. */
+static int       g_browse_open;
+static struct { D2D1_RECT_F r; uint64_t cid; } g_browse_rows[64];
+static int       g_n_browse_rows;
 static int       g_pal_accepting;      /* inside palette_accept: see palette_close */
 static uint64_t  g_jump_fetched;        /* the id we already fetched around, so we ask once */
 static ULONGLONG g_jump_deadline;       /* GetTickCount64 by which it must appear */
@@ -1423,6 +1429,7 @@ static int already_backfilled(uint64_t cid) {
 static void close_overlays(void) {
     const oc_model *mm = model();
     g_prefs_open = 0;
+    g_browse_open = 0;
     g_profile_uid = 0;
     g_notify_open = 0;
     g_keys_open = 0;
@@ -2663,7 +2670,7 @@ static void ovl_end(ID2D1RenderTarget *rt, D2D1_RECT_F body) {
     ID2D1RenderTarget_PopAxisAlignedClip(rt);
 }
 
-enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES };
+enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE };
 
 /* An overlay title bar; returns the region below it for the overlay body. */
 static D2D1_RECT_F overlay_header(ID2D1RenderTarget *rt, D2D1_RECT_F reg, const char *title) {
@@ -4869,7 +4876,7 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
  * They used to replace the transcript, which made "change a setting" cost you
  * your place in the conversation. */
 static int modal_open(void) {
-    return g_prefs_open || g_keys_open || g_wsmgr_open || g_notify_open;
+    return g_prefs_open || g_keys_open || g_wsmgr_open || g_notify_open || g_browse_open;
 }
 
 static D2D1_RECT_F g_modal_card;
@@ -5042,6 +5049,8 @@ static D2D1_RECT_F modal_frame(ID2D1RenderTarget *rt, const oc_modal_spec *s,
  * same description the painter used. */
 static const oc_modal_spec *modal_current(void);
 
+static void draw_browse(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F body);  /* fwd */
+
 static void draw_modal(ID2D1RenderTarget *rt, const oc_model *m, float W, float H) {
     if (!modal_open()) {
         g_modal_card = rf(0, 0, 0, 0);
@@ -5056,6 +5065,7 @@ static void draw_modal(ID2D1RenderTarget *rt, const oc_model *m, float W, float 
     else if (g_keys_open)   draw_keys(rt, body);
     else if (g_wsmgr_open)  draw_wsmgr(rt, body);
     else if (g_notify_open) draw_notify_prefs(rt, m, body);
+    else if (g_browse_open) draw_browse(rt, m, body);
 }
 
 static void prefs_save(void);                    /* fwd */
@@ -5147,6 +5157,12 @@ static const oc_modal_spec *modal_current(void) {
         sp.buttons[1] = (oc_mbtn){ "Save",   MB_PRIMARY, MODAL_OK };
         sp.n_buttons = 2;
         sp.snapshot = notify_snapshot; sp.restore = notify_restore; sp.commit = NULL;
+    } else if (g_browse_open) {
+        sp.title = "Browse channels";
+        sp.subtitle = "Every public channel in this workspace.";
+        sp.size = MODAL_LG;
+        sp.buttons[0] = (oc_mbtn){ "Done", MB_PRIMARY, MODAL_OK };
+        sp.n_buttons = 1;
     } else if (g_keys_open) {
         sp.title = "Keyboard shortcuts";
         sp.size = MODAL_LG;
@@ -5200,7 +5216,7 @@ static void modal_finish(int save) {
     const oc_modal_spec *s = modal_current();
     if (save) { if (s->commit) s->commit(); }
     else      { if (s->restore) s->restore(); }
-    g_prefs_open = g_keys_open = g_wsmgr_open = g_notify_open = 0;
+    g_prefs_open = g_keys_open = g_wsmgr_open = g_notify_open = g_browse_open = 0;
     g_modal_closed_by = save ? "save" : "cancel";
 }
 
@@ -5736,6 +5752,57 @@ static void draw_later_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h
                      g_lchan, g_n_lchan, g_later_chan,
                      g_lchan_rows, &g_n_lchan_rows,
                      "Channels appear here once you save something in them.", NULL);
+}
+
+/* The channel directory (REQ-038). Unjoined channels first: what you can act on is
+ * the reason you opened this, and the ones you are already in are in the sidebar. */
+static void draw_browse(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F body) {
+    g_n_browse_rows = 0;
+    if (!m) return;
+    int n_public = 0;
+    for (size_t i = 0; i < m->n_channels; i++)
+        if (m->channels[i].kind != OC_CHANNEL_KIND_DM && m->channels[i].is_public) n_public++;
+    if (!n_public) {
+        overlay_empty(rt, body, "No public channels yet.");
+        return;
+    }
+    float rowh = 54.0f;
+    ovl_use(OVL_BROWSE);
+    float y = ovl_begin(rt, body, (float)n_public * rowh + 12);
+    for (int pass = 0; pass < 2; pass++) {
+        for (size_t i = 0; i < m->n_channels; i++) {
+            const oc_channel *c = &m->channels[i];
+            if (c->kind == OC_CHANNEL_KIND_DM || !c->is_public) continue;
+            if ((pass == 0) == (c->joined != 0)) continue;    /* unjoined first */
+            if (y + rowh < body.top) { y += rowh; continue; }
+            if (y > body.bottom) break;
+            char nm[128]; snprintf(nm, sizeof nm, "#%s", c->name[0] ? c->name : "channel");
+            draw_text(rt, nm, g_ui_b, rf(body.left + 8, y + 6, body.right - 130, y + 26),
+                      OC_COL_TEXT);
+            draw_text(rt, (c->topic && c->topic[0]) ? c->topic : "No topic set.", g_meta,
+                      rf(body.left + 8, y + 26, body.right - 130, y + 46), OC_COL_FAINT);
+            D2D1_RECT_F b = rf(body.right - 110, y + 12, body.right - 8, y + 40);
+            int hot = in_rect(b, g_mouse_x, g_mouse_y);
+            if (c->joined) {
+                fill_round(rt, b, 6.0f, hot ? OC_COL_HOVER : OC_COL_INPUT);
+                stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
+            } else {
+                fill_round(rt, b, 6.0f, hot ? OC_COL_ACCENT_DIM : OC_COL_ACCENT);
+            }
+            IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+            draw_text(rt, c->joined ? "Open" : "Join", g_ui, rf(b.left, b.top + 1, b.right, b.bottom),
+                      c->joined ? OC_COL_TEXT : 0xFFFFFF);
+            IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+            if (g_n_browse_rows < 64) {
+                g_browse_rows[g_n_browse_rows].r = b;
+                g_browse_rows[g_n_browse_rows].cid = c->channel_id;
+                g_n_browse_rows++;
+            }
+            fill(rt, rf(body.left + 8, y + rowh - 1, body.right - 8, y + rowh), OC_COL_BORDER);
+            y += rowh;
+        }
+    }
+    ovl_end(rt, body);
 }
 
 static void draw_later(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
@@ -7314,6 +7381,26 @@ static int on_click(HWND hwnd, int x, int y) {
         }
         return 1;
     }
+    if (g_browse_open) {
+        for (int i = 0; i < g_n_browse_rows; i++)
+            if (in_rect(g_browse_rows[i].r, x, y)) {
+                uint64_t cid = g_browse_rows[i].cid;
+                const oc_model *bm = model();
+                const oc_channel *bc = bm ? oc_model_channel((oc_model *)bm, cid) : NULL;
+                if (bc && !bc->joined) {
+                    /* Join and stay: the directory is a place you browse, so it does
+                     * not close under you on the first join. */
+                    oc_client_join_channel(g_client, cid);
+                    toast_push("Joined.", 0);
+                } else {
+                    modal_finish(1);          /* Open means leave the directory */
+                    g_view = VIEW_HOME;
+                    select_channel(cid);
+                    layout_composer(hwnd);
+                }
+                return 1;
+            }
+    }
     if (g_prefs_open) {
         for (int i = 0; i < g_n_pref_hits; i++) {
             if (!in_rect(g_pref_hits[i].r, x, y)) continue;
@@ -8723,6 +8810,7 @@ static void open_new_menu(HWND hwnd) {
      * menu entry, no button, nothing. ARCH-82 says this GUI is affordance-driven,
      * and the palette was the one surface reachable only by a keystroke. */
     mi_item(8, "Jump to\xE2\x80\xA6  (Ctrl+K)");
+    mi_item(9, "Browse channels\xE2\x80\xA6");
     g_menu = MENU_NEW; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 224;
     g_menu_x = RAIL_W + 8;
     /* Bottom-aligned to the New button, so the menu grows upward out of the thing
@@ -8926,6 +9014,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 910: case 911: case 912:           g_file_sort   = cmd - 910; break;
     case 920: case 921: case 922:           g_file_scope  = cmd - 920; break;
     case 8:  palette_open(hwnd); break;                    /* WIN-75 */
+    case 9:  modal_enter(hwnd, &g_browse_open); break;     /* REQ-038, WIN-54a */
     case 2:  oc_client_reconnect(g_client); break;
     case 3:  oc_client_logout(g_client, OC_LOGOUT_THIS); g_logging_out = 1; break;
     case 5:  oc_client_logout(g_client, OC_LOGOUT_ALL);  g_logging_out = 1; break;
@@ -9305,7 +9394,8 @@ static void test_dump(const char *path) {
             g_modal_close_btn.right, g_modal_close_btn.bottom, g_n_modal_btns);
     fprintf(f, "modal=%s theme=%d time24=%d members=%d daysep=%d notify=%d\n",
             g_prefs_open ? "prefs" : g_keys_open ? "keys" :
-            g_wsmgr_open ? "wsmgr" : g_notify_open ? "notify" : "none",
+            g_wsmgr_open ? "wsmgr" : g_notify_open ? "notify" :
+            g_browse_open ? "browse" : "none",
             oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep, g_pref_notify);
     fprintf(f, "workspaces=%d active=%d elsewhere=%d\n", g_n_wss, g_ws_active, ws_unread_elsewhere());
     for (int i = 0; i < g_n_wss; i++) {
@@ -9604,9 +9694,13 @@ static void test_poll(HWND hwnd) {
     } else if (!strcmp(verb, "mkchan")) {
         /* Bypass the modal New-channel dialog, as "upload" bypasses the file
          * dialog: the harness cannot drive a modal. */
+        /* `mkchan <name> [public]`, public defaulting to 1 — and it means what it
+         * says. It used to pass `pub == 0` as is_public, so asking for a PUBLIC
+         * channel created a private one; the argument's name and its effect were
+         * opposites, which is a trap for anyone writing a test with it. */
         char nm[64] = {0}; int pub = 1;
         sscanf(arg, "%63s %d", nm, &pub);
-        if (g_client && nm[0]) { oc_client_create_channel_ex(g_client, nm, pub == 0); test_ack("ok"); }
+        if (g_client && nm[0]) { oc_client_create_channel_ex(g_client, nm, pub != 0); test_ack("ok"); }
         else test_ack("err");
     } else if (!strcmp(verb, "del")) {
         /* Delete a message without the modal menu; mid 0 = the newest. */
