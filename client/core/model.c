@@ -1157,15 +1157,49 @@ void oc_sidebar_opts_defaults(oc_sidebar_opts *o) {
 }
 
 void oc_sidebar_opts_encode(const oc_sidebar_opts *o, char *out, size_t cap) {
-    snprintf(out, cap, "c:%u,%u,%u;d:%u,%u,%u",
+    /* Appended, not inserted: an older client parses the "c:...;d:..." prefix with
+     * sscanf and ignores the rest, so it keeps working against a bucket written by
+     * this one. The starred section's own sort/filter/collapsed ride the same
+     * scheme once anyone needs them; today only its collapse matters and it
+     * defaults open. */
+    int used = snprintf(out, cap, "c:%u,%u,%u;d:%u,%u,%u",
              o->sort[OC_SB_CHANNELS], o->filter[OC_SB_CHANNELS], o->collapsed[OC_SB_CHANNELS],
              o->sort[OC_SB_DMS],      o->filter[OC_SB_DMS],      o->collapsed[OC_SB_DMS]);
+    if (used < 0 || (size_t)used >= cap) return;
+    if (o->n_starred) {
+        size_t at = (size_t)used;
+        at += (size_t)snprintf(out + at, cap - at, ";s:");
+        for (uint8_t i = 0; i < o->n_starred && at + 24 < cap; i++)
+            at += (size_t)snprintf(out + at, cap - at, "%s%llu", i ? "," : "",
+                                   (unsigned long long)o->starred[i]);
+    }
+    if ((size_t)used < cap) {
+        size_t at2 = strlen(out);
+        if (at2 + 8 < cap) snprintf(out + at2, cap - at2, ";sc:%u", o->collapsed[OC_SB_STARRED]);
+    }
 }
 
 void oc_sidebar_opts_parse(oc_sidebar_opts *o, const char *s) {
     unsigned cs, cf, cc, ds, df, dc;
     if (!s || !*s) return;
     if (sscanf(s, "c:%u,%u,%u;d:%u,%u,%u", &cs, &cf, &cc, &ds, &df, &dc) != 6) return;
+    /* The starred list and its collapse are optional suffixes, so a bucket written
+     * by an older client parses fine and simply has none. */
+    o->n_starred = 0;
+    const char *sp = strstr(s, ";s:");
+    if (sp) {
+        sp += 3;
+        while (*sp && o->n_starred < OC_SB_STARRED_MAX) {
+            char *end = NULL;
+            unsigned long long v = strtoull(sp, &end, 10);
+            if (!end || end == sp) break;
+            if (v) o->starred[o->n_starred++] = (uint64_t)v;
+            if (*end != ',') break;
+            sp = end + 1;
+        }
+    }
+    const char *cp = strstr(s, ";sc:");
+    if (cp) o->collapsed[OC_SB_STARRED] = (uint8_t)(atoi(cp + 4) ? 1 : 0);
     /* Clamp: a bucket value can come from a newer client that knows more modes. */
     o->sort[OC_SB_CHANNELS]      = (uint8_t)(cs <= OC_SB_SORT_UNREAD ? cs : OC_SB_SORT_AZ);
     o->filter[OC_SB_CHANNELS]    = (uint8_t)(cf <= OC_SB_FILTER_ACTIVE ? cf : OC_SB_FILTER_ALL);
@@ -1214,19 +1248,53 @@ static int sb_cmp(const void *va, const void *vb) {
     return strcmp(a->row.label, b->row.label);   /* A-Z, and the tiebreak for both */
 }
 
+int oc_sidebar_is_starred(const oc_sidebar_opts *o, uint64_t channel_id) {
+    if (!o || !channel_id) return 0;
+    for (uint8_t i = 0; i < o->n_starred; i++)
+        if (o->starred[i] == channel_id) return 1;
+    return 0;
+}
+
+int oc_sidebar_toggle_star(oc_sidebar_opts *o, uint64_t channel_id) {
+    if (!o || !channel_id) return 0;
+    for (uint8_t i = 0; i < o->n_starred; i++)
+        if (o->starred[i] == channel_id) {
+            memmove(&o->starred[i], &o->starred[i + 1],
+                    (size_t)(o->n_starred - i - 1) * sizeof o->starred[0]);
+            o->n_starred--;
+            return 1;
+        }
+    if (o->n_starred >= OC_SB_STARRED_MAX) return 0;   /* full: refuse, do not evict */
+    o->starred[o->n_starred++] = channel_id;
+    return 1;
+}
+
 size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
                         oc_sidebar_row *out, size_t cap) {
     if (!m || !o || !out || cap == 0) return 0;
     size_t n = 0;
 
-    for (int sec = 0; sec < OC_SB_SECTIONS; sec++) {
+    /* STARRED first on screen, then Channels, then DMs — Slack's order. The enum
+     * numbers the sections for storage; this array decides what the eye sees, so
+     * adding a section does not renumber anyone's saved preferences. */
+    static const int ORDER[OC_SB_SECTIONS] = { OC_SB_STARRED, OC_SB_CHANNELS, OC_SB_DMS };
+    for (int oi = 0; oi < OC_SB_SECTIONS; oi++) {
+        int sec = ORDER[oi];
         /* Collect this section's rows, with the timestamp alongside for sorting. */
         sb_tmp *tmp = calloc(m->n_channels + 1, sizeof *tmp);
         size_t tn = 0, total = 0;
         for (size_t i = 0; tmp && i < m->n_channels; i++) {
             const oc_channel *c = &m->channels[i];
             int is_dm = (c->kind == OC_CHANNEL_KIND_DM);
-            if ((sec == OC_SB_DMS) != is_dm) continue;
+            int starred = oc_sidebar_is_starred(o, c->channel_id);
+            /* A starred conversation appears ONCE, in Starred: leaving it in its
+             * normal section too would show it twice, and Slack lifts it out. */
+            if (sec == OC_SB_STARRED) {
+                if (!starred) continue;
+            } else {
+                if (starred) continue;
+                if ((sec == OC_SB_DMS) != is_dm) continue;
+            }
             /* A named channel the user has not joined is browsable, not listed. */
             if (!is_dm && (!c->name || !c->name[0])) continue;
             total++;
@@ -1271,6 +1339,7 @@ size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
             h->is_header = 1;
             h->section = (uint8_t)sec;
             snprintf(h->label, sizeof h->label, "%s",
+                     sec == OC_SB_STARRED  ? "Starred" :
                      sec == OC_SB_CHANNELS ? "Channels" : "Direct messages");
             h->section_total = (int)total;
         }

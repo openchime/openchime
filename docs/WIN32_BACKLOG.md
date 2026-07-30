@@ -9,7 +9,7 @@ clients, or a `REQ-NNN`.
 parity table is the *feature reachability* tracker. This document is the *work
 list* derived from both — one row per shippable branch.
 
-**Ids.** Items are `WIN-1` … `WIN-82`, numbered once and **stable**: an id is
+**Ids.** Items are `WIN-1` … `WIN-83`, numbered once and **stable**: an id is
 never renumbered or reused, so a commit or branch can cite it. Ordering is *not*
 priority — the **Pri** column is, and it may change. Section membership may also
 change as blockers clear (an item moves from §3 to §1 without changing its id).
@@ -75,6 +75,7 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 | **WIN-80** | Custom DirectWrite composer, replacing RichEdit (ARCH-98) | P1 | XL |
 | **WIN-81** | The GUI smoke does not run in CI — needs a self-hosted Windows runner | P2 | M |
 | **WIN-82** | Files' channel census only sees the 200-row page — needs a distinct-channels query | P3 | S |
+| **WIN-83** | User-defined custom sidebar sections (the other half of REQ-234) | P3 | M |
 
 ### The items added 2026-07-30, in detail
 
@@ -207,7 +208,7 @@ Not startable in this client. Each names what must land first.
 | **WIN-38** | Search paging | Wire gap: `SEARCH_RESULTS` carries `truncated` but **no cursor or offset**, so load-more is impossible today |
 | **WIN-39** | Search operators (`from:` / `in:` / `has:` / dates) | REQ-081 — no operator grammar |
 | **WIN-40** | Mute channel/DM (suppress + de-emphasize) | REQ-137 — distinct from level=none; needs per-user mute storage |
-| **WIN-41** | Starred/favourite conversations + custom sidebar sections | REQ-234 — per-user sidebar state storage. **ARCH-88 settles the open question by elimination**: with no client-local storage it must be server-side, and the `client_settings` bucket already exists for exactly this |
+| ~~**WIN-41**~~ | ~~Starred conversations~~ **DONE** (the favourites half of REQ-234). A third **Starred** section, first on screen, holding channels and DMs alike — and each appears **once**: a starred conversation is lifted OUT of its normal section, as Slack does. Star/unstar from the channel menu; the set persists in the `client_settings` bucket appended to the existing sidebar string, so a bucket written by an older client still parses and simply has no stars. Collapsed automatically in the DMs view, where a starred #channel would contradict the point of that view. **User-defined custom sections are split out as WIN-83** rather than claimed here. | — |
 | ~~**WIN-42**~~ | ~~Pin a message~~ **DONE.** REQ-230/ARCH-90 built in the daemon (migration 0022) and surfaced here: "Pin to channel" / "Unpin from channel" in the message kebab, a "Pinned by …" marker above the message inline, and a **Pinned** button in the channel header opening the list — each row jumps to the message in context, or unpins it. | — |
 | ~~**WIN-43**~~ | ~~Save for later / the **Later** rail stub~~ **DONE.** REQ-231/ARCH-95: "Save for later" in the message menu, a **Later** view listing what you saved with Remove, and a click jumping to the message in its channel. Private — keyed (user, message), the mirror of a pin. | — |
 | ~~**WIN-44**~~ | ~~Copy link / jump-to-permalink~~ **DONE.** The inbound half was all that was missing — `HISTORY_AROUND` and Copy link already existed. A permalink pasted into the **command palette** navigates: switch channel, arm the jump, fetch around the id if it is outside the loaded window (ARCH-96). Deliberately **not** the composer, where pasting must keep inserting the text, because sharing a link is the common case. Every failure says why — not signed in, another workspace, a channel you cannot see — since a link that silently does nothing is indistinguishable from a broken app. **Found while building it:** the outbound format omitted the port (`g_host` holds the host alone), so a link from a workspace on 8443 pointed at 443 and could not be followed. Having only one half of a feature is what hid that. | — |

@@ -309,7 +309,12 @@ oc_channel *oc_model_channel(oc_model *m, uint64_t channel_id);
  * private ones marked) and Direct messages. A DM has no name on the wire — the
  * daemon stores NULL (kind='dm') — so a row carries a rendered `label` and a
  * frontend must never filter on `name`. */
-enum { OC_SB_CHANNELS = 0, OC_SB_DMS = 1, OC_SB_SECTIONS = 2 };
+/* Three sections now. STARRED is Slack's shape: pinned conversations lifted to the
+ * top and REMOVED from their normal section, so a starred channel appears once. It
+ * is last in the enum so the existing per-section arrays keep their indices — the
+ * order on SCREEN is decided by the builder, not by this numbering. */
+enum { OC_SB_CHANNELS = 0, OC_SB_DMS = 1, OC_SB_STARRED = 2, OC_SB_SECTIONS = 3 };
+#define OC_SB_STARRED_MAX 32u
 enum { OC_SB_SORT_AZ = 0, OC_SB_SORT_RECENT, OC_SB_SORT_UNREAD };
 enum { OC_SB_FILTER_ALL = 0, OC_SB_FILTER_UNREAD, OC_SB_FILTER_ACTIVE };
 
@@ -318,7 +323,19 @@ typedef struct {
     uint8_t  filter[OC_SB_SECTIONS];     /* OC_SB_FILTER_* , per section */
     uint8_t  collapsed[OC_SB_SECTIONS];  /* 1 = show the header only */
     char     find[64];                   /* "Find a conversation" text, lowercased */
+    /* Starred conversations (REQ-234, WIN-41). Ids rather than names: a channel can
+     * be renamed and a DM has no name at all. Kept in the OPTIONS rather than the
+     * model because it is a per-user display choice, exactly like sort and filter,
+     * and the frontend owns persisting it. */
+    uint64_t starred[OC_SB_STARRED_MAX];
+    uint8_t  n_starred;
 } oc_sidebar_opts;
+
+/* Is `channel_id` starred? Shared so a frontend's menu and the builder cannot
+ * disagree about it. */
+int  oc_sidebar_is_starred(const oc_sidebar_opts *o, uint64_t channel_id);
+/* Toggle. Returns 1 when the set changed (a full list refuses silently otherwise). */
+int  oc_sidebar_toggle_star(oc_sidebar_opts *o, uint64_t channel_id);
 
 typedef struct {
     uint8_t  is_header;      /* a section header row */

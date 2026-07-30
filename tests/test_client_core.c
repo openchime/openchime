@@ -348,45 +348,77 @@ static void test_sidebar(void) {
     oc_sidebar_opts o; oc_sidebar_opts_defaults(&o);
     oc_sidebar_row rows[16];
 
-    /* Two headers; channels A-Z; the DM titled by its peer, not skipped. */
+    /* THREE headers now (WIN-41): Starred first — empty but present, so it can be
+     * used — then Channels A-Z, then the DM titled by its peer. */
     size_t n = oc_model_sidebar(&m, &o, rows, 16);
-    CHECK(n == 5);
-    CHECK(rows[0].is_header && rows[0].section == OC_SB_CHANNELS && rows[0].section_total == 2);
-    CHECK(strcmp(rows[1].label, "alpha") == 0 && rows[1].is_private == 1);
-    CHECK(strcmp(rows[2].label, "zulu") == 0  && rows[2].is_private == 0);
-    CHECK(rows[3].is_header && rows[3].section == OC_SB_DMS);
-    CHECK(strcmp(rows[4].label, "bob") == 0 && rows[4].unread == 3);
+    CHECK(n == 6);
+    CHECK(rows[0].is_header && rows[0].section == OC_SB_STARRED && rows[0].section_total == 0);
+    CHECK(rows[1].is_header && rows[1].section == OC_SB_CHANNELS && rows[1].section_total == 2);
+    CHECK(strcmp(rows[2].label, "alpha") == 0 && rows[2].is_private == 1);
+    CHECK(strcmp(rows[3].label, "zulu") == 0  && rows[3].is_private == 0);
+    CHECK(rows[4].is_header && rows[4].section == OC_SB_DMS);
+    CHECK(strcmp(rows[5].label, "bob") == 0 && rows[5].unread == 3);
+
+    /* Starring lifts a conversation OUT of its section into Starred — it must appear
+     * once, not twice. */
+    CHECK(oc_sidebar_toggle_star(&o, 11) == 1);
+    CHECK(oc_sidebar_is_starred(&o, 11) && !oc_sidebar_is_starred(&o, 12));
+    n = oc_model_sidebar(&m, &o, rows, 16);
+    CHECK(n == 6);
+    CHECK(rows[0].is_header && rows[0].section == OC_SB_STARRED && rows[0].section_total == 1);
+    CHECK(strcmp(rows[1].label, "alpha") == 0 && rows[1].section == OC_SB_STARRED);
+    CHECK(rows[2].is_header && rows[2].section == OC_SB_CHANNELS);
+    CHECK(strcmp(rows[3].label, "zulu") == 0);      /* alpha is gone from Channels */
+    /* A DM stars too, and un-starring puts it back. */
+    CHECK(oc_sidebar_toggle_star(&o, 12) == 1);
+    n = oc_model_sidebar(&m, &o, rows, 16);
+    CHECK(rows[0].section_total == 2);
+    CHECK(oc_sidebar_toggle_star(&o, 11) == 1 && oc_sidebar_toggle_star(&o, 12) == 1);
+    CHECK(o.n_starred == 0);
+    n = oc_model_sidebar(&m, &o, rows, 16);
+    CHECK(n == 6 && strcmp(rows[2].label, "alpha") == 0);
 
     /* Recency uses the server-reported last_message_at: alpha(300) before zulu(100). */
     o.sort[OC_SB_CHANNELS] = OC_SB_SORT_RECENT;
     n = oc_model_sidebar(&m, &o, rows, 16);
-    CHECK(strcmp(rows[1].label, "alpha") == 0 && strcmp(rows[2].label, "zulu") == 0);
+    CHECK(strcmp(rows[2].label, "alpha") == 0 && strcmp(rows[3].label, "zulu") == 0);
 
     /* Collapsing keeps the header (so it can be reopened) and drops the children. */
     o.collapsed[OC_SB_CHANNELS] = 1;
     n = oc_model_sidebar(&m, &o, rows, 16);
-    CHECK(n == 3 && rows[0].is_header && rows[0].section_total == 2);
+    CHECK(n == 4 && rows[1].is_header && rows[1].section_total == 2);
     o.collapsed[OC_SB_CHANNELS] = 0;
 
     /* Unread-only hides the read channels but keeps the unread DM. */
     o.filter[OC_SB_CHANNELS] = OC_SB_FILTER_UNREAD;
     n = oc_model_sidebar(&m, &o, rows, 16);
-    CHECK(n == 3 && rows[1].is_header && strcmp(rows[2].label, "bob") == 0);
+    CHECK(n == 4 && rows[2].is_header && strcmp(rows[3].label, "bob") == 0);
     o.filter[OC_SB_CHANNELS] = OC_SB_FILTER_ALL;
 
     /* Find matches the rendered LABEL, so a DM (which has no name) is findable. */
     snprintf(o.find, sizeof o.find, "bo");
     n = oc_model_sidebar(&m, &o, rows, 16);
-    CHECK(n == 3 && strcmp(rows[2].label, "bob") == 0);
+    CHECK(n == 4 && strcmp(rows[3].label, "bob") == 0);
     o.find[0] = '\0';
 
     /* Options round-trip through the settings bucket (ARCH-88: no local file). */
     o.sort[OC_SB_DMS] = OC_SB_SORT_UNREAD; o.collapsed[OC_SB_DMS] = 1;
-    char enc[64]; oc_sidebar_opts_encode(&o, enc, sizeof enc);
+    CHECK(oc_sidebar_toggle_star(&o, 11) == 1);
+    CHECK(oc_sidebar_toggle_star(&o, 12) == 1);
+    o.collapsed[OC_SB_STARRED] = 1;
+    char enc[256]; oc_sidebar_opts_encode(&o, enc, sizeof enc);
     oc_sidebar_opts p2; oc_sidebar_opts_defaults(&p2);
     oc_sidebar_opts_parse(&p2, enc);
     CHECK(p2.sort[OC_SB_DMS] == OC_SB_SORT_UNREAD && p2.collapsed[OC_SB_DMS] == 1);
     CHECK(p2.sort[OC_SB_CHANNELS] == OC_SB_SORT_RECENT);
+    /* The starred set survives the round trip, in order, with its collapse. */
+    CHECK(p2.n_starred == 2 && p2.starred[0] == 11 && p2.starred[1] == 12);
+    CHECK(p2.collapsed[OC_SB_STARRED] == 1);
+    /* And a bucket written by an OLDER client (no ";s:" suffix) still parses, with
+     * no stars — the suffix is optional by design. */
+    oc_sidebar_opts p3; oc_sidebar_opts_defaults(&p3);
+    oc_sidebar_opts_parse(&p3, "c:1,0,0;d:2,0,1");
+    CHECK(p3.n_starred == 0 && p3.sort[OC_SB_DMS] == OC_SB_SORT_UNREAD);
 
     oc_model_free(&m);
 }

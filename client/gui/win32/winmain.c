@@ -1918,7 +1918,13 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
      * shows only that section; Home shows both. */
     oc_sidebar_opts o = g_sb;
     snprintf(o.find, sizeof o.find, "%s", g_find_filter);
-    if (g_view == VIEW_DMS) o.collapsed[OC_SB_CHANNELS] = 1;
+    if (g_view == VIEW_DMS) {
+        o.collapsed[OC_SB_CHANNELS] = 1;
+        /* Starred holds channels as well as DMs (WIN-41), and the DMs view is only
+         * about people — showing a starred #channel there would contradict the whole
+         * reason that view exists. */
+        o.collapsed[OC_SB_STARRED] = 1;
+    }
     /* Sized to what the model actually holds — a fixed 512 was a silent cap on
      * how many conversations could appear, which a busy workspace would hit
      * with no indication that rows were missing. Grown once and kept. */
@@ -3078,7 +3084,7 @@ static void nav_conversation(HWND hwnd, int delta, int unread_only) {
     const oc_model *m = model();
     if (!m || !m->n_channels) return;
     oc_sidebar_opts o = g_sb;
-    if (g_view == VIEW_DMS) o.collapsed[OC_SB_CHANNELS] = 1;
+    if (g_view == VIEW_DMS) { o.collapsed[OC_SB_CHANNELS] = 1; o.collapsed[OC_SB_STARRED] = 1; }
     snprintf(o.find, sizeof o.find, "%s", g_find_filter);
     size_t cap = m->n_channels + OC_SB_SECTIONS + 2;
     oc_sidebar_row *rows = malloc(cap * sizeof *rows);
@@ -9109,7 +9115,9 @@ static void prefs_load(const oc_model *m) {
 
 static void sidebar_opts_save(void) {
     if (!g_client) return;
-    char enc[64];
+    /* Bigger than the old 64: the encoding now carries up to 32 starred channel ids
+     * (WIN-41), and a truncated setting would silently drop stars. */
+    char enc[512];
     oc_sidebar_opts_encode(&g_sb, enc, sizeof enc);
     oc_client_set_setting(g_client, SB_SETTING_KEY, enc);
 }
@@ -9359,6 +9367,8 @@ static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, float 
     if (!c->joined && c->is_public) {
         mi_item(1, "Join channel");
     } else {
+        mi_item(30, oc_sidebar_is_starred(&g_sb, cid) ? "Remove from Starred"
+                                                      : "Add to Starred");
         mi_item(2, "Mark as read");
         /* Notification levels FLATTENED out of a submenu (WIN-79), with the current
          * one ticked — the same reasoning as the member role: the useful part of a
@@ -9404,6 +9414,10 @@ static void channel_menu_run(HWND hwnd, int cmd) {
     uint64_t cid = g_menu_target;
     if (!m || !cid) return;
     switch (cmd) {
+    case 30:                                   /* WIN-41 */
+        if (oc_sidebar_toggle_star(&g_sb, cid)) sidebar_opts_save();
+        else toast_push("Starred is full (32).", 1);
+        break;
     case 1:  oc_client_join_channel(g_client, cid); break;
     case 2:  oc_client_mark_read(g_client, cid); break;
     case 3:  oc_client_leave_channel(g_client, cid); break;
