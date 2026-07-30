@@ -1489,6 +1489,29 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_delete_webhook(&w, OC_PROTOCOL_VERSION, &dw) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
+            if (c->type == OC_CMD_LIST_INVITES) {
+                uint8_t buf[16]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_invites(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_REVOKE_INVITE) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_revoke_invite ri = { c->message_id };
+                if (oc_encode_revoke_invite(&w, OC_PROTOCOL_VERSION, &ri) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_WEBHOOK_STATE) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_webhook_state sw = { c->message_id, c->op };
+                if (oc_encode_set_webhook_state(&w, OC_PROTOCOL_VERSION, &sw) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_ROTATE_WEBHOOK) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_rotate_webhook rw = { c->message_id };
+                if (oc_encode_rotate_webhook(&w, OC_PROTOCOL_VERSION, &rw) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
             if (c->type == OC_CMD_UPLOAD && c->body) {
                 if (xfer.mode != 0) { xfer_notice(&ctx, 2, "busy: another transfer is in progress"); }
                 else {

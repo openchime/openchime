@@ -211,6 +211,12 @@ void oc_client_webhooks(oc_client *c, uint64_t channel_id);
 void oc_client_close_webhooks(oc_client *c);
 void oc_client_create_webhook(oc_client *c, uint64_t channel_id, const char *label);
 void oc_client_delete_webhook(oc_client *c, uint64_t webhook_id);
+/* Invite management (REQ-026, WIN-46) and webhook lifecycle (WIN-48). A webhook's
+ * token can be ROTATED but never revealed: only its hash is stored. */
+void oc_client_list_invites(oc_client *c);
+void oc_client_revoke_invite(oc_client *c, uint64_t invite_id);
+void oc_client_set_webhook_state(oc_client *c, uint64_t webhook_id, int disabled);
+void oc_client_rotate_webhook(oc_client *c, uint64_t webhook_id);
 
 /* Attachments (REQ-140/141). Upload a local file and post it to `channel_id`
  * (the core streams it, then links it into a message); download an attachment by

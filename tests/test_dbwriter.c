@@ -2617,6 +2617,179 @@ static void test_attachments(void) {
 
 /* Incoming webhooks (REQ-170): minting a token and posting via it resolve to a
  * message in the scoped channel authored by the webhook's creator. */
+
+/* Invite management (REQ-026, WIN-46) and webhook lifecycle (WIN-48). Both touch
+ * tables whose columns already existed, so the risk is in the ops and their
+ * authorisation — which is what this asserts. */
+static void test_invites_and_webhook_lifecycle(void) {
+    const char *path = "build/test_dbwriter_invites.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t owner  = reg(w, "iv-owner",  "pw", OC_ROLE_OWNER);
+    uint64_t member = reg(w, "iv-member", "pw", OC_ROLE_MEMBER);
+    CHECK(owner && member);
+
+    /* Mint two invites, then list them. */
+    for (int i = 0; i < 2; i++) {
+        oc_job *j = oc_job_new(OC_JOB_INVITE_USER, 1);
+        j->user_id = owner; j->role = OC_ROLE_MEMBER;
+        oc_dbwriter_submit(w, j);
+        oc_dbres *r = wait_result(w);
+        CHECK(r && r->type == OC_RES_INVITE_OK);
+        oc_dbres_free(r);
+    }
+
+    oc_job *j = oc_job_new(OC_JOB_LIST_INVITES, 2);
+    j->user_id = owner;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_INVITE_LIST && r->n_invites == 2);
+    uint64_t iid = r->n_invites ? r->invites[0].invite_id : 0;
+    CHECK(iid != 0);
+    /* The role travels; the TOKEN must not exist in this result at all. */
+    CHECK(r->invites[0].role == OC_ROLE_MEMBER);
+    CHECK(r->invites[0].expires_at > 0);
+    oc_dbres_free(r);
+
+    /* A plain member may not list. */
+    j = oc_job_new(OC_JOB_LIST_INVITES, 3);
+    j->user_id = member;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    /* Nor revoke. */
+    j = oc_job_new(OC_JOB_REVOKE_INVITE, 4);
+    j->user_id = member; j->message_id = iid;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    /* The owner can, and it disappears from the list. */
+    j = oc_job_new(OC_JOB_REVOKE_INVITE, 5);
+    j->user_id = owner; j->message_id = iid;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_INVITE_REVOKED && r->message_id == iid);
+    oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_LIST_INVITES, 6);
+    j->user_id = owner;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_INVITE_LIST && r->n_invites == 1);
+    oc_dbres_free(r);
+
+    /* Revoking it twice fails rather than silently succeeding. */
+    j = oc_job_new(OC_JOB_REVOKE_INVITE, 7);
+    j->user_id = owner; j->message_id = iid;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_LIST_ERR);
+    oc_dbres_free(r);
+
+    /* ---- webhook disable / rotate ---- */
+    j = oc_job_new(OC_JOB_CREATE_WEBHOOK, 8);
+    j->user_id = owner; j->channel_id = OC_DEFAULT_CHANNEL; j->ch_name = strdup("hook");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_CREATED);
+    uint64_t wid = r->message_id;
+    uint8_t tok1[OC_SESSION_TOKEN_LEN];
+    memcpy(tok1, r->session_token, sizeof tok1);
+    oc_dbres_free(r);
+
+    /* Disabling answers with the channel's list, and the row says so. */
+    j = oc_job_new(OC_JOB_SET_WEBHOOK_STATE, 9);
+    j->user_id = owner; j->message_id = wid; j->hook_disabled = 1;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_LIST && r->n_whlist >= 1);
+    int saw_disabled = 0;
+    for (size_t i = 0; i < r->n_whlist; i++)
+        if (r->whlist[i].id == wid && r->whlist[i].disabled) saw_disabled = 1;
+    CHECK(saw_disabled);
+    oc_dbres_free(r);
+
+    /* A disabled webhook's token stops posting — the point of disabling it. */
+    j = oc_job_new(OC_JOB_WEBHOOK_POST, 10);
+    oc_job_set_token(j, tok1, sizeof tok1);
+    oc_job_set_body(j, "nope", 4);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_ERR);
+    oc_dbres_free(r);
+
+    /* Re-enable, then ROTATE: a new token arrives and the old one dies. */
+    j = oc_job_new(OC_JOB_SET_WEBHOOK_STATE, 11);
+    j->user_id = owner; j->message_id = wid; j->hook_disabled = 0;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w); CHECK(r && r->type == OC_RES_WEBHOOK_LIST); oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_ROTATE_WEBHOOK, 12);
+    j->user_id = owner; j->message_id = wid;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_CREATED && r->message_id == wid);
+    uint8_t tok2[OC_SESSION_TOKEN_LEN];
+    memcpy(tok2, r->session_token, sizeof tok2);
+    CHECK(memcmp(tok1, tok2, sizeof tok1) != 0);
+    oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_WEBHOOK_POST, 13);
+    oc_job_set_token(j, tok1, sizeof tok1);
+    oc_job_set_body(j, "old", 3);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_ERR);      /* the rotated-away token */
+    oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_WEBHOOK_POST, 14);
+    oc_job_set_token(j, tok2, sizeof tok2);
+    oc_job_set_body(j, "new", 3);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_POSTED);   /* the new one works */
+    oc_dbres_free(r);
+
+    /* Authorisation is by CHANNEL membership, and the default channel is public, so
+     * `member` legitimately CAN rotate that one — the earlier version of this test
+     * asserted the opposite and failed, which was the test being wrong about its own
+     * premise rather than the rule. A private channel gives a real non-member. */
+    r = create_channel(w, owner, "hooks-priv", 0);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t priv = r->channel_id;
+    oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_CREATE_WEBHOOK, 15);
+    j->user_id = owner; j->channel_id = priv; j->ch_name = strdup("secret");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_CREATED);
+    uint64_t pwid = r->message_id;
+    oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_ROTATE_WEBHOOK, 16);
+    j->user_id = member; j->message_id = pwid;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+
+    j = oc_job_new(OC_JOB_SET_WEBHOOK_STATE, 17);
+    j->user_id = member; j->message_id = pwid; j->hook_disabled = 1;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+}
+
 static void test_webhooks(void) {
     const char *path = "build/test_dbwriter_webhook.db";
     cleanup_db(path);
@@ -2943,6 +3116,7 @@ int run_dbwriter_tests(void) {
     test_dm();
     test_attachments();
     test_webhooks();
+    test_invites_and_webhook_lifecycle();
     test_notify_prefs();
     test_admin_ops();
     test_reactions();

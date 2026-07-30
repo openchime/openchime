@@ -169,6 +169,12 @@ enum {
     OC_CMD_CREATE_WEBHOOK,  /* mint an incoming webhook for `channel_id`: body = label */
     OC_CMD_LIST_WEBHOOKS,   /* list `channel_id`'s webhooks */
     OC_CMD_DELETE_WEBHOOK,  /* delete a webhook: message_id = webhook_id */
+    /* WIN-46 / WIN-48. message_id carries the invite or webhook id; `flag` the
+     * desired disabled state for SET_WEBHOOK_STATE. */
+    OC_CMD_LIST_INVITES,
+    OC_CMD_REVOKE_INVITE,
+    OC_CMD_SET_WEBHOOK_STATE,
+    OC_CMD_ROTATE_WEBHOOK,
     OC_CMD_UPLOAD,          /* upload+post a file to `channel_id`: body = local path */
     OC_CMD_DOWNLOAD,        /* download an attachment: message_id = attachment_id, body = dest path */
     OC_CMD_LOGOUT,          /* revoke this session (op = scope) and close the connection */

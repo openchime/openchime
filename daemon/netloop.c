@@ -1116,6 +1116,42 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        /* Invite management (REQ-026, WIN-46) + webhook lifecycle (WIN-48). */
+        if (hdr.msg_type == OC_MSG_LIST_INVITES) {
+            oc_job *j = oc_job_new(OC_JOB_LIST_INVITES, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_REVOKE_INVITE) {
+            oc_revoke_invite ri;
+            if (oc_decode_revoke_invite(&p, &ri) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_REVOKE_INVITE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->message_id = ri.invite_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_WEBHOOK_STATE) {
+            oc_set_webhook_state sw;
+            if (oc_decode_set_webhook_state(&p, &sw) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_WEBHOOK_STATE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->message_id = sw.webhook_id;
+            j->hook_disabled = sw.disabled;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_ROTATE_WEBHOOK) {
+            oc_rotate_webhook rw;
+            if (oc_decode_rotate_webhook(&p, &rw) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_ROTATE_WEBHOOK, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->message_id = rw.webhook_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_LIST_WEBHOOKS) {
             oc_list_webhooks lw;
             if (oc_decode_list_webhooks(&p, &lw) != OC_OK) return -1;
@@ -2425,6 +2461,28 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
+        break;
+    }
+    case OC_RES_INVITE_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_invite_entry ents[OC_MAX_INVITES];
+        uint16_t n = 0;
+        for (size_t i = 0; i < r->n_invites && n < OC_MAX_INVITES; i++) ents[n++] = r->invites[i];
+        oc_invite_list il = { n, ents };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_invite_list(&w, OC_PROTOCOL_VERSION, &il);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_INVITE_REVOKED: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        /* The ack carries the id so a client can drop that row without re-listing. */
+        oc_revoke_invite rv = { r->message_id };
+        oc_encode_invite_revoked(&w, OC_PROTOCOL_VERSION, &rv);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
     case OC_RES_WEBHOOK_LIST: {

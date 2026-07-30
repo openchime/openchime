@@ -82,7 +82,11 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_PRUNE_DEVICE_TOKEN = 52,
        /* Page backwards through one channel's history (§6.3). Read-only; it
         * answers with the same BACKFILL_OK shape the forward replay uses. */
-       OC_JOB_HISTORY = 53 };
+       OC_JOB_HISTORY = 53,
+       /* Invite management (REQ-026, WIN-46) and webhook lifecycle (WIN-48). Both
+        * read/write tables that already had the columns; only the ops were missing. */
+       OC_JOB_LIST_INVITES = 54, OC_JOB_REVOKE_INVITE = 55,
+       OC_JOB_SET_WEBHOOK_STATE = 56, OC_JOB_ROTATE_WEBHOOK = 57 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -138,6 +142,10 @@ typedef struct oc_job {
 
     /* SAVE_ITEM (message_id above): add/remove. */
     uint8_t        save_op;
+    /* SET_WEBHOOK_STATE's desired state (WIN-48). Its own field rather than reusing
+     * one of the *_op flags above: a reader should not have to know that "save_op"
+     * secretly means "disabled" for a different job type. */
+    uint8_t        hook_disabled;
 
     /* HISTORY: 0 pages backwards from message_id, 1 fetches AROUND it (ARCH-96). */
     uint8_t        hist_around;
@@ -252,7 +260,8 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_PIN_OK = 59, OC_RES_PIN_ERR = 60, OC_RES_PINS = 61,
        /* A channel's member roster / its shared files; ERR carries err_code. */
        OC_RES_MEMBER_LIST = 66, OC_RES_FILE_LIST = 67, OC_RES_LIST_ERR = 68,
-       OC_RES_SAVED_OK = 69, OC_RES_SAVED_LIST = 70, OC_RES_ACTIVITY = 71 };
+       OC_RES_SAVED_OK = 69, OC_RES_SAVED_LIST = 70, OC_RES_ACTIVITY = 71,
+       OC_RES_INVITE_LIST = 72, OC_RES_INVITE_REVOKED = 73 };
 
 /* One saved message (REQ-231). Carries its body for the same reason a pin does:
  * a saved message is usually far outside loaded history. */
@@ -548,6 +557,10 @@ typedef struct oc_dbres {
     oc_client_setting_row  *cslist;          /* heap array */
     size_t                  n_cslist;
     oc_reclaim_row         *reclaim;         /* heap array (OC_RES_STORAGE_MAINT) */
+    /* Outstanding invites (OC_RES_INVITE_LIST). Ids, never tokens: only a hash is
+     * stored, and a list is not a place to hand credentials back. */
+    oc_invite_entry        *invites;
+    size_t                  n_invites;
     size_t                  n_reclaim;
     uint64_t                maint_orphans;   /* counts, for the log line */
     uint64_t                maint_expired;

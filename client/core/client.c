@@ -514,6 +514,41 @@ void oc_client_delete_webhook(oc_client *c, uint64_t webhook_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+/* WIN-46: outstanding invites. No arguments — the server decides what "outstanding"
+ * means (not consumed, not expired) so two clients cannot disagree about it. */
+void oc_client_list_invites(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_INVITES);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_revoke_invite(oc_client *c, uint64_t invite_id) {
+    if (!c || !invite_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_REVOKE_INVITE);
+    if (!cmd) return;
+    cmd->message_id = invite_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* WIN-48. Disable is reversible and rotate is not — the old token dies the moment
+ * the new one is minted, which is the point of rotating a leaked one. */
+void oc_client_set_webhook_state(oc_client *c, uint64_t webhook_id, int disabled) {
+    if (!c || !webhook_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_WEBHOOK_STATE);
+    if (!cmd) return;
+    cmd->message_id = webhook_id;
+    cmd->op = disabled ? 1 : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_rotate_webhook(oc_client *c, uint64_t webhook_id) {
+    if (!c || !webhook_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_ROTATE_WEBHOOK);
+    if (!cmd) return;
+    cmd->message_id = webhook_id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_upload(oc_client *c, uint64_t channel_id, const char *path) {
     if (!c || !channel_id || !path || !path[0]) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_UPLOAD);

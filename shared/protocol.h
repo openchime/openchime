@@ -115,6 +115,12 @@ typedef enum {
     OC_MSG_DELETE_WEBHOOK     = 0x005D, /* C->S, remove a webhook */
     OC_MSG_WEBHOOK_DELETED    = 0x005E, /* S->C, ack for DELETE_WEBHOOK */
     OC_MSG_UPDATE_CHANNEL     = 0x005F, /* C->S (REQ-034/035/036), mutate a channel */
+    /* Webhook lifecycle (WIN-48). `webhooks.disabled` already existed and nothing
+     * could set it. **Reveal is impossible and deliberately absent**: only the
+     * token's SHA-256 is stored, so a lost token can be rotated but never shown
+     * again — the UI has to say so rather than offer a button that cannot work. */
+    OC_MSG_SET_WEBHOOK_STATE  = 0x006B, /* C->S, enable/disable one */
+    OC_MSG_ROTATE_WEBHOOK     = 0x006C, /* C->S, mint a new token for it */
     /* Saved items + activity feed (REQ-231/139, ARCH-95). 0x0060-0x0061 are
      * taken; this family starts at the next free run. */
     OC_MSG_SAVE_ITEM        = 0x0062, /* C->S, save/unsave a message (private) */
@@ -169,6 +175,14 @@ typedef enum {
     OC_MSG_SET_DISPLAY_NAME = 0x0048, /* C->S, change your own display name (REQ-020) */
     OC_MSG_CHANGE_PASSWORD  = 0x0049, /* C->S, change your own local password (verify old) */
     OC_MSG_PROFILE_UPDATED  = 0x004A, /* S->C, a user's display name changed (also the self ack) */
+    /* Invite management (REQ-026, WIN-46). The `invites` table has always carried
+     * role, expires_at_ms and consumed_at_ms — nothing could READ them, so a minted
+     * invite was write-only: no way to see what was outstanding or to revoke one.
+     * No migration; two ops and a list frame. */
+    OC_MSG_LIST_INVITES     = 0x004B, /* C->S, outstanding invites (owner/admin) */
+    OC_MSG_INVITE_LIST      = 0x004C, /* S->C, the list (token HASHES only, never tokens) */
+    OC_MSG_REVOKE_INVITE    = 0x004D, /* C->S, revoke one by id */
+    OC_MSG_INVITE_REVOKED   = 0x004E, /* S->C, ack */
     OC_MSG_SEARCH           = 0x0060, /* C->S (REQ-080) */
     OC_MSG_SEARCH_RESULTS   = 0x0061, /* S->C */
     OC_MSG_BACKFILL_REQUEST = 0x0030, /* C->S */
@@ -328,6 +342,7 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 
 /* Synced client settings (the daemon-side settings bucket). */
 #define OC_MAX_CLIENT_SETTINGS 128u /* cap on a CLIENT_SETTINGS snapshot */
+#define OC_MAX_INVITES     64u  /* cap on an INVITE_LIST (WIN-46) */
 #define OC_CLIENT_TYPE_MAX     32u  /* client_type string cap (bytes) */
 #define OC_SETTING_KEY_MAX     64u  /* setting key string cap (bytes) */
 #define OC_SETTING_VALUE_MAX   512u /* setting value string cap (bytes) */
@@ -527,6 +542,10 @@ typedef struct { uint64_t webhook_id; uint64_t channel_id; oc_slice token; } oc_
 typedef struct { uint64_t channel_id; } oc_list_webhooks;
 typedef struct { uint64_t webhook_id; uint64_t channel_id; oc_slice label; uint8_t disabled; } oc_webhook_list_entry;
 typedef struct { uint16_t count; const oc_webhook_list_entry *entries; } oc_webhook_list;  /* tokens never listed */
+/* WIN-48. ROTATE replies with a WEBHOOK_INFO carrying the new token — the same
+ * shown-once frame CREATE uses, because it is the same situation. */
+typedef struct { uint64_t webhook_id; uint8_t disabled; } oc_set_webhook_state;
+typedef struct { uint64_t webhook_id; } oc_rotate_webhook;
 typedef struct { uint64_t webhook_id; } oc_delete_webhook;
 typedef struct { uint64_t webhook_id; } oc_webhook_deleted;
 typedef struct { uint8_t status; } oc_set_presence;
@@ -624,6 +643,13 @@ typedef struct { uint8_t role; } oc_invite_user;
 typedef struct { uint64_t user_id; } oc_remove_user;
 typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; } oc_user_updated;
 typedef struct { oc_slice token; uint8_t role; uint64_t expires_at; } oc_invite_created;
+/* WIN-46. An outstanding invite, identified by a server-side id rather than its
+ * token: the token is not recoverable (only its hash is stored) and putting one on
+ * the wire again would hand it to anyone who could read a list. */
+typedef struct { uint64_t invite_id; uint8_t role; uint64_t created_at; uint64_t expires_at;
+                 uint64_t created_by; } oc_invite_entry;
+typedef struct { uint16_t count; const oc_invite_entry *entries; } oc_invite_list;
+typedef struct { uint64_t invite_id; } oc_revoke_invite;
 typedef struct { oc_slice token; oc_slice username; oc_slice password; } oc_redeem_invite;
 /* Self-service profile (REQ-020). */
 typedef struct { oc_slice name; } oc_set_display_name;
@@ -715,6 +741,12 @@ oc_result oc_encode_webhook_info(oc_wbuf *w, uint16_t version, const oc_webhook_
 oc_result oc_encode_list_webhooks(oc_wbuf *w, uint16_t version, const oc_list_webhooks *m);
 oc_result oc_encode_webhook_list(oc_wbuf *w, uint16_t version, const oc_webhook_list *m);
 oc_result oc_encode_delete_webhook(oc_wbuf *w, uint16_t version, const oc_delete_webhook *m);
+oc_result oc_encode_set_webhook_state(oc_wbuf *w, uint16_t version, const oc_set_webhook_state *m);
+oc_result oc_encode_rotate_webhook(oc_wbuf *w, uint16_t version, const oc_rotate_webhook *m);
+oc_result oc_encode_list_invites(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_invite_list(oc_wbuf *w, uint16_t version, const oc_invite_list *m);
+oc_result oc_encode_revoke_invite(oc_wbuf *w, uint16_t version, const oc_revoke_invite *m);
+oc_result oc_encode_invite_revoked(oc_wbuf *w, uint16_t version, const oc_revoke_invite *m);
 oc_result oc_encode_webhook_deleted(oc_wbuf *w, uint16_t version, const oc_webhook_deleted *m);
 oc_result oc_encode_set_presence(oc_wbuf *w, uint16_t version, const oc_set_presence *m);
 oc_result oc_encode_presence_update(oc_wbuf *w, uint16_t version, const oc_presence_update *m);
@@ -836,6 +868,11 @@ oc_result oc_decode_remove_from_channel(oc_rbuf *p, oc_channel_member_op *m);
 oc_result oc_decode_open_dm(oc_rbuf *p, oc_open_dm *m);
 oc_result oc_decode_create_webhook(oc_rbuf *p, oc_create_webhook *m);
 oc_result oc_decode_webhook_info(oc_rbuf *p, oc_webhook_info *m);
+oc_result oc_decode_set_webhook_state(oc_rbuf *p, oc_set_webhook_state *m);
+oc_result oc_decode_rotate_webhook(oc_rbuf *p, oc_rotate_webhook *m);
+oc_result oc_decode_invite_list(oc_rbuf *p, oc_invite_entry *entries, uint16_t cap, uint16_t *out_count);
+oc_result oc_decode_revoke_invite(oc_rbuf *p, oc_revoke_invite *m);
+oc_result oc_decode_invite_revoked(oc_rbuf *p, oc_revoke_invite *m);
 oc_result oc_decode_list_webhooks(oc_rbuf *p, oc_list_webhooks *m);
 oc_result oc_decode_webhook_list(oc_rbuf *p, oc_webhook_list_entry *entries, uint16_t cap, uint16_t *out_count);
 oc_result oc_decode_delete_webhook(oc_rbuf *p, oc_delete_webhook *m);

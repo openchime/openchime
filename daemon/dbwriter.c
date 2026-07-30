@@ -3549,6 +3549,150 @@ static oc_dbres *process_prune_device_token(sqlite3 *db, const oc_job *j) {
 }
 
 /* The caller's full notification settings (REQ-130/131). Read. */
+/* ---- invite management (REQ-026, WIN-46) ------------------------------------
+ *
+ * The `invites` table has carried role, expires_at_ms and consumed_at_ms since
+ * migration 0002; nothing could read them, so a minted invite was write-only —
+ * no way to see what was outstanding, and no way to take one back.
+ *
+ * Outstanding means: not consumed and not expired. A consumed one is history (the
+ * audit log has it) and an expired one is already inert, so listing either would
+ * pad the view with rows nobody can act on.
+ */
+static oc_dbres *process_list_invites(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    uint8_t role = OC_ROLE_MEMBER;
+    user_role(db, j->user_id, &role);
+    if (role < OC_ROLE_ADMIN) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    r->type = OC_RES_INVITE_LIST;
+
+    /* rowid AS the id: the table is keyed by token_hash, and a hash is exactly what
+     * must not travel. rowid is stable for the life of the row, which is all a
+     * revoke needs. */
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT rowid, role, expires_at_ms, COALESCE(created_by,0) FROM invites "
+        " WHERE consumed_at_ms IS NULL AND expires_at_ms > ?1 "
+        " ORDER BY expires_at_ms ASC LIMIT ?2;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)OC_MAX_INVITES);
+    oc_invite_entry *arr = calloc(OC_MAX_INVITES, sizeof *arr);
+    size_t n = 0;
+    while (arr && n < OC_MAX_INVITES && sqlite3_step(st) == SQLITE_ROW) {
+        arr[n].invite_id  = (uint64_t)sqlite3_column_int64(st, 0);
+        const unsigned char *rl = sqlite3_column_text(st, 1);
+        arr[n].role = (rl && !strcmp((const char *)rl, "owner")) ? OC_ROLE_OWNER
+                    : (rl && !strcmp((const char *)rl, "admin")) ? OC_ROLE_ADMIN
+                                                                 : OC_ROLE_MEMBER;
+        arr[n].expires_at = (uint64_t)sqlite3_column_int64(st, 2);
+        arr[n].created_by = (uint64_t)sqlite3_column_int64(st, 3);
+        arr[n].created_at = 0;      /* not stored; the table has no created_at_ms */
+        n++;
+    }
+    sqlite3_finalize(st);
+    r->invites = arr; r->n_invites = n;
+    return r;
+}
+
+static oc_dbres *process_revoke_invite(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    uint8_t role = OC_ROLE_MEMBER;
+    user_role(db, j->user_id, &role);
+    if (role < OC_ROLE_ADMIN) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+    }
+    /* DELETE, not a consumed-stamp: a revoked invite was never redeemed, and
+     * marking it consumed would claim in the audit trail that somebody used it. */
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "DELETE FROM invites WHERE rowid=? AND consumed_at_ms IS NULL;",
+                       -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);   /* invite rowid */
+    sqlite3_step(st);
+    int gone = sqlite3_changes(db);
+    sqlite3_finalize(st);
+    if (!gone) { r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r; }
+    audit_actor(db, OC_AUDIT_ADMIN, "invite.revoke", j->user_id, j->message_id, NULL, 1, NULL);
+    r->type = OC_RES_INVITE_REVOKED;
+    r->message_id = j->message_id;
+    return r;
+}
+
+/* ---- webhook lifecycle (WIN-48) --------------------------------------------
+ *
+ * `webhooks.disabled` has existed since migration 0016 and nothing could set it.
+ * Reveal is absent because it is IMPOSSIBLE: only the token's SHA-256 is stored, so
+ * a lost token can be replaced but never shown again.
+ */
+static oc_dbres *process_set_webhook_state(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    /* Authorised by the webhook's CHANNEL, not by a tenant role: a webhook belongs
+     * to a channel, and its members are who can post there anyway. */
+    sqlite3_stmt *st = NULL;
+    uint64_t cid = 0;
+    sqlite3_prepare_v2(db, "SELECT channel_id FROM webhooks WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+    if (sqlite3_step(st) == SQLITE_ROW) cid = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    if (!cid) { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_UNKNOWN_WEBHOOK; return r; }
+    if (!is_member(db, cid, j->user_id)) {
+        r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+    sqlite3_prepare_v2(db, "UPDATE webhooks SET disabled=? WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int(st, 1, j->hook_disabled ? 1 : 0);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->message_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    audit_actor(db, OC_AUDIT_ADMIN, j->hook_disabled ? "webhook.disable" : "webhook.enable",
+                j->user_id, j->message_id, NULL, 1, NULL);
+    /* Reply with the channel's list so the client's view cannot drift from the
+     * truth — the same shape LIST_WEBHOOKS answers with. */
+    oc_job lj = *j; lj.channel_id = cid;
+    free(r);
+    return process_list_webhooks(db, &lj);
+}
+
+static oc_dbres *process_rotate_webhook(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    sqlite3_stmt *st = NULL;
+    uint64_t cid = 0;
+    sqlite3_prepare_v2(db, "SELECT channel_id FROM webhooks WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+    if (sqlite3_step(st) == SQLITE_ROW) cid = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    if (!cid) { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_UNKNOWN_WEBHOOK; return r; }
+    if (!is_member(db, cid, j->user_id)) {
+        r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+    uint8_t token[OC_SESSION_TOKEN_LEN], hash[OC_SHA256_LEN];
+    if (oc_rand_bytes(token, sizeof token) != 0 || oc_sha256(token, sizeof token, hash) != 0) {
+        r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+    }
+    sqlite3_prepare_v2(db, "UPDATE webhooks SET token_hash=? WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_blob (st, 1, hash, sizeof hash, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->message_id);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    audit_actor(db, OC_AUDIT_ADMIN, "webhook.rotate", j->user_id, j->message_id, NULL, 1, NULL);
+    /* The same shown-once frame CREATE uses: it is the same situation, and the old
+     * token stops working the instant this commits. */
+    r->type = OC_RES_WEBHOOK_CREATED;
+    r->message_id = j->message_id;
+    r->channel_id = cid;
+    memcpy(r->session_token, token, sizeof token);
+    return r;
+}
+
 static oc_dbres *process_list_notify_prefs(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -3733,6 +3877,9 @@ static int is_read_job(int type) {
            type == OC_JOB_LIST_SAVED || type == OC_JOB_LIST_THREAD ||
            type == OC_JOB_TYPING || type == OC_JOB_ATTACH_LOOKUP ||
            type == OC_JOB_LIST_WEBHOOKS || type == OC_JOB_LIST_NOTIFY_PREFS ||
+           /* Read-only, so it goes to the reader thread (ARCH-66) like every other
+            * list. Its three siblings — revoke, set-state, rotate — write. */
+           type == OC_JOB_LIST_INVITES ||
            type == OC_JOB_LIST_CLIENT_SETTINGS ||
            type == OC_JOB_CALL_AUTH ||
            type == OC_JOB_STORAGE_STATUS ||
@@ -3757,6 +3904,7 @@ static oc_dbres *process_read(sqlite3 *rdb, const oc_job *j) {
     if (j->type == OC_JOB_STORAGE_STATUS) return process_storage_status(rdb, j);
     if (j->type == OC_JOB_AUDIT_QUERY)    return process_audit_query(rdb, j);
     if (j->type == OC_JOB_LIST_WEBHOOKS)  return process_list_webhooks(rdb, j);
+    if (j->type == OC_JOB_LIST_INVITES)   return process_list_invites(rdb, j);
     if (j->type == OC_JOB_LIST_NOTIFY_PREFS) return process_list_notify_prefs(rdb, j);
     if (j->type == OC_JOB_LIST_CLIENT_SETTINGS) return process_list_client_settings(rdb, j);
     if (j->type == OC_JOB_CALL_AUTH)      return process_call_auth(rdb, j);
@@ -3800,6 +3948,9 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_ATTACH_CREATE)   return process_attach_create(w->db, j);
     if (j->type == OC_JOB_ATTACH_FINALIZE) return process_attach_finalize(w->db, j);
     if (j->type == OC_JOB_CREATE_WEBHOOK)  return process_create_webhook(w->db, j);
+    if (j->type == OC_JOB_REVOKE_INVITE)     return process_revoke_invite(w->db, j);
+    if (j->type == OC_JOB_SET_WEBHOOK_STATE) return process_set_webhook_state(w->db, j);
+    if (j->type == OC_JOB_ROTATE_WEBHOOK)    return process_rotate_webhook(w->db, j);
     if (j->type == OC_JOB_WEBHOOK_POST)    return process_webhook_post(w->db, j);
     if (j->type == OC_JOB_DELETE_WEBHOOK)  return process_delete_webhook(w->db, j);
     if (j->type == OC_JOB_SET_NOTIFY_PREF) return process_set_notify_pref(w->db, j);

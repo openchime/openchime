@@ -2074,3 +2074,91 @@ oc_result oc_parse_local_credential(oc_slice credential, oc_slice *username, oc_
     if (password) *password = p;
     return OC_OK;
 }
+
+/* ---- invite management (REQ-026, WIN-46) + webhook lifecycle (WIN-48) ------- */
+
+oc_result oc_encode_set_webhook_state(oc_wbuf *w, uint16_t version, const oc_set_webhook_state *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_WEBHOOK_STATE);
+    oc_w_u64(w, m->webhook_id);
+    oc_w_u8(w, m->disabled);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_webhook_state(oc_rbuf *p, oc_set_webhook_state *m) {
+    m->webhook_id = oc_r_u64(p);
+    m->disabled   = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_rotate_webhook(oc_wbuf *w, uint16_t version, const oc_rotate_webhook *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_ROTATE_WEBHOOK);
+    oc_w_u64(w, m->webhook_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_rotate_webhook(oc_rbuf *p, oc_rotate_webhook *m) {
+    m->webhook_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_list_invites(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_INVITES);
+    return oc_frame_end(w, off);
+}
+
+/* The token is NOT in this frame and must never be: only its SHA-256 is stored, and
+ * a list any admin can pull is not a place to hand back credentials. */
+oc_result oc_encode_invite_list(oc_wbuf *w, uint16_t version, const oc_invite_list *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_INVITE_LIST);
+    oc_w_u16(w, m->count);
+    for (uint16_t i = 0; i < m->count; i++) {
+        oc_w_u64(w, m->entries[i].invite_id);
+        oc_w_u8(w, m->entries[i].role);
+        oc_w_u64(w, m->entries[i].created_at);
+        oc_w_u64(w, m->entries[i].expires_at);
+        oc_w_u64(w, m->entries[i].created_by);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_invite_list(oc_rbuf *p, oc_invite_entry *entries, uint16_t cap,
+                               uint16_t *out_count) {
+    uint16_t count = oc_r_u16(p);
+    if (out_count) *out_count = count < cap ? count : cap;
+    for (uint16_t i = 0; i < count && !p->underflow; i++) {
+        oc_invite_entry e;
+        e.invite_id  = oc_r_u64(p);
+        e.role       = oc_r_u8(p);
+        e.created_at = oc_r_u64(p);
+        e.expires_at = oc_r_u64(p);
+        e.created_by = oc_r_u64(p);
+        if (i < cap) entries[i] = e;   /* drain the rest so the frame still validates */
+    }
+    return r_done(p);
+}
+
+oc_result oc_encode_revoke_invite(oc_wbuf *w, uint16_t version, const oc_revoke_invite *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_REVOKE_INVITE);
+    oc_w_u64(w, m->invite_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_revoke_invite(oc_rbuf *p, oc_revoke_invite *m) {
+    m->invite_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+/* The S->C ack. Same single field as the request, but its own opcode — the first
+ * attempt re-tagged the request frame in place, which wrote over the VERSION field
+ * because msg_type sits at offset 6, not 2. A frame is cheaper than that class of
+ * bug. */
+oc_result oc_encode_invite_revoked(oc_wbuf *w, uint16_t version, const oc_revoke_invite *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_INVITE_REVOKED);
+    oc_w_u64(w, m->invite_id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_invite_revoked(oc_rbuf *p, oc_revoke_invite *m) {
+    m->invite_id = oc_r_u64(p);
+    return r_done(p);
+}
