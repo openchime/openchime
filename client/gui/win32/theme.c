@@ -110,7 +110,7 @@ static int system_prefers_light(void) {
 }
 
 void oc_theme_apply(int mode) {
-    if (mode < 0 || mode > OC_THEME_SYSTEM) mode = OC_THEME_DARK;
+    if (mode < 0 || mode > OC_THEME_SYSTEM) mode = OC_THEME_SYSTEM;
     g_mode = mode;
     int light = (mode == OC_THEME_LIGHT) ||
                 (mode == OC_THEME_SYSTEM && system_prefers_light());
@@ -147,6 +147,8 @@ static int scheme_light(void) {
            (g_mode == OC_THEME_SYSTEM && system_prefers_light());
 }
 
+int oc_theme_is_light(void) { return scheme_light(); }
+
 uint32_t oc_theme_scheme_accent(int scheme) {
     if (scheme < 0 || scheme >= OC_SCHEME_COUNT) scheme = OC_SCHEME_MIDNIGHT;
     return scheme_light() ? SCHEMES[scheme].l : SCHEMES[scheme].d;
@@ -157,7 +159,7 @@ uint32_t oc_theme_scheme_rail(int scheme) {
     return scheme_light() ? SCHEMES[scheme].rail_l : SCHEMES[scheme].rail_d;
 }
 
-int oc_theme_mode(void) { return g_mode < 0 ? OC_THEME_DARK : g_mode; }
+int oc_theme_mode(void) { return g_mode < 0 ? OC_THEME_SYSTEM : g_mode; }
 
 const char *oc_theme_mode_name(int mode) {
     return mode == OC_THEME_LIGHT ? "Light"

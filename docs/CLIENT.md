@@ -648,6 +648,21 @@ is the product of the first two, so nothing downstream has to know there are two
 inputs; anything that caches a font size of its own (the RichEdit's CHARFORMAT, the
 placeholder HFONT, the form fields' HFONT) is rebuilt by `scale_apply`.
 
+## Two standing UI rules
+
+**No "…" on a command.** Not in menus, not on buttons, not in cue banners. The
+convention means "this opens something", but the app is affordance-driven — nearly
+every command opens something — so it decorated almost everything and distinguished
+nothing. Ellipses survive only where they mean *continuation*: "Loading…",
+"Reconnecting…", "alice is typing…", and the `:…:` placeholder for an emoji whose
+image has not arrived.
+
+**An expanded section that is empty says so**, in italics — the app's only italic
+(ARCH-97 names weights, not styles) precisely so it cannot be read as a conversation
+called "Empty". It says "No matches" instead when a find filter is what emptied it,
+because "you have none of these" and "none of yours match" are different answers and
+an empty list gives the same silence to both.
+
 ## The composer is ours (WIN-80, ARCH-98)
 
 There is no RichEdit and **no child window**. The field is drawn into the Direct2D
@@ -691,7 +706,7 @@ unverifiable.
 
 ## Run the GUI smoke before pushing Win32 chrome
 
-`scripts/gui_smoke.sh` asserts **115 invariants** through the test hook: for each of
+`scripts/gui_smoke.sh` asserts **116 invariants** through the test hook: for each of
 the six views, what is in the second column (`sidebar_kind`), whether the middle
 one is typeable (`main_is_conversation`), which native children are shown, and
 whether anything covers the window — plus the search overlay, the Pins tab, the

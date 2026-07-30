@@ -523,6 +523,37 @@ static void test_sidebar(void) {
     CHECK(oc_sidebar_section_add(&f2, "one more") == -1);
     CHECK(f2.n_custom == (int)OC_SB_CUSTOM_MAX);
 
+    /* "Active only" and a GROUP DM (REQ-056). A group has no single peer, so the 1:1
+     * test — "is peer_id online" — read peer 0 as offline and hid every group. The
+     * rule for a group is "is ANYONE in it around", which is what the filter means. */
+    {
+        oc_ev ge; memset(&ge, 0, sizeof ge);
+        ge.type = OC_EV_CHANNEL; ge.channel_id = 13; ge.status = 1; ge.op = OC_CHANNEL_KIND_DM;
+        ge.n_peers = 3; ge.peers[0] = 1; ge.peers[1] = 2; ge.peers[2] = 3;
+        oc_model_apply(&m, &ge);
+        memset(&ge, 0, sizeof ge);
+        ge.type = OC_EV_USER; ge.user_id = 3; ge.body = strdup("carol"); oc_model_apply(&m, &ge);
+
+        oc_sidebar_opts a2; oc_sidebar_opts_defaults(&a2);
+        a2.filter[OC_SB_DMS] = OC_SB_FILTER_ACTIVE;
+        oc_sidebar_row ar[16];
+        size_t an = oc_model_sidebar(&m, &a2, ar, 16);
+        int saw_group = 0;
+        for (size_t i = 0; i < an; i++)
+            if (!ar[i].is_header && ar[i].channel_id == 13) saw_group = 1;
+        CHECK(!saw_group);                       /* nobody in it is online yet */
+
+        memset(&ge, 0, sizeof ge);
+        ge.type = OC_EV_PRESENCE; ge.user_id = 3; ge.status = OC_PRESENCE_ONLINE;
+        oc_model_apply(&m, &ge);
+        an = oc_model_sidebar(&m, &a2, ar, 16);
+        saw_group = 0;
+        for (size_t i = 0; i < an; i++)
+            if (!ar[i].is_header && ar[i].channel_id == 13) saw_group = 1;
+        CHECK(saw_group);                        /* carol is around, so the group is */
+    }
+
+
     oc_model_free(&m);
 }
 

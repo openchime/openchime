@@ -1623,8 +1623,20 @@ size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
             }
             if (oc_sb_filter_of(o, sec) == OC_SB_FILTER_UNREAD && c->unread <= 0) continue;
             if (oc_sb_filter_of(o, sec) == OC_SB_FILTER_ACTIVE) {
-                /* Channels: joined ones. DMs: a peer who is not offline. */
-                if (is_dm) {
+                /* Channels: joined ones. DMs: a peer who is not offline.
+                 *
+                 * A GROUP DM (REQ-056) has no single peer — peer_id is 0 — so the
+                 * 1:1 test read it as "offline" and the filter hid every group
+                 * conversation. "Active" means somebody in it is around, so for a
+                 * group that is ANY participant but you. */
+                if (is_dm && c->n_peers > 2) {
+                    int any = 0;
+                    for (uint16_t k = 0; k < c->n_peers && !any; k++) {
+                        if (c->peers[k] == m->user_id) continue;
+                        if (oc_model_presence_of(m, c->peers[k]) != OC_PRESENCE_OFFLINE) any = 1;
+                    }
+                    if (!any) continue;
+                } else if (is_dm) {
                     if (oc_model_presence_of(m, c->peer_id) == OC_PRESENCE_OFFLINE) continue;
                 } else if (!c->joined) continue;
             }

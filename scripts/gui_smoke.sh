@@ -219,8 +219,13 @@ expect "$(snap)" time24 "$before" "the run left the setting as it found it"
 # be there: this is the one channel action that cannot be undone by repeating it.
 say "== channel visibility"
 "$DRIVE" view 0 >/dev/null 2>&1; sleep 0.4
+# `mkchan` is a no-op when the channel already exists, so this run may inherit one
+# left either way by the last. The checks are therefore about the FLIP — the value
+# changes, and changes back — not about an absolute state a previous run decided.
 "$DRIVE" mkchan smokevis 0 >/dev/null 2>&1; sleep 1.2
 "$DRIVE" channel smokevis >/dev/null 2>&1; "$DRIVE" tab 3 >/dev/null 2>&1; sleep 0.8
+
+vispub() { snap | grep -oE '^  ch [0-9]+ "smokevis" pub=[01]' | grep -oE 'pub=[01]' | cut -d= -f2; }
 
 click_about() {                    # click_about <field>
   local r l t rr b
@@ -231,24 +236,33 @@ click_about() {                    # click_about <field>
   "$DRIVE" click $(( (${l%.*} + ${rr%.*}) / 2 )) $(( (${t%.*} + ${b%.*}) / 2 )) >/dev/null 2>&1
 }
 
-click_about aboutvis && sleep 0.8
-expect "$(snap)" modal confirm "making a channel public asks first"
-"$DRIVE" key enter >/dev/null 2>&1; sleep 1.2
+was=$(vispub)
 checks=$((checks + 1))
-if snap | grep -qE '^  ch [0-9]+ "smokevis".*'; then
-  # The lock is the sidebar's rendering of is_public; the row list carries it.
-  if snap | grep -qE '^  sbrow .*label="smokevis"'; then ok "it is public now (still listed)"
-  else fail "smokevis vanished from the sidebar"; fi
-else fail "no smokevis channel after the flip"; fi
+[ -n "$was" ] && ok "the channel is there (pub=$was)" || fail "no smokevis channel in the dump"
 
-# ... and back. Private is the direction that changes who can READ it, so the
-# channel must still be there for a member afterwards.
 click_about aboutvis && sleep 0.8
-expect "$(snap)" modal confirm "making it private asks too"
-"$DRIVE" key enter >/dev/null 2>&1; sleep 1.2
+expect "$(snap)" modal confirm "changing visibility asks first"
+"$DRIVE" key enter >/dev/null 2>&1; sleep 1.4
+now=$(vispub)
 checks=$((checks + 1))
-if snap | grep -qE '^  sbrow .*label="smokevis"'; then ok "a member still sees it once private"
+if [ -n "$now" ] && [ "$now" != "$was" ]; then ok "the flip lands (pub=$was -> $now)"
+else fail "visibility did not change (still pub=${now:-?})"; fi
+# A member keeps the channel in ANY direction — private narrows who can read it,
+# it does not remove the people who are in it.
+checks=$((checks + 1))
+if snap | grep -qE '^  ch [0-9]+ "smokevis"'; then ok "a member still sees it"
 else fail "the channel disappeared for its own member"; fi
+# Deliberately the `ch` line and not `sbrow`: whether a member still HAS the channel
+# is a fact about the channel list. Asserting it through the sidebar made the check
+# depend on which section a previous run had filed it under, and on whether that
+# section was collapsed.
+
+click_about aboutvis && sleep 0.8
+"$DRIVE" key enter >/dev/null 2>&1; sleep 1.4
+checks=$((checks + 1))
+back=$(vispub)
+if [ "$back" = "$was" ]; then ok "and flips back (pub=$back)"
+else fail "did not come back: pub=${back:-?}, started at $was"; fi
 "$DRIVE" tab 0 >/dev/null 2>&1; sleep 0.4
 
 # --- custom emoji (REQ-072) -------------------------------------------------
@@ -286,6 +300,11 @@ fi
 # returns the same conversation rather than a second one.
 say "== group DMs"
 "$DRIVE" view 0 >/dev/null 2>&1; sleep 0.4
+# Section collapse is per-user state and it PERSISTS on the server: a collapsed
+# Direct-messages section emits its header and no children, so every row assertion
+# below would fail for a reason that has nothing to do with group DMs. Ask for the
+# state this section needs rather than inheriting whatever the last run left.
+"$DRIVE" section expand 1 >/dev/null 2>&1; sleep 0.3
 "$DRIVE" groupdm bob,carol >/dev/null 2>&1; sleep 1.5
 d=$(snap)
 checks=$((checks + 1))
@@ -342,6 +361,7 @@ fi
 # rather than from a screenshot.
 say "== sidebar sections"
 "$DRIVE" view 0 >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; sleep 0.5
+"$DRIVE" section expand 0 >/dev/null 2>&1; sleep 0.3   # Channels, for the same reason
 
 rows_have() {                     # rows_have <label> <count>
   local want="$1" n="$2" got
@@ -351,6 +371,13 @@ rows_have() {                     # rows_have <label> <count>
   else fail "#$want appears $got time(s), expected $n"; fi
 }
 
+# Sections are per-user state on the SERVER, so they survive a run. Clear them all
+# first: a test that assumes it starts from zero passes exactly once.
+for _ in 1 2 3 4 5 6 7 8; do
+  n=$(snap | grep -oE '^sections=[0-9]+' | cut -d= -f2)
+  [ "${n:-0}" = "0" ] && break
+  "$DRIVE" section rm 0 >/dev/null 2>&1; sleep 0.3
+done
 "$DRIVE" section add SmokeSec >/dev/null 2>&1; sleep 0.4
 d=$(snap)
 expect "$d" sections 1 "a section is created"

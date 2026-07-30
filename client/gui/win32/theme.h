@@ -36,6 +36,11 @@ enum {
 };
 
 /* Theme modes, in the order the preferences UI offers them. */
+/* SYSTEM is the DEFAULT (2026-07-30). An app that ignores the desktop's own
+ * light/dark setting looks like it was written before the setting existed —
+ * matching it is the least surprising thing a native client can do, and it is the
+ * reason ARCH-82 chose native rendering in the first place. Dark and light stay as
+ * explicit overrides for people who want one regardless of the machine. */
 enum { OC_THEME_DARK = 0, OC_THEME_LIGHT = 1, OC_THEME_SYSTEM = 2 };
 
 extern uint32_t oc_theme[TH_COUNT];
@@ -67,6 +72,10 @@ uint32_t oc_theme_scheme_rail(int scheme);
 /* Apply a mode. OC_THEME_SYSTEM follows the Windows apps-use-light-theme
  * setting, resolving to dark when it cannot be read. */
 void oc_theme_apply(int mode);
+/* Is the palette in force the LIGHT one? Not the same question as the mode: SYSTEM
+ * resolves to either. Anything outside theme.c that has to match the shell — the
+ * window caption, for one — asks this rather than re-reading the registry. */
+int  oc_theme_is_light(void);
 int  oc_theme_mode(void);            /* the mode last applied (not the resolved one) */
 const char *oc_theme_mode_name(int mode);
 

@@ -327,6 +327,7 @@ static IDWriteTextFormat *g_meta_w;   /* the same, wrapping — paragraphs of ex
 static IDWriteTextFormat *g_meta_r;   /* the same, trailing-aligned — timestamps */
 static IDWriteTextFormat *g_avatar;   /* title weight, centred in the disc */
 static IDWriteTextFormat *g_micro;    /* 10/600 — rail labels */
+static IDWriteTextFormat *g_meta_i;   /* meta, ITALIC — placeholder text only */
 static IDWriteTextFormat *g_emoji;   /* Segoe UI Emoji, picker cells (22px) */
 static IDWriteTextFormat *g_emoji_s; /* the same, sized for reaction chips */
 /* Lucide vector icons: geometry cached once (device-independent, from the factory,
@@ -1260,10 +1261,14 @@ static D2D1_RECT_F rf(float l, float t, float r, float b) {
 /* theme.h stores 0xRRGGBB; GDI/Win32 want a COLORREF (0x00BBGGRR). */
 #define OCRGB(x) RGB(((x) >> 16) & 0xff, ((x) >> 8) & 0xff, (x) & 0xff)
 
-/* Ask DWM for a dark window caption (native title bar matching the shell).
- * Attr 20 = DWMWA_USE_IMMERSIVE_DARK_MODE on Win10 1903+, 19 on 1809. */
-static void apply_dark_titlebar(HWND h) {
-    BOOL dark = TRUE;
+/* Ask DWM for a caption that matches the shell. Attr 20 = DWMWA_USE_IMMERSIVE_DARK_MODE
+ * on Win10 1903+, 19 on 1809.
+ *
+ * It follows the RESOLVED theme, not a constant: with SYSTEM as the default, a light
+ * machine drew a light shell under a dark caption, which is the one part of the window
+ * we do not paint and therefore the one part that gives the mismatch away. */
+static void apply_titlebar(HWND h) {
+    BOOL dark = oc_theme_is_light() ? FALSE : TRUE;
     if (FAILED(DwmSetWindowAttribute(h, 20, &dark, sizeof dark)))
         DwmSetWindowAttribute(h, 19, &dark, sizeof dark);
 }
@@ -1459,11 +1464,11 @@ static void draw_lucide(ID2D1RenderTarget *rt, int id, D2D1_RECT_F box, uint32_t
 
 /* ---- Direct2D / DirectWrite setup ---------------------------------------- */
 
-static IDWriteTextFormat *mk_fmt(const WCHAR *family, float size, DWRITE_FONT_WEIGHT wt,
-                                 DWRITE_TEXT_ALIGNMENT ta, DWRITE_PARAGRAPH_ALIGNMENT pa,
-                                 int wrap) {
+static IDWriteTextFormat *mk_fmt_s(const WCHAR *family, float size, DWRITE_FONT_WEIGHT wt,
+                                   DWRITE_TEXT_ALIGNMENT ta, DWRITE_PARAGRAPH_ALIGNMENT pa,
+                                   int wrap, DWRITE_FONT_STYLE style) {
     IDWriteTextFormat *f = NULL;
-    IDWriteFactory_CreateTextFormat(g_dwrite, family, NULL, wt, DWRITE_FONT_STYLE_NORMAL,
+    IDWriteFactory_CreateTextFormat(g_dwrite, family, NULL, wt, style,
         DWRITE_FONT_STRETCH_NORMAL, size, L"en-us", &f);
     if (f) {
         IDWriteTextFormat_SetTextAlignment(f, ta);
@@ -1472,6 +1477,12 @@ static IDWriteTextFormat *mk_fmt(const WCHAR *family, float size, DWRITE_FONT_WE
                                                   : DWRITE_WORD_WRAPPING_NO_WRAP);
     }
     return f;
+}
+
+static IDWriteTextFormat *mk_fmt(const WCHAR *family, float size, DWRITE_FONT_WEIGHT wt,
+                                 DWRITE_TEXT_ALIGNMENT ta, DWRITE_PARAGRAPH_ALIGNMENT pa,
+                                 int wrap) {
+    return mk_fmt_s(family, size, wt, ta, pa, wrap, DWRITE_FONT_STYLE_NORMAL);
 }
 
 /* Modal content inset. One number, so no two modals disagree about their gutter.
@@ -1538,7 +1549,8 @@ static void fonts_build(void) {
     const WCHAR *UI = ui_family();
     const float k = g_text_scale;
     IDWriteTextFormat **all[] = { &g_display, &g_title, &g_body, &g_ui, &g_ui_b,
-                                  &g_meta, &g_meta_w, &g_meta_r, &g_avatar, &g_micro };
+                                  &g_meta, &g_meta_w, &g_meta_r, &g_avatar, &g_micro,
+                                  &g_meta_i };
     for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) fmt_release(all[i]);
 
     /* Two weights in all chrome (ARCH-97). Bold 700 is markdown's, applied to a
@@ -1562,6 +1574,10 @@ static void fonts_build(void) {
     /* The avatar initial is title-sized and centred in its disc, both axes. */
     g_avatar  = mk_fmt(UI, FONT_TITLE   * k, SEM, C, MID, 0);
     g_micro   = mk_fmt(UI, FONT_MICRO   * k, SEM, C, MID, 0);
+    /* The ONE italic in the app (ARCH-97 names weights, not styles). It marks text
+     * that is not content — an empty section's "Empty" — so it cannot be mistaken for
+     * a conversation called Empty. A style, not a seventh size token. */
+    g_meta_i  = mk_fmt_s(UI, FONT_META  * k, REG, L, MID, 0, DWRITE_FONT_STYLE_ITALIC);
 }
 
 static void d2d_init(void) {
@@ -2180,7 +2196,14 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
 
     float top = HEADER_H + 46, bot = h;
     g_sb_view = bot - top;
-    g_sb_content = (float)nrows * ROW_H;
+    /* The "Empty" placeholders occupy rows too, so they count toward the scrollable
+     * height — otherwise the list is short by one row per empty section and the last
+     * conversation is unreachable, which is WIN-6 all over again. */
+    size_t nplace = 0;
+    for (size_t ri = 0; ri < nrows; ri++)
+        if (rows[ri].is_header && !oc_sb_collapsed_of(&g_sb, rows[ri].section) &&
+            (ri + 1 >= nrows || rows[ri + 1].is_header)) nplace++;
+    g_sb_content = (float)(nrows + nplace) * ROW_H;
     /* Clamp before drawing, so a resize or a collapse cannot strand the list. */
     float maxscroll = g_sb_content > g_sb_view ? g_sb_content - g_sb_view : 0;
     if (g_sb_scroll > maxscroll) g_sb_scroll = maxscroll;
@@ -2205,6 +2228,21 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                 IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
                 draw_text(rt, "\xE2\x8B\xAF", g_meta, g_sb_kebab, OC_COL_MUTED);
                 IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+            }
+            /* An EXPANDED section with nothing under it says so. An open section that
+             * looks identical to a collapsed one is a question the user has to answer
+             * by clicking — and with a find filter active, "no matches here" and "you
+             * have none of these" look the same without it.
+             *
+             * Asked of the BUILT list rather than of section_total: the total counts
+             * what belongs in the section, and the filter is applied after it, so it
+             * would call a section non-empty while showing nothing. */
+            if (!oc_sb_collapsed_of(&g_sb, r->section) &&
+                (ri + 1 >= nrows || rows[ri + 1].is_header)) {
+                float ey = y; y += ROW_H;         /* the placeholder occupies a row */
+                if (!(ey + ROW_H < top || ey > bot))
+                    draw_text(rt, g_sb.find[0] ? "No matches" : "Empty", g_meta_i,
+                              rf(sx0 + 34, ey, sx1 - 12, ey + ROW_H), OC_COL_FAINT);
             }
         } else {
             int selected = (r->channel_id == g_sel);
@@ -3733,7 +3771,7 @@ static void draw_about(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
     g_about_topic = rf(reg.right - 24 - 110, y - 4, reg.right - 24, y + 24);
     stroke_round(rt, g_about_topic, 6.0f, OC_COL_BORDER, 1.0f);
     IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, "Set topic\u2026", g_meta, g_about_topic, OC_COL_MUTED);
+    draw_text(rt, "Set topic", g_meta, g_about_topic, OC_COL_MUTED);
     IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
     y += 56;
 
@@ -3766,17 +3804,17 @@ static void draw_about(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
         g_about_hooks = rf(x + 480, y, x + 600, y + 28);
         stroke_round(rt, g_about_hooks, 6.0f, OC_COL_BORDER, 1.0f);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, "Webhooks\u2026", g_meta, g_about_hooks, OC_COL_MUTED);
+        draw_text(rt, "Webhooks", g_meta, g_about_hooks, OC_COL_MUTED);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
 
         g_about_rename = rf(x, y, x + 150, y + 28);
         stroke_round(rt, g_about_rename, 6.0f, OC_COL_BORDER, 1.0f);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, "Rename channel\u2026", g_meta, g_about_rename, OC_COL_MUTED);
+        draw_text(rt, "Rename channel", g_meta, g_about_rename, OC_COL_MUTED);
         /* Visibility (REQ-031), beside the other two channel-shape actions. */
         g_about_visibility = rf(x + 160, y, x + 310, y + 28);
         stroke_round(rt, g_about_visibility, 6.0f, OC_COL_BORDER, 1.0f);
-        draw_text(rt, c->is_public ? "Make private\u2026" : "Make public\u2026", g_meta,
+        draw_text(rt, c->is_public ? "Make private" : "Make public", g_meta,
                   g_about_visibility, OC_COL_MUTED);
         g_about_archive = rf(x + 320, y, x + 470, y + 28);
         stroke_round(rt, g_about_archive, 6.0f, OC_COL_BORDER, 1.0f);
@@ -4307,7 +4345,7 @@ static void draw_files_view(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
     g_file_up_btn = rf(reg.right - 116, reg.top + 14, reg.right - 20, reg.top + 42);
     fill_round(rt, g_file_up_btn, 6.0f, OC_COL_ACCENT);
     IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, "Upload\u2026", g_meta, g_file_up_btn, 0xFFFFFF);
+    draw_text(rt, "Upload", g_meta, g_file_up_btn, 0xFFFFFF);
     IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
     fill(rt, rf(reg.left, reg.top + HEADER_H - 1, reg.right, reg.top + HEADER_H), OC_COL_BORDER);
     D2D1_RECT_F body = rf(reg.left, reg.top + HEADER_H, reg.right, reg.bottom);
@@ -4475,7 +4513,7 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
                      "A separator between days in the transcript.", ONOFF, 2, g_pref_daysep);
         /* WIN-28: the quick reactions were six literals in the source. */
         {
-            static const char *EDIT1[1] = { "Change\u2026" };
+            static const char *EDIT1[1] = { "Change" };
             char cur[128] = "";
             for (int i = 0; i < g_n_quick; i++)
                 snprintf(cur + strlen(cur), sizeof cur - strlen(cur), "%s ", REACT_EMO[i]);
@@ -4492,7 +4530,7 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
         /* Levels, quiet hours and the global default live in their own sheet, and
          * this points at it rather than duplicating it: two places to set the same
          * value is how they end up disagreeing. */
-        static const char *OPEN1[1] = { "Open\u2026" };
+        static const char *OPEN1[1] = { "Open" };
         y = pref_row(rt, body, y, PREF_ROW_NOTIFY + 100, "Per-conversation levels",
                      "Mute, mention-only, quiet hours and the workspace default.",
                      OPEN1, 1, -1);
@@ -4508,7 +4546,7 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
         snprintf(dh, sizeof dh, "Currently %d. For layout checks.", g_dpi);
         y = pref_row(rt, body, y, PREF_ROW_DPI, "DPI override", dh, DPIS, 4, -1);
 
-        static const char *RESET1[1] = { "Reset\u2026" };
+        static const char *RESET1[1] = { "Reset" };
         y = pref_row(rt, body, y, PREF_ROW_RESET, "Reset preferences",
                      "Back to the defaults; applied on Save.", RESET1, 1, -1);
     }
@@ -4972,7 +5010,7 @@ static void draw_palette(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
     /* Name the mode: the same panel means two things now, and a picker that does
      * not say which is a trap. */
     if (g_fwd_mid)
-        draw_text(rt, "Forward to\u2026", g_meta,
+        draw_text(rt, "Forward to", g_meta,
                   rf(px + 16, py + 50, px + pw - 12, py + 68), OC_COL_ACCENT);
     draw_lucide(rt, OC_ICON_SEARCH, rf(g_pal_box.left + 9, g_pal_box.top + 9,
                                        g_pal_box.left + 25, g_pal_box.top + 25), OC_COL_MUTED);
@@ -5232,7 +5270,7 @@ static void draw_signin(ID2D1RenderTarget *rt, float W, float H) {
     if (g_si_step == 1) {
         g_si_adv_link = rf(fx, y, fx + fw, y + 20);
         draw_text(rt, g_si_advanced ? "\xE2\x86\x90 Use a workspace name"
-                                    : "Advanced options\xE2\x80\xA6",
+                                    : "Advanced options",
                   g_meta, g_si_adv_link, OC_COL_ACCENT);
         y += 26;
     } else {
@@ -7831,7 +7869,7 @@ static void composer_cue(const oc_model *m, char *out, size_t cap) {
     /* Say why, not just that it is disabled (REQ-035). */
     else if (c && c->archived) snprintf(out, cap, "#%s is archived \u2014 read-only",
                                         c->name ? c->name : "this channel");
-    else if (m && m->thread_open) snprintf(out, cap, "Reply\u2026");
+    else if (m && m->thread_open) snprintf(out, cap, "Reply");
     else if (!c)               snprintf(out, cap, "Message");
     else if (c->kind == OC_CHANNEL_KIND_DM) {
         const char *pn = oc_model_user_name(m, c->peer_id);
@@ -8016,7 +8054,7 @@ static void files_find_create(HWND parent) {
         (HMENU)(INT_PTR)0xF2, GetModuleHandleW(NULL), NULL);
     if (!g_ffind) return;
     SendMessageW(g_ffind, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
-    SendMessageW(g_ffind, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search files…");
+    SendMessageW(g_ffind, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search files");
 }
 
 static void find_create(HWND parent) {
@@ -8025,7 +8063,7 @@ static void find_create(HWND parent) {
         (HMENU)(INT_PTR)0xF1, GetModuleHandleW(NULL), NULL);
     if (!g_find) return;
     SendMessageW(g_find, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
-    SendMessageW(g_find, EM_SETCUEBANNER, TRUE, (LPARAM)L"Find a conversation…");
+    SendMessageW(g_find, EM_SETCUEBANNER, TRUE, (LPARAM)L"Find a conversation");
     g_find_oldproc = (WNDPROC)SetWindowLongPtrW(g_find, GWLP_WNDPROC, (LONG_PTR)find_proc);
     layout_find(parent);
 }
@@ -8057,7 +8095,7 @@ static void search_create(HWND parent) {
         (HMENU)(INT_PTR)0xF2, GetModuleHandleW(NULL), NULL);
     if (!g_srch) return;
     SendMessageW(g_srch, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
-    SendMessageW(g_srch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search messages…");
+    SendMessageW(g_srch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search messages");
     g_srch_prev = (WNDPROC)SetWindowLongPtrW(g_srch, GWLP_WNDPROC, (LONG_PTR)srch_proc);
 }
 
@@ -8392,6 +8430,9 @@ static void scale_apply(HWND hwnd) {
 static void theme_set(int mode) {
     oc_theme_apply(mode);
     theme_restyle_children();
+    /* The caption is not ours to paint, so it has to be told. */
+    HWND top = GetActiveWindow();
+    if (top) apply_titlebar(top);
 }
 
 /* Where the RichEdit used to be created. Nothing to create: the composer is part of
@@ -8490,7 +8531,7 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, float cx, 
     if (!msg) return;
 
     g_n_mi = 0;
-    if (g_n_quick > 0) { mi_emojirow(); mi_item(7, "More reactions\u2026"); mi_sep(); }
+    if (g_n_quick > 0) { mi_emojirow(); mi_item(7, "More reactions"); mi_sep(); }
     for (int i = 0; i < msg->n_attach; i++) {
         char lbl[200];
         snprintf(lbl, sizeof lbl, "Download %s", msg->attach[i].filename);
@@ -8512,7 +8553,7 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, float cx, 
      * the read cursor moves to just BEFORE this message, so this one and everything
      * after it are unread (REQ-235). */
     mi_item(107, "Unread from here");
-    mi_item(106, "Forward\u2026");
+    mi_item(106, "Forward");
     mi_item(105, "Copy link");
     mi_item(104, "Save for later");
     mi_item(20,  "Copy text");
@@ -9104,7 +9145,7 @@ static int on_click(HWND hwnd, int x, int y) {
             case PREF_ROW_RESET:
                 /* Not persisted here: Save commits, like every other control on
                  * this card. Cancel puts the old values back from the snapshot. */
-                theme_set(OC_THEME_DARK);
+                theme_set(OC_THEME_SYSTEM);
                 oc_theme_set_scheme(OC_SCHEME_MIDNIGHT);
                 g_pref_time24 = 1; g_pref_members = 1; g_pref_daysep = 1;
                 g_pref_notify = NOTIFY_FULL;
@@ -9490,7 +9531,7 @@ static int on_click(HWND hwnd, int x, int y) {
         /* The image kebab, on the app's own menu now (WIN-79). */
         g_n_mi = 0;
         mi_item(1, "View full size");
-        mi_item(2, "Save image as\u2026");
+        mi_item(2, "Save image as");
         mi_sep();
         mi_item(3, "Copy filename");
         g_menu = MENU_THUMB; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 220;
@@ -10496,7 +10537,7 @@ static void open_ws_menu(HWND hwnd) {
     g_n_mi = 0;
     if (admin) { mi_item(40, "Invite people as member"); mi_item(41, "Invite people as admin"); mi_sep(); }
     mi_item(70, "Preferences");
-    mi_item(71, "Notifications\u2026");
+    mi_item(71, "Notifications");
     mi_item(73, "Mark all as read");
     mi_item(72, "Keyboard shortcuts");
     if (admin) { mi_section("TOOLS & SETTINGS"); mi_item(60, "Storage usage"); mi_item(61, "Audit log"); }
@@ -10512,7 +10553,7 @@ static void open_profile_menu(HWND hwnd) {
     g_n_mi = 0;
     mi_item(10, "Set status: Online");
     mi_item(11, "Set status: Away");
-    mi_item(50, "Do not disturb\xE2\x80\xA6");
+    mi_item(50, "Do not disturb");
     mi_sep();
     /* Custom status (REQ-241/122, WIN-53) — distinct from presence above: presence is
      * "am I here", status is "what am I doing", and Slack keeps both. */
@@ -10527,29 +10568,29 @@ static void open_profile_menu(HWND hwnd) {
                      me->status_emoji[0] ? "  " : "", me->status_text);
             mi_section(cur);
             mi_item(52, "Clear status");
-            mi_item(51, "Change status\xE2\x80\xA6");
+            mi_item(51, "Change status");
         } else {
-            mi_item(51, "Set a status\xE2\x80\xA6");
+            mi_item(51, "Set a status");
         }
     }
-    mi_item(53, "Edit profile\xE2\x80\xA6");
+    mi_item(53, "Edit profile");
     /* WIN-47. Two items rather than a field in the profile form: choosing a file is
      * an OS dialog, and burying it behind a text form would mean opening one modal to
      * reach another. "Remove" only appears when there is a photo to remove. */
-    mi_item(55, "Change photo\xE2\x80\xA6");
+    mi_item(55, "Change photo");
     {
         const oc_model *am = model();
         if (am && avatar_of(am, am->user_id)) mi_item(56, "Remove photo");
     }
-    mi_item(54, "Active sessions\xE2\x80\xA6");   /* REQ-182 */
+    mi_item(54, "Active sessions");   /* REQ-182 */
     /* Preferences hangs off YOU as well as off the workspace menu (WIN-78). It was
      * only on the workspace menu, which is the same category error as the
      * connection dot in the channel header: how the app looks to you is not a
      * property of the workspace. */
-    mi_item(70, "Preferences\xE2\x80\xA6  (Ctrl+,)");
+    mi_item(70, "Preferences  (Ctrl+,)");
     mi_sep();
-    mi_item(30, "Change display name\xE2\x80\xA6");
-    mi_item(31, "Change password\xE2\x80\xA6");
+    mi_item(30, "Change display name");
+    mi_item(31, "Change password");
     g_menu = MENU_PROFILE; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 224;
     RECT rc; GetClientRect(hwnd, &rc);
     float profile_top = rc.bottom - 3 * RAIL_IH - 6 + 2 * RAIL_IH;
@@ -10560,19 +10601,19 @@ static void open_profile_menu(HWND hwnd) {
 
 static void open_new_menu(HWND hwnd) {
     g_n_mi = 0;
-    mi_item(1, "New channel\xE2\x80\xA6");
-    mi_item(6, "New direct message\xE2\x80\xA6");
-    mi_item(83, "New group message\xE2\x80\xA6");   /* REQ-056 */
-    mi_item(7, "Upload a file\xE2\x80\xA6");
+    mi_item(1, "New channel");
+    mi_item(6, "New direct message");
+    mi_item(83, "New group message");   /* REQ-056 */
+    mi_item(7, "Upload a file");
     mi_sep();
-    mi_item(4, "Search messages\xE2\x80\xA6");
+    mi_item(4, "Search messages");
     /* WIN-75: the palette had exactly two callers — Ctrl+K and the test hook. No
      * menu entry, no button, nothing. ARCH-82 says this GUI is affordance-driven,
      * and the palette was the one surface reachable only by a keystroke. */
-    mi_item(8, "Jump to\xE2\x80\xA6  (Ctrl+K)");
-    mi_item(9, "Browse channels\xE2\x80\xA6");
-    mi_item(82, "New sidebar section\xE2\x80\xA6");   /* WIN-83 */
-    mi_item(84, "Add custom emoji\xE2\x80\xA6");      /* REQ-072 */
+    mi_item(8, "Jump to  (Ctrl+K)");
+    mi_item(9, "Browse channels");
+    mi_item(82, "New sidebar section");   /* WIN-83 */
+    mi_item(84, "Add custom emoji");      /* REQ-072 */
     g_menu = MENU_NEW; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 224;
     g_menu_x = RAIL_W + 8;
     /* Bottom-aligned to the New button, so the menu grows upward out of the thing
@@ -10710,7 +10751,7 @@ static void open_section_menu(HWND hwnd, int sec) {
      * which is why these two live here rather than in the shared block above. */
     if (cust >= 0) {
         mi_sep();
-        mi_item(SEC_CMD(sec, 7), "Rename\u2026");
+        mi_item(SEC_CMD(sec, 7), "Rename");
         mi_item_d(SEC_CMD(sec, 8), "Remove section");
     }
     g_menu = MENU_SECTION; g_menu_headerblock = 0; g_menu_hover = -1;
@@ -10788,8 +10829,8 @@ static void open_switcher(HWND hwnd) {
     }
     if (g_n_sw == 0) mi_item(-1, "(no remembered workspaces)");
     mi_sep();
-    mi_item(80, "Add a workspace\xE2\x80\xA6");
-    mi_item(81, "Manage workspaces\xE2\x80\xA6");
+    mi_item(80, "Add a workspace");
+    mi_item(81, "Manage workspaces");
     g_menu = MENU_SWITCHER; g_menu_headerblock = 0; g_menu_hover = -1;
     g_menu_x = RAIL_W + 8; g_menu_y = 12; g_menu_w = 244;
 }
@@ -11120,11 +11161,11 @@ static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, float 
             mi_sep();
             /* WIN-31: both frames had always existed on the wire and reached no
              * client, so a private channel could be created but never populated. */
-            mi_item(6, "Add someone\u2026");
-            mi_item(7, "Remove someone\u2026");
+            mi_item(6, "Add someone");
+            mi_item(7, "Remove someone");
             mi_sep();
-            mi_item(4, "Webhooks\u2026");
-            mi_item(5, "Create webhook\u2026");
+            mi_item(4, "Webhooks");
+            mi_item(5, "Create webhook");
             mi_item_d(3, "Leave channel");
         }
     }
@@ -11530,10 +11571,10 @@ static void test_dump(const char *path) {
         /* notify= so the Notifications form's Cancel is assertable: those levels
          * live on the SERVER, so "restore" means re-sending them, and a revert
          * that silently did nothing would look identical to one that worked. */
-        fprintf(f, "  ch %llu %s\"%s\" unread=%d msgs=%zu notify=%u prev=\"%s\" prevby=%llu%s\n",
+        fprintf(f, "  ch %llu %s\"%s\" pub=%d unread=%d msgs=%zu notify=%u prev=\"%s\" prevby=%llu%s\n",
                 (unsigned long long)c->channel_id,
                 c->kind == OC_CHANNEL_KIND_DM ? "DM " : "",
-                c->name ? c->name : "", c->unread,
+                c->name ? c->name : "", c->is_public, c->unread,
                 c->n_msgs, (unsigned)c->notify_level, c->preview,
                 (unsigned long long)c->preview_author,
                 c->channel_id == g_sel ? " *" : "");
@@ -11849,6 +11890,12 @@ static void test_poll(HWND hwnd) {
             oc_sidebar_assign(&g_sb, (uint64_t)cid, -1); test_ack("ok");
         }
         else if (!strcmp(what, "rm"))    { oc_sidebar_section_remove(&g_sb, atoi(rest)); test_ack("ok"); }
+        /* `section expand <n>` — collapse state is per-user state that PERSISTS on the
+         * server, so a test that assumes a section is open passes only until somebody
+         * collapses it. This lets a run assert the state it needs instead of
+         * inheriting one. */
+        else if (!strcmp(what, "expand")) { oc_sb_set_collapsed(&g_sb, atoi(rest), 0); test_ack("ok"); }
+        else if (!strcmp(what, "collapse")) { oc_sb_set_collapsed(&g_sb, atoi(rest), 1); test_ack("ok"); }
         else                             { test_ack("err"); }
         sidebar_opts_save();
         InvalidateRect(hwnd, NULL, FALSE);
@@ -12011,14 +12058,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_pal_edit) {
             SendMessageW(g_pal_edit, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
             SendMessageW(g_pal_edit, EM_SETCUEBANNER, TRUE,
-                         (LPARAM)L"Run an action or jump to a conversation\u2026");
+                         (LPARAM)L"Run an action or jump to a conversation");
             g_pal_prev = (WNDPROC)SetWindowLongPtrW(g_pal_edit, GWLP_WNDPROC, (LONG_PTR)pal_proc);
         }
         g_pick_edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL,
             0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)0xF3, GetModuleHandleW(NULL), NULL);
         if (g_pick_edit) {
             SendMessageW(g_pick_edit, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
-            SendMessageW(g_pick_edit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search emoji\u2026");
+            SendMessageW(g_pick_edit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search emoji");
         }
         signin_create(hwnd);
         DragAcceptFiles(hwnd, TRUE);              /* drop files anywhere to upload */
@@ -12335,6 +12382,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         /* Persist when a drag ENDS, not on every WM_SIZE: the bucket is a
          * network round trip and a resize emits dozens of those. */
         if (geom_capture(hwnd) && g_geom_applied) prefs_save();
+        return 0;
+    case WM_SETTINGCHANGE:
+        /* The desktop's light/dark setting changed. With SYSTEM as the default this
+         * is the common case, not an exotic one — and an app that only notices at the
+         * next launch is the thing "match system" was supposed to avoid. Windows
+         * signals it as a WM_SETTINGCHANGE naming "ImmersiveColorSet". */
+        if (lp && oc_theme_mode() == OC_THEME_SYSTEM &&
+            lstrcmpiW((LPCWSTR)lp, L"ImmersiveColorSet") == 0) {
+            theme_set(OC_THEME_SYSTEM);          /* re-resolve; also fixes the caption */
+            thumbs_drop();                       /* nothing cached is wrong, but the RT is */
+            InvalidateRect(hwnd, NULL, TRUE);
+        }
         return 0;
     case WM_SIZE:
         if (geom_capture(hwnd)) g_geom_dirty_at = GetTickCount64();
@@ -12710,7 +12769,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     dpi_declare_awareness();
     /* Before anything paints: the palette is runtime state now, and every
      * OC_COL_* reads through it. */
-    oc_theme_apply(OC_THEME_DARK);
+    /* SYSTEM by default: match the desktop unless the user says otherwise. */
+    oc_theme_apply(OC_THEME_SYSTEM);
     d2d_init();                           /* factory only; the RT is made per-hwnd in paint */
     if (direct) {
         connect_start(aws, acred);
@@ -12747,7 +12807,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
                     WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                     1120, 820, NULL, NULL, inst, NULL);
     if (!hwnd) return 1;
-    apply_dark_titlebar(hwnd);
+    apply_titlebar(hwnd);
     /* When we are auto-connecting, hold the window back until the settings
      * bucket arrives so it can open where it was left rather than snapping
      * there a second later. Shown regardless after a short grace period, and
