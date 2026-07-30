@@ -387,16 +387,27 @@ fi
 click_cat 0; sleep 0.5
 d=$(snap)
 ts0=$(printf '%s' "$d" | grep -oE 'textsize=[0-9]' | cut -d= -f2)
-ac0=$(printf '%s' "$d" | grep -oE 'accent=[0-9]' | cut -d= -f2)
+ac0=$(printf '%s' "$d" | grep -oE 'scheme=[0-9]' | cut -d= -f2)
+rail0=$(printf '%s' "$d" | grep -oE 'railcol=[0-9A-F]+' | cut -d= -f2)
 click_pref 7 2 && sleep 0.4      # Text size -> Large
-click_pref 6 2 && sleep 0.4      # Accent -> the third swatch
+click_pref 6 2 && sleep 0.4      # Colour scheme -> the third swatch
 d=$(snap)
 expect "$d" textsize 2 "a text size applies while the sheet is open"
-expect "$d" accent   2 "so does an accent"
-"$DRIVE" key esc >/dev/null 2>&1; sleep 0.6
+expect "$d" scheme   2 "so does a colour scheme"
+# A scheme is a PAIR: the rail has to move with the accent, or the picker is
+# changing half of what it shows.
+checks=$((checks + 1))
+rail1=$(printf '%s' "$d" | grep -oE 'railcol=[0-9A-F]+' | cut -d= -f2)
+if [ -n "$rail1" ] && [ "$rail1" != "$rail0" ]; then ok "and the rail colour with it ($rail0 -> $rail1)"
+else fail "the rail did not change with the scheme (still $rail1)"; fi
+"$DRIVE" key esc >/dev/null 2>&1; sleep 1.2
 d=$(snap)
 expect "$d" textsize "$ts0" "Cancel RESTORES the text size"
-expect "$d" accent   "$ac0" "Cancel RESTORES the accent"
+expect "$d" scheme   "$ac0" "Cancel RESTORES the scheme"
+checks=$((checks + 1))
+if [ "$(printf '%s' "$d" | grep -oE 'railcol=[0-9A-F]+' | cut -d= -f2)" = "$rail0" ]; then
+  ok "... and the rail with it"
+else fail "the rail did not come back: $(printf '%s' "$d" | grep -oE 'railcol=[0-9A-F]+')"; fi
 
 # --- the generic form on the modal frame (WIN-77) ---------------------------
 # Sixteen call sites went through a native GDI popup with its own window class and

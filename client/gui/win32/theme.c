@@ -60,17 +60,40 @@ static const uint32_t LIGHT[TH_COUNT] = {
 
 uint32_t oc_theme[TH_COUNT];
 static int g_mode = -1;
-static int g_accent = OC_ACCENT_BLUE;
+static int g_scheme = OC_SCHEME_MIDNIGHT;
 
-/* name, dark accent, dark dim, light accent, light dim. The BLUE row is exactly
- * what the two palettes above already carry, so the default is not a new colour
- * scheme arriving with the feature. */
-static const struct { const char *name; uint32_t d, dd, l, ld; } ACCENTS[OC_ACCENT_COUNT] = {
-    { "Blue",   0x3D8BFF, 0x2563EB, 0x1264A3, 0x0B4C7F },
-    { "Indigo", 0x8B7CFF, 0x6D5AE0, 0x4F46B5, 0x3B3490 },
-    { "Teal",   0x2DD4BF, 0x14A99B, 0x0F766E, 0x0A5750 },
-    { "Plum",   0xE879C7, 0xC2569F, 0xA1367F, 0x7C2762 },
+/* A scheme is the RAIL and the ACCENT together, per mode:
+ *   name, dark rail, light rail, dark accent, dark dim, light accent, light dim.
+ *
+ * MIDNIGHT is exactly what the two palettes above already carry — the navy rail in
+ * dark, Slack's aubergine in light — so the default is not a new colour scheme
+ * arriving with the feature.
+ *
+ * Every rail is dark in BOTH modes on purpose: the rail's icons and labels are
+ * near-white (TH_RAIL_ICON), so a light rail would need its own foreground set and
+ * a second contrast problem to keep solved. Slack's light theme keeps a dark rail
+ * for the same reason. */
+static const struct {
+    const char *name;
+    uint32_t rail_d, rail_l;
+    uint32_t d, dd, l, ld;
+} SCHEMES[OC_SCHEME_COUNT] = {
+    { "Midnight", 0x101A2E, 0x21324F, 0x3D8BFF, 0x2563EB, 0x1264A3, 0x0B4C7F },
+    { "Indigo",   0x241B4D, 0x3A2E7A, 0x8B7CFF, 0x6D5AE0, 0x4F46B5, 0x3B3490 },
+    { "Teal",     0x0B322D, 0x134A43, 0x2DD4BF, 0x14A99B, 0x0F766E, 0x0A5750 },
+    { "Plum",     0x3B1039, 0x4A1240, 0xE879C7, 0xC2569F, 0xA1367F, 0x7C2762 },
 };
+
+/* Mix two 0xRRGGBB colours, `t` in 0..1 of `a` over `b`. Per channel, because the
+ * point is a colour that belongs to BOTH — a selected row has to read as the accent
+ * without becoming a second accent. */
+static uint32_t mix(uint32_t a, uint32_t b, float t) {
+    float u = 1.0f - t;
+    unsigned r = (unsigned)(((a >> 16) & 0xFF) * t + ((b >> 16) & 0xFF) * u);
+    unsigned g = (unsigned)(((a >>  8) & 0xFF) * t + ((b >>  8) & 0xFF) * u);
+    unsigned bl = (unsigned)((a & 0xFF) * t + (b & 0xFF) * u);
+    return (r << 16) | (g << 8) | bl;
+}
 
 /* The user's app theme, from the same registry value the shell reads. Anything
  * unreadable means dark: this app was designed dark, so that is the safe miss. */
@@ -93,31 +116,45 @@ void oc_theme_apply(int mode) {
                 (mode == OC_THEME_SYSTEM && system_prefers_light());
     const uint32_t *src = light ? LIGHT : DARK;
     for (int i = 0; i < TH_COUNT; i++) oc_theme[i] = src[i];
-    /* The accent is applied AFTER the palette copy, not folded into the tables:
-     * otherwise every accent would need its own full palette and the two would
-     * drift the first time a neutral changed. */
-    oc_theme[TH_ACCENT]     = light ? ACCENTS[g_accent].l  : ACCENTS[g_accent].d;
-    oc_theme[TH_ACCENT_DIM] = light ? ACCENTS[g_accent].ld : ACCENTS[g_accent].dd;
+    /* The scheme is applied AFTER the palette copy, not folded into the tables:
+     * otherwise every scheme would need its own full palette and the two would drift
+     * the first time a neutral changed. */
+    oc_theme[TH_ACCENT]     = light ? SCHEMES[g_scheme].l  : SCHEMES[g_scheme].d;
+    oc_theme[TH_ACCENT_DIM] = light ? SCHEMES[g_scheme].ld : SCHEMES[g_scheme].dd;
+    oc_theme[TH_RAIL]       = light ? SCHEMES[g_scheme].rail_l : SCHEMES[g_scheme].rail_d;
+    /* The SELECTED row follows the scheme too. It is the accent at low strength over
+     * the sidebar, not a colour of its own: a fixed blue selection under a plum
+     * scheme looked like a bug rather than a neutral, and it is the second most
+     * prominent coloured surface after the rail. */
+    oc_theme[TH_SELECT] = mix(oc_theme[TH_ACCENT], oc_theme[TH_SIDEBAR], light ? 0.22f : 0.34f);
 }
 
-void oc_theme_set_accent(int accent) {
-    if (accent < 0 || accent >= OC_ACCENT_COUNT) accent = OC_ACCENT_BLUE;
-    g_accent = accent;
+void oc_theme_set_scheme(int scheme) {
+    if (scheme < 0 || scheme >= OC_SCHEME_COUNT) scheme = OC_SCHEME_MIDNIGHT;
+    g_scheme = scheme;
     oc_theme_apply(oc_theme_mode());      /* re-resolve; the mode decides which pair */
 }
 
-int oc_theme_accent(void) { return g_accent; }
+int oc_theme_scheme(void) { return g_scheme; }
 
-const char *oc_theme_accent_name(int accent) {
-    if (accent < 0 || accent >= OC_ACCENT_COUNT) accent = OC_ACCENT_BLUE;
-    return ACCENTS[accent].name;
+const char *oc_theme_scheme_name(int scheme) {
+    if (scheme < 0 || scheme >= OC_SCHEME_COUNT) scheme = OC_SCHEME_MIDNIGHT;
+    return SCHEMES[scheme].name;
 }
 
-uint32_t oc_theme_accent_swatch(int accent) {
-    if (accent < 0 || accent >= OC_ACCENT_COUNT) accent = OC_ACCENT_BLUE;
-    int light = (g_mode == OC_THEME_LIGHT) ||
-                (g_mode == OC_THEME_SYSTEM && system_prefers_light());
-    return light ? ACCENTS[accent].l : ACCENTS[accent].d;
+static int scheme_light(void) {
+    return (g_mode == OC_THEME_LIGHT) ||
+           (g_mode == OC_THEME_SYSTEM && system_prefers_light());
+}
+
+uint32_t oc_theme_scheme_accent(int scheme) {
+    if (scheme < 0 || scheme >= OC_SCHEME_COUNT) scheme = OC_SCHEME_MIDNIGHT;
+    return scheme_light() ? SCHEMES[scheme].l : SCHEMES[scheme].d;
+}
+
+uint32_t oc_theme_scheme_rail(int scheme) {
+    if (scheme < 0 || scheme >= OC_SCHEME_COUNT) scheme = OC_SCHEME_MIDNIGHT;
+    return scheme_light() ? SCHEMES[scheme].rail_l : SCHEMES[scheme].rail_d;
 }
 
 int oc_theme_mode(void) { return g_mode < 0 ? OC_THEME_DARK : g_mode; }

@@ -632,6 +632,14 @@ the DPI, and `prefs_restore` re-applies each through the one path that knows wha
 costs (`scale_apply` rebuilds every DirectWrite format; `dpi_set` drops the render
 target, the brushes and the thumbnail cache).
 
+**A colour scheme is a PAIR** — the nav rail and the accent — because they are seen
+together: an accent chosen against a fixed rail could fight it, and that looked like a
+bug rather than a choice. Each scheme carries both colours for both modes, and the
+selected-row tint is derived from the accent rather than being a palette constant, so
+a plum scheme does not leave a blue selection behind. Every rail is dark in both
+modes on purpose: rail icons and labels are near-white, so a light rail would need its
+own foreground set and a second contrast problem to keep solved.
+
 **The three scale multipliers stay separate (ARCH-97).** Text size is a preference
 and follows the account. Zoom (Ctrl+`=` / Ctrl+`-` / Ctrl+`0`) is this window only
 and is deliberately **not** persisted — a temporary magnification following you to
@@ -683,7 +691,7 @@ unverifiable.
 
 ## Run the GUI smoke before pushing Win32 chrome
 
-`scripts/gui_smoke.sh` asserts **109 invariants** through the test hook: for each of
+`scripts/gui_smoke.sh` asserts **111 invariants** through the test hook: for each of
 the six views, what is in the second column (`sidebar_kind`), whether the middle
 one is typeable (`main_is_conversation`), which native children are shown, and
 whether anything covers the window — plus the search overlay, the Pins tab, the

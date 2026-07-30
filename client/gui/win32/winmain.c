@@ -4363,20 +4363,26 @@ static const char *PC_NAME[PC_COUNT] = { "Appearance", "Messages", "Notification
 static int g_pref_cat = PC_APPEARANCE;
 static D2D1_RECT_F g_pref_cats[PC_COUNT];
 
-/* The accent swatch row: colour discs rather than named chips, because the name
- * of a colour is not the thing being chosen. */
+/* The colour-scheme row: each choice is a PAIR — the rail colour and the accent —
+ * drawn as one swatch showing both, because that is what you are choosing. Discs
+ * rather than named chips: the name of a colour is not the thing being chosen. */
 static float pref_accent_row(ID2D1RenderTarget *rt, D2D1_RECT_F body, float y) {
     float bx = body.right - 24, swatch_left = body.right - 24;
-    for (int i = OC_ACCENT_COUNT - 1; i >= 0; i--) {
-        D2D1_RECT_F b = rf(bx - 26, y + 2, bx, y + 28);
+    for (int i = OC_SCHEME_COUNT - 1; i >= 0; i--) {
+        D2D1_RECT_F b = rf(bx - 30, y + 2, bx, y + 28);
         float cx = (b.left + b.right) / 2, cy = (b.top + b.bottom) / 2;
-        D2D1_ELLIPSE e = { { cx, cy }, 10, 10 };
-        ID2D1RenderTarget_FillEllipse(rt, &e, paint_with(oc_theme_accent_swatch(i)));
-        if (i == oc_theme_accent()) {
-            /* A ring, not a tick: a tick in the accent colour on the accent
-             * colour is invisible, and one in white is invisible on the light
-             * swatches. */
-            D2D1_ELLIPSE r2 = { { cx, cy }, 13, 13 };
+        /* The rail is the disc and the accent is the dot on it — the same relation
+         * they have on screen, where the accent appears ON the rail. Two half-discs
+         * were the alternative and read as a single two-tone colour rather than as
+         * a surface and a highlight. */
+        D2D1_ELLIPSE outer = { { cx, cy }, 11, 11 };
+        ID2D1RenderTarget_FillEllipse(rt, &outer, paint_with(oc_theme_scheme_rail(i)));
+        D2D1_ELLIPSE inner = { { cx, cy }, 5.5f, 5.5f };
+        ID2D1RenderTarget_FillEllipse(rt, &inner, paint_with(oc_theme_scheme_accent(i)));
+        if (i == oc_theme_scheme()) {
+            /* A ring, not a tick: a tick in the accent colour on the accent colour is
+             * invisible, and one in white is invisible on the light swatches. */
+            D2D1_ELLIPSE r2 = { { cx, cy }, 14, 14 };
             ID2D1RenderTarget_DrawEllipse(rt, &r2, paint_with(OC_COL_TEXT), 1.6f, NULL);
         }
         if (g_n_pref_hits < 24) {
@@ -4390,10 +4396,15 @@ static float pref_accent_row(ID2D1RenderTarget *rt, D2D1_RECT_F body, float y) {
     }
     /* Same rule as pref_row: label and hint stop where the controls start, so
      * neither can be clipped by a row whose controls are wider than a guess. */
-    draw_text(rt, "Accent colour", g_ui_b,
+    draw_text(rt, "Colour scheme", g_ui_b,
               rf(body.left + 24, y, swatch_left - 12, y + 22), OC_COL_TEXT);
-    draw_text(rt, "Selection, links and buttons.", g_meta,
-              rf(body.left + 24, y + 20, swatch_left - 12, y + 40), OC_COL_FAINT);
+    {
+        char hint[96];
+        snprintf(hint, sizeof hint, "%s \u2014 the sidebar and the accent.",
+                 oc_theme_scheme_name(oc_theme_scheme()));
+        draw_text(rt, hint, g_meta,
+                  rf(body.left + 24, y + 20, swatch_left - 12, y + 40), OC_COL_FAINT);
+    }
     fill(rt, rf(body.left + 24, y + 46, body.right - 24, y + 47), OC_COL_BORDER);
     return y + 62;
 }
@@ -5933,7 +5944,7 @@ static void prefs_snapshot(void) {
     g_prefs_snap.members = g_pref_members;
     g_prefs_snap.daysep  = g_pref_daysep;
     g_prefs_snap.notify  = g_pref_notify;
-    g_prefs_snap.accent   = oc_theme_accent();
+    g_prefs_snap.accent   = oc_theme_scheme();
     g_prefs_snap.textsize = g_pref_textsize;
     g_prefs_snap.density  = g_pref_density;
     g_prefs_snap.zoom     = g_zoom_step;
@@ -5947,7 +5958,7 @@ static void prefs_restore(void) {
     g_pref_members = g_prefs_snap.members;
     g_pref_daysep  = g_prefs_snap.daysep;
     g_pref_notify  = g_prefs_snap.notify;
-    if (oc_theme_accent() != g_prefs_snap.accent) oc_theme_set_accent(g_prefs_snap.accent);
+    if (oc_theme_scheme() != g_prefs_snap.accent) oc_theme_set_scheme(g_prefs_snap.accent);
     g_pref_density = g_prefs_snap.density;
     g_density      = g_prefs_snap.density ? 1.0f : 0.6f;
     snprintf(g_quick_names, sizeof g_quick_names, "%s", g_prefs_snap.quick);
@@ -9053,7 +9064,7 @@ static int on_click(HWND hwnd, int x, int y) {
             /* Appearance applies LIVE while the sheet is open — a colour, a text
              * size and a density are their own preview and cannot be judged from a
              * label — and reverts with everything else on Cancel. */
-            case PREF_ROW_ACCENT:   oc_theme_set_accent(v); break;
+            case PREF_ROW_ACCENT:   oc_theme_set_scheme(v); break;
             case PREF_ROW_TEXTSIZE: g_pref_textsize = v; scale_apply(hwnd); break;
             case PREF_ROW_DENSITY:  g_pref_density = v; g_density = v ? 1.0f : 0.6f; break;
             case PREF_ROW_ZOOM:
@@ -9072,7 +9083,7 @@ static int on_click(HWND hwnd, int x, int y) {
                 /* Not persisted here: Save commits, like every other control on
                  * this card. Cancel puts the old values back from the snapshot. */
                 theme_set(OC_THEME_DARK);
-                oc_theme_set_accent(OC_ACCENT_BLUE);
+                oc_theme_set_scheme(OC_SCHEME_MIDNIGHT);
                 g_pref_time24 = 1; g_pref_members = 1; g_pref_daysep = 1;
                 g_pref_notify = NOTIFY_FULL;
                 g_pref_textsize = 1; g_pref_density = 1; g_density = 1.0f;
@@ -10546,7 +10557,7 @@ static void prefs_save(void) {
      * account to every other machine. */
     snprintf(enc, sizeof enc, "t:%d;h:%d;m:%d;d:%d;n:%d;a:%d;s:%d;y:%d;w:%d,%d,%d,%d,%d;q:%s",
              oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep,
-             g_pref_notify, oc_theme_accent(), g_pref_textsize, g_pref_density,
+             g_pref_notify, oc_theme_scheme(), g_pref_textsize, g_pref_density,
              g_win_x, g_win_y, g_win_w, g_win_h, g_win_max,
              g_quick_names);
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
@@ -10565,7 +10576,7 @@ static void prefs_load(const oc_model *m) {
             if (k == 't') t = val; else if (k == 'h') h = val;
             else if (k == 'm') mm = val; else if (k == 'd') d = val;
             else if (k == 'n') g_pref_notify = (val < 0 || val > 2) ? NOTIFY_FULL : val;
-            else if (k == 'a') oc_theme_set_accent(val);
+            else if (k == 'a') oc_theme_set_scheme(val);
             else if (k == 's') g_pref_textsize = (val < 0 || val > 3) ? 1 : val;
             else if (k == 'y') { g_pref_density = val ? 1 : 0; g_density = val ? 1.0f : 0.6f; }
             else if (k == 'w') {
@@ -11322,9 +11333,17 @@ static void test_dump(const char *path) {
     fprintf(f, "lastclick %s\n", g_modal_lastclick);
     /* The three scale inputs ARCH-97 keeps apart, plus the product the font table
      * actually uses — so "the text did not change size" is one line to check. */
-    fprintf(f, "textsize=%d zoom=%d scale=%.3f dpi=%u density=%d accent=%d\n",
+    /* The scheme AND both of its colours: "the picker changed the accent but not the
+     * rail" is the failure this feature can have, and an index alone cannot show it.
+     *
+     * `railcol`/`accentcol`, not `rail`/`accent`: a field name that is a SUFFIX of
+     * another one silently matched twice in the smoke's extractor and produced a
+     * two-line "expected" value. Names in this dump are read by grep, so they have to
+     * be unambiguous to grep. */
+    fprintf(f, "textsize=%d zoom=%d scale=%.3f dpi=%u density=%d "
+               "scheme=%d railcol=%06X accentcol=%06X\n",
             g_pref_textsize, g_zoom_step, g_text_scale, g_dpi, g_pref_density,
-            oc_theme_accent());
+            oc_theme_scheme(), (unsigned)OC_COL_RAIL, (unsigned)OC_COL_ACCENT);
     /* The sidebar AS BUILT, which is where the appear-once rule lives: a
      * conversation in a custom section leaves Channels, a starred one leaves both.
      * Counting a label in this list is the only way to assert that. */

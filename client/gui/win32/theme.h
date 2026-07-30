@@ -40,24 +40,29 @@ enum { OC_THEME_DARK = 0, OC_THEME_LIGHT = 1, OC_THEME_SYSTEM = 2 };
 
 extern uint32_t oc_theme[TH_COUNT];
 
-/* Accent choices (WIN-78). The accent is a SEPARATE axis from the mode: each
- * one carries a dark-shell and a light-shell pair, because the bright blue that
- * pops on navy is unreadable on white — which is the whole reason the two
- * palettes above differ in their accent at all. Picking a colour must not undo
- * that, so an accent is two colours per mode, never one hex the user chose.
+/* COLOUR SCHEMES (WIN-78). A scheme is a PAIR: the nav rail — the app's main
+ * branded surface, the thing you see before you read anything — and the accent
+ * that marks selection, links and primary buttons. They are picked together
+ * because they are seen together; choosing an accent that fights the rail was
+ * possible when the rail was fixed, and looked like a bug rather than a choice.
  *
- * A fixed set rather than a colour picker: every value has to stay legible
- * against TH_TEXT on a chip and white-on-accent on a primary button, and an
- * arbitrary RGB cannot promise that. */
-enum { OC_ACCENT_BLUE = 0, OC_ACCENT_INDIGO, OC_ACCENT_TEAL, OC_ACCENT_PLUM,
-       OC_ACCENT_COUNT };
+ * Each scheme carries BOTH colours for BOTH modes. The bright blue that pops on
+ * navy is unreadable on white, which is the whole reason the two palettes differ
+ * in their accent at all — picking a scheme must not undo that.
+ *
+ * A fixed set rather than a colour picker: every value has to stay legible as
+ * white-on-accent on a primary button and as white icons on the rail, and an
+ * arbitrary RGB cannot promise either. */
+enum { OC_SCHEME_MIDNIGHT = 0, OC_SCHEME_INDIGO, OC_SCHEME_TEAL, OC_SCHEME_PLUM,
+       OC_SCHEME_COUNT };
 
-void oc_theme_set_accent(int accent);
-int  oc_theme_accent(void);
-const char *oc_theme_accent_name(int accent);
-/* The swatch to DRAW for `accent`, resolved for the mode in force — so the
- * chooser shows the colour you will actually get. */
-uint32_t oc_theme_accent_swatch(int accent);
+void oc_theme_set_scheme(int scheme);
+int  oc_theme_scheme(void);
+const char *oc_theme_scheme_name(int scheme);
+/* The two swatches to DRAW for `scheme`, resolved for the mode in force — so the
+ * chooser shows the pair you will actually get. */
+uint32_t oc_theme_scheme_accent(int scheme);
+uint32_t oc_theme_scheme_rail(int scheme);
 
 /* Apply a mode. OC_THEME_SYSTEM follows the Windows apps-use-light-theme
  * setting, resolving to dark when it cannot be read. */
