@@ -9,7 +9,7 @@ clients, or a `REQ-NNN`.
 parity table is the *feature reachability* tracker. This document is the *work
 list* derived from both — one row per shippable branch.
 
-**Ids.** Items are `WIN-1` … `WIN-78`, numbered once and **stable**: an id is
+**Ids.** Items are `WIN-1` … `WIN-79`, numbered once and **stable**: an id is
 never renumbered or reused, so a commit or branch can cite it. Ordering is *not*
 priority — the **Pri** column is, and it may change. Section membership may also
 change as blockers clear (an item moves from §3 to §1 without changing its id).
@@ -71,6 +71,7 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 | **WIN-76** | Long lists do not scroll: Files, Later (and audit/webhook rows unchecked) | P1 | M |
 | **WIN-77** | Modal frame: the remaining conversions — pane headers, `confirm()`, `form_dialog`'s 16 sites | P1 | L |
 | **WIN-78** | Preferences as two panes + appearance depth (accent, text size, density, zoom) | P2 | M |
+| **WIN-79** | Replace the four remaining **native `TrackPopupMenu`** context menus with the app's own | P1 | M |
 
 ### The items added 2026-07-30, in detail
 
@@ -118,6 +119,30 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
   a themed `confirm()` for the four `MessageBoxW` calls; and `form_dialog`'s **16
   call sites**, which are native GDI popups and the most foreign-looking surfaces in
   the app.
+
+- **WIN-79 — two menu systems, one product.** Left-click dropdowns (workspace,
+  profile, New, switcher, sidebar section) are drawn by the app. Right-click context
+  menus are **native GDI popups**: four `TrackPopupMenu` sites — the message kebab,
+  the member menu, the image-thumbnail kebab and the channel menu — built from seven
+  `CreatePopupMenu` calls and 39 `AppendMenuW` items. The custom system's own header
+  comment says "One reusable floating menu replaces the old `TrackPopupMenu`", so
+  the replacement was started and abandoned half-way.
+
+  It is not only that they look foreign (OS-themed, so light-on-dark in dark mode,
+  and outside ARCH-97's type tokens). `TPM_RETURNCMD` **runs its own modal message
+  loop**, with three consequences: our tick and repaints stop while a menu is up;
+  the message-loop shortcuts from `SHORTCUTS[]` cannot fire; and **the harness cannot
+  drive them at all** — which the code already concedes, since the `pin` test verb
+  exists only because "the kebab's Pin item goes through a modal `TrackPopupMenu`
+  the harness cannot navigate". Every context-menu action is therefore unverifiable
+  except by hand.
+
+  The one piece of real work hiding here: three of them have **submenus**
+  (reactions, roles, notification levels) and the custom system has no submenu kind —
+  only ITEM / SECTION / SEP. So this either adds one, or flattens them the way Slack
+  does (a submenu becomes an item that opens a panel or dialog). Flattening is
+  probably right for notification levels and roles; the quick-reaction row wants to
+  stay inline.
 
 - **WIN-78 — Preferences.** A two-pane card (categories left, panel right) carrying
   accent colour, **text size** (the `g_text_scale` hook exists and is applied by
