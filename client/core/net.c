@@ -453,6 +453,9 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->server_time = ents[i].last_message_at;
                 e->count = ents[i].unread;
                 if (ents[i].kind == OC_CHANNEL_KIND_DM) e->user_id = ents[i].peer_id;
+                e->n_peers = ents[i].n_peers;                       /* REQ-056 */
+                for (uint16_t k = 0; k < ents[i].n_peers && k < 9; k++)
+                    e->peers[k] = ents[i].peers[k];
                 e->body = malloc(ents[i].name.len + 1);
                 if (e->body) { memcpy(e->body, ents[i].name.ptr, ents[i].name.len); e->body[ents[i].name.len] = '\0'; }
                 e->archived = ents[i].archived;
@@ -488,6 +491,9 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->op = ci.kind;
                     e->is_public = ci.is_public;
                     e->user_id = ci.peer_id;           /* DM peer, if any */
+                    e->n_peers = ci.n_peers;                        /* REQ-056 */
+                    for (uint16_t k = 0; k < ci.n_peers && k < 9; k++)
+                        e->peers[k] = ci.peers[k];
                     e->body = malloc(ci.name.len + 1);
                     if (e->body) { memcpy(e->body, ci.name.ptr, ci.name.len); e->body[ci.name.len] = '\0'; }
                     e->archived = ci.archived;
@@ -1666,6 +1672,14 @@ static int run_connection(oc_net *n, int reconnecting,
                 uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
                 oc_set_mute sm = { c->channel_id, c->op };
                 if (oc_encode_set_mute(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_OPEN_GROUP_DM) {
+                uint8_t buf[96]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_open_group_dm gd; memset(&gd, 0, sizeof gd);
+                gd.count = (uint16_t)(c->n_gids > (int)OC_MAX_GROUP_DM ? (int)OC_MAX_GROUP_DM : c->n_gids);
+                for (uint16_t i = 0; i < gd.count; i++) gd.user_ids[i] = c->gids[i];
+                if (oc_encode_open_group_dm(&w, OC_PROTOCOL_VERSION, &gd) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SET_AVATAR) {

@@ -342,8 +342,16 @@ the requirement says so explicitly rather than implying one.
   supported as a first-class conversation distinct from a named channel — a
   participant-defined, unnamed DM any participant could post to but not rename or
   govern membership on. It has ridden the same message model as a 1:1 or self-DM
-  (REQ-050/055), extended to N participants. **[needs ARCH decision — group-DM
-  identity/membership model vs. reusing a private channel.]**
+  (REQ-050/055), extended to N participants. **DONE** (2026-07-30). The decision:
+  **a group DM is a DM with more than two participants** — the same `channels.kind`,
+  identified by the same `dm_key` (the sorted participant ids under a unique index)
+  the 1:1 case has always used. No migration, no second code path for membership or
+  read access, and no way for the two to disagree about what a DM is. Reopening the
+  same set — in any order, by any participant — returns the same conversation.
+  Capped at 9 people: a group DM with fifty in it is a channel, and pretending
+  otherwise gives you a conversation nobody can name, govern or leave. The
+  participant list rides `CHANNEL_INFO` and `CHANNEL_LIST`, so a client titles it by
+  its people on first paint rather than after a roster fetch per group.
 - **REQ-057.** A user has been able to **forward (share) a message** to another
   channel or DM they can post to, carrying a reference to the original — its
   author and a quoted excerpt — rather than copying the text opaquely, so a

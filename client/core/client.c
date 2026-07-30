@@ -601,6 +601,17 @@ void oc_client_upload_avatar(oc_client *c, uint64_t channel_id, const char *path
     oc_queue_push(&c->cmds, cmd);
 }
 
+/* A group DM (REQ-056). */
+void oc_client_open_group_dm(oc_client *c, const uint64_t *user_ids, int n) {
+    if (!c || !user_ids || n < 2) return;
+    if (n > 8) n = 8;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_OPEN_GROUP_DM);
+    if (!cmd) return;
+    for (int i = 0; i < n; i++) cmd->gids[i] = user_ids[i];
+    cmd->n_gids = n;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 /* The avatar (WIN-47). */
 void oc_client_set_avatar(oc_client *c, uint64_t attachment_id) {
     if (!c) return;

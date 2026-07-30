@@ -3133,6 +3133,141 @@ static void test_webhooks(void) {
 
 /* Notification preferences (REQ-130/131): per-channel level + DND, persisted and
  * upserted, gated on channel access. */
+/* Group DMs (REQ-056). A group DM is a DM with more than two participants — the
+ * same `kind`, identified by its participant set, which is what a DM has always
+ * been. So the properties to prove are: it is created, reopening the same SET
+ * returns the SAME conversation regardless of the order given, two participants is
+ * refused (that is a 1:1 and must reuse OPEN_DM or the pair ends up with two
+ * conversations), and everyone in it is a member. */
+static void test_group_dm(void) {
+    const char *path = "build/test_dbwriter_groupdm.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "gd-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "gd-bob",   "pw", OC_ROLE_MEMBER);
+    uint64_t carol = reg(w, "gd-carol", "pw", OC_ROLE_MEMBER);
+    uint64_t dave  = reg(w, "gd-dave",  "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob && carol && dave);
+
+    oc_job *j = oc_job_new(OC_JOB_OPEN_GROUP_DM, 1);
+    j->user_id = alice;
+    j->group_uids[0] = bob; j->group_uids[1] = carol; j->n_group_uids = 2;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CHANNEL_INFO);
+    uint64_t gid = r ? r->channel_id : 0;
+    CHECK(gid != 0);
+    /* peer 0 and three participants: that pair of facts is how a client tells a
+     * group from a 1:1 without a second round trip. */
+    CHECK(r && r->ch_peer == 0 && r->n_ch_peers == 3);
+    /* And it fans out, or the other two would not see it until their next refresh. */
+    CHECK(r && r->ch_fanout && r->n_members == 3);
+    oc_dbres_free(r);
+
+    /* The same set in a DIFFERENT order is the same conversation. */
+    j = oc_job_new(OC_JOB_OPEN_GROUP_DM, 2);
+    j->user_id = alice;
+    j->group_uids[0] = carol; j->group_uids[1] = bob; j->n_group_uids = 2;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->channel_id == gid);
+    oc_dbres_free(r);
+
+    /* ... and so is the same set opened by a DIFFERENT participant. */
+    j = oc_job_new(OC_JOB_OPEN_GROUP_DM, 3);
+    j->user_id = bob;
+    j->group_uids[0] = alice; j->group_uids[1] = carol; j->n_group_uids = 2;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->channel_id == gid);
+    oc_dbres_free(r);
+
+    /* A duplicate name collapses rather than making a "different" group. */
+    j = oc_job_new(OC_JOB_OPEN_GROUP_DM, 4);
+    j->user_id = alice;
+    j->group_uids[0] = bob; j->group_uids[1] = bob; j->group_uids[2] = carol;
+    j->n_group_uids = 3;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->channel_id == gid);
+    oc_dbres_free(r);
+
+    /* A different set is a different conversation. */
+    j = oc_job_new(OC_JOB_OPEN_GROUP_DM, 5);
+    j->user_id = alice;
+    j->group_uids[0] = bob; j->group_uids[1] = dave; j->n_group_uids = 2;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->channel_id != 0 && r->channel_id != gid);
+    oc_dbres_free(r);
+
+    /* ONE other person is refused: that is a 1:1 DM. */
+    j = oc_job_new(OC_JOB_OPEN_GROUP_DM, 6);
+    j->user_id = alice;
+    j->group_uids[0] = bob; j->n_group_uids = 1;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR);
+    oc_dbres_free(r);
+
+    /* An unknown user is refused without saying which — OPEN_DM's rule. */
+    j = oc_job_new(OC_JOB_OPEN_GROUP_DM, 7);
+    j->user_id = alice;
+    j->group_uids[0] = bob; j->group_uids[1] = 999999; j->n_group_uids = 2;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CHANNEL_ERR && r->err_code == OC_ERR_FORBIDDEN);
+    oc_dbres_free(r);
+
+    /* Everyone in it can post and read it; dave (not in it) cannot. */
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0x71, sizeof idem);
+    {
+        oc_job *sj = oc_job_new(OC_JOB_SEND, 8);
+        sj->user_id = carol; sj->channel_id = gid;
+        memcpy(sj->idem, idem, OC_IDEM_LEN);
+        oc_job_set_body(sj, "hi both", 7);
+        oc_dbwriter_submit(w, sj);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_SEND_OK);
+        oc_dbres_free(r);
+    }
+    memset(idem, 0x72, sizeof idem);
+    {
+        oc_job *sj = oc_job_new(OC_JOB_SEND, 9);
+        sj->user_id = dave; sj->channel_id = gid;
+        memcpy(sj->idem, idem, OC_IDEM_LEN);
+        oc_job_set_body(sj, "let me in", 9);
+        oc_dbwriter_submit(w, sj);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_SEND_ERR);
+        oc_dbres_free(r);
+    }
+
+    /* It appears in a participant's channel list WITH its participants, so the
+     * sidebar can title it on first paint. */
+    j = oc_job_new(OC_JOB_LIST_CHANNELS, 10);
+    j->user_id = bob;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_CHANNEL_LIST);
+    if (r) {
+        int seen = 0;
+        for (size_t i = 0; i < r->n_chlist; i++) {
+            if (r->chlist[i].channel_id != gid) continue;
+            seen = 1;
+            CHECK(r->chlist[i].kind == OC_CHANNEL_KIND_DM);
+            CHECK(r->chlist[i].n_peers == 3);
+        }
+        CHECK(seen);
+    }
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* The avatar (WIN-47). Three properties, and the second is the one that matters for
  * security: an avatar is readable WORKSPACE-WIDE, so the id has to be one the setter
  * was entitled to in the first place. */
@@ -3521,6 +3656,7 @@ int run_dbwriter_tests(void) {
     test_webhooks();
     test_invites_and_webhook_lifecycle();
     test_status_and_profile();
+    test_group_dm();
     test_avatar();
     test_notify_prefs();
     test_admin_ops();

@@ -544,6 +544,38 @@ static void test_notify_frames(void) {
         CHECK(oc_decode_list_notify_prefs(&p) == OC_OK);
     }
     {
+        /* REQ-056: a group DM's participant list, and the cap being a REFUSAL rather
+         * than a silent clamp — clamping would read the ids from whatever followed
+         * and open a conversation with the wrong people in it. */
+        oc_open_group_dm in; memset(&in, 0, sizeof in);
+        in.count = 3; in.user_ids[0] = 7; in.user_ids[1] = 9; in.user_ids[2] = 11;
+        ROUNDTRIP(oc_encode_open_group_dm(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_OPEN_GROUP_DM, h, p);
+        oc_open_group_dm out;
+        CHECK(oc_decode_open_group_dm(&p, &out) == OC_OK && out.count == 3);
+        CHECK(out.user_ids[0] == 7 && out.user_ids[1] == 9 && out.user_ids[2] == 11);
+    }
+    {
+        /* The same frame with its COUNT overwritten past the cap. Patched rather than
+         * hand-built because oc_frame_begin/end are internal to protocol.c — and the
+         * point is the decoder, not the encoder. */
+        oc_open_group_dm in; memset(&in, 0, sizeof in);
+        in.count = 1; in.user_ids[0] = 5;
+        oc_wbuf w2; oc_wbuf_init(&w2, frame, sizeof frame);
+        CHECK(oc_encode_open_group_dm(&w2, OC_PROTOCOL_VERSION, &in) == OC_OK);
+        oc_header h2; oc_rbuf p2;
+        CHECK(oc_parse_frame(frame, w2.len, &h2, &p2) == OC_OK);
+        /* The count is the first payload field; find it by decoding once, then move
+         * the read cursor back is not possible — so patch the buffer and re-parse. */
+        /* The payload starts after the 8-byte header (length 4, version 2, type 2);
+         * the count is its first field, big-endian. */
+        frame[8] = 0; frame[9] = 99;
+        oc_header h3; oc_rbuf p3;
+        CHECK(oc_parse_frame(frame, w2.len, &h3, &p3) == OC_OK);
+        oc_open_group_dm bad;
+        CHECK(oc_decode_open_group_dm(&p3, &bad) != OC_OK);
+    }
+    {
         oc_set_notify_default in = { OC_NOTIFY_NONE };            /* REQ-134 */
         ROUNDTRIP(oc_encode_set_notify_default(&w, OC_PROTOCOL_VERSION, &in),
                   OC_MSG_SET_NOTIFY_DEFAULT, h, p);

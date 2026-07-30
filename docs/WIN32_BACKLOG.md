@@ -80,6 +80,25 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 
 ### The items added 2026-07-30, in detail
 
+- ~~**WIN-54c — group DMs (REQ-056).**~~ **DONE.** A group DM is a **DM with more than
+  two participants**: the same `kind`, the same `dm_key` identity (the sorted
+  participant ids under a unique index), the same membership and read-access code. So
+  there is no migration and no second path that could disagree with the 1:1 case about
+  what a DM is. `OPEN_GROUP_DM` (0x0079) creates or **reuses** — the same set in any
+  order, opened by any participant, is the same conversation, which is the property
+  that stops a group you cannot get back to. The participants ride `CHANNEL_INFO` and
+  `CHANNEL_LIST` (a layout change, hence the protocol bump), so the sidebar titles it
+  by its people on first paint: a group whose name only arrives after you open it is a
+  row you cannot choose between.
+  The title is rendered ONCE in the core (`oc_model_dm_title`) and used by both the
+  sidebar and the header — two renderers would eventually disagree about who is in a
+  conversation. Yourself excluded, alphabetical, and it degrades to ", +N" rather than
+  truncating a name mid-word, because half a name reads as a different person. A group
+  row shows a **participant count** rather than one member's avatar and one member's
+  presence dot, both of which would be a claim about the wrong person.
+  A named-but-unknown user is an **error**, not a silent omission: a group opened with
+  the people it could resolve is not the group that was asked for.
+
 - ~~**WIN-47 — avatar images.**~~ **DONE** (REQ-240's last piece). An avatar is an
   ordinary attachment (REQ-140) claimed with a new `SET_AVATAR` (0x0078): the upload
   path, the size cap and the blob store all keep working, and `users.avatar_attachment_id`

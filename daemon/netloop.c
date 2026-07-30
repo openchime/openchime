@@ -1141,6 +1141,18 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_OPEN_GROUP_DM) {
+            oc_open_group_dm gd;
+            if (oc_decode_open_group_dm(&p, &gd) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_OPEN_GROUP_DM, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            j->n_group_uids = gd.count;
+            for (uint16_t i = 0; i < gd.count && i < OC_MAX_GROUP_DM; i++)
+                j->group_uids[i] = gd.user_ids[i];
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SET_AVATAR) {
             oc_set_avatar sa;
             if (oc_decode_set_avatar(&p, &sa) != OC_OK) return -1;
@@ -1853,16 +1865,32 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         break;
     }
     case OC_RES_CHANNEL_INFO: {
+        /* One filler for all three sends below. Designated, not positional: adding
+         * `n_peers`/`peers` for group DMs (REQ-056) to the middle of a positional
+         * initializer is how the notify-prefs frame silently sent its entry count as
+         * the new field earlier today. */
+        #define CHINFO(dst, peer, joined_flag) do {                                  \
+            memset(&(dst), 0, sizeof (dst));                                         \
+            (dst).channel_id = r->channel_id;                                        \
+            (dst).kind       = r->ch_kind;                                           \
+            (dst).name       = oc_slice_str(r->ch_name ? r->ch_name : "");           \
+            (dst).is_public  = r->ch_is_public;                                      \
+            (dst).joined     = (joined_flag);                                        \
+            (dst).created_at = r->ch_created_at;                                     \
+            (dst).peer_id    = (peer);                                               \
+            (dst).topic      = oc_slice_str(r->ch_topic ? r->ch_topic : "");         \
+            (dst).archived   = r->ch_archived;                                       \
+            (dst).n_peers    = r->n_ch_peers;                                        \
+            for (uint16_t pi = 0; pi < r->n_ch_peers; pi++)                          \
+                (dst).peers[pi] = r->ch_peers[pi];                                   \
+        } while (0)
         /* Ack the actor with the channel's state. For a DM, peer_id is the other
          * participant (from the actor's view). */
         conn *c = find_by_id(conns, r->conn_id);
         uint64_t actor = c ? c->user_id : 0;
         if (c) {
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
-            oc_channel_info ci = { r->channel_id, r->ch_kind,
-                                   oc_slice_str(r->ch_name ? r->ch_name : ""),
-                                   r->ch_is_public, r->ch_joined, r->ch_created_at, r->ch_peer,
-                                   oc_slice_str(r->ch_topic ? r->ch_topic : ""), r->ch_archived };
+            oc_channel_info ci; CHINFO(ci, r->ch_peer, r->ch_joined);
             oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci);
             send_bytes(ep, conns, c->fd, g_enc, w.len);
         }
@@ -1870,10 +1898,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
          * say, so its CHANNEL_INFO fans out rather than only acking the actor. */
         if (r->ch_fanout) {
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
-            oc_channel_info ci = { r->channel_id, r->ch_kind,
-                                   oc_slice_str(r->ch_name ? r->ch_name : ""),
-                                   r->ch_is_public, 1, r->ch_created_at, 0,
-                                   oc_slice_str(r->ch_topic ? r->ch_topic : ""), r->ch_archived };
+            oc_channel_info ci; CHINFO(ci, 0, 1);
             oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci);
             size_t len = w.len;
             for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
@@ -1889,10 +1914,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         if (r->push_user_id) {
             uint64_t push_peer = (r->ch_kind == OC_CHANNEL_KIND_DM) ? actor : 0;
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
-            oc_channel_info ci = { r->channel_id, r->ch_kind,
-                                   oc_slice_str(r->ch_name ? r->ch_name : ""),
-                                   r->ch_is_public, 1, r->ch_created_at, push_peer,
-                                   oc_slice_str(r->ch_topic ? r->ch_topic : ""), r->ch_archived };
+            oc_channel_info ci; CHINFO(ci, push_peer, 1);
             oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &ci);
             size_t len = w.len;
             for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
@@ -1944,6 +1966,9 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             ents[i].created_at = r->chlist[i].created_at;
             ents[i].preview = oc_slice_str(r->chlist[i].preview ? r->chlist[i].preview : "");
             ents[i].preview_author = r->chlist[i].preview_author;
+            ents[i].n_peers = r->chlist[i].n_peers;               /* REQ-056 */
+            for (uint16_t k = 0; k < r->chlist[i].n_peers; k++)
+                ents[i].peers[k] = r->chlist[i].peers[k];
         }
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_channel_list cl = { (uint16_t)n, ents };

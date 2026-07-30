@@ -139,7 +139,8 @@ typedef enum {
     /* REQ-134: the level for channels with no per-channel override. Rides the
      * NOTIFY_PREFS frame back, so a client learns it with the rest. */
     OC_MSG_SET_NOTIFY_DEFAULT = 0x0077,
-    OC_MSG_SET_AVATAR         = 0x0078, /* C->S, my avatar attachment id (WIN-47) */ /* C->S */
+    OC_MSG_SET_AVATAR         = 0x0078, /* C->S, my avatar attachment id (WIN-47) */
+    OC_MSG_OPEN_GROUP_DM      = 0x0079, /* C->S, open/create a group DM (REQ-056) */ /* C->S */
     OC_MSG_LIST_SESSIONS      = 0x0075, /* C->S */
     OC_MSG_SESSION_LIST       = 0x0076, /* S->C, never the tokens */
     OC_MSG_LIST_FILE_CHANNELS = 0x0073, /* C->S */
@@ -549,8 +550,17 @@ typedef struct { uint32_t count; uint64_t seen_at; } oc_activity;
  * `peer_id` used to be an "optional trailing" field written only for DMs; that
  * trick does not survive a SECOND optional field, so as of REQ-034/035/036 the
  * layout is fixed and peer_id is always written (0 when not a DM). */
+/* A group DM (REQ-056). The ids are the OTHER participants; the daemon adds the
+ * caller. Capped because a group DM with fifty people in it is a channel, and
+ * pretending otherwise gives you a conversation nobody can name or leave. */
+#define OC_MAX_GROUP_DM 8u
+
+/* `peers` carries a GROUP DM's participants (REQ-056), so a client can title the
+ * conversation on first paint instead of fetching a roster per group. Empty for a
+ * channel and for a 1:1 DM, whose single other participant is `peer_id`. */
 typedef struct { uint64_t channel_id; uint8_t kind; oc_slice name; uint8_t is_public; uint8_t joined; uint64_t created_at;
-                 uint64_t peer_id; oc_slice topic; uint8_t archived; } oc_channel_info;
+                 uint64_t peer_id; oc_slice topic; uint8_t archived;
+                 uint16_t n_peers; uint64_t peers[OC_MAX_GROUP_DM + 1]; } oc_channel_info;
 typedef struct { uint64_t channel_id; } oc_channel_ref;                       /* JOIN / LEAVE */
 typedef struct { uint64_t channel_id; uint64_t user_id; } oc_channel_member_op; /* INVITE / REMOVE */
 /* CHANNEL_LIST entry. `last_message_at`/`unread` were added 2026-07-27 so a
@@ -564,7 +574,8 @@ typedef struct { uint64_t channel_id; oc_slice name; uint8_t is_public; uint8_t 
                  oc_slice topic; uint8_t archived; uint64_t created_at;
                  /* The newest top-level message, for a scannable list: a client
                   * that caches nothing (ARCH-88) has no other way to show one. */
-                 oc_slice preview; uint64_t preview_author; } oc_channel_list_entry;
+                 oc_slice preview; uint64_t preview_author;
+                 uint16_t n_peers; uint64_t peers[OC_MAX_GROUP_DM + 1]; } oc_channel_list_entry;
 typedef struct { uint64_t user_id; } oc_open_dm;
 /* Incoming-webhook management (REQ-170). CREATE_WEBHOOK asks for a token scoped
  * to a channel; WEBHOOK_INFO returns the id + the raw 32-byte token (shown once,
@@ -587,6 +598,7 @@ typedef struct { oc_slice title; oc_slice timezone; } oc_set_profile;
  * upload (REQ-140) and this points at the result, so dedup, size caps and the blob
  * store all keep working. 0 clears the avatar. */
 typedef struct { uint64_t attachment_id; } oc_set_avatar;
+typedef struct { uint16_t count; uint64_t user_ids[OC_MAX_GROUP_DM]; } oc_open_group_dm;
 typedef struct { uint64_t user_id; oc_slice display_name; oc_slice email;
                  oc_slice status_emoji; oc_slice status_text; uint64_t status_expires;
                  oc_slice title; oc_slice timezone; uint64_t avatar_id;
@@ -830,8 +842,10 @@ oc_result oc_encode_set_webhook_state(oc_wbuf *w, uint16_t version, const oc_set
 oc_result oc_encode_rotate_webhook(oc_wbuf *w, uint16_t version, const oc_rotate_webhook *m);
 oc_result oc_encode_set_notify_default(oc_wbuf *w, uint16_t version, const oc_set_notify_default *m);
 oc_result oc_encode_set_avatar(oc_wbuf *w, uint16_t version, const oc_set_avatar *m);
+oc_result oc_encode_open_group_dm(oc_wbuf *w, uint16_t version, const oc_open_group_dm *m);
 oc_result oc_decode_set_notify_default(oc_rbuf *p, oc_set_notify_default *m);
 oc_result oc_decode_set_avatar(oc_rbuf *p, oc_set_avatar *m);
+oc_result oc_decode_open_group_dm(oc_rbuf *p, oc_open_group_dm *m);
 oc_result oc_encode_list_sessions(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_session_list(oc_wbuf *w, uint16_t version, const oc_session_list *m);
 oc_result oc_decode_session_list(oc_rbuf *p, oc_session_entry *entries, uint16_t cap,

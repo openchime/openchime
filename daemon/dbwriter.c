@@ -1593,6 +1593,25 @@ static int load_channel_info(sqlite3 *db, uint64_t channel_id, uint64_t actor, o
     }
     sqlite3_finalize(st);
     if (found) r->ch_joined = (uint8_t)(is_member(db, channel_id, actor) ? 1 : 0);
+    /* A DM with more than two participants is a GROUP DM (REQ-056) — the same
+     * `kind`, distinguished by its participant set, which is what a DM's identity
+     * has always been. Load them so the client can name it. */
+    r->n_ch_peers = 0;
+    if (found && r->ch_kind == OC_CHANNEL_KIND_DM) {
+        sqlite3_stmt *ps = NULL;
+        sqlite3_prepare_v2(db,
+            "SELECT user_id FROM channel_members WHERE channel_id=? "
+            "ORDER BY joined_at_ms, user_id LIMIT 9;", -1, &ps, NULL);
+        sqlite3_bind_int64(ps, 1, (sqlite3_int64)channel_id);
+        uint64_t tmp[9]; int tn = 0;
+        while (sqlite3_step(ps) == SQLITE_ROW && tn < 9)
+            tmp[tn++] = (uint64_t)sqlite3_column_int64(ps, 0);
+        sqlite3_finalize(ps);
+        if (tn > 2) {
+            for (int i = 0; i < tn; i++) r->ch_peers[i] = tmp[i];
+            r->n_ch_peers = (uint16_t)tn;
+        }
+    }
     return found;
 }
 
@@ -1806,9 +1825,31 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
         const unsigned char *pv = sqlite3_column_text(st, 11);
         arr[n].preview         = (pv && pv[0]) ? strdup((const char *)pv) : NULL;
         arr[n].preview_author  = (uint64_t)sqlite3_column_int64(st, 12);
+        arr[n].n_peers         = 0;
         n++;
     }
     sqlite3_finalize(st);
+
+    /* Group DMs (REQ-056): one pass over the participants of the DMs just listed.
+     * A correlated subquery per row would have to return N values, which SQL cannot
+     * do in one column — so this is a second, small query rather than a clever one. */
+    for (size_t i = 0; i < n; i++) {
+        if (arr[i].kind != OC_CHANNEL_KIND_DM) continue;
+        sqlite3_stmt *ps = NULL;
+        sqlite3_prepare_v2(db,
+            "SELECT user_id FROM channel_members WHERE channel_id=? "
+            "ORDER BY joined_at_ms, user_id LIMIT 9;", -1, &ps, NULL);
+        sqlite3_bind_int64(ps, 1, (sqlite3_int64)arr[i].channel_id);
+        uint64_t tmp[9]; int tn = 0;
+        while (sqlite3_step(ps) == SQLITE_ROW && tn < 9)
+            tmp[tn++] = (uint64_t)sqlite3_column_int64(ps, 0);
+        sqlite3_finalize(ps);
+        if (tn > 2) {
+            for (int k = 0; k < tn; k++) arr[i].peers[k] = tmp[k];
+            arr[i].n_peers = (uint16_t)tn;
+        }
+    }
+
     r->chlist = arr;
     r->n_chlist = n;
     return r;
@@ -1975,6 +2016,102 @@ static oc_dbres *process_open_dm(sqlite3 *db, const oc_job *j) {
     load_channel_info(db, cid, self, r);
     r->ch_peer = other;                      /* the DM's other participant (self for a self-DM) */
     r->push_user_id = self_dm ? 0 : other;   /* no peer to push a self-DM to */
+    return r;
+}
+
+/* A GROUP DM (REQ-056).
+ *
+ * Deliberately NOT a new `channels.kind`. A group DM is a DM with more than two
+ * participants, and the identity of a DM is already its participant set — the
+ * `dm_key` under a unique index (migration 0019). So the same key with three or
+ * more ids in it IS the group, which means: no migration, no second code path for
+ * membership or read access, and no way for a 1:1 and a group to disagree about
+ * what a DM is. The client tells them apart by the participant count, which it can
+ * see from the roster it already fetches.
+ *
+ * Reopening the same set returns the same conversation, exactly like OPEN_DM — a
+ * group DM you cannot get back to is a lost conversation. */
+static oc_dbres *process_open_group_dm(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+
+    /* The participant set: the caller plus the named others, deduplicated. Sorted,
+     * because the key must not depend on the order the client listed them in. */
+    uint64_t ids[OC_MAX_GROUP_DM + 1];
+    int n = 0;
+    ids[n++] = j->user_id;
+    for (uint16_t i = 0; i < j->n_group_uids && n <= (int)OC_MAX_GROUP_DM; i++) {
+        uint64_t u = j->group_uids[i];
+        if (!u) continue;
+        int dup = 0;
+        for (int k = 0; k < n; k++) if (ids[k] == u) dup = 1;
+        if (dup) continue;
+        uint8_t role = OC_ROLE_MEMBER;
+        /* An unknown or disabled user is refused without saying which — the same
+         * no-disclosure rule OPEN_DM follows. */
+        if (!user_role(db, u, &role)) {
+            r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_FORBIDDEN; return r;
+        }
+        ids[n++] = u;
+    }
+    /* Three is the floor: two participants is a 1:1 DM and must reuse that path, or
+     * the same pair would end up with two conversations. */
+    if (n < 3) { r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_MALFORMED_FRAME; return r; }
+    for (int a = 0; a < n; a++)
+        for (int b = a + 1; b < n; b++)
+            if (ids[b] < ids[a]) { uint64_t t = ids[a]; ids[a] = ids[b]; ids[b] = t; }
+
+    char key[24 * (OC_MAX_GROUP_DM + 1)];
+    size_t at = 0;
+    for (int i = 0; i < n; i++)
+        at += (size_t)snprintf(key + at, sizeof key - at, "%s%llu", i ? "," : "",
+                               (unsigned long long)ids[i]);
+
+    uint64_t cid = 0;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "SELECT id FROM channels WHERE kind='dm' AND dm_key=?1;", -1, &st, NULL);
+    sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) cid = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+
+    if (cid == 0) {
+        sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+        sqlite3_prepare_v2(db,
+            "INSERT INTO channels(kind,name,is_public,created_at_ms,dm_key) "
+            "VALUES('dm',NULL,0,?1,?2);", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)dbw_now_ms());
+        sqlite3_bind_text(st, 2, key, -1, SQLITE_TRANSIENT);
+        int rc = sqlite3_step(st);
+        sqlite3_finalize(st);
+        if (rc != SQLITE_DONE) {
+            sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+            r->type = OC_RES_CHANNEL_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+        }
+        cid = (uint64_t)sqlite3_last_insert_rowid(db);
+        for (int i = 0; i < n; i++) add_membership(db, cid, ids[i]);
+        sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    } else {
+        /* Re-assert membership, as OPEN_DM does: anything that removed a user must
+         * not leave a group conversation unreachable for them. */
+        for (int i = 0; i < n; i++) add_membership(db, cid, ids[i]);
+    }
+
+    r->type = OC_RES_CHANNEL_INFO;
+    load_channel_info(db, cid, j->user_id, r);
+    /* peer 0 marks it as a group rather than a 1:1 — there is no single other
+     * person to name, and the client titles it from the roster. */
+    r->ch_peer = 0;
+    /* Fan the new conversation out to the other participants through the members
+     * list the CHANNEL_INFO broadcast already uses, so it appears in their sidebar
+     * now rather than at their next refresh. push_user_id carries one user and a
+     * group has several. */
+    r->ch_fanout = 1;
+    r->members = malloc((size_t)n * sizeof *r->members);
+    if (r->members) {
+        r->n_members = 0;
+        for (int i = 0; i < n; i++) r->members[r->n_members++] = ids[i];
+    }
     return r;
 }
 
@@ -4325,6 +4462,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_INVITE_CHANNEL) return process_invite_channel(w->db, j);
     if (j->type == OC_JOB_REMOVE_CHANNEL) return process_remove_channel(w->db, j);
     if (j->type == OC_JOB_OPEN_DM)        return process_open_dm(w->db, j);
+    if (j->type == OC_JOB_OPEN_GROUP_DM) return process_open_group_dm(w->db, j);
     if (j->type == OC_JOB_INVITE_USER)    return process_invite_user(w->db, j);
     if (j->type == OC_JOB_REMOVE_USER)    return process_remove_user(w->db, j);
     if (j->type == OC_JOB_REDEEM)         return process_redeem(w, j);

@@ -1702,7 +1702,13 @@ static void select_channel(uint64_t cid) {
 
 /* A channel's display name into `out` ("# general" / "@ bob"). */
 static void channel_label(const oc_model *m, const oc_channel *c, char *out, size_t cap) {
-    if (c->kind == OC_CHANNEL_KIND_DM) {
+    if (c->kind == OC_CHANNEL_KIND_DM && c->n_peers > 2) {
+        /* A group DM (REQ-056). The people, from the core's one renderer, so the
+         * header and the sidebar cannot disagree about who is in it. */
+        char names[192];
+        oc_model_dm_title(m, c, names, sizeof names);
+        snprintf(out, cap, "\xF0\x9F\x91\xA5 %s", names);   /* busts */
+    } else if (c->kind == OC_CHANNEL_KIND_DM) {
         const char *pn = oc_model_user_name(m, c->peer_id);
         snprintf(out, cap, "@ %s", (pn && pn[0]) ? pn : "dm");
     } else {
@@ -2176,11 +2182,24 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                 /* A person gets an avatar and a presence dot, not an "@" glyph —
                  * the marker in Slack's DM list is the human, not the sigil. */
                 D2D1_RECT_F av = rf(sx0 + 12, ry + (ROW_H - 18) / 2, sx0 + 30, ry + (ROW_H + 18) / 2);
+                /* A GROUP DM (REQ-056) is several people, so it gets a group marker
+                 * rather than one participant's avatar and one participant's presence
+                 * dot — both of which would be a claim about the wrong person. */
+                if (rc && rc->n_peers > 2) {
+                    fill_round(rt, av, 5.0f, OC_COL_INPUT);
+                    stroke_round(rt, av, 5.0f, OC_COL_BORDER, 1.0f);
+                    char cnt[8];
+                    snprintf(cnt, sizeof cnt, "%u", (unsigned)(rc->n_peers - 1));
+                    IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_CENTER);
+                    draw_text(rt, cnt, g_micro, av, selected ? OC_COL_TEXT : OC_COL_MUTED);
+                    IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_CENTER);
+                } else {
                 uint32_t tint = AVPAL[r->peer_id % (sizeof AVPAL / sizeof AVPAL[0])];
                 draw_user_avatar(rt, m, r->peer_id, r->label, av, tint, g_meta, 1, 5.0f);
                 draw_presence_dot(rt, av.right - 1, av.bottom - 1, 3.5f,
                                   oc_model_presence_of(m, r->peer_id),
                                   selected ? OC_COL_SELECT : OC_COL_SIDEBAR);
+                }
             } else {
                 const char *mark = r->is_private ? "\xF0\x9F\x94\x92" : "#";
                 draw_text(rt, mark, g_ui, rf(sx0 + 12, ry, sx0 + 34, ry + ROW_H),
@@ -9811,6 +9830,7 @@ static void open_new_menu(HWND hwnd) {
     g_n_mi = 0;
     mi_item(1, "New channel\xE2\x80\xA6");
     mi_item(6, "New direct message\xE2\x80\xA6");
+    mi_item(83, "New group message\xE2\x80\xA6");   /* REQ-056 */
     mi_item(7, "Upload a file\xE2\x80\xA6");
     mi_sep();
     mi_item(4, "Search messages\xE2\x80\xA6");
@@ -10223,6 +10243,35 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     /* Adding a workspace must not sign you out of the one you are in — which is
      * exactly what reset_session() here used to do. Park the current one and
      * sign in alongside it. */
+    case 83: {   /* REQ-056: a group DM */
+        oc_field f[1] = { { FF_TEXT, "People",
+                            "Two to eight usernames, comma separated.", "" } };
+        if (!m || !form_dialog(hwnd, "New group message", f, 1) || !f[0].value[0]) break;
+        uint64_t ids[8]; int n = 0;
+        char buf[256]; snprintf(buf, sizeof buf, "%s", f[0].value);
+        for (char *tok = strtok(buf, ","); tok && n < 8; tok = strtok(NULL, ",")) {
+            while (*tok == ' ') tok++;
+            size_t L = strlen(tok);
+            while (L && (tok[L - 1] == ' ' || tok[L - 1] == '@')) tok[--L] = '\0';
+            if (tok[0] == '@') tok++;
+            if (!tok[0]) continue;
+            uint64_t uid = oc_model_user_id(m, tok);
+            /* Named and unknown is an error, not a silent omission: a group opened
+             * with the people it could resolve is not the group that was asked for. */
+            if (!uid) {
+                char msg[128];
+                snprintf(msg, sizeof msg, "No such user: %s", tok);
+                toast_push(msg, 1);
+                n = -1; break;
+            }
+            if (uid == m->user_id) continue;      /* you are always in it */
+            ids[n++] = uid;
+        }
+        if (n < 0) break;
+        if (n < 2) { toast_push("A group message needs at least two other people.", 1); break; }
+        g_view = VIEW_HOME;
+        oc_client_open_group_dm(g_client, ids, n);
+        break; }
     case 82: {   /* WIN-83 — 82 because 10 and 11 are the presence items */
         if (g_sb.n_custom >= (int)OC_SB_CUSTOM_MAX) {
             toast_push("You already have 8 sections.", 1);
@@ -10725,7 +10774,12 @@ static void test_poll(HWND hwnd) {
         if (g_re) { WCHAR w[1024]; to_w(arg, w, 1024); SetWindowTextW(g_re, w); composer_send(); }
         test_ack("ok");
     } else if (!strcmp(verb, "channel")) {
-        if (m) for (size_t k = 0; k < m->n_channels; k++)
+        /* By NAME, or by id when the argument is a number — a DM has no name at all
+         * and a group DM (REQ-056) has none either, so "select that conversation" was
+         * undrivable for exactly the conversations whose titles are computed. */
+        uint64_t byid = (arg[0] >= '1' && arg[0] <= '9') ? strtoull(arg, NULL, 10) : 0;
+        if (byid && m && oc_model_channel((oc_model *)m, byid)) select_channel(byid);
+        else if (m) for (size_t k = 0; k < m->n_channels; k++)
             if (m->channels[k].name && !strcmp(m->channels[k].name, arg)) {
                 select_channel(m->channels[k].channel_id); break;
             }
@@ -10913,6 +10967,19 @@ static void test_poll(HWND hwnd) {
             snprintf(g_form_last, sizeof g_form_last, "%s text=\"%s\" check=%s choice=%s",
                      okp ? "ok" : "cancel", f[0].value, f[1].value, f[2].value);
         }
+    } else if (!strcmp(verb, "groupdm")) {
+        /* REQ-056. `groupdm <name>,<name>[,...]` — the menu item opens a form the
+         * harness would have to type into and dismiss; this is the call underneath. */
+        const oc_model *gm = model();
+        uint64_t ids[8]; int n = 0;
+        char buf[256]; snprintf(buf, sizeof buf, "%s", arg);
+        for (char *tok = strtok(buf, ","); tok && gm && n < 8; tok = strtok(NULL, ",")) {
+            while (*tok == ' ') tok++;
+            uint64_t uid = oc_model_user_id(gm, tok);
+            if (uid && uid != gm->user_id) ids[n++] = uid;
+        }
+        if (n < 2) test_ack("err");
+        else { oc_client_open_group_dm(g_client, ids, n); test_ack("ok"); }
     } else if (!strcmp(verb, "avatar")) {
         /* WIN-47. `avatar <windows path>` uploads and claims it; `avatar 0` clears.
          * The menu item opens an OS file dialog, which a harness cannot drive at all,

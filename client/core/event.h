@@ -128,6 +128,10 @@ typedef struct {
     uint64_t created_at;   /* CHANNEL (from CHANNEL_INFO): when it was created */
     char    *preview;      /* heap; CHANNEL: newest message text (REQ-050 sidebar) */
     uint64_t preview_author;
+    /* CHANNEL: a GROUP DM's participants (REQ-056). Empty for everything else; the
+     * single peer of a 1:1 DM stays in `user_id`. */
+    uint64_t peers[9];
+    uint16_t n_peers;
     uint64_t size;         /* FILE: byte size (REQ-143) */
     uint64_t attach_id;    /* FILE: the attachment's own id */
     uint8_t  reclaimed;    /* FILE: bytes reclaimed; the row is a tombstone */
@@ -202,6 +206,7 @@ enum {
     OC_CMD_LIST_SESSIONS,        /* REQ-182 */
     OC_CMD_SET_NOTIFY_DEFAULT,   /* REQ-134: op = level */
     OC_CMD_SET_AVATAR,           /* WIN-47: message_id = attachment id, 0 clears */
+    OC_CMD_OPEN_GROUP_DM,        /* REQ-056: gids[0..n_gids) */
     OC_CMD_UPLOAD,          /* upload+post a file to `channel_id`: body = local path */
     OC_CMD_DOWNLOAD,        /* download an attachment: message_id = attachment_id, body = dest path */
     OC_CMD_LOGOUT,          /* revoke this session (op = scope) and close the connection */
@@ -220,6 +225,10 @@ typedef struct {
     uint8_t  op;           /* REACT: add/remove */
     char    *body;         /* heap; SEND body / REACT emoji / SET_SETTING key */
     char    *body2;        /* heap; SET_SETTING value, else NULL */
+    /* OPEN_GROUP_DM (REQ-056): the other participants. Inline, because the wire
+     * caps the count and a fixed array needs no ownership rules. */
+    uint64_t gids[8];
+    int      n_gids;
 } oc_cmd;
 
 oc_cmd *oc_cmd_new(int type);

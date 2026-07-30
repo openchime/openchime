@@ -85,6 +85,12 @@ typedef struct {
     uint8_t  kind;             /* OC_CHANNEL_KIND / _DM */
     uint8_t  is_public;        /* 1 public, 0 private/DM (REQ-031) */
     uint64_t peer_id;          /* DM: the other participant (for the title) */
+    /* GROUP DM (REQ-056): every participant, including you. n_peers is 0 for a
+     * channel and for a 1:1 DM — a DM IS a group when it has more than two people
+     * in it, which is what a DM's identity has always been on the server. Carried on
+     * the channel so the sidebar can title it on first paint. */
+    uint64_t peers[9];
+    uint16_t n_peers;
     uint8_t  notify_level;     /* OC_NOTIFY_ALL/_MENTIONS/_NONE (REQ-130) */
     /* Muted (REQ-137, WIN-40) — NOT the same as level=NONE. Level decides whether
      * the daemon notifies; muted also de-emphasises the row and suppresses its
@@ -446,6 +452,12 @@ typedef struct {
     int      unread;
     int      section_total;  /* header rows: how many children (before collapse) */
 } oc_sidebar_row;
+
+/* Render a DM's title — the peer's name for a 1:1, the participants for a group
+ * (REQ-056). Exposed because a frontend needs the same string in its header as the
+ * sidebar shows, and two renderers would eventually disagree about who is in a
+ * conversation. */
+void oc_model_dm_title(const oc_model *m, const oc_channel *c, char *out, size_t cap);
 
 /* Build the sidebar. Returns the row count written to `out` (capped by `cap`).
  * Headers are emitted even when a section is empty or collapsed, so the user can

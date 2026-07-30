@@ -102,7 +102,8 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_LIST_FILE_CHANNELS = 73,   /* WIN-82 */
        OC_JOB_LIST_SESSIONS = 74,        /* REQ-182 */
        OC_JOB_SET_NOTIFY_DEFAULT = 75,   /* REQ-134 */
-       OC_JOB_SET_AVATAR = 76 };         /* WIN-47 */
+       OC_JOB_SET_AVATAR = 76,           /* WIN-47 */
+       OC_JOB_OPEN_GROUP_DM = 77 };      /* REQ-056 */
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -128,6 +129,11 @@ typedef struct oc_job {
     /* SET_ROLE (change a user's tenant role; ARCH-60). Actor is `user_id`.
      * Also carries the target for channel INVITE/REMOVE. */
     uint64_t       target_user_id;
+    /* OPEN_GROUP_DM (REQ-056): the other participants. A small fixed array rather
+     * than a heap list — the wire caps it at OC_MAX_GROUP_DM, so there is nothing
+     * to allocate and nothing to free. */
+    uint64_t       group_uids[8];
+    uint16_t       n_group_uids;
 
     /* CREATE_CHANNEL */
     char          *ch_name;    /* heap */
@@ -341,6 +347,11 @@ typedef struct {
     uint64_t last_message_at;
     uint32_t unread;
     uint64_t peer_id;    /* DM: the other participant, so a client can name it */
+    /* GROUP DM (REQ-056): every participant. Empty unless this is a DM with more
+     * than two, so the sidebar can title it on FIRST paint — a group whose name
+     * arrives only after you open it is a row you cannot choose between. */
+    uint64_t peers[9];
+    uint16_t n_peers;
     char    *preview;       /* heap; newest top-level body, truncated */
     uint64_t preview_author;
 } oc_channel_row;
@@ -490,6 +501,11 @@ typedef struct oc_dbres {
      * actor: a rename or archive changes what everyone's sidebar should say. */
     uint8_t        ch_fanout;
     uint64_t       ch_peer;         /* DM (ch_kind=1): the other participant's id (0 = not a DM) */
+    /* GROUP DM (REQ-056): every participant, including the actor. Empty for a
+     * channel and for a 1:1 DM, whose other participant is ch_peer. Carried so a
+     * client can title the conversation without a roster fetch per group. */
+    uint64_t       ch_peers[9];
+    uint16_t       n_ch_peers;
     uint64_t       push_user_id;    /* INVITE: also push CHANNEL_INFO to this user (0 = none) */
 
     /* CHANNEL_LIST */

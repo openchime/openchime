@@ -708,6 +708,10 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             c->kind = e->op;                     /* channel vs DM */
             c->is_public = e->is_public;         /* public vs private (REQ-031) */
             if (e->user_id) c->peer_id = e->user_id;   /* DM peer (CHANNEL_INFO only) */
+            /* A group DM's participants (REQ-056). Assigned, not merged: the server's
+             * set is the truth, and a group can lose a member. */
+            c->n_peers = e->n_peers > 9 ? 9 : e->n_peers;
+            for (uint16_t k = 0; k < c->n_peers; k++) c->peers[k] = e->peers[k];
             if (e->server_time) c->last_message_at = e->server_time;
             if (e->count) {
                 c->srv_unread = e->count;
@@ -1338,6 +1342,35 @@ void oc_sidebar_opts_parse(oc_sidebar_opts *o, const char *s) {
  * titled by its peer — which is exactly why the old Win32 sidebar, which skipped
  * unnamed channels, showed no DMs at all. */
 static void sb_label(const oc_model *m, const oc_channel *c, char *out, size_t cap) {
+    /* A GROUP DM is titled by its people (REQ-056), the way Slack does it: names
+     * rather than a made-up name, because nobody named it. Yourself excluded — you
+     * know you are in it, and including you costs the width that would have shown
+     * one more person. Alphabetical, so the same group reads the same way in every
+     * client and does not reshuffle when somebody posts. */
+    if (c->kind == OC_CHANNEL_KIND_DM && c->n_peers > 2) {
+        const char *names[9]; int nn = 0;
+        for (uint16_t i = 0; i < c->n_peers && nn < 9; i++) {
+            if (c->peers[i] == m->user_id) continue;
+            const char *nm = oc_model_user_name(m, c->peers[i]);
+            names[nn++] = (nm && nm[0]) ? nm : "someone";
+        }
+        for (int a = 0; a < nn; a++)
+            for (int b = a + 1; b < nn; b++)
+                if (strcmp(names[b], names[a]) < 0) { const char *t = names[a]; names[a] = names[b]; names[b] = t; }
+        size_t at = 0;
+        int shown = 0;
+        for (int i = 0; i < nn; i++) {
+            size_t need = strlen(names[i]) + (at ? 2 : 0);
+            /* Leave room for ", +N" rather than truncating a name mid-word: a
+             * half-written name reads as a different person. */
+            if (at && at + need + 6 >= cap) break;
+            at += (size_t)snprintf(out + at, cap - at, "%s%s", at ? ", " : "", names[i]);
+            shown++;
+        }
+        if (shown < nn && at + 8 < cap) snprintf(out + at, cap - at, ", +%d", nn - shown);
+        if (!at) snprintf(out, cap, "group message");
+        return;
+    }
     if (c->kind == OC_CHANNEL_KIND_DM) {
         /* Always the account name, never "you": a self-DM's peer_id IS the user's
          * own id, so the ordinary lookup already yields the right name and the
@@ -1506,6 +1539,11 @@ int oc_sidebar_assign(oc_sidebar_opts *o, uint64_t channel_id, int idx) {
     if (o->custom[idx].n_ids >= OC_SB_CUSTOM_IDS) return changed;   /* full: refuse */
     o->custom[idx].ids[o->custom[idx].n_ids++] = channel_id;
     return 1;
+}
+
+void oc_model_dm_title(const oc_model *m, const oc_channel *c, char *out, size_t cap) {
+    if (!m || !c || !out || !cap) return;
+    sb_label(m, c, out, cap);
 }
 
 size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,

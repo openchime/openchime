@@ -649,6 +649,13 @@ oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_
     oc_w_u64(w, m->peer_id);      /* 0 when not a DM; no longer optional (ARCH-93) */
     oc_w_str(w, m->topic);
     oc_w_u8(w, m->archived);
+    /* A group DM's participants (REQ-056). Zero for everything else, so the field
+     * costs two bytes on frames that do not need it. */
+    {
+        uint16_t np = m->n_peers > OC_MAX_GROUP_DM + 1 ? (uint16_t)(OC_MAX_GROUP_DM + 1) : m->n_peers;
+        oc_w_u16(w, np);
+        for (uint16_t i = 0; i < np; i++) oc_w_u64(w, m->peers[i]);
+    }
     return oc_frame_end(w, off);
 }
 
@@ -679,6 +686,12 @@ oc_result oc_encode_channel_list(oc_wbuf *w, uint16_t version, const oc_channel_
         oc_w_u64(w, m->entries[i].created_at);
         oc_w_str(w, m->entries[i].preview);
         oc_w_u64(w, m->entries[i].preview_author);
+        {
+            uint16_t np = m->entries[i].n_peers > OC_MAX_GROUP_DM + 1
+                        ? (uint16_t)(OC_MAX_GROUP_DM + 1) : m->entries[i].n_peers;
+            oc_w_u16(w, np);
+            for (uint16_t k = 0; k < np; k++) oc_w_u64(w, m->entries[i].peers[k]);
+        }
     }
     return oc_frame_end(w, off);
 }
@@ -1725,6 +1738,9 @@ oc_result oc_decode_channel_info(oc_rbuf *p, oc_channel_info *m) {
     m->peer_id  = oc_r_u64(p);
     m->topic    = oc_r_str(p);
     m->archived = oc_r_u8(p);
+    m->n_peers  = oc_r_u16(p);
+    if (m->n_peers > OC_MAX_GROUP_DM + 1) return OC_E_MALFORMED;
+    for (uint16_t i = 0; i < m->n_peers; i++) m->peers[i] = oc_r_u64(p);
     return r_done(p);
 }
 
@@ -1750,7 +1766,13 @@ oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries,
         uint64_t created = oc_r_u64(p);
         oc_slice prev = oc_r_str(p);
         uint64_t prev_a = oc_r_u64(p);
+        uint16_t np = oc_r_u16(p);
+        if (np > OC_MAX_GROUP_DM + 1) return OC_E_MALFORMED;
+        uint64_t peers[OC_MAX_GROUP_DM + 1];
+        for (uint16_t k = 0; k < np; k++) peers[k] = oc_r_u64(p);
         if (i < cap) {
+            entries[i].n_peers = np;
+            for (uint16_t k = 0; k < np; k++) entries[i].peers[k] = peers[k];
             entries[i].channel_id = id;
             entries[i].name = name;
             entries[i].is_public = is_public;
@@ -2364,5 +2386,25 @@ oc_result oc_encode_set_avatar(oc_wbuf *w, uint16_t version, const oc_set_avatar
 
 oc_result oc_decode_set_avatar(oc_rbuf *p, oc_set_avatar *m) {
     m->attachment_id = oc_r_u64(p);
+    return r_done(p);
+}
+
+/* A group DM (REQ-056). */
+oc_result oc_encode_open_group_dm(oc_wbuf *w, uint16_t version, const oc_open_group_dm *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_OPEN_GROUP_DM);
+    uint16_t n = m->count > OC_MAX_GROUP_DM ? (uint16_t)OC_MAX_GROUP_DM : m->count;
+    oc_w_u16(w, n);
+    for (uint16_t i = 0; i < n; i++) oc_w_u64(w, m->user_ids[i]);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_open_group_dm(oc_rbuf *p, oc_open_group_dm *m) {
+    memset(m, 0, sizeof *m);
+    uint16_t n = oc_r_u16(p);
+    /* A count beyond the cap is not clamped silently: the ids would be read as
+     * whatever followed, and a wrong participant set is worse than a refusal. */
+    if (n > OC_MAX_GROUP_DM) return OC_E_MALFORMED;
+    m->count = n;
+    for (uint16_t i = 0; i < n; i++) m->user_ids[i] = oc_r_u64(p);
     return r_done(p);
 }

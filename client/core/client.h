@@ -231,6 +231,11 @@ void oc_client_set_notify_default(oc_client *c, uint8_t level);
  * workspace-wide (WIN-47). */
 void oc_client_set_avatar(oc_client *c, uint64_t attachment_id);
 void oc_client_upload_avatar(oc_client *c, uint64_t channel_id, const char *path);
+
+/* Open (or reopen) a GROUP DM with `n` other people (REQ-056). Reopening the same
+ * set returns the same conversation. n must be >= 2 — two participants in total is a
+ * 1:1 DM and belongs to oc_client_open_dm. */
+void oc_client_open_group_dm(oc_client *c, const uint64_t *user_ids, int n);
 /* Custom status (REQ-241/122) and profile fields (REQ-240). Empty status text clears
  * it; expiry 0 means "until changed", and the DAEMON enforces the lapse. */
 void oc_client_list_file_channels(oc_client *c);   /* WIN-82 */

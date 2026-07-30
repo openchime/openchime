@@ -213,6 +213,36 @@ click_pref 1 "$before"; sleep 0.3
 "$DRIVE" key enter >/dev/null 2>&1; sleep 0.5
 expect "$(snap)" time24 "$before" "the run left the setting as it found it"
 
+# --- group DMs (REQ-056) ----------------------------------------------------
+# A group DM is a DM with more than two participants, so the claims worth asserting
+# are that it appears ONCE with a computed title, and that reopening the same set
+# returns the same conversation rather than a second one.
+say "== group DMs"
+"$DRIVE" view 0 >/dev/null 2>&1; sleep 0.4
+"$DRIVE" groupdm bob,carol >/dev/null 2>&1; sleep 1.5
+d=$(snap)
+checks=$((checks + 1))
+gid=$(printf '%s' "$d" | grep -oE '^  sbrow sec=1 header=0 cid=[0-9]+ label="bob, carol"' | grep -oE 'cid=[0-9]+' | cut -d= -f2 | head -1)
+if [ -n "${gid:-}" ]; then ok "the group appears titled by its people (cid=$gid)"
+else fail "no sidebar row labelled \"bob, carol\""; fi
+checks=$((checks + 1))
+n=$(printf '%s' "$d" | grep -cE 'sbrow .*label="bob, carol"' || true)
+if [ "$n" = "1" ]; then ok "and exactly once"
+else fail "the group appears $n times"; fi
+
+# Reopening the same set must not make a second conversation.
+"$DRIVE" groupdm carol,bob >/dev/null 2>&1; sleep 1.2
+checks=$((checks + 1))
+n=$(snap | grep -cE 'sbrow .*label="bob, carol"' || true)
+if [ "$n" = "1" ]; then ok "reopening the same set reuses it"
+else fail "reopening produced $n rows"; fi
+
+# The header names the group, and a DM's tab strip has no About tab.
+if [ -n "${gid:-}" ]; then
+  "$DRIVE" channel "$gid" >/dev/null 2>&1; sleep 0.8
+  expect "$(snap)" sel "$gid" "selecting it works by id"
+fi
+
 # --- avatars (WIN-47) -------------------------------------------------------
 # Two things are asserted, because the second was invisible for an hour: that the
 # avatar is set, AND that a screenshot can see an image at all. Every capture used
