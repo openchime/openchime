@@ -2927,34 +2927,121 @@ static void nav_conversation(HWND hwnd, int delta, int unread_only) {
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
-/* WIN-25: the shortcut sheet, generated from one table so it cannot drift from
- * what the key handlers actually do. */
-static const struct { const char *keys, *what; } KEYMAP[] = {
-    { "Enter",              "Send the message" },
-    { "Shift+Enter",        "New line" },
-    { "Esc",                "Close the open pane, popover or picker" },
-    { "Tab",                "Insert the highlighted completion" },
-    { "Up / Down",          "Move through completions" },
-    { "Alt+Up / Alt+Down",  "Previous / next conversation" },
-    { "Alt+Shift+Up / Down","Previous / next UNREAD conversation" },
-    { "Ctrl+K",             "Command palette" },
-    { "Ctrl+F",             "Search messages" },
-    { "Ctrl+/",             "This list" },
-    { "F6",                 "Move focus between the composer and the filter box" },
-    { "Mouse wheel",        "Scroll the transcript, sidebar or open pane" },
-    { "Right-click",        "Actions for a message, member or channel" },
+/* ---- shortcuts: one table, dispatched from the message loop ----------------
+ *
+ * Named SHORTCUTS, not ACCEL: windows.h already defines an ACCEL struct for
+ * accelerator tables.
+ *
+ * This table drives BOTH the sheet (Ctrl+/) and the keys themselves, which the
+ * previous version only claimed: the sheet was a display list, while the handlers
+ * lived in three separate window procs — and so the sheet advertised chords that
+ * did not work.
+ *
+ * They did not work because they were handled in the MAIN window's WM_KEYDOWN,
+ * and the main window almost never has focus: the composer does. A native child
+ * consumes what it does not recognise, so Ctrl+K, Ctrl+F and Ctrl+/ were dead
+ * whenever the cursor was in the message box — which is to say, always. The find
+ * box, search box, palette box, picker and sign-in fields were the same black
+ * hole, each having had to re-implement any chord it wanted to let through.
+ *
+ * So dispatch happens in the message loop, before the message reaches any window.
+ * Focus stops being part of the question. Rows with ACC_NONE are documentation for
+ * behaviour that is inherently focus-specific — Enter sends only in the composer,
+ * Esc means something different in each surface — and those stay in their procs.
+ */
+enum { ACC_NONE = 0, ACC_PALETTE, ACC_SEARCH, ACC_KEYS,
+       ACC_NAV_PREV, ACC_NAV_NEXT, ACC_NAV_PREV_UNREAD, ACC_NAV_NEXT_UNREAD,
+       ACC_FOCUS };
+#define AM_CTRL  1u
+#define AM_ALT   2u
+#define AM_SHIFT 4u
+
+static const struct {
+    uint8_t  mods;        /* AM_* mask; 0 = no modifier */
+    uint16_t vk;          /* 0 for a documentation-only row */
+    uint8_t  action;      /* ACC_* ; ACC_NONE = documentation only */
+    const char *keys, *what;
+} SHORTCUTS[] = {
+    { 0,                  0,          ACC_NONE,  "Enter",              "Send the message" },
+    { 0,                  0,          ACC_NONE,  "Shift+Enter",        "New line" },
+    { 0,                  0,          ACC_NONE,  "Esc",                "Close the open pane, popover or picker" },
+    { 0,                  0,          ACC_NONE,  "Tab",                "Insert the highlighted completion" },
+    { 0,                  0,          ACC_NONE,  "Up / Down",          "Move through completions" },
+    { AM_ALT,             VK_UP,      ACC_NAV_PREV,        "Alt+Up / Alt+Down",   "Previous / next conversation" },
+    { AM_ALT,             VK_DOWN,    ACC_NAV_NEXT,        NULL, NULL },
+    { AM_ALT | AM_SHIFT,  VK_UP,      ACC_NAV_PREV_UNREAD, "Alt+Shift+Up / Down", "Previous / next UNREAD conversation" },
+    { AM_ALT | AM_SHIFT,  VK_DOWN,    ACC_NAV_NEXT_UNREAD, NULL, NULL },
+    { AM_CTRL,            'K',        ACC_PALETTE, "Ctrl+K",           "Command palette" },
+    { AM_CTRL,            'F',        ACC_SEARCH,  "Ctrl+F",           "Search messages" },
+    { AM_CTRL,            VK_OEM_2,   ACC_KEYS,    "Ctrl+/",           "This list" },
+    { 0,                  VK_F6,      ACC_FOCUS,   "F6",               "Move focus between the composer and the filter box" },
+    { 0,                  0,          ACC_NONE,  "Mouse wheel",        "Scroll the transcript, sidebar or open pane" },
+    { 0,                  0,          ACC_NONE,  "Right-click",        "Actions for a message, member or channel" },
 };
+
+static void search_open(HWND hwnd);            /* fwd */
+static void palette_open(HWND hwnd);           /* fwd */
+static void modal_enter(HWND hwnd, int *flag); /* fwd */
+static void modal_finish(int save);            /* fwd */
+static int  modal_open(void);                  /* fwd */
+
+static void accel_run(HWND hwnd, int action) {
+    switch (action) {
+    case ACC_PALETTE: palette_open(hwnd); break;
+    case ACC_SEARCH:  search_open(hwnd);  break;
+    case ACC_KEYS:    if (g_keys_open) modal_finish(0); else modal_enter(hwnd, &g_keys_open); break;
+    case ACC_NAV_PREV:        nav_conversation(hwnd, -1, 0); break;
+    case ACC_NAV_NEXT:        nav_conversation(hwnd,  1, 0); break;
+    case ACC_NAV_PREV_UNREAD: nav_conversation(hwnd, -1, 1); break;
+    case ACC_NAV_NEXT_UNREAD: nav_conversation(hwnd,  1, 1); break;
+    case ACC_FOCUS: {
+        /* One toggle rather than an F6 handler in each control, which is how the
+         * two ends drifted: the composer sent focus to the filter box even in the
+         * views that have no filter box. */
+        HWND f = GetFocus();
+        if (f == g_re && g_find && IsWindowVisible(g_find)) SetFocus(g_find);
+        else if (g_re) SetFocus(g_re);
+        break; }
+    default: break;
+    }
+}
+
+/* Called from the message loop for every keystroke. Returns 1 when it claimed
+ * the key, so it is neither translated nor dispatched. */
+static int accel_dispatch(HWND hwnd, const MSG *m) {
+    if (m->message != WM_KEYDOWN && m->message != WM_SYSKEYDOWN) return 0;
+    /* A modal owns the window: shortcuts that open other surfaces behind it would
+     * leave two things claiming the screen. Esc and Enter reach it through
+     * modal_key in the window proc. */
+    if (modal_open()) return 0;
+    unsigned mods = 0;
+    if (GetKeyState(VK_CONTROL) & 0x8000) mods |= AM_CTRL;
+    if (GetKeyState(VK_MENU)    & 0x8000) mods |= AM_ALT;
+    if (GetKeyState(VK_SHIFT)   & 0x8000) mods |= AM_SHIFT;
+    for (size_t i = 0; i < sizeof SHORTCUTS / sizeof SHORTCUTS[0]; i++) {
+        if (SHORTCUTS[i].action == ACC_NONE || !SHORTCUTS[i].vk) continue;
+        if (SHORTCUTS[i].vk != (uint16_t)m->wParam) continue;
+        if (SHORTCUTS[i].mods != mods) continue;
+        accel_run(hwnd, SHORTCUTS[i].action);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 1;
+    }
+    return 0;
+}
 
 static void draw_keys(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
     D2D1_RECT_F body = reg;   /* the frame drew the title bar (modal_frame) */
     ovl_use(OVL_KEYS);
-    int n = (int)(sizeof KEYMAP / sizeof KEYMAP[0]);
+    int n = (int)(sizeof SHORTCUTS / sizeof SHORTCUTS[0]);
+    int shown = 0;
+    for (int i = 0; i < n; i++) if (SHORTCUTS[i].keys) shown++;
     float rowh = 32;
-    float y = ovl_begin(rt, body, (float)n * rowh + 12);
+    float y = ovl_begin(rt, body, (float)shown * rowh + 12);
     for (int i = 0; i < n; i++) {
+        if (!SHORTCUTS[i].keys) continue;        /* the paired row, described above */
         if (y > body.bottom) break;
-        draw_text(rt, KEYMAP[i].keys, g_ui_b, rf(body.left + 24, y, body.left + 200, y + rowh), OC_COL_TEXT);
-        draw_text(rt, KEYMAP[i].what, g_ui, rf(body.left + 210, y, body.right - 24, y + rowh), OC_COL_MUTED);
+        draw_text(rt, SHORTCUTS[i].keys, g_ui_b, rf(body.left + 24, y, body.left + 200, y + rowh), OC_COL_TEXT);
+        draw_text(rt, SHORTCUTS[i].what, g_ui, rf(body.left + 210, y, body.right - 24, y + rowh), OC_COL_MUTED);
         y += rowh;
     }
     ovl_end(rt, body);
@@ -5849,16 +5936,6 @@ static LRESULT CALLBACK re_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     /* Conversation movement while typing: the composer holds focus almost
      * always, so these have to work from here or they do not work at all. */
-    if (msg == WM_KEYDOWN && (GetKeyState(VK_MENU) & 0x8000) &&
-        (wp == VK_UP || wp == VK_DOWN)) {
-        nav_conversation(GetParent(hwnd), wp == VK_DOWN ? 1 : -1,
-                         (GetKeyState(VK_SHIFT) & 0x8000) != 0);
-        return 0;
-    }
-    if (msg == WM_KEYDOWN && wp == VK_F6) {
-        SetFocus(g_find ? g_find : hwnd);
-        return 0;
-    }
     if ((msg == WM_KEYDOWN || msg == WM_CHAR) && wp == VK_RETURN
         && !(GetKeyState(VK_SHIFT) & 0x8000)) {
         if (msg == WM_KEYDOWN) composer_send();
@@ -5998,17 +6075,14 @@ static void nav_conversation(HWND hwnd, int delta, int unread_only);   /* fwd */
 /* F6 has to work in both directions, or moving focus to the filter box strands
  * the keyboard there. Esc returns as well, since that is the reflex. */
 static LRESULT CALLBACK find_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_KEYDOWN && (wp == VK_F6 || wp == VK_ESCAPE)) {
+    /* Esc only. F6 and Alt+arrows are message-loop shortcuts now (SHORTCUTS) —
+     * this proc used to carry its own copies, which is how the two ends of F6
+     * drifted apart. */
+    if (msg == WM_KEYDOWN && wp == VK_ESCAPE) {
         SetFocus(g_re ? g_re : GetParent(hwnd));
         return 0;
     }
     if (msg == WM_CHAR && wp == VK_ESCAPE) return 0;    /* no MessageBeep */
-    if (msg == WM_KEYDOWN && (GetKeyState(VK_MENU) & 0x8000) &&
-        (wp == VK_UP || wp == VK_DOWN)) {
-        nav_conversation(GetParent(hwnd), wp == VK_DOWN ? 1 : -1,
-                         (GetKeyState(VK_SHIFT) & 0x8000) != 0);
-        return 0;
-    }
     return CallWindowProcW(g_find_oldproc, hwnd, msg, wp, lp);
 }
 
@@ -8813,10 +8887,48 @@ static void test_poll(HWND hwnd) {
          * behaviour is drivable at all — without this, every keyboard rule in the
          * app was verifiable only by hand. Names for the ones used most, so a test
          * reads `key esc` rather than `key 27`. */
-        int vk = !strcmp(arg, "esc")   ? VK_ESCAPE :
-                 !strcmp(arg, "enter") ? VK_RETURN :
-                 !strcmp(arg, "tab")   ? VK_TAB    : atoi(arg);
-        SendMessageW(hwnd, WM_KEYDOWN, (WPARAM)vk, 0);
+        /* `key ctrl+k`, `key alt+shift+up`, `key esc`, `key 27`. Modifiers matter:
+         * the app's shortcuts are dispatched from the message loop and read
+         * GetKeyState, so a chord cannot be tested by posting a bare key — and
+         * until this existed, no chord in the app was testable at all. */
+        unsigned want = 0;
+        const char *k = arg;
+        for (;;) {
+            if (!strncmp(k, "ctrl+", 5))  { want |= AM_CTRL;  k += 5; continue; }
+            if (!strncmp(k, "alt+", 4))   { want |= AM_ALT;   k += 4; continue; }
+            if (!strncmp(k, "shift+", 6)) { want |= AM_SHIFT; k += 6; continue; }
+            break;
+        }
+        int vk = !strcmp(k, "esc")   ? VK_ESCAPE :
+                 !strcmp(k, "enter") ? VK_RETURN :
+                 !strcmp(k, "tab")   ? VK_TAB    :
+                 !strcmp(k, "up")    ? VK_UP     :
+                 !strcmp(k, "down")  ? VK_DOWN   :
+                 !strcmp(k, "f6")    ? VK_F6     :
+                 !strcmp(k, "slash") ? VK_OEM_2  :
+                 (k[0] >= 'a' && k[0] <= 'z' && !k[1]) ? (k[0] - 32) : atoi(k);
+        /* Modifiers are read with GetKeyState, so they have to be really held:
+         * SetKeyboardState makes them so for this thread without moving the user's
+         * physical keyboard. */
+        BYTE ks[256]; GetKeyboardState(ks);
+        BYTE saved_c = ks[VK_CONTROL], saved_a = ks[VK_MENU], saved_s = ks[VK_SHIFT];
+        if (want & AM_CTRL)  ks[VK_CONTROL] = 0x80;
+        if (want & AM_ALT)   ks[VK_MENU]    = 0x80;
+        if (want & AM_SHIFT) ks[VK_SHIFT]   = 0x80;
+        SetKeyboardState(ks);
+        MSG km; memset(&km, 0, sizeof km);
+        km.hwnd = hwnd; km.message = (want & AM_ALT) ? WM_SYSKEYDOWN : WM_KEYDOWN;
+        km.wParam = (WPARAM)vk;
+        /* Unclaimed keys go to the FOCUSED window, which is where a real keystroke
+         * goes. Sending them to the main window instead made Esc look broken: the
+         * palette's Esc lives in the palette box's proc, and the main proc has no
+         * reason to know about it. */
+        if (!accel_dispatch(hwnd, &km)) {
+            HWND target = GetFocus();
+            SendMessageW(target ? target : hwnd, km.message, (WPARAM)vk, 0);
+        }
+        ks[VK_CONTROL] = saved_c; ks[VK_MENU] = saved_a; ks[VK_SHIFT] = saved_s;
+        SetKeyboardState(ks);
         test_ack("ok");
     } else if (!strcmp(verb, "move")) {
         /* A real WM_MOUSEMOVE, so hover goes through the same path the mouse
@@ -9535,21 +9647,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (wp == VK_ESCAPE && g_more_open) { g_more_open = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_ESCAPE && g_has_sel) { g_has_sel = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
-        if (wp == VK_OEM_2 && (GetKeyState(VK_CONTROL) & 0x8000)) {   /* Ctrl+/ */
-            int on = !g_keys_open;
-            close_overlays();
-            g_keys_open = on; g_view = VIEW_HOME;
-            InvalidateRect(hwnd, NULL, FALSE);
-            return 0;
-        }
-        if (wp == 'F' && (GetKeyState(VK_CONTROL) & 0x8000)) { search_open(hwnd); return 0; }
-        if (wp == 'K' && (GetKeyState(VK_CONTROL) & 0x8000)) { palette_open(hwnd); return 0; }
-        if ((GetKeyState(VK_MENU) & 0x8000) && (wp == VK_UP || wp == VK_DOWN)) {
-            nav_conversation(hwnd, wp == VK_DOWN ? 1 : -1,
-                             (GetKeyState(VK_SHIFT) & 0x8000) != 0);
-            return 0;
-        }
-        if (wp == VK_F6) { SetFocus(g_re ? g_re : hwnd); return 0; }
+        /* Ctrl+/, Ctrl+F, Ctrl+K, Alt+arrows and F6 are handled in the message
+         * loop (SHORTCUTS / accel_dispatch), not here: a shortcut in this proc only
+         * fires when the main window has focus, and the composer holds it. */
         return 0;
     case WM_GETMINMAXINFO: {
         /* Item 4: never shrink below fitting the workspace icon + Home + More +
@@ -9711,6 +9811,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
          * and Enter submits. Gated to that view so the RichEdit composer keeps
          * its own Tab/Enter handling (re_proc) everywhere else. */
         if (g_view == VIEW_SIGNIN && IsDialogMessageW(hwnd, &m)) continue;
+        /* App shortcuts BEFORE anything sees the key, so they work regardless of
+         * which control has focus — and the composer has it almost always. */
+        if (accel_dispatch(hwnd, &m)) continue;
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }

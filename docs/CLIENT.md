@@ -519,6 +519,31 @@ It went red for **eleven consecutive pushes** on 2026-07-29 because
 green the whole time, which is exactly why a green local suite is not a substitute
 for reading the run. Push, then check.
 
+## Shortcuts belong in the message loop, not a window proc
+
+`SHORTCUTS[]` in winmain.c drives **both** the sheet (Ctrl+/) and the keys, and
+`accel_dispatch()` runs from the message loop before any window sees the message.
+
+This is not tidiness. The chords used to be handled in the main window's
+`WM_KEYDOWN`, and the main window almost never has focus — **the composer does**.
+A native child consumes what it does not recognise, so Ctrl+K, Ctrl+F and Ctrl+/
+were dead whenever the caret was in the message box, which is to say always, while
+the shortcut sheet advertised them. The find box, search box, palette box, picker
+and sign-in fields were the same black hole; each had to re-implement any chord it
+wanted to let through, and F6's two ends duly drifted apart.
+
+- **A new global shortcut goes in `SHORTCUTS[]`** with an `ACC_*` action. It then
+  works from every focus and appears in the sheet, because they read the same rows.
+- **Focus-specific keys stay in their procs** and are `ACC_NONE` rows in the table:
+  Enter sends only in the composer; Esc means something different in every surface.
+- **Shortcuts are suppressed while a modal is open** — a modal owns the window, and
+  opening a second surface behind it would leave two things claiming the screen.
+  Esc and Enter reach it through `modal_key`.
+- Test with `gui_drive.sh key ctrl+k` (also `alt+shift+up`, `ctrl+slash`, `esc`).
+  The verb really holds the modifiers via `SetKeyboardState`, because
+  `accel_dispatch` reads `GetKeyState`; posting a bare key proves nothing. Before
+  it existed, **no chord in the app was testable at all**.
+
 ## Modals: one frame, explicit commit
 
 Every modal is drawn by `modal_frame()` (winmain.c) from an `oc_modal_spec`. The

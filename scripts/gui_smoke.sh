@@ -126,6 +126,31 @@ expect "$d" pal     1 "command palette: its box shown"
 expect "$d" covered 1 "command palette: window covered"
 "$DRIVE" palette >/dev/null 2>&1; sleep 0.4
 
+# --- global shortcuts ------------------------------------------------------
+# Every one of these was DEAD while the composer had focus, which is nearly
+# always: they were handled in the main window's WM_KEYDOWN, and a native child
+# consumes what it does not recognise. The shortcut sheet advertised them anyway.
+# They are dispatched from the message loop now, so the assertions are made with
+# the caret sitting in the message box — the case that was broken.
+say "== global shortcuts (composer focused)"
+"$DRIVE" view 0 >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; sleep 0.5
+"$DRIVE" type "typing when the shortcut arrives" >/dev/null 2>&1; sleep 0.3
+
+"$DRIVE" key ctrl+k >/dev/null 2>&1; sleep 0.6
+expect "$(snap)" pal 1 "Ctrl+K opens the palette from the composer"
+"$DRIVE" key esc >/dev/null 2>&1; sleep 0.5
+expect "$(snap)" pal 0 "Esc closes it"
+
+"$DRIVE" key ctrl+f >/dev/null 2>&1; sleep 0.6
+expect "$(snap)" srch 1 "Ctrl+F opens search from the composer"
+"$DRIVE" key esc >/dev/null 2>&1; sleep 0.5
+expect "$(snap)" srch 0 "Esc closes search"
+
+"$DRIVE" key ctrl+slash >/dev/null 2>&1; sleep 0.6
+expect "$(snap)" modal keys "Ctrl+/ opens the shortcut sheet"
+"$DRIVE" key esc >/dev/null 2>&1; sleep 0.5
+expect "$(snap)" modal none "Esc closes the sheet"
+
 # --- the modal frame -------------------------------------------------------
 # Explicit commit is the whole design (ARCH-94 / docs/CLIENT.md): Save persists,
 # Cancel and Esc put the snapshot back. A Cancel that silently behaved like Save
