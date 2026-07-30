@@ -53,6 +53,11 @@ typedef struct {
     uint8_t      pinned;      /* pinned to its channel (REQ-230) */
     uint64_t     pinned_by;   /* who pinned it (0 = unknown) */
     uint64_t     pinned_at;
+    /* Saved for later by THIS user (REQ-231). Private, unlike a pin: it arrives
+     * only on this connection, from SAVED_UPDATED — live when you save, and
+     * replayed after a reconnect so a bookmark survives a reload. */
+    uint8_t      saved;
+    uint64_t     saved_at;
 } oc_msg;
 
 typedef struct {

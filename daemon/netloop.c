@@ -2631,6 +2631,20 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             send_bytes(ep, conns, fd, g_enc, w.len);
         }
 
+        /* And this user's saved-for-later marks, for the same reason again — but
+         * note the difference: a pin is a channel-wide fact and this is private,
+         * so it goes only down THIS connection and is keyed to the requester
+         * (REQ-231). Without it, a reload showed nothing bookmarked until the
+         * Later view was opened. */
+        for (size_t i = 0; i < r->n_replay && conns[fd]; i++) {
+            if (!r->replay[i].saved) continue;
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_saved_updated su = { r->replay[i].message_id, OC_SAVE_ADD,
+                                    r->replay[i].saved_at };
+            oc_encode_saved_updated(&w, OC_PROTOCOL_VERSION, &su);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+        }
+
         /* Then the reaction state for those messages. A BROADCAST carries none,
          * so without this every reaction vanished on reload. op=ADD with the
          * aggregate count reconstructs the chip; user_id is the requester when

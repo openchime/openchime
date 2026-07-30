@@ -2859,11 +2859,22 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             "  COALESCE(NULLIF(m.author_name,''), u.display_name, ''), "
             /* Pin state travels with the message: a BROADCAST has no field for
              * it, so a reconnecting client would otherwise lose every pin. */
-            "  COALESCE(p.pinned_by,0), COALESCE(p.created_at_ms,0) "
+            "  COALESCE(p.pinned_by,0), COALESCE(p.created_at_ms,0), "
+            /* And this user's saved-for-later state, for the same reason. LEFT
+             * JOIN rather than EXISTS so the timestamp comes with it, and keyed on
+             * the REQUESTING user because a saved item is private (REQ-231). */
+            "  COALESCE(s.created_at_ms,0) "
             "FROM messages m LEFT JOIN users u ON u.id = m.author_id "
             "                LEFT JOIN pins  p ON p.message_id = m.id "
-            "WHERE m.channel_id=? AND m.id>? AND m.parent_id IS NULL "
-            "ORDER BY m.id LIMIT ?;", -1, &st, NULL);
+            "                LEFT JOIN saved_items s ON s.message_id = m.id AND s.user_id = ?4 "
+            /* Every marker numbered explicitly. An anonymous `?` takes the next
+             * unused index, so introducing ?4 ABOVE these silently renumbered them
+             * to 5, 6 and 7 — the binds still succeeded, the query saw NULLs, and
+             * backfill returned nothing. 36 tests caught it; reading would not
+             * have. */
+            "WHERE m.channel_id=?1 AND m.id>?2 AND m.parent_id IS NULL "
+            "ORDER BY m.id LIMIT ?3;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 4, (sqlite3_int64)j->user_id);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)ch);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)after);   /* resolved above */
         sqlite3_bind_int64(st, 3, (sqlite3_int64)(OC_BACKFILL_MAX - n));
@@ -2892,6 +2903,8 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
             if (an && an[0]) m->author_name = strdup(an);   /* webhook display name (REQ-170) */
             m->pinned_by = (uint64_t)sqlite3_column_int64(st, 7);
             m->pinned_at = (uint64_t)sqlite3_column_int64(st, 8);
+            m->saved_at  = (uint64_t)sqlite3_column_int64(st, 9);
+            m->saved     = m->saved_at != 0;
             /* Re-attach the message's linked attachments so a reconnecting client
              * sees them inline, not just live members (REQ-140). */
             load_message_attachments(db, m->message_id, m->attach, &m->n_attach);

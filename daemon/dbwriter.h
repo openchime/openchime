@@ -391,6 +391,12 @@ typedef struct {
      * replay above exists to prevent. */
     uint64_t pinned_by;    /* 0 when not pinned */
     uint64_t pinned_at;
+    /* Saved-for-later state (REQ-231), for the REQUESTING user only — a pin is a
+     * channel-wide fact, this is private, so it can never travel in a fan-out
+     * BROADCAST. It rides the per-connection replay and the net thread turns it
+     * into a SAVED_UPDATED, exactly as pins do above. */
+    uint8_t  saved;
+    uint64_t saved_at;
 } oc_replay_msg;
 
 typedef struct oc_dbres {

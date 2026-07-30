@@ -46,9 +46,19 @@ static void msg_tombstone(oc_msg *msg) {
     msg->n_attach = msg->cap_attach = 0;
     msg->pinned = 0;
     msg->pinned_by = msg->pinned_at = 0;
+    msg->saved = 0;
+    msg->saved_at = 0;
 }
 
 /* Apply a PIN event to one message, wherever it lives (REQ-230). */
+/* Both message lists, always — the channel's and any open thread's. Keeping this
+ * beside msg_set_pinned because it is the same shape and the same trap: applying
+ * a pin to only c->msgs left a pinned REPLY looking unpinned in the thread pane. */
+static void msg_set_saved(oc_msg *msg, const oc_ev *e) {
+    msg->saved    = (e->op == 1);
+    msg->saved_at = (e->op == 1) ? e->pinned_at : 0;   /* the ev's timestamp slot */
+}
+
 static void msg_set_pinned(oc_msg *msg, const oc_ev *e) {
     msg->pinned    = (e->op == 1);
     msg->pinned_by = (e->op == 1) ? e->user_id : 0;
@@ -781,6 +791,19 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         if (m->saved_open) m->saved_loading = 0;
         break;
     case OC_EV_SAVED_UPDATED:
+        /* Mark the message itself, in every list that can hold it, so the
+         * transcript can show a bookmark without the Later view ever being
+         * opened. Both lists for the reason msg_set_saved states. */
+        for (size_t ci = 0; ci < m->n_channels; ci++) {
+            oc_channel *c = &m->channels[ci];
+            for (size_t i = 0; i < c->n_msgs; i++)
+                if (c->msgs[i].message_id == e->message_id) { msg_set_saved(&c->msgs[i], e); break; }
+        }
+        for (size_t i = 0; i < m->n_thread_msgs; i++)
+            if (m->thread_msgs[i].message_id == e->message_id) {
+                msg_set_saved(&m->thread_msgs[i], e);
+                break;
+            }
         /* Drop it from an open list on unsave, so the view cannot show a row
          * the server no longer has. */
         if (m->saved_open && e->op == 0)

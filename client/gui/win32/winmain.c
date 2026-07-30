@@ -1500,6 +1500,21 @@ static void ensure_selection(const oc_model *m) {
 
 #define RAIL_IH 68.0f     /* rail item pitch — pixel-matched to Slack (center-to-center) */
 
+/* Where the painter actually put a rail item. Menus anchor to this rather than
+ * recomputing the geometry from the window height — which is what the New menu did,
+ * and it was wrong by a whole rail item (it counted three up from the bottom when
+ * New is two up), leaving the menu floating in the middle of the sidebar with a
+ * 90px gap to the button that opened it. The painter already knows; ask it. */
+static int rail_rect_of(int act, float *top, float *bot) {
+    for (int i = 0; i < g_n_navrows; i++)
+        if (g_navrows[i].act == act) {
+            if (top) *top = g_navrows[i].top;
+            if (bot) *bot = g_navrows[i].bot;
+            return 1;
+        }
+    return 0;
+}
+
 static void rail_hit(float top, float bot, int act) {
     if (g_n_navrows < (int)(sizeof g_navrows / sizeof g_navrows[0])) {
         g_navrows[g_n_navrows].top = top; g_navrows[g_n_navrows].bot = bot;
@@ -3014,6 +3029,18 @@ static int accel_dispatch(HWND hwnd, const MSG *m) {
      * leave two things claiming the screen. Esc and Enter reach it through
      * modal_key in the window proc. */
     if (modal_open()) return 0;
+    /* Esc dismisses a transient overlay FIRST, whatever has focus. The
+     * menu/flyout/lightbox/palette Esc handling lives in the main window's proc,
+     * which the composer's focus makes unreachable — the same trap as the chords
+     * above. Everything else about Esc is focus-specific (cancel an edit, close the
+     * picker, drop a selection) and stays in the control that owns it, so this only
+     * claims the key when one of these four is actually up. */
+    if (m->message == WM_KEYDOWN && m->wParam == VK_ESCAPE) {
+        if (g_menu)      { g_menu = MENU_NONE; g_menu_hover = -1; InvalidateRect(hwnd, NULL, FALSE); return 1; }
+        if (g_more_open) { g_more_open = 0;    InvalidateRect(hwnd, NULL, FALSE); return 1; }
+        if (g_lightbox)  { g_lightbox = 0;     InvalidateRect(hwnd, NULL, FALSE); return 1; }
+        return 0;
+    }
     unsigned mods = 0;
     if (GetKeyState(VK_CONTROL) & 0x8000) mods |= AM_CTRL;
     if (GetKeyState(VK_MENU)    & 0x8000) mods |= AM_ALT;
@@ -8180,10 +8207,17 @@ static void open_new_menu(HWND hwnd) {
     mi_sep();
     mi_item(4, "Search messages\xE2\x80\xA6");
     g_menu = MENU_NEW; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 224;
-    RECT rc; GetClientRect(hwnd, &rc);
-    float new_top = rc.bottom - 3 * RAIL_IH - 6;
     g_menu_x = RAIL_W + 8;
-    g_menu_y = new_top - menu_total_height();
+    /* Bottom-aligned to the New button, so the menu grows upward out of the thing
+     * you clicked. Falls back to the window bottom only if the rail has not been
+     * painted yet. */
+    float btop = 0, bbot = 0;
+    if (rail_rect_of(NAV_NEW, &btop, &bbot)) {
+        g_menu_y = bbot - menu_total_height();
+    } else {
+        RECT rc; GetClientRect(hwnd, &rc);
+        g_menu_y = DIPF(rc.bottom) - 8 - menu_total_height();
+    }
     if (g_menu_y < 8) g_menu_y = 8;
 }
 
@@ -8714,6 +8748,8 @@ static void test_dump(const char *path) {
     /* Modal + the settings a form modal can change, so snapshot/commit/restore is
      * assertable rather than eyeballed — Cancel silently behaving like Save is
      * exactly the bug this design exists to prevent. */
+    fprintf(f, "menu=%d more=%d lightbox=%llu\n", g_menu, g_more_open,
+            (unsigned long long)g_lightbox);
     fprintf(f, "lastclick %s\n", g_modal_lastclick);
     for (int i = 0; i < g_n_pref_hits; i++)
         fprintf(f, "  prefhit row=%d val=%d r=%.0f,%.0f,%.0f,%.0f\n",
