@@ -9,6 +9,7 @@
 
 #include <ctype.h>
 #include <stdlib.h>
+#include <stdio.h>      /* snprintf */
 #include <string.h>
 
 static int fuzzy(const char *hay, const char *needle) {

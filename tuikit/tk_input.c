@@ -9,6 +9,7 @@
 #include "tk_draw.h"
 
 #include "utf8proc.h"
+#include <stdio.h>      /* snprintf, used below; it was missing and warned */
 #include <string.h>
 
 void tk_input_init(tk_input *in, int mask, const char *placeholder) {

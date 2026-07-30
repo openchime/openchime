@@ -20,7 +20,6 @@
 #include <windows.h>
 #include <windowsx.h>         /* GET_X_LPARAM / GET_Y_LPARAM */
 #include <shellapi.h>         /* CommandLineToArgvW, Shell_NotifyIconW (WIN-18) */
-#include <richedit.h>         /* MSFTEDIT_CLASS composer */
 #include <commdlg.h>          /* GetSaveFileNameW (attachment download) */
 #include <dwmapi.h>           /* DwmSetWindowAttribute (dark title bar) */
 #include <d2d1.h>
@@ -354,8 +353,23 @@ static int      g_n_backfilled;
 
 /* The composer is a native RichEdit child (IME / selection / clipboard / undo);
  * we subclass it to make Enter send and Shift+Enter insert a newline. */
-static HWND     g_re;
-static WNDPROC  g_re_oldproc;
+/* The composer is OURS now (WIN-80 / ARCH-98): no RichEdit, no child window. The
+ * declarations sit up here because the shell — drafts, the send button, the
+ * autocomplete, the picker, F6 — talks to it from above its definition. */
+static int  g_ed_focus;
+static int  ed_len(void);
+static int  ed_caret_pos(void);
+static int  ed_focused(void);
+static int  ed_get(WCHAR *out, int cap);
+static void ed_set(const WCHAR *s);
+static void ed_clear(void);
+static void ed_insert(const WCHAR *s);
+static void ed_replace_range(int a, int b, const WCHAR *s);
+static void ed_select_all(void);
+static void ed_focus(HWND hwnd);
+static int  ed_has_sel(void);
+static int  ed_lines(float w);
+static void ed_draw(ID2D1RenderTarget *rt, D2D1_RECT_F box);
 static DWORD    g_last_typing;
 
 /* Sidebar row hit-boxes, captured during paint for WM_LBUTTONDOWN. */
@@ -1661,9 +1675,9 @@ static void ac_close(void);   /* fwd */
 
 /* Stash whatever is in the composer under `cid`; an empty composer clears it. */
 static void draft_save(uint64_t cid) {
-    if (!g_re || !cid || g_edit_msg) return;      /* an edit-in-progress is not a draft */
+    if (!cid || g_edit_msg) return;               /* an edit-in-progress is not a draft */
     WCHAR w[1024];
-    int n = GetWindowTextW(g_re, w, 1024);
+    int n = ed_get(w, 1024);
     int slot = -1;
     for (int i = 0; i < g_n_drafts; i++) if (g_drafts[i].cid == cid) { slot = i; break; }
     if (n <= 0) {                                  /* drop it, keeping the array dense */
@@ -1679,14 +1693,12 @@ static void draft_save(uint64_t cid) {
 }
 
 static void draft_restore(uint64_t cid) {
-    if (!g_re) return;
     for (int i = 0; i < g_n_drafts; i++)
         if (g_drafts[i].cid == cid) {
-            SetWindowTextW(g_re, g_drafts[i].text);
-            SendMessageW(g_re, EM_SETSEL, (WPARAM)-2, -1);   /* caret to end */
+            ed_set(g_drafts[i].text);                    /* caret lands at the end */
             return;
         }
-    SetWindowTextW(g_re, L"");
+    ed_clear();
 }
 
 static void select_channel(uint64_t cid) {
@@ -3618,8 +3630,9 @@ static void accel_run(HWND hwnd, int action) {
          * two ends drifted: the composer sent focus to the filter box even in the
          * views that have no filter box. */
         HWND f = GetFocus();
-        if (f == g_re && g_find && IsWindowVisible(g_find)) SetFocus(g_find);
-        else if (g_re) SetFocus(g_re);
+        if (ed_focused() && g_find && IsWindowVisible(g_find)) { g_ed_focus = 0; SetFocus(g_find); }
+        else ed_focus(hwnd);
+        (void)f;
         break; }
     default: break;
     }
@@ -5415,7 +5428,7 @@ static void picker_open(HWND hwnd, uint64_t mid) {
 static void picker_close(HWND hwnd) {
     g_pick_open = 0; g_pick_mid = 0;
     if (g_pick_edit) ShowWindow(g_pick_edit, SW_HIDE);
-    if (g_re) SetFocus(g_re);
+    ed_focus(hwnd);
     if (hwnd) InvalidateRect(hwnd, NULL, FALSE);
 }
 
@@ -5434,11 +5447,10 @@ static void picker_choose(HWND hwnd, const char *emoji) {
                 }
         oc_client_react(g_client, chan, g_pick_mid, emoji,
                         (msg && reaction_is_mine(msg, emoji)) ? 0 : 1);
-    } else if (g_re) {
+    } else {
         WCHAR w[16];
         if (MultiByteToWideChar(CP_UTF8, 0, emoji, -1, w, 16) > 0) {
-            SendMessageW(g_re, EM_SETSEL, (WPARAM)-1, -1);   /* caret to end */
-            SendMessageW(g_re, EM_REPLACESEL, TRUE, (LPARAM)w);
+            ed_insert(w);
         }
     }
     picker_close(hwnd);
@@ -5484,6 +5496,17 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     draw_lucide(rt, OC_ICON_AT, rf(g_at_btn.left + 8, g_at_btn.top + 8,
                                    g_at_btn.right - 8, g_at_btn.bottom - 8), OC_COL_MUTED);
 
+    /* THE FIELD (WIN-80). Between the left buttons and Send, at the rect
+     * layout_composer computed — the same rect ed_hit tests against, so what you
+     * click is what you see. */
+    {
+        float tx = bx0 + 6 + sq * 3 + 8, tr = bx1 - 6 - sq - 8;
+        float inner = composer_inner_h();
+        float texth = inner > COMPOSER_BTN ? inner : COMPOSER_LINE;
+        float ty = by0 + COMPOSER_PAD + (inner > COMPOSER_BTN ? 0.0f : (COMPOSER_BTN - COMPOSER_LINE) / 2);
+        ed_draw(rt, rf(tx, ty, tr, ty + texth));
+    }
+
     /* Send on the right — accent when there is something to send. A paper
      * plane rather than an up-arrow, which read as "scroll" more than "send". */
     /* An archived channel is read-only (REQ-035). The daemon refuses the send
@@ -5491,7 +5514,7 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     const oc_model *cm = model();
     const oc_channel *cc = cm && g_sel ? oc_model_channel((oc_model *)cm, g_sel) : NULL;
     int ro = (cc && cc->archived);
-    int has_text = !ro && g_re && GetWindowTextLengthW(g_re) > 0;
+    int has_text = !ro && ed_len() > 0;
     g_send_btn = rf(bx1 - 6 - sq, cy, bx1 - 6, cy + sq);
     fill_round(rt, g_send_btn, 8.0f, has_text ? OC_COL_ACCENT : OC_COL_INPUT);
     if (!has_text) stroke_round(rt, g_send_btn, 8.0f, OC_COL_BORDER, 1.0f);
@@ -7027,9 +7050,577 @@ static void paint(HWND hwnd) {
     }
 }
 
-/* ---- composer (native RichEdit) ------------------------------------------ */
+/* ---- the composer: our own editor (WIN-80, ARCH-98) ------------------------
+ *
+ * It was a native RichEdit, chosen by ARCH-82 for good reasons — editing, IME,
+ * selection, clipboard and undo for free. ARCH-98 amends that, and the cost is
+ * paid here: all of it is written by hand below. What it buys:
+ *
+ *   - COLOUR emoji in the field. RichEdit draws through GDI, so the same
+ *     character looked washed out in the composer and correct in the picker, on a
+ *     reaction chip and in the transcript — three surfaces against one.
+ *   - a placeholder that EXISTS in the scene rather than being over-painted with
+ *     GDI after the control finished (which was invisible to every capture until
+ *     an explicit WM_PRINTCLIENT arm was added for it).
+ *   - custom emoji, mention highlighting and eventually rich text (REQ-220) in
+ *     the field, all of which need a layout we own.
+ *   - a surface the harness can drive and a screenshot can see.
+ *
+ * There is no child window: the text is part of the Direct2D scene and the MAIN
+ * window owns the keyboard while `g_ed_focus` is set. That is what makes the
+ * caret, the selection and the composition string ours to draw — and it is why
+ * every native-child rule in layout_natives no longer applies to the composer.
+ *
+ * IME is the named risk (docs/WIN32_BACKLOG.md, WIN-80). The composition string
+ * is drawn inline with an underline and the candidate window is positioned at the
+ * caret; what cannot be self-verified here is how it behaves for CJK input on a
+ * machine whose author does not use it, and that is recorded rather than claimed.
+ */
+#define ED_MAX   4000        /* UTF-16 units; a message, not a document */
+#define ED_UNDO  16
+
+static WCHAR g_ed[ED_MAX + 1];
+static int   g_ed_len;
+static int   g_ed_caret, g_ed_anchor;      /* selection is [min, max) */
+static int   g_ed_dragging;
+static float g_ed_scroll;                  /* DIPs, vertical */
+static D2D1_RECT_F g_ed_box;               /* where the text is drawn (DIPs) */
+static IDWriteTextLayout *g_ed_layout;     /* cached; NULL = rebuild */
+static float g_ed_layout_w;
+static ULONGLONG g_ed_blink;               /* caret phase reference */
+
+/* IME composition in progress: drawn inline at the caret, not yet in the text. */
+static WCHAR g_ed_comp[128];
+static int   g_ed_comp_len;
+
+/* Undo/redo: whole-text snapshots. A message is at most ED_MAX units, so a
+ * snapshot is 8KB and sixteen of them is cheaper than the bookkeeping a
+ * per-edit journal needs — and it cannot get out of step with the buffer. */
+typedef struct { WCHAR t[ED_MAX + 1]; int len, caret; } ed_snap;
+static ed_snap g_ed_undo[ED_UNDO], g_ed_redo[ED_UNDO];
+static int g_ed_n_undo, g_ed_n_redo;
+
+static void ed_invalidate_layout(void) {
+    if (g_ed_layout) { IDWriteTextLayout_Release(g_ed_layout); g_ed_layout = NULL; }
+}
+
+static int ed_sel_lo(void) { return g_ed_caret < g_ed_anchor ? g_ed_caret : g_ed_anchor; }
+static int ed_sel_hi(void) { return g_ed_caret > g_ed_anchor ? g_ed_caret : g_ed_anchor; }
+static int ed_has_sel(void) { return g_ed_caret != g_ed_anchor; }
+
+static void ed_snap_push(ed_snap *stack, int *n) {
+    if (*n == ED_UNDO) {                        /* oldest out */
+        memmove(&stack[0], &stack[1], (size_t)(ED_UNDO - 1) * sizeof stack[0]);
+        (*n)--;
+    }
+    ed_snap *s = &stack[(*n)++];
+    memcpy(s->t, g_ed, (size_t)(g_ed_len + 1) * sizeof(WCHAR));
+    s->len = g_ed_len;
+    s->caret = g_ed_caret;
+}
+
+static void ed_snap_apply(const ed_snap *s) {
+    memcpy(g_ed, s->t, (size_t)(s->len + 1) * sizeof(WCHAR));
+    g_ed_len = s->len;
+    g_ed_caret = g_ed_anchor = s->caret > s->len ? s->len : s->caret;
+    ed_invalidate_layout();
+}
+
+/* Every mutation goes through here, so undo can never miss one. */
+static void ed_begin_edit(void) {
+    ed_snap_push(g_ed_undo, &g_ed_n_undo);
+    g_ed_n_redo = 0;                            /* a new edit forks the future */
+}
+
+static void ed_undo(void) {
+    if (!g_ed_n_undo) return;
+    ed_snap_push(g_ed_redo, &g_ed_n_redo);
+    ed_snap_apply(&g_ed_undo[--g_ed_n_undo]);
+}
+
+static void ed_redo(void) {
+    if (!g_ed_n_redo) return;
+    ed_snap_push(g_ed_undo, &g_ed_n_undo);
+    ed_snap_apply(&g_ed_redo[--g_ed_n_redo]);
+}
+
+static void ed_delete_range(int a, int b) {
+    if (a > b) { int t = a; a = b; b = t; }
+    if (a < 0) a = 0;
+    if (b > g_ed_len) b = g_ed_len;
+    if (a >= b) return;
+    memmove(g_ed + a, g_ed + b, (size_t)(g_ed_len - b + 1) * sizeof(WCHAR));
+    g_ed_len -= (b - a);
+    g_ed_caret = g_ed_anchor = a;
+    ed_invalidate_layout();
+}
+
+static void ed_insert_n(const WCHAR *s, int n) {
+    if (!s || n <= 0) return;
+    if (ed_has_sel()) ed_delete_range(ed_sel_lo(), ed_sel_hi());
+    if (g_ed_len + n > ED_MAX) n = ED_MAX - g_ed_len;   /* a cap, not a crash */
+    if (n <= 0) return;
+    memmove(g_ed + g_ed_caret + n, g_ed + g_ed_caret,
+            (size_t)(g_ed_len - g_ed_caret + 1) * sizeof(WCHAR));
+    memcpy(g_ed + g_ed_caret, s, (size_t)n * sizeof(WCHAR));
+    g_ed_len += n;
+    g_ed_caret += n;
+    g_ed_anchor = g_ed_caret;
+    g_ed[g_ed_len] = 0;
+    ed_invalidate_layout();
+}
+
+/* ---- the API the rest of the app uses (it used to send EM_* messages) ------ */
+
+static int  ed_len(void) { return g_ed_len; }
+static int  ed_caret_pos(void) { return g_ed_caret; }
+static int  ed_focused(void) { return g_ed_focus; }
+
+static int ed_get(WCHAR *out, int cap) {
+    int n = g_ed_len < cap - 1 ? g_ed_len : cap - 1;
+    if (n < 0) n = 0;
+    memcpy(out, g_ed, (size_t)n * sizeof(WCHAR));
+    out[n] = 0;
+    return n;
+}
+
+static void ed_set(const WCHAR *s) {
+    ed_begin_edit();
+    int n = s ? lstrlenW(s) : 0;
+    if (n > ED_MAX) n = ED_MAX;
+    if (n > 0) memcpy(g_ed, s, (size_t)n * sizeof(WCHAR));
+    g_ed_len = n; g_ed[n] = 0;
+    g_ed_caret = g_ed_anchor = n;               /* caret to end, as EM_SETSEL -2 did */
+    g_ed_scroll = 0;
+    ed_invalidate_layout();
+}
+
+static void ed_clear(void) { ed_set(L""); g_ed_n_undo = g_ed_n_redo = 0; }
+
+static void ed_insert(const WCHAR *s) { ed_begin_edit(); ed_insert_n(s, s ? lstrlenW(s) : 0); }
+
+static void ed_replace_range(int a, int b, const WCHAR *s) {
+    ed_begin_edit();
+    g_ed_caret = g_ed_anchor = a;
+    ed_delete_range(a, b);
+    ed_insert_n(s, s ? lstrlenW(s) : 0);
+}
+
+static void ed_select_all(void) { g_ed_anchor = 0; g_ed_caret = g_ed_len; }
+
+static void ed_focus(HWND hwnd) {
+    g_ed_focus = 1;
+    g_ed_blink = GetTickCount64();
+    if (hwnd) SetFocus(hwnd);                   /* the MAIN window owns the keys */
+}
+
+/* The layout, rebuilt only when the text or the width changed. The composition
+ * string is spliced in at the caret so it wraps and measures like real text —
+ * which is what makes the candidate window land in the right place. */
+static IDWriteTextLayout *ed_layout(float w) {
+    if (g_ed_layout && g_ed_layout_w == w) return g_ed_layout;
+    ed_invalidate_layout();
+    WCHAR tmp[ED_MAX + 130];
+    int n = 0;
+    memcpy(tmp, g_ed, (size_t)g_ed_caret * sizeof(WCHAR)); n = g_ed_caret;
+    if (g_ed_comp_len) { memcpy(tmp + n, g_ed_comp, (size_t)g_ed_comp_len * sizeof(WCHAR)); n += g_ed_comp_len; }
+    memcpy(tmp + n, g_ed + g_ed_caret, (size_t)(g_ed_len - g_ed_caret) * sizeof(WCHAR));
+    n += g_ed_len - g_ed_caret;
+    tmp[n] = 0;
+    if (FAILED(IDWriteFactory_CreateTextLayout(g_dwrite, tmp, (UINT32)(n ? n : 0), g_body,
+                                               w, 10000.0f, &g_ed_layout)))
+        return NULL;
+    g_ed_layout_w = w;
+    return g_ed_layout;
+}
+
+/* How many WRAPPED lines the text occupies, so the box can grow with it. */
+static int ed_lines(float w) {
+    IDWriteTextLayout *tl = ed_layout(w);
+    if (!tl || (!g_ed_len && !g_ed_comp_len)) return 1;
+    DWRITE_TEXT_METRICS tm;
+    if (FAILED(IDWriteTextLayout_GetMetrics(tl, &tm))) return 1;
+    return tm.lineCount < 1 ? 1 : (int)tm.lineCount;
+}
+
+/* The caret's rect, in the coordinate space of `box`. */
+static int ed_caret_rect(D2D1_RECT_F box, D2D1_RECT_F *out) {
+    IDWriteTextLayout *tl = ed_layout(box.right - box.left);
+    if (!tl) return 0;
+    DWRITE_HIT_TEST_METRICS hm;
+    float cx = 0, cy = 0;
+    UINT32 pos = (UINT32)(g_ed_caret + g_ed_comp_len);
+    if (FAILED(IDWriteTextLayout_HitTestTextPosition(tl, pos, FALSE, &cx, &cy, &hm)))
+        return 0;
+    *out = rf(box.left + cx, box.top + cy - g_ed_scroll,
+              box.left + cx + 1.6f, box.top + cy + hm.height - g_ed_scroll);
+    return 1;
+}
+
 
 /* Send the composer's text to the selected channel and clear it. */
+
+/* ---- input ---------------------------------------------------------------- */
+
+/* Word boundaries for Ctrl+Left/Right and Ctrl+Backspace. Deliberately simple:
+ * runs of non-space, which is what a message composer needs and what every user
+ * expectation here is built on. */
+static int ed_word_left(int from) {
+    int i = from;
+    while (i > 0 && g_ed[i - 1] == L' ') i--;
+    while (i > 0 && g_ed[i - 1] != L' ') i--;
+    return i;
+}
+static int ed_word_right(int from) {
+    int i = from;
+    while (i < g_ed_len && g_ed[i] != L' ') i++;
+    while (i < g_ed_len && g_ed[i] == L' ') i++;
+    return i;
+}
+
+static void ed_clip_copy(HWND hwnd) {
+    if (!ed_has_sel()) return;
+    int a = ed_sel_lo(), n = ed_sel_hi() - a;
+    if (!OpenClipboard(hwnd)) return;
+    EmptyClipboard();
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (SIZE_T)(n + 1) * sizeof(WCHAR));
+    if (h) {
+        WCHAR *dst = (WCHAR *)GlobalLock(h);
+        if (dst) {
+            memcpy(dst, g_ed + a, (size_t)n * sizeof(WCHAR));
+            dst[n] = 0;
+            GlobalUnlock(h);
+            SetClipboardData(CF_UNICODETEXT, h);
+        } else GlobalFree(h);
+    }
+    CloseClipboard();
+}
+
+static void ed_clip_paste(HWND hwnd) {
+    if (!OpenClipboard(hwnd)) return;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (h) {
+        const WCHAR *src = (const WCHAR *)GlobalLock(h);
+        if (src) {
+            /* Newlines survive — a pasted paragraph is a paragraph — but a lone
+             * CR from a Windows CRLF pair would draw as a stray glyph, so the pair
+             * collapses to one LF. */
+            WCHAR tmp[ED_MAX + 1];
+            int n = 0;
+            for (int i = 0; src[i] && n < ED_MAX; i++) {
+                if (src[i] == L'\r' && src[i + 1] == L'\n') continue;
+                tmp[n++] = src[i] == L'\r' ? L'\n' : src[i];
+            }
+            tmp[n] = 0;
+            ed_insert(tmp);
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+}
+
+static void composer_send(void);            /* fwd */
+static void composer_cancel_edit(void);     /* fwd */
+static int  composer_remeasure(void);       /* fwd */
+static void ac_rebuild(void);               /* fwd */
+static void ac_close(void);                 /* fwd */
+static void ac_accept(void);                /* fwd */
+static void layout_composer(HWND hwnd);     /* fwd */
+
+/* Anything that CHANGED the text: re-measure the box, refresh the completion
+ * popover and repaint. One place, so no key handler can forget a step. */
+static void ed_changed(HWND hwnd) {
+    /* The typing indicator used to ride EN_CHANGE from the RichEdit. This is that
+     * notification's replacement, and the rate limit is the same 2s. */
+    DWORD now = GetTickCount();
+    if (g_client && g_sel && now - g_last_typing > 2000) {
+        oc_client_typing(g_client, g_sel);
+        g_last_typing = now;
+    }
+    ac_rebuild();
+    if (composer_remeasure()) layout_composer(hwnd);
+    g_ed_blink = GetTickCount64();       /* a caret that blinks while you type reads as lag */
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* A printable character. Returns 1 when consumed. */
+static int ed_char(HWND hwnd, WCHAR ch) {
+    if (!g_ed_focus) return 0;
+    if (ch == L'\t') return 1;               /* Tab is navigation, never text */
+    if (ch < 0x20 && ch != L'\n') return 1;  /* control chars: eaten, not inserted */
+    WCHAR s[2] = { ch, 0 };
+    ed_insert(s);
+    ed_changed(hwnd);
+    return 1;
+}
+
+/* A virtual key. Returns 1 when consumed. */
+static int ed_key(HWND hwnd, WPARAM vk) {
+    if (!g_ed_focus) return 0;
+    int ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    int shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    int moved = 0, changed = 0;
+
+    switch (vk) {
+    case VK_LEFT:
+        g_ed_caret = ctrl ? ed_word_left(g_ed_caret) : (g_ed_caret > 0 ? g_ed_caret - 1 : 0);
+        moved = 1; break;
+    case VK_RIGHT:
+        g_ed_caret = ctrl ? ed_word_right(g_ed_caret)
+                          : (g_ed_caret < g_ed_len ? g_ed_caret + 1 : g_ed_len);
+        moved = 1; break;
+    case VK_UP: case VK_DOWN: {
+        /* Vertical movement goes through the LAYOUT, not the buffer: with wrapping,
+         * "the line above" is a question only DirectWrite can answer. */
+        IDWriteTextLayout *tl = ed_layout(g_ed_box.right - g_ed_box.left);
+        if (!tl) break;
+        DWRITE_HIT_TEST_METRICS hm; float cx = 0, cy = 0;
+        if (FAILED(IDWriteTextLayout_HitTestTextPosition(tl, (UINT32)g_ed_caret, FALSE, &cx, &cy, &hm))) break;
+        float wanty = cy + (vk == VK_UP ? -hm.height / 2 : hm.height * 1.5f);
+        BOOL trail = FALSE, inside = FALSE;
+        DWRITE_HIT_TEST_METRICS h2;
+        if (SUCCEEDED(IDWriteTextLayout_HitTestPoint(tl, cx, wanty, &trail, &inside, &h2)))
+            g_ed_caret = (int)h2.textPosition + (trail ? (int)h2.length : 0);
+        if (g_ed_caret > g_ed_len) g_ed_caret = g_ed_len;
+        moved = 1; break;
+    }
+    case VK_HOME: g_ed_caret = 0; moved = 1; break;
+    case VK_END:  g_ed_caret = g_ed_len; moved = 1; break;
+    case VK_BACK:
+        if (ed_has_sel()) { ed_begin_edit(); ed_delete_range(ed_sel_lo(), ed_sel_hi()); }
+        else if (g_ed_caret > 0) {
+            ed_begin_edit();
+            ed_delete_range(ctrl ? ed_word_left(g_ed_caret) : g_ed_caret - 1, g_ed_caret);
+        }
+        changed = 1; break;
+    case VK_DELETE:
+        if (ed_has_sel()) { ed_begin_edit(); ed_delete_range(ed_sel_lo(), ed_sel_hi()); }
+        else if (g_ed_caret < g_ed_len) {
+            ed_begin_edit();
+            ed_delete_range(g_ed_caret, ctrl ? ed_word_right(g_ed_caret) : g_ed_caret + 1);
+        }
+        changed = 1; break;
+    case VK_RETURN:
+        /* The completion popover claims Enter first — that is what makes Tab and
+         * Enter interchangeable for accepting one. */
+        if (g_n_ac > 0) { ac_accept(); changed = 1; break; }
+        if (shift) { ed_insert(L"\n"); changed = 1; break; }
+        composer_send();
+        return 1;
+    case VK_TAB:
+        if (g_n_ac > 0) { ac_accept(); changed = 1; break; }
+        return 1;                            /* never a literal tab in a message */
+    case VK_ESCAPE:
+        if (g_n_ac > 0) { ac_close(); InvalidateRect(hwnd, NULL, FALSE); return 1; }
+        if (g_edit_msg) { composer_cancel_edit(); return 1; }
+        return 0;                            /* let the shell close what is open */
+    case 'A': if (ctrl) { ed_select_all(); InvalidateRect(hwnd, NULL, FALSE); return 1; } return 0;
+    case 'C': if (ctrl) { ed_clip_copy(hwnd); return 1; } return 0;
+    case 'X': if (ctrl) { ed_clip_copy(hwnd);
+                          if (ed_has_sel()) { ed_begin_edit(); ed_delete_range(ed_sel_lo(), ed_sel_hi()); }
+                          changed = 1; break; } return 0;
+    case 'V': if (ctrl) { ed_clip_paste(hwnd); changed = 1; break; } return 0;
+    case 'Z': if (ctrl) { if (shift) ed_redo(); else ed_undo(); changed = 1; break; } return 0;
+    case 'Y': if (ctrl) { ed_redo(); changed = 1; break; } return 0;
+    default:
+        /* Everything else — including the app's chords, which the message loop has
+         * already had its go at — is not ours. */
+        return 0;
+    }
+
+    if (moved) {
+        if (!shift) g_ed_anchor = g_ed_caret;
+        ed_invalidate_layout();          /* the composition splice moves with the caret */
+        g_ed_blink = GetTickCount64();
+        ac_rebuild();
+        InvalidateRect(hwnd, NULL, FALSE);
+    }
+    if (changed) ed_changed(hwnd);
+    return 1;
+}
+
+/* Click and drag. `x`/`y` are client DIPs, as every other hit test here uses. */
+static int ed_hit(float x, float y) {
+    IDWriteTextLayout *tl = ed_layout(g_ed_box.right - g_ed_box.left);
+    if (!tl) return 0;
+    BOOL trail = FALSE, inside = FALSE;
+    DWRITE_HIT_TEST_METRICS hm;
+    if (FAILED(IDWriteTextLayout_HitTestPoint(tl, x - g_ed_box.left,
+                                              y - g_ed_box.top + g_ed_scroll,
+                                              &trail, &inside, &hm)))
+        return 0;
+    int pos = (int)hm.textPosition + (trail ? (int)hm.length : 0);
+    /* The composition string is spliced into the layout but is not in the buffer,
+     * so a hit past it has to come back by its length. */
+    if (g_ed_comp_len && pos > g_ed_caret)
+        pos = pos - g_ed_comp_len < g_ed_caret ? g_ed_caret : pos - g_ed_comp_len;
+    return pos < 0 ? 0 : (pos > g_ed_len ? g_ed_len : pos);
+}
+
+static int ed_mouse_down(HWND hwnd, float x, float y) {
+    if (!in_rect(g_ed_box, x, y)) return 0;
+    ed_focus(hwnd);
+    g_ed_caret = g_ed_anchor = ed_hit(x, y);
+    g_ed_dragging = 1;
+    SetCapture(hwnd);
+    InvalidateRect(hwnd, NULL, FALSE);
+    return 1;
+}
+
+static void ed_mouse_move(HWND hwnd, float x, float y) {
+    if (!g_ed_dragging) return;
+    g_ed_caret = ed_hit(x, y);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static void ed_mouse_up(void) {
+    if (!g_ed_dragging) return;
+    g_ed_dragging = 0;
+    ReleaseCapture();
+}
+
+/* ---- IME ------------------------------------------------------------------
+ * The composition string is drawn inline (underlined) and the candidate window is
+ * pinned to the caret. Handled here rather than left to DefWindowProc because a
+ * self-drawn field has no HIMC-owning control to place it for us. */
+static void ed_ime_place(HWND hwnd) {
+    HIMC imc = ImmGetContext(hwnd);
+    if (!imc) return;
+    D2D1_RECT_F cr;
+    if (ed_caret_rect(g_ed_box, &cr)) {
+        COMPOSITIONFORM cf;
+        cf.dwStyle = CFS_POINT;
+        cf.ptCurrentPos.x = PX(cr.left);
+        cf.ptCurrentPos.y = PX(cr.top);
+        cf.rcArea.left = PX(g_ed_box.left);   cf.rcArea.top = PX(g_ed_box.top);
+        cf.rcArea.right = PX(g_ed_box.right); cf.rcArea.bottom = PX(g_ed_box.bottom);
+        ImmSetCompositionWindow(imc, &cf);
+        CANDIDATEFORM cdf;
+        cdf.dwIndex = 0;
+        cdf.dwStyle = CFS_CANDIDATEPOS;
+        cdf.ptCurrentPos = cf.ptCurrentPos;
+        memset(&cdf.rcArea, 0, sizeof cdf.rcArea);
+        ImmSetCandidateWindow(imc, &cdf);
+    }
+    ImmReleaseContext(hwnd, imc);
+}
+
+static int ed_ime(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    (void)wp;
+    if (!g_ed_focus) return 0;
+    if (msg == WM_IME_STARTCOMPOSITION) {
+        g_ed_comp_len = 0; g_ed_comp[0] = 0;
+        ed_invalidate_layout();
+        ed_ime_place(hwnd);
+        return 1;                            /* no default composition window */
+    }
+    if (msg == WM_IME_ENDCOMPOSITION) {
+        g_ed_comp_len = 0; g_ed_comp[0] = 0;
+        ed_invalidate_layout();
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 1;
+    }
+    if (msg == WM_IME_COMPOSITION) {
+        HIMC imc = ImmGetContext(hwnd);
+        if (imc) {
+            if (lp & GCS_RESULTSTR) {
+                LONG bytes = ImmGetCompositionStringW(imc, GCS_RESULTSTR, NULL, 0);
+                if (bytes > 0 && bytes < (LONG)sizeof g_ed_comp) {
+                    WCHAR res[128];
+                    ImmGetCompositionStringW(imc, GCS_RESULTSTR, res, (DWORD)bytes);
+                    int n = bytes / (LONG)sizeof(WCHAR);
+                    res[n] = 0;
+                    g_ed_comp_len = 0;         /* the committed text replaces it */
+                    ed_insert(res);
+                }
+            }
+            if (lp & GCS_COMPSTR) {
+                LONG bytes = ImmGetCompositionStringW(imc, GCS_COMPSTR, NULL, 0);
+                g_ed_comp_len = 0;
+                if (bytes > 0 && bytes < (LONG)sizeof g_ed_comp) {
+                    ImmGetCompositionStringW(imc, GCS_COMPSTR, g_ed_comp, (DWORD)bytes);
+                    g_ed_comp_len = bytes / (LONG)sizeof(WCHAR);
+                }
+                g_ed_comp[g_ed_comp_len] = 0;
+            }
+            ImmReleaseContext(hwnd, imc);
+        }
+        ed_invalidate_layout();
+        ed_ime_place(hwnd);
+        ed_changed(hwnd);
+        return 1;
+    }
+    return 0;
+}
+
+/* ---- draw ---------------------------------------------------------------- */
+
+/* The field's text, selection, caret, composition underline and placeholder.
+ * `box` is the text area the composer chrome laid out. */
+static void ed_draw(ID2D1RenderTarget *rt, D2D1_RECT_F box) {
+    g_ed_box = box;
+    IDWriteTextLayout *tl = ed_layout(box.right - box.left);
+    if (!tl) return;
+
+    /* An empty field shows the cue — in the SCENE, so a screenshot has it. */
+    if (!g_ed_len && !g_ed_comp_len) {
+        char cue[160];
+        composer_cue(model(), cue, sizeof cue);
+        if (cue[0]) draw_text(rt, cue, g_body, rf(box.left, box.top, box.right, box.top + 20),
+                              OC_COL_FAINT);
+    }
+
+    ID2D1RenderTarget_PushAxisAlignedClip(rt, &box, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    D2D1_POINT_2F org = { box.left, box.top - g_ed_scroll };
+
+    /* Selection under the text, as every editor draws it. */
+    if (ed_has_sel()) {
+        DWRITE_HIT_TEST_METRICS hm[64];
+        UINT32 got = 0;
+        if (SUCCEEDED(IDWriteTextLayout_HitTestTextRange(tl, (UINT32)ed_sel_lo(),
+                                                         (UINT32)(ed_sel_hi() - ed_sel_lo()),
+                                                         org.x, org.y, hm, 64, &got)))
+            for (UINT32 i = 0; i < got; i++)
+                fill(rt, rf(hm[i].left, hm[i].top, hm[i].left + hm[i].width,
+                            hm[i].top + hm[i].height), OC_COL_SELECT);
+    }
+
+    ID2D1RenderTarget_DrawTextLayout(rt, org, tl, paint_with(OC_COL_TEXT),
+                                     D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+
+    /* The composition string is underlined, the convention every IME user reads as
+     * "not committed yet". */
+    if (g_ed_comp_len) {
+        DWRITE_HIT_TEST_METRICS hm[16];
+        UINT32 got = 0;
+        if (SUCCEEDED(IDWriteTextLayout_HitTestTextRange(tl, (UINT32)g_ed_caret,
+                                                         (UINT32)g_ed_comp_len,
+                                                         org.x, org.y, hm, 16, &got)))
+            for (UINT32 i = 0; i < got; i++)
+                fill(rt, rf(hm[i].left, hm[i].top + hm[i].height - 1.5f,
+                            hm[i].left + hm[i].width, hm[i].top + hm[i].height),
+                     OC_COL_ACCENT);
+    }
+
+    /* The caret: 530ms phases, and it does not blink while typing (ed_changed
+     * resets the phase) because a caret that vanishes mid-keystroke reads as lag. */
+    if (g_ed_focus) {
+        D2D1_RECT_F cr;
+        if (ed_caret_rect(box, &cr) &&
+            ((GetTickCount64() - g_ed_blink) / 530) % 2 == 0)
+            fill(rt, cr, OC_COL_TEXT);
+    }
+    ID2D1RenderTarget_PopAxisAlignedClip(rt);
+
+    /* Keep the caret in view when the text is taller than the box. */
+    D2D1_RECT_F cr;
+    if (ed_caret_rect(box, &cr)) {
+        if (cr.bottom > box.bottom) g_ed_scroll += cr.bottom - box.bottom;
+        else if (cr.top < box.top)  g_ed_scroll -= box.top - cr.top;
+        if (g_ed_scroll < 0) g_ed_scroll = 0;
+    }
+}
+
 /* ---- composer autocomplete (WIN-7) ---------------------------------------
  * Everything works in UTF-16 for the RichEdit and UTF-8 for the core: the text
  * up to the caret is converted once for oc_complete(), while the replacement
@@ -7039,14 +7630,11 @@ static void paint(HWND hwnd) {
 
 /* The caret, and the start of the token it sits in, as UTF-16 indices. */
 static int ac_token_range(WCHAR *buf, int cap, int *tok_start) {
-    if (!g_re) return -1;
-    DWORD sels = 0, sele = 0;
-    SendMessageW(g_re, EM_GETSEL, (WPARAM)&sels, (LPARAM)&sele);
-    if (sels != sele) return -1;                 /* a live selection: not completing */
-    int len = GetWindowTextLengthW(g_re);
+    if (ed_has_sel()) return -1;                 /* a live selection: not completing */
+    int len = ed_len();
     if (len <= 0 || len >= cap) return -1;
-    GetWindowTextW(g_re, buf, cap);
-    int caret = (int)sele;
+    ed_get(buf, cap);
+    int caret = ed_caret_pos();
     if (caret > len) caret = len;
     int ts = 0;
     for (int i = caret - 1; i >= 0; i--)
@@ -7077,7 +7665,7 @@ static void ac_rebuild(void) {
  * so the next word starts cleanly. */
 static void ac_accept(void) {
     crumb("ac_accept sel=%d n=%d", g_ac_sel, g_n_ac);
-    if (g_n_ac <= 0 || !g_re) return;
+    if (g_n_ac <= 0) return;
     WCHAR buf[4096]; int ts = 0;
     int caret = ac_token_range(buf, 4096, &ts);
     if (caret < 0) { ac_close(); return; }
@@ -7087,14 +7675,13 @@ static void ac_accept(void) {
     if (n <= 0) { ac_close(); return; }
     repl[n - 1] = L' '; repl[n] = 0;             /* overwrite the NUL with a space */
 
-    SendMessageW(g_re, EM_SETSEL, (WPARAM)ts, (LPARAM)caret);
-    SendMessageW(g_re, EM_REPLACESEL, TRUE, (LPARAM)repl);
+    ed_replace_range(ts, caret, repl);
     ac_close();
 }
 
 static void composer_send(void) {
     crumb("composer_send ch=%llu", (unsigned long long)g_sel);
-    if (!g_re || !g_client || !g_sel) return;
+    if (!g_client || !g_sel) return;
     /* Refuse locally in an archived channel so the text is not lost to a server
      * rejection you have to read in a toast (REQ-035). The daemon refuses it
      * too — this is the courteous half, not the enforcing one. */
@@ -7106,11 +7693,11 @@ static void composer_send(void) {
             return;
         }
     }
-    int wlen = GetWindowTextLengthW(g_re);
+    int wlen = ed_len();
     if (wlen <= 0) return;
     WCHAR *w = (WCHAR *)malloc((size_t)(wlen + 1) * sizeof(WCHAR));
     if (!w) return;
-    GetWindowTextW(g_re, w, wlen + 1);
+    ed_get(w, wlen + 1);
     int blen = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
     char *b = (char *)malloc((size_t)(blen > 0 ? blen : 1));
     if (b) {
@@ -7138,33 +7725,22 @@ static void composer_send(void) {
     g_unread_from = 0; g_unread_count = 0;
     for (int i = 0; i < g_n_drafts; i++)          /* it is sent; not a draft any more */
         if (g_drafts[i].cid == g_sel) { g_drafts[i] = g_drafts[--g_n_drafts]; break; }
-    SetWindowTextW(g_re, L"");
+    ed_clear();
 }
 
 static void composer_begin_edit(const oc_msg *msg) {
-    if (!g_re || !msg || msg->deleted) return;
+    if (!msg || msg->deleted) return;
     g_edit_msg = msg->message_id;
     WCHAR w[2048];
     to_w(msg->body ? msg->body : "", w, 2048);
-    SetWindowTextW(g_re, w);
-    SendMessageW(g_re, EM_SETSEL, (WPARAM)-2, -1);      /* caret to end */
-    SetFocus(g_re);
+    ed_set(w);                                          /* caret lands at the end */
+    ed_focus(GetActiveWindow());
 }
 
 static void composer_cancel_edit(void) {
     g_edit_msg = 0;
-    if (g_re) SetWindowTextW(g_re, L"");
+    ed_clear();
 }
-
-/* The composer's placeholder. It has to be painted INSIDE the control: the
- * RichEdit is opaque and composites above the Direct2D chrome, so anything the
- * scene draws behind it is hidden. RichEdit also ignores EM_SETCUEBANNER, which
- * is what the other boxes use.
- *
- * Worth the trouble because the composer said nothing about where the message
- * was going — and with several workspaces open (WIN-29) "which conversation is
- * this?" is a real question. */
-static HFONT g_ph_font;
 
 /* The composer's cue text, derived from the open conversation.
  *
@@ -7190,33 +7766,6 @@ static void composer_cue(const oc_model *m, char *out, size_t cap) {
         snprintf(out, cap, "Message #%s", c->name ? c->name : "channel");
 }
 
-/* `into` is NULL for an ordinary repaint (we fetch the control's own DC) and a
- * caller's DC when the control is being rendered into a bitmap — which is how
- * the cue reaches a screenshot at all. Painting only to GetDC(hwnd) meant the
- * cue existed on screen and nowhere else: invisible to every capture route, so
- * the one string in the composer that users read could not be checked. */
-static void composer_draw_placeholder(HWND hwnd, HDC into) {
-    char ph[160];
-    composer_cue(model(), ph, sizeof ph);
-    if (!ph[0] || GetWindowTextLengthW(hwnd) > 0) return;
-    HDC dc = into ? into : GetDC(hwnd);
-    if (!dc) return;
-    if (!g_ph_font)
-        /* The placeholder has to match the RichEdit's own text exactly, so it
-         * takes the same family and the same body token. */
-        g_ph_font = CreateFontW(-PX(FONT_BODY * g_text_scale), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                                VARIABLE_PITCH | FF_SWISS, ui_family());
-    HFONT old = (HFONT)SelectObject(dc, g_ph_font);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, OCRGB(OC_COL_FAINT));
-    WCHAR w[160]; int n = to_w(ph, w, 160);
-    RECT rc; GetClientRect(hwnd, &rc);
-    /* Matches EM_SETMARGINS(12) and the control's own first-line origin. */
-    TextOutW(dc, 0, PX(1), w, n);
-    SelectObject(dc, old);
-    if (!into) ReleaseDC(hwnd, dc);
-}
 
 /* Subclass proc: Enter sends, Shift+Enter inserts a newline. While the
  * autocomplete popover is open it takes Up/Down/Tab/Enter/Esc first — Enter
@@ -7224,52 +7773,6 @@ static void composer_draw_placeholder(HWND hwnd, HDC into) {
  * part of the composer instead of a thing floating over it. */
 static void nav_conversation(HWND hwnd, int delta, int unread_only);   /* fwd */
 
-static LRESULT CALLBACK re_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_PAINT) {
-        /* Let the control paint, then overlay the cue on the empty field. */
-        LRESULT r = CallWindowProcW(g_re_oldproc, hwnd, msg, wp, lp);
-        composer_draw_placeholder(hwnd, NULL);
-        return r;
-    }
-    /* The same overlay when the control is asked to render into someone's DC —
-     * the screenshot path. Without this arm a capture shows an empty composer
-     * however correct the cue is. */
-    if (msg == WM_PRINTCLIENT) {
-        LRESULT r = CallWindowProcW(g_re_oldproc, hwnd, msg, wp, lp);
-        composer_draw_placeholder(hwnd, (HDC)wp);
-        return r;
-    }
-    if (g_n_ac > 0 && (msg == WM_KEYDOWN || msg == WM_CHAR)) {
-        int handled = 1;
-        switch (wp) {
-        case VK_UP:     if (msg == WM_KEYDOWN) g_ac_sel = (g_ac_sel + g_n_ac - 1) % g_n_ac; break;
-        case VK_DOWN:   if (msg == WM_KEYDOWN) g_ac_sel = (g_ac_sel + 1) % g_n_ac; break;
-        case VK_TAB:
-        case VK_RETURN: if (msg == WM_KEYDOWN) ac_accept(); break;
-        case VK_ESCAPE: if (msg == WM_KEYDOWN) ac_close(); break;
-        default: handled = 0;
-        }
-        if (handled) { InvalidateRect(GetParent(hwnd), NULL, FALSE); return 0; }
-    }
-    /* Conversation movement while typing: the composer holds focus almost
-     * always, so these have to work from here or they do not work at all. */
-    if ((msg == WM_KEYDOWN || msg == WM_CHAR) && wp == VK_RETURN
-        && !(GetKeyState(VK_SHIFT) & 0x8000)) {
-        if (msg == WM_KEYDOWN) composer_send();
-        return 0;                                   /* eat both so no newline/bell */
-    }
-    if ((msg == WM_KEYDOWN || msg == WM_CHAR) && wp == VK_ESCAPE) {
-        if (g_pick_open) { if (msg == WM_KEYDOWN) picker_close(GetParent(hwnd)); return 0; }
-        /* modal_open() explicitly: a modal is not an `any_overlay` (it covers the
-         * whole window, not the middle column), but Esc must still dismiss it. */
-        if (modal_open() || any_overlay(model())) {
-            if (msg == WM_KEYDOWN) close_overlays();
-            return 0;
-        }
-        if (g_edit_msg) { if (msg == WM_KEYDOWN) composer_cancel_edit(); return 0; }
-    }
-    return CallWindowProcW(g_re_oldproc, hwnd, msg, wp, lp);
-}
 
 /* Recompute the composer's height from what is actually in it. EM_GETLINECOUNT
  * counts WRAPPED lines on a multiline control, so a long single paragraph grows
@@ -7278,8 +7781,14 @@ static LRESULT CALLBACK re_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
  * on every keystroke. */
 static int composer_remeasure(void) {
     float want = COMPOSER_H;
-    if (g_re) {
-        int lines = (int)SendMessageW(g_re, EM_GETLINECOUNT, 0, 0);
+    {
+        /* From OUR layout now: the wrapped line count of the text at the width the
+         * field is actually drawn at. EM_GETLINECOUNT answered the same question for
+         * the RichEdit; this answers it for the same reason — a long paragraph has to
+         * grow the box, which is the case a fixed height got worst. */
+        float w = g_ed_box.right - g_ed_box.left;
+        if (w < 40) w = 400;                     /* before the first layout pass */
+        int lines = ed_lines(w);
         if (lines < 1) lines = 1;
         if (lines > COMPOSER_MAX_LINES) lines = COMPOSER_MAX_LINES;
         float th = (float)lines * COMPOSER_LINE;
@@ -7326,11 +7835,17 @@ static int window_is_covered(void) {
 
 static void layout_composer(HWND hwnd) {
     layout_find(hwnd);
-    if (!g_re) return;
-    /* Only where there is a conversation to type into, and only when nothing
-     * covers the window (layout_natives explains why both matter). */
-    if (!main_is_conversation() || window_is_covered()) { ShowWindow(g_re, SW_HIDE); return; }
-    ShowWindow(g_re, SW_SHOW);
+    /* The composer is drawn, not moved (WIN-80): this computes the TEXT RECT that
+     * ed_draw paints into and ed_hit tests against. There is no child window to
+     * show or hide any more — which also means no bare control punched through an
+     * overlay, the class of bug that produced WIN-70 and its two relatives. Focus
+     * is still dropped when the field is not typeable, or keys would go to a field
+     * nobody can see. */
+    if (!main_is_conversation() || window_is_covered()) {
+        g_ed_box = rf(0, 0, 0, 0);
+        g_ed_focus = 0;
+        return;
+    }
     RECT rc; GetClientRect(hwnd, &rc);
     rc.right = (LONG)DIPF(rc.right); rc.bottom = (LONG)DIPF(rc.bottom);
     const oc_model *m = model();
@@ -7348,7 +7863,7 @@ static void layout_composer(HWND hwnd) {
     float inner = composer_inner_h();
     float texth = inner > COMPOSER_BTN ? inner : COMPOSER_LINE;
     float ty = by0 + COMPOSER_PAD + (inner > COMPOSER_BTN ? 0.0f : (COMPOSER_BTN - COMPOSER_LINE) / 2);
-    MoveWindow(g_re, PX(tx), PX(ty), PX(tr - tx), PX(texth), TRUE);
+    g_ed_box = rf(tx, ty, tr, ty + texth);
 }
 
 /* Position the "Find a conversation" EDIT inside its sidebar box (transcript
@@ -7396,7 +7911,7 @@ static LRESULT CALLBACK find_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
      * this proc used to carry its own copies, which is how the two ends of F6
      * drifted apart. */
     if (msg == WM_KEYDOWN && wp == VK_ESCAPE) {
-        SetFocus(g_re ? g_re : GetParent(hwnd));
+        ed_focus(GetParent(hwnd));
         return 0;
     }
     if (msg == WM_CHAR && wp == VK_ESCAPE) return 0;    /* no MessageBeep */
@@ -7480,7 +7995,7 @@ static void palette_close(HWND hwnd) {
     if (g_fwd_mid && !g_pal_accepting) { g_fwd_mid = g_fwd_cid = 0; }
     g_pal_open = 0; g_pal_sel = 0;
     if (g_pal_edit) ShowWindow(g_pal_edit, SW_HIDE);
-    if (g_re) SetFocus(g_re);
+    ed_focus(GetActiveWindow());
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
@@ -7682,7 +8197,7 @@ static LRESULT CALLBACK srch_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HWND parent = GetParent(hwnd);
         if (g_client) oc_client_close_search(g_client);
         ShowWindow(hwnd, SW_HIDE);
-        SetFocus(g_re ? g_re : parent);
+        ed_focus(parent);
         InvalidateRect(parent, NULL, FALSE);
         return 0;
     }
@@ -7755,22 +8270,13 @@ static void signin_create(HWND parent) {
     layout_signin(parent);
 }
 
-/* Re-skin the native children after a theme change. The D2D chrome repaints
- * itself from oc_theme[] every frame, but a RichEdit keeps its own background
- * and the EDIT brush is cached — leave them and the controls stay dark on a
- * light shell. */
+/* Re-skin the native children after a theme change. The D2D chrome repaints itself
+ * from oc_theme[] every frame; an EDIT caches its background brush. The composer
+ * used to be here too, when it was a RichEdit with its own background and character
+ * format — it is drawn from oc_theme[] like everything else now (WIN-80). */
 static void theme_restyle_children(void) {
     if (g_find_brush) { DeleteObject(g_find_brush); g_find_brush = NULL; }
-    if (!g_re) return;
-    SendMessageW(g_re, EM_SETBKGNDCOLOR, 0, (LPARAM)OCRGB(OC_COL_INPUT));
-    CHARFORMAT2W cf; ZeroMemory(&cf, sizeof cf);
-    cf.cbSize = sizeof cf;
-    cf.dwMask = CFM_COLOR;
-    cf.crTextColor = OCRGB(OC_COL_TEXT);
-    SendMessageW(g_re, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
 }
-
-static void composer_scale_font(void);    /* fwd */
 
 /* Force a scale factor. Shared by WM_DPICHANGED's path, the `dpi` test verb and
  * the Advanced pane's override, because the render target, the brushes and every
@@ -7785,7 +8291,6 @@ static void dpi_set(HWND hwnd, UINT dpi) {
     if (g_brush4) { ID2D1SolidColorBrush_Release(g_brush4); g_brush4 = NULL; }
     thumbs_drop();
     if (g_rt) { ID2D1HwndRenderTarget_Release(g_rt); g_rt = NULL; }
-    if (g_ph_font) { DeleteObject(g_ph_font); g_ph_font = NULL; }
     if (g_form_font) { DeleteObject(g_form_font); g_form_font = NULL; g_form_font_scale = -1; }
     layout_natives(hwnd);
     layout_signin(hwnd);
@@ -7802,8 +8307,9 @@ static void scale_apply(HWND hwnd) {
     if (g_body)
         IDWriteTextFormat_SetLineSpacing(g_body, DWRITE_LINE_SPACING_METHOD_UNIFORM,
                                          22.0f * g_text_scale, 16.5f * g_text_scale);
-    if (g_ph_font) { DeleteObject(g_ph_font); g_ph_font = NULL; }   /* rebuilt on demand */
-    composer_scale_font();     /* the RichEdit carries its own size, in twips */
+    /* The composer draws through g_body, which fonts_build() just replaced, so its
+     * cached layout is stale — and stale is not visibly wrong, which is worse. */
+    ed_invalidate_layout();
     layout_natives(hwnd);
     InvalidateRect(hwnd, NULL, FALSE);
 }
@@ -7814,41 +8320,12 @@ static void theme_set(int mode) {
     theme_restyle_children();
 }
 
-/* The composer's text size. A RichEdit keeps its own CHARFORMAT, in twips, so it
- * does not follow a DirectWrite rebuild — leave this out and the transcript scales
- * while the box you type into does not. */
-static void composer_scale_font(void) {
-    if (!g_re) return;
-    CHARFORMAT2W cf; ZeroMemory(&cf, sizeof cf);
-    cf.cbSize = sizeof cf;
-    cf.dwMask = CFM_SIZE | CFM_FACE;
-    cf.yHeight = (LONG)(FONT_BODY * g_text_scale * 15.0f);
-    lstrcpynW(cf.szFaceName, ui_family(), LF_FACESIZE);
-    SendMessageW(g_re, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
-}
-
+/* Where the RichEdit used to be created. Nothing to create: the composer is part of
+ * the scene (WIN-80). It still needs the focus at startup, because typing into the
+ * conversation without clicking first is the whole point of a chat client. */
 static void composer_create(HWND parent) {
-    g_re = CreateWindowExW(0, MSFTEDIT_CLASS, L"",
-        WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL,
-        0, 0, 10, 10, parent, NULL, GetModuleHandleW(NULL), NULL);
-    if (!g_re) return;
-    SendMessageW(g_re, EM_SETBKGNDCOLOR, 0, (LPARAM)OCRGB(OC_COL_INPUT));
-    CHARFORMAT2W cf; ZeroMemory(&cf, sizeof cf);
-    cf.cbSize = sizeof cf;
-    cf.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE;
-    cf.crTextColor = OCRGB(OC_COL_TEXT);
-    /* Match g_body exactly: DIP -> twips is x15 (72/96 pt-per-DIP, 20 twips/pt). */
-    cf.yHeight = (LONG)(FONT_BODY * g_text_scale * 15.0f);   /* twips */
-    lstrcpynW(cf.szFaceName, ui_family(), LF_FACESIZE);
-    SendMessageW(g_re, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
-    SendMessageW(g_re, EM_SETEVENTMASK, 0, ENM_CHANGE);
-    /* A little inner margin so text isn't jammed against the edge. */
-    /* No inner margin: the control is placed at the box's text inset already,
-     * and a second margin pushed the caret visibly off the left edge. */
-    SendMessageW(g_re, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(0, 0));
-    g_re_oldproc = (WNDPROC)SetWindowLongPtrW(g_re, GWLP_WNDPROC, (LONG_PTR)re_proc);
     layout_composer(parent);
-    SetFocus(g_re);
+    ed_focus(parent);
 }
 
 /* ---- context menus + actions --------------------------------------------- */
@@ -8597,7 +9074,7 @@ static int on_click(HWND hwnd, int x, int y) {
     if (g_n_ac > 0) {
         if (in_rect(g_ac_panel, x, y)) {
             for (int i = 0; i < g_n_ac; i++)
-                if (in_rect(g_ac_rows[i], x, y)) { g_ac_sel = i; ac_accept(); SetFocus(g_re); break; }
+                if (in_rect(g_ac_rows[i], x, y)) { g_ac_sel = i; ac_accept(); ed_focus(hwnd); break; }
             return 1;
         }
         ac_close();     /* a click anywhere else dismisses it, then falls through */
@@ -8954,9 +9431,9 @@ static int on_click(HWND hwnd, int x, int y) {
     if (in_rect(g_at_btn, x, y)) {
         /* Insert the trigger at the caret and let the normal completion path
          * take over, so the button and typing "@" behave identically. */
-        if (g_re) {
-            SetFocus(g_re);
-            SendMessageW(g_re, EM_REPLACESEL, TRUE, (LPARAM)L"@");
+        {
+            ed_focus(hwnd);
+            ed_insert(L"@");
             ac_rebuild();
             InvalidateRect(hwnd, NULL, FALSE);
         }
@@ -10815,6 +11292,16 @@ static void test_dump(const char *path) {
                 g_rows[i].sec, g_rows[i].header,
                 (unsigned long long)g_rows[i].cid, g_rows[i].label);
     fprintf(f, "myavatar=%llu\n", (unsigned long long)avatar_of(m, m->user_id));
+    {
+        char ed8[1024] = "";
+        WCHAR edw[512];
+        int n = ed_get(edw, 512);
+        if (n > 0) WideCharToMultiByte(CP_UTF8, 0, edw, -1, ed8, sizeof ed8, NULL, NULL);
+        fprintf(f, "ed len=%d caret=%d sel=%d focus=%d box=%.0f,%.0f,%.0f,%.0f comp=%d text=\"%s\"\n",
+                ed_len(), ed_caret_pos(), ed_has_sel(), ed_focused(),
+                g_ed_box.left, g_ed_box.top, g_ed_box.right, g_ed_box.bottom,
+                g_ed_comp_len, ed8);
+    }
     fprintf(f, "cemoji=%zu\n", m->n_cemoji);
     for (size_t i = 0; i < m->n_cemoji; i++)
         fprintf(f, "  cemoji %s attach=%llu\n", m->cemoji[i].name,
@@ -10876,7 +11363,7 @@ static void test_dump(const char *path) {
      * they are reported here instead — otherwise the one class of bug the
      * harness cannot see is the one that reaches the user. */
     fprintf(f, "natives re=%d find=%d ffind=%d srch=%d pick=%d pal=%d si_ws=%d sbkind=%d conv=%d covered=%d\n",
-            g_re && IsWindowVisible(g_re), g_find && IsWindowVisible(g_find),
+            (g_ed_box.right > g_ed_box.left), g_find && IsWindowVisible(g_find),
             g_ffind && IsWindowVisible(g_ffind),
             g_srch && IsWindowVisible(g_srch), g_pick_edit && IsWindowVisible(g_pick_edit),
             g_pal_edit && IsWindowVisible(g_pal_edit),
@@ -10969,7 +11456,7 @@ static void test_poll(HWND hwnd) {
     } else if (!strcmp(verb, "shot")) {
         test_ack(test_shot(hwnd, arg) ? "ok" : "err");
     } else if (!strcmp(verb, "send")) {
-        if (g_re) { WCHAR w[1024]; to_w(arg, w, 1024); SetWindowTextW(g_re, w); composer_send(); }
+        { WCHAR w[1024]; to_w(arg, w, 1024); ed_set(w); composer_send(); }
         test_ack("ok");
     } else if (!strcmp(verb, "channel")) {
         /* By NAME, or by id when the argument is a number — a DM has no name at all
@@ -10983,7 +11470,15 @@ static void test_poll(HWND hwnd) {
             }
         test_ack("ok");
     } else if (!strcmp(verb, "click")) {
-        int x = 0, y = 0; sscanf(arg, "%d %d", &x, &y); on_click(hwnd, x, y); test_ack("ok");
+        /* A REAL WM_LBUTTONDOWN/UP pair, not a direct on_click: the composer is a
+         * self-drawn field now (WIN-80) and its caret placement lives in the button
+         * handler, so a verb that jumped straight to on_click could not click into
+         * the one control users click into most. */
+        int x = 0, y = 0; sscanf(arg, "%d %d", &x, &y);
+        LPARAM pos = MAKELPARAM(PX(x), PX(y));
+        SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, pos);
+        SendMessageW(hwnd, WM_LBUTTONUP, 0, pos);
+        test_ack("ok");
     } else if (!strcmp(verb, "rclick")) {
         int x = 0, y = 0; sscanf(arg, "%d %d", &x, &y); on_rclick(hwnd, x, y); test_ack("ok");
     } else if (!strcmp(verb, "members")) {
@@ -11004,13 +11499,12 @@ static void test_poll(HWND hwnd) {
     } else if (!strcmp(verb, "type")) {
         /* Put text in the composer WITHOUT sending, caret at the end, so the
          * autocomplete popover sees the same state as live typing. */
-        if (g_re) {
+        {
             WCHAR w[1024]; to_w(arg, w, 1024);
-            SetWindowTextW(g_re, w);
-            SendMessageW(g_re, EM_SETSEL, (WPARAM)-2, -1);
+            ed_set(w);
             ac_rebuild();
             test_ack("ok");
-        } else test_ack("err");
+        }
     } else if (!strcmp(verb, "upload")) {
         /* Bypass the file dialog so an attachment can be posted from the harness. */
         if (g_client && g_sel && arg[0]) { oc_client_upload(g_client, g_sel, arg); test_ack("ok"); }
@@ -11039,6 +11533,13 @@ static void test_poll(HWND hwnd) {
         ClientToScreen(hwnd, &sp);
         SendMessageW(hwnd, WM_MOUSEWHEEL, (WPARAM)(d << 16), MAKELPARAM(sp.x, sp.y));
         test_ack("ok");
+    } else if (!strcmp(verb, "chars")) {
+        /* Real WM_CHARs, one per character (WIN-80). `type` SETS the text; this
+         * TYPES it, which is the path that exercises insertion, the caret, the
+         * typing indicator and the autocomplete — the code a user actually runs. */
+        WCHAR w[512]; int n = to_w(arg, w, 512);
+        for (int i = 0; i < n; i++) SendMessageW(hwnd, WM_CHAR, (WPARAM)w[i], 0);
+        test_ack("ok");
     } else if (!strcmp(verb, "key")) {
         /* A raw virtual key through the real WM_KEYDOWN path, so Esc/Enter/Tab
          * behaviour is drivable at all — without this, every keyboard rule in the
@@ -11063,6 +11564,14 @@ static void test_poll(HWND hwnd) {
                  !strcmp(k, "down")  ? VK_DOWN   :
                  !strcmp(k, "f6")    ? VK_F6     :
                  !strcmp(k, "slash") ? VK_OEM_2  :
+                 /* Named, because a single digit is the DIGIT key (Ctrl+0 is zoom
+                  * reset) — `key 8` for VK_BACK would be read as typing "8". */
+                 (!strcmp(k, "back") || !strcmp(k, "backspace")) ? VK_BACK :
+                 (!strcmp(k, "del") || !strcmp(k, "delete")) ? VK_DELETE :
+                 !strcmp(k, "home") ? VK_HOME :
+                 !strcmp(k, "end")  ? VK_END  :
+                 !strcmp(k, "left") ? VK_LEFT :
+                 !strcmp(k, "right") ? VK_RIGHT :
                  /* The OEM keys, by name: "=" and "-" are not letters and atoi()
                   * quietly turned both into VK 0, so `key ctrl+=` was a no-op that
                   * still acked "ok" — a harness lying in the one direction that
@@ -11714,16 +12223,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         layout_signin(hwnd);      /* the card is centred, so it moves with the window */
         return 0;
     case WM_COMMAND:
-        if (g_re && (HWND)lp == g_re && HIWORD(wp) == EN_CHANGE) {
-            DWORD now = GetTickCount();
-            if (g_client && g_sel && now - g_last_typing > 2000) {
-                oc_client_typing(g_client, g_sel);
-                g_last_typing = now;
-            }
-            ac_rebuild();                       /* WIN-7: candidates track the caret */
-            if (composer_remeasure()) layout_composer(hwnd);
-            InvalidateRect(hwnd, NULL, FALSE);
-        }
         if (g_pal_edit && (HWND)lp == g_pal_edit && HIWORD(wp) == EN_CHANGE) {
             g_pal_sel = 0;
             InvalidateRect(hwnd, NULL, FALSE);
@@ -11812,6 +12311,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_LBUTTONDOWN: {
         int mx = (int)DIPF(GET_X_LPARAM(lp)), my = (int)DIPF(GET_Y_LPARAM(lp));
+        /* The composer first: it is a self-drawn field now (WIN-80), so a click in it
+         * places the caret rather than being swallowed by a child window. Before
+         * on_click, or the transcript's selection would start under it. */
+        if (!window_is_covered() && ed_mouse_down(hwnd, (float)mx, (float)my)) return 0;
         if (!any_overlay(model()) && pt_in(g_sbar_thumb, mx, my)) {
             g_sbar_drag = 1; g_sbar_grab = (float)my - g_sbar_thumb.top;
             SetCapture(hwnd);
@@ -11829,6 +12332,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_mouse_x = mx; g_mouse_y = my;
             if (modal_open()) InvalidateRect(hwnd, NULL, FALSE);   /* frame hovers */
         }
+        if (g_ed_dragging) { ed_mouse_move(hwnd, (float)mx, (float)my); return 0; }
         if (g_sbar_drag) {
             if (g_sbar_travel > 0) {
                 float off = (float)my - g_sbar_grab - g_sbar_track_top;
@@ -11924,6 +12428,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_LBUTTONUP:
+        if (g_ed_dragging) { ed_mouse_up(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (g_sbar_drag) { g_sbar_drag = 0; ReleaseCapture(); InvalidateRect(hwnd, NULL, FALSE); }
         else if (g_selecting) { selection_end(); InvalidateRect(hwnd, NULL, FALSE); }
         return 0;
@@ -11943,9 +12448,36 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (wp == VK_ESCAPE && g_more_open) { g_more_open = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_ESCAPE && g_has_sel) { g_has_sel = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
+        /* The composer LAST among the specific cases and before the shell's
+         * fall-through: the overlays above own Esc while they are open, and the
+         * field owns every other key while it has focus (WIN-80). The main window
+         * really does have Win32 focus now — the field is not a child — so this is
+         * where its keys arrive. */
+        if (ed_key(hwnd, wp)) return 0;
         /* Ctrl+/, Ctrl+F, Ctrl+K, Alt+arrows and F6 are handled in the message
          * loop (SHORTCUTS / accel_dispatch), not here: a shortcut in this proc only
-         * fires when the main window has focus, and the composer holds it. */
+         * fires when the main window has focus, which is now always. */
+        return 0;
+    case WM_CHAR:
+        if (ed_char(hwnd, (WCHAR)wp)) return 0;
+        return 0;
+    case WM_IME_STARTCOMPOSITION:
+    case WM_IME_COMPOSITION:
+    case WM_IME_ENDCOMPOSITION:
+        if (ed_ime(hwnd, msg, wp, lp)) return 0;
+        break;
+    case WM_SETFOCUS:
+        /* Coming back from a native child (the find box, the palette, a form
+         * field) means the field is typeable again. */
+        if (main_is_conversation() && !window_is_covered()) ed_focus(hwnd);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    case WM_KILLFOCUS:
+        /* Losing it to a child, or to another app: the caret must stop drawing, or
+         * two carets blink at once and neither is where your keys go. */
+        g_ed_focus = 0;
+        ed_mouse_up();
+        InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     case WM_GETMINMAXINFO: {
         /* Item 4: never shrink below fitting the workspace icon + Home + More +
@@ -12009,6 +12541,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     default:
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
+    /* A `break` inside the switch (the IME arms) means "not handled": fall through
+     * to the default handling rather than returning 0, which would swallow it. */
+    return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
@@ -12053,7 +12588,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
 
     /* Before the window exists: awareness is a process-wide, one-shot decision. */
     dpi_declare_awareness();
-    LoadLibraryW(L"Msftedit.dll");        /* registers MSFTEDIT_CLASS (RICHEDIT50W) */
     /* Before anything paints: the palette is runtime state now, and every
      * OC_COL_* reads through it. */
     oc_theme_apply(OC_THEME_DARK);

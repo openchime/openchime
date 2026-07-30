@@ -8,6 +8,7 @@
 #include "tk_style.h"
 #include "tk_term.h"
 
+#include <stdio.h>      /* snprintf */
 #include <string.h>
 
 tk_rect tk_modal_begin(int W, int H, int w, int h, const char *title) {

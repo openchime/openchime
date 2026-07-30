@@ -640,6 +640,30 @@ is the product of the first two, so nothing downstream has to know there are two
 inputs; anything that caches a font size of its own (the RichEdit's CHARFORMAT, the
 placeholder HFONT, the form fields' HFONT) is rebuilt by `scale_apply`.
 
+## The composer is ours (WIN-80, ARCH-98)
+
+There is no RichEdit and **no child window**. The field is drawn into the Direct2D
+scene by `ed_draw()`, and the **main window** owns the keyboard while `g_ed_focus` is
+set. Consequences worth knowing before touching it:
+
+- **`layout_composer()` computes a rect, it does not move a control.** `g_ed_box` is
+  both what `ed_draw` paints into and what `ed_hit` tests against, so what you click
+  is what you see. When the middle column is not a conversation the rect is emptied
+  **and focus is dropped** — keys must not go to a field nobody can see.
+- **Every mutation goes through `ed_begin_edit()`**, which pushes an undo snapshot.
+  Undo is whole-text snapshots rather than a journal: a message is at most 4000 UTF-16
+  units, so a snapshot is 8KB, and it cannot get out of step with the buffer.
+- **`ed_changed()` is the one post-edit path** — it re-measures the box, fires the
+  typing indicator (which used to ride `EN_CHANGE`), refreshes the completion popover
+  and resets the caret blink. A key handler that mutates text and skips it will look
+  almost right.
+- **The IME composition string is spliced into the layout at the caret**, not appended
+  to the buffer: that is what makes it wrap and measure like real text, and therefore
+  what makes the candidate window land in the right place. Hit-testing subtracts its
+  length again, because it is in the layout and not in the text.
+- **Anything that replaces `g_body` must call `ed_invalidate_layout()`** (see
+  `scale_apply`). A stale layout is not visibly broken, which is worse than broken.
+
 ## Screenshots can see images (and could not, until WIN-47)
 
 `test_shot` renders the scene into its own DC render target. A D2D bitmap belongs to
@@ -659,7 +683,7 @@ unverifiable.
 
 ## Run the GUI smoke before pushing Win32 chrome
 
-`scripts/gui_smoke.sh` asserts **98 invariants** through the test hook: for each of
+`scripts/gui_smoke.sh` asserts **109 invariants** through the test hook: for each of
 the six views, what is in the second column (`sidebar_kind`), whether the middle
 one is typeable (`main_is_conversation`), which native children are shown, and
 whether anything covers the window — plus the search overlay, the Pins tab, the

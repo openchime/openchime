@@ -72,7 +72,7 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 | ~~**WIN-77**~~ | ~~Modal frame: `confirm()` · pane headers · `form_dialog`'s 16 sites~~ **DONE** — see §1 | P1 | L |
 | ~~**WIN-78**~~ | ~~Preferences as two panes + appearance depth~~ **DONE** — see §1 | P2 | M |
 | ~~**WIN-79**~~ | ~~Replace the native context menus~~ **DONE** (ARCH-98). All four — message, member, channel, image kebab — are the app's own floating menu; `TrackPopupMenu`, `CreatePopupMenu` and `AppendMenuW` appear nowhere in the client. They keep **their own command numbers**, dispatched per kind, because the dropdowns' space was already crowded (a message's "Edit = 21" collides with a notification level). The three **submenus were flattened**: roles and notify levels became ticked sections, which shows the current value that a submenu hid behind a hover; the quick reactions became a new `MK_EMOJIROW` — one row, per-glyph hit-boxes, colour font like the picker. | — |
-| **WIN-80** | Custom DirectWrite composer, replacing RichEdit (ARCH-98) | P1 | XL |
+| ~~**WIN-80**~~ | ~~Custom DirectWrite composer, replacing RichEdit~~ **DONE** (ARCH-98) — see §1 | P1 | XL |
 | ~~**WIN-81**~~ | ~~The GUI smoke does not run in CI~~ **DONE as far as it can be** — the job exists, gated on a self-hosted runner | P2 | M |
 | ~~**WIN-82**~~ | ~~Files' census only saw the 200-row page~~ **DONE.** `LIST_FILE_CHANNELS` — one `GROUP BY` over attachments with the same membership filter as `LIST_FILES`, over the index migration 0023 already added. The column is now exact, so the "From the 200 most recent files" caveat is deleted rather than reworded. Counts verified against the database directly (17 and 1). | — |
 | ~~**WIN-83**~~ | ~~User-defined custom sidebar sections~~ **DONE** — see §1 | P3 | M |
@@ -257,15 +257,30 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
   LIST_MEMBERS per channel — and a name filter, since the palette already searches
   conversations by name.
 
-- **WIN-80 — the composer becomes ours.** Approved 2026-07-30 and recorded as
-  **ARCH-98**, which amends ARCH-82's LOCKED choice of RichEdit. RichEdit was chosen
-  for good reasons — editing, IME, selection, clipboard and undo for free — and all
-  of that has to be **written by hand** now. What it buys: colour emoji in the field
-  (RichEdit draws through GDI, so today the same character looks different in the
-  composer than in the picker or on a reaction chip), WYSIWYG for REQ-220, and a
-  surface we can make accessible for REQ-269. **The stated risk is IME**: it breaks
-  silently for CJK input on a machine where the author will not notice, and it is the
-  one part of this that cannot be self-verified. Lands behind the GUI smoke.
+- ~~**WIN-80 — the composer becomes ours.**~~ **DONE** (ARCH-98). No RichEdit and **no
+  child window**: the field is part of the Direct2D scene and the main window owns the
+  keyboard while it has focus. Hand-written and asserted by 11 new smoke checks:
+  insertion, wrapped-line measurement (so the box still grows with a long paragraph),
+  word-wise motion, selection by keyboard and by drag, clipboard, snapshot undo/redo,
+  click-to-caret, the draft round-trip and the mention completion.
+  **What it bought:** colour emoji in the field — the reason this was worth doing, since
+  the same character used to look washed out in the composer and correct in the picker,
+  on a reaction chip and in the transcript; a placeholder that lives in the SCENE rather
+  than being over-painted with GDI after the control finished (a hack that needed its own
+  `WM_PRINTCLIENT` arm to show up in a capture at all); and one less surface that can be
+  a native control punched through an overlay — the exact shape of WIN-70, WIN-71 and
+  WIN-72.
+  **IME is handled and remains the one unverified part**, as ARCH-98 said it would be:
+  the composition string is spliced into the layout so it wraps and measures like real
+  text, drawn underlined, and the candidate window is pinned to the caret
+  (`ImmSetCompositionWindow` / `ImmSetCandidateWindow`, so `-limm32` is a new link
+  dependency). What cannot be self-verified is how it behaves for CJK input on a machine
+  whose author does not use it. Recorded rather than claimed.
+  Two things fell out of the harness while building it: the `click` verb called
+  `on_click` directly and so could not click into the one control users click into most
+  — it sends a real `WM_LBUTTONDOWN`/`UP` pair now — and `key <n>` for a numeric VK
+  collided with the digit keys the zoom shortcuts needed, so `backspace`, `delete`,
+  `home`, `end`, `left` and `right` are named.
 
 - ~~**WIN-81 — the smoke is not in CI.**~~ **DONE as far as it honestly can be.** The
   `gui-smoke` job is written and committed: it builds both sides on a **self-hosted

@@ -8,6 +8,7 @@
 
 #include <ctype.h>
 #include <stdlib.h>
+#include <stdio.h>      /* snprintf */
 #include <string.h>
 
 /* Case-insensitive subsequence ("fuzzy") match: do needle's chars appear in

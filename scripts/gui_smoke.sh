@@ -457,6 +457,80 @@ else
   "$DRIVE" key esc >/dev/null 2>&1
 fi
 
+# --- the composer is ours (WIN-80) ------------------------------------------
+# Every one of these was the RichEdit's job until today, which means every one of
+# them is now code that can be wrong. They are asserted through `chars` (real
+# WM_CHARs) rather than `type` (which sets the text), because typing is the path a
+# user runs.
+say "== composer"
+"$DRIVE" view 0 >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; sleep 0.5
+ed() { snap | grep -oE "^ed .*" | head -1; }
+edf() {                            # edf <field>  -> its value
+  ed | grep -oE "$1=[-0-9]+" | head -1 | cut -d= -f2
+}
+
+"$DRIVE" chars "hello world" >/dev/null 2>&1; sleep 0.4
+checks=$((checks + 1))
+if [ "$(edf len)" = "11" ] && [ "$(edf caret)" = "11" ]; then ok "typing inserts and moves the caret"
+else fail "after typing: $(ed)"; fi
+
+"$DRIVE" key backspace >/dev/null 2>&1; sleep 0.3
+checks=$((checks + 1))
+[ "$(edf len)" = "10" ] && ok "Backspace deletes" || fail "Backspace: $(ed)"
+
+"$DRIVE" key ctrl+left >/dev/null 2>&1; sleep 0.3
+checks=$((checks + 1))
+[ "$(edf caret)" = "6" ] && ok "Ctrl+Left jumps a word" || fail "Ctrl+Left: $(ed)"
+
+"$DRIVE" key shift+left >/dev/null 2>&1; sleep 0.3
+checks=$((checks + 1))
+[ "$(edf sel)" = "1" ] && ok "Shift+Left selects" || fail "Shift+Left: $(ed)"
+
+"$DRIVE" key ctrl+z >/dev/null 2>&1; sleep 0.3
+checks=$((checks + 1))
+[ "$(edf len)" = "11" ] && ok "Ctrl+Z undoes the delete" || fail "Ctrl+Z: $(ed)"
+
+"$DRIVE" key ctrl+a >/dev/null 2>&1; sleep 0.3
+checks=$((checks + 1))
+[ "$(edf sel)" = "1" ] && ok "Ctrl+A selects all" || fail "Ctrl+A: $(ed)"
+
+# A click INSIDE the field places the caret — the field is drawn, not a child, so
+# this goes through the same WM_LBUTTONDOWN a user generates.
+r=$(ed | grep -oE 'box=[0-9,.-]+' | cut -d= -f2)
+if [ -n "${r:-}" ]; then
+  IFS=, read -r bl bt br bb <<<"$r"
+  "$DRIVE" click $(( ${bl%.*} + 14 )) $(( (${bt%.*} + ${bb%.*}) / 2 )) >/dev/null 2>&1; sleep 0.3
+  checks=$((checks + 1))
+  c=$(edf caret)
+  if [ -n "$c" ] && [ "$c" -lt 5 ]; then ok "a click places the caret (caret=$c)"
+  else fail "click-to-caret: $(ed)"; fi
+else
+  checks=$((checks + 1)); fail "no ed box in the dump"
+fi
+
+# The mention popover still tracks the caret, and Tab accepts.
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; sleep 0.3
+"$DRIVE" chars "hey @al" >/dev/null 2>&1; sleep 0.6
+"$DRIVE" key tab >/dev/null 2>&1; sleep 0.4
+checks=$((checks + 1))
+if ed | grep -q 'text="hey @alice "'; then ok "Tab accepts a mention completion"
+else fail "completion: $(ed)"; fi
+
+# Enter sends and clears; the draft machinery still works across a switch.
+"$DRIVE" key enter >/dev/null 2>&1; sleep 1
+checks=$((checks + 1))
+[ "$(edf len)" = "0" ] && ok "Enter sends and clears the field" || fail "after Enter: $(ed)"
+
+"$DRIVE" chars "a draft" >/dev/null 2>&1; sleep 0.3
+"$DRIVE" channel design >/dev/null 2>&1; sleep 0.5
+checks=$((checks + 1))
+[ "$(edf len)" = "0" ] && ok "the other channel starts empty" || fail "draft leaked: $(ed)"
+"$DRIVE" channel general >/dev/null 2>&1; sleep 0.5
+checks=$((checks + 1))
+if ed | grep -q 'text="a draft"'; then ok "and the draft comes back"
+else fail "draft lost: $(ed)"; fi
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1
+
 # --- the composer cue tracks the conversation ------------------------------
 # It was a cached global that went stale on a channel switch ("Message bob" while
 # reading alice), so it is asserted rather than eyeballed.
