@@ -1190,10 +1190,25 @@ None are yet backed by an architecture decision.*
   conform to the PUBLIC spec (verifiable, and a connector's parser expects those
   shapes anyway) and follow Discovery's naming where it is known, rather than claim
   bit-exactness with a document we cannot read.
-  **Mattermost's compliance export** is the other openly-documented model, and is
-  job-and-artifact oriented (Actiance XML, Global Relay EML, CSV) rather than an
-  API — closer to what a self-hosted operator actually runs, and worth considering
-  for the export FORMAT even if the interface follows Slack.
+  **Mattermost's compliance export is the other openly-documented model — and
+  checking it changed the question (2026-07-30).** Its formats are not Mattermost's:
+  per Mattermost's own documentation they are the **archiving vendors' ingest
+  formats** — *Actiance XML* for Smarsh (Vantage), *Global Relay EML* for Global
+  Relay, Proofpoint via Global Relay EML with custom SMTP, plus a generic CSV. So
+  the integration surface in this market is **the vendor's ingest format, not any
+  chat product's API**, and an open-source competitor demonstrably reaches those
+  vendors by emitting into them.
+  That points at a **push** mechanism — the daemon writes batches to a configured
+  destination on a schedule — as an alternative to the **pull** API this
+  requirement describes. Push is materially smaller: no public authenticated
+  surface, no integration-credential model, nothing new to defend, and it suits a
+  self-hosted operator who configures a destination rather than exposing a port.
+  The pull API earns its place where a vendor wants live capture or where the
+  operator cannot reach the destination.
+  **Not yet verified:** the Actiance-XML and Global-Relay-EML schemas themselves.
+  The vendor names and which format each consumes come from Mattermost's docs; the
+  formats would have to be obtained from the vendors before anything is emitted
+  claiming to be one.
 
   **[needs ARCH decision — (a) wire-compatible with Slack's `discovery.*` URLs and
   JSON envelope so an existing connector works unmodified, versus our own shape;
