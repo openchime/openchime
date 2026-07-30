@@ -73,7 +73,7 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
 | ~~**WIN-78**~~ | ~~Preferences as two panes + appearance depth~~ **DONE** — see §1 | P2 | M |
 | ~~**WIN-79**~~ | ~~Replace the native context menus~~ **DONE** (ARCH-98). All four — message, member, channel, image kebab — are the app's own floating menu; `TrackPopupMenu`, `CreatePopupMenu` and `AppendMenuW` appear nowhere in the client. They keep **their own command numbers**, dispatched per kind, because the dropdowns' space was already crowded (a message's "Edit = 21" collides with a notification level). The three **submenus were flattened**: roles and notify levels became ticked sections, which shows the current value that a submenu hid behind a hover; the quick reactions became a new `MK_EMOJIROW` — one row, per-glyph hit-boxes, colour font like the picker. | — |
 | **WIN-80** | Custom DirectWrite composer, replacing RichEdit (ARCH-98) | P1 | XL |
-| **WIN-81** | The GUI smoke does not run in CI — needs a self-hosted Windows runner | P2 | M |
+| ~~**WIN-81**~~ | ~~The GUI smoke does not run in CI~~ **DONE as far as it can be** — the job exists, gated on a self-hosted runner | P2 | M |
 | ~~**WIN-82**~~ | ~~Files' census only saw the 200-row page~~ **DONE.** `LIST_FILE_CHANNELS` — one `GROUP BY` over attachments with the same membership filter as `LIST_FILES`, over the index migration 0023 already added. The column is now exact, so the "From the 200 most recent files" caveat is deleted rather than reworded. Counts verified against the database directly (17 and 1). | — |
 | ~~**WIN-83**~~ | ~~User-defined custom sidebar sections~~ **DONE** — see §1 | P3 | M |
 | ~~**WIN-84**~~ | ~~Searches on the read connection see no rows~~ **WRONG DIAGNOSIS — see §1**; the real bug was `has:link` | P2 | M |
@@ -225,12 +225,19 @@ change as blockers clear (an item moves from §3 to §1 without changing its id)
   silently for CJK input on a machine where the author will not notice, and it is the
   one part of this that cannot be self-verified. Lands behind the GUI smoke.
 
-- **WIN-81 — the smoke is not in CI.** `scripts/gui_smoke.sh` asserts 59 chrome
-  invariants and has caught a real regression, but it runs by hand: the daemon is
-  epoll-based so it is Linux-only, and GitHub's Windows runners cannot host it (no
-  Linux containers). Needs a self-hosted Windows box with the daemon reachable.
-  Until then the pre-push gate is a human remembering, which is the same class of
-  problem as everything else in this file.
+- ~~**WIN-81 — the smoke is not in CI.**~~ **DONE as far as it honestly can be.** The
+  `gui-smoke` job is written and committed: it builds both sides on a **self-hosted
+  Windows+WSL** runner, runs `scripts/gui_smoke.sh --kill`, and uploads the captures
+  as artifacts, because a failing chrome assertion is a boolean whose *why* is a
+  picture. It is gated on a repository variable (`GUI_SMOKE=1`) plus the runner
+  labels, so with no such runner it is **skipped rather than red** — a permanently
+  failing check is one people learn to ignore.
+  **What remains is infrastructure, not code:** a machine with Windows for the client
+  and WSL for the daemon. GitHub's hosted Windows runners cannot host an epoll daemon
+  (no Linux containers), which is the whole reason this is not an ordinary job.
+  Writing it now rather than when the runner appears is deliberate: an unwritten job
+  is one nobody writes, and until the runner exists the smoke stays the pre-push gate
+  docs/CLIENT.md states as a standing rule.
 
 - ~~**WIN-84**~~ — **the diagnosis was wrong, and the real bug was worse.** The
   filed symptom was "six messages committed, a search returns 0 rows, so the
