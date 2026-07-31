@@ -532,8 +532,21 @@ the requirement says so explicitly rather than implying one.
   (REQ-120) — a distinct indicator on the presence dot plus a status line in the
   roster — so a colleague has known someone was unavailable before messaging
   them. This has been display only: it has not changed delivery, which DND
-  governs separately (REQ-131). **[needs ARCH decision — how DND/OOO/custom-status
-  is projected into the `PRESENCE_UPDATE` surface (ARCH-67).]**
+  governs separately (REQ-131).
+
+  **Partially built, and the unbuilt half is the DND half.** Custom status with
+  expiry shipped (WIN-53, migration 0027) and is shown beside names in the member
+  pane and profile. **Do-not-disturb is still self-only:** `dnd_enabled` /
+  `dnd_start_min` / `dnd_end_min` live on the model's *own-user* block, and
+  `oc_user` — the roster entry for everybody else — carries no DND field at all,
+  so the Win32 client's quiet-hours badge is something you can see only about
+  yourself. Slack shows a snooze icon to everyone, which is the point of the
+  indicator: it exists for the *sender*. This gets more valuable with REQ-278,
+  where a pause is transient and a sender has no other way to know.
+  **[needs ARCH decision — how DND/OOO/custom-status is projected into the
+  `PRESENCE_UPDATE` surface (ARCH-67); note ARCH-89 already records that presence
+  is invisible to the push worker's read-only connection, which is a related
+  constraint on where this state can be read.]**
 
 ---
 
@@ -544,12 +557,22 @@ the requirement says so explicitly rather than implying one.
   Built (ARCH-72): `SET_NOTIFY_PREF` stores the level in `notification_prefs`
   (server-authoritative), and a `NOTIFY_PREFS` snapshot syncs it to all the
   user's devices.
-- **REQ-131.** Each user has been able to configure a do-not-disturb
-  schedule that has suppressed push notification delivery without altering
-  in-app unread state (badges/counts have still updated). Built (ARCH-72):
-  `SET_DND` stores a daily UTC minutes-of-day window on `users`; it governs push
-  only. The push *delivery* it gates (REQ-132/133) is built as the daemon push
-  emitter (ARCH-85), which honors the DND window.
+- **REQ-131.** Each user has been able to configure a **recurring daily**
+  do-not-disturb window that has suppressed push notification delivery without
+  altering in-app unread state (badges/counts have still updated). Built
+  (ARCH-72): `SET_DND` stores a daily UTC minutes-of-day window on `users`
+  (wrapping past midnight); it governs push only. The push *delivery* it gates
+  (REQ-132/133) is built as the daemon push emitter (ARCH-85), which honors the
+  window.
+
+  > **Scope note (2026-07-31).** This is one of **three** distinct mechanisms
+  > Slack ships, and for a long time this requirement was treated as if it were
+  > all of them. It is the *recurring* one. A **transient pause to an absolute
+  > instant** ("do not disturb until 17:00") is **REQ-278** and is **not
+  > expressible in this model at all** — a minutes-of-day window is periodic by
+  > construction, so storing "until 5pm today" here would silence 5pm *every*
+  > day. A **richer recurring schedule** (per-weekday windows) is REQ-136, and a
+  > **workspace-level default** is REQ-279.
 - **REQ-132.** Push notifications have been delivered via APNs on iOS/macOS
   and FCM on Android (ARCH-16), at no per-notification cost, per the
   providers' free tiers as of this writing.
@@ -581,11 +604,62 @@ the requirement says so explicitly rather than implying one.
   notify. Both have driven notification like a mention (REQ-221). **[needs ARCH
   decision — keyword/priority storage + the match→notify decision, adjacent to
   ARCH-72/REQ-221.]**
-- **REQ-136.** A user has been able to configure a **notification schedule /
-  quiet hours** richer than the single daily DND window (REQ-131) — for example
-  different windows per weekday — suppressing push during scheduled quiet periods
-  without altering in-app unread state. **[needs ARCH decision — schedule model
-  (per-day windows) extending the ARCH-72 DND column.]**
+- **REQ-136.** A user has been able to configure a **recurring notification
+  schedule** richer than the single daily window (REQ-131): notifications allowed
+  **Every day**, **Weekdays**, or **Custom** — Custom carrying an independent
+  start and end time **per day of the week** — suppressing push outside the
+  allowed hours without altering in-app unread state. Slack's shape, and the
+  reason its schedule is a *schedule* rather than a window: "quiet after 18:00 on
+  weekdays and all weekend" is not expressible as one daily range. A user's own
+  schedule has overridden any workspace-level default (REQ-279). **[needs ARCH
+  decision — per-weekday schedule model replacing the two ARCH-72 DND columns,
+  and whether the schedule is stored in the user's local timezone (REQ-241) or
+  UTC; a per-weekday window is only meaningful against a local calendar day.]**
+- **REQ-278.** A user has been able to **pause notifications until a chosen
+  instant** — "do not disturb until 17:00" — as a **one-shot** act distinct from
+  any recurring window (REQ-131/136). The client has offered **durations**
+  (30 minutes, 1 hour, 2 hours, until tomorrow) and a **custom** end time; the
+  pause has expired on its own; and the user has been able to **resume
+  immediately** without waiting for it. While paused, the user's **do-not-disturb
+  state has been visible to other people** beside their presence (REQ-122) —
+  Slack draws a snooze icon — so a sender knows before writing rather than after
+  being ignored.
+
+  **This is a different type from REQ-131, not a longer version of it.** A
+  recurring window is a pair of minutes-of-day and is periodic by construction; a
+  pause is a single **absolute instant**. Neither can express the other, which is
+  why both exist in every product that ships this and why REQ-131 alone left "DND
+  until 5pm" unbuildable.
+
+  **The storage shape is already proven in-tree.** Custom status expiry
+  (REQ-122/240, migration 0027) solved exactly this problem: an absolute expiry
+  stamp, **enforced by the daemon on read** — because a client that is not
+  running cannot clear its own state, and an expired value that simply *reads* as
+  absent needs no clock on the reader's side and no sweep. A `dnd_until_ms`
+  column applied the same way costs the push worker one comparison it already
+  makes for the window. The client has computed the absolute instant (only it
+  knows the user's timezone, so "until tomorrow morning" is a different moment
+  per user), exactly as custom status does.
+
+  **Escape hatches, both deferred and recorded rather than assumed away.** Slack
+  lets a sender **override a pause once per day** for an urgent DM, and lets a
+  user nominate **VIPs** whose messages arrive regardless. The second is
+  REQ-135's "priority people" and should be built with it. The first is a
+  deliberate hole in a guarantee and is **not** adopted here without a decision:
+  a recipient's do-not-disturb that any sender may pierce is a weaker promise
+  than it appears. **[needs ARCH decision — `dnd_until_ms` on `users` beside the
+  ARCH-72 window, the precedence rule when a pause and a window disagree (the
+  pause is later and more specific, so it should win in both directions,
+  including *un*-pausing inside a quiet window), and whether a sender override
+  exists at all.]**
+- **REQ-279.** A workspace **owner or admin has been able to set default
+  do-not-disturb hours** for the workspace, applying to members who have not
+  configured their own, and **any member has been able to override them** with
+  their own schedule (REQ-136) or turn do-not-disturb off entirely. A default
+  that could not be overridden would be an availability policy rather than a
+  notification preference, and this is deliberately the latter. **[needs ARCH
+  decision — tenant-level setting storage (no tenant settings surface exists
+  today, REQ-042) and the resolution order against REQ-131/136/278.]**
 - **REQ-137.** A user has been able to **mute a channel or DM**: muting has
   suppressed its notifications **and de-emphasized it in the sidebar** (dimmed,
   excluded from the unread badge) without the user leaving it — distinct from
