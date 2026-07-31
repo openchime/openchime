@@ -1212,8 +1212,9 @@ None are yet backed by an architecture decision.*
   kind and byte span; `shared/mention.c` is the one scanner both sides link, so
   highlight and notify cannot disagree. Known limitation: `@here` is treated as a
   broadcast for *push*, because presence is not visible to the push worker.
-- **REQ-287.** Mentioning someone who is **not in the channel** has never been
-  silent. The sender has been told — privately, in a notice only they see, since
+- **REQ-287.** *(Built 2026-07-31 — daemon, wire and the Win32 client; the TUI
+  does not surface it yet.)* Mentioning someone who is **not in the channel** has
+  never been silent. The sender has been told — privately, in a notice only they see, since
   it concerns their action and not the conversation — that the mention reached
   nobody, and offered the remedy that fits the channel: **add them**, or **send
   them the message** so they have it without joining, or do nothing.
