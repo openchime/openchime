@@ -389,6 +389,17 @@ the requirement says so explicitly rather than implying one.
   each parent channel. A reply has optionally also been **posted to the channel's
   main scroll** rather than only the thread. **[needs ARCH decision —
   thread-follow storage + the aggregated cross-channel thread query.]**
+- **REQ-282.** A user has been able to **follow every thread in a chosen channel
+  or DM** — a per-conversation setting distinct from following one thread
+  (REQ-062) — so that every new thread started there, and every reply within it,
+  has notified them under that conversation's level (REQ-130). This is the setting
+  a person responsible for a channel actually wants: following threads one at a
+  time requires already having seen the thread, which is the thing being missed.
+  It has composed with mute (REQ-137) in the obvious direction — a muted
+  conversation has stayed silent regardless — and that ordering is fixed by
+  REQ-281's precedence, not decided per client. **[needs ARCH decision — storage
+  is naturally a column on `notification_prefs` beside `level` and `muted`, since
+  it is per (user, channel) exactly as they are.]**
 
 ### 2.3 Reactions
 
@@ -576,6 +587,18 @@ the requirement says so explicitly rather than implying one.
 - **REQ-132.** Push notifications have been delivered via APNs on iOS/macOS
   and FCM on Android (ARCH-16), at no per-notification cost, per the
   providers' free tiers as of this writing.
+
+  **Deferred until a mobile client exists — recorded, not scheduled.** Slack
+  carries three settings that only mean anything once a phone is in the picture,
+  and they are noted here rather than given requirement ids that would sit
+  unbuilt indefinitely: (a) **mobile timing** — notify the phone immediately, only
+  once the desktop is inactive, or after a further delay; (b) the **desktop
+  inactivity threshold** that (a) is measured against; and (c) a **per-conversation
+  mobile override**, so one channel can be louder on the phone than on the desktop
+  (or the reverse). All three are refinements of the *same* notify decision
+  (REQ-281), not new decisions — they choose the device and the moment, never
+  whether the user is notified at all. They become real requirements when a mobile
+  client does.
 - **REQ-133.** Push delivery has been a **federated function** (ARCH-76): the
   published mobile clients are signed under the maintaining project's Apple and
   Google developer accounts, so only the project has been able to mint valid
@@ -670,8 +693,19 @@ the requirement says so explicitly rather than implying one.
   toast) for messages due under the user's notification settings (REQ-130/134),
   with a content-preview toggle, plus optional **notification sounds and unread
   badges** on the app icon. These are per-client rendering of the server's notify
-  decision (ARCH-72), not a new server surface. **[needs ARCH decision —
-  per-platform notification API mapping + preview/privacy toggle.]**
+  decision (ARCH-72), not a new server surface.
+
+  **Sounds have been per event type, not one sound for everything** — a distinct,
+  user-chosen sound for a new message, a priority-person message (REQ-135), a
+  call starting (REQ-285), and a direct message received while already viewing
+  that conversation — plus a single **mute-all-sounds** switch that has silenced
+  every one of them without disturbing the individual choices. Slack's set, and
+  the reason for it is that an audible cue is only useful if it distinguishes:
+  one sound for all events carries no more information than a badge. Sound choice
+  is a **client preference** (the synced `client_settings` bucket, ARCH-88), never
+  a server surface — the daemon decides *whether* to notify, never how it sounds.
+  **[needs ARCH decision — per-platform notification API mapping +
+  preview/privacy toggle.]**
 - **REQ-139.** A client has offered an **activity feed / notification inbox** — an
   aggregated, filterable view of @mentions (REQ-221), reactions to the user's
   messages (REQ-070), and thread replies (REQ-060/061) across all channels — so a
@@ -683,6 +717,127 @@ the requirement says so explicitly rather than implying one.
   `reactions` and threaded `messages`, excluding your own actions and gated on
   current membership. `users.activity_seen_ms` is a watermark — enough to mark
   what is new, deliberately not per-item read state.
+- **REQ-280.** **Email notifications have not been provided, in any deployment
+  model.** No digest, no "you were mentioned" mail, no unread summary, and no
+  outbound SMTP of any kind. Two reasons, both deliberate. **Operationally**, it
+  would oblige every self-hoster to run or rent a mail relay and inherit
+  deliverability, bounce, and unsubscribe handling — a second delivery system
+  with its own failure modes, for a product whose entire delivery story is
+  otherwise one TLS connection. **On principle**, an email notification puts
+  message content (or, at minimum, who is talking to whom) into a third-party
+  mail system, which is precisely what a self-hosted deployment exists to avoid;
+  "we email your messages to Gmail" would undercut REQ-040/041's whole claim.
+
+  **The consequence has been stated rather than discovered.** Push is a federated
+  function (REQ-133) — only the project can mint APNs/FCM credentials for the
+  published apps — so with email excluded, a **self-hosted stand-alone
+  deployment has no out-of-app notification path at all**. Not a degraded one:
+  none. A user who is not looking at a client is not reached, and their unread
+  state is waiting when they return. That is an acceptable, even coherent, trade
+  for an air-gappable deployment, but an operator has been told it up front
+  rather than inferring it after choosing stand-alone.
+- **REQ-281.** The decision *whether to notify a given user about a given
+  message* has been made in **exactly one evaluator**, with a **documented
+  precedence order**, and covered by a **truth table** rather than case-by-case
+  tests. Every input has fed that one function: the per-channel level (REQ-130),
+  the global default (REQ-134), mute (REQ-137), follow-every-thread (REQ-282),
+  the recurring DND window (REQ-131), the per-weekday schedule (REQ-136), the
+  transient pause (REQ-278), the workspace default (REQ-279), keywords and
+  priority people (REQ-135), and mention resolution (REQ-221).
+
+  **This exists because the failure mode is already proven here.** Building
+  REQ-134 uncovered two live push defects of exactly this shape: the level
+  fallback was hardcoded to `ALL`, and `notification_prefs.muted` was **never
+  consulted at all** — so a user who had explicitly muted a conversation was
+  notified anyway. Both were silent, both were precedence errors, and both
+  survived because the decision was assembled inline rather than owned. Three
+  more inputs (REQ-136/278/279) are about to join it.
+
+  **Two properties have made the order testable rather than merely written
+  down.** First, the evaluator has been **pure** — inputs in, a decision out, no
+  I/O — so the truth table is a unit test with no daemon, matching how
+  `shared/mention.c` and `shared/searchq.c` are already shared and tested.
+  Second, it has been the **single** implementation both the push worker and
+  every client consult, for the same reason ARCH-89 gives for the mention
+  scanner: two copies of a notify rule will disagree, and the disagreement will
+  be invisible — one side silently notifying where the other would not.
+  **[needs ARCH decision — the precedence order itself. Proposed: most specific
+  and most recent wins. Mute beats level; a transient pause (278) beats a
+  schedule (136); a schedule beats the workspace default (279); an explicit
+  per-channel level beats the global default (134). The genuinely contested cell
+  is whether priority people (135) pierce a pause — see REQ-278's open question
+  on sender override — and it should be answered once, here, not twice.]**
+- **REQ-283.** A user has been able to set a **reminder** — on a message ("remind
+  me about this" at a chosen time) and as a **due date on a saved item**
+  (REQ-231) — and has been notified when it came due, through the same notify
+  path as everything else (REQ-281) and rendered by the same client surfaces
+  (REQ-138/139). A reminder has been **private** to the user who set it, exactly
+  as a saved item is, and has survived a client restart because it lives on the
+  server.
+
+  **In scope, and narrower than Slack's.** Delivery has been **in-app and push
+  only** — never email (REQ-280) — so a stand-alone deployment's reminder waits
+  in the activity feed rather than chasing the user, consistent with that model's
+  stated trade. Slack routes reminders through Slackbot as a DM; a conversation
+  with a bot is not a thing this product has (REQ-275), so the reminder has
+  surfaced as an activity-feed entry and a notification instead of a synthetic
+  message from a fake user.
+
+  **The cheap parts and the one real part.** Storage is small — saved items
+  (ARCH-95, migration 0025) already hold (user, message) and want only a
+  `remind_at_ms` beside the existing stamp — and **delivery has a precedent**: the
+  daemon already runs a bounded periodic maintenance pass off the net loop's tick
+  (ARCH-78), which is the natural place for a due-reminder sweep and means no new
+  scheduler, thread, or timer subsystem. **[needs ARCH decision — whether the
+  sweep is that pass or its own, and the granularity guarantee: a reminder that
+  may fire minutes late is a different product promise from one that fires on the
+  minute, and the maintenance interval defaults to 5 minutes.]**
+- **REQ-284.** What the **unread badge counts** has been defined and
+  user-controllable, rather than left implicit. A user has been able to choose
+  whether the badge counts **every unread message** in a conversation or only
+  messages that would notify them under their settings, and whether **thread
+  replies that do not mention them** count toward it at all. The default has been
+  the quieter reading — the badge reflects what was worth notifying — because a
+  badge that counts everything is a badge nobody reads.
+
+  **This is a requirement about meaning, not three settings.** Today the product
+  ships badges (REQ-138) and per-channel unread (REQ-014) with no statement
+  anywhere of what a number on a conversation *represents*, which is how two
+  clients end up disagreeing about the same count and both looking correct.
+  Mute already removes a conversation from the badge (REQ-137); this defines the
+  rest of the rule. **[needs ARCH decision — whether the choice is a client
+  preference or server state; it affects the count a client displays, not the
+  notify decision, which argues for the synced `client_settings` bucket rather
+  than a new server surface.]**
+- **REQ-285.** A user has been **notified when a call has started** in a channel
+  or DM they are a member of, subject to the same notification settings as a
+  message (REQ-281) — because a call is time-sensitive in a way a message is not:
+  a missed message is read later, a missed call is simply missed. The
+  notification has named the conversation and who started it, and joining from it
+  has landed the user in the call.
+
+  Recorded now, ahead of the client it needs. The daemon's call signaling and
+  ephemeral roster already exist (REQ-150–152, ARCH-73) — `CALL_JOIN` on an empty
+  roster *is* the "call started" event — so this is a notify decision over state
+  the server already keeps, not new call machinery. It ships with the audio
+  client rather than before it. **[needs ARCH decision — whether call-start is a
+  level a user can set independently, as Slack does, or simply follows the
+  conversation's level.]**
+- **REQ-286.** A desktop client's **window and notification-area behaviour has
+  been specified and user-controllable**: whether closing the window **quits the
+  application or leaves it running in the notification area / tray** still
+  receiving notifications, and whether the taskbar entry is **flashed or
+  highlighted** when a notification arrives. The default has been to keep running
+  in the tray, because a chat client that stops notifying the moment its window
+  is closed silently breaks every other notification requirement in this section.
+
+  **Written because the behaviour already exists without a contract.** The Win32
+  client ships a tray icon and raises tray balloons (REQ-138) while `WM_CLOSE`
+  quits after warning about a non-empty outbox — so today, closing the window
+  ends notifications, and nothing anywhere says whether that is intended. This is
+  per-platform surface (ARCH-92), not a server concern. **[needs ARCH decision —
+  none expected; this is a client preference in the synced bucket, but the
+  *default* is a product call.]**
 
 ---
 
