@@ -101,19 +101,24 @@ All of them already exist in the app-core, so closing the gap is TUI work alone;
 the list and a proposed order are in
 [docs/CLIENT_GAP_ANALYSIS.md](docs/CLIENT_GAP_ANALYSIS.md) §4–§5. Some frames the
 daemon speaks reach no client at all yet — see [docs/CLIENT.md](docs/CLIENT.md)
-§3. The app-core also has a local
-SQLite store, so it reconnects silently across restarts, shows cached history
-offline, and queues sends made while disconnected (REQ-100/101/102).
+§3. The app-core **writes nothing to disk** (ARCH-88/REQ-201): one credential per
+workspace in the OS credential store carries the session token, the TOFU pin and
+the workspace book, so it reconnects silently across restarts and queues sends
+made while disconnected — in memory, for the life of the process. History comes
+from the server's own read cursor rather than a local cache (REQ-100/101/102).
 
 A native **Windows GUI** (Win32 + Direct2D/DirectWrite, pure C — ARCH-82) is the
 most complete client: every tracked engine feature is reachable, its numbered
 depth backlog is closed, and it now *leads* the TUI by more than twenty features.
-An adversarial review on 2026-07-30 — the 116-invariant smoke suite plus
-hand-driven probing — found no defect in the closed backlog; what remains is a
-short open list in [docs/WIN32_BACKLOG.md](docs/WIN32_BACKLOG.md) (two
-avatar-consistency defects, a flaky test harness, one unreproduced crash, and
-rich text + accessibility, both blocked on an ARCH decision). The four-way
-surface analysis behind it is
+An adversarial review on 2026-07-30 — then a 135-check smoke suite plus
+hand-driven probing — found no defect in the closed backlog. Since then
+accessibility shipped (REQ-269/ARCH-99: a UI Automation provider over the
+self-drawn UI, a system caret and spoken notifications, verified by a real UIA
+client from outside the process), the avatar and harness defects were fixed, and
+the unreproduced typing crash was closed as living in a composer that no longer
+exists. What remains in [docs/WIN32_BACKLOG.md](docs/WIN32_BACKLOG.md) is rich
+text (dialect now settled, ARCH-100) and three items waiting on a daemon
+requirement. The four-way surface analysis behind it is
 [docs/CLIENT_GAP_ANALYSIS.md](docs/CLIENT_GAP_ANALYSIS.md). Next is **TUI
 catch-up**, then GTK (Linux), AppKit (macOS), a web DOM UI, and mobile.
 
