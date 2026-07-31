@@ -4,6 +4,20 @@ The execution list for `client/gui/win32/` (ARCH-82). Every item below is a
 gap between the shipped Win32 client and the bar set by the TUI, the reference
 clients, or a `REQ-NNN`.
 
+> **STATUS, 2026-07-30: this list is EMPTY — every WIN-* item is struck through.**
+> The last to land were the modal frame's remaining sites (WIN-77), two-pane
+> Preferences (WIN-78), sidebar sections (WIN-83), avatar images (WIN-47), group
+> DMs and custom emoji (WIN-54's tail), and the custom DirectWrite composer
+> (WIN-80/ARCH-98). WIN-81 is done as far as code can take it — the CI job exists
+> and skips until a self-hosted Windows+WSL runner does.
+>
+> That is a statement about **this list**, not about the client. New work belongs
+> here as new ids (never reused), and the honest reading of an empty backlog is
+> that the *known* gaps are closed — the ones found by using it are not on any
+> list until somebody writes them down. Several of today's were found exactly that
+> way: the profile pane rendering a user id of 0, the "Message" button that opened
+> a DM and left you where you were, and a starred DM drawn with a channel glyph.
+
 **Where this sits.** [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) is the
 *analysis* (what is thin, versus Slack and Pumble); [STATUS.md](./STATUS.md)'s
 parity table is the *feature reachability* tracker. This document is the *work

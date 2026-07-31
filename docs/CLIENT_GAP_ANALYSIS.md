@@ -12,6 +12,14 @@ Vendor-facing rows are inherently perishable — a competitor can change a plan 
 
 **Pumble sourcing (researched 2026-07-26).** Pumble is a Slack-shaped SaaS team chat product from COING (the makers of Clockify and Plaky, sold together as the CAKE.com bundle). Its column below is built from Pumble's own pricing page, feature pages, and help centre, cross-checked against independent reviews (Cloudwards) and comparison directories (Capterra, GetApp, TrustRadius). **Vendor-authored comparison content was treated as a claim, not evidence** — where Pumble's marketing and its own help centre disagreed, the help centre won. Two such corrections are recorded in §7.
 
+> **Reconciled 2026-07-30.** Much of what this document calls thin has since
+> shipped: group DMs, custom emoji, avatars, user-defined sidebar sections, the
+> global notification default, channel visibility, two-pane preferences with a
+> colour scheme and text size, and a custom composer. [STATUS.md](./STATUS.md) is
+> the authoritative per-requirement view; the rows here are kept for the *analysis*
+> — why each gap mattered — rather than as a live tracker. Where the two disagree,
+> STATUS.md is right.
+
 ## 1. Legend
 
 | Glyph | Meaning |
