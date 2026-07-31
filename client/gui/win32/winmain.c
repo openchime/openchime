@@ -1881,12 +1881,28 @@ static void avatar_want(uint64_t aid) {
     oc_client_fetch_attachment(g_client, aid);
 }
 
+/* The disc colour for a user's initial. Derived from the id, so one person is one
+ * colour everywhere they appear — it is an identity cue, not decoration.
+ *
+ * This was a `tint` PARAMETER until 2026-07-31 (WIN-85), which meant every caller
+ * chose, and one of them chose differently: the rail's "You" avatar passed the
+ * theme's accent while the transcript, sidebar and profile pane all passed
+ * AVPAL[uid % 6], so the signed-in user was one colour in the rail and another
+ * everywhere else. Invisible to anyone with a photo, since the photo path returns
+ * before the disc is drawn — and wrong for everybody else, which is the default
+ * state. A value that must agree across call sites should not be an argument. */
+static uint32_t avatar_tint(uint64_t uid) {
+    return AVPAL[uid % (sizeof AVPAL / sizeof AVPAL[0])];
+}
+
 /* One user avatar, wherever one is drawn: the photo when we have it, otherwise the
- * coloured initial that has always been there. `tint` is the initial's disc colour,
- * `fmt` the format its letter is drawn in. */
+ * coloured initial that has always been there. `fmt` is the format the letter is
+ * drawn in. Every avatar in the app goes through here — see WIN-86 on what happens
+ * when some of them do not. */
 static void draw_user_avatar(ID2D1RenderTarget *rt, const oc_model *m, uint64_t uid,
-                             const char *name, D2D1_RECT_F box, uint32_t tint,
+                             const char *name, D2D1_RECT_F box,
                              IDWriteTextFormat *fmt, int square, float radius) {
+    uint32_t tint = avatar_tint(uid);
     uint64_t aid = avatar_of(m, uid);
     if (aid) {
         if (draw_avatar_image(rt, aid, box, radius, square)) return;
@@ -1985,7 +2001,7 @@ static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
             fill_round_a(rt, rf(cx - 18, py + 6, cx + 18, py + 42), 10.0f, 0xFFFFFF, 0.08f);
         const char *nm = m ? oc_model_user_name(m, m->user_id) : "";
         draw_user_avatar(rt, m, m ? m->user_id : 0, (nm && nm[0]) ? nm : "U",
-                         rf(cx - 15, py + 9, cx + 15, py + 39), OC_COL_ACCENT_DIM,
+                         rf(cx - 15, py + 9, cx + 15, py + 39),
                          g_avatar, 0, 0);
         /* Your own presence, bottom-right — the same dot, from the same helper, that
          * every person in the DM list and the member pane carries. It was missing
@@ -2323,8 +2339,7 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                     draw_text(rt, cnt, g_micro, av, selected ? OC_COL_TEXT : OC_COL_MUTED);
                     IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_CENTER);
                 } else {
-                uint32_t tint = AVPAL[r->peer_id % (sizeof AVPAL / sizeof AVPAL[0])];
-                draw_user_avatar(rt, m, r->peer_id, r->label, av, tint, g_meta, 1, 5.0f);
+                draw_user_avatar(rt, m, r->peer_id, r->label, av, g_meta, 1, 5.0f);
                 draw_presence_dot(rt, av.right - 1, av.bottom - 1, 3.5f,
                                   oc_model_presence_of(m, r->peer_id),
                                   selected ? OC_COL_SELECT : OC_COL_SIDEBAR);
@@ -2604,7 +2619,7 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
         const char *nm = msg->author_name[0] ? msg->author_name : oc_model_user_name(m, msg->author_id);
         if (!nm || !nm[0]) nm = "user";
         draw_user_avatar(rt, m, msg->author_id, nm, rf(ax, ty, ax + AVA, ty + AVA),
-                         AVPAL[msg->author_id % 6], g_avatar, 0, 0);
+                         g_avatar, 0, 0);
 
         /* Author + timestamp on the header line. */
         D2D1_RECT_F hl = rf(tx, ty, x0 + content_w + AVA + 12, ty + 20);
@@ -4613,7 +4628,7 @@ static void draw_profile_card(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
     float cx = (reg.left + reg.right) / 2, y = reg.top + 18;
 
     draw_user_avatar(rt, m, g_profile_uid, nm, rf(cx - 36, y, cx + 36, y + 72),
-                     AVPAL[g_profile_uid % 6], g_display, 0, 0);
+                     g_display, 0, 0);
     y += 84;
 
     draw_text(rt, nm, g_display, rf(reg.left + 12, y, reg.right - 12, y + 28), OC_COL_TEXT);
@@ -6649,12 +6664,8 @@ static void draw_dm_list(ID2D1RenderTarget *rt, const oc_model *m, float h) {
 
         const char *nm = oc_model_user_name((oc_model *)m, best->peer_id);
         if (!nm || !nm[0]) nm = "user";
-        D2D1_ELLIPSE av = { { row.left + 24, y + 26 }, 15, 15 };
-        ID2D1RenderTarget_FillEllipse(rt, &av, paint_with(AVPAL[best->peer_id % 6]));
-        char ini[2] = { (char)(nm[0] >= 'a' && nm[0] <= 'z' ? nm[0] - 32 : nm[0]), 0 };
-        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, ini, g_ui, rf(row.left + 9, y + 11, row.left + 39, y + 41), 0xFFFFFF);
-        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+        draw_user_avatar(rt, m, best->peer_id, nm,
+                         rf(row.left + 9, y + 11, row.left + 39, y + 41), g_ui, 0, 0);
         draw_presence_dot(rt, row.left + 35, y + 37, 4.5f,
                           oc_model_presence_of(m, best->peer_id), OC_COL_SIDEBAR);
 
@@ -6709,12 +6720,8 @@ static void draw_dm_compose(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
         if (u->disabled) continue;
         D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + 44);
         if (g_dm_hover == u->user_id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
-        D2D1_ELLIPSE av = { { row.left + 28, y + 22 }, 16, 16 };
-        ID2D1RenderTarget_FillEllipse(rt, &av, paint_with(AVPAL[u->user_id % 6]));
-        char ini[2] = { (char)(u->name[0] >= 'a' && u->name[0] <= 'z' ? u->name[0] - 32 : u->name[0]), 0 };
-        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, ini, g_ui, rf(row.left + 12, y + 6, row.left + 44, y + 38), 0xFFFFFF);
-        IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+        draw_user_avatar(rt, m, u->user_id, u->name[0] ? u->name : "user",
+                         rf(row.left + 12, y + 6, row.left + 44, y + 38), g_ui, 0, 0);
         char nm[96];
         snprintf(nm, sizeof nm, "%s%s", u->name[0] ? u->name : "user",
                  u->user_id == m->user_id ? " (you)" : "");
@@ -6810,13 +6817,8 @@ static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h
             fill(rt, rf(row.left, row.top + 6, row.left + 3, row.bottom - 6), OC_COL_ACCENT);
 
         const char *who = oc_model_user_name((oc_model *)m, a->actor_id);
-        D2D1_ELLIPSE av = { { row.left + 26, y + 20 }, 13, 13 };
-        ID2D1RenderTarget_FillEllipse(rt, &av, paint_with(AVPAL[a->actor_id % 6]));
-        char ini[2] = { (char)((who && who[0] >= 'a' && who[0] <= 'z') ? who[0] - 32
-                               : (who && who[0]) ? who[0] : '?'), 0 };
-        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, ini, g_meta, rf(row.left + 13, y + 8, row.left + 39, y + 34), 0xFFFFFF);
-        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+        draw_user_avatar(rt, m, a->actor_id, (who && who[0]) ? who : "?",
+                         rf(row.left + 13, y + 8, row.left + 39, y + 34), g_meta, 0, 0);
 
         char when[24]; rel_time(a->at, when, sizeof when);
         draw_text(rt, (who && who[0]) ? who : "someone", g_ui_b,
