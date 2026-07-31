@@ -598,6 +598,12 @@ the requirement says so explicitly rather than implying one.
   (REQ-132/133) is built as the daemon push emitter (ARCH-85), which honors the
   window.
 
+  > **Superseded by REQ-136 (2026-07-31), which absorbs it.** Slack has one
+  > recurring mechanism, not two: *Every day* with one start and end is this
+  > requirement's case. What is written here stays as the record of what was
+  > built and how it behaves; the target state is REQ-136's schedule, and the two
+  > minutes-of-day columns below are replaced by it.
+  >
   > **Naming, matched to Slack (2026-07-31).** Slack calls this half the **DND
   > schedule** (`dnd_enabled`, `next_dnd_start_ts`, `next_dnd_end_ts`) and the
   > manual one **snooze** (`snooze_*`). They are separate APIs with separate ways
@@ -660,20 +666,53 @@ the requirement says so explicitly rather than implying one.
 - **REQ-135.** A user has been able to define **keyword (highlight-word)
   notifications** — terms that notify them regardless of a channel's level
   (REQ-130/134) — and to designate **priority people** whose messages always
-  notify. Both have driven notification like a mention (REQ-221). **[needs ARCH
-  decision — keyword/priority storage + the match→notify decision, adjacent to
-  ARCH-72/REQ-221.]**
+  notify. Both have driven notification like a mention (REQ-221).
+
+  **Keywords are part of the `mentions` level, not a switch of their own**
+  (2026-07-31). Slack's middle level is literally "Mentions & keywords", so a
+  channel set to *mentions* notifies on both and a channel set to *none* notifies
+  on neither. Matching is **case-insensitive and exact** — "deploy" does not
+  match "deployment" — and phrases are allowed, as Slack's are. A hit surfaces in
+  the activity feed as a **mention**, not a fourth kind, for the same reason.
+
+  **Keywords fire in threads, which is a deliberate divergence.** Slack's own
+  help says keywords in thread messages never notify; that reads as a limitation
+  rather than a decision, and a thread is where the substantive discussion
+  usually is — the worst place to go deaf. REQ-061 already notifies thread
+  participants, so this costs nothing extra.
+
+  **Priority people pierce a level, and a pause, but never a mute.** A level and a
+  pause are statements about *when and how much*; a VIP is a statement about
+  *who*, and it is the recipient's own list — which is precisely why REQ-278
+  declines a sender-side override while accepting this. Mute is different in kind:
+  REQ-137 deliberately separated it from level as the strongest "I do not want to
+  hear from this", and a VIP that overrode it would make mute unreliable at the
+  moment somebody is reaching for it. Slack documents the pause case only and is
+  silent on the other two; these are ours. **[needs ARCH decision — keyword and
+  priority-person storage, and where the match→notify test lives; it must be the
+  same shared scanner path as mentions (ARCH-89) or the highlight a reader sees
+  and the notification the server sends will drift.]**
 - **REQ-136.** A user has been able to configure a **recurring notification
-  schedule** richer than the single daily window (REQ-131): notifications allowed
-  **Every day**, **Weekdays**, or **Custom** — Custom carrying an independent
-  start and end time **per day of the week** — suppressing push outside the
-  allowed hours without altering in-app unread state. Slack's shape, and the
-  reason its schedule is a *schedule* rather than a window: "quiet after 18:00 on
-  weekdays and all weekend" is not expressible as one daily range. A user's own
-  schedule has overridden any workspace-level default (REQ-279). **[needs ARCH
-  decision — per-weekday schedule model replacing the two ARCH-72 DND columns,
-  and whether the schedule is stored in the user's local timezone (REQ-241) or
-  UTC; a per-weekday window is only meaningful against a local calendar day.]**
+  schedule**: notifications allowed **Every day**, **Weekdays**, or **Custom** —
+  Custom carrying an independent start and end time **per day of the week** —
+  suppressing notification delivery outside the allowed hours without altering
+  in-app unread state. Slack's shape, and the reason its schedule is a *schedule*
+  rather than a window: "quiet after 18:00 on weekdays and all weekend" is not
+  expressible as one daily range. A user's own schedule has overridden any
+  workspace-level default (REQ-279).
+
+  **This is the ONLY recurring mechanism — it absorbs REQ-131 (2026-07-31).**
+  Slack has exactly one: *Every day* with a single start and end simply **is**
+  the daily-window case, which is why its API exposes one schedule and not two
+  settings. Keeping our single window beside a per-weekday schedule would leave
+  two things able to disagree about the same question, which is the trap REQ-278
+  was written to avoid. REQ-131 therefore records what was built and defers here;
+  its two minutes-of-day columns are replaced rather than supplemented. There are
+  no live deployments, so the schema change need not preserve existing values.
+
+  **Stored against the user's local calendar day** (their timezone, REQ-241), not
+  UTC. A per-weekday window is only meaningful locally: in UTC somebody's "Friday
+  evening" silently becomes Saturday for a large part of the world.
 - **REQ-278.** A user has been able to **pause notifications until a chosen
   instant** — "do not disturb until 17:00" — as a **one-shot** act distinct from
   any recurring window (REQ-131/136). The client has offered **durations**
