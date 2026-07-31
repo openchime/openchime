@@ -1212,6 +1212,51 @@ None are yet backed by an architecture decision.*
   kind and byte span; `shared/mention.c` is the one scanner both sides link, so
   highlight and notify cannot disagree. Known limitation: `@here` is treated as a
   broadcast for *push*, because presence is not visible to the push worker.
+- **REQ-287.** Mentioning someone who is **not in the channel** has never been
+  silent. The sender has been told — privately, in a notice only they see, since
+  it concerns their action and not the conversation — that the mention reached
+  nobody, and offered the remedy that fits the channel: **add them**, or **send
+  them the message** so they have it without joining, or do nothing.
+
+  **The problem it fixes is not the missing invite; it is the false
+  confirmation.** Resolution requires channel membership (REQ-221/ARCH-89) but
+  the *highlight* is syntactic — `shared/mention.c` marks any `@name`, and the
+  client colours the span without asking whether it resolved. So a mention that
+  notified nobody renders **identically** to one that worked: accent-coloured,
+  semi-bold, apparently fine. The sender has every reason to believe the person
+  was pinged and no way to discover otherwise. A feature that fails silently is
+  worse than one that is absent, because the absent one does not lie.
+
+  **Public and private are genuinely different and have been treated as such.**
+  In a **public** channel the person can already read the message, so the only
+  thing missing is the notification (REQ-288) and adding them is a convenience.
+  In a **private** channel they cannot see the message at all until invited, and
+  inviting them **discloses the channel's history** — the same disclosure
+  REQ-036a records for making a private channel public. So the private case has
+  named that consequence rather than offering a one-click reflex, and has stayed
+  refusable: not every mention of a name is a decision to admit its owner.
+
+  Where the sender cannot add anyone — a DM or group DM, an archived channel
+  (REQ-035), or a channel whose membership they may not change — the notice has
+  said so plainly instead of offering an action that would fail. The mentioned
+  name has also been **rendered as ordinary text rather than as a live mention**
+  once known to be unresolved, so the transcript stops asserting something untrue.
+- **REQ-288.** A mention in a **public** channel has notified the mentioned
+  person **even when they are not a member**, landing in their activity feed
+  (REQ-139), because a public channel is one they can already read: the message
+  is available to them, and withholding the notification only means they find out
+  later or never. In a **private** channel it has NOT — they cannot open the
+  message, and a notification pointing at something unreadable is worse than
+  silence.
+
+  This is Slack's split, verified in its documentation: a mention in a public
+  channel "will receive a notification in their Activity feed", while in a private
+  channel they "won't be notified and can't see your message until you invite
+  them to join the channel". Ours currently does neither, because `store_mentions`
+  joins `channel_members` for every channel kind — correct reasoning for private,
+  applied too widely. **[needs a product decision — this changes who receives
+  notifications, so it is recorded and not assumed; the daemon change itself is
+  confined to that one membership test.]**
 - **REQ-222.** A URL in a message has optionally been **unfurled** into a preview
   (title, description, thumbnail) fetched from the linked page. The fetch has been
   performed **server-side by the daemon or an isolated helper** — never by pushing
