@@ -9,7 +9,10 @@ mirrors.
 implemented across the codec, framebuf, migrations, auth/JWT/roles/rate-limiting,
 the DB-writer handlers, storage/maintenance, enrollment, push, and the shared
 @mention scanner (`test_mention` — deliberately its own suite because the daemon
-and every client link that one implementation, ARCH-89), plus in-process
+and every client link that one implementation, ARCH-89), the message-formatting
+parser (`test_richtext`, REQ-220/ARCH-100 — same reasoning one level down: both
+frontends render from that one parser, and its edge cases are where a dialect
+eats text somebody meant literally), plus in-process
 integration suites that drive the real epoll server over TLS (`itest_netloop`,
 `itest_tls`, `itest_slow_blob`) and the headless client app-core
 (`test_client_core.c`) — all compiled into one `build/tests` binary by `make test`.

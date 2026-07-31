@@ -41,6 +41,7 @@
 #include "model.h"
 #include "complete.h"   /* shared @user / #channel / :emoji: completion */
 #include "mention.h"    /* the same @mention scanner the daemon resolves with */
+#include "richtext.h"   /* the shared *bold* / _italic_ / `code` parser (ARCH-100) */
 #include "searchq.h"    /* the same query parser the core sends to the daemon */
 #include "resolve.h"
 #include "store.h"            /* peek a stored session token (skip the login box) */
@@ -2510,6 +2511,87 @@ static int emoji_runs(const char *utf8, oc_emoji_run *out, int max) {
     return n;
 }
 
+/* ---- rich text (REQ-220, ARCH-100) ----------------------------------------
+ * Formatting is DirectWrite ranges over the unchanged body — the mechanism the
+ * @mention highlighting already uses — so it composes with mentions and custom
+ * emoji instead of fighting them, and the layout keeps indexing the bytes the
+ * daemon stored. Selection, copy, hit-testing and the mention offsets all
+ * address that same text; a rewritten string would have to re-map every one.
+ *
+ * Where the two callers differ is the DELIMITERS. The TRANSCRIPT removes them:
+ * you asked for bold, not for asterisks. The COMPOSER only dims them, because
+ * its text is what will be sent — you are editing `*bold*`, and a field that
+ * hid the asterisks would leave you stepping the caret through characters you
+ * cannot see and unable to find the markup you have to delete to undo it.
+ *
+ * Removing one takes a transparent brush AND a 0.1 DIP font size, because the
+ * layout covers the raw body: a transparent asterisk keeps its width and every
+ * bold word ends up fenced by two gaps that read as typos (checked by looking —
+ * they are obvious). Shrinking the run to nothing takes the width with it, and
+ * costs nothing else: line height comes from the rest of the line, and copy
+ * still yields the source because the characters are all still there.
+ *
+ * BLOCK markers are the exception and stay visible, merely faint: `- `, `1. `
+ * and `> ` *are* the rendering of a list or a quote in a text-range-only
+ * treatment, not scaffolding around it. */
+static const WCHAR *rt_mono_family(void) { return L"Consolas"; }
+
+/* Byte offset -> UTF-16 offset in the same text. Spans arrive as byte offsets
+ * and a layout indexes UTF-16, so each is re-measured rather than assumed. */
+static UINT32 rt_u16(const char *u8, size_t bytes) {
+    int n;
+    if (bytes == 0) return 0;
+    n = MultiByteToWideChar(CP_UTF8, 0, u8, (int)bytes, NULL, 0);
+    return n < 0 ? 0 : (UINT32)n;
+}
+
+/* Apply the parsed spans to `layout`, whose text must be the UTF-16 transcoding
+ * of `u8` (the transcript body, or the composer buffer with its IME composition
+ * spliced in). `dim` is the faint brush; `clear` is the transparent one and
+ * passing it is what asks for inline delimiters to be REMOVED rather than
+ * dimmed — see the note above. */
+static void apply_richtext(IDWriteTextLayout *layout, const char *u8, size_t blen,
+                           UINT32 wmax, ID2D1SolidColorBrush *dim,
+                           ID2D1SolidColorBrush *clear) {
+    oc_rt_span sp[OC_RT_MAX];
+    size_t n, i;
+    if (!layout || !u8 || !blen) return;
+    n = oc_rt_scan(u8, blen, sp, OC_RT_MAX);
+    if (n > OC_RT_MAX) n = OC_RT_MAX;
+    for (i = 0; i < n; i++) {
+        UINT32 at  = rt_u16(u8, sp[i].start);
+        UINT32 len = rt_u16(u8 + sp[i].start, sp[i].len);
+        DWRITE_TEXT_RANGE tr;
+        uint16_t st = sp[i].style;
+        /* A very long body is transcoded into a fixed buffer, so a span can
+         * point past the end of the layout's text. Clamp rather than trust it. */
+        if (at >= wmax) continue;
+        if (len > wmax - at) len = wmax - at;
+        if (!len) continue;
+        tr.startPosition = at;
+        tr.length = len;
+        if (st & OC_RT_DELIM) {
+            int block = (st & (OC_RT_BULLET | OC_RT_ORDERED | OC_RT_QUOTE)) != 0;
+            if (clear && !block) {
+                IDWriteTextLayout_SetDrawingEffect(layout, (IUnknown *)clear, tr);
+                IDWriteTextLayout_SetFontSize(layout, 0.1f, tr);
+            } else if (dim) {
+                IDWriteTextLayout_SetDrawingEffect(layout, (IUnknown *)dim, tr);
+            }
+            continue;
+        }
+        if (st & OC_RT_BOLD)   IDWriteTextLayout_SetFontWeight(layout, DWRITE_FONT_WEIGHT_BOLD, tr);
+        if (st & OC_RT_ITALIC) IDWriteTextLayout_SetFontStyle(layout, DWRITE_FONT_STYLE_ITALIC, tr);
+        if (st & OC_RT_STRIKE) IDWriteTextLayout_SetStrikethrough(layout, TRUE, tr);
+        if (st & (OC_RT_CODE | OC_RT_CODEBLOCK))
+            IDWriteTextLayout_SetFontFamilyName(layout, rt_mono_family(), tr);
+        /* A quote has no bar to draw in a range-only rendering, so it takes the
+         * secondary text colour — the same "this is not my sentence" signal. */
+        if ((st & OC_RT_QUOTE) && dim)
+            IDWriteTextLayout_SetDrawingEffect(layout, (IUnknown *)dim, tr);
+    }
+}
+
 static IDWriteTextLayout *body_layout(const oc_msg *msg, float cw, UINT32 *wlen) {
     WCHAR w[2048];
     int n = to_w(body_text(msg), w, 2048);
@@ -2529,6 +2611,13 @@ static IDWriteTextLayout *body_layout(const oc_msg *msg, float cw, UINT32 *wlen)
     if (layout && edit_len && g_brush2) {
         DWRITE_TEXT_RANGE tr = { edit_at, edit_len };
         IDWriteTextLayout_SetDrawingEffect(layout, (IUnknown *)g_brush2, tr);
+    }
+    /* Formatting first (REQ-220), so a @mention inside *bold* still ends up with
+     * the accent below rather than the delimiter's faint brush. */
+    if (layout && !msg->deleted) {
+        const char *src = body_text(msg);
+        apply_richtext(layout, src, src ? strlen(src) : 0, (UINT32)(n - (int)edit_len),
+                       g_brush2, g_brush4);
     }
     /* Mark the @mentions (REQ-221). The scanner is the one the daemon resolves
      * with, so what is highlighted is exactly what the server acted on — a
@@ -7604,6 +7693,18 @@ static IDWriteTextLayout *ed_layout(float w) {
         const oc_model *m = model();
         static char u8[(ED_MAX + 130) * 3 + 1];   /* static: too big for the stack */
         int bytes = WideCharToMultiByte(CP_UTF8, 0, tmp, n, u8, (int)sizeof u8 - 1, NULL, NULL);
+        /* Show the formatting AS YOU TYPE (REQ-220). Affordable only because the
+         * parser is client-side and runs over a <=4000-unit buffer — the same
+         * pass that already re-scans mentions on every keystroke.
+         *
+         * The delimiters stay VISIBLE here, merely faint, which is the honest
+         * rendering for a field whose text is what will be sent: you are editing
+         * `*bold*`, and a composer that hid the asterisks would leave you unable
+         * to see the markup you have to delete to undo it. */
+        if (bytes > 0 && g_ed_rt) {
+            u8[bytes] = '\0';
+            apply_richtext(g_ed_layout, u8, (size_t)bytes, (UINT32)n, g_brush2, NULL);
+        }
         if (m && bytes > 0 && g_brush3 && g_ed_rt) {
             u8[bytes] = '\0';
             oc_mention mm[OC_MENTION_MAX];

@@ -824,8 +824,9 @@ to change a DirectWrite size, so any preference that moves the scale must call
   **Accessibility (REQ-269) is now the active piece of work** — a UIA provider
   over the self-drawn UI, a real system caret, and UIA events, decided as
   **ARCH-99**: the custom controls are implemented *for*, not walked back. What
-  remains behind it is rich text (**REQ-220**, still needs its markup dialect),
-  one unreproduced crash, and the items waiting on a daemon requirement — all in
+  remains behind it is the formatting **toolbar** (WIN-96) — rich text itself
+  (**REQ-220**) built on 2026-07-31 as a shared parser in `client/core/` plus
+  DirectWrite ranges — and the items waiting on a daemon requirement, all in
   [WIN32_BACKLOG.md](./WIN32_BACKLOG.md).
 - **Next — TUI catch-up (P0).** The two frontends have swapped places: the TUI was
   the reference client and is now behind the GUI by **more than twenty** features,

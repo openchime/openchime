@@ -21,8 +21,12 @@ document is only the work list derived from them.
 
 ## Open
 
-*Nothing startable in `client/gui/win32/` is open.* New work belongs here as new
-ids (never reused); the items below are waiting on a requirement or a decision.
+| # | Item | Pri | Size |
+|---|---|---|---|
+| **WIN-96** | **Formatting toolbar and its keyboard shortcuts (REQ-220).** The authoring *affordance* for the markup WIN-90 now parses and renders: a toolbar over the composer (bold, italic, strikethrough, code, quote, lists) plus **Ctrl+B / Ctrl+I** and friends wrapping the selection in the delimiters. Startable since 2026-07-31 — it was split out deliberately because WIN-90 is what makes formatting *exist*, and a second way to author it was worth nothing until the first worked. **Constrained by ARCH-100:** anything the toolbar produces must be expressible in text ([MARKDOWN.md](./MARKDOWN.md) §5), or the two authoring paths diverge and a message becomes uneditable in one of them. The parser is the check on that — a toolbar insertion that `oc_rt_scan` does not read back the same way is a bug in the toolbar. | P2 | M |
+
+New work belongs here as new ids (never reused); the items below are waiting on
+a requirement or a decision.
 
 ## Open, but not startable here
 
@@ -31,9 +35,7 @@ pattern REQ-221 and REQ-230 both followed.
 
 | # | Item | Blocked on |
 |---|---|---|
-| **WIN-90** | **Rich text / formatting.** No markup parsing or formatting toolbar yet, but it is now **startable**: the dialect is settled (ARCH-100, [MARKDOWN.md](./MARKDOWN.md)) and the rendering side was unblocked by the custom composer (WIN-80/ARCH-98) — the field is ours to lay out. Work is a parser in `client/core/richtext.[ch]` returning spans, DirectWrite ranges in `body_layout` beside the existing mention highlighting, and a composer that shows formatting as you type. The toolbar and Ctrl+B/Ctrl+I are deliberately **not** here — they are WIN-96. Also gates snippets (REQ-226). | — (dialect settled; this is now ordinary client work) |
 | **WIN-97** | **Activity filters: Unreads, DMs, Channels (REQ-139).** The feed answers "what involved me" — mentions, reactions, thread replies — and not "what have I not read". Slack's Activity has both, and the three missing filters are the second half. One query with three predicates rather than three features: *messages past my read cursor, in conversations I belong to*, filtered by kind (DMs) or by notification level (Channels), or unfiltered (Unreads). The cursor already exists — `delivery_cursors`, REQ-090. Needs a daemon half (the query and its wire op) before the Win32 tabs. Slack's saved custom views are deliberately not in scope. | P1 | M |
-| **WIN-96** | **Formatting toolbar and its keyboard shortcuts (REQ-220).** The authoring *affordance* for the markup WIN-90 parses: a toolbar over the composer (bold, italic, strikethrough, code, quote, lists) plus **Ctrl+B / Ctrl+I** and friends wrapping the selection in the delimiters. Split out deliberately — WIN-90 is parse-and-render, which is what makes formatting *exist*; this is a second way to author what you can already type, and it is worth nothing until the first works. **Constrained by ARCH-100:** anything the toolbar produces must be expressible in text ([MARKDOWN.md](./MARKDOWN.md) §5), or the two authoring paths diverge and a message becomes uneditable in one of them. | P2 | M |
 | **WIN-91** | **Drafts across a restart.** Drafts are per-channel and in memory (`g_drafts`, 24 slots), so they die with the process. **Decided (ARCH-101): a server-side `drafts` table keyed `(user_id, channel_id, thread_root)` with its own ops** — not the `client_settings` bucket, which is partitioned per frontend and would leave a GUI draft invisible in the TUI. Client work: save on switch/blur/quit and only when changed, restore on entering a conversation, never overwrite a composer being typed in, and mark the sidebar row — **matching Slack's surface**. Daemon work: the table, `SET_DRAFT`/`LIST_DRAFTS`, fan-out to the user's other connections, and the delete cascades. | — (decision made; needs the daemon half built) |
 | **WIN-92** | **"Pause notifications until…" (REQ-278).** The client can set a *recurring daily* window (REQ-131) and nothing else, so the most-reached-for form — "until 17:00", or for 30 minutes — is not expressible: a minutes-of-day pair is periodic, so "until 5pm today" would silence 5pm every day. **Spec settled against Slack's `dnd` API:** presets are *durations from now* (30m / 1h / 2h / until tomorrow / custom), `dnd_until_ms` on `users` with 0 meaning ended, a pause only ever adds silence, and ending a pause is distinct from ending the current scheduled period. Also needs DND carried to **other users** as a second, independent axis beside presence — the fact only, never the end time (REQ-122). VIPs pierce a pause when REQ-135 lands; senders never do (a deliberate divergence from Slack). | REQ-278 daemon half + REQ-122 presence bit |
 | **WIN-94** | **Notification schedule and keyword alerts (REQ-135/136).** Two halves of the same subsystem, both specified 2026-07-31. **Schedule:** *Every day / Weekdays / Custom* with an independent start and end per weekday, stored against the user's local calendar day — and it **replaces** REQ-131's single daily window rather than joining it, because Slack has one recurring mechanism and two would be able to disagree. **Keywords:** part of the *mentions* level rather than their own switch, matched case-insensitively and exactly, phrases allowed, surfacing in the activity feed as mentions — and firing **in threads**, where Slack's do not. **Priority people** pierce a level and a pause but never a mute. | REQ-135 / REQ-136 daemon halves |
@@ -99,11 +101,12 @@ pattern REQ-221 and REQ-230 both followed.
 
 ## What "closed" does and does not mean
 
-**Everything startable in `client/gui/win32/` is closed** (2026-07-31). WIN-1 …
-WIN-89 plus WIN-93 and WIN-95 are done — accessibility included, built *for* the
-custom controls rather than by retreating to native ones (ARCH-99). The items
-above are each blocked on a daemon requirement or an ARCH decision, or, in
-WIN-60's case, on a crash that has not reproduced since it was instrumented. An adversarial review on 2026-07-30 found no defect in the
+WIN-1 … WIN-90 plus WIN-93 and WIN-95 are done — accessibility included, built
+*for* the custom controls rather than by retreating to native ones (ARCH-99),
+and rich text as of 2026-07-31. **WIN-90 closing is what opened WIN-96**, which
+is the one startable item above; the rest are each blocked on a daemon
+requirement or an ARCH decision, or, in WIN-60's case, on a crash that has not
+reproduced since it was instrumented. An adversarial review on 2026-07-30 found no defect in the
 previously-closed list, several claims verified by round-trip against a live
 daemon (pin → Pins tab; save → Later; Activity, Files, Later and Admin all
 rendering real content).

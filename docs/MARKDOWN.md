@@ -45,6 +45,19 @@ meant literally. Three rules, in order:
    because without one there is no way to write a literal asterisk at a word
    boundary and the answer "you cannot" is not one.
 
+Two clarifications the implementation forced, recorded because they are the
+difference between the rules above working and merely sounding right:
+
+- **A run of delimiters is looked *through* to find the boundary.** Rule 1 has
+  to accept a delimiter as an opener's left-hand context or `*_x_*` could never
+  nest, but accepting it blindly makes `snake__case__here` italicise `case_` —
+  the run traces back to `e`, and an identifier is not a word boundary however
+  many underscores are in it.
+- **Only `**` means anything doubled.** `~~struck~~`, `__loud__` and `***x***`
+  are literal text. The alternative is matching the first delimiter of the pair
+  and striking through `~struck` — visibly half-eaten, which is worse than
+  leaving what the author typed alone.
+
 An unmatched or ambiguous construct **always degrades to its literal source**.
 Rendering is never allowed to lose characters the author typed.
 
@@ -121,11 +134,21 @@ and an underline is indistinguishable from a link in most renderings.
 Each frontend maps spans to its own facilities, and the mapping is the frontend's
 business:
 
-- **Win32** — DirectWrite ranges on the existing layout, the same mechanism
-  `@mention` highlighting already uses (`body_layout`), so formatting composes
-  with mentions and custom emoji rather than fighting them.
+- **Win32** — **built 2026-07-31 (WIN-90).** DirectWrite ranges on the existing
+  layout, the same mechanism `@mention` highlighting already uses
+  (`body_layout`), so formatting composes with mentions and custom emoji rather
+  than fighting them. The **transcript removes** the inline delimiters and the
+  **composer only dims** them: the composer's text is what will be sent, so
+  hiding the asterisks there would leave you stepping a caret through
+  characters you cannot see. Removing one takes a transparent brush *and* a
+  0.1 DIP size, because the layout still covers the raw body and a transparent
+  asterisk keeps its width — two gaps around every bold word, which read as
+  typos. Block markers (`- `, `1. `, `> `) stay visible but faint: in a
+  range-only treatment they *are* the rendering of a list or a quote.
 - **TUI** — tuikit attributes; code blocks and blockquotes get in-band markers
-  since a terminal has no proportional styling to lean on.
+  since a terminal has no proportional styling to lean on. **Not built yet** —
+  the parser is shared and waiting for it, and until then the TUI shows the
+  markup as source, which the dialect guarantees is legible.
 
 **The composer shows formatting as you type**, which is only affordable because
 the parser is client-side and runs over a ≤4000-unit buffer — the same pass that
