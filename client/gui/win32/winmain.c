@@ -2255,7 +2255,13 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
             int muted = rc && rc->muted;
             int unread = (r->unread > 0) && !muted;
             if (selected) fill_round(rt, rf(sx0, ry + 2, sx1, ry + ROW_H - 2), 6.0f, OC_COL_SELECT);
-            if (r->section == OC_SB_DMS) {
+            /* Ask what the ROW IS, not where it happens to be filed. Starring a DM
+             * moves it into Starred (WIN-41), and this test used to be
+             * `section == OC_SB_DMS` — so a starred person rendered with the channel
+             * "#" glyph and no presence dot. A custom section (WIN-83) had the same
+             * problem. `peer_id` is set for a 1:1 DM and n_peers for a group. */
+            int row_is_dm = (rc && rc->kind == OC_CHANNEL_KIND_DM) || r->peer_id != 0;
+            if (row_is_dm) {
                 /* A person gets an avatar and a presence dot, not an "@" glyph —
                  * the marker in Slack's DM list is the human, not the sigil. */
                 D2D1_RECT_F av = rf(sx0 + 12, ry + (ROW_H - 18) / 2, sx0 + 30, ry + (ROW_H + 18) / 2);
@@ -6522,6 +6528,23 @@ static int g_dm_index_now;            /* this frame's middle column is the DM in
 static D2D1_RECT_F g_dm_compose_btn;
 
 /* The DM channel with `uid`, or NULL. */
+/* Open a DM AND go to it. The channel does not exist yet at click time — the
+ * daemon creates it — so the destination is armed and the tick selects it when
+ * CHANNEL_INFO lands (the same shape the permalink jump uses).
+ *
+ * This machinery already existed and exactly ONE of the four "message this person"
+ * paths used it: the compose picker. The other three — the profile pane's Message
+ * button, the member menu, and the New-direct-message dialog — called open_dm and
+ * left you looking at whatever channel you were already in, with a new row
+ * somewhere in the sidebar. A button labelled "Message" that does not take you to
+ * the message is not a button that half works; it is one that does not work. */
+static void open_dm_go(uint64_t uid) {
+    if (!g_client || !uid) return;
+    g_view = VIEW_HOME;
+    g_dm_pending = uid;
+    oc_client_open_dm(g_client, uid);
+}
+
 static const oc_channel *dm_with(const oc_model *m, uint64_t uid) {
     for (size_t i = 0; i < m->n_channels; i++)
         if (m->channels[i].kind == OC_CHANNEL_KIND_DM && m->channels[i].peer_id == uid)
@@ -8746,7 +8769,7 @@ static void member_menu_run(HWND hwnd, int cmd) {
     (void)hwnd;
     uint64_t uid = g_menu_target;
     switch (cmd) {
-    case 1:  oc_client_open_dm(g_client, uid); break;
+    case 1:  open_dm_go(uid); break;
     case 2:  profile_open(uid); break;
     case 10: oc_client_set_role(g_client, uid, OC_ROLE_MEMBER); break;
     case 11: oc_client_set_role(g_client, uid, OC_ROLE_ADMIN); break;
@@ -9039,7 +9062,7 @@ static int on_click(HWND hwnd, int x, int y) {
          * to the member list: the profile has done its job, we are leaving for the
          * conversation. */
         rp_pop();
-        oc_client_open_dm(g_client, uid);
+        open_dm_go(uid);
         return 1;
     }
     if (g_wsmgr_open) {
@@ -9396,7 +9419,7 @@ static int on_click(HWND hwnd, int x, int y) {
                 const oc_channel *ex = dm_m ? dm_with(dm_m, g_pickrows[i].uid) : NULL;
                 g_dm_compose = 0;
                 if (ex) select_channel(ex->channel_id);
-                else { g_dm_pending = g_pickrows[i].uid; oc_client_open_dm(g_client, g_pickrows[i].uid); }
+                else open_dm_go(g_pickrows[i].uid);
                 return 1;
             }
     }
@@ -10886,7 +10909,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         /* An unknown name used to do nothing at all, which looked like a bug. */
         if (!id) { toast_push("No such user in this workspace.", 1); break; }
         g_view = VIEW_HOME;
-        oc_client_open_dm(g_client, id);
+        open_dm_go(id);
         break; }
     case 7:  g_view = VIEW_HOME; upload_file(hwnd); break;
     case 10: oc_client_set_presence(g_client, OC_PRESENCE_ONLINE); break;
