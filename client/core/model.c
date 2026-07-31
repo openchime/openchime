@@ -1360,14 +1360,14 @@ void oc_sidebar_opts_parse(oc_sidebar_opts *o, const char *s) {
  * unnamed channels, showed no DMs at all. */
 static void sb_label(const oc_model *m, const oc_channel *c, char *out, size_t cap) {
     /* A GROUP DM is titled by its people (REQ-056), the way Slack does it: names
-     * rather than a made-up name, because nobody named it. Yourself excluded — you
-     * know you are in it, and including you costs the width that would have shown
-     * one more person. Alphabetical, so the same group reads the same way in every
-     * client and does not reshuffle when somebody posts. */
+     * rather than a made-up name, because nobody named it. EVERY participant is
+     * listed, yourself included: the title states who is in the conversation, and
+     * a roster that silently omits the reader disagrees with the member pane and
+     * with the participant count beside it. Alphabetical, so the same group reads
+     * the same way in every client and does not reshuffle when somebody posts. */
     if (c->kind == OC_CHANNEL_KIND_DM && c->n_peers > 2) {
         const char *names[9]; int nn = 0;
         for (uint16_t i = 0; i < c->n_peers && nn < 9; i++) {
-            if (c->peers[i] == m->user_id) continue;
             const char *nm = oc_model_user_name(m, c->peers[i]);
             names[nn++] = (nm && nm[0]) ? nm : "someone";
         }

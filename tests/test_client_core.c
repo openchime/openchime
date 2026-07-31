@@ -326,6 +326,49 @@ static void test_pins(void) {
     oc_model_free(&m);
 }
 
+/* A GROUP DM is titled by everyone in it, the reader included (REQ-056). This
+ * went untested, and the title quietly disagreed with both the member pane and
+ * the participant count beside it: a three-person group read "bob, carol". */
+static void test_group_dm_title(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;                                  /* signed in as alice */
+
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("alice"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob");   oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 3; e.body = strdup("carol"); oc_model_apply(&m, &e);
+
+    /* The daemon sends every member of the DM, self included (dbwriter.c selects
+     * the whole channel_members row set), so n_peers is 3 here, not 2. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 20; e.status = 1; e.op = OC_CHANNEL_KIND_DM;
+    e.user_id = 2; e.server_time = 500;
+    e.n_peers = 3; e.peers[0] = 1; e.peers[1] = 2; e.peers[2] = 3;
+    oc_model_apply(&m, &e);
+
+    const oc_channel *c = oc_model_channel(&m, 20);
+    CHECK(c != NULL);
+    CHECK(c->n_peers == 3);                          /* the count the GUI badge draws */
+
+    char title[96];
+    oc_model_dm_title(&m, c, title, sizeof title);
+    CHECK(strcmp(title, "alice, bob, carol") == 0);  /* alphabetical, self included */
+
+    /* A 1:1 DM is still titled by the other person, not by both of them. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 21; e.status = 1; e.op = OC_CHANNEL_KIND_DM;
+    e.user_id = 2; e.server_time = 600; oc_model_apply(&m, &e);
+    const oc_channel *d = oc_model_channel(&m, 21);
+    CHECK(d != NULL);
+    oc_model_dm_title(&m, d, title, sizeof title);
+    CHECK(strcmp(title, "bob") == 0);
+
+    oc_model_free(&m);
+}
+
 static void test_sidebar(void) {
     oc_model m; oc_model_init(&m);
     m.user_id = 1;
@@ -799,6 +842,7 @@ static void test_secret_routing(void) {
 int run_client_core_tests(void) {
     printf("test_client_core: sidebar, resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, client-settings, profile, seen-by, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox\n");
 
+    test_group_dm_title();
     test_sidebar();
     test_pins();
     test_resolve();

@@ -1934,21 +1934,26 @@ static void draw_user_avatar(ID2D1RenderTarget *rt, const oc_model *m, uint64_t 
     IDWriteTextFormat_SetTextAlignment(fmt, prev);
 }
 
-/* A group conversation's marker: the number of other people, not one of their
+/* A group conversation's marker: how many people are in it, not one of their
  * faces. Picking a participant's avatar to stand for a group is a claim about
  * the wrong person, which is why the sidebar has drawn it this way since
  * REQ-056; this is that idiom lifted out so the DMs index draws the same thing
- * (WIN-95) instead of inventing a second answer. */
+ * (WIN-95) instead of inventing a second answer. The count includes you, so it
+ * matches the names in the title and the rows in the member pane. */
 static void draw_group_avatar(ID2D1RenderTarget *rt, const oc_model *m,
                               const oc_channel *c, D2D1_RECT_F box) {
     (void)m;
     fill_round(rt, box, 5.0f, OC_COL_INPUT);
     stroke_round(rt, box, 5.0f, OC_COL_BORDER, 1.0f);
     char cnt[8];
-    snprintf(cnt, sizeof cnt, "%u", (unsigned)(c->n_peers > 0 ? c->n_peers - 1 : 0));
+    snprintf(cnt, sizeof cnt, "%u", (unsigned)c->n_peers);
     IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_CENTER);
     draw_text(rt, cnt, g_micro, rf(box.left, box.top + 6, box.right, box.bottom), OC_COL_MUTED);
-    IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_LEADING);
+    /* Back to CENTER, which is how g_micro was created. Restoring LEADING here
+     * left every later g_micro draw left-aligned — most visibly the rail labels,
+     * which centre themselves in a full-width rect and so drifted off the rail
+     * the moment a group DM was on screen. */
+    IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_CENTER);
 }
 
 static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
@@ -2362,7 +2367,7 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                     fill_round(rt, av, 5.0f, OC_COL_INPUT);
                     stroke_round(rt, av, 5.0f, OC_COL_BORDER, 1.0f);
                     char cnt[8];
-                    snprintf(cnt, sizeof cnt, "%u", (unsigned)(rc->n_peers - 1));
+                    snprintf(cnt, sizeof cnt, "%u", (unsigned)rc->n_peers);
                     IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_CENTER);
                     draw_text(rt, cnt, g_micro, av, selected ? OC_COL_TEXT : OC_COL_MUTED);
                     IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_CENTER);
