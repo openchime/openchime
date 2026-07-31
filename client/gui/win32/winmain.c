@@ -26,6 +26,7 @@
 #include <dwrite.h>
 #include <wincodec.h>       /* WIC: decode an inline image from memory (WIN-17) */
 #include <dbghelp.h>        /* MINIDUMP_* types; the function is loaded at run time */
+#include "a11y.h"           /* the UIA provider (REQ-269, ARCH-99) */
 
 #include <stdarg.h>          /* va_list — the crash breadcrumb ring */
 #include <stdio.h>
@@ -3630,6 +3631,8 @@ static void scale_apply(HWND hwnd);        /* fwd — text size / zoom (ARCH-97)
 static void dpi_set(HWND hwnd, UINT dpi);  /* fwd */
 static void layout_search(HWND hwnd);     /* fwd */
 static int  window_is_covered(void);      /* fwd */
+static int  g_a11y_n;    /* items published last frame — reported, so the tree is assertable */
+static void a11y_publish_scene(const oc_model *m);  /* fwd — ARCH-99; defined beside the composer state it reads */
 
 /* Move `delta` conversations through the sidebar as it is currently shown, so
  * the order matches what the eye sees — the section order, sort and filter all
@@ -7334,6 +7337,7 @@ static void paint(HWND hwnd) {
      * different reason: it has to react to a menu opening, which is not a
      * relayout and so never reached it. */
     layout_natives(hwnd);
+    a11y_publish_scene(m);   /* describe what was just drawn (ARCH-99) */
 
     HRESULT hr = ID2D1RenderTarget_EndDraw(rt, NULL, NULL);
     if (hr == (HRESULT)D2DERR_RECREATE_TARGET) {
@@ -8008,6 +8012,83 @@ static void ed_draw(ID2D1RenderTarget *rt, D2D1_RECT_F box) {
         ed_caret_sync(cr);
     }
 }
+
+/* ---- describing what was just drawn (REQ-269, ARCH-99) ---------------------
+ * Built from the SAME arrays the paint pass hit-tests against — g_rows for the
+ * sidebar, g_msgrows for the transcript, g_ed_box for the composer — so the
+ * accessible tree and the visible one cannot describe different layouts. Called
+ * immediately after render_scene, while those arrays describe this frame.
+ *
+ * Rects are converted to device pixels here, which keeps every DPI question on
+ * this side of the seam; a11y.c only ever maps client to screen. */
+static void a11y_publish_scene(const oc_model *m) {
+    static oc_acc_item items[OC_ACC_MAX];
+    int n = 0;
+
+    /* Conversations. Headers are skipped: "Channels" is a label, not a place you
+     * can go, and a screen reader offering it as a list item invites the user to
+     * activate something that does nothing. */
+    for (int i = 0; i < g_n_rows && n < OC_ACC_MAX; i++) {
+        if (g_rows[i].header || !g_rows[i].cid) continue;
+        oc_acc_item *it = &items[n++];
+        it->kind = OC_ACC_CONVERSATION;
+        it->id   = g_rows[i].cid;
+        it->l = PX(RAIL_W); it->r = PX(RAIL_W + SIDEBAR_W);
+        it->t = PX(g_rows[i].top); it->b = PX(g_rows[i].bot);
+        const oc_channel *c = m ? oc_model_channel((oc_model *)m, g_rows[i].cid) : NULL;
+        /* Unread belongs in the NAME, not only in a property: it is the reason a
+         * person is scanning this list, and a count nobody reads aloud is a
+         * count that does not exist. */
+        if (c && c->unread > 0)
+            snprintf(it->name, sizeof it->name, "%s, %d unread", g_rows[i].label, (int)c->unread);
+        else
+            snprintf(it->name, sizeof it->name, "%s", g_rows[i].label);
+    }
+
+    /* Messages, in the order they are drawn. The name is what a person would say
+     * reading the transcript aloud — who, when, what — because that is what a
+     * screen reader will say. */
+    for (int i = 0; i < g_n_msgrows && n < OC_ACC_MAX; i++) {
+        const oc_channel *c = (m && g_sel) ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+        const oc_msg *msg = c ? find_msg(c, g_msgrows[i].mid) : NULL;
+        if (!msg) continue;
+        oc_acc_item *it = &items[n++];
+        it->kind = OC_ACC_MESSAGE;
+        it->id   = g_msgrows[i].mid;
+        it->l = PX(g_msgrows[i].left);  it->r = PX(g_msgrows[i].right);
+        it->t = PX(g_msgrows[i].top);   it->b = PX(g_msgrows[i].bot);
+        const char *who = msg->author_name[0] ? msg->author_name
+                                              : oc_model_user_name(m, msg->author_id);
+        char when[24]; rel_time(msg->server_time, when, sizeof when);
+        if (msg->deleted)
+            snprintf(it->name, sizeof it->name, "%s, %s, message deleted",
+                     who ? who : "someone", when);
+        else
+            snprintf(it->name, sizeof it->name, "%s, %s: %s",
+                     who ? who : "someone", when, msg->body ? msg->body : "");
+    }
+
+    /* The composer, and its text, so it can be read back rather than only typed
+     * into. Published even when the box is empty — an Edit element that vanishes
+     * when you clear it is worse than one that says it is empty. */
+    const WCHAR *ctext = NULL;
+    int caret = 0, anchor = 0;
+    if (main_is_conversation() && g_ed_box.right > g_ed_box.left && n < OC_ACC_MAX) {
+        oc_acc_item *it = &items[n++];
+        it->kind = OC_ACC_COMPOSER;
+        it->id   = g_sel;
+        it->l = PX(g_ed_box.left);  it->r = PX(g_ed_box.right);
+        it->t = PX(g_ed_box.top);   it->b = PX(g_ed_box.bottom);
+        char cue[128]; composer_cue(m, cue, sizeof cue);
+        snprintf(it->name, sizeof it->name, "%s", cue[0] ? cue : "Message");
+        ctext  = g_ed;
+        caret  = g_ed_caret;
+        anchor = g_ed_anchor;
+    }
+    g_a11y_n = n;
+    oc_a11y_publish(items, n, ctext, caret, anchor);
+}
+
 
 /* ---- composer autocomplete (WIN-7) ---------------------------------------
  * Everything works in UTF-16 for the RichEdit and UTF-8 for the core: the text
@@ -11707,6 +11788,12 @@ static void test_dump(const char *path) {
      * from "this daemon has never heard of bob" — and it once reported the
      * former for three runs while the latter was true. Capped: a dump is read by
      * a person, and 500 names is not read by anyone. */
+    /* The accessibility surface (ARCH-99). `avail` is whether the UIA entry
+     * points resolved at all; `items` is what the last paint described. Neither
+     * proves a client can SEE the tree — scripts/uia_probe.ps1 does that, from
+     * outside the process — but a zero here localises the failure to this side. */
+    fprintf(f, "a11y avail=%d items=%d announced=%u\n",
+            oc_a11y_available(), g_a11y_n, oc_a11y_announced());
     /* The system caret (ARCH-99). Reported because it is invisible by design —
      * the app paints its own — so the only way to tell it exists is to ask. A
      * screen reader that cannot follow typing looks exactly like one that can. */
@@ -12398,6 +12485,9 @@ static void test_poll(HWND hwnd) {
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
+        /* Before any child: the provider must exist by the time the first
+         * WM_GETOBJECT arrives, and a screen reader may ask immediately. */
+        oc_a11y_init(hwnd);
         composer_create(hwnd);
         find_create(hwnd);
         files_find_create(hwnd);
@@ -13004,6 +13094,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_IME_ENDCOMPOSITION:
         if (ed_ime(hwnd, msg, wp, lp)) return 0;
         break;
+    case WM_GETOBJECT: {
+        /* The whole accessibility surface hangs off this one message (ARCH-99).
+         * Answering only UiaRootObjectId and falling through otherwise leaves
+         * MSAA/OBJID_CLIENT to DefWindowProc, which is what the nine native EDIT
+         * children still rely on. */
+        int handled = 0;
+        LRESULT r = oc_a11y_get_object(hwnd, wp, lp, &handled);
+        if (handled) return r;
+        break;
+    }
     case WM_SETFOCUS:
         /* Coming back from a native child (the find box, the palette, a form
          * field) means the field is typeable again. */
@@ -13073,6 +13173,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return DefWindowProcW(hwnd, msg, wp, lp);   /* proceed with the close */
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_TICK);
+        oc_a11y_shutdown();   /* tell UIA the provider is going, before the window does */
         tray_done();       /* or the icon lingers in the notification area */
         for (int i = 0; i < g_n_wss; i++)
             if (g_wss[i].client && g_wss[i].client != g_client) oc_client_stop(g_wss[i].client);

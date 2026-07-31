@@ -879,6 +879,31 @@ ed_step len 0 "the other channel starts empty"
 expect_grep '^ed .*text="a draft"' "and the draft comes back"
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1
 
+# --- accessibility (REQ-269, ARCH-99) ---------------------------------------
+# Two claims, and they are NOT the same claim. The dump proves what the app
+# published; only a real UIA client proves anything can see it. The second is the
+# feature, so the second is the one that gates.
+say "== accessibility"
+"$DRIVE" view 0 >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; settle sbkind 1
+expect_grep '^a11y avail=1 ' "the UIA provider resolved"
+checks=$((checks + 1))
+n=$(snap | grep -oE '^a11y avail=[0-9] items=[0-9]+' | grep -oE 'items=[0-9]+' | cut -d= -f2)
+if [ -n "${n:-}" ] && [ "$n" -ge 2 ]; then ok "the paint pass described $n elements"
+else fail "nothing published to the accessibility tree (items=${n:-?})"; fi
+
+# The real gate: walk the tree from OUTSIDE the process, as a screen reader does.
+if [ -f "$LIN_DIR/uia_probe.ps1" ] || cp "$HERE/scripts/uia_probe.ps1" "$LIN_DIR/" 2>/dev/null; then
+  checks=$((checks + 1))
+  if powershell.exe -NoProfile -ExecutionPolicy Bypass \
+       -File 'C:\Windows\Temp\octest\uia_probe.ps1' -Assert 2>/dev/null | grep -q 'uia_probe: OK'; then
+    ok "a real UIA client can read the tree (lists, items and the composer)"
+  else
+    fail "uia_probe could not read the tree — run it directly to see the walk"
+  fi
+else
+  say "   (could not stage uia_probe.ps1 — skipping the external check)"
+fi
+
 # --- the composer cue tracks the conversation ------------------------------
 # It was a cached global that went stale on a channel switch ("Message bob" while
 # reading alice), so it is asserted rather than eyeballed.

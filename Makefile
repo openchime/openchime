@@ -196,7 +196,7 @@ $(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
 	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result -municode -mwindows $(WIN_GUI_INC) -Iclient/gui/win32/res \
 	    $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
 	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -lshell32 -lcomdlg32 -lgdi32 -ladvapi32 \
-	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -luuid -limm32 -static -o $@
+	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -luuid -limm32 -loleaut32 -static -o $@
 
 # --- tuikit demo (ARCH-83) ----------------------------------------------------
 # Standalone harness exercising every tuikit widget — no core, no daemon, no TLS.
