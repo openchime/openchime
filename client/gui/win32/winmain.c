@@ -7581,6 +7581,46 @@ static int ed_lines(float w) {
 }
 
 /* The caret's rect, in the coordinate space of `box`. */
+/* ---- the system caret (REQ-269, ARCH-99) ----------------------------------
+ * A self-drawn text field still has to tell Windows where the caret is. The
+ * system caret is what screen readers and magnifiers track, and what a
+ * `WM_GETOBJECT`-less app has never had here. `g_caret_owned` is our own record
+ * of having created one, because `CreateCaret` replaces the thread's caret
+ * silently and destroying one we do not own would take it from a native child. */
+static int   g_caret_owned;
+static POINT g_caret_at = { -32768, -32768 };
+
+static void ed_caret_kill(void) {
+    if (!g_caret_owned) return;
+    DestroyCaret();
+    g_caret_owned = 0;
+    g_caret_at.x = g_caret_at.y = -32768;
+}
+
+/* `cr` is the caret rect in DIPs, as the field draws it. */
+static void ed_caret_sync(D2D1_RECT_F cr) {
+    if (!g_ed_focus) { ed_caret_kill(); return; }
+    int h = PX(cr.bottom - cr.top);
+    if (h < 1) h = 1;
+    if (!g_caret_owned) {
+        /* The caret belongs to the focused window by definition, and ed_focus()
+         * puts focus on the MAIN window (the composer is drawn, not a child), so
+         * GetFocus() is the right owner without threading an HWND through the
+         * paint pass. If focus has gone elsewhere there is no caret to own.
+         *
+         * One device pixel wide and never shown: this caret exists to be
+         * reported, not seen — see the call site in ed_draw. */
+        HWND owner = GetFocus();
+        if (!owner || !CreateCaret(owner, NULL, 1, h)) return;
+        g_caret_owned = 1;
+        g_caret_at.x = g_caret_at.y = -32768;
+    }
+    POINT p = { PX(cr.left), PX(cr.top) };
+    if (p.x == g_caret_at.x && p.y == g_caret_at.y) return;   /* no event churn */
+    g_caret_at = p;
+    SetCaretPos(p.x, p.y);
+}
+
 static int ed_caret_rect(D2D1_RECT_F box, D2D1_RECT_F *out) {
     IDWriteTextLayout *tl = ed_layout(box.right - box.left);
     if (!tl) return 0;
@@ -7956,6 +7996,16 @@ static void ed_draw(ID2D1RenderTarget *rt, D2D1_RECT_F box) {
         if (cr.bottom > box.bottom) g_ed_scroll += cr.bottom - box.bottom;
         else if (cr.top < box.top)  g_ed_scroll -= box.top - cr.top;
         if (g_ed_scroll < 0) g_ed_scroll = 0;
+        /* The SYSTEM caret (REQ-269 / ARCH-99). Screen readers and magnifiers
+         * follow the caret Windows knows about, not the one we paint — and this
+         * field paints its own, so assistive technology could not follow typing
+         * at all. Synced here because this is the one place guaranteed to run
+         * whenever the caret has moved and the field is on screen.
+         *
+         * It is deliberately never shown: `ShowCaret` is not called, so Windows
+         * tracks a 1px caret that is not drawn and the app's own caret stays the
+         * visible one (blink phase, colour and thickness all stay ours). */
+        ed_caret_sync(cr);
     }
 }
 
@@ -11657,6 +11707,14 @@ static void test_dump(const char *path) {
      * from "this daemon has never heard of bob" — and it once reported the
      * former for three runs while the latter was true. Capped: a dump is read by
      * a person, and 500 names is not read by anyone. */
+    /* The system caret (ARCH-99). Reported because it is invisible by design —
+     * the app paints its own — so the only way to tell it exists is to ask. A
+     * screen reader that cannot follow typing looks exactly like one that can. */
+    {
+        POINT cp = { -1, -1 };
+        GetCaretPos(&cp);
+        fprintf(f, "caret owned=%d x=%ld y=%ld\n", g_caret_owned, (long)cp.x, (long)cp.y);
+    }
     /* The last error the core reported, and its monotonic sequence. Without this
      * a failed intent is indistinguishable from an intent that was never sent —
      * both look like "nothing happened" from a dump — and `error_seq` is here
@@ -12956,6 +13014,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         /* Losing it to a child, or to another app: the caret must stop drawing, or
          * two carets blink at once and neither is where your keys go. */
         g_ed_focus = 0;
+        /* And the SYSTEM caret goes with it (ARCH-99) — a caret left behind on a
+         * window that no longer has focus is a lie told to every screen reader
+         * and magnifier watching it. */
+        ed_caret_kill();
         ed_mouse_up();
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;

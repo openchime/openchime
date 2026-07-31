@@ -831,6 +831,26 @@ else
   checks=$((checks + 1)); fail "no ed box in the dump"
 fi
 
+# The SYSTEM caret (REQ-269 / ARCH-99) — invisible by design, so the only way to
+# know it is there is to ask. It is what screen readers and magnifiers follow, and
+# a self-drawn field that never creates one leaves them unable to track typing at
+# all. Asserted as a TRANSITION: that it exists, and that it MOVES with the text
+# caret, because a caret pinned at the box origin looks identical to a working one
+# in any single sample.
+checks=$((checks + 1))
+if snap | grep -q '^caret owned=1 '; then ok "a system caret exists while the composer has focus"
+else fail "no system caret: $(snap | grep '^caret ')"; fi
+cx() { snap | grep -oE '^caret owned=[0-9] x=[0-9-]+' | grep -oE 'x=[0-9-]+' | cut -d= -f2; }
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+x0=$(cx)
+"$DRIVE" chars "system caret tracks" >/dev/null 2>&1; ed_wait len 19
+x1=$(cx)
+checks=$((checks + 1))
+if [ -n "${x0:-}" ] && [ -n "${x1:-}" ] && [ "$x1" -gt "$x0" ]; then
+  ok "and it follows the text caret ($x0 -> $x1)"
+else fail "the system caret did not move with the caret ($x0 -> $x1)"; fi
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+
 # The mention popover still tracks the caret, and Tab accepts. `alice` is asserted
 # to exist in the fixture at launch, so a miss here is the completion, not the
 # roster — which is a distinction three earlier runs got wrong.
