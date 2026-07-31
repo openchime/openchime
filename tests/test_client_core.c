@@ -391,22 +391,23 @@ static void test_sidebar(void) {
     oc_sidebar_opts o; oc_sidebar_opts_defaults(&o);
     oc_sidebar_row rows[16];
 
-    /* THREE headers now (WIN-41): Starred first — empty but present, so it can be
-     * used — then Channels A-Z, then the DM titled by its peer. */
+    /* With nothing starred there is NO Starred section at all: it is purely
+     * derived, so an empty one is a row that says nothing and opens onto
+     * nothing. Two headers then — Channels A-Z, and the DM titled by its peer. */
     size_t n = oc_model_sidebar(&m, &o, rows, 16);
-    CHECK(n == 6);
-    CHECK(rows[0].is_header && rows[0].section == OC_SB_STARRED && rows[0].section_total == 0);
-    CHECK(rows[1].is_header && rows[1].section == OC_SB_CHANNELS && rows[1].section_total == 2);
-    CHECK(strcmp(rows[2].label, "alpha") == 0 && rows[2].is_private == 1);
-    CHECK(strcmp(rows[3].label, "zulu") == 0  && rows[3].is_private == 0);
-    CHECK(rows[4].is_header && rows[4].section == OC_SB_DMS);
-    CHECK(strcmp(rows[5].label, "bob") == 0 && rows[5].unread == 3);
+    CHECK(n == 5);
+    CHECK(rows[0].is_header && rows[0].section == OC_SB_CHANNELS && rows[0].section_total == 2);
+    CHECK(strcmp(rows[1].label, "alpha") == 0 && rows[1].is_private == 1);
+    CHECK(strcmp(rows[2].label, "zulu") == 0  && rows[2].is_private == 0);
+    CHECK(rows[3].is_header && rows[3].section == OC_SB_DMS);
+    CHECK(strcmp(rows[4].label, "bob") == 0 && rows[4].unread == 3);
 
     /* Starring lifts a conversation OUT of its section into Starred — it must appear
      * once, not twice. */
     CHECK(oc_sidebar_toggle_star(&o, 11) == 1);
     CHECK(oc_sidebar_is_starred(&o, 11) && !oc_sidebar_is_starred(&o, 12));
     n = oc_model_sidebar(&m, &o, rows, 16);
+    /* ...and starring one brings the section INTO existence. */
     CHECK(n == 6);
     CHECK(rows[0].is_header && rows[0].section == OC_SB_STARRED && rows[0].section_total == 1);
     CHECK(strcmp(rows[1].label, "alpha") == 0 && rows[1].section == OC_SB_STARRED);
@@ -419,29 +420,32 @@ static void test_sidebar(void) {
     CHECK(oc_sidebar_toggle_star(&o, 11) == 1 && oc_sidebar_toggle_star(&o, 12) == 1);
     CHECK(o.n_starred == 0);
     n = oc_model_sidebar(&m, &o, rows, 16);
-    CHECK(n == 6 && strcmp(rows[2].label, "alpha") == 0);
+    /* Un-starring the last one takes the section away again, and the
+     * conversations go back where they came from. */
+    CHECK(n == 5 && rows[0].section == OC_SB_CHANNELS);
+    CHECK(strcmp(rows[1].label, "alpha") == 0);
 
     /* Recency uses the server-reported last_message_at: alpha(300) before zulu(100). */
     o.sort[OC_SB_CHANNELS] = OC_SB_SORT_RECENT;
     n = oc_model_sidebar(&m, &o, rows, 16);
-    CHECK(strcmp(rows[2].label, "alpha") == 0 && strcmp(rows[3].label, "zulu") == 0);
+    CHECK(strcmp(rows[1].label, "alpha") == 0 && strcmp(rows[2].label, "zulu") == 0);
 
     /* Collapsing keeps the header (so it can be reopened) and drops the children. */
     o.collapsed[OC_SB_CHANNELS] = 1;
     n = oc_model_sidebar(&m, &o, rows, 16);
-    CHECK(n == 4 && rows[1].is_header && rows[1].section_total == 2);
+    CHECK(n == 3 && rows[0].is_header && rows[0].section_total == 2);
     o.collapsed[OC_SB_CHANNELS] = 0;
 
     /* Unread-only hides the read channels but keeps the unread DM. */
     o.filter[OC_SB_CHANNELS] = OC_SB_FILTER_UNREAD;
     n = oc_model_sidebar(&m, &o, rows, 16);
-    CHECK(n == 4 && rows[2].is_header && strcmp(rows[3].label, "bob") == 0);
+    CHECK(n == 3 && rows[1].is_header && strcmp(rows[2].label, "bob") == 0);
     o.filter[OC_SB_CHANNELS] = OC_SB_FILTER_ALL;
 
     /* Find matches the rendered LABEL, so a DM (which has no name) is findable. */
     snprintf(o.find, sizeof o.find, "bo");
     n = oc_model_sidebar(&m, &o, rows, 16);
-    CHECK(n == 4 && strcmp(rows[3].label, "bob") == 0);
+    CHECK(n == 3 && strcmp(rows[2].label, "bob") == 0);
     o.find[0] = '\0';
 
     /* Options round-trip through the settings bucket (ARCH-88: no local file). */
@@ -469,18 +473,20 @@ static void test_sidebar(void) {
     int work = oc_sidebar_section_add(&u, "Work");
     CHECK(work == 0 && u.n_custom == 1);
 
-    /* A named section sits between Starred and Channels, and a conversation in it
-     * is REMOVED from Channels — the same appear-once rule Starred follows. */
+    /* A named section sits where Starred would be (nothing is starred here, so
+     * that section is absent) and above Channels, and a conversation in it is
+     * REMOVED from Channels — the same appear-once rule Starred follows. A custom
+     * section, unlike Starred, stays visible when empty: somebody made it, and
+     * hiding it would leave no way to manage or remove it. */
     CHECK(oc_sidebar_assign(&u, 10, work) == 1);         /* zulu */
     CHECK(oc_sidebar_section_of(&u, 10) == work);
     n = oc_model_sidebar(&m, &u, rows, 16);
-    CHECK(n == 7);
-    CHECK(rows[0].is_header && rows[0].section == OC_SB_STARRED);
-    CHECK(rows[1].is_header && rows[1].section == OC_SB_CUSTOM_BASE);
-    CHECK(strcmp(rows[1].label, "Work") == 0 && rows[1].section_total == 1);
-    CHECK(strcmp(rows[2].label, "zulu") == 0 && rows[2].section == OC_SB_CUSTOM_BASE);
-    CHECK(rows[3].is_header && rows[3].section == OC_SB_CHANNELS && rows[3].section_total == 1);
-    CHECK(strcmp(rows[4].label, "alpha") == 0);           /* zulu is gone from here */
+    CHECK(n == 6);
+    CHECK(rows[0].is_header && rows[0].section == OC_SB_CUSTOM_BASE);
+    CHECK(strcmp(rows[0].label, "Work") == 0 && rows[0].section_total == 1);
+    CHECK(strcmp(rows[1].label, "zulu") == 0 && rows[1].section == OC_SB_CUSTOM_BASE);
+    CHECK(rows[2].is_header && rows[2].section == OC_SB_CHANNELS && rows[2].section_total == 1);
+    CHECK(strcmp(rows[3].label, "alpha") == 0);           /* zulu is gone from here */
 
     /* At most one section: assigning again MOVES rather than duplicating. */
     int later = oc_sidebar_section_add(&u, "Later");

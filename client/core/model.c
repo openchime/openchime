@@ -1676,7 +1676,20 @@ size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
 
         if (tn > 1) { g_sb_sort = oc_sb_sort_of(o, sec); qsort(tmp, tn, sizeof *tmp, sb_cmp); }
 
-        /* Header first, always — a collapsed or empty section must stay openable. */
+        /* Starred vanishes entirely when nothing is starred. It is the one
+         * section that is purely DERIVED — it exists because you starred
+         * something — so with nothing in it there is nothing to open and no
+         * reason to spend a row saying so. The others earn their empty state: a
+         * custom section was created deliberately and has to stay visible to be
+         * managed or removed, and an empty Channels or Direct messages is
+         * information about the workspace rather than clutter.
+         *
+         * `total` and not `tn`: tn is what survived the find box and the
+         * unread/active filter, and a section disappearing because you typed in
+         * the filter would be a different behaviour — and a confusing one. */
+        if (sec == OC_SB_STARRED && total == 0) { free(tmp); continue; }
+
+        /* Header first — a collapsed or empty section must stay openable. */
         if (n < cap) {
             oc_sidebar_row *h = &out[n++];
             memset(h, 0, sizeof *h);
