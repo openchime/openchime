@@ -819,10 +819,14 @@ to change a DirectWrite size, so any preference that moves the scale must call
   (REQ-235/137/234), profile depth with avatars and custom status
   (REQ-240/241/122), the global notify default (REQ-134) and the
   **N-concurrent-workspace model** (REQ-012–015, WIN-29) are all built. An
-  adversarial review on 2026-07-30 confirmed it. What is left is a short open
-  list — two avatar-consistency defects, a flaky smoke harness, one unreproduced
-  crash, and the ARCH-blocked pair of rich text (**REQ-220**) and accessibility
-  (**REQ-269**) — in [WIN32_BACKLOG.md](./WIN32_BACKLOG.md).
+  adversarial review on 2026-07-30 confirmed it, and the avatar defects, the
+  flaky harness and the typed group-DM picker were closed on 2026-07-31.
+  **Accessibility (REQ-269) is now the active piece of work** — a UIA provider
+  over the self-drawn UI, a real system caret, and UIA events, decided as
+  **ARCH-99**: the custom controls are implemented *for*, not walked back. What
+  remains behind it is rich text (**REQ-220**, still needs its markup dialect),
+  one unreproduced crash, and the items waiting on a daemon requirement — all in
+  [WIN32_BACKLOG.md](./WIN32_BACKLOG.md).
 - **Next — TUI catch-up (P0).** The two frontends have swapped places: the TUI was
   the reference client and is now behind the GUI by **more than twenty** features,
   every one of which already exists in the app-core — @mentions (REQ-221), pins

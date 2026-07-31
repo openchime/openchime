@@ -254,6 +254,20 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **What stays native:** the `EDIT` boxes (find, search, files-search, sign-in, palette), the file picker, and the window frame itself. Those are cheap, correct, and already accessible; the pattern that governs them is "native children composite above Direct2D" in `docs/CLIENT.md`, not this amendment.
 
+  **The bill this amendment left, and who pays it — see ARCH-99.** ARCH-80 justified going native-per-platform partly because the native toolkit supplies *accessibility*; taking the composer and menus custom forfeited exactly that, for the controls where it matters most. The cost was never priced here. ARCH-99 prices it and pays it — **without** walking any of this back.
+
+- **ARCH-99 (Accessibility — a UI Automation provider over the self-drawn UI):** Answers REQ-269 for the Win32 client and settles the marker ARCH-92 left open on it.
+
+  **The decision: implement accessibility FOR the custom controls, not by retreating from them.** The self-drawn transcript, rail, sidebar, menus and composer are the product's rendering strategy (ARCH-82/98) and are not reverted to native controls to obtain accessibility for free. The client answers `WM_GETOBJECT` with a **UI Automation provider** (`UiaReturnRawElementProvider`) implementing `IRawElementProviderSimple`/`Fragment`/`FragmentRoot`, and raises UIA events.
+
+  **UIA rather than MSAA/`IAccessible`.** MSAA is cheaper to stand up and materially worse for the one thing this application *is* — text. UIA carries control types, patterns, and structured navigation, is what modern screen readers prefer, and is the surface Microsoft's own tooling (Accessibility Insights, `inspect.exe`) inspects. Choosing the weaker API to save a week on a product whose whole content is prose would be the wrong trade.
+
+  **The tree is built from the pass that draws.** The provider does not re-derive layout: the paint pass already computes every row rectangle it hit-tests against (`msgrows`, `sbrow`, the picker rects), and the accessible tree is published from that same pass. This is the same principle as the harness reading hit-boxes the app reports rather than measuring pixels — two descriptions of one layout will disagree, and the disagreement is invisible until somebody who depends on it cannot use the app.
+
+  **Per-frontend, not in the core.** ARCH-92 already answers this: an accessible tree is a description of *a particular UI's* structure, and the core (ARCH-74) holds the model, not panes. GTK will expose ATK/AT-SPI and AppKit `NSAccessibility` over the same model; nothing shared is gained by inventing a neutral tree in between.
+
+  **The system caret is part of this, not a detail.** A self-drawn text field must still create a real system caret (`CreateCaret`/`SetCaretPos`): screen readers and magnifiers track it, and it is what makes IME composition position correctly. The composer draws its own caret and created none, so assistive technology could not follow typing at all.
+
 - **ARCH-97 (Typography — the platform owns the family, we own the scale):** Applies to every graphical client (ARCH-74's native front-ends); the TUI is exempt, since a terminal's font is the user's business.
 
   **The family comes from the OS.** Segoe UI Variable Text on Windows 11 falling back to Segoe UI, the desktop's `system-ui` on GTK, SF on macOS. Bundling a typeface is the most visible way to look foreign in a window — it is a large part of why Slack's own desktop client reads as not-quite-native — and it adds a licensing and shipping cost for a negative. A client that looks like it belongs on the platform is the whole point of not using a toolkit (ARCH-82).

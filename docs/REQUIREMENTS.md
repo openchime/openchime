@@ -1549,17 +1549,19 @@ REQ-269, whose accessibility half is a real open decision.*
   to the platform's accessibility layer, so a screen reader can convey a
   conversation rather than an unlabelled rectangle.
 
-  *Status: unimplemented, and deliberately recorded rather than left implicit.*
-  The Win32 client is keyboard-operable in the ordinary paths (composer,
-  completion, conversation movement, command palette, shortcut sheet) but
-  exposes **no accessibility surface at all** — it draws its own UI with
-  Direct2D and answers no `WM_GETOBJECT`, so a screen reader sees one blank
-  window. A self-drawn UI gets nothing for free here, which is exactly why this
-  is a requirement and not an assumption: the cost grows with every pane added.
+  *Status: in progress on Win32 (ARCH-99, 2026-07-31).* The client is
+  keyboard-operable in the ordinary paths (composer, completion, conversation
+  movement, command palette, shortcut sheet) and, until now, exposed **no
+  accessibility surface at all** — it draws its own UI with Direct2D and
+  answered no `WM_GETOBJECT`, so a screen reader saw one blank window with nine
+  edit boxes in it. A self-drawn UI gets nothing for free here, which is exactly
+  why this is a requirement and not an assumption: the cost grows with every
+  pane added.
 
-  **[needs ARCH decision — UI Automation provider vs. IAccessible, and whether
-  the accessible tree is built per-frontend or described once in the core
-  (ARCH-74) and projected by each.]**
+  **The approach is settled (ARCH-99): a UI Automation provider over the
+  self-drawn UI.** The custom controls are not walked back to native ones — they
+  are the product's rendering strategy (ARCH-82/98) and a deliberate choice, so
+  accessibility is implemented *for* them rather than by retreating from them.
 
 ---
 
