@@ -9032,6 +9032,13 @@ static int on_click(HWND hwnd, int x, int y) {
     if (g_profile_uid && in_rect(g_prof_dm_btn, x, y)) {
         uint64_t uid = g_profile_uid;
         close_overlays();
+        /* close_overlays() clears g_profile_uid, and the pane was still in PROFILE
+         * mode — so it carried on drawing a profile for id 0 and rendered the
+         * fallbacks as if they were data: a "U" avatar, the literal name "user",
+         * "Offline", and this very button, now pointing at nobody. Pop the pane back
+         * to the member list: the profile has done its job, we are leaving for the
+         * conversation. */
+        rp_pop();
         oc_client_open_dm(g_client, uid);
         return 1;
     }
@@ -11451,7 +11458,10 @@ static void test_dump(const char *path) {
         fprintf(f, "  sbrow sec=%d header=%d cid=%llu label=\"%s\"\n",
                 g_rows[i].sec, g_rows[i].header,
                 (unsigned long long)g_rows[i].cid, g_rows[i].label);
-    fprintf(f, "myavatar=%llu\n", (unsigned long long)avatar_of(m, m->user_id));
+    fprintf(f, "myavatar=%llu profileuid=%llu rpmode=%d prof_dm=%.0f,%.0f,%.0f,%.0f\n",
+            (unsigned long long)avatar_of(m, m->user_id),
+            (unsigned long long)g_profile_uid, g_rp_mode,
+            g_prof_dm_btn.left, g_prof_dm_btn.top, g_prof_dm_btn.right, g_prof_dm_btn.bottom);
     {
         char ed8[1024] = "";
         WCHAR edw[512];
@@ -11818,7 +11828,11 @@ static void test_poll(HWND hwnd) {
          * poll loop until dismissed, so the ack lands after the dialog closes. */
         menu_dispatch(hwnd, atoi(arg)); test_ack("ok");
     } else if (!strcmp(verb, "profile")) {
-        close_overlays(); g_profile_uid = strtoull(arg, NULL, 10); g_view = VIEW_HOME; test_ack("ok");
+        /* Through profile_open, so the verb takes the same path a click does — it
+         * used to set the id WITHOUT switching the pane, so the profile never drew
+         * and the harness could not have caught this bug. */
+        close_overlays(); g_view = VIEW_HOME;
+        test_ack(profile_open(strtoull(arg, NULL, 10)) ? "ok" : "err");
     } else if (!strcmp(verb, "form")) {
         /* Drive the generic form (WIN-77). The ack goes FIRST, because the form runs
          * a nested message loop: acking afterwards would make the harness wait for a
