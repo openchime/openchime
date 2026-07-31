@@ -68,15 +68,20 @@ pattern REQ-221 and REQ-230 both followed.
 
 ## What "closed" does and does not mean
 
-WIN-1 … WIN-84 are closed, and an adversarial review on 2026-07-30 —
-116 smoke invariants plus hand-driven probing of the surfaces the smoke does not
-reach — found no defect in any of them. Every feature the parity table claims is
-reachable was confirmed reachable, several by round-trip against a live daemon
-(pin → Pins tab; save → Later; the Activity, Files, Later and Admin views all
-render real content).
+**Everything startable in `client/gui/win32/` is closed** (2026-07-31). WIN-1 …
+WIN-88 plus WIN-93 and WIN-95 are done; the six items above are each blocked on a
+daemon requirement or an ARCH decision, and the last of them cannot be started
+here at all. An adversarial review on 2026-07-30 found no defect in the
+previously-closed list, several claims verified by round-trip against a live
+daemon (pin → Pins tab; save → Later; Activity, Files, Later and Admin all
+rendering real content).
 
-That is a statement about the *known* list. The gaps found by using the client
-are not on any list until somebody writes them down, and WIN-85 and WIN-86 above
-are exactly that: both were found by looking at the running client during this
-review, not by any assertion. Update [STATUS.md](./STATUS.md)'s parity table
-when an item changes a mark.
+**Two things worth remembering from how the recent items were found.** Neither
+WIN-85 nor WIN-86 came from an assertion — both were spotted by *looking* at the
+running client. And the two most serious defects of the batch were not on any
+list at all: a composer that reached negative width and disappeared, and a
+transfer-slot desync that made every upload fail, both surfaced only once the
+smoke was made trustworthy enough to believe. A backlog records what somebody
+wrote down; it is not a survey of what is wrong.
+
+Update [STATUS.md](./STATUS.md)'s parity table when an item changes a mark.

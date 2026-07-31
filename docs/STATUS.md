@@ -30,14 +30,14 @@ daemon is Linux-only and GitHub's Windows runners cannot host it, WIN-81), so it
 is a local pre-push gate. A ✅ on a client row generally means it passed there,
 not that it was eyeballed.
 
-> **Read that gate with a caveat (2026-07-30).** The suite is **flaky**: five
-> consecutive runs against a clean daemon gave 2 failures, clean, clean, 2
-> failures, 4 failures, with the failures moving between runs. Every failure
-> observed was verified by hand to be a **harness artifact — timing, or a
-> daemon-selection trap — not a product defect** (WIN-87, WIN-88). Two
-> consequences: a red run is not evidence of a regression until reproduced
-> deterministically, and a green run is worth slightly less than its 116 checks
-> suggest. Fixing that is WIN-87.
+> **The gate was flaky and is now deterministic (2026-07-31, WIN-87/88).** It
+> used to fail ~60% of runs for reasons that were never product defects, and
+> worse, it asserted *states* rather than transitions — so "Esc closes the
+> palette" passed when the palette never opened, inflating the pass count on
+> exactly the runs where something was broken. It now waits on the state it is
+> about to assert, owns its own daemon on port 9500, and refuses to run if the
+> workspace it reaches is not the fixture. **Six consecutive clean runs**, and it
+> is up to **123 checks** with the group-DM picker covered.
 
 **The numbered Win32 backlog (WIN-1 … WIN-84) is closed**, and an adversarial
 review on 2026-07-30 found no defect in any of it. Work found since — including
@@ -243,16 +243,30 @@ revoke, the active-session list, group DMs, custom emoji, avatars and the
 N-concurrent-workspace model. What is left in this client is the short open list
 in [WIN32_BACKLOG.md](./WIN32_BACKLOG.md):
 
-- **Two avatar-consistency defects** (WIN-85/86) — the signed-in user's initial
-  is a different colour in the rail than everywhere else, and three sites draw
-  avatars without the shared helper so they can never show an uploaded photo.
-- **A flaky smoke suite** (WIN-87) and a **daemon-selection trap** in its launcher
-  (WIN-88) — test-harness work, but it is what a gate is worth.
-- **One unreproduced crash while typing** (WIN-60) — now instrumented with a
-  crash filter; nothing caught since.
-- **Blocked on a REQ, not on this client:** accessibility (REQ-269), rich text
-  (REQ-220), drafts across a restart, and a notification schedule richer than one
-  daily DND window (REQ-135/136).
+**Everything startable in this client is now closed** (2026-07-31). The avatar
+defects (WIN-85/86), the flaky harness and its daemon-selection trap (WIN-87/88),
+the typed group-DM picker (WIN-93) and the group shown as "user" in the DMs index
+(WIN-95) are all fixed, verified on Windows and covered by the smoke. Two product
+bugs the reworked harness then caught are fixed with them: the composer could
+reach **negative width** and vanish on a default window at 150% DPI, and an
+unrelated server error mid-transfer desynchronised the client's transfer slot
+from the daemon's, so every later upload failed with an opaque `transfer error`.
+
+What remains is **blocked, not deferred** — each needs a daemon requirement or a
+product decision, and none is startable in `client/gui/win32/`:
+
+- **WIN-60** — the unreproduced crash while typing. Instrumented with a crash
+  filter; nothing caught since. Open because unreproduced is not fixed.
+- **WIN-89 / REQ-269** — accessibility. Zero `WM_GETOBJECT`; a self-drawn UI gets
+  nothing free. Needs an ARCH decision on the UI-Automation surface.
+- **WIN-90 / REQ-220** — rich text. Needs the markup dialect settled first.
+- **WIN-91** — drafts across a restart. ARCH-88 leaves only server storage, so
+  this needs a decision on where a draft lives *and* on whether a half-typed
+  message should sync to your other devices.
+- **WIN-92 / REQ-278** — "pause notifications until…". Needs the daemon half
+  (`dnd_until_ms`) built first.
+- **WIN-94 / REQ-135/136** — the per-weekday schedule and keyword alerts. Same:
+  daemon first, and the client half is small.
 
 ---
 
