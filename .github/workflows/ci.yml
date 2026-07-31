@@ -103,7 +103,11 @@ jobs:
 
   windows:
     name: windows cross-compile (TUI + GUI)
-    runs-on: ubuntu-22.04
+    # 24.04, not 22.04: the older runner's mingw-w64 headers declare
+    # IRawElementProviderSimple but not the fragment/text interfaces, so the UIA
+    # provider (ARCH-99) compiled to its stub and CI proved nothing about the
+    # code that actually ships.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       # mingw-w64 for the cross-compile; bzip2 + curl for the vendored mbedTLS

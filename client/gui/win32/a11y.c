@@ -22,9 +22,17 @@
  *     └── "Message"        (Edit)  → the composer
  */
 #define COBJMACROS
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0A00   /* UiaRaiseNotificationEvent is Win10 1709+ */
-#endif
+/* The build's baseline is Windows 7 (-D_WIN32_WINNT=0x0601 in WIN_CFLAGS), and
+ * the UIA headers gate IRawElementProviderFragment, ITextProvider and the
+ * UIA_* ids behind a later one. Raised for THIS FILE ONLY, which is safe because
+ * every entry point here is resolved with GetProcAddress: nothing an older
+ * Windows lacks is imported, so the binary still loads there — it simply reports
+ * no accessibility. Without this the file compiles to a stub and the feature
+ * silently disappears, which is how it reached CI red. */
+#undef  _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#undef  NTDDI_VERSION
+#define NTDDI_VERSION 0x0A000000
 #include <windows.h>
 #include <initguid.h>
 #include <uiautomation.h>
@@ -34,6 +42,27 @@
 #include <wctype.h>   /* towlower — FindText's ignore-case */
 
 #include "a11y.h"
+
+/* An older mingw-w64 (the ubuntu-22.04 runner shipped one) declares
+ * IRawElementProviderSimple but not the fragment/text interfaces. Rather than
+ * fail the cross-build on a toolchain nobody ships from, compile a stub that
+ * says the feature is unavailable — and keep CI on a toolchain that has them, so
+ * the real path is the one actually compiled (see .github/workflows/ci.yml). */
+#ifndef __IRawElementProviderFragment_INTERFACE_DEFINED__
+#warning "UIA provider interfaces missing from this toolchain - accessibility disabled"
+void oc_a11y_init(HWND hwnd) { (void)hwnd; }
+void oc_a11y_shutdown(void) { }
+int  oc_a11y_available(void) { return 0; }
+LRESULT oc_a11y_get_object(HWND h, WPARAM w, LPARAM l, int *handled) {
+    (void)h; (void)w; (void)l; *handled = 0; return 0;
+}
+void oc_a11y_publish(const oc_acc_item *i, int n, const WCHAR *c, int a, int b) {
+    (void)i; (void)n; (void)c; (void)a; (void)b;
+}
+void oc_a11y_announce(const char *s) { (void)s; }
+unsigned oc_a11y_announced(void) { return 0; }
+void oc_a11y_focus(oc_acc_kind k, uint64_t id) { (void)k; (void)id; }
+#else
 
 /* ---- runtime-resolved provider API ---------------------------------------- */
 
@@ -994,3 +1023,5 @@ static HRESULT STDMETHODCALLTYPE vp_get_IsReadOnly(IValueProvider *t, BOOL *out)
 static IValueProviderVtbl g_vpvt = {
     vp_QI, vp_AddRef, vp_Release, vp_SetValue, vp_get_Value, vp_get_IsReadOnly
 };
+
+#endif /* __IRawElementProviderFragment_INTERFACE_DEFINED__ */
