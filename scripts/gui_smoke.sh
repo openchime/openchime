@@ -254,6 +254,26 @@ expect "$d" srch 1 "search overlay: query box shown"
 expect "$d" re   0 "search overlay: composer hidden"
 "$DRIVE" search "" >/dev/null 2>&1; settle srch 0    # toggle off
 
+# The search box is a native child, so it composites ABOVE the Direct2D output
+# and shows up as a bare white rectangle over whatever is really there. It was
+# gated on `search_open` alone — a MODEL flag that outlives the view — so
+# leaving search open and walking to DMs floated it over the third person in
+# the "New direct message" picker (WIN-99, reported from a screenshot of the
+# running client). The view matrix above could not catch it: it visits each view
+# from a clean state, and this needs a surface left open in the PREVIOUS one.
+"$DRIVE" search "" >/dev/null 2>&1; settle srch 1
+"$DRIVE" view 1 >/dev/null 2>&1; settle sbkind 2
+"$DRIVE" dmcompose >/dev/null 2>&1
+expect_eventually srch 0 "search left open does not follow you to the DM picker (WIN-99)"
+"$DRIVE" dmcompose >/dev/null 2>&1
+# Coming back restores it — the fix has to be "not while that view is up", not
+# "closed for good", and only asserting the first half would pass either way.
+# No `channel` here: PICKING a conversation closes search, which is the app
+# behaving correctly and would hide what this is asking about.
+"$DRIVE" view 0 >/dev/null 2>&1; settle sbkind 1
+expect_eventually srch 1 "and it comes back when you return to the transcript"
+"$DRIVE" search "" >/dev/null 2>&1; settle srch 0
+"$DRIVE" channel general >/dev/null 2>&1
 
 "$DRIVE" tab 2 >/dev/null 2>&1                       # Pins
 settle re 0

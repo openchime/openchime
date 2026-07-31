@@ -6711,6 +6711,24 @@ static int transcript_shell(void) {
     return g_view == VIEW_HOME || g_view == VIEW_DMS || g_view == VIEW_ACTIVITY;
 }
 
+static int g_dm_compose;              /* the "start a conversation" picker is up */
+
+/* Is the middle column the DM PERSON LIST — the index, or the "New direct
+ * message" picker — rather than a conversation?
+ *
+ * A function because this expression was written out THREE times: twice inline
+ * in render_scene and a third time, spelled differently, inside
+ * main_is_conversation(). sidebar_kind()'s comment above says why that is worse
+ * than it looks — an expression repeated is a rule waiting to be applied in one
+ * place and not another — and it duly was: the search box asked none of them,
+ * so leaving search open and walking to DMs floated a native EDIT over the
+ * third person in the picker (WIN-99). Anything that depends on what the middle
+ * column HOLDS asks here. */
+static int dm_index_view(void) {
+    const oc_model *m = model();
+    const oc_channel *c = (m && g_sel) ? oc_model_channel((oc_model *)m, g_sel) : NULL;
+    return g_view == VIEW_DMS && (g_dm_compose || !(c && c->kind == OC_CHANNEL_KIND_DM));
+}
 
 /* WHAT is in the second column — not merely whether there is one.
  *
@@ -6892,7 +6910,6 @@ static uint64_t g_dm_hover;
  * this, picking someone created the conversation and left you looking at the
  * list, with the new row somewhere in the sidebar. */
 static uint64_t g_dm_pending;
-static int g_dm_compose;              /* the "start a conversation" picker is up */
 static int g_dm_index_now;            /* this frame's middle column is the DM index */
 static D2D1_RECT_F g_dm_compose_btn;
 
@@ -7526,9 +7543,7 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
             case SBK_ACTIVITY: draw_activity_list(rt, m, H); break;
             default:           draw_sidebar(rt, m, H);       break;
         }
-        const oc_channel *selc0 = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
-        int dm_index0 = (g_view == VIEW_DMS &&
-                         (g_dm_compose || !(selc0 && selc0->kind == OC_CHANNEL_KIND_DM)));
+        int dm_index0 = dm_index_view();
         if (!dm_index0) draw_header(rt, m, main_x, main_w);
         float th = dm_index0 ? 0 : draw_tabbar(rt, m, main_x, main_w);
         float bh = draw_banner(rt, m, main_x, main_w, th);  /* pushes the transcript down */
@@ -7536,9 +7551,7 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
             /* In the DMs view, the middle column is the PERSON list until a
              * conversation is picked — that is what makes it a destination
              * rather than Home with a section folded. */
-            const oc_channel *selc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
-            int dm_index = (g_view == VIEW_DMS &&
-                            (g_dm_compose || !(selc && selc->kind == OC_CHANNEL_KIND_DM)));
+            int dm_index = dm_index_view();
             if (dm_index) {
                 if (g_dm_compose) draw_dm_compose(rt, m, rf(main_x, 0, main_r, H - g_composer_h));
                 else overlay_empty(rt, rf(main_x, 0, main_r, H - g_composer_h),
@@ -8757,10 +8770,7 @@ static int main_is_conversation(void) {
          m->storage_open || m->audit_open))
         return 0;
     if (g_tab == TAB_ABOUT) return 0;
-    if (g_view != VIEW_DMS) return 1;
-    if (g_dm_compose) return 0;
-    const oc_channel *c = (m && g_sel) ? oc_model_channel((oc_model *)m, g_sel) : NULL;
-    return c && c->kind == OC_CHANNEL_KIND_DM;
+    return !dm_index_view();
 }
 
 /* Does something own the whole window right now? A native child underneath it
@@ -8924,8 +8934,20 @@ static void layout_search(HWND hwnd) {
      * a modal drawn over it would otherwise have this control punched through
      * its card.
      *
-     */
-    if (!m || !m->search_open || window_is_covered()) { ShowWindow(g_srch, SW_HIDE); return; }
+     * And `transcript_shell()`, for the same reason as the natives take above.
+     * This box was gated on `search_open` ALONE, which is a MODEL flag and so
+     * outlives the view that owns the surface: leaving search open and going to
+     * DMs left a native EDIT floating over the "New direct message" list,
+     * covering the third person in it. That the other two boxes were safe is not
+     * an accident — each is gated on its own view (`VIEW_FILES`, `SBK_CHANNELS`)
+     * — and layout_find's comment claiming search "is already gated on its own
+     * pane's open flag" is exactly the assumption that was wrong: `g_pick_open`
+     * is a static the paint pass clears on leaving the shell, `search_open` is
+     * not. Reported from a screenshot of the running client (WIN-99). */
+    if (!m || !m->search_open || !transcript_shell() || dm_index_view() ||
+        window_is_covered()) {
+        ShowWindow(g_srch, SW_HIDE); return;
+    }
     (void)hwnd;
     ShowWindow(g_srch, SW_SHOW);
     MoveWindow(g_srch, PX(g_srch_box.left + 30), PX(g_srch_box.top + 8),
@@ -12957,6 +12979,15 @@ static void test_poll(HWND hwnd) {
         else test_ack("err");
     } else if (!strcmp(verb, "tab")) {
         select_tab(atoi(arg));
+        test_ack("ok");
+    } else if (!strcmp(verb, "dmcompose")) {
+        /* Toggle the "New direct message" picker, as its sidebar button does.
+         * A verb rather than a click at a measured coordinate: the button moves
+         * with the sidebar, and a test that misses it would pass by asserting
+         * about the view it failed to leave. */
+        g_dm_compose = !g_dm_compose;
+        layout_composer(hwnd);
+        InvalidateRect(hwnd, NULL, FALSE);
         test_ack("ok");
     } else if (!strcmp(verb, "pins")) {
         const oc_model *pm = model();
