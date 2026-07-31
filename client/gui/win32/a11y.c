@@ -31,6 +31,7 @@
 #include <oleauto.h>
 #include <stdio.h>
 #include <string.h>
+#include <wctype.h>   /* towlower — FindText's ignore-case */
 
 #include "a11y.h"
 
@@ -73,11 +74,16 @@ typedef struct {
     IRawElementProviderSimple       s;
     IRawElementProviderFragment     f;
     IRawElementProviderFragmentRoot r;
+    ITextProvider                   t;   /* transcript + composer (ARCH-99) */
+    IValueProvider                  v;   /* the composer's text, read-only */
     LONG ref;
     int  idx;        /* EL_* or an index into g_items */
 } acc_el;
 
 static acc_el *el_new(int idx);
+static ITextProviderVtbl  g_tpvt;    /* fwd — defined with the text surface below */
+static IValueProviderVtbl g_vpvt;
+static int  composer_idx(void);
 
 /* ---- helpers --------------------------------------------------------------- */
 
@@ -135,8 +141,23 @@ static HRESULT STDMETHODCALLTYPE s_GetOptions(IRawElementProviderSimple *this_, 
 }
 static HRESULT STDMETHODCALLTYPE s_GetPatternProvider(IRawElementProviderSimple *this_,
                                                       PATTERNID pid, IUnknown **out) {
-    (void)this_; (void)pid;
-    *out = NULL;                    /* text patterns land in the next commit */
+    acc_el *e = CONTAINING_RECORD(this_, acc_el, s);
+    *out = NULL;
+    EnterCriticalSection(&g_lock);
+    int is_composer = item_kind(e->idx, OC_ACC_COMPOSER);
+    int is_script   = (e->idx == EL_MSGS);
+    LeaveCriticalSection(&g_lock);
+    /* TextPattern on the composer AND the transcript: one so what you typed can
+     * be proof-read, the other so the conversation can be READ rather than
+     * stepped through element by element. ValuePattern on the composer as well,
+     * because a client that only wants "what is in that box" should not have to
+     * open a text range to find out. */
+    if (pid == UIA_TextPatternId && (is_composer || is_script)) {
+        *out = (IUnknown *)&e->t; s_AddRef(&e->s); return S_OK;
+    }
+    if (pid == UIA_ValuePatternId && is_composer) {
+        *out = (IUnknown *)&e->v; s_AddRef(&e->s); return S_OK;
+    }
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE s_GetPropertyValue(IRawElementProviderSimple *this_,
@@ -147,7 +168,12 @@ static HRESULT STDMETHODCALLTYPE s_GetPropertyValue(IRawElementProviderSimple *t
     switch (pid) {
     case UIA_ControlTypePropertyId:
         v->vt = VT_I4;
-        v->lVal = (e->idx == EL_CONVS || e->idx == EL_MSGS) ? UIA_ListControlTypeId
+        /* The message list is a DOCUMENT, not a List: screen readers look for
+         * TextPattern on a Document, and "read the conversation" is the whole
+         * point. It keeps its ListItem children, so stepping message by message
+         * still works. */
+        v->lVal = (e->idx == EL_MSGS)                       ? UIA_DocumentControlTypeId
+                : (e->idx == EL_CONVS)                      ? UIA_ListControlTypeId
                 : (e->idx == EL_ROOT)                       ? UIA_GroupControlTypeId
                 : item_kind(e->idx, OC_ACC_COMPOSER)        ? UIA_EditControlTypeId
                                                             : UIA_ListItemControlTypeId;
@@ -370,6 +396,10 @@ static HRESULT STDMETHODCALLTYPE s_QI(IRawElementProviderSimple *this_, REFIID i
         *out = &e->f;
     else if (IsEqualIID(iid, &IID_IRawElementProviderFragmentRoot) && e->idx == EL_ROOT)
         *out = &e->r;
+    else if (IsEqualIID(iid, &IID_ITextProvider))
+        *out = &e->t;
+    else if (IsEqualIID(iid, &IID_IValueProvider))
+        *out = &e->v;
     else { *out = NULL; return E_NOINTERFACE; }
     InterlockedIncrement(&e->ref);
     return S_OK;
@@ -390,6 +420,8 @@ static acc_el *el_new(int idx) {
     e->s.lpVtbl = &g_svt;
     e->f.lpVtbl = &g_fvt;
     e->r.lpVtbl = &g_rvt;
+    e->t.lpVtbl = &g_tpvt;
+    e->v.lpVtbl = &g_vpvt;
     e->ref = 1;
     e->idx = idx;
     return e;
@@ -482,3 +514,483 @@ void oc_a11y_focus(oc_acc_kind kind, uint64_t id) {
     p_raise_event(&e->s, UIA_AutomationFocusChangedEventId);
     s_Release(&e->s);
 }
+
+/* ============================================================================
+ * Text (REQ-269, ARCH-99) — ITextProvider / ITextRangeProvider / IValueProvider
+ *
+ * Two documents, addressed the same way:
+ *
+ *   DOC_COMPOSER   what you are typing, so it can be REVIEWED and not only
+ *                  written — a field a screen reader cannot read back is a
+ *                  field you cannot proof-read.
+ *   DOC_TRANSCRIPT the loaded messages, flattened in drawn order, so "read all"
+ *                  works and reading does not require stepping element by
+ *                  element.
+ *
+ * The transcript document is the published item NAMES joined with newlines —
+ * the same "who, when: what" a screen reader speaks when navigating the list.
+ * Building it from anything else would give the two surfaces different words for
+ * the same message.
+ *
+ * TWO BOUNDS, STATED RATHER THAN IMPLIED:
+ *  - `Line` is a LOGICAL line (newline-delimited), not a visual one. The
+ *    composer wraps, so a wrapped line reads as one line here. Honest and
+ *    survivable; per-visual-line would mean holding a DWrite layout for every
+ *    message.
+ *  - `GetBoundingRectangles` resolves to MESSAGE granularity in the transcript
+ *    (the enclosing row), not per character, for the same reason.
+ * ========================================================================== */
+
+enum { DOC_COMPOSER = 0, DOC_TRANSCRIPT = 1 };
+
+static WCHAR g_doc[65536];
+static int   g_doc_len;
+static int   g_doc_which = -1;
+/* Where each message landed in the flattened transcript, so a range can be
+ * mapped back to the row it came from. */
+static struct { int start, end, item; } g_doc_msg[OC_ACC_MAX];
+static int   g_n_doc_msg;
+
+/* Caller holds g_lock. */
+static void doc_build(int doc) {
+    g_doc_which = doc;
+    g_n_doc_msg = 0;
+    if (doc == DOC_COMPOSER) {
+        int n = g_comp_len;
+        if (n > (int)(sizeof g_doc / sizeof g_doc[0]) - 1) n = (int)(sizeof g_doc / sizeof g_doc[0]) - 1;
+        memcpy(g_doc, g_comp, (size_t)n * sizeof(WCHAR));
+        g_doc[n] = 0; g_doc_len = n;
+        return;
+    }
+    int at = 0, cap = (int)(sizeof g_doc / sizeof g_doc[0]) - 2;
+    for (int i = 0; i < g_n_items && at < cap; i++) {
+        if (g_items[i].kind != OC_ACC_MESSAGE) continue;
+        int w = MultiByteToWideChar(CP_UTF8, 0, g_items[i].name, -1, g_doc + at, cap - at);
+        if (w <= 0) continue;
+        w -= 1;                                     /* drop the NUL */
+        if (g_n_doc_msg < OC_ACC_MAX) {
+            g_doc_msg[g_n_doc_msg].start = at;
+            g_doc_msg[g_n_doc_msg].end   = at + w;
+            g_doc_msg[g_n_doc_msg].item  = i;
+            g_n_doc_msg++;
+        }
+        at += w;
+        if (at < cap) g_doc[at++] = L'\n';
+    }
+    g_doc[at] = 0; g_doc_len = at;
+}
+
+static void doc_need(int doc) { if (g_doc_which != doc) doc_build(doc); else doc_build(doc); }
+
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static int is_wordch(WCHAR c) { return !(c == L' ' || c == L'\t' || c == L'\n' || c == L'\r'); }
+
+/* ---- ITextRangeProvider ---------------------------------------------------- */
+
+typedef struct {
+    ITextRangeProvider itr;
+    LONG ref;
+    int  doc;        /* DOC_* */
+    int  s, e;       /* [s,e) offsets into that document */
+} acc_range;
+
+static acc_range *range_new(int doc, int s, int e);
+
+static HRESULT STDMETHODCALLTYPE tr_QI(ITextRangeProvider *t, REFIID iid, void **out) {
+    acc_range *r = CONTAINING_RECORD(t, acc_range, itr);
+    if (!out) return E_POINTER;
+    if (IsEqualIID(iid, &IID_IUnknown) || IsEqualIID(iid, &IID_ITextRangeProvider)) {
+        *out = &r->itr; InterlockedIncrement(&r->ref); return S_OK;
+    }
+    *out = NULL; return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE tr_AddRef(ITextRangeProvider *t) {
+    return (ULONG)InterlockedIncrement(&CONTAINING_RECORD(t, acc_range, itr)->ref);
+}
+static ULONG STDMETHODCALLTYPE tr_Release(ITextRangeProvider *t) {
+    acc_range *r = CONTAINING_RECORD(t, acc_range, itr);
+    LONG n = InterlockedDecrement(&r->ref);
+    if (!n) free(r);
+    return (ULONG)n;
+}
+static HRESULT STDMETHODCALLTYPE tr_Clone(ITextRangeProvider *t, ITextRangeProvider **out) {
+    acc_range *r = CONTAINING_RECORD(t, acc_range, itr);
+    acc_range *c = range_new(r->doc, r->s, r->e);
+    if (!c) { *out = NULL; return E_OUTOFMEMORY; }
+    *out = &c->itr; return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE tr_Compare(ITextRangeProvider *t, ITextRangeProvider *o, BOOL *eq) {
+    acc_range *a = CONTAINING_RECORD(t, acc_range, itr);
+    acc_range *b = CONTAINING_RECORD(o, acc_range, itr);
+    *eq = (a->doc == b->doc && a->s == b->s && a->e == b->e) ? TRUE : FALSE;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE tr_CompareEndpoints(ITextRangeProvider *t,
+        enum TextPatternRangeEndpoint ep1, ITextRangeProvider *o,
+        enum TextPatternRangeEndpoint ep2, int *ret) {
+    acc_range *a = CONTAINING_RECORD(t, acc_range, itr);
+    acc_range *b = CONTAINING_RECORD(o, acc_range, itr);
+    int va = (ep1 == TextPatternRangeEndpoint_Start) ? a->s : a->e;
+    int vb = (ep2 == TextPatternRangeEndpoint_Start) ? b->s : b->e;
+    *ret = va - vb;
+    return S_OK;
+}
+/* Grow [s,e) out to the enclosing unit. */
+static void unit_expand(int doc, enum TextUnit unit, int *s, int *e) {
+    doc_need(doc);
+    int L = g_doc_len;
+    *s = clampi(*s, 0, L); *e = clampi(*e, *s, L);
+    switch (unit) {
+    case TextUnit_Character:
+        if (*e <= *s) *e = clampi(*s + 1, 0, L);
+        break;
+    case TextUnit_Word:
+        while (*s > 0 && is_wordch(g_doc[*s - 1])) (*s)--;
+        while (*e < L && is_wordch(g_doc[*e])) (*e)++;
+        if (*e == *s && *e < L) (*e)++;
+        break;
+    case TextUnit_Line:
+    case TextUnit_Paragraph:
+        while (*s > 0 && g_doc[*s - 1] != L'\n') (*s)--;
+        while (*e < L && g_doc[*e] != L'\n') (*e)++;
+        break;
+    default:                       /* Page, Document, Format */
+        *s = 0; *e = L;
+        break;
+    }
+}
+static HRESULT STDMETHODCALLTYPE tr_Expand(ITextRangeProvider *t, enum TextUnit unit) {
+    acc_range *r = CONTAINING_RECORD(t, acc_range, itr);
+    EnterCriticalSection(&g_lock);
+    unit_expand(r->doc, unit, &r->s, &r->e);
+    LeaveCriticalSection(&g_lock);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE tr_FindAttribute(ITextRangeProvider *t, TEXTATTRIBUTEID a,
+                                                  VARIANT v, BOOL back, ITextRangeProvider **out) {
+    (void)t; (void)a; (void)v; (void)back; *out = NULL; return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE tr_FindText(ITextRangeProvider *t, BSTR text, BOOL back,
+                                             BOOL ignorecase, ITextRangeProvider **out) {
+    acc_range *r = CONTAINING_RECORD(t, acc_range, itr);
+    *out = NULL;
+    if (!text) return S_OK;
+    EnterCriticalSection(&g_lock);
+    doc_need(r->doc);
+    int tl = (int)SysStringLen(text), found = -1;
+    if (tl > 0 && tl <= r->e - r->s) {
+        for (int i = back ? r->e - tl : r->s;
+             back ? i >= r->s : i + tl <= r->e;
+             i += back ? -1 : 1) {
+            int k = 0;
+            for (; k < tl; k++) {
+                WCHAR c1 = g_doc[i + k], c2 = text[k];
+                if (ignorecase) { c1 = (WCHAR)towlower(c1); c2 = (WCHAR)towlower(c2); }
+                if (c1 != c2) break;
+            }
+            if (k == tl) { found = i; break; }
+        }
+    }
+    LeaveCriticalSection(&g_lock);
+    if (found < 0) return S_OK;
+    acc_range *n = range_new(r->doc, found, found + tl);
+    if (!n) return E_OUTOFMEMORY;
+    *out = &n->itr;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE tr_GetAttributeValue(ITextRangeProvider *t, TEXTATTRIBUTEID a,
+                                                      VARIANT *v) {
+    (void)t; (void)a;
+    VariantInit(v);
+    v->vt = VT_UNKNOWN; v->punkVal = NULL;   /* "not supported", per the contract */
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE tr_GetBoundingRectangles(ITextRangeProvider *t, SAFEARRAY **out) {
+    acc_range *r = CONTAINING_RECORD(t, acc_range, itr);
+    *out = NULL;
+    EnterCriticalSection(&g_lock);
+    doc_need(r->doc);
+    /* Message granularity — see the header comment. One rect per row the range
+     * touches, which is what a magnifier needs to follow reading. */
+    double rects[4 * 64];
+    int n = 0;
+    if (r->doc == DOC_TRANSCRIPT) {
+        for (int i = 0; i < g_n_doc_msg && n < 64; i++) {
+            if (g_doc_msg[i].end <= r->s || g_doc_msg[i].start >= r->e) continue;
+            const oc_acc_item *it = &g_items[g_doc_msg[i].item];
+            POINT tl = { it->l, it->t }, br = { it->r, it->b };
+            ClientToScreen(g_hwnd, &tl); ClientToScreen(g_hwnd, &br);
+            rects[n * 4 + 0] = tl.x; rects[n * 4 + 1] = tl.y;
+            rects[n * 4 + 2] = br.x - tl.x; rects[n * 4 + 3] = br.y - tl.y;
+            n++;
+        }
+    } else {
+        int ci = composer_idx();
+        if (ci >= 0) {
+            const oc_acc_item *it = &g_items[ci];
+            POINT tl = { it->l, it->t }, br = { it->r, it->b };
+            ClientToScreen(g_hwnd, &tl); ClientToScreen(g_hwnd, &br);
+            rects[0] = tl.x; rects[1] = tl.y; rects[2] = br.x - tl.x; rects[3] = br.y - tl.y;
+            n = 1;
+        }
+    }
+    LeaveCriticalSection(&g_lock);
+    SAFEARRAY *sa = SafeArrayCreateVector(VT_R8, 0, (ULONG)(n * 4));
+    if (!sa) return E_OUTOFMEMORY;
+    for (LONG i = 0; i < n * 4; i++) SafeArrayPutElement(sa, &i, &rects[i]);
+    *out = sa;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE tr_GetEnclosingElement(ITextRangeProvider *t,
+                                                        IRawElementProviderSimple **out) {
+    acc_range *r = CONTAINING_RECORD(t, acc_range, itr);
+    *out = NULL;
+    EnterCriticalSection(&g_lock);
+    int idx = EL_MSGS;
+    if (r->doc == DOC_COMPOSER) idx = composer_idx();
+    else for (int i = 0; i < g_n_doc_msg; i++)
+        if (g_doc_msg[i].end > r->s && g_doc_msg[i].start < r->e) { idx = g_doc_msg[i].item; break; }
+    LeaveCriticalSection(&g_lock);
+    acc_el *e = el_new(idx);
+    if (!e) return E_OUTOFMEMORY;
+    *out = &e->s;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE tr_GetText(ITextRangeProvider *t, int maxlen, BSTR *out) {
+    acc_range *r = CONTAINING_RECORD(t, acc_range, itr);
+    EnterCriticalSection(&g_lock);
+    doc_need(r->doc);
+    int s = clampi(r->s, 0, g_doc_len), e = clampi(r->e, s, g_doc_len);
+    if (maxlen >= 0 && e - s > maxlen) e = s + maxlen;
+    *out = SysAllocStringLen(g_doc + s, (UINT)(e - s));
+    LeaveCriticalSection(&g_lock);
+    return *out ? S_OK : E_OUTOFMEMORY;
+}
+/* Step whole units, collapsing the range as UIA specifies. */
+static int unit_step(int doc, enum TextUnit unit, int pos, int count) {
+    doc_need(doc);
+    int L = g_doc_len, dir = count < 0 ? -1 : 1, todo = count < 0 ? -count : count;
+    while (todo-- > 0) {
+        if (unit == TextUnit_Character) { pos = clampi(pos + dir, 0, L); continue; }
+        if (unit == TextUnit_Word) {
+            pos = clampi(pos + dir, 0, L);
+            while (pos > 0 && pos < L && is_wordch(g_doc[pos - 1]) == is_wordch(g_doc[pos])) pos += dir;
+            continue;
+        }
+        if (unit == TextUnit_Line || unit == TextUnit_Paragraph) {
+            pos = clampi(pos + dir, 0, L);
+            while (pos > 0 && pos < L && g_doc[pos - 1] != L'\n') pos += dir;
+            continue;
+        }
+        pos = dir < 0 ? 0 : L;
+    }
+    return clampi(pos, 0, L);
+}
+static HRESULT STDMETHODCALLTYPE tr_Move(ITextRangeProvider *t, enum TextUnit unit,
+                                         int count, int *moved) {
+    acc_range *r = CONTAINING_RECORD(t, acc_range, itr);
+    EnterCriticalSection(&g_lock);
+    int before = r->s;
+    r->s = unit_step(r->doc, unit, r->s, count);
+    r->e = r->s;
+    unit_expand(r->doc, unit, &r->s, &r->e);
+    *moved = (r->s == before) ? 0 : count;
+    LeaveCriticalSection(&g_lock);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE tr_MoveEndpointByUnit(ITextRangeProvider *t,
+        enum TextPatternRangeEndpoint ep, enum TextUnit unit, int count, int *moved) {
+    acc_range *r = CONTAINING_RECORD(t, acc_range, itr);
+    EnterCriticalSection(&g_lock);
+    int *v = (ep == TextPatternRangeEndpoint_Start) ? &r->s : &r->e;
+    int before = *v;
+    *v = unit_step(r->doc, unit, *v, count);
+    if (r->e < r->s) { if (ep == TextPatternRangeEndpoint_Start) r->e = r->s; else r->s = r->e; }
+    *moved = (*v == before) ? 0 : count;
+    LeaveCriticalSection(&g_lock);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE tr_MoveEndpointByRange(ITextRangeProvider *t,
+        enum TextPatternRangeEndpoint ep, ITextRangeProvider *o,
+        enum TextPatternRangeEndpoint oep) {
+    acc_range *r = CONTAINING_RECORD(t, acc_range, itr);
+    acc_range *b = CONTAINING_RECORD(o, acc_range, itr);
+    int v = (oep == TextPatternRangeEndpoint_Start) ? b->s : b->e;
+    if (ep == TextPatternRangeEndpoint_Start) { r->s = v; if (r->e < r->s) r->e = r->s; }
+    else                                      { r->e = v; if (r->e < r->s) r->s = r->e; }
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE tr_Select(ITextRangeProvider *t) { (void)t; return S_OK; }
+static HRESULT STDMETHODCALLTYPE tr_AddToSelection(ITextRangeProvider *t) { (void)t; return S_OK; }
+static HRESULT STDMETHODCALLTYPE tr_RemoveFromSelection(ITextRangeProvider *t) { (void)t; return S_OK; }
+static HRESULT STDMETHODCALLTYPE tr_ScrollIntoView(ITextRangeProvider *t, BOOL top) {
+    (void)t; (void)top; return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE tr_GetChildren(ITextRangeProvider *t, SAFEARRAY **out) {
+    (void)t;
+    *out = SafeArrayCreateVector(VT_UNKNOWN, 0, 0);
+    return *out ? S_OK : E_OUTOFMEMORY;
+}
+
+static ITextRangeProviderVtbl g_trvt = {
+    tr_QI, tr_AddRef, tr_Release, tr_Clone, tr_Compare, tr_CompareEndpoints,
+    tr_Expand, tr_FindAttribute, tr_FindText, tr_GetAttributeValue,
+    tr_GetBoundingRectangles, tr_GetEnclosingElement, tr_GetText, tr_Move,
+    tr_MoveEndpointByUnit, tr_MoveEndpointByRange, tr_Select, tr_AddToSelection,
+    tr_RemoveFromSelection, tr_ScrollIntoView, tr_GetChildren
+};
+
+static acc_range *range_new(int doc, int s, int e) {
+    acc_range *r = (acc_range *)calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->itr.lpVtbl = &g_trvt;
+    r->ref = 1; r->doc = doc; r->s = s; r->e = e;
+    return r;
+}
+
+/* ---- ITextProvider --------------------------------------------------------- */
+
+static int el_doc(const acc_el *e) {
+    return (e->idx == EL_MSGS) ? DOC_TRANSCRIPT : DOC_COMPOSER;
+}
+
+static HRESULT STDMETHODCALLTYPE tp_QI(ITextProvider *t, REFIID iid, void **o) {
+    return s_QI(&CONTAINING_RECORD(t, acc_el, t)->s, iid, o);
+}
+static ULONG STDMETHODCALLTYPE tp_AddRef(ITextProvider *t) {
+    return s_AddRef(&CONTAINING_RECORD(t, acc_el, t)->s);
+}
+static ULONG STDMETHODCALLTYPE tp_Release(ITextProvider *t) {
+    return s_Release(&CONTAINING_RECORD(t, acc_el, t)->s);
+}
+static HRESULT STDMETHODCALLTYPE tp_GetSelection(ITextProvider *t, SAFEARRAY **out) {
+    acc_el *e = CONTAINING_RECORD(t, acc_el, t);
+    *out = NULL;
+    int doc = el_doc(e), s = 0, en = 0;
+    EnterCriticalSection(&g_lock);
+    if (doc == DOC_COMPOSER) {
+        s  = g_comp_caret < g_comp_anchor ? g_comp_caret : g_comp_anchor;
+        en = g_comp_caret > g_comp_anchor ? g_comp_caret : g_comp_anchor;
+    }
+    LeaveCriticalSection(&g_lock);
+    acc_range *r = range_new(doc, s, en);
+    if (!r) return E_OUTOFMEMORY;
+    SAFEARRAY *sa = SafeArrayCreateVector(VT_UNKNOWN, 0, 1);
+    if (!sa) { tr_Release(&r->itr); return E_OUTOFMEMORY; }
+    LONG i = 0;
+    SafeArrayPutElement(sa, &i, (IUnknown *)&r->itr);
+    tr_Release(&r->itr);            /* SafeArrayPutElement took its own ref */
+    *out = sa;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE tp_GetVisibleRanges(ITextProvider *t, SAFEARRAY **out) {
+    acc_el *e = CONTAINING_RECORD(t, acc_el, t);
+    int doc = el_doc(e), len;
+    EnterCriticalSection(&g_lock);
+    doc_need(doc); len = g_doc_len;
+    LeaveCriticalSection(&g_lock);
+    /* Everything published IS what is on screen — the paint pass only describes
+     * what it drew — so the visible range is the document. */
+    acc_range *r = range_new(doc, 0, len);
+    if (!r) { *out = NULL; return E_OUTOFMEMORY; }
+    SAFEARRAY *sa = SafeArrayCreateVector(VT_UNKNOWN, 0, 1);
+    if (!sa) { tr_Release(&r->itr); *out = NULL; return E_OUTOFMEMORY; }
+    LONG i = 0;
+    SafeArrayPutElement(sa, &i, (IUnknown *)&r->itr);
+    tr_Release(&r->itr);
+    *out = sa;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE tp_RangeFromChild(ITextProvider *t,
+        IRawElementProviderSimple *child, ITextRangeProvider **out) {
+    acc_el *e = CONTAINING_RECORD(t, acc_el, t);
+    acc_el *c = CONTAINING_RECORD(child, acc_el, s);
+    *out = NULL;
+    int s = 0, en = 0;
+    EnterCriticalSection(&g_lock);
+    doc_need(el_doc(e));
+    for (int i = 0; i < g_n_doc_msg; i++)
+        if (g_doc_msg[i].item == c->idx) { s = g_doc_msg[i].start; en = g_doc_msg[i].end; break; }
+    LeaveCriticalSection(&g_lock);
+    acc_range *r = range_new(el_doc(e), s, en);
+    if (!r) return E_OUTOFMEMORY;
+    *out = &r->itr;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE tp_RangeFromPoint(ITextProvider *t, struct UiaPoint pt,
+                                                   ITextRangeProvider **out) {
+    acc_el *e = CONTAINING_RECORD(t, acc_el, t);
+    POINT p = { (LONG)pt.x, (LONG)pt.y };
+    ScreenToClient(g_hwnd, &p);
+    int s = 0, en = 0;
+    EnterCriticalSection(&g_lock);
+    doc_need(el_doc(e));
+    for (int i = 0; i < g_n_doc_msg; i++) {
+        const oc_acc_item *it = &g_items[g_doc_msg[i].item];
+        if (p.y >= it->t && p.y < it->b) { s = g_doc_msg[i].start; en = s; break; }
+    }
+    LeaveCriticalSection(&g_lock);
+    acc_range *r = range_new(el_doc(e), s, en);
+    if (!r) { *out = NULL; return E_OUTOFMEMORY; }
+    *out = &r->itr;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE tp_DocumentRange(ITextProvider *t, ITextRangeProvider **out) {
+    acc_el *e = CONTAINING_RECORD(t, acc_el, t);
+    int doc = el_doc(e), len;
+    EnterCriticalSection(&g_lock);
+    doc_need(doc); len = g_doc_len;
+    LeaveCriticalSection(&g_lock);
+    acc_range *r = range_new(doc, 0, len);
+    if (!r) { *out = NULL; return E_OUTOFMEMORY; }
+    *out = &r->itr;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE tp_SupportedTextSelection(ITextProvider *t,
+        enum SupportedTextSelection *out) {
+    acc_el *e = CONTAINING_RECORD(t, acc_el, t);
+    /* The composer has a caret and a selection; the transcript is read-only and
+     * says so rather than pretending to a selection it cannot move. */
+    *out = (el_doc(e) == DOC_COMPOSER) ? SupportedTextSelection_Single
+                                       : SupportedTextSelection_None;
+    return S_OK;
+}
+
+static ITextProviderVtbl g_tpvt = {
+    tp_QI, tp_AddRef, tp_Release, tp_GetSelection, tp_GetVisibleRanges,
+    tp_RangeFromChild, tp_RangeFromPoint, tp_DocumentRange, tp_SupportedTextSelection
+};
+
+/* ---- IValueProvider -------------------------------------------------------- */
+
+static HRESULT STDMETHODCALLTYPE vp_QI(IValueProvider *t, REFIID iid, void **o) {
+    return s_QI(&CONTAINING_RECORD(t, acc_el, v)->s, iid, o);
+}
+static ULONG STDMETHODCALLTYPE vp_AddRef(IValueProvider *t) {
+    return s_AddRef(&CONTAINING_RECORD(t, acc_el, v)->s);
+}
+static ULONG STDMETHODCALLTYPE vp_Release(IValueProvider *t) {
+    return s_Release(&CONTAINING_RECORD(t, acc_el, v)->s);
+}
+static HRESULT STDMETHODCALLTYPE vp_SetValue(IValueProvider *t, LPCWSTR val) {
+    (void)t; (void)val;
+    /* Deliberately refused. Letting automation stuff text into the composer
+     * would bypass the completion, mention scanning and draft handling that make
+     * it that field rather than a buffer — and a half-updated composer is worse
+     * than a read-only one. */
+    return UIA_E_NOTSUPPORTED;
+}
+static HRESULT STDMETHODCALLTYPE vp_get_Value(IValueProvider *t, BSTR *out) {
+    (void)t;
+    EnterCriticalSection(&g_lock);
+    *out = SysAllocStringLen(g_comp, (UINT)g_comp_len);
+    LeaveCriticalSection(&g_lock);
+    return *out ? S_OK : E_OUTOFMEMORY;
+}
+static HRESULT STDMETHODCALLTYPE vp_get_IsReadOnly(IValueProvider *t, BOOL *out) {
+    (void)t; *out = TRUE; return S_OK;
+}
+
+static IValueProviderVtbl g_vpvt = {
+    vp_QI, vp_AddRef, vp_Release, vp_SetValue, vp_get_Value, vp_get_IsReadOnly
+};

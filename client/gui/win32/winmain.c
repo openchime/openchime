@@ -3766,6 +3766,29 @@ static void accel_run(HWND hwnd, int action) {
 
 /* Called from the message loop for every keystroke. Returns 1 when it claimed
  * the key, so it is neither translated nor dispatched. */
+/* ---- who is holding a modifier ---------------------------------------------
+ * Normally the real keyboard. While the harness is delivering a SYNTHETIC chord
+ * this holds the modifier set it means, and the handlers read that instead.
+ *
+ * The harness used to fake the chord by writing the thread's key state with
+ * SetKeyboardState and letting the handlers read it back with GetKeyState. That
+ * round trip through the OS is racy: Windows resyncs a thread's input state from
+ * the real keyboard around focus and foreground changes, so a synthetic Ctrl
+ * could be gone by the time it was read — intermittently, and only on the runs
+ * where the window was not foreground. It produced years-of-your-life failures
+ * that moved between runs and never reproduced by hand (WIN-87's residue). The
+ * state does not need to travel through the OS at all: the hook knows which
+ * modifiers it means, so it says so. */
+static int g_synth_mods = -1;
+
+static int mod_down(int vk) {
+    if (g_synth_mods >= 0)
+        return vk == VK_CONTROL ? !!(g_synth_mods & AM_CTRL)
+             : vk == VK_MENU    ? !!(g_synth_mods & AM_ALT)
+             : vk == VK_SHIFT   ? !!(g_synth_mods & AM_SHIFT) : 0;
+    return (GetKeyState(vk) & 0x8000) != 0;
+}
+
 static int accel_dispatch(HWND hwnd, const MSG *m) {
     if (m->message != WM_KEYDOWN && m->message != WM_SYSKEYDOWN) return 0;
     /* A modal owns the window: shortcuts that open other surfaces behind it would
@@ -3785,9 +3808,9 @@ static int accel_dispatch(HWND hwnd, const MSG *m) {
         return 0;
     }
     unsigned mods = 0;
-    if (GetKeyState(VK_CONTROL) & 0x8000) mods |= AM_CTRL;
-    if (GetKeyState(VK_MENU)    & 0x8000) mods |= AM_ALT;
-    if (GetKeyState(VK_SHIFT)   & 0x8000) mods |= AM_SHIFT;
+    if (mod_down(VK_CONTROL)) mods |= AM_CTRL;
+    if (mod_down(VK_MENU))    mods |= AM_ALT;
+    if (mod_down(VK_SHIFT))   mods |= AM_SHIFT;
     for (size_t i = 0; i < sizeof SHORTCUTS / sizeof SHORTCUTS[0]; i++) {
         if (SHORTCUTS[i].action == ACC_NONE || !SHORTCUTS[i].vk) continue;
         if (SHORTCUTS[i].vk != (uint16_t)m->wParam) continue;
@@ -7738,8 +7761,8 @@ static int ed_char(HWND hwnd, WCHAR ch) {
 /* A virtual key. Returns 1 when consumed. */
 static int ed_key(HWND hwnd, WPARAM vk) {
     if (!g_ed_focus) return 0;
-    int ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-    int shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    int ctrl = mod_down(VK_CONTROL);
+    int shift = mod_down(VK_SHIFT);
     int moved = 0, changed = 0;
 
     switch (vk) {
@@ -12174,6 +12197,8 @@ static void test_poll(HWND hwnd) {
         if (want & AM_ALT)   ks[VK_MENU]    = 0x80;
         if (want & AM_SHIFT) ks[VK_SHIFT]   = 0x80;
         SetKeyboardState(ks);
+        /* And say it directly, which is what the handlers actually read. */
+        g_synth_mods = (int)want;
         MSG km; memset(&km, 0, sizeof km);
         km.hwnd = hwnd; km.message = (want & AM_ALT) ? WM_SYSKEYDOWN : WM_KEYDOWN;
         km.wParam = (WPARAM)vk;
@@ -12185,6 +12210,7 @@ static void test_poll(HWND hwnd) {
             HWND target = GetFocus();
             SendMessageW(target ? target : hwnd, km.message, (WPARAM)vk, 0);
         }
+        g_synth_mods = -1;
         ks[VK_CONTROL] = saved_c; ks[VK_MENU] = saved_a; ks[VK_SHIFT] = saved_s;
         SetKeyboardState(ks);
         test_ack("ok");
@@ -13061,7 +13087,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (g_selecting) { selection_end(); InvalidateRect(hwnd, NULL, FALSE); }
         return 0;
     case WM_KEYDOWN:
-        if (wp == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)) { copy_selection(hwnd); return 0; }
+        if (wp == 'C' && mod_down(VK_CONTROL)) { copy_selection(hwnd); return 0; }
         if (wp == VK_ESCAPE && g_lightbox) { g_lightbox = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         /* Esc pops the context pane back to the member list before it reaches
          * the middle column's overlays — the pane is what you just opened. */
