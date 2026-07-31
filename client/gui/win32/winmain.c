@@ -107,12 +107,12 @@ static UINT dpi_for_window(HWND hwnd) {
  * transcript with only "Esc to close" as the way back, so there was no standing
  * sense of where you were. */
 #define TABBAR_H    34.0f
-/* One row at rest: attach, emoji, the text field, and send on the right. The
- * box grows downward as the message wraps, to COMPOSER_MAX_LINES, with the
- * buttons staying on the bottom line — so a tall composer reads as the same
- * control that grew, not a different arrangement.
+/* The formatting toolbar on top (WIN-96), then attach, emoji, the text field
+ * and send on the bottom row. The box grows downward as the message wraps, to
+ * COMPOSER_MAX_LINES, with both rows staying put — so a tall composer reads as
+ * the same control that grew, not a different arrangement.
  *
- *   margin-top | pad | max(text, button) | pad | margin-bottom
+ *   margin-top | toolbar | pad | max(text, button) | pad | margin-bottom
  */
 #define COMPOSER_MT     12.0f    /* above the box */
 #define COMPOSER_MB     16.0f    /* below it */
@@ -120,7 +120,13 @@ static UINT dpi_for_window(HWND hwnd) {
 #define COMPOSER_BTN    34.0f    /* the square buttons */
 #define COMPOSER_LINE   20.0f    /* one wrapped line of text */
 #define COMPOSER_MAX_LINES 4
-#define COMPOSER_CHROME (COMPOSER_MT + COMPOSER_PAD * 2 + COMPOSER_MB)
+/* The formatting row: Slack puts it at the TOP of the input, above the text,
+ * and so do we — the bottom row already holds attach/emoji/mention/send, and a
+ * second row of small buttons beside them would read as one undifferentiated
+ * strip of chrome instead of two jobs. */
+#define COMPOSER_TB     30.0f    /* the formatting toolbar row */
+#define COMPOSER_FMT    24.0f    /* its square buttons */
+#define COMPOSER_CHROME (COMPOSER_MT + COMPOSER_TB + COMPOSER_PAD * 2 + COMPOSER_MB)
 /* Resting height: one line, but never shorter than the buttons need. */
 #define COMPOSER_H      (COMPOSER_CHROME + COMPOSER_BTN)
 static float g_composer_h = COMPOSER_H;
@@ -339,6 +345,12 @@ static IDWriteTextFormat *g_meta_r;   /* the same, trailing-aligned — timestam
 static IDWriteTextFormat *g_avatar;   /* title weight, centred in the disc */
 static IDWriteTextFormat *g_micro;    /* 10/600 — rail labels */
 static IDWriteTextFormat *g_meta_i;   /* meta, ITALIC — placeholder text only */
+/* The formatting toolbar's two letterforms (WIN-96). A "B" that is not bold and
+ * an "I" that is not italic would be labels for the thing rather than pictures
+ * of it, which is the whole trick these two buttons have always used. */
+static IDWriteTextFormat *g_fmt_bold;
+static IDWriteTextFormat *g_fmt_ital;
+static IDWriteTextFormat *g_fmt_quote;
 static IDWriteTextFormat *g_emoji;   /* Segoe UI Emoji, picker cells (22px) */
 static IDWriteTextFormat *g_emoji_s; /* the same, sized for reaction chips */
 /* Lucide vector icons: geometry cached once (device-independent, from the factory,
@@ -979,6 +991,16 @@ static D2D1_RECT_F g_emoji_btn;         /* composer emoji-picker hit-box (WIN-8)
 static D2D1_RECT_F g_at_btn;            /* composer mention button */
 static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
 
+/* The formatting toolbar (WIN-96, REQ-220). One entry per button, in the order
+ * they are drawn — emphasis, then code, then the block forms, which is both
+ * Slack's grouping and the order MARKDOWN.md lists the dialect in. */
+enum {
+    FMT_BOLD = 0, FMT_ITALIC, FMT_STRIKE, FMT_CODE,
+    FMT_QUOTE, FMT_BULLET, FMT_ORDERED, FMT_COUNT
+};
+static D2D1_RECT_F g_fmt_btn[FMT_COUNT];
+static int         g_fmt_hover = -1;
+
 /* ---- sign-in view (WIN-2, REQ-263/020) -------------------------------------
  * Slack signs in in two steps — workspace address first, credentials once the
  * workspace is known — and does it *in the app window*. We match that shape,
@@ -1571,7 +1593,7 @@ static void fonts_build(void) {
     const float k = g_text_scale;
     IDWriteTextFormat **all[] = { &g_display, &g_title, &g_body, &g_ui, &g_ui_b,
                                   &g_meta, &g_meta_w, &g_meta_r, &g_avatar, &g_micro,
-                                  &g_meta_i };
+                                  &g_meta_i, &g_fmt_bold, &g_fmt_ital, &g_fmt_quote };
     for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) fmt_release(all[i]);
 
     /* Two weights in all chrome (ARCH-97). Bold 700 is markdown's, applied to a
@@ -1599,6 +1621,21 @@ static void fonts_build(void) {
      * that is not content — an empty section's "Empty" — so it cannot be mistaken for
      * a conversation called Empty. A style, not a seventh size token. */
     g_meta_i  = mk_fmt_s(UI, FONT_META  * k, REG, L, MID, 0, DWRITE_FONT_STYLE_ITALIC);
+    /* The toolbar's B and I (WIN-96), centred in their buttons. Bold 700 is the
+     * one named above — markdown's weight, which is exactly what this button
+     * depicts — so it is that same exception rather than a third chrome weight.
+     *
+     * The italic is SERIF, and that is not decoration: a sans-serif capital I in
+     * italic is a bare diagonal stroke, which reads as a slash and not as a
+     * letter at all (it did — the first screenshot of this toolbar showed "/").
+     * Serifs are what make the glyph an I, which is why every toolbar that has
+     * ever drawn this button drew it with them. */
+    g_fmt_bold = mk_fmt(UI, FONT_UI * k, DWRITE_FONT_WEIGHT_BOLD, C, MID, 0);
+    g_fmt_ital = mk_fmt_s(L"Georgia", (FONT_UI + 1.0f) * k, REG, C, MID, 0,
+                          DWRITE_FONT_STYLE_ITALIC);
+    /* Oversized on purpose: a quotation mark occupies the top third of its em
+     * box, so at text size it is a speck in the middle of a 24 px button. */
+    g_fmt_quote = mk_fmt(L"Georgia", (FONT_UI + 9.0f) * k, DWRITE_FONT_WEIGHT_BOLD, C, MID, 0);
 }
 
 static void d2d_init(void) {
@@ -3820,6 +3857,12 @@ static const struct {
 } SHORTCUTS[] = {
     { 0,                  0,          ACC_NONE,  "Enter",              "Send the message" },
     { 0,                  0,          ACC_NONE,  "Shift+Enter",        "New line" },
+    /* Formatting (WIN-96). Display-only rows: the keys are dispatched inside the
+     * composer (ed_key), not by accel_dispatch, because they mean nothing when
+     * the field does not have focus — but somebody looking for them looks here. */
+    { 0,                  0,          ACC_NONE,  "Ctrl+B / Ctrl+I",    "Bold / italic the selection" },
+    { 0,                  0,          ACC_NONE,  "Ctrl+Shift+X / C",   "Strikethrough / code" },
+    { 0,                  0,          ACC_NONE,  "Ctrl+Shift+7/8/9",   "Numbered list / bulleted list / blockquote" },
     { 0,                  0,          ACC_NONE,  "Esc",                "Close the open pane, popover or picker" },
     { 0,                  0,          ACC_NONE,  "Tab",                "Insert the highlighted completion" },
     { 0,                  0,          ACC_NONE,  "Up / Down",          "Move through completions" },
@@ -5766,6 +5809,98 @@ static void composer_cue(const oc_model *m, char *out, size_t cap);   /* fwd */
 static int main_is_conversation(void);   /* fwd — decides the composer, chrome and child alike */
 static float members_w(float client_w_dip); /* fwd — the members pane yields when narrow */
 
+/* ---- the formatting toolbar (WIN-96) --------------------------------------
+ * Seven buttons, drawn rather than iconised. B / I / S are the letterforms
+ * themselves — the style IS the icon, which is why every editor since the first
+ * one has drawn them this way and why no icon set improves on it. The four
+ * block forms are line work: at 24 px a stroked rectangle is crisper than a
+ * glyph, and they are shapes rather than letters in every toolbar too. */
+static void fmt_bar(ID2D1RenderTarget *rt, float x, float y, float w, float th, uint32_t c) {
+    fill(rt, rf(x, y, x + w, y + th), c);
+}
+
+static void draw_fmt_icon(ID2D1RenderTarget *rt, int which, D2D1_RECT_F b, uint32_t c) {
+    float cx = (b.left + b.right) / 2, cy = (b.top + b.bottom) / 2;
+    switch (which) {
+    case FMT_BOLD:
+        draw_text(rt, "B", g_fmt_bold, b, c);
+        break;
+    case FMT_ITALIC:
+        draw_text(rt, "I", g_fmt_ital, b, c);
+        break;
+    case FMT_STRIKE:
+        draw_text(rt, "S", g_fmt_bold, b, c);
+        fmt_bar(rt, cx - 6, cy - 0.5f, 12, 1.4f, c);      /* the line is the point */
+        break;
+    case FMT_CODE: {
+        /* Two chevrons. Four short bars rather than a font's angle brackets,
+         * which sit high and read as punctuation next to the letters. */
+        float d = 4.0f;
+        for (int i = 0; i < 2; i++) {
+            float sx = i ? cx + 1.5f : cx - 1.5f, dir = i ? 1.0f : -1.0f;
+            D2D1_POINT_2F p0, p1, p2;
+            p0.x = sx + dir * 0.0f; p0.y = cy - d;
+            p1.x = sx + dir * d;    p1.y = cy;
+            p2.x = sx + dir * 0.0f; p2.y = cy + d;
+            ID2D1RenderTarget_DrawLine(rt, p0, p1, paint_with(c), 1.6f, NULL);
+            ID2D1RenderTarget_DrawLine(rt, p1, p2, paint_with(c), 1.6f, NULL);
+        }
+        break;
+    }
+    case FMT_QUOTE: {
+        /* A quotation mark, not a rule-and-lines. The rule-and-lines drawing is
+         * the honest depiction of what a blockquote renders as — and it came out
+         * near-identical to the numbered list two buttons along, which is a
+         * worse failure than being less literal. Nothing is mistakable for a
+         * pair of quote marks. */
+        /* Nudged DOWN, not centred: the glyph lives in the top third of its em
+         * box, so a box centred on the em box hangs the mark above the row. */
+        D2D1_RECT_F q = rf(b.left, b.top + 5, b.right, b.bottom + 5);
+        draw_text(rt, "\u201C", g_fmt_quote, q, c);
+        break;
+    }
+    case FMT_BULLET:
+    case FMT_ORDERED: {
+        float rowy[3] = { cy - 5.0f, cy - 0.7f, cy + 3.6f };
+        for (int i = 0; i < 3; i++) {
+            fmt_bar(rt, cx - 2, rowy[i], 9, 1.4f, c);
+            if (which == FMT_BULLET) {
+                D2D1_ELLIPSE e; e.point.x = cx - 6; e.point.y = rowy[i] + 0.7f;
+                e.radiusX = e.radiusY = 1.5f;
+                ID2D1RenderTarget_FillEllipse(rt, &e, paint_with(c));
+            } else {
+                /* Not numerals: three digits at this size are mush, and the eye
+                 * only has to tell this apart from the dots beside it. Ticks of
+                 * increasing length say "ordered" and stay legible. */
+                fmt_bar(rt, cx - 8, rowy[i], 2.0f + (float)i * 1.5f, 1.4f, c);
+            }
+        }
+        break;
+    }
+    default: break;
+    }
+}
+
+static void draw_fmt_toolbar(ID2D1RenderTarget *rt, float bx0, float by0, float bx1) {
+    static const char *TIPS[FMT_COUNT] = {
+        "Bold", "Italic", "Strikethrough", "Code", "Blockquote",
+        "Bulleted list", "Numbered list"
+    };
+    float sq = COMPOSER_FMT;
+    float y = by0 + (COMPOSER_TB - sq) / 2;
+    float x = bx0 + 8;
+    (void)bx1; (void)TIPS;
+    for (int i = 0; i < FMT_COUNT; i++) {
+        /* A gap before the block forms: emphasis wraps a selection, a block
+         * marker changes whole lines, and the two are not the same gesture. */
+        if (i == FMT_QUOTE) x += 8;
+        g_fmt_btn[i] = rf(x, y, x + sq, y + sq);
+        if (g_fmt_hover == i) fill_round(rt, g_fmt_btn[i], 5.0f, OC_COL_HOVER);
+        draw_fmt_icon(rt, i, g_fmt_btn[i], g_fmt_hover == i ? OC_COL_TEXT : OC_COL_MUTED);
+        x += sq + 2;
+    }
+}
+
 static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     float top = h - g_composer_h;
     fill(rt, rf(x0, top, x0 + w, h), OC_COL_BASE);
@@ -5776,6 +5911,8 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     float by0 = top + COMPOSER_MT, by1 = h - COMPOSER_MB;
     fill_round(rt, rf(bx0, by0, bx1, by1), 10.0f, OC_COL_INPUT);
     stroke_round(rt, rf(bx0, by0, bx1, by1), 10.0f, OC_COL_BORDER, 1.0f);
+
+    draw_fmt_toolbar(rt, bx0, by0, bx1);
 
     /* Buttons sit on the box's bottom line. At rest that is also its middle,
      * so a one-line composer reads as a single centred row. */
@@ -5809,7 +5946,8 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
         float tx = bx0 + 6 + sq * 3 + 8, tr = bx1 - 6 - sq - 8;
         float inner = composer_inner_h();
         float texth = inner > COMPOSER_BTN ? inner : COMPOSER_LINE;
-        float ty = by0 + COMPOSER_PAD + (inner > COMPOSER_BTN ? 0.0f : (COMPOSER_BTN - COMPOSER_LINE) / 2);
+        float ty = by0 + COMPOSER_TB + COMPOSER_PAD +
+                   (inner > COMPOSER_BTN ? 0.0f : (COMPOSER_BTN - COMPOSER_LINE) / 2);
         ed_draw(rt, rf(tx, ty, tr, ty + texth));
     }
 
@@ -6572,6 +6710,7 @@ static void layout_natives(HWND hwnd) {
 static int transcript_shell(void) {
     return g_view == VIEW_HOME || g_view == VIEW_DMS || g_view == VIEW_ACTIVITY;
 }
+
 
 /* WHAT is in the second column — not merely whether there is one.
  *
@@ -7664,6 +7803,156 @@ static void ed_replace_range(int a, int b, const WCHAR *s) {
 
 static void ed_select_all(void) { g_ed_anchor = 0; g_ed_caret = g_ed_len; }
 
+/* ---- formatting (WIN-96, REQ-220, ARCH-100) --------------------------------
+ * The toolbar and its chords insert the SAME delimiters you could have typed.
+ * There is no rich-text model behind them and there deliberately cannot be one:
+ * ARCH-100 §5 says anything the toolbar produces must be expressible in text,
+ * or a message becomes editable in one authoring path and not the other. So
+ * these functions edit the plain body, and the field's live rendering (WIN-90)
+ * shows what the parser made of the result.
+ *
+ * Which means this toolbar can do something a WYSIWYG one cannot: produce
+ * markup that does not take. Bolding "bar" inside "foobar" gives `foo*bar*`,
+ * and MARKDOWN.md §2's word-boundary rule says that is not emphasis. We insert
+ * it anyway rather than quietly moving somebody's selection somewhere they did
+ * not put it — and because the field renders formatting as you type, the
+ * asterisks simply stay unstyled, which says so immediately and honestly. */
+
+static int ed_is_space(WCHAR c) { return c == L' ' || c == L'\t' || c == L'\n' || c == L'\r'; }
+
+/* Wrap (or unwrap) the selection in `d`. */
+static void ed_fmt_inline(const WCHAR *d) {
+    int dl = lstrlenW(d);
+    int a = ed_sel_lo(), b = ed_sel_hi();
+    size_t db = (size_t)dl * sizeof(WCHAR);
+
+    /* Trim to the non-space core. A delimiter next to a space is not a
+     * delimiter (MARKDOWN.md §2.1), so wrapping the trailing space a
+     * double-click includes would produce markup that cannot parse. */
+    while (a < b && ed_is_space(g_ed[a])) a++;
+    while (b > a && ed_is_space(g_ed[b - 1])) b--;
+
+    ed_begin_edit();
+    /* Already wrapped? Take it off. The second press of a button undoing the
+     * first is what every editor does, and it is the only way to remove
+     * formatting without hunting for the delimiters by hand. Both shapes count:
+     * the delimiters just OUTSIDE the selection (you selected the word), and
+     * just inside it (you selected the marked-up run). */
+    if (a >= dl && b + dl <= g_ed_len &&
+        !memcmp(g_ed + a - dl, d, db) && !memcmp(g_ed + b, d, db)) {
+        ed_delete_range(b, b + dl);
+        ed_delete_range(a - dl, a);
+        g_ed_anchor = a - dl; g_ed_caret = b - dl;
+        return;
+    }
+    if (b - a >= 2 * dl && !memcmp(g_ed + a, d, db) && !memcmp(g_ed + b - dl, d, db)) {
+        ed_delete_range(b - dl, b);
+        ed_delete_range(a, a + dl);
+        g_ed_anchor = a; g_ed_caret = b - 2 * dl;
+        return;
+    }
+    if (a >= b) {                       /* no selection: the pair, caret between */
+        g_ed_caret = g_ed_anchor = a;
+        ed_insert_n(d, dl);
+        ed_insert_n(d, dl);
+        g_ed_caret = g_ed_anchor = (a + dl <= g_ed_len) ? a + dl : g_ed_len;
+        return;
+    }
+    /* The closer first, so the opener's offset is still the one we measured. */
+    g_ed_caret = g_ed_anchor = b; ed_insert_n(d, dl);
+    g_ed_caret = g_ed_anchor = a; ed_insert_n(d, dl);
+    g_ed_anchor = a + dl;               /* leave the text selected, not the markup,
+                                         * so a second press is the undo */
+    g_ed_caret  = (b + dl <= g_ed_len) ? b + dl : g_ed_len;
+}
+
+/* The block marker already on the line starting at `p`, if any: its offset and
+ * length, indentation excluded. Mirrors scan_line() in richtext.c — the point
+ * of the toolbar is to write what that function reads. */
+static int ed_block_marker(int p, int kind, int *at, int *len) {
+    int i = p, q;
+    while (i < g_ed_len && (g_ed[i] == L' ' || g_ed[i] == L'\t')) i++;
+    if (at) *at = i;
+    if (kind == FMT_QUOTE) {
+        if (i < g_ed_len && g_ed[i] == L'>') {
+            if (len) *len = (i + 1 < g_ed_len && g_ed[i + 1] == L' ') ? 2 : 1;
+            return 1;
+        }
+    } else if (kind == FMT_BULLET) {
+        if (i + 1 < g_ed_len && g_ed[i] == L'-' && g_ed[i + 1] == L' ') {
+            if (len) *len = 2;
+            return 1;
+        }
+    } else {
+        q = i;
+        while (q < g_ed_len && g_ed[q] >= L'0' && g_ed[q] <= L'9') q++;
+        if (q > i && q + 1 < g_ed_len && g_ed[q] == L'.' && g_ed[q + 1] == L' ') {
+            if (len) *len = q + 2 - i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Toggle a block marker on every line the selection touches. */
+static void ed_fmt_block(int kind) {
+    int had_sel = ed_has_sel();
+    int a = ed_sel_lo(), b = ed_sel_hi();
+    int ls = a, le = b, i, n = 0, all = 1;
+    int starts[256];                    /* a bound, not a guess: a 256-line block
+                                         * toggle is past what ED_MAX can hold in
+                                         * anything but empty lines */
+    while (ls > 0 && g_ed[ls - 1] != L'\n') ls--;
+    while (le < g_ed_len && g_ed[le] != L'\n') le++;
+    for (i = ls; i <= le && n < (int)(sizeof starts / sizeof starts[0]); ) {
+        starts[n++] = i;
+        while (i < le && g_ed[i] != L'\n') i++;
+        if (i < le) i++; else break;
+    }
+    for (i = 0; i < n; i++)
+        if (!ed_block_marker(starts[i], kind, NULL, NULL)) { all = 0; break; }
+
+    ed_begin_edit();
+    /* Backwards, so the offsets of the lines not yet touched stay valid. */
+    for (i = n - 1; i >= 0; i--) {
+        int at = 0, len = 0;
+        if (all) {
+            if (ed_block_marker(starts[i], kind, &at, &len)) {
+                ed_delete_range(at, at + len);
+                le -= len;
+            }
+        } else if (!ed_block_marker(starts[i], kind, &at, NULL)) {
+            WCHAR pre[12];
+            /* Numbered by POSITION in the block, not by iteration order, so a
+             * list reads 1. 2. 3. however it was built. */
+            if (kind == FMT_ORDERED) wsprintfW(pre, L"%d. ", i + 1);
+            else lstrcpyW(pre, kind == FMT_QUOTE ? L"> " : L"- ");
+            len = lstrlenW(pre);
+            g_ed_caret = g_ed_anchor = at;
+            ed_insert_n(pre, len);
+            le += len;
+        }
+    }
+    if (le > g_ed_len) le = g_ed_len;
+    if (le < 0) le = 0;
+    /* Keep a selection selected so a second press toggles the same block back;
+     * a bare caret stays a bare caret rather than growing a selection nobody
+     * asked for. */
+    g_ed_caret = le;
+    g_ed_anchor = had_sel ? ls : le;
+}
+
+/* One entry point for both the toolbar and the chords, so they cannot drift. */
+static void ed_format(int what) {
+    switch (what) {
+    case FMT_BOLD:   ed_fmt_inline(L"*"); break;
+    case FMT_ITALIC: ed_fmt_inline(L"_"); break;
+    case FMT_STRIKE: ed_fmt_inline(L"~"); break;
+    case FMT_CODE:   ed_fmt_inline(L"`"); break;
+    default:         ed_fmt_block(what);  break;
+    }
+}
+
 static void ed_focus(HWND hwnd) {
     g_ed_focus = 1;
     g_ed_blink = GetTickCount64();
@@ -7955,8 +8244,18 @@ static int ed_key(HWND hwnd, WPARAM vk) {
         if (g_edit_msg) { composer_cancel_edit(); return 1; }
         return 0;                            /* let the shell close what is open */
     case 'A': if (ctrl) { ed_select_all(); InvalidateRect(hwnd, NULL, FALSE); return 1; } return 0;
-    case 'C': if (ctrl) { ed_clip_copy(hwnd); return 1; } return 0;
-    case 'X': if (ctrl) { ed_clip_copy(hwnd);
+    /* Formatting (WIN-96). Slack's bindings, because they are the ones in the
+     * fingers of anyone arriving here — and the Ctrl+Shift pairs sit on top of
+     * cut and copy exactly as they do there. */
+    case 'B': if (ctrl && !shift) { ed_format(FMT_BOLD);   changed = 1; break; } return 0;
+    case 'I': if (ctrl && !shift) { ed_format(FMT_ITALIC); changed = 1; break; } return 0;
+    case '7': if (ctrl && shift)  { ed_format(FMT_ORDERED); changed = 1; break; } return 0;
+    case '8': if (ctrl && shift)  { ed_format(FMT_BULLET);  changed = 1; break; } return 0;
+    case '9': if (ctrl && shift)  { ed_format(FMT_QUOTE);   changed = 1; break; } return 0;
+    case 'C': if (ctrl && shift) { ed_format(FMT_CODE); changed = 1; break; }
+              if (ctrl) { ed_clip_copy(hwnd); return 1; } return 0;
+    case 'X': if (ctrl && shift) { ed_format(FMT_STRIKE); changed = 1; break; }
+              if (ctrl) { ed_clip_copy(hwnd);
                           if (ed_has_sel()) { ed_begin_edit(); ed_delete_range(ed_sel_lo(), ed_sel_hi()); }
                           changed = 1; break; } return 0;
     case 'V': if (ctrl) { ed_clip_paste(hwnd); changed = 1; break; } return 0;
@@ -8481,6 +8780,8 @@ static void layout_composer(HWND hwnd) {
      * nobody can see. */
     if (!main_is_conversation() || window_is_covered()) {
         g_ed_box = rf(0, 0, 0, 0);
+        for (int i = 0; i < FMT_COUNT; i++) g_fmt_btn[i] = rf(0, 0, 0, 0);
+        g_fmt_hover = -1;
         g_ed_focus = 0;
         return;
     }
@@ -8499,7 +8800,13 @@ static void layout_composer(HWND hwnd) {
     float tx = bx0 + 6 + sq * 3 + 8, tr = bx1 - 6 - sq - 8;
     float inner = composer_inner_h();
     float texth = inner > COMPOSER_BTN ? inner : COMPOSER_LINE;
-    float ty = by0 + COMPOSER_PAD + (inner > COMPOSER_BTN ? 0.0f : (COMPOSER_BTN - COMPOSER_LINE) / 2);
+    /* The toolbar row owns the top of the box (WIN-96); the field starts under
+     * it. Both this and draw_composer offset by the same constant, which is the
+     * pairing that has to stay true — the rect ed_hit tests against is the one
+     * ed_draw paints into, and a toolbar added to only one of them would put the
+     * caret a row away from the text. */
+    float ty = by0 + COMPOSER_TB + COMPOSER_PAD +
+               (inner > COMPOSER_BTN ? 0.0f : (COMPOSER_BTN - COMPOSER_LINE) / 2);
     /* Never hand back an inverted rect. members_w() should have prevented it, but
      * `right < left` is the one shape every consumer of this box gets wrong
      * silently: ed_hit matches nothing, ed_draw clips to nothing, and the dump's
@@ -8507,7 +8814,13 @@ static void layout_composer(HWND hwnd) {
      * arrives as "the message box is gone" with no clue why. Collapse to empty
      * instead, which every consumer already handles because it is what a
      * non-conversation view returns. */
-    if (tr <= tx) { g_ed_box = rf(0, 0, 0, 0); g_ed_focus = 0; return; }
+    if (tr <= tx) {
+        g_ed_box = rf(0, 0, 0, 0);
+        for (int i = 0; i < FMT_COUNT; i++) g_fmt_btn[i] = rf(0, 0, 0, 0);
+        g_fmt_hover = -1;
+        g_ed_focus = 0;
+        return;
+    }
     g_ed_box = rf(tx, ty, tr, ty + texth);
 }
 
@@ -8609,7 +8922,9 @@ static void layout_search(HWND hwnd) {
     if (!g_srch) return;
     /* `covered` matters here too: the search box is a middle-column overlay, and
      * a modal drawn over it would otherwise have this control punched through
-     * its card. */
+     * its card.
+     *
+     */
     if (!m || !m->search_open || window_is_covered()) { ShowWindow(g_srch, SW_HIDE); return; }
     (void)hwnd;
     ShowWindow(g_srch, SW_SHOW);
@@ -10127,6 +10442,16 @@ static int on_click(HWND hwnd, int x, int y) {
     }
     if (in_rect(g_attach_btn, x, y)) { upload_file(hwnd); return 1; }
     if (in_rect(g_emoji_btn, x, y))  { picker_open(hwnd, 0); return 1; }
+    /* The formatting toolbar (WIN-96). Focus first: the button acts on the
+     * field's selection, and clicking chrome must not be what takes the caret
+     * away from the text it is about to wrap. */
+    for (int i = 0; i < FMT_COUNT; i++)
+        if (in_rect(g_fmt_btn[i], x, y)) {
+            ed_focus(hwnd);
+            ed_format(i);
+            ed_changed(hwnd);
+            return 1;
+        }
     if (in_rect(g_at_btn, x, y)) {
         /* Insert the trigger at the caret and let the normal completion path
          * take over, so the button and typing "@" behave identically. */
@@ -12126,6 +12451,14 @@ static void test_dump(const char *path) {
      * it either — same reason as the natives line above. */
     { char cue[160]; composer_cue(m, cue, sizeof cue);
       fprintf(f, "composer_cue=\"%s\"\n", cue); }
+    /* The formatting toolbar's hit-boxes (WIN-96), so the smoke can CLICK the
+     * buttons rather than only fire the chords — they are two paths into
+     * ed_format() and a test of one is not a test of the other. */
+    fprintf(f, "fmtbar hover=%d", g_fmt_hover);
+    for (int i = 0; i < FMT_COUNT; i++)
+        fprintf(f, " %.0f,%.0f,%.0f,%.0f", g_fmt_btn[i].left, g_fmt_btn[i].top,
+                g_fmt_btn[i].right, g_fmt_btn[i].bottom);
+    fprintf(f, "\n");
     fprintf(f, "msgrows n=%d x=%.0f..%.0f hover=%llu listrows=%d\n", g_n_msgrows,
             g_n_msgrows ? g_msgrows[0].left : -1.0f, g_n_msgrows ? g_msgrows[0].right : -1.0f,
             (unsigned long long)g_hover_mid, g_n_listrows);
@@ -13211,6 +13544,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_mouse_x = mx; g_mouse_y = my;
             if (modal_open()) InvalidateRect(hwnd, NULL, FALSE);   /* frame hovers */
         }
+        {   /* Formatting-toolbar hover (WIN-96). Cheap enough to ask every move,
+             * and it keeps the seven buttons out of the hover state machine
+             * below — they are chrome over the composer, not a surface. */
+            int fh = -1;
+            for (int i = 0; i < FMT_COUNT; i++)
+                if (in_rect(g_fmt_btn[i], (float)mx, (float)my)) { fh = i; break; }
+            if (fh != g_fmt_hover) { g_fmt_hover = fh; InvalidateRect(hwnd, NULL, FALSE); }
+        }
         if (g_ed_dragging) { ed_mouse_move(hwnd, (float)mx, (float)my); return 0; }
         if (g_sbar_drag) {
             if (g_sbar_travel > 0) {
@@ -13312,7 +13653,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (g_selecting) { selection_end(); InvalidateRect(hwnd, NULL, FALSE); }
         return 0;
     case WM_KEYDOWN:
-        if (wp == 'C' && mod_down(VK_CONTROL)) { copy_selection(hwnd); return 0; }
+        /* Ctrl+C copies the TRANSCRIPT selection — but only when there is one,
+         * and only unshifted. It used to claim the key outright, which meant
+         * copy_selection() returned having done nothing and the composer's own
+         * Ctrl+C never ran: selecting text in the message box and copying it put
+         * nothing on the clipboard, silently, because the transcript's handler
+         * had already answered for it. Found by trying it (WIN-98), not by
+         * reading it, and it is the same claim that swallowed WIN-96's
+         * Ctrl+Shift+C. Falling through is what makes the field's copy reachable
+         * at all. */
+        if (wp == 'C' && mod_down(VK_CONTROL) && !mod_down(VK_SHIFT) && g_has_sel) {
+            copy_selection(hwnd); return 0;
+        }
         if (wp == VK_ESCAPE && g_lightbox) { g_lightbox = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         /* Esc pops the context pane back to the member list before it reaches
          * the middle column's overlays — the pane is what you just opened. */
@@ -13557,6 +13909,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     if (g_meta_w) IDWriteTextFormat_Release(g_meta_w);
     if (g_avatar)   IDWriteTextFormat_Release(g_avatar);
     if (g_micro)  IDWriteTextFormat_Release(g_micro);
+    if (g_meta_i) IDWriteTextFormat_Release(g_meta_i);
+    if (g_fmt_bold) IDWriteTextFormat_Release(g_fmt_bold);
+    if (g_fmt_ital) IDWriteTextFormat_Release(g_fmt_ital);
+    if (g_fmt_quote) IDWriteTextFormat_Release(g_fmt_quote);
     for (int i = 0; i < OC_ICON_COUNT; i++)
         if (g_icon_geo[i]) ID2D1PathGeometry_Release(g_icon_geo[i]);
     if (g_icon_stroke) ID2D1StrokeStyle_Release(g_icon_stroke);

@@ -254,6 +254,7 @@ expect "$d" srch 1 "search overlay: query box shown"
 expect "$d" re   0 "search overlay: composer hidden"
 "$DRIVE" search "" >/dev/null 2>&1; settle srch 0    # toggle off
 
+
 "$DRIVE" tab 2 >/dev/null 2>&1                       # Pins
 settle re 0
 expect_eventually re 0 "pins tab: composer hidden"
@@ -878,6 +879,76 @@ ed_step len 0 "the other channel starts empty"
 "$DRIVE" channel general >/dev/null 2>&1
 expect_grep '^ed .*text="a draft"' "and the draft comes back"
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1
+
+# --- formatting: the toolbar and its chords (WIN-96, REQ-220) ---------------
+# Two paths into one operation — the buttons and the keys — so both are driven.
+# Every assertion is against the TEXT, because what the toolbar produces has to
+# be the plain markup a person could have typed (ARCH-100 §5); if these ever
+# start asserting a style instead, the constraint has been lost.
+say "== formatting"
+fmtbar=$(snap | grep -m1 '^fmtbar ')
+nbtns=$(echo "$fmtbar" | awk '{print NF - 2}')
+checks=$((checks + 1))
+[ "${nbtns:-0}" = "7" ] && ok "the composer publishes seven formatting buttons" \
+                        || fail "formatting toolbar — expected 7 buttons, got ${nbtns:-<none>}"
+
+fmt_rect() {                       # fmt_rect <index> -> "x y" at its centre
+  echo "$fmtbar" | awk -v i="$1" '{ split($(i + 3), r, ","); print int((r[1]+r[3])/2), int((r[2]+r[4])/2) }'
+}
+
+"$DRIVE" chars "ship it" >/dev/null 2>&1; ed_wait len 7
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key ctrl+b >/dev/null 2>&1
+expect_grep '^ed .*text="\*ship it\*"' "Ctrl+B wraps the selection"
+"$DRIVE" key ctrl+b >/dev/null 2>&1
+expect_grep '^ed .*text="ship it"' "and pressing it again takes it off"
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key ctrl+i >/dev/null 2>&1
+expect_grep '^ed .*text="_ship it_"' "Ctrl+I italicises"
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key ctrl+shift+x >/dev/null 2>&1
+expect_grep '^ed .*text="~_ship it_~"' "Ctrl+Shift+X strikes through, around it"
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+"$DRIVE" chars "run it" >/dev/null 2>&1; ed_wait len 6
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key ctrl+shift+c >/dev/null 2>&1
+expect_grep '^ed .*text="`run it`"' "Ctrl+Shift+C marks it as code"
+
+# The transcript's Ctrl+C used to claim the key whether or not it had a
+# selection, so the FIELD's copy never ran and Ctrl+C there put nothing on the
+# clipboard (WIN-98). Asserted as a round trip through the real clipboard.
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key ctrl+c >/dev/null 2>&1
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+"$DRIVE" key ctrl+v >/dev/null 2>&1
+expect_grep '^ed .*text="`run it`"' "Ctrl+C in the composer copies (WIN-98)"
+
+# Block markers apply to every line the selection touches, and number themselves.
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+"$DRIVE" chars "one" >/dev/null 2>&1
+"$DRIVE" key shift+enter >/dev/null 2>&1
+"$DRIVE" chars "two" >/dev/null 2>&1
+ed_wait len 7
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key ctrl+shift+8 >/dev/null 2>&1
+ed_step len 11 "Ctrl+Shift+8 bullets every line in the selection"
+"$DRIVE" key ctrl+shift+8 >/dev/null 2>&1
+ed_step len 7 "and takes them all off again"
+"$DRIVE" key ctrl+shift+7 >/dev/null 2>&1
+expect_grep '^ed .*text="1\. one' "Ctrl+Shift+7 numbers them from one"
+"$DRIVE" key ctrl+shift+7 >/dev/null 2>&1
+"$DRIVE" key ctrl+shift+9 >/dev/null 2>&1
+expect_grep '^ed .*text="> one' "Ctrl+Shift+9 quotes them"
+"$DRIVE" key ctrl+shift+9 >/dev/null 2>&1; ed_wait len 7
+
+# The BUTTON is the other path in, and clicking one must not be what takes the
+# caret away from the text it is about to wrap.
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+"$DRIVE" chars "by hand" >/dev/null 2>&1; ed_wait len 7
+"$DRIVE" key ctrl+a >/dev/null 2>&1
+"$DRIVE" click $(fmt_rect 0) >/dev/null 2>&1
+expect_grep '^ed .*text="\*by hand\*"' "clicking B does what Ctrl+B does"
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+# With no selection it opens a pair and puts the caret between them, so what you
+# type next is already inside the markup.
+"$DRIVE" key ctrl+b >/dev/null 2>&1
+"$DRIVE" chars "inside" >/dev/null 2>&1
+expect_grep '^ed .*text="\*inside\*"' "with no selection it opens a pair to type into"
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
 
 # --- mentioning someone who is not in the channel (REQ-287) ------------------
 # The defect this covers is a FALSE CONFIRMATION: the highlight is syntactic, so
