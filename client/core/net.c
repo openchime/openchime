@@ -1154,8 +1154,29 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     push_err(to_ui, "upload refused: the server is low on storage");
                 else
                     push_err(to_ui, msg[0] ? msg : "server error");
-                /* An error mid-transfer aborts it; abandon the local file. */
-                if (ctx && ctx->xfer->mode != 0) xfer_reset(ctx->xfer);
+                /* An error ABOUT THE TRANSFER aborts it; abandon the local file.
+                 *
+                 * It used to abort on *any* error that happened to arrive while a
+                 * transfer was running, which desynchronised the two ends: the
+                 * client freed its slot and the daemon did not, so every later
+                 * upload on that connection was refused with `transfer error`
+                 * (netloop.c rejects UPLOAD_BEGIN when `c->xfer.state !=
+                 * XFER_NONE`). The trigger was ordinary and unrelated — a
+                 * "channel already exists" landing mid-upload was enough — and
+                 * the symptom appeared much later and nowhere near the cause,
+                 * as custom emoji and avatars silently failing to upload.
+                 *
+                 * The daemon already distinguishes these: send_transfer_error()
+                 * puts the attachment id in `context`, and the codes below are
+                 * the ones it uses. Everything else is somebody else's error and
+                 * must leave the transfer alone. */
+                int about_transfer =
+                    err.code == OC_ERR_TRANSFER_PROTOCOL   ||
+                    err.code == OC_ERR_ATTACHMENT_TOO_LARGE ||
+                    err.code == OC_ERR_ATTACHMENT_GONE      ||
+                    err.code == OC_ERR_UNKNOWN_ATTACHMENT   ||
+                    err.code == OC_ERR_STORAGE_FULL;
+                if (ctx && ctx->xfer->mode != 0 && about_transfer) xfer_reset(ctx->xfer);
                 if (err.fatal) return -1;
             }
         }

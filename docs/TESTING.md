@@ -256,44 +256,54 @@ real time three times in a single day before the guard existed.
 skips the build and `OC_DRIVE_NO_DAEMON=1` leaves the daemon alone — for when a
 mismatched pair is the thing under test, such as the version-reject path.
 
-> **Run the smoke against an isolated daemon.** The staleness check keeps a
-> daemon already listening on the dev port when its start time postdates the
-> `openchimed` binary — which means an *unrelated* daemon on that port is adopted
-> silently. During the 2026-07-30 review it bound to a nine-hour-old daemon
+> **The smoke owns its own daemon (WIN-88, fixed 2026-07-31).** It defaults to
+> port **9500** and `/tmp/oc-smoke`, wipes that directory, and **verifies the
+> workspace it reached is the fixture** — name plus the presence of alice, bob
+> and carol — refusing to run otherwise. Before that it silently adopted whatever
+> was listening: during the 2026-07-30 review it bound to a nine-hour-old daemon
 > holding real workspace data and reported confident failures for group DMs and
-> `@`-completion, because the suite's fixture users did not exist there. Pass
-> `OC_DEV_PORT` and `OC_DEV_DIR` to get a clean one:
+> `@`-completion because the fixture users did not exist there. It also no longer
+> leaves `smokevis` / `smokedrafts` channels in anyone's workspace, since it
+> starts from an empty one.
 >
-> ```
-> OC_DEV_PORT=9500 OC_DEV_DIR=/tmp/oc-smoke scripts/gui_smoke.sh
-> ```
->
-> The run also leaves its `smokevis` / `smokedrafts` channels and probe messages
-> behind in whatever workspace it touched. Tracked as WIN-88.
+> **Kill a dev daemon by its environment, not its command line.** It is started
+> as `env OPENCHIME_PROTO_PORT=… openchimed`, so the port never appears in the
+> process's *cmdline* and `pkill -f OPENCHIME_PROTO_PORT=9500` matches nothing —
+> exiting 1, looking exactly like "nothing to kill". The daemon then keeps
+> running on a directory that has been deleted underneath it (SQLite happily
+> writes to the unlinked inode), and every upload fails with an opaque
+> `transfer error`. Match `/proc/<pid>/environ`, as `gui_smoke.sh` now does.
 
 ## Known flakiness
 
-**`scripts/gui_smoke.sh` is flaky (WIN-87).** Five consecutive runs against a
-clean daemon gave 2 failures, clean, clean, 2 failures, 4 failures — with the
-failing assertions *moving between runs*: `Ctrl+=` zoom, `Ctrl+F`, `Ctrl+/`, and
-a cascade through the composer section when a `type`/`chars` has not landed
-before the next assertion reads the field.
+*None currently known in the GUI smoke.*
 
-**Every failure observed was verified by hand to be a harness artifact, not a
-product defect.** Driven deterministically, `Ctrl+=` steps zoom 0→1→2→3 with the
-font scale tracking 1.000→1.080→1.160→1.240 and `Ctrl+-`/`Ctrl+0` are correct;
-`Ctrl+F` and `Ctrl+/` open on a fresh client; the `@`-completion accepts on Tab.
+**Resolved 2026-07-31 — the suite was flaky and is now deterministic (WIN-87).**
+Five consecutive runs used to give 2 failures, clean, clean, 2 failures, 4
+failures, with the failing assertions *moving between runs*. Every failure was a
+harness artifact, not a product defect. Two causes, both fixed:
 
-The cause is that the suite settles by sleeping fixed intervals (0.3–1.5 s)
-rather than waiting on the state it is about to assert — the same class of bug
-as the resolved `last_error` case below, and the same fix: wait on a condition,
-not a clock. Until then: **a red run is not evidence of a regression until it
-reproduces deterministically**, and a green run is worth slightly less than its
-116 checks suggest.
+1. **It slept instead of waiting.** 96 hand-tuned `sleep`s guarded 91
+   assertions. `ack` means the verb's *handler ran*, not that its effect is
+   observable — most dump fields are recorded during `WM_PAINT`, and anything
+   that reaches the server lands a round trip later. The suite now waits on the
+   state it is about to assert (`expect_eventually`, `wait_grep`, `settle`), so
+   a true assertion returns on the first poll and only a real failure pays the
+   timeout. Seven `sleep`s remain, all inside those poll loops.
+2. **It asserted states, not transitions** — so "Esc closes the palette" passed
+   when the palette never opened, inflating the pass count on exactly the runs
+   where something was broken. Chords and zoom now assert the whole
+   closed→open→closed round trip and refuse to credit the close if the open
+   never happened.
+
+After the fix: **six consecutive clean runs, 116/116 each.** Tune the patience
+with `OC_SMOKE_WAIT_MS` (default 6000).
 
 *One caveat when reading a failure message:* the dump's `comp=` field is the
 **IME composition length**, not the autocomplete popover — the dump exposes no
-popover state at all, so `comp=0` beside a completion failure means nothing.
+popover state, so `comp=0` beside a completion failure means nothing. The fields
+worth reading are `error_seq` and `last_error`, added 2026-07-31: without them a
+failed intent and an intent that was never sent look identical.
 
 **Resolved 2026-07-29 — the one intermittent assertion.** `test_client_core`'s
 live two-client section failed occasionally on

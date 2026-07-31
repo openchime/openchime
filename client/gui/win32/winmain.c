@@ -136,6 +136,15 @@ static float composer_inner_h(void) { return g_composer_h - COMPOSER_CHROME; }
  * will fit less as REQ-240/241 add fields. */
 #define MEMBERS_W   300.0f
 
+/* The narrowest the conversation column may become before the members pane gives
+ * way. Below this the transcript is unreadable and the composer has less width
+ * than its own buttons — at 732 DIP (a 1098px window at 150% DPI, which is simply
+ * the default window on a scaled display) the rail, sidebar and a fixed 300px
+ * members pane left the composer with NEGATIVE width, so `g_ed_box.right` fell
+ * below `.left` and the message box silently disappeared. A responsive pane
+ * yields; it does not push the primary content off the window. */
+#define MAIN_MIN_W  380.0f
+
 /* Primary views selected by the left-nav rail (Slack-style). HOME/DMS/ADMIN are
  * real today; ACTIVITY/FILES/LATER/NOTIFICATIONS are stubs until their features
  * land. Rail item `act` values <0 are special (switcher / new / profile / more). */
@@ -5585,6 +5594,7 @@ static void picker_choose(HWND hwnd, const char *emoji) {
 static void composer_cue(const oc_model *m, char *out, size_t cap);   /* fwd */
 
 static int main_is_conversation(void);   /* fwd — decides the composer, chrome and child alike */
+static float members_w(float client_w_dip); /* fwd — the members pane yields when narrow */
 
 static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     float top = h - g_composer_h;
@@ -7081,7 +7091,7 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
 
     if (shell_visible()) {
         float main_x = RAIL_W + SIDEBAR_W;
-        float members = (g_show_members && m->authed) ? MEMBERS_W : 0;
+        float members = members_w(W);
         float main_r = W - members, main_w = main_r - main_x;
         switch (sidebar_kind()) {
             case SBK_DMS:      draw_dm_list(rt, m, H);       break;
@@ -7995,6 +8005,16 @@ static void layout_find(HWND hwnd);   /* fwd */
  *
  * Not the same as "this view has a sidebar": the DMs view has one, but its
  * middle column is the index (or the compose picker) until you pick someone. */
+/* How wide the members pane is RIGHT NOW — 0 when it is asked for but will not
+ * fit. One function because the drawing pass and the composer layout each used
+ * to decide this for themselves with the same expression, and an expression
+ * repeated in two places is a rule waiting to be applied in one of them. */
+static float members_w(float client_w_dip) {
+    const oc_model *m = model();
+    if (!g_show_members || !m || !m->authed) return 0;
+    return (client_w_dip - RAIL_W - SIDEBAR_W - MEMBERS_W < MAIN_MIN_W) ? 0 : MEMBERS_W;
+}
+
 static int main_is_conversation(void) {
     if (!transcript_shell()) return 0;
     const oc_model *m = model();
@@ -8037,8 +8057,7 @@ static void layout_composer(HWND hwnd) {
     }
     RECT rc; GetClientRect(hwnd, &rc);
     rc.right = (LONG)DIPF(rc.right); rc.bottom = (LONG)DIPF(rc.bottom);
-    const oc_model *m = model();
-    float members = (g_show_members && m && m->authed) ? MEMBERS_W : 0;
+    float members = members_w((float)rc.right);
     float main_x = RAIL_W + SIDEBAR_W;
     /* Inside the composer box, between the attach (+) and send buttons. */
     float bx0 = main_x + 20, bx1 = (rc.right - members) - 20;
@@ -8052,6 +8071,14 @@ static void layout_composer(HWND hwnd) {
     float inner = composer_inner_h();
     float texth = inner > COMPOSER_BTN ? inner : COMPOSER_LINE;
     float ty = by0 + COMPOSER_PAD + (inner > COMPOSER_BTN ? 0.0f : (COMPOSER_BTN - COMPOSER_LINE) / 2);
+    /* Never hand back an inverted rect. members_w() should have prevented it, but
+     * `right < left` is the one shape every consumer of this box gets wrong
+     * silently: ed_hit matches nothing, ed_draw clips to nothing, and the dump's
+     * `re` flag (right > left) reports the composer as ABSENT — so the failure
+     * arrives as "the message box is gone" with no clue why. Collapse to empty
+     * instead, which every consumer already handles because it is what a
+     * non-conversation view returns. */
+    if (tr <= tx) { g_ed_box = rf(0, 0, 0, 0); g_ed_focus = 0; return; }
     g_ed_box = rf(tx, ty, tr, ty + texth);
 }
 
@@ -11480,6 +11507,22 @@ static void test_dump(const char *path) {
             m->authed, m->connected, (unsigned long long)g_sel, g_show_members);
     fprintf(f, "workspace name=\"%s\" deployment=%s max_users=%u\n",
             oc_model_workspace_name(m), oc_model_deployment_name(m), oc_model_max_users(m));
+    /* The roster, by name. A harness that names people ("group-DM bob,carol",
+     * "@al completes to alice") cannot otherwise tell "the feature is broken"
+     * from "this daemon has never heard of bob" — and it once reported the
+     * former for three runs while the latter was true. Capped: a dump is read by
+     * a person, and 500 names is not read by anyone. */
+    /* The last error the core reported, and its monotonic sequence. Without this
+     * a failed intent is indistinguishable from an intent that was never sent —
+     * both look like "nothing happened" from a dump — and `error_seq` is here
+     * rather than the string alone because the string is CLEARED on reconnect
+     * (tests/TESTING.md records the same trap costing a flaky assertion). */
+    fprintf(f, "error_seq=%u last_error=\"%s\"\n",
+            (unsigned)m->error_seq, m->last_error);
+    fprintf(f, "users n=%u names=\"", (unsigned)m->n_users);
+    for (size_t i = 0; i < m->n_users && i < 32; i++)
+        fprintf(f, "%s%s", i ? "," : "", m->users[i].name);
+    fprintf(f, "%s\"\n", m->n_users > 32 ? ",…" : "");
     {
         const oc_channel *dc = g_sel ? oc_model_channel((oc_model *)m, g_sel) : NULL;
         if (dc) for (size_t i = 0; i < dc->n_msgs; i++)
