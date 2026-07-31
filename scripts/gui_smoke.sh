@@ -391,7 +391,11 @@ wait_grep '^  ch [0-9]+ "smokevis"' >/dev/null 2>&1 || true
 "$DRIVE" channel smokevis >/dev/null 2>&1; "$DRIVE" tab 3 >/dev/null 2>&1
 wait_grep 'aboutvis=[0-9]' >/dev/null 2>&1 || true
 
-vispub() { snap | grep -oE '^  ch [0-9]+ "smokevis" pub=[01]' | grep -oE 'pub=[01]' | cut -d= -f2; }
+# Anchored on the name and then on `pub=` separately, rather than on the two
+# being adjacent: they stopped being adjacent the moment `peers=` was added to
+# the line (WIN-95), and a matcher that encodes field ORDER breaks on every new
+# field. This one only requires that both are on the smokevis row.
+vispub() { snap | grep -E '^  ch [0-9]+ "smokevis" ' | grep -oE 'pub=[01]' | head -1 | cut -d= -f2; }
 
 click_about() {                    # click_about <field>
   local r l t rr b
@@ -519,6 +523,61 @@ if [ -n "${gid:-}" ]; then
   "$DRIVE" channel "$gid" >/dev/null 2>&1
   expect_eventually sel "$gid" "selecting it works by id"
 fi
+
+# --- the group-DM picker (WIN-93) -------------------------------------------
+# The engine half is asserted above through the `groupdm` verb. This is the
+# AFFORDANCE: gathering people by ticking them, which is what replaced a form
+# asking for "two to eight usernames, comma separated". Driven through the rects
+# the app reports, because the rows MOVE when the gathering bar appears — the
+# first attempt at this clicked a measured pixel and toggled the same person
+# twice.
+say "== group-DM picker"
+# click_tick <uid> — that row's tick, from the rect reported right now
+click_tick() {
+  local uid="$1" r l t rr b
+  r=$(snap | grep -oE "pickrow uid=$uid chk=[0-9,.-]+" | head -1 | sed 's/.*chk=//')
+  [ -n "$r" ] || { fail "no pickrow for uid=$uid"; return 1; }
+  IFS=, read -r l t rr b <<<"$r"
+  [ "${rr%.*}" -gt "${l%.*}" ] || { fail "uid=$uid has no tick"; return 1; }
+  "$DRIVE" click $(( (${l%.*} + ${rr%.*}) / 2 )) $(( (${t%.*} + ${b%.*}) / 2 )) >/dev/null 2>&1
+}
+
+"$DRIVE" menu 83 >/dev/null 2>&1
+expect_eventually view 1 "the group action opens the DMs view"
+expect_grep '^pick n=[1-9]' "the picker lists people"
+
+# You are not offered a tick beside your own name: you are in every conversation
+# you start, so it would be a control that cannot change anything.
+me=$(snap | grep -oE '^authed=[0-9]+ connected=[0-9]+ sel=[0-9]+' >/dev/null 2>&1; \
+     snap | grep -oE 'pickrow uid=[0-9]+ chk=0,0,0,0' | head -1 | grep -oE 'uid=[0-9]+' | cut -d= -f2)
+checks=$((checks + 1))
+if [ -n "${me:-}" ]; then ok "no tick beside yourself (uid=$me)"
+else fail "every picker row offers a tick, including your own"; fi
+
+# The first two rows that HAVE a tick — whoever they are. Naming bob and carol
+# here would hardcode the fixture's ids into a check about the picker.
+others=$(snap | grep -oE 'pickrow uid=[0-9]+ chk=[0-9,.-]+' |
+         grep -v 'chk=0,0,0,0' | grep -oE 'uid=[0-9]+' | cut -d= -f2 | head -2)
+set -- $others
+click_tick "${1:-0}" >/dev/null 2>&1
+expect_eventually chosen 1 "ticking one person gathers them"
+click_tick "${2:-0}" >/dev/null 2>&1
+expect_eventually chosen 2 "and ticking a second gathers both"
+
+# Start, and land IN the conversation — creating something and staying where you
+# were reads as nothing having happened.
+gor=$(snap | grep -oE '^pick .*go=[0-9,.-]+' | sed 's/.*go=//')
+if [ -n "${gor:-}" ]; then
+  IFS=, read -r gl gt gr gb <<<"$gor"
+  "$DRIVE" click $(( (${gl%.*} + ${gr%.*}) / 2 )) $(( (${gt%.*} + ${gb%.*}) / 2 )) >/dev/null 2>&1
+  expect_eventually chosen 0 "Start clears the gathering bar"
+  if [ -n "${gid:-}" ]; then
+    expect_eventually sel "$gid" "and lands in the group it reopened"
+  fi
+else
+  checks=$((checks + 2)); fail "no Start button rect in the dump"
+fi
+"$DRIVE" view 0 >/dev/null 2>&1; settle sbkind 1
 
 # --- avatars (WIN-47) -------------------------------------------------------
 # Two things are asserted, because the second was invisible for an hour: that the

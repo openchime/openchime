@@ -1923,6 +1923,23 @@ static void draw_user_avatar(ID2D1RenderTarget *rt, const oc_model *m, uint64_t 
     IDWriteTextFormat_SetTextAlignment(fmt, prev);
 }
 
+/* A group conversation's marker: the number of other people, not one of their
+ * faces. Picking a participant's avatar to stand for a group is a claim about
+ * the wrong person, which is why the sidebar has drawn it this way since
+ * REQ-056; this is that idiom lifted out so the DMs index draws the same thing
+ * (WIN-95) instead of inventing a second answer. */
+static void draw_group_avatar(ID2D1RenderTarget *rt, const oc_model *m,
+                              const oc_channel *c, D2D1_RECT_F box) {
+    (void)m;
+    fill_round(rt, box, 5.0f, OC_COL_INPUT);
+    stroke_round(rt, box, 5.0f, OC_COL_BORDER, 1.0f);
+    char cnt[8];
+    snprintf(cnt, sizeof cnt, "%u", (unsigned)(c->n_peers > 0 ? c->n_peers - 1 : 0));
+    IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, cnt, g_micro, rf(box.left, box.top + 6, box.right, box.bottom), OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_LEADING);
+}
+
 static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     fill(rt, rf(0, 0, RAIL_W, h), OC_COL_RAIL);
     g_n_navrows = 0;
@@ -4989,6 +5006,7 @@ static float draw_banner(ID2D1RenderTarget *rt, const oc_model *m, float x0, flo
 static const struct { const char *label; int cmd; } PALETTE[] = {
     { "Create a channel",        1  },
     { "New direct message",      6  },
+    { "New group message",       83 },
     { "Search messages",         4  },
     { "Upload a file",           7  },
     { "Preferences",             70 },
@@ -6614,6 +6632,32 @@ static const oc_channel *dm_with(const oc_model *m, uint64_t uid) {
     return NULL;
 }
 
+/* The group conversation for exactly this set of people, or NULL.
+ *
+ * A group has no `peer_id`, so `dm_with` cannot find one — it answers for the
+ * 1:1 case only. Matching on the SET is also the right test rather than a
+ * convenience: the daemon keys a DM on its participants (`dm_key`, REQ-056), so
+ * "the group with these people" is the identity, and asking that question the
+ * same way the server answers it means a reopen cannot land on a different
+ * conversation than the one that was created. */
+static const oc_channel *group_dm_with(const oc_model *m, const uint64_t *ids, int n) {
+    if (n <= 0) return NULL;
+    for (size_t i = 0; i < m->n_channels; i++) {
+        const oc_channel *c = &m->channels[i];
+        if (c->kind != OC_CHANNEL_KIND_DM) continue;
+        if (c->n_peers != (uint16_t)(n + 1)) continue;   /* +1: you are in it too */
+        int all = 1;
+        for (int k = 0; k < n && all; k++) {
+            int found = 0;
+            for (uint16_t p = 0; p < c->n_peers; p++)
+                if (c->peers[p] == ids[k]) { found = 1; break; }
+            all = found;
+        }
+        if (all) return c;
+    }
+    return NULL;
+}
+
 /* "15 mins" / "Yesterday" / "12 Jul" — a DM list is scanned, and an absolute
  * timestamp on every row makes it a table to read rather than a list to skim. */
 static void rel_time(uint64_t ms, char *out, size_t cap) {
@@ -6662,17 +6706,30 @@ static void draw_dm_list(ID2D1RenderTarget *rt, const oc_model *m, float h) {
         if (g_dm_hover == best->channel_id || g_sel == best->channel_id)
             fill_round(rt, row, 6.0f, g_sel == best->channel_id ? OC_COL_SELECT : OC_COL_HOVER);
 
-        const char *nm = oc_model_user_name((oc_model *)m, best->peer_id);
-        if (!nm || !nm[0]) nm = "user";
-        draw_user_avatar(rt, m, best->peer_id, nm,
-                         rf(row.left + 9, y + 11, row.left + 39, y + 41), g_ui, 0, 0);
-        draw_presence_dot(rt, row.left + 35, y + 37, 4.5f,
-                          oc_model_presence_of(m, best->peer_id), OC_COL_SIDEBAR);
+        /* WIN-95: a GROUP DM has no single peer, so deriving the name from
+         * `peer_id` produced the fallback "user" and the avatar colour for id 0 —
+         * while the Home sidebar, which asks the core, titled the same
+         * conversation "bob, carol". One renderer (`oc_model_dm_title`) answers
+         * for both kinds, so the two views cannot disagree about what a
+         * conversation is called. */
+        int group = best->n_peers > 2;
+        char title[96];
+        oc_model_dm_title(m, best, title, sizeof title);
+        const char *nm = title[0] ? title : "user";
+        if (group) {
+            /* A stack of people rather than one face: the row is about a set. */
+            draw_group_avatar(rt, m, best, rf(row.left + 9, y + 11, row.left + 39, y + 41));
+        } else {
+            draw_user_avatar(rt, m, best->peer_id, nm,
+                             rf(row.left + 9, y + 11, row.left + 39, y + 41), g_ui, 0, 0);
+            draw_presence_dot(rt, row.left + 35, y + 37, 4.5f,
+                              oc_model_presence_of(m, best->peer_id), OC_COL_SIDEBAR);
+        }
 
         int unread = best->unread > 0;
-        char label[80];
+        char label[112];
         snprintf(label, sizeof label, "%s%s", nm,
-                 best->peer_id == m->user_id ? " (you)" : "");
+                 (!group && best->peer_id == m->user_id) ? " (you)" : "");
         draw_text(rt, label, unread ? g_ui_b : g_ui,
                   rf(row.left + 48, y + 5, row.right - 60, y + 25), OC_COL_TEXT);
 
@@ -6708,13 +6765,73 @@ static void draw_dm_list(ID2D1RenderTarget *rt, const oc_model *m, float h) {
 /* The "start a conversation" picker: every person, which is what the compose
  * button is FOR. Not the resting state of the DMs view — the reference lists
  * conversations, and a roster masquerading as an inbox was my mistake. */
-static struct { D2D1_RECT_F r; uint64_t uid; } g_pickrows[256];
+static struct { D2D1_RECT_F r; D2D1_RECT_F chk; uint64_t uid; } g_pickrows[256];
 static int g_n_pickrows;
 
+/* WIN-93: who is being gathered for a group message. The picker used to be a
+ * single-line form asking for "two to eight usernames, comma separated" — which
+ * is a command line in a dialog, and required knowing and spelling names the app
+ * was already showing on screen. Selecting people from the list of people is the
+ * affordance ARCH-82 asks for.
+ *
+ * Clicking a ROW still opens a 1:1 immediately: that is the common case and it
+ * stays one click. Only the tick on the right gathers, so nothing about the
+ * existing gesture changes. */
+static uint64_t g_pick_chosen[OC_MAX_GROUP_DM];
+static int      g_n_chosen;
+/* The set a just-issued OPEN_GROUP_DM asked for, so the reply can be recognised
+ * and selected. Separate from g_dm_pending, which holds a user id. */
+static uint64_t g_group_pending[OC_MAX_GROUP_DM];
+static int      g_n_group_pending;
+static D2D1_RECT_F g_pick_go;          /* the "Start group message" button */
+
+static int pick_is_chosen(uint64_t uid) {
+    for (int i = 0; i < g_n_chosen; i++) if (g_pick_chosen[i] == uid) return 1;
+    return 0;
+}
+static void pick_toggle(uint64_t uid) {
+    for (int i = 0; i < g_n_chosen; i++)
+        if (g_pick_chosen[i] == uid) {
+            g_pick_chosen[i] = g_pick_chosen[--g_n_chosen];
+            return;
+        }
+    if (g_n_chosen < (int)(sizeof g_pick_chosen / sizeof g_pick_chosen[0]))
+        g_pick_chosen[g_n_chosen++] = uid;
+}
+static void pick_clear(void) { g_n_chosen = 0; }
+
 static void draw_dm_compose(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
-    D2D1_RECT_F body = pane_header(rt, reg, "New direct message");
+    D2D1_RECT_F body = pane_header(rt, reg,
+        g_n_chosen ? "New group message" : "New direct message");
     g_n_pickrows = 0;
+    g_pick_go = rf(0, 0, 0, 0);
     float y = body.top + 8;
+
+    /* The gathering bar, only once somebody is on it. It says what will happen
+     * and what is still needed, because "Start" greyed out with no reason is the
+     * same as no button at all. */
+    if (g_n_chosen > 0) {
+        D2D1_RECT_F bar = rf(body.left + 12, y, body.right - 12, y + 40);
+        fill_round(rt, bar, 6.0f, OC_COL_SELECT);
+        char who[256] = ""; size_t used = 0;
+        for (int i = 0; i < g_n_chosen; i++) {
+            const char *nm = oc_model_user_name((oc_model *)m, g_pick_chosen[i]);
+            used += (size_t)snprintf(who + used, sizeof who - used, "%s%s",
+                                     used ? ", " : "", (nm && nm[0]) ? nm : "user");
+            if (used >= sizeof who - 1) break;
+        }
+        draw_text(rt, who, g_ui, rf(bar.left + 10, bar.top + 4, bar.right - 150, bar.bottom - 4),
+                  OC_COL_TEXT);
+        int ready = g_n_chosen >= 2;
+        g_pick_go = rf(bar.right - 140, bar.top + 6, bar.right - 10, bar.bottom - 6);
+        fill_round(rt, g_pick_go, 5.0f, ready ? OC_COL_ACCENT : OC_COL_BORDER);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, ready ? "Start group message" : "Pick one more",
+                  g_meta, rf(g_pick_go.left, g_pick_go.top + 4, g_pick_go.right, g_pick_go.bottom),
+                  ready ? 0xFFFFFF : OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+        y += 48;
+    }
     for (size_t i = 0; i < m->n_users && y < body.bottom; i++) {
         const oc_member *u = &m->users[i];
         if (u->disabled) continue;
@@ -6730,8 +6847,28 @@ static void draw_dm_compose(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
                       ? "Message yourself \u2014 notes, links, reminders"
                       : (dm_with(m, u->user_id) ? "Open the conversation" : "Start a conversation"),
                   g_meta, rf(row.left + 56, y + 23, row.right - 20, y + 41), OC_COL_FAINT);
+
+        /* The gather tick. Not offered for yourself: you are in every
+         * conversation you start, and the daemon drops you from the participant
+         * list anyway (REQ-056), so a tick beside your own name would be a
+         * control that cannot change anything. */
+        D2D1_RECT_F chk = rf(0, 0, 0, 0);
+        if (u->user_id != m->user_id) {
+            chk = rf(row.right - 40, y + 12, row.right - 16, y + 36);
+            int on = pick_is_chosen(u->user_id);
+            D2D1_ELLIPSE ce = { { (chk.left + chk.right) / 2, (chk.top + chk.bottom) / 2 }, 11, 11 };
+            if (on) {
+                ID2D1RenderTarget_FillEllipse(rt, &ce, paint_with(OC_COL_ACCENT));
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+                draw_text(rt, "\u2713", g_meta, rf(chk.left, chk.top + 2, chk.right, chk.bottom), 0xFFFFFF);
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+            } else {
+                ID2D1RenderTarget_DrawEllipse(rt, &ce, paint_with(OC_COL_BORDER), 1.5f, NULL);
+            }
+        }
         if (g_n_pickrows < (int)(sizeof g_pickrows / sizeof g_pickrows[0])) {
             g_pickrows[g_n_pickrows].r = row;
+            g_pickrows[g_n_pickrows].chk = chk;
             g_pickrows[g_n_pickrows].uid = u->user_id;
             g_n_pickrows++;
         }
@@ -9072,7 +9209,7 @@ static int on_click(HWND hwnd, int x, int y) {
     {
         const oc_model *pm = model();
         if ((g_dm_compose || (pm && any_overlay(pm))) && in_rect(g_pane_close, x, y)) {
-            if (g_dm_compose) g_dm_compose = 0;
+            if (g_dm_compose) { g_dm_compose = 0; pick_clear(); }
             else              close_overlays();
             layout_composer(hwnd);
             InvalidateRect(hwnd, NULL, FALSE);
@@ -9473,21 +9610,44 @@ static int on_click(HWND hwnd, int x, int y) {
         if (in_rect(g_dm_compose_btn, x, y)) { g_dm_compose = !g_dm_compose; return 1; }
         for (int i = 0; i < g_n_dmrows; i++)
             if (in_rect(g_dmrows[i].r, x, y)) {
-                g_dm_compose = 0;
+                g_dm_compose = 0; pick_clear();
                 select_channel(g_dmrows[i].cid);
                 return 1;
             }
-        /* A person in the compose picker: open the conversation, creating it if
-         * it does not exist yet. */
-        for (int i = 0; i < g_n_pickrows; i++)
+        /* Start the group, if enough people are on the bar (WIN-93). */
+        if (g_n_chosen >= 2 && in_rect(g_pick_go, x, y)) {
+            oc_client_open_group_dm(g_client, g_pick_chosen, g_n_chosen);
+            /* Remember WHO, not a user id: the pending-DM slot resolves through
+             * dm_with(), which answers for one peer and cannot find a group.
+             * Landing in the conversation you just created is the same rule as
+             * "Message" taking you to the DM — creating a thing and being left
+             * where you were reads as nothing having happened. */
+            memcpy(g_group_pending, g_pick_chosen, sizeof g_group_pending);
+            g_n_group_pending = g_n_chosen;
+            pick_clear();
+            g_dm_compose = 0;
+            return 1;
+        }
+        if (g_n_chosen == 1 && in_rect(g_pick_go, x, y)) return 1;   /* not yet a group */
+        /* A person in the compose picker: the tick GATHERS them, the row opens a
+         * 1:1 straight away. Two gestures on one row, and the common one is
+         * unchanged — a group message is the rarer intent and pays the extra
+         * click, not the other way round. */
+        for (int i = 0; i < g_n_pickrows; i++) {
+            if (g_pickrows[i].chk.right > g_pickrows[i].chk.left &&
+                in_rect(g_pickrows[i].chk, x, y)) {
+                pick_toggle(g_pickrows[i].uid);
+                return 1;
+            }
             if (in_rect(g_pickrows[i].r, x, y)) {
                 const oc_model *dm_m = model();
                 const oc_channel *ex = dm_m ? dm_with(dm_m, g_pickrows[i].uid) : NULL;
-                g_dm_compose = 0;
+                g_dm_compose = 0; pick_clear();
                 if (ex) select_channel(ex->channel_id);
                 else open_dm_go(g_pickrows[i].uid);
                 return 1;
             }
+        }
     }
     /* Everything below is only meaningful in the transcript views. */
     if (!transcript_shell()) return 1;
@@ -11159,35 +11319,18 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         if (!up) { toast_push("Open a conversation first.", 1); break; }
         oc_client_upload_emoji(g_client, up, name, path);
         break; }
-    case 83: {   /* REQ-056: a group DM */
-        oc_field f[1] = { { FF_TEXT, "People",
-                            "Two to eight usernames, comma separated.", "" } };
-        if (!m || !form_dialog(hwnd, "New group message", f, 1) || !f[0].value[0]) break;
-        uint64_t ids[8]; int n = 0;
-        char buf[256]; snprintf(buf, sizeof buf, "%s", f[0].value);
-        for (char *tok = strtok(buf, ","); tok && n < 8; tok = strtok(NULL, ",")) {
-            while (*tok == ' ') tok++;
-            size_t L = strlen(tok);
-            while (L && (tok[L - 1] == ' ' || tok[L - 1] == '@')) tok[--L] = '\0';
-            if (tok[0] == '@') tok++;
-            if (!tok[0]) continue;
-            uint64_t uid = oc_model_user_id(m, tok);
-            /* Named and unknown is an error, not a silent omission: a group opened
-             * with the people it could resolve is not the group that was asked for. */
-            if (!uid) {
-                char msg[128];
-                snprintf(msg, sizeof msg, "No such user: %s", tok);
-                toast_push(msg, 1);
-                n = -1; break;
-            }
-            if (uid == m->user_id) continue;      /* you are always in it */
-            ids[n++] = uid;
-        }
-        if (n < 0) break;
-        if (n < 2) { toast_push("A group message needs at least two other people.", 1); break; }
-        g_view = VIEW_HOME;
-        oc_client_open_group_dm(g_client, ids, n);
-        break; }
+    case 83:      /* REQ-056: a group DM — open the picker (WIN-93) */
+        /* This was a one-line form asking for "two to eight usernames, comma
+         * separated". It worked, and it was the wrong shape: you had to know and
+         * spell names the app was already listing on screen, an unknown one
+         * failed the whole thing, and ARCH-82 says this GUI is affordance-driven.
+         * The picker is the same list of people, with a tick. */
+        close_overlays();
+        g_view = VIEW_DMS;
+        g_dm_compose = 1;
+        pick_clear();
+        layout_composer(hwnd);
+        break;
     case 82: {   /* WIN-83 — 82 because 10 and 11 are the presence items */
         if (g_sb.n_custom >= (int)OC_SB_CUSTOM_MAX) {
             toast_push("You already have 8 sections.", 1);
@@ -11521,6 +11664,19 @@ static void test_dump(const char *path) {
      * (tests/TESTING.md records the same trap costing a flaky assertion). */
     fprintf(f, "error_seq=%u last_error=\"%s\"\n",
             (unsigned)m->error_seq, m->last_error);
+    /* The group-DM picker's hit-boxes (WIN-93). Reported for the same reason as
+     * the preference chips: measuring them off a screenshot was wrong the first
+     * time I tried it, and the app already knows where it drew them. */
+    fprintf(f, "pick n=%d chosen=%d go=%.0f,%.0f,%.0f,%.0f\n",
+            g_n_pickrows, g_n_chosen,
+            g_pick_go.left, g_pick_go.top, g_pick_go.right, g_pick_go.bottom);
+    for (int i = 0; i < g_n_pickrows; i++)
+        fprintf(f, "  pickrow uid=%llu chk=%.0f,%.0f,%.0f,%.0f row=%.0f,%.0f,%.0f,%.0f\n",
+                (unsigned long long)g_pickrows[i].uid,
+                g_pickrows[i].chk.left, g_pickrows[i].chk.top,
+                g_pickrows[i].chk.right, g_pickrows[i].chk.bottom,
+                g_pickrows[i].r.left, g_pickrows[i].r.top,
+                g_pickrows[i].r.right, g_pickrows[i].r.bottom);
     fprintf(f, "users n=%u names=\"", (unsigned)m->n_users);
     for (size_t i = 0; i < m->n_users && i < 32; i++)
         fprintf(f, "%s%s", i ? "," : "", m->users[i].name);
@@ -11702,10 +11858,10 @@ static void test_dump(const char *path) {
         /* notify= so the Notifications form's Cancel is assertable: those levels
          * live on the SERVER, so "restore" means re-sending them, and a revert
          * that silently did nothing would look identical to one that worked. */
-        fprintf(f, "  ch %llu %s\"%s\" pub=%d unread=%d msgs=%zu notify=%u prev=\"%s\" prevby=%llu%s\n",
+        fprintf(f, "  ch %llu %s\"%s\" peers=%u pub=%d unread=%d msgs=%zu notify=%u prev=\"%s\" prevby=%llu%s\n",
                 (unsigned long long)c->channel_id,
                 c->kind == OC_CHANNEL_KIND_DM ? "DM " : "",
-                c->name ? c->name : "", c->is_public, c->unread,
+                c->name ? c->name : "", (unsigned)c->n_peers, c->is_public, c->unread,
                 c->n_msgs, (unsigned)c->notify_level, c->preview,
                 (unsigned long long)c->preview_author,
                 c->channel_id == g_sel ? " *" : "");
@@ -12244,9 +12400,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             /* A DM we asked for has arrived — select it. Picking someone should
              * land you IN the conversation, not back at the list with a new row
              * somewhere in the sidebar. */
+            if (g_n_group_pending) {
+                const oc_channel *ng = group_dm_with(m, g_group_pending, g_n_group_pending);
+                if (ng) {
+                    g_n_group_pending = 0;
+                    g_dm_compose = 0;
+                    g_view = VIEW_HOME;
+                    select_channel(ng->channel_id);
+                    layout_composer(hwnd);
+                }
+            }
             if (g_dm_pending) {
                 const oc_channel *nd = dm_with(m, g_dm_pending);
-                if (nd) { g_dm_pending = 0; g_dm_compose = 0; select_channel(nd->channel_id);
+                if (nd) { g_dm_pending = 0; g_dm_compose = 0; pick_clear(); select_channel(nd->channel_id);
                           InvalidateRect(hwnd, NULL, FALSE); }
             }
             /* Persist a settled move. WM_EXITSIZEMOVE covers a drag, but not a
