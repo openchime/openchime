@@ -21,6 +21,20 @@ codec, migrations, auth/jwt/roles/ratelimit, dbwriter handlers, and an
 end-to-end `itest_netloop` that drives the real epoll server + writer thread
 over TLS) plus a compose-based black-box e2e (`make integration`).
 
+For the **Win32 GUI** there is a third surface: `scripts/gui_smoke.sh` drives the
+running client through its test hook and asserts **116 behavioural invariants** —
+what is in each column, which native children are shown, what covers the window,
+modal commit-vs-cancel, the composer's editing primitives, group DMs, custom
+emoji, avatars, sidebar sections and channel visibility. It is not in CI (the
+daemon is Linux-only and GitHub's Windows runners cannot host it, WIN-81), so it
+is the pre-push gate a human runs. A ✅ on a client row generally means it passed
+there, not that it was eyeballed.
+
+**As of 2026-07-30 the Win32 backlog is empty** — every WIN-* item is struck
+through in [WIN32_BACKLOG.md](./WIN32_BACKLOG.md), including the custom
+DirectWrite composer (WIN-80/ARCH-98). That is a statement about that list, not
+about the product: the ⛔ rows below are what remains.
+
 ---
 
 ## Status by requirement
@@ -329,8 +343,8 @@ build order lives in that document's §5 and the [CLIENT.md](./CLIENT.md) §8 ro
 | 221 @mentions | ✅ | **Built (ARCH-89, migration 0021):** the body stays plain UTF-8 with the literal `@name`; `shared/mention.c` is the single scanner both daemon and client link, so highlight and notify cannot drift. The daemon resolves each name against the *channel's* membership and stores `(message, user, kind, span)` in `mentions`; `@here`/`@channel`/`@everyone` are broadcasts. The Win32 client accent-colours mention spans and tints a row that names you. Limitation: `@here` is treated as a plain broadcast for push, because presence is not visible to the push worker's read-only connection (ARCH-66). |
 | 230 pins | ✅ 🔵 | **Built (ARCH-90, migration 0022):** a pin is channel state keyed on the message — any member may pin or unpin (including someone else's), capped at 100 per channel, listed newest-first with each message's body so the view opens in one round trip. Pin state is replayed on backfill, so it survives a reconnect. Win32 shows a "Pinned by …" marker inline and a Pinned list in the channel header. **TUI has none of this yet.** |
 | 231 saved items ("Later") | ✅ 🔵 | **Built (ARCH-95, migration 0025):** `saved_items` keyed (user, message) — private, the mirror of a pin. Win32 fills the **Later** rail view, with "Save for later" in the message menu and Remove in the list. **TUI: none.** |
-| 220, 222–229 rich text, threads-in-place | ⛔ | Forward scope; none backed by an ARCH decision yet. |
-| 240–242 profiles, timezone, status text | ⛔ | Forward scope. |
+| 220, 222–229 rich text, threads-in-place | ⛔ | Forward scope; none backed by an ARCH decision yet. REQ-220 is now unblocked by the custom composer (WIN-80/ARCH-98) — the field is ours to lay out. |
+| 240–242 profiles, timezone, status text | ✅ | **Built** (WIN-47/53, migrations 0027): title, timezone, custom status with expiry, and **avatar images** (2026-07-30) — an attachment id, so upload/caps/dedup/reclaim are the existing paths. Pronouns are the one field not built. Building avatars exposed that the reclaim sweep would have deleted every one of them. |
 | 250 opt-in retention policy | ⛔ | Distinct from REQ-217's max attachment age (built) — 250 also ages out *messages*, which nothing does today. Still `[needs ARCH decision]`. |
 | 251 audit log | ✅ | **Built** (ARCH-79, migration 0016): four families — admin, account, security, moderation — recorded on the writer, read via `AUDIT_QUERY`/`AUDIT_PAGE` (0x0099/0x009A) and the TUI's Audit log action (Ctrl+K → Audit log), owner/admin gated against the user's *current* role. Never records the secret involved. Verified live: role change, invite, and password change all appear with the acting user, and a member promoted mid-session immediately gains access. |
 | 251a bounded audit log | ✅ | Aged out by the ARCH-78 maintenance pass, `OPENCHIME_AUDIT_MAX_DAYS` (default 365). |
@@ -358,22 +372,27 @@ CLIENT_GAP_ANALYSIS.md §5 and the CLIENT.md §8 roadmap, not here.
 | 027 SSO scope (OIDC-via-central only; no SAML) | ➖ | Design exclusion (ARCH-55); recorded, not code. The daemon already only verifies the central ES256 JWT. |
 | 034 channel topic / description | ✅ 🔵 | **Built (ARCH-93, migration 0024):** a `topic` column set via `UPDATE_CHANNEL`; **any member** may set it, empty clears it, 250-byte cap. Win32 shows it on the header's second line and edits it in the About tab. **TUI has none of this.** |
 | 035 archive channel | ✅ 🔵 | **Built (ARCH-93, migration 0024):** `archived_at_ms` non-NULL is the flag. Read-only enforced in `channel_post_access`, so send, threaded reply, upload and webhook post all return `CHANNEL_ARCHIVED`; hidden from the list for non-members, kept (flagged) for members; reversible. Owner/admin. Win32: header badge, About-tab toggle with a confirm, read-only composer. **TUI: none.** |
-| 036 rename channel | ✅ 🔵 | **Built (ARCH-93):** owner/admin; the **id is untouched**, so membership, history and cursors follow it — verified live on a channel with 13 messages and 3 members. Unique-name index applies (`CHANNEL_EXISTS`). No name-history table by design. **TUI: none.** |
+| 036 rename channel | ✅ 🔵 | **Built (ARCH-93):** owner/admin; the **id is untouched**, so membership, history and cursors follow it. |
+| 036a change channel visibility | ✅ | **Built 2026-07-30** (`OC_CHUP_PRIVATE` / `OC_CHUP_PUBLIC`): two ops rather than a toggle, so two admins cannot flip it twice. No membership surgery either way. The directions are asymmetric and the product says so — public→private narrows; private→public discloses the whole history and cannot be undone by flipping back. |
 | 037 guest accounts | ⛔ | Role model is owner/admin/member (REQ-030); no channel-scoped guest. |
-| 038 browse/join public-channel directory | ⛔ | No directory listing; joining needs a known channel. |
+| 038 browse/join public-channel directory | ✅ 🔵 | **Win32 built** (WIN-54a): "Browse channels" lists every public channel with its topic, unjoined first, Join or Open. No daemon work — `LIST_CHANNELS` always returned them with a `joined` flag; what was missing was somewhere to see them. |
 | 042 workspace settings + branding | ⛔ | No tenant name/icon/default-channels/join-policy surface. |
 | 043 admin console (member table, bulk, analytics) | ⛔ | Admin ops exist per-action (roles/invite/remove/storage/audit); no console. |
-| 057 forward / quote-share a message | ⛔ | Not on the wire. |
+| 056 group direct messages | ✅ | **Built 2026-07-30** (`OPEN_GROUP_DM`): a group DM is a DM with more than two participants — same kind, same `dm_key` identity, same membership and read-access code, so no migration and no second path that could disagree. Reopening the same set returns the same conversation. Titled by its people from one renderer in the core. |
+| 072 custom emoji | ✅ | **Built 2026-07-30** (migration 0029): name is the identity, image is an attachment, catalogue fanned to everyone on change. Drawn wherever an emoji is — chips, picker, reactor list — and inline in message bodies over a transparent shortcode. Reclaim excludes them, the trap avatars taught. |
+| 081 search operators (`from:` `in:` `has:` dates) | ✅ | **Built** (WIN-39, `shared/searchq.c`): one parser both frontends and the daemon share. `has:link` was silently matching nothing until 2026-07-30 — bodies are BLOBs and LIKE on a BLOB is false for every pattern. |
+| 234 starred conversations + custom sections | ✅ | **Built** (WIN-41/83): both halves, in `client_settings` so nothing is stored locally (ARCH-88). A conversation appears exactly once; caps refuse rather than evict. |
+| 057 forward / quote-share a message | ✅ 🔵 | **Win32 built** (WIN-51): forwards carry the quoted body, attachment name and a permalink; `oc_send` already carried `attach_ids`, so no new op. |
 | 062 followed-threads view + follow/unfollow | ⛔ | Threads work (REQ-060); no follow-state or aggregated view. |
-| 073 configurable quick reactions | 🔵 ⛔ | Reactions built (REQ-070); quick-set is a per-user client pref, unbuilt. |
-| 122 surface DND/OOO/custom-status in presence | ⛔ | Presence built (REQ-120); status not projected into it. |
-| 134 global (default) notification level | ⛔ | Per-channel level built (REQ-130); no workspace default. |
+| 073 configurable quick reactions | ✅ 🔵 | **Win32 built** (WIN-28): six shortcodes in Preferences, resolved through the shared catalogue so an unknown name drops rather than renders wrong. |
+| 122 surface DND/OOO/custom-status in presence | ✅ 🔵 | **Built** (WIN-53, migration 0027): custom status with expiry, shown beside names in the member pane and profile. The rail's own avatar carries presence AND a quiet-hours badge (2026-07-30). |
+| 134 global (default) notification level | ✅ | **Built 2026-07-30** (migration 0028, `SET_NOTIFY_DEFAULT`): `users.notify_default`, carried on every NOTIFY_PREFS sync so no client guesses it, and honoured by push as `COALESCE(np.level, u.notify_default)`. Fixed two push bugs on the way: the fallback was hardcoded to ALL, and `np.muted` was never consulted. |
 | 135 keyword / priority-people alerts | ⛔ | The mention→notify path it extends is now built (REQ-221/ARCH-89); keyword and priority-people matching itself is not. |
 | 136 notification schedule / quiet hours | ⛔ | Single daily DND window built (REQ-131); richer schedule unbuilt. |
-| 137 mute channel/DM (suppress + de-emphasize) | ⛔ | Distinct from level=none; sidebar de-emphasis + unread exclusion unbuilt. |
+| 137 mute channel/DM (suppress + de-emphasize) | ✅ | **Built** (WIN-40, migration 0026): a `muted` column distinct from level — level decides whether the daemon notifies, mute also de-emphasises the sidebar row and drops the badge. Push honours it as of 2026-07-30. |
 | 138 OS toast + sounds + badges | 🔵 ⛔ | Per-client rendering of the notify decision (ARCH-72); no client does OS toast yet. |
 | 139 activity feed / notification inbox | ✅ 🔵 | **Built (ARCH-95):** a union of three queries — mentions of you, reactions to your messages, replies under your threads — excluding your own actions and gated on current membership. No maintained table: the rows were already stored and indexed. `users.activity_seen_ms` is a watermark for "what is new", deliberately not per-item read state. Win32 renders it as a list-and-detail view (ARCH-94): the feed is the second column, the conversation stays in the middle, and clicking an item shows the thread from that message down — reaching it through fetch-around (ARCH-96) however old it is. Filter by All / Mentions / Reactions / Threads. **TUI: none.** |
-| 142 inline image/thumbnail rendering | 🔵 ⛔ | Graphical-frontend only (TUI exempt, ARCH-75); Win32 shows attachment lines only. |
+| 142 inline image/thumbnail rendering | ✅ 🔵 | **Win32 built** (WIN-17): WIC decode + D2D, click to expand, save-on-hover. TUI exempt (ARCH-75). Screenshots could not show them until 2026-07-30 — the capture used its own render target, so every capture of this app was a picture with the pictures missing. |
 | 143 files browser (channel + workspace) | ✅ 🔵 | **Built (ARCH-91, migration 0023):** `LIST_FILES` streams a channel's shared files newest-first, or (channel 0) every channel the caller can read. Pending uploads excluded; reclaimed rows listed and flagged rather than hidden. Win32 surfaces it twice: the channel's **Files & links** tab, and a workspace-wide **Files** view on the rail that names the channel each file came from and jumps to it. Both filter by type (All / Images / Documents / Other), client-side over `mime`, and say so when the 200-row cap is hit. **TUI has none of this.** |
 | 176 third-party API / SDK | ⛔ | No public programmatic surface; wire is the custom binary protocol (ARCH-6). |
 | 177 email-to-channel ingestion | ⛔ | Needs out-of-daemon inbound-mail; unbuilt. |
@@ -381,19 +400,19 @@ CLIENT_GAP_ANALYSIS.md §5 and the CLIENT.md §8 roadmap, not here.
 | 192 IP allowlist / access restriction | ⛔ | Per-IP throttle exists in the accept loop; no allowlist. |
 | 225 native polls | ⛔ | Not a message type today. |
 | 226 code/text snippets | ⛔ | Fenced code blocks pending (REQ-220); no first-class snippet object. |
-| 235 mark message/conversation unread | ⛔ | Read cursor exists (REQ-090/095); no mark-unback op. |
-| 236 new-message divider + jump-to-unread | 🔵 ⛔ | Client-side over the read cursor; TUI has unread markers, no divider/jump. |
+| 235 mark message/conversation unread | ✅ | **Built** (WIN-52, migration 0027): a DISTINCT op that may move the cursor backwards — the ack path stays monotonic by construction (`MAX(message_id, excluded)`), which is deliberate replay safety, not an oversight. |
+| 236 new-message divider + jump-to-unread | ✅ 🔵 | **Win32 built**: an unread divider in the transcript plus an "N new" jump in the header. TUI has markers only. |
 | 237 all-unreads / unreads-only views | ⛔ | Per-channel unread tracked (REQ-014); no aggregate view. |
-| 238 mark-all-read / catch-up | ⛔ | No bulk cursor-advance. |
+| 238 mark-all-read / catch-up | ✅ 🔵 | **Win32 built** (WIN-33): a loop over the existing CLIENT_ACK — cumulative per channel, so no new op was needed. A true bulk op stays open as REQ-238's server half. |
 | 254 data import / migration | ⛔ | No importer; distinct from compliance export (REQ-252). |
 | 260 command palette / quick switcher | 🔵 ✅ | TUI Ctrl+K (ARCH-83); **Win32 built** (WIN-11): Ctrl+K subsequence palette over a 20-action catalogue plus every conversation as "Go to", dispatching through the same menu codes the menus use. |
-| 261 in-app settings/preferences hub | 🔵 ✅ GUI / ⛔ TUI | **Win32 built** (WIN-9): appearance, time format, members pane, date dividers, desktop notifications and quick reactions, applied live and synced through the `gui` settings bucket. TUI remains file-only. |
-| 262 theme/appearance selection | 🔵 ✅ GUI / ⛔ TUI | **Win32 built** (WIN-26): dark / light / match-system, applied on the next frame and persisted. TUI still has no in-app toggle. |
+| 261 in-app settings/preferences hub | 🔵 ✅ GUI / ⛔ TUI | **Win32 built** (WIN-9, rebuilt WIN-78): two panes — Appearance / Messages / Notifications / Advanced — with explicit commit (Save/Cancel), reached from the You menu and Ctrl+, as well as the workspace menu. |
+| 262 theme/appearance selection | 🔵 ✅ GUI / ⛔ TUI | **Win32 built** (WIN-26, extended WIN-78): **System is the default** and follows the desktop live (WM_SETTINGCHANGE), incl. the title bar. A **colour scheme** is a PAIR — nav rail + accent, both per mode — and the selected-row tint derives from the accent. Plus text size, message density and per-window zoom (ARCH-97 keeps the three multipliers apart). |
 | 263 error/toast + connection-status surface | 🔵 🟡 | TUI partial (status line). **Win32 built** (WIN-1): a transient toast stack for in-session failures + a connection banner (reason + Retry now); runtime-verified. **Win32 sign-in rebuilt** (WIN-2): a two-step in-window view reporting DNS and auth failures inline, retryable, with sign-out returning to it. The reconnect countdown now ticks (WIN-55). |
 | 264 keyboard-shortcut reference | ✅ | TUI `?` overlay; **Win32 built** (WIN-25): Ctrl+/ sheet generated from one KEYMAP table so it cannot drift from the handlers. |
 | 265 composer autocomplete + emoji picker | ✅ | **Win32 built** (WIN-7/8): @/#/:emoji popover plus a searchable category picker, both over a shared core catalogue (`client/core/complete.[ch]`) so the two frontends complete identically. |
 | 266 other-user profile viewer | 🔵 ✅ GUI / ⛔ TUI | **Win32 built** (WIN-10, moved to the context pane by ARCH-94): avatar, name, live presence, role, and Message — beside the transcript rather than over it, with one level of back to the member list. Rich fields remain REQ-240. |
-| 267 sidebar org parity (DM section, sections, search) | ✅ | **Win32 built** (WIN-5/6): collapsible Channels/DMs with per-section sort+filter, scrolling, presence avatars, built from the shared `oc_model_sidebar` so TUI and GUI cannot drift. |
+| 267 sidebar org parity (DM section, sections, search) | ✅ | **Win32 built** (WIN-5/6/41/83): Starred, **user-defined sections** (8 × 32, appear-once with Starred winning), Channels and DMs, each with its own sort/filter/collapse, plus find. An expanded empty section says so in italics. |
 | 268 first-run onboarding (signup/first-owner UI) | 🔵 ✅ GUI / ⛔ TUI | **Win32 built** (WIN-32): "Have an invite? Create an account" redeems an invite on the sign-in card, creating the account and signing in together. |
 | 269 keyboard-only operation + accessibility | 🟡 ⛔ | Win32 is keyboard-operable in the ordinary paths (composer, completion, Alt+Up/Down conversation movement, Ctrl+K, Ctrl+/, F6) but exposes **no accessibility surface**: it answers no `WM_GETOBJECT`, so a screen reader sees one blank window. A self-drawn UI gets nothing for free. |
 | 270 GIF/sticker pickers | ➖ | Explicit exclusion (app/webhook territory). |
