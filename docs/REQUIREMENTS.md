@@ -1280,8 +1280,33 @@ None are yet backed by an architecture decision.*
 - **REQ-223.** An unsent composer's contents (per channel/thread/DM) have been
   preserved as a **draft** across app restarts and, for a signed-in identity,
   synced across that user's devices, so a half-written message has not been lost.
-  **[needs ARCH decision — draft storage: client-local (ARCH-64) vs.
-  server-synced.]**
+  **Settled by ARCH-101 (2026-07-31):** server-stored, in its own `drafts` table
+  keyed `(user_id, channel_id, thread_root)` with its own ops — deliberately not
+  the `client_settings` bucket, which is partitioned per frontend and would leave
+  a GUI draft invisible in the TUI. `thread_root` is in the key from the start
+  (0 = the channel) so the thread half of this requirement costs a client change
+  later rather than a migration.
+
+  **A draft is user content, with the consequences that follow.** It is in scope
+  for compliance capture (REQ-276). For DLP (REQ-277) the *timing* is what
+  matters: that requirement redacts on write, and applying it literally to a
+  draft would rewrite the author's own half-typed text underneath them on every
+  save. **Decided: redaction happens once, at send.** DLP over a draft is
+  **advisory — it may flag, never rewrite** — so the author's own unsent text is
+  never mutated underneath them, and the single point at which content is
+  redacted stays the moment it becomes a message.
+
+  **The surface follows Slack's as closely as it can.** A conversation holding an
+  unsent draft is marked in the sidebar, the draft is restored into the composer
+  on returning to it, and it clears on send — the behaviour people already have
+  the habit for. Where Slack pairs this with a "Drafts & scheduled" hub we do not
+  yet, because the scheduled half does not exist (REQ-224); that hub is its own
+  item rather than a divergence.
+
+  The sidebar marks a conversation that has a draft because a draft you
+  cannot see you have is one you never return to. It is not counted as unread:
+  it is your own text and must not make a channel look like it wants attention.
+  A "Drafts" hub is out of scope here and pairs with scheduled send (REQ-224).
 - **REQ-224.** A user has been able to **schedule a message** for future delivery
   to a channel or DM; the message has been held until its send time, then
   delivered through the ordinary path (REQ-090), and cancelable before it fired.
@@ -1511,6 +1536,12 @@ None are yet backed by an architecture decision.*
   what the webhook returns is what gets posted. A redaction therefore *replaces* the
   message on the way in; the original is never stored, never delivered, and never
   needs recalling.
+
+  **Drafts (REQ-223) are advisory only.** They are stored user content and are
+  captured (REQ-276), but DLP does not rewrite them: redaction happens once, at
+  send. Rewriting a draft on save would mutate the author's own half-typed text
+  underneath them on every keystroke-batch, which is a different and worse
+  promise than redacting a message nobody has seen yet.
 
   **This is deliberately not Slack's model.** Slack's Discovery API redacts
   *afterwards* (`discovery.chats.tombstone`), which needs a restore window, a

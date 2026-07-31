@@ -280,6 +280,18 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **Ambiguity degrades to literal source.** Emphasis is word-boundary anchored and must close on the same line, so `2 * 3` is arithmetic and a half-typed `*` never restyles the rest of a message; a backslash escape gives an explicit way out, which Slack has no equivalent of.
 
+- **ARCH-101 (Drafts — server-stored user content, not a client setting):** Answers REQ-223's open marker.
+
+  **A draft is stored on the daemon in its own `drafts` table, keyed `(user_id, channel_id, thread_root)`, with its own ops** — not in the `client_settings` bucket. The bucket was the obvious cheap answer and is the wrong one twice over. It is keyed `(user_id, client_type, key)` and **partitioned per frontend by design**, so a draft written in the Win32 GUI would be invisible in the TUI — the opposite of REQ-223's "synced across that user's devices". And its own schema notes describe its contents as "single-user, low-contention **prefs**": a draft is the one thing we would put there that the user typed as a *message*, and it is the higher-contention case the bucket says it is not for.
+
+  **`thread_root` is in the key from the start, defaulting to 0** (the channel itself). The client cannot use it yet — the thread pane shares the one composer, which is why `main_is_conversation()` treats an open thread as a conversation — so this dimension is unused on day one. It is there because the costs are asymmetric: one column now, against a migration on a table of user content plus a change to two wire ops that shipped clients already speak. Thread drafts then become a client-only change with no server work.
+
+  **Two rules make last-writer-wins survivable**, and neither is a merge algorithm. (1) A client **only writes a draft it actually changed**, so a device holding a stale buffer never clobbers a newer one just by switching channels. (2) A client **never overwrites a composer the user is typing in** — an incoming draft from another device updates the model, not the field. Stomping live typing to honour a remote write is worse than being briefly out of date.
+
+  **Deleted only when the thing it belongs to is gone:** on send, on channel deletion, and with the user on removal (the same cascade `remove_user` already does for DM channels). **Not on archive and not on leaving** — both are reversible (REQ-035), so discarding typed content for a temporary act is a permanent consequence of an undoable one. A draft for a channel you are not in is simply invisible until you return.
+
+  **Bounded by the composer, not by an invented number:** a draft cannot exceed what can be typed into the field (`ED_MAX`, 4000 UTF-16 units), which is already far under REQ-054's 64 KB body cap. The client's 24-slot in-memory limit was a memory constraint and stops being a product one.
+
 - **ARCH-97 (Typography — the platform owns the family, we own the scale):** Applies to every graphical client (ARCH-74's native front-ends); the TUI is exempt, since a terminal's font is the user's business.
 
   **The family comes from the OS.** Segoe UI Variable Text on Windows 11 falling back to Segoe UI, the desktop's `system-ui` on GTK, SF on macOS. Bundling a typeface is the most visible way to look foreign in a window — it is a large part of why Slack's own desktop client reads as not-quite-native — and it adds a licensing and shipping cost for a negative. A client that looks like it belongs on the platform is the whole point of not using a toolkit (ARCH-82).

@@ -476,6 +476,7 @@ CLIENT_GAP_ANALYSIS.md §5 and the CLIENT.md §8 roadmap, not here.
 | 177 email-to-channel ingestion | ⛔ | Needs out-of-daemon inbound-mail; unbuilt. |
 | 184 MFA / 2FA (local mode) | ⛔ | Local auth is password-only (ARCH-59); no second factor. |
 | 192 IP allowlist / access restriction | ⛔ | Per-IP throttle exists in the accept loop; no allowlist. |
+| 223 drafts | ⛔ | **Decided 2026-07-31 (ARCH-101), not built.** Server-stored in a `drafts` table keyed `(user_id, channel_id, thread_root)` with its own ops — deliberately not `client_settings`, which is partitioned per frontend and would leave a GUI draft invisible in the TUI. `thread_root` is in the key from day one (0 = the channel) so thread drafts cost a client change later, not a migration. Last-writer-wins, made survivable by two client rules: only write a draft you changed, and never overwrite a composer being typed in. Kept on archive and on leaving (both reversible); deleted on send, channel deletion and user removal. Sidebar marks a conversation holding one, matching Slack; not counted as unread. In scope for compliance capture (REQ-276); DLP still redacts at send (REQ-277). |
 | 225 native polls | ⛔ | Not a message type today. |
 | 226 code/text snippets | ⛔ | Fenced code blocks pending (REQ-220); no first-class snippet object. |
 | 235 mark message/conversation unread | ✅ | **Built** (WIN-52, migration 0027): a DISTINCT op that may move the cursor backwards — the ack path stays monotonic by construction (`MAX(message_id, excluded)`), which is deliberate replay safety, not an oversight. |
