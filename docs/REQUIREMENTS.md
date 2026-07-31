@@ -1150,126 +1150,114 @@ None are yet backed by an architecture decision.*
   them as one line hid that. Legal hold stays here.
   **[needs ARCH decision — hold model and its interaction with retention.]**
 
-- **REQ-276.** A tenant has been able to **capture its history through a
-  compliance API** — an authenticated, read-only interface returning messages,
-  threads, files, channels and users across the whole tenant, including **edits and
-  deletions** where retention preserved them, so an eDiscovery or archiving system
-  can hold a faithful record without a human exporting files by hand. Modelled on
-  Slack's Discovery API, which is the interface every vendor connector in this
-  space already speaks.
+- **REQ-276.** A tenant has been able to **capture its history for compliance** —
+  every message, thread, file, channel and user, including **edits and deletions**
+  where retention preserved them — so an eDiscovery or archiving system holds a
+  faithful record without a human exporting files by hand.
 
-  **Constraints that follow from the rest of this product:**
+  **Two delivery mechanisms, because the market has two and they are not
+  interchangeable.**
 
-  - **The caller is not a person.** A compliance exporter is an integration, so it
-    authenticates with an owner-minted, **scoped, revocable, audited** credential —
-    never a user session. Reusing a session would give an archiver every
-    user-facing operation as well, and would die whenever that owner signed out
-    everywhere (REQ-182).
-  - **Paging is a keyset cursor**, not an offset — the same reasoning as search
+  **(a) Vendor-format push (Global Relay EML).** The archiving vendors define the
+  interchange, not the chat products: Mattermost's "Actiance XML" is Smarsh's
+  ingest format and its "Global Relay EML" is Global Relay's. The reachable one for
+  us is **RFC-5322 email**, because it turns up twice independently — Global Relay
+  ingests it, and Microsoft **Purview**'s third-party connectors (the documented
+  Slack path uses 17a-4's DataParser) convert messages *into* email and import them
+  to mailboxes before litigation hold and retention apply. RFC 5322/2045 are public
+  and any mail parser validates our output locally, which no gated vendor schema
+  allows.
+
+  **Transport is SMTP, and that is a real dependency.** Global Relay and Proofpoint
+  are *journaling* destinations: the platform mails each record to a per-customer
+  address using vendor-issued SMTP credentials (Mattermost's config is customer
+  account type A9/A10/Custom plus SMTP user, password, address, and for Custom a
+  server and port). Actiance XML and CSV are written to a **local directory** for a
+  collector to take instead. So:
+
+  | Mechanism | Delivery | New machinery |
+  |---|---|---|
+  | Global Relay EML / Proofpoint | SMTP submission, authenticated | MIME assembly **+ an SMTP client** (AUTH, TLS, queue, retry) |
+  | File drop | Files in a spool directory | Encoder only |
+
+  The daemon has no outbound mail today. The **file drop is therefore the first
+  slice** — same extract, no network client, no credentials, nothing new to fail
+  under someone's compliance obligation — and SMTP follows when a customer names
+  Global Relay or Proofpoint, because only then are there credentials to test
+  against.
+
+  **(b) A first-class pull API, ours, documented and published.** A whole-instance
+  read interface for a compliance consumer that wants to fetch rather than be sent
+  to. Deliberately **our own**, not a Slack impersonation: Slack publishes no
+  machine-readable Discovery spec (its OpenAPI repo carries only the Web and Events
+  APIs; `api.slack.com/admins/discovery` is 403; there is no `docs.slack.dev` method
+  page), so "wire compatible" would be guesswork about field names. We conform to
+  what we can verify and document it properly instead.
+
+  **Constraints that follow from decisions already made here:**
+
+  - **The caller is not a person.** A compliance consumer authenticates with an
+    owner-minted **scoped, revocable, audited** credential — never a user session,
+    which would hand it every user-facing operation and would die when that owner
+    signs out everywhere (REQ-182).
+  - **Paging is a keyset cursor**, never an offset — the same reasoning as search
     (WIN-38): a message posted mid-export must not make a row repeat or vanish.
   - **DMs and private channels are the point and the danger.** Including them is
-    what makes it a compliance tool; it is therefore a deliberate, separately
-    audited act, not a side effect of holding a token.
-  - **The self-hosted operator already has the database.** For them this API is a
-    convenience over a documented read path; it earns its keep in the hosted model
-    (ARCH-76), where they do not, and wherever a vendor connector is the actual
-    requirement.
+    what makes it a compliance tool, so it is a deliberate, separately audited act.
+  - **The self-hosted operator already has the database**, so this earns its keep in
+    the hosted model (ARCH-76) and wherever a connector is the requirement.
 
-  **What we can actually model it on (checked 2026-07-30, not assumed):** Slack
-  publishes **no machine-readable spec for Discovery**. `slackapi/slack-api-specs`
-  contains only the Web API and Events API — zero discovery entries;
-  `api.slack.com/admins/discovery` answers **403** to an unauthenticated fetch, and
-  there is no `docs.slack.dev` method page for `discovery.conversations.history`.
-  Every field-level description in circulation is secondary (Slack's help centre,
-  vendor blogs), so a promise of *wire compatibility* would partly be guesswork
-  about field names.
-  What IS specified, in OpenAPI, is Slack's **public Web API** — and the Discovery
-  methods are recognisably those shapes with an org-wide scope: the same
-  `{"ok":true,…}` envelope, the same `limit` + `response_metadata.next_cursor`
-  paging, the same message/channel/user objects. So the buildable answer is to
-  conform to the PUBLIC spec (verifiable, and a connector's parser expects those
-  shapes anyway) and follow Discovery's naming where it is known, rather than claim
-  bit-exactness with a document we cannot read.
-  **Mattermost's compliance export is the other openly-documented model — and
-  checking it changed the question (2026-07-30).** Its formats are not Mattermost's:
-  per Mattermost's own documentation they are the **archiving vendors' ingest
-  formats** — *Actiance XML* for Smarsh (Vantage), *Global Relay EML* for Global
-  Relay, Proofpoint via Global Relay EML with custom SMTP, plus a generic CSV. So
-  the integration surface in this market is **the vendor's ingest format, not any
-  chat product's API**, and an open-source competitor demonstrably reaches those
-  vendors by emitting into them.
-  That points at a **push** mechanism — the daemon writes batches to a configured
-  destination on a schedule — as an alternative to the **pull** API this
-  requirement describes. Push is materially smaller: no public authenticated
-  surface, no integration-credential model, nothing new to defend, and it suits a
-  self-hosted operator who configures a destination rather than exposing a port.
-  The pull API earns its place where a vendor wants live capture or where the
-  operator cannot reach the destination.
-  **The concrete target (checked 2026-07-30): RFC-5322 email.** It is the one format
-  that turns up twice, independently, in publicly documented pipelines: it is Global
-  Relay's ingest, and it is what Microsoft **Purview**'s third-party connectors
-  convert into — the documented Slack path (17a-4's DataParser) maps users to
-  mailbox addresses, converts messages to email, imports them into user mailboxes,
-  and only then does litigation hold, retention and communication compliance apply.
-  So an emitter that produces correct `.eml` reaches Global Relay directly and
-  Purview through the connector pattern, **without a partner contract and without a
-  gated schema** — RFC 5322/2045 are public, and any mail parser validates the
-  output locally. That is the difference from Actiance XML, whose definition lives
-  behind Smarsh's Developers Program.
-  For contrast, **Pumble** (a reference product for this project) offers only a
-  workspace-owner ZIP of PUBLIC channels — no DMs, no private channels, no API, and
-  the export is deleted 10 days after download. Compliance capture is a
-  differentiator here, not table stakes.
+  For contrast, **Pumble** offers a workspace-owner ZIP of PUBLIC channels only — no
+  DMs, no private channels, no API, deleted 10 days after download. Compliance
+  capture is a differentiator in this segment, not table stakes.
 
-  **Not yet verified:** the Actiance-XML and Global-Relay-EML schemas themselves.
-  The vendor names and which format each consumes come from Mattermost's docs; the
-  formats would have to be obtained from the vendors before anything is emitted
-  claiming to be one.
+  **[gaps, held open deliberately — (i) the extract's own schema, which both
+  mechanisms encode from; (ii) the credential model, which nothing in the product
+  has yet; (iii) whether the pull API is served on the daemon's existing admin/health
+  listener or its own; (iv) user→email mapping, load-bearing for EML and for
+  Actiance's `LoginName` alike; (v) no vendor ingest has been tested, so no vendor may
+  be named as "supported" until one is.]**
 
-  **[needs ARCH decision — (a) wire-compatible with Slack's `discovery.*` URLs and
-  JSON envelope so an existing connector works unmodified, versus our own shape;
-  (b) where it is served: the daemon's existing admin/health HTTP listener is the
-  obvious host, and it is a second surface next to the binary protocol either way;
-  (c) the integration-credential model, which nothing in the product has yet.]**
+- **REQ-277.** A tenant has been able to apply **data-loss prevention to messages
+  before they are stored** — content is offered to a configured **DLP webhook**, and
+  what the webhook returns is what gets posted. A redaction therefore *replaces* the
+  message on the way in; the original is never stored, never delivered, and never
+  needs recalling.
 
-- **REQ-277.** A tenant has been able to let an approved **DLP integration act on
-  content** — redacting a message or file **in place**, leaving a tombstone that
-  says a policy removed it, restorable within a retention window. Distinct from a
-  user deleting their own message (REQ-058): a different actor, a different audit
-  family, and a different reversibility.
+  **This is deliberately not Slack's model.** Slack's Discovery API redacts
+  *afterwards* (`discovery.chats.tombstone`), which needs a restore window, a
+  tombstone rendered faithfully in every surface — transcript, thread, search, pins,
+  saved items, files, exports — and accepts that the original was already delivered
+  to everyone. Redacting **at send time** removes all of that: there is no
+  after-the-fact mutation of other people's messages, no second deletion semantics
+  beside REQ-058's, and nothing to un-show.
 
-  **What makes this bigger than the API it rides on:** it is the first write path
-  in the product where a **non-human mutates somebody else's message**. Three
-  consequences, all of which are the work rather than incidental to it:
+  **The example we ship and test: US Social Security numbers.** A reference webhook
+  that rewrites `123-45-6789` to a redaction marker, exercised in the test suite so
+  the contract is executable rather than described — the daemon posts the redacted
+  text, and the original never reaches the database.
 
-  - **A tombstone must be visible everywhere the content was** — transcript,
-    thread, search results, pins, saved items, the file list and any export. A
-    redaction that only takes effect in the view the redactor was looking at is not
-    a redaction, and the daemon already learned this lesson once with archived
-    channels (REQ-035): enforce it where every path passes.
-  - **The actor is a policy, not a user.** The audit row has to name the
-    integration, and the client has to be able to say "removed by your
-    organisation's policy" rather than attributing it to whoever installed the app.
-  - **It is destructive and remotely triggered**, so the scope that permits it is
-    separate from the read scope of REQ-276 and is refused by default.
+  **What the design has to answer, and the answer IS the compliance posture:**
 
-  **[needs ARCH decision — tombstone representation (reuse `deleted_at_ms` plus a
-  reason, or a distinct state), the restore window, and whether this is offered at
-  all for the self-hosted target.]**
-- **REQ-253.** In OIDC/enterprise deployments, user provisioning and
-  deprovisioning have been automatable via **SCIM** from the organization's
-  identity provider, so account lifecycle matched the directory. Like OIDC this
-  has been a **federated function** brokered through the central service (ARCH-76,
-  ARCH-56), not the daemon — available to self-hosted federated and hosted
-  deployments, with no local-mode or stand-alone applicability. **[needs ARCH decision — SCIM endpoint placement
-  (central service).]**
-- **REQ-254.** A tenant has been able to **import** message and channel history
-  from another system (e.g. a Slack export, or a CSV of direct messages) and to
-  **migrate** an existing workspace's data in, so adopting OpenChime has not meant
-  abandoning history. Import has been an owner/admin operation that maps foreign
-  users onto tenant accounts (REQ-030), distinct from the compliance **export** of
-  REQ-252. **[needs ARCH decision — import format(s), user-identity mapping, and
-  idempotent re-runs.]**
+  - **The send path becomes blocking on an external call.** Timeout, retry and
+    failure policy are the feature: **fail-open** (post the original when the webhook
+    is unreachable — availability first, and a gap in enforcement) or **fail-closed**
+    (refuse the send — enforcement first, and the product stops when the webhook
+    does). It must be configurable and it must be logged either way, because "which
+    one was in force" is the first question an auditor asks.
+  - **Latency is now in the user's send.** A budget belongs in the config, and
+    exceeding it is a failure that hits the policy above.
+  - **The webhook sees everything before anyone else does**, including DMs. That is
+    the most sensitive egress in the product and needs its own scope, its own audit
+    family, and TLS with a pinned or operator-supplied trust anchor.
+  - **Edits and attachments.** An edit is a new send and goes through the same path;
+    file CONTENT scanning is a different problem (size, binary formats) and is
+    **out of scope for the first pass** — recorded rather than silently omitted.
+
+  **[gaps — the request/response contract itself (shape, versioning, how a webhook
+  signals "block entirely" versus "post this instead"), the signing scheme that lets
+  a webhook trust the daemon, and whether a redaction is visible to the SENDER as
+  having happened.]**
 
 ---
 

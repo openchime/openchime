@@ -336,8 +336,8 @@ build order lives in that document's §5 and the [CLIENT.md](./CLIENT.md) §8 ro
 | 251a bounded audit log | ✅ | Aged out by the ARCH-78 maintenance pass, `OPENCHIME_AUDIT_MAX_DAYS` (default 365). |
 | 251b per-family cap | ✅ | **The cap is applied per family**, so a flood of attacker-controlled `auth.failed` entries cannot age out administrative history — without this the audit log becomes an evidence-shredder. Rate-limited attempts are dropped silently rather than audited, so a throttled spray produces no rows at all. Regression-tested with a 200-entry security flood against a surviving admin entry. |
 | 252 legal hold | ⛔ | Narrowed 2026-07-30: export → REQ-276, DLP → REQ-277. `[needs ARCH decision]`. |
-| 276 compliance capture API (Discovery) | ⛔ | Scoped 2026-07-30. Read-only tenant-wide capture incl. edits/deletes, integration credential, keyset cursor. Open: Slack `discovery.*` wire-compat vs our own shape. `[needs ARCH decision]`. |
-| 277 DLP write-back (tombstone) | ⛔ | Scoped 2026-07-30. First path where a non-human mutates someone else's message; tombstone must hold in every view. `[needs ARCH decision]`. |
+| 276 compliance capture | ⛔ | Scoped 2026-07-30, two mechanisms: vendor push (Global Relay EML over **SMTP journaling**; file-drop first) and our own documented pull API. Gaps held open: extract schema, credential model, user→email mapping. |
+| 277 DLP at send time | ⛔ | Scoped 2026-07-30. Pre-post **webhook**: what it returns is what is stored, so nothing is redacted after delivery. Reference SSN redactor in the test suite. Open: fail-open vs fail-closed, contract, signing. |
 | 253 SCIM provisioning | ⛔ | Federated function (ARCH-76); central-service concern. |
 
 ---
