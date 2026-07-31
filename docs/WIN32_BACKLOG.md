@@ -21,9 +21,8 @@ document is only the work list derived from them.
 
 ## Open
 
-| # | Item | Pri | Size |
-|---|---|---|---|
-| **WIN-60** | **Unreproduced crash while typing.** Seen three times, never reproduced, no dump at the time. Since 2026-07-29 the client installs an unhandled-exception filter (`crash_filter`) writing `crash-<pid>.txt` with the exception code, faulting address and module base, resolvable via `scripts/crash_resolve.sh`. Nothing has been caught since. Open because unreproduced is not fixed. | P1 | — |
+*Nothing startable in `client/gui/win32/` is open.* New work belongs here as new
+ids (never reused); the items below are waiting on a requirement or a decision.
 
 ## Open, but not startable here
 
@@ -36,6 +35,35 @@ pattern REQ-221 and REQ-230 both followed.
 | **WIN-91** | **Drafts across a restart.** Drafts are per-channel and in memory (`g_drafts`, 24 slots), so they die with the process. A stateless client (ARCH-88) cannot persist one locally, so this needs server-side storage — the `client_settings` route or a real op. | An ARCH decision on where a draft lives |
 | **WIN-92** | **"Pause notifications until…" — the transient DND that does not exist.** The client can set a *recurring daily* window (REQ-131) and nothing else, so the single most-reached-for form — "do not disturb until 17:00", or for 30 minutes — is not expressible: a minutes-of-day pair is periodic, so "until 5pm today" would silence 5pm every day. Needs `dnd_until_ms` (an absolute instant), the presets + custom end time, a resume-now affordance, and the DND state carried to *other* users so a sender sees it before writing (REQ-122 — `oc_user` has no DND field today). The storage pattern is already proven in-tree by custom-status expiry: an absolute stamp the daemon enforces **on read**, so no client needs a clock and nothing has to sweep. | **REQ-278** (new) + REQ-122 |
 | **WIN-94** | **Recurring schedule and keyword alerts.** The DND window is typed `HH:MM` with no time picker and no per-weekday schedule (Slack: Every day / Weekdays / Custom, with independent start and end per day). Keyword and priority-people alerts are the same family and cheap now — the match→notify path @mentions built (ARCH-89) — and priority people is also REQ-278's VIP escape hatch. | REQ-135 / REQ-136 |
+
+## Closed without a fix, and why
+
+- **WIN-60 — the unreproduced crash while typing.** Closed 2026-07-31. Three
+  crashes were seen on 2026-07-29, all while typing, none reproduced. The
+  crash filter (`crash_filter`, breadcrumbs + minidump) went in at **21:49 that
+  evening** — *after* the last occurrence — and **the composer was rewritten the
+  next morning** (WIN-80/ARCH-98, 09:54 on 2026-07-30), replacing the native
+  RichEdit child with the self-drawn editor. So every occurrence happened in code
+  that no longer exists, and the instrumentation has never once seen the
+  replacement fail.
+  
+  Evidence for closing rather than merely parking it: the crash filter is
+  **verified working** — a deliberate fault (`crashtest`) produces the report and
+  a 7.7 MB minidump — so zero crash files is a real result and not a silent
+  handler. Since the rewrite the composer has taken thousands of harness-driven
+  keystrokes without a fault: a targeted stress run (40 rounds of typing,
+  non-ASCII where the UTF-16↔UTF-8 offset mapping runs, the ED_MAX boundary,
+  undo/redo churn over the 16-deep snapshot stack, completion on all three
+  triggers, draft save/restore across switches, resize mid-layout) plus repeated
+  full smoke runs.
+  
+  A read of the current composer for the usual suspects also found it sound:
+  `ed_insert_n` caps rather than overflows, the undo snapshots are bounded, and
+  both IME composition branches are length-guarded against `g_ed_comp`.
+  
+  **If it recurs it is new information and a new id** — the report will now carry
+  the faulting address, the access kind and the last breadcrumbs, which is
+  exactly what the original three lacked.
 
 ## Environment, not defects
 

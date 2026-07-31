@@ -255,8 +255,13 @@ from the daemon's, so every later upload failed with an opaque `transfer error`.
 What remains is **blocked, not deferred** — each needs a daemon requirement or a
 product decision, and none is startable in `client/gui/win32/`:
 
-- **WIN-60** — the unreproduced crash while typing. Instrumented with a crash
-  filter; nothing caught since. Open because unreproduced is not fixed.
+- ~~**WIN-60** — the unreproduced crash while typing.~~ **Closed 2026-07-31.**
+  All three occurrences predate the composer rewrite (WIN-80/ARCH-98) that
+  replaced the RichEdit child wholesale the next morning, so they happened in
+  code that no longer exists. The crash filter is verified working (a deliberate
+  fault produces the report and a minidump) and has seen nothing since, across a
+  targeted composer stress run and repeated smoke runs. A recurrence is new
+  information and a new id.
 - ~~**WIN-89 / REQ-269** — accessibility.~~ **Built 2026-07-31 (ARCH-99).** A UIA
   provider over the self-drawn UI, a real system caret, TextPattern on both the
   transcript and the composer, and announcements. The custom controls were not
