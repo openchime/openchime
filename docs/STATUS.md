@@ -27,13 +27,24 @@ what is in each column, which native children are shown, what covers the window,
 modal commit-vs-cancel, the composer's editing primitives, group DMs, custom
 emoji, avatars, sidebar sections and channel visibility. It is not in CI (the
 daemon is Linux-only and GitHub's Windows runners cannot host it, WIN-81), so it
-is the pre-push gate a human runs. A ✅ on a client row generally means it passed
-there, not that it was eyeballed.
+is a local pre-push gate. A ✅ on a client row generally means it passed there,
+not that it was eyeballed.
 
-**As of 2026-07-30 the Win32 backlog is empty** — every WIN-* item is struck
-through in [WIN32_BACKLOG.md](./WIN32_BACKLOG.md), including the custom
-DirectWrite composer (WIN-80/ARCH-98). That is a statement about that list, not
-about the product: the ⛔ rows below are what remains.
+> **Read that gate with a caveat (2026-07-30).** The suite is **flaky**: five
+> consecutive runs against a clean daemon gave 2 failures, clean, clean, 2
+> failures, 4 failures, with the failures moving between runs. Every failure
+> observed was verified by hand to be a **harness artifact — timing, or a
+> daemon-selection trap — not a product defect** (WIN-87, WIN-88). Two
+> consequences: a red run is not evidence of a regression until reproduced
+> deterministically, and a green run is worth slightly less than its 116 checks
+> suggest. Fixing that is WIN-87.
+
+**The numbered Win32 backlog (WIN-1 … WIN-84) is closed**, and an adversarial
+review on 2026-07-30 found no defect in any of it. Work found since — including
+two avatar-consistency defects found by looking at the running client rather
+than by any assertion — is the open list in
+[WIN32_BACKLOG.md](./WIN32_BACKLOG.md). The ⛔ rows below are what remains at the
+requirement level.
 
 ---
 
@@ -126,7 +137,7 @@ about the product: the ⛔ rows below are what remains.
 
 | REQ | Status | Notes |
 |-----|--------|-------|
-| 201 no local storage in any client | 🔵 ✅ | **Built** (ARCH-88). A client writes **no files at all**: the session token, TOFU pin and workspace book are one credential per workspace in the OS credential store (Credential Manager / libsecret, enumerated for the book), cached history is gone, and the outbox is in memory. Works because the read cursor is server-side (REQ-090) — a cursorless `BACKFILL_REQUEST`, or an explicit cursor of 0, resumes from it. `third_party/sqlite`, `-lsqlite3` and the borrowed `daemon/migrate.c` are gone from every client target; the Win32 binary went 2.9 MB → **1.9 MB**. Verified on Windows: sign-in, restart, silent reconnect and history all working with an empty `%LOCALAPPDATA%`. **Costs:** no offline history, a queued message dies with the process (WIN-59 warns on quit), and no keyring means no persistence at all. The rule covers client *state*; the TUI's user-authored `~/.config/openchime/config` is deliberately still a file. |
+| 201 no local storage in any client | 🔵 ✅ | **Built** (ARCH-88). A client writes **no files at all**: the session token, TOFU pin and workspace book are one credential per workspace in the OS credential store (Credential Manager / libsecret, enumerated for the book), cached history is gone, and the outbox is in memory. Works because the read cursor is server-side (REQ-090) — a cursorless `BACKFILL_REQUEST`, or an explicit cursor of 0, resumes from it. `third_party/sqlite`, `-lsqlite3` and the borrowed `daemon/migrate.c` are gone from every client target; dropping SQLite took the Win32 binary from 2.9 MB to 1.9 MB at the time. (It has since grown with the features added after: `make windows-gui` produces **3.7 MB unstripped, 1.2 MB stripped**, measured 2026-07-30. The Makefile does not strip, so 3.7 MB is what ships today — quote a measurement, not the 1.9 MB historical figure.) Verified on Windows: sign-in, restart, silent reconnect and history all working with an empty `%LOCALAPPDATA%`. **Costs:** no offline history, a queued message dies with the process (WIN-59 warns on quit), and no keyring means no persistence at all. The rule covers client *state*; the TUI's user-authored `~/.config/openchime/config` is deliberately still a file. |
 | 200 Linux/Win/macOS/iOS/Android clients | 🟡 | Client pivoted to **one shared C app-core + native UI per platform** (ARCH-74, tdlib model — supersedes the raylib/Windows-cross-compile plan). The app-core (`client/core/`: net thread, queues, view-model + reducers, `oc_client` facade) is **built and headless-tested** (`tests/test_client_core.c` drives it against an in-process daemon; `make core` compile-check, linked into `make test`). First frontend is a **TUI** — rebuilt menu/screen-driven on the in-tree `tuikit` toolbox (ARCH-83) with a 256-color theme and a Ctrl+K command palette; the slash-command UX (ARCH-75) is gone — with: connect + local auth, channel sidebar + unread, live messages + history backfill, display names, per-nick colors, scrollback, send, with reactions, edit/delete, typing indicators, threads, search, channel + DM management, presence + roster, who-reacted, notification prefs + DND, admin (roles/invite/remove), webhook management, attachments, and logout — all reached through context menus and the command palette (Ctrl+K). Nearly every capability the app-core exposes is reachable from the TUI — the exceptions (webhook delete, log-out-everywhere) and the daemon frames no client reaches yet are listed in [CLIENT.md](./CLIENT.md) §3; native GUIs pending. The **Windows GUI** rendering stack is settled — **Win32 + Direct2D/DirectWrite + RichEdit**, pure C (ARCH-82); two first-draft GUIs (comctl32, and a self-rendered Clay+raylib) were built, rejected as dated / non-native, and **have been removed** (the old self-rendered `client/gui` tree and the vendored Clay/raylib are deleted — the current native GUI lives at `client/gui/win32/` and is unrelated). Native AppKit/Android/DOM/WASM frontends still pending. Daemon is Linux-only (epoll/eventfd). |
 | 210 lean/standard memory profile | ✅ | **Measured** (`Scripts/bench.sh`): ~5 MB baseline + **~50 KB RSS per idle connection**, so a few hundred connections sit in ~15–30 MB and low-thousands stay within the 256 MB lean profile. Message round-trip **p50 ~2–3 ms, p90 ~80 ms, p99 ~130 ms** at 32 concurrent senders. (An earlier *p99 ~20–40 ms* was a harness artifact and was corrected 2026-07-19 — see [BENCHMARK.md](./BENCHMARK.md).) |
 | 211 low-hundreds concurrent connections | ✅ | **Measured**: hundreds of concurrent pinned-TLS connections held in a small fraction of the lean profile. Connection *setup* is bounded by the 600k-iteration PBKDF2 auth on the single writer at **~2 logins/s** (≈500 ms each), so a burst of simultaneous logins queues there; steady-state is cheap. `OC_NETLOOP_MAX_FD=4096`. See [BENCHMARK.md](./BENCHMARK.md) — an earlier ~6–7 logins/s figure was a harness artifact (a 10 s read timeout silently dropping most connections) and was corrected 2026-07-19. |
@@ -166,14 +177,14 @@ Legend: ✅ done · 🔨 in progress · ⛔ not started.
 | Admin: roles / remove | `set_role`, `remove_user` | ✅ | Member right-click, role-gated. |
 | Admin: invite | `invite_user` | ✅ | Rail → workspace menu → Invite people as member / as admin (token shown once, owner/admin only). |
 | Threads | `open_thread`, `reply`, `close_thread` | ✅ | Message menu → Reply/Open thread; overlay + reply composer. |
-| Search | `search`, `close_search` | ✅ | Rail → New (+) → Search messages… or Ctrl+F; a result jumps to the matched message and flashes it (WIN-3). No paging — the wire has no cursor (WIN-38). |
+| Search | `search`, `close_search` | ✅ | Rail → New (+) → Search messages… or Ctrl+F; a result jumps to the matched message and flashes it (WIN-3). **Paged** (WIN-38): `SEARCH` carries a `before_id` **keyset** cursor — not an offset, so a message posted mid-paging cannot make a row repeat or vanish — and "Load more results" appears only when the server says there is more. **Operators** (WIN-39): `from:` / `in:` / `has:file\|link\|image` / `after:` / `before:`, parsed in `shared/searchq.c` so the client's filter line and the daemon's WHERE clause cannot disagree. |
 | Channel management | `create_channel`, `join_channel`, `leave_channel`, `list_members`, `update_channel` | ✅ | Rail → New (+) → New channel (name + public/private); sidebar right-click Join / Leave / Mark as read; the members pane lists the **channel's** roster (REQ-031). The **About** tab sets the topic (any member) and renames or archives (owner/admin) — REQ-034/035/036. |
 | @mentions | shared `oc_mention_scan` + notify level | ✅ | Accent-coloured, semi-bold spans; a message naming you tints its row and gets an accent bar; the `mentions` notify level is evaluated with the same scanner the daemon resolves with (REQ-221). |
 | Pins | `pin`, `list_pins`, `close_pins` | ✅ | Message menu → Pin/Unpin to channel; a "Pinned by …" marker above the message; the **Pins** tab lists them, jumps to one, or unpins (REQ-230). |
-| Channel files | `list_files`, `close_files` | ✅ | The **Files & links** tab: name, uploader, size, date, download, jump-to-message (REQ-143). The workspace-wide form (`channel_id 0`) is on the wire but the rail's Files view is still a stub. |
+| Channel files | `list_files`, `close_files` | ✅ | The **Files & links** tab: name, uploader, size, date, download, jump-to-message (REQ-143). The workspace-wide form (`channel_id 0`) fills the rail's **Files** view, naming the channel each file came from and jumping to it, with a name search and type/ownership filters. Its channel column is exact rather than inferred from the 200-row page (WIN-82, `LIST_FILE_CHANNELS`). |
 | Attachments: download | `download` | ✅ | Right-click → Download (native Save dialog), or the Files tab. |
 | Attachments: upload | `upload` | ✅ | Composer "+" button + drag-drop anywhere. |
-| Notifications / DND | `set_notify_pref`, `set_dnd`, `list_notify_prefs` | ✅ | Channel menu level + rail → profile avatar → Do not disturb… (raw `HH:MM-HH:MM` prompt, no picker) + a **Notifications pane** (WIN-12) that calls `list_notify_prefs` and edits the per-channel level. |
+| Notifications / DND | `set_notify_pref`, `set_dnd`, `list_notify_prefs` | ✅ | Channel menu level + rail → profile avatar → Do not disturb… (an on/off check plus validated From/To fields, WIN-13 — typed `HH:MM`, no time picker and no weekday schedule, REQ-136) + a **Notifications pane** (WIN-12) that calls `list_notify_prefs` and edits the per-channel level. |
 | Self-service profile | `set_display_name`, `change_password` | ✅ | Rail → profile avatar → Change display name… / Change password… (one dialog each; the password form has a confirm field, WIN-20). |
 | Webhooks | `webhooks`, `create_webhook`, `delete_webhook` | ✅ | Channel **About** tab → Webhooks… (channel-scoped admin belongs with the channel, ARCH-94); also the channel menu. Overlay, click-to-delete. |
 | Storage / audit (admin) | `storage_status`, `audit_query` | ✅ | Rail → **Admin** (Storage · Audit log tabs, refetched on entry, owner/admin only); also on the workspace menu. |
@@ -181,7 +192,7 @@ Legend: ✅ done · 🔨 in progress · ⛔ not started.
 | Read receipts (seen-by) | model `readers[]` | ✅ | "✓ Seen by …" footer under the transcript. |
 | Logout | `logout` | ✅ | Rail → workspace menu → Sign out / Sign out everywhere; window closes on the drop. |
 | Manual reconnect | `reconnect` | ✅ | Three ways: the **connection dot** beside the workspace name (filled = live, hollow = not; click to retry, WIN-64), the connection banner with the reason, a live countdown and "Retry now" (WIN-1/WIN-55), and the workspace menu's Reconnect now. |
-| Multiple workspaces | one `oc_client` per ws + switcher | 🔨 | **Rail switcher UI built** — the workspace avatar at the top of the rail (`open_switcher`/`switch_workspace`, winmain.c) — remembered workspaces + "Add a workspace…". It **stop/reconnects a single `oc_client`**, so the remaining piece is the TUI's **N-concurrent-client** model (background receive + "N elsewhere" unread), not the switcher affordance. |
+| Multiple workspaces | one `oc_client` per ws + switcher | ✅ | **Built** (WIN-29). Up to `WS_MAX` clients are held in a slot array (`g_wss`) and **every one is ticked each frame** (`WM_TIMER`/`TIMER_TICK`), not just the one on screen, so a background workspace drains events, accrues unread and can raise a notification. Per-workspace view state (selection, scroll, backfill set) swaps on switch; unread elsewhere surfaces as a rail badge (`ws_unread_elsewhere`) and per-row counts in the switcher. A no-argument launch signs in to every remembered workspace holding a session token (WIN-57). |
 
 > **Depth caveat:** this table tracks whether each engine feature is *reachable*; it does **not** measure how developed each screen/dialog is. For the full four-way (Slack vs Pumble vs TUI vs Win32) surface-depth gap analysis — including underdeveloped screens and a recommended build order — see [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md).
 
@@ -207,35 +218,41 @@ substring-filters channel names).
 thing: **DMs is a person-centric index** — every workspace member as a row, with
 existing conversations first and everyone else below, picking one opening (or
 creating) the DM. It also surfaces **self-DM** (REQ-055), which the engine has
-supported all along with no client able to reach it. **Activity, Files and Later are still `draw_stub_view` placeholders** ("coming soon"), mapping
-onto REQ-139 (activity feed), REQ-143 (a *workspace-wide* files view), REQ-231
-(saved items) and REQ-138 respectively. Two notes on that list: **Preferences is
-no longer a stub** (WIN-9), and the **Files** stub is now the cheapest of them to
-fill — `LIST_FILES` already accepts `channel_id 0` for "every channel I can
-read", and the per-channel Files tab is built.
+supported all along with no client able to reach it.
+
+**No rail view is a stub any more.** Activity (REQ-139), Files (REQ-143) and
+Later (REQ-231) were the last three and all now render real surfaces — verified
+2026-07-30 against a running client: Activity has All/Mentions/Reactions/Threads
+filters over a real feed, Files has a channel column with a name search and
+type/ownership filters, Later lists saved items by channel. `draw_stub_view`
+survives only as the `default:` arm of the view switch. Admin is likewise a
+developed pane (Storage · Audit log · Invites).
 
 **Every tracked engine feature is reachable**, and since this table was written
 the Win32 GUI has moved from trailing the TUI to leading it: sign-in was rebuilt
 (WIN-2), the failure surface landed (WIN-1), the client became stateless
 (ARCH-88), and @mentions, pins, the channel Files tab and the per-channel roster
-(REQ-221/230/143/031) shipped here first. The depth backlog below is the live
-picture:
+(REQ-221/230/143/031) shipped here first.
 
-- **DND configuration** — the window is settable and displayed, but only through
-  a typed `HH:MM` form: no picker, no weekday schedule (REQ-136). (The prefs
-  *review* screen it used to lack is built — WIN-12.)
-- **One unreproduced crash while typing** (WIN-60 in the backlog) — seen once,
-  never since, no dump. Tracked rather than forgotten.
-- **Multiple workspaces** — the rail switcher UI exists, but Win32 switches by
-  stop/reconnecting a single `oc_client`, so a background workspace does not
-  receive or accrue unread ("N elsewhere"). This is the one genuinely unbuilt
-  *capability* versus the TUI's N-concurrent-client model.
+**The depth pass is done.** Every item that opened it — the error/toast and
+connection surface (REQ-263), navigable search with paging and operators
+(REQ-080), the sidebar overhaul (REQ-267), the preferences hub (REQ-261), the
+command palette (REQ-260), inline images (REQ-142) — has landed, along with
+mark-unread, mute, star, forward, copy-link/permalink, invite management with
+revoke, the active-session list, group DMs, custom emoji, avatars and the
+N-concurrent-workspace model. What is left in this client is the short open list
+in [WIN32_BACKLOG.md](./WIN32_BACKLOG.md):
 
-Next per the agreed sequencing is the **depth pass**. The numbered work list is
-[WIN32_BACKLOG.md](./WIN32_BACKLOG.md) (`WIN-1`…`WIN-54`); its ordering rationale
-is [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5. It leads with the
-error/toast surface (REQ-263), navigable search (REQ-080), and the sidebar
-overhaul (REQ-267).
+- **Two avatar-consistency defects** (WIN-85/86) — the signed-in user's initial
+  is a different colour in the rail than everywhere else, and three sites draw
+  avatars without the shared helper so they can never show an uploaded photo.
+- **A flaky smoke suite** (WIN-87) and a **daemon-selection trap** in its launcher
+  (WIN-88) — test-harness work, but it is what a gate is worth.
+- **One unreproduced crash while typing** (WIN-60) — now instrumented with a
+  crash filter; nothing caught since.
+- **Blocked on a REQ, not on this client:** accessibility (REQ-269), rich text
+  (REQ-220), drafts across a restart, and a notification schedule richer than one
+  daily DND window (REQ-135/136).
 
 ---
 
@@ -314,20 +331,46 @@ on the daemon is not hardening but the follow-ups noted per-REQ above (e.g. the
 webhook CA cert REQ-171). The MENTIONS push level is no longer pending — REQ-221
 closed it.
 
-The **client** is a shared, frontend-agnostic **C app-core** (ARCH-74) with a
-**termbox2 + utf8proc TUI** (ARCH-75) as the reference frontend. It reached
-*every* engine feature on the wire until this week's daemon work; **it is now
-behind by four** — @mentions (REQ-221), pins (REQ-230), the channel files listing
-(REQ-143) and the channel member listing (REQ-031), all of which exist on the
-wire and are surfaced only in the Win32 GUI. Closing that gap is TUI work only —
-the app-core already carries all four.
+The **client** is a shared, frontend-agnostic **C app-core** (ARCH-74) with two
+frontends over it: a **termbox2 + utf8proc TUI** (ARCH-75) and the **native Win32
+GUI** (ARCH-82). The TUI was the reference client and reached *every* engine
+feature on the wire until the July 2026 work; **the Win32 GUI now leads it by
+more than twenty features**, not the four this section claimed until 2026-07-30.
+Everything in this list exists on the wire and in the app-core and is surfaced
+only in the GUI, so closing it is TUI work alone:
 
-The core also has a **local store** (SQLite today; being removed from all clients
-per ARCH-88/REQ-201) giving silent session-token reconnect, a persisted TOFU pin,
-cached history, and an offline outbox (REQ-100/101/102 met client-side). The remaining client work is
-scope, not hardening: the incomplete **Windows GUI** depth pass, the later native
-GUIs (GTK/AppKit) + web/mobile, the **OIDC browser flow**, the **audio client**
-(Opus/UDP), and **screenshare** (REQ-161).
+- **Messages:** @mentions (221), pins (230), saved items / Later (231), forward
+  (057), copy-link and permalink navigation (232), mark-unread (235), the unread
+  divider and jump-to-unread (236), mark-all-read (238), inline images (142 —
+  *the one permanent exemption*, ARCH-75 renders no graphics).
+- **Channels:** the per-channel member roster (031), topic (034), archive (035),
+  rename (036), visibility change (036a), browse/join directory (038), the files
+  listing (143), mute (137), starred conversations and user-defined sections (234).
+- **People and presence:** group DMs (056), custom status with expiry (122),
+  profile depth incl. avatars (240/241), the other-user profile viewer (266).
+- **Notifications:** the global default level (134), the activity feed (139).
+- **Shell and account:** the preferences hub (261), theme/appearance (262),
+  first-run onboarding / invite redeem (268), configurable quick reactions (073),
+  custom emoji (072), the active-session list (182), webhook *delete*, and
+  log-out-everywhere.
+
+The app-core carries all of it, which is what makes this a catch-up rather than a
+build. See [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §4 for the same
+list framed as gaps.
+
+The core's **store keeps nothing on disk** (ARCH-88/REQ-201 — done, not in
+progress: `client/core/store.c` references SQLite zero times). One credential per
+workspace in the OS credential store carries the session token, the TOFU pin and
+the workspace book, which is why silent reconnect and a persisted pin survive a
+restart; history comes from the server's own read cursor and the outbox lives in
+RAM (REQ-100/101/102 met client-side, at the cost of no offline history and a
+queued message dying with the process).
+
+The remaining client work is scope, not hardening: the **Win32 open list**
+(two avatar-consistency defects, a flaky smoke harness, one unreproduced crash —
+[WIN32_BACKLOG.md](./WIN32_BACKLOG.md)), the **TUI catch-up** below, the later
+native GUIs (GTK/AppKit) + web/mobile, the **OIDC browser flow**, the **audio
+client** (Opus/UDP), and **screenshare** (REQ-161).
 
 The forward feature scope is the Sections 11–14 table and the **Non-video
 competitor-parity backlog** table below (REQ-026…275), reconciled
@@ -360,10 +403,11 @@ build order lives in that document's §5 and the [CLIENT.md](./CLIENT.md) §8 ro
 
 The non-video features Slack/Pumble ship that OpenChime lacked a requirement for
 are now specced (REQUIREMENTS.md §§1–16, added from
-[CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md)). All are **forward scope** —
-none is built beyond what its cross-referenced note says — and most still need an
-ARCH decision. Tracked here so the target-state contract and the reality stay
-reconciled. The **prioritized build order** (which of these to do first) lives in
+[CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md)). This started as pure forward
+scope; **much of it has since shipped** — read each row's status mark, not the
+section heading. What remains unbuilt is mostly either an explicit exclusion (➖)
+or still waiting on an ARCH decision. Tracked here so the target-state contract
+and the reality stay reconciled. The **prioritized build order** lives in
 CLIENT_GAP_ANALYSIS.md §5 and the CLIENT.md §8 roadmap, not here.
 
 | REQ | Status | Notes |

@@ -12,13 +12,23 @@ Vendor-facing rows are inherently perishable — a competitor can change a plan 
 
 **Pumble sourcing (researched 2026-07-26).** Pumble is a Slack-shaped SaaS team chat product from COING (the makers of Clockify and Plaky, sold together as the CAKE.com bundle). Its column below is built from Pumble's own pricing page, feature pages, and help centre, cross-checked against independent reviews (Cloudwards) and comparison directories (Capterra, GetApp, TrustRadius). **Vendor-authored comparison content was treated as a claim, not evidence** — where Pumble's marketing and its own help centre disagreed, the help centre won. Two such corrections are recorded in §7.
 
-> **Reconciled 2026-07-30.** Much of what this document calls thin has since
-> shipped: group DMs, custom emoji, avatars, user-defined sidebar sections, the
-> global notification default, channel visibility, two-pane preferences with a
-> colour scheme and text size, and a custom composer. [STATUS.md](./STATUS.md) is
-> the authoritative per-requirement view; the rows here are kept for the *analysis*
-> — why each gap mattered — rather than as a live tracker. Where the two disagree,
-> STATUS.md is right.
+> ## ⚠️ Read this before the tables
+>
+> **The §2 category tables are a snapshot of 2026-07-26/28 and are NOT a live
+> tracker.** They are kept for the *analysis* — why each gap mattered, and how we
+> compare to Slack and Pumble — not as a status source. A great many cells marked
+> ❌ or 🔸 for Win32 have since shipped: group DMs, custom emoji, avatars, custom
+> status, mute, star, user-defined sections, mark-unread, forward, copy-link and
+> permalinks, search paging and operators, the active-session list, invite
+> management, the global notification default, channel topic/rename/archive/
+> visibility, the activity feed, saved items, the workspace-wide files view,
+> N-concurrent workspaces, two-pane preferences with a colour scheme and text
+> size, and a custom DirectWrite composer.
+>
+> **[STATUS.md](./STATUS.md) is the authoritative per-requirement view. Where the
+> two disagree, STATUS.md is right.** The sections that *are* maintained here are
+> **§4** (what each client is still missing) and **§5** (build order), both
+> rewritten 2026-07-30 against the code and a running client.
 
 ## 1. Legend
 
@@ -325,7 +335,7 @@ Vendor-facing rows are inherently perishable — a competitor can change a plan 
 
 | Feature / Surface | Slack | Pumble | TUI | Win32 | Gap notes & priority |
 |---|---|---|---|---|---|
-| Multi-workspace switcher rail | ✅ | ✅ | ✅ remembered+open, unread, per-ws state | 🟡 rail switcher built (single-client stop/reconnect; no N-concurrent, no background unread) | Win32 has the switcher UI; the remaining delta is the TUI's N-concurrent-client model. **P1** |
+| Multi-workspace switcher rail | ✅ | ✅ | ✅ remembered+open, unread, per-ws state | ✅ **N-concurrent** (WIN-29): up to `WS_MAX` clients held, all ticked every frame, background unread as an "N elsewhere" rail badge | Parity reached 2026-07-30; a no-argument launch signs in to every remembered workspace holding a token (WIN-57). **—** |
 | Add workspace | ✅ | ✅ | 🟡 | 🟡 "Add a workspace…" in the switcher | **P1** |
 | Workspace switch by number | ✅ Cmd+1..9 | ❔ | 🟡 | ❌ | **P2** |
 | Reconnect / auto-reconnect | ✅ | ✅ | ⚪ stub | ✅ auto-reconnect + banner + "Retry now" + live countdown | Win32 done (WIN-1/WIN-55). **P1 (TUI)** |
@@ -357,35 +367,40 @@ Vendor-facing rows are inherently perishable — a competitor can change a plan 
 
 Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by user impact.
 
-1. **Search results** — *Win32: mostly done* — a result click jumps to the exact message and flashes it (WIN-3), with an in-overlay query box and resolved display names. *Remaining:* term highlighting, and **paging is blocked on the wire** — `SEARCH_RESULTS` carries `truncated` but no cursor (WIN-38), so the 128-result cap cannot be paged past. The **TUI** list is still read-only, non-navigable and shows raw `userNNN`. **P0 (TUI) / P1 (paging)**
+*Rewritten 2026-07-30. Almost every Win32 entry here has closed; what survives is
+mostly the TUI column and two cross-client gaps.*
 
-2. **Win32 error/failure surface** — **closed (WIN-1 + WIN-2).** A toast stack carries in-session failures (verified against a live `send rate exceeded`), a connection banner carries the reason plus Retry now, and the rebuilt sign-in view reports DNS and auth failures inline and retryably. *Remaining:* the banner's countdown is static text rather than ticking (WIN-55). —
+1. **Search results** — *Win32: done.* A result click jumps to the exact message and flashes it (WIN-3), with an in-overlay query box, resolved display names, term tinting, **keyset paging** (WIN-38) and `from:`/`in:`/`has:`/date **operators** (WIN-39). The **TUI** list is still read-only, non-navigable and shows raw `userNNN`. **P0 (TUI)**
 
-3. **Settings / Preferences** — *Win32: done* (WIN-9/WIN-26 — appearance incl. dark/light/system, time format, day dividers, members pane, desktop notifications, quick reactions). *Remaining:* the **TUI** is still config-file-only with no in-app toggles. **P1 (TUI)**
+2. **Win32 error/failure surface** — **closed** (WIN-1 + WIN-2 + WIN-55). Toast stack, connection banner with the reason and a **ticking** countdown plus Retry now, and an in-window sign-in reporting DNS and auth failures inline and retryably. —
 
-4. **DND / notification schedule (both)** — *Today:* Win32 has a real dialog (an on/off check plus From/To fields, validated, midnight-crossing noted) but still typed `HH:MM` rather than a time picker; the TUI parses raw text. Neither shows a schedule, and DND is invisible to others. Richer schedules are REQ-136, unbuilt. *Done:* pickers, weekday schedules, and a DND indicator in presence. **P1**
+3. **Settings / Preferences** — *Win32: done* (WIN-9/26/78 — two panes, explicit Save/Cancel, theme + colour scheme + text size + zoom, applied live). *Remaining:* the **TUI** is still config-file-only with no in-app toggles. **P0 (TUI)**
 
-5. **Audit log (both)** — *Today:* read-only, no scroll/paging/filter/search/export; TUI ~22-row cap, Win32 offset fixed at 0. *Done:* paged/scrollable view with actor/action/date filters and export. **P1**
+4. **DND / notification schedule (both)** — Win32 has a real dialog (on/off check plus validated From/To fields, midnight-crossing noted) but still typed `HH:MM` rather than a time picker; the TUI parses raw text. Neither shows a weekday schedule, and DND is invisible to others. Richer schedules are REQ-136, unbuilt on the engine. **P1**
 
-6. **Webhooks overlays (both)** — *Today:* read-only lists; TUI still shows a STALE slash-command hint and CANNOT delete (core supports delete); Win32 delete is via MessageBox with no enable/disable/rotate/reveal/date and no scroll. *Done:* full CRUD (create/reveal/rotate/enable-disable/delete), metadata columns, scroll. TUI delete is a quick core-backed win. **P1**
+5. **Audit log** — *Win32: mostly done* (WIN-19 — scrolls, pages on reaching the bottom with the oldest stamp as cursor, family filter chips). *Remaining:* the filter is **client-side over what has been paged in**, so it narrows the view rather than re-querying; actor/action filters need a server-side parameter. No export. The **TUI** is still read-only with a ~22-row cap and no paging. **P2 (Win32) / P1 (TUI)**
 
-7. **Invite dialog (both)** — *Today:* TUI hardcodes MEMBER role with token in a hard-to-see banner; Win32 is member/admin only with token via MessageBox; neither has expiry/target/pending-list/revoke. *Done:* role + expiry + target selection, a pending-invites list with revoke, and a copyable token/link surface. **P1**
+6. **Webhooks overlays** — *Win32: done* (WIN-23/48 — scrolling, an active/disabled chip, and per-row Disable/Enable · Rotate · Delete; "reveal" is struck as *impossible*, since only the token's SHA-256 is stored, and the pane says so in words rather than offering a button that cannot work). The **TUI** still shows a stale slash-command hint and **cannot delete** despite the core supporting it — a quick core-backed win. **P1 (TUI)**
 
-8. **Thread overlays (both)** — *Today:* TUI is a read-only dump with no per-reply actions; Win32 has a working reply composer but replies are read-only (no react/edit/delete) and there's no scrollbar. *Done:* full per-reply actions inside the thread + scrollbar. **P1**
+7. **Invite dialog** — *Win32: done* (WIN-22/46 — Admin → Invites with role, an expiry **countdown**, who minted it, and Revoke behind a confirm; tokens land on the clipboard the moment they are shown and say they will not be shown again). The **TUI** still hardcodes the MEMBER role and puts the token in a hard-to-see banner, with no pending list or revoke. **P1 (TUI)**
 
-9. **Profile / account editor (both)** — *Today:* the TUI is a read-only viewer; Win32 has a purpose-built dialog each for display name and password (with a confirm field, WIN-20). Neither edits avatar/email/timezone/status — **because those fields do not exist yet** (REQ-240/241, unbuilt). *Done:* the fields first, then an editor. **P1**
+8. **Thread overlays (both)** — Win32 has a reply composer, a scrollbar and the **full message menu on a reply** (WIN-15). The **TUI** is still a read-only dump with no per-reply actions and no scroll. *Remaining for both:* nothing on the Win32 side; there are no nested threads by design (REQ-060). **P1 (TUI)**
 
-10. **New-channel dialog (both)** — *Today:* name-only (TUI prompt / Win32 stub); no privacy, topic, or member step. *Done:* full create flow (visibility toggle, topic/description, add-members). **P1**
+9. **Profile / account editor** — *Win32: done* (WIN-20/47/53 — display name and password each with a purpose-built dialog and a confirm field; title, timezone, avatar image and custom status with expiry all landed with migration 0027). The **TUI** is still a read-only viewer of your own identity and cannot view a peer at all. **P1 (TUI)**
 
-11. **Win32 sidebar** — *Today:* flat list, hides unnamed channels, 512 cap, no DM section, no sections/collapsing/search/starred/muted. *Done:* grouped Public/DM/Private sections (TUI-parity), search box, mute/star affordances, load-more. **P0**
+10. **New-channel dialog (both)** — Win32 takes name + public/private (`create_channel_ex`, WIN-30) and the topic is set afterwards from the About tab; neither client offers a topic or an add-members step *in the create flow*. TUI is name-only. **P2**
 
-12. **Storage report (Win32)** — *Today:* read-only KV dump, no refresh/actions/history (TUI's is RICH by comparison). *Done:* match TUI richness + refresh. **P2**
+11. **Win32 sidebar** — **closed** (WIN-5/6/41/83). Starred, user-defined sections, Channels and DMs, each with its own sort/filter/collapse, scrolling, and a find box. An expanded empty section says so. **—**
 
-13. **Members/roster panel** — *Win32: done* — per-channel roster with a header count chip and profile-on-click (REQ-031/ARCH-91). *Remaining:* search and scrolling in the pane; and the **TUI** still shows the workspace roster. **P1 (TUI)**
+12. **Storage report** — **closed** (WIN-24). Grouped Disk / Policy / Reclaimed like the TUI, free-of-total on one line, pressure and evictions flagged in red, and a Refresh button. **—**
 
-14. **Win32 "six-forms-in-one-prompt" anti-pattern** — **closed (WIN-21).** Every flow that used the generic single-line prompt now has a typed multi-field modal (`form_dialog`), and `text_prompt` is deleted. **—**
+13. **Members/roster panel** — *Win32: done* — per-channel roster with a header count chip, an inline role glyph and profile-on-click (REQ-031/ARCH-91). *Remaining:* search and scrolling in the pane; and the **TUI** still shows the workspace roster beside a channel name. **P1 (TUI)**
 
-15. **Roster overlay (TUI)** — *Today:* THIN and effectively UNREACHABLE (no input path). *Done:* wire an entry point or remove. **P2**
+14. **Win32 "six-forms-in-one-prompt" anti-pattern** — **closed (WIN-21/77).** Every flow that used the generic single-line prompt has a typed multi-field modal (`form_dialog`), `text_prompt` is deleted, and five dialog idioms became one. **—**
+
+15. **Roster overlay (TUI)** — THIN and effectively UNREACHABLE (no input path). Wire an entry point or remove it. **P2**
+
+16. **Avatar consistency (Win32)** — *found 2026-07-30.* One user renders in two different colours (rail vs everywhere else), and three sites draw avatars without the shared helper so an uploaded photo never appears there. WIN-85/86. **P2**
 
 ---
 
@@ -393,36 +408,37 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 
 ### Win32 GUI — missing
 
-*Rewritten 2026-07-28 against the code; entries closed since the original audit are listed at the end rather than deleted, so the record stays honest.*
+*Rewritten 2026-07-30 after an adversarial review: the smoke suite's 116 invariants plus hand-driven probing of the surfaces it does not reach. **Nearly everything this section used to list has shipped.** What follows is what is actually left.*
 
-- **N-concurrent-workspace model** — the rail switcher UI exists, but Win32 stop/reconnects a **single** client; no holding N clients at once with background unread. **P1**
-- **Mark-unread** (REQ-235); **mute channel/DM** (REQ-137); **star/favourite** (REQ-234). **P1**
-- **Copy-link / permalink and forward** on messages — permalinks are REQ-232, unbuilt. **P1**
-- **Search paging, filters, term highlight** — paging is blocked on the wire: `SEARCH_RESULTS` carries `truncated` but no cursor (WIN-38). In-overlay input and jump-to-message are built. **P1**
-- **Rich text / formatting toolbar** (REQ-220) — blocked on an ARCH decision about the markup dialect. **P2**
-- **Avatar upload, email, timezone, job title** in the profile editor (REQ-240/241). **P1**
-- **Custom status** (emoji + text, REQ-122/240) — presence is online/away only. **P1**
-- **Active-session list** — revoke-all *is* built ("Sign out everywhere"); enumerating sessions is not (REQ-182 has no list op). **P2**
-- ~~**Global (workspace-default) notify level** (REQ-134)~~ — **DONE**, engine and Win32. Still open: **keyword / priority-people alerts** (REQ-135) and a **notification schedule** richer than one daily DND window (REQ-136), both unbuilt on the engine. **P1**
-- **DND configuration surface** — the value is displayed, but it is set through a raw `HH:MM-HH:MM` prompt with no picker. **P1**
-- **Audit-log paging/filtering** — read-only, offset fixed at 0. **P2**
-- **Webhook enable/disable/rotate/reveal**, and dates in the list. **P2**
-- **Invite depth** — member/admin only, token shown via `MessageBox`, no expiry/target/pending list. **P1**
-- **Storage report depth** — read-only KV dump, no refresh or actions (the TUI's is richer). **P2**
-- **Draft persistence across restarts** — drafts are per-channel and in memory only; a stateless client (ARCH-88) cannot persist them locally, so this needs server storage. **P2**
-- **Group DMs** (REQ-056), **self-DM surface** (REQ-055 exists on the engine, unsurfaced), **browse-channels directory** (REQ-038). **P2**
-- **Accessibility / keyboard-only operation** (REQ-269) — recorded, unimplemented, needs an ARCH decision. **P1**
+- **Accessibility / keyboard-only operation** (REQ-269) — the client answers **no `WM_GETOBJECT` at all** (verified: zero occurrences), so a screen reader sees one blank window. The ordinary keyboard paths work (composer, completion, Alt+Up/Down, Ctrl+K, Ctrl+/, F6); the accessibility *surface* does not exist. A self-drawn UI gets nothing for free. **P1**
+- **Rich text / formatting toolbar** (REQ-220) — no markup parsing anywhere. Unblocked on the rendering side by the custom composer (WIN-80/ARCH-98), still blocked on an ARCH decision about the dialect. Gates snippets (REQ-226). **P2**
+- **Draft persistence across restarts** — drafts are per-channel and in memory (24 slots); a stateless client (ARCH-88) cannot persist them locally, so this needs server storage. **P2**
+- **Notification schedule and keyword alerts** — DND is one daily window set through typed `HH:MM` fields (validated, but no time picker and no weekday schedule, REQ-136); keyword / priority-people alerts (REQ-135) are unbuilt on the engine, and cheap now that @mentions built the match→notify path. **P1**
+- **Two avatar-consistency defects, found during the 2026-07-30 review** (WIN-85/86): the signed-in user's initial is drawn in the theme's accent in the rail and in the identity palette everywhere else, so one person shows two colours; and three sites (`draw_dm_list`, `draw_dm_compose`, `draw_activity_list`) draw avatars without the shared helper, so an uploaded photo never appears in the DM list, the DM composer or the Activity feed. **P2**
+- **Audit-log filtering is client-side** over what has been paged in — it narrows the view rather than re-querying by family. Actor/action filters need a server-side query parameter. Paging and scrolling *are* built (WIN-19). **P2**
 
-**Closed since the original audit** (kept for the record): **activity feed** (REQ-139) and **saved items** (REQ-231), which were the last two rail stubs · **channel topic, rename and archive** with the About tab (REQ-034/035/036, WIN-34–36) · error/toast surface and the connection banner with a live countdown (WIN-1/WIN-55) · sign-in rebuilt in-window with inline errors, remember-me and retry (WIN-2) · Preferences hub with theme / 12-24h / panel toggles (WIN-9/WIN-26) · view another user's profile (WIN-10) · composer emoji picker over the shared ~179-emoji catalogue (WIN-8) · `@`/`#`/`:` autocomplete (`oc_complete`) · Ctrl+K command palette · sidebar sections, collapsing, scrolling and a "Find a conversation" filter · DM section and rail DMs view · OS tray balloon (WIN-18, delivery still visually unconfirmed) · notification-prefs review/edit pane · jump-to-unread and the "New" divider (WIN-14) · inline image thumbnails + lightbox · signup / invite redeem (WIN-32) · keyboard-shortcut reference · display-name and password dialogs (WIN-20) · channel member management (WIN-31) · **@mentions** (REQ-221) · **pins** (REQ-230) · **channel Files tab and per-channel roster** (REQ-143/031, WIN-37).
+**Closed since the original audit.** Everything below was on this list and is now built and verified: N-concurrent workspaces with background unread (WIN-29) · mark-unread (235) · mute (137) · star + user-defined sections (234) · copy-link, permalinks and jump-in-context (232/ARCH-96) · forward (057) · search paging with a keyset cursor and `from:`/`in:`/`has:`/date operators (WIN-38/39) · avatar upload, title and timezone (240/241) · custom status with expiry (122) · the active-session list (182) · the global notify default (134) · invite management with expiry, pending list and revoke (WIN-46) · webhook enable/disable/rotate (WIN-48) · storage report with grouping and refresh (WIN-24) · group DMs (056) · self-DM (055) · browse-channels directory (038) · custom emoji (072) · activity feed (139) · saved items / Later (231) · the workspace-wide Files view with an exact channel census (WIN-50/82) · channel topic, rename, archive and visibility (034/035/036/036a) · error/toast + connection banner with a live countdown (WIN-1/55) · in-window sign-in with inline errors (WIN-2) · Preferences in two panes with theme, colour scheme, text size and zoom (WIN-9/26/78) · other-user profile viewer (WIN-10) · emoji picker and `@`/`#`/`:` autocomplete (WIN-7/8) · Ctrl+K palette (WIN-11) · sidebar sections, scrolling and filter (WIN-5/6) · OS tray balloon (WIN-18, rendering still visually unconfirmed on this host) · notification-prefs pane (WIN-12) · unread divider and jump (WIN-14) · inline images + lightbox (WIN-17) · signup / invite redeem (WIN-32) · shortcut reference (WIN-25) · display-name and password dialogs (WIN-20) · channel member management (WIN-31) · @mentions (221) · pins (230) · channel Files tab and per-channel roster (143/031, WIN-37) · the custom DirectWrite composer and self-drawn context menus (WIN-79/80).
 
 ### TUI — missing
 
-*The TUI reached every engine feature on the wire until 2026-07-28; it is now **four behind**, listed first.*
+*The TUI reached every engine feature on the wire until 2026-07-28. As of
+2026-07-30 it is behind by **more than twenty** — not the "four" this line said
+until the review. Every one already exists in the app-core, so this is catch-up,
+not new construction; [STATUS.md](./STATUS.md)'s summary carries the same list
+grouped by area, and §5 above proposes an order.*
 
 - **@mentions** (REQ-221) — it autocompletes `@name` but does not highlight a mention or act on the MENTIONS notify level. **P1**
 - **Pins** (REQ-230) — no pin/unpin action and no pins list. **P1**
+- **Saved items / Later** (REQ-231) — none. **P1**
 - **Channel Files listing** (REQ-143) — `LIST_FILES` is on the wire and unused. **P1**
 - **Per-channel member roster** (REQ-031 `LIST_MEMBERS`) — its roster is still workspace-wide. **P1**
+- **Mute, star, user-defined sections** (REQ-137/234) — none. **P1**
+- **Mark-unread and the unread divider / jump** (REQ-235/236) — markers only. **P1**
+- **Group DMs** (REQ-056) and **self-DM** (REQ-055). **P2**
+- **Permalinks / copy-link and jump-in-context** (REQ-232). **P1**
+- **Search paging and operators** (WIN-38/39 — `shared/searchq.c` is shared, so this is parsing the same predicates the GUI already does). **P1**
+- **Active-session list** (REQ-182). **P2**
+- **Theme / appearance selection** (REQ-262). **P2**
 - **Delete webhook** (core supports it; not surfaced). **P1**
 - **Log-out-everywhere / revoke sessions** (core supports `OC_LOGOUT_ALL`; Win32 surfaces it, the TUI does not). **P2**
 - **In-app settings / config editor** (file-only; no theme/12-24h/panel toggles). **P0**
@@ -447,58 +463,50 @@ Surfaces that *exist* in TUI and/or Win32 but are thin/stub/read-only. Ranked by
 
 ---
 
-## 5. Recommended Build Order for Win32 (current focus) — top 10 by impact
+## 5. Build order — Win32 is done; the TUI is now the gap
 
-> **The execution list lives in [WIN32_BACKLOG.md](./WIN32_BACKLOG.md)** — every
-> gap below, numbered `WIN-1`…`WIN-70`, split by whether it is buildable today or
-> blocked on daemon work. This section stays the *rationale* for the ordering.
+> **The open execution list lives in [WIN32_BACKLOG.md](./WIN32_BACKLOG.md)**,
+> which is the open items only. This section stays the *rationale* for ordering.
 
-**Rewritten 2026-07-28.** The original top 10 is essentially spent: items 1, 4, 5,
-6 and 10 are done outright, 2 is done except paging (blocked on the wire), 3 is
-done except mute/star, and 7 is half done (pin ✅, permalink/mark-unread ❌).
-What follows replaces it.
+**Rewritten 2026-07-30, after an adversarial review.** The previous top-10 is
+**spent — all ten are done**, including the three it called blocked: search
+paging shipped with a keyset cursor (WIN-38), permalinks with fetch-around
+context shipped (ARCH-96), and the N-concurrent-workspace model shipped (WIN-29).
+Win32 no longer has a depth backlog worth ordering; what remains there is four
+small items and two ARCH-blocked ones (§4).
 
-**The pattern that now sets the order:** the remaining Win32 gaps are mostly
-*daemon* features, and the client half is small. REQ-221 (@mentions), REQ-230
-(pins) and REQ-143/031 (files + channel roster) each took a day of engine work and
-a fraction of that in the GUI. Anything below that says "needs REQ-x" should be
-read as "build the engine feature; the Win32 work is the easy part."
+**The pattern that set the old order still holds and is worth keeping:** where a
+gap was really a *daemon* feature, the client half was small. REQ-221 (@mentions),
+REQ-230 (pins) and REQ-143/031 (files + channel roster) each took about a day of
+engine work and a fraction of that in the GUI. Read "needs REQ-x" as "build the
+engine feature; the client work is the easy part."
 
-1. ~~**Channel management — rename, topic, archive**~~ **Done** (REQ-034/035/036,
-   ARCH-93) — and it added the **About** tab, completing the channel surface.
-2. **Activity feed / notification inbox** (REQ-139). Fills the rail's Activity
-   stub, and mentions finally make it meaningful — a mention you can only see by
-   already looking at the channel is half a feature. Migration 0021 indexes
-   mentions by user, so the mentions half is a query, not new state. **P1**
-3. **Permalinks + jump-to-message-in-context** (REQ-232). Unblocks copy-link, and
-   fixes a live limitation: clicking a pin only jumps if that message happens to be
-   in loaded history. Needs a fetch-around-an-id backfill mode. **P1**
-4. **Search paging, filters and term highlight.** Blocked on the wire —
-   `SEARCH_RESULTS` carries `truncated` but no cursor (WIN-38), so this starts with
-   a protocol change. **P1**
-5. **Mark-unread, mute, star** (REQ-235/137/234). Three small engine features that
-   together make the sidebar behave the way people expect. **P1**
-6. **Profile depth + custom status** (REQ-240/241/122). Avatar, email, timezone,
-   title; presence is still online/away only. **P1**
-7. **Notification depth** — ~~workspace-default level (REQ-134, done)~~, keyword and
-   priority-people alerts (REQ-135), a real schedule (REQ-136), and a DND picker
-   instead of a raw `HH:MM-HH:MM` prompt. REQ-135 is cheap now: it is the same
-   match→notify path @mentions built. **P1**
-8. **Rich text** (REQ-220). Biggest single feature left, and still needs an ARCH
-   decision on the markup dialect before any code. It also gates the composer
-   toolbar and snippets (REQ-226). **P2**
-9. **Accessibility / keyboard-only operation** (REQ-269). Recorded, unimplemented,
-   needs an ARCH decision — and gets more expensive the longer the UI grows. **P1**
-10. **N-concurrent workspaces.** The rail switcher exists but stop/reconnects a
-    single client, so background unread across workspaces does not work. **P1**
+**The order that matters now is the TUI's**, because the two frontends have
+swapped places: the TUI was the reference client and is now behind by more than
+twenty features, every one of which already exists in the app-core. Suggested
+sequence, cheapest-and-most-missed first:
 
-*Two cheap wins outside the ten:* the rail's **Files** stub can be filled almost
-for free — `LIST_FILES` already accepts `channel_id 0` for "every channel I can
-read" — and **saved items** (REQ-231) fills the **Later** stub with a per-user
-table that is deliberately the mirror image of pins (ARCH-90).
+1. **@mentions, pins, saved items** (221/230/231) — the message-level features
+   people notice hourly. All three are model state the core already holds.
+2. **The per-channel member roster** (031) — the TUI still shows the *workspace*
+   roster beside a channel name, which is wrong for any workspace with more than
+   one channel. `LIST_MEMBERS` is on the wire and unused.
+3. **Channel management** — topic, rename, archive, visibility, browse/join
+   (034/035/036/036a/038). A block of one op each.
+4. **The sidebar** — mute, star, user-defined sections, mark-unread, the unread
+   divider (137/234/235/236). These are what make a sidebar feel correct.
+5. **The activity feed** (139) and the **files listing** (143) — two panes over
+   queries that already exist.
+6. **In-app preferences** (261) and **theme selection** (262) — the TUI is still
+   config-file-only, which §3 rates its single worst remaining surface (P0).
+7. **Profile depth and custom status** (240/241/122), **group DMs** (056),
+   **custom emoji** (072), **forward and copy-link** (057/232).
+8. **The small correctness items:** destructive confirmations (delete message,
+   remove user have none), webhook *delete* (the core supports it), and
+   log-out-everywhere.
 
-*Follow-ups just behind: full webhook CRUD, paged audit log, richer invite dialog,
-per-reply thread actions, group DMs, browse-channels directory.*
+*Permanently exempt for the TUI:* inline image rendering (142) — ARCH-75 renders
+no graphics — and screenshare (161).
 
 ---
 

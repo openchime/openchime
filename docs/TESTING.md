@@ -256,9 +256,44 @@ real time three times in a single day before the guard existed.
 skips the build and `OC_DRIVE_NO_DAEMON=1` leaves the daemon alone — for when a
 mismatched pair is the thing under test, such as the version-reject path.
 
+> **Run the smoke against an isolated daemon.** The staleness check keeps a
+> daemon already listening on the dev port when its start time postdates the
+> `openchimed` binary — which means an *unrelated* daemon on that port is adopted
+> silently. During the 2026-07-30 review it bound to a nine-hour-old daemon
+> holding real workspace data and reported confident failures for group DMs and
+> `@`-completion, because the suite's fixture users did not exist there. Pass
+> `OC_DEV_PORT` and `OC_DEV_DIR` to get a clean one:
+>
+> ```
+> OC_DEV_PORT=9500 OC_DEV_DIR=/tmp/oc-smoke scripts/gui_smoke.sh
+> ```
+>
+> The run also leaves its `smokevis` / `smokedrafts` channels and probe messages
+> behind in whatever workspace it touched. Tracked as WIN-88.
+
 ## Known flakiness
 
-*None currently known.*
+**`scripts/gui_smoke.sh` is flaky (WIN-87).** Five consecutive runs against a
+clean daemon gave 2 failures, clean, clean, 2 failures, 4 failures — with the
+failing assertions *moving between runs*: `Ctrl+=` zoom, `Ctrl+F`, `Ctrl+/`, and
+a cascade through the composer section when a `type`/`chars` has not landed
+before the next assertion reads the field.
+
+**Every failure observed was verified by hand to be a harness artifact, not a
+product defect.** Driven deterministically, `Ctrl+=` steps zoom 0→1→2→3 with the
+font scale tracking 1.000→1.080→1.160→1.240 and `Ctrl+-`/`Ctrl+0` are correct;
+`Ctrl+F` and `Ctrl+/` open on a fresh client; the `@`-completion accepts on Tab.
+
+The cause is that the suite settles by sleeping fixed intervals (0.3–1.5 s)
+rather than waiting on the state it is about to assert — the same class of bug
+as the resolved `last_error` case below, and the same fix: wait on a condition,
+not a clock. Until then: **a red run is not evidence of a regression until it
+reproduces deterministically**, and a green run is worth slightly less than its
+116 checks suggest.
+
+*One caveat when reading a failure message:* the dump's `comp=` field is the
+**IME composition length**, not the autocomplete popover — the dump exposes no
+popover state at all, so `comp=0` beside a completion failure means nothing.
 
 **Resolved 2026-07-29 — the one intermittent assertion.** `test_client_core`'s
 live two-client section failed occasionally on

@@ -91,25 +91,30 @@ covers live messaging with history backfill, reactions, edit/delete, typing,
 threads, search, channel + DM management, roster + presence, who-reacted,
 notification prefs + DND, admin (roles/invite/remove), webhooks, attachments,
 storage and audit overlays, multiple workspaces, and logout. It reached nearly
-every capability the app-core exposes until the July 2026 engine work; the
-exceptions are now webhook *deletion*, log-out-everywhere, and the four features
-added since — **@mentions, pins, the channel files listing and the per-channel
-member roster** — which are surfaced only in the Windows GUI. Some frames the
+every capability the app-core exposes until the July 2026 engine and GUI work;
+it is now behind the Windows GUI by **more than twenty** features — among them
+@mentions, pins, saved items, the channel files listing, the per-channel member
+roster, channel topic/rename/archive, mute, star, mark-unread, the activity feed,
+in-app preferences and themes — plus webhook *deletion* and log-out-everywhere.
+All of them already exist in the app-core, so closing the gap is TUI work alone;
+the list and a proposed order are in
+[docs/CLIENT_GAP_ANALYSIS.md](docs/CLIENT_GAP_ANALYSIS.md) §4–§5. Some frames the
 daemon speaks reach no client at all yet — see [docs/CLIENT.md](docs/CLIENT.md)
 §3. The app-core also has a local
 SQLite store, so it reconnects silently across restarts, shows cached history
 offline, and queues sends made while disconnected (REQ-100/101/102).
 
-A native **Windows GUI** (Win32 + Direct2D/DirectWrite, pure C — ARCH-82) is in
-progress: every tracked engine feature is reachable, and it now *leads* the TUI
-on @mentions, pins, the channel Files tab and the per-channel roster. The one
-partial is multiple workspaces (the rail switcher is built; holding N clients at
-once is not). The depth work is
-a numbered backlog in
-[docs/WIN32_BACKLOG.md](docs/WIN32_BACKLOG.md), with the four-way surface
-analysis behind it in
-[docs/CLIENT_GAP_ANALYSIS.md](docs/CLIENT_GAP_ANALYSIS.md). GTK (Linux), AppKit
-(macOS), a web DOM UI, and mobile follow.
+A native **Windows GUI** (Win32 + Direct2D/DirectWrite, pure C — ARCH-82) is the
+most complete client: every tracked engine feature is reachable, its numbered
+depth backlog is closed, and it now *leads* the TUI by more than twenty features.
+An adversarial review on 2026-07-30 — the 116-invariant smoke suite plus
+hand-driven probing — found no defect in the closed backlog; what remains is a
+short open list in [docs/WIN32_BACKLOG.md](docs/WIN32_BACKLOG.md) (two
+avatar-consistency defects, a flaky test harness, one unreproduced crash, and
+rich text + accessibility, both blocked on an ARCH decision). The four-way
+surface analysis behind it is
+[docs/CLIENT_GAP_ANALYSIS.md](docs/CLIENT_GAP_ANALYSIS.md). Next is **TUI
+catch-up**, then GTK (Linux), AppKit (macOS), a web DOM UI, and mobile.
 
 ## Local Docker environment
 

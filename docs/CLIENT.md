@@ -807,25 +807,31 @@ to change a DirectWrite size, so any preference that moves the scale must call
   history, offline outbox, workspace book), **multiple workspaces** (REQ-012–015),
   DNS workspace resolution (REQ-010/011), the local **Sign in** dialog, and the
   **Windows TUI** (ARCH-81). See §5–§6.
-- **Next — Windows GUI depth (P0).** The Win32 GUI surfaces every engine feature
-  (ARCH-82), and the original depth list is now largely spent: the error/toast +
-  connection surface (**REQ-263**), search-to-matched-message (REQ-080), the
-  sidebar overhaul (**REQ-267**), composer autocomplete + emoji picker
-  (**REQ-265**), the preferences hub (**REQ-261**), the other-user profile viewer
-  (**REQ-266**), the command palette (**REQ-260**) and inline image rendering
-  (**REQ-142**) are all built. What remains, in
-  [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5 order: channel
-  rename/topic/archive (REQ-034/035/036), the activity feed (**REQ-139**),
-  permalinks and jump-in-context (**REQ-232**), search paging (blocked on a wire
-  cursor), mark-unread/mute/star (REQ-235/137/234), profile depth (REQ-240/241),
-  notification depth (REQ-134/135/136), rich text (**REQ-220**), accessibility
-  (**REQ-269**), and the **N-concurrent-workspace model** (REQ-012–015 — the rail
-  switcher UI is built; holding N clients at once with background unread is not,
-  as the TUI does).
-- **Next — TUI catch-up (P1).** For the first time the TUI is *behind*: @mentions
-  (REQ-221), pins (REQ-230), the channel files listing (REQ-143) and the
-  per-channel member roster (REQ-031) are all on the wire and in the app-core, and
-  none is surfaced in the terminal client.
+- **Done — Windows GUI depth.** The Win32 GUI surfaces every engine feature
+  (ARCH-82) and its depth backlog is **closed**: the error/toast + connection
+  surface (**REQ-263**), search with jump-to-match, keyset paging and operators
+  (REQ-080), the sidebar overhaul (**REQ-267**), composer autocomplete + emoji
+  picker (**REQ-265**), the preferences hub (**REQ-261**), the other-user profile
+  viewer (**REQ-266**), the command palette (**REQ-260**), inline images
+  (**REQ-142**), channel rename/topic/archive/visibility
+  (REQ-034/035/036/036a), the activity feed (**REQ-139**), permalinks and
+  jump-in-context (**REQ-232**/ARCH-96), mark-unread/mute/star
+  (REQ-235/137/234), profile depth with avatars and custom status
+  (REQ-240/241/122), the global notify default (REQ-134) and the
+  **N-concurrent-workspace model** (REQ-012–015, WIN-29) are all built. An
+  adversarial review on 2026-07-30 confirmed it. What is left is a short open
+  list — two avatar-consistency defects, a flaky smoke harness, one unreproduced
+  crash, and the ARCH-blocked pair of rich text (**REQ-220**) and accessibility
+  (**REQ-269**) — in [WIN32_BACKLOG.md](./WIN32_BACKLOG.md).
+- **Next — TUI catch-up (P0).** The two frontends have swapped places: the TUI was
+  the reference client and is now behind the GUI by **more than twenty** features,
+  every one of which already exists in the app-core — @mentions (REQ-221), pins
+  (REQ-230), saved items (REQ-231), the channel files listing (REQ-143), the
+  per-channel roster (REQ-031), channel management (REQ-034/035/036/038), mute and
+  star (REQ-137/234), mark-unread (REQ-235), the activity feed (REQ-139), in-app
+  preferences and themes (REQ-261/262), profile depth and custom status
+  (REQ-240/241/122), group DMs (REQ-056), custom emoji (REQ-072), and more. The
+  proposed order is [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5.
 - **Next — auth completeness.** The **OIDC browser flow + PKCE + loopback
   courier** — the one remaining piece of REQ-020 and what makes SSO usable at all
   (there is no SAML by design, **REQ-027**); plus first-run onboarding
