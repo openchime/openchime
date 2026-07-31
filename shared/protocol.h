@@ -199,6 +199,12 @@ typedef enum {
     OC_MSG_REGISTER_DEVICE_TOKEN   = 0x00B0, /* C->S, register a mobile push token (REQ-132) */
     OC_MSG_UNREGISTER_DEVICE_TOKEN = 0x00B1, /* C->S, drop a push token (logout / token change) */
     OC_MSG_DEVICE_TOKEN_ACK        = 0x00B2, /* S->C, register/unregister acknowledged */
+    /* S->C, to the SENDER ONLY: names in the message that are people here but
+     * are not in this channel, so the mention notified nobody (REQ-287). Not an
+     * ERROR frame: nothing failed, the message was accepted and stored — it is a
+     * notice about a consequence the sender cannot otherwise see, because the
+     * highlight is syntactic and renders the same either way. */
+    OC_MSG_MENTION_UNRESOLVED      = 0x00B3,
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -523,6 +529,27 @@ typedef struct { uint64_t channel_id; uint32_t count; } oc_pins;
  * disk to reconstruct (ARCH-88). */
 typedef struct { uint64_t channel_id; } oc_list_members;
 typedef struct { uint64_t channel_id; uint64_t user_id; uint8_t role; uint64_t joined_at; } oc_member_entry;
+
+/* REQ-287. One frame per SEND, listing every mention that resolved to a real
+ * person who is not in this channel. `can_add` is the daemon's answer to "may
+ * the sender fix this here" — a DM has nobody to add, an archived channel takes
+ * no writes — so the client offers an action only when there is one, rather than
+ * discovering that by failing. `is_private` travels because the remedy differs:
+ * adding to a private channel discloses its history (cf. REQ-036a), and the
+ * client has to say so before doing it. */
+enum { OC_UNRESOLVED_MAX = 8 };
+typedef struct {
+    uint64_t user_id;
+    char     name[OC_MAX_DISPLAY_NAME + 1];
+} oc_unresolved_mention;
+typedef struct {
+    uint64_t channel_id;
+    uint64_t message_id;
+    uint8_t  can_add;      /* the sender may add people to this channel */
+    uint8_t  is_private;   /* adding discloses history */
+    uint16_t count;
+    oc_unresolved_mention who[OC_UNRESOLVED_MAX];
+} oc_mention_unresolved;
 typedef struct { uint64_t channel_id; uint32_t count; } oc_members;
 
 /* channel_id 0 means "every channel I can read" — the same query with a wider
@@ -851,6 +878,7 @@ oc_result oc_encode_list_activity(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_activity_entry(oc_wbuf *w, uint16_t version, const oc_activity_entry *m);
 oc_result oc_encode_activity(oc_wbuf *w, uint16_t version, const oc_activity *m);
 oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_info *m);
+oc_result oc_encode_mention_unresolved(oc_wbuf *w, uint16_t version, const oc_mention_unresolved *m);
 oc_result oc_encode_list_channels(oc_wbuf *w, uint16_t version);
 /* Bodyless request for the storage report (REQ-214); owner/admin only. */
 oc_result oc_encode_storage_status_req(oc_wbuf *w, uint16_t version);
@@ -1010,6 +1038,7 @@ oc_result oc_decode_saved(oc_rbuf *p, oc_saved *m);
 oc_result oc_decode_activity_entry(oc_rbuf *p, oc_activity_entry *m);
 oc_result oc_decode_activity(oc_rbuf *p, oc_activity *m);
 oc_result oc_decode_channel_info(oc_rbuf *p, oc_channel_info *m);
+oc_result oc_decode_mention_unresolved(oc_rbuf *p, oc_mention_unresolved *m);
 oc_result oc_decode_list_channels(oc_rbuf *p);
 oc_result oc_decode_channel_list(oc_rbuf *p, oc_channel_list_entry *entries, uint16_t cap, uint16_t *out_count);
 oc_result oc_decode_join_channel(oc_rbuf *p, oc_channel_ref *m);

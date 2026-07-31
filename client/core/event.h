@@ -107,7 +107,11 @@ enum {
     OC_EV_ACTIVITY_END,    /* the feed is complete: count + pinned_at = seen watermark */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
     OC_EV_BACKOFF,         /* next reconnect attempt: server_time = deadline (ms), 0 = clear */
-    OC_EV_ERROR            /* protocol/transport error; body = human message */
+    OC_EV_ERROR,           /* protocol/transport error; body = human message */
+    /* REQ-287: people you named who are not in this channel. body = their names,
+     * comma-joined for display; `peers`/`n_peers` carry their ids so the client
+     * can offer to add them; status packs can_add|is_private. */
+    OC_EV_MENTION_UNRESOLVED
 };
 
 typedef struct {

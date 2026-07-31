@@ -1275,7 +1275,8 @@ static void load_message_attachments(sqlite3 *db, uint64_t mid, oc_attach_meta *
  * name is simply not a mention: it stays as text in the body and notifies
  * nobody, which is the right outcome for a typo. */
 static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
-                           const void *body, size_t body_len, uint64_t ts) {
+                           const void *body, size_t body_len, uint64_t ts,
+                           oc_mention_unresolved *unres) {
     if (!body || !body_len) return;
     oc_mention m[OC_MENTION_MAX];
     size_t n = oc_mention_scan((const char *)body, body_len, m, OC_MENTION_MAX);
@@ -1304,7 +1305,39 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
             sqlite3_bind_text(q, 2, m[i].name, -1, SQLITE_STATIC);
             if (sqlite3_step(q) == SQLITE_ROW) uid = sqlite3_column_int64(q, 0);
             sqlite3_finalize(q);
-            if (!uid) continue;                    /* no such member: just text */
+            if (!uid) {
+                /* Not a member — but is it a PERSON? A typo and a colleague who
+                 * is simply not in this channel look identical from here, and
+                 * they are completely different situations for the sender
+                 * (REQ-287). Ask the tenant roster before deciding it was noise. */
+                if (unres && unres->count < OC_UNRESOLVED_MAX) {
+                    sqlite3_stmt *w = NULL;
+                    if (sqlite3_prepare_v2(db,
+                            "SELECT id, display_name FROM users "
+                            "WHERE disabled = 0 AND lower(display_name) = lower(?1) LIMIT 1;",
+                            -1, &w, NULL) == SQLITE_OK) {
+                        sqlite3_bind_text(w, 1, m[i].name, -1, SQLITE_STATIC);
+                        if (sqlite3_step(w) == SQLITE_ROW) {
+                            int dup = 0;
+                            uint64_t found = (uint64_t)sqlite3_column_int64(w, 0);
+                            for (uint16_t k = 0; k < unres->count; k++)
+                                if (unres->who[k].user_id == found) { dup = 1; break; }
+                            /* Mentioning the same absent person twice in one
+                             * message is one problem, not two. */
+                            if (!dup) {
+                                const unsigned char *dn = sqlite3_column_text(w, 1);
+                                unres->who[unres->count].user_id = found;
+                                snprintf(unres->who[unres->count].name,
+                                         sizeof unres->who[unres->count].name, "%s",
+                                         dn ? (const char *)dn : m[i].name);
+                                unres->count++;
+                            }
+                        }
+                        sqlite3_finalize(w);
+                    }
+                }
+                continue;                          /* not a member: just text */
+            }
         }
         sqlite3_reset(ins);
         sqlite3_bind_int64(ins, 1, (sqlite3_int64)mid);
@@ -1405,7 +1438,31 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
         return r;
     }
     uint64_t mid = (uint64_t)sqlite3_last_insert_rowid(db);
-    store_mentions(db, mid, j->channel_id, j->body, j->body_len, ts);
+    /* Collected during resolution and carried back so the sender can be told
+     * (REQ-287); the message itself is stored either way. */
+    r->unres.channel_id = j->channel_id;
+    r->unres.message_id = mid;
+    store_mentions(db, mid, j->channel_id, j->body, j->body_len, ts, &r->unres);
+    if (r->unres.count) {
+        /* Whether the sender can do anything about it, answered here where the
+         * channel is in hand rather than guessed at by the client. */
+        sqlite3_stmt *ci = NULL;
+        if (sqlite3_prepare_v2(db,
+                "SELECT kind, is_public, archived_at_ms FROM channels WHERE id = ?1;",
+                -1, &ci, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(ci, 1, (sqlite3_int64)j->channel_id);
+            if (sqlite3_step(ci) == SQLITE_ROW) {
+                const unsigned char *kind = sqlite3_column_text(ci, 0);
+                int is_dm = kind && strcmp((const char *)kind, "dm") == 0;
+                r->unres.is_private = sqlite3_column_int(ci, 1) ? 0 : 1;
+                /* A DM has nobody to add, and an archived channel takes no
+                 * writes (REQ-035): offering the action would be offering a
+                 * failure. */
+                r->unres.can_add = (!is_dm && sqlite3_column_type(ci, 2) == SQLITE_NULL) ? 1 : 0;
+            }
+            sqlite3_finalize(ci);
+        }
+    }
 
     sqlite3_prepare_v2(db,
         "INSERT INTO sent_messages(channel_id, idempotency_token, message_id, created_at_ms) "

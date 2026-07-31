@@ -459,6 +459,21 @@ oc_result oc_encode_member_entry(oc_wbuf *w, uint16_t version, const oc_member_e
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_mention_unresolved(oc_wbuf *w, uint16_t version, const oc_mention_unresolved *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_MENTION_UNRESOLVED);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->message_id);
+    oc_w_u8(w, m->can_add);
+    oc_w_u8(w, m->is_private);
+    uint16_t n = m->count > OC_UNRESOLVED_MAX ? OC_UNRESOLVED_MAX : m->count;
+    oc_w_u16(w, n);
+    for (uint16_t i = 0; i < n; i++) {
+        oc_w_u64(w, m->who[i].user_id);
+        oc_w_str(w, oc_slice_str(m->who[i].name));
+    }
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_members(oc_wbuf *w, uint16_t version, const oc_members *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_MEMBERS);
     oc_w_u64(w, m->channel_id);
@@ -1571,6 +1586,29 @@ oc_result oc_decode_member_entry(oc_rbuf *p, oc_member_entry *m) {
     m->user_id    = oc_r_u64(p);
     m->role       = oc_r_u8(p);
     m->joined_at  = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_mention_unresolved(oc_rbuf *p, oc_mention_unresolved *m) {
+    memset(m, 0, sizeof *m);
+    m->channel_id = oc_r_u64(p);
+    m->message_id = oc_r_u64(p);
+    m->can_add    = oc_r_u8(p);
+    m->is_private = oc_r_u8(p);
+    uint16_t n    = oc_r_u16(p);
+    /* Read every entry the sender wrote even past our cap, or the remaining
+     * bytes are misread as the next frame — the parser must consume exactly what
+     * was framed regardless of what we can store. */
+    for (uint16_t i = 0; i < n; i++) {
+        uint64_t uid = oc_r_u64(p);
+        oc_slice nm  = oc_r_str(p);
+        if (i >= OC_UNRESOLVED_MAX) continue;
+        m->who[i].user_id = uid;
+        size_t len = nm.len < OC_MAX_DISPLAY_NAME ? nm.len : OC_MAX_DISPLAY_NAME;
+        if (nm.ptr && len) memcpy(m->who[i].name, nm.ptr, len);
+        m->who[i].name[len] = '\0';
+        m->count = (uint16_t)(i + 1);
+    }
     return r_done(p);
 }
 

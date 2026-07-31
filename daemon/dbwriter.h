@@ -479,6 +479,9 @@ typedef struct oc_dbres {
     size_t         n_members;
     int            duplicate; /* idempotent replay: ack only, no broadcast */
     oc_attach_meta attach[OC_MAX_ATTACH];  /* SEND_OK: attachments linked to this message */
+    /* SEND_OK: names that are people here but not in this channel (REQ-287).
+     * count == 0 for the overwhelming majority of sends. */
+    oc_mention_unresolved unres;
     size_t         n_attach;
     char          *author_name;  /* heap; SEND_OK/WEBHOOK_POSTED override name, else NULL */
 

@@ -525,6 +525,30 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 oc_ev *e = oc_ev_new(OC_EV_PRESENCE);
                 if (e) { e->user_id = pu.user_id; e->status = pu.status; oc_queue_push(to_ui, e); }
             }
+        } else if (hdr.msg_type == OC_MSG_MENTION_UNRESOLVED) {
+            /* REQ-287. Flattened to a display string here rather than in the
+             * frontend, so the TUI and the GUI phrase it the same way — the same
+             * reason oc_model_dm_title exists. The ids travel alongside, because
+             * "add them" needs the person, not the text. */
+            oc_mention_unresolved mu;
+            if (oc_decode_mention_unresolved(&p, &mu) == OC_OK && mu.count) {
+                oc_ev *e = oc_ev_new(OC_EV_MENTION_UNRESOLVED);
+                if (e) {
+                    e->channel_id = mu.channel_id;
+                    e->message_id = mu.message_id;
+                    e->status = (uint8_t)((mu.can_add ? 1 : 0) | (mu.is_private ? 2 : 0));
+                    char names[256]; size_t at = 0;
+                    for (uint16_t i = 0; i < mu.count && i < 9; i++) {
+                        e->peers[i] = mu.who[i].user_id;
+                        e->n_peers  = (uint16_t)(i + 1);
+                        at += (size_t)snprintf(names + at, sizeof names - at, "%s%s",
+                                               at ? ", " : "", mu.who[i].name);
+                        if (at >= sizeof names - 1) break;
+                    }
+                    e->body = strdup(names);
+                    oc_queue_push(to_ui, e);
+                }
+            }
         } else if (hdr.msg_type == OC_MSG_MEMBER_ENTRY) {
             oc_member_entry me;
             if (oc_decode_member_entry(&p, &me) == OC_OK) {

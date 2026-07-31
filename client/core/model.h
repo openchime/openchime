@@ -344,6 +344,20 @@ typedef struct {
      * notices only when the TEXT changes stays silent when you repeat a failing
      * action — the second attempt looks like it worked. */
     uint32_t error_seq;
+
+    /* REQ-287: the last SEND that named people who are not in that channel.
+     * `seq` bumps per occurrence for the same reason `error_seq` does — mention
+     * the same absent colleague in two messages and the second must not be
+     * swallowed as a duplicate of the first. */
+    struct {
+        uint64_t channel_id, message_id;
+        uint64_t peers[9];
+        uint16_t n_peers;
+        uint8_t  can_add;      /* the sender may add people here */
+        uint8_t  is_private;   /* adding discloses the channel's history */
+        char     names[192];   /* comma-joined, ready to show */
+        uint32_t seq;
+    } unresolved;
 } oc_model;
 
 void oc_model_init(oc_model *m);

@@ -1810,6 +1810,15 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             ack.server_time = r->server_time;
             oc_encode_send_ack(&w, OC_PROTOCOL_VERSION, &ack);
             send_bytes(ep, conns, sender->fd, g_enc, w.len);
+            /* And, to the SENDER ONLY, anyone they named who is not in this
+             * channel (REQ-287). After the ack, because the message was accepted
+             * — this is a consequence, not a failure — and to nobody else,
+             * because it is about their action rather than the conversation. */
+            if (r->unres.count && !r->duplicate) {
+                oc_wbuf_init(&w, g_enc, sizeof g_enc);
+                if (oc_encode_mention_unresolved(&w, OC_PROTOCOL_VERSION, &r->unres) == OC_OK)
+                    send_bytes(ep, conns, sender->fd, g_enc, w.len);
+            }
         }
         if (!r->duplicate) {
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
