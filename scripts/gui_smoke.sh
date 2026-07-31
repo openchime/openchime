@@ -891,6 +891,23 @@ n=$(snap | grep -oE '^a11y avail=[0-9] items=[0-9]+' | grep -oE 'items=[0-9]+' |
 if [ -n "${n:-}" ] && [ "$n" -ge 2 ]; then ok "the paint pass described $n elements"
 else fail "nothing published to the accessibility tree (items=${n:-?})"; fi
 
+# Announcements. What is SAID cannot be observed from here — the same honest
+# limit as the tray balloon (WIN-18) — so what is asserted is that the path runs:
+# a failure raises one, and your own message does not, because being read your
+# own words back is noise.
+ann() { snap | grep -oE 'announced=[0-9]+' | cut -d= -f2; }
+a0=$(ann)
+"$DRIVE" send "smoke: my own message is not announced" >/dev/null 2>&1
+settle re 1; sleep 1
+checks=$((checks + 1))
+if [ "$(ann)" = "$a0" ]; then ok "your own message raises no announcement"
+else fail "a self-authored message was announced ($a0 -> $(ann))"; fi
+"$DRIVE" mkchan general 1 >/dev/null 2>&1          # duplicate name -> a real failure toast
+t=0; while [ "$(ann)" = "$a0" ] && [ $t -lt $WAIT_MS ]; do sleep 0.1; t=$((t+100)); done
+checks=$((checks + 1))
+if [ "$(ann)" != "$a0" ]; then ok "a failure is announced ($a0 -> $(ann))"
+else fail "a failure raised no announcement (still $a0)"; fi
+
 # The real gate: walk the tree from OUTSIDE the process, as a screen reader does.
 if [ -f "$LIN_DIR/uia_probe.ps1" ] || cp "$HERE/scripts/uia_probe.ps1" "$LIN_DIR/" 2>/dev/null; then
   checks=$((checks + 1))

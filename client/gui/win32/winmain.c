@@ -1081,6 +1081,16 @@ static void toast_drop(int i) {
  * rather than stacking, so a burst of identical failures reads as one event. */
 static void toast_push(const char *text, int danger) {
     if (!text || !text[0]) return;
+    /* Every toast is also spoken (ARCH-99). A toast is how this client says
+     * something went wrong — a send refused, a rate limit, a connection dropped —
+     * and it says it by drawing, which reaches nobody using a screen reader.
+     * Announcing here rather than at each call site means a failure surfaced in
+     * future cannot be silent by omission: it is one code path, not thirty.
+     *
+     * Raised before the de-duplication below on purpose: a toast repeating is
+     * the app telling you it happened AGAIN, and swallowing that would make a
+     * repeated failure indistinguishable from a single one. */
+    oc_a11y_announce(text);
     for (int i = 0; i < g_n_toast; i++) {
         if (strcmp(g_toast[i].text, text) == 0) { g_toast[i].born = GetTickCount64(); return; }
     }
@@ -12631,6 +12641,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     uint64_t prev = g_notify_hw[slot].seen;
                     g_notify_hw[slot].seen = c->high_water;
                     if (!g_notify_primed || c->high_water <= prev) continue;
+
+                    /* ANNOUNCE FIRST, and deliberately BEFORE the "you are
+                     * reading it" test below (ARCH-99). That test is right for a
+                     * toast — a message you can see does not need one — and
+                     * exactly wrong here: a screen-reader user sitting in the
+                     * channel cannot see it either, and the arrival is precisely
+                     * what they need told. Skipping it would make the client
+                     * silent in the one conversation being used.
+                     *
+                     * Muted conversations still say nothing: mute means "do not
+                     * interrupt me about this", which is a statement about
+                     * attention, not about eyesight. */
+                    if (is_active && !c->muted && oc_a11y_available()) {
+                        const oc_msg *lm = c->n_msgs ? &c->msgs[c->n_msgs - 1] : NULL;
+                        /* Not your own — you just sent it, and being read your
+                         * own words back is noise, not information. The toast
+                         * path draws the same conclusion further down. */
+                        if (lm && !lm->deleted && lm->author_id != wm->user_id) {
+                            const char *who = lm->author_name[0] ? lm->author_name
+                                            : oc_model_user_name(wm, lm->author_id);
+                            char say[OC_ACC_NAME_MAX];
+                            snprintf(say, sizeof say, "%s in %s: %s",
+                                     who ? who : "someone",
+                                     c->name ? c->name : "a conversation",
+                                     lm->body ? lm->body : "");
+                            oc_a11y_announce(say);
+                        }
+                    }
+
                     if (fg && is_active && c->channel_id == g_sel) continue;   /* you are reading it */
                     if (quiet) continue;
                     /* MENTIONS now has an answer (REQ-221): the same scanner
