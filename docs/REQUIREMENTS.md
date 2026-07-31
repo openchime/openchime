@@ -783,6 +783,27 @@ the requirement says so explicitly rather than implying one.
   `reactions` and threaded `messages`, excluding your own actions and gated on
   current membership. `users.activity_seen_ms` is a watermark — enough to mark
   what is new, deliberately not per-item read state.
+
+  **Extended 2026-07-31 to Slack's filter set.** The three kinds above answer
+  "what involved me". Slack's Activity also answers "what have I not read",
+  through three further filters that are now in scope:
+
+  | Filter | What it lists |
+  |---|---|
+  | **Unreads** | every message not yet read, in any conversation the user is in |
+  | **DMs** | unread direct messages |
+  | **Channels** | unread messages in channels whose notification level is *all* |
+
+  This is a genuine widening, and worth naming: the feed stops being only "things
+  addressed to me" and becomes an inbox. The three share one shape — *messages
+  past my read cursor, in conversations I belong to*, filtered by channel kind or
+  notification level — so they are one query with three predicates rather than
+  three features, and the cursor they need is `delivery_cursors`, which REQ-090
+  already maintains per (user, channel).
+
+  Slack's **saved custom views** are not adopted: they are a way to cope with a
+  filter set larger than this one, and inventing persistence for view
+  combinations before the filters exist would be building the lid before the box.
 - **REQ-280.** **Email notifications have not been provided, in any deployment
   model.** No digest, no "you were mentioned" mail, no unread summary, and no
   outbound SMTP of any kind. Two reasons, both deliberate. **Operationally**, it
