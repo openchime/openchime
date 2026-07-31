@@ -21,12 +21,8 @@ document is only the work list derived from them.
 
 ## Open
 
-| # | Item | Pri | Size |
-|---|---|---|---|
-| **WIN-96** | **Formatting toolbar and its keyboard shortcuts (REQ-220).** The authoring *affordance* for the markup WIN-90 now parses and renders: a toolbar over the composer (bold, italic, strikethrough, code, quote, lists) plus **Ctrl+B / Ctrl+I** and friends wrapping the selection in the delimiters. Startable since 2026-07-31 — it was split out deliberately because WIN-90 is what makes formatting *exist*, and a second way to author it was worth nothing until the first worked. **Constrained by ARCH-100:** anything the toolbar produces must be expressible in text ([MARKDOWN.md](./MARKDOWN.md) §5), or the two authoring paths diverge and a message becomes uneditable in one of them. The parser is the check on that — a toolbar insertion that `oc_rt_scan` does not read back the same way is a bug in the toolbar. | P2 | M |
-
-New work belongs here as new ids (never reused); the items below are waiting on
-a requirement or a decision.
+*Nothing startable in `client/gui/win32/` is open.* New work belongs here as new
+ids (never reused); the items below are waiting on a requirement or a decision.
 
 ## Open, but not startable here
 
@@ -82,7 +78,7 @@ pattern REQ-221 and REQ-230 both followed.
   The daemon is epoll-based and Linux-only, and GitHub's Windows runners cannot
   host it. The job exists and skips until a self-hosted Windows+WSL runner does.
   Until then the smoke is a local gate. It is a trustworthy one since WIN-87/88:
-  130 checks, waiting on state rather than sleeping, refusing to run against the
+  150 checks, waiting on state rather than sleeping, refusing to run against the
   wrong daemon, and including a real UIA client walking the accessibility tree
   from outside the process.
 
@@ -101,12 +97,19 @@ pattern REQ-221 and REQ-230 both followed.
 
 ## What "closed" does and does not mean
 
-WIN-1 … WIN-90 plus WIN-93 and WIN-95 are done — accessibility included, built
-*for* the custom controls rather than by retreating to native ones (ARCH-99),
-and rich text as of 2026-07-31. **WIN-90 closing is what opened WIN-96**, which
-is the one startable item above; the rest are each blocked on a daemon
-requirement or an ARCH decision, or, in WIN-60's case, on a crash that has not
-reproduced since it was instrumented. An adversarial review on 2026-07-30 found no defect in the
+WIN-1 … WIN-90 plus WIN-93, WIN-95, WIN-96, WIN-98 and WIN-99 are done —
+accessibility included, built *for* the custom controls rather than by retreating
+to native ones (ARCH-99), and rich text with its toolbar as of 2026-07-31. The
+items below are each blocked on a daemon requirement or an ARCH decision, or, in
+WIN-60's case, on a crash that has not reproduced since it was instrumented.
+
+**Two of those three ids did not come from this list.** WIN-98 (Ctrl+C in the
+composer copied nothing, because the transcript's handler claimed the key and
+then did nothing with it) surfaced while wiring WIN-96's Ctrl+Shift+C, by trying
+it rather than by reading it. WIN-99 (search left open floated its native EDIT
+over the "New direct message" picker) arrived as a screenshot of the running
+client. Both are the shape this document's closing note already describes: a
+backlog records what somebody wrote down, and neither of these was on it. An adversarial review on 2026-07-30 found no defect in the
 previously-closed list, several claims verified by round-trip against a live
 daemon (pin → Pins tab; save → Later; Activity, Files, Later and Admin all
 rendering real content).

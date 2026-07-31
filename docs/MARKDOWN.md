@@ -117,9 +117,11 @@ and an underline is indistinguishable from a link in most renderings.
 
 - **No WYSIWYG-only constructs.** Anything the toolbar can produce must be
   expressible in text, or the two authoring paths diverge and a message becomes
-  uneditable in one of them. (The toolbar itself, and `Ctrl+B`/`Ctrl+I`, are
-  WIN-96 — a second way to author what you can already type, and worth nothing
-  until the parser exists.)
+  uneditable in one of them. (The toolbar itself, and `Ctrl+B`/`Ctrl+I`, are WIN-96 —
+  **built 2026-07-31**, once the parser existed to make them worth anything. It
+  inserts delimiters into the plain body and nothing else, so the constraint
+  holds by construction rather than by discipline: there is no second
+  representation for the two paths to disagree about.)
 - **No tables, headings, images or HTML.** A chat message is a paragraph, not a
   document. Headings in a 400-character message are noise; tables need a column
   model no terminal can honour; images are attachments (REQ-140/142).
