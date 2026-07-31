@@ -2554,13 +2554,20 @@ static void apply_richtext(IDWriteTextLayout *layout, const char *u8, size_t ble
                            UINT32 wmax, ID2D1SolidColorBrush *dim,
                            ID2D1SolidColorBrush *clear) {
     oc_rt_span sp[OC_RT_MAX];
-    size_t n, i;
+    size_t n, i, seen_b = 0;      /* how far the byte->UTF-16 walk has got */
+    UINT32 seen_w = 0;
     if (!layout || !u8 || !blen) return;
     n = oc_rt_scan(u8, blen, sp, OC_RT_MAX);
     if (n > OC_RT_MAX) n = OC_RT_MAX;
     for (i = 0; i < n; i++) {
-        UINT32 at  = rt_u16(u8, sp[i].start);
-        UINT32 len = rt_u16(u8 + sp[i].start, sp[i].len);
+        /* Spans arrive sorted, so the offset walk carries forward instead of
+         * re-measuring from byte 0 each time — that is 128 spans x the whole
+         * body on a long message, and this runs per message per layout pass. */
+        UINT32 at, len;
+        if (sp[i].start >= seen_b) at = seen_w + rt_u16(u8 + seen_b, sp[i].start - seen_b);
+        else                       at = rt_u16(u8, sp[i].start);
+        seen_b = sp[i].start; seen_w = at;
+        len = rt_u16(u8 + sp[i].start, sp[i].len);
         DWRITE_TEXT_RANGE tr;
         uint16_t st = sp[i].style;
         /* A very long body is transcoded into a fixed buffer, so a span can
