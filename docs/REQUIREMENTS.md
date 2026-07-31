@@ -545,6 +545,26 @@ the requirement says so explicitly rather than implying one.
   them. This has been display only: it has not changed delivery, which DND
   governs separately (REQ-131).
 
+  **Availability and do-not-disturb are two INDEPENDENT axes, as in Slack.**
+  Presence (REQ-120) answers *are they around* — active / away / offline.
+  Do-not-disturb answers *may they be interrupted* — on / off. Neither implies
+  the other: someone active can be paused, and someone away can be perfectly
+  interruptible. Slack keeps them in separate APIs for exactly this reason
+  (`users.getPresence` versus `dnd.info`) and renders DND as a badge *over* the
+  presence dot rather than as a fourth presence value. Collapsing them into one
+  enum would make "away" and "do not disturb" mutually exclusive, which is wrong
+  in both directions.
+
+  **What other people see is the FACT, not the timing.** A viewer learns that
+  someone is not to be disturbed; they do not learn when it ends. Slack's API is
+  explicit — every `snooze_*` field is visible only to the user themselves, and a
+  query about somebody else returns only whether DND is on plus the next schedule
+  boundaries. A colleague needs the first to decide whether to write; the second
+  is a movement report about a person. (Slack's help centre says others "see a
+  snooze icon", which is consistent: the badge reflects the fact. If finer
+  behaviour ever matters it would have to be observed against Slack, whose docs
+  do not say.)
+
   **Partially built, and the unbuilt half is the DND half.** Custom status with
   expiry shipped (WIN-53, migration 0027) and is shown beside names in the member
   pane and profile. **Do-not-disturb is still self-only:** `dnd_enabled` /
@@ -557,7 +577,9 @@ the requirement says so explicitly rather than implying one.
   **[needs ARCH decision — how DND/OOO/custom-status is projected into the
   `PRESENCE_UPDATE` surface (ARCH-67); note ARCH-89 already records that presence
   is invisible to the push worker's read-only connection, which is a related
-  constraint on where this state can be read.]**
+  constraint on where this state can be read. `PRESENCE_UPDATE` carries one
+  status byte today and needs a second, INDEPENDENT DND bit rather than a fourth
+  status value — see the two-axis note above.]**
 
 ---
 
@@ -576,7 +598,21 @@ the requirement says so explicitly rather than implying one.
   (REQ-132/133) is built as the daemon push emitter (ARCH-85), which honors the
   window.
 
-  > **Scope note (2026-07-31).** This is one of **three** distinct mechanisms
+  > **Naming, matched to Slack (2026-07-31).** Slack calls this half the **DND
+  > schedule** (`dnd_enabled`, `next_dnd_start_ts`, `next_dnd_end_ts`) and the
+  > manual one **snooze** (`snooze_*`). They are separate APIs with separate ways
+  > to cancel — `dnd.endDnd` ends the current scheduled period, `dnd.endSnooze`
+  > ends a pause — and cancelling one has never cancelled the other. Ours should
+  > read the same way so the two are never confused for versions of each other.
+  >
+  > **Correction (2026-07-31):** the line below says this "governs push only".
+  > That understates what is built — the Win32 client already suppresses desktop
+  > toasts while DND is active (`quiet = dnd_active(m)` gates the notify loop),
+  > which is right and matches Slack, where pausing notifications pauses the ones
+  > you can see. What DND does *not* touch is in-app unread state: badges and
+  > counts keep updating, because they are a record rather than an interruption.
+  >
+  > **Scope note.** This is one of **three** distinct mechanisms
   > Slack ships, and for a long time this requirement was treated as if it were
   > all of them. It is the *recurring* one. A **transient pause to an absolute
   > instant** ("do not disturb until 17:00") is **REQ-278** and is **not
@@ -643,10 +679,9 @@ the requirement says so explicitly rather than implying one.
   any recurring window (REQ-131/136). The client has offered **durations**
   (30 minutes, 1 hour, 2 hours, until tomorrow) and a **custom** end time; the
   pause has expired on its own; and the user has been able to **resume
-  immediately** without waiting for it. While paused, the user's **do-not-disturb
-  state has been visible to other people** beside their presence (REQ-122) —
-  Slack draws a snooze icon — so a sender knows before writing rather than after
-  being ignored.
+  immediately** without waiting for it. While paused, the **fact** that the user
+  is not to be disturbed has been visible to other people beside their presence
+  (REQ-122), so a sender knows before writing rather than after being ignored.
 
   **This is a different type from REQ-131, not a longer version of it.** A
   recurring window is a pair of minutes-of-day and is periodic by construction; a
@@ -664,17 +699,48 @@ the requirement says so explicitly rather than implying one.
   knows the user's timezone, so "until tomorrow morning" is a different moment
   per user), exactly as custom status does.
 
-  **Escape hatches, both deferred and recorded rather than assumed away.** Slack
-  lets a sender **override a pause once per day** for an urgent DM, and lets a
-  user nominate **VIPs** whose messages arrive regardless. The second is
-  REQ-135's "priority people" and should be built with it. The first is a
-  deliberate hole in a guarantee and is **not** adopted here without a decision:
-  a recipient's do-not-disturb that any sender may pierce is a weaker promise
-  than it appears. **[needs ARCH decision — `dnd_until_ms` on `users` beside the
-  ARCH-72 window, the precedence rule when a pause and a window disagree (the
-  pause is later and more specific, so it should win in both directions,
-  including *un*-pausing inside a quiet window), and whether a sender override
-  exists at all.]**
+  **Settled 2026-07-31: match Slack's model, which its API states exactly.**
+  `dnd.info` exposes two independent mechanisms, and naming them apart is the
+  whole design:
+
+  | Slack | What it is | Ours |
+  |---|---|---|
+  | `dnd_enabled`, `next_dnd_start_ts`, `next_dnd_end_ts` | the **schedule** — recurring, planned | REQ-131 + REQ-136 |
+  | `snooze_enabled`, `snooze_endtime`, `snooze_remaining` | the **pause** — manual, one-shot | this requirement |
+
+  `dnd.setSnooze` takes **minutes from now**, so every preset is a duration and
+  the absolute instant is derived — 30 minutes, 1 hour, 2 hours, until tomorrow,
+  or a custom end time. `dnd.endSnooze` ends the pause early and is a distinct
+  act from `dnd.endDnd`, which ends the *current scheduled* period: two
+  mechanisms, two ways to cancel, and cancelling one has never cancelled the
+  other. Slack also carries `snooze_is_indefinite`, which its own reference says
+  cannot be set to true; we do not implement it.
+
+  **A pause only ever ADDS silence.** It cannot un-silence someone inside their
+  scheduled quiet hours — there is no "notify me anyway until 17:00" in Slack or
+  in this requirement — so a pause and a schedule never disagree in a way needing
+  a precedence rule. When a pause expires the schedule simply applies again.
+
+  **The fact is public; the timing is private.** Slack's help says other people
+  see a snooze icon, while its API marks every `snooze_*` field self-only and
+  returns just `dnd_enabled` and the next schedule boundaries for another user.
+  The coherent reading, and the one adopted here: others learn **that** someone
+  is not to be disturbed, never **when they will be back**. A colleague needs the
+  first to decide whether to write; the second is a movement report. See REQ-122
+  for the presence surface that carries it.
+
+  **VIPs pierce a pause; senders do not.** Slack allows both — a nominated VIP
+  always gets through, and a sender may additionally force one urgent DM past a
+  pause once a day. The VIP half is adopted (it is REQ-135's priority people, and
+  it is the *recipient* choosing who may reach them). **The sender override is a
+  deliberate divergence and the only one in this requirement:** a
+  do-not-disturb any sender can pierce is a weaker promise than the words
+  suggest, and the legitimate need behind it is already served from the right
+  side by the VIP list. Recorded here so the difference from Slack is a choice
+  rather than an omission.
+
+  **The storage** is `dnd_until_ms` on `users` beside the ARCH-72 window, the
+  proven pattern above. Ending early sets it to 0; there is no second op.
 - **REQ-279.** A workspace **owner or admin has been able to set default
   do-not-disturb hours** for the workspace, applying to members who have not
   configured their own, and **any member has been able to override them** with
