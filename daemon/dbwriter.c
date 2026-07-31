@@ -1289,12 +1289,34 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
             "VALUES(?1,?2,?3,?4,?5,?6,?7);", -1, &ins, NULL) != SQLITE_OK)
         return;
 
+    /* Public channels resolve a mention against the whole roster; private ones
+     * only against their members (REQ-288). The split is not a nicety: in a
+     * public channel the person can already open the message, so the notification
+     * is the only thing missing, and withholding it just means they find out late
+     * or never. In a private one they cannot read it at all, and a notification
+     * pointing at something unreadable is worse than silence. */
+    int chan_public = 0;
+    {
+        sqlite3_stmt *cq = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT is_public, kind FROM channels WHERE id = ?1;",
+                               -1, &cq, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(cq, 1, (sqlite3_int64)channel_id);
+            if (sqlite3_step(cq) == SQLITE_ROW) {
+                const unsigned char *k = sqlite3_column_text(cq, 1);
+                /* A DM is never "public" here whatever the column says — there is
+                 * no joining one, so there is nobody outside it to notify. */
+                chan_public = sqlite3_column_int(cq, 0) && !(k && strcmp((const char *)k, "dm") == 0);
+            }
+            sqlite3_finalize(cq);
+        }
+    }
+
     for (size_t i = 0; i < n; i++) {
         int64_t uid = 0;
         if (m[i].kind == OC_MENTION_USER) {
-            /* Match the display name case-insensitively, and only a member of
-             * this channel: mentioning someone who cannot read the channel
-             * would notify them about a message they can never open. */
+            /* Match the display name case-insensitively among this channel's
+             * members. Membership is asked first regardless of channel kind,
+             * because "are they in it" is also what REQ-287 reports. */
             sqlite3_stmt *q = NULL;
             if (sqlite3_prepare_v2(db,
                     "SELECT u.id FROM users u JOIN channel_members cm ON cm.user_id = u.id "
@@ -1310,33 +1332,39 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
                  * is simply not in this channel look identical from here, and
                  * they are completely different situations for the sender
                  * (REQ-287). Ask the tenant roster before deciding it was noise. */
-                if (unres && unres->count < OC_UNRESOLVED_MAX) {
-                    sqlite3_stmt *w = NULL;
-                    if (sqlite3_prepare_v2(db,
-                            "SELECT id, display_name FROM users "
-                            "WHERE disabled = 0 AND lower(display_name) = lower(?1) LIMIT 1;",
-                            -1, &w, NULL) == SQLITE_OK) {
-                        sqlite3_bind_text(w, 1, m[i].name, -1, SQLITE_STATIC);
-                        if (sqlite3_step(w) == SQLITE_ROW) {
+                uint64_t outsider = 0;
+                sqlite3_stmt *w = NULL;
+                if (sqlite3_prepare_v2(db,
+                        "SELECT id, display_name FROM users "
+                        "WHERE disabled = 0 AND lower(display_name) = lower(?1) LIMIT 1;",
+                        -1, &w, NULL) == SQLITE_OK) {
+                    sqlite3_bind_text(w, 1, m[i].name, -1, SQLITE_STATIC);
+                    if (sqlite3_step(w) == SQLITE_ROW) {
+                        outsider = (uint64_t)sqlite3_column_int64(w, 0);
+                        if (unres && unres->count < OC_UNRESOLVED_MAX) {
                             int dup = 0;
-                            uint64_t found = (uint64_t)sqlite3_column_int64(w, 0);
                             for (uint16_t k = 0; k < unres->count; k++)
-                                if (unres->who[k].user_id == found) { dup = 1; break; }
+                                if (unres->who[k].user_id == outsider) { dup = 1; break; }
                             /* Mentioning the same absent person twice in one
                              * message is one problem, not two. */
                             if (!dup) {
                                 const unsigned char *dn = sqlite3_column_text(w, 1);
-                                unres->who[unres->count].user_id = found;
+                                unres->who[unres->count].user_id = outsider;
                                 snprintf(unres->who[unres->count].name,
                                          sizeof unres->who[unres->count].name, "%s",
                                          dn ? (const char *)dn : m[i].name);
                                 unres->count++;
                             }
                         }
-                        sqlite3_finalize(w);
                     }
+                    sqlite3_finalize(w);
                 }
-                continue;                          /* not a member: just text */
+                /* REQ-288: in a public channel they still get the mention, so it
+                 * is stored and reaches their activity feed. The sender is told
+                 * either way (REQ-287) — being notified is not the same as being
+                 * IN the channel, and only membership gets them what comes next. */
+                if (outsider && chan_public) uid = (int64_t)outsider;
+                else continue;                     /* private, or not a person: just text */
             }
         }
         sqlite3_reset(ins);
@@ -2629,8 +2657,17 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
         "    FROM mentions mn JOIN messages m ON m.id = mn.message_id "
         "   WHERE (mn.user_id = ?1 OR mn.kind <> 0) AND m.author_id <> ?1 "
         "     AND m.deleted_at_ms IS NULL "
-        "     AND EXISTS(SELECT 1 FROM channel_members cm "
-        "                 WHERE cm.channel_id = mn.channel_id AND cm.user_id = ?1) "
+        /* Membership OR a public channel (REQ-288). This gate is where a mention
+         * of a non-member actually lands: store_mentions can record the row, but
+         * if this still demanded membership the feed would filter it straight
+         * back out and the feature would look built and do nothing. A public
+         * channel is readable by everyone here, so showing it discloses nothing
+         * the person could not already open. */
+        "     AND ( EXISTS(SELECT 1 FROM channel_members cm "
+        "                   WHERE cm.channel_id = mn.channel_id AND cm.user_id = ?1) "
+        "           OR EXISTS(SELECT 1 FROM channels c "
+        "                      WHERE c.id = mn.channel_id AND c.is_public = 1 "
+        "                        AND c.kind <> 'dm') ) "
         "  UNION ALL "
         /* --- reactions to what I wrote --- */
         "  SELECT 1, rx.message_id, m.channel_id, rx.user_id, rx.created_at_ms, rx.emoji "

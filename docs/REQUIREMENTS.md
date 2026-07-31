@@ -1255,9 +1255,17 @@ None are yet backed by an architecture decision.*
   channel they "won't be notified and can't see your message until you invite
   them to join the channel". Ours currently does neither, because `store_mentions`
   joins `channel_members` for every channel kind — correct reasoning for private,
-  applied too widely. **[needs a product decision — this changes who receives
-  notifications, so it is recorded and not assumed; the daemon change itself is
-  confined to that one membership test.]**
+  applied too widely.
+
+  **Built 2026-07-31, and deliberately narrow.** Delivery is the **activity feed
+  only**: push stays membership-gated, so this never rings a phone about a
+  channel somebody never joined. The mention notifies **regardless of notification
+  level**, because a mention is a direct address and a non-member has no
+  per-channel preference to consult — routing it through their global default
+  would apply a setting never made with this case in mind. It touched **three**
+  gates, not the one first estimated: mention resolution, the activity-feed query
+  (where it actually lands — without that the row is stored and nobody ever sees
+  it), and push, which was left alone on purpose.
 - **REQ-222.** A URL in a message has optionally been **unfurled** into a preview
   (title, description, thumbnail) fetched from the linked page. The fetch has been
   performed **server-side by the daemon or an isolated helper** — never by pushing

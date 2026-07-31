@@ -11876,6 +11876,11 @@ static void test_dump(const char *path) {
                 g_pickrows[i].chk.right, g_pickrows[i].chk.bottom,
                 g_pickrows[i].r.left, g_pickrows[i].r.top,
                 g_pickrows[i].r.right, g_pickrows[i].r.bottom);
+    /* WHO is signed in. Absent until 2026-07-31, which made any two-account test
+     * unfalsifiable: a stored session token silently re-auths the previous user,
+     * and every other line in this dump looks identical either way. */
+    fprintf(f, "me id=%llu name=\"%s\"\n", (unsigned long long)m->user_id,
+            oc_model_user_name(m, m->user_id) ? oc_model_user_name(m, m->user_id) : "");
     fprintf(f, "users n=%u names=\"", (unsigned)m->n_users);
     for (size_t i = 0; i < m->n_users && i < 32; i++)
         fprintf(f, "%s%s", i ? "," : "", m->users[i].name);
@@ -12630,11 +12635,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                  "full history — everything already said here.",
                                  m->unresolved.names, several ? "are" : "is", where);
                     else
+                        /* Public: since REQ-288 they DO get the mention, in their
+                         * activity feed. Saying "not notified" here would be the
+                         * same false confirmation this notice exists to fix, just
+                         * pointing the other way — so it offers membership, which
+                         * is the thing they still do not have. */
                         snprintf(body, sizeof body,
-                                 "%s %s not in #%s, so they were not notified.\n\n"
-                                 "Anyone here can read this channel, so you can add "
-                                 "them — or leave it and they will not be pinged.",
-                                 m->unresolved.names, several ? "are" : "is", where);
+                                 "%s %s not in #%s.\n\n"
+                                 "The mention will reach %s — anyone here can read "
+                                 "this channel — but %s will not see what comes next "
+                                 "unless you add %s.",
+                                 m->unresolved.names, several ? "are" : "is", where,
+                                 "them", "they", "them");
                     confirm_open(hwnd, CONF_MENTION_ADD, 0,
                                  "Not in this channel", body, "Add them");
                 } else {
@@ -12642,7 +12654,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                      * channel takes no writes — so say what happened rather than
                      * dangling an action that would fail. */
                     char t[256];
-                    snprintf(t, sizeof t, "%s %s not in this conversation — not notified.",
+                    snprintf(t, sizeof t, "%s %s not in this conversation.",
                              m->unresolved.names, several ? "are" : "is");
                     toast_push(t, 1);
                 }

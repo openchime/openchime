@@ -895,6 +895,15 @@ t=0; while [ "$(snap | grep -oE '^unres seq=[0-9]+' | cut -d= -f2)" = "$useq" ] 
   sleep 0.1; t=$((t+100)); done
 expect_grep '^unres seq=[0-9]+ n=1 can_add=1 priv=0 names="bob"' \
             "naming a non-member is reported to the sender, with a remedy"
+
+# REQ-288: in a PUBLIC channel the mention still reaches them, so the notice
+# offers membership rather than claiming they were not notified. The delivery
+# itself needs a second account and is covered by hand (a mention of bob lands in
+# bob's activity feed; a private channel leaves it empty) — asserted here is the
+# half that lives in one session: that the sender is told, and told the truth.
+checks=$((checks + 1))
+if snap | grep -q '^unres .*priv=0 '; then ok "a public channel reports it as a membership gap, not a delivery failure"
+else fail "public/private not distinguished: $(snap | grep '^unres ')"; fi
 expect_eventually modal confirm "and it is offered as a confirmation, not a silent drop"
 
 # Accepting it adds them — proven by the mention going quiet afterwards rather
