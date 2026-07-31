@@ -1200,8 +1200,13 @@ None are yet backed by an architecture decision.*
   without proportional styling; the TUI shows code blocks and emphasis in-band).
   The stored body has remained plain UTF-8 (REQ-054) with formatting expressed
   in-band, so no schema change is required, and a client that does not render a
-  construct has shown its literal source legibly. **[needs ARCH decision — the
-  markup dialect + whether it is parsed server-side or purely client-side.]**
+  construct has shown its literal source legibly.
+
+  **Settled by ARCH-100 (2026-07-31):** a Slack-compatible subset for inline
+  emphasis, extended with the list syntax Slack's markup lacks, parsed
+  **client-side in `client/core/`** and never by the daemon, returning spans over
+  the unchanged body. Full dialect, the escaping rules, and the places we
+  deliberately diverge from Slack are in [MARKDOWN.md](./MARKDOWN.md).
 - **REQ-221.** A message has been able to **@mention** a user, and the broadcast
   audiences `@here` / `@channel` / `@everyone`. A mention has been stored as a
   stable reference (user id) that survives display-name changes, has highlighted

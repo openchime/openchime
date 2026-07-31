@@ -268,6 +268,18 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **The system caret is part of this, not a detail.** A self-drawn text field must still create a real system caret (`CreateCaret`/`SetCaretPos`): screen readers and magnifiers track it, and it is what makes IME composition position correctly. The composer draws its own caret and created none, so assistive technology could not follow typing at all.
 
+- **ARCH-100 (Message formatting — a Slack-compatible subset, parsed in the client core):** Answers REQ-220's open marker. Full dialect in [MARKDOWN.md](./MARKDOWN.md).
+
+  **The dialect is Slack's `mrkdwn` for inline emphasis** — `*bold*` (a single asterisk), `_italic_`, `~strike~`, backtick code, `>` blockquote — **extended with real list syntax**, which Slack's markup does not have at all (its docs say to "mimic list formatting with regular text and line breaks", and its toolbar produces lists its own API cannot express). Muscle memory transfers; REQ-220's lists still get delivered.
+
+  **Two of Slack's rules are deliberately NOT adopted**, because they are artifacts of its API layer rather than properties of a chat message: `<URL|label>` link wrapping, and HTML-entity encoding of `&`, `<`, `>`. Our bodies are plain UTF-8 (REQ-054) indexed directly by FTS5, so entity-encoding would put `&amp;` into the search index and mangle a `<` somebody typed in prose. URLs autolink from the bare text instead.
+
+  **Parsed in `client/core/`, not `shared/` and not the daemon.** This is where formatting differs from @mentions: ARCH-89 had to resolve mentions server-side because only the daemon holds the roster, whereas formatting needs no server knowledge whatever — parsing it there would buy nothing and add a wire contract to version forever. `shared/` is the wrong home too, since that directory is specifically the contract shared *with the daemon*; formatting is shared between frontends only, which is what `client/core/` already is (`complete.c`). One parser, both frontends, for the reason ARCH-89 gives for the mention scanner: two implementations of "is this bold" drift, and neither side can tell which is right.
+
+  **The parser returns SPANS over the original bytes, never a rewritten string.** The body a client renders stays byte-identical to the body the daemon stored, so search, the mention table's byte offsets (migration 0021) and editing all keep addressing the same text. The stored body is unchanged plain UTF-8 with markup in band, so there is no schema change and no second representation to keep in step.
+
+  **Ambiguity degrades to literal source.** Emphasis is word-boundary anchored and must close on the same line, so `2 * 3` is arithmetic and a half-typed `*` never restyles the rest of a message; a backslash escape gives an explicit way out, which Slack has no equivalent of.
+
 - **ARCH-97 (Typography — the platform owns the family, we own the scale):** Applies to every graphical client (ARCH-74's native front-ends); the TUI is exempt, since a terminal's font is the user's business.
 
   **The family comes from the OS.** Segoe UI Variable Text on Windows 11 falling back to Segoe UI, the desktop's `system-ui` on GTK, SF on macOS. Bundling a typeface is the most visible way to look foreign in a window — it is a large part of why Slack's own desktop client reads as not-quite-native — and it adds a licensing and shipping cost for a negative. A client that looks like it belongs on the platform is the whole point of not using a toolkit (ARCH-82).

@@ -33,7 +33,8 @@ path, and echo cancellation), [docs/VIDEO.md](docs/VIDEO.md) (screenshare — th
 codec-as-wire-contract decision and why it is sequenced behind
 audio), [docs/CLIENT.md](docs/CLIENT.md) (the native client
 architecture), [docs/WIN32_BACKLOG.md](docs/WIN32_BACKLOG.md) (the numbered
-Windows GUI work list), [docs/CONFIG.md](docs/CONFIG.md) (every environment
+Windows GUI work list), [docs/MARKDOWN.md](docs/MARKDOWN.md) (the message-formatting dialect and where
+it is parsed), [docs/CONFIG.md](docs/CONFIG.md) (every environment
 variable the daemon reads), [docs/TESTING.md](docs/TESTING.md) (the unit +
 integration test strategy), and [docs/VENDORS.md](docs/VENDORS.md) (every
 third-party dependency, with source, version pinning, and license) for the
