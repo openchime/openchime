@@ -5760,7 +5760,16 @@ static D2D1_RECT_F g_modal_card;
  */
 enum { CONF_NONE = 0, CONF_WEBHOOK_DELETE, CONF_WEBHOOK_ROTATE, CONF_INVITE_REVOKE,
        CONF_CHANNEL_ARCHIVE, CONF_WS_FORGET,
-       CONF_CHANNEL_PRIVATE, CONF_CHANNEL_PUBLIC };
+       CONF_CHANNEL_PRIVATE, CONF_CHANNEL_PUBLIC, CONF_MENTION_ADD };
+
+/* REQ-287: who the "add them" confirmation would add, and where. Kept beside the
+ * confirmation rather than read from the model when it runs, because the model
+ * moves on — another send, another notice — and a confirmation must act on what
+ * it asked about. */
+static uint64_t g_mention_add[9];
+static int      g_n_mention_add;
+static uint64_t g_mention_cid;
+static uint32_t g_unresolved_seen;
 
 static void confirm_open(HWND hwnd, int act, uint64_t id, const char *title,
                          const char *body, const char *ok_label) {
@@ -5778,6 +5787,10 @@ static void confirm_run(HWND hwnd) {
     case CONF_WEBHOOK_ROTATE: oc_client_rotate_webhook(g_client, g_confirm_id);
                               g_await_webhook = 1; break;
     case CONF_INVITE_REVOKE:  oc_client_revoke_invite(g_client, g_confirm_id); break;
+    case CONF_MENTION_ADD:
+        for (int i = 0; i < g_n_mention_add; i++)
+            oc_client_channel_invite(g_client, g_mention_cid, g_mention_add[i]);
+        break;
     /* "" is what the original call passed and what the daemon expects for a toggle;
      * "1" would have been a plausible-looking change of behaviour smuggled in with
      * a refactor. */
@@ -11830,6 +11843,9 @@ static void test_dump(const char *path) {
      * points resolved at all; `items` is what the last paint described. Neither
      * proves a client can SEE the tree — scripts/uia_probe.ps1 does that, from
      * outside the process — but a zero here localises the failure to this side. */
+    fprintf(f, "unres seq=%u n=%u can_add=%u priv=%u names=\"%s\"\n",
+            m->unresolved.seq, (unsigned)m->unresolved.n_peers,
+            m->unresolved.can_add, m->unresolved.is_private, m->unresolved.names);
     fprintf(f, "a11y avail=%d items=%d announced=%u\n",
             oc_a11y_available(), g_a11y_n, oc_a11y_announced());
     /* The system caret (ARCH-99). Reported because it is invisible by design —
@@ -12586,6 +12602,51 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * toast channel while the sign-in view owns the window. */
             if (g_view == VIEW_SIGNIN) { if (g_si_connecting) signin_poll(hwnd); }
             else toast_tick(m);
+            /* You named somebody who is not in this channel (REQ-287). Driven off
+             * `seq` rather than a changed name: mention the same absent colleague
+             * in two messages and the second must not be swallowed as a repeat of
+             * the first — the same rule `error_seq` exists for. */
+            if (m && m->unresolved.seq != g_unresolved_seen) {
+                g_unresolved_seen = m->unresolved.seq;
+                const oc_channel *uc = oc_model_channel((oc_model *)m, m->unresolved.channel_id);
+                const char *where = (uc && uc->name && uc->name[0]) ? uc->name : "this conversation";
+                int several = m->unresolved.n_peers > 1;
+                char body[512];
+                if (m->unresolved.can_add) {
+                    g_n_mention_add = m->unresolved.n_peers > 9 ? 9 : m->unresolved.n_peers;
+                    for (int i = 0; i < g_n_mention_add; i++)
+                        g_mention_add[i] = m->unresolved.peers[i];
+                    g_mention_cid = m->unresolved.channel_id;
+                    /* A private channel is not a louder version of a public one:
+                     * adding somebody hands them everything ever said here. That
+                     * is the same disclosure REQ-036a spells out for making a
+                     * channel public, and it is said before the click, not after. */
+                    /* "them" reads correctly for one person or several, so the
+                     * only thing that varies is the verb. */
+                    if (m->unresolved.is_private)
+                        snprintf(body, sizeof body,
+                                 "%s %s not in #%s, so they were not notified.\n\n"
+                                 "Adding them to this private channel gives them its "
+                                 "full history — everything already said here.",
+                                 m->unresolved.names, several ? "are" : "is", where);
+                    else
+                        snprintf(body, sizeof body,
+                                 "%s %s not in #%s, so they were not notified.\n\n"
+                                 "Anyone here can read this channel, so you can add "
+                                 "them — or leave it and they will not be pinged.",
+                                 m->unresolved.names, several ? "are" : "is", where);
+                    confirm_open(hwnd, CONF_MENTION_ADD, 0,
+                                 "Not in this channel", body, "Add them");
+                } else {
+                    /* Nothing to offer — a DM has nobody to add and an archived
+                     * channel takes no writes — so say what happened rather than
+                     * dangling an action that would fail. */
+                    char t[256];
+                    snprintf(t, sizeof t, "%s %s not in this conversation — not notified.",
+                             m->unresolved.names, several ? "are" : "is");
+                    toast_push(t, 1);
+                }
+            }
             /* A DM we asked for has arrived — select it. Picking someone should
              * land you IN the conversation, not back at the list with a new row
              * somewhere in the sidebar. */

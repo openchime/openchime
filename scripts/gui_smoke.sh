@@ -187,7 +187,7 @@ case "$fixture" in
      say "   Refusing to run: every assertion below would be about someone else's data."
      exit 1;;
 esac
-# The fixture's people, too. The group-DM and completion checks name bob, carol
+# The fixture's people, too. The group-DM and completion checks name alice, bob and carol
 # and alice; without this, "no such user" and "the feature is broken" are the
 # same failure from here — which is exactly how three runs were misread.
 if ! wait_grep '^users n=[0-9]+ names="' 10000; then
@@ -498,12 +498,12 @@ say "== group DMs"
 # state this section needs rather than inheriting whatever the last run left.
 "$DRIVE" section expand 1 >/dev/null 2>&1
 "$DRIVE" groupdm bob,carol >/dev/null 2>&1
-expect_grep '^  sbrow sec=1 header=0 cid=[0-9]+ label="bob, carol"' \
-            "the group appears titled by its people"
+expect_grep '^  sbrow sec=1 header=0 cid=[0-9]+ label="alice, bob, carol"' \
+            "the group is titled by everyone in it, the reader included"
 d=$(snap)
-gid=$(printf '%s' "$d" | grep -oE '^  sbrow sec=1 header=0 cid=[0-9]+ label="bob, carol"' | grep -oE 'cid=[0-9]+' | cut -d= -f2 | head -1)
+gid=$(printf '%s' "$d" | grep -oE '^  sbrow sec=1 header=0 cid=[0-9]+ label="alice, bob, carol"' | grep -oE 'cid=[0-9]+' | cut -d= -f2 | head -1)
 checks=$((checks + 1))
-n=$(printf '%s' "$d" | grep -cE 'sbrow .*label="bob, carol"' || true)
+n=$(printf '%s' "$d" | grep -cE 'sbrow .*label="alice, bob, carol"' || true)
 if [ "$n" = "1" ]; then ok "and exactly once"
 else fail "the group appears $n times"; fi
 
@@ -514,7 +514,7 @@ else fail "the group appears $n times"; fi
 "$DRIVE" groupdm carol,bob >/dev/null 2>&1
 [ -n "${gid:-}" ] && settle sel "$gid"
 checks=$((checks + 1))
-n=$(snap | grep -cE 'sbrow .*label="bob, carol"' || true)
+n=$(snap | grep -cE 'sbrow .*label="alice, bob, carol"' || true)
 if [ "$n" = "1" ]; then ok "reopening the same set reuses it"
 else fail "reopening produced $n rows"; fi
 
@@ -878,6 +878,46 @@ ed_step len 0 "the other channel starts empty"
 "$DRIVE" channel general >/dev/null 2>&1
 expect_grep '^ed .*text="a draft"' "and the draft comes back"
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1
+
+# --- mentioning someone who is not in the channel (REQ-287) ------------------
+# The defect this covers is a FALSE CONFIRMATION: the highlight is syntactic, so
+# a mention that notified nobody looked exactly like one that worked. Asserted as
+# a round trip — the notice appears, the remedy works, and afterwards the same
+# mention is silent because it now resolves.
+say "== mention of a non-member"
+"$DRIVE" view 0 >/dev/null 2>&1; settle sbkind 1
+"$DRIVE" mkchan solo 1 >/dev/null 2>&1
+wait_grep '^  ch [0-9]+ "solo"' >/dev/null 2>&1 || true
+"$DRIVE" channel solo >/dev/null 2>&1; settle re 1
+useq=$(snap | grep -oE '^unres seq=[0-9]+' | cut -d= -f2)
+"$DRIVE" send "hello @bob are you there" >/dev/null 2>&1
+t=0; while [ "$(snap | grep -oE '^unres seq=[0-9]+' | cut -d= -f2)" = "$useq" ] && [ $t -lt $WAIT_MS ]; do
+  sleep 0.1; t=$((t+100)); done
+expect_grep '^unres seq=[0-9]+ n=1 can_add=1 priv=0 names="bob"' \
+            "naming a non-member is reported to the sender, with a remedy"
+expect_eventually modal confirm "and it is offered as a confirmation, not a silent drop"
+
+# Accepting it adds them — proven by the mention going quiet afterwards rather
+# than by reading a members list, because resolution is the thing under test.
+"$DRIVE" key enter >/dev/null 2>&1; settle modal none
+useq=$(snap | grep -oE '^unres seq=[0-9]+' | cut -d= -f2)
+"$DRIVE" channel solo >/dev/null 2>&1; settle re 1
+"$DRIVE" send "second ping @bob" >/dev/null 2>&1
+sleep 2
+checks=$((checks + 1))
+if [ "$(snap | grep -oE '^unres seq=[0-9]+' | cut -d= -f2)" = "$useq" ]; then
+  ok "after adding them the same mention resolves and says nothing"
+else fail "still reported as unresolved after the add"; fi
+
+# A PRIVATE channel must say what adding someone discloses (cf. REQ-036a).
+"$DRIVE" mkchan hush 0 >/dev/null 2>&1
+wait_grep '^  ch [0-9]+ "hush"' >/dev/null 2>&1 || true
+"$DRIVE" channel hush >/dev/null 2>&1; settle re 1
+"$DRIVE" send "quiet word @carol" >/dev/null 2>&1
+expect_grep '^unres seq=[0-9]+ n=1 can_add=1 priv=1 names="carol"' \
+            "a private channel reports the disclosure it would make"
+"$DRIVE" key esc >/dev/null 2>&1; settle modal none
+"$DRIVE" view 0 >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; settle sbkind 1
 
 # --- accessibility (REQ-269, ARCH-99) ---------------------------------------
 # Two claims, and they are NOT the same claim. The dump proves what the app

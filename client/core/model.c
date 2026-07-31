@@ -1232,6 +1232,23 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->authed = false;
         set_status(m, "disconnected");
         break;
+    case OC_EV_MENTION_UNRESOLVED:
+        /* REQ-287. Stored rather than shown: the model does not know what a
+         * notice looks like, and the remedy differs per frontend (a confirmation
+         * in the GUI, a line in the TUI). `seq` bumps per occurrence for the same
+         * reason error_seq does — naming the same absent colleague in a second
+         * message must not be swallowed as a repeat of the first. */
+        m->unresolved.channel_id = e->channel_id;
+        m->unresolved.message_id = e->message_id;
+        m->unresolved.can_add    = (uint8_t)(e->status & 1);
+        m->unresolved.is_private = (uint8_t)((e->status & 2) ? 1 : 0);
+        m->unresolved.n_peers    = e->n_peers > 9 ? 9 : e->n_peers;
+        for (uint16_t i = 0; i < m->unresolved.n_peers; i++)
+            m->unresolved.peers[i] = e->peers[i];
+        snprintf(m->unresolved.names, sizeof m->unresolved.names, "%s",
+                 e->body ? e->body : "");
+        m->unresolved.seq++;
+        break;
     case OC_EV_ERROR:
         if (e->body) {
             set_status(m, e->body);
