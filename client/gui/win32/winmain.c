@@ -1755,6 +1755,25 @@ static void select_channel(uint64_t cid) {
     ac_close();
 }
 
+/* Are quiet hours in force RIGHT NOW (REQ-131)? The window is minutes since local
+ * midnight and may WRAP past midnight (22:00–07:00), which is the case a naive
+ * start<=now<=end gets wrong — and the case people actually configure.
+ *
+ * The daemon owns the same test for the push decision (oc_push_dnd_active); this is
+ * the client's own read for what to SHOW. They agree because the rule is simple and
+ * both are written from the same two fields — if it ever grows, it belongs in
+ * shared/ like the mention scanner. */
+static int dnd_now(const oc_model *m) {
+    if (!m || !m->dnd_enabled) return 0;
+    time_t t = time(NULL);
+    struct tm lt;
+    localtime_s(&lt, &t);
+    int now = lt.tm_hour * 60 + lt.tm_min;
+    int a = m->dnd_start_min, b = m->dnd_end_min;
+    if (a == b) return 1;                 /* a zero-length window means all day */
+    return (a < b) ? (now >= a && now < b) : (now >= a || now < b);
+}
+
 /* A channel's display name into `out` ("# general" / "@ bob"). */
 static void channel_label(const oc_model *m, const oc_channel *c, char *out, size_t cap) {
     if (c->kind == OC_CHANNEL_KIND_DM && c->n_peers > 2) {
@@ -1959,6 +1978,24 @@ static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
         draw_user_avatar(rt, m, m ? m->user_id : 0, (nm && nm[0]) ? nm : "U",
                          rf(cx - 15, py + 9, cx + 15, py + 39), OC_COL_ACCENT_DIM,
                          g_avatar, 0, 0);
+        /* Your own presence, bottom-right — the same dot, from the same helper, that
+         * every person in the DM list and the member pane carries. It was missing
+         * only here, which is the one place you cannot see yourself any other way. */
+        draw_presence_dot(rt, cx + 11, py + 35, 4.5f,
+                          m ? oc_model_presence_of(m, m->user_id) : OC_PRESENCE_OFFLINE,
+                          OC_COL_RAIL);
+        /* QUIET HOURS on the TOP hemisphere, deliberately opposite the presence dot:
+         * they answer different questions — "am I here" versus "will this reach me" —
+         * and stacking them in one corner would read as one compound state. A "z"
+         * rather than a bell-with-slash: at 11px the slash is a smudge, and the
+         * letterform survives the size. */
+        if (dnd_now(m)) {
+            D2D1_ELLIPSE ring = { { cx + 11, py + 13 }, 6.6f, 6.6f };
+            ID2D1RenderTarget_FillEllipse(rt, &ring, paint_with(OC_COL_RAIL));
+            D2D1_ELLIPSE badge = { { cx + 11, py + 13 }, 5.2f, 5.2f };
+            ID2D1RenderTarget_FillEllipse(rt, &badge, paint_with(OC_COL_NOTICE));
+            draw_text(rt, "z", g_micro, rf(cx + 5, py + 7, cx + 17, py + 19), OC_COL_RAIL);
+        }
         draw_text(rt, "You", g_micro, rf(0, py + 45, RAIL_W, py + 61), OC_COL_RAIL_ICON);
         rail_hit(py, py + RAIL_IH, NAV_PROFILE);
     }
