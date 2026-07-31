@@ -86,6 +86,15 @@ static void test_not_markup(void) {
     CHECK(scan("_only one_side") == 3);          /* this one DOES close */
     CHECK(scan("a * b") == 0);
 
+    /* A run of openers with nothing to close against is entirely literal —
+     * partially matching a pair of them would be worse than leaving it alone.
+     * The parser stops searching after the first failure (it cannot succeed
+     * later within the same range), so the second line here is the check that
+     * matters: giving up is scoped to the line, not to the message. */
+    CHECK(scan("*a *b *c") == 0);
+    CHECK(content_spans("*a *b\n*c* ok", OC_RT_BOLD) == 1);
+    CHECK(span_over("*a *b\n*c* ok", "c", OC_RT_BOLD));
+
     /* Nothing at all in ordinary prose. */
     CHECK(scan("hello there, how are you?") == 0);
     CHECK(scan("") == 0);
