@@ -257,9 +257,11 @@ product decision, and none is startable in `client/gui/win32/`:
 
 - **WIN-60** — the unreproduced crash while typing. Instrumented with a crash
   filter; nothing caught since. Open because unreproduced is not fixed.
-- **WIN-89 / REQ-269** — accessibility. **Decided and in progress (ARCH-99):** a
-  UIA provider over the self-drawn UI, plus a real system caret and UIA events.
-  The custom controls are explicitly *not* walked back to native ones.
+- ~~**WIN-89 / REQ-269** — accessibility.~~ **Built 2026-07-31 (ARCH-99).** A UIA
+  provider over the self-drawn UI, a real system caret, TextPattern on both the
+  transcript and the composer, and announcements. The custom controls were not
+  walked back. Verified by a real UIA client walking the tree from outside the
+  process (`scripts/uia_probe.ps1`).
 - **WIN-90 / REQ-220** — rich text. Needs the markup dialect settled first.
 - **WIN-91** — drafts across a restart. ARCH-88 leaves only server storage, so
   this needs a decision on where a draft lives *and* on whether a half-typed
@@ -482,7 +484,7 @@ CLIENT_GAP_ANALYSIS.md §5 and the CLIENT.md §8 roadmap, not here.
 | 266 other-user profile viewer | 🔵 ✅ GUI / ⛔ TUI | **Win32 built** (WIN-10, moved to the context pane by ARCH-94): avatar, name, live presence, role, and Message — beside the transcript rather than over it, with one level of back to the member list. Rich fields remain REQ-240. |
 | 267 sidebar org parity (DM section, sections, search) | ✅ | **Win32 built** (WIN-5/6/41/83): Starred, **user-defined sections** (8 × 32, appear-once with Starred winning), Channels and DMs, each with its own sort/filter/collapse, plus find. An expanded empty section says so in italics. |
 | 268 first-run onboarding (signup/first-owner UI) | 🔵 ✅ GUI / ⛔ TUI | **Win32 built** (WIN-32): "Have an invite? Create an account" redeems an invite on the sign-in card, creating the account and signing in together. |
-| 269 keyboard-only operation + accessibility | 🟡 🔨 | Win32 is keyboard-operable in the ordinary paths (composer, completion, Alt+Up/Down conversation movement, Ctrl+K, Ctrl+/, F6). The accessibility half was absent — no `WM_GETOBJECT`, no system caret — and is **now being built (ARCH-99)**: a UIA provider over the self-drawn UI (transcript as a navigable message list, sidebar as conversations, composer as editable text), a real system caret, and UIA events for arriving messages and failures. **The custom controls stay** — accessibility is implemented for them, not obtained by reverting to native controls. |
+| 269 keyboard-only operation + accessibility | ✅ 🔵 | Win32 is keyboard-operable in the ordinary paths (composer, completion, Alt+Up/Down conversation movement, Ctrl+K, Ctrl+/, F6). The accessibility half was absent — no `WM_GETOBJECT`, no system caret — and is **built (ARCH-99, 2026-07-31)**: a UIA provider over the self-drawn UI (transcript as a navigable message list, sidebar as conversations, composer as editable text), a real system caret, and UIA events for arriving messages and failures. **The custom controls stay** — accessibility is implemented for them, not obtained by reverting to native controls. |
 | 270 GIF/sticker pickers | ➖ | Explicit exclusion (app/webhook territory). |
 | 271 Canvas / collaborative docs | ➖ | Explicit exclusion. |
 | 272 Lists / tables / boards | ➖ | Explicit exclusion. |

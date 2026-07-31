@@ -23,7 +23,6 @@ document is only the work list derived from them.
 
 | # | Item | Pri | Size |
 |---|---|---|---|
-| **WIN-89** | **Accessibility — a UIA provider over the self-drawn UI (REQ-269, ARCH-99).** The client answers no `WM_GETOBJECT` (verified: zero occurrences) and creates no system caret, so a screen reader sees one blank window with nine edit boxes and cannot follow typing. **Decided 2026-07-31: implement accessibility FOR the custom controls — they are not being walked back to native ones.** Three parts: (1) a real **system caret** in the composer, which is also what makes IME composition position correctly; (2) a **UIA provider** — `IRawElementProviderSimple`/`Fragment`/`FragmentRoot`, answered from `WM_GETOBJECT` — exposing the transcript as a navigable list of messages, the sidebar as a list of conversations, and the composer as an editable text element; (3) **events** — `UiaRaiseNotificationEvent` for arriving messages, send failures and connection changes, plus focus and text-changed events. The tree is published from the paint pass that already computes every row rectangle, so the drawn UI and the described UI cannot drift. | P1 | L |
 | **WIN-60** | **Unreproduced crash while typing.** Seen three times, never reproduced, no dump at the time. Since 2026-07-29 the client installs an unhandled-exception filter (`crash_filter`) writing `crash-<pid>.txt` with the exception code, faulting address and module base, resolvable via `scripts/crash_resolve.sh`. Nothing has been caught since. Open because unreproduced is not fixed. | P1 | — |
 
 ## Open, but not startable here
@@ -50,8 +49,10 @@ pattern REQ-221 and REQ-230 both followed.
 - **The smoke does not run in CI** (WIN-81, closed as far as code can take it).
   The daemon is epoll-based and Linux-only, and GitHub's Windows runners cannot
   host it. The job exists and skips until a self-hosted Windows+WSL runner does.
-  Until then the smoke is a local gate — and see WIN-87 on how far it can be
-  trusted as one.
+  Until then the smoke is a local gate. It is a trustworthy one since WIN-87/88:
+  130 checks, waiting on state rather than sleeping, refusing to run against the
+  wrong daemon, and including a real UIA client walking the accessibility tree
+  from outside the process.
 
 ## Not planned for this client
 
@@ -69,9 +70,10 @@ pattern REQ-221 and REQ-230 both followed.
 ## What "closed" does and does not mean
 
 **Everything startable in `client/gui/win32/` is closed** (2026-07-31). WIN-1 …
-WIN-88 plus WIN-93 and WIN-95 are done; the six items above are each blocked on a
-daemon requirement or an ARCH decision, and the last of them cannot be started
-here at all. An adversarial review on 2026-07-30 found no defect in the
+WIN-89 plus WIN-93 and WIN-95 are done — accessibility included, built *for* the
+custom controls rather than by retreating to native ones (ARCH-99). The items
+above are each blocked on a daemon requirement or an ARCH decision, or, in
+WIN-60's case, on a crash that has not reproduced since it was instrumented. An adversarial review on 2026-07-30 found no defect in the
 previously-closed list, several claims verified by round-trip against a live
 daemon (pin → Pins tab; save → Later; Activity, Files, Later and Admin all
 rendering real content).
