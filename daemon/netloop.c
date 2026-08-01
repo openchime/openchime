@@ -118,6 +118,11 @@ typedef struct {
     uint64_t     send_win_start; /* fixed-window start for the send rate limit */
     uint32_t     send_count;     /* sends counted in the current window */
     uint8_t      presence;       /* OC_PRESENCE_ONLINE / _AWAY (per connection) */
+    /* The pause's end instant (REQ-278), seeded from AUTH_OK and refreshed when
+     * the user sets one. Held here rather than read from the database because
+     * this thread has none (ARCH-66/67), and presence — the thing it rides
+     * beside — already lives in exactly this memory. */
+    uint64_t     dnd_until_ms;
     conn_xfer    xfer;           /* in-flight attachment transfer, if any */
     /* HTTP mode (ARCH-32/54): a connection that did not negotiate the oc/1 ALPN
      * is a webhook/HTTP client, not a binary-protocol peer. `hin` accumulates the
@@ -363,9 +368,24 @@ static void presence_send(int ep, conn *c, const uint8_t *buf, size_t len) {
     if (out_append(c, buf, len) == 0) { flush_out(c); update_interest(ep, c); }
 }
 
-static void encode_presence(uint8_t *buf, size_t cap, size_t *outlen, uint64_t uid, uint8_t status) {
+/* Is this user paused right now? Any of their connections carrying a stamp in
+ * the future answers yes; a stamp that has passed answers no without anyone
+ * having to clear it, which is the same rule the database applies on read. */
+static int dnd_of(conn **conns, uint64_t uid) {
+    uint64_t now = (uint64_t)time(NULL) * 1000ull;
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+        conn *c = conns[fd];
+        if (c && c->authed && c->user_id == uid && c->dnd_until_ms > now) return 1;
+    }
+    return 0;
+}
+
+static void encode_presence(uint8_t *buf, size_t cap, size_t *outlen, uint64_t uid,
+                            uint8_t status, int dnd) {
     oc_wbuf w; oc_wbuf_init(&w, buf, cap);
-    oc_presence_update pu = { uid, status };
+    /* The FACT only, never the instant: a colleague needs to know whether to
+     * write, and when you are back is a movement report (REQ-122/278). */
+    oc_presence_update pu = { uid, status, (uint8_t)(dnd ? 1 : 0) };
     oc_encode_presence_update(&w, OC_PROTOCOL_VERSION, &pu);
     *outlen = w.len;
 }
@@ -375,7 +395,7 @@ static void encode_presence(uint8_t *buf, size_t cap, size_t *outlen, uint64_t u
  * own presence locally. */
 static void broadcast_presence(int ep, conn **conns, uint64_t uid, uint8_t status) {
     uint8_t buf[32]; size_t len = 0;
-    encode_presence(buf, sizeof buf, &len, uid, status);
+    encode_presence(buf, sizeof buf, &len, uid, status, dnd_of(conns, uid));
     for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
         if (conns[fd] && conns[fd]->authed && conns[fd]->user_id != uid)
             presence_send(ep, conns[fd], buf, len);
@@ -1325,6 +1345,15 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_SNOOZE) {
+            oc_set_snooze ss;
+            if (oc_decode_set_snooze(&p, &ss) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_SNOOZE, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->snooze_minutes = ss.minutes;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_REGISTER_DEVICE_TOKEN) {
             oc_register_device_token rd;
             if (oc_decode_register_device_token(&p, &rd) != OC_OK) return -1;
@@ -1815,6 +1844,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         c->user_id = r->user_id;
         c->session_id = r->session_id;   /* REQ-182 */
         c->presence = OC_PRESENCE_ONLINE;
+        c->dnd_until_ms = r->snooze_until_ms;   /* REQ-278, already expiry-checked */
         int fd = c->fd;
         uint64_t uid = r->user_id;
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
@@ -1852,7 +1882,8 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
                 if (conns[g] && conns[g]->authed && conns[g]->user_id == v->user_id) { first = 0; break; }
             if (!first) continue;
             uint8_t pbuf[32]; size_t plen = 0;
-            encode_presence(pbuf, sizeof pbuf, &plen, v->user_id, presence_of(conns, v->user_id));
+            encode_presence(pbuf, sizeof pbuf, &plen, v->user_id, presence_of(conns, v->user_id),
+                            dnd_of(conns, v->user_id));
             presence_send(ep, conns[fd], pbuf, plen);
         }
         int others = 0;
@@ -2848,6 +2879,39 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             if (c && c->authed && c->user_id == r->user_id)
                 send_bytes(ep, conns, fd, g_enc, len);
         }
+        /* The pause travels with the rest of a user's notification state, in its
+         * own frame (REQ-278) — NOTIFY_PREFS ends in a repeated list, so a field
+         * added to its fixed part would shift every entry after the first. */
+        {
+            uint8_t sbuf[32]; oc_wbuf sw; oc_wbuf_init(&sw, sbuf, sizeof sbuf);
+            oc_snooze sn = { r->snooze_until_ms };
+            oc_encode_snooze(&sw, OC_PROTOCOL_VERSION, &sn);
+            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                conn *c = conns[fd];
+                if (c && c->authed && c->user_id == r->user_id) {
+                    c->dnd_until_ms = r->snooze_until_ms;
+                    send_bytes(ep, conns, fd, sbuf, sw.len);
+                }
+            }
+        }
+        break;
+    }
+    case OC_RES_SNOOZE: {
+        /* To the user's own connections: when it ends, which only they may know.
+         * Then re-announce their presence to everyone else, because the FACT is
+         * public — a sender should learn it before writing, not after being
+         * ignored (REQ-122). */
+        uint8_t sbuf[32]; oc_wbuf sw; oc_wbuf_init(&sw, sbuf, sizeof sbuf);
+        oc_snooze sn = { r->snooze_until_ms };
+        oc_encode_snooze(&sw, OC_PROTOCOL_VERSION, &sn);
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id == r->user_id) {
+                c->dnd_until_ms = r->snooze_until_ms;
+                send_bytes(ep, conns, fd, sbuf, sw.len);
+            }
+        }
+        broadcast_presence(ep, conns, r->user_id, presence_of(conns, r->user_id));
         break;
     }
     case OC_RES_NOTIFY_ERR: {
@@ -3177,6 +3241,24 @@ static void maybe_fire_scheduled(oc_dbwriter *dbw) {
     if (j) oc_dbwriter_submit(dbw, j);
 }
 
+/* A pause that has simply RUN OUT. Nothing needs to clear the stamp — every
+ * reader treats a passed one as absent — but other people were told the fact,
+ * and only a frame can untell them. So the tick that notices an expiry
+ * re-announces that user's presence, and does nothing at all otherwise
+ * (REQ-278). */
+static void expire_snoozes(int ep, conn **conns) {
+    uint64_t now = (uint64_t)time(NULL) * 1000ull;
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+        conn *c = conns[fd];
+        if (!c || !c->authed || !c->dnd_until_ms || c->dnd_until_ms > now) continue;
+        uint64_t uid = c->user_id;
+        for (int g = 0; g < OC_NETLOOP_MAX_FD; g++)      /* every connection they hold */
+            if (conns[g] && conns[g]->authed && conns[g]->user_id == uid)
+                conns[g]->dnd_until_ms = 0;
+        broadcast_presence(ep, conns, uid, presence_of(conns, uid));
+    }
+}
+
 static void maybe_run_maintenance(oc_dbwriter *dbw) {
     uint64_t now = now_ms();
     if (g_last_maint_ms && now - g_last_maint_ms < g_spol.interval_ms) return;
@@ -3437,6 +3519,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         /* Every tick, timeout included — a quiet box must still be maintained. */
         maybe_run_maintenance(dbw);
         maybe_fire_scheduled(dbw);
+        expire_snoozes(ep, conns);
         if (nfds < 0) { if (errno == EINTR) continue; break; }
 
         for (int i = 0; i < nfds; i++) {

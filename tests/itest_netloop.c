@@ -1325,6 +1325,11 @@ static void test_notify_prefs_vertical(int port, const uint8_t *pin) {
         CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_NOTIFY_PREFS);
         CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, &dnd, NULL) == OC_OK && n == 1);
         CHECK(ents[0].channel_id == OC_DEFAULT_CHANNEL && ents[0].level == OC_NOTIFY_MENTIONS);
+        /* The pause travels with the rest of the notification state, in its own
+         * frame (REQ-278) — asserted rather than skipped, because "the snapshot
+         * arrived" and "the snapshot arrived complete" are different claims. */
+        CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SNOOZE);
+        { oc_snooze sn; CHECK(oc_decode_snooze(&p, &sn) == OC_OK && sn.until_ms == 0); }
     }
 
     /* Set DND on device 2 -> both devices get the snapshot (pref persists). */
@@ -1336,6 +1341,8 @@ static void test_notify_prefs_vertical(int port, const uint8_t *pin) {
         CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_NOTIFY_PREFS);
         CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, &dnd, NULL) == OC_OK);
         CHECK(dnd.enabled == 1 && dnd.start_min == 1320 && dnd.end_min == 480 && n == 1);
+        CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SNOOZE);
+        { oc_snooze sn; CHECK(oc_decode_snooze(&p, &sn) == OC_OK && sn.until_ms == 0); }
     }
 
     /* The global default (REQ-134) rides the same snapshot and syncs the same way:
@@ -1351,7 +1358,43 @@ static void test_notify_prefs_vertical(int port, const uint8_t *pin) {
         CHECK(dflt == OC_NOTIFY_NONE);
         /* ... and the per-channel override is still there, untouched. */
         CHECK(n == 1 && ents[0].level == OC_NOTIFY_MENTIONS);
+        CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SNOOZE);
+        { oc_snooze sn; CHECK(oc_decode_snooze(&p, &sn) == OC_OK && sn.until_ms == 0); }
     }
+
+    /* --- pausing (REQ-278, WIN-92) ----------------------------------------
+     * The pause is the OTHER mechanism, and the vertical is what proves they
+     * are separate: setting one must not disturb the other, both of the user's
+     * devices learn the instant, and the other user learns only the fact. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_snooze ss = { 30 };
+    CHECK(oc_encode_set_snooze(&w, OC_PROTOCOL_VERSION, &ss) == OC_OK);
+    CHECK(send_frame(&a1, buf, w.len) == 0);
+    uint64_t until = 0;
+    for (int d = 0; d < 2; d++) {
+        CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SNOOZE);
+        oc_snooze sn; CHECK(oc_decode_snooze(&p, &sn) == OC_OK);
+        CHECK(sn.until_ms > 0);
+        if (d == 0) until = sn.until_ms; else CHECK(sn.until_ms == until);
+    }
+
+    /* Ending it early is the same op with 0 minutes — and the schedule set
+     * above is untouched by either act, which is the whole point of naming the
+     * two mechanisms apart. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_snooze off = { 0 };
+    CHECK(oc_encode_set_snooze(&w, OC_PROTOCOL_VERSION, &off) == OC_OK);
+    CHECK(send_frame(&a2, buf, w.len) == 0);
+    for (int d = 0; d < 2; d++) {
+        CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SNOOZE);
+        oc_snooze sn; CHECK(oc_decode_snooze(&p, &sn) == OC_OK && sn.until_ms == 0);
+    }
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_list_notify_prefs(&w, OC_PROTOCOL_VERSION) == OC_OK);
+    CHECK(send_frame(&a1, buf, w.len) == 0);
+    CHECK(read_frame(&a1, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_NOTIFY_PREFS);
+    CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, &dnd, NULL) == OC_OK);
+    CHECK(dnd.enabled == 1 && dnd.start_min == 1320 && dnd.end_min == 480);
 
     client_close(&a1);
     client_close(&a2);

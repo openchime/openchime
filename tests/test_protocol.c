@@ -505,11 +505,39 @@ static void test_presence_frames(void) {
         CHECK(oc_decode_set_presence(&p, &out) == OC_OK && out.status == OC_PRESENCE_AWAY);
     }
     {
-        oc_presence_update in = { 42, OC_PRESENCE_ONLINE };
+        oc_presence_update in = { 42, OC_PRESENCE_ONLINE, 0 };
         ROUNDTRIP(oc_encode_presence_update(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PRESENCE_UPDATE, h, p);
         oc_presence_update out;
         CHECK(oc_decode_presence_update(&p, &out) == OC_OK);
-        CHECK(out.user_id == 42 && out.status == OC_PRESENCE_ONLINE);
+        CHECK(out.user_id == 42 && out.status == OC_PRESENCE_ONLINE && out.dnd == 0);
+    }
+    {   /* The do-not-disturb FACT rides beside presence (REQ-122/278) — and it
+         * is a fact, never an instant: there is nowhere in this frame to put a
+         * time, which is the design rather than an omission. */
+        oc_presence_update in = { 42, OC_PRESENCE_AWAY, 1 };
+        ROUNDTRIP(oc_encode_presence_update(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PRESENCE_UPDATE, h, p);
+        oc_presence_update out;
+        CHECK(oc_decode_presence_update(&p, &out) == OC_OK);
+        CHECK(out.user_id == 42 && out.status == OC_PRESENCE_AWAY && out.dnd == 1);
+    }
+    {   /* Pausing (REQ-278): minutes from now on the way in, an absolute instant
+         * on the way back, and 0 in either direction means "not paused". */
+        oc_set_snooze in = { 30 };
+        ROUNDTRIP(oc_encode_set_snooze(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_SNOOZE, h, p);
+        oc_set_snooze out;
+        CHECK(oc_decode_set_snooze(&p, &out) == OC_OK && out.minutes == 30);
+    }
+    {
+        oc_set_snooze in = { 0 };
+        ROUNDTRIP(oc_encode_set_snooze(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_SNOOZE, h, p);
+        oc_set_snooze out;
+        CHECK(oc_decode_set_snooze(&p, &out) == OC_OK && out.minutes == 0);
+    }
+    {
+        oc_snooze in = { 1785620669000ull };
+        ROUNDTRIP(oc_encode_snooze(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SNOOZE, h, p);
+        oc_snooze out;
+        CHECK(oc_decode_snooze(&p, &out) == OC_OK && out.until_ms == 1785620669000ull);
     }
     {
         oc_typing in = { 7 };

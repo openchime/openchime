@@ -74,6 +74,8 @@ struct oc_dbwriter {
 #define OC_IDEM_RETENTION_MS (24ull * 60 * 60 * 1000)
 #define OC_PRUNE_INTERVAL_MS (60ull * 60 * 1000)
 
+static uint64_t snooze_until(sqlite3 *db, uint64_t uid);   /* fwd — auth and the prefs snapshot both read it */
+
 static uint64_t dbw_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -701,6 +703,9 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
     r->user_id = uid;
     r->role = role;
     r->session_id = sess_id;   /* REQ-182: which row this connection is using */
+    /* The pause rides along (REQ-278): the net thread keeps the FACT in memory
+     * so presence fan-out can carry it, and it has no database of its own. */
+    r->snooze_until_ms = snooze_until(db, uid);
     if (fresh) {
         uint8_t token[OC_SESSION_TOKEN_LEN]; uint64_t expiry = 0;
         if (mint_session(db, uid, token, &expiry, &sess_id) != 0) {
@@ -978,6 +983,7 @@ static oc_dbres *process_redeem(oc_dbwriter *w, const oc_job *j) {
     r->session_id = sid;
     r->user_id = uid;
     r->role = role;
+    r->snooze_until_ms = snooze_until(db, uid);
     memcpy(r->session_token, token, sizeof token);
     r->has_session_token = 1;
     r->session_expiry = sexp;
@@ -4070,6 +4076,10 @@ static oc_dbres *process_delete_webhook(sqlite3 *db, const oc_job *j) {
 static void build_notify_prefs(sqlite3 *db, uint64_t user_id, oc_dbres *r) {
     r->type = OC_RES_NOTIFY_PREFS;
     r->user_id = user_id;
+    /* A pause is notification state, so it belongs in the same answer — carried
+     * beside the frame rather than inside it, because NOTIFY_PREFS ends in a
+     * repeated list and anything added to its fixed part shifts every entry. */
+    r->snooze_until_ms = snooze_until(db, user_id);
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
         "SELECT dnd_enabled, dnd_start_min, dnd_end_min, notify_default "
@@ -4361,6 +4371,45 @@ static oc_dbres *process_get_profile(sqlite3 *db, const oc_job *j) {
 }
 
 /* Set the caller's do-not-disturb window (REQ-131). Write. */
+/* The pause's end instant for `uid`, ENFORCED ON READ: a stamp that has passed
+ * reads as 0, so nobody — the push worker, the net thread, the user's own client
+ * — needs a sweep or a clock of their own to agree that it is over (REQ-278,
+ * the pattern migration 0027 proved for status expiry). */
+static uint64_t snooze_until(sqlite3 *db, uint64_t uid) {
+    sqlite3_stmt *st = NULL;
+    uint64_t until = 0;
+    sqlite3_prepare_v2(db, "SELECT dnd_until_ms FROM users WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    if (sqlite3_step(st) == SQLITE_ROW) until = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return (until && until <= dbw_now_ms()) ? 0 : until;
+}
+
+/* Pause notifications until an instant (REQ-278, WIN-92). The wire carries
+ * MINUTES FROM NOW, as Slack's `dnd.setSnooze` does — every preset is a duration
+ * and only the client knows the timezone that turns "until tomorrow" into a
+ * moment — so the instant is resolved here, once. 0 minutes ends the pause:
+ * ending early is "until now", not a second op. Write. */
+static oc_dbres *process_set_snooze(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_SNOOZE;
+    r->user_id = j->user_id;
+    /* Capped so a bad client cannot silence somebody for a decade by arithmetic;
+     * a week is already far past any preset the requirement names. */
+    uint32_t mins = j->snooze_minutes > 7u * 24u * 60u ? 7u * 24u * 60u : j->snooze_minutes;
+    uint64_t until = mins ? dbw_now_ms() + (uint64_t)mins * 60000ull : 0;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "UPDATE users SET dnd_until_ms=?1 WHERE id=?2;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)until);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    r->snooze_until_ms = until;
+    return r;
+}
+
 static oc_dbres *process_set_dnd(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -5280,6 +5329,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_AVATAR)      return process_set_avatar(w->db, j);
     if (j->type == OC_JOB_SET_READ_CURSOR) return process_set_read_cursor(w->db, j);
     if (j->type == OC_JOB_SET_DND)         return process_set_dnd(w->db, j);
+    if (j->type == OC_JOB_SET_SNOOZE)      return process_set_snooze(w->db, j);
     if (j->type == OC_JOB_REGISTER_DEVICE_TOKEN)   return process_register_device_token(w->db, j);
     if (j->type == OC_JOB_UNREGISTER_DEVICE_TOKEN) return process_unregister_device_token(w->db, j);
     if (j->type == OC_JOB_PRUNE_DEVICE_TOKEN)      return process_prune_device_token(w->db, j);

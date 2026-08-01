@@ -38,11 +38,15 @@
  * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
  * preview_author. Shipping client and daemon together (ARCH-61) means there is
  * no compatibility window to preserve — only a mismatch to detect loudly. */
-/* 4: USER_LIST carries each user's avatar attachment id (WIN-47). A frame LAYOUT
+/* 5: PRESENCE_UPDATE carries the do-not-disturb FACT beside the status byte
+ * (REQ-122/278). One byte appended to a fixed frame is still a layout change,
+ * and the rule above has no exception for small ones.
+ *
+ * 4: USER_LIST carries each user's avatar attachment id (WIN-47). A frame LAYOUT
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
  * "connection lost" (ARCH-61 ships the two together). */
-#define OC_PROTOCOL_VERSION 4u
+#define OC_PROTOCOL_VERSION 5u
 
 /* Transport conventions (see PROTOCOL.md §1). The binary protocol shares TLS
  * port 443 with the future HTTP/webhook surface, demultiplexed by ALPN: a
@@ -223,6 +227,14 @@ typedef enum {
     OC_MSG_UPDATE_SCHEDULED = 0x00C7, /* C->S, change its time or its text */
     OC_MSG_SCHEDULED        = 0x00C8, /* S->C, one row: list entry AND push */
     OC_MSG_SCHEDULED_LIST   = 0x00C9, /* S->C, terminator */
+    /* Pausing notifications (REQ-278). Slack's `dnd.setSnooze` — the MANUAL,
+     * one-shot half — deliberately named apart from the recurring schedule at
+     * 0x0091: two mechanisms, two ways to cancel, and cancelling one has never
+     * cancelled the other. A separate frame rather than a field on NOTIFY_PREFS
+     * because that frame ends in a repeated list, so anything added to its fixed
+     * part shifts every entry. */
+    OC_MSG_SET_SNOOZE       = 0x00CA, /* C->S, pause for N minutes from now (0 = end it) */
+    OC_MSG_SNOOZE           = 0x00CB, /* S->C, to that user's own connections: when it ends */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -708,12 +720,22 @@ typedef struct { uint64_t channel_id; uint64_t message_id; } oc_set_read_cursor;
 typedef struct { uint64_t webhook_id; } oc_delete_webhook;
 typedef struct { uint64_t webhook_id; } oc_webhook_deleted;
 typedef struct { uint8_t status; } oc_set_presence;
-typedef struct { uint64_t user_id; uint8_t status; } oc_presence_update;
+/* `dnd` is the pause/schedule FACT for other people (REQ-122/278) — one bit,
+ * never the end time. Appended after `status`, and decoded tolerantly, so a peer
+ * built before it existed still reads the frame it always read. */
+typedef struct { uint64_t user_id; uint8_t status; uint8_t dnd; } oc_presence_update;
 typedef struct { uint64_t channel_id; } oc_typing;
 typedef struct { uint64_t channel_id; uint64_t user_id; } oc_typing_update;
 /* Notification preferences (REQ-130/131). */
 typedef struct { uint64_t channel_id; uint8_t level; } oc_set_notify_pref;
 typedef struct { uint8_t enabled; uint16_t start_min; uint16_t end_min; } oc_set_dnd;
+/* REQ-278. Minutes FROM NOW, as Slack's API takes them: the presets are all
+ * durations, and only the client knows the timezone that turns "until tomorrow"
+ * into an instant. 0 ends the pause — there is no second op. */
+typedef struct { uint32_t minutes; } oc_set_snooze;
+/* The absolute instant it ends, 0 for "not paused". Self-only: other people
+ * learn THAT you are not to be disturbed, never when you are back (REQ-122). */
+typedef struct { uint64_t until_ms; } oc_snooze;
 
 /* Push device-token registration (REQ-132). platform: OC_PUSH_APNS / OC_PUSH_FCM. */
 #define OC_PUSH_APNS        0u
@@ -989,6 +1011,8 @@ oc_result oc_encode_typing(oc_wbuf *w, uint16_t version, const oc_typing *m);
 oc_result oc_encode_typing_update(oc_wbuf *w, uint16_t version, const oc_typing_update *m);
 oc_result oc_encode_set_notify_pref(oc_wbuf *w, uint16_t version, const oc_set_notify_pref *m);
 oc_result oc_encode_set_dnd(oc_wbuf *w, uint16_t version, const oc_set_dnd *m);
+oc_result oc_encode_set_snooze(oc_wbuf *w, uint16_t version, const oc_set_snooze *m);
+oc_result oc_encode_snooze(oc_wbuf *w, uint16_t version, const oc_snooze *m);
 oc_result oc_encode_register_device_token(oc_wbuf *w, uint16_t version, const oc_register_device_token *m);
 oc_result oc_encode_unregister_device_token(oc_wbuf *w, uint16_t version, oc_slice token);
 oc_result oc_encode_device_token_ack(oc_wbuf *w, uint16_t version, const oc_device_token_ack *m);
@@ -1134,6 +1158,8 @@ oc_result oc_decode_typing(oc_rbuf *p, oc_typing *m);
 oc_result oc_decode_typing_update(oc_rbuf *p, oc_typing_update *m);
 oc_result oc_decode_set_notify_pref(oc_rbuf *p, oc_set_notify_pref *m);
 oc_result oc_decode_set_dnd(oc_rbuf *p, oc_set_dnd *m);
+oc_result oc_decode_set_snooze(oc_rbuf *p, oc_set_snooze *m);
+oc_result oc_decode_snooze(oc_rbuf *p, oc_snooze *m);
 oc_result oc_decode_register_device_token(oc_rbuf *p, oc_register_device_token *m);
 oc_result oc_decode_unregister_device_token(oc_rbuf *p, oc_slice *token);
 oc_result oc_decode_device_token_ack(oc_rbuf *p, oc_device_token_ack *m);

@@ -414,6 +414,17 @@ Server-authoritative notification settings, synced across a user's devices.
 - `dnd_start_min`, `dnd_end_min` (INTEGER) — the daily DND window as minutes of
   day (UTC; the client converts from local), wrapping past midnight when
   `start > end`. DND suppresses push, not in-app unread (REQ-131).
+- `dnd_until_ms` (INTEGER, migration 0033) — a **pause** (REQ-278): the absolute
+  instant it ends, `0` for none. A different type from the window above, not a
+  longer version of it — the window is periodic by construction, this is one
+  moment, and neither can express the other, which is why "do not disturb until
+  5pm" was unbuildable with the window alone.
+
+  **Enforced on read**, the pattern migration 0027 proved for status expiry: a
+  stamp that has passed reads as absent everywhere (the push worker, the auth
+  result, the prefs snapshot), so a client that is not running to clear its own
+  state costs nothing and there is no sweep to keep correct. Ending a pause early
+  writes `0` — the same op with 0 minutes, not a second one.
 
 ---
 

@@ -651,6 +651,24 @@ static const char MIGRATION_0032[] =
     "CREATE INDEX idx_sched_due ON scheduled_messages(send_at_ms) WHERE state='pending';"
     "CREATE INDEX idx_sched_user ON scheduled_messages(user_id, send_at_ms);";
 
+static const char MIGRATION_0033[] =
+    /* Pausing notifications (REQ-278, WIN-92). An ABSOLUTE instant, not a
+     * duration: the wire takes minutes-from-now because that is what the presets
+     * are, and the daemon resolves them once, here, so a pause cannot drift with
+     * the reader's clock.
+     *
+     * Enforced ON READ, the pattern migration 0027 proved for status expiry: a
+     * client that is not running cannot clear its own state, and a stamp that
+     * reads as absent once it has passed needs no sweep and no timer. 0 means
+     * "not paused", which is also what ending one early writes — there is no
+     * second op (REQ-278).
+     *
+     * Beside the ARCH-72 window rather than replacing it: they are different
+     * types. The window is a pair of minutes-of-day and is periodic by
+     * construction; this is one instant. Neither can express the other, which is
+     * why Slack ships both and why the window alone left "until 5pm" unbuildable. */
+    "ALTER TABLE users ADD COLUMN dnd_until_ms INTEGER NOT NULL DEFAULT 0;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -684,6 +702,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 30, MIGRATION_0030 },
     { 31, MIGRATION_0031 },
     { 32, MIGRATION_0032 },
+    { 33, MIGRATION_0033 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

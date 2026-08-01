@@ -324,7 +324,8 @@ int oc_push_dnd_active(int enabled, int start_min, int end_min, int now_min) {
 }
 
 int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
-                    uint64_t message_id, int now_min, oc_push_target *out, int max) {
+                    uint64_t message_id, int now_min, uint64_t now_ms,
+                    oc_push_target *out, int max) {
     sqlite3_stmt *st = NULL;
     /* Level ALL (0) always; level MENTIONS (1) only when this message actually
      * names the recipient — the deferred half of ARCH-72, which waited on
@@ -337,7 +338,8 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
      * alike. Recorded rather than silently approximated: the cost is that
      * @here may push someone who was already looking. */
     if (sqlite3_prepare_v2(db,
-            "SELECT dt.platform, dt.token, u.dnd_enabled, u.dnd_start_min, u.dnd_end_min "
+            "SELECT dt.platform, dt.token, u.dnd_enabled, u.dnd_start_min, u.dnd_end_min, "
+            "       u.dnd_until_ms "
             "FROM channel_members cm "
             "JOIN device_tokens dt ON dt.user_id = cm.user_id "
             "JOIN users u ON u.id = cm.user_id "
@@ -370,6 +372,11 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
         int dnd_start = sqlite3_column_int(st, 3);
         int dnd_end   = sqlite3_column_int(st, 4);
         if (oc_push_dnd_active(dnd_en, dnd_start, dnd_end, now_min)) continue;
+        /* A PAUSE (REQ-278), the other half of do-not-disturb: an absolute
+         * instant, checked here rather than swept anywhere, and it only ever ADDS
+         * silence — so it needs no precedence rule against the window above. */
+        uint64_t until = (uint64_t)sqlite3_column_int64(st, 5);
+        if (until && until > (uint64_t)now_ms) continue;
 
         const char *platform = (const char *)sqlite3_column_text(st, 0);
         const char *token    = (const char *)sqlite3_column_text(st, 1);
@@ -479,7 +486,7 @@ static void do_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
 
     oc_push_target targets[OC_PUSH_MAX_TARGETS];
     int n = oc_push_collect(p->rdb, channel_id, author_id, message_id, now_min,
-                            targets, OC_PUSH_MAX_TARGETS);
+                            (uint64_t)nowsec * 1000ull, targets, OC_PUSH_MAX_TARGETS);
     if (n <= 0) return;
 
     size_t cap = (size_t)n * (OC_DEVICE_TOKEN_MAX + 96) + 64;

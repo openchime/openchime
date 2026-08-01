@@ -46,9 +46,12 @@ typedef struct { uint8_t platform; char token[OC_DEVICE_TOKEN_MAX]; } oc_push_ta
  * not in DND at now_min, with a device token. Fills up to `max`; returns count. */
 /* `message_id` is what makes the MENTIONS level answerable; pass 0 to mean "no
  * particular message", which then selects only level-ALL recipients. */
+/* `now_min` is the minute of the day the recurring window is compared against;
+ * `now_ms` is the wall instant a pause is compared against (REQ-278). Both are
+ * passed in rather than read here, so a test can state the moment it means. */
 int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
-                    uint64_t message_id,
-                    int now_min, oc_push_target *out, int max);
+                    uint64_t message_id, int now_min, uint64_t now_ms,
+                    oc_push_target *out, int max);
 
 /* Sign the CP-12 canonical string for `body` with the enrollment key ->
  * base64(DER ECDSA) into sig_b64. Returns 0 on success. */

@@ -184,12 +184,12 @@ static void test_collect(void) {
 
     /* At 10:30 (630): author excluded, carol muted, bob in DND → only dave. */
     oc_push_target t[8];
-    int n = oc_push_collect(rdb, 1, alice, 0, 630, t, 8);
+    int n = oc_push_collect(rdb, 1, alice, 0, 630, 0, t, 8);
     CHECK(n == 1);
     if (n == 1) CHECK(strcmp(t[0].token, "tok-dave") == 0);
 
     /* At 01:40 (100): bob no longer in DND → bob + dave (carol still muted). */
-    n = oc_push_collect(rdb, 1, alice, 0, 100, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 0, 100, 0, t, 8);
     CHECK(n == 2);
     int saw_bob = 0, saw_dave = 0, saw_carol = 0, saw_alice = 0;
     for (int i = 0; i < n; i++) {
@@ -211,7 +211,7 @@ static void test_collect(void) {
 
     CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
     /* A message that mentions nobody: dave is on MENTIONS, so he is out. */
-    n = oc_push_collect(rdb, 1, alice, 0, 100, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 0, 100, 0, t, 8);
     int only_bob = (n == 1) && strcmp(t[0].token, "tok-bob") == 0;
     CHECK(only_bob);
 
@@ -226,7 +226,7 @@ static void test_collect(void) {
         CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
         sqlite3_close(wdb);
     }
-    n = oc_push_collect(rdb, 1, alice, 4242, 100, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 4242, 100, 0, t, 8);
     int saw_d = 0, saw_b = 0;
     for (int i = 0; i < n; i++) {
         if (strcmp(t[i].token, "tok-dave") == 0) saw_d = 1;
@@ -236,7 +236,7 @@ static void test_collect(void) {
 
     /* A DIFFERENT message still leaves him out: the gate is per message, not a
      * sticky "dave gets mentions" flag. */
-    n = oc_push_collect(rdb, 1, alice, 4243, 100, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 4243, 100, 0, t, 8);
     saw_d = 0;
     for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-dave") == 0) saw_d = 1;
     CHECK(!saw_d);
@@ -251,7 +251,7 @@ static void test_collect(void) {
             " VALUES(4244,1,NULL,2,0,8,1);", NULL, NULL, NULL) == SQLITE_OK);
         sqlite3_close(wdb);
     }
-    n = oc_push_collect(rdb, 1, alice, 4244, 100, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 4244, 100, 0, t, 8);
     saw_d = 0; int saw_c = 0;
     for (int i = 0; i < n; i++) {
         if (strcmp(t[i].token, "tok-dave") == 0)  saw_d = 1;
@@ -260,6 +260,48 @@ static void test_collect(void) {
     CHECK(saw_d);
     CHECK(!saw_c);
     sqlite3_close(rdb);
+
+    /* --- a PAUSE silences regardless of the window (REQ-278, WIN-92) --------
+     * The window is periodic; a pause is one instant. At 01:40 bob is outside
+     * his quiet hours and would be pushed — a pause has to reach him anyway,
+     * which is the whole reason the two mechanisms both exist. */
+    {
+        oc_job *sj = oc_job_new(OC_JOB_SET_SNOOZE, 0);
+        sj->user_id = bob; sj->snooze_minutes = 60;
+        oc_dbwriter_submit(w, sj);
+        oc_dbres *sr = wait_result(w);
+        CHECK(sr && sr->type == OC_RES_SNOOZE && sr->snooze_until_ms > 0);
+        uint64_t until = sr ? sr->snooze_until_ms : 0;
+        oc_dbres_free(sr);
+
+        CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+        n = oc_push_collect(rdb, 1, alice, 0, 100, until - 1000, t, 8);
+        int saw_b2 = 0;
+        for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-bob") == 0) saw_b2 = 1;
+        CHECK(!saw_b2);                       /* paused: no push, window or not */
+
+        /* One millisecond past the end it is over, with nothing having cleared
+         * it — the stamp is enforced on READ, so there is no sweep to wait for. */
+        n = oc_push_collect(rdb, 1, alice, 0, 100, until + 1, t, 8);
+        saw_b2 = 0;
+        for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-bob") == 0) saw_b2 = 1;
+        CHECK(saw_b2);
+        sqlite3_close(rdb);
+
+        /* Ending early is the same op with 0 minutes, not a second one. */
+        sj = oc_job_new(OC_JOB_SET_SNOOZE, 0);
+        sj->user_id = bob; sj->snooze_minutes = 0;
+        oc_dbwriter_submit(w, sj);
+        sr = wait_result(w);
+        CHECK(sr && sr->type == OC_RES_SNOOZE && sr->snooze_until_ms == 0);
+        oc_dbres_free(sr);
+        CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+        n = oc_push_collect(rdb, 1, alice, 0, 100, until - 1000, t, 8);
+        saw_b2 = 0;
+        for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-bob") == 0) saw_b2 = 1;
+        CHECK(saw_b2);
+        sqlite3_close(rdb);
+    }
 
     set_level(w, dave, 1, OC_NOTIFY_ALL);        /* restore for the checks below */
     CHECK(oc_dbwriter_register_device_token(w, carol, OC_PUSH_FCM, "tok-carol"));
@@ -271,7 +313,7 @@ static void test_collect(void) {
     CHECK(token_count(path, "tok-dave") == 0);
 
     CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
-    n = oc_push_collect(rdb, 1, alice, 0, 100, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 0, 100, 0, t, 8);
     CHECK(n == 1);   /* dave pruned → only bob */
     if (n == 1) CHECK(strcmp(t[0].token, "tok-bob") == 0);
     sqlite3_close(rdb);
@@ -312,7 +354,7 @@ static void test_default_and_mute(void) {
     oc_push_target t[8];
     sqlite3 *rdb = NULL;
     CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
-    CHECK(oc_push_collect(rdb, 1, alice, 0, 100, t, 8) == 2);   /* the default default is ALL */
+    CHECK(oc_push_collect(rdb, 1, alice, 0, 100, 0, t, 8) == 2);   /* the default default is ALL */
     sqlite3_close(rdb);
 
     /* Bob sets his global default to MENTIONS, having no row for channel 1. */
@@ -325,7 +367,7 @@ static void test_default_and_mute(void) {
         oc_dbres_free(r);
     }
     CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
-    int n = oc_push_collect(rdb, 1, alice, 0, 100, t, 8);
+    int n = oc_push_collect(rdb, 1, alice, 0, 100, 0, t, 8);
     CHECK(n == 1 && strcmp(t[0].token, "tok-c") == 0);          /* bob is out */
 
     /* ... and a message that names him is in, through the same default. */
@@ -339,13 +381,13 @@ static void test_default_and_mute(void) {
         CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
         sqlite3_close(wdb);
     }
-    CHECK(oc_push_collect(rdb, 1, alice, 9001, 100, t, 8) == 2);
+    CHECK(oc_push_collect(rdb, 1, alice, 9001, 100, 0, t, 8) == 2);
     sqlite3_close(rdb);
 
     /* An explicit per-channel row still OVERRIDES the default, in both directions. */
     set_level(w, bob, 1, OC_NOTIFY_ALL);
     CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
-    CHECK(oc_push_collect(rdb, 1, alice, 0, 100, t, 8) == 2);
+    CHECK(oc_push_collect(rdb, 1, alice, 0, 100, 0, t, 8) == 2);
     sqlite3_close(rdb);
 
     /* Mute wins over the level: carol is at ALL and hears nothing. */
@@ -357,7 +399,7 @@ static void test_default_and_mute(void) {
         oc_dbres_free(r);
     }
     CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
-    n = oc_push_collect(rdb, 1, alice, 0, 100, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 0, 100, 0, t, 8);
     CHECK(n == 1 && strcmp(t[0].token, "tok-b") == 0);
     /* ... not even for a message that names her: mute means mute. */
     {
@@ -370,7 +412,7 @@ static void test_default_and_mute(void) {
         CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
         sqlite3_close(wdb);
     }
-    n = oc_push_collect(rdb, 1, alice, 9002, 100, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 9002, 100, 0, t, 8);
     CHECK(n == 1 && strcmp(t[0].token, "tok-b") == 0);
     sqlite3_close(rdb);
 

@@ -782,7 +782,30 @@ oc_result oc_encode_presence_update(oc_wbuf *w, uint16_t version, const oc_prese
     size_t off = oc_frame_begin(w, version, OC_MSG_PRESENCE_UPDATE);
     oc_w_u64(w, m->user_id);
     oc_w_u8(w, m->status);
+    oc_w_u8(w, m->dnd);
     return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_set_snooze(oc_wbuf *w, uint16_t version, const oc_set_snooze *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_SNOOZE);
+    oc_w_u32(w, m->minutes);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_snooze(oc_wbuf *w, uint16_t version, const oc_snooze *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SNOOZE);
+    oc_w_u64(w, m->until_ms);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_snooze(oc_rbuf *p, oc_set_snooze *m) {
+    m->minutes = oc_r_u32(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_snooze(oc_rbuf *p, oc_snooze *m) {
+    m->until_ms = oc_r_u64(p);
+    return r_done(p);
 }
 
 oc_result oc_encode_typing(oc_wbuf *w, uint16_t version, const oc_typing *m) {
@@ -2041,6 +2064,7 @@ oc_result oc_decode_set_presence(oc_rbuf *p, oc_set_presence *m) {
 oc_result oc_decode_presence_update(oc_rbuf *p, oc_presence_update *m) {
     m->user_id = oc_r_u64(p);
     m->status = oc_r_u8(p);
+    m->dnd = oc_r_u8(p);
     return r_done(p);
 }
 

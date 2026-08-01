@@ -114,7 +114,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * netloop's timer with no connection behind it, like STORAGE_MAINT. */
        OC_JOB_SCHEDULE = 83, OC_JOB_LIST_SCHEDULED = 84,
        OC_JOB_CANCEL_SCHEDULED = 85, OC_JOB_UPDATE_SCHEDULED = 86,
-       OC_JOB_FIRE_SCHEDULED = 87 };
+       OC_JOB_FIRE_SCHEDULED = 87,
+       /* Pause notifications (REQ-278). Minutes from now in `snooze_minutes`,
+        * 0 to end it — one job, because ending early is just "until now". */
+       OC_JOB_SET_SNOOZE = 88 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -216,6 +219,7 @@ typedef struct oc_job {
     uint8_t        notify_level;
     uint8_t        dnd_enabled;
     uint16_t       dnd_start_min, dnd_end_min;
+    uint32_t       snooze_minutes;   /* SET_SNOOZE: from now; 0 ends the pause */
 
     /* BACKFILL */
     oc_bf_cursor  *cursors;   /* heap */
@@ -313,7 +317,11 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* One scheduled row (list entry and push) and the list terminator. FIRED
         * carries the messages the sweep actually delivered, which the net thread
         * broadcasts exactly as it would an ordinary send. */
-       OC_RES_SCHEDULED = 80, OC_RES_SCHEDULED_LIST = 81, OC_RES_SCHED_FIRED = 82 };
+       OC_RES_SCHEDULED = 80, OC_RES_SCHEDULED_LIST = 81, OC_RES_SCHED_FIRED = 82,
+       /* The pause's new end instant, to that user's own connections (REQ-278).
+        * The net thread also re-broadcasts their presence, because the FACT that
+        * they are paused is public even though this instant is not. */
+       OC_RES_SNOOZE = 83 };
 
 /* One custom emoji (REQ-072). */
 typedef struct oc_emoji_row {
@@ -638,6 +646,9 @@ typedef struct oc_dbres {
     size_t              n_nprefs;
     uint8_t             np_dnd_enabled;
     uint16_t            np_dnd_start_min, np_dnd_end_min;
+    /* OC_RES_SNOOZE, and carried on AUTH_OK so the net thread can seed its
+     * in-memory copy without a second round trip. Already expiry-checked. */
+    uint64_t            snooze_until_ms;
 
     /* CLIENT_SETTINGS: the bucket's client_type + its key/value rows. */
     char                   *cs_client_type;  /* heap */

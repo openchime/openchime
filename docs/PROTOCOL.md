@@ -1015,11 +1015,20 @@ aggregate status — **online** if any of their connections is active, **away** 
 all are away, **offline** once the last closes — and, if it changed, broadcasts.
 
 **`PRESENCE_UPDATE` (server → client), msg_type `0x0071`** `{ user_id: u64,
-status: u8 }` — sent tenant-wide to every *other* authenticated connection when a
-user's aggregate status changes (a client tracks its own presence locally, so it
+status: u8, dnd: u8 }` — sent tenant-wide to every *other* authenticated
+connection when a user's aggregate status changes (a client tracks its own presence locally, so it
 is excluded from its own broadcast). On authenticating, a client also receives a
 **one-shot snapshot** — one `PRESENCE_UPDATE` per currently-online user — so it
 starts with an accurate roster without polling.
+
+`dnd` is the do-not-disturb **fact** (REQ-122/278) — that the user is not to be
+disturbed, never when they will be back. It is a second axis beside presence, not
+a status value: somebody can be online and paused, and collapsing the two would
+make "away" and "do not disturb" indistinguishable. The net thread holds each
+connected user's pause instant in memory (seeded at `AUTH_OK`, ARCH-66/67 gives it
+no database of its own) and compares it per frame, so an expiry needs no sweep —
+but a pause that runs out is re-announced on the next tick, since only a frame can
+untell the people who were told.
 
 **`TYPING` (client → server), msg_type `0x0072`** `{ channel_id: u64 }` — the
 caller signals they are composing in `channel_id`. The server resolves the
@@ -1189,6 +1198,25 @@ dnd_end_min: u16, count: u16, count × { channel_id: u64, level: u8 } }` — the
 snapshot. It is sent both as the reply to `LIST_NOTIFY_PREFS` and, after any
 `SET_*`, **pushed to every one of the user's connections** so a change on one
 device updates the others.
+
+**`SET_SNOOZE` (C → S), `0x00CA`** `{ minutes: u32 }` — **pause** notifications
+for that many minutes from now; `0` ends the pause. Slack's `dnd.setSnooze` takes
+minutes for the same reason ours does: every preset the client offers is a
+duration, and only the client knows the timezone that turns "until tomorrow" into
+an instant. The daemon resolves it once and stores the absolute end.
+
+**`SNOOZE` (S → C), `0x00CB`** `{ until_ms: u64 }` — when the pause ends, `0` for
+none. Sent to **that user's own connections only**, after a `SET_SNOOZE` and
+alongside every `NOTIFY_PREFS`. Other people are told the *fact* through
+`PRESENCE_UPDATE`'s `dnd` byte and never the instant (REQ-122/278): a colleague
+needs to know whether to write; when you are back is a movement report.
+
+*Why a separate frame.* `NOTIFY_PREFS` ends in a repeated list, so anything added
+to its fixed part shifts every entry after the first — the trap that cost protocol
+version 3. And the separation is the design, not just an encoding convenience: the
+**pause** is manual and one-shot, the **schedule** at `0x0091` is recurring and
+planned, cancelling one has never cancelled the other, and a pause only ever *adds*
+silence — so the two can never disagree in a way needing a precedence rule.
 
 ---
 
@@ -1580,6 +1608,8 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0091` | `SET_DND`          | C → S     | no        | §5.16   |
 | `0x0092` | `LIST_NOTIFY_PREFS`| C → S     | no        | §5.16   |
 | `0x0093` | `NOTIFY_PREFS`     | S → C     | no        | §5.16   |
+| `0x00CA` | `SET_SNOOZE`       | C → S     | no        | §5.16   |
+| `0x00CB` | `SNOOZE`           | S → C     | no        | §5.16   |
 | `0x0094` | `SET_CLIENT_SETTING`   | C → S | no        | §5.16a  |
 | `0x0095` | `LIST_CLIENT_SETTINGS` | C → S | no        | §5.16a  |
 | `0x0096` | `CLIENT_SETTINGS`      | S → C | no        | §5.16a  |
