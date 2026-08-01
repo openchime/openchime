@@ -77,7 +77,7 @@ pattern REQ-221 and REQ-230 both followed.
   The daemon is epoll-based and Linux-only, and GitHub's Windows runners cannot
   host it. The job exists and skips until a self-hosted Windows+WSL runner does.
   Until then the smoke is a local gate. It is a trustworthy one since WIN-87/88:
-  179 checks, waiting on state rather than sleeping, refusing to run against the
+  194 checks, waiting on state rather than sleeping, refusing to run against the
   wrong daemon, and including a real UIA client walking the accessibility tree
   from outside the process.
 

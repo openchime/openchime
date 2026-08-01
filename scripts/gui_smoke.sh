@@ -221,7 +221,7 @@ say "== views"
 while read -r v sbkind re find ffind conv name; do
   [ -z "${v:-}" ] && continue
   "$DRIVE" view "$v" >/dev/null 2>&1
-  [ "$v" = "0" ] && "$DRIVE" channel general >/dev/null 2>&1
+  [ "$v" = "home" ] && "$DRIVE" channel general >/dev/null 2>&1
   # The second column identifies the view, so it is the thing to wait on; the
   # other five are same-frame properties of it.
   settle sbkind "$sbkind"
@@ -233,13 +233,13 @@ while read -r v sbkind re find ffind conv name; do
   expect "$d" conv   "$conv"   "$name: middle column typeable"
   expect "$d" covered 0        "$name: nothing covering"
 done <<'MATRIX'
-0 1 1 1 0 1 Home
-1 2 0 0 0 0 DMs
-2 3 1 0 0 1 Activity
-3 4 0 0 1 0 Files
-4 5 0 0 0 0 Later
-5 1 0 1 0 0 Drafts
-6 0 0 0 0 0 Admin
+home     1 1 1 0 1 Home
+dms      2 0 0 0 0 DMs
+activity 3 1 0 0 1 Activity
+files    4 0 0 1 0 Files
+later    5 0 0 0 0 Later
+drafts   1 0 1 0 0 Drafts
+admin    0 0 0 0 0 Admin
 MATRIX
 
 # --- overlays --------------------------------------------------------------
@@ -1094,6 +1094,42 @@ checks=$((checks + 1))
   || fail "caret moved across repaints: $before -> $(caret_top) (WIN-105 oscillation)"
 "$DRIVE" key ctrl+0 >/dev/null 2>&1
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+
+# --- New message, as a pane (REQ-229) ---------------------------------------
+# The old picker asked WHO first and let you write second. This addresses and
+# composes in one place, so the assertions follow that order: filter, pick,
+# write, send — and the message that arrives must be exactly what was typed,
+# once.
+say "== new message"
+"$DRIVE" newmsg >/dev/null 2>&1
+expect_eventually tofocus 1 "the To: field takes the keys first"
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1
+"$DRIVE" chars "bo" >/dev/null 2>&1
+expect_eventually cand 1 "typing filters people and channels together"
+"$DRIVE" key enter >/dev/null 2>&1
+expect_eventually chips 1 "Enter takes the highlighted one"
+# Enter with nothing left to pick is "done addressing", not another pick — it
+# used to keep taking whoever was first in the roster.
+"$DRIVE" key enter >/dev/null 2>&1
+d=$(snap)
+expect "$d" chips 1 "and a second Enter does not add another"
+expect "$d" tofocus 0 "it moves to the message instead"
+"$DRIVE" chars "from the pane" >/dev/null 2>&1
+expect_grep '^ed .*text="from the pane"' "typing now goes to the message"
+
+# Send resolves the recipient into a conversation and posts there.
+sendpt=$(snap | awk '/^newmsg /{ for (i=1;i<=NF;i++) if ($i ~ /^send=/) { sub(/^send=/,"",$i);
+  split($i, b, ","); print int((b[1]+b[3])/2), int((b[2]+b[4])/2) } }')
+"$DRIVE" click $sendpt >/dev/null 2>&1
+ed_step len 0 "sending clears the pane"
+expect_grep '^  ch [0-9]+ DM .*prev="from the pane"' "and the message arrives, once"
+# Reopening starts clean: the unaddressed draft went with the send. It did not,
+# once — the clear used the addressed API, which refuses channel 0 outright.
+"$DRIVE" newmsg >/dev/null 2>&1
+ed_step len 0 "reopening the pane starts empty"
+# Put the app back where the sections after this one expect it: they type into
+# the CONVERSATION composer, and leaving the pane up pointed them at its field.
+"$DRIVE" view home >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; settle conv 1
 
 # --- selecting text with the mouse (WIN-100) --------------------------------
 # The self-drawn field (WIN-80) replaced a native EDIT, and word selection left

@@ -199,6 +199,7 @@ static void job_free(oc_job *j) {
     free(j->cs_client_type);
     free(j->cs_key);
     free(j->cs_value);
+    free(j->recipients);
     free(j->pf_name);
     free(j->pf_old_pw);
     free(j->pf_new_pw);
@@ -4539,8 +4540,11 @@ static oc_dbres *process_set_draft(sqlite3 *db, const oc_job *j) {
     r->user_id = j->user_id;
     /* Membership first, as every channel-scoped handler does. A draft is user
      * content about a conversation, and storing one for a channel you cannot
-     * see would leak its existence back to you on any other device. */
-    if (!j->channel_id || !is_member(db, j->channel_id, j->user_id)) {
+     * see would leak its existence back to you on any other device.
+     *
+     * channel_id 0 is the UNADDRESSED case (REQ-229) and has no membership to
+     * check: it belongs to nobody's conversation yet, which is the point. */
+    if (j->channel_id && !is_member(db, j->channel_id, j->user_id)) {
         r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
     }
     size_t blen = j->body_len > OC_DRAFT_BODY_MAX ? OC_DRAFT_BODY_MAX : j->body_len;
@@ -4549,6 +4553,33 @@ static oc_dbres *process_set_draft(sqlite3 *db, const oc_job *j) {
      * copy it just received was newer than the one it wrote. */
     uint64_t now = dbw_now_ms();
     sqlite3_stmt *st = NULL;
+    if (!j->channel_id) {
+        /* Unaddressed: one per user, which is what the pane holds. Written as
+         * delete-then-insert because the partial unique index deliberately does
+         * NOT cover these rows — there is no conversation to be unique on. */
+        sqlite3_prepare_v2(db, "DELETE FROM drafts WHERE user_id=? AND channel_id IS NULL;",
+                           -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_step(st); sqlite3_finalize(st);
+        if (blen) {
+            sqlite3_prepare_v2(db,
+                "INSERT INTO drafts (user_id, channel_id, thread_root, recipients, body, updated_ms) "
+                "VALUES (?, NULL, 0, ?, ?, ?);", -1, &st, NULL);
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+            sqlite3_bind_text (st, 2, j->recipients ? j->recipients : "", -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text (st, 3, (const char *)j->body, (int)blen, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(st, 4, (sqlite3_int64)now);
+            sqlite3_step(st); sqlite3_finalize(st);
+        }
+        r->type = OC_RES_DRAFT;
+        r->draft.id = (uint64_t)sqlite3_last_insert_rowid(db);
+        r->draft.channel_id = 0;
+        r->draft.thread_root = 0;
+        r->draft.updated_ms = now;
+        r->draft.recipients = strdup(j->recipients ? j->recipients : "");
+        r->draft.body = blen ? strndup((const char *)j->body, blen) : strdup("");
+        return r;
+    }
     if (blen == 0) {
         sqlite3_prepare_v2(db,
             "DELETE FROM drafts WHERE user_id=? AND channel_id=? AND thread_root=?;",

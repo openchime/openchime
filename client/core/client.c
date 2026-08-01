@@ -480,6 +480,17 @@ void oc_client_update_scheduled(oc_client *c, uint64_t id, uint64_t send_at_ms,
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_set_draft_to(oc_client *c, const char *recipients, const char *body) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_DRAFT);
+    if (!cmd) return;
+    cmd->channel_id = 0;                  /* not addressed yet */
+    cmd->message_id = 0;
+    cmd->body  = strdup(body ? body : "");
+    cmd->body2 = strdup(recipients ? recipients : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_list_drafts(oc_client *c) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_DRAFTS);

@@ -202,6 +202,7 @@ typedef struct oc_job {
     uint64_t       message_id; /* target message for EDIT / DELETE */
     uint64_t       parent_id;  /* thread parent for SEND_REPLY / LIST_THREAD */
     uint64_t       sched_at_ms; /* SCHEDULE / UPDATE_SCHEDULED: when to send */
+    char          *recipients;  /* SET_DRAFT with no channel (REQ-229); heap */
     uint8_t        idem[OC_IDEM_LEN];
     uint8_t       *body;      /* heap (SEND / EDIT new body) */
     size_t         body_len;

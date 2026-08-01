@@ -183,6 +183,9 @@ void oc_client_set_setting(oc_client *c, const char *key, const char *value);
 void oc_client_set_draft(oc_client *c, uint64_t channel_id, uint64_t thread_root,
                          const char *body);
 void oc_client_list_drafts(oc_client *c);
+/* An UNADDRESSED draft (REQ-229): no channel yet, `recipients` a comma-separated
+ * user-id list (possibly empty). An empty body deletes it, as ever. */
+void oc_client_set_draft_to(oc_client *c, const char *recipients, const char *body);
 /* Scheduled messages (REQ-224, ARCH-102). `send_at_ms` is absolute. */
 void oc_client_schedule(oc_client *c, uint64_t channel_id, uint64_t thread_root,
                         uint64_t send_at_ms, const char *body);

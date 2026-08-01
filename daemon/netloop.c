@@ -1415,6 +1415,10 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
                 memcpy(j->body, sd.body.ptr, bl);
             }
             j->body_len = bl;          /* 0 is the DELETE form, not a decode failure */
+            {   /* Who it is for, when it is not for a channel yet (REQ-229). */
+                size_t rl = sd.recipients.len < 160 ? sd.recipients.len : 160;
+                j->recipients = strndup((const char *)sd.recipients.ptr, rl);
+            }
             oc_dbwriter_submit(dbw, j);
             continue;
         }
