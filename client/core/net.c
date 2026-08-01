@@ -523,7 +523,12 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             oc_presence_update pu;
             if (oc_decode_presence_update(&p, &pu) == OC_OK) {
                 oc_ev *e = oc_ev_new(OC_EV_PRESENCE);
-                if (e) { e->user_id = pu.user_id; e->status = pu.status; oc_queue_push(to_ui, e); }
+                /* `op` carries the do-not-disturb FACT (REQ-122): a second axis
+                 * beside presence, not a status value — somebody can be online
+                 * and paused, and folding it into `status` would make "away" and
+                 * "do not disturb" the same thing. */
+                if (e) { e->user_id = pu.user_id; e->status = pu.status; e->op = pu.dnd;
+                         oc_queue_push(to_ui, e); }
             }
         } else if (hdr.msg_type == OC_MSG_MENTION_UNRESOLVED) {
             /* REQ-287. Flattened to a display string here rather than in the
@@ -851,6 +856,12 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->op = ne[i].level;
                 e->status = ne[i].muted;      /* WIN-40: distinct from the level */
                 oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_SNOOZE) {
+            oc_snooze sn;
+            if (oc_decode_snooze(&p, &sn) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_SNOOZE);
+                if (e) { e->server_time = sn.until_ms; oc_queue_push(to_ui, e); }
             }
         } else if (hdr.msg_type == OC_MSG_EMOJI_LIST) {
             oc_emoji_entry ee[OC_MAX_CUSTOM_EMOJI]; uint16_t count = 0;
@@ -1666,6 +1677,12 @@ static int run_connection(oc_net *n, int reconnecting,
                 /* op = enabled; channel_id = start_min, message_id = end_min. */
                 oc_set_dnd sd = { c->op, (uint16_t)c->channel_id, (uint16_t)c->message_id };
                 if (oc_encode_set_dnd(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_SNOOZE) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_snooze ss = { (uint32_t)c->message_id };
+                if (oc_encode_set_snooze(&w, OC_PROTOCOL_VERSION, &ss) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_LIST_NOTIFY_PREFS) {

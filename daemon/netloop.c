@@ -1871,6 +1871,17 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             if (!conns[fd]) break;   /* dropped on the WORKSPACE_INFO write */
         }
 
+        /* A pause outlives the session that set it (REQ-278), so the client is
+         * told at auth rather than only when it opens its notification
+         * settings — otherwise a restart shows "not paused" to somebody who is. */
+        {
+            uint8_t sbuf[32]; oc_wbuf sw; oc_wbuf_init(&sw, sbuf, sizeof sbuf);
+            oc_snooze sn = { r->snooze_until_ms };
+            oc_encode_snooze(&sw, OC_PROTOCOL_VERSION, &sn);
+            send_bytes(ep, conns, fd, sbuf, sw.len);
+            if (!conns[fd]) break;
+        }
+
         /* Presence (REQ-120): send the new client a snapshot of who is currently
          * online/away, then — if this is the user's first connection — announce
          * them online to everyone. */

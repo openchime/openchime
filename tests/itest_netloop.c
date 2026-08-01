@@ -243,6 +243,12 @@ static int do_auth(client *c, const char *user, const char *pass, uint64_t *user
      * presence snapshot). Consume it here so both read_frame and the raw
      * presence/typing test start from a clean stream. */
     if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_WORKSPACE_INFO) return -1;
+    /* Then the pause (REQ-278), which outlives the session that set it and so is
+     * told at auth rather than only on request. Asserted, not skipped: a fresh
+     * account is not paused, and reading it here keeps every later test's stream
+     * positional. */
+    if (read_frame_raw(c, &hdr, &p) != 0 || hdr.msg_type != OC_MSG_SNOOZE) return -1;
+    { oc_snooze sn; if (oc_decode_snooze(&p, &sn) != OC_OK) return -1; }
     return 0;
 }
 
@@ -1649,6 +1655,11 @@ static void test_admin_vertical(int port, const uint8_t *pin) {
     oc_auth_ok ok; CHECK(oc_decode_auth_ok(&p, &ok) == OC_OK);
     uint64_t unh = ok.user_id;
     CHECK(unh != 0 && ok.role == OC_ROLE_MEMBER);
+    /* Redeeming an invite authenticates, so it carries the pause too (REQ-278):
+     * a brand new account is not paused, but the frame is unconditional — the
+     * client must never have to infer "no pause" from silence. */
+    CHECK(read_frame(&nh, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SNOOZE);
+    { oc_snooze sn0; CHECK(oc_decode_snooze(&p, &sn0) == OC_OK && sn0.until_ms == 0); }
 
     /* Owner promotes the new hire to admin: owner acks, the hire is pushed the
      * new role on their live connection. */

@@ -224,19 +224,32 @@ static void draw_conn_dot(ID2D1RenderTarget *rt, float cx, float cy, float r, in
     else      ID2D1RenderTarget_DrawEllipse(rt, &e, paint_with(OC_COL_ACCENT), 1.8f, NULL);
 }
 
-static void draw_presence_dot(ID2D1RenderTarget *rt, float cx, float cy, float r,
-                              uint8_t presence, uint32_t surface) {
+/* `dnd` is do-not-disturb (REQ-122/278) and is deliberately NOT a third presence
+ * value: somebody can be online and paused, so it is drawn as a crescent carved
+ * out of the same dot rather than as a colour that would have to replace one.
+ * Slack shows a moon for exactly this reason. */
+static void draw_presence_dot_dnd(ID2D1RenderTarget *rt, float cx, float cy, float r,
+                                  uint8_t presence, uint32_t surface, int dnd) {
     uint32_t c = presence == OC_PRESENCE_ONLINE ? OC_COL_ONLINE
                : presence == OC_PRESENCE_AWAY   ? OC_COL_AWAY : OC_COL_FAINT;
     D2D1_ELLIPSE ring = { { cx, cy }, r + 1.6f, r + 1.6f };
     ID2D1RenderTarget_FillEllipse(rt, &ring, paint_with(surface));
     D2D1_ELLIPSE dot = { { cx, cy }, r, r };
-    ID2D1RenderTarget_FillEllipse(rt, &dot, paint_with(c));
+    ID2D1RenderTarget_FillEllipse(rt, &dot, paint_with(dnd ? OC_COL_MUTED : c));
     /* Offline reads as an outline, so "not here" is not just a dim fill. */
-    if (presence != OC_PRESENCE_ONLINE && presence != OC_PRESENCE_AWAY) {
+    if (!dnd && presence != OC_PRESENCE_ONLINE && presence != OC_PRESENCE_AWAY) {
         D2D1_ELLIPSE in = { { cx, cy }, r - 1.3f, r - 1.3f };
         ID2D1RenderTarget_FillEllipse(rt, &in, paint_with(surface));
     }
+    if (dnd) {   /* carve the crescent with the surface colour */
+        D2D1_ELLIPSE bite = { { cx + r * 0.55f, cy - r * 0.55f }, r * 0.95f, r * 0.95f };
+        ID2D1RenderTarget_FillEllipse(rt, &bite, paint_with(surface));
+    }
+}
+
+static void draw_presence_dot(ID2D1RenderTarget *rt, float cx, float cy, float r,
+                              uint8_t presence, uint32_t surface) {
+    draw_presence_dot_dnd(rt, cx, cy, r, presence, surface, 0);
 }
 
 /* Typed modal form fields (WIN-21); form_dialog() is defined further down. */
@@ -2158,9 +2171,9 @@ static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
         /* Your own presence, bottom-right — the same dot, from the same helper, that
          * every person in the DM list and the member pane carries. It was missing
          * only here, which is the one place you cannot see yourself any other way. */
-        draw_presence_dot(rt, cx + 11, py + 35, 4.5f,
-                          m ? oc_model_presence_of(m, m->user_id) : OC_PRESENCE_OFFLINE,
-                          OC_COL_RAIL);
+        draw_presence_dot_dnd(rt, cx + 11, py + 35, 4.5f,
+                              m ? oc_model_presence_of(m, m->user_id) : OC_PRESENCE_OFFLINE,
+                              OC_COL_RAIL, m ? oc_model_snoozed(m) : 0);
         /* QUIET HOURS on the TOP hemisphere, deliberately opposite the presence dot:
          * they answer different questions — "am I here" versus "will this reach me" —
          * and stacking them in one corner would read as one compound state. A "z"
@@ -2541,9 +2554,10 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                     IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_CENTER);
                 } else {
                 draw_user_avatar(rt, m, r->peer_id, r->label, av, g_meta, 1, 5.0f);
-                draw_presence_dot(rt, av.right - 1, av.bottom - 1, 3.5f,
-                                  oc_model_presence_of(m, r->peer_id),
-                                  selected ? OC_COL_SELECT : OC_COL_SIDEBAR);
+                draw_presence_dot_dnd(rt, av.right - 1, av.bottom - 1, 3.5f,
+                                      oc_model_presence_of(m, r->peer_id),
+                                      selected ? OC_COL_SELECT : OC_COL_SIDEBAR,
+                                      oc_model_dnd_of(m, r->peer_id));
                 }
             } else {
                 const char *mark = r->is_private ? "\xF0\x9F\x94\x92" : "#";
@@ -5346,7 +5360,13 @@ static const struct { const char *label; int cmd; } PALETTE[] = {
     { "Mark all as read",        73 },
     { "Edit display name",       30 },
     { "Change password",         31 },
-    { "Do not disturb",          50 },
+    { "Notification schedule",   50 },
+    { "Pause notifications for 30 minutes", 58 },
+    { "Pause notifications for 1 hour",     59 },
+    { "Pause notifications for 2 hours",    62 },
+    { "Pause notifications until tomorrow", 63 },
+    { "Pause notifications until\u2026",    64 },
+    { "Resume notifications",    57 },
     { "Set yourself active",     10 },
     { "Set yourself away",       11 },
     { "Invite people as member", 40 },
@@ -5552,8 +5572,9 @@ static void draw_members(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         const oc_chan_member *cm = &m->chanmem[i];
         if (y > H) break;
         const char *nm = oc_model_user_name((oc_model *)m, cm->user_id);
-        draw_presence_dot(rt, x0 + 22, y + ROW_H / 2, 4.5f,
-                          oc_model_presence_of(m, cm->user_id), OC_COL_SIDEBAR);
+        draw_presence_dot_dnd(rt, x0 + 22, y + ROW_H / 2, 4.5f,
+                              oc_model_presence_of(m, cm->user_id), OC_COL_SIDEBAR,
+                              oc_model_dnd_of(m, cm->user_id));
         const char *disp = (nm && nm[0]) ? nm : "user";
         draw_text(rt, disp, g_ui, rf(x0 + 34, y, W - 14, y + ROW_H), OC_COL_TEXT);
         /* Role glyph INLINE, immediately after the name — not in a column of its
@@ -7212,8 +7233,9 @@ static void draw_dm_list(ID2D1RenderTarget *rt, const oc_model *m, float h) {
         } else {
             draw_user_avatar(rt, m, best->peer_id, nm,
                              rf(row.left + 9, y + 11, row.left + 39, y + 41), g_ui, 0, 0);
-            draw_presence_dot(rt, row.left + 35, y + 37, 4.5f,
-                              oc_model_presence_of(m, best->peer_id), OC_COL_SIDEBAR);
+            draw_presence_dot_dnd(rt, row.left + 35, y + 37, 4.5f,
+                                  oc_model_presence_of(m, best->peer_id), OC_COL_SIDEBAR,
+                                  oc_model_dnd_of(m, best->peer_id));
         }
 
         int unread = best->unread > 0;
@@ -12780,11 +12802,59 @@ static void open_ws_menu(HWND hwnd) {
     g_menu_x = RAIL_W + 8; g_menu_y = HEADER_H - 6; g_menu_w = 268;
 }
 
+/* "Notifications paused until 5:03 PM" — the one place a pause's end time
+ * appears at all. It is MY pause: the server never sends anyone else's instant
+ * (REQ-122), so there is deliberately no version of this for another person. */
+static void snooze_label(uint64_t until_ms, char *out, size_t cap) {
+    time_t t = (time_t)(until_ms / 1000);
+    struct tm tv; char when[24] = "";
+    if (oc_localtime_r(&t, &tv))
+        strftime(when, sizeof when, g_pref_time24 ? "%H:%M" : "%I:%M %p", &tv);
+    snprintf(out, cap, "PAUSED UNTIL %s", when);
+}
+
+/* Minutes from now until `hh:mm` LOCAL, tomorrow if that has already passed
+ * today. The wire takes minutes precisely so this arithmetic happens where the
+ * timezone is known (REQ-278) — the daemon would have to guess. */
+static uint32_t minutes_until_local(int hh, int mm, int force_tomorrow) {
+    time_t now = time(NULL);
+    struct tm tv;
+    if (!oc_localtime_r(&now, &tv)) return 0;
+    int now_min = tv.tm_hour * 60 + tv.tm_min;
+    int want = hh * 60 + mm;
+    int delta = want - now_min;
+    if (force_tomorrow || delta <= 0) delta += 24 * 60;
+    return (uint32_t)delta;
+}
+
 static void open_profile_menu(HWND hwnd) {
     g_n_mi = 0;
     mi_item(10, "Set status: Online");
     mi_item(11, "Set status: Away");
-    mi_item(50, "Do not disturb");
+    /* Pausing (REQ-278) sits here because Slack puts it here, and because this is
+     * the menu you reach for when you want to be left alone. Presets are
+     * DURATIONS — the wire takes minutes and only this side knows the timezone
+     * that turns "until tomorrow" into an instant.
+     *
+     * Flat rather than a submenu: five items is not a hierarchy, and every other
+     * menu in this app is one level. */
+    {
+        const oc_model *sm = model();
+        if (sm && oc_model_snoozed(sm)) {
+            char lbl[64];
+            snooze_label(sm->snooze_until_ms, lbl, sizeof lbl);
+            mi_section(lbl);
+            mi_item(57, "Resume notifications");
+        } else {
+            mi_section("PAUSE NOTIFICATIONS");
+            mi_item(58, "For 30 minutes");
+            mi_item(59, "For 1 hour");
+            mi_item(62, "For 2 hours");
+            mi_item(63, "Until tomorrow");
+            mi_item(64, "Custom\u2026");
+        }
+    }
+    mi_item(50, "Notification schedule");
     mi_sep();
     /* Custom status (REQ-241/122, WIN-53) — distinct from presence above: presence is
      * "am I here", status is "what am I doing", and Slack keeps both. */
@@ -13084,6 +13154,31 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 920: case 921: case 922:           g_file_scope  = cmd - 920; break;
     case 8:  palette_open(hwnd); break;                    /* WIN-75 */
     case 9:  modal_enter(hwnd, &g_browse_open); break;     /* REQ-038, WIN-54a */
+    /* Pausing notifications (REQ-278, WIN-92). Presets are durations, as Slack's
+     * are; "until tomorrow" resolves against the LOCAL clock here, which is the
+     * whole reason the wire carries minutes rather than an instant. */
+    case 57: oc_client_set_snooze(g_client, 0);   toast_push("Notifications resumed.", 0); break;
+    case 58: oc_client_set_snooze(g_client, 30);  break;
+    case 59: oc_client_set_snooze(g_client, 60);  break;
+    case 62: oc_client_set_snooze(g_client, 120); break;
+    /* Slack's "until tomorrow" means tomorrow MORNING, not midnight — the point
+     * is to be reachable when the day starts, not the moment the date changes. */
+    case 63: oc_client_set_snooze(g_client, minutes_until_local(9, 0, 1)); break;
+    case 64: {   /* Custom: an end TIME, because that is how the thought arrives
+                  * ("until 5") — the duration is arithmetic, not the decision. */
+        oc_field f[1] = { { FF_TEXT, "Pause until (HH:MM)",
+                            "Today, or tomorrow if that time has passed.", "17:00" } };
+        if (!form_dialog(hwnd, "Pause notifications", f, 1)) break;
+        int hh = -1, mm = -1;
+        if (sscanf(f[0].value, "%d:%d", &hh, &mm) != 2 ||
+            hh < 0 || hh > 23 || mm < 0 || mm > 59) {
+            toast_push("Enter a time as HH:MM.", 1); break;
+        }
+        uint32_t mins = minutes_until_local(hh, mm, 0);
+        if (!mins) { toast_push("That time is now.", 1); break; }
+        oc_client_set_snooze(g_client, mins);
+        break;
+    }
     case 2:  oc_client_reconnect(g_client); break;
     case 3:  oc_client_logout(g_client, OC_LOGOUT_THIS); g_logging_out = 1; break;
     case 5:  oc_client_logout(g_client, OC_LOGOUT_ALL);  g_logging_out = 1; break;
@@ -13859,6 +13954,24 @@ static void test_dump(const char *path) {
             g_tgt_box.left, g_tgt_box.top, g_tgt_box.right, g_tgt_box.bottom,
             g_nm_send.left, g_nm_send.top, g_nm_send.right, g_nm_send.bottom,
             g_nm_to_focus, g_n_tgt_chip, g_n_tgt);
+    /* Pausing (REQ-278, WIN-92): whether MY notifications are paused and until
+     * when, plus how many people the roster shows as not-to-be-disturbed — the
+     * fact is a drawn crescent, which no assertion could read from pixels. */
+    {
+        int others = 0;
+        if (m) for (size_t i = 0; i < m->n_users; i++)
+            if (m->users[i].user_id != m->user_id && oc_model_dnd_of(m, m->users[i].user_id))
+                others++;
+        fprintf(f, "snoozed=%d snooze_until=%llu dnd_others=%d\n",
+                m ? oc_model_snoozed(m) : 0,
+                (unsigned long long)(m ? m->snooze_until_ms : 0), others);
+    }
+    /* Whether this window actually HAS the keyboard, which is the condition the
+     * composer's auto-focus turns on — "focus=0" alone cannot tell you whether
+     * the field declined it or the window never had it to give. */
+    {   HWND aw = GetActiveWindow();
+        fprintf(f, "wnd_active=%d wnd_focus=%d\n",
+                GetForegroundWindow() == aw, GetFocus() == aw); }
     fprintf(f, "sbsel=%d\n", g_n_sbsel);
     fprintf(f, "shelf n=%d", g_n_shelf);
     for (int i = 0; i < g_n_shelf; i++)

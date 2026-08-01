@@ -169,6 +169,8 @@ void oc_client_close_reactions(oc_client *c);
  * overlay (frontend view state; opening refreshes the sync). */
 void oc_client_set_notify_pref(oc_client *c, uint64_t channel_id, uint8_t level);
 void oc_client_set_dnd(oc_client *c, uint8_t enabled, uint16_t start_min, uint16_t end_min);
+/* REQ-278: pause notifications for `minutes` from now; 0 ends the pause. */
+void oc_client_set_snooze(oc_client *c, uint32_t minutes);
 void oc_client_list_notify_prefs(oc_client *c);
 void oc_client_toggle_prefs(oc_client *c, int open);
 

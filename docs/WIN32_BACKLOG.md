@@ -34,6 +34,24 @@ pattern REQ-221 and REQ-230 both followed.
 | **WIN-92** | **"Pause notifications until…" (REQ-278).** The client can set a *recurring daily* window (REQ-131) and nothing else, so the most-reached-for form — "until 17:00", or for 30 minutes — is not expressible: a minutes-of-day pair is periodic, so "until 5pm today" would silence 5pm every day. **Spec settled against Slack's `dnd` API:** presets are *durations from now* (30m / 1h / 2h / until tomorrow / custom), `dnd_until_ms` on `users` with 0 meaning ended, a pause only ever adds silence, and ending a pause is distinct from ending the current scheduled period. Also needs DND carried to **other users** as a second, independent axis beside presence — the fact only, never the end time (REQ-122). VIPs pierce a pause when REQ-135 lands; senders never do (a deliberate divergence from Slack). | REQ-278 daemon half + REQ-122 presence bit |
 | **WIN-94** | **Notification schedule and keyword alerts (REQ-135/136).** Two halves of the same subsystem, both specified 2026-07-31. **Schedule:** *Every day / Weekdays / Custom* with an independent start and end per weekday, stored against the user's local calendar day — and it **replaces** REQ-131's single daily window rather than joining it, because Slack has one recurring mechanism and two would be able to disagree. **Keywords:** part of the *mentions* level rather than their own switch, matched case-insensitively and exactly, phrases allowed, surfacing in the activity feed as mentions — and firing **in threads**, where Slack's do not. **Priority people** pierce a level and a pause but never a mute. | REQ-135 / REQ-136 daemon halves |
 
+## WIN-107 — a visual pass over the whole shell
+
+Raised 2026-08-01, from the running client rather than from a list: features have
+been landing faster than the surfaces they live on have been re-read, and the
+result is a set of small formatting defects that individually look like nothing
+and together look like carelessness. WIN-106 fixed three of them one at a time,
+which is the wrong shape — three more appeared in the next screenshot.
+
+So this is one deliberate pass, screen by screen, against the running client:
+spacing and alignment in the sidebar rows and their badges, the presence and
+do-not-disturb marks (small, dark, and hung off the avatar's corner), transcript
+gutters and the day divider, the composer's toolbar and its two rows, empty
+states, and every pane the rail can reach. Each fix asserted where the assertion
+can outlive it — geometry in the dump, not eyeballed once.
+
+**Not to be interleaved with feature work.** The point is to look at the whole
+thing at once, which is exactly what shipping a feature at a time cannot do.
+
 ## Closed without a fix, and why
 
 - **WIN-60 — the unreproduced crash while typing.** Closed 2026-07-31. Three

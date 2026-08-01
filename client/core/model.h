@@ -107,7 +107,9 @@ typedef struct {
     size_t   n_readers, cap_readers;
 } oc_channel;
 
-typedef struct { uint64_t user_id; uint8_t status; } oc_presence_row;
+/* `dnd` is a SECOND AXIS beside status, not a status value (REQ-122): a person
+ * can be online and not to be disturbed, and one field could not say both. */
+typedef struct { uint64_t user_id; uint8_t status; uint8_t dnd; } oc_presence_row;
 
 /* A tenant roster entry (from LIST_USERS): id, display name, role, disabled. */
 typedef struct {
@@ -312,6 +314,9 @@ typedef struct {
     uint8_t   prefs_open;
     uint8_t   dnd_enabled;
     uint16_t  dnd_start_min, dnd_end_min;
+    /* REQ-278: when the manual PAUSE ends, 0 for none. Distinct from the window
+     * above in type as well as in name — one instant against a daily range. */
+    uint64_t  snooze_until_ms;
     /* REQ-134: the level a channel takes when it has NO per-channel row. Server
      * state, not a client guess — the daemon is what decides whether to push. */
     uint8_t   notify_default;
@@ -614,6 +619,12 @@ uint8_t *oc_model_take_attachment(oc_model *m, uint64_t *attachment_id, size_t *
 
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);
+/* Whether a user is not to be disturbed right now (REQ-122). The fact only: the
+ * server never sends anyone else's end time. */
+int oc_model_dnd_of(const oc_model *m, uint64_t user_id);
+/* Are MY notifications paused, and until when (0 = no) — my own end time is the
+ * one this client is allowed to know. */
+int oc_model_snoozed(const oc_model *m);
 /* Record a presence value (used for our own presence, which the server does not
  * echo back to us). */
 void oc_model_note_presence(oc_model *m, uint64_t user_id, uint8_t status);

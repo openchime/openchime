@@ -753,9 +753,13 @@ static int channel_append(oc_channel *c, uint64_t author_id, const char *author_
     return 1;
 }
 
-static void presence_set(oc_model *m, uint64_t user_id, uint8_t status) {
+static void presence_set(oc_model *m, uint64_t user_id, uint8_t status, int dnd) {
     for (size_t i = 0; i < m->n_presence; i++) {
-        if (m->presence[i].user_id == user_id) { m->presence[i].status = status; return; }
+        if (m->presence[i].user_id == user_id) {
+            m->presence[i].status = status;
+            m->presence[i].dnd = (uint8_t)(dnd ? 1 : 0);
+            return;
+        }
     }
     if (m->n_presence == m->cap_presence) {
         size_t cap = m->cap_presence ? m->cap_presence * 2 : 16;
@@ -766,11 +770,24 @@ static void presence_set(oc_model *m, uint64_t user_id, uint8_t status) {
     }
     m->presence[m->n_presence].user_id = user_id;
     m->presence[m->n_presence].status = status;
+    m->presence[m->n_presence].dnd = (uint8_t)(dnd ? 1 : 0);
     m->n_presence++;
 }
 
 void oc_model_note_presence(oc_model *m, uint64_t user_id, uint8_t status) {
-    presence_set(m, user_id, status);
+    /* Our own presence, which the server does not echo — it says nothing about
+     * a pause, so the flag we already hold is kept rather than cleared. */
+    presence_set(m, user_id, status, oc_model_dnd_of(m, user_id));
+}
+
+int oc_model_dnd_of(const oc_model *m, uint64_t user_id) {
+    for (size_t i = 0; i < m->n_presence; i++)
+        if (m->presence[i].user_id == user_id) return m->presence[i].dnd ? 1 : 0;
+    return 0;
+}
+
+int oc_model_snoozed(const oc_model *m) {
+    return m && m->snooze_until_ms != 0;
 }
 
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id) {
@@ -795,7 +812,10 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->authed = true;
         m->user_id = e->user_id;
         m->last_error[0] = '\0';
-        presence_set(m, e->user_id, OC_PRESENCE_ONLINE);   /* self: the server won't tell us */
+        /* Self: the server won't tell us. A pause survives a reconnect, and the
+         * SNOOZE frame that follows AUTH_OK is what sets it — this only seeds
+         * the row. */
+        presence_set(m, e->user_id, OC_PRESENCE_ONLINE, m->snooze_until_ms != 0);
         set_status(m, "authenticated");
         /* The net thread asks for this user's drafts on every (re)connect, so
          * bump the sync generation HERE — the reply's terminator then sweeps
@@ -861,7 +881,14 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         break;
     }
     case OC_EV_PRESENCE:
-        presence_set(m, e->user_id, e->status);
+        presence_set(m, e->user_id, e->status, e->op);
+        break;
+    case OC_EV_SNOOZE:
+        /* MY pause (REQ-278). The end instant is self-only, so this is the one
+         * place a time appears at all; everybody else's is just a flag. */
+        m->snooze_until_ms = e->server_time;
+        presence_set(m, m->user_id, oc_model_presence_of(m, m->user_id),
+                     e->server_time != 0);
         break;
     case OC_EV_TYPING:
         typing_touch(m, e->channel_id, e->user_id);

@@ -140,6 +140,20 @@ wait_grep() {
 # dump and check several keys from that same frame.
 settle() { wait_for "$1" "$2" >/dev/null 2>&1 || true; }
 
+# After a `launch`, the new window does not always take the keyboard back from
+# whatever had it — and when it does not, every `key`/`chars` verb still acks "ok"
+# while going nowhere, so the suite reports "sending did not clear the field" for
+# a send that was never typed. That cost a real investigation. Wait for the window
+# to actually hold focus, and say plainly when it never does.
+wait_typeable() {
+  local t=0
+  while [ "$(snap | grep -oE '^wnd_focus=[0-9]' | cut -d= -f2)" != "1" ]; do
+    [ "$t" -ge 8000 ] && { say "   the window never took the keyboard — the checks below would blame the product"; return 1; }
+    sleep 0.2; t=$((t + 200))
+  done
+  return 0
+}
+
 # expect <dump> <key> <wanted> <label> — same-frame check against a captured dump.
 expect() {
   local dump="$1" key="$2" want="$3" label="$4" got
@@ -1205,6 +1219,7 @@ expect "$d" draftrail 1 "drafts: the Home sidebar carries the destination"
 # The whole point: a NEW PROCESS finds it.
 "$DRIVE" launch >/dev/null 2>&1
 if ! wait_grep 'authed=1 connected=1' 20000; then fail "relaunch did not authenticate"; fi
+wait_typeable || true
 "$DRIVE" channel general >/dev/null 2>&1; settle conv 1
 expect_grep '^ed .*text="unsent thoughts"' "and it is still there after a restart"
 
@@ -1309,6 +1324,36 @@ if [ -f "$LIN_DIR/uia_probe.ps1" ] || cp "$HERE/scripts/uia_probe.ps1" "$LIN_DIR
 else
   say "   (could not stage uia_probe.ps1 — skipping the external check)"
 fi
+
+# --- pausing notifications (WIN-92, REQ-278) -------------------------------
+# The pause is SERVER state, not a client mood: the restart below is the point of
+# the section — a client that only remembered it locally would pass every other
+# check here and still show "not paused" to somebody who is.
+say "== pause notifications"
+"$DRIVE" view 0 >/dev/null 2>&1; settle sbkind 1
+"$DRIVE" menu 57 >/dev/null 2>&1          # start from resumed, whatever a previous run left
+expect_grep '^snoozed=0 ' "starts unpaused"
+"$DRIVE" menu 58 >/dev/null 2>&1          # for 30 minutes
+checks=$((checks + 1))
+if wait_grep '^snoozed=1 snooze_until=1[0-9]{12}'; then
+  ok "pausing for 30 minutes sets an absolute end instant"
+else fail "pause did not take: $(snap | grep '^snoozed=')"; fi
+until0=$(snap | grep -oE '^snoozed=1 snooze_until=[0-9]+' | cut -d= -f3)
+
+# It outlives the process, because the daemon holds it and tells the client at
+# auth — the frame is unconditional, so "not paused" is never inferred from
+# silence.
+"$DRIVE" kill >/dev/null 2>&1
+"$DRIVE" launch >/dev/null 2>&1
+wait_for authed 1 >/dev/null 2>&1
+wait_typeable || true
+checks=$((checks + 1))
+if wait_grep "^snoozed=1 snooze_until=$until0"; then
+  ok "the pause survives a restart, to the same instant"
+else fail "pause lost across a restart: $(snap | grep '^snoozed=')"; fi
+
+"$DRIVE" menu 57 >/dev/null 2>&1          # resume
+expect_grep '^snoozed=0 snooze_until=0 ' "resuming ends it, and ends it now"
 
 # --- one selected row at a time (WIN-106) ----------------------------------
 # Reported from a screenshot: the Drafts pane lit its own shelf row AND left the

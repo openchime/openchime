@@ -51,6 +51,7 @@ enum {
     OC_EV_SEARCH_RESULT,   /* a SEARCH_RESULTS entry: channel/message/author + snippet(body) */
     OC_EV_REACTIONS,       /* a REACTIONS entry: message_id + one reactor (user_id + emoji) */
     OC_EV_DND,             /* a NOTIFY_PREFS header (frame start): status=enabled, count=(start<<16|end) */
+    OC_EV_SNOOZE,          /* a SNOOZE: server_time = when the pause ends, 0 = not paused (REQ-278) */
     OC_EV_NOTIFY_PREF,     /* a NOTIFY_PREFS entry: channel_id + level(op) */
     OC_EV_USER_UPDATED,    /* a USER_UPDATED: user_id + role(status) + disabled(op) */
     OC_EV_INVITE,          /* an INVITE_CREATED: body=token, op=role, server_time=expires_at */
@@ -194,6 +195,7 @@ enum {
     OC_CMD_LIST_REACTIONS,  /* inspect who reacted to `message_id` in `channel_id` */
     OC_CMD_SET_NOTIFY_PREF, /* set `channel_id`'s notification level (op = level) */
     OC_CMD_SET_DND,         /* set the DND window: op = enabled, channel_id = start_min, message_id = end_min */
+    OC_CMD_SET_SNOOZE,      /* pause notifications: message_id = minutes from now, 0 ends it (REQ-278) */
     OC_CMD_LIST_NOTIFY_PREFS, /* request all notification settings (DND + per-channel) */
     OC_CMD_SET_SETTING,     /* upsert a synced client setting: body=key, body2=value (empty value deletes) */
     OC_CMD_LIST_SETTINGS,   /* request the synced client-settings bucket */

@@ -408,6 +408,17 @@ void oc_client_set_dnd(oc_client *c, uint8_t enabled, uint16_t start_min, uint16
     oc_queue_push(&c->cmds, cmd);
 }
 
+/* Pause notifications for `minutes` from now; 0 ends a pause early (REQ-278).
+ * Minutes rather than an instant because that is what the presets ARE, and the
+ * daemon resolving them once is what keeps a pause off everybody's clock. */
+void oc_client_set_snooze(oc_client *c, uint32_t minutes) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_SNOOZE);
+    if (!cmd) return;
+    cmd->message_id = minutes;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_list_notify_prefs(oc_client *c) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_NOTIFY_PREFS);
