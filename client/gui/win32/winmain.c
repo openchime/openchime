@@ -909,6 +909,9 @@ static int g_view = VIEW_HOME;          /* current primary view (rail selection)
  * derived hover states (g_nav_hover, g_hover_mid, …) but never the position
  * itself, so shared chrome — the modal frame's buttons — had nothing to ask. */
 static int g_mouse_x = -1, g_mouse_y = -1;
+/* The last double-click, for counting a third one (WIN-100). */
+static ULONGLONG g_dbl_ms;
+static int g_dbl_x, g_dbl_y;
 static int g_nav_hover = -100;          /* rail item under the cursor (act value) */
 /* Rail item hit-boxes, captured during paint. `act` >=0 is a VIEW_*, <0 a NAV_*. */
 static struct { float top, bot; int act; } g_navrows[16];
@@ -8331,6 +8334,41 @@ static void ed_mouse_up(void) {
     ReleaseCapture();
 }
 
+/* ---- double-click word selection (WIN-100) --------------------------------
+ * A native EDIT does this for free, which is why nothing here did it after
+ * WIN-80/ARCH-98 replaced the RichEdit with a self-drawn field: the behaviour
+ * left with the control and no test missed it, because the harness could not
+ * express a gesture at all until `drag` was added alongside this.
+ *
+ * Two things were needed. The window class never set CS_DBLCLKS, so Windows was
+ * not sending WM_LBUTTONDBLCLK in the first place — a second click arrived as
+ * another plain WM_LBUTTONDOWN, which quietly re-placed the caret and looked
+ * exactly like "selection is broken". And there was no handler for it. */
+
+/* The run around `pos` — a word, or the whitespace between two. UTF-16 offsets,
+ * which is what both callers already index in (the field's buffer, and the
+ * transcript's body layout). */
+static void word_bounds(const WCHAR *s, int len, int pos, int *a, int *b) {
+    int i = pos < 0 ? 0 : (pos > len ? len : pos), sp;
+    /* Clicking just PAST a word takes that word. It is where the caret lands
+     * when you double-click the end of one, and taking the space instead is the
+     * kind of nearly-right that reads as broken. */
+    if ((i >= len || ed_is_space(s[i])) && i > 0 && !ed_is_space(s[i - 1])) i--;
+    sp = (i < len) ? (ed_is_space(s[i]) ? 1 : 0) : 1;
+    *a = *b = i;
+    while (*a > 0 && (ed_is_space(s[*a - 1]) ? 1 : 0) == sp) (*a)--;
+    while (*b < len && (ed_is_space(s[*b]) ? 1 : 0) == sp) (*b)++;
+}
+
+static int ed_select_word(HWND hwnd, float x, float y) {
+    int a, b;
+    if (!in_rect(g_ed_box, x, y)) return 0;
+    ed_focus(hwnd);
+    word_bounds(g_ed, g_ed_len, ed_hit(x, y), &a, &b);
+    g_ed_anchor = a; g_ed_caret = b;
+    return 1;
+}
+
 /* ---- IME ------------------------------------------------------------------
  * The composition string is drawn inline (underlined) and the candidate window is
  * pinned to the caret. Handled here rather than left to DefWindowProc because a
@@ -10629,6 +10667,31 @@ static int selection_start(HWND hwnd, int x, int y) {
     return 1;
 }
 
+/* The transcript's half of WIN-100: double-click selects the word under the
+ * pointer, triple-click the whole message. Same positions selection_start uses,
+ * so copy_selection needs to know nothing about how the range was made. */
+static int selection_word(HWND hwnd, int x, int y, int whole_message) {
+    const oc_model *m = model();
+    const oc_channel *c;
+    const oc_msg *msg;
+    WCHAR w[2048];
+    int n, a, b, r = msgrow_at(x, y);
+    if (r < 0 || !m || !g_sel) return 0;
+    c = oc_model_channel((oc_model *)m, g_sel);
+    msg = find_msg(c, g_msgrows[r].mid);
+    if (!msg || !msg_has_body(msg)) return 0;
+    n = to_w(body_text(msg), w, 2048);
+    if (n < 0) n = 0;
+    if (whole_message) { a = 0; b = n; }
+    else word_bounds(w, n, (int)hit_pos(r, x, y), &a, &b);
+    if (a >= b) return 0;
+    g_sel_a_mid = g_sel_f_mid = g_msgrows[r].mid;
+    g_sel_a_pos = (uint32_t)a; g_sel_f_pos = (uint32_t)b;
+    g_has_sel = 1; g_selecting = 0; g_hover_mid = 0;
+    SetFocus(hwnd);                        /* so Ctrl+C reaches us */
+    return 1;
+}
+
 static void selection_update(int x, int y) {
     if (!g_selecting) return;
     int r = msgrow_clamp(y);
@@ -12484,6 +12547,16 @@ static void test_dump(const char *path) {
     fprintf(f, "msgrows n=%d x=%.0f..%.0f hover=%llu listrows=%d\n", g_n_msgrows,
             g_n_msgrows ? g_msgrows[0].left : -1.0f, g_n_msgrows ? g_msgrows[0].right : -1.0f,
             (unsigned long long)g_hover_mid, g_n_listrows);
+    /* Where each message's BODY actually is, and what is selected in it. Both
+     * are here because WIN-100 needed them and neither existed: a test that
+     * wants to double-click a word had no way to find one, and no way to see
+     * what it got. */
+    for (int i = 0; i < g_n_msgrows; i++)
+        fprintf(f, "  msgrow %d mid=%llu body=%.0f,%.0f\n", i,
+                (unsigned long long)g_msgrows[i].mid, g_msgrows[i].bx, g_msgrows[i].by);
+    fprintf(f, "tsel has=%d a=%llu:%u f=%llu:%u\n", g_has_sel,
+            (unsigned long long)g_sel_a_mid, g_sel_a_pos,
+            (unsigned long long)g_sel_f_mid, g_sel_f_pos);
     fprintf(f, "tray_live=%d notify_pref=%d toasts_raised=%d dnd=%d\n",
             g_tray_live, g_pref_notify, g_toasts_raised, dnd_active(m));
     fprintf(f, "lightbox=%llu thumb_hits=%d\n", (unsigned long long)g_lightbox, g_n_thumb_hits);
@@ -12585,6 +12658,42 @@ static void test_poll(HWND hwnd) {
         SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, pos);
         SendMessageW(hwnd, WM_LBUTTONUP, 0, pos);
         test_ack("ok");
+    } else if (!strcmp(verb, "dblclick") || !strcmp(verb, "tripleclick")) {
+        /* A real WM_LBUTTONDBLCLK, which is what the system sends only because
+         * the class asks for it (CS_DBLCLKS) — driving two `click`s instead
+         * would test the thing that was already happening and passing. The
+         * triple sends the following down/up too, in one go, so the assertion
+         * does not depend on the harness beating GetDoubleClickTime(). */
+        int x = 0, y = 0;
+        if (sscanf(arg, "%d %d", &x, &y) == 2) {
+            LPARAM pos = MAKELPARAM(PX(x), PX(y));
+            SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, pos);
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, pos);
+            SendMessageW(hwnd, WM_LBUTTONDBLCLK, MK_LBUTTON, pos);
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, pos);
+            if (verb[0] == 't') {
+                SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, pos);
+                SendMessageW(hwnd, WM_LBUTTONUP, 0, pos);
+            }
+            test_ack("ok");
+        } else test_ack("err");
+    } else if (!strcmp(verb, "drag")) {
+        /* Press, move, release — the gesture that SELECTS, and until now the one
+         * gesture the harness could not make. `click` sends a down/up pair at one
+         * point, so every selection path in the app (the composer's, the
+         * transcript's) was reachable only by hand. Intermediate moves are sent,
+         * not just the endpoint, because a drag handler that tracks state per
+         * move is exactly the kind that passes a teleport and fails a drag. */
+        int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        if (sscanf(arg, "%d %d %d %d", &x0, &y0, &x1, &y1) == 4) {
+            SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(PX(x0), PX(y0)));
+            for (int s = 1; s <= 4; s++)
+                SendMessageW(hwnd, WM_MOUSEMOVE, MK_LBUTTON,
+                             MAKELPARAM(PX(x0 + (x1 - x0) * s / 4),
+                                        PX(y0 + (y1 - y0) * s / 4)));
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(PX(x1), PX(y1)));
+            test_ack("ok");
+        } else test_ack("err");
     } else if (!strcmp(verb, "rclick")) {
         int x = 0, y = 0; sscanf(arg, "%d %d", &x, &y); on_rclick(hwnd, x, y); test_ack("ok");
     } else if (!strcmp(verb, "members")) {
@@ -13552,8 +13661,37 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     }
+    /* Double-click selects a word, in the field or in a message (WIN-100). The
+     * same order as the button-down below — composer first, then the
+     * transcript — so what you double-click is what answers. */
+    case WM_LBUTTONDBLCLK: {
+        int mx = (int)DIPF(GET_X_LPARAM(lp)), my = (int)DIPF(GET_Y_LPARAM(lp));
+        g_dbl_ms = GetTickCount64(); g_dbl_x = mx; g_dbl_y = my;
+        if (!window_is_covered() && ed_select_word(hwnd, (float)mx, (float)my)) {
+            InvalidateRect(hwnd, NULL, FALSE); return 0;
+        }
+        if (!any_overlay(model()) && selection_word(hwnd, mx, my, 0)) {
+            InvalidateRect(hwnd, NULL, FALSE); return 0;
+        }
+        return 0;
+    }
     case WM_LBUTTONDOWN: {
         int mx = (int)DIPF(GET_X_LPARAM(lp)), my = (int)DIPF(GET_Y_LPARAM(lp));
+        /* A THIRD click on the same spot takes the paragraph — the whole field,
+         * or the whole message. Windows has no triple-click message; every app
+         * that offers one counts it, and this is that count: the click after a
+         * double-click, inside the system's own double-click time. */
+        if ((GetTickCount64() - g_dbl_ms) < GetDoubleClickTime() &&
+            mx >= g_dbl_x - 4 && mx <= g_dbl_x + 4 && my >= g_dbl_y - 4 && my <= g_dbl_y + 4) {
+            g_dbl_ms = 0;
+            if (!window_is_covered() && in_rect(g_ed_box, (float)mx, (float)my)) {
+                ed_focus(hwnd); ed_select_all();
+                InvalidateRect(hwnd, NULL, FALSE); return 0;
+            }
+            if (!any_overlay(model()) && selection_word(hwnd, mx, my, 1)) {
+                InvalidateRect(hwnd, NULL, FALSE); return 0;
+            }
+        }
         /* The composer first: it is a self-drawn field now (WIN-80), so a click in it
          * places the caret rather than being swallowed by a child window. Before
          * on_click, or the transcript's selection would start under it. */
@@ -13891,6 +14029,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     WNDCLASSEXW wc;
     memset(&wc, 0, sizeof wc);
     wc.cbSize        = sizeof wc;
+    /* CS_DBLCLKS or Windows never sends WM_LBUTTONDBLCLK at all — a double-click
+     * arrives as two ordinary downs, which is why double-clicking a word in the
+     * self-drawn field just moved the caret twice (WIN-100). */
+    wc.style         = CS_DBLCLKS;
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = inst;
     wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);

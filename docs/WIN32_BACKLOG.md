@@ -78,7 +78,7 @@ pattern REQ-221 and REQ-230 both followed.
   The daemon is epoll-based and Linux-only, and GitHub's Windows runners cannot
   host it. The job exists and skips until a self-hosted Windows+WSL runner does.
   Until then the smoke is a local gate. It is a trustworthy one since WIN-87/88:
-  150 checks, waiting on state rather than sleeping, refusing to run against the
+  157 checks, waiting on state rather than sleeping, refusing to run against the
   wrong daemon, and including a real UIA client walking the accessibility tree
   from outside the process.
 
@@ -97,19 +97,30 @@ pattern REQ-221 and REQ-230 both followed.
 
 ## What "closed" does and does not mean
 
-WIN-1 … WIN-90 plus WIN-93, WIN-95, WIN-96, WIN-98 and WIN-99 are done —
+WIN-1 … WIN-90 plus WIN-93, WIN-95, WIN-96 and WIN-98 … WIN-100 are done —
 accessibility included, built *for* the custom controls rather than by retreating
 to native ones (ARCH-99), and rich text with its toolbar as of 2026-07-31. The
 items below are each blocked on a daemon requirement or an ARCH decision, or, in
 WIN-60's case, on a crash that has not reproduced since it was instrumented.
 
-**Two of those three ids did not come from this list.** WIN-98 (Ctrl+C in the
+**Three of those ids did not come from this list.** WIN-98 (Ctrl+C in the
 composer copied nothing, because the transcript's handler claimed the key and
 then did nothing with it) surfaced while wiring WIN-96's Ctrl+Shift+C, by trying
 it rather than by reading it. WIN-99 (search left open floated its native EDIT
-over the "New direct message" picker) arrived as a screenshot of the running
-client. Both are the shape this document's closing note already describes: a
-backlog records what somebody wrote down, and neither of these was on it. An adversarial review on 2026-07-30 found no defect in the
+over the "New direct message" picker) and WIN-100 (double-click selected no
+word, anywhere — the window class never asked for `CS_DBLCLKS`, so Windows was
+not sending the message at all) both arrived from **somebody using the client**.
+
+WIN-100 is the sharpest of the three, because it is a *regression by omission*:
+a native EDIT does word selection for free, so the behaviour left with the
+control when WIN-80/ARCH-98 replaced it with a self-drawn field, and nothing
+noticed for a fortnight. The harness could not have caught it either — until
+this fix it had no verb for a gesture at all, only `click`, which is a down/up
+pair at one point. `drag`, `dblclick` and `tripleclick` exist now, and the
+suite uses all three.
+
+All are the shape this document's closing note already describes: a backlog
+records what somebody wrote down, and none of these was on it. An adversarial review on 2026-07-30 found no defect in the
 previously-closed list, several claims verified by round-trip against a live
 daemon (pin → Pins tab; save → Later; Activity, Files, Later and Admin all
 rendering real content).

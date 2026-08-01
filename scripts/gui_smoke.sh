@@ -970,6 +970,51 @@ expect_grep '^ed .*text="\*by hand\*"' "clicking B does what Ctrl+B does"
 expect_grep '^ed .*text="\*inside\*"' "with no selection it opens a pair to type into"
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
 
+# --- selecting text with the mouse (WIN-100) --------------------------------
+# The self-drawn field (WIN-80) replaced a native EDIT, and word selection left
+# with the control: the window class never asked for CS_DBLCLKS, so Windows was
+# not even sending WM_LBUTTONDBLCLK and a double-click just moved the caret
+# twice. Nothing caught it because the harness could not express a gesture at
+# all — `drag`, `dblclick` and `tripleclick` exist as of this section.
+say "== selecting with the mouse"
+ed_pt() {                          # ed_pt <dx> <dy> -> a point inside the field
+  snap | awk -v dx="$1" -v dy="$2" '/^ed /{
+    for (i = 1; i <= NF; i++) if ($i ~ /^box=/) { sub(/^box=/, "", $i); split($i, b, ",");
+      if (b[3] > b[1]) print int(b[1] + dx), int(b[2] + dy); exit } }'
+}
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+"$DRIVE" chars "select some of this text" >/dev/null 2>&1; ed_wait len 24
+"$DRIVE" dblclick $(ed_pt 44 10) >/dev/null 2>&1
+ed_step sel 1 "double-click selects a word in the composer"
+# What it selected, asserted through the operation it exists to serve: the word
+# and nothing but the word, or the delimiters land in the wrong place.
+"$DRIVE" key ctrl+b >/dev/null 2>&1
+expect_grep '^ed .*text="select \*some\* of this text"' "and it is the word under the pointer, exactly"
+"$DRIVE" key ctrl+b >/dev/null 2>&1
+"$DRIVE" tripleclick $(ed_pt 44 10) >/dev/null 2>&1
+"$DRIVE" key ctrl+b >/dev/null 2>&1
+expect_grep '^ed .*text="\*select some of this text\*"' "triple-click takes the whole field"
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+"$DRIVE" chars "drag across me" >/dev/null 2>&1; ed_wait len 14
+"$DRIVE" drag $(ed_pt 2 10) $(ed_pt 60 10) >/dev/null 2>&1
+ed_step sel 1 "dragging in the composer selects a range"
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+
+# The transcript has the same two gestures, and its selection is what Ctrl+C
+# copies — so this asserts the round trip rather than the internal range.
+"$DRIVE" send "the quick brown fox jumps" >/dev/null 2>&1
+wait_grep '^tsel ' >/dev/null 2>&1 || true
+body=$(snap | awk '/^  msgrow /{ for (i=1;i<=NF;i++) if ($i ~ /^body=/) { sub(/^body=/,"",$i); split($i,b,","); x=b[1]; y=b[2] } } END{ print int(x)+12, int(y)+8 }')
+"$DRIVE" dblclick $body >/dev/null 2>&1
+expect_grep '^tsel has=1 a=[0-9]+:0 f=[0-9]+:3' "double-click selects a word in a message"
+"$DRIVE" tripleclick $body >/dev/null 2>&1
+expect_grep '^tsel has=1 a=[0-9]+:0 f=[0-9]+:25' "triple-click selects the whole message"
+"$DRIVE" key ctrl+c >/dev/null 2>&1
+"$DRIVE" click $(ed_pt 44 10) >/dev/null 2>&1
+"$DRIVE" key ctrl+v >/dev/null 2>&1
+expect_grep '^ed .*text="the quick brown fox jumps"' "and Ctrl+C copies what was selected"
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+
 # --- mentioning someone who is not in the channel (REQ-287) ------------------
 # The defect this covers is a FALSE CONFIRMATION: the highlight is syntactic, so
 # a mention that notified nobody looked exactly like one that worked. Asserted as
