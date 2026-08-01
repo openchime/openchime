@@ -2558,11 +2558,13 @@ static int emoji_runs(const char *utf8, oc_emoji_run *out, int max) {
  * daemon stored. Selection, copy, hit-testing and the mention offsets all
  * address that same text; a rewritten string would have to re-map every one.
  *
- * Where the two callers differ is the DELIMITERS. The TRANSCRIPT removes them:
- * you asked for bold, not for asterisks. The COMPOSER only dims them, because
- * its text is what will be sent — you are editing `*bold*`, and a field that
- * hid the asterisks would leave you stepping the caret through characters you
- * cannot see and unable to find the markup you have to delete to undo it.
+ * BOTH callers remove the delimiters (WIN-101). The transcript always did; the
+ * composer dimmed them at first, on the reasoning that its text is what will be
+ * sent and hiding characters would strand the caret among them. That was half a
+ * product — styled text with the asterisks still beside it reads as a leak — and
+ * the caret objection turned out to be answerable rather than fatal: see the
+ * WYSIWYG note above ed_hidden_build(), which is where the answer lives. The two
+ * surfaces now render a body identically, which is the property worth having.
  *
  * Removing one takes a transparent brush AND a 0.1 DIP font size, because the
  * layout covers the raw body: a transparent asterisk keeps its width and every
@@ -2573,7 +2575,8 @@ static int emoji_runs(const char *utf8, oc_emoji_run *out, int max) {
  *
  * BLOCK markers are the exception and stay visible, merely faint: `- `, `1. `
  * and `> ` *are* the rendering of a list or a quote in a text-range-only
- * treatment, not scaffolding around it. */
+ * treatment, not scaffolding around it — in both surfaces, for the same
+ * reason. */
 static const WCHAR *rt_mono_family(void) { return L"Consolas"; }
 
 /* Byte offset -> UTF-16 offset in the same text. Spans arrive as byte offsets
@@ -7711,8 +7714,199 @@ typedef struct { WCHAR t[ED_MAX + 1]; int len, caret; } ed_snap;
 static ed_snap g_ed_undo[ED_UNDO], g_ed_redo[ED_UNDO];
 static int g_ed_n_undo, g_ed_n_redo;
 
+/* ---- WYSIWYG (WIN-101, REQ-220, ARCH-100) ----------------------------------
+ * The field shows FORMATTING, never markup — the same rendering the transcript
+ * gives, so what you are typing looks like what will be posted. Slack shows no
+ * markup either, and a field that showed half of it (styled text with the
+ * asterisks still visible beside it) read as a leak rather than a feature.
+ *
+ * The buffer is still the plain source. There is no second representation and
+ * cannot be: ARCH-100 says the body is plain UTF-8 with the markup in band, so
+ * the delimiters stay in `g_ed` — drafts, sends, undo and Ctrl+C all keep
+ * working on exactly the bytes the daemon will store. They are simply drawn
+ * with no ink and no width.
+ *
+ * What that costs is caret arithmetic, and the cost is smaller than it looks.
+ * Our delimiters are one or two characters, so there are no positions STRICTLY
+ * inside one that a caret could get stuck in. The real problem is subtler: two
+ * positions either side of an invisible marker are the SAME PLACE on screen, so
+ * an arrow key appears to do nothing and a click could land on either.
+ *
+ * Both are fixed by one rule: **canonicalise every caret position to the
+ * leftmost of the set that draws in the same place**, and make an arrow key
+ * keep stepping while the character it crossed was invisible.
+ *
+ * The rule is not arbitrary — it is what makes emphasis behave the way Slack's
+ * does at the edges. Leftmost means the caret after a bold word sits INSIDE the
+ * closing delimiter, so typing continues the bold; and the caret before one
+ * sits OUTSIDE the opening delimiter, so typing there does not start it. Which
+ * is exactly what a rich editor does, out of a rule about invisible characters
+ * rather than a special case about formatting. */
+
+/* One byte per UTF-16 unit of `g_ed`: 0 visible, ED_H_OPEN an invisible OPENING
+ * delimiter, ED_H_CLOSE an invisible closing one. Rebuilt from the shared
+ * parser, so "what is hidden" and "what is markup" cannot disagree — the same
+ * reason the mention scanner is shared.
+ *
+ * Which END a delimiter is matters exactly once, in ed_caret_for_typing(), and
+ * it is the difference between typing at the edge of a bold word extending it
+ * and typing there falling out of it. */
+#define ED_H_OPEN  1
+#define ED_H_CLOSE 2
+static unsigned char g_ed_hidden[ED_MAX + 1];
+static int g_ed_hidden_valid;
+
 static void ed_invalidate_layout(void) {
     if (g_ed_layout) { IDWriteTextLayout_Release(g_ed_layout); g_ed_layout = NULL; }
+    g_ed_hidden_valid = 0;
+}
+
+static void ed_hidden_build(void) {
+    static char u8[ED_MAX * 3 + 1];
+    oc_rt_span sp[OC_RT_MAX];
+    size_t n, i;
+    int bytes;
+    g_ed_hidden_valid = 1;
+    memset(g_ed_hidden, 0, sizeof g_ed_hidden);
+    if (g_ed_len <= 0) return;
+    bytes = WideCharToMultiByte(CP_UTF8, 0, g_ed, g_ed_len, u8, (int)sizeof u8 - 1, NULL, NULL);
+    if (bytes <= 0) return;
+    u8[bytes] = 0;
+    n = oc_rt_scan(u8, (size_t)bytes, sp, OC_RT_MAX);
+    if (n > OC_RT_MAX) n = OC_RT_MAX;
+    for (i = 0; i < n; i++) {
+        int at, len, k;
+        /* Only INLINE delimiters vanish. A list marker or a quote's `> ` is the
+         * rendering of that construct in a text field, not scaffolding around
+         * it — the transcript keeps them too, and the two surfaces showing the
+         * same body differently is the thing this change exists to end. */
+        unsigned char kind = ED_H_CLOSE;
+        if (!(sp[i].style & OC_RT_DELIM)) continue;
+        if (sp[i].style & (OC_RT_BULLET | OC_RT_ORDERED | OC_RT_QUOTE)) continue;
+        /* The opener is the delimiter the parser emits immediately before the
+         * content it opens — see the emit order in richtext.c's scan_inline. A
+         * lone DELIM with no content after it is an escape's backslash, which
+         * opens nothing and is left as a closer so typing never steps over it. */
+        if (i + 1 < n && sp[i + 1].start == sp[i].start + sp[i].len &&
+            (sp[i + 1].style | OC_RT_DELIM) == sp[i].style)
+            kind = ED_H_OPEN;
+        at  = MultiByteToWideChar(CP_UTF8, 0, u8, (int)sp[i].start, NULL, 0);
+        len = MultiByteToWideChar(CP_UTF8, 0, u8 + sp[i].start, (int)sp[i].len, NULL, 0);
+        if (at < 0 || len <= 0) continue;
+        for (k = at; k < at + len && k < g_ed_len; k++) g_ed_hidden[k] = kind;
+    }
+}
+
+static void ed_delete_range(int a, int b);   /* fwd */
+
+/* The buffer as it was before the current edit, and what was invisible in it.
+ * Kept for one reason: see ed_repair_orphans(). */
+static WCHAR         g_ed_prev[ED_MAX + 1];
+static int           g_ed_prev_len;
+static unsigned char g_ed_prev_hidden[ED_MAX + 1];
+
+/* Is the character at buffer index `i` invisible? */
+static int ed_char_hidden(int i) {
+    if (i < 0 || i >= g_ed_len) return 0;
+    if (!g_ed_hidden_valid) ed_hidden_build();
+    return g_ed_hidden[i];
+}
+
+/* The leftmost position that draws where `pos` draws. Every caret and every
+ * selection endpoint passes through here, so no two visually identical
+ * positions can ever both be reachable. */
+static int ed_canon(int pos) {
+    if (pos < 0) return 0;
+    if (pos > g_ed_len) pos = g_ed_len;
+    while (pos > 0 && ed_char_hidden(pos - 1)) pos--;
+    return pos;
+}
+
+/* Markup must never APPEAR on screen without being typed (WIN-101).
+ *
+ * The delimiters live in the buffer, so an edit somewhere else can stop a
+ * construct parsing and make them visible again. Delete the space in "a *x* b"
+ * and `*x*` no longer sits at a word boundary (MARKDOWN.md §2.1) — the emphasis
+ * is gone, and two asterisks nobody typed take its place on screen. That is the
+ * exact failure this change exists to remove, arriving by the back door.
+ *
+ * So: a delimiter that WAS invisible and no longer parses is deleted. The
+ * formatting goes, the markup never shows. It is the only answer available with
+ * in-band markup — keeping "x" bold would need `a*x*` to be emphasis, which is
+ * the rule that stops `a_variable_name` becoming italic, and that rule is worth
+ * more than this case is.
+ *
+ * The edit is found by diffing against the previous buffer rather than by
+ * bookkeeping inside the mutators: a user edit is one contiguous replacement, so
+ * a common prefix and suffix locate it exactly, and this can run once at the end
+ * of an operation instead of once per insert. Which matters — ed_fmt_inline
+ * inserts an opener and a closer separately, and repairing between the two would
+ * delete the opener for not yet having a partner. */
+static void ed_repair_orphans(void) {
+    int p = 0, so, sn, i, drop[64], n = 0, caret = g_ed_caret, anchor = g_ed_anchor;
+    if (g_ed_prev_len <= 0) return;
+    while (p < g_ed_prev_len && p < g_ed_len && g_ed_prev[p] == g_ed[p]) p++;
+    so = g_ed_prev_len; sn = g_ed_len;
+    while (so > p && sn > p && g_ed_prev[so - 1] == g_ed[sn - 1]) { so--; sn--; }
+    if (!g_ed_hidden_valid) ed_hidden_build();
+    /* Untouched head, then untouched tail at its new offset. Anything inside the
+     * edit itself is the user's own typing and is never second-guessed. */
+    for (i = 0; i < p && n < 64; i++)
+        if (g_ed_prev_hidden[i] && !g_ed_hidden[i]) drop[n++] = i;
+    for (i = so; i < g_ed_prev_len && n < 64; i++) {
+        int j = i - so + sn;
+        if (j >= 0 && j < g_ed_len && g_ed_prev_hidden[i] && !g_ed_hidden[j]) drop[n++] = j;
+    }
+    /* Right to left, so the earlier offsets stay valid, and carry the caret
+     * back over everything removed before it. */
+    for (i = n - 1; i >= 0; i--) {
+        ed_delete_range(drop[i], drop[i] + 1);
+        if (caret  > drop[i]) caret--;
+        if (anchor > drop[i]) anchor--;
+    }
+    if (n) {
+        g_ed_caret  = ed_canon(caret  < 0 ? 0 : (caret  > g_ed_len ? g_ed_len : caret));
+        g_ed_anchor = ed_canon(anchor < 0 ? 0 : (anchor > g_ed_len ? g_ed_len : anchor));
+    }
+}
+
+/* Remember the state every repair is measured against. */
+static void ed_remember(void) {
+    if (!g_ed_hidden_valid) ed_hidden_build();
+    g_ed_prev_len = g_ed_len;
+    memcpy(g_ed_prev, g_ed, (size_t)(g_ed_len + 1) * sizeof(WCHAR));
+    memcpy(g_ed_prev_hidden, g_ed_hidden, (size_t)g_ed_len);
+}
+
+/* One step left/right, crossing any invisible run in the same keypress —
+ * otherwise an arrow key spends a press moving nowhere the eye can see. */
+static int ed_step(int pos, int dir) {
+    if (dir < 0) {
+        if (pos <= 0) return 0;
+        pos--;
+        while (pos > 0 && ed_char_hidden(pos - 1)) pos--;
+        return pos;
+    }
+    if (pos >= g_ed_len) return g_ed_len;
+    while (pos < g_ed_len && ed_char_hidden(pos)) pos++;   /* over the opener */
+    if (pos < g_ed_len) pos++;                             /* and one real character */
+    return ed_canon(pos);
+}
+
+/* Delete the visible character at `at`, and with it the emphasis it was the
+ * last of. Without that, removing the final letter of *x* leaves ** behind —
+ * which no longer parses, so two asterisks nobody typed appear out of nowhere.
+ * Runs on both sides at once, so deleting the b in *a*b*c* leaves *ac*: two
+ * bold runs with the gap between them closed, which is what the screen showed
+ * you happening. */
+static void ed_delete_char_at(int at) {
+    int s = at, e = at + 1;
+    if (at < 0 || at >= g_ed_len) return;
+    if (ed_char_hidden(at - 1) && ed_char_hidden(at + 1)) {
+        while (s > 0 && ed_char_hidden(s - 1)) s--;
+        while (e < g_ed_len && ed_char_hidden(e)) e++;
+    }
+    ed_delete_range(s, e);
 }
 
 static int ed_sel_lo(void) { return g_ed_caret < g_ed_anchor ? g_ed_caret : g_ed_anchor; }
@@ -8005,17 +8199,14 @@ static IDWriteTextLayout *ed_layout(float w) {
         const oc_model *m = model();
         static char u8[(ED_MAX + 130) * 3 + 1];   /* static: too big for the stack */
         int bytes = WideCharToMultiByte(CP_UTF8, 0, tmp, n, u8, (int)sizeof u8 - 1, NULL, NULL);
-        /* Show the formatting AS YOU TYPE (REQ-220). Affordable only because the
-         * parser is client-side and runs over a <=4000-unit buffer — the same
-         * pass that already re-scans mentions on every keystroke.
-         *
-         * The delimiters stay VISIBLE here, merely faint, which is the honest
-         * rendering for a field whose text is what will be sent: you are editing
-         * `*bold*`, and a composer that hid the asterisks would leave you unable
-         * to see the markup you have to delete to undo it. */
+        /* Show the formatting AS YOU TYPE (REQ-220), with no markup at all
+         * (WIN-101) — the same call the transcript makes, so the field and the
+         * message it becomes are drawn by one piece of code. Affordable only
+         * because the parser is client-side and runs over a <=4000-unit buffer:
+         * the same pass that already re-scans mentions on every keystroke. */
         if (bytes > 0 && g_ed_rt) {
             u8[bytes] = '\0';
-            apply_richtext(g_ed_layout, u8, (size_t)bytes, (UINT32)n, g_brush2, NULL);
+            apply_richtext(g_ed_layout, u8, (size_t)bytes, (UINT32)n, g_brush2, g_brush4);
         }
         if (m && bytes > 0 && g_brush3 && g_ed_rt) {
             u8[bytes] = '\0';
@@ -8182,10 +8373,35 @@ static void ed_changed(HWND hwnd) {
         oc_client_typing(g_client, g_sel);
         g_last_typing = now;
     }
+    ed_repair_orphans();      /* WIN-101, before anything measures or draws */
+    ed_remember();
     ac_rebuild();
     if (composer_remeasure()) layout_composer(hwnd);
     g_ed_blink = GetTickCount64();       /* a caret that blinks while you type reads as lag */
     InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* Where typed text goes when the caret sits against an invisible marker.
+ *
+ * Inside it, always. The caret canonicalises LEFT, so at the front edge of a
+ * bold word it sits before the opening delimiter — and text inserted there
+ * would leave `X*bold*`, which is not emphasis at a word boundary, so the
+ * repair pass would then drop the formatting off a word the user was only
+ * editing. Landing inside keeps it: typing at either edge of a formatted run
+ * joins that run.
+ *
+ * This is the one place the field departs from Slack, and it departs because
+ * the markup is in band. Slack has no delimiters to be on the wrong side of, so
+ * it can make the new character plain and leave the old one bold; the same
+ * choice here costs the whole word its formatting, silently. Extending is the
+ * smaller surprise, and Ctrl+B on the character undoes it. */
+static int ed_caret_for_typing(void) {
+    int c = g_ed_caret;
+    /* Openers only. Stepping over a CLOSER would leave the run, which is the
+     * opposite of what the caret sitting there means: at the back edge of a
+     * bold word, typing continues the bold. */
+    while (c < g_ed_len && (ed_char_hidden(c) == ED_H_OPEN)) c++;
+    return c;
 }
 
 /* A printable character. Returns 1 when consumed. */
@@ -8194,6 +8410,7 @@ static int ed_char(HWND hwnd, WCHAR ch) {
     if (ch == L'\t') return 1;               /* Tab is navigation, never text */
     if (ch < 0x20 && ch != L'\n') return 1;  /* control chars: eaten, not inserted */
     WCHAR s[2] = { ch, 0 };
+    if (!ed_has_sel()) g_ed_caret = g_ed_anchor = ed_caret_for_typing();
     ed_insert(s);
     ed_changed(hwnd);
     return 1;
@@ -8208,11 +8425,10 @@ static int ed_key(HWND hwnd, WPARAM vk) {
 
     switch (vk) {
     case VK_LEFT:
-        g_ed_caret = ctrl ? ed_word_left(g_ed_caret) : (g_ed_caret > 0 ? g_ed_caret - 1 : 0);
+        g_ed_caret = ctrl ? ed_canon(ed_word_left(g_ed_caret)) : ed_step(g_ed_caret, -1);
         moved = 1; break;
     case VK_RIGHT:
-        g_ed_caret = ctrl ? ed_word_right(g_ed_caret)
-                          : (g_ed_caret < g_ed_len ? g_ed_caret + 1 : g_ed_len);
+        g_ed_caret = ctrl ? ed_canon(ed_word_right(g_ed_caret)) : ed_step(g_ed_caret, 1);
         moved = 1; break;
     case VK_UP: case VK_DOWN: {
         /* Vertical movement goes through the LAYOUT, not the buffer: with wrapping,
@@ -8227,22 +8443,38 @@ static int ed_key(HWND hwnd, WPARAM vk) {
         if (SUCCEEDED(IDWriteTextLayout_HitTestPoint(tl, cx, wanty, &trail, &inside, &h2)))
             g_ed_caret = (int)h2.textPosition + (trail ? (int)h2.length : 0);
         if (g_ed_caret > g_ed_len) g_ed_caret = g_ed_len;
+        g_ed_caret = ed_canon(g_ed_caret);
         moved = 1; break;
     }
     case VK_HOME: g_ed_caret = 0; moved = 1; break;
-    case VK_END:  g_ed_caret = g_ed_len; moved = 1; break;
+    /* End canonicalises INTO a trailing delimiter, which is the rule doing its
+     * job: it puts the caret where typing continues the emphasis the message
+     * ends in, as it would in any rich editor. */
+    case VK_END:  g_ed_caret = ed_canon(g_ed_len); moved = 1; break;
     case VK_BACK:
         if (ed_has_sel()) { ed_begin_edit(); ed_delete_range(ed_sel_lo(), ed_sel_hi()); }
         else if (g_ed_caret > 0) {
             ed_begin_edit();
-            ed_delete_range(ctrl ? ed_word_left(g_ed_caret) : g_ed_caret - 1, g_ed_caret);
+            /* The caret is canonical, so the character before it is a visible
+             * one by construction — there is no invisible marker to step over
+             * first, and no press that deletes nothing. */
+            if (ctrl) ed_delete_range(ed_word_left(g_ed_caret), g_ed_caret);
+            else      ed_delete_char_at(g_ed_caret - 1);
         }
         changed = 1; break;
     case VK_DELETE:
         if (ed_has_sel()) { ed_begin_edit(); ed_delete_range(ed_sel_lo(), ed_sel_hi()); }
         else if (g_ed_caret < g_ed_len) {
             ed_begin_edit();
-            ed_delete_range(g_ed_caret, ctrl ? ed_word_right(g_ed_caret) : g_ed_caret + 1);
+            if (ctrl) ed_delete_range(g_ed_caret, ed_word_right(g_ed_caret));
+            else {
+                /* Forward is the asymmetric one: the caret sits at the LEFT of
+                 * its equivalent positions, so an invisible run can lie between
+                 * it and the character the user is looking at. */
+                int q = g_ed_caret;
+                while (q < g_ed_len && ed_char_hidden(q)) q++;
+                ed_delete_char_at(q);
+            }
         }
         changed = 1; break;
     case VK_RETURN:
@@ -8315,7 +8547,7 @@ static int ed_hit(float x, float y) {
 static int ed_mouse_down(HWND hwnd, float x, float y) {
     if (!in_rect(g_ed_box, x, y)) return 0;
     ed_focus(hwnd);
-    g_ed_caret = g_ed_anchor = ed_hit(x, y);
+    g_ed_caret = g_ed_anchor = ed_canon(ed_hit(x, y));
     g_ed_dragging = 1;
     SetCapture(hwnd);
     InvalidateRect(hwnd, NULL, FALSE);
@@ -8324,7 +8556,7 @@ static int ed_mouse_down(HWND hwnd, float x, float y) {
 
 static void ed_mouse_move(HWND hwnd, float x, float y) {
     if (!g_ed_dragging) return;
-    g_ed_caret = ed_hit(x, y);
+    g_ed_caret = ed_canon(ed_hit(x, y));
     InvalidateRect(hwnd, NULL, FALSE);
 }
 

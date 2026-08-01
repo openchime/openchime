@@ -970,6 +970,47 @@ expect_grep '^ed .*text="\*by hand\*"' "clicking B does what Ctrl+B does"
 expect_grep '^ed .*text="\*inside\*"' "with no selection it opens a pair to type into"
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
 
+# --- the field shows formatting, never markup (WIN-101) ---------------------
+# The delimiters are still in the buffer — every assertion here is on the TEXT,
+# which is what gets sent — but they are drawn with no ink and no width. What
+# that costs is caret arithmetic, and these are the rules that pay it.
+say "== composer WYSIWYG"
+fmt_reset() {
+  "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+  "$DRIVE" chars "$1" >/dev/null 2>&1; ed_wait len "$2"
+}
+# An arrow key crosses an invisible marker in the SAME press: nine visible steps
+# from the start of "say *bold* now" land after the space, at buffer index 11.
+fmt_reset 'say *bold* now' 14
+"$DRIVE" key home >/dev/null 2>&1
+for _ in 1 2 3 4 5 6 7 8 9; do "$DRIVE" key right >/dev/null 2>&1; done
+ed_step caret 11 "arrow keys step over invisible delimiters, never into them"
+
+# The caret canonicalises left, which is what makes emphasis sticky at the back
+# edge and open at the front — the two behaviours a rich editor has.
+fmt_reset 'a *bold*' 8
+"$DRIVE" key end >/dev/null 2>&1; "$DRIVE" chars "X" >/dev/null 2>&1
+expect_grep '^ed .*text="a \*boldX\*"' "typing at the end of emphasis continues it"
+fmt_reset '*bold* b' 8
+"$DRIVE" key home >/dev/null 2>&1; "$DRIVE" chars "X" >/dev/null 2>&1
+expect_grep '^ed .*text="\*Xbold\* b"' "typing at the front of emphasis joins it"
+
+# Markup must never APPEAR without being typed. Deleting the space before a bold
+# word stops it parsing (MARKDOWN.md §2.1), so the delimiters go with it rather
+# than showing up on screen as two asterisks nobody wrote.
+fmt_reset 'a *x* b' 7
+for _ in 1 2 3; do "$DRIVE" key left >/dev/null 2>&1; done
+"$DRIVE" key back >/dev/null 2>&1
+expect_grep '^ed .*text="ax b"' "breaking a construct drops the emphasis, not the disguise"
+
+# And emptying one takes both delimiters, or ** would be left behind — which no
+# longer parses either, so it would come back visible.
+fmt_reset 'a *x* b' 7
+for _ in 1 2; do "$DRIVE" key left >/dev/null 2>&1; done
+"$DRIVE" key back >/dev/null 2>&1
+expect_grep '^ed .*text="a  b"' "deleting the last character removes the emphasis whole"
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+
 # --- selecting text with the mouse (WIN-100) --------------------------------
 # The self-drawn field (WIN-80) replaced a native EDIT, and word selection left
 # with the control: the window class never asked for CS_DBLCLKS, so Windows was

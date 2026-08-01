@@ -139,14 +139,24 @@ business:
 - **Win32** — **built 2026-07-31 (WIN-90).** DirectWrite ranges on the existing
   layout, the same mechanism `@mention` highlighting already uses
   (`body_layout`), so formatting composes with mentions and custom emoji rather
-  than fighting them. The **transcript removes** the inline delimiters and the
-  **composer only dims** them: the composer's text is what will be sent, so
-  hiding the asterisks there would leave you stepping a caret through
-  characters you cannot see. Removing one takes a transparent brush *and* a
-  0.1 DIP size, because the layout still covers the raw body and a transparent
-  asterisk keeps its width — two gaps around every bold word, which read as
-  typos. Block markers (`- `, `1. `, `> `) stay visible but faint: in a
-  range-only treatment they *are* the rendering of a list or a quote.
+  than fighting them. **Both the transcript and the composer remove the inline
+  delimiters** (WIN-101), so a body is drawn the same way wherever it appears —
+  you see formatting, never markup, as in Slack. Removing one takes a
+  transparent brush *and* a 0.1 DIP size, because the layout still covers the
+  raw body and a transparent asterisk keeps its width — two gaps around every
+  bold word, which read as typos. Block markers (`- `, `1. `, `> `) stay visible
+  but faint: in a range-only treatment they *are* the rendering of a list or a
+  quote.
+
+  The composer keeps the plain source in its buffer — there is still no second
+  representation — and pays for the hidden characters in caret arithmetic
+  instead: every caret position canonicalises to the leftmost of the set that
+  draws in the same place, arrows cross an invisible run within one keypress,
+  typed text lands inside an adjacent run rather than breaking it, and a
+  delimiter that stops parsing because of an edit elsewhere is **deleted** — the
+  formatting goes, the markup never appears. That last rule is forced: keeping
+  `x` emphasised in `a*x*` would need the word-boundary rule of §2 to bend, and
+  that rule is what stops `a_variable_name` becoming italic.
 - **TUI** — tuikit attributes; code blocks and blockquotes get in-band markers
   since a terminal has no proportional styling to lean on. **Not built yet** —
   the parser is shared and waiting for it, and until then the TUI shows the
