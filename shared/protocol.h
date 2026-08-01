@@ -205,6 +205,14 @@ typedef enum {
      * notice about a consequence the sender cannot otherwise see, because the
      * highlight is syntactic and renders the same either way. */
     OC_MSG_MENTION_UNRESOLVED      = 0x00B3,
+    /* Drafts (REQ-223, ARCH-101). DRAFT is deliberately BOTH the streamed list
+     * entry and the device-sync push, exactly as CLIENT_SETTINGS doubles as
+     * snapshot and push: one frame the client folds the same way whatever
+     * prompted it, rather than two that can disagree. */
+    OC_MSG_SET_DRAFT        = 0x00C0, /* C->S, upsert a draft (empty body = delete) */
+    OC_MSG_LIST_DRAFTS      = 0x00C1, /* C->S, all of my drafts */
+    OC_MSG_DRAFT            = 0x00C2, /* S->C, one draft: a list entry AND the sync push */
+    OC_MSG_DRAFTS           = 0x00C3, /* S->C, terminator */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -389,6 +397,12 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_CLIENT_TYPE_MAX     32u  /* client_type string cap (bytes) */
 #define OC_SETTING_KEY_MAX     64u  /* setting key string cap (bytes) */
 #define OC_SETTING_VALUE_MAX   512u /* setting value string cap (bytes) */
+/* A draft is bounded by the COMPOSER, not by an invented number (ARCH-101): the
+ * field holds ED_MAX = 4000 UTF-16 units, which is at most 12000 bytes of UTF-8
+ * (surrogate pairs are cheaper still, 4 bytes per 2 units). 16 KB clears that
+ * with room and stays far under REQ-054's 64 KB body cap. */
+#define OC_DRAFT_BODY_MAX    16384u
+#define OC_MAX_DRAFTS          256u /* cap on a LIST_DRAFTS reply */
 
 /* Channel kind (SCHEMA.md channels.kind) and the name cap for CREATE_CHANNEL. */
 #define OC_CHANNEL_KIND    0u   /* a named channel */
@@ -699,6 +713,10 @@ typedef struct { uint8_t dnd_enabled; uint16_t dnd_start_min; uint16_t dnd_end_m
                  uint8_t notify_default;
                  uint16_t count; const oc_notify_pref_entry *entries; } oc_notify_prefs;
 /* Synced client settings bucket (the daemon-side layer of the client config). */
+typedef struct { uint64_t channel_id; uint64_t thread_root; oc_slice body; } oc_set_draft;
+typedef struct { uint64_t channel_id; uint64_t thread_root;
+                 uint64_t updated_ms; oc_slice body; } oc_draft;
+typedef struct { uint16_t count; } oc_drafts;
 typedef struct { oc_slice client_type; oc_slice key; oc_slice value; } oc_set_client_setting;
 typedef struct { oc_slice client_type; } oc_list_client_settings;
 typedef struct { oc_slice key; oc_slice value; } oc_client_setting_entry;
@@ -938,6 +956,10 @@ oc_result oc_encode_unregister_device_token(oc_wbuf *w, uint16_t version, oc_sli
 oc_result oc_encode_device_token_ack(oc_wbuf *w, uint16_t version, const oc_device_token_ack *m);
 oc_result oc_encode_list_notify_prefs(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_notify_prefs(oc_wbuf *w, uint16_t version, const oc_notify_prefs *m);
+oc_result oc_encode_set_draft(oc_wbuf *w, uint16_t version, const oc_set_draft *m);
+oc_result oc_encode_list_drafts(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_draft(oc_wbuf *w, uint16_t version, const oc_draft *m);
+oc_result oc_encode_drafts(oc_wbuf *w, uint16_t version, const oc_drafts *m);
 oc_result oc_encode_set_client_setting(oc_wbuf *w, uint16_t version, const oc_set_client_setting *m);
 oc_result oc_encode_list_client_settings(oc_wbuf *w, uint16_t version, const oc_list_client_settings *m);
 oc_result oc_encode_audit_query(oc_wbuf *w, uint16_t ver, const oc_audit_query *m);
@@ -1075,6 +1097,9 @@ oc_result oc_decode_list_notify_prefs(oc_rbuf *p);
 oc_result oc_decode_notify_prefs(oc_rbuf *p, oc_notify_pref_entry *entries, uint16_t cap,
                                  uint16_t *out_count, oc_set_dnd *dnd_out,
                                  uint8_t *out_default);
+oc_result oc_decode_set_draft(oc_rbuf *p, oc_set_draft *m);
+oc_result oc_decode_draft(oc_rbuf *p, oc_draft *m);
+oc_result oc_decode_drafts(oc_rbuf *p, oc_drafts *m);
 oc_result oc_decode_set_client_setting(oc_rbuf *p, oc_set_client_setting *m);
 oc_result oc_decode_list_client_settings(oc_rbuf *p, oc_list_client_settings *m);
 /* CLIENT_SETTINGS decodes the entries into a caller buffer; client_type stays a

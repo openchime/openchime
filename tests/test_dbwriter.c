@@ -52,7 +52,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 29);
+    CHECK(oc_schema_version(db) == 30);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -1440,6 +1440,120 @@ static void test_saved_and_activity(void) {
     r = list_activity(w, bob);
     CHECK(r && r->n_alist == 0);
     oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* --- Drafts (REQ-223, ARCH-101) ------------------------------------------ */
+
+static oc_dbres *set_draft(oc_dbwriter *w, uint64_t uid, uint64_t cid,
+                           uint64_t root, const char *body) {
+    oc_job *j = oc_job_new(OC_JOB_SET_DRAFT, 900);
+    j->user_id = uid; j->channel_id = cid; j->parent_id = root;
+    if (body && *body) oc_job_set_body(j, body, strlen(body));
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *list_drafts(oc_dbwriter *w, uint64_t uid) {
+    oc_job *j = oc_job_new(OC_JOB_LIST_DRAFTS, 901);
+    j->user_id = uid;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_drafts(void) {
+    const char *path = "build/test_dbwriter_drafts.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t alice = reg(w, "alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    oc_dbres *r = set_draft(w, alice, OC_DEFAULT_CHANNEL, 0, "half a thought");
+    CHECK(r && r->type == OC_RES_DRAFT);
+    CHECK(r->draft.body && strcmp(r->draft.body, "half a thought") == 0);
+    CHECK(r->draft.updated_ms != 0);
+    oc_dbres_free(r);
+
+    r = list_drafts(w, alice);
+    CHECK(r && r->type == OC_RES_DRAFTS && r->n_drafts == 1);
+    CHECK(r->drafts[0].channel_id == OC_DEFAULT_CHANNEL && r->drafts[0].thread_root == 0);
+    CHECK(r->drafts[0].body && strcmp(r->drafts[0].body, "half a thought") == 0);
+    oc_dbres_free(r);
+
+    /* Writing again REPLACES rather than accumulating — the key is the
+     * conversation, not the keystroke. */
+    r = set_draft(w, alice, OC_DEFAULT_CHANNEL, 0, "a whole one"); oc_dbres_free(r);
+    r = list_drafts(w, alice);
+    CHECK(r && r->n_drafts == 1);
+    CHECK(r->drafts[0].body && strcmp(r->drafts[0].body, "a whole one") == 0);
+    oc_dbres_free(r);
+
+    /* Private: bob has none, and cannot see hers. */
+    r = list_drafts(w, bob); CHECK(r && r->n_drafts == 0); oc_dbres_free(r);
+
+    /* A thread draft is a DIFFERENT draft in the same channel (ARCH-101 keeps
+     * the column ahead of the client, so nothing writes this yet — but the key
+     * has to hold it the day something does). */
+    r = set_draft(w, alice, OC_DEFAULT_CHANNEL, 4242, "in the thread"); oc_dbres_free(r);
+    r = list_drafts(w, alice); CHECK(r && r->n_drafts == 2); oc_dbres_free(r);
+    r = set_draft(w, alice, OC_DEFAULT_CHANNEL, 4242, ""); oc_dbres_free(r);
+
+    /* An empty body is the delete. */
+    r = set_draft(w, alice, OC_DEFAULT_CHANNEL, 0, "");
+    CHECK(r && r->type == OC_RES_DRAFT && r->draft.body && r->draft.body[0] == 0);
+    oc_dbres_free(r);
+    r = list_drafts(w, alice); CHECK(r && r->n_drafts == 0); oc_dbres_free(r);
+
+    /* A non-member is refused: a draft is user content ABOUT a conversation,
+     * and storing one for a channel you cannot see would report its existence
+     * back to you on every other device. */
+    r = set_draft(w, alice, 999999, 0, "for a channel that is not mine");
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+
+    /* SENDING clears the draft, server-side, in the send's own transaction. */
+    r = set_draft(w, alice, OC_DEFAULT_CHANNEL, 0, "about to send this"); oc_dbres_free(r);
+    r = list_drafts(w, alice); CHECK(r && r->n_drafts == 1); oc_dbres_free(r);
+    {
+        uint8_t idem[OC_IDEM_LEN]; memset(idem, 0x77, sizeof idem);
+        CHECK(send_msg(w, alice, idem, "about to send this") != 0);
+    }
+    r = list_drafts(w, alice); CHECK(r && r->n_drafts == 0); oc_dbres_free(r);
+    /* And only the sender's: bob's draft for the same channel survives. */
+    r = set_draft(w, bob, OC_DEFAULT_CHANNEL, 0, "bob is still writing"); oc_dbres_free(r);
+    {
+        uint8_t idem[OC_IDEM_LEN]; memset(idem, 0x78, sizeof idem);
+        CHECK(send_msg(w, alice, idem, "alice sends again") != 0);
+    }
+    r = list_drafts(w, bob); CHECK(r && r->n_drafts == 1); oc_dbres_free(r);
+
+    /* Removing a user takes their drafts with them. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_REMOVE_USER, 902);
+        j->user_id = alice; j->target_user_id = bob;
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
+    r = list_drafts(w, bob); CHECK(r && r->n_drafts == 0); oc_dbres_free(r);
+
+    /* A body over the cap is TRUNCATED, not refused: the client cannot type one
+     * that long, so a frame this size is a bug or a probe, and losing the tail
+     * of it is better than losing the draft. */
+    {
+        static char big[OC_DRAFT_BODY_MAX + 100];
+        memset(big, 'y', sizeof big - 1); big[sizeof big - 1] = 0;
+        r = set_draft(w, alice, OC_DEFAULT_CHANNEL, 0, big);
+        CHECK(r && r->type == OC_RES_DRAFT);
+        oc_dbres_free(r);
+        r = list_drafts(w, alice);
+        CHECK(r && r->n_drafts == 1 && strlen(r->drafts[0].body) == OC_DRAFT_BODY_MAX);
+        oc_dbres_free(r);
+    }
 
     oc_dbwriter_stop(w);
     cleanup_db(path);
@@ -3882,6 +3996,7 @@ int run_dbwriter_tests(void) {
     test_mentions_stored();
     test_pins();
     test_channel_details();
+    test_drafts();
     test_channel_mutability();
     test_saved_and_activity();
     test_history_around();

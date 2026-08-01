@@ -598,6 +598,57 @@ static void test_notify_frames(void) {
     }
 }
 
+/* Drafts (REQ-223, ARCH-101). The empty body is the DELETE form and has to
+ * survive the round trip as an empty string rather than a missing field, and a
+ * body at the cap has to survive intact — a draft silently truncated on the
+ * wire is worse than one refused. */
+static void test_draft_frames(void) {
+    {
+        oc_set_draft in = { 7, 0, oc_slice_str("half a thought") };
+        ROUNDTRIP(oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_DRAFT, h, p);
+        oc_set_draft out;
+        CHECK(oc_decode_set_draft(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.thread_root == 0);
+        CHECK(out.body.len == 14 && memcmp(out.body.ptr, "half a thought", 14) == 0);
+    }
+    {   /* the delete form */
+        oc_set_draft in = { 7, 0, oc_slice_str("") };
+        ROUNDTRIP(oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_DRAFT, h, p);
+        oc_set_draft out;
+        CHECK(oc_decode_set_draft(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 7 && out.body.len == 0);
+    }
+    {   /* thread_root carried, though no client writes one yet (ARCH-101) */
+        oc_set_draft in = { 7, 4242, oc_slice_str("x") };
+        ROUNDTRIP(oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_DRAFT, h, p);
+        oc_set_draft out;
+        CHECK(oc_decode_set_draft(&p, &out) == OC_OK);
+        CHECK(out.thread_root == 4242);
+    }
+    {
+        ROUNDTRIP(oc_encode_list_drafts(&w, OC_PROTOCOL_VERSION), OC_MSG_LIST_DRAFTS, h, p);
+        (void)p;
+    }
+    {   /* a body at the cap, byte for byte */
+        static char big[OC_DRAFT_BODY_MAX];
+        memset(big, 'x', sizeof big);
+        oc_slice bs = { (const uint8_t *)big, sizeof big };
+        oc_draft in = { 9, 0, 1234567890123ULL, bs };
+        ROUNDTRIP(oc_encode_draft(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DRAFT, h, p);
+        oc_draft out;
+        CHECK(oc_decode_draft(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 9 && out.updated_ms == 1234567890123ULL);
+        CHECK(out.body.len == OC_DRAFT_BODY_MAX);
+        CHECK(memcmp(out.body.ptr, big, OC_DRAFT_BODY_MAX) == 0);
+    }
+    {
+        oc_drafts in = { 3 };
+        ROUNDTRIP(oc_encode_drafts(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DRAFTS, h, p);
+        oc_drafts out;
+        CHECK(oc_decode_drafts(&p, &out) == OC_OK && out.count == 3);
+    }
+}
+
 static void test_client_settings_frames(void) {
     {
         oc_set_client_setting in = { oc_slice_str("tui"), oc_slice_str("mouse"), oc_slice_str("1") };
@@ -1068,6 +1119,7 @@ int run_protocol_tests(void) {
     test_attachment_frames();
     test_webhook_frames();
     test_notify_frames();
+    test_draft_frames();
     test_client_settings_frames();
     test_read_cursor_frames();
     test_storage_status_frames();

@@ -899,6 +899,56 @@ oc_result oc_decode_notify_prefs(oc_rbuf *p, oc_notify_pref_entry *entries, uint
     return r_done(p);
 }
 
+/* --- Drafts (REQ-223, ARCH-101) ------------------------------------------ */
+
+oc_result oc_encode_set_draft(oc_wbuf *w, uint16_t version, const oc_set_draft *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_DRAFT);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->thread_root);
+    oc_w_str(w, m->body);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_list_drafts(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_DRAFTS);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_draft(oc_wbuf *w, uint16_t version, const oc_draft *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_DRAFT);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->thread_root);
+    oc_w_u64(w, m->updated_ms);
+    oc_w_str(w, m->body);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_drafts(oc_wbuf *w, uint16_t version, const oc_drafts *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_DRAFTS);
+    oc_w_u16(w, m->count);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_draft(oc_rbuf *p, oc_set_draft *m) {
+    m->channel_id  = oc_r_u64(p);
+    m->thread_root = oc_r_u64(p);
+    m->body        = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_draft(oc_rbuf *p, oc_draft *m) {
+    m->channel_id  = oc_r_u64(p);
+    m->thread_root = oc_r_u64(p);
+    m->updated_ms  = oc_r_u64(p);
+    m->body        = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_drafts(oc_rbuf *p, oc_drafts *m) {
+    m->count = oc_r_u16(p);
+    return r_done(p);
+}
+
 /* --- Synced client settings bucket -------------------------------------- */
 
 oc_result oc_encode_set_client_setting(oc_wbuf *w, uint16_t version, const oc_set_client_setting *m) {

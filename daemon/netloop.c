@@ -1352,6 +1352,31 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_DRAFT) {
+            oc_set_draft sd;
+            if (oc_decode_set_draft(&p, &sd) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_DRAFT, c->conn_id);
+            if (!j) return -1;
+            size_t bl = sd.body.len < OC_DRAFT_BODY_MAX ? sd.body.len : OC_DRAFT_BODY_MAX;
+            j->user_id    = c->user_id;
+            j->channel_id = sd.channel_id;
+            j->parent_id  = sd.thread_root;
+            if (bl) {
+                j->body = malloc(bl);
+                if (!j->body) return -1;
+                memcpy(j->body, sd.body.ptr, bl);
+            }
+            j->body_len = bl;          /* 0 is the DELETE form, not a decode failure */
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_DRAFTS) {
+            oc_job *j = oc_job_new(OC_JOB_LIST_DRAFTS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SET_CLIENT_SETTING) {
             oc_set_client_setting cs;
             if (oc_decode_set_client_setting(&p, &cs) != OC_OK) return -1;
@@ -2775,6 +2800,43 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         oc_error e = { r->err_code, 0, { NULL, 0 }, oc_slice_str("notify pref error") };
         oc_encode_error(&w, OC_PROTOCOL_VERSION, &e);
         send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_DRAFT: {
+        /* To the user's OTHER connections only (ARCH-101). The device that wrote
+         * it already has the text, and echoing it back is how a client ends up
+         * overwriting the composer somebody is still typing in. */
+        oc_draft d = { r->draft.channel_id, r->draft.thread_root, r->draft.updated_ms,
+                       oc_slice_str(r->draft.body ? r->draft.body : "") };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_draft(&w, OC_PROTOCOL_VERSION, &d);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id == r->user_id && c->conn_id != r->conn_id)
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_DRAFTS: {
+        /* The list, to the connection that asked: N drafts then the terminator,
+         * the same shape the saved-items listing uses. */
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        for (size_t i = 0; i < r->n_drafts && conns[c->fd]; i++) {
+            oc_draft d = { r->drafts[i].channel_id, r->drafts[i].thread_root,
+                           r->drafts[i].updated_ms,
+                           oc_slice_str(r->drafts[i].body ? r->drafts[i].body : "") };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            if (oc_encode_draft(&w, OC_PROTOCOL_VERSION, &d) == OC_OK)
+                send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        if (conns[c->fd]) {
+            oc_drafts term = { (uint16_t)r->n_drafts };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_drafts(&w, OC_PROTOCOL_VERSION, &term);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
         break;
     }
     case OC_RES_CLIENT_SETTINGS: {

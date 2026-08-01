@@ -572,6 +572,28 @@ static const char MIGRATION_0029[] =
     "  created_at_ms INTEGER NOT NULL"
     ");";
 
+/* 0030: drafts (REQ-223, ARCH-101). Its own table with its own ops, NOT the
+ * client_settings bucket: that bucket is keyed (user, client_type, key) and
+ * partitioned per frontend by design, so a draft written in the GUI would be
+ * invisible in the TUI — the opposite of "synced across that user's devices".
+ * Its own schema notes also call its contents low-contention *prefs*, and a
+ * draft is the one thing there that the user typed as a message.
+ *
+ * `thread_root` is in the key from the start, 0 meaning the channel itself. No
+ * client can write anything else yet — the thread pane shares the one composer
+ * — but the costs are asymmetric: one column now, against a migration on a
+ * table of user content plus a change to two wire ops that shipped clients
+ * already speak. Thread drafts then cost a client change and no server work. */
+static const char MIGRATION_0030[] =
+    "CREATE TABLE drafts ("
+    "  user_id     INTEGER NOT NULL REFERENCES users(id),"
+    "  channel_id  INTEGER NOT NULL REFERENCES channels(id),"
+    "  thread_root INTEGER NOT NULL DEFAULT 0,"
+    "  body        TEXT    NOT NULL,"
+    "  updated_ms  INTEGER NOT NULL,"
+    "  PRIMARY KEY (user_id, channel_id, thread_root)"
+    ");";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -602,6 +624,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 27, MIGRATION_0027 },
     { 28, MIGRATION_0028 },
     { 29, MIGRATION_0029 },
+    { 30, MIGRATION_0030 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

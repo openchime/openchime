@@ -653,6 +653,43 @@ I can see that are **not** archived".
 
 ---
 
+## 3z. Migration 0030 — drafts (REQ-223, ARCH-101)
+
+```sql
+CREATE TABLE drafts (
+  user_id     INTEGER NOT NULL REFERENCES users(id),
+  channel_id  INTEGER NOT NULL REFERENCES channels(id),
+  thread_root INTEGER NOT NULL DEFAULT 0,
+  body        TEXT    NOT NULL,
+  updated_ms  INTEGER NOT NULL,
+  PRIMARY KEY (user_id, channel_id, thread_root));
+```
+
+*Its own table, not the `client_settings` bucket.* That bucket was the cheap
+answer and is wrong twice: it is keyed `(user, client_type, key)` and
+**partitioned per frontend by design**, so a draft written in the GUI would be
+invisible in the TUI — the opposite of REQ-223's "synced across that user's
+devices" — and its own notes here describe its contents as low-contention
+*prefs*, while a draft is the one thing we would put there that the user typed as
+a **message**.
+
+*No index.* The PK's leading `user_id` serves the only query there is, "all my
+drafts"; a second index on a table this small would cost writes to serve nothing.
+
+*`thread_root` is in the key from the start*, 0 meaning the channel itself. No
+client can write another value yet — the thread pane shares the one composer —
+but the costs are asymmetric: one column now, against a migration on a table of
+**user content** plus a change to two wire ops that shipped clients already
+speak.
+
+*Deleted only when the thing it belongs to is gone*: on send (in the send's own
+transaction), and with the user on removal. **Not** on archive and not on
+leaving, both of which are reversible (REQ-035) — discarding typed content for an
+undoable act is a permanent consequence of a temporary one. A draft for a channel
+you are not in is simply not listed until you return.
+
+---
+
 ## 3u. Migration 0025 — saved items, and the activity watermark (REQ-231/139, ARCH-95)
 
 ```sql

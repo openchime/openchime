@@ -825,6 +825,32 @@ message body and its first attachment's name, like a pin — a saved message is
 usually far outside loaded history. Entries whose channel you have since left are
 omitted: leaving a channel must stop it leaking through your saved list.
 
+### Drafts (REQ-223, ARCH-101)
+
+**`SET_DRAFT` (client → server), msg_type `0x00C0`**
+`{ channel_id: u64, thread_root: u64, body: str }`. Upserts the draft for that
+conversation; **an empty body deletes it**, which is the same frame rather than a
+second op. Requires membership of the channel — a draft is user content *about* a
+conversation, and storing one for a channel you cannot see would report its
+existence back to you on every other device. Bodies over `OC_DRAFT_BODY_MAX`
+(16 KB) are **truncated, not refused**: no composer can type one that long, so a
+frame that size is a bug or a probe, and losing its tail beats losing the draft.
+
+**`DRAFT` (`0x00C2`)** `{ channel_id, thread_root, updated_ms, body }` is sent to
+the writer's **other** connections as a device sync — never back to the
+connection that wrote it, which already has the text and would otherwise be at
+risk of overwriting a composer still being typed in. A delete arrives as the same
+frame with an empty body.
+
+**`LIST_DRAFTS` (`0x00C1`)** (no body) streams **`DRAFT` (`0x00C2`)** newest
+first, then **`DRAFTS` (`0x00C3`)** `{ count: u16 }`, capped at 256. Entries for
+channels you have since left are omitted but **not deleted**: leaving is
+reversible, so the draft waits for you rather than being discarded.
+
+*One frame for two jobs.* `DRAFT` is both the streamed list entry and the sync
+push, exactly as `CLIENT_SETTINGS` doubles as snapshot and push — the client
+folds it the same way whatever prompted it, instead of two frames that can drift.
+
 **`LIST_ACTIVITY` (`0x0067`)** (no body) streams **`ACTIVITY_ENTRY` (`0x0068`)**
 newest first, then **`ACTIVITY` (`0x0069`)** `{ count: u32, seen_at: u64 }`.
 

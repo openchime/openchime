@@ -268,6 +268,9 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->cs_client_type);
     for (size_t i = 0; i < r->n_cslist; i++) { free(r->cslist[i].key); free(r->cslist[i].value); }
     free(r->cslist);
+    free(r->draft.body);
+    for (size_t i = 0; i < r->n_drafts; i++) free(r->drafts[i].body);
+    free(r->drafts);
     free(r->profile_name);
     free(r->rcur);
     free(r);
@@ -1120,6 +1123,17 @@ static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
     sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_prepare_v2(db, "DELETE FROM local_credentials WHERE user_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
+    /* Their drafts go with them (REQ-223, ARCH-101) — user content, and the
+     * account is gone. The second sweep catches OTHER people's drafts for the
+     * DM channels just deleted above: those channels no longer exist, so a row
+     * pointing at one is unreachable and would sit there forever. There is no
+     * channel-delete op in the product, so this is the only path by which a
+     * channel dies and the only place that sweep can live. */
+    sqlite3_prepare_v2(db, "DELETE FROM drafts WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db,
+        "DELETE FROM drafts WHERE channel_id NOT IN (SELECT id FROM channels);", -1, &st, NULL);
+    sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
     audit_actor(db, OC_AUDIT_ADMIN, "user.remove", j->user_id,
@@ -1417,6 +1431,19 @@ static char *lookup_display_name(sqlite3 *db, uint64_t user_id) {
     return name;
 }
 
+/* Forget one draft. Used by the send paths and the user cascade; a no-op when
+ * there is nothing stored, which is the common case. */
+static void drop_draft(sqlite3 *db, uint64_t user_id, uint64_t channel_id, uint64_t thread_root) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "DELETE FROM drafts WHERE user_id=? AND channel_id=? AND thread_root=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)channel_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)thread_root);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
 static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -1508,6 +1535,12 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
         link_attachments(db, mid, j->channel_id, j->user_id, j->attach_ids, j->n_attach);
         load_message_attachments(db, mid, r->attach, &r->n_attach);
     }
+
+    /* The draft this message came from is gone (REQ-223, ARCH-101), in the same
+     * transaction as the send. Server-side rather than a client courtesy: a
+     * client that dies between the send and its own cleanup would otherwise
+     * leave the sent text sitting in the composer of every other device. */
+    drop_draft(db, j->user_id, j->channel_id, 0);
 
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
@@ -3038,6 +3071,12 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
         load_message_attachments(db, mid, r->attach, &r->n_attach);
     }
 
+    /* This THREAD's draft, keyed by its root — not the channel's. No client
+     * writes one yet (ARCH-101 keeps the column ahead of the client), so today
+     * this deletes nothing; it is here so the day one does, the clear already
+     * works and is not a second thing to remember. */
+    drop_draft(db, j->user_id, j->channel_id, j->parent_id);
+
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 
     uint32_t count = 0;
@@ -4476,6 +4515,99 @@ static oc_dbres *process_rotate_webhook(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* --- Drafts (REQ-223, ARCH-101) ------------------------------------------ */
+
+/* Upsert a draft, or delete it when the body is empty. Returns the row as
+ * OC_RES_DRAFT so the net thread can fan it to the user's other devices; a
+ * delete is carried as the same frame with an empty body, which is exactly what
+ * the client folds as "this draft is gone". */
+static oc_dbres *process_set_draft(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->user_id = j->user_id;
+    /* Membership first, as every channel-scoped handler does. A draft is user
+     * content about a conversation, and storing one for a channel you cannot
+     * see would leak its existence back to you on any other device. */
+    if (!j->channel_id || !is_member(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+    size_t blen = j->body_len > OC_DRAFT_BODY_MAX ? OC_DRAFT_BODY_MAX : j->body_len;
+    /* One reading, used for the stored row and the echoed one: two calls can
+     * straddle a millisecond, and a device that compares them would think the
+     * copy it just received was newer than the one it wrote. */
+    uint64_t now = dbw_now_ms();
+    sqlite3_stmt *st = NULL;
+    if (blen == 0) {
+        sqlite3_prepare_v2(db,
+            "DELETE FROM drafts WHERE user_id=? AND channel_id=? AND thread_root=?;",
+            -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->parent_id);
+        sqlite3_step(st); sqlite3_finalize(st);
+    } else {
+        sqlite3_prepare_v2(db,
+            "INSERT INTO drafts (user_id, channel_id, thread_root, body, updated_ms) "
+            "VALUES (?,?,?,?,?) "
+            "ON CONFLICT(user_id, channel_id, thread_root) DO UPDATE SET "
+            "  body=excluded.body, updated_ms=excluded.updated_ms;", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)j->parent_id);
+        sqlite3_bind_text (st, 4, (const char *)j->body, (int)blen, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 5, (sqlite3_int64)now);
+        sqlite3_step(st); sqlite3_finalize(st);
+    }
+    r->type = OC_RES_DRAFT;
+    r->draft.channel_id  = j->channel_id;
+    r->draft.thread_root = j->parent_id;
+    r->draft.updated_ms  = now;
+    r->draft.body = blen ? strndup((const char *)j->body, blen) : strdup("");
+    return r;
+}
+
+/* Every draft this user holds, newest first. Bounded by OC_MAX_DRAFTS: the cap
+ * exists so one account cannot make a reply the net thread has to stream
+ * without end, not because more would be meaningless. */
+static oc_dbres *process_list_drafts(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->user_id = j->user_id;
+    r->type = OC_RES_DRAFTS;
+    size_t cap = 16;
+    r->drafts = malloc(cap * sizeof *r->drafts);
+    if (!r->drafts) return r;
+    sqlite3_stmt *st = NULL;
+    /* Joined to channel_members so a draft for a conversation the user has
+     * since left stays stored (ARCH-101: leaving is reversible) but is not
+     * listed — "a draft for a channel you are not in is simply invisible until
+     * you return". */
+    sqlite3_prepare_v2(db,
+        "SELECT d.channel_id, d.thread_root, d.body, d.updated_ms FROM drafts d "
+        "JOIN channel_members m ON m.channel_id = d.channel_id AND m.user_id = d.user_id "
+        "WHERE d.user_id=? ORDER BY d.updated_ms DESC LIMIT ?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int  (st, 2, (int)OC_MAX_DRAFTS);
+    while (sqlite3_step(st) == SQLITE_ROW && r->n_drafts < OC_MAX_DRAFTS) {
+        if (r->n_drafts == cap) {
+            cap *= 2;
+            oc_draft_row *g = realloc(r->drafts, cap * sizeof *g);
+            if (!g) break;
+            r->drafts = g;
+        }
+        const unsigned char *b = sqlite3_column_text(st, 2);
+        r->drafts[r->n_drafts].channel_id  = (uint64_t)sqlite3_column_int64(st, 0);
+        r->drafts[r->n_drafts].thread_root = (uint64_t)sqlite3_column_int64(st, 1);
+        r->drafts[r->n_drafts].body        = strdup(b ? (const char *)b : "");
+        r->drafts[r->n_drafts].updated_ms  = (uint64_t)sqlite3_column_int64(st, 3);
+        r->n_drafts++;
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
 static oc_dbres *process_list_notify_prefs(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -4721,6 +4853,8 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_ADD_EMOJI)      return process_add_emoji(w->db, j);
     if (j->type == OC_JOB_DELETE_EMOJI)   return process_delete_emoji(w->db, j);
     if (j->type == OC_JOB_INVITE_USER)    return process_invite_user(w->db, j);
+    if (j->type == OC_JOB_SET_DRAFT)      return process_set_draft(w->db, j);
+    if (j->type == OC_JOB_LIST_DRAFTS)    return process_list_drafts(w->db, j);
     if (j->type == OC_JOB_REMOVE_USER)    return process_remove_user(w->db, j);
     if (j->type == OC_JOB_REDEEM)         return process_redeem(w, j);
     if (j->type == OC_JOB_REACT)          return process_react(w->db, j);
