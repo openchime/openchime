@@ -828,15 +828,21 @@ to change a DirectWrite size, so any preference that moves the scale must call
   (**REQ-220**) and its toolbar both built on 2026-07-31, as a shared parser in
   `client/core/` plus DirectWrite ranges and a composer toolbar — all in
   [WIN32_BACKLOG.md](./WIN32_BACKLOG.md).
-- **Next — TUI catch-up (P0).** The two frontends have swapped places: the TUI was
+- **The frontend order is fixed: all of Win32, then the TUI, then GTK, then
+  macOS.** Win32 is the reference client and it is finished *first* — including
+  the items now waiting on a daemon requirement, which are Win32 work waiting on
+  their other half, not work deferred behind another frontend. The TUI being
+  behind is an accepted consequence of that order, not a reason to reorder it.
+- **Then — TUI catch-up.** The two frontends have swapped places: the TUI was
   the reference client and is now behind the GUI by **more than twenty** features,
   every one of which already exists in the app-core — @mentions (REQ-221), pins
   (REQ-230), saved items (REQ-231), the channel files listing (REQ-143), the
   per-channel roster (REQ-031), channel management (REQ-034/035/036/038), mute and
   star (REQ-137/234), mark-unread (REQ-235), the activity feed (REQ-139), in-app
   preferences and themes (REQ-261/262), profile depth and custom status
-  (REQ-240/241/122), group DMs (REQ-056), custom emoji (REQ-072), and more. The
-  proposed order is [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5.
+  (REQ-240/241/122), group DMs (REQ-056), custom emoji (REQ-072), rich text
+  (REQ-220), and more. The order within it is
+  [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5.
 - **Next — auth completeness.** The **OIDC browser flow + PKCE + loopback
   courier** — the one remaining piece of REQ-020 and what makes SSO usable at all
   (there is no SAML by design, **REQ-027**); plus first-run onboarding

@@ -464,8 +464,15 @@ grouped by area, and §5 above proposes an order.*
 
 ---
 
-## 5. Build order — Win32 is done; the TUI is now the gap
+## 5. Build order — Win32 to completion, then the TUI
 
+> **The frontend order is fixed: all of Win32, then the TUI, then GTK, then
+> macOS** (2026-07-31). Win32 finishing first includes the items waiting on a
+> daemon requirement — those are Win32 work waiting on their other half. That
+> the TUI is more than twenty features behind is an accepted consequence of the
+> order and not an argument against it; this section orders the TUI's own work
+> for when its turn comes.
+>
 > **The open execution list lives in [WIN32_BACKLOG.md](./WIN32_BACKLOG.md)**,
 > which is the open items only. This section stays the *rationale* for ordering.
 

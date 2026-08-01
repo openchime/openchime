@@ -392,11 +392,13 @@ restart; history comes from the server's own read cursor and the outbox lives in
 RAM (REQ-100/101/102 met client-side, at the cost of no offline history and a
 queued message dying with the process).
 
-The remaining client work is scope, not hardening: the **Win32 open list**
-(two avatar-consistency defects, a flaky smoke harness, one unreproduced crash —
-[WIN32_BACKLOG.md](./WIN32_BACKLOG.md)), the **TUI catch-up** below, the later
-native GUIs (GTK/AppKit) + web/mobile, the **OIDC browser flow**, the **audio
-client** (Opus/UDP), and **screenshare** (REQ-161).
+The remaining client work is scope, not hardening, and the frontend order is
+fixed: **all of Win32, then the TUI, then GTK, then macOS.** So the **Win32 open
+list** ([WIN32_BACKLOG.md](./WIN32_BACKLOG.md) — now four items, each waiting on
+a daemon requirement), then the **TUI catch-up** below, then the later native
+GUIs (GTK/AppKit) + web/mobile. Alongside those, independent of frontend order:
+the **OIDC browser flow**, the **audio client** (Opus/UDP), and **screenshare**
+(REQ-161).
 
 The forward feature scope is the Sections 11–14 table and the **Non-video
 competitor-parity backlog** table below (REQ-026…275), reconciled
