@@ -8284,12 +8284,31 @@ static int ed_caret_rect(D2D1_RECT_F box, D2D1_RECT_F *out) {
     IDWriteTextLayout *tl = ed_layout(box.right - box.left);
     if (!tl) return 0;
     DWRITE_HIT_TEST_METRICS hm;
-    float cx = 0, cy = 0;
-    UINT32 pos = (UINT32)(g_ed_caret + g_ed_comp_len);
+    DWRITE_LINE_METRICS lm[64];
+    float cx = 0, cy = 0, top, h;
+    UINT32 pos = (UINT32)(g_ed_caret + g_ed_comp_len), n = 0, i, seen = 0;
     if (FAILED(IDWriteTextLayout_HitTestTextPosition(tl, pos, FALSE, &cx, &cy, &hm)))
         return 0;
-    *out = rf(box.left + cx, box.top + cy - g_ed_scroll,
-              box.left + cx + 1.6f, box.top + cy + hm.height - g_ed_scroll);
+    top = cy; h = hm.height;
+    /* Only the X comes from the cluster. Its HEIGHT is a property of the LINE,
+     * and asking the cluster instead is a bug the moment a run on that line is
+     * not full size — which is exactly what a hidden delimiter is (0.1 DIP, see
+     * apply_richtext). The caret then came back 0.1 DIP tall, sitting on the
+     * baseline rather than spanning the line: "the cursor is in the wrong
+     * alignment as soon as formatting appears", reported from a screenshot.
+     * Every visible caret in the field is drawn from this rect, so one wrong
+     * answer here moved the drawn caret, the system caret a screen reader
+     * tracks, and the IME candidate window all at once. */
+    if (SUCCEEDED(IDWriteTextLayout_GetLineMetrics(tl, lm, 64, &n)) && n) {
+        float y = 0;
+        for (i = 0; i < n; i++) {
+            if (seen + lm[i].length > pos || i == n - 1) { top = y; h = lm[i].height; break; }
+            seen += lm[i].length;
+            y += lm[i].height;
+        }
+    }
+    *out = rf(box.left + cx, box.top + top - g_ed_scroll,
+              box.left + cx + 1.6f, box.top + top + h - g_ed_scroll);
     return 1;
 }
 
@@ -12682,6 +12701,15 @@ static void test_dump(const char *path) {
         WCHAR edw[512];
         int n = ed_get(edw, 512);
         if (n > 0) WideCharToMultiByte(CP_UTF8, 0, edw, -1, ed8, sizeof ed8, NULL, NULL);
+        {   /* The caret's own rect, so "is the caret on the text line" is a
+             * question the harness can ask. It could not, which is how a caret
+             * drawn below the line by a zero-height formatting run got out. */
+            D2D1_RECT_F cr;
+            if (ed_caret_rect(g_ed_box, &cr))
+                fprintf(f, "edcaret %.1f,%.1f,%.1f,%.1f h=%.1f\n",
+                        cr.left, cr.top, cr.right, cr.bottom, cr.bottom - cr.top);
+            else fprintf(f, "edcaret none\n");
+        }
         fprintf(f, "ed len=%d caret=%d sel=%d focus=%d box=%.0f,%.0f,%.0f,%.0f comp=%d text=\"%s\"\n",
                 ed_len(), ed_caret_pos(), ed_has_sel(), ed_focused(),
                 g_ed_box.left, g_ed_box.top, g_ed_box.right, g_ed_box.bottom,

@@ -1011,6 +1011,21 @@ for _ in 1 2; do "$DRIVE" key left >/dev/null 2>&1; done
 expect_grep '^ed .*text="a  b"' "deleting the last character removes the emphasis whole"
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
 
+# The caret spans the LINE, whatever runs are on it. It used to take its height
+# from the cluster it sat against, so the moment a hidden delimiter was next to
+# it the caret became 0.1 DIP tall and sat on the baseline — reported as "the
+# cursor is in the wrong alignment when formatting appears" (WIN-102). Asserted
+# as an equality rather than a number, so it holds at any DPI or text size.
+caret_h() { snap | awk '/^edcaret /{ for (i=1;i<=NF;i++) if ($i ~ /^h=/) { sub(/^h=/,"",$i); print $i } }'; }
+fmt_reset 'plain text' 10
+plain_h=$(caret_h)
+fmt_reset 'plain _text_' 12
+checks=$((checks + 1))
+[ -n "$plain_h" ] && [ "$(caret_h)" = "$plain_h" ] \
+  && ok "the caret spans the line, with formatting or without (h=$plain_h)" \
+  || fail "caret height changed with formatting — plain $plain_h, formatted $(caret_h)"
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+
 # --- selecting text with the mouse (WIN-100) --------------------------------
 # The self-drawn field (WIN-80) replaced a native EDIT, and word selection left
 # with the control: the window class never asked for CS_DBLCLKS, so Windows was
