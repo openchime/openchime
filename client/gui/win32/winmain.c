@@ -405,6 +405,7 @@ static int  ed_has_sel(void);
 static int  ed_lines(float w);
 static void ed_draw(ID2D1RenderTarget *rt, D2D1_RECT_F box);
 static void ed_invalidate_layout(void);   /* fwd — prefs re-draw the field */
+static float ed_line_h(void);             /* fwd — the field's REAL line height */
 static void ed_mode_changed(void);        /* fwd — the editor preference flips */
 static DWORD    g_last_typing;
 
@@ -5982,9 +5983,10 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     {
         float tx = bx0 + 6 + sq * 3 + 8, tr = bx1 - 6 - sq - 8;
         float inner = composer_inner_h();
-        float texth = inner > COMPOSER_BTN ? inner : COMPOSER_LINE;
+        float lh = ed_line_h();
+        float texth = inner > COMPOSER_BTN ? inner : lh;
         float ty = by0 + composer_tb() + COMPOSER_PAD +
-                   (inner > COMPOSER_BTN ? 0.0f : (COMPOSER_BTN - COMPOSER_LINE) / 2);
+                   (inner > COMPOSER_BTN ? 0.0f : (COMPOSER_BTN - lh) / 2);
         ed_draw(rt, rf(tx, ty, tr, ty + texth));
     }
 
@@ -7725,6 +7727,29 @@ static int   g_ed_len;
 static int   g_ed_caret, g_ed_anchor;      /* selection is [min, max) */
 static int   g_ed_dragging;
 static float g_ed_scroll;                  /* DIPs, vertical */
+
+/* How tall one line of the field actually is (WIN-105).
+ *
+ * COMPOSER_LINE is 20 and was used as the answer everywhere. It is not the
+ * answer: fonts_build gives g_body UNIFORM line spacing of 22 DIP times the
+ * text scale, so the real line is 22 at rest and more when the user zooms — and
+ * the constant stayed 20. A one-line composer therefore drew a 22 DIP line into
+ * a 20 DIP box, which clipped the bottom of every line and, worse, made the
+ * caret-visibility scroll below UNSATISFIABLE: no offset can put both edges of
+ * a caret taller than its view inside that view, so the two branches took turns
+ * and the whole line plus the caret oscillated by the difference, forever, at
+ * the caret-blink repaint rate. Reported as "text jumping up and down" and
+ * measured at 3.8 DIP with one zoom step applied.
+ *
+ * Asked of the FORMAT rather than a layout: the format is where the value is
+ * set, and a layout's height depends on the box whose height we are computing. */
+static float ed_line_h(void) {
+    DWRITE_LINE_SPACING_METHOD m; FLOAT h = 0, b = 0;
+    if (g_body && SUCCEEDED(IDWriteTextFormat_GetLineSpacing(g_body, &m, &h, &b)) &&
+        m == DWRITE_LINE_SPACING_METHOD_UNIFORM && h > 0.0f)
+        return (float)h;
+    return COMPOSER_LINE;
+}
 static D2D1_RECT_F g_ed_box;               /* where the text is drawn (DIPs) */
 static IDWriteTextLayout *g_ed_layout;     /* cached; NULL = rebuild */
 static float g_ed_layout_w;
@@ -8818,12 +8843,21 @@ static void ed_draw(ID2D1RenderTarget *rt, D2D1_RECT_F box) {
     }
     ID2D1RenderTarget_PopAxisAlignedClip(rt);
 
-    /* Keep the caret in view when the text is taller than the box. */
+    /* Keep the caret in view when the text is taller than the box.
+     *
+     * Only when the caret FITS. `cr` already carries `-g_ed_scroll`, so this is
+     * a feedback loop, and a caret taller than its view has no offset that puts
+     * both of its edges inside: the two branches then alternate forever and the
+     * line visibly oscillates (WIN-105). The geometry above makes that
+     * impossible now — the box is a real line tall — and this is the guard that
+     * keeps it impossible if some future size makes them disagree again. */
     D2D1_RECT_F cr;
     if (ed_caret_rect(box, &cr)) {
-        if (cr.bottom > box.bottom) g_ed_scroll += cr.bottom - box.bottom;
-        else if (cr.top < box.top)  g_ed_scroll -= box.top - cr.top;
-        if (g_ed_scroll < 0) g_ed_scroll = 0;
+        if ((cr.bottom - cr.top) <= (box.bottom - box.top) + 0.5f) {
+            if (cr.bottom > box.bottom) g_ed_scroll += cr.bottom - box.bottom;
+            else if (cr.top < box.top)  g_ed_scroll -= box.top - cr.top;
+            if (g_ed_scroll < 0) g_ed_scroll = 0;
+        }
         /* The SYSTEM caret (REQ-269 / ARCH-99). Screen readers and magnifiers
          * follow the caret Windows knows about, not the one we paint — and this
          * field paints its own, so assistive technology could not follow typing
@@ -8832,7 +8866,10 @@ static void ed_draw(ID2D1RenderTarget *rt, D2D1_RECT_F box) {
          *
          * It is deliberately never shown: `ShowCaret` is not called, so Windows
          * tracks a 1px caret that is not drawn and the app's own caret stays the
-         * visible one (blink phase, colour and thickness all stay ours). */
+         * visible one (blink phase, colour and thickness all stay ours).
+         *
+         * OUTSIDE the guard above: the scroll may decline to move, but a screen
+         * reader must still be told where the caret is. */
         ed_caret_sync(cr);
     }
 }
@@ -9084,7 +9121,7 @@ static int composer_remeasure(void) {
         int lines = ed_lines(w);
         if (lines < 1) lines = 1;
         if (lines > COMPOSER_MAX_LINES) lines = COMPOSER_MAX_LINES;
-        float th = (float)lines * COMPOSER_LINE;
+        float th = (float)lines * ed_line_h();
         want = composer_chrome() + (th > COMPOSER_BTN ? th : COMPOSER_BTN);
     }
     if (want == g_composer_h) return 0;
@@ -9162,14 +9199,14 @@ static void layout_composer(HWND hwnd) {
     float sq = COMPOSER_BTN;
     float tx = bx0 + 6 + sq * 3 + 8, tr = bx1 - 6 - sq - 8;
     float inner = composer_inner_h();
-    float texth = inner > COMPOSER_BTN ? inner : COMPOSER_LINE;
+    float texth = inner > COMPOSER_BTN ? inner : ed_line_h();
     /* The toolbar row owns the top of the box (WIN-96); the field starts under
      * it. Both this and draw_composer offset by the same constant, which is the
      * pairing that has to stay true — the rect ed_hit tests against is the one
      * ed_draw paints into, and a toolbar added to only one of them would put the
      * caret a row away from the text. */
     float ty = by0 + composer_tb() + COMPOSER_PAD +
-               (inner > COMPOSER_BTN ? 0.0f : (COMPOSER_BTN - COMPOSER_LINE) / 2);
+               (inner > COMPOSER_BTN ? 0.0f : (COMPOSER_BTN - ed_line_h()) / 2);
     /* Never hand back an inverted rect. members_w() should have prevented it, but
      * `right < left` is the one shape every consumer of this box gets wrong
      * silently: ed_hit matches nothing, ed_draw clips to nothing, and the dump's

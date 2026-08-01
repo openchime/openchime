@@ -1068,6 +1068,32 @@ checks=$((checks + 1))
   || fail "caret height changed with formatting — plain $plain_h, formatted $(caret_h)"
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
 
+# The field's box must be at least as tall as a line, and the caret must not
+# move when nothing has changed. Both are the same defect (WIN-105): the box was
+# a hardcoded 20 DIP while a line is 22 x the text scale, so every line was
+# clipped AND the caret-visibility scroll had no satisfiable answer — its two
+# branches alternated on every repaint and the line oscillated by the
+# difference. Reported as "text jumping up and down"; measured at 3.8 DIP with
+# one zoom step applied, which is why the zoomed case is the one asserted.
+fmt_reset 'i like you' 10
+"$DRIVE" key ctrl+= >/dev/null 2>&1          # the case that made it worst
+caret_top() { snap | awk '/^edcaret /{ split($2, a, ","); print a[2] }'; }
+box_h() { snap | awk '/^ed /{ for (i=1;i<=NF;i++) if ($i ~ /^box=/) { sub(/^box=/,"",$i);
+  split($i, b, ","); print b[4] - b[2] } }'; }
+checks=$((checks + 1))
+bh=$(box_h); ch=$(caret_h)
+awk -v b="$bh" -v c="$ch" 'BEGIN{ exit !(b + 0.5 >= c) }' \
+  && ok "the field's box is at least a line tall (box $bh >= caret $ch)" \
+  || fail "composer box $bh is shorter than a line $ch — clipping, and the scroll cannot settle"
+before=$(caret_top)
+"$DRIVE" shot _osc1 >/dev/null 2>&1; "$DRIVE" shot _osc2 >/dev/null 2>&1
+checks=$((checks + 1))
+[ "$(caret_top)" = "$before" ] \
+  && ok "and the caret does not drift when nothing changes ($before)" \
+  || fail "caret moved across repaints: $before -> $(caret_top) (WIN-105 oscillation)"
+"$DRIVE" key ctrl+0 >/dev/null 2>&1
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+
 # --- selecting text with the mouse (WIN-100) --------------------------------
 # The self-drawn field (WIN-80) replaced a native EDIT, and word selection left
 # with the control: the window class never asked for CS_DBLCLKS, so Windows was
