@@ -432,6 +432,23 @@ void oc_client_set_setting(oc_client *c, const char *key, const char *value) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_set_draft(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                         const char *body) {
+    if (!c || !channel_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_DRAFT);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = thread_root;
+    cmd->body = strdup(body ? body : "");   /* empty deletes */
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_drafts(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_DRAFTS);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_list_settings(oc_client *c) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_SETTINGS);

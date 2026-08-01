@@ -167,7 +167,7 @@ static float composer_inner_h(void) { return g_composer_h - composer_chrome(); }
  * real today; ACTIVITY/FILES/LATER/NOTIFICATIONS are stubs until their features
  * land. Rail item `act` values <0 are special (switcher / new / profile / more). */
 enum { VIEW_HOME = 0, VIEW_DMS, VIEW_ACTIVITY, VIEW_FILES, VIEW_LATER,
-       VIEW_ADMIN, VIEW_COUNT,
+       VIEW_DRAFTS, VIEW_ADMIN, VIEW_COUNT,
        /* Not a rail destination: the sign-in screen, which owns the whole window
         * (no rail, no sidebar, no composer) until there is a session. */
        VIEW_SIGNIN = 100 };
@@ -506,13 +506,21 @@ static float g_thr_scroll, g_thr_scroll_max;
 /* WIN-14: the read marker as it stood when this channel was opened. It has to be
  * snapshotted, because entering a channel acks it — read live, the divider would
  * vanish in the same frame it appeared. Cleared when you leave or send. */
-/* WIN-27: per-channel drafts, in memory for the life of the process. ARCH-88
- * leaves two options — memory-only, or server-synced through the settings
- * bucket — and this is the cheap half: a half-typed message survives a channel
- * switch, not a restart. Cross-restart drafts need the synced route. */
-enum { DRAFT_MAX = 24 };
-static struct { uint64_t cid; WCHAR text[1024]; } g_drafts[DRAFT_MAX];
-static int g_n_drafts;
+/* Drafts (WIN-91, REQ-223, ARCH-101). WIN-27's 24 in-memory slots are gone: a
+ * draft now lives on the DAEMON, keyed (user, channel, thread root), so it
+ * survives a restart and follows you to your other devices. The model holds
+ * them; this file keeps only what is needed to avoid pointless writes.
+ *
+ * `g_draft_sent` is the text last written to the server for `g_draft_sent_cid`.
+ * ARCH-101's first survival rule is "only write a draft you actually changed" —
+ * without it, a device that merely VISITS a conversation would write back the
+ * copy it happens to hold and clobber a newer one from somewhere else. */
+enum { DRAFT_TEXT_MAX = 4001 };       /* ED_MAX + 1, asserted where ED_MAX is defined */
+static uint64_t g_draft_sent_cid;
+static WCHAR    g_draft_sent[DRAFT_TEXT_MAX];
+static int       g_draft_dirty;       /* the composer has changed since the last write */
+static ULONGLONG g_draft_touch_ms;    /* when it last changed, for the debounce */
+#define DRAFT_DEBOUNCE_MS 2000
 
 /* ---- OS notifications (WIN-18, REQ-138) ------------------------------------
  * Shell_NotifyIconW with NIF_INFO rather than WinRT toasts: the client is pure C
@@ -1772,38 +1780,63 @@ static int any_overlay(const oc_model *m) {
 
 static void ac_close(void);   /* fwd */
 
-/* Stash whatever is in the composer under `cid`; an empty composer clears it. */
-static void draft_save(uint64_t cid) {
-    if (!cid || g_edit_msg) return;               /* an edit-in-progress is not a draft */
-    WCHAR w[1024];
-    int n = ed_get(w, 1024);
-    int slot = -1;
-    for (int i = 0; i < g_n_drafts; i++) if (g_drafts[i].cid == cid) { slot = i; break; }
-    if (n <= 0) {                                  /* drop it, keeping the array dense */
-        if (slot >= 0) g_drafts[slot] = g_drafts[--g_n_drafts];
-        return;
+/* Write the composer's contents to the daemon as `cid`'s draft — but only if
+ * they differ from what we last wrote (ARCH-101). An empty composer deletes it,
+ * which is the same op with an empty body.
+ *
+ * The model is updated locally as well as sent: the daemon deliberately does not
+ * echo a draft to the connection that wrote it, so the sidebar marker and the
+ * Drafts view would otherwise not see our own until the next connect. */
+static void draft_flush(uint64_t cid) {
+    if (!cid || !g_client || g_edit_msg) return;   /* an edit-in-progress is not a draft */
+    WCHAR w[DRAFT_TEXT_MAX];
+    int n = ed_get(w, DRAFT_TEXT_MAX);
+    if (n < 0) n = 0;
+    if (cid == g_draft_sent_cid && lstrcmpW(w, g_draft_sent) == 0) return;   /* unchanged */
+    int blen = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    char *b = (char *)malloc((size_t)(blen > 0 ? blen : 1));
+    if (!b) return;
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, b, blen, NULL, NULL);
+    oc_client_set_draft(g_client, cid, 0, b);
+    {   /* keep our own copy in step; see the note above */
+        const oc_model *m = model();
+        if (m) oc_model_draft_local((oc_model *)m, cid, 0, b);
     }
-    if (slot < 0) {
-        if (g_n_drafts == DRAFT_MAX) g_drafts[0] = g_drafts[--g_n_drafts];   /* oldest out */
-        slot = g_n_drafts++;
-        g_drafts[slot].cid = cid;
-    }
-    lstrcpynW(g_drafts[slot].text, w, 1024);
+    free(b);
+    g_draft_sent_cid = cid;
+    lstrcpynW(g_draft_sent, w, DRAFT_TEXT_MAX);
+    g_draft_dirty = 0;
+    /* The sidebar marker and the Drafts rail entry are drawn FROM the model this
+     * just changed, and nothing else here would repaint: the write is on a
+     * debounce, seconds after the keystroke that caused the last paint. Without
+     * this the pencil appears whenever something unrelated redraws — which the
+     * caret blink usually does within half a second, so it looked fine and was
+     * simply late. */
+    { HWND hw = GetActiveWindow(); if (hw) InvalidateRect(hw, NULL, FALSE); }
 }
 
+/* Put `cid`'s stored draft in the composer, or clear it. */
 static void draft_restore(uint64_t cid) {
-    for (int i = 0; i < g_n_drafts; i++)
-        if (g_drafts[i].cid == cid) {
-            ed_set(g_drafts[i].text);                    /* caret lands at the end */
-            return;
-        }
-    ed_clear();
+    const oc_model *m = model();
+    const char *d = m ? oc_model_draft(m, cid, 0) : NULL;
+    if (d && d[0]) {
+        WCHAR w[DRAFT_TEXT_MAX];
+        to_w(d, w, DRAFT_TEXT_MAX);
+        ed_set(w);                                   /* caret lands at the end */
+        g_draft_sent_cid = cid;
+        lstrcpynW(g_draft_sent, w, DRAFT_TEXT_MAX);
+    } else {
+        ed_clear();
+        g_draft_sent_cid = cid;
+        g_draft_sent[0] = 0;
+    }
+    g_draft_dirty = 0;
 }
 
 static void select_channel(uint64_t cid) {
     if (!g_client || !cid) return;
     crumb("select_channel %llu", (unsigned long long)cid);
-    if (g_sel && g_sel != cid) draft_save(g_sel);
+    if (g_sel && g_sel != cid) draft_flush(g_sel);   /* leaving writes it, if changed */
     close_overlays();
     g_has_sel = 0;                       /* drop any transcript text selection */
 
@@ -1940,10 +1973,15 @@ static const struct { int act; int icon; const char *label; int admin; } RAIL_IT
     { VIEW_ACTIVITY, OC_ICON_BELL,     "Activity", 0 },
     { VIEW_FILES,    OC_ICON_FILE,     "Files",    0 },
     { VIEW_LATER,    OC_ICON_BOOKMARK, "Later",    0 },
+    /* Drafts is CONDITIONAL — see rail_item_shown(). Slack's "Drafts & sent"
+     * appears only when you have one, and a permanent door to an empty room is
+     * worse than no door. */
+    { VIEW_DRAFTS,   OC_ICON_SQUARE_PEN, "Drafts", 0 },
     { VIEW_ADMIN,    OC_ICON_SETTINGS, "Admin",    1 },
 };
 #define RAIL_N_ITEMS ((int)(sizeof RAIL_ITEMS / sizeof RAIL_ITEMS[0]))
 
+static int g_rail_drafts;      /* last paint offered the Drafts destination */
 static int ws_unread_elsewhere(void);   /* fwd */
 
 static void avatar_want(uint64_t aid) {
@@ -2051,8 +2089,21 @@ static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     /* Gate admin-only items, then overflow the tail into "More" when there isn't
      * enough vertical space (fold Admin first, up toward Home; Home never folds). */
     int vis[RAIL_N_ITEMS], nv = 0;
-    for (int i = 0; i < RAIL_N_ITEMS; i++)
-        if (!RAIL_ITEMS[i].admin || (m && self_role(m) >= OC_ROLE_ADMIN)) vis[nv++] = i;
+    g_rail_drafts = 0;
+    for (int i = 0; i < RAIL_N_ITEMS; i++) {
+        if (RAIL_ITEMS[i].admin && !(m && self_role(m) >= OC_ROLE_ADMIN)) continue;
+        /* Drafts exists only while you have one (WIN-91), as Slack's does — and
+         * it also has to survive being the CURRENT view when the last draft is
+         * sent, or the rail would drop a destination you are standing in. */
+        if (RAIL_ITEMS[i].act == VIEW_DRAFTS) {
+            if (!(m && m->n_drafts) && g_view != VIEW_DRAFTS) continue;
+            /* Recorded for the harness: whether the destination EXISTS is this
+             * filter's answer, and where it ended up — rail or "More" overflow —
+             * is the window's height, which a test should not be asserting. */
+            g_rail_drafts = 1;
+        }
+        vis[nv++] = i;
+    }
 
     float y = 64;                                   /* below the workspace + divider */
     float by = h - 2 * RAIL_IH - 6;                 /* bottom cluster top */
@@ -2462,6 +2513,14 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                 IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
                 draw_text(rt, badge, g_meta, br, 0xFFFFFF);
                 IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+            } else if (r->channel_id && oc_model_has_draft(m, r->channel_id)) {
+                /* A conversation holding a draft is marked, as Slack marks it —
+                 * and NOT counted as unread (ARCH-101): unread means somebody
+                 * else said something, and your own half-written line is not
+                 * news. Only where no badge is, so a count is never displaced by
+                 * a pencil. */
+                draw_text(rt, "\u270E", g_meta,
+                          rf(sx1 - 34, ry, sx1 - 10, ry + ROW_H), OC_COL_FAINT);
             }
         }
         if (g_n_rows < (int)(sizeof g_rows / sizeof g_rows[0])) {
@@ -7467,6 +7526,54 @@ static void draw_browse(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F bo
     ovl_end(rt, body);
 }
 
+/* Every conversation holding an unsent message (WIN-91, REQ-223). Slack's
+ * "Drafts & sent" without the halves we do not have: there is no scheduled send
+ * and no sent-items list, so this is the Drafts tab alone rather than an empty
+ * tab bar over one populated pane. */
+static void draw_drafts(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    D2D1_RECT_F body = view_header(rt, reg, "Drafts",
+                                   "Messages you started. Only you can see these.");
+    g_n_listrows = 0;
+    if (m->n_drafts == 0) {
+        overlay_empty(rt, body, "No drafts. Start typing anywhere and it will wait here.");
+        return;
+    }
+    float rowh = 56.0f;
+    ovl_use(OVL_LATER);          /* the shared overlay scroll, like every list pane */
+    float y = ovl_begin(rt, body, (float)m->n_drafts * rowh + 16);
+    for (size_t i = 0; i < m->n_drafts; i++) {
+        const oc_draft_view *dv = &m->drafts[i];
+        if (y + rowh < body.top) { y += rowh; continue; }
+        if (y > body.bottom) break;
+        D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + 52);
+        if (g_listrow_hover == dv->channel_id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
+        draw_lucide(rt, OC_ICON_SQUARE_PEN, rf(row.left + 12, y + 8, row.left + 32, y + 28),
+                    OC_COL_MUTED);
+        const oc_channel *ch = oc_model_channel((oc_model *)m, dv->channel_id);
+        char where[128];
+        if (ch && ch->kind == OC_CHANNEL_KIND_DM) {
+            const char *pn = oc_model_user_name((oc_model *)m, ch->peer_id);
+            snprintf(where, sizeof where, "@%s", (pn && pn[0]) ? pn : "dm");
+        } else {
+            snprintf(where, sizeof where, "#%s", (ch && ch->name[0]) ? ch->name : "channel");
+        }
+        draw_text(rt, where, g_ui_b, rf(row.left + 42, y + 6, row.right - 12, y + 26), OC_COL_TEXT);
+        draw_text(rt, dv->body ? dv->body : "", g_meta,
+                  rf(row.left + 42, y + 26, row.right - 12, y + 46), OC_COL_MUTED);
+        /* Clicking one opens the conversation it belongs to — a draft is a place
+         * you were, and the only useful thing to do with it is go back. */
+        if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
+            g_listrows[g_n_listrows].row = row;
+            g_listrows[g_n_listrows].act = rf(0, 0, 0, 0);
+            g_listrows[g_n_listrows].mid = 0;          /* a draft has no message id */
+            g_listrows[g_n_listrows].cid = dv->channel_id;
+            g_n_listrows++;
+        }
+        y += rowh;
+    }
+    ovl_end(rt, body);
+}
+
 static void draw_later(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
     char title[96] = "Later";
     if (g_later_chan) {
@@ -7635,6 +7742,7 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
                 draw_later_sidebar(rt, m, H);
                 draw_later(rt, m, rf(RAIL_W + SIDEBAR_W, 0, W, H));
                 break;
+            case VIEW_DRAFTS:        draw_drafts(rt, m, reg); break;
             case VIEW_ADMIN:         draw_admin(rt, m, reg); break;
             default:                 draw_stub_view(rt, reg, "OpenChime", ""); break;
         }
@@ -7720,6 +7828,9 @@ static void paint(HWND hwnd) {
  * machine whose author does not use it, and that is recorded rather than claimed.
  */
 #define ED_MAX   4000        /* UTF-16 units; a message, not a document */
+/* The draft mirror declared far above must hold everything this field can, or a
+ * long draft would be compared against a truncated copy and rewritten forever. */
+typedef char draft_mirror_fits_the_field[(DRAFT_TEXT_MAX == ED_MAX + 1) ? 1 : -1];
 #define ED_UNDO  16
 
 static WCHAR g_ed[ED_MAX + 1];
@@ -8483,6 +8594,12 @@ static void ed_changed(HWND hwnd) {
     }
     ed_repair_orphans();      /* WIN-101, before anything measures or draws */
     ed_remember();
+    /* The draft is behind again (WIN-91). The write itself is debounced on the
+     * ordinary tick: a frame per keystroke would be chattier than anything else
+     * this client sends, and a draft nobody is reading yet does not need to be
+     * that fresh. Leaving, blurring and quitting all flush immediately. */
+    g_draft_dirty = 1;
+    g_draft_touch_ms = GetTickCount64();
     ac_rebuild();
     if (composer_remeasure()) layout_composer(hwnd);
     g_ed_blink = GetTickCount64();       /* a caret that blinks while you type reads as lag */
@@ -9053,8 +9170,15 @@ static void composer_send(void) {
     /* Your own message ends the unread run; leaving the divider above it would
      * claim there is still something new to read. */
     g_unread_from = 0; g_unread_count = 0;
-    for (int i = 0; i < g_n_drafts; i++)          /* it is sent; not a draft any more */
-        if (g_drafts[i].cid == g_sel) { g_drafts[i] = g_drafts[--g_n_drafts]; break; }
+    /* It is sent, so it is not a draft any more. The daemon clears the row in
+     * the send's own transaction (REQ-223); this keeps our own model in step
+     * without waiting to be told, since we are not told — a draft is never
+     * echoed to the connection that wrote it. */
+    {
+        const oc_model *sm2 = model();
+        if (sm2) oc_model_draft_local((oc_model *)sm2, g_sel, 0, "");
+    }
+    g_draft_sent_cid = g_sel; g_draft_sent[0] = 0; g_draft_dirty = 0;
     ed_clear();
 }
 
@@ -12907,6 +13031,19 @@ static void test_dump(const char *path) {
     /* The formatting toolbar's hit-boxes (WIN-96), so the smoke can CLICK the
      * buttons rather than only fire the chords — they are two paths into
      * ed_format() and a test of one is not a test of the other. */
+    /* Drafts (WIN-91): how many the model holds, whether the rail is offering
+     * its destination, and whether THIS conversation has one — the three things
+     * a test would otherwise have to infer from pixels. */
+    {
+        int rail = g_rail_drafts;
+        /* Distinct key names on purpose: the harness reads `key=value` from
+         * anywhere in the dump, so a generic `n=` would have matched msgrows'
+         * first — which it did, reporting a draft count of 0 in the same frame
+         * that said this conversation had one. */
+        fprintf(f, "draftn=%zu draftrail=%d drafthere=%d\n",
+                m ? m->n_drafts : (size_t)0, rail,
+                (m && g_sel) ? oc_model_has_draft(m, g_sel) : 0);
+    }
     fprintf(f, "fmtbar hover=%d", g_fmt_hover);
     for (int i = 0; i < FMT_COUNT; i++)
         fprintf(f, " %.0f,%.0f,%.0f,%.0f", g_fmt_btn[i].left, g_fmt_btn[i].top,
@@ -13561,6 +13698,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == TIMER_TICK && g_client) {
             oc_client_tick(g_client);
             files_view_sync();
+            /* The debounced draft write (WIN-91). On this tick rather than a
+             * timer of its own: there is already one heartbeat driving the
+             * client, and a second would be a second thing to start, stop and
+             * forget on every path that opens or closes a window. */
+            if (g_draft_dirty && g_sel && !g_edit_msg &&
+                GetTickCount64() - g_draft_touch_ms >= DRAFT_DEBOUNCE_MS) {
+                draft_flush(g_sel);
+                InvalidateRect(hwnd, NULL, FALSE);   /* the marker is model-drawn */
+            }
+            /* A draft written on ANOTHER device lands in the model; show it here
+             * only if this field is empty and has not been touched since it was
+             * opened (ARCH-101). Never over live typing: being briefly out of
+             * date is a smaller harm than deleting a sentence somebody is in the
+             * middle of. Polled on the tick rather than hooked to the event
+             * because the condition is about the FIELD, not about the arrival. */
+            if (g_sel && !g_edit_msg && !g_draft_dirty && ed_len() == 0 && !g_ed_comp_len) {
+                const oc_model *dm = model();
+                const char *rd = dm ? oc_model_draft(dm, g_sel, 0) : NULL;
+                if (rd && rd[0]) draft_restore(g_sel);
+            }
             const oc_model *m = oc_client_model(g_client);
             /* A sign-in failure belongs in the card, not a toast — suppress the
              * toast channel while the sign-in view owns the window. */
@@ -14261,6 +14418,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     case WM_KILLFOCUS:
+        /* Whatever you were typing is written now (WIN-91): losing focus is the
+         * moment you stopped, and waiting out the debounce risks the app being
+         * closed or killed in between. */
+        if (g_sel) draft_flush(g_sel);
         /* Losing it to a child, or to another app: the caret must stop drawing, or
          * two carets blink at once and neither is where your keys go. */
         g_ed_focus = 0;
@@ -14292,6 +14453,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ERASEBKGND:
         return 1;
     case WM_CLOSE:
+        /* The draft goes with the window (WIN-91). Before the outbox prompt
+         * below, because that prompt can be answered "stay" — and a draft
+         * written on the way to a decision you reversed is still correct. */
+        if (g_sel) draft_flush(g_sel);
         /* WIN-59: the outbox is in memory now (ARCH-88), so quitting with a send
          * still queued loses it. Make that a choice rather than a surprise. */
         if (geom_capture(hwnd) && g_geom_applied) prefs_save();

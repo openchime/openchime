@@ -795,6 +795,98 @@ static void test_search_vertical(int port, const uint8_t *pin) {
  * online (and gets a snapshot of who's online), an away change propagates, a
  * typing signal reaches other channel members, and a disconnect announces
  * offline. */
+/* Drafts across two connections of the SAME user (REQ-223, ARCH-101). This is
+ * the half no unit test can reach: the fan-out rule is "every connection of this
+ * user EXCEPT the one that wrote it", and getting that backwards is invisible
+ * until two devices are actually attached. */
+static void test_drafts_vertical(int port, const uint8_t *pin) {
+    client a, b;
+    uint64_t ua = 0, ub = 0;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+    /* alice's SECOND device, not a second person. */
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&b) == 0);
+    CHECK(do_auth(&b, "alice", "pw-alice", &ub) == 0);
+    CHECK(ua == ub);
+
+    oc_header hdr; oc_rbuf p; uint8_t buf[512]; oc_wbuf w;
+
+    /* Device A writes a draft; device B is told, and A is NOT — echoing it back
+     * to the writer is how a client overwrites the composer being typed in. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_draft sd = { 1, 0, oc_slice_str("half a thought") };
+    CHECK(oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+
+    CHECK(read_frame_raw(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_DRAFT);
+    oc_draft d;
+    CHECK(oc_decode_draft(&p, &d) == OC_OK);
+    CHECK(d.channel_id == 1 && d.thread_root == 0 && d.updated_ms != 0);
+    CHECK(d.body.len == 14 && memcmp(d.body.ptr, "half a thought", 14) == 0);
+
+    /* B lists and sees it, which is also what a cold start does. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_list_drafts(&w, OC_PROTOCOL_VERSION) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    CHECK(read_frame_raw(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_DRAFT);
+    CHECK(oc_decode_draft(&p, &d) == OC_OK && d.channel_id == 1);
+    CHECK(read_frame_raw(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_DRAFTS);
+    oc_drafts dl; CHECK(oc_decode_drafts(&p, &dl) == OC_OK && dl.count == 1);
+
+    /* Deleting arrives as the same frame with an empty body. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_draft del = { 1, 0, oc_slice_str("") };
+    CHECK(oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &del) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame_raw(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_DRAFT);
+    CHECK(oc_decode_draft(&p, &d) == OC_OK && d.body.len == 0);
+
+    /* And SENDING clears it server-side: write one, send a message, and the
+     * list comes back empty without anyone asking it to. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_draft again = { 1, 0, oc_slice_str("about to send") };
+    CHECK(oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &again) == OC_OK);
+    CHECK(send_frame(&a, buf, w.len) == 0);
+    CHECK(read_frame_raw(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_DRAFT);
+
+    {
+        oc_wbuf_init(&w, buf, sizeof buf);
+        oc_send sm = {0};
+        sm.channel_id = 1;
+        memset(sm.idem, 0xD1, OC_IDEM_SIZE);
+        sm.body = oc_slice_str("about to send");
+        CHECK(oc_encode_send(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK);
+        CHECK(send_frame(&a, buf, w.len) == 0);
+    }
+    /* And the WRITER is never told about its own drafts. Asserted here rather
+     * than asserted in a comment: A has written two drafts and just sent a
+     * message, so if the fan-out included the originator there would be a DRAFT
+     * frame waiting in front of A's SEND_ACK. Drain until the ack and require
+     * that nothing on the way is one. */
+    for (int i = 0; i < 8; i++) {
+        CHECK(read_frame_raw(&a, &hdr, &p) == 0);
+        CHECK(hdr.msg_type != OC_MSG_DRAFT);
+        if (hdr.msg_type == OC_MSG_SEND_ACK) break;
+    }
+    /* Drain until the list answers; the send also broadcasts to both devices. */
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_list_drafts(&w, OC_PROTOCOL_VERSION) == OC_OK);
+    CHECK(send_frame(&b, buf, w.len) == 0);
+    for (int i = 0; i < 8; i++) {
+        CHECK(read_frame_raw(&b, &hdr, &p) == 0);
+        if (hdr.msg_type == OC_MSG_DRAFTS) {
+            CHECK(oc_decode_drafts(&p, &dl) == OC_OK && dl.count == 0);
+            break;
+        }
+        CHECK(hdr.msg_type != OC_MSG_DRAFT);   /* a cleared draft must not be listed */
+    }
+
+    client_close(&a);
+    client_close(&b);
+}
+
 static void test_presence_typing(int port, const uint8_t *pin) {
     client a;
     CHECK(client_open(&a, port, pin) == 0);
@@ -1764,7 +1856,7 @@ static void test_conn_throttle(int port) {
 }
 
 int run_netloop_tests(void) {
-    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, search, dm, load, rate-limit, out-cap, throttle, admin, logout\n");
+    printf("itest_netloop: handshake, version REJECT, two-client AUTH+SEND+BROADCAST, backfill, edit/delete, channels, reactions, threads, search, dm, drafts across two devices, load, rate-limit, out-cap, throttle, admin, logout\n");
 
     /* Attachment blobs go to a build-local dir (REQ-140); the daemon defaults to
      * /data/blobs, which isn't writable in the test sandbox. */
@@ -1823,6 +1915,7 @@ int run_netloop_tests(void) {
         test_threads_vertical(arg.port, pin);
         test_search_vertical(arg.port, pin);
         test_dm_vertical(arg.port, pin);
+        test_drafts_vertical(arg.port, pin);
         test_presence_typing(arg.port, pin);
         test_attachments_vertical(arg.port, pin);
         test_upload_abandoned(arg.port, pin);

@@ -621,6 +621,28 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     oc_queue_push(to_ui, e);
                 }
             }
+        } else if (hdr.msg_type == OC_MSG_DRAFT) {
+            /* A list entry and a device-sync push are the same frame (ARCH-101),
+             * so this fold does not care which prompted it. */
+            oc_draft d;
+            if (oc_decode_draft(&p, &d) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_DRAFT);
+                if (e) {
+                    e->channel_id  = d.channel_id;
+                    e->message_id  = d.thread_root;
+                    e->server_time = d.updated_ms;
+                    e->body = malloc(d.body.len + 1);
+                    if (e->body) { if (d.body.len) memcpy(e->body, d.body.ptr, d.body.len);
+                                   e->body[d.body.len] = '\0'; }
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_DRAFTS) {
+            oc_drafts dl;
+            if (oc_decode_drafts(&p, &dl) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_DRAFTS_END);
+                if (e) { e->count = dl.count; oc_queue_push(to_ui, e); }
+            }
         } else if (hdr.msg_type == OC_MSG_SAVED) {
             oc_saved sv;
             if (oc_decode_saved(&p, &sv) == OC_OK) {
@@ -1351,6 +1373,12 @@ static int run_connection(oc_net *n, int reconnecting,
         oc_wbuf_init(&lw, lb, sizeof lb);
         if (oc_encode_list_users(&lw, OC_PROTOCOL_VERSION) == OC_OK)
             (void)write_all(&conn, fd, lb, lw.len, &n->stop);
+        /* And this user's drafts (REQ-223). On connect, not on demand: the
+         * sidebar marks conversations holding one, so the answer has to be
+         * there before anything is drawn — and it is a small list. */
+        oc_wbuf_init(&lw, lb, sizeof lb);
+        if (oc_encode_list_drafts(&lw, OC_PROTOCOL_VERSION) == OC_OK)
+            (void)write_all(&conn, fd, lb, lw.len, &n->stop);
 
         /* On a reconnect, recover anything missed while offline: backfill each
          * known channel from its last-seen message id (REQ-101). Replays dedup on
@@ -1621,6 +1649,18 @@ static int run_connection(oc_net *n, int reconnecting,
                                              oc_slice_str(c->body ? c->body : ""),
                                              oc_slice_str(c->body2 ? c->body2 : "") };
                 if (oc_encode_set_client_setting(&w, OC_PROTOCOL_VERSION, &cs) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_DRAFT) {
+                static uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_draft sd = { c->channel_id, c->message_id,
+                                    oc_slice_str(c->body ? c->body : "") };
+                if (oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_DRAFTS) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_drafts(&w, OC_PROTOCOL_VERSION) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_LIST_SETTINGS) {

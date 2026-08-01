@@ -179,6 +179,17 @@ typedef struct {
     char     attach_name[128];
 } oc_saved_view;
 
+/* One draft (REQ-223, ARCH-101). Keyed by the conversation, not by time: there
+ * is exactly one per (channel, thread root), which is why a write replaces
+ * rather than appends. `gen` is the sync generation — see oc_model_drafts_begin. */
+typedef struct {
+    uint64_t channel_id;
+    uint64_t thread_root;
+    uint64_t updated_ms;
+    char    *body;        /* heap, never NULL for a stored draft */
+    uint32_t gen;
+} oc_draft_view;
+
 /* One activity item (REQ-139): `text` is the message for a mention or reply and
  * the emoji for a reaction. */
 typedef struct {
@@ -263,6 +274,12 @@ typedef struct {
     uint8_t   saved_open, saved_loading;
     oc_saved_view *saved;
     size_t    n_saved, cap_saved;
+    /* Drafts (REQ-223). Always loaded — the sidebar marks conversations that
+     * hold one — so unlike `saved` this has no open/close, only a generation
+     * that a full LIST bumps so stale entries can be swept when it completes. */
+    oc_draft_view *drafts;
+    size_t    n_drafts, cap_drafts;
+    uint32_t  draft_gen;
     uint8_t   activity_open, activity_loading;
     oc_activity_view *activity;
     size_t    n_activity, cap_activity;
@@ -541,6 +558,19 @@ void oc_model_close_sessions(oc_model *m);
 /* A synced setting's value by key, or NULL if the bucket has no such key. Valid
  * until the next CLIENT_SETTINGS frame folds in. */
 const char *oc_model_setting(const oc_model *m, const char *key);
+/* The draft for a conversation, or NULL. `thread_root` is 0 for the channel. */
+const char *oc_model_draft(const oc_model *m, uint64_t channel_id, uint64_t thread_root);
+/* Does this channel hold any draft? (the sidebar marker) */
+int         oc_model_has_draft(const oc_model *m, uint64_t channel_id);
+/* A full LIST is starting: bump the generation so oc_model_drafts_end can drop
+ * whatever the server did not mention this time. */
+void        oc_model_drafts_begin(oc_model *m);
+/* Apply a draft this client just wrote. The daemon does not echo a draft to the
+ * connection that wrote it (ARCH-101 — echoing it back is how a client ends up
+ * overwriting the composer someone is still typing in), so without this our own
+ * drafts would be invisible to our own sidebar until the next connect. */
+void        oc_model_draft_local(oc_model *m, uint64_t channel_id,
+                                 uint64_t thread_root, const char *body);
 
 /* Seen-by (REQ-090): fill `out` with up to `cap` user ids who have read
  * `channel_id` up to at least `message_id`, excluding `exclude` (typically self).

@@ -142,6 +142,8 @@ void oc_model_free(oc_model *m) {
     free(m->chanmem);
     for (size_t i = 0; i < m->n_saved; i++) free(m->saved[i].body);
     free(m->saved);
+    for (size_t i = 0; i < m->n_drafts; i++) free(m->drafts[i].body);
+    free(m->drafts);
     for (size_t i = 0; i < m->n_activity; i++) free(m->activity[i].text);
     free(m->activity);
     free(m->files);
@@ -169,6 +171,60 @@ static void setting_upsert(oc_model *m, const char *key, const char *value) {
     oc_setting *s = &m->settings[m->n_settings++];
     snprintf(s->key, sizeof s->key, "%s", key);
     snprintf(s->value, sizeof s->value, "%s", value ? value : "");
+}
+
+/* --- drafts (REQ-223, ARCH-101) ------------------------------------------ */
+
+static oc_draft_view *draft_find(oc_model *m, uint64_t cid, uint64_t root) {
+    for (size_t i = 0; i < m->n_drafts; i++)
+        if (m->drafts[i].channel_id == cid && m->drafts[i].thread_root == root)
+            return &m->drafts[i];
+    return NULL;
+}
+
+/* Upsert, or remove when the body is empty — the daemon reports a deletion as a
+ * draft with no text, so both directions arrive through the one frame. */
+static void draft_apply(oc_model *m, uint64_t cid, uint64_t root,
+                        uint64_t updated_ms, const char *body) {
+    oc_draft_view *d = draft_find(m, cid, root);
+    if (!body || !body[0]) {
+        if (!d) return;
+        free(d->body);
+        *d = m->drafts[--m->n_drafts];            /* dense; order is not meaningful */
+        return;
+    }
+    if (!d) {
+        if (m->n_drafts == m->cap_drafts) {
+            size_t nc = m->cap_drafts ? m->cap_drafts * 2 : 8;
+            oc_draft_view *g = realloc(m->drafts, nc * sizeof *g);
+            if (!g) return;
+            m->drafts = g; m->cap_drafts = nc;
+        }
+        d = &m->drafts[m->n_drafts++];
+        d->channel_id = cid; d->thread_root = root; d->body = NULL;
+    }
+    free(d->body);
+    d->body = strdup(body);
+    d->updated_ms = updated_ms;
+    d->gen = m->draft_gen;
+}
+
+const char *oc_model_draft(const oc_model *m, uint64_t channel_id, uint64_t thread_root) {
+    oc_draft_view *d = draft_find((oc_model *)m, channel_id, thread_root);
+    return d ? d->body : NULL;
+}
+
+int oc_model_has_draft(const oc_model *m, uint64_t channel_id) {
+    for (size_t i = 0; i < m->n_drafts; i++)
+        if (m->drafts[i].channel_id == channel_id) return 1;
+    return 0;
+}
+
+void oc_model_drafts_begin(oc_model *m) { if (m) m->draft_gen++; }
+
+void oc_model_draft_local(oc_model *m, uint64_t channel_id, uint64_t thread_root,
+                          const char *body) {
+    if (m && channel_id) draft_apply(m, channel_id, thread_root, 0, body);
 }
 
 const char *oc_model_setting(const oc_model *m, const char *key) {
@@ -695,6 +751,11 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->last_error[0] = '\0';
         presence_set(m, e->user_id, OC_PRESENCE_ONLINE);   /* self: the server won't tell us */
         set_status(m, "authenticated");
+        /* The net thread asks for this user's drafts on every (re)connect, so
+         * bump the sync generation HERE — the reply's terminator then sweeps
+         * anything the server did not mention, which is how a draft deleted on
+         * another device while we were offline stops being ours. */
+        oc_model_drafts_begin(m);
         break;
     case OC_EV_WORKSPACE_INFO:
         m->deployment_mode = e->status;
@@ -1117,6 +1178,19 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         break;
     case OC_EV_SETTING:
         setting_upsert(m, e->author_name, e->body ? e->body : "");
+        break;
+    case OC_EV_DRAFT:
+        draft_apply(m, e->channel_id, e->message_id, e->server_time, e->body);
+        break;
+    case OC_EV_DRAFTS_END:
+        /* Everything the server just listed carries the current generation.
+         * Anything older is a draft it did not mention — deleted elsewhere,
+         * possibly while this client was not connected — so it goes. */
+        for (size_t i = m->n_drafts; i-- > 0; )
+            if (m->drafts[i].gen != m->draft_gen) {
+                free(m->drafts[i].body);
+                m->drafts[i] = m->drafts[--m->n_drafts];
+            }
         break;
     case OC_EV_AUDIT_BEGIN:
         m->n_audit = 0;              /* a page replaces whatever was shown */

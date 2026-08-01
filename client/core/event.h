@@ -103,6 +103,12 @@ enum {
     OC_EV_SAVED_UPDATED,   /* a message was saved/unsaved: message_id + op (REQ-231) */
     OC_EV_SAVED_MSG,       /* one saved item (streamed) */
     OC_EV_SAVED_END,       /* the saved list is complete: count */
+    /* Drafts (REQ-223). One draft — a list entry AND the device-sync push, which
+     * the model folds identically: channel_id, message_id = thread root,
+     * server_time = updated_ms, body (empty means it is gone). END completes a
+     * LIST and lets the model drop anything the server did not mention. */
+    OC_EV_DRAFT,
+    OC_EV_DRAFTS_END,
     OC_EV_ACTIVITY,        /* one activity item: status=kind, user_id=actor (REQ-139) */
     OC_EV_ACTIVITY_END,    /* the feed is complete: count + pinned_at = seen watermark */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
@@ -186,6 +192,11 @@ enum {
     OC_CMD_LIST_NOTIFY_PREFS, /* request all notification settings (DND + per-channel) */
     OC_CMD_SET_SETTING,     /* upsert a synced client setting: body=key, body2=value (empty value deletes) */
     OC_CMD_LIST_SETTINGS,   /* request the synced client-settings bucket */
+    /* Drafts (REQ-223, ARCH-101). SET carries channel_id + message_id as the
+     * THREAD ROOT (0 = the channel itself) + body; an empty body deletes, which
+     * is the same command rather than a second one. */
+    OC_CMD_SET_DRAFT,
+    OC_CMD_LIST_DRAFTS,
     OC_CMD_SET_DISPLAY_NAME, /* change your own display name: body=name */
     OC_CMD_CHANGE_PASSWORD, /* change your own password: body=old, body2=new */
     OC_CMD_MARK_READ,       /* CLIENT_ACK: read `channel_id` up to `message_id` (drives seen-by) */

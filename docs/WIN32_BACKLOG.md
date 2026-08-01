@@ -32,7 +32,6 @@ pattern REQ-221 and REQ-230 both followed.
 | # | Item | Blocked on |
 |---|---|---|
 | **WIN-97** | **Activity filters: Unreads, DMs, Channels (REQ-139).** The feed answers "what involved me" — mentions, reactions, thread replies — and not "what have I not read". Slack's Activity has both, and the three missing filters are the second half. One query with three predicates rather than three features: *messages past my read cursor, in conversations I belong to*, filtered by kind (DMs) or by notification level (Channels), or unfiltered (Unreads). The cursor already exists — `delivery_cursors`, REQ-090. Needs a daemon half (the query and its wire op) before the Win32 tabs. Slack's saved custom views are deliberately not in scope. | P1 | M |
-| **WIN-91** | **Drafts across a restart.** Drafts are per-channel and in memory (`g_drafts`, 24 slots), so they die with the process. **Decided (ARCH-101): a server-side `drafts` table keyed `(user_id, channel_id, thread_root)` with its own ops** — not the `client_settings` bucket, which is partitioned per frontend and would leave a GUI draft invisible in the TUI. Client work: save on switch/blur/quit and only when changed, restore on entering a conversation, never overwrite a composer being typed in, and mark the sidebar row — **matching Slack's surface**. Daemon work: the table, `SET_DRAFT`/`LIST_DRAFTS`, fan-out to the user's other connections, and the delete cascades. | — (decision made; needs the daemon half built) |
 | **WIN-92** | **"Pause notifications until…" (REQ-278).** The client can set a *recurring daily* window (REQ-131) and nothing else, so the most-reached-for form — "until 17:00", or for 30 minutes — is not expressible: a minutes-of-day pair is periodic, so "until 5pm today" would silence 5pm every day. **Spec settled against Slack's `dnd` API:** presets are *durations from now* (30m / 1h / 2h / until tomorrow / custom), `dnd_until_ms` on `users` with 0 meaning ended, a pause only ever adds silence, and ending a pause is distinct from ending the current scheduled period. Also needs DND carried to **other users** as a second, independent axis beside presence — the fact only, never the end time (REQ-122). VIPs pierce a pause when REQ-135 lands; senders never do (a deliberate divergence from Slack). | REQ-278 daemon half + REQ-122 presence bit |
 | **WIN-94** | **Notification schedule and keyword alerts (REQ-135/136).** Two halves of the same subsystem, both specified 2026-07-31. **Schedule:** *Every day / Weekdays / Custom* with an independent start and end per weekday, stored against the user's local calendar day — and it **replaces** REQ-131's single daily window rather than joining it, because Slack has one recurring mechanism and two would be able to disagree. **Keywords:** part of the *mentions* level rather than their own switch, matched case-insensitively and exactly, phrases allowed, surfacing in the activity feed as mentions — and firing **in threads**, where Slack's do not. **Priority people** pierce a level and a pause but never a mute. | REQ-135 / REQ-136 daemon halves |
 
@@ -78,7 +77,7 @@ pattern REQ-221 and REQ-230 both followed.
   The daemon is epoll-based and Linux-only, and GitHub's Windows runners cannot
   host it. The job exists and skips until a self-hosted Windows+WSL runner does.
   Until then the smoke is a local gate. It is a trustworthy one since WIN-87/88:
-  171 checks, waiting on state rather than sleeping, refusing to run against the
+  179 checks, waiting on state rather than sleeping, refusing to run against the
   wrong daemon, and including a real UIA client walking the accessibility tree
   from outside the process.
 
@@ -97,7 +96,7 @@ pattern REQ-221 and REQ-230 both followed.
 
 ## What "closed" does and does not mean
 
-WIN-1 … WIN-90 plus WIN-93, WIN-95, WIN-96 and WIN-98 … WIN-105 are done —
+WIN-1 … WIN-91 plus WIN-93, WIN-95, WIN-96 and WIN-98 … WIN-105 are done —
 accessibility included, built *for* the custom controls rather than by retreating
 to native ones (ARCH-99), and rich text with its toolbar as of 2026-07-31. The
 items below are each blocked on a daemon requirement or an ARCH decision, or, in

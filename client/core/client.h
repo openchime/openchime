@@ -178,6 +178,11 @@ void oc_client_toggle_prefs(oc_client *c, int open);
  * oc_model_setting) and syncs to the user's other same-type devices. */
 void oc_client_set_client_type(oc_client *c, const char *client_type);
 void oc_client_set_setting(oc_client *c, const char *key, const char *value);
+/* Drafts (REQ-223, ARCH-101). `thread_root` is 0 for the channel itself; an
+ * empty or NULL body deletes the draft. */
+void oc_client_set_draft(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                         const char *body);
+void oc_client_list_drafts(oc_client *c);
 void oc_client_list_settings(oc_client *c);
 
 /* Storage usage report (REQ-214; owner/admin only — the daemon refuses it for a

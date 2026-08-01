@@ -1139,6 +1139,35 @@ expect_grep '^tsel has=1 a=[0-9]+:0 f=[0-9]+:25' "triple-click selects the whole
 expect_grep '^ed .*text="the quick brown fox jumps"' "and Ctrl+C copies what was selected"
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
 
+# --- drafts that outlive the process (WIN-91, REQ-223, ARCH-101) -------------
+# WIN-27's drafts were 24 slots in memory: a switch survived them, a restart did
+# not. They now live on the daemon, so the assertion that matters is the one the
+# old ones could never pass — kill the client and find the text still there.
+say "== drafts"
+"$DRIVE" channel general >/dev/null 2>&1; settle conv 1
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+"$DRIVE" chars "unsent thoughts" >/dev/null 2>&1; ed_wait len 15
+# The write is debounced (~2s) rather than sent per keystroke; wait for the
+# state, do not sleep a guess.
+expect_eventually drafthere 1 "typing a draft records it against this conversation"
+d=$(snap)
+expect "$d" draftn    1 "drafts: the model holds one"
+expect "$d" draftrail 1 "drafts: the rail offers its destination"
+
+# The whole point: a NEW PROCESS finds it.
+"$DRIVE" launch >/dev/null 2>&1
+if ! wait_grep 'authed=1 connected=1' 20000; then fail "relaunch did not authenticate"; fi
+"$DRIVE" channel general >/dev/null 2>&1; settle conv 1
+expect_grep '^ed .*text="unsent thoughts"' "and it is still there after a restart"
+
+# Sending it is what ends it — on the daemon, in the send's own transaction.
+"$DRIVE" key enter >/dev/null 2>&1
+ed_step len 0 "sending clears the field"
+expect_eventually drafthere 0 "and the draft with it"
+d=$(snap)
+expect "$d" draftn    0 "drafts: none left"
+expect "$d" draftrail 0 "drafts: the rail destination goes with the last one"
+
 # --- mentioning someone who is not in the channel (REQ-287) ------------------
 # The defect this covers is a FALSE CONFIRMATION: the highlight is syntactic, so
 # a mention that notified nobody looked exactly like one that worked. Asserted as
