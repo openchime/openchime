@@ -281,6 +281,58 @@ size_t oc_emoji_search(const char *query, const oc_emoji **out, size_t max) {
 
 /* ---- completion ----------------------------------------------------------- */
 
+/* Substring, case-insensitively — the second band of oc_complete_targets. */
+static int ci_contains(const char *s, const char *needle) {
+    if (!s || !needle || !*needle) return 1;
+    size_t nl = strlen(needle);
+    for (const char *p = s; *p; p++) {
+        size_t i = 0;
+        while (i < nl && p[i] &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) i++;
+        if (i == nl) return 1;
+    }
+    return 0;
+}
+
+size_t oc_complete_targets(const oc_model *m, const char *query,
+                           oc_target *out, size_t max) {
+    if (!m || !out || max == 0) return 0;
+    const char *q = query ? query : "";
+    /* A leading sigil is accepted and ignored rather than treated as a filter:
+     * somebody typing "@ali" in a To: field means the person, not a literal. */
+    if (*q == '@' || *q == '#') q++;
+    size_t n = 0;
+    /* Two passes so prefix matches lead, and within each pass people lead —
+     * you address a person more often than a channel. */
+    for (int band = 0; band < 2 && n < max; band++) {
+        for (size_t i = 0; i < m->n_users && n < max; i++) {
+            const char *nm = m->users[i].name;
+            if (!nm || !nm[0] || m->users[i].user_id == m->user_id) continue;  /* not yourself */
+            int pre = ci_prefix(nm, q);
+            if (band == 0 ? !pre : (pre || !ci_contains(nm, q))) continue;
+            out[n].id = m->users[i].user_id;
+            out[n].is_channel = 0;
+            snprintf(out[n].name, sizeof out[n].name, "%s", nm);
+            /* The subtitle is their title if they set one — Slack shows the real
+             * name beside the handle; ours has a title field and no second name. */
+            snprintf(out[n].sub, sizeof out[n].sub, "%s", m->users[i].title);
+            n++;
+        }
+        for (size_t i = 0; i < m->n_channels && n < max; i++) {
+            const oc_channel *c = &m->channels[i];
+            if (c->kind == OC_CHANNEL_KIND_DM || !c->name || !c->name[0]) continue;
+            int pre = ci_prefix(c->name, q);
+            if (band == 0 ? !pre : (pre || !ci_contains(c->name, q))) continue;
+            out[n].id = c->channel_id;
+            out[n].is_channel = 1;
+            snprintf(out[n].name, sizeof out[n].name, "%s", c->name);
+            out[n].sub[0] = '\0';
+            n++;
+        }
+    }
+    return n;
+}
+
 size_t oc_complete(const oc_model *m, const char *text,
                    oc_completion *out, size_t max, int *repl_start, int *kind) {
     if (kind) *kind = OC_AC_NONE;

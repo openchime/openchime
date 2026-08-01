@@ -443,6 +443,43 @@ void oc_client_set_draft(oc_client *c, uint64_t channel_id, uint64_t thread_root
     oc_queue_push(&c->cmds, cmd);
 }
 
+void oc_client_schedule(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                        uint64_t send_at_ms, const char *body) {
+    if (!c || !channel_id || !body || !body[0]) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SCHEDULE);
+    if (!cmd) return;
+    cmd->channel_id = channel_id;
+    cmd->message_id = thread_root;
+    cmd->server_time = send_at_ms;
+    cmd->body = strdup(body);
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_list_scheduled(oc_client *c) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_SCHEDULED);
+    if (cmd) oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_cancel_scheduled(oc_client *c, uint64_t id) {
+    if (!c || !id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_CANCEL_SCHEDULED);
+    if (!cmd) return;
+    cmd->message_id = id;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_update_scheduled(oc_client *c, uint64_t id, uint64_t send_at_ms,
+                                const char *body) {
+    if (!c || !id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_UPDATE_SCHEDULED);
+    if (!cmd) return;
+    cmd->message_id = id;
+    cmd->server_time = send_at_ms;
+    cmd->body = strdup(body ? body : "");
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_list_drafts(oc_client *c) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_DRAFTS);

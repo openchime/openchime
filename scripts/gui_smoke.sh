@@ -238,7 +238,8 @@ done <<'MATRIX'
 2 3 1 0 0 1 Activity
 3 4 0 0 1 0 Files
 4 5 0 0 0 0 Later
-5 0 0 0 0 0 Admin
+5 1 0 1 0 0 Drafts
+6 0 0 0 0 0 Admin
 MATRIX
 
 # --- overlays --------------------------------------------------------------
@@ -1152,7 +1153,7 @@ say "== drafts"
 expect_eventually drafthere 1 "typing a draft records it against this conversation"
 d=$(snap)
 expect "$d" draftn    1 "drafts: the model holds one"
-expect "$d" draftrail 1 "drafts: the rail offers its destination"
+expect "$d" draftrail 1 "drafts: the Home sidebar carries the destination"
 
 # The whole point: a NEW PROCESS finds it.
 "$DRIVE" launch >/dev/null 2>&1
@@ -1166,7 +1167,10 @@ ed_step len 0 "sending clears the field"
 expect_eventually drafthere 0 "and the draft with it"
 d=$(snap)
 expect "$d" draftn    0 "drafts: none left"
-expect "$d" draftrail 0 "drafts: the rail destination goes with the last one"
+# The ROW stays — Slack's "Drafts & sent" is always in the sidebar and it is the
+# COUNT that comes and goes. Asserting the row disappears would be asserting the
+# mistake this branch corrected.
+expect "$d" draftrail 1 "drafts: the destination stays, only the count clears"
 
 # --- mentioning someone who is not in the channel (REQ-287) ------------------
 # The defect this covers is a FALSE CONFIRMATION: the highlight is syntactic, so

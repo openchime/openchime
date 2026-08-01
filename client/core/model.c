@@ -144,6 +144,8 @@ void oc_model_free(oc_model *m) {
     free(m->saved);
     for (size_t i = 0; i < m->n_drafts; i++) free(m->drafts[i].body);
     free(m->drafts);
+    for (size_t i = 0; i < m->n_scheds; i++) free(m->scheds[i].body);
+    free(m->scheds);
     for (size_t i = 0; i < m->n_activity; i++) free(m->activity[i].text);
     free(m->activity);
     free(m->files);
@@ -221,6 +223,50 @@ int oc_model_has_draft(const oc_model *m, uint64_t channel_id) {
 }
 
 void oc_model_drafts_begin(oc_model *m) { if (m) m->draft_gen++; }
+
+/* --- scheduled messages (REQ-224, ARCH-102) ------------------------------ */
+
+static void sched_apply(oc_model *m, uint64_t id, uint64_t cid, uint64_t at,
+                        uint8_t state, const char *body, const char *fail) {
+    oc_sched_view *d = NULL;
+    for (size_t i = 0; i < m->n_scheds; i++) if (m->scheds[i].id == id) { d = &m->scheds[i]; break; }
+    /* GONE is a cancellation, and SENT means it is a message now — either way it
+     * stops being something waiting to happen. */
+    if (state == OC_SCHED_GONE || state == OC_SCHED_SENT) {
+        if (!d) return;
+        free(d->body);
+        *d = m->scheds[--m->n_scheds];
+        return;
+    }
+    if (!d) {
+        if (m->n_scheds == m->cap_scheds) {
+            size_t nc = m->cap_scheds ? m->cap_scheds * 2 : 8;
+            oc_sched_view *g = realloc(m->scheds, nc * sizeof *g);
+            if (!g) return;
+            m->scheds = g; m->cap_scheds = nc;
+        }
+        d = &m->scheds[m->n_scheds++];
+        d->body = NULL;
+    }
+    free(d->body);
+    d->id = id; d->channel_id = cid; d->send_at_ms = at; d->state = state;
+    d->body = strdup(body ? body : "");
+    snprintf(d->fail, sizeof d->fail, "%s", fail ? fail : "");
+    d->gen = m->sched_gen;
+}
+
+size_t oc_model_scheduled_pending(const oc_model *m) {
+    size_t n = 0;
+    for (size_t i = 0; m && i < m->n_scheds; i++)
+        if (m->scheds[i].state == OC_SCHED_PENDING) n++;
+    return n;
+}
+size_t oc_model_scheduled_failed(const oc_model *m) {
+    size_t n = 0;
+    for (size_t i = 0; m && i < m->n_scheds; i++)
+        if (m->scheds[i].state == OC_SCHED_FAILED) n++;
+    return n;
+}
 
 void oc_model_draft_local(oc_model *m, uint64_t channel_id, uint64_t thread_root,
                           const char *body) {
@@ -756,6 +802,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
          * anything the server did not mention, which is how a draft deleted on
          * another device while we were offline stops being ours. */
         oc_model_drafts_begin(m);
+        m->sched_gen++;          /* the same sweep, for what is waiting to send */
         break;
     case OC_EV_WORKSPACE_INFO:
         m->deployment_mode = e->status;
@@ -1181,6 +1228,17 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         break;
     case OC_EV_DRAFT:
         draft_apply(m, e->channel_id, e->message_id, e->server_time, e->body);
+        break;
+    case OC_EV_SCHEDULED:
+        sched_apply(m, e->message_id, e->channel_id, e->server_time, e->op,
+                    e->body, e->author_name);
+        break;
+    case OC_EV_SCHEDULED_END:
+        for (size_t i = m->n_scheds; i-- > 0; )
+            if (m->scheds[i].gen != m->sched_gen) {
+                free(m->scheds[i].body);
+                m->scheds[i] = m->scheds[--m->n_scheds];
+            }
         break;
     case OC_EV_DRAFTS_END:
         /* Everything the server just listed carries the current generation.

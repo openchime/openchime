@@ -637,6 +637,31 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     oc_queue_push(to_ui, e);
                 }
             }
+        } else if (hdr.msg_type == OC_MSG_SCHEDULED) {
+            oc_scheduled sc;
+            if (oc_decode_scheduled(&p, &sc) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_SCHEDULED);
+                if (e) {
+                    e->message_id  = sc.id;
+                    e->channel_id  = sc.channel_id;
+                    e->server_time = sc.send_at_ms;
+                    e->op          = sc.state;
+                    size_t fn = sc.fail_reason.len < sizeof e->author_name - 1
+                              ? sc.fail_reason.len : sizeof e->author_name - 1;
+                    memcpy(e->author_name, sc.fail_reason.ptr, fn);
+                    e->author_name[fn] = '\0';
+                    e->body = malloc(sc.body.len + 1);
+                    if (e->body) { if (sc.body.len) memcpy(e->body, sc.body.ptr, sc.body.len);
+                                   e->body[sc.body.len] = '\0'; }
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_SCHEDULED_LIST) {
+            oc_scheduled_list sl;
+            if (oc_decode_scheduled_list(&p, &sl) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_SCHEDULED_END);
+                if (e) { e->count = sl.count; oc_queue_push(to_ui, e); }
+            }
         } else if (hdr.msg_type == OC_MSG_DRAFTS) {
             oc_drafts dl;
             if (oc_decode_drafts(&p, &dl) == OC_OK) {
@@ -1379,6 +1404,11 @@ static int run_connection(oc_net *n, int reconnecting,
         oc_wbuf_init(&lw, lb, sizeof lb);
         if (oc_encode_list_drafts(&lw, OC_PROTOCOL_VERSION) == OC_OK)
             (void)write_all(&conn, fd, lb, lw.len, &n->stop);
+        /* And anything waiting to be sent (REQ-224): the pane counts them and
+         * a failure needs surfacing whether or not anyone opens it. */
+        oc_wbuf_init(&lw, lb, sizeof lb);
+        if (oc_encode_list_scheduled(&lw, OC_PROTOCOL_VERSION) == OC_OK)
+            (void)write_all(&conn, fd, lb, lw.len, &n->stop);
 
         /* On a reconnect, recover anything missed while offline: backfill each
          * known channel from its last-seen message id (REQ-101). Replays dedup on
@@ -1653,9 +1683,37 @@ static int run_connection(oc_net *n, int reconnecting,
             }
             if (c->type == OC_CMD_SET_DRAFT) {
                 static uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                /* body2 carries the recipient list for an UNADDRESSED draft
+                 * (REQ-229); empty for the ordinary channel case. */
                 oc_set_draft sd = { c->channel_id, c->message_id,
+                                    oc_slice_str(c->body2 ? c->body2 : ""),
                                     oc_slice_str(c->body ? c->body : "") };
                 if (oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SCHEDULE) {
+                static uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_schedule_message sm = { c->channel_id, c->message_id, c->server_time,
+                                           oc_slice_str(c->body ? c->body : "") };
+                if (oc_encode_schedule_message(&w, OC_PROTOCOL_VERSION, &sm) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_SCHEDULED) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                if (oc_encode_list_scheduled(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_CANCEL_SCHEDULED) {
+                uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_cancel_scheduled cs = { c->message_id };
+                if (oc_encode_cancel_scheduled(&w, OC_PROTOCOL_VERSION, &cs) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_UPDATE_SCHEDULED) {
+                static uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_update_scheduled us = { c->message_id, c->server_time,
+                                           oc_slice_str(c->body ? c->body : "") };
+                if (oc_encode_update_scheduled(&w, OC_PROTOCOL_VERSION, &us) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_LIST_DRAFTS) {

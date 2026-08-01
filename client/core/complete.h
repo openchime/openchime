@@ -74,4 +74,21 @@ enum {
 size_t oc_complete(const oc_model *m, const char *text,
                    oc_completion *out, size_t max, int *repl_start, int *kind);
 
+/* ---- addressing a message (REQ-229) ---------------------------------------
+ * People AND channels, ranked together, for a query with NO sigil — which is
+ * what a "To:" field takes. oc_complete above dispatches on the leading `@`,
+ * `#` or `:`, so it structurally cannot answer this: it has to be told which
+ * kind you meant before it will look. A picker is asked the opposite question.
+ *
+ * Ranking: prefix matches before substring matches, people before channels
+ * within each band (you address a person more often than a channel), each band
+ * alphabetical so the list does not reshuffle as you type.
+ *
+ * `out[i].repl` carries the id as text — "u123" for a user, "c45" for a channel
+ * — because the caller needs to resolve a choice, not re-parse a display name
+ * that may not be unique. `disp` is what to show. */
+typedef struct { uint64_t id; int is_channel; char name[80]; char sub[80]; } oc_target;
+size_t oc_complete_targets(const oc_model *m, const char *query,
+                           oc_target *out, size_t max);
+
 #endif /* OC_COMPLETE_H */

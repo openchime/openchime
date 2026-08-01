@@ -166,6 +166,8 @@ static float composer_inner_h(void) { return g_composer_h - composer_chrome(); }
 /* Primary views selected by the left-nav rail (Slack-style). HOME/DMS/ADMIN are
  * real today; ACTIVITY/FILES/LATER/NOTIFICATIONS are stubs until their features
  * land. Rail item `act` values <0 are special (switcher / new / profile / more). */
+/* VIEW_DRAFTS is a real destination but NOT a rail item: it is reached from the
+ * Home sidebar's top shelf, where Slack puts "Drafts & sent" (REQ-228). */
 enum { VIEW_HOME = 0, VIEW_DMS, VIEW_ACTIVITY, VIEW_FILES, VIEW_LATER,
        VIEW_DRAFTS, VIEW_ADMIN, VIEW_COUNT,
        /* Not a rail destination: the sign-in screen, which owns the whole window
@@ -869,6 +871,10 @@ static int g_n_notify_hits;
 static int      g_show_members = 1;     /* members pane visible */
 static D2D1_RECT_F g_members_btn;       /* header toggle hit-box */
 enum { TAB_MESSAGES = 0, TAB_FILES, TAB_PINS, TAB_ABOUT, TAB_COUNT };
+/* The Drafts pane's own tabs (REQ-228), Slack's three. Numbered separately from
+ * the channel tabs above: they share a drawing routine, not a meaning. */
+enum { DTAB_DRAFTS = 0, DTAB_SCHEDULED, DTAB_SENT, DTAB_COUNT };
+static int g_dtab;
 
 /* Does this tab exist for this conversation? (WIN-74)
  *
@@ -1973,15 +1979,19 @@ static const struct { int act; int icon; const char *label; int admin; } RAIL_IT
     { VIEW_ACTIVITY, OC_ICON_BELL,     "Activity", 0 },
     { VIEW_FILES,    OC_ICON_FILE,     "Files",    0 },
     { VIEW_LATER,    OC_ICON_BOOKMARK, "Later",    0 },
-    /* Drafts is CONDITIONAL — see rail_item_shown(). Slack's "Drafts & sent"
-     * appears only when you have one, and a permanent door to an empty room is
-     * worse than no door. */
-    { VIEW_DRAFTS,   OC_ICON_SQUARE_PEN, "Drafts", 0 },
+    /* Drafts is NOT here. It briefly was, and that was wrong: Slack reaches
+     * "Drafts & sent" from a row at the top of the HOME SIDEBAR, beside Threads
+     * and Directories, not from a sixth rail destination. REQ-223 said so before
+     * it was built. See the destinations shelf in draw_sidebar. */
     { VIEW_ADMIN,    OC_ICON_SETTINGS, "Admin",    1 },
 };
 #define RAIL_N_ITEMS ((int)(sizeof RAIL_ITEMS / sizeof RAIL_ITEMS[0]))
 
-static int g_rail_drafts;      /* last paint offered the Drafts destination */
+/* The Home sidebar's destinations shelf (REQ-228): where each row landed, so a
+ * click can find it, and which one the pointer is over. */
+static struct { float top, bot; int view; } g_shelf_rows[4];
+static int g_n_shelf;
+static int g_shelf_hover = -1;
 static int ws_unread_elsewhere(void);   /* fwd */
 
 static void avatar_want(uint64_t aid) {
@@ -2089,19 +2099,8 @@ static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     /* Gate admin-only items, then overflow the tail into "More" when there isn't
      * enough vertical space (fold Admin first, up toward Home; Home never folds). */
     int vis[RAIL_N_ITEMS], nv = 0;
-    g_rail_drafts = 0;
     for (int i = 0; i < RAIL_N_ITEMS; i++) {
         if (RAIL_ITEMS[i].admin && !(m && self_role(m) >= OC_ROLE_ADMIN)) continue;
-        /* Drafts exists only while you have one (WIN-91), as Slack's does — and
-         * it also has to survive being the CURRENT view when the last draft is
-         * sent, or the rail would drop a destination you are standing in. */
-        if (RAIL_ITEMS[i].act == VIEW_DRAFTS) {
-            if (!(m && m->n_drafts) && g_view != VIEW_DRAFTS) continue;
-            /* Recorded for the harness: whether the destination EXISTS is this
-             * filter's answer, and where it ended up — rail or "More" overflow —
-             * is the window's height, which a test should not be asserting. */
-            g_rail_drafts = 1;
-        }
         vis[nv++] = i;
     }
 
@@ -2418,6 +2417,48 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     if (g_sb_scroll < 0) g_sb_scroll = 0;
 
     float sx0 = RAIL_W + 8, sx1 = RAIL_W + SIDEBAR_W - 8;
+
+    /* ---- the destinations shelf (REQ-228) ---------------------------------
+     * Slack's Home sidebar opens with a short list of places — Threads,
+     * Huddles, Drafts & sent, Directories — above Starred and the channel
+     * list. Only one of those exists here today; it is drawn as a LIST rather
+     * than as a special-cased row so the others join it when they are built,
+     * instead of each arriving as its own exception. */
+    {
+        static const struct { int view; const char *label; int icon; } SHELF[] = {
+            { VIEW_DRAFTS, "Drafts, scheduled & sent", OC_ICON_SQUARE_PEN },
+        };
+        float sy = top;
+        for (size_t si = 0; si < sizeof SHELF / sizeof SHELF[0]; si++) {
+            int on = (g_view == SHELF[si].view);
+            D2D1_RECT_F row = rf(sx0, sy, sx1, sy + ROW_H);
+            if (on) fill_round(rt, row, 6.0f, OC_COL_SELECT);
+            else if (g_shelf_hover == (int)si) fill_round(rt, row, 6.0f, OC_COL_HOVER);
+            draw_lucide(rt, SHELF[si].icon, rf(sx0 + 10, sy + 7, sx0 + 28, sy + 25),
+                        on ? OC_COL_TEXT : OC_COL_MUTED);
+            draw_text(rt, SHELF[si].label, on ? g_ui_b : g_ui,
+                      rf(sx0 + 34, sy, sx1 - 40, sy + ROW_H), on ? OC_COL_TEXT : OC_COL_MUTED);
+            /* The count Slack shows: drafts waiting, and anything that FAILED to
+             * send, which is the one number worth interrupting somebody for. */
+            {
+                size_t nd = m->n_drafts, nf = oc_model_scheduled_failed(m);
+                if (nd || nf) {
+                    char badge[24];
+                    snprintf(badge, sizeof badge, "%s%zu", nf ? "\u26A0 " : "\u270E ", nd + nf);
+                    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
+                    draw_text(rt, badge, g_meta, rf(sx1 - 60, sy, sx1 - 8, sy + ROW_H),
+                              nf ? OC_COL_AWAY : OC_COL_MUTED);
+                    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+            }
+            g_shelf_rows[si].top = sy; g_shelf_rows[si].bot = sy + ROW_H;
+            g_shelf_rows[si].view = SHELF[si].view;
+            sy += ROW_H;
+        }
+        g_n_shelf = (int)(sizeof SHELF / sizeof SHELF[0]);
+        top = sy + 6;                      /* the conversation list starts below it */
+        fill(rt, rf(sx0 + 6, sy + 2, sx1 - 6, sy + 3), OC_COL_BORDER);
+    }
     float y = top - g_sb_scroll;
     g_n_rows = 0;
     g_sb_kebab = rf(0, 0, 0, 0);
@@ -6857,6 +6898,9 @@ static int sidebar_kind(void) {
     case VIEW_ACTIVITY: return SBK_ACTIVITY;
     case VIEW_FILES:    return SBK_FILES;
     case VIEW_LATER:    return SBK_LATER;
+    /* The channel list, because that is the column the shelf row lives in and
+     * you came from (REQ-228). */
+    case VIEW_DRAFTS:   return SBK_CHANNELS;
     default:            return SBK_NONE;
     }
 }
@@ -7068,6 +7112,18 @@ static const oc_channel *group_dm_with(const oc_model *m, const uint64_t *ids, i
 
 /* "15 mins" / "Yesterday" / "12 Jul" — a DM list is scanned, and an absolute
  * timestamp on every row makes it a table to read rather than a list to skim. */
+/* "Today" / "Yesterday" / a date — the grouping Slack's Sent list uses, and the
+ * only thing a list spanning days needs to say about when. */
+static void rel_day(uint64_t ms, char *out, size_t cap) {
+    time_t t = (time_t)(ms / 1000), now = time(NULL);
+    struct tm tv, nv;
+    if (!oc_localtime_r(&t, &tv) || !oc_localtime_r(&now, &nv)) { snprintf(out, cap, ""); return; }
+    int dt = tv.tm_yday, dn = nv.tm_yday;
+    if (tv.tm_year == nv.tm_year && dt == dn)      snprintf(out, cap, "Today");
+    else if (tv.tm_year == nv.tm_year && dt == dn - 1) snprintf(out, cap, "Yesterday");
+    else strftime(out, cap, "%d %B %Y", &tv);
+}
+
 static void rel_time(uint64_t ms, char *out, size_t cap) {
     out[0] = '\0';
     if (!ms) return;
@@ -7526,47 +7582,224 @@ static void draw_browse(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F bo
     ovl_end(rt, body);
 }
 
-/* Every conversation holding an unsent message (WIN-91, REQ-223). Slack's
- * "Drafts & sent" without the halves we do not have: there is no scheduled send
- * and no sent-items list, so this is the Drafts tab alone rather than an empty
- * tab bar over one populated pane. */
+/* Slack's empty states are art, a sentence and a way out. Ours are the sentence
+ * and the way out — a headline, a line of explanation and the button that
+ * starts the thing the pane is empty of. The illustration is the part we cannot
+ * match without shipping artwork, and a grey line of text where Slack has a
+ * pencil is a worse pane than one that at least tells you what goes here. */
+static void draw_empty_state(ID2D1RenderTarget *rt, D2D1_RECT_F body,
+                             const char *title, const char *sub, const char *cta,
+                             D2D1_RECT_F *out_btn) {
+    float cy = (body.top + body.bottom) / 2 - 40;
+    IDWriteTextFormat_SetTextAlignment(g_display, DWRITE_TEXT_ALIGNMENT_CENTER);
+    IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, title, g_display, rf(body.left, cy, body.right, cy + 28), OC_COL_TEXT);
+    draw_text(rt, sub, g_ui, rf(body.left + 60, cy + 34, body.right - 60, cy + 78), OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_display, DWRITE_TEXT_ALIGNMENT_LEADING);
+    if (cta && out_btn) {
+        float w = text_width(cta, g_ui) + 44;
+        D2D1_RECT_F b = rf((body.left + body.right) / 2 - w / 2, cy + 92,
+                           (body.left + body.right) / 2 + w / 2, cy + 128);
+        fill_round(rt, b, 6.0f, OC_COL_ACCENT);
+        draw_text(rt, cta, g_ui, rf(b.left, b.top + 8, b.right, b.bottom), 0xFFFFFF);
+        *out_btn = b;
+    }
+    IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+}
+
+/* One row of any of the three lists: an icon, where it is going or went, the
+ * time on the right, and the first line of what it says. Slack's Sent rows and
+ * ours are the same shape because the question is the same one. */
+static void draw_msgish_row(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F row,
+                            uint64_t channel_id, const char *body, const char *when,
+                            int icon, uint32_t icon_col, const char *note) {
+    draw_lucide(rt, icon, rf(row.left + 12, row.top + 8, row.left + 32, row.top + 28), icon_col);
+    const oc_channel *ch = oc_model_channel((oc_model *)m, channel_id);
+    char where[128];
+    if (ch && ch->kind == OC_CHANNEL_KIND_DM) {
+        const char *pn = oc_model_user_name((oc_model *)m, ch->peer_id);
+        snprintf(where, sizeof where, "@%s", (pn && pn[0]) ? pn : "dm");
+    } else {
+        snprintf(where, sizeof where, "#%s", (ch && ch->name[0]) ? ch->name : "channel");
+    }
+    draw_text(rt, where, g_ui_b, rf(row.left + 42, row.top + 6, row.right - 90, row.top + 26),
+              OC_COL_TEXT);
+    if (when && when[0]) {
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        draw_text(rt, when, g_meta, rf(row.right - 86, row.top + 6, row.right - 10, row.top + 26),
+                  OC_COL_FAINT);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+    }
+    draw_text(rt, body ? body : "", g_meta,
+              rf(row.left + 42, row.top + 26, row.right - 10, row.top + 46),
+              note ? OC_COL_AWAY : OC_COL_MUTED);
+    if (note && note[0])
+        draw_text(rt, note, g_meta, rf(row.left + 42, row.top + 42, row.right - 10, row.top + 58),
+                  OC_COL_AWAY);
+}
+
+/* Drafts, scheduled & sent (REQ-228) — Slack's three tabs, in the pane its
+ * sidebar row opens. Reached from the Home sidebar, never from the rail. */
+static D2D1_RECT_F g_dtab_hit[DTAB_COUNT];
+static D2D1_RECT_F g_dnew_btn;
+
 static void draw_drafts(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
-    D2D1_RECT_F body = view_header(rt, reg, "Drafts",
-                                   "Messages you started. Only you can see these.");
+    D2D1_RECT_F body = view_header(rt, reg, "Drafts, scheduled & sent",
+                                   "Everything you have written but not said.");
     g_n_listrows = 0;
-    if (m->n_drafts == 0) {
-        overlay_empty(rt, body, "No drafts. Start typing anywhere and it will wait here.");
+    g_dnew_btn = rf(0, 0, 0, 0);
+    /* The tab bar, drawn like the channel tabs so the two read as the same
+     * control doing the same job in a different pane. */
+    {
+        static const char *NAMES[DTAB_COUNT] = { "Drafts", "Scheduled", "Sent" };
+        float tx = body.left + 24, ty = body.top;
+        for (int i = 0; i < DTAB_COUNT; i++) {
+            char label[48];
+            if (i == DTAB_DRAFTS && m->n_drafts)
+                snprintf(label, sizeof label, "%s %zu", NAMES[i], m->n_drafts);
+            else if (i == DTAB_SCHEDULED && m->n_scheds)
+                snprintf(label, sizeof label, "%s %zu", NAMES[i], m->n_scheds);
+            else snprintf(label, sizeof label, "%s", NAMES[i]);
+            float w = text_width(label, g_ui_b) + 28;
+            D2D1_RECT_F t = rf(tx, ty, tx + w, ty + 34);
+            draw_text(rt, label, g_dtab == i ? g_ui_b : g_ui,
+                      rf(t.left + 14, t.top + 7, t.right, t.bottom),
+                      g_dtab == i ? OC_COL_TEXT : OC_COL_MUTED);
+            if (g_dtab == i) fill(rt, rf(t.left + 10, t.bottom - 2, t.right - 4, t.bottom),
+                                  OC_COL_ACCENT);
+            g_dtab_hit[i] = t;
+            tx += w;
+        }
+        fill(rt, rf(body.left, ty + 34, body.right, ty + 35), OC_COL_BORDER);
+        body.top = ty + 44;
+    }
+
+    float rowh = 62.0f;
+    if (g_dtab == DTAB_DRAFTS) {
+        if (m->n_drafts == 0) {
+            draw_empty_state(rt, body, "Draft messages to send when you\u2019re ready",
+                             "Start typing a message anywhere, then find it here. "
+                             "Re-read, revise, and send whenever you\u2019d like.",
+                             "New Message", &g_dnew_btn);
+            return;
+        }
+        ovl_use(OVL_LATER);
+        float y = ovl_begin(rt, body, (float)m->n_drafts * rowh + 16);
+        for (size_t i = 0; i < m->n_drafts; i++) {
+            const oc_draft_view *dv = &m->drafts[i];
+            if (y + rowh < body.top) { y += rowh; continue; }
+            if (y > body.bottom) break;
+            D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + rowh - 6);
+            if (g_listrow_hover == dv->channel_id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
+            draw_msgish_row(rt, m, row, dv->channel_id, dv->body, NULL,
+                            OC_ICON_SQUARE_PEN, OC_COL_MUTED, NULL);
+            if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
+                g_listrows[g_n_listrows].row = row;
+                g_listrows[g_n_listrows].act = rf(0, 0, 0, 0);
+                g_listrows[g_n_listrows].mid = 0;
+                g_listrows[g_n_listrows].cid = dv->channel_id;
+                g_n_listrows++;
+            }
+            y += rowh;
+        }
+        ovl_end(rt, body);
         return;
     }
-    float rowh = 56.0f;
-    ovl_use(OVL_LATER);          /* the shared overlay scroll, like every list pane */
-    float y = ovl_begin(rt, body, (float)m->n_drafts * rowh + 16);
-    for (size_t i = 0; i < m->n_drafts; i++) {
-        const oc_draft_view *dv = &m->drafts[i];
-        if (y + rowh < body.top) { y += rowh; continue; }
-        if (y > body.bottom) break;
-        D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + 52);
-        if (g_listrow_hover == dv->channel_id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
-        draw_lucide(rt, OC_ICON_SQUARE_PEN, rf(row.left + 12, y + 8, row.left + 32, y + 28),
-                    OC_COL_MUTED);
-        const oc_channel *ch = oc_model_channel((oc_model *)m, dv->channel_id);
-        char where[128];
-        if (ch && ch->kind == OC_CHANNEL_KIND_DM) {
-            const char *pn = oc_model_user_name((oc_model *)m, ch->peer_id);
-            snprintf(where, sizeof where, "@%s", (pn && pn[0]) ? pn : "dm");
-        } else {
-            snprintf(where, sizeof where, "#%s", (ch && ch->name[0]) ? ch->name : "channel");
+
+    if (g_dtab == DTAB_SCHEDULED) {
+        if (m->n_scheds == 0) {
+            draw_empty_state(rt, body, "Write now, send later",
+                             "Schedule messages to be sent at a later time, or another "
+                             "day altogether. They\u2019ll wait here until they\u2019re delivered.",
+                             "New Message", &g_dnew_btn);
+            return;
         }
-        draw_text(rt, where, g_ui_b, rf(row.left + 42, y + 6, row.right - 12, y + 26), OC_COL_TEXT);
-        draw_text(rt, dv->body ? dv->body : "", g_meta,
-                  rf(row.left + 42, y + 26, row.right - 12, y + 46), OC_COL_MUTED);
-        /* Clicking one opens the conversation it belongs to — a draft is a place
-         * you were, and the only useful thing to do with it is go back. */
+        ovl_use(OVL_LATER);
+        float y = ovl_begin(rt, body, (float)m->n_scheds * rowh + 16);
+        for (size_t i = 0; i < m->n_scheds; i++) {
+            const oc_sched_view *sv = &m->scheds[i];
+            if (y + rowh < body.top) { y += rowh; continue; }
+            if (y > body.bottom) break;
+            D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + rowh - 6);
+            if (g_listrow_hover == sv->id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
+            char when[48] = "";
+            {   /* When it goes — or went wrong. */
+                time_t t = (time_t)(sv->send_at_ms / 1000);
+                struct tm tv;
+                if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%d %b %H:%M", &tv);
+            }
+            draw_msgish_row(rt, m, row, sv->channel_id, sv->body, when,
+                            sv->state == OC_SCHED_FAILED ? OC_ICON_BELL : OC_ICON_SEND,
+                            sv->state == OC_SCHED_FAILED ? OC_COL_AWAY : OC_COL_MUTED,
+                            sv->state == OC_SCHED_FAILED ? sv->fail : NULL);
+            if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
+                g_listrows[g_n_listrows].row = row;
+                g_listrows[g_n_listrows].act = rf(row.right - 90, row.top + 8,
+                                                  row.right - 12, row.top + 32);
+                g_listrows[g_n_listrows].mid = sv->id;      /* cancel target */
+                g_listrows[g_n_listrows].cid = sv->channel_id;
+                g_n_listrows++;
+            }
+            /* Cancel, on the row rather than behind a menu: a message about to
+             * be sent by a clock is the one you most need to be able to stop. */
+            {
+                D2D1_RECT_F cx = rf(row.right - 90, row.top + 8, row.right - 12, row.top + 32);
+                stroke_round(rt, cx, 5.0f, OC_COL_BORDER, 1.0f);
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+                draw_text(rt, "Cancel", g_meta, rf(cx.left, cx.top + 4, cx.right, cx.bottom),
+                          OC_COL_MUTED);
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+            }
+            y += rowh;
+        }
+        ovl_end(rt, body);
+        return;
+    }
+
+    /* SENT. No new server work: REQ-104's search already answers "everything I
+     * sent" as a filters-only query, access-scoped, newest first and paged
+     * (REQ-228). The results land in the ordinary search model. */
+    /* `search_open` is the model's "a query is in flight or its results are
+     * showing"; the Sent tab issues one when it opens (see the click handler),
+     * so an empty list with the flag down means there is genuinely nothing. */
+    if (!m->search_open && m->n_search == 0) {
+        draw_empty_state(rt, body, "Nothing sent yet",
+                         "Messages you send will be listed here, newest first.", NULL, NULL);
+        return;
+    }
+    if (m->n_search == 0) { overlay_empty(rt, body, "Loading\u2026"); return; }
+    ovl_use(OVL_LATER);
+    float y = ovl_begin(rt, body, (float)m->n_search * rowh + 16);
+    uint64_t last_day = 0;
+    for (size_t i = 0; i < m->n_search; i++) {
+        const oc_search_result *sr = &m->search_results[i];
+        if (y > body.bottom) break;
+        /* Grouped by day, as Slack groups them: "Today", "Yesterday", a date. */
+        uint64_t day = sr->server_time / 86400000ULL;
+        if (day != last_day) {
+            char hdr[48]; rel_day(sr->server_time, hdr, sizeof hdr);
+            if (y + 26 >= body.top)
+                draw_text(rt, hdr, g_ui_b, rf(body.left + 16, y, body.right - 12, y + 24),
+                          OC_COL_MUTED);
+            y += 28; last_day = day;
+        }
+        if (y + rowh < body.top) { y += rowh; continue; }
+        D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + rowh - 6);
+        if (g_listrow_hover == sr->message_id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
+        char when[24] = "";
+        {
+            time_t t = (time_t)(sr->server_time / 1000);
+            struct tm tv;
+            if (oc_localtime_r(&t, &tv))
+                strftime(when, sizeof when, g_pref_time24 ? "%H:%M" : "%I:%M %p", &tv);
+        }
+        draw_msgish_row(rt, m, row, sr->channel_id, sr->snippet, when,
+                        OC_ICON_SEND, OC_COL_MUTED, NULL);
         if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
             g_listrows[g_n_listrows].row = row;
             g_listrows[g_n_listrows].act = rf(0, 0, 0, 0);
-            g_listrows[g_n_listrows].mid = 0;          /* a draft has no message id */
-            g_listrows[g_n_listrows].cid = dv->channel_id;
+            g_listrows[g_n_listrows].mid = sr->message_id;
+            g_listrows[g_n_listrows].cid = sr->channel_id;
             g_n_listrows++;
         }
         y += rowh;
@@ -7742,7 +7975,14 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
                 draw_later_sidebar(rt, m, H);
                 draw_later(rt, m, rf(RAIL_W + SIDEBAR_W, 0, W, H));
                 break;
-            case VIEW_DRAFTS:        draw_drafts(rt, m, reg); break;
+            case VIEW_DRAFTS:
+                /* The Home sidebar STAYS (REQ-228): this pane is reached from a
+                 * row in it, that row is highlighted while you are here, and
+                 * Slack keeps the conversation list beside it throughout. Same
+                 * shape as Files and Later — sidebar plus a narrowed region. */
+                draw_sidebar(rt, m, H);
+                draw_drafts(rt, m, rf(RAIL_W + SIDEBAR_W, 0, W, H));
+                break;
             case VIEW_ADMIN:         draw_admin(rt, m, reg); break;
             default:                 draw_stub_view(rt, reg, "OpenChime", ""); break;
         }
@@ -10363,6 +10603,40 @@ static int on_click(HWND hwnd, int x, int y) {
         if (!in_rect(g_pal_panel, x, y)) palette_close(hwnd);
         return 1;
     }
+    /* The Drafts pane's tabs, its Cancel buttons and its empty-state button. */
+    if (g_view == VIEW_DRAFTS) {
+        for (int i = 0; i < DTAB_COUNT; i++)
+            if (in_rect(g_dtab_hit[i], x, y)) {
+                g_dtab = i;
+                g_ovl_scroll = 0;      /* a new tab starts at its top */
+                /* Sent is a SEARCH (REQ-228): "from:<me>", filters only, which
+                 * the daemon already answers newest-first and access-scoped —
+                 * no new op, and the results land in the ordinary search model. */
+                if (i == DTAB_SENT && g_client) {
+                    const oc_model *sm = model();
+                    const char *me = sm ? oc_model_user_name((oc_model *)sm, sm->user_id) : NULL;
+                    if (me && me[0]) {
+                        char q[96];
+                        snprintf(q, sizeof q, "from:%s", me);
+                        oc_client_search(g_client, q);
+                    }
+                }
+                return 1;
+            }
+        if (in_rect(g_dnew_btn, x, y)) { g_view = VIEW_DMS; g_dm_compose = 1;
+                                         layout_composer(hwnd); return 1; }
+        for (int i = 0; i < g_n_listrows; i++) {
+            if (g_dtab == DTAB_SCHEDULED && in_rect(g_listrows[i].act, x, y)) {
+                oc_client_cancel_scheduled(g_client, g_listrows[i].mid);
+                return 1;
+            }
+            if (in_rect(g_listrows[i].row, x, y) && g_listrows[i].cid) {
+                select_channel(g_listrows[i].cid);
+                g_view = VIEW_HOME;
+                return 1;
+            }
+        }
+    }
     if (g_pick_open) {
         if (in_rect(g_pick_panel, x, y)) {
             for (int i = 0; i < g_n_pick_cells; i++)
@@ -10982,6 +11256,21 @@ static int on_click(HWND hwnd, int x, int y) {
         return 1;
     }
     if (in_rect(g_attach_btn, x, y)) { upload_file(hwnd); return 1; }
+    /* The Home sidebar's destinations shelf (REQ-228) — before the conversation
+     * rows below it, which start where the shelf ends. */
+    if (transcript_shell() && sidebar_kind() == SBK_CHANNELS &&
+        x >= RAIL_W && x < RAIL_W + SIDEBAR_W) {
+        for (int i = 0; i < g_n_shelf; i++)
+            if (y >= g_shelf_rows[i].top && y < g_shelf_rows[i].bot) {
+                g_view = g_shelf_rows[i].view;
+                if (g_view == VIEW_DRAFTS && g_client) {
+                    oc_client_list_drafts(g_client);
+                    oc_client_list_scheduled(g_client);
+                }
+                layout_composer(hwnd);
+                return 1;
+            }
+    }
     if (in_rect(g_emoji_btn, x, y))  { picker_open(hwnd, 0); return 1; }
     /* The formatting toolbar (WIN-96). Focus first: the button acts on the
      * field's selection, and clicking chrome must not be what takes the caret
@@ -13035,7 +13324,9 @@ static void test_dump(const char *path) {
      * its destination, and whether THIS conversation has one — the three things
      * a test would otherwise have to infer from pixels. */
     {
-        int rail = g_rail_drafts;
+        int rail = 0;
+        for (int i = 0; i < g_n_shelf; i++)
+            if (g_shelf_rows[i].view == VIEW_DRAFTS) rail = 1;   /* the SHELF row now */
         /* Distinct key names on purpose: the harness reads `key=value` from
          * anywhere in the dump, so a generic `n=` would have matched msgrows'
          * first — which it did, reporting a draft count of 0 in the same frame
@@ -13044,6 +13335,18 @@ static void test_dump(const char *path) {
                 m ? m->n_drafts : (size_t)0, rail,
                 (m && g_sel) ? oc_model_has_draft(m, g_sel) : 0);
     }
+    /* The Drafts pane's tabs and its shelf row, so a test can click them
+     * without measuring a screenshot — pixels in a shot are DEVICE pixels and
+     * these are DIPs, which is exactly the confusion that wasted two clicks. */
+    fprintf(f, "dtab=%d", g_dtab);
+    for (int i = 0; i < DTAB_COUNT; i++)
+        fprintf(f, " %.0f,%.0f,%.0f,%.0f", g_dtab_hit[i].left, g_dtab_hit[i].top,
+                g_dtab_hit[i].right, g_dtab_hit[i].bottom);
+    fprintf(f, "\n");
+    fprintf(f, "shelf n=%d", g_n_shelf);
+    for (int i = 0; i < g_n_shelf; i++)
+        fprintf(f, " %d:%.0f-%.0f", g_shelf_rows[i].view, g_shelf_rows[i].top, g_shelf_rows[i].bot);
+    fprintf(f, "\n");
     fprintf(f, "fmtbar hover=%d", g_fmt_hover);
     for (int i = 0; i < FMT_COUNT; i++)
         fprintf(f, " %.0f,%.0f,%.0f,%.0f", g_fmt_btn[i].left, g_fmt_btn[i].top,
@@ -14247,6 +14550,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (mx != g_mouse_x || g_mouse_y != my) {
             g_mouse_x = mx; g_mouse_y = my;
             if (modal_open()) InvalidateRect(hwnd, NULL, FALSE);   /* frame hovers */
+        }
+        {   /* Shelf hover (REQ-228). */
+            int sh = -1;
+            if ((float)mx >= RAIL_W && (float)mx < RAIL_W + SIDEBAR_W)
+                for (int i = 0; i < g_n_shelf; i++)
+                    if ((float)my >= g_shelf_rows[i].top && (float)my < g_shelf_rows[i].bot) sh = i;
+            if (sh != g_shelf_hover) { g_shelf_hover = sh; InvalidateRect(hwnd, NULL, FALSE); }
         }
         {   /* Formatting-toolbar hover (WIN-96). Cheap enough to ask every move,
              * and it keeps the seven buttons out of the hover state machine

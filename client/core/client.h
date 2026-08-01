@@ -183,6 +183,13 @@ void oc_client_set_setting(oc_client *c, const char *key, const char *value);
 void oc_client_set_draft(oc_client *c, uint64_t channel_id, uint64_t thread_root,
                          const char *body);
 void oc_client_list_drafts(oc_client *c);
+/* Scheduled messages (REQ-224, ARCH-102). `send_at_ms` is absolute. */
+void oc_client_schedule(oc_client *c, uint64_t channel_id, uint64_t thread_root,
+                        uint64_t send_at_ms, const char *body);
+void oc_client_list_scheduled(oc_client *c);
+void oc_client_cancel_scheduled(oc_client *c, uint64_t id);
+void oc_client_update_scheduled(oc_client *c, uint64_t id, uint64_t send_at_ms,
+                                const char *body);
 void oc_client_list_settings(oc_client *c);
 
 /* Storage usage report (REQ-214; owner/admin only — the daemon refuses it for a

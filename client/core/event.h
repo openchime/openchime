@@ -109,6 +109,11 @@ enum {
      * LIST and lets the model drop anything the server did not mention. */
     OC_EV_DRAFT,
     OC_EV_DRAFTS_END,
+    /* One scheduled message — a list entry AND the push, folded identically:
+     * message_id = its id, channel_id, server_time = send_at_ms, op = state,
+     * body, author_name = the failure reason when there is one. */
+    OC_EV_SCHEDULED,
+    OC_EV_SCHEDULED_END,
     OC_EV_ACTIVITY,        /* one activity item: status=kind, user_id=actor (REQ-139) */
     OC_EV_ACTIVITY_END,    /* the feed is complete: count + pinned_at = seen watermark */
     OC_EV_DISCONNECTED,    /* connection dropped/closed */
@@ -197,6 +202,13 @@ enum {
      * is the same command rather than a second one. */
     OC_CMD_SET_DRAFT,
     OC_CMD_LIST_DRAFTS,
+    /* Scheduled messages (REQ-224). SCHEDULE: channel_id + message_id as the
+     * thread root + server_time as the send time + body. CANCEL/UPDATE use
+     * message_id as the scheduled row's id. */
+    OC_CMD_SCHEDULE,
+    OC_CMD_LIST_SCHEDULED,
+    OC_CMD_CANCEL_SCHEDULED,
+    OC_CMD_UPDATE_SCHEDULED,
     OC_CMD_SET_DISPLAY_NAME, /* change your own display name: body=name */
     OC_CMD_CHANGE_PASSWORD, /* change your own password: body=old, body2=new */
     OC_CMD_MARK_READ,       /* CLIENT_ACK: read `channel_id` up to `message_id` (drives seen-by) */
@@ -246,6 +258,7 @@ typedef struct {
     uint64_t channel_id;
     uint64_t message_id;   /* REACT */
     uint8_t  op;           /* REACT: add/remove */
+    uint64_t server_time;  /* SCHEDULE: when to send (ms) */
     char    *body;         /* heap; SEND body / REACT emoji / SET_SETTING key */
     char    *body2;        /* heap; SET_SETTING value, else NULL */
     /* OPEN_GROUP_DM (REQ-056): the other participants. Inline, because the wire

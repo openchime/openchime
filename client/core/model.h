@@ -190,6 +190,18 @@ typedef struct {
     uint32_t gen;
 } oc_draft_view;
 
+/* One scheduled message (REQ-224). `state` is OC_SCHED_*; a FAILED one keeps its
+ * reason, because that is the whole of what its author needs to see. */
+typedef struct {
+    uint64_t id;
+    uint64_t channel_id;
+    uint64_t send_at_ms;
+    uint8_t  state;
+    char    *body;        /* heap */
+    char     fail[96];
+    uint32_t gen;
+} oc_sched_view;
+
 /* One activity item (REQ-139): `text` is the message for a mention or reply and
  * the emoji for a reaction. */
 typedef struct {
@@ -280,6 +292,9 @@ typedef struct {
     oc_draft_view *drafts;
     size_t    n_drafts, cap_drafts;
     uint32_t  draft_gen;
+    oc_sched_view *scheds;
+    size_t    n_scheds, cap_scheds;
+    uint32_t  sched_gen;
     uint8_t   activity_open, activity_loading;
     oc_activity_view *activity;
     size_t    n_activity, cap_activity;
@@ -571,6 +586,10 @@ void        oc_model_drafts_begin(oc_model *m);
  * drafts would be invisible to our own sidebar until the next connect. */
 void        oc_model_draft_local(oc_model *m, uint64_t channel_id,
                                  uint64_t thread_root, const char *body);
+/* How many scheduled messages are waiting, and how many failed — the pane's two
+ * counts, and the only reason the sidebar row needs to know about them. */
+size_t      oc_model_scheduled_pending(const oc_model *m);
+size_t      oc_model_scheduled_failed(const oc_model *m);
 
 /* Seen-by (REQ-090): fill `out` with up to `cap` user ids who have read
  * `channel_id` up to at least `message_id`, excluding `exclude` (typically self).
