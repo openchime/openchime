@@ -52,7 +52,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 30);
+    CHECK(oc_schema_version(db) == 32);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -1554,6 +1554,120 @@ static void test_drafts(void) {
         CHECK(r && r->n_drafts == 1 && strlen(r->drafts[0].body) == OC_DRAFT_BODY_MAX);
         oc_dbres_free(r);
     }
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* --- Scheduled messages (REQ-224, ARCH-102) ------------------------------ */
+
+static oc_dbres *sched_new(oc_dbwriter *w, uint64_t uid, uint64_t cid,
+                           uint64_t at, const char *body) {
+    oc_job *j = oc_job_new(OC_JOB_SCHEDULE, 910);
+    j->user_id = uid; j->channel_id = cid; j->sched_at_ms = at;
+    if (body && *body) oc_job_set_body(j, body, strlen(body));
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static oc_dbres *sched_list(oc_dbwriter *w, uint64_t uid) {
+    oc_job *j = oc_job_new(OC_JOB_LIST_SCHEDULED, 911);
+    j->user_id = uid;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+static oc_dbres *sched_fire(oc_dbwriter *w) {
+    oc_job *j = oc_job_new(OC_JOB_FIRE_SCHEDULED, 0);
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_scheduled(void) {
+    const char *path = "build/test_dbwriter_sched.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    /* Scheduled far ahead: listed, and NOT delivered by a sweep. */
+    oc_dbres *r = sched_new(w, alice, OC_DEFAULT_CHANNEL,
+                            (uint64_t)time(NULL) * 1000 + 3600000, "later today");
+    CHECK(r && r->type == OC_RES_SCHEDULED && r->sched.id != 0);
+    CHECK(r->sched.state == OC_SCHED_PENDING);
+    uint64_t sid = r->sched.id;
+    oc_dbres_free(r);
+
+    r = sched_list(w, alice);
+    CHECK(r && r->type == OC_RES_SCHEDULED_LIST && r->n_scheds == 1);
+    CHECK(r->scheds[0].id == sid);
+    CHECK(r->scheds[0].body && strcmp(r->scheds[0].body, "later today") == 0);
+    oc_dbres_free(r);
+    r = sched_list(w, bob); CHECK(r && r->n_scheds == 0); oc_dbres_free(r);   /* private */
+
+    r = sched_fire(w);
+    CHECK(r && r->type == OC_RES_SCHED_FIRED);   /* nothing due yet */
+    oc_dbres_free(r);
+    r = sched_list(w, alice); CHECK(r && r->n_scheds == 1); oc_dbres_free(r);
+
+    /* An empty body is refused rather than stored: a row that fires into
+     * nothing at 09:00 is worse than a refusal now. */
+    r = sched_new(w, alice, OC_DEFAULT_CHANNEL, 1, "");
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_INVALID_MESSAGE);
+    oc_dbres_free(r);
+    /* And a channel you are not in is refused, like every other write. */
+    r = sched_new(w, alice, 999999, 1, "nope");
+    CHECK(r && r->type == OC_RES_LIST_ERR && r->err_code == OC_ERR_NOT_A_MEMBER);
+    oc_dbres_free(r);
+
+    /* Cancel takes it out of the list. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_CANCEL_SCHEDULED, 912);
+        j->user_id = alice; j->message_id = sid;
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_SCHEDULED && r->sched.state == OC_SCHED_GONE);
+        oc_dbres_free(r);
+    }
+    r = sched_list(w, alice); CHECK(r && r->n_scheds == 0); oc_dbres_free(r);
+
+    /* Due in the past: the sweep delivers it through the ORDINARY send path, so
+     * the result that comes back is a SEND_OK — the netloop broadcasts it
+     * without knowing it was scheduled (ARCH-102). */
+    r = sched_new(w, alice, OC_DEFAULT_CHANNEL, 1, "sent by the clock");
+    CHECK(r && r->type == OC_RES_SCHEDULED);
+    uint64_t due = r->sched.id;
+    oc_dbres_free(r);
+    r = sched_fire(w);
+    CHECK(r && r->type == OC_RES_SEND_OK && r->message_id != 0);
+    CHECK(r->body_len == 17 && memcmp(r->body, "sent by the clock", 17) == 0);
+    oc_dbres_free(r);
+    /* Delivered ones leave the list: they are messages now. */
+    r = sched_list(w, alice); CHECK(r && r->n_scheds == 0); oc_dbres_free(r);
+    /* And firing again does nothing — the row is no longer pending, which is
+     * also what stops a double post if the sweep runs twice. */
+    r = sched_fire(w); CHECK(r && r->type == OC_RES_SCHED_FIRED); oc_dbres_free(r);
+    (void)due;
+
+    /* An archived channel cannot take it: FAILED with a reason the author sees,
+     * rather than posting into a read-only channel or discarding in silence. */
+    r = sched_new(w, alice, OC_DEFAULT_CHANNEL, 1, "into an archive");
+    CHECK(r && r->type == OC_RES_SCHEDULED);
+    oc_dbres_free(r);
+    {
+        oc_job *j = oc_job_new(OC_JOB_UPDATE_CHANNEL, 913);
+        j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL;
+        j->chup_op = OC_CHUP_ARCHIVE;
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
+    r = sched_fire(w);
+    CHECK(r && r->type == OC_RES_SCHED_FIRED);      /* not delivered */
+    oc_dbres_free(r);
+    r = sched_list(w, alice);
+    CHECK(r && r->n_scheds == 1 && r->scheds[0].state == OC_SCHED_FAILED);
+    CHECK(r->scheds[0].fail_reason && strstr(r->scheds[0].fail_reason, "archived") != NULL);
+    oc_dbres_free(r);
 
     oc_dbwriter_stop(w);
     cleanup_db(path);
@@ -3997,6 +4111,7 @@ int run_dbwriter_tests(void) {
     test_pins();
     test_channel_details();
     test_drafts();
+    test_scheduled();
     test_channel_mutability();
     test_saved_and_activity();
     test_history_around();

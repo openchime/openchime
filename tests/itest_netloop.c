@@ -101,6 +101,17 @@ static int client_open(client *c, int port, const uint8_t *pin) {
         usleep(20000);
     }
     if (c->fd < 0) return -1;
+    /* A READ DEADLINE, so a missing frame fails this suite instead of hanging
+     * it. Learned the hard way: a schema change broke an upsert on the daemon
+     * side, the reply never came, and a blocking read turned a one-line bug
+     * into a twenty-minute hang with no output — the least useful failure mode
+     * a test can have. 20 s is far longer than any legitimate wait here (the
+     * slowest case is the concurrent-load client's TLS handshake) and far
+     * shorter than a person's patience. */
+    {
+        struct timeval tv = { 20, 0 };
+        setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    }
     /* Concurrent TLS setup across threads (test_concurrent_load opens 8 clients
      * at once) is safe: the vendored mbedTLS is built with MBEDTLS_THREADING. */
     if (oc_tls_client_init(&c->cli, pin) != 0) return -1;
@@ -816,7 +827,7 @@ static void test_drafts_vertical(int port, const uint8_t *pin) {
     /* Device A writes a draft; device B is told, and A is NOT — echoing it back
      * to the writer is how a client overwrites the composer being typed in. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_set_draft sd = { 1, 0, oc_slice_str("half a thought") };
+    oc_set_draft sd = { 1, 0, oc_slice_str(""), oc_slice_str("half a thought") };
     CHECK(oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK);
     CHECK(send_frame(&a, buf, w.len) == 0);
 
@@ -837,7 +848,7 @@ static void test_drafts_vertical(int port, const uint8_t *pin) {
 
     /* Deleting arrives as the same frame with an empty body. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_set_draft del = { 1, 0, oc_slice_str("") };
+    oc_set_draft del = { 1, 0, oc_slice_str(""), oc_slice_str("") };
     CHECK(oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &del) == OC_OK);
     CHECK(send_frame(&a, buf, w.len) == 0);
     CHECK(read_frame_raw(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_DRAFT);
@@ -846,7 +857,7 @@ static void test_drafts_vertical(int port, const uint8_t *pin) {
     /* And SENDING clears it server-side: write one, send a message, and the
      * list comes back empty without anyone asking it to. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_set_draft again = { 1, 0, oc_slice_str("about to send") };
+    oc_set_draft again = { 1, 0, oc_slice_str(""), oc_slice_str("about to send") };
     CHECK(oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &again) == OC_OK);
     CHECK(send_frame(&a, buf, w.len) == 0);
     CHECK(read_frame_raw(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_DRAFT);

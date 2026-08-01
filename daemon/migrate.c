@@ -594,6 +594,63 @@ static const char MIGRATION_0030[] =
     "  PRIMARY KEY (user_id, channel_id, thread_root)"
     ");";
 
+/* 0031: a draft may be UNADDRESSED (REQ-229, ARCH-101 as amended). Slack's New
+ * Message pane autosaves before a recipient is chosen, and the original key
+ * cannot express that.
+ *
+ * SQLite cannot drop a NOT NULL or change a primary key in place, so the table
+ * is rebuilt — which is also the only way to keep the ADDRESSED case exactly as
+ * it was: a surrogate id, plus a UNIQUE INDEX on (user_id, channel_id,
+ * thread_root) that only applies WHERE channel_id IS NOT NULL. Addressed drafts
+ * keep their one-per-conversation guarantee; unaddressed ones are free rows,
+ * because "one unaddressed draft per user" is a rule nobody asked for. */
+static const char MIGRATION_0031[] =
+    "CREATE TABLE drafts_new ("
+    "  id          INTEGER PRIMARY KEY,"
+    "  user_id     INTEGER NOT NULL REFERENCES users(id),"
+    "  channel_id  INTEGER REFERENCES channels(id),"   /* NULL = not addressed yet */
+    "  thread_root INTEGER NOT NULL DEFAULT 0,"
+    "  recipients  TEXT    NOT NULL DEFAULT '',"       /* comma-separated user ids */
+    "  body        TEXT    NOT NULL,"
+    "  updated_ms  INTEGER NOT NULL"
+    ");"
+    "INSERT INTO drafts_new (user_id, channel_id, thread_root, body, updated_ms) "
+    "  SELECT user_id, channel_id, thread_root, body, updated_ms FROM drafts;"
+    "DROP TABLE drafts;"
+    "ALTER TABLE drafts_new RENAME TO drafts;"
+    "CREATE UNIQUE INDEX idx_drafts_conv ON drafts(user_id, channel_id, thread_root) "
+    "  WHERE channel_id IS NOT NULL;"
+    "CREATE INDEX idx_drafts_user ON drafts(user_id, updated_ms DESC);";
+
+/* 0032: scheduled messages (REQ-224, ARCH-102). Its own table and NOT a flag on
+ * `messages`: a scheduled message is not a message yet — no id anyone can link
+ * to, invisible to every member but its author, and it may never exist at all —
+ * so a pending flag would make history, search, backfill, unread and mentions
+ * each responsible for excluding it, and the first query that forgot would leak
+ * an unsent message into somebody else's transcript.
+ *
+ * `state` carries the outcome rather than the row being deleted on failure: a
+ * message that was promised and could not be sent is exactly what its author
+ * needs to see (ARCH-102). */
+static const char MIGRATION_0032[] =
+    "CREATE TABLE scheduled_messages ("
+    "  id          INTEGER PRIMARY KEY,"
+    "  user_id     INTEGER NOT NULL REFERENCES users(id),"
+    "  channel_id  INTEGER REFERENCES channels(id),"   /* NULL until recipients resolve */
+    "  thread_root INTEGER NOT NULL DEFAULT 0,"
+    "  recipients  TEXT    NOT NULL DEFAULT '',"
+    "  body        TEXT    NOT NULL,"
+    "  send_at_ms  INTEGER NOT NULL,"
+    "  created_ms  INTEGER NOT NULL,"
+    "  state       TEXT    NOT NULL DEFAULT 'pending'"
+    "    CHECK (state IN ('pending','sent','failed')),"
+    "  fail_reason TEXT,"
+    "  message_id  INTEGER"                            /* what it became, once sent */
+    ");"
+    /* The sweep's query, and the only one that runs on a timer. */
+    "CREATE INDEX idx_sched_due ON scheduled_messages(send_at_ms) WHERE state='pending';"
+    "CREATE INDEX idx_sched_user ON scheduled_messages(user_id, send_at_ms);";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -625,6 +682,8 @@ const oc_migration OC_MIGRATIONS[] = {
     { 28, MIGRATION_0028 },
     { 29, MIGRATION_0029 },
     { 30, MIGRATION_0030 },
+    { 31, MIGRATION_0031 },
+    { 32, MIGRATION_0032 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

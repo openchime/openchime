@@ -905,6 +905,7 @@ oc_result oc_encode_set_draft(oc_wbuf *w, uint16_t version, const oc_set_draft *
     size_t off = oc_frame_begin(w, version, OC_MSG_SET_DRAFT);
     oc_w_u64(w, m->channel_id);
     oc_w_u64(w, m->thread_root);
+    oc_w_str(w, m->recipients);
     oc_w_str(w, m->body);
     return oc_frame_end(w, off);
 }
@@ -916,9 +917,11 @@ oc_result oc_encode_list_drafts(oc_wbuf *w, uint16_t version) {
 
 oc_result oc_encode_draft(oc_wbuf *w, uint16_t version, const oc_draft *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_DRAFT);
+    oc_w_u64(w, m->id);
     oc_w_u64(w, m->channel_id);
     oc_w_u64(w, m->thread_root);
     oc_w_u64(w, m->updated_ms);
+    oc_w_str(w, m->recipients);
     oc_w_str(w, m->body);
     return oc_frame_end(w, off);
 }
@@ -932,15 +935,104 @@ oc_result oc_encode_drafts(oc_wbuf *w, uint16_t version, const oc_drafts *m) {
 oc_result oc_decode_set_draft(oc_rbuf *p, oc_set_draft *m) {
     m->channel_id  = oc_r_u64(p);
     m->thread_root = oc_r_u64(p);
+    m->recipients  = oc_r_str(p);
     m->body        = oc_r_str(p);
     return r_done(p);
 }
 
 oc_result oc_decode_draft(oc_rbuf *p, oc_draft *m) {
+    m->id          = oc_r_u64(p);
     m->channel_id  = oc_r_u64(p);
     m->thread_root = oc_r_u64(p);
     m->updated_ms  = oc_r_u64(p);
+    m->recipients  = oc_r_str(p);
     m->body        = oc_r_str(p);
+    return r_done(p);
+}
+
+/* --- Scheduled messages (REQ-224, ARCH-102) ------------------------------ */
+
+oc_result oc_encode_schedule_message(oc_wbuf *w, uint16_t version, const oc_schedule_message *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SCHEDULE_MESSAGE);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->thread_root);
+    oc_w_u64(w, m->send_at_ms);
+    oc_w_str(w, m->body);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_list_scheduled(oc_wbuf *w, uint16_t version) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_SCHEDULED);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_cancel_scheduled(oc_wbuf *w, uint16_t version, const oc_cancel_scheduled *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_CANCEL_SCHEDULED);
+    oc_w_u64(w, m->id);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_update_scheduled(oc_wbuf *w, uint16_t version, const oc_update_scheduled *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_UPDATE_SCHEDULED);
+    oc_w_u64(w, m->id);
+    oc_w_u64(w, m->send_at_ms);
+    oc_w_str(w, m->body);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_scheduled(oc_wbuf *w, uint16_t version, const oc_scheduled *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SCHEDULED);
+    oc_w_u64(w, m->id);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->thread_root);
+    oc_w_u64(w, m->send_at_ms);
+    oc_w_u64(w, m->created_ms);
+    oc_w_u8 (w, m->state);
+    oc_w_str(w, m->fail_reason);
+    oc_w_str(w, m->body);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_scheduled_list(oc_wbuf *w, uint16_t version, const oc_scheduled_list *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SCHEDULED_LIST);
+    oc_w_u16(w, m->count);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_schedule_message(oc_rbuf *p, oc_schedule_message *m) {
+    m->channel_id  = oc_r_u64(p);
+    m->thread_root = oc_r_u64(p);
+    m->send_at_ms  = oc_r_u64(p);
+    m->body        = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_cancel_scheduled(oc_rbuf *p, oc_cancel_scheduled *m) {
+    m->id = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_update_scheduled(oc_rbuf *p, oc_update_scheduled *m) {
+    m->id         = oc_r_u64(p);
+    m->send_at_ms = oc_r_u64(p);
+    m->body       = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_scheduled(oc_rbuf *p, oc_scheduled *m) {
+    m->id          = oc_r_u64(p);
+    m->channel_id  = oc_r_u64(p);
+    m->thread_root = oc_r_u64(p);
+    m->send_at_ms  = oc_r_u64(p);
+    m->created_ms  = oc_r_u64(p);
+    m->state       = oc_r_u8(p);
+    m->fail_reason = oc_r_str(p);
+    m->body        = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_scheduled_list(oc_rbuf *p, oc_scheduled_list *m) {
+    m->count = oc_r_u16(p);
     return r_done(p);
 }
 

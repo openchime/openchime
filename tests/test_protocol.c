@@ -604,7 +604,7 @@ static void test_notify_frames(void) {
  * wire is worse than one refused. */
 static void test_draft_frames(void) {
     {
-        oc_set_draft in = { 7, 0, oc_slice_str("half a thought") };
+        oc_set_draft in = { 7, 0, oc_slice_str(""), oc_slice_str("half a thought") };
         ROUNDTRIP(oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_DRAFT, h, p);
         oc_set_draft out;
         CHECK(oc_decode_set_draft(&p, &out) == OC_OK);
@@ -612,14 +612,14 @@ static void test_draft_frames(void) {
         CHECK(out.body.len == 14 && memcmp(out.body.ptr, "half a thought", 14) == 0);
     }
     {   /* the delete form */
-        oc_set_draft in = { 7, 0, oc_slice_str("") };
+        oc_set_draft in = { 7, 0, oc_slice_str(""), oc_slice_str("") };
         ROUNDTRIP(oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_DRAFT, h, p);
         oc_set_draft out;
         CHECK(oc_decode_set_draft(&p, &out) == OC_OK);
         CHECK(out.channel_id == 7 && out.body.len == 0);
     }
     {   /* thread_root carried, though no client writes one yet (ARCH-101) */
-        oc_set_draft in = { 7, 4242, oc_slice_str("x") };
+        oc_set_draft in = { 7, 4242, oc_slice_str(""), oc_slice_str("x") };
         ROUNDTRIP(oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_DRAFT, h, p);
         oc_set_draft out;
         CHECK(oc_decode_set_draft(&p, &out) == OC_OK);
@@ -633,13 +633,22 @@ static void test_draft_frames(void) {
         static char big[OC_DRAFT_BODY_MAX];
         memset(big, 'x', sizeof big);
         oc_slice bs = { (const uint8_t *)big, sizeof big };
-        oc_draft in = { 9, 0, 1234567890123ULL, bs };
+        oc_draft in = { 5, 9, 0, 1234567890123ULL, oc_slice_str(""), bs };
         ROUNDTRIP(oc_encode_draft(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_DRAFT, h, p);
         oc_draft out;
         CHECK(oc_decode_draft(&p, &out) == OC_OK);
         CHECK(out.channel_id == 9 && out.updated_ms == 1234567890123ULL);
         CHECK(out.body.len == OC_DRAFT_BODY_MAX);
         CHECK(memcmp(out.body.ptr, big, OC_DRAFT_BODY_MAX) == 0);
+    }
+    {   /* UNADDRESSED (REQ-229): no channel, a recipient list instead, and an
+         * id that is the only thing telling two of them apart. */
+        oc_set_draft in = { 0, 0, oc_slice_str("2,3"), oc_slice_str("to nobody yet") };
+        ROUNDTRIP(oc_encode_set_draft(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_DRAFT, h, p);
+        oc_set_draft out;
+        CHECK(oc_decode_set_draft(&p, &out) == OC_OK);
+        CHECK(out.channel_id == 0);
+        CHECK(out.recipients.len == 3 && memcmp(out.recipients.ptr, "2,3", 3) == 0);
     }
     {
         oc_drafts in = { 3 };

@@ -131,6 +131,11 @@ typedef struct {
 /* Scratch for encoding one outgoing frame; net thread only, so a single static
  * buffer is safe and avoids per-send allocation (bodies can be ~64KB). */
 static uint8_t g_enc[OC_MAX_FRAME_SIZE];
+/* Scheduled-send sweep state (REQ-224, ARCH-102). `more` is set by the result
+ * path when a send arrives with no connection behind it — that is one the sweep
+ * fired, and there may be another right behind it. */
+static uint64_t g_last_sched_ms;
+static int      g_sched_more;
 static uint64_t g_next_conn_id = 1;
 
 /* Attachment blob store + the upload size cap (ARCH-70). Set once at the top of
@@ -1352,6 +1357,49 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SCHEDULE_MESSAGE) {
+            oc_schedule_message sm;
+            if (oc_decode_schedule_message(&p, &sm) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SCHEDULE, c->conn_id);
+            if (!j) return -1;
+            size_t bl = sm.body.len < OC_MAX_BODY_SIZE ? sm.body.len : OC_MAX_BODY_SIZE;
+            j->user_id = c->user_id; j->channel_id = sm.channel_id;
+            j->parent_id = sm.thread_root; j->sched_at_ms = sm.send_at_ms;
+            if (bl) { j->body = malloc(bl); if (!j->body) return -1;
+                      memcpy(j->body, sm.body.ptr, bl); }
+            j->body_len = bl;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_LIST_SCHEDULED) {
+            oc_job *j = oc_job_new(OC_JOB_LIST_SCHEDULED, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_CANCEL_SCHEDULED) {
+            oc_cancel_scheduled cs;
+            if (oc_decode_cancel_scheduled(&p, &cs) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_CANCEL_SCHEDULED, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->message_id = cs.id;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_UPDATE_SCHEDULED) {
+            oc_update_scheduled us;
+            if (oc_decode_update_scheduled(&p, &us) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_UPDATE_SCHEDULED, c->conn_id);
+            if (!j) return -1;
+            size_t bl = us.body.len < OC_MAX_BODY_SIZE ? us.body.len : OC_MAX_BODY_SIZE;
+            j->user_id = c->user_id; j->message_id = us.id; j->sched_at_ms = us.send_at_ms;
+            if (bl) { j->body = malloc(bl); if (!j->body) return -1;
+                      memcpy(j->body, us.body.ptr, bl); }
+            j->body_len = bl;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SET_DRAFT) {
             oc_set_draft sd;
             if (oc_decode_set_draft(&p, &sd) != OC_OK) return -1;
@@ -1825,6 +1873,10 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         break;
     }
     case OC_RES_SEND_OK: {
+        /* A send nobody asked for is one the scheduled sweep fired (ARCH-102):
+         * ask for the next straight away, so a backlog drains at queue speed
+         * instead of one per fifteen seconds. */
+        if (r->conn_id == 0) g_sched_more = 1;
         conn *sender = find_by_id(conns, r->conn_id);
         if (sender) {
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
@@ -2802,11 +2854,57 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         send_bytes(ep, conns, c->fd, g_enc, w.len);
         break;
     }
+    case OC_RES_SCHEDULED: {
+        /* To every connection of the author, INCLUDING the one that asked: this
+         * is an acknowledgement as much as a sync, and unlike a draft it cannot
+         * overwrite anything being typed. */
+        oc_scheduled sc = { r->sched.id, r->sched.channel_id, r->sched.thread_root,
+                            r->sched.send_at_ms, r->sched.created_ms, r->sched.state,
+                            oc_slice_str(r->sched.fail_reason ? r->sched.fail_reason : ""),
+                            oc_slice_str(r->sched.body ? r->sched.body : "") };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_scheduled(&w, OC_PROTOCOL_VERSION, &sc);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id == r->user_id)
+                send_bytes(ep, conns, fd, g_enc, len);
+        }
+        break;
+    }
+    case OC_RES_SCHEDULED_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        for (size_t i = 0; i < r->n_scheds && conns[c->fd]; i++) {
+            oc_scheduled sc = { r->scheds[i].id, r->scheds[i].channel_id,
+                                r->scheds[i].thread_root, r->scheds[i].send_at_ms,
+                                r->scheds[i].created_ms, r->scheds[i].state,
+                                oc_slice_str(r->scheds[i].fail_reason ? r->scheds[i].fail_reason : ""),
+                                oc_slice_str(r->scheds[i].body ? r->scheds[i].body : "") };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            if (oc_encode_scheduled(&w, OC_PROTOCOL_VERSION, &sc) == OC_OK)
+                send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        if (conns[c->fd]) {
+            oc_scheduled_list term = { (uint16_t)r->n_scheds };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_scheduled_list(&w, OC_PROTOCOL_VERSION, &term);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        break;
+    }
+    case OC_RES_SCHED_FIRED:
+        /* Nothing was due, or the one that was could not be delivered and has
+         * been marked for its author. A delivered one comes back as SEND_OK and
+         * is broadcast by that case, which is the point of ARCH-102. */
+        break;
     case OC_RES_DRAFT: {
         /* To the user's OTHER connections only (ARCH-101). The device that wrote
          * it already has the text, and echoing it back is how a client ends up
          * overwriting the composer somebody is still typing in. */
-        oc_draft d = { r->draft.channel_id, r->draft.thread_root, r->draft.updated_ms,
+        oc_draft d = { r->draft.id, r->draft.channel_id, r->draft.thread_root,
+                       r->draft.updated_ms,
+                       oc_slice_str(r->draft.recipients ? r->draft.recipients : ""),
                        oc_slice_str(r->draft.body ? r->draft.body : "") };
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_encode_draft(&w, OC_PROTOCOL_VERSION, &d);
@@ -2824,8 +2922,9 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
         for (size_t i = 0; i < r->n_drafts && conns[c->fd]; i++) {
-            oc_draft d = { r->drafts[i].channel_id, r->drafts[i].thread_root,
-                           r->drafts[i].updated_ms,
+            oc_draft d = { r->drafts[i].id, r->drafts[i].channel_id,
+                           r->drafts[i].thread_root, r->drafts[i].updated_ms,
+                           oc_slice_str(r->drafts[i].recipients ? r->drafts[i].recipients : ""),
                            oc_slice_str(r->drafts[i].body ? r->drafts[i].body : "") };
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
             if (oc_encode_draft(&w, OC_PROTOCOL_VERSION, &d) == OC_OK)
@@ -3042,6 +3141,37 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
  * stop precisely when it matters most. The pass itself is a DB job — finding
  * what to reclaim is a query — and the bytes are deleted by the transfer pool
  * when the result comes back. */
+/* Scheduled messages (REQ-224, ARCH-102), on their OWN interval. Storage
+ * maintenance's five minutes is not a send time: a message scheduled for 09:00
+ * arriving at 09:04 is a different product. Fifteen seconds is close enough that
+ * nobody notices, and far enough apart that an idle workspace is not paying for
+ * a query it never needs.
+ *
+ * Raised again immediately whenever one fires, so a backlog drains at queue
+ * speed rather than one per tick — the flag is set by the result path below. */
+static uint64_t g_last_sched_ms;
+static int      g_sched_more;
+/* Overridable for tests, exactly as OPENCHIME_MAINT_INTERVAL_MS is: a suite
+ * that has to wait fifteen real seconds to see a scheduled message fire is one
+ * nobody runs. Floored so a bad value cannot busy-loop the writer. */
+static uint64_t sched_tick_ms(void) {
+    const char *e = getenv("OPENCHIME_SCHED_TICK_MS");
+    if (e && *e) {
+        unsigned long long v = strtoull(e, NULL, 10);
+        if (v >= 50) return (uint64_t)v;
+    }
+    return 15000u;
+}
+
+static void maybe_fire_scheduled(oc_dbwriter *dbw) {
+    uint64_t now = now_ms();
+    if (!g_sched_more && g_last_sched_ms && now - g_last_sched_ms < sched_tick_ms()) return;
+    g_last_sched_ms = now;
+    g_sched_more = 0;
+    oc_job *j = oc_job_new(OC_JOB_FIRE_SCHEDULED, 0);   /* no connection owns this */
+    if (j) oc_dbwriter_submit(dbw, j);
+}
+
 static void maybe_run_maintenance(oc_dbwriter *dbw) {
     uint64_t now = now_ms();
     if (g_last_maint_ms && now - g_last_maint_ms < g_spol.interval_ms) return;
@@ -3301,6 +3431,7 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         int nfds = epoll_wait(ep, events, 64, 500);
         /* Every tick, timeout included — a quiet box must still be maintained. */
         maybe_run_maintenance(dbw);
+        maybe_fire_scheduled(dbw);
         if (nfds < 0) { if (errno == EINTR) continue; break; }
 
         for (int i = 0; i < nfds; i++) {

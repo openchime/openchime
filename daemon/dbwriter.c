@@ -268,9 +268,12 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->cs_client_type);
     for (size_t i = 0; i < r->n_cslist; i++) { free(r->cslist[i].key); free(r->cslist[i].value); }
     free(r->cslist);
-    free(r->draft.body);
-    for (size_t i = 0; i < r->n_drafts; i++) free(r->drafts[i].body);
+    free(r->draft.body); free(r->draft.recipients);
+    for (size_t i = 0; i < r->n_drafts; i++) { free(r->drafts[i].body); free(r->drafts[i].recipients); }
     free(r->drafts);
+    free(r->sched.body); free(r->sched.fail_reason);
+    for (size_t i = 0; i < r->n_scheds; i++) { free(r->scheds[i].body); free(r->scheds[i].fail_reason); }
+    free(r->scheds);
     free(r->profile_name);
     free(r->rcur);
     free(r);
@@ -1131,6 +1134,14 @@ static oc_dbres *process_remove_user(sqlite3 *db, const oc_job *j) {
      * channel dies and the only place that sweep can live. */
     sqlite3_prepare_v2(db, "DELETE FROM drafts WHERE user_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
+    /* And anything they had scheduled (REQ-224): the account is gone, so the
+     * promise cannot be kept and there is nobody left to tell. */
+    sqlite3_prepare_v2(db, "DELETE FROM scheduled_messages WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->target_user_id); sqlite3_step(st); sqlite3_finalize(st);
+    sqlite3_prepare_v2(db,
+        "DELETE FROM scheduled_messages WHERE channel_id NOT IN (SELECT id FROM channels);",
+        -1, &st, NULL);
+    sqlite3_step(st); sqlite3_finalize(st);
     sqlite3_prepare_v2(db,
         "DELETE FROM drafts WHERE channel_id NOT IN (SELECT id FROM channels);", -1, &st, NULL);
     sqlite3_step(st); sqlite3_finalize(st);
@@ -4550,8 +4561,14 @@ static oc_dbres *process_set_draft(sqlite3 *db, const oc_job *j) {
         sqlite3_prepare_v2(db,
             "INSERT INTO drafts (user_id, channel_id, thread_root, body, updated_ms) "
             "VALUES (?,?,?,?,?) "
-            "ON CONFLICT(user_id, channel_id, thread_root) DO UPDATE SET "
-            "  body=excluded.body, updated_ms=excluded.updated_ms;", -1, &st, NULL);
+            /* The WHERE is not decoration: migration 0031 made this a PARTIAL
+             * unique index, and SQLite requires a partial index's predicate
+             * repeated here or the target "does not match any PRIMARY KEY or
+             * UNIQUE constraint" and every upsert fails. It did — silently, from
+             * the daemon's side, which is why the integration test hung waiting
+             * for a reply that was never coming rather than failing. */
+            "ON CONFLICT(user_id, channel_id, thread_root) WHERE channel_id IS NOT NULL "
+            "DO UPDATE SET body=excluded.body, updated_ms=excluded.updated_ms;", -1, &st, NULL);
         sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
         sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
         sqlite3_bind_int64(st, 3, (sqlite3_int64)j->parent_id);
@@ -4560,9 +4577,11 @@ static oc_dbres *process_set_draft(sqlite3 *db, const oc_job *j) {
         sqlite3_step(st); sqlite3_finalize(st);
     }
     r->type = OC_RES_DRAFT;
+    r->draft.id          = (uint64_t)sqlite3_last_insert_rowid(db);
     r->draft.channel_id  = j->channel_id;
     r->draft.thread_root = j->parent_id;
     r->draft.updated_ms  = now;
+    r->draft.recipients  = strdup("");
     r->draft.body = blen ? strndup((const char *)j->body, blen) : strdup("");
     return r;
 }
@@ -4585,9 +4604,15 @@ static oc_dbres *process_list_drafts(sqlite3 *db, const oc_job *j) {
      * listed — "a draft for a channel you are not in is simply invisible until
      * you return". */
     sqlite3_prepare_v2(db,
-        "SELECT d.channel_id, d.thread_root, d.body, d.updated_ms FROM drafts d "
-        "JOIN channel_members m ON m.channel_id = d.channel_id AND m.user_id = d.user_id "
-        "WHERE d.user_id=? ORDER BY d.updated_ms DESC LIMIT ?;", -1, &st, NULL);
+        /* LEFT JOIN, and the membership test allows a NULL channel: an
+         * UNADDRESSED draft (REQ-229) belongs to no conversation yet, so an
+         * inner join would hide exactly the drafts the New Message pane
+         * depends on. */
+        "SELECT d.channel_id, d.thread_root, d.body, d.updated_ms, d.id, d.recipients "
+        "FROM drafts d "
+        "LEFT JOIN channel_members m ON m.channel_id = d.channel_id AND m.user_id = d.user_id "
+        "WHERE d.user_id=? AND (d.channel_id IS NULL OR m.user_id IS NOT NULL) "
+        "ORDER BY d.updated_ms DESC LIMIT ?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
     sqlite3_bind_int  (st, 2, (int)OC_MAX_DRAFTS);
     while (sqlite3_step(st) == SQLITE_ROW && r->n_drafts < OC_MAX_DRAFTS) {
@@ -4598,14 +4623,290 @@ static oc_dbres *process_list_drafts(sqlite3 *db, const oc_job *j) {
             r->drafts = g;
         }
         const unsigned char *b = sqlite3_column_text(st, 2);
+        const unsigned char *rc2 = sqlite3_column_text(st, 5);
         r->drafts[r->n_drafts].channel_id  = (uint64_t)sqlite3_column_int64(st, 0);
         r->drafts[r->n_drafts].thread_root = (uint64_t)sqlite3_column_int64(st, 1);
         r->drafts[r->n_drafts].body        = strdup(b ? (const char *)b : "");
         r->drafts[r->n_drafts].updated_ms  = (uint64_t)sqlite3_column_int64(st, 3);
+        r->drafts[r->n_drafts].id          = (uint64_t)sqlite3_column_int64(st, 4);
+        r->drafts[r->n_drafts].recipients  = strdup(rc2 ? (const char *)rc2 : "");
         r->n_drafts++;
     }
     sqlite3_finalize(st);
     return r;
+}
+
+/* --- Scheduled messages (REQ-224, ARCH-102) ------------------------------ */
+
+/* Load one row into `out`; 0 if it is not this user's or does not exist. */
+static int sched_load(sqlite3 *db, uint64_t id, uint64_t user_id, oc_sched_row *out) {
+    sqlite3_stmt *st = NULL;
+    int got = 0;
+    sqlite3_prepare_v2(db,
+        "SELECT id, channel_id, thread_root, send_at_ms, created_ms, state, "
+        "       fail_reason, body FROM scheduled_messages WHERE id=? AND user_id=?;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)user_id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *stt = sqlite3_column_text(st, 5);
+        const unsigned char *fr  = sqlite3_column_text(st, 6);
+        const unsigned char *bd  = sqlite3_column_text(st, 7);
+        out->id          = (uint64_t)sqlite3_column_int64(st, 0);
+        out->channel_id  = (uint64_t)sqlite3_column_int64(st, 1);
+        out->thread_root = (uint64_t)sqlite3_column_int64(st, 2);
+        out->send_at_ms  = (uint64_t)sqlite3_column_int64(st, 3);
+        out->created_ms  = (uint64_t)sqlite3_column_int64(st, 4);
+        out->state = (stt && !strcmp((const char *)stt, "sent"))   ? OC_SCHED_SENT :
+                     (stt && !strcmp((const char *)stt, "failed")) ? OC_SCHED_FAILED
+                                                                   : OC_SCHED_PENDING;
+        out->fail_reason = strdup(fr ? (const char *)fr : "");
+        out->body        = strdup(bd ? (const char *)bd : "");
+        got = 1;
+    }
+    sqlite3_finalize(st);
+    return got;
+}
+
+static oc_dbres *process_schedule(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id; r->user_id = j->user_id;
+    if (!j->channel_id || !is_member(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; return r;
+    }
+    /* An empty scheduled message is refused rather than stored: there is nothing
+     * to deliver, and a row that fires into nothing at 09:00 is worse than a
+     * refusal now. BODY_TOO_LARGE would be a lie about which end of the range
+     * was wrong, so this reuses the send path's own "there is no message here"
+     * refusal — INVALID_MESSAGE — added beside it. */
+    if (!j->body_len) { r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_INVALID_MESSAGE; return r; }
+    size_t blen = j->body_len > OC_MAX_BODY_SIZE ? OC_MAX_BODY_SIZE : j->body_len;
+    uint64_t now = dbw_now_ms();
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO scheduled_messages "
+        "  (user_id, channel_id, thread_root, body, send_at_ms, created_ms, state) "
+        "VALUES (?,?,?,?,?,?,'pending');", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->parent_id);
+    sqlite3_bind_text (st, 4, (const char *)j->body, (int)blen, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)j->sched_at_ms);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)now);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
+    r->type = OC_RES_SCHEDULED;
+    r->sched.id          = (uint64_t)sqlite3_last_insert_rowid(db);
+    r->sched.channel_id  = j->channel_id;
+    r->sched.thread_root = j->parent_id;
+    r->sched.send_at_ms  = j->sched_at_ms;
+    r->sched.created_ms  = now;
+    r->sched.state       = OC_SCHED_PENDING;
+    r->sched.fail_reason = strdup("");
+    r->sched.body        = strndup((const char *)j->body, blen);
+    return r;
+}
+
+static oc_dbres *process_list_scheduled(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id; r->user_id = j->user_id;
+    r->type = OC_RES_SCHEDULED_LIST;
+    size_t cap = 16;
+    r->scheds = malloc(cap * sizeof *r->scheds);
+    if (!r->scheds) return r;
+    sqlite3_stmt *st = NULL;
+    /* Everything still waiting, plus anything that FAILED — a message that was
+     * promised and could not be sent is the one thing its author must see
+     * (ARCH-102). Delivered ones drop out: they are messages now. */
+    sqlite3_prepare_v2(db,
+        "SELECT id, channel_id, thread_root, send_at_ms, created_ms, state, fail_reason, body "
+        "FROM scheduled_messages WHERE user_id=? AND state IN ('pending','failed') "
+        "ORDER BY send_at_ms ASC LIMIT ?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int  (st, 2, (int)OC_MAX_SCHEDULED);
+    while (sqlite3_step(st) == SQLITE_ROW && r->n_scheds < OC_MAX_SCHEDULED) {
+        if (r->n_scheds == cap) {
+            cap *= 2;
+            oc_sched_row *g = realloc(r->scheds, cap * sizeof *g);
+            if (!g) break;
+            r->scheds = g;
+        }
+        oc_sched_row *row = &r->scheds[r->n_scheds];
+        const unsigned char *stt = sqlite3_column_text(st, 5);
+        const unsigned char *fr  = sqlite3_column_text(st, 6);
+        const unsigned char *bd  = sqlite3_column_text(st, 7);
+        row->id          = (uint64_t)sqlite3_column_int64(st, 0);
+        row->channel_id  = (uint64_t)sqlite3_column_int64(st, 1);
+        row->thread_root = (uint64_t)sqlite3_column_int64(st, 2);
+        row->send_at_ms  = (uint64_t)sqlite3_column_int64(st, 3);
+        row->created_ms  = (uint64_t)sqlite3_column_int64(st, 4);
+        row->state = (stt && !strcmp((const char *)stt, "failed")) ? OC_SCHED_FAILED
+                                                                  : OC_SCHED_PENDING;
+        row->fail_reason = strdup(fr ? (const char *)fr : "");
+        row->body        = strdup(bd ? (const char *)bd : "");
+        r->n_scheds++;
+    }
+    sqlite3_finalize(st);
+    return r;
+}
+
+static oc_dbres *process_cancel_scheduled(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id; r->user_id = j->user_id;
+    oc_sched_row row = {0};
+    if (!sched_load(db, j->message_id, j->user_id, &row)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r;
+    }
+    free(row.fail_reason); free(row.body);
+    sqlite3_stmt *st = NULL;
+    /* Only a message that has not gone: cancelling one already delivered is a
+     * request to unsend, which is REQ-058's territory and not this op's. */
+    sqlite3_prepare_v2(db,
+        "DELETE FROM scheduled_messages WHERE id=? AND user_id=? AND state<>'sent';",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_step(st); sqlite3_finalize(st);
+    r->type = OC_RES_SCHEDULED;
+    r->sched.id = j->message_id;
+    r->sched.state = OC_SCHED_GONE;      /* the client drops it on this */
+    r->sched.fail_reason = strdup("");
+    r->sched.body = strdup("");
+    return r;
+}
+
+static oc_dbres *process_update_scheduled(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id; r->user_id = j->user_id;
+    oc_sched_row row = {0};
+    if (!sched_load(db, j->message_id, j->user_id, &row) || row.state == OC_SCHED_SENT) {
+        free(row.fail_reason); free(row.body);
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_UNKNOWN_MESSAGE; return r;
+    }
+    size_t blen = j->body_len > OC_MAX_BODY_SIZE ? OC_MAX_BODY_SIZE : j->body_len;
+    sqlite3_stmt *st = NULL;
+    /* Editing a FAILED one puts it back in the queue: the author has just fixed
+     * whatever the reason said, and making them cancel and retype would be a
+     * punishment for the daemon's report. */
+    sqlite3_prepare_v2(db,
+        "UPDATE scheduled_messages SET body=?, send_at_ms=?, state='pending', "
+        "  fail_reason=NULL WHERE id=? AND user_id=?;", -1, &st, NULL);
+    sqlite3_bind_text (st, 1, blen ? (const char *)j->body : row.body, blen ? (int)blen : -1,
+                       SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)(j->sched_at_ms ? j->sched_at_ms : row.send_at_ms));
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->message_id);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)j->user_id);
+    sqlite3_step(st); sqlite3_finalize(st);
+    free(row.fail_reason); free(row.body);
+    r->type = OC_RES_SCHEDULED;
+    if (!sched_load(db, j->message_id, j->user_id, &r->sched)) {
+        r->sched.fail_reason = strdup(""); r->sched.body = strdup("");
+    }
+    return r;
+}
+
+/* The sweep, ONE due message per job. Delivery is literally `process_send`, and
+ * the result is handed back UNCHANGED — so the net thread broadcasts it, pushes
+ * it and acks it through the same code a typed message uses, without knowing it
+ * was scheduled. That is ARCH-102's "the ordinary send path" taken at its word
+ * rather than reimplemented beside it.
+ *
+ * One at a time because the result IS the send: the netloop raises another job
+ * as soon as one fires (see maybe_fire_scheduled), so a backlog drains at queue
+ * speed rather than one per tick. */
+static oc_dbres *process_fire_scheduled(sqlite3 *db, const oc_job *j) {
+    (void)j;
+    uint64_t id = 0, uid = 0, cid = 0, root = 0;
+    char *body = NULL;
+    uint64_t now = dbw_now_ms();
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT id, user_id, channel_id, thread_root, body FROM scheduled_messages "
+        "WHERE state='pending' AND send_at_ms <= ? ORDER BY send_at_ms LIMIT 1;",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)now);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *b = sqlite3_column_text(st, 4);
+        id   = (uint64_t)sqlite3_column_int64(st, 0);
+        uid  = (uint64_t)sqlite3_column_int64(st, 1);
+        cid  = (uint64_t)sqlite3_column_int64(st, 2);
+        root = (uint64_t)sqlite3_column_int64(st, 3);
+        body = strdup(b ? (const char *)b : "");
+    }
+    sqlite3_finalize(st);
+    if (!id) {                                  /* nothing due: a benign no-op */
+        oc_dbres *idle = calloc(1, sizeof *idle);
+        if (idle) idle->type = OC_RES_SCHED_FIRED;
+        free(body);
+        return idle;
+    }
+
+    /* The two ways a promise can no longer be kept (ARCH-102), both reported
+     * rather than silently dropped or forced through a read-only channel. */
+    const char *fail = NULL;
+    if (!is_member(db, cid, uid)) fail = "you are no longer in that conversation";
+    else {
+        sqlite3_stmt *cs = NULL;
+        int archived = 0;
+        /* `archived_at_ms`, not `archived`: REQ-035 stores WHEN, and non-NULL is
+         * the flag (migration 0026). Named wrongly here at first, which prepared
+         * a statement that never stepped and left every channel looking open —
+         * the failure was silent, and only visible because the test asserted
+         * the specific REASON rather than merely that it failed. */
+        sqlite3_prepare_v2(db, "SELECT archived_at_ms IS NOT NULL FROM channels WHERE id=?;",
+                           -1, &cs, NULL);
+        sqlite3_bind_int64(cs, 1, (sqlite3_int64)cid);
+        if (sqlite3_step(cs) == SQLITE_ROW) archived = sqlite3_column_int(cs, 0);
+        sqlite3_finalize(cs);
+        if (archived) fail = "that channel was archived before it could be sent";
+    }
+    if (fail) {
+        sqlite3_prepare_v2(db,
+            "UPDATE scheduled_messages SET state='failed', fail_reason=? WHERE id=?;",
+            -1, &st, NULL);
+        sqlite3_bind_text (st, 1, fail, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)id);
+        sqlite3_step(st); sqlite3_finalize(st);
+        free(body);
+        oc_dbres *failed = calloc(1, sizeof *failed);
+        if (failed) failed->type = OC_RES_SCHED_FIRED;   /* the author sees it on next list */
+        return failed;
+    }
+
+    oc_job sj;
+    memset(&sj, 0, sizeof sj);
+    sj.type = OC_JOB_SEND;
+    sj.conn_id = 0;                    /* nobody is waiting for an ack */
+    sj.user_id = uid;
+    sj.channel_id = cid;
+    sj.parent_id = root;
+    sj.body = (uint8_t *)body;
+    sj.body_len = body ? strlen(body) : 0;
+    /* The token is minted HERE (REQ-093, ARCH-102): it identifies a send
+     * attempt, and the client's belonged to the scheduling request. Derived
+     * from the row id, so a row swept twice deduplicates instead of double
+     * posting — which is exactly what idempotency is for. */
+    memcpy(sj.idem, "sched", 5);
+    memcpy(sj.idem + 5, &id, sizeof id);
+    oc_dbres *sent = process_send(db, &sj);
+    int ok = sent && sent->type == OC_RES_SEND_OK;
+    sqlite3_prepare_v2(db, ok
+        ? "UPDATE scheduled_messages SET state='sent', message_id=? WHERE id=?;"
+        : "UPDATE scheduled_messages SET state='failed', message_id=?, "
+          "  fail_reason='the server could not deliver it' WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)(ok ? sent->message_id : 0));
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)id);
+    sqlite3_step(st); sqlite3_finalize(st);
+    free(body);
+    if (sent) return sent;             /* handed back UNCHANGED — see the note above */
+    oc_dbres *none = calloc(1, sizeof *none);
+    if (none) none->type = OC_RES_SCHED_FIRED;
+    return none;
 }
 
 static oc_dbres *process_list_notify_prefs(sqlite3 *db, const oc_job *j) {
@@ -4853,6 +5154,11 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_ADD_EMOJI)      return process_add_emoji(w->db, j);
     if (j->type == OC_JOB_DELETE_EMOJI)   return process_delete_emoji(w->db, j);
     if (j->type == OC_JOB_INVITE_USER)    return process_invite_user(w->db, j);
+    if (j->type == OC_JOB_FIRE_SCHEDULED)    return process_fire_scheduled(w->db, j);
+    if (j->type == OC_JOB_SCHEDULE)          return process_schedule(w->db, j);
+    if (j->type == OC_JOB_LIST_SCHEDULED)    return process_list_scheduled(w->db, j);
+    if (j->type == OC_JOB_CANCEL_SCHEDULED)  return process_cancel_scheduled(w->db, j);
+    if (j->type == OC_JOB_UPDATE_SCHEDULED)  return process_update_scheduled(w->db, j);
     if (j->type == OC_JOB_SET_DRAFT)      return process_set_draft(w->db, j);
     if (j->type == OC_JOB_LIST_DRAFTS)    return process_list_drafts(w->db, j);
     if (j->type == OC_JOB_REMOVE_USER)    return process_remove_user(w->db, j);

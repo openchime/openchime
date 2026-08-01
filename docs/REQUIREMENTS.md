@@ -1425,9 +1425,10 @@ None are yet backed by an architecture decision.*
   **The surface follows Slack's as closely as it can.** A conversation holding an
   unsent draft is marked in the sidebar, the draft is restored into the composer
   on returning to it, and it clears on send — the behaviour people already have
-  the habit for. Where Slack pairs this with a "Drafts & scheduled" hub we do not
-  yet, because the scheduled half does not exist (REQ-224); that hub is its own
-  item rather than a divergence.
+  the habit for. The hub Slack pairs this with is **REQ-228**, built 2026-08-01
+  together with the scheduled half (REQ-224); until then this requirement's
+  surface was the sidebar mark alone, and a Drafts destination briefly appeared
+  in the *rail*, which is not where Slack puts it and was corrected with REQ-228.
 
   The sidebar marks a conversation that has a draft because a draft you
   cannot see you have is one you never return to. It is not counted as unread:
@@ -1436,8 +1437,41 @@ None are yet backed by an architecture decision.*
 - **REQ-224.** A user has been able to **schedule a message** for future delivery
   to a channel or DM; the message has been held until its send time, then
   delivered through the ordinary path (REQ-090), and cancelable before it fired.
-  **[needs ARCH decision — where a scheduled message is held (a server-side queue)
-  and its interaction with idempotency (REQ-093).]**
+  **Settled by ARCH-102 (2026-08-01):** held in its own `scheduled_messages`
+  table rather than in `messages` — it is not a message yet, and a "pending" flag
+  would make every history, search, backfill and unread query responsible for
+  excluding it. Fired by a daemon sweep on its own ~15 s timer (storage
+  maintenance's five minutes is not a send time), delivered through the ordinary
+  send path so mentions and notifications cannot diverge, with the **daemon
+  minting the idempotency token at fire time** — the client's token belongs to
+  the scheduling request. Editable and cancelable until it fires. A channel
+  archived or an author removed in between marks it **failed with a reason the
+  author sees**: a message promised and not sent is the one case where silence is
+  indefensible.
+
+  Surfaced in the **Scheduled** tab of the Drafts, scheduled & sent pane
+  (REQ-228), which is where Slack puts it and where a user goes looking.
+- **REQ-228.** A user has been able to reach one place holding **everything they
+  have written but not said, and everything they have said** — drafts (REQ-223),
+  scheduled messages (REQ-224) and a **sent list**: their own messages, newest
+  first, grouped by day, across every conversation they can see, each row naming
+  its destination and reading its first line. Slack's *Drafts & sent*, reached
+  from the Home sidebar rather than from a top-level destination, carrying a
+  count of the drafts waiting in it.
+
+  **The sent half needs no new server work** and is recorded as a requirement so
+  it stops being an unnumbered feature: REQ-104's search already accepts a
+  filters-only query, scopes results to what the user may read, orders newest
+  first and pages on a keyset cursor, so "everything I sent" is `from:me` through
+  the query that exists.
+
+- **REQ-229.** A user has been able to start a message **before choosing who it
+  is for** — composing in a first-class pane, addressing it to any mix of
+  channels and people, with the half-written result **preserved as an
+  unaddressed draft** (REQ-223, ARCH-101 as amended) so closing the pane has not
+  lost it. Sending has resolved the recipients into the right conversation:
+  an existing channel, a direct message, or a group DM (REQ-056).
+
 - **REQ-225.** A user has been able to post a **poll** — a question with options
   other members vote on, results tallied and shown live — as a first-class message
   type rather than via an external app. **[needs ARCH decision — poll storage

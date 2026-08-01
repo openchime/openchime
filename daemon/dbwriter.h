@@ -109,7 +109,12 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* Drafts (REQ-223, ARCH-101). SET reuses channel_id + parent_id (the
         * thread root) + body/body_len — the same fields SEND already carries,
         * because a draft is the message you have not sent. */
-       OC_JOB_SET_DRAFT = 81, OC_JOB_LIST_DRAFTS = 82 };
+       OC_JOB_SET_DRAFT = 81, OC_JOB_LIST_DRAFTS = 82,
+       /* Scheduled messages (REQ-224, ARCH-102). FIRE_SCHEDULED is raised by the
+        * netloop's timer with no connection behind it, like STORAGE_MAINT. */
+       OC_JOB_SCHEDULE = 83, OC_JOB_LIST_SCHEDULED = 84,
+       OC_JOB_CANCEL_SCHEDULED = 85, OC_JOB_UPDATE_SCHEDULED = 86,
+       OC_JOB_FIRE_SCHEDULED = 87 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -196,6 +201,7 @@ typedef struct oc_job {
     uint64_t       channel_id;
     uint64_t       message_id; /* target message for EDIT / DELETE */
     uint64_t       parent_id;  /* thread parent for SEND_REPLY / LIST_THREAD */
+    uint64_t       sched_at_ms; /* SCHEDULE / UPDATE_SCHEDULED: when to send */
     uint8_t        idem[OC_IDEM_LEN];
     uint8_t       *body;      /* heap (SEND / EDIT new body) */
     size_t         body_len;
@@ -301,7 +307,11 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_SESSION_LIST = 76, OC_RES_EMOJI_LIST = 77,
        /* One draft — fanned to the user's OTHER connections as a device sync
         * (ARCH-101) — and the full list for the connection that asked. */
-       OC_RES_DRAFT = 78, OC_RES_DRAFTS = 79 };
+       OC_RES_DRAFT = 78, OC_RES_DRAFTS = 79,
+       /* One scheduled row (list entry and push) and the list terminator. FIRED
+        * carries the messages the sweep actually delivered, which the net thread
+        * broadcasts exactly as it would an ordinary send. */
+       OC_RES_SCHEDULED = 80, OC_RES_SCHEDULED_LIST = 81, OC_RES_SCHED_FIRED = 82 };
 
 /* One custom emoji (REQ-072). */
 typedef struct oc_emoji_row {
@@ -377,7 +387,12 @@ typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; } oc_notify_
 
 /* One row in a CLIENT_SETTINGS result: a synced key/value. */
 typedef struct { char *key; char *value; } oc_client_setting_row;
-typedef struct { uint64_t channel_id, thread_root, updated_ms; char *body; } oc_draft_row;
+typedef struct { uint64_t id, channel_id, thread_root, updated_ms;
+                 char *recipients, *body; } oc_draft_row;
+/* One scheduled message (REQ-224). `state` is OC_SCHED_*; `fail_reason` is set
+ * only when the sweep could not deliver it, and is what the author is shown. */
+typedef struct { uint64_t id, channel_id, thread_root, send_at_ms, created_ms;
+                 uint8_t state; char *fail_reason, *body; } oc_sched_row;
 /* One blob the maintenance pass decided to reclaim (ARCH-78). The row is already
  * tombstoned in SQLite; only the bytes remain, and deleting those is the net
  * thread's job via the transfer pool because it can block on S3. */
@@ -624,6 +639,9 @@ typedef struct oc_dbres {
 
     /* CLIENT_SETTINGS: the bucket's client_type + its key/value rows. */
     char                   *cs_client_type;  /* heap */
+    oc_sched_row            sched;           /* OC_RES_SCHEDULED — heap strings */
+    oc_sched_row           *scheds;          /* heap array (OC_RES_SCHEDULED_LIST) */
+    size_t                  n_scheds;
     oc_draft_row            draft;           /* OC_RES_DRAFT — body is heap */
     oc_draft_row           *drafts;          /* heap array (OC_RES_DRAFTS) */
     size_t                  n_drafts;

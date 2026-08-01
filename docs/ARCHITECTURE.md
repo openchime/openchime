@@ -280,7 +280,23 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **Ambiguity degrades to literal source.** Emphasis is word-boundary anchored and must close on the same line, so `2 * 3` is arithmetic and a half-typed `*` never restyles the rest of a message; a backslash escape gives an explicit way out, which Slack has no equivalent of.
 
+- **ARCH-102 (Scheduled messages — a queue the daemon owns, delivered through the ordinary send path):** Answers REQ-224's open marker.
+
+  **Held in its own `scheduled_messages` table, not in `messages`.** A scheduled message is not a message yet: it has no id anyone can link to, it is invisible to search and to every member but its author, and it may never exist at all. Putting it in `messages` with a "pending" flag would make every query in the product — history, search, backfill, unread, mentions — responsible for excluding it, and the first one that forgot would leak an unsent message into somebody else's transcript.
+
+  **Fired by the daemon, on its own ~15 s sweep.** The connectionless job already exists: `maybe_run_maintenance` raises one with `conn_id = 0` because no client owns a timer. Storage maintenance runs every five minutes, which is not a send time — a message scheduled for 09:00 arriving at 09:04 is a different product — so this gets its own interval rather than sharing that one.
+
+  **Delivery goes through the ordinary send path.** Mentions, notifications, unfurls, read cursors and the live broadcast all have to behave exactly as they would for a typed message, and a second delivery path is a second thing to keep in step — the class of divergence ARCH-89 and ARCH-100 both exist to prevent. The scheduled row supplies the body and the target; everything after that is `process_send`.
+
+  **The daemon mints the idempotency token at fire time.** REQ-093's token identifies a *send attempt*, and the client's token here belongs to the scheduling request — reusing it would mean a message rescheduled after a failed fire is deduplicated against its own earlier attempt and silently never sent.
+
+  **Cancelable and editable until it fires**, which is the whole point of the feature and is why the state lives in a row rather than in a timer.
+
+  **If it cannot be delivered, the author is told.** A channel archived (REQ-035) or an author removed between scheduling and firing leaves two bad options — post into a read-only channel, or discard in silence — so the row is marked failed with a reason and surfaced in the Scheduled tab. A message you were promised would be sent, and was not, is the one case where silence is indefensible.
+
 - **ARCH-101 (Drafts — server-stored user content, not a client setting):** Answers REQ-223's open marker.
+
+  **Amended 2026-08-01 — a draft may be UNADDRESSED.** Slack's New Message pane autosaves before a recipient is chosen ("Saved a moment ago"), and that is most of why it feels safe to close. The original key `(user_id, channel_id, thread_root)` cannot express it, so `channel_id` becomes nullable with a `recipients` list beside it, and the addressed case keeps exactly its old shape through a unique index rather than a changed primary key. The alternative — holding an unaddressed draft only in client memory — reintroduces precisely the loss this decision was made to end, one surface later.
 
   **A draft is stored on the daemon in its own `drafts` table, keyed `(user_id, channel_id, thread_root)`, with its own ops** — not in the `client_settings` bucket. The bucket was the obvious cheap answer and is the wrong one twice over. It is keyed `(user_id, client_type, key)` and **partitioned per frontend by design**, so a draft written in the Win32 GUI would be invisible in the TUI — the opposite of REQ-223's "synced across that user's devices". And its own schema notes describe its contents as "single-user, low-contention **prefs**": a draft is the one thing we would put there that the user typed as a *message*, and it is the higher-contention case the bucket says it is not for.
 
