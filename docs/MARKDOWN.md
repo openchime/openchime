@@ -148,7 +148,13 @@ business:
   but faint: in a range-only treatment they *are* the rendering of a list or a
   quote.
 
-  The composer keeps the plain source in its buffer — there is still no second
+  A preference chooses between them (WIN-103): *Rich text*, which is the
+  default and is described here, or *Plain text*, where the markup is shown as
+  written and the field never restyles or rewrites it. Two audiences, one of
+  whom types this dialect fluently and does not want an editor second-guessing
+  it; Slack offers the same switch.
+
+  In rich mode the composer keeps the plain source in its buffer — there is still no second
   representation — and pays for the hidden characters in caret arithmetic
   instead: every caret position canonicalises to the leftmost of the set that
   draws in the same place, arrows cross an invisible run within one keypress,

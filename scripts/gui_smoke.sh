@@ -1011,6 +1011,27 @@ for _ in 1 2; do "$DRIVE" key left >/dev/null 2>&1; done
 expect_grep '^ed .*text="a  b"' "deleting the last character removes the emphasis whole"
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
 
+# --- the editor preference (WIN-103) ----------------------------------------
+# Two modes, and BOTH are driven here: a preference with one tested path has an
+# untested path, and this one changes what every keystroke does.
+say "== editor preference"
+"$DRIVE" editor plain >/dev/null 2>&1
+fmt_reset 'say *bold* now' 14
+"$DRIVE" key home >/dev/null 2>&1
+for _ in 1 2 3 4 5; do "$DRIVE" key right >/dev/null 2>&1; done
+ed_step caret 5 "plain text: the caret steps one character at a time, markup included"
+# And nothing edits your markup for you — the rich mode's repair is inert here.
+fmt_reset 'a *x* b' 7
+for _ in 1 2 3; do "$DRIVE" key left >/dev/null 2>&1; done
+"$DRIVE" key back >/dev/null 2>&1
+expect_grep '^ed .*text="a \*\* b"' "plain text: the delimiters are left exactly as typed"
+"$DRIVE" editor rich >/dev/null 2>&1
+fmt_reset 'say *bold* now' 14
+"$DRIVE" key home >/dev/null 2>&1
+for _ in 1 2 3 4 5; do "$DRIVE" key right >/dev/null 2>&1; done
+ed_step caret 6 "rich text: the same five presses cross the invisible delimiter"
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+
 # The caret spans the LINE, whatever runs are on it. It used to take its height
 # from the cluster it sat against, so the moment a hidden delimiter was next to
 # it the caret became 0.1 DIP tall and sat on the baseline — reported as "the

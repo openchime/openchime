@@ -394,6 +394,7 @@ static void ed_focus(HWND hwnd);
 static int  ed_has_sel(void);
 static int  ed_lines(float w);
 static void ed_draw(ID2D1RenderTarget *rt, D2D1_RECT_F box);
+static void ed_invalidate_layout(void);   /* fwd — prefs re-draw the field */
 static DWORD    g_last_typing;
 
 /* Sidebar row hit-boxes, captured during paint for WM_LBUTTONDOWN. */
@@ -428,6 +429,10 @@ static D2D1_RECT_F g_prof_dm_btn;
 static int g_pref_time24    = 1;   /* 24-hour timestamps */
 static int g_pref_members   = 1;   /* members pane shown by default */
 static int g_pref_daysep    = 1;   /* date dividers in the transcript */
+/* WIN-103: 1 = the rich editor (formatting shown, markup hidden — WIN-101),
+ * 0 = plain text, where the markup is what you see and the field never restyles
+ * what you typed. Rich by default: it is the mode that needs no explaining. */
+static int g_pref_richtext  = 1;
 static int g_prefs_pending;        /* fold the synced values in once they land */
 /* Window placement, remembered across runs. It rides in the same synced bucket
  * as the other preferences because a client writes no files (ARCH-88) — which
@@ -4673,7 +4678,8 @@ static float pref_row(ID2D1RenderTarget *rt, D2D1_RECT_F body, float y, int row,
 
 enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
        PREF_ROW_NOTIFY, PREF_ROW_QUICK, PREF_ROW_ACCENT, PREF_ROW_TEXTSIZE,
-       PREF_ROW_DENSITY, PREF_ROW_ZOOM, PREF_ROW_DPI, PREF_ROW_RESET };
+       PREF_ROW_DENSITY, PREF_ROW_ZOOM, PREF_ROW_DPI, PREF_ROW_RESET,
+       PREF_ROW_EDITOR };
 
 /* Preferences is two-paned (WIN-78): categories left, one category's rows right.
  * A single scrolling list was fine at six rows and is not at fourteen — and the
@@ -4763,6 +4769,7 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
     static const char *ONOFF[2]  = { "Off", "On" };
     static const char *SIZES[4]  = { "Small", "Default", "Large", "Larger" };
     static const char *DENS[2]   = { "Compact", "Cozy" };
+    static const char *EDITORS[2] = { "Plain text", "Rich text" };
 
     if (g_pref_cat == PC_APPEARANCE) {
         y = pref_row(rt, body, y, PREF_ROW_THEME, "Theme",
@@ -4781,6 +4788,14 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
                      "How message timestamps are shown.", TIMES, 2, g_pref_time24);
         y = pref_row(rt, body, y, PREF_ROW_DAYSEP, "Date dividers",
                      "A separator between days in the transcript.", ONOFF, 2, g_pref_daysep);
+        /* WIN-103. Slack has the same switch, for the same people: one group
+         * wants a box that formats what they type, the other types the markup
+         * fluently and wants to be left alone. The rich editor is the default
+         * because it is the one that needs no explanation. */
+        y = pref_row(rt, body, y, PREF_ROW_EDITOR, "Message input",
+                     "Rich text formats as you type. Plain text shows the markup "
+                     "and never restyles it.",
+                     EDITORS, 2, g_pref_richtext);
         /* WIN-28: the quick reactions were six literals in the source. */
         {
             static const char *EDIT1[1] = { "Change" };
@@ -6393,6 +6408,7 @@ static struct {
     int accent, textsize, density, zoom;
     unsigned dpi;
     char quick[160];
+    int  richtext;
 } g_prefs_snap;
 
 static void prefs_snapshot(void) {
@@ -6404,6 +6420,7 @@ static void prefs_snapshot(void) {
     g_prefs_snap.accent   = oc_theme_scheme();
     g_prefs_snap.textsize = g_pref_textsize;
     g_prefs_snap.density  = g_pref_density;
+    g_prefs_snap.richtext = g_pref_richtext;
     g_prefs_snap.zoom     = g_zoom_step;
     g_prefs_snap.dpi      = g_dpi;
     snprintf(g_prefs_snap.quick, sizeof g_prefs_snap.quick, "%s", g_quick_names);
@@ -6418,6 +6435,8 @@ static void prefs_restore(void) {
     if (oc_theme_scheme() != g_prefs_snap.accent) oc_theme_set_scheme(g_prefs_snap.accent);
     g_pref_density = g_prefs_snap.density;
     g_density      = g_prefs_snap.density ? 1.0f : 0.6f;
+    g_pref_richtext = g_prefs_snap.richtext;
+    ed_invalidate_layout();
     snprintf(g_quick_names, sizeof g_quick_names, "%s", g_prefs_snap.quick);
     quick_rebuild();
     /* Text size, zoom and DPI each cost a font-table rebuild, so restore them
@@ -7768,6 +7787,13 @@ static void ed_hidden_build(void) {
     int bytes;
     g_ed_hidden_valid = 1;
     memset(g_ed_hidden, 0, sizeof g_ed_hidden);
+    /* PLAIN TEXT mode (WIN-103) is exactly this: nothing is hidden. Every rule
+     * above keys off that one fact — ed_canon becomes the identity, ed_step
+     * becomes plus or minus one, typed text lands where the caret is, and
+     * ed_repair_orphans finds nothing to repair because nothing was invisible.
+     * The mode is one `if`, not a second editor, which is the only reason it is
+     * safe to ship a switch between them. */
+    if (!g_pref_richtext) return;
     if (g_ed_len <= 0) return;
     bytes = WideCharToMultiByte(CP_UTF8, 0, g_ed, g_ed_len, u8, (int)sizeof u8 - 1, NULL, NULL);
     if (bytes <= 0) return;
@@ -8204,7 +8230,12 @@ static IDWriteTextLayout *ed_layout(float w) {
          * message it becomes are drawn by one piece of code. Affordable only
          * because the parser is client-side and runs over a <=4000-unit buffer:
          * the same pass that already re-scans mentions on every keystroke. */
-        if (bytes > 0 && g_ed_rt) {
+        /* Plain text means PLAIN: the markup is shown as written and nothing is
+         * restyled. Styling it while showing the delimiters is the hybrid this
+         * preference exists to let people escape, so it is not on offer in
+         * either mode. Mentions still light up below — those are not markup,
+         * they are a fact about who gets notified. */
+        if (bytes > 0 && g_ed_rt && g_pref_richtext) {
             u8[bytes] = '\0';
             apply_richtext(g_ed_layout, u8, (size_t)bytes, (UINT32)n, g_brush2, g_brush4);
         }
@@ -10289,6 +10320,10 @@ static int on_click(HWND hwnd, int x, int y) {
              * restart to see is indistinguishable from one that did nothing. */
             case PREF_ROW_MEMBERS: g_pref_members = v; g_show_members = v; layout_composer(hwnd); break;
             case PREF_ROW_DAYSEP:  g_pref_daysep = v; break;
+            case PREF_ROW_EDITOR:
+                g_pref_richtext = v ? 1 : 0;
+                ed_invalidate_layout();   /* the field is drawn a different way now */
+                break;
             case PREF_ROW_NOTIFY:  g_pref_notify = v; break;
             /* Appearance applies LIVE while the sheet is open — a colour, a text
              * size and a density are their own preview and cannot be judged from a
@@ -11862,9 +11897,10 @@ static void prefs_save(void) {
     /* Zoom is deliberately absent: it is per window and transient (ARCH-97), so
      * persisting it would make one window's temporary magnification follow the
      * account to every other machine. */
-    snprintf(enc, sizeof enc, "t:%d;h:%d;m:%d;d:%d;n:%d;a:%d;s:%d;y:%d;w:%d,%d,%d,%d,%d;q:%s",
+    snprintf(enc, sizeof enc, "t:%d;h:%d;m:%d;d:%d;n:%d;a:%d;s:%d;y:%d;r:%d;w:%d,%d,%d,%d,%d;q:%s",
              oc_theme_mode(), g_pref_time24, g_pref_members, g_pref_daysep,
              g_pref_notify, oc_theme_scheme(), g_pref_textsize, g_pref_density,
+             g_pref_richtext,
              g_win_x, g_win_y, g_win_w, g_win_h, g_win_max,
              g_quick_names);
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
@@ -11886,6 +11922,7 @@ static void prefs_load(const oc_model *m) {
             else if (k == 'a') oc_theme_set_scheme(val);
             else if (k == 's') g_pref_textsize = (val < 0 || val > 3) ? 1 : val;
             else if (k == 'y') { g_pref_density = val ? 1 : 0; g_density = val ? 1.0f : 0.6f; }
+            else if (k == 'r') g_pref_richtext = val ? 1 : 0;
             else if (k == 'w') {
                 int a, b2, c2, d2, e2;
                 if (sscanf(p + 2, "%d,%d,%d,%d,%d", &a, &b2, &c2, &d2, &e2) == 5 && c2 > 200 && d2 > 150) {
@@ -13348,6 +13385,15 @@ static void test_poll(HWND hwnd) {
         else test_ack("err");
     } else if (!strcmp(verb, "tab")) {
         select_tab(atoi(arg));
+        test_ack("ok");
+    } else if (!strcmp(verb, "editor")) {
+        /* Switch the composer between the rich editor and plain text (WIN-103),
+         * as the Messages preference does. A verb so BOTH modes can be asserted:
+         * a preference with one tested path is a preference with an untested
+         * path, and this one changes how every keystroke behaves. */
+        g_pref_richtext = !strcmp(arg, "rich") ? 1 : 0;
+        ed_invalidate_layout();
+        InvalidateRect(hwnd, NULL, FALSE);
         test_ack("ok");
     } else if (!strcmp(verb, "dmcompose")) {
         /* Toggle the "New direct message" picker, as its sidebar button does.
