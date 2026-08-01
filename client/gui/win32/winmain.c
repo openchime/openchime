@@ -126,13 +126,23 @@ static UINT dpi_for_window(HWND hwnd) {
  * strip of chrome instead of two jobs. */
 #define COMPOSER_TB     30.0f    /* the formatting toolbar row */
 #define COMPOSER_FMT    24.0f    /* its square buttons */
+/* ...and it is only there in the rich editor (WIN-104). In plain text the
+ * toolbar would be a row of buttons for markup you are already looking at, and
+ * leaving its 30px behind would be a gap with nothing in it. The height is a
+ * question rather than a constant because every consumer — the box, the field's
+ * origin, the growth measurement — has to ask it and get the same answer. */
+static int composer_toolbar_on(void);          /* fwd */
+static float composer_tb(void) { return composer_toolbar_on() ? COMPOSER_TB : 0.0f; }
+static float composer_chrome(void) {
+    return COMPOSER_MT + composer_tb() + COMPOSER_PAD * 2 + COMPOSER_MB;
+}
 #define COMPOSER_CHROME (COMPOSER_MT + COMPOSER_TB + COMPOSER_PAD * 2 + COMPOSER_MB)
 /* Resting height: one line, but never shorter than the buttons need. */
 #define COMPOSER_H      (COMPOSER_CHROME + COMPOSER_BTN)
 static float g_composer_h = COMPOSER_H;
 
 /* The box's inner height — what the text and the buttons share. */
-static float composer_inner_h(void) { return g_composer_h - COMPOSER_CHROME; }
+static float composer_inner_h(void) { return g_composer_h - composer_chrome(); }
 #define ROW_H       32.0f     /* a sidebar channel row */
 #define AVA         36.0f     /* transcript avatar diameter */
 #define LINE_H      19.0f     /* an extra (reaction/attach/thread) line */
@@ -395,6 +405,7 @@ static int  ed_has_sel(void);
 static int  ed_lines(float w);
 static void ed_draw(ID2D1RenderTarget *rt, D2D1_RECT_F box);
 static void ed_invalidate_layout(void);   /* fwd — prefs re-draw the field */
+static void ed_mode_changed(void);        /* fwd — the editor preference flips */
 static DWORD    g_last_typing;
 
 /* Sidebar row hit-boxes, captured during paint for WM_LBUTTONDOWN. */
@@ -433,6 +444,10 @@ static int g_pref_daysep    = 1;   /* date dividers in the transcript */
  * 0 = plain text, where the markup is what you see and the field never restyles
  * what you typed. Rich by default: it is the mode that needs no explaining. */
 static int g_pref_richtext  = 1;
+/* The formatting toolbar belongs to the rich editor. In plain text it would
+ * offer buttons for markup already on screen, and the honest shape of that mode
+ * is a plain box. */
+static int composer_toolbar_on(void) { return g_pref_richtext; }
 static int g_prefs_pending;        /* fold the synced values in once they land */
 /* Window placement, remembered across runs. It rides in the same synced bucket
  * as the other preferences because a client writes no files (ARCH-88) — which
@@ -5933,7 +5948,8 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     fill_round(rt, rf(bx0, by0, bx1, by1), 10.0f, OC_COL_INPUT);
     stroke_round(rt, rf(bx0, by0, bx1, by1), 10.0f, OC_COL_BORDER, 1.0f);
 
-    draw_fmt_toolbar(rt, bx0, by0, bx1);
+    if (composer_toolbar_on()) draw_fmt_toolbar(rt, bx0, by0, bx1);
+    else { for (int i = 0; i < FMT_COUNT; i++) g_fmt_btn[i] = rf(0, 0, 0, 0); g_fmt_hover = -1; }
 
     /* Buttons sit on the box's bottom line. At rest that is also its middle,
      * so a one-line composer reads as a single centred row. */
@@ -5967,7 +5983,7 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
         float tx = bx0 + 6 + sq * 3 + 8, tr = bx1 - 6 - sq - 8;
         float inner = composer_inner_h();
         float texth = inner > COMPOSER_BTN ? inner : COMPOSER_LINE;
-        float ty = by0 + COMPOSER_TB + COMPOSER_PAD +
+        float ty = by0 + composer_tb() + COMPOSER_PAD +
                    (inner > COMPOSER_BTN ? 0.0f : (COMPOSER_BTN - COMPOSER_LINE) / 2);
         ed_draw(rt, rf(tx, ty, tr, ty + texth));
     }
@@ -6436,7 +6452,7 @@ static void prefs_restore(void) {
     g_pref_density = g_prefs_snap.density;
     g_density      = g_prefs_snap.density ? 1.0f : 0.6f;
     g_pref_richtext = g_prefs_snap.richtext;
-    ed_invalidate_layout();
+    ed_mode_changed();
     snprintf(g_quick_names, sizeof g_quick_names, "%s", g_prefs_snap.quick);
     quick_rebuild();
     /* Text size, zoom and DPI each cost a font-table rebuild, so restore them
@@ -7870,6 +7886,10 @@ static int ed_canon(int pos) {
  * delete the opener for not yet having a partner. */
 static void ed_repair_orphans(void) {
     int p = 0, so, sn, i, drop[64], n = 0, caret = g_ed_caret, anchor = g_ed_anchor;
+    /* Plain text hides nothing, so there is nothing that can stop being hidden.
+     * Belt as well as braces: ed_mode_changed() re-baselines the snapshot, and
+     * this makes the pass inert in the mode it has no business running in. */
+    if (!g_pref_richtext) return;
     if (g_ed_prev_len <= 0) return;
     while (p < g_ed_prev_len && p < g_ed_len && g_ed_prev[p] == g_ed[p]) p++;
     so = g_ed_prev_len; sn = g_ed_len;
@@ -7902,6 +7922,19 @@ static void ed_remember(void) {
     g_ed_prev_len = g_ed_len;
     memcpy(g_ed_prev, g_ed, (size_t)(g_ed_len + 1) * sizeof(WCHAR));
     memcpy(g_ed_prev_hidden, g_ed_hidden, (size_t)g_ed_len);
+}
+
+/* The editor mode changed (WIN-103/104). Re-baseline before anything else can
+ * run: the snapshot the repair measures against was taken under the OTHER
+ * mode's rules, and in plain text nothing is hidden at all. Without this, the
+ * first keystroke after a switch reads every delimiter that used to be
+ * invisible as one that has stopped parsing — and deletes it. Switching to
+ * plain text and typing a character silently ate the markup it was showing you,
+ * which is the opposite of what that mode promises. */
+static void ed_mode_changed(void) {
+    ed_invalidate_layout();
+    ed_hidden_build();
+    ed_remember();
 }
 
 /* One step left/right, crossing any invisible run in the same keypress —
@@ -9052,7 +9085,7 @@ static int composer_remeasure(void) {
         if (lines < 1) lines = 1;
         if (lines > COMPOSER_MAX_LINES) lines = COMPOSER_MAX_LINES;
         float th = (float)lines * COMPOSER_LINE;
-        want = COMPOSER_CHROME + (th > COMPOSER_BTN ? th : COMPOSER_BTN);
+        want = composer_chrome() + (th > COMPOSER_BTN ? th : COMPOSER_BTN);
     }
     if (want == g_composer_h) return 0;
     g_composer_h = want;
@@ -9135,7 +9168,7 @@ static void layout_composer(HWND hwnd) {
      * pairing that has to stay true — the rect ed_hit tests against is the one
      * ed_draw paints into, and a toolbar added to only one of them would put the
      * caret a row away from the text. */
-    float ty = by0 + COMPOSER_TB + COMPOSER_PAD +
+    float ty = by0 + composer_tb() + COMPOSER_PAD +
                (inner > COMPOSER_BTN ? 0.0f : (COMPOSER_BTN - COMPOSER_LINE) / 2);
     /* Never hand back an inverted rect. members_w() should have prevented it, but
      * `right < left` is the one shape every consumer of this box gets wrong
@@ -10322,7 +10355,8 @@ static int on_click(HWND hwnd, int x, int y) {
             case PREF_ROW_DAYSEP:  g_pref_daysep = v; break;
             case PREF_ROW_EDITOR:
                 g_pref_richtext = v ? 1 : 0;
-                ed_invalidate_layout();   /* the field is drawn a different way now */
+                ed_mode_changed();        /* drawn a different way, and measured against a different baseline */
+                if (composer_remeasure()) layout_composer(hwnd);
                 break;
             case PREF_ROW_NOTIFY:  g_pref_notify = v; break;
             /* Appearance applies LIVE while the sheet is open — a colour, a text
@@ -11922,7 +11956,7 @@ static void prefs_load(const oc_model *m) {
             else if (k == 'a') oc_theme_set_scheme(val);
             else if (k == 's') g_pref_textsize = (val < 0 || val > 3) ? 1 : val;
             else if (k == 'y') { g_pref_density = val ? 1 : 0; g_density = val ? 1.0f : 0.6f; }
-            else if (k == 'r') g_pref_richtext = val ? 1 : 0;
+            else if (k == 'r') { g_pref_richtext = val ? 1 : 0; ed_mode_changed(); }
             else if (k == 'w') {
                 int a, b2, c2, d2, e2;
                 if (sscanf(p + 2, "%d,%d,%d,%d,%d", &a, &b2, &c2, &d2, &e2) == 5 && c2 > 200 && d2 > 150) {
@@ -13392,7 +13426,8 @@ static void test_poll(HWND hwnd) {
          * a preference with one tested path is a preference with an untested
          * path, and this one changes how every keystroke behaves. */
         g_pref_richtext = !strcmp(arg, "rich") ? 1 : 0;
-        ed_invalidate_layout();
+        ed_mode_changed();
+        if (composer_remeasure()) layout_composer(hwnd);
         InvalidateRect(hwnd, NULL, FALSE);
         test_ack("ok");
     } else if (!strcmp(verb, "dmcompose")) {

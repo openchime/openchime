@@ -1025,7 +1025,28 @@ fmt_reset 'a *x* b' 7
 for _ in 1 2 3; do "$DRIVE" key left >/dev/null 2>&1; done
 "$DRIVE" key back >/dev/null 2>&1
 expect_grep '^ed .*text="a \*\* b"' "plain text: the delimiters are left exactly as typed"
+# The toolbar belongs to the rich editor: in plain text it would offer buttons
+# for markup already on screen, and its row must give back the height too.
+checks=$((checks + 1))
+snap | grep -qE '^fmtbar hover=-?[0-9]+ (0,0,0,0 ?){7}$' \
+  && ok "plain text: the formatting toolbar is collapsed" \
+  || fail "plain text: toolbar still has hit-boxes — $(snap | grep '^fmtbar ')"
+
+# Switching modes must not EDIT what you wrote. It did: the repair pass measures
+# against a snapshot of what was invisible, so after a switch to plain — where
+# nothing is hidden — the first keystroke read every delimiter as one that had
+# stopped parsing and deleted it (WIN-104). Reported as "text jumping".
+fmt_reset 'a *bold* b' 10
 "$DRIVE" editor rich >/dev/null 2>&1
+"$DRIVE" editor plain >/dev/null 2>&1
+"$DRIVE" chars "X" >/dev/null 2>&1
+expect_grep '^ed .*text="a \*bold\* bX"' "switching modes leaves the markup alone"
+
+"$DRIVE" editor rich >/dev/null 2>&1
+checks=$((checks + 1))
+snap | grep -qE '^fmtbar hover=-?[0-9]+ (0,0,0,0 ?){7}$' \
+  && fail "rich text: the toolbar did not come back" \
+  || ok "rich text: the toolbar comes back"
 fmt_reset 'say *bold* now' 14
 "$DRIVE" key home >/dev/null 2>&1
 for _ in 1 2 3 4 5; do "$DRIVE" key right >/dev/null 2>&1; done
