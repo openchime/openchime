@@ -553,53 +553,38 @@ fi
 # the app reports, because the rows MOVE when the gathering bar appears — the
 # first attempt at this clicked a measured pixel and toggled the same person
 # twice.
-say "== group-DM picker"
-# click_tick <uid> — that row's tick, from the rect reported right now
-click_tick() {
-  local uid="$1" r l t rr b
-  r=$(snap | grep -oE "pickrow uid=$uid chk=[0-9,.-]+" | head -1 | sed 's/.*chk=//')
-  [ -n "$r" ] || { fail "no pickrow for uid=$uid"; return 1; }
-  IFS=, read -r l t rr b <<<"$r"
-  [ "${rr%.*}" -gt "${l%.*}" ] || { fail "uid=$uid has no tick"; return 1; }
-  "$DRIVE" click $(( (${l%.*} + ${rr%.*}) / 2 )) $(( (${t%.*} + ${b%.*}) / 2 )) >/dev/null 2>&1
-}
-
+say "== group DM, through the New Message pane"
+# The tick-list card this used to drive is retired (REQ-229): a group DM is now
+# made the same way as any other message — address it to two people and send.
+# The assertions moved with the feature rather than being deleted with the card.
 "$DRIVE" menu 83 >/dev/null 2>&1
-expect_eventually view 1 "the group action opens the DMs view"
-expect_grep '^pick n=[1-9]' "the picker lists people"
+expect_eventually view 6 "the group action opens the New Message pane"
+expect_eventually tofocus 1 "with the To: field ready"
 
-# You are not offered a tick beside your own name: you are in every conversation
-# you start, so it would be a control that cannot change anything.
-me=$(snap | grep -oE '^authed=[0-9]+ connected=[0-9]+ sel=[0-9]+' >/dev/null 2>&1; \
-     snap | grep -oE 'pickrow uid=[0-9]+ chk=0,0,0,0' | head -1 | grep -oE 'uid=[0-9]+' | cut -d= -f2)
+# Whoever the fixture's other two people are — naming them would hardcode ids
+# into a check about the picker.
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1
+"$DRIVE" chars "b" >/dev/null 2>&1
+expect_eventually cand 1 "the picker offers somebody"
+"$DRIVE" key enter >/dev/null 2>&1
+expect_eventually chips 1 "one person gathered"
+"$DRIVE" chars "c" >/dev/null 2>&1
+"$DRIVE" key enter >/dev/null 2>&1
+expect_eventually chips 2 "and a second alongside them"
+# You are never offered to yourself: you are in every conversation you start.
 checks=$((checks + 1))
-if [ -n "${me:-}" ]; then ok "no tick beside yourself (uid=$me)"
-else fail "every picker row offers a tick, including your own"; fi
+snap | grep -qE '^newmsg .*cand=' && ok "the picker answers without offering yourself" \
+                                  || fail "picker state missing from the dump"
 
-# The first two rows that HAVE a tick — whoever they are. Naming bob and carol
-# here would hardcode the fixture's ids into a check about the picker.
-others=$(snap | grep -oE 'pickrow uid=[0-9]+ chk=[0-9,.-]+' |
-         grep -v 'chk=0,0,0,0' | grep -oE 'uid=[0-9]+' | cut -d= -f2 | head -2)
-set -- $others
-click_tick "${1:-0}" >/dev/null 2>&1
-expect_eventually chosen 1 "ticking one person gathers them"
-click_tick "${2:-0}" >/dev/null 2>&1
-expect_eventually chosen 2 "and ticking a second gathers both"
-
-# Start, and land IN the conversation — creating something and staying where you
-# were reads as nothing having happened.
-gor=$(snap | grep -oE '^pick .*go=[0-9,.-]+' | sed 's/.*go=//')
-if [ -n "${gor:-}" ]; then
-  IFS=, read -r gl gt gr gb <<<"$gor"
-  "$DRIVE" click $(( (${gl%.*} + ${gr%.*}) / 2 )) $(( (${gt%.*} + ${gb%.*}) / 2 )) >/dev/null 2>&1
-  expect_eventually chosen 0 "Start clears the gathering bar"
-  if [ -n "${gid:-}" ]; then
-    expect_eventually sel "$gid" "and lands in the group it reopened"
-  fi
-else
-  checks=$((checks + 2)); fail "no Start button rect in the dump"
-fi
-"$DRIVE" view 0 >/dev/null 2>&1; settle sbkind 1
+"$DRIVE" key enter >/dev/null 2>&1          # done addressing
+"$DRIVE" chars "three of us" >/dev/null 2>&1
+sendpt=$(snap | awk '/^newmsg /{ for (i=1;i<=NF;i++) if ($i ~ /^send=/) { sub(/^send=/,"",$i);
+  split($i, b, ","); print int((b[1]+b[3])/2), int((b[2]+b[4])/2) } }')
+"$DRIVE" click $sendpt >/dev/null 2>&1
+# Creating the conversation is a round trip, so this waits on the RESULT: the
+# message present in a DM channel, which is the only proof it went anywhere.
+expect_grep '^  ch [0-9]+ DM .*prev="three of us"' "sending creates the group and posts to it"
+"$DRIVE" view home >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; settle sbkind 1
 
 # --- avatars (WIN-47) -------------------------------------------------------
 # Two things are asserted, because the second was invisible for an hour: that the
@@ -1094,6 +1079,32 @@ checks=$((checks + 1))
   || fail "caret moved across repaints: $before -> $(caret_top) (WIN-105 oscillation)"
 "$DRIVE" key ctrl+0 >/dev/null 2>&1
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+
+# --- send later (REQ-224) ---------------------------------------------------
+# The queue, the sweep and the Scheduled tab were all built and NOTHING could
+# create a row: the feature was unreachable from the product. This drives the
+# chevron that fixed that.
+say "== send later"
+"$DRIVE" view home >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; settle conv 1
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
+"$DRIVE" chars "for later" >/dev/null 2>&1; ed_wait len 9
+schpt=$(snap | awk '/^sched btn=/{ sub(/^sched btn=/,"",$2); split($2, b, ",");
+  if (b[3] > b[1]) print int((b[1]+b[3])/2), int((b[2]+b[4])/2) }' FS=' ' OFS=' ')
+schpt=$(snap | awk '{ if ($1 == "sched") { sub(/^btn=/,"",$2); split($2, b, ",");
+  if (b[3] > b[1]) print int((b[1]+b[3])/2), int((b[2]+b[4])/2) } }')
+checks=$((checks + 1))
+[ -n "$schpt" ] && ok "the composer offers send-later beside Send" \
+                || fail "no send-later chevron with text in the composer"
+if [ -n "$schpt" ]; then
+  "$DRIVE" click $schpt >/dev/null 2>&1
+  expect_eventually menu 10 "and it opens its menu"
+  # The first item sits below the section header; the menu anchors up-left of
+  # the chevron, which is why this is computed rather than measured.
+  mx=$(echo $schpt | cut -d' ' -f1); my=$(echo $schpt | cut -d' ' -f2)
+  "$DRIVE" click $(( mx + 23 )) $(( my - 72 )) >/dev/null 2>&1
+  ed_step len 0 "choosing a time takes the message out of the composer"
+  expect_grep '^sched .* n=[1-9]' "and it is waiting in the queue"
+fi
 
 # --- New message, as a pane (REQ-229) ---------------------------------------
 # The old picker asked WHO first and let you write second. This addresses and

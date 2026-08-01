@@ -977,7 +977,7 @@ static int g_n_moreflyrows;
  * 200+, 900+) and a message's "Edit = 21" would have collided with a notification
  * level. `g_menu_target` carries what the menu is about. */
 enum { MENU_NONE = 0, MENU_WS, MENU_PROFILE, MENU_NEW, MENU_SWITCHER, MENU_SECTION,
-       MENU_MSG, MENU_MEMBER, MENU_CHANNEL, MENU_THUMB };
+       MENU_MSG, MENU_MEMBER, MENU_CHANNEL, MENU_THUMB, MENU_SCHED };
 /* MK_EMOJIROW is one row holding the quick reactions side by side, each its own
  * hit-box. The native menu had them as a submenu; the custom menu has no submenus,
  * and six separate rows would bury the rest of the message actions. */
@@ -1025,6 +1025,7 @@ static int   g_n_sw;
 
 static D2D1_RECT_F g_attach_btn;        /* composer attach (+) hit-box */
 static D2D1_RECT_F g_send_btn;          /* composer send-button hit-box */
+static D2D1_RECT_F g_sched_btn;         /* "send later" chevron beside it (REQ-224) */
 static D2D1_RECT_F g_emoji_btn;         /* composer emoji-picker hit-box (WIN-8) */
 static D2D1_RECT_F g_at_btn;            /* composer mention button */
 static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
@@ -6081,7 +6082,7 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
      * layout_composer computed — the same rect ed_hit tests against, so what you
      * click is what you see. */
     {
-        float tx = bx0 + 6 + sq * 3 + 8, tr = bx1 - 6 - sq - 8;
+        float tx = bx0 + 6 + sq * 3 + 8, tr = bx1 - 6 - sq - 30;   /* room for the chevron */
         float inner = composer_inner_h();
         float lh = ed_line_h();
         float texth = inner > COMPOSER_BTN ? inner : lh;
@@ -6098,6 +6099,17 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     const oc_channel *cc = cm && g_sel ? oc_model_channel((oc_model *)cm, g_sel) : NULL;
     int ro = (cc && cc->archived);
     int has_text = !ro && ed_len() > 0;
+    /* Send later (REQ-224). The queue, the sweep and the Scheduled tab were all
+     * built and NOTHING could create a row: the feature was unreachable from
+     * the product. A chevron beside Send, where Slack puts it. */
+    /* BESIDE the field, not over it: placed inside its rect at first, where the
+     * composer's own mouse-down swallowed every click on it. */
+    g_sched_btn = rf(bx1 - 6 - sq - 26, cy + 6, bx1 - 6 - sq - 4, cy + sq - 6);
+    if (has_text)
+        draw_text(rt, "\u25BE", g_meta,
+                  rf(g_sched_btn.left, g_sched_btn.top, g_sched_btn.right, g_sched_btn.bottom),
+                  OC_COL_MUTED);
+    else g_sched_btn = rf(0, 0, 0, 0);
     g_send_btn = rf(bx1 - 6 - sq, cy, bx1 - 6, cy + sq);
     fill_round(rt, g_send_btn, 8.0f, has_text ? OC_COL_ACCENT : OC_COL_INPUT);
     if (!has_text) stroke_round(rt, g_send_btn, 8.0f, OC_COL_BORDER, 1.0f);
@@ -8037,7 +8049,11 @@ static void draw_drafts(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
                 struct tm tv;
                 if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%d %b %H:%M", &tv);
             }
-            draw_msgish_row(rt, m, row, sv->channel_id, sv->body, when,
+            /* The time is drawn to the LEFT of Cancel: draw_msgish_row puts it
+             * hard right, where the button already is, and the two printed on
+             * top of each other. */
+            D2D1_RECT_F trow = rf(row.left, row.top, row.right - 92, row.bottom);
+            draw_msgish_row(rt, m, trow, sv->channel_id, sv->body, when,
                             sv->state == OC_SCHED_FAILED ? OC_ICON_BELL : OC_ICON_SEND,
                             sv->state == OC_SCHED_FAILED ? OC_COL_AWAY : OC_COL_MUTED,
                             sv->state == OC_SCHED_FAILED ? sv->fail : NULL);
@@ -9695,6 +9711,39 @@ static void ac_accept(void) {
     ac_close();
 }
 
+/* Hand the composer's text to the daemon's queue instead of sending it now
+ * (REQ-224, ARCH-102). The body leaves the field exactly as a send would take
+ * it, so what arrives later is what you wrote. */
+static void sched_menu_run(HWND hwnd, int cmd) {
+    if (!g_client || !g_sel || ed_len() <= 0) return;
+    uint64_t now = (uint64_t)time(NULL) * 1000ULL, at = now;
+    if (cmd == 300) at = now + 30ULL * 60 * 1000;
+    else if (cmd == 301) at = now + 60ULL * 60 * 1000;
+    else if (cmd == 302) {
+        time_t t = (time_t)(now / 1000); struct tm tv;
+        if (oc_localtime_r(&t, &tv)) {
+            tv.tm_mday += 1; tv.tm_hour = 9; tv.tm_min = 0; tv.tm_sec = 0;
+            time_t when = mktime(&tv);
+            if (when > 0) at = (uint64_t)when * 1000ULL;
+        }
+    } else return;
+
+    WCHAR w[DRAFT_TEXT_MAX];
+    int n = ed_get(w, DRAFT_TEXT_MAX);
+    if (n <= 0) return;
+    int blen = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    char *b = (char *)malloc((size_t)(blen > 0 ? blen : 1));
+    if (!b) return;
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, b, blen, NULL, NULL);
+    oc_client_schedule(g_client, g_sel, 0, at, b);
+    free(b);
+    ed_clear();
+    /* The draft it came from goes with it, as it would on a send. */
+    draft_flush(g_sel);
+    toast_push("Scheduled \u2014 see Drafts, scheduled & sent.", 0);
+    ed_changed(hwnd);
+}
+
 static void composer_send(void) {
     crumb("composer_send ch=%llu", (unsigned long long)g_sel);
     if (!g_client || !g_sel) return;
@@ -9899,7 +9948,7 @@ static void layout_composer(HWND hwnd) {
      * top-aligned once the box is taller than one line so growth reads
      * downward; at rest it is centred against the buttons. */
     float sq = COMPOSER_BTN;
-    float tx = bx0 + 6 + sq * 3 + 8, tr = bx1 - 6 - sq - 8;
+    float tx = bx0 + 6 + sq * 3 + 8, tr = bx1 - 6 - sq - 30;   /* room for the chevron */
     float inner = composer_inner_h();
     float texth = inner > COMPOSER_BTN ? inner : ed_line_h();
     /* The toolbar row owns the top of the box (WIN-96); the field starts under
@@ -11276,7 +11325,8 @@ static int on_click(HWND hwnd, int x, int y) {
                 g_menu = MENU_NONE; g_menu_hover = -1;
                 /* Per-kind dispatch: a context menu's numbers are its own, so 21
                  * means Edit on a message and a notification level in a dropdown. */
-                if (kind == MENU_MSG)          msg_menu_run(hwnd, cmd);
+                if (kind == MENU_SCHED)        sched_menu_run(hwnd, cmd);
+                else if (kind == MENU_MSG)     msg_menu_run(hwnd, cmd);
                 else if (kind == MENU_MEMBER)  member_menu_run(hwnd, cmd);
                 else if (kind == MENU_CHANNEL) channel_menu_run(hwnd, cmd);
                 else if (kind == MENU_THUMB)   thumb_menu_run(hwnd, cmd);
@@ -11618,7 +11668,10 @@ static int on_click(HWND hwnd, int x, int y) {
     if (in_rect(g_attach_btn, x, y)) { upload_file(hwnd); return 1; }
     /* The Home sidebar's destinations shelf (REQ-228) — before the conversation
      * rows below it, which start where the shelf ends. */
-    if (transcript_shell() && sidebar_kind() == SBK_CHANNELS &&
+    /* sidebar_kind(), not transcript_shell(): the shelf is drawn in the Drafts
+     * and New Message panes too (they keep this sidebar), and gating on the
+     * transcript left the row you came from drawn but dead once you arrived. */
+    if (sidebar_kind() == SBK_CHANNELS &&
         x >= RAIL_W && x < RAIL_W + SIDEBAR_W) {
         for (int i = 0; i < g_n_shelf; i++)
             if (y >= g_shelf_rows[i].top && y < g_shelf_rows[i].bot) {
@@ -11651,6 +11704,20 @@ static int on_click(HWND hwnd, int x, int y) {
             ac_rebuild();
             InvalidateRect(hwnd, NULL, FALSE);
         }
+        return 1;
+    }
+    if (in_rect(g_sched_btn, x, y)) {
+        /* Presets are DURATIONS from now, plus a fixed morning — the two ways
+         * people actually name a send time. "Tomorrow morning" is 09:00 local
+         * because a scheduled message is about the recipient's day. */
+        g_n_mi = 0;
+        mi_section("SEND LATER");
+        mi_item(300, "In 30 minutes");
+        mi_item(301, "In 1 hour");
+        mi_item(302, "Tomorrow, 9:00");
+        g_menu = MENU_SCHED; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 200;
+        g_menu_x = x - 40; g_menu_y = y - 120;
+        if (g_menu_y < 8) g_menu_y = 8;
         return 1;
     }
     if (in_rect(g_send_btn, x, y))   { composer_send(); return 1; }
@@ -13158,9 +13225,9 @@ static void menu_dispatch(HWND hwnd, int cmd) {
          * failed the whole thing, and ARCH-82 says this GUI is affordance-driven.
          * The picker is the same list of people, with a tick. */
         close_overlays();
-        g_view = VIEW_DMS;
-        g_dm_compose = 1;
-        pick_clear();
+        g_view = VIEW_NEWMSG; g_nm_to_focus = 1;
+        tgt_clear();
+        newmsg_restore();
         layout_composer(hwnd);
         break;
     case 82: {   /* WIN-83 — 82 because 10 and 11 are the presence items */
@@ -13706,6 +13773,9 @@ static void test_dump(const char *path) {
     /* The New Message pane (REQ-229): where its two fields and its button are,
      * which of them has the keys, and what the picker is offering — everything
      * a test needs to drive it without measuring a screenshot. */
+    fprintf(f, "sched btn=%.0f,%.0f,%.0f,%.0f n=%zu failed=%zu\n",
+            g_sched_btn.left, g_sched_btn.top, g_sched_btn.right, g_sched_btn.bottom,
+            m ? m->n_scheds : (size_t)0, m ? oc_model_scheduled_failed(m) : (size_t)0);
     fprintf(f, "newmsg to=%.0f,%.0f,%.0f,%.0f send=%.0f,%.0f,%.0f,%.0f tofocus=%d chips=%d cand=%d\n",
             g_tgt_box.left, g_tgt_box.top, g_tgt_box.right, g_tgt_box.bottom,
             g_nm_send.left, g_nm_send.top, g_nm_send.right, g_nm_send.bottom,
@@ -14413,7 +14483,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * a message with no conversation yet, and this rule would keep
              * refilling it with the SELECTED CHANNEL's draft — which is why
              * clearing that pane appeared to do nothing at all. */
-            if (g_sel && g_view != VIEW_NEWMSG &&
+            /* ...and not while the field has FOCUS. Clicking into an empty
+             * composer is claiming it: filling it underneath you a moment later
+             * puts the restored text and what you then type into each other,
+             * which is exactly what it did — "thitthis goes out laterhis goes
+             * out later". If you are in the box, it is yours. */
+            if (g_sel && g_view != VIEW_NEWMSG && !g_ed_focus &&
                 !g_edit_msg && !g_draft_dirty && ed_len() == 0 && !g_ed_comp_len) {
                 const oc_model *dm = model();
                 const char *rd = dm ? oc_model_draft(dm, g_sel, 0) : NULL;
@@ -14479,7 +14554,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             /* A DM we asked for has arrived — select it. Picking someone should
              * land you IN the conversation, not back at the list with a new row
              * somewhere in the sidebar. */
-            if (g_n_group_pending) {
+            /* ...unless a New Message is waiting to be SENT into it (REQ-229).
+             * This block clears the pending set, so it consumed the arrival and
+             * the message never went. */
+            if (g_n_group_pending && !g_nm_pending) {
                 const oc_channel *ng = group_dm_with(m, g_group_pending, g_n_group_pending);
                 if (ng) {
                     g_n_group_pending = 0;
