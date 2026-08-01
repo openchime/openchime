@@ -31,7 +31,6 @@ pattern REQ-221 and REQ-230 both followed.
 
 | # | Item | Blocked on |
 |---|---|---|
-| **WIN-97** | **Activity filters: Unreads, DMs, Channels (REQ-139).** The feed answers "what involved me" — mentions, reactions, thread replies — and not "what have I not read". Slack's Activity has both, and the three missing filters are the second half. One query with three predicates rather than three features: *messages past my read cursor, in conversations I belong to*, filtered by kind (DMs) or by notification level (Channels), or unfiltered (Unreads). The cursor already exists — `delivery_cursors`, REQ-090. Needs a daemon half (the query and its wire op) before the Win32 tabs. Slack's saved custom views are deliberately not in scope. | P1 | M |
 | **WIN-92** | **"Pause notifications until…" (REQ-278).** The client can set a *recurring daily* window (REQ-131) and nothing else, so the most-reached-for form — "until 17:00", or for 30 minutes — is not expressible: a minutes-of-day pair is periodic, so "until 5pm today" would silence 5pm every day. **Spec settled against Slack's `dnd` API:** presets are *durations from now* (30m / 1h / 2h / until tomorrow / custom), `dnd_until_ms` on `users` with 0 meaning ended, a pause only ever adds silence, and ending a pause is distinct from ending the current scheduled period. Also needs DND carried to **other users** as a second, independent axis beside presence — the fact only, never the end time (REQ-122). VIPs pierce a pause when REQ-135 lands; senders never do (a deliberate divergence from Slack). | REQ-278 daemon half + REQ-122 presence bit |
 | **WIN-94** | **Notification schedule and keyword alerts (REQ-135/136).** Two halves of the same subsystem, both specified 2026-07-31. **Schedule:** *Every day / Weekdays / Custom* with an independent start and end per weekday, stored against the user's local calendar day — and it **replaces** REQ-131's single daily window rather than joining it, because Slack has one recurring mechanism and two would be able to disagree. **Keywords:** part of the *mentions* level rather than their own switch, matched case-insensitively and exactly, phrases allowed, surfacing in the activity feed as mentions — and firing **in threads**, where Slack's do not. **Priority people** pierce a level and a pause but never a mute. | REQ-135 / REQ-136 daemon halves |
 
@@ -96,11 +95,27 @@ pattern REQ-221 and REQ-230 both followed.
 
 ## What "closed" does and does not mean
 
-WIN-1 … WIN-91 plus WIN-93, WIN-95, WIN-96 and WIN-98 … WIN-105 are done —
+WIN-1 … WIN-91 plus WIN-93, WIN-95, WIN-96, WIN-97 and WIN-98 … WIN-106 are done —
 accessibility included, built *for* the custom controls rather than by retreating
 to native ones (ARCH-99), and rich text with its toolbar as of 2026-07-31. The
 items below are each blocked on a daemon requirement or an ARCH decision, or, in
 WIN-60's case, on a crash that has not reproduced since it was instrumented.
+
+**WIN-97 came off the blocked list on 2026-08-01**, daemon half first: one query
+with three predicates over `delivery_cursors`, and three tabs that re-ask the
+server rather than filter what the involved-me feed already returned. Building it
+found that **the Activity feed had never shown anything at all** — nothing called
+`oc_model_activity_begin`, so every row the server sent was dropped by the fold
+that gates on an open list. The filters were the reason to look.
+
+**WIN-106** is a batch of three reported from one screenshot on 2026-08-01: the
+Drafts pane lit its shelf row while leaving the conversation lit underneath it
+(two rows claiming to be where you are — selection now asks whether the main area
+is actually showing that conversation); the empty-state button's label sat on its
+bottom edge (a hand-picked top inset, now DirectWrite centring in both axes); and
+a text caret left blinking in a pane with no field, because `CreateCaret` adopts
+the *thread's* caret, so ours kept the visible state a native EDIT had set — the
+paint pass now owns its life and kills a caret nothing placed that frame.
 
 **Three of those ids did not come from this list.** WIN-98 (Ctrl+C in the
 composer copied nothing, because the transcript's handler claimed the key and

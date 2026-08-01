@@ -2693,6 +2693,62 @@ static oc_dbres *process_list_activity(sqlite3 *db, const oc_job *j) {
     if (sqlite3_step(st) == SQLITE_ROW) r->activity_seen = (uint64_t)sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
 
+    /* The three UNREAD views (REQ-139). One query with three predicates, not
+     * three features: messages past my read cursor, in a conversation I belong
+     * to, narrowed by the channel's kind or its notification level.
+     *
+     * `delivery_cursors` is REQ-090's, already maintained per (user, channel) —
+     * LEFT JOINed because a channel you have never acked has no row and every
+     * message in it is unread, which an inner join would report as none.
+     *
+     * Muted conversations are excluded (REQ-137): mute is the strongest "do not
+     * hear from this", and an inbox that lists what you muted is an inbox you
+     * stop trusting. Your own messages are excluded too — you have read what
+     * you wrote. */
+    if (j->act_filter != OC_ACTF_INVOLVED) {
+        static const char *USQL =
+            "SELECT ?5 AS kind, m.id, m.channel_id, m.author_id, m.created_at_ms, "
+            "       substr(COALESCE(m.body,''),1,?2) AS text "
+            "  FROM messages m "
+            "  JOIN channel_members cm ON cm.channel_id = m.channel_id AND cm.user_id = ?1 "
+            "  JOIN channels c ON c.id = m.channel_id "
+            "  LEFT JOIN delivery_cursors dc ON dc.channel_id = m.channel_id AND dc.user_id = ?1 "
+            "  LEFT JOIN notification_prefs np ON np.channel_id = m.channel_id AND np.user_id = ?1 "
+            " WHERE m.deleted_at_ms IS NULL "
+            "   AND m.author_id <> ?1 "
+            "   AND m.id > COALESCE(dc.message_id, 0) "
+            "   AND COALESCE(np.muted, 0) = 0 "
+            "   AND ( ?4 = 1 "
+            "         OR (?4 = 2 AND c.kind = 'dm') "
+            "         OR (?4 = 3 AND c.kind <> 'dm' "
+            "             AND COALESCE(np.level, (SELECT notify_default FROM users WHERE id=?1)) = 0) ) "
+            " ORDER BY m.created_at_ms DESC LIMIT ?3;";
+        sqlite3_prepare_v2(db, USQL, -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int  (st, 2, (int)OC_MAX_PREVIEW);
+        sqlite3_bind_int  (st, 3, (int)OC_MAX_ACTIVITY);
+        sqlite3_bind_int  (st, 4, (int)j->act_filter);
+        sqlite3_bind_int  (st, 5, (int)OC_ACT_UNREAD);
+        oc_activity_row *uarr = calloc(OC_MAX_ACTIVITY, sizeof *uarr);
+        size_t un = 0;
+        while (uarr && un < OC_MAX_ACTIVITY && sqlite3_step(st) == SQLITE_ROW) {
+            uarr[un].kind       = (uint8_t)sqlite3_column_int(st, 0);
+            uarr[un].message_id = (uint64_t)sqlite3_column_int64(st, 1);
+            uarr[un].channel_id = (uint64_t)sqlite3_column_int64(st, 2);
+            uarr[un].actor_id   = (uint64_t)sqlite3_column_int64(st, 3);
+            uarr[un].at         = (uint64_t)sqlite3_column_int64(st, 4);
+            const unsigned char *t = sqlite3_column_text(st, 5);
+            uarr[un].text = t ? strdup((const char *)t) : NULL;
+            un++;
+        }
+        sqlite3_finalize(st);
+        r->alist = uarr; r->n_alist = un;
+        /* No watermark stamp here: `activity_seen_ms` marks what is new in the
+         * INVOLVED feed, and reading your unreads is not the same act. What
+         * clears an unread is acking the conversation (REQ-090). */
+        return r;
+    }
+
     static const char *SQL =
         "SELECT kind, message_id, channel_id, actor_id, at, text FROM ("
         /* --- mentions of me --- */

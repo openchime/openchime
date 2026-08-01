@@ -851,12 +851,16 @@ reversible, so the draft waits for you rather than being discarded.
 push, exactly as `CLIENT_SETTINGS` doubles as snapshot and push — the client
 folds it the same way whatever prompted it, instead of two frames that can drift.
 
-**`LIST_ACTIVITY` (`0x0067`)** (no body) streams **`ACTIVITY_ENTRY` (`0x0068`)**
-newest first, then **`ACTIVITY` (`0x0069`)** `{ count: u32, seen_at: u64 }`.
+**`LIST_ACTIVITY` (`0x0067`)** `{ filter: u8 }` streams **`ACTIVITY_ENTRY`
+(`0x0068`)** newest first, then **`ACTIVITY` (`0x0069`)** `{ count: u32,
+seen_at: u64 }`. `filter` is `0` involved-me (the original question) · `1` unread
+· `2` unread DMs · `3` unread channels I am notified about. An **empty body** is
+read as `0`, so a client built before the filter existed keeps working — the
+frame it sends is exactly the frame it always sent.
 
 | Field        | Type | Notes                                                     |
 |--------------|------|------------------------------------------------------------|
-| `kind`       | u8   | `0` mention · `1` reaction to your message · `2` reply under your thread |
+| `kind`       | u8   | `0` mention · `1` reaction to your message · `2` reply under your thread · `3` unread (only in an unread answer) |
 | `message_id` | u64  | What to jump to.                                           |
 | `channel_id` | u64  | Where it happened.                                         |
 | `actor_id`   | u64  | Who did it — never you: a feed of your own doings is noise. |

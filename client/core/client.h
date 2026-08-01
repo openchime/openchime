@@ -148,7 +148,8 @@ void oc_client_close_saved(oc_client *c);
 
 /* What involved you — mentions, reactions to your messages, replies under them
  * (REQ-139). Opening it stamps the seen watermark server-side. */
-void oc_client_list_activity(oc_client *c);
+/* `filter` is an OC_ACTF_*: the original feed, or one of the three unread views. */
+void oc_client_list_activity(oc_client *c, uint8_t filter);
 void oc_client_close_activity(oc_client *c);
 
 void oc_client_list_members(oc_client *c, uint64_t channel_id);

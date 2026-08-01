@@ -631,9 +631,19 @@ oc_result oc_encode_saved(oc_wbuf *w, uint16_t version, const oc_saved *m) {
     oc_w_u32(w, m->count);
     return oc_frame_end(w, off);
 }
-oc_result oc_encode_list_activity(oc_wbuf *w, uint16_t version) {
+oc_result oc_encode_list_activity(oc_wbuf *w, uint16_t version, uint8_t filter) {
     size_t off = oc_frame_begin(w, version, OC_MSG_LIST_ACTIVITY);
+    oc_w_u8(w, filter);
     return oc_frame_end(w, off);
+}
+
+/* Tolerates the old empty body: a frame with nothing in it is the original
+ * question, which is what every caller meant before there was a choice. */
+oc_result oc_decode_list_activity(oc_rbuf *p, uint8_t *filter) {
+    uint8_t f = oc_r_u8(p);
+    if (p->underflow) { p->underflow = 0; f = OC_ACTF_INVOLVED; }
+    if (filter) *filter = f;
+    return OC_OK;
 }
 oc_result oc_encode_activity_entry(oc_wbuf *w, uint16_t version, const oc_activity_entry *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_ACTIVITY_ENTRY);

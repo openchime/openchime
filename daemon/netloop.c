@@ -961,6 +961,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_job *j = oc_job_new(OC_JOB_LIST_ACTIVITY, c->conn_id);
             if (!j) return -1;
             j->user_id = c->user_id;
+            { uint8_t f = OC_ACTF_INVOLVED; oc_decode_list_activity(&p, &f); j->act_filter = f; }
             oc_dbwriter_submit(dbw, j);
             continue;
         }

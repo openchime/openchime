@@ -1310,6 +1310,57 @@ else
   say "   (could not stage uia_probe.ps1 — skipping the external check)"
 fi
 
+# --- one selected row at a time (WIN-106) ----------------------------------
+# Reported from a screenshot: the Drafts pane lit its own shelf row AND left the
+# conversation lit underneath it, so two places claimed to be where you were.
+say "== sidebar selection"
+"$DRIVE" view 0 >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; settle sbkind 1
+expect_grep '^sbsel=1' "Home: the open conversation is the one selected row"
+"$DRIVE" view drafts >/dev/null 2>&1; settle sbkind 1
+expect_grep '^sbsel=1' "Drafts: its shelf row is selected and the conversation is not"
+"$DRIVE" view 0 >/dev/null 2>&1; settle sbkind 1
+
+# --- Activity: the three unread tabs (WIN-97) ------------------------------
+# These tabs are a different QUESTION, not a client-side filter of the involved-me
+# feed, so they are asserted end to end: a message arrives from SOMEBODY ELSE
+# (demo_client as bob — one session cannot make itself an unread), and the tab is
+# reached by CLICKING its chip, which is the path that broke when the chips
+# wrapped onto a second row.
+say "== activity unread filters"
+if make -C "$HERE" demo-client >/dev/null 2>&1 && [ -x "$HERE/build/demo_client" ]; then
+  # Read somewhere else first: reading #general is what clears its unread.
+  "$DRIVE" view 0 >/dev/null 2>&1; "$DRIVE" channel solo >/dev/null 2>&1; settle sbkind 1
+  gid=$(snap | grep -oE '^  ch [0-9]+ "general"' | grep -oE '[0-9]+' | head -1)
+  if [ -z "$gid" ]; then gid=1; fi
+  "$HERE/build/demo_client" 127.0.0.1 "$OC_DEV_PORT" bob pw send "$gid" "unread from bob" >/dev/null 2>&1
+  "$DRIVE" view activity >/dev/null 2>&1; settle sbkind 3
+  chip() { snap | grep -E "^  actchip i=$1 " | grep -oE 'c[xy]=[0-9]+' | cut -d= -f2 | tr '\n' ' '; }
+  # 4 = Unreads, 5 = DMs, 6 = Channels.
+  "$DRIVE" click $(chip 4) >/dev/null 2>&1
+  expect_grep '^acttab=4 actwire=1 ' "clicking Unreads selects it and asks the server the unread question"
+  checks=$((checks + 1))
+  if wait_grep '^acttab=4 actwire=1 actrows=[1-9]'; then ok "an unread from another person is listed"
+  else fail "Unreads is empty after bob posted to #general: $(snap | grep '^acttab=')"; fi
+  "$DRIVE" click $(chip 6) >/dev/null 2>&1
+  checks=$((checks + 1))
+  if wait_grep '^acttab=6 actwire=3 actrows=[1-9]'; then ok "the same message is a Channels unread"
+  else fail "Channels missed a channel unread: $(snap | grep '^acttab=')"; fi
+  "$DRIVE" click $(chip 5) >/dev/null 2>&1
+  expect_grep '^acttab=5 actwire=2 actrows=0' "DMs does not claim a channel message"
+  # Reading it clears it — the cursor, not a client-side dismissal.
+  "$DRIVE" view 0 >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; settle re 1
+  sleep 1
+  "$DRIVE" view activity >/dev/null 2>&1; settle sbkind 3
+  "$DRIVE" click $(chip 4) >/dev/null 2>&1
+  expect_grep '^acttab=4 actwire=1 actrows=0' "reading the channel clears it from Unreads"
+  # And the involved-me tabs stay a LOCAL filter: All must not have been re-asked
+  # into an unread answer.
+  "$DRIVE" click $(chip 0) >/dev/null 2>&1
+  expect_grep '^acttab=0 actwire=0 ' "All goes back to the involved-me question"
+else
+  say "   (demo_client unavailable — skipping the unread-tab checks)"
+fi
+
 # --- the composer cue tracks the conversation ------------------------------
 # It was a cached global that went stale on a channel switch ("Message bob" while
 # reading alice), so it is asserted rather than eyeballed.

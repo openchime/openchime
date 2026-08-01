@@ -1993,7 +1993,13 @@ static const struct { int act; int icon; const char *label; int admin; } RAIL_IT
 static struct { float top, bot; int view; } g_shelf_rows[4];
 static int g_n_shelf;
 static int g_shelf_hover = -1;
+/* How many sidebar rows painted themselves SELECTED this frame. Two at once is a
+ * defect the shot showed and no assertion could (WIN-106). */
+static int g_n_sbsel;
 static int ws_unread_elsewhere(void);   /* fwd */
+static int main_is_conversation(void); /* fwd — the sidebar's selection asks it too */
+static void ed_caret_kill(void);       /* fwd — the paint pass owns the caret's life */
+static int  g_caret_placed;            /* set by ed_caret_sync, cleared each paint */
 
 static void avatar_want(uint64_t aid) {
     if (!aid || g_thumbs_off || g_thumb_pending || !g_client) return;
@@ -2430,8 +2436,10 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
             { VIEW_DRAFTS, "Drafts, scheduled & sent", OC_ICON_SQUARE_PEN },
         };
         float sy = top;
+        g_n_sbsel = 0;
         for (size_t si = 0; si < sizeof SHELF / sizeof SHELF[0]; si++) {
             int on = (g_view == SHELF[si].view);
+            if (on) g_n_sbsel++;
             D2D1_RECT_F row = rf(sx0, sy, sx1, sy + ROW_H);
             if (on) fill_round(rt, row, 6.0f, OC_COL_SELECT);
             else if (g_shelf_hover == (int)si) fill_round(rt, row, 6.0f, OC_COL_HOVER);
@@ -2495,7 +2503,12 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                               rf(sx0 + 34, ey, sx1 - 12, ey + ROW_H), OC_COL_FAINT);
             }
         } else {
-            int selected = (r->channel_id == g_sel);
+            /* Selected means "this is what the main area is showing". The
+             * conversation stays REMEMBERED while a pane (Drafts, New Message)
+             * has the main area, but painting it selected then lit two rows at
+             * once (WIN-106). */
+            int selected = (r->channel_id == g_sel) && main_is_conversation();
+            if (selected) g_n_sbsel++;
             /* MUTED (REQ-137, WIN-40): the row de-emphasises and its badge goes.
              * This is what makes mute different from notification level "none" —
              * level silences the notification, mute also stops the conversation
@@ -7379,16 +7392,32 @@ static D2D1_RECT_F view_header(ID2D1RenderTarget *rt, D2D1_RECT_F reg, const cha
  * The filter is over `kind`, which is all the wire carries; Slack additionally
  * splits DMs out, which for us is a property of the channel rather than of the
  * activity, and is left until it earns its place. */
-enum { AF_ALL = 0, AF_MENTIONS, AF_REACTIONS, AF_THREADS, AF_COUNT };
+enum { AF_ALL = 0, AF_MENTIONS, AF_REACTIONS, AF_THREADS,
+       AF_UNREADS, AF_DMS, AF_CHANNELS, AF_COUNT };
 static int g_act_filter;
 static D2D1_RECT_F g_act_filters[AF_COUNT];
 static uint64_t g_act_selected;
+
+/* Which question the server is being asked for the current tab. The first four
+ * tabs are one server answer filtered here (they are all "what involved me");
+ * the last three are different QUERIES, so changing to one re-asks. */
+static uint8_t act_wire_filter(void) {
+    switch (g_act_filter) {
+        case AF_UNREADS:  return OC_ACTF_UNREADS;
+        case AF_DMS:      return OC_ACTF_DMS;
+        case AF_CHANNELS: return OC_ACTF_CHANNELS;
+        default:          return OC_ACTF_INVOLVED;
+    }
+}
 
 static int act_passes(const oc_activity_view *a) {
     switch (g_act_filter) {
         case AF_MENTIONS:  return a->kind == OC_ACT_MENTION;
         case AF_REACTIONS: return a->kind == OC_ACT_REACTION;
         case AF_THREADS:   return a->kind == OC_ACT_REPLY;
+        /* The unread views are answered by the SERVER, so everything that came
+         * back belongs to the tab that asked for it. */
+        case AF_UNREADS: case AF_DMS: case AF_CHANNELS: return a->kind == OC_ACT_UNREAD;
         default:           return 1;
     }
 }
@@ -7398,10 +7427,12 @@ static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h
     sidebar_surface(rt, h);
     draw_text(rt, "Activity", g_display, rf(x0 + 16, 0, x1 - 12, HEADER_H), OC_COL_TEXT);
 
-    static const char *L[AF_COUNT] = { "All", "Mentions", "Reactions", "Threads" };
+    static const char *L[AF_COUNT] = { "All", "Mentions", "Reactions", "Threads",
+                                       "Unreads", "DMs", "Channels" };
     float fx = x0 + 12, fy = HEADER_H - 2;
     for (int i = 0; i < AF_COUNT; i++) {
         float fw = text_width(L[i], g_meta) + 16;
+        if (fx > x0 + 12 && fx + fw > x1 - 8) { fx = x0 + 12; fy += 26; }  /* wrap: 7 chips do not fit one row */
         D2D1_RECT_F b = rf(fx, fy, fx + fw, fy + 22);
         int on = (g_act_filter == i);
         if (on) fill_round(rt, b, 6.0f, OC_COL_ACCENT);
@@ -7444,14 +7475,21 @@ static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h
         /* What kind, and where — the line Slack puts under the name. */
         const oc_channel *ch = oc_model_channel((oc_model *)m, a->channel_id);
         int icon = a->kind == OC_ACT_MENTION ? OC_ICON_AT
-                 : a->kind == OC_ACT_REACTION ? OC_ICON_SMILE : OC_ICON_DMS;
+                 : a->kind == OC_ACT_REACTION ? OC_ICON_SMILE
+                 : a->kind == OC_ACT_UNREAD ? OC_ICON_BELL : OC_ICON_DMS;
         draw_lucide(rt, icon, rf(row.left + 46, y + 25, row.left + 60, y + 39), OC_COL_FAINT);
         char whereline[128];
+        /* A DM has no name, so "in a conversation" would be the whole answer for
+         * every unread from a person — say who it is with instead (WIN-97). */
+        const char *peer = (ch && ch->kind == OC_CHANNEL_KIND_DM)
+                         ? oc_model_user_name((oc_model *)m, ch->peer_id) : NULL;
         snprintf(whereline, sizeof whereline, "%s in %s%s",
                  a->kind == OC_ACT_MENTION ? "Mention" :
-                 a->kind == OC_ACT_REACTION ? "Reaction" : "Thread",
-                 (ch && ch->name && ch->name[0]) ? "#" : "",
-                 (ch && ch->name && ch->name[0]) ? ch->name : "a conversation");
+                 a->kind == OC_ACT_REACTION ? "Reaction" :
+                 a->kind == OC_ACT_UNREAD ? "Unread" : "Thread",
+                 (ch && ch->name && ch->name[0]) ? "#" : (peer && peer[0]) ? "@" : "",
+                 (ch && ch->name && ch->name[0]) ? ch->name
+                                                 : (peer && peer[0]) ? peer : "a conversation");
         draw_text(rt, whereline, g_meta, rf(row.left + 64, y + 24, row.right - 8, y + 42),
                   OC_COL_FAINT);
         draw_text(rt, a->text ? a->text : "", g_meta_w,
@@ -7467,7 +7505,10 @@ static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h
         y += 78;
     }
     if (!shown)
-        draw_text(rt, m->n_activity ? "Nothing of that kind."
+        draw_text(rt, (g_act_filter == AF_UNREADS || g_act_filter == AF_DMS ||
+                       g_act_filter == AF_CHANNELS)
+                        ? "Nothing unread here. You are all caught up."
+                    : m->n_activity ? "Nothing of that kind."
                                     : "Nothing yet. Mentions, reactions to your messages "
                                       "and replies to your threads land here.",
                   g_meta_w, rf(x0 + 16, y + 8, x1 - 12, y + 80), OC_COL_FAINT);
@@ -7922,7 +7963,12 @@ static void draw_empty_state(ID2D1RenderTarget *rt, D2D1_RECT_F body,
         D2D1_RECT_F b = rf((body.left + body.right) / 2 - w / 2, cy + 92,
                            (body.left + body.right) / 2 + w / 2, cy + 128);
         fill_round(rt, b, 6.0f, OC_COL_ACCENT);
-        draw_text(rt, cta, g_ui, rf(b.left, b.top + 8, b.right, b.bottom), 0xFFFFFF);
+        /* Centred by DirectWrite in BOTH axes rather than by a hand-picked top
+         * inset: the inset was right for one text size and dropped the label
+         * onto the button's bottom edge at every other (WIN-106). */
+        IDWriteTextFormat_SetParagraphAlignment(g_ui, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        draw_text(rt, cta, g_ui, b, 0xFFFFFF);
+        IDWriteTextFormat_SetParagraphAlignment(g_ui, DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
         *out_btn = b;
     }
     IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
@@ -8350,7 +8396,9 @@ static void paint(HWND hwnd) {
     if (g_brush3) { D2D1_COLOR_F c3 = col(OC_COL_ACCENT); ID2D1SolidColorBrush_SetColor(g_brush3, &c3); }
 
     ID2D1RenderTarget_BeginDraw(rt);
+    g_caret_placed = 0;
     render_scene(rt, m, W, H);
+    if (!g_caret_placed) ed_caret_kill();   /* no field drew a caret this frame */
     /* Boxes placed against chrome the scene just measured, so they can only be
      * positioned after the scene is laid out. `layout_find` is here for a
      * different reason: it has to react to a menu opening, which is not a
@@ -9015,6 +9063,11 @@ static int ed_lines(float w) {
  * `WM_GETOBJECT`-less app has never had here. `g_caret_owned` is our own record
  * of having created one, because `CreateCaret` replaces the thread's caret
  * silently and destroying one we do not own would take it from a native child. */
+/* g_caret_placed (declared above, with the paint pass that clears it): a caret
+ * nobody placed this frame belongs to a field that is no longer on screen — and
+ * it does NOT go away by itself, because our CreateCaret adopts the thread's
+ * caret, so if a native EDIT had shown one, ours blinks wherever it was last
+ * put. That is the bar left sitting at the bottom of the Drafts pane (WIN-106). */
 static int   g_caret_owned;
 static POINT g_caret_at = { -32768, -32768 };
 
@@ -9028,6 +9081,7 @@ static void ed_caret_kill(void) {
 /* `cr` is the caret rect in DIPs, as the field draws it. */
 static void ed_caret_sync(D2D1_RECT_F cr) {
     if (!g_ed_focus) { ed_caret_kill(); return; }
+    g_caret_placed = 1;
     int h = PX(cr.bottom - cr.top);
     if (h < 1) h = 1;
     if (!g_caret_owned) {
@@ -11372,7 +11426,7 @@ static int on_click(HWND hwnd, int x, int y) {
                     if (act == VIEW_FILES) { g_file_chan = 0; g_filelist_from_view = 1;
                                              oc_client_list_files(g_client, 0);
                                              oc_client_list_file_channels(g_client); }
-                    if (act == VIEW_ACTIVITY) oc_client_list_activity(g_client);
+                    if (act == VIEW_ACTIVITY) oc_client_list_activity(g_client, act_wire_filter());
                     if (act == VIEW_LATER)  { g_later_chan = 0; oc_client_list_saved(g_client); }
                 }
                 else if (act == NAV_MORE)      { g_more_open = !g_more_open; }
@@ -11391,7 +11445,15 @@ static int on_click(HWND hwnd, int x, int y) {
     if (g_view == VIEW_FILES && files_click(hwnd, x, y)) return 1;
     if (g_view == VIEW_ACTIVITY) {
         for (int i = 0; i < AF_COUNT; i++)
-            if (in_rect(g_act_filters[i], x, y)) { g_act_filter = i; return 1; }
+            if (in_rect(g_act_filters[i], x, y)) {
+                uint8_t was = act_wire_filter();
+                g_act_filter = i;
+                /* Only the tabs that ask a DIFFERENT question re-fetch; moving
+                 * between the four involved-me tabs is a local filter. */
+                if (act_wire_filter() != was)
+                    oc_client_list_activity(g_client, act_wire_filter());
+                return 1;
+            }
         for (int i = 0; i < g_n_listrows; i++)
             if (in_rect(g_listrows[i].row, x, y)) {
                 /* Stay in Activity: the list is navigation, so you can walk it.
@@ -13747,6 +13809,23 @@ static void test_dump(const char *path) {
     /* The formatting toolbar's hit-boxes (WIN-96), so the smoke can CLICK the
      * buttons rather than only fire the chords — they are two paths into
      * ed_format() and a test of one is not a test of the other. */
+    /* Activity (WIN-97): which tab is selected, which question the server was
+     * asked for it, and how many rows survive act_passes() — the last is the
+     * only one an image could show, and only by counting pixels. */
+    {
+        int shown = 0;
+        if (m && g_view == VIEW_ACTIVITY)
+            for (size_t i = 0; i < m->n_activity; i++)
+                if (act_passes(&m->activity[i])) shown++;
+        fprintf(f, "acttab=%d actwire=%d actrows=%d\n",
+                g_act_filter, act_wire_filter(), shown);
+        /* The chips' hit-boxes, so a test CLICKS the tab rather than being given
+         * a verb that sets it — the click is the path that has broken. */
+        for (int i = 0; i < AF_COUNT; i++)
+            fprintf(f, "  actchip i=%d cx=%d cy=%d\n", i,
+                    (int)((g_act_filters[i].left + g_act_filters[i].right) / 2),
+                    (int)((g_act_filters[i].top + g_act_filters[i].bottom) / 2));
+    }
     /* Drafts (WIN-91): how many the model holds, whether the rail is offering
      * its destination, and whether THIS conversation has one — the three things
      * a test would otherwise have to infer from pixels. */
@@ -13780,6 +13859,7 @@ static void test_dump(const char *path) {
             g_tgt_box.left, g_tgt_box.top, g_tgt_box.right, g_tgt_box.bottom,
             g_nm_send.left, g_nm_send.top, g_nm_send.right, g_nm_send.bottom,
             g_nm_to_focus, g_n_tgt_chip, g_n_tgt);
+    fprintf(f, "sbsel=%d\n", g_n_sbsel);
     fprintf(f, "shelf n=%d", g_n_shelf);
     for (int i = 0; i < g_n_shelf; i++)
         fprintf(f, " %d:%.0f-%.0f", g_shelf_rows[i].view, g_shelf_rows[i].top, g_shelf_rows[i].bot);
@@ -14328,7 +14408,7 @@ static void test_poll(HWND hwnd) {
                 !strcmp(arg, "admin")    ? VIEW_ADMIN : atoi(arg);
         if (v >= 0 && v < VIEW_COUNT) {
             g_view = v; layout_composer(hwnd);
-            if (v == VIEW_ACTIVITY) oc_client_list_activity(g_client);
+            if (v == VIEW_ACTIVITY) oc_client_list_activity(g_client, act_wire_filter());
             if (v == VIEW_LATER)  { g_later_chan = 0; oc_client_list_saved(g_client); }
             if (v == VIEW_FILES)  { g_file_chan = 0; g_filelist_from_view = 1;
                                     oc_client_list_files(g_client, 0);

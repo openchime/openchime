@@ -1673,6 +1673,90 @@ static void test_scheduled(void) {
     cleanup_db(path);
 }
 
+/* --- Activity's unread views (REQ-139, WIN-97) ---------------------------- */
+
+static oc_dbres *activity(oc_dbwriter *w, uint64_t uid, uint8_t filter) {
+    oc_job *j = oc_job_new(OC_JOB_LIST_ACTIVITY, 920);
+    j->user_id = uid; j->act_filter = filter;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static void test_activity_unreads(void) {
+    const char *path = "build/test_dbwriter_unread.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0x91, sizeof idem);
+    uint64_t m1 = send_msg(w, bob, idem, "bob says one");
+    memset(idem, 0x92, sizeof idem);
+    uint64_t m2 = send_msg(w, bob, idem, "bob says two");
+    CHECK(m1 && m2);
+
+    /* Everything bob said is unread to alice. */
+    oc_dbres *r = activity(w, alice, OC_ACTF_UNREADS);
+    CHECK(r && r->type == OC_RES_ACTIVITY && r->n_alist == 2);
+    CHECK(r->alist[0].kind == OC_ACT_UNREAD);
+    oc_dbres_free(r);
+
+    /* Your own messages are not unread to you — you have read what you wrote. */
+    memset(idem, 0x93, sizeof idem);
+    CHECK(send_msg(w, alice, idem, "alice says something") != 0);
+    r = activity(w, alice, OC_ACTF_UNREADS);
+    CHECK(r && r->n_alist == 2);
+    oc_dbres_free(r);
+
+    /* Acking clears them: the cursor REQ-090 already maintains IS the read
+     * state, which is why this needed no new table. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_SET_READ_CURSOR, 921);
+        j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = m2;
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
+    r = activity(w, alice, OC_ACTF_UNREADS);
+    CHECK(r && r->n_alist == 0);
+    oc_dbres_free(r);
+
+    /* A channel is not a DM. */
+    memset(idem, 0x94, sizeof idem);
+    CHECK(send_msg(w, bob, idem, "after the ack") != 0);
+    r = activity(w, alice, OC_ACTF_UNREADS);  CHECK(r && r->n_alist == 1); oc_dbres_free(r);
+    r = activity(w, alice, OC_ACTF_DMS);      CHECK(r && r->n_alist == 0); oc_dbres_free(r);
+    r = activity(w, alice, OC_ACTF_CHANNELS); CHECK(r && r->n_alist == 1); oc_dbres_free(r);
+
+    /* Channels lists only what is set to ALL: turning this one down to mentions
+     * takes it out, which is the whole distinction between the two tabs. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_SET_NOTIFY_PREF, 922);
+        j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL;
+        j->notify_level = OC_NOTIFY_MENTIONS;
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
+    r = activity(w, alice, OC_ACTF_CHANNELS); CHECK(r && r->n_alist == 0); oc_dbres_free(r);
+    r = activity(w, alice, OC_ACTF_UNREADS);  CHECK(r && r->n_alist == 1); oc_dbres_free(r);
+
+    /* Muting takes it out of Unreads too (REQ-137): an inbox that lists what you
+     * muted is an inbox you stop trusting. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_SET_MUTE, 923);
+        j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL;
+        j->hook_disabled = 1;                  /* the field SET_MUTE reuses for it */
+        oc_dbwriter_submit(w, j);
+        oc_dbres_free(wait_result(w));
+    }
+    r = activity(w, alice, OC_ACTF_UNREADS); CHECK(r && r->n_alist == 0); oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_channel_mutability(void) {
     const char *path = "build/test_dbwriter_chanmut.db";
     cleanup_db(path);
@@ -4112,6 +4196,7 @@ int run_dbwriter_tests(void) {
     test_channel_details();
     test_drafts();
     test_scheduled();
+    test_activity_unreads();
     test_channel_mutability();
     test_saved_and_activity();
     test_history_around();

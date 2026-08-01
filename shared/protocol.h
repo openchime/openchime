@@ -163,7 +163,7 @@ typedef enum {
     OC_MSG_LIST_SAVED       = 0x0064, /* C->S, my saved items */
     OC_MSG_SAVED_MSG        = 0x0065, /* S->C, one saved message (streamed) */
     OC_MSG_SAVED            = 0x0066, /* S->C, terminator */
-    OC_MSG_LIST_ACTIVITY    = 0x0067, /* C->S (REQ-139), what involved me */
+    OC_MSG_LIST_ACTIVITY    = 0x0067, /* C->S (REQ-139), what involved me — or what I have not read */
     OC_MSG_ACTIVITY_ENTRY   = 0x0068, /* S->C, one activity item (streamed) */
     OC_MSG_ACTIVITY         = 0x0069, /* S->C, terminator + the seen watermark */
     OC_MSG_SET_PRESENCE     = 0x0070, /* C->S, set own presence (REQ-120) */
@@ -413,6 +413,16 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
  * (surrogate pairs are cheaper still, 4 bytes per 2 units). 16 KB clears that
  * with room and stays far under REQ-054's 64 KB body cap. */
 #define OC_DRAFT_BODY_MAX    16384u
+/* Which question LIST_ACTIVITY is asking (REQ-139). The first is the original
+ * feed — mentions, reactions, thread replies. The other three are "what have I
+ * not read", which share one shape: messages past my read cursor in a
+ * conversation I belong to, narrowed by the channel's kind or its notify level. */
+#define OC_ACTF_INVOLVED   0u
+#define OC_ACTF_UNREADS    1u
+#define OC_ACTF_DMS        2u
+#define OC_ACTF_CHANNELS   3u
+/* A row that is simply an unread message rather than something aimed at you. */
+#define OC_ACT_UNREAD      3u
 #define OC_MAX_DRAFTS          256u /* cap on a LIST_DRAFTS reply */
 #define OC_MAX_SCHEDULED       256u /* cap on a LIST_SCHEDULED reply */
 
@@ -919,7 +929,8 @@ oc_result oc_encode_saved_updated(oc_wbuf *w, uint16_t version, const oc_saved_u
 oc_result oc_encode_list_saved(oc_wbuf *w, uint16_t version);
 oc_result oc_encode_saved_msg(oc_wbuf *w, uint16_t version, const oc_saved_msg *m);
 oc_result oc_encode_saved(oc_wbuf *w, uint16_t version, const oc_saved *m);
-oc_result oc_encode_list_activity(oc_wbuf *w, uint16_t version);
+oc_result oc_encode_list_activity(oc_wbuf *w, uint16_t version, uint8_t filter);
+oc_result oc_decode_list_activity(oc_rbuf *p, uint8_t *filter);
 oc_result oc_encode_activity_entry(oc_wbuf *w, uint16_t version, const oc_activity_entry *m);
 oc_result oc_encode_activity(oc_wbuf *w, uint16_t version, const oc_activity *m);
 oc_result oc_encode_channel_info(oc_wbuf *w, uint16_t version, const oc_channel_info *m);

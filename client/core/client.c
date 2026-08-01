@@ -335,11 +335,16 @@ void oc_client_list_saved(oc_client *c) {
     if (cmd) oc_queue_push(&c->cmds, cmd);
 }
 void oc_client_close_saved(oc_client *c) { if (c) oc_model_close_saved(&c->model); }
-void oc_client_list_activity(oc_client *c) {
+void oc_client_list_activity(oc_client *c, uint8_t filter) {
     if (!c) return;
+    /* Open the list BEFORE asking, as every other list command does: the fold
+     * drops an entry that arrives while the list is closed, so without this the
+     * feed was silently empty however many rows the server sent. */
     oc_model_activity_begin(&c->model);
     oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_ACTIVITY);
-    if (cmd) oc_queue_push(&c->cmds, cmd);
+    if (!cmd) return;
+    cmd->op = filter;
+    oc_queue_push(&c->cmds, cmd);
 }
 void oc_client_close_activity(oc_client *c) { if (c) oc_model_close_activity(&c->model); }
 

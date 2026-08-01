@@ -1634,7 +1634,7 @@ static int run_connection(oc_net *n, int reconnecting,
             }
             if (c->type == OC_CMD_LIST_ACTIVITY) {
                 uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                if (oc_encode_list_activity(&w, OC_PROTOCOL_VERSION) == OC_OK)
+                if (oc_encode_list_activity(&w, OC_PROTOCOL_VERSION, c->op) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_LIST_MEMBERS) {
