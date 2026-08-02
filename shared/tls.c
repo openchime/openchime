@@ -45,10 +45,18 @@ static int bio_recv(void *ctx, unsigned char *buf, size_t len) {
     return MBEDTLS_ERR_NET_RECV_FAILED;
 }
 
-/* ALPN list offered by clients and advertised by the server, so port 443 can
- * be demultiplexed between the binary protocol and the HTTP/webhook surface
- * (PROTOCOL.md §1, ARCH-54). NULL-terminated; the array must outlive the config. */
-static const char *oc_tls_alpn[] = { OC_ALPN_PROTO, NULL };
+/* ALPN lists, so port 443 can be demultiplexed between the binary protocol and
+ * the HTTP/webhook surface (PROTOCOL.md §1, ARCH-54). NULL-terminated; each
+ * array must outlive the config that points at it.
+ *
+ * A binary-protocol client offers oc/1 alone. The server advertises oc/1 *and*
+ * http/1.1: mbedTLS picks the first entry of the server's list that the client
+ * also offers, so an oc/1 peer still gets the binary protocol, while a webhook
+ * sender — which offers a normal list such as h2,http/1.1 and would otherwise
+ * be aborted with `no_application_protocol` — negotiates http/1.1 and reaches
+ * the HTTP handler. */
+static const char *oc_tls_alpn[]        = { OC_ALPN_PROTO, NULL };
+static const char *oc_tls_alpn_server[] = { OC_ALPN_PROTO, OC_ALPN_HTTP11, NULL };
 
 static oc_tls_status status_of(int rc) {
     if (rc == MBEDTLS_ERR_SSL_WANT_READ)  return OC_TLS_WANT_READ;
@@ -161,7 +169,7 @@ int oc_tls_server_init(oc_tls_server *s, const char *cert_path, const char *key_
     mbedtls_ssl_conf_rng(&s->conf, mbedtls_ctr_drbg_random, &s->ctr_drbg);
     if ((rc = mbedtls_ssl_conf_own_cert(&s->conf, &s->cert, &s->key)) != 0)
         return rc;
-    if ((rc = mbedtls_ssl_conf_alpn_protocols(&s->conf, oc_tls_alpn)) != 0)
+    if ((rc = mbedtls_ssl_conf_alpn_protocols(&s->conf, oc_tls_alpn_server)) != 0)
         return rc;
     return 0;
 }
@@ -197,7 +205,7 @@ static int client_verify(void *ctx, mbedtls_x509_crt *crt, int depth, uint32_t *
     return 0;
 }
 
-int oc_tls_client_init_ex(oc_tls_client *c, const uint8_t *pin, int with_alpn) {
+int oc_tls_client_init_ex(oc_tls_client *c, const uint8_t *pin, const char **alpn) {
     int rc;
     static const char *pers = "openchimed-tls-client";
 
@@ -223,15 +231,16 @@ int oc_tls_client_init_ex(oc_tls_client *c, const uint8_t *pin, int with_alpn) {
      * mismatch still fails the connection (TOFU, ARCH-10). */
     mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
     mbedtls_ssl_conf_verify(&c->conf, client_verify, c);
-    /* Offer the oc/1 ALPN for the binary protocol; an HTTP/webhook client omits
-     * it so the daemon's ALPN demux (ARCH-54) routes it to the HTTP handler. */
-    if (with_alpn && (rc = mbedtls_ssl_conf_alpn_protocols(&c->conf, oc_tls_alpn)) != 0)
+    /* `alpn` selects which side of the daemon's ALPN demux (ARCH-54) this client
+     * lands on: the oc/1 list for the binary protocol, an HTTP list (or NULL,
+     * offering nothing) for the HTTP handler. */
+    if (alpn && (rc = mbedtls_ssl_conf_alpn_protocols(&c->conf, alpn)) != 0)
         return rc;
     return 0;
 }
 
 int oc_tls_client_init(oc_tls_client *c, const uint8_t *pin) {
-    return oc_tls_client_init_ex(c, pin, 1);
+    return oc_tls_client_init_ex(c, pin, oc_tls_alpn);
 }
 
 /* Where distributions keep the trusted-root bundle. Probed in order when the
@@ -245,7 +254,7 @@ static const char *const CA_BUNDLES[] = {
 };
 
 int oc_tls_client_init_ca(oc_tls_client *c, const char *ca_bundle) {
-    int rc = oc_tls_client_init_ex(c, NULL, 0);   /* no pin, no ALPN */
+    int rc = oc_tls_client_init_ex(c, NULL, NULL);   /* no pin, no ALPN */
     if (rc != 0) return rc;
     c->ca_mode = 1;
 

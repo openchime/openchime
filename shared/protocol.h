@@ -60,6 +60,12 @@
  * handler (anything else is HTTP). Clients dial OC_DEFAULT_PORT unless a SRV
  * record or .well-known metadata overrides the port. */
 #define OC_ALPN_PROTO   "oc/1"     /* ALPN id for the binary protocol */
+/* The daemon also advertises HTTP/1.1, because a webhook sender is an ordinary
+ * HTTPS client that always offers an ALPN list: advertising oc/1 alone makes the
+ * server abort every such handshake with `no_application_protocol` before the
+ * HTTP handler is reached. Second in the server's preference order, so a peer
+ * offering both still lands on the binary protocol. */
+#define OC_ALPN_HTTP11  "http/1.1" /* ALPN id for the HTTP/webhook surface */
 #define OC_DEFAULT_PORT 443        /* default client connect port */
 #define OC_HEADER_SIZE      8u     /* length(4) + version(2) + msg_type(2) */
 #define OC_LENGTH_MIN       4u     /* version(2) + msg_type(2), empty payload */

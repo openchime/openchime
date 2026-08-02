@@ -1354,7 +1354,8 @@ hits
 No CA-signed certificate for the webhook endpoint; no ACME/on-demand issuance.
 
 *Impact:* Any ordinary HTTPS sender must disable certificate verification to post a
-webhook; compounds the ALPN defect below.
+webhook. With the ALPN defect below fixed, this is now the only thing between a
+third-party sender and a working webhook.
 
 **Verified** — grep -rniE 'acme|letsencrypt|ca-signed' daemon/ shared/ scripts/ -> 0 hits;
 webhook endpoint rides the TOFU self-signed cert (shared/tls.c,
@@ -1448,6 +1449,27 @@ CA-certificate work (REQ-171) would not help; the connection dies before
 certificate trust matters. **Verified end to end** on 2026-08-02: `curl` was
 refused with `TLS alert, no application protocol (632)`, and the same request
 with `--no-alpn` succeeded.
+
+**FIXED 2026-08-02.** The daemon now advertises `oc/1` **and** `http/1.1`
+(`OC_ALPN_HTTP11`); mbedTLS selects by the server's preference order, so `oc/1`
+is still chosen whenever the peer offers it. Measured against a daemon built
+from this branch: default `curl` (offering `h2,http/1.1`) now reports `ALPN:
+server accepted http/1.1` and gets `HTTP/1.1 404` from the webhook handler for
+an unknown token — reaching the handler is the thing that was impossible — where
+before the fix the same command died at the handshake with OpenSSL reason 1120.
+`curl --http1.1` likewise returns 404 rather than failing to connect.
+
+The reason the suite never saw this is closed too: `tests/itest_netloop.c`'s
+webhook client offered **no** ALPN, the one shape that never exercises server
+selection. It now offers `h2,http/1.1` exactly as curl does, and drives the same
+200-with-`author_name` and 404 assertions through it. `tests/itest_tls.c` gains
+`test_tls_alpn_demux`, covering four peers against the real server config: an
+HTTPS list selects `http/1.1`; a peer offering both gets `oc/1`; no ALPN
+connects and selects nothing; and an `h2`-only peer is still refused, since
+serving HTTP bytes to a peer that cannot parse them is not an improvement.
+Both checks were proven to fail — reinstating the one-protocol server list
+produced 13 failing assertions across the two suites, 2 of them in the new
+`test_tls_alpn_demux` and the rest the webhook path in `itest_netloop`.
 
 ---
 

@@ -1118,8 +1118,8 @@ the requirement says so explicitly rather than implying one.
   is `application/json {"text": "..."}` or a raw `text/plain` body, capped at
   `MAX_BODY_SIZE`; the message is posted as the webhook's creator. A per-token
   fixed-window rate limit (60/min) bounds abuse. The endpoint is ALPN-demuxed on
-  the proto port (ARCH-54): a connection that doesn't negotiate `oc/1` is routed
-  to the HTTP handler.
+  the proto port (ARCH-54): the daemon advertises `oc/1` and `http/1.1`, and a
+  connection that doesn't negotiate `oc/1` is routed to the HTTP handler.
 - **REQ-171.** *(Not built)* A tenant that has enabled webhooks has had a CA-signed TLS
   certificate obtained on-demand for that endpoint, since third-party
   webhook senders validate against a standard CA trust store and cannot pin

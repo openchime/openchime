@@ -73,11 +73,9 @@ signaling and the UDP sidecar are built; the client-side codec is not
 ([docs/AUDIO.md](docs/AUDIO.md)).
 
 For what is known to be wrong with it, see
-**[docs/BACKLOG.md](docs/BACKLOG.md)**. Three daemon defects are open there, two
-of them reproduced against a running daemon: incoming webhooks are unreachable by
-ordinary HTTPS clients (the daemon advertises only the `oc/1` ALPN protocol), a
-webhook that is reachable can post into an archived channel, and two message
-types share an opcode so editing a profile drops the connection. Remaining
+**[docs/BACKLOG.md](docs/BACKLOG.md)**. Two daemon defects are open there: a
+webhook can post into an archived channel, and two message types share an opcode
+so editing a profile drops the connection. Remaining
 server-side scope includes a CA-signed certificate for the webhook endpoint
 (REQ-171).
 

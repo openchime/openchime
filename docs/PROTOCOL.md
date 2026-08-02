@@ -77,9 +77,15 @@ ARCH-25) by **ALPN** negotiated during the TLS handshake:
 
 - The client **MUST** offer ALPN **`oc/1`** (`OC_ALPN_PROTO`). The daemon
   selects it and routes the connection to the binary-protocol handler.
-- A connection that negotiates anything else (or offers `http/1.1`) is routed to
+- The daemon advertises **`oc/1` then `http/1.1`** (`OC_ALPN_HTTP11`), and
+  selection follows the *server's* order, so a peer offering both still gets the
+  binary protocol.
+- A connection that negotiates `http/1.1`, or offers no ALPN at all, is routed to
   the HTTP handler instead. Third-party webhook clients are ordinary HTTPS and
   never offer `oc/1`, so they land on the HTTP side automatically.
+- A client offering neither — `h2` alone, say — is refused during the handshake
+  with `no_application_protocol`, because the daemon speaks no protocol it asked
+  for.
 
 ```
                           TLS on :443
@@ -99,14 +105,7 @@ the landing page are on the separate plaintext health port (ARCH-25). The
 CA-signed certificate for the webhook endpoint (ARCH-34, REQ-171) is the part
 that remains unbuilt; the endpoint currently answers on the daemon's TOFU cert.
 
-> **The ALPN demux does not admit an ordinary HTTPS client.** The daemon
-> advertises exactly one protocol, `oc/1`, so a client offering any other list —
-> `h2, http/1.1`, which is every browser, `curl`, and every webhook sender —
-> is refused during the handshake with `no_application_protocol` and never
-> reaches the HTTP handler. Only a client that offers **no** ALPN at all gets
-> through. Incoming webhooks are therefore unreachable by their intended senders;
-> see [BACKLOG.md](./BACKLOG.md). The `oc`
-version suffix (`/1`) tracks the transport-framing generation, distinct from the
+The `oc` version suffix (`/1`) tracks the transport-framing generation, distinct from the
 per-frame `version` field in §2.
 
 ---
@@ -1293,10 +1292,8 @@ rejects it before the handler sees it), `404` (unknown or disabled token), `405`
 (non-POST), `413` (the raw request exceeded the read buffer, `MAX_BODY_SIZE` plus
 16 KiB, before parsing completed), `429` (per-token rate limit, 60/min).
 
-Two gaps, both in [BACKLOG.md](./BACKLOG.md): REQ-171's CA-signed certificate for
-this endpoint is not implemented, so it answers on the daemon's TOFU cert; and
-the ALPN demux in front of it refuses any client that offers a normal protocol
-list, so an ordinary HTTPS sender never reaches this handler at all. **An
+One gap, in [BACKLOG.md](./BACKLOG.md): REQ-171's CA-signed certificate for this
+endpoint is not implemented, so it answers on the daemon's TOFU cert. **An
 archived channel does not stop a webhook post** — the archived check that
 `SEND` performs is absent here.
 

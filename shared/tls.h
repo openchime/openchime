@@ -84,9 +84,10 @@ int  oc_tls_server_fingerprint(const oc_tls_server *s, uint8_t out[OC_TLS_FINGER
 /* Initialize a client. If `pin` is non-NULL it must point to
  * OC_TLS_FINGERPRINT_LEN bytes and enables TOFU pinning. Returns 0 on success. */
 int  oc_tls_client_init(oc_tls_client *c, const uint8_t *pin);
-/* As above, but `with_alpn == 0` omits the oc/1 ALPN — for an HTTP/webhook
- * client that the daemon should route to its HTTP handler (ARCH-32/54). */
-int  oc_tls_client_init_ex(oc_tls_client *c, const uint8_t *pin, int with_alpn);
+/* As above, but with an explicit NULL-terminated ALPN list (which must outlive
+ * the client): pass an HTTP list, or NULL to offer no ALPN at all, for a client
+ * the daemon should route to its HTTP handler (ARCH-32/54). */
+int  oc_tls_client_init_ex(oc_tls_client *c, const uint8_t *pin, const char **alpn);
 
 /* Initialize a client that verifies the peer against a **CA bundle** with
  * hostname checking (MBEDTLS_SSL_VERIFY_REQUIRED), for talking to a public
@@ -123,7 +124,8 @@ int  oc_tls_peer_fingerprint(const oc_tls_conn *c, uint8_t out[OC_TLS_FINGERPRIN
 int  oc_tls_conn_cert_rejected(const oc_tls_conn *c);
 
 /* The ALPN protocol negotiated on this connection, or NULL if none. The daemon
- * routes port 443 by this: OC_ALPN_PROTO is the binary protocol (PROTOCOL.md §1). */
+ * routes port 443 by this: OC_ALPN_PROTO is the binary protocol, and anything
+ * else — OC_ALPN_HTTP11, or no ALPN — is HTTP (PROTOCOL.md §1). */
 const char *oc_tls_alpn_selected(const oc_tls_conn *c);
 
 #endif /* OPENCHIME_TLS_H */

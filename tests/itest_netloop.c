@@ -121,8 +121,15 @@ static int client_open(client *c, int port, const uint8_t *pin) {
     return 0;
 }
 
-/* Open a TLS connection that does NOT offer the oc/1 ALPN, so the daemon routes
- * it to the HTTP handler (ARCH-54) — used to drive the webhook endpoint. */
+/* The ALPN list an ordinary HTTPS client offers — curl's default, and what a
+ * webhook sender such as GitHub presents. Deliberately not "no ALPN": offering
+ * nothing is the one shape that never exercised the server's ALPN selection,
+ * which is how a server list of oc/1 alone (refusing every real sender with
+ * `no_application_protocol`) went unnoticed here. */
+static const char *http_alpn[] = { "h2", OC_ALPN_HTTP11, NULL };
+
+/* Open a TLS connection as such a client, so the daemon routes it to the HTTP
+ * handler (ARCH-54) — used to drive the webhook endpoint. */
 static int http_client_open(client *c, int port, const uint8_t *pin) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
@@ -137,7 +144,7 @@ static int http_client_open(client *c, int port, const uint8_t *pin) {
         usleep(20000);
     }
     if (c->fd < 0) return -1;
-    if (oc_tls_client_init_ex(&c->cli, pin, 0) != 0) return -1;   /* no ALPN */
+    if (oc_tls_client_init_ex(&c->cli, pin, http_alpn) != 0) return -1;
     if (oc_tls_conn_init(&c->conn, &c->cli.conf, c->fd) != 0) return -1;
     if (handshake_blocking(&c->conn) != OC_TLS_OK) return -1;
     oc_framebuf_init(&c->fb);
