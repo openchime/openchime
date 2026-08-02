@@ -1877,6 +1877,53 @@ static void test_logout_closes(int port, const uint8_t *pin) {
     client_close(&a);
 }
 
+/* A post-handshake frame carrying a version other than the negotiated one is
+ * refused with a fatal ERROR and the connection closed. Before this, hdr.version
+ * was written by both sides and read by neither: the field cost two bytes a
+ * frame and bought nothing, and a peer that disagreed about a layout misparsed
+ * the payload instead of being told — surfacing as a decode failure somewhere
+ * downstream, which is what "connection lost" usually turns out to be. */
+static void test_frame_version_mismatch(int port, const uint8_t *pin) {
+    client a;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+
+    /* A frame that is valid in every respect except its version stamp. */
+    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_list_channels(&w, OC_PROTOCOL_VERSION + 1) == OC_OK);
+    CHECK(write_all(&a.conn, buf, w.len) == 0);
+
+    oc_header hdr; oc_rbuf p;
+    CHECK(read_frame(&a, &hdr, &p) == 0);
+    CHECK(hdr.msg_type == OC_MSG_ERROR);
+    oc_error err;
+    CHECK(oc_decode_error(&p, &err) == OC_OK);
+    CHECK(err.code == OC_ERR_VERSION_MISMATCH);
+    CHECK(err.fatal == 1);
+    /* The ERROR itself carries the negotiated version, not the offending one —
+     * it has to be readable by the peer we are about to hang up on. */
+    CHECK(hdr.version == OC_PROTOCOL_VERSION);
+    /* Fatal means fatal: nothing further, and the socket closes. */
+    CHECK(read_frame(&a, &hdr, &p) != 0);
+    client_close(&a);
+
+    /* The same frame at the negotiated version is answered normally — proving
+     * the check rejects the version and not the frame. */
+    client b;
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&b) == 0);
+    uint64_t ub = 0;
+    CHECK(do_auth(&b, "alice", "pw-alice", &ub) == 0);
+    oc_wbuf_init(&w, buf, sizeof buf);
+    CHECK(oc_encode_list_channels(&w, OC_PROTOCOL_VERSION) == OC_OK);
+    CHECK(write_all(&b.conn, buf, w.len) == 0);
+    CHECK(read_frame(&b, &hdr, &p) == 0);
+    CHECK(hdr.msg_type == OC_MSG_CHANNEL_LIST);
+    client_close(&b);
+}
+
 /* Concurrency load (robustness backlog #5): many clients connect, authenticate,
  * and send at once, exercising the accept path + writer + fan-out under
  * contention. Each must get an ack for every message it sent — proving the
@@ -2022,6 +2069,7 @@ int run_netloop_tests(void) {
 
     if (failures == 0) {
         test_version_reject(arg.port, pin);
+        test_frame_version_mismatch(arg.port, pin);
         test_message_vertical(arg.port, pin);
         test_backfill_reconnect(arg.port, pin);
         test_edit_delete_vertical(arg.port, pin);

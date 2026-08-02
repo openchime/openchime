@@ -287,6 +287,7 @@ typedef struct {
     obox        *obox;       /* in-memory outbox, cleared on each SEND_ACK */
     const char  *workspace;
     const char  *client_type; /* which settings bucket this frontend syncs */
+    uint16_t     version;     /* negotiated at WELCOME; every frame must carry it */
 } disp_ctx;
 
 /* Push a transfer notice (phase: 0 progress, 1 done, 2 error) to the UI. */
@@ -406,6 +407,16 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
         if (r < 0)  return -1;
         oc_header hdr; oc_rbuf p;
         if (oc_parse_frame(frame, flen, &hdr, &p) != OC_OK) return -1;
+
+        /* The version stamped on the frame must be the one this session
+         * negotiated. Dropping the connection is the whole of the response: a
+         * payload in a layout we did not agree to has no correct reading, and
+         * decoding it anyway is what turns a version disagreement into a
+         * mystery "connection lost" further down. */
+        if (hdr.version != ctx->version) {
+            push_err(ctx->to_ui, "server sent a frame with an unnegotiated protocol version");
+            return -1;
+        }
 
         if (hdr.msg_type == OC_MSG_BROADCAST) {
             oc_broadcast b;
@@ -1392,6 +1403,7 @@ static int run_connection(oc_net *n, int reconnecting,
     oc_framebuf_init(&fb);
     /* Attachment transfer state, valid from here to `drop:` (which may reset it). */
     oc_xfer xfer; memset(&xfer, 0, sizeof xfer);
+    uint16_t negotiated = 0;   /* set from WELCOME; checked on every later frame */
 
     if (do_handshake(&conn, fd, &n->stop) != 0) {
         /* A pinned handshake that fails on peer verification means the server's
@@ -1417,6 +1429,18 @@ static int run_connection(oc_net *n, int reconnecting,
         if (read_one(&conn, fd, &fb, &hdr, &p, &n->stop) != 0) goto drop;
         if (hdr.msg_type == OC_MSG_REJECT) { push_err(n->to_ui, "version rejected"); rc = RC_FATAL; goto drop; }
         if (hdr.msg_type != OC_MSG_WELCOME) goto drop;
+        /* WELCOME's payload was previously never decoded — the frame's presence
+         * was the whole handshake. The chosen version is what every later frame
+         * is checked against, so it has to be read. */
+        oc_welcome wel;
+        if (oc_decode_welcome(&p, &wel) != OC_OK) goto drop;
+        if (wel.chosen_version != OC_PROTOCOL_VERSION) {
+            /* We send min == max, so the server cannot legitimately choose
+             * anything else; if it did, we could not speak what it picked. */
+            push_err(n->to_ui, "server chose a protocol version we did not offer");
+            rc = RC_FATAL; goto drop;
+        }
+        negotiated = wel.chosen_version;
     }
 
     /* WELCOME is followed by AUTH_CHALLENGE advertising the daemon's methods
@@ -1425,6 +1449,10 @@ static int run_connection(oc_net *n, int reconnecting,
     {
         oc_header hdr; oc_rbuf p;
         if (read_one(&conn, fd, &fb, &hdr, &p, &n->stop) != 0) goto drop;
+        /* Post-handshake, so the negotiated version applies from here on — the
+         * auth exchange is checked like any other frame rather than being a
+         * window where the field is ignored. */
+        if (hdr.version != negotiated) goto drop;
         if (hdr.msg_type != OC_MSG_AUTH_CHALLENGE) goto drop;
         oc_auth_challenge ch;
         if (oc_decode_auth_challenge(&p, &ch) != OC_OK) goto drop;
@@ -1465,6 +1493,7 @@ static int run_connection(oc_net *n, int reconnecting,
         if (er != OC_OK || write_all(&conn, fd, buf, w.len, &n->stop) != 0) goto drop;
         oc_header hdr; oc_rbuf p;
         if (read_one(&conn, fd, &fb, &hdr, &p, &n->stop) != 0) goto drop;
+        if (hdr.version != negotiated) goto drop;
         if (hdr.msg_type != OC_MSG_AUTH_OK) {
             /* Bad password, or an expired/revoked session on reconnect — either
              * way there is nothing to silently retry. */
@@ -1548,7 +1577,7 @@ static int run_connection(oc_net *n, int reconnecting,
     *served = 1;
     disp_ctx ctx = { n->to_ui, &conn, fd, &n->stop, &xfer, hw,
                      cs ? cs->store : NULL, cs ? cs->obox : NULL,
-                     cs ? cs->workspace : NULL, n->client_type };
+                     cs ? cs->workspace : NULL, n->client_type, negotiated };
     while (!n->stop) {
         oc_cmd *c;
         while ((c = oc_queue_try_pop(n->from_ui)) != NULL) {

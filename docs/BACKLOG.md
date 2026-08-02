@@ -252,6 +252,37 @@ frame. It means the version field costs two bytes per frame and buys nothing,
 and that a mismatched peer would misparse rather than be told. **Verified** —
 full dispatch-path read; the `conn` struct has no version member.
 
+**FIXED 2026-08-02.** Both sides now store the negotiated version and check it
+on every post-handshake frame, before dispatch. The daemon keeps it on `conn`
+(set from the `chosen` it puts in `WELCOME`) and answers a mismatch with a fatal
+`ERROR VERSION_MISMATCH` (**1006**, a new reason code) then closes. The client
+keeps it in `disp_ctx` — which required decoding `WELCOME`'s payload at all, as
+it previously only checked that the frame *was* a `WELCOME` and never read
+`chosen_version` — and drops the connection with a stated reason. The handshake
+frames are exempt, being frozen at 1.
+
+1006 is its own code rather than `MALFORMED_FRAME`: the frame is not malformed,
+it parses fine. The peer agreed a version and then sent another, which is a
+different fact and one a client should be able to report differently. The
+`ERROR` is stamped with the *negotiated* version, not the offending one — it has
+to be readable by the peer being hung up on.
+
+Measured, daemon side: `test_frame_version_mismatch` authenticates, sends a
+`LIST_CHANNELS` that is valid in every respect except its version stamp, and
+asserts `ERROR VERSION_MISMATCH` with `fatal = 1`, that the error frame itself
+carries the negotiated version, and that the socket then closes. It then sends
+the *same* frame at the right version and gets a normal `CHANNEL_LIST` back,
+which is what proves the check rejects the version rather than the frame.
+Proven to fail: disabling the daemon check produces 4 failing assertions.
+
+Measured, client side: no test can fault-inject this, since the core's test
+drives a real in-process daemon. So it was measured once by hand, as an A/B
+against a daemon deliberately stamping `AUTH_CHALLENGE` with
+`OC_PROTOCOL_VERSION + 1`. With the client check in place the client refuses and
+never authenticates; with only that check disabled and the same broken daemon,
+**the whole suite passes green** — the wrong version goes entirely unnoticed,
+which is the defect this item describes, demonstrated rather than argued.
+
 ## 10. `UNEXPECTED_MSG_TYPE` is never sent
 
 `OC_ERR_UNEXPECTED_MSG_TYPE` (1005) appears in no `.c` file. A first frame that

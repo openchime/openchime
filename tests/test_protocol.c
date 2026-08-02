@@ -1208,6 +1208,7 @@ static void test_reason_codes_unique(void) {
         { "VERSION_TOO_OLD",        OC_ERR_VERSION_TOO_OLD },
         { "VERSION_TOO_NEW",        OC_ERR_VERSION_TOO_NEW },
         { "UNEXPECTED_MSG_TYPE",    OC_ERR_UNEXPECTED_MSG_TYPE },
+        { "VERSION_MISMATCH",       OC_ERR_VERSION_MISMATCH },
         { "FRAME_TOO_LARGE",        OC_ERR_FRAME_TOO_LARGE },
         { "AUTH_INVALID_TOKEN",     OC_ERR_AUTH_INVALID_TOKEN },
         { "AUTH_REQUIRED",          OC_ERR_AUTH_REQUIRED },

@@ -108,6 +108,11 @@ typedef struct {
     oc_framebuf  fb;
     conn_state   state;
     int          did_hello;
+    /* The version this session negotiated, from WELCOME. Every post-handshake
+     * frame must carry it (PROTOCOL.md §2.1): the field describes the layout the
+     * payload is in, so a frame that disagrees cannot be decoded correctly by
+     * definition, whatever it happens to parse as. */
+    uint16_t     version;
     int          authed;
     uint64_t     user_id;
     uint64_t     session_id;   /* REQ-182: which sessions row this conn uses */
@@ -601,6 +606,7 @@ static int handle_hello(conn *c, oc_rbuf *payload, oc_dbwriter *dbw) {
     oc_welcome wel = { chosen, now_ms() };
     oc_encode_welcome(&w, &wel);
     out_append(c, tmp, w.len);
+    c->version = chosen;   /* what every later frame on this connection must carry */
 
     /* Immediately advertise the auth methods this deployment accepts (AUTH.md
      * §5) — local+session, or oidc+session in OIDC mode — plus the OIDC params
@@ -713,6 +719,22 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             c->did_hello = 1;
             if (handle_hello(c, &p, dbw) < 0) return -1;
             continue;
+        }
+
+        /* Every frame after the handshake must carry the negotiated version.
+         * Until this check existed the field was decorative — two bytes on every
+         * frame that nothing read — so a peer that disagreed about a layout
+         * misparsed the payload instead of being told, which surfaces as a
+         * decode failure somewhere downstream and reads as "connection lost".
+         * Fatal, and answered before dispatch: a frame whose layout we do not
+         * share is not one to act on. */
+        if (hdr.version != c->version) {
+            uint8_t ebuf[128]; oc_wbuf ew; oc_wbuf_init(&ew, ebuf, sizeof ebuf);
+            oc_error err = { OC_ERR_VERSION_MISMATCH, 1, oc_slice_str("frame"),
+                             oc_slice_str("frame version is not the negotiated one") };
+            oc_encode_error(&ew, c->version, &err);
+            out_append(c, ebuf, ew.len);
+            return -1;
         }
 
         if (!c->authed) {

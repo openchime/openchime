@@ -323,6 +323,13 @@ typedef enum {
     OC_ERR_MALFORMED_FRAME     = 1003,
     OC_ERR_FRAME_TOO_LARGE     = 1004,
     OC_ERR_UNEXPECTED_MSG_TYPE = 1005,
+    /* A post-handshake frame stamped with a version other than the one this
+     * session negotiated. Distinct from VERSION_TOO_OLD/TOO_NEW, which answer a
+     * HELLO and precede a session: this one says the peer already agreed and
+     * then sent something else, so the disagreement is about a frame rather
+     * than about the connection. Fatal — the negotiated layout is the only
+     * basis on which the payload could be read at all. */
+    OC_ERR_VERSION_MISMATCH    = 1006,
     OC_ERR_AUTH_REQUIRED       = 2001,
     OC_ERR_AUTH_INVALID_TOKEN  = 2002,
     OC_ERR_AUTH_RATE_LIMITED   = 2003,

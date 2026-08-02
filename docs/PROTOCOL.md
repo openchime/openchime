@@ -136,12 +136,15 @@ type-specific payload. All multi-byte integers are **network byte order**
 | `payload`  | var  | `length - 4` bytes, laid out per the message type at that version.  |
 
 - `version` is present on **every** frame, not only the first, so a frame is
-  self-describing. A session negotiates a single version at handshake (§3) and
-  both sides stamp it on every frame they send. **Neither side reads it again**:
-  the negotiated version is not stored on the connection, and dispatch is on
-  `msg_type` alone, so a frame carrying a different version is processed
-  normally rather than rejected. The field is therefore descriptive, not
-  enforced — see [BACKLOG.md](./BACKLOG.md).
+  self-describing. A session negotiates a single version at handshake (§3), both
+  sides store it on the connection, and **both sides check it on every
+  post-handshake frame before dispatch**. A frame stamped with anything else is
+  refused rather than decoded: the field names the layout the payload is in, so a
+  frame that disagrees has no correct reading regardless of what it would parse
+  as. The daemon answers a fatal `ERROR VERSION_MISMATCH` (`1006`) — itself
+  stamped with the *negotiated* version, so the peer being hung up on can read
+  it — and closes; the client drops the connection and reports it. The handshake
+  frames are exempt, being frozen at 1 (§3).
 - The `HELLO`, `WELCOME` and `REJECT` handshake frames are **frozen at version 1**
   (`OC_HANDSHAKE_VERSION`), so negotiation itself can never hit a version
   mismatch: the frames that exist to discover a mismatch must not be able to be
@@ -1955,9 +1958,10 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 |--------|-----------------------|------------|-------|----------------------------------------------------------------|
 | `1001` | `VERSION_TOO_OLD`     | handshake  | yes   | Client's `max_version` < server minimum. Show "please update." |
 | `1002` | `VERSION_TOO_NEW`     | handshake  | yes   | Client's `min_version` > server maximum. Operator must upgrade the daemon; do **not** prompt the user to update the app. |
-| `1003` | `MALFORMED_FRAME`     | any        | yes   | Unparseable frame, or `version` not equal to the negotiated one. |
+| `1003` | `MALFORMED_FRAME`     | any        | yes   | Unparseable frame.                                             |
 | `1004` | `FRAME_TOO_LARGE`     | any        | yes   | `length` implies a frame larger than `MAX_FRAME_SIZE`.         |
 | `1005` | `UNEXPECTED_MSG_TYPE` | any        | yes   | Reserved for a frame not valid in the current state. **Never emitted**: a non-`HELLO` first frame closes the socket silently and an unrecognised post-auth type is ignored. A `SEND` before `AUTH_OK` gets `AUTH_REQUIRED` instead. |
+| `1006` | `VERSION_MISMATCH`    | post-hello | yes   | A post-handshake frame carried a `version` other than the negotiated one. Distinct from `1001`/`1002`, which answer a `HELLO` and precede a session: this says the peer agreed and then sent something else. The `ERROR` itself is stamped with the negotiated version, so it is readable by the peer being disconnected. |
 | `2001` | `AUTH_REQUIRED`       | post-hello | yes   | A messaging frame arrived before successful `AUTH`.            |
 | `2002` | `AUTH_INVALID_TOKEN`  | auth       | yes   | JWT failed signature/audience/expiry validation (REQ-023).     |
 | `2003` | `AUTH_RATE_LIMITED`   | auth       | yes   | Too many auth attempts for this tenant (REQ-191).              |
