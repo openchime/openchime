@@ -156,6 +156,12 @@ type-specific payload. All multi-byte integers are **network byte order**
 > same version number while disagreeing about what it means, and the failure
 > surfaces as a decode error mid-session rather than a clean rejection.
 >
+> **Reassigning an opcode is the same kind of change** and gets the same bump,
+> even though no payload moved: v8 moved `TYPING`/`TYPING_UPDATE` to
+> `0x007E`/`0x007F`, and to a v7 peer a v8 `TYPING` frame *is* a `PROFILE_INFO` —
+> decoded as the wrong struct rather than rejected, which is precisely what the
+> version number exists to prevent.
+>
 > This is written down because it was learned the hard way: `CHANNEL_INFO` and
 > `CHANNEL_LIST` both grew fields while the version stayed at 1, and a client
 > built from the new source talking to a daemon still running the old binary
@@ -1146,13 +1152,13 @@ no database of its own) and compares it per frame, so an expiry needs no sweep �
 but a pause that runs out is re-announced on the next tick, since only a frame can
 untell the people who were told.
 
-**`TYPING` (client → server), msg_type `0x0072`** `{ channel_id: u64 }` — the
+**`TYPING` (client → server), msg_type `0x007E`** `{ channel_id: u64 }` — the
 caller signals they are composing in `channel_id`. The server resolves the
 channel's members (on the read connection, ARCH-66) and, if the caller has access,
 relays to the other connected members only — private-channel and DM typing never
 leaks to non-members.
 
-**`TYPING_UPDATE` (server → client), msg_type `0x0073`** `{ channel_id: u64,
+**`TYPING_UPDATE` (server → client), msg_type `0x007F`** `{ channel_id: u64,
 user_id: u64 }` — delivered to each connected member of `channel_id` except the
 sender. There is **no expiry frame and no "stopped typing" signal**: the client
 displays the indicator and expires it locally after **~6 seconds**, refreshed by
@@ -1987,10 +1993,13 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 opcode order, 154 of them. The sections above specify the payload layouts; this
 table is the index and the authority on which values are taken.
 
-Three opcodes are **used by two message types each** (`0x0070`, `0x0072`,
-`0x0073`), marked below. Two of the three pairs are direction-disjoint and inert;
+One opcode is **used by two message types** (`0x0070`), marked below:
 `SET_PROFILE`/`SET_PRESENCE` are both client→server and collide for real. See
-[BACKLOG.md](./BACKLOG.md).
+[BACKLOG.md](./BACKLOG.md). The other two shared values are gone — `TYPING` and
+`TYPING_UPDATE` moved to `0x007E`/`0x007F` in v8, leaving `0x0072` to
+`PROFILE_INFO` and `0x0073` to `LIST_FILE_CHANNELS` alone. `scripts/check_opcodes.sh`
+(run by `make test` and CI) fails on any duplicate outside that one tracked
+exception, so this table cannot silently regain a shared value.
 
 | msg_type | Name | Direction | Notes |
 |---|---|---|---|
@@ -2084,10 +2093,8 @@ Three opcodes are **used by two message types each** (`0x0070`, `0x0072`,
 | `0x0070` | `SET_PRESENCE` | C → S | set own presence (REQ-120) **(opcode shared)** |
 | `0x0070` | `SET_PROFILE` | C → S | my title/timezone **(opcode shared)** |
 | `0x0071` | `PRESENCE_UPDATE` | S → C | a user's presence changed |
-| `0x0072` | `PROFILE_INFO` | S → C | a user's full profile (also a push) **(opcode shared)** |
-| `0x0072` | `TYPING` | C → S | "I am typing" in a channel (REQ-121) **(opcode shared)** |
-| `0x0073` | `LIST_FILE_CHANNELS` | C → S |  **(opcode shared)** |
-| `0x0073` | `TYPING_UPDATE` | S → C | relay of a typing signal **(opcode shared)** |
+| `0x0072` | `PROFILE_INFO` | S → C | a user's full profile (also a push) |
+| `0x0073` | `LIST_FILE_CHANNELS` | C → S |  |
 | `0x0074` | `FILE_CHANNELS` | S → C | (channel_id, count) pairs |
 | `0x0075` | `LIST_SESSIONS` | C → S |  |
 | `0x0076` | `SESSION_LIST` | S → C | never the tokens |
@@ -2097,6 +2104,8 @@ Three opcodes are **used by two message types each** (`0x0070`, `0x0072`,
 | `0x007B` | `DELETE_EMOJI` | C → S | name |
 | `0x007C` | `LIST_EMOJI` | C → S | ask for the catalogue |
 | `0x007D` | `EMOJI_LIST` | S → C | the catalogue (also a push) |
+| `0x007E` | `TYPING` | C → S | "I am typing" in a channel (REQ-121) |
+| `0x007F` | `TYPING_UPDATE` | S → C | relay of a typing signal |
 | `0x0080` | `UPLOAD_BEGIN` | C → S | declare an attachment upload (REQ-140) |
 | `0x0081` | `UPLOAD_READY` | S → C | id + chunk size + in-flight window |
 | `0x0082` | `UPLOAD_CHUNK` | C → S | one upload chunk |

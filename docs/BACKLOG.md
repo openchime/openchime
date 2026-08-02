@@ -184,6 +184,31 @@ asserted by `tests/itest_netloop.c:942`. The pair that is *not* direction-disjoi
 `SET_PROFILE` and `SET_PRESENCE` — is a live defect; see "Editing a profile
 drops the connection and saves nothing".
 
+**FIXED 2026-08-02.** `TYPING` and `TYPING_UPDATE` move to `0x007E`/`0x007F`,
+which clears both collisions by relocating two values rather than four: they are
+the only contiguous pair among the three frames involved, so moving them leaves
+`0x0072` to `PROFILE_INFO` and `0x0073` to `LIST_FILE_CHANNELS` without splitting
+any other pair. `OC_PROTOCOL_VERSION` goes to **8** — no payload layout changed,
+which is the one case the "bump on layout change" rule does not name, but a v7
+peer's `TYPING` *is* a v8 peer's `PROFILE_INFO`, so it is exactly the silent
+mis-decode the version exists to convert into a clean `REJECT`.
+
+Measured: the full suite passes on the new values, including the typing round
+trip (`itest_netloop.c:942`) that drives `TYPING` → `TYPING_UPDATE` end to end.
+`test_version_reject` gains the other half of the bump's guarantee — a peer
+speaking version 7 is refused with `VERSION_TOO_OLD` — proven to fail by widening
+the daemon's accepted range to `OC_PROTOCOL_VERSION - 1`, which produced 3 failing
+assertions.
+
+The absence that let two collisions land is closed: `scripts/check_opcodes.sh`
+parses every `OC_MSG_*` in `shared/protocol.h` and fails on any duplicate, run by
+`make test` and by CI's build job. It reports 156 opcodes, all unique, with one
+declared exception — `0x0070`, carried by both `SET_PROFILE` and `SET_PRESENCE`,
+named in the script with its backlog item so that removing the line is what turns
+enforcement on. Proven to fail: putting `TYPING` back on `0x0072` exits 1 naming
+both types; pointed at a file with no opcodes it exits 2 rather than passing
+vacuously.
+
 ## 8. Handshake frames are not stamped version 1
 
 `PROTOCOL.md` and `shared/protocol.h:986` both state that `HELLO`/`WELCOME`/

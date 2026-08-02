@@ -270,6 +270,20 @@ static void test_version_reject(int port, const uint8_t *pin) {
     CHECK(oc_decode_reject(&p, &rej) == OC_OK);
     CHECK(rej.code == OC_ERR_VERSION_TOO_NEW);
     client_close(&c);
+
+    /* And the previous version is refused as TOO_OLD. This is what a version
+     * bump has to buy to be worth making: v8 reassigned TYPING/TYPING_UPDATE to
+     * 0x007E/0x007F, so a v7 peer's TYPING frame would arrive as PROFILE_INFO —
+     * the daemon advertises min == max == OC_PROTOCOL_VERSION precisely so that
+     * pair never reaches a decoder. */
+    client d;
+    CHECK(client_open(&d, port, pin) == 0);
+    CHECK(send_hello(&d, OC_PROTOCOL_VERSION - 1, OC_PROTOCOL_VERSION - 1) == 0);
+    CHECK(read_frame(&d, &hdr, &p) == 0);
+    CHECK(hdr.msg_type == OC_MSG_REJECT);
+    CHECK(oc_decode_reject(&p, &rej) == OC_OK);
+    CHECK(rej.code == OC_ERR_VERSION_TOO_OLD);
+    client_close(&d);
 }
 
 static void test_message_vertical(int port, const uint8_t *pin) {

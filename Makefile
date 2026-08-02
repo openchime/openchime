@@ -68,7 +68,7 @@ endif
 TUI_INC   := $(CORE_INC) -Iclient/tui -Iclient/shared -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
-.PHONY: all run test integration core tui bench clean s3-smoke windows-tui windows-gui tuikit-demo demo-client
+.PHONY: all run test check-opcodes integration core tui bench clean s3-smoke windows-tui windows-gui tuikit-demo demo-client
 
 all: $(BIN)
 
@@ -90,9 +90,14 @@ $(BIN): $(SRC) $(MBEDTLS_A) $(HDRS)
 $(MBEDTLS_A):
 	scripts/build_mbedtls.sh
 
+# The wire contract's one static invariant: no two message types share an opcode.
+# A source check rather than a C test, because a C test cannot enumerate an enum.
+check-opcodes:
+	scripts/check_opcodes.sh shared/protocol.h
+
 # Unit + in-process integration tests, one binary (docs/TESTING.md §2). Built
 # -O0 -g; a non-zero exit fails the build and CI.
-test: $(TEST_BIN)
+test: check-opcodes $(TEST_BIN)
 	./$(TEST_BIN)
 
 $(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(HDRS) $(wildcard tests/*.h client/core/*.h) $(MBEDTLS_A) | build

@@ -38,7 +38,13 @@
  * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
  * preview_author. Shipping client and daemon together (ARCH-61) means there is
  * no compatibility window to preserve — only a mismatch to detect loudly. */
-/* 7: USER_LIST carries title, timezone and custom status (REQ-289) — a repeated
+/* 8: TYPING and TYPING_UPDATE move to 0x007E/0x007F, off the two opcodes they
+ * shared with PROFILE_INFO and LIST_FILE_CHANNELS. No frame's layout changed, so
+ * this is the one case the rule above does not cover — but it is a wire change
+ * of exactly the kind the version exists to make loud: a v7 peer's TYPING is a
+ * v8 peer's PROFILE_INFO, decoded as a different struct rather than rejected.
+ *
+ * 7: USER_LIST carries title, timezone and custom status (REQ-289) — a repeated
  * list, so an added field shifts every entry after the first.
  *
  * 6: NOTIFY_PREFS drops the three DND-window fields — the recurring schedule is
@@ -52,7 +58,7 @@
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
  * "connection lost" (ARCH-61 ships the two together). */
-#define OC_PROTOCOL_VERSION 7u
+#define OC_PROTOCOL_VERSION 8u
 
 /* Transport conventions (see PROTOCOL.md §1). The binary protocol shares TLS
  * port 443 with the future HTTP/webhook surface, demultiplexed by ALPN: a
@@ -184,8 +190,16 @@ typedef enum {
     OC_MSG_ACTIVITY         = 0x0069, /* S->C, terminator + the seen watermark */
     OC_MSG_SET_PRESENCE     = 0x0070, /* C->S, set own presence (REQ-120) */
     OC_MSG_PRESENCE_UPDATE  = 0x0071, /* S->C, a user's presence changed */
-    OC_MSG_TYPING           = 0x0072, /* C->S, "I am typing" in a channel (REQ-121) */
-    OC_MSG_TYPING_UPDATE    = 0x0073, /* S->C, relay of a typing signal */
+    /* Moved off 0x0072/0x0073 in v8: those two values were each carried by a
+     * second message type (PROFILE_INFO, LIST_FILE_CHANNELS). Each pair was
+     * direction-disjoint, so nothing misdecoded — but the safety came from the
+     * dispatch chains happening to hold one branch per value, which is a
+     * property the next inbound branch silently removes. Typing moves rather
+     * than the other two because it is the only contiguous pair among them, so
+     * two values buy back both collisions. 0x0070 still carries two types
+     * (SET_PROFILE/SET_PRESENCE) and is a live defect, tracked separately. */
+    OC_MSG_TYPING           = 0x007E, /* C->S, "I am typing" in a channel (REQ-121) */
+    OC_MSG_TYPING_UPDATE    = 0x007F, /* S->C, relay of a typing signal */
     OC_MSG_UPLOAD_BEGIN     = 0x0080, /* C->S, declare an attachment upload (REQ-140) */
     OC_MSG_UPLOAD_READY     = 0x0081, /* S->C, id + chunk size + in-flight window */
     OC_MSG_UPLOAD_CHUNK     = 0x0082, /* C->S, one upload chunk */

@@ -56,6 +56,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends libsqlite3-dev bzip2
       - name: Build daemon
         run: make
+      # Also a prerequisite of `make test`; named here so a duplicate opcode
+      # fails as itself rather than inside the test step.
+      - name: Check opcode uniqueness
+        run: make check-opcodes
       - name: Run unit tests
         run: |
           if ls tests/*.c >/dev/null 2>&1; then
