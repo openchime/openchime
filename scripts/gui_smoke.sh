@@ -1401,7 +1401,7 @@ expect_grep '^schedbase=.* tpopen=0 ' "escape closes it without changing anythin
 # Custom expands seven days, pre-filled as a working week — every day off would
 # be a schedule that silences everything the moment it is chosen.
 "$DRIVE" click $(mode_xy 3) >/dev/null 2>&1
-expect_grep '^keywords=.* schedmode=3 scheddays=7' "Custom expands the whole week"
+expect_grep '^keywords=.* schedmode=3 .*scheddays=7' "Custom expands the whole week"
 expect_grep '^  schedrow wd=1 on=1 win=540-1020' "Monday is on, 09:00-17:00"
 expect_grep '^  schedrow wd=0 on=0 ' "Sunday is off"
 # A day toggles through its own checkbox.
@@ -1415,7 +1415,7 @@ expect_grep '^  schedrow wd=6 on=1 ' "a day switches on from its checkbox"
 "$DRIVE" launch >/dev/null 2>&1
 wait_for authed 1 >/dev/null 2>&1
 expect_typeable "the client takes the keyboard after a restart"
-expect_grep '^keywords="deploy,release train" nvip=1 schedmode=3 scheddays=7' \
+expect_grep '^keywords="deploy,release train" nvip=1 schedmode=3 .*scheddays=7' \
             "keywords, priority people and the whole custom week survive a restart"
 
 "$DRIVE" menu 71 >/dev/null 2>&1

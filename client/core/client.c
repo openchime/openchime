@@ -10,6 +10,7 @@
 #include "protocol.h"   /* the OC_NOTIFY_* levels are wire constants */
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 struct oc_client {

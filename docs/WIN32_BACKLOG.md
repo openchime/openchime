@@ -34,21 +34,41 @@ pattern REQ-221 and REQ-230 both followed.
 
 ## WIN-107 — a visual pass over the whole shell
 
-Raised 2026-08-01, from the running client rather than from a list: features have
-been landing faster than the surfaces they live on have been re-read, and the
-result is a set of small formatting defects that individually look like nothing
-and together look like carelessness. WIN-106 fixed three of them one at a time,
-which is the wrong shape — three more appeared in the next screenshot.
+**First pass done 2026-08-02**, screen by screen against the running client, with
+Slack as the reference rather than taste. What it found and fixed:
 
-So this is one deliberate pass, screen by screen, against the running client:
-spacing and alignment in the sidebar rows and their badges, the presence and
-do-not-disturb marks (small, dark, and hung off the avatar's corner), transcript
-gutters and the day divider, the composer's toolbar and its two rows, empty
-states, and every pane the rail can reach. Each fix asserted where the assertion
-can outlive it — geometry in the dump, not eyeballed once.
+- **The transcript's timestamp was right-aligned to the pane edge.** Slack puts it
+  inline beside the author. On a wide window ours left a hand's width of nothing
+  between a name and its time, and made the eye cross the whole transcript to
+  answer "when". Now inline.
+- **The members pane showed with no conversation open** — in the DMs index it
+  listed the roster of the channel you had *left*, which reads as a fact about the
+  empty pane. Gated on the same predicate as the composer.
+- **Sidebar helper text was cut mid-word** ("…once something i") in Files and
+  Later: a non-wrapping format in a fixed box. Wraps now.
+- **Activity's filter chips took three rows** of a 248px column after WIN-97 added
+  three. Tighter padding fits them in two.
+- **The People search box had no chrome** — an unframed EDIT on a white pane:
+  reported visible by the harness and invisible to a person.
+- **A People row with no title sat high**, its name pinned to the top of a 56px
+  row with an empty half beneath, which reads as a missing field. Centres now.
+- **Drafts rows had no timestamp**, so the list could not be triaged; the row
+  helper already had the field.
+- **The Threads card** put its reply count and unread pill at the far right and a
+  standing "Turn off replies" label in the corner. Slack has the count under the
+  message on the left and the action in a ⋯ overflow; ours does now.
+- **The Notifications card promised Cancel and could not keep it.** Every control
+  in it applies immediately — the level chips always did, and the keyword,
+  priority and schedule editors do too — so Cancel could only compensate for the
+  two settings it knew about while silently keeping the other three. One **Done**
+  button, as Slack has.
+- Earlier in the same pass: the presence/DND mark inset into the avatar with a
+  2px ring instead of hanging off its corner (it read as an artifact, not a
+  status).
 
-**Not to be interleaved with feature work.** The point is to look at the whole
-thing at once, which is exactly what shipping a feature at a time cannot do.
+**Still open in this item:** the transcript's gutters and day divider, the
+composer's two toolbar rows, and empty-state art. They need the same treatment and
+did not get it here.
 
 ## WIN-110 — AutomationIds on every actionable element (REQ-290)
 

@@ -520,14 +520,26 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 /* REQ-289: the profile fields now travel with the roster, so a
                  * client knows them for EVERYONE rather than only for itself.
                  * Fixed-size copies, as oc_member holds them. */
-                { size_t n2 = ue[i].title.len < sizeof e->pf_title - 1 ? ue[i].title.len : sizeof e->pf_title - 1;
-                  if (n2) memcpy(e->pf_title, ue[i].title.ptr, n2); e->pf_title[n2] = '\0'; }
-                { size_t n2 = ue[i].timezone.len < sizeof e->pf_tz - 1 ? ue[i].timezone.len : sizeof e->pf_tz - 1;
-                  if (n2) memcpy(e->pf_tz, ue[i].timezone.ptr, n2); e->pf_tz[n2] = '\0'; }
-                { size_t n2 = ue[i].status_emoji.len < sizeof e->emoji - 1 ? ue[i].status_emoji.len : sizeof e->emoji - 1;
-                  if (n2) memcpy(e->emoji, ue[i].status_emoji.ptr, n2); e->emoji[n2] = '\0'; }
-                { size_t n2 = ue[i].status_text.len < sizeof e->author_name - 1 ? ue[i].status_text.len : sizeof e->author_name - 1;
-                  if (n2) memcpy(e->author_name, ue[i].status_text.ptr, n2); e->author_name[n2] = '\0'; }
+                {
+                    size_t n2 = ue[i].title.len < sizeof e->pf_title - 1 ? ue[i].title.len : sizeof e->pf_title - 1;
+                    if (n2) memcpy(e->pf_title, ue[i].title.ptr, n2);
+                    e->pf_title[n2] = '\0';
+                }
+                {
+                    size_t n2 = ue[i].timezone.len < sizeof e->pf_tz - 1 ? ue[i].timezone.len : sizeof e->pf_tz - 1;
+                    if (n2) memcpy(e->pf_tz, ue[i].timezone.ptr, n2);
+                    e->pf_tz[n2] = '\0';
+                }
+                {
+                    size_t n2 = ue[i].status_emoji.len < sizeof e->emoji - 1 ? ue[i].status_emoji.len : sizeof e->emoji - 1;
+                    if (n2) memcpy(e->emoji, ue[i].status_emoji.ptr, n2);
+                    e->emoji[n2] = '\0';
+                }
+                {
+                    size_t n2 = ue[i].status_text.len < sizeof e->author_name - 1 ? ue[i].status_text.len : sizeof e->author_name - 1;
+                    if (n2) memcpy(e->author_name, ue[i].status_text.ptr, n2);
+                    e->author_name[n2] = '\0';
+                }
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_PRESENCE_UPDATE) {

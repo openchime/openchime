@@ -250,10 +250,7 @@ static void draw_presence_dot_dnd(ID2D1RenderTarget *rt, float cx, float cy, flo
     }
 }
 
-static void draw_presence_dot(ID2D1RenderTarget *rt, float cx, float cy, float r,
-                              uint8_t presence, uint32_t surface) {
-    draw_presence_dot_dnd(rt, cx, cy, r, presence, surface, 0);
-}
+
 
 /* Typed modal form fields (WIN-21); form_dialog() is defined further down. */
 enum { FF_TEXT = 0, FF_PASSWORD, FF_CHECK, FF_CHOICE };
@@ -920,10 +917,12 @@ static D2D1_RECT_F g_notify_kw_btn, g_notify_vip_btn;
 /* The Threads pane (REQ-062): its unread-only toggle and the per-card
  * "turn off replies" targets. */
 static char        g_dir_filter[80];     /* the People pane's search text (REQ-289) */
+static D2D1_RECT_F g_dir_search_box;
 static HWND        g_dir_edit;
 static int         g_threads_unread;
 static D2D1_RECT_F g_threads_unread_btn;
 static D2D1_RECT_F g_thread_follow_hit[32];
+static uint64_t    g_thread_menu_root;   /* which card's overflow is open */
 static D2D1_RECT_F g_sched_mode_hit[4];
 static D2D1_RECT_F g_sched_base_hit[2];
 static D2D1_RECT_F g_sched_day_chk[7];
@@ -1053,7 +1052,7 @@ static int g_n_moreflyrows;
  * 200+, 900+) and a message's "Edit = 21" would have collided with a notification
  * level. `g_menu_target` carries what the menu is about. */
 enum { MENU_NONE = 0, MENU_WS, MENU_PROFILE, MENU_NEW, MENU_SWITCHER, MENU_SECTION,
-       MENU_MSG, MENU_MEMBER, MENU_CHANNEL, MENU_THUMB, MENU_SCHED };
+       MENU_MSG, MENU_MEMBER, MENU_CHANNEL, MENU_THUMB, MENU_SCHED, MENU_THREAD };
 /* MK_EMOJIROW is one row holding the quick reactions side by side, each its own
  * hit-box. The native menu had them as a submenu; the custom menu has no submenus,
  * and six separate rows would bury the rest of the message actions. */
@@ -3047,7 +3046,11 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
         draw_user_avatar(rt, m, msg->author_id, nm, rf(ax, ty, ax + AVA, ty + AVA),
                          g_avatar, 0, 0);
 
-        /* Author + timestamp on the header line. */
+        /* Author, then the time INLINE beside it — Slack's shape, and the one
+         * that reads as "alice said this at 10:25" rather than as a mail client's
+         * date column. Right-aligning it to the pane edge put metres of whitespace
+         * between a name and its time on a wide window, and made the eye travel
+         * the full width of the transcript to answer "when" (WIN-107). */
         D2D1_RECT_F hl = rf(tx, ty, x0 + content_w + AVA + 12, ty + 20);
         draw_text(rt, nm, g_title, hl, OC_COL_TEXT);
         if (msg->server_time) {
@@ -3055,7 +3058,9 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
             struct tm tv; char when[24] = "";
             if (oc_localtime_r(&t, &tv))
                 strftime(when, sizeof when, g_pref_time24 ? "%H:%M" : "%I:%M %p", &tv);
-            draw_text(rt, when, g_meta_r, hl, OC_COL_FAINT);
+            float wx = tx + text_width(nm, g_title) + 8;
+            if (wx < hl.right - 60)
+                draw_text(rt, when, g_meta, rf(wx, ty + 2, hl.right, ty + 20), OC_COL_FAINT);
         }
     }
 
@@ -5106,8 +5111,10 @@ static void draw_chan_column(ID2D1RenderTarget *rt, const oc_model *m, float h,
         y = r.bottom + 2;
     }
     if (!n_census)
-        draw_text(rt, empty_hint, g_meta,
-                  rf(RAIL_W + 16, y + 2, RAIL_W + SIDEBAR_W - 12, y + 60), OC_COL_FAINT);
+        /* WRAPPING: g_meta does not, so this sentence was cut mid-word at the
+         * sidebar's edge — "once something i" (WIN-107). */
+        draw_text(rt, empty_hint, g_meta_w,
+                  rf(RAIL_W + 16, y + 2, RAIL_W + SIDEBAR_W - 12, y + 76), OC_COL_FAINT);
     else if (foot)
         draw_text(rt, foot, g_meta, rf(RAIL_W + 16, h - 26, RAIL_W + SIDEBAR_W - 12, h - 6),
                   OC_COL_FAINT);
@@ -6383,6 +6390,7 @@ static void composer_cue(const oc_model *m, char *out, size_t cap);   /* fwd */
 
 static int main_is_conversation(void);   /* fwd — decides the composer, chrome and child alike */
 static float members_w(float client_w_dip); /* fwd — the members pane yields when narrow */
+static int   main_is_conversation(void);    /* fwd — and it belongs to a conversation */
 
 /* ---- the formatting toolbar (WIN-96) --------------------------------------
  * Seven buttons, drawn rather than iconised. B / I / S are the letterforms
@@ -7020,33 +7028,6 @@ static void prefs_restore(void) {
  * simply restore locals: Cancel has to re-send whatever it changed. The snapshot
  * is the levels as they were when the sheet opened, and restore re-sends only the
  * rows that differ — silence for the untouched ones. */
-static struct { uint64_t cid; uint8_t level; } g_notify_snap[64];
-static int g_n_notify_snap;
-static uint8_t g_notify_snap_default;     /* REQ-134 */
-
-static void notify_snapshot(void) {
-    const oc_model *m = model();
-    g_n_notify_snap = 0;
-    if (!m) return;
-    g_notify_snap_default = m->notify_default;
-    for (size_t i = 0; i < m->n_channels && g_n_notify_snap < 64; i++) {
-        g_notify_snap[g_n_notify_snap].cid   = m->channels[i].channel_id;
-        g_notify_snap[g_n_notify_snap].level = m->channels[i].notify_level;
-        g_n_notify_snap++;
-    }
-}
-
-static void notify_restore(void) {
-    const oc_model *m = model();
-    if (!m || !g_client) return;
-    for (int i = 0; i < g_n_notify_snap; i++) {
-        const oc_channel *c = oc_model_channel((oc_model *)m, g_notify_snap[i].cid);
-        if (c && c->notify_level != g_notify_snap[i].level)
-            oc_client_set_notify_pref(g_client, g_notify_snap[i].cid, g_notify_snap[i].level);
-    }
-    if (m->notify_default != g_notify_snap_default)
-        oc_client_set_notify_default(g_client, g_notify_snap_default);
-}
 
 static const oc_modal_spec *modal_current(void) {
     static oc_modal_spec sp;
@@ -7079,10 +7060,15 @@ static const oc_modal_spec *modal_current(void) {
         sp.title = "Notifications";
         sp.subtitle = "Per conversation, plus keywords, priority people and your schedule.";
         sp.size = MODAL_LG;
-        sp.buttons[0] = (oc_mbtn){ "Cancel", MB_NORMAL,  MODAL_CANCEL };
-        sp.buttons[1] = (oc_mbtn){ "Save",   MB_PRIMARY, MODAL_OK };
-        sp.n_buttons = 2;
-        sp.snapshot = notify_snapshot; sp.restore = notify_restore; sp.commit = NULL;
+        /* ONE button, as Slack's notification preferences have. Every control
+         * here applies the moment it is clicked — the level chips always did,
+         * and the keyword, priority and schedule editors reach the server the
+         * same way — so a Cancel could only ever have undone the two settings it
+         * knew how to compensate for, while silently keeping the other three.
+         * A promise the card cannot keep is worse than no promise. */
+        sp.buttons[0] = (oc_mbtn){ "Done", MB_PRIMARY, MODAL_OK };
+        sp.n_buttons = 1;
+        sp.snapshot = NULL; sp.restore = NULL; sp.commit = NULL;
     } else if (g_sessions_open) {
         sp.title = "Active sessions";
         sp.subtitle = "Where you are signed in. Sign out everywhere revokes all of them.";
@@ -7577,7 +7563,7 @@ static const oc_channel *group_dm_with(const oc_model *m, const uint64_t *ids, i
 static void rel_day(uint64_t ms, char *out, size_t cap) {
     time_t t = (time_t)(ms / 1000), now = time(NULL);
     struct tm tv, nv;
-    if (!oc_localtime_r(&t, &tv) || !oc_localtime_r(&now, &nv)) { snprintf(out, cap, ""); return; }
+    if (!oc_localtime_r(&t, &tv) || !oc_localtime_r(&now, &nv)) { if (cap) out[0] = '\0'; return; }
     int dt = tv.tm_yday, dn = nv.tm_yday;
     if (tv.tm_year == nv.tm_year && dt == dn)      snprintf(out, cap, "Today");
     else if (tv.tm_year == nv.tm_year && dt == dn - 1) snprintf(out, cap, "Yesterday");
@@ -7866,8 +7852,11 @@ static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h
                                        "Unreads", "DMs", "Channels" };
     float fx = x0 + 12, fy = HEADER_H - 2;
     for (int i = 0; i < AF_COUNT; i++) {
-        float fw = text_width(L[i], g_meta) + 16;
-        if (fx > x0 + 12 && fx + fw > x1 - 8) { fx = x0 + 12; fy += 26; }  /* wrap: 7 chips do not fit one row */
+        /* 12px of padding and a 3px gap rather than 16 and 4: seven chips then
+         * fit TWO rows in a 248px column instead of three, and three rows of
+         * chrome above a list is chrome outweighing content (WIN-107). */
+        float fw = text_width(L[i], g_meta) + 12;
+        if (fx > x0 + 12 && fx + fw > x1 - 8) { fx = x0 + 12; fy += 26; }
         D2D1_RECT_F b = rf(fx, fy, fx + fw, fy + 22);
         int on = (g_act_filter == i);
         if (on) fill_round(rt, b, 6.0f, OC_COL_ACCENT);
@@ -7875,7 +7864,7 @@ static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h
         draw_text(rt, L[i], g_meta, b, on ? 0xFFFFFF : OC_COL_MUTED);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
         g_act_filters[i] = b;
-        fx = b.right + 4;
+        fx = b.right + 3;
     }
 
     g_n_listrows = 0;
@@ -8355,7 +8344,7 @@ static void newmsg_send(HWND hwnd) {
         }
     } else {
         uint64_t ids[OC_MAX_GROUP_DM]; int k = 0;
-        for (int i = 0; i < g_n_tgt_chip && k < OC_MAX_GROUP_DM; i++)
+        for (int i = 0; i < g_n_tgt_chip && k < (int)OC_MAX_GROUP_DM; i++)
             if (!g_tgt_chip[i].is_channel) ids[k++] = g_tgt_chip[i].id;
         free(g_nm_pending); g_nm_pending = strdup(b);
         g_nm_wait_uid = 0;
@@ -8445,6 +8434,21 @@ static void draw_msgish_row(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
 static D2D1_RECT_F g_dtab_hit[DTAB_COUNT];
 static D2D1_RECT_F g_dnew_btn;
 
+/* A thread card's overflow (REQ-062). Its own numbers, like every other context
+ * menu: the dropdown space is crowded and "700" here cannot be mistaken for a
+ * notification level there. */
+static void thread_menu_run(HWND hwnd, int cmd) {
+    (void)hwnd;
+    uint64_t root = g_menu_target, cid = g_menu_target2;
+    g_thread_menu_root = 0;
+    if (!root) return;
+    switch (cmd) {
+    case 700: oc_client_thread_follow(g_client, cid, root, 0); break;
+    case 701: oc_client_mark_thread_read(g_client, root, 0); break;
+    default: break;
+    }
+}
+
 /* Does this person match what was typed? Name, title and status, because those
  * are the three things visible in the row — searching over a field the row does
  * not show makes a match look like a bug. Disabled accounts are out: a directory
@@ -8473,9 +8477,18 @@ static void draw_directory(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
     D2D1_RECT_F body = view_header(rt, reg, "People",
                                    "Everyone in this workspace.");
     g_n_listrows = 0;
-    /* The search box is a native EDIT, placed by layout_natives like every other
-     * one in this app; here we only leave room for it. */
-    body.top += 46;
+    /* The search field's CHROME — the rounded container and the glyph — with the
+     * native EDIT placed inside it by layout_dir_find, exactly as the Files
+     * search is built. Reserving the space without painting the box left an
+     * unframed EDIT on a white pane: reported visible by the harness and
+     * invisible to a person, which is the worst of both. */
+    g_dir_search_box = rf(body.left + 20, body.top + 8, body.left + 360, body.top + 40);
+    fill_round(rt, g_dir_search_box, 8.0f, OC_COL_INPUT);
+    stroke_round(rt, g_dir_search_box, 8.0f, OC_COL_BORDER, 1.0f);
+    draw_lucide(rt, OC_ICON_SEARCH,
+                rf(g_dir_search_box.left + 9, g_dir_search_box.top + 8,
+                   g_dir_search_box.left + 25, g_dir_search_box.top + 24), OC_COL_MUTED);
+    body.top += 52;
 
     char filter[80];
     snprintf(filter, sizeof filter, "%s", g_dir_filter);
@@ -8505,9 +8518,6 @@ static void draw_directory(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
         draw_presence_dot_dnd(rt, row.left + 40, y + 38, 4.5f,
                               oc_model_presence_of(m, u->user_id), OC_COL_BASE,
                               oc_model_dnd_of(m, u->user_id));
-        draw_text(rt, u->name[0] ? u->name : "user", g_ui_b,
-                  rf(row.left + 56, y + 8, row.right - 200, y + 28), OC_COL_TEXT);
-
         /* Title, or the custom status when there is one — Slack shows the status
          * in its place, because it is the more current of the two. */
         char sub[160];
@@ -8515,6 +8525,13 @@ static void draw_directory(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
             snprintf(sub, sizeof sub, "%s%s%s", u->status_emoji,
                      u->status_emoji[0] ? "  " : "", u->status_text);
         else snprintf(sub, sizeof sub, "%s", u->title);
+        /* With nothing underneath it the name CENTRES on the avatar; two lines
+         * sit either side of it. A name pinned to the top of a 56px row with an
+         * empty half beneath reads as a missing field rather than as a person
+         * who has not set one. */
+        float ny = sub[0] ? y + 8 : y + 16;
+        draw_text(rt, u->name[0] ? u->name : "user", g_ui_b,
+                  rf(row.left + 56, ny, row.right - 200, ny + 20), OC_COL_TEXT);
         if (sub[0])
             draw_text(rt, sub, g_meta, rf(row.left + 56, y + 27, row.right - 200, y + 47),
                       OC_COL_MUTED);
@@ -8626,32 +8643,40 @@ static void draw_threads(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
                   rf(card.left + 52, card.top + 46, card.right - 140, card.top + 84),
                   OC_COL_MUTED);
 
-        /* The reply count, and the unread pill Slack puts beside it. */
-        char rc[48];
-        snprintf(rc, sizeof rc, "%u repl%s", t->reply_count, t->reply_count == 1 ? "y" : "ies");
-        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
-        draw_text(rt, rc, g_meta, rf(card.right - 130, card.top + 56, card.right - 16,
-                                     card.top + 76), OC_COL_ACCENT);
-        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
-        if (t->unread) {
-            char up[24]; snprintf(up, sizeof up, "%u new", t->unread);
-            float pw = text_width(up, g_micro) + 16;
-            D2D1_RECT_F pill = rf(card.right - 130 - pw - 8, card.top + 56,
-                                  card.right - 130 - 8, card.top + 76);
-            fill_round(rt, pill, 10.0f, OC_COL_ACCENT);
-            IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_CENTER);
-            draw_text(rt, up, g_micro, pill, 0xFFFFFF);
-            IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_LEADING);
+        /* The reply count under the message and to the LEFT, where Slack puts it
+         * — it belongs to the conversation above it, not to the card's far edge,
+         * and right-aligning it left a hand's width of nothing between the text
+         * and its own count. The unread pill sits beside it. */
+        {
+            char rc[48];
+            snprintf(rc, sizeof rc, "%u repl%s", t->reply_count,
+                     t->reply_count == 1 ? "y" : "ies");
+            float fy = card.bottom - 26;
+            draw_text(rt, rc, g_meta, rf(card.left + 52, fy, card.left + 200, fy + 20),
+                      OC_COL_ACCENT);
+            if (t->unread) {
+                char up[24]; snprintf(up, sizeof up, "%u new", t->unread);
+                float pw = text_width(up, g_micro) + 16;
+                float px2 = card.left + 56 + text_width(rc, g_meta) + 10;
+                D2D1_RECT_F pill = rf(px2, fy, px2 + pw, fy + 19);
+                fill_round(rt, pill, 9.0f, OC_COL_ACCENT);
+                IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_CENTER);
+                draw_text(rt, up, g_micro, pill, 0xFFFFFF);
+                IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_LEADING);
+            }
         }
 
-        /* Turning replies off, which is the other half of REQ-062: following is
-         * derived from having replied, so leaving is an explicit act. */
+        /* Turning replies off is REQ-062's other half, and it lives behind an
+         * overflow rather than as a permanent label: Slack keeps it in the card's
+         * ⋯ menu, and a standing "Turn off replies" in the corner is both clutter
+         * and something to hit by accident on the way to opening the thread. */
         {
-            D2D1_RECT_F fb = rf(card.right - 130, card.top + 28, card.right - 16, card.top + 50);
-            IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_TRAILING);
-            draw_text(rt, "Turn off replies", g_micro, fb, OC_COL_FAINT);
-            IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_LEADING);
-            g_thread_follow_hit[i] = fb;
+            D2D1_RECT_F ob = rf(card.right - 44, card.top + 26, card.right - 16, card.top + 50);
+            if (g_listrow_hover == t->root_id || g_thread_menu_root == t->root_id)
+                fill_round(rt, ob, 6.0f, OC_COL_INPUT);
+            draw_lucide(rt, OC_ICON_ELLIPSIS, rf(ob.left + 5, ob.top + 4, ob.right - 5, ob.bottom - 4),
+                        OC_COL_MUTED);
+            g_thread_follow_hit[i] = ob;
         }
 
         if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
@@ -8714,7 +8739,12 @@ static void draw_drafts(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
             if (y > body.bottom) break;
             D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + rowh - 6);
             if (g_listrow_hover == dv->channel_id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
-            draw_msgish_row(rt, m, row, dv->channel_id, dv->body, NULL,
+            /* When it was last touched, right-aligned as Slack's drafts list has
+             * it: a list of drafts with no times cannot be triaged, and the row
+             * already had the field (WIN-107). */
+            char dwhen[24] = "";
+            if (dv->updated_ms) rel_time(dv->updated_ms, dwhen, sizeof dwhen);
+            draw_msgish_row(rt, m, row, dv->channel_id, dv->body, dwhen[0] ? dwhen : NULL,
                             OC_ICON_SQUARE_PEN, OC_COL_MUTED, NULL);
             if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
                 g_listrows[g_n_listrows].row = row;
@@ -10610,6 +10640,11 @@ static void layout_find(HWND hwnd);   /* fwd */
 static float members_w(float client_w_dip) {
     const oc_model *m = model();
     if (!g_show_members || !m || !m->authed) return 0;
+    /* A roster with no conversation beside it is the LAST conversation's roster:
+     * in the DMs index with nothing picked, the pane listed the members of the
+     * channel you had left, which reads as a fact about the empty pane (WIN-107).
+     * The same predicate the composer uses — one question, one answer. */
+    if (!main_is_conversation()) return 0;
     return (client_w_dip - RAIL_W - SIDEBAR_W - MEMBERS_W < MAIN_MIN_W) ? 0 : MEMBERS_W;
 }
 
@@ -10784,8 +10819,12 @@ static void layout_dir_find(HWND hwnd) {
     if (!g_dir_edit) return;
     int want = (g_view == VIEW_DIRECTORY) && !window_is_covered();
     if (!want) { ShowWindow(g_dir_edit, SW_HIDE); return; }
-    float x = RAIL_W + SIDEBAR_W + 24, y = HEADER_H + 10;
-    MoveWindow(g_dir_edit, PX(x), PX(y), PX(320), PX(24), TRUE);
+    /* Inside the box the painter measured, inset so the container reads as the
+     * control's border — g_dir_search_box is only valid after a paint, which is
+     * why this runs from the paint path too. */
+    if (g_dir_search_box.right <= g_dir_search_box.left) { ShowWindow(g_dir_edit, SW_HIDE); return; }
+    MoveWindow(g_dir_edit, PX(g_dir_search_box.left + 30), PX(g_dir_search_box.top + 7),
+               PX(g_dir_search_box.right - g_dir_search_box.left - 42), PX(18), TRUE);
     ShowWindow(g_dir_edit, SW_SHOW);
 }
 
@@ -12209,6 +12248,7 @@ static int on_click(HWND hwnd, int x, int y) {
     /* An open dropdown menu takes clicks first: a row runs its command; a click
      * anywhere else dismisses it. */
     if (g_menu) {
+        if (g_menu != MENU_THREAD) g_thread_menu_root = 0;
         for (int i = 0; i < g_n_mirows; i++)
             if ((float)y >= g_mirows[i].top && (float)y < g_mirows[i].bot &&
                 (float)x >= g_menu_x && (float)x < g_menu_x + g_menu_w) {
@@ -12216,7 +12256,8 @@ static int on_click(HWND hwnd, int x, int y) {
                 g_menu = MENU_NONE; g_menu_hover = -1;
                 /* Per-kind dispatch: a context menu's numbers are its own, so 21
                  * means Edit on a message and a notification level in a dropdown. */
-                if (kind == MENU_SCHED)        sched_menu_run(hwnd, cmd);
+                if (kind == MENU_THREAD)       thread_menu_run(hwnd, cmd);
+                else if (kind == MENU_SCHED)   sched_menu_run(hwnd, cmd);
                 else if (kind == MENU_MSG)     msg_menu_run(hwnd, cmd);
                 else if (kind == MENU_MEMBER)  member_menu_run(hwnd, cmd);
                 else if (kind == MENU_CHANNEL) channel_menu_run(hwnd, cmd);
@@ -12302,8 +12343,16 @@ static int on_click(HWND hwnd, int x, int y) {
             const oc_model *tm = model();
             for (int i = 0; tm && i < (int)tm->n_threads && i < 32; i++)
                 if (in_rect(g_thread_follow_hit[i], x, y)) {
-                    oc_client_thread_follow(g_client, tm->threads[i].channel_id,
-                                            tm->threads[i].root_id, 0);
+                    g_thread_menu_root = tm->threads[i].root_id;
+                    g_menu_target  = tm->threads[i].root_id;
+                    g_menu_target2 = tm->threads[i].channel_id;
+                    g_n_mi = 0;
+                    mi_item(700, "Turn off replies");
+                    mi_item(701, "Mark as read");
+                    g_menu = MENU_THREAD; g_menu_headerblock = 0; g_menu_hover = -1;
+                    g_menu_w = 200;
+                    g_menu_x = g_thread_follow_hit[i].left - 160;
+                    g_menu_y = g_thread_follow_hit[i].bottom + 4;
                     return 1;
                 }
         }
