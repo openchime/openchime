@@ -74,7 +74,11 @@ static void test_handshake_frames(void) {
     {
         oc_hello in = { 1, 3, oc_slice_str("openchime-desktop/0.1 linux") };
         ROUNDTRIP(oc_encode_hello(&w, &in), OC_MSG_HELLO, h, p);
-        CHECK(h.version == OC_PROTOCOL_VERSION); /* HELLO is frozen at v1 */
+        /* Frozen at 1, asserted as the literal rather than via the constant:
+         * the point is that this value does NOT track OC_PROTOCOL_VERSION, and
+         * an assertion written in terms of the constant would follow it. */
+        CHECK(h.version == 1);
+        CHECK(OC_HANDSHAKE_VERSION == 1);
         oc_hello out;
         CHECK(oc_decode_hello(&p, &out) == OC_OK);
         CHECK(out.min_version == 1 && out.max_version == 3);
@@ -83,6 +87,7 @@ static void test_handshake_frames(void) {
     {
         oc_welcome in = { 2, 1751200000000ull };
         ROUNDTRIP(oc_encode_welcome(&w, &in), OC_MSG_WELCOME, h, p);
+        CHECK(h.version == 1);   /* frozen, and independent of chosen_version */
         oc_welcome out;
         CHECK(oc_decode_welcome(&p, &out) == OC_OK);
         CHECK(out.chosen_version == 2 && out.server_time == 1751200000000ull);
@@ -90,6 +95,10 @@ static void test_handshake_frames(void) {
     {
         oc_reject in = { OC_ERR_VERSION_TOO_OLD, oc_slice_str("please update") };
         ROUNDTRIP(oc_encode_reject(&w, &in), OC_MSG_REJECT, h, p);
+        /* REJECT matters most: it is the frame sent TO a peer whose version we
+         * have just refused, so it is the one that must be decodable by a peer
+         * that agrees with us about nothing else. */
+        CHECK(h.version == 1);
         oc_reject out;
         CHECK(oc_decode_reject(&p, &out) == OC_OK);
         CHECK(out.code == OC_ERR_VERSION_TOO_OLD);

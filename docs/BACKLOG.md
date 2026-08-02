@@ -223,6 +223,25 @@ mismatch — does not hold: it rests on a constant the encoders never write. The
 documentation now records the actual behaviour; the code is unchanged.
 **Verified.**
 
+**FIXED 2026-08-02.** The three encoders stamp `OC_HANDSHAKE_VERSION` (1), a
+named constant rather than a literal so the freeze is stated where it is relied
+on. The claimed property now holds in code, and the documentation goes back to
+stating it rather than disclaiming it.
+
+Measured: `test_handshake_frames` asserts `h.version == 1` on all three frames —
+written as the **literal**, not as `OC_HANDSHAKE_VERSION`, because the property
+is precisely that this value does not track `OC_PROTOCOL_VERSION`, and an
+assertion phrased in terms of a constant follows the constant wherever it goes.
+The old assertion was `h.version == OC_PROTOCOL_VERSION` under a comment reading
+"HELLO is frozen at v1" — the test had been reconciled to the code rather than
+to the specification, which is why the suite was green while the property was
+false. Proven to fail: restamping `REJECT` with `OC_PROTOCOL_VERSION` produces
+1 failing assertion.
+
+`REJECT` is the frame that makes this matter — it is sent *to* a peer whose
+version has just been refused, so it is the one that has to be decodable by a
+peer that agrees about nothing else.
+
 ## 9. The per-frame version is never validated after the handshake
 
 Neither side reads `hdr.version` on any post-handshake frame, and the negotiated

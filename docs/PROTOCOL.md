@@ -142,12 +142,13 @@ type-specific payload. All multi-byte integers are **network byte order**
   `msg_type` alone, so a frame carrying a different version is processed
   normally rather than rejected. The field is therefore descriptive, not
   enforced — see [BACKLOG.md](./BACKLOG.md).
-- The `HELLO`, `WELCOME` and `REJECT` handshake frames are **intended** to be
-  frozen at version 1 so negotiation itself can never hit a version mismatch.
-  The encoders do not implement that: they stamp `OC_PROTOCOL_VERSION` like every
-  other frame. Nothing validates it, so the two peers agree in practice; the
-  stated property does not hold, and it is a backlog item rather than a
-  behaviour to rely on.
+- The `HELLO`, `WELCOME` and `REJECT` handshake frames are **frozen at version 1**
+  (`OC_HANDSHAKE_VERSION`), so negotiation itself can never hit a version
+  mismatch: the frames that exist to discover a mismatch must not be able to be
+  one. `REJECT` is the case that decides it — it is sent *to* a peer whose
+  version has just been refused, so it has to be decodable by a peer that agrees
+  about nothing else. Their layout is frozen with the number; a new handshake
+  field means a new frame, not a new version of these.
 
 > **Bump `OC_PROTOCOL_VERSION` whenever a frame's LAYOUT changes** — a new field,
 > a reordering, a field that stops being optional — and not only when a frame is
@@ -227,9 +228,10 @@ reserves `REJECT`/`UNEXPECTED_MSG_TYPE` for it, and the daemon does not send it
 (see BACKLOG.md). The
 connection is closed.
 
-The `HELLO`/`WELCOME`/`REJECT` frames are **frozen at `version = 1`**: their
-layout is guaranteed never to change, so a client of any era can always speak
-the handshake and receive an intelligible answer.
+The `HELLO`/`WELCOME`/`REJECT` frames are **frozen at `version = 1`**
+(`OC_HANDSHAKE_VERSION`, stamped by the three encoders that take no version
+argument): their layout is guaranteed never to change, so a client of any era can
+always speak the handshake and receive an intelligible answer.
 
 ### 3.1 `HELLO` (client → server), msg_type `0x0001`
 

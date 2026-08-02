@@ -214,7 +214,7 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 #define OC_CHECK_BODY(slice) do { if ((slice).len > OC_MAX_BODY_SIZE) return OC_E_BODY_TOO_LARGE; } while (0)
 
 oc_result oc_encode_hello(oc_wbuf *w, const oc_hello *m) {
-    size_t off = oc_frame_begin(w, OC_PROTOCOL_VERSION, OC_MSG_HELLO);
+    size_t off = oc_frame_begin(w, OC_HANDSHAKE_VERSION, OC_MSG_HELLO);
     oc_w_u16(w, m->min_version);
     oc_w_u16(w, m->max_version);
     oc_w_str(w, m->client_info);
@@ -222,14 +222,14 @@ oc_result oc_encode_hello(oc_wbuf *w, const oc_hello *m) {
 }
 
 oc_result oc_encode_welcome(oc_wbuf *w, const oc_welcome *m) {
-    size_t off = oc_frame_begin(w, OC_PROTOCOL_VERSION, OC_MSG_WELCOME);
+    size_t off = oc_frame_begin(w, OC_HANDSHAKE_VERSION, OC_MSG_WELCOME);
     oc_w_u16(w, m->chosen_version);
     oc_w_u64(w, m->server_time);
     return oc_frame_end(w, off);
 }
 
 oc_result oc_encode_reject(oc_wbuf *w, const oc_reject *m) {
-    size_t off = oc_frame_begin(w, OC_PROTOCOL_VERSION, OC_MSG_REJECT);
+    size_t off = oc_frame_begin(w, OC_HANDSHAKE_VERSION, OC_MSG_REJECT);
     oc_w_u16(w, m->code);
     oc_w_str(w, m->message);
     return oc_frame_end(w, off);

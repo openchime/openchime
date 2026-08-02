@@ -60,6 +60,14 @@
  * "connection lost" (ARCH-61 ships the two together). */
 #define OC_PROTOCOL_VERSION 8u
 
+/* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
+ * be allowed to depend on its own outcome: if the handshake frames carried the
+ * current version, then the frames that exist to *discover* a version mismatch
+ * would themselves be a version mismatch. Freezing them at 1 is what makes
+ * "your peer is too old" expressible rather than undecodable — so their layout
+ * can never change either, and a new handshake field means a new frame. */
+#define OC_HANDSHAKE_VERSION 1u
+
 /* Transport conventions (see PROTOCOL.md §1). The binary protocol shares TLS
  * port 443 with the future HTTP/webhook surface, demultiplexed by ALPN: a
  * client offers OC_ALPN_PROTO, and the daemon routes that to the binary
