@@ -94,8 +94,9 @@ and that machine then persists no credential at all (headless / no D-Bus). They 
 | Image / tool | Version | Purpose | License | Source |
 |--------------|---------|---------|---------|--------|
 | **Alpine Linux** | `3.20` | Build + runtime base image | mixed (base OS) | https://alpinelinux.org |
-| **MinIO** | `minio/minio:latest` | S3-compatible object storage, **dev/test only** | AGPL-3.0 | https://github.com/minio/minio |
-| **MinIO Client (`mc`)** | `minio/mc:latest` | One-shot bucket init (compose `minio-init`) | AGPL-3.0 | https://github.com/minio/mc |
+| **MinIO** | digest-pinned | S3-compatible object storage, **dev/test only** | AGPL-3.0 | https://github.com/minio/minio |
+| **MinIO Client (`mc`)** | digest-pinned | One-shot bucket init (compose `minio-init`) | AGPL-3.0 | https://github.com/minio/mc |
+| **curl** | digest-pinned | One-shot enrolment reserve in the federated compose | curl licence (MIT/X derivative) | https://github.com/curl/curl-docker |
 
 - **MinIO** runs as its own container in `docker-compose.yml` to simulate a
   managed S3-compatible store (ARCH-38). It is **not part of the daemon** and its
@@ -103,8 +104,11 @@ and that machine then persists no credential at all (headless / no D-Bus). They 
   daemon's S3 blob backend (ARCH-70) defaults to the local filesystem and is not
   wired into compose.
 - Runtime Alpine packages: `sqlite-libs`, `sqlite`, `ca-certificates`.
-- **Pinning gap:** the MinIO images use `:latest` (not version-pinned) — worth
-  pinning to a digest for reproducible dev/test.
+- **Pinned by digest**, not by tag: a digest is immutable, where a release tag can
+  be moved. Each `image:` line carries the date its digest was resolved and the
+  `docker manifest inspect` command that re-resolves it. `postgres:17` in the
+  federated compose is a major-version tag and is deliberately left as one — it
+  is the upstream's own stability contract.
 
 ## 5. Build & dev tooling (not linked into the product)
 

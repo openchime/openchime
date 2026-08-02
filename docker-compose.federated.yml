@@ -44,7 +44,8 @@ services:
   # Reserves the daemon's enrollment code (written to the shared volume) via the
   # dev-only reserve endpoint, so the daemon activates hands-off.
   enroll-init:
-    image: curlimages/curl:latest
+    # Pinned by digest, resolved from Docker Hub 2026-08-02.
+    image: curlimages/curl@sha256:7c12af72ceb38b7432ab85e1a265cff6ae58e06f95539d539b654f2cfa64bb13
     depends_on:
       - control-plane
     volumes:

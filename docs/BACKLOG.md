@@ -75,6 +75,16 @@ All three MIT-vendored libraries now carry a licence file.
 consumer today (the blob backend defaults to local disk), so nothing shipped
 depends on it. **Verified** — VENDORS.md §4 records the same gap.
 
+**FIXED 2026-08-02.** All three are pinned by **digest**, which is immutable
+where a release tag can be moved. **The item's title understated the scope**:
+`docker-compose.federated.yml` carried a third unpinned image,
+`curlimages/curl:latest`, that this backlog had missed — it is pinned with the
+other two rather than left as a known defect one file away. Each digest was
+resolved from Docker Hub and checked to resolve with `docker manifest inspect`;
+both compose files still parse under `docker compose config` and resolve to the
+pinned digests. `postgres:17` is deliberately left as a major-version tag, which
+is the upstream's own stability contract.
+
 ## 4. The mbedTLS fetch verifies no checksum
 
 `scripts/build_mbedtls.sh` downloads the release tarball over TLS from GitHub and
