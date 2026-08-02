@@ -84,27 +84,35 @@ title — the native stand-in for Slack's illustrations, and the difference betw
 the suite. Anything found later is a new id, not a reopening of this one — the
 point of the item was the sweep, and the sweep happened.
 
-## WIN-110 — AutomationIds on every actionable element (REQ-290)
+## WIN-110 — AutomationIds on every actionable element (REQ-290) (CLOSED)
 
-Raised 2026-08-02, out of the testing question rather than the accessibility one.
+Done 2026-08-02. The provider existed (ARCH-99) and served Name, ControlType and
+the text patterns; what it did not serve was an **identity**, so a client could
+read the app and not address it.
 
-The client has a UIA provider already (ARCH-99), so the tree exists and a screen
-reader can read it. What it does not have is a **stable id per element**, which is
-what an automated test needs to find a control without knowing where it was drawn.
-The current harness clicks coordinates read out of a debug dump — workable, and
-the reason several failures this session needed a human to decide whether they were
-real.
+- `AutomationId` on every element, composed from identity for anything dynamic:
+  `conv.<channel_id>`, `message.<id>`, `thread.card.<root>`, `people.row.<uid>`,
+  and fixed names for the rest (`rail.home`, `shelf.threads`, `composer.send`,
+  `composer.format.bold`, `drafts.tab.sent`, `activity.filter.unreads`,
+  `modal.button.save`).
+- **InvokePattern** on everything pressable, which is what makes the tree drivable
+  rather than merely readable. The token is posted to the UI thread and ends in
+  the same call the mouse path makes.
+- The tree's navigation was hard-coded to three children (conversations, messages,
+  composer), so nothing new was reachable however carefully it was published. It
+  walks a generic root-child set now.
+- Two defects the external walk caught that the app could not see: three rail rows
+  all answered to `rail.more`, and three composer buttons were findable but not
+  pressable.
 
-Scope: an `AutomationId` on every element a user can act on — rail and shelf rows,
-sidebar conversations, tabs, chips, list rows, composer controls, toolbar buttons,
-menu items, modal fields and buttons. Composed from identity for anything dynamic
-(`sidebar.row.<channel_id>`), never from position. Ids are defined beside the
-control and treated as a contract: renaming one is a breaking change.
+`scripts/uia_probe.ps1 -Assert` now fails on a missing id, a duplicate id or an
+uninvokable control, and `scripts/uia_invoke.ps1` presses one by id — used in the
+suite to open a pane with no coordinates involved.
 
-This is the prerequisite for driving the client the way Windows applications are
-supposed to be driven — UIA from a separate test process (FlaUI or equivalent),
-locating by id — rather than by synthetic clicks at measured points. It does not
-by itself decide where that suite runs; that is the CI-agent question.
+**What this unblocks:** a UIA-driven suite (FlaUI or Appium Windows Driver) that
+locates by id, on a runner that is not a developer's desktop. That is the CI-agent
+question, still open.
+
 
 ## Closed without a fix, and why
 
@@ -167,7 +175,7 @@ by itself decide where that suite runs; that is the CI-agent question.
 
 ## What "closed" does and does not mean
 
-WIN-1 … WIN-109 are done (WIN-92, WIN-94, WIN-107, WIN-108 and WIN-109 landed 2026-08-02) —
+WIN-1 … WIN-110 are done (WIN-92, WIN-94, WIN-107 … WIN-110 landed 2026-08-02) —
 accessibility included, built *for* the custom controls rather than by retreating
 to native ones (ARCH-99), and rich text with its toolbar as of 2026-07-31. The
 items below are each blocked on a daemon requirement or an ARCH decision, or, in

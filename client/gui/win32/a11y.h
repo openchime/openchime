@@ -25,10 +25,15 @@
 typedef enum {
     OC_ACC_CONVERSATION = 0,   /* a sidebar row: channel or DM */
     OC_ACC_MESSAGE,            /* one message in the transcript */
-    OC_ACC_COMPOSER            /* the message box (exactly one) */
+    OC_ACC_COMPOSER,           /* the message box (exactly one) */
+    /* Anything you can press. Published with an INVOKE token so a UIA client can
+     * activate it rather than click at a measured point (REQ-290, WIN-110). */
+    OC_ACC_BUTTON,
+    OC_ACC_TAB,                /* a tab or filter chip: one of a set, selectable */
+    OC_ACC_LISTITEM            /* a row in a pane's list (threads, people, drafts) */
 } oc_acc_kind;
 
-enum { OC_ACC_NAME_MAX = 320, OC_ACC_MAX = 800 };
+enum { OC_ACC_NAME_MAX = 320, OC_ACC_MAX = 800, OC_ACC_AID_MAX = 64 };
 
 /* Rects are DEVICE PIXELS, client-relative — the units the paint pass already
  * has after PX(). Keeping the DPI conversion on the publisher's side means this
@@ -39,12 +44,25 @@ typedef struct {
     uint64_t    id;                      /* channel id / message id */
     int         l, t, r, b;
     char        name[OC_ACC_NAME_MAX];   /* UTF-8, what a screen reader speaks */
+    /* The STABLE identifier a test locates by (REQ-290). Composed from identity
+     * for anything dynamic — `sidebar.row.<channel_id>`, never `sidebar.row.3` —
+     * because the third row is a different conversation tomorrow. Empty for
+     * elements that have no meaningful identity of their own. */
+    char        aid[OC_ACC_AID_MAX];
+    /* What to run when a UIA client invokes it. 0 = not invokable. The token is
+     * opaque here: a11y.c cannot see the app's statics, and giving it a function
+     * pointer into them would be the same coupling by another name. */
+    uint64_t    invoke;
 } oc_acc_item;
 
 /* Lifecycle. init() resolves the provider entry points; everything below is a
  * no-op when they are absent, so a Windows without UIAutomationCore.dll simply
  * gets the app as it was. */
 void oc_a11y_init(HWND hwnd);
+/* Where an Invoke is delivered. UIA calls arrive on an RPC thread, so the token
+ * is POSTED to the window rather than dispatched here — the app then runs it on
+ * the thread that owns every rect and every piece of state it will touch. */
+#define OC_WM_A11Y_INVOKE (WM_APP + 71)
 void oc_a11y_shutdown(void);
 int  oc_a11y_available(void);
 

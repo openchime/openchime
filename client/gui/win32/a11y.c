@@ -105,13 +105,15 @@ typedef struct {
     IRawElementProviderFragmentRoot r;
     ITextProvider                   t;   /* transcript + composer (ARCH-99) */
     IValueProvider                  v;   /* the composer's text, read-only */
+    IInvokeProvider                 iv;  /* anything you can press (REQ-290) */
     LONG ref;
     int  idx;        /* EL_* or an index into g_items */
 } acc_el;
 
 static acc_el *el_new(int idx);
-static ITextProviderVtbl  g_tpvt;    /* fwd — defined with the text surface below */
-static IValueProviderVtbl g_vpvt;
+static ITextProviderVtbl   g_tpvt;   /* fwd — defined with the text surface below */
+static IValueProviderVtbl  g_vpvt;
+static IInvokeProviderVtbl g_ivvt;
 static int  composer_idx(void);
 
 /* ---- helpers --------------------------------------------------------------- */
@@ -157,6 +159,26 @@ static int first_of(oc_acc_kind k, int last) {
 }
 static int composer_idx(void) { return first_of(OC_ACC_COMPOSER, 0); }
 
+/* Everything that is not a conversation or a message hangs directly off the root:
+ * the composer, and every button, tab and pane row (REQ-290). They are a flat set
+ * on purpose — a client finds them by AutomationId, and inventing group elements
+ * to nest them under would add tree to walk without adding anything to find. */
+static int is_root_child(int idx) {
+    return idx >= 0 && idx < g_n_items && group_of(idx) == EL_ROOT;
+}
+static int root_child_scan(int from, int dir) {
+    for (int i = from; i >= 0 && i < g_n_items; i += dir)
+        if (is_root_child(i)) return i;
+    return -1;
+}
+
+/* Can a client press it? Anything the app published an invoke token for — the
+ * token is what the press turns into, so "has a token" and "is invokable" are
+ * the same fact rather than two that can disagree (REQ-290). */
+static int item_invokable(int idx) {
+    return idx >= 0 && idx < g_n_items && g_items[idx].invoke != 0;
+}
+
 /* ---- IRawElementProviderSimple --------------------------------------------- */
 
 static HRESULT STDMETHODCALLTYPE s_QI(IRawElementProviderSimple *this_, REFIID iid, void **out);
@@ -187,6 +209,15 @@ static HRESULT STDMETHODCALLTYPE s_GetPatternProvider(IRawElementProviderSimple 
     if (pid == UIA_ValuePatternId && is_composer) {
         *out = (IUnknown *)&e->v; s_AddRef(&e->s); return S_OK;
     }
+    /* InvokePattern is what makes the tree DRIVABLE rather than merely readable:
+     * without it a test can find a control and then has no way to press it but
+     * to click at a measured point, which is the thing REQ-290 exists to end. */
+    if (pid == UIA_InvokePatternId) {
+        EnterCriticalSection(&g_lock);
+        int inv = item_invokable(e->idx);
+        LeaveCriticalSection(&g_lock);
+        if (inv) { *out = (IUnknown *)&e->iv; s_AddRef(&e->s); return S_OK; }
+    }
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE s_GetPropertyValue(IRawElementProviderSimple *this_,
@@ -205,7 +236,18 @@ static HRESULT STDMETHODCALLTYPE s_GetPropertyValue(IRawElementProviderSimple *t
                 : (e->idx == EL_CONVS)                      ? UIA_ListControlTypeId
                 : (e->idx == EL_ROOT)                       ? UIA_GroupControlTypeId
                 : item_kind(e->idx, OC_ACC_COMPOSER)        ? UIA_EditControlTypeId
+                : item_kind(e->idx, OC_ACC_BUTTON)          ? UIA_ButtonControlTypeId
+                : item_kind(e->idx, OC_ACC_TAB)             ? UIA_TabItemControlTypeId
                                                             : UIA_ListItemControlTypeId;
+        break;
+    /* The identifier a test locates by (REQ-290). Stable across layout, wording,
+     * size, theme, language and position — which is exactly what Name is not. */
+    case UIA_AutomationIdPropertyId:
+        if (e->idx >= 0 && e->idx < g_n_items && g_items[e->idx].aid[0]) {
+            v->vt = VT_BSTR; v->bstrVal = bstr_utf8(g_items[e->idx].aid);
+        } else if (e->idx == EL_CONVS) { v->vt = VT_BSTR; v->bstrVal = bstr_utf8("conversations"); }
+        else if (e->idx == EL_MSGS)    { v->vt = VT_BSTR; v->bstrVal = bstr_utf8("transcript"); }
+        else if (e->idx == EL_ROOT)    { v->vt = VT_BSTR; v->bstrVal = bstr_utf8("openchime"); }
         break;
     case UIA_NamePropertyId:
         v->vt = VT_BSTR;
@@ -278,22 +320,26 @@ static HRESULT STDMETHODCALLTYPE f_Navigate(IRawElementProviderFragment *t,
                : (e->idx == EL_CONVS) ? first_of(OC_ACC_CONVERSATION, 0)
                : (e->idx == EL_MSGS)  ? first_of(OC_ACC_MESSAGE, 0) : -9999;
         break;
-    case NavigateDirection_LastChild:
-        target = (e->idx == EL_ROOT)  ? composer_idx()
+    case NavigateDirection_LastChild: {
+        int last_root = root_child_scan(g_n_items - 1, -1);
+        target = (e->idx == EL_ROOT)  ? (last_root >= 0 ? last_root : EL_MSGS)
                : (e->idx == EL_CONVS) ? first_of(OC_ACC_CONVERSATION, 1)
                : (e->idx == EL_MSGS)  ? first_of(OC_ACC_MESSAGE, 1) : -9999;
         break;
+    }
     case NavigateDirection_NextSibling:
         target = (e->idx == EL_CONVS) ? EL_MSGS
-               : (e->idx == EL_MSGS)  ? composer_idx()
-               : (e->idx >= 0 && item_kind(e->idx, OC_ACC_COMPOSER)) ? -9999
+               : (e->idx == EL_MSGS)  ? root_child_scan(0, +1)
+               : is_root_child(e->idx) ? root_child_scan(e->idx + 1, +1)
                : sibling(e->idx, +1);
         break;
-    case NavigateDirection_PreviousSibling:
+    case NavigateDirection_PreviousSibling: {
+        int prev_root = is_root_child(e->idx) ? root_child_scan(e->idx - 1, -1) : -1;
         target = (e->idx == EL_MSGS) ? EL_CONVS
-               : (e->idx >= 0 && item_kind(e->idx, OC_ACC_COMPOSER)) ? EL_MSGS
+               : is_root_child(e->idx) ? (prev_root >= 0 ? prev_root : EL_MSGS)
                : sibling(e->idx, -1);
         break;
+    }
     default: break;
     }
     LeaveCriticalSection(&g_lock);
@@ -429,6 +475,8 @@ static HRESULT STDMETHODCALLTYPE s_QI(IRawElementProviderSimple *this_, REFIID i
         *out = &e->t;
     else if (IsEqualIID(iid, &IID_IValueProvider))
         *out = &e->v;
+    else if (IsEqualIID(iid, &IID_IInvokeProvider))
+        *out = &e->iv;
     else { *out = NULL; return E_NOINTERFACE; }
     InterlockedIncrement(&e->ref);
     return S_OK;
@@ -451,6 +499,7 @@ static acc_el *el_new(int idx) {
     e->r.lpVtbl = &g_rvt;
     e->t.lpVtbl = &g_tpvt;
     e->v.lpVtbl = &g_vpvt;
+    e->iv.lpVtbl = &g_ivvt;
     e->ref = 1;
     e->idx = idx;
     return e;
@@ -1022,6 +1071,35 @@ static HRESULT STDMETHODCALLTYPE vp_get_IsReadOnly(IValueProvider *t, BOOL *out)
 
 static IValueProviderVtbl g_vpvt = {
     vp_QI, vp_AddRef, vp_Release, vp_SetValue, vp_get_Value, vp_get_IsReadOnly
+};
+
+/* ---- IInvokeProvider (REQ-290) ---------------------------------------------
+ * The press itself is NOT performed here. UIA calls arrive on an RPC thread,
+ * and every one of the app's rects, menus and model pointers belongs to the UI
+ * thread — so the token is posted to the window and the app runs it where it is
+ * safe to. Doing the work on this thread would be a data race that shows up as
+ * a crash under a screen reader and nowhere else. */
+static HRESULT STDMETHODCALLTYPE ivp_QI(IInvokeProvider *t, REFIID iid, void **o) {
+    return s_QI(&CONTAINING_RECORD(t, acc_el, iv)->s, iid, o);
+}
+static ULONG STDMETHODCALLTYPE ivp_AddRef(IInvokeProvider *t) {
+    return s_AddRef(&CONTAINING_RECORD(t, acc_el, iv)->s);
+}
+static ULONG STDMETHODCALLTYPE ivp_Release(IInvokeProvider *t) {
+    return s_Release(&CONTAINING_RECORD(t, acc_el, iv)->s);
+}
+static HRESULT STDMETHODCALLTYPE ivp_Invoke(IInvokeProvider *t) {
+    acc_el *e = CONTAINING_RECORD(t, acc_el, iv);
+    uint64_t tok = 0;
+    EnterCriticalSection(&g_lock);
+    if (e->idx >= 0 && e->idx < g_n_items) tok = g_items[e->idx].invoke;
+    LeaveCriticalSection(&g_lock);
+    if (!tok || !g_hwnd) return UIA_E_INVALIDOPERATION;
+    PostMessageW(g_hwnd, OC_WM_A11Y_INVOKE, (WPARAM)(tok >> 32), (LPARAM)(tok & 0xFFFFFFFFu));
+    return S_OK;
+}
+static IInvokeProviderVtbl g_ivvt = {
+    ivp_QI, ivp_AddRef, ivp_Release, ivp_Invoke
 };
 
 #endif /* __IRawElementProviderFragment_INTERFACE_DEFINED__ */

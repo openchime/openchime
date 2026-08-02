@@ -1861,9 +1861,24 @@ REQ-269, whose accessibility half is a real open decision.*
   surface in the same way a renamed wire field is to the protocol.
 
   **Dynamic elements get composed ids**: a per-conversation row is
-  `sidebar.row.<channel_id>`, not `sidebar.row.3`, because the third row is a
-  different conversation tomorrow. The id is derived from the thing's identity,
-  never from where it happens to be drawn.
+  `conv.<channel_id>`, not `conv.3`, because the third row is a different
+  conversation tomorrow. The id is derived from the thing's identity, never from
+  where it happens to be drawn.
+
+  *Status: built on Win32 (WIN-110, 2026-08-02).* Every rail and shelf row,
+  conversation, message, composer control, formatting button, filter chip, tab,
+  pane row and modal button carries an id and — where it is a control rather than
+  content — an `InvokePattern`, so a client can press it rather than click at a
+  measured point. Verified from OUTSIDE the process: `scripts/uia_probe.ps1`
+  asserts that no actionable element lacks an id, that no id is claimed twice and
+  that each is invokable, and `scripts/uia_invoke.ps1` presses one by id in the
+  suite.
+
+  **Invokes are marshalled, not executed where they arrive.** UIA calls come in on
+  an RPC thread; the app posts the element's token to its own window and runs it
+  there, because every rect, menu and model pointer it touches belongs to the UI
+  thread. Each token ends in the same call the mouse path makes — an automation
+  route that reimplemented the action would be testing a second implementation.
 
 ---
 

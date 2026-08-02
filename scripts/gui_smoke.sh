@@ -1330,14 +1330,30 @@ if [ "$(ann)" != "$a0" ]; then ok "a failure is announced ($a0 -> $(ann))"
 else fail "a failure raised no announcement (still $a0)"; fi
 
 # The real gate: walk the tree from OUTSIDE the process, as a screen reader does.
-if [ -f "$LIN_DIR/uia_probe.ps1" ] || cp "$HERE/scripts/uia_probe.ps1" "$LIN_DIR/" 2>/dev/null; then
+# Always re-stage: `[ -f ] ||` left a stale copy in place, so a changed probe
+# silently did not run — the same trap as a path-relative dump name.
+cp "$HERE/scripts/uia_probe.ps1" "$HERE/scripts/uia_invoke.ps1" "$LIN_DIR/" 2>/dev/null
+if [ -f "$LIN_DIR/uia_probe.ps1" ]; then
   checks=$((checks + 1))
   if powershell.exe -NoProfile -ExecutionPolicy Bypass \
        -File 'C:\Windows\Temp\octest\uia_probe.ps1' -Assert 2>/dev/null | grep -q 'uia_probe: OK'; then
-    ok "a real UIA client can read the tree (lists, items and the composer)"
+    ok "a real UIA client can read the tree, and every control has a unique id"
   else
-    fail "uia_probe could not read the tree — run it directly to see the walk"
+    fail "uia_probe failed — run it directly to see the walk"
   fi
+
+  # ...and DRIVE it by id, which is the whole point of the identifiers (REQ-290).
+  # Coordinates are not involved: this is the same route a UIA-based suite would
+  # take, so a pane moving cannot break it.
+  checks=$((checks + 1))
+  if powershell.exe -NoProfile -ExecutionPolicy Bypass \
+       -File 'C:\Windows\Temp\octest\uia_invoke.ps1' -Aid 'shelf.threads' 2>/dev/null |
+       grep -q 'uia_invoke: OK'; then
+    if wait_grep '^threads n=[0-9]+ '; then
+      ok "a UIA client can PRESS a control by id, not only find it"
+    else fail "invoking shelf.threads did not open the pane"; fi
+  else fail "could not invoke shelf.threads through UI Automation"; fi
+  "$DRIVE" view 0 >/dev/null 2>&1; settle sbkind 1
 else
   say "   (could not stage uia_probe.ps1 — skipping the external check)"
 fi

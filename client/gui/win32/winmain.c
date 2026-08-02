@@ -6720,7 +6720,7 @@ typedef struct {
 
 /* Frame-owned hit-boxes, valid after a paint. */
 static D2D1_RECT_F g_modal_close_btn;
-static struct { D2D1_RECT_F r; int cmd; uint8_t kind; } g_modal_btns[MODAL_MAX_BTNS];
+static struct { D2D1_RECT_F r; int cmd; uint8_t kind; char label[32]; } g_modal_btns[MODAL_MAX_BTNS];
 static int g_n_modal_btns;
 static int g_modal_primary_cmd = -1;        /* what Enter fires */
 
@@ -6812,6 +6812,11 @@ static D2D1_RECT_F modal_frame(ID2D1RenderTarget *rt, const oc_modal_spec *s,
                 g_modal_btns[g_n_modal_btns].r = r;
                 g_modal_btns[g_n_modal_btns].cmd = b->cmd;
                 g_modal_btns[g_n_modal_btns].kind = b->kind;
+                /* The word on the button IS its accessible name (REQ-290) — a
+                 * button announced as "modal.button.1" tells a screen reader
+                 * nothing and a test nothing it did not already know. */
+                snprintf(g_modal_btns[g_n_modal_btns].label,
+                         sizeof g_modal_btns[g_n_modal_btns].label, "%s", b->label);
                 g_n_modal_btns++;
             }
             if (b->kind == MB_PRIMARY || b->kind == MB_DANGER_PRIMARY)
@@ -10369,6 +10374,91 @@ static void ed_draw(ID2D1RenderTarget *rt, D2D1_RECT_F box) {
  *
  * Rects are converted to device pixels here, which keeps every DPI question on
  * this side of the seam; a11y.c only ever maps client to screen. */
+/* The send-later menu (REQ-224). One builder, called by the chevron's click and
+ * by an automation invoke, because two copies of a menu's items are two things
+ * to keep in step — and the automation route exists to exercise the real one. */
+static void sched_menu_open(float x, float y) {
+    /* Presets are DURATIONS from now, plus a fixed morning — the two ways people
+     * actually name a send time. "Tomorrow morning" is 09:00 local because a
+     * scheduled message is about the recipient's day. */
+    g_n_mi = 0;
+    mi_section("SEND LATER");
+    mi_item(300, "In 30 minutes");
+    mi_item(301, "In 1 hour");
+    mi_item(302, "Tomorrow, 9:00");
+    g_menu = MENU_SCHED; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 200;
+    g_menu_x = x - 40; g_menu_y = y - 120;
+    if (g_menu_y < 8) g_menu_y = 8;
+}
+
+/* --- the automation surface's identifiers (REQ-290, WIN-110) ----------------
+ *
+ * An invoke token is what a press TURNS INTO, carried opaquely through a11y.c
+ * and posted back to this thread. The high byte is the kind and the rest is its
+ * payload, so one 64-bit value covers every actionable element without a11y.c
+ * knowing what any of them mean.
+ *
+ * Ids are composed from IDENTITY, never from position: `conv.7` is a particular
+ * conversation, where `conv.3` would be whichever one happens to be third today.
+ * They are part of the control, reviewed like any other name — renaming one is a
+ * breaking change to anything that drives this app. */
+enum {
+    AT_VIEW = 1,      /* payload: a VIEW_* / NAV_* rail act */
+    AT_CONV,          /* payload: channel id */
+    AT_MENU,          /* payload: a menu_dispatch command */
+    AT_SEND,          /* the composer's send */
+    AT_DTAB,          /* payload: drafts tab index */
+    AT_ACTFILTER,     /* payload: activity filter index */
+    AT_THREAD,        /* payload: thread root id — open it */
+    AT_PEOPLE,        /* payload: user id — open the profile */
+    AT_MODALBTN,      /* payload: modal button index */
+    AT_FMT,           /* payload: formatting-toolbar button index */
+    AT_EMOJI,         /* the composer's emoji picker */
+    AT_MENTION,       /* insert the @ trigger, as typing it does */
+    AT_SCHEDMENU,     /* the send-later menu */
+    AT_THREADFILTER   /* the Threads pane's unreads-only toggle */
+};
+#define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
+
+static void acc_push(oc_acc_item *items, int *n, oc_acc_kind kind, const char *aid,
+                     const char *name, D2D1_RECT_F r, uint64_t invoke) {
+    if (*n >= OC_ACC_MAX) return;
+    if (r.right <= r.left || r.bottom <= r.top) return;   /* nothing drawn, nothing to say */
+    oc_acc_item *it = &items[(*n)++];
+    memset(it, 0, sizeof *it);
+    it->kind = kind;
+    it->l = PX(r.left); it->r = PX(r.right);
+    it->t = PX(r.top);  it->b = PX(r.bottom);
+    snprintf(it->aid, sizeof it->aid, "%s", aid ? aid : "");
+    snprintf(it->name, sizeof it->name, "%s", name ? name : "");
+    it->invoke = invoke;
+}
+
+/* The stable name for a rail destination. Derived from the view rather than from
+ * the label, because the label is prose and prose gets rewritten. */
+static const char *view_aid(int act) {
+    switch (act) {
+    /* The rail's non-destination rows are still rows, and REQ-290 says an id is
+     * UNIQUE: three of them answering "more" made two of the three unaddressable
+     * and the third ambiguous. */
+    case NAV_SWITCHER:   return "switcher";
+    case NAV_NEW:        return "new";
+    case NAV_PROFILE:    return "you";
+    case NAV_MORE:       return "more";
+    case VIEW_HOME:      return "home";
+    case VIEW_DMS:       return "dms";
+    case VIEW_ACTIVITY:  return "activity";
+    case VIEW_FILES:     return "files";
+    case VIEW_LATER:     return "later";
+    case VIEW_ADMIN:     return "admin";
+    case VIEW_THREADS:   return "threads";
+    case VIEW_DIRECTORY: return "people";
+    case VIEW_DRAFTS:    return "drafts";
+    case VIEW_NEWMSG:    return "newmsg";
+    default:             return "";
+    }
+}
+
 static void a11y_publish_scene(const oc_model *m) {
     static oc_acc_item items[OC_ACC_MAX];
     int n = 0;
@@ -10379,8 +10469,11 @@ static void a11y_publish_scene(const oc_model *m) {
     for (int i = 0; i < g_n_rows && n < OC_ACC_MAX; i++) {
         if (g_rows[i].header || !g_rows[i].cid) continue;
         oc_acc_item *it = &items[n++];
+        memset(it, 0, sizeof *it);
         it->kind = OC_ACC_CONVERSATION;
         it->id   = g_rows[i].cid;
+        snprintf(it->aid, sizeof it->aid, "conv.%llu", (unsigned long long)g_rows[i].cid);
+        it->invoke = ATOK(AT_CONV, g_rows[i].cid);
         it->l = PX(RAIL_W); it->r = PX(RAIL_W + SIDEBAR_W);
         it->t = PX(g_rows[i].top); it->b = PX(g_rows[i].bot);
         const oc_channel *c = m ? oc_model_channel((oc_model *)m, g_rows[i].cid) : NULL;
@@ -10401,8 +10494,10 @@ static void a11y_publish_scene(const oc_model *m) {
         const oc_msg *msg = c ? find_msg(c, g_msgrows[i].mid) : NULL;
         if (!msg) continue;
         oc_acc_item *it = &items[n++];
+        memset(it, 0, sizeof *it);
         it->kind = OC_ACC_MESSAGE;
         it->id   = g_msgrows[i].mid;
+        snprintf(it->aid, sizeof it->aid, "message.%llu", (unsigned long long)g_msgrows[i].mid);
         it->l = PX(g_msgrows[i].left);  it->r = PX(g_msgrows[i].right);
         it->t = PX(g_msgrows[i].top);   it->b = PX(g_msgrows[i].bot);
         const char *who = msg->author_name[0] ? msg->author_name
@@ -10423,8 +10518,10 @@ static void a11y_publish_scene(const oc_model *m) {
     int caret = 0, anchor = 0;
     if (main_is_conversation() && g_ed_box.right > g_ed_box.left && n < OC_ACC_MAX) {
         oc_acc_item *it = &items[n++];
+        memset(it, 0, sizeof *it);
         it->kind = OC_ACC_COMPOSER;
         it->id   = g_sel;
+        snprintf(it->aid, sizeof it->aid, "composer");
         it->l = PX(g_ed_box.left);  it->r = PX(g_ed_box.right);
         it->t = PX(g_ed_box.top);   it->b = PX(g_ed_box.bottom);
         char cue[128]; composer_cue(m, cue, sizeof cue);
@@ -10433,6 +10530,112 @@ static void a11y_publish_scene(const oc_model *m) {
         caret  = g_ed_caret;
         anchor = g_ed_anchor;
     }
+    /* The rail. Ids from the destination, not the label — "Home" is prose. */
+    for (int i = 0; i < g_n_navrows && n < OC_ACC_MAX; i++) {
+        const char *a = view_aid(g_navrows[i].act);
+        char aid[OC_ACC_AID_MAX], nm[64];
+        snprintf(aid, sizeof aid, "rail.%s", a[0] ? a : "more");
+        snprintf(nm, sizeof nm, "%s", a[0] ? a : "more");
+        acc_push(items, &n, OC_ACC_BUTTON, aid, nm,
+                 rf(0, g_navrows[i].top, RAIL_W, g_navrows[i].bot),
+                 ATOK(AT_VIEW, (uint64_t)(g_navrows[i].act + 1000)));
+    }
+
+    /* The Home sidebar's destinations shelf. */
+    for (int i = 0; i < g_n_shelf && n < OC_ACC_MAX; i++) {
+        const char *a = view_aid(g_shelf_rows[i].view);
+        char aid[OC_ACC_AID_MAX];
+        snprintf(aid, sizeof aid, "shelf.%s", a);
+        acc_push(items, &n, OC_ACC_BUTTON, aid, a,
+                 rf(RAIL_W, g_shelf_rows[i].top, RAIL_W + SIDEBAR_W, g_shelf_rows[i].bot),
+                 ATOK(AT_VIEW, (uint64_t)(g_shelf_rows[i].view + 1000)));
+    }
+
+    /* The composer's controls. Send carries the state a test needs to assert on
+     * in its NAME, since an element that is present but refuses is the case a
+     * locator alone cannot distinguish. */
+    if (main_is_conversation()) {
+        acc_push(items, &n, OC_ACC_BUTTON, "composer.attach", "Attach a file",
+                 g_attach_btn, ATOK(AT_MENU, 7));
+        acc_push(items, &n, OC_ACC_BUTTON, "composer.emoji", "Emoji", g_emoji_btn,
+                 ATOK(AT_EMOJI, 0));
+        acc_push(items, &n, OC_ACC_BUTTON, "composer.mention", "Mention someone", g_at_btn,
+                 ATOK(AT_MENTION, 0));
+        acc_push(items, &n, OC_ACC_BUTTON, "composer.send",
+                 ed_len() ? "Send" : "Send, nothing to send", g_send_btn, ATOK(AT_SEND, 0));
+        acc_push(items, &n, OC_ACC_BUTTON, "composer.schedule", "Send later", g_sched_btn,
+                 ATOK(AT_SCHEDMENU, 0));
+        static const char *FMT_AID[FMT_COUNT] = {
+            "bold", "italic", "strike", "code", "quote", "bullets", "numbers"
+        };
+        for (int i = 0; i < FMT_COUNT && n < OC_ACC_MAX; i++) {
+            char aid[OC_ACC_AID_MAX];
+            snprintf(aid, sizeof aid, "composer.format.%s", FMT_AID[i]);
+            acc_push(items, &n, OC_ACC_BUTTON, aid, FMT_AID[i], g_fmt_btn[i],
+                     ATOK(AT_FMT, i));
+        }
+    }
+
+    /* Activity's filters, the Drafts tabs, and the two panes that are lists of
+     * things rather than of messages. */
+    if (g_view == VIEW_ACTIVITY) {
+        static const char *AF_AID[AF_COUNT] = {
+            "all", "mentions", "reactions", "threads", "unreads", "dms", "channels"
+        };
+        for (int i = 0; i < AF_COUNT && n < OC_ACC_MAX; i++) {
+            char aid[OC_ACC_AID_MAX];
+            snprintf(aid, sizeof aid, "activity.filter.%s", AF_AID[i]);
+            acc_push(items, &n, OC_ACC_TAB, aid, AF_AID[i], g_act_filters[i],
+                     ATOK(AT_ACTFILTER, i));
+        }
+    }
+    if (g_view == VIEW_DRAFTS) {
+        static const char *DT_AID[DTAB_COUNT] = { "drafts", "scheduled", "sent" };
+        for (int i = 0; i < DTAB_COUNT && n < OC_ACC_MAX; i++) {
+            char aid[OC_ACC_AID_MAX];
+            snprintf(aid, sizeof aid, "drafts.tab.%s", DT_AID[i]);
+            acc_push(items, &n, OC_ACC_TAB, aid, DT_AID[i], g_dtab_hit[i], ATOK(AT_DTAB, i));
+        }
+    }
+    if (g_view == VIEW_THREADS && m) {
+        acc_push(items, &n, OC_ACC_BUTTON, "threads.unreadonly",
+                 g_threads_unread ? "Unreads only" : "All threads", g_threads_unread_btn,
+                 ATOK(AT_THREADFILTER, 0));
+        for (int i = 0; i < g_n_listrows && n < OC_ACC_MAX; i++) {
+            char aid[OC_ACC_AID_MAX], nm[OC_ACC_NAME_MAX];
+            snprintf(aid, sizeof aid, "thread.card.%llu",
+                     (unsigned long long)g_listrows[i].mid);
+            snprintf(nm, sizeof nm, "thread %llu", (unsigned long long)g_listrows[i].mid);
+            acc_push(items, &n, OC_ACC_LISTITEM, aid, nm, g_listrows[i].row,
+                     ATOK(AT_THREAD, g_listrows[i].mid));
+        }
+    }
+    if (g_view == VIEW_DIRECTORY && m) {
+        for (int i = 0; i < g_n_listrows && n < OC_ACC_MAX; i++) {
+            uint64_t uid = g_listrows[i].mid;
+            const char *nm = oc_model_user_name((oc_model *)m, uid);
+            char aid[OC_ACC_AID_MAX];
+            snprintf(aid, sizeof aid, "people.row.%llu", (unsigned long long)uid);
+            acc_push(items, &n, OC_ACC_LISTITEM, aid, nm && nm[0] ? nm : "user",
+                     g_listrows[i].row, ATOK(AT_PEOPLE, uid));
+        }
+    }
+
+    /* A modal's buttons: the one surface where "press the primary" is the whole
+     * interaction, and where clicking a measured point is least forgivable. */
+    if (modal_open()) {
+        for (int i = 0; i < g_n_modal_btns && n < OC_ACC_MAX; i++) {
+            char aid[OC_ACC_AID_MAX];
+            /* Named for the WORD, so `modal.button.save` survives the button
+             * moving and `modal.button.1` would not. */
+            char low[32]; snprintf(low, sizeof low, "%s", g_modal_btns[i].label);
+            for (char *c = low; *c; c++) *c = (char)tolower((unsigned char)*c);
+            snprintf(aid, sizeof aid, "modal.button.%s", low);
+            acc_push(items, &n, OC_ACC_BUTTON, aid, g_modal_btns[i].label,
+                     g_modal_btns[i].r, ATOK(AT_MODALBTN, i));
+        }
+    }
+
     g_a11y_n = n;
     oc_a11y_publish(items, n, ctext, caret, anchor);
 }
@@ -12736,20 +12939,7 @@ static int on_click(HWND hwnd, int x, int y) {
         }
         return 1;
     }
-    if (in_rect(g_sched_btn, x, y)) {
-        /* Presets are DURATIONS from now, plus a fixed morning — the two ways
-         * people actually name a send time. "Tomorrow morning" is 09:00 local
-         * because a scheduled message is about the recipient's day. */
-        g_n_mi = 0;
-        mi_section("SEND LATER");
-        mi_item(300, "In 30 minutes");
-        mi_item(301, "In 1 hour");
-        mi_item(302, "Tomorrow, 9:00");
-        g_menu = MENU_SCHED; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 200;
-        g_menu_x = x - 40; g_menu_y = y - 120;
-        if (g_menu_y < 8) g_menu_y = 8;
-        return 1;
-    }
+    if (in_rect(g_sched_btn, x, y)) { sched_menu_open(x, y); return 1; }
     if (in_rect(g_send_btn, x, y))   { composer_send(); return 1; }
     /* Overlay row clicks (main area only). */
     {
@@ -16528,6 +16718,84 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         LRESULT r = oc_a11y_get_object(hwnd, wp, lp, &handled);
         if (handled) return r;
         break;
+    }
+    case OC_WM_A11Y_INVOKE: {
+        /* A UIA client pressed something (REQ-290). It arrived on an RPC thread
+         * and was posted here, so every rect, menu and model pointer this touches
+         * belongs to the thread now running it.
+         *
+         * Each case ends in the SAME call the mouse path makes. That is the whole
+         * discipline: an automation route that reimplements the action tests a
+         * second implementation of it and proves nothing about the first. */
+        uint64_t tok = ((uint64_t)wp << 32) | (uint32_t)lp;
+        int kind = (int)(tok >> 56);
+        uint64_t arg = tok & 0x00FFFFFFFFFFFFFFull;
+        switch (kind) {
+        case AT_VIEW: {
+            int act = (int)arg - 1000;
+            if (act == NAV_MORE) { g_more_open = !g_more_open; }
+            else if (act >= 0 && act < VIEW_COUNT) {
+                close_overlays();
+                g_view = act;
+                if (act == VIEW_ACTIVITY) oc_client_list_activity(g_client, act_wire_filter());
+                if (act == VIEW_THREADS)  oc_client_list_threads(g_client,
+                                              g_threads_unread ? OC_THREADF_UNREAD : OC_THREADF_ALL);
+                if (act == VIEW_DIRECTORY) oc_client_list_users(g_client);
+                if (act == VIEW_LATER)  { g_later_chan = 0; oc_client_list_saved(g_client); }
+                layout_composer(hwnd);
+            }
+            break;
+        }
+        case AT_CONV:      select_channel(arg); break;
+        case AT_MENU:      menu_dispatch(hwnd, (int)arg); break;
+        case AT_SEND:      composer_send(); break;
+        case AT_DTAB:      g_dtab = (int)arg; g_ovl_scroll = 0; break;
+        case AT_ACTFILTER: {
+            uint8_t was = act_wire_filter();
+            g_act_filter = (int)arg;
+            if (act_wire_filter() != was) oc_client_list_activity(g_client, act_wire_filter());
+            break;
+        }
+        case AT_THREAD: {
+            const oc_model *tm = model();
+            uint64_t cid = 0;
+            for (size_t i = 0; tm && i < tm->n_threads; i++)
+                if (tm->threads[i].root_id == arg) { cid = tm->threads[i].channel_id; break; }
+            if (cid) {
+                oc_client_mark_thread_read(g_client, arg, 0);
+                select_channel(cid);
+                g_view = VIEW_HOME;
+                oc_client_open_thread(g_client, cid, arg);
+            }
+            break;
+        }
+        case AT_PEOPLE:    profile_open(arg); break;
+        case AT_MODALBTN:
+            if ((int)arg < g_n_modal_btns) {
+                int cmd = g_modal_btns[arg].cmd;
+                if (cmd == MODAL_OK)          modal_finish(1);
+                else if (cmd == MODAL_CANCEL) modal_finish(0);
+                else                          menu_dispatch(hwnd, cmd);
+            }
+            break;
+        case AT_FMT:       ed_format((int)arg); break;
+        case AT_EMOJI:     picker_open(hwnd, 0); break;
+        case AT_MENTION:   ed_focus(hwnd); ed_insert(L"@"); ac_rebuild(); break;
+        case AT_SCHEDMENU:
+            /* The same menu the chevron opens, built where it is built — a second
+             * copy of its items here would be a second thing to keep in step. */
+            sched_menu_open((g_sched_btn.left + g_sched_btn.right) / 2,
+                            (g_sched_btn.top + g_sched_btn.bottom) / 2);
+            break;
+        case AT_THREADFILTER:
+            g_threads_unread = !g_threads_unread;
+            oc_client_list_threads(g_client,
+                g_threads_unread ? OC_THREADF_UNREAD : OC_THREADF_ALL);
+            break;
+        default: break;
+        }
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
     }
     case WM_SETFOCUS:
         /* Coming back from a native child (the find box, the palette, a form

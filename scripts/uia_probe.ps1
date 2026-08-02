@@ -8,6 +8,11 @@
 #
 #   powershell.exe -NoProfile -File scripts/uia_probe.ps1            # print the tree
 #   powershell.exe -NoProfile -File scripts/uia_probe.ps1 -Assert    # exit 1 on failure
+#
+# ASCII ONLY in code strings. Windows PowerShell reads a .ps1 without a BOM as
+# ANSI, so a UTF-8 em dash inside a quoted string becomes three characters and
+# the parser reports "Missing closing '}'" pointing at a block forty lines away.
+# Comments are safe; strings are not.
 param([switch]$Assert)
 
 $ErrorActionPreference = 'Stop'
@@ -26,6 +31,9 @@ if (-not $root) { Write-Output 'FAIL no automation element for the process'; exi
 
 $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
 $counts = @{}
+$ids = @{}          # AutomationId -> how many elements claim it (REQ-290)
+$noId = @()         # buttons and tabs with no id at all
+$notInvokable = @() # ...and ones a client could find but not press
 $composerText = $null
 $textDocs = @{}
 $firstWord = @{}
@@ -66,6 +74,18 @@ function Walk($el, $depth) {
             $script:firstWord[$type] = $r.GetText(-1)
         } catch { $script:textDocs[$type] = "<no TextPattern: $($_.Exception.Message)>" }
     }
+    # REQ-290: every element you can act on carries a stable, UNIQUE id, and the
+    # ones that are buttons can actually be pressed. A tree you can read and not
+    # drive is half the feature.
+    if ($type -eq 'Button' -or $type -eq 'TabItem') {
+        $aid = $c.AutomationId
+        if (-not $aid) { $script:noId += "$type '$name'" }
+        else {
+            $script:ids[$aid] = 1 + ($script:ids[$aid] | ForEach-Object { $_ })
+            try { $null = $el.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern) }
+            catch { $script:notInvokable += $aid }
+        }
+    }
     $child = $walker.GetFirstChild($el)
     while ($child) { Walk $child ($depth + 1); $child = $walker.GetNextSibling($child) }
 }
@@ -94,6 +114,31 @@ if ($Assert) {
             Write-Output "FAIL $k has no working TextPattern"; $fail = 1
         }
     }
+    # The identifiers (REQ-290). Named ones first: these are the contract, and a
+    # rename is a breaking change rather than a test to update.
+    foreach ($want in 'rail.home', 'shelf.threads', 'composer.send', 'composer') {
+        $byId = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty, $want)
+        if (-not $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $byId)) {
+            Write-Output "FAIL no element with AutomationId '$want'"; $fail = 1
+        }
+    }
+    if ($noId.Count) {
+        Write-Output ("FAIL " + $noId.Count + " actionable element(s) with no AutomationId: " +
+                      (($noId | Select-Object -First 4) -join ', '))
+        $fail = 1
+    }
+    $dupes = $ids.GetEnumerator() | Where-Object { $_.Value -gt 1 }
+    if ($dupes) {
+        Write-Output ("FAIL duplicate AutomationId(s): " +
+                      (($dupes | ForEach-Object { "$($_.Key) x$($_.Value)" }) -join ', '))
+        $fail = 1
+    }
+    if ($notInvokable.Count) {
+        Write-Output ("FAIL found but not pressable: " +
+                      (($notInvokable | Select-Object -First 4) -join ', '))
+        $fail = 1
+    }
     if ($fail) { exit 1 }
-    Write-Output 'uia_probe: OK'
+    Write-Output ("uia_probe: OK - " + $ids.Count + " identified controls, all invokable")
 }
