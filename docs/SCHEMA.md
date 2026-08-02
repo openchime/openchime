@@ -410,10 +410,36 @@ Server-authoritative notification settings, synced across a user's devices.
   the default** (all), so the table stays sparse.
 
 ### `users` (added columns)
-- `dnd_enabled` (INTEGER 0/1) — do-not-disturb on/off.
-- `dnd_start_min`, `dnd_end_min` (INTEGER) — the daily DND window as minutes of
-  day (UTC; the client converts from local), wrapping past midnight when
-  `start > end`. DND suppresses push, not in-app unread (REQ-131).
+- `dnd_mode` (INTEGER 0-3, migration 0034) — the notification schedule (REQ-136):
+  `0` off, `1` every day, `2` weekdays, `3` custom. It **replaced** `dnd_enabled`,
+  which is dropped.
+- `allow_start_min`, `allow_end_min` (INTEGER) — the daily window as minutes of
+  day, wrapping past midnight when `start > end`. Renamed from `dnd_start_min`/
+  `dnd_end_min` in migration 0034 **because the sense flipped**: this is the range
+  in which notifications are **allowed**, the complement of the quiet window it
+  replaced. Existing values were swapped as they were carried forward. Suppresses
+  push, not in-app unread.
+- `tz_offset_min` (INTEGER) — minutes east of UTC, refreshed by the client on
+  connect. A per-weekday window is only meaningful on the user's local calendar
+  day, and the daemon cannot resolve an IANA zone per push (ARCH-103).
+
+### `notify_schedule` (migration 0034)
+- `(user_id, weekday)` (PK), `enabled`, `start_min`, `end_min` — used by
+  **custom** mode only. Sparse on purpose: no row for a day means that day is
+  quiet, so a schedule listing Monday to Friday is a statement about the weekend
+  too rather than an omission.
+
+### `notify_keywords`, `priority_people` (migration 0035)
+- `notify_keywords (user_id, term)` — one term per row, stored lowercased.
+  Matching is case-insensitive and **exact** ("deploy" does not match
+  "deployment"), done by `shared/mention.c` and never by SQL, because the client
+  has to highlight precisely what the server notified on (REQ-135, ARCH-103).
+- `priority_people (user_id, person_id)` — a relation, not a level: every other
+  notification setting says *where*, this one says *who*. Pierces a level and a
+  pause, never a mute.
+- A keyword hit is written into **`mentions`** with `kind = 4`, so the push
+  query, the activity feed and the reader's highlight all keep working with no
+  further change.
 - `dnd_until_ms` (INTEGER, migration 0033) — a **pause** (REQ-278): the absolute
   instant it ends, `0` for none. A different type from the window above, not a
   longer version of it — the window is periodic by construction, this is one

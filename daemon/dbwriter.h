@@ -58,7 +58,7 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_CREATE_WEBHOOK = 33, OC_JOB_WEBHOOK_POST = 34,
        OC_JOB_LIST_WEBHOOKS = 35, OC_JOB_DELETE_WEBHOOK = 36,
        /* Notification preferences (REQ-130/131). */
-       OC_JOB_SET_NOTIFY_PREF = 37, OC_JOB_SET_DND = 38,
+       OC_JOB_SET_NOTIFY_PREF = 37, /* 38 was SET_DND, retired with REQ-131's window */
        OC_JOB_LIST_NOTIFY_PREFS = 39,
        /* Audio call join authorization (REQ-150): read job, channel access gate. */
        OC_JOB_CALL_AUTH = 40,
@@ -117,7 +117,12 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_FIRE_SCHEDULED = 87,
        /* Pause notifications (REQ-278). Minutes from now in `snooze_minutes`,
         * 0 to end it — one job, because ending early is just "until now". */
-       OC_JOB_SET_SNOOZE = 88 };
+       OC_JOB_SET_SNOOZE = 88,
+       /* The recurring schedule and the two alert lists (REQ-135/136). Each
+        * REPLACES what was there: the lists are short and a client editing one
+        * holds all of it, so an add/remove pair would need ids for terms that
+        * are their own identity. */
+       OC_JOB_SET_SCHEDULE = 89, OC_JOB_SET_KEYWORDS = 90, OC_JOB_SET_PRIORITY = 91 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -217,9 +222,18 @@ typedef struct oc_job {
     /* Notification prefs (REQ-130/131). SET_NOTIFY_PREF uses channel_id + level;
      * SET_DND uses the dnd_* fields. */
     uint8_t        notify_level;
-    uint8_t        dnd_enabled;
-    uint16_t       dnd_start_min, dnd_end_min;
     uint32_t       snooze_minutes;   /* SET_SNOOZE: from now; 0 ends the pause */
+    /* SET_SCHEDULE (REQ-136). `sched_days` is heap when n_sched_days > 0. */
+    uint8_t          sched_mode;
+    int16_t          sched_tz_offset_min;
+    uint16_t         sched_start_min, sched_end_min;
+    oc_schedule_day *sched_days;
+    uint8_t          n_sched_days;
+    /* SET_KEYWORDS / SET_PRIORITY (REQ-135), both heap and both wholesale. */
+    char           **kw_terms;
+    uint8_t          n_kw_terms;
+    uint64_t        *pri_people;
+    uint8_t          n_pri_people;
 
     /* BACKFILL */
     oc_bf_cursor  *cursors;   /* heap */
@@ -321,7 +335,10 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* The pause's new end instant, to that user's own connections (REQ-278).
         * The net thread also re-broadcasts their presence, because the FACT that
         * they are paused is public even though this instant is not. */
-       OC_RES_SNOOZE = 83 };
+       OC_RES_SNOOZE = 83,
+       /* The schedule as stored, and the two alert lists — both self-only, both
+        * fanned to every one of the user's connections like NOTIFY_PREFS. */
+       OC_RES_SCHEDULE = 84, OC_RES_ALERT_PREFS = 85 };
 
 /* One custom emoji (REQ-072). */
 typedef struct oc_emoji_row {
@@ -644,8 +661,18 @@ typedef struct oc_dbres {
     oc_notify_pref_row *nprefs;    /* heap array */
     uint8_t            np_default;  /* REQ-134: the level for channels with no row */
     size_t              n_nprefs;
-    uint8_t             np_dnd_enabled;
-    uint16_t            np_dnd_start_min, np_dnd_end_min;
+    /* OC_RES_SCHEDULE (REQ-136) — also carried on the prefs snapshot and at auth,
+     * so a client learns all of its notification state in one exchange. */
+    uint8_t             sc_mode;
+    int16_t             sc_tz_offset_min;
+    uint16_t            sc_start_min, sc_end_min;
+    oc_schedule_day     sc_days[OC_SCHEDULE_DAYS];
+    uint8_t             sc_n_days;
+    /* OC_RES_ALERT_PREFS (REQ-135): my keywords and my priority people. */
+    char              **al_terms;      /* heap array of heap strings */
+    uint8_t             al_n_terms;
+    uint64_t           *al_people;     /* heap */
+    uint8_t             al_n_people;
     /* OC_RES_SNOOZE, and carried on AUTH_OK so the net thread can seed its
      * in-memory copy without a second round trip. Already expiry-checked. */
     uint64_t            snooze_until_ms;

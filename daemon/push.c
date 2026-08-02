@@ -5,6 +5,7 @@
  * dedicated read-only connection. */
 
 #include "push.h"
+#include "notify.h"
 #include "tls.h"
 
 #include <mbedtls/base64.h>
@@ -316,11 +317,14 @@ static int post_notify(push_ctx *ctx, const char *audience, long ts, const char 
 
 /* --- exposed helpers ------------------------------------------------------- */
 
+/* REQ-131's helper, kept because REQ-136 subsumed the WINDOW, not the arithmetic:
+ * it is still what "inside a daily range" means, and the tests that pin the
+ * midnight-wrap behaviour are pinning this. */
+/* REQ-131's helper, kept because REQ-136 subsumed the WINDOW, not the
+ * arithmetic: the tests that pin the midnight-wrap behaviour pin this. */
 int oc_push_dnd_active(int enabled, int start_min, int end_min, int now_min) {
     if (!enabled) return 0;
-    if (start_min == end_min) return 0;             /* empty window */
-    if (start_min < end_min) return now_min >= start_min && now_min < end_min;
-    return now_min >= start_min || now_min < end_min; /* wraps past midnight */
+    return oc_notify_in_window(start_min, end_min, now_min);
 }
 
 int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
@@ -338,13 +342,27 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
      * alike. Recorded rather than silently approximated: the cost is that
      * @here may push someone who was already looking. */
     if (sqlite3_prepare_v2(db,
-            "SELECT dt.platform, dt.token, u.dnd_enabled, u.dnd_start_min, u.dnd_end_min, "
-            "       u.dnd_until_ms "
+            "SELECT dt.platform, dt.token, u.dnd_mode, u.allow_start_min, u.allow_end_min, "
+            "       u.dnd_until_ms, u.tz_offset_min, "
+            "       ns.weekday IS NOT NULL, COALESCE(ns.enabled,0), "
+            "       COALESCE(ns.start_min,0), COALESCE(ns.end_min,0), "
+            /* Is the AUTHOR one of this recipient's priority people (REQ-135)?
+             * A statement about who, evaluated against the sender — which is why
+             * it cannot be a level, and why it is answered here rather than in
+             * the WHERE clause: it must pierce the level and the pause, not
+             * merely pass them. */
+            "       EXISTS(SELECT 1 FROM priority_people pp "
+            "               WHERE pp.user_id = cm.user_id AND pp.person_id = ?2) "
             "FROM channel_members cm "
             "JOIN device_tokens dt ON dt.user_id = cm.user_id "
             "JOIN users u ON u.id = cm.user_id "
             "LEFT JOIN notification_prefs np "
             "  ON np.user_id = cm.user_id AND np.channel_id = cm.channel_id "
+            /* The recipient's LOCAL weekday, from the instant and their stored
+             * offset: 1970-01-01 was a Thursday, hence the +4. */
+            "LEFT JOIN notify_schedule ns "
+            "  ON ns.user_id = cm.user_id "
+            " AND ns.weekday = ((((?4/60000) + u.tz_offset_min)/1440) + 4) % 7 "
             "WHERE cm.channel_id = ?1 AND cm.user_id <> ?2 AND u.disabled = 0 "
             /* The fallback is the user's GLOBAL default (REQ-134), not a hardcoded
              * ALL: "notify me only when mentioned, everywhere" has to hold for the
@@ -355,7 +373,12 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
              * honoured in the sidebar and ignored here, so a muted channel at level
              * ALL still rang the phone. */
             "  AND COALESCE(np.muted, 0) = 0 "
+            /* A priority person pierces the LEVEL (REQ-135): "always notify me
+             * about them" is meaningless if a channel set to mentions-only can
+             * silence it. Mute above still wins — that is the deliberate limit. */
             "  AND ( COALESCE(np.level, u.notify_default) = 0 "
+            "        OR EXISTS(SELECT 1 FROM priority_people pp "
+            "                   WHERE pp.user_id = cm.user_id AND pp.person_id = ?2) "
             "        OR ( COALESCE(np.level, u.notify_default) = 1 AND ?3 <> 0 AND EXISTS ("
             "               SELECT 1 FROM mentions mn WHERE mn.message_id = ?3 "
             "                 AND (mn.user_id = cm.user_id OR mn.kind <> 0)) ) );",
@@ -365,18 +388,37 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
     sqlite3_bind_int64(st, 1, (sqlite3_int64)channel_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)author_id);
     sqlite3_bind_int64(st, 3, (sqlite3_int64)message_id);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)now_ms);
 
     int n = 0;
     while (n < max && sqlite3_step(st) == SQLITE_ROW) {
-        int dnd_en    = sqlite3_column_int(st, 2);
-        int dnd_start = sqlite3_column_int(st, 3);
-        int dnd_end   = sqlite3_column_int(st, 4);
-        if (oc_push_dnd_active(dnd_en, dnd_start, dnd_end, now_min)) continue;
-        /* A PAUSE (REQ-278), the other half of do-not-disturb: an absolute
-         * instant, checked here rather than swept anywhere, and it only ever ADDS
-         * silence — so it needs no precedence rule against the window above. */
-        uint64_t until = (uint64_t)sqlite3_column_int64(st, 5);
-        if (until && until > (uint64_t)now_ms) continue;
+        int mode        = sqlite3_column_int(st, 2);
+        int base_start  = sqlite3_column_int(st, 3);
+        int base_end    = sqlite3_column_int(st, 4);
+        uint64_t until  = (uint64_t)sqlite3_column_int64(st, 5);
+        int tz_off      = sqlite3_column_int(st, 6);
+        int day_present = sqlite3_column_int(st, 7);
+        int day_enabled = sqlite3_column_int(st, 8);
+        int day_start   = sqlite3_column_int(st, 9);
+        int day_end     = sqlite3_column_int(st, 10);
+        int vip         = sqlite3_column_int(st, 11);
+        /* The recipient's own clock, not the server's (REQ-136). */
+        long long lmin  = (long long)(now_ms / 60000) + tz_off;
+        int local_min   = (int)(((lmin % 1440) + 1440) % 1440);
+        int weekday     = (int)(((lmin / 1440) + 4) % 7);
+        if (weekday < 0) weekday += 7;
+        (void)now_min;
+        /* A priority person pierces a schedule and a pause alike (REQ-135): both
+         * say WHEN, and this says WHO. Mute is checked in the query above and is
+         * deliberately not pierced. */
+        if (!vip) {
+            if (oc_notify_quiet(mode, base_start, base_end, day_present, day_enabled,
+                                day_start, day_end, local_min, weekday)) continue;
+            /* A PAUSE (REQ-278), the other half of do-not-disturb: an absolute
+             * instant, checked here rather than swept anywhere, and it only ever
+             * ADDS silence — so it needs no precedence rule against the schedule. */
+            if (until && until > (uint64_t)now_ms) continue;
+        }
 
         const char *platform = (const char *)sqlite3_column_text(st, 0);
         const char *token    = (const char *)sqlite3_column_text(st, 1);

@@ -837,16 +837,15 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             }
         } else if (hdr.msg_type == OC_MSG_NOTIFY_PREFS) {
             enum { NPREF_CAP = 256 };
-            oc_notify_pref_entry ne[NPREF_CAP]; uint16_t count = 0; oc_set_dnd dnd = {0,0,0};
+            oc_notify_pref_entry ne[NPREF_CAP]; uint16_t count = 0;
             uint8_t npdefault = 0;
-            if (oc_decode_notify_prefs(&p, ne, NPREF_CAP, &count, &dnd, &npdefault) != OC_OK) return -1;
+            if (oc_decode_notify_prefs(&p, ne, NPREF_CAP, &count, &npdefault) != OC_OK) return -1;
             if (count > NPREF_CAP) count = NPREF_CAP;
-            /* Header first (the sync boundary), then one event per channel. */
+            /* Header first (the sync boundary), then one event per channel. The
+             * DND window left with REQ-136 — the schedule is its own frame. */
             oc_ev *h = oc_ev_new(OC_EV_DND);
             if (h) {
-                h->status = dnd.enabled;
                 h->op = npdefault;                /* REQ-134 */
-                h->count = ((uint32_t)dnd.start_min << 16) | dnd.end_min;
                 oc_queue_push(to_ui, h);
             }
             for (uint16_t i = 0; i < count; i++) {
@@ -856,6 +855,38 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->op = ne[i].level;
                 e->status = ne[i].muted;      /* WIN-40: distinct from the level */
                 oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_SCHEDULE) {
+            oc_schedule sc; oc_schedule_day days[OC_SCHEDULE_DAYS];
+            if (oc_decode_schedule(&p, &sc, days) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_SCHEDULE);
+                if (e) {
+                    e->sched_mode = sc.mode;
+                    e->tz_offset_min = sc.tz_offset_min;
+                    e->sched_start_min = sc.start_min;
+                    e->sched_end_min = sc.end_min;
+                    e->n_sched_days = sc.count;
+                    for (uint8_t i = 0; i < sc.count; i++) e->sched_days[i] = days[i];
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_ALERT_PREFS) {
+            oc_slice terms[OC_MAX_KEYWORDS]; uint8_t nt = 0;
+            uint64_t people[OC_MAX_PRIORITY]; uint8_t np = 0;
+            if (oc_decode_alert_prefs(&p, terms, OC_MAX_KEYWORDS, &nt,
+                                      people, OC_MAX_PRIORITY, &np) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_ALERT_PREFS);
+                if (e) {
+                    for (uint8_t i = 0; i < nt; i++) {
+                        size_t len = terms[i].len < OC_KEYWORD_MAX - 1 ? terms[i].len : OC_KEYWORD_MAX - 1;
+                        if (len) memcpy(e->kw_terms[i], terms[i].ptr, len);
+                        e->kw_terms[i][len] = '\0';
+                    }
+                    e->n_kw_terms = nt;
+                    for (uint8_t i = 0; i < np; i++) e->pri_people[i] = people[i];
+                    e->n_pri_people = np;
+                    oc_queue_push(to_ui, e);
+                }
             }
         } else if (hdr.msg_type == OC_MSG_SNOOZE) {
             oc_snooze sn;
@@ -1672,11 +1703,27 @@ static int run_connection(oc_net *n, int reconnecting,
                 if (oc_encode_set_notify_pref(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
-            if (c->type == OC_CMD_SET_DND) {
-                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                /* op = enabled; channel_id = start_min, message_id = end_min. */
-                oc_set_dnd sd = { c->op, (uint16_t)c->channel_id, (uint16_t)c->message_id };
-                if (oc_encode_set_dnd(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK)
+            if (c->type == OC_CMD_SET_SCHEDULE) {
+                uint8_t buf[96]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_schedule sc = { c->sched_mode, c->tz_offset_min, c->sched_start_min,
+                                   c->sched_end_min, c->n_sched_days, c->sched_days };
+                if (oc_encode_set_schedule(&w, OC_PROTOCOL_VERSION, &sc) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_KEYWORDS) {
+                uint8_t buf[OC_MAX_KEYWORDS * (OC_KEYWORD_MAX + 4) + 16];
+                oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_slice terms[OC_MAX_KEYWORDS];
+                for (uint8_t i = 0; i < c->n_kw_terms; i++) terms[i] = oc_slice_str(c->kw_terms[i]);
+                oc_set_keywords sk = { c->n_kw_terms, terms };
+                if (oc_encode_set_keywords(&w, OC_PROTOCOL_VERSION, &sk) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_SET_PRIORITY) {
+                uint8_t buf[OC_MAX_PRIORITY * 8 + 16];
+                oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_priority sp = { c->n_pri_people, c->pri_people };
+                if (oc_encode_set_priority(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SET_SNOOZE) {

@@ -975,15 +975,47 @@ int run_client_core_tests(void) {
         oc_client_set_notify_pref(a, 1, OC_NOTIFY_MENTIONS);
         CHECK(WAIT_FOR(a, oc_model_channel((oc_model *)m, 1) &&
                           oc_model_channel((oc_model *)m, 1)->notify_level == OC_NOTIFY_MENTIONS));
-        oc_client_set_dnd(a, 1, 1320, 420);        /* 22:00 -> 07:00 */
-        CHECK(WAIT_FOR(a, m->dnd_enabled && m->dnd_start_min == 1320 && m->dnd_end_min == 420));
+        /* The SCHEDULE (REQ-136): a per-weekday one, so the round trip proves the
+         * rows survive and not merely the two base integers. The window is the
+         * ALLOWED range now — 07:00 to 22:00 is the working day. */
+        { oc_schedule_day d[2] = { { 1, 1, 540, 1020 }, { 0, 0, 0, 0 } };  /* Mon 9-5, Sun off */
+          oc_client_set_schedule(a, OC_DND_CUSTOM, -300, 420, 1320, d, 2); }
+        CHECK(WAIT_FOR(a, m->dnd_mode == OC_DND_CUSTOM && m->allow_start_min == 420 &&
+                          m->allow_end_min == 1320 && m->n_sched_days == 2 &&
+                          m->tz_offset_min == -300));
+        /* Stored — and returned — in WEEKDAY order, not the order they were sent:
+         * a schedule is a week, and a client rendering seven rows should not have
+         * to sort them or care how the last edit happened to be assembled. */
+        { const oc_model *sm = oc_client_model(a);
+          CHECK(sm->sched_days[0].weekday == 0 && sm->sched_days[0].enabled == 0);
+          CHECK(sm->sched_days[1].weekday == 1 && sm->sched_days[1].start_min == 540); }
         /* Opening the prefs overlay re-syncs and the channel level survives. */
         oc_client_toggle_prefs(a, 1);
         CHECK(WAIT_FOR(a, m->prefs_open &&
                           oc_model_channel((oc_model *)m, 1)->notify_level == OC_NOTIFY_MENTIONS));
-        /* Clearing DND turns it off. */
-        oc_client_set_dnd(a, 0, 0, 0);
-        CHECK(WAIT_FOR(a, !m->dnd_enabled));
+        /* Turning the schedule off keeps nothing behind — including the days,
+         * which would otherwise apply again the moment it was re-enabled. */
+        oc_client_set_schedule(a, OC_DND_OFF, -300, 0, 0, NULL, 0);
+        CHECK(WAIT_FOR(a, m->dnd_mode == OC_DND_OFF && m->n_sched_days == 0));
+
+        /* Keywords and priority people (REQ-135), and the client-side matcher
+         * that has to agree with the server's — same list, same scanner. */
+        { char terms[2][OC_KEYWORD_MAX] = { "deploy", "release train" };
+          oc_client_set_keywords(a, terms, 2); }
+        CHECK(WAIT_FOR(a, m->n_kw_terms == 2));
+        { const oc_model *km = oc_client_model(a);
+          CHECK(oc_model_keyword_hit(km, "ship the deploy now", 19, NULL, NULL));
+          CHECK(oc_model_keyword_hit(km, "the release train leaves", 24, NULL, NULL));
+          /* "deploy" must not match "deployment": a highlight-word that fires on
+           * every longer word containing it is a word you turn off. */
+          CHECK(!oc_model_keyword_hit(km, "the deployment is fine", 22, NULL, NULL)); }
+        /* A real person: the daemon refuses an id that is nobody, so a test using
+         * 4242 would pass on a list that silently stayed empty. */
+        uint64_t vip_id = oc_model_user_id(oc_client_model(a), "erik");
+        CHECK(vip_id != 0);
+        { uint64_t vip[1] = { vip_id }; oc_client_set_priority(a, vip, 1); }
+        CHECK(WAIT_FOR(a, m->n_pri_people == 1 && oc_model_is_priority(m, vip_id)));
+        CHECK(!oc_model_is_priority(oc_client_model(a), 999999));
         oc_client_toggle_prefs(a, 0);
         CHECK(!oc_client_model(a)->prefs_open);
 

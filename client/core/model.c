@@ -3,6 +3,7 @@
  */
 
 #include "model.h"
+#include "mention.h"   /* oc_keyword_match — the client half of ARCH-103 */
 
 #include "protocol.h"   /* OC_PRESENCE_OFFLINE */
 
@@ -790,6 +791,21 @@ int oc_model_snoozed(const oc_model *m) {
     return m && m->snooze_until_ms != 0;
 }
 
+int oc_model_keyword_hit(const oc_model *m, const char *body, size_t len,
+                         size_t *span_start, size_t *span_len) {
+    if (!m || !body || !len) return 0;
+    for (uint8_t i = 0; i < m->n_kw_terms; i++)
+        if (oc_keyword_match(body, len, m->kw_terms[i], span_start, span_len)) return 1;
+    return 0;
+}
+
+int oc_model_is_priority(const oc_model *m, uint64_t user_id) {
+    if (!m || !user_id) return 0;
+    for (uint8_t i = 0; i < m->n_pri_people; i++)
+        if (m->pri_people[i] == user_id) return 1;
+    return 0;
+}
+
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id) {
     for (size_t i = 0; i < m->n_presence; i++)
         if (m->presence[i].user_id == user_id) return m->presence[i].status;
@@ -882,6 +898,21 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     }
     case OC_EV_PRESENCE:
         presence_set(m, e->user_id, e->status, e->op);
+        break;
+    case OC_EV_SCHEDULE:
+        m->dnd_mode        = e->sched_mode;
+        m->tz_offset_min   = e->tz_offset_min;
+        m->allow_start_min = e->sched_start_min;
+        m->allow_end_min   = e->sched_end_min;
+        m->n_sched_days    = e->n_sched_days;
+        for (uint8_t i = 0; i < e->n_sched_days; i++) m->sched_days[i] = e->sched_days[i];
+        break;
+    case OC_EV_ALERT_PREFS:
+        m->n_kw_terms = e->n_kw_terms;
+        for (uint8_t i = 0; i < e->n_kw_terms; i++)
+            snprintf(m->kw_terms[i], sizeof m->kw_terms[i], "%s", e->kw_terms[i]);
+        m->n_pri_people = e->n_pri_people;
+        for (uint8_t i = 0; i < e->n_pri_people; i++) m->pri_people[i] = e->pri_people[i];
         break;
     case OC_EV_SNOOZE:
         /* MY pause (REQ-278). The end instant is self-only, so this is the one
@@ -1218,9 +1249,8 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         m->notify_default = e->op;                 /* REQ-134 */
         for (size_t i = 0; i < m->n_channels; i++)
             m->channels[i].notify_level = m->notify_default;
-        m->dnd_enabled   = e->status;
-        m->dnd_start_min = (uint16_t)(e->count >> 16);
-        m->dnd_end_min   = (uint16_t)(e->count & 0xFFFF);
+        /* The DND window left this frame with REQ-136: the schedule arrives in
+         * its own OC_EV_SCHEDULE, right behind this one. */
         break;
     case OC_EV_NOTIFY_PREF: {
         oc_channel *c = oc_model_channel(m, e->channel_id);

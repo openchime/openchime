@@ -388,12 +388,17 @@ static const char *notify_label(uint8_t level) {
 static void build_prefs_rows(rows_t *r, const oc_model *m, int width) {
     (void)width;
     char line[160];
-    if (m->dnd_enabled)
-        snprintf(line, sizeof line, "do-not-disturb: %02u:%02u\xe2\x80\x93%02u:%02u",
-                 m->dnd_start_min / 60, m->dnd_start_min % 60,
-                 m->dnd_end_min / 60, m->dnd_end_min % 60);
+    /* The schedule states the ALLOWED hours now (REQ-136), so it is described
+     * that way — the sentence should be the setting. */
+    if (m->dnd_mode == OC_DND_CUSTOM)
+        snprintf(line, sizeof line, "notifications: custom schedule");
+    else if (m->dnd_mode != OC_DND_OFF)
+        snprintf(line, sizeof line, "notifications: %s %02u:%02u\xe2\x80\x93%02u:%02u",
+                 m->dnd_mode == OC_DND_WEEKDAYS ? "weekdays" : "daily",
+                 m->allow_start_min / 60, m->allow_start_min % 60,
+                 m->allow_end_min / 60, m->allow_end_min % 60);
     else
-        snprintf(line, sizeof line, "do-not-disturb: off");
+        snprintf(line, sizeof line, "notifications: any time");
     char *h = malloc(strlen(line) + 1);
     if (h) { strcpy(h, line); rows_push(r, h, TB_YELLOW | TB_BOLD); }
 
@@ -1925,12 +1930,19 @@ int main(int argc, char **argv) {
                     if (u) oc_client_open_dm(cl, u);
                 }
                 else if (k == PROMPT_DND) {
-                    if (strcmp(v, "off") == 0 || !*v) oc_client_set_dnd(cl, 0, 0, 0);
+                    /* Two times = the hours notifications are ALLOWED (REQ-136).
+                     * The full per-weekday schedule is a Win32-first feature; the
+                     * TUI keeps the everyday case working rather than pretending
+                     * the old quiet-hours meaning still holds. */
+                    if (strcmp(v, "off") == 0 || !*v)
+                        oc_client_set_schedule(cl, OC_DND_OFF, 0, 0, 0, NULL, 0);
                     else {
                         char s1[16] = "", s2[16] = "";
                         int a = parse_hhmm((sscanf(v, "%15s %15s", s1, s2) == 2) ? s1 : "");
                         int b = parse_hhmm(s2);
-                        if (a >= 0 && b >= 0) oc_client_set_dnd(cl, 1, (uint16_t)a, (uint16_t)b);
+                        if (a >= 0 && b >= 0)
+                            oc_client_set_schedule(cl, OC_DND_EVERY_DAY, 0,
+                                                   (uint16_t)a, (uint16_t)b, NULL, 0);
                     }
                 }
                 else if (k == PROMPT_PASSWD_OLD) {     /* step 1: stash, ask for the new one */

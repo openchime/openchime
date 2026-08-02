@@ -38,7 +38,10 @@
  * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
  * preview_author. Shipping client and daemon together (ARCH-61) means there is
  * no compatibility window to preserve — only a mismatch to detect loudly. */
-/* 5: PRESENCE_UPDATE carries the do-not-disturb FACT beside the status byte
+/* 6: NOTIFY_PREFS drops the three DND-window fields — the recurring schedule is
+ * its own frame (REQ-136), and SET_DND is retired with them.
+ *
+ * 5: PRESENCE_UPDATE carries the do-not-disturb FACT beside the status byte
  * (REQ-122/278). One byte appended to a fixed frame is still a layout change,
  * and the rule above has no exception for small ones.
  *
@@ -46,7 +49,7 @@
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
  * "connection lost" (ARCH-61 ships the two together). */
-#define OC_PROTOCOL_VERSION 5u
+#define OC_PROTOCOL_VERSION 6u
 
 /* Transport conventions (see PROTOCOL.md §1). The binary protocol shares TLS
  * port 443 with the future HTTP/webhook surface, demultiplexed by ALPN: a
@@ -186,7 +189,10 @@ typedef enum {
     OC_MSG_DOWNLOAD_END     = 0x0089, /* S->C, all bytes sent */
     OC_MSG_TRANSFER_CANCEL  = 0x008A, /* C->S, abort an in-progress transfer */
     OC_MSG_SET_NOTIFY_PREF  = 0x0090, /* C->S, set a channel's notification level (REQ-130) */
-    OC_MSG_SET_DND          = 0x0091, /* C->S, set the do-not-disturb window (REQ-131) */
+    /* 0x0091 was SET_DND, REQ-131's single quiet window. REQ-136 replaced it
+     * with a schedule (0x00CC) that states ALLOWED hours, so the op is retired
+     * rather than redefined: the same number meaning the opposite thing is how a
+     * client and a daemon agree loudly and behave differently. */
     OC_MSG_LIST_NOTIFY_PREFS= 0x0092, /* C->S, request all notification settings */
     OC_MSG_NOTIFY_PREFS     = 0x0093, /* S->C, DND + per-channel levels (also a sync push) */
     OC_MSG_SET_CLIENT_SETTING  = 0x0094, /* C->S, upsert a synced client setting (empty value = delete) */
@@ -235,6 +241,14 @@ typedef enum {
      * part shifts every entry. */
     OC_MSG_SET_SNOOZE       = 0x00CA, /* C->S, pause for N minutes from now (0 = end it) */
     OC_MSG_SNOOZE           = 0x00CB, /* S->C, to that user's own connections: when it ends */
+    /* The recurring SCHEDULE (REQ-136), the pause's opposite number: planned
+     * rather than manual, and stating when notifications are ALLOWED. */
+    OC_MSG_SET_SCHEDULE     = 0x00CC, /* C->S, mode + base window + per-weekday rows */
+    OC_MSG_SCHEDULE         = 0x00CD, /* S->C, self only: the same, as stored */
+    /* Keywords and priority people (REQ-135) — the recipient's own lists. */
+    OC_MSG_SET_KEYWORDS     = 0x00CE, /* C->S, replace my keyword list wholesale */
+    OC_MSG_SET_PRIORITY     = 0x00CF, /* C->S, replace my priority-people list */
+    OC_MSG_ALERT_PREFS      = 0x00D0, /* S->C, self only: both lists, as stored */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -728,7 +742,31 @@ typedef struct { uint64_t channel_id; } oc_typing;
 typedef struct { uint64_t channel_id; uint64_t user_id; } oc_typing_update;
 /* Notification preferences (REQ-130/131). */
 typedef struct { uint64_t channel_id; uint8_t level; } oc_set_notify_pref;
-typedef struct { uint8_t enabled; uint16_t start_min; uint16_t end_min; } oc_set_dnd;
+/* The notification schedule (REQ-136, ARCH-103). `mode`: 0 off, 1 every day,
+ * 2 weekdays, 3 custom. `start_min`/`end_min` are the ALLOWED window for modes 1
+ * and 2; mode 3 reads the per-weekday rows instead, weekday 0 = Sunday.
+ *
+ * `tz_offset_min` rides along because the window is meaningless without it: the
+ * day boundaries are the user's local ones, and only the client knows the zone
+ * (the same reason SET_SNOOZE carries minutes rather than an instant). */
+#define OC_SCHEDULE_DAYS 7u
+enum { OC_DND_OFF = 0, OC_DND_EVERY_DAY = 1, OC_DND_WEEKDAYS = 2, OC_DND_CUSTOM = 3 };
+typedef struct { uint8_t weekday; uint8_t enabled; uint16_t start_min; uint16_t end_min; } oc_schedule_day;
+typedef struct { uint8_t mode; int16_t tz_offset_min;
+                 uint16_t start_min, end_min;
+                 uint8_t count; const oc_schedule_day *days; } oc_schedule;
+/* Keyword alerts and priority people (REQ-135). Both are REPLACE-the-whole-list
+ * ops: the lists are short, and a client that edits one has the whole thing in
+ * front of it — an add/remove pair would need ids for terms that are their own
+ * identity. */
+#define OC_MAX_KEYWORDS 64u
+#define OC_MAX_PRIORITY 64u
+#define OC_KEYWORD_MAX  64u
+typedef struct { uint8_t count; const oc_slice *terms; } oc_set_keywords;
+typedef struct { uint8_t count; const uint64_t *people; } oc_set_priority;
+typedef struct { uint8_t n_terms; const oc_slice *terms;
+                 uint8_t n_people; const uint64_t *people; } oc_alert_prefs;
+
 /* REQ-278. Minutes FROM NOW, as Slack's API takes them: the presets are all
  * durations, and only the client knows the timezone that turns "until tomorrow"
  * into an instant. 0 ends the pause — there is no second op. */
@@ -753,8 +791,10 @@ typedef struct { uint8_t level; } oc_set_notify_default;
  * of its notification state, rather than needing a second round trip. Appended at the
  * END of the fixed fields, before the repeated list, which is a layout change — and
  * the reason it lands in the same release as protocol 3. */
-typedef struct { uint8_t dnd_enabled; uint16_t dnd_start_min; uint16_t dnd_end_min;
-                 uint8_t notify_default;
+/* The DND window's three fields left with REQ-136: the schedule is its own frame
+ * now, and three stale fields describing the opposite sense would have read
+ * correctly while being wrong. */
+typedef struct { uint8_t notify_default;
                  uint16_t count; const oc_notify_pref_entry *entries; } oc_notify_prefs;
 /* Synced client settings bucket (the daemon-side layer of the client config). */
 /* `recipients` is a comma-separated user-id list, used only when channel_id is 0
@@ -1010,9 +1050,13 @@ oc_result oc_encode_presence_update(oc_wbuf *w, uint16_t version, const oc_prese
 oc_result oc_encode_typing(oc_wbuf *w, uint16_t version, const oc_typing *m);
 oc_result oc_encode_typing_update(oc_wbuf *w, uint16_t version, const oc_typing_update *m);
 oc_result oc_encode_set_notify_pref(oc_wbuf *w, uint16_t version, const oc_set_notify_pref *m);
-oc_result oc_encode_set_dnd(oc_wbuf *w, uint16_t version, const oc_set_dnd *m);
 oc_result oc_encode_set_snooze(oc_wbuf *w, uint16_t version, const oc_set_snooze *m);
 oc_result oc_encode_snooze(oc_wbuf *w, uint16_t version, const oc_snooze *m);
+oc_result oc_encode_set_schedule(oc_wbuf *w, uint16_t version, const oc_schedule *m);
+oc_result oc_encode_schedule(oc_wbuf *w, uint16_t version, const oc_schedule *m);
+oc_result oc_encode_set_keywords(oc_wbuf *w, uint16_t version, const oc_set_keywords *m);
+oc_result oc_encode_set_priority(oc_wbuf *w, uint16_t version, const oc_set_priority *m);
+oc_result oc_encode_alert_prefs(oc_wbuf *w, uint16_t version, const oc_alert_prefs *m);
 oc_result oc_encode_register_device_token(oc_wbuf *w, uint16_t version, const oc_register_device_token *m);
 oc_result oc_encode_unregister_device_token(oc_wbuf *w, uint16_t version, oc_slice token);
 oc_result oc_encode_device_token_ack(oc_wbuf *w, uint16_t version, const oc_device_token_ack *m);
@@ -1157,16 +1201,20 @@ oc_result oc_decode_presence_update(oc_rbuf *p, oc_presence_update *m);
 oc_result oc_decode_typing(oc_rbuf *p, oc_typing *m);
 oc_result oc_decode_typing_update(oc_rbuf *p, oc_typing_update *m);
 oc_result oc_decode_set_notify_pref(oc_rbuf *p, oc_set_notify_pref *m);
-oc_result oc_decode_set_dnd(oc_rbuf *p, oc_set_dnd *m);
 oc_result oc_decode_set_snooze(oc_rbuf *p, oc_set_snooze *m);
 oc_result oc_decode_snooze(oc_rbuf *p, oc_snooze *m);
+/* `days` must have room for OC_SCHEDULE_DAYS entries; `m->days` points at it. */
+oc_result oc_decode_schedule(oc_rbuf *p, oc_schedule *m, oc_schedule_day *days);
+oc_result oc_decode_set_keywords(oc_rbuf *p, oc_slice *terms, uint8_t cap, uint8_t *out_n);
+oc_result oc_decode_set_priority(oc_rbuf *p, uint64_t *people, uint8_t cap, uint8_t *out_n);
+oc_result oc_decode_alert_prefs(oc_rbuf *p, oc_slice *terms, uint8_t tcap, uint8_t *out_nt,
+                                uint64_t *people, uint8_t pcap, uint8_t *out_np);
 oc_result oc_decode_register_device_token(oc_rbuf *p, oc_register_device_token *m);
 oc_result oc_decode_unregister_device_token(oc_rbuf *p, oc_slice *token);
 oc_result oc_decode_device_token_ack(oc_rbuf *p, oc_device_token_ack *m);
 oc_result oc_decode_list_notify_prefs(oc_rbuf *p);
 oc_result oc_decode_notify_prefs(oc_rbuf *p, oc_notify_pref_entry *entries, uint16_t cap,
-                                 uint16_t *out_count, oc_set_dnd *dnd_out,
-                                 uint8_t *out_default);
+                                 uint16_t *out_count, uint8_t *out_default);
 oc_result oc_decode_schedule_message(oc_rbuf *p, oc_schedule_message *m);
 oc_result oc_decode_cancel_scheduled(oc_rbuf *p, oc_cancel_scheduled *m);
 oc_result oc_decode_update_scheduled(oc_rbuf *p, oc_update_scheduled *m);

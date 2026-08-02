@@ -803,6 +803,116 @@ oc_result oc_decode_set_snooze(oc_rbuf *p, oc_set_snooze *m) {
     return r_done(p);
 }
 
+/* One encoder for both directions: the schedule a client sends and the schedule
+ * the server echoes are the same fact, and two shapes for it would be two things
+ * to keep in step (the argument DRAFT settled the same way). */
+static oc_result enc_schedule(oc_wbuf *w, uint16_t version, uint16_t type, const oc_schedule *m) {
+    size_t off = oc_frame_begin(w, version, type);
+    oc_w_u8(w, m->mode);
+    oc_w_u16(w, (uint16_t)m->tz_offset_min);   /* two's complement; minutes east of UTC */
+    oc_w_u16(w, m->start_min);
+    oc_w_u16(w, m->end_min);
+    uint8_t n = m->count > OC_SCHEDULE_DAYS ? (uint8_t)OC_SCHEDULE_DAYS : m->count;
+    oc_w_u8(w, n);
+    for (uint8_t i = 0; i < n; i++) {
+        oc_w_u8(w, m->days[i].weekday);
+        oc_w_u8(w, m->days[i].enabled);
+        oc_w_u16(w, m->days[i].start_min);
+        oc_w_u16(w, m->days[i].end_min);
+    }
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_set_schedule(oc_wbuf *w, uint16_t version, const oc_schedule *m) {
+    return enc_schedule(w, version, OC_MSG_SET_SCHEDULE, m);
+}
+
+oc_result oc_encode_schedule(oc_wbuf *w, uint16_t version, const oc_schedule *m) {
+    return enc_schedule(w, version, OC_MSG_SCHEDULE, m);
+}
+
+oc_result oc_decode_schedule(oc_rbuf *p, oc_schedule *m, oc_schedule_day *days) {
+    m->mode = oc_r_u8(p);
+    m->tz_offset_min = (int16_t)oc_r_u16(p);
+    m->start_min = oc_r_u16(p);
+    m->end_min = oc_r_u16(p);
+    uint8_t n = oc_r_u8(p);
+    if (n > OC_SCHEDULE_DAYS) return OC_E_MALFORMED;
+    for (uint8_t i = 0; i < n && !p->underflow; i++) {
+        days[i].weekday = oc_r_u8(p);
+        days[i].enabled = oc_r_u8(p);
+        days[i].start_min = oc_r_u16(p);
+        days[i].end_min = oc_r_u16(p);
+    }
+    m->count = n;
+    m->days = days;
+    return r_done(p);
+}
+
+oc_result oc_encode_set_keywords(oc_wbuf *w, uint16_t version, const oc_set_keywords *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_KEYWORDS);
+    uint8_t n = m->count > OC_MAX_KEYWORDS ? (uint8_t)OC_MAX_KEYWORDS : m->count;
+    oc_w_u8(w, n);
+    for (uint8_t i = 0; i < n; i++) oc_w_str(w, m->terms[i]);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_keywords(oc_rbuf *p, oc_slice *terms, uint8_t cap, uint8_t *out_n) {
+    uint8_t n = oc_r_u8(p);
+    for (uint8_t i = 0; i < n && !p->underflow; i++) {
+        oc_slice t = oc_r_str(p);
+        if (i < cap) terms[i] = t;
+    }
+    *out_n = n > cap ? cap : n;
+    return r_done(p);
+}
+
+oc_result oc_encode_set_priority(oc_wbuf *w, uint16_t version, const oc_set_priority *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_PRIORITY);
+    uint8_t n = m->count > OC_MAX_PRIORITY ? (uint8_t)OC_MAX_PRIORITY : m->count;
+    oc_w_u8(w, n);
+    for (uint8_t i = 0; i < n; i++) oc_w_u64(w, m->people[i]);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_priority(oc_rbuf *p, uint64_t *people, uint8_t cap, uint8_t *out_n) {
+    uint8_t n = oc_r_u8(p);
+    for (uint8_t i = 0; i < n && !p->underflow; i++) {
+        uint64_t id = oc_r_u64(p);
+        if (i < cap) people[i] = id;
+    }
+    *out_n = n > cap ? cap : n;
+    return r_done(p);
+}
+
+oc_result oc_encode_alert_prefs(oc_wbuf *w, uint16_t version, const oc_alert_prefs *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_ALERT_PREFS);
+    uint8_t nt = m->n_terms > OC_MAX_KEYWORDS ? (uint8_t)OC_MAX_KEYWORDS : m->n_terms;
+    oc_w_u8(w, nt);
+    for (uint8_t i = 0; i < nt; i++) oc_w_str(w, m->terms[i]);
+    uint8_t np = m->n_people > OC_MAX_PRIORITY ? (uint8_t)OC_MAX_PRIORITY : m->n_people;
+    oc_w_u8(w, np);
+    for (uint8_t i = 0; i < np; i++) oc_w_u64(w, m->people[i]);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_alert_prefs(oc_rbuf *p, oc_slice *terms, uint8_t tcap, uint8_t *out_nt,
+                                uint64_t *people, uint8_t pcap, uint8_t *out_np) {
+    uint8_t nt = oc_r_u8(p);
+    for (uint8_t i = 0; i < nt && !p->underflow; i++) {
+        oc_slice t = oc_r_str(p);
+        if (i < tcap) terms[i] = t;
+    }
+    *out_nt = nt > tcap ? tcap : nt;
+    uint8_t np = oc_r_u8(p);
+    for (uint8_t i = 0; i < np && !p->underflow; i++) {
+        uint64_t id = oc_r_u64(p);
+        if (i < pcap) people[i] = id;
+    }
+    *out_np = np > pcap ? pcap : np;
+    return r_done(p);
+}
+
 oc_result oc_decode_snooze(oc_rbuf *p, oc_snooze *m) {
     m->until_ms = oc_r_u64(p);
     return r_done(p);
@@ -830,14 +940,6 @@ oc_result oc_encode_set_notify_pref(oc_wbuf *w, uint16_t version, const oc_set_n
     return oc_frame_end(w, off);
 }
 
-oc_result oc_encode_set_dnd(oc_wbuf *w, uint16_t version, const oc_set_dnd *m) {
-    size_t off = oc_frame_begin(w, version, OC_MSG_SET_DND);
-    oc_w_u8(w, m->enabled);
-    oc_w_u16(w, m->start_min);
-    oc_w_u16(w, m->end_min);
-    return oc_frame_end(w, off);
-}
-
 oc_result oc_encode_list_notify_prefs(oc_wbuf *w, uint16_t version) {
     size_t off = oc_frame_begin(w, version, OC_MSG_LIST_NOTIFY_PREFS);
     return oc_frame_end(w, off);
@@ -845,9 +947,6 @@ oc_result oc_encode_list_notify_prefs(oc_wbuf *w, uint16_t version) {
 
 oc_result oc_encode_notify_prefs(oc_wbuf *w, uint16_t version, const oc_notify_prefs *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_NOTIFY_PREFS);
-    oc_w_u8(w, m->dnd_enabled);
-    oc_w_u16(w, m->dnd_start_min);
-    oc_w_u16(w, m->dnd_end_min);
     oc_w_u8(w, m->notify_default);      /* REQ-134 */
     oc_w_u16(w, m->count);
     for (uint16_t i = 0; i < m->count; i++) {
@@ -861,13 +960,6 @@ oc_result oc_encode_notify_prefs(oc_wbuf *w, uint16_t version, const oc_notify_p
 oc_result oc_decode_set_notify_pref(oc_rbuf *p, oc_set_notify_pref *m) {
     m->channel_id = oc_r_u64(p);
     m->level = oc_r_u8(p);
-    return r_done(p);
-}
-
-oc_result oc_decode_set_dnd(oc_rbuf *p, oc_set_dnd *m) {
-    m->enabled = oc_r_u8(p);
-    m->start_min = oc_r_u16(p);
-    m->end_min = oc_r_u16(p);
     return r_done(p);
 }
 
@@ -913,11 +1005,7 @@ oc_result oc_decode_list_notify_prefs(oc_rbuf *p) {
 }
 
 oc_result oc_decode_notify_prefs(oc_rbuf *p, oc_notify_pref_entry *entries, uint16_t cap,
-                                 uint16_t *out_count, oc_set_dnd *dnd_out,
-                                 uint8_t *out_default) {
-    dnd_out->enabled = oc_r_u8(p);
-    dnd_out->start_min = oc_r_u16(p);
-    dnd_out->end_min = oc_r_u16(p);
+                                 uint16_t *out_count, uint8_t *out_default) {
     uint8_t dflt = oc_r_u8(p);                 /* REQ-134 */
     if (out_default) *out_default = dflt;
     uint16_t count = oc_r_u16(p);

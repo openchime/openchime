@@ -561,11 +561,54 @@ static void test_notify_frames(void) {
         oc_set_notify_pref out;
         CHECK(oc_decode_set_notify_pref(&p, &out) == OC_OK && out.channel_id == 7 && out.level == OC_NOTIFY_MENTIONS);
     }
+    {   /* The SCHEDULE (REQ-136), which replaced the single window. Its range is
+         * the ALLOWED hours, and the offset rides with it because a per-weekday
+         * window without one is a window on the wrong day for half the world. */
+        oc_schedule_day days_in[3] = { { 1, 1, 540, 1020 }, { 3, 0, 0, 0 }, { 6, 1, 600, 720 } };
+        oc_schedule in = { OC_DND_CUSTOM, -480, 480, 1320, 3, days_in };
+        ROUNDTRIP(oc_encode_set_schedule(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_SCHEDULE, h, p);
+        oc_schedule out; oc_schedule_day days[OC_SCHEDULE_DAYS];
+        CHECK(oc_decode_schedule(&p, &out, days) == OC_OK);
+        CHECK(out.mode == OC_DND_CUSTOM && out.tz_offset_min == -480);
+        CHECK(out.start_min == 480 && out.end_min == 1320 && out.count == 3);
+        CHECK(days[0].weekday == 1 && days[0].start_min == 540 && days[0].end_min == 1020);
+        CHECK(days[1].weekday == 3 && days[1].enabled == 0);
+        CHECK(days[2].weekday == 6 && days[2].enabled == 1 && days[2].end_min == 720);
+    }
+    {   /* A NEGATIVE offset is the common case west of Greenwich, so it is the
+         * one worth pinning: it travels as two's complement in a u16. */
+        oc_schedule in = { OC_DND_EVERY_DAY, -330, 480, 1320, 0, NULL };
+        ROUNDTRIP(oc_encode_schedule(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SCHEDULE, h, p);
+        oc_schedule out; oc_schedule_day days[OC_SCHEDULE_DAYS];
+        CHECK(oc_decode_schedule(&p, &out, days) == OC_OK);
+        CHECK(out.tz_offset_min == -330 && out.count == 0 && out.mode == OC_DND_EVERY_DAY);
+    }
+    {   /* Keywords and priority people (REQ-135), both wholesale replacements. */
+        oc_slice terms_in[2] = { oc_slice_str("deploy"), oc_slice_str("release train") };
+        oc_set_keywords in = { 2, terms_in };
+        ROUNDTRIP(oc_encode_set_keywords(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_KEYWORDS, h, p);
+        oc_slice out[8]; uint8_t n = 0;
+        CHECK(oc_decode_set_keywords(&p, out, 8, &n) == OC_OK && n == 2);
+        CHECK(out[0].len == 6 && memcmp(out[0].ptr, "deploy", 6) == 0);
+        CHECK(out[1].len == 13 && memcmp(out[1].ptr, "release train", 13) == 0);
+    }
     {
-        oc_set_dnd in = { 1, 1320, 480 };   /* 22:00 -> 08:00 UTC */
-        ROUNDTRIP(oc_encode_set_dnd(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_DND, h, p);
-        oc_set_dnd out;
-        CHECK(oc_decode_set_dnd(&p, &out) == OC_OK && out.enabled == 1 && out.start_min == 1320 && out.end_min == 480);
+        uint64_t people_in[2] = { 7, 9 };
+        oc_set_priority in = { 2, people_in };
+        ROUNDTRIP(oc_encode_set_priority(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_PRIORITY, h, p);
+        uint64_t out[8]; uint8_t n = 0;
+        CHECK(oc_decode_set_priority(&p, out, 8, &n) == OC_OK && n == 2);
+        CHECK(out[0] == 7 && out[1] == 9);
+    }
+    {
+        oc_slice terms_in[1] = { oc_slice_str("outage") };
+        uint64_t people_in[1] = { 42 };
+        oc_alert_prefs in = { 1, terms_in, 1, people_in };
+        ROUNDTRIP(oc_encode_alert_prefs(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_ALERT_PREFS, h, p);
+        oc_slice t[4]; uint8_t nt = 0; uint64_t pe[4]; uint8_t np = 0;
+        CHECK(oc_decode_alert_prefs(&p, t, 4, &nt, pe, 4, &np) == OC_OK);
+        CHECK(nt == 1 && np == 1 && pe[0] == 42);
+        CHECK(t[0].len == 6 && memcmp(t[0].ptr, "outage", 6) == 0);
     }
     {
         ROUNDTRIP(oc_encode_list_notify_prefs(&w, OC_PROTOCOL_VERSION), OC_MSG_LIST_NOTIFY_PREFS, h, p);
@@ -613,14 +656,12 @@ static void test_notify_frames(void) {
     {
         oc_notify_pref_entry ents[2] = { { 7, OC_NOTIFY_MENTIONS }, { 9, OC_NOTIFY_NONE } };
         oc_notify_prefs in;
-        in.dnd_enabled = 1; in.dnd_start_min = 1320; in.dnd_end_min = 480;
         in.notify_default = OC_NOTIFY_MENTIONS;   /* REQ-134 */
         in.count = 2; in.entries = ents;
         ROUNDTRIP(oc_encode_notify_prefs(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_NOTIFY_PREFS, h, p);
-        oc_notify_pref_entry got[4]; uint16_t n = 0; oc_set_dnd dnd; uint8_t dflt = 0xFF;
-        CHECK(oc_decode_notify_prefs(&p, got, 4, &n, &dnd, &dflt) == OC_OK && n == 2);
+        oc_notify_pref_entry got[4]; uint16_t n = 0; uint8_t dflt = 0xFF;
+        CHECK(oc_decode_notify_prefs(&p, got, 4, &n, &dflt) == OC_OK && n == 2);
         CHECK(dflt == OC_NOTIFY_MENTIONS);
-        CHECK(dnd.enabled == 1 && dnd.start_min == 1320 && dnd.end_min == 480);
         CHECK(got[0].channel_id == 7 && got[0].level == OC_NOTIFY_MENTIONS);
         CHECK(got[1].channel_id == 9 && got[1].level == OC_NOTIFY_NONE);
     }

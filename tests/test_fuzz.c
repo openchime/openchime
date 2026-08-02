@@ -81,12 +81,24 @@ static void decode_all(const uint8_t *buf, size_t len) {
     oc_typing ty; D(oc_decode_typing(&p, &ty));
     oc_typing_update tu2; D(oc_decode_typing_update(&p, &tu2));
     oc_set_notify_pref snp; D(oc_decode_set_notify_pref(&p, &snp));
-    oc_set_dnd sdnd; D(oc_decode_set_dnd(&p, &sdnd));
     D(oc_decode_list_notify_prefs(&p));
-    { oc_notify_pref_entry ne[4]; uint16_t nc = 0; oc_set_dnd dd;
+    { oc_notify_pref_entry ne[4]; uint16_t nc = 0;
       oc_rbuf_init(&p, buf, len);
-      rc = oc_decode_notify_prefs(&p, ne, 4, &nc, &dd, NULL);
+      rc = oc_decode_notify_prefs(&p, ne, 4, &nc, NULL);
       CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
+    { oc_schedule sc; oc_schedule_day days[OC_SCHEDULE_DAYS];
+      oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_schedule(&p, &sc, days); CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
+    { oc_slice terms[8]; uint8_t nt = 0; oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_set_keywords(&p, terms, 8, &nt); CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
+    { uint64_t pe[8]; uint8_t np = 0; oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_set_priority(&p, pe, 8, &np); CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
+    { oc_slice terms[8]; uint8_t nt = 0; uint64_t pe[8]; uint8_t np = 0;
+      oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_alert_prefs(&p, terms, 8, &nt, pe, 8, &np);
+      CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
+    { oc_snooze sn; oc_rbuf_init(&p, buf, len);
+      rc = oc_decode_snooze(&p, &sn); CHECK(rc == OC_OK || rc == OC_E_MALFORMED); }
     oc_call_join cj; D(oc_decode_call_join(&p, &cj));
     oc_call_leave cle; D(oc_decode_call_leave(&p, &cle));
     { oc_call_joined jn; uint64_t pr[4]; oc_rbuf_init(&p, buf, len);

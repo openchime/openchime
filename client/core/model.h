@@ -312,8 +312,21 @@ typedef struct {
     oc_custom_emoji *cemoji;
     size_t    n_cemoji, cap_cemoji;
     uint8_t   prefs_open;
-    uint8_t   dnd_enabled;
-    uint16_t  dnd_start_min, dnd_end_min;
+    /* The recurring SCHEDULE (REQ-136): `dnd_mode` is OC_DND_*, and the window
+     * is the hours notifications are ALLOWED — the opposite sense from the quiet
+     * window it replaced, which is why the fields are named for it. */
+    uint8_t   dnd_mode;
+    int16_t   tz_offset_min;
+    uint16_t  allow_start_min, allow_end_min;
+    oc_schedule_day sched_days[OC_SCHEDULE_DAYS];
+    uint8_t   n_sched_days;
+    /* Keyword alerts and priority people (REQ-135). Held so the client can
+     * HIGHLIGHT what the server notified on — the same list, matched by the same
+     * scanner, which is the whole point of ARCH-103. */
+    char      kw_terms[OC_MAX_KEYWORDS][OC_KEYWORD_MAX];
+    uint8_t   n_kw_terms;
+    uint64_t  pri_people[OC_MAX_PRIORITY];
+    uint8_t   n_pri_people;
     /* REQ-278: when the manual PAUSE ends, 0 for none. Distinct from the window
      * above in type as well as in name — one instant against a daily range. */
     uint64_t  snooze_until_ms;
@@ -625,6 +638,13 @@ int oc_model_dnd_of(const oc_model *m, uint64_t user_id);
 /* Are MY notifications paused, and until when (0 = no) — my own end time is the
  * one this client is allowed to know. */
 int oc_model_snoozed(const oc_model *m);
+/* Does `body` hit one of MY keywords (REQ-135)? The client's half of ARCH-103:
+ * the same scanner the daemon notified with, so a highlight and a notification
+ * can never disagree. */
+int oc_model_keyword_hit(const oc_model *m, const char *body, size_t len,
+                         size_t *span_start, size_t *span_len);
+/* Is `user_id` one of my priority people? */
+int oc_model_is_priority(const oc_model *m, uint64_t user_id);
 /* Record a presence value (used for our own presence, which the server does not
  * echo back to us). */
 void oc_model_note_presence(oc_model *m, uint64_t user_id, uint8_t status);

@@ -168,7 +168,13 @@ void oc_client_close_reactions(oc_client *c);
  * sync that folds into the channels + the model DND fields. Toggle the prefs
  * overlay (frontend view state; opening refreshes the sync). */
 void oc_client_set_notify_pref(oc_client *c, uint64_t channel_id, uint8_t level);
-void oc_client_set_dnd(oc_client *c, uint8_t enabled, uint16_t start_min, uint16_t end_min);
+/* REQ-136: the recurring schedule, stating the hours notifications are ALLOWED. */
+void oc_client_set_schedule(oc_client *c, uint8_t mode, int16_t tz_offset_min,
+                            uint16_t start_min, uint16_t end_min,
+                            const oc_schedule_day *days, uint8_t n_days);
+/* REQ-135: replace my keyword list / my priority people, wholesale. */
+void oc_client_set_keywords(oc_client *c, const char terms[][OC_KEYWORD_MAX], uint8_t n);
+void oc_client_set_priority(oc_client *c, const uint64_t *people, uint8_t n);
 /* REQ-278: pause notifications for `minutes` from now; 0 ends the pause. */
 void oc_client_set_snooze(oc_client *c, uint32_t minutes);
 void oc_client_list_notify_prefs(oc_client *c);

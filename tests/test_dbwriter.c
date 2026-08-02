@@ -52,7 +52,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 33);
+    CHECK(oc_schema_version(db) == 35);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -1680,6 +1680,117 @@ static oc_dbres *activity(oc_dbwriter *w, uint64_t uid, uint8_t filter) {
     j->user_id = uid; j->act_filter = filter;
     oc_dbwriter_submit(w, j);
     return wait_result(w);
+}
+
+/* Keyword alerts (REQ-135, WIN-94). The claim under test is the one ARCH-103
+ * rests on: a hit IS a mention — same table, same kind column — which is what
+ * makes it notify, appear in the activity feed and highlight without any of the
+ * three learning about keywords at all. */
+static void test_keyword_alerts(void) {
+    const char *path = "build/test_dbwriter_keywords.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    uint64_t alice = reg(w, "alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    {   /* alice watches for "deploy" and the phrase "release train". */
+        oc_job *j = oc_job_new(OC_JOB_SET_KEYWORDS, 1);
+        j->user_id = alice;
+        j->kw_terms = calloc(2, sizeof *j->kw_terms);
+        j->kw_terms[0] = strdup("Deploy");          /* stored folded to lower case */
+        j->kw_terms[1] = strdup("release train");
+        j->n_kw_terms = 2;
+        oc_dbwriter_submit(w, j);
+        oc_dbres *r = wait_result(w);
+        CHECK(r && r->type == OC_RES_ALERT_PREFS && r->al_n_terms == 2);
+        CHECK(strcmp(r->al_terms[0], "deploy") == 0);
+        oc_dbres_free(r);
+    }
+
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0xA1, sizeof idem);
+    uint64_t hit = send_msg(w, bob, idem, "starting the deploy now");
+    memset(idem, 0xA2, sizeof idem);
+    uint64_t miss = send_msg(w, bob, idem, "the deployment plan is fine");
+    memset(idem, 0xA3, sizeof idem);
+    uint64_t own = send_msg(w, alice, idem, "I will deploy it myself");
+    CHECK(hit && miss && own);
+
+    /* The feed is the honest end-to-end check: mentions are what it reads, so a
+     * hit appearing there proves the row landed with a kind the feed accepts. */
+    oc_dbres *r = activity(w, alice, OC_ACTF_INVOLVED);
+    CHECK(r && r->type == OC_RES_ACTIVITY);
+    int saw_hit = 0, saw_miss = 0, saw_own = 0;
+    for (size_t i = 0; r && i < r->n_alist; i++) {
+        if (r->alist[i].message_id == hit)  saw_hit = 1;
+        if (r->alist[i].message_id == miss) saw_miss = 1;
+        if (r->alist[i].message_id == own)  saw_own = 1;
+    }
+    CHECK(saw_hit);
+    CHECK(!saw_miss);   /* "deployment" is not "deploy" */
+    CHECK(!saw_own);    /* your own message is not news */
+    oc_dbres_free(r);
+
+    /* Keywords fire in THREADS, deliberately unlike Slack (REQ-135). */
+    {
+        oc_job *j = oc_job_new(OC_JOB_SEND_REPLY, 1);
+        j->user_id = bob; j->channel_id = OC_DEFAULT_CHANNEL; j->parent_id = hit;
+        memset(idem, 0xA4, sizeof idem);
+        memcpy(j->idem, idem, OC_IDEM_LEN);
+        oc_job_set_body(j, "and the release train after", 27);
+        oc_dbwriter_submit(w, j);
+        oc_dbres *rr = wait_result(w);
+        uint64_t rid = (rr && rr->type == OC_RES_REPLY_OK) ? rr->message_id : 0;
+        oc_dbres_free(rr);
+        CHECK(rid);
+        r = activity(w, alice, OC_ACTF_INVOLVED);
+        int saw_reply = 0;
+        for (size_t i = 0; r && i < r->n_alist; i++)
+            if (r->alist[i].message_id == rid) saw_reply = 1;
+        CHECK(saw_reply);
+        oc_dbres_free(r);
+    }
+
+    /* Setting the list REPLACES it: dropping a term stops it firing, which an
+     * add-only op would have made impossible to express. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_SET_KEYWORDS, 1);
+        j->user_id = alice; j->n_kw_terms = 0;
+        oc_dbwriter_submit(w, j);
+        oc_dbres *rr = wait_result(w);
+        CHECK(rr && rr->al_n_terms == 0);
+        oc_dbres_free(rr);
+    }
+    memset(idem, 0xA5, sizeof idem);
+    uint64_t after = send_msg(w, bob, idem, "one more deploy");
+    r = activity(w, alice, OC_ACTF_INVOLVED);
+    int saw_after = 0;
+    for (size_t i = 0; r && i < r->n_alist; i++)
+        if (r->alist[i].message_id == after) saw_after = 1;
+    CHECK(!saw_after);
+    oc_dbres_free(r);
+
+    /* Priority people: a relation, refused for somebody who does not exist —
+     * a setting that can never fire is worse than an error. */
+    {
+        oc_job *j = oc_job_new(OC_JOB_SET_PRIORITY, 1);
+        j->user_id = alice;
+        j->pri_people = calloc(3, sizeof *j->pri_people);
+        j->pri_people[0] = bob;
+        j->pri_people[1] = alice;      /* yourself: never notifies you anyway */
+        j->pri_people[2] = 999999;     /* nobody */
+        j->n_pri_people = 3;
+        oc_dbwriter_submit(w, j);
+        oc_dbres *rr = wait_result(w);
+        CHECK(rr && rr->type == OC_RES_ALERT_PREFS && rr->al_n_people == 1);
+        CHECK(rr->al_people[0] == bob);
+        oc_dbres_free(rr);
+    }
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
 }
 
 static void test_activity_unreads(void) {
@@ -3920,11 +4031,11 @@ static void test_notify_prefs(void) {
     uint64_t bob   = reg(w, "np-bob",   "pw", OC_ROLE_MEMBER);
     CHECK(alice && bob);
 
-    /* Default: no prefs, DND off. */
+    /* Default: no prefs, and no schedule — mode 0 is "notify me whenever". */
     oc_job *j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 1);
     j->user_id = alice; oc_dbwriter_submit(w, j);
     oc_dbres *r = wait_result(w);
-    CHECK(r && r->type == OC_RES_NOTIFY_PREFS && r->n_nprefs == 0 && r->np_dnd_enabled == 0);
+    CHECK(r && r->type == OC_RES_NOTIFY_PREFS && r->n_nprefs == 0 && r->sc_mode == OC_DND_OFF);
     oc_dbres_free(r);
 
     /* Set a channel level; the snapshot reflects it. */
@@ -3936,13 +4047,23 @@ static void test_notify_prefs(void) {
     CHECK(r->nprefs[0].channel_id == OC_DEFAULT_CHANNEL && r->nprefs[0].level == OC_NOTIFY_MENTIONS);
     oc_dbres_free(r);
 
-    /* Set DND; the pref persists alongside. */
-    j = oc_job_new(OC_JOB_SET_DND, 3);
-    j->user_id = alice; j->dnd_enabled = 1; j->dnd_start_min = 1320; j->dnd_end_min = 480;
+    /* Set the SCHEDULE (REQ-136); the per-channel pref persists alongside, and
+     * the snapshot carries the schedule back. The window is the ALLOWED range
+     * now — 08:00 to 22:00 is "notify me during the day", the complement of the
+     * quiet window it replaced. */
+    j = oc_job_new(OC_JOB_SET_SCHEDULE, 3);
+    j->user_id = alice; j->sched_mode = OC_DND_EVERY_DAY;
+    j->sched_start_min = 480; j->sched_end_min = 1320; j->sched_tz_offset_min = -300;
     oc_dbwriter_submit(w, j);
     r = wait_result(w);
-    CHECK(r && r->type == OC_RES_NOTIFY_PREFS && r->np_dnd_enabled == 1);
-    CHECK(r->np_dnd_start_min == 1320 && r->np_dnd_end_min == 480 && r->n_nprefs == 1);
+    CHECK(r && r->type == OC_RES_SCHEDULE && r->sc_mode == OC_DND_EVERY_DAY);
+    CHECK(r->sc_start_min == 480 && r->sc_end_min == 1320 && r->sc_tz_offset_min == -300);
+    oc_dbres_free(r);
+    j = oc_job_new(OC_JOB_LIST_NOTIFY_PREFS, 3);
+    j->user_id = alice; oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_NOTIFY_PREFS && r->n_nprefs == 1);
+    CHECK(r->sc_mode == OC_DND_EVERY_DAY && r->sc_start_min == 480);
     oc_dbres_free(r);
 
     /* Re-setting the level upserts (no duplicate row). */
@@ -4180,6 +4301,7 @@ int run_dbwriter_tests(void) {
     test_group_dm();
     test_avatar();
     test_notify_prefs();
+    test_keyword_alerts();
     test_admin_ops();
     test_reactions();
     test_threads();

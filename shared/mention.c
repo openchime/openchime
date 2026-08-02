@@ -65,3 +65,37 @@ int oc_mention_targets(const char *body, size_t len, const char *name) {
     }
     return 0;
 }
+
+/* --- keyword matching (REQ-135, ARCH-103) --------------------------------- */
+
+static int kw_wordish(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
+int oc_keyword_match(const char *body, size_t len, const char *term,
+                     size_t *span_start, size_t *span_len) {
+    if (!body || !term || !*term) return 0;
+    size_t tl = strlen(term);
+    if (!tl || tl > len) return 0;
+    for (size_t i = 0; i + tl <= len; i++) {
+        /* Boundary BEFORE: the byte to the left must not be word-ish, or the
+         * term is the tail of a longer word ("redeploy" must not match). */
+        if (i && kw_wordish((unsigned char)body[i - 1])) continue;
+        size_t k = 0;
+        while (k < tl) {
+            unsigned char a = (unsigned char)body[i + k], b = (unsigned char)term[k];
+            if (a >= 'A' && a <= 'Z') a = (unsigned char)(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = (unsigned char)(b - 'A' + 'a');
+            if (a != b) break;
+            k++;
+        }
+        if (k != tl) continue;
+        /* ...and AFTER, which is what stops "deploy" matching "deployment". */
+        if (i + tl < len && kw_wordish((unsigned char)body[i + tl])) continue;
+        if (span_start) *span_start = i;
+        if (span_len)   *span_len   = tl;
+        return 1;
+    }
+    return 0;
+}

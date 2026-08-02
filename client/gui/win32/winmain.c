@@ -39,6 +39,7 @@
 #include "client.h"
 #include "secret_os.h"
 #include "model.h"
+#include "notify.h"
 #include "complete.h"   /* shared @user / #channel / :emoji: completion */
 #include "mention.h"    /* the same @mention scanner the daemon resolves with */
 #include "richtext.h"   /* the shared *bold* / _italic_ / `code` parser (ARCH-100) */
@@ -567,16 +568,47 @@ static NOTIFYICONDATAW g_tray;
 
 /* Is `t` (minutes since midnight) inside the DND window? Windows may wrap past
  * midnight, which is why this is not a plain range test. */
-static int in_dnd_window(uint16_t t, uint16_t start, uint16_t end) {
-    if (start == end) return 0;
-    return (start < end) ? (t >= start && t < end) : (t >= start || t < end);
+/* Minutes east of UTC, right now. The daemon stores this beside the schedule
+ * because a per-weekday window has to be evaluated on the user's own calendar
+ * day and only this side knows the zone (ARCH-103). Computed from the difference
+ * the C library already knows about rather than parsed from a zone name. */
+static int local_utc_offset_min(void) {
+    time_t now = time(NULL);
+    struct tm lt, gt;
+    if (!oc_localtime_r(&now, &lt)) return 0;
+#if defined(_WIN32)
+    if (gmtime_s(&gt, &now) != 0) return 0;
+#else
+    if (!gmtime_r(&now, &gt)) return 0;
+#endif
+    int lmin = lt.tm_hour * 60 + lt.tm_min;
+    int gmin = gt.tm_hour * 60 + gt.tm_min;
+    int diff = lmin - gmin;
+    int dday = lt.tm_yday - gt.tm_yday;
+    /* Year boundaries make yday jump the wrong way; only the sign matters. */
+    if (dday ==  1 || dday < -1) diff += 1440;
+    if (dday == -1 || dday >  1) diff -= 1440;
+    return diff;
 }
 
+/* Am I quiet right now? The rule lives in shared/notify.c (ARCH-103), because
+ * the daemon applies exactly the same one when it decides whether to notify —
+ * and this file used to carry TWO divergent copies of the simpler version it
+ * replaced, one for the tray and one for the header. */
 static int dnd_active(const oc_model *m) {
-    if (!m || !m->dnd_enabled) return 0;
+    if (!m || m->dnd_mode == OC_DND_OFF) return 0;
     time_t now = time(NULL); struct tm tv;
     if (!oc_localtime_r(&now, &tv)) return 0;
-    return in_dnd_window((uint16_t)(tv.tm_hour * 60 + tv.tm_min), m->dnd_start_min, m->dnd_end_min);
+    int local_min = tv.tm_hour * 60 + tv.tm_min, weekday = tv.tm_wday;
+    int present = 0, enabled = 0, ds = 0, de = 0;
+    for (uint8_t i = 0; i < m->n_sched_days; i++)
+        if (m->sched_days[i].weekday == weekday) {
+            present = 1; enabled = m->sched_days[i].enabled;
+            ds = m->sched_days[i].start_min; de = m->sched_days[i].end_min;
+            break;
+        }
+    return oc_notify_quiet(m->dnd_mode, m->allow_start_min, m->allow_end_min,
+                           present, enabled, ds, de, local_min, weekday);
 }
 
 static void tray_init(HWND hwnd) {
@@ -1898,16 +1930,7 @@ static void select_channel(uint64_t cid) {
  * the client's own read for what to SHOW. They agree because the rule is simple and
  * both are written from the same two fields — if it ever grows, it belongs in
  * shared/ like the mention scanner. */
-static int dnd_now(const oc_model *m) {
-    if (!m || !m->dnd_enabled) return 0;
-    time_t t = time(NULL);
-    struct tm lt;
-    localtime_s(&lt, &t);
-    int now = lt.tm_hour * 60 + lt.tm_min;
-    int a = m->dnd_start_min, b = m->dnd_end_min;
-    if (a == b) return 1;                 /* a zero-length window means all day */
-    return (a < b) ? (now >= a && now < b) : (now >= a || now < b);
-}
+static int dnd_now(const oc_model *m) { return dnd_active(m); }
 
 /* A channel's display name into `out` ("# general" / "@ bob"). */
 static void channel_label(const oc_model *m, const oc_channel *c, char *out, size_t cap) {
@@ -3885,15 +3908,21 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
     ovl_use(OVL_NOTIFY);
     g_n_notify_hits = 0;
 
-    char dnd[96];
-    if (m->dnd_enabled)
-        snprintf(dnd, sizeof dnd, "Do not disturb %02u:%02u \u2013 %02u:%02u",
-                 m->dnd_start_min / 60, m->dnd_start_min % 60,
-                 m->dnd_end_min / 60, m->dnd_end_min % 60);
+    /* The schedule states when notifications are ALLOWED (REQ-136), so it is
+     * described that way rather than inverted into quiet hours — the sentence a
+     * user reads should be the setting they set. */
+    char dnd[128];
+    static const char *MODE[] = { "off", "every day", "weekdays", "custom" };
+    if (m->dnd_mode == OC_DND_CUSTOM)
+        snprintf(dnd, sizeof dnd, "Notifications allowed on a custom schedule");
+    else if (m->dnd_mode != OC_DND_OFF)
+        snprintf(dnd, sizeof dnd, "Notifications allowed %s, %02u:%02u \u2013 %02u:%02u",
+                 MODE[m->dnd_mode], m->allow_start_min / 60, m->allow_start_min % 60,
+                 m->allow_end_min / 60, m->allow_end_min % 60);
     else
-        snprintf(dnd, sizeof dnd, "Do not disturb is off");
+        snprintf(dnd, sizeof dnd, "Notifications are allowed at any time");
     draw_text(rt, dnd, g_meta, rf(body.left + 20, body.top + 4, body.right - 20, body.top + 26),
-              m->dnd_enabled ? OC_COL_NOTICE : OC_COL_FAINT);
+              m->dnd_mode != OC_DND_OFF ? OC_COL_NOTICE : OC_COL_FAINT);
     body.top += 30;
 
     /* REQ-134: the level every channel WITHOUT its own row takes. It sits above
@@ -13302,26 +13331,41 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 41: oc_client_invite_user(g_client, OC_ROLE_ADMIN);  g_await_invite = 1; break;
     case 60: g_view = VIEW_HOME; close_overlays(); oc_client_toggle_storage(g_client, 1); oc_client_storage_status(g_client); break;
     case 61: g_view = VIEW_HOME; close_overlays(); oc_client_toggle_audit(g_client, 1); oc_client_audit_query(g_client, 0); break;
-    case 50: {   /* WIN-13: separate fields and an explicit on/off, not one parsed string. */
+    case 50: {   /* The notification SCHEDULE (REQ-136, WIN-94), in Slack's words:
+                  * you say when notifications are ALLOWED, not when to be quiet.
+                  * Per-weekday editing is the next step; this covers the three
+                  * modes that need no rows. */
         oc_field f[3] = {
-            { FF_CHECK, "Do not disturb during these hours", "", "0" },
-            { FF_TEXT,  "From (HH:MM)", "", "22:00" },
-            { FF_TEXT,  "To (HH:MM)",   "A window may cross midnight.", "08:00" },
+            { FF_CHOICE, "Allow notifications", "Any time|Every day|Weekdays", "0" },
+            { FF_TEXT,   "From (HH:MM)", "", "08:00" },
+            { FF_TEXT,   "To (HH:MM)",   "A window may cross midnight.", "22:00" },
         };
-        if (m && m->dnd_enabled) {
-            snprintf(f[0].value, sizeof f[0].value, "1");
-            snprintf(f[1].value, sizeof f[1].value, "%02u:%02u", m->dnd_start_min / 60, m->dnd_start_min % 60);
-            snprintf(f[2].value, sizeof f[2].value, "%02u:%02u", m->dnd_end_min / 60, m->dnd_end_min % 60);
+        if (m && m->dnd_mode != OC_DND_OFF) {
+            snprintf(f[0].value, sizeof f[0].value, "%d",
+                     m->dnd_mode == OC_DND_WEEKDAYS ? 2 : 1);
+            snprintf(f[1].value, sizeof f[1].value, "%02u:%02u",
+                     m->allow_start_min / 60, m->allow_start_min % 60);
+            snprintf(f[2].value, sizeof f[2].value, "%02u:%02u",
+                     m->allow_end_min / 60, m->allow_end_min % 60);
         }
-        if (!form_dialog(hwnd, "Do not disturb", f, 3)) break;
-        if (!atoi(f[0].value)) { oc_client_set_dnd(g_client, 0, 0, 0); toast_push("Do not disturb is off.", 0); break; }
+        if (!form_dialog(hwnd, "Notification schedule", f, 3)) break;
+        int choice = atoi(f[0].value);
+        int tzoff = local_utc_offset_min();
+        if (choice == 0) {
+            oc_client_set_schedule(g_client, OC_DND_OFF, (int16_t)tzoff, 0, 0, NULL, 0);
+            toast_push("Notifications are allowed at any time.", 0);
+            break;
+        }
         int sh = 0, sm = 0, eh = 0, em = 0;
         if (sscanf(f[1].value, "%d:%d", &sh, &sm) != 2 || sscanf(f[2].value, "%d:%d", &eh, &em) != 2 ||
             sh < 0 || sh > 23 || eh < 0 || eh > 23 || sm < 0 || sm > 59 || em < 0 || em > 59) {
             toast_push("Use HH:MM, 00:00 to 23:59.", 1);
             break;
         }
-        oc_client_set_dnd(g_client, 1, (uint16_t)(sh * 60 + sm), (uint16_t)(eh * 60 + em));
+        oc_client_set_schedule(g_client,
+                               choice == 2 ? OC_DND_WEEKDAYS : OC_DND_EVERY_DAY,
+                               (int16_t)tzoff, (uint16_t)(sh * 60 + sm),
+                               (uint16_t)(eh * 60 + em), NULL, 0);
         break; }
     case 70: modal_enter(hwnd, &g_prefs_open); break;
     case 73: {   /* WIN-33: catch-up, as a loop over the existing CLIENT_ACK.

@@ -669,6 +669,71 @@ static const char MIGRATION_0033[] =
      * why Slack ships both and why the window alone left "until 5pm" unbuildable. */
     "ALTER TABLE users ADD COLUMN dnd_until_ms INTEGER NOT NULL DEFAULT 0;";
 
+static const char MIGRATION_0034[] =
+    /* The notification SCHEDULE (REQ-136, ARCH-103, WIN-94). It REPLACES the
+     * single daily window rather than joining it: Slack has exactly one
+     * recurring mechanism, and two things able to disagree about "am I quiet
+     * now" would need a precedence rule nobody could remember.
+     *
+     * The sense flips with it. REQ-131's window was the QUIET hours ("do not
+     * disturb from 22:00 to 08:00"); Slack's schedule — and REQ-136 — states the
+     * ALLOWED hours and suppresses everything outside them. Same two integers,
+     * opposite meaning, so the columns are renamed rather than reused silently,
+     * and the existing values are swapped as they are carried forward. A column
+     * whose meaning changed under its old name is the kind of thing that reads
+     * correctly for a year and is wrong the whole time.
+     *
+     * `dnd_mode`: 0 off, 1 every day, 2 weekdays, 3 custom. The first three need
+     * no rows anywhere — only *custom* uses the table below, so the common cases
+     * stay two integers.
+     *
+     * `tz_offset_min` is what makes a per-weekday window answerable: the day has
+     * to be the user's LOCAL one, and the daemon cannot resolve an IANA zone per
+     * push without carrying tzdata into the push thread. The client refreshes the
+     * offset on connect — the same division of labour the pause uses. */
+    "ALTER TABLE users RENAME COLUMN dnd_start_min TO allow_start_min;"
+    "ALTER TABLE users RENAME COLUMN dnd_end_min TO allow_end_min;"
+    "ALTER TABLE users ADD COLUMN dnd_mode INTEGER NOT NULL DEFAULT 0 "
+    "  CHECK (dnd_mode IN (0,1,2,3));"
+    "ALTER TABLE users ADD COLUMN tz_offset_min INTEGER NOT NULL DEFAULT 0;"
+    /* Quiet [start,end) becomes allowed [end,start): the complement of the same
+     * pair. An enabled window carries forward as "every day", which is what it
+     * meant, and SQLite evaluates both right-hand sides against the original row,
+     * so this is a real swap rather than an assignment through itself. */
+    "UPDATE users SET dnd_mode = 1, allow_start_min = allow_end_min, "
+    "                 allow_end_min = allow_start_min WHERE dnd_enabled = 1;"
+    "ALTER TABLE users DROP COLUMN dnd_enabled;"
+    "CREATE TABLE notify_schedule ("
+    "  user_id   INTEGER NOT NULL REFERENCES users(id),"
+    "  weekday   INTEGER NOT NULL,"          /* 0 = Sunday, as strftime('%w') */
+    "  enabled   INTEGER NOT NULL DEFAULT 1,"
+    "  start_min INTEGER NOT NULL DEFAULT 0,"
+    "  end_min   INTEGER NOT NULL DEFAULT 0,"
+    "  PRIMARY KEY (user_id, weekday)"
+    ") WITHOUT ROWID;";
+
+static const char MIGRATION_0035[] =
+    /* Keywords and priority people (REQ-135, ARCH-103). One term per row: a
+     * comma-joined string would make a term containing a comma unrepresentable
+     * and every read a parser.
+     *
+     * Terms are stored lowercased; matching is case-insensitive and exact, so
+     * "deploy" does not match "deployment" — done by shared/mention.c and never
+     * by SQL, because the CLIENT has to highlight precisely what the server
+     * notified on and a predicate cannot be linked into a client. */
+    "CREATE TABLE notify_keywords ("
+    "  user_id INTEGER NOT NULL REFERENCES users(id),"
+    "  term    TEXT    NOT NULL,"
+    "  PRIMARY KEY (user_id, term)"
+    ") WITHOUT ROWID;"
+    /* A relation, not a level: every other notification setting says WHERE, this
+     * one says WHO, and it is evaluated against the author. */
+    "CREATE TABLE priority_people ("
+    "  user_id   INTEGER NOT NULL REFERENCES users(id),"
+    "  person_id INTEGER NOT NULL REFERENCES users(id),"
+    "  PRIMARY KEY (user_id, person_id)"
+    ") WITHOUT ROWID;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -703,6 +768,8 @@ const oc_migration OC_MIGRATIONS[] = {
     { 31, MIGRATION_0031 },
     { 32, MIGRATION_0032 },
     { 33, MIGRATION_0033 },
+    { 34, MIGRATION_0034 },
+    { 35, MIGRATION_0035 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

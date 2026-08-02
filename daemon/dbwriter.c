@@ -20,6 +20,7 @@
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 #include <sys/eventfd.h>
 #include <time.h>
@@ -75,6 +76,8 @@ struct oc_dbwriter {
 #define OC_PRUNE_INTERVAL_MS (60ull * 60 * 1000)
 
 static uint64_t snooze_until(sqlite3 *db, uint64_t uid);   /* fwd — auth and the prefs snapshot both read it */
+static void fill_schedule(sqlite3 *db, uint64_t uid, oc_dbres *r);      /* fwd — REQ-136 */
+static void fill_alert_prefs(sqlite3 *db, uint64_t uid, oc_dbres *r);   /* fwd — REQ-135 */
 
 static uint64_t dbw_now_ms(void) {
     struct timespec ts;
@@ -1306,6 +1309,61 @@ static void load_message_attachments(sqlite3 *db, uint64_t mid, oc_attach_meta *
  * Resolution happens HERE because only the daemon has the roster. An unmatched
  * name is simply not a mention: it stays as text in the body and notifies
  * nobody, which is the right outcome for a typo. */
+/* Keyword hits (REQ-135, ARCH-103). Written into `mentions` with their own kind,
+ * so the push query's MENTIONS branch, the activity feed and the reader's
+ * highlight all keep working with no further change — the three places a
+ * parallel table would have had to be taught about, where the first one that
+ * forgot would be a keyword that notifies but never appears.
+ *
+ * Matched by the SHARED scanner, never by SQL: "deploy" must not match
+ * "deployment", phrases are allowed, and the client has to highlight exactly
+ * what the server notified on (ARCH-89's argument, second time).
+ *
+ * The author's own keywords are skipped — your own message is not news — and
+ * a hit is skipped where the @ scanner already named that person, so one message
+ * cannot notify them twice for the same reason.
+ *
+ * Thread messages included, deliberately diverging from Slack: a thread is where
+ * the substantive discussion usually is, and the worst place to go deaf. */
+static void store_keyword_hits(sqlite3 *db, uint64_t mid, uint64_t channel_id,
+                               uint64_t author_id, const void *body, size_t body_len,
+                               uint64_t ts) {
+    if (!body || !body_len) return;
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT k.user_id, k.term FROM notify_keywords k "
+            "  JOIN channel_members cm ON cm.user_id = k.user_id "
+            " WHERE cm.channel_id = ?1 AND k.user_id <> ?2;", -1, &q, NULL) != SQLITE_OK)
+        return;
+    sqlite3_bind_int64(q, 1, (sqlite3_int64)channel_id);
+    sqlite3_bind_int64(q, 2, (sqlite3_int64)author_id);
+    sqlite3_stmt *ins = NULL;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO mentions(message_id, channel_id, user_id, kind, "
+            "                     span_start, span_len, created_at_ms) "
+            "SELECT ?1,?2,?3,?4,?5,?6,?7 WHERE NOT EXISTS("
+            "   SELECT 1 FROM mentions WHERE message_id=?1 AND user_id=?3);",
+            -1, &ins, NULL) != SQLITE_OK) { sqlite3_finalize(q); return; }
+    while (sqlite3_step(q) == SQLITE_ROW) {
+        uint64_t uid = (uint64_t)sqlite3_column_int64(q, 0);
+        const unsigned char *term = sqlite3_column_text(q, 1);
+        size_t st_off = 0, st_len = 0;
+        if (!term || !oc_keyword_match((const char *)body, body_len,
+                                       (const char *)term, &st_off, &st_len)) continue;
+        sqlite3_reset(ins);
+        sqlite3_bind_int64(ins, 1, (sqlite3_int64)mid);
+        sqlite3_bind_int64(ins, 2, (sqlite3_int64)channel_id);
+        sqlite3_bind_int64(ins, 3, (sqlite3_int64)uid);
+        sqlite3_bind_int  (ins, 4, OC_MENTION_KEYWORD);
+        sqlite3_bind_int  (ins, 5, (int)st_off);
+        sqlite3_bind_int  (ins, 6, (int)st_len);
+        sqlite3_bind_int64(ins, 7, (sqlite3_int64)ts);
+        sqlite3_step(ins);
+    }
+    sqlite3_finalize(ins);
+    sqlite3_finalize(q);
+}
+
 static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
                            const void *body, size_t body_len, uint64_t ts,
                            oc_mention_unresolved *unres) {
@@ -1516,6 +1574,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     r->unres.channel_id = j->channel_id;
     r->unres.message_id = mid;
     store_mentions(db, mid, j->channel_id, j->body, j->body_len, ts, &r->unres);
+    store_keyword_hits(db, mid, j->channel_id, j->user_id, j->body, j->body_len, ts);
     if (r->unres.count) {
         /* Whether the sender can do anything about it, answered here where the
          * channel is in hand rather than guessed at by the client. */
@@ -3129,6 +3188,12 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
         r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
     uint64_t mid = (uint64_t)sqlite3_last_insert_rowid(db);
+    /* Keywords fire in THREADS (REQ-135), which is a deliberate divergence:
+     * Slack's help says keywords in thread messages never notify, and a thread
+     * is where the substantive discussion usually is — the worst place to go
+     * deaf. (@mentions in replies remain a separate gap; REQ-061 notifies thread
+     * participants by a different route.) */
+    store_keyword_hits(db, mid, j->channel_id, j->user_id, j->body, j->body_len, ts);
     sqlite3_prepare_v2(db,
         "INSERT INTO sent_messages(channel_id, idempotency_token, message_id, created_at_ms) "
         "VALUES(?, ?, ?, ?);", -1, &st, NULL);
@@ -4076,21 +4141,19 @@ static oc_dbres *process_delete_webhook(sqlite3 *db, const oc_job *j) {
 static void build_notify_prefs(sqlite3 *db, uint64_t user_id, oc_dbres *r) {
     r->type = OC_RES_NOTIFY_PREFS;
     r->user_id = user_id;
-    /* A pause is notification state, so it belongs in the same answer — carried
-     * beside the frame rather than inside it, because NOTIFY_PREFS ends in a
-     * repeated list and anything added to its fixed part shifts every entry. */
-    r->snooze_until_ms = snooze_until(db, user_id);
+    /* Every other piece of notification state rides the same answer — each in
+     * its own frame, because NOTIFY_PREFS ends in a repeated list and anything
+     * added to its fixed part shifts every entry after the first. One request,
+     * so a client never has to assemble its settings from four round trips or
+     * decide what to show while half of them are outstanding. */
+    r->snooze_until_ms = snooze_until(db, user_id);       /* REQ-278 */
+    fill_schedule(db, user_id, r);                        /* REQ-136 */
+    fill_alert_prefs(db, user_id, r);                     /* REQ-135 */
     sqlite3_stmt *st = NULL;
-    sqlite3_prepare_v2(db,
-        "SELECT dnd_enabled, dnd_start_min, dnd_end_min, notify_default "
-        "  FROM users WHERE id=?;", -1, &st, NULL);
+    sqlite3_prepare_v2(db, "SELECT notify_default FROM users WHERE id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)user_id);
-    if (sqlite3_step(st) == SQLITE_ROW) {
-        r->np_dnd_enabled   = (uint8_t)sqlite3_column_int(st, 0);
-        r->np_dnd_start_min = (uint16_t)sqlite3_column_int(st, 1);
-        r->np_dnd_end_min   = (uint16_t)sqlite3_column_int(st, 2);
-        r->np_default       = (uint8_t)sqlite3_column_int(st, 3);   /* REQ-134 */
-    }
+    if (sqlite3_step(st) == SQLITE_ROW)
+        r->np_default = (uint8_t)sqlite3_column_int(st, 0);          /* REQ-134 */
     sqlite3_finalize(st);
 
     sqlite3_prepare_v2(db,
@@ -4410,20 +4473,167 @@ static oc_dbres *process_set_snooze(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
-static oc_dbres *process_set_dnd(sqlite3 *db, const oc_job *j) {
+/* Read the schedule as stored (REQ-136). Modes 0-2 need no rows at all; only
+ * *custom* reads the per-weekday table, which is why three of the four cases
+ * cost one query. */
+static void fill_schedule(sqlite3 *db, uint64_t uid, oc_dbres *r) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "SELECT dnd_mode, tz_offset_min, allow_start_min, allow_end_min "
+        "  FROM users WHERE id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        r->sc_mode           = (uint8_t)sqlite3_column_int(st, 0);
+        r->sc_tz_offset_min  = (int16_t)sqlite3_column_int(st, 1);
+        r->sc_start_min      = (uint16_t)sqlite3_column_int(st, 2);
+        r->sc_end_min        = (uint16_t)sqlite3_column_int(st, 3);
+    }
+    sqlite3_finalize(st);
+    sqlite3_prepare_v2(db,
+        "SELECT weekday, enabled, start_min, end_min FROM notify_schedule "
+        " WHERE user_id=? ORDER BY weekday;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    while (r->sc_n_days < OC_SCHEDULE_DAYS && sqlite3_step(st) == SQLITE_ROW) {
+        oc_schedule_day *d = &r->sc_days[r->sc_n_days++];
+        d->weekday   = (uint8_t)sqlite3_column_int(st, 0);
+        d->enabled   = (uint8_t)sqlite3_column_int(st, 1);
+        d->start_min = (uint16_t)sqlite3_column_int(st, 2);
+        d->end_min   = (uint16_t)sqlite3_column_int(st, 3);
+    }
+    sqlite3_finalize(st);
+}
+
+static void build_schedule(sqlite3 *db, uint64_t uid, oc_dbres *r) {
+    r->type = OC_RES_SCHEDULE;
+    r->user_id = uid;
+    fill_schedule(db, uid, r);
+}
+
+/* Set the schedule (REQ-136, WIN-94). Replaces what was there — including the
+ * per-weekday rows, which are deleted before the new ones land, because a
+ * schedule is one fact and a merge would leave a day nobody can see set. */
+static oc_dbres *process_set_schedule(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
     r->conn_id = j->conn_id;
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "UPDATE users SET dnd_enabled=?, dnd_start_min=?, dnd_end_min=? WHERE id=?;", -1, &st, NULL);
-    sqlite3_bind_int  (st, 1, j->dnd_enabled ? 1 : 0);
-    sqlite3_bind_int  (st, 2, (int)j->dnd_start_min);
-    sqlite3_bind_int  (st, 3, (int)j->dnd_end_min);
-    sqlite3_bind_int64(st, 4, (sqlite3_int64)j->user_id);
+        "UPDATE users SET dnd_mode=?1, tz_offset_min=?2, allow_start_min=?3, "
+        "                 allow_end_min=?4 WHERE id=?5;", -1, &st, NULL);
+    sqlite3_bind_int  (st, 1, j->sched_mode > OC_DND_CUSTOM ? 0 : (int)j->sched_mode);
+    sqlite3_bind_int  (st, 2, (int)j->sched_tz_offset_min);
+    sqlite3_bind_int  (st, 3, (int)j->sched_start_min);
+    sqlite3_bind_int  (st, 4, (int)j->sched_end_min);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)j->user_id);
     sqlite3_step(st);
     sqlite3_finalize(st);
-    build_notify_prefs(db, j->user_id, r);
+
+    sqlite3_prepare_v2(db, "DELETE FROM notify_schedule WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+
+    for (uint8_t i = 0; i < j->n_sched_days && j->sched_days; i++) {
+        const oc_schedule_day *d = &j->sched_days[i];
+        if (d->weekday > 6) continue;              /* a day that does not exist */
+        sqlite3_prepare_v2(db,
+            "INSERT INTO notify_schedule(user_id,weekday,enabled,start_min,end_min) "
+            "VALUES(?1,?2,?3,?4,?5);", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int  (st, 2, (int)d->weekday);
+        sqlite3_bind_int  (st, 3, d->enabled ? 1 : 0);
+        sqlite3_bind_int  (st, 4, (int)d->start_min);
+        sqlite3_bind_int  (st, 5, (int)d->end_min);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+    build_schedule(db, j->user_id, r);
+    return r;
+}
+
+/* My keywords and my priority people (REQ-135). Read together because they are
+ * one idea in the product — "what reaches me regardless of level" — and a client
+ * that showed one without the other would be showing half a setting. */
+static void fill_alert_prefs(sqlite3 *db, uint64_t uid, oc_dbres *r) {
+    sqlite3_stmt *st = NULL;
+    r->al_terms = calloc(OC_MAX_KEYWORDS, sizeof *r->al_terms);
+    sqlite3_prepare_v2(db, "SELECT term FROM notify_keywords WHERE user_id=? ORDER BY term;",
+                       -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    while (r->al_terms && r->al_n_terms < OC_MAX_KEYWORDS && sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *t = sqlite3_column_text(st, 0);
+        r->al_terms[r->al_n_terms++] = strdup(t ? (const char *)t : "");
+    }
+    sqlite3_finalize(st);
+    r->al_people = calloc(OC_MAX_PRIORITY, sizeof *r->al_people);
+    sqlite3_prepare_v2(db, "SELECT person_id FROM priority_people WHERE user_id=? ORDER BY person_id;",
+                       -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    while (r->al_people && r->al_n_people < OC_MAX_PRIORITY && sqlite3_step(st) == SQLITE_ROW)
+        r->al_people[r->al_n_people++] = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+}
+
+static void build_alert_prefs(sqlite3 *db, uint64_t uid, oc_dbres *r) {
+    r->type = OC_RES_ALERT_PREFS;
+    r->user_id = uid;
+    fill_alert_prefs(db, uid, r);
+}
+
+static oc_dbres *process_set_keywords(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "DELETE FROM notify_keywords WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    for (uint8_t i = 0; i < j->n_kw_terms && j->kw_terms; i++) {
+        const char *t = j->kw_terms[i];
+        if (!t || !*t) continue;
+        /* Stored lowercased, because matching is case-insensitive (REQ-135) and
+         * folding once on write beats folding on every message. */
+        char low[OC_KEYWORD_MAX];
+        size_t n = 0;
+        for (; t[n] && n + 1 < sizeof low; n++) low[n] = (char)tolower((unsigned char)t[n]);
+        low[n] = '\0';
+        if (!n) continue;
+        sqlite3_prepare_v2(db,
+            "INSERT OR IGNORE INTO notify_keywords(user_id, term) VALUES(?1, ?2);",
+            -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_text (st, 2, low, -1, SQLITE_TRANSIENT);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+    build_alert_prefs(db, j->user_id, r);
+    return r;
+}
+
+static oc_dbres *process_set_priority(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "DELETE FROM priority_people WHERE user_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    for (uint8_t i = 0; i < j->n_pri_people && j->pri_people; i++) {
+        uint64_t pid = j->pri_people[i];
+        /* Yourself is not a priority person: your own messages never notify you,
+         * so the row would be a setting that can never fire. */
+        if (!pid || pid == j->user_id) continue;
+        sqlite3_prepare_v2(db,
+            "INSERT OR IGNORE INTO priority_people(user_id, person_id) "
+            "SELECT ?1, ?2 WHERE EXISTS(SELECT 1 FROM users WHERE id=?2);", -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)pid);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+    build_alert_prefs(db, j->user_id, r);
     return r;
 }
 
@@ -5328,7 +5538,9 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_PROFILE)     return process_set_profile(w->db, j);
     if (j->type == OC_JOB_SET_AVATAR)      return process_set_avatar(w->db, j);
     if (j->type == OC_JOB_SET_READ_CURSOR) return process_set_read_cursor(w->db, j);
-    if (j->type == OC_JOB_SET_DND)         return process_set_dnd(w->db, j);
+    if (j->type == OC_JOB_SET_SCHEDULE)    return process_set_schedule(w->db, j);
+    if (j->type == OC_JOB_SET_KEYWORDS)    return process_set_keywords(w->db, j);
+    if (j->type == OC_JOB_SET_PRIORITY)    return process_set_priority(w->db, j);
     if (j->type == OC_JOB_SET_SNOOZE)      return process_set_snooze(w->db, j);
     if (j->type == OC_JOB_REGISTER_DEVICE_TOKEN)   return process_register_device_token(w->db, j);
     if (j->type == OC_JOB_UNREGISTER_DEVICE_TOKEN) return process_unregister_device_token(w->db, j);

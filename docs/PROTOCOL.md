@@ -1185,17 +1185,17 @@ level for a channel the caller can read: `0` all, `1` mentions-only, `2` none. A
 absent pref means the default (all). Refused with `ERROR NOT_A_MEMBER` for a
 channel the caller can't access, or an invalid level.
 
-**`SET_DND` (C → S), `0x0091`** `{ enabled: u8, start_min: u16, end_min: u16 }` —
-set the do-not-disturb window as a daily `[start, end)` range in **minutes of day
-(UTC**; the client converts from local time), wrapping past midnight when
-`start > end`.
+**`SET_DND` (`0x0091`) is RETIRED.** REQ-136 replaced the single quiet window
+with a schedule that states the hours notifications are **allowed** — the same
+two integers, the opposite sense — so the op number is retired rather than
+redefined. A number that means the reverse of what a peer thinks it means is how
+two sides agree loudly and behave differently.
 
 **`LIST_NOTIFY_PREFS` (C → S), `0x0092`** (empty) — request the caller's full
 settings.
 
-**`NOTIFY_PREFS` (S → C), `0x0093`** `{ dnd_enabled: u8, dnd_start_min: u16,
-dnd_end_min: u16, count: u16, count × { channel_id: u64, level: u8 } }` — the
-snapshot. It is sent both as the reply to `LIST_NOTIFY_PREFS` and, after any
+**`NOTIFY_PREFS` (S → C), `0x0093`** `{ notify_default: u8, count: u16,
+count × { channel_id: u64, level: u8, muted: u8 } }` — the snapshot. It is sent both as the reply to `LIST_NOTIFY_PREFS` and, after any
 `SET_*`, **pushed to every one of the user's connections** so a change on one
 device updates the others.
 
@@ -1211,7 +1211,30 @@ alongside every `NOTIFY_PREFS`. Other people are told the *fact* through
 `PRESENCE_UPDATE`'s `dnd` byte and never the instant (REQ-122/278): a colleague
 needs to know whether to write; when you are back is a movement report.
 
-*Why a separate frame.* `NOTIFY_PREFS` ends in a repeated list, so anything added
+**`SET_SCHEDULE` (C → S), `0x00CC`** and **`SCHEDULE` (S → C), `0x00CD`**
+`{ mode: u8, tz_offset_min: i16, start_min: u16, end_min: u16, count: u8,
+count × { weekday: u8, enabled: u8, start_min: u16, end_min: u16 } }` — the
+recurring schedule (REQ-136). `mode` is `0` off · `1` every day · `2` weekdays ·
+`3` custom; the window is the hours notifications are **allowed**, and the
+per-weekday rows apply to `custom` only (weekday `0` = Sunday). `tz_offset_min`
+rides with it because a per-weekday window without one is a window on the wrong
+day for half the world — and only the client knows the zone. One shape both
+directions: the schedule a client sends and the schedule the server echoes are
+the same fact.
+
+**`SET_KEYWORDS` (C → S), `0x00CE`** `{ count: u8, count × str }` and
+**`SET_PRIORITY` (C → S), `0x00CF`** `{ count: u8, count × u64 }` — replace my
+keyword list / my priority people wholesale (REQ-135). Wholesale because both
+lists are short, a client editing one holds all of it, and a term is its own
+identity — there is nothing an add/remove pair could name. **`ALERT_PREFS`
+(S → C), `0x00D0`** `{ n_terms: u8, terms…, n_people: u8, people… }` returns both.
+
+*One request, all of it.* `LIST_NOTIFY_PREFS` answers with `NOTIFY_PREFS`, then
+`SNOOZE`, `SCHEDULE` and `ALERT_PREFS`, in that order — so a client never has to
+assemble its notification settings from four round trips or decide what to show
+while half of them are outstanding.
+
+*Why separate frames.* `NOTIFY_PREFS` ends in a repeated list, so anything added
 to its fixed part shifts every entry after the first — the trap that cost protocol
 version 3. And the separation is the design, not just an encoding convenience: the
 **pause** is manual and one-shot, the **schedule** at `0x0091` is recurring and
@@ -1605,11 +1628,15 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x0072` | `TYPING`           | C → S     | no        | §5.13   |
 | `0x0073` | `TYPING_UPDATE`    | S → C     | no        | §5.13   |
 | `0x0090` | `SET_NOTIFY_PREF`  | C → S     | no        | §5.16   |
-| `0x0091` | `SET_DND`          | C → S     | no        | §5.16   |
 | `0x0092` | `LIST_NOTIFY_PREFS`| C → S     | no        | §5.16   |
 | `0x0093` | `NOTIFY_PREFS`     | S → C     | no        | §5.16   |
 | `0x00CA` | `SET_SNOOZE`       | C → S     | no        | §5.16   |
 | `0x00CB` | `SNOOZE`           | S → C     | no        | §5.16   |
+| `0x00CC` | `SET_SCHEDULE`     | C → S     | no        | §5.16   |
+| `0x00CD` | `SCHEDULE`         | S → C     | no        | §5.16   |
+| `0x00CE` | `SET_KEYWORDS`     | C → S     | no        | §5.16   |
+| `0x00CF` | `SET_PRIORITY`     | C → S     | no        | §5.16   |
+| `0x00D0` | `ALERT_PREFS`      | S → C     | no        | §5.16   |
 | `0x0094` | `SET_CLIENT_SETTING`   | C → S | no        | §5.16a  |
 | `0x0095` | `LIST_CLIENT_SETTINGS` | C → S | no        | §5.16a  |
 | `0x0096` | `CLIENT_SETTINGS`      | S → C | no        | §5.16a  |

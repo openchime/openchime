@@ -9,6 +9,11 @@
 
 #include <stdint.h>
 
+/* For the schedule and alert-list shapes carried on events and commands: they
+ * are wire types, and re-declaring them here would be a second definition to
+ * keep in step (REQ-135/136). */
+#include "protocol.h"
+
 /* Storage usage, policy, and what maintenance has reclaimed (REQ-214/215),
  * carried on OC_EV_STORAGE and folded into the model for the frontend to
  * render. Owner/admin only — the daemon refuses the request otherwise. */
@@ -52,6 +57,8 @@ enum {
     OC_EV_REACTIONS,       /* a REACTIONS entry: message_id + one reactor (user_id + emoji) */
     OC_EV_DND,             /* a NOTIFY_PREFS header (frame start): status=enabled, count=(start<<16|end) */
     OC_EV_SNOOZE,          /* a SNOOZE: server_time = when the pause ends, 0 = not paused (REQ-278) */
+    OC_EV_SCHEDULE,        /* a SCHEDULE frame: the recurring allowed-hours schedule (REQ-136) */
+    OC_EV_ALERT_PREFS,     /* an ALERT_PREFS frame: my keywords + priority people (REQ-135) */
     OC_EV_NOTIFY_PREF,     /* a NOTIFY_PREFS entry: channel_id + level(op) */
     OC_EV_USER_UPDATED,    /* a USER_UPDATED: user_id + role(status) + disabled(op) */
     OC_EV_INVITE,          /* an INVITE_CREATED: body=token, op=role, server_time=expires_at */
@@ -159,6 +166,18 @@ typedef struct {
     char     emoji[40];    /* REACTION: the emoji */
     char     author_name[64]; /* MESSAGE: author display name ("" = fall back to id) */
     char    *body;         /* heap; MESSAGE/ERROR/CHANNEL(name) only, else NULL */
+    /* The recurring schedule (REQ-136) and the two alert lists (REQ-135). Inline
+     * arrays: both are wire-capped and small, and a fixed array needs no
+     * ownership rules — the same reasoning `peers` and `gids` already use. */
+    oc_schedule_day sched_days[OC_SCHEDULE_DAYS];
+    uint8_t  n_sched_days;
+    uint8_t  sched_mode;
+    int16_t  tz_offset_min;
+    uint16_t sched_start_min, sched_end_min;
+    char     kw_terms[OC_MAX_KEYWORDS][OC_KEYWORD_MAX];
+    uint8_t  n_kw_terms;
+    uint64_t pri_people[OC_MAX_PRIORITY];
+    uint8_t  n_pri_people;
 } oc_ev;
 
 oc_ev *oc_ev_new(int type);
@@ -196,6 +215,9 @@ enum {
     OC_CMD_SET_NOTIFY_PREF, /* set `channel_id`'s notification level (op = level) */
     OC_CMD_SET_DND,         /* set the DND window: op = enabled, channel_id = start_min, message_id = end_min */
     OC_CMD_SET_SNOOZE,      /* pause notifications: message_id = minutes from now, 0 ends it (REQ-278) */
+    OC_CMD_SET_SCHEDULE,    /* the recurring schedule (REQ-136), carried in cmd->sched */
+    OC_CMD_SET_KEYWORDS,    /* replace my keyword list (REQ-135), carried in cmd->list */
+    OC_CMD_SET_PRIORITY,    /* replace my priority-people list (REQ-135) */
     OC_CMD_LIST_NOTIFY_PREFS, /* request all notification settings (DND + per-channel) */
     OC_CMD_SET_SETTING,     /* upsert a synced client setting: body=key, body2=value (empty value deletes) */
     OC_CMD_LIST_SETTINGS,   /* request the synced client-settings bucket */
@@ -267,6 +289,18 @@ typedef struct {
      * caps the count and a fixed array needs no ownership rules. */
     uint64_t gids[8];
     int      n_gids;
+    /* SET_SCHEDULE / SET_KEYWORDS / SET_PRIORITY (REQ-135/136), all inline and
+     * all wholesale — each command carries the whole setting, because that is
+     * what the ops are. */
+    oc_schedule_day sched_days[OC_SCHEDULE_DAYS];
+    uint8_t  n_sched_days;
+    uint8_t  sched_mode;
+    int16_t  tz_offset_min;
+    uint16_t sched_start_min, sched_end_min;
+    char     kw_terms[OC_MAX_KEYWORDS][OC_KEYWORD_MAX];
+    uint8_t  n_kw_terms;
+    uint64_t pri_people[OC_MAX_PRIORITY];
+    uint8_t  n_pri_people;
 } oc_cmd;
 
 oc_cmd *oc_cmd_new(int type);

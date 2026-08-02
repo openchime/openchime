@@ -38,6 +38,8 @@ void oc_push_stop(oc_push *p);
 /* True when now_min (minutes-of-day UTC, 0..1439) is inside the DND window
  * [start,end); handles the wrap-around case start > end. enabled==0 -> 0. */
 int oc_push_dnd_active(int enabled, int start_min, int end_min, int now_min);
+/* The schedule predicate lives in shared/notify.h: the client has to agree with
+ * it, and a copy on each side is a disagreement waiting to happen (ARCH-103). */
 
 typedef struct { uint8_t platform; char token[OC_DEVICE_TOKEN_MAX]; } oc_push_target;
 

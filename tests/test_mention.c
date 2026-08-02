@@ -121,6 +121,31 @@ static void test_targets(void) {
     CHECK(oc_mention_targets(S("danny@example.com"), "example.com") == 0);
 }
 
+/* Keyword matching (REQ-135, ARCH-103). The rules that matter are the two ends:
+ * a term must not match inside a longer word, in either direction, or a
+ * highlight-word becomes a word you turn off. */
+static void test_keywords(void) {
+    size_t st = 0, ln = 0;
+    CHECK(oc_keyword_match(S("ship the deploy now"), "deploy", &st, &ln) == 1);
+    CHECK(st == 9 && ln == 6);
+    CHECK(oc_keyword_match(S("Deploy at noon"), "deploy", NULL, NULL) == 1);   /* case */
+    CHECK(oc_keyword_match(S("deploy"), "deploy", NULL, NULL) == 1);           /* whole body */
+    CHECK(oc_keyword_match(S("the deployment plan"), "deploy", NULL, NULL) == 0);
+    CHECK(oc_keyword_match(S("a redeploy happened"), "deploy", NULL, NULL) == 0);
+    CHECK(oc_keyword_match(S("redeployment"), "deploy", NULL, NULL) == 0);
+    /* Punctuation IS a boundary, so a word at the end of a sentence still hits. */
+    CHECK(oc_keyword_match(S("deploy!"), "deploy", NULL, NULL) == 1);
+    CHECK(oc_keyword_match(S("(deploy)"), "deploy", NULL, NULL) == 1);
+    CHECK(oc_keyword_match(S("please deploy."), "deploy", NULL, NULL) == 1);
+    /* Phrases are allowed, as Slack's are, and are matched whole. */
+    CHECK(oc_keyword_match(S("the release train leaves"), "release train", NULL, NULL) == 1);
+    CHECK(oc_keyword_match(S("the release trainer"), "release train", NULL, NULL) == 0);
+    /* Degenerate input answers no rather than crashing or matching everything. */
+    CHECK(oc_keyword_match(S("anything"), "", NULL, NULL) == 0);
+    CHECK(oc_keyword_match(NULL, 0, "deploy", NULL, NULL) == 0);
+    CHECK(oc_keyword_match(S("hi"), "a longer term than the body", NULL, NULL) == 0);
+}
+
 int run_mention_tests(void) {
     failures = 0;
     test_basic();
@@ -130,6 +155,7 @@ int run_mention_tests(void) {
     test_spans();
     test_truncation_and_limits();
     test_targets();
-    printf("test_mention: scan, word boundaries, trailing punctuation, broadcasts, spans, truncation, targets\n");
+    test_keywords();
+    printf("test_mention: scan, word boundaries, trailing punctuation, broadcasts, spans, truncation, targets, keywords\n");
     return failures;
 }

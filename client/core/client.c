@@ -398,13 +398,46 @@ void oc_client_set_notify_pref(oc_client *c, uint64_t channel_id, uint8_t level)
     oc_queue_push(&c->cmds, cmd);
 }
 
-void oc_client_set_dnd(oc_client *c, uint8_t enabled, uint16_t start_min, uint16_t end_min) {
+/* The recurring schedule (REQ-136). `start_min`/`end_min` are the hours
+ * notifications are ALLOWED; `days` applies only to OC_DND_CUSTOM. The timezone
+ * offset rides along because only this side knows it — the daemon would have to
+ * carry tzdata into the thread that answers every push (ARCH-103). */
+void oc_client_set_schedule(oc_client *c, uint8_t mode, int16_t tz_offset_min,
+                            uint16_t start_min, uint16_t end_min,
+                            const oc_schedule_day *days, uint8_t n_days) {
     if (!c) return;
-    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_DND);
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_SCHEDULE);
     if (!cmd) return;
-    cmd->op = enabled;
-    cmd->channel_id = start_min;   /* reused: DND window start (minutes) */
-    cmd->message_id = end_min;     /* reused: DND window end (minutes) */
+    cmd->sched_mode = mode;
+    cmd->tz_offset_min = tz_offset_min;
+    cmd->sched_start_min = start_min;
+    cmd->sched_end_min = end_min;
+    if (n_days > OC_SCHEDULE_DAYS) n_days = OC_SCHEDULE_DAYS;
+    for (uint8_t i = 0; i < n_days && days; i++) cmd->sched_days[i] = days[i];
+    cmd->n_sched_days = days ? n_days : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* Both lists are REPLACEMENTS (REQ-135): short, edited whole, and their terms
+ * are their own identity, so there is nothing an add/remove pair could name. */
+void oc_client_set_keywords(oc_client *c, const char terms[][OC_KEYWORD_MAX], uint8_t n) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_KEYWORDS);
+    if (!cmd) return;
+    if (n > OC_MAX_KEYWORDS) n = OC_MAX_KEYWORDS;
+    for (uint8_t i = 0; i < n && terms; i++)
+        snprintf(cmd->kw_terms[i], OC_KEYWORD_MAX, "%s", terms[i]);
+    cmd->n_kw_terms = terms ? n : 0;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_set_priority(oc_client *c, const uint64_t *people, uint8_t n) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_PRIORITY);
+    if (!cmd) return;
+    if (n > OC_MAX_PRIORITY) n = OC_MAX_PRIORITY;
+    for (uint8_t i = 0; i < n && people; i++) cmd->pri_people[i] = people[i];
+    cmd->n_pri_people = people ? n : 0;
     oc_queue_push(&c->cmds, cmd);
 }
 

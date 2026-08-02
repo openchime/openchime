@@ -1309,6 +1309,22 @@ static void test_webhook_vertical(int port, const uint8_t *pin) {
 /* Notification preferences sync across a user's devices (REQ-130/131): setting a
  * channel level or DND on one connection pushes a fresh NOTIFY_PREFS snapshot to
  * all of the same user's connections. */
+/* One request answers with ALL of a user's notification state, in a fixed order:
+ * NOTIFY_PREFS, then the pause, the schedule and the alert lists (REQ-135/136/278).
+ * A test that read only the first would pass while three frames piled up in the
+ * stream and desynchronised everything after it — which is exactly what happened. */
+static void read_notify_tail(client *c) {
+    oc_header hdr; oc_rbuf p;
+    CHECK(read_frame(c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SNOOZE);
+    { oc_snooze sn; CHECK(oc_decode_snooze(&p, &sn) == OC_OK); }
+    CHECK(read_frame(c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SCHEDULE);
+    { oc_schedule sc; oc_schedule_day days[OC_SCHEDULE_DAYS];
+      CHECK(oc_decode_schedule(&p, &sc, days) == OC_OK); }
+    CHECK(read_frame(c, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ALERT_PREFS);
+    { oc_slice t[OC_MAX_KEYWORDS]; uint8_t nt = 0; uint64_t pe[OC_MAX_PRIORITY]; uint8_t np = 0;
+      CHECK(oc_decode_alert_prefs(&p, t, OC_MAX_KEYWORDS, &nt, pe, OC_MAX_PRIORITY, &np) == OC_OK); }
+}
+
 static void test_notify_prefs_vertical(int port, const uint8_t *pin) {
     client a1, a2;                       /* same user, two devices */
     CHECK(client_open(&a1, port, pin) == 0); CHECK(do_handshake(&a1) == 0);
@@ -1319,7 +1335,7 @@ static void test_notify_prefs_vertical(int port, const uint8_t *pin) {
     CHECK(ua == ua2);
 
     oc_header hdr; oc_rbuf p; uint8_t buf[128]; oc_wbuf w;
-    oc_notify_pref_entry ents[16]; uint16_t n; oc_set_dnd dnd;
+    oc_notify_pref_entry ents[16]; uint16_t n;
 
     /* Set a channel level on device 1 -> both devices get the snapshot. */
     oc_wbuf_init(&w, buf, sizeof buf);
@@ -1329,26 +1345,32 @@ static void test_notify_prefs_vertical(int port, const uint8_t *pin) {
     client *devs[2] = { &a1, &a2 };
     for (int d = 0; d < 2; d++) {
         CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_NOTIFY_PREFS);
-        CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, &dnd, NULL) == OC_OK && n == 1);
+        CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, NULL) == OC_OK && n == 1);
         CHECK(ents[0].channel_id == OC_DEFAULT_CHANNEL && ents[0].level == OC_NOTIFY_MENTIONS);
-        /* The pause travels with the rest of the notification state, in its own
-         * frame (REQ-278) — asserted rather than skipped, because "the snapshot
-         * arrived" and "the snapshot arrived complete" are different claims. */
-        CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SNOOZE);
-        { oc_snooze sn; CHECK(oc_decode_snooze(&p, &sn) == OC_OK && sn.until_ms == 0); }
+        /* The rest of the notification state travels with it, each in its own
+         * frame — asserted rather than skipped, because "the snapshot arrived"
+         * and "the snapshot arrived complete" are different claims. */
+        read_notify_tail(devs[d]);
     }
 
-    /* Set DND on device 2 -> both devices get the snapshot (pref persists). */
+    /* Set the SCHEDULE on device 2 -> both devices get it, in its own frame
+     * (REQ-136). The window states the hours notifications are ALLOWED, which is
+     * the opposite sense from the window it replaced — the reason SET_DND was
+     * retired rather than redefined. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_set_dnd sd = { 1, 1320, 480 };
-    CHECK(oc_encode_set_dnd(&w, OC_PROTOCOL_VERSION, &sd) == OC_OK);
+    oc_schedule_day cust[2] = { { 1, 1, 540, 1020 }, { 5, 0, 0, 0 } };  /* Mon 09:00-17:00, Fri off */
+    oc_schedule sc_in = { OC_DND_CUSTOM, -300, 480, 1320, 2, cust };
+    CHECK(oc_encode_set_schedule(&w, OC_PROTOCOL_VERSION, &sc_in) == OC_OK);
     CHECK(send_frame(&a2, buf, w.len) == 0);
     for (int d = 0; d < 2; d++) {
-        CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_NOTIFY_PREFS);
-        CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, &dnd, NULL) == OC_OK);
-        CHECK(dnd.enabled == 1 && dnd.start_min == 1320 && dnd.end_min == 480 && n == 1);
-        CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SNOOZE);
-        { oc_snooze sn; CHECK(oc_decode_snooze(&p, &sn) == OC_OK && sn.until_ms == 0); }
+        oc_schedule sc; oc_schedule_day days[OC_SCHEDULE_DAYS];
+        CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SCHEDULE);
+        CHECK(oc_decode_schedule(&p, &sc, days) == OC_OK);
+        CHECK(sc.mode == OC_DND_CUSTOM && sc.tz_offset_min == -300);
+        CHECK(sc.start_min == 480 && sc.end_min == 1320 && sc.count == 2);
+        CHECK(days[0].weekday == 1 && days[0].enabled == 1 &&
+              days[0].start_min == 540 && days[0].end_min == 1020);
+        CHECK(days[1].weekday == 5 && days[1].enabled == 0);
     }
 
     /* The global default (REQ-134) rides the same snapshot and syncs the same way:
@@ -1360,12 +1382,11 @@ static void test_notify_prefs_vertical(int port, const uint8_t *pin) {
     for (int d = 0; d < 2; d++) {
         uint8_t dflt = 0xFF;
         CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_NOTIFY_PREFS);
-        CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, &dnd, &dflt) == OC_OK);
+        CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, &dflt) == OC_OK);
         CHECK(dflt == OC_NOTIFY_NONE);
         /* ... and the per-channel override is still there, untouched. */
         CHECK(n == 1 && ents[0].level == OC_NOTIFY_MENTIONS);
-        CHECK(read_frame(devs[d], &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SNOOZE);
-        { oc_snooze sn; CHECK(oc_decode_snooze(&p, &sn) == OC_OK && sn.until_ms == 0); }
+        read_notify_tail(devs[d]);
     }
 
     /* --- pausing (REQ-278, WIN-92) ----------------------------------------
@@ -1399,8 +1420,16 @@ static void test_notify_prefs_vertical(int port, const uint8_t *pin) {
     CHECK(oc_encode_list_notify_prefs(&w, OC_PROTOCOL_VERSION) == OC_OK);
     CHECK(send_frame(&a1, buf, w.len) == 0);
     CHECK(read_frame(&a1, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_NOTIFY_PREFS);
-    CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, &dnd, NULL) == OC_OK);
-    CHECK(dnd.enabled == 1 && dnd.start_min == 1320 && dnd.end_min == 480);
+    CHECK(oc_decode_notify_prefs(&p, ents, 16, &n, NULL) == OC_OK);
+    /* The snapshot carries the schedule beside it, still as it was set: a pause
+     * and a schedule are two mechanisms, and neither act touched the other. */
+    { oc_schedule sc; oc_schedule_day days[OC_SCHEDULE_DAYS];
+      CHECK(read_frame(&a1, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SNOOZE);
+      { oc_snooze sn0; CHECK(oc_decode_snooze(&p, &sn0) == OC_OK && sn0.until_ms == 0); }
+      CHECK(read_frame(&a1, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SCHEDULE);
+      CHECK(oc_decode_schedule(&p, &sc, days) == OC_OK);
+      CHECK(sc.mode == OC_DND_CUSTOM && sc.count == 2 && sc.tz_offset_min == -300);
+      CHECK(read_frame(&a1, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_ALERT_PREFS); }
 
     client_close(&a1);
     client_close(&a2);

@@ -691,7 +691,11 @@ the requirement says so explicitly rather than implying one.
   silent on the other two; these are ours. **[needs ARCH decision — keyword and
   priority-person storage, and where the match→notify test lives; it must be the
   same shared scanner path as mentions (ARCH-89) or the highlight a reader sees
-  and the notification the server sends will drift.]**
+  and the notification the server sends will drift.]** **Settled by ARCH-103
+  (2026-08-01):** keywords one per row in `notify_keywords`, priority people as a
+  relation in `priority_people`, and a hit written into `mentions` with its own
+  kind — so the push query, the activity feed and the reader's highlight all keep
+  working unchanged. Matched by `shared/mention.c`, never by SQL.
 - **REQ-136.** A user has been able to configure a **recurring notification
   schedule**: notifications allowed **Every day**, **Weekdays**, or **Custom** —
   Custom carrying an independent start and end time **per day of the week** —
@@ -713,6 +717,12 @@ the requirement says so explicitly rather than implying one.
   **Stored against the user's local calendar day** (their timezone, REQ-241), not
   UTC. A per-weekday window is only meaningful locally: in UTC somebody's "Friday
   evening" silently becomes Saturday for a large part of the world.
+
+  **Settled by ARCH-103 (2026-08-01):** `dnd_enabled` becomes `dnd_mode`
+  (off/every day/weekdays/custom), the existing window columns carry the first
+  three, and only *custom* adds rows to `notify_schedule`. The local day is
+  resolved against a stored UTC offset the client refreshes on connect, not an
+  IANA zone the daemon would have to parse per push.
 - **REQ-278.** A user has been able to **pause notifications until a chosen
   instant** — "do not disturb until 17:00" — as a **one-shot** act distinct from
   any recurring window (REQ-131/136). The client has offered **durations**

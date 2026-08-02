@@ -23,7 +23,12 @@ enum {
     OC_MENTION_USER = 0,    /* @someone — resolve `name` against the roster */
     OC_MENTION_HERE,        /* @here     — members currently online */
     OC_MENTION_CHANNEL,     /* @channel  — every member */
-    OC_MENTION_EVERYONE     /* @everyone — every member */
+    OC_MENTION_EVERYONE,    /* @everyone — every member */
+    /* A KEYWORD hit (REQ-135). Never produced by oc_mention_scan — there is no
+     * '@' to find — but it shares the mentions table and the notify path,
+     * because REQ-135 puts keywords inside the *mentions* level and surfaces a
+     * hit in the activity feed as a mention. One kind, not a fourth mechanism. */
+    OC_MENTION_KEYWORD
 };
 
 #define OC_MENTION_NAME_MAX 64
@@ -57,5 +62,21 @@ size_t oc_mention_scan(const char *body, size_t len, oc_mention *out, size_t max
  * audience? A convenience for the common "is this for me" question; `name` may
  * be NULL to ask only about broadcasts. */
 int oc_mention_targets(const char *body, size_t len, const char *name);
+
+/* Does `body` contain `term` as a keyword (REQ-135)? Case-insensitive and EXACT:
+ * "deploy" does not match "deployment", because a highlight-word that fires on
+ * every longer word containing it is a word you turn off. Phrases are allowed —
+ * the term may contain spaces — and the boundary rule applies at both ends of
+ * the whole term.
+ *
+ * Lives here, beside the @ scanner, for ARCH-89's reason: the daemon decides
+ * whether to notify and the client decides what to highlight, and two
+ * implementations of "does this match" would disagree in a way neither side
+ * could see. `span_start`/`span_len` report the first hit when non-NULL.
+ *
+ * A boundary is anything that is not a letter, a digit or '_' — punctuation and
+ * ends of input included, so "deploy!" and "(deploy)" both match. */
+int oc_keyword_match(const char *body, size_t len, const char *term,
+                     size_t *span_start, size_t *span_len);
 
 #endif /* OC_MENTION_H */

@@ -1335,13 +1335,59 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
-        if (hdr.msg_type == OC_MSG_SET_DND) {
-            oc_set_dnd sd;
-            if (oc_decode_set_dnd(&p, &sd) != OC_OK) return -1;
-            oc_job *j = oc_job_new(OC_JOB_SET_DND, c->conn_id);
+        if (hdr.msg_type == OC_MSG_SET_SCHEDULE) {
+            oc_schedule sc; oc_schedule_day days[OC_SCHEDULE_DAYS];
+            if (oc_decode_schedule(&p, &sc, days) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_SCHEDULE, c->conn_id);
             if (!j) return -1;
-            j->user_id = c->user_id; j->dnd_enabled = sd.enabled;
-            j->dnd_start_min = sd.start_min; j->dnd_end_min = sd.end_min;
+            j->user_id = c->user_id;
+            j->sched_mode = sc.mode;
+            j->sched_tz_offset_min = sc.tz_offset_min;
+            j->sched_start_min = sc.start_min;
+            j->sched_end_min = sc.end_min;
+            if (sc.count) {
+                j->sched_days = calloc(sc.count, sizeof *j->sched_days);
+                if (j->sched_days) {
+                    memcpy(j->sched_days, days, sc.count * sizeof *j->sched_days);
+                    j->n_sched_days = sc.count;
+                }
+            }
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_KEYWORDS) {
+            oc_slice terms[OC_MAX_KEYWORDS]; uint8_t n = 0;
+            if (oc_decode_set_keywords(&p, terms, OC_MAX_KEYWORDS, &n) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_KEYWORDS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            if (n) {
+                j->kw_terms = calloc(n, sizeof *j->kw_terms);
+                for (uint8_t i = 0; j->kw_terms && i < n; i++) {
+                    size_t len = terms[i].len < OC_KEYWORD_MAX - 1 ? terms[i].len : OC_KEYWORD_MAX - 1;
+                    char *t = malloc(len + 1);
+                    if (!t) break;
+                    if (len) memcpy(t, terms[i].ptr, len);
+                    t[len] = '\0';
+                    j->kw_terms[j->n_kw_terms++] = t;
+                }
+            }
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_PRIORITY) {
+            uint64_t people[OC_MAX_PRIORITY]; uint8_t n = 0;
+            if (oc_decode_set_priority(&p, people, OC_MAX_PRIORITY, &n) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_PRIORITY, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id;
+            if (n) {
+                j->pri_people = calloc(n, sizeof *j->pri_people);
+                if (j->pri_people) {
+                    memcpy(j->pri_people, people, n * sizeof *j->pri_people);
+                    j->n_pri_people = n;
+                }
+            }
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -2876,9 +2922,6 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
          * assigned the count to the new field. A positional initializer turns "one new
          * struct field" into a data corruption with no compiler error worth the name. */
         oc_notify_prefs np;
-        np.dnd_enabled    = r->np_dnd_enabled;
-        np.dnd_start_min  = r->np_dnd_start_min;
-        np.dnd_end_min    = r->np_dnd_end_min;
         np.notify_default = r->np_default;        /* REQ-134 */
         np.count          = n;
         np.entries        = ents;
@@ -2890,9 +2933,10 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             if (c && c->authed && c->user_id == r->user_id)
                 send_bytes(ep, conns, fd, g_enc, len);
         }
-        /* The pause travels with the rest of a user's notification state, in its
-         * own frame (REQ-278) — NOTIFY_PREFS ends in a repeated list, so a field
-         * added to its fixed part would shift every entry after the first. */
+        /* The rest of the user's notification state travels with it, each in its
+         * own frame — NOTIFY_PREFS ends in a repeated list, so a field added to
+         * its fixed part would shift every entry after the first. One request
+         * answers with all of it, in a fixed order: pause, schedule, alerts. */
         {
             uint8_t sbuf[32]; oc_wbuf sw; oc_wbuf_init(&sw, sbuf, sizeof sbuf);
             oc_snooze sn = { r->snooze_until_ms };
@@ -2904,6 +2948,59 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
                     send_bytes(ep, conns, fd, sbuf, sw.len);
                 }
             }
+        }
+        {
+            oc_schedule sc = { r->sc_mode, r->sc_tz_offset_min, r->sc_start_min,
+                               r->sc_end_min, r->sc_n_days, r->sc_days };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_schedule(&w, OC_PROTOCOL_VERSION, &sc);
+            size_t sl = w.len;
+            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                conn *c = conns[fd];
+                if (c && c->authed && c->user_id == r->user_id)
+                    send_bytes(ep, conns, fd, g_enc, sl);
+            }
+        }
+        {
+            oc_slice terms[OC_MAX_KEYWORDS];
+            for (uint8_t i = 0; i < r->al_n_terms; i++) terms[i] = oc_slice_str(r->al_terms[i]);
+            oc_alert_prefs ap = { r->al_n_terms, terms, r->al_n_people, r->al_people };
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_encode_alert_prefs(&w, OC_PROTOCOL_VERSION, &ap);
+            size_t al = w.len;
+            for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                conn *c = conns[fd];
+                if (c && c->authed && c->user_id == r->user_id)
+                    send_bytes(ep, conns, fd, g_enc, al);
+            }
+        }
+        break;
+    }
+    case OC_RES_SCHEDULE: {
+        /* Self-only, and to EVERY connection the user holds: a schedule set on
+         * one device that left another showing the old one would be two answers
+         * to "when am I quiet", which is the thing REQ-136 exists to prevent. */
+        oc_schedule sc = { r->sc_mode, r->sc_tz_offset_min, r->sc_start_min, r->sc_end_min,
+                           r->sc_n_days, r->sc_days };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_schedule(&w, OC_PROTOCOL_VERSION, &sc);
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id == r->user_id)
+                send_bytes(ep, conns, fd, g_enc, w.len);
+        }
+        break;
+    }
+    case OC_RES_ALERT_PREFS: {
+        oc_slice terms[OC_MAX_KEYWORDS];
+        for (uint8_t i = 0; i < r->al_n_terms; i++) terms[i] = oc_slice_str(r->al_terms[i]);
+        oc_alert_prefs ap = { r->al_n_terms, terms, r->al_n_people, r->al_people };
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_encode_alert_prefs(&w, OC_PROTOCOL_VERSION, &ap);
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id == r->user_id)
+                send_bytes(ep, conns, fd, g_enc, w.len);
         }
         break;
     }
