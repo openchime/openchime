@@ -61,6 +61,12 @@ licence file; jsmn's MIT text exists only in the header comment.
 *Impact:* an MIT attribution nicety, not a functional one. **Verified** —
 `ls third_party/jsmn/`.
 
+**FIXED 2026-08-02.** `third_party/jsmn/LICENSE` is committed, extracted
+verbatim from the notice in `jsmn.h` rather than typed from memory, so it
+provably matches the vendored source: all 19 lines of the header's notice appear
+in it. The file is tracked and not caught by the `third_party/*` ignore rule.
+All three MIT-vendored libraries now carry a licence file.
+
 ## 3. The MinIO dev images are not version-pinned
 
 `docker-compose.yml` uses `minio/minio:latest` and `minio/mc:latest`.

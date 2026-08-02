@@ -41,9 +41,9 @@ raw `tb_*` grid calls — so the toolbox is the shared layer rather than an
 exclusive one.
 
 Committed files: `third_party/{termbox2/termbox2.h, utf8proc/utf8proc.{c,h},
-utf8proc/utf8proc_data.c, jsmn/jsmn.h}`. termbox2 ships its `LICENSE` and
-utf8proc its `LICENSE.md`; **jsmn's license file is not committed** — only
-`jsmn.h`, whose header carries the MIT text. `.gitignore` ignores
+utf8proc/utf8proc_data.c, jsmn/jsmn.h}`, and **each carries its licence file**:
+termbox2's `LICENSE`, utf8proc's `LICENSE.md`, and jsmn's `LICENSE` (extracted
+verbatim from the notice in `jsmn.h`, which is where upstream keeps it). `.gitignore` ignores
 `third_party/*` and whitelists **four** paths: `jsmn/`, `termbox2/`,
 `utf8proc/` and `lucide/` (committed, see below). Everything else under
 `third_party/` — the fetched mbedTLS trees among it — stays ignored.
