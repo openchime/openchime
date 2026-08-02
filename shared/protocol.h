@@ -38,7 +38,10 @@
  * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
  * preview_author. Shipping client and daemon together (ARCH-61) means there is
  * no compatibility window to preserve — only a mismatch to detect loudly. */
-/* 6: NOTIFY_PREFS drops the three DND-window fields — the recurring schedule is
+/* 7: USER_LIST carries title, timezone and custom status (REQ-289) — a repeated
+ * list, so an added field shifts every entry after the first.
+ *
+ * 6: NOTIFY_PREFS drops the three DND-window fields — the recurring schedule is
  * its own frame (REQ-136), and SET_DND is retired with them.
  *
  * 5: PRESENCE_UPDATE carries the do-not-disturb FACT beside the status byte
@@ -49,7 +52,7 @@
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
  * "connection lost" (ARCH-61 ships the two together). */
-#define OC_PROTOCOL_VERSION 6u
+#define OC_PROTOCOL_VERSION 7u
 
 /* Transport conventions (see PROTOCOL.md §1). The binary protocol shares TLS
  * port 443 with the future HTTP/webhook surface, demultiplexed by ALPN: a
@@ -249,6 +252,15 @@ typedef enum {
     OC_MSG_SET_KEYWORDS     = 0x00CE, /* C->S, replace my keyword list wholesale */
     OC_MSG_SET_PRIORITY     = 0x00CF, /* C->S, replace my priority-people list */
     OC_MSG_ALERT_PREFS      = 0x00D0, /* S->C, self only: both lists, as stored */
+    /* Threads I am in, across channels (REQ-062, ARCH-104). Every existing thread
+     * op is scoped to ONE parent; this is the aggregate Slack's Threads view
+     * needs, and the only one that can answer "what have I missed" without
+     * visiting every channel. */
+    OC_MSG_LIST_THREADS     = 0x00D1, /* C->S, {filter} 0 all / 1 unread only */
+    OC_MSG_THREAD_SUMMARY   = 0x00D2, /* S->C, one thread (streamed) */
+    OC_MSG_THREADS          = 0x00D3, /* S->C, terminator */
+    OC_MSG_SET_THREAD_FOLLOW= 0x00D4, /* C->S, follow/unfollow one thread */
+    OC_MSG_MARK_THREAD_READ = 0x00D5, /* C->S, its replies are read up to here */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -767,6 +779,28 @@ typedef struct { uint8_t count; const uint64_t *people; } oc_set_priority;
 typedef struct { uint8_t n_terms; const oc_slice *terms;
                  uint8_t n_people; const uint64_t *people; } oc_alert_prefs;
 
+/* One thread in the aggregated view (REQ-062). `unread` counts replies by other
+ * people past my per-thread cursor — a channel cursor cannot answer this, since
+ * reading a channel says nothing about whether I read its threads.
+ *
+ * `following` is whether I would be notified: participation is derived (I wrote
+ * the root or a reply), so the flag reports the resolved answer rather than the
+ * presence of a row (ARCH-104). */
+#define OC_MAX_THREADS 100u
+enum { OC_THREADF_ALL = 0, OC_THREADF_UNREAD = 1 };
+typedef struct {
+    uint64_t root_id, channel_id, root_author;
+    uint64_t root_at, last_reply_at;
+    uint32_t reply_count, unread;
+    uint8_t  following;
+    oc_slice preview;
+} oc_thread_summary;
+typedef struct { uint8_t filter; } oc_list_threads;
+typedef struct { uint32_t count; } oc_threads;
+typedef struct { uint64_t root_id, channel_id; uint8_t on; } oc_set_thread_follow;
+/* `up_to` 0 means "everything in it", which is what opening a thread means. */
+typedef struct { uint64_t root_id, up_to; } oc_mark_thread_read;
+
 /* REQ-278. Minutes FROM NOW, as Slack's API takes them: the presets are all
  * durations, and only the client knows the timezone that turns "until tomorrow"
  * into an instant. 0 ends the pause — there is no second op. */
@@ -886,8 +920,15 @@ typedef struct { uint64_t attachment_id; uint32_t seq; oc_slice data; } oc_downl
 typedef struct { uint64_t attachment_id; } oc_download_end;
 typedef struct { uint64_t attachment_id; } oc_transfer_cancel;
 typedef struct { uint16_t count; const oc_channel_list_entry *entries; } oc_channel_list;
+/* `title`, `timezone` and the custom status ride here as of protocol 7 (REQ-289).
+ * They were on PROFILE_INFO alone, which the daemon sends ONLY to the user who
+ * edited them — so no client ever learned anyone else's, and the profile card had
+ * to say the fields were not built although REQ-240 shipped them. A directory
+ * cannot exist without them, and neither could the card. */
 typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; oc_slice email;
-                 oc_slice display_name; uint64_t avatar_id; } oc_user_list_entry;
+                 oc_slice display_name; uint64_t avatar_id;
+                 oc_slice title; oc_slice timezone;
+                 oc_slice status_emoji; oc_slice status_text; } oc_user_list_entry;
 typedef struct { uint16_t count; const oc_user_list_entry *entries; } oc_user_list;
 typedef struct { uint64_t user_id; uint8_t role; } oc_set_role;
 typedef struct { uint8_t role; } oc_invite_user;
@@ -1057,6 +1098,11 @@ oc_result oc_encode_schedule(oc_wbuf *w, uint16_t version, const oc_schedule *m)
 oc_result oc_encode_set_keywords(oc_wbuf *w, uint16_t version, const oc_set_keywords *m);
 oc_result oc_encode_set_priority(oc_wbuf *w, uint16_t version, const oc_set_priority *m);
 oc_result oc_encode_alert_prefs(oc_wbuf *w, uint16_t version, const oc_alert_prefs *m);
+oc_result oc_encode_list_threads(oc_wbuf *w, uint16_t version, const oc_list_threads *m);
+oc_result oc_encode_thread_summary(oc_wbuf *w, uint16_t version, const oc_thread_summary *m);
+oc_result oc_encode_threads(oc_wbuf *w, uint16_t version, const oc_threads *m);
+oc_result oc_encode_set_thread_follow(oc_wbuf *w, uint16_t version, const oc_set_thread_follow *m);
+oc_result oc_encode_mark_thread_read(oc_wbuf *w, uint16_t version, const oc_mark_thread_read *m);
 oc_result oc_encode_register_device_token(oc_wbuf *w, uint16_t version, const oc_register_device_token *m);
 oc_result oc_encode_unregister_device_token(oc_wbuf *w, uint16_t version, oc_slice token);
 oc_result oc_encode_device_token_ack(oc_wbuf *w, uint16_t version, const oc_device_token_ack *m);
@@ -1209,6 +1255,11 @@ oc_result oc_decode_set_keywords(oc_rbuf *p, oc_slice *terms, uint8_t cap, uint8
 oc_result oc_decode_set_priority(oc_rbuf *p, uint64_t *people, uint8_t cap, uint8_t *out_n);
 oc_result oc_decode_alert_prefs(oc_rbuf *p, oc_slice *terms, uint8_t tcap, uint8_t *out_nt,
                                 uint64_t *people, uint8_t pcap, uint8_t *out_np);
+oc_result oc_decode_list_threads(oc_rbuf *p, oc_list_threads *m);
+oc_result oc_decode_thread_summary(oc_rbuf *p, oc_thread_summary *m);
+oc_result oc_decode_threads(oc_rbuf *p, oc_threads *m);
+oc_result oc_decode_set_thread_follow(oc_rbuf *p, oc_set_thread_follow *m);
+oc_result oc_decode_mark_thread_read(oc_rbuf *p, oc_mark_thread_read *m);
 oc_result oc_decode_register_device_token(oc_rbuf *p, oc_register_device_token *m);
 oc_result oc_decode_unregister_device_token(oc_rbuf *p, oc_slice *token);
 oc_result oc_decode_device_token_ack(oc_rbuf *p, oc_device_token_ack *m);

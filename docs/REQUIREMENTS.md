@@ -1582,6 +1582,18 @@ messages (author name, ARCH-74). Not yet backed by an architecture decision.*
   can become one. Edit authority is the user's own: no admin-managed fields, which
   is the simpler half of the choice and the one a self-hosted deployment can live
   with.
+- **REQ-289.** A user has been able to **browse the people in the workspace** — a
+  directory listing everyone with their avatar, display name, title, custom status
+  and presence, searchable by name or title, opening a person's profile. Slack has
+  this and we did not; the channels directory (REQ-038) had no counterpart for
+  people, so the only ways to find somebody were the DM picker and the command
+  palette, both of which answer "who do I already know the name of".
+
+  **It also fixed a gap in REQ-240, which was marked DONE.** Title and timezone
+  were carried only on `PROFILE_INFO`, which the daemon sends *to the person who
+  edited them* — so no client ever learned anyone else's, and the profile card
+  said the fields "are not built" although they were. They ride `USER_LIST` now,
+  which is why the protocol moved to 7.
 - **REQ-241.** A user has been able to set a transient **custom status** — a
   short text plus an emoji, with an optional expiry — shown alongside their name
   and presence (Section 4). **[needs ARCH decision — status storage + expiry and
@@ -1822,6 +1834,36 @@ REQ-269, whose accessibility half is a real open decision.*
   self-drawn UI.** The custom controls are not walked back to native ones — they
   are the product's rendering strategy (ARCH-82/98) and a deliberate choice, so
   accessibility is implemented *for* them rather than by retreating from them.
+
+- **REQ-290.** Every element a user can act on in a graphical client has carried a
+  **stable, unique automation identifier** — Win32's UIA `AutomationId`, and the
+  equivalent on each other platform — that does not change with layout, wording,
+  window size, theme, language or the element's position in a list.
+
+  **This is a testability requirement, not a second accessibility one.** REQ-269
+  is about what assistive technology can *convey*; this is about what an automated
+  test can *address*. The two share the UIA provider (ARCH-99) and are otherwise
+  different obligations: a control can be perfectly legible to a screen reader and
+  still be impossible to locate reliably from a test.
+
+  **Why it is a requirement at all.** The supported way to drive a Windows
+  application is UI Automation, and the discipline that makes it reliable is
+  locating elements by id rather than by coordinates, visible text or tree
+  position. Coordinates move whenever a pane is re-laid out; visible text moves
+  when wording or locale changes; tree position moves when a list gains a row.
+  Our own harness drives by coordinates today, and that is precisely why its
+  failures have needed interpretation — a click that lands two pixels outside a
+  chip is indistinguishable from a feature that does not work.
+
+  **The identifier is part of the control, not of the test.** It is assigned where
+  the control is defined, is reviewed like any other name, and does not change to
+  suit a test that has broken — a renamed id is a breaking change to the automation
+  surface in the same way a renamed wire field is to the protocol.
+
+  **Dynamic elements get composed ids**: a per-conversation row is
+  `sidebar.row.<channel_id>`, not `sidebar.row.3`, because the third row is a
+  different conversation tomorrow. The id is derived from the thing's identity,
+  never from where it happens to be drawn.
 
 ---
 

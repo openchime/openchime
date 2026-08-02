@@ -149,6 +149,8 @@ void oc_model_free(oc_model *m) {
     free(m->scheds);
     for (size_t i = 0; i < m->n_activity; i++) free(m->activity[i].text);
     free(m->activity);
+    for (size_t i = 0; i < m->n_threads; i++) free(m->threads[i].preview);
+    free(m->threads);
     free(m->files);
     free(m->users);
     free(m->webhooks);
@@ -445,6 +447,55 @@ void oc_model_saved_begin(oc_model *m) {
     oc_model_close_saved(m);
     m->saved_open = 1; m->saved_loading = 1;
 }
+/* One thread from the server: a list entry and the follow/read push are the same
+ * frame, so this both inserts and replaces (the shape draft_apply uses). */
+static void thread_apply(oc_model *m, const oc_ev *e) {
+    oc_thread_view *t = NULL;
+    for (size_t i = 0; i < m->n_threads; i++)
+        if (m->threads[i].root_id == e->message_id) { t = &m->threads[i]; break; }
+    if (!t) {
+        if (m->n_threads == m->cap_threads) {
+            size_t nc = m->cap_threads ? m->cap_threads * 2 : 16;
+            oc_thread_view *g = realloc(m->threads, nc * sizeof *g);
+            if (!g) return;
+            m->threads = g; m->cap_threads = nc;
+        }
+        t = &m->threads[m->n_threads++];
+        memset(t, 0, sizeof *t);
+    }
+    free(t->preview);
+    t->root_id       = e->message_id;
+    t->channel_id    = e->channel_id;
+    t->root_author   = e->author_id;
+    t->root_at       = e->server_time;
+    t->last_reply_at = e->pinned_at;
+    t->reply_count   = e->reply_count;
+    t->unread        = e->unread_count;
+    t->following     = e->following;
+    t->preview       = e->body ? strdup(e->body) : NULL;
+    t->gen           = m->thread_gen;
+    /* An unfollowed thread leaves the list the moment it is unfollowed: the view
+     * is "threads I am in", and staying visible would make the button look
+     * broken. The server agrees — the next list will not carry it. */
+    if (!t->following) {
+        free(t->preview);
+        *t = m->threads[--m->n_threads];
+    }
+}
+
+void oc_model_threads_begin(oc_model *m) {
+    if (!m) return;
+    m->thread_gen++;
+    m->threads_loading = 1;
+}
+
+uint32_t oc_model_thread_unread(const oc_model *m) {
+    uint32_t n = 0;
+    if (!m) return 0;
+    for (size_t i = 0; i < m->n_threads; i++) n += m->threads[i].unread;
+    return n;
+}
+
 void oc_model_close_activity(oc_model *m) {
     for (size_t i = 0; i < m->n_activity; i++) free(m->activity[i].text);
     free(m->activity);
@@ -1286,6 +1337,17 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     case OC_EV_DRAFT:
         draft_apply(m, e->channel_id, e->message_id, e->server_time, e->body);
         break;
+    case OC_EV_THREAD_SUMMARY:
+        thread_apply(m, e);
+        break;
+    case OC_EV_THREADS_END:
+        m->threads_loading = 0;
+        for (size_t i = m->n_threads; i-- > 0; )
+            if (m->threads[i].gen != m->thread_gen) {
+                free(m->threads[i].preview);
+                m->threads[i] = m->threads[--m->n_threads];
+            }
+        break;
     case OC_EV_SCHEDULED:
         sched_apply(m, e->message_id, e->channel_id, e->server_time, e->op,
                     e->body, e->author_name);
@@ -1364,6 +1426,18 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         break;
     case OC_EV_USER:
         user_upsert(m, e->user_id, e->body ? e->body : "", e->status, e->op, e->message_id);
+        /* The roster carries the profile fields now (REQ-289), so every surface
+         * that shows a person can show them — the profile card included, which
+         * used to say they "are not built" because only PROFILE_INFO had them and
+         * it never left the person who edited them. */
+        for (size_t i = 0; i < m->n_users; i++)
+            if (m->users[i].user_id == e->user_id) {
+                snprintf(m->users[i].title, sizeof m->users[i].title, "%s", e->pf_title);
+                snprintf(m->users[i].timezone, sizeof m->users[i].timezone, "%s", e->pf_tz);
+                snprintf(m->users[i].status_emoji, sizeof m->users[i].status_emoji, "%s", e->emoji);
+                snprintf(m->users[i].status_text, sizeof m->users[i].status_text, "%s", e->author_name);
+                break;
+            }
         break;
     case OC_EV_WEBHOOK_INFO:
         /* A freshly-minted webhook: the token is shown once. Record it and, if the

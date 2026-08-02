@@ -608,6 +608,12 @@ role policy (owner/admin/member, ARCH-60, AUTH.md §6); enumeration is open to a
 authenticated user.
 
 **`LIST_USERS` (client → server), msg_type `0x0040`** — empty payload; replies
+**`USER_LIST` (server → client), msg_type `0x0041`** — as of protocol 7 each entry
+also carries `title`, `timezone`, `status_emoji` and `status_text` (REQ-289).
+They existed on `PROFILE_INFO` alone, which is sent only to the user who edited
+them, so no client ever learned anyone else's; the people directory needs them,
+and so did the profile card that had to say the fields were not built.
+
 **`USER_LIST` (server → client), msg_type `0x0041`**:
 
 | Field       | Type            | Notes                                                        |
@@ -927,6 +933,36 @@ body is fine — then closes with a **`THREAD` (server → client), msg_type
 | `parent_id` | u64  | The thread root.                             |
 | `count`     | u32  | Number of replies streamed.                  |
 | `truncated` | u8   | 1 if the reply stream was capped (more replies exist than were streamed). |
+
+**`LIST_THREADS` (client → server), msg_type `0x00D1`** `{ filter: u8 }` — every
+thread the caller is in, across every channel (REQ-062). `0` all, `1` unread only;
+an empty body reads as `0`. The daemon streams **`THREAD_SUMMARY` (`0x00D2`)**,
+newest activity first, and closes with **`THREADS` (`0x00D3`)** `{ count: u32 }`.
+
+| Field           | Type | Notes                                                  |
+|-----------------|------|--------------------------------------------------------|
+| `root_id`       | u64  | The thread's root message.                             |
+| `channel_id`    | u64  | Where it lives — the reason this list is worth having. |
+| `root_author`   | u64  | Who started it.                                        |
+| `root_at`       | u64  | When it started.                                       |
+| `last_reply_at` | u64  | When it last moved; the sort key.                      |
+| `reply_count`   | u32  | Replies, excluding the root.                           |
+| `unread`        | u32  | Replies by others past my per-thread cursor.           |
+| `following`     | u8   | Resolved, not stored: participation counts (ARCH-104). |
+| `preview`       | str  | The root's first bytes.                                |
+
+**`SET_THREAD_FOLLOW` (client → server), `0x00D4`** `{ root_id: u64,
+channel_id: u64, on: u8 }` and **`MARK_THREAD_READ` (client → server), `0x00D5`**
+`{ root_id: u64, up_to: u64 }` (`0` = every reply in it, which is what opening one
+means). Both answer with a single `THREAD_SUMMARY` — the row that changed, fanned
+to all of the user's connections — rather than a fresh list: a client folds a
+summary the same way whichever prompted it, and re-listing after every read mark
+would make opening a thread cost the whole view.
+
+*Why a second thread family.* The ops above are each scoped to ONE parent, which
+is the right shape for reading a thread and useless for finding one. Nothing in
+the product could answer "what have I missed, everywhere" without walking every
+channel.
 
 On reconnect backfill (§6) the main scroll replays only top-level messages; a
 parent that has replies is followed by a **`THREAD_META` (server → client),
@@ -1637,6 +1673,11 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 | `0x00CE` | `SET_KEYWORDS`     | C → S     | no        | §5.16   |
 | `0x00CF` | `SET_PRIORITY`     | C → S     | no        | §5.16   |
 | `0x00D0` | `ALERT_PREFS`      | S → C     | no        | §5.16   |
+| `0x00D1` | `LIST_THREADS`     | C → S     | no        | §5.5    |
+| `0x00D2` | `THREAD_SUMMARY`   | S → C     | no        | §5.5    |
+| `0x00D3` | `THREADS`          | S → C     | no        | §5.5    |
+| `0x00D4` | `SET_THREAD_FOLLOW`| C → S     | no        | §5.5    |
+| `0x00D5` | `MARK_THREAD_READ` | C → S     | no        | §5.5    |
 | `0x0094` | `SET_CLIENT_SETTING`   | C → S | no        | §5.16a  |
 | `0x0095` | `LIST_CLIENT_SETTINGS` | C → S | no        | §5.16a  |
 | `0x0096` | `CLIENT_SETTINGS`      | S → C | no        | §5.16a  |

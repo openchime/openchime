@@ -122,7 +122,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * REPLACES what was there: the lists are short and a client editing one
         * holds all of it, so an add/remove pair would need ids for terms that
         * are their own identity. */
-       OC_JOB_SET_SCHEDULE = 89, OC_JOB_SET_KEYWORDS = 90, OC_JOB_SET_PRIORITY = 91 };
+       OC_JOB_SET_SCHEDULE = 89, OC_JOB_SET_KEYWORDS = 90, OC_JOB_SET_PRIORITY = 91,
+       /* Threads across channels (REQ-062, ARCH-104). */
+       OC_JOB_LIST_THREADS = 92, OC_JOB_SET_THREAD_FOLLOW = 93,
+       OC_JOB_MARK_THREAD_READ = 94 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -229,6 +232,10 @@ typedef struct oc_job {
     uint16_t         sched_start_min, sched_end_min;
     oc_schedule_day *sched_days;
     uint8_t          n_sched_days;
+    /* Threads (REQ-062): LIST reads `thread_filter`; FOLLOW reads channel_id +
+     * parent_id + `follow_on`; MARK_READ reads parent_id + message_id (0 = all). */
+    uint8_t        thread_filter;
+    uint8_t        follow_on;
     /* SET_KEYWORDS / SET_PRIORITY (REQ-135), both heap and both wholesale. */
     char           **kw_terms;
     uint8_t          n_kw_terms;
@@ -338,7 +345,21 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        OC_RES_SNOOZE = 83,
        /* The schedule as stored, and the two alert lists — both self-only, both
         * fanned to every one of the user's connections like NOTIFY_PREFS. */
-       OC_RES_SCHEDULE = 84, OC_RES_ALERT_PREFS = 85 };
+       OC_RES_SCHEDULE = 84, OC_RES_ALERT_PREFS = 85,
+       /* The aggregated thread list, and the ack for a follow/read change —
+        * which carries the ONE row that changed, so a client folds it without
+        * re-listing (the shape DRAFT already uses). */
+       OC_RES_THREAD_LIST = 86, OC_RES_THREAD_ONE = 87 };
+
+/* One thread in the aggregated view (REQ-062). Mirrors oc_thread_summary on the
+ * wire; `preview` is heap. */
+typedef struct oc_thread_row {
+    uint64_t root_id, channel_id, root_author;
+    uint64_t root_at, last_reply_at;
+    uint32_t reply_count, unread;
+    uint8_t  following;
+    char    *preview;
+} oc_thread_row;
 
 /* One custom emoji (REQ-072). */
 typedef struct oc_emoji_row {
@@ -467,6 +488,13 @@ typedef struct {
     char    *email;         /* heap; may be "" */
     char    *display_name;  /* heap; may be "" */
     uint64_t avatar_id;     /* WIN-47: attachment id, 0 = none */
+    /* REQ-289: the profile fields a directory needs, and the ones PROFILE_INFO
+     * was sending only to their owner. Expired status reads as absent, the same
+     * rule build_profile applies. */
+    char    *title;         /* heap; may be "" */
+    char    *timezone;      /* heap; may be "" */
+    char    *status_emoji;  /* heap; may be "" */
+    char    *status_text;   /* heap; may be "" */
 } oc_user_row;
 
 /* One message to replay on reconnect (rendered as a BROADCAST by the net thread),
@@ -668,6 +696,10 @@ typedef struct oc_dbres {
     uint16_t            sc_start_min, sc_end_min;
     oc_schedule_day     sc_days[OC_SCHEDULE_DAYS];
     uint8_t             sc_n_days;
+    /* OC_RES_THREAD_LIST / _ONE (REQ-062): heap array of summaries with heap
+     * previews, freed by oc_dbres_free like every other list result. */
+    struct oc_thread_row *threads;
+    size_t               n_threads;
     /* OC_RES_ALERT_PREFS (REQ-135): my keywords and my priority people. */
     char              **al_terms;      /* heap array of heap strings */
     uint8_t             al_n_terms;

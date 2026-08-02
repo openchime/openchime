@@ -239,13 +239,19 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->slist);
     for (size_t i = 0; i < r->n_alist; i++) free(r->alist[i].text);
     free(r->alist);
+    for (size_t i = 0; i < r->n_threads; i++) free(r->threads[i].preview);
+    free(r->threads);
     for (size_t i = 0; i < r->n_flist; i++) { free(r->flist[i].filename); free(r->flist[i].mime); }
     free(r->flist);
     free(r->ch_name);
     free(r->ch_topic);
     for (size_t i = 0; i < r->n_chlist; i++) { free(r->chlist[i].name); free(r->chlist[i].topic); free(r->chlist[i].preview); }
     free(r->chlist);
-    for (size_t i = 0; i < r->n_ulist; i++) { free(r->ulist[i].email); free(r->ulist[i].display_name); }
+    for (size_t i = 0; i < r->n_ulist; i++) {
+        free(r->ulist[i].email); free(r->ulist[i].display_name);
+        free(r->ulist[i].title); free(r->ulist[i].timezone);
+        free(r->ulist[i].status_emoji); free(r->ulist[i].status_text);
+    }
     free(r->ulist);
     free(r->emoji);
     for (size_t i = 0; i < r->n_rlist; i++) free(r->rlist[i].emoji);
@@ -814,7 +820,8 @@ static oc_dbres *process_list_users(sqlite3 *db, const oc_job *j) {
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
         "SELECT id, role, disabled, COALESCE(email,''), COALESCE(display_name,''), "
-        "       COALESCE(avatar_attachment_id,0) "
+        "       COALESCE(avatar_attachment_id,0), COALESCE(title,''), COALESCE(timezone,''), "
+        "       COALESCE(status_emoji,''), COALESCE(status_text,''), status_expires_ms "
         "FROM users ORDER BY id;", -1, &st, NULL);
     size_t cap = 8, n = 0;
     oc_user_row *arr = malloc(cap * sizeof *arr);
@@ -828,6 +835,17 @@ static oc_dbres *process_list_users(sqlite3 *db, const oc_job *j) {
         /* The roster carries the avatar (WIN-47) so a transcript can draw every
          * author's picture without a PROFILE_INFO round trip per author. */
         arr[n].avatar_id    = (uint64_t)sqlite3_column_int64(st, 5);
+        /* REQ-289: the profile fields, so a client learns them for everyone
+         * rather than only for itself. Expired status reads as absent — the same
+         * rule build_profile applies, applied in the same place. */
+        arr[n].title        = strdup((const char *)sqlite3_column_text(st, 6));
+        arr[n].timezone     = strdup((const char *)sqlite3_column_text(st, 7));
+        {
+            uint64_t exp = (uint64_t)sqlite3_column_int64(st, 10);
+            int expired = (exp != 0 && exp <= dbw_now_ms());
+            arr[n].status_emoji = strdup(expired ? "" : (const char *)sqlite3_column_text(st, 8));
+            arr[n].status_text  = strdup(expired ? "" : (const char *)sqlite3_column_text(st, 9));
+        }
         n++;
     }
     sqlite3_finalize(st);
@@ -4473,6 +4491,171 @@ static oc_dbres *process_set_snooze(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
+/* --- threads across channels (REQ-062, ARCH-104) --------------------------- */
+
+/* Fill one summary row from a stepped statement whose columns are, in order:
+ * root_id, channel_id, root_author, root_at, last_reply_at, replies, unread,
+ * following, preview. */
+static void thread_row_from(sqlite3_stmt *st, oc_thread_row *t) {
+    t->root_id      = (uint64_t)sqlite3_column_int64(st, 0);
+    t->channel_id   = (uint64_t)sqlite3_column_int64(st, 1);
+    t->root_author  = (uint64_t)sqlite3_column_int64(st, 2);
+    t->root_at      = (uint64_t)sqlite3_column_int64(st, 3);
+    t->last_reply_at= (uint64_t)sqlite3_column_int64(st, 4);
+    t->reply_count  = (uint32_t)sqlite3_column_int(st, 5);
+    t->unread       = (uint32_t)sqlite3_column_int(st, 6);
+    t->following    = (uint8_t)sqlite3_column_int(st, 7);
+    const unsigned char *p = sqlite3_column_text(st, 8);
+    t->preview      = strdup(p ? (const char *)p : "");
+}
+
+/* The one query the product did not have: every thread I am in, across every
+ * channel, newest activity first.
+ *
+ * Membership of the channel is checked first, as everywhere else — a thread in a
+ * conversation I have left is not mine to see. Participation is derived, and an
+ * explicit unfollow wins over it, which is what "turn off replies" means. A root
+ * with no replies is not a thread yet, so it is excluded rather than listed as an
+ * empty one. */
+static oc_dbres *process_list_threads(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    r->type = OC_RES_THREAD_LIST;
+    r->user_id = j->user_id;
+    static const char *SQL =
+        "SELECT r.id, r.channel_id, r.author_id, r.created_at_ms, "
+        "       (SELECT MAX(x.created_at_ms) FROM messages x "
+        "         WHERE x.parent_id = r.id AND x.deleted_at_ms IS NULL) AS last_at, "
+        "       (SELECT COUNT(*) FROM messages x "
+        "         WHERE x.parent_id = r.id AND x.deleted_at_ms IS NULL) AS replies, "
+        "       (SELECT COUNT(*) FROM messages x "
+        "         WHERE x.parent_id = r.id AND x.deleted_at_ms IS NULL "
+        "           AND x.author_id <> ?1 "
+        "           AND x.id > COALESCE((SELECT tr.last_read_reply_id FROM thread_reads tr "
+        "                                 WHERE tr.user_id = ?1 AND tr.root_id = r.id), 0)) AS unread, "
+        "       COALESCE((SELECT tf.state FROM thread_follows tf "
+        "                  WHERE tf.user_id = ?1 AND tf.root_id = r.id), 1) AS following, "
+        "       substr(COALESCE(r.body,''),1,?2) "
+        "  FROM messages r "
+        "  JOIN channel_members cm ON cm.channel_id = r.channel_id AND cm.user_id = ?1 "
+        " WHERE r.parent_id IS NULL AND r.deleted_at_ms IS NULL "
+        /* In it, one way or another: I wrote it, I replied to it, or I said so. */
+        "   AND ( r.author_id = ?1 "
+        "      OR EXISTS(SELECT 1 FROM messages y WHERE y.parent_id = r.id "
+        "                 AND y.author_id = ?1 AND y.deleted_at_ms IS NULL) "
+        "      OR EXISTS(SELECT 1 FROM thread_follows f WHERE f.user_id = ?1 "
+        "                 AND f.root_id = r.id AND f.state = 1) ) "
+        /* ...unless I said otherwise, which outranks having replied. */
+        "   AND COALESCE((SELECT tf2.state FROM thread_follows tf2 "
+        "                  WHERE tf2.user_id = ?1 AND tf2.root_id = r.id), 1) = 1 "
+        "   AND EXISTS(SELECT 1 FROM messages z WHERE z.parent_id = r.id "
+        "               AND z.deleted_at_ms IS NULL) "
+        "   AND (?4 = 0 OR unread > 0) "
+        " ORDER BY last_at DESC LIMIT ?3;";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &st, NULL) != SQLITE_OK) return r;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int  (st, 2, (int)OC_MAX_PREVIEW);
+    sqlite3_bind_int  (st, 3, (int)OC_MAX_THREADS);
+    sqlite3_bind_int  (st, 4, (int)j->thread_filter);
+    oc_thread_row *arr = calloc(OC_MAX_THREADS, sizeof *arr);
+    size_t n = 0;
+    while (arr && n < OC_MAX_THREADS && sqlite3_step(st) == SQLITE_ROW)
+        thread_row_from(st, &arr[n++]);
+    sqlite3_finalize(st);
+    r->threads = arr; r->n_threads = n;
+    return r;
+}
+
+/* One thread's summary, for the ack of a follow or a read mark: the client folds
+ * the row that changed rather than re-listing everything, which is the shape
+ * DRAFT already uses and the reason a list op is not needed here. */
+static void build_thread_one(sqlite3 *db, uint64_t uid, uint64_t root_id, oc_dbres *r) {
+    r->type = OC_RES_THREAD_ONE;
+    r->user_id = uid;
+    static const char *SQL =
+        "SELECT r.id, r.channel_id, r.author_id, r.created_at_ms, "
+        "       COALESCE((SELECT MAX(x.created_at_ms) FROM messages x "
+        "         WHERE x.parent_id = r.id AND x.deleted_at_ms IS NULL),0), "
+        "       (SELECT COUNT(*) FROM messages x "
+        "         WHERE x.parent_id = r.id AND x.deleted_at_ms IS NULL), "
+        "       (SELECT COUNT(*) FROM messages x "
+        "         WHERE x.parent_id = r.id AND x.deleted_at_ms IS NULL "
+        "           AND x.author_id <> ?1 "
+        "           AND x.id > COALESCE((SELECT tr.last_read_reply_id FROM thread_reads tr "
+        "                                 WHERE tr.user_id = ?1 AND tr.root_id = r.id), 0)), "
+        "       COALESCE((SELECT tf.state FROM thread_follows tf "
+        "                  WHERE tf.user_id = ?1 AND tf.root_id = r.id), 1), "
+        "       substr(COALESCE(r.body,''),1,?2) "
+        "  FROM messages r WHERE r.id = ?3;";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, SQL, -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
+    sqlite3_bind_int  (st, 2, (int)OC_MAX_PREVIEW);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)root_id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        r->threads = calloc(1, sizeof *r->threads);
+        if (r->threads) { thread_row_from(st, &r->threads[0]); r->n_threads = 1; }
+    }
+    sqlite3_finalize(st);
+}
+
+static oc_dbres *process_set_thread_follow(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    if (!channel_read_access(db, j->channel_id, j->user_id)) {
+        r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_NOT_A_MEMBER; r->user_id = j->user_id;
+        return r;
+    }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO thread_follows(user_id, root_id, channel_id, state, updated_ms) "
+        "VALUES(?1,?2,?3,?4,?5) ON CONFLICT(user_id, root_id) DO UPDATE SET "
+        "state=excluded.state, updated_ms=excluded.updated_ms;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->parent_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_int  (st, 4, j->follow_on ? 1 : 0);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    build_thread_one(db, j->user_id, j->parent_id, r);
+    return r;
+}
+
+/* Mark a thread's replies read. `message_id` 0 means all of them, which is what
+ * opening a thread means; the cursor only ever advances, like REQ-090's. */
+static oc_dbres *process_mark_thread_read(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    uint64_t up_to = j->message_id;
+    if (!up_to) {
+        sqlite3_stmt *q = NULL;
+        sqlite3_prepare_v2(db,
+            "SELECT COALESCE(MAX(id),0) FROM messages WHERE parent_id=?;", -1, &q, NULL);
+        sqlite3_bind_int64(q, 1, (sqlite3_int64)j->parent_id);
+        if (sqlite3_step(q) == SQLITE_ROW) up_to = (uint64_t)sqlite3_column_int64(q, 0);
+        sqlite3_finalize(q);
+    }
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO thread_reads(user_id, root_id, last_read_reply_id, updated_ms) "
+        "VALUES(?1,?2,?3,?4) ON CONFLICT(user_id, root_id) DO UPDATE SET "
+        "last_read_reply_id=MAX(last_read_reply_id, excluded.last_read_reply_id), "
+        "updated_ms=excluded.updated_ms;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->parent_id);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)up_to);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)dbw_now_ms());
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    build_thread_one(db, j->user_id, j->parent_id, r);
+    return r;
+}
+
 /* Read the schedule as stored (REQ-136). Modes 0-2 need no rows at all; only
  * *custom* reads the per-weekday table, which is why three of the four cases
  * cost one query. */
@@ -5538,6 +5721,9 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_PROFILE)     return process_set_profile(w->db, j);
     if (j->type == OC_JOB_SET_AVATAR)      return process_set_avatar(w->db, j);
     if (j->type == OC_JOB_SET_READ_CURSOR) return process_set_read_cursor(w->db, j);
+    if (j->type == OC_JOB_LIST_THREADS)    return process_list_threads(w->db, j);
+    if (j->type == OC_JOB_SET_THREAD_FOLLOW) return process_set_thread_follow(w->db, j);
+    if (j->type == OC_JOB_MARK_THREAD_READ)  return process_mark_thread_read(w->db, j);
     if (j->type == OC_JOB_SET_SCHEDULE)    return process_set_schedule(w->db, j);
     if (j->type == OC_JOB_SET_KEYWORDS)    return process_set_keywords(w->db, j);
     if (j->type == OC_JOB_SET_PRIORITY)    return process_set_priority(w->db, j);

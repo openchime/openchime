@@ -59,6 +59,8 @@ enum {
     OC_EV_SNOOZE,          /* a SNOOZE: server_time = when the pause ends, 0 = not paused (REQ-278) */
     OC_EV_SCHEDULE,        /* a SCHEDULE frame: the recurring allowed-hours schedule (REQ-136) */
     OC_EV_ALERT_PREFS,     /* an ALERT_PREFS frame: my keywords + priority people (REQ-135) */
+    OC_EV_THREAD_SUMMARY,  /* one aggregated thread (REQ-062): a list entry AND the push */
+    OC_EV_THREADS_END,     /* the thread list's terminator */
     OC_EV_NOTIFY_PREF,     /* a NOTIFY_PREFS entry: channel_id + level(op) */
     OC_EV_USER_UPDATED,    /* a USER_UPDATED: user_id + role(status) + disabled(op) */
     OC_EV_INVITE,          /* an INVITE_CREATED: body=token, op=role, server_time=expires_at */
@@ -166,6 +168,15 @@ typedef struct {
     char     emoji[40];    /* REACTION: the emoji */
     char     author_name[64]; /* MESSAGE: author display name ("" = fall back to id) */
     char    *body;         /* heap; MESSAGE/ERROR/CHANNEL(name) only, else NULL */
+    /* One aggregated thread (REQ-062). `count`/`op` carry the reply and unread
+     * counts, `pinned_at` the last reply's time — reusing the generic fields the
+     * way every other list event here does. */
+    uint32_t reply_count, unread_count;
+    uint8_t  following;
+    /* REQ-289: the profile fields carried on a USER entry. `emoji` and
+     * `author_name` already exist and carry the custom status's two halves. */
+    char     pf_title[64];
+    char     pf_tz[48];
     /* The recurring schedule (REQ-136) and the two alert lists (REQ-135). Inline
      * arrays: both are wire-capped and small, and a fixed array needs no
      * ownership rules — the same reasoning `peers` and `gids` already use. */
@@ -218,6 +229,9 @@ enum {
     OC_CMD_SET_SCHEDULE,    /* the recurring schedule (REQ-136), carried in cmd->sched */
     OC_CMD_SET_KEYWORDS,    /* replace my keyword list (REQ-135), carried in cmd->list */
     OC_CMD_SET_PRIORITY,    /* replace my priority-people list (REQ-135) */
+    OC_CMD_LIST_THREADS,    /* threads I am in (REQ-062): op = filter */
+    OC_CMD_THREAD_FOLLOW,   /* follow/unfollow: channel_id + message_id = root, op = on */
+    OC_CMD_MARK_THREAD_READ,/* its replies are read: message_id = root, server_time = up to */
     OC_CMD_LIST_NOTIFY_PREFS, /* request all notification settings (DND + per-channel) */
     OC_CMD_SET_SETTING,     /* upsert a synced client setting: body=key, body2=value (empty value deletes) */
     OC_CMD_LIST_SETTINGS,   /* request the synced client-settings bucket */

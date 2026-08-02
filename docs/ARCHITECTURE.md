@@ -280,6 +280,20 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **Ambiguity degrades to literal source.** Emphasis is word-boundary anchored and must close on the same line, so `2 * 3` is arithmetic and a half-typed `*` never restyles the rest of a message; a backslash escape gives an explicit way out, which Slack has no equivalent of.
 
+- **ARCH-104 (Threads across channels — participation derived, follows as overrides, unread on its own cursor):** Answers REQ-062's open marker.
+
+  **Participation is DERIVED, never stored.** You are in a thread if you wrote its root or any reply, which `messages.parent_id` already records. Storing it instead would mean a write on every reply and a second answer to a question the first table answers — and the two would disagree the first time a reply was deleted. So `thread_follows` holds only **overrides**: an explicit follow of a thread you never replied to, and an explicit unfollow of one you did. The common case costs no rows at all.
+
+  **An unfollow outranks having replied.** "Turn off replies" has to survive your own participation, or the button does nothing for the person most likely to press it — someone who replied once and does not want the rest.
+
+  **Unread needs its own cursor.** `delivery_cursors` (REQ-090) advances when you read the CHANNEL, which says nothing about whether you read a thread inside it: threads are deliberately out of the main scroll (REQ-060), so the channel cursor sweeps past replies you have never seen. `thread_reads (user_id, root_id, last_read_reply_id)` is per thread, advances only, and is what the unread-reply count in the view is counted against. Deriving it from the channel cursor would report zero unread for exactly the person the view exists for.
+
+  **One query, bounded, ordered by last reply.** Roots I authored ∪ roots I replied to ∪ roots I follow, minus unfollowed, restricted to channels I am still in and to roots that actually have replies — a root with none is a message, not a thread. It is the first cross-channel thread query in the product; the activity feed's reply arm is parent-author-only and ungrouped, so it could not be reused.
+
+  **The follow and read acks return the ONE row that changed**, not a fresh list. A client folds a summary the same way whether it came from a list or a push, which is the shape `DRAFT` already uses, and re-listing after every read mark would make opening a thread cost the whole view.
+
+  **REQ-282 (follow every thread in a channel) is deliberately not built here.** Its storage is a column on `notification_prefs` beside `level` and `muted`, since it is per (user, channel) exactly as they are; when it lands it composes with this by adding a fourth arm to the union above.
+
 - **ARCH-103 (Notification schedule, keywords and priority people — one storage shape each, and one matcher):** Answers the open markers on REQ-135 and REQ-136.
 
   **The schedule replaces the window; it does not sit beside it.** REQ-136 absorbed REQ-131 for a reason that is architectural rather than editorial: two mechanisms answering "am I quiet now" can disagree, and nothing decides which wins. So `dnd_enabled` becomes `dnd_mode` — off / every day / weekdays / custom — the existing `dnd_start_min`/`dnd_end_min` carry the every-day and weekday window, and only *custom* needs the new table `notify_schedule (user_id, weekday, enabled, start_min, end_min)`. Three of the four modes therefore add no rows at all, and the sparse table means "no row for Tuesday" has one meaning: that day follows the base window.

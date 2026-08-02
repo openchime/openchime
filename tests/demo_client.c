@@ -5,6 +5,7 @@
  *
  *   demo_client <host> <port> <user> <pass> token <apns|fcm> <device-token>
  *   demo_client <host> <port> <user> <pass> send  <channel_id> <text...>
+ *   demo_client <host> <port> <user> <pass> reply <channel_id> <parent_id> <text...>
  *
  * `token` registers a push device token (so a later SEND has someone to notify);
  * `send` posts a message (which, if the daemon is enrolled + OC_PUSH_URL is set,
@@ -170,14 +171,43 @@ static int cmd_send(client *c, uint64_t channel_id, const char *text) {
     FAIL("no send ack");
 }
 
+/* Reply in a thread, so a second account can put an UNREAD reply into somebody
+ * else's thread — the state the Threads view exists to report and the one a
+ * single session cannot create for itself. */
+static int cmd_reply(client *c, uint64_t channel_id, uint64_t parent_id, const char *text) {
+    uint8_t idem[OC_IDEM_SIZE];
+    size_t tl = strlen(text) ? strlen(text) : 1;
+    for (size_t i = 0; i < sizeof idem; i++) idem[i] = (uint8_t)(text[i % tl] ^ (i + 0x5A));
+    uint8_t buf[4096]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_send_reply s = {0};
+    s.channel_id = channel_id;
+    s.parent_id = parent_id;
+    memcpy(s.idem, idem, OC_IDEM_SIZE);
+    s.body = oc_slice_str(text);
+    if (oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &s) != OC_OK ||
+        write_all(&c->conn, buf, w.len) != 0)
+        FAIL("reply");
+    for (int i = 0; i < 4; i++) {
+        oc_header hdr; oc_rbuf p;
+        if (read_frame(c, &hdr, &p) != 0) FAIL("read after reply");
+        if (hdr.msg_type == OC_MSG_THREAD_REPLY) {
+            printf("demo_client: replied in thread %llu\n", (unsigned long long)parent_id);
+            return 0;
+        }
+        if (hdr.msg_type == OC_MSG_ERROR) FAIL("reply rejected");
+    }
+    FAIL("no reply ack");
+}
+
 int main(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr,
             "usage: %s <host> <port> <user> <pass> token <apns|fcm> <device-token>\n"
             "       %s <host> <port> <user> <pass> send  <channel_id> <text...>\n"
+            "       %s <host> <port> <user> <pass> reply <channel_id> <parent> <text...>\n"
             "       %s <host> <port> --oidc <jwt>   whoami\n"
             "       %s <host> <port> --oidc <jwt>   send <channel_id> <text...>\n",
-            argv[0], argv[0], argv[0], argv[0]);
+            argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
     const char *host = argv[1]; int port = atoi(argv[2]);
@@ -204,6 +234,8 @@ int main(int argc, char **argv) {
         rc = cmd_token(&c, argv[6], argv[7]);
     } else if (strcmp(cmd, "send") == 0 && argc >= 8) {
         rc = cmd_send(&c, strtoull(argv[6], NULL, 10), argv[7]);
+    } else if (strcmp(cmd, "reply") == 0 && argc >= 9) {
+        rc = cmd_reply(&c, strtoull(argv[6], NULL, 10), strtoull(argv[7], NULL, 10), argv[8]);
     } else {
         fprintf(stderr, "demo_client: unknown or malformed command\n");
         rc = -1;

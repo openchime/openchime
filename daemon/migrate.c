@@ -734,6 +734,36 @@ static const char MIGRATION_0035[] =
     "  PRIMARY KEY (user_id, person_id)"
     ") WITHOUT ROWID;";
 
+static const char MIGRATION_0036[] =
+    /* The aggregated Threads view (REQ-062, ARCH-104, WIN-108).
+     *
+     * Participation is DERIVED, never stored: you are in a thread if you wrote
+     * its root or any reply, which the messages table already knows. So this
+     * table holds only OVERRIDES — an explicit follow of a thread you never
+     * replied to, and an explicit unfollow of one you did. `state` 1 follow,
+     * 0 unfollow. Storing participation instead would mean a write on every
+     * reply and a second source of truth for a question the first one answers.
+     *
+     * `thread_reads` is a per-thread cursor, and it has to be its own: the
+     * channel cursor (delivery_cursors, REQ-090) advances when you read the
+     * CHANNEL, which says nothing about whether you read a thread inside it —
+     * and unread-reply counts are the whole point of the view. */
+    "CREATE TABLE thread_follows ("
+    "  user_id    INTEGER NOT NULL REFERENCES users(id),"
+    "  root_id    INTEGER NOT NULL REFERENCES messages(id),"
+    "  channel_id INTEGER NOT NULL REFERENCES channels(id),"
+    "  state      INTEGER NOT NULL DEFAULT 1 CHECK (state IN (0,1)),"
+    "  updated_ms INTEGER NOT NULL DEFAULT 0,"
+    "  PRIMARY KEY (user_id, root_id)"
+    ") WITHOUT ROWID;"
+    "CREATE TABLE thread_reads ("
+    "  user_id             INTEGER NOT NULL REFERENCES users(id),"
+    "  root_id             INTEGER NOT NULL REFERENCES messages(id),"
+    "  last_read_reply_id  INTEGER NOT NULL DEFAULT 0,"
+    "  updated_ms          INTEGER NOT NULL DEFAULT 0,"
+    "  PRIMARY KEY (user_id, root_id)"
+    ") WITHOUT ROWID;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -770,6 +800,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 33, MIGRATION_0033 },
     { 34, MIGRATION_0034 },
     { 35, MIGRATION_0035 },
+    { 36, MIGRATION_0036 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

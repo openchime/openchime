@@ -192,6 +192,17 @@ typedef struct {
     uint32_t gen;
 } oc_draft_view;
 
+/* One thread in the aggregated view (REQ-062). `gen` is the sync generation, as
+ * drafts use it: a list replaces what the server did not mention. */
+typedef struct {
+    uint64_t root_id, channel_id, root_author;
+    uint64_t root_at, last_reply_at;
+    uint32_t reply_count, unread;
+    uint8_t  following;
+    char    *preview;     /* heap */
+    uint32_t gen;
+} oc_thread_view;
+
 /* One scheduled message (REQ-224). `state` is OC_SCHED_*; a FAILED one keeps its
  * reason, because that is the whole of what its author needs to see. */
 typedef struct {
@@ -291,6 +302,11 @@ typedef struct {
     /* Drafts (REQ-223). Always loaded — the sidebar marks conversations that
      * hold one — so unlike `saved` this has no open/close, only a generation
      * that a full LIST bumps so stale entries can be swept when it completes. */
+    /* Threads I am in (REQ-062), newest activity first as the server ordered them. */
+    oc_thread_view *threads;
+    size_t    n_threads, cap_threads;
+    uint32_t  thread_gen;
+    uint8_t   threads_loading;
     oc_draft_view *drafts;
     size_t    n_drafts, cap_drafts;
     uint32_t  draft_gen;
@@ -632,6 +648,11 @@ uint8_t *oc_model_take_attachment(oc_model *m, uint64_t *attachment_id, size_t *
 
 /* A user's presence (OC_PRESENCE_OFFLINE if unknown). */
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id);
+/* The thread list (REQ-062). `oc_model_threads_begin` bumps the sync generation;
+ * the terminator sweeps anything the server did not mention. */
+void oc_model_threads_begin(oc_model *m);
+/* Total unread replies across every thread — the badge on the Threads row. */
+uint32_t oc_model_thread_unread(const oc_model *m);
 /* Whether a user is not to be disturbed right now (REQ-122). The fact only: the
  * server never sends anyone else's end time. */
 int oc_model_dnd_of(const oc_model *m, uint64_t user_id);

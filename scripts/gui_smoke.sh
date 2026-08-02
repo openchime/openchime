@@ -1379,15 +1379,35 @@ else fail "a typo in the priority list was swallowed (announcements still $a0)";
 # discard the rest of what was typed.
 expect_grep '^keywords=.* nvip=1 ' "the names that resolve are saved anyway"
 
-"$DRIVE" key escape >/dev/null 2>&1; settle modal none
+# The schedule (REQ-136) is inline in the SAME overlay, as Slack keeps it: one
+# row of modes, and Custom expands the seven days in place. Driven by clicking
+# the real chips and the real time dropdown, which is the only way to know the
+# hit-boxes and the dropdown's scroll arithmetic are right.
+mode_xy() { snap | grep -oE '^schedmodes=.*' | cut -d= -f2 | cut -d" " -f$(( $1 + 1 )) | tr ',' ' '; }
+"$DRIVE" click $(mode_xy 1) >/dev/null 2>&1     # Every day
+expect_grep '^keywords=.* schedmode=1 schedwin=480-1320' "Every day saves as allowed hours, 08:00-22:00"
+"$DRIVE" click $(mode_xy 2) >/dev/null 2>&1     # Weekdays
+expect_grep '^keywords=.* schedmode=2 ' "Weekdays is its own mode, not a second window"
 
-# The schedule: its window is the hours notifications are ALLOWED (REQ-136).
-"$DRIVE" formnext "1|08:00|22:00" >/dev/null 2>&1
-"$DRIVE" menu 50 >/dev/null 2>&1
-expect_grep '^keywords=.* schedmode=1 schedwin=480-1320' "an every-day schedule saves as allowed hours"
-"$DRIVE" formnext "2|09:00|17:30" >/dev/null 2>&1
-"$DRIVE" menu 50 >/dev/null 2>&1
-expect_grep '^keywords=.* schedmode=2 schedwin=540-1050' "weekdays is its own mode, not a second window"
+# The time dropdown: open it on the base window's start and pick a value. The
+# list scrolls, so the row a click lands on is computed from its position rather
+# than its index — the arithmetic that would silently set the wrong hour.
+basestart=$(snap | grep -oE '^schedbase=[0-9]+,[0-9]+' | cut -d= -f2 | tr ',' ' ')
+[ -n "$basestart" ] && "$DRIVE" click $basestart >/dev/null 2>&1
+expect_grep '^schedbase=.* tpopen=1 tprows=[1-9]' "a time field opens the dropdown"
+"$DRIVE" key esc >/dev/null 2>&1
+expect_grep '^schedbase=.* tpopen=0 ' "escape closes it without changing anything"
+
+# Custom expands seven days, pre-filled as a working week — every day off would
+# be a schedule that silences everything the moment it is chosen.
+"$DRIVE" click $(mode_xy 3) >/dev/null 2>&1
+expect_grep '^keywords=.* schedmode=3 scheddays=7' "Custom expands the whole week"
+expect_grep '^  schedrow wd=1 on=1 win=540-1020' "Monday is on, 09:00-17:00"
+expect_grep '^  schedrow wd=0 on=0 ' "Sunday is off"
+# A day toggles through its own checkbox.
+satchk=$(snap | grep -E '^  schedday d=6 ' | grep -oE 'chk=[0-9]+,[0-9]+' | cut -d= -f2 | tr ',' ' ')
+[ -n "$satchk" ] && "$DRIVE" click $satchk >/dev/null 2>&1
+expect_grep '^  schedrow wd=6 on=1 ' "a day switches on from its checkbox"
 
 # All of it is the daemon's, so a new process finds it — the check the client's
 # own memory could never fail.
@@ -1395,12 +1415,13 @@ expect_grep '^keywords=.* schedmode=2 schedwin=540-1050' "weekdays is its own mo
 "$DRIVE" launch >/dev/null 2>&1
 wait_for authed 1 >/dev/null 2>&1
 expect_typeable "the client takes the keyboard after a restart"
-expect_grep '^keywords="deploy,release train" nvip=1 schedmode=2 schedwin=540-1050' \
-            "keywords, priority people and the schedule all survive a restart"
+expect_grep '^keywords="deploy,release train" nvip=1 schedmode=3 scheddays=7' \
+            "keywords, priority people and the whole custom week survive a restart"
 
-"$DRIVE" formnext "0" >/dev/null 2>&1
-"$DRIVE" menu 50 >/dev/null 2>&1
+"$DRIVE" menu 71 >/dev/null 2>&1
+"$DRIVE" click $(mode_xy 0) >/dev/null 2>&1     # Any time
 expect_grep '^keywords=.* schedmode=0 ' "turning the schedule off leaves nothing behind"
+"$DRIVE" key esc >/dev/null 2>&1; settle modal none
 
 # --- pausing notifications (WIN-92, REQ-278) -------------------------------
 # The pause is SERVER state, not a client mood: the restart below is the point of
@@ -1431,6 +1452,55 @@ else fail "pause lost across a restart: $(snap | grep '^snoozed=')"; fi
 
 "$DRIVE" menu 57 >/dev/null 2>&1          # resume
 expect_grep '^snoozed=0 snooze_until=0 ' "resuming ends it, and ends it now"
+
+# --- Threads, across channels (WIN-108, REQ-062) ---------------------------
+# The claim is that this is a SERVER answer: threads I am in wherever they are,
+# with unread counts a channel cursor cannot produce. So it is seeded from a
+# second account and driven through the shelf row.
+say "== threads"
+"$DRIVE" view 0 >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; settle conv 1
+gid=$(snap | grep -oE '^  ch [0-9]+ "general"' | grep -oE '[0-9]+' | head -1)
+[ -z "$gid" ] && gid=1
+"$DRIVE" send "a thread starts here" >/dev/null 2>&1
+sleep 1
+root=$(snap | grep -oE '^  msgrow [0-9]+ mid=[0-9]+' | tail -1 | grep -oE 'mid=[0-9]+' | cut -d= -f2)
+checks=$((checks + 1))
+if [ -n "$root" ]; then ok "a root message to hang a thread on"
+else fail "no message id to reply to"; fi
+# bob replies, so the thread has a reply from somebody else — the unread case.
+if [ -n "$root" ] && [ -x "$HERE/build/demo_client" ]; then
+  "$HERE/build/demo_client" 127.0.0.1 "$OC_DEV_PORT" bob pw reply "$gid" "$root" "and bob answers" >/dev/null 2>&1
+fi
+sleep 1
+"$DRIVE" view threads >/dev/null 2>&1
+expect_grep '^threads n=[1-9]' "the thread appears in the cross-channel list"
+expect_grep "^  thread root=$root .*unread=1 follow=1" "with bob's reply counted unread, and me following"
+
+# Opening it is reading it: the unread count is about replies you have not seen.
+card=$(snap | grep -E "^  thread root=$root " | grep -oE 'at=[0-9]+,[0-9]+' | cut -d= -f2 | tr ',' ' ')
+[ -n "$card" ] && "$DRIVE" click $card >/dev/null 2>&1
+sleep 1
+"$DRIVE" view threads >/dev/null 2>&1
+expect_grep "^  thread root=$root .*unread=0 " "opening it clears its unread replies"
+
+# Unread-only re-asks the server rather than filtering what is loaded.
+ubtn=$(snap | grep -E '^threads ' | grep -oE 'btn=[0-9]+,[0-9]+' | cut -d= -f2 | tr ',' ' ')
+[ -n "$ubtn" ] && "$DRIVE" click $ubtn >/dev/null 2>&1
+expect_grep '^threads n=0 unreadonly=1' "unreads-only asks again and comes back empty"
+[ -n "$ubtn" ] && "$DRIVE" click $ubtn >/dev/null 2>&1
+expect_grep '^threads n=[1-9] unreadonly=0' "and back"
+
+# --- People (WIN-109, REQ-289) ---------------------------------------------
+# The directory exists because the roster now carries title/timezone/status. The
+# check that matters is that it filters, since the pane is otherwise a list.
+say "== people"
+"$DRIVE" view people >/dev/null 2>&1
+expect_grep '^people n=[3-9] q="" box=1' "the directory lists the workspace, with its search box up"
+"$DRIVE" dirfind bob >/dev/null 2>&1
+expect_grep '^people n=1 q="bob"' "typing a name filters to one person"
+"$DRIVE" dirfind "" >/dev/null 2>&1
+expect_grep '^people n=[3-9] q=""' "clearing it restores everyone"
+"$DRIVE" view 0 >/dev/null 2>&1; settle sbkind 1
 
 # --- one selected row at a time (WIN-106) ----------------------------------
 # Reported from a screenshot: the Drafts pane lit its own shelf row AND left the

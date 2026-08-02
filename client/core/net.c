@@ -517,6 +517,17 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->message_id = ue[i].avatar_id;      /* WIN-47 */
                 e->body = malloc(ue[i].display_name.len + 1);
                 if (e->body) { memcpy(e->body, ue[i].display_name.ptr, ue[i].display_name.len); e->body[ue[i].display_name.len] = '\0'; }
+                /* REQ-289: the profile fields now travel with the roster, so a
+                 * client knows them for EVERYONE rather than only for itself.
+                 * Fixed-size copies, as oc_member holds them. */
+                { size_t n2 = ue[i].title.len < sizeof e->pf_title - 1 ? ue[i].title.len : sizeof e->pf_title - 1;
+                  if (n2) memcpy(e->pf_title, ue[i].title.ptr, n2); e->pf_title[n2] = '\0'; }
+                { size_t n2 = ue[i].timezone.len < sizeof e->pf_tz - 1 ? ue[i].timezone.len : sizeof e->pf_tz - 1;
+                  if (n2) memcpy(e->pf_tz, ue[i].timezone.ptr, n2); e->pf_tz[n2] = '\0'; }
+                { size_t n2 = ue[i].status_emoji.len < sizeof e->emoji - 1 ? ue[i].status_emoji.len : sizeof e->emoji - 1;
+                  if (n2) memcpy(e->emoji, ue[i].status_emoji.ptr, n2); e->emoji[n2] = '\0'; }
+                { size_t n2 = ue[i].status_text.len < sizeof e->author_name - 1 ? ue[i].status_text.len : sizeof e->author_name - 1;
+                  if (n2) memcpy(e->author_name, ue[i].status_text.ptr, n2); e->author_name[n2] = '\0'; }
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_PRESENCE_UPDATE) {
@@ -855,6 +866,33 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->op = ne[i].level;
                 e->status = ne[i].muted;      /* WIN-40: distinct from the level */
                 oc_queue_push(to_ui, e);
+            }
+        } else if (hdr.msg_type == OC_MSG_THREAD_SUMMARY) {
+            oc_thread_summary ts;
+            if (oc_decode_thread_summary(&p, &ts) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_THREAD_SUMMARY);
+                if (e) {
+                    e->message_id  = ts.root_id;
+                    e->channel_id  = ts.channel_id;
+                    e->author_id   = ts.root_author;
+                    e->server_time = ts.root_at;
+                    e->pinned_at   = ts.last_reply_at;
+                    e->reply_count = ts.reply_count;
+                    e->unread_count= ts.unread;
+                    e->following   = ts.following;
+                    e->body = malloc(ts.preview.len + 1);
+                    if (e->body) {
+                        if (ts.preview.len) memcpy(e->body, ts.preview.ptr, ts.preview.len);
+                        e->body[ts.preview.len] = '\0';
+                    }
+                    oc_queue_push(to_ui, e);
+                }
+            }
+        } else if (hdr.msg_type == OC_MSG_THREADS) {
+            oc_threads th;
+            if (oc_decode_threads(&p, &th) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_THREADS_END);
+                if (e) { e->count = th.count; oc_queue_push(to_ui, e); }
             }
         } else if (hdr.msg_type == OC_MSG_SCHEDULE) {
             oc_schedule sc; oc_schedule_day days[OC_SCHEDULE_DAYS];
@@ -1708,6 +1746,24 @@ static int run_connection(oc_net *n, int reconnecting,
                 oc_schedule sc = { c->sched_mode, c->tz_offset_min, c->sched_start_min,
                                    c->sched_end_min, c->n_sched_days, c->sched_days };
                 if (oc_encode_set_schedule(&w, OC_PROTOCOL_VERSION, &sc) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_LIST_THREADS) {
+                uint8_t buf[24]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_list_threads lt = { c->op };
+                if (oc_encode_list_threads(&w, OC_PROTOCOL_VERSION, &lt) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_THREAD_FOLLOW) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_set_thread_follow tf = { c->message_id, c->channel_id, c->op };
+                if (oc_encode_set_thread_follow(&w, OC_PROTOCOL_VERSION, &tf) == OC_OK)
+                    (void)write_all(&conn, fd, buf, w.len, &n->stop);
+            }
+            if (c->type == OC_CMD_MARK_THREAD_READ) {
+                uint8_t buf[32]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                oc_mark_thread_read mr = { c->message_id, c->server_time };
+                if (oc_encode_mark_thread_read(&w, OC_PROTOCOL_VERSION, &mr) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SET_KEYWORDS) {

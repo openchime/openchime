@@ -913,6 +913,88 @@ oc_result oc_decode_alert_prefs(oc_rbuf *p, oc_slice *terms, uint8_t tcap, uint8
     return r_done(p);
 }
 
+/* --- Threads, aggregated (REQ-062, ARCH-104) ----------------------------- */
+
+oc_result oc_encode_list_threads(oc_wbuf *w, uint16_t version, const oc_list_threads *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_LIST_THREADS);
+    oc_w_u8(w, m->filter);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_list_threads(oc_rbuf *p, oc_list_threads *m) {
+    uint8_t f = oc_r_u8(p);
+    /* An empty body is the original question, as LIST_ACTIVITY's is. */
+    if (p->underflow) { p->underflow = 0; f = OC_THREADF_ALL; }
+    m->filter = f;
+    return OC_OK;
+}
+
+oc_result oc_encode_thread_summary(oc_wbuf *w, uint16_t version, const oc_thread_summary *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_THREAD_SUMMARY);
+    oc_w_u64(w, m->root_id);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->root_author);
+    oc_w_u64(w, m->root_at);
+    oc_w_u64(w, m->last_reply_at);
+    oc_w_u32(w, m->reply_count);
+    oc_w_u32(w, m->unread);
+    oc_w_u8(w, m->following);
+    oc_w_str(w, m->preview);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_thread_summary(oc_rbuf *p, oc_thread_summary *m) {
+    m->root_id = oc_r_u64(p);
+    m->channel_id = oc_r_u64(p);
+    m->root_author = oc_r_u64(p);
+    m->root_at = oc_r_u64(p);
+    m->last_reply_at = oc_r_u64(p);
+    m->reply_count = oc_r_u32(p);
+    m->unread = oc_r_u32(p);
+    m->following = oc_r_u8(p);
+    m->preview = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_threads(oc_wbuf *w, uint16_t version, const oc_threads *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_THREADS);
+    oc_w_u32(w, m->count);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_threads(oc_rbuf *p, oc_threads *m) {
+    m->count = oc_r_u32(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_set_thread_follow(oc_wbuf *w, uint16_t version, const oc_set_thread_follow *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_THREAD_FOLLOW);
+    oc_w_u64(w, m->root_id);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u8(w, m->on);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_thread_follow(oc_rbuf *p, oc_set_thread_follow *m) {
+    m->root_id = oc_r_u64(p);
+    m->channel_id = oc_r_u64(p);
+    m->on = oc_r_u8(p);
+    return r_done(p);
+}
+
+oc_result oc_encode_mark_thread_read(oc_wbuf *w, uint16_t version, const oc_mark_thread_read *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_MARK_THREAD_READ);
+    oc_w_u64(w, m->root_id);
+    oc_w_u64(w, m->up_to);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_mark_thread_read(oc_rbuf *p, oc_mark_thread_read *m) {
+    m->root_id = oc_r_u64(p);
+    m->up_to = oc_r_u64(p);
+    return r_done(p);
+}
+
 oc_result oc_decode_snooze(oc_rbuf *p, oc_snooze *m) {
     m->until_ms = oc_r_u64(p);
     return r_done(p);
@@ -1499,6 +1581,10 @@ oc_result oc_encode_user_list(oc_wbuf *w, uint16_t version, const oc_user_list *
         oc_w_str(w, m->entries[i].email);
         oc_w_str(w, m->entries[i].display_name);
         oc_w_u64(w, m->entries[i].avatar_id);      /* WIN-47; 0 = none */
+        oc_w_str(w, m->entries[i].title);          /* REQ-240/289 */
+        oc_w_str(w, m->entries[i].timezone);
+        oc_w_str(w, m->entries[i].status_emoji);   /* REQ-241 */
+        oc_w_str(w, m->entries[i].status_text);
     }
     return oc_frame_end(w, off);
 }
@@ -2276,6 +2362,10 @@ oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries,
         oc_slice email = oc_r_str(p);
         oc_slice name = oc_r_str(p);
         uint64_t avatar = oc_r_u64(p);
+        oc_slice title = oc_r_str(p);
+        oc_slice tz = oc_r_str(p);
+        oc_slice semoji = oc_r_str(p);
+        oc_slice stext = oc_r_str(p);
         if (i < cap) {
             entries[i].user_id = uid;
             entries[i].role = role;
@@ -2283,6 +2373,10 @@ oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries,
             entries[i].email = email;
             entries[i].display_name = name;
             entries[i].avatar_id = avatar;
+            entries[i].title = title;
+            entries[i].timezone = tz;
+            entries[i].status_emoji = semoji;
+            entries[i].status_text = stext;
         }
     }
     return r_done(p);

@@ -184,6 +184,13 @@ and extends `users`. Appended as `MIGRATION_0002` + a `{ 2, ... }` entry in
 `OC_MIGRATIONS` — the runner is unchanged (§1). `users` gains columns via
 `ALTER TABLE ADD COLUMN` (SQLite-supported; existing rows default).
 
+### `users` — read path (REQ-289)
+`title`, `timezone`, `status_emoji` and `status_text` now travel on `USER_LIST`
+as well as `PROFILE_INFO`. They always existed; `PROFILE_INFO` is sent only to the
+user who edited them, so no client learned anyone else's — which is why the
+profile card claimed the fields were not built. Expired status reads as absent
+here too, applying `build_profile`'s rule in the second place that needs it.
+
 ### `users` (added columns)
 `subject` remains the unique identity key, namespaced by source
 (`oidc:<issuer>|<sub>` or `local:<username>`, ARCH-19).
@@ -428,6 +435,17 @@ Server-authoritative notification settings, synced across a user's devices.
   **custom** mode only. Sparse on purpose: no row for a day means that day is
   quiet, so a schedule listing Monday to Friday is a statement about the weekend
   too rather than an omission.
+
+### `thread_follows`, `thread_reads` (migration 0036)
+- `thread_follows (user_id, root_id)` + `channel_id`, `state` — **overrides only**
+  (REQ-062, ARCH-104). Participation is derived from `messages.parent_id`: you are
+  in a thread if you wrote its root or a reply. `state` 1 is an explicit follow of
+  one you did not write in, `state` 0 an explicit unfollow of one you did — and
+  the unfollow outranks participation, which is what "turn off replies" means.
+- `thread_reads (user_id, root_id, last_read_reply_id)` — a per-thread cursor,
+  advancing only. It cannot be derived from `delivery_cursors`: that advances when
+  the CHANNEL is read, and thread replies are deliberately not in the main scroll
+  (REQ-060), so the channel cursor sweeps past replies nobody has seen.
 
 ### `notify_keywords`, `priority_people` (migration 0035)
 - `notify_keywords (user_id, term)` — one term per row, stored lowercased.

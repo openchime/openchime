@@ -50,6 +50,28 @@ can outlive it — geometry in the dump, not eyeballed once.
 **Not to be interleaved with feature work.** The point is to look at the whole
 thing at once, which is exactly what shipping a feature at a time cannot do.
 
+## WIN-110 — AutomationIds on every actionable element (REQ-290)
+
+Raised 2026-08-02, out of the testing question rather than the accessibility one.
+
+The client has a UIA provider already (ARCH-99), so the tree exists and a screen
+reader can read it. What it does not have is a **stable id per element**, which is
+what an automated test needs to find a control without knowing where it was drawn.
+The current harness clicks coordinates read out of a debug dump — workable, and
+the reason several failures this session needed a human to decide whether they were
+real.
+
+Scope: an `AutomationId` on every element a user can act on — rail and shelf rows,
+sidebar conversations, tabs, chips, list rows, composer controls, toolbar buttons,
+menu items, modal fields and buttons. Composed from identity for anything dynamic
+(`sidebar.row.<channel_id>`), never from position. Ids are defined beside the
+control and treated as a contract: renaming one is a breaking change.
+
+This is the prerequisite for driving the client the way Windows applications are
+supposed to be driven — UIA from a separate test process (FlaUI or equivalent),
+locating by id — rather than by synthetic clicks at measured points. It does not
+by itself decide where that suite runs; that is the CI-agent question.
+
 ## Closed without a fix, and why
 
 - **WIN-60 — the unreproduced crash while typing.** Closed 2026-07-31. Three
@@ -111,11 +133,25 @@ thing at once, which is exactly what shipping a feature at a time cannot do.
 
 ## What "closed" does and does not mean
 
-WIN-1 … WIN-106 are done (WIN-92 and WIN-94 landed 2026-08-02) —
+WIN-1 … WIN-109 are done (WIN-92, WIN-94, WIN-108 and WIN-109 landed 2026-08-02) —
 accessibility included, built *for* the custom controls rather than by retreating
 to native ones (ARCH-99), and rich text with its toolbar as of 2026-07-31. The
 items below are each blocked on a daemon requirement or an ARCH decision, or, in
 WIN-60's case, on a crash that has not reproduced since it was instrumented.
+
+**WIN-108 (Threads) and WIN-109 (People)** are the Home sidebar's other two shelf
+rows, both landed 2026-08-02. Threads answers REQ-062 with ARCH-104: participation
+derived from authorship, `thread_follows` holding only overrides, and a per-thread
+read cursor, because the channel's advances when you read the channel and says
+nothing about a thread inside it. People answers the new REQ-289 — and repaired a
+gap in REQ-240, which was marked DONE: title and timezone rode `PROFILE_INFO`
+alone, which is sent only to the person who edited them, so no client ever learned
+anyone else's and the profile card had to say the fields were not built.
+
+**Huddles, the remaining shelf row, is deliberately absent.** The daemon has calls
+end to end, but the client half does not exist — no Opus, no UDP media path, no
+device enumeration — and nothing lists calls in progress at any layer. A row would
+point at nothing.
 
 **WIN-92 and WIN-94 came off it on 2026-08-02**, daemon first each time. The
 pause (REQ-278) is Slack's `snooze`: an absolute instant enforced on read, named

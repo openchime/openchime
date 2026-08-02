@@ -452,6 +452,36 @@ void oc_client_set_snooze(oc_client *c, uint32_t minutes) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+/* Threads I am in, across channels (REQ-062). `filter` is OC_THREADF_*. Opens
+ * the list first, as every other list command does — the fold drops entries that
+ * arrive while it is closed, which is the bug that made the activity feed look
+ * permanently empty. */
+void oc_client_list_threads(oc_client *c, uint8_t filter) {
+    if (!c) return;
+    oc_model_threads_begin(&c->model);
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_THREADS);
+    if (!cmd) return;
+    cmd->op = filter;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+void oc_client_thread_follow(oc_client *c, uint64_t channel_id, uint64_t root_id, uint8_t on) {
+    if (!c || !root_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_THREAD_FOLLOW);
+    if (!cmd) return;
+    cmd->channel_id = channel_id; cmd->message_id = root_id; cmd->op = on;
+    oc_queue_push(&c->cmds, cmd);
+}
+
+/* `up_to` 0 means every reply in it, which is what opening one means. */
+void oc_client_mark_thread_read(oc_client *c, uint64_t root_id, uint64_t up_to) {
+    if (!c || !root_id) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_MARK_THREAD_READ);
+    if (!cmd) return;
+    cmd->message_id = root_id; cmd->server_time = up_to;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_list_notify_prefs(oc_client *c) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_NOTIFY_PREFS);

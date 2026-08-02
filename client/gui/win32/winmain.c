@@ -170,7 +170,7 @@ static float composer_inner_h(void) { return g_composer_h - composer_chrome(); }
 /* VIEW_DRAFTS is a real destination but NOT a rail item: it is reached from the
  * Home sidebar's top shelf, where Slack puts "Drafts & sent" (REQ-228). */
 enum { VIEW_HOME = 0, VIEW_DMS, VIEW_ACTIVITY, VIEW_FILES, VIEW_LATER,
-       VIEW_DRAFTS, VIEW_NEWMSG, VIEW_ADMIN, VIEW_COUNT,
+       VIEW_DRAFTS, VIEW_NEWMSG, VIEW_ADMIN, VIEW_THREADS, VIEW_DIRECTORY, VIEW_COUNT,
        /* Not a rail destination: the sign-in screen, which owns the whole window
         * (no rail, no sidebar, no composer) until there is a session. */
        VIEW_SIGNIN = 100 };
@@ -233,7 +233,9 @@ static void draw_presence_dot_dnd(ID2D1RenderTarget *rt, float cx, float cy, flo
                                   uint8_t presence, uint32_t surface, int dnd) {
     uint32_t c = presence == OC_PRESENCE_ONLINE ? OC_COL_ONLINE
                : presence == OC_PRESENCE_AWAY   ? OC_COL_AWAY : OC_COL_FAINT;
-    D2D1_ELLIPSE ring = { { cx, cy }, r + 1.6f, r + 1.6f };
+    /* A 2px ring in the surface colour, as Slack's has: the dot sits ON the
+     * avatar, and without a ring it reads as a speck stuck to the edge. */
+    D2D1_ELLIPSE ring = { { cx, cy }, r + 2.0f, r + 2.0f };
     ID2D1RenderTarget_FillEllipse(rt, &ring, paint_with(surface));
     D2D1_ELLIPSE dot = { { cx, cy }, r, r };
     ID2D1RenderTarget_FillEllipse(rt, &dot, paint_with(dnd ? OC_COL_MUTED : c));
@@ -913,6 +915,33 @@ static int g_notify_open, g_keys_open;
 static struct { D2D1_RECT_F r; uint64_t cid; uint8_t level; } g_notify_hits[128];
 /* The two Edit buttons on the notifications overlay (REQ-135). */
 static D2D1_RECT_F g_notify_kw_btn, g_notify_vip_btn;
+/* The schedule section (REQ-136): mode chips, the base window's two time fields,
+ * and — in custom mode — a checkbox and two time fields per weekday. */
+/* The Threads pane (REQ-062): its unread-only toggle and the per-card
+ * "turn off replies" targets. */
+static char        g_dir_filter[80];     /* the People pane's search text (REQ-289) */
+static HWND        g_dir_edit;
+static int         g_threads_unread;
+static D2D1_RECT_F g_threads_unread_btn;
+static D2D1_RECT_F g_thread_follow_hit[32];
+static D2D1_RECT_F g_sched_mode_hit[4];
+static D2D1_RECT_F g_sched_base_hit[2];
+static D2D1_RECT_F g_sched_day_chk[7];
+static D2D1_RECT_F g_sched_day_hit[7][2];
+static int         g_sched_rows_drawn;
+/* The time dropdown. Slack's is a scrolling list of half-hours, which the action
+ * menus cannot be: they are a fixed panel capped at 28 items and 48 would neither
+ * fit the array nor the screen. So this is its own small control — the same
+ * widget Slack uses, not a different design.
+ *
+ * `field` is what is being edited: 0/1 the base window's start/end, else
+ * 2 + day*2 + (0 start, 1 end). */
+static int         g_tp_open, g_tp_field;
+static float       g_tp_x, g_tp_y, g_tp_scroll;
+static D2D1_RECT_F g_tp_panel;
+static D2D1_RECT_F g_tp_rows[48];
+static int         g_n_tp_rows;
+static int         g_tp_rows_hover = -1;
 static int g_n_notify_hits;
 
 static int      g_show_members = 1;     /* members pane visible */
@@ -2471,7 +2500,11 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
      * instead of each arriving as its own exception. */
     {
         static const struct { int view; const char *label; int icon; } SHELF[] = {
+            /* Threads first, as Slack orders it: it is the one people open every
+             * day, and Drafts is the one they open when they remember. */
+            { VIEW_THREADS, "Threads", OC_ICON_DMS },
             { VIEW_DRAFTS, "Drafts, scheduled & sent", OC_ICON_SQUARE_PEN },
+            { VIEW_DIRECTORY, "People", OC_ICON_USER },
         };
         float sy = top;
         g_n_sbsel = 0;
@@ -2485,9 +2518,24 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                         on ? OC_COL_TEXT : OC_COL_MUTED);
             draw_text(rt, SHELF[si].label, on ? g_ui_b : g_ui,
                       rf(sx0 + 34, sy, sx1 - 40, sy + ROW_H), on ? OC_COL_TEXT : OC_COL_MUTED);
+            /* Threads carry the count Slack shows there: unread REPLIES, which
+             * is the number the row exists to report. */
+            if (SHELF[si].view == VIEW_THREADS) {
+                uint32_t un = oc_model_thread_unread(m);
+                if (un) {
+                    char badge[24];
+                    snprintf(badge, sizeof badge, "%u", un);
+                    float bw = text_width(badge, g_micro) + 14;
+                    D2D1_RECT_F pill = rf(sx1 - 12 - bw, sy + 8, sx1 - 12, sy + 26);
+                    fill_round(rt, pill, 9.0f, OC_COL_ACCENT);
+                    IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_CENTER);
+                    draw_text(rt, badge, g_micro, pill, 0xFFFFFF);
+                    IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+            }
             /* The count Slack shows: drafts waiting, and anything that FAILED to
              * send, which is the one number worth interrupting somebody for. */
-            {
+            if (SHELF[si].view == VIEW_DRAFTS) {
                 size_t nd = m->n_drafts, nf = oc_model_scheduled_failed(m);
                 if (nd || nf) {
                     char badge[24];
@@ -2579,7 +2627,11 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                     IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_CENTER);
                 } else {
                 draw_user_avatar(rt, m, r->peer_id, r->label, av, g_meta, 1, 5.0f);
-                draw_presence_dot_dnd(rt, av.right - 1, av.bottom - 1, 3.5f,
+                /* INSET into the avatar, not hung off its corner: at
+                 * (right-1, bottom-1) most of the dot was outside the picture,
+                 * which is what made it read as an artifact rather than a status
+                 * (WIN-107, reported from a screenshot). */
+                draw_presence_dot_dnd(rt, av.right - 4, av.bottom - 4, 4.5f,
                                       oc_model_presence_of(m, r->peer_id),
                                       selected ? OC_COL_SELECT : OC_COL_SIDEBAR,
                                       oc_model_dnd_of(m, r->peer_id));
@@ -3910,6 +3962,129 @@ static void draw_weblist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
 /* One right-aligned All/Mentions/None chip group, registering its own hit-boxes.
  * Shared by the per-channel rows and the global default (cid 0) so the two cannot
  * drift apart in either look or behaviour. */
+static void sched_time_label(uint16_t mins, char *out, size_t cap);   /* fwd */
+
+/* One time field: a bordered box with the time and a chevron, which is what a
+ * dropdown looks like natively and what Slack's schedule uses. Returns its rect
+ * so the caller can register the hit-box. */
+static D2D1_RECT_F time_field(ID2D1RenderTarget *rt, float x, float y, const char *label) {
+    float w = text_width(label, g_meta) + 40;
+    if (w < 92) w = 92;                     /* so 9:00 AM and 11:30 PM line up */
+    D2D1_RECT_F b = rf(x, y, x + w, y + 26);
+    fill_round(rt, b, 6.0f, OC_COL_INPUT);
+    stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
+    draw_text(rt, label, g_meta, rf(b.left + 10, b.top, b.right - 22, b.bottom), OC_COL_TEXT);
+    /* The same glyph the workspace header uses for its dropdown — one chevron in
+     * the app, not two that look slightly different. */
+    draw_text(rt, "\xE2\x96\xBE", g_meta, rf(b.right - 20, b.top, b.right - 6, b.bottom), OC_COL_MUTED);
+    return b;
+}
+
+/* The time dropdown: 48 half-hours, scrolling, clamped to the window. Slack's is
+ * the same list; the app's action menus could not be it, being a fixed panel
+ * capped at 28 items. */
+static void draw_time_picker(ID2D1RenderTarget *rt, float W, float H) {
+    g_n_tp_rows = 0;
+    if (!g_tp_open) { g_tp_panel = rf(0, 0, 0, 0); return; }
+    const float ROWH = 28.0f, PAD = 6.0f;
+    float full = 48 * ROWH + PAD * 2;
+    float maxh = H - 40;
+    float h = full < maxh ? full : maxh;
+    float x = g_tp_x, y = g_tp_y;
+    if (x + 150 > W - 8) x = W - 8 - 150;
+    if (y + h > H - 8)   y = H - 8 - h;
+    if (y < 8) y = 8;
+    D2D1_RECT_F panel = rf(x, y, x + 150, y + h);
+    g_tp_panel = panel;
+    fill_round(rt, rf(panel.left + 2, panel.top + 4, panel.right + 2, panel.bottom + 4), 10.0f, OC_COL_RAIL);
+    fill_round(rt, panel, 10.0f, OC_COL_INPUT);
+    stroke_round(rt, panel, 10.0f, OC_COL_BORDER, 1.0f);
+    float maxscroll = full > h ? full - h : 0;
+    if (g_tp_scroll < 0) g_tp_scroll = 0;
+    if (g_tp_scroll > maxscroll) g_tp_scroll = maxscroll;
+    for (int i = 0; i < 48; i++) {
+        float ry = panel.top + PAD + i * ROWH - g_tp_scroll;
+        if (ry + ROWH < panel.top + PAD || ry > panel.bottom - PAD) continue;
+        D2D1_RECT_F r = rf(panel.left + 4, ry, panel.right - 4, ry + ROWH);
+        char lbl[16];
+        sched_time_label((uint16_t)(i * 30), lbl, sizeof lbl);
+        if (g_tp_rows_hover == i) fill_round(rt, r, 6.0f, OC_COL_HOVER);
+        draw_text(rt, lbl, g_meta, rf(r.left + 12, r.top, r.right - 8, r.bottom), OC_COL_TEXT);
+        g_tp_rows[g_n_tp_rows++] = r;
+    }
+}
+
+static void time_picker_open(int field, float x, float y, uint16_t current) {
+    g_tp_open = 1; g_tp_field = field;
+    g_tp_x = x; g_tp_y = y;
+    /* Open with the current value in view rather than at midnight — a picker that
+     * always starts at 00:00 makes 17:00 a scroll every single time. */
+    g_tp_scroll = (float)(current / 30) * 28.0f - 84.0f;
+    if (g_tp_scroll < 0) g_tp_scroll = 0;
+    g_tp_rows_hover = -1;
+}
+
+/* --- the notification schedule's helpers (REQ-136, WIN-94) ----------------- */
+
+/* A time as this client shows times everywhere else — the 12/24-hour preference
+ * decides, so the schedule cannot disagree with the transcript. */
+static void sched_time_label(uint16_t mins, char *out, size_t cap) {
+    unsigned h = mins / 60u, m = mins % 60u;
+    if (g_pref_time24) snprintf(out, cap, "%02u:%02u", h, m);
+    else {
+        unsigned h12 = h % 12u; if (!h12) h12 = 12u;
+        snprintf(out, cap, "%u:%02u %s", h12, m, h < 12u ? "AM" : "PM");
+    }
+}
+
+/* The seven days as the model holds them, with the ones it has no row for filled
+ * in. A missing day is OFF, which is what the daemon means by it (ARCH-103) —
+ * seeding it as "on" here would make the UI disagree with the notifier. */
+static void sched_days_from_model(const oc_model *m, oc_schedule_day *out) {
+    for (int d = 0; d < 7; d++) {
+        out[d].weekday = (uint8_t)d;
+        out[d].enabled = 0;
+        out[d].start_min = 540;    /* 09:00, the value a day takes when switched on */
+        out[d].end_min   = 1020;   /* 17:00 */
+    }
+    if (!m) return;
+    for (uint8_t i = 0; i < m->n_sched_days; i++) {
+        const oc_schedule_day *d = &m->sched_days[i];
+        if (d->weekday > 6) continue;
+        out[d->weekday].enabled   = d->enabled;
+        out[d->weekday].start_min = d->start_min;
+        out[d->weekday].end_min   = d->end_min;
+    }
+}
+
+/* Send the whole schedule, always. It is one setting: the op replaces what is
+ * stored, so building the complete week from the model plus this one change is
+ * both simpler than a diff and the only thing the wire can express. */
+static void sched_send(uint8_t mode, uint16_t start, uint16_t end,
+                       const oc_schedule_day *days) {
+    oc_client_set_schedule(g_client, mode, (int16_t)local_utc_offset_min(),
+                           start, end,
+                           mode == OC_DND_CUSTOM ? days : NULL,
+                           mode == OC_DND_CUSTOM ? 7 : 0);
+}
+
+/* Apply one field of the schedule, reading everything else from the model. */
+static void sched_set_field(int field, uint16_t value) {
+    const oc_model *m = model();
+    if (!m) return;
+    oc_schedule_day days[7];
+    sched_days_from_model(m, days);
+    uint16_t start = m->allow_start_min, end = m->allow_end_min;
+    if (field == 0) start = value;
+    else if (field == 1) end = value;
+    else {
+        int d = (field - 2) / 2, which = (field - 2) % 2;
+        if (d < 0 || d > 6) return;
+        if (which == 0) days[d].start_min = value; else days[d].end_min = value;
+    }
+    sched_send(m->dnd_mode, start, end, days);
+}
+
 static void notify_chips(ID2D1RenderTarget *rt, D2D1_RECT_F body, float y, float rowh,
                          uint64_t cid, uint8_t level) {
     static const char *LEVELS[3] = { "All", "Mentions", "None" };
@@ -3937,23 +4112,6 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
     D2D1_RECT_F body = reg;   /* the frame drew the title bar (modal_frame) */
     ovl_use(OVL_NOTIFY);
     g_n_notify_hits = 0;
-
-    /* The schedule states when notifications are ALLOWED (REQ-136), so it is
-     * described that way rather than inverted into quiet hours — the sentence a
-     * user reads should be the setting they set. */
-    char dnd[128];
-    static const char *MODE[] = { "off", "every day", "weekdays", "custom" };
-    if (m->dnd_mode == OC_DND_CUSTOM)
-        snprintf(dnd, sizeof dnd, "Notifications allowed on a custom schedule");
-    else if (m->dnd_mode != OC_DND_OFF)
-        snprintf(dnd, sizeof dnd, "Notifications allowed %s, %02u:%02u \u2013 %02u:%02u",
-                 MODE[m->dnd_mode], m->allow_start_min / 60, m->allow_start_min % 60,
-                 m->allow_end_min / 60, m->allow_end_min % 60);
-    else
-        snprintf(dnd, sizeof dnd, "Notifications are allowed at any time");
-    draw_text(rt, dnd, g_meta, rf(body.left + 20, body.top + 4, body.right - 20, body.top + 26),
-              m->dnd_mode != OC_DND_OFF ? OC_COL_NOTICE : OC_COL_FAINT);
-    body.top += 30;
 
     /* Keyword alerts and priority people (REQ-135), above the per-channel list
      * for the same reason the default is: they are rules that cut ACROSS the
@@ -4000,6 +4158,91 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
 
         fill(rt, rf(body.left + 20, y1 + 44, body.right - 20, y1 + 45), OC_COL_BORDER);
         body.top = y1 + 54;
+    }
+
+    /* The SCHEDULE (REQ-136), in Slack's shape: one row of choices, a time range
+     * beside it, and — for Custom — the seven days expanded in place. Inline
+     * rather than behind a dialog because that is where Slack keeps it, and
+     * because a schedule is read as a week, not as seven separate answers. */
+    {
+        float y0 = body.top;
+        draw_text(rt, "Allow notifications", g_ui_b,
+                  rf(body.left + 20, y0, body.right - 20, y0 + 20), OC_COL_TEXT);
+        static const char *MODES[4] = { "Any time", "Every day", "Weekdays", "Custom" };
+        float mx = body.left + 20, my = y0 + 24;
+        for (int i = 0; i < 4; i++) {
+            float bw = text_width(MODES[i], g_meta) + 22;
+            D2D1_RECT_F b = rf(mx, my, mx + bw, my + 26);
+            int on = (m->dnd_mode == i);
+            fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
+            if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
+            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+            draw_text(rt, MODES[i], g_meta, b, on ? 0xFFFFFF : OC_COL_MUTED);
+            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+            g_sched_mode_hit[i] = b;
+            mx = b.right + 8;
+        }
+        float ny = my + 34;
+        g_sched_rows_drawn = 0;
+        for (int i = 0; i < 7; i++) {
+            g_sched_day_chk[i] = rf(0, 0, 0, 0);
+            g_sched_day_hit[i][0] = g_sched_day_hit[i][1] = rf(0, 0, 0, 0);
+        }
+        g_sched_base_hit[0] = g_sched_base_hit[1] = rf(0, 0, 0, 0);
+
+        if (m->dnd_mode == OC_DND_EVERY_DAY || m->dnd_mode == OC_DND_WEEKDAYS) {
+            char t0[16], t1[16];
+            sched_time_label(m->allow_start_min, t0, sizeof t0);
+            sched_time_label(m->allow_end_min,   t1, sizeof t1);
+            draw_text(rt, "from", g_meta, rf(body.left + 20, ny, body.left + 56, ny + 26), OC_COL_MUTED);
+            g_sched_base_hit[0] = time_field(rt, body.left + 58, ny, t0);
+            draw_text(rt, "to", g_meta, rf(g_sched_base_hit[0].right + 10, ny,
+                                           g_sched_base_hit[0].right + 34, ny + 26), OC_COL_MUTED);
+            g_sched_base_hit[1] = time_field(rt, g_sched_base_hit[0].right + 36, ny, t1);
+            ny += 34;
+        } else if (m->dnd_mode == OC_DND_CUSTOM) {
+            static const char *DAYS[7] = { "Sunday", "Monday", "Tuesday", "Wednesday",
+                                           "Thursday", "Friday", "Saturday" };
+            oc_schedule_day days[7];
+            sched_days_from_model(m, days);
+            /* Monday first, as a working week is read — the storage is Sunday-first
+             * because strftime's %w is, and those are different questions. */
+            static const int ORDER[7] = { 1, 2, 3, 4, 5, 6, 0 };
+            for (int k = 0; k < 7; k++) {
+                int d = ORDER[k];
+                draw_text(rt, DAYS[d], g_ui, rf(body.left + 20, ny, body.left + 120, ny + 26),
+                          OC_COL_TEXT);
+                /* The same checkbox the form fields draw — box, fill, and the ✓
+                 * glyph. There is no check in the icon set, and the send arrow I
+                 * reached for first read as a paper plane in a tick's place. */
+                D2D1_RECT_F chk = rf(body.left + 124, ny + 3, body.left + 144, ny + 23);
+                fill_round(rt, chk, 4.0f, days[d].enabled ? OC_COL_ACCENT : OC_COL_INPUT);
+                if (!days[d].enabled) stroke_round(rt, chk, 4.0f, OC_COL_BORDER, 1.0f);
+                if (days[d].enabled) {
+                    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+                    draw_text(rt, "\u2713", g_meta, chk, 0xFFFFFF);
+                    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+                g_sched_day_chk[d] = chk;
+                if (days[d].enabled) {
+                    char t0[16], t1[16];
+                    sched_time_label(days[d].start_min, t0, sizeof t0);
+                    sched_time_label(days[d].end_min,   t1, sizeof t1);
+                    g_sched_day_hit[d][0] = time_field(rt, body.left + 152, ny, t0);
+                    draw_text(rt, "\u2013", g_meta,
+                              rf(g_sched_day_hit[d][0].right + 6, ny,
+                                 g_sched_day_hit[d][0].right + 20, ny + 26), OC_COL_MUTED);
+                    g_sched_day_hit[d][1] = time_field(rt, g_sched_day_hit[d][0].right + 22, ny, t1);
+                } else {
+                    draw_text(rt, "No notifications", g_meta,
+                              rf(body.left + 152, ny, body.right - 20, ny + 26), OC_COL_FAINT);
+                }
+                ny += 30;
+            }
+            g_sched_rows_drawn = 7;
+        }
+        fill(rt, rf(body.left + 20, ny + 6, body.right - 20, ny + 7), OC_COL_BORDER);
+        body.top = ny + 16;
     }
 
     /* REQ-134: the level every channel WITHOUT its own row takes. It sits above
@@ -4243,6 +4486,7 @@ static int accel_dispatch(HWND hwnd, const MSG *m) {
      * picker, drop a selection) and stays in the control that owns it, so this only
      * claims the key when one of these four is actually up. */
     if (m->message == WM_KEYDOWN && m->wParam == VK_ESCAPE) {
+        if (g_tp_open)   { g_tp_open = 0; InvalidateRect(hwnd, NULL, FALSE); return 1; }
         if (g_menu)      { g_menu = MENU_NONE; g_menu_hover = -1; InvalidateRect(hwnd, NULL, FALSE); return 1; }
         if (g_more_open) { g_more_open = 0;    InvalidateRect(hwnd, NULL, FALSE); return 1; }
         if (g_lightbox)  { g_lightbox = 0;     InvalidateRect(hwnd, NULL, FALSE); return 1; }
@@ -5158,10 +5402,35 @@ static void draw_profile_card(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
                   rf(reg.left + 24, y, reg.right - 12, y + 20), OC_COL_FAINT);
         y += 28;
     }
-    /* The fields a real profile wants (REQ-240/241) do not exist yet; saying so
-     * is better than a card that looks finished and is not. */
-    draw_text(rt, "No title, timezone or email yet \u2014 those fields are not built.",
-              g_meta_w, rf(reg.left + 16, y + 6, reg.right - 16, y + 56), OC_COL_FAINT);
+    /* The profile fields (REQ-240/241). They reach a client for EVERYONE as of
+     * REQ-289 — before that only PROFILE_INFO carried them and it never left the
+     * person who set them, so this card had to say they were not built. */
+    {
+        const oc_member *pm = NULL;
+        for (size_t i = 0; i < m->n_users; i++)
+            if (m->users[i].user_id == g_profile_uid) { pm = &m->users[i]; break; }
+        int any = 0;
+        if (pm && pm->status_text[0]) {
+            char st[128];
+            snprintf(st, sizeof st, "%s%s%s", pm->status_emoji,
+                     pm->status_emoji[0] ? "  " : "", pm->status_text);
+            draw_text(rt, st, g_ui, rf(reg.left + 16, y + 4, reg.right - 16, y + 26), OC_COL_TEXT);
+            y += 26; any = 1;
+        }
+        if (pm && pm->title[0]) {
+            draw_text(rt, pm->title, g_meta, rf(reg.left + 16, y + 4, reg.right - 16, y + 26),
+                      OC_COL_MUTED);
+            y += 24; any = 1;
+        }
+        if (pm && pm->timezone[0]) {
+            draw_text(rt, pm->timezone, g_meta, rf(reg.left + 16, y + 4, reg.right - 16, y + 26),
+                      OC_COL_FAINT);
+            y += 24; any = 1;
+        }
+        if (!any)
+            draw_text(rt, "No title, timezone or status set.", g_meta_w,
+                      rf(reg.left + 16, y + 6, reg.right - 16, y + 46), OC_COL_FAINT);
+    }
 }
 
 /* Who reacted (REQ-071) — a list of PEOPLE, so it belongs in the context pane
@@ -5492,6 +5761,8 @@ static const struct { const char *label; int cmd; } PALETTE[] = {
     { "Mark all as read",        73 },
     { "Edit display name",       30 },
     { "Change password",         31 },
+    { "Threads",                 74 },
+    { "People",                  75 },
     { "Notification schedule",   50 },
     { "Pause notifications for 30 minutes", 58 },
     { "Pause notifications for 1 hour",     59 },
@@ -6880,6 +7151,7 @@ static void modal_enter(HWND hwnd, int *flag) {
 static const char *g_modal_closed_by = "";   /* diagnosis only; see the dump */
 
 static void modal_finish(int save) {
+    g_tp_open = 0;   /* nothing floating may outlive the card it was opened from */
     const oc_modal_spec *s = modal_current();
     /* A confirmation's "commit" is its action. Handled here rather than through
      * spec->commit so the action can take the window handle. */
@@ -6935,6 +7207,11 @@ static int modal_frame_click(HWND hwnd, int x, int y) {
 static int modal_key(HWND hwnd, WPARAM vk) {
     (void)hwnd;
     if (!modal_open()) return 0;
+    /* A dropdown floating over the modal owns Escape first — closing the card
+     * underneath it and leaving the list open is the wrong half, and the
+     * pre-translate handler that would have caught this returns early while a
+     * modal is up (deliberately: shortcuts must not open surfaces behind it). */
+    if (vk == VK_ESCAPE && g_tp_open) { g_tp_open = 0; return 1; }
     if (vk == VK_ESCAPE) { modal_finish(0); g_modal_closed_by = "esc"; return 1; }
     if (vk == VK_RETURN) {
         if (g_modal_primary_cmd == MODAL_OK) modal_finish(1);
@@ -6971,11 +7248,13 @@ static int modal_key(HWND hwnd, WPARAM vk) {
  * new overlay has to be named in one of those predicates; it cannot silently
  * inherit somebody else's children. */
 static void layout_files_find(HWND hwnd);   /* fwd */
+static void layout_dir_find(HWND hwnd);     /* fwd */
 
 static void layout_natives(HWND hwnd) {
     layout_composer(hwnd);     /* also does layout_find */
     layout_search(hwnd);
     layout_files_find(hwnd);
+    layout_dir_find(hwnd);
 
     int covered = window_is_covered();
     if (g_pal_edit) {
@@ -7078,6 +7357,8 @@ static int sidebar_kind(void) {
     case VIEW_LATER:    return SBK_LATER;
     /* The channel list, because that is the column the shelf row lives in and
      * you came from (REQ-228). */
+    case VIEW_THREADS:  return SBK_CHANNELS;
+    case VIEW_DIRECTORY: return SBK_CHANNELS;
     case VIEW_DRAFTS:   return SBK_CHANNELS;
     case VIEW_NEWMSG:   return SBK_CHANNELS;
     default:            return SBK_NONE;
@@ -7365,7 +7646,7 @@ static void draw_dm_list(ID2D1RenderTarget *rt, const oc_model *m, float h) {
         } else {
             draw_user_avatar(rt, m, best->peer_id, nm,
                              rf(row.left + 9, y + 11, row.left + 39, y + 41), g_ui, 0, 0);
-            draw_presence_dot_dnd(rt, row.left + 35, y + 37, 4.5f,
+            draw_presence_dot_dnd(rt, row.left + 34, y + 36, 5.0f,
                                   oc_model_presence_of(m, best->peer_id), OC_COL_SIDEBAR,
                                   oc_model_dnd_of(m, best->peer_id));
         }
@@ -8164,6 +8445,227 @@ static void draw_msgish_row(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_
 static D2D1_RECT_F g_dtab_hit[DTAB_COUNT];
 static D2D1_RECT_F g_dnew_btn;
 
+/* Does this person match what was typed? Name, title and status, because those
+ * are the three things visible in the row — searching over a field the row does
+ * not show makes a match look like a bug. Disabled accounts are out: a directory
+ * is who you can reach. */
+static int dir_matches(const oc_member *u, const char *lower_needle) {
+    if (u->disabled) return 0;
+    if (!lower_needle || !lower_needle[0]) return 1;
+    char hay[256];
+    snprintf(hay, sizeof hay, "%s %s %s", u->name, u->title, u->status_text);
+    for (char *c = hay; *c; c++) *c = (char)tolower((unsigned char)*c);
+    return strstr(hay, lower_needle) != NULL;
+}
+
+/* The people directory (REQ-289, WIN-109).
+ *
+ * Slack's shape: a full pane with a search field and a row per person — avatar,
+ * display name, title, presence — and clicking one opens their profile. Ours
+ * filters the roster the client already holds, because it holds all of it
+ * (LIST_USERS returns the workspace) and a search op would be a round trip to
+ * answer a question already in memory.
+ *
+ * It exists at all because the roster now carries title, timezone and status
+ * (REQ-289): before that a client knew nothing about anyone but itself, and a
+ * directory would have been a list of names. */
+static void draw_directory(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    D2D1_RECT_F body = view_header(rt, reg, "People",
+                                   "Everyone in this workspace.");
+    g_n_listrows = 0;
+    /* The search box is a native EDIT, placed by layout_natives like every other
+     * one in this app; here we only leave room for it. */
+    body.top += 46;
+
+    char filter[80];
+    snprintf(filter, sizeof filter, "%s", g_dir_filter);
+    for (char *c = filter; *c; c++) *c = (char)tolower((unsigned char)*c);
+
+    const float ROWH2 = 56.0f;
+    size_t shown = 0;
+    for (size_t i = 0; i < m->n_users; i++) if (dir_matches(&m->users[i], filter)) shown++;
+    if (!shown) {
+        draw_text(rt, filter[0] ? "Nobody by that name." : "The roster is empty.",
+                  g_meta, rf(body.left + 24, body.top + 8, body.right - 24, body.top + 30),
+                  OC_COL_FAINT);
+        return;
+    }
+    ovl_use(OVL_LATER);
+    float y = ovl_begin(rt, body, (float)shown * ROWH2 + 16);
+    for (size_t i = 0; i < m->n_users; i++) {
+        const oc_member *u = &m->users[i];
+        if (!dir_matches(u, filter)) continue;
+        if (y + ROWH2 < body.top) { y += ROWH2; continue; }
+        if (y > body.bottom) break;
+        D2D1_RECT_F row = rf(body.left + 16, y, body.right - 16, y + ROWH2 - 4);
+        if (g_listrow_hover == u->user_id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
+
+        draw_user_avatar(rt, m, u->user_id, u->name[0] ? u->name : "?",
+                         rf(row.left + 12, y + 10, row.left + 44, y + 42), g_ui, 0, 0);
+        draw_presence_dot_dnd(rt, row.left + 40, y + 38, 4.5f,
+                              oc_model_presence_of(m, u->user_id), OC_COL_BASE,
+                              oc_model_dnd_of(m, u->user_id));
+        draw_text(rt, u->name[0] ? u->name : "user", g_ui_b,
+                  rf(row.left + 56, y + 8, row.right - 200, y + 28), OC_COL_TEXT);
+
+        /* Title, or the custom status when there is one — Slack shows the status
+         * in its place, because it is the more current of the two. */
+        char sub[160];
+        if (u->status_text[0])
+            snprintf(sub, sizeof sub, "%s%s%s", u->status_emoji,
+                     u->status_emoji[0] ? "  " : "", u->status_text);
+        else snprintf(sub, sizeof sub, "%s", u->title);
+        if (sub[0])
+            draw_text(rt, sub, g_meta, rf(row.left + 56, y + 27, row.right - 200, y + 47),
+                      OC_COL_MUTED);
+
+        if (u->timezone[0]) {
+            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
+            draw_text(rt, u->timezone, g_meta, rf(row.right - 190, y + 18, row.right - 16, y + 38),
+                      OC_COL_FAINT);
+            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
+        if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
+            g_listrows[g_n_listrows].row = row;
+            g_listrows[g_n_listrows].act = rf(0, 0, 0, 0);
+            g_listrows[g_n_listrows].mid = u->user_id;
+            g_listrows[g_n_listrows].cid = 0;
+            g_n_listrows++;
+        }
+        y += ROWH2;
+    }
+    ovl_end(rt, body);
+}
+
+/* Threads I am in, across every channel (REQ-062, ARCH-104, WIN-108).
+ *
+ * Slack's shape: a full-width feed of cards, newest activity first. A card is the
+ * thread's root — who wrote it, where, and what it says — with the reply count,
+ * when it last moved, and an unread pill when replies have arrived since I looked.
+ * Clicking one opens the thread, which is also what marks it read.
+ *
+ * A feed rather than the list-plus-detail two-column shape Activity uses, because
+ * a thread is read as a unit: the root without its replies is a message, and the
+ * point of this view is the conversation. */
+static void draw_threads(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
+    D2D1_RECT_F body = view_header(rt, reg, "Threads",
+                                   "Conversations you are part of, wherever they are.");
+    g_n_listrows = 0;
+    g_threads_unread_btn = rf(0, 0, 0, 0);
+    for (int i = 0; i < 32; i++) g_thread_follow_hit[i] = rf(0, 0, 0, 0);
+
+    /* Unread-only, the way Slack's Threads header offers it. A client-side filter
+     * would lie the moment a reply arrived, so it re-asks the server. */
+    {
+        const char *lbl = g_threads_unread ? "Unreads only" : "All threads";
+        float w = text_width(lbl, g_meta) + 24;
+        D2D1_RECT_F b = rf(body.right - 24 - w, body.top + 10, body.right - 24, body.top + 36);
+        fill_round(rt, b, 6.0f, g_threads_unread ? OC_COL_ACCENT : OC_COL_INPUT);
+        if (!g_threads_unread) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, lbl, g_meta, b, g_threads_unread ? 0xFFFFFF : OC_COL_MUTED);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_threads_unread_btn = b;
+    }
+    body.top += 46;
+
+    if (m->threads_loading && !m->n_threads) {
+        draw_text(rt, "Loading\u2026", g_meta,
+                  rf(body.left + 24, body.top + 8, body.right - 24, body.top + 30), OC_COL_FAINT);
+        return;
+    }
+    if (!m->n_threads) {
+        draw_empty_state(rt, body,
+                         g_threads_unread ? "No unread replies"
+                                          : "You are not in any threads yet",
+                         g_threads_unread
+                           ? "Threads you are part of appear here when somebody replies."
+                           : "Reply to a message, or start a thread of your own, and it "
+                             "will show up here with everything else you are following.",
+                         NULL, NULL);
+        return;
+    }
+
+    ovl_use(OVL_LATER);
+    const float CARDH = 104.0f;
+    float y = ovl_begin(rt, body, (float)m->n_threads * CARDH + 16);
+    for (size_t i = 0; i < m->n_threads && i < 32; i++) {
+        const oc_thread_view *t = &m->threads[i];
+        if (y + CARDH < body.top) { y += CARDH; continue; }
+        if (y > body.bottom) break;
+        D2D1_RECT_F card = rf(body.left + 20, y + 4, body.right - 20, y + CARDH - 10);
+        fill_round(rt, card, 8.0f, OC_COL_BASE);
+        stroke_round(rt, card, 8.0f, OC_COL_BORDER, 1.0f);
+        if (g_listrow_hover == t->root_id) fill_round(rt, card, 8.0f, OC_COL_HOVER);
+
+        /* Where it is, which is the first thing you need in a cross-channel list. */
+        char where[128];
+        const oc_channel *ch = oc_model_channel((oc_model *)m, t->channel_id);
+        if (ch && ch->kind == OC_CHANNEL_KIND_DM) {
+            const char *pn = oc_model_user_name((oc_model *)m, ch->peer_id);
+            snprintf(where, sizeof where, "@ %s", (pn && pn[0]) ? pn : "direct message");
+        } else snprintf(where, sizeof where, "# %s", (ch && ch->name[0]) ? ch->name : "channel");
+        draw_text(rt, where, g_meta, rf(card.left + 16, card.top + 8, card.right - 200,
+                                        card.top + 26), OC_COL_MUTED);
+
+        char when[24]; rel_time(t->last_reply_at ? t->last_reply_at : t->root_at,
+                                when, sizeof when);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        draw_text(rt, when, g_meta, rf(card.right - 120, card.top + 8, card.right - 16,
+                                       card.top + 26), OC_COL_FAINT);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+        const char *who = oc_model_user_name((oc_model *)m, t->root_author);
+        draw_user_avatar(rt, m, t->root_author, (who && who[0]) ? who : "?",
+                         rf(card.left + 16, card.top + 30, card.left + 44, card.top + 58),
+                         g_meta, 0, 0);
+        draw_text(rt, (who && who[0]) ? who : "someone", g_ui_b,
+                  rf(card.left + 52, card.top + 28, card.right - 140, card.top + 48),
+                  OC_COL_TEXT);
+        draw_text(rt, t->preview ? t->preview : "", g_meta_w,
+                  rf(card.left + 52, card.top + 46, card.right - 140, card.top + 84),
+                  OC_COL_MUTED);
+
+        /* The reply count, and the unread pill Slack puts beside it. */
+        char rc[48];
+        snprintf(rc, sizeof rc, "%u repl%s", t->reply_count, t->reply_count == 1 ? "y" : "ies");
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        draw_text(rt, rc, g_meta, rf(card.right - 130, card.top + 56, card.right - 16,
+                                     card.top + 76), OC_COL_ACCENT);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+        if (t->unread) {
+            char up[24]; snprintf(up, sizeof up, "%u new", t->unread);
+            float pw = text_width(up, g_micro) + 16;
+            D2D1_RECT_F pill = rf(card.right - 130 - pw - 8, card.top + 56,
+                                  card.right - 130 - 8, card.top + 76);
+            fill_round(rt, pill, 10.0f, OC_COL_ACCENT);
+            IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_CENTER);
+            draw_text(rt, up, g_micro, pill, 0xFFFFFF);
+            IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
+
+        /* Turning replies off, which is the other half of REQ-062: following is
+         * derived from having replied, so leaving is an explicit act. */
+        {
+            D2D1_RECT_F fb = rf(card.right - 130, card.top + 28, card.right - 16, card.top + 50);
+            IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_TRAILING);
+            draw_text(rt, "Turn off replies", g_micro, fb, OC_COL_FAINT);
+            IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_LEADING);
+            g_thread_follow_hit[i] = fb;
+        }
+
+        if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
+            g_listrows[g_n_listrows].row = card;
+            g_listrows[g_n_listrows].act = rf(0, 0, 0, 0);
+            g_listrows[g_n_listrows].mid = t->root_id;
+            g_listrows[g_n_listrows].cid = t->channel_id;
+            g_n_listrows++;
+        }
+        y += CARDH;
+    }
+    ovl_end(rt, body);
+}
+
 static void draw_drafts(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
     D2D1_RECT_F body = view_header(rt, reg, "Drafts, scheduled & sent",
                                    "Everything you have written but not said.");
@@ -8504,6 +9006,16 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
                 draw_sidebar(rt, m, H);
                 draw_newmsg(rt, m, rf(RAIL_W + SIDEBAR_W, 0, W, H));
                 break;
+            case VIEW_DIRECTORY:
+                draw_sidebar(rt, m, H);
+                draw_directory(rt, m, rf(RAIL_W + SIDEBAR_W, 0, W, H));
+                break;
+            case VIEW_THREADS:
+                /* Same shape as Drafts: the Home sidebar stays, because this is a
+                 * destination reached from a row in it. */
+                draw_sidebar(rt, m, H);
+                draw_threads(rt, m, rf(RAIL_W + SIDEBAR_W, 0, W, H));
+                break;
             case VIEW_DRAFTS:
                 /* The Home sidebar STAYS (REQ-228): this pane is reached from a
                  * row in it, that row is highlighted while you are here, and
@@ -8521,6 +9033,7 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
     draw_more_flyout(rt);   /* floats over the pane when open */
     draw_palette(rt, m, W, H);   /* the palette dims and covers the app */
     draw_menu(rt);          /* dropdown menus float on top of everything */
+    draw_time_picker(rt, W, H);   /* ...and the time dropdown above the overlay it belongs to */
     if (si_over) {          /* the sign-in card, over a dimmed live shell */
         D2D1_RECT_F all = rf(0, 0, W, H);
         ID2D1RenderTarget_FillRectangle(rt, &all, paint_alpha(0x000000, 0.55f));
@@ -10253,6 +10766,29 @@ static void layout_files_find(HWND hwnd) {
     ShowWindow(g_ffind, SW_SHOW);
 }
 
+/* The People pane's search box. Native child number EIGHT, and written to the
+ * same rules as the seventh: gated on its own view, never on a predicate that
+ * happens to be true there, and reported in the dump because `shot` renders
+ * Direct2D only and cannot see a native child. */
+static void dir_find_create(HWND parent) {
+    g_dir_edit = CreateWindowExW(0, L"EDIT", L"",
+        WS_CHILD | ES_AUTOHSCROLL, 0, 0, 10, 10, parent,
+        (HMENU)(INT_PTR)0xF5, GetModuleHandleW(NULL), NULL);
+    if (!g_dir_edit) return;
+    SendMessageW(g_dir_edit, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    SendMessageW(g_dir_edit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search people");
+}
+
+static void layout_dir_find(HWND hwnd) {
+    (void)hwnd;
+    if (!g_dir_edit) return;
+    int want = (g_view == VIEW_DIRECTORY) && !window_is_covered();
+    if (!want) { ShowWindow(g_dir_edit, SW_HIDE); return; }
+    float x = RAIL_W + SIDEBAR_W + 24, y = HEADER_H + 10;
+    MoveWindow(g_dir_edit, PX(x), PX(y), PX(320), PX(24), TRUE);
+    ShowWindow(g_dir_edit, SW_SHOW);
+}
+
 static void files_find_create(HWND parent) {
     g_ffind = CreateWindowExW(0, L"EDIT", L"",
         WS_CHILD | ES_AUTOHSCROLL, 0, 0, 10, 10, parent,
@@ -11272,6 +11808,81 @@ static int on_click(HWND hwnd, int x, int y) {
                 }
         }
         if (g_notify_open) {
+            /* The time dropdown is above everything else in this overlay, so it
+             * gets the click first — otherwise a row underneath it takes one that
+             * was aimed at the list. */
+            if (g_tp_open) {
+                for (int i = 0; i < g_n_tp_rows; i++)
+                    if (in_rect(g_tp_rows[i], x, y)) {
+                        /* The row index is not the half-hour index once the list
+                         * is scrolled: only the VISIBLE rows are recorded, so the
+                         * value comes from the row's position in the list. */
+                        float rel = g_tp_rows[i].top - (g_tp_panel.top + 6) + g_tp_scroll;
+                        int slot = (int)((rel + 1.0f) / 28.0f);
+                        if (slot < 0) slot = 0;
+                        if (slot > 47) slot = 47;
+                        sched_set_field(g_tp_field, (uint16_t)(slot * 30));
+                        g_tp_open = 0;
+                        return 1;
+                    }
+                g_tp_open = 0;            /* a click anywhere else closes it */
+                if (in_rect(g_tp_panel, x, y)) return 1;
+            }
+            /* The schedule (REQ-136). Every control applies immediately, as the
+             * level chips beside them do — this overlay has no Save button and a
+             * setting that waited for one would be the only thing here that did. */
+            for (int i = 0; i < 4; i++)
+                if (in_rect(g_sched_mode_hit[i], x, y)) {
+                    const oc_model *sm = model();
+                    if (!sm) return 1;
+                    oc_schedule_day days[7];
+                    sched_days_from_model(sm, days);
+                    uint16_t st = sm->allow_start_min, en = sm->allow_end_min;
+                    /* Choosing a mode for the first time needs a window worth
+                     * having: an empty one would mean "quiet always", which is
+                     * not what picking "Every day" says. */
+                    if (st == en) { st = 480; en = 1320; }     /* 08:00 - 22:00 */
+                    if (i == OC_DND_CUSTOM) {
+                        int any = 0;
+                        for (int d = 0; d < 7; d++) if (days[d].enabled) any = 1;
+                        /* And a custom week starts as the working week, which is
+                         * what it is for; every day off would be a schedule that
+                         * silences everything the moment it is chosen. */
+                        if (!any) for (int d = 1; d <= 5; d++) {
+                            days[d].enabled = 1; days[d].start_min = 540; days[d].end_min = 1020;
+                        }
+                    }
+                    sched_send((uint8_t)i, st, en, days);
+                    return 1;
+                }
+            for (int i = 0; i < 2; i++)
+                if (in_rect(g_sched_base_hit[i], x, y)) {
+                    const oc_model *sm = model();
+                    time_picker_open(i, g_sched_base_hit[i].left, g_sched_base_hit[i].bottom + 4,
+                                     sm ? (i ? sm->allow_end_min : sm->allow_start_min) : 0);
+                    return 1;
+                }
+            for (int d = 0; d < 7; d++) {
+                if (in_rect(g_sched_day_chk[d], x, y)) {
+                    const oc_model *sm = model();
+                    if (!sm) return 1;
+                    oc_schedule_day days[7];
+                    sched_days_from_model(sm, days);
+                    days[d].enabled = days[d].enabled ? 0 : 1;
+                    sched_send(sm->dnd_mode, sm->allow_start_min, sm->allow_end_min, days);
+                    return 1;
+                }
+                for (int w = 0; w < 2; w++)
+                    if (in_rect(g_sched_day_hit[d][w], x, y)) {
+                        const oc_model *sm = model();
+                        oc_schedule_day days[7];
+                        sched_days_from_model(sm, days);
+                        time_picker_open(2 + d * 2 + w, g_sched_day_hit[d][w].left,
+                                         g_sched_day_hit[d][w].bottom + 4,
+                                         w ? days[d].end_min : days[d].start_min);
+                        return 1;
+                    }
+            }
             /* Keywords (REQ-135). Comma-separated, which is Slack's shape and its
              * limitation too — storage is one term per row regardless, so the
              * separator is a property of this box rather than of the setting. */
@@ -11669,6 +12280,46 @@ static int on_click(HWND hwnd, int x, int y) {
     /* The Files view has no sidebar, so its clicks must be served before the
      * transcript-only guard below. */
     if (g_view == VIEW_FILES && files_click(hwnd, x, y)) return 1;
+    if (g_view == VIEW_DIRECTORY) {
+        for (int i = 0; i < g_n_listrows; i++)
+            if (in_rect(g_listrows[i].row, x, y)) {
+                profile_open(g_listrows[i].mid);
+                return 1;
+            }
+        return 1;
+    }
+    if (g_view == VIEW_THREADS) {
+        if (in_rect(g_threads_unread_btn, x, y)) {
+            /* Re-asks rather than filtering what is loaded: "unread" is the
+             * server's answer, and a client-side filter would go stale the
+             * moment a reply arrived. */
+            g_threads_unread = !g_threads_unread;
+            oc_client_list_threads(g_client,
+                g_threads_unread ? OC_THREADF_UNREAD : OC_THREADF_ALL);
+            return 1;
+        }
+        {
+            const oc_model *tm = model();
+            for (int i = 0; tm && i < (int)tm->n_threads && i < 32; i++)
+                if (in_rect(g_thread_follow_hit[i], x, y)) {
+                    oc_client_thread_follow(g_client, tm->threads[i].channel_id,
+                                            tm->threads[i].root_id, 0);
+                    return 1;
+                }
+        }
+        for (int i = 0; i < g_n_listrows; i++)
+            if (in_rect(g_listrows[i].row, x, y)) {
+                /* Opening it IS reading it (REQ-062): the unread count is about
+                 * replies you have not seen, and you are about to see them. */
+                uint64_t root = g_listrows[i].mid, cid = g_listrows[i].cid;
+                oc_client_mark_thread_read(g_client, root, 0);
+                select_channel(cid);
+                g_view = VIEW_HOME;
+                oc_client_open_thread(g_client, cid, root);
+                return 1;
+            }
+        return 1;
+    }
     if (g_view == VIEW_ACTIVITY) {
         for (int i = 0; i < AF_COUNT; i++)
             if (in_rect(g_act_filters[i], x, y)) {
@@ -11964,6 +12615,12 @@ static int on_click(HWND hwnd, int x, int y) {
         for (int i = 0; i < g_n_shelf; i++)
             if (y >= g_shelf_rows[i].top && y < g_shelf_rows[i].bot) {
                 g_view = g_shelf_rows[i].view;
+                /* A destination that lists server state asks for it on arrival,
+                 * as the rail's Activity row does — otherwise the pane shows
+                 * whatever was last fetched, which for a first visit is nothing. */
+                if (g_view == VIEW_THREADS)
+                    oc_client_list_threads(g_client,
+                        g_threads_unread ? OC_THREADF_UNREAD : OC_THREADF_ALL);
                 if (g_view == VIEW_DRAFTS && g_client) {
                     oc_client_list_drafts(g_client);
                     oc_client_list_scheduled(g_client);
@@ -13527,42 +14184,26 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 41: oc_client_invite_user(g_client, OC_ROLE_ADMIN);  g_await_invite = 1; break;
     case 60: g_view = VIEW_HOME; close_overlays(); oc_client_toggle_storage(g_client, 1); oc_client_storage_status(g_client); break;
     case 61: g_view = VIEW_HOME; close_overlays(); oc_client_toggle_audit(g_client, 1); oc_client_audit_query(g_client, 0); break;
-    case 50: {   /* The notification SCHEDULE (REQ-136, WIN-94), in Slack's words:
-                  * you say when notifications are ALLOWED, not when to be quiet.
-                  * Per-weekday editing is the next step; this covers the three
-                  * modes that need no rows. */
-        oc_field f[3] = {
-            { FF_CHOICE, "Allow notifications", "Any time|Every day|Weekdays", "0" },
-            { FF_TEXT,   "From (HH:MM)", "", "08:00" },
-            { FF_TEXT,   "To (HH:MM)",   "A window may cross midnight.", "22:00" },
-        };
-        if (m && m->dnd_mode != OC_DND_OFF) {
-            snprintf(f[0].value, sizeof f[0].value, "%d",
-                     m->dnd_mode == OC_DND_WEEKDAYS ? 2 : 1);
-            snprintf(f[1].value, sizeof f[1].value, "%02u:%02u",
-                     m->allow_start_min / 60, m->allow_start_min % 60);
-            snprintf(f[2].value, sizeof f[2].value, "%02u:%02u",
-                     m->allow_end_min / 60, m->allow_end_min % 60);
-        }
-        if (!form_dialog(hwnd, "Notification schedule", f, 3)) break;
-        int choice = atoi(f[0].value);
-        int tzoff = local_utc_offset_min();
-        if (choice == 0) {
-            oc_client_set_schedule(g_client, OC_DND_OFF, (int16_t)tzoff, 0, 0, NULL, 0);
-            toast_push("Notifications are allowed at any time.", 0);
-            break;
-        }
-        int sh = 0, sm = 0, eh = 0, em = 0;
-        if (sscanf(f[1].value, "%d:%d", &sh, &sm) != 2 || sscanf(f[2].value, "%d:%d", &eh, &em) != 2 ||
-            sh < 0 || sh > 23 || eh < 0 || eh > 23 || sm < 0 || sm > 59 || em < 0 || em > 59) {
-            toast_push("Use HH:MM, 00:00 to 23:59.", 1);
-            break;
-        }
-        oc_client_set_schedule(g_client,
-                               choice == 2 ? OC_DND_WEEKDAYS : OC_DND_EVERY_DAY,
-                               (int16_t)tzoff, (uint16_t)(sh * 60 + sm),
-                               (uint16_t)(eh * 60 + em), NULL, 0);
-        break; }
+    case 74:  /* Threads (REQ-062), the same destination the shelf row opens.
+               * 51/52 belong to the profile menu's status items — the dispatch
+               * space is shared, which is exactly the collision the context
+               * menus were given their own numbering to avoid. */
+        close_overlays();
+        g_view = VIEW_THREADS;
+        oc_client_list_threads(g_client,
+            g_threads_unread ? OC_THREADF_UNREAD : OC_THREADF_ALL);
+        break;
+    case 75:  /* The people directory (REQ-289). */
+        close_overlays();
+        g_view = VIEW_DIRECTORY;
+        oc_client_list_users(g_client);
+        break;
+    case 50:  /* The schedule lives in the Notifications overlay now (REQ-136),
+               * inline as Slack keeps it — so this entry, and the palette's, open
+               * that rather than a dialog that could disagree with it. */
+        oc_client_list_notify_prefs(g_client);
+        modal_enter(hwnd, &g_notify_open);
+        break;
     case 70: modal_enter(hwnd, &g_prefs_open); break;
     case 73: {   /* WIN-33: catch-up, as a loop over the existing CLIENT_ACK.
                   * REQ-238 may later add a true bulk op; this needs no wire
@@ -14231,6 +14872,29 @@ static void test_dump(const char *path) {
             if (kw[0]) strncat(kw, ",", sizeof kw - strlen(kw) - 1);
             strncat(kw, m->kw_terms[i], sizeof kw - strlen(kw) - 1);
         }
+        fprintf(f, "schedmodes=%.0f,%.0f %.0f,%.0f %.0f,%.0f %.0f,%.0f\n",
+                (g_sched_mode_hit[0].left + g_sched_mode_hit[0].right) / 2,
+                (g_sched_mode_hit[0].top + g_sched_mode_hit[0].bottom) / 2,
+                (g_sched_mode_hit[1].left + g_sched_mode_hit[1].right) / 2,
+                (g_sched_mode_hit[1].top + g_sched_mode_hit[1].bottom) / 2,
+                (g_sched_mode_hit[2].left + g_sched_mode_hit[2].right) / 2,
+                (g_sched_mode_hit[2].top + g_sched_mode_hit[2].bottom) / 2,
+                (g_sched_mode_hit[3].left + g_sched_mode_hit[3].right) / 2,
+                (g_sched_mode_hit[3].top + g_sched_mode_hit[3].bottom) / 2);
+        fprintf(f, "schedbase=%.0f,%.0f %.0f,%.0f tpopen=%d tprows=%d\n",
+                (g_sched_base_hit[0].left + g_sched_base_hit[0].right) / 2,
+                (g_sched_base_hit[0].top + g_sched_base_hit[0].bottom) / 2,
+                (g_sched_base_hit[1].left + g_sched_base_hit[1].right) / 2,
+                (g_sched_base_hit[1].top + g_sched_base_hit[1].bottom) / 2,
+                g_tp_open, g_n_tp_rows);
+        for (int d = 0; d < 7; d++)
+            fprintf(f, "  schedday d=%d chk=%.0f,%.0f t0=%.0f,%.0f t1=%.0f,%.0f\n", d,
+                    (g_sched_day_chk[d].left + g_sched_day_chk[d].right) / 2,
+                    (g_sched_day_chk[d].top + g_sched_day_chk[d].bottom) / 2,
+                    (g_sched_day_hit[d][0].left + g_sched_day_hit[d][0].right) / 2,
+                    (g_sched_day_hit[d][0].top + g_sched_day_hit[d][0].bottom) / 2,
+                    (g_sched_day_hit[d][1].left + g_sched_day_hit[d][1].right) / 2,
+                    (g_sched_day_hit[d][1].top + g_sched_day_hit[d][1].bottom) / 2);
         fprintf(f, "kwbtn=%.0f,%.0f vipbtn=%.0f,%.0f\n",
                 (g_notify_kw_btn.left + g_notify_kw_btn.right) / 2,
                 (g_notify_kw_btn.top + g_notify_kw_btn.bottom) / 2,
@@ -14240,6 +14904,47 @@ static void test_dump(const char *path) {
                 kw, m ? m->n_pri_people : 0, m ? m->dnd_mode : 0,
                 m ? m->allow_start_min : 0, m ? m->allow_end_min : 0,
                 m ? m->n_sched_days : 0);
+        for (uint8_t i = 0; m && i < m->n_sched_days; i++)
+            fprintf(f, "  schedrow wd=%u on=%u win=%u-%u\n",
+                    m->sched_days[i].weekday, m->sched_days[i].enabled,
+                    m->sched_days[i].start_min, m->sched_days[i].end_min);
+    }
+    /* People (REQ-289): how many the filter shows and whether its native search
+     * box is up — `shot` cannot see a native child, which is the lesson the Files
+     * box left behind. */
+    {
+        int nvis = 0;
+        char low[80]; snprintf(low, sizeof low, "%s", g_dir_filter);
+        for (char *c = low; *c; c++) *c = (char)tolower((unsigned char)*c);
+        if (m) for (size_t i = 0; i < m->n_users; i++)
+            if (dir_matches(&m->users[i], low)) nvis++;
+        fprintf(f, "people n=%d q=\"%s\" box=%d\n", nvis, g_dir_filter,
+                g_dir_edit && IsWindowVisible(g_dir_edit));
+    }
+    /* Threads (REQ-062): what the list holds and what the pane offers. */
+    {
+        fprintf(f, "threads n=%zu unreadonly=%d totalunread=%u btn=%.0f,%.0f\n",
+                m ? m->n_threads : (size_t)0, g_threads_unread,
+                m ? oc_model_thread_unread(m) : 0u,
+                (g_threads_unread_btn.left + g_threads_unread_btn.right) / 2,
+                (g_threads_unread_btn.top + g_threads_unread_btn.bottom) / 2);
+        for (size_t i = 0; m && i < m->n_threads && i < 8; i++) {
+            /* The card's centre, so a test clicks the row rather than a guessed
+             * point — the lesson the view matrix learned when it drove views by
+             * number and the numbers moved. */
+            float cx = 0, cy = 0;
+            for (int k = 0; k < g_n_listrows; k++)
+                if (g_listrows[k].mid == m->threads[i].root_id) {
+                    cx = (g_listrows[k].row.left + g_listrows[k].row.right) / 2;
+                    cy = (g_listrows[k].row.top + g_listrows[k].row.bottom) / 2;
+                    break;
+                }
+            fprintf(f, "  thread root=%llu cid=%llu replies=%u unread=%u follow=%u at=%.0f,%.0f\n",
+                    (unsigned long long)m->threads[i].root_id,
+                    (unsigned long long)m->threads[i].channel_id,
+                    m->threads[i].reply_count, m->threads[i].unread,
+                    m->threads[i].following, cx, cy);
+        }
     }
     fprintf(f, "sbsel=%d\n", g_n_sbsel);
     fprintf(f, "shelf n=%d", g_n_shelf);
@@ -14427,6 +15132,20 @@ static void test_poll(HWND hwnd) {
             ac_rebuild();
             test_ack("ok");
         }
+    } else if (!strcmp(verb, "dirfind")) {
+        /* Drive the People pane's search box (REQ-289). Through the control, so
+         * the EN_CHANGE path the user's typing takes is the one under test — the
+         * palette verb sets its box the same way. */
+        if (g_dir_edit) {
+            WCHAR w[80]; to_w(arg, w, 80);
+            SetWindowTextW(g_dir_edit, w);
+            /* SetWindowText does not reliably raise EN_CHANGE for a control the
+             * app owns, so the notification is posted explicitly rather than
+             * assumed — the alternative is a verb that sets a box nothing reads. */
+            SendMessageW(hwnd, WM_COMMAND,
+                         MAKEWPARAM(0xF5, EN_CHANGE), (LPARAM)g_dir_edit);
+            test_ack("ok");
+        } else test_ack("err");
     } else if (!strcmp(verb, "upload")) {
         /* Bypass the file dialog so an attachment can be posted from the harness. */
         if (g_client && g_sel && arg[0]) { oc_client_upload(g_client, g_sel, arg); test_ack("ok"); }
@@ -14804,12 +15523,16 @@ static void test_poll(HWND hwnd) {
                 !strcmp(arg, "activity") ? VIEW_ACTIVITY :
                 !strcmp(arg, "files")    ? VIEW_FILES :
                 !strcmp(arg, "later")    ? VIEW_LATER :
+                !strcmp(arg, "threads")  ? VIEW_THREADS :
+                !strcmp(arg, "people")   ? VIEW_DIRECTORY :
                 !strcmp(arg, "drafts")   ? VIEW_DRAFTS :
                 !strcmp(arg, "newmsg")   ? VIEW_NEWMSG :
                 !strcmp(arg, "admin")    ? VIEW_ADMIN : atoi(arg);
         if (v >= 0 && v < VIEW_COUNT) {
             g_view = v; layout_composer(hwnd);
             if (v == VIEW_ACTIVITY) oc_client_list_activity(g_client, act_wire_filter());
+            if (v == VIEW_THREADS)  oc_client_list_threads(g_client,
+                                        g_threads_unread ? OC_THREADF_UNREAD : OC_THREADF_ALL);
             if (v == VIEW_LATER)  { g_later_chan = 0; oc_client_list_saved(g_client); }
             if (v == VIEW_FILES)  { g_file_chan = 0; g_filelist_from_view = 1;
                                     oc_client_list_files(g_client, 0);
@@ -14890,6 +15613,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         composer_create(hwnd);
         find_create(hwnd);
         files_find_create(hwnd);
+        dir_find_create(hwnd);
         search_create(hwnd);
         g_pal_edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL,
             0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)0xF4, GetModuleHandleW(NULL), NULL);
@@ -15414,6 +16138,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
+        if (g_dir_edit && (HWND)lp == g_dir_edit && HIWORD(wp) == EN_CHANGE) {
+            WCHAR w[80]; GetWindowTextW(g_dir_edit, w, 80);
+            WideCharToMultiByte(CP_UTF8, 0, w, -1, g_dir_filter, sizeof g_dir_filter, NULL, NULL);
+            g_ovl_scroll = 0;          /* a new query starts at the top */
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         if (g_find && (HWND)lp == g_find && HIWORD(wp) == EN_CHANGE) {
             WCHAR w[64]; GetWindowTextW(g_find, w, 64);
             char b[128]; WideCharToMultiByte(CP_UTF8, 0, w, -1, b, sizeof b, NULL, NULL);
@@ -15426,7 +16157,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         /* The find box and the sign-in fields both sit on the OC_COL_INPUT
          * surface the D2D chrome paints under them, so they share a brush. */
         if ((HWND)lp == g_find || (HWND)lp == g_srch || (HWND)lp == g_pick_edit ||
-            (HWND)lp == g_ffind ||
+            (HWND)lp == g_ffind || (HWND)lp == g_dir_edit ||
             (HWND)lp == g_pal_edit ||
             (HWND)lp == g_si_e_ws ||
             (HWND)lp == g_si_e_user || (HWND)lp == g_si_e_pass) {
@@ -15444,6 +16175,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         wpt.x = (LONG)DIPF(wpt.x); wpt.y = (LONG)DIPF(wpt.y);
         float dy = (float)GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 48.0f;
         const oc_model *wm = model();
+        if (g_tp_open) {   /* the open dropdown owns the wheel, as a dropdown does */
+            g_tp_scroll -= dy;
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         if (transcript_shell() && wpt.x >= (int)RAIL_W && wpt.x < (int)(RAIL_W + SIDEBAR_W)) {
             float maxs = g_sb_content > g_sb_view ? g_sb_content - g_sb_view : 0;
             g_sb_scroll -= dy;

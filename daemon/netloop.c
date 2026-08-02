@@ -1355,6 +1355,34 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_LIST_THREADS) {
+            oc_list_threads lt;
+            if (oc_decode_list_threads(&p, &lt) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_LIST_THREADS, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->thread_filter = lt.filter;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_SET_THREAD_FOLLOW) {
+            oc_set_thread_follow tf;
+            if (oc_decode_set_thread_follow(&p, &tf) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_THREAD_FOLLOW, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->parent_id = tf.root_id;
+            j->channel_id = tf.channel_id; j->follow_on = tf.on;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
+        if (hdr.msg_type == OC_MSG_MARK_THREAD_READ) {
+            oc_mark_thread_read mr;
+            if (oc_decode_mark_thread_read(&p, &mr) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_MARK_THREAD_READ, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->parent_id = mr.root_id; j->message_id = mr.up_to;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SET_KEYWORDS) {
             oc_slice terms[OC_MAX_KEYWORDS]; uint8_t n = 0;
             if (oc_decode_set_keywords(&p, terms, OC_MAX_KEYWORDS, &n) != OC_OK) return -1;
@@ -2198,6 +2226,10 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             ents[i].email = oc_slice_str(r->ulist[i].email ? r->ulist[i].email : "");
             ents[i].display_name = oc_slice_str(r->ulist[i].display_name ? r->ulist[i].display_name : "");
             ents[i].avatar_id = r->ulist[i].avatar_id;      /* WIN-47 */
+            ents[i].title = oc_slice_str(r->ulist[i].title ? r->ulist[i].title : "");
+            ents[i].timezone = oc_slice_str(r->ulist[i].timezone ? r->ulist[i].timezone : "");
+            ents[i].status_emoji = oc_slice_str(r->ulist[i].status_emoji ? r->ulist[i].status_emoji : "");
+            ents[i].status_text = oc_slice_str(r->ulist[i].status_text ? r->ulist[i].status_text : "");
         }
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_user_list ul = { (uint16_t)n, ents };
@@ -2973,6 +3005,45 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
                 if (c && c->authed && c->user_id == r->user_id)
                     send_bytes(ep, conns, fd, g_enc, al);
             }
+        }
+        break;
+    }
+    case OC_RES_THREAD_LIST: {
+        conn *c = find_by_id(conns, r->conn_id);
+        if (!c) return;
+        for (size_t i = 0; i < r->n_threads && conns[c->fd]; i++) {
+            const oc_thread_row *t = &r->threads[i];
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_thread_summary ts = { t->root_id, t->channel_id, t->root_author,
+                                     t->root_at, t->last_reply_at, t->reply_count,
+                                     t->unread, t->following,
+                                     oc_slice_str(t->preview ? t->preview : "") };
+            oc_encode_thread_summary(&w, OC_PROTOCOL_VERSION, &ts);
+            send_bytes(ep, conns, c->fd, g_enc, w.len);
+        }
+        if (!conns[c->fd]) break;
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_threads term = { (uint32_t)r->n_threads };
+        oc_encode_threads(&w, OC_PROTOCOL_VERSION, &term);
+        send_bytes(ep, conns, c->fd, g_enc, w.len);
+        break;
+    }
+    case OC_RES_THREAD_ONE: {
+        /* The one row that changed, to every one of the user's connections: a
+         * follow or a read mark is a fact about them, not about this device. */
+        if (!r->n_threads) break;
+        const oc_thread_row *t = &r->threads[0];
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_thread_summary ts = { t->root_id, t->channel_id, t->root_author,
+                                 t->root_at, t->last_reply_at, t->reply_count,
+                                 t->unread, t->following,
+                                 oc_slice_str(t->preview ? t->preview : "") };
+        oc_encode_thread_summary(&w, OC_PROTOCOL_VERSION, &ts);
+        size_t len = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && c->user_id == r->user_id)
+                send_bytes(ep, conns, fd, g_enc, len);
         }
         break;
     }
