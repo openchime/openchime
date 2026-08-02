@@ -308,17 +308,17 @@ typedef enum {
     OC_ERR_UNKNOWN_MESSAGE     = 3007, /* no such message in the channel (edit/delete) */
     OC_ERR_INVALID_CHANNEL     = 3008, /* bad channel name on CREATE_CHANNEL (empty/too long) */
     OC_ERR_INVALID_REACTION    = 3009, /* empty/oversized emoji on REACT */
-    OC_ERR_INVALID_MESSAGE     = 3014, /* nothing to send: an empty body (REQ-224) */
     OC_ERR_ATTACHMENT_TOO_LARGE = 3010, /* upload exceeds MAX_ATTACHMENT_SIZE (REQ-140) */
     OC_ERR_UNKNOWN_ATTACHMENT  = 3011, /* no such attachment, or not finalized (REQ-141) */
     OC_ERR_STORAGE_FULL        = 3012, /* upload refused: below the DB reserve (REQ-216) */
     OC_ERR_ATTACHMENT_GONE     = 3013, /* reclaimed by age or storage pressure (REQ-215/217) */
+    OC_ERR_INVALID_DEVICE_TOKEN = 3014, /* empty token or unknown platform on REGISTER_DEVICE_TOKEN */
     OC_ERR_TRANSFER_PROTOCOL   = 3015, /* out-of-order/oversized chunk or bad transfer state */
     OC_ERR_UNKNOWN_WEBHOOK     = 3016, /* no such (or disabled) incoming webhook token (REQ-170) */
     OC_ERR_CHANNEL_EXISTS      = 3017, /* a channel of that name already exists (names are unique, case-insensitively) */
     OC_ERR_TOO_MANY_PINS       = 3018, /* channel already holds OC_MAX_PINS pins (REQ-230) */
     OC_ERR_CHANNEL_ARCHIVED    = 3019, /* channel is archived: read-only (REQ-035) */
-    OC_ERR_INVALID_DEVICE_TOKEN = 3014, /* empty token or unknown platform on REGISTER_DEVICE_TOKEN */
+    OC_ERR_INVALID_MESSAGE     = 3020, /* nothing to send: an empty body (REQ-224) */
     OC_ERR_INTERNAL            = 9001
 } oc_reason_code;
 

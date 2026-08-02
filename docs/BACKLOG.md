@@ -149,6 +149,27 @@ a real ambiguity the moment a client renders either code. **Verified** —
 adversarial refutation attempt, 2026-08-02, could not construct a reachable
 collision.
 
+**FIXED 2026-08-02.** `INVALID_MESSAGE` moves to **3020**, the next free value.
+It was the newer of the two — added 2026-08-01 with scheduled messages, reusing
+a number `INVALID_DEVICE_TOKEN` had held since 2026-07-24 — so the newcomer
+yields. Both were also sitting out of numeric order in the enum, which is the
+tell that they were inserted rather than placed; the block is ordered again.
+
+**A test now makes the defect impossible to reintroduce**, because the reason it
+happened is that nothing was checking. `test_reason_codes_unique` compares every
+pair of the 30 reason codes and names both sides of any collision. It is listed
+explicitly rather than derived — C cannot enumerate an enum, and a test that
+walked a numeric range would pass for a code nobody remembered to add — and a
+check verifies the list covers every enum member, so an omission is visible.
+
+**The check was proved to fail before it was trusted:** putting
+`INVALID_MESSAGE` back to 3014 turns the suite red with
+`FAIL reason code 3014 is both INVALID_DEVICE_TOKEN and INVALID_MESSAGE`, and
+restoring 3020 turns it green.
+
+No protocol version bump: the `ERROR` frame's layout is unchanged, and §8's
+design already has clients categorising an unrecognised code by its 3000-range.
+
 ## 7. Two message-type opcodes are used twice each
 
 `PROFILE_INFO` and `TYPING` are both `0x0072`; `LIST_FILE_CHANNELS` and

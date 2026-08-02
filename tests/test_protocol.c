@@ -1181,9 +1181,68 @@ static void test_storage_status_frames(void) {
     CHECK(h.msg_type == OC_MSG_STORAGE_STATUS_REQ);
 }
 
+/* Every reason code is distinct.
+ *
+ * This exists because they were not. INVALID_MESSAGE (REQ-224) was added in
+ * 2026-08 reusing 3014, which REGISTER_DEVICE_TOKEN's INVALID_DEVICE_TOKEN had
+ * held since 2026-07 -- so one number meant two things and a client reading the
+ * ERROR frame could not tell which. Nothing caught it because nothing looked.
+ *
+ * Listed explicitly rather than derived: an enum cannot be enumerated in C, and
+ * a test that walks a range would pass for a code nobody remembered to add. A
+ * new reason code belongs in this array, and the compiler says nothing if it is
+ * missing -- but the next duplicate does not reach the wire.
+ */
+static void test_reason_codes_unique(void) {
+    static const struct { const char *name; int code; } codes[] = {
+        { "MALFORMED_FRAME",        OC_ERR_MALFORMED_FRAME },
+        { "VERSION_TOO_OLD",        OC_ERR_VERSION_TOO_OLD },
+        { "VERSION_TOO_NEW",        OC_ERR_VERSION_TOO_NEW },
+        { "UNEXPECTED_MSG_TYPE",    OC_ERR_UNEXPECTED_MSG_TYPE },
+        { "FRAME_TOO_LARGE",        OC_ERR_FRAME_TOO_LARGE },
+        { "AUTH_INVALID_TOKEN",     OC_ERR_AUTH_INVALID_TOKEN },
+        { "AUTH_REQUIRED",          OC_ERR_AUTH_REQUIRED },
+        { "AUTH_RATE_LIMITED",      OC_ERR_AUTH_RATE_LIMITED },
+        { "USER_LIMIT",             OC_ERR_USER_LIMIT },
+        { "UNKNOWN_CHANNEL",        OC_ERR_UNKNOWN_CHANNEL },
+        { "NOT_A_MEMBER",           OC_ERR_NOT_A_MEMBER },
+        { "BODY_TOO_LARGE",         OC_ERR_BODY_TOO_LARGE },
+        { "SEND_RATE_LIMITED",      OC_ERR_SEND_RATE_LIMITED },
+        { "FORBIDDEN",              OC_ERR_FORBIDDEN },
+        { "LAST_OWNER",             OC_ERR_LAST_OWNER },
+        { "UNKNOWN_MESSAGE",        OC_ERR_UNKNOWN_MESSAGE },
+        { "INVALID_CHANNEL",        OC_ERR_INVALID_CHANNEL },
+        { "INVALID_REACTION",       OC_ERR_INVALID_REACTION },
+        { "ATTACHMENT_TOO_LARGE",   OC_ERR_ATTACHMENT_TOO_LARGE },
+        { "UNKNOWN_ATTACHMENT",     OC_ERR_UNKNOWN_ATTACHMENT },
+        { "STORAGE_FULL",           OC_ERR_STORAGE_FULL },
+        { "ATTACHMENT_GONE",        OC_ERR_ATTACHMENT_GONE },
+        { "INVALID_DEVICE_TOKEN",   OC_ERR_INVALID_DEVICE_TOKEN },
+        { "TRANSFER_PROTOCOL",      OC_ERR_TRANSFER_PROTOCOL },
+        { "UNKNOWN_WEBHOOK",        OC_ERR_UNKNOWN_WEBHOOK },
+        { "CHANNEL_EXISTS",         OC_ERR_CHANNEL_EXISTS },
+        { "TOO_MANY_PINS",          OC_ERR_TOO_MANY_PINS },
+        { "CHANNEL_ARCHIVED",       OC_ERR_CHANNEL_ARCHIVED },
+        { "INVALID_MESSAGE",        OC_ERR_INVALID_MESSAGE },
+        { "INTERNAL",               OC_ERR_INTERNAL },
+    };
+    const size_t n = sizeof codes / sizeof codes[0];
+    for (size_t i = 0; i < n; i++) {
+        for (size_t j = i + 1; j < n; j++) {
+            if (codes[i].code == codes[j].code)
+                printf("  FAIL reason code %d is both %s and %s\n",
+                       codes[i].code, codes[i].name, codes[j].name);
+            CHECK(codes[i].code != codes[j].code);
+        }
+    }
+    /* The specific collision this test was written for. */
+    CHECK(OC_ERR_INVALID_MESSAGE != OC_ERR_INVALID_DEVICE_TOKEN);
+}
+
 int run_protocol_tests(void) {
     printf("test_protocol: primitives, handshake, auth, messaging, backfill,\n");
     printf("               error, size limits, malformed frames, version negotiation\n");
+    test_reason_codes_unique();
     test_primitives();
     test_handshake_frames();
     test_auth_frames();
