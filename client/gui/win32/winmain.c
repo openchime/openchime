@@ -3302,11 +3302,16 @@ static void draw_day_sep(ID2D1RenderTarget *rt, uint64_t ms, D2D1_RECT_F reg, fl
             tw = tm.widthIncludingTrailingWhitespace;
         IDWriteTextLayout_Release(l);
     }
-    float gap = tw / 2 + 14;
-    fill(rt, rf(reg.left + 40, cy, cx - gap, cy + 1), OC_COL_BORDER);
-    fill(rt, rf(cx + gap, cy, reg.right - 40, cy + 1), OC_COL_BORDER);
+    /* The rule runs the FULL width and the label sits on it in a pill, as
+     * Slack's does — breaking the line around bare text left the date looking
+     * like a stray word in the transcript rather than a marker on a divider. */
+    fill(rt, rf(reg.left + 24, cy, reg.right - 24, cy + 1), OC_COL_BORDER);
+    D2D1_RECT_F pill = rf(cx - tw / 2 - 12, y + 2, cx + tw / 2 + 12, y + SEP_H - 2);
+    fill_round(rt, pill, (pill.bottom - pill.top) / 2, OC_COL_BASE);
+    stroke_round(rt, pill, (pill.bottom - pill.top) / 2, OC_COL_BORDER, 1.0f);
     IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, lbl, g_meta, rf(reg.left, y + 5, reg.right, y + SEP_H - 3), OC_COL_MUTED);
+    draw_text(rt, lbl, g_meta, rf(pill.left, pill.top + 2, pill.right, pill.bottom),
+              OC_COL_MUTED);
     IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 
@@ -8394,10 +8399,17 @@ static void newmsg_send(HWND hwnd) {
  * starts the thing the pane is empty of. The illustration is the part we cannot
  * match without shipping artwork, and a grey line of text where Slack has a
  * pencil is a worse pane than one that at least tells you what goes here. */
-static void draw_empty_state(ID2D1RenderTarget *rt, D2D1_RECT_F body,
+/* `icon` is an OC_ICON_* drawn large and faint above the title — the native
+ * stand-in for the illustration Slack puts here. An empty pane with two lines of
+ * grey text and nothing else reads as a pane that failed to load. */
+static void draw_empty_state(ID2D1RenderTarget *rt, D2D1_RECT_F body, int icon,
                              const char *title, const char *sub, const char *cta,
                              D2D1_RECT_F *out_btn) {
     float cy = (body.top + body.bottom) / 2 - 40;
+    if (icon >= 0) {
+        float cxm = (body.left + body.right) / 2;
+        draw_lucide(rt, icon, rf(cxm - 22, cy - 62, cxm + 22, cy - 18), OC_COL_BORDER);
+    }
     IDWriteTextFormat_SetTextAlignment(g_display, DWRITE_TEXT_ALIGNMENT_CENTER);
     IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
     draw_text(rt, title, g_display, rf(body.left, cy, body.right, cy + 28), OC_COL_TEXT);
@@ -8613,7 +8625,7 @@ static void draw_threads(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
         return;
     }
     if (!m->n_threads) {
-        draw_empty_state(rt, body,
+        draw_empty_state(rt, body, OC_ICON_DMS,
                          g_threads_unread ? "No unread replies"
                                           : "You are not in any threads yet",
                          g_threads_unread
@@ -8746,7 +8758,8 @@ static void draw_drafts(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
     float rowh = 62.0f;
     if (g_dtab == DTAB_DRAFTS) {
         if (m->n_drafts == 0) {
-            draw_empty_state(rt, body, "Draft messages to send when you\u2019re ready",
+            draw_empty_state(rt, body, OC_ICON_SQUARE_PEN,
+                             "Draft messages to send when you\u2019re ready",
                              "Start typing a message anywhere, then find it here. "
                              "Re-read, revise, and send whenever you\u2019d like.",
                              "New Message", &g_dnew_btn);
@@ -8782,7 +8795,7 @@ static void draw_drafts(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
 
     if (g_dtab == DTAB_SCHEDULED) {
         if (m->n_scheds == 0) {
-            draw_empty_state(rt, body, "Write now, send later",
+            draw_empty_state(rt, body, OC_ICON_BELL, "Write now, send later",
                              "Schedule messages to be sent at a later time, or another "
                              "day altogether. They\u2019ll wait here until they\u2019re delivered.",
                              "New Message", &g_dnew_btn);
@@ -8841,7 +8854,7 @@ static void draw_drafts(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
      * showing"; the Sent tab issues one when it opens (see the click handler),
      * so an empty list with the flag down means there is genuinely nothing. */
     if (!m->search_open && m->n_search == 0) {
-        draw_empty_state(rt, body, "Nothing sent yet",
+        draw_empty_state(rt, body, OC_ICON_SEND, "Nothing sent yet",
                          "Messages you send will be listed here, newest first.", NULL, NULL);
         return;
     }

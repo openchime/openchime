@@ -32,7 +32,7 @@ pattern REQ-221 and REQ-230 both followed.
 | # | Item | Blocked on |
 |---|---|---|
 
-## WIN-107 — a visual pass over the whole shell
+## WIN-107 — a visual pass over the whole shell (CLOSED)
 
 **First pass done 2026-08-02**, screen by screen against the running client, with
 Slack as the reference rather than taste. What it found and fixed:
@@ -74,7 +74,15 @@ the same, growing downward as you type. The New Message pane had its own
 arrangement with Send outside the box; it is the same control, so it is drawn the
 same way.
 
-**Still open in this item:** the transcript's day divider, and empty-state art.
+**Third pass.** The day divider was a hairline broken around bare text, which
+read as a stray word in the transcript; it is a full-width rule with the date in a
+pill sitting on it, as Slack's is. Empty states get a large faint icon above the
+title — the native stand-in for Slack's illustrations, and the difference between
+"nothing here yet" and "this pane failed to load".
+
+**Closed 2026-08-02.** Three passes, each verified against the running client and
+the suite. Anything found later is a new id, not a reopening of this one — the
+point of the item was the sweep, and the sweep happened.
 
 ## WIN-110 — AutomationIds on every actionable element (REQ-290)
 
@@ -159,7 +167,7 @@ by itself decide where that suite runs; that is the CI-agent question.
 
 ## What "closed" does and does not mean
 
-WIN-1 … WIN-109 are done (WIN-92, WIN-94, WIN-108 and WIN-109 landed 2026-08-02) —
+WIN-1 … WIN-109 are done (WIN-92, WIN-94, WIN-107, WIN-108 and WIN-109 landed 2026-08-02) —
 accessibility included, built *for* the custom controls rather than by retreating
 to native ones (ARCH-99), and rich text with its toolbar as of 2026-07-31. The
 items below are each blocked on a daemon requirement or an ARCH decision, or, in
