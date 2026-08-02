@@ -93,6 +93,21 @@ does not check a pinned hash.
 *Impact:* a supply-chain hardening opportunity. The transport is authenticated;
 the artifact is not. **Verified** — VENDORS.md §2 records it.
 
+**FIXED 2026-08-02.** Both fetch scripts — the host one and the Windows
+cross-compile one, which had the same gap — verify the tarball's SHA-256 before
+unpacking. The expected value is not one I computed from my own download: it is
+the digest **upstream publishes** in the `mbedtls-3.6.2-sha256sum.txt` release
+asset, and our download matched it exactly. An unknown `MBEDTLS_VERSION` is
+refused rather than fetched unverified.
+
+Tested on all three paths, because a check that has never failed is a comment:
+the real tarball is accepted; a tampered copy is **rejected and deleted**
+(mismatch reported with both digests); an unpinned version exits with the
+command that retrieves the upstream sum. Then end to end — the existing tree was
+moved aside and `scripts/build_mbedtls.sh` re-fetched, verified, patched in
+`MBEDTLS_THREADING_C` and built all three static libraries, after which the
+daemon rebuilt and `make test` passed against them.
+
 ## 5. The Windows binary ships unstripped
 
 make windows-gui ships a 4.4 MB unstripped binary; the Makefile never strips.

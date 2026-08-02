@@ -60,8 +60,13 @@ tarball into `third_party/mbedtls-3.6.2/` (gitignored). Version pinned by
 (`libmbedtls/libmbedx509/libmbedcrypto.a`) with **`MBEDTLS_THREADING`** enabled —
 the client runs a TLS network thread per connection and the tests drive several
 TLS clients concurrently, which races without it (see docs/TLS.md).
-**Supply-chain note:** the fetch trusts GitHub over TLS and does **not** verify a
-pinned checksum — a hardening opportunity.
+**The tarball is checksum-verified before it is unpacked.** Both fetch scripts
+carry the known-good SHA-256 for the pinned version — the value upstream
+publishes in the `mbedtls-<version>-sha256sum.txt` asset beside the release — and
+refuse a mismatch, deleting the bad file rather than extracting it. Bumping
+`MBEDTLS_VERSION` without supplying a matching sum is **refused**, not fetched
+unverified: the script prints the `curl` that retrieves the upstream sum and
+exits. Override for a new version with `MBEDTLS_SHA256=<sum>`.
 
 ## 3. System / OS packages (linked at build)
 
