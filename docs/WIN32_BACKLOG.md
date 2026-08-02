@@ -66,9 +66,15 @@ Slack as the reference rather than taste. What it found and fixed:
   2px ring instead of hanging off its corner (it read as an artifact, not a
   status).
 
-**Still open in this item:** the transcript's gutters and day divider, the
-composer's two toolbar rows, and empty-state art. They need the same treatment and
-did not get it here.
+**Second pass, same day — the composer.** It had the action buttons BESIDE the
+field, so the text was one line tall whatever the box did and a third of a narrow
+window went to chrome. Slack's composer is three bands — formatting toolbar, the
+text at full width, then the action row with send at its right — and ours is now
+the same, growing downward as you type. The New Message pane had its own
+arrangement with Send outside the box; it is the same control, so it is drawn the
+same way.
+
+**Still open in this item:** the transcript's day divider, and empty-state art.
 
 ## WIN-110 — AutomationIds on every actionable element (REQ-290)
 

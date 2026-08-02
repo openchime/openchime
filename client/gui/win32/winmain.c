@@ -134,12 +134,18 @@ static UINT dpi_for_window(HWND hwnd) {
  * origin, the growth measurement — has to ask it and get the same answer. */
 static int composer_toolbar_on(void);          /* fwd */
 static float composer_tb(void) { return composer_toolbar_on() ? COMPOSER_TB : 0.0f; }
+/* The action row lives BELOW the text, which is Slack's shape and the reason the
+ * text can be the full width of the box: buttons beside the field took a third of
+ * a narrow window away from the thing you are actually typing into, and made the
+ * field one line tall whatever the box did. */
+#define COMPOSER_ACTIONS 38.0f
 static float composer_chrome(void) {
-    return COMPOSER_MT + composer_tb() + COMPOSER_PAD * 2 + COMPOSER_MB;
+    return COMPOSER_MT + composer_tb() + COMPOSER_PAD * 2 + COMPOSER_ACTIONS + COMPOSER_MB;
 }
-#define COMPOSER_CHROME (COMPOSER_MT + COMPOSER_TB + COMPOSER_PAD * 2 + COMPOSER_MB)
-/* Resting height: one line, but never shorter than the buttons need. */
-#define COMPOSER_H      (COMPOSER_CHROME + COMPOSER_BTN)
+#define COMPOSER_CHROME (COMPOSER_MT + COMPOSER_TB + COMPOSER_PAD * 2 + COMPOSER_ACTIONS + COMPOSER_MB)
+/* Resting height: one line of text. The buttons no longer set a floor, having
+ * moved out of the field's row. */
+#define COMPOSER_H      (COMPOSER_CHROME + 22.0f)
 static float g_composer_h = COMPOSER_H;
 
 /* The box's inner height — what the text and the buttons share. */
@@ -6498,10 +6504,10 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     if (composer_toolbar_on()) draw_fmt_toolbar(rt, bx0, by0, bx1);
     else { for (int i = 0; i < FMT_COUNT; i++) g_fmt_btn[i] = rf(0, 0, 0, 0); g_fmt_hover = -1; }
 
-    /* Buttons sit on the box's bottom line. At rest that is also its middle,
-     * so a one-line composer reads as a single centred row. */
+    /* The ACTION ROW, along the bottom of the box under the text — Slack's
+     * arrangement. The field above it is the full width of the box. */
     float sq = COMPOSER_BTN;
-    float cy = by1 - COMPOSER_PAD - sq;
+    float cy = by1 - COMPOSER_PAD + (COMPOSER_ACTIONS - sq) / 2 - COMPOSER_ACTIONS;
 
     g_attach_btn = rf(bx0 + 6, cy, bx0 + 6 + sq, cy + sq);
     draw_lucide(rt, OC_ICON_PLUS, rf(g_attach_btn.left + 8, g_attach_btn.top + 8,
@@ -6527,12 +6533,11 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
      * layout_composer computed — the same rect ed_hit tests against, so what you
      * click is what you see. */
     {
-        float tx = bx0 + 6 + sq * 3 + 8, tr = bx1 - 6 - sq - 30;   /* room for the chevron */
+        float tx = bx0 + COMPOSER_PAD, tr = bx1 - COMPOSER_PAD;
         float inner = composer_inner_h();
         float lh = ed_line_h();
-        float texth = inner > COMPOSER_BTN ? inner : lh;
-        float ty = by0 + composer_tb() + COMPOSER_PAD +
-                   (inner > COMPOSER_BTN ? 0.0f : (COMPOSER_BTN - lh) / 2);
+        float texth = inner > lh ? inner : lh;
+        float ty = by0 + composer_tb() + COMPOSER_PAD;
         ed_draw(rt, rf(tx, ty, tr, ty + texth));
     }
 
@@ -8251,26 +8256,42 @@ static void draw_newmsg(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
     /* The composer sits below whatever the picker's list took, so an open list
      * pushes it down rather than covering it. */
     float ey = tobox.top + grew + 16;
-    float eh = 120;
+    float eh = 150;   /* toolbar + text + the action row */
     D2D1_RECT_F edbox = rf(body.left + pad, ey, body.right - pad, ey + eh);
     fill_round(rt, edbox, 8.0f, OC_COL_INPUT);
     stroke_round(rt, edbox, 8.0f, g_nm_to_focus ? OC_COL_BORDER : OC_COL_ACCENT, 1.0f);
     if (composer_toolbar_on()) draw_fmt_toolbar(rt, edbox.left, edbox.top, edbox.right);
-    g_nm_ed = rf(edbox.left + 12, edbox.top + composer_tb() + 8,
-                 edbox.right - 12, edbox.bottom - 12);
+    /* The same three bands as the conversation composer — toolbar, text, actions
+     * — because it is the same control. Send sat OUTSIDE the box here, which made
+     * the two look like different things doing the same job (WIN-107). */
+    g_nm_ed = rf(edbox.left + COMPOSER_PAD, edbox.top + composer_tb() + 8,
+                 edbox.right - COMPOSER_PAD, edbox.bottom - COMPOSER_ACTIONS - 6);
     ed_draw(rt, g_nm_ed);
     if (!ed_len() && !g_nm_to_focus)
         draw_text(rt, "Start a new message", g_body,
                   rf(g_nm_ed.left, g_nm_ed.top, g_nm_ed.right, g_nm_ed.top + 22), OC_COL_FAINT);
 
     int ready = (g_n_tgt_chip > 0 && ed_len() > 0);
-    g_nm_send = rf(body.right - pad - 120, edbox.bottom + 12, body.right - pad, edbox.bottom + 48);
-    fill_round(rt, g_nm_send, 6.0f, ready ? OC_COL_ACCENT : OC_COL_INPUT);
-    if (!ready) stroke_round(rt, g_nm_send, 6.0f, OC_COL_BORDER, 1.0f);
-    IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_CENTER);
-    draw_text(rt, "Send", g_ui, rf(g_nm_send.left, g_nm_send.top + 8, g_nm_send.right, g_nm_send.bottom),
-              ready ? 0xFFFFFF : OC_COL_FAINT);
-    IDWriteTextFormat_SetTextAlignment(g_ui, DWRITE_TEXT_ALIGNMENT_LEADING);
+    {
+        float sq = COMPOSER_BTN;
+        float cy = edbox.bottom - COMPOSER_PAD + (COMPOSER_ACTIONS - sq) / 2 - COMPOSER_ACTIONS + 6;
+        /* Chrome only: the pane's attach/emoji/mention wiring is the conversation
+         * composer's, and it needs a channel — which this pane does not have until
+         * you have chosen one. Drawn so the control reads the same in both places,
+         * greyed so it does not promise what it cannot do here. */
+        for (int i = 0; i < 3; i++) {
+            static const int IC[3] = { OC_ICON_PLUS, OC_ICON_SMILE, OC_ICON_AT };
+            D2D1_RECT_F b = rf(edbox.left + 6 + sq * i, cy, edbox.left + 6 + sq * (i + 1), cy + sq);
+            draw_lucide(rt, IC[i], rf(b.left + 8, b.top + 8, b.right - 8, b.bottom - 8),
+                        OC_COL_FAINT);
+        }
+        g_nm_send = rf(edbox.right - 6 - sq, cy, edbox.right - 6, cy + sq);
+        fill_round(rt, g_nm_send, 8.0f, ready ? OC_COL_ACCENT : OC_COL_INPUT);
+        if (!ready) stroke_round(rt, g_nm_send, 8.0f, OC_COL_BORDER, 1.0f);
+        draw_lucide(rt, OC_ICON_SEND, rf(g_nm_send.left + 8, g_nm_send.top + 8,
+                                         g_nm_send.right - 8, g_nm_send.bottom - 8),
+                    ready ? 0xFFFFFF : OC_COL_FAINT);
+    }
 }
 
 /* The pane's own draft (REQ-229, ARCH-101 as amended): channel 0, recipients
@@ -10619,7 +10640,8 @@ static int composer_remeasure(void) {
         if (lines < 1) lines = 1;
         if (lines > COMPOSER_MAX_LINES) lines = COMPOSER_MAX_LINES;
         float th = (float)lines * ed_line_h();
-        want = composer_chrome() + (th > COMPOSER_BTN ? th : COMPOSER_BTN);
+        float lh = ed_line_h();
+        want = composer_chrome() + (th > lh ? th : lh);
     }
     if (want == g_composer_h) return 0;
     g_composer_h = want;
@@ -10703,17 +10725,18 @@ static void layout_composer(HWND hwnd) {
     /* The field sits between the left buttons and Send. Its height is the text,
      * top-aligned once the box is taller than one line so growth reads
      * downward; at rest it is centred against the buttons. */
-    float sq = COMPOSER_BTN;
-    float tx = bx0 + 6 + sq * 3 + 8, tr = bx1 - 6 - sq - 30;   /* room for the chevron */
+    /* Full width of the box, inset by the padding: the buttons are on their own
+     * row underneath now, so nothing shares this line with the text. */
+    float tx = bx0 + COMPOSER_PAD, tr = bx1 - COMPOSER_PAD;
     float inner = composer_inner_h();
-    float texth = inner > COMPOSER_BTN ? inner : ed_line_h();
+    float lh0 = ed_line_h();
+    float texth = inner > lh0 ? inner : lh0;
     /* The toolbar row owns the top of the box (WIN-96); the field starts under
      * it. Both this and draw_composer offset by the same constant, which is the
      * pairing that has to stay true — the rect ed_hit tests against is the one
      * ed_draw paints into, and a toolbar added to only one of them would put the
      * caret a row away from the text. */
-    float ty = by0 + composer_tb() + COMPOSER_PAD +
-               (inner > COMPOSER_BTN ? 0.0f : (COMPOSER_BTN - ed_line_h()) / 2);
+    float ty = by0 + composer_tb() + COMPOSER_PAD;
     /* Never hand back an inverted rect. members_w() should have prevented it, but
      * `right < left` is the one shape every consumer of this box gets wrong
      * silently: ed_hit matches nothing, ed_draw clips to nothing, and the dump's
