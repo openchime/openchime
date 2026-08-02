@@ -106,9 +106,14 @@ and `>` to be sent as `&amp;`, `&lt;`, `&gt;`, and wraps links as
 adopting them would be actively harmful here: our bodies are plain UTF-8
 (REQ-054) that FTS5 indexes directly, so entity-encoding would put `&amp;` into
 the search index and into every client that renders the body literally, and a
-user typing `<` in ordinary prose would see it mangled. URLs are detected by
-**autolinking** instead (REQ-222's unfurl already works from the bare URL), and
-`&`, `<`, `>` are ordinary characters.
+user typing `<` in ordinary prose would see it mangled. So `&`, `<` and `>` are
+ordinary characters and a URL is ordinary text.
+
+**A URL is not a construct.** The parser emits no link span — `OC_RT_*`
+(`client/core/richtext.h`) covers bold, italic, strike, code, code block, quote,
+bullet and ordered list, and nothing else — so no client detects, styles or
+opens a URL, and no client fetches a preview for one. Autolinking and REQ-222's
+unfurl are both unbuilt; they are backlog items, not properties of this dialect.
 
 **No underline.** Slack's toolbar offers it; its `mrkdwn` has no syntax for it,
 and an underline is indistinguishable from a link in most renderings.

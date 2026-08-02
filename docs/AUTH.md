@@ -74,10 +74,11 @@ authority.
   plaintext password in the `AUTH` frame is acceptable on the wire; it is never
   stored.
 - **Bootstrapping the first owner:** the initial account (tenant **owner**) is
-  created at first run from a one-time **setup token** — a value in the config
-  file, or printed once to the daemon's log. This avoids the chicken-and-egg of
-  "you need an admin to create the first admin" without requiring email
-  (air-gapped-safe).
+  created at first run from a one-time **setup token**. There is no config file
+  and no configuration variable for it (ARCH-26): the daemon **mints** the token
+  itself when a local-mode first run finds no owner, and prints it once to
+  stderr. This avoids the chicken-and-egg of "you need an admin to create the
+  first admin" without requiring email (air-gapped-safe).
 - **Adding users:** an owner/admin creates an account and issues an **invite
   token**; the invitee sets their password by presenting the token. Email
   magic-link delivery is an optional future enhancement, never required.
@@ -259,7 +260,7 @@ reverse, ARCH-56) to prove possession of the private key and activate the bindin
 The enrolled audience then feeds the OIDC configuration above (§3.4) automatically,
 so an enrolled box need not be given `OPENCHIME_OIDC_AUDIENCE` by hand. The enrollment
 *flow/registry* remains a control-plane concern; only the client half is here.
-Two optional knobs support unattended bring-up (see [DEMO.md](./DEMO.md)):
+Two optional knobs support unattended bring-up (see [TESTING.md §6](./TESTING.md)):
 `OPENCHIME_ENROLL_CODE_FILE` also writes the `oce1.` code to a file (so orchestration can
 reserve it without scraping the log), and `OPENCHIME_ENROLL_WAIT_SECS` retries activation for
 that many seconds before serving (default 0 = one attempt, retry next boot), so a box
@@ -284,9 +285,10 @@ token on reconnect), the daemon then does the same thing:
 
 1. **Provision/look-up the user** (`users` table). `users.subject` is the unique
    identity key, namespaced by source: `oidc:<issuer>|<sub>` or `local:<username>`.
-   OIDC users are provisioned just-in-time on first login (role defaults to
-   `member`; a configured bootstrap subject becomes `owner`). Local users are
-   created by invite (§2).
+   OIDC users are provisioned just-in-time on first login, always with the
+   schema's default role `member` — there is no bootstrap-subject setting, and
+   promotion to owner or admin is a separate administrative action. Local users
+   are created by invite (§2).
 2. **Mint a session:** a random 32-byte token, returned to the client. The daemon
    stores only **`SHA-256(token)`** (so a database leak does not expose live
    sessions), with `user_id`, `created_at`, `expires_at`, `last_seen`, and an
@@ -339,7 +341,7 @@ unit-tested in `daemon/roles.c`.
   channel may delete (not edit) others' messages; `process_delete` performs the
   tombstone after an `oc_role_can_moderate` check for a non-author and records it
   as a moderator deletion via `messages.deleted_by` (and in the audit log). (This
-  matches the AUTH.md intro, ARCH-60, and STATUS.md row 032.)
+  matches the AUTH.md intro and ARCH-60.)
 - **Invite/remove (REQ-033, implemented):** only owner/admin may invite or remove
   tenant members (`oc_role_can_manage_members`), and only an owner may invite at
   or remove an admin/owner. Invite mints a single-use token (`invites`);

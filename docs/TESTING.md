@@ -138,14 +138,22 @@ framework, and OpenChime follows suit.
 Unit tests must be reproducible and independent of wall-clock or environment:
 
 - Any use of `rand()` seeds it explicitly (openblocks seeds `srand(12345)`).
-- No test asserts an exact wall-clock timestamp. Server time and
-  `message_id` assignment are reached through an **injectable clock/id source**
-  so a test can supply a scripted sequence — the same technique openblocks uses
-  to drive `input.c` from a fake 60 Hz clock. Tests assert *relative* facts
-  (ids strictly increase; a timestamp is within a supplied fake range), never a
-  literal now().
-- Tests touch no network and no real disk. Where a subject needs SQLite, it
-  uses an in-memory database (`:memory:`), not a file.
+- No test asserts an exact wall-clock timestamp. Tests assert *relative* facts —
+  ids strictly increase, a timestamp falls inside a window the test itself
+  bounded — never a literal `now()`. **There is no injectable clock or id
+  source**: `dbw_now_ms` calls `clock_gettime` directly with no override seam, so
+  determinism here comes from asserting relative facts rather than from
+  scripting time. What *is* injectable is the interval a periodic job runs at
+  (`oc_dbwriter_set_idem_retention`, `OPENCHIME_MAINT_INTERVAL_MS`,
+  `OPENCHIME_SCHED_TICK_MS`), which is what lets a suite compress a clock it
+  cannot fake.
+- Unit tests touch no network. **Several suites use real files on disk**, not
+  `:memory:` — `test_dbwriter`, `test_push`, `test_client_core`, `itest_netloop`
+  and `itest_slow_blob` each open a database under `build/`, because they
+  exercise migration-on-boot, WAL behaviour and multi-connection paths that an
+  in-memory database does not reproduce. They clean up after themselves; the
+  purely-logical suites (codec, framebuf, mention, richtext, searchq) touch
+  nothing.
 
 ---
 
@@ -162,9 +170,12 @@ source of truth for the frames means the integration tests also dogfood the
 codec the real client will ship.
 
 The test client lives under `tests/` (`tests/e2e_client.c`, the black-box client
-built as `build/e2e_client` and driven by `make integration`). It speaks real
-frames: `HELLO`/`WELCOME`, `AUTH`, `SEND`/`SEND_ACK`/`BROADCAST`/`CLIENT_ACK`,
-`BACKFILL_REQUEST`/`BACKFILL_DONE`.
+built as `build/e2e_client` and driven by `make integration`). It speaks
+`HELLO`/`WELCOME`, `AUTH_CHALLENGE`/`AUTH`/`AUTH_OK`, and
+`SEND`/`SEND_ACK`/`BROADCAST` — the auth-and-message vertical, and nothing
+further. `CLIENT_ACK`, backfill, version rejection and session revocation are
+exercised in the **in-process** integration suites (`itest_netloop`), not by this
+client.
 
 **Client-side TLS (settled).** The wire protocol runs over TLS with TOFU
 pinning (ARCH-10, REQ-180); there is no plaintext fallback. The TLS library is
@@ -185,12 +196,22 @@ wrappers (ARCH-40).
 
 ### 3.3 Scenarios
 
-Grouped by what they prove. **All of the below are implemented and run in CI**;
-the ★ marks that once distinguished "reachable against the placeholder daemon"
-are gone, because the placeholder is gone.
+Every scenario below is implemented and runs in CI. **Which tier runs it is the
+part that matters**, because the compose stack proves something the in-process
+suites cannot — that the shipped *image* works — and the in-process suites prove
+things the compose stack does not reach.
 
-- **Liveness:**
-  - health check: `/healthz` returns `200 OK` (ARCH-25).
+**Against the deployed container (`make integration`,
+`Scripts/test-integration.sh`) — two checks:**
+
+- **Liveness:** `/healthz` returns `200 OK` (ARCH-25).
+- **The auth-and-message vertical over TLS:** `build/e2e_client` handshakes,
+  authenticates in local mode, sends, and observes its own `SEND_ACK` and the
+  `BROADCAST` (REQ-023, REQ-090/092).
+
+**In-process, over the real epoll server and TLS (`make test` —
+`itest_netloop`, `itest_tls`, `itest_slow_blob`, `test_client_core`):**
+
 - **Handshake/versioning:** a client advertising an unsupported range gets a
   `REJECT` with the right `VERSION_TOO_OLD`/`VERSION_TOO_NEW` code and a closed
   connection (REQ-110/111).
@@ -209,15 +230,19 @@ are gone, because the placeholder is gone.
 - **Reconnect/backfill:** a client that disconnects, misses messages, then
   reconnects and issues `BACKFILL_REQUEST` receives exactly the missed messages
   and a `BACKFILL_DONE` (REQ-100/101).
+- **Slow-backend isolation:** a download crawling through a deliberately slow S3
+  endpoint does not stall message round-trips (ARCH-69,
+  [TESTING.md §5](./TESTING.md)).
 
 ---
 
 ## 4. Continuous integration
 
 CI is GitHub Actions (`.github/workflows/ci.yml`), mirroring openblocks'
-conventions: it triggers on pushes to `main` and on pull requests targeting
-`main`, skips doc-only changes via `paths-ignore`, and uses a `concurrency`
-group to cancel superseded runs.
+conventions: it triggers on **every branch push** — deliberately unfiltered, so
+the branch gate CONTRIBUTING.md's merge policy depends on is real — and on pull
+requests targeting `main`. It skips doc-only changes via `paths-ignore` and uses
+a `concurrency` group to cancel superseded runs.
 
 Jobs:
 
@@ -234,17 +259,300 @@ Jobs:
 Everything runs non-interactively and communicates pass/fail purely through
 exit codes, so no scenario depends on a human reading output.
 
-**Audio (AUDIO.md §6.4).** Echo cancellation is testable with no hardware: a
-synthetic room impulse response convolved with a far-end signal produces a known
-"echo", near-end speech is mixed in, and the harness measures **ERLE** (dB of
-echo removed). Clock drift is injected by resampling one side. This keeps a
-notoriously subjective component on the same footing as everything else here —
-a number in `make test` rather than someone listening and forming an opinion. New unit test
-binaries are added to the `build` job's `make test`; new socket-level
-integration scenarios join the `integration` job once the client-TLS decision
-(§3.1) is settled.
+**Audio.** `tests/test_audio.c` covers the **relay sidecar only** — forwarding,
+call isolation, and `REVOKE`. Echo cancellation has **no harness**: AUDIO.md §6.4
+designs one (a synthetic room impulse response convolved with a far-end signal,
+near-end speech mixed in, and **ERLE** in dB as the measured output, with clock
+drift injected by resampling one side) and sequences it with the audio client,
+which does not exist. It is a design, not a test that runs.
+
+New unit-test binaries are added to the `build` job's `make test`.
 
 ---
+
+---
+
+## 5. Capacity benchmark (REQ-210/211)
+
+Measured answers to "how much memory does the daemon use, and how many
+concurrent connections does it hold" — the two requirements that were previously
+plausible-but-unmeasured. Reproduced by `Scripts/bench.sh`, which drives the
+running daemon with the `tests/bench_load.c` load client and samples the
+daemon's resident memory (`/proc/<pid>/status` `VmRSS`) while the load runs.
+
+**Environment.** Localhost, single box, one daemon process (single-threaded net
+loop + one DB-writer thread), mbedTLS, glibc. These are therefore an *upper
+bound on latency* and a *lower bound on capacity per unit RAM*: a real
+deployment on dedicated hardware with clients over a network sees no worse
+memory behavior, and network latency dominates the sub-millisecond local
+scheduling costs measured here.
+
+### How to run
+
+```
+Scripts/bench.sh                 # default: idle memory at 50, 100, 200 conns + latency
+Scripts/bench.sh 50 100 200 400  # custom connection counts
+```
+
+It bootstraps a set of local accounts (auth is a 600k-iteration PBKDF2, so it
+keeps the count modest), starts a throwaway daemon, and prints a table of
+connections vs. peak RSS vs. round-trip latency, tearing everything down after.
+
+### Results
+
+Representative figures (they vary a few KB/ms run to run):
+
+| Metric | Value |
+|--------|-------|
+| Baseline daemon RSS (0 connections) | **~5 MB** |
+| RSS per idle authenticated connection | **~50–60 KB** |
+| 100 idle connections | ~10–12 MB total |
+| 200 idle connections | ~15–18 MB total |
+| Message round-trip (persist + `SEND_ACK`), 32 concurrent senders | **p50 ~2–3 ms, p90 ~80 ms, p99 ~130 ms** |
+| Connection *setup* throughput | **~2 logins/sec** (see bottleneck below) |
+
+> **Corrected 2026-07-19.** The two figures above were previously recorded as
+> *p99 ~20–40 ms* and *~6–7 logins/sec*. Both were measured against a harness
+> that was silently dropping most of its connections: `bench_load` used a 10 s
+> read timeout while authentication is a 600k-iteration PBKDF2 serialized on the
+> single writer, so a 32-connection burst only ever landed ~10 authenticated
+> clients — and `Scripts/bench.sh` stripped the `connections_ok=` prefix that
+> would have shown it. The latency percentiles were therefore measured at about a
+> third of the intended concurrency, which flattered them by roughly 5×. With the
+> timeout raised so all 32 connect, p99 is ~130 ms. The per-connection memory
+> figure survived the correction largely unchanged (~58–60 KB), because peak RSS
+> had included the connections that later timed out.
+
+The per-connection cost is dominated by the mbedTLS session buffers plus the
+per-connection frame reassembler and output buffer — flat and predictable, with
+no per-connection growth beyond that at rest.
+
+### What this means for capacity
+
+Working from ~5 MB baseline + ~50 KB per idle connection:
+
+- **By memory alone:** `(256 − 5) MB ÷ 50 KB ≈ ~5,000 idle connections` before
+  RAM is the constraint in the lean profile (REQ-210).
+- **The binding limit is the fd cap, not memory:** `OC_NETLOOP_MAX_FD = 4096`
+  (a compile-time constant in `daemon/netloop.c`) caps the daemon at ~4,000
+  connections regardless of RAM — and ~4,000 idle connections is still only
+  ~200 MB, within the lean profile.
+- **Comfortable planning number:** budget **~2,000–3,000 concurrent connections**
+  on a 256 MB box, reserving headroom for SQLite's page cache, attachment
+  transfer buffers, and the per-connection output buffers that grow (up to a
+  1 MiB cap) while a connection drains a broadcast burst — the ~50 KB figure is
+  measured on *idle* connections.
+- **In users:** at ~1–2 connections per user (laptop + phone) and the fact that
+  not everyone is online at once, that is roughly **1,500–3,000 concurrent
+  users**, backing a registered tenant of **5,000–10,000+**.
+
+Relative to REQ-211's stated target — "low-hundreds of concurrent connections…
+sufficient for the 50–100 target customer scale" — a single 256 MB box clears it
+by **one to two orders of magnitude**. At the 50-user scale specifically
+(~100 connections ≈ 10 MB total, ~4% of the lean profile), the daemon is nowhere
+near any limit; it would run on a 64 MB box.
+
+Scaling further needs no architecture change (REQ-210): raise
+`OC_NETLOOP_MAX_FD` and move to the ~512 MB standard profile.
+
+### The one bottleneck: connection setup
+
+Steady-state connection *count* is cheap; connection *establishment* is not. Each
+login runs a **600k-iteration PBKDF2-HMAC-SHA256** password verification
+(OWASP-tier, `OC_PW_ITERATIONS` in `daemon/auth.h`), and — like all mutations —
+it runs on the **single DB-writer thread** (ARCH-5). That serializes logins at
+**~2 per second** (≈500 ms each), the figure the results table and the
+harness-limitations section below both carry.
+
+This is a deliberate security cost paid once per login, not a memory or
+steady-state limit: a box holding thousands of connections is fine, but a
+**thundering-herd reconnect** (e.g. every client re-authenticating at once after
+a daemon restart) drains at ~2/sec — ~25 minutes for 3,000 clients. If that ever
+matters at scale, the fix is to parallelize the PBKDF2 across a small worker pool
+off the single writer (the auth verification is CPU-bound and independent per
+login), not to add RAM. It is a modest cost at the low-hundreds target scale
+(50 logins ≈ 25 seconds), and session-token reconnect (ARCH-58) skips PBKDF2
+entirely, which is what a real reconnect storm uses.
+
+### Caveats
+
+- Idle-connection memory; active fan-out uses more (bounded by the 1 MiB
+  per-connection output cap and recoverable via reconnect + backfill).
+- Localhost measurement — excludes real network RTT (which would dominate the
+  low-single-millisecond local p50) and NIC/kernel socket-buffer memory under
+  real load.
+- No periodic large-scale soak test yet; these are point-in-time measurements.
+
+### Slow-backend isolation (ARCH-69)
+
+`itest_slow_blob` (in `make test`) answers the question the transfer pool exists
+for and that nothing previously tested: **does a slow blob backend stall message
+delivery?** Every earlier test ran against the local filesystem, where a blob
+operation completes in microseconds — the ~100 ms/op regime the pool was built
+for was never exercised.
+
+The test points the daemon's S3 backend at a loopback endpoint that dribbles a
+download 16 KB at a time with a 120 ms delay between pieces, then measures one
+client's message round-trips while another client's download crawls through it.
+
+```
+bob round-trip: idle median 57ms | during slow-download median 52ms, max 62ms
+backend 120 ms/op, 3 slow segment(s) served DURING the measurement
+  (= 360 ms of backend stall the loop did not absorb)
+```
+
+**The test discriminates.** Temporarily reverting `download_pump` to read inline
+on the epoll thread (pre-ARCH-69 behavior) makes the run **time out entirely** —
+the loop freezes on the slow reads and the daemon stops serving anyone. A test
+that cannot fail proves nothing, so this was verified rather than assumed.
+
+Two implementation notes worth keeping, both learned by getting it wrong first:
+
+- The slow path must be a **download**, not an upload. Making a *write* block
+  requires exceeding the sender's socket send buffer (~2.5 MB), so an
+  upload-based version needs a multi-megabyte payload and runs for minutes. A
+  slow *reader* blocks trivially — there is no data yet.
+- The concurrent client must run on **its own thread**. Ticking it between the
+  measured client's sends makes the two barely overlap, and the measurement
+  becomes a no-op that passes either way.
+
+### Maintenance-pass overhead (ARCH-78)
+
+Running the storage maintenance pass every 200 ms — 25× more often than the
+5-minute default — against the same load shows no measurable cost:
+
+| | baseline | maint every 200 ms |
+|---|---|---|
+| Daemon RSS | 5.0 MB | 5.1 MB |
+| KB per connection | 55–57 | 52–65 |
+| Round-trip latency | unchanged | unchanged |
+
+### Known harness limitations
+
+**Diagnosed and fixed.** The shortfall was `bench_load`'s own 10-second read
+timeout, not a daemon limit. Authentication is a 600k-iteration PBKDF2 that runs
+**serialized on the single writer thread**, measured here at **~2 logins/sec**
+(≈500 ms each — the expected cost of 600k iterations). A burst of N clients
+therefore takes N/2 seconds to drain, so everything past roughly the 20th client
+gave up mid-authentication and was counted as a connection failure.
+
+The knee is sharp and reproducible: 8/8 and 16/16 connect, 24 drops to 22/24.
+
+Three fixes, all in the harness — the daemon was behaving exactly as designed:
+
+- `bench_load`'s read timeout is now 180 s, so the auth ramp is never the limit.
+- `Scripts/bench.sh` prints the whole result line. It previously piped through a
+  `sed` that kept only `rtt_ms...` and dropped the `connections_ok=` prefix —
+  and failed connections report `rtt 0.00`, so a degenerate run printed
+  `p50=0.00 p90=0.00 p99=0.00`, which reads like an outstanding result rather
+  than no result at all.
+- The memory table now reports **requested vs connected** and divides by the
+  connections that actually established, rather than by the number requested.
+
+**The real constraint this exposes** is that connection setup is bounded at
+~2/sec by design (REQ-191 wants PBKDF2 expensive). A server restart with a few
+hundred clients reconnecting takes minutes to fully re-authenticate them, and
+session-token reconnect (ARCH-58) — which skips PBKDF2 entirely — is what makes
+that tolerable in practice. Worth remembering before quoting a connection-count
+capacity number: the daemon *holds* thousands of connections, but *establishes*
+them at two per second.
+
+---
+
+## 6. Running the federated stack by hand
+
+Runs the whole federated system on one machine — the C daemon enrolled against the
+.NET control plane (`openchime-saas`), with a client driving the two daemon→central
+outbound wires (enrollment, ARCH-84; push, ARCH-85). Verified end to end.
+
+### What it proves
+
+1. **Enrollment** — the daemon generates a keypair + opaque audience, prints an `oce1.`
+   code, the operator reserves it in the console, and the daemon proves possession and
+   activates (ARCH-84; the control plane ratifies).
+2. **Push** — a client registers a device token; a message send drives the daemon's push
+   emitter, which signs a contentless batch with the enrollment key and POSTs it to the
+   control-plane gateway, which verifies the request signature and relays it (ARCH-85;
+   control-plane side). The cross-language crypto (mbedTLS sign ↔ .NET verify) matches by construction.
+
+### Run it — one command (recommended)
+
+Assuming the sibling layout `../openchime-saas`:
+
+```sh
+docker compose -f docker-compose.federated.yml up --build
+```
+
+That stands up Postgres + the control plane (with the dev log push provider + the dev
+enrollment-reserve shortcut) + a daemon that **enrolls hands-off**: the daemon writes its
+`oce1` code to a shared volume (`OPENCHIME_ENROLL_CODE_FILE`), an `enroll-init` step reserves it
+via the dev endpoint, and the daemon activates (`OPENCHIME_ENROLL_WAIT_SECS` lets it wait for the
+reserve, then come up Active with push enabled). The daemon serves on `localhost:8443`.
+
+Then drive a client against it:
+
+```sh
+make demo-client
+build/demo_client 127.0.0.1 8443 bob   pw token apns tok-bob-demo
+build/demo_client 127.0.0.1 8443 alice pw send  1 "hello from the federated stack"
+```
+
+Watch the control-plane log for:
+
+```
+push[Apns] would notify token tok-bob-demo (channel 1, ...)
+```
+
+That is the daemon→central push wire firing end to end (signed, contentless).
+
+### Run it — scripted, against a control plane you started yourself
+
+If you're running the control plane directly (e.g. `dotnet run` with
+`Push:Log:Enabled=true`), `scripts/demo-federated.sh http://localhost:5176` does the same
+flow against it (it scripts the real console reserve, no dev endpoint needed).
+
+### OIDC-relay login (the identity wire)
+
+`scripts/demo-oidc.sh` proves the other daemon↔central wire (ARCH-56/57): the control
+plane **mints** an ES256 identity token and a daemon in **OIDC mode verifies** it against
+the central key it pins. It generates an ES256 keypair (private → the control plane's
+signing key, public → the daemon), starts both, mints a token via the dev endpoint
+`POST /api/dev/oidc/token` (gated on `Oidc:DevMintEnabled` — never in prod), and runs:
+
+```sh
+build/demo_client 127.0.0.1 18444 --oidc "$JWT" whoami
+# -> demo_client: authenticated as uid 1
+```
+
+The browser upstream-IdP flow (Google) is bypassed on purpose — this exercises the
+daemon's *verification*, the untested half. A real deployment supplies real Google
+credentials to the relay instead of the dev mint endpoint.
+
+### TUI runtime smoke (the interactive client)
+
+`scripts/demo-tui.sh` runtime-verifies the **TUI** (ARCH-75) against a live daemon — the
+headless check the project lacked (it was only ever build-verified). It drives the real
+interactive client in a **tmux** pane: connect + auto-login as alice, send a message from
+the composer, receive a broadcast from bob (via `demo_client`), and assert both render in
+the transcript. Requires `tmux`. To connect the TUI by hand instead:
+
+```sh
+make tui
+build/openchime-tui 127.0.0.1 8443 alice:pw    # <host> <port> [user:pass] direct connect
+```
+
+### Notes / gotchas
+
+- **`OPENCHIME_BLOB_DIR`** must point at a writable directory. Outside the container the
+  default `/data/blobs` doesn't exist, and `oc_netloop_run` refuses to start without a
+  usable blob store — the daemon logs `blob storage = local disk` then exits before
+  `netloop: listening`. The script sets it to a temp dir.
+- The demo uses **local auth** for the client (bootstrap users), independent of push.
+  Push only needs the box **enrolled** (active audience + key) and `OPENCHIME_PUSH_URL` set.
+- **OIDC-relay login** against a live daemon is *not* covered here — it needs real Google
+  credentials on the control plane. The mint↔verify contract is unit-tested on both sides.
+- `demo_client` (`make demo-client`) is the flexible black-box tool: `token <apns|fcm>
+  <tok>` or `send <channel> <text>` against a running daemon.
 
 ## Driving the Win32 GUI
 
@@ -299,8 +607,16 @@ harness artifact, not a product defect. Two causes, both fixed:
    closed→open→closed round trip and refuse to credit the close if the open
    never happened.
 
-After the fix: **six consecutive clean runs, 116/116 each.** Tune the patience
-with `OC_SMOKE_WAIT_MS` (default 6000).
+After the fix the suite went six consecutive runs clean. It has grown a great
+deal since — it reported **249 checks** on 2026-08-02 — so read the total the run
+prints rather than quoting a number from here. Tune the patience with
+`OC_SMOKE_WAIT_MS` (default 6000).
+
+**Not every `sleep` is inside a poll loop.** The WIN-87 rewrite replaced the
+sleeps that *guarded assertions*, and those are gone; the suite still uses plain
+inter-action sleeps between driving steps (roughly two dozen), which are settling
+time rather than assertion timing. A new assertion waits on the state it is about
+to assert — it does not add a sleep.
 
 *One caveat when reading a failure message:* the dump's `comp=` field is the
 **IME composition length**, not the autocomplete popover — the dump exposes no

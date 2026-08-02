@@ -14,15 +14,25 @@ and reconnect backfill, plus the error frame. It **also now covers** presence an
 typing (§5.13, REQ-120/121), attachments (§5.14), incoming webhooks (§5.15),
 notification preferences (§5.16), synced client settings (§5.16a), self-service
 profile (§5.16b), audio-call signaling (§5.17, REQ-150–152), and push device
-tokens — all of which earlier revisions of this document deferred. The remaining
-deferrals are **thread notifications** (REQ-061, which needs @mentions) and the
-**screenshare** additions reserved in §5.17 (REQ-161, unbuilt). New message types
-are additive; the header format and the frozen handshake frames (§3) do not
-change.
+tokens.
+
+**§9 is the complete list; §5's prose is not.** The registry is generated from
+`shared/protocol.h` and carries all 154 message types. The narrative sections
+below specify the payload layouts for the families they name, and a number of
+later families — drafts, scheduled send, the notification schedule and pause,
+keywords, custom emoji, group DMs, invite and session management, webhook
+enable/rotate, cross-channel threads, unresolved-mention notices, and the
+per-channel file census — are listed in §9 with their opcodes and directions but
+are specified in §§5.16d–5.16i. The remaining protocol-level deferral is the
+**screenshare** addition reserved in §5.17 (REQ-161, unbuilt).
 
 **Status.** Implemented. The frames in this document are realized in
 `shared/protocol.c` (codec), `daemon/dbwriter.c` (handlers), and
-`daemon/netloop.c` (dispatch), exercised end-to-end by the test suite.
+`daemon/netloop.c` (dispatch). Coverage is uneven: the auth-and-message vertical
+is exercised end to end against the deployed container, and the rest in-process
+(TESTING.md §3.3). Where this document and the codec disagree, the codec is
+right — three such disagreements were found on 2026-08-02 and are recorded in
+[BACKLOG.md](./BACKLOG.md) rather than silently corrected here.
 
 ---
 
@@ -82,10 +92,20 @@ ARCH-25) by **ALPN** negotiated during the TLS handshake:
                               (this document)   (ARCH-32/34)
 ```
 
-Only the binary-protocol side and TLS termination exist today; the HTTP handler
-and its CA-signed cert (ARCH-34) are a later milestone. The **`oc/1` ALPN and
-the 443 default are fixed now** so clients are correct from first release and
-the HTTP surface can be added on the same port without touching them. The `oc`
+Both sides exist. A connection that negotiates `oc/1` reaches the binary
+protocol; one that does not is read by the HTTP/1.1 handler, which serves
+`POST /webhook/<token>` (§5.15) and nothing else on this port — `/healthz` and
+the landing page are on the separate plaintext health port (ARCH-25). The
+CA-signed certificate for the webhook endpoint (ARCH-34, REQ-171) is the part
+that remains unbuilt; the endpoint currently answers on the daemon's TOFU cert.
+
+> **The ALPN demux does not admit an ordinary HTTPS client.** The daemon
+> advertises exactly one protocol, `oc/1`, so a client offering any other list —
+> `h2, http/1.1`, which is every browser, `curl`, and every webhook sender —
+> is refused during the handshake with `no_application_protocol` and never
+> reaches the HTTP handler. Only a client that offers **no** ALPN at all gets
+> through. Incoming webhooks are therefore unreachable by their intended senders;
+> see [BACKLOG.md](./BACKLOG.md). The `oc`
 version suffix (`/1`) tracks the transport-framing generation, distinct from the
 per-frame `version` field in §2.
 
@@ -117,13 +137,18 @@ type-specific payload. All multi-byte integers are **network byte order**
 | `payload`  | var  | `length - 4` bytes, laid out per the message type at that version.  |
 
 - `version` is present on **every** frame, not only the first, so a frame is
-  self-describing. In practice a session negotiates a single version at
-  handshake (§3) and all subsequent frames carry it; a frame whose `version`
-  differs from the negotiated one is a protocol error (`ERROR`
-  `MALFORMED_FRAME`, §8).
-- The `HELLO`, `WELCOME`, and `REJECT` handshake frames are **frozen at
-  version 1 forever** (§3), so version negotiation itself never has a version
-  mismatch problem.
+  self-describing. A session negotiates a single version at handshake (§3) and
+  both sides stamp it on every frame they send. **Neither side reads it again**:
+  the negotiated version is not stored on the connection, and dispatch is on
+  `msg_type` alone, so a frame carrying a different version is processed
+  normally rather than rejected. The field is therefore descriptive, not
+  enforced — see [BACKLOG.md](./BACKLOG.md).
+- The `HELLO`, `WELCOME` and `REJECT` handshake frames are **intended** to be
+  frozen at version 1 so negotiation itself can never hit a version mismatch.
+  The encoders do not implement that: they stamp `OC_PROTOCOL_VERSION` like every
+  other frame. Nothing validates it, so the two peers agree in practice; the
+  stated property does not hold, and it is a backlog item rather than a
+  behaviour to rely on.
 
 > **Bump `OC_PROTOCOL_VERSION` whenever a frame's LAYOUT changes** — a new field,
 > a reordering, a field that stops being optional — and not only when a frame is
@@ -140,11 +165,22 @@ type-specific payload. All multi-byte integers are **network byte order**
 > turns exactly that situation into a `REJECT` carrying `VERSION_TOO_OLD` /
 > `VERSION_TOO_NEW`, which says what is wrong.
 >
-> **Current version: 2** (2026-07-29). v2 = v1 plus `CHANNEL_INFO`'s topic and
-> archived (and `peer_id` no longer optional) and `CHANNEL_LIST`'s topic,
-> archived, created_at, preview and preview_author. Since the client and daemon
-> ship together (ARCH-61) there is no compatibility window to preserve — only a
-> mismatch to detect loudly.
+> **Current version: 7.** Since the client and daemon ship together (ARCH-61)
+> there is no compatibility window to preserve — only a mismatch to detect
+> loudly, which is why a frame *layout* change moves the number even when it adds
+> one byte.
+>
+> | Version | Change |
+> |---|---|
+> | 2 | `CHANNEL_INFO` gained `topic`/`archived` and made `peer_id` unconditional; `CHANNEL_LIST` gained `topic`, `archived`, `created_at`, `preview`, `preview_author` (2026-07-29). |
+> | 3 | Mute and mark-unread (REQ-137/235, migration 0026). |
+> | 4 | `USER_LIST` carries each user's avatar attachment id. A repeated list, so the added field shifts every entry after the first. |
+> | 5 | `PRESENCE_UPDATE` carries the do-not-disturb **fact** beside the status byte (REQ-122/278). |
+> | 6 | `NOTIFY_PREFS` **drops** the three DND-window fields: the recurring schedule is its own frame (REQ-136) and `SET_DND` is retired with them. |
+> | 7 | `USER_LIST` carries `title`, `timezone` and custom status (REQ-289). |
+>
+> Versions 4–7 are recorded in `shared/protocol.h`; version 3's entry is not, and
+> is reconstructed here from the commit that raised it.
 
 ### 2.1 Size limits (ARCH-30, REQ-054)
 
@@ -181,7 +217,9 @@ byte order as they are parsed; nothing is `memcpy`'d over a struct (ARCH-7).
 ## 3. Handshake and version negotiation (resolves REQ-110, REQ-111)
 
 The first frame on a new connection MUST be `HELLO` from the client. Any other
-first frame is answered with `REJECT` (`UNEXPECTED_MSG_TYPE`) and the
+first frame **closes the connection with no frame written** — the specification
+reserves `REJECT`/`UNEXPECTED_MSG_TYPE` for it, and the daemon does not send it
+(see BACKLOG.md). The
 connection is closed.
 
 The `HELLO`/`WELCOME`/`REJECT` frames are **frozen at `version = 1`**: their
@@ -505,7 +543,10 @@ msg_type `0x0051`** describing the channel and the caller's membership:
 | `is_public`  | u8   | `1` public, `0` private.                          |
 | `joined`     | u8   | `1` if the recipient is now a member.             |
 | `created_at` | u64  | Creation time, ms since epoch UTC.                |
-| `peer_id`    | u64  | **Optional trailing.** For a DM (`kind=1`), the other participant *from the recipient's view* — the client titles the DM from the roster. Written only for a DM, so a named-channel `CHANNEL_INFO` is byte-identical to the pre-DM layout. |
+| `peer_id`    | u64  | Always written since protocol 2 (`0` when not a DM). For a 1:1 DM, the other participant *from the recipient's view*. |
+| `topic`      | str  | Empty when unset (REQ-034). |
+| `archived`   | u8   | `1` when the channel is archived and read-only (REQ-035). |
+| `n_peers`    | u16  | Participant count, then that many `u64` ids — a group DM's people (REQ-056). `0` for a named channel. |
 
 Failures are non-fatal `ERROR` frames carrying the `channel_id` (8 bytes,
 big-endian) in `context`: `UNKNOWN_CHANNEL`, `NOT_A_MEMBER`, `FORBIDDEN`, or
@@ -526,7 +567,20 @@ public channel plus the private channels the user belongs to:
 | Field       | Type            | Notes                                             |
 |-------------|-----------------|---------------------------------------------------|
 | `count`     | u16             | Number of entries.                                |
-| `entries[]` | `count` × entry | Each: `channel_id` (u64), `name` (str), `is_public` (u8), `joined` (u8), `kind` (u8 — `0` channel, `1` DM). |
+| `entries[]` | `count` × entry | See below. |
+
+Each entry, in wire order:
+
+`channel_id` (u64) · `name` (str) · `is_public` (u8) · `joined` (u8) ·
+`kind` (u8 — `0` channel, `1` DM) · `last_message_at` (u64) · `unread` (u32) ·
+`peer_id` (u64) · `topic` (str) · `archived` (u8) · `created_at` (u64) ·
+`preview` (str) · `preview_author` (u64) · `n_peers` (u16) followed by `n_peers` ×
+`u64` participant ids.
+
+Nothing here is optional: every field is written for every entry, so a decoder
+that stops early desynchronises the whole repeated list rather than losing one
+row. The trailing participant list carries a group DM's people (REQ-056) and is
+`0`-length for anything else.
 
 The list includes the caller's DMs (§5.12) alongside channels; DM entries have
 `kind=1`, an empty `name`, and `is_public=0`.
@@ -587,9 +641,12 @@ skim — and it is per *channel*, not per DM, so the ordinary sidebar can use it
 > client that caches nothing (ARCH-88) must be able to render the sidebar and the
 > channel's About surface from the list alone.
 
-**An archived channel is read-only**, enforced in one place so every write path
-inherits it: `SEND`, `SEND_REPLY`, `UPLOAD_BEGIN` and an incoming webhook post all
-return `CHANNEL_ARCHIVED` (3019). It is hidden from `CHANNEL_LIST` for
+**An archived channel is read-only** on the client-facing wire: `SEND`,
+`SEND_REPLY` and `UPLOAD_BEGIN` share one access check and all return
+`CHANNEL_ARCHIVED` (3019). **The incoming-webhook post path does not call it** —
+it resolves the token and inserts the message, so a third party can still post
+into an archived channel and archiving does not disable a channel's webhooks.
+That is a defect, not a design; it is in [BACKLOG.md](./BACKLOG.md). It is hidden from `CHANNEL_LIST` for
 non-members; members keep it, flagged, so they can find their way back in.
 History, search and membership are untouched — archiving is the reversible
 alternative to a deletion that is not offered for channels holding history.
@@ -619,7 +676,20 @@ and so did the profile card that had to say the fields were not built.
 | Field       | Type            | Notes                                                        |
 |-------------|-----------------|--------------------------------------------------------------|
 | `count`     | u16             | Number of entries.                                           |
-| `entries[]` | `count` × entry | Each: `user_id` (u64), `role` (u8), `disabled` (u8), `email` (str), `display_name` (str). |
+| `entries[]` | `count` × entry | See below. |
+
+Each entry, in wire order:
+
+`user_id` (u64) · `role` (u8) · `disabled` (u8) · `email` (str) ·
+`display_name` (str) · `avatar_id` (u64) · `title` (str) · `timezone` (str) ·
+`status_emoji` (str) · `status_text` (str).
+
+`avatar_id` arrived at protocol 4 and the last four at protocol 7. Because this
+is a repeated list, an added field shifts **every** entry after the first — which
+is why each of those raised the protocol version rather than riding along.
+`title` and `timezone` are here, and not only on `PROFILE_INFO`, because that
+frame is sent to the person who edited them: before REQ-289 no client ever
+learned anybody else's.
 
 **`SET_ROLE` (client → server), msg_type `0x0042`** `{ user_id: u64, role: u8 }` —
 changes a user's tenant role. Enforced by the role policy: only owner/admin may
@@ -993,10 +1063,21 @@ Implemented with a SQLite FTS5 index over message bodies (ARCH-15, SCHEMA.md
 
 **`SEARCH` (client → server), msg_type `0x0060`:**
 
-| Field   | Type | Notes                                                          |
-|---------|------|----------------------------------------------------------------|
-| `query` | str  | Free text. The daemon quotes each whitespace-separated term, so query punctuation is literal and multiple terms are ANDed; it never errors on syntax. |
-| `limit` | u16  | Max results wanted; the daemon caps it (currently 50).         |
+| Field         | Type | Notes                                                    |
+|---------------|------|----------------------------------------------------------|
+| `query`       | str  | Free text. The daemon quotes each whitespace-separated term, so query punctuation is literal and multiple terms are ANDed; it never errors on syntax. May be empty when the filters below carry the whole query. |
+| `limit`       | u16  | Max results wanted; the daemon caps it (currently 50).   |
+| `before_id`   | u64  | **Keyset paging cursor** — return only messages with a lower id. `0` for the first page. Not an offset, so a message posted mid-paging cannot make a row repeat or vanish. |
+| `from_name`   | str  | `from:` — restrict to one author. Empty for no constraint. |
+| `in_channel`  | str  | `in:` — restrict to one channel. Empty for no constraint. |
+| `has_mask`    | u8   | `has:` — bitmask, `0x01` file, `0x02` link, `0x04` image. `0` for no constraint. |
+| `after_ms`    | u64  | `after:` — lower time bound, ms since epoch UTC. `0` for none. |
+| `before_ms`   | u64  | `before:` — upper time bound. `0` for none. |
+
+The operator grammar is parsed by `shared/searchq.c`, which the daemon and both
+frontends link, so the filter line a client shows and the `WHERE` clause the
+daemon builds cannot disagree (REQ-081). Results stay scoped to history the
+caller may read (REQ-031).
 
 Replies **`SEARCH_RESULTS` (server → client), msg_type `0x0061`**, newest match
 first:
@@ -1102,8 +1183,10 @@ with `TRANSFER_CANCEL`. Chunk `data` is bounded so each frame stays
    upload targeting a channel/DM it can post to. The server authorizes
    membership, checks `total_size <= MAX_ATTACHMENT_SIZE`, allocates an
    `attachment_id` + opaque storage key, and opens a streaming write to object
-   storage. Idempotent on `(channel, token)` like `SEND` (§5.1, ARCH-44). On
-   failure → `ERROR` (`FORBIDDEN`, `ATTACHMENT_TOO_LARGE`, …).
+   storage. The frame carries an idempotency token, but **the daemon does not use
+   it**: the insert is unconditional and `attachments` has no token column, so a
+   retried `UPLOAD_BEGIN` allocates a second attachment rather than resuming the
+   first. On failure → `ERROR` (`FORBIDDEN`, `ATTACHMENT_TOO_LARGE`, …).
 2. **`UPLOAD_READY` (S → C), `0x0081`** `{ attachment_id: u64, chunk_size: u32,
    window_bytes: u32 }` — the server advertises the max `data` per chunk and the
    **in-flight window**: the client may have at most `window_bytes` of un-acked
@@ -1150,7 +1233,9 @@ be empty when it carries attachments.
 1. **`DOWNLOAD_BEGIN` (C → S), `0x0086`** `{ attachment_id: u64 }` — the server
    authorizes the requester against the message the attachment belongs to
    (`channel_read_access`, REQ-141); an unauthorized or unknown id → `ERROR`
-   (`FORBIDDEN` / `NOT_FOUND`). It opens a streaming read from storage on a
+   (`FORBIDDEN`; an unknown or unfinalized id is `UNKNOWN_ATTACHMENT` 3011 and a
+   reclaimed one `ATTACHMENT_GONE` 3013 — there is no `NOT_FOUND` code). It opens
+   a streaming read from storage on a
    transfer worker.
 2. **`DOWNLOAD_INFO` (S → C), `0x0087`** `{ attachment_id: u64, filename: str,
    mime: str, total_size: u64, sha256: bytes }` — sent once before the bytes.
@@ -1202,10 +1287,18 @@ the text as a message **authored by the webhook's creator**, carrying the
 webhook's **label as a display-name override** (the `author_name` field on
 `BROADCAST`, so the post shows as e.g. "GitHub CI") — delivered to the channel's
 members as an ordinary `BROADCAST` (§5.3) and included in backfill.
-Responses: `200 {"ok":true,"message_id":N}` on success; `400` (empty/bad body),
-`404` (unknown or disabled token), `405` (non-POST), `413` (too large), `429`
-(per-token rate limit, 60/min). Note: REQ-171's CA-signed certificate for this
-endpoint is not yet implemented — it currently uses the daemon's TOFU cert.
+Responses: `200 {"ok":true,"message_id":N}` on success; `400` (empty or bad
+body, **including a declared `Content-Length` over `MAX_BODY_SIZE`** — the parser
+rejects it before the handler sees it), `404` (unknown or disabled token), `405`
+(non-POST), `413` (the raw request exceeded the read buffer, `MAX_BODY_SIZE` plus
+16 KiB, before parsing completed), `429` (per-token rate limit, 60/min).
+
+Two gaps, both in [BACKLOG.md](./BACKLOG.md): REQ-171's CA-signed certificate for
+this endpoint is not implemented, so it answers on the daemon's TOFU cert; and
+the ALPN demux in front of it refuses any client that offers a normal protocol
+list, so an ordinary HTTPS sender never reaches this handler at all. **An
+archived channel does not stop a webhook post** — the archived check that
+`SEND` performs is absent here.
 
 ---
 
@@ -1218,7 +1311,8 @@ window** (REQ-131). They are the config that clients honor and that the push emi
 
 **`SET_NOTIFY_PREF` (C → S), `0x0090`** `{ channel_id: u64, level: u8 }` — set the
 level for a channel the caller can read: `0` all, `1` mentions-only, `2` none. An
-absent pref means the default (all). Refused with `ERROR NOT_A_MEMBER` for a
+absent pref falls back to the user's own default (`SET_NOTIFY_DEFAULT`, REQ-134),
+not to a fixed "all". Refused with `ERROR NOT_A_MEMBER` for a
 channel the caller can't access, or an invalid level.
 
 **`SET_DND` (`0x0091`) is RETIRED.** REQ-136 replaced the single quiet window
@@ -1351,10 +1445,291 @@ the password; that an invite was redeemed, never the token (ARCH-79).
 
 ---
 
+### 5.16d Notification schedule, pause, and the notify default
+
+Everything a user says about *when* they are notified, beyond §5.16's per-channel
+level. `SET_DND` (`0x0091`) is **retired**: REQ-136's schedule replaced it and
+states the hours notifications are **allowed** — the same two integers with the
+opposite meaning, which is why the opcode was retired rather than redefined
+(ARCH-103).
+
+Each of these answers with a full `NOTIFY_PREFS` (`0x0093`) to **all** of the
+user's connections, followed by `SNOOZE`, `SCHEDULE` and `ALERT_PREFS`. That
+four-frame trailer follows every `NOTIFY_PREFS`, not only a `LIST` request, so a
+client always folds a complete picture rather than a delta.
+
+**`SET_SNOOZE` (C → S), `0x00CA`** — Pause my notifications for N minutes from now; 0 ends the pause. (REQ-278, WIN-92)
+
+    minutes (u32)
+
+**`SNOOZE` (S → C), `0x00CB`** — Tell the user's own connections the absolute instant their pause ends. (REQ-278, REQ-122)
+
+    until_ms (u64)
+
+**`SET_SCHEDULE` (C → S), `0x00CC`** — Replace my recurring notification schedule: mode, base window, and the per-weekday rows. (REQ-136, ARCH-103, WIN-94)
+
+    mode (u8), tz_offset_min (u16 — int16 two's complement, minutes east of UTC), start_min (u16), end_min (u16), count (u8), then count x { weekday (u8), enabled (u8), start_min (u16), end_min (u16) }
+
+**`SCHEDULE` (S → C), `0x00CD`** — The stored recurring schedule echoed back to its owner. (REQ-136, ARCH-103)
+
+    mode (u8), tz_offset_min (u16 — int16 two's complement, minutes east of UTC), start_min (u16), end_min (u16), count (u8), then count x { weekday (u8), enabled (u8), start_min (u16), end_min (u16) }
+
+**`SET_NOTIFY_DEFAULT` (C → S), `0x0077`** — Set the workspace-wide fallback notification level used by channels with no per-channel override. (REQ-134)
+
+    level (u8)
+
+**`SET_MUTE` (C → S), `0x006D`** — Mute or unmute one conversation for the calling user. (REQ-137, WIN-40)
+
+    channel_id (u64), muted (u8)
+
+**`SET_READ_CURSOR` (C → S), `0x006E`** — Set my read cursor for a channel deliberately, including BACKWARDS (mark unread). (REQ-235, WIN-52)
+
+    channel_id (u64), message_id (u64)
+
+`SET_READ_CURSOR` is deliberately **not** `CLIENT_ACK`: the ack path upserts
+`MAX(existing, new)` so a replayed ack can never rewind anyone, and mark-unread
+needs to move the cursor *backwards*. It replies with `READ_CURSOR` frames — the
+actor's new position to the channel's other members, and every other member's
+position back to the actor (REQ-090's seen-by).
+
+`SNOOZE` is **self-only**. Other people learn *that* someone is not to be
+disturbed, through the DND byte on `PRESENCE_UPDATE` (protocol 5), and never
+when they are back (REQ-122). The instant is enforced on read: a stamp already in
+the past reports as `0`, so no sweep and no shared clock are needed to agree a
+pause is over.
+
+**Keywords and priority people** (REQ-135, ARCH-103) are replaced wholesale
+rather than edited, which keeps the ops idempotent and the caps enforceable:
+
+**`SET_KEYWORDS` (C → S), `0x00CE`** — replace my keyword list.
+
+    count (u8), then count × term (str)
+
+**`SET_PRIORITY` (C → S), `0x00CF`** — replace my priority-people list.
+
+    count (u8), then count × user_id (u64)
+
+**`ALERT_PREFS` (S → C), `0x00D0`** — both lists as stored, self only.
+
+    n_terms (u8), n_terms × term (str), n_people (u8), n_people × user_id (u64)
+
+Both lists cap at 64 (`OC_MAX_KEYWORDS`, `OC_MAX_PRIORITY`) and a term at 64
+bytes; the encoder truncates to the cap rather than failing. A keyword hit is
+**written into `mentions` with its own kind**, so the push query, the activity
+feed and the reader's highlight all keep working unchanged — and it is matched by
+`shared/mention.c`, never by SQL, so a client highlights exactly what the server
+notified on. Priority people pierce a level and a pause but never a mute
+(REQ-135/137).
+
+### 5.16e Profile depth: custom status, title, timezone and avatar
+
+**`SET_STATUS` (C → S), `0x006F`** — Set or clear my transient custom status. (REQ-241, REQ-122, WIN-53)
+
+    emoji (str), text (str), expires_at (u64)
+
+**`SET_PROFILE` (C → S), `0x0070`** — Set my job title and timezone. (REQ-240, WIN-47)
+
+    title (str), timezone (str)
+
+**`SET_AVATAR` (C → S), `0x0078`** — Point my avatar at an already-uploaded attachment, or clear it. (REQ-240, WIN-47 (image travels via the REQ-140 upload path))
+
+    attachment_id (u64)
+
+**`PROFILE_INFO` (S → C), `0x0072`** — One person's complete profile — everything a roster shows about them — as the reply to a profile read and to any of SET_STATUS / SET_PROFILE / SET_AVATAR. (REQ-240, REQ-241, WIN-47, WIN-53)
+
+    user_id (u64), display_name (str), email (str), status_emoji (str), status_text (str), status_expires (u64), title (str), timezone (str), avatar_id (u64), role (u8)
+
+An **empty `text` on `SET_STATUS` clears all three fields together** — emoji,
+text and expiry — because "no status" is one state rather than two, and a client
+must not be able to leave an orphan emoji behind. `expires_at` is an absolute
+instant, `0` meaning "until I change it", and the **daemon** enforces it on read:
+a client that is not running cannot clear its own status.
+
+`SET_AVATAR` takes an **attachment id, never bytes**, so the upload path's dedup,
+size cap and reclamation all keep working. The id is validated rather than
+trusted: it must exist, be finalized, carry an `image/*` MIME type, **and have
+been uploaded by the caller**. That last check is load-bearing — avatars are
+readable workspace-wide, so without it a member could point their avatar at
+somebody else's private-channel attachment.
+
+> **`SET_PROFILE` cannot be delivered.** Its opcode `0x0070` is also
+> `SET_PRESENCE`; the daemon dispatches presence first, and a title/timezone
+> payload fails the presence decoder, so the connection is dropped. Do not
+> implement against `0x0070` for this frame until the number is resolved. See
+> [BACKLOG.md](./BACKLOG.md).
+
+### 5.16f Drafts and scheduled messages
+
+Server-stored user content (ARCH-101/102), not client settings: the
+`client_settings` bucket is partitioned per frontend, which would make a draft
+written in one client invisible in another.
+
+**`SET_DRAFT` (C → S), `0x00C0`** — Upsert the caller's draft for a conversation; an empty body deletes it. (REQ-223, REQ-229, ARCH-101)
+
+    channel_id (u64), thread_root (u64), recipients (str), body (str)
+
+**`LIST_DRAFTS` (C → S), `0x00C1`** — Ask for every draft the caller holds. (REQ-223, ARCH-101)
+
+    (empty)
+
+**`DRAFT` (S → C), `0x00C2`** — One draft — both a LIST_DRAFTS stream entry and the cross-device sync push. (REQ-223, REQ-229, ARCH-101)
+
+    id (u64), channel_id (u64), thread_root (u64), updated_ms (u64), recipients (str), body (str)
+
+**`DRAFTS` (S → C), `0x00C3`** — Terminator for a LIST_DRAFTS stream, carrying how many DRAFT frames preceded it. (REQ-223, ARCH-101)
+
+    count (u16)
+
+**`SCHEDULE_MESSAGE` (C → S), `0x00C4`** — Hold a message and deliver it through the ordinary send path at send_at_ms. (REQ-224, ARCH-102)
+
+    channel_id (u64), thread_root (u64), send_at_ms (u64), body (str)
+
+**`LIST_SCHEDULED` (C → S), `0x00C5`** — Ask for everything the caller still has waiting. (REQ-224, ARCH-102)
+
+    (empty)
+
+**`CANCEL_SCHEDULED` (C → S), `0x00C6`** — Drop a scheduled message before it fires. (REQ-224, ARCH-102)
+
+    id (u64)
+
+**`UPDATE_SCHEDULED` (C → S), `0x00C7`** — Change a scheduled message's fire time, its text, or both. (REQ-224, ARCH-102)
+
+    id (u64), send_at_ms (u64), body (str)
+
+**`SCHEDULED` (S → C), `0x00C8`** — One scheduled row — both a LIST_SCHEDULED stream entry and the ack/sync push. (REQ-224, ARCH-102)
+
+    id (u64), channel_id (u64), thread_root (u64), send_at_ms (u64), created_ms (u64), state (u8), fail_reason (str), body (str)
+
+**`SCHEDULED_LIST` (S → C), `0x00C9`** — Terminator for a LIST_SCHEDULED stream, carrying how many SCHEDULED frames preceded it. (REQ-224, ARCH-102)
+
+    count (u16)
+
+A draft may be **unaddressed** — `channel_id` absent with a `recipients` list
+beside it — because the New Message pane autosaves before a recipient is chosen
+(REQ-229). A scheduled message is held in its own table and fired by a daemon
+sweep on its own ~15 s timer (`OPENCHIME_SCHED_TICK_MS`), delivered through the
+ordinary send path so mentions and notifications cannot diverge, with the
+**daemon minting the idempotency token at fire time** — the client's token
+belongs to the scheduling request.
+
+### 5.16g Custom emoji, group DMs and unresolved mentions
+
+**`ADD_EMOJI` (C → S), `0x007A`** — Register a custom emoji shortcode pointing at an already-uploaded image. (REQ-072)
+
+    name (str), attachment_id (u64)
+
+**`DELETE_EMOJI` (C → S), `0x007B`** — Remove a custom emoji shortcode by name. (REQ-072)
+
+    name (str)
+
+**`LIST_EMOJI` (C → S), `0x007C`** — Ask for the workspace's custom-emoji catalogue. (REQ-072)
+
+    (empty)
+
+**`EMOJI_LIST` (S → C), `0x007D`** — The whole custom-emoji catalogue — a reply to LIST_EMOJI and also the push after any add or delete. (REQ-072)
+
+    count (u16), then count repetitions of: name (str), attachment_id (u64), created_by (u64)
+
+**`OPEN_GROUP_DM` (C → S), `0x0079`** — Open — or reopen — the group DM whose participant set is the caller plus the named users. (REQ-056)
+
+    count (u16), then count repetitions of: user_id (u64)
+
+**`MENTION_UNRESOLVED` (S → C), `0x00B3`** — Tell the sender alone which names in a just-sent message resolved to real people who are not in this channel, so the mention notified nobody. (REQ-287)
+
+    channel_id (u64), message_id (u64), can_add (u8), is_private (u8), count (u16), then count repetitions of: user_id (u64), name (str)
+
+**`LIST_FILE_CHANNELS` (C → S), `0x0073`** — Ask which channels hold files, and how many each holds. (WIN-82)
+
+    (empty)
+
+**`FILE_CHANNELS` (S → C), `0x0074`** — One (channel_id, file count) pair per channel the caller can read that holds at least one file. (WIN-82)
+
+    count (u16), then count repetitions of: channel_id (u64), count (u32)
+
+A custom emoji's **name is its identity**, flat and workspace-wide: a duplicate
+is refused rather than replacing an image existing messages already refer to. A
+group DM is not a second kind — it is the same `kind='dm'` channel under the same
+participant-set key, which is why it needed no migration. `MENTION_UNRESOLVED`
+goes to the **sender only**: nothing failed and the message was stored, so it is
+a notice rather than an `ERROR`, and it carries `can_add`/`is_private` so the
+client never offers an action that would fail.
+
+### 5.16h Invite, session and webhook management
+
+**`LIST_INVITES` (C → S), `0x004B`** — Ask for the outstanding (unconsumed, unexpired) tenant invites. (REQ-026, WIN-46)
+
+    (empty)
+
+**`INVITE_LIST` (S → C), `0x004C`** — The outstanding invites, identified by a server-side id — never the token. (REQ-026, WIN-46)
+
+    count (u16), then count x { invite_id (u64), role (u8), created_at (u64), expires_at (u64), created_by (u64) }
+
+**`REVOKE_INVITE` (C → S), `0x004D`** — Revoke one outstanding invite by its id. (REQ-026, WIN-46)
+
+    invite_id (u64)
+
+**`INVITE_REVOKED` (S → C), `0x004E`** — Ack for REVOKE_INVITE, carrying the id so the client can drop that row without re-listing. (REQ-026, WIN-46)
+
+    invite_id (u64)
+
+**`LIST_SESSIONS` (C → S), `0x0075`** — Ask for the caller's own active sessions. (REQ-182)
+
+    (empty)
+
+**`SESSION_LIST` (S → C), `0x0076`** — The caller's unexpired sessions, so a device can be identified before it is revoked. (REQ-182)
+
+    count (u16), then count x { session_id (u64), created_at (u64), last_seen (u64), expires_at (u64), current (u8), device_label (str) }
+
+**`SET_WEBHOOK_STATE` (C → S), `0x006B`** — Enable or disable one incoming webhook. (REQ-170, WIN-48)
+
+    webhook_id (u64), disabled (u8)
+
+**`ROTATE_WEBHOOK` (C → S), `0x006C`** — Mint a new token for an existing webhook, invalidating the old one. (REQ-170, WIN-48)
+
+    webhook_id (u64)
+
+`SESSION_LIST` never carries a token — only the metadata needed to recognise a
+session and revoke it (REQ-182). Rotating a webhook mints a new token and returns
+it once, on the same terms as creation: only the SHA-256 is stored, so a token
+cannot be re-shown.
+
+### 5.16i Threads across channels
+
+Delivers REQ-062 (ARCH-104). Participation is **derived** — you are in a thread
+if you wrote its root or any reply — so the follow table holds only overrides,
+and an explicit unfollow outranks having replied.
+
+**`LIST_THREADS` (C → S), `0x00D1`** — Ask for every thread I am in, across all channels, optionally only the unread ones. (REQ-062, ARCH-104)
+
+    filter (u8) — OPTIONAL: an EMPTY payload is legal and decodes as filter = OC_THREADF_ALL (0)
+
+**`THREADS` (S → C), `0x00D3`** — Terminator of a LIST_THREADS response, stating how many THREAD_SUMMARY frames preceded it. (REQ-062, ARCH-104)
+
+    count (u32)
+
+**`THREAD_SUMMARY` (S → C), `0x00D2`** — One thread's aggregate row: its root, its activity, my unread count and whether I follow it. (REQ-062, ARCH-104)
+
+    root_id (u64), channel_id (u64), root_author (u64), root_at (u64), last_reply_at (u64), reply_count (u32), unread (u32), following (u8), preview (str)
+
+**`SET_THREAD_FOLLOW` (C → S), `0x00D4`** — Follow or unfollow one thread explicitly. (REQ-062, ARCH-104)
+
+    root_id (u64), channel_id (u64), on (u8)
+
+**`MARK_THREAD_READ` (C → S), `0x00D5`** — Mark a thread's replies read up to a reply id. (REQ-062, ARCH-104)
+
+    root_id (u64), up_to (u64)
+
+Unread replies are counted against a **per-thread cursor**, not the channel's:
+the channel cursor advances when the channel is read and says nothing about a
+thread inside it, and threads are deliberately outside the main scroll (REQ-060).
+The follow and read acks return the one row that changed rather than a fresh
+list, so opening a thread does not cost the whole view.
+
 ### 5.17 Audio call signaling (REQ-150, REQ-152)
 
 Audio is **server-relayed** (no P2P/ICE, ARCH-18): the media itself flows over a
-separate UDP sidecar (ARCH-31, a later milestone), but a call is *set up* over
+separate UDP sidecar (ARCH-31) — built, forked at daemon startup, and handed each
+join's token over its IPC socket — but a call is *set up* over
 this TCP protocol. A call is **one per channel** (`call_id == channel_id`), and
 its roster is **ephemeral net-thread state** (like presence, ARCH-67) — it holds
 no DB rows and resets on daemon restart.
@@ -1467,8 +1842,10 @@ A **non-zero** cursor keeps its literal meaning — strictly greater than
 `after_message_id` — so a reconnecting client that still holds history receives
 only what it missed, with no duplicate replay.
 
-The server only replays messages in channels the requesting user is a member of
-(REQ-031, REQ-080).
+The server replays a channel the caller may **read** — public, or one they are a
+member of — which is the same rule §5.7 applies to reading generally (REQ-031).
+A cursorless request is the narrower case: with no cursors the server derives the
+caller's *member* channels and resumes each from its stored read cursor.
 
 ### 6.2 Replay and `BACKFILL_DONE` (server → client), msg_type `0x0031`
 
@@ -1575,7 +1952,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `1002` | `VERSION_TOO_NEW`     | handshake  | yes   | Client's `min_version` > server maximum. Operator must upgrade the daemon; do **not** prompt the user to update the app. |
 | `1003` | `MALFORMED_FRAME`     | any        | yes   | Unparseable frame, or `version` not equal to the negotiated one. |
 | `1004` | `FRAME_TOO_LARGE`     | any        | yes   | `length` implies a frame larger than `MAX_FRAME_SIZE`.         |
-| `1005` | `UNEXPECTED_MSG_TYPE` | any        | yes   | A frame not valid in the current state (e.g. non-`HELLO` first frame, or a `SEND` before `AUTH_OK`). |
+| `1005` | `UNEXPECTED_MSG_TYPE` | any        | yes   | Reserved for a frame not valid in the current state. **Never emitted**: a non-`HELLO` first frame closes the socket silently and an unrecognised post-auth type is ignored. A `SEND` before `AUTH_OK` gets `AUTH_REQUIRED` instead. |
 | `2001` | `AUTH_REQUIRED`       | post-hello | yes   | A messaging frame arrived before successful `AUTH`.            |
 | `2002` | `AUTH_INVALID_TOKEN`  | auth       | yes   | JWT failed signature/audience/expiry validation (REQ-023).     |
 | `2003` | `AUTH_RATE_LIMITED`   | auth       | yes   | Too many auth attempts for this tenant (REQ-191).              |
@@ -1594,9 +1971,12 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `3012` | `STORAGE_FULL`        | messaging  | no    | Upload refused: below the DB reserve (REQ-216). |
 | `3013` | `ATTACHMENT_GONE`     | messaging  | no    | Reclaimed by age or storage pressure (REQ-215/217). |
 | `3014` | `INVALID_DEVICE_TOKEN`| messaging  | no    | `REGISTER_DEVICE_TOKEN` had an empty token or unknown platform (REQ-132). |
+| `3014` | `INVALID_MESSAGE`     | messaging  | no    | Nothing to send — an empty body on a scheduled message (REQ-224). **The value is assigned twice**; the two travel on different frames, so a receiver disambiguates by context rather than by code. 3020 is unused. See [BACKLOG.md](./BACKLOG.md). |
 | `3015` | `TRANSFER_PROTOCOL`   | messaging  | no    | Out-of-order/oversized chunk or bad transfer state. |
 | `3016` | `UNKNOWN_WEBHOOK`     | webhook    | no    | No such (or disabled) incoming webhook token (REQ-170). |
 | `3017` | `CHANNEL_EXISTS`      | channel    | no    | `CREATE_CHANNEL` name already taken, compared case-insensitively (REQ-040). |
+| `3018` | `TOO_MANY_PINS`       | channel    | no    | The channel already holds 100 pins (REQ-230, ARCH-90). |
+| `3019` | `CHANNEL_ARCHIVED`    | channel    | no    | The channel is archived and read-only (REQ-035). Returned by `SEND`, `SEND_REPLY` and `UPLOAD_BEGIN`; **not** by the webhook post path. |
 | `9001` | `INTERNAL_ERROR`      | any        | maybe | Server-side failure; `fatal` indicates whether the connection survives. |
 
 Handshake-stage version codes (`1001`/`1002`) are delivered via `REJECT`, which
@@ -1606,121 +1986,171 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 
 ## 9. Message type registry
 
-| msg_type | Name               | Direction | Frozen@v1 | Section |
-|----------|--------------------|-----------|-----------|---------|
-| `0x0001` | `HELLO`            | C → S     | yes       | §3.1    |
-| `0x0002` | `WELCOME`          | S → C     | yes       | §3.2    |
-| `0x0003` | `REJECT`           | S → C     | yes       | §3.3    |
-| `0x0010` | `AUTH`             | C → S     | no        | §4.2    |
-| `0x0011` | `AUTH_OK`          | S → C     | no        | §4.3    |
-| `0x0012` | `AUTH_CHALLENGE`   | S → C     | no        | §4.1    |
-| `0x0013` | `LOGOUT`           | C → S     | no        | §4.4    |
-| `0x0014` | `WORKSPACE_INFO`   | S → C     | no        | §4.3a   |
-| `0x0040` | `LIST_USERS`       | C → S     | no        | §5.8    |
-| `0x0041` | `USER_LIST`        | S → C     | no        | §5.8    |
-| `0x0042` | `SET_ROLE`         | C → S     | no        | §5.8    |
-| `0x0043` | `INVITE_USER`      | C → S     | no        | §5.8    |
-| `0x0044` | `REMOVE_USER`      | C → S     | no        | §5.8    |
-| `0x0045` | `USER_UPDATED`     | S → C     | no        | §5.8    |
-| `0x0046` | `INVITE_CREATED`   | S → C     | no        | §5.8    |
-| `0x0047` | `REDEEM_INVITE`    | C → S     | no        | §5.8    |
-| `0x0060` | `SEARCH`           | C → S     | no        | §5.11   |
-| `0x0061` | `SEARCH_RESULTS`   | S → C     | no        | §5.11   |
-| `0x0020` | `SEND`             | C → S     | no        | §5.1    |
-| `0x0021` | `SEND_ACK`         | S → C     | no        | §5.2    |
-| `0x0022` | `BROADCAST`        | S → C     | no        | §5.3    |
-| `0x0023` | `CLIENT_ACK`       | C → S     | no        | §5.4    |
-| `0x0033` | `READ_CURSOR`      | S → C     | no        | §5.4    |
-| `0x0024` | `EDIT`             | C → S     | no        | §5.5    |
-| `0x0025` | `DELETE`           | C → S     | no        | §5.6    |
-| `0x0026` | `MSG_EDITED`       | S → C     | no        | §5.5    |
-| `0x0027` | `MSG_DELETED`      | S → C     | no        | §5.6    |
-| `0x0028` | `REACT`            | C → S     | no        | §5.9    |
-| `0x0029` | `REACTION_UPDATED` | S → C     | no        | §5.9    |
-| `0x002A` | `LIST_REACTIONS`   | C → S     | no        | §5.9    |
-| `0x002B` | `REACTIONS`        | S → C     | no        | §5.9    |
-| `0x002C` | `SEND_REPLY`       | C → S     | no        | §5.10   |
-| `0x002D` | `THREAD_REPLY`     | S → C     | no        | §5.10   |
-| `0x002E` | `LIST_THREAD`      | C → S     | no        | §5.10   |
-| `0x002F` | `THREAD`           | S → C     | no        | §5.10   |
-| `0x0032` | `THREAD_META`      | S → C     | no        | §5.10   |
-| `0x0050` | `CREATE_CHANNEL`   | C → S     | no        | §5.7    |
-| `0x0051` | `CHANNEL_INFO`     | S → C     | no        | §5.7    |
-| `0x0052` | `LIST_CHANNELS`    | C → S     | no        | §5.7    |
-| `0x0053` | `CHANNEL_LIST`     | S → C     | no        | §5.7    |
-| `0x0054` | `JOIN_CHANNEL`     | C → S     | no        | §5.7    |
-| `0x0055` | `LEAVE_CHANNEL`    | C → S     | no        | §5.7    |
-| `0x0056` | `INVITE_TO_CHANNEL`| C → S     | no        | §5.7    |
-| `0x0057` | `REMOVE_FROM_CHANNEL`| C → S   | no        | §5.7    |
-| `0x0058` | `OPEN_DM`          | C → S     | no        | §5.12   |
-| `0x0059` | `CREATE_WEBHOOK`   | C → S     | no        | §5.15   |
-| `0x005A` | `WEBHOOK_INFO`     | S → C     | no        | §5.15   |
-| `0x005B` | `LIST_WEBHOOKS`    | C → S     | no        | §5.15   |
-| `0x005C` | `WEBHOOK_LIST`     | S → C     | no        | §5.15   |
-| `0x005D` | `DELETE_WEBHOOK`   | C → S     | no        | §5.15   |
-| `0x005E` | `WEBHOOK_DELETED`  | S → C     | no        | §5.15   |
-| `0x0070` | `SET_PRESENCE`     | C → S     | no        | §5.13   |
-| `0x0071` | `PRESENCE_UPDATE`  | S → C     | no        | §5.13   |
-| `0x0072` | `TYPING`           | C → S     | no        | §5.13   |
-| `0x0073` | `TYPING_UPDATE`    | S → C     | no        | §5.13   |
-| `0x0090` | `SET_NOTIFY_PREF`  | C → S     | no        | §5.16   |
-| `0x0092` | `LIST_NOTIFY_PREFS`| C → S     | no        | §5.16   |
-| `0x0093` | `NOTIFY_PREFS`     | S → C     | no        | §5.16   |
-| `0x00CA` | `SET_SNOOZE`       | C → S     | no        | §5.16   |
-| `0x00CB` | `SNOOZE`           | S → C     | no        | §5.16   |
-| `0x00CC` | `SET_SCHEDULE`     | C → S     | no        | §5.16   |
-| `0x00CD` | `SCHEDULE`         | S → C     | no        | §5.16   |
-| `0x00CE` | `SET_KEYWORDS`     | C → S     | no        | §5.16   |
-| `0x00CF` | `SET_PRIORITY`     | C → S     | no        | §5.16   |
-| `0x00D0` | `ALERT_PREFS`      | S → C     | no        | §5.16   |
-| `0x00D1` | `LIST_THREADS`     | C → S     | no        | §5.5    |
-| `0x00D2` | `THREAD_SUMMARY`   | S → C     | no        | §5.5    |
-| `0x00D3` | `THREADS`          | S → C     | no        | §5.5    |
-| `0x00D4` | `SET_THREAD_FOLLOW`| C → S     | no        | §5.5    |
-| `0x00D5` | `MARK_THREAD_READ` | C → S     | no        | §5.5    |
-| `0x0094` | `SET_CLIENT_SETTING`   | C → S | no        | §5.16a  |
-| `0x0095` | `LIST_CLIENT_SETTINGS` | C → S | no        | §5.16a  |
-| `0x0096` | `CLIENT_SETTINGS`      | S → C | no        | §5.16a  |
-| `0x0097` | `STORAGE_STATUS_REQ` | C → S | no | §5.16c |
-| `0x0098` | `STORAGE_STATUS` | S → C | no | §5.16c |
-| `0x0099` | `AUDIT_QUERY` | C → S | no | §5.16c |
-| `0x009A` | `AUDIT_PAGE` | S → C | no | §5.16c |
-| `0x0048` | `SET_DISPLAY_NAME` | C → S     | no        | §5.16b  |
-| `0x0049` | `CHANGE_PASSWORD`  | C → S     | no        | §5.16b  |
-| `0x004A` | `PROFILE_UPDATED`  | S → C     | no        | §5.16b  |
-| `0x00A0` | `CALL_JOIN`        | C → S     | no        | §5.17   |
-| `0x00A1` | `CALL_LEAVE`       | C → S     | no        | §5.17   |
-| `0x00A2` | `CALL_JOINED`      | S → C     | no        | §5.17   |
-| `0x00A3` | `CALL_ROSTER`      | S → C     | no        | §5.17   |
-| `0x00B0` | `REGISTER_DEVICE_TOKEN`   | C → S | no    | Push device-token registry (REQ-132). |
-| `0x00B1` | `UNREGISTER_DEVICE_TOKEN` | C → S | no    | Drop a push token (logout / rotation). |
-| `0x00B2` | `DEVICE_TOKEN_ACK`        | S → C | no    | Register/unregister acknowledged. |
-| `0x0080` | `UPLOAD_BEGIN`     | C → S     | no        | §5.14   |
-| `0x0081` | `UPLOAD_READY`     | S → C     | no        | §5.14   |
-| `0x0082` | `UPLOAD_CHUNK`     | C → S     | no        | §5.14   |
-| `0x0083` | `UPLOAD_ACK`       | S → C     | no        | §5.14   |
-| `0x0084` | `UPLOAD_END`       | C → S     | no        | §5.14   |
-| `0x0085` | `UPLOAD_OK`        | S → C     | no        | §5.14   |
-| `0x0086` | `DOWNLOAD_BEGIN`   | C → S     | no        | §5.14   |
-| `0x0087` | `DOWNLOAD_INFO`    | S → C     | no        | §5.14   |
-| `0x0088` | `DOWNLOAD_CHUNK`   | S → C     | no        | §5.14   |
-| `0x0089` | `DOWNLOAD_END`     | S → C     | no        | §5.14   |
-| `0x008A` | `TRANSFER_CANCEL`  | C → S     | no        | §5.14   |
-| `0x0030` | `BACKFILL_REQUEST` | C → S     | no        | §6.1    |
-| `0x0034` | `HISTORY_REQUEST`  | C → S     | no        | §6.3    |
-| `0x0031` | `BACKFILL_DONE`    | S → C     | no        | §6.2    |
-| `0x00FF` | `ERROR`            | S → C     | no        | §8.1    |
+**Generated from `shared/protocol.h`** — every `OC_MSG_*` the codec defines, in
+opcode order, 154 of them. The sections above specify the payload layouts; this
+table is the index and the authority on which values are taken.
 
-Ranges are left sparse (`0x0001–` handshake, `0x0010–` auth/session, `0x0020–`
-messaging, `0x0030–` reconnect, `0x0040–` users/profiles, `0x0050–` channel
-management, `0x0060–` search, `0x0070–` presence/typing, `0x0080–` attachment
-transfer, `0x0090–` notification prefs / client settings / storage / audit,
-`0x00A0–` audio calls, `0x00B0–` push device tokens, `0x00FF` error) so later
-revisions can slot in without renumbering. The `0x0040–0x0048` users/profile
-frames (user enumeration, roles, tenant invite/remove, and `SET_DISPLAY_NAME`;
-§5.8/§5.16b) are all defined.
+Three opcodes are **used by two message types each** (`0x0070`, `0x0072`,
+`0x0073`), marked below. Two of the three pairs are direction-disjoint and inert;
+`SET_PROFILE`/`SET_PRESENCE` are both client→server and collide for real. See
+[BACKLOG.md](./BACKLOG.md).
 
----
+| msg_type | Name | Direction | Notes |
+|---|---|---|---|
+| `0x0001` | `HELLO` | C → S | frozen@v1 |
+| `0x0002` | `WELCOME` | S → C | frozen@v1 |
+| `0x0003` | `REJECT` | S → C | frozen@v1, fatal |
+| `0x0010` | `AUTH` | C → S |  |
+| `0x0011` | `AUTH_OK` | S → C |  |
+| `0x0012` | `AUTH_CHALLENGE` | S → C |  |
+| `0x0013` | `LOGOUT` | C → S |  |
+| `0x0014` | `WORKSPACE_INFO` | S → C | pushed after AUTH_OK |
+| `0x0020` | `SEND` | C → S |  |
+| `0x0021` | `SEND_ACK` | S → C |  |
+| `0x0022` | `BROADCAST` | S → C |  |
+| `0x0023` | `CLIENT_ACK` | C → S |  |
+| `0x0024` | `EDIT` | C → S | (REQ-051) |
+| `0x0025` | `DELETE` | C → S | (REQ-052) |
+| `0x0026` | `MSG_EDITED` | S → C | edit fan-out |
+| `0x0027` | `MSG_DELETED` | S → C | tombstone fan-out |
+| `0x0028` | `REACT` | C → S | (REQ-070) |
+| `0x0029` | `REACTION_UPDATED` | S → C | reaction fan-out |
+| `0x002A` | `LIST_REACTIONS` | C → S | (REQ-071) |
+| `0x002B` | `REACTIONS` | S → C |  |
+| `0x002C` | `SEND_REPLY` | C → S | (REQ-060), a threaded reply |
+| `0x002D` | `THREAD_REPLY` | S → C | reply fan-out (not in main scroll) |
+| `0x002E` | `LIST_THREAD` | C → S | open a thread |
+| `0x002F` | `THREAD` | S → C | a thread's replies |
+| `0x0030` | `BACKFILL_REQUEST` | C → S |  |
+| `0x0031` | `BACKFILL_DONE` | S → C |  |
+| `0x0032` | `THREAD_META` | S → C | a parent's reply count (backfill) |
+| `0x0033` | `READ_CURSOR` | S → C | a member's read cursor advanced (REQ-090 seen-by) |
+| `0x0034` | `HISTORY_REQUEST` | C → S | page BACKWARDS through a channel (§6.3) |
+| `0x0035` | `PIN` | C → S | (REQ-230), pin/unpin a message |
+| `0x0036` | `PIN_UPDATED` | S → C | pin fan-out to every channel member |
+| `0x0037` | `LIST_PINS` | C → S | a channel's pinned messages |
+| `0x0038` | `PINNED_MSG` | S → C | one pinned message (streamed, body included) |
+| `0x0039` | `PINS` | S → C | terminator of a LIST_PINS response |
+| `0x003A` | `LIST_MEMBERS` | C → S | (REQ-031), a channel's members |
+| `0x003B` | `MEMBER_ENTRY` | S → C | one channel member (streamed) |
+| `0x003C` | `MEMBERS` | S → C | terminator of a LIST_MEMBERS response |
+| `0x003D` | `LIST_FILES` | C → S | (REQ-143), files in a channel (0 = everywhere) |
+| `0x003E` | `FILE_ENTRY` | S → C | one shared file (streamed) |
+| `0x003F` | `FILES` | S → C | terminator of a LIST_FILES response |
+| `0x0040` | `LIST_USERS` | C → S | tenant user enumeration |
+| `0x0041` | `USER_LIST` | S → C |  |
+| `0x0042` | `SET_ROLE` | C → S | (ARCH-60, REQ-030) |
+| `0x0043` | `INVITE_USER` | C → S | (REQ-033, tenant-level; owner/admin) |
+| `0x0044` | `REMOVE_USER` | C → S | (REQ-033, tenant-level; owner/admin) |
+| `0x0045` | `USER_UPDATED` | S → C | ack/push for SET_ROLE + REMOVE_USER |
+| `0x0046` | `INVITE_CREATED` | S → C | the minted invite token |
+| `0x0047` | `REDEEM_INVITE` | C → S | pre-auth account creation |
+| `0x0048` | `SET_DISPLAY_NAME` | C → S | change your own display name (REQ-020) |
+| `0x0049` | `CHANGE_PASSWORD` | C → S | change your own local password (verify old) |
+| `0x004A` | `PROFILE_UPDATED` | S → C | a user's display name changed (also the self ack) |
+| `0x004B` | `LIST_INVITES` | C → S | outstanding invites (owner/admin) |
+| `0x004C` | `INVITE_LIST` | S → C | the list (token HASHES only, never tokens) |
+| `0x004D` | `REVOKE_INVITE` | C → S | revoke one by id |
+| `0x004E` | `INVITE_REVOKED` | S → C | ack |
+| `0x0050` | `CREATE_CHANNEL` | C → S | (REQ-050) |
+| `0x0051` | `CHANNEL_INFO` | S → C | ack for create/join/leave/invite/remove |
+| `0x0052` | `LIST_CHANNELS` | C → S |  |
+| `0x0053` | `CHANNEL_LIST` | S → C |  |
+| `0x0054` | `JOIN_CHANNEL` | C → S |  |
+| `0x0055` | `LEAVE_CHANNEL` | C → S |  |
+| `0x0056` | `INVITE_TO_CHANNEL` | C → S | (REQ-033, channel-level) |
+| `0x0057` | `REMOVE_FROM_CHANNEL` | C → S | (REQ-033, channel-level) |
+| `0x0058` | `OPEN_DM` | C → S | open/get a 1:1 DM (REQ-050) |
+| `0x0059` | `CREATE_WEBHOOK` | C → S | mint an incoming-webhook token (REQ-170) |
+| `0x005A` | `WEBHOOK_INFO` | S → C | the minted webhook id + token (shown once) |
+| `0x005B` | `LIST_WEBHOOKS` | C → S | list a channel's webhooks (REQ-170) |
+| `0x005C` | `WEBHOOK_LIST` | S → C | the webhook list (no tokens) |
+| `0x005D` | `DELETE_WEBHOOK` | C → S | remove a webhook |
+| `0x005E` | `WEBHOOK_DELETED` | S → C | ack for DELETE_WEBHOOK |
+| `0x005F` | `UPDATE_CHANNEL` | C → S | (REQ-034/035/036), mutate a channel |
+| `0x0060` | `SEARCH` | C → S | (REQ-080) |
+| `0x0061` | `SEARCH_RESULTS` | S → C |  |
+| `0x0062` | `SAVE_ITEM` | C → S | save/unsave a message (private) |
+| `0x0063` | `SAVED_UPDATED` | S → C | ack to the actor only |
+| `0x0064` | `LIST_SAVED` | C → S | my saved items |
+| `0x0065` | `SAVED_MSG` | S → C | one saved message (streamed) |
+| `0x0066` | `SAVED` | S → C | terminator |
+| `0x0067` | `LIST_ACTIVITY` | C → S | (REQ-139), what involved me — or what I have not read |
+| `0x0068` | `ACTIVITY_ENTRY` | S → C | one activity item (streamed) |
+| `0x0069` | `ACTIVITY` | S → C | terminator + the seen watermark |
+| `0x006A` | `HISTORY_AROUND` | C → S | (REQ-232), the messages AROUND an id |
+| `0x006B` | `SET_WEBHOOK_STATE` | C → S | enable/disable one |
+| `0x006C` | `ROTATE_WEBHOOK` | C → S | mint a new token for it |
+| `0x006D` | `SET_MUTE` | C → S | mute/unmute a conversation |
+| `0x006E` | `SET_READ_CURSOR` | C → S | set the cursor (may move BACK) |
+| `0x006F` | `SET_STATUS` | C → S | my custom status (empty text clears) |
+| `0x0070` | `SET_PRESENCE` | C → S | set own presence (REQ-120) **(opcode shared)** |
+| `0x0070` | `SET_PROFILE` | C → S | my title/timezone **(opcode shared)** |
+| `0x0071` | `PRESENCE_UPDATE` | S → C | a user's presence changed |
+| `0x0072` | `PROFILE_INFO` | S → C | a user's full profile (also a push) **(opcode shared)** |
+| `0x0072` | `TYPING` | C → S | "I am typing" in a channel (REQ-121) **(opcode shared)** |
+| `0x0073` | `LIST_FILE_CHANNELS` | C → S |  **(opcode shared)** |
+| `0x0073` | `TYPING_UPDATE` | S → C | relay of a typing signal **(opcode shared)** |
+| `0x0074` | `FILE_CHANNELS` | S → C | (channel_id, count) pairs |
+| `0x0075` | `LIST_SESSIONS` | C → S |  |
+| `0x0076` | `SESSION_LIST` | S → C | never the tokens |
+| `0x0077` | `SET_NOTIFY_DEFAULT` | — |  |
+| `0x0079` | `OPEN_GROUP_DM` | C → S | open/create a group DM (REQ-056) |
+| `0x007A` | `ADD_EMOJI` | C → S | name + attachment id (REQ-072) |
+| `0x007B` | `DELETE_EMOJI` | C → S | name |
+| `0x007C` | `LIST_EMOJI` | C → S | ask for the catalogue |
+| `0x007D` | `EMOJI_LIST` | S → C | the catalogue (also a push) |
+| `0x0080` | `UPLOAD_BEGIN` | C → S | declare an attachment upload (REQ-140) |
+| `0x0081` | `UPLOAD_READY` | S → C | id + chunk size + in-flight window |
+| `0x0082` | `UPLOAD_CHUNK` | C → S | one upload chunk |
+| `0x0083` | `UPLOAD_ACK` | S → C | window advance |
+| `0x0084` | `UPLOAD_END` | C → S | finish the upload |
+| `0x0085` | `UPLOAD_OK` | S → C | upload finalized (id + size + sha256) |
+| `0x0086` | `DOWNLOAD_BEGIN` | C → S | request an attachment (REQ-141) |
+| `0x0087` | `DOWNLOAD_INFO` | S → C | metadata preceding the bytes |
+| `0x0088` | `DOWNLOAD_CHUNK` | S → C | one download chunk |
+| `0x0089` | `DOWNLOAD_END` | S → C | all bytes sent |
+| `0x008A` | `TRANSFER_CANCEL` | C → S | abort an in-progress transfer |
+| `0x0090` | `SET_NOTIFY_PREF` | C → S | set a channel's notification level (REQ-130) |
+| `0x0092` | `LIST_NOTIFY_PREFS` | C → S | request all notification settings |
+| `0x0093` | `NOTIFY_PREFS` | S → C | DND + per-channel levels (also a sync push) |
+| `0x0094` | `SET_CLIENT_SETTING` | C → S | upsert a synced client setting (empty value = delete) |
+| `0x0095` | `LIST_CLIENT_SETTINGS` | C → S | request a client_type bucket's settings |
+| `0x0096` | `CLIENT_SETTINGS` | S → C | a bucket snapshot (also a device-sync push) |
+| `0x0097` | `STORAGE_STATUS_REQ` | C → S | owner/admin: ask for storage usage (REQ-214) |
+| `0x0098` | `STORAGE_STATUS` | S → C | usage + policy + what maintenance reclaimed |
+| `0x0099` | `AUDIT_QUERY` | C → S | owner/admin: page the audit log (REQ-251) |
+| `0x009A` | `AUDIT_PAGE` | S → C | a page of entries, newest first |
+| `0x00A0` | `CALL_JOIN` | C → S | join a channel's audio call (REQ-150) |
+| `0x00A1` | `CALL_LEAVE` | C → S | leave the call |
+| `0x00A2` | `CALL_JOINED` | S → C | to the joiner: call id + UDP endpoint/token + roster |
+| `0x00A3` | `CALL_ROSTER` | S → C | to participants: roster changed |
+| `0x00B0` | `REGISTER_DEVICE_TOKEN` | C → S | register a mobile push token (REQ-132) |
+| `0x00B1` | `UNREGISTER_DEVICE_TOKEN` | C → S | drop a push token (logout / token change) |
+| `0x00B2` | `DEVICE_TOKEN_ACK` | S → C | register/unregister acknowledged |
+| `0x00B3` | `MENTION_UNRESOLVED` | — | Drafts (REQ-223, ARCH-101). DRAFT is deliberately BOTH the streamed list * entry and the dev… |
+| `0x00C0` | `SET_DRAFT` | C → S | upsert a draft (empty body = delete) |
+| `0x00C1` | `LIST_DRAFTS` | C → S | all of my drafts |
+| `0x00C2` | `DRAFT` | S → C | one draft: a list entry AND the sync push |
+| `0x00C3` | `DRAFTS` | S → C | terminator |
+| `0x00C4` | `SCHEDULE_MESSAGE` | C → S | hold this until send_at_ms |
+| `0x00C5` | `LIST_SCHEDULED` | C → S | everything I have waiting |
+| `0x00C6` | `CANCEL_SCHEDULED` | C → S | drop one before it fires |
+| `0x00C7` | `UPDATE_SCHEDULED` | C → S | change its time or its text |
+| `0x00C8` | `SCHEDULED` | S → C | one row: list entry AND push |
+| `0x00C9` | `SCHEDULED_LIST` | S → C | terminator |
+| `0x00CA` | `SET_SNOOZE` | C → S | pause for N minutes from now (0 = end it) |
+| `0x00CB` | `SNOOZE` | S → C | to that user's own connections: when it ends |
+| `0x00CC` | `SET_SCHEDULE` | C → S | mode + base window + per-weekday rows |
+| `0x00CD` | `SCHEDULE` | S → C | self only: the same, as stored |
+| `0x00CE` | `SET_KEYWORDS` | C → S | replace my keyword list wholesale |
+| `0x00CF` | `SET_PRIORITY` | C → S | replace my priority-people list |
+| `0x00D0` | `ALERT_PREFS` | S → C | self only: both lists, as stored |
+| `0x00D1` | `LIST_THREADS` | C → S | {filter} 0 all / 1 unread only |
+| `0x00D2` | `THREAD_SUMMARY` | S → C | one thread (streamed) |
+| `0x00D3` | `THREADS` | S → C | terminator |
+| `0x00D4` | `SET_THREAD_FOLLOW` | C → S | follow/unfollow one thread |
+| `0x00D5` | `MARK_THREAD_READ` | C → S | its replies are read up to here |
 
 ## 10. Connection state machine
 
@@ -1745,7 +2175,9 @@ frames (user enumeration, roles, tenant invite/remove, and `SET_DISPLAY_NAME`;
 ```
 
 - Any fatal `ERROR`/`REJECT` transitions to closed from any state.
-- A frame invalid for the current state yields `ERROR UNEXPECTED_MSG_TYPE`
+- A frame invalid for the current state is specified to yield `ERROR
+  UNEXPECTED_MSG_TYPE`, and does not: the pre-auth case answers `AUTH_REQUIRED`,
+  and the others close or ignore silently
   (fatal).
 - On an unexpected transport close, the client reconnects (REQ-100) and starts
   over from `HELLO`, following `AUTH_OK` with a `BACKFILL_REQUEST` (§6).
@@ -1766,7 +2198,7 @@ frames (user enumeration, roles, tenant invite/remove, and `SET_DISPLAY_NAME`;
 | REQ-140     | Chunked upload/download proxied through the daemon; blob in object storage, pointer in SQLite (§5.14, ARCH-69/70). |
 | REQ-141     | Every byte proxied, so access control is the ordinary membership check on the attached message — no signed URLs (§5.14, ARCH-69). |
 | REQ-170     | `CREATE_WEBHOOK`/`WEBHOOK_INFO` mint a hashed per-channel token; `POST /webhook/<token>` (ALPN-demuxed HTTP) posts as the creator (§5.15, ARCH-71). |
-| REQ-130/131 | `SET_NOTIFY_PREF`/`SET_DND`/`LIST_NOTIFY_PREFS` → `NOTIFY_PREFS`; server-authoritative settings synced to all the user's devices (§5.16, ARCH-72). |
+| REQ-130/136/278 | `SET_NOTIFY_PREF`/`SET_NOTIFY_DEFAULT`/`SET_MUTE`/`SET_SCHEDULE`/`SET_SNOOZE`/`LIST_NOTIFY_PREFS` → `NOTIFY_PREFS`; server-authoritative settings synced to all the user's devices (§5.16, ARCH-72/103). REQ-131's `SET_DND` is retired — the schedule replaced it. |
 
 Related decisions newly recorded in ARCHITECTURE.md: ARCH-41 (handshake &
 version negotiation), ARCH-42 (primitive field encodings), ARCH-43 (message id

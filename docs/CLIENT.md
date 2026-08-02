@@ -21,7 +21,7 @@ and mobile follow.
 ```
 shared/        wire contract: protocol, tls, framebuf, sock   (daemon + client)
 client/core/   the app-core — frontend-agnostic, headless-testable C:
-               net thread + session + (later) SQLite store + the view-model
+               net thread + session + credential store + the view-model
                (channels, messages, roster, presence, unread) + reducers
 client/tui/    terminal frontend over the core                (first frontend)
 client/gui/win32/  the native Win32 GUI over the same core    (in progress)
@@ -61,11 +61,16 @@ exact `shared/` wire source, so client and server can't drift (the same reason
   into that state. A frontend owns an `oc_model`, drains events each tick, applies
   them, and renders — the "read events at frame start" shape, fed by the net
   thread. Single-threaded on the frontend, so no locking.
-- **`client.c` — the facade.** `oc_client_start(host, port, cred)` /
-  `oc_client_tick()` (drain + apply) / `oc_client_model()` / `oc_client_send()` /
-  `oc_client_backfill()` / `oc_client_mark_read()` / `oc_client_react()` /
-  `oc_client_edit()` / `oc_client_delete()` / `oc_client_typing()` /
-  `oc_client_stop()`. A frontend uses only this.
+- **`client.c` — the facade.** The lifecycle is `oc_client_start` /
+  `start_secure` / `start_stored`, then `oc_client_tick()` (drain + apply),
+  `oc_client_model()` and `oc_client_stop()`; the messaging core is
+  `send` / `backfill` / `history` / `history_around` / `mark_read` / `react` /
+  `edit` / `delete` / `typing`. **`client/core/client.h` is the authoritative
+  list** — it declares over a hundred entry points, covering threads, pins, saved
+  items, activity, search with operators and paging, channel and member
+  management, files, drafts, scheduling, custom emoji, profile and status,
+  notification settings, admin and storage. This document does not enumerate
+  them; read the header. A frontend uses only this facade.
 
 **Headless-testable.** `tests/test_client_core.c` starts the daemon's netloop
 in-process (like the itest) and drives real `oc_client`s against it — connect +
@@ -117,7 +122,8 @@ model; translate input to intents }, stop.
   drawn cell-by-cell, re-laid-out on resize, measuring glyph width with utf8proc.
   **Navigation mode** (Esc from the composer, or Tab on an empty composer): a
   panel is focused (bright border); Tab cycles Channels / Messages / Members,
-  j/k move a highlighted selection, Esc returns to the composer. On the Messages
+  the arrow keys move a highlighted selection (`j`/`k` were dropped with the
+  tuikit redesign), Esc returns to the composer. On the Messages
   panel, Enter opens an action menu (Reply in thread / Add reaction / Download /
   Edit / Delete / Who reacted); single-key accelerators act directly: `t`
   thread, `r` react (opens a filterable emoji picker), `e` edit (prefills the
@@ -149,12 +155,12 @@ model; translate input to intents }, stop.
   `oc_client_list_settings`, folding each snapshot into the model
   (`oc_model_setting`); the `tui` bucket is separate from the `gui` one the
   Win32 client identifies as, so
-  frontends never step on each other. Synced prefs are read-only from the TUI: it
-  pulls the daemon bucket on connect and layers it over the machine-local
-  `~/.config/openchime/config` file, but the interactive `/set` writer was
-  removed with the slash-command UX. Edit the config file to change local prefs.
-  (The core still exposes `oc_client_set_setting`; no frontend surface currently
-  calls it.) Which server you connect to
+  frontends never step on each other. The TUI pulls the daemon bucket on connect
+  and layers it over the machine-local `~/.config/openchime/config` file. Most
+  display prefs are read-only there — the interactive `/set` writer went with the
+  slash-command UX, so editing the file is how they change — but the TUI **does**
+  write one thing back: its sidebar sort, filter and collapse state, persisted
+  through `oc_client_set_setting`. Which server you connect to
   (`workspace`) is deliberately machine-local and never synced.
   **Storage report (REQ-214):** the launcher's "Storage usage" opens an admin overlay showing free
   space, live attachment usage, the active retention/eviction policy, and how
@@ -245,7 +251,7 @@ model; translate input to intents }, stop.
     `oc_client_delete_webhook` and the daemon handles `DELETE_WEBHOOK`, but the
     overlay is read-only and its header still shows a stale `/webhook` slash-command
     hint left over from the removed slash UX (both are known bugs —
-    [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §3.6).
+    [BACKLOG.md](./BACKLOG.md)).
   - **attachments** — the launcher's "Upload a file" streams a local file through
     the daemon (UPLOAD_BEGIN → CHUNKs within the advertised window → END → OK) and
     links it into a message; the message menu's "Download file" saves an
@@ -254,24 +260,38 @@ model; translate input to intents }, stop.
     (id, filename, mime, size), rendered as a `📎 name (size) #id` line.
     Text-only, so files are never rendered inline (REQ-140/141).
 
-  With attachments surfaced, **nearly every capability the app-core exposes is
-  reachable from the TUI** — the two `oc_client_*` calls with no TUI surface are
-  `delete_webhook` (above) and `logout(OC_LOGOUT_ALL)` (the TUI only revokes its
-  own session). `oc_client_set_setting` also has no caller in any frontend.
+  **The TUI reaches a minority of the app-core today.** It was the reference
+  client until the July 2026 engine and GUI work; since then the core has roughly
+  doubled and the TUI has not followed, so **most `oc_client_*` entry points have
+  no TUI caller** — pins, saved items, the activity feed, the channel member and
+  file listings, mute, the notification default, group DMs, custom emoji, status
+  and profile fields, drafts, scheduling, threads-follow, the People directory,
+  search operators and paging, and webhook delete among them. The frontend order
+  (all of Win32 first) makes that an accepted consequence rather than a defect;
+  the itemised list is [BACKLOG.md](./BACKLOG.md). `oc_client_set_setting`, once
+  recorded here as callerless, **is called by both frontends** — the TUI persists
+  its sidebar sort/filter/collapse through it and the Win32 client its
+  preferences.
 
-  Separately, several frames the **daemon** speaks reach **no client** yet:
+  Separately, three frames the **daemon** speaks reach **no client**:
   `CALL_JOIN`/`CALL_LEAVE` (the audio client, REQ-150–152),
   `REGISTER_DEVICE_TOKEN`/`UNREGISTER_DEVICE_TOKEN` (exercised only by
   `tests/demo_client.c`, so no shipped client can populate the push registry —
-  ARCH-85), `INVITE_TO_CHANNEL`, `REMOVE_FROM_CHANNEL`, `REDEEM_INVITE` (the
-  missing signup/first-owner flow, REQ-268), and `TRANSFER_CANCEL`. None is
-  implemented in `client/core`, so this is core work, not frontend work.
-- **Windows (`client/gui/win32/`, in progress):** **Win32 in pure C** over the
+  ARCH-85), and `TRANSFER_CANCEL`. None is implemented in `client/core`, so those
+  are core work rather than frontend work. `INVITE_TO_CHANNEL`,
+  `REMOVE_FROM_CHANNEL` and `REDEEM_INVITE` **are** implemented
+  (`oc_client_channel_invite` / `_channel_kick` / `_redeem_invite`) and the Win32
+  client surfaces all three.
+- **Windows (`client/gui/win32/`):** **Win32 in pure C** over the
   core — **Direct2D/DirectWrite
-  (+ WIC)** for the custom surfaces (message transcript, sidebar, rails) and
-  **native controls for the hard bits** (RichEdit composer, EDIT search, Win32
-  menus, dialogs). No WinUI, no .NET, no C++, no cross-platform toolkit
-  (ARCH-80/82). The **Windows TUI** already shipped and validated the core port —
+  (+ WIC)** for the custom surfaces (message transcript, sidebar, rails,
+  **the composer**, and every menu) and **native controls where they still earn
+  their keep**: `EDIT` boxes (find, search, files-search, sign-in, palette, the
+  form fields), the file picker, and the window frame. No WinUI, no .NET, no C++,
+  no cross-platform toolkit (ARCH-80/82). The composer and the context menus were
+  native once and are not any more — ARCH-98 took them back, so **`RichEdit`,
+  `TrackPopupMenu`, `CreatePopupMenu` and `AppendMenuW` appear nowhere in the
+  client**. The **Windows TUI** already shipped and validated the core port —
   pthreads, DNS SRV, sockets — via a termbox2-API layer over the Windows Console
   API (ARCH-81, done), so the GUI proceeds against a trusted core. Two earlier
   GUI drafts were built and rejected (ARCH-82): a comctl32 GUI (too dated) and a
@@ -288,13 +308,16 @@ model; translate input to intents }, stop.
   everywhere), **profile** (presence, DND, display name, password), and **New**
   (channel, DM, upload, search). Right of the rail sits the channel column
   (header with settings + compose buttons, a "Find a conversation" filter, then
-  the channel list), the transcript, the RichEdit composer, and an optional
-  members pane. Only **Home** and **DMs** render that chat shell — and today they
-  render it identically. **Activity, Files and Later are
-  "coming soon" placeholders**, as is Preferences; they correspond to REQ-139,
-  REQ-143, REQ-231 and REQ-261. Per-feature status is
-  [STATUS.md](./STATUS.md)'s parity table; the depth backlog is
-  [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5.
+  the channel list), the transcript, the self-drawn composer, and an optional
+  members pane. **Home, DMs and Activity** render that chat shell
+  (`shell_visible()`), and Home and DMs are not the same: the second column holds
+  channels in one and conversations in the other (`sidebar_kind()`), and DMs shows
+  an index until a conversation is picked. **Activity, Files, Later, Drafts,
+  Threads, People, Admin and Preferences are all developed surfaces** — none is a
+  placeholder — answering REQ-139, REQ-143, REQ-231, REQ-223/224/228, REQ-062,
+  REQ-289 and REQ-261. Per-feature status is the marker on each
+  requirement in [REQUIREMENTS.md](./REQUIREMENTS.md); open work is
+  [BACKLOG.md](./BACKLOG.md).
 - **Linux GUI (later):** **GTK in pure C** — GTK is the native Linux toolkit and
   a C library (ARCH-80). Distributed as an AppImage/Flatpak, not a static binary
   (GTK cannot cleanly static-link).
@@ -311,9 +334,9 @@ The core links `shared/protocol.c` (every `oc_encode_*`/`oc_decode_*` for both
 directions exists), `shared/tls.c` (client TLS + TOFU), `shared/framebuf.c`
 (reassembly), and `shared/sock.h` (POSIX/Winsock shim). The wire sequence is
 PROTOCOL.md §3–§6 and the §10 state machine. **TOFU pinning (ARCH-10) is built:**
-the first connect to a remote workspace records the cert's SHA-256 in the client
-store (`workspace_state.tls_pin`, §5) and every later connect enforces an exact
-match; a genuine change is reported distinctly ("the server's security certificate
+the first connect to a remote workspace records the cert's SHA-256 in that
+workspace's OS-credential blob (`oc_store_save_pin`, §5) and every later connect
+enforces an exact match; a genuine change is reported distinctly ("the server's security certificate
 has changed") rather than as an unreachable host. **Loopback is deliberately not
 pinned** — a `127.0.0.1` connection has no MITM vector, and pinning it only fires
 false alarms as local dev daemons re-self-sign (`client/core/net.c:is_loopback`,
@@ -333,52 +356,40 @@ OS credential store, nothing persists at all.
   **There is no plaintext fallback.** Where no store exists — headless, no D-Bus,
   a locked keychain — `oc_store_save_session`/`load_session` simply do nothing, so
   that machine keeps no session and the user signs in again next launch. Opening a
-  store also **erases any token an older build left in the file**, so upgrading
-  costs one re-sign-in rather than leaving a plaintext credential behind. Only the
-  *token* is a credential: the (public) TOFU pin, the message cache, and the
-  workspace book stay in SQLite. macOS Keychain slots behind the same vtable.
-- `cached_message` — **cached history** per channel (ARCH-45/46). Every BROADCAST
-  is written through as it arrives (edits/deletes update the row); on startup the
-  net thread replays the cache into the model *before connecting*, so history
-  shows instantly (proven offline: a headless test and a PTY smoke both load it
-  with the daemon down). The replay also seeds the net thread's per-channel
-  high-water, so the first `BACKFILL_REQUEST` resumes from the last cached id
-  instead of refetching from 0, and replayed history is marked read (not stale
-  "unread"). Reactions/attachments on cached messages aren't cached yet — they
-  re-appear only for messages the backfill re-sends.
+  store also **erases any `state.db` an older build left behind**, so upgrading
+  costs one re-sign-in and one re-TOFU rather than leaving a plaintext credential
+  on disk. macOS Keychain slots behind the same vtable.
 
-- `outbox` — the **offline outbox** (REQ-102). Every send is recorded here (with
-  its idempotency token) before it goes out, removed on the `SEND_ACK`, and
-  resent on reconnect — so a message composed while disconnected (or in flight
-  when the connection dropped, or still queued when the app closed) survives, and
-  the daemon's idempotency dedups any partial delivery. Proven end-to-end: a
-  headless test and a PTY smoke both compose a message with the daemon down, and
-  a later run flushes it.
+**One credential per workspace holds three things**, in a flat versioned blob
+(`SEC_VER`) rather than a schema — there is no database, so there are no tables
+and no migrations:
 
-- `workspace_book` — the **workspace book** (REQ-012), one row per workspace this
-  device has signed into: the address the user typed (friendlier than the
-  resolved `"host:port"` key), the account used, and a last-used stamp for
-  most-recently-used ordering. It backs the switcher, so returning to a workspace
-  never means retyping its address. `oc_store_workspace_forget` removes the row
-  *and* that workspace's session token, TOFU pin, cached history, and outbox — so
-  "forget" leaves nothing of it on disk.
+- the **session token**, which is what makes silent reconnect across a restart
+  work (REQ-100);
+- the **TOFU pin** (REQ-183), which is not secret but is integrity-sensitive:
+  rewriting a pin is how a man-in-the-middle is accepted, so it lives where the
+  token does rather than in a file anyone can edit;
+- the **workspace book** fields (REQ-012) — the address the user typed, the
+  account, and a last-used stamp. Because there is one credential per workspace,
+  **enumerating the credential store is the book** (`oc_secret_each`), and
+  "forget" is a single delete that leaves nothing behind.
 
-The store is owned by the net thread (one connection, one thread); an unusable
-path just disables persistence (in-memory only). The TUI puts it at
-`$OPENCHIME_STATE` or `$HOME/.local/state/openchime/state.db`. The three
-`workspace_book` calls are the one exception to net-thread ownership: they are
-safe from a second `oc_store` handle on the same file (WAL + busy timeout, and
-they run at login/logout rather than on the message path), which is how the
-switcher lists workspaces that have no running client.
+**Cached history does not exist**, and the **offline outbox is in memory** on the
+net thread for the life of the process (ARCH-88). Every send is recorded there
+with its idempotency token before it goes out and cleared on its `SEND_ACK`, so a
+message composed while disconnected, or in flight when the connection dropped, is
+resent on reconnect and deduped by the daemon — but **a message still queued when
+the process exits is lost**, which is why a frontend warns on quit while the
+outbox is non-empty.
 
-Note migrations are forward-only, so the historical `instance_*` spellings
-persist in migrations 1–3; migration 4 renames them to `workspace_*`, and a
-fresh store lands on the same schema an upgraded one does.
+The store is owned by the net thread. An unusable store just disables persistence
+and the client runs in memory. The TUI resolves `$OPENCHIME_STATE`, else
+`$HOME/.local/state/openchime/state`, purely as an on/off flag — nothing is
+written at that path, and resolving it deletes a pre-ARCH-88 `state.db` if one is
+there.
 
-With the outbox, **the store + reconnect/offline work (REQ-100/101/102) is
-complete.** Keychains for the token are noted future hardening; optimistic local
-echo of an offline-composed message (showing it before the reconnect delivers it)
-is a later UI refinement.
+**Reconnect and offline (REQ-100/101/102) are complete**, at the stated cost:
+no offline reading of history, and a queued message dies with the process.
 
 ## 6. Auth + reconnect/offline
 
@@ -449,9 +460,11 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
 
 ## Native children over Direct2D (Win32)
 
-A native child window — the composer's RichEdit, the find/search/picker/palette
-boxes, the sign-in fields — composites **above** the Direct2D output. There is no
-z-order to lose and nothing can be drawn over one. A child left visible while the
+A native child window — the find/search/files-search/palette boxes, the sign-in
+fields, the form fields — composites **above** the Direct2D output. There is no
+z-order to lose and nothing can be drawn over one. (The composer was one of these
+until WIN-80; it is part of the scene now, which is what removed a whole class of
+this bug rather than managing it.) A child left visible while the
 surface it belongs to is not drawn therefore appears as a bare control floating
 over whatever *is* drawn, which reads as corruption rather than as a bug.
 
@@ -469,8 +482,9 @@ three shared predicates —
   the sign-in card owns the whole window.
 
 **And the drawing must ask the same question as the control.** Hiding the
-composer's RichEdit while still painting its box and buttons produced an input
-you could not type into, which is its own defect.
+composer while still painting its box and buttons produced an input you could not
+type into, which is its own defect — the rule outlived the RichEdit that taught
+it, and `main_is_conversation()` now decides both the field's rect and its focus.
 
 A new view or overlay has to name itself in one of those predicates. It cannot
 silently inherit another surface's children.
@@ -490,7 +504,9 @@ kept reaching the user rather than being caught in verification. **That is fixed
 window" below), so a screenshot shows what the user sees. The dump reports each
 child's `IsWindowVisible` alongside the three predicates as well, because a
 boolean is a better assertion than an image when what you want to know is
-*whether* a control is shown:
+*whether* a control is shown. Read `re=` with WIN-80 in mind: the composer has no
+child window any more, so that field reports whether its **rect is non-empty**,
+not a child's visibility. Every other flag is still an `IsWindowVisible`:
 
 ```
 natives re=1 find=1 ffind=0 srch=0 pick=0 pal=0 si_ws=0 sbkind=1 conv=1 covered=0
@@ -579,8 +595,9 @@ that actually changed.
 ### `form_dialog()` — our frame, the platform's fields
 
 `form_dialog(owner, title, fields, n)` is the generic typed form (`FF_TEXT`,
-`FF_PASSWORD`, `FF_CHECK`, `FF_CHOICE`) behind sixteen call sites — topics, renames,
-webhooks, invites, the DND window, quick reactions, sign-up. It used to be a native
+`FF_PASSWORD`, `FF_CHECK`, `FF_CHOICE`) behind every typed form in the client —
+topics, renames, webhooks, invites, quick reactions, sign-up, keywords, priority
+people, the custom pause time, profile fields, sections and more. It used to be a native
 popup with its own window class, STATIC labels, BUTTONs, a `WS_CAPTION` title bar
 and the stock shell font. The justification was that the platform's focus, tab order
 and IME handling beat matching the palette — and **half of that still holds**:
@@ -603,7 +620,7 @@ Two consequences worth knowing before touching it:
   Enter-commits/Esc-cancels dead in the one modal where you are always typing. The
   smoke caught that.
 
-It stays **synchronous**, by a nested message loop, because all sixteen callers read
+It stays **synchronous**, by a nested message loop, because every caller reads
 the answer on the next line. That loop is the one the old popup ran and it already
 ran from inside `on_click`, so the re-entrancy is not new.
 
@@ -706,13 +723,18 @@ unverifiable.
 
 ## Run the GUI smoke before pushing Win32 chrome
 
-`scripts/gui_smoke.sh` asserts **116 invariants** through the test hook: for each of
-the six views, what is in the second column (`sidebar_kind`), whether the middle
-one is typeable (`main_is_conversation`), which native children are shown, and
-whether anything covers the window — plus the search overlay, the Pins tab, the
-Preferences modal, the command palette, the generic form (including that Esc does
-**not** commit and Enter does), a pane header's ✕, and that the composer cue names
-the open conversation.
+`scripts/gui_smoke.sh` drives the client through the test hook and asserts a
+**dynamic count** — it prints the total it ran, which was **249** on 2026-08-02.
+Do not quote a fixed number: the suite grows, and helpers like `fitcheck` assert
+in loops. It covers, for each view, what is in the second column
+(`sidebar_kind`), whether the middle one is typeable (`main_is_conversation`),
+which native children are shown, and whether anything covers the window — plus
+the search overlay, the Pins tab, the Preferences modal, the command palette, the
+generic form (including that Esc does **not** commit and Enter does), a pane
+header's ✕, the composer cue naming the open conversation, the notification
+schedule and keyword editors, the pause, threads, the People directory, the
+Activity unread filters, and a **chrome-fit matrix across DPI × zoom × text
+size** (ARCH-97/WIN-111).
 
 Every one of those is a boolean, and booleans belong in a script. Three bugs
 reached the user in a day for want of this (WIN-70, WIN-71's regression, WIN-72),
@@ -818,16 +840,17 @@ to change a DirectWrite size, so any preference that moves the scale must call
   jump-in-context (**REQ-232**/ARCH-96), mark-unread/mute/star
   (REQ-235/137/234), profile depth with avatars and custom status
   (REQ-240/241/122), the global notify default (REQ-134) and the
-  **N-concurrent-workspace model** (REQ-012–015, WIN-29) are all built. An
-  adversarial review on 2026-07-30 confirmed it, and the avatar defects, the
-  flaky harness and the typed group-DM picker were closed on 2026-07-31.
-  **Accessibility (REQ-269) is now the active piece of work** — a UIA provider
-  over the self-drawn UI, a real system caret, and UIA events, decided as
-  **ARCH-99**: the custom controls are implemented *for*, not walked back. What
-  remains is the set of items waiting on a daemon requirement — rich text
-  (**REQ-220**) and its toolbar both built on 2026-07-31, as a shared parser in
-  `client/core/` plus DirectWrite ranges and a composer toolbar — all in
-  [WIN32_BACKLOG.md](./WIN32_BACKLOG.md).
+  **N-concurrent-workspace model** (REQ-012–015, WIN-29) are all built.
+  **Accessibility (REQ-269) is built** — a UIA provider over the self-drawn UI, a
+  real system caret and UIA events (**ARCH-99**), with an `AutomationId` and an
+  `InvokePattern` on every actionable element (**REQ-290**, WIN-110), verified
+  from outside the process by `scripts/uia_probe.ps1`. Rich text and its toolbar
+  are built too (**REQ-220**, ARCH-100: a shared parser in `client/core/` plus
+  DirectWrite ranges). The items that once waited on a daemon requirement —
+  drafts, scheduled send, the notification schedule, keywords and priority
+  people, the pause, cross-channel threads, the People directory — all landed
+  with their server halves on 2026-08-01/02. Open work is
+  [BACKLOG.md](./BACKLOG.md).
 - **The frontend order is fixed: all of Win32, then the TUI, then GTK, then
   macOS.** Win32 is the reference client and it is finished *first* — including
   the items now waiting on a daemon requirement, which are Win32 work waiting on
@@ -841,23 +864,18 @@ to change a DirectWrite size, so any preference that moves the scale must call
   star (REQ-137/234), mark-unread (REQ-235), the activity feed (REQ-139), in-app
   preferences and themes (REQ-261/262), profile depth and custom status
   (REQ-240/241/122), group DMs (REQ-056), custom emoji (REQ-072), rich text
-  (REQ-220), and more. The order within it is
-  [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §5.
+  (REQ-220), and more. Because the frontend order puts all of Win32 first, the
+  TUI's gap is a consequence of that order rather than tracked work; it is
+  deliberately not in [BACKLOG.md](./BACKLOG.md).
 - **Next — auth completeness.** The **OIDC browser flow + PKCE + loopback
   courier** — the one remaining piece of REQ-020 and what makes SSO usable at all
   (there is no SAML by design, **REQ-027**); plus first-run onboarding
   (**REQ-268**).
 - **Next — audio client.** Opus encode/decode + UDP to the sidecar — the deferred
   half of REQ-150/151 ([AUDIO.md](./AUDIO.md)).
-- **Then — broader competitor parity (non-video).** The rest of the parity
-  backlog now specced in REQUIREMENTS.md §§1–16 and tracked in
-  [STATUS.md](./STATUS.md): message actions (forward **REQ-057**, mark-unread
-  **REQ-235**, unread nav **REQ-236**, mute **REQ-137**), notification depth
-  (global level **REQ-134**, keywords **REQ-135**, OS toast **REQ-138**, activity
-  feed **REQ-139**), channel management (rename **REQ-036**, browse/join
-  **REQ-038**, files browser **REQ-143**), workspace admin (**REQ-042/043**),
-  themes (**REQ-262**), polls (**REQ-225**), and the rest. Priorities are
-  CLIENT_GAP_ANALYSIS.md §5.
+- **Then — the rest of the specified scope.** REQUIREMENTS.md §§1–16 carries it,
+  each requirement marked with whether it is built; whatever is not built and
+  matters is an item in [BACKLOG.md](./BACKLOG.md), in impact order.
 - **Then — remaining platforms + screenshare.** The other native GUIs (GTK,
   AppKit), a web DOM UI, and mobile — and, gated behind the audio client,
   **screenshare** (REQ-161, [VIDEO.md](./VIDEO.md)).

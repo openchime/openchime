@@ -76,6 +76,7 @@ Local-backend concerns; with external S3 only the database grows locally.
 | `OPENCHIME_ATTACH_MAX_AGE_DAYS` | `0` (keep forever) | Standing age policy; expiry runs every pass regardless of pressure (REQ-217). |
 | `OPENCHIME_MAINT_INTERVAL_MS` | `300000` (5 min) | Maintenance-pass interval, driven off the net loop tick so an idle box is maintained too (REQ-218). |
 | `OPENCHIME_MAINT_BATCH` | `64` | Maximum blobs reclaimed per pass. |
+| `OPENCHIME_SCHED_TICK_MS` | `15000` (15 s) | Scheduled-send sweep interval (REQ-224/ARCH-102), separate from the maintenance pass because five minutes is not a send time. Values below 50 are ignored and the default stands, so a bad value cannot busy-loop the writer. |
 | `OPENCHIME_AUDIT_MAX_DAYS` | `365` | Audit-log retention, applied **per family** so a flood of security noise cannot age out administrative history (REQ-251b). |
 
 ## Federated services (ARCH-84/85)
@@ -97,7 +98,7 @@ exactly the self-hosted stand-alone model (ARCH-76).
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPENCHIME_AUDIO_PORT` | `0` (disabled) | UDP port for the forked audio-relay sidecar (ARCH-28/73). The relay forwards opaque payloads; the daemon never decodes a codec. |
+| `OPENCHIME_AUDIO_PORT` | `0` (ephemeral) | UDP port for the forked audio-relay sidecar (ARCH-28/73). **`0` means the kernel picks a free port, not that audio is off** — the daemon binds the socket, reads the assigned port back with `getsockname`, forks the sidecar unconditionally, and advertises that port in `CALL_JOINED`. Setting a value pins the port. The relay forwards opaque payloads; the daemon never decodes a codec. |
 
 ---
 
@@ -114,10 +115,10 @@ rather than client state (ARCH-88/REQ-201).
 
 | Variable | Used by | Meaning |
 |---|---|---|
-| `OPENCHIME_STATE` | core store | Overrides the client store path (default `$HOME/.local/state/openchime/state.db`; `%LOCALAPPDATA%` on Windows). |
+| `OPENCHIME_STATE` | TUI | A vestigial path (default `$HOME/.local/state/openchime/state`), read only as a **persistence on/off flag**: the client writes no file there (ARCH-88), and the store keeps everything in the OS credential store. An unset `HOME` with no override resolves to nothing, which disables persistence for that run. Resolving the path also **deletes** any `state.db`/`-wal`/`-shm` a pre-ARCH-88 build left behind. |
 | `OPENCHIME_SUFFIX` | `resolve.c` | Overrides the DNS suffix appended to a bare workspace name (`acme` → `acme.<suffix>`), ARCH-14. **Defaults to `openchime.io`** (`OC_SERVICE_SUFFIX` in `client/core/resolve.h`, returned by `oc_default_suffix()`) — the hosted case is the common one, so a bare name resolves under the service domain unless this says otherwise. A dotted domain or an explicit `:port` bypasses suffixing entirely. |
 | `OPENCHIME_CRED` | TUI | Credential passed as `user:password`, so a password never lands in the process arguments. |
-| `OPENCHIME_TEST_DIR` | Win32 GUI | Enables the in-app automation hook (screenshot / state-dump drop directory) used by `scripts/gui_snap.sh`. Dev only. |
+| `OPENCHIME_TEST_DIR` | Win32 GUI | Enables the in-app automation hook — a file command channel plus the screenshot / state-dump drop directory — set by `scripts/gui_drive.sh` (which exports it across the WSL boundary via `WSLENV`) and used by `scripts/gui_smoke.sh` through it. `scripts/gui_snap.sh` neither sets nor reads it: that script captures the window from outside with `PrintWindow`. Dev only. |
 
 ## Compose-only
 

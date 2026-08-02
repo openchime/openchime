@@ -4,7 +4,8 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Status.** **Migrations 0001–0025 are applied.** 0001 establishes the core
+**Status.** **Migrations 0001–0036 are applied** (`daemon/migrate.c`,
+`OC_MIGRATIONS`). 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
 credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
 `users.disabled` lockout flag; **0004** (§3b) reactions; **0005** (§3c) threads;
@@ -15,7 +16,14 @@ notification preferences and the DND window; **0013** (§3k) synced client
 settings; **0014–0015** attachment tombstones and reclaim reason; **0016** (§3l)
 the audit log; **0017** (§3m) federated enrollment; **0018** (§3n) push device
 tokens; **0019** (§3o) the DM participant-set key; **0020** (§3p) the
-unique channel name; **0021** (§3q) resolved @mentions; **0022** (§3r) pinned messages; **0023** (§3s) the channel-files index; **0024** (§3t) channel topic + archive; **0025** (§3u) saved items.
+unique channel name; **0021** (§3q) resolved @mentions; **0022** (§3r) pinned messages; **0023** (§3s) the channel-files index; **0024** (§3t) channel topic + archive; **0025** (§3u) saved items;
+**0026** (§3v) channel mute + the delivery-cursor index; **0027** (§3w) profile
+depth — custom status with expiry, title, timezone, avatar; **0028** (§3x) the
+global notification default; **0029** (§3y) custom emoji; **0030–0031** (§3z)
+drafts, then unaddressed drafts; **0032** (§3aa) scheduled messages;
+**0033–0035** (§3j) the notification pause, the per-weekday schedule that
+replaces the DND window, and keywords + priority people; **0036** (§3ab) thread
+follows and per-thread read cursors.
 
 *Corrected: an earlier revision of this line said presence, notification config,
 and attachments were "intentionally not here yet." Notification config landed in
@@ -84,9 +92,11 @@ migrations — `role`/`avatar_key` (0002), `disabled` (0003), and the DND window
 A channel or a direct-message conversation (REQ-050). `is_public` distinguishes
 open channels from private ones for the read/post gate in REQ-031. A **DM** is a
 `kind='dm'` row with `name=NULL`, `is_public=0`, and its participants as members
-— two for a normal DM, or one for a self-DM (notes to self, REQ-055) — via
-`OPEN_DM` (PROTOCOL.md §5.12), so messaging/backfill/search reuse the ordinary
-membership path. The channel-management ops act only on `kind='channel'`.
+— one for a self-DM (notes to self, REQ-055), two for a 1:1, or **three to nine
+for a group DM** (REQ-056) — via `OPEN_DM` / `OPEN_GROUP_DM`, so
+messaging/backfill/search reuse the ordinary membership path. A group DM is not a
+second kind: it is the same `kind='dm'` row under the same `dm_key`, which is why
+no migration and no second membership path were needed. The channel-management ops act only on `kind='channel'`.
 
 | column          | type    | notes                                            |
 |-----------------|---------|--------------------------------------------------|
@@ -324,7 +334,7 @@ newest-first.
 ## 3e. Migration 0007 — delivery cursors
 
 Server-side delivery accounting (REQ-090); see the server-robustness notes in
-STATUS.md. A `delivery_cursors` row per `(user, channel)` advanced by
+REQ-090. A `delivery_cursors` row per `(user, channel)` advanced by
 `CLIENT_ACK` so a cursorless backfill can resume where the user left off.
 
 ---
@@ -412,9 +422,16 @@ backfill. A metadata-only default-NULL add.
 Server-authoritative notification settings, synced across a user's devices.
 
 ### `notification_prefs`
-- `(user_id, channel_id)` (PK) — one level per user per channel.
-- `level` (INTEGER 0/1/2) — 0 all, 1 mentions-only, 2 none. An **absent row means
-  the default** (all), so the table stays sparse.
+- `(user_id, channel_id)` (PK) — one row per user per channel.
+- `level` (INTEGER 0/1/2) — 0 all, 1 mentions-only, 2 none. An **absent row falls
+  back to `users.notify_default`** (migration 0028, REQ-134), not to a hardcoded
+  "all", so the table stays sparse and the per-user default is what fills the
+  gap: the push query reads `COALESCE(np.level, u.notify_default)`.
+- `muted` (INTEGER 0/1, migration 0026) — distinct from `level`. Level decides
+  whether the daemon notifies; mute additionally de-emphasises the sidebar row
+  and drops the conversation from the unread badge (REQ-137). Push excludes a
+  muted channel unconditionally, so mute outranks both the level and a priority
+  person.
 
 ### `users` (added columns)
 - `dnd_mode` (INTEGER 0-3, migration 0034) — the notification schedule (REQ-136):
@@ -426,9 +443,12 @@ Server-authoritative notification settings, synced across a user's devices.
   in which notifications are **allowed**, the complement of the quiet window it
   replaced. Existing values were swapped as they were carried forward. Suppresses
   push, not in-app unread.
-- `tz_offset_min` (INTEGER) — minutes east of UTC, refreshed by the client on
-  connect. A per-weekday window is only meaningful on the user's local calendar
-  day, and the daemon cannot resolve an IANA zone per push (ARCH-103).
+- `tz_offset_min` (INTEGER) — minutes east of UTC. A per-weekday window is only
+  meaningful on the user's local calendar day, and the daemon cannot resolve an
+  IANA zone per push (ARCH-103). **The client writes it only as part of
+  `SET_SCHEDULE`**, so it is refreshed when the user edits their schedule and at
+  no other time; ARCH-103's stated design of a connect-time refresh is not built,
+  and a stale offset is a backlog item rather than a property of this column.
 
 ### `notify_schedule` (migration 0034)
 - `(user_id, weekday)` (PK), `enabled`, `start_min`, `end_min` — used by
@@ -562,7 +582,9 @@ every write path remembering to.
 
 The backfill uses `MIN`/`MAX` rather than `group_concat`, whose ordering SQLite
 does not guarantee — the key must be byte-identical to the one the daemon
-computes. DMs hold one or two participants (group DMs are REQ-056, unbuilt).
+computes. A DM holds one participant (self-DM), two, or up to nine for a group DM
+(`OC_MAX_GROUP_DM` is 8 others plus the caller) — the same key over a longer
+sorted list, which is exactly why group DMs (REQ-056) needed no migration.
 
 *Pre-existing violations are deleted, not merged* — this shipped before any
 release, and merging two conversations is a judgement no migration should make
@@ -708,17 +730,31 @@ I can see that are **not** archived".
 
 ---
 
-## 3z. Migration 0030 — drafts (REQ-223, ARCH-101)
+## 3z. Migrations 0030–0031 — drafts, addressed and unaddressed (REQ-223/229, ARCH-101)
+
+0030 created the table keyed on the conversation. **0031 rebuilt it** so a draft
+may exist before it has a recipient (REQ-229's New Message pane autosaves before
+you choose one), which the original primary key could not express:
 
 ```sql
 CREATE TABLE drafts (
+  id          INTEGER PRIMARY KEY,
   user_id     INTEGER NOT NULL REFERENCES users(id),
-  channel_id  INTEGER NOT NULL REFERENCES channels(id),
+  channel_id  INTEGER REFERENCES channels(id),   -- NULL = unaddressed
   thread_root INTEGER NOT NULL DEFAULT 0,
+  recipients  TEXT,
   body        TEXT    NOT NULL,
-  updated_ms  INTEGER NOT NULL,
-  PRIMARY KEY (user_id, channel_id, thread_root));
+  updated_ms  INTEGER NOT NULL);
+CREATE UNIQUE INDEX idx_drafts_conv ON drafts(user_id, channel_id, thread_root)
+  WHERE channel_id IS NOT NULL;
+CREATE INDEX idx_drafts_user ON drafts(user_id, updated_ms DESC);
 ```
+
+The addressed case keeps exactly its old shape through the **partial unique
+index** rather than through the primary key, so one conversation still holds at
+most one draft while an unaddressed draft — `channel_id` NULL, its `recipients`
+beside it — is representable and repeatable. The surrogate `id` is what the wire
+returns so a client can address a specific unaddressed draft.
 
 *Its own table, not the `client_settings` bucket.* That bucket was the cheap
 answer and is wrong twice: it is keyed `(user, client_type, key)` and
@@ -728,8 +764,10 @@ devices" — and its own notes here describe its contents as low-contention
 *prefs*, while a draft is the one thing we would put there that the user typed as
 a **message**.
 
-*No index.* The PK's leading `user_id` serves the only query there is, "all my
-drafts"; a second index on a table this small would cost writes to serve nothing.
+*Two indexes, each with a job.* `idx_drafts_conv` enforces one draft per
+conversation (and only for addressed drafts, which is what the `WHERE` clause
+buys); `idx_drafts_user` orders "all my drafts, newest first", which is what the
+Drafts pane asks for.
 
 *`thread_root` is in the key from the start*, 0 meaning the channel itself. No
 client can write another value yet — the thread pane shares the one composer —
@@ -772,6 +810,120 @@ its place — see ARCH-95.
 
 ---
 
+## 3v. Migration 0026 — mute, and the read-cursor index (REQ-137/235)
+
+```sql
+ALTER TABLE notification_prefs ADD COLUMN muted INTEGER NOT NULL DEFAULT 0
+  CHECK (muted IN (0,1));
+CREATE INDEX IF NOT EXISTS idx_cursors_user ON delivery_cursors(user_id, channel_id);
+```
+
+*Mute is a column, not a fourth level.* `level` decides whether the daemon
+notifies; mute additionally de-emphasises the sidebar row and drops the unread
+badge. The two are independent because a user can want a channel quiet but still
+countable, or countable but silent.
+
+*The index serves mark-unread.* `process_client_ack` upserts
+`MAX(message_id, excluded.message_id)`, so the read cursor is monotonic by
+construction and a replayed ack can never move it backwards — a correctness
+property worth keeping, which is why marking unread gets its own op
+(`SET_READ_CURSOR`) rather than reusing the ack. The cursor needs no schema
+change; this index is what makes recomputing "unread from here" cheap.
+
+## 3w. Migration 0027 — profile depth and custom status (REQ-240/241/122)
+
+```sql
+ALTER TABLE users ADD COLUMN status_emoji TEXT;
+ALTER TABLE users ADD COLUMN status_text TEXT;
+ALTER TABLE users ADD COLUMN status_expires_ms INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN title TEXT;
+ALTER TABLE users ADD COLUMN timezone TEXT;
+ALTER TABLE users ADD COLUMN avatar_attachment_id INTEGER;
+```
+
+All on `users`: they are facts about a person and there is exactly one row per
+person, so a side table would buy nothing but a join.
+
+`status_expires_ms` is why a status is not two text columns. "In a meeting until
+3pm" has to stop being true on its own, and a client cannot be trusted to clear
+it because it may not be running — so the daemon **enforces expiry on read**, and
+`0` means no expiry. That pattern is reused for the notification pause (§3j,
+migration 0033).
+
+The avatar is an **attachment id**, not a blob column: the attachment store
+already handles upload, the size cap, dedup by hash and reclamation (REQ-215,
+ARCH-78), and a second image path would reimplement all of it. Reclamation
+excludes avatars, which building them exposed.
+
+## 3x. Migration 0028 — the global notification default (REQ-134)
+
+```sql
+ALTER TABLE users ADD COLUMN notify_default INTEGER NOT NULL DEFAULT 0
+  CHECK (notify_default IN (0,1,2));
+```
+
+`notification_prefs` is a per-channel **override**, so a channel the user has
+never touched had no answer but a compiled-in constant — which the user could not
+change. One column on `users` supplies it, per-channel rows keep overriding it,
+and the push query reads `COALESCE(np.level, u.notify_default)`. Storage is on
+`users` rather than a sentinel row in `notification_prefs`: a default is a
+property of the person, and a `channel_id` of 0 in a table keyed by channel is a
+trap for every later query.
+
+## 3y. Migration 0029 — custom emoji (REQ-072)
+
+```sql
+CREATE TABLE custom_emoji (
+  name          TEXT PRIMARY KEY,
+  attachment_id INTEGER NOT NULL REFERENCES attachments(id),
+  created_by    INTEGER NOT NULL REFERENCES users(id),
+  created_at_ms INTEGER NOT NULL);
+```
+
+**The name is the identity** and the namespace is flat and workspace-wide, so
+`:shipit:` means one image or every message containing it is ambiguous. A
+duplicate is refused rather than replacing the image existing messages already
+refer to. The image is an attachment id for the same reason an avatar is (§3w).
+Any member may add one; deleting is the creator or an admin, because deletion
+breaks every message that used the shortcode.
+
+## 3aa. Migration 0032 — scheduled messages (REQ-224, ARCH-102)
+
+```sql
+CREATE TABLE scheduled_messages (
+  id          INTEGER PRIMARY KEY,
+  user_id     INTEGER NOT NULL REFERENCES users(id),
+  channel_id  INTEGER REFERENCES channels(id),
+  thread_root INTEGER NOT NULL DEFAULT 0,
+  recipients  TEXT,
+  body        TEXT NOT NULL,
+  send_at_ms  INTEGER NOT NULL,
+  created_ms  INTEGER NOT NULL,
+  state       TEXT NOT NULL DEFAULT 'pending'
+              CHECK (state IN ('pending','sent','failed')),
+  fail_reason TEXT,
+  message_id  INTEGER);
+CREATE INDEX idx_sched_due  ON scheduled_messages(send_at_ms) WHERE state='pending';
+CREATE INDEX idx_sched_user ON scheduled_messages(user_id, send_at_ms);
+```
+
+**Its own table, not a flag on `messages`.** A scheduled message is not a message
+yet: nothing can link to it, it is invisible to search and to every member but its
+author, and it may never exist at all. A "pending" flag would make every history,
+search, backfill, unread and mention query responsible for excluding it, and the
+first one that forgot would leak unsent text into somebody else's transcript.
+
+The partial `idx_sched_due` is what the ~15 s firing sweep reads
+(`OPENCHIME_SCHED_TICK_MS`); `state` carries the outcome, and `fail_reason` is
+shown to the author, because a message promised and not sent is the one case
+where silence is indefensible.
+
+## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
+
+Documented with the notification tables in §3j, since they arrived together.
+
+---
+
 ## 4. Deferred to later migrations
 
 Tracked here so the omissions are deliberate, not forgotten:
@@ -779,9 +931,19 @@ Tracked here so the omissions are deliberate, not forgotten:
 - **Thread notifications** (REQ-061) — still deferred. Its dependency, @mentions
   (REQ-221), is now built (§3q), so what remains is deciding *when a reply
   notifies a thread's participants*, not the mention machinery underneath it.
-- **Rich text, saved items, permalinks, profiles, retention policy**
-  (REQ-220, REQ-222–229, REQ-231–234, REQ-240/241, REQ-250) — forward scope, none
-  yet backed by an ARCH decision.
+- **Link unfurls** (REQ-222) and **polls** (REQ-225) — forward scope, no ARCH
+  decision and no schema. **Snippets** (REQ-226) have half of what they need:
+  fenced code blocks parse and render (REQ-220), but a titled snippet *object*
+  does not exist.
+- **Retention policy** (REQ-250) — opt-in message ageing, distinct from REQ-217's
+  attachment max age (built). No schema, no ARCH decision.
+- **Legal hold** (REQ-252), **compliance capture** (REQ-276) and **DLP**
+  (REQ-277) — scoped in REQUIREMENTS.md, no schema.
+
+  *Off this list since it was written:* rich text needs no schema at all (it is
+  in-band in the body, ARCH-100); saved items are §3u; permalinks are ids plus a
+  history mode, not storage (ARCH-96); profiles are §3w; drafts, scheduled send,
+  starred/sections, mark-unread and mute are §3z/§3aa/§3v and `client_settings`.
 - **Screenshare** (REQ-161) — needs no schema; it is ephemeral media state on the
   same relay path as audio (ARCH-86, [VIDEO.md](./VIDEO.md)).
 

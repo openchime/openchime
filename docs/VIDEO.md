@@ -21,7 +21,7 @@ REQ-160 and nothing here reverses that (§2).
 Screenshare is the one video-shaped feature with a clear, bounded work-chat
 justification: showing someone an error, a diff, a design, or a spreadsheet.
 Both reference products ship it — Slack in huddles, Pumble from its $2.49 Pro
-tier (see [CLIENT_GAP_ANALYSIS.md](./CLIENT_GAP_ANALYSIS.md) §2.15).
+tier.
 
 It is worth being clear-eyed about what that means competitively: shipping
 screenshare buys **parity, not differentiation**. It closes a checkbox gap; it
@@ -194,10 +194,10 @@ jitter buffer, no UDP media path, no `CALL_*` handling in `client/core` (verifie
 Screenshare sits on top of all of it. Built first, the media transport gets built
 twice.
 
-The order that follows from this document and CLIENT_GAP_ANALYSIS.md §5:
+The order that follows from this document:
 
 1. ~~Win32 GUI P0 depth gaps (error/toast surface, search, sidebar, settings).~~
-   **Done** — see CLIENT_GAP_ANALYSIS.md §5, which has been re-ordered around
+   **Done** — the client build order was re-ordered around
    what is actually left.
 2. AUDIO.md phases 1–5 — device layer, Opus, `CALL_*` signaling, UDP media,
    jitter buffer, mixing.

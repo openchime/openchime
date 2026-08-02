@@ -35,12 +35,18 @@ CI builds share byte-identical sources with zero transitive dependencies
 | ~~**SQLite (amalgamation)**~~ | — | **Removed (ARCH-88).** It was vendored so the Windows *client* could have a store; no client embeds a database engine any more, and `third_party/sqlite` is deleted. The daemon still uses system SQLite. | — | — | — |
 
 Since **ARCH-83**, `tuikit/` is the in-tree toolbox wrapping termbox2 + utf8proc
-(terminal layer + width handling), which the TUI builds on — `client/tui`
-consumes them through tuikit, not directly.
+(terminal layer + width handling), which the TUI builds on. `client/tui/main.c`
+also calls both libraries **directly** — `utf8proc_iterate` for width, and the
+raw `tb_*` grid calls — so the toolbox is the shared layer rather than an
+exclusive one.
 
 Committed files: `third_party/{termbox2/termbox2.h, utf8proc/utf8proc.{c,h},
-utf8proc/utf8proc_data.c, jsmn/jsmn.h}` (+ each project's LICENSE). These three
-are whitelisted in `.gitignore`; everything else under `third_party/` is ignored.
+utf8proc/utf8proc_data.c, jsmn/jsmn.h}`. termbox2 ships its `LICENSE` and
+utf8proc its `LICENSE.md`; **jsmn's license file is not committed** — only
+`jsmn.h`, whose header carries the MIT text. `.gitignore` ignores
+`third_party/*` and whitelists **four** paths: `jsmn/`, `termbox2/`,
+`utf8proc/` and `lucide/` (committed, see below). Everything else under
+`third_party/` — the fetched mbedTLS trees among it — stays ignored.
 
 ## 2. Fetched at build time — `scripts/build_*.sh` (gitignored output)
 
@@ -77,8 +83,11 @@ and that machine then persists no credential at all (headless / no D-Bus). They 
 
 - **Local build headers:** `libsqlite3-dev` (Ubuntu) / `sqlite-dev` (Alpine), and
   `libsecret-1-dev` for the keyring backend.
-- **CI installs:** `libsqlite3-dev` + `bzip2` (for the mbedTLS tarball). CI does
-  not build the TUI, so it needs neither libsecret nor libresolv.
+- **CI installs:** `libsqlite3-dev` + `bzip2` (for the mbedTLS tarball). CI builds
+  the **Windows** TUI and GUI (`make windows-tui windows-gui`) but not the Linux
+  `make tui` target, so it needs neither libsecret nor libresolv: the mingw build
+  reaches DNS through `DnsQuery` and the credential store through Credential
+  Manager.
 
 ## 4. Container images — deployment & dev (Docker / Compose)
 

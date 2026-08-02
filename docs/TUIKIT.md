@@ -90,7 +90,9 @@ supplies a function that formats item *i* into a styled string. This is the rule
 - It must **never** include `client/core`, `oc_model`, `oc_client`, or any OpenChime header.
 - Chat-specific code stays in the app (`client/tui/`): the message/roster/search row builders
   (reimplemented as `tk_list`/`tk_viewport` delegates), the panel `layout`, `ws_session`,
-  `config.c`, `secret_backend.c`.
+  and `config.c`. The credential backends are **not** among them — they live in
+  `client/shared/` (`secret_libsecret.c`, `secret_win.c`) behind the `oc_secret`
+  vtable (`client/core/secret.h`), because both frontends use them.
 
 ## Build
 
