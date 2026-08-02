@@ -80,7 +80,13 @@ static int read_frame(client *c, oc_header *hdr, oc_rbuf *payload) {
              * this black-box test doesn't exercise them, so skip them rather than
              * let a broadcast desync the expected stream. */
             if (hdr->msg_type == OC_MSG_PRESENCE_UPDATE || hdr->msg_type == OC_MSG_TYPING_UPDATE ||
-                hdr->msg_type == OC_MSG_WORKSPACE_INFO)   /* post-AUTH_OK push; not exercised here */
+                hdr->msg_type == OC_MSG_WORKSPACE_INFO ||  /* post-AUTH_OK push; not exercised here */
+                /* Notification state also arrives unbidden after AUTH_OK (the
+                 * pause, REQ-278) — same category as the two above: a push this
+                 * black-box test does not exercise, and letting it through would
+                 * desync every expectation after the login. */
+                hdr->msg_type == OC_MSG_SNOOZE || hdr->msg_type == OC_MSG_SCHEDULE ||
+                hdr->msg_type == OC_MSG_ALERT_PREFS)
                 continue;
             return 0;
         }
