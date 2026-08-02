@@ -363,6 +363,29 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **Text size is stated as following the user, not the machine.** Preferences live in the daemon's per-(user, client_type) bucket and a client stores nothing locally (ARCH-88), so a text size chosen on a 4K laptop also arrives on a 1080p desktop. That is the wrong answer for a screen-shaped setting and is accepted deliberately rather than by accident: giving it a per-device answer means inventing a device identity for one preference, which is a larger commitment than the problem justifies. Zoom is the per-window escape hatch in the meantime.
 
+  **Amended 2026-08-02 (WIN-111): a box that HOLDS text scales with the text.**
+  The rule above was applied to the layout constants as well, so at Largest text
+  every list clipped its own descenders, the composer's text ran into its own
+  buttons, and the channel header lost its name entirely — the members chip had
+  grown into a title rect reserved by a fixed number. The distinction that was
+  missing: the space *between* blocks is the density setting's business and
+  correctly independent, but a container's own height and its internal padding
+  belong to the text inside it. `UIS()` puts the metrics through the same scale as
+  the fonts.
+
+  **The shell's furniture is capped by the window.** Column widths and the rail's
+  pitch scale too — Slack grows its sidebar, and a zoom control that left it
+  behind would read as broken — but a width has a limit a height does not: the
+  rail and sidebar together may not take more than half the window, and the rail's
+  four irreducible items must fit its height. `UISW()` is that capped scale, never
+  below 1.0, which is the design size.
+
+  **The invariant is checked, not remembered.** The automation surface (REQ-290)
+  already publishes every element's rect; `chromefit` in the test dump counts
+  siblings that overlap and elements drawn entirely off their surface. A healthy
+  layout is `0 0` at every scale, and the matrix that found these defects asserts
+  it.
+
 - **ARCH-96 (Permalinks — an id pair, and a fetch-around-an-id history mode):** Delivers REQ-232.
 
   **A permalink is the ids, not the names.** `openchime://<workspace-host>/c/<channel_id>/m/<message_id>`. Channel *names* are mutable (REQ-036) and message ordering is not stable across anything but the id, so a link built from names would break the first time someone renamed a channel — which is precisely the question REQ-036 asked and ARCH-93 answered by refusing a name-history table. The ids are the durable reference; the workspace host is what makes a link portable between people rather than only meaningful inside one client.

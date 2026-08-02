@@ -114,7 +114,7 @@ locates by id, on a runner that is not a developer's desktop. That is the CI-age
 question, still open.
 
 
-## WIN-111 — chrome polish: the layout does not survive scaling
+## WIN-111 — chrome polish: the layout does not survive scaling (FIXED)
 
 Found 2026-08-02 by an adversarial pass over the whole shell at
 **dpi 96/192/240 × zoom −2…+4 × text size Small…Largest**, driven through the new
@@ -172,8 +172,38 @@ assert it rather than a person re-reading screenshots: no row's content taller
 than its row, no text rect narrower than its ellipsis, no element outside the card
 that owns it.
 
+**Fixed 2026-08-02**, by cause rather than by symptom, and recorded as an
+amendment to ARCH-97: *a box that HOLDS text scales with the text; the space
+between boxes stays density's business.*
+
+- `UIS()` puts every layout metric through the same scale as the fonts — the
+  `#define`d ones scale at every use site, and the ~25 local row heights with them.
+- `UISW()` is the same scale **capped by the window** for the shell's furniture:
+  the rail and sidebar together may never take more than half the width, and the
+  rail's four irreducible items must fit its height. Without the cap the columns
+  ate the transcript at 240 DPI, and the rail's items overlapped each other.
+- Ellipsis is set once in the font factory for every non-wrapping format, which
+  covers headers, subtitles, tab labels and previews together.
+- The channel header, the shelf badge and the other right-edge gutters MEASURE
+  what they reserve instead of subtracting a constant.
+- The modal card scales, and its body is clipped — the Notifications rows painted
+  over the shell before. Its title and subtitle stack by the title's own height
+  rather than by a constant, which is why they overlapped.
+- `scale_apply` now re-measures the composer and rebuilds the emoji formats, both
+  of which it silently skipped.
+
+**Three defects the fit check found that the review had not**: the sidebar's
+filter box cached its placement against DPI but not scale, so it floated as a bare
+white rectangle after a text-size change; the formatting toolbar's last buttons
+were drawn off the window on a narrow one; and the composer's optional icons ran
+under Send. All three are named in the dump by id when they recur.
+
 **Explicitly not in this item:** anything about what the controls *do*. This is
-cleanliness only, per the review's terms.
+cleanliness only, per the review's terms. One functional consequence is noted and
+NOT fixed here: at an extreme scale in a small window the Notifications card's
+sections are now clipped rather than spilling, so the lower ones cannot be
+reached — the card needs its whole body in the scroller, which is a behaviour
+change and belongs to the functional pass.
 
 ## Closed without a fix, and why
 

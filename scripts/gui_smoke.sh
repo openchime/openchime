@@ -1439,6 +1439,72 @@ expect_grep '^keywords="deploy,release train" nvip=1 schedmode=3 .*scheddays=7' 
 expect_grep '^keywords=.* schedmode=0 ' "turning the schedule off leaves nothing behind"
 "$DRIVE" key esc >/dev/null 2>&1; settle modal none
 
+# --- the chrome survives scaling (WIN-111) ---------------------------------
+# The defects this covers appear ONLY when something scales, which is why they
+# went unseen: at 100% the shell is clean. `chromefit` is computed from the same
+# element rects the automation surface publishes (REQ-290) — siblings that
+# overlap, and anything drawn entirely off its own surface. A healthy layout is
+# 0 0 at every combination.
+say "== chrome fit across dpi x zoom x text size"
+"$DRIVE" view 0 >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; settle sbkind 1
+fitcheck() {   # dpi zoom textsize label
+  "$DRIVE" dpi "$1" >/dev/null 2>&1
+  "$DRIVE" zoom "$2" >/dev/null 2>&1
+  "$DRIVE" textsize "$3" >/dev/null 2>&1
+  sleep 0.4
+  checks=$((checks + 1))
+  local line; line=$(snap | grep -E '^chromefit ')
+  case "$line" in
+    *"overlaps=0 outside=0"*) ok "$4" ;;
+    *) fail "$4 — $line" ;;
+  esac
+}
+# WITH TEXT IN THE COMPOSER. The first version of this matrix ran against an
+# EMPTY composer, which is one line tall and fits at every scale — so it reported
+# a clean shell while the typed text was being drawn straight through the +,
+# emoji and @ icons. The composer is the one control whose height depends on its
+# contents; testing it empty tests the case that cannot fail.
+"$DRIVE" type "twenty twentyone twentytwo twentythree twentyfour" >/dev/null 2>&1
+sleep 0.3
+fitcheck  96  0 1 "the shell fits at 100%"
+fitcheck  96  0 3 "...at the largest text size"
+fitcheck  96  4 3 "...and zoomed in on top of it"
+fitcheck 192  0 1 "...at 200% DPI"
+fitcheck 240  4 3 "...and at everything at once, where it used to collide"
+# The panes and the densest overlay, at the size that broke them.
+for v in threads people drafts activity; do
+  "$DRIVE" view "$v" >/dev/null 2>&1; sleep 0.4
+  checks=$((checks + 1))
+  line=$(snap | grep -E '^chromefit ')
+  case "$line" in
+    *"overlaps=0 outside=0"*) ok "$v fits at the largest scale" ;;
+    *) fail "$v does not fit — $line" ;;
+  esac
+done
+# A composer that has grown to its four-line maximum, at the largest scale: the
+# tallest the field ever gets against the row it collided with.
+"$DRIVE" view 0 >/dev/null 2>&1; settle sbkind 1
+"$DRIVE" type " and now a much longer paragraph that has to wrap several times over so the field grows to the maximum height it is ever allowed to reach" >/dev/null 2>&1
+sleep 0.4
+checks=$((checks + 1))
+line=$(snap | grep -E '^chromefit ')
+case "$line" in
+  *"overlaps=0 outside=0"*) ok "a grown composer stays clear of its action row" ;;
+  *) fail "the composer collides — $line" ;;
+esac
+"$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1
+"$DRIVE" menu 71 >/dev/null 2>&1; sleep 0.5
+checks=$((checks + 1))
+line=$(snap | grep -E '^chromefit ')
+case "$line" in
+  *"overlaps=0 outside=0"*) ok "the notifications card keeps its content inside itself" ;;
+  *) fail "the modal spills — $line" ;;
+esac
+"$DRIVE" key esc >/dev/null 2>&1; settle modal none
+# Back to the defaults, since the text size is a persisted preference.
+"$DRIVE" dpi 96 >/dev/null 2>&1; "$DRIVE" zoom 0 >/dev/null 2>&1; "$DRIVE" textsize 1 >/dev/null 2>&1
+sleep 0.4
+
 # --- pausing notifications (WIN-92, REQ-278) -------------------------------
 # The pause is SERVER state, not a client mood: the restart below is the point of
 # the section — a client that only remembered it locally would pass every other

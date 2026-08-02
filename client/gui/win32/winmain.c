@@ -99,15 +99,68 @@ static UINT dpi_for_window(HWND hwnd) {
 #define PX(v)   ((int)((float)(v) * (float)g_dpi / 96.0f + 0.5f))   /* DIP -> device */
 #define DIPF(v) ((float)(v) * 96.0f / (float)g_dpi)                 /* device -> DIP */
 
-#define RAIL_W      70.0f     /* pixel-matched to the Slack rail reference */
-#define SIDEBAR_W   250.0f
-#define HEADER_H    56.0f
+/* ---- the UI scale (ARCH-97, amended by WIN-111) ----------------------------
+ * ARCH-97 scales the FONTS with the text-size preference and the per-window zoom,
+ * and deliberately leaves "block margins" alone — which is right for the space
+ * BETWEEN messages, since that is what the density setting governs.
+ *
+ * It was wrong for the boxes that CONTAIN text. A row whose height is a constant
+ * while its label grows is a clipping bug waiting for somebody to change a
+ * setting, and at Largest text every list in the app clipped its own descenders,
+ * the composer's text ran into its own buttons and the channel header lost its
+ * name. So: a box that holds text scales with the text; the gap between boxes is
+ * still density's business.
+ *
+ * `g_text_scale` is declared here, ahead of the metrics, because they are macros
+ * and every use site expands against it. */
+/* 1.0 until the first scale_apply, and the initialiser is load-bearing: every
+ * metric below expands against this, so a zero here makes every row, header and
+ * avatar zero-sized at the first paint — degenerate geometry that faults inside
+ * d2d1.dll rather than drawing nothing. */
+static float g_text_scale = 1.0f;
+#define UIS(x) ((x) * g_text_scale)
+
+/* The COLUMN widths scale too — a sidebar that stays 250 while its rows grow
+ * reads as cramped beside everything else, and Slack grows its. But a width has
+ * a limit a height does not: the rail and the sidebar together must still leave
+ * the conversation something to live in, and at 240 DPI with Largest text the
+ * unclamped pair took 527 of a 600 DIP window and squeezed the transcript to
+ * nothing. So widths use a scale CAPPED against the window — never below 1.0,
+ * since that is the design size. */
+static float g_shell_scale = 1.0f;
+#define UISW(x) ((x) * g_shell_scale)
+static D2D1_RECT_F find_box(void);   /* fwd — the painter and layout_find share it */
+static void shell_scale_update(float client_w_dip, float client_h_dip) {
+    float s = g_text_scale;
+    /* Width: the rail and sidebar together may not take more than half the
+     * window, or the conversation has nowhere to live. */
+    float cap_w = (client_w_dip * 0.5f) / (70.0f + 250.0f);
+    /* Height: the rail's four irreducible items — one destination, More, New and
+     * You — must fit between the workspace button and the bottom. Without this
+     * they overlapped each other at large scale, which the fit check caught as
+     * rail.home+rail.new.
+     *
+     * This was `68 * 4.6`, and the 4.6 was a guess. draw_rail's real requirement
+     * is the workspace block (64) plus FOUR rail rows plus the 6px the bottom
+     * cluster is inset by — a factor of 4.94, not 4.6 — so the cap allowed a
+     * scale the rail cannot lay out, and More was drawn on top of New
+     * (rail.more+rail.new, WIN-111). Spelled as the arithmetic it is, so it
+     * moves when RAIL_IH does. */
+    float cap_h = (client_h_dip - 6.0f) / (64.0f + 4.0f * 68.0f);
+    float cap = cap_w < cap_h ? cap_w : cap_h;
+    if (cap < 1.0f) cap = 1.0f;   /* never below the design size */
+    g_shell_scale = s > cap ? cap : s;
+}
+
+#define RAIL_W      UISW(70.0f)     /* pixel-matched to the Slack rail reference */
+#define SIDEBAR_W   UISW(250.0f)
+#define HEADER_H    UIS(56.0f)
 /* The channel tab strip under the header (WIN-37). Slack's shape: the channel
  * name and its controls on one row, and the channel's own sub-views on the next.
  * It also fixes something structural — Pins and Files used to replace the
  * transcript with only "Esc to close" as the way back, so there was no standing
  * sense of where you were. */
-#define TABBAR_H    34.0f
+#define TABBAR_H    UIS(34.0f)
 /* The formatting toolbar on top (WIN-96), then attach, emoji, the text field
  * and send on the bottom row. The box grows downward as the message wraps, to
  * COMPOSER_MAX_LINES, with both rows staying put — so a tall composer reads as
@@ -115,18 +168,18 @@ static UINT dpi_for_window(HWND hwnd) {
  *
  *   margin-top | toolbar | pad | max(text, button) | pad | margin-bottom
  */
-#define COMPOSER_MT     12.0f    /* above the box */
-#define COMPOSER_MB     16.0f    /* below it */
-#define COMPOSER_PAD    12.0f    /* box inner */
-#define COMPOSER_BTN    34.0f    /* the square buttons */
-#define COMPOSER_LINE   20.0f    /* one wrapped line of text */
+#define COMPOSER_MT     UIS(12.0f)    /* above the box */
+#define COMPOSER_MB     UIS(16.0f)    /* below it */
+#define COMPOSER_PAD    UIS(12.0f)    /* box inner */
+#define COMPOSER_BTN    UIS(34.0f)    /* the square buttons */
+#define COMPOSER_LINE   UIS(20.0f)    /* one wrapped line of text */
 #define COMPOSER_MAX_LINES 4
 /* The formatting row: Slack puts it at the TOP of the input, above the text,
  * and so do we — the bottom row already holds attach/emoji/mention/send, and a
  * second row of small buttons beside them would read as one undifferentiated
  * strip of chrome instead of two jobs. */
-#define COMPOSER_TB     30.0f    /* the formatting toolbar row */
-#define COMPOSER_FMT    24.0f    /* its square buttons */
+#define COMPOSER_TB     UIS(30.0f)    /* the formatting toolbar row */
+#define COMPOSER_FMT    UIS(24.0f)    /* its square buttons */
 /* ...and it is only there in the rich editor (WIN-104). In plain text the
  * toolbar would be a row of buttons for markup you are already looking at, and
  * leaving its 30px behind would be a gap with nothing in it. The height is a
@@ -138,28 +191,41 @@ static float composer_tb(void) { return composer_toolbar_on() ? COMPOSER_TB : 0.
  * text can be the full width of the box: buttons beside the field took a third of
  * a narrow window away from the thing you are actually typing into, and made the
  * field one line tall whatever the box did. */
-#define COMPOSER_ACTIONS 38.0f
+#define COMPOSER_ACTIONS UIS(38.0f)
+/* Between the text and the action row. It was zero — the field grew DOWN from the
+ * top of the box and the icons were anchored UP from the bottom, and the two
+ * expressions met at exactly the same coordinate. That is not a layout, it is a
+ * coincidence: any disagreement at all between g_composer_h and the field's real
+ * line height — a stale height, a font whose natural height exceeds the spacing we
+ * ask for, a rounding step at a scale nobody tried — puts the text INSIDE the
+ * icons, which is what it did (WIN-111). A real gap, plus the clamp in
+ * composer_geom(), makes the collision impossible rather than unlikely. */
+#define COMPOSER_GAP    UIS(6.0f)
 static float composer_chrome(void) {
-    return COMPOSER_MT + composer_tb() + COMPOSER_PAD * 2 + COMPOSER_ACTIONS + COMPOSER_MB;
+    return COMPOSER_MT + composer_tb() + COMPOSER_PAD * 2 + COMPOSER_GAP +
+           COMPOSER_ACTIONS + COMPOSER_MB;
 }
-#define COMPOSER_CHROME (COMPOSER_MT + COMPOSER_TB + COMPOSER_PAD * 2 + COMPOSER_ACTIONS + COMPOSER_MB)
+#define COMPOSER_CHROME (COMPOSER_MT + COMPOSER_TB + COMPOSER_PAD * 2 + COMPOSER_GAP + \
+                         COMPOSER_ACTIONS + COMPOSER_MB)
 /* Resting height: one line of text. The buttons no longer set a floor, having
  * moved out of the field's row. */
 #define COMPOSER_H      (COMPOSER_CHROME + 22.0f)
-static float g_composer_h = COMPOSER_H;
+/* At scale 1; recomputed by composer_remeasure(), which scale_apply() now calls
+ * — a static initialiser cannot hold a runtime expression. */
+static float g_composer_h = 142.0f;
 
 /* The box's inner height — what the text and the buttons share. */
 static float composer_inner_h(void) { return g_composer_h - composer_chrome(); }
-#define ROW_H       32.0f     /* a sidebar channel row */
-#define AVA         36.0f     /* transcript avatar diameter */
-#define LINE_H      19.0f     /* an extra (reaction/attach/thread) line */
+#define ROW_H       UIS(32.0f)     /* a sidebar channel row */
+#define AVA         UIS(36.0f)     /* transcript avatar diameter */
+#define LINE_H      UIS(19.0f)     /* an extra (reaction/attach/thread) line */
 /* The right-hand CONTEXT pane. It holds what is true about *people* in this
  * conversation — the member list, and a person's card when you open one. Your
  * OWN account (preferences, shortcuts, workspaces, notification settings) is a
  * modal instead: those interrupt, they are not context for what you are reading.
  * 300 rather than the original 220 because a profile does not fit in 220 and
  * will fit less as REQ-240/241 add fields. */
-#define MEMBERS_W   300.0f
+#define MEMBERS_W   UISW(300.0f)
 
 /* The narrowest the conversation column may become before the members pane gives
  * way. Below this the transcript is unreadable and the composer has less width
@@ -168,7 +234,7 @@ static float composer_inner_h(void) { return g_composer_h - composer_chrome(); }
  * members pane left the composer with NEGATIVE width, so `g_ed_box.right` fell
  * below `.left` and the message box silently disappeared. A responsive pane
  * yields; it does not push the primary content off the window. */
-#define MAIN_MIN_W  380.0f
+#define MAIN_MIN_W  UIS(380.0f)
 
 /* Primary views selected by the left-nav rail (Slack-style). HOME/DMS/ADMIN are
  * real today; ACTIVITY/FILES/LATER/NOTIFICATIONS are stubs until their features
@@ -652,8 +718,8 @@ static void notify_toast(const char *title, const char *body) {
  *
  * The decoded bitmaps belong to the render target, so the cache is dropped
  * whenever the RT is recreated. */
-#define THUMB_H 160.0f
-#define THUMB_W 260.0f
+#define THUMB_H UIS(160.0f)
+#define THUMB_W UIS(260.0f)
 enum { THUMB_CACHE = 32 };
 /* Dimensions are captured at decode time from WIC rather than read back with
  * ID2D1Bitmap_GetSize(). That method returns a struct by value and mingw's C
@@ -1199,9 +1265,9 @@ static si_geom si_layout(float W, float H);
 #define TOAST_MAX      4
 #define TOAST_MS       6000       /* long enough to read a sentence, short enough not to nag */
 #define TOAST_W        340.0f
-#define TOAST_H        52.0f
-#define TOAST_GAP      10.0f
-#define BANNER_H       34.0f
+#define TOAST_H        UIS(52.0f)
+#define TOAST_GAP      UIS(10.0f)
+#define BANNER_H       UIS(34.0f)
 static struct {
     char      text[192];
     ULONGLONG born;               /* GetTickCount64 at push */
@@ -1638,6 +1704,21 @@ static IDWriteTextFormat *mk_fmt_s(const WCHAR *family, float size, DWRITE_FONT_
         IDWriteTextFormat_SetParagraphAlignment(f, pa);
         IDWriteTextFormat_SetWordWrapping(f, wrap ? DWRITE_WORD_WRAPPING_WRAP
                                                   : DWRITE_WORD_WRAPPING_NO_WRAP);
+        /* A single-line format that outgrows its box stops mid-glyph unless it is
+         * told otherwise — which is what "Files & li" and a channel header reading
+         * as a bare "#" were (WIN-111). Ellipsis here, once, rather than at fifty
+         * call sites. Wrapping formats get none: they wrap by design, and a
+         * trimming sign on them would cut a paragraph at its first line. */
+        if (!wrap) {
+            IDWriteInlineObject *sign = NULL;
+            if (SUCCEEDED(IDWriteFactory_CreateEllipsisTrimmingSign(g_dwrite, f, &sign)) && sign) {
+                DWRITE_TRIMMING tr;
+                tr.granularity = DWRITE_TRIMMING_GRANULARITY_CHARACTER;
+                tr.delimiter = 0; tr.delimiterCount = 0;
+                IDWriteTextFormat_SetTrimming(f, &tr, sign);
+                IDWriteInlineObject_Release(sign);
+            }
+        }
     }
     return f;
 }
@@ -1651,14 +1732,13 @@ static IDWriteTextFormat *mk_fmt(const WCHAR *family, float size, DWRITE_FONT_WE
 /* Modal content inset. One number, so no two modals disagree about their gutter.
  * Up here rather than beside the frame because the two-paned Preferences has to
  * undo it to bleed its category column to the card edge. */
-#define MODAL_PAD    24.0f
+#define MODAL_PAD    UIS(24.0f)
 
 /* ---- typography (ARCH-97) ------------------------------------------------- */
 
 /* The user's text-size preference (REQ-269), NOT system DPI and NOT window zoom
  * — ARCH-97 keeps the three separate on purpose. A DirectWrite format's size is
  * immutable, so changing this means rebuilding all of them. */
-static float g_text_scale = 1.0f;
 
 /* ARCH-97 keeps three multipliers apart, and this is where two of them live: the
  * user's TEXT SIZE (a preference, follows the account) and per-window ZOOM
@@ -1758,6 +1838,20 @@ static void fonts_build(void) {
     g_fmt_quote = mk_fmt(L"Georgia", (FONT_UI + 9.0f) * k, DWRITE_FONT_WEIGHT_BOLD, C, MID, 0);
 }
 
+/* The emoji formats, rebuilt on every scale change like the rest (WIN-111).
+ * Named explicitly, because falling back from "Segoe UI" reaches the monochrome
+ * Segoe UI Symbol glyphs first — the picker rendered as outlines. */
+static void emoji_fonts_build(void) {
+    const float k = g_text_scale;
+    if (g_emoji)   { IDWriteTextFormat_Release(g_emoji);   g_emoji = NULL; }
+    if (g_emoji_s) { IDWriteTextFormat_Release(g_emoji_s); g_emoji_s = NULL; }
+    g_emoji = mk_fmt(L"Segoe UI Emoji", 22.0f * k, DWRITE_FONT_WEIGHT_NORMAL,
+                     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
+    g_emoji_s = mk_fmt(L"Segoe UI Emoji", 13.0f * k, DWRITE_FONT_WEIGHT_NORMAL,
+                       DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
+}
+
+
 static void d2d_init(void) {
     D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &IID_ID2D1Factory, NULL,
                       (void **)&g_factory);
@@ -1765,12 +1859,7 @@ static void d2d_init(void) {
                         (IUnknown **)&g_dwrite);
     if (!g_dwrite) return;
     fonts_build();
-    /* Named explicitly, because falling back from "Segoe UI" reaches the
-     * monochrome Segoe UI Symbol glyphs first — the picker rendered as outlines. */
-    g_emoji = mk_fmt(L"Segoe UI Emoji", 22.0f, DWRITE_FONT_WEIGHT_NORMAL,
-                     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
-    g_emoji_s = mk_fmt(L"Segoe UI Emoji", 13.0f, DWRITE_FONT_WEIGHT_NORMAL,
-                       DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, 0);
+    emoji_fonts_build();
     /* Round-capped stroke style for the Lucide line icons. */
     D2D1_STROKE_STYLE_PROPERTIES ssp;
     ZeroMemory(&ssp, sizeof ssp);
@@ -2000,7 +2089,7 @@ static void ensure_selection(const oc_model *m) {
 
 /* ---- rail + sidebar ------------------------------------------------------ */
 
-#define RAIL_IH 68.0f     /* rail item pitch — pixel-matched to Slack (center-to-center) */
+#define RAIL_IH UISW(68.0f)     /* rail item pitch — pixel-matched to Slack (center-to-center) */
 
 /* Where the painter actually put a rail item. Menus anchor to this rather than
  * recomputing the geometry from the window height — which is what the New menu did,
@@ -2183,12 +2272,23 @@ static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
         vis[nv++] = i;
     }
 
-    float y = 64;                                   /* below the workspace + divider */
+    float y = UISW(64);                             /* below the workspace + divider */
     float by = h - 2 * RAIL_IH - 6;                 /* bottom cluster top */
-    int maxfit = (int)((by - y) / RAIL_IH);
-    if (maxfit < 1) maxfit = 1;
+    /* How many rows — destinations plus the "More" that replaces the tail — fit
+     * above the bottom cluster. Nothing may be placed past `by`, because New and
+     * You are anchored there and do not move.
+     *
+     * `maxfit` used to be clamped UP to 1 when nothing fit, and then More was
+     * drawn below the single destination regardless — two rows in the space for
+     * none, landing on top of New. The clamp is now DOWN to zero: a rail with no
+     * room for a destination shows none, which is legible, rather than showing
+     * one on top of another, which is not. shell_scale_update's cap should keep
+     * this above 2 in practice; this is what makes a wrong cap a missing row
+     * instead of a collision. */
+    int rows = (int)((by - y) / RAIL_IH);
+    if (rows < 0) rows = 0;
     int shown = nv, overflow = 0;
-    if (nv > maxfit) { shown = maxfit - 1; if (shown < 1) shown = 1; overflow = 1; }
+    if (nv > rows) { shown = rows - 1; if (shown < 0) shown = 0; overflow = (rows >= 1); }
 
     g_n_more = 0;
     for (int k = 0; k < shown; k++) {
@@ -2255,7 +2355,7 @@ static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
 static void draw_more_flyout(ID2D1RenderTarget *rt) {
     g_n_moreflyrows = 0;
     if (!g_more_open || g_n_more == 0) return;
-    float rowh = 40, w = 196, pad = 6;
+    float rowh = UIS(40), w = UIS(196), pad = UIS(6);
     float x0 = RAIL_W + 6, y0 = g_more_y;
     D2D1_RECT_F panel = rf(x0, y0, x0 + w, y0 + g_n_more * rowh + 2 * pad);
     fill_round(rt, rf(panel.left + 2, panel.top + 3, panel.right + 2, panel.bottom + 3), 12.0f,
@@ -2450,10 +2550,14 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
 
     /* "Find a conversation" box — a rounded container with a search glyph; the
      * native EDIT child (g_find) sits inside and live-filters the list. */
-    D2D1_RECT_F fb = rf(RAIL_W + 10, HEADER_H + 6, RAIL_W + SIDEBAR_W - 10, HEADER_H + 36);
+    /* The container and the native EDIT inside it are derived from the same
+     * numbers (find_box()), because two hand-kept copies is how the white box
+     * ended up floating half out of its own border at large text (WIN-111). */
+    D2D1_RECT_F fb = find_box();
     fill_round(rt, fb, 8.0f, OC_COL_INPUT);
     stroke_round(rt, fb, 8.0f, OC_COL_BORDER, 1.0f);
-    draw_lucide(rt, OC_ICON_SEARCH, rf(fb.left + 8, fb.top + 7, fb.left + 24, fb.top + 23), OC_COL_MUTED);
+    draw_lucide(rt, OC_ICON_SEARCH, rf(fb.left + UIS(8), fb.top + UIS(7),
+                                       fb.left + UIS(24), fb.top + UIS(23)), OC_COL_MUTED);
 
     /* Rows come from the core (oc_model_sidebar): grouping, filtering, sorting
      * and collapse are decided there so both frontends agree. The DMs rail view
@@ -2521,8 +2625,21 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
             else if (g_shelf_hover == (int)si) fill_round(rt, row, 6.0f, OC_COL_HOVER);
             draw_lucide(rt, SHELF[si].icon, rf(sx0 + 10, sy + 7, sx0 + 28, sy + 25),
                         on ? OC_COL_TEXT : OC_COL_MUTED);
+            /* Reserve what the badge MEASURES, not a constant 40: at large text
+             * the count ran over its own label — "Drafts, schedule✎ 2" (WIN-111). */
+            float badge_w = 0;
+            if (SHELF[si].view == VIEW_THREADS) {
+                uint32_t un = oc_model_thread_unread(m);
+                if (un) { char b[24]; snprintf(b, sizeof b, "%u", un);
+                          badge_w = text_width(b, g_micro) + UIS(26); }
+            } else if (SHELF[si].view == VIEW_DRAFTS) {
+                size_t nd = m->n_drafts, nf = oc_model_scheduled_failed(m);
+                if (nd || nf) { char b[24]; snprintf(b, sizeof b, "%s%zu", nf ? "\u26A0 " : "\u270E ", nd + nf);
+                                badge_w = text_width(b, g_meta) + UIS(20); }
+            }
             draw_text(rt, SHELF[si].label, on ? g_ui_b : g_ui,
-                      rf(sx0 + 34, sy, sx1 - 40, sy + ROW_H), on ? OC_COL_TEXT : OC_COL_MUTED);
+                      rf(sx0 + 34, sy, sx1 - UIS(12) - badge_w, sy + ROW_H),
+                      on ? OC_COL_TEXT : OC_COL_MUTED);
             /* Threads carry the count Slack shows there: unread REPLIES, which
              * is the number the row exists to report. */
             if (SHELF[si].view == VIEW_THREADS) {
@@ -2546,7 +2663,7 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                     char badge[24];
                     snprintf(badge, sizeof badge, "%s%zu", nf ? "\u26A0 " : "\u270E ", nd + nf);
                     IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
-                    draw_text(rt, badge, g_meta, rf(sx1 - 60, sy, sx1 - 8, sy + ROW_H),
+                    draw_text(rt, badge, g_meta, rf(sx1 - UIS(60), sy, sx1 - UIS(8), sy + ROW_H),
                               nf ? OC_COL_AWAY : OC_COL_MUTED);
                     IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
                 }
@@ -2649,17 +2766,17 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
             uint32_t fg = muted ? OC_COL_FAINT
                         : (selected || unread) ? OC_COL_TEXT : OC_COL_MUTED;
             draw_text(rt, r->label, unread ? g_ui_b : g_ui,
-                      rf(sx0 + 34, ry, sx1 - 44, ry + ROW_H), fg);
+                      rf(sx0 + 34, ry, sx1 - UIS(44), ry + ROW_H), fg);
             if (r->is_self) {
                 /* "you" sits right after the name, dimmed — so the self-DM is
                  * still addressed by account name (Slack's treatment). */
                 float w = text_width(r->label, unread ? g_ui_b : g_ui);
                 draw_text(rt, "you", g_meta,
-                          rf(sx0 + 34 + w + 8, ry, sx1 - 44, ry + ROW_H), OC_COL_FAINT);
+                          rf(sx0 + 34 + w + 8, ry, sx1 - UIS(44), ry + ROW_H), OC_COL_FAINT);
             }
             if (unread) {
                 char badge[16]; snprintf(badge, sizeof badge, "%d", r->unread);
-                D2D1_RECT_F br = rf(sx1 - 40, ry + 6, sx1 - 10, ry + ROW_H - 6);
+                D2D1_RECT_F br = rf(sx1 - UIS(40), ry + 6, sx1 - UIS(10), ry + ROW_H - 6);
                 fill_round(rt, br, 9.0f, OC_COL_ACCENT);
                 IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
                 draw_text(rt, badge, g_meta, br, 0xFFFFFF);
@@ -2671,7 +2788,7 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                  * news. Only where no badge is, so a count is never displaced by
                  * a pencil. */
                 draw_text(rt, "\u270E", g_meta,
-                          rf(sx1 - 34, ry, sx1 - 10, ry + ROW_H), OC_COL_FAINT);
+                          rf(sx1 - UIS(34), ry, sx1 - UIS(10), ry + ROW_H), OC_COL_FAINT);
             }
         }
         if (g_n_rows < (int)(sizeof g_rows / sizeof g_rows[0])) {
@@ -2973,7 +3090,7 @@ static IDWriteTextLayout *body_layout(const oc_msg *msg, float cw, UINT32 *wlen)
  * name. The two are separate settings for that reason. */
 static float g_density = 1.0f;         /* 0.6 compact, 1.0 cozy */
 #define MSG_TOP(g)   ((g) ? 4.0f * g_density : 12.0f * g_density)
-#define MSG_NAME(g)  ((g) ? 0.0f  : 20.0f)   /* header (name/time) line height */
+#define MSG_NAME(g)  ((g) ? 0.0f  : UIS(20.0f))   /* header (name/time) line height */
 /* The margin BELOW a block is chosen by whether the NEXT message continues this
  * one — not by whether this one is a continuation.
  *
@@ -2989,7 +3106,7 @@ static float g_density = 1.0f;         /* 0.6 compact, 1.0 cozy */
 /* A pinned message gets a marker line above its header (REQ-230), the way
  * Slack does — a pin you can only see by opening a list is a pin you forget.
  * It sits ABOVE the block, so it costs height on grouped continuations too. */
-#define MSG_PIN_H 17.0f
+#define MSG_PIN_H UIS(17.0f)
 #define MSG_PIN(msg) ((msg)->pinned ? MSG_PIN_H : 0.0f)
 
 /* A message's rendered height for a given content width (creates + returns the
@@ -3256,7 +3373,7 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
     }
 }
 
-#define SEP_H 30.0f     /* a date-divider row */
+#define SEP_H UIS(30.0f)     /* a date-divider row */
 
 static int pt_in(D2D1_RECT_F r, int x, int y) {
     return (float)x >= r.left && (float)x < r.right &&
@@ -3702,7 +3819,7 @@ static void draw_search(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
 
     if (m->n_search == 0) { g_srch_max = g_srch_scroll = 0; return; }
 
-    float rowh = 54;
+    float rowh = UIS(54);
     float visible = body.bottom - body.top;
     /* The "Load more" button is CONTENT, so its height belongs in the total: without
      * it the scroll stopped at the last row and the button sat permanently just past
@@ -3870,7 +3987,7 @@ static void draw_audit(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
         if (!g_audit_family || m->audit[i].family == g_audit_family) shown++;
     if (shown == 0) { overlay_empty(rt, body, "Nothing in that category yet."); return; }
 
-    float rowh = 46;
+    float rowh = UIS(46);
     float y = ovl_begin(rt, body, (float)shown * rowh + 34);
     for (size_t i = 0; i < m->n_audit; i++) {
         const oc_audit_view *a = &m->audit[i];
@@ -3919,7 +4036,7 @@ static void draw_weblist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
               g_meta, rf(body.left + 20, body.top + 4, body.right - 16, body.top + 24), OC_COL_FAINT);
     body.top += 28;
     ovl_use(OVL_WEB);
-    float rowh = 40;
+    float rowh = UIS(40);
     float y = ovl_begin(rt, body, (float)m->n_webhooks * rowh);
     for (size_t i = 0; i < m->n_webhooks; i++) {
         const oc_webhook_view *wv = &m->webhooks[i];
@@ -4140,11 +4257,11 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
             strncat(kw, m->kw_terms[i], sizeof kw - strlen(kw) - 1);
         }
         draw_text(rt, "My keywords", g_ui_b,
-                  rf(body.left + 20, y0, body.right - 140, y0 + 20), OC_COL_TEXT);
+                  rf(body.left + 20, y0, body.right - UIS(140), y0 + 20), OC_COL_TEXT);
         draw_text(rt, kw[0] ? kw : "None \u2014 messages containing a keyword notify you like a mention.",
-                  g_meta, rf(body.left + 20, y0 + 18, body.right - 140, y0 + 38),
+                  g_meta, rf(body.left + 20, y0 + 18, body.right - UIS(140), y0 + 38),
                   kw[0] ? OC_COL_MUTED : OC_COL_FAINT);
-        g_notify_kw_btn = rf(body.right - 120, y0 + 2, body.right - 24, y0 + 28);
+        g_notify_kw_btn = rf(body.right - UIS(120), y0 + 2, body.right - UIS(24), y0 + 28);
         fill_round(rt, g_notify_kw_btn, 6.0f, OC_COL_INPUT);
         stroke_round(rt, g_notify_kw_btn, 6.0f, OC_COL_BORDER, 1.0f);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -4160,12 +4277,12 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
             strncat(vips, nm, sizeof vips - strlen(vips) - 1);
         }
         draw_text(rt, "Priority people", g_ui_b,
-                  rf(body.left + 20, y1, body.right - 140, y1 + 20), OC_COL_TEXT);
+                  rf(body.left + 20, y1, body.right - UIS(140), y1 + 20), OC_COL_TEXT);
         draw_text(rt, vips[0] ? vips
                               : "None \u2014 they reach you through a level and a pause, never a mute.",
-                  g_meta, rf(body.left + 20, y1 + 18, body.right - 140, y1 + 38),
+                  g_meta, rf(body.left + 20, y1 + 18, body.right - UIS(140), y1 + 38),
                   vips[0] ? OC_COL_MUTED : OC_COL_FAINT);
-        g_notify_vip_btn = rf(body.right - 120, y1 + 2, body.right - 24, y1 + 28);
+        g_notify_vip_btn = rf(body.right - UIS(120), y1 + 2, body.right - UIS(24), y1 + 28);
         fill_round(rt, g_notify_vip_btn, 6.0f, OC_COL_INPUT);
         stroke_round(rt, g_notify_vip_btn, 6.0f, OC_COL_BORDER, 1.0f);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -4266,9 +4383,9 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
      * are exceptions to — a default you have to scroll to find reads as row zero
      * of the list instead of as the rule. cid=0 marks it in the hit table. */
     {
-        float rowh0 = 38, y0 = body.top;
+        float rowh0 = UIS(38), y0 = body.top;
         draw_text(rt, "Default for all channels", g_ui_b,
-                  rf(body.left + 20, y0, body.right - 260, y0 + rowh0), OC_COL_TEXT);
+                  rf(body.left + 20, y0, body.right - UIS(260), y0 + rowh0), OC_COL_TEXT);
         notify_chips(rt, body, y0, rowh0, 0, m->notify_default);
         draw_text(rt, "Channels listed below override this.", g_meta,
                   rf(body.left + 20, y0 + rowh0 - 16, body.right - 260, y0 + rowh0 + 4),
@@ -4277,7 +4394,7 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
         body.top += rowh0 + 16;
     }
 
-    float rowh = 38;
+    float rowh = UIS(38);
     float y = ovl_begin(rt, body, (float)m->n_channels * rowh);
     for (size_t i = 0; i < m->n_channels; i++) {
         const oc_channel *c = &m->channels[i];
@@ -4285,7 +4402,7 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
         if (y > body.bottom) break;
         char label[128];
         channel_label(m, c, label, sizeof label);
-        draw_text(rt, label, g_ui, rf(body.left + 20, y, body.right - 260, y + rowh), OC_COL_TEXT);
+        draw_text(rt, label, g_ui, rf(body.left + 20, y, body.right - UIS(260), y + rowh), OC_COL_TEXT);
         notify_chips(rt, body, y, rowh, c->channel_id, c->notify_level);
         fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 20, y + rowh), OC_COL_BORDER);
         y += rowh;
@@ -4529,7 +4646,7 @@ static void draw_keys(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
     int n = (int)(sizeof SHORTCUTS / sizeof SHORTCUTS[0]);
     int shown = 0;
     for (int i = 0; i < n; i++) if (SHORTCUTS[i].keys) shown++;
-    float rowh = 32;
+    float rowh = UIS(32);
     float y = ovl_begin(rt, body, (float)shown * rowh + 12);
     for (int i = 0; i < n; i++) {
         if (!SHORTCUTS[i].keys) continue;        /* the paired row, described above */
@@ -4665,7 +4782,7 @@ static void draw_pinlist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
     float y = body.top + 8;
     for (size_t i = 0; i < m->n_pins && y < body.bottom; i++) {
         const oc_pinned_row *pr = &m->pins[i];
-        float rh = 58;
+        float rh = UIS(58);
         D2D1_RECT_F row = rf(body.left + 12, y, body.right - 12, y + rh - 6);
         if (g_hover_pinrow == pr->message_id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
 
@@ -4980,7 +5097,7 @@ static void draw_file_rows(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
     /* Scrolling (WIN-76), through the offset five other panes already share. The
      * list used to stop at the pane edge and merely COUNT what it could not show,
      * which told you the rows existed and still refused to reach them. */
-    float rowh = 50.0f;
+    float rowh = UIS(50.0f);
     D2D1_RECT_F list = rf(body.left, y, body.right, body.bottom);
     ovl_use(OVL_FILES);
     y = ovl_begin(rt, list, (float)g_n_forder * rowh + 16);
@@ -5475,7 +5592,7 @@ static void sw_book_load(void);       /* fwd */
 static void draw_wsmgr(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
     D2D1_RECT_F body = reg;   /* the frame drew the title bar (modal_frame) */
     g_n_wsmgr_hits = 0;
-    float y = body.top + 34, rowh = 54;
+    float y = body.top + UIS(34), rowh = UIS(54);
 
     for (int i = 0; i < g_n_sw; i++) {
         int slot = ws_find(g_sw[i].ws);
@@ -5610,23 +5727,36 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
         snprintf(t2, sizeof t2, "%s  \u00B7  archived", title);
         snprintf(title, sizeof title, "%s", t2);
     }
+    /* MEASURE the right-hand cluster before drawing the title, and reserve what it
+     * actually needs. A flat 240 was fine at 100% and at Largest text left the
+     * title a rect narrower than one word — the header rendered as a bare "#",
+     * with the channel's name nowhere on screen (WIN-111). */
+    char mc[16] = "";
+    if (c && m->chanmem_channel == g_sel && !m->chanmem_loading)
+        snprintf(mc, sizeof mc, "%u", (unsigned)m->n_chanmem);
+    float cw = UIS(30) + (mc[0] ? text_width(mc, g_meta) + UIS(4) : 0);
+    float right_used = UIS(16) + cw;
+    char ulbl[40] = "";
+    if (g_unread_from && g_unread_chan == g_sel && g_unread_count > 0) {
+        snprintf(ulbl, sizeof ulbl, "%d new \u2191", g_unread_count);
+        right_used += text_width(ulbl, g_meta) + UIS(22) + UIS(12);
+    }
+    float title_r = x0 + w - right_used - UIS(12);
+    if (title_r < x0 + UIS(80)) title_r = x0 + UIS(80);   /* never nothing at all */
+
     if (typing[0]) {
-        draw_text(rt, title, g_display, rf(x0 + 20, 6, x0 + w - 240, 34), OC_COL_TEXT);
-        draw_text(rt, typing, g_meta, rf(x0 + 20, 32, x0 + w - 240, HEADER_H - 6), OC_COL_ACCENT);
+        draw_text(rt, title, g_display, rf(x0 + 20, 6, title_r, 34), OC_COL_TEXT);
+        draw_text(rt, typing, g_meta, rf(x0 + 20, 32, title_r, HEADER_H - 6), OC_COL_ACCENT);
     } else if (topic) {
-        draw_text(rt, title, g_display, rf(x0 + 20, 6, x0 + w - 240, 34), OC_COL_TEXT);
-        draw_text(rt, topic, g_meta, rf(x0 + 20, 32, x0 + w - 240, HEADER_H - 6), OC_COL_MUTED);
+        draw_text(rt, title, g_display, rf(x0 + 20, 6, title_r, 34), OC_COL_TEXT);
+        draw_text(rt, topic, g_meta, rf(x0 + 20, 32, title_r, HEADER_H - 6), OC_COL_MUTED);
     } else {
-        draw_text(rt, title, g_display, rf(x0 + 20, 0, x0 + w - 240, HEADER_H), OC_COL_TEXT);
+        draw_text(rt, title, g_display, rf(x0 + 20, 0, title_r, HEADER_H), OC_COL_TEXT);
     }
 
     /* Member count chip (right), Slack's shape: an icon and a number rather than
      * the word "Members". The count is the CHANNEL's roster (REQ-031), not the
      * tenant's — which is what the pane beside it used to show. */
-    char mc[16] = "";
-    if (c && m->chanmem_channel == g_sel && !m->chanmem_loading)
-        snprintf(mc, sizeof mc, "%u", (unsigned)m->n_chanmem);
-    float cw = 30 + (mc[0] ? text_width(mc, g_meta) + 4 : 0);
     g_memchip = rf(x0 + w - 16 - cw, 13, x0 + w - 16, HEADER_H - 13);
     if (g_show_members) fill_round(rt, g_memchip, 6.0f, OC_COL_SELECT);
     else                stroke_round(rt, g_memchip, 6.0f, OC_COL_BORDER, 1.0f);
@@ -5641,10 +5771,9 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
     /* Jump-to-unread (WIN-14): only while this channel actually has a divider to
      * jump to, so it is never a dead control. */
     float statr = g_memchip.left - 12;
-    if (g_unread_from && g_unread_chan == g_sel && g_unread_count > 0) {
-        char lbl[40];
-        snprintf(lbl, sizeof lbl, "%d new \u2191", g_unread_count);
-        float bw = text_width(lbl, g_meta) + 22;
+    if (ulbl[0]) {
+        const char *lbl = ulbl;
+        float bw = text_width(lbl, g_meta) + UIS(22);
         g_unread_jump = rf(statr - bw, 14, statr, HEADER_H - 14);
         fill_round(rt, g_unread_jump, 12.0f, OC_COL_DANGER);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -5821,7 +5950,7 @@ static void draw_palette(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
 
     float pw = 520; if (pw > W - 80) pw = W - 80;
     float px = (W - pw) / 2, py = 96;
-    float rowh = 32, maxrows = 10;
+    float rowh = UIS(32), maxrows = 10;
 
     char q[64] = "";
     if (g_pal_edit) {
@@ -6208,7 +6337,7 @@ static void draw_autocomplete(ID2D1RenderTarget *rt, float x0, float w, float h)
     if (g_n_ac <= 0) { g_ac_panel = rf(0, 0, 0, 0); return; }
     /* Height = header band + rows + hint band. Each band is accounted for once,
      * or the hint lands on top of the last row. */
-    float rowh = 26, hdr_h = 22, hint_h = 22;
+    float rowh = UIS(26), hdr_h = UIS(22), hint_h = UIS(22);
     float pw = 320; if (pw > w - 40) pw = w - 40;
     float ph = hdr_h + g_n_ac * rowh + hint_h;
     float px = x0 + 20, py = h - g_composer_h - ph - 6;
@@ -6483,15 +6612,54 @@ static void draw_fmt_toolbar(ID2D1RenderTarget *rt, float bx0, float by0, float 
     float sq = COMPOSER_FMT;
     float y = by0 + (COMPOSER_TB - sq) / 2;
     float x = bx0 + 8;
-    (void)bx1; (void)TIPS;
+    (void)TIPS;
     for (int i = 0; i < FMT_COUNT; i++) {
         /* A gap before the block forms: emphasis wraps a selection, a block
          * marker changes whole lines, and the two are not the same gesture. */
         if (i == FMT_QUOTE) x += 8;
+        /* Stop at the box's edge. At a small window and a large scale the seven
+         * buttons are wider than the composer, and the tail was drawn off the
+         * WINDOW — found as composer.format.numbers escaping (WIN-111). Every one
+         * of them has a keyboard chord and a palette entry, so a button that does
+         * not fit is hidden rather than unreachable. */
+        if (x + sq > bx1 - 8) {
+            for (int j = i; j < FMT_COUNT; j++) g_fmt_btn[j] = rf(0, 0, 0, 0);
+            break;
+        }
         g_fmt_btn[i] = rf(x, y, x + sq, y + sq);
         if (g_fmt_hover == i) fill_round(rt, g_fmt_btn[i], 5.0f, OC_COL_HOVER);
         draw_fmt_icon(rt, i, g_fmt_btn[i], g_fmt_hover == i ? OC_COL_TEXT : OC_COL_MUTED);
         x += sq + 2;
+    }
+}
+
+/* THE ONE SOURCE for the composer's inner geometry.
+ *
+ * draw_composer and layout_composer each derived the box, the field and the action
+ * row from the same constants, separately — two copies of an arithmetic that has
+ * to agree exactly, in two functions four thousand lines apart. They did agree,
+ * right up until the field's real line height stopped matching the height the box
+ * had been measured for, and then the text was drawn over the icons while the hit
+ * rect said it was not (WIN-111). Neither copy was wrong on its own; having two of
+ * them was.
+ *
+ * `field` is clamped to stop COMPOSER_GAP short of the action row whatever the
+ * inputs say. If that leaves nothing, it comes back empty rather than inverted —
+ * every consumer already handles empty, and none handles right < left.
+ */
+static void composer_geom(float bx0, float bx1, float h,
+                          D2D1_RECT_F *box, D2D1_RECT_F *field, float *act_y) {
+    float by0 = h - g_composer_h + COMPOSER_MT, by1 = h - COMPOSER_MB;
+    float atop = by1 - COMPOSER_PAD - COMPOSER_ACTIONS;   /* the row of buttons */
+    float ty   = by0 + composer_tb() + COMPOSER_PAD;      /* under the toolbar */
+    float inner = composer_inner_h(), lh = ed_line_h();
+    float texth = inner > lh ? inner : lh;
+    if (ty + texth > atop - COMPOSER_GAP) texth = atop - COMPOSER_GAP - ty;
+    if (box)   *box   = rf(bx0, by0, bx1, by1);
+    if (act_y) *act_y = atop + (COMPOSER_ACTIONS - COMPOSER_BTN) / 2;
+    if (field) {
+        float tx = bx0 + COMPOSER_PAD, tr = bx1 - COMPOSER_PAD;
+        *field = (tr <= tx || texth < 1.0f) ? rf(0, 0, 0, 0) : rf(tx, ty, tr, ty + texth);
     }
 }
 
@@ -6502,7 +6670,9 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     /* A bordered, rounded input container the composer lives inside (Slack-style),
      * so the field reads as a real control rather than a naked line of text. */
     float bx0 = x0 + 20, bx1 = x0 + w - 20;
-    float by0 = top + COMPOSER_MT, by1 = h - COMPOSER_MB;
+    D2D1_RECT_F cbox, cfield; float cy_act;
+    composer_geom(bx0, bx1, h, &cbox, &cfield, &cy_act);
+    float by0 = cbox.top, by1 = cbox.bottom;
     fill_round(rt, rf(bx0, by0, bx1, by1), 10.0f, OC_COL_INPUT);
     stroke_round(rt, rf(bx0, by0, bx1, by1), 10.0f, OC_COL_BORDER, 1.0f);
 
@@ -6512,39 +6682,48 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     /* The ACTION ROW, along the bottom of the box under the text — Slack's
      * arrangement. The field above it is the full width of the box. */
     float sq = COMPOSER_BTN;
-    float cy = by1 - COMPOSER_PAD + (COMPOSER_ACTIONS - sq) / 2 - COMPOSER_ACTIONS;
+    float cy = cy_act;
 
     g_attach_btn = rf(bx0 + 6, cy, bx0 + 6 + sq, cy + sq);
-    draw_lucide(rt, OC_ICON_PLUS, rf(g_attach_btn.left + 8, g_attach_btn.top + 8,
-                                     g_attach_btn.right - 8, g_attach_btn.bottom - 8),
-                OC_COL_MUTED);
 
     /* A monochrome line icon, not a colour glyph: this is chrome, and it sat
      * next to a grey "+" and a grey paper plane as the only coloured control in
      * the whole shell. Colour is for content — messages, reactions, and the
      * glyphs you pick in the picker. */
     g_emoji_btn = rf(bx0 + 6 + sq, cy, bx0 + 6 + sq * 2, cy + sq);
-    draw_lucide(rt, OC_ICON_SMILE, rf(g_emoji_btn.left + 8, g_emoji_btn.top + 8,
-                                      g_emoji_btn.right - 8, g_emoji_btn.bottom - 8),
-                OC_COL_MUTED);
 
     /* Mention. The '@' trigger already worked when typed; ARCH-82 says the GUI
-     * is affordance-driven, so it needs to be visible too. */
+     * is affordance-driven, so it needs to be visible too.
+     *
+     * The left cluster yields to Send rather than growing under it: on a narrow
+     * window at a large scale the three of them plus the send button are wider
+     * than the box, and @ ended up beneath Send — caught as
+     * composer.mention+composer.send (WIN-111). Send is the one that must always
+     * be there, so the optional icons drop off from the right. */
+    float left_limit = bx1 - 6 - sq - UIS(30);
     g_at_btn = rf(bx0 + 6 + sq * 2, cy, bx0 + 6 + sq * 3, cy + sq);
-    draw_lucide(rt, OC_ICON_AT, rf(g_at_btn.left + 8, g_at_btn.top + 8,
-                                   g_at_btn.right - 8, g_at_btn.bottom - 8), OC_COL_MUTED);
+    if (g_at_btn.right > left_limit) g_at_btn = rf(0, 0, 0, 0);
+    if (g_emoji_btn.right > left_limit) g_emoji_btn = rf(0, 0, 0, 0);
+    if (g_attach_btn.right > left_limit) g_attach_btn = rf(0, 0, 0, 0);
+    if (g_attach_btn.right > g_attach_btn.left)
+        draw_lucide(rt, OC_ICON_PLUS, rf(g_attach_btn.left + 8, g_attach_btn.top + 8,
+                                         g_attach_btn.right - 8, g_attach_btn.bottom - 8),
+                    OC_COL_MUTED);
+    /* A monochrome line icon, not a colour glyph: this is chrome, and it sat next
+     * to a grey "+" and a grey paper plane as the only coloured control in the
+     * whole shell. Colour is for content. */
+    if (g_emoji_btn.right > g_emoji_btn.left)
+        draw_lucide(rt, OC_ICON_SMILE, rf(g_emoji_btn.left + 8, g_emoji_btn.top + 8,
+                                          g_emoji_btn.right - 8, g_emoji_btn.bottom - 8),
+                    OC_COL_MUTED);
+    if (g_at_btn.right > g_at_btn.left)
+        draw_lucide(rt, OC_ICON_AT, rf(g_at_btn.left + 8, g_at_btn.top + 8,
+                                       g_at_btn.right - 8, g_at_btn.bottom - 8), OC_COL_MUTED);
 
     /* THE FIELD (WIN-80). Between the left buttons and Send, at the rect
      * layout_composer computed — the same rect ed_hit tests against, so what you
      * click is what you see. */
-    {
-        float tx = bx0 + COMPOSER_PAD, tr = bx1 - COMPOSER_PAD;
-        float inner = composer_inner_h();
-        float lh = ed_line_h();
-        float texth = inner > lh ? inner : lh;
-        float ty = by0 + composer_tb() + COMPOSER_PAD;
-        ed_draw(rt, rf(tx, ty, tr, ty + texth));
-    }
+    if (cfield.right > cfield.left) ed_draw(rt, cfield);
 
     /* Send on the right — accent when there is something to send. A paper
      * plane rather than an up-arrow, which read as "scroll" more than "send". */
@@ -6729,8 +6908,8 @@ static int g_modal_primary_cmd = -1;        /* what Enter fires */
 enum { MODAL_CANCEL = -2, MODAL_OK = -1 };
 
 
-#define MODAL_TITLE_H 52.0f
-#define MODAL_FOOT_H  60.0f
+#define MODAL_TITLE_H UIS(52.0f)
+#define MODAL_FOOT_H  UIS(60.0f)
 
 static float btn_width(const char *label) {
     float w = text_width(label, g_ui) + 34;
@@ -6745,8 +6924,12 @@ static D2D1_RECT_F modal_frame(ID2D1RenderTarget *rt, const oc_modal_spec *s,
 
     /* Two sizes rather than free arithmetic: the old per-modal `cw = W - 160`
      * gave a six-row settings list a 720px card. */
-    float want_w = (s->size == MODAL_LG) ? 720.0f : 460.0f;
-    float want_h = (s->size == MODAL_LG) ? 620.0f : 300.0f;
+    /* The card holds text, so it grows with it (WIN-111). At Largest text a fixed
+     * 720x620 could not hold what it was asked to draw, and — since nothing
+     * clipped — the overflow painted over the shell behind the card, with the
+     * footer buttons underneath its own rows. */
+    float want_w = UIS((s->size == MODAL_LG) ? 720.0f : 460.0f);
+    float want_h = UIS((s->size == MODAL_LG) ? 620.0f : 300.0f);
     float cw = W - 96, ch = H - 96;
     if (cw > want_w) cw = want_w;
     if (ch > want_h) ch = want_h;
@@ -6759,17 +6942,27 @@ static D2D1_RECT_F modal_frame(ID2D1RenderTarget *rt, const oc_modal_spec *s,
 
     /* Title bar. The close button is a D2D hit-box, not a native child: a child
      * would composite above the card and punch through it. */
-    float ty = card.top + (s->subtitle && s->subtitle[0] ? 12.0f : 0.0f);
+    /* Title then subtitle, STACKED by the title's own height rather than by a
+     * constant 30: at large text the two were drawn on top of each other, since
+     * the title grew and the subtitle's offset did not (WIN-111). */
+    int has_sub = (s->subtitle && s->subtitle[0]) ? 1 : 0;
+    float title_line = UIS(30.0f);
     draw_text(rt, s->title, g_display,
-              rf(card.left + MODAL_PAD, card.top, card.right - 56, card.top + MODAL_TITLE_H - ty + card.top),
+              rf(card.left + MODAL_PAD, card.top + UIS(10),
+                 card.right - UIS(56), card.top + UIS(10) + title_line),
               OC_COL_TEXT);
-    if (s->subtitle && s->subtitle[0])
+    if (has_sub)
         draw_text(rt, s->subtitle, g_meta,
-                  rf(card.left + MODAL_PAD, card.top + 30, card.right - 56, card.top + 50),
+                  rf(card.left + MODAL_PAD, card.top + UIS(10) + title_line,
+                     card.right - UIS(56), card.top + UIS(10) + title_line + UIS(20)),
                   OC_COL_FAINT);
-    float title_h = MODAL_TITLE_H + (s->subtitle && s->subtitle[0] ? 14.0f : 0.0f);
+    /* Measured from the same numbers the title block was drawn with, so the body
+     * starts BELOW it — MODAL_TITLE_H plus a constant under-counted once the
+     * title grew, and the first row of every card was clipped by the divider. */
+    float title_h = UIS(10) + title_line + (has_sub ? UIS(20) : 0) + UIS(12);
 
-    g_modal_close_btn = rf(card.right - 44, card.top + 12, card.right - 16, card.top + 40);
+    g_modal_close_btn = rf(card.right - UIS(44), card.top + UIS(12),
+                           card.right - UIS(16), card.top + UIS(40));
     if (in_rect(g_modal_close_btn, (float)g_mouse_x, (float)g_mouse_y))
         fill_round(rt, g_modal_close_btn, 6.0f, OC_COL_HOVER);
     /* The same glyph the members pane closes with (there is no Lucide X in the
@@ -6847,8 +7040,14 @@ static D2D1_RECT_F modal_frame(ID2D1RenderTarget *rt, const oc_modal_spec *s,
         }
     }
 
-    return rf(card.left + MODAL_PAD, card.top + title_h,
-              card.right - MODAL_PAD, foot_top - 8);
+    {   /* Clamped at the source too: a modal handed an inverted body draws its
+         * rows at negative heights, which is the same defect one layer up. */
+        float bt = card.top + title_h, bb = foot_top - 8;
+        float bl = card.left + MODAL_PAD, br = card.right - MODAL_PAD;
+        if (bb < bt) bb = bt;
+        if (br < bl) br = bl;
+        return rf(bl, bt, br, bb);
+    }
 }
 
 /* The spec of whichever modal is open, so the click and key routers work from the
@@ -6862,9 +7061,9 @@ static const oc_modal_spec *modal_current(void);
  * chips the rest of the app uses rather than native BUTTONs: a radio button is
  * fine, but two idioms on one card is what this whole item was about. */
 static float form_rowh(const oc_field *f) {
-    if (f->kind == FF_CHECK)  return 34;
-    if (f->kind == FF_CHOICE) return 54;
-    return (f->hint && f->hint[0]) ? 74.0f : 54.0f;
+    if (f->kind == FF_CHECK)  return UIS(34);
+    if (f->kind == FF_CHOICE) return UIS(54);
+    return (f->hint && f->hint[0]) ? UIS(74.0f) : UIS(54.0f);
 }
 
 static void draw_form(ID2D1RenderTarget *rt, D2D1_RECT_F body) {
@@ -6965,6 +7164,22 @@ static void draw_modal(ID2D1RenderTarget *rt, const oc_model *m, float W, float 
     const oc_modal_spec *s = modal_current();
     D2D1_RECT_F body = modal_frame(rt, s, W, H);
 
+    /* CLIP the body to itself. The bodies that scroll already clip (ovl_begin);
+     * the ones that do not — the form, the notification prologue — drew straight
+     * past the card at large text, over the shell behind it and over the footer
+     * buttons. Clipping turns an unreadable overlap into an obvious truncation,
+     * and the card growing with the text removes most of the truncation
+     * (WIN-111). The clip lives here rather than in modal_frame because the frame
+     * returns and the caller draws afterwards. */
+    /* NEVER an inverted rect. At a large scale in a small window the scaled title
+     * band and footer can exceed the card, leaving body.bottom above body.top —
+     * and D2D faults INSIDE d2d1.dll on an inverted clip rather than refusing it.
+     * That crash took the client down mid-suite and surfaced as a dozen unrelated
+     * failures (WIN-111). */
+    D2D1_RECT_F clip = rf(body.left, body.top,
+                          body.right > body.left ? body.right : body.left,
+                          body.bottom > body.top ? body.bottom : body.top);
+    ID2D1RenderTarget_PushAxisAlignedClip(rt, &clip, D2D1_ANTIALIAS_MODE_ALIASED);
     if (g_prefs_open)       draw_prefs(rt, body);
     else if (g_keys_open)   draw_keys(rt, body);
     else if (g_wsmgr_open)  draw_wsmgr(rt, body);
@@ -6973,6 +7188,7 @@ static void draw_modal(ID2D1RenderTarget *rt, const oc_model *m, float W, float 
     else if (g_confirm_open) draw_confirm(rt, body);
     else if (g_sessions_open) draw_sessions(rt, m, body);
     else if (g_form_open)   draw_form(rt, body);
+    ID2D1RenderTarget_PopAxisAlignedClip(rt);
 }
 
 static void prefs_save(void);                    /* fwd */
@@ -7252,6 +7468,12 @@ static void layout_files_find(HWND hwnd);   /* fwd */
 static void layout_dir_find(HWND hwnd);     /* fwd */
 
 static void layout_natives(HWND hwnd) {
+    {   /* The native children are placed against the same columns the scene
+         * draws, so they need the same scale — computed here too, because layout
+         * can run before a paint. */
+        RECT rc0; GetClientRect(hwnd, &rc0);
+        shell_scale_update(DIPF(rc0.right), DIPF(rc0.bottom));
+    }
     layout_composer(hwnd);     /* also does layout_find */
     layout_search(hwnd);
     layout_files_find(hwnd);
@@ -7411,7 +7633,7 @@ static void draw_invites(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F b
               OC_COL_FAINT);
     body.top += 28;
     ovl_use(OVL_INVITES);
-    float rowh = 44;
+    float rowh = UIS(44);
     float y = ovl_begin(rt, body, (float)m->n_invites * rowh + 8);
     for (size_t i = 0; i < m->n_invites; i++) {
         const oc_invite_row *iv = &m->invites[i];
@@ -7883,7 +8105,7 @@ static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h
     }
 
     g_n_listrows = 0;
-    float y = fy + 30;
+    float y = fy + UIS(30);
     if (m->activity_loading) {
         draw_text(rt, "Loading\u2026", g_meta, rf(x0 + 16, y + 8, x1 - 12, y + 30), OC_COL_FAINT);
         return;
@@ -7893,7 +8115,7 @@ static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h
         const oc_activity_view *a = &m->activity[i];
         if (!act_passes(a)) continue;
         shown++;
-        D2D1_RECT_F row = rf(x0 + 6, y, x1 - 6, y + 74);
+        D2D1_RECT_F row = rf(x0 + 6, y, x1 - 6, y + UIS(74));
         if (g_act_selected == a->message_id)      fill_round(rt, row, 6.0f, OC_COL_SELECT);
         else if (g_listrow_hover == a->message_id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
         /* Arrived since you last opened the feed — all the watermark buys us. */
@@ -7941,7 +8163,7 @@ static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h
             g_listrows[g_n_listrows].cid = a->channel_id;
             g_n_listrows++;
         }
-        y += 78;
+        y += UIS(78);
     }
     if (!shown)
         draw_text(rt, (g_act_filter == AF_UNREADS || g_act_filter == AF_DMS ||
@@ -7992,7 +8214,7 @@ static void draw_sessions(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F 
         overlay_empty(rt, body, "No other sessions.");
         return;
     }
-    float rowh = 52;
+    float rowh = UIS(52);
     ovl_use(OVL_SESSIONS);
     float y = ovl_begin(rt, body, (float)m->n_sessions * rowh + 12);
     for (size_t i = 0; i < m->n_sessions; i++) {
@@ -8036,7 +8258,7 @@ static void draw_browse(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F bo
         overlay_empty(rt, body, "No public channels yet.");
         return;
     }
-    float rowh = 54.0f;
+    float rowh = UIS(54.0f);
     ovl_use(OVL_BROWSE);
     float y = ovl_begin(rt, body, (float)n_public * rowh + 12);
     for (int pass = 0; pass < 2; pass++) {
@@ -8206,7 +8428,7 @@ static float tgt_draw(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F box,
     if (!g_n_tgt) tgt_rebuild();
     if (!g_n_tgt) return box.bottom - box.top;
 
-    float rowh = 34, ly = box.bottom + 4;
+    float rowh = UIS(34), ly = box.bottom + UIS(4);
     float lh = (float)g_n_tgt * rowh + 8;
     D2D1_RECT_F list = rf(box.left, ly, box.right, ly + lh);
     fill_round(rt, list, 8.0f, OC_COL_BASE);
@@ -8532,7 +8754,7 @@ static void draw_directory(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
     snprintf(filter, sizeof filter, "%s", g_dir_filter);
     for (char *c = filter; *c; c++) *c = (char)tolower((unsigned char)*c);
 
-    const float ROWH2 = 56.0f;
+    const float ROWH2 = UIS(56.0f);
     size_t shown = 0;
     for (size_t i = 0; i < m->n_users; i++) if (dir_matches(&m->users[i], filter)) shown++;
     if (!shown) {
@@ -8569,14 +8791,14 @@ static void draw_directory(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
          * who has not set one. */
         float ny = sub[0] ? y + 8 : y + 16;
         draw_text(rt, u->name[0] ? u->name : "user", g_ui_b,
-                  rf(row.left + 56, ny, row.right - 200, ny + 20), OC_COL_TEXT);
+                  rf(row.left + 56, ny, row.right - UIS(200), ny + 20), OC_COL_TEXT);
         if (sub[0])
-            draw_text(rt, sub, g_meta, rf(row.left + 56, y + 27, row.right - 200, y + 47),
+            draw_text(rt, sub, g_meta, rf(row.left + 56, y + 27, row.right - UIS(200), y + 47),
                       OC_COL_MUTED);
 
         if (u->timezone[0]) {
             IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
-            draw_text(rt, u->timezone, g_meta, rf(row.right - 190, y + 18, row.right - 16, y + 38),
+            draw_text(rt, u->timezone, g_meta, rf(row.right - UIS(190), y + 18, row.right - UIS(16), y + 38),
                       OC_COL_FAINT);
             IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
         }
@@ -8642,7 +8864,7 @@ static void draw_threads(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
     }
 
     ovl_use(OVL_LATER);
-    const float CARDH = 104.0f;
+    const float CARDH = UIS(104.0f);
     float y = ovl_begin(rt, body, (float)m->n_threads * CARDH + 16);
     for (size_t i = 0; i < m->n_threads && i < 32; i++) {
         const oc_thread_view *t = &m->threads[i];
@@ -8660,13 +8882,13 @@ static void draw_threads(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
             const char *pn = oc_model_user_name((oc_model *)m, ch->peer_id);
             snprintf(where, sizeof where, "@ %s", (pn && pn[0]) ? pn : "direct message");
         } else snprintf(where, sizeof where, "# %s", (ch && ch->name[0]) ? ch->name : "channel");
-        draw_text(rt, where, g_meta, rf(card.left + 16, card.top + 8, card.right - 200,
+        draw_text(rt, where, g_meta, rf(card.left + 16, card.top + 8, card.right - UIS(200),
                                         card.top + 26), OC_COL_MUTED);
 
         char when[24]; rel_time(t->last_reply_at ? t->last_reply_at : t->root_at,
                                 when, sizeof when);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
-        draw_text(rt, when, g_meta, rf(card.right - 120, card.top + 8, card.right - 16,
+        draw_text(rt, when, g_meta, rf(card.right - UIS(120), card.top + 8, card.right - UIS(16),
                                        card.top + 26), OC_COL_FAINT);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
 
@@ -8675,10 +8897,10 @@ static void draw_threads(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
                          rf(card.left + 16, card.top + 30, card.left + 44, card.top + 58),
                          g_meta, 0, 0);
         draw_text(rt, (who && who[0]) ? who : "someone", g_ui_b,
-                  rf(card.left + 52, card.top + 28, card.right - 140, card.top + 48),
+                  rf(card.left + 52, card.top + 28, card.right - UIS(140), card.top + 48),
                   OC_COL_TEXT);
         draw_text(rt, t->preview ? t->preview : "", g_meta_w,
-                  rf(card.left + 52, card.top + 46, card.right - 140, card.top + 84),
+                  rf(card.left + 52, card.top + 46, card.right - UIS(140), card.top + 84),
                   OC_COL_MUTED);
 
         /* The reply count under the message and to the LEFT, where Slack puts it
@@ -8747,7 +8969,7 @@ static void draw_drafts(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
                 snprintf(label, sizeof label, "%s %zu", NAMES[i], m->n_scheds);
             else snprintf(label, sizeof label, "%s", NAMES[i]);
             float w = text_width(label, g_ui_b) + 28;
-            D2D1_RECT_F t = rf(tx, ty, tx + w, ty + 34);
+            D2D1_RECT_F t = rf(tx, ty, tx + w, ty + UIS(34));
             draw_text(rt, label, g_dtab == i ? g_ui_b : g_ui,
                       rf(t.left + 14, t.top + 7, t.right, t.bottom),
                       g_dtab == i ? OC_COL_TEXT : OC_COL_MUTED);
@@ -8757,10 +8979,10 @@ static void draw_drafts(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
             tx += w;
         }
         fill(rt, rf(body.left, ty + 34, body.right, ty + 35), OC_COL_BORDER);
-        body.top = ty + 44;
+        body.top = ty + UIS(44);
     }
 
-    float rowh = 62.0f;
+    float rowh = UIS(62.0f);
     if (g_dtab == DTAB_DRAFTS) {
         if (m->n_drafts == 0) {
             draw_empty_state(rt, body, OC_ICON_SQUARE_PEN,
@@ -8924,7 +9146,7 @@ static void draw_later(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
     /* Scrolling via the shared overlay offset (WIN-76) — the same helper the audit,
      * webhook, reaction, notify and shortcut panes use. A private offset here would
      * have been a sixth copy of a solved problem. */
-    float rowh = 56.0f;
+    float rowh = UIS(56.0f);
     int shown_total = 0;
     for (size_t i = 0; i < m->n_saved; i++)
         if (!g_later_chan || m->saved[i].channel_id == g_later_chan) shown_total++;
@@ -8993,6 +9215,7 @@ static void draw_stub_view(ID2D1RenderTarget *rt, D2D1_RECT_F reg,
 static void draw_lightbox(ID2D1RenderTarget *rt, float W, float H);   /* fwd */
 
 static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, float H) {
+    shell_scale_update(W, H);   /* the shell's furniture is capped by the window (WIN-111) */
     /* Start from a known identity transform — draw_lucide sets a scale/translate
      * transform per icon and resets it, but reset defensively here so a leaked
      * transform can never distort the menu/avatar chrome (guards the malformed
@@ -10459,8 +10682,13 @@ static const char *view_aid(int act) {
     }
 }
 
+/* The published scene, kept at file scope so the harness can measure it (WIN-111).
+ * It is already the app's own account of every element it drew and where — which
+ * is exactly what a fit check needs, and it costs nothing to reuse. */
+static oc_acc_item g_acc_items[OC_ACC_MAX];
+
 static void a11y_publish_scene(const oc_model *m) {
-    static oc_acc_item items[OC_ACC_MAX];
+    oc_acc_item *items = g_acc_items;
     int n = 0;
 
     /* Conversations. Headers are skipped: "Channels" is a label, not a place you
@@ -10936,23 +11164,11 @@ static void layout_composer(HWND hwnd) {
     float main_x = RAIL_W + SIDEBAR_W;
     /* Inside the composer box, between the attach (+) and send buttons. */
     float bx0 = main_x + 20, bx1 = (rc.right - members) - 20;
-    float by0 = rc.bottom - g_composer_h + COMPOSER_MT;
-    float by1 = rc.bottom - COMPOSER_MB; (void)by1;
-    /* The field sits between the left buttons and Send. Its height is the text,
-     * top-aligned once the box is taller than one line so growth reads
-     * downward; at rest it is centred against the buttons. */
-    /* Full width of the box, inset by the padding: the buttons are on their own
-     * row underneath now, so nothing shares this line with the text. */
-    float tx = bx0 + COMPOSER_PAD, tr = bx1 - COMPOSER_PAD;
-    float inner = composer_inner_h();
-    float lh0 = ed_line_h();
-    float texth = inner > lh0 ? inner : lh0;
-    /* The toolbar row owns the top of the box (WIN-96); the field starts under
-     * it. Both this and draw_composer offset by the same constant, which is the
-     * pairing that has to stay true — the rect ed_hit tests against is the one
-     * ed_draw paints into, and a toolbar added to only one of them would put the
-     * caret a row away from the text. */
-    float ty = by0 + composer_tb() + COMPOSER_PAD;
+    /* The SAME call draw_composer makes, so the rect ed_hit tests against is the
+     * rect ed_draw paints into — not a second derivation that has to be kept in
+     * step by hand. See composer_geom(). */
+    D2D1_RECT_F field;
+    composer_geom(bx0, bx1, (float)rc.bottom, NULL, &field, NULL);
     /* Never hand back an inverted rect. members_w() should have prevented it, but
      * `right < left` is the one shape every consumer of this box gets wrong
      * silently: ed_hit matches nothing, ed_draw clips to nothing, and the dump's
@@ -10960,18 +11176,26 @@ static void layout_composer(HWND hwnd) {
      * arrives as "the message box is gone" with no clue why. Collapse to empty
      * instead, which every consumer already handles because it is what a
      * non-conversation view returns. */
-    if (tr <= tx) {
+    if (field.right <= field.left) {
         g_ed_box = rf(0, 0, 0, 0);
         for (int i = 0; i < FMT_COUNT; i++) g_fmt_btn[i] = rf(0, 0, 0, 0);
         g_fmt_hover = -1;
         g_ed_focus = 0;
         return;
     }
-    g_ed_box = rf(tx, ty, tr, ty + texth);
+    g_ed_box = field;
 }
 
 /* Position the "Find a conversation" EDIT inside its sidebar box (transcript
  * views only). */
+/* Where the sidebar's filter box is, in DIP. The painter draws its container
+ * here and layout_find places the EDIT inside it — one source, so they cannot
+ * disagree at a scale nobody tested. */
+static D2D1_RECT_F find_box(void) {
+    return rf(RAIL_W + UIS(10), HEADER_H + UIS(6),
+              RAIL_W + SIDEBAR_W - UIS(10), HEADER_H + UIS(36));
+}
+
 static void layout_find(HWND hwnd) {
     (void)hwnd;   /* the sidebar has a fixed width; geometry is constant */
     if (!g_find) return;
@@ -10995,12 +11219,19 @@ static void layout_find(HWND hwnd) {
      * has to re-place it even though its visibility did not move. */
     static int shown = -1;
     static UINT laid_at_dpi = 0;
-    if (want == shown && laid_at_dpi == g_dpi) return;
+    static float laid_at_scale = -1.0f;
+    /* The SCALE is part of "changed" too, and it was not: text size or zoom moved
+     * the chrome this box sits in while the cache said nothing had happened, so
+     * the control stayed at its old place — a bare white rectangle floating over
+     * the sidebar (WIN-111). */
+    if (want == shown && laid_at_dpi == g_dpi && laid_at_scale == g_text_scale) return;
     shown = want;
     laid_at_dpi = g_dpi;
+    laid_at_scale = g_text_scale;
     if (!want) { ShowWindow(g_find, SW_HIDE); return; }
-    int x = (int)(RAIL_W + 10 + 28), r = (int)(RAIL_W + SIDEBAR_W - 10 - 8);
-    int top = (int)(HEADER_H + 6 + 6), hgt = 18;
+    D2D1_RECT_F fb = find_box();
+    int x = (int)(fb.left + UIS(28)), r = (int)(fb.right - UIS(8));
+    int top = (int)(fb.top + UIS(7)), hgt = (int)UIS(16);
     MoveWindow(g_find, PX(x), PX(top), PX(r - x), PX(hgt), TRUE);
     ShowWindow(g_find, SW_SHOW);
 }
@@ -11455,6 +11686,13 @@ static void scale_apply(HWND hwnd) {
     /* The composer draws through g_body, which fonts_build() just replaced, so its
      * cached layout is stale — and stale is not visibly wrong, which is worse. */
     ed_invalidate_layout();
+    /* The composer's height is measured, not constant, so it has to be re-measured
+     * when the measurement changes — without this the box kept its old height and
+     * the text grew inside it (WIN-111). */
+    composer_remeasure();
+    /* The emoji formats are built once in d2d_init and were never rebuilt, so
+     * every glyph stayed its original size while the words around it grew. */
+    emoji_fonts_build();
     layout_natives(hwnd);
     InvalidateRect(hwnd, NULL, FALSE);
 }
@@ -15126,6 +15364,71 @@ static void test_dump(const char *path) {
         fprintf(f, "snoozed=%d snooze_until=%llu dnd_others=%d\n",
                 m ? oc_model_snoozed(m) : 0,
                 (unsigned long long)(m ? m->snooze_until_ms : 0), others);
+    }
+    /* CHROME FIT (WIN-111). Two invariants over the elements the app says it drew:
+     * nothing overlaps a sibling, and nothing leaves the surface that owns it. The
+     * defects this item exists for are both — the composer's text running into its
+     * own action row is an overlap, the modal's rows painting over the shell is an
+     * escape. A healthy layout is 0 0 at every scale.
+     *
+     * (The plan also named a `clipped` count for text wider than its rect. It is
+     * not here: the item's format is not published, and after the ellipsis change
+     * truncation is legible rather than broken, so it would report style, not a
+     * defect.) */
+    {
+        int overlaps = 0, outside = 0;
+        /* Name the first of each: a count alone is a hunt. */
+        #define contains(o, i) ((o)->l <= (i)->l && (o)->t <= (i)->t && \
+                                (o)->r >= (i)->r && (o)->b >= (i)->b)
+        char first_ov[96] = "", first_out[96] = "";
+        RECT rcw; GetClientRect(g_main_hwnd ? g_main_hwnd : GetActiveWindow(), &rcw);
+        int md = modal_open();
+        int ml = PX(g_modal_card.left), mt = PX(g_modal_card.top);
+        int mr = PX(g_modal_card.right), mb = PX(g_modal_card.bottom);
+        for (int i = 0; i < g_a11y_n; i++) {
+            const oc_acc_item *a = &g_acc_items[i];
+            if (a->r <= a->l || a->b <= a->t) continue;
+            /* ENTIRELY outside, not merely straddling: a row half below the fold
+             * of a scrolling list is ordinary, and counting it made a healthy
+             * sidebar look broken at every large scale. Drawn where nobody can
+             * see it at all is the defect. */
+            if (a->r <= 0 || a->b <= 0 || a->l >= rcw.right || a->t >= rcw.bottom) {
+                outside++;
+                if (!first_out[0]) snprintf(first_out, sizeof first_out, "%s", a->aid);
+            } else if (md && !strncmp(a->aid, "modal.", 6) &&
+                       (a->r <= ml || a->b <= mt || a->l >= mr || a->t >= mb)) {
+                /* Only the MODAL's own elements are required inside the card. The
+                 * shell behind it is still published and still legitimately
+                 * elsewhere — the first version of this check counted all 33 of
+                 * them and reported a healthy layout as broken. */
+                outside++;
+                if (!first_out[0]) snprintf(first_out, sizeof first_out, "escaped:%s", a->aid);
+            }
+            for (int j = i + 1; j < g_a11y_n; j++) {
+                const oc_acc_item *b = &g_acc_items[j];
+                if (b->r <= b->l || b->b <= b->t) continue;
+                /* NESTING is not a collision — a message row contains its own
+                 * reaction chips, a card contains its buttons — so a rect wholly
+                 * inside another is skipped. PARTIAL overlap is a defect whatever
+                 * the two kinds are.
+                 *
+                 * This used to read `if (a->kind != b->kind) continue`, on the
+                 * theory that only like-with-like can collide. That excluded
+                 * exactly one pair worth having: the composer's text (COMPOSER)
+                 * against its own action icons (BUTTON) — the collision this whole
+                 * item exists for. The check reported 0 overlaps across the entire
+                 * scale matrix while the text was being drawn on top of the "+".
+                 * A check with an exemption shaped like the bug is not a check. */
+                if (contains(a, b) || contains(b, a)) continue;
+                if (a->l < b->r && b->l < a->r && a->t < b->b && b->t < a->b) {
+                    overlaps++;
+                    if (!first_ov[0]) snprintf(first_ov, sizeof first_ov, "%s+%s", a->aid, b->aid);
+                }
+            }
+        }
+        #undef contains
+        fprintf(f, "chromefit overlaps=%d outside=%d n=%d ov=\"%s\" out=\"%s\"\n",
+                overlaps, outside, g_a11y_n, first_ov, first_out);
     }
     /* Whether this window actually HAS the keyboard, which is the condition the
      * composer's auto-focus turns on — "focus=0" alone cannot tell you whether
