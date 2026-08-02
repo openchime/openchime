@@ -11,6 +11,7 @@
 #
 # Commands: shot <winpath> | send <text> | channel <name> | click x y |
 #           rclick x y | members | scroll <dy> | size w h | dump <winpath> |
+#           formnext <v1>|<v2>|... (arm the next modal form) |
 #           search [query] | find <text>
 #
 # `shot <name>` and `dump <name>` take a bare name; every other path is a

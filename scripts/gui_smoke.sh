@@ -145,13 +145,18 @@ settle() { wait_for "$1" "$2" >/dev/null 2>&1 || true; }
 # while going nowhere, so the suite reports "sending did not clear the field" for
 # a send that was never typed. That cost a real investigation. Wait for the window
 # to actually hold focus, and say plainly when it never does.
+# Both halves, because they are different facts and only the second is the one
+# `key`/`chars` need: the WINDOW can hold the keyboard while the composer has not
+# claimed it (the auto-focus runs on the idle tick and only in a conversation).
+# Waiting on the window alone still let a run reach `key enter` with focus=0.
 wait_typeable() {
   local t=0
-  while [ "$(snap | grep -oE '^wnd_focus=[0-9]' | cut -d= -f2)" != "1" ]; do
-    [ "$t" -ge 8000 ] && { say "   the window never took the keyboard — the checks below would blame the product"; return 1; }
+  while :; do
+    local d; d=$(snap)
+    case "$d" in *"wnd_focus=1"*) case "$d" in *"focus=1"*) return 0;; esac;; esac
+    [ "$t" -ge 8000 ] && { say "   the composer never took the keyboard — the checks below would blame the product"; return 1; }
     sleep 0.2; t=$((t + 200))
   done
-  return 0
 }
 
 # expect <dump> <key> <wanted> <label> — same-frame check against a captured dump.
@@ -1219,8 +1224,8 @@ expect "$d" draftrail 1 "drafts: the Home sidebar carries the destination"
 # The whole point: a NEW PROCESS finds it.
 "$DRIVE" launch >/dev/null 2>&1
 if ! wait_grep 'authed=1 connected=1' 20000; then fail "relaunch did not authenticate"; fi
-wait_typeable || true
 "$DRIVE" channel general >/dev/null 2>&1; settle conv 1
+wait_typeable || true
 expect_grep '^ed .*text="unsent thoughts"' "and it is still there after a restart"
 
 # Sending it is what ends it — on the daemon, in the send's own transaction.
@@ -1324,6 +1329,66 @@ if [ -f "$LIN_DIR/uia_probe.ps1" ] || cp "$HERE/scripts/uia_probe.ps1" "$LIN_DIR
 else
   say "   (could not stage uia_probe.ps1 — skipping the external check)"
 fi
+
+# --- keywords, priority people, schedule (WIN-94, REQ-135/136) -------------
+# All three are SERVER state reached through a modal form, which is why the
+# harness learned `formnext`: a form blocks the command loop, so every setting
+# behind one was undrivable and therefore untested end to end.
+say "== keywords, priority people and the schedule"
+"$DRIVE" view 0 >/dev/null 2>&1; settle sbkind 1
+"$DRIVE" menu 71 >/dev/null 2>&1          # the notifications overlay
+kwb=$(snap | grep -oE '^kwbtn=[0-9]+,[0-9]+' | cut -d= -f2 | tr ',' ' ')
+vipb=$(snap | grep -oE 'vipbtn=[0-9]+,[0-9]+' | cut -d= -f2 | tr ',' ' ')
+checks=$((checks + 1))
+if [ -n "$kwb" ] && [ -n "$vipb" ]; then ok "the overlay offers both editors"
+else fail "no keyword/priority buttons in the dump"; fi
+
+"$DRIVE" formnext "deploy, release train" >/dev/null 2>&1
+[ -n "$kwb" ] && "$DRIVE" click $kwb >/dev/null 2>&1
+expect_grep '^keywords="deploy,release train"' "keywords save through the real button"
+
+"$DRIVE" formnext "bob" >/dev/null 2>&1
+[ -n "$vipb" ] && "$DRIVE" click $vipb >/dev/null 2>&1
+expect_grep '^keywords=.* nvip=1 ' "a priority person resolves by name and saves"
+
+# A name that is nobody is REPORTED, not silently dropped — the list is a
+# promise about who reaches you, so a typo must not fail quietly.
+# Every toast is also ANNOUNCED (ARCH-99), and the announcement counter is the
+# one the dump carries — `toasts_raised` counts OS tray balloons, which is a
+# different thing and stays at zero here.
+a0=$(ann)
+"$DRIVE" formnext "bob, nosuchperson" >/dev/null 2>&1
+[ -n "$vipb" ] && "$DRIVE" click $vipb >/dev/null 2>&1
+t=0; while [ "$(ann)" = "$a0" ] && [ $t -lt $WAIT_MS ]; do sleep 0.1; t=$((t+100)); done
+checks=$((checks + 1))
+if [ "$(ann)" != "$a0" ]; then ok "an unknown name is reported rather than dropped"
+else fail "a typo in the priority list was swallowed (announcements still $a0)"; fi
+# ...and the people who DO resolve are still saved: reporting the miss must not
+# discard the rest of what was typed.
+expect_grep '^keywords=.* nvip=1 ' "the names that resolve are saved anyway"
+
+"$DRIVE" key escape >/dev/null 2>&1; settle modal none
+
+# The schedule: its window is the hours notifications are ALLOWED (REQ-136).
+"$DRIVE" formnext "1|08:00|22:00" >/dev/null 2>&1
+"$DRIVE" menu 50 >/dev/null 2>&1
+expect_grep '^keywords=.* schedmode=1 schedwin=480-1320' "an every-day schedule saves as allowed hours"
+"$DRIVE" formnext "2|09:00|17:30" >/dev/null 2>&1
+"$DRIVE" menu 50 >/dev/null 2>&1
+expect_grep '^keywords=.* schedmode=2 schedwin=540-1050' "weekdays is its own mode, not a second window"
+
+# All of it is the daemon's, so a new process finds it — the check the client's
+# own memory could never fail.
+"$DRIVE" kill >/dev/null 2>&1
+"$DRIVE" launch >/dev/null 2>&1
+wait_for authed 1 >/dev/null 2>&1
+wait_typeable || true
+expect_grep '^keywords="deploy,release train" nvip=1 schedmode=2 schedwin=540-1050' \
+            "keywords, priority people and the schedule all survive a restart"
+
+"$DRIVE" formnext "0" >/dev/null 2>&1
+"$DRIVE" menu 50 >/dev/null 2>&1
+expect_grep '^keywords=.* schedmode=0 ' "turning the schedule off leaves nothing behind"
 
 # --- pausing notifications (WIN-92, REQ-278) -------------------------------
 # The pause is SERVER state, not a client mood: the restart below is the point of

@@ -31,8 +31,6 @@ pattern REQ-221 and REQ-230 both followed.
 
 | # | Item | Blocked on |
 |---|---|---|
-| **WIN-92** | **"Pause notifications until…" (REQ-278).** The client can set a *recurring daily* window (REQ-131) and nothing else, so the most-reached-for form — "until 17:00", or for 30 minutes — is not expressible: a minutes-of-day pair is periodic, so "until 5pm today" would silence 5pm every day. **Spec settled against Slack's `dnd` API:** presets are *durations from now* (30m / 1h / 2h / until tomorrow / custom), `dnd_until_ms` on `users` with 0 meaning ended, a pause only ever adds silence, and ending a pause is distinct from ending the current scheduled period. Also needs DND carried to **other users** as a second, independent axis beside presence — the fact only, never the end time (REQ-122). VIPs pierce a pause when REQ-135 lands; senders never do (a deliberate divergence from Slack). | REQ-278 daemon half + REQ-122 presence bit |
-| **WIN-94** | **Notification schedule and keyword alerts (REQ-135/136).** Two halves of the same subsystem, both specified 2026-07-31. **Schedule:** *Every day / Weekdays / Custom* with an independent start and end per weekday, stored against the user's local calendar day — and it **replaces** REQ-131's single daily window rather than joining it, because Slack has one recurring mechanism and two would be able to disagree. **Keywords:** part of the *mentions* level rather than their own switch, matched case-insensitively and exactly, phrases allowed, surfacing in the activity feed as mentions — and firing **in threads**, where Slack's do not. **Priority people** pierce a level and a pause but never a mute. | REQ-135 / REQ-136 daemon halves |
 
 ## WIN-107 — a visual pass over the whole shell
 
@@ -113,11 +111,29 @@ thing at once, which is exactly what shipping a feature at a time cannot do.
 
 ## What "closed" does and does not mean
 
-WIN-1 … WIN-91 plus WIN-93, WIN-95, WIN-96, WIN-97 and WIN-98 … WIN-106 are done —
+WIN-1 … WIN-106 are done (WIN-92 and WIN-94 landed 2026-08-02) —
 accessibility included, built *for* the custom controls rather than by retreating
 to native ones (ARCH-99), and rich text with its toolbar as of 2026-07-31. The
 items below are each blocked on a daemon requirement or an ARCH decision, or, in
 WIN-60's case, on a crash that has not reproduced since it was instrumented.
+
+**WIN-92 and WIN-94 came off it on 2026-08-02**, daemon first each time. The
+pause (REQ-278) is Slack's `snooze`: an absolute instant enforced on read, named
+apart from the schedule because cancelling one has never cancelled the other. The
+schedule (REQ-136) REPLACED REQ-131's window and flipped its sense — it states
+the hours notifications are *allowed* — so the columns were renamed, their values
+swapped, and `SET_DND` retired rather than redefined. Keywords (REQ-135) are
+written into `mentions` with their own kind, which is what lets the push query,
+the activity feed and the reader's highlight all keep working untouched.
+
+Two things moved to `shared/` in the process, both overdue: the keyword matcher
+(so a highlight and a notification can never disagree) and the quiet-hours
+predicate — the Win32 client had grown *two* divergent copies of the simpler
+version, and its own comment said that if the rule ever grew it belonged there.
+
+The harness gained `formnext`: a modal form blocks the command loop, so every
+setting reached through one — keywords, priority people, the schedule, the
+pause's custom time — was undrivable and therefore untested end to end.
 
 **WIN-97 came off the blocked list on 2026-08-01**, daemon half first: one query
 with three predicates over `delivery_cursors`, and three tabs that re-ask the

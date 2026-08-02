@@ -911,6 +911,8 @@ enum { WSM_GO = 0, WSM_SIGNOUT, WSM_FORGET };
 /* Notification-prefs review (WIN-12) + the shortcut sheet (WIN-25). */
 static int g_notify_open, g_keys_open;
 static struct { D2D1_RECT_F r; uint64_t cid; uint8_t level; } g_notify_hits[128];
+/* The two Edit buttons on the notifications overlay (REQ-135). */
+static D2D1_RECT_F g_notify_kw_btn, g_notify_vip_btn;
 static int g_n_notify_hits;
 
 static int      g_show_members = 1;     /* members pane visible */
@@ -2862,6 +2864,34 @@ static IDWriteTextLayout *body_layout(const oc_msg *msg, float cw, UINT32 *wlen)
             IDWriteTextLayout_SetFontWeight(layout, DWRITE_FONT_WEIGHT_SEMI_BOLD, tr);
         }
     }
+    /* And my KEYWORDS (REQ-135), through the same scanner the daemon notified
+     * with — that agreement is the whole point of ARCH-103, and it is why the
+     * list is held in the model rather than fetched when the settings open.
+     * Marked like a mention because that is what a hit IS here, in the activity
+     * feed and in the notification decision alike. */
+    if (layout && !msg->deleted && g_brush3) {
+        const oc_model *km = model();
+        const char *utf8 = body_text(msg);
+        size_t blen = utf8 ? strlen(utf8) : 0;
+        for (uint8_t k = 0; km && k < km->n_kw_terms && blen; k++) {
+            size_t off = 0;
+            /* Every occurrence, not just the first: a message that says the word
+             * three times should not highlight one of them. */
+            while (off < blen) {
+                size_t hs = 0, hl = 0;
+                if (!oc_keyword_match(utf8 + off, blen - off, km->kw_terms[k], &hs, &hl)) break;
+                size_t abs_start = off + hs;
+                int u16_start = MultiByteToWideChar(CP_UTF8, 0, utf8, (int)abs_start, NULL, 0);
+                int u16_len   = MultiByteToWideChar(CP_UTF8, 0, utf8 + abs_start, (int)hl, NULL, 0);
+                if (u16_start >= 0 && u16_len > 0) {
+                    DWRITE_TEXT_RANGE tr = { (UINT32)u16_start, (UINT32)u16_len };
+                    IDWriteTextLayout_SetDrawingEffect(layout, (IUnknown *)g_brush3, tr);
+                    IDWriteTextLayout_SetFontWeight(layout, DWRITE_FONT_WEIGHT_SEMI_BOLD, tr);
+                }
+                off = abs_start + (hl ? hl : 1);
+            }
+        }
+    }
     /* Hide the custom-emoji shortcodes; draw_message paints the images over them.
      * The text stays in the layout so it keeps its width, its hit-testing and its
      * place in a copied selection — a user who copies a message gets `:shipit:`
@@ -3924,6 +3954,53 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
     draw_text(rt, dnd, g_meta, rf(body.left + 20, body.top + 4, body.right - 20, body.top + 26),
               m->dnd_mode != OC_DND_OFF ? OC_COL_NOTICE : OC_COL_FAINT);
     body.top += 30;
+
+    /* Keyword alerts and priority people (REQ-135), above the per-channel list
+     * for the same reason the default is: they are rules that cut ACROSS the
+     * rows below, not another row. Slack keeps them on this screen too. */
+    {
+        float y0 = body.top;
+        char kw[256] = "";
+        for (uint8_t i = 0; i < m->n_kw_terms; i++) {
+            if (kw[0]) strncat(kw, ", ", sizeof kw - strlen(kw) - 1);
+            strncat(kw, m->kw_terms[i], sizeof kw - strlen(kw) - 1);
+        }
+        draw_text(rt, "My keywords", g_ui_b,
+                  rf(body.left + 20, y0, body.right - 140, y0 + 20), OC_COL_TEXT);
+        draw_text(rt, kw[0] ? kw : "None \u2014 messages containing a keyword notify you like a mention.",
+                  g_meta, rf(body.left + 20, y0 + 18, body.right - 140, y0 + 38),
+                  kw[0] ? OC_COL_MUTED : OC_COL_FAINT);
+        g_notify_kw_btn = rf(body.right - 120, y0 + 2, body.right - 24, y0 + 28);
+        fill_round(rt, g_notify_kw_btn, 6.0f, OC_COL_INPUT);
+        stroke_round(rt, g_notify_kw_btn, 6.0f, OC_COL_BORDER, 1.0f);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Edit", g_meta, g_notify_kw_btn, OC_COL_TEXT);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+        float y1 = y0 + 44;
+        char vips[256] = "";
+        for (uint8_t i = 0; i < m->n_pri_people; i++) {
+            const char *nm = oc_model_user_name((oc_model *)m, m->pri_people[i]);
+            if (!nm || !nm[0]) continue;
+            if (vips[0]) strncat(vips, ", ", sizeof vips - strlen(vips) - 1);
+            strncat(vips, nm, sizeof vips - strlen(vips) - 1);
+        }
+        draw_text(rt, "Priority people", g_ui_b,
+                  rf(body.left + 20, y1, body.right - 140, y1 + 20), OC_COL_TEXT);
+        draw_text(rt, vips[0] ? vips
+                              : "None \u2014 they reach you through a level and a pause, never a mute.",
+                  g_meta, rf(body.left + 20, y1 + 18, body.right - 140, y1 + 38),
+                  vips[0] ? OC_COL_MUTED : OC_COL_FAINT);
+        g_notify_vip_btn = rf(body.right - 120, y1 + 2, body.right - 24, y1 + 28);
+        fill_round(rt, g_notify_vip_btn, 6.0f, OC_COL_INPUT);
+        stroke_round(rt, g_notify_vip_btn, 6.0f, OC_COL_BORDER, 1.0f);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_text(rt, "Edit", g_meta, g_notify_vip_btn, OC_COL_TEXT);
+        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+        fill(rt, rf(body.left + 20, y1 + 44, body.right - 20, y1 + 45), OC_COL_BORDER);
+        body.top = y1 + 54;
+    }
 
     /* REQ-134: the level every channel WITHOUT its own row takes. It sits above
      * the list, and outside the scroller, because it is the thing the rows below
@@ -6703,7 +6780,7 @@ static const oc_modal_spec *modal_current(void) {
         sp.snapshot = prefs_snapshot; sp.restore = prefs_restore; sp.commit = prefs_save;
     } else if (g_notify_open) {
         sp.title = "Notifications";
-        sp.subtitle = "Per conversation, plus quiet hours.";
+        sp.subtitle = "Per conversation, plus keywords, priority people and your schedule.";
         sp.size = MODAL_LG;
         sp.buttons[0] = (oc_mbtn){ "Cancel", MB_NORMAL,  MODAL_CANCEL };
         sp.buttons[1] = (oc_mbtn){ "Save",   MB_PRIMARY, MODAL_OK };
@@ -11169,6 +11246,78 @@ static int on_click(HWND hwnd, int x, int y) {
                 }
         }
         if (g_notify_open) {
+            /* Keywords (REQ-135). Comma-separated, which is Slack's shape and its
+             * limitation too — storage is one term per row regardless, so the
+             * separator is a property of this box rather than of the setting. */
+            if (in_rect(g_notify_kw_btn, x, y)) {
+                const oc_model *km = model();
+                oc_field f[1] = { { FF_TEXT, "Keywords",
+                                    "Separate with commas. Matched whole and case-insensitively.", "" } };
+                if (km) for (uint8_t i = 0; i < km->n_kw_terms; i++) {
+                    if (f[0].value[0]) strncat(f[0].value, ", ", sizeof f[0].value - strlen(f[0].value) - 1);
+                    strncat(f[0].value, km->kw_terms[i], sizeof f[0].value - strlen(f[0].value) - 1);
+                }
+                if (!form_dialog(hwnd, "My keywords", f, 1)) return 1;
+                char terms[OC_MAX_KEYWORDS][OC_KEYWORD_MAX];
+                uint8_t n = 0;
+                for (char *p2 = f[0].value; *p2 && n < OC_MAX_KEYWORDS; ) {
+                    while (*p2 == ' ' || *p2 == ',') p2++;
+                    char *e = strchr(p2, ',');
+                    size_t len = e ? (size_t)(e - p2) : strlen(p2);
+                    while (len && p2[len - 1] == ' ') len--;
+                    if (len) {
+                        if (len > OC_KEYWORD_MAX - 1) len = OC_KEYWORD_MAX - 1;
+                        memcpy(terms[n], p2, len); terms[n][len] = '\0'; n++;
+                    }
+                    if (!e) break;
+                    p2 = e + 1;
+                }
+                oc_client_set_keywords(g_client, terms, n);
+                toast_push(n ? "Keywords saved." : "Keywords cleared.", 0);
+                return 1;
+            }
+            /* Priority people, by display name — the roster resolves them, and a
+             * name that is nobody is reported rather than silently dropped. */
+            if (in_rect(g_notify_vip_btn, x, y)) {
+                const oc_model *km = model();
+                oc_field f[1] = { { FF_TEXT, "Priority people",
+                                    "Separate with commas. They reach you through a level and a pause, never a mute.", "" } };
+                if (km) for (uint8_t i = 0; i < km->n_pri_people; i++) {
+                    const char *nm = oc_model_user_name((oc_model *)km, km->pri_people[i]);
+                    if (!nm || !nm[0]) continue;
+                    if (f[0].value[0]) strncat(f[0].value, ", ", sizeof f[0].value - strlen(f[0].value) - 1);
+                    strncat(f[0].value, nm, sizeof f[0].value - strlen(f[0].value) - 1);
+                }
+                if (!form_dialog(hwnd, "Priority people", f, 1)) return 1;
+                uint64_t ids[OC_MAX_PRIORITY]; uint8_t n = 0;
+                char missing[128] = "";
+                for (char *p2 = f[0].value; *p2 && n < OC_MAX_PRIORITY; ) {
+                    while (*p2 == ' ' || *p2 == ',') p2++;
+                    char *e = strchr(p2, ',');
+                    size_t len = e ? (size_t)(e - p2) : strlen(p2);
+                    while (len && p2[len - 1] == ' ') len--;
+                    if (len) {
+                        char nm[80];
+                        if (len > sizeof nm - 1) len = sizeof nm - 1;
+                        memcpy(nm, p2, len); nm[len] = '\0';
+                        uint64_t uid = km ? oc_model_user_id(km, nm) : 0;
+                        if (uid) ids[n++] = uid;
+                        else if (strlen(missing) + len + 2 < sizeof missing) {
+                            if (missing[0]) strncat(missing, ", ", sizeof missing - strlen(missing) - 1);
+                            strncat(missing, nm, sizeof missing - strlen(missing) - 1);
+                        }
+                    }
+                    if (!e) break;
+                    p2 = e + 1;
+                }
+                oc_client_set_priority(g_client, ids, n);
+                if (missing[0]) {
+                    char msg[160];
+                    snprintf(msg, sizeof msg, "No such person: %s", missing);
+                    toast_push(msg, 1);
+                } else toast_push(n ? "Priority people saved." : "Priority people cleared.", 0);
+                return 1;
+            }
             for (int i = 0; i < g_n_notify_hits; i++)
                 if (in_rect(g_notify_hits[i].r, x, y)) {
                     if (g_notify_hits[i].cid == 0)      /* REQ-134: the global default */
@@ -12668,9 +12817,30 @@ static LRESULT CALLBACK form_edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     return CallWindowProcW(g_form_edit_prev, hwnd, msg, wp, lp);
 }
 
+/* Seeded by the harness's `formnext` verb: the NEXT form dialog answers with
+ * these values instead of running its nested message loop.
+ *
+ * It exists because a modal form blocks the command poll loop — so every feature
+ * reached through one (the keyword list, the schedule, the pause's custom time)
+ * was undrivable, and therefore untested end to end, however carefully the rest
+ * of the path was covered. The dialog's own rendering and keys are exercised by
+ * the `form` verb; this covers the button -> dialog -> save -> server path that
+ * the blocking loop hid. */
+static char g_form_seed[FORM_MAX_FIELDS][256];
+static int  g_form_seeded;      /* how many fields were seeded; 0 = not armed */
+static int  g_form_seed_cancel; /* seeded, but answer "cancel" */
+
 static int form_dialog(HWND owner, const char *title, oc_field *f, int n) {
     if (!owner || !f || n <= 0) return 0;
     if (n > FORM_MAX_FIELDS) n = FORM_MAX_FIELDS;
+    if (g_form_seeded) {
+        int seeded = g_form_seeded, cancel = g_form_seed_cancel;
+        g_form_seeded = 0; g_form_seed_cancel = 0;
+        if (cancel) return 0;
+        for (int i = 0; i < n && i < seeded; i++)
+            snprintf(f[i].value, sizeof f[i].value, "%s", g_form_seed[i]);
+        return 1;
+    }
     if (g_form_open) return 0;              /* one at a time; see the header */
 
     HINSTANCE inst = GetModuleHandleW(NULL);
@@ -14016,6 +14186,24 @@ static void test_dump(const char *path) {
     {   HWND aw = GetActiveWindow();
         fprintf(f, "wnd_active=%d wnd_focus=%d\n",
                 GetForegroundWindow() == aw, GetFocus() == aw); }
+    /* Keywords and priority people (REQ-135), and the schedule (REQ-136): what
+     * the client believes, which is the half a server-side test cannot see. */
+    {
+        char kw[256] = "";
+        for (uint8_t i = 0; m && i < m->n_kw_terms; i++) {
+            if (kw[0]) strncat(kw, ",", sizeof kw - strlen(kw) - 1);
+            strncat(kw, m->kw_terms[i], sizeof kw - strlen(kw) - 1);
+        }
+        fprintf(f, "kwbtn=%.0f,%.0f vipbtn=%.0f,%.0f\n",
+                (g_notify_kw_btn.left + g_notify_kw_btn.right) / 2,
+                (g_notify_kw_btn.top + g_notify_kw_btn.bottom) / 2,
+                (g_notify_vip_btn.left + g_notify_vip_btn.right) / 2,
+                (g_notify_vip_btn.top + g_notify_vip_btn.bottom) / 2);
+        fprintf(f, "keywords=\"%s\" nvip=%d schedmode=%d schedwin=%u-%u scheddays=%d\n",
+                kw, m ? m->n_pri_people : 0, m ? m->dnd_mode : 0,
+                m ? m->allow_start_min : 0, m ? m->allow_end_min : 0,
+                m ? m->n_sched_days : 0);
+    }
     fprintf(f, "sbsel=%d\n", g_n_sbsel);
     fprintf(f, "shelf n=%d", g_n_shelf);
     for (int i = 0; i < g_n_shelf; i++)
@@ -14355,6 +14543,25 @@ static void test_poll(HWND hwnd) {
          * and the harness could not have caught this bug. */
         close_overlays(); g_view = VIEW_HOME;
         test_ack(profile_open(strtoull(arg, NULL, 10)) ? "ok" : "err");
+    } else if (!strcmp(verb, "formnext")) {
+        /* formnext <v1>|<v2>|... — arm the next form dialog with these values, or
+         * `cancel` to have it refuse. See g_form_seed. */
+        g_form_seeded = 0; g_form_seed_cancel = 0;
+        if (!strcmp(arg, "cancel")) { g_form_seed_cancel = 1; g_form_seeded = 1; }
+        else {
+            const char *p2 = arg;
+            while (*p2 && g_form_seeded < FORM_MAX_FIELDS) {
+                const char *e = strchr(p2, '|');
+                size_t len = e ? (size_t)(e - p2) : strlen(p2);
+                if (len > sizeof g_form_seed[0] - 1) len = sizeof g_form_seed[0] - 1;
+                memcpy(g_form_seed[g_form_seeded], p2, len);
+                g_form_seed[g_form_seeded][len] = '\0';
+                g_form_seeded++;
+                if (!e) break;
+                p2 = e + 1;
+            }
+        }
+        test_ack("ok");
     } else if (!strcmp(verb, "form")) {
         /* Drive the generic form (WIN-77). The ack goes FIRST, because the form runs
          * a nested message loop: acking afterwards would make the harness wait for a
@@ -15036,6 +15243,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 oc_client_list_users(g_client);
                 oc_client_list_channels(g_client);
                 oc_client_list_emoji(g_client);      /* REQ-072: the custom catalogue */
+                /* All of the notification state in one exchange (REQ-135/136/278):
+                 * the keyword list is needed to HIGHLIGHT, not merely to edit, so
+                 * waiting until the settings modal opens would leave every message
+                 * before that un-highlighted. */
+                oc_client_list_notify_prefs(g_client);
                 g_post_auth = 1;
                 g_sb_settings_pending = 1;   /* fold the synced sidebar prefs when they land */
                 g_prefs_pending = 1;
