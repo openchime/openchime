@@ -149,14 +149,26 @@ settle() { wait_for "$1" "$2" >/dev/null 2>&1 || true; }
 # `key`/`chars` need: the WINDOW can hold the keyboard while the composer has not
 # claimed it (the auto-focus runs on the idle tick and only in a conversation).
 # Waiting on the window alone still let a run reach `key enter` with focus=0.
+# A freshly launched client must take the keyboard: the window is shown LATE when
+# it auto-connects (it waits for its saved geometry), and a window shown by a
+# process that does not own the foreground is not activated — so the composer's
+# auto-focus, which is gated on having focus, never fired. That is what produced
+# three "sending did not clear the field" failures for sends that were never
+# typed. The client now activates itself on show; this asserts it rather than
+# waiting it out, so a regression is a failure and not a slow pass.
 wait_typeable() {
   local t=0
   while :; do
     local d; d=$(snap)
     case "$d" in *"wnd_focus=1"*) case "$d" in *"focus=1"*) return 0;; esac;; esac
-    [ "$t" -ge 8000 ] && { say "   the composer never took the keyboard — the checks below would blame the product"; return 1; }
+    [ "$t" -ge 8000 ] && return 1
     sleep 0.2; t=$((t + 200))
   done
+}
+expect_typeable() {
+  checks=$((checks + 1))
+  if wait_typeable; then ok "$1"
+  else fail "$1 — the composer never took the keyboard: $(snap | grep -E '^wnd_|^ed ' | tr '\n' ' ')"; fi
 }
 
 # expect <dump> <key> <wanted> <label> — same-frame check against a captured dump.
@@ -1225,7 +1237,7 @@ expect "$d" draftrail 1 "drafts: the Home sidebar carries the destination"
 "$DRIVE" launch >/dev/null 2>&1
 if ! wait_grep 'authed=1 connected=1' 20000; then fail "relaunch did not authenticate"; fi
 "$DRIVE" channel general >/dev/null 2>&1; settle conv 1
-wait_typeable || true
+expect_typeable "a relaunched client takes the keyboard"
 expect_grep '^ed .*text="unsent thoughts"' "and it is still there after a restart"
 
 # Sending it is what ends it — on the daemon, in the send's own transaction.
@@ -1382,7 +1394,7 @@ expect_grep '^keywords=.* schedmode=2 schedwin=540-1050' "weekdays is its own mo
 "$DRIVE" kill >/dev/null 2>&1
 "$DRIVE" launch >/dev/null 2>&1
 wait_for authed 1 >/dev/null 2>&1
-wait_typeable || true
+expect_typeable "the client takes the keyboard after a restart"
 expect_grep '^keywords="deploy,release train" nvip=1 schedmode=2 schedwin=540-1050' \
             "keywords, priority people and the schedule all survive a restart"
 
@@ -1411,7 +1423,7 @@ until0=$(snap | grep -oE '^snoozed=1 snooze_until=[0-9]+' | cut -d= -f3)
 "$DRIVE" kill >/dev/null 2>&1
 "$DRIVE" launch >/dev/null 2>&1
 wait_for authed 1 >/dev/null 2>&1
-wait_typeable || true
+expect_typeable "the client takes the keyboard after a restart"
 checks=$((checks + 1))
 if wait_grep "^snoozed=1 snooze_until=$until0"; then
   ok "the pause survives a restart, to the same instant"

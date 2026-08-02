@@ -4050,6 +4050,32 @@ static void a11y_publish_scene(const oc_model *m);  /* fwd — ARCH-99; defined 
  *
  * Reuses the same core helper the sidebar draws from; walking m->channels
  * directly would drift from the visible order the moment a sort changed. */
+/* Show the main window AND take the keyboard.
+ *
+ * `ShowWindow` alone is not enough here, and the reason is specific rather than
+ * superstitious: when the client auto-connects, the window is deliberately held
+ * back until the saved geometry arrives (up to 1.5 s below), so it is shown LATE
+ * — and Windows will not activate a window shown by a process that does not
+ * already own the foreground. The window then sits visible but inactive,
+ * `GetFocus()` returns NULL for our thread, and the composer's auto-focus — which
+ * is gated on exactly that — never fires. Every keystroke is dropped until the
+ * user clicks, which is what the idle-focus comment further down describes and
+ * what this closes properly.
+ *
+ * It also fixed the thing that had been reported as a flaky smoke failure three
+ * times: the suite launches a client while it is still killing the previous one
+ * through a PowerShell interop process, and that contention is precisely the case
+ * where the show does not activate. A clean launch with nothing competing
+ * activated every time, which is why the A/B against an older build looked like a
+ * regression and then refused to reproduce. */
+static void show_and_focus(HWND hwnd) {
+    if (!hwnd) return;
+    if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+    SetActiveWindow(hwnd);
+    SetFocus(hwnd);
+}
+
 static void nav_conversation(HWND hwnd, int delta, int unread_only) {
     const oc_model *m = model();
     if (!m || !m->n_channels) return;
@@ -13914,6 +13940,11 @@ static void test_ack(const char *msg) {
     FILE *f = fopen(p, "wb"); if (f) { fputs(msg ? msg : "ok", f); fclose(f); }
 }
 
+/* The main window, for the dump's own use: the harness needs to ask about THIS
+ * window rather than about whatever happens to be active. */
+static HWND g_main_hwnd;
+static HWND test_main_window(void) { return g_main_hwnd; }
+
 static void test_dump(const char *path) {
     const oc_model *m = model();
     FILE *f = fopen(path, "wb"); if (!f) return;
@@ -14183,9 +14214,15 @@ static void test_dump(const char *path) {
     /* Whether this window actually HAS the keyboard, which is the condition the
      * composer's auto-focus turns on — "focus=0" alone cannot tell you whether
      * the field declined it or the window never had it to give. */
-    {   HWND aw = GetActiveWindow();
+    /* Against the MAIN window, not GetActiveWindow(): when the app is not active
+     * both GetActiveWindow() and GetFocus() return NULL for this thread, so
+     * comparing them to each other reported "focused" in precisely the case that
+     * is broken — and the wait built on it waited for a condition that was
+     * already true. An instrument that reads 1 when the thing it measures is
+     * absent is worse than no instrument. */
+    {   HWND mw = test_main_window();
         fprintf(f, "wnd_active=%d wnd_focus=%d\n",
-                GetForegroundWindow() == aw, GetFocus() == aw); }
+                GetForegroundWindow() == mw, GetFocus() == mw); }
     /* Keywords and priority people (REQ-135), and the schedule (REQ-136): what
      * the client believes, which is the half a server-side test cannot see. */
     {
@@ -15042,7 +15079,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if (!g_geom_applied && g_geom_deadline && GetTickCount64() > g_geom_deadline) {
                 g_geom_applied = 1;                 /* settings never came */
-                if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOW);
+                show_and_focus(hwnd);
             }
             /* OS notifications (WIN-18). Raised for messages that arrive while
              * the window is not in front, subject to the channel's level and the
@@ -15223,7 +15260,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         wp2.rcNormalPosition.bottom = g_win_y + g_win_h;
                         SetWindowPlacement(hwnd, &wp2);
                     }
-                    if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOW);
+                    show_and_focus(hwnd);   /* see show_and_focus: shown late = not activated */
                 }
                 layout_composer(hwnd);
                 InvalidateRect(hwnd, NULL, FALSE);
@@ -15234,7 +15271,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * freshly launched client sat with no caret and dropped every keystroke
              * until you clicked. The guard is GetFocus(), so this can never steal the
              * keyboard from the find box, the palette or a form field. */
-            if (!g_ed_focus && GetFocus() == hwnd &&
+            /* `GetFocus() == hwnd` guards against stealing the keyboard from the
+             * find box, the palette or a form field — all children of this
+             * thread. But when the APP is not active, GetFocus() returns NULL for
+             * the thread, and there is then nothing to steal from: refusing in
+             * that case left a client that had been shown while another process
+             * owned the foreground dropping every keystroke until it was clicked.
+             * A window shown late is exactly that case, and this client shows
+             * late by design when it auto-connects (it waits for its geometry). */
+            HWND tf = GetFocus();
+            if (!g_ed_focus && (tf == hwnd || tf == NULL) &&
                 main_is_conversation() && !window_is_covered())
                 ed_focus(hwnd);
             if (m->authed && !g_post_auth) {          /* one-shot: identify the bucket + pull state */
@@ -15841,13 +15887,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
                     WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                     1120, 820, NULL, NULL, inst, NULL);
     if (!hwnd) return 1;
+    g_main_hwnd = hwnd;
     apply_titlebar(hwnd);
     /* When we are auto-connecting, hold the window back until the settings
      * bucket arrives so it can open where it was left rather than snapping
      * there a second later. Shown regardless after a short grace period, and
      * immediately when there is nothing to wait for (the sign-in view). */
     if (direct) g_geom_deadline = GetTickCount64() + 1500;
-    else { g_geom_applied = 1; ShowWindow(hwnd, show); }
+    else { g_geom_applied = 1; ShowWindow(hwnd, show); SetForegroundWindow(hwnd); }
     UpdateWindow(hwnd);
     /* After ShowWindow: SetFocus on a child of a not-yet-shown window does not
      * stick, which left the workspace field unfocused and swallowed typing. */
