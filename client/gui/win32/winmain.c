@@ -15689,6 +15689,18 @@ static void test_poll(HWND hwnd) {
         else                             { test_ack("err"); }
         sidebar_opts_save();
         InvalidateRect(hwnd, NULL, FALSE);
+    } else if (!strcmp(verb, "textsize")) {
+        /* 0 Small .. 3 Largest (ARCH-97). Drivable because the scaling paths are
+         * where fixed-height chrome fails, and a review that cannot set the size
+         * can only ever check the one it happens to be at. */
+        int v = atoi(arg);
+        if (v >= 0 && v <= 3) { g_pref_textsize = v; scale_apply(hwnd); prefs_save(); test_ack("ok"); }
+        else test_ack("err");
+    } else if (!strcmp(verb, "zoom")) {
+        /* -2 .. +4, the per-window zoom Ctrl+= drives. */
+        int v = atoi(arg);
+        if (v >= -2 && v <= 4) { g_zoom_step = v; scale_apply(hwnd); test_ack("ok"); }
+        else test_ack("err");
     } else if (!strcmp(verb, "prefs")) {
         modal_enter(hwnd, &g_prefs_open); test_ack("ok");
     } else if (!strcmp(verb, "theme")) {

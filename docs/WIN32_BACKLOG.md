@@ -114,6 +114,67 @@ locates by id, on a runner that is not a developer's desktop. That is the CI-age
 question, still open.
 
 
+## WIN-111 — chrome polish: the layout does not survive scaling
+
+Found 2026-08-02 by an adversarial pass over the whole shell at
+**dpi 96/192/240 × zoom −2…+4 × text size Small…Largest**, driven through the new
+`dpi`, `zoom` and `textsize` verbs. At 100% everything looks right; the defects
+appear as soon as anything scales, which is why they had not been seen.
+
+**Four root causes account for all of it.** Fixing them by cause rather than by
+symptom is the point of this item — the list below is what to check afterwards,
+not fourteen separate patches.
+
+**A. Fixed-height rows and boxes that do not grow with the text.** Type scales
+(ARCH-97 scales fonts, deliberately not block margins), but these heights are
+constants, so the glyphs outgrow their container and are clipped or collide:
+
+1. The composer's text overlaps the action row at large scale — the descenders and
+   the caret run into the +/emoji/mention icons. `COMPOSER_ACTIONS` and
+   `COMPOSER_BTN` are fixed DIP while `ed_line_h()` scales.
+2. Thread cards clip their own content: the author line, the preview and the
+   "N replies" row overlap inside a fixed `CARDH` of 104.
+3. Draft/scheduled/sent rows clip descenders at a fixed `rowh` of 62.
+4. Sidebar shelf rows and channel rows clip at `ROW_H` 32.
+5. The Notifications overlay's day rows, keyword rows and section titles clip
+   vertically.
+6. Tab bars (`Messages / Files & links / Pins / About`, and the Drafts tabs) keep a
+   fixed 34px band while their labels grow.
+
+**B. Nothing sets a trimming mode, so truncation cuts mid-glyph with no ellipsis.**
+DirectWrite draws until it runs out and stops. Everywhere a label can outgrow its
+box:
+
+7. Pane headers ("Drafts, scheduled a…") and their subtitles.
+8. Channel/DM tab labels ("Files & li").
+9. Draft and thread previews.
+10. Sidebar helper text was fixed in WIN-107 by wrapping; the rest of these want
+    ellipsis rather than wrapping, since they are single-line by design.
+
+**C. Reserved gutters are fixed DIP while what goes in them scales**, so labels
+collide with the thing the gutter was reserved for:
+
+11. The shelf row's badge overruns its label — "Drafts, schedule✎ 2" — because the
+    label rect reserves a constant 40.
+12. The channel header loses its NAME entirely at large scale, rendering as a bare
+    "#": the members chip has grown and the title rect is squeezed to nothing.
+13. The thread card's channel label does the same.
+
+**D. Modals are a fixed size and neither scroll nor clip their content.**
+
+14. At large scale the Notifications card's rows spill *outside* the card and draw
+    over the shell behind it, and the Done button sits in the middle of the
+    content it is supposed to be under. `MODAL_LG` is a constant 720×620 DIP.
+
+**How to verify afterwards.** The same matrix, driven the same way — and the
+geometry that should hold at every scale belongs in the dump so the suite can
+assert it rather than a person re-reading screenshots: no row's content taller
+than its row, no text rect narrower than its ellipsis, no element outside the card
+that owns it.
+
+**Explicitly not in this item:** anything about what the controls *do*. This is
+cleanliness only, per the review's terms.
+
 ## Closed without a fix, and why
 
 - **WIN-60 — the unreproduced crash while typing.** Closed 2026-07-31. Three
