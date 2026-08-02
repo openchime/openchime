@@ -554,6 +554,23 @@ build/openchime-tui 127.0.0.1 8443 alice:pw    # <host> <port> [user:pass] direc
 - `demo_client` (`make demo-client`) is the flexible black-box tool: `token <apns|fcm>
   <tok>` or `send <channel> <text>` against a running daemon.
 
+## Symbolicating a Win32 crash
+
+`make windows-gui` ships a **stripped** `build/openchime.exe` and keeps the
+symbols beside it in `build/openchime.debug`, linked by a `.gnu_debuglink`. The
+crash report the client writes carries a module-relative `rva=`, which stripping
+does not move, so a crash is resolved without the shipped binary having symbols
+in it:
+
+```
+base=$(x86_64-w64-mingw32-objdump -p build/openchime.debug | awk '/ImageBase/{print $2}')
+va=$(python3 -c "print(hex(0x$base + 0xRVA))")
+x86_64-w64-mingw32-addr2line -e build/openchime.debug -f -C -i "$va"
+```
+
+Keep the `.debug` file for any binary handed to somebody else; without it a
+minidump from that build resolves to nothing.
+
 ## Driving the Win32 GUI
 
 `scripts/gui_drive.sh launch` **builds both sides and restarts the daemon if the

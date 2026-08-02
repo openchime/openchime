@@ -154,6 +154,7 @@ $(TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) \
 # core seams (threads/DNS/RNG) are in shared/oc_thread.h + resolve.c + net.c.
 WINCC     ?= x86_64-w64-mingw32-gcc
 WINDRES   ?= x86_64-w64-mingw32-windres
+WINOBJCOPY ?= x86_64-w64-mingw32-objcopy
 MBEDTLS_WIN := third_party/mbedtls-3.6.2-win
 WIN_MBEDLIBS := $(MBEDTLS_WIN)/library/libmbedtls.a \
                 $(MBEDTLS_WIN)/library/libmbedx509.a \
@@ -180,6 +181,8 @@ $(WIN_TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) \
 # TUI/tuikit stack and links the Direct2D stack. -municode gives the wWinMain
 # Unicode entry point; -mwindows selects the GUI subsystem (no console).
 WIN_GUI_BIN := build/openchime.exe
+# Debug symbols, split out of the shipped binary (see the strip step below).
+WIN_GUI_SYMS := build/openchime.debug
 GUI_SRC := $(wildcard client/gui/win32/*.c) client/shared/icons.c client/shared/secret_win.c
 WIN_GUI_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
                $(CORE_INC) -Iclient/gui/win32 -Iclient/shared
@@ -197,6 +200,14 @@ $(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
 	    $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
 	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -lshell32 -lcomdlg32 -lgdi32 -ladvapi32 \
 	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -luuid -limm32 -loleaut32 -static -o $@
+# Split the debug info out rather than discarding it. The client writes real
+# minidumps on a crash (crash_filter, winmain.c), and symbolicating a mingw
+# build needs its DWARF -- a plain strip would shrink the download by trading
+# away every future crash report. So: keep the symbols beside the binary, strip
+# the shipped one, and record a debuglink so a debugger loads them back.
+	$(WINOBJCOPY) --only-keep-debug $@ $(WIN_GUI_SYMS)
+	$(WINOBJCOPY) --strip-debug --strip-unneeded $@
+	$(WINOBJCOPY) --add-gnu-debuglink=$(WIN_GUI_SYMS) $@
 
 # --- tuikit demo (ARCH-83) ----------------------------------------------------
 # Standalone harness exercising every tuikit widget — no core, no daemon, no TLS.

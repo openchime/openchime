@@ -118,6 +118,25 @@ quoted from history.
 **Verified** — Makefile:164 'No runtime cost; strip on release if size matters.'; Makefile:193
 windows-gui has no strip step; 4.4 MB measured 2026-08-02 at commit 453782f
 
+**FIXED 2026-08-02 — split-debug, not a plain strip.** A plain strip would have
+traded every future crash report for a smaller download: the client writes real
+minidumps (`crash_filter`), and symbolicating a mingw build needs its DWARF. So
+`make windows-gui` now splits the symbols into `build/openchime.debug`, strips
+the shipped `openchime.exe`, and records a `.gnu_debuglink` so a debugger loads
+them back.
+
+Measured: the shipped binary goes **4,399,617 → 1,429,919 bytes (67% smaller)**,
+with 2,981,889 bytes of symbols kept beside it. The shipped binary has no
+`.debug_info`; the debug file has it, and carries 28,229 DWARF name entries.
+
+Crash reporting was then tested end to end on the **stripped** binary rather
+than assumed: it launches and authenticates, `crashtest` produces an 8 MB
+minidump and a report, and the report's module-relative `rva=0x3edd8` — an
+offset stripping does not move — resolves through the split debug file to
+`test_poll` at `client/gui/win32/winmain.c:15624`, which is the crashtest
+handler itself. A stripped binary whose crashes still symbolicate is the whole
+point of doing it this way.
+
 ## 6. Reason code 3014 is assigned to two different errors
 
 `OC_ERR_INVALID_MESSAGE` and `OC_ERR_INVALID_DEVICE_TOKEN` are both `3014`
