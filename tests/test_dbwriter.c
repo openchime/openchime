@@ -52,7 +52,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 36);
+    CHECK(oc_schema_version(db) == 37);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -3116,7 +3116,44 @@ static void test_attachments(void) {
     CHECK(r && r->type == OC_RES_ATTACH_CREATED);
     CHECK(r->attachment_id > 0 && r->storage_key && r->storage_key[0]);
     uint64_t aid = r->attachment_id;
+    const char *first_key = r->storage_key;
+    char key_copy[64];
+    snprintf(key_copy, sizeof key_copy, "%s", first_key ? first_key : "");
     oc_dbres_free(r);
+
+    /* Retrying the SAME (channel, token) hands back the SAME row, rather than
+     * minting a second pending one. This is what a client does after a dropped
+     * connection: it never heard the first answer, so it asks again — and until
+     * migration 0037 every attempt left another orphan row behind, reclaimed
+     * eventually by the storage sweep but real until then. Same id AND same
+     * storage key, because the retrying client's next move is to stream bytes. */
+    j = oc_job_new(OC_JOB_ATTACH_CREATE, 1);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->att_size = 2048;
+    memcpy(j->idem, idem, sizeof idem);
+    j->filename = strdup("notes.txt"); j->mime = strdup("text/plain");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_CREATED);
+    CHECK(r && r->attachment_id == aid);
+    CHECK(r && r->storage_key && strcmp(r->storage_key, key_copy) == 0);
+    CHECK(r && r->duplicate == 1);   /* and it says so, as SEND does */
+    oc_dbres_free(r);
+
+    /* A DIFFERENT token on the same channel is a different upload. Without
+     * this the "fix" could simply be returning the first row for everything. */
+    {
+        uint8_t idem2[OC_IDEM_LEN]; memset(idem2, 0x77, sizeof idem2);
+        j = oc_job_new(OC_JOB_ATTACH_CREATE, 1);
+        j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->att_size = 2048;
+        memcpy(j->idem, idem2, sizeof idem2);
+        j->filename = strdup("other.txt"); j->mime = strdup("text/plain");
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_ATTACH_CREATED);
+        CHECK(r && r->attachment_id != aid);
+        CHECK(r && r->duplicate == 0);
+        oc_dbres_free(r);
+    }
 
     /* A download LOOKUP before finalize fails — the blob is not complete. */
     j = oc_job_new(OC_JOB_ATTACH_LOOKUP, 2);

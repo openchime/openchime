@@ -453,6 +453,39 @@ loop. A client that did retry after a drop would create orphan pending rows,
 which the maintenance sweep would later reclaim. The documentation has been
 corrected. **Verified.**
 
+**FIXED 2026-08-03.** The daemon now honours the token instead of the
+documentation being bent to match the code. `process_attach_create` looks up
+`(channel_id, idem_token)` first and returns the existing row — same
+`attachment_id`, same storage key, `duplicate = 1` — exactly as `SEND` does. A
+retrying client is one that never heard the first answer and whose next move is
+to stream bytes, so an identical reply is the right one.
+
+**Why the token lives on the attachment row** (migration 0037) rather than in a
+`sent_messages`-style side map: an attachment is *reclaimable* (REQ-215/217). A
+map keyed to a row the storage sweep later deletes would hand a client back an id
+for something that no longer exists. On the row, the token dies with the row. The
+`UNIQUE (channel_id, idem_token)` index is **partial** — `WHERE idem_token IS NOT
+NULL` — so it constrains only rows minted from here on, and the NULLs on every
+pre-existing row do not collide.
+
+Fixing it rather than deleting the field was the choice because the field is
+already on the wire: `oc_upload_begin` carries `idem[16]` and `netloop.c` already
+copied it into the job. A frame field that exists and is ignored is worse than
+one that was never specified — it reads as a guarantee. Removing it instead would
+have been a wire change plus a version bump, and would have foreclosed the
+retry-after-reconnect path the client's own auto-reconnect and offline outbox
+(REQ-100/102) make likely.
+
+Measured: `test_attachments` retries the same `(channel, token)` and asserts the
+same id, the same storage key, and `duplicate == 1`; a *different* token on the
+same channel still mints a new row, which is what stops "return the first row for
+everything" passing as a fix. Proven to fail: disabling the lookup produces 4
+failing assertions. Note what the failure looks like — with the lookup gone the
+retry hits the new UNIQUE index and errors rather than silently creating an
+orphan, so the index is a second line of defence and not just an optimisation.
+The two schema-version assertions (`test_migrate`, `test_dbwriter`) caught the
+migration and were updated to 37, which is what they are for.
+
 ## 16. The tray balloon's rendering has never been observed
 
 The tray balloon's rendering has never been observed.

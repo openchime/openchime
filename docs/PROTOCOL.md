@@ -1193,10 +1193,14 @@ with `TRANSFER_CANCEL`. Chunk `data` is bounded so each frame stays
    upload targeting a channel/DM it can post to. The server authorizes
    membership, checks `total_size <= MAX_ATTACHMENT_SIZE`, allocates an
    `attachment_id` + opaque storage key, and opens a streaming write to object
-   storage. The frame carries an idempotency token, but **the daemon does not use
-   it**: the insert is unconditional and `attachments` has no token column, so a
-   retried `UPLOAD_BEGIN` allocates a second attachment rather than resuming the
-   first. On failure → `ERROR` (`FORBIDDEN`, `ATTACHMENT_TOO_LARGE`, …).
+   storage. **Idempotent on `(channel_id, idempotency_token)`**, as `SEND` is: a
+   retry after a dropped connection returns the *same* `attachment_id` and the
+   same storage key rather than allocating a second attachment, because the
+   client that retries is one that never heard the first answer and whose next
+   move is to stream the bytes. The token is held on the attachment row
+   (migration 0037) rather than in a side map, so it is reclaimed with the row —
+   a map would outlive a storage-swept attachment and hand back a dead id. On
+   failure → `ERROR` (`FORBIDDEN`, `ATTACHMENT_TOO_LARGE`, …).
 2. **`UPLOAD_READY` (S → C), `0x0081`** `{ attachment_id: u64, chunk_size: u32,
    window_bytes: u32 }` — the server advertises the max `data` per chunk and the
    **in-flight window**: the client may have at most `window_bytes` of un-acked

@@ -4,7 +4,7 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Status.** **Migrations 0001–0036 are applied** (`daemon/migrate.c`,
+**Status.** **Migrations 0001–0037 are applied** (`daemon/migrate.c`,
 `OC_MIGRATIONS`). 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
 credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
@@ -23,7 +23,7 @@ global notification default; **0029** (§3y) custom emoji; **0030–0031** (§3z
 drafts, then unaddressed drafts; **0032** (§3aa) scheduled messages;
 **0033–0035** (§3j) the notification pause, the per-weekday schedule that
 replaces the DND window, and keywords + priority people; **0036** (§3ab) thread
-follows and per-thread read cursors.
+follows and per-thread read cursors; **0037** the attachment idempotency token.
 
 *Corrected: an earlier revision of this line said presence, notification config,
 and attachments were "intentionally not here yet." Notification config landed in
@@ -370,6 +370,14 @@ only the pointer and metadata. Bytes are proxied through the daemon in chunks
 - `uploader_id` (FK `users`) — who uploaded it; the only user allowed to link a
   pending attachment.
 - `storage_key` (TEXT) — opaque object-storage key (never exposed on the wire).
+- `idem_token` (BLOB, nullable, migration 0037) — the 16-byte token from
+  `UPLOAD_BEGIN`, with a **partial** `UNIQUE (channel_id, idem_token) WHERE
+  idem_token IS NOT NULL`, which is what makes a retried declaration return the
+  first row instead of minting a second. Held here rather than in a
+  `sent_messages`-style side map because an attachment is *reclaimable*
+  (REQ-215/217): a map row would outlive the attachment the storage sweep
+  deleted and hand a client back an id for something gone. NULL on every row
+  predating the migration, and NULLs do not collide in a UNIQUE index.
 - `filename`, `mime` (TEXT) — original name and declared content type.
 - `size` (INTEGER) — byte length, verified against the streamed total on
   `UPLOAD_END`.

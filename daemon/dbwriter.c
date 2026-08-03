@@ -3860,17 +3860,44 @@ static oc_dbres *process_attach_create(sqlite3 *db, const oc_job *j) {
     if (acc == CH_DENIED)  { r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_NOT_A_MEMBER;   return r; }
     if (acc == CH_ARCHIVED){ r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_CHANNEL_ARCHIVED; return r; }
 
+    /* Idempotent replay, the same contract SEND honours: a known
+     * (channel, token) hands back the row the first attempt minted rather than
+     * minting a second. The token has always been on the wire and in the job;
+     * until migration 0037 nothing read it, so a client that retried after a
+     * dropped connection created an orphan pending row for every attempt.
+     *
+     * The reply is deliberately identical to a first attempt's — same id, same
+     * storage key — because the retrying client is one that never heard the
+     * first answer, and its next move is to stream the bytes. */
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
+        "SELECT id, storage_key, size FROM attachments "
+        "WHERE channel_id=? AND idem_token=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_blob (st, 2, j->idem, OC_IDEM_LEN, SQLITE_STATIC);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        r->type = OC_RES_ATTACH_CREATED;
+        r->attachment_id = (uint64_t)sqlite3_column_int64(st, 0);
+        const unsigned char *k = sqlite3_column_text(st, 1);
+        r->storage_key = strdup(k ? (const char *)k : "");
+        r->att_size = (uint64_t)sqlite3_column_int64(st, 2);
+        r->duplicate = 1;
+        sqlite3_finalize(st);
+        return r;
+    }
+    sqlite3_finalize(st);
+
+    sqlite3_prepare_v2(db,
         "INSERT INTO attachments(channel_id, message_id, uploader_id, storage_key, "
-        "  filename, mime, size, sha256, created_at_ms) "
-        "VALUES(?, NULL, ?, '', ?, ?, ?, NULL, ?);", -1, &st, NULL);
+        "  filename, mime, size, sha256, created_at_ms, idem_token) "
+        "VALUES(?, NULL, ?, '', ?, ?, ?, NULL, ?, ?);", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
     sqlite3_bind_text (st, 3, j->filename ? j->filename : "", -1, SQLITE_STATIC);
     sqlite3_bind_text (st, 4, j->mime ? j->mime : "", -1, SQLITE_STATIC);
     sqlite3_bind_int64(st, 5, (sqlite3_int64)j->att_size);
     sqlite3_bind_int64(st, 6, (sqlite3_int64)dbw_now_ms());
+    sqlite3_bind_blob (st, 7, j->idem, OC_IDEM_LEN, SQLITE_STATIC);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) { r->type = OC_RES_ATTACH_ERR; r->err_code = OC_ERR_INTERNAL; return r; }
