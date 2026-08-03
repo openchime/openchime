@@ -1511,6 +1511,19 @@ static int run_connection(oc_net *n, int reconnecting,
         push_simple(n->to_ui, OC_EV_CONNECTED, ok.user_id);
         push_simple(n->to_ui, OC_EV_AUTH_OK, ok.user_id);
 
+        /* Refresh the stored UTC offset on every connect (ARCH-103). It was only
+         * ever written as a field on SET_SCHEDULE, so it was captured when the
+         * user last edited their quiet hours and never again — and the offset is
+         * exactly the thing that moves without the schedule changing, when the
+         * user travels or a daylight-saving boundary passes. Sent here, from the
+         * core, so every frontend gets it rather than each remembering to. */
+        {
+            uint8_t tb[16]; oc_wbuf tw; oc_wbuf_init(&tw, tb, sizeof tb);
+            oc_set_tz_offset tz = { (int16_t)oc_utc_offset_min() };
+            if (oc_encode_set_tz_offset(&tw, negotiated, &tz) == OC_OK)
+                (void)write_all(&conn, fd, tb, tw.len, &n->stop);
+        }
+
         /* Ask for the channel list + the roster so the model can populate the
          * sidebar and resolve user names (for DMs, mentions). */
         uint8_t lb[16]; oc_wbuf lw; oc_wbuf_init(&lw, lb, sizeof lb);

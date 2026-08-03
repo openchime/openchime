@@ -1454,6 +1454,15 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
+        if (hdr.msg_type == OC_MSG_SET_TZ_OFFSET) {
+            oc_set_tz_offset tz;
+            if (oc_decode_set_tz_offset(&p, &tz) != OC_OK) return -1;
+            oc_job *j = oc_job_new(OC_JOB_SET_TZ_OFFSET, c->conn_id);
+            if (!j) return -1;
+            j->user_id = c->user_id; j->tz_offset_min = tz.tz_offset_min;
+            oc_dbwriter_submit(dbw, j);
+            continue;
+        }
         if (hdr.msg_type == OC_MSG_SET_SNOOZE) {
             oc_set_snooze ss;
             if (oc_decode_set_snooze(&p, &ss) != OC_OK) return -1;

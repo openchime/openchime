@@ -639,28 +639,11 @@ static NOTIFYICONDATAW g_tray;
 
 /* Is `t` (minutes since midnight) inside the DND window? Windows may wrap past
  * midnight, which is why this is not a plain range test. */
-/* Minutes east of UTC, right now. The daemon stores this beside the schedule
- * because a per-weekday window has to be evaluated on the user's own calendar
- * day and only this side knows the zone (ARCH-103). Computed from the difference
- * the C library already knows about rather than parsed from a zone name. */
-static int local_utc_offset_min(void) {
-    time_t now = time(NULL);
-    struct tm lt, gt;
-    if (!oc_localtime_r(&now, &lt)) return 0;
-#if defined(_WIN32)
-    if (gmtime_s(&gt, &now) != 0) return 0;
-#else
-    if (!gmtime_r(&now, &gt)) return 0;
-#endif
-    int lmin = lt.tm_hour * 60 + lt.tm_min;
-    int gmin = gt.tm_hour * 60 + gt.tm_min;
-    int diff = lmin - gmin;
-    int dday = lt.tm_yday - gt.tm_yday;
-    /* Year boundaries make yday jump the wrong way; only the sign matters. */
-    if (dday ==  1 || dday < -1) diff += 1440;
-    if (dday == -1 || dday >  1) diff -= 1440;
-    return diff;
-}
+/* Minutes east of UTC, right now — oc_utc_offset_min (shared/oc_port.h). This
+ * file used to carry its own copy; the app-core needs the same number to refresh
+ * the stored offset on connect (ARCH-103), so it moved to the header they share
+ * rather than becoming a second implementation to keep in step. */
+#define local_utc_offset_min() oc_utc_offset_min()
 
 /* Am I quiet right now? The rule lives in shared/notify.c (ARCH-103), because
  * the daemon applies exactly the same one when it decides whether to notify —

@@ -365,6 +365,43 @@ which requires an active enrollment and a push gateway. It becomes a real
 mis-timing the moment push is enabled for a user who travels or crosses a
 daylight-saving boundary. **Verified** — sole reader is `daemon/push.c:346/365`.
 
+**FIXED 2026-08-02.** ARCH-103's connect-time refresh is built. A new C→S frame
+`SET_TZ_OFFSET` (`0x00D6`, `{ tz_offset_min: i16 }`) is sent by the **app-core**
+immediately after `AUTH_OK`, so every frontend gets it rather than each
+remembering to; the daemon clamps to −720…+840 (the range real offsets occupy)
+and writes `users.tz_offset_min`. Fire-and-forget — there is no reply, because
+nothing about the session changes.
+
+**No `OC_PROTOCOL_VERSION` bump.** Adding a frame is the case the version rule
+explicitly exempts: no existing layout moved, and an old peer neither sends nor
+expects the new type. A field on `SET_SCHEDULE` would have been a layout change —
+and would also have been wrong, since refreshing the offset must not require, or
+rewrite, a schedule.
+
+The offset computation moved to `oc_utc_offset_min` in `shared/oc_port.h`, beside
+the `localtime` shim it is built on. The Win32 client had the only copy, and the
+core now needs the same number, so it became one implementation rather than two
+to keep in step.
+
+Measured end to end, which is the only level that proves the item: with the test
+process pinned to `Asia/Kolkata`, a core that connects causes the daemon's own
+`users` row to read **330**. The value is deliberately neither zero nor a whole
+hour — a zero would be indistinguishable from the column's default, and a whole
+hour from a truncating bug. The client is not the witness: the assertion reads
+the daemon's database, since the client says nothing about this. Proven to fail:
+suppressing just the connect-time send leaves the column unwritten and the
+assertion fails.
+
+Also covered: the codec round-trip at `-330` and `+840` (the negative case is the
+one that breaks if the field is ever read unsigned, which is most of the
+Americas).
+
+One incidental correction to the first draft of that test: it queried
+`users.username`, which does not exist — identity is `subject`, namespaced
+`local:<name>`. The query silently failed to prepare and the assertion read a
+sentinel, which is exactly how a test can look like it is checking something and
+not be.
+
 ## 13. `UPLOAD_BEGIN` is not idempotent
 
 The documented contract said it deduplicates on `(channel, token)` like `SEND`.

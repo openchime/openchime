@@ -125,7 +125,12 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        OC_JOB_SET_SCHEDULE = 89, OC_JOB_SET_KEYWORDS = 90, OC_JOB_SET_PRIORITY = 91,
        /* Threads across channels (REQ-062, ARCH-104). */
        OC_JOB_LIST_THREADS = 92, OC_JOB_SET_THREAD_FOLLOW = 93,
-       OC_JOB_MARK_THREAD_READ = 94 };
+       OC_JOB_MARK_THREAD_READ = 94,
+       /* The client's current UTC offset, refreshed on every connect (ARCH-103).
+        * Fire-and-forget: nothing is returned, because nothing about the
+        * session changes — it only keeps the stored offset from going stale
+        * when the user travels or crosses a daylight-saving boundary. */
+       OC_JOB_SET_TZ_OFFSET = 95 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -226,6 +231,7 @@ typedef struct oc_job {
      * SET_DND uses the dnd_* fields. */
     uint8_t        notify_level;
     uint32_t       snooze_minutes;   /* SET_SNOOZE: from now; 0 ends the pause */
+    int16_t        tz_offset_min;    /* SET_TZ_OFFSET: minutes east of UTC */
     /* SET_SCHEDULE (REQ-136). `sched_days` is heap when n_sched_days > 0. */
     uint8_t          sched_mode;
     int16_t          sched_tz_offset_min;

@@ -19,6 +19,7 @@
 #include "check.h"
 
 #include <sqlite3.h>     /* to hand-build a pre-rename store for the upgrade test */
+#include "oc_port.h"      /* oc_utc_offset_min: the value the core sends on connect */
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -878,6 +879,16 @@ int run_client_core_tests(void) {
     CHECK(oc_dbwriter_register_local(dbw, "faye", "pw-faye", OC_ROLE_MEMBER, 2048) != 0);
     CHECK(oc_dbwriter_register_local(dbw, "gil",  "pw-gil",  OC_ROLE_MEMBER, 2048) != 0);
 
+    /* Pin the process timezone before any client connects, so the offset the
+     * core sends on connect (ARCH-103) is a value that cannot be confused with
+     * an unwritten column: +05:30 is non-zero AND not a whole hour, so neither
+     * the schema default nor a truncating bug can produce it by accident. */
+    const char *tz_saved = getenv("TZ");
+    char tz_saved_buf[64] = "";
+    if (tz_saved) snprintf(tz_saved_buf, sizeof tz_saved_buf, "%s", tz_saved);
+    setenv("TZ", "Asia/Kolkata", 1);
+    tzset();
+
     struct core_loop_arg arg;
     arg.port = 19000 + (int)(getpid() % 2000);
     arg.srv = &srv;
@@ -898,6 +909,37 @@ int run_client_core_tests(void) {
         CHECK(WAIT_FOR(a, m->authed && m->user_id != 0));
         CHECK(WAIT_FOR(b, m->authed && m->user_id != 0));
         CHECK(oc_client_model(a)->connected);
+
+        /* The UTC offset is refreshed on connect (ARCH-103). It used to be
+         * written only as a field on SET_SCHEDULE, so it was captured whenever
+         * the user last edited their quiet hours and never again — and the
+         * offset is precisely what changes without the schedule changing, when
+         * the user travels or daylight saving turns over. Asserted against the
+         * daemon's own row: the client says nothing about this, so the model
+         * cannot be the witness. */
+        {
+            int expect = oc_utc_offset_min();
+            CHECK(expect == 330);          /* Asia/Kolkata, per the TZ set above */
+            int got = -9999;
+            for (int i = 0; i < 200 && got != expect; i++) {   /* the job is async */
+                sqlite3 *rdb = NULL;
+                if (sqlite3_open_v2("build/itest_core.db", &rdb,
+                                    SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+                    sqlite3_stmt *st = NULL;
+                    /* Identity is `subject`, namespaced by source (AUTH.md §4);
+                     * there is no username column. */
+                    if (sqlite3_prepare_v2(rdb, "SELECT tz_offset_min FROM users"
+                                                " WHERE subject='local:dana';",
+                                           -1, &st, NULL) == SQLITE_OK &&
+                        sqlite3_step(st) == SQLITE_ROW)
+                        got = sqlite3_column_int(st, 0);
+                    sqlite3_finalize(st);
+                    sqlite3_close(rdb);
+                }
+                if (got != expect) usleep(10000);
+            }
+            CHECK(got == expect);
+        }
         CHECK(WAIT_FOR(a, oc_model_channel((oc_model *)m, 1) != NULL));
         CHECK(WAIT_FOR(b, oc_model_channel((oc_model *)m, 1) != NULL));
 
@@ -1362,6 +1404,12 @@ int run_client_core_tests(void) {
     unlink("build/itest_core.db");
     unlink("build/itest_core.db-wal");
     unlink("build/itest_core.db-shm");
+
+    /* Put the process timezone back: it is global state, and a later suite
+     * reading a local time should not inherit this one's fixture. */
+    if (tz_saved_buf[0]) setenv("TZ", tz_saved_buf, 1);
+    else                 unsetenv("TZ");
+    tzset();
 
     return failures;
 }

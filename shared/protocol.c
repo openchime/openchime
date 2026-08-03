@@ -786,6 +786,12 @@ oc_result oc_encode_presence_update(oc_wbuf *w, uint16_t version, const oc_prese
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_set_tz_offset(oc_wbuf *w, uint16_t version, const oc_set_tz_offset *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_SET_TZ_OFFSET);
+    oc_w_u16(w, (uint16_t)m->tz_offset_min);   /* two's complement; minutes east of UTC */
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_set_snooze(oc_wbuf *w, uint16_t version, const oc_set_snooze *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_SET_SNOOZE);
     oc_w_u32(w, m->minutes);
@@ -796,6 +802,11 @@ oc_result oc_encode_snooze(oc_wbuf *w, uint16_t version, const oc_snooze *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_SNOOZE);
     oc_w_u64(w, m->until_ms);
     return oc_frame_end(w, off);
+}
+
+oc_result oc_decode_set_tz_offset(oc_rbuf *p, oc_set_tz_offset *m) {
+    m->tz_offset_min = (int16_t)oc_r_u16(p);
+    return r_done(p);
 }
 
 oc_result oc_decode_set_snooze(oc_rbuf *p, oc_set_snooze *m) {

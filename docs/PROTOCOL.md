@@ -1360,6 +1360,16 @@ day for half the world — and only the client knows the zone. One shape both
 directions: the schedule a client sends and the schedule the server echoes are
 the same fact.
 
+**`SET_TZ_OFFSET` (C → S), `0x00D6`** `{ tz_offset_min: i16 }` — the client's
+UTC offset in minutes east, sent **on every connect** (ARCH-103). The offset the
+schedule above is evaluated against is not a property of the schedule: it changes
+when the user travels or when daylight saving turns over, neither of which
+involves editing quiet hours. Carrying it only on `SET_SCHEDULE` meant it was
+captured at the last edit and then trusted indefinitely, so this is its own frame
+— refreshing the offset must not require, or rewrite, a schedule. The daemon
+clamps it to −720…+840, the range real offsets occupy. There is no reply: nothing
+about the session changes, and the value matters later, to the push decision.
+
 **`SET_KEYWORDS` (C → S), `0x00CE`** `{ count: u8, count × str }` and
 **`SET_PRIORITY` (C → S), `0x00CF`** `{ count: u8, count × u64 }` — replace my
 keyword list / my priority people wholesale (REQ-135). Wholesale because both
@@ -1465,6 +1475,10 @@ Each of these answers with a full `NOTIFY_PREFS` (`0x0093`) to **all** of the
 user's connections, followed by `SNOOZE`, `SCHEDULE` and `ALERT_PREFS`. That
 four-frame trailer follows every `NOTIFY_PREFS`, not only a `LIST` request, so a
 client always folds a complete picture rather than a delta.
+
+**`SET_TZ_OFFSET` (C → S), `0x00D6`** — My current UTC offset, minutes east, refreshed on every connect. (ARCH-103)
+
+    tz_offset_min (i16)
 
 **`SET_SNOOZE` (C → S), `0x00CA`** — Pause my notifications for N minutes from now; 0 ends the pause. (REQ-278, WIN-92)
 
@@ -1996,7 +2010,7 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 ## 9. Message type registry
 
 **Generated from `shared/protocol.h`** — every `OC_MSG_*` the codec defines, in
-opcode order, 154 of them. The sections above specify the payload layouts; this
+opcode order, 157 of them. The sections above specify the payload layouts; this
 table is the index and the authority on which values are taken.
 
 One opcode is **used by two message types** (`0x0070`), marked below:
@@ -2163,6 +2177,7 @@ exception, so this table cannot silently regain a shared value.
 | `0x00D3` | `THREADS` | S → C | terminator |
 | `0x00D4` | `SET_THREAD_FOLLOW` | C → S | follow/unfollow one thread |
 | `0x00D5` | `MARK_THREAD_READ` | C → S | its replies are read up to here |
+| `0x00D6` | `SET_TZ_OFFSET` | C → S | minutes east of UTC, refreshed on every connect |
 
 ## 10. Connection state machine
 

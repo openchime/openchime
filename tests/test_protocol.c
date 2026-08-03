@@ -529,6 +529,23 @@ static void test_presence_frames(void) {
         CHECK(oc_decode_presence_update(&p, &out) == OC_OK);
         CHECK(out.user_id == 42 && out.status == OC_PRESENCE_AWAY && out.dnd == 1);
     }
+    {   /* The connect-time UTC offset (ARCH-103). Signed and not always a whole
+         * hour: the negative case is the one that breaks if the field is ever
+         * widened or read unsigned, since west of Greenwich is most of the
+         * Americas. */
+        oc_set_tz_offset in = { -330 };
+        ROUNDTRIP(oc_encode_set_tz_offset(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_SET_TZ_OFFSET, h, p);
+        oc_set_tz_offset out;
+        CHECK(oc_decode_set_tz_offset(&p, &out) == OC_OK && out.tz_offset_min == -330);
+    }
+    {
+        oc_set_tz_offset in = { 840 };            /* UTC+14, the eastmost real one */
+        ROUNDTRIP(oc_encode_set_tz_offset(&w, OC_PROTOCOL_VERSION, &in),
+                  OC_MSG_SET_TZ_OFFSET, h, p);
+        oc_set_tz_offset out;
+        CHECK(oc_decode_set_tz_offset(&p, &out) == OC_OK && out.tz_offset_min == 840);
+    }
     {   /* Pausing (REQ-278): minutes from now on the way in, an absolute instant
          * on the way back, and 0 in either direction means "not paused". */
         oc_set_snooze in = { 30 };

@@ -289,6 +289,14 @@ typedef enum {
     OC_MSG_THREADS          = 0x00D3, /* S->C, terminator */
     OC_MSG_SET_THREAD_FOLLOW= 0x00D4, /* C->S, follow/unfollow one thread */
     OC_MSG_MARK_THREAD_READ = 0x00D5, /* C->S, its replies are read up to here */
+    /* The client's current UTC offset, sent on every connect (ARCH-103). A
+     * per-weekday quiet-hours schedule is evaluated on the user's local calendar
+     * day, and only the client knows the zone — but the offset it implies moves
+     * with travel and with daylight saving, so it cannot be captured once when
+     * the schedule is edited and then trusted. Its own frame rather than a field
+     * on SET_SCHEDULE because refreshing the offset must not require, or rewrite,
+     * a schedule. */
+    OC_MSG_SET_TZ_OFFSET    = 0x00D6, /* C->S, minutes east of UTC, right now */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -836,6 +844,11 @@ typedef struct { uint64_t root_id, channel_id; uint8_t on; } oc_set_thread_follo
 /* `up_to` 0 means "everything in it", which is what opening a thread means. */
 typedef struct { uint64_t root_id, up_to; } oc_mark_thread_read;
 
+/* Minutes east of UTC at the moment of sending (ARCH-103). Signed: west of
+ * Greenwich is negative, and the range spans -720..+840 including the offsets
+ * that are not whole hours. */
+typedef struct { int16_t tz_offset_min; } oc_set_tz_offset;
+
 /* REQ-278. Minutes FROM NOW, as Slack's API takes them: the presets are all
  * durations, and only the client knows the timezone that turns "until tomorrow"
  * into an instant. 0 ends the pause — there is no second op. */
@@ -1126,6 +1139,7 @@ oc_result oc_encode_presence_update(oc_wbuf *w, uint16_t version, const oc_prese
 oc_result oc_encode_typing(oc_wbuf *w, uint16_t version, const oc_typing *m);
 oc_result oc_encode_typing_update(oc_wbuf *w, uint16_t version, const oc_typing_update *m);
 oc_result oc_encode_set_notify_pref(oc_wbuf *w, uint16_t version, const oc_set_notify_pref *m);
+oc_result oc_encode_set_tz_offset(oc_wbuf *w, uint16_t version, const oc_set_tz_offset *m);
 oc_result oc_encode_set_snooze(oc_wbuf *w, uint16_t version, const oc_set_snooze *m);
 oc_result oc_encode_snooze(oc_wbuf *w, uint16_t version, const oc_snooze *m);
 oc_result oc_encode_set_schedule(oc_wbuf *w, uint16_t version, const oc_schedule *m);
@@ -1282,6 +1296,7 @@ oc_result oc_decode_presence_update(oc_rbuf *p, oc_presence_update *m);
 oc_result oc_decode_typing(oc_rbuf *p, oc_typing *m);
 oc_result oc_decode_typing_update(oc_rbuf *p, oc_typing_update *m);
 oc_result oc_decode_set_notify_pref(oc_rbuf *p, oc_set_notify_pref *m);
+oc_result oc_decode_set_tz_offset(oc_rbuf *p, oc_set_tz_offset *m);
 oc_result oc_decode_set_snooze(oc_rbuf *p, oc_set_snooze *m);
 oc_result oc_decode_snooze(oc_rbuf *p, oc_snooze *m);
 /* `days` must have room for OC_SCHEDULE_DAYS entries; `m->days` points at it. */

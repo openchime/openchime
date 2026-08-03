@@ -4471,6 +4471,25 @@ static uint64_t snooze_until(sqlite3 *db, uint64_t uid) {
  * and only the client knows the timezone that turns "until tomorrow" into a
  * moment — so the instant is resolved here, once. 0 minutes ends the pause:
  * ending early is "until now", not a second op. Write. */
+/* Refresh the stored UTC offset (ARCH-103). Fire-and-forget: it returns no
+ * result, because nothing observable changed for this session — the offset only
+ * matters later, to the push worker deciding whether a per-weekday quiet-hours
+ * window is currently in force on the recipient's own calendar day. Clamped to
+ * the range real offsets occupy, so a broken or hostile client cannot move
+ * somebody's local day by an arbitrary amount. */
+static oc_dbres *process_set_tz_offset(sqlite3 *db, const oc_job *j) {
+    int off = j->tz_offset_min;
+    if (off < -720) off = -720;        /* UTC-12, the westmost real offset */
+    if (off >  840) off =  840;        /* UTC+14, the eastmost */
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(db, "UPDATE users SET tz_offset_min=?1 WHERE id=?2;", -1, &st, NULL);
+    sqlite3_bind_int(st, 1, off);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    return NULL;
+}
+
 static oc_dbres *process_set_snooze(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -5728,6 +5747,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_KEYWORDS)    return process_set_keywords(w->db, j);
     if (j->type == OC_JOB_SET_PRIORITY)    return process_set_priority(w->db, j);
     if (j->type == OC_JOB_SET_SNOOZE)      return process_set_snooze(w->db, j);
+    if (j->type == OC_JOB_SET_TZ_OFFSET)   return process_set_tz_offset(w->db, j);
     if (j->type == OC_JOB_REGISTER_DEVICE_TOKEN)   return process_register_device_token(w->db, j);
     if (j->type == OC_JOB_UNREGISTER_DEVICE_TOKEN) return process_unregister_device_token(w->db, j);
     if (j->type == OC_JOB_PRUNE_DEVICE_TOKEN)      return process_prune_device_token(w->db, j);
