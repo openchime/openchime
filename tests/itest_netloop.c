@@ -1877,6 +1877,79 @@ static void test_logout_closes(int port, const uint8_t *pin) {
     client_close(&a);
 }
 
+/* The two states where the specification promises UNEXPECTED_MSG_TYPE and the
+ * daemon used to say nothing: a first frame that is not HELLO (socket closed
+ * with nothing written) and a post-auth type no branch claims (ignored
+ * silently). Our own client can trigger neither; a third-party implementer gets
+ * either a bare close or a frame that vanishes with the connection still up,
+ * which is the least debuggable outcome available. */
+static void test_unexpected_msg_type(int port, const uint8_t *pin) {
+    /* --- first frame is not HELLO ------------------------------------------ */
+    {
+        client c;
+        CHECK(client_open(&c, port, pin) == 0);
+        uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_list_channels(&w, OC_PROTOCOL_VERSION) == OC_OK);
+        CHECK(write_all(&c.conn, buf, w.len) == 0);
+
+        oc_header hdr; oc_rbuf p;
+        CHECK(read_frame(&c, &hdr, &p) == 0);
+        CHECK(hdr.msg_type == OC_MSG_REJECT);
+        /* REJECT, not ERROR: no version has been negotiated, and REJECT is the
+         * frame frozen at 1 that any peer of any era can read. */
+        CHECK(hdr.version == 1);
+        oc_reject rej;
+        CHECK(oc_decode_reject(&p, &rej) == OC_OK);
+        CHECK(rej.code == OC_ERR_UNEXPECTED_MSG_TYPE);
+        CHECK(read_frame(&c, &hdr, &p) != 0);      /* and then closed */
+        client_close(&c);
+    }
+
+    /* --- post-auth type that no branch handles ---------------------------- */
+    {
+        client c;
+        CHECK(client_open(&c, port, pin) == 0);
+        CHECK(do_handshake(&c) == 0);
+        uint64_t uid = 0;
+        CHECK(do_auth(&c, "alice", "pw-alice", &uid) == 0);
+
+        /* A well-formed frame whose msg_type is not defined at this version.
+         * Built by encoding a real frame and patching the type in place —
+         * oc_frame_begin/end are internal to protocol.c, and the point is the
+         * dispatcher, not the encoder. msg_type is the u16 at offset 6. */
+        uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_list_channels(&w, OC_PROTOCOL_VERSION) == OC_OK);
+        buf[6] = 0xEE; buf[7] = 0xEE;
+        CHECK(write_all(&c.conn, buf, w.len) == 0);
+
+        oc_header hdr; oc_rbuf p;
+        CHECK(read_frame(&c, &hdr, &p) == 0);
+        CHECK(hdr.msg_type == OC_MSG_ERROR);
+        oc_error err;
+        CHECK(oc_decode_error(&p, &err) == OC_OK);
+        CHECK(err.code == OC_ERR_UNEXPECTED_MSG_TYPE);
+        CHECK(err.fatal == 1);
+        CHECK(read_frame(&c, &hdr, &p) != 0);      /* fatal means closed */
+        client_close(&c);
+    }
+
+    /* --- a defined type still works --------------------------------------- */
+    {
+        client c;
+        CHECK(client_open(&c, port, pin) == 0);
+        CHECK(do_handshake(&c) == 0);
+        uint64_t uid = 0;
+        CHECK(do_auth(&c, "alice", "pw-alice", &uid) == 0);
+        uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+        CHECK(oc_encode_list_channels(&w, OC_PROTOCOL_VERSION) == OC_OK);
+        CHECK(write_all(&c.conn, buf, w.len) == 0);
+        oc_header hdr; oc_rbuf p;
+        CHECK(read_frame(&c, &hdr, &p) == 0);
+        CHECK(hdr.msg_type == OC_MSG_CHANNEL_LIST);
+        client_close(&c);
+    }
+}
+
 /* A post-handshake frame carrying a version other than the negotiated one is
  * refused with a fatal ERROR and the connection closed. Before this, hdr.version
  * was written by both sides and read by neither: the field cost two bytes a
@@ -2070,6 +2143,7 @@ int run_netloop_tests(void) {
     if (failures == 0) {
         test_version_reject(arg.port, pin);
         test_frame_version_mismatch(arg.port, pin);
+        test_unexpected_msg_type(arg.port, pin);
         test_message_vertical(arg.port, pin);
         test_backfill_reconnect(arg.port, pin);
         test_edit_delete_vertical(arg.port, pin);

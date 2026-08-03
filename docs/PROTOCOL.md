@@ -226,10 +226,10 @@ byte order as they are parsed; nothing is `memcpy`'d over a struct (ARCH-7).
 ## 3. Handshake and version negotiation (resolves REQ-110, REQ-111)
 
 The first frame on a new connection MUST be `HELLO` from the client. Any other
-first frame **closes the connection with no frame written** — the specification
-reserves `REJECT`/`UNEXPECTED_MSG_TYPE` for it, and the daemon does not send it
-(see BACKLOG.md). The
-connection is closed.
+first frame is answered with **`REJECT` carrying `UNEXPECTED_MSG_TYPE`** and the
+connection is closed. `REJECT` rather than `ERROR` because no version has been
+negotiated yet, and `REJECT` is frozen at version 1 — the one frame a peer of any
+era can read.
 
 The `HELLO`/`WELCOME`/`REJECT` frames are **frozen at `version = 1`**
 (`OC_HANDSHAKE_VERSION`, stamped by the three encoders that take no version
@@ -1960,7 +1960,7 @@ Codes are grouped by range so a client can categorize an unrecognized code.
 | `1002` | `VERSION_TOO_NEW`     | handshake  | yes   | Client's `min_version` > server maximum. Operator must upgrade the daemon; do **not** prompt the user to update the app. |
 | `1003` | `MALFORMED_FRAME`     | any        | yes   | Unparseable frame.                                             |
 | `1004` | `FRAME_TOO_LARGE`     | any        | yes   | `length` implies a frame larger than `MAX_FRAME_SIZE`.         |
-| `1005` | `UNEXPECTED_MSG_TYPE` | any        | yes   | Reserved for a frame not valid in the current state. **Never emitted**: a non-`HELLO` first frame closes the socket silently and an unrecognised post-auth type is ignored. A `SEND` before `AUTH_OK` gets `AUTH_REQUIRED` instead. |
+| `1005` | `UNEXPECTED_MSG_TYPE` | any        | yes   | A frame not valid in the current state: a non-`HELLO` first frame (sent as `REJECT`, since no version is negotiated yet) or a post-auth type this version does not define (sent as `ERROR`). A `SEND` before `AUTH_OK` gets the more specific `AUTH_REQUIRED` instead. |
 | `1006` | `VERSION_MISMATCH`    | post-hello | yes   | A post-handshake frame carried a `version` other than the negotiated one. Distinct from `1001`/`1002`, which answer a `HELLO` and precede a session: this says the peer agreed and then sent something else. The `ERROR` itself is stamped with the negotiated version, so it is readable by the peer being disconnected. |
 | `2001` | `AUTH_REQUIRED`       | post-hello | yes   | A messaging frame arrived before successful `AUTH`.            |
 | `2002` | `AUTH_INVALID_TOKEN`  | auth       | yes   | JWT failed signature/audience/expiry validation (REQ-023).     |
@@ -2187,10 +2187,10 @@ exception, so this table cannot silently regain a shared value.
 ```
 
 - Any fatal `ERROR`/`REJECT` transitions to closed from any state.
-- A frame invalid for the current state is specified to yield `ERROR
-  UNEXPECTED_MSG_TYPE`, and does not: the pre-auth case answers `AUTH_REQUIRED`,
-  and the others close or ignore silently
-  (fatal).
+- A frame invalid for the current state yields `UNEXPECTED_MSG_TYPE` (fatal):
+  as `REJECT` before the handshake, as `ERROR` afterwards. The pre-auth case is
+  the deliberate exception — a messaging frame before `AUTH_OK` answers
+  `AUTH_REQUIRED`, which says the same thing more precisely.
 - On an unexpected transport close, the client reconnects (REQ-100) and starts
   over from `HELLO`, following `AUTH_OK` with a `BACKFILL_REQUEST` (§6).
 

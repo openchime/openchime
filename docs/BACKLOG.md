@@ -293,6 +293,32 @@ type is ignored silently.
 sends types the daemon dispatches. A third-party implementer gets a silent close
 where the specification promises a reason. **Verified.**
 
+**FIXED 2026-08-02.** Both promised cases now say why. A non-`HELLO` first frame
+is answered with **`REJECT`** carrying `UNEXPECTED_MSG_TYPE` — `REJECT` rather
+than `ERROR` because no version has been negotiated at that point, and `REJECT`
+is the frame frozen at version 1, so it is the only one this peer is guaranteed
+to be able to read. A post-auth type no branch claims is answered with a fatal
+**`ERROR`** and the connection closed.
+
+The pre-auth case is left alone deliberately: a messaging frame before `AUTH_OK`
+already answers `AUTH_REQUIRED`, which says the same thing more precisely. The
+documentation stops describing 1005 as never emitted.
+
+Making the unhandled-type case fatal is only safe if no shipped client relies on
+being ignored, so that was checked rather than assumed: every `oc_encode_*` frame
+in `client/core/net.c` was matched against the types dispatched inside
+`drain_frames`, and all of them are handled (the one apparent miss,
+`oc_encode_local_credential`, is a blob nested inside `AUTH`, not a frame). The
+full suite passing is the second half of that evidence — a legitimate frame
+reaching the new fallthrough would now drop the connection loudly.
+
+Measured: `test_unexpected_msg_type` covers both paths and the control. A
+non-`HELLO` first frame returns `REJECT`/`UNEXPECTED_MSG_TYPE` stamped version 1,
+then the socket closes. A frame whose `msg_type` is patched to an undefined
+`0xEEEE` returns `ERROR`/`UNEXPECTED_MSG_TYPE` with `fatal = 1`, then closes. The
+same frame with its real type still returns `CHANNEL_LIST`. Proven to fail:
+restoring both silent behaviours produces 10 failing assertions.
+
 ## 11. Backfill replays public channels the caller has not joined
 
 An explicit backfill cursor is gated on `channel_read_access` (public **or**

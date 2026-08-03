@@ -715,7 +715,20 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
         if (oc_parse_frame(frame, flen, &hdr, &p) != OC_OK) return -1;
 
         if (!c->did_hello) {
-            if (hdr.msg_type != OC_MSG_HELLO) return -1;
+            if (hdr.msg_type != OC_MSG_HELLO) {
+                /* The specification reserves a reason for this and the daemon
+                 * used to close the socket with nothing written, which tells a
+                 * third-party implementer only that something went wrong. It is
+                 * a REJECT rather than an ERROR because no version has been
+                 * negotiated yet: REJECT is frozen at version 1 (§3), so it is
+                 * the only frame we can be sure this peer can read. */
+                uint8_t rbuf[128]; oc_wbuf rw; oc_wbuf_init(&rw, rbuf, sizeof rbuf);
+                oc_reject rej = { OC_ERR_UNEXPECTED_MSG_TYPE,
+                                  oc_slice_str("first frame must be HELLO") };
+                oc_encode_reject(&rw, &rej);
+                out_append(c, rbuf, rw.len);
+                return -1;
+            }
             c->did_hello = 1;
             if (handle_hello(c, &p, dbw) < 0) return -1;
             continue;
@@ -1769,7 +1782,19 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             xfer_reset(&c->xfer);   /* aborts an open upload blob; drops a download */
             continue;
         }
-        /* Other post-auth frame types are ignored by this skeleton. */
+        /* No branch claimed this type. Silently ignoring it was indistinguishable
+         * from handling it and choosing to say nothing, which is the worst thing
+         * to do to an implementer: their frame vanishes and the connection stays
+         * up. Every type our own client sends is dispatched above, so reaching
+         * here means the peer sent something this version does not define. */
+        {
+            uint8_t ebuf[128]; oc_wbuf ew; oc_wbuf_init(&ew, ebuf, sizeof ebuf);
+            oc_error err = { OC_ERR_UNEXPECTED_MSG_TYPE, 1, oc_slice_str("frame"),
+                             oc_slice_str("message type not valid in this state") };
+            oc_encode_error(&ew, c->version, &err);
+            out_append(c, ebuf, ew.len);
+            return -1;
+        }
     }
 }
 
