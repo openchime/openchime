@@ -332,6 +332,27 @@ This was a false statement in `PROTOCOL.md` §6.1, now corrected, rather than a
 code defect. Kept in the list so the earlier reading is not rediscovered as a
 security finding. **Verified** — no membership filter precedes the access check.
 
+**CLOSED 2026-08-02 — no code change, behaviour pinned instead.** Re-verified:
+`channel_read_access` (`daemon/dbwriter.c:1262`) is `is_public || is_member`, and
+PROTOCOL.md §6.1 already states that rule correctly. There is nothing to fix.
+
+What was missing was a test that says so. The nearest existing assertion — carol
+backfilling `townhall` — proves nothing about membership, because carol had
+posted to it first and public channels **auto-join** the poster: she was a member
+by the time she read. The rule was therefore unpinned in both directions.
+
+`test_dbwriter` now uses `dave`, who joins nothing and posts nothing: an explicit
+cursor on a public channel replays it, and the same non-member gets nothing from
+a private channel that does have messages. Proven to fail: narrowing the read
+gate to `is_member` alone produces 3 failing assertions, one of them this new
+case.
+
+One incidental correction: the first version of that test asserted a public
+channel is absent from a non-member's `LIST_CHANNELS`, and it is not — a public
+channel is listed for everyone, carrying `joined = 0`, which is how it is
+discoverable at all. The assertion now records that, since it is the fact that
+makes `dave` a genuine non-member.
+
 ## 12. A stale timezone offset is never refreshed
 
 `users.tz_offset_min` decides which local day a per-weekday quiet-hours schedule

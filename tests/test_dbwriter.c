@@ -2212,6 +2212,31 @@ static void test_channels(void) {
     CHECK(r && r->type == OC_RES_BACKFILL_OK && r->n_replay >= 1);
     oc_dbres_free(r);
 
+    /* The case that actually states the rule: a user who has NEVER joined.
+     * carol above was auto-joined by posting, so her replay proves nothing
+     * about membership. dave joins nothing and posts nothing, and an explicit
+     * cursor on a public channel still replays it — public means readable by
+     * anyone in the tenant (REQ-031), and backfill applies the same read gate
+     * as every other read. Asserted because it has twice been read as a leak;
+     * pinning it means a change in either direction has to be deliberate. */
+    uint64_t dave = reg(w, "dave", "pw", OC_ROLE_MEMBER);
+    /* A public channel is listed for everyone (that is how it is discoverable),
+     * carrying joined = 0 for someone who has not joined — which is what makes
+     * dave a genuine non-member for the assertion below. */
+    r = list_channels(w, dave);
+    joined = -1;
+    CHECK(r && list_has(r, townhall, &joined) && joined == 0);
+    oc_dbres_free(r);
+    r = backfill(w, dave, townhall, 0);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK && r->n_replay >= 1);
+    oc_dbres_free(r);
+
+    /* And the gate is a gate: the same non-member gets nothing from a private
+     * channel that does have messages. */
+    r = backfill(w, dave, secret, 0);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK && r->n_replay == 0);
+    oc_dbres_free(r);
+
     /* Posting to a channel that does not exist is UNKNOWN_CHANNEL. */
     CHECK(send_to(w, alice, 99999, "void") == OC_ERR_UNKNOWN_CHANNEL);
 
