@@ -374,6 +374,21 @@ static int g_n_form_hits;
  * a user can reasonably be asked to type; oc_emoji_by_name() resolves them
  * through the same catalogue the picker uses, so an unknown name simply drops
  * out instead of writing a broken glyph. */
+/* The user's skin tone (OC_SKIN_*), applied to every emoji in the catalogue
+ * that takes one. A preference rather than a per-insertion choice: nobody wants
+ * to re-pick their own skin tone on every reaction, which is why every reference
+ * client makes it sticky and puts it on the picker. Persisted in the `gui`
+ * settings bucket with the rest of the prefs. */
+static int g_skin_tone = OC_SKIN_DEFAULT;
+
+/* `e` with the chosen tone applied, into a caller-owned buffer. Falls back to
+ * the base character for anything that does not take a tone, so callers need no
+ * branch of their own. */
+static const char *toned(const oc_emoji *e, char *buf, size_t cap) {
+    if (oc_emoji_with_tone(e, (uint8_t)g_skin_tone, buf, cap) > 0) return buf;
+    return e ? e->emoji : "";
+}
+
 #define QUICK_DEFAULT "+1,heart,joy,tada,eyes,cry"
 static char  g_quick_names[160] = QUICK_DEFAULT;
 static const char *REACT_EMO[6];
@@ -1057,6 +1072,10 @@ static float    g_pick_scroll;
 static D2D1_RECT_F g_pick_panel, g_pick_box;
 static struct { D2D1_RECT_F r; const char *emoji; } g_pick_cells[256];
 static int      g_n_pick_cells;
+/* The skin-tone swatches along the picker's header. Six, always in the same
+ * order, so the one you want is in the same place every time. */
+static struct { D2D1_RECT_F r; int tone; } g_pick_tones[OC_SKIN_COUNT];
+static int      g_n_pick_tones;
 
 enum { AC_MAX = 8 };
 static oc_completion g_ac[AC_MAX];
@@ -6358,6 +6377,7 @@ static void draw_autocomplete(ID2D1RenderTarget *rt, float x0, float w, float h)
  * appear in the same place. */
 static void draw_emoji_picker(ID2D1RenderTarget *rt, float x0, float w, float h) {
     g_n_pick_cells = 0;
+    g_n_pick_tones = 0;
     if (!g_pick_open) { g_pick_panel = rf(0, 0, 0, 0); return; }
 
     float pw = 360; if (pw > w - 40) pw = w - 40;
@@ -6385,11 +6405,47 @@ static void draw_emoji_picker(ID2D1RenderTarget *rt, float x0, float w, float h)
         WideCharToMultiByte(CP_UTF8, 0, wq, -1, q, sizeof q, NULL, NULL);
     }
 
+    /* Skin-tone swatches, in the panel header beside the title. Drawn from a
+     * real tonable emoji rather than an abstract colour chip, so the choice is
+     * shown in the thing it affects.
+     *
+     * Above the body clip on purpose: the first version drew these at the title
+     * row AFTER PushAxisAlignedClip(body), where body starts 68px down the
+     * panel — so they were clipped away entirely and the row simply never
+     * appeared. Coordinates come from the panel, not from `body`, for the same
+     * reason. */
+    {
+        const oc_emoji *sample = NULL;
+        size_t all_n = 0;
+        const oc_emoji *all = oc_emoji_all(&all_n);
+        for (size_t i = 0; i < all_n && !sample; i++) if (all[i].tonable) sample = &all[i];
+        if (sample) {
+            static char sw[OC_SKIN_COUNT][24];
+            float tw = 24, tx = px + pw - 14 - tw * OC_SKIN_COUNT;
+            float ty = py + 6;
+            for (int t = 0; t < OC_SKIN_COUNT; t++) {
+                D2D1_RECT_F r = rf(tx, ty, tx + tw - 2, ty + 22);
+                oc_emoji_with_tone(sample, (uint8_t)t, sw[t], sizeof sw[t]);
+                if (t == g_skin_tone) fill_round(rt, r, 5.0f, OC_COL_ACCENT_DIM);
+                draw_emoji_glyph(rt, sw[t], r);
+                if (g_n_pick_tones < OC_SKIN_COUNT) {
+                    g_pick_tones[g_n_pick_tones].r = r;
+                    g_pick_tones[g_n_pick_tones].tone = t;
+                    g_n_pick_tones++;
+                }
+                tx += tw;
+            }
+        }
+    }
+
     D2D1_RECT_F body = rf(px + 8, py + 68, px + pw - 8, py + ph - 8);
     ID2D1RenderTarget_PushAxisAlignedClip(rt, &body, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
-    const oc_emoji *hits[256];
-    size_t nh = oc_emoji_search(q[0] ? q : NULL, hits, 256);
+    /* Sized by the catalogue's own bound, not a round number: at 256 a browse
+     * showed the first 256 entries and silently dropped every category after
+     * them, which an 800-entry catalogue makes into most of the picker. */
+    const oc_emoji *hits[OC_EMOJI_MAX];
+    size_t nh = oc_emoji_search(q[0] ? q : NULL, hits, OC_EMOJI_MAX);
 
     float cell = 34, cols = (float)(int)((body.right - body.left) / cell);
     if (cols < 1) cols = 1;
@@ -6430,6 +6486,10 @@ static void draw_emoji_picker(ID2D1RenderTarget *rt, float x0, float w, float h)
             if (col != 0) { y += cell; col = 0; x = body.left; }
         }
     }
+    /* The toned strings a cell points at must outlive the frame, as with the
+     * custom-emoji pool above. */
+    static char tpool[256][24];
+    int tn = 0;
     for (size_t i = 0; i < nh; i++) {
         /* Category headings only when browsing; a filtered list is already the
          * answer to a question and section breaks just fragment it. */
@@ -6443,12 +6503,17 @@ static void draw_emoji_picker(ID2D1RenderTarget *rt, float x0, float w, float h)
         }
         if (y + cell >= body.top && y <= body.bottom) {
             D2D1_RECT_F r = rf(x, y, x + cell, y + cell);
+            const char *glyph = hits[i]->emoji;
+            if (hits[i]->tonable && g_skin_tone != OC_SKIN_DEFAULT && tn < 256) {
+                glyph = toned(hits[i], tpool[tn], sizeof tpool[tn]);
+                tn++;
+            }
             if (g_n_pick_cells < 256) {
                 g_pick_cells[g_n_pick_cells].r = r;
-                g_pick_cells[g_n_pick_cells].emoji = hits[i]->emoji;
+                g_pick_cells[g_n_pick_cells].emoji = glyph;
                 g_n_pick_cells++;
             }
-            draw_emoji_glyph(rt, hits[i]->emoji, r);
+            draw_emoji_glyph(rt, glyph, r);
         }
         x += cell;
         if (++col >= (int)cols) { col = 0; x = body.left; y += cell; }
@@ -12287,6 +12352,17 @@ static int on_click(HWND hwnd, int x, int y) {
     }
     if (g_pick_open) {
         if (in_rect(g_pick_panel, x, y)) {
+            /* A tone is a preference, so choosing one re-renders the picker
+             * and stays open — it is a change to what you are looking at, not
+             * a selection. Saved immediately: it survives to the next window
+             * and the next device through the settings bucket. */
+            for (int i = 0; i < g_n_pick_tones; i++)
+                if (in_rect(g_pick_tones[i].r, x, y)) {
+                    g_skin_tone = g_pick_tones[i].tone;
+                    prefs_save();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 1;
+                }
             for (int i = 0; i < g_n_pick_cells; i++)
                 if (in_rect(g_pick_cells[i].r, x, y)) { picker_choose(hwnd, g_pick_cells[i].emoji); return 1; }
             return 1;   /* inside the panel but not on a cell: stay open */
@@ -14324,6 +14400,12 @@ static void prefs_save(void) {
              g_pref_richtext,
              g_win_x, g_win_y, g_win_w, g_win_h, g_win_max,
              g_quick_names);
+    /* Appended rather than folded into the format string above so an older
+     * build, which stops at `q:`, still reads everything it understands. */
+    {
+        size_t at = strlen(enc);
+        snprintf(enc + at, sizeof enc - at, ";k:%d", g_skin_tone);
+    }
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
 }
 
@@ -14350,6 +14432,8 @@ static void prefs_load(const oc_model *m) {
                     g_win_x = a; g_win_y = b2; g_win_w = c2; g_win_h = d2; g_win_max = e2;
                 }
             }
+            else if (k == 'k') g_skin_tone = (val < 0 || val >= OC_SKIN_COUNT)
+                                             ? OC_SKIN_DEFAULT : val;
             else if (k == 'q') {
                 size_t n2 = 0;
                 for (const char *q = p + 2; *q && *q != ';' && n2 + 1 < sizeof g_quick_names; q++)

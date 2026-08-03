@@ -23,6 +23,7 @@ int run_xferpool_tests(void);
 int run_storage_tests(void);
 int run_slow_blob_tests(void);
 int run_audio_tests(void);
+int run_emoji_tests(void);
 int run_tls_tests(void);
 int run_netloop_tests(void);
 int run_client_core_tests(void);
@@ -50,6 +51,7 @@ int main(void) {
     total += run_storage_tests();
     total += run_slow_blob_tests();
     total += run_audio_tests();
+    total += run_emoji_tests();
     total += run_tls_tests();
     total += run_netloop_tests();
     total += run_client_core_tests();

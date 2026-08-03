@@ -448,6 +448,73 @@ compensate.
 **Verified** — client/core/complete.c EMOJI[] holds 179 rows (counted); `grep -i skin` returns
 nothing anywhere in the client
 
+**FIXED 2026-08-02.** The catalogue is **837 entries** (from 179), and skin tones
+exist. 70 entries are marked `tonable` and `oc_emoji_with_tone()` applies a
+Fitzpatrick modifier to them; the Win32 picker gains a six-swatch tone row whose
+choice is a sticky preference, persisted in the `gui` settings bucket beside the
+other prefs.
+
+**No shortcode that ever shipped stopped resolving**, which is the risk this
+change actually carries: a message stored last week with `:sweat_smile:` renders
+from this same table. 32 of the old 179 would have been lost — six were genuinely
+missing emoji (`sweat_smile`, `melting`, `salute`, `brain`, `popcorn`,
+`pushpin`), now in the catalogue; the other 26 were older spellings of entries
+that were renamed, and became an **alias table** that `oc_emoji_by_name` consults
+on a miss. Aliases are deliberately *not* in `EMOJI[]`, so the picker does not
+show `:nerd:` and `:nerd_face:` as two copies of one glyph.
+
+Tone application is defined only where it is exactly right: single-codepoint
+bases. A ZWJ sequence like `:technologist:` is left un-tonable rather than made
+subtly wrong by appending a modifier to the end of a sequence. A trailing
+variation selector (U+FE0F) is *replaced* by the modifier, since the pair is not
+well-formed and the modifier already implies the emoji presentation.
+
+`OC_EMOJI_MAX` bounds the catalogue and `complete.c` static-asserts the table
+against it, so a caller can size a hit buffer that cannot silently truncate. The
+Win32 picker's buffer was **256** — with 837 entries a browse would have shown
+the first 256 and dropped every category after them. It is now sized by that
+bound. (The TUI picker bounds by its caller's `max` and is unaffected.)
+
+Measured: `tests/test_emoji.c` is new — the catalogue had **no test at all** at
+179 entries. It asserts catalogue integrity (unique lowercase shortcodes,
+well-formed UTF-8 in every character and keyword string, in-range and
+non-decreasing categories, which is what lets a picker emit section headers in
+one pass), that the shipped shortcodes still resolve, the tone algebra (the five
+modifiers distinct, VS16 replaced, non-tonable and out-of-range and
+`OC_SKIN_DEFAULT` all yielding the base, a too-small buffer reporting 0 rather
+than truncating into invalid UTF-8), and that a browse returns the whole
+catalogue. Proven to fail twice: deleting one alias row produces
+`shortcode stopped resolving: nerd` and 2 failures; keeping the variation
+selector when applying a tone produces 2 more.
+
+**Visually verified**, via `scripts/gui_drive.sh` — and the attempt caught a
+defect that no test would have. The tone row drew at the panel's title line,
+*after* `PushAxisAlignedClip(body)`, and `body` starts 68px down the panel: every
+swatch was clipped away and the row simply never appeared, in a build that
+compiled cleanly and passed every test. It now draws from the panel's own
+coordinates, above the clip. Observed after the fix: six wave swatches in the
+header, five visibly distinct tones plus the yellow base, the current one
+highlighted; clicking the dark swatch moves the highlight to it. The grid cells
+go through the same `oc_emoji_with_tone` + `draw_emoji_glyph` path the swatches
+do, which is what those five distinct swatches demonstrate.
+
+**`gui_snap.sh` cannot see this app's client area, and that is structural.** It
+captures with `PrintWindow`, which renders into a GDI HDC; the client paints
+through an `ID2D1HwndRenderTarget` (`winmain.c:1889`) that presents via DirectX
+and never touches GDI. So the capture returns the DWM-drawn frame and title bar
+over a blank white client area — which it does identically for a binary built
+from `main`, so it is not a property of any change. `gui_drive.sh shot` works
+because the app re-renders the scene itself into a `CreateDCRenderTarget`
+(`winmain.c:15111`), which is GDI-backed. That second render target exists
+precisely because the first cannot be captured from outside. **`gui_drive.sh` is
+the visual feedback loop; `gui_snap.sh` is not**, beyond confirming a window
+exists.
+
+One unexplained observation, recorded rather than dismissed: in a single session
+`shot` returned `err` for every name after one success, including with no overlay
+open, and cleared completely on relaunch. Not reproduced in three subsequent
+runs. No mechanism established, so no claim is made about one.
+
 ## 17. Quiet hours are typed HH:MM fields rather than time pickers
 
 Quiet hours are typed HH:MM fields, not time pickers.

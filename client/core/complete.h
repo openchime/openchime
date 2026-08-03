@@ -24,6 +24,10 @@ typedef struct {
     const char *emoji;     /* the UTF-8 character(s) */
     const char *keywords;  /* extra space-separated search terms, may be "" */
     uint8_t     category;  /* OC_EMOJI_CAT_* */
+    /* Nonzero if a Fitzpatrick skin-tone modifier may be appended. Set only for
+     * single-codepoint bases: appending after a ZWJ sequence is not the same
+     * operation, so those are left alone rather than made subtly wrong. */
+    uint8_t     tonable;
 } oc_emoji;
 
 enum {
@@ -38,11 +42,43 @@ enum {
     OC_EMOJI_CAT_COUNT
 };
 
+/* ---- skin tones -----------------------------------------------------------
+ * Unicode spells a skin tone as the base emoji followed by a Fitzpatrick
+ * modifier (U+1F3FB..U+1F3FF). It applies only to emoji that depict a person or
+ * a body part, which is what `oc_emoji.tonable` marks. */
+enum {
+    OC_SKIN_DEFAULT = 0,   /* the yellow base, no modifier */
+    OC_SKIN_LIGHT,
+    OC_SKIN_MEDIUM_LIGHT,
+    OC_SKIN_MEDIUM,
+    OC_SKIN_MEDIUM_DARK,
+    OC_SKIN_DARK,
+    OC_SKIN_COUNT
+};
+
+/* Display name of a tone ("Medium-light"), or "" if out of range. */
+const char *oc_emoji_skin_name(uint8_t tone);
+
+/* Write `e` with `tone` applied into `out` (NUL-terminated), returning the
+ * length written, or 0 if it would not fit. A tone of OC_SKIN_DEFAULT, an
+ * out-of-range tone, or an emoji that is not `tonable` all yield the base
+ * character unchanged — so a caller may apply a user's chosen tone blindly to
+ * anything in the catalogue and get the right answer. */
+size_t oc_emoji_with_tone(const oc_emoji *e, uint8_t tone, char *out, size_t cap);
+
+/* Upper bound on the catalogue's size, so a caller can size a hit buffer that
+ * cannot silently truncate. complete.c static-asserts the table against it: the
+ * build breaks if the catalogue outgrows this, rather than a picker quietly
+ * showing the first N and dropping whole categories off the end. */
+#define OC_EMOJI_MAX 1024
+
 /* The whole catalogue, and the display name of a category. */
 const oc_emoji *oc_emoji_all(size_t *count);
 const char     *oc_emoji_category_name(uint8_t category);
 
-/* The emoji for a shortcode ("fire", no colons), or NULL. */
+/* The emoji for a shortcode ("fire", no colons), or NULL. Also resolves the
+ * older spellings that shipped before the catalogue was expanded, so a message
+ * already stored with `:sweat_smile:` keeps rendering. */
 const char     *oc_emoji_by_name(const char *name);
 
 /* Fill `out` with catalogue entries matching `query` (matched against the
