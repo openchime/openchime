@@ -1,0 +1,368 @@
+# Publish a release of the daemon (ARCH-20).
+#
+# Until this existed the project shipped nothing: CI built the daemon on every
+# push and threw it away, the Dockerfile was never built by CI, and the image the
+# control plane provisions onto customer boxes was produced by hand. Four
+# channels come out of one run, all carrying the same release number:
+#
+#   apt      Debian/Ubuntu, GPG-signed repository on R2
+#   dnf/yum  RHEL family, GPG-signed repository on R2
+#   tarball  everyone else, and the offline case -- attached to the GitHub release
+#   image    GHCR, for the hosted model (Fly) and for anyone running Compose
+#
+# ONE BINARY PER ARCHITECTURE feeds the .deb, the .rpm and the tarball, so all
+# three ship a byte-identical artifact rather than three builds that merely came
+# from one source tree. It is built inside a rockylinux:9 container -- glibc 2.34,
+# the oldest target -- because the runner's own glibc is too new: a binary linked
+# against 2.35+ will not start on RHEL 9, and one linked here against the runner's
+# libc failed outright on Debian bookworm during development.
+#
+# The image is the deliberate exception: it stays an Alpine/musl build, so it
+# carries a different binary from the same source.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build and verify everything, publish nothing, tag nothing'
+        type: boolean
+        default: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # The same jobs a branch push runs. Reused, not re-implemented.
+  test:
+    name: gate on CI
+    uses: ./.github/workflows/ci.yml
+
+  version:
+    name: allocate the release number
+    needs: test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      number: ${{ steps.n.outputs.number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: n
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --quiet
+          # Computed up front, unlike the control plane which tags after the
+          # fact: a package version is the artifact's identity and has to exist
+          # before anything is built.
+          N=$(scripts/version.sh next)
+          echo "number=$N" >> "$GITHUB_OUTPUT"
+          echo "this release is $N (previous: $(scripts/version.sh current))"
+
+  packages:
+    name: ${{ matrix.arch }} packages
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            # Native, not cross-compiled: cross-building would need a
+            # foreign-architecture libsqlite3-dev and would leave the result
+            # untested on the architecture it targets.
+            runner: ubuntu-22.04-arm
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # One binary, built against the oldest glibc we support, then stripped
+      # once. Everything downstream consumes this exact file.
+      - name: Build the daemon (glibc 2.34)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker run --rm -v "$PWD:/src:ro" -v "$PWD/dist:/out" rockylinux:9 bash -c '
+            set -euo pipefail
+            # curl is NOT requested: Rocky ships curl-minimal and asking for
+            # curl makes dnf reject the whole transaction as a conflict.
+            dnf install -y -q gcc make sqlite-devel bzip2 tar findutils binutils rpm-build
+            cp -a /src /build && cd /build
+            make OC_VERSION='"$VERSION"' >/dev/null
+            strip openchimed -o /out/openchimed
+            packaging/build-rpm.sh '"$VERSION"' /out/openchimed /out >/dev/null
+          '
+          ./dist/openchimed --version
+
+      - name: Build the .deb and the tarball
+        run: |
+          set -euo pipefail
+          packaging/build-deb.sh     "$VERSION" "${{ matrix.arch }}" dist/openchimed dist
+          packaging/build-tarball.sh "$VERSION" "${{ matrix.arch }}" dist/openchimed dist
+
+      # Proves the three channels carry the same file. If this ever fails, the
+      # "one binary, packaged three ways" claim in the docs is false and should
+      # not be published.
+      - name: Verify all channels ship one identical binary
+        run: |
+          set -euo pipefail
+          want=$(sha256sum dist/openchimed | cut -d' ' -f1)
+          mkdir -p v/deb v/rpm v/tar
+          dpkg-deb -x dist/openchimed_${VERSION}_${{ matrix.arch }}.deb v/deb
+          ( cd v/rpm && rpm2cpio ../../dist/openchimed-${VERSION}-1.*.rpm | cpio -idm --quiet )
+          tar xzf dist/openchimed-${VERSION}-linux-${{ matrix.arch }}.tar.gz -C v/tar
+          for f in v/deb/usr/bin/openchimed v/rpm/usr/bin/openchimed \
+                   v/tar/openchimed-${VERSION}-linux-${{ matrix.arch }}/openchimed; do
+            got=$(sha256sum "$f" | cut -d' ' -f1)
+            [ "$got" = "$want" ] || { echo "::error::$f differs from the built binary"; exit 1; }
+          done
+          echo "all three channels ship $want"
+
+      # Install from the actual package in a clean container. A package that
+      # builds but does not install is precisely the failure this pipeline
+      # exists to catch, and only an install finds it.
+      - name: Clean-room install
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/dist:/pkg:ro" debian:bookworm bash -c '
+            set -e
+            apt-get update -qq >/dev/null
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq /pkg/openchimed_'"$VERSION"'_${{ matrix.arch }}.deb >/dev/null
+            /usr/bin/openchimed --version
+          '
+          docker run --rm -v "$PWD/dist:/pkg:ro" rockylinux:9 bash -c '
+            set -e
+            dnf install -y -q /pkg/openchimed-'"$VERSION"'-1.*.rpm >/dev/null 2>&1
+            /usr/bin/openchimed --version
+          '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  image:
+    name: container image
+    needs: version
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          build-args: OC_VERSION=${{ env.VERSION }}
+          push: ${{ inputs.dry_run == false }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/openchime:${{ env.VERSION }}
+            ghcr.io/${{ github.repository_owner }}/openchime:latest
+
+  publish:
+    name: publish repositories
+    needs: [version, packages, image]
+    if: inputs.dry_run == false
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write        # to push the release tag and create the GitHub release
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+      # R2 speaks the S3 API; rclone is configured from these.
+      R2_ACCOUNT_ID:  ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY:  ${{ secrets.R2_ACCESS_KEY }}
+      R2_SECRET_KEY:  ${{ secrets.R2_SECRET_KEY }}
+      R2_BUCKET:      ${{ secrets.R2_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: dist
+
+      - name: Install repository tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq apt-utils createrepo-c rclone gnupg
+
+      - name: Import the signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.REPO_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$GPG_PRIVATE_KEY" ] || { echo "::error::REPO_SIGNING_KEY is not set"; exit 1; }
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "GPG_KEY_ID=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')" >> "$GITHUB_ENV"
+
+      - name: Configure rclone for R2
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${R2_ACCESS_KEY}
+          secret_access_key = ${R2_SECRET_KEY}
+          endpoint = https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
+          EOF
+
+      # Both repositories are regenerated from the FULL pool, not from this
+      # release's packages alone. An index built from the new package only would
+      # silently drop every previous release the moment it was published.
+      - name: Publish the apt repository
+        run: |
+          set -euo pipefail
+          mkdir -p repo/apt
+          rclone copy "r2:${R2_BUCKET}/apt" repo/apt --fast-list || true
+
+          mkdir -p repo/apt/pool/main/o/openchimed
+          cp dist/*.deb repo/apt/pool/main/o/openchimed/
+
+          cd repo/apt
+          for arch in amd64 arm64; do
+            mkdir -p "dists/stable/main/binary-${arch}"
+            apt-ftparchive --arch "$arch" packages pool \
+              > "dists/stable/main/binary-${arch}/Packages"
+            gzip -9kf "dists/stable/main/binary-${arch}/Packages"
+          done
+
+          cat > /tmp/apt-release.conf <<'EOF'
+          APT::FTPArchive::Release::Origin "OpenChime";
+          APT::FTPArchive::Release::Label "OpenChime";
+          APT::FTPArchive::Release::Suite "stable";
+          APT::FTPArchive::Release::Codename "stable";
+          APT::FTPArchive::Release::Architectures "amd64 arm64";
+          APT::FTPArchive::Release::Components "main";
+          EOF
+          apt-ftparchive -c /tmp/apt-release.conf release dists/stable > dists/stable/Release
+
+          rm -f dists/stable/Release.gpg dists/stable/InRelease
+          gpg --batch --yes --local-user "$GPG_KEY_ID" -abs \
+              -o dists/stable/Release.gpg dists/stable/Release
+          gpg --batch --yes --local-user "$GPG_KEY_ID" --clearsign \
+              -o dists/stable/InRelease dists/stable/Release
+
+          cd ../..
+          rclone copy repo/apt "r2:${R2_BUCKET}/apt" --fast-list
+
+      - name: Publish the rpm repository
+        run: |
+          set -euo pipefail
+          mkdir -p repo/rpm
+          rclone copy "r2:${R2_BUCKET}/rpm" repo/rpm --fast-list || true
+          cp dist/*.rpm repo/rpm/
+
+          # Each package is signed individually -- rpm verifies package
+          # signatures, unlike apt which verifies the index.
+          cat > /tmp/rpmmacros <<EOF
+          %_gpg_name ${GPG_KEY_ID}
+          %__gpg_sign_cmd %{__gpg} gpg --batch --no-armor --no-secmem-warning -u "%{_gpg_name}" -sbo %{__signature_filename} %{__plaintext_filename}
+          EOF
+          HOME=/root || true
+          cp /tmp/rpmmacros ~/.rpmmacros
+          rpm --addsign repo/rpm/*.rpm
+
+          createrepo_c --update repo/rpm
+          gpg --batch --yes --local-user "$GPG_KEY_ID" --detach-sign --armor \
+              -o repo/rpm/repodata/repomd.xml.asc repo/rpm/repodata/repomd.xml
+
+          rclone copy repo/rpm "r2:${R2_BUCKET}/rpm" --fast-list
+
+      - name: Publish the public key and repo definitions
+        run: |
+          set -euo pipefail
+          mkdir -p repo/meta
+          gpg --export --armor "$GPG_KEY_ID" > repo/meta/openchime-archive-keyring.asc
+          gpg --export "$GPG_KEY_ID"         > repo/meta/openchime-archive-keyring.gpg
+          cat > repo/meta/openchime.repo <<EOF
+          [openchime]
+          name=OpenChime
+          baseurl=https://apt.openchime.io/rpm
+          enabled=1
+          gpgcheck=1
+          repo_gpgcheck=1
+          gpgkey=https://apt.openchime.io/openchime-archive-keyring.asc
+          EOF
+          rclone copy repo/meta "r2:${R2_BUCKET}/" --fast-list
+
+      # Installing from the PUBLISHED repository, not from a local file. This is
+      # the only step that proves signing, index generation and the R2 layout are
+      # all correct together; a local install would pass with a broken repo.
+      - name: Smoke the published repositories
+        run: |
+          set -euo pipefail
+          docker run --rm debian:bookworm bash -c '
+            set -e
+            apt-get update -qq >/dev/null
+            apt-get install -y -qq curl ca-certificates >/dev/null
+            curl -fsSL https://apt.openchime.io/openchime-archive-keyring.gpg \
+              -o /usr/share/keyrings/openchime-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] https://apt.openchime.io/apt stable main" \
+              > /etc/apt/sources.list.d/openchime.list
+            apt-get update -qq
+            apt-get install -y -qq openchimed
+            openchimed --version
+          '
+          docker run --rm rockylinux:9 bash -c '
+            set -e
+            curl -fsSL https://apt.openchime.io/openchime.repo -o /etc/yum.repos.d/openchime.repo
+            rpm --import https://apt.openchime.io/openchime-archive-keyring.asc
+            dnf install -y -q openchimed
+            openchimed --version
+          '
+
+      - name: Tag the release and attach the tarballs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git tag "release-${VERSION}" "$GITHUB_SHA"
+          git push origin "release-${VERSION}"
+          gh release create "release-${VERSION}" \
+            --title "release-${VERSION}" \
+            --notes "Daemon release ${VERSION}. Installs via apt and dnf (see README); the tarballs below are the offline install." \
+            dist/*.tar.gz dist/*.sha256
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Released \`${VERSION}\`"
+            echo
+            echo "| Channel | Where |"
+            echo "|---|---|"
+            echo "| apt | \`https://apt.openchime.io/apt stable main\` |"
+            echo "| dnf | \`https://apt.openchime.io/rpm\` |"
+            echo "| image | \`ghcr.io/${{ github.repository_owner }}/openchime:${VERSION}\` |"
+            echo "| tarball | attached to \`release-${VERSION}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

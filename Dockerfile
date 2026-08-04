@@ -13,11 +13,18 @@ COPY daemon ./daemon
 # mbedTLS, which scripts/build_mbedtls.sh downloads during `make` — so it must
 # be copied from the build context.
 COPY third_party/jsmn ./third_party/jsmn
-RUN make
+# Stamped by the release so a running container reports the release it came from
+# (`openchimed --version`). Unset for a local build, which reports "dev".
+ARG OC_VERSION=
+RUN make OC_VERSION="$OC_VERSION"
 
 FROM alpine:3.20
 
-RUN apk add --no-cache sqlite-libs sqlite ca-certificates
+# No `sqlite` CLI: the daemon creates and migrates its own database, and the
+# entrypoint no longer seeds one. ca-certificates is for the daemon's *outbound*
+# TLS only -- enrollment, push and S3 -- never for its own listener, which is
+# self-signed and pinned by the client (ARCH-10).
+RUN apk add --no-cache sqlite-libs ca-certificates
 
 COPY --from=build /src/openchimed /usr/local/bin/openchimed
 COPY entrypoint.sh /entrypoint.sh

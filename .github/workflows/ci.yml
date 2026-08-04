@@ -37,6 +37,11 @@ on:
       - '**.md'
       - '.gitignore'
       - '.env.example'
+  # Lets the release workflow gate on these exact jobs rather than re-implement
+  # them. A release that ran a weaker suite than CI would be worse than no gate,
+  # because it would look like one. Same arrangement the control-plane repo's
+  # deploys use.
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.ref }}
