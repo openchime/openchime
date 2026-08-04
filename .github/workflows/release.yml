@@ -108,10 +108,18 @@ jobs:
             make OC_VERSION='"$VERSION"' >/dev/null
             strip openchimed -o /out/openchimed
             packaging/build-rpm.sh '"$VERSION"' /out/openchimed /out >/dev/null
-            # mbedTLS is fetched and built on the container's own copy of the
-            # tree, so its licence text does not exist on the runner -- and
+            # mbedTLS is fetched and built on the copy of the tree inside this
+            # container, so its licence text does not exist on the runner -- and
             # licenses.sh refuses to package a binary without it, which is how
             # this was found. Carry the notice out with the binary it belongs to.
+            #
+            # NOTE: no apostrophes anywhere in this block, comments included.
+            # This whole script is a single-quoted string on the host, so one
+            # apostrophe closes it and every line after runs on the runner
+            # instead of in the container. Not hypothetical: the word
+            # "container" followed by an apostrophe-s, in this very comment,
+            # silently moved the two lines below onto the host, where mkdir
+            # tried to create /out at the filesystem root and was denied.
             mkdir -p /out/.mbedtls
             cp third_party/mbedtls-3.6.2/LICENSE /out/.mbedtls/LICENSE
           '

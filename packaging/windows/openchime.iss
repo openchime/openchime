@@ -95,8 +95,13 @@ Filename: "{app}\openchime.exe"; Description: "Launch OpenChime"; \
 Type: dirifempty; Name: "{app}"
 
 [Code]
-{ Appending unconditionally would grow PATH by one copy of {app} on every
-  repair or upgrade. }
+// Appending unconditionally would grow PATH by one copy of the install
+// directory on every repair or upgrade.
+//
+// Line comments, not a { } block: Pascal brace comments do not nest, so a
+// block comment mentioning an Inno constant like the app directory ends at
+// that constant's own closing brace and the rest of the sentence is compiled
+// as code. That is what "Column 66: 'BEGIN' expected" meant here.
 function NeedsAddPath(Param: string): Boolean;
 var
   Existing: string;
