@@ -108,6 +108,12 @@ jobs:
             make OC_VERSION='"$VERSION"' >/dev/null
             strip openchimed -o /out/openchimed
             packaging/build-rpm.sh '"$VERSION"' /out/openchimed /out >/dev/null
+            # mbedTLS is fetched and built on the container's own copy of the
+            # tree, so its licence text does not exist on the runner -- and
+            # licenses.sh refuses to package a binary without it, which is how
+            # this was found. Carry the notice out with the binary it belongs to.
+            mkdir -p /out/.mbedtls
+            cp third_party/mbedtls-3.6.2/LICENSE /out/.mbedtls/LICENSE
           '
           "./$DIST/openchimed" --version
 
@@ -116,6 +122,11 @@ jobs:
       # layout: the release pipeline owns where artifacts go, so one caller
       # decides it rather than three scripts agreeing by coincidence.
       - name: Build the .deb and the tarball
+        # The licence tree staged out of the container above. The .rpm was built
+        # inside it, where the real tree was still present, so only these two
+        # need pointing at the copy.
+        env:
+          MBEDTLS_DIR: ${{ github.workspace }}/dist/linux-${{ matrix.arch }}/.mbedtls
         run: |
           set -euo pipefail
           packaging/build-deb.sh     "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST"
@@ -214,7 +225,13 @@ jobs:
   windows-build:
     name: windows binaries
     needs: version
-    runs-on: ubuntu-22.04
+    # 24.04, matching ci.yml's windows job and for the same reason: 22.04's
+    # mingw-w64 headers declare IRawElementProviderSimple but not the
+    # fragment/text interfaces, so the UIA provider (ARCH-99) compiles to its
+    # stub. On 22.04 this job SUCCEEDS and ships a client whose accessibility
+    # provider is a no-op -- a different binary from the one CI validates.
+    # The release must build what CI tested.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.version.outputs.number }}
@@ -224,7 +241,16 @@ jobs:
       - name: Install the mingw-w64 toolchain
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq mingw-w64
+          # bzip2 and curl are for build_mbedtls_windows.sh below, which fetches
+          # and cross-builds the pinned tarball.
+          sudo apt-get install -y -qq mingw-w64 bzip2 curl
+
+      # Unlike the native build, the Makefile has no rule that produces the
+      # Windows mbedTLS archives, so nothing builds them implicitly: `make
+      # windows-gui` just fails with "No rule to make target". ci.yml runs this
+      # too -- the release omitted it, which is what this dry run found.
+      - name: Cross-build the vendored Windows mbedTLS
+        run: scripts/build_mbedtls_windows.sh
 
       - name: Build the GUI and the TUI
         run: |
