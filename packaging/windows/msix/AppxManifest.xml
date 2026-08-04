@@ -26,8 +26,9 @@
     xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
     xmlns:uap4="http://schemas.microsoft.com/appx/manifest/uap/windows10/4"
     xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+    xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
     xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-    IgnorableNamespaces="uap uap3 uap4 desktop rescap">
+    IgnorableNamespaces="uap uap3 uap4 desktop desktop4 rescap">
 
   <Identity
       Name="OpenChime.OpenChime"
@@ -82,7 +83,7 @@
          the package still presents as one app. -->
     <Application Id="OpenChimeTui" Executable="bin\openchime-tui.exe"
                  EntryPoint="Windows.FullTrustApplication"
-                 desktop:Subsystem="console">
+                 desktop4:Subsystem="console">
       <uap:VisualElements
           AppListEntry="none"
           DisplayName="OpenChime (terminal)"
