@@ -197,10 +197,36 @@ static void *health_thread(void *arg) {
     return NULL;
 }
 
-int main(void) {
+/* Stamped by the build (-DOC_VERSION=...). A source build that sets nothing
+ * reports "dev", which is the honest answer: only a release build carries a
+ * release number, and an operator comparing a running process against an
+ * installed package needs to be able to tell the two apart. */
+#ifndef OC_VERSION
+#define OC_VERSION "dev"
+#endif
+
+int main(int argc, char **argv) {
+    /* The only argument the daemon takes. Everything else is configuration, and
+     * configuration comes from the environment (ARCH-26) — so this is a version
+     * probe, not the beginning of a command-line interface. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
+            printf("openchimed %s (protocol %u)\n", OC_VERSION,
+                   (unsigned)OC_PROTOCOL_VERSION);
+            return 0;
+        }
+        fprintf(stderr, "openchimed: unknown argument '%s'\n", argv[i]);
+        fprintf(stderr, "usage: openchimed [--version]\n");
+        fprintf(stderr, "configuration is read from the environment; see CONFIG.md\n");
+        return 2;
+    }
+
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN); /* a peer vanishing mid-write must not kill us */
+
+    fprintf(stderr, "openchimed: version %s (protocol %u)\n", OC_VERSION,
+            (unsigned)OC_PROTOCOL_VERSION);
 
     /* All daemon config is read once, here, into the process-global oc_config
      * (config.c). Subsystems read it via oc_config_get(); nothing else touches

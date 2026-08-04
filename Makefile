@@ -2,6 +2,17 @@ CC ?= cc
 CFLAGS ?= -std=c99 -D_GNU_SOURCE -Wall -Wextra -O2
 LDFLAGS ?= -lsqlite3 -lpthread
 
+# Release identity (ARCH-20). The release workflow passes the release number it
+# is about to publish (OC_VERSION=7); a source build leaves it unset and the
+# daemon reports "dev". Only the daemon takes it — the tests link the same
+# objects and have no use for it.
+OC_VERSION ?=
+ifneq ($(OC_VERSION),)
+VERSION_DEF := -DOC_VERSION='"$(OC_VERSION)"'
+else
+VERSION_DEF :=
+endif
+
 BIN := openchimed
 
 # The tree is split into three concerns: shared/ is the wire contract (linked by
@@ -85,7 +96,7 @@ run: $(BIN) $(TUI_BIN)
 	 OPENCHIME_BOOTSTRAP_USERS="alice:pw:owner,bob:pw:member" ./$(BIN)
 
 $(BIN): $(SRC) $(MBEDTLS_A) $(HDRS)
-	$(CC) $(CFLAGS) $(INC) -o $@ $(SRC) $(MBEDTLS_LIBS) $(LDFLAGS)
+	$(CC) $(CFLAGS) $(VERSION_DEF) $(INC) -o $@ $(SRC) $(MBEDTLS_LIBS) $(LDFLAGS)
 
 $(MBEDTLS_A):
 	scripts/build_mbedtls.sh
