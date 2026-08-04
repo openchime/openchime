@@ -81,9 +81,16 @@
          alias is the whole point, since a console program nobody can type the
          name of is unreachable. AppListEntry="none" keeps it out of Start so
          the package still presents as one app. -->
+    <!-- SupportsMultipleInstances is not optional here: the packaging tooling
+         refuses Subsystem="console" without it. That is a sensible requirement
+         rather than a quirk, since a terminal client restricted to one running
+         window would be a poor terminal client.
+         (No double hyphens anywhere in this comment: XML forbids them inside
+         a comment, and one here made the whole manifest unparseable.) -->
     <Application Id="OpenChimeTui" Executable="bin\openchime-tui.exe"
                  EntryPoint="Windows.FullTrustApplication"
-                 desktop4:Subsystem="console">
+                 desktop4:Subsystem="console"
+                 desktop4:SupportsMultipleInstances="true">
       <uap:VisualElements
           AppListEntry="none"
           DisplayName="OpenChime (terminal)"
