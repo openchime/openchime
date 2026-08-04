@@ -79,6 +79,57 @@ so editing a profile drops the connection. Remaining
 server-side scope includes a CA-signed certificate for the webhook endpoint
 (REQ-171).
 
+## Install the daemon
+
+Four channels, one release number (ARCH-20). Packages are signed; the daemon
+runs under systemd as a transient user with its state in `/var/lib/openchime`.
+
+**Debian / Ubuntu** — bookworm or 22.04 and newer:
+
+```sh
+curl -fsSL https://apt.openchime.io/openchime-archive-keyring.gpg \
+  | sudo tee /usr/share/keyrings/openchime-archive-keyring.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] https://apt.openchime.io/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/openchime.list
+sudo apt update && sudo apt install openchimed
+```
+
+**RHEL / Rocky / Alma / Fedora** — RHEL 9 and newer:
+
+```sh
+sudo curl -fsSL https://apt.openchime.io/openchime.repo -o /etc/yum.repos.d/openchime.repo
+sudo rpm --import https://apt.openchime.io/openchime-archive-keyring.asc
+sudo dnf install openchimed
+```
+
+**Anything else, and the offline case.** The tarballs on each
+[release](https://github.com/dannyheskett/openchime/releases) carry the binary,
+the unit and the config with an `install.sh`. Nothing is fetched at install
+time — TLS is statically linked — so this is the channel for an air-gapped box.
+Verify the `.sha256` beside it.
+
+**Container** — for Compose, or any container runtime:
+
+```sh
+docker run ghcr.io/dannyheskett/openchime:latest --version
+```
+
+After installing, the daemon starts and mints a one-time owner setup token:
+
+```sh
+journalctl -u openchimed | grep -i 'setup token'
+```
+
+Configuration is entirely environment variables in
+`/etc/openchime/openchimed.env` (every one of them:
+[docs/CONFIG.md](docs/CONFIG.md)). It listens on **8443** out of the box so
+installing cannot collide with a web server on 443; switch
+`OPENCHIME_PROTO_PORT=443` for a real deployment, which needs no root because
+the unit already carries `CAP_NET_BIND_SERVICE`.
+
+**Requirements:** glibc **2.34+** and libsqlite3. Everything else, TLS included,
+is statically linked. Debian bullseye (glibc 2.31) is too old.
+
 ## Local build (daemon)
 
 ```
@@ -86,7 +137,20 @@ make
 ```
 
 Requires a C toolchain and SQLite development headers (`sqlite3.h`,
-`libsqlite3`) on the host.
+`libsqlite3`) on the host. `make OC_VERSION=<n>` stamps a release number into
+`openchimed --version`; an unstamped build reports `dev`.
+
+To build the distributable packages from an already-built binary:
+
+```sh
+packaging/build-deb.sh     <version> amd64 ./openchimed dist
+packaging/build-rpm.sh     <version>       ./openchimed dist   # needs rpmbuild
+packaging/build-tarball.sh <version> amd64 ./openchimed dist
+```
+
+Note the release does **not** build with the host toolchain: it builds inside a
+`rockylinux:9` container so the binary links against glibc 2.34, the oldest
+target. A binary built on a newer host will not start on an older one.
 
 ## Client (app-core + native frontends)
 

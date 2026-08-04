@@ -12,6 +12,16 @@ ever fetched from a control plane at runtime, in any deployment model — a
 federated deployment contacts its opted-in services for their own function, never
 to learn how to run (ARCH-26/76).
 
+**The packages ship an `EnvironmentFile`, and it is not decoration.** The `.deb`,
+`.rpm` and tarball install `/etc/openchime/openchimed.env` and the unit reads it.
+It is marked as configuration (`conffiles` / `%config(noreplace)`), so an
+upgrade preserves your edits. It **must** override the path defaults below: those
+point at `/data`, which suits the container image, whereas the systemd unit runs
+with `ProtectSystem=strict` and a `StateDirectory`, making `/var/lib/openchime`
+the only writable path. The shipped file repoints the database, blobs and TLS
+identity there. The table's defaults are therefore what the *binary* does, not
+what a packaged install does.
+
 **Deprecated aliases.** Variables marked *alias* also accept an older `OC_`-
 prefixed spelling. The alias still works and logs a one-line deprecation warning
 to stderr; prefer the `OPENCHIME_` name.

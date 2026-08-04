@@ -470,7 +470,17 @@ Full design and rationale in [AUTH.md](./AUTH.md).
 
 ## Packaging and Distribution
 
-- **ARCH-20 (Linux, self-hosted):** apt / `.deb` with a systemd unit, from a GPG-signed repo the project hosts on R2. Package distribution is a federated function (ARCH-76): a stand-alone operator who wants zero dependency on the project builds from source or mirrors the repo instead. This is a build/update-time dependency only — nothing about the running daemon differs either way.
+- **ARCH-20 (Linux, self-hosted): BUILT.** apt / `.deb` with a systemd unit, from a GPG-signed repo the project hosts on R2. Package distribution is a federated function (ARCH-76): a stand-alone operator who wants zero dependency on the project builds from source or mirrors the repo instead. This is a build/update-time dependency only — nothing about the running daemon differs either way.
+
+  **Amended, four channels rather than one.** apt alone left the RHEL family and the offline case unserved, so the release publishes: **apt** (Debian/Ubuntu), **dnf/yum** (RHEL family — a second GPG-signed repository beside the first), a **portable tarball**, and an **OCI image** on GHCR. The image is not a duplicate of the packages: the hosted model (ARCH-76 model 3) provisions Fly Machines, which ingest an image and cannot install a package, and it also serves anyone running the Compose stack (ARCH-36). *The tarball exists because the original text was not quite true:* "builds from source" runs `scripts/build_mbedtls.sh`, which downloads mbedTLS from GitHub — so the advertised zero-dependency path required the network. The tarball is the one that does not.
+
+  **One binary per architecture** feeds the `.deb`, the `.rpm` and the tarball, and CI fails the release if the three do not carry a byte-identical file. It is built inside a `rockylinux:9` container — **glibc 2.34**, the oldest supported target — because a binary linked against a newer libc will not start on an older one. That sets the floor: Ubuntu 22.04+, Debian bookworm+, RHEL 9+; **Debian bullseye (glibc 2.31) is not supported**. The image is the deliberate exception, staying an Alpine/musl build, so it carries a different binary from the same source.
+
+  **Versioning is `release-N`**, the sibling control plane's scheme — a monotonically increasing integer, and the package version *is* that number. One difference: the control plane tags after a successful deploy because its artifact is identified by a commit sha, whereas a package version is the artifact's identity and must exist before the build, so the release allocates `N` up front and tags only on success. *A bare integer cannot later become SemVer:* dpkg compares the first component numerically, so `0.1.0` sorts below `5`, and the move would need an epoch.
+
+  **Signing-key custody, recorded rather than assumed.** The repository signing key's private half is a GitHub Actions secret, so any workflow able to publish is able to sign, and a leak lets an attacker serve packages to every self-hoster who trusts the key. This is the same class of trade the control-plane repo records for `Fly__ApiToken` (its SECURITY.md §2). Offline custody with a publishing subkey is the improvement, deferred rather than done.
+
+  **Distributing binaries carries attribution obligations that building from source did not.** `openchimed` links mbedTLS (Apache-2.0) and jsmn (MIT); both require their notice to accompany the binary. Every channel ships the full texts, assembled by `packaging/licenses.sh` from the trees the build actually used so they cannot drift from what was linked.
 - **ARCH-21 (Windows):** Microsoft Store via MSIX packaging, chosen to avoid an Authenticode cert purchase.
 
 ## Local Development and Build

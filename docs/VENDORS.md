@@ -32,7 +32,32 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **termbox2** | v2.5.0 | Terminal cell grid + input | tuikit (→ TUI) | https://github.com/termbox/termbox2 | MIT |
 | **utf8proc** | v2.11.3 | Unicode width + grapheme segmentation (correct emoji/CJK width) | tuikit (→ TUI) | https://github.com/JuliaStrings/utf8proc | MIT (bundled Unicode data under the Unicode license) |
 | **jsmn** | commit-pinned (upstream has no release tags) | Minimal JSON tokenizer | Daemon (OIDC/webhook JSON) | https://github.com/zserge/jsmn | MIT |
-| ~~**SQLite (amalgamation)**~~ | — | **Removed (ARCH-88).** It was vendored so the Windows *client* could have a store; no client embeds a database engine any more, and `third_party/sqlite` is deleted. The daemon still uses system SQLite. | — | — | — |
+| ~~**SQLite (amalgamation)**~~ | — | **Removed (ARCH-88).** It was vendored so the Windows *client* could have a store; no client embeds a database engine any more, and `third_party/sqlite` is deleted. The daemon still uses system SQLite — see below for why it stays that way. | — | — | — |
+
+**Why the daemon keeps system SQLite rather than vendoring it back (ARCH-20).**
+Packaging the daemon raised the question, since a statically linked SQLite would
+leave the `.deb` and `.rpm` depending on nothing but glibc. It stays dynamic
+deliberately: mbedTLS is already static, so **we** already own TLS CVE response,
+and static-linking SQLite would double that — every SQLite CVE would need an
+OpenChime release and an operator upgrade, where today `apt upgrade` or `dnf
+update` fixes it with no action from us. For software distributed *through* those
+package managers, the distribution's security path is the feature. `libsqlite3-0`
+(Debian) / `sqlite-libs` (RHEL) is present on essentially every system, so the
+dependency costs close to nothing. The counter-argument is real and recorded: the
+control-plane repo had to pin SQLite forward past CVE-2025-6965 — but that was a
+native library bundled into a container, which has no distribution update path,
+which is exactly the situation apt and dnf avoid.
+
+**Attribution when shipping binaries.** Building from source never triggered the
+vendored licences' notice requirements; distributing packages does. `openchimed`
+links **mbedTLS** (Apache-2.0) and **jsmn** (MIT), and every channel ships both
+texts in full — `/usr/share/doc/openchimed/copyright` on Debian,
+`/usr/share/licenses/openchimed/copyright` on RHEL, `COPYRIGHT` in the tarball.
+`packaging/licenses.sh` reads them out of the trees the build actually used, so
+the notice cannot drift from what was linked, and it **fails the build** if a
+licence file is missing rather than shipping a binary without one. termbox2,
+utf8proc and lucide are deliberately absent from that file: they are TUI and
+client components, and none is linked into the daemon.
 
 Since **ARCH-83**, `tuikit/` is the in-tree toolbox wrapping termbox2 + utf8proc
 (terminal layer + width handling), which the TUI builds on. `client/tui/main.c`
