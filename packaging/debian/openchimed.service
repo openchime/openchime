@@ -1,0 +1,60 @@
+# OpenChime daemon, self-hosted (ARCH-20).
+#
+# Logs go to stderr and journald collects them (ARCH-53) — `journalctl -u
+# openchimed`. There is no log file and no syslog configuration to do.
+
+[Unit]
+Description=OpenChime daemon
+Documentation=https://github.com/dannyheskett/openchime
+# The daemon binds listeners and, in a federated deployment, makes outbound
+# calls at startup (enrollment, ARCH-84). Waiting for a routable address avoids
+# a first-boot failure that a restart would silently paper over.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# `exec` rather than `simple`: systemd then reports a failure to *execute* as a
+# start failure, instead of reporting success and letting the unit die a moment
+# later.
+Type=exec
+ExecStart=/usr/bin/openchimed
+
+# All configuration is environment (ARCH-26); this is the systemd expression of
+# it. Leading `-` so a deleted file is not a start failure — the daemon has
+# defaults for everything.
+EnvironmentFile=-/etc/openchime/openchimed.env
+
+# A transient system user allocated at start, with no entry in /etc/passwd and
+# nothing to clean up on purge. StateDirectory gives /var/lib/openchime owned by
+# that user, which is where the database, blobs and TLS identity live.
+DynamicUser=yes
+StateDirectory=openchime
+# 0700: the directory holds the TLS private key and the message database.
+StateDirectoryMode=0700
+
+# ARCH-54 wants port 443 in production, which is privileged. This grants exactly
+# that one capability and nothing else, so the daemon can bind low ports without
+# ever being root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+# AF_UNIX is not optional: the daemon forks an audio relay sidecar (ARCH-28) and
+# talks to it over a Unix socket pair. AF_INET/AF_INET6 cover the listeners and
+# the sidecar's UDP socket.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
