@@ -9,6 +9,8 @@
 #   dnf/yum  RHEL family, GPG-signed repository on R2
 #   tarball  everyone else, and the offline case -- attached to the GitHub release
 #   image    GHCR, for the hosted model (Fly) and for anyone running Compose
+#   windows  the client, not the daemon: a signed installer attached to the
+#            GitHub release, and an MSIX for the Store
 #
 # ONE BINARY PER ARCHITECTURE feeds the .deb, the .rpm and the tarball, so all
 # three ship a byte-identical artifact rather than three builds that merely came
@@ -82,6 +84,12 @@ jobs:
             runner: ubuntu-22.04-arm
     env:
       VERSION: ${{ needs.version.outputs.number }}
+      # Every artifact this job produces lands under dist/<platform>/, which is
+      # also the artifact's name -- see the upload at the end of the job for why
+      # those two being the same string is what keeps the layout intact across
+      # the artifact round-trip.
+      PLATFORM: linux-${{ matrix.arch }}
+      DIST: dist/linux-${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v4
 
@@ -90,8 +98,8 @@ jobs:
       - name: Build the daemon (glibc 2.34)
         run: |
           set -euo pipefail
-          mkdir -p dist
-          docker run --rm -v "$PWD:/src:ro" -v "$PWD/dist:/out" rockylinux:9 bash -c '
+          mkdir -p "$DIST"
+          docker run --rm -v "$PWD:/src:ro" -v "$PWD/$DIST:/out" rockylinux:9 bash -c '
             set -euo pipefail
             # curl is NOT requested: Rocky ships curl-minimal and asking for
             # curl makes dnf reject the whole transaction as a conflict.
@@ -101,13 +109,17 @@ jobs:
             strip openchimed -o /out/openchimed
             packaging/build-rpm.sh '"$VERSION"' /out/openchimed /out >/dev/null
           '
-          ./dist/openchimed --version
+          "./$DIST/openchimed" --version
 
+      # The build-*.sh scripts take an output directory and default to a bare
+      # dist/. They are deliberately left knowing nothing about the per-platform
+      # layout: the release pipeline owns where artifacts go, so one caller
+      # decides it rather than three scripts agreeing by coincidence.
       - name: Build the .deb and the tarball
         run: |
           set -euo pipefail
-          packaging/build-deb.sh     "$VERSION" "${{ matrix.arch }}" dist/openchimed dist
-          packaging/build-tarball.sh "$VERSION" "${{ matrix.arch }}" dist/openchimed dist
+          packaging/build-deb.sh     "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST"
+          packaging/build-tarball.sh "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST"
 
       # Proves the three channels carry the same file. If this ever fails, the
       # "one binary, packaged three ways" claim in the docs is false and should
@@ -115,11 +127,11 @@ jobs:
       - name: Verify all channels ship one identical binary
         run: |
           set -euo pipefail
-          want=$(sha256sum dist/openchimed | cut -d' ' -f1)
+          want=$(sha256sum "$DIST/openchimed" | cut -d' ' -f1)
           mkdir -p v/deb v/rpm v/tar
-          dpkg-deb -x dist/openchimed_${VERSION}_${{ matrix.arch }}.deb v/deb
-          ( cd v/rpm && rpm2cpio ../../dist/openchimed-${VERSION}-1.*.rpm | cpio -idm --quiet )
-          tar xzf dist/openchimed-${VERSION}-linux-${{ matrix.arch }}.tar.gz -C v/tar
+          dpkg-deb -x "$DIST/openchimed_${VERSION}_${{ matrix.arch }}.deb" v/deb
+          ( cd v/rpm && rpm2cpio ../../"$DIST"/openchimed-${VERSION}-1.*.rpm | cpio -idm --quiet )
+          tar xzf "$DIST/openchimed-${VERSION}-linux-${{ matrix.arch }}.tar.gz" -C v/tar
           for f in v/deb/usr/bin/openchimed v/rpm/usr/bin/openchimed \
                    v/tar/openchimed-${VERSION}-linux-${{ matrix.arch }}/openchimed; do
             got=$(sha256sum "$f" | cut -d' ' -f1)
@@ -133,26 +145,32 @@ jobs:
       - name: Clean-room install
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD/dist:/pkg:ro" debian:bookworm bash -c '
+          docker run --rm -v "$PWD/$DIST:/pkg:ro" debian:bookworm bash -c '
             set -e
             apt-get update -qq >/dev/null
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq /pkg/openchimed_'"$VERSION"'_${{ matrix.arch }}.deb >/dev/null
             /usr/bin/openchimed --version
           '
-          docker run --rm -v "$PWD/dist:/pkg:ro" rockylinux:9 bash -c '
+          docker run --rm -v "$PWD/$DIST:/pkg:ro" rockylinux:9 bash -c '
             set -e
             dnf install -y -q /pkg/openchimed-'"$VERSION"'-1.*.rpm >/dev/null 2>&1
             /usr/bin/openchimed --version
           '
 
+      # The artifact is NAMED for the platform, and the publish job downloads
+      # without merge-multiple. That combination is what rebuilds dist/<platform>/
+      # on the other side: upload-artifact strips the common path prefix, so the
+      # directory only survives the round-trip by being the artifact's name.
+      # The stripped binary is not uploaded -- it ships inside all three packages
+      # and the step above proves they are identical.
       - uses: actions/upload-artifact@v4
         with:
-          name: packages-${{ matrix.arch }}
+          name: ${{ env.PLATFORM }}
           path: |
-            dist/*.deb
-            dist/*.rpm
-            dist/*.tar.gz
-            dist/*.sha256
+            ${{ env.DIST }}/*.deb
+            ${{ env.DIST }}/*.rpm
+            ${{ env.DIST }}/*.tar.gz
+            ${{ env.DIST }}/*.sha256
           if-no-files-found: error
 
   image:
@@ -184,9 +202,165 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/openchime:${{ env.VERSION }}
             ghcr.io/${{ github.repository_owner }}/openchime:latest
 
+  # The Windows client (ARCH-80/81). It carries the same release number as the
+  # daemon even though it is a separate program, so a support question only ever
+  # needs one number.
+  #
+  # Split across two runners for one reason: the binaries cross-compile with
+  # mingw-w64 on Linux, exactly as `make windows-gui` does locally, but
+  # Authenticode signing and MSIX packaging (makeappx.exe) exist only on
+  # Windows. Compiling on windows-latest instead would mean maintaining a
+  # second, otherwise-unused toolchain for the same source.
+  windows-build:
+    name: windows binaries
+    needs: version
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the mingw-w64 toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mingw-w64
+
+      - name: Build the GUI and the TUI
+        run: |
+          set -euo pipefail
+          make OC_VERSION="$VERSION" windows-gui windows-tui
+          # Both are statically linked, so nothing downstream has to chain a
+          # redistributable. If that ever stops being true the installer will
+          # still build and the app will fail to start on a clean machine, so
+          # it is asserted here rather than discovered there.
+          for f in build/openchime.exe build/openchime-tui.exe; do
+            file "$f" | grep -q 'PE32+' || { echo "::error::$f is not a PE32+ binary"; exit 1; }
+          done
+
+      # Named for the toolchain, not the platform: these are the unpackaged
+      # compiler outputs handed to the next job, not a release artifact. The
+      # publish job collects dist/<platform>/ by matching `windows-*`, and this
+      # must not be caught by that.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mingw-binaries
+          path: |
+            build/openchime.exe
+            build/openchime-tui.exe
+          if-no-files-found: error
+
+  windows-package:
+    name: windows installers
+    needs: [version, windows-build]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+      # Signing is gated on a real release. A dry run produces the same
+      # artifacts unsigned and never reads the credentials, which is also what
+      # makes this job safe to run from a fork.
+      SIGN: ${{ inputs.dry_run == false }}
+      # Same convention as the packages job: artifacts land in dist/<platform>/
+      # and the artifact is named for that platform. build/ stays the staging
+      # area -- the unpackaged binaries and the MSIX layout are inputs to a
+      # package, not outputs of one, and the .iss reads them from there.
+      PLATFORM: windows-x64
+      DIST: dist/windows-x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: mingw-binaries
+          path: build
+
+      # The SDK ships on the runner image but is not on PATH, and its versioned
+      # directory moves with each image update, so it is discovered rather than
+      # pinned to a build number that would silently rot.
+      - name: Locate the Windows SDK
+        shell: pwsh
+        run: |
+          $bin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $sdk = Get-ChildItem $bin -Directory -ErrorAction Stop |
+                 Where-Object Name -match '^10\.' | Sort-Object Name | Select-Object -Last 1
+          if (-not $sdk) { throw "no Windows 10 SDK under $bin" }
+          Write-Host "using SDK $($sdk.Name)"
+          "$($sdk.FullName)\x64" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+
+      # Signed before packaging, not after: both the installer and the MSIX
+      # embed these files, so signing them afterwards would leave the copies
+      # inside the packages unsigned.
+      - name: Sign the binaries
+        if: env.SIGN == 'true'
+        uses: azure/trusted-signing-action@v0
+        with:
+          endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+          files-folder: build
+          files-folder-filter: exe
+          file-digest: SHA256
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          # DIST is written with forward slashes because upload-artifact's globs
+          # require them; ISCC is given the backslash form rather than trusting
+          # it to normalise a path handed to /O.
+          $out = $env:DIST -replace '/','\'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+              "/DVersion=$env:VERSION" "/O$out" packaging\windows\openchime.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+      - name: Sign the installer
+        if: env.SIGN == 'true'
+        uses: azure/trusted-signing-action@v0
+        with:
+          endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+          files-folder: ${{ env.DIST }}
+          files-folder-filter: exe
+          file-digest: SHA256
+
+      # Left unsigned on purpose: a Store submission is re-signed by Microsoft,
+      # and signing it here with our own certificate would be discarded. A
+      # sideloadable .msix is a different artifact and would need one.
+      - name: Build the MSIX
+        shell: pwsh
+        run: |
+          $stage = 'build\msix'
+          New-Item -ItemType Directory -Force "$stage\bin" | Out-Null
+          Copy-Item packaging\windows\msix\* $stage -Recurse -Force
+          Copy-Item build\*.exe "$stage\bin"
+
+          # version.sh hands out a bare integer; MSIX requires a.b.c.d with the
+          # fourth field reserved for the Store, so the release number lands in
+          # the third. Monotonic, which is all the Store checks.
+          $m = "$stage\AppxManifest.xml"
+          (Get-Content $m -Raw).Replace('Version="1.0.0.0"', "Version=`"1.0.$env:VERSION.0`"") |
+            Set-Content $m -Encoding utf8
+
+          # Without a resources.pri the scale-N asset variants are inert and
+          # the tile renders from the scale-100 file at every DPI.
+          makepri.exe createconfig /cf "$stage\priconfig.xml" /dq en-US /o
+          makepri.exe new /pr $stage /cf "$stage\priconfig.xml" /of "$stage\resources.pri" /o
+          Remove-Item "$stage\priconfig.xml"
+
+          $out = $env:DIST -replace '/','\'
+          makeappx.exe pack /d $stage /p "$out\openchime-$env:VERSION.msix" /o
+          if ($LASTEXITCODE -ne 0) { throw "makeappx failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PLATFORM }}
+          path: ${{ env.DIST }}/*
+          if-no-files-found: error
+
   publish:
     name: publish repositories
-    needs: [version, packages, image]
+    needs: [version, packages, image, windows-package]
     if: inputs.dry_run == false
     runs-on: ubuntu-22.04
     timeout-minutes: 30
@@ -204,16 +378,37 @@ jobs:
         with:
           fetch-depth: 0
 
+      # merge-multiple is deliberately absent: without it each artifact unpacks
+      # into a directory named after itself, and since every producing job names
+      # its artifact for its platform, that reconstitutes dist/<platform>/ here.
+      # Turning it on would flatten all three platforms into one directory,
+      # which is what put a Windows .exe within reach of the Debian pool glob
+      # below.
+      #
+      # Two patterns rather than a bare `*`, so the intermediate mingw-binaries
+      # artifact -- unpackaged compiler output, not a release artifact -- is not
+      # dragged in as a fourth platform.
       - uses: actions/download-artifact@v4
         with:
-          pattern: packages-*
-          merge-multiple: true
+          pattern: linux-*
           path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*
+          path: dist
+
+      - name: Show what will be published
+        run: find dist -type f | sort
 
       - name: Install repository tooling
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq apt-utils createrepo-c rclone gnupg
+          # `rpm` is not optional and not implied: createrepo-c pulls librpm's
+          # shared libraries but not the rpm binary, and an Ubuntu runner has
+          # neither rpm nor rpmsign preinstalled. Without it the rpm repository
+          # step fails at `rpm --addsign` with command-not-found -- in a job the
+          # dry run skips, so it would only ever surface on a real release.
+          sudo apt-get install -y -qq apt-utils createrepo-c rclone gnupg rpm
 
       - name: Import the signing key
         env:
@@ -246,7 +441,7 @@ jobs:
           rclone copy "r2:${R2_BUCKET}/apt" repo/apt --fast-list || true
 
           mkdir -p repo/apt/pool/main/o/openchimed
-          cp dist/*.deb repo/apt/pool/main/o/openchimed/
+          cp dist/linux-*/*.deb repo/apt/pool/main/o/openchimed/
 
           cd repo/apt
           for arch in amd64 arm64; do
@@ -280,7 +475,7 @@ jobs:
           set -euo pipefail
           mkdir -p repo/rpm
           rclone copy "r2:${R2_BUCKET}/rpm" repo/rpm --fast-list || true
-          cp dist/*.rpm repo/rpm/
+          cp dist/linux-*/*.rpm repo/rpm/
 
           # Each package is signed individually -- rpm verifies package
           # signatures, unlike apt which verifies the index.
@@ -288,7 +483,8 @@ jobs:
           %_gpg_name ${GPG_KEY_ID}
           %__gpg_sign_cmd %{__gpg} gpg --batch --no-armor --no-secmem-warning -u "%{_gpg_name}" -sbo %{__signature_filename} %{__plaintext_filename}
           EOF
-          HOME=/root || true
+          # rpm reads ~/.rpmmacros for the invoking user, so this must land in the
+          # home directory of whoever runs the next line -- not root's.
           cp /tmp/rpmmacros ~/.rpmmacros
           rpm --addsign repo/rpm/*.rpm
 
@@ -348,10 +544,13 @@ jobs:
           set -euo pipefail
           git tag "release-${VERSION}" "$GITHUB_SHA"
           git push origin "release-${VERSION}"
+          # The .msix is deliberately NOT attached. It is unsigned, because the
+          # Store re-signs on submission, so a downloaded copy will not install
+          # -- it is a build artifact for Partner Center, not a release asset.
           gh release create "release-${VERSION}" \
             --title "release-${VERSION}" \
-            --notes "Daemon release ${VERSION}. Installs via apt and dnf (see README); the tarballs below are the offline install." \
-            dist/*.tar.gz dist/*.sha256
+            --notes "Release ${VERSION}. The daemon installs via apt and dnf (see README); the tarballs below are the offline install. The Windows client installer is attached." \
+            dist/linux-*/*.tar.gz dist/linux-*/*.sha256 dist/windows-x64/*-setup.exe
 
       - name: Summary
         if: always()
@@ -365,4 +564,88 @@ jobs:
             echo "| dnf | \`https://apt.openchime.io/rpm\` |"
             echo "| image | \`ghcr.io/${{ github.repository_owner }}/openchime:${VERSION}\` |"
             echo "| tarball | attached to \`release-${VERSION}\` |"
+            echo "| windows | installer attached to \`release-${VERSION}\`; \`.msix\` in the \`windows-x64\` artifact |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # WinGet. This is NOT the shape of the apt and dnf publishing above, despite
+  # sitting in the same position in the pipeline: there is no repository to
+  # host, no index to generate, and nothing to GPG-sign. Microsoft hosts the
+  # index and the GitHub release already serves the installer, so the entire
+  # channel is three YAML files submitted as a pull request.
+  #
+  # It runs AFTER publish rather than beside it, because the manifest points at
+  # a release asset URL. Submitting first would hand winget-pkgs' automated
+  # validation a 404.
+  #
+  # On Windows only because wingetcreate is a Windows executable. Nothing else
+  # in this job needs it -- render.sh runs under Git Bash exactly as it does on
+  # a developer's machine.
+  winget:
+    name: submit to winget
+    needs: [version, publish]
+    if: inputs.dry_run == false
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+      # A classic PAT with public_repo. The default GITHUB_TOKEN cannot be used:
+      # submission forks microsoft/winget-pkgs and opens a PR there, which is
+      # outside this repository's scope entirely.
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/windows-x64
+
+      # Checked before any work: the release is already published at this point,
+      # so a missing token is a real failure to surface, not something to skip
+      # past quietly and leave the package silently a version behind.
+      - name: Check the submission token
+        shell: bash
+        run: |
+          [ -n "$WINGET_TOKEN" ] || {
+            echo "::error::WINGET_TOKEN is not set; release ${VERSION} is published but not submitted to WinGet"
+            exit 1
+          }
+
+      # The URL is derived from the file actually attached to the release rather
+      # than reconstructed from the version, so a change to the installer's
+      # OutputBaseFilename cannot leave the manifest pointing at a name that was
+      # never uploaded.
+      - name: Render the manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          installer=$(ls dist/windows-x64/*-setup.exe)
+          url="https://github.com/${{ github.repository }}/releases/download/release-${VERSION}/$(basename "$installer")"
+          echo "installer: $installer"
+          echo "url:       $url"
+          packaging/windows/winget/render.sh "$VERSION" "$installer" "$url" dist/winget
+          cat dist/winget/*.installer.yaml
+
+      - name: Install wingetcreate
+        shell: pwsh
+        run: Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+
+      # Forks winget-pkgs under the token's account, commits the three files to
+      # manifests/o/OpenChime/OpenChime/<version>/, and opens the PR. Merging is
+      # gated on Microsoft's automated validation plus moderation, so the
+      # package goes live some time after this job is green -- minutes to days.
+      - name: Submit the pull request
+        shell: pwsh
+        run: |
+          .\wingetcreate.exe submit --token $env:WINGET_TOKEN dist\winget
+          if ($LASTEXITCODE -ne 0) { throw "wingetcreate submit failed" }
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### WinGet"
+            echo
+            echo "Submitted \`OpenChime.OpenChime\` version \`${VERSION}\` to microsoft/winget-pkgs."
+            echo "It becomes installable once that PR passes validation and is merged."
           } >> "$GITHUB_STEP_SUMMARY"

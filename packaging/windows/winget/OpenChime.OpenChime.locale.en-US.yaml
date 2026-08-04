@@ -1,0 +1,36 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+#
+# What `winget show OpenChime.OpenChime` displays. Nothing here affects
+# installation or upgrade detection.
+PackageIdentifier: OpenChime.OpenChime
+PackageVersion: "@VERSION@"
+PackageLocale: en-US
+
+Publisher: OpenChime
+PublisherUrl: https://openchime.io
+PublisherSupportUrl: https://openchime.io
+PackageName: OpenChime
+PackageUrl: https://openchime.io
+
+# The daemon and the client share a source tree that is not public, so the
+# binary ships under the same terms packaging/licenses.sh states.
+License: Proprietary
+Copyright: Copyright (c) Danny Heskett. All rights reserved.
+
+ShortDescription: Desktop client for a self-hostable business chat system.
+Description: |-
+  The Windows client for OpenChime, a self-hostable business chat system. It
+  connects to an OpenChime daemon that you or your organisation runs; there is
+  no OpenChime-operated service in the message path.
+
+  The installer places both front-ends: a native Windows GUI, and a terminal
+  client (openchime-tui) that can optionally be added to PATH.
+
+Tags:
+  - chat
+  - messaging
+  - self-hosted
+  - collaboration
+
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

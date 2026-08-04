@@ -87,5 +87,40 @@ def main(out):
     print("wrote", out, "sizes", SIZES)
 
 
+# --- MSIX tile assets ---------------------------------------------------------
+# The Store package needs PNGs, not an .ico, at a fixed set of names. They are
+# drawn from the same render() as the taskbar icon rather than exported by hand,
+# so the tile and the taskbar cannot drift apart.
+#
+# Each logo exists at five display scales; makepri picks one at runtime from the
+# `.scale-N` suffix. The targetsize variants are the small-icon case (taskbar,
+# Alt-Tab), where `altform-unplated` means Windows draws the image alone instead
+# of stamping it onto a solid accent-coloured plate -- correct here, because the
+# icon already IS a rounded accent square and would otherwise be plated twice.
+SCALES = [100, 125, 150, 200, 400]
+TARGETSIZES = [16, 24, 32, 48, 256]
+LOGOS = {"StoreLogo": 50, "Square150x150Logo": 150, "Square44x44Logo": 44}
+
+
+def main_msix(outdir):
+    import os
+    os.makedirs(outdir, exist_ok=True)
+    n = 0
+    for name, base in LOGOS.items():
+        for scale in SCALES:
+            px = -(-base * scale // 100)          # ceil, which is what MSIX expects
+            suffix = "" if scale == 100 else ".scale-%d" % scale
+            render(px).save(os.path.join(outdir, "%s%s.png" % (name, suffix)))
+            n += 1
+    for px in TARGETSIZES:
+        render(px).save(os.path.join(
+            outdir, "Square44x44Logo.targetsize-%d_altform-unplated.png" % px))
+        n += 1
+    print("wrote", n, "assets to", outdir)
+
+
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "client/gui/win32/res/openchime.ico")
+    if len(sys.argv) > 1 and sys.argv[1] == "--msix":
+        main_msix(sys.argv[2] if len(sys.argv) > 2 else "packaging/windows/msix/assets")
+    else:
+        main(sys.argv[1] if len(sys.argv) > 1 else "client/gui/win32/res/openchime.ico")

@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSIX package manifest for the Windows client (ARCH-80/81): the Store
+  channel. The direct-download channel is ../openchime.iss.
+
+  (Comments here use ":" and ";" where the rest of the tree uses an em dash,
+  because XML forbids a double hyphen inside a comment.)
+
+  This packages the SAME two mingw-w64 binaries the installer ships. MSIX does
+  not require a UWP app: rescap:runFullTrust below declares an ordinary Win32
+  program, which is what these are.
+
+  THREE VALUES BELOW ARE PLACEHOLDERS and must be replaced with what Partner
+  Center assigns once the name is reserved: Identity/@Name,
+  Identity/@Publisher, and PublisherDisplayName. A package whose Publisher
+  does not match the account's certificate subject is rejected at submission,
+  not at pack time, so this fails late if it is left as-is.
+
+  Version is rewritten by .github/workflows/release.yml. It must be a.b.c.d
+  with the fourth field 0 (the Store reserves the revision), so the bare
+  release number from version.sh lands in the third field.
+-->
+<Package
+    xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+    xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+    xmlns:uap4="http://schemas.microsoft.com/appx/manifest/uap/windows10/4"
+    xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+    xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+    IgnorableNamespaces="uap uap3 uap4 desktop rescap">
+
+  <Identity
+      Name="OpenChime.OpenChime"
+      Publisher="CN=REPLACE-WITH-PARTNER-CENTER-PUBLISHER-ID"
+      Version="1.0.0.0"
+      ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>OpenChime</DisplayName>
+    <PublisherDisplayName>OpenChime</PublisherDisplayName>
+    <Logo>assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <!-- 17763 (1809) is the floor: it is the oldest build that still receives
+         servicing and the oldest that supports the appExecutionAlias below.
+         The client itself targets _WIN32_WINNT=0x0601 and would run lower. -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0"
+                        MaxVersionTested="10.0.22621.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Capabilities>
+    <!-- runFullTrust is what makes a packaged Win32 program legal. It is a
+         restricted capability: Store submission requires a short written
+         justification, which for this app is "existing native desktop
+         application". internetClient covers the daemon connection. -->
+    <rescap:Capability Name="runFullTrust" />
+    <Capability Name="internetClient" />
+  </Capabilities>
+
+  <Applications>
+    <Application Id="OpenChime" Executable="bin\openchime.exe"
+                 EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+          DisplayName="OpenChime"
+          Description="Chat client for an OpenChime server."
+          BackgroundColor="#3D8BFF"
+          Square150x150Logo="assets\Square150x150Logo.png"
+          Square44x44Logo="assets\Square44x44Logo.png">
+        <uap:DefaultTile ShortName="OpenChime" />
+      </uap:VisualElements>
+    </Application>
+
+    <!-- The terminal client. It is a second Application entry only because an
+         execution alias attaches to an application, not to a package; the
+         alias is the whole point, since a console program nobody can type the
+         name of is unreachable. AppListEntry="none" keeps it out of Start so
+         the package still presents as one app. -->
+    <Application Id="OpenChimeTui" Executable="bin\openchime-tui.exe"
+                 EntryPoint="Windows.FullTrustApplication"
+                 desktop:Subsystem="console">
+      <uap:VisualElements
+          AppListEntry="none"
+          DisplayName="OpenChime (terminal)"
+          Description="Terminal chat client for an OpenChime server."
+          BackgroundColor="#3D8BFF"
+          Square150x150Logo="assets\Square150x150Logo.png"
+          Square44x44Logo="assets\Square44x44Logo.png" />
+      <Extensions>
+        <uap3:Extension Category="windows.appExecutionAlias"
+                        Executable="bin\openchime-tui.exe"
+                        EntryPoint="Windows.FullTrustApplication">
+          <uap3:AppExecutionAlias>
+            <desktop:ExecutionAlias Alias="openchime-tui.exe" />
+          </uap3:AppExecutionAlias>
+        </uap3:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>
