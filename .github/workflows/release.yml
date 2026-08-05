@@ -308,6 +308,22 @@ jobs:
           name: mingw-binaries
           path: build
 
+      # Both binaries carry a VERSIONINFO resource (client/shared/res). It is
+      # asserted rather than assumed because the failure is silent: a missing
+      # or misbuilt resource still produces a working .exe, and the installer
+      # wrapping it carries its own version, so nothing downstream notices that
+      # the shipped files report none. Before that resource existed this step
+      # read back empty for both.
+      - name: Check the embedded version
+        shell: pwsh
+        run: |
+          $want = "1.0.$env:VERSION.0"
+          foreach ($f in 'build\openchime.exe','build\openchime-tui.exe') {
+            $got = (Get-Item $f).VersionInfo.FileVersion
+            if ($got -ne $want) { throw "$f reports FileVersion '$got', expected '$want'" }
+            Write-Host "$f $got"
+          }
+
       # The SDK ships on the runner image but is not on PATH, and its versioned
       # directory moves with each image update, so it is discovered rather than
       # pinned to a build number that would silently rot.

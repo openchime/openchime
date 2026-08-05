@@ -171,6 +171,18 @@ $(TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) \
 WINCC     ?= x86_64-w64-mingw32-gcc
 WINDRES   ?= x86_64-w64-mingw32-windres
 WINOBJCOPY ?= x86_64-w64-mingw32-objcopy
+
+# Both .exe files carry a VERSIONINFO resource from client/shared/res. Only the
+# number is passed; the .rc builds the display string from it, for the reason
+# recorded there. OC_VERSION is a bare integer or empty, and VERSIONINFO has no
+# spelling for "dev", so an unset version stamps 0.
+#
+# make tracks file times, not variables, so changing OC_VERSION on a tree that
+# already built leaves the old number in build/*_res.o. CI checks out clean and
+# never sees this; a local rebuild at a new version wants `make clean` first.
+OC_VERSION_NUM := $(if $(OC_VERSION),$(OC_VERSION),0)
+WIN_RES_SRC  := client/shared/res/version_info.rc
+WINDRES_ARGS := -I client/shared/res --define OC_VERSION_NUM=$(OC_VERSION_NUM)
 MBEDTLS_WIN := third_party/mbedtls-3.6.2-win
 WIN_MBEDLIBS := $(MBEDTLS_WIN)/library/libmbedtls.a \
                 $(MBEDTLS_WIN)/library/libmbedx509.a \
@@ -183,11 +195,17 @@ WIN_CFLAGS := -std=c99 -Wall -Wextra -O2 -g -D_WIN32_WINNT=0x0601 -DUTF8PROC_STA
 WIN_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
            $(CORE_INC) -Iclient/tui -Iclient/shared -Ituikit -Ithird_party/termbox2 -Ithird_party/utf8proc
 
+# Version metadata only -- no icon, which for a console program comes from the
+# host terminal window rather than the image.
+WIN_TUI_RES := build/openchime_tui_res.o
+$(WIN_TUI_RES): client/tui/res/openchime_tui.rc $(WIN_RES_SRC) | build
+	$(WINDRES) $(WINDRES_ARGS) $< -O coff -o $@
+
 windows-tui: $(WIN_TUI_BIN)
-$(WIN_TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) \
+$(WIN_TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(WIN_TUI_RES) \
                 $(wildcard client/tui/*.h tuikit/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) | build
 	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result $(WIN_INC) \
-	    $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) \
+	    $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $(WIN_TUI_RES) \
 	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -ladvapi32 -static -o $@
 
 
@@ -203,11 +221,12 @@ GUI_SRC := $(wildcard client/gui/win32/*.c) client/shared/icons.c client/shared/
 WIN_GUI_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
                $(CORE_INC) -Iclient/gui/win32 -Iclient/shared
 
-# Resources (app icon). Regenerate the .ico with scripts/gen_appicon.py.
+# Resources (app icon + VERSIONINFO). Regenerate the .ico with
+# scripts/gen_appicon.py.
 WIN_GUI_RES := build/openchime_res.o
 $(WIN_GUI_RES): client/gui/win32/res/openchime.rc client/gui/win32/res/openchime.ico \
-                client/gui/win32/res/openchime_res.h | build
-	$(WINDRES) -I client/gui/win32/res $< -O coff -o $@
+                client/gui/win32/res/openchime_res.h $(WIN_RES_SRC) | build
+	$(WINDRES) -I client/gui/win32/res $(WINDRES_ARGS) $< -O coff -o $@
 
 windows-gui: $(WIN_GUI_BIN)
 $(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \

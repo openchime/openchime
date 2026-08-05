@@ -8,3 +8,7 @@
 #include "openchime_res.h"
 
 IDI_APPICON ICON "openchime.ico"
+
+#define OC_RES_DESC "Chat client for an OpenChime server."
+#define OC_RES_ORIG "openchime.exe"
+#include "version_info.rc"
