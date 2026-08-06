@@ -5,8 +5,8 @@
 # control plane provisions onto customer boxes was produced by hand. Four
 # channels come out of one run, all carrying the same release number:
 #
-#   apt      Debian/Ubuntu, GPG-signed repository on R2
-#   dnf/yum  RHEL family, GPG-signed repository on R2
+#   apt      Debian/Ubuntu, GPG-signed repository in object storage
+#   dnf/yum  RHEL family, GPG-signed repository in object storage
 #   tarball  everyone else, and the offline case -- attached to the GitHub release
 #   image    GHCR, for the hosted model (Fly) and for anyone running Compose
 #   windows  the client, not the daemon: a signed installer attached to the
@@ -418,11 +418,25 @@ jobs:
       contents: write        # to push the release tag and create the GitHub release
     env:
       VERSION: ${{ needs.version.outputs.number }}
-      # R2 speaks the S3 API; rclone is configured from these.
-      R2_ACCOUNT_ID:  ${{ secrets.R2_ACCOUNT_ID }}
-      R2_ACCESS_KEY:  ${{ secrets.R2_ACCESS_KEY }}
-      R2_SECRET_KEY:  ${{ secrets.R2_SECRET_KEY }}
-      R2_BUCKET:      ${{ secrets.R2_BUCKET }}
+      # Object storage is Tigris, provisioned through Fly (`fly storage create`)
+      # and billed on the Fly account, so it is not a separate vendor
+      # relationship. It speaks the S3 API; rclone is configured from these.
+      #
+      # Named for the role rather than the provider. Nothing outside this job
+      # knows where the bytes live -- the control plane serves DIST_BASE_URL and
+      # reads from the bucket -- so moving to another S3 endpoint is a change to
+      # these four values and nothing else. That indirection is the reason the
+      # public URL can be permanent while the storage behind it is not.
+      DIST_S3_ACCESS_KEY: ${{ secrets.DIST_S3_ACCESS_KEY }}
+      DIST_S3_SECRET_KEY: ${{ secrets.DIST_S3_SECRET_KEY }}
+      DIST_S3_ENDPOINT:   ${{ vars.DIST_S3_ENDPOINT }}
+      DIST_BUCKET:        ${{ vars.DIST_BUCKET }}
+      # Endpoint and bucket are variables, not secrets: neither is confidential,
+      # and a masked bucket name turns every rclone log line into asterisks.
+      #
+      # The published base. Baked into every operator's sources.list, so it is
+      # permanent in a way nothing else here is (ARCH-20).
+      DIST_BASE_URL: https://openchime.io/dist
     steps:
       - uses: actions/checkout@v4
         with:
@@ -469,16 +483,24 @@ jobs:
           printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
           echo "GPG_KEY_ID=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')" >> "$GITHUB_ENV"
 
-      - name: Configure rclone for R2
+      - name: Configure rclone for object storage
         run: |
+          set -euo pipefail
+          for v in DIST_S3_ACCESS_KEY DIST_S3_SECRET_KEY DIST_S3_ENDPOINT DIST_BUCKET; do
+            [ -n "${!v}" ] || { echo "::error::$v is not set"; exit 1; }
+          done
           mkdir -p ~/.config/rclone
+          # provider = Other rather than a named one: rclone has no Tigris
+          # profile, and the generic S3 path is what Tigris documents. region is
+          # required by the S3 signature even though Tigris routes globally.
           cat > ~/.config/rclone/rclone.conf <<EOF
-          [r2]
+          [dist]
           type = s3
-          provider = Cloudflare
-          access_key_id = ${R2_ACCESS_KEY}
-          secret_access_key = ${R2_SECRET_KEY}
-          endpoint = https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
+          provider = Other
+          access_key_id = ${DIST_S3_ACCESS_KEY}
+          secret_access_key = ${DIST_S3_SECRET_KEY}
+          endpoint = ${DIST_S3_ENDPOINT}
+          region = auto
           EOF
 
       # Both repositories are regenerated from the FULL pool, not from this
@@ -488,7 +510,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p repo/apt
-          rclone copy "r2:${R2_BUCKET}/apt" repo/apt --fast-list || true
+          rclone copy "dist:${DIST_BUCKET}/apt" repo/apt --fast-list || true
 
           mkdir -p repo/apt/pool/main/o/openchimed
           cp dist/linux-*/*.deb repo/apt/pool/main/o/openchimed/
@@ -518,13 +540,13 @@ jobs:
               -o dists/stable/InRelease dists/stable/Release
 
           cd ../..
-          rclone copy repo/apt "r2:${R2_BUCKET}/apt" --fast-list
+          rclone copy repo/apt "dist:${DIST_BUCKET}/apt" --fast-list
 
       - name: Publish the rpm repository
         run: |
           set -euo pipefail
           mkdir -p repo/rpm
-          rclone copy "r2:${R2_BUCKET}/rpm" repo/rpm --fast-list || true
+          rclone copy "dist:${DIST_BUCKET}/rpm" repo/rpm --fast-list || true
           cp dist/linux-*/*.rpm repo/rpm/
 
           # Each package is signed individually -- rpm verifies package
@@ -542,7 +564,7 @@ jobs:
           gpg --batch --yes --local-user "$GPG_KEY_ID" --detach-sign --armor \
               -o repo/rpm/repodata/repomd.xml.asc repo/rpm/repodata/repomd.xml
 
-          rclone copy repo/rpm "r2:${R2_BUCKET}/rpm" --fast-list
+          rclone copy repo/rpm "dist:${DIST_BUCKET}/rpm" --fast-list
 
       - name: Publish the public key and repo definitions
         run: |
@@ -553,36 +575,46 @@ jobs:
           cat > repo/meta/openchime.repo <<EOF
           [openchime]
           name=OpenChime
-          baseurl=https://apt.openchime.io/rpm
+          baseurl=${DIST_BASE_URL}/rpm
           enabled=1
           gpgcheck=1
           repo_gpgcheck=1
-          gpgkey=https://apt.openchime.io/openchime-archive-keyring.asc
+          gpgkey=${DIST_BASE_URL}/openchime-archive-keyring.asc
           EOF
-          rclone copy repo/meta "r2:${R2_BUCKET}/" --fast-list
+          rclone copy repo/meta "dist:${DIST_BUCKET}/" --fast-list
 
-      # Installing from the PUBLISHED repository, not from a local file. This is
-      # the only step that proves signing, index generation and the R2 layout are
-      # all correct together; a local install would pass with a broken repo.
+      # Installing from the PUBLISHED URL, not from a local file and not from the
+      # bucket. This is the only step that exercises the whole path end to end:
+      # signing, index generation, the object layout, AND the control plane
+      # serving it. A local install would pass with every one of those broken.
+      #
+      # It therefore depends on the control plane already serving DIST_BASE_URL
+      # (openchime-saas). Until that ships, this step is what fails, which is the
+      # correct place for the dependency to surface.
+      #
+      # DIST_BASE_URL is passed with -e rather than interpolated: these scripts
+      # are single-quoted, so the shell inside the container expands it. NOTE, as
+      # elsewhere in this file: no apostrophes in these blocks, comments
+      # included, or the quoting closes early and the rest runs on the runner.
       - name: Smoke the published repositories
         run: |
           set -euo pipefail
-          docker run --rm debian:bookworm bash -c '
+          docker run --rm -e DIST_BASE_URL debian:bookworm bash -c '
             set -e
             apt-get update -qq >/dev/null
             apt-get install -y -qq curl ca-certificates >/dev/null
-            curl -fsSL https://apt.openchime.io/openchime-archive-keyring.gpg \
+            curl -fsSL "$DIST_BASE_URL/openchime-archive-keyring.gpg" \
               -o /usr/share/keyrings/openchime-archive-keyring.gpg
-            echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] https://apt.openchime.io/apt stable main" \
+            echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] $DIST_BASE_URL/apt stable main" \
               > /etc/apt/sources.list.d/openchime.list
             apt-get update -qq
             apt-get install -y -qq openchimed
             openchimed --version
           '
-          docker run --rm rockylinux:9 bash -c '
+          docker run --rm -e DIST_BASE_URL rockylinux:9 bash -c '
             set -e
-            curl -fsSL https://apt.openchime.io/openchime.repo -o /etc/yum.repos.d/openchime.repo
-            rpm --import https://apt.openchime.io/openchime-archive-keyring.asc
+            curl -fsSL "$DIST_BASE_URL/openchime.repo" -o /etc/yum.repos.d/openchime.repo
+            rpm --import "$DIST_BASE_URL/openchime-archive-keyring.asc"
             dnf install -y -q openchimed
             openchimed --version
           '
@@ -610,8 +642,8 @@ jobs:
             echo
             echo "| Channel | Where |"
             echo "|---|---|"
-            echo "| apt | \`https://apt.openchime.io/apt stable main\` |"
-            echo "| dnf | \`https://apt.openchime.io/rpm\` |"
+            echo "| apt | \`${DIST_BASE_URL}/apt stable main\` |"
+            echo "| dnf | \`${DIST_BASE_URL}/rpm\` |"
             echo "| image | \`ghcr.io/${{ github.repository_owner }}/openchime:${VERSION}\` |"
             echo "| tarball | attached to \`release-${VERSION}\` |"
             echo "| windows | installer attached to \`release-${VERSION}\`; \`.msix\` in the \`windows-x64\` artifact |"

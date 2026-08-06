@@ -87,9 +87,9 @@ runs under systemd as a transient user with its state in `/var/lib/openchime`.
 **Debian / Ubuntu** — bookworm or 22.04 and newer:
 
 ```sh
-curl -fsSL https://apt.openchime.io/openchime-archive-keyring.gpg \
+curl -fsSL https://openchime.io/dist/openchime-archive-keyring.gpg \
   | sudo tee /usr/share/keyrings/openchime-archive-keyring.gpg >/dev/null
-echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] https://apt.openchime.io/apt stable main" \
+echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] https://openchime.io/dist/apt stable main" \
   | sudo tee /etc/apt/sources.list.d/openchime.list
 sudo apt update && sudo apt install openchimed
 ```
@@ -97,8 +97,8 @@ sudo apt update && sudo apt install openchimed
 **RHEL / Rocky / Alma / Fedora** — RHEL 9 and newer:
 
 ```sh
-sudo curl -fsSL https://apt.openchime.io/openchime.repo -o /etc/yum.repos.d/openchime.repo
-sudo rpm --import https://apt.openchime.io/openchime-archive-keyring.asc
+sudo curl -fsSL https://openchime.io/dist/openchime.repo -o /etc/yum.repos.d/openchime.repo
+sudo rpm --import https://openchime.io/dist/openchime-archive-keyring.asc
 sudo dnf install openchimed
 ```
 
