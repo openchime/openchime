@@ -88,6 +88,19 @@ jobs:
             echo "violation=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Best-effort, and deliberately non-fatal.
+      #
+      # Remediation on the DEFAULT branch requires the repository ruleset to
+      # grant a force-push bypass to the GitHub Actions app. Without it this call
+      # returns 403 "Resource not accessible by integration" no matter what
+      # `permissions:` says above, because a ruleset outranks a token scope. That
+      # is not a hypothetical: it is what happened, and because the step then
+      # exited non-zero, the run stopped here and reported an HTTP error instead
+      # of the violation that caused it -- so the log named the wrong problem.
+      #
+      # Failing softly keeps the guard honest either way: the push is reported as
+      # rejected by the final step whether or not the ref could be rolled back,
+      # and an un-remediated violation says so in as many words.
       - name: Remediate violating push
         if: steps.scan.outputs.violation == 'true' && github.event_name == 'push'
         env:
@@ -99,20 +112,26 @@ jobs:
         run: |
           set -u
           ZERO=0000000000000000000000000000000000000000
+          failed() {
+            echo "::warning::Could not roll back $1. The commits are still on the ref."
+            echo "::warning::Remediating the default branch needs a ruleset bypass for the GitHub Actions app."
+          }
           case "$REF" in
             refs/heads/*)
               branch="${REF#refs/heads/}"
               if [ "$branch" = "$DEFAULT" ] && [ "$BEFORE" != "$ZERO" ]; then
                 echo "Force-resetting $branch to pre-push state $BEFORE"
-                gh api -X PATCH "repos/$REPO/git/refs/heads/$branch" -f sha="$BEFORE" -F force=true
+                gh api -X PATCH "repos/$REPO/git/refs/heads/$branch" -f sha="$BEFORE" -F force=true \
+                  || failed "$branch"
               else
                 echo "Deleting branch $branch"
-                gh api -X DELETE "repos/$REPO/git/refs/heads/$branch"
+                gh api -X DELETE "repos/$REPO/git/refs/heads/$branch" || failed "$branch"
               fi
               ;;
             refs/tags/*)
               echo "Deleting tag ${REF#refs/tags/}"
-              gh api -X DELETE "repos/$REPO/git/refs/tags/${REF#refs/tags/}"
+              gh api -X DELETE "repos/$REPO/git/refs/tags/${REF#refs/tags/}" \
+                || failed "tag ${REF#refs/tags/}"
               ;;
           esac
 
