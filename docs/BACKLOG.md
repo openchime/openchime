@@ -14,7 +14,7 @@ consequence of that order rather than an open item. Work whose implementation
 lives in the separate control-plane repository is likewise out of scope, and is
 listed at the end so the boundary is visible rather than implied.
 
-**Ordering: item 1 is the lowest impact, item 118 the highest.** Impact is what
+**Ordering: item 1 is the lowest impact, item 123 the highest.** Impact is what
 the issue costs a user or an operator, judged on three things in order — whether
 it breaks something that ships and is used, whether it blocks a capability the
 product claims, and how many people meet it. So a defect in a working feature
@@ -35,6 +35,12 @@ rediscovered as a defect by the next reader.
 
 Verified on **2026-08-02** against commit `453782f`, with the daemon and
 `build/openchime.exe` rebuilt from that tree.
+
+The five release-pipeline entries (6, 7, 121, 122, 123) were added on
+**2026-08-06** against commit `678ccbb` and verified differently, because
+nothing was built to check them: each cites the workflow line, the dry-run job
+timings, or the empty `gh secret list` / `git tag -l` that shows the state. None
+was reproduced by running a release, which is itself item 123.
 
 ---
 
@@ -137,7 +143,39 @@ offset stripping does not move — resolves through the split debug file to
 handler itself. A stripped binary whose crashes still symbolicate is the whole
 point of doing it this way.
 
-## 6. Reason code 3014 is assigned to two different errors
+## 6. The release spends twelve of its fifteen minutes emulating arm64
+
+`.github/workflows/release.yml` builds the multi-architecture container image
+with QEMU user-mode translation, which predates the discovery that GitHub's
+native ARM runners are available to this repository. The `packages` job already
+uses one.
+
+*Impact:* Release wall-clock, not correctness. The image job is 82% of the run,
+so every release costs roughly six times what it needs to.
+
+**Verified** — dry run 30954057012 (2026-08-04): `container image` 12m 37s under
+QEMU against `arm64 packages` 1m 28s natively on `ubuntu-22.04-arm`; total run
+15m 25s, of which the image job is 12m 37s. Splitting the image across native
+runners and joining with a manifest list would take the release under 10 minutes.
+
+## 7. A missing release credential is discovered twenty-five minutes in
+
+No job asserts that the release secrets exist before work starts. Each is read
+at the point of use, and every step that reads one is skipped on a dry run, so
+the first time a missing value can surface is a real release — after the CI
+gate, both package builds, the image and the Windows binaries have all run.
+
+*Impact:* A wasted release run and a confusing failure, not a wrong artifact.
+Compounded by `publish` needing `windows-package`: a credential missing on the
+Windows side stops the Linux repositories publishing too.
+
+**Verified** — release.yml `publish` reads `DIST_S3_*` and `REPO_SIGNING_KEY`
+only inside its own steps; `windows-package` gates signing on
+`SIGN: ${{ inputs.dry_run == false }}`, so no dry run ever evaluates the
+credentials. `gh secret list` and `gh variable list` are both empty as of
+2026-08-06.
+
+## 8. Reason code 3014 is assigned to two different errors
 
 `OC_ERR_INVALID_MESSAGE` and `OC_ERR_INVALID_DEVICE_TOKEN` are both `3014`
 (`shared/protocol.h:311`, `:321`). 3020 is unused.
@@ -170,7 +208,7 @@ restoring 3020 turns it green.
 No protocol version bump: the `ERROR` frame's layout is unchanged, and §8's
 design already has clients categorising an unrecognised code by its 3000-range.
 
-## 7. Two message-type opcodes are used twice each
+## 9. Two message-type opcodes are used twice each
 
 `PROFILE_INFO` and `TYPING` are both `0x0072`; `LIST_FILE_CHANNELS` and
 `TYPING_UPDATE` are both `0x0073`.
@@ -209,7 +247,7 @@ enforcement on. Proven to fail: putting `TYPING` back on `0x0072` exits 1 naming
 both types; pointed at a file with no opcodes it exits 2 rather than passing
 vacuously.
 
-## 8. Handshake frames are not stamped version 1
+## 10. Handshake frames are not stamped version 1
 
 `PROTOCOL.md` and `shared/protocol.h:986` both state that `HELLO`/`WELCOME`/
 `REJECT` are frozen at version 1 so negotiation can never hit a version
@@ -242,7 +280,7 @@ false. Proven to fail: restamping `REJECT` with `OC_PROTOCOL_VERSION` produces
 version has just been refused, so it is the one that has to be decodable by a
 peer that agrees about nothing else.
 
-## 9. The per-frame version is never validated after the handshake
+## 11. The per-frame version is never validated after the handshake
 
 Neither side reads `hdr.version` on any post-handshake frame, and the negotiated
 version is not stored on the connection at all.
@@ -283,7 +321,7 @@ never authenticates; with only that check disabled and the same broken daemon,
 **the whole suite passes green** — the wrong version goes entirely unnoticed,
 which is the defect this item describes, demonstrated rather than argued.
 
-## 10. `UNEXPECTED_MSG_TYPE` is never sent
+## 12. `UNEXPECTED_MSG_TYPE` is never sent
 
 `OC_ERR_UNEXPECTED_MSG_TYPE` (1005) appears in no `.c` file. A first frame that
 is not `HELLO` closes the socket with nothing written; an unknown post-auth frame
@@ -319,7 +357,7 @@ then the socket closes. A frame whose `msg_type` is patched to an undefined
 same frame with its real type still returns `CHANNEL_LIST`. Proven to fail:
 restoring both silent behaviours produces 10 failing assertions.
 
-## 11. Backfill replays public channels the caller has not joined
+## 13. Backfill replays public channels the caller has not joined
 
 An explicit backfill cursor is gated on `channel_read_access` (public **or**
 member), so a public channel a user never joined is replayed when they ask for
@@ -353,7 +391,7 @@ channel is listed for everyone, carrying `joined = 0`, which is how it is
 discoverable at all. The assertion now records that, since it is the fact that
 makes `dave` a genuine non-member.
 
-## 12. A stale timezone offset is never refreshed
+## 14. A stale timezone offset is never refreshed
 
 `users.tz_offset_min` decides which local day a per-weekday quiet-hours schedule
 applies to. The client writes it only as part of `SET_SCHEDULE`, so it is
@@ -402,7 +440,7 @@ One incidental correction to the first draft of that test: it queried
 sentinel, which is exactly how a test can look like it is checking something and
 not be.
 
-## 13. `UPLOAD_BEGIN` is not idempotent
+## 15. `UPLOAD_BEGIN` is not idempotent
 
 The documented contract said it deduplicates on `(channel, token)` like `SEND`.
 It does not: `process_attach_create` performs an unconditional `INSERT` and the
@@ -415,7 +453,7 @@ loop. A client that did retry after a drop would create orphan pending rows,
 which the maintenance sweep would later reclaim. The documentation has been
 corrected. **Verified.**
 
-## 14. The tray balloon's rendering has never been observed
+## 16. The tray balloon's rendering has never been observed
 
 The tray balloon's rendering has never been observed.
 
@@ -426,7 +464,7 @@ catch it.
 (winmain.c:694 g_tray_live), but §4's own note records that no capture on this
 host shows the balloon; there is no Windows GUI CI (BACKLOG item 19)
 
-## 15. A custom emoji keeps its shortcode's width
+## 17. A custom emoji keeps its shortcode's width
 
 The Win32 client draws a custom emoji image over its hidden shortcode, so the run
 keeps the text's width and a short emoji leaves uneven spacing around it. Closing
@@ -437,7 +475,7 @@ height, centred in the run it replaces, so the leftover reads as symmetric
 spacing rather than a missing character — the alternative, left-aligning it,
 looked like a defect. **Verified** — `client/gui/win32/winmain.c:3217-3225`.
 
-## 16. The emoji catalogue is small and has no skin tones
+## 18. The emoji catalogue is small and has no skin tones
 
 The emoji catalogue is 179 entries with no skin tones.
 
@@ -515,7 +553,7 @@ One unexplained observation, recorded rather than dismissed: in a single session
 open, and cleared completely on relaunch. Not reproduced in three subsequent
 runs. No mechanism established, so no claim is made about one.
 
-## 17. Quiet hours are typed HH:MM fields rather than time pickers
+## 19. Quiet hours are typed HH:MM fields rather than time pickers
 
 Quiet hours are typed HH:MM fields, not time pickers.
 
@@ -526,7 +564,7 @@ high DPI — BACKLOG item 26.
 protocol.h:249, migrations 0034/0035) but the base window is two validated text
 fields, not a picker — §3 item 4's residue
 
-## 18. There is no persistent keybinding hint bar
+## 20. There is no persistent keybinding hint bar
 
 No persistent keybinding hint bar.
 
@@ -536,7 +574,7 @@ table marks Win32 ❌.
 **Verified** — There is a Ctrl+/ shortcuts pane (winmain.c:4538 ACC_KEYS) but no always-
 visible footer of contextual chords
 
-## 19. No Ctrl+1..9 workspace switching
+## 21. No Ctrl+1..9 workspace switching
 
 No Ctrl+1..9 workspace switching.
 
@@ -547,7 +585,7 @@ still the mouse.
 else; Ctrl+0 is zoom reset. Switching is mouse-only via the rail switcher menu
 (:14520-14531)
 
-## 20. Mark-all-read has no keyboard shortcut
+## 22. Mark-all-read has no keyboard shortcut
 
 Mark-all-read has no keyboard shortcut.
 
@@ -556,7 +594,7 @@ Mark-all-read has no keyboard shortcut.
 **Verified** — Item 73 'Mark all as read' in the workspace menu (winmain.c:5908) and the
 palette; not in the accelerator table (:4526-4546). Slack binds Shift+Esc
 
-## 21. No hover strip of one-click reactions on a message row
+## 23. No hover strip of one-click reactions on a message row
 
 No hover strip of one-click reactions on a message row.
 
@@ -566,7 +604,7 @@ No hover strip of one-click reactions on a message row.
 QUICK_DEFAULT, :11805 mi_emojirow) — the table's '6 hardcoded' is stale — but a
 message row has no hover affordance, so reacting is two clicks
 
-## 22. Activity has filters but no saved views
+## 24. Activity has filters but no saved views
 
 Activity has facets but no saved views.
 
@@ -576,7 +614,7 @@ Activity has facets but no saved views.
 (winmain.c:8053-8090) — the doc's 'no DMs facet' is stale — but no way to name
 and keep a filter combination
 
-## 23. No long-form channel description, only the one topic line
+## 25. No long-form channel description, only the one topic line
 
 No long-form channel description — only the one topic line.
 
@@ -586,7 +624,7 @@ No long-form channel description — only the one topic line.
 (client/core/client.h:136 + winmain.c:12985-13036); REQ-034 defines a single
 topic string
 
-## 24. Custom emoji have no administration surface
+## 26. Custom emoji have no administration surface
 
 Custom emoji have add/delete but no administration surface.
 
@@ -596,7 +634,7 @@ Custom emoji have add/delete but no administration surface.
 custom emoji' in the menu (winmain.c:14312); no pane listing the catalogue, no
 per-role permission on who may add
 
-## 25. A #channel reference is text, not a link
+## 27. A #channel reference is text, not a link
 
 A #channel reference completes as text and is not navigable.
 
@@ -607,7 +645,7 @@ switcher rather than a link.
 span pass (winmain.c:3013-3065) styles user mentions only — there is no
 channel-mention span and no click target
 
-## 26. There is no back/forward navigation history
+## 28. There is no back/forward navigation history
 
 No back/forward navigation history.
 
@@ -618,7 +656,7 @@ to where you were.
 accelerator table (winmain.c:4526-4546) has no Alt+Left/Right or mouse-
 button-4/5 handling
 
-## 27. There is no always-present search field
+## 29. There is no always-present search field
 
 No always-present top-bar search field.
 
@@ -629,7 +667,7 @@ the single most-used affordance in both reference products.
 query box inside the overlay (:3781); the sidebar's 'Find a conversation' box
 (:2551) filters conversations, not messages
 
-## 28. `openchime://` is not registered with the OS
+## 30. `openchime://` is not registered with the OS
 
 Copying a permalink puts the text on the clipboard and pasting one into the app
 jumps to it, but the scheme is not registered, so a link is not clickable outside
@@ -640,7 +678,7 @@ nothing from a browser or a mail client. Registering it is an install-time act,
 deliberately not done as a side effect of running the client. **Verified** —
 ARCH-96 records the omission.
 
-## 29. The members pane cannot scroll
+## 31. The members pane cannot scroll
 
 `draw_members` stops drawing when it runs past the pane's height and has no
 scroll offset, so members below the fold are unreachable. The pane has no search
@@ -652,7 +690,7 @@ People directory and the command palette, which is what keeps this below the
 items that make a surface unusable outright. **Verified** — `if (y > H) break;`
 with no scroll state anywhere in the pane.
 
-## 30. The audit log filters only what has already been paged in
+## 32. The audit log filters only what has already been paged in
 
 `AUDIT_QUERY` carries a timestamp cursor and a limit and nothing else, so the
 family chips in the Win32 Admin pane narrow the rows already fetched rather than
@@ -663,7 +701,7 @@ every other family to reach it. Paging and scrolling themselves work. Admin-only
 surface. **Verified** — `oc_audit_query` is `{before_ms, limit}`
 (`shared/protocol.h:879`); the family filter is the client-side `g_audit_family`.
 
-## 31. The Files view stops at 200 rows with no paging
+## 33. The Files view stops at 200 rows with no paging
 
 The Files view stops at 200 with no paging.
 
@@ -674,7 +712,7 @@ older ones; the type/scope/sort filters (FF_LABEL/FS_LABEL/FSORT_LABEL,
 **Verified** — winmain.c:5169 draws 'Showing the most recent 200. Older files are in search.'
 — LIST_FILES has no keyset cursor, unlike search (WIN-38)
 
-## 32. The who-reacted overlay cannot add or remove a reaction
+## 34. The who-reacted overlay cannot add or remove a reaction
 
 The who-reacted overlay cannot add or remove a reaction.
 
@@ -683,7 +721,7 @@ The who-reacted overlay cannot add or remove a reaction.
 **Verified** — OVL_REACT is populated by oc_client_list_reactions (client/core/client.h:162)
 and rendered as a list; no oc_client_react call from that pane
 
-## 33. The create-channel flow takes name and visibility only
+## 35. The create-channel flow takes name and visibility only
 
 The create-channel flow takes name + visibility only — no topic, no initial
 members.
@@ -696,7 +734,7 @@ FF_CHOICE, "Visibility", "Public|Private" ... } };` then create_channel_ex.
 Topic is set afterwards from the About tab (:4694-4702); members afterwards
 from the channel menu (:14868 'Add someone')
 
-## 34. Search operators are typed text with no filters panel
+## 36. Search operators are typed text with no filters panel
 
 Search operators are typed text only; no filters panel.
 
@@ -707,7 +745,7 @@ anyone who has not read the docs.
 what it understood, but there is no date picker, channel picker or has-
 file/link checkbox UI anywhere in draw_search
 
-## 35. Search has no Messages/Files/Channels/People tabs
+## 37. Search has no Messages/Files/Channels/People tabs
 
 Search has no Messages/Files/Channels/People result tabs.
 
@@ -718,7 +756,7 @@ the People directory.
 only tab strips are TAB_MESSAGES/FILES/PINS/ABOUT (channel, :1020) and DTAB_*
 (drafts, :1023)
 
-## 36. Search is newest-first only, with no sort choice
+## 38. Search is newest-first only, with no sort choice
 
 Search is newest-first only — no relevance or oldest sort, on either side.
 
@@ -728,7 +766,7 @@ Search is newest-first only — no relevance or oldest sort, on either side.
 **Verified** — daemon/dbwriter.c:3394 `ORDER BY m.id DESC LIMIT ?3;` is the only ordering;
 oc_search (shared/protocol.h:967) carries no sort field
 
-## 37. Search has no `on:` single-day operator
+## 39. Search has no `on:` single-day operator
 
 Search lacks the `on:` single-day operator.
 
@@ -738,7 +776,7 @@ else in the operator set works.
 **Verified** — shared/searchq.c implements from: (:51), in: (:58), has: (:66), before: (:84),
 after: (:89) — there is no `on:` branch, though REQ-081 names it explicitly.
 
-## 38. The right-hand surfaces are read-only overlays
+## 40. The right-hand surfaces are read-only overlays
 
 The right-hand surfaces are overlays and largely read-only.
 
@@ -749,7 +787,7 @@ reacted, where you cannot add or remove a reaction.
 (winmain.c:3714) plus the context pane (ARCH-94); the reactions overlay is
 view-only and the audit/storage panes have no per-row action
 
-## 39. There is no unreads-only sidebar mode
+## 41. There is no unreads-only sidebar mode
 
 No unreads-only sidebar mode.
 
@@ -760,7 +798,7 @@ keyboard move-to-next-unread does exist (ACC_NAV_NEXT_UNREAD, :4569).
 only mode; the unread-only toggles that exist are the Threads pane's (:8837)
 and Activity's Unreads facet (:8064)
 
-## 40. File upload shows no progress and no pre-send preview
+## 42. File upload shows no progress and no pre-send preview
 
 File upload shows no progress and no pre-send preview.
 
@@ -771,7 +809,7 @@ no chance to cancel or check the wrong file was chosen.
 (:1968) and 'IME composition in progress' (:9453); no byte counter or thumbnail
 between picking a file and its arrival in the transcript
 
-## 41. No inline document preview and no media carousel
+## 43. No inline document preview and no media carousel
 
 No inline PDF/document preview and no media carousel.
 
@@ -782,7 +820,7 @@ shared images has no way to page through them.
 PDF tag); mime_is_image (:774) limits inline render to png/jpeg/gif/bmp/webp;
 `grep -i 'carousel|gallery'` returns nothing
 
-## 42. A DM cannot be closed, extended or converted to a channel
+## 44. A DM cannot be closed, extended or converted to a channel
 
 A DM cannot be closed from the sidebar, cannot gain people, and cannot become a
 channel.
@@ -795,7 +833,7 @@ Mark as read / three notify levels and stops — the Add someone / Remove someon
 / Leave block is gated `if (c->kind != OC_CHANNEL_KIND_DM)`. No convert-to-
 channel op on the wire
 
-## 43. There is no channel bookmark bar
+## 45. There is no channel bookmark bar
 
 No channel bookmark bar.
 
@@ -806,7 +844,7 @@ pinned as messages and scroll away.
 Saved/Later (:2143, :3576, :9166); no per-channel pinned-link store in the
 schema
 
-## 44. There is no sortable admin members table
+## 46. There is no sortable admin members table
 
 No sortable/bulk admin members table.
 
@@ -816,7 +854,7 @@ No sortable/bulk admin members table.
 searchable list with per-row actions; no column sort, no multi-select, no bulk
 role change or bulk removal
 
-## 45. There is no analytics beyond the storage report
+## 47. There is no analytics beyond the storage report
 
 No analytics beyond the storage report.
 
@@ -825,7 +863,7 @@ No analytics beyond the storage report.
 **Verified** — STORAGE_STATUS (protocol.h:204) is the only metrics op; no
 message/activity/adoption counters exist in the schema
 
-## 46. A removed user can never be reactivated
+## 48. A removed user can never be reactivated
 
 A removed user can never be reactivated.
 
@@ -837,7 +875,7 @@ on the operator's database.
 code path clears the flag. Win32 member menu (winmain.c:11963-11984) offers
 View profile / Message / Role / Remove from workspace and nothing else
 
-## 47. There is no out-of-office status distinct from a custom status
+## 49. There is no out-of-office status distinct from a custom status
 
 No out-of-office status distinct from a custom status.
 
@@ -848,7 +886,7 @@ message will wait.
 SET_STATUS (protocol.h:713) is emoji + text + expiry, with no OOO semantics.
 REQ-122 names out-of-office alongside DND and custom status
 
-## 48. There is no block or DM-privacy control
+## 50. There is no block or DM-privacy control
 
 No block / DM-privacy control.
 
@@ -859,7 +897,7 @@ arriving.
 client/gui/win32/winmain.c` matches only unrelated words. Nothing prevents a
 user from opening a DM to anyone
 
-## 49. There is no catch-up or digest surface
+## 51. There is no catch-up or digest surface
 
 No catch-up / digest surface.
 
@@ -870,7 +908,7 @@ Activity's Unreads facet.
 HOME/DMS/ACTIVITY/LATER/DRAFTS/NEWMSG/ADMIN/THREADS/DIRECTORY (winmain.c:245);
 nothing walks unreads conversation-by-conversation
 
-## 50. A user cannot edit their own email address
+## 52. A user cannot edit their own email address
 
 Email address cannot be edited by its owner.
 
@@ -881,7 +919,7 @@ access can.
 (shared/protocol.h:714) — email travels on PROFILE_INFO/USER_LIST for display
 (:730, :928) but no op writes it
 
-## 51. Pronouns and custom profile fields are not built
+## 53. Pronouns and custom profile fields are not built
 
 Pronouns is the one profile field not built.
 
@@ -891,7 +929,7 @@ Pronouns is the one profile field not built.
 (daemon/migrate.c:533) carries title/timezone/status, and avatars are an
 attachment id
 
-## 52. New members auto-join no default channels
+## 54. New members auto-join no default channels
 
 No default channels for new members.
 
@@ -901,7 +939,7 @@ Adjacent to REQ-042 workspace settings, which is already in BACKLOG.
 **Verified** — `grep -i default_channel` across the tree returns nothing; invite redemption
 joins nothing automatically
 
-## 53. There are no per-channel posting or management permissions
+## 55. There are no per-channel posting or management permissions
 
 No per-channel posting or management permissions.
 
@@ -911,7 +949,7 @@ post.
 **Verified** — `grep -iE 'posting permission|who_can_post' client/gui/win32/winmain.c` → 0;
 daemon/roles.c is tenant-role only; UPDATE_CHANNEL has no permission op
 
-## 54. Send-later cannot be used on a thread reply
+## 56. Send-later cannot be used on a thread reply
 
 Send-later cannot be used on a thread reply, though the wire supports it.
 
@@ -923,7 +961,7 @@ presets with no custom date/time.
 ...)` (client/core/client.h:203) takes a thread root; the only caller passes 0
 — winmain.c:10954 `oc_client_schedule(g_client, g_sel, 0, at, b);`
 
-## 55. Typing indicators do not work inside a thread
+## 57. Typing indicators do not work inside a thread
 
 Typing indicators do not work inside a thread.
 
@@ -933,7 +971,7 @@ collide.
 **Verified** — OC_MSG_TYPING is channel-scoped (shared/protocol.h:181, 'I am typing in a
 channel'); no thread root on the frame
 
-## 56. Typing is channel-scoped and cannot be scoped to a thread
+## 58. Typing is channel-scoped and cannot be scoped to a thread
 
 Typing is channel-scoped only; it cannot be scoped to a thread.
 
@@ -944,7 +982,7 @@ expiry half is built correctly.
 shared/protocol.h:753-754. The requirement says "scoped to the active channel
 or thread".
 
-## 57. A thread reply cannot also be posted to the channel
+## 59. A thread reply cannot also be posted to the channel
 
 No 'also send to channel' on a thread reply.
 
@@ -953,7 +991,7 @@ No 'also send to channel' on a thread reply.
 **Verified** — `grep -iE 'also.send|also_send' client/gui/win32/winmain.c shared/protocol.h`
 returns nothing; SEND_REPLY (protocol.h:97) has no broadcast flag
 
-## 58. A thread reply cannot also go to the main scroll
+## 60. A thread reply cannot also go to the main scroll
 
 A thread reply cannot also be posted to the channel's main scroll.
 
@@ -965,7 +1003,7 @@ parent_id, body, attachments). Follow/unfollow + the aggregated view ARE built
 (thread_follows/thread_reads, daemon/migrate.c:751,759; LIST_THREADS 0x00D1 /
 SET_THREAD_FOLLOW 0x00D4).
 
-## 59. A parent message shows a reply count but not the recent repliers
+## 61. A parent message shows a reply count but not the recent repliers
 
 The parent message shows a reply count but never the most recent repliers.
 
@@ -976,7 +1014,7 @@ cannot tell a conversation they are in from one they are not.
 (shared/protocol.h:649); Win32 draws "↳ N replies"
 (client/gui/win32/winmain.c:3331-3334) with no repliers.
 
-## 60. Mark-all-read loops per channel with no bulk server operation
+## 62. Mark-all-read loops per channel with no bulk server operation
 
 Mark-all-read has no bulk server op; the client loops CLIENT_ACK per channel.
 
@@ -985,7 +1023,7 @@ Mark-all-read has no bulk server op; the client loops CLIENT_ACK per channel.
 **Verified** — client/gui/win32/winmain.c:14728 loops oc_client_mark_read over every channel;
 no bulk opcode in shared/protocol.h
 
-## 61. The optional `.well-known` half of workspace resolution is unused
+## 63. The optional `.well-known` half of workspace resolution is unused
 
 The optional .well-known half of workspace resolution is never consulted.
 
@@ -995,7 +1033,7 @@ record cannot be discovered.
 **Verified** — client/core/resolve.c:83-108 does SRV _openchime._tcp.<domain> then an A-record
 fallback at 443; grep 'well.known' client/core/resolve.c -> 0 hits
 
-## 62. Switching workspaces does not flush the composer safely
+## 64. Switching workspaces does not flush the composer safely
 
 Switching workspaces neither flushes nor clears the composer, and can write one
 workspace's text as a draft in another.
@@ -1011,7 +1049,7 @@ edit control. The debounce at winmain.c:16266 then calls draft_flush(g_sel)
 with the NEW workspace's channel id while the box still holds the OLD
 workspace's text.
 
-## 63. Context-menu actions are reachable only by right-click
+## 65. Context-menu actions are reachable only by right-click
 
 Context-menu actions are reachable only by right-click — no keyboard route.
 
@@ -1026,7 +1064,7 @@ show_msg_menu() is called only from mouse handlers
 handler anywhere; SHORTCUTS[] (winmain.c:4549) documents "Right-click — Actions
 for a message, member or channel" as the only route.
 
-## 64. A muted conversation still counts toward the rail badge
+## 66. A muted conversation still counts toward the rail badge
 
 A muted conversation still counts toward the cross-workspace rail badge.
 
@@ -1039,7 +1077,7 @@ clause most obviously covers.
 but ws_unread_elsewhere (winmain.c:13540-13548) sums m->channels[c].unread with
 no mute check.
 
-## 65. Keywords and priority people are ignored by the desktop toast
+## 67. Keywords and priority people are ignored by the desktop toast
 
 Keywords and priority people are honoured by push but ignored by the Win32
 desktop-toast gate.
@@ -1054,7 +1092,7 @@ daemon/push.c:354,380 priority pierce). Win32 sets both lists
 (oc_client_set_keywords/set_priority) and highlights keywords (winmain.c:3056),
 but the toast gate at winmain.c:16463-16470 tests only oc_mention_targets().
 
-## 66. A forwarded message loses its attachments and its reference
+## 68. A forwarded message loses its attachments and its reference
 
 Forward is a client-side quoted copy; attachments do not travel and the
 reference is not structured.
@@ -1067,7 +1105,7 @@ embedded copy) was resolved by accident, not by decision.
 excerpt\nopenchime://…" and sends it through the ordinary send path; no wire
 field, no daemon handling, `n_attach` is not carried across.
 
-## 67. Read receipts have no privacy control and no not-retroactive rule
+## 69. Read receipts have no privacy control and no not-retroactive rule
 
 Read receipts have no privacy control and no not-retroactive rule.
 
@@ -1079,7 +1117,7 @@ oc_model_seen_by (client/core/model.c:304), rendered at
 client/gui/win32/winmain.c:5676-5680. `grep -rn receipt daemon client` finds
 nothing — no deployment switch, no per-user opt-out.
 
-## 68. Only the transient pause is visible to other people
+## 70. Only the transient pause is visible to other people
 
 Only the transient pause is visible to other people; the recurring schedule and
 OOO are not.
@@ -1094,7 +1132,7 @@ dnd_of() reads only conn->dnd_until_ms — the REQ-278 pause.
 dnd_mode/allow_start_min are never consulted, and no out-of-office state
 exists.
 
-## 69. The audit log records no successful sign-in
+## 71. The audit log records no successful sign-in
 
 No access log: successful sign-ins, invite redemption, owner bootstrap and
 channel-member removal are never audited.
@@ -1109,7 +1147,7 @@ entry for a successful auth, none in process_redeem_invite, none at the REQ-024
 owner bootstrap (dbwriter.c:912), and none on channel kick — all four are named
 in REQ-251's catalog (docs/REQUIREMENTS.md:1639-1648)
 
-## 70. The low-hundreds concurrency target has never been measured
+## 72. The low-hundreds concurrency target has never been measured
 
 The low-hundreds concurrency claim has never been measured.
 
@@ -1120,7 +1158,7 @@ regression would be invisible.
 the capacity plausibly exists; there is no soak or scale test in tests/
 (docs/BACKLOG.md #21 records the same absence).
 
-## 71. There is no data import and no workspace export
+## 73. There is no data import and no workspace export
 
 No data import and no workspace export.
 
@@ -1133,7 +1171,7 @@ import/export job in daemon/dbwriter.h's OC_JOB_* list. Not covered by REQ-252
 (legal hold), whose export half docs/REQUIREMENTS.md:1665 explicitly narrowed
 out
 
-## 72. There is no migration path from another product
+## 74. There is no migration path from another product
 
 No data import / migration path.
 
@@ -1141,7 +1179,7 @@ No data import / migration path.
 
 **Verified** — grep -rniE 'importer|REQ-254' daemon/ client/ -> 0 hits
 
-## 73. The chrome-fit check cannot see clipped text
+## 75. The chrome-fit check cannot see clipped text
 
 `chromefit` compares published element rectangles. It has no view of glyph
 extents, so text cut mid-character inside a correctly-sized box reads as clean.
@@ -1153,7 +1191,7 @@ cannot see the defect class it is trusted for will
 keep certifying it. **Verified** — screenshot compared against the same run's
 `chromefit` line, 2026-08-02.
 
-## 74. The chrome-fit overlap test has no z-layer exemption
+## 76. The chrome-fit overlap test has no z-layer exemption
 
 The "outside" half of the check exempts elements that legitimately sit behind a
 modal; the overlap half compares every published pair with only a containment
@@ -1166,7 +1204,7 @@ painted opaquely over a dimmed scrim before the button is drawn. A check that
 cries wolf gets discounted, which is how a real failure beside it gets missed.
 **Verified** — the reported geometry is real; the interpretation is not.
 
-## 75. Echo cancellation has no test harness
+## 77. Echo cancellation has no test harness
 
 AUDIO.md §6.4 designs an ERLE measurement with a synthetic impulse response, and
 the testing documentation described it as if it ran. `tests/test_audio.c` covers
@@ -1177,7 +1215,7 @@ not exist ("The audio client does not exist"). The documentation has been
 corrected. **Verified** — no ERLE
 or AEC symbol anywhere in the tree.
 
-## 76. There is no large-scale soak test
+## 78. There is no large-scale soak test
 
 Capacity is measured at points in time (`Scripts/bench.sh`): ~5 MB baseline,
 ~50 KB per idle connection, p50 2–3 ms round-trip, ~2 logins/s.
@@ -1186,7 +1224,7 @@ Capacity is measured at points in time (`Scripts/bench.sh`): ~5 MB baseline,
 exhaustion. The figures that exist are honest and were corrected once already
 when the harness proved to be the limit. **Verified** — TESTING.md §5.
 
-## 77. The GUI smoke suite does not run in CI
+## 79. The GUI smoke suite does not run in CI
 
 The daemon is epoll-based and Linux-only; GitHub's Windows runners cannot host
 it. The job exists and skips.
@@ -1196,7 +1234,7 @@ pushing. `REQ-290`'s automation ids (built, WIN-110) are what a UIA-driven suite
 on a self-hosted Windows runner would need; that runner does not exist.
 **Verified** — the suite ran locally on 2026-08-02 and reported 249 checks.
 
-## 78. Most Win32 features have never been driven and observed
+## 80. Most Win32 features have never been driven and observed
 
 The feature inventory extracted from the code — every rail and shelf destination,
 composer control, message/channel/member/profile/workspace menu item, keyboard
@@ -1210,7 +1248,7 @@ checks that exist, not about the client. **Verified** — the inventory and its
 method were recorded in `FEATURE_AUDIT.md`, now folded here; the rows were never
 filled in.
 
-## 79. A click on empty modal background reaches the shell behind it
+## 81. A click on empty modal background reaches the shell behind it
 
 `modal_frame_click` returns 0 for a click inside the card that matches no footer
 button, and the notification card's hit tests fall through when nothing matches,
@@ -1223,7 +1261,7 @@ whenever a card overlaps the sidebar column, which at 240 DPI is the default
 window. **Verified** — found while refuting "The chrome-fit overlap test has no
 z-layer exemption"; distinct from it.
 
-## 80. The Drafts pane's "Sent" tab is laid out off-window at large scale
+## 82. The Drafts pane's "Sent" tab is laid out off-window at large scale
 
 The tab strip measures each label from the scaled font and advances by it, with
 no wrap, no clamp to the pane's right edge and no scroller. Past roughly 591 DIP
@@ -1236,7 +1274,7 @@ unreachable at large text size with zoom, in a window narrower than the tabs
 need. **Verified** — the smoke's chrome-fit matrix failed on exactly this
 (`outside=1 out="drafts.tab.sent"`) on 2026-08-02.
 
-## 81. The Notifications card clips its own content at high DPI, and the hidden rows stay live
+## 83. The Notifications card clips its own content at high DPI, and the hidden rows stay live
 
 The card's prologue advances by raw unscaled constants while the fonts and the
 card frame scale, and the only scroller covers the per-channel list at the
@@ -1256,7 +1294,7 @@ high DPI. This is the functional half that `WIN-111` explicitly deferred as a
 behaviour change; the vertical clipping of the titles it recorded as fixed is not
 fixed. **Verified** — screenshot plus the dump's own geometry, 2026-08-02.
 
-## 82. A thread reply notifies nobody
+## 84. A thread reply notifies nobody
 
 Thread replies never produce a notification decision.
 
@@ -1267,7 +1305,7 @@ channel-level sends do.
 calls oc_push_notify) vs daemon/netloop.c:2037 (OC_RES_SENT does);
 daemon/dbwriter.c:3212 comment names it a gap
 
-## 83. Notifications have no sound, no badge and no preview toggle
+## 85. Notifications have no sound, no badge and no preview toggle
 
 Notification rendering: no sounds, no unread/taskbar badge, no window flash, no
 content-preview toggle.
@@ -1279,7 +1317,7 @@ on the taskbar, and no way to keep message text off the screen.
 grep -niE 'PlaySound|ITaskbarList|OverlayIcon|FlashWindow' winmain.c -> 0
 notification hits; grep 'preview.*toast|show_preview' -> 0 hits
 
-## 84. Closing the window quits the app and ends all notification
+## 86. Closing the window quits the app and ends all notification
 
 WM_CLOSE quits the app; no close-to-tray and no taskbar flash, with no stated
 contract.
@@ -1291,7 +1329,7 @@ product call.
 **Verified** — client/gui/win32/winmain.c:17156-17188 WM_CLOSE falls through to DefWindowProcW
 after the unsent-outbox prompt; tray_done() in WM_DESTROY:17193
 
-## 85. Nothing states what an unread badge counts
+## 87. Nothing states what an unread badge counts
 
 Nothing states what an unread badge counts.
 
@@ -1302,7 +1340,7 @@ should be the quieter reading (badge = what was worth notifying).
 client keeps its own high-water (client/core/model.h:98-101); no requirement
 reconciles them
 
-## 86. A user cannot follow every thread in a channel
+## 88. A user cannot follow every thread in a channel
 
 Cannot follow every thread in a channel.
 
@@ -1312,7 +1350,7 @@ missed.
 **Verified** — daemon/migrate.c:225-230 + :521 notification_prefs has only level and muted; no
 per-channel thread-follow column and no op in shared/protocol.h
 
-## 87. There are no reminders and no saved-item due dates
+## 89. There are no reminders and no saved-item due dates
 
 Reminders and saved-item due dates.
 
@@ -1322,7 +1360,7 @@ ARCH-78 pass defaults to 5 min, a different promise from firing on the minute.
 **Verified** — grep -rniE 'remind_at|reminder' daemon/ shared/ client/core/ -> only an emoji
 keyword; saved_items (migration 0025, daemon/migrate.c:494) has no remind_at_ms
 
-## 88. A call starting raises no notification
+## 90. A call starting raises no notification
 
 A call starting raises no notification.
 
@@ -1333,7 +1371,7 @@ with the audio client.
 **Verified** — daemon/netloop.c:1588-1596 CALL_JOIN submits an access-gate job only; no
 oc_push_notify or fan-out on an empty roster becoming non-empty
 
-## 89. The notify decision has no single evaluator and no precedence order
+## 91. The notify decision has no single evaluator and no precedence order
 
 No single notify evaluator: the precedence rule is split between push SQL and
 each client.
@@ -1347,7 +1385,7 @@ still undecided, including whether priority people pierce a pause.
 lives in daemon/push.c:334-425 SQL and separately in
 client/gui/win32/winmain.c:16462-16463
 
-## 90. There are no workspace-default quiet hours
+## 92. There are no workspace-default quiet hours
 
 Workspace default DND hours — blocked on there being no tenant-settings
 surface.
@@ -1358,7 +1396,7 @@ configure their own.
 **Verified** — daemon/migrate.c:672-735 (0034) stores dnd_mode/allow_*_min per user only; no
 tenant-level default column or op
 
-## 91. Invites are single-use only, with no shareable link
+## 93. Invites are single-use only, with no shareable link
 
 Invite management (pending list, revoke, expiry) IS built; only multi-use
 shareable links are missing.
@@ -1370,7 +1408,7 @@ started' both overstate the gap.
 (0x004B-0x004E); daemon/dbwriter.c:4894,4933; daemon/migrate.c:85-91 invites
 has expires_at_ms + consumed_at_ms (single-use); client/core/client.c:681,688
 
-## 92. There are no guest accounts
+## 94. There are no guest accounts
 
 Guest accounts — no channel-scoped role.
 
@@ -1380,7 +1418,7 @@ be excluded.
 **Verified** — daemon/roles.c/roles.h and daemon/migrate.c CHECK (role IN
 ('owner','admin','member')) — grep 'guest' -> 0 hits
 
-## 93. The admin console has no member table and no bulk actions
+## 95. The admin console has no member table and no bulk actions
 
 Admin console exists as a rail view but has no member table, no bulk actions
 and no analytics.
@@ -1392,7 +1430,7 @@ time and has no usage picture.
 Invites only; role change and remove are per-member context actions; no
 aggregate/analytics op in shared/protocol.h
 
-## 94. There is no workspace-settings surface at all
+## 96. There is no workspace-settings surface at all
 
 No workspace-settings surface at all: name is env-only, no icon, default
 channels or join policy.
@@ -1404,7 +1442,7 @@ daemon's environment; blocks REQ-279.
 shared/protocol.h:566 oc_workspace_info is read-only (deployment_mode,
 max_users, workspace_name); no SET_WORKSPACE_* opcode exists
 
-## 95. A URL cannot be authored as a link and is not clickable
+## 97. A URL cannot be authored as a link and is not clickable
 
 No hyperlink construct: cannot author a link, and a URL in a message is not
 clickable.
@@ -1419,7 +1457,7 @@ winmain.c:1184 FMT_* toolbar has no link button; `grep -E
 'ShellExecute|CreateProcess|WinExec' client/gui/win32/winmain.c` returns
 nothing, so no URL can be opened from the client at all
 
-## 96. There are no link unfurls
+## 98. There are no link unfurls
 
 Link unfurls.
 
@@ -1427,7 +1465,7 @@ Link unfurls.
 
 **Verified** — grep -rni 'unfurl' daemon/ client/ shared/ -> 0 hits
 
-## 97. There are no native polls
+## 99. There are no native polls
 
 Native polls.
 
@@ -1435,7 +1473,7 @@ Native polls.
 
 **Verified** — no poll/vote message type in shared/protocol.h; grep for poll+vote -> 0 hits
 
-## 98. There is no first-class snippet object
+## 100. There is no first-class snippet object
 
 Snippets: fenced code blocks render, but there is no first-class snippet
 object.
@@ -1447,7 +1485,7 @@ can share and open on its own.
 fenced blocks; grep 'snippet' finds only FTS search snippets
 (client/core/model.h:137)
 
-## 99. Local auth has no second factor
+## 101. Local auth has no second factor
 
 No MFA/2FA in local auth mode.
 
@@ -1457,7 +1495,7 @@ deployment.
 **Verified** — grep -rniE 'totp|mfa|2fa|two-factor' daemon/ shared/ client/core/ -> 0 hits;
 auth is PBKDF2 password only (daemon/auth.c)
 
-## 100. There is no IP allowlist
+## 102. There is no IP allowlist
 
 No IP allowlist / access restriction.
 
@@ -1466,7 +1504,7 @@ No IP allowlist / access restriction.
 **Verified** — grep -rn 'allowlist|allow_list' daemon/ -> 0 hits; only
 OPENCHIME_MAX_CONNS_PER_IP throttling in the accept loop
 
-## 101. There is no message retention policy
+## 103. There is no message retention policy
 
 Opt-in message retention policy — nothing ages out messages.
 
@@ -1476,7 +1514,7 @@ Opt-in message retention policy — nothing ages out messages.
 **Verified** — daemon/storage.c:23 only OPENCHIME_ATTACH_MAX_AGE_DAYS (REQ-217); no message-
 pruning statement anywhere in daemon/dbwriter.c
 
-## 102. There is no legal hold
+## 104. There is no legal hold
 
 Legal hold — needs ARCH decision, narrowed to REQ-276/277.
 
@@ -1485,7 +1523,7 @@ REQ-277.
 
 **Verified** — grep -rniE 'legal_hold|LEGAL' daemon/ -> 0 hits
 
-## 103. There is no compliance capture
+## 105. There is no compliance capture
 
 Compliance capture (vendor push + pull API) scoped but unbuilt.
 
@@ -1496,7 +1534,7 @@ over SMTP journaling (file-drop first) and our own documented pull API.
 **Verified** — no SMTP/journaling/export code in daemon/; drafts are declared in scope for it
 (docs/REQUIREMENTS.md:1745)
 
-## 104. There is no send-time DLP
+## 106. There is no send-time DLP
 
 Send-time DLP pre-post webhook scoped but unbuilt.
 
@@ -1506,7 +1544,7 @@ suite.
 
 **Verified** — no pre-post hook in daemon/dbwriter.c process_send; grep for DLP -> 0 hits
 
-## 105. There is no app or bot platform
+## 107. There is no app or bot platform
 
 No app/bot identity model and no slash-command dispatch.
 
@@ -1516,7 +1554,7 @@ the third-party route around REQ-270) has no foundation.
 **Verified** — No bot identity column or table in daemon/migrate.c; no install/registration
 opcodes in shared/protocol.h; the Win32 composer has no slash dispatcher.
 
-## 106. There are no outgoing webhooks
+## 108. There are no outgoing webhooks
 
 No outgoing webhooks / event subscriptions.
 
@@ -1527,7 +1565,7 @@ complement.
 daemon/migrate.c; no outbound delivery/retry/signing code beyond enroll.c and
 push.c, which are both fixed-endpoint.
 
-## 107. There is no workflow automation
+## 109. There is no workflow automation
 
 No workflow automation.
 
@@ -1535,7 +1573,7 @@ No workflow automation.
 
 **Verified** — No trigger/action model anywhere in daemon/ or shared/protocol.h.
 
-## 108. There is no app-directory client surface
+## 110. There is no app-directory client surface
 
 No app directory (federated function).
 
@@ -1545,7 +1583,7 @@ this repo.
 **Verified** — No directory client in daemon/ (only enroll.c and push.c call out); nothing in
 client/gui/win32.
 
-## 109. There is no third-party API or SDK
+## 111. There is no third-party API or SDK
 
 No third-party API or SDK.
 
@@ -1554,7 +1592,7 @@ No third-party API or SDK.
 **Verified** — the only wire is the custom binary protocol (shared/protocol.h); the sole HTTP
 surface is POST /webhook/<token> (daemon/netloop.c:1813)
 
-## 110. There is no email-to-channel ingestion
+## 112. There is no email-to-channel ingestion
 
 No email-to-channel ingestion.
 
@@ -1564,7 +1602,7 @@ mail receiver.
 **Verified** — no inbound-mail path anywhere in daemon/; the only ingress handlers are the
 oc/1 protocol and the webhook POST
 
-## 111. Screenshare is designed and unbuilt
+## 113. Screenshare is designed and unbuilt
 
 Screenshare designed but zero code, with four unresolved design questions.
 
@@ -1575,7 +1613,7 @@ CALL_JOINED. Sequenced behind the audio client.
 **Verified** — grep -rniE 'vp9|libvpx|screenshare|screen_share' (excluding third_party) -> 0
 hits
 
-## 112. The webhook endpoint has no CA-signed certificate
+## 114. The webhook endpoint has no CA-signed certificate
 
 No CA-signed certificate for the webhook endpoint; no ACME/on-demand issuance.
 
@@ -1587,7 +1625,7 @@ third-party sender and a working webhook.
 webhook endpoint rides the TOFU self-signed cert (shared/tls.c,
 daemon/netloop.c:3776)
 
-## 113. A webhook can post into an archived channel
+## 115. A webhook can post into an archived channel
 
 Archiving makes a channel read-only, and `SEND`, `SEND_REPLY` and `UPLOAD_BEGIN`
 all enforce it through one shared access check. The incoming-webhook post path
@@ -1602,7 +1640,7 @@ from `453782f`, a POST to a live token on an archived channel returned
 `HTTP 200 {"ok":true,"message_id":1}` and the row is in `messages`. No test
 covers it.
 
-## 114. Editing a profile drops the connection and saves nothing
+## 116. Editing a profile drops the connection and saves nothing
 
 `OC_MSG_SET_PROFILE` and `OC_MSG_SET_PRESENCE` are both `0x0070`, and the
 daemon's dispatch chain tests `SET_PRESENCE` first, so the `SET_PROFILE` branch
@@ -1618,7 +1656,7 @@ which is why it has gone unnoticed. Nothing exercises `SET_PROFILE` over the
 wire in any test. **Verified** — full chain read and the decode reproduced
 against the real codec.
 
-## 115. The push emitter has no client that can register a device
+## 117. The push emitter has no client that can register a device
 
 The daemon owns the device-token registry and emits signed, contentless push
 batches to the control-plane gateway. `REGISTER_DEVICE_TOKEN` is sent by no
@@ -1632,7 +1670,7 @@ frames no client sends.
 
 ---
 
-## 116. The audio client does not exist
+## 118. The audio client does not exist
 
 Call signalling, the per-channel roster, per-join tokens and the forked UDP relay
 sidecar are built and tested server-side. The client half is absent: no Opus, no
@@ -1644,7 +1682,7 @@ behind it — screenshare (REQ-161), the call-start notification (REQ-285), and 
 Huddles surface the Win32 sidebar deliberately omits because a row would point at
 nothing. **Verified** — no `CALL_*` in `client/core`.
 
-## 117. No client can complete an OIDC login
+## 119. No client can complete an OIDC login
 
 The daemon verifies a re-issued ES256 token and the control plane mints one, but
 the client half — the system-browser flow, PKCE, and the loopback redirect that
@@ -1658,7 +1696,7 @@ user. `scripts/demo-oidc.sh` proves the mint↔verify contract with a dev endpoi
 deliberately bypassing the browser flow. **Verified** — no OIDC entry point in
 the facade; REQ-020 and AUTH.md §7 both record it.
 
-## 118. The TLS handshake rejects every standard HTTPS client, so incoming webhooks are unreachable
+## 120. The TLS handshake rejects every standard HTTPS client, so incoming webhooks are unreachable
 
 The daemon advertises exactly one ALPN protocol, `oc/1`. A client that offers any
 other protocol list — which is every ordinary HTTPS client, including `curl`,
@@ -1698,6 +1736,62 @@ produced 13 failing assertions across the two suites, 2 of them in the new
 `test_tls_alpn_demux` and the rest the webhook path in `itest_netloop`.
 
 ---
+
+## 121. The Windows signing step names a service that no longer exists
+
+`release.yml` signs with `azure/trusted-signing-action@v0` and passes
+`trusted-signing-account-name`. Azure renamed Trusted Signing to **Artifact
+Signing** in January 2026: the action moved to `Azure/artifact-signing-action`,
+that input is deprecated in favour of `signing-account-name`, and the RBAC role
+became *Artifact Signing Certificate Profile Signer*.
+
+Separately, and more seriously, the step passes **no Azure authentication at
+all** — no `azure-tenant-id`/`azure-client-id`/`azure-client-secret`, and no
+`azure/login` step before it. The three inputs it does pass identify which
+signing profile to use; none of them prove the caller may use it.
+
+*Impact:* The first real release fails at the signing step, and because
+`publish` needs `windows-package`, the Linux repositories do not publish either.
+No dry run can catch it: signing is gated off whenever `dry_run` is true.
+
+**Verified** — release.yml:329 and :352 use the old action and input;
+`Azure/artifact-signing-action`'s `action.yml` lists `signing-account-name` with
+`trusted-signing-account-name` marked deprecated, and lists the azure-* auth
+inputs this workflow omits.
+
+## 122. The MSIX carries three placeholder identity values
+
+`packaging/windows/msix/AppxManifest.xml` ships `Identity/@Name`,
+`Identity/@Publisher` and `PublisherDisplayName` as literal placeholders. They
+can only be filled from a reserved Partner Center name, which does not exist
+yet.
+
+*Impact:* The Store channel cannot ship. The failure is late by construction —
+a package whose `Publisher` does not match the account certificate subject is
+rejected **at submission, not at pack time**, so CI builds it green every run.
+
+**Verified** — AppxManifest.xml:34-35 and :41 read
+`CN=REPLACE-WITH-PARTNER-CENTER-PUBLISHER-ID` and are packed unchanged by
+release.yml's `Build the MSIX` step, which rewrites only `Version`. Artifact
+Signing's own FAQ lists error `0x8007000b` for exactly this mismatch, and
+states the subject cannot be customised — it is the validated legal name.
+
+## 123. The publish job has never executed
+
+Every dry run skips `publish` (`if: inputs.dry_run == false`), and no real
+release has been run. So repository signing, `apt-ftparchive` and
+`createrepo_c` index generation, the object layout, the upload, and the
+clean-room install smoke have all been written and none have been observed.
+
+*Impact:* The largest untested surface in the pipeline, and it only runs when it
+matters. Two defects in it have already been found by reading rather than
+running — a missing `rpm` binary for `rpm --addsign`, and the `curl` /
+`curl-minimal` conflict — which is evidence about the class, not a claim that
+the rest is wrong.
+
+**Verified** — release.yml `publish` and `winget` both carry
+`if: inputs.dry_run == false`; dry run 30954057012 shows both SKIPPED;
+`git tag -l 'release-*'` is empty as of 2026-08-06.
 
 ## Recorded and closed without a fix
 
