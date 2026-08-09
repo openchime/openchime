@@ -3155,6 +3155,27 @@ static void test_attachments(void) {
         oc_dbres_free(r);
     }
 
+    /* And ANOTHER USER replaying alice's token on the same channel gets their
+     * own new row, never hers. This is the case that makes the lookup key
+     * (channel, uploader, token) rather than SEND's (channel, token): what comes
+     * back is a storage key the net loop opens for WRITING, so handing bob the
+     * row alice declared would let him stream over her file. Guessing 128 random
+     * bits is not a threat — but the row already records its owner, so there is
+     * no reason for the question to exist. */
+    {
+        j = oc_job_new(OC_JOB_ATTACH_CREATE, 1);
+        j->user_id = bob; j->channel_id = OC_DEFAULT_CHANNEL; j->att_size = 2048;
+        memcpy(j->idem, idem, sizeof idem);          /* alice's token, verbatim */
+        j->filename = strdup("notes.txt"); j->mime = strdup("text/plain");
+        oc_dbwriter_submit(w, j);
+        r = wait_result(w);
+        CHECK(r && r->type == OC_RES_ATTACH_CREATED);
+        CHECK(r && r->attachment_id != aid);         /* not alice's row */
+        CHECK(r && r->storage_key && strcmp(r->storage_key, key_copy) != 0);
+        CHECK(r && r->duplicate == 0);
+        oc_dbres_free(r);
+    }
+
     /* A download LOOKUP before finalize fails — the blob is not complete. */
     j = oc_job_new(OC_JOB_ATTACH_LOOKUP, 2);
     j->user_id = bob; j->attachment_id = aid;

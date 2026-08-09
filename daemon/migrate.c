@@ -734,24 +734,6 @@ static const char MIGRATION_0035[] =
     "  PRIMARY KEY (user_id, person_id)"
     ") WITHOUT ROWID;";
 
-static const char MIGRATION_0037[] =
-    /* Make UPLOAD_BEGIN idempotent (BACKLOG "`UPLOAD_BEGIN` is not idempotent").
-     *
-     * The frame has always carried a 16-byte idempotency token and the daemon
-     * has always copied it into the job — and then never read it, so a retry
-     * after a dropped connection minted a second pending row for the same
-     * upload. SEND solves this with a `sent_messages` map; attachments do not
-     * need a second table, because unlike a message an attachment row is
-     * RECLAIMABLE (REQ-215/217): a map keyed to a row the storage sweep later
-     * deletes would hand a client back an id for something that no longer
-     * exists. Holding the token on the row itself means it dies with the row.
-     *
-     * NULL for every existing row, and NULLs do not collide in a UNIQUE index —
-     * so the constraint applies only to rows minted from here on. */
-    "ALTER TABLE attachments ADD COLUMN idem_token BLOB;"
-    "CREATE UNIQUE INDEX idx_attachments_idem ON attachments(channel_id, idem_token)"
-    "  WHERE idem_token IS NOT NULL;";
-
 static const char MIGRATION_0036[] =
     /* The aggregated Threads view (REQ-062, ARCH-104, WIN-108).
      *
@@ -781,6 +763,36 @@ static const char MIGRATION_0036[] =
     "  updated_ms          INTEGER NOT NULL DEFAULT 0,"
     "  PRIMARY KEY (user_id, root_id)"
     ") WITHOUT ROWID;";
+
+static const char MIGRATION_0037[] =
+    /* Make UPLOAD_BEGIN idempotent (BACKLOG "`UPLOAD_BEGIN` is not idempotent").
+     *
+     * The frame has always carried a 16-byte idempotency token and the daemon
+     * has always copied it into the job — and then never read it, so a retry
+     * after a dropped connection minted a second pending row for the same
+     * upload. SEND solves this with a `sent_messages` map; attachments do not
+     * need a second table, because unlike a message an attachment row is
+     * RECLAIMABLE (REQ-215/217): a map keyed to a row the storage sweep later
+     * deletes would hand a client back an id for something that no longer
+     * exists. Holding the token on the row itself means it dies with the row.
+     *
+     * NULL for every existing row, and NULLs do not collide in a UNIQUE index —
+     * so the constraint applies only to rows minted from here on.
+     *
+     * Keyed on the UPLOADER as well as the channel, which `sent_messages` does
+     * not need to be: replaying a SEND token returns a message id, and replaying
+     * this one returns a WRITABLE handle — the net loop opens the row's storage
+     * key and lets the caller stream over it. Without the uploader in the key,
+     * one member replaying another's token in a channel they share is handed
+     * back that person's attachment. Guessing 128 random bits is not a threat,
+     * but the row already records who owns it and is the only one allowed to
+     * link it (§3g), so scoping the lookup the same way costs one column and
+     * removes the question. The index matches the lookup exactly, so the two
+     * cannot disagree about what "already declared" means. */
+    "ALTER TABLE attachments ADD COLUMN idem_token BLOB;"
+    "CREATE UNIQUE INDEX idx_attachments_idem"
+    "  ON attachments(channel_id, uploader_id, idem_token)"
+    "  WHERE idem_token IS NOT NULL;";
 
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },

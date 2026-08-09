@@ -453,12 +453,26 @@ loop. A client that did retry after a drop would create orphan pending rows,
 which the maintenance sweep would later reclaim. The documentation has been
 corrected. **Verified.**
 
-**FIXED 2026-08-03.** The daemon now honours the token instead of the
+**FIXED 2026-08-03, landed 2026-08-09.** The daemon now honours the token instead of the
 documentation being bent to match the code. `process_attach_create` looks up
 `(channel_id, idem_token)` first and returns the existing row — same
 `attachment_id`, same storage key, `duplicate = 1` — exactly as `SEND` does. A
 retrying client is one that never heard the first answer and whose next move is
 to stream bytes, so an identical reply is the right one.
+
+**The lookup key is `(channel, uploader, token)`, not SEND's `(channel,
+token)`** — found while landing this and fixed here rather than left as a note.
+Replaying a SEND token returns a message id; replaying this one returns a
+**storage key the net loop opens for writing**, so a key without the uploader in
+it hands one member the row another member declared, and the retry then streams
+over their file. Guessing 128 random bits is not a threat and this was never
+exploitable in practice, but the row already records its owner as the only user
+allowed to link it, so the question did not need to exist. The UNIQUE index
+carries the same three columns, because an index that does not match its lookup
+is two opinions about what "already declared" means. **Proven to fail:** with the
+uploader dropped from the lookup, a second user replaying the first's token is
+handed her `attachment_id`, her storage key and `duplicate = 1` — 3 failing
+assertions.
 
 **Why the token lives on the attachment row** (migration 0037) rather than in a
 `sent_messages`-style side map: an attachment is *reclaimable* (REQ-215/217). A

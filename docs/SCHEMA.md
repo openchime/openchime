@@ -371,9 +371,16 @@ only the pointer and metadata. Bytes are proxied through the daemon in chunks
   pending attachment.
 - `storage_key` (TEXT) — opaque object-storage key (never exposed on the wire).
 - `idem_token` (BLOB, nullable, migration 0037) — the 16-byte token from
-  `UPLOAD_BEGIN`, with a **partial** `UNIQUE (channel_id, idem_token) WHERE
-  idem_token IS NOT NULL`, which is what makes a retried declaration return the
-  first row instead of minting a second. Held here rather than in a
+  `UPLOAD_BEGIN`, with a **partial** `UNIQUE (channel_id, uploader_id,
+  idem_token) WHERE idem_token IS NOT NULL`, which is what makes a retried
+  declaration return the first row instead of minting a second. The **uploader
+  is in the key**, where `sent_messages` needs only `(channel, token)`: replaying
+  a SEND token returns a message id, while replaying this one returns a storage
+  key the net loop opens for *writing*, so a lookup that ignored the uploader
+  would let one member stream over another's attachment. The row already records
+  its owner as the only user allowed to link it (above), and the index matches
+  the lookup exactly so the two cannot disagree about what "already declared"
+  means. Held here rather than in a
   `sent_messages`-style side map because an attachment is *reclaimable*
   (REQ-215/217): a map row would outlive the attachment the storage sweep
   deleted and hand a client back an id for something gone. NULL on every row

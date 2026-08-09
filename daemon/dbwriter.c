@@ -3868,13 +3868,18 @@ static oc_dbres *process_attach_create(sqlite3 *db, const oc_job *j) {
      *
      * The reply is deliberately identical to a first attempt's — same id, same
      * storage key — because the retrying client is one that never heard the
-     * first answer, and its next move is to stream the bytes. */
+     * first answer, and its next move is to stream the bytes.
+     *
+     * Scoped to the UPLOADER too, unlike the `sent_messages` map: what comes
+     * back here is a key the net loop opens for WRITING, so this must not hand
+     * one member the row another member declared (migration 0037). */
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
         "SELECT id, storage_key, size FROM attachments "
-        "WHERE channel_id=? AND idem_token=?;", -1, &st, NULL);
+        "WHERE channel_id=? AND uploader_id=? AND idem_token=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
-    sqlite3_bind_blob (st, 2, j->idem, OC_IDEM_LEN, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
+    sqlite3_bind_blob (st, 3, j->idem, OC_IDEM_LEN, SQLITE_STATIC);
     if (sqlite3_step(st) == SQLITE_ROW) {
         r->type = OC_RES_ATTACH_CREATED;
         r->attachment_id = (uint64_t)sqlite3_column_int64(st, 0);
