@@ -23,6 +23,7 @@ construct shows its source legibly.
 | Blockquote | `> quoted` | At the start of a line. |
 | Bulleted list | `- item` | At the start of a line. **Not Slack** — see §4. |
 | Ordered list | `1. item` | At the start of a line. **Not Slack** — see §4. |
+| Link | `https://example.com` | Not typed as markup: a bare `http`/`https` address is **autolinked**. There is no syntax for a labelled link — see §4. |
 
 Emphasis nests (`*bold with _italic_ inside*`); code does not — everything inside
 a code span or block is literal, including other delimiters.
@@ -109,11 +110,41 @@ the search index and into every client that renders the body literally, and a
 user typing `<` in ordinary prose would see it mangled. So `&`, `<` and `>` are
 ordinary characters and a URL is ordinary text.
 
-**A URL is not a construct.** The parser emits no link span — `OC_RT_*`
-(`client/core/richtext.h`) covers bold, italic, strike, code, code block, quote,
-bullet and ordered list, and nothing else — so no client detects, styles or
-opens a URL, and no client fetches a preview for one. Autolinking and REQ-222's
-unfurl are both unbuilt; they are backlog items, not properties of this dialect.
+**A URL needs no construct — it autolinks.** A bare `http://` or `https://`
+address yields one `OC_RT_LINK` span over exactly the address, with **no
+delimiter span**, because there is no markup around it to hide: the address is
+its own label. This is why there is no authoring syntax to go with it. Slack's
+`<url|label>` is declined above, and a Markdown `[label](url)` form was
+considered and not taken — a link whose visible text can say anything while it
+points elsewhere is the shape every phishing message wants, and in a chat client
+the address IS the trustworthy part. Pasting a URL is what people do anyway.
+
+**Only `http` and `https`.** A link span is what a frontend hands to the
+operating system, so this list is the set of things a message can ask a reader's
+machine to open. `file://`, `javascript:`, `mailto:` and anything else stay
+ordinary text. The restriction lives in the shared parser rather than in each
+frontend, which is what stops two clients answering a security question
+differently — the same argument ARCH-89 makes for the mention scanner.
+
+**Where an address ends** is the part with all the edge cases, and the rule is
+that trailing punctuation belongs to the sentence: `see https://example.com.`
+links the address and not the full stop. A closing bracket counts only if the
+address opened it, so `(see https://example.com/a)` drops the `)` while
+`https://en.wikipedia.org/wiki/Foo_(bar)` keeps it. `*` and `~` are trimmed too,
+so `*https://example.com*` is a bold link — but **`_` deliberately is not**,
+because underscores are ordinary inside real addresses and asterisks are not.
+The consequence is recorded rather than hidden: `_https://example.com_` links
+`https://example.com_` and is not italic. Trimming a character the address owns
+changes where the link goes, silently, which is a worse failure than an italic
+that does not render.
+
+Emphasis never reaches inside an address either — the closer search steps over a
+URL exactly as it steps over a code span — so an `_` in a path cannot end an
+italic run that opened before it.
+
+REQ-222's **unfurl** (fetching a title and thumbnail for a link) is a different
+feature and remains unbuilt: it needs a server-side fetcher, and it is a backlog
+item rather than a property of this dialect.
 
 **No underline.** Slack's toolbar offers it; its `mrkdwn` has no syntax for it,
 and an underline is indistinguishable from a link in most renderings.
@@ -168,6 +199,15 @@ business:
   formatting goes, the markup never appears. That last rule is forced: keeping
   `x` emphasised in `a*x*` would need the word-boundary rule of §2 to bend, and
   that rule is what stops `a_variable_name` becoming italic.
+  **A link is accent + underline, and the cursor is the affordance** (WIN-112).
+  Colour alone is not one — it is what a `@mention` already wears, and it says
+  nothing to a reader who cannot distinguish it — so the underline carries "this
+  goes somewhere" and the hand cursor confirms it before the click. Opening
+  happens on **release over the same address the press landed on**, not on press,
+  so dragging a selection that starts inside a URL still selects rather than
+  launching a browser; sliding off before letting go cancels, as everywhere else.
+  `ShellExecuteW` re-checks the scheme even though the parser already guaranteed
+  it, because that call is the dangerous end.
 - **TUI** — tuikit attributes; code blocks and blockquotes get in-band markers
   since a terminal has no proportional styling to lean on. **Not built yet** —
   the parser is shared and waiting for it, and until then the TUI shows the

@@ -1457,6 +1457,51 @@ winmain.c:1184 FMT_* toolbar has no link button; `grep -E
 'ShellExecute|CreateProcess|WinExec' client/gui/win32/winmain.c` returns
 nothing, so no URL can be opened from the client at all
 
+**FIXED 2026-08-09 — the READING half, by autolinking; there is deliberately no
+authoring syntax.** `OC_RT_LINK` joins the shared parser: a bare `http(s)`
+address becomes one span over exactly the address, and the Win32 client draws it
+accent + underlined, shows a hand cursor, and opens it with `ShellExecuteW`.
+MARKDOWN.md §4 is amended from "a URL is not a construct" to the rule that now
+holds — which is also what ARCH-100 already said would happen ("URLs autolink
+from the bare text instead"), so the code and the decision agree again.
+
+**The item's title asked for two things and one of them was declined.** A
+labelled-link syntax (`[label](url)`, or Slack's `<url|label>`) would let the
+visible text say one thing while the address says another, which is the shape a
+phishing message wants, and in a chat client the address is the trustworthy
+part. Recorded as a choice, not an omission.
+
+**Only `http` and `https` produce a span**, which is what keeps a message from
+pointing `ShellExecute` at `file://` or a custom scheme. The restriction is in
+the shared parser rather than in the frontend, so every client inherits it.
+
+Measured: `tests/test_richtext.c` gains 30 assertions covering the scheme
+restriction, the end-of-address rules (trailing punctuation, balanced brackets),
+suppression inside code, composition with emphasis, and byte offsets. **Proven
+to fail** — admitting `file://` to `url_scheme_len` turns the suite red on
+`content_spans("file:///etc/passwd", OC_RT_LINK) == 0`.
+
+That proof is the reason a second defect is not in this tree: the first attempt
+gated the parser call on the first byte being `h`, so the *scheme list* was not
+what rejected `file://` and the same test passed with the mutation in place —
+green for the wrong reason, and a trap for whoever added a scheme later. The
+gate is deleted and `url_scheme_len` is the only place schemes are decided.
+
+**The Win32 half is built and compiles but has NOT been run** — there is no
+Windows host here and the GUI smoke does not run in CI (item 79). It is left
+assertable rather than asserted: the dump reports `link hover="<url>"`, and
+`scripts/gui_smoke.sh` gains a block that hovers `https://example.com/runbook.`
+and requires the reported address to exclude the sentence's full stop. Writing
+that block found a real defect before it shipped — the hover was computed inside
+the branch owning the transcript's x range, so moving the pointer into the rail
+left a stale hand cursor and a stale address; it is now computed unconditionally,
+and the "leaving the transcript clears it" check exists because that is the
+direction that was broken.
+
+Remaining, and deliberately not done here: registering `openchime://` with the
+OS (item 30), unfurls (item 98), and any TUI rendering — the span is shared, so
+the TUI inherits it the day it renders rich text at all (MARKDOWN.md §6).
+
 ## 98. There are no link unfurls
 
 Link unfurls.

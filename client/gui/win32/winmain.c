@@ -474,6 +474,13 @@ static uint64_t g_sel;              /* selected channel id (0 = none) */
 static float    g_scroll;           /* px scrolled up from the bottom of the transcript */
 static float    g_scroll_max;       /* recomputed each paint, for input clamping */
 static uint64_t g_hover_mid;        /* transcript message under the cursor (0 = none) */
+/* The URL under the cursor, and the one the press landed on (WIN-112). Two,
+ * not one, because a link opens on RELEASE over the same address it was pressed
+ * on: opening on press would make dragging a selection that starts inside a URL
+ * launch a browser instead, and copying a URL is the second most common thing
+ * anyone does with one. */
+static char g_link_hover[1024];
+static char g_link_down[1024];
 
 /* Custom transcript scrollbar (drawn over the D2D surface). Geometry is captured
  * each paint so the mouse handlers can hit-test and drag the thumb. */
@@ -2979,6 +2986,14 @@ static void apply_richtext(IDWriteTextLayout *layout, const char *u8, size_t ble
                 IDWriteTextLayout_SetDrawingEffect(layout, (IUnknown *)dim, tr);
             }
             continue;
+        }
+        /* A link is accent + underline (WIN-112, REQ-220). Underline as well as
+         * colour, because colour alone is not an affordance for a reader who
+         * cannot distinguish it — the accent is also what a @mention wears, and
+         * the underline is what says "this one goes somewhere". */
+        if (st & OC_RT_LINK) {
+            if (g_brush3) IDWriteTextLayout_SetDrawingEffect(layout, (IUnknown *)g_brush3, tr);
+            IDWriteTextLayout_SetUnderline(layout, TRUE, tr);
         }
         if (st & OC_RT_BOLD)   IDWriteTextLayout_SetFontWeight(layout, DWRITE_FONT_WEIGHT_BOLD, tr);
         if (st & OC_RT_ITALIC) IDWriteTextLayout_SetFontStyle(layout, DWRITE_FONT_STYLE_ITALIC, tr);
@@ -13370,6 +13385,96 @@ static uint32_t hit_pos(int ri, int x, int y) {
     return pos;
 }
 
+/* ---- clickable links (WIN-112, item 97) -----------------------------------
+ *
+ * The shared parser marks a bare URL (OC_RT_LINK); this is the half that turns
+ * one into something you can press. The span is re-derived per query rather
+ * than cached on the row: scanning one body is microseconds, a cache is a
+ * second thing to invalidate on every edit, and this runs only on a click or a
+ * hover move.
+ *
+ * `inside` is not optional. HitTestPoint returns the NEAREST text position when
+ * the point is past the end of a line, so without it every click in the empty
+ * space to the right of a message ending in a URL would open a browser. */
+static int link_at(int ri, int x, int y, char *out, size_t cap) {
+    const oc_model *m = model();
+    const oc_channel *c;
+    const oc_msg *msg;
+    const char *u8;
+    size_t blen, n, i, seen_b = 0;
+    UINT32 seen_w = 0, pos;
+    oc_rt_span sp[OC_RT_MAX];
+    IDWriteTextLayout *l;
+    BOOL trailing = FALSE, inside = FALSE;
+    DWRITE_HIT_TEST_METRICS htm;
+    float lx, ly;
+
+    if (out && cap) out[0] = 0;
+    if (ri < 0 || ri >= g_n_msgrows || !m || !g_sel) return 0;
+    c = oc_model_channel((oc_model *)m, g_sel);
+    msg = find_msg(c, g_msgrows[ri].mid);
+    if (!msg || msg->deleted) return 0;
+    u8 = body_text(msg);
+    blen = u8 ? strlen(u8) : 0;
+    if (!blen) return 0;
+
+    lx = (float)x - g_msgrows[ri].bx;
+    ly = (float)y - g_msgrows[ri].by;
+    if (lx < 0 || ly < 0) return 0;
+    l = body_layout(msg, g_msgrows[ri].cw, NULL);
+    if (!l) return 0;
+    IDWriteTextLayout_HitTestPoint(l, lx, ly, &trailing, &inside, &htm);
+    IDWriteTextLayout_Release(l);
+    if (!inside) return 0;
+    pos = htm.textPosition;
+
+    n = oc_rt_scan(u8, blen, sp, OC_RT_MAX);
+    if (n > OC_RT_MAX) n = OC_RT_MAX;
+    for (i = 0; i < n; i++) {
+        /* The same carry-forward byte->UTF-16 walk apply_richtext uses, and for
+         * the same reason: it must run over EVERY span, not only the links, or
+         * the offsets drift. */
+        UINT32 at, len;
+        if (sp[i].start >= seen_b) at = seen_w + rt_u16(u8 + seen_b, sp[i].start - seen_b);
+        else                       at = rt_u16(u8, sp[i].start);
+        seen_b = sp[i].start; seen_w = at;
+        if (!(sp[i].style & OC_RT_LINK)) continue;
+        len = rt_u16(u8 + sp[i].start, sp[i].len);
+        if (pos >= at && pos < at + len) {
+            if (out && cap) {
+                size_t nb = sp[i].len < cap - 1 ? sp[i].len : cap - 1;
+                memcpy(out, u8 + sp[i].start, nb);
+                out[nb] = 0;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* The link under the pointer anywhere in the transcript, or 0. */
+static int link_under(int x, int y, char *out, size_t cap) {
+    int r;
+    if (out && cap) out[0] = 0;
+    if (any_overlay(model()) || !transcript_shell()) return 0;
+    r = msgrow_at(x, y);
+    return r < 0 ? 0 : link_at(r, x, y, out, cap);
+}
+
+/* Hand it to the shell. The scheme set is enforced in the PARSER (only http and
+ * https produce a span), which is what keeps a message from pointing this call
+ * at `file://` or anything else the OS would happily open — so the check lives
+ * where both frontends inherit it rather than here. Re-checked anyway: this is
+ * the call that does the damage, and a one-line guard at the dangerous end is
+ * worth more than the assumption that every future caller kept the invariant. */
+static void link_open(const char *url) {
+    WCHAR w[1024];
+    if (!url || !url[0]) return;
+    if (_strnicmp(url, "http://", 7) && _strnicmp(url, "https://", 8)) return;
+    if (to_w(url, w, 1024) < 1) return;
+    ShellExecuteW(NULL, L"open", w, NULL, NULL, SW_SHOWNORMAL);
+}
+
 static int selection_start(HWND hwnd, int x, int y) {
     int r = msgrow_at(x, y);
     if (r < 0) { g_has_sel = 0; return 0; }
@@ -15611,6 +15716,12 @@ static void test_dump(const char *path) {
     for (int i = 0; i < g_n_msgrows; i++)
         fprintf(f, "  msgrow %d mid=%llu body=%.0f,%.0f\n", i,
                 (unsigned long long)g_msgrows[i].mid, g_msgrows[i].bx, g_msgrows[i].by);
+    /* The link under the pointer (WIN-112). A screenshot cannot show a cursor
+     * shape or prove which bytes a click would open, so the address itself is
+     * reported: hovering a URL and reading this back is the only way the
+     * autolink boundary rules — where a trailing full stop or bracket stops —
+     * are checkable from outside the process. */
+    fprintf(f, "link hover=\"%s\"\n", g_link_hover);
     fprintf(f, "tsel has=%d a=%llu:%u f=%llu:%u\n", g_has_sel,
             (unsigned long long)g_sel_a_mid, g_sel_a_pos,
             (unsigned long long)g_sel_f_mid, g_sel_f_pos);
@@ -16918,6 +17029,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_sbar_drag = 1; g_sbar_grab = (float)my - g_sbar_thumb.top;
             SetCapture(hwnd);
         } else if (!on_click(hwnd, mx, my) && !any_overlay(model())) {
+            /* Recorded HERE rather than at the top of the handler, so it is tied
+             * to the one case where the transcript actually took the click: if
+             * on_click consumed it (a thumbnail, a reaction chip), there is no
+             * link press to release. */
+            link_under(mx, my, g_link_down, sizeof g_link_down);
             selection_start(hwnd, mx, my);
         }
         InvalidateRect(hwnd, NULL, FALSE);
@@ -16947,6 +17063,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (fh != g_fmt_hover) { g_fmt_hover = fh; InvalidateRect(hwnd, NULL, FALSE); }
         }
         if (g_ed_dragging) { ed_mouse_move(hwnd, (float)mx, (float)my); return 0; }
+        /* Link hover (WIN-112). UNCONDITIONAL, before the rail/sidebar/transcript
+         * split below: the first version of this sat inside the branch for the
+         * transcript's own x range, so moving the pointer from a URL into the
+         * rail left the hand cursor and a stale address behind — the state was
+         * only ever updated by the branch that could set it, never by the ones
+         * that should clear it. link_under() answers 0 off the transcript, which
+         * is the clearing case and has to be reached to happen.
+         *
+         * WM_SETCURSOR reads the result. It arrives BEFORE this message for the
+         * same position, so the cursor is also set here: without that it lags one
+         * move behind on the way onto a link. */
+        {
+            char u[sizeof g_link_hover];
+            int had = g_link_hover[0] != 0;
+            if (!link_under(mx, my, u, sizeof u)) u[0] = 0;
+            if (strcmp(u, g_link_hover)) {
+                memcpy(g_link_hover, u, strlen(u) + 1);
+                if (u[0])      SetCursor(LoadCursorW(NULL, IDC_HAND));
+                else if (had)  SetCursor(LoadCursorW(NULL, IDC_ARROW));
+            }
+        }
         if (g_sbar_drag) {
             if (g_sbar_travel > 0) {
                 float off = (float)my - g_sbar_grab - g_sbar_track_top;
@@ -17041,11 +17178,38 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
-    case WM_LBUTTONUP:
+    case WM_LBUTTONUP: {
+        int mx = (int)DIPF(GET_X_LPARAM(lp)), my = (int)DIPF(GET_Y_LPARAM(lp));
         if (g_ed_dragging) { ed_mouse_up(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (g_sbar_drag) { g_sbar_drag = 0; ReleaseCapture(); InvalidateRect(hwnd, NULL, FALSE); }
-        else if (g_selecting) { selection_end(); InvalidateRect(hwnd, NULL, FALSE); }
+        else if (g_selecting) {
+            selection_end();
+            /* Open only if this was a CLICK and not a drag — selection_end()
+             * clears g_has_sel when the anchor and the focus are the same spot,
+             * so that flag is exactly the question "did the pointer move". And
+             * only if the release is over the same address as the press, which
+             * is how every other application lets you change your mind by
+             * sliding off the link before letting go. */
+            if (!g_has_sel && g_link_down[0]) {
+                char up[sizeof g_link_down];
+                if (link_under(mx, my, up, sizeof up) && !strcmp(up, g_link_down))
+                    link_open(g_link_down);
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        g_link_down[0] = 0;
         return 0;
+    }
+    case WM_SETCURSOR:
+        /* The hand is the affordance; the accent and underline only say a run is
+         * special. Driven off the hover state WM_MOUSEMOVE already computes
+         * rather than re-deriving it here, because this arrives for every move
+         * and re-laying out a message body per message is not free. */
+        if (LOWORD(lp) == HTCLIENT && g_link_hover[0]) {
+            SetCursor(LoadCursorW(NULL, IDC_HAND));
+            return TRUE;
+        }
+        break;
     case WM_KEYDOWN:
         /* Ctrl+C copies the TRANSCRIPT selection — but only when there is one,
          * and only unshifted. It used to claim the key outright, which meant

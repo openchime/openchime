@@ -72,15 +72,93 @@ static size_t code_span_len(rt_ctx *c, size_t i, size_t e) {
     return 0;
 }
 
+/* ---- autolinking (MARKDOWN.md §4) ----------------------------------------
+ *
+ * A bare URL is the only construct with no delimiters: the address is its own
+ * label, which is why there is no authoring syntax to go with this and no
+ * `<url|label>` form (that one is Slack's API artifact and is declined).
+ *
+ * ONLY http and https. An OC_RT_LINK span is what a frontend hands to the
+ * shell, so this list is the set of things a message can ask the OS to open —
+ * a `file://` or a custom scheme reaching that call is a security question, not
+ * a formatting one, and answering it in the shared parser is what stops each
+ * frontend answering it differently. */
+static char rt_lower(char ch) { return (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch; }
+
+static size_t url_scheme_len(rt_ctx *c, size_t i, size_t e) {
+    static const char *https = "https://", *http = "http://";
+    size_t k;
+    for (k = 0; k < 8; k++) if (i + k >= e || rt_lower(c->b[i + k]) != https[k]) break;
+    if (k == 8) return 8;                      /* https first: http is its prefix */
+    for (k = 0; k < 7; k++) if (i + k >= e || rt_lower(c->b[i + k]) != http[k]) break;
+    return k == 7 ? 7 : 0;
+}
+
+/* A byte that cannot be inside a URL. Space ends it; `<`/`>`/`"` cannot appear
+ * literally in one; a backtick would let a link straddle a code span. */
+static int url_stop(char ch) {
+    unsigned char u = (unsigned char)ch;
+    return u <= 0x20 || u == 0x7f || ch == '<' || ch == '>' || ch == '"' || ch == '`';
+}
+
+/* Trailing bytes that belong to the sentence rather than the address.
+ *
+ * `*` and `~` are here so an emphasised URL (`*https://x.com*`) links the
+ * address and not the closing delimiter — find_close steps over a URL, so
+ * without this the address would swallow the closer and the emphasis would
+ * never match. **`_` is deliberately NOT here**, though it is a delimiter too:
+ * underscores are ordinary inside real addresses (`/wiki/Foo_bar_baz`) and
+ * asterisks and tildes are not. Trimming one that the address owns changes
+ * where the link GOES, silently, which is a worse failure than an italic that
+ * does not render — so the delimiter that is common inside a URL is the one
+ * left alone. The cost, recorded rather than hidden: `_https://x.com_` links
+ * `https://x.com_` and is not italic. */
+static int url_trim(char ch) {
+    return ch == '.' || ch == ',' || ch == ';' || ch == ':' || ch == '!' ||
+           ch == '?' || ch == '\'' || ch == '*' || ch == '~';
+}
+
+/* The length of the URL starting at `i`, or 0. */
+static size_t url_len(rt_ctx *c, size_t i, size_t e) {
+    size_t s = url_scheme_len(c, i, e), j, n;
+    if (!s || !open_ok(c, i)) return 0;
+    for (j = i + s; j < e && !url_stop(c->b[j]); j++) { }
+    n = j - i;
+    for (;;) {
+        char last;
+        if (n <= s) return 0;                  /* a scheme with no address */
+        last = c->b[i + n - 1];
+        if (url_trim(last)) { n--; continue; }
+        /* A closing bracket is part of the address only if the address opened
+         * it: Wikipedia's `..._(disambiguation)` keeps its `)`, while a URL
+         * written inside `(parentheses)` does not take the one that closes
+         * them. */
+        if (last == ')' || last == ']' || last == '}') {
+            char op = last == ')' ? '(' : (last == ']' ? '[' : '{');
+            size_t k, no = 0, nc = 0;
+            for (k = 0; k < n; k++) {
+                if (c->b[i + k] == op)   no++;
+                else if (c->b[i + k] == last) nc++;
+            }
+            if (nc > no) { n--; continue; }
+        }
+        break;
+    }
+    return n;
+}
+
 /* The first valid closer for a `d`-byte run of `ch` in [from, e), or RT_NONE.
- * Escapes and code spans are stepped over rather than looked inside, so the
- * `*` in "*a `b*c` d*" closes at the end and not in the middle. */
+ * Escapes, code spans and URLs are stepped over rather than looked inside, so
+ * the `*` in "*a `b*c` d*" closes at the end and not in the middle — and an
+ * underscore inside a URL cannot close an emphasis run that opened before it. */
 static size_t find_close(rt_ctx *c, size_t from, size_t e, char ch, size_t d) {
     size_t i = from;
     while (i < e) {
         size_t cs;
         if (c->b[i] == '\\' && i + 1 < e && rt_escapable(c->b[i + 1])) { i += 2; continue; }
         cs = code_span_len(c, i, e);
+        if (cs) { i += cs; continue; }
+        cs = url_len(c, i, e);
         if (cs) { i += cs; continue; }
         if (c->b[i] == ch && i > from && i + d <= e && !rt_space(c->b[i - 1])) {
             size_t k;
@@ -114,6 +192,20 @@ static void scan_inline(rt_ctx *c, size_t s, size_t e, int depth) {
             emit(c, i, 1, OC_RT_DELIM);      /* the backslash is markup, not text */
             i += 2;
             continue;
+        }
+        /* Before the delimiter forms, so a URL is one span rather than a
+         * scattering of whatever punctuation it happens to contain. It carries
+         * no OC_RT_DELIM: there is no markup around it to hide.
+         *
+         * Asked at every byte rather than behind a cheap `ch == 'h'` gate. That
+         * gate was here and was deleted: it made the SCHEME LIST a lie, since a
+         * scheme added to url_scheme_len would never be reached, and a test
+         * asserting `file://` does not autolink passed for that reason instead
+         * of the intended one. url_scheme_len rejects on its first byte anyway,
+         * so the gate bought a comparison and cost the invariant. */
+        {
+            size_t L = url_len(c, i, e);
+            if (L) { emit(c, i, L, OC_RT_LINK); i += L; continue; }
         }
         if (ch == '`') {
             size_t L = code_span_len(c, i, e);

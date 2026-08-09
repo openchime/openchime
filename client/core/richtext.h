@@ -35,6 +35,7 @@ enum {
     OC_RT_QUOTE     = 0x0020,   /* > quoted */
     OC_RT_BULLET    = 0x0040,   /* - item */
     OC_RT_ORDERED   = 0x0080,   /* 1. item */
+    OC_RT_LINK      = 0x0100,   /* a bare http(s) URL, autolinked */
 
     OC_RT_DELIM     = 0x8000    /* the delimiter bytes of the construct above */
 };
@@ -72,7 +73,16 @@ typedef struct {
  *     or a fenced block.
  *   - Block markers (`>`, `- `, `1. `) are matched at the start of a line,
  *     after optional indentation, and are exempt from the inline rules.
+ *   - A bare `http://` or `https://` URL is autolinked: it yields one
+ *     OC_RT_LINK span over the address, with NO delimiter span, because there
+ *     is no markup to hide — the address is its own label (MARKDOWN.md §4).
+ *     Trailing sentence punctuation and an unbalanced closing bracket are left
+ *     outside the span, so `(see https://example.com/a).` links the address and
+ *     not the full stop. Only those two schemes are recognised: a link span is
+ *     what a frontend turns into something the OS opens, so widening the set is
+ *     a security decision and it is taken HERE rather than per frontend.
  *
+
  * Anything unmatched or ambiguous degrades to its literal source: an unclosed
  * delimiter yields no span at all, so a half-typed `*` never restyles the rest
  * of the message.

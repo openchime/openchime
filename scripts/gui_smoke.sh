@@ -1218,6 +1218,31 @@ expect_grep '^tsel has=1 a=[0-9]+:0 f=[0-9]+:25' "triple-click selects the whole
 expect_grep '^ed .*text="the quick brown fox jumps"' "and Ctrl+C copies what was selected"
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
 
+# --- clickable links (WIN-112, REQ-220) --------------------------------------
+# The autolink BOUNDARY rules are unit-tested where they belong
+# (tests/test_richtext.c, which can enumerate them). What only this suite can
+# show is that the client agrees with the parser about which bytes are the link
+# — the span has to survive a byte->UTF-16 remap and a DirectWrite hit test, and
+# either of those being off by one is invisible in a screenshot and produces a
+# link that opens the wrong address.
+#
+# Hence the trailing full stop below: it is in the MESSAGE and must not be in
+# the LINK. That single character is the whole assertion — a hover that reported
+# the URL with it attached would be a client that navigates somewhere else.
+say "== links"
+"$DRIVE" channel general >/dev/null 2>&1; settle conv 1
+"$DRIVE" send "https://example.com/runbook." >/dev/null 2>&1
+wait_grep '^tsel ' >/dev/null 2>&1 || true
+lbody=$(snap | awk '/^  msgrow /{ for (i=1;i<=NF;i++) if ($i ~ /^body=/) { sub(/^body=/,"",$i); split($i,b,","); x=b[1]; y=b[2] } } END{ print int(x)+12, int(y)+8 }')
+"$DRIVE" move $lbody >/dev/null 2>&1
+expect_grep '^link hover="https://example\.com/runbook"$' \
+  "hovering a URL reports it, without the sentence's full stop"
+# Off the transcript entirely: the rail. This is the direction that was broken
+# first time round — the hover was computed in the branch that owns the
+# transcript's x range, so nothing ever cleared it on the way out.
+"$DRIVE" move 5 5 >/dev/null 2>&1
+expect_grep '^link hover=""$' "and leaving the transcript clears it"
+
 # --- drafts that outlive the process (WIN-91, REQ-223, ARCH-101) -------------
 # WIN-27's drafts were 24 slots in memory: a switch survived them, a restart did
 # not. They now live on the daemon, so the assertion that matters is the one the

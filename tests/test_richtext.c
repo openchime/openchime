@@ -191,6 +191,66 @@ static void test_offsets_are_source_bytes(void) {
     CHECK(memcmp(b + g_sp[1].start, "x", 1) == 0);
 }
 
+/* Autolinking (MARKDOWN.md §4). The span is what a frontend hands to the shell,
+ * so the checks that matter are the ones about what does NOT become one. */
+static void test_autolink(void) {
+    CHECK(span_over("see https://example.com now", "https://example.com", OC_RT_LINK));
+    CHECK(span_over("see http://example.com now", "http://example.com", OC_RT_LINK));
+    CHECK(span_over("HTTPS://EXAMPLE.COM", "HTTPS://EXAMPLE.COM", OC_RT_LINK));
+    CHECK(span_over("https://example.com/a/b?q=1&r=2#frag", "https://example.com/a/b?q=1&r=2#frag", OC_RT_LINK));
+    /* No delimiter span: the address is its own label. */
+    CHECK(scan("https://example.com") == 1);
+
+    /* ONLY http(s). Everything else stays text, because this list is the set of
+     * schemes a message can ask the OS to open. */
+    CHECK(content_spans("file:///etc/passwd", OC_RT_LINK) == 0);
+    CHECK(content_spans("javascript:alert(1)", OC_RT_LINK) == 0);
+    CHECK(content_spans("mailto:a@b.com", OC_RT_LINK) == 0);
+    CHECK(content_spans("ftp://example.com", OC_RT_LINK) == 0);
+    CHECK(content_spans("openchime://host/c/1/m/2", OC_RT_LINK) == 0);
+    /* A scheme with no address is not a link. */
+    CHECK(content_spans("https://", OC_RT_LINK) == 0);
+    /* Not at a word boundary — the guard against a scheme inside a longer token. */
+    CHECK(content_spans("xhttps://example.com", OC_RT_LINK) == 0);
+
+    /* Trailing punctuation belongs to the sentence. */
+    CHECK(span_over("go to https://example.com.", "https://example.com", OC_RT_LINK));
+    CHECK(span_over("https://example.com, then", "https://example.com", OC_RT_LINK));
+    CHECK(span_over("really? https://example.com?!", "https://example.com", OC_RT_LINK));
+    /* A bracket the address opened is kept; one it did not is not. */
+    CHECK(span_over("(see https://example.com/a)", "https://example.com/a", OC_RT_LINK));
+    CHECK(span_over("https://en.wikipedia.org/wiki/Foo_(bar)",
+                    "https://en.wikipedia.org/wiki/Foo_(bar)", OC_RT_LINK));
+    CHECK(span_over("(https://example.com/x_(y)).", "https://example.com/x_(y)", OC_RT_LINK));
+
+    /* Code suppresses it, like everything else. */
+    CHECK(content_spans("`https://example.com`", OC_RT_LINK) == 0);
+    CHECK(content_spans("```\nhttps://example.com\n```", OC_RT_LINK) == 0);
+
+    /* It composes with emphasis rather than fighting it: the delimiters stay
+     * outside the address, and an underscore INSIDE one cannot close a run that
+     * opened before it. */
+    CHECK(span_over("*https://example.com*", "https://example.com", OC_RT_LINK));
+    CHECK(span_over("*https://example.com*", "https://example.com", OC_RT_BOLD));
+    /* An underscore is NOT trimmed, so an address keeps the one it owns and the
+     * emphasis is what gives way — see the note on url_trim(). */
+    CHECK(span_over("_a https://example.com/a_b_", "https://example.com/a_b_", OC_RT_LINK));
+    CHECK(content_spans("_a https://example.com/a_b_", OC_RT_ITALIC) == 0);
+    CHECK(span_over("https://en.wikipedia.org/wiki/Foo_bar_", "https://en.wikipedia.org/wiki/Foo_bar_", OC_RT_LINK));
+    /* A quoted or bulleted line still autolinks. */
+    CHECK(span_over("> see https://example.com", "https://example.com", OC_RT_LINK));
+    CHECK(span_over("- see https://example.com", "https://example.com", OC_RT_LINK));
+
+    /* Every occurrence, and byte offsets into the ORIGINAL body. */
+    CHECK(content_spans("https://a.com and https://b.com", OC_RT_LINK) == 2);
+    {
+        const char *b = "caf\xc3\xa9 https://x.com";   /* "café https://x.com" */
+        size_t n = scan(b);
+        CHECK(n == 1);
+        CHECK(g_sp[0].start == 6 && g_sp[0].len == 13);
+    }
+}
+
 static void test_truncation(void) {
     /* Like the mention scanner: the count may exceed `max` so a caller can tell
      * it was truncated, and nothing is written past the bound. */
@@ -210,8 +270,9 @@ int run_richtext_tests(void) {
     test_blocks();
     test_nesting();
     test_offsets_are_source_bytes();
+    test_autolink();
     test_truncation();
     printf("test_richtext: emphasis, literal delimiters, escapes, code, fenced blocks, "
-           "quotes and lists, nesting, byte offsets, truncation\n");
+           "quotes and lists, nesting, byte offsets, autolinking, truncation\n");
     return failures;
 }
