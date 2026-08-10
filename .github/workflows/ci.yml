@@ -10,19 +10,12 @@ name: ci
 #   - windows:     mingw cross-compile check of the Windows front-ends (TUI + the
 #                  native Direct2D/DirectWrite GUI, ARCH-82). Build breaks only.
 #
-#   - gui-smoke:   scripts/gui_smoke.sh (91 behavioural assertions) on a
-#                  SELF-HOSTED Windows+WSL runner. Opt-in, see below.
-#
-# The Win32 GUI's behaviour cannot run on GitHub's hosted runners: the daemon is
-# epoll-based, so it is Linux-only, and a hosted Windows runner cannot host it (no
-# Linux containers). The job below is therefore written for a self-hosted box with
-# both halves — Windows for the client, WSL for the daemon — and is gated on a
-# repository variable so it is SKIPPED rather than failing red until one exists
-# (Settings > Variables > `GUI_SMOKE=1`). Writing it now rather than "when the
-# runner exists" is deliberate: an unwritten job is one nobody will write, and the
-# gap it covers already let three bugs reach the user (WIN-70, WIN-71, WIN-72).
-# Until the runner is there, the smoke stays a pre-push gate run by hand — which
-# docs/CLIENT.md states as a standing rule.
+# There is deliberately no GUI smoke job. scripts/gui_smoke.sh needs a Windows host
+# for the client and a Linux one for the epoll-based daemon at the same time, which
+# no hosted runner provides; it was carried here for a self-hosted box gated on
+# vars.GUI_SMOKE and, with that variable never set, ran zero times while the release
+# inherited its skip as a pass. The script stays as the pre-push gate docs/CLIENT.md
+# already makes it.
 # Doc-only changes skip CI. See docs/TESTING.md for the full strategy.
 
 on:
@@ -132,37 +125,3 @@ jobs:
       # builds under mingw.
       - name: Compile the Windows front-ends
         run: make windows-tui windows-gui
-
-  gui-smoke:
-    name: win32 gui smoke (self-hosted)
-    # Skipped entirely unless the repository sets GUI_SMOKE=1 AND provides a
-    # runner with these labels. A job that cannot run must not be red: a
-    # permanently failing check is a check people learn to ignore.
-    if: vars.GUI_SMOKE == '1'
-    runs-on: [self-hosted, windows, wsl]
-    steps:
-      - uses: actions/checkout@v4
-      # The runner is expected to have: mingw-w64 + gcc + libsqlite3-dev inside
-      # WSL, and the WSL interop that scripts/gui_drive.sh uses to launch the
-      # Windows exe (powershell.exe on PATH). gui_drive.sh's `launch` builds both
-      # sides and restarts the daemon itself — the client and the daemon share a
-      # wire (ARCH-61) and a mismatched pair reports only "connection lost".
-      - name: Build both sides and run the smoke
-        shell: bash
-        run: |
-          set -euo pipefail
-          scripts/build_mbedtls.sh
-          scripts/build_mbedtls_windows.sh
-          make
-          make windows-gui
-          # --kill so the runner is not left holding a client between jobs.
-          scripts/gui_smoke.sh --kill
-      # The captures are the evidence when an assertion fails: a chrome invariant
-      # is a boolean, but "why" is a picture.
-      - name: Keep the screenshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gui-smoke-shots
-          path: /mnt/c/Windows/Temp/octest/*.bmp
-          if-no-files-found: ignore
