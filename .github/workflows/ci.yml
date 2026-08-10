@@ -27,6 +27,10 @@ name: ci
 
 on:
   push:
+    # Not main: it reaches CI through release.yml's workflow_call, and running it
+    # standalone as well puts two runs in the same concurrency group, so one cancels
+    # the other. Same fix as openchime-saas/ci.yml.
+    branches-ignore: [main]
     paths-ignore:
       - '**.md'
       - '.gitignore'
