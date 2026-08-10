@@ -49,7 +49,7 @@ jobs:
     name: build + unit tests
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install build deps
         run: |
           sudo apt-get update
@@ -69,7 +69,7 @@ jobs:
     name: end-to-end (compose)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install deps
         run: |
           sudo apt-get update
@@ -90,7 +90,7 @@ jobs:
     name: client app-core (compile check)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The client app-core (ARCH-74) is frontend-agnostic C linking the shared
       # wire code; `make core` proves it compiles standalone. Its behaviour is
       # driven end-to-end by the headless test in the build job's `make test`
@@ -110,7 +110,7 @@ jobs:
     # code that actually ships.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # mingw-w64 for the cross-compile; bzip2 + curl for the vendored mbedTLS
       # tarball that build_mbedtls_windows.sh fetches and cross-builds.
       - name: Install cross toolchain
