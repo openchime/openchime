@@ -103,7 +103,7 @@ sudo dnf install openchimed
 ```
 
 **Anything else, and the offline case.** The tarballs on each
-[release](https://github.com/dannyheskett/openchime/releases) carry the binary,
+[release](https://github.com/openchime/openchime/releases) carry the binary,
 the unit and the config with an `install.sh`. Nothing is fetched at install
 time — TLS is statically linked — so this is the channel for an air-gapped box.
 Verify the `.sha256` beside it.
@@ -111,7 +111,7 @@ Verify the `.sha256` beside it.
 **Container** — for Compose, or any container runtime:
 
 ```sh
-docker run ghcr.io/dannyheskett/openchime:latest --version
+docker run ghcr.io/openchime/openchime:latest --version
 ```
 
 After installing, the daemon starts and mints a one-time owner setup token:

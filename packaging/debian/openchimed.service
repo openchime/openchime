@@ -5,7 +5,7 @@
 
 [Unit]
 Description=OpenChime daemon
-Documentation=https://github.com/dannyheskett/openchime
+Documentation=https://github.com/openchime/openchime
 # The daemon binds listeners and, in a federated deployment, makes outbound
 # calls at startup (enrollment, ARCH-84). Waiting for a routable address avoids
 # a first-boot failure that a restart would silently paper over.
