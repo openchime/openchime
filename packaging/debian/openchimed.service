@@ -20,8 +20,18 @@ Type=exec
 ExecStart=/usr/bin/openchimed
 
 # All configuration is environment (ARCH-26); this is the systemd expression of
-# it. Leading `-` so a deleted file is not a start failure — the daemon has
-# defaults for everything.
+# it.
+#
+# The conffile is REQUIRED, despite the leading `-`. The daemon does have
+# compiled-in defaults, but they point at /data (daemon/config.c) to suit the
+# container image, and ProtectSystem=strict below makes /data read-only under
+# this unit -- so a deleted or emptied conffile is a start failure, not a
+# fallback. packaging/openchimed.env exists precisely to redirect those four
+# paths at StateDirectory.
+#
+# The `-` is kept anyway, and buys exactly one thing: the failure surfaces in the
+# daemon's own log, where it can say which path it could not open, instead of
+# systemd refusing to load the unit with no such detail.
 EnvironmentFile=-/etc/openchime/openchimed.env
 
 # A transient system user allocated at start, with no entry in /etc/passwd and

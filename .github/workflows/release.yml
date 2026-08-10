@@ -44,9 +44,20 @@ jobs:
     name: gate on CI
     uses: ./.github/workflows/ci.yml
 
+  # attribution-guard.yml has carried `workflow_call:` specifically so a release
+  # could gate on it, and nothing did -- this was the only release path in the
+  # estate that skipped it. contents: write is declared here because a called
+  # workflow cannot exceed its caller's permissions and this workflow defaults to
+  # read; scoped to this job so the rest stays read-only.
+  guard:
+    name: attribution guard
+    uses: ./.github/workflows/attribution-guard.yml
+    permissions:
+      contents: write
+
   version:
     name: allocate the release number
-    needs: test
+    needs: [test, guard]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     outputs:
@@ -176,6 +187,42 @@ jobs:
             /usr/bin/openchimed --version
           '
 
+      # Neither install above touches the unit file: both maintainer scripts gate
+      # the enable/start path on `[ -d /run/systemd/system ]`, which a plain
+      # `docker run` container does not have. So the 60 lines of ProtectSystem,
+      # DynamicUser and RestrictAddressFamilies that CI produces were parsed by
+      # nothing, ever. This container installs systemd and makes it parse them.
+      #
+      # Not a real boot: that needs --privileged and cgroup plumbing. `verify`
+      # resolves every directive against the installed systemd, which is the
+      # failure class that ships unchecked today.
+      - name: Validate the unit file
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/$DIST:/pkg:ro" debian:bookworm bash -c '
+            set -e
+            apt-get update -qq >/dev/null
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq systemd >/dev/null
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq /pkg/openchimed_'"$VERSION"'_${{ matrix.arch }}.deb >/dev/null
+            # systemd-analyze exits 0 even for a directive it does not recognise, so
+            # its status is worthless here -- measured in a bookworm container, not
+            # assumed. Grep the output instead.
+            #
+            # The pattern is "Unknown key", NOT "Unknown key name": this systemd
+            # words it "Unknown key '"'"'ProtectSystm'"'"' in section [Service], ignoring."
+            # A first draft matching "Unknown key name" passed a unit with a typo'"'"'d
+            # ProtectSystem, which is the exact bug this step exists to catch.
+            out=$(systemd-analyze verify /lib/systemd/system/openchimed.service 2>&1 || true)
+            printf "%s\n" "$out"
+            # An absent ExecStart binary is expected inside this container.
+            if printf "%s\n" "$out" | grep -v "is not executable" \
+                 | grep -E "Unknown key|Unknown lvalue|Unknown section|Failed to |Invalid "; then
+              echo "::error::openchimed.service has a directive this systemd rejects"
+              exit 1
+            fi
+            echo "unit parses clean"
+          '
+
       # The artifact is NAMED for the platform, and the publish job downloads
       # without merge-multiple. That combination is what rebuilds dist/<platform>/
       # on the other side: upload-artifact strips the common path prefix, so the
@@ -282,6 +329,7 @@ jobs:
           path: |
             build/openchime.exe
             build/openchime-tui.exe
+            build/openchime.debug
           if-no-files-found: error
 
   windows-package:
@@ -401,6 +449,17 @@ jobs:
           $out = $env:DIST -replace '/','\'
           makeappx.exe pack /d $stage /p "$out\openchime-$env:VERSION.msix" /o
           if ($LASTEXITCODE -ne 0) { throw "makeappx failed" }
+
+      # The GUI's DWARF, split out by the Makefile and referenced by a
+      # .gnu_debuglink in the shipped .exe. It has to travel in THIS artifact:
+      # publish downloads linux-* and windows-* only, deliberately excluding the
+      # intermediate mingw-binaries, so anything left there never reaches the
+      # release.
+      - name: Stage the GUI debug symbols beside the installer
+        shell: pwsh
+        run: |
+          $out = $env:DIST -replace '/','\'
+          Copy-Item build\openchime.debug "$out\openchime.debug"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -629,10 +688,17 @@ jobs:
           # The .msix is deliberately NOT attached. It is unsigned, because the
           # Store re-signs on submission, so a downloaded copy will not install
           # -- it is a build artifact for Partner Center, not a release asset.
+          #
+          # openchime.debug IS attached. The Makefile splits the GUI's DWARF into
+          # it and records a .gnu_debuglink in the shipped .exe, so without this
+          # the link points at a file that exists nowhere downloadable and
+          # crash_resolve.sh reports "built without -g?" for every released
+          # build. Build artifacts expire; a crash report does not.
           gh release create "release-${VERSION}" \
             --title "release-${VERSION}" \
             --notes "Release ${VERSION}. The daemon installs via apt and dnf (see README); the tarballs below are the offline install. The Windows client installer is attached." \
-            dist/linux-*/*.tar.gz dist/linux-*/*.sha256 dist/windows-x64/*-setup.exe
+            dist/linux-*/*.tar.gz dist/linux-*/*.sha256 dist/windows-x64/*-setup.exe \
+            dist/windows-x64/openchime.debug
 
       - name: Summary
         if: always()
