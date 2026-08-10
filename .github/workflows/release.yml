@@ -63,7 +63,7 @@ jobs:
     outputs:
       number: ${{ steps.n.outputs.number }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: n
@@ -102,7 +102,7 @@ jobs:
       PLATFORM: linux-${{ matrix.arch }}
       DIST: dist/linux-${{ matrix.arch }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # One binary, built against the oldest glibc we support, then stripped
       # once. Everything downstream consumes this exact file.
@@ -229,7 +229,7 @@ jobs:
       # directory only survives the round-trip by being the artifact's name.
       # The stripped binary is not uploaded -- it ships inside all three packages
       # and the step above proves they are identical.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.PLATFORM }}
           path: |
@@ -250,15 +250,15 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.number }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -291,7 +291,7 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.number }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install the mingw-w64 toolchain
         run: |
@@ -323,7 +323,7 @@ jobs:
       # compiler outputs handed to the next job, not a release artifact. The
       # publish job collects dist/<platform>/ by matching `windows-*`, and this
       # must not be caught by that.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: mingw-binaries
           path: |
@@ -350,8 +350,8 @@ jobs:
       PLATFORM: windows-x64
       DIST: dist/windows-x64
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: mingw-binaries
           path: build
@@ -390,7 +390,7 @@ jobs:
       # inside the packages unsigned.
       - name: Sign the binaries
         if: env.SIGN == 'true'
-        uses: azure/trusted-signing-action@v0
+        uses: azure/trusted-signing-action@v2
         with:
           endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
           trusted-signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
@@ -413,7 +413,7 @@ jobs:
 
       - name: Sign the installer
         if: env.SIGN == 'true'
-        uses: azure/trusted-signing-action@v0
+        uses: azure/trusted-signing-action@v2
         with:
           endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
           trusted-signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
@@ -461,7 +461,7 @@ jobs:
           $out = $env:DIST -replace '/','\'
           Copy-Item build\openchime.debug "$out\openchime.debug"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.PLATFORM }}
           path: ${{ env.DIST }}/*
@@ -497,7 +497,7 @@ jobs:
       # permanent in a way nothing else here is (ARCH-20).
       DIST_BASE_URL: https://openchime.io/dist
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -511,11 +511,11 @@ jobs:
       # Two patterns rather than a bare `*`, so the intermediate mingw-binaries
       # artifact -- unpackaged compiler output, not a release artifact -- is not
       # dragged in as a fourth platform.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: linux-*
           path: dist
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: windows-*
           path: dist
@@ -741,8 +741,8 @@ jobs:
       # outside this repository's scope entirely.
       WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: windows-x64
           path: dist/windows-x64
