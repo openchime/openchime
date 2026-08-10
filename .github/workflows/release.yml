@@ -60,6 +60,8 @@ jobs:
     needs: [test, guard]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
+    permissions:
+      contents: write        # to reserve the tag; see the reserve step
     outputs:
       number: ${{ steps.n.outputs.number }}
     steps:
@@ -76,6 +78,32 @@ jobs:
           N=$(scripts/version.sh next)
           echo "number=$N" >> "$GITHUB_OUTPUT"
           echo "this release is $N (previous: $(scripts/version.sh current))"
+
+      # Reserve the number NOW, not after publishing.
+      #
+      # The tag push used to be the last step of `publish`, by which point apt, dnf
+      # and GHCR had already been written. version.sh derives the next number purely
+      # from tags, so a refused push -- tag protection, a ruleset, a transient 500 --
+      # left release N live and untagged, and the next dispatch computed N again,
+      # built different content, and published it under the same version. version.sh
+      # says it itself: two .debs sharing a version is the one thing apt cannot
+      # recover from. It guards the branch-scoping route to that outcome and left
+      # this one open.
+      #
+      # Reserving instead means the failure mode is a burnt number, which costs
+      # nothing, rather than a duplicated one. The unreserve job at the bottom hands
+      # it back when publish did not succeed.
+      - name: Reserve the release number
+        if: ${{ !inputs.dry_run }}
+        env:
+          N: ${{ steps.n.outputs.number }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "release-${N}" "$GITHUB_SHA"
+          git push origin "release-${N}"
+          echo "reserved release-${N}"
 
   packages:
     name: ${{ matrix.arch }} packages
@@ -264,9 +292,12 @@ jobs:
           platforms: linux/amd64,linux/arm64
           build-args: OC_VERSION=${{ env.VERSION }}
           push: ${{ inputs.dry_run == false }}
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/openchime:${{ env.VERSION }}
-            ghcr.io/${{ github.repository_owner }}/openchime:latest
+          # :VERSION only. `image` needs only `version`, so it runs alongside
+          # windows-package -- and if that fails, publish is skipped and nothing
+          # reaches apt, dnf or the releases page, yet :latest would already point
+          # at that build. Anyone running Compose against :latest would get a
+          # version that officially does not exist. :latest moves in `publish`.
+          tags: ghcr.io/${{ github.repository_owner }}/openchime:${{ env.VERSION }}
 
   # The Windows client (ARCH-80/81). It carries the same release number as the
   # daemon even though it is a separate program, so a support question only ever
@@ -475,6 +506,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write        # to push the release tag and create the GitHub release
+      packages: write        # to move :latest once the release is real
     env:
       VERSION: ${{ needs.version.outputs.number }}
       # Object storage is Tigris, provisioned through Fly (`fly storage create`)
@@ -569,7 +601,28 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p repo/apt
-          rclone copy "dist:${DIST_BUCKET}/apt" repo/apt --fast-list || true
+          # `|| true` used to sit here, and it could not tell "the prefix does not
+          # exist yet" from "credentials rejected" or "endpoint returned 503". On any
+          # fetch failure the pool stayed empty, the index below was built from this
+          # release alone, and the upload replaced Release/InRelease in the bucket --
+          # so every existing installation's `apt-get update` saw a repository
+          # containing one version. The old objects survive; the index naming them
+          # does not.
+          if rclone lsjson "dist:${DIST_BUCKET}/apt" >/dev/null 2>&1; then
+            rclone copy "dist:${DIST_BUCKET}/apt" repo/apt --fast-list
+          else
+            echo "::notice::no existing apt prefix in ${DIST_BUCKET}; treating as first publish"
+          fi
+
+          # lsjson proves the prefix is reachable, not that the copy completed, so
+          # this is a second and independent witness: the tag count is what the pool
+          # SHOULD contain. Free -- publish already checks out with fetch-depth: 0.
+          pool_count=$(find repo/apt -name '*.deb' | wc -l)
+          prior=$(git tag -l 'release-*' | wc -l)
+          if [ "$pool_count" -eq 0 ] && [ "$prior" -gt 0 ]; then
+            echo "::error::apt pool is empty but ${prior} release tag(s) exist -- refusing to publish an index that would delist them"
+            exit 1
+          fi
 
           mkdir -p repo/apt/pool/main/o/openchimed
           cp dist/linux-*/*.deb repo/apt/pool/main/o/openchimed/
@@ -605,7 +658,28 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p repo/rpm
-          rclone copy "dist:${DIST_BUCKET}/rpm" repo/rpm --fast-list || true
+          # `|| true` used to sit here, and it could not tell "the prefix does not
+          # exist yet" from "credentials rejected" or "endpoint returned 503". On any
+          # fetch failure the pool stayed empty, the index below was built from this
+          # release alone, and the upload replaced Release/InRelease in the bucket --
+          # so every existing installation's `apt-get update` saw a repository
+          # containing one version. The old objects survive; the index naming them
+          # does not.
+          if rclone lsjson "dist:${DIST_BUCKET}/rpm" >/dev/null 2>&1; then
+            rclone copy "dist:${DIST_BUCKET}/rpm" repo/rpm --fast-list
+          else
+            echo "::notice::no existing rpm prefix in ${DIST_BUCKET}; treating as first publish"
+          fi
+
+          # lsjson proves the prefix is reachable, not that the copy completed, so
+          # this is a second and independent witness: the tag count is what the pool
+          # SHOULD contain. Free -- publish already checks out with fetch-depth: 0.
+          pool_count=$(find repo/rpm -name '*.rpm' | wc -l)
+          prior=$(git tag -l 'release-*' | wc -l)
+          if [ "$pool_count" -eq 0 ] && [ "$prior" -gt 0 ]; then
+            echo "::error::rpm pool is empty but ${prior} release tag(s) exist -- refusing to publish an index that would delist them"
+            exit 1
+          fi
           cp dist/linux-*/*.rpm repo/rpm/
 
           # Each package is signed individually -- rpm verifies package
@@ -683,8 +757,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git tag "release-${VERSION}" "$GITHUB_SHA"
-          git push origin "release-${VERSION}"
+          # The tag already exists: `version` reserved it before anything was built
+          # (P3-OC-02). Assert rather than create, so a mismatch is loud instead of
+          # silently tagging a second commit with the same number.
+          git fetch --tags --force --quiet
+          git rev-parse -q --verify "refs/tags/release-${VERSION}" >/dev/null || {
+            echo "::error::release-${VERSION} was not reserved; refusing to publish"
+            exit 1
+          }
           # The .msix is deliberately NOT attached. It is unsigned, because the
           # Store re-signs on submission, so a downloaded copy will not install
           # -- it is a build artifact for Partner Center, not a release asset.
@@ -699,6 +779,18 @@ jobs:
             --notes "Release ${VERSION}. The daemon installs via apt and dnf (see README); the tarballs below are the offline install. The Windows client installer is attached." \
             dist/linux-*/*.tar.gz dist/linux-*/*.sha256 dist/windows-x64/*-setup.exe \
             dist/windows-x64/openchime.debug
+
+      # Only now does :latest move. imagetools re-points the tag from the registry
+      # side without pulling or rebuilding, so the manifest digest is preserved
+      # exactly -- the property the control plane's promote step relies on.
+      - name: Move :latest to the released version
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker buildx imagetools create \
+            -t "ghcr.io/${{ github.repository_owner }}/openchime:latest" \
+            "ghcr.io/${{ github.repository_owner }}/openchime:${VERSION}"
+          echo "latest -> ${VERSION}"
 
       - name: Summary
         if: always()
@@ -773,9 +865,29 @@ jobs:
           packaging/windows/winget/render.sh "$VERSION" "$installer" "$url" dist/winget
           cat dist/winget/*.installer.yaml
 
+      # Pinned to a versioned asset with a checksum, not https://aka.ms/wingetcreate/
+      # latest. That is a mutable redirect, and whatever it served on the day ran
+      # nine lines later with WINGET_TOKEN in the environment. This repo already
+      # refuses to fetch mbedTLS without a known SHA-256 and explains why; the same
+      # rule applies to an executable handed a submission credential.
+      #
+      # Bump WINGETCREATE_VERSION and WINGETCREATE_SHA256 together. The hash is
+      # Microsoft's own, published beside the asset as wingetcreate.exe.txt, and
+      # confirmed by downloading and hashing the binary independently.
       - name: Install wingetcreate
         shell: pwsh
-        run: Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+        env:
+          WINGETCREATE_VERSION: v1.12.13.0
+          WINGETCREATE_SHA256: 24042BD37915805615E6CF969AC57C6439124C3FE85823327F5F3FB24BD9FFEA
+        run: |
+          $url = "https://github.com/microsoft/winget-create/releases/download/$env:WINGETCREATE_VERSION/wingetcreate.exe"
+          Invoke-WebRequest $url -OutFile wingetcreate.exe
+          $got = (Get-FileHash wingetcreate.exe -Algorithm SHA256).Hash
+          if ($got -ne $env:WINGETCREATE_SHA256) {
+            Remove-Item wingetcreate.exe -Force
+            throw "wingetcreate.exe checksum mismatch: got $got, expected $env:WINGETCREATE_SHA256"
+          }
+          Write-Output "wingetcreate $env:WINGETCREATE_VERSION verified"
 
       # Forks winget-pkgs under the token's account, commits the three files to
       # manifests/o/OpenChime/OpenChime/<version>/, and opens the PR. Merging is
@@ -797,3 +909,30 @@ jobs:
             echo "Submitted \`OpenChime.OpenChime\` version \`${VERSION}\` to microsoft/winget-pkgs."
             echo "It becomes installable once that PR passes validation and is merged."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Hands the reserved number back when the release did not happen.
+  #
+  # Safe precisely because publish did not succeed: no index, no GitHub release and
+  # no :latest names this number, so nothing downstream can be pointing at it. The
+  # `|| true` is deliberate -- the tag may never have been pushed (a dry run, or a
+  # failure before the reserve step), and failing here would only obscure the real
+  # error that is already red above.
+  #
+  # D-6: openchime has zero webhooks and nothing else consumes its tags, so a tag
+  # appearing and disappearing on a failed run has no external observer.
+  unreserve:
+    name: return the release number
+    needs: [version, publish]
+    if: ${{ always() && !inputs.dry_run && needs.version.result == 'success' && needs.publish.result != 'success' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - env:
+          N: ${{ needs.version.outputs.number }}
+        run: |
+          set -euo pipefail
+          git push origin ":refs/tags/release-${N}" || true
+          echo "::warning::release ${N} did not publish; the number has been returned"
