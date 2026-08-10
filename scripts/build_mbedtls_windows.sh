@@ -47,6 +47,20 @@ SRC="mbedtls-${MBEDTLS_VERSION}-win"
 TARBALL="${SRC}.tar.bz2"
 URL="https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MBEDTLS_VERSION}/mbedtls-${MBEDTLS_VERSION}.tar.bz2"
 
+# No MBEDTLS_THREADING edit here, deliberately -- build_mbedtls.sh enables
+# MBEDTLS_THREADING_C + MBEDTLS_THREADING_PTHREAD and this script does not.
+#
+# That is not an oversight and not a divergence to reconcile. The native script's
+# stated reason is its TEST SUITE, which drives several TLS clients concurrently;
+# that suite is a Linux binary and never runs here. The Windows front-ends run the
+# same app-core, but nothing in it shares an mbedTLS context between threads:
+# client/core/net.c has the only oc_thread_create in the core, and shared/tls.h
+# keeps mbedtls_entropy_context and mbedtls_ctr_drbg_context as per-struct
+# members, so every TLS context owns its own RNG.
+#
+# If that ever stops being true, the fix is NOT to copy the native flags:
+# MBEDTLS_THREADING_PTHREAD is wrong for mingw, which needs MBEDTLS_THREADING_ALT
+# plus an implementation of the mutex callbacks.
 if [ ! -f "${SRC}/library/libmbedtls.a" ]; then
   if [ ! -d "${SRC}" ]; then
     echo "build_mbedtls_windows: downloading mbedTLS ${MBEDTLS_VERSION}"

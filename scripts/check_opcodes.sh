@@ -34,8 +34,21 @@ awk -v known="$KNOWN_SHARED" '
         name = part[1]
         code = part[2]
         sub(/^0[xX]/, "", code)
-        code = "0x" toupper(code)
-        gsub(/0X/, "0x", code)
+        # Numeric, not textual. Normalising case alone left zero-padding
+        # significant, so 0x70 and 0x0070 -- the same opcode -- produced
+        # different keys and a genuine duplicate written with different padding
+        # was never detected. The header promises "one value, one meaning"; this
+        # is what enforces it rather than "one spelling, one meaning".
+        #
+        # NOTE the variable names. This script already uses `n` to COUNT opcodes
+        # and `i` in its BEGIN loop; an accumulator called `n` silently corrupts
+        # the count (a 2-opcode fixture reported "113 opcodes").
+        val = 0
+        for (ci = 1; ci <= length(code); ci++) {
+            ch = tolower(substr(code, ci, 1))
+            val = val * 16 + index("0123456789abcdef", ch) - 1
+        }
+        code = sprintf("0x%04X", val)
         if (code in seen) {
             if (code in allowed)
                 printf "check_opcodes: known shared opcode %s (%s, %s) — tracked in BACKLOG.md\n",
