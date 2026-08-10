@@ -1,3 +1,4 @@
+#error deliberate build break to verify required status checks
 /* Unified daemon configuration loader (env → oc_config). See config.h. */
 
 #include "config.h"
