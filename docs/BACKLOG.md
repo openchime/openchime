@@ -20,7 +20,21 @@ it breaks something that ships and is used, whether it blocks a capability the
 product claims, and how many people meet it. So a defect in a working feature
 outranks an absent one, and both outrank hygiene. **The number is a position,
 not an identifier**: it moves when items are added or closed. Cite an item by
-its title.
+its title **when referring to it from elsewhere in this file** — a title survives
+the renumbering that a cross-reference would otherwise rot against.
+
+**A commit message is the exception, and cites the number** (CONTRIBUTING.md):
+it is a record of what was true when it was written rather than a live pointer,
+and the number is how an item is referred to at the time. So a commit naming
+"backlog 13" for an item now sitting at 15 is correct history, not a stale
+reference.
+
+**Nothing is ever deleted from this list.** A resolved item keeps its entry and
+gains a **FIXED** block recording what was done and how it was proven; the
+entries that record an effect *tested and found not to occur* are kept for the
+same reason. The list is the project's memory of what was looked at, not only of
+what is outstanding — a removed entry is a finding somebody will rediscover from
+scratch.
 
 **Evidence standard.** Every entry states what was observed rather than what was
 inferred, and carries the file:line or the command that shows it. Two were

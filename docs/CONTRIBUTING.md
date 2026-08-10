@@ -26,6 +26,14 @@ The branch, commit, and CI policy for this repo. The private control-plane repo
   names the area/subsystem (`TUI:`, `GUI:`, `docs:`, `daemon:`, …), not a fixed
   type set.
 - Cite decision ids inline where relevant: `ARCH-N`, `REQ-N`.
+- **A commit that resolves a [BACKLOG.md](./BACKLOG.md) entry cites its NUMBER**
+  — "backlog 15", "item 15" — as the number stands when the commit is written.
+  Yes, that number is a position and will drift as items above it close, so an
+  old commit may name a number that has since moved; the message is a record of
+  what was true when it was written, and the number is how the work is referred
+  to at the time. This is deliberately the opposite convention from
+  cross-references *inside* BACKLOG.md, which cite by title because that file is
+  read as a live list rather than as history.
 - **Never** add a `Co-Authored-By:` or any attribution trailer naming Claude /
   Anthropic. The [`attribution-guard`](../.github/workflows/attribution-guard.yml)
   workflow scans author, committer, and message on every push and **rejects**
