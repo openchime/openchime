@@ -33,8 +33,12 @@ ID="OpenChime.OpenChime"
 # omits it entirely, with no error anywhere, and every install is stranded.
 # Nothing else in the pipeline notices -- the manifest validates, the PR merges,
 # and the package looks fine.
-iss_appid="$(grep -oE 'AppId=\{\{[0-9A-Fa-f-]+' "$here/../openchime.iss" | sed 's/.*{{//')"
-wg_appid="$(grep -oE 'ProductCode: "\{[0-9A-Fa-f-]+' "$here/$ID.installer.yaml" | sed 's/.*{//')"
+# `|| true` on both: under `set -euo pipefail` a no-match grep exits 1, pipefail
+# propagates it and set -e aborts the assignment -- so the -z branch below, and the
+# "<not found>" diagnostics written for exactly that case, could never print. The
+# script died silently here instead of reporting which side was missing.
+iss_appid="$(grep -oE 'AppId=\{\{[0-9A-Fa-f-]+' "$here/../openchime.iss" | sed 's/.*{{//' || true)"
+wg_appid="$(grep -oE 'ProductCode: "\{[0-9A-Fa-f-]+' "$here/$ID.installer.yaml" | sed 's/.*{//' || true)"
 if [ -z "$iss_appid" ] || [ "$iss_appid" != "$wg_appid" ]; then
   echo "render.sh: the WinGet ProductCode does not match the Inno AppId" >&2
   echo "  openchime.iss  AppId       = {${iss_appid:-<not found>}}" >&2
