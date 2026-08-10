@@ -38,15 +38,31 @@ $composerText = $null
 $textDocs = @{}
 $firstWord = @{}
 
+# MAX_DEPTH bounds the printed indentation, and it used to bound the WALK -- but
+# $ids, $noId and $notInvokable are only populated in here, so "every control has
+# a unique id" was really "every control in the first seven levels". The four
+# named-id checks below use FindFirst(Descendants) and are unbounded, which made
+# the inconsistency easy to miss. The cap now limits printing only; the walk is
+# complete, and $seen stops a cyclic provider looping.
+$script:MAX_PRINT_DEPTH = 6
+$script:seen = @{}
+
 function Walk($el, $depth) {
-    if ($depth -gt 6) { return }
+    $rt = $null
+    try { $rt = $el.GetRuntimeId() -join '.' } catch { }
+    if ($rt) {
+        if ($script:seen.ContainsKey($rt)) { return }
+        $script:seen[$rt] = $true
+    }
     $c = $el.Current
     $type = $c.ControlType.ProgrammaticName -replace 'ControlType\.', ''
     $script:counts[$type] = 1 + ($script:counts[$type] | ForEach-Object { $_ })
     $pad = ' ' * ($depth * 2)
     $name = $c.Name
     if ($name.Length -gt 72) { $name = $name.Substring(0, 72) + '...' }
-    Write-Output ("{0}{1}: {2}" -f $pad, $type, $name)
+    if ($depth -le $script:MAX_PRINT_DEPTH) {
+        Write-Output ("{0}{1}: {2}" -f $pad, $type, $name)
+    }
 
     if ($type -eq 'Edit') {
         try {
