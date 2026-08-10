@@ -14,7 +14,7 @@ consequence of that order rather than an open item. Work whose implementation
 lives in the separate control-plane repository is likewise out of scope, and is
 listed at the end so the boundary is visible rather than implied.
 
-**Ordering: item 1 is the lowest impact, item 123 the highest.** Impact is what
+**Ordering: item 1 is the lowest impact, item 124 the highest.** Impact is what
 the issue costs a user or an operator, judged on three things in order — whether
 it breaks something that ships and is used, whether it blocks a capability the
 product claims, and how many people meet it. So a defect in a working feature
@@ -1355,7 +1355,169 @@ high DPI. This is the functional half that `WIN-111` explicitly deferred as a
 behaviour change; the vertical clipping of the titles it recorded as fixed is not
 fixed. **Verified** — screenshot plus the dump's own geometry, 2026-08-02.
 
-## 84. A thread reply notifies nobody
+**FIXED 2026-08-10. The stated cause above is wrong, and that mattered.** This
+entry blames "raw unscaled constants while the fonts and the card frame scale."
+`UIS()` is the **text** scale (`g_text_scale`), not DPI: D2D applies the DPI
+through the render target's `dpiX/dpiY` (`winmain.c:1890`), so every layout
+number in this card is DIP and already DPI-independent. Fixing what the entry
+described would have changed nothing.
+
+The actual mechanism, measured at three scales against a running client: the
+card's content is a fixed ~420 DIP tall, and a window's DIP extent shrinks in
+inverse proportion to DPI. The same 1104x781-pixel window is 1104 DIP wide at 96
+DPI and 441 at 240. So the card — clamped to the window — went from 620 DIP of
+body at 96 DPI to 312 at 240, while its content did not move: Sunday's checkbox
+sat at y=502, 469 and 421 at 96/192/240 DPI against card bottoms of 700, 342 and
+312. Above roughly 150 DPI the content simply does not fit, and the card had no
+way to reach anything past the fold. It was never a scaling bug; it was a
+**missing scroller**, which is the problem `ovl_begin()` already solved for every
+other list overlay and which this card applied to its trailing channel list only.
+
+So the whole body scrolls now, through that same helper, and the wheel already
+routed to it. Content height is **measured from the draw** rather than computed,
+because computing it means restating every section's height a second time and the
+two copies drift the first time a row is added.
+
+**The half that was worse than invisible is closed by clamping, not by
+scrolling.** The card published its hit rectangles as it drew, including rows the
+clip discarded, and the click dispatcher tested them with a bare `in_rect`. Every
+rectangle is now intersected with the painted region — intersected rather than
+dropped, so a half-scrolled row stays clickable over exactly the half you can
+see. Demonstrated end to end before the fix on a client built from `4de7459`: at
+240 DPI with a Custom schedule, the card bottom was 312 and Thursday to Sunday
+were laid out at y=331/361/391/421; a click at (206,301) — inside the card, below
+the visible body — flipped Wednesday from `on=0` to `on=1` with the modal still
+open and nothing on screen changing. The same click after the fix leaves it
+alone, and the clipped rows are reachable by scrolling.
+
+**Two further defects were found by fixing it, and are fixed here rather than
+noted.** Both are the same shape as the original — a control that was reachable
+only because it was dishonestly live.
+
+- *The mode chips overflowed the card horizontally.* The row measured each chip
+  from the scaled font and advanced without ever consulting the card's right
+  edge, so at the largest text size **Custom** — the chip that opens the entire
+  weekday editor — was laid out at x=503 against a card ending at 394, drawn over
+  the shell, and clicked there. Clamping the hit rectangles turned it into a
+  control no sequence of inputs could reach, which is how it surfaced. The row
+  now wraps.
+- *A modal did not own the wheel.* The wheel handler's branches claim on shell
+  state that survives underneath an open modal — the sidebar claims an x range a
+  card is drawn over, an open thread claims it everywhere — so scrolling the card
+  moved the shell behind it. The modal check now comes first, ahead of all of
+  them.
+
+The second one is worth its own sentence, because of how it was found: scrolling
+worked in every interactive session I tried and failed in the suite. The
+difference is that the suite opens a thread earlier in its run. A defect that
+only appears after unrelated navigation is one hand-testing does not find.
+
+**One correction to the entry's third paragraph.** It records that "the body's
+top is computed past its own bottom and the inverted rectangle is handed to the
+clip call without a clamp." That has not been true since WIN-111: `winmain.c`
+clamps both axes at the `PushAxisAlignedClip` call, under a comment recording
+that the unclamped version faulted inside `d2d1.dll` and took the client down
+mid-suite. The paragraph read as a live crash and was not one.
+
+**Measured**, and measured on Windows rather than argued from the source — the
+harness can drive this: `gui_drive.sh`'s `dpi` verb forces a scale factor through
+the same path `WM_DPICHANGED` takes, so the layout is checkable without a scaled
+display attached. `gui_smoke.sh` gains four checks at the matrix's largest scale
+(240 DPI, zoom 4, text size 3): the Custom chip is reachable and selects Custom;
+no weekday row is hit-testable outside the card; a *visible* weekday still
+toggles; and the card scrolls far enough to reach Sunday. The suite is 255 checks
+and the only failures are the two that were already failing — "The Drafts pane's
+'Sent' tab is laid out off-window at large scale" and the `modal.button.done`
+false positive from "The chrome-fit overlap test has no z-layer exemption".
+`make test` passes.
+
+**Proven to fail**, all four, by reverting `winmain.c` and re-running: the Custom
+chip is "published at 503,254 but clicking it did nothing", no weekday row is
+ever drawn, Sunday is unreachable at every scroll offset, and the visible-weekday
+control does not toggle.
+
+The third of those checks is a **control, and it caught a fake pass in its own
+first draft**: clamping every rectangle to nothing would have satisfied the other
+three. The out-of-card check also passed vacuously at first — with Custom never
+reached there were no weekday rows, so "none of them is outside the card" was
+true and meaningless. It now fails loudly when it has nothing to inspect.
+
+`chromefit` could not have caught any of this, and still cannot: it compares
+published rectangles, and the rows in question were published outside the card
+while every element it knows about sat inside. That is "The chrome-fit check
+cannot see clipped text" from the other direction.
+
+**The card's HORIZONTAL squeeze is fixed here too**, having first been recorded
+as a follow-up. Every column in the card reserved a flat strip for whatever sat
+on its right, which is the same mistake as the vertical one on the other axis:
+
+- The channel rows reserved **260 DIP** for their three chips whatever the card's
+  width, leaving about 66 DIP for the name at 240 DPI — a channel read as `#...`
+  and the default row as `D..`. The reserve is now **measured** from the same
+  scaled font that draws the chips, and below a readable minimum the row stacks:
+  name on its line, chips on the next.
+- The keyword and priority-people blocks reserved a strip for their Edit button,
+  so the sentence saying what the setting DOES was cut to "None — messages con…".
+  The button moves to its own line when the card is narrow, and both descriptions
+  now **wrap** rather than ellipsise — they were drawn with the no-wrap `g_meta`,
+  which carries an ellipsis trimming sign.
+- Every modal's **subtitle** had a flat one-line allowance, so the card's own
+  summary line ended in "…" at 240 DPI. It wraps, and `modal_frame` measures the
+  wrapped height instead of assuming one line. This needed a `text_height()` to
+  exist at all — there was only `text_width()`, so a caller could not ask the
+  question for the other axis.
+
+**And the subtitle now yields when the card cannot afford it**, which was found
+by measuring rather than by looking: at 240 DPI *with* zoom and Largest text, the
+header and footer together consumed the entire card and the body came out **nine
+DIP tall** — a scroller over nothing. Dropping the subtitle in that case takes the
+body to 119 DIP. The subtitle is the only part of the modal chrome that explains
+rather than does, so it is the part that goes.
+
+Measured after: at plain 240 DPI the body is 159 DIP and the card reads normally;
+at 96 DPI every one of these paths is byte-identical to before, which is the point
+— the stacked layouts engage on width, not on DPI, and `chromefit` reports
+`overlaps=0 outside=0` for the card at 96 DPI.
+
+## 84. The Preferences card draws its two panes on top of each other at high DPI
+
+`draw_prefs` reserves a flat 168 DIP for its category rail and starts the rows
+pane after it, without consulting the card's width. At 240 DPI the card has about
+300 DIP of content, so the two panes were laid out over each other: "Appearance"
+printed through "Theme", the colour swatches through their own label, "Advanced"
+through "Text size". The card also had **no scroller at all**, so everything past
+the first row and a half was drawn outside it and unreachable.
+
+*Impact:* the preferences surface is unusable at high DPI — unreadable where the
+panes collide, and unreachable below the fold. Distinct from "The Notifications
+card clips its own content at high DPI" and found while fixing it: the same two
+mistakes, in the modal next door.
+
+**Verified** — screenshot at 240 DPI plus `chromefit overlaps=4`, against a client
+built from `4de7459`, i.e. before any of that work. Reproduced identically on the
+unmodified tree, so it is not a consequence of the notifications fix.
+
+**FIXED 2026-08-10.** Two columns only while both fit: below `catw + 260` the rail
+becomes a wrapping chip row above the rows it filters, and the rows pane takes the
+full width. The rail's width is scaled now as well — the category names are text
+and it was a raw 168. The rows scroll through the same `ovl_begin()` helper as
+every other overlay, and the row hit rectangles are clamped to the painted region,
+because Preferences published them while drawing exactly as the notifications card
+did. **The categories deliberately do NOT scroll**: a chip you have to scroll to
+find is not a way to reach the section it names.
+
+Measured: at 240 DPI the panes no longer overlap, the last Appearance row is
+reachable by wheel with a scroll range of 226 DIP, and the category chips stay
+put. At 96 DPI the two-pane rail is unchanged and `chromefit` reports
+`overlaps=0 outside=0` with nothing to scroll (`max=0`), which is what shows the
+new path engages on width rather than on DPI.
+
+Not fixed, and recorded rather than left to be rediscovered: the rail labels sit a
+pixel or two into the card's left edge at 96 DPI, clipping the first glyph
+slightly. It predates this work — the two-pane branch is unchanged from
+`4de7459` — and is cosmetic.
+
+## 85. A thread reply notifies nobody
 
 Thread replies never produce a notification decision.
 
@@ -1366,7 +1528,7 @@ channel-level sends do.
 calls oc_push_notify) vs daemon/netloop.c:2037 (OC_RES_SENT does);
 daemon/dbwriter.c:3212 comment names it a gap
 
-## 85. Notifications have no sound, no badge and no preview toggle
+## 86. Notifications have no sound, no badge and no preview toggle
 
 Notification rendering: no sounds, no unread/taskbar badge, no window flash, no
 content-preview toggle.
@@ -1378,7 +1540,7 @@ on the taskbar, and no way to keep message text off the screen.
 grep -niE 'PlaySound|ITaskbarList|OverlayIcon|FlashWindow' winmain.c -> 0
 notification hits; grep 'preview.*toast|show_preview' -> 0 hits
 
-## 86. Closing the window quits the app and ends all notification
+## 87. Closing the window quits the app and ends all notification
 
 WM_CLOSE quits the app; no close-to-tray and no taskbar flash, with no stated
 contract.
@@ -1390,7 +1552,7 @@ product call.
 **Verified** — client/gui/win32/winmain.c:17156-17188 WM_CLOSE falls through to DefWindowProcW
 after the unsent-outbox prompt; tray_done() in WM_DESTROY:17193
 
-## 87. Nothing states what an unread badge counts
+## 88. Nothing states what an unread badge counts
 
 Nothing states what an unread badge counts.
 
@@ -1401,7 +1563,7 @@ should be the quieter reading (badge = what was worth notifying).
 client keeps its own high-water (client/core/model.h:98-101); no requirement
 reconciles them
 
-## 88. A user cannot follow every thread in a channel
+## 89. A user cannot follow every thread in a channel
 
 Cannot follow every thread in a channel.
 
@@ -1411,7 +1573,7 @@ missed.
 **Verified** — daemon/migrate.c:225-230 + :521 notification_prefs has only level and muted; no
 per-channel thread-follow column and no op in shared/protocol.h
 
-## 89. There are no reminders and no saved-item due dates
+## 90. There are no reminders and no saved-item due dates
 
 Reminders and saved-item due dates.
 
@@ -1421,7 +1583,7 @@ ARCH-78 pass defaults to 5 min, a different promise from firing on the minute.
 **Verified** — grep -rniE 'remind_at|reminder' daemon/ shared/ client/core/ -> only an emoji
 keyword; saved_items (migration 0025, daemon/migrate.c:494) has no remind_at_ms
 
-## 90. A call starting raises no notification
+## 91. A call starting raises no notification
 
 A call starting raises no notification.
 
@@ -1432,7 +1594,7 @@ with the audio client.
 **Verified** — daemon/netloop.c:1588-1596 CALL_JOIN submits an access-gate job only; no
 oc_push_notify or fan-out on an empty roster becoming non-empty
 
-## 91. The notify decision has no single evaluator and no precedence order
+## 92. The notify decision has no single evaluator and no precedence order
 
 No single notify evaluator: the precedence rule is split between push SQL and
 each client.
@@ -1446,7 +1608,7 @@ still undecided, including whether priority people pierce a pause.
 lives in daemon/push.c:334-425 SQL and separately in
 client/gui/win32/winmain.c:16462-16463
 
-## 92. There are no workspace-default quiet hours
+## 93. There are no workspace-default quiet hours
 
 Workspace default DND hours — blocked on there being no tenant-settings
 surface.
@@ -1457,7 +1619,7 @@ configure their own.
 **Verified** — daemon/migrate.c:672-735 (0034) stores dnd_mode/allow_*_min per user only; no
 tenant-level default column or op
 
-## 93. Invites are single-use only, with no shareable link
+## 94. Invites are single-use only, with no shareable link
 
 Invite management (pending list, revoke, expiry) IS built; only multi-use
 shareable links are missing.
@@ -1469,7 +1631,7 @@ started' both overstate the gap.
 (0x004B-0x004E); daemon/dbwriter.c:4894,4933; daemon/migrate.c:85-91 invites
 has expires_at_ms + consumed_at_ms (single-use); client/core/client.c:681,688
 
-## 94. There are no guest accounts
+## 95. There are no guest accounts
 
 Guest accounts — no channel-scoped role.
 
@@ -1479,7 +1641,7 @@ be excluded.
 **Verified** — daemon/roles.c/roles.h and daemon/migrate.c CHECK (role IN
 ('owner','admin','member')) — grep 'guest' -> 0 hits
 
-## 95. The admin console has no member table and no bulk actions
+## 96. The admin console has no member table and no bulk actions
 
 Admin console exists as a rail view but has no member table, no bulk actions
 and no analytics.
@@ -1491,7 +1653,7 @@ time and has no usage picture.
 Invites only; role change and remove are per-member context actions; no
 aggregate/analytics op in shared/protocol.h
 
-## 96. There is no workspace-settings surface at all
+## 97. There is no workspace-settings surface at all
 
 No workspace-settings surface at all: name is env-only, no icon, default
 channels or join policy.
@@ -1503,7 +1665,7 @@ daemon's environment; blocks REQ-279.
 shared/protocol.h:566 oc_workspace_info is read-only (deployment_mode,
 max_users, workspace_name); no SET_WORKSPACE_* opcode exists
 
-## 97. A URL cannot be authored as a link and is not clickable
+## 98. A URL cannot be authored as a link and is not clickable
 
 No hyperlink construct: cannot author a link, and a URL in a message is not
 clickable.
@@ -1563,7 +1725,7 @@ Remaining, and deliberately not done here: registering `openchime://` with the
 OS (item 30), unfurls (item 98), and any TUI rendering — the span is shared, so
 the TUI inherits it the day it renders rich text at all (MARKDOWN.md §6).
 
-## 98. There are no link unfurls
+## 99. There are no link unfurls
 
 Link unfurls.
 
@@ -1571,7 +1733,7 @@ Link unfurls.
 
 **Verified** — grep -rni 'unfurl' daemon/ client/ shared/ -> 0 hits
 
-## 99. There are no native polls
+## 100. There are no native polls
 
 Native polls.
 
@@ -1579,7 +1741,7 @@ Native polls.
 
 **Verified** — no poll/vote message type in shared/protocol.h; grep for poll+vote -> 0 hits
 
-## 100. There is no first-class snippet object
+## 101. There is no first-class snippet object
 
 Snippets: fenced code blocks render, but there is no first-class snippet
 object.
@@ -1591,7 +1753,7 @@ can share and open on its own.
 fenced blocks; grep 'snippet' finds only FTS search snippets
 (client/core/model.h:137)
 
-## 101. Local auth has no second factor
+## 102. Local auth has no second factor
 
 No MFA/2FA in local auth mode.
 
@@ -1601,7 +1763,7 @@ deployment.
 **Verified** — grep -rniE 'totp|mfa|2fa|two-factor' daemon/ shared/ client/core/ -> 0 hits;
 auth is PBKDF2 password only (daemon/auth.c)
 
-## 102. There is no IP allowlist
+## 103. There is no IP allowlist
 
 No IP allowlist / access restriction.
 
@@ -1610,7 +1772,7 @@ No IP allowlist / access restriction.
 **Verified** — grep -rn 'allowlist|allow_list' daemon/ -> 0 hits; only
 OPENCHIME_MAX_CONNS_PER_IP throttling in the accept loop
 
-## 103. There is no message retention policy
+## 104. There is no message retention policy
 
 Opt-in message retention policy — nothing ages out messages.
 
@@ -1620,7 +1782,7 @@ Opt-in message retention policy — nothing ages out messages.
 **Verified** — daemon/storage.c:23 only OPENCHIME_ATTACH_MAX_AGE_DAYS (REQ-217); no message-
 pruning statement anywhere in daemon/dbwriter.c
 
-## 104. There is no legal hold
+## 105. There is no legal hold
 
 Legal hold — needs ARCH decision, narrowed to REQ-276/277.
 
@@ -1629,7 +1791,7 @@ REQ-277.
 
 **Verified** — grep -rniE 'legal_hold|LEGAL' daemon/ -> 0 hits
 
-## 105. There is no compliance capture
+## 106. There is no compliance capture
 
 Compliance capture (vendor push + pull API) scoped but unbuilt.
 
@@ -1640,7 +1802,7 @@ over SMTP journaling (file-drop first) and our own documented pull API.
 **Verified** — no SMTP/journaling/export code in daemon/; drafts are declared in scope for it
 (docs/REQUIREMENTS.md:1745)
 
-## 106. There is no send-time DLP
+## 107. There is no send-time DLP
 
 Send-time DLP pre-post webhook scoped but unbuilt.
 
@@ -1650,7 +1812,7 @@ suite.
 
 **Verified** — no pre-post hook in daemon/dbwriter.c process_send; grep for DLP -> 0 hits
 
-## 107. There is no app or bot platform
+## 108. There is no app or bot platform
 
 No app/bot identity model and no slash-command dispatch.
 
@@ -1660,7 +1822,7 @@ the third-party route around REQ-270) has no foundation.
 **Verified** — No bot identity column or table in daemon/migrate.c; no install/registration
 opcodes in shared/protocol.h; the Win32 composer has no slash dispatcher.
 
-## 108. There are no outgoing webhooks
+## 109. There are no outgoing webhooks
 
 No outgoing webhooks / event subscriptions.
 
@@ -1671,7 +1833,7 @@ complement.
 daemon/migrate.c; no outbound delivery/retry/signing code beyond enroll.c and
 push.c, which are both fixed-endpoint.
 
-## 109. There is no workflow automation
+## 110. There is no workflow automation
 
 No workflow automation.
 
@@ -1679,7 +1841,7 @@ No workflow automation.
 
 **Verified** — No trigger/action model anywhere in daemon/ or shared/protocol.h.
 
-## 110. There is no app-directory client surface
+## 111. There is no app-directory client surface
 
 No app directory (federated function).
 
@@ -1689,7 +1851,7 @@ this repo.
 **Verified** — No directory client in daemon/ (only enroll.c and push.c call out); nothing in
 client/gui/win32.
 
-## 111. There is no third-party API or SDK
+## 112. There is no third-party API or SDK
 
 No third-party API or SDK.
 
@@ -1698,7 +1860,7 @@ No third-party API or SDK.
 **Verified** — the only wire is the custom binary protocol (shared/protocol.h); the sole HTTP
 surface is POST /webhook/<token> (daemon/netloop.c:1813)
 
-## 112. There is no email-to-channel ingestion
+## 113. There is no email-to-channel ingestion
 
 No email-to-channel ingestion.
 
@@ -1708,7 +1870,7 @@ mail receiver.
 **Verified** — no inbound-mail path anywhere in daemon/; the only ingress handlers are the
 oc/1 protocol and the webhook POST
 
-## 113. Screenshare is designed and unbuilt
+## 114. Screenshare is designed and unbuilt
 
 Screenshare designed but zero code, with four unresolved design questions.
 
@@ -1719,7 +1881,7 @@ CALL_JOINED. Sequenced behind the audio client.
 **Verified** — grep -rniE 'vp9|libvpx|screenshare|screen_share' (excluding third_party) -> 0
 hits
 
-## 114. The webhook endpoint has no CA-signed certificate
+## 115. The webhook endpoint has no CA-signed certificate
 
 No CA-signed certificate for the webhook endpoint; no ACME/on-demand issuance.
 
@@ -1731,7 +1893,7 @@ third-party sender and a working webhook.
 webhook endpoint rides the TOFU self-signed cert (shared/tls.c,
 daemon/netloop.c:3776)
 
-## 115. A webhook can post into an archived channel
+## 116. A webhook can post into an archived channel
 
 Archiving makes a channel read-only, and `SEND`, `SEND_REPLY` and `UPLOAD_BEGIN`
 all enforce it through one shared access check. The incoming-webhook post path
@@ -1746,7 +1908,7 @@ from `453782f`, a POST to a live token on an archived channel returned
 `HTTP 200 {"ok":true,"message_id":1}` and the row is in `messages`. No test
 covers it.
 
-## 116. Editing a profile drops the connection and saves nothing
+## 117. Editing a profile drops the connection and saves nothing
 
 `OC_MSG_SET_PROFILE` and `OC_MSG_SET_PRESENCE` are both `0x0070`, and the
 daemon's dispatch chain tests `SET_PRESENCE` first, so the `SET_PROFILE` branch
@@ -1762,7 +1924,7 @@ which is why it has gone unnoticed. Nothing exercises `SET_PROFILE` over the
 wire in any test. **Verified** — full chain read and the decode reproduced
 against the real codec.
 
-## 117. The push emitter has no client that can register a device
+## 118. The push emitter has no client that can register a device
 
 The daemon owns the device-token registry and emits signed, contentless push
 batches to the control-plane gateway. `REGISTER_DEVICE_TOKEN` is sent by no
@@ -1776,7 +1938,7 @@ frames no client sends.
 
 ---
 
-## 118. The audio client does not exist
+## 119. The audio client does not exist
 
 Call signalling, the per-channel roster, per-join tokens and the forked UDP relay
 sidecar are built and tested server-side. The client half is absent: no Opus, no
@@ -1788,7 +1950,7 @@ behind it — screenshare (REQ-161), the call-start notification (REQ-285), and 
 Huddles surface the Win32 sidebar deliberately omits because a row would point at
 nothing. **Verified** — no `CALL_*` in `client/core`.
 
-## 119. No client can complete an OIDC login
+## 120. No client can complete an OIDC login
 
 The daemon verifies a re-issued ES256 token and the control plane mints one, but
 the client half — the system-browser flow, PKCE, and the loopback redirect that
@@ -1802,7 +1964,7 @@ user. `scripts/demo-oidc.sh` proves the mint↔verify contract with a dev endpoi
 deliberately bypassing the browser flow. **Verified** — no OIDC entry point in
 the facade; REQ-020 and AUTH.md §7 both record it.
 
-## 120. The TLS handshake rejects every standard HTTPS client, so incoming webhooks are unreachable
+## 121. The TLS handshake rejects every standard HTTPS client, so incoming webhooks are unreachable
 
 The daemon advertises exactly one ALPN protocol, `oc/1`. A client that offers any
 other protocol list — which is every ordinary HTTPS client, including `curl`,
@@ -1843,7 +2005,7 @@ produced 13 failing assertions across the two suites, 2 of them in the new
 
 ---
 
-## 121. The Windows signing step names a service that no longer exists
+## 122. The Windows signing step names a service that no longer exists
 
 `release.yml` signs with `azure/trusted-signing-action@v0` and passes
 `trusted-signing-account-name`. Azure renamed Trusted Signing to **Artifact
@@ -1865,7 +2027,7 @@ No dry run can catch it: signing is gated off whenever `dry_run` is true.
 `trusted-signing-account-name` marked deprecated, and lists the azure-* auth
 inputs this workflow omits.
 
-## 122. The MSIX carries three placeholder identity values
+## 123. The MSIX carries three placeholder identity values
 
 `packaging/windows/msix/AppxManifest.xml` ships `Identity/@Name`,
 `Identity/@Publisher` and `PublisherDisplayName` as literal placeholders. They
@@ -1882,7 +2044,7 @@ release.yml's `Build the MSIX` step, which rewrites only `Version`. Artifact
 Signing's own FAQ lists error `0x8007000b` for exactly this mismatch, and
 states the subject cannot be customised — it is the validated legal name.
 
-## 123. The publish job has never executed
+## 124. The publish job has never executed
 
 Every dry run skips `publish` (`if: inputs.dry_run == false`), and no real
 release has been run. So repository signing, `apt-ftparchive` and

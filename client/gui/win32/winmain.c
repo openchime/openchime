@@ -1555,6 +1555,25 @@ static float text_width(const char *s, IDWriteTextFormat *fmt) {
     return out;
 }
 
+/* How tall `s` is once wrapped into `w` — the same question text_width answers
+ * for the other axis, and the one a header has to ask before it decides how much
+ * room to leave. Without it a caller can only assume one line, which is what cut
+ * every modal subtitle to "…" the moment the card was narrower than the sentence. */
+static float text_height(const char *s, IDWriteTextFormat *fmt, float w) {
+    WCHAR wc[256];
+    int n = to_w(s, wc, 256);
+    if (n <= 0 || !g_dwrite || w <= 0) return 0;
+    IDWriteTextLayout *tl = NULL;
+    if (FAILED(IDWriteFactory_CreateTextLayout(g_dwrite, wc, (UINT32)n, fmt,
+                                               w, 4000.0f, &tl)) || !tl)
+        return 0;
+    DWRITE_TEXT_METRICS tm;
+    float out = 0;
+    if (SUCCEEDED(IDWriteTextLayout_GetMetrics(tl, &tm))) out = tm.height;
+    IDWriteTextLayout_Release(tl);
+    return out;
+}
+
 /* ":name:" -> "name", or 0 when it is not one. Deliberately strict about the shape:
  * a bare colon in ordinary text must not be read as an emoji. */
 static int custom_emoji_id(const char *s, char *name, size_t cap) {
@@ -3728,7 +3747,11 @@ static void ovl_end(ID2D1RenderTarget *rt, D2D1_RECT_F body) {
     ID2D1RenderTarget_PopAxisAlignedClip(rt);
 }
 
-enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS };
+enum { OVL_AUDIT = 1, OVL_WEB, OVL_REACT, OVL_NOTIFY, OVL_KEYS, OVL_LATER, OVL_FILES, OVL_BROWSE, OVL_INVITES, OVL_SESSIONS, OVL_PREFS };
+
+/* Measured from the previous frame's draw, for the same reason the notifications
+ * card's is: computing it means restating every row's height a second time. */
+static float g_prefs_content_h;
 
 /* A PANE title bar — Thread, Search, Pins, Storage, Audit, Webhooks, the DM picker.
  *
@@ -4235,27 +4258,106 @@ static void sched_set_field(int field, uint16_t value) {
     sched_send(m->dnd_mode, start, end, days);
 }
 
+static const char *const NOTIFY_LEVELS[3] = { "All", "Mentions", "None" };
+
+/* What the three chips actually need, measured from the same scaled font that
+ * draws them. The label column used to reserve a flat 260 DIP for them instead,
+ * which is a second opinion about one number: at 240 DPI that left about 66 DIP
+ * for the name and a channel row read as "#...". */
+static float notify_chips_w(void) {
+    float w = 12;   /* the two 6 DIP gaps between them */
+    for (int L = 0; L < 3; L++) w += text_width(NOTIFY_LEVELS[L], g_meta) + 20;
+    return w;
+}
+
+/* A label narrower than this is not worth drawing beside the chips — below it,
+ * with the full width of the card, is more readable than four ellipsised
+ * characters. */
+#define NOTIFY_LABEL_MIN UIS(96.0f)
+
+static int notify_row_stacked(D2D1_RECT_F body) {
+    return (body.right - 24 - notify_chips_w()) - (body.left + 20) < NOTIFY_LABEL_MIN;
+}
+
+/* The row height a level row needs: one line, or two when the chips have to sit
+ * under the label rather than beside it. */
+static float notify_rowh(D2D1_RECT_F body) {
+    return notify_row_stacked(body) ? UIS(38) + 34 : UIS(38);
+}
+
+static void notify_chip_one(ID2D1RenderTarget *rt, D2D1_RECT_F b, int L,
+                            uint64_t cid, uint8_t level) {
+    int on = (level == L);
+    fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
+    if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_text(rt, NOTIFY_LEVELS[L], g_meta, b, on ? 0xFFFFFF : OC_COL_MUTED);
+    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+    if (g_n_notify_hits < 128) {
+        g_notify_hits[g_n_notify_hits].r = b;
+        g_notify_hits[g_n_notify_hits].cid = cid;
+        g_notify_hits[g_n_notify_hits].level = (uint8_t)L;
+        g_n_notify_hits++;
+    }
+}
+
+/* Right-aligned beside the label, or left-aligned on a line of their own when
+ * the card is too narrow to hold both. */
 static void notify_chips(ID2D1RenderTarget *rt, D2D1_RECT_F body, float y, float rowh,
                          uint64_t cid, uint8_t level) {
-    static const char *LEVELS[3] = { "All", "Mentions", "None" };
+    if (notify_row_stacked(body)) {
+        float cy = y + rowh - 28, bx = body.left + 20;
+        for (int L = 0; L < 3; L++) {
+            float bw = text_width(NOTIFY_LEVELS[L], g_meta) + 20;
+            D2D1_RECT_F b = rf(bx, cy, bx + bw, cy + 24);
+            notify_chip_one(rt, b, L, cid, level);
+            bx = b.right + 6;
+        }
+        return;
+    }
     float bx = body.right - 24;
     for (int L = 2; L >= 0; L--) {
-        float bw = text_width(LEVELS[L], g_meta) + 20;
+        float bw = text_width(NOTIFY_LEVELS[L], g_meta) + 20;
         D2D1_RECT_F b = rf(bx - bw, y + (rowh - 24) / 2, bx, y + (rowh - 24) / 2 + 24);
-        int on = (level == L);
-        fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
-        if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
-        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_text(rt, LEVELS[L], g_meta, b, on ? 0xFFFFFF : OC_COL_MUTED);
-        IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
-        if (g_n_notify_hits < 128) {
-            g_notify_hits[g_n_notify_hits].r = b;
-            g_notify_hits[g_n_notify_hits].cid = cid;
-            g_notify_hits[g_n_notify_hits].level = (uint8_t)L;
-            g_n_notify_hits++;
-        }
+        notify_chip_one(rt, b, L, cid, level);
         bx = b.left - 6;
     }
+}
+
+/* The keyword / priority-people blocks put their Edit button on a line of their
+ * own once the text column beside it drops below this, on the same principle as
+ * the level rows: a sentence cut to three words explains nothing. */
+static int notify_edit_stacked(D2D1_RECT_F body) {
+    return (body.right - UIS(140)) - (body.left + 20) < UIS(200);
+}
+
+/* Where a label drawn beside the chips has to stop. */
+static float notify_label_right(D2D1_RECT_F body) {
+    return notify_row_stacked(body) ? body.right - 20
+                                    : body.right - 24 - notify_chips_w() - 8;
+}
+
+/* The card's drawn height, measured on the previous frame. It is measured rather
+ * than computed because computing it means restating every section's height a
+ * second time, and the two copies drift the first time a row is added. One frame
+ * of lag costs nothing: the offset starts clamped to 0 (the top), and the card
+ * redraws continuously while it is open. */
+static float g_notify_content_h;
+
+/* Confine a hit rectangle to the region that was actually painted.
+ *
+ * This is the half of the clipping defect that is worse than invisible. The card
+ * publishes its hit rectangles while drawing, and the click dispatcher tested
+ * them with a bare in_rect — so a row the clip had painted away stayed live, and
+ * a click on apparently-empty card background toggled a weekday the user could
+ * not see. Intersecting rather than dropping keeps a half-scrolled row clickable
+ * over exactly the half of it that is visible. */
+static D2D1_RECT_F hit_visible(D2D1_RECT_F r, D2D1_RECT_F vis) {
+    D2D1_RECT_F o = rf(r.left   > vis.left   ? r.left   : vis.left,
+                       r.top    > vis.top    ? r.top    : vis.top,
+                       r.right  < vis.right  ? r.right  : vis.right,
+                       r.bottom < vis.bottom ? r.bottom : vis.bottom);
+    return (o.right <= o.left || o.bottom <= o.top) ? rf(0, 0, 0, 0) : o;
 }
 
 static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg) {
@@ -4263,29 +4365,58 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
     ovl_use(OVL_NOTIFY);
     g_n_notify_hits = 0;
 
+    /* The WHOLE body scrolls, not just the channel list at the end.
+     *
+     * The card's content is a fixed ~420 DIP tall and the card is clamped to the
+     * window, whose DIP extent shrinks in inverse proportion to DPI — so at 240
+     * DPI a default-sized window leaves ~310 DIP of body and everything from the
+     * weekday rows down was simply drawn outside the clip. It was never a
+     * scaling bug: the layout math is DIP and DPI-independent (D2D applies the
+     * DPI through the render target). The card just had no way to reach content
+     * taller than the window, which is the exact problem ovl_begin() already
+     * solved for every other list overlay. */
+    float top = ovl_begin(rt, reg, g_notify_content_h);
+    body.top = top;
+
     /* Keyword alerts and priority people (REQ-135), above the per-channel list
      * for the same reason the default is: they are rules that cut ACROSS the
      * rows below, not another row. Slack keeps them on this screen too. */
     {
+        /* Same stacking rule as the level rows, for the same reason: the Edit
+         * button reserved a flat strip on the right whatever the card's width,
+         * so at 240 DPI the sentence explaining what keywords DO was cut to
+         * "None \u2014 messages con\u2026". Below the text, the sentence gets the card. */
+        int estack = notify_edit_stacked(body);
+        float er   = estack ? body.right - 20 : body.right - UIS(140);
+        float dw   = er - (body.left + 20);
         float y0 = body.top;
         char kw[256] = "";
         for (uint8_t i = 0; i < m->n_kw_terms; i++) {
             if (kw[0]) strncat(kw, ", ", sizeof kw - strlen(kw) - 1);
             strncat(kw, m->kw_terms[i], sizeof kw - strlen(kw) - 1);
         }
+        /* These two lines say what the setting DOES, and they are the first thing
+         * a narrow card threw away. They wrap now, and the block's height is
+         * measured from the wrap rather than fixed at one line. */
+        const char *kwtext = kw[0] ? kw
+            : "None \u2014 messages containing a keyword notify you like a mention.";
+        float kwh = text_height(kwtext, g_meta_w, dw);
+        if (kwh < 20) kwh = 20;
+        float kwblk = estack ? 18 + kwh + 34 : 18 + kwh + 6;
         draw_text(rt, "My keywords", g_ui_b,
-                  rf(body.left + 20, y0, body.right - UIS(140), y0 + 20), OC_COL_TEXT);
-        draw_text(rt, kw[0] ? kw : "None \u2014 messages containing a keyword notify you like a mention.",
-                  g_meta, rf(body.left + 20, y0 + 18, body.right - UIS(140), y0 + 38),
+                  rf(body.left + 20, y0, er, y0 + 20), OC_COL_TEXT);
+        draw_text(rt, kwtext, g_meta_w, rf(body.left + 20, y0 + 18, er, y0 + 18 + kwh),
                   kw[0] ? OC_COL_MUTED : OC_COL_FAINT);
-        g_notify_kw_btn = rf(body.right - UIS(120), y0 + 2, body.right - UIS(24), y0 + 28);
+        g_notify_kw_btn = estack
+            ? rf(body.left + 20, y0 + 22 + kwh, body.left + 20 + UIS(96), y0 + 48 + kwh)
+            : rf(body.right - UIS(120), y0 + 2, body.right - UIS(24), y0 + 28);
         fill_round(rt, g_notify_kw_btn, 6.0f, OC_COL_INPUT);
         stroke_round(rt, g_notify_kw_btn, 6.0f, OC_COL_BORDER, 1.0f);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
         draw_text(rt, "Edit", g_meta, g_notify_kw_btn, OC_COL_TEXT);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
 
-        float y1 = y0 + 44;
+        float y1 = y0 + kwblk;
         char vips[256] = "";
         for (uint8_t i = 0; i < m->n_pri_people; i++) {
             const char *nm = oc_model_user_name((oc_model *)m, m->pri_people[i]);
@@ -4293,21 +4424,26 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
             if (vips[0]) strncat(vips, ", ", sizeof vips - strlen(vips) - 1);
             strncat(vips, nm, sizeof vips - strlen(vips) - 1);
         }
+        const char *viptext = vips[0] ? vips
+            : "None \u2014 they reach you through a level and a pause, never a mute.";
+        float viph = text_height(viptext, g_meta_w, dw);
+        if (viph < 20) viph = 20;
+        float vipblk = estack ? 18 + viph + 34 : 18 + viph + 6;
         draw_text(rt, "Priority people", g_ui_b,
-                  rf(body.left + 20, y1, body.right - UIS(140), y1 + 20), OC_COL_TEXT);
-        draw_text(rt, vips[0] ? vips
-                              : "None \u2014 they reach you through a level and a pause, never a mute.",
-                  g_meta, rf(body.left + 20, y1 + 18, body.right - UIS(140), y1 + 38),
+                  rf(body.left + 20, y1, er, y1 + 20), OC_COL_TEXT);
+        draw_text(rt, viptext, g_meta_w, rf(body.left + 20, y1 + 18, er, y1 + 18 + viph),
                   vips[0] ? OC_COL_MUTED : OC_COL_FAINT);
-        g_notify_vip_btn = rf(body.right - UIS(120), y1 + 2, body.right - UIS(24), y1 + 28);
+        g_notify_vip_btn = estack
+            ? rf(body.left + 20, y1 + 22 + viph, body.left + 20 + UIS(96), y1 + 48 + viph)
+            : rf(body.right - UIS(120), y1 + 2, body.right - UIS(24), y1 + 28);
         fill_round(rt, g_notify_vip_btn, 6.0f, OC_COL_INPUT);
         stroke_round(rt, g_notify_vip_btn, 6.0f, OC_COL_BORDER, 1.0f);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
         draw_text(rt, "Edit", g_meta, g_notify_vip_btn, OC_COL_TEXT);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
 
-        fill(rt, rf(body.left + 20, y1 + 44, body.right - 20, y1 + 45), OC_COL_BORDER);
-        body.top = y1 + 54;
+        fill(rt, rf(body.left + 20, y1 + vipblk, body.right - 20, y1 + vipblk + 1), OC_COL_BORDER);
+        body.top = y1 + vipblk + 10;
     }
 
     /* The SCHEDULE (REQ-136), in Slack's shape: one row of choices, a time range
@@ -4319,9 +4455,20 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
         draw_text(rt, "Allow notifications", g_ui_b,
                   rf(body.left + 20, y0, body.right - 20, y0 + 20), OC_COL_TEXT);
         static const char *MODES[4] = { "Any time", "Every day", "Weekdays", "Custom" };
+        /* The row WRAPS. Each chip is measured from the scaled font and the row
+         * used to advance without ever consulting the card's right edge, so at a
+         * large text size the last chip — Custom, the one that opens the whole
+         * weekday editor — was laid out past the card and drawn over the shell.
+         * It was clickable there, which is why nothing noticed; clamping the hit
+         * rectangles to what is painted turned that into a control no sequence of
+         * inputs could reach, which is how it was found. */
         float mx = body.left + 20, my = y0 + 24;
         for (int i = 0; i < 4; i++) {
             float bw = text_width(MODES[i], g_meta) + 22;
+            if (mx > body.left + 20 && mx + bw > body.right - 20) {
+                mx = body.left + 20;
+                my += 34;
+            }
             D2D1_RECT_F b = rf(mx, my, mx + bw, my + 26);
             int on = (m->dnd_mode == i);
             fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
@@ -4400,31 +4547,58 @@ static void draw_notify_prefs(ID2D1RenderTarget *rt, const oc_model *m, D2D1_REC
      * are exceptions to — a default you have to scroll to find reads as row zero
      * of the list instead of as the rule. cid=0 marks it in the hit table. */
     {
-        float rowh0 = UIS(38), y0 = body.top;
+        float rowh0 = notify_rowh(body), y0 = body.top;
+        float lr = notify_label_right(body);
+        /* The title and its caption keep the ONE-line height whether or not the
+         * chips stack; stacking adds a line below them, it does not stretch the
+         * two lines that were already there. */
         draw_text(rt, "Default for all channels", g_ui_b,
-                  rf(body.left + 20, y0, body.right - UIS(260), y0 + rowh0), OC_COL_TEXT);
+                  rf(body.left + 20, y0, lr, y0 + UIS(38)), OC_COL_TEXT);
         notify_chips(rt, body, y0, rowh0, 0, m->notify_default);
         draw_text(rt, "Channels listed below override this.", g_meta,
-                  rf(body.left + 20, y0 + rowh0 - 16, body.right - 260, y0 + rowh0 + 4),
+                  rf(body.left + 20, y0 + UIS(38) - 16, lr, y0 + UIS(38) + 4),
                   OC_COL_FAINT);
         fill(rt, rf(body.left + 20, y0 + rowh0 + 6, body.right - 20, y0 + rowh0 + 7), OC_COL_BORDER);
         body.top += rowh0 + 16;
     }
 
-    float rowh = UIS(38);
-    float y = ovl_begin(rt, body, (float)m->n_channels * rowh);
+    float rowh = notify_rowh(body);
+    float y = body.top;
     for (size_t i = 0; i < m->n_channels; i++) {
         const oc_channel *c = &m->channels[i];
-        if (y + rowh < body.top) { y += rowh; continue; }
-        if (y > body.bottom) break;
-        char label[128];
-        channel_label(m, c, label, sizeof label);
-        draw_text(rt, label, g_ui, rf(body.left + 20, y, body.right - UIS(260), y + rowh), OC_COL_TEXT);
-        notify_chips(rt, body, y, rowh, c->channel_id, c->notify_level);
-        fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 20, y + rowh), OC_COL_BORDER);
+        /* Cull against the visible region, and NEVER break out of the loop: the
+         * running y is what measures the content, so stopping early would report
+         * a height that ends at the fold and the scroll would clamp to it. */
+        if (y + rowh >= reg.top && y <= reg.bottom) {
+            char label[128];
+            channel_label(m, c, label, sizeof label);
+            draw_text(rt, label, g_ui,
+                      rf(body.left + 20, y, notify_label_right(body), y + UIS(38)), OC_COL_TEXT);
+            notify_chips(rt, body, y, rowh, c->channel_id, c->notify_level);
+            fill(rt, rf(body.left + 20, y + rowh - 1, body.right - 20, y + rowh), OC_COL_BORDER);
+        }
         y += rowh;
     }
-    ovl_end(rt, body);
+    /* Measured from the unscrolled origin, so the height is the content's own and
+     * does not move as it is scrolled. */
+    g_notify_content_h = y - top;
+    ovl_end(rt, reg);
+
+    /* Everything above published hit rectangles as it drew, including rows the
+     * clip discarded. Confine them all to what was painted. Listed explicitly
+     * rather than swept, because a rectangle this pass forgets is exactly the
+     * silent mis-set this item is about. */
+    g_notify_kw_btn  = hit_visible(g_notify_kw_btn,  reg);
+    g_notify_vip_btn = hit_visible(g_notify_vip_btn, reg);
+    for (int i = 0; i < 4; i++) g_sched_mode_hit[i] = hit_visible(g_sched_mode_hit[i], reg);
+    for (int i = 0; i < 2; i++) g_sched_base_hit[i] = hit_visible(g_sched_base_hit[i], reg);
+    for (int d = 0; d < 7; d++) {
+        g_sched_day_chk[d]    = hit_visible(g_sched_day_chk[d],    reg);
+        g_sched_day_hit[d][0] = hit_visible(g_sched_day_hit[d][0], reg);
+        g_sched_day_hit[d][1] = hit_visible(g_sched_day_hit[d][1], reg);
+    }
+    for (int i = 0; i < g_n_notify_hits; i++)
+        g_notify_hits[i].r = hit_visible(g_notify_hits[i].r, reg);
 }
 
 static void layout_composer(HWND hwnd);   /* fwd */
@@ -5416,24 +5590,66 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
     g_n_pref_hits = 0;
 
     /* The category column. Inside the frame's content rect, with its own right
-     * edge — the same treatment every other second column in the app gets. */
-    float catw = 168;
-    D2D1_RECT_F cats = rf(reg.left - MODAL_PAD + 1, reg.top, reg.left - MODAL_PAD + catw, reg.bottom);
-    fill(rt, cats, OC_COL_SIDEBAR);
-    fill(rt, rf(cats.right - 1, cats.top, cats.right, cats.bottom), OC_COL_BORDER);
-    float cy = cats.top + 10;
-    for (int i = 0; i < PC_COUNT; i++) {
-        D2D1_RECT_F r = rf(cats.left + 8, cy, cats.right - 9, cy + 32);
-        int on = (i == g_pref_cat);
-        if (on) fill_round(rt, r, 6.0f, OC_COL_SELECT);
-        else if (in_rect(r, (float)g_mouse_x, (float)g_mouse_y)) fill_round(rt, r, 6.0f, OC_COL_HOVER);
-        draw_text(rt, PC_NAME[i], on ? g_ui_b : g_ui,
-                  rf(r.left + 12, r.top, r.right, r.bottom), on ? OC_COL_TEXT : OC_COL_MUTED);
-        g_pref_cats[i] = r;
-        cy = r.bottom + 2;
+     * edge — the same treatment every other second column in the app gets.
+     *
+     * TWO COLUMNS ONLY WHILE BOTH FIT. The rail reserved a flat 168 DIP whatever
+     * the card's width, and the rows pane started after it, so at 240 DPI — where
+     * a default-sized window leaves the card about 300 DIP of content — the two
+     * were laid out on top of each other: "Appearance" printed through "Theme",
+     * the colour swatches through their own label. Below that width the rail
+     * becomes a wrapping chip row above the rows it filters, which is the same
+     * move the notifications card's mode chips make and costs one line instead of
+     * a column. The width is scaled now too: the names are text. */
+    float catw = UIS(168.0f);
+    int narrow = (reg.right - reg.left) < catw + UIS(260.0f);
+    D2D1_RECT_F body;
+
+    if (narrow) {
+        float mx = reg.left, my = reg.top + 6, rowbot = my + 28;
+        for (int i = 0; i < PC_COUNT; i++) {
+            float bw = text_width(PC_NAME[i], g_meta) + 22;
+            if (mx > reg.left && mx + bw > reg.right) { mx = reg.left; my += 32; }
+            D2D1_RECT_F r = rf(mx, my, mx + bw, my + 28);
+            int on = (i == g_pref_cat);
+            fill_round(rt, r, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
+            if (!on) stroke_round(rt, r, 6.0f, OC_COL_BORDER, 1.0f);
+            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
+            draw_text(rt, PC_NAME[i], g_meta, r, on ? 0xFFFFFF : OC_COL_MUTED);
+            IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
+            g_pref_cats[i] = r;
+            mx = r.right + 6;
+            rowbot = r.bottom;
+        }
+        fill(rt, rf(reg.left, rowbot + 8, reg.right, rowbot + 9), OC_COL_BORDER);
+        body = rf(reg.left, rowbot + 9, reg.right, reg.bottom);
+    } else {
+        D2D1_RECT_F cats = rf(reg.left - MODAL_PAD + 1, reg.top,
+                              reg.left - MODAL_PAD + catw, reg.bottom);
+        fill(rt, cats, OC_COL_SIDEBAR);
+        fill(rt, rf(cats.right - 1, cats.top, cats.right, cats.bottom), OC_COL_BORDER);
+        float cy = cats.top + 10;
+        for (int i = 0; i < PC_COUNT; i++) {
+            D2D1_RECT_F r = rf(cats.left + 8, cy, cats.right - 9, cy + 32);
+            int on = (i == g_pref_cat);
+            if (on) fill_round(rt, r, 6.0f, OC_COL_SELECT);
+            else if (in_rect(r, (float)g_mouse_x, (float)g_mouse_y)) fill_round(rt, r, 6.0f, OC_COL_HOVER);
+            draw_text(rt, PC_NAME[i], on ? g_ui_b : g_ui,
+                      rf(r.left + 12, r.top, r.right, r.bottom), on ? OC_COL_TEXT : OC_COL_MUTED);
+            g_pref_cats[i] = r;
+            cy = r.bottom + 2;
+        }
+        body = rf(cats.right + MODAL_PAD - 24, reg.top, reg.right, reg.bottom);
     }
 
-    D2D1_RECT_F body = rf(cats.right + MODAL_PAD - 24, reg.top, reg.right, reg.bottom);
+    /* The ROWS scroll; the categories do not. Preferences had no scroller at all,
+     * so at 240 DPI everything past the first row and a half was drawn outside the
+     * card and unreachable — the same defect the notifications card had, in the
+     * modal next to it. The category rail stays put because it is navigation: a
+     * chip you have to scroll to find is not a way to reach the section it names. */
+    ovl_use(OVL_PREFS);
+    D2D1_RECT_F rows = body;
+    float rows_top = ovl_begin(rt, rows, g_prefs_content_h);
+    body.top = rows_top - 14;   /* the callers below start at body.top + 14 */
     float y = body.top + 14;
 
     static const char *THEMES[3] = { "Dark", "Light", "System" };
@@ -5507,6 +5723,15 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
         y = pref_row(rt, body, y, PREF_ROW_RESET, "Reset preferences",
                      "Back to the defaults; applied on Save.", RESET1, 1, -1);
     }
+
+    g_prefs_content_h = y - rows_top;
+    ovl_end(rt, rows);
+
+    /* Same reason as the notifications card: these were published while drawing,
+     * including rows the clip discarded, and the click router tested them with a
+     * bare in_rect. The category chips are outside the scroller and keep theirs. */
+    for (int i = 0; i < g_n_pref_hits; i++)
+        g_pref_hits[i].r = hit_visible(g_pref_hits[i].r, rows);
 }
 
 /* A person's card, in the context pane (right). Laid out VERTICALLY: the old
@@ -7014,15 +7239,34 @@ static D2D1_RECT_F modal_frame(ID2D1RenderTarget *rt, const oc_modal_spec *s,
               rf(card.left + MODAL_PAD, card.top + UIS(10),
                  card.right - UIS(56), card.top + UIS(10) + title_line),
               OC_COL_TEXT);
+    /* The subtitle WRAPS, and the header grows to hold it. It was given a flat
+     * UIS(20) — one line — so a card narrower than the sentence showed its first
+     * few words and an ellipsis, which at 240 DPI is most of them. Measured
+     * rather than assumed, and by the same call that draws it, so the two cannot
+     * disagree; a two-line subtitle now costs the body two lines instead of
+     * silently losing the text. */
+    float sub_w = (card.right - UIS(56)) - (card.left + MODAL_PAD);
+    float sub_h = has_sub ? text_height(s->subtitle, g_meta_w, sub_w) : 0;
+    if (has_sub && sub_h < UIS(20)) sub_h = UIS(20);
+    /* The subtitle YIELDS when the card cannot afford it. At a large text size in
+     * a small window the header and the footer together consume the whole card —
+     * measured at 240 DPI with zoom and Largest text, the body came out NINE DIP
+     * tall, which is a scroller over nothing. The subtitle is the only part of the
+     * chrome that explains rather than does, so it is what goes; the title, the
+     * close button and the buttons all still work without it. */
+    if (has_sub && (ch - (UIS(10) + title_line + sub_h + UIS(12)) - MODAL_FOOT_H) < UIS(140)) {
+        has_sub = 0;
+        sub_h = 0;
+    }
     if (has_sub)
-        draw_text(rt, s->subtitle, g_meta,
+        draw_text(rt, s->subtitle, g_meta_w,
                   rf(card.left + MODAL_PAD, card.top + UIS(10) + title_line,
-                     card.right - UIS(56), card.top + UIS(10) + title_line + UIS(20)),
+                     card.right - UIS(56), card.top + UIS(10) + title_line + sub_h),
                   OC_COL_FAINT);
     /* Measured from the same numbers the title block was drawn with, so the body
      * starts BELOW it — MODAL_TITLE_H plus a constant under-counted once the
      * title grew, and the first row of every card was clipped by the divider. */
-    float title_h = UIS(10) + title_line + (has_sub ? UIS(20) : 0) + UIS(12);
+    float title_h = UIS(10) + title_line + sub_h + UIS(12);
 
     g_modal_close_btn = rf(card.right - UIS(44), card.top + UIS(12),
                            card.right - UIS(16), card.top + UIS(40));
@@ -15631,6 +15875,13 @@ static void test_dump(const char *path) {
                 (g_sched_mode_hit[2].top + g_sched_mode_hit[2].bottom) / 2,
                 (g_sched_mode_hit[3].left + g_sched_mode_hit[3].right) / 2,
                 (g_sched_mode_hit[3].top + g_sched_mode_hit[3].bottom) / 2);
+        /* The shared overlay scroll offset, its clamp, and the content height the
+         * notifications card measured. Published because "the card does not
+         * scroll" has three different causes — the wheel never reached it, the
+         * content height came out zero, or the offset is being reset every frame
+         * — and from outside they look identical. */
+        fprintf(f, "ovl kind=%d scroll=%.0f max=%.0f notifyh=%.0f\n",
+                g_ovl_kind, g_ovl_scroll, g_ovl_max, g_notify_content_h);
         fprintf(f, "schedbase=%.0f,%.0f %.0f,%.0f tpopen=%d tprows=%d\n",
                 (g_sched_base_hit[0].left + g_sched_base_hit[0].right) / 2,
                 (g_sched_base_hit[0].top + g_sched_base_hit[0].bottom) / 2,
@@ -16948,7 +17199,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
-        if (transcript_shell() && wpt.x >= (int)RAIL_W && wpt.x < (int)(RAIL_W + SIDEBAR_W)) {
+        /* A MODAL OWNS THE WHEEL, ahead of every shell surface below.
+         *
+         * This has to come first, not merely before the sidebar. The branches
+         * below claim the wheel on shell state that survives underneath an open
+         * modal — the sidebar claims an x range a card is drawn over, and an open
+         * thread claims it everywhere — so the wheel scrolled the shell BEHIND
+         * the modal while the modal's own content sat unreachable below the fold.
+         *
+         * Found by the smoke rather than by hand, and only because the suite
+         * opens a thread earlier in the run: scrolling the notifications card
+         * worked in every interactive session I tried and failed in the suite,
+         * which is the difference between the two. */
+        if (modal_open()) {
+            g_ovl_scroll -= dy;
+            if (g_ovl_scroll < 0) g_ovl_scroll = 0;
+            if (g_ovl_scroll > g_ovl_max) g_ovl_scroll = g_ovl_max;
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        if (transcript_shell()
+            && wpt.x >= (int)RAIL_W && wpt.x < (int)(RAIL_W + SIDEBAR_W)) {
             float maxs = g_sb_content > g_sb_view ? g_sb_content - g_sb_view : 0;
             g_sb_scroll -= dy;
             if (g_sb_scroll < 0) g_sb_scroll = 0;
@@ -16972,10 +17243,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             /* At the bottom of the audit log, page older entries in (WIN-19). */
             if (wm->audit_open && g_ovl_scroll >= g_ovl_max - 0.5f && g_audit_oldest > 1)
                 oc_client_audit_query(g_client, g_audit_oldest - 1);
-        } else if (g_notify_open || g_keys_open) {
-            g_ovl_scroll -= dy;
-            if (g_ovl_scroll < 0) g_ovl_scroll = 0;
-            if (g_ovl_scroll > g_ovl_max) g_ovl_scroll = g_ovl_max;
         } else if (wm && wm->search_open) {
             /* The results list scrolls top-down, unlike the bottom-pinned
              * transcript, so the sign is the other way round. */

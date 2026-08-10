@@ -1525,6 +1525,112 @@ case "$line" in
   *"overlaps=0 outside=0"*) ok "the notifications card keeps its content inside itself" ;;
   *) fail "the modal spills — $line" ;;
 esac
+
+# --- "The Notifications card clips its own content at high DPI" -------------
+# Cited by title, not by number: a backlog position moves whenever an item is
+# added or closed, and a number here would rot silently.
+# `chromefit` above cannot see this: it compares published rectangles, and the
+# card's own rows were published at coordinates well past its bottom edge while
+# every element it does know about sat inside. The card's content is a fixed
+# ~420 DIP tall; a window's DIP extent shrinks in inverse proportion to DPI, so
+# at 240 DPI the body is ~250 DIP and the weekday rows were drawn outside the
+# clip — invisible, and still hit-testable, so a click on empty card background
+# toggled a weekday nobody could see.
+say "== the notifications card at high dpi"
+"$DRIVE" dpi 240 >/dev/null 2>&1
+settle modal notify
+# A paint has to have HAPPENED at the new scale before any rectangle is read.
+# `dpi` acks when its handler ran, and the hit rects are recorded during
+# WM_PAINT, so reading them straight after the verb returns the previous scale's
+# geometry. That is how this block failed the first time it ran.
+sleep 0.5
+cardr=$(snap | grep -oE 'card=[0-9]+,[0-9]+,[0-9]+,[0-9]+' | head -1 | cut -d= -f2)
+cl=$(echo "$cardr" | cut -d, -f1); ct=$(echo "$cardr" | cut -d, -f2)
+cr=$(echo "$cardr" | cut -d, -f3); cb=$(echo "$cardr" | cut -d, -f4)
+cmx=$(( (cl + cr) / 2 )); cmy=$(( (ct + cb) / 2 ))
+
+# reach <sed-program> — reads a published "x,y" out of the dump, wheeling DOWN a
+# notch at a time until it stops reporting 0,0. Every rectangle in this card is
+# now clamped to what was painted, so 0,0 means "below the fold", and the way to
+# a control below the fold is to scroll to it. That is also the assertion: this
+# block arrives at the matrix's largest scale (dpi 240, zoom 4, text size 3),
+# where even the mode chips start below the fold — before the scroller existed
+# there was no sequence of inputs that could reach them at all.
+# The step is 96 DIP (a -240 wheel delta is two notches of 48), deliberately
+# SMALLER than the card's visible body at the scale this runs at — which measures
+# ~119 DIP. A coarser step can carry a control from below the fold to above it
+# between two samples and report it unreachable when it is not; that happened with
+# a 240 DIP step, and it looks exactly like the defect being tested for.
+reach() {
+  local v i
+  for i in $(seq 0 16); do
+    v=$(snap | sed -nE "$1" | head -1 | tr -d '\r')
+    [ -n "$v" ] && [ "$v" != "0,0" ] && { printf '%s' "$v"; return 0; }
+    "$DRIVE" wheel "$cmx" "$cmy" -240 >/dev/null 2>&1; sleep 0.25
+  done
+  return 1
+}
+
+# Custom is the mode that expands the seven weekday rows, and so the mode that
+# makes the card outgrow the window.
+chip=$(reach 's/^schedmodes=.*[ ]([0-9]+,[0-9]+)$/\1/p') || chip=""
+checks=$((checks + 1))
+if [ -n "$chip" ]; then
+  "$DRIVE" click "${chip%,*}" "${chip#*,}" >/dev/null 2>&1
+  if wait_for schedmode 3; then ok "the Custom chip is reachable and selects Custom"
+  else fail "the Custom chip was published at $chip but clicking it did nothing"; fi
+else fail "the Custom chip is unreachable at any scroll offset"; fi
+
+# Scroll until Monday is on screen. Selecting Custom leaves the card at the top,
+# where the weekday rows it just added are still below the fold — so this has to
+# happen BEFORE the count below, or that count reads zero rows and the check that
+# follows is vacuous.
+monchk=$(reach 's/^  schedday d=1 .*chk=([0-9]+,[0-9]+).*/\1/p') || monchk=""
+
+# A row published outside the card is a row that can be clicked but not seen.
+outside=0
+for yy in $(snap | grep -E '^  schedday d=[0-6] ' | sed -E 's/.*chk=[0-9]+,([0-9]+).*/\1/'); do
+  [ "$yy" = 0 ] && continue
+  [ "$yy" -gt "$cb" ] && outside=$((outside + 1))
+done
+# Guarded, because this passes for the WRONG reason when no weekday row is drawn
+# at all: "none of them is outside the card" is then true and meaningless. It
+# passed exactly that way against the unfixed client, where Custom was never
+# reached — the fake pass this suite's header is about.
+nrows=$(snap | grep -cE '^  schedday d=[0-6] chk=[1-9]')
+mode=$(key_of "$(snap)" schedmode)
+checks=$((checks + 1))
+if [ "$mode" != 3 ]; then
+  fail "no weekday rows were ever drawn (schedmode=$mode) — this check verified nothing"
+elif [ "$nrows" = 0 ]; then
+  fail "Custom is selected but no weekday row could be scrolled into view"
+elif [ "$outside" = 0 ]; then
+  ok "no weekday row is hit-testable outside the card ($nrows on screen)"
+else
+  fail "$outside weekday rows are live below the card bottom ($cb) — invisible and clickable"
+fi
+
+# The control, and it is the important one: clamping every rectangle to nothing
+# would satisfy every check here. A row that IS visible must still toggle. Done
+# now, while Monday is known to be on screen.
+monbefore=$(snap | grep -E '^  schedrow wd=1 ' | sed -E 's/.*on=([01]).*/\1/' | tr -d '\r')
+[ -n "$monchk" ] && "$DRIVE" click "${monchk%,*}" "${monchk#*,}" >/dev/null 2>&1
+sleep 0.4
+monafter=$(snap | grep -E '^  schedrow wd=1 ' | sed -E 's/.*on=([01]).*/\1/' | tr -d '\r')
+checks=$((checks + 1))
+if [ -n "$monbefore" ] && [ "$monbefore" != "$monafter" ]; then
+  ok "a visible weekday still toggles (on=$monbefore -> on=$monafter)"
+  "$DRIVE" click "${monchk%,*}" "${monchk#*,}" >/dev/null 2>&1   # put it back
+else fail "clicking a VISIBLE weekday changed nothing — the clamp is too wide"; fi
+
+# ... and the rows that are now hidden must be REACHABLE, or the fix is just a
+# thinner kind of broken. Sunday is the last row the card ever draws.
+checks=$((checks + 1))
+if reach 's/^  schedday d=0 .*chk=([0-9]+,[0-9]+).*/\1/p' >/dev/null; then
+  ok "the card scrolls far enough to reach Sunday"
+else fail "Sunday is unreachable at every scroll offset"; fi
+
+
 "$DRIVE" key esc >/dev/null 2>&1; settle modal none
 # Back to the defaults, since the text size is a persisted preference.
 "$DRIVE" dpi 96 >/dev/null 2>&1; "$DRIVE" zoom 0 >/dev/null 2>&1; "$DRIVE" textsize 1 >/dev/null 2>&1
