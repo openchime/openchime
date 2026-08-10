@@ -70,12 +70,7 @@ jobs:
       - name: Check opcode uniqueness
         run: make check-opcodes
       - name: Run unit tests
-        run: |
-          if ls tests/*.c >/dev/null 2>&1; then
-            make test
-          else
-            echo "no unit tests yet — skipping (see docs/TESTING.md §2)"
-          fi
+        run: make test
 
   integration:
     name: end-to-end (compose)
