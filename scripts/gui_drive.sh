@@ -131,6 +131,15 @@ for _ in $(seq 1 100); do [ -f "$LIN_DIR/ack" ] && break; sleep 0.1; done
 ack="$(cat "$LIN_DIR/ack" 2>/dev/null || echo TIMEOUT)"
 echo "ack: $ack"
 
+# The contract of this wrapper is "ack means the handler ran". On timeout it means
+# exactly the opposite, and exiting 0 said it ran. gui_smoke.sh parses state rather
+# than status so it never noticed, but anything checking the exit code was told the
+# command succeeded when the client never answered.
+if [ "$ack" = TIMEOUT ]; then
+  echo "gui_drive: no ack for '$1' after 10s — the client did not answer" >&2
+  exit 1
+fi
+
 if { [ "$1" = "shot" ] || [ "$1" = "shotfull" ]; } && [ $# -eq 2 ]; then
   cp "$LIN_DIR/${2}.bmp" "$OUT/${2}.bmp" 2>/dev/null && echo "$OUT/${2}.bmp"
 fi

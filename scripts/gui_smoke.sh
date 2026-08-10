@@ -52,6 +52,26 @@ export OC_DEV_WS="${OC_DEV_WS:-Smoke Fixture}"
 # nothing can open. That cost a debugging round — the symptom was "custom emoji
 # and avatars fail to upload", which looks nothing like the cause.
 #
+# Defined ABOVE kill_dev_daemon, not below it. The refusal path in that block
+# calls say() twice to explain why the run is stopping, and bash resolves
+# functions at call time -- so with these defined later, both calls died with
+# "say: command not found" and the operator saw the refusal with no reason, at
+# the one moment the reason matters. (The debug branch below reaches snap(),
+# which is still defined later; that is fine, it only fires for section headers
+# starting "==", which the refusal messages are not.)
+say()  {
+  printf '%s\n' "$*"
+  # OC_SMOKE_DEBUG=1 tags each section with the core's error counter, which is how
+  # you find the section that BROKE something rather than the one that noticed.
+  case "${OC_SMOKE_DEBUG:-0}$*" in
+    1==*) printf '       [error_seq=%s last=%s]\n' \
+            "$(snap | grep -oE '^error_seq=[0-9]+' | cut -d= -f2)" \
+            "$(snap | grep -oE 'last_error="[^"]*"' | head -1)";;
+  esac
+}
+fail() { printf '  FAIL %s\n' "$*"; fails=$((fails + 1)); }
+ok()   { printf '  ok   %s\n' "$*"; }
+
 # Killing it needs the ENVIRONMENT, not the command line. The daemon is started
 # as `env OPENCHIME_PROTO_PORT=… openchimed`, so its own cmdline is just the
 # binary and `pkill -f OPENCHIME_PROTO_PORT=9500` matches NOTHING — it exits 1,
@@ -84,19 +104,6 @@ fi
 # How long a predicate wait will tolerate before calling it a failure. Generous:
 # the cost of a high value is paid only by runs that are already failing.
 WAIT_MS="${OC_SMOKE_WAIT_MS:-6000}"
-
-say()  {
-  printf '%s\n' "$*"
-  # OC_SMOKE_DEBUG=1 tags each section with the core's error counter, which is how
-  # you find the section that BROKE something rather than the one that noticed.
-  case "${OC_SMOKE_DEBUG:-0}$*" in
-    1==*) printf '       [error_seq=%s last=%s]\n' \
-            "$(snap | grep -oE '^error_seq=[0-9]+' | cut -d= -f2)" \
-            "$(snap | grep -oE 'last_error="[^"]*"' | head -1)";;
-  esac
-}
-fail() { printf '  FAIL %s\n' "$*"; fails=$((fails + 1)); }
-ok()   { printf '  ok   %s\n' "$*"; }
 
 # Read one `key=value` out of a fresh dump.
 snap() { "$DRIVE" dump smoke >/dev/null 2>&1; cat "$LIN_DIR/smoke.txt" 2>/dev/null; }
@@ -1099,9 +1106,16 @@ box_h() { snap | awk '/^ed /{ for (i=1;i<=NF;i++) if ($i ~ /^box=/) { sub(/^box=
   split($i, b, ","); print b[4] - b[2] } }'; }
 checks=$((checks + 1))
 bh=$(box_h); ch=$(caret_h)
-awk -v b="$bh" -v c="$ch" 'BEGIN{ exit !(b + 0.5 >= c) }' \
-  && ok "the field's box is at least a line tall (box $bh >= caret $ch)" \
-  || fail "composer box $bh is shorter than a line $ch — clipping, and the scroll cannot settle"
+# Emptiness first. awk coerces an empty string to 0, so a dump missing `ed box=`
+# or `edcaret h=` made the test 0 + 0.5 >= 0 -- true -- and the check reported ok
+# with a blank measurement printed. A missing measurement is a failure, not a pass.
+if [ -z "$bh" ] || [ -z "$ch" ]; then
+  fail "no composer geometry in the dump (box='$bh' caret='$ch') — nothing was measured"
+elif awk -v b="$bh" -v c="$ch" 'BEGIN{ exit !(b + 0.5 >= c) }'; then
+  ok "the field's box is at least a line tall (box $bh >= caret $ch)"
+else
+  fail "composer box $bh is shorter than a line $ch — clipping, and the scroll cannot settle"
+fi
 before=$(caret_top)
 "$DRIVE" shot _osc1 >/dev/null 2>&1; "$DRIVE" shot _osc2 >/dev/null 2>&1
 checks=$((checks + 1))
@@ -1119,8 +1133,6 @@ say "== send later"
 "$DRIVE" view home >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; settle conv 1
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
 "$DRIVE" chars "for later" >/dev/null 2>&1; ed_wait len 9
-schpt=$(snap | awk '/^sched btn=/{ sub(/^sched btn=/,"",$2); split($2, b, ",");
-  if (b[3] > b[1]) print int((b[1]+b[3])/2), int((b[2]+b[4])/2) }' FS=' ' OFS=' ')
 schpt=$(snap | awk '{ if ($1 == "sched") { sub(/^btn=/,"",$2); split($2, b, ",");
   if (b[3] > b[1]) print int((b[1]+b[3])/2), int((b[2]+b[4])/2) } }')
 checks=$((checks + 1))
@@ -1207,11 +1219,19 @@ ed_step sel 1 "dragging in the composer selects a range"
 # copies — so this asserts the round trip rather than the internal range.
 "$DRIVE" send "the quick brown fox jumps" >/dev/null 2>&1
 wait_grep '^tsel ' >/dev/null 2>&1 || true
-body=$(snap | awk '/^  msgrow /{ for (i=1;i<=NF;i++) if ($i ~ /^body=/) { sub(/^body=/,"",$i); split($i,b,","); x=b[1]; y=b[2] } } END{ print int(x)+12, int(y)+8 }')
+body=$(snap | awk '/^  msgrow /{ for (i=1;i<=NF;i++) if ($i ~ /^body=/) { sub(/^body=/,"",$i); split($i,b,","); x=b[1]; y=b[2]; seen=1 } } END{ if (seen) print int(x)+12, int(y)+8 }')
+# Empty means no msgrow was in the dump. The awk used to fall through to
+# `print int(x)+12, int(y)+8` with x and y unset, i.e. the literal point "12 8",
+# so the clicks landed in the corner and the selection assertions failed blaming
+# the selection feature for an absent message row.
+if [ -z "$body" ]; then
+  fail "no msgrow in the dump — cannot locate a message to select"
+else
 "$DRIVE" dblclick $body >/dev/null 2>&1
 expect_grep '^tsel has=1 a=[0-9]+:0 f=[0-9]+:3' "double-click selects a word in a message"
 "$DRIVE" tripleclick $body >/dev/null 2>&1
 expect_grep '^tsel has=1 a=[0-9]+:0 f=[0-9]+:25' "triple-click selects the whole message"
+fi
 "$DRIVE" key ctrl+c >/dev/null 2>&1
 "$DRIVE" click $(ed_pt 44 10) >/dev/null 2>&1
 "$DRIVE" key ctrl+v >/dev/null 2>&1
@@ -1233,10 +1253,14 @@ say "== links"
 "$DRIVE" channel general >/dev/null 2>&1; settle conv 1
 "$DRIVE" send "https://example.com/runbook." >/dev/null 2>&1
 wait_grep '^tsel ' >/dev/null 2>&1 || true
-lbody=$(snap | awk '/^  msgrow /{ for (i=1;i<=NF;i++) if ($i ~ /^body=/) { sub(/^body=/,"",$i); split($i,b,","); x=b[1]; y=b[2] } } END{ print int(x)+12, int(y)+8 }')
+lbody=$(snap | awk '/^  msgrow /{ for (i=1;i<=NF;i++) if ($i ~ /^body=/) { sub(/^body=/,"",$i); split($i,b,","); x=b[1]; y=b[2]; seen=1 } } END{ if (seen) print int(x)+12, int(y)+8 }')
+if [ -z "$lbody" ]; then
+  fail "no msgrow in the dump — cannot locate the link to hover"
+else
 "$DRIVE" move $lbody >/dev/null 2>&1
 expect_grep '^link hover="https://example\.com/runbook"$' \
   "hovering a URL reports it, without the sentence's full stop"
+fi
 # Off the transcript entirely: the rail. This is the direction that was broken
 # first time round — the hover was computed in the branch that owns the
 # transcript's x range, so nothing ever cleared it on the way out.
@@ -1681,13 +1705,21 @@ checks=$((checks + 1))
 if [ -n "$root" ]; then ok "a root message to hang a thread on"
 else fail "no message id to reply to"; fi
 # bob replies, so the thread has a reply from somebody else — the unread case.
-if [ -n "$root" ] && [ -x "$HERE/build/demo_client" ]; then
+#
+# demo_client is BUILT here, not merely tested for. Nothing built it before this
+# point -- the activity section does, 50 lines below -- so on a clean checkout the
+# guard skipped the setup while the two assertions under it ran unconditionally.
+# bob never replied and both failed, blaming the product for a missing fixture.
+if make -C "$HERE" demo-client >/dev/null 2>&1 && [ -n "$root" ] && [ -x "$HERE/build/demo_client" ]; then
   "$HERE/build/demo_client" 127.0.0.1 "$OC_DEV_PORT" bob pw reply "$gid" "$root" "and bob answers" >/dev/null 2>&1
+  sleep 1
+  "$DRIVE" view threads >/dev/null 2>&1
+  expect_grep '^threads n=[1-9]' "the thread appears in the cross-channel list"
+  expect_grep "^  thread root=$root .*unread=1 follow=1" "with bob's reply counted unread, and me following"
+else
+  say "   (demo_client unavailable — skipping the cross-channel unread checks)"
+  "$DRIVE" view threads >/dev/null 2>&1
 fi
-sleep 1
-"$DRIVE" view threads >/dev/null 2>&1
-expect_grep '^threads n=[1-9]' "the thread appears in the cross-channel list"
-expect_grep "^  thread root=$root .*unread=1 follow=1" "with bob's reply counted unread, and me following"
 
 # Opening it is reading it: the unread count is about replies you have not seen.
 card=$(snap | grep -E "^  thread root=$root " | grep -oE 'at=[0-9]+,[0-9]+' | cut -d= -f2 | tr ',' ' ')
