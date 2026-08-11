@@ -183,29 +183,53 @@ Same rule as `build_mbedtls.sh`, which refuses to fetch without a known SHA-256.
 
 ## What the first real release found
 
-It ran on 2026-08-11, built every package on every platform, and stopped in
-`publish`. Two faults, neither visible by reading the file:
+It took **four attempts**, and every failure was in the release machinery rather
+than in anything being released. Every build, on every platform, was green from
+the first attempt onward. Recorded in order, because the pattern matters more
+than any single fault: each one was invisible to review and obvious the moment
+the pipeline ran.
 
-**The pool guard counted its own reservation.** `version` reserves `release-N`
-before anything is built; the guard counts `release-*` tags to tell "first
-publish" from "the fetch failed". On the first release those meet — pool empty,
-one tag — and it refused itself. Both mechanisms were correct alone and wrong
+**Attempt 1 — the pool guard counted its own reservation.** `version` reserves
+`release-N` before anything is built; the guard counts `release-*` tags to tell
+"first publish" from "the fetch failed". On a first release those meet — pool
+empty, one tag — and it refused itself. Both mechanisms correct alone, wrong
 together. The count now excludes the current version.
 
-**A docs-only pull request could not merge.** `ci.yml`'s `pull_request` trigger
-carried `paths-ignore: '**.md'` while those four jobs are required status checks,
-and a job that never triggers never *reports* — so the PR waited forever on a
-check that would not run. `paths-ignore` stays on `push` and is gone from
-`pull_request`.
+**Attempt 2 — the corrected count killed its own step, silently.** Once this
+release's tag is filtered out, a first release leaves `grep -vx` with no match.
+grep exits 1, `pipefail` propagates, `set -e` aborts the assignment. The step
+died in under a second having printed nothing at all: no notice, no error. This
+is the same defect as the dead error path in `winget/render.sh`, fixed hours
+earlier and reintroduced here — a no-match grep is not an error, but under
+`set -euo pipefail` it reads as one.
 
-What worked: `unreserve` deleted `release-1` and handed the number back, so the
-failed run cost nothing and the next attempt is still release 1. That is the
-entire reason the number is reserved rather than tagged last, and this was its
-first real test.
+**Attempt 3 — apt and dnf published, then the release step could not find the
+installer.** `no matches found for dist/windows-x64/*-setup.exe`. It had been
+built and uploaded correctly: `pattern: windows-*` matches exactly one artifact
+and unpacked it flat into `dist/`, while `pattern: linux-*` matches two and nests
+each in a named directory. The windows artifact is now downloaded by name.
 
-The general lesson, worth keeping: **every individual fix here was reviewed and
-statically sound.** The interaction was not, and no amount of re-reading either
-one would have surfaced it. Run the pipeline.
+That attempt exposed a second, worse fault. It failed *after* the repositories
+were live, and `unreserve` dutifully handed the number back — leaving release 1
+visible to apt clients with no tag naming it. That is the published-but-untagged
+state reserving the number exists to prevent, reached from the other direction.
+`publish` now sets an output the moment the apt index lands, and `unreserve`
+requires it to be unset. **Returning a number is only safe while nothing has been
+published under it.**
+
+**Alongside all this — a docs-only pull request could not merge at all.**
+`ci.yml`'s `pull_request` trigger carried `paths-ignore: '**.md'` while those four
+jobs are required status checks, and a job that never triggers never *reports*,
+so the PR waited forever on a check that would not run. Found by opening one to
+write this file. `paths-ignore` stays on `push` and is gone from `pull_request`.
+
+**Attempt 4 — green.** Tag, GitHub release with six assets, apt and dnf live and
+smoked, `:latest` moved to `1`, and the WinGet pull request opened.
+
+The lesson worth keeping: **every one of these fixes was reviewed and statically
+sound, and three of the four faults were interactions between two correct
+changes.** No amount of re-reading either half would have surfaced them. A dry
+run would not have either — it withholds exactly the steps that failed.
 
 ## Dry runs
 
