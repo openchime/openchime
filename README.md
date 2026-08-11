@@ -240,6 +240,24 @@ curl http://localhost:8080/healthz
 
 Should return `OK`.
 
+## Licence
+
+Two licences, split by what the code is:
+
+- **`daemon/`** and everything not listed below: **AGPL-3.0-or-later** (`LICENSE`).
+  Section 13 is the point of choosing it: run a modified openchimed as a service
+  for other people, and those users are entitled to your modified source.
+- **`client/`, `shared/`, `tuikit/`**: **MIT** (`LICENSE-MIT`).
+
+`shared/` is MIT rather than AGPL because the client links it — had it been
+AGPL, every client binary would be a work based on AGPL code and the MIT label
+would have been decorative.
+
+Contributions are taken under the Developer Certificate of Origin (`DCO.txt`);
+sign off with `git commit -s`. There is no CLA and copyright is not assigned.
+
+See [LICENSING.md](LICENSING.md) for the full map, including `third_party/`.
+
 ## Known fidelity gaps
 
 - Docker containers share the host kernel; Fly.io actually runs machines on
