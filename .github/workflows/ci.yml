@@ -28,12 +28,14 @@ on:
       - '**.md'
       - '.gitignore'
       - '.env.example'
+  # No paths-ignore here, deliberately, unlike the push trigger above. These four
+  # jobs are required status checks on main, and a job that never triggers never
+  # reports -- so a docs-only pull request waits forever for a check that will not
+  # run. Found by opening one: the release runbook PR was unmergeable, with only
+  # `guard` reporting. The suite costs a couple of minutes; an unmergeable PR costs
+  # more. Same reasoning the control-plane repo records on its own trigger.
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - '.gitignore'
-      - '.env.example'
   # Lets the release workflow gate on these exact jobs rather than re-implement
   # them. A release that ran a weaker suite than CI would be worse than no gate,
   # because it would look like one. Same arrangement the control-plane repo's

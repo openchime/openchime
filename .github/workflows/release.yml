@@ -641,7 +641,12 @@ jobs:
           # this is a second and independent witness: the tag count is what the pool
           # SHOULD contain. Free -- publish already checks out with fetch-depth: 0.
           pool_count=$(find repo/apt -name '*.deb' | wc -l)
-          prior=$(git tag -l 'release-*' | wc -l)
+          # PRIOR releases -- this one's tag is excluded, because `version` reserved
+          # it before anything was built (P3-OC-02). Counting it made the first ever
+          # release refuse itself: pool empty, prior=1, which is exactly the shape
+          # this guard treats as "an index that would delist history". The two fixes
+          # were correct separately and wrong together.
+          prior=$(git tag -l 'release-*' | grep -vx "release-${VERSION}" | wc -l)
           if [ "$pool_count" -eq 0 ] && [ "$prior" -gt 0 ]; then
             echo "::error::apt pool is empty but ${prior} release tag(s) exist -- refusing to publish an index that would delist them"
             exit 1
@@ -698,7 +703,12 @@ jobs:
           # this is a second and independent witness: the tag count is what the pool
           # SHOULD contain. Free -- publish already checks out with fetch-depth: 0.
           pool_count=$(find repo/rpm -name '*.rpm' | wc -l)
-          prior=$(git tag -l 'release-*' | wc -l)
+          # PRIOR releases -- this one's tag is excluded, because `version` reserved
+          # it before anything was built (P3-OC-02). Counting it made the first ever
+          # release refuse itself: pool empty, prior=1, which is exactly the shape
+          # this guard treats as "an index that would delist history". The two fixes
+          # were correct separately and wrong together.
+          prior=$(git tag -l 'release-*' | grep -vx "release-${VERSION}" | wc -l)
           if [ "$pool_count" -eq 0 ] && [ "$prior" -gt 0 ]; then
             echo "::error::rpm pool is empty but ${prior} release tag(s) exist -- refusing to publish an index that would delist them"
             exit 1
