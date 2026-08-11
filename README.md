@@ -32,7 +32,7 @@ REQ-027.
 
 ## The documents
 
-Sixteen, and each has one job. **Start with the first three**: they answer what
+Seventeen, and each has one job. **Start with the first three**: they answer what
 the product is meant to do, what is wrong with it today, and why it is built the
 way it is.
 
@@ -54,6 +54,7 @@ way it is.
 | [TUIKIT.md](docs/TUIKIT.md) | The in-tree TUI widget toolbox the terminal client is built on — deliberately generic, and knowing nothing about chat. |
 | [VENDORS.md](docs/VENDORS.md) | Every third-party dependency, how it enters the build, and its licence. |
 | [CONTRIBUTING.md](docs/CONTRIBUTING.md) | Branch, commit and CI policy, including the attribution guard that runs on every push. |
+| [RELEASING.md](docs/RELEASING.md) | How a version is published to apt, dnf, GHCR and WinGet — the release-number reservation, the pool guard that stops an index delisting prior releases, the archive signing key's properties, and what a dry run cannot test. |
 
 The daemon is a **feature-complete v1 chat core**. On the foundations — the v1
 wire-protocol frame codec (PROTOCOL.md), the two-thread model (ARCH-5: an epoll
