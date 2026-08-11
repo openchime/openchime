@@ -530,6 +530,11 @@ jobs:
     permissions:
       contents: write        # to push the release tag and create the GitHub release
       packages: write        # to move :latest once the release is real
+    outputs:
+      # Set the moment the apt index is in the bucket. From then on the number is
+      # SPENT whether or not the rest of the job succeeds, and unreserve must not
+      # hand it back -- see the note on that job.
+      published: ${{ steps.apt.outputs.published }}
     env:
       VERSION: ${{ needs.version.outputs.number }}
       # Object storage is Tigris, provisioned through Fly (`fly storage create`)
@@ -570,10 +575,18 @@ jobs:
         with:
           pattern: linux-*
           path: dist
+      # Named explicitly, not `pattern: windows-*`, and the path is spelled out.
+      # With a pattern, download-artifact nests each match in a directory named
+      # after it -- which is what rebuilds dist/<platform>/ for the two linux
+      # artifacts -- but the windows pattern matches exactly ONE artifact and it
+      # unpacked FLAT into dist/, so `dist/windows-x64/*-setup.exe` matched nothing
+      # and the release step failed after apt and dnf had already published.
+      # An explicit name and path does not depend on that behaviour either way, and
+      # it also makes the mingw-binaries exclusion structural rather than a glob.
       - uses: actions/download-artifact@v8
         with:
-          pattern: windows-*
-          path: dist
+          name: windows-x64
+          path: dist/windows-x64
 
       - name: Show what will be published
         run: find dist -type f | sort
@@ -621,6 +634,7 @@ jobs:
       # release's packages alone. An index built from the new package only would
       # silently drop every previous release the moment it was published.
       - name: Publish the apt repository
+        id: apt
         run: |
           set -euo pipefail
           mkdir -p repo/apt
@@ -686,6 +700,8 @@ jobs:
 
           cd ../..
           rclone copy repo/apt "dist:${DIST_BUCKET}/apt" --fast-list
+          # Past this line the number is spent: an apt client can see release N.
+          echo "published=true" >> "$GITHUB_OUTPUT"
 
       - name: Publish the rpm repository
         run: |
@@ -973,7 +989,15 @@ jobs:
   unreserve:
     name: return the release number
     needs: [version, publish]
-    if: ${{ always() && !inputs.dry_run && needs.version.result == 'success' && needs.publish.result != 'success' }}
+    # NOT on any publish failure -- only on one that published nothing.
+    #
+    # Learned by running it: the first successful publish failed at the very last
+    # step, `gh release create`, AFTER apt and dnf were written and smoked. This job
+    # then dutifully deleted the tag, leaving release 1 live in the apt index with
+    # no tag naming it -- which is precisely the state reserving the number early
+    # exists to prevent. Returning a number is only safe while nothing has been
+    # published under it.
+    if: ${{ always() && !inputs.dry_run && needs.version.result == 'success' && needs.publish.result != 'success' && needs.publish.outputs.published != 'true' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     permissions:
