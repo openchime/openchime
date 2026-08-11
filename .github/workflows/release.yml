@@ -646,7 +646,12 @@ jobs:
           # release refuse itself: pool empty, prior=1, which is exactly the shape
           # this guard treats as "an index that would delist history". The two fixes
           # were correct separately and wrong together.
-          prior=$(git tag -l 'release-*' | grep -vx "release-${VERSION}" | wc -l)
+          # `|| true` inside the braces, and it is not cosmetic. Once this release's
+          # own tag is filtered out, a FIRST release leaves grep with no match, so it
+          # exits 1; pipefail propagates that and set -e kills the assignment. The
+          # step died in under a second with no output at all -- the same shape as
+          # the dead error path in winget/render.sh, reintroduced here.
+          prior=$( { git tag -l 'release-*' | grep -vx "release-${VERSION}" || true; } | wc -l )
           if [ "$pool_count" -eq 0 ] && [ "$prior" -gt 0 ]; then
             echo "::error::apt pool is empty but ${prior} release tag(s) exist -- refusing to publish an index that would delist them"
             exit 1
@@ -708,7 +713,12 @@ jobs:
           # release refuse itself: pool empty, prior=1, which is exactly the shape
           # this guard treats as "an index that would delist history". The two fixes
           # were correct separately and wrong together.
-          prior=$(git tag -l 'release-*' | grep -vx "release-${VERSION}" | wc -l)
+          # `|| true` inside the braces, and it is not cosmetic. Once this release's
+          # own tag is filtered out, a FIRST release leaves grep with no match, so it
+          # exits 1; pipefail propagates that and set -e kills the assignment. The
+          # step died in under a second with no output at all -- the same shape as
+          # the dead error path in winget/render.sh, reintroduced here.
+          prior=$( { git tag -l 'release-*' | grep -vx "release-${VERSION}" || true; } | wc -l )
           if [ "$pool_count" -eq 0 ] && [ "$prior" -gt 0 ]; then
             echo "::error::rpm pool is empty but ${prior} release tag(s) exist -- refusing to publish an index that would delist them"
             exit 1
