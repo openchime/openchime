@@ -370,10 +370,21 @@ jobs:
     timeout-minutes: 30
     env:
       VERSION: ${{ needs.version.outputs.number }}
-      # Signing is gated on a real release. A dry run produces the same
-      # artifacts unsigned and never reads the credentials, which is also what
-      # makes this job safe to run from a fork.
-      SIGN: ${{ inputs.dry_run == false }}
+      # Signing is gated on a real release AND on the credentials existing. A dry
+      # run produces the same artifacts unsigned and never reads them, which is
+      # what makes this job safe to run from a fork.
+      #
+      # The second half of that condition is what stops an absent certificate
+      # taking down the whole release. SIGN used to be `dry_run == false` alone,
+      # so a real release ran azure/trusted-signing-action against an empty
+      # endpoint, windows-package failed, and publish -- which needs it -- was
+      # skipped. The Linux packages were never the problem and never shipped
+      # either. Same shape the game repos use for absent Play signing secrets: an
+      # incomplete config degrades the artifact, it does not fail the release.
+      #
+      # Nothing needs editing when Trusted Signing is provisioned; setting the
+      # three secrets turns signing back on by itself.
+      SIGN: ${{ inputs.dry_run == false && secrets.TRUSTED_SIGNING_ENDPOINT != '' && secrets.TRUSTED_SIGNING_ACCOUNT != '' && secrets.TRUSTED_SIGNING_PROFILE != '' }}
       # Same convention as the packages job: artifacts land in dist/<platform>/
       # and the artifact is named for that platform. build/ stays the staging
       # area -- the unpackaged binaries and the MSIX layout are inputs to a
@@ -441,6 +452,18 @@ jobs:
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
               "/DVersion=$env:VERSION" "/O$out" packaging\windows\openchime.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+      # An unsigned installer is a real cost, not a footnote: Windows SmartScreen
+      # will warn on it and some users will not click through. Said here so the
+      # run itself records why, rather than leaving it to be rediscovered.
+      - name: Note the missing signature
+        if: ${{ inputs.dry_run == false && env.SIGN != 'true' }}
+        shell: bash
+        run: |
+          echo "::warning::Trusted Signing credentials are not set; the Windows installer and binaries in this release are UNSIGNED. Users will see a SmartScreen warning."
+          echo "### Windows artifacts are unsigned" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "TRUSTED_SIGNING_ENDPOINT / _ACCOUNT / _PROFILE are unset, so signing was skipped. Set all three to turn it back on; nothing else needs changing." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Sign the installer
         if: env.SIGN == 'true'
@@ -774,9 +797,16 @@ jobs:
           # the link points at a file that exists nowhere downloadable and
           # crash_resolve.sh reports "built without -g?" for every released
           # build. Build artifacts expire; a crash report does not.
+          # The note tells the truth about the installer's signing status, because
+          # the person who meets SmartScreen is the one who needs to know.
+          notes="Release ${VERSION}. The daemon installs via apt and dnf (see README); the tarballs below are the offline install. The Windows client installer is attached."
+          if [ -z "${{ secrets.TRUSTED_SIGNING_ENDPOINT }}" ]; then
+            unsigned="**The Windows installer in this release is not code-signed.** Windows SmartScreen will warn that the publisher is unrecognised; the download is still the artifact this workflow built, and its checksum is in the release assets."
+            notes="${notes}"$'\n\n'"${unsigned}"
+          fi
           gh release create "release-${VERSION}" \
             --title "release-${VERSION}" \
-            --notes "Release ${VERSION}. The daemon installs via apt and dnf (see README); the tarballs below are the offline install. The Windows client installer is attached." \
+            --notes "$notes" \
             dist/linux-*/*.tar.gz dist/linux-*/*.sha256 dist/windows-x64/*-setup.exe \
             dist/windows-x64/openchime.debug
 
