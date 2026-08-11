@@ -181,6 +181,32 @@ Same rule as `build_mbedtls.sh`, which refuses to fetch without a known SHA-256.
 
 `GITHUB_TOKEN` covers GHCR; nothing extra is needed for the image.
 
+## What the first real release found
+
+It ran on 2026-08-11, built every package on every platform, and stopped in
+`publish`. Two faults, neither visible by reading the file:
+
+**The pool guard counted its own reservation.** `version` reserves `release-N`
+before anything is built; the guard counts `release-*` tags to tell "first
+publish" from "the fetch failed". On the first release those meet — pool empty,
+one tag — and it refused itself. Both mechanisms were correct alone and wrong
+together. The count now excludes the current version.
+
+**A docs-only pull request could not merge.** `ci.yml`'s `pull_request` trigger
+carried `paths-ignore: '**.md'` while those four jobs are required status checks,
+and a job that never triggers never *reports* — so the PR waited forever on a
+check that would not run. `paths-ignore` stays on `push` and is gone from
+`pull_request`.
+
+What worked: `unreserve` deleted `release-1` and handed the number back, so the
+failed run cost nothing and the next attempt is still release 1. That is the
+entire reason the number is reserved rather than tagged last, and this was its
+first real test.
+
+The general lesson, worth keeping: **every individual fix here was reviewed and
+statically sound.** The interaction was not, and no amount of re-reading either
+one would have surfaced it. Run the pipeline.
+
 ## Dry runs
 
 `dry_run: true` builds and verifies everything and withholds exactly two things:
