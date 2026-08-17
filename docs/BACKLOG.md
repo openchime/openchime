@@ -2151,6 +2151,43 @@ needs no container, and could be a `make run-constrained` target.
 users and no limits; `docker-compose.yml`, which carried `mem_limit: 256m` and
 `cpus: "1"`, is deleted.
 
+## 128. The daemon exits 0, silently, when it cannot start
+
+`oc_netloop_run` (`daemon/netloop.c`) returns `-1` without printing anything for
+every one of its startup failures: the listening socket, `bind`, `listen`,
+`epoll_create1`, `oc_blobstore_open` and `oc_xferpool_start`. `main` does not
+check the return value — it falls through to `oc_push_stop`, prints
+`shutdown complete` and returns **0**.
+
+So a daemon that cannot serve is indistinguishable from one that was asked to
+stop, and it reports success to whatever started it.
+
+*Impact:* Under systemd this is the bad case. `Type=simple` with a clean exit 0
+means the unit is considered to have run successfully and `Restart=on-failure`
+does not fire, so a daemon that cannot open its blob directory stops and stays
+stopped with `systemctl status` showing no error and the journal showing
+`healthz listening on :8080` as its final word. The health check compounds it:
+`/healthz` binds and answers *before* the protocol loop starts, so a monitor
+polling it sees a healthy daemon for the fraction of a second before exit, and
+an operator reading the log sees a successful boot.
+
+Found while porting the integration test off Compose (item 125). The stack had
+been masking it: every path default points into `/data`, which exists in the
+image, so `oc_blobstore_open("/data/blobs")` only fails outside a container.
+Roughly forty minutes went into diagnosing a daemon that logged nothing wrong.
+
+*Shape of a fix:* one `fprintf` per failure branch naming the operation and
+`strerror(errno)`, and `main` returning non-zero when `oc_netloop_run` does.
+Both are small and independent; the exit code is the one that changes systemd's
+behaviour.
+
+**Verified** — `netloop.c` `oc_netloop_run` has six bare `return -1` paths with
+no diagnostic; `main.c:434` calls it as a void statement and `main.c:439-440`
+prints `shutdown complete` and `return 0` unconditionally. Reproduced locally:
+with `OPENCHIME_BLOB_DIR` unset, the daemon prints through
+`blob storage = local disk`, never prints the `storage maintenance` line that
+follows a successful blobstore open, and exits 0.
+
 ## Recorded and closed without a fix
 
 - **The unreproduced typing crash.** Three crashes on 2026-07-29, all while

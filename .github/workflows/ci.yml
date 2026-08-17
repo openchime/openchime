@@ -98,16 +98,32 @@ jobs:
       # complete" before the next step can curl it. Measured, not guessed.
       - name: End-to-end (healthz, then the protocol vertical over TLS)
         env:
-          # What docker-compose.yml used to set for the daemon service, so the
-          # e2e client's expectations did not have to change either. The
-          # bootstrap variable is the OPENCHIME_-prefixed name; the OC_ form
+          # What docker-compose.yml used to set for the daemon service, plus the
+          # paths the image supplied implicitly and a bare runner does not.
+          #
+          # EVERY path default points into /data, which exists in the image and
+          # nowhere else. Compose therefore never had to set them. The blob
+          # directory is the one that bites: oc_blobstore_open("/data/blobs")
+          # fails on a runner, oc_netloop_run returns -1 without printing
+          # anything, and the daemon exits 0 having logged "healthz listening on
+          # :8080" — so it looks like a healthy daemon that mysteriously will not
+          # answer. Diagnosed by reproducing it locally; see BACKLOG item 128 for
+          # the silent-failure defect underneath.
+          #
+          # The bootstrap variable is the OPENCHIME_-prefixed name; the OC_ form
           # compose used is a deprecated alias and the daemon warns about it.
-          OPENCHIME_DB_PATH: ${{ runner.temp }}/openchime.db
+          OPENCHIME_DB_PATH: ${{ runner.temp }}/itest/openchime.db
+          OPENCHIME_BLOB_DIR: ${{ runner.temp }}/itest/blobs
+          OPENCHIME_TLS_CERT: ${{ runner.temp }}/itest/cert.pem
+          OPENCHIME_TLS_KEY: ${{ runner.temp }}/itest/key.pem
           OPENCHIME_HEALTH_PORT: '8080'
           OPENCHIME_PROTO_PORT: '8443'
           OPENCHIME_BOOTSTRAP_USERS: 'e2e-alice:e2e-pw:owner,e2e-bob:e2e-pw:member'
         run: |
           set -euo pipefail
+          # The daemon creates its database and its certificate, but not the
+          # directories holding them -- the image's entrypoint does that (ARCH-39).
+          mkdir -p "${{ runner.temp }}/itest/blobs"
           log="${{ runner.temp }}/daemon.log"
           ./openchimed >"$log" 2>&1 &
           dpid=$!
