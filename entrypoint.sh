@@ -12,7 +12,7 @@ set -eu
 : "${OPENCHIME_DB_PATH:=/data/openchime.db}"
 mkdir -p "$(dirname "$OPENCHIME_DB_PATH")"
 
-# Arguments are forwarded, so `docker run <image> --version` reports the release
+# Arguments are forwarded, so `podman run <image> --version` reports the release
 # instead of silently starting a daemon. Without "$@" the entrypoint swallows
 # whatever it was given, which makes the image impossible to interrogate without
 # overriding the entrypoint.

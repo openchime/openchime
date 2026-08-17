@@ -4,8 +4,11 @@ name: ci
 # and on PRs targeting main. Four jobs:
 #   - build:       native gcc build of the daemon, plus unit tests (make test),
 #                  which include the headless client app-core test.
-#   - integration: the deployed image end-to-end on the Docker Compose stack —
-#                  health check plus the protocol vertical over TLS.
+#   - integration: the daemon end-to-end, run natively on the runner — health
+#                  check plus the protocol vertical over TLS. This used to drive
+#                  the deployed image on a Docker Compose stack; the project no
+#                  longer uses Docker anywhere, in CI or locally, so the same two
+#                  assertions run against the binary the job builds.
 #   - core:        standalone compile check of the client app-core (ARCH-74).
 #   - windows:     mingw cross-compile check of the Windows front-ends (TUI + the
 #                  native Direct2D/DirectWrite GUI, ARCH-82). Build breaks only.
@@ -27,7 +30,6 @@ on:
     paths-ignore:
       - '**.md'
       - '.gitignore'
-      - '.env.example'
   # No paths-ignore here, deliberately, unlike the push trigger above. These four
   # jobs are required status checks on main, and a job that never triggers never
   # reports -- so a docs-only pull request waits forever for a check that will not
@@ -68,7 +70,7 @@ jobs:
         run: make test
 
   integration:
-    name: end-to-end (compose)
+    name: end-to-end (native daemon)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
@@ -76,17 +78,58 @@ jobs:
         run: |
           sudo apt-get update
           # bzip2 for the vendored mbedTLS tarball that the e2e client builds.
-          sudo apt-get install -y --no-install-recommends bzip2
+          sudo apt-get install -y --no-install-recommends libsqlite3-dev bzip2
 
-      # The whole harness — healthz plus the protocol vertical over TLS — lives
-      # in one script so it runs identically here and locally
-      # (`make integration`). See docs/TESTING.md §3.
-      - name: Run integration harness
-        run: Scripts/test-integration.sh
+      - name: Build the daemon and the e2e client
+        run: make && make build/e2e_client
 
-      - name: Tear down
+      # These two assertions used to live in Scripts/test-integration.sh, which
+      # brought up the Docker Compose stack and drove the *deployed image* as a
+      # black box. The stack is gone, so they run against the binary this job
+      # just built. The assertions are unchanged; what they run against is not.
+      #
+      # Understand what that costs: the image published to GHCR is no longer
+      # exercised by any test, here or in the release. The daemon's behaviour is
+      # covered, its packaging into an image is not. ARCH-48 records the trade.
+      - name: Start the daemon
+        env:
+          # Matches what docker-compose.yml used to set, so the e2e client's
+          # expectations did not have to change either.
+          OPENCHIME_DB_PATH: ${{ runner.temp }}/openchime.db
+          OPENCHIME_HEALTH_PORT: '8080'
+          OPENCHIME_PROTO_PORT: '8443'
+          OC_BOOTSTRAP_USERS: 'e2e-alice:e2e-pw:owner,e2e-bob:e2e-pw:member'
+        run: |
+          set -euo pipefail
+          ./openchimed >"${{ runner.temp }}/daemon.log" 2>&1 &
+          echo "$!" > "${{ runner.temp }}/daemon.pid"
+
+      - name: 1/2 wait for /healthz
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            if curl -sf http://localhost:8080/healthz >/dev/null 2>&1; then
+              echo "[itest] 1/2 healthz OK"; exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::daemon did not become healthy"
+          cat "${{ runner.temp }}/daemon.log"
+          exit 1
+
+      - name: 2/2 protocol vertical over TLS
+        run: |
+          set -euo pipefail
+          ./build/e2e_client 127.0.0.1 8443
+          echo "[itest] 2/2 protocol vertical OK"
+
+      - name: Daemon log
         if: always()
-        run: COMPOSE_PROJECT_NAME=openchime docker compose down -v
+        run: cat "${{ runner.temp }}/daemon.log" || true
+
+      - name: Stop the daemon
+        if: always()
+        run: kill "$(cat "${{ runner.temp }}/daemon.pid")" 2>/dev/null || true
 
   core:
     name: client app-core (compile check)

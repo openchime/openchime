@@ -39,14 +39,22 @@ assertion ever fires, something deleted the reservation mid-run.
 
 ## `:latest` moves last
 
-`image` needs only `version`, so it runs beside `windows-package`. It pushes
+`image` needs only `version`, so it runs beside `windows-package`. It builds one
+image per architecture with **buildah** on a native runner of that architecture;
+a separate `image-manifest` job then publishes the `:VERSION` manifest list that
+indexes them. The per-architecture tags (`:VERSION-amd64`, `:VERSION-arm64`) are
+an implementation detail — nothing is documented as pullable until the manifest
+exists.
+
 `:VERSION` **only**. If `:latest` moved there and a later job failed, `publish`
 would be skipped and `:latest` would point at a version with no packages, no tag
-and no release — anyone running Compose against `:latest` would be on a build
-that officially does not exist.
+and no release — anyone pulling `:latest` would be on a build that officially
+does not exist.
 
-`publish` moves it at the end with `docker buildx imagetools create`, which
-re-points the tag registry-side without pulling, preserving the digest.
+`publish` moves it at the end with `skopeo copy --all`, which re-points the tag
+registry-side without pulling, preserving the digest. `--all` copies the whole
+manifest list rather than just the runner's architecture. It replaced
+`docker buildx imagetools create`, which did the same job with a daemon.
 
 ## The apt/dnf pool guard
 
@@ -126,21 +134,52 @@ Properties worth knowing before touching it:
 
 `openchimed.service` is 60 lines of `ProtectSystem`, `DynamicUser` and
 `RestrictAddressFamilies` that CI produces and, until recently, nothing ever
-parsed: both maintainer scripts gate the enable path on `[ -d /run/systemd/system ]`,
-which a plain `docker run` container does not have.
+parsed: both maintainer scripts gate the enable path on `[ -d /run/systemd/system ]`.
 
-A third clean-room container installs systemd and runs `systemd-analyze verify`.
-Two things about that check are measured, not assumed:
+The release runs `systemd-analyze verify` against it. This check needed a
+container originally, for exactly the reason above — `docker run` has no
+`/run/systemd/system`, so a container had to install systemd to have anything
+that would parse the unit. The runner is the opposite case: it boots systemd for
+real, so the check now runs directly on it, against a newer systemd than the
+bookworm container offered.
+
+Two things about the check are measured, not assumed:
 
 1. **`systemd-analyze verify` exits 0 for a directive it does not recognise.** Its
    status is worthless; the output must be grepped.
-2. **The pattern is `Unknown key`, not `Unknown key name`.** Bookworm words it
+2. **The pattern is `Unknown key`, not `Unknown key name`.** systemd words it
    `Unknown key 'ProtectSystm' in section [Service], ignoring.` A first draft
    matching `Unknown key name` passed a unit with a typo'd `ProtectSystem` — the
    exact bug the step exists to catch.
 
 Tested against three fixtures: real unit passes, typo'd key fails, bad `Type=`
 value fails.
+
+## What the clean-room install used to catch, and no longer does
+
+The release used to install each built package inside a pristine `debian:bookworm`
+and `rockylinux:9` container and run the binary — on the reasoning that a package
+which builds but does not install is precisely the failure a release pipeline
+exists to catch, and only an install finds it.
+
+Both containers are gone, and this is a **deliberate reduction in coverage**, not
+a cleanup. What replaced them:
+
+- **The `.deb`** is installed on the runner itself and the binary is executed.
+  Weaker: Ubuntu rather than Debian, and a runner that is not pristine. It still
+  proves the package unpacks, its dependencies resolve, and what it lays down
+  runs.
+- **The `.rpm` has no replacement at all.** Nothing on a hosted runner can
+  install one. Between the identical-binary check and the apt repository smoke
+  test, the *binary* and the *signing and object layout* are both covered — but
+  nothing exercises `dnf`, so an rpm that builds and signs correctly yet fails to
+  install on the RHEL family will not be caught before it is published.
+- **The published-repository smoke test lost its dnf half** for the same reason.
+  The apt half runs on the runner and shares the signing key and object layout
+  with the rpm repository, so faults in those still surface there.
+
+This trade was made to remove Docker from the pipeline entirely (ARCH-36). It is
+tracked in docs/BACKLOG.md rather than treated as settled.
 
 ## Windows signing is optional
 
@@ -179,7 +218,9 @@ Same rule as `build_mbedtls.sh`, which refuses to fetch without a known SHA-256.
 | `TRUSTED_SIGNING_ACCOUNT` / `_ENDPOINT` / `_PROFILE` | secret | Authenticode; **optional** |
 | `DIST_S3_ENDPOINT` / `DIST_BUCKET` | variable | rclone configuration |
 
-`GITHUB_TOKEN` covers GHCR; nothing extra is needed for the image.
+`GITHUB_TOKEN` covers GHCR; nothing extra is needed for the image. It is passed
+to `buildah login` and `skopeo --creds`, which replaced `docker login` when the
+pipeline stopped using Docker — the credential and its scope are unchanged.
 
 ## What the first real release found
 

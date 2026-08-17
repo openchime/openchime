@@ -43,8 +43,10 @@ The branch, commit, and CI policy for this repo. The private control-plane repo
 
 - **`build`** — native gcc build + `make test` (unit + in-process integration,
   including the headless client app-core test).
-- **`integration`** — the deployed image end-to-end on the Docker Compose stack
-  (health check + the protocol vertical over TLS).
+- **`integration`** — the daemon end-to-end, started natively on the runner
+  (health check + the protocol vertical over TLS). It used to drive the deployed
+  image on a Docker Compose stack; the project no longer uses Docker anywhere,
+  and there is no local equivalent of this job (docs/TESTING.md §3.2).
 - **`core`** — standalone compile check of the client app-core (ARCH-74).
 - **`windows`** — cross-compiles the Windows TUI + GUI (`make windows-tui windows-gui`).
 - **`guard`** — the job in the separate [`attribution-guard`](../.github/workflows/attribution-guard.yml)

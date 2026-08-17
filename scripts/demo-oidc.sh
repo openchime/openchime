@@ -9,8 +9,12 @@
 # it. The upstream-IdP + browser flow is bypassed on purpose: this exercises the
 # daemon's verification, which is the untested half; mint↔verify is unit-tested too.
 #
-# Prereqs: the sibling ../openchime-saas, dotnet, Postgres (this script starts the
-# compose db), curl, openssl.
+# Prereqs: the sibling ../openchime-saas, dotnet, curl, openssl, and a Postgres
+# already listening on localhost:5432 with the openchime role/database below.
+# This script used to start that Postgres itself via the sibling repo's compose
+# stack; the project no longer uses Docker anywhere, so bringing the database up
+# is now the caller's job -- same convention as scripts/demo-federated.sh, which
+# has always expected an already-running control plane.
 #
 # Usage: scripts/demo-oidc.sh
 set -euo pipefail
@@ -31,8 +35,14 @@ say "Generate an ES256 keypair (central signs with the private half; the daemon 
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$WORK/priv.pem" 2>/dev/null
 openssl pkey -in "$WORK/priv.pem" -pubout -out "$WORK/pub.pem" 2>/dev/null
 
-say "Start Postgres + the control plane (with the signing key + the dev token-mint)"
-( cd "$SAAS" && docker compose up -d db >/dev/null 2>&1 )
+say "Check Postgres is up (start it yourself -- see the prereqs at the top)"
+if ! (exec 3<>/dev/tcp/localhost/5432) 2>/dev/null; then
+  echo "demo-oidc: nothing listening on localhost:5432." >&2
+  echo "  Start Postgres with the openchime role/database, then re-run." >&2
+  exit 1
+fi
+
+say "Start the control plane (with the signing key + the dev token-mint)"
 ( cd "$SAAS" && ConnectionStrings__ControlPlane="Host=localhost;Port=5432;Database=openchime_cp;Username=openchime;Password=openchime_dev" \
   Database__MigrateOnStartup=true \
   Oidc__SigningKeyPem="$(cat "$WORK/priv.pem")" Oidc__Kid=demo-kid Oidc__Issuer="$ISS" Oidc__DevMintEnabled=true \

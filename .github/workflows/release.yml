@@ -8,19 +8,26 @@
 #   apt      Debian/Ubuntu, GPG-signed repository in object storage
 #   dnf/yum  RHEL family, GPG-signed repository in object storage
 #   tarball  everyone else, and the offline case -- attached to the GitHub release
-#   image    GHCR, for the hosted model (Fly) and for anyone running Compose
+#   image    GHCR, for the hosted model (Fly)
 #   windows  the client, not the daemon: a signed installer attached to the
 #            GitHub release, and an MSIX for the Store
 #
 # ONE BINARY PER ARCHITECTURE feeds the .deb, the .rpm and the tarball, so all
 # three ship a byte-identical artifact rather than three builds that merely came
-# from one source tree. It is built inside a rockylinux:9 container -- glibc 2.34,
-# the oldest target -- because the runner's own glibc is too new: a binary linked
-# against 2.35+ will not start on RHEL 9, and one linked here against the runner's
-# libc failed outright on Debian bookworm during development.
+# from one source tree. It is built with `zig cc` targeting glibc 2.34, the
+# oldest supported target -- because the runner's own glibc is too new: a binary
+# linked against 2.35+ will not start on RHEL 9, and one linked here against the
+# runner's libc failed outright on Debian bookworm during development.
 #
-# The image is the deliberate exception: it stays an Alpine/musl build, so it
-# carries a different binary from the same source.
+# NOTHING IN THIS WORKFLOW USES DOCKER. The 2.34 floor was previously held by
+# building inside a rockylinux:9 container; zig ships glibc stubs for every
+# version and pins the floor on a bare runner instead. The container image is
+# built with buildah, per-architecture on native runners, so the QEMU emulation
+# that a multi-arch buildx build required is gone too. Keeping the pipeline
+# daemon-free is a standing constraint, not an accident -- see docs/RELEASING.md.
+#
+# The image is the deliberate exception to the one-binary rule: it stays an
+# Alpine/musl build, so it carries a different binary from the same source.
 name: release
 
 on:
@@ -116,11 +123,15 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-22.04
+            zig: x86_64
+            zig_sha: d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea
           - arch: arm64
             # Native, not cross-compiled: cross-building would need a
             # foreign-architecture libsqlite3-dev and would leave the result
             # untested on the architecture it targets.
             runner: ubuntu-22.04-arm
+            zig: aarch64
+            zig_sha: 041ac42323837eb5624068acd8b00cd5777dac4cf91179e8dad7a7e90dd0c556
     env:
       VERSION: ${{ needs.version.outputs.number }}
       # Every artifact this job produces lands under dist/<platform>/, which is
@@ -132,48 +143,84 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The toolchain that holds the glibc floor. `zig cc` ships glibc stub
+      # libraries for every version back to 2.17 and links against whichever one
+      # it is asked for, regardless of the host's own glibc -- so a 2.34 binary
+      # comes off a runner carrying 2.35 with no container in the picture.
+      #
+      # Pinned by checksum for the same reason scripts/build_mbedtls.sh pins
+      # mbedTLS: this is the compiler that produces the shipped binary, and an
+      # unverified fetch of a compiler is not a thing to shrug at.
+      - name: Install the zig toolchain
+        env:
+          ZIG_VERSION: '0.13.0'
+        run: |
+          set -euo pipefail
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${{ matrix.zig }}-${ZIG_VERSION}.tar.xz"
+          curl -fsSL -o /tmp/zig.tar.xz "$url"
+          echo "${{ matrix.zig_sha }}  /tmp/zig.tar.xz" | sha256sum -c -
+          mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          /opt/zig/zig version
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # libsqlite3-dev for the daemon's only dynamic dependency; rpm supplies
+          # rpmbuild, which used to come from the Rocky container.
+          sudo apt-get install -y -qq --no-install-recommends libsqlite3-dev bzip2 rpm
+
       # One binary, built against the oldest glibc we support, then stripped
       # once. Everything downstream consumes this exact file.
+      #
+      # The wrapper exists to keep one rule: the ONLY host header this build may
+      # see is sqlite3.h. Adding -I/usr/include instead would pull the runner's
+      # glibc 2.39 headers, which redirect strtol to __isoc23_strtol -- a 2.38
+      # symbol that does not exist in the 2.34 stubs, so the link fails. libc
+      # headers come from zig; the sqlite header is copied out on its own.
       - name: Build the daemon (glibc 2.34)
         run: |
           set -euo pipefail
-          mkdir -p "$DIST"
-          docker run --rm -v "$PWD:/src:ro" -v "$PWD/$DIST:/out" rockylinux:9 bash -c '
-            set -euo pipefail
-            # curl is NOT requested: Rocky ships curl-minimal and asking for
-            # curl makes dnf reject the whole transaction as a conflict.
-            dnf install -y -q gcc make sqlite-devel bzip2 tar findutils binutils rpm-build
-            cp -a /src /build && cd /build
-            make OC_VERSION='"$VERSION"' >/dev/null
-            strip openchimed -o /out/openchimed
-            packaging/build-rpm.sh '"$VERSION"' /out/openchimed /out >/dev/null
-            # mbedTLS is fetched and built on the copy of the tree inside this
-            # container, so its licence text does not exist on the runner -- and
-            # licenses.sh refuses to package a binary without it, which is how
-            # this was found. Carry the notice out with the binary it belongs to.
-            #
-            # NOTE: no apostrophes anywhere in this block, comments included.
-            # This whole script is a single-quoted string on the host, so one
-            # apostrophe closes it and every line after runs on the runner
-            # instead of in the container. Not hypothetical: the word
-            # "container" followed by an apostrophe-s, in this very comment,
-            # silently moved the two lines below onto the host, where mkdir
-            # tried to create /out at the filesystem root and was denied.
-            mkdir -p /out/.mbedtls
-            cp third_party/mbedtls-3.6.2/LICENSE /out/.mbedtls/LICENSE
-          '
+          mkdir -p "$DIST" /tmp/sqinc
+          cp /usr/include/sqlite3.h /usr/include/sqlite3ext.h /tmp/sqinc/
+          cat > /tmp/zcc <<EOF
+          #!/bin/sh
+          exec /opt/zig/zig cc -target ${{ matrix.zig }}-linux-gnu.2.34 \
+            -I/tmp/sqinc -L/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH) "\$@"
+          EOF
+          chmod +x /tmp/zcc
+          make CC=/tmp/zcc OC_VERSION="$VERSION"
+          strip openchimed -o "$DIST/openchimed"
+          packaging/build-rpm.sh "$VERSION" "$DIST/openchimed" "$DIST" >/dev/null
           "./$DIST/openchimed" --version
+
+      # The floor is a shipped promise (README: "glibc 2.34+", RHEL 9+), and it
+      # is invisible in a passing build -- a binary needing 2.38 links and runs
+      # perfectly here, then fails to start on the distro it was built for. The
+      # container used to enforce it structurally; with the container gone this
+      # assertion is what enforces it, so it is not optional.
+      - name: Assert the glibc floor
+        run: |
+          set -euo pipefail
+          max=$(objdump -T "$DIST/openchimed" \
+                | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)
+          echo "highest glibc symbol required: $max"
+          [ "$max" = "GLIBC_2.34" ] || {
+            echo "::error::binary requires $max, above the supported floor GLIBC_2.34"
+            exit 1
+          }
 
       # The build-*.sh scripts take an output directory and default to a bare
       # dist/. They are deliberately left knowing nothing about the per-platform
       # layout: the release pipeline owns where artifacts go, so one caller
       # decides it rather than three scripts agreeing by coincidence.
       - name: Build the .deb and the tarball
-        # The licence tree staged out of the container above. The .rpm was built
-        # inside it, where the real tree was still present, so only these two
-        # need pointing at the copy.
-        env:
-          MBEDTLS_DIR: ${{ github.workspace }}/dist/linux-${{ matrix.arch }}/.mbedtls
+        # No MBEDTLS_DIR override any more. It used to point at a licence tree
+        # copied out of the build container, because mbedTLS was fetched and
+        # built on the container's throwaway copy of the source and its LICENSE
+        # never existed on the runner. The build now happens in this very tree,
+        # so licenses.sh finds third_party/mbedtls-3.6.2/LICENSE where it
+        # defaults to looking.
         run: |
           set -euo pipefail
           packaging/build-deb.sh     "$VERSION" "${{ matrix.arch }}" "$DIST/openchimed" "$DIST"
@@ -197,59 +244,55 @@ jobs:
           done
           echo "all three channels ship $want"
 
-      # Install from the actual package in a clean container. A package that
-      # builds but does not install is precisely the failure this pipeline
-      # exists to catch, and only an install finds it.
-      - name: Clean-room install
+      # Install the real .deb and run what it put on disk. This is a weaker check
+      # than the clean-room install it replaces: the runner is not pristine, it
+      # is Ubuntu rather than Debian, and there is no equivalent for the .rpm at
+      # all, because nothing on an Ubuntu runner can install one. What survives
+      # is the single most valuable assertion of the three -- that the package
+      # unpacks, its dependencies resolve, and the binary it lays down executes.
+      #
+      # Dropping the container was a deliberate trade (see docs/RELEASING.md).
+      # The .rpm is now covered only by the identical-binary check above and by
+      # the repository smoke test in `publish`; a package that builds but fails
+      # to install on the RHEL family will not be caught before it is published.
+      - name: Install the package and run it
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD/$DIST:/pkg:ro" debian:bookworm bash -c '
-            set -e
-            apt-get update -qq >/dev/null
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq /pkg/openchimed_'"$VERSION"'_${{ matrix.arch }}.deb >/dev/null
-            /usr/bin/openchimed --version
-          '
-          docker run --rm -v "$PWD/$DIST:/pkg:ro" rockylinux:9 bash -c '
-            set -e
-            dnf install -y -q /pkg/openchimed-'"$VERSION"'-1.*.rpm >/dev/null 2>&1
-            /usr/bin/openchimed --version
-          '
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            "./$DIST/openchimed_${VERSION}_${{ matrix.arch }}.deb"
+          /usr/bin/openchimed --version
 
-      # Neither install above touches the unit file: both maintainer scripts gate
-      # the enable/start path on `[ -d /run/systemd/system ]`, which a plain
-      # `docker run` container does not have. So the 60 lines of ProtectSystem,
-      # DynamicUser and RestrictAddressFamilies that CI produces were parsed by
-      # nothing, ever. This container installs systemd and makes it parse them.
+      # The install above does not touch the unit file: both maintainer scripts
+      # gate the enable/start path on `[ -d /run/systemd/system ]`. So the 60
+      # lines of ProtectSystem, DynamicUser and RestrictAddressFamilies that CI
+      # produces need something to actually parse them.
       #
-      # Not a real boot: that needs --privileged and cgroup plumbing. `verify`
-      # resolves every directive against the installed systemd, which is the
-      # failure class that ships unchecked today.
+      # This used to need a container precisely because `docker run` has no
+      # /run/systemd/system. The runner is the opposite case -- it boots systemd
+      # for real -- so the check runs directly, against a newer systemd than the
+      # bookworm container offered.
+      #
+      # Not a real boot: that would need the service to start. `verify` resolves
+      # every directive against the installed systemd, which is the failure class
+      # that would otherwise ship unchecked.
       - name: Validate the unit file
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD/$DIST:/pkg:ro" debian:bookworm bash -c '
-            set -e
-            apt-get update -qq >/dev/null
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq systemd >/dev/null
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq /pkg/openchimed_'"$VERSION"'_${{ matrix.arch }}.deb >/dev/null
-            # systemd-analyze exits 0 even for a directive it does not recognise, so
-            # its status is worthless here -- measured in a bookworm container, not
-            # assumed. Grep the output instead.
-            #
-            # The pattern is "Unknown key", NOT "Unknown key name": this systemd
-            # words it "Unknown key '"'"'ProtectSystm'"'"' in section [Service], ignoring."
-            # A first draft matching "Unknown key name" passed a unit with a typo'"'"'d
-            # ProtectSystem, which is the exact bug this step exists to catch.
-            out=$(systemd-analyze verify /lib/systemd/system/openchimed.service 2>&1 || true)
-            printf "%s\n" "$out"
-            # An absent ExecStart binary is expected inside this container.
-            if printf "%s\n" "$out" | grep -v "is not executable" \
-                 | grep -E "Unknown key|Unknown lvalue|Unknown section|Failed to |Invalid "; then
-              echo "::error::openchimed.service has a directive this systemd rejects"
-              exit 1
-            fi
-            echo "unit parses clean"
-          '
+          # systemd-analyze exits 0 even for a directive it does not recognise, so
+          # its status is worthless here -- measured, not assumed. Grep the output.
+          #
+          # The pattern is "Unknown key", NOT "Unknown key name": systemd words it
+          # "Unknown key 'ProtectSystm' in section [Service], ignoring." A first
+          # draft matching "Unknown key name" passed a unit with a typo'd
+          # ProtectSystem, which is the exact bug this step exists to catch.
+          out=$(systemd-analyze verify /lib/systemd/system/openchimed.service 2>&1 || true)
+          printf "%s\n" "$out"
+          if printf "%s\n" "$out" | grep -v "is not executable" \
+               | grep -E "Unknown key|Unknown lvalue|Unknown section|Failed to |Invalid "; then
+            echo "::error::openchimed.service has a directive this systemd rejects"
+            exit 1
+          fi
+          echo "unit parses clean"
 
       # The artifact is NAMED for the platform, and the publish job downloads
       # without merge-multiple. That combination is what rebuilds dist/<platform>/
@@ -267,37 +310,93 @@ jobs:
             ${{ env.DIST }}/*.sha256
           if-no-files-found: error
 
+  # Built with buildah, not docker. Two consequences beyond removing the daemon:
+  #
+  # 1. Each architecture builds on a runner of that architecture, so the QEMU
+  #    emulation this job used to need is gone. Native arm64 is both faster and
+  #    a truer build than emulating it on x86.
+  # 2. A multi-arch tag is no longer a side effect of one buildx invocation, so
+  #    the per-arch images and the manifest list that indexes them are two
+  #    separate jobs. The per-arch tags are an implementation detail; nothing is
+  #    documented as pullable until image-manifest publishes :VERSION.
   image:
-    name: container image
+    name: ${{ matrix.arch }} image
     needs: version
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/openchime
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install buildah
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends buildah
+          buildah version
+      # The Dockerfile is unchanged and is read as-is; buildah speaks the same
+      # format. Only the tool that reads it changed.
+      - name: Build the image
+        run: |
+          set -euo pipefail
+          buildah build \
+            --build-arg "OC_VERSION=${VERSION}" \
+            -f Dockerfile \
+            -t "${IMAGE}:${VERSION}-${{ matrix.arch }}" \
+            .
+      - name: Push the per-architecture image
+        if: ${{ inputs.dry_run == false }}
+        run: |
+          set -euo pipefail
+          buildah login -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}" ghcr.io
+          buildah push "${IMAGE}:${VERSION}-${{ matrix.arch }}"
+
+  # :VERSION only. `image` needs only `version`, so it runs alongside
+  # windows-package -- and if that fails, publish is skipped and nothing reaches
+  # apt, dnf or the releases page, yet :latest would already point at that build.
+  # Anyone pulling :latest would get a version that officially does not exist.
+  # :latest moves in `publish`.
+  image-manifest:
+    name: container image manifest
+    needs: [version, image]
+    # Nothing was pushed on a dry run, so there is nothing to index. The
+    # per-arch builds above still ran, which is the part worth proving.
+    if: ${{ inputs.dry_run == false }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: write
     env:
       VERSION: ${{ needs.version.outputs.number }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/openchime
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          build-args: OC_VERSION=${{ env.VERSION }}
-          push: ${{ inputs.dry_run == false }}
-          # :VERSION only. `image` needs only `version`, so it runs alongside
-          # windows-package -- and if that fails, publish is skipped and nothing
-          # reaches apt, dnf or the releases page, yet :latest would already point
-          # at that build. Anyone running Compose against :latest would get a
-          # version that officially does not exist. :latest moves in `publish`.
-          tags: ghcr.io/${{ github.repository_owner }}/openchime:${{ env.VERSION }}
+      - name: Install buildah
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends buildah
+      - name: Publish the manifest list
+        run: |
+          set -euo pipefail
+          buildah login -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}" ghcr.io
+          buildah manifest create "${IMAGE}:${VERSION}"
+          for a in amd64 arm64; do
+            buildah manifest add "${IMAGE}:${VERSION}" "docker://${IMAGE}:${VERSION}-${a}"
+          done
+          buildah manifest push --all "${IMAGE}:${VERSION}" "docker://${IMAGE}:${VERSION}"
 
   # The Windows client (ARCH-80/81). It carries the same release number as the
   # daemon even though it is a separate program, so a support question only ever
@@ -523,7 +622,7 @@ jobs:
 
   publish:
     name: publish repositories
-    needs: [version, packages, image, windows-package]
+    needs: [version, packages, image-manifest, windows-package]
     if: inputs.dry_run == false
     runs-on: ubuntu-22.04
     timeout-minutes: 30
@@ -784,32 +883,27 @@ jobs:
       # (openchime-saas). Until that ships, this step is what fails, which is the
       # correct place for the dependency to surface.
       #
-      # DIST_BASE_URL is passed with -e rather than interpolated: these scripts
-      # are single-quoted, so the shell inside the container expands it. NOTE, as
-      # elsewhere in this file: no apostrophes in these blocks, comments
-      # included, or the quoting closes early and the rest runs on the runner.
-      - name: Smoke the published repositories
+      # The apt half runs directly on the runner, which is ephemeral, so polluting
+      # its package state costs nothing.
+      #
+      # The dnf half is GONE, and this is a real hole rather than a tidy-up. It
+      # needed a RHEL-family userland, which no hosted runner provides and which
+      # a container used to supply. The rpm repository's signing, its repodata
+      # and the .repo definition are now published with nothing proving a RHEL
+      # box can install from them -- the apt path below shares the signing key
+      # and the object layout, so it catches faults in those, but nothing
+      # exercises dnf itself. First reported by a RHEL user is not where this
+      # should surface; see the FIXED-pending note in docs/BACKLOG.md.
+      - name: Smoke the published apt repository
         run: |
           set -euo pipefail
-          docker run --rm -e DIST_BASE_URL debian:bookworm bash -c '
-            set -e
-            apt-get update -qq >/dev/null
-            apt-get install -y -qq curl ca-certificates >/dev/null
-            curl -fsSL "$DIST_BASE_URL/openchime-archive-keyring.gpg" \
-              -o /usr/share/keyrings/openchime-archive-keyring.gpg
-            echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] $DIST_BASE_URL/apt stable main" \
-              > /etc/apt/sources.list.d/openchime.list
-            apt-get update -qq
-            apt-get install -y -qq openchimed
-            openchimed --version
-          '
-          docker run --rm -e DIST_BASE_URL rockylinux:9 bash -c '
-            set -e
-            curl -fsSL "$DIST_BASE_URL/openchime.repo" -o /etc/yum.repos.d/openchime.repo
-            rpm --import "$DIST_BASE_URL/openchime-archive-keyring.asc"
-            dnf install -y -q openchimed
-            openchimed --version
-          '
+          sudo curl -fsSL "$DIST_BASE_URL/openchime-archive-keyring.gpg" \
+            -o /usr/share/keyrings/openchime-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] $DIST_BASE_URL/apt stable main" \
+            | sudo tee /etc/apt/sources.list.d/openchime.list >/dev/null
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openchimed
+          openchimed --version
 
       - name: Tag the release and attach the tarballs
         env:
@@ -846,16 +940,21 @@ jobs:
             dist/linux-*/*.tar.gz dist/linux-*/*.sha256 dist/windows-x64/*-setup.exe \
             dist/windows-x64/openchime.debug
 
-      # Only now does :latest move. imagetools re-points the tag from the registry
-      # side without pulling or rebuilding, so the manifest digest is preserved
-      # exactly -- the property the control plane's promote step relies on.
+      # Only now does :latest move. `skopeo copy` re-points the tag registry-side
+      # without pulling or rebuilding, preserving the manifest digest exactly --
+      # the property the control plane's promote step relies on. It replaces
+      # `docker buildx imagetools create`, which did the same job with a daemon.
+      # --all copies the whole manifest list, not just the host architecture.
       - name: Move :latest to the released version
         run: |
           set -euo pipefail
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker buildx imagetools create \
-            -t "ghcr.io/${{ github.repository_owner }}/openchime:latest" \
-            "ghcr.io/${{ github.repository_owner }}/openchime:${VERSION}"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends skopeo
+          skopeo copy --all \
+            --dest-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+            --src-creds  "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+            "docker://ghcr.io/${{ github.repository_owner }}/openchime:${VERSION}" \
+            "docker://ghcr.io/${{ github.repository_owner }}/openchime:latest"
           echo "latest -> ${VERSION}"
 
       - name: Summary

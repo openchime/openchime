@@ -109,11 +109,16 @@ the unit and the config with an `install.sh`. Nothing is fetched at install
 time — TLS is statically linked — so this is the channel for an air-gapped box.
 Verify the `.sha256` beside it.
 
-**Container** — for Compose, or any container runtime:
+**Container** — for any OCI runtime (Podman, Docker, containerd, Fly):
 
 ```sh
-docker run ghcr.io/openchime/openchime:latest --version
+podman run ghcr.io/openchime/openchime:latest --version
 ```
+
+The image is published for deployment — it is what the hosted model feeds to Fly
+Machines, which ingest an image and cannot install a package. OpenChime itself
+does not use containers to build or test anything; the image is an output, not a
+tool. There is no Compose stack in this repository.
 
 After installing, the daemon starts and mints a one-time owner setup token:
 
@@ -149,9 +154,14 @@ packaging/build-rpm.sh     <version>       ./openchimed dist   # needs rpmbuild
 packaging/build-tarball.sh <version> amd64 ./openchimed dist
 ```
 
-Note the release does **not** build with the host toolchain: it builds inside a
-`rockylinux:9` container so the binary links against glibc 2.34, the oldest
-target. A binary built on a newer host will not start on an older one.
+Note the release does **not** build with the host toolchain. It builds with
+[`zig cc`](https://ziglang.org) targeting `glibc 2.34`, the oldest supported
+target, because a binary linked against a newer glibc will not start on an older
+one — and every hosted runner carries a newer one. Zig ships glibc stub
+libraries for each version and links against whichever it is told to, so the
+floor holds without a container. The release asserts the result rather than
+trusting it: if the built binary needs a symbol above `GLIBC_2.34`, the build
+fails. Nothing in the pipeline uses Docker.
 
 ## Client (app-core + native frontends)
 
@@ -203,37 +213,35 @@ see, and the verification gap underneath them are in
 [docs/BACKLOG.md](docs/BACKLOG.md). Next is **TUI catch-up**, then GTK (Linux),
 AppKit (macOS), a web DOM UI, and mobile.
 
-## Local Docker environment
+## Local development environment
 
-Requires Docker with Compose v2 (`docker compose`, not the standalone
-`docker-compose` v1).
-
-```
-Scripts/run.sh
-```
-
-This copies `.env.example` to `.env` if missing, builds and starts the
-stack, and waits for the daemon's health check before returning. Use
-`Scripts/stop.sh` to stop the platform while keeping local data, or
-`Scripts/reset.sh` to stop it and wipe the local DB + MinIO volumes
-entirely, for a from-scratch start.
-
-Equivalently, by hand:
+Nothing in this project runs in a container. Build the daemon and run it
+directly:
 
 ```
-cp .env.example .env
-docker compose up --build
+make run
 ```
 
-This starts three services:
-- `minio` — S3-compatible object storage for local dev (ARCH-38). It currently
-  has no consumer: the daemon's S3 blob backend (ARCH-70) defaults to the local
-  filesystem and is not wired up here.
-- `minio-init` — one-shot job that creates the dev bucket
-- `daemon` — the daemon, resource-capped to approximate Fly.io's smallest
-  instance (256MB / 1 shared vCPU, ARCH-4)
+This builds the daemon and the TUI, then starts a dev daemon on
+`127.0.0.1:8443` with its database and blobs under `/tmp/openchime-dev` and two
+bootstrap users (`alice/pw`, `bob/pw`). Connect with the TUI it just built:
+
+```
+build/openchime-tui 127.0.0.1 8443 alice:pw
+```
+
+Stop it with Ctrl-C. To start from scratch, delete `/tmp/openchime-dev` — there
+are no volumes and no daemon holding state anywhere else.
+
+There used to be a `Scripts/run.sh` / `stop.sh` / `reset.sh` trio wrapping a
+Docker Compose stack, plus a MinIO service standing in for S3 (ARCH-38). All of
+it is gone: the stack was removed along with every other use of Docker in the
+project, and the MinIO service had no consumer, since the daemon's S3 blob
+backend (ARCH-70) defaults to the local filesystem.
 
 ### Verify the health check
+
+The dev daemon serves `/healthz` on `OPENCHIME_HEALTH_PORT` (8080 by default):
 
 ```
 curl http://localhost:8080/healthz
@@ -261,8 +269,15 @@ See [LICENSING.md](LICENSING.md) for the full map, including `third_party/`.
 
 ## Known fidelity gaps
 
-- Docker containers share the host kernel; Fly.io actually runs machines on
-  Firecracker microVMs. This setup validates build and runtime behavior, not
-  kernel-level isolation.
-- Docker's `cpus` limit approximates Fly's shared-cpu-1x but doesn't
-  reproduce its exact throttling behavior.
+- **Local development does not approximate the deployment target at all.** It
+  used to, loosely: the Compose stack capped the daemon at 256MB / 1 CPU to
+  stand in for Fly.io's smallest instance (ARCH-4, REQ-210). That stack is gone
+  with the rest of the project's Docker usage, and `make run` applies no limits
+  whatsoever. Resource-constraint behaviour is now unexercised until deploy.
+- The gap that replaced was never large — Docker shares the host kernel while
+  Fly.io runs Firecracker microVMs, and its `cpus` limit did not reproduce Fly's
+  shared-vCPU throttling — but "loose approximation" and "none" are different,
+  and this is the latter.
+- The published container image is built by the release but **exercised by no
+  test**. The end-to-end suite drives a natively-built daemon, so the daemon's
+  behaviour is covered and its packaging into an image is not.
