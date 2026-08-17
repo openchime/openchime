@@ -182,9 +182,20 @@ the remedy the *Verified* note above proposed; it happened because the whole
 pipeline was moved off Docker (ARCH-36), which required replacing the buildx
 build regardless.
 
-**Not yet measured.** The predicted saving is unverified — no release or dry run
-has been executed against the new jobs at the time of writing. The 12m 37s figure
-above is the QEMU baseline to compare a first dry run against.
+**Measured** — dry run 32082302886 (2026-08-17), the same kind of run as the
+30954057012 baseline above, so the two are comparable:
+
+| | QEMU (30954057012) | native (32082302886) |
+|---|---|---|
+| image, amd64 | *(one job, both arches)* 12m 37s | 1m 02s |
+| image, arm64 | | 53s |
+| **total run** | **15m 25s** | **4m 32s** |
+
+The image is no longer the critical path: at ~1 minute per architecture it is
+beaten by `build + unit tests` (1m 59s) and `windows binaries` (1m 31s). The
+prediction above was "under 10 minutes"; the actual is 4m 32s, because the
+`packages` jobs also dropped their container (1m 06s / 1m 11s, having previously
+paid for a `dnf install` of a toolchain on every run).
 
 ## 7. A missing release credential is discovered twenty-five minutes in
 
