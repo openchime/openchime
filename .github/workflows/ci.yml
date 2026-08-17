@@ -91,45 +91,47 @@ jobs:
       # Understand what that costs: the image published to GHCR is no longer
       # exercised by any test, here or in the release. The daemon's behaviour is
       # covered, its packaging into an image is not. ARCH-48 records the trade.
-      - name: Start the daemon
+      # Start, assert, stop -- all in ONE step, deliberately. A backgrounded
+      # daemon does not survive the end of the step that launched it: the runner
+      # tears down the step's process tree, so splitting this across steps gets
+      # a daemon that reports "healthz listening on :8080" and then "shutdown
+      # complete" before the next step can curl it. Measured, not guessed.
+      - name: End-to-end (healthz, then the protocol vertical over TLS)
         env:
-          # Matches what docker-compose.yml used to set, so the e2e client's
-          # expectations did not have to change either.
+          # What docker-compose.yml used to set for the daemon service, so the
+          # e2e client's expectations did not have to change either. The
+          # bootstrap variable is the OPENCHIME_-prefixed name; the OC_ form
+          # compose used is a deprecated alias and the daemon warns about it.
           OPENCHIME_DB_PATH: ${{ runner.temp }}/openchime.db
           OPENCHIME_HEALTH_PORT: '8080'
           OPENCHIME_PROTO_PORT: '8443'
-          OC_BOOTSTRAP_USERS: 'e2e-alice:e2e-pw:owner,e2e-bob:e2e-pw:member'
+          OPENCHIME_BOOTSTRAP_USERS: 'e2e-alice:e2e-pw:owner,e2e-bob:e2e-pw:member'
         run: |
           set -euo pipefail
-          ./openchimed >"${{ runner.temp }}/daemon.log" 2>&1 &
-          echo "$!" > "${{ runner.temp }}/daemon.pid"
+          log="${{ runner.temp }}/daemon.log"
+          ./openchimed >"$log" 2>&1 &
+          dpid=$!
+          trap 'kill "$dpid" 2>/dev/null || true' EXIT
 
-      - name: 1/2 wait for /healthz
-        run: |
-          set -euo pipefail
+          ok=
           for _ in $(seq 1 60); do
-            if curl -sf http://localhost:8080/healthz >/dev/null 2>&1; then
-              echo "[itest] 1/2 healthz OK"; exit 0
-            fi
+            if curl -sf http://localhost:8080/healthz >/dev/null 2>&1; then ok=1; break; fi
+            # A daemon that died is never going to answer; fail now with its log
+            # rather than after two more minutes of polling a dead port.
+            kill -0 "$dpid" 2>/dev/null || break
             sleep 2
           done
-          echo "::error::daemon did not become healthy"
-          cat "${{ runner.temp }}/daemon.log"
-          exit 1
+          if [ -z "$ok" ]; then
+            echo "::error::daemon did not become healthy"
+            cat "$log"
+            exit 1
+          fi
+          echo "[itest] 1/2 healthz OK"
 
-      - name: 2/2 protocol vertical over TLS
-        run: |
-          set -euo pipefail
           ./build/e2e_client 127.0.0.1 8443
           echo "[itest] 2/2 protocol vertical OK"
-
-      - name: Daemon log
-        if: always()
-        run: cat "${{ runner.temp }}/daemon.log" || true
-
-      - name: Stop the daemon
-        if: always()
-        run: kill "$(cat "${{ runner.temp }}/daemon.pid")" 2>/dev/null || true
+          echo "[itest] ALL INTEGRATION CHECKS PASSED"
+          cat "$log"
 
   core:
     name: client app-core (compile check)
