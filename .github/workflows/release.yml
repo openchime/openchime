@@ -287,7 +287,17 @@ jobs:
           # ProtectSystem, which is the exact bug this step exists to catch.
           out=$(systemd-analyze verify /lib/systemd/system/openchimed.service 2>&1 || true)
           printf "%s\n" "$out"
-          if printf "%s\n" "$out" | grep -v "is not executable" \
+          # Scope to OUR unit before matching. `verify` walks the dependency
+          # graph and reports on everything it loads, which in a pristine
+          # container was only openchimed.service -- and on a runner is also
+          # whatever systemd units that runner ships. Both of these are real
+          # output from ubuntu-22.04 and both matched the patterns below:
+          #   /lib/systemd/system/snapd.service:23: Unknown key name 'RestartMode'
+          #   netplan-ovs-cleanup.service: Failed to open ...: Permission denied
+          # Neither says anything about openchimed. Every message that does is
+          # prefixed either with the unit name or with its path and line number,
+          # so filtering on the name first is what keeps this check about us.
+          if printf "%s\n" "$out" | grep "openchimed" | grep -v "is not executable" \
                | grep -E "Unknown key|Unknown lvalue|Unknown section|Failed to |Invalid "; then
             echo "::error::openchimed.service has a directive this systemd rejects"
             exit 1

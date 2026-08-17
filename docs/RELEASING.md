@@ -143,7 +143,7 @@ that would parse the unit. The runner is the opposite case: it boots systemd for
 real, so the check now runs directly on it, against a newer systemd than the
 bookworm container offered.
 
-Two things about the check are measured, not assumed:
+Three things about the check are measured, not assumed:
 
 1. **`systemd-analyze verify` exits 0 for a directive it does not recognise.** Its
    status is worthless; the output must be grepped.
@@ -151,6 +151,16 @@ Two things about the check are measured, not assumed:
    `Unknown key 'ProtectSystm' in section [Service], ignoring.` A first draft
    matching `Unknown key name` passed a unit with a typo'd `ProtectSystem` — the
    exact bug the step exists to catch.
+3. **The output must be scoped to our unit before it is matched.** `verify` walks
+   the dependency graph and reports on everything it loads. In the container that
+   was only `openchimed.service`; on the runner it is also the runner's own
+   units, and `ubuntu-22.04` ships two that trip the patterns above —
+   `snapd.service` has an `Unknown key name 'RestartMode'`, and
+   `netplan-ovs-cleanup.service` gives `Failed to open ...: Permission denied`.
+   The first dry run after moving this check off the container failed on exactly
+   those, with nothing wrong in `openchimed.service`. Grepping for `openchimed`
+   first is what makes the check about us; every message that concerns a unit is
+   prefixed with its name or its path and line.
 
 Tested against three fixtures: real unit passes, typo'd key fails, bad `Type=`
 value fails.
