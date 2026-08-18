@@ -57,7 +57,12 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install build deps
         run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update
+          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update
           # libsqlite3-dev for the daemon; bzip2 for the vendored mbedTLS
           # tarball that `make test` builds via scripts/build_mbedtls.sh.
           sudo apt-get install -y --no-install-recommends libsqlite3-dev bzip2
@@ -78,7 +83,12 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install deps
         run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update
+          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update
           # bzip2 for the vendored mbedTLS tarball that the e2e client builds.
           sudo apt-get install -y --no-install-recommends libsqlite3-dev bzip2
 
@@ -163,7 +173,12 @@ jobs:
       # (tests/test_client_core.c). bzip2 for the vendored mbedTLS tarball.
       - name: Install build deps
         run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update
+          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update
           sudo apt-get install -y --no-install-recommends bzip2
       - name: Compile the app-core
         run: make core
@@ -182,7 +197,12 @@ jobs:
       # tarball that build_mbedtls_windows.sh fetches and cross-builds.
       - name: Install cross toolchain
         run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update
+          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-mingw-w64-x86-64 bzip2 curl
       - name: Cross-build the vendored Windows mbedTLS

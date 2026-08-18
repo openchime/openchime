@@ -165,7 +165,12 @@ jobs:
       - name: Install build dependencies
         run: |
           set -euo pipefail
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update -qq
+          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update -qq
           # libsqlite3-dev for the daemon's only dynamic dependency; rpm supplies
           # rpmbuild, which used to come from the Rocky container.
           sudo apt-get install -y -qq --no-install-recommends libsqlite3-dev bzip2 rpm
@@ -353,7 +358,12 @@ jobs:
       - name: Install buildah
         run: |
           set -euo pipefail
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update -qq
+          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends buildah
           buildah version
       # The Dockerfile is unchanged and is read as-is; buildah speaks the same
@@ -396,7 +406,12 @@ jobs:
       - name: Install buildah
         run: |
           set -euo pipefail
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update -qq
+          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends buildah
       - name: Publish the manifest list
         run: |
@@ -435,7 +450,12 @@ jobs:
 
       - name: Install the mingw-w64 toolchain
         run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update -qq
+          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update -qq
           # bzip2 and curl are for build_mbedtls_windows.sh below, which fetches
           # and cross-builds the pinned tarball.
           sudo apt-get install -y -qq mingw-w64 bzip2 curl
@@ -702,7 +722,12 @@ jobs:
 
       - name: Install repository tooling
         run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update -qq
+          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update -qq
           # `rpm` is not optional and not implied: createrepo-c pulls librpm's
           # shared libraries but not the rpm binary, and an Ubuntu runner has
           # neither rpm nor rpmsign preinstalled. Without it the rpm repository
@@ -911,7 +936,12 @@ jobs:
             -o /usr/share/keyrings/openchime-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] $DIST_BASE_URL/apt stable main" \
             | sudo tee /etc/apt/sources.list.d/openchime.list >/dev/null
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update -qq
+          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openchimed
           openchimed --version
 
@@ -958,7 +988,12 @@ jobs:
       - name: Move :latest to the released version
         run: |
           set -euo pipefail
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update -qq
+          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends skopeo
           skopeo copy --all \
             --dest-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
