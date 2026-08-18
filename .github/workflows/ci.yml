@@ -60,6 +60,16 @@ jobs:
           # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
           # apt config, not per-command flags: it has to cover `install`, which
           # fetches from the same mirror, and not just `update`.
+          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
+          # runners point at, and it stalls (issue #35). Retries and timeouts are
+          # not enough on their own: apt gives up on azure, falls back to
+          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
+          # and sits there until the job timeout. Measured on ubuntu-24.04 --
+          # every noble entry came back Ign: and the step hung 20 minutes.
+          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+            /etc/apt/sources.list.d/*.list 2>/dev/null || true
           printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
           sudo apt-get update
@@ -86,6 +96,16 @@ jobs:
           # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
           # apt config, not per-command flags: it has to cover `install`, which
           # fetches from the same mirror, and not just `update`.
+          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
+          # runners point at, and it stalls (issue #35). Retries and timeouts are
+          # not enough on their own: apt gives up on azure, falls back to
+          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
+          # and sits there until the job timeout. Measured on ubuntu-24.04 --
+          # every noble entry came back Ign: and the step hung 20 minutes.
+          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+            /etc/apt/sources.list.d/*.list 2>/dev/null || true
           printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
           sudo apt-get update
@@ -176,6 +196,16 @@ jobs:
           # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
           # apt config, not per-command flags: it has to cover `install`, which
           # fetches from the same mirror, and not just `update`.
+          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
+          # runners point at, and it stalls (issue #35). Retries and timeouts are
+          # not enough on their own: apt gives up on azure, falls back to
+          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
+          # and sits there until the job timeout. Measured on ubuntu-24.04 --
+          # every noble entry came back Ign: and the step hung 20 minutes.
+          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+            /etc/apt/sources.list.d/*.list 2>/dev/null || true
           printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
           sudo apt-get update
@@ -200,6 +230,16 @@ jobs:
           # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
           # apt config, not per-command flags: it has to cover `install`, which
           # fetches from the same mirror, and not just `update`.
+          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
+          # runners point at, and it stalls (issue #35). Retries and timeouts are
+          # not enough on their own: apt gives up on azure, falls back to
+          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
+          # and sits there until the job timeout. Measured on ubuntu-24.04 --
+          # every noble entry came back Ign: and the step hung 20 minutes.
+          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+            /etc/apt/sources.list.d/*.list 2>/dev/null || true
           printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
           sudo apt-get update
