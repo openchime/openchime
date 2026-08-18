@@ -37,6 +37,10 @@ on:
         description: 'Build and verify everything, publish nothing, tag nothing'
         type: boolean
         default: false
+      skip_repo_smoke:
+        description: 'Skip the published-repository smoke test (use only while the control plane is not yet serving DIST_BASE_URL)'
+        type: boolean
+        default: false
 
 concurrency:
   group: release
@@ -980,6 +984,11 @@ jobs:
       # exercises dnf itself. First reported by a RHEL user is not where this
       # should surface; see the FIXED-pending note in docs/BACKLOG.md.
       - name: Smoke the published apt repository
+        # Skipped only when explicitly asked. The default stays a hard failure:
+        # this step existing to fail while DIST_BASE_URL is unserved is a
+        # recorded decision, not an oversight, and auto-detecting the outage
+        # would silently mask a genuinely broken repository later.
+        if: ${{ !inputs.skip_repo_smoke }}
         run: |
           set -euo pipefail
           sudo curl -fsSL "$DIST_BASE_URL/openchime-archive-keyring.gpg" \
@@ -1004,6 +1013,13 @@ jobs:
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openchimed
           openchimed --version
+
+      - name: Note the skipped smoke test
+        if: ${{ inputs.skip_repo_smoke }}
+        run: |
+          echo "::warning::published-repository smoke test SKIPPED by request -- "\
+            "nothing has verified that the apt repository installs"
+          echo '> :warning: The published-repository smoke test was skipped.' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Tag the release and attach the tarballs
         env:

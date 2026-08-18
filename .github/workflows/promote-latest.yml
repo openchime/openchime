@@ -1,0 +1,71 @@
+# TEMPORARY. Delete once it has run.
+#
+# Moves ghcr.io/<owner>/openchime:latest onto an already-published version tag.
+#
+# Release 2 published apt, dnf and the image, then failed at the repository smoke
+# test because the control plane is not yet serving DIST_BASE_URL. That failure
+# skipped the two steps after it, so :latest was left pointing at release 1 while
+# release 2 is live in both package repositories. The GitHub release and its
+# assets were restored by hand; this closes the remaining gap.
+#
+# Re-running release.yml is NOT the fix: the number is derived from tags, so it
+# would allocate release 3 rather than finish release 2.
+name: promote-latest
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Published version to point :latest at'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  promote:
+    name: move :latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/openchime
+    steps:
+      - name: Install skopeo
+        run: |
+          set -euo pipefail
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+            /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends skopeo
+
+      # Refuse to point :latest at something that is not there.
+      - name: Verify the source tag exists
+        run: |
+          set -euo pipefail
+          skopeo inspect --raw \
+            --creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+            "docker://${IMAGE}:${{ inputs.version }}" > /tmp/src.json
+          python3 -c "import json;d=json.load(open('/tmp/src.json'));print('mediaType:',d.get('mediaType'));print('arch entries:',len(d.get('manifests',[])))"
+
+      # --all copies the whole manifest list, not just this runner's architecture,
+      # and re-points registry-side so the digest is preserved exactly.
+      - name: Move :latest
+        run: |
+          set -euo pipefail
+          skopeo copy --all \
+            --src-creds  "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+            --dest-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+            "docker://${IMAGE}:${{ inputs.version }}" \
+            "docker://${IMAGE}:latest"
+
+      - name: Verify they now match
+        run: |
+          set -euo pipefail
+          a=$(skopeo inspect --raw --creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" "docker://${IMAGE}:${{ inputs.version }}" | sha256sum | cut -d' ' -f1)
+          b=$(skopeo inspect --raw --creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" "docker://${IMAGE}:latest" | sha256sum | cut -d' ' -f1)
+          echo "version=$a"; echo "latest =$b"
+          [ "$a" = "$b" ] || { echo "::error::latest does not match ${{ inputs.version }}"; exit 1; }
+          echo "latest -> ${{ inputs.version }}"
