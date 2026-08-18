@@ -172,6 +172,31 @@ QEMU against `arm64 packages` 1m 28s natively on `ubuntu-22.04-arm`; total run
 15m 25s, of which the image job is 12m 37s. Splitting the image across native
 runners and joining with a manifest list would take the release under 10 minutes.
 
+**FIXED 2026-08-17 — as a side effect of removing Docker, not as its own fix.**
+The `image` job is now a matrix over `ubuntu-22.04` and `ubuntu-22.04-arm`,
+building with **buildah** on a runner of the target architecture, and a separate
+`image-manifest` job joins the two per-architecture tags into the `:VERSION`
+manifest list. QEMU is gone: `docker/setup-qemu-action` and
+`docker/setup-buildx-action` are no longer referenced anywhere. This is exactly
+the remedy the *Verified* note above proposed; it happened because the whole
+pipeline was moved off Docker (ARCH-36), which required replacing the buildx
+build regardless.
+
+**Measured** — dry run 32082302886 (2026-08-17), the same kind of run as the
+30954057012 baseline above, so the two are comparable:
+
+| | QEMU (30954057012) | native (32082302886) |
+|---|---|---|
+| image, amd64 | *(one job, both arches)* 12m 37s | 1m 02s |
+| image, arm64 | | 53s |
+| **total run** | **15m 25s** | **4m 32s** |
+
+The image is no longer the critical path: at ~1 minute per architecture it is
+beaten by `build + unit tests` (1m 59s) and `windows binaries` (1m 31s). The
+prediction above was "under 10 minutes"; the actual is 4m 32s, because the
+`packages` jobs also dropped their container (1m 06s / 1m 11s, having previously
+paid for a `dnf install` of a toolchain on every run).
+
 ## 7. A missing release credential is discovered twenty-five minutes in
 
 No job asserts that the release secrets exist before work starts. Each is read
@@ -2060,6 +2085,119 @@ the rest is wrong.
 **Verified** — release.yml `publish` and `winget` both carry
 `if: inputs.dry_run == false`; dry run 30954057012 shows both SKIPPED;
 `git tag -l 'release-*'` is empty as of 2026-08-06.
+
+## 125. Nothing tests the container image any more
+
+Removing Docker from the project (ARCH-36) removed the only test that exercised
+the image that ships. CI's `integration` job used to bring up the Compose stack
+and drive the **deployed image** as a black box; it now starts the daemon binary
+natively and drives that instead. The two assertions are unchanged; what they run
+against is not.
+
+The image is still built by the release, with buildah, and pushed to GHCR. It is
+pulled by nothing, started by nothing, and asserted about by nothing — in CI or
+in the release.
+
+*Impact:* A fault confined to the `Dockerfile`, `entrypoint.sh` (ARCH-39) or the
+Alpine/musl build reaches GHCR unchallenged, and from there the hosted model's
+Fly Machines (ARCH-76 model 3), which is the image's only remaining consumer. The
+daemon's own behaviour is unaffected — it is covered by the black-box assertions
+and the in-process suites.
+
+*Shape of a fix:* run the built image with a daemonless runtime (`podman run`)
+in the `image` job and assert `/healthz`, before the manifest is published. That
+reintroduces no Docker; podman is daemonless and reads the same OCI image.
+
+**Verified** — `.github/workflows/ci.yml` `integration` job starts `./openchimed`
+directly; `grep -rn 'docker' .github/workflows/` matches only comments and
+`docker://` transport URIs; nothing in either workflow pulls or runs
+`ghcr.io/*/openchime`.
+
+## 126. The .rpm is published without any install ever being attempted
+
+The release used to install each built package inside a pristine `debian:bookworm`
+and `rockylinux:9` container and run the binary, and to smoke the published apt
+**and** dnf repositories the same way. Both container steps were removed with the
+rest of the project's Docker usage (ARCH-36).
+
+The `.deb` retained a weaker version of the check — it is installed on the runner
+itself, which is Ubuntu rather than Debian and not pristine. **The `.rpm` retained
+nothing.** No hosted runner can install one, so the rpm path now has no install
+coverage at any point: not from the built package, not from the published
+repository.
+
+*Impact:* An rpm that builds and signs correctly but fails to install — a bad
+`Requires:`, a file conflict, a scriptlet fault — is published to the dnf
+repository and discovered by a RHEL-family user. The identical-binary check
+proves the payload is the same file the `.deb` carries, and the apt repository
+smoke shares the signing key and object layout, so the failure modes left
+uncovered are specifically rpm metadata and scriptlets.
+
+*Shape of a fix:* `podman run --rm rockylinux:9` for both the clean-room install
+and the dnf repository smoke. Daemonless, no Docker, and a near-literal
+translation of the two steps that were deleted.
+
+**Verified** — `.github/workflows/release.yml` `packages` job installs only the
+`.deb` (`apt-get install ./$DIST/openchimed_*.deb`); the `publish` job's smoke
+step is named "Smoke the published apt repository" and contains no dnf path.
+
+## 127. Local development no longer approximates the deployment target
+
+The Compose stack capped the daemon at 256MB and 1 CPU to stand in, loosely, for
+Fly.io's smallest instance (ARCH-4, REQ-210). It was deleted with the rest of the
+Docker usage (ARCH-36) and deliberately not replaced: `make run` applies no
+resource limits at all.
+
+*Impact:* Behaviour under the memory and CPU ceiling the product actually targets
+is unexercised until deploy. The previous fidelity was already poor — Docker
+shares the host kernel where Fly runs Firecracker microVMs, and its `cpus` limit
+did not reproduce shared-vCPU throttling — but "loose approximation" and "none"
+are different things, and this is the latter.
+
+*Shape of a fix:* `systemd-run --scope -p MemoryMax=256M -p CPUQuota=100%` around
+the dev daemon reproduces the cgroup ceiling more accurately than Compose did,
+needs no container, and could be a `make run-constrained` target.
+
+**Verified** — the `run` target in `Makefile` sets paths, ports and bootstrap
+users and no limits; `docker-compose.yml`, which carried `mem_limit: 256m` and
+`cpus: "1"`, is deleted.
+
+## 128. The daemon exits 0, silently, when it cannot start
+
+`oc_netloop_run` (`daemon/netloop.c`) returns `-1` without printing anything for
+every one of its startup failures: the listening socket, `bind`, `listen`,
+`epoll_create1`, `oc_blobstore_open` and `oc_xferpool_start`. `main` does not
+check the return value — it falls through to `oc_push_stop`, prints
+`shutdown complete` and returns **0**.
+
+So a daemon that cannot serve is indistinguishable from one that was asked to
+stop, and it reports success to whatever started it.
+
+*Impact:* Under systemd this is the bad case. `Type=simple` with a clean exit 0
+means the unit is considered to have run successfully and `Restart=on-failure`
+does not fire, so a daemon that cannot open its blob directory stops and stays
+stopped with `systemctl status` showing no error and the journal showing
+`healthz listening on :8080` as its final word. The health check compounds it:
+`/healthz` binds and answers *before* the protocol loop starts, so a monitor
+polling it sees a healthy daemon for the fraction of a second before exit, and
+an operator reading the log sees a successful boot.
+
+Found while porting the integration test off Compose (item 125). The stack had
+been masking it: every path default points into `/data`, which exists in the
+image, so `oc_blobstore_open("/data/blobs")` only fails outside a container.
+Roughly forty minutes went into diagnosing a daemon that logged nothing wrong.
+
+*Shape of a fix:* one `fprintf` per failure branch naming the operation and
+`strerror(errno)`, and `main` returning non-zero when `oc_netloop_run` does.
+Both are small and independent; the exit code is the one that changes systemd's
+behaviour.
+
+**Verified** — `netloop.c` `oc_netloop_run` has six bare `return -1` paths with
+no diagnostic; `main.c:434` calls it as a void statement and `main.c:439-440`
+prints `shutdown complete` and `return 0` unconditionally. Reproduced locally:
+with `OPENCHIME_BLOB_DIR` unset, the daemon prints through
+`blob storage = local disk`, never prints the `storage maintenance` line that
+follows a successful blobstore open, and exits 0.
 
 ## Recorded and closed without a fix
 

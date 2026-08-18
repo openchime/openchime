@@ -130,11 +130,14 @@ rather than client state (ARCH-88/REQ-201).
 | `OPENCHIME_CRED` | TUI | Credential passed as `user:password`, so a password never lands in the process arguments. |
 | `OPENCHIME_TEST_DIR` | Win32 GUI | Enables the in-app automation hook — a file command channel plus the screenshot / state-dump drop directory — set by `scripts/gui_drive.sh` (which exports it across the WSL boundary via `WSLENV`) and used by `scripts/gui_smoke.sh` through it. `scripts/gui_snap.sh` neither sets nor reads it: that script captures the window from outside with `PrintWindow`. Dev only. |
 
-## Compose-only
+## Compose-only — none, and there is no Compose
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `OPENCHIME_BUCKET` | `openchime-dev` | Read by `docker-compose.yml` to create a MinIO bucket in the dev stack. **The daemon never reads it** — its bucket is `OPENCHIME_S3_BUCKET`. Per ARCH-38 the MinIO service currently has no consumer, since the blob backend defaults to the local filesystem and is not wired into compose. |
+This section listed `OPENCHIME_BUCKET` (default `openchime-dev`), read by
+`docker-compose.yml` to create a MinIO bucket in the dev stack. The daemon never
+read it — its bucket is `OPENCHIME_S3_BUCKET` — and per ARCH-38 the MinIO service
+never had a consumer. The Compose stack, the MinIO service and `.env.example`
+were all deleted when Docker was removed from the project (ARCH-36), so the
+variable now has no reader anywhere and is not set by anything.
 
 ## Test-only knobs
 

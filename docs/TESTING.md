@@ -16,8 +16,8 @@ eats text somebody meant literally), plus in-process
 integration suites that drive the real epoll server over TLS (`itest_netloop`,
 `itest_tls`, `itest_slow_blob`) and the headless client app-core
 (`test_client_core.c`) — all compiled into one `build/tests` binary by `make test`.
-The integration tier drives the deployed container over the compose stack
-(`make integration`). A deterministic codec fuzzer (45k iterations by default —
+The black-box integration tier drives a natively-run daemon over a real socket
+(the `integration` job in `.github/workflows/ci.yml`; §3.2). A deterministic codec fuzzer (45k iterations by default —
 30k random + 15k framed; clean under
 ASan/UBSan) and a concurrency load test (`tests/bench_load.c`, driven by
 `Scripts/bench.sh`) round it out.
@@ -170,7 +170,7 @@ source of truth for the frames means the integration tests also dogfood the
 codec the real client will ship.
 
 The test client lives under `tests/` (`tests/e2e_client.c`, the black-box client
-built as `build/e2e_client` and driven by `make integration`). It speaks
+built as `build/e2e_client` and driven by CI's `integration` job). It speaks
 `HELLO`/`WELCOME`, `AUTH_CHALLENGE`/`AUTH`/`AUTH_OK`, and
 `SEND`/`SEND_ACK`/`BROADCAST` — the auth-and-message vertical, and nothing
 further. `CLIENT_ACK`, backfill, version rejection and session revocation are
@@ -184,25 +184,45 @@ client; `shared/tls.c` already provides a TOFU-pinning client, so socket-level
 integration scenarios are no longer gated. `tests/itest_tls.c` exercises the
 handshake + pinning end-to-end today.
 
-### 3.2 Runner: the existing Docker Compose stack
+### 3.2 Runner: a natively-run daemon in CI
 
-Integration tests run **against the Docker Compose environment already defined
-for local dev** (ARCH-36/38/39), not a second bespoke environment — the same
-`daemon` + `minio` + `minio-init` topology, so what CI exercises is the image
-that ships. A wrapper script, `Scripts/test-integration.sh`, brings the
-stack up, runs the scenario driver, and tears it down with a non-zero exit on
-any failed scenario. It sits alongside the existing `run.sh`/`stop.sh`/`reset.sh`
-wrappers (ARCH-40).
+Integration tests run **against the daemon binary CI just built**, started
+directly on the runner with the environment the Compose `daemon` service used to
+set, then driven by `build/e2e_client`.
+
+This replaced the previous runner and is a **weaker arrangement**, so the change
+is worth stating rather than glossing. Integration tests used to run against the
+Docker Compose environment defined for local dev (ARCH-36/38/39) — the same
+`daemon` + `minio` + `minio-init` topology — chosen precisely so that what CI
+exercised was *the image that ships*. The project no longer uses Docker
+anywhere (ARCH-36), so that stack, and the `Scripts/test-integration.sh` wrapper
+that drove it, were deleted rather than reimplemented.
+
+**Consequence: no test anywhere exercises the published container image.** The
+release builds it with buildah and pushes it to GHCR; nothing pulls it, starts
+it or asserts anything about it. A fault confined to the `Dockerfile`, the
+entrypoint (ARCH-39) or the Alpine/musl build would not be caught before it
+reached users. The daemon's own behaviour remains covered by the assertions
+below and by the in-process suites.
+
+**There is also no local runner any more.** The two assertions live inline in
+the `integration` job of `.github/workflows/ci.yml`; `make integration` is gone.
+`make build/e2e_client` still builds the driver, so you can point it at a daemon
+you started yourself (`make run` starts one on `127.0.0.1:8443`).
 
 ### 3.3 Scenarios
 
 Every scenario below is implemented and runs in CI. **Which tier runs it is the
-part that matters**, because the compose stack proves something the in-process
-suites cannot — that the shipped *image* works — and the in-process suites prove
-things the compose stack does not reach.
+part that matters**, because the two tiers reach different things: the black-box
+tier drives the daemon over a real socket from a separate process, and the
+in-process suites reach states a black-box client cannot drive.
 
-**Against the deployed container (`make integration`,
-`Scripts/test-integration.sh`) — two checks:**
+Note what this list no longer claims. The black-box tier used to prove that the
+shipped *image* works; it now proves that the built *binary* works. Nothing
+proves the image works (§3.2).
+
+**Black-box, against a natively-run daemon (the `integration` job in
+`.github/workflows/ci.yml`) — two checks:**
 
 - **Liveness:** `/healthz` returns `200 OK` (ARCH-25).
 - **The auth-and-message vertical over TLS:** `build/e2e_client` handshakes,
@@ -248,10 +268,10 @@ Jobs:
 
 - **`build`** — installs `libsqlite3-dev`, then runs `make` and `make test`.
   Fast feedback on compile + unit tests.
-- **`integration`** — the deployed image end-to-end on the Compose stack:
-  build the image, bring the stack up, wait for `/healthz`, then drive the
-  protocol vertical over TLS with the e2e client. This is the automation of the
-  manual steps in the README's "Verify" section.
+- **`integration`** — the daemon end-to-end, natively: build it and the e2e
+  client, start the daemon on the runner, wait for `/healthz`, then drive the
+  protocol vertical over TLS with the e2e client. It used to build the image and
+  bring up the Compose stack instead; see §3.2 for what that change gave up.
 - **`core`** — a standalone compile-check of the client app-core (ARCH-74).
 - **`windows`** — the Windows cross-compile of the TUI and GUI
   (`make windows-tui windows-gui`), so the ported client stays building.
@@ -475,21 +495,26 @@ outbound wires (enrollment, ARCH-84; push, ARCH-85). Verified end to end.
    control-plane gateway, which verifies the request signature and relays it (ARCH-85;
    control-plane side). The cross-language crypto (mbedTLS sign ↔ .NET verify) matches by construction.
 
-### Run it — one command (recommended)
+### Run it — scripted, against a control plane you started yourself
 
-Assuming the sibling layout `../openchime-saas`:
+This is now the only way to run it. There used to be a one-command
+`docker compose -f docker-compose.federated.yml up --build` that stood up
+Postgres + the control plane + a hands-off-enrolling daemon in one go; that file
+was deleted along with every other use of Docker in the project (ARCH-36), and
+the hands-off enrollment shortcut it orchestrated (a shared volume for
+`OPENCHIME_ENROLL_CODE_FILE` plus an `enroll-init` step calling the dev reserve
+endpoint) went with it. **Bringing up Postgres and the control plane is now
+your job.**
+
+Start the control plane directly (e.g. `dotnet run` with `Push:Log:Enabled=true`
+against a Postgres you started), then:
 
 ```sh
-docker compose -f docker-compose.federated.yml up --build
+scripts/demo-federated.sh http://localhost:5176
 ```
 
-That stands up Postgres + the control plane (with the dev log push provider + the dev
-enrollment-reserve shortcut) + a daemon that **enrolls hands-off**: the daemon writes its
-`oce1` code to a shared volume (`OPENCHIME_ENROLL_CODE_FILE`), an `enroll-init` step reserves it
-via the dev endpoint, and the daemon activates (`OPENCHIME_ENROLL_WAIT_SECS` lets it wait for the
-reserve, then come up Active with push enabled). The daemon serves on `localhost:8443`.
-
-Then drive a client against it:
+It scripts the real console reserve — no dev endpoint needed — and drives the
+same flow. Then drive a client against the daemon it left running:
 
 ```sh
 make demo-client
@@ -505,18 +530,14 @@ push[Apns] would notify token tok-bob-demo (channel 1, ...)
 
 That is the daemon→central push wire firing end to end (signed, contentless).
 
-### Run it — scripted, against a control plane you started yourself
-
-If you're running the control plane directly (e.g. `dotnet run` with
-`Push:Log:Enabled=true`), `scripts/demo-federated.sh http://localhost:5176` does the same
-flow against it (it scripts the real console reserve, no dev endpoint needed).
-
 ### OIDC-relay login (the identity wire)
 
 `scripts/demo-oidc.sh` proves the other daemon↔central wire (ARCH-56/57): the control
 plane **mints** an ES256 identity token and a daemon in **OIDC mode verifies** it against
 the central key it pins. It generates an ES256 keypair (private → the control plane's
-signing key, public → the daemon), starts both, mints a token via the dev endpoint
+signing key, public → the daemon), starts both — **it needs a Postgres already
+listening on `localhost:5432`, which it used to start itself via the sibling
+repo's compose stack and no longer does** — mints a token via the dev endpoint
 `POST /api/dev/oidc/token` (gated on `Oidc:DevMintEnabled` — never in prod), and runs:
 
 ```sh

@@ -23,8 +23,9 @@ DAEMON_SRC := daemon/main.c daemon/config.c daemon/migrate.c daemon/dbwriter.c d
 SRC        := $(SHARED_SRC) $(DAEMON_SRC)
 HDRS       := $(wildcard shared/*.h daemon/*.h)
 
-# Vendored, pinned mbedTLS (scripts/build_mbedtls.sh) — one version across
-# local/CI/Docker. Link order matters for static archives: tls -> x509 -> crypto.
+# Vendored, pinned mbedTLS (scripts/build_mbedtls.sh) — one version across local
+# builds, CI, the release, and the container image. Link order matters for static
+# archives: tls -> x509 -> crypto.
 MBEDTLS_DIR  := third_party/mbedtls-3.6.2
 MBEDTLS_INC  := $(MBEDTLS_DIR)/include
 MBEDTLS_A    := $(MBEDTLS_DIR)/library/libmbedtls.a
@@ -79,7 +80,7 @@ endif
 TUI_INC   := $(CORE_INC) -Iclient/tui -Iclient/shared -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
-.PHONY: all run test check-opcodes integration core tui bench clean s3-smoke windows-tui windows-gui tuikit-demo demo-client
+.PHONY: all run test check-opcodes core tui bench clean s3-smoke windows-tui windows-gui tuikit-demo demo-client
 
 all: $(BIN)
 
@@ -115,9 +116,13 @@ $(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(HDRS) $(wildcard tests/*.h cli
 	$(CC) $(CFLAGS) -O0 -g $(INC) $(CORE_INC) -Itests \
 	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MBEDTLS_LIBS) -lsqlite3 -lresolv -lpthread -o $@
 
-# Black-box end-to-end integration against the containerized daemon (compose).
-integration: build/e2e_client
-	Scripts/test-integration.sh
+# There is no `integration` target any more. It ran Scripts/test-integration.sh,
+# which drove the daemon through a Docker Compose stack; the project no longer
+# uses Docker anywhere, and the script was deleted rather than reimplemented. The
+# two assertions it made now live in the `integration` job of
+# .github/workflows/ci.yml, against a natively-run daemon. `make build/e2e_client`
+# still builds the client that job drives, if you want to point it at a daemon of
+# your own. See docs/TESTING.md §3.
 
 # The e2e client links only the shared wire modules (no daemon internals).
 build/e2e_client: tests/e2e_client.c $(SHARED_SRC) $(wildcard shared/*.h) $(MBEDTLS_A) | build

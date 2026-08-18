@@ -11,7 +11,7 @@ are four ways a dependency enters the build; each row below says which:
 | **Vendored (committed)** | Single-file source committed under `third_party/` | Yes — frozen in git |
 | **Fetched at build** | Downloaded + built by a `scripts/build_*.sh` (gitignored output) | Version-pinned in the script |
 | **System / OS package** | Provided by the host or base image, linked at build | Pinned by the OS, not by us |
-| **Container image** | Pulled by Docker / Compose for deployment or dev | Per the image tag |
+| **Container image** | Base of the published deployment image; not used for dev or test | Per the image tag |
 
 **License posture:** everything linked into the shipping **daemon** and **TUI**
 is permissive — MIT, Apache-2.0, Public Domain, or (for the *optional, dynamically
@@ -119,36 +119,46 @@ and that machine then persists no credential at all (headless / no D-Bus). They 
   reaches DNS through `DnsQuery` and the credential store through Credential
   Manager.
 
-## 4. Container images — deployment & dev (Docker / Compose)
+## 4. Container images — deployment only
 
 | Image / tool | Version | Purpose | License | Source |
 |--------------|---------|---------|---------|--------|
-| **Alpine Linux** | `3.20` | Build + runtime base image | mixed (base OS) | https://alpinelinux.org |
-| **MinIO** | digest-pinned | S3-compatible object storage, **dev/test only** | AGPL-3.0 | https://github.com/minio/minio |
-| **MinIO Client (`mc`)** | digest-pinned | One-shot bucket init (compose `minio-init`) | AGPL-3.0 | https://github.com/minio/mc |
-| **curl** | digest-pinned | One-shot enrolment reserve in the federated compose | curl licence (MIT/X derivative) | https://github.com/curl/curl-docker |
+| **Alpine Linux** | `3.20` | Build + runtime base of the published image | mixed (base OS) | https://alpinelinux.org |
 
-- **MinIO** runs as its own container in `docker-compose.yml` to simulate a
-  managed S3-compatible store (ARCH-38). It is **not part of the daemon** and its
-  AGPL does not reach any OpenChime binary. It currently has no consumer — the
-  daemon's S3 blob backend (ARCH-70) defaults to the local filesystem and is not
-  wired into compose.
-- Runtime Alpine packages: `sqlite-libs`, `sqlite`, `ca-certificates`.
-- **Pinned by digest**, not by tag: a digest is immutable, where a release tag can
-  be moved. Each `image:` line carries the date its digest was resolved and the
-  `docker manifest inspect` command that re-resolves it. `postgres:17` in the
-  federated compose is a major-version tag and is deliberately left as one — it
-  is the upstream's own stability contract.
+One image, and it is an **output** rather than a tool: the OCI image published to
+GHCR for the hosted model (ARCH-20/76). Runtime Alpine packages: `sqlite-libs`,
+`ca-certificates`.
+
+**Everything else that was in this table is gone**, because the project no
+longer runs containers for development or testing (ARCH-36). Removed with the
+Compose stacks: **MinIO** and **MinIO Client** (AGPL-3.0, the dev-only
+S3 simulation for ARCH-38, which never had a consumer), **curl**
+(digest-pinned, the one-shot enrolment reserve in the federated stack) and
+**`postgres:17`** (the federated stack's database — now something you start
+yourself; see docs/TESTING.md).
+
+The digest-pinning convention those entries documented no longer applies to
+anything: the sole remaining image reference is the `FROM alpine:3.20` in
+`Dockerfile`, a tag rather than a digest, which is the upstream's own stability
+contract for a base OS.
 
 ## 5. Build & dev tooling (not linked into the product)
 
 - **C99 toolchain** — gcc or clang (+ `ar`); the whole tree builds with
   `-std=c99 -Wall -Wextra`.
 - **make** — the only build system (no CMake/autotools for OpenChime itself).
-- **bash, curl, tar, bzip2** — used by `scripts/build_mbedtls.sh` and the Docker
+- **bash, curl, tar, bzip2** — used by `scripts/build_mbedtls.sh` and the image
   build.
 - **pkg-config** — detects libsecret for the TUI.
-- **Docker + Docker Compose** — local platform + e2e integration harness.
+- **zig** (`0.13.0`, MIT) — **release only**, not needed for a local build.
+  `zig cc` builds the shipped Linux daemon against glibc 2.34, the oldest
+  supported target (ARCH-20). Pinned by SHA-256 per architecture in
+  `.github/workflows/release.yml`.
+- **buildah / skopeo** — **release only**. Build and push the OCI image and move
+  the `:latest` tag, daemonlessly.
+- **Docker and Docker Compose are NOT used**, anywhere, by anything — not to
+  build, not to test, not locally, not in CI. This is a standing constraint;
+  see ARCH-36 and the header of `.github/workflows/release.yml`.
 
 ## 6. Vestigial — present locally but in NO current build
 
