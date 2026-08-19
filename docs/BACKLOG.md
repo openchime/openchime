@@ -14,9 +14,13 @@ consequence of that order rather than an open item. Work whose implementation
 lives in the separate control-plane repository is likewise out of scope, and is
 listed at the end so the boundary is visible rather than implied.
 
-**Ordering: item 1 is the lowest impact, item 124 the highest.** Impact is what
-the issue costs a user or an operator, judged on three things in order — whether
-it breaks something that ships and is used, whether it blocks a capability the
+**Ordering: item 1 is the lowest impact, item 128 the highest.** Items 129-135
+were appended after that ordering was set (2026-08-19) and sit outside it: they
+are in the order they were written, not in impact order, and 134/135 are already
+fixed.
+
+Impact is what the issue costs a user or an operator, judged on three things in
+order — whether it breaks something that ships and is used, whether it blocks a capability the
 product claims, and how many people meet it. So a defect in a working feature
 outranks an absent one, and both outrank hygiene. **The number is a position,
 not an identifier**: it moves when items are added or closed. Cite an item by
@@ -2198,6 +2202,198 @@ prints `shutdown complete` and `return 0` unconditionally. Reproduced locally:
 with `OPENCHIME_BLOB_DIR` unset, the daemon prints through
 `blob storage = local disk`, never prints the `storage maintenance` line that
 follows a successful blobstore open, and exits 0.
+
+## 129. A desktop notification cannot be acted on
+
+`tray_init` (`client/gui/win32/winmain.c:697`) sets `uFlags = NIF_ICON | NIF_TIP`
+and never sets `uCallbackMessage`, and nothing calls `NIM_SETVERSION`. The tray
+icon therefore has no callback window message, so the shell has nowhere to send
+`NIN_BALLOONUSERCLICK` — clicking the notification does nothing at all. Nor is
+there any record of which `(workspace, channel)` raised the last balloon, so
+even with a callback there is nothing to select.
+
+*Impact:* The notification tells you a message arrived and then refuses to take
+you to it: you read the toast, then go and find the conversation by hand. Every
+comparable client — Slack included — treats the click as the point of the
+notification, and this one is a poster rather than a control. It is also the
+cheapest of the notification items to fix, which is why it sits at the top of
+them.
+
+*Shape of a fix:* set `uCallbackMessage` and `NIM_SETVERSION(NOTIFYICON_VERSION_4)`
+in `tray_init`, remember the `(slot, cid)` `notify_toast` was raised for, and on
+`NIN_BALLOONUSERCLICK` switch to that workspace, select that channel and
+`show_and_focus` the window. The tray icon also has no context menu and no
+left-click restore, which is the same message plumbing.
+
+**Verified** — read from `winmain.c:697-712`; no `NIN_`, `uCallbackMessage` or
+`NIM_SETVERSION` appears anywhere in the file.
+
+## 130. There are no notification sounds, of any kind
+
+REQ-138 specifies a chosen sound per event type — new message, priority-person
+message (REQ-135), a call starting (REQ-285), a DM arriving while you are
+already in that conversation — plus a single mute-all switch that leaves the
+individual choices intact. None of it exists: `PlaySound`, `sndPlaySound` and
+any other audio call appear nowhere under `client/`.
+
+*Impact:* The client is silent. A notification you have to be looking at the
+screen to receive is half a notification, and the audible cue is the half that
+works when the window is behind something. The per-event part matters as much as
+the sound itself — REQ-138 argues the point directly: a cue is only useful if it
+distinguishes, and one sound for everything trains you to ignore it.
+
+*Shape of a fix:* `PlaySound(..., SND_ASYNC | SND_FILENAME | SND_NODEFAULT)` at
+the same place `notify_toast` is called, gated on the same decision, with a
+per-event preference row and one mute-all. The work is not the API — it is
+choosing and shipping the .wav set, and deciding whether a sound plays when the
+toast is suppressed because you are looking at the conversation (Slack's answer:
+yes, for a DM, and it is a separate setting for exactly that reason).
+
+**Verified** — `grep -rn "PlaySound\|sndPlaySound\|MessageBeep" client/` returns
+only two `MessageBeep`-suppression comments in dialog key handling.
+
+## 131. The taskbar says nothing: no badge, no flash
+
+There is no `ITaskbarList3::SetOverlayIcon` and no `FlashWindowEx` in the
+client. Unread state exists in the model and is drawn in the sidebar, and the
+window is the only place it appears.
+
+*Impact:* With the window minimised or behind something, the taskbar button is
+identical whether you have no unread messages or forty. This is the state a chat
+client spends most of its day in, and it is also the fallback that still works
+when OS notifications are suppressed — by Focus Assist, by the per-app Windows
+setting, or by item 132's single point of failure. Slack ships both, and splits
+the flash into *always* / *only when idle* because the always case is
+intrusive for some people and essential for others.
+
+*Shape of a fix:* an overlay icon carrying the unread count (or a dot past a
+threshold) refreshed where the sidebar's unread is computed, and `FlashWindowEx`
+on a mention with the two-way preference. Both are plain Win32 and need no new
+dependency; the overlay icon needs a `CoCreateInstance(CLSID_TaskbarList)` which
+the client already has COM initialised for.
+
+**Verified** — `grep -rn "ITaskbarList\|SetOverlayIcon\|FlashWindowEx" client/`
+returns nothing.
+
+## 132. The notification delivery mechanism is hardcoded, and not a choice
+
+`notify_toast` (`winmain.c:715`) is the whole OS-notification surface: a tray
+balloon, `NIF_INFO` through `Shell_NotifyIconW`. The comment above it
+(`winmain.c:642`) records the reasoning — the client is pure C (ARCH-82) and
+WinRT's `ToastNotificationManager` normally means a C++/WinRT projection plus a
+registered AppUserModelID, while Windows 10+ renders a balloon through the toast
+system anyway.
+
+That is true, and it has three consequences the comment does not draw out:
+
+- **It is one point of failure.** `notify_toast` returns immediately when
+  `g_tray_live` is 0 (`winmain.c:716`), so if `Shell_NotifyIcon(NIM_ADD)` fails —
+  a busy shell at logon is the common case — every notification for the rest of
+  the session is dropped in silence.
+- **A balloon cannot express what a toast can:** no buttons, no inline reply, no
+  avatar or image, no grouping, no replace-by-tag, and hard truncation at 64
+  characters of title and 256 of body (`winmain.c:719-720`), applied without a
+  word to the user.
+- **The user has no say.** Slack's Windows client offers "Deliver notifications
+  via…" with three answers — Windows Action Center, Windows Action Center
+  (abbreviated), and Slack's own built-in toast — and the third exists precisely
+  because the OS channel has broken before (it did on Windows 24H2). Here the
+  only related preference is Off / Count / Preview (`winmain.c:655`), which
+  governs the *content*, not the mechanism.
+
+*Impact:* On a machine where the shell channel misbehaves there is no fallback
+and no setting to reach for, and on every machine the notification is the least
+capable of the three shapes Windows can render.
+
+*Shape of a fix:* a delivery preference with three values, matching Slack's
+shape — *OS notification* / *OpenChime's own* / *none* — over two real backends.
+The WinRT one is more available than the comment assumes: WinRT is COM
+underneath, so `RoGetActivationFactory` + `IToastNotificationManagerStatics` is
+callable from C with no C++/WinRT projection and no new toolchain. Identity is
+already solved for the packaged build — `packaging/windows/msix/AppxManifest.xml`
+declares `<Application Id="OpenChime">`, so an MSIX install has a package
+identity and needs no shortcut hack; the Inno Setup install
+(`packaging/windows/openchime.iss`) would need a Start-menu shortcut carrying an
+explicit AppUserModelID plus `SetCurrentProcessExplicitAppUserModelID`. Keep the
+balloon as the fallback when neither identity is present. The own-toast backend
+is a layered always-on-top borderless window; the drawing already exists in
+`toast_push` (`winmain.c:1310`) but is hosted in the main window, which is the
+one place a notification is no use.
+
+**Verified** — read from `winmain.c:642-723`; `notify_toast` is the only caller
+of `Shell_NotifyIconW` with `NIF_INFO`, and the only notification preference is
+the three-way `NOTIFY_OFF/COUNT/FULL` at `winmain.c:655` surfaced at
+`winmain.c:5710`.
+
+## 133. Keywords and priority people do not raise a desktop notification
+
+REQ-135 makes keywords part of the `mentions` level: a channel set to *mentions*
+notifies on a keyword hit as it does on an @-mention, and the client half of the
+rule is built — `oc_model_keyword_hit()` exists (`client/core/model.c:845`) and
+the transcript highlights hits (`winmain.c:3102`, via `oc_keyword_match`).
+
+The notification path does not consult it. At the `OC_NOTIFY_MENTIONS` branch
+(`winmain.c:17049`) the only test is `oc_mention_targets(...)` against your
+own name; `oc_model_keyword_hit` is never called from `winmain.c`, and neither
+is anything about priority people. Thread replies are likewise absent — the
+decision runs over channel high-water marks, which a thread reply does not move
+in the same way.
+
+*Impact:* You can define keywords and priority people, see the editor confirm
+them, watch them highlight in the transcript — and never be notified about one.
+The feature reads as built and silently is not, which is worse than its absence:
+a user who relies on a keyword to catch something will miss it.
+
+*Shape of a fix:* add the keyword and priority-person tests beside the mention
+test in the same branch, so all three ways a message can be "for me" are asked
+in one place; thread replies need the notify pass to look at thread marks as
+well as channel ones, which is the larger of the two.
+
+**Verified** — `grep -n "oc_model_keyword_hit" client/gui/win32/winmain.c`
+returns nothing; the `OC_NOTIFY_MENTIONS` branch tests `oc_mention_targets` only.
+
+## 134. A soft newline did not continue a list
+
+**FIXED (2026-08-19).** `case VK_RETURN` in the composer's key handler ran
+`ed_insert(L"\n")` for Shift+Enter with no regard for the line it was leaving. So
+the list buttons marked the line the caret was on and nothing else: `- one`,
+Shift+Enter, and you were on a bare line with no marker, with every item after
+the first to be typed by hand. Reported as the list buttons "only working on the
+first entry", which is exactly what it looked like.
+
+*Fix:* `ed_newline()` (`winmain.c:10354`) reads the current line's block marker
+with the same `ed_block_marker()` the toolbar writes with, and continues it —
+bullet, ordered (numbering from the line above, so `3.` yields `4.`) or quote.
+An empty item ends the list instead of adding another: the marker on the current
+line is removed and no newline is inserted, which is the standard way out and the
+only one that does not require deleting characters you did not type.
+
+**Verified** — driven through the test hook against a daemon on 127.0.0.1:8443
+and captured: `- one` + Shift+Enter yields a second `- ` item; `1. first` +
+Shift+Enter yields `2. `; a further Shift+Enter on the empty item drops the
+marker and leaves a plain line.
+
+## 135. Formatting with no selection left markdown residue in the composer
+
+**FIXED (2026-08-19).** `ed_fmt_inline()` (`winmain.c:10184`) had one answer for
+an empty selection: insert the delimiter pair and park the caret between them.
+With the caret at the end of `hello` that produced `hello**`, which cannot parse
+under MARKDOWN.md §2's word-boundary rule — so the live renderer (WIN-90) had no
+reason to hide it, and two asterisks nobody typed stayed on screen. Pressing the
+button on an empty composer left a bare `**` and lit the send button, so the
+residue was sendable.
+
+*Fix:* a caret-only press now takes the **word the caret is in or against** and
+wraps that, as every editor with a bold button does, and a second press unwraps
+it — the two existing unwrap tests are re-run against the chosen word so a
+`*hello*` with the caret inside it comes apart. The empty pair is still inserted
+when there is genuinely nothing to wrap (whitespace, or an empty composer),
+because there it is the only thing the press can mean and the next character
+makes it parse.
+
+**Verified** — driven through the test hook and captured: with the caret after
+`hello`, Ctrl+B renders a bold `hello` and no asterisks; a second Ctrl+B returns
+it to plain. Before the change the same sequence left `hello**` on screen.
 
 ## Recorded and closed without a fix
 
