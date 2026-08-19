@@ -201,6 +201,13 @@ static float composer_tb(void) { return composer_toolbar_on() ? COMPOSER_TB : 0.
  * icons, which is what it did (WIN-111). A real gap, plus the clamp in
  * composer_geom(), makes the collision impossible rather than unlikely. */
 #define COMPOSER_GAP    UIS(6.0f)
+/* The action row's gutter — the inset from the composer box's edges to the "+"
+ * on the left and the send split-button on the right. It was a bare 6 at four
+ * call sites while the text field above used COMPOSER_PAD (12), so the buttons
+ * sat closer to the box edge than the text they belong to and the two ends
+ * could drift apart independently. One name, one number, and the row now lines
+ * up with the field: same inset, same edge. */
+#define COMPOSER_GUTTER COMPOSER_PAD
 static float composer_chrome(void) {
     return COMPOSER_MT + composer_tb() + COMPOSER_PAD * 2 + COMPOSER_GAP +
            COMPOSER_ACTIONS + COMPOSER_MB;
@@ -1195,6 +1202,9 @@ enum {
 };
 static D2D1_RECT_F g_fmt_btn[FMT_COUNT];
 static int         g_fmt_hover = -1;
+/* Which half of the composer's send split-button the pointer is over:
+ * 0 neither, 1 Send, 2 the "send later" dropdown. */
+static int         g_send_hover = 0;
 
 /* ---- sign-in view (WIN-2, REQ-263/020) -------------------------------------
  * Slack signs in in two steps — workspace address first, credentials once the
@@ -6951,6 +6961,19 @@ static void composer_geom(float bx0, float bx1, float h,
     }
 }
 
+/* Is there something the send split-button can act on? BOTH halves are gated on
+ * the same answer — Send and Send later differ in when the message leaves, not
+ * in what makes one possible — and three places ask (the painter, the click
+ * handler, the accessibility name). One function, so a disabled-looking button
+ * cannot also be a live one. An archived channel is read-only (REQ-035): the
+ * daemon refuses the send regardless, this is so you can see why first. */
+static int composer_ready(void) {
+    const oc_model *cm = model();
+    const oc_channel *cc = cm && g_sel ? oc_model_channel((oc_model *)cm, g_sel) : NULL;
+    if (cc && cc->archived) return 0;
+    return ed_len() > 0;
+}
+
 static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     float top = h - g_composer_h;
     fill(rt, rf(x0, top, x0 + w, h), OC_COL_BASE);
@@ -6972,13 +6995,13 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
     float sq = COMPOSER_BTN;
     float cy = cy_act;
 
-    g_attach_btn = rf(bx0 + 6, cy, bx0 + 6 + sq, cy + sq);
+    g_attach_btn = rf(bx0 + COMPOSER_GUTTER, cy, bx0 + COMPOSER_GUTTER + sq, cy + sq);
 
     /* A monochrome line icon, not a colour glyph: this is chrome, and it sat
      * next to a grey "+" and a grey paper plane as the only coloured control in
      * the whole shell. Colour is for content — messages, reactions, and the
      * glyphs you pick in the picker. */
-    g_emoji_btn = rf(bx0 + 6 + sq, cy, bx0 + 6 + sq * 2, cy + sq);
+    g_emoji_btn = rf(bx0 + COMPOSER_GUTTER + sq, cy, bx0 + COMPOSER_GUTTER + sq * 2, cy + sq);
 
     /* Mention. The '@' trigger already worked when typed; ARCH-82 says the GUI
      * is affordance-driven, so it needs to be visible too.
@@ -6988,8 +7011,8 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
      * than the box, and @ ended up beneath Send — caught as
      * composer.mention+composer.send (WIN-111). Send is the one that must always
      * be there, so the optional icons drop off from the right. */
-    float left_limit = bx1 - 6 - sq - UIS(30);
-    g_at_btn = rf(bx0 + 6 + sq * 2, cy, bx0 + 6 + sq * 3, cy + sq);
+    float left_limit = bx1 - COMPOSER_GUTTER - sq - UIS(30);
+    g_at_btn = rf(bx0 + COMPOSER_GUTTER + sq * 2, cy, bx0 + COMPOSER_GUTTER + sq * 3, cy + sq);
     if (g_at_btn.right > left_limit) g_at_btn = rf(0, 0, 0, 0);
     if (g_emoji_btn.right > left_limit) g_emoji_btn = rf(0, 0, 0, 0);
     if (g_attach_btn.right > left_limit) g_attach_btn = rf(0, 0, 0, 0);
@@ -7017,24 +7040,73 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
      * plane rather than an up-arrow, which read as "scroll" more than "send". */
     /* An archived channel is read-only (REQ-035). The daemon refuses the send
      * regardless; this is so you can see why before you type it. */
-    const oc_model *cm = model();
-    const oc_channel *cc = cm && g_sel ? oc_model_channel((oc_model *)cm, g_sel) : NULL;
-    int ro = (cc && cc->archived);
-    int has_text = !ro && ed_len() > 0;
+    int has_text = composer_ready();
     /* Send later (REQ-224). The queue, the sweep and the Scheduled tab were all
      * built and NOTHING could create a row: the feature was unreachable from
-     * the product. A chevron beside Send, where Slack puts it. */
+     * the product. A chevron beside Send, where Slack puts it.
+     *
+     * A SPLIT BUTTON, not a chevron floating in the padding. The
+     * first version drew a bare "\u25BE" glyph in the gap to the left of the
+     * send square: it had no body, no edge and no hover, so it read as a
+     * stray mark rather than a control, and nothing said it belonged to Send.
+     * Now the two share one rounded body with a hairline between them —
+     * Windows' own split-button shape, and Slack's. */
     /* BESIDE the field, not over it: placed inside its rect at first, where the
      * composer's own mouse-down swallowed every click on it. */
-    g_sched_btn = rf(bx1 - 6 - sq - 26, cy + 6, bx1 - 6 - sq - 4, cy + sq - 6);
-    if (has_text)
-        draw_text(rt, "\u25BE", g_meta,
-                  rf(g_sched_btn.left, g_sched_btn.top, g_sched_btn.right, g_sched_btn.bottom),
-                  OC_COL_MUTED);
-    else g_sched_btn = rf(0, 0, 0, 0);
-    g_send_btn = rf(bx1 - 6 - sq, cy, bx1 - 6, cy + sq);
-    fill_round(rt, g_send_btn, 8.0f, has_text ? OC_COL_ACCENT : OC_COL_INPUT);
-    if (!has_text) stroke_round(rt, g_send_btn, 8.0f, OC_COL_BORDER, 1.0f);
+    /* The dropdown half is ALWAYS THERE — drawn disabled when there is nothing
+     * to schedule, not withheld. Two earlier shapes were wrong for the same
+     * reason in opposite directions: appearing with the first character moved
+     * Send 22 DIP left, out from under the pointer reaching for it; reserving
+     * the space but painting nothing kept the geometry still but left the
+     * feature invisible until you typed — and being unfindable is the defect
+     * this control was added to fix. A greyed half says both "this exists" and
+     * "not yet", which is what a disabled control is for. */
+    float chev = UIS(22);                     /* the dropdown half */
+    float gx1 = bx1 - COMPOSER_GUTTER, gx0 = gx1 - sq - chev;
+    D2D1_RECT_F body = rf(gx0, cy, gx1, cy + sq);
+    g_send_btn  = rf(gx0, cy, gx0 + sq, cy + sq);
+    g_sched_btn = rf(gx0 + sq, cy, gx1, cy + sq);
+    fill_round(rt, body, 8.0f, has_text ? OC_COL_ACCENT : OC_COL_INPUT);
+    if (!has_text) stroke_round(rt, body, 8.0f, OC_COL_BORDER, 1.0f);
+    if (has_text) {
+        /* Hover lights ONE half, which is the whole point of a split button:
+         * you can see which of the two actions the click will take before you
+         * take it. White over the accent rather than a second fill, so the
+         * corners stay the body's. Nothing lights while disabled — a hover
+         * response is a promise the click cannot keep. */
+        D2D1_RECT_F hov = g_send_hover == 1 ? g_send_btn
+                        : g_send_hover == 2 ? g_sched_btn : rf(0, 0, 0, 0);
+        if (hov.right > hov.left) {
+            D2D1_ROUNDED_RECT rr;
+            /* Clipped to the body so the highlight cannot round the seam or
+             * bleed past the outer edge. */
+            ID2D1RenderTarget_PushAxisAlignedClip(rt, &hov, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            rr.rect = body; rr.radiusX = rr.radiusY = 8.0f;
+            ID2D1RenderTarget_FillRoundedRectangle(rt, &rr, paint_alpha(0xFFFFFF, 0.16f));
+            ID2D1RenderTarget_PopAxisAlignedClip(rt);
+        }
+    }
+    {
+        /* The seam. Inset top and bottom: a full-height rule cuts the body in
+         * two, a short one divides it. On the accent it is white at a third;
+         * disabled it is the same border the body is outlined in, or it would
+         * be the one bright mark on a grey control. */
+        D2D1_RECT_F seam = rf(gx0 + sq - 0.5f, cy + 5, gx0 + sq + 0.5f, cy + sq - 5);
+        if (has_text) ID2D1RenderTarget_FillRectangle(rt, &seam, paint_alpha(0xFFFFFF, 0.35f));
+        else          fill(rt, seam, OC_COL_BORDER);
+        /* Two strokes, not the "\u25BE" glyph: the glyph is a solid triangle
+         * that sits off the optical centre of its em box, and next to a line
+         * icon it reads as a different family. */
+        uint32_t cc2 = has_text ? 0xFFFFFF : OC_COL_FAINT;
+        float ccx = (g_sched_btn.left + g_sched_btn.right) / 2 + 0.5f;
+        float ccy = (cy + cy + sq) / 2, d = 3.2f;
+        D2D1_POINT_2F p0, p1, p2;
+        p0.x = ccx - d; p0.y = ccy - d / 2;
+        p1.x = ccx;     p1.y = ccy + d / 2;
+        p2.x = ccx + d; p2.y = ccy - d / 2;
+        ID2D1RenderTarget_DrawLine(rt, p0, p1, paint_with(cc2), 1.6f, NULL);
+        ID2D1RenderTarget_DrawLine(rt, p1, p2, paint_with(cc2), 1.6f, NULL);
+    }
     draw_lucide(rt, OC_ICON_SEND, rf(g_send_btn.left + 8, g_send_btn.top + 8,
                                      g_send_btn.right - 8, g_send_btn.bottom - 8),
                 has_text ? 0xFFFFFF : OC_COL_FAINT);
@@ -10139,12 +10211,45 @@ static void ed_fmt_inline(const WCHAR *d) {
         g_ed_anchor = a; g_ed_caret = b - 2 * dl;
         return;
     }
-    if (a >= b) {                       /* no selection: the pair, caret between */
-        g_ed_caret = g_ed_anchor = a;
-        ed_insert_n(d, dl);
-        ed_insert_n(d, dl);
-        g_ed_caret = g_ed_anchor = (a + dl <= g_ed_len) ? a + dl : g_ed_len;
-        return;
+    if (a >= b) {
+        /* No selection: take the WORD the caret is in or against, the way every
+         * editor with a bold button does. The old behaviour — insert the pair
+         * and sit between them — is what left markdown residue all over the
+         * composer: with the caret after "hello" it produced "hello**", which
+         * cannot parse (MARKDOWN.md §2's word-boundary rule), so it did not
+         * hide, and two asterisks nobody typed stayed on screen. Pressing B on
+         * a word now bolds the word. */
+        int ws = a, we = a;
+        while (ws > 0 && !ed_is_space(g_ed[ws - 1])) ws--;
+        while (we < g_ed_len && !ed_is_space(g_ed[we])) we++;
+        if (we > ws) { a = ws; b = we; }
+        else {
+            /* Genuinely nothing to wrap — in whitespace or an empty composer.
+             * The pair with the caret between it is then the ONLY thing the
+             * press can mean ("start typing bold here"), and typing makes it
+             * parse immediately. */
+            g_ed_caret = g_ed_anchor = a;
+            ed_insert_n(d, dl);
+            ed_insert_n(d, dl);
+            g_ed_caret = g_ed_anchor = (a + dl <= g_ed_len) ? a + dl : g_ed_len;
+            return;
+        }
+        /* The word may already be wrapped — "*hello*" with the caret in it is
+         * the second press, and it has to come off, so both unwrap tests run
+         * again against the word we just chose. */
+        if (a >= dl && b + dl <= g_ed_len &&
+            !memcmp(g_ed + a - dl, d, db) && !memcmp(g_ed + b, d, db)) {
+            ed_delete_range(b, b + dl);
+            ed_delete_range(a - dl, a);
+            g_ed_anchor = g_ed_caret = b - dl;
+            return;
+        }
+        if (b - a >= 2 * dl && !memcmp(g_ed + a, d, db) && !memcmp(g_ed + b - dl, d, db)) {
+            ed_delete_range(b - dl, b);
+            ed_delete_range(a, a + dl);
+            g_ed_anchor = g_ed_caret = b - 2 * dl;
+            return;
+        }
     }
     /* The closer first, so the opener's offset is still the one we measured. */
     g_ed_caret = g_ed_anchor = b; ed_insert_n(d, dl);
@@ -10228,6 +10333,55 @@ static void ed_fmt_block(int kind) {
      * asked for. */
     g_ed_caret = le;
     g_ed_anchor = had_sel ? ls : le;
+}
+
+/* A soft newline (Shift+Enter) inside a list or a quote CONTINUES it.
+ *
+ * Without this the toolbar could only mark the line the caret was on: you got
+ * "- one", pressed Shift+Enter, and landed on a bare line with no marker, so
+ * every item after the first had to be typed by hand — which is why the list
+ * buttons read as "only working on the first entry". Every editor that has
+ * lists continues them here, and the continuation is the whole reason the
+ * marker is a prefix rather than a mode.
+ *
+ * An EMPTY item ends the list instead of adding another one: the marker on the
+ * current line is removed and no newline is inserted, which is the standard way
+ * out and the only one that does not require deleting characters you did not
+ * type. Numbering follows the line above (`3.` yields `4.`), so a list built by
+ * continuation reads in order; the toolbar's own numbering already worked that
+ * way for a multi-line selection.
+ */
+static void ed_newline(void) {
+    int ls = g_ed_caret, le = g_ed_caret, at = 0, len = 0, kind = -1, i, empty = 1;
+    while (ls > 0 && g_ed[ls - 1] != L'\n') ls--;
+    while (le < g_ed_len && g_ed[le] != L'\n') le++;
+    if      (ed_block_marker(ls, FMT_BULLET,  &at, &len)) kind = FMT_BULLET;
+    else if (ed_block_marker(ls, FMT_ORDERED, &at, &len)) kind = FMT_ORDERED;
+    else if (ed_block_marker(ls, FMT_QUOTE,   &at, &len)) kind = FMT_QUOTE;
+    if (kind < 0) { ed_insert(L"\n"); return; }
+
+    for (i = at + len; i < le; i++)
+        if (g_ed[i] != L' ' && g_ed[i] != L'\t') { empty = 0; break; }
+    ed_begin_edit();
+    if (empty) {                        /* the way out of the list */
+        ed_delete_range(at, at + len);
+        g_ed_caret = g_ed_anchor = at;
+        return;
+    }
+    {
+        WCHAR pre[20];
+        if (kind == FMT_ORDERED) {
+            int num = 0;
+            for (i = at; i < g_ed_len && g_ed[i] >= L'0' && g_ed[i] <= L'9'; i++)
+                num = num * 10 + (g_ed[i] - L'0');
+            wsprintfW(pre, L"\n%d. ", num + 1);
+        } else lstrcpyW(pre, kind == FMT_QUOTE ? L"\n> " : L"\n- ");
+        /* From the END of the item, not from mid-word: Shift+Enter with the
+         * caret in the middle of "one" would otherwise split the text across
+         * the marker and leave half of it above. */
+        g_ed_caret = g_ed_anchor = le;
+        ed_insert_n(pre, lstrlenW(pre));
+    }
 }
 
 /* One entry point for both the toolbar and the chords, so they cannot drift. */
@@ -10611,7 +10765,7 @@ static int ed_key(HWND hwnd, WPARAM vk) {
         /* The completion popover claims Enter first — that is what makes Tab and
          * Enter interchangeable for accepting one. */
         if (g_n_ac > 0) { ac_accept(); changed = 1; break; }
-        if (shift) { ed_insert(L"\n"); changed = 1; break; }
+        if (shift) { ed_newline(); changed = 1; break; }
         composer_send();
         return 1;
     case VK_TAB:
@@ -11098,8 +11252,9 @@ static void a11y_publish_scene(const oc_model *m) {
                  ATOK(AT_MENTION, 0));
         acc_push(items, &n, OC_ACC_BUTTON, "composer.send",
                  ed_len() ? "Send" : "Send, nothing to send", g_send_btn, ATOK(AT_SEND, 0));
-        acc_push(items, &n, OC_ACC_BUTTON, "composer.schedule", "Send later", g_sched_btn,
-                 ATOK(AT_SCHEDMENU, 0));
+        acc_push(items, &n, OC_ACC_BUTTON, "composer.schedule",
+                 composer_ready() ? "Send later" : "Send later, nothing to schedule",
+                 g_sched_btn, ATOK(AT_SCHEDMENU, 0));
         static const char *FMT_AID[FMT_COUNT] = {
             "bold", "italic", "strike", "code", "quote", "bullets", "numbers"
         };
@@ -13495,7 +13650,9 @@ static int on_click(HWND hwnd, int x, int y) {
         }
         return 1;
     }
-    if (in_rect(g_sched_btn, x, y)) { sched_menu_open(x, y); return 1; }
+    /* A disabled half still CONSUMES the click — it is a button, and a button
+     * you can see is not a hole through to whatever is behind it. */
+    if (in_rect(g_sched_btn, x, y)) { if (composer_ready()) sched_menu_open(x, y); return 1; }
     if (in_rect(g_send_btn, x, y))   { composer_send(); return 1; }
     /* Overlay row clicks (main area only). */
     {
@@ -17329,6 +17486,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (in_rect(g_fmt_btn[i], (float)mx, (float)my)) { fh = i; break; }
             if (fh != g_fmt_hover) { g_fmt_hover = fh; InvalidateRect(hwnd, NULL, FALSE); }
         }
+        {   /* Send split-button hover, same reasoning as above: two
+             * rects, asked every move, kept out of the surface hover machine. */
+            int sh2 = !composer_ready() ? 0
+                    : in_rect(g_send_btn,  (float)mx, (float)my) ? 1
+                    : in_rect(g_sched_btn, (float)mx, (float)my) ? 2 : 0;
+            if (sh2 != g_send_hover) { g_send_hover = sh2; InvalidateRect(hwnd, NULL, FALSE); }
+        }
         if (g_ed_dragging) { ed_mouse_move(hwnd, (float)mx, (float)my); return 0; }
         /* Link hover (WIN-112). UNCONDITIONAL, before the rail/sidebar/transcript
          * split below: the first version of this sat inside the branch for the
@@ -17597,8 +17761,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case AT_SCHEDMENU:
             /* The same menu the chevron opens, built where it is built — a second
              * copy of its items here would be a second thing to keep in step. */
-            sched_menu_open((g_sched_btn.left + g_sched_btn.right) / 2,
-                            (g_sched_btn.top + g_sched_btn.bottom) / 2);
+            if (composer_ready())
+                sched_menu_open((g_sched_btn.left + g_sched_btn.right) / 2,
+                                (g_sched_btn.top + g_sched_btn.bottom) / 2);
             break;
         case AT_THREADFILTER:
             g_threads_unread = !g_threads_unread;
