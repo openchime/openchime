@@ -17,10 +17,10 @@ explicitly, in one of four forms:
 
 That marker is what keeps this document honest: the present-perfect voice states
 what the finished system does, so without it a reader cannot tell a shipped
-guarantee from an intention. **Every marked requirement has a corresponding entry
-in [BACKLOG.md](./BACKLOG.md)**, which is the project's only issue list and the
-place priority is expressed — this document says *what*, the backlog says *what
-is missing and what it costs*. The markers were assigned by checking the code,
+guarantee from an intention. **Every marked requirement has a corresponding
+issue** in the [tracker](https://github.com/openchime/openchime/issues), which is the project's only issue list and the
+place priority is expressed — this document says *what*, an issue says *what is
+missing and what it costs*. The markers were assigned by checking the code,
 not by reading a prior status document.
 
 The daemon is a feature-complete v1 chat core: messaging, auth, roles, channels,
@@ -211,7 +211,7 @@ the requirement says so explicitly rather than implying one.
   because the daemon verifies and the control plane mints while nothing carries
   the token between them — `scripts/demo-oidc.sh` proves the mint↔verify contract
   with a dev endpoint that deliberately bypasses the browser flow. That last one
-  is the open item ([BACKLOG.md](./BACKLOG.md)); the first two are settled.
+  is the open item (#137); the first two are settled.
 
 ### 1.3 Authorization and Roles
 
@@ -598,7 +598,7 @@ the requirement says so explicitly rather than implying one.
   do not say.)
 
   **Partially built, and the unbuilt half is the DND half.** Custom status with
-  expiry shipped (WIN-53, migration 0027) and is shown beside names in the member
+  expiry shipped (migration 0027) and is shown beside names in the member
   pane and profile. **Do-not-disturb is still self-only:** `dnd_enabled` /
   `dnd_start_min` / `dnd_end_min` live on the model's *own-user* block, and
   `oc_user` — the roster entry for everybody else — carries no DND field at all,
@@ -1728,7 +1728,7 @@ None are yet backed by an architecture decision.*
     which would hand it every user-facing operation and would die when that owner
     signs out everywhere (REQ-182).
   - **Paging is a keyset cursor**, never an offset — the same reasoning as search
-    (WIN-38): a message posted mid-export must not make a row repeat or vanish.
+   : a message posted mid-export must not make a row repeat or vanish.
   - **DMs and private channels are the point and the danger.** Including them is
     what makes it a compliance tool, so it is a deliberate, separately audited act.
   - **The self-hosted operator already has the database**, so this earns its keep in
@@ -1897,7 +1897,7 @@ REQ-269, whose accessibility half is a real open decision.*
   conversation tomorrow. The id is derived from the thing's identity, never from
   where it happens to be drawn.
 
-  *Status: built on Win32 (WIN-110, 2026-08-02).* Every rail and shelf row,
+  *Status: built on Win32 (2026-08-02).* Every rail and shelf row,
   conversation, message, composer control, formatting button, filter chip, tab,
   pane row and modal button carries an id and — where it is a control rather than
   content — an `InvokePattern`, so a client can press it rather than click at a

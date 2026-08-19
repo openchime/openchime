@@ -35,7 +35,7 @@ struct oc_net {
     char          host[256];
     int           port;
     char         *token;
-    char         *invite;       /* one-shot signup token (WIN-32), else NULL */
+    char         *invite;       /* one-shot signup token, else NULL */
     char         *store_path;   /* local store for token/pin persistence, or NULL */
     oc_secret    *secret;       /* borrowed OS keyring for the session token, or NULL */
     char          client_type[32]; /* synced-settings bucket id (default "tui") */
@@ -225,7 +225,7 @@ typedef struct {
     int      mode;        /* 0 idle, 1 upload, 2 download */
     uint64_t id;          /* attachment id (0 for an upload until UPLOAD_READY) */
     FILE    *fp;          /* the local file (source for upload, sink for download) */
-    /* An in-memory download (WIN-17): `fp` is NULL and chunks accumulate here
+    /* An in-memory download: `fp` is NULL and chunks accumulate here
      * instead. Inline image thumbnails must not write a file — a client stores
      * nothing locally (ARCH-88) — and a temp file for rendering would be exactly
      * the cache that decision removed. */
@@ -239,7 +239,7 @@ typedef struct {
     uint32_t acked_seq;   /* upload: chunks the server has acked */
     int      ended;       /* upload: UPLOAD_END has been sent */
     uint64_t channel;     /* upload: channel to link the finished attachment into */
-    /* What the finished upload is FOR (WIN-47). 0 posts it as a message, which is
+    /* What the finished upload is FOR. 0 posts it as a message, which is
      * every ordinary upload; 1 makes it the user's avatar and posts nothing. Without
      * this an avatar arrived in the transcript as a bare image nobody sent. */
     uint8_t  purpose;
@@ -297,7 +297,7 @@ static void xfer_notice(disp_ctx *ctx, uint8_t phase, const char *msg) {
 }
 
 /* Tear down the active transfer (closing the file), leaving it idle. */
-/* Cap on an in-memory download (WIN-17). Big enough for any screenshot someone
+/* Cap on an in-memory download. Big enough for any screenshot someone
  * pastes into chat, small enough that a hostile size cannot be used to grow the
  * client without bound. Anything larger falls back to "download to a file". */
 #define OC_INLINE_MAX (8u * 1024u * 1024u)
@@ -525,7 +525,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 e->user_id = ue[i].user_id;
                 e->status = ue[i].role;
                 e->op = ue[i].disabled;
-                e->message_id = ue[i].avatar_id;      /* WIN-47 */
+                e->message_id = ue[i].avatar_id;      /* */
                 e->body = malloc(ue[i].display_name.len + 1);
                 if (e->body) { memcpy(e->body, ue[i].display_name.ptr, ue[i].display_name.len); e->body[ue[i].display_name.len] = '\0'; }
                 /* REQ-289: the profile fields now travel with the roster, so a
@@ -887,7 +887,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 if (!e) continue;
                 e->channel_id = ne[i].channel_id;
                 e->op = ne[i].level;
-                e->status = ne[i].muted;      /* WIN-40: distinct from the level */
+                e->status = ne[i].muted;      /* distinct from the level */
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_THREAD_SUMMARY) {
@@ -1097,7 +1097,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     continue;
                 }
                 if (x->purpose == 1) {
-                    /* An avatar (WIN-47): claim it with SET_AVATAR instead of posting
+                    /* An avatar: claim it with SET_AVATAR instead of posting
                      * it. The daemon checks that the uploader is the setter, and its
                      * reclaim sweep excludes avatars — an attachment no message
                      * references would otherwise be collected as an orphan. */
@@ -1263,7 +1263,7 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_INVITE_LIST) {
-            /* WIN-46. Cap-safe like the webhook list above: the decoder drains the
+            /* Cap-safe like the webhook list above: the decoder drains the
              * whole frame and keeps what fits, so an over-long list cannot desync
              * the stream. */
             oc_invite_entry iv[OC_MAX_INVITES]; uint16_t count = 0;
@@ -1475,7 +1475,7 @@ static int run_connection(oc_net *n, int reconnecting,
                                 : oc_slice_str(cred);
             oc_slice pass = sep ? oc_slice_str(sep + 1) : (oc_slice){ (const uint8_t *)"", 0 };
             if (n->invite && n->invite[0]) {
-                /* Signup (WIN-32): creates the account AND authenticates, so the
+                /* Signup: creates the account AND authenticates, so the
                  * reply below is the same AUTH_OK. Spent once — clearing it here
                  * means a later reconnect re-auths with the session token rather
                  * than replaying an invite the server has already consumed. */
@@ -1664,7 +1664,7 @@ static int run_connection(oc_net *n, int reconnecting,
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SEARCH && c->body) {
-                /* Parse HERE, in the core, with the shared parser (WIN-39): the wire
+                /* Parse HERE, in the core, with the shared parser: the wire
                  * carries predicates, not a grammar, so the daemon never has to agree
                  * with us about what "from:" means — and the TUI gets the same
                  * behaviour for free because it calls the same function. */
@@ -1680,7 +1680,7 @@ static int run_connection(oc_net *n, int reconnecting,
                 memset(&s, 0, sizeof s);
                 s.query      = oc_slice_str(sq.text);
                 s.limit      = 50;
-                s.before_id  = c->message_id;          /* WIN-38 paging cursor */
+                s.before_id  = c->message_id;          /* paging cursor */
                 s.from_name  = oc_slice_str(sq.from);
                 s.in_channel = oc_slice_str(sq.in);
                 s.has_mask   = (uint8_t)sq.has;
@@ -2099,7 +2099,7 @@ static int run_connection(oc_net *n, int reconnecting,
             }
             if (c->type == OC_CMD_FETCH) {
                 /* Same DOWNLOAD_BEGIN, no file: the bytes come back as an event
-                 * (WIN-17). Silently skipped while another transfer is running —
+                 *. Silently skipped while another transfer is running —
                  * a thumbnail must never interrupt a real download, and the
                  * frontend simply re-requests on a later frame. */
                 if (xfer.mode == 0) {
@@ -2254,7 +2254,7 @@ static void *net_thread(void *arg) {
                      (backoff_ms + 999) / 1000);
             push_err(n->to_ui, msg);
         }
-        /* Publish the deadline so a frontend can tick it down (WIN-55). The
+        /* Publish the deadline so a frontend can tick it down. The
          * error string can only say the delay once, which is why the GUI banner
          * showed a number that never moved. */
         {

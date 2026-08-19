@@ -1,6 +1,5 @@
 /*
- * OpenChime Win32 GUI — the two palettes and the switch between them (WIN-26,
- * REQ-262). See theme.h.
+ * OpenChime Win32 GUI — the two palettes and the switch between them (REQ-262). See theme.h.
  */
 
 #include "theme.h"

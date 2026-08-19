@@ -64,15 +64,15 @@ enum {
     OC_EV_NOTIFY_PREF,     /* a NOTIFY_PREFS entry: channel_id + level(op) */
     OC_EV_USER_UPDATED,    /* a USER_UPDATED: user_id + role(status) + disabled(op) */
     OC_EV_INVITE,          /* an INVITE_CREATED: body=token, op=role, server_time=expires_at */
-    /* WIN-46. One outstanding invite (message_id=invite_id, op=role,
+    /* One outstanding invite (message_id=invite_id, op=role,
      * server_time=expires_at, user_id=created_by); END terminates a list; REVOKED is
      * the ack. No token: only its hash is stored, so a list cannot carry one. */
     OC_EV_INVITE_ROW,
     OC_EV_INVITE_END,
     OC_EV_INVITE_REVOKED,
-    /* A PROFILE_INFO (WIN-47/53): user_id + the fields, carried in the ev's slices. */
+    /* A PROFILE_INFO (53): user_id + the fields, carried in the ev's slices. */
     OC_EV_PROFILE_INFO,
-    /* WIN-82: one census row (channel_id + count in `count`); BEGIN clears. */
+    /* one census row (channel_id + count in `count`); BEGIN clears. */
     /* REQ-182: one live session (message_id=id, server_time=created, pinned_at=last
      * seen, channel_id=expiry, op=is-current, body=device label); END terminates. */
     OC_EV_SESSION_ROW,
@@ -258,24 +258,24 @@ enum {
     OC_CMD_CREATE_WEBHOOK,  /* mint an incoming webhook for `channel_id`: body = label */
     OC_CMD_LIST_WEBHOOKS,   /* list `channel_id`'s webhooks */
     OC_CMD_DELETE_WEBHOOK,  /* delete a webhook: message_id = webhook_id */
-    /* WIN-46 / WIN-48. message_id carries the invite or webhook id; `flag` the
+    /* / message_id carries the invite or webhook id; `flag` the
      * desired disabled state for SET_WEBHOOK_STATE. */
     OC_CMD_LIST_INVITES,
     OC_CMD_REVOKE_INVITE,
     OC_CMD_SET_WEBHOOK_STATE,
     OC_CMD_ROTATE_WEBHOOK,
-    /* WIN-40 / WIN-52: channel_id + op (muted), and channel_id + message_id. */
+    /* / channel_id + op (muted), and channel_id + message_id. */
     OC_CMD_SET_MUTE,
     OC_CMD_SET_READ_CURSOR,
-    /* WIN-53 / WIN-47: body=emoji, body2=text, server_time=expiry / body=title,
+    /* / body=emoji, body2=text, server_time=expiry / body=title,
      * body2=timezone. */
     OC_CMD_SET_STATUS,
     OC_CMD_SET_PROFILE,
     OC_CMD_GET_PROFILE,
-    OC_CMD_LIST_FILE_CHANNELS,   /* WIN-82 */
+    OC_CMD_LIST_FILE_CHANNELS,   /* */
     OC_CMD_LIST_SESSIONS,        /* REQ-182 */
     OC_CMD_SET_NOTIFY_DEFAULT,   /* REQ-134: op = level */
-    OC_CMD_SET_AVATAR,           /* WIN-47: message_id = attachment id, 0 clears */
+    OC_CMD_SET_AVATAR,           /* message_id = attachment id, 0 clears */
     OC_CMD_OPEN_GROUP_DM,        /* REQ-056: gids[0..n_gids) */
     OC_CMD_ADD_EMOJI,            /* REQ-072: body = name, message_id = attachment */
     OC_CMD_DELETE_EMOJI,         /* REQ-072: body = name */

@@ -2,7 +2,7 @@
  * OpenChime Win32 GUI — theme palette (ARCH-82, REQ-262).
  *
  * The palette is a runtime array rather than a set of literals, so a theme can
- * be switched while the app runs (WIN-26). Call sites are unchanged: each
+ * be switched while the app runs. Call sites are unchanged: each
  * OC_COL_* still reads as a plain 0xRRGGBB expression, it just resolves through
  * `oc_theme[]` now. Nothing may use one in a static initialiser for that reason.
  *
@@ -45,7 +45,7 @@ enum { OC_THEME_DARK = 0, OC_THEME_LIGHT = 1, OC_THEME_SYSTEM = 2 };
 
 extern uint32_t oc_theme[TH_COUNT];
 
-/* COLOUR SCHEMES (WIN-78). A scheme is a PAIR: the nav rail — the app's main
+/* COLOUR SCHEMES. A scheme is a PAIR: the nav rail — the app's main
  * branded surface, the thing you see before you read anything — and the accent
  * that marks selection, links and primary buttons. They are picked together
  * because they are seen together; choosing an accent that fights the rail was

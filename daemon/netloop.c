@@ -1076,7 +1076,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             j->user_id = c->user_id;
             j->search_limit = sq.limit;
             if (oc_job_set_body(j, sq.query.ptr, sq.query.len) != 0) return -1;
-            /* WIN-38/39: the cursor and the filters. */
+            /* 39: the cursor and the filters. */
             j->message_id = sq.before_id;
             j->sq_from   = sq.from_name.len  ? strndup((const char *)sq.from_name.ptr, sq.from_name.len)   : NULL;
             j->sq_in     = sq.in_channel.len ? strndup((const char *)sq.in_channel.ptr, sq.in_channel.len) : NULL;
@@ -1185,7 +1185,7 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_dbwriter_submit(dbw, j);
             continue;
         }
-        /* Invite management (REQ-026, WIN-46) + webhook lifecycle (WIN-48). */
+        /* Invite management (REQ-026) + webhook lifecycle. */
         if (hdr.msg_type == OC_MSG_LIST_INVITES) {
             oc_job *j = oc_job_new(OC_JOB_LIST_INVITES, c->conn_id);
             if (!j) return -1;
@@ -2281,7 +2281,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             ents[i].disabled = r->ulist[i].disabled;
             ents[i].email = oc_slice_str(r->ulist[i].email ? r->ulist[i].email : "");
             ents[i].display_name = oc_slice_str(r->ulist[i].display_name ? r->ulist[i].display_name : "");
-            ents[i].avatar_id = r->ulist[i].avatar_id;      /* WIN-47 */
+            ents[i].avatar_id = r->ulist[i].avatar_id;      /* */
             ents[i].title = oc_slice_str(r->ulist[i].title ? r->ulist[i].title : "");
             ents[i].timezone = oc_slice_str(r->ulist[i].timezone ? r->ulist[i].timezone : "");
             ents[i].status_emoji = oc_slice_str(r->ulist[i].status_emoji ? r->ulist[i].status_emoji : "");
@@ -3003,7 +3003,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         for (size_t i = 0; i < r->n_nprefs && n < OC_MAX_NOTIFY_PREFS; i++) {
             ents[n].channel_id = r->nprefs[i].channel_id;
             ents[n].level = r->nprefs[i].level;
-            ents[n].muted = r->nprefs[i].muted;      /* WIN-40 */
+            ents[n].muted = r->nprefs[i].muted;      /* */
             n++;
         }
         /* Designated, not positional: adding `notify_default` before `count` silently

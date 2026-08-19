@@ -1,5 +1,5 @@
 /*
- * Search query parsing (REQ-081, WIN-39).
+ * Search query parsing (REQ-081).
  *
  * Deliberately in shared/ and linked by BOTH the daemon and the client core, for the
  * same reason as shared/mention.c: "what does this query mean" is answered in two

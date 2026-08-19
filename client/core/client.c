@@ -160,7 +160,7 @@ void oc_client_close_thread(oc_client *c) {
     oc_model_close_thread(&c->model);
 }
 
-/* Open the search view with no query. The overlay owns the input box (WIN-4),
+/* Open the search view with no query. The overlay owns the input box,
  * so it needs the pane on screen before there is anything to search for. */
 void oc_client_open_search(oc_client *c) {
     if (!c) return;
@@ -176,7 +176,7 @@ void oc_client_search(oc_client *c, const char *query) {
     oc_queue_push(&c->cmds, cmd);
 }
 
-/* WIN-38: the next page of the CURRENT search. `before_id` is the oldest id already
+/* the next page of the CURRENT search. `before_id` is the oldest id already
  * shown — a keyset cursor, so a message posted while you page cannot make a row
  * repeat or vanish the way an OFFSET would. The query is re-sent verbatim because the
  * server holds no search state; that is deliberate (a stateless server cannot leak a
@@ -207,7 +207,7 @@ void oc_client_create_channel_ex(oc_client *c, const char *name, int is_public) 
 }
 
 /* CREATE_CHANNEL has always carried is_public on the wire; this facade dropped
- * it and hardcoded public (WIN-30). Kept as the public-channel shorthand. */
+ * it and hardcoded public. Kept as the public-channel shorthand. */
 void oc_client_create_channel(oc_client *c, const char *name) {
     oc_client_create_channel_ex(c, name, 1);
 }
@@ -676,7 +676,7 @@ void oc_client_delete_webhook(oc_client *c, uint64_t webhook_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
-/* WIN-46: outstanding invites. No arguments — the server decides what "outstanding"
+/* outstanding invites. No arguments — the server decides what "outstanding"
  * means (not consumed, not expired) so two clients cannot disagree about it. */
 void oc_client_list_invites(oc_client *c) {
     if (!c) return;
@@ -693,7 +693,7 @@ void oc_client_revoke_invite(oc_client *c, uint64_t invite_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
-/* WIN-48. Disable is reversible and rotate is not — the old token dies the moment
+/* Disable is reversible and rotate is not — the old token dies the moment
  * the new one is minted, which is the point of rotating a leaked one. */
 void oc_client_set_webhook_state(oc_client *c, uint64_t webhook_id, int disabled) {
     if (!c || !webhook_id) return;
@@ -712,7 +712,7 @@ void oc_client_rotate_webhook(oc_client *c, uint64_t webhook_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
-/* Mute (REQ-137, WIN-40). Independent of the notification level: the daemon keeps
+/* Mute (REQ-137). Independent of the notification level: the daemon keeps
  * them in separate columns for the same reason. */
 void oc_client_set_mute(oc_client *c, uint64_t channel_id, int muted) {
     if (!c || !channel_id) return;
@@ -732,7 +732,7 @@ void oc_client_set_notify_default(oc_client *c, uint8_t level) {
     oc_queue_push(&c->cmds, cmd);
 }
 
-/* Upload an image and make it my avatar (WIN-47). Same transfer machinery as any
+/* Upload an image and make it my avatar. Same transfer machinery as any
  * upload — chunking, window, size cap — but the finished attachment is claimed with
  * SET_AVATAR rather than posted. `channel_id` is where the bytes are uploaded (the
  * wire requires one); nothing is posted there. */
@@ -792,7 +792,7 @@ void oc_client_open_group_dm(oc_client *c, const uint64_t *user_ids, int n) {
     oc_queue_push(&c->cmds, cmd);
 }
 
-/* The avatar (WIN-47). */
+/* The avatar. */
 void oc_client_set_avatar(oc_client *c, uint64_t attachment_id) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_AVATAR);
@@ -801,7 +801,7 @@ void oc_client_set_avatar(oc_client *c, uint64_t attachment_id) {
     oc_queue_push(&c->cmds, cmd);
 }
 
-/* Mark unread (REQ-235, WIN-52). `message_id` is where reading resumes; 0 marks the
+/* Mark unread (REQ-235). `message_id` is where reading resumes; 0 marks the
  * whole conversation unread. Deliberately not oc_client_mark_read's path, which may
  * only ever advance the cursor. */
 void oc_client_set_read_cursor(oc_client *c, uint64_t channel_id, uint64_t message_id) {
@@ -813,7 +813,7 @@ void oc_client_set_read_cursor(oc_client *c, uint64_t channel_id, uint64_t messa
     oc_queue_push(&c->cmds, cmd);
 }
 
-/* Custom status (REQ-241/122, WIN-53). Empty text clears it; `expires_at` 0 means
+/* Custom status (REQ-241/122). Empty text clears it; `expires_at` 0 means
  * "until I change it". The DAEMON enforces expiry — a client that is not running
  * cannot clear its own status, so it must not be the thing that decides. */
 /* REQ-182: my own live sessions. */
@@ -824,7 +824,7 @@ void oc_client_list_sessions(oc_client *c) {
     if (cmd) oc_queue_push(&c->cmds, cmd);
 }
 
-/* WIN-82: the exact channel census for the Files view. */
+/* the exact channel census for the Files view. */
 void oc_client_list_file_channels(oc_client *c) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_LIST_FILE_CHANNELS);
@@ -842,7 +842,7 @@ void oc_client_set_status(oc_client *c, const char *emoji, const char *text,
     oc_queue_push(&c->cmds, cmd);
 }
 
-/* Profile fields (REQ-240, WIN-47). */
+/* Profile fields (REQ-240). */
 void oc_client_set_profile(oc_client *c, const char *title, const char *timezone) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_PROFILE);

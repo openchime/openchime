@@ -26,14 +26,14 @@ The branch, commit, and CI policy for this repo. The private control-plane repo
   names the area/subsystem (`TUI:`, `GUI:`, `docs:`, `daemon:`, …), not a fixed
   type set.
 - Cite decision ids inline where relevant: `ARCH-N`, `REQ-N`.
-- **A commit that resolves a [BACKLOG.md](./BACKLOG.md) entry cites its NUMBER**
-  — "backlog 15", "item 15" — as the number stands when the commit is written.
-  Yes, that number is a position and will drift as items above it close, so an
-  old commit may name a number that has since moved; the message is a record of
-  what was true when it was written, and the number is how the work is referred
-  to at the time. This is deliberately the opposite convention from
-  cross-references *inside* BACKLOG.md, which cite by title because that file is
-  read as a live list rather than as history.
+- **A commit that resolves an issue cites it** — `#144`, or `Closes #144` when
+  the merge should close it. Issues are the project's only issue list; the
+  numbers are stable identifiers, unlike the positional numbering of the
+  `BACKLOG.md` they replaced (migrated 2026-08-19).
+- **Source files cite no issue numbers.** Comments explain themselves or cite a
+  `REQ-N` / `ARCH-N`, both of which are stable documents. An issue number in a
+  comment rots the moment the issue is closed, renamed or superseded, and the
+  reader has no way to tell that it has.
 - **Never** add a `Co-Authored-By:` or any attribution trailer naming Claude /
   Anthropic. The [`attribution-guard`](../.github/workflows/attribution-guard.yml)
   workflow scans author, committer, and message on every push and **rejects**

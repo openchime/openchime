@@ -319,7 +319,7 @@ static void user_upsert(oc_model *m, uint64_t user_id, const char *name, uint8_t
         if (m->users[i].user_id == user_id) {
             snprintf(m->users[i].name, sizeof m->users[i].name, "%s", name ? name : "");
             m->users[i].role = role; m->users[i].disabled = disabled;
-            m->users[i].avatar_id = avatar_id;                    /* WIN-47 */
+            m->users[i].avatar_id = avatar_id;                    /* */
             return;
         }
     if (m->n_users == m->cap_users) {
@@ -769,7 +769,7 @@ static int channel_append(oc_channel *c, uint64_t author_id, const char *author_
      * server did not assign one (shouldn't happen for a BROADCAST) — keep it.
      *
      * An id at or below the mark is USUALLY a redelivery, but it is also what a
-     * backwards history page looks like (WIN-16). So instead of rejecting it
+     * backwards history page looks like. So instead of rejecting it
      * outright, check whether we actually hold it: if not, it is older history
      * and belongs at its sorted position. Rejecting on the mark alone silently
      * discarded every paged-in message. */
@@ -1187,7 +1187,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         /* A thread reply is NOT in the channel's message list, so marking only
          * that list left a pinned reply looking unpinned in the thread pane —
          * and its menu still offering "Pin", which made unpinning it from there
-         * impossible (a re-pin is a no-op). Same omission as WIN-15. */
+         * impossible (a re-pin is a no-op). The same omission, twice. */
         for (size_t i = 0; i < m->n_thread_msgs; i++)
             if (m->thread_msgs[i].message_id == e->message_id) {
                 msg_set_pinned(&m->thread_msgs[i], e);
@@ -1266,7 +1266,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             }
         }
         /* A deleted thread reply lives in the open thread, not the channel list
-         * — the same omission that hid a pinned reply (WIN-15's lesson, twice). */
+         * — the same omission that hid a pinned reply (the same lesson, twice). */
         for (size_t i = 0; i < m->n_thread_msgs; i++)
             if (m->thread_msgs[i].message_id == e->message_id) {
                 msg_tombstone(&m->thread_msgs[i]);
@@ -1524,7 +1524,7 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     }
 }
 
-/* ---- the sidebar (WIN-5/6, see model.h) ------------------------------------ */
+/* ---- the sidebar (6, see model.h) ------------------------------------ */
 
 void oc_sidebar_opts_defaults(oc_sidebar_opts *o) {
     memset(o, 0, sizeof *o);
@@ -1556,7 +1556,7 @@ void oc_sidebar_opts_encode(const oc_sidebar_opts *o, char *out, size_t cap) {
         size_t at2 = strlen(out);
         if (at2 + 8 < cap) snprintf(out + at2, cap - at2, ";sc:%u", o->collapsed[OC_SB_STARRED]);
     }
-    /* Custom sections (WIN-83), one ";u:" run each: name|sort,filter,collapsed|ids.
+    /* Custom sections, one ";u:" run each: name|sort,filter,collapsed|ids.
      * Appended for the same reason as everything above — an older client parses the
      * prefix it knows and ignores this. */
     for (int i = 0; i < o->n_custom; i++) {
@@ -1860,7 +1860,7 @@ size_t oc_model_sidebar(const oc_model *m, const oc_sidebar_opts *o,
      * adding a section does not renumber anyone's saved preferences. */
     /* Starred, then the user's own sections in their order, then Channels, then
      * DMs. Built as a list rather than a fixed array because the middle is now
-     * variable-length (WIN-83). */
+     * variable-length. */
     int order[OC_SB_SECTIONS + OC_SB_CUSTOM_MAX];
     int n_order = 0;
     order[n_order++] = OC_SB_STARRED;

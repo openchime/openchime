@@ -31,8 +31,8 @@ are specified in §§5.16d–5.16i. The remaining protocol-level deferral is the
 `daemon/netloop.c` (dispatch). Coverage is uneven: the auth-and-message vertical
 is exercised end to end against the deployed container, and the rest in-process
 (TESTING.md §3.3). Where this document and the codec disagree, the codec is
-right — three such disagreements were found on 2026-08-02 and are recorded in
-[BACKLOG.md](./BACKLOG.md) rather than silently corrected here.
+right — three such disagreements were found on 2026-08-02 and are recorded as
+issues rather than silently corrected here.
 
 ---
 
@@ -656,7 +656,7 @@ skim — and it is per *channel*, not per DM, so the ordinary sidebar can use it
 `CHANNEL_ARCHIVED` (3019). **The incoming-webhook post path does not call it** —
 it resolves the token and inserts the message, so a third party can still post
 into an archived channel and archiving does not disable a channel's webhooks.
-That is a defect, not a design; it is in [BACKLOG.md](./BACKLOG.md). It is hidden from `CHANNEL_LIST` for
+That is a defect, not a design; it is #133. It is hidden from `CHANNEL_LIST` for
 non-members; members keep it, flagged, so they can find their way back in.
 History, search and membership are untouched — archiving is the reversible
 alternative to a deletion that is not offered for channels holding history.
@@ -1307,7 +1307,7 @@ rejects it before the handler sees it), `404` (unknown or disabled token), `405`
 (non-POST), `413` (the raw request exceeded the read buffer, `MAX_BODY_SIZE` plus
 16 KiB, before parsing completed), `429` (per-token rate limit, 60/min).
 
-One gap, in [BACKLOG.md](./BACKLOG.md): REQ-171's CA-signed certificate for this
+One gap, #132: REQ-171's CA-signed certificate for this
 endpoint is not implemented, so it answers on the daemon's TOFU cert. **An
 archived channel does not stop a webhook post** — the archived check that
 `SEND` performs is absent here.
@@ -1484,7 +1484,7 @@ client always folds a complete picture rather than a delta.
 
     tz_offset_min (i16)
 
-**`SET_SNOOZE` (C → S), `0x00CA`** — Pause my notifications for N minutes from now; 0 ends the pause. (REQ-278, WIN-92)
+**`SET_SNOOZE` (C → S), `0x00CA`** — Pause my notifications for N minutes from now; 0 ends the pause. (REQ-278)
 
     minutes (u32)
 
@@ -1492,7 +1492,7 @@ client always folds a complete picture rather than a delta.
 
     until_ms (u64)
 
-**`SET_SCHEDULE` (C → S), `0x00CC`** — Replace my recurring notification schedule: mode, base window, and the per-weekday rows. (REQ-136, ARCH-103, WIN-94)
+**`SET_SCHEDULE` (C → S), `0x00CC`** — Replace my recurring notification schedule: mode, base window, and the per-weekday rows. (REQ-136, ARCH-103)
 
     mode (u8), tz_offset_min (u16 — int16 two's complement, minutes east of UTC), start_min (u16), end_min (u16), count (u8), then count x { weekday (u8), enabled (u8), start_min (u16), end_min (u16) }
 
@@ -1504,11 +1504,11 @@ client always folds a complete picture rather than a delta.
 
     level (u8)
 
-**`SET_MUTE` (C → S), `0x006D`** — Mute or unmute one conversation for the calling user. (REQ-137, WIN-40)
+**`SET_MUTE` (C → S), `0x006D`** — Mute or unmute one conversation for the calling user. (REQ-137)
 
     channel_id (u64), muted (u8)
 
-**`SET_READ_CURSOR` (C → S), `0x006E`** — Set my read cursor for a channel deliberately, including BACKWARDS (mark unread). (REQ-235, WIN-52)
+**`SET_READ_CURSOR` (C → S), `0x006E`** — Set my read cursor for a channel deliberately, including BACKWARDS (mark unread). (REQ-235)
 
     channel_id (u64), message_id (u64)
 
@@ -1549,19 +1549,19 @@ notified on. Priority people pierce a level and a pause but never a mute
 
 ### 5.16e Profile depth: custom status, title, timezone and avatar
 
-**`SET_STATUS` (C → S), `0x006F`** — Set or clear my transient custom status. (REQ-241, REQ-122, WIN-53)
+**`SET_STATUS` (C → S), `0x006F`** — Set or clear my transient custom status. (REQ-241, REQ-122)
 
     emoji (str), text (str), expires_at (u64)
 
-**`SET_PROFILE` (C → S), `0x0070`** — Set my job title and timezone. (REQ-240, WIN-47)
+**`SET_PROFILE` (C → S), `0x0070`** — Set my job title and timezone. (REQ-240)
 
     title (str), timezone (str)
 
-**`SET_AVATAR` (C → S), `0x0078`** — Point my avatar at an already-uploaded attachment, or clear it. (REQ-240, WIN-47 (image travels via the REQ-140 upload path))
+**`SET_AVATAR` (C → S), `0x0078`** — Point my avatar at an already-uploaded attachment, or clear it. (REQ-240; the image travels via the REQ-140 upload path)
 
     attachment_id (u64)
 
-**`PROFILE_INFO` (S → C), `0x0072`** — One person's complete profile — everything a roster shows about them — as the reply to a profile read and to any of SET_STATUS / SET_PROFILE / SET_AVATAR. (REQ-240, REQ-241, WIN-47, WIN-53)
+**`PROFILE_INFO` (S → C), `0x0072`** — One person's complete profile — everything a roster shows about them — as the reply to a profile read and to any of SET_STATUS / SET_PROFILE / SET_AVATAR. (REQ-240, REQ-241)
 
     user_id (u64), display_name (str), email (str), status_emoji (str), status_text (str), status_expires (u64), title (str), timezone (str), avatar_id (u64), role (u8)
 
@@ -1582,7 +1582,7 @@ somebody else's private-channel attachment.
 > `SET_PRESENCE`; the daemon dispatches presence first, and a title/timezone
 > payload fails the presence decoder, so the connection is dropped. Do not
 > implement against `0x0070` for this frame until the number is resolved. See
-> [BACKLOG.md](./BACKLOG.md).
+> #134.
 
 ### 5.16f Drafts and scheduled messages
 
@@ -1664,11 +1664,11 @@ belongs to the scheduling request.
 
     channel_id (u64), message_id (u64), can_add (u8), is_private (u8), count (u16), then count repetitions of: user_id (u64), name (str)
 
-**`LIST_FILE_CHANNELS` (C → S), `0x0073`** — Ask which channels hold files, and how many each holds. (WIN-82)
+**`LIST_FILE_CHANNELS` (C → S), `0x0073`** — Ask which channels hold files, and how many each holds.
 
     (empty)
 
-**`FILE_CHANNELS` (S → C), `0x0074`** — One (channel_id, file count) pair per channel the caller can read that holds at least one file. (WIN-82)
+**`FILE_CHANNELS` (S → C), `0x0074`** — One (channel_id, file count) pair per channel the caller can read that holds at least one file.
 
     count (u16), then count repetitions of: channel_id (u64), count (u32)
 
@@ -1682,19 +1682,19 @@ client never offers an action that would fail.
 
 ### 5.16h Invite, session and webhook management
 
-**`LIST_INVITES` (C → S), `0x004B`** — Ask for the outstanding (unconsumed, unexpired) tenant invites. (REQ-026, WIN-46)
+**`LIST_INVITES` (C → S), `0x004B`** — Ask for the outstanding (unconsumed, unexpired) tenant invites. (REQ-026)
 
     (empty)
 
-**`INVITE_LIST` (S → C), `0x004C`** — The outstanding invites, identified by a server-side id — never the token. (REQ-026, WIN-46)
+**`INVITE_LIST` (S → C), `0x004C`** — The outstanding invites, identified by a server-side id — never the token. (REQ-026)
 
     count (u16), then count x { invite_id (u64), role (u8), created_at (u64), expires_at (u64), created_by (u64) }
 
-**`REVOKE_INVITE` (C → S), `0x004D`** — Revoke one outstanding invite by its id. (REQ-026, WIN-46)
+**`REVOKE_INVITE` (C → S), `0x004D`** — Revoke one outstanding invite by its id. (REQ-026)
 
     invite_id (u64)
 
-**`INVITE_REVOKED` (S → C), `0x004E`** — Ack for REVOKE_INVITE, carrying the id so the client can drop that row without re-listing. (REQ-026, WIN-46)
+**`INVITE_REVOKED` (S → C), `0x004E`** — Ack for REVOKE_INVITE, carrying the id so the client can drop that row without re-listing. (REQ-026)
 
     invite_id (u64)
 
@@ -1706,11 +1706,11 @@ client never offers an action that would fail.
 
     count (u16), then count x { session_id (u64), created_at (u64), last_seen (u64), expires_at (u64), current (u8), device_label (str) }
 
-**`SET_WEBHOOK_STATE` (C → S), `0x006B`** — Enable or disable one incoming webhook. (REQ-170, WIN-48)
+**`SET_WEBHOOK_STATE` (C → S), `0x006B`** — Enable or disable one incoming webhook. (REQ-170)
 
     webhook_id (u64), disabled (u8)
 
-**`ROTATE_WEBHOOK` (C → S), `0x006C`** — Mint a new token for an existing webhook, invalidating the old one. (REQ-170, WIN-48)
+**`ROTATE_WEBHOOK` (C → S), `0x006C`** — Mint a new token for an existing webhook, invalidating the old one. (REQ-170)
 
     webhook_id (u64)
 
@@ -2019,7 +2019,7 @@ table is the index and the authority on which values are taken.
 
 One opcode is **used by two message types** (`0x0070`), marked below:
 `SET_PROFILE`/`SET_PRESENCE` are both client→server and collide for real. See
-[BACKLOG.md](./BACKLOG.md). The other two shared values are gone — `TYPING` and
+#134. The other two shared values are gone — `TYPING` and
 `TYPING_UPDATE` moved to `0x007E`/`0x007F` in v8, leaving `0x0072` to
 `PROFILE_INFO` and `0x0073` to `LIST_FILE_CHANNELS` alone. `scripts/check_opcodes.sh`
 (run by `make test` and CI) fails on any duplicate outside that one tracked

@@ -19,12 +19,12 @@
 #define COBJMACROS            /* C-style COM: Interface_Method(obj, ...) */
 #include <windows.h>
 #include <windowsx.h>         /* GET_X_LPARAM / GET_Y_LPARAM */
-#include <shellapi.h>         /* CommandLineToArgvW, Shell_NotifyIconW (WIN-18) */
+#include <shellapi.h>         /* CommandLineToArgvW, Shell_NotifyIconW */
 #include <commdlg.h>          /* GetSaveFileNameW (attachment download) */
 #include <dwmapi.h>           /* DwmSetWindowAttribute (dark title bar) */
 #include <d2d1.h>
 #include <dwrite.h>
-#include <wincodec.h>       /* WIC: decode an inline image from memory (WIN-17) */
+#include <wincodec.h>       /* WIC: decode an inline image from memory */
 #include <dbghelp.h>        /* MINIDUMP_* types; the function is loaded at run time */
 #include "a11y.h"           /* the UIA provider (REQ-269, ARCH-99) */
 
@@ -99,7 +99,7 @@ static UINT dpi_for_window(HWND hwnd) {
 #define PX(v)   ((int)((float)(v) * (float)g_dpi / 96.0f + 0.5f))   /* DIP -> device */
 #define DIPF(v) ((float)(v) * 96.0f / (float)g_dpi)                 /* device -> DIP */
 
-/* ---- the UI scale (ARCH-97, amended by WIN-111) ----------------------------
+/* ---- the UI scale (ARCH-97, since amended) ----------------------------
  * ARCH-97 scales the FONTS with the text-size preference and the per-window zoom,
  * and deliberately leaves "block margins" alone — which is right for the space
  * BETWEEN messages, since that is what the density setting governs.
@@ -144,7 +144,7 @@ static void shell_scale_update(float client_w_dip, float client_h_dip) {
      * is the workspace block (64) plus FOUR rail rows plus the 6px the bottom
      * cluster is inset by — a factor of 4.94, not 4.6 — so the cap allowed a
      * scale the rail cannot lay out, and More was drawn on top of New
-     * (rail.more+rail.new, WIN-111). Spelled as the arithmetic it is, so it
+     * (rail.more+rail.new). Spelled as the arithmetic it is, so it
      * moves when RAIL_IH does. */
     float cap_h = (client_h_dip - 6.0f) / (64.0f + 4.0f * 68.0f);
     float cap = cap_w < cap_h ? cap_w : cap_h;
@@ -155,13 +155,13 @@ static void shell_scale_update(float client_w_dip, float client_h_dip) {
 #define RAIL_W      UISW(70.0f)     /* pixel-matched to the Slack rail reference */
 #define SIDEBAR_W   UISW(250.0f)
 #define HEADER_H    UIS(56.0f)
-/* The channel tab strip under the header (WIN-37). Slack's shape: the channel
+/* The channel tab strip under the header. Slack's shape: the channel
  * name and its controls on one row, and the channel's own sub-views on the next.
  * It also fixes something structural — Pins and Files used to replace the
  * transcript with only "Esc to close" as the way back, so there was no standing
  * sense of where you were. */
 #define TABBAR_H    UIS(34.0f)
-/* The formatting toolbar on top (WIN-96), then attach, emoji, the text field
+/* The formatting toolbar on top, then attach, emoji, the text field
  * and send on the bottom row. The box grows downward as the message wraps, to
  * COMPOSER_MAX_LINES, with both rows staying put — so a tall composer reads as
  * the same control that grew, not a different arrangement.
@@ -180,7 +180,7 @@ static void shell_scale_update(float client_w_dip, float client_h_dip) {
  * strip of chrome instead of two jobs. */
 #define COMPOSER_TB     UIS(30.0f)    /* the formatting toolbar row */
 #define COMPOSER_FMT    UIS(24.0f)    /* its square buttons */
-/* ...and it is only there in the rich editor (WIN-104). In plain text the
+/* ...and it is only there in the rich editor. In plain text the
  * toolbar would be a row of buttons for markup you are already looking at, and
  * leaving its 30px behind would be a gap with nothing in it. The height is a
  * question rather than a constant because every consumer — the box, the field's
@@ -198,7 +198,7 @@ static float composer_tb(void) { return composer_toolbar_on() ? COMPOSER_TB : 0.
  * coincidence: any disagreement at all between g_composer_h and the field's real
  * line height — a stale height, a font whose natural height exceeds the spacing we
  * ask for, a rounding step at a scale nobody tried — puts the text INSIDE the
- * icons, which is what it did (WIN-111). A real gap, plus the clamp in
+ * icons, which is what it did. A real gap, plus the clamp in
  * composer_geom(), makes the collision impossible rather than unlikely. */
 #define COMPOSER_GAP    UIS(6.0f)
 /* The action row's gutter — the inset from the composer box's edges to the "+"
@@ -281,7 +281,7 @@ static ID2D1Brush *paint_with(uint32_t rgb);   /* fwd */
  * makes it legible against ANY avatar colour rather than just the ones we
  * happened to pick — a tint close to the status colour would otherwise swallow
  * it again the moment the palette changed. */
-/* Connection state as a dot (WIN-64): filled when live, hollow when not.
+/* Connection state as a dot: filled when live, hollow when not.
  *
  * This started as THREE states — live / reconnecting / down — which sounded
  * better than it rendered. Measured against a killed daemon, the dot flickered:
@@ -293,7 +293,7 @@ static ID2D1Brush *paint_with(uint32_t rgb);   /* fwd */
  *
  * The hollow ring is drawn in the ACCENT rather than a dead grey because it is
  * the honest reading: we are always trying. The detail — why, and how long until
- * the next attempt — belongs to the connection banner (WIN-1), which has room
+ * the next attempt — belongs to the connection banner, which has room
  * for words and a Retry button.
  *
  * A widget rather than an inline blob because the rail's per-workspace avatars
@@ -331,7 +331,7 @@ static void draw_presence_dot_dnd(ID2D1RenderTarget *rt, float cx, float cy, flo
 
 
 
-/* Typed modal form fields (WIN-21); form_dialog() is defined further down. */
+/* Typed modal form fields; form_dialog() is defined further down. */
 enum { FF_TEXT = 0, FF_PASSWORD, FF_CHECK, FF_CHOICE };
 
 typedef struct {
@@ -344,7 +344,7 @@ typedef struct {
 } oc_field;
 static int form_dialog(HWND owner, const char *title, oc_field *f, int n);
 
-/* The form is drawn on the modal frame like every other sheet (WIN-77), so its
+/* The form is drawn on the modal frame like every other sheet, so its
  * state has to be visible to the painter, the click router and layout_natives —
  * hence globals rather than locals inside form_dialog. At most one form is open:
  * it runs a nested message loop, so a second one cannot start underneath it.
@@ -376,7 +376,7 @@ static D2D1_RECT_F g_form_erect[FORM_MAX_FIELDS];     /* where the painter put e
 static struct { D2D1_RECT_F r; int field, val; } g_form_hits[FORM_MAX_FIELDS * 4];
 static int g_n_form_hits;
 
-/* The quick reactions offered inline by the message menu (WIN-28). Shortcodes,
+/* The quick reactions offered inline by the message menu. Shortcodes,
  * not literals, because they are stored as a preference and a shortcode is what
  * a user can reasonably be asked to type; oc_emoji_by_name() resolves them
  * through the same catalogue the picker uses, so an unknown name simply drops
@@ -464,7 +464,7 @@ static IDWriteTextFormat *g_meta_r;   /* the same, trailing-aligned — timestam
 static IDWriteTextFormat *g_avatar;   /* title weight, centred in the disc */
 static IDWriteTextFormat *g_micro;    /* 10/600 — rail labels */
 static IDWriteTextFormat *g_meta_i;   /* meta, ITALIC — placeholder text only */
-/* The formatting toolbar's two letterforms (WIN-96). A "B" that is not bold and
+/* The formatting toolbar's two letterforms. A "B" that is not bold and
  * an "I" that is not italic would be labels for the thing rather than pictures
  * of it, which is the whole trick these two buttons have always used. */
 static IDWriteTextFormat *g_fmt_bold;
@@ -481,7 +481,7 @@ static uint64_t g_sel;              /* selected channel id (0 = none) */
 static float    g_scroll;           /* px scrolled up from the bottom of the transcript */
 static float    g_scroll_max;       /* recomputed each paint, for input clamping */
 static uint64_t g_hover_mid;        /* transcript message under the cursor (0 = none) */
-/* The URL under the cursor, and the one the press landed on (WIN-112). Two,
+/* The URL under the cursor, and the one the press landed on. Two,
  * not one, because a link opens on RELEASE over the same address it was pressed
  * on: opening on press would make dragging a selection that starts inside a URL
  * launch a browser instead, and copying a URL is the second most common thing
@@ -503,7 +503,7 @@ static int      g_n_backfilled;
 
 /* The composer is a native RichEdit child (IME / selection / clipboard / undo);
  * we subclass it to make Enter send and Shift+Enter insert a newline. */
-/* The composer is OURS now (WIN-80 / ARCH-98): no RichEdit, no child window. The
+/* The composer is OURS now (ARCH-98): no RichEdit, no child window. The
  * declarations sit up here because the shell — drafts, the send button, the
  * autocomplete, the picker, F6 — talks to it from above its definition. */
 static int  g_ed_focus;
@@ -542,22 +542,22 @@ static void sidebar_opts_load(const oc_model *m);
 #define SB_SETTING_KEY "sidebar"
 #define PREFS_SETTING_KEY "prefs"
 
-/* Preferences (WIN-9, REQ-261). Client-side display choices, synced through the
+/* Preferences (REQ-261). Client-side display choices, synced through the
  * daemon's `gui` settings bucket so they follow the account to another machine —
  * a client writes no files (ARCH-88), so this bucket is the only place they can
  * live. Server-side behaviour (per-channel notification level, DND) stays on its
  * own surfaces; this pane is deliberately only what the client itself decides. */
 static int g_prefs_open;
-/* Profile pane (WIN-10). Viewing a person was impossible from anywhere: clicking
+/* Profile pane. Viewing a person was impossible from anywhere: clicking
  * a member opened a DM and that was the whole interaction. Richer fields (avatar
- * image, email, timezone, title) are REQ-240 / WIN-47; this shows what the
+ * image, email, timezone, title) are REQ-240; this shows what the
  * roster actually knows today rather than inventing placeholders for them. */
 static uint64_t g_profile_uid;
 static D2D1_RECT_F g_prof_dm_btn;
 static int g_pref_time24    = 1;   /* 24-hour timestamps */
 static int g_pref_members   = 1;   /* members pane shown by default */
 static int g_pref_daysep    = 1;   /* date dividers in the transcript */
-/* WIN-103: 1 = the rich editor (formatting shown, markup hidden — WIN-101),
+/* 1 = the rich editor (formatting shown, markup hidden),
  * 0 = plain text, where the markup is what you see and the field never restyles
  * what you typed. Rich by default: it is the mode that needs no explaining. */
 static int g_pref_richtext  = 1;
@@ -607,22 +607,22 @@ static int g_n_rows;
  * test against it matched the whole width of the window: hovering the Activity
  * list, or the members pane, lit up whatever message happened to share that
  * line, and right-clicking there opened that message's menu. Exactly the defect
- * WIN-66 fixed in the members pane, in a second place. A hit-box that stores one
+ * the members-pane fix landed, in a second place. A hit-box that stores one
  * axis will be asked about both. */
 typedef struct { float top, bot, left, right, bx, by, cw; uint64_t mid; } oc_msgrow;
 static oc_msgrow g_msgrows[600];
 static int g_n_msgrows;
-/* The same, for the thread pane (WIN-15) — replies were read-only because the
+/* The same, for the thread pane — replies were read-only because the
  * pane recorded no hit-boxes at all. Its own scroll offset, so opening a thread
  * does not disturb where the transcript was. */
 static oc_msgrow g_thrrows[200];
 static int g_n_thrrows;
 static float g_thr_scroll, g_thr_scroll_max;
 
-/* WIN-14: the read marker as it stood when this channel was opened. It has to be
+/* the read marker as it stood when this channel was opened. It has to be
  * snapshotted, because entering a channel acks it — read live, the divider would
  * vanish in the same frame it appeared. Cleared when you leave or send. */
-/* Drafts (WIN-91, REQ-223, ARCH-101). WIN-27's 24 in-memory slots are gone: a
+/* Drafts (REQ-223, ARCH-101). The 24 in-memory slots are gone: a
  * draft now lives on the DAEMON, keyed (user, channel, thread root), so it
  * survives a restart and follows you to your other devices. The model holds
  * them; this file keeps only what is needed to avoid pointless writes.
@@ -638,7 +638,7 @@ static int       g_draft_dirty;       /* the composer has changed since the last
 static ULONGLONG g_draft_touch_ms;    /* when it last changed, for the debounce */
 #define DRAFT_DEBOUNCE_MS 2000
 
-/* ---- OS notifications (WIN-18, REQ-138) ------------------------------------
+/* ---- OS notifications (REQ-138) ------------------------------------
  * Shell_NotifyIconW with NIF_INFO rather than WinRT toasts: the client is pure C
  * (ARCH-82), and WinRT's ToastNotificationManager needs a C++/WinRT projection
  * plus a registered AppUserModelID. On Windows 10+ a balloon is rendered by the
@@ -722,7 +722,7 @@ static void notify_toast(const char *title, const char *body) {
     Shell_NotifyIconW(NIM_MODIFY, &g_tray);
 }
 
-/* ---- inline image thumbnails (WIN-17) -------------------------------------
+/* ---- inline image thumbnails -------------------------------------
  * Attachments rendered as text lines only. The bytes are fetched INTO MEMORY
  * (oc_client_fetch_attachment) and decoded with WIC — no temp file, because a
  * client stores nothing locally (ARCH-88) and a scratch file for rendering is
@@ -751,7 +751,7 @@ static int      g_n_thumbs;
  * pointers: the comparison silently missed on the real window target too, which
  * turned every cache lookup into a miss and every miss into another fetch — a
  * decode loop that filled the cache with copies of the same image. */
-/* Images in SCREENSHOTS (WIN-47's diagnosis). g_thumbs_off used to mean "this render
+/* Images in SCREENSHOTS. g_thumbs_off used to mean "this render
  * is a capture, so draw no images and request none" — which made every screenshot of
  * this app a picture with the pictures missing. That cost an hour here: the avatars
  * were drawing correctly on screen the whole time and no capture could show it.
@@ -837,7 +837,7 @@ static void thumbs_drop(void) {
     g_n_thumbs = 0;
 }
 
-/* A user's avatar id, or 0. Roster-carried (WIN-47), so no round trip per author. */
+/* A user's avatar id, or 0. Roster-carried, so no round trip per author. */
 static uint64_t avatar_of(const oc_model *m, uint64_t uid) {
     if (!m || !uid) return 0;
     for (size_t i = 0; i < m->n_users; i++)
@@ -846,7 +846,7 @@ static uint64_t avatar_of(const oc_model *m, uint64_t uid) {
 }
 
 /* Draw a user's avatar in `box`: their photo when we have the bytes, the coloured
- * initial otherwise (WIN-47).
+ * initial otherwise.
  *
  * The image is CIRCLE-CLIPPED by filling an ellipse with a bitmap brush rather than
  * pushing a layer: a layer costs a render-target flush per avatar, and a transcript
@@ -897,7 +897,7 @@ static int draw_avatar_image(ID2D1RenderTarget *rt, uint64_t aid, D2D1_RECT_F bo
  * transfers. */
 static void avatar_want(uint64_t aid);
 
-/* WIN-16: paging older history. One request in flight at a time, and a
+/* paging older history. One request in flight at a time, and a
  * remembered "we reached the top" so we stop asking a channel that has no more. */
 static uint64_t g_hist_pending_chan, g_hist_before;
 static ULONGLONG g_hist_deadline;
@@ -926,17 +926,17 @@ static int g_n_memrows;
 static struct { float top, bot; uint64_t cid, mid; } g_searchrows[128];
 static int g_n_searchrows;
 
-/* WIN-3: jump-to-message. A search hit names a message, not just a channel, so
+/* jump-to-message. A search hit names a message, not just a channel, so
  * clicking one arms a jump: the transcript scrolls that message into view and
  * flashes it. The jump survives a few frames because the channel's history is
  * usually still in flight when the click lands — `g_jump_deadline` is what turns
  * "not loaded yet" into an honest failure instead of a silent no-op. */
 static uint64_t  g_jump_mid;            /* message to scroll to, 0 = none */
-/* Forwarding (REQ-057, WIN-51): the message chosen in the kebab, waiting for a
+/* Forwarding (REQ-057): the message chosen in the kebab, waiting for a
  * destination. The palette picks the destination — it already lists every
  * conversation, so a forward needs no new picker. */
 static uint64_t  g_fwd_mid, g_fwd_cid;
-/* The channel directory (REQ-038, WIN-54a). No daemon work: LIST_CHANNELS already
+/* The channel directory (REQ-038). No daemon work: LIST_CHANNELS already
  * returns every PUBLIC channel plus a `joined` flag — the client simply never gave
  * you a place to see them together. */
 static int       g_browse_open;
@@ -948,8 +948,8 @@ static ULONGLONG g_jump_deadline;       /* GetTickCount64 by which it must appea
 static uint64_t  g_flash_mid;           /* message to tint */
 static ULONGLONG g_flash_until;
 /* Webhook-overlay row hit-boxes (row -> webhook id, for delete). */
-/* Per-row action buttons (WIN-48): enable/disable, rotate, delete. */
-static D2D1_RECT_F g_srch_more_btn;   /* WIN-38: next page of search results */
+/* Per-row action buttons: enable/disable, rotate, delete. */
+static D2D1_RECT_F g_srch_more_btn;   /* next page of search results */
 static int g_await_webhook;     /* show the minted webhook token once it arrives */
 static int      g_sessions_open;   /* REQ-182 */
 static int      g_confirm_open;
@@ -960,20 +960,20 @@ static char     g_confirm_body[320];
 static char     g_confirm_ok[32];
 static char     g_confirm_ws[160];   /* CONF_WS_FORGET's target, by address */
 
-static struct { D2D1_RECT_F r; uint64_t id; } g_invrows[64];   /* WIN-46 Revoke buttons */
+static struct { D2D1_RECT_F r; uint64_t id; } g_invrows[64];   /* Revoke buttons */
 static int g_n_invrows;
 static struct { D2D1_RECT_F r; uint64_t wid; int act; int disabled; } g_webacts[48];
 static int g_n_webacts;
 static struct { float top, bot; uint64_t wid; } g_webrows[64];
 static int g_n_webrows;
 
-/* Audit family filter (WIN-19): 0 = all, else the OC audit family id. */
+/* Audit family filter: 0 = all, else the OC audit family id. */
 static int g_audit_family;
 static D2D1_RECT_F g_audit_filters[5];
 static int g_n_audit_filters;
 static uint64_t g_audit_oldest;     /* the oldest entry paged in, for load-older */
 
-/* Command palette (WIN-11). Every action on the rail and in the menus is
+/* Command palette. Every action on the rail and in the menus is
  * mouse-only today; this is the same catalogue reached by keyboard, plus
  * channel and DM quick-switch so Ctrl+K also answers "take me to X". */
 static int   g_pal_open, g_pal_sel;
@@ -991,7 +991,7 @@ static struct { D2D1_RECT_F r; int row, act; } g_wsmgr_hits[48];
 static int g_n_wsmgr_hits;
 enum { WSM_GO = 0, WSM_SIGNOUT, WSM_FORGET };
 
-/* Notification-prefs review (WIN-12) + the shortcut sheet (WIN-25). */
+/* Notification-prefs review + the shortcut sheet. */
 static int g_notify_open, g_keys_open;
 static struct { D2D1_RECT_F r; uint64_t cid; uint8_t level; } g_notify_hits[128];
 /* The two Edit buttons on the notifications overlay (REQ-135). */
@@ -1035,7 +1035,7 @@ enum { TAB_MESSAGES = 0, TAB_FILES, TAB_PINS, TAB_ABOUT, TAB_COUNT };
 enum { DTAB_DRAFTS = 0, DTAB_SCHEDULED, DTAB_SENT, DTAB_COUNT };
 static int g_dtab;
 
-/* Does this tab exist for this conversation? (WIN-74)
+/* Does this tab exist for this conversation?
  *
  * Pins and Files are genuinely right for a DM — the daemon's pin and file paths
  * require only membership, and a DM's two participants are members. **About is
@@ -1049,10 +1049,10 @@ static int tab_applies(const oc_channel *c, int tab) {
     if (tab == TAB_ABOUT && c->kind == OC_CHANNEL_KIND_DM) return 0;
     return 1;
 }
-static int g_tab;                       /* the selected channel tab (WIN-37) */
+static int g_tab;                       /* the selected channel tab */
 static D2D1_RECT_F g_tab_r[TAB_COUNT];  /* tab hit-boxes */
 static D2D1_RECT_F g_memchip;           /* header member-count chip */
-static D2D1_RECT_F g_ws_dot;            /* workspace connection dot (WIN-64) */
+static D2D1_RECT_F g_ws_dot;            /* workspace connection dot */
 static int g_tab_hover = -1;
 /* Reaction-chip hit-boxes, rebuilt every frame like the thumbnail ones. */
 static struct { D2D1_RECT_F r; uint64_t mid; char emoji[40]; uint8_t mine; } g_chips[128];
@@ -1071,12 +1071,12 @@ static D2D1_RECT_F g_ws_hdr_btn;        /* channel-column workspace header (open
 static D2D1_RECT_F g_hdr_gear, g_hdr_compose;   /* header settings + compose buttons */
 static HWND     g_find;                 /* "Find a conversation" filter box (native EDIT) */
 static HWND     g_ffind;                /* "Search files" box, Files view only (native EDIT) */
-static HWND     g_srch;                 /* search-overlay query box (WIN-4, native EDIT) */
+static HWND     g_srch;                 /* search-overlay query box (native EDIT) */
 
-/* Composer autocomplete (WIN-7). The candidate list is rebuilt from the text up
+/* Composer autocomplete. The candidate list is rebuilt from the text up
  * to the caret on every change; the popover renders above the composer and the
  * RichEdit subclass steals the navigation keys while it is open. */
-/* Emoji picker (WIN-8). One panel serves two callers: with g_pick_mid == 0 it
+/* Emoji picker. One panel serves two callers: with g_pick_mid == 0 it
  * inserts into the composer, otherwise it reacts to that message — the same
  * catalogue either way, so the reaction set is no longer six hardcoded glyphs. */
 static int      g_pick_open;
@@ -1107,7 +1107,7 @@ static int g_view = VIEW_HOME;          /* current primary view (rail selection)
  * derived hover states (g_nav_hover, g_hover_mid, …) but never the position
  * itself, so shared chrome — the modal frame's buttons — had nothing to ask. */
 static int g_mouse_x = -1, g_mouse_y = -1;
-/* The last double-click, for counting a third one (WIN-100). */
+/* The last double-click, for counting a third one. */
 static ULONGLONG g_dbl_ms;
 static int g_dbl_x, g_dbl_y;
 static int g_nav_hover = -100;          /* rail item under the cursor (act value) */
@@ -1123,13 +1123,13 @@ static struct { float top, bot; int act; } g_moreflyrows[8];
 static int g_n_moreflyrows;
 
 /* ---- custom D2D dropdown menus (workspace / profile / new / switcher) -------
- * One reusable floating menu. As of WIN-79 this is EVERY menu in the client — the
- * four native context popups are gone, so the claim this comment used to make is
- * finally true. An opener fills
+ * One reusable floating menu. This is now EVERY menu in the client — the
+ * four native context popups are gone, so the claim this comment used to make
+ * is finally true. An opener fills
  * g_mi[] + anchor; draw_menu() renders it last so it floats; on_click routes to
  * menu_dispatch(). Item kinds: ITEM (icon+label+cmd), SECTION (faint header),
  * SEP. MENU_WS/MENU_SWITCHER also draw a workspace header block on top. */
-/* MENU_MSG..MENU_THUMB are the CONTEXT menus (WIN-79, ARCH-98). They were native
+/* MENU_MSG..MENU_THUMB are the CONTEXT menus (ARCH-98). They were native
  * TrackPopupMenu popups, which meant: OS-themed rather than ours, a modal message
  * loop that froze our tick and blocked the message-loop shortcuts, and — the part
  * that mattered most — completely undrivable and unscreenshottable by the harness,
@@ -1189,11 +1189,11 @@ static int   g_n_sw;
 static D2D1_RECT_F g_attach_btn;        /* composer attach (+) hit-box */
 static D2D1_RECT_F g_send_btn;          /* composer send-button hit-box */
 static D2D1_RECT_F g_sched_btn;         /* "send later" chevron beside it (REQ-224) */
-static D2D1_RECT_F g_emoji_btn;         /* composer emoji-picker hit-box (WIN-8) */
+static D2D1_RECT_F g_emoji_btn;         /* composer emoji-picker hit-box */
 static D2D1_RECT_F g_at_btn;            /* composer mention button */
 static uint64_t g_edit_msg;             /* non-zero => composer is editing this message */
 
-/* The formatting toolbar (WIN-96, REQ-220). One entry per button, in the order
+/* The formatting toolbar (REQ-220). One entry per button, in the order
  * they are drawn — emphasis, then code, then the block forms, which is both
  * Slack's grouping and the order MARKDOWN.md lists the dialect in. */
 enum {
@@ -1206,7 +1206,7 @@ static int         g_fmt_hover = -1;
  * 0 neither, 1 Send, 2 the "send later" dropdown. */
 static int         g_send_hover = 0;
 
-/* ---- sign-in view (WIN-2, REQ-263/020) -------------------------------------
+/* ---- sign-in view (REQ-263/020) -------------------------------------
  * Slack signs in in two steps — workspace address first, credentials once the
  * workspace is known — and does it *in the app window*. We match that shape,
  * not Slack's credential mechanism: their email/magic-code/SSO path has no
@@ -1232,7 +1232,7 @@ static int   g_si_overlay;
  * parked once the new workspace actually authenticates. On failure or cancel
  * nothing about it has changed. */
 static oc_client *g_si_client;
-/* An invite token entered on step 2 (WIN-32). Non-empty turns the next attempt
+/* An invite token entered on step 2. Non-empty turns the next attempt
  * into a redeem: the account is created and signed in together. */
 static char  g_si_invite[128];
 static D2D1_RECT_F g_si_invite_link;
@@ -1265,7 +1265,7 @@ static void layout_signin(HWND hwnd);
 typedef struct { float x0, y0, w, h, fx, fw, fields_y; } si_geom;
 static si_geom si_layout(float W, float H);
 
-/* ---- failure surface: toasts + connection banner (WIN-1, REQ-263) ----------
+/* ---- failure surface: toasts + connection banner (REQ-263) ----------
  * Until now the only way a failure reached the user was `last_error` drawn into
  * an *empty* transcript — so a failed send, a rate-limit, or a storage refusal
  * on a working connection was silent. Two surfaces fix that:
@@ -1354,10 +1354,10 @@ static void toast_tick(const oc_model *m) {
  * and screenshot the client from WSL/CI without screen-scraping. */
 static char g_test_dir[512];
 
-/* ---- crash diagnosis (WIN-60) --------------------------------------------- */
+/* ---- crash diagnosis --------------------------------------------- */
 
 /*
- * WIN-60 has sat in the backlog as "unreproduced crash while typing" because a
+ * An unreproduced crash while typing sat open for weeks because a
  * crash left nothing behind: no dump, no log, no idea what the app was doing. It
  * happened twice more on 2026-07-29 while the client was being driven, and both
  * times all I could say was "it exited" — which is not a bug report, it is an
@@ -1627,7 +1627,7 @@ static void draw_text(ID2D1RenderTarget *rt, const char *s, IDWriteTextFormat *f
 }
 
 /* Like draw_text, but tints every occurrence of a whitespace-separated term from
- * `terms` (WIN-3). Matching is case-insensitive and substring-based, which is
+ * `terms`. Matching is case-insensitive and substring-based, which is
  * what the daemon's LIKE-based search does — highlighting on a stricter rule
  * than the search itself would leave hits visibly unmarked. */
 static void draw_text_hl(ID2D1RenderTarget *rt, const char *s, IDWriteTextFormat *fmt,
@@ -1744,7 +1744,7 @@ static IDWriteTextFormat *mk_fmt_s(const WCHAR *family, float size, DWRITE_FONT_
                                                   : DWRITE_WORD_WRAPPING_NO_WRAP);
         /* A single-line format that outgrows its box stops mid-glyph unless it is
          * told otherwise — which is what "Files & li" and a channel header reading
-         * as a bare "#" were (WIN-111). Ellipsis here, once, rather than at fifty
+         * as a bare "#" were. Ellipsis here, once, rather than at fifty
          * call sites. Wrapping formats get none: they wrap by design, and a
          * trimming sign on them would cut a paragraph at its first line. */
         if (!wrap) {
@@ -1859,7 +1859,7 @@ static void fonts_build(void) {
      * that is not content — an empty section's "Empty" — so it cannot be mistaken for
      * a conversation called Empty. A style, not a seventh size token. */
     g_meta_i  = mk_fmt_s(UI, FONT_META  * k, REG, L, MID, 0, DWRITE_FONT_STYLE_ITALIC);
-    /* The toolbar's B and I (WIN-96), centred in their buttons. Bold 700 is the
+    /* The toolbar's B and I, centred in their buttons. Bold 700 is the
      * one named above — markdown's weight, which is exactly what this button
      * depicts — so it is that same exception rather than a third chrome weight.
      *
@@ -1876,7 +1876,7 @@ static void fonts_build(void) {
     g_fmt_quote = mk_fmt(L"Georgia", (FONT_UI + 9.0f) * k, DWRITE_FONT_WEIGHT_BOLD, C, MID, 0);
 }
 
-/* The emoji formats, rebuilt on every scale change like the rest (WIN-111).
+/* The emoji formats, rebuilt on every scale change like the rest.
  * Named explicitly, because falling back from "Segoe UI" reaches the monochrome
  * Segoe UI Symbol glyphs first — the picker rendered as outlines. */
 static void emoji_fonts_build(void) {
@@ -2056,7 +2056,7 @@ static void select_channel(uint64_t cid) {
     g_has_sel = 0;                       /* drop any transcript text selection */
 
     /* Snapshot where the read marker stood BEFORE the mark-read below, so the
-     * "New" divider survives entering the channel (WIN-14). */
+     * "New" divider survives entering the channel. */
     const oc_model *sm = model();
     const oc_channel *sc = sm ? oc_model_channel((oc_model *)sm, cid) : NULL;
     g_unread_from  = (sc && sc->high_water > sc->read_marker) ? sc->read_marker : 0;
@@ -2065,7 +2065,7 @@ static void select_channel(uint64_t cid) {
 
     g_sel = cid;
     g_scroll = 0;
-    {   /* The new conversation may not have the tab that was open (WIN-74). */
+    {   /* The new conversation may not have the tab that was open. */
         const oc_model *tm2 = model();
         const oc_channel *tc2 = tm2 ? oc_model_channel((oc_model *)tm2, cid) : NULL;
         if (tc2 && !tab_applies(tc2, g_tab)) g_tab = TAB_MESSAGES;
@@ -2193,7 +2193,7 @@ static struct { float top, bot; int view; } g_shelf_rows[4];
 static int g_n_shelf;
 static int g_shelf_hover = -1;
 /* How many sidebar rows painted themselves SELECTED this frame. Two at once is a
- * defect the shot showed and no assertion could (WIN-106). */
+ * defect the shot showed and no assertion could. */
 static int g_n_sbsel;
 static int ws_unread_elsewhere(void);   /* fwd */
 static int main_is_conversation(void); /* fwd — the sidebar's selection asks it too */
@@ -2211,7 +2211,7 @@ static void avatar_want(uint64_t aid) {
 /* The disc colour for a user's initial. Derived from the id, so one person is one
  * colour everywhere they appear — it is an identity cue, not decoration.
  *
- * This was a `tint` PARAMETER until 2026-07-31 (WIN-85), which meant every caller
+ * This was a `tint` PARAMETER until 2026-07-31, which meant every caller
  * chose, and one of them chose differently: the rail's "You" avatar passed the
  * theme's accent while the transcript, sidebar and profile pane all passed
  * AVPAL[uid % 6], so the signed-in user was one colour in the rail and another
@@ -2224,7 +2224,7 @@ static uint32_t avatar_tint(uint64_t uid) {
 
 /* One user avatar, wherever one is drawn: the photo when we have it, otherwise the
  * coloured initial that has always been there. `fmt` is the format the letter is
- * drawn in. Every avatar in the app goes through here — see WIN-86 on what happens
+ * drawn in. Every avatar in the app goes through here — see the avatar cache note on what happens
  * when some of them do not. */
 static void draw_user_avatar(ID2D1RenderTarget *rt, const oc_model *m, uint64_t uid,
                              const char *name, D2D1_RECT_F box,
@@ -2254,7 +2254,7 @@ static void draw_user_avatar(ID2D1RenderTarget *rt, const oc_model *m, uint64_t 
  * faces. Picking a participant's avatar to stand for a group is a claim about
  * the wrong person, which is why the sidebar has drawn it this way since
  * REQ-056; this is that idiom lifted out so the DMs index draws the same thing
- * (WIN-95) instead of inventing a second answer. The count includes you, so it
+ * instead of inventing a second answer. The count includes you, so it
  * matches the names in the title and the rows in the member pane. */
 static void draw_group_avatar(ID2D1RenderTarget *rt, const oc_model *m,
                               const oc_channel *c, D2D1_RECT_F box) {
@@ -2285,7 +2285,7 @@ static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     char wsn[80]; ws_display_name(m, wsn, sizeof wsn);
     char init[2] = { (char)(wsn[0] ? (wsn[0] >= 'a' && wsn[0] <= 'z' ? wsn[0] - 32 : wsn[0]) : 'O'), 0 };
     draw_text(rt, init, g_avatar, av, 0xFFFFFF);
-    /* "N elsewhere" (WIN-29): unread sitting in the workspaces you are not
+    /* "N elsewhere": unread sitting in the workspaces you are not
      * looking at. Without it, holding several clients would be invisible. */
     int elsewhere = ws_unread_elsewhere();
     if (elsewhere > 0) {
@@ -2351,7 +2351,7 @@ static void draw_rail(ID2D1RenderTarget *rt, const oc_model *m, float h) {
      *
      * "Alerts" used to sit here with a bell, beside an "Activity" item carrying
      * a heartbeat line — two entries for one idea, both dead ends. Notification
-     * *settings* already have a real home (the Notifications pane, WIN-12), so
+     * *settings* already have a real home (the Notifications pane), so
      * Alerts was redundant as well as empty. It is gone, and Activity inherits
      * the bell: a pulse-line glyph reads as a system monitor, not as "things
      * that happened to you". */
@@ -2590,7 +2590,7 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
      * native EDIT child (g_find) sits inside and live-filters the list. */
     /* The container and the native EDIT inside it are derived from the same
      * numbers (find_box()), because two hand-kept copies is how the white box
-     * ended up floating half out of its own border at large text (WIN-111). */
+     * ended up floating half out of its own border at large text. */
     D2D1_RECT_F fb = find_box();
     fill_round(rt, fb, 8.0f, OC_COL_INPUT);
     stroke_round(rt, fb, 8.0f, OC_COL_BORDER, 1.0f);
@@ -2604,7 +2604,7 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     snprintf(o.find, sizeof o.find, "%s", g_find_filter);
     if (g_view == VIEW_DMS) {
         o.collapsed[OC_SB_CHANNELS] = 1;
-        /* Starred holds channels as well as DMs (WIN-41), and the DMs view is only
+        /* Starred holds channels as well as DMs, and the DMs view is only
          * about people — showing a starred #channel there would contradict the whole
          * reason that view exists. */
         o.collapsed[OC_SB_STARRED] = 1;
@@ -2626,7 +2626,7 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     g_sb_view = bot - top;
     /* The "Empty" placeholders occupy rows too, so they count toward the scrollable
      * height — otherwise the list is short by one row per empty section and the last
-     * conversation is unreachable, which is WIN-6 all over again. */
+     * conversation is unreachable, which is the old unreachable-conversation bug all over again. */
     size_t nplace = 0;
     for (size_t ri = 0; ri < nrows; ri++)
         if (rows[ri].is_header && !oc_sb_collapsed_of(&g_sb, rows[ri].section) &&
@@ -2664,7 +2664,7 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
             draw_lucide(rt, SHELF[si].icon, rf(sx0 + 10, sy + 7, sx0 + 28, sy + 25),
                         on ? OC_COL_TEXT : OC_COL_MUTED);
             /* Reserve what the badge MEASURES, not a constant 40: at large text
-             * the count ran over its own label — "Drafts, schedule✎ 2" (WIN-111). */
+             * the count ran over its own label — "Drafts, schedule✎ 2". */
             float badge_w = 0;
             if (SHELF[si].view == VIEW_THREADS) {
                 uint32_t un = oc_model_thread_unread(m);
@@ -2752,10 +2752,10 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
             /* Selected means "this is what the main area is showing". The
              * conversation stays REMEMBERED while a pane (Drafts, New Message)
              * has the main area, but painting it selected then lit two rows at
-             * once (WIN-106). */
+             * once. */
             int selected = (r->channel_id == g_sel) && main_is_conversation();
             if (selected) g_n_sbsel++;
-            /* MUTED (REQ-137, WIN-40): the row de-emphasises and its badge goes.
+            /* MUTED (REQ-137): the row de-emphasises and its badge goes.
              * This is what makes mute different from notification level "none" —
              * level silences the notification, mute also stops the conversation
              * competing for attention in the list. The unread COUNT still exists
@@ -2765,9 +2765,9 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
             int unread = (r->unread > 0) && !muted;
             if (selected) fill_round(rt, rf(sx0, ry + 2, sx1, ry + ROW_H - 2), 6.0f, OC_COL_SELECT);
             /* Ask what the ROW IS, not where it happens to be filed. Starring a DM
-             * moves it into Starred (WIN-41), and this test used to be
+             * moves it into Starred, and this test used to be
              * `section == OC_SB_DMS` — so a starred person rendered with the channel
-             * "#" glyph and no presence dot. A custom section (WIN-83) had the same
+             * "#" glyph and no presence dot. A custom section had the same
              * problem. `peer_id` is set for a 1:1 DM and n_peers for a group. */
             int row_is_dm = (rc && rc->kind == OC_CHANNEL_KIND_DM) || r->peer_id != 0;
             if (row_is_dm) {
@@ -2790,7 +2790,7 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                 /* INSET into the avatar, not hung off its corner: at
                  * (right-1, bottom-1) most of the dot was outside the picture,
                  * which is what made it read as an artifact rather than a status
-                 * (WIN-107, reported from a screenshot). */
+                 * (reported from a screenshot). */
                 draw_presence_dot_dnd(rt, av.right - 4, av.bottom - 4, 4.5f,
                                       oc_model_presence_of(m, r->peer_id),
                                       selected ? OC_COL_SELECT : OC_COL_SIDEBAR,
@@ -2840,7 +2840,7 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
     }
 
     /* Scrollbar, only when there is overflow — the reason channels past the fold
-     * used to be unreachable (WIN-6). */
+     * used to be unreachable. */
     if (maxscroll > 0) {
         float trackh = bot - top;
         float th = trackh * (g_sb_view / g_sb_content); if (th < 24) th = 24;
@@ -2944,7 +2944,7 @@ static int emoji_runs(const char *utf8, oc_emoji_run *out, int max) {
  * daemon stored. Selection, copy, hit-testing and the mention offsets all
  * address that same text; a rewritten string would have to re-map every one.
  *
- * BOTH callers remove the delimiters (WIN-101). The transcript always did; the
+ * BOTH callers remove the delimiters. The transcript always did; the
  * composer dimmed them at first, on the reasoning that its text is what will be
  * sent and hiding characters would strand the caret among them. That was half a
  * product — styled text with the asterisks still beside it reads as a leak — and
@@ -3016,7 +3016,7 @@ static void apply_richtext(IDWriteTextLayout *layout, const char *u8, size_t ble
             }
             continue;
         }
-        /* A link is accent + underline (WIN-112, REQ-220). Underline as well as
+        /* A link is accent + underline (REQ-220). Underline as well as
          * colour, because colour alone is not an affordance for a reader who
          * cannot distinguish it — the accent is also what a @mention wears, and
          * the underline is what says "this one goes somewhere". */
@@ -3130,7 +3130,7 @@ static IDWriteTextLayout *body_layout(const oc_msg *msg, float cw, UINT32 *wlen)
 /* Vertical layout of a message block. An ungrouped message gets an even top
  * margin (so the avatar/name isn't jammed against the block top) matching the
  * bottom pad; grouped continuations stay tight. */
-/* Message density (WIN-78). It scales the BLOCK MARGINS only — never the line
+/* Message density. It scales the BLOCK MARGINS only — never the line
  * height or the font — because "compact" means fitting more messages on screen,
  * and shrinking the text to do that is a text-size preference wearing the wrong
  * name. The two are separate settings for that reason. */
@@ -3219,7 +3219,7 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
          * that reads as "alice said this at 10:25" rather than as a mail client's
          * date column. Right-aligning it to the pane edge put metres of whitespace
          * between a name and its time on a wide window, and made the eye travel
-         * the full width of the transcript to answer "when" (WIN-107). */
+         * the full width of the transcript to answer "when". */
         D2D1_RECT_F hl = rf(tx, ty, x0 + content_w + AVA + 12, ty + 20);
         draw_text(rt, nm, g_title, hl, OC_COL_TEXT);
         if (msg->server_time) {
@@ -3482,7 +3482,7 @@ static void draw_day_sep(ID2D1RenderTarget *rt, uint64_t ms, D2D1_RECT_F reg, fl
  * `capture` is set, records per-message hit-boxes for the context menu. */
 /* mode: MSGLIST_MAIN for the transcript, MSGLIST_THREAD for the thread pane.
  * The thread pane needs the same hit-boxes and scrollbar the main list has —
- * without them its replies were read-only and it could not scroll (WIN-15) —
+ * without them its replies were read-only and it could not scroll —
  * but not the date dividers, which only make sense on a day-spanning scroll. */
 enum { MSGLIST_MAIN = 1, MSGLIST_THREAD = 2 };
 
@@ -3498,7 +3498,7 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
     if (content_w < 80) content_w = 80;
 
     size_t n = nmsgs, first = 0;
-    /* The render window, not a history limit: with paging (WIN-16) a channel can
+    /* The render window, not a history limit: with paging a channel can
      * hold far more than this, and only the newest CAP are laid out. Raised from
      * 600 so several pages stay reachable by scrolling without re-requesting. */
     enum { CAP = 2000 };
@@ -3538,7 +3538,7 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
     float visible = reg.bottom - reg.top;
     *scroll_max = total > visible ? total - visible : 0;
 
-    /* Resolve an armed jump (WIN-3). A message's top sits at
+    /* Resolve an armed jump. A message's top sits at
      *   screen_y = (reg.bottom - total) + g_scroll + jump_off,
      * so placing it a third of the way down the pane solves for g_scroll. The
      * clamp is what keeps a hit in the newest or oldest screenful sensible
@@ -3619,7 +3619,7 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
                     fill(rt, rf(reg.left, y, reg.left + 3, y + heights[i]), OC_COL_ACCENT);
                 }
             }
-            /* Saved for later (REQ-231, WIN-73): a bookmark in the right margin and
+            /* Saved for later (REQ-231): a bookmark in the right margin and
              * a faint inverse band. Deliberately NOT the accent used for a mention
              * two blocks up — a message can be both, and if the two tints matched
              * you could not tell which one you were looking at. OC_COL_SELECT is the
@@ -3683,7 +3683,7 @@ static void draw_msglist(ID2D1RenderTarget *rt, const oc_model *m,
         layouts[i] = NULL;
     }
 
-    /* At the top of what we hold, pull the previous page (WIN-16). Guarded by a
+    /* At the top of what we hold, pull the previous page. Guarded by a
      * single in-flight request and by a per-channel "no more" mark, so this
      * cannot turn a scroll into a request storm. */
     if (capture && *scroll_max > 0.5f && *scroll >= *scroll_max - 1.0f &&
@@ -3828,7 +3828,7 @@ static void draw_search(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
     D2D1_RECT_F body = pane_header(rt, reg, "Search");
     g_n_searchrows = 0;
 
-    /* The query box lives IN the overlay (WIN-4), so refining a search never
+    /* The query box lives IN the overlay, so refining a search never
      * closes and reopens it. The native EDIT is placed over this chrome by
      * layout_search(). */
     g_srch_box = rf(body.left + 20, body.top + 10, body.right - 20, body.top + 42);
@@ -3844,14 +3844,14 @@ static void draw_search(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
     else if (m->n_search == 0) snprintf(count, sizeof count, "No matches for \u201c%s\u201d.", m->search_query);
     else snprintf(count, sizeof count, "%zu %s for \u201c%s\u201d%s",
                   m->n_search, m->n_search == 1 ? "result" : "results", m->search_query,
-                  /* WIN-38 gave the wire a cursor, so this stops apologising and the
+                  /* gave the wire a cursor, so this stops apologising and the
                    * footer offers the next page instead. */
                   m->search_truncated ? " \u2014 more below" : "");
     draw_text(rt, count, g_meta, rf(body.left + 20, body.top, body.right - 16, body.top + 18),
               m->search_truncated ? OC_COL_NOTICE : OC_COL_MUTED);
     body.top += 22;
 
-    /* WIN-39: say what the query was UNDERSTOOD as, using the same parser that was
+    /* say what the query was UNDERSTOOD as, using the same parser that was
      * sent to the server. A filter that was silently ignored — or silently applied —
      * is the difference between a search you can trust and one you cannot. */
     if (m->search_query[0]) {
@@ -3907,7 +3907,7 @@ static void draw_search(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
         }
         y += rowh;
     }
-    /* WIN-38: the next page. Only when the server SAID there is more — a button that
+    /* the next page. Only when the server SAID there is more — a button that
      * fetches nothing teaches the user to distrust it. It sits after the last row, so
      * paging is a continuation of reading rather than a control you hunt for. */
     g_srch_more_btn = rf(0, 0, 0, 0);
@@ -3948,7 +3948,7 @@ static void draw_kv(ID2D1RenderTarget *rt, D2D1_RECT_F body, float *y,
     *y += 28;
 }
 
-/* WIN-24: TUI parity plus a refresh. The TUI's version groups the numbers into
+/* TUI parity plus a refresh. The TUI's version groups the numbers into
  * Disk / Policy / Reclaimed and flags pressure and evictions in red; this was a
  * flat key/value dump with no way to ask again. */
 static D2D1_RECT_F g_storage_refresh;
@@ -4013,7 +4013,7 @@ static void draw_audit(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
     ovl_use(OVL_AUDIT);
     if (m->n_audit == 0) { overlay_empty(rt, body, "No audit entries."); return; }
 
-    /* Family filter (WIN-19). Client-side over what has been paged in, which is
+    /* Family filter. Client-side over what has been paged in, which is
      * honest: it narrows what you are looking at, it does not re-query. */
     static const char *FAMS[5] = { "All", "Admin", "Account", "Security", "Moderation" };
     float fx = body.left + 20;
@@ -4080,7 +4080,7 @@ static void draw_weblist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
         return;
     }
     /* Rotate is the answer to a leaked token, because REVEAL IS IMPOSSIBLE: only the
-     * SHA-256 is stored, so the token cannot be shown again (WIN-48). Saying that
+     * SHA-256 is stored, so the token cannot be shown again. Saying that
      * here is the difference between a missing feature and an explained one. */
     draw_text(rt, "A token is shown once. If one leaks, rotate it \u2014 it cannot be shown again.",
               g_meta, rf(body.left + 20, body.top + 4, body.right - 16, body.top + 24), OC_COL_FAINT);
@@ -4139,7 +4139,7 @@ static void draw_weblist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F r
     ovl_end(rt, body);
 }
 
-/* WIN-12: every channel's notification level, editable in place. The prefs are
+/* every channel's notification level, editable in place. The prefs are
  * server-synced (REQ-130/131) and were reachable only one channel at a time from
  * a context menu, so there was no way to review them. */
 /* One right-aligned All/Mentions/None chip group, registering its own hit-boxes.
@@ -4207,7 +4207,7 @@ static void time_picker_open(int field, float x, float y, uint16_t current) {
     g_tp_rows_hover = -1;
 }
 
-/* --- the notification schedule's helpers (REQ-136, WIN-94) ----------------- */
+/* --- the notification schedule's helpers (REQ-136) ----------------- */
 
 /* A time as this client shows times everywhere else — the 12/24-hour preference
  * decides, so the schedule cannot disagree with the transcript. */
@@ -4721,7 +4721,7 @@ static const struct {
 } SHORTCUTS[] = {
     { 0,                  0,          ACC_NONE,  "Enter",              "Send the message" },
     { 0,                  0,          ACC_NONE,  "Shift+Enter",        "New line" },
-    /* Formatting (WIN-96). Display-only rows: the keys are dispatched inside the
+    /* Formatting. Display-only rows: the keys are dispatched inside the
      * composer (ed_key), not by accel_dispatch, because they mean nothing when
      * the field does not have focus — but somebody looking for them looks here. */
     { 0,                  0,          ACC_NONE,  "Ctrl+B / Ctrl+I",    "Bold / italic the selection" },
@@ -4794,7 +4794,7 @@ static void accel_run(HWND hwnd, int action) {
  * the real keyboard around focus and foreground changes, so a synthetic Ctrl
  * could be gone by the time it was read — intermittently, and only on the runs
  * where the window was not foreground. It produced years-of-your-life failures
- * that moved between runs and never reproduced by hand (WIN-87's residue). The
+ * that moved between runs and never reproduced by hand. The
  * state does not need to travel through the OS at all: the hook knows which
  * modifiers it means, so it says so. */
 static int g_synth_mods = -1;
@@ -5048,7 +5048,7 @@ enum { FS_ALL = 0, FS_MINE, FS_THEIRS, FS_SCOPES };
 static int g_file_scope;
 static D2D1_RECT_F g_file_scopes[FS_SCOPES];
 
-/* The Files view's left column (WIN-67). Slack separates the three filter axes
+/* The Files view's left column. Slack separates the three filter axes
  * by POSITION — collection on the left, ownership top-left, type and sort
  * top-right — because they are different questions and stacking them in one
  * chip row makes the user read all of them to find the one they want.
@@ -5060,11 +5060,11 @@ static D2D1_RECT_F g_file_scopes[FS_SCOPES];
  * channel is an exact refetch rather than a slice of the page we hold. */
 static uint64_t g_file_chan;                 /* 0 = everywhere I can see */
 /* One row of a channel column: which channel, and how many of the thing. Distinct
- * from the core's oc_chan_count (which the server fills for Files, WIN-82) because
+ * from the core's oc_chan_count (which the server fills for Files) because
  * the Later census is still computed client-side from the saved list. */
 typedef struct { uint64_t id; int n; } oc_gui_chan_count;
 
-/* The Later view's channel column (WIN-73). Same shape as the Files one above,
+/* The Later view's channel column. Same shape as the Files one above,
  * with one honest difference: LIST_SAVED takes NO arguments, unlike LIST_FILES
  * which takes a channel id — so picking a channel here filters the page we already
  * hold instead of re-asking the server. At the 200-item cap that is the whole list
@@ -5182,7 +5182,7 @@ static void files_build_order(const oc_model *m) {
  * files, and recounting there would collapse the column to the one row you are
  * standing on — the list you navigate by would vanish as you used it. */
 static void files_index(const oc_model *m) {
-    /* WIN-82: the SERVER computes this now (one GROUP BY over attachments), so the
+    /* the SERVER computes this now (one GROUP BY over attachments), so the
      * column is complete instead of "whatever channels appear in the newest 200
      * files". Nothing here counts any more — it just copies the census across. */
     g_n_fchan = 0;
@@ -5295,7 +5295,7 @@ static void draw_file_rows(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
     files_build_order(m);
     g_n_filerows = 0;
     int shown = 0;
-    /* Scrolling (WIN-76), through the offset five other panes already share. The
+    /* Scrolling, through the offset five other panes already share. The
      * list used to stop at the pane edge and merely COUNT what it could not show,
      * which told you the rows existed and still refused to reach them. */
     float rowh = UIS(50.0f);
@@ -5361,7 +5361,7 @@ static void draw_file_rows(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
         draw_text(rt, none, g_meta,
                   rf(body.left + 20, y + 6, body.right - 20, y + 26), OC_COL_FAINT);
     }
-    /* The "%d more — narrow the filters" line is gone with WIN-76: it existed only
+    /* The "%d more — narrow the filters" line is gone: it existed only
      * because the list could not scroll, and a count of unreachable rows is a worse
      * answer than a scrollbar. The 200-row SERVER cap below is different — that one
      * is a real limit and still has to be said. */
@@ -5385,7 +5385,7 @@ static void draw_filelist(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F 
 
 /* The Files view's left column: "All files", then the channels that have any,
  * each with its count. */
-/* The channel column shared by the Files and Later views (WIN-71, WIN-73).
+/* The channel column shared by the Files and Later views.
  *
  * One function for both, because they are the same widget with a different list
  * behind them, and two copies would drift the first time one of them changed. The
@@ -5441,7 +5441,7 @@ static void draw_chan_column(ID2D1RenderTarget *rt, const oc_model *m, float h,
     }
     if (!n_census)
         /* WRAPPING: g_meta does not, so this sentence was cut mid-word at the
-         * sidebar's edge — "once something i" (WIN-107). */
+         * sidebar's edge — "once something i". */
         draw_text(rt, empty_hint, g_meta_w,
                   rf(RAIL_W + 16, y + 2, RAIL_W + SIDEBAR_W - 12, y + 76), OC_COL_FAINT);
     else if (foot)
@@ -5455,7 +5455,7 @@ static void draw_files_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h
                      g_fchan, g_n_fchan, g_file_chan,
                      g_fchan_rows, &g_n_fchan_rows,
                      "Channels appear here once something is shared in them.",
-                     NULL);   /* WIN-82: the census is exact now, so no caveat to state */
+                     NULL);   /* the census is exact now, so no caveat to state */
 }
 
 /* The workspace-wide Files view (rail). The same list with `channel_id 0`, which
@@ -5537,7 +5537,7 @@ enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
        PREF_ROW_DENSITY, PREF_ROW_ZOOM, PREF_ROW_DPI, PREF_ROW_RESET,
        PREF_ROW_EDITOR };
 
-/* Preferences is two-paned (WIN-78): categories left, one category's rows right.
+/* Preferences is two-paned: categories left, one category's rows right.
  * A single scrolling list was fine at six rows and is not at fourteen — and the
  * rows are not one subject: how the app LOOKS, how messages READ, when it
  * INTERRUPTS you, and the machine-level escape hatches are four different
@@ -5686,7 +5686,7 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
                      "How message timestamps are shown.", TIMES, 2, g_pref_time24);
         y = pref_row(rt, body, y, PREF_ROW_DAYSEP, "Date dividers",
                      "A separator between days in the transcript.", ONOFF, 2, g_pref_daysep);
-        /* WIN-103. Slack has the same switch, for the same people: one group
+        /* Slack has the same switch, for the same people: one group
          * wants a box that formats what they type, the other types the markup
          * fluently and wants to be left alone. The rich editor is the default
          * because it is the one that needs no explanation. */
@@ -5694,7 +5694,7 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
                      "Rich text formats as you type. Plain text shows the markup "
                      "and never restyles it.",
                      EDITORS, 2, g_pref_richtext);
-        /* WIN-28: the quick reactions were six literals in the source. */
+        /* the quick reactions were six literals in the source. */
         {
             static const char *EDIT1[1] = { "Change" };
             char cur[128] = "";
@@ -5982,7 +5982,7 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
     /* MEASURE the right-hand cluster before drawing the title, and reserve what it
      * actually needs. A flat 240 was fine at 100% and at Largest text left the
      * title a rect narrower than one word — the header rendered as a bare "#",
-     * with the channel's name nowhere on screen (WIN-111). */
+     * with the channel's name nowhere on screen. */
     char mc[16] = "";
     if (c && m->chanmem_channel == g_sel && !m->chanmem_loading)
         snprintf(mc, sizeof mc, "%u", (unsigned)m->n_chanmem);
@@ -6020,7 +6020,7 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
                                       g_memchip.right, g_memchip.bottom), mcol);
     g_members_btn = rf(0, 0, 0, 0);   /* superseded by the chip */
 
-    /* Jump-to-unread (WIN-14): only while this channel actually has a divider to
+    /* Jump-to-unread: only while this channel actually has a divider to
      * jump to, so it is never a dead control. */
     float statr = g_memchip.left - 12;
     if (ulbl[0]) {
@@ -6036,13 +6036,13 @@ static void draw_header(ID2D1RenderTarget *rt, const oc_model *m, float x0, floa
         g_unread_jump = rf(0, 0, 0, 0);
     }
 
-    /* No connection text here any more (WIN-64): it is workspace state, shown on
+    /* No connection text here any more: it is workspace state, shown on
      * the workspace name, and the banner below carries the detail when it
      * matters. `statr` survives because the unread-jump pill positions off it. */
     (void)statr;
 }
 
-/* Switch channel tab (WIN-37). Each tab owns the sub-view it names, so entering
+/* Switch channel tab. Each tab owns the sub-view it names, so entering
  * one closes the others rather than stacking overlays — the state the tab strip
  * displays and the state the transcript renders are the same variable. */
 static void select_tab(int t) {
@@ -6050,7 +6050,7 @@ static void select_tab(int t) {
     const oc_model *mm = model();
     /* A tab that does not exist here cannot be selected — by click, by the palette,
      * or by the test hook. Switching from a channel to a DM while About was open
-     * would otherwise leave the pane showing a surface with no tab (WIN-74). */
+     * would otherwise leave the pane showing a surface with no tab. */
     if (mm && g_sel && !tab_applies(oc_model_channel((oc_model *)mm, g_sel), t)) t = TAB_MESSAGES;
     if (mm && mm->pinlist_open)  oc_client_close_pins(g_client);
     if (mm && mm->filelist_open) oc_client_close_files(g_client);
@@ -6105,7 +6105,7 @@ static float draw_banner(ID2D1RenderTarget *rt, const oc_model *m, float x0, flo
     g_banner_on = 0;
     if (!m || m->authed) return 0;
 
-    /* A LIVE countdown (WIN-55). The core's error string states the delay once
+    /* A LIVE countdown. The core's error string states the delay once
      * per backoff, so the number in it never moved — it read as a hung client.
      * The deadline ticks because the model now carries it, and the same clock
      * source is used on both sides so the two cannot disagree. */
@@ -6214,7 +6214,7 @@ static void draw_palette(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
     struct { const char *label, *kind; int cmd; uint64_t cid; } hit[12];
     int nh = 0;
     /* While a forward is pending the palette is a DESTINATION picker, so the action
-     * rows are left out entirely (WIN-51). They were listed first, which put "Create
+     * rows are left out entirely. They were listed first, which put "Create
      * a channel" under the selection — and choosing an action mid-forward can only
      * cancel it. A list whose top item undoes the thing you started is worse than a
      * shorter list. */
@@ -6384,7 +6384,7 @@ static void draw_members(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
          * horizontal space on every row to serve the rare one, in a pane only
          * 220px wide. Owner gets a crown, admin a shield, member nothing: a
          * marker on every row is noise, and "member" is the default that needs no
-         * saying. The glyph is an at-a-glance hint; the profile pane (WIN-10)
+         * saying. The glyph is an at-a-glance hint; the profile pane
          * remains the answer, in words. */
         if (cm->role >= OC_ROLE_ADMIN) {
             float gx = x0 + 34 + text_width(disp, g_ui) + 6;
@@ -6392,7 +6392,7 @@ static void draw_members(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
                 draw_lucide(rt, cm->role == OC_ROLE_OWNER ? OC_ICON_CROWN : OC_ICON_SHIELD,
                             rf(gx, y + ROW_H / 2 - 7, gx + 14, y + ROW_H / 2 + 7), OC_COL_FAINT);
         }
-        /* A custom status (REQ-241, WIN-53) sits after the name and role, dimmed —
+        /* A custom status (REQ-241) sits after the name and role, dimmed —
          * it is what somebody is DOING, so it must not compete with who they are.
          * An expired one never arrives: the daemon suppresses it on read, so this
          * needs no clock of its own. */
@@ -6557,7 +6557,7 @@ static void draw_signin(ID2D1RenderTarget *rt, float W, float H) {
         g_si_back = rf(fx, y, fx + fw, y + 20);
         IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_CENTER);
         draw_text(rt, "\xE2\x86\x90 Use a different workspace", g_meta, g_si_back, OC_COL_ACCENT);
-        /* WIN-32: the only way to turn an invite into an account used to be the
+        /* the only way to turn an invite into an account used to be the
          * command line. Signup is its own small form rather than three more
          * fields on this card, which would push the layout around for a path
          * most people take once. */
@@ -6830,7 +6830,7 @@ static int main_is_conversation(void);   /* fwd — decides the composer, chrome
 static float members_w(float client_w_dip); /* fwd — the members pane yields when narrow */
 static int   main_is_conversation(void);    /* fwd — and it belongs to a conversation */
 
-/* ---- the formatting toolbar (WIN-96) --------------------------------------
+/* ---- the formatting toolbar --------------------------------------
  * Seven buttons, drawn rather than iconised. B / I / S are the letterforms
  * themselves — the style IS the icon, which is why every editor since the first
  * one has drawn them this way and why no icon set improves on it. The four
@@ -6917,7 +6917,7 @@ static void draw_fmt_toolbar(ID2D1RenderTarget *rt, float bx0, float by0, float 
         if (i == FMT_QUOTE) x += 8;
         /* Stop at the box's edge. At a small window and a large scale the seven
          * buttons are wider than the composer, and the tail was drawn off the
-         * WINDOW — found as composer.format.numbers escaping (WIN-111). Every one
+         * WINDOW — found as composer.format.numbers escaping. Every one
          * of them has a keyboard chord and a palette entry, so a button that does
          * not fit is hidden rather than unreachable. */
         if (x + sq > bx1 - 8) {
@@ -6938,7 +6938,7 @@ static void draw_fmt_toolbar(ID2D1RenderTarget *rt, float bx0, float by0, float 
  * to agree exactly, in two functions four thousand lines apart. They did agree,
  * right up until the field's real line height stopped matching the height the box
  * had been measured for, and then the text was drawn over the icons while the hit
- * rect said it was not (WIN-111). Neither copy was wrong on its own; having two of
+ * rect said it was not. Neither copy was wrong on its own; having two of
  * them was.
  *
  * `field` is clamped to stop COMPOSER_GAP short of the action row whatever the
@@ -7009,7 +7009,7 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
      * The left cluster yields to Send rather than growing under it: on a narrow
      * window at a large scale the three of them plus the send button are wider
      * than the box, and @ ended up beneath Send — caught as
-     * composer.mention+composer.send (WIN-111). Send is the one that must always
+     * composer.mention+composer.send. Send is the one that must always
      * be there, so the optional icons drop off from the right. */
     float left_limit = bx1 - COMPOSER_GUTTER - sq - UIS(30);
     g_at_btn = rf(bx0 + COMPOSER_GUTTER + sq * 2, cy, bx0 + COMPOSER_GUTTER + sq * 3, cy + sq);
@@ -7031,7 +7031,7 @@ static void draw_composer(ID2D1RenderTarget *rt, float x0, float w, float h) {
         draw_lucide(rt, OC_ICON_AT, rf(g_at_btn.left + 8, g_at_btn.top + 8,
                                        g_at_btn.right - 8, g_at_btn.bottom - 8), OC_COL_MUTED);
 
-    /* THE FIELD (WIN-80). Between the left buttons and Send, at the rect
+    /* THE FIELD. Between the left buttons and Send, at the rect
      * layout_composer computed — the same rect ed_hit tests against, so what you
      * click is what you see. */
     if (cfield.right > cfield.left) ed_draw(rt, cfield);
@@ -7127,7 +7127,7 @@ static int modal_open(void) {
 
 static D2D1_RECT_F g_modal_card;
 
-/* ---- confirm() : a themed confirmation on the modal frame (WIN-77) ----------
+/* ---- confirm() : a themed confirmation on the modal frame ----------
  *
  * Replaces MessageBoxW. Native message boxes cannot be themed, look foreign beside
  * the rest of the app, and — the reason this moved up the list — **cannot be driven
@@ -7284,7 +7284,7 @@ static D2D1_RECT_F modal_frame(ID2D1RenderTarget *rt, const oc_modal_spec *s,
 
     /* Two sizes rather than free arithmetic: the old per-modal `cw = W - 160`
      * gave a six-row settings list a 720px card. */
-    /* The card holds text, so it grows with it (WIN-111). At Largest text a fixed
+    /* The card holds text, so it grows with it. At Largest text a fixed
      * 720x620 could not hold what it was asked to draw, and — since nothing
      * clipped — the overflow painted over the shell behind the card, with the
      * footer buttons underneath its own rows. */
@@ -7304,7 +7304,7 @@ static D2D1_RECT_F modal_frame(ID2D1RenderTarget *rt, const oc_modal_spec *s,
      * would composite above the card and punch through it. */
     /* Title then subtitle, STACKED by the title's own height rather than by a
      * constant 30: at large text the two were drawn on top of each other, since
-     * the title grew and the subtitle's offset did not (WIN-111). */
+     * the title grew and the subtitle's offset did not. */
     int has_sub = (s->subtitle && s->subtitle[0]) ? 1 : 0;
     float title_line = UIS(30.0f);
     draw_text(rt, s->title, g_display,
@@ -7433,7 +7433,7 @@ static D2D1_RECT_F modal_frame(ID2D1RenderTarget *rt, const oc_modal_spec *s,
  * same description the painter used. */
 static const oc_modal_spec *modal_current(void);
 
-/* ---- the generic form, on the frame (WIN-77) -------------------------------
+/* ---- the generic form, on the frame -------------------------------
  *
  * Row heights are computed per field, so a one-field rename is not padded out to
  * the size of a three-field sign-up. Checks and choices are drawn with the same
@@ -7548,13 +7548,13 @@ static void draw_modal(ID2D1RenderTarget *rt, const oc_model *m, float W, float 
      * past the card at large text, over the shell behind it and over the footer
      * buttons. Clipping turns an unreadable overlap into an obvious truncation,
      * and the card growing with the text removes most of the truncation
-     * (WIN-111). The clip lives here rather than in modal_frame because the frame
+     *. The clip lives here rather than in modal_frame because the frame
      * returns and the caller draws afterwards. */
     /* NEVER an inverted rect. At a large scale in a small window the scaled title
      * band and footer can exceed the card, leaving body.bottom above body.top —
      * and D2D faults INSIDE d2d1.dll on an inverted clip rather than refusing it.
      * That crash took the client down mid-suite and surfaced as a dozen unrelated
-     * failures (WIN-111). */
+     * failures. */
     D2D1_RECT_F clip = rf(body.left, body.top,
                           body.right > body.left ? body.right : body.left,
                           body.bottom > body.top ? body.bottom : body.top);
@@ -7827,7 +7827,7 @@ static int modal_key(HWND hwnd, WPARAM vk) {
  *
  * Deciding it per-control, at each control's own site, is what made this recur.
  * The find box leaked three times as the second column gained new tenants
- * (WIN-70), and the composer stayed live in the DMs index, where there is no
+ *, and the composer stayed live in the DMs index, where there is no
  * conversation to type into. Every one of those was a different file location
  * asking a slightly different question.
  *
@@ -7924,7 +7924,7 @@ static int g_dm_compose;              /* the "start a conversation" picker is up
  * than it looks — an expression repeated is a rule waiting to be applied in one
  * place and not another — and it duly was: the search box asked none of them,
  * so leaving search open and walking to DMs floated a native EDIT over the
- * third person in the picker (WIN-99). Anything that depends on what the middle
+ * third person in the picker. Anything that depends on what the middle
  * column HOLDS asks here. */
 static int dm_index_view(void) {
     const oc_model *m = model();
@@ -7979,7 +7979,7 @@ static int shell_visible(void) {
  * open the workspace menu instead, which is a dead end wearing a signpost. Both
  * reports were already built; this just puts them where the rail already
  * promised they were. */
-/* WIN-46 adds Invites: the `invites` table has always held role and expiry, and
+/* adds Invites: the `invites` table has always held role and expiry, and
  * nothing could see them, so a minted invite was write-only. */
 enum { ADM_STORAGE = 0, ADM_AUDIT, ADM_INVITES, ADM_COUNT };
 static int g_adm_tab;
@@ -7995,7 +7995,7 @@ static void admin_select(int t) {
     else                       { oc_client_toggle_audit(g_client, 1);   oc_client_audit_query(g_client, 0); }
 }
 
-/* Outstanding invites (REQ-026, WIN-46). Soonest expiry first, because the useful
+/* Outstanding invites (REQ-026). Soonest expiry first, because the useful
  * question is "what is about to lapse" — the server sorts it that way. */
 static void draw_invites(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F body) {
     g_n_invrows = 0;
@@ -8232,7 +8232,7 @@ static void draw_dm_list(ID2D1RenderTarget *rt, const oc_model *m, float h) {
         if (g_dm_hover == best->channel_id || g_sel == best->channel_id)
             fill_round(rt, row, 6.0f, g_sel == best->channel_id ? OC_COL_SELECT : OC_COL_HOVER);
 
-        /* WIN-95: a GROUP DM has no single peer, so deriving the name from
+        /* a GROUP DM has no single peer, so deriving the name from
          * `peer_id` produced the fallback "user" and the avatar colour for id 0 —
          * while the Home sidebar, which asks the core, titled the same
          * conversation "bob, carol". One renderer (`oc_model_dm_title`) answers
@@ -8295,7 +8295,7 @@ static void draw_dm_list(ID2D1RenderTarget *rt, const oc_model *m, float h) {
 static struct { D2D1_RECT_F r; D2D1_RECT_F chk; uint64_t uid; } g_pickrows[256];
 static int g_n_pickrows;
 
-/* WIN-93: who is being gathered for a group message. The picker used to be a
+/* who is being gathered for a group message. The picker used to be a
  * single-line form asking for "two to eight usernames, comma separated" — which
  * is a command line in a dialog, and required knowing and spelling names the app
  * was already showing on screen. Selecting people from the list of people is the
@@ -8470,7 +8470,7 @@ static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h
     for (int i = 0; i < AF_COUNT; i++) {
         /* 12px of padding and a 3px gap rather than 16 and 4: seven chips then
          * fit TWO rows in a 248px column instead of three, and three rows of
-         * chrome above a list is chrome outweighing content (WIN-107). */
+         * chrome above a list is chrome outweighing content. */
         float fw = text_width(L[i], g_meta) + 12;
         if (fx > x0 + 12 && fx + fw > x1 - 8) { fx = x0 + 12; fy += 26; }
         D2D1_RECT_F b = rf(fx, fy, fx + fw, fy + 22);
@@ -8520,7 +8520,7 @@ static void draw_activity_list(ID2D1RenderTarget *rt, const oc_model *m, float h
         draw_lucide(rt, icon, rf(row.left + 46, y + 25, row.left + 60, y + 39), OC_COL_FAINT);
         char whereline[128];
         /* A DM has no name, so "in a conversation" would be the whole answer for
-         * every unread from a person — say who it is with instead (WIN-97). */
+         * every unread from a person — say who it is with instead. */
         const char *peer = (ch && ch->kind == OC_CHANNEL_KIND_DM)
                          ? oc_model_user_name((oc_model *)m, ch->peer_id) : NULL;
         snprintf(whereline, sizeof whereline, "%s in %s%s",
@@ -8874,7 +8874,7 @@ static void draw_newmsg(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
     if (composer_toolbar_on()) draw_fmt_toolbar(rt, edbox.left, edbox.top, edbox.right);
     /* The same three bands as the conversation composer — toolbar, text, actions
      * — because it is the same control. Send sat OUTSIDE the box here, which made
-     * the two look like different things doing the same job (WIN-107). */
+     * the two look like different things doing the same job. */
     g_nm_ed = rf(edbox.left + COMPOSER_PAD, edbox.top + composer_tb() + 8,
                  edbox.right - COMPOSER_PAD, edbox.bottom - COMPOSER_ACTIONS - 6);
     ed_draw(rt, g_nm_ed);
@@ -9028,7 +9028,7 @@ static void draw_empty_state(ID2D1RenderTarget *rt, D2D1_RECT_F body, int icon,
         fill_round(rt, b, 6.0f, OC_COL_ACCENT);
         /* Centred by DirectWrite in BOTH axes rather than by a hand-picked top
          * inset: the inset was right for one text size and dropped the label
-         * onto the button's bottom edge at every other (WIN-106). */
+         * onto the button's bottom edge at every other. */
         IDWriteTextFormat_SetParagraphAlignment(g_ui, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         draw_text(rt, cta, g_ui, b, 0xFFFFFF);
         IDWriteTextFormat_SetParagraphAlignment(g_ui, DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
@@ -9101,7 +9101,7 @@ static int dir_matches(const oc_member *u, const char *lower_needle) {
     return strstr(hay, lower_needle) != NULL;
 }
 
-/* The people directory (REQ-289, WIN-109).
+/* The people directory (REQ-289).
  *
  * Slack's shape: a full pane with a search field and a row per person — avatar,
  * display name, title, presence — and clicking one opens their profile. Ours
@@ -9193,7 +9193,7 @@ static void draw_directory(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F
     ovl_end(rt, body);
 }
 
-/* Threads I am in, across every channel (REQ-062, ARCH-104, WIN-108).
+/* Threads I am in, across every channel (REQ-062, ARCH-104).
  *
  * Slack's shape: a full-width feed of cards, newest activity first. A card is the
  * thread's root — who wrote it, where, and what it says — with the reply count,
@@ -9381,7 +9381,7 @@ static void draw_drafts(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F re
             if (g_listrow_hover == dv->channel_id) fill_round(rt, row, 6.0f, OC_COL_HOVER);
             /* When it was last touched, right-aligned as Slack's drafts list has
              * it: a list of drafts with no times cannot be triaged, and the row
-             * already had the field (WIN-107). */
+             * already had the field. */
             char dwhen[24] = "";
             if (dv->updated_ms) rel_time(dv->updated_ms, dwhen, sizeof dwhen);
             draw_msgish_row(rt, m, row, dv->channel_id, dv->body, dwhen[0] ? dwhen : NULL,
@@ -9522,7 +9522,7 @@ static void draw_later(ID2D1RenderTarget *rt, const oc_model *m, D2D1_RECT_F reg
         overlay_empty(rt, body, "Nothing saved. Use \u22EF \u2192 Save for later on any message.");
         return;
     }
-    /* Scrolling via the shared overlay offset (WIN-76) — the same helper the audit,
+    /* Scrolling via the shared overlay offset — the same helper the audit,
      * webhook, reaction, notify and shortcut panes use. A private offset here would
      * have been a sixth copy of a solved problem. */
     float rowh = UIS(56.0f);
@@ -9594,7 +9594,7 @@ static void draw_stub_view(ID2D1RenderTarget *rt, D2D1_RECT_F reg,
 static void draw_lightbox(ID2D1RenderTarget *rt, float W, float H);   /* fwd */
 
 static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, float H) {
-    shell_scale_update(W, H);   /* the shell's furniture is capped by the window (WIN-111) */
+    shell_scale_update(W, H);   /* the shell's furniture is capped by the window */
     /* Start from a known identity transform — draw_lucide sets a scale/translate
      * transform per icon and resets it, but reset defensively here so a leaked
      * transform can never distort the menu/avatar chrome (guards the malformed
@@ -9662,14 +9662,14 @@ static void render_scene(ID2D1RenderTarget *rt, const oc_model *m, float W, floa
         D2D1_RECT_F reg = rf(RAIL_W, 0, W, H);
         switch (g_view) {
             /* Files is the one non-transcript view with a second column of its
-             * own (WIN-67), so it narrows the region rather than taking the
+             * own, so it narrows the region rather than taking the
              * whole width — sidebar_kind() says SBK_FILES to match. */
             case VIEW_FILES:
                 draw_files_sidebar(rt, m, H);
                 draw_files_view(rt, m, rf(RAIL_W + SIDEBAR_W, 0, W, H));
                 break;
             case VIEW_LATER:
-                /* Files-shaped (WIN-73): its own channel column, narrowed region. */
+                /* Files-shaped: its own channel column, narrowed region. */
                 draw_later_sidebar(rt, m, H);
                 draw_later(rt, m, rf(RAIL_W + SIDEBAR_W, 0, W, H));
                 break;
@@ -9756,7 +9756,7 @@ static void paint(HWND hwnd) {
     }
 }
 
-/* ---- the composer: our own editor (WIN-80, ARCH-98) ------------------------
+/* ---- the composer: our own editor (ARCH-98) ------------------------
  *
  * It was a native RichEdit, chosen by ARCH-82 for good reasons — editing, IME,
  * selection, clipboard and undo for free. ARCH-98 amends that, and the cost is
@@ -9777,7 +9777,7 @@ static void paint(HWND hwnd) {
  * caret, the selection and the composition string ours to draw — and it is why
  * every native-child rule in layout_natives no longer applies to the composer.
  *
- * IME is the named risk (docs/WIN32_BACKLOG.md, WIN-80). The composition string
+ * IME is the named risk. The composition string
  * is drawn inline with an underline and the candidate window is positioned at the
  * caret; what cannot be self-verified here is how it behaves for CJK input on a
  * machine whose author does not use it, and that is recorded rather than claimed.
@@ -9794,7 +9794,7 @@ static int   g_ed_caret, g_ed_anchor;      /* selection is [min, max) */
 static int   g_ed_dragging;
 static float g_ed_scroll;                  /* DIPs, vertical */
 
-/* How tall one line of the field actually is (WIN-105).
+/* How tall one line of the field actually is.
  *
  * COMPOSER_LINE is 20 and was used as the answer everywhere. It is not the
  * answer: fonts_build gives g_body UNIFORM line spacing of 22 DIP times the
@@ -9840,7 +9840,7 @@ typedef struct { WCHAR t[ED_MAX + 1]; int len, caret; } ed_snap;
 static ed_snap g_ed_undo[ED_UNDO], g_ed_redo[ED_UNDO];
 static int g_ed_n_undo, g_ed_n_redo;
 
-/* ---- WYSIWYG (WIN-101, REQ-220, ARCH-100) ----------------------------------
+/* ---- WYSIWYG (REQ-220, ARCH-100) ----------------------------------
  * The field shows FORMATTING, never markup — the same rendering the transcript
  * gives, so what you are typing looks like what will be posted. Slack shows no
  * markup either, and a field that showed half of it (styled text with the
@@ -9894,7 +9894,7 @@ static void ed_hidden_build(void) {
     int bytes;
     g_ed_hidden_valid = 1;
     memset(g_ed_hidden, 0, sizeof g_ed_hidden);
-    /* PLAIN TEXT mode (WIN-103) is exactly this: nothing is hidden. Every rule
+    /* PLAIN TEXT mode is exactly this: nothing is hidden. Every rule
      * above keys off that one fact — ed_canon becomes the identity, ed_step
      * becomes plus or minus one, typed text lands where the caret is, and
      * ed_repair_orphans finds nothing to repair because nothing was invisible.
@@ -9955,7 +9955,7 @@ static int ed_canon(int pos) {
     return pos;
 }
 
-/* Markup must never APPEAR on screen without being typed (WIN-101).
+/* Markup must never APPEAR on screen without being typed.
  *
  * The delimiters live in the buffer, so an edit somewhere else can stop a
  * construct parsing and make them visible again. Delete the space in "a *x* b"
@@ -10015,7 +10015,7 @@ static void ed_remember(void) {
     memcpy(g_ed_prev_hidden, g_ed_hidden, (size_t)g_ed_len);
 }
 
-/* The editor mode changed (WIN-103/104). Re-baseline before anything else can
+/* The editor mode changed (104). Re-baseline before anything else can
  * run: the snapshot the repair measures against was taken under the OTHER
  * mode's rules, and in plain text nothing is hidden at all. Without this, the
  * first keystroke after a switch reads every delimiter that used to be
@@ -10163,12 +10163,12 @@ static void ed_replace_range(int a, int b, const WCHAR *s) {
 
 static void ed_select_all(void) { g_ed_anchor = 0; g_ed_caret = g_ed_len; }
 
-/* ---- formatting (WIN-96, REQ-220, ARCH-100) --------------------------------
+/* ---- formatting (REQ-220, ARCH-100) --------------------------------
  * The toolbar and its chords insert the SAME delimiters you could have typed.
  * There is no rich-text model behind them and there deliberately cannot be one:
  * ARCH-100 §5 says anything the toolbar produces must be expressible in text,
  * or a message becomes editable in one authoring path and not the other. So
- * these functions edit the plain body, and the field's live rendering (WIN-90)
+ * these functions edit the plain body, and the field's live rendering
  * shows what the parser made of the result.
  *
  * Which means this toolbar can do something a WYSIWYG one cannot: produce
@@ -10432,7 +10432,7 @@ static IDWriteTextLayout *ed_layout(float w) {
         static char u8[(ED_MAX + 130) * 3 + 1];   /* static: too big for the stack */
         int bytes = WideCharToMultiByte(CP_UTF8, 0, tmp, n, u8, (int)sizeof u8 - 1, NULL, NULL);
         /* Show the formatting AS YOU TYPE (REQ-220), with no markup at all
-         * (WIN-101) — the same call the transcript makes, so the field and the
+         * — the same call the transcript makes, so the field and the
          * message it becomes are drawn by one piece of code. Affordable only
          * because the parser is client-side and runs over a <=4000-unit buffer:
          * the same pass that already re-scans mentions on every keystroke. */
@@ -10487,7 +10487,7 @@ static int ed_lines(float w) {
  * nobody placed this frame belongs to a field that is no longer on screen — and
  * it does NOT go away by itself, because our CreateCaret adopts the thread's
  * caret, so if a native EDIT had shown one, ours blinks wherever it was last
- * put. That is the bar left sitting at the bottom of the Drafts pane (WIN-106). */
+ * put. That is the bar left sitting at the bottom of the Drafts pane. */
 static int   g_caret_owned;
 static POINT g_caret_at = { -32768, -32768 };
 
@@ -10635,9 +10635,9 @@ static void ed_changed(HWND hwnd) {
         oc_client_typing(g_client, g_sel);
         g_last_typing = now;
     }
-    ed_repair_orphans();      /* WIN-101, before anything measures or draws */
+    ed_repair_orphans();      /* before anything measures or draws */
     ed_remember();
-    /* The draft is behind again (WIN-91). The write itself is debounced on the
+    /* The draft is behind again. The write itself is debounced on the
      * ordinary tick: a frame per keystroke would be chattier than anything else
      * this client sends, and a draft nobody is reading yet does not need to be
      * that fresh. Leaving, blurring and quitting all flush immediately. */
@@ -10776,7 +10776,7 @@ static int ed_key(HWND hwnd, WPARAM vk) {
         if (g_edit_msg) { composer_cancel_edit(); return 1; }
         return 0;                            /* let the shell close what is open */
     case 'A': if (ctrl) { ed_select_all(); InvalidateRect(hwnd, NULL, FALSE); return 1; } return 0;
-    /* Formatting (WIN-96). Slack's bindings, because they are the ones in the
+    /* Formatting. Slack's bindings, because they are the ones in the
      * fingers of anyone arriving here — and the Ctrl+Shift pairs sit on top of
      * cut and copy exactly as they do there. */
     case 'B': if (ctrl && !shift) { ed_format(FMT_BOLD);   changed = 1; break; } return 0;
@@ -10850,9 +10850,9 @@ static void ed_mouse_up(void) {
     ReleaseCapture();
 }
 
-/* ---- double-click word selection (WIN-100) --------------------------------
+/* ---- double-click word selection --------------------------------
  * A native EDIT does this for free, which is why nothing here did it after
- * WIN-80/ARCH-98 replaced the RichEdit with a self-drawn field: the behaviour
+ * ARCH-98 replaced the RichEdit with a self-drawn field: the behaviour
  * left with the control and no test missed it, because the harness could not
  * express a gesture at all until `drag` was added alongside this.
  *
@@ -11024,7 +11024,7 @@ static void ed_draw(ID2D1RenderTarget *rt, D2D1_RECT_F box) {
      * Only when the caret FITS. `cr` already carries `-g_ed_scroll`, so this is
      * a feedback loop, and a caret taller than its view has no offset that puts
      * both of its edges inside: the two branches then alternate forever and the
-     * line visibly oscillates (WIN-105). The geometry above makes that
+     * line visibly oscillates. The geometry above makes that
      * impossible now — the box is a real line tall — and this is the guard that
      * keeps it impossible if some future size makes them disagree again. */
     D2D1_RECT_F cr;
@@ -11075,7 +11075,7 @@ static void sched_menu_open(float x, float y) {
     if (g_menu_y < 8) g_menu_y = 8;
 }
 
-/* --- the automation surface's identifiers (REQ-290, WIN-110) ----------------
+/* --- the automation surface's identifiers (REQ-290) ----------------
  *
  * An invoke token is what a press TURNS INTO, carried opaquely through a11y.c
  * and posted back to this thread. The high byte is the kind and the rest is its
@@ -11143,7 +11143,7 @@ static const char *view_aid(int act) {
     }
 }
 
-/* The published scene, kept at file scope so the harness can measure it (WIN-111).
+/* The published scene, kept at file scope so the harness can measure it.
  * It is already the app's own account of every element it drew and where — which
  * is exactly what a fit check needs, and it costs nothing to reuse. */
 static oc_acc_item g_acc_items[OC_ACC_MAX];
@@ -11331,7 +11331,7 @@ static void a11y_publish_scene(const oc_model *m) {
 }
 
 
-/* ---- composer autocomplete (WIN-7) ---------------------------------------
+/* ---- composer autocomplete ---------------------------------------
  * Everything works in UTF-16 for the RichEdit and UTF-8 for the core: the text
  * up to the caret is converted once for oc_complete(), while the replacement
  * range is found by scanning the UTF-16 buffer back to the token's whitespace
@@ -11570,7 +11570,7 @@ static float members_w(float client_w_dip) {
     if (!g_show_members || !m || !m->authed) return 0;
     /* A roster with no conversation beside it is the LAST conversation's roster:
      * in the DMs index with nothing picked, the pane listed the members of the
-     * channel you had left, which reads as a fact about the empty pane (WIN-107).
+     * channel you had left, which reads as a fact about the empty pane.
      * The same predicate the composer uses — one question, one answer. */
     if (!main_is_conversation()) return 0;
     return (client_w_dip - RAIL_W - SIDEBAR_W - MEMBERS_W < MAIN_MIN_W) ? 0 : MEMBERS_W;
@@ -11602,10 +11602,10 @@ static int window_is_covered(void) {
 
 static void layout_composer(HWND hwnd) {
     layout_find(hwnd);
-    /* The composer is drawn, not moved (WIN-80): this computes the TEXT RECT that
+    /* The composer is drawn, not moved: this computes the TEXT RECT that
      * ed_draw paints into and ed_hit tests against. There is no child window to
      * show or hide any more — which also means no bare control punched through an
-     * overlay, the class of bug that produced WIN-70 and its two relatives. Focus
+     * overlay, the class of bug that produced three defects in a row. Focus
      * is still dropped when the field is not typeable, or keys would go to a field
      * nobody can see. */
     /* The New Message pane BORROWS this field (REQ-229) and places it itself, so
@@ -11685,7 +11685,7 @@ static void layout_find(HWND hwnd) {
     /* The SCALE is part of "changed" too, and it was not: text size or zoom moved
      * the chrome this box sits in while the cache said nothing had happened, so
      * the control stayed at its old place — a bare white rectangle floating over
-     * the sidebar (WIN-111). */
+     * the sidebar. */
     if (want == shown && laid_at_dpi == g_dpi && laid_at_scale == g_text_scale) return;
     shown = want;
     laid_at_dpi = g_dpi;
@@ -11799,7 +11799,7 @@ static void layout_search(HWND hwnd) {
      * — and layout_find's comment claiming search "is already gated on its own
      * pane's open flag" is exactly the assumption that was wrong: `g_pick_open`
      * is a static the paint pass clears on leaving the shell, `search_open` is
-     * not. Reported from a screenshot of the running client (WIN-99). */
+     * not. Reported from a screenshot of the running client. */
     if (!m || !m->search_open || !transcript_shell() || dm_index_view() ||
         window_is_covered()) {
         ShowWindow(g_srch, SW_HIDE); return;
@@ -11849,13 +11849,13 @@ static void palette_open(HWND hwnd) {
 
 /* Run the highlighted row. Closing FIRST matters: several commands open a modal
  * form, and the palette must not still be on screen behind it. */
-static int  permalink_follow(HWND hwnd, const char *text);   /* fwd (WIN-44) */
-static void forward_send(HWND hwnd, uint64_t to_cid);        /* fwd (WIN-51) */
+static int  permalink_follow(HWND hwnd, const char *text);   /* fwd */
+static void forward_send(HWND hwnd, uint64_t to_cid);        /* fwd */
 
 static void palette_accept(HWND hwnd) {
     g_pal_accepting = 1;
     /* A pasted permalink is accepted here rather than in the composer, and that is
-     * the deliberate half of WIN-44: pasting a link into the message box must keep
+     * the deliberate half of the paste rule: pasting a link into the message box must keep
      * INSERTING it, because sharing a link is the common case. The palette is the
      * "jump to" surface, so following one there surprises nobody. */
     {
@@ -11874,7 +11874,7 @@ static void palette_accept(HWND hwnd) {
     uint64_t cid = g_pal_rows[g_pal_sel].cid;
     palette_close(hwnd);
     /* A pending forward makes the next conversation choice a destination rather
-     * than a navigation (WIN-51). Command rows are ignored while forwarding — a
+     * than a navigation. Command rows are ignored while forwarding — a
      * half-finished forward should not run "Upload a file…". */
     if (g_fwd_mid) {
         if (cid) forward_send(hwnd, cid);
@@ -12001,7 +12001,7 @@ static void search_submit(void) {
     oc_client_search(g_client, q);
 }
 
-/* Open the overlay with the box focused and empty (WIN-4) — no modal prompt. */
+/* Open the overlay with the box focused and empty — no modal prompt. */
 static void search_open(HWND hwnd) {
     if (!g_client) return;
     g_view = VIEW_HOME;
@@ -12111,7 +12111,7 @@ static void signin_create(HWND parent) {
 /* Re-skin the native children after a theme change. The D2D chrome repaints itself
  * from oc_theme[] every frame; an EDIT caches its background brush. The composer
  * used to be here too, when it was a RichEdit with its own background and character
- * format — it is drawn from oc_theme[] like everything else now (WIN-80). */
+ * format — it is drawn from oc_theme[] like everything else now. */
 static void theme_restyle_children(void) {
     if (g_find_brush) { DeleteObject(g_find_brush); g_find_brush = NULL; }
 }
@@ -12150,7 +12150,7 @@ static void scale_apply(HWND hwnd) {
     ed_invalidate_layout();
     /* The composer's height is measured, not constant, so it has to be re-measured
      * when the measurement changes — without this the box kept its old height and
-     * the text grew inside it (WIN-111). */
+     * the text grew inside it. */
     composer_remeasure();
     /* The emoji formats are built once in d2d_init and were never rebuilt, so
      * every glyph stayed its original size while the words around it grew. */
@@ -12169,7 +12169,7 @@ static void theme_set(int mode) {
 }
 
 /* Where the RichEdit used to be created. Nothing to create: the composer is part of
- * the scene (WIN-80). It still needs the focus at startup, because typing into the
+ * the scene. It still needs the focus at startup, because typing into the
  * conversation without clicking first is the whole point of a chat client. */
 static void composer_create(HWND parent) {
     layout_composer(parent);
@@ -12241,7 +12241,7 @@ static void upload_file(HWND hwnd) {
     }
 }
 
-/* The message context menu (WIN-79). Built into the app's own floating menu — see
+/* The message context menu. Built into the app's own floating menu — see
  * the MENU_* comment for why it stopped being a TrackPopupMenu.
  *
  * `cx`/`cy` are CLIENT DIPs, not screen pixels: the custom menu is drawn by us, in
@@ -12252,7 +12252,7 @@ static void show_msg_menu(HWND hwnd, const oc_model *m, uint64_t mid, float cx, 
     const oc_channel *c = oc_model_channel((oc_model *)m, g_sel);
     const oc_msg *msg = find_msg(c, mid);
     /* A thread reply is not in the channel's message list, so look there too —
-     * otherwise the menu simply never appeared for replies (WIN-15). */
+     * otherwise the menu simply never appeared for replies. */
     int is_reply = 0;
     uint64_t chan = g_sel;
     if (!msg && m->thread_open) {
@@ -12358,7 +12358,7 @@ static void msg_menu_run(HWND hwnd, int cmd) {
     } else if (cmd == 105) {
         /* Ids, not names: a channel can be renamed (REQ-036) and a link built from
          * a name would rot the moment it was (ARCH-96). The port belongs in it when
-         * it is not the default — g_host holds the host alone (WIN-44). */
+         * it is not the default — g_host holds the host alone. */
         char linkhost[288], link[360];
         if (g_port && g_port != OC_DEFAULT_PORT)
             snprintf(linkhost, sizeof linkhost, "%s:%d", g_host[0] ? g_host : "workspace", g_port);
@@ -12387,7 +12387,7 @@ static void msg_menu_run(HWND hwnd, int cmd) {
         toast_push("Marked unread.", 0);
     } else if (cmd == 106) {
         /* The palette picks the destination: it already lists every conversation
-         * with a filter, so a forward needs no picker of its own (WIN-51). */
+         * with a filter, so a forward needs no picker of its own. */
         g_fwd_mid = mid; g_fwd_cid = chan;
         palette_open(hwnd);
     } else if (cmd == 104) {
@@ -12425,7 +12425,7 @@ static void show_member_menu(HWND hwnd, const oc_model *m, uint64_t uid, float c
     mi_item(2, "View profile");
     if (!self) mi_item(1, "Message");
     if (me >= OC_ROLE_ADMIN && !self) {
-        /* The role submenu is FLATTENED into a checked section (WIN-79): the custom
+        /* The role submenu is FLATTENED into a checked section: the custom
          * menu has no submenus, and "set role" is a three-way choice where showing
          * the current one is the useful part — a submenu hid it behind a hover. */
         mi_sep();
@@ -12559,7 +12559,7 @@ static int files_click(HWND hwnd, int x, int y) {
     return 0;
 }
 
-/* ---- inbound permalinks (WIN-44, ARCH-96) ---------------------------------
+/* ---- inbound permalinks (ARCH-96) ---------------------------------
  *
  * Copying a link and HISTORY_AROUND both existed; PASTING one did nothing, so a
  * link was write-only. This is the other half.
@@ -12591,7 +12591,7 @@ static int permalink_parse(const char *text, char *host, size_t hostcap,
 
 /* Follow one. Returns 0 with a toast when it cannot, rather than failing quietly:
  * a link that does nothing is indistinguishable from a broken app. */
-/* Send `mid` on to another conversation as a quote (REQ-057, WIN-51).
+/* Send `mid` on to another conversation as a quote (REQ-057).
  *
  * A quote, not a copy of the attachment: `link_attachments` will only link a file
  * whose `message_id IS NULL` and whose uploader and channel match the sender, so an
@@ -12692,7 +12692,7 @@ static int on_click(HWND hwnd, int x, int y) {
      * three cannot disagree. */
     if (modal_frame_click(hwnd, x, y)) return 1;
     if (g_lightbox) { g_lightbox = 0; return 1; }   /* any click dismisses it */
-    /* A pane's ✕ (WIN-77). One test for every pane, because there is one header:
+    /* A pane's ✕. One test for every pane, because there is one header:
      * they all occupy the middle column and only one can be up. Gated on a pane
      * ACTUALLY being open so a stale rect from the last one cannot swallow a click
      * in the transcript. */
@@ -13012,7 +13012,7 @@ static int on_click(HWND hwnd, int x, int y) {
         }
         return 1;
     }
-    /* Revoke, in the Admin > Invites tab (WIN-46). Confirmed: the invite stops
+    /* Revoke, in the Admin > Invites tab. Confirmed: the invite stops
      * working immediately and cannot be un-revoked, only re-minted. */
     if (g_view == VIEW_ADMIN && g_adm_tab == ADM_INVITES)
         for (int i = 0; i < g_n_invrows; i++)
@@ -13342,7 +13342,7 @@ static int on_click(HWND hwnd, int x, int y) {
                 return 1;
             }
     }
-    /* Later's channel column (WIN-73). A client-side filter, not a refetch:
+    /* Later's channel column. A client-side filter, not a refetch:
      * LIST_SAVED carries no channel argument, unlike LIST_FILES. The scroll offset
      * resets with the filter, or a short list inherits a long one's offset and
      * renders empty. */
@@ -13382,7 +13382,7 @@ static int on_click(HWND hwnd, int x, int y) {
                 select_channel(g_dmrows[i].cid);
                 return 1;
             }
-        /* Start the group, if enough people are on the bar (WIN-93). */
+        /* Start the group, if enough people are on the bar. */
         if (g_n_chosen >= 2 && in_rect(g_pick_go, x, y)) {
             oc_client_open_group_dm(g_client, g_pick_chosen, g_n_chosen);
             /* Remember WHO, not a user id: the pending-DM slot resolves through
@@ -13424,7 +13424,7 @@ static int on_click(HWND hwnd, int x, int y) {
     if (in_rect(g_hdr_gear, x, y))    { open_ws_menu(hwnd); return 1; }
     if (in_rect(g_hdr_compose, x, y)) { open_new_menu(hwnd); return 1; }
     /* The dot sits inside the workspace-header button, so it must be tested
-     * first or the menu swallows it (WIN-64). It only exists while retrying is
+     * first or the menu swallows it. It only exists while retrying is
      * meaningful — see draw_sidebar. */
     if (in_rect(g_ws_dot, x, y)) {
         oc_client_reconnect(g_client);
@@ -13439,7 +13439,7 @@ static int on_click(HWND hwnd, int x, int y) {
         open_section_menu(hwnd, g_sb_hover_sec);
         return 1;
     }
-    /* The channel tabs (WIN-37). Selecting a tab re-asks the server rather than
+    /* The channel tabs. Selecting a tab re-asks the server rather than
      * showing a cached list: pins and files change from other clients, and a
      * stale list is worse than a moment's load. */
     for (int t = 0; t < TAB_COUNT; t++)
@@ -13516,7 +13516,7 @@ static int on_click(HWND hwnd, int x, int y) {
     for (int i = 0; i < g_n_chips; i++)
         if (in_rect(g_chips[i].r, x, y)) {
             /* A reply's chips belong to the thread's channel, not the selected
-             * one — the same lookup the message menu does (WIN-15's lesson). */
+             * one — the same lookup the message menu does. */
             const oc_model *rm = model();
             uint64_t rch = g_sel;
             if (rm && rm->thread_open && !find_msg(oc_model_channel((oc_model *)rm, g_sel),
@@ -13569,7 +13569,7 @@ static int on_click(HWND hwnd, int x, int y) {
          * only what actually works. */
         POINT pt = { PX(x), PX(y) };
         ClientToScreen(hwnd, &pt);
-        /* The image kebab, on the app's own menu now (WIN-79). */
+        /* The image kebab, on the app's own menu now. */
         g_n_mi = 0;
         mi_item(1, "View full size");
         mi_item(2, "Save image as");
@@ -13629,7 +13629,7 @@ static int on_click(HWND hwnd, int x, int y) {
             }
     }
     if (in_rect(g_emoji_btn, x, y))  { picker_open(hwnd, 0); return 1; }
-    /* The formatting toolbar (WIN-96). Focus first: the button acts on the
+    /* The formatting toolbar. Focus first: the button acts on the
      * field's selection, and clicking chrome must not be what takes the caret
      * away from the text it is about to wrap. */
     for (int i = 0; i < FMT_COUNT; i++)
@@ -13730,7 +13730,7 @@ static int on_click(HWND hwnd, int x, int y) {
     if (g_show_members && in_rect(g_rp_close, x, y)) {
         rp_pop(); g_show_members = 0; layout_composer(hwnd); return 1;
     }
-    /* Members-pane rows: click opens the person's profile (WIN-10), which is
+    /* Members-pane rows: click opens the person's profile, which is
      * where "Message" now lives. Jumping straight into a DM made viewing someone
      * impossible, and it is the more destructive of the two actions. */
     for (int i = 0; i < g_n_memrows; i++)
@@ -13786,7 +13786,7 @@ static uint32_t hit_pos(int ri, int x, int y) {
     return pos;
 }
 
-/* ---- clickable links (WIN-112, item 97) -----------------------------------
+/* ---- clickable links (item 97) -----------------------------------
  *
  * The shared parser marks a bare URL (OC_RT_LINK); this is the half that turns
  * one into something you can press. The span is re-derived per query rather
@@ -13887,7 +13887,7 @@ static int selection_start(HWND hwnd, int x, int y) {
     return 1;
 }
 
-/* The transcript's half of WIN-100: double-click selects the word under the
+/* The transcript's half of word selection: double-click selects the word under the
  * pointer, triple-click the whole message. Same positions selection_start uses,
  * so copy_selection needs to know nothing about how the range was made. */
 static int selection_word(HWND hwnd, int x, int y, int whole_message) {
@@ -13992,7 +13992,7 @@ static void on_rclick(HWND hwnd, int x, int y) {
         }
     /* Inside an open thread the replies own the region, so their rows are
      * checked first — and the same message menu applies, since a reply is an
-     * ordinary message with an id (WIN-15). */
+     * ordinary message with an id. */
     if (m->thread_open) {
         for (int i = 0; i < g_n_thrrows; i++)
             if ((float)y >= g_thrrows[i].top && (float)y < g_thrrows[i].bot &&
@@ -14087,7 +14087,7 @@ static void remember_workspace(const char *ws, const char *user) {
     oc_store_close(s);
 }
 
-/* ---- N concurrent workspaces (WIN-29, REQ-012–015) -------------------------
+/* ---- N concurrent workspaces (REQ-012–015) -------------------------
  * The rail switcher used to stop the single client and start another, so a
  * background workspace received nothing and accrued no unread — you only found
  * out you had messages by switching to look.
@@ -14265,7 +14265,7 @@ static void boot_other_workspaces(const char *skip) {
     if (keep >= 0) ws_load(keep);
 }
 
-/* ---- sign-in flow (WIN-2) -------------------------------------------------- */
+/* ---- sign-in flow -------------------------------------------------- */
 
 /* Read a native EDIT's text as UTF-8. */
 static void si_get(HWND e, char *out, size_t cap) {
@@ -14464,7 +14464,7 @@ static void signin_submit(HWND hwnd) {
                                          g_si_remember ? store_path() : NULL,
                                          g_si_remember ? g_secret : NULL);
     if (!g_si_client) { snprintf(g_si_err, sizeof g_si_err, "could not start the client"); goto redraw; }
-    /* Signup (WIN-32): with an invite in hand this connection redeems it instead
+    /* Signup: with an invite in hand this connection redeems it instead
      * of authenticating — one step that creates the account and signs in — so
      * bringing up a tenant no longer needs the command line. */
     if (g_si_invite[0]) {
@@ -14496,7 +14496,7 @@ static void signin_poll(HWND hwnd) {
         g_si_connecting = 0;
         g_si_err[0] = '\0';
         g_view = VIEW_HOME;
-        ws_register();               /* the client exists; give it a slot (WIN-29) */
+        ws_register();               /* the client exists; give it a slot */
         if (g_si_remember) {
             char user[128]; si_get(g_si_e_user, user, sizeof user);
             remember_workspace(g_si_ws, user[0] ? user : NULL);
@@ -14530,7 +14530,7 @@ static HFONT form_font(void) {
     return g_form_font;
 }
 
-/* ---- generic multi-field modal form (WIN-21) ------------------------------
+/* ---- generic multi-field modal form ------------------------------
  * Six flows used to collapse into one single-line prompt, which is why the
  * password change had no confirm field and the DND window was an HH:MM-HH:MM
  * string parsed with sscanf. One form definition with typed fields replaces the
@@ -14660,7 +14660,7 @@ static void copy_to_clipboard(HWND hwnd, const char *utf8);   /* fwd */
 
 /* A one-time secret (invite / webhook token). A MessageBox cannot be selected
  * from, so the token was easy to lose the moment it was dismissed — the one
- * thing that must not happen to a value shown exactly once (WIN-22). This gives
+ * thing that must not happen to a value shown exactly once. This gives
  * it a read-only-ish field, puts it on the clipboard immediately, and says
  * plainly that it will not be shown again. */
 static void show_secret(HWND owner, const char *title, const char *what,
@@ -14675,7 +14675,7 @@ static void show_secret(HWND owner, const char *title, const char *what,
     form_dialog(owner, title, f, 1);
 }
 
-/* text_prompt() is gone (WIN-21): every flow that used it now has a form
+/* text_prompt() is gone: every flow that used it now has a form
  * describing its actual shape. */
 
 /* ---- app menu (workspace avatar) + channel menu -------------------------- */
@@ -14692,7 +14692,7 @@ static float menu_total_height(void) {
 /* Re-point the single client at another workspace (true N-hosting is a later
  * phase). Empty cred = silent reconnect via the stored session token. */
 /* Switch to `ws`. Already connected -> instant, and the one we leave keeps
- * running (WIN-29). Otherwise connect it as an additional client; only when
+ * running. Otherwise connect it as an additional client; only when
  * there is no credential to connect with do we fall back to sign-in. */
 static void switch_workspace(HWND hwnd, const char *ws, const char *cred) {
     if (!ws || !ws[0]) return;
@@ -14816,7 +14816,7 @@ static void open_profile_menu(HWND hwnd) {
     }
     mi_item(50, "Notification schedule");
     mi_sep();
-    /* Custom status (REQ-241/122, WIN-53) — distinct from presence above: presence is
+    /* Custom status (REQ-241/122) — distinct from presence above: presence is
      * "am I here", status is "what am I doing", and Slack keeps both. */
     {
         const oc_model *pm = model();
@@ -14835,7 +14835,7 @@ static void open_profile_menu(HWND hwnd) {
         }
     }
     mi_item(53, "Edit profile");
-    /* WIN-47. Two items rather than a field in the profile form: choosing a file is
+    /* Two items rather than a field in the profile form: choosing a file is
      * an OS dialog, and burying it behind a text form would mean opening one modal to
      * reach another. "Remove" only appears when there is a photo to remove. */
     mi_item(55, "Change photo");
@@ -14844,7 +14844,7 @@ static void open_profile_menu(HWND hwnd) {
         if (am && avatar_of(am, am->user_id)) mi_item(56, "Remove photo");
     }
     mi_item(54, "Active sessions");   /* REQ-182 */
-    /* Preferences hangs off YOU as well as off the workspace menu (WIN-78). It was
+    /* Preferences hangs off YOU as well as off the workspace menu. It was
      * only on the workspace menu, which is the same category error as the
      * connection dot in the channel header: how the app looks to you is not a
      * property of the workspace. */
@@ -14868,12 +14868,12 @@ static void open_new_menu(HWND hwnd) {
     mi_item(7, "Upload a file");
     mi_sep();
     mi_item(4, "Search messages");
-    /* WIN-75: the palette had exactly two callers — Ctrl+K and the test hook. No
+    /* the palette had exactly two callers — Ctrl+K and the test hook. No
      * menu entry, no button, nothing. ARCH-82 says this GUI is affordance-driven,
      * and the palette was the one surface reachable only by a keystroke. */
     mi_item(8, "Jump to  (Ctrl+K)");
     mi_item(9, "Browse channels");
-    mi_item(82, "New sidebar section");   /* WIN-83 */
+    mi_item(82, "New sidebar section");   /* */
     mi_item(84, "Add custom emoji");      /* REQ-072 */
     g_menu = MENU_NEW; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 224;
     g_menu_x = RAIL_W + 8;
@@ -14966,7 +14966,7 @@ static void prefs_load(const oc_model *m) {
 static void sidebar_opts_save(void) {
     if (!g_client) return;
     /* Bigger than the old 64: the encoding now carries up to 32 starred channel ids
-     * (WIN-41), and a truncated setting would silently drop stars. */
+     *, and a truncated setting would silently drop stars. */
     char enc[512];
     oc_sidebar_opts_encode(&g_sb, enc, sizeof enc);
     oc_client_set_setting(g_client, SB_SETTING_KEY, enc);
@@ -15109,7 +15109,7 @@ static void open_switcher(HWND hwnd) {
 static void menu_dispatch(HWND hwnd, int cmd) {
     const oc_model *m = model();
     switch (cmd) {
-    case 1: {   /* WIN-30: the wire has always carried is_public; now so does the UI. */
+    case 1: {   /* the wire has always carried is_public; now so does the UI. */
         oc_field f[2] = {
             { FF_TEXT,   "Channel name", "Lower-case, no spaces. Names are unique.", "" },
             { FF_CHOICE, "Visibility",   "Public|Private",                            "0" },
@@ -15120,9 +15120,9 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 900: case 901: case 902: case 903: g_file_filter = cmd - 900; break;
     case 910: case 911: case 912:           g_file_sort   = cmd - 910; break;
     case 920: case 921: case 922:           g_file_scope  = cmd - 920; break;
-    case 8:  palette_open(hwnd); break;                    /* WIN-75 */
-    case 9:  modal_enter(hwnd, &g_browse_open); break;     /* REQ-038, WIN-54a */
-    /* Pausing notifications (REQ-278, WIN-92). Presets are durations, as Slack's
+    case 8:  palette_open(hwnd); break;                    /* */
+    case 9:  modal_enter(hwnd, &g_browse_open); break;     /* REQ-038 */
+    /* Pausing notifications (REQ-278). Presets are durations, as Slack's
      * are; "until tomorrow" resolves against the LOCAL clock here, which is the
      * whole reason the wire carries minutes rather than an instant. */
     case 57: oc_client_set_snooze(g_client, 0);   toast_push("Notifications resumed.", 0); break;
@@ -15164,7 +15164,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 7:  g_view = VIEW_HOME; upload_file(hwnd); break;
     case 10: oc_client_set_presence(g_client, OC_PRESENCE_ONLINE); break;
     case 11: oc_client_set_presence(g_client, OC_PRESENCE_AWAY); break;
-    case 51: {   /* WIN-53 */
+    case 51: {   /* */
         oc_field f[3] = {
             { FF_TEXT,   "Emoji",  "A shortcode, e.g. :pizza: — or leave it empty.", "" },
             { FF_TEXT,   "Status", "What you are doing. Empty clears it.",           "" },
@@ -15199,10 +15199,10 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         oc_client_list_sessions(g_client);
         modal_enter(hwnd, &g_sessions_open);
         break;
-    case 52:     /* WIN-53: clear */
+    case 52:     /* clear */
         oc_client_set_status(g_client, "", "", 0);
         break;
-    case 53: {   /* WIN-47 */
+    case 53: {   /* */
         oc_field f[2] = {
             { FF_TEXT, "Title",    "Your role, shown on your profile.", "" },
             { FF_TEXT, "Timezone", "e.g. Europe/London.",               "" },
@@ -15217,7 +15217,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         if (!form_dialog(hwnd, "Edit profile", f, 2)) break;
         oc_client_set_profile(g_client, f[0].value, f[1].value);
         break; }
-    case 55: {   /* WIN-47: choose an image, upload it, claim it as the avatar */
+    case 55: {   /* choose an image, upload it, claim it as the avatar */
         if (!g_client) break;
         WCHAR file[MAX_PATH]; file[0] = 0;
         OPENFILENAMEW ofn; ZeroMemory(&ofn, sizeof ofn);
@@ -15244,7 +15244,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         if (!up) { toast_push("Open a conversation first.", 1); break; }
         oc_client_upload_avatar(g_client, up, path);
         break; }
-    case 56:                                   /* WIN-47 */
+    case 56:                                   /* */
         oc_client_set_avatar(g_client, 0);
         break;
     case 30: {
@@ -15255,7 +15255,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         if (form_dialog(hwnd, "Edit profile", f, 1) && f[0].value[0])
             oc_client_set_display_name(g_client, f[0].value);
         break; }
-    case 31: {   /* WIN-20: a confirm field, which the chained prompts had none of. */
+    case 31: {   /* a confirm field, which the chained prompts had none of. */
         oc_field f[3] = {
             { FF_PASSWORD, "Current password", "", "" },
             { FF_PASSWORD, "New password",     "", "" },
@@ -15291,7 +15291,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         modal_enter(hwnd, &g_notify_open);
         break;
     case 70: modal_enter(hwnd, &g_prefs_open); break;
-    case 73: {   /* WIN-33: catch-up, as a loop over the existing CLIENT_ACK.
+    case 73: {   /* catch-up, as a loop over the existing CLIENT_ACK.
                   * REQ-238 may later add a true bulk op; this needs no wire
                   * change and the acks are cumulative per channel anyway. */
         if (!m) break;
@@ -15305,8 +15305,8 @@ static void menu_dispatch(HWND hwnd, int cmd) {
                  n, n == 1 ? "" : "s");
         toast_push(msg, 0);
         break; }
-    case 71: oc_client_list_notify_prefs(g_client); modal_enter(hwnd, &g_notify_open); break;   /* WIN-12 */
-    case 72: modal_enter(hwnd, &g_keys_open); break;   /* WIN-25 */
+    case 71: oc_client_list_notify_prefs(g_client); modal_enter(hwnd, &g_notify_open); break;   /* */
+    case 72: modal_enter(hwnd, &g_keys_open); break;   /* */
     /* "Add a workspace…" drops the current session and goes to the same sign-in
      * view the app starts on — one sign-in implementation, not two. */
     /* Adding a workspace must not sign you out of the one you are in — which is
@@ -15342,7 +15342,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         if (!up) { toast_push("Open a conversation first.", 1); break; }
         oc_client_upload_emoji(g_client, up, name, path);
         break; }
-    case 83:      /* REQ-056: a group DM — open the picker (WIN-93) */
+    case 83:      /* REQ-056: a group DM — open the picker */
         /* This was a one-line form asking for "two to eight usernames, comma
          * separated". It worked, and it was the wrong shape: you had to know and
          * spell names the app was already listing on screen, an unknown one
@@ -15354,7 +15354,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         newmsg_restore();
         layout_composer(hwnd);
         break;
-    case 82: {   /* WIN-83 — 82 because 10 and 11 are the presence items */
+    case 82: {   /* 82 because 10 and 11 are the presence items */
         if (g_sb.n_custom >= (int)OC_SB_CUSTOM_MAX) {
             toast_push("You already have 8 sections.", 1);
             break;
@@ -15378,7 +15378,7 @@ static void menu_dispatch(HWND hwnd, int cmd) {
             if (slot == 0)                   oc_sb_set_collapsed(&g_sb, sec, (uint8_t)!oc_sb_collapsed_of(&g_sb, sec));
             else if (slot >= 1 && slot <= 3) oc_sb_set_sort(&g_sb, sec, (uint8_t)(slot - 1));
             else if (slot >= 4 && slot <= 6) oc_sb_set_filter(&g_sb, sec, (uint8_t)(slot - 4));
-            else if (slot == 7) {                       /* rename (WIN-83) */
+            else if (slot == 7) {                       /* rename */
                 int ci = oc_sb_custom_index(sec);
                 if (ci >= 0 && ci < g_sb.n_custom) {
                     oc_field f[1] = { { FF_TEXT, "Section name",
@@ -15421,7 +15421,7 @@ static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, float 
                                                       : "Add to Starred");
         mi_item(31, c->muted ? "Unmute" : "Mute");
         mi_item(2, "Mark as read");
-        /* Notification levels FLATTENED out of a submenu (WIN-79), with the current
+        /* Notification levels FLATTENED out of a submenu, with the current
          * one ticked — the same reasoning as the member role: the useful part of a
          * three-way choice is seeing which one is set. */
         mi_section("NOTIFICATIONS");
@@ -15437,7 +15437,7 @@ static void show_channel_menu(HWND hwnd, const oc_model *m, uint64_t cid, float 
         mi_item(22, lbl);
         if (c->kind != OC_CHANNEL_KIND_DM) {
             mi_sep();
-            /* WIN-31: both frames had always existed on the wire and reached no
+            /* both frames had always existed on the wire and reached no
              * client, so a private channel could be created but never populated. */
             mi_item(6, "Add someone");
             mi_item(7, "Remove someone");
@@ -15465,11 +15465,11 @@ static void channel_menu_run(HWND hwnd, int cmd) {
     uint64_t cid = g_menu_target;
     if (!m || !cid) return;
     switch (cmd) {
-    case 31: {                                 /* WIN-40 */
+    case 31: {                                 /* */
         const oc_channel *mc = oc_model_channel((oc_model *)m, cid);
         oc_client_set_mute(g_client, cid, mc && mc->muted ? 0 : 1);
         break; }
-    case 30:                                   /* WIN-41 */
+    case 30:                                   /* */
         if (oc_sidebar_toggle_star(&g_sb, cid)) sidebar_opts_save();
         else toast_push("Starred is full (32).", 1);
         break;
@@ -15548,7 +15548,7 @@ static int write_bmp(const char *path, int w, int h, const void *bgra) {
  *     draw. The composer's RichEdit, the find/search/files boxes, the emoji
  *     picker and the sign-in fields are child windows, so they are invisible to
  *     it — and that is exactly the class of bug that kept reaching the user
- *     (WIN-70), plus anything the RichEdit paints itself, like the composer cue.
+ *    , plus anything the RichEdit paints itself, like the composer cue.
  *   - PrintWindow(PW_RENDERFULLCONTENT) captures the children and the window
  *     chrome but returns a BLANK client area, because our WM_PAINT renders
  *     through a D2D HWND target straight to the screen and never touches the HDC
@@ -15709,7 +15709,7 @@ static void test_dump(const char *path) {
      * (tests/TESTING.md records the same trap costing a flaky assertion). */
     fprintf(f, "error_seq=%u last_error=\"%s\"\n",
             (unsigned)m->error_seq, m->last_error);
-    /* The group-DM picker's hit-boxes (WIN-93). Reported for the same reason as
+    /* The group-DM picker's hit-boxes. Reported for the same reason as
      * the preference chips: measuring them off a screenshot was wrong the first
      * time I tried it, and the app already knows where it drew them. */
     fprintf(f, "pick n=%d chosen=%d go=%.0f,%.0f,%.0f,%.0f\n",
@@ -15873,10 +15873,10 @@ static void test_dump(const char *path) {
      * it either — same reason as the natives line above. */
     { char cue[160]; composer_cue(m, cue, sizeof cue);
       fprintf(f, "composer_cue=\"%s\"\n", cue); }
-    /* The formatting toolbar's hit-boxes (WIN-96), so the smoke can CLICK the
+    /* The formatting toolbar's hit-boxes, so the smoke can CLICK the
      * buttons rather than only fire the chords — they are two paths into
      * ed_format() and a test of one is not a test of the other. */
-    /* Activity (WIN-97): which tab is selected, which question the server was
+    /* Activity: which tab is selected, which question the server was
      * asked for it, and how many rows survive act_passes() — the last is the
      * only one an image could show, and only by counting pixels. */
     {
@@ -15893,7 +15893,7 @@ static void test_dump(const char *path) {
                     (int)((g_act_filters[i].left + g_act_filters[i].right) / 2),
                     (int)((g_act_filters[i].top + g_act_filters[i].bottom) / 2));
     }
-    /* Drafts (WIN-91): how many the model holds, whether the rail is offering
+    /* Drafts: how many the model holds, whether the rail is offering
      * its destination, and whether THIS conversation has one — the three things
      * a test would otherwise have to infer from pixels. */
     {
@@ -15926,7 +15926,7 @@ static void test_dump(const char *path) {
             g_tgt_box.left, g_tgt_box.top, g_tgt_box.right, g_tgt_box.bottom,
             g_nm_send.left, g_nm_send.top, g_nm_send.right, g_nm_send.bottom,
             g_nm_to_focus, g_n_tgt_chip, g_n_tgt);
-    /* Pausing (REQ-278, WIN-92): whether MY notifications are paused and until
+    /* Pausing (REQ-278): whether MY notifications are paused and until
      * when, plus how many people the roster shows as not-to-be-disturbed — the
      * fact is a drawn crescent, which no assertion could read from pixels. */
     {
@@ -15938,7 +15938,7 @@ static void test_dump(const char *path) {
                 m ? oc_model_snoozed(m) : 0,
                 (unsigned long long)(m ? m->snooze_until_ms : 0), others);
     }
-    /* CHROME FIT (WIN-111). Two invariants over the elements the app says it drew:
+    /* CHROME FIT. Two invariants over the elements the app says it drew:
      * nothing overlaps a sibling, and nothing leaves the surface that owns it. The
      * defects this item exists for are both — the composer's text running into its
      * own action row is an overlap, the modal's rows painting over the shell is an
@@ -16118,13 +16118,13 @@ static void test_dump(const char *path) {
             g_n_msgrows ? g_msgrows[0].left : -1.0f, g_n_msgrows ? g_msgrows[0].right : -1.0f,
             (unsigned long long)g_hover_mid, g_n_listrows);
     /* Where each message's BODY actually is, and what is selected in it. Both
-     * are here because WIN-100 needed them and neither existed: a test that
+     * are here because word selection needed them and neither existed: a test that
      * wants to double-click a word had no way to find one, and no way to see
      * what it got. */
     for (int i = 0; i < g_n_msgrows; i++)
         fprintf(f, "  msgrow %d mid=%llu body=%.0f,%.0f\n", i,
                 (unsigned long long)g_msgrows[i].mid, g_msgrows[i].bx, g_msgrows[i].by);
-    /* The link under the pointer (WIN-112). A screenshot cannot show a cursor
+    /* The link under the pointer. A screenshot cannot show a cursor
      * shape or prove which bytes a click would open, so the address itself is
      * reported: hovering a URL and reading this back is the only way the
      * autolink boundary rules — where a trailing full stop or bracket stops —
@@ -16226,7 +16226,7 @@ static void test_poll(HWND hwnd) {
         test_ack("ok");
     } else if (!strcmp(verb, "click")) {
         /* A REAL WM_LBUTTONDOWN/UP pair, not a direct on_click: the composer is a
-         * self-drawn field now (WIN-80) and its caret placement lives in the button
+         * self-drawn field now and its caret placement lives in the button
          * handler, so a verb that jumped straight to on_click could not click into
          * the one control users click into most. */
         int x = 0, y = 0; sscanf(arg, "%d %d", &x, &y);
@@ -16339,7 +16339,7 @@ static void test_poll(HWND hwnd) {
         SendMessageW(hwnd, WM_MOUSEWHEEL, (WPARAM)(d << 16), MAKELPARAM(sp.x, sp.y));
         test_ack("ok");
     } else if (!strcmp(verb, "chars")) {
-        /* Real WM_CHARs, one per character (WIN-80). `type` SETS the text; this
+        /* Real WM_CHARs, one per character. `type` SETS the text; this
          * TYPES it, which is the path that exercises insertion, the caret, the
          * typing indicator and the autocomplete — the code a user actually runs. */
         WCHAR w[512]; int n = to_w(arg, w, 512);
@@ -16483,7 +16483,7 @@ static void test_poll(HWND hwnd) {
         }
         test_ack("ok");
     } else if (!strcmp(verb, "form")) {
-        /* Drive the generic form (WIN-77). The ack goes FIRST, because the form runs
+        /* Drive the generic form. The ack goes FIRST, because the form runs
          * a nested message loop: acking afterwards would make the harness wait for a
          * dialog it has not been told about yet, which is the trap the `menu` verb
          * documents above. The OUTCOME lands in the dump instead. */
@@ -16536,7 +16536,7 @@ static void test_poll(HWND hwnd) {
         if (n < 2) test_ack("err");
         else { oc_client_open_group_dm(g_client, ids, n); test_ack("ok"); }
     } else if (!strcmp(verb, "avatar")) {
-        /* WIN-47. `avatar <windows path>` uploads and claims it; `avatar 0` clears.
+        /* `avatar <windows path>` uploads and claims it; `avatar 0` clears.
          * The menu item opens an OS file dialog, which a harness cannot drive at all,
          * so the verb goes at the client call underneath it. */
         if (!strcmp(arg, "0")) { oc_client_set_avatar(g_client, 0); test_ack("ok"); }
@@ -16551,7 +16551,7 @@ static void test_poll(HWND hwnd) {
             else { oc_client_upload_avatar(g_client, up, arg); test_ack("ok"); }
         }
     } else if (!strcmp(verb, "section")) {
-        /* WIN-83: `section add <name>` | `section put <cid> <idx>` | `section rm <idx>`
+        /* `section add <name>` | `section put <cid> <idx>` | `section rm <idx>`
          * | `section clear <cid>`. The menus that reach these open a modal form, and a
          * form inside a menu inside the harness is three layers of driving for what is
          * one call — so the verb goes at the model, and the smoke asserts the sidebar
@@ -16604,7 +16604,7 @@ static void test_poll(HWND hwnd) {
         if (arg[0]) { WCHAR w[256]; to_w(arg, w, 256); SetWindowTextW(g_srch, w); search_submit(); }
         test_ack("ok");
     } else if (!strcmp(verb, "pin")) {
-        /* Kept after WIN-79 made the kebab drivable: this exercises the client call
+        /* Kept once the kebab became drivable: this exercises the client call
          * without depending on menu geometry, which is the right level for a test
          * that cares about pinning rather than about where the item sits. */
         uint64_t mid = strtoull(arg, NULL, 10);
@@ -16651,7 +16651,7 @@ static void test_poll(HWND hwnd) {
         test_ack("ok");
     } else if (!strcmp(verb, "mkhook")) {
         /* Bypass the Create-webhook form, as mkchan and upload bypass theirs: the
-         * harness cannot drive a modal form_dialog (that is WIN-77's job). */
+         * harness cannot drive a modal form_dialog (that is the form harness's job). */
         if (g_client && g_sel && arg[0]) {
             oc_client_create_webhook(g_client, g_sel, arg);
             g_await_webhook = 1;
@@ -16726,7 +16726,7 @@ static void test_poll(HWND hwnd) {
         select_tab(atoi(arg));
         test_ack("ok");
     } else if (!strcmp(verb, "editor")) {
-        /* Switch the composer between the rich editor and plain text (WIN-103),
+        /* Switch the composer between the rich editor and plain text,
          * as the Messages preference does. A verb so BOTH modes can be asserted:
          * a preference with one tested path is a preference with an untested
          * path, and this one changes how every keystroke behaves. */
@@ -16809,7 +16809,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DragAcceptFiles(hwnd, TRUE);              /* drop files anywhere to upload */
         g_dpi = dpi_for_window(hwnd);
         SetTimer(hwnd, TIMER_TICK, 30, NULL);
-        tray_init(hwnd);   /* WIN-18: the notification surface */
+        tray_init(hwnd);   /* the notification surface */
         return 0;
     case WM_DROPFILES: {
         HDROP drop = (HDROP)wp;
@@ -16828,7 +16828,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         if (wp == TIMER_TICK) {
             /* Every workspace is ticked, not just the one on screen — that is
-             * the whole point of WIN-29. A background workspace drains its
+             * the whole point of multi-workspace. A background workspace drains its
              * events, accrues unread, and can raise a notification. */
             for (int wi = 0; wi < g_n_wss; wi++)
                 if (g_wss[wi].client && g_wss[wi].client != g_client)
@@ -16839,7 +16839,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == TIMER_TICK && g_client) {
             oc_client_tick(g_client);
             files_view_sync();
-            /* The debounced draft write (WIN-91). On this tick rather than a
+            /* The debounced draft write. On this tick rather than a
              * timer of its own: there is already one heartbeat driving the
              * client, and a second would be a second thing to start, stop and
              * forget on every path that opens or closes a window. */
@@ -16981,7 +16981,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_geom_applied = 1;                 /* settings never came */
                 show_and_focus(hwnd);
             }
-            /* OS notifications (WIN-18). Raised for messages that arrive while
+            /* OS notifications. Raised for messages that arrive while
              * the window is not in front, subject to the channel's level and the
              * DND window. The first pass after connecting only records the
              * marks: the backfill is not "new mail". */
@@ -17077,7 +17077,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 g_notify_primed = 1;
             }
-            /* An inline image arrived: decode and cache it (WIN-17). */
+            /* An inline image arrived: decode and cache it. */
             {
                 uint64_t fid = 0; size_t flen = 0;
                 uint8_t *fd = oc_model_take_attachment((oc_model *)m, &fid, &flen);
@@ -17397,7 +17397,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_ovl_scroll -= dy;
             if (g_ovl_scroll < 0) g_ovl_scroll = 0;
             if (g_ovl_scroll > g_ovl_max) g_ovl_scroll = g_ovl_max;
-            /* At the bottom of the audit log, page older entries in (WIN-19). */
+            /* At the bottom of the audit log, page older entries in. */
             if (wm->audit_open && g_ovl_scroll >= g_ovl_max - 0.5f && g_audit_oldest > 1)
                 oc_client_audit_query(g_client, g_audit_oldest - 1);
         } else if (wm && wm->search_open) {
@@ -17414,7 +17414,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     }
-    /* Double-click selects a word, in the field or in a message (WIN-100). The
+    /* Double-click selects a word, in the field or in a message. The
      * same order as the button-down below — composer first, then the
      * transcript — so what you double-click is what answers. */
     case WM_LBUTTONDBLCLK: {
@@ -17445,7 +17445,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, NULL, FALSE); return 0;
             }
         }
-        /* The composer first: it is a self-drawn field now (WIN-80), so a click in it
+        /* The composer first: it is a self-drawn field now, so a click in it
          * places the caret rather than being swallowed by a child window. Before
          * on_click, or the transcript's selection would start under it. */
         if (!window_is_covered() && ed_mouse_down(hwnd, (float)mx, (float)my)) return 0;
@@ -17478,7 +17478,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if ((float)my >= g_shelf_rows[i].top && (float)my < g_shelf_rows[i].bot) sh = i;
             if (sh != g_shelf_hover) { g_shelf_hover = sh; InvalidateRect(hwnd, NULL, FALSE); }
         }
-        {   /* Formatting-toolbar hover (WIN-96). Cheap enough to ask every move,
+        {   /* Formatting-toolbar hover. Cheap enough to ask every move,
              * and it keeps the seven buttons out of the hover state machine
              * below — they are chrome over the composer, not a surface. */
             int fh = -1;
@@ -17494,7 +17494,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (sh2 != g_send_hover) { g_send_hover = sh2; InvalidateRect(hwnd, NULL, FALSE); }
         }
         if (g_ed_dragging) { ed_mouse_move(hwnd, (float)mx, (float)my); return 0; }
-        /* Link hover (WIN-112). UNCONDITIONAL, before the rail/sidebar/transcript
+        /* Link hover. UNCONDITIONAL, before the rail/sidebar/transcript
          * split below: the first version of this sat inside the branch for the
          * transcript's own x range, so moving the pointer from a URL into the
          * rail left the hand cursor and a stale address behind — the state was
@@ -17647,8 +17647,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * copy_selection() returned having done nothing and the composer's own
          * Ctrl+C never ran: selecting text in the message box and copying it put
          * nothing on the clipboard, silently, because the transcript's handler
-         * had already answered for it. Found by trying it (WIN-98), not by
-         * reading it, and it is the same claim that swallowed WIN-96's
+         * had already answered for it. Found by trying it, not by
+         * reading it, and it is the same claim that swallowed the formatting toolbar's
          * Ctrl+Shift+C. Falling through is what makes the field's copy reachable
          * at all. */
         if (wp == 'C' && mod_down(VK_CONTROL) && !mod_down(VK_SHIFT) && g_has_sel) {
@@ -17670,7 +17670,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == VK_ESCAPE && g_has_sel) { g_has_sel = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         /* The composer LAST among the specific cases and before the shell's
          * fall-through: the overlays above own Esc while they are open, and the
-         * field owns every other key while it has focus (WIN-80). The main window
+         * field owns every other key while it has focus. The main window
          * really does have Win32 focus now — the field is not a child — so this is
          * where its keys arrive. */
         if (ed_key(hwnd, wp)) return 0;
@@ -17782,7 +17782,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     case WM_KILLFOCUS:
-        /* Whatever you were typing is written now (WIN-91): losing focus is the
+        /* Whatever you were typing is written now: losing focus is the
          * moment you stopped, and waiting out the debounce risks the app being
          * closed or killed in between. */
         if (g_sel) draft_flush(g_sel);
@@ -17817,15 +17817,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ERASEBKGND:
         return 1;
     case WM_CLOSE:
-        /* The draft goes with the window (WIN-91). Before the outbox prompt
+        /* The draft goes with the window. Before the outbox prompt
          * below, because that prompt can be answered "stay" — and a draft
          * written on the way to a decision you reversed is still correct. */
         if (g_sel) draft_flush(g_sel);
-        /* WIN-59: the outbox is in memory now (ARCH-88), so quitting with a send
+        /* the outbox is in memory now (ARCH-88), so quitting with a send
          * still queued loses it. Make that a choice rather than a surprise. */
         if (geom_capture(hwnd) && g_geom_applied) prefs_save();
         {
-            /* Across EVERY workspace (WIN-29), not just the visible one: a
+            /* Across EVERY workspace, not just the visible one: a
              * message stranded in a background workspace is the easiest of all
              * to lose, because you cannot see it. */
             int pending = g_client ? oc_client_outbox_pending(g_client) : 0;
@@ -17840,7 +17840,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                          pending, pending == 1 ? "" : "s", pending == 1 ? "has" : "have",
                          pending == 1 ? "it" : "them");
                 to_w(line, w, 320);
-                /* The ONE MessageBoxW that stays (WIN-77): WM_CLOSE has to answer
+                /* The ONE MessageBoxW that stays: WM_CLOSE has to answer
                  * "may I close?" before it returns, and the app's own modal is
                  * non-blocking by design — it answers on a later click. A blocking
                  * question needs a blocking dialog. */
@@ -17890,7 +17890,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
      *      silently; the net thread reuses the stored token.
      *   3. Otherwise the in-window sign-in view, pre-filled from the book.
      * Only case 3 needs the window up first, but the window is now created
-     * before any of them so the sign-in view has somewhere to live (WIN-2). */
+     * before any of them so the sign-in view has somewhere to live. */
     static char aws[256], acred[264];
     static char pre_ws[256], pre_user[128];
     int direct = 0;
@@ -17917,9 +17917,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     d2d_init();                           /* factory only; the RT is made per-hwnd in paint */
     if (direct) {
         connect_start(aws, acred);
-        /* WIN-57: bring up EVERY other remembered workspace that has a stored
+        /* bring up EVERY other remembered workspace that has a stored
          * token, not just the one you used last. This was blocked purely on
-         * WIN-29 — with one client there was nowhere to put them, so unread
+         * with one client there was nowhere to put them, so unread
          * elsewhere was invisible until you went looking. The most-recently-used
          * one stays active; the rest connect behind it. */
         if (!acred[0]) boot_other_workspaces(aws);
@@ -17938,7 +17938,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     wc.cbSize        = sizeof wc;
     /* CS_DBLCLKS or Windows never sends WM_LBUTTONDBLCLK at all — a double-click
      * arrives as two ordinary downs, which is why double-clicking a word in the
-     * self-drawn field just moved the caret twice (WIN-100). */
+     * self-drawn field just moved the caret twice. */
     wc.style         = CS_DBLCLKS;
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = inst;

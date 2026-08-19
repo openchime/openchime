@@ -1591,7 +1591,7 @@ oc_result oc_encode_user_list(oc_wbuf *w, uint16_t version, const oc_user_list *
         oc_w_u8(w, m->entries[i].disabled);
         oc_w_str(w, m->entries[i].email);
         oc_w_str(w, m->entries[i].display_name);
-        oc_w_u64(w, m->entries[i].avatar_id);      /* WIN-47; 0 = none */
+        oc_w_u64(w, m->entries[i].avatar_id);      /* 0 = none */
         oc_w_str(w, m->entries[i].title);          /* REQ-240/289 */
         oc_w_str(w, m->entries[i].timezone);
         oc_w_str(w, m->entries[i].status_emoji);   /* REQ-241 */
@@ -1667,7 +1667,7 @@ oc_result oc_encode_search(oc_wbuf *w, uint16_t version, const oc_search *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_SEARCH);
     oc_w_str(w, m->query);
     oc_w_u16(w, m->limit);
-    /* WIN-38/39 fields. A layout change, hence protocol 3. */
+    /* 39 fields. A layout change, hence protocol 3. */
     oc_w_u64(w, m->before_id);
     oc_w_str(w, m->from_name);
     oc_w_str(w, m->in_channel);
@@ -2527,7 +2527,7 @@ oc_result oc_parse_local_credential(oc_slice credential, oc_slice *username, oc_
     return OC_OK;
 }
 
-/* ---- invite management (REQ-026, WIN-46) + webhook lifecycle (WIN-48) ------- */
+/* ---- invite management (REQ-026) + webhook lifecycle ------- */
 
 oc_result oc_encode_set_webhook_state(oc_wbuf *w, uint16_t version, const oc_set_webhook_state *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_SET_WEBHOOK_STATE);
@@ -2615,7 +2615,7 @@ oc_result oc_decode_invite_revoked(oc_rbuf *p, oc_revoke_invite *m) {
     return r_done(p);
 }
 
-/* Mute (REQ-137, WIN-40) and mark-unread (REQ-235, WIN-52). */
+/* Mute (REQ-137) and mark-unread (REQ-235). */
 
 oc_result oc_encode_set_mute(oc_wbuf *w, uint16_t version, const oc_set_mute *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_SET_MUTE);
@@ -2643,7 +2643,7 @@ oc_result oc_decode_set_read_cursor(oc_rbuf *p, oc_set_read_cursor *m) {
     return r_done(p);
 }
 
-/* Custom status (REQ-241/122, WIN-53) and profile fields (REQ-240, WIN-47). */
+/* Custom status (REQ-241/122) and profile fields (REQ-240). */
 
 oc_result oc_encode_set_status(oc_wbuf *w, uint16_t version, const oc_set_status *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_SET_STATUS);
@@ -2704,7 +2704,7 @@ oc_result oc_decode_profile_info(oc_rbuf *p, oc_profile_info *m) {
     return r_done(p);
 }
 
-/* Which channels hold files (WIN-82). */
+/* Which channels hold files. */
 
 oc_result oc_encode_list_file_channels(oc_wbuf *w, uint16_t version) {
     size_t off = oc_frame_begin(w, version, OC_MSG_LIST_FILE_CHANNELS);
@@ -2784,7 +2784,7 @@ oc_result oc_decode_set_notify_default(oc_rbuf *p, oc_set_notify_default *m) {
     return r_done(p);
 }
 
-/* The avatar (WIN-47). */
+/* The avatar. */
 oc_result oc_encode_set_avatar(oc_wbuf *w, uint16_t version, const oc_set_avatar *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_SET_AVATAR);
     oc_w_u64(w, m->attachment_id);

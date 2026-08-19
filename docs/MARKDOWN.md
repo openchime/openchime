@@ -153,7 +153,7 @@ and an underline is indistinguishable from a link in most renderings.
 
 - **No WYSIWYG-only constructs.** Anything the toolbar can produce must be
   expressible in text, or the two authoring paths diverge and a message becomes
-  uneditable in one of them. (The toolbar itself, and `Ctrl+B`/`Ctrl+I`, are WIN-96 —
+  uneditable in one of them. (The toolbar itself, and `Ctrl+B`/`Ctrl+I`, are the formatting toolbar —
   **built 2026-07-31**, once the parser existed to make them worth anything. It
   inserts delimiters into the plain body and nothing else, so the constraint
   holds by construction rather than by discipline: there is no second
@@ -172,11 +172,11 @@ and an underline is indistinguishable from a link in most renderings.
 Each frontend maps spans to its own facilities, and the mapping is the frontend's
 business:
 
-- **Win32** — **built 2026-07-31 (WIN-90).** DirectWrite ranges on the existing
+- **Win32** — **built 2026-07-31.** DirectWrite ranges on the existing
   layout, the same mechanism `@mention` highlighting already uses
   (`body_layout`), so formatting composes with mentions and custom emoji rather
   than fighting them. **Both the transcript and the composer remove the inline
-  delimiters** (WIN-101), so a body is drawn the same way wherever it appears —
+  delimiters**, so a body is drawn the same way wherever it appears —
   you see formatting, never markup, as in Slack. Removing one takes a
   transparent brush *and* a 0.1 DIP size, because the layout still covers the
   raw body and a transparent asterisk keeps its width — two gaps around every
@@ -184,7 +184,7 @@ business:
   but faint: in a range-only treatment they *are* the rendering of a list or a
   quote.
 
-  A preference chooses between them (WIN-103): *Rich text*, which is the
+  A preference chooses between them: *Rich text*, which is the
   default and is described here, or *Plain text*, where the markup is shown as
   written and the field never restyles or rewrites it. Two audiences, one of
   whom types this dialect fluently and does not want an editor second-guessing
@@ -199,7 +199,7 @@ business:
   formatting goes, the markup never appears. That last rule is forced: keeping
   `x` emphasised in `a*x*` would need the word-boundary rule of §2 to bend, and
   that rule is what stops `a_variable_name` becoming italic.
-  **A link is accent + underline, and the cursor is the affordance** (WIN-112).
+  **A link is accent + underline, and the cursor is the affordance**.
   Colour alone is not one — it is what a `@mention` already wears, and it says
   nothing to a reader who cannot distinguish it — so the underline carries "this
   goes somewhere" and the hand cursor confirms it before the click. Opening

@@ -228,7 +228,7 @@ static const unsigned char SRV_ANSWER[] = {
     0x03,'s','r','v', 0x04,'a','c','m','e', 0x03,'c','o','m', 0x00       /* target srv.acme.com */
 };
 
-/* The sidebar helper (WIN-5/6): grouping, filter, sort, collapse — shared by
+/* The sidebar helper (6): grouping, filter, sort, collapse — shared by
  * every frontend so the TUI and the GUI cannot disagree about what belongs
  * where. Built against a hand-made model, no daemon needed. */
 /* Pins folded into the model (REQ-230, ARCH-90): the inline flag on a message
@@ -469,7 +469,7 @@ static void test_sidebar(void) {
     CHECK(p3.n_starred == 0 && p3.sort[OC_SB_DMS] == OC_SB_SORT_UNREAD);
     CHECK(p3.n_custom == 0);
 
-    /* ---- user-defined sections (WIN-83, the other half of REQ-234) ---------- */
+    /* ---- user-defined sections (the other half of REQ-234) ---------- */
     oc_sidebar_opts u; oc_sidebar_opts_defaults(&u);
     int work = oc_sidebar_section_add(&u, "Work");
     CHECK(work == 0 && u.n_custom == 1);

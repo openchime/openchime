@@ -47,17 +47,17 @@ void oc_client_send(oc_client *c, uint64_t channel_id, const char *body);
 /* Request history for `channel_id` (once per channel — a frontend calls this the
  * first time a channel is opened). Replayed messages fold into the model. */
 void oc_client_backfill(oc_client *c, uint64_t channel_id);
-/* Page BACKWARDS through a channel (WIN-16): the newest page strictly older
+/* Page BACKWARDS through a channel: the newest page strictly older
  * than `before_message_id`. Replies arrive as ordinary messages, so the model
  * folds them in exactly like a forward replay. */
 void oc_client_history(oc_client *c, uint64_t channel_id, uint64_t before_message_id);
 
-/* Channel membership (REQ-033, WIN-31). Both frames have always existed on the
+/* Channel membership (REQ-033). Both frames have always existed on the
  * wire; nothing exposed them. */
 void oc_client_channel_invite(oc_client *c, uint64_t channel_id, uint64_t user_id);
 void oc_client_channel_kick(oc_client *c, uint64_t channel_id, uint64_t user_id);
 
-/* Signup (WIN-32, REQ-268): redeem an invite on this connection instead of
+/* Signup (REQ-268): redeem an invite on this connection instead of
  * authenticating. Call immediately after a start_* with `cred` = "user:password"
  * — the pair the new account will have. */
 void oc_client_redeem_invite(oc_client *c, const char *invite_token);
@@ -90,7 +90,7 @@ void oc_client_close_thread(oc_client *c);
  * the search view. */
 void oc_client_open_search(oc_client *c);
 void oc_client_search(oc_client *c, const char *query);
-/* Next page of the current search (WIN-38): `before_id` is the oldest id shown. */
+/* Next page of the current search: `before_id` is the oldest id shown. */
 void oc_client_search_more(oc_client *c, uint64_t before_id);
 void oc_client_close_search(oc_client *c);
 
@@ -241,7 +241,7 @@ void oc_client_webhooks(oc_client *c, uint64_t channel_id);
 void oc_client_close_webhooks(oc_client *c);
 void oc_client_create_webhook(oc_client *c, uint64_t channel_id, const char *label);
 void oc_client_delete_webhook(oc_client *c, uint64_t webhook_id);
-/* Invite management (REQ-026, WIN-46) and webhook lifecycle (WIN-48). A webhook's
+/* Invite management (REQ-026) and webhook lifecycle. A webhook's
  * token can be ROTATED but never revealed: only its hash is stored. */
 void oc_client_list_invites(oc_client *c);
 void oc_client_revoke_invite(oc_client *c, uint64_t invite_id);
@@ -256,7 +256,7 @@ void oc_client_set_notify_default(oc_client *c, uint8_t level);
 
 /* Set (or clear, with 0) my avatar. The image must already have been uploaded as an
  * attachment BY ME — the daemon refuses anything else, since an avatar is readable
- * workspace-wide (WIN-47). */
+ * workspace-wide. */
 void oc_client_set_avatar(oc_client *c, uint64_t attachment_id);
 void oc_client_upload_avatar(oc_client *c, uint64_t channel_id, const char *path);
 
@@ -275,7 +275,7 @@ void oc_client_delete_emoji(oc_client *c, const char *name);
 void oc_client_upload_emoji(oc_client *c, uint64_t channel_id, const char *name, const char *path);
 /* Custom status (REQ-241/122) and profile fields (REQ-240). Empty status text clears
  * it; expiry 0 means "until changed", and the DAEMON enforces the lapse. */
-void oc_client_list_file_channels(oc_client *c);   /* WIN-82 */
+void oc_client_list_file_channels(oc_client *c);   /* */
 void oc_client_list_sessions(oc_client *c);        /* REQ-182 */
 void oc_client_set_status(oc_client *c, const char *emoji, const char *text,
                           uint64_t expires_at);
@@ -288,7 +288,7 @@ void oc_client_set_read_cursor(oc_client *c, uint64_t channel_id, uint64_t messa
 void oc_client_upload(oc_client *c, uint64_t channel_id, const char *path);
 void oc_client_download(oc_client *c, uint64_t attachment_id, const char *dest_path);
 
-/* Fetch an attachment INTO MEMORY (WIN-17): the bytes arrive as an
+/* Fetch an attachment INTO MEMORY: the bytes arrive as an
  * OC_EV_ATTACHMENT_DATA the frontend consumes, with no file written anywhere
  * (ARCH-88). For inline images; anything over the core's inline cap is dropped
  * rather than buffered, so a caller should fall back to a real download. */

@@ -27,7 +27,7 @@ typedef enum {
     OC_ACC_MESSAGE,            /* one message in the transcript */
     OC_ACC_COMPOSER,           /* the message box (exactly one) */
     /* Anything you can press. Published with an INVOKE token so a UIA client can
-     * activate it rather than click at a measured point (REQ-290, WIN-110). */
+     * activate it rather than click at a measured point (REQ-290). */
     OC_ACC_BUTTON,
     OC_ACC_TAB,                /* a tab or filter chip: one of a set, selectable */
     OC_ACC_LISTITEM            /* a row in a pane's list (threads, people, drafts) */
@@ -82,7 +82,7 @@ void oc_a11y_announce(const char *utf8);
 
 /* How many announcements have been raised — the harness's only handle on a path
  * whose effect is audible and therefore unobservable here (the same honest limit
- * as the tray balloon in WIN-18). */
+ * as the tray balloon does). */
 unsigned oc_a11y_announced(void);
 
 /* Focus moved to a published item, so a screen reader follows the app rather

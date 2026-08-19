@@ -83,7 +83,7 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
        /* Page backwards through one channel's history (§6.3). Read-only; it
         * answers with the same BACKFILL_OK shape the forward replay uses. */
        OC_JOB_HISTORY = 53,
-       /* Invite management (REQ-026, WIN-46) and webhook lifecycle (WIN-48). Both
+       /* Invite management (REQ-026) and webhook lifecycle. Both
         * read/write tables that already had the columns; only the ops were missing. */
        OC_JOB_LIST_INVITES = 54, OC_JOB_REVOKE_INVITE = 55,
        OC_JOB_SET_WEBHOOK_STATE = 56, OC_JOB_ROTATE_WEBHOOK = 57,
@@ -99,10 +99,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * reading the enum would not have, because the two declarations are 200 lines
         * apart. New jobs go after the highest value, always. */
        OC_JOB_SET_STATUS = 70, OC_JOB_SET_PROFILE = 71, OC_JOB_GET_PROFILE = 72,
-       OC_JOB_LIST_FILE_CHANNELS = 73,   /* WIN-82 */
+       OC_JOB_LIST_FILE_CHANNELS = 73,   /* */
        OC_JOB_LIST_SESSIONS = 74,        /* REQ-182 */
        OC_JOB_SET_NOTIFY_DEFAULT = 75,   /* REQ-134 */
-       OC_JOB_SET_AVATAR = 76,           /* WIN-47 */
+       OC_JOB_SET_AVATAR = 76,           /* */
        OC_JOB_OPEN_GROUP_DM = 77,        /* REQ-056 */
        /* Custom emoji (REQ-072). ADD carries ch_name + message_id (attachment). */
        OC_JOB_ADD_EMOJI = 78, OC_JOB_DELETE_EMOJI = 79, OC_JOB_LIST_EMOJI = 80,
@@ -191,11 +191,11 @@ typedef struct oc_job {
 
     /* SAVE_ITEM (message_id above): add/remove. */
     uint8_t        save_op;
-    /* SET_WEBHOOK_STATE's desired state (WIN-48). Its own field rather than reusing
+    /* SET_WEBHOOK_STATE's desired state. Its own field rather than reusing
      * one of the *_op flags above: a reader should not have to know that "save_op"
      * secretly means "disabled" for a different job type. */
     uint8_t        hook_disabled;
-    /* Search filters (REQ-081, WIN-39) and the paging cursor (WIN-38; carried in
+    /* Search filters (REQ-081) and the paging cursor (carried in
      * message_id). Parsed by the CLIENT via shared/searchq.c — the daemon receives
      * predicates, never a grammar to interpret. */
     char          *sq_from;      /* heap; "" or NULL = any */
@@ -493,7 +493,7 @@ typedef struct {
     uint8_t  disabled;
     char    *email;         /* heap; may be "" */
     char    *display_name;  /* heap; may be "" */
-    uint64_t avatar_id;     /* WIN-47: attachment id, 0 = none */
+    uint64_t avatar_id;     /* attachment id, 0 = none */
     /* REQ-289: the profile fields a directory needs, and the ones PROFILE_INFO
      * was sending only to their owner. Expired status reads as absent, the same
      * rule build_profile applies. */
@@ -730,13 +730,13 @@ typedef struct oc_dbres {
      * stored, and a list is not a place to hand credentials back. */
     oc_invite_entry        *invites;
     size_t                  n_invites;
-    /* OC_RES_PROFILE_INFO (WIN-47/53). Heap strings, freed with the result. Appended
+    /* OC_RES_PROFILE_INFO (53). Heap strings, freed with the result. Appended
      * at the END rather than inserted mid-struct: the first attempt landed between
      * `reclaim` and `n_reclaim`, splitting a pointer from its count, which is exactly
      * the pairing a reader relies on. */
     char                   *st_emoji, *st_text, *pf_title, *pf_tz;
     uint64_t                st_expires, pf_avatar;
-    /* OC_RES_FILE_CHANNELS (WIN-82). */
+    /* OC_RES_FILE_CHANNELS. */
     oc_file_channel_entry  *fchans;
     size_t                  n_fchans;
     /* OC_RES_SESSION_LIST (REQ-182). `session_id` also rides an AUTH_OK, to mark

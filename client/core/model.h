@@ -96,7 +96,7 @@ typedef struct {
     uint64_t peers[9];
     uint16_t n_peers;
     uint8_t  notify_level;     /* OC_NOTIFY_ALL/_MENTIONS/_NONE (REQ-130) */
-    /* Muted (REQ-137, WIN-40) — NOT the same as level=NONE. Level decides whether
+    /* Muted (REQ-137) — NOT the same as level=NONE. Level decides whether
      * the daemon notifies; muted also de-emphasises the row and suppresses its
      * unread badge, so a conversation can be quiet but still countable, or
      * countable but silent. */
@@ -117,7 +117,7 @@ typedef struct {
     char     name[64];
     uint8_t  role;
     uint8_t  disabled;
-    /* Custom status (REQ-241, WIN-53) and profile fields (REQ-240, WIN-47). Kept on
+    /* Custom status (REQ-241) and profile fields (REQ-240). Kept on
      * the roster entry rather than in a side table so a member list can render a
      * status without a second lookup — the roster is small and already in memory.
      * An EXPIRED status arrives empty: the daemon applies that rule, so no client
@@ -160,7 +160,7 @@ typedef struct {
     char     device[64];
 } oc_session_row;
 
-/* (channel, count) — the shape of a census row (WIN-82). */
+/* (channel, count) — the shape of a census row. */
 typedef struct { uint64_t channel_id; uint32_t count; } oc_chan_count;
 
 /* One file shared in a channel (REQ-143, ARCH-91). */
@@ -170,7 +170,7 @@ typedef struct {
     char     filename[128], mime[64];
 } oc_file_view;
 
-/* One outstanding invite (REQ-026, WIN-46). No token: only its SHA-256 is stored
+/* One outstanding invite (REQ-026). No token: only its SHA-256 is stored
  * server-side, so there is nothing to carry. */
 typedef struct { uint64_t invite_id, expires_at, created_by; uint8_t role; } oc_invite_row;
 
@@ -254,7 +254,7 @@ typedef struct {
     char      search_query[128];
     oc_search_result *search_results;
     size_t    n_search, cap_search;
-    /* The server said it had more hits than it sent. WIN-38 gave the wire a keyset
+    /* The server said it had more hits than it sent. The wire gained a keyset
      * cursor, so this now drives a "Load more" affordance rather than only an
      * apology; it still exists to be honest about the cap
      * rather than to drive a load-more. */
@@ -290,7 +290,7 @@ typedef struct {
     uint8_t   sessions_open, sessions_loading;
     oc_session_row *sessions;
     size_t    n_sessions, cap_sessions;
-    /* Which channels hold files, with counts (WIN-82). Server-computed, so the Files
+    /* Which channels hold files, with counts. Server-computed, so the Files
      * column is complete rather than "whatever was in the newest 200". */
     oc_chan_count *fchans;
     size_t    n_fchans, cap_fchans;
@@ -362,7 +362,7 @@ typedef struct {
     oc_webhook_view *webhooks;
     size_t    n_webhooks, cap_webhooks;
     char      webhook_token[80];
-    /* Outstanding invites (REQ-026, WIN-46). Refreshed on open, like every other
+    /* Outstanding invites (REQ-026). Refreshed on open, like every other
      * admin report — a client caches nothing (ARCH-88). */
     uint8_t   invites_open, invites_loading;
     oc_invite_row *invites;
@@ -392,7 +392,7 @@ typedef struct {
     /* The last hard error (auth failed, unreachable, …). Unlike `status` it is
      * NOT overwritten by the "disconnected" line, so a login flow can read the
      * reason after the connection drops; cleared on a successful connect. */
-    /* The most recent in-memory attachment fetch (WIN-17). The model holds the
+    /* The most recent in-memory attachment fetch. The model holds the
      * bytes until a frontend takes them; taking transfers ownership, so nothing
      * accumulates if nobody asks. */
     uint64_t fetched_attachment;
@@ -402,7 +402,7 @@ typedef struct {
     /* When the net thread will next attempt a reconnect, as a monotonic
      * millisecond stamp (0 = not backing off). The error text carries the delay
      * once per backoff, which cannot tick; a frontend that wants a live
-     * countdown needs the deadline itself (WIN-55). */
+     * countdown needs the deadline itself. */
     uint64_t reconnect_at_ms;
 
     char     last_error[160];
@@ -436,7 +436,7 @@ void oc_model_apply(oc_model *m, oc_ev *e);
 /* Find a channel by id, or NULL. */
 oc_channel *oc_model_channel(oc_model *m, uint64_t channel_id);
 
-/* ---- the sidebar (WIN-5/6) --------------------------------------------------
+/* ---- the sidebar (6) --------------------------------------------------
  * Grouping, filtering, sorting and collapse are IDENTICAL in every frontend, so
  * they live here rather than being written twice (ARCH-74: the core holds the
  * logic, a frontend is view + input). A frontend asks for the rows and draws
@@ -453,7 +453,7 @@ oc_channel *oc_model_channel(oc_model *m, uint64_t channel_id);
 enum { OC_SB_CHANNELS = 0, OC_SB_DMS = 1, OC_SB_STARRED = 2, OC_SB_SECTIONS = 3 };
 #define OC_SB_STARRED_MAX 32u
 
-/* User-defined sections (REQ-234's other half, WIN-83). A custom section is a NAME
+/* User-defined sections (REQ-234's other half). A custom section is a NAME
  * plus a set of conversation ids, and a conversation in one is removed from
  * Channels/DMs so it still appears exactly once — the same rule Starred follows.
  * Starred wins over a custom section when a conversation is in both: two "lift it
@@ -476,7 +476,7 @@ typedef struct {
     uint8_t  filter[OC_SB_SECTIONS];     /* OC_SB_FILTER_* , per section */
     uint8_t  collapsed[OC_SB_SECTIONS];  /* 1 = show the header only */
     char     find[64];                   /* "Find a conversation" text, lowercased */
-    /* Starred conversations (REQ-234, WIN-41). Ids rather than names: a channel can
+    /* Starred conversations (REQ-234). Ids rather than names: a channel can
      * be renamed and a DM has no name at all. Kept in the OPTIONS rather than the
      * model because it is a per-user display choice, exactly like sort and filter,
      * and the frontend owns persisting it. */
@@ -642,7 +642,7 @@ uint64_t oc_model_reconnect_in(const oc_model *m, uint64_t now_ms);
  * jumps. */
 uint64_t oc_model_now_ms(void);
 
-/* Take the last fetched attachment's bytes (WIN-17), transferring ownership to
+/* Take the last fetched attachment's bytes, transferring ownership to
  * the caller, which must free() them. Returns NULL when nothing is waiting. */
 uint8_t *oc_model_take_attachment(oc_model *m, uint64_t *attachment_id, size_t *len);
 

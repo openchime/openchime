@@ -605,7 +605,7 @@ real time three times in a single day before the guard existed.
 skips the build and `OC_DRIVE_NO_DAEMON=1` leaves the daemon alone — for when a
 mismatched pair is the thing under test, such as the version-reject path.
 
-> **The smoke owns its own daemon (WIN-88, fixed 2026-07-31).** It defaults to
+> **The smoke owns its own daemon (fixed 2026-07-31).** It defaults to
 > port **9500** and `/tmp/oc-smoke`, wipes that directory, and **verifies the
 > workspace it reached is the fixture** — name plus the presence of alice, bob
 > and carol — refusing to run otherwise. Before that it silently adopted whatever
@@ -627,7 +627,7 @@ mismatched pair is the thing under test, such as the version-reject path.
 
 *None currently known in the GUI smoke.*
 
-**Resolved 2026-07-31 — the suite was flaky and is now deterministic (WIN-87).**
+**Resolved 2026-07-31 — the suite was flaky and is now deterministic.**
 Five consecutive runs used to give 2 failures, clean, clean, 2 failures, 4
 failures, with the failing assertions *moving between runs*. Every failure was a
 harness artifact, not a product defect. Two causes, both fixed:
@@ -650,7 +650,7 @@ deal since — it reported **249 checks** on 2026-08-02 — so read the total th
 prints rather than quoting a number from here. Tune the patience with
 `OC_SMOKE_WAIT_MS` (default 6000).
 
-**Not every `sleep` is inside a poll loop.** The WIN-87 rewrite replaced the
+**Not every `sleep` is inside a poll loop.** The determinism rewrite replaced the
 sleeps that *guarded assertions*, and those are gone; the suite still uses plain
 inter-action sleeps between driving steps (roughly two dozen), which are settling
 time rather than assertion timing. A new assertion waits on the state it is about

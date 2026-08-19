@@ -271,7 +271,7 @@ static void test_collect(void) {
     CHECK(!saw_c);
     sqlite3_close(rdb);
 
-    /* --- a PAUSE silences regardless of the window (REQ-278, WIN-92) --------
+    /* --- a PAUSE silences regardless of the window (REQ-278) --------
      * The window is periodic; a pause is one instant. At 01:40 bob is outside
      * his quiet hours and would be pushed — a pause has to reach him anyway,
      * which is the whole reason the two mechanisms both exist. */
@@ -313,7 +313,7 @@ static void test_collect(void) {
         sqlite3_close(rdb);
     }
 
-    /* --- the SCHEDULE evaluates the recipient's LOCAL day (REQ-136, WIN-94) ---
+    /* --- the SCHEDULE evaluates the recipient's LOCAL day (REQ-136) ---
      * The unit under test is the predicate, because the day boundary is where
      * this goes wrong: a UTC weekday puts a large part of the world's Friday
      * evening on Saturday, and no fixture would notice. */

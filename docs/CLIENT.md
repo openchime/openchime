@@ -250,8 +250,8 @@ model; translate input to intents }, stop.
     **Deleting a webhook is not surfaced**: the core exposes
     `oc_client_delete_webhook` and the daemon handles `DELETE_WEBHOOK`, but the
     overlay is read-only and its header still shows a stale `/webhook` slash-command
-    hint left over from the removed slash UX (both are known bugs —
-    [BACKLOG.md](./BACKLOG.md)).
+    hint left over from the removed slash UX (both are known bugs, and
+    tracked).
   - **attachments** — the launcher's "Upload a file" streams a local file through
     the daemon (UPLOAD_BEGIN → CHUNKs within the advertised window → END → OK) and
     links it into a message; the message menu's "Download file" saves an
@@ -268,7 +268,7 @@ model; translate input to intents }, stop.
   and profile fields, drafts, scheduling, threads-follow, the People directory,
   search operators and paging, and webhook delete among them. The frontend order
   (all of Win32 first) makes that an accepted consequence rather than a defect;
-  the itemised list is [BACKLOG.md](./BACKLOG.md). `oc_client_set_setting`, once
+  the itemised list is the [issue tracker](https://github.com/openchime/openchime/issues). `oc_client_set_setting`, once
   recorded here as callerless, **is called by both frontends** — the TUI persists
   its sidebar sort/filter/collapse through it and the Win32 client its
   preferences.
@@ -316,8 +316,8 @@ model; translate input to intents }, stop.
   Threads, People, Admin and Preferences are all developed surfaces** — none is a
   placeholder — answering REQ-139, REQ-143, REQ-231, REQ-223/224/228, REQ-062,
   REQ-289 and REQ-261. Per-feature status is the marker on each
-  requirement in [REQUIREMENTS.md](./REQUIREMENTS.md); open work is
-  [BACKLOG.md](./BACKLOG.md).
+  requirement in [REQUIREMENTS.md](./REQUIREMENTS.md); open work is in the
+  [issue tracker](https://github.com/openchime/openchime/issues).
 - **Linux GUI (later):** **GTK in pure C** — GTK is the native Linux toolkit and
   a C library (ARCH-80). Distributed as an AppImage/Flatpak, not a static binary
   (GTK cannot cleanly static-link).
@@ -463,7 +463,7 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
 A native child window — the find/search/files-search/palette boxes, the sign-in
 fields, the form fields — composites **above** the Direct2D output. There is no
 z-order to lose and nothing can be drawn over one. (The composer was one of these
-until WIN-80; it is part of the scene now, which is what removed a whole class of
+until the composer was rewritten; it is part of the scene now, which is what removed a whole class of
 this bug rather than managing it.) A child left visible while the
 surface it belongs to is not drawn therefore appears as a bare control floating
 over whatever *is* drawn, which reads as corruption rather than as a bug.
@@ -504,7 +504,7 @@ kept reaching the user rather than being caught in verification. **That is fixed
 window" below), so a screenshot shows what the user sees. The dump reports each
 child's `IsWindowVisible` alongside the three predicates as well, because a
 boolean is a better assertion than an image when what you want to know is
-*whether* a control is shown. Read `re=` with WIN-80 in mind: the composer has no
+*whether* a control is shown. Read `re=` with the self-drawn composer in mind: the composer has no
 child window any more, so that field reports whether its **rect is non-empty**,
 not a child's visibility. Every other flag is still an `IsWindowVisible`:
 
@@ -680,7 +680,7 @@ called "Empty". It says "No matches" instead when a find filter is what emptied 
 because "you have none of these" and "none of yours match" are different answers and
 an empty list gives the same silence to both.
 
-## The composer is ours (WIN-80, ARCH-98)
+## The composer is ours (ARCH-98)
 
 There is no RichEdit and **no child window**. The field is drawn into the Direct2D
 scene by `ed_draw()`, and the **main window** owns the keyboard while `g_ed_focus` is
@@ -704,12 +704,12 @@ set. Consequences worth knowing before touching it:
 - **Anything that replaces `g_body` must call `ed_invalidate_layout()`** (see
   `scale_apply`). A stale layout is not visibly broken, which is worse than broken.
 
-## Screenshots can see images (and could not, until WIN-47)
+## Screenshots can see images (and once could not)
 
 `test_shot` renders the scene into its own DC render target. A D2D bitmap belongs to
 the target that created it, so the capture used to switch images off entirely — which
 means **every screenshot ever taken of this app was a picture with the pictures
-missing**, including the inline-image feature (WIN-17) whose whole point is the
+missing**, including the inline-image feature whose whole point is the
 picture. That cost an hour of diagnosing a working avatar as broken.
 
 The decoded PBGRA pixels are now kept beside each cached bitmap, and a capture creates
@@ -734,11 +734,11 @@ generic form (including that Esc does **not** commit and Enter does), a pane
 header's ✕, the composer cue naming the open conversation, the notification
 schedule and keyword editors, the pause, threads, the People directory, the
 Activity unread filters, and a **chrome-fit matrix across DPI × zoom × text
-size** (ARCH-97/WIN-111).
+size** (ARCH-97).
 
 Every one of those is a boolean, and booleans belong in a script. Three bugs
-reached the user in a day for want of this (WIN-70, WIN-71's regression, WIN-72),
-all of them chrome. It is verified to catch them: reintroducing WIN-71 — Files
+reached the user in a day for want of this, one of them a regression,
+all of them chrome. It is verified to catch them: reintroducing Files
 returning `SBK_CHANNELS` — fails exactly two checks, the column kind and the leaked
 find box.
 
@@ -840,17 +840,17 @@ to change a DirectWrite size, so any preference that moves the scale must call
   jump-in-context (**REQ-232**/ARCH-96), mark-unread/mute/star
   (REQ-235/137/234), profile depth with avatars and custom status
   (REQ-240/241/122), the global notify default (REQ-134) and the
-  **N-concurrent-workspace model** (REQ-012–015, WIN-29) are all built.
+  **N-concurrent-workspace model** (REQ-012–015) are all built.
   **Accessibility (REQ-269) is built** — a UIA provider over the self-drawn UI, a
   real system caret and UIA events (**ARCH-99**), with an `AutomationId` and an
-  `InvokePattern` on every actionable element (**REQ-290**, WIN-110), verified
+  `InvokePattern` on every actionable element (**REQ-290**), verified
   from outside the process by `scripts/uia_probe.ps1`. Rich text and its toolbar
   are built too (**REQ-220**, ARCH-100: a shared parser in `client/core/` plus
   DirectWrite ranges). The items that once waited on a daemon requirement —
   drafts, scheduled send, the notification schedule, keywords and priority
   people, the pause, cross-channel threads, the People directory — all landed
-  with their server halves on 2026-08-01/02. Open work is
-  [BACKLOG.md](./BACKLOG.md).
+  with their server halves on 2026-08-01/02. Open work is in the
+  [issue tracker](https://github.com/openchime/openchime/issues).
 - **The frontend order is fixed: all of Win32, then the TUI, then GTK, then
   macOS.** Win32 is the reference client and it is finished *first* — including
   the items now waiting on a daemon requirement, which are Win32 work waiting on
@@ -866,7 +866,7 @@ to change a DirectWrite size, so any preference that moves the scale must call
   (REQ-240/241/122), group DMs (REQ-056), custom emoji (REQ-072), rich text
   (REQ-220), and more. Because the frontend order puts all of Win32 first, the
   TUI's gap is a consequence of that order rather than tracked work; it is
-  deliberately not in [BACKLOG.md](./BACKLOG.md).
+  deliberately not tracked as an issue.
 - **Next — auth completeness.** The **OIDC browser flow + PKCE + loopback
   courier** — the one remaining piece of REQ-020 and what makes SSO usable at all
   (there is no SAML by design, **REQ-027**); plus first-run onboarding
@@ -875,7 +875,7 @@ to change a DirectWrite size, so any preference that moves the scale must call
   half of REQ-150/151 ([AUDIO.md](./AUDIO.md)).
 - **Then — the rest of the specified scope.** REQUIREMENTS.md §§1–16 carries it,
   each requirement marked with whether it is built; whatever is not built and
-  matters is an item in [BACKLOG.md](./BACKLOG.md), in impact order.
+  matters is an issue in the [tracker](https://github.com/openchime/openchime/issues).
 - **Then — remaining platforms + screenshare.** The other native GUIs (GTK,
   AppKit), a web DOM UI, and mobile — and, gated behind the audio client,
   **screenshare** (REQ-161, [VIDEO.md](./VIDEO.md)).

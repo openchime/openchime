@@ -1410,7 +1410,7 @@ static void test_notify_prefs_vertical(int port, const uint8_t *pin) {
         read_notify_tail(devs[d]);
     }
 
-    /* --- pausing (REQ-278, WIN-92) ----------------------------------------
+    /* --- pausing (REQ-278) ----------------------------------------
      * The pause is the OTHER mechanism, and the vertical is what proves they
      * are separate: setting one must not disturb the other, both of the user's
      * devices learn the instant, and the other user learns only the fact. */
@@ -1997,7 +1997,7 @@ static void test_frame_version_mismatch(int port, const uint8_t *pin) {
     client_close(&b);
 }
 
-/* Concurrency load (robustness backlog #5): many clients connect, authenticate,
+/* Concurrency load: many clients connect, authenticate,
  * and send at once, exercising the accept path + writer + fan-out under
  * contention. Each must get an ack for every message it sent — proving the
  * two-thread (now three-thread) model stays correct and deadlock-free under

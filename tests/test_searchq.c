@@ -1,4 +1,4 @@
-/* Search query parsing (REQ-081, WIN-39).
+/* Search query parsing (REQ-081).
  *
  * This parser decides what a query MEANS in two processes — the client shows the user
  * what it understood and the daemon executes it — so the edge cases are the point of

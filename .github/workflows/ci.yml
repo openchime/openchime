@@ -139,7 +139,7 @@ jobs:
           # fails on a runner, oc_netloop_run returns -1 without printing
           # anything, and the daemon exits 0 having logged "healthz listening on
           # :8080" — so it looks like a healthy daemon that mysteriously will not
-          # answer. Diagnosed by reproducing it locally; see BACKLOG item 128 for
+          # answer. Diagnosed by reproducing it locally; see #144 for
           # the silent-failure defect underneath.
           #
           # The bootstrap variable is the OPENCHIME_-prefixed name; the OC_ form

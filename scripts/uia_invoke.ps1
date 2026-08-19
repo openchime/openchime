@@ -1,4 +1,4 @@
-# Press one control by AutomationId, through UI Automation (REQ-290, WIN-110).
+# Press one control by AutomationId, through UI Automation (REQ-290).
 #
 # This is the point of the identifiers: a test finds a control by a name that is
 # part of the control, and invokes it through the same pattern a screen reader or

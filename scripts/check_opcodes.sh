@@ -2,7 +2,7 @@
 # Fail if two OC_MSG_* message types share an opcode.
 #
 # The wire contract is "one value, one meaning". Two collisions reached main
-# unnoticed (BACKLOG.md, "Two message-type opcodes are used twice each") because
+# unnoticed ("two message types shared one opcode") because
 # nothing checked: each pair happened to be direction-disjoint, so both dispatch
 # chains held exactly one branch for the value and nothing misdecoded. That is a
 # property of today's branches, not of the protocol, and the next inbound branch
@@ -11,14 +11,14 @@
 # Run by `make check-opcodes` and by CI's build job.
 #
 # KNOWN_SHARED lists the opcodes that are still shared and are tracked as open
-# backlog items. An entry here is a defect with a number, not an exemption:
-# delete the value when the item is fixed, and the check starts enforcing it.
+# issues. An entry here is a defect on the record, not an exemption: delete the
+# value when it is fixed, and the check starts enforcing it.
 set -eu
 
 HDR="${1:-shared/protocol.h}"
 
 # 0x0070 — SET_PROFILE (C->S) and SET_PRESENCE (C->S). NOT direction-disjoint:
-# editing a profile drops the connection and saves nothing. Backlog item 114.
+# editing a profile drops the connection and saves nothing.
 KNOWN_SHARED="0x0070"
 
 [ -r "$HDR" ] || { echo "check_opcodes: cannot read $HDR" >&2; exit 2; }
@@ -51,7 +51,7 @@ awk -v known="$KNOWN_SHARED" '
         code = sprintf("0x%04X", val)
         if (code in seen) {
             if (code in allowed)
-                printf "check_opcodes: known shared opcode %s (%s, %s) — tracked in BACKLOG.md\n",
+                printf "check_opcodes: known shared opcode %s (%s, %s) — a tracked defect\n",
                        code, seen[code], name
             else {
                 printf "check_opcodes: DUPLICATE opcode %s used by %s and %s\n",

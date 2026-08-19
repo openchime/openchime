@@ -369,7 +369,7 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
              * channels the user never opened a preference on — which is most of
              * them, and the whole point of having a default.
              *
-             * A MUTED channel never pushes (REQ-137, WIN-40). Mute was being
+             * A MUTED channel never pushes (REQ-137). Mute was being
              * honoured in the sidebar and ignored here, so a muted channel at level
              * ALL still rang the phone. */
             "  AND COALESCE(np.muted, 0) = 0 "

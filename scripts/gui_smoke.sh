@@ -4,8 +4,7 @@
 #   scripts/gui_smoke.sh            # launch, assert, leave the client running
 #   scripts/gui_smoke.sh --kill     # ... and shut it down afterwards
 #
-# WHY THIS EXISTS. Three bugs reached the user in one day (WIN-70, WIN-71's
-# regression, WIN-72) and every one of them was a *chrome* bug: a native child
+# WHY THIS EXISTS. Three bugs reached the user in one day (one of them a regression) and every one of them was a *chrome* bug: a native child
 # shown in a view it does not belong to, a composer under a surface you cannot
 # type into, a hit-box matching the wrong column. None was visible in a Direct2D
 # screenshot at the time, and all of them are one boolean each. Booleans belong in
@@ -29,7 +28,7 @@ LIN_DIR='/mnt/c/Windows/Temp/octest'
 fails=0
 checks=0
 
-# --- isolation (WIN-88) -----------------------------------------------------
+# --- isolation -----------------------------------------------------
 # The suite runs against its OWN daemon on its OWN port, wiped each run, and it
 # says so rather than adopting whatever is listening. gui_drive's staleness check
 # keeps a daemon whose start time postdates the binary — which silently adopts an
@@ -108,7 +107,7 @@ WAIT_MS="${OC_SMOKE_WAIT_MS:-6000}"
 # Read one `key=value` out of a fresh dump.
 snap() { "$DRIVE" dump smoke >/dev/null 2>&1; cat "$LIN_DIR/smoke.txt" 2>/dev/null; }
 
-# --- waiting on state instead of on a clock (WIN-87) ------------------------
+# --- waiting on state instead of on a clock ------------------------
 # `ack` means the verb's HANDLER RAN, not that its effect is observable: most of
 # the interesting dump fields (`natives`, the hit-box rects) are recorded during
 # WM_PAINT, and anything that goes to the server lands a round trip later. The
@@ -215,7 +214,7 @@ if ! wait_grep 'authed=1 connected=1' 20000; then
 fi
 say "   authed"
 
-# --- and it is the RIGHT daemon (WIN-88) ------------------------------------
+# --- and it is the RIGHT daemon ------------------------------------
 # Assert the fixture before asserting anything about the product. Getting this
 # wrong does not look like a broken harness, it looks like broken features.
 fixture=$(snap | grep -o 'workspace name="[^"]*"' | cut -d'"' -f2)
@@ -253,7 +252,7 @@ settle sbkind 1
 #  1    2       0   0     0      0        DMs: conversation list, index in the middle
 #  2    3       1   0     0      1        Activity: feed left, transcript stays
 #  3    4       0   0     1      0        Files: own column + its own search box
-#  4    5       0   0     0      0        Later: own column (WIN-73), Files-shaped
+#  4    5       0   0     0      0        Later: own column, Files-shaped
 #  5    0       0   0     0      0        Admin: no second column
 say "== views"
 while read -r v sbkind re find ffind conv name; do
@@ -297,13 +296,13 @@ expect "$d" re   0 "search overlay: composer hidden"
 # and shows up as a bare white rectangle over whatever is really there. It was
 # gated on `search_open` alone — a MODEL flag that outlives the view — so
 # leaving search open and walking to DMs floated it over the third person in
-# the "New direct message" picker (WIN-99, reported from a screenshot of the
+# the "New direct message" picker (reported from a screenshot of the
 # running client). The view matrix above could not catch it: it visits each view
 # from a clean state, and this needs a surface left open in the PREVIOUS one.
 "$DRIVE" search "" >/dev/null 2>&1; settle srch 1
 "$DRIVE" view 1 >/dev/null 2>&1; settle sbkind 2
 "$DRIVE" dmcompose >/dev/null 2>&1
-expect_eventually srch 0 "search left open does not follow you to the DM picker (WIN-99)"
+expect_eventually srch 0 "search left open does not follow you to the DM picker"
 "$DRIVE" dmcompose >/dev/null 2>&1
 # Coming back restores it — the fix has to be "not while that view is up", not
 # "closed for good", and only asserting the first half would pass either way.
@@ -383,7 +382,7 @@ say "== modal frame"
 # screenshot. Hardcoded coordinates were wrong twice while writing this: the card
 # geometry shifted under the new frame, and a chip's width depends on its label.
 # The app already reports where it drew each hit-box, so ask it.
-# Preferences is two-paned (WIN-78), so a row only has hit-boxes while ITS category
+# Preferences is two-paned, so a row only has hit-boxes while ITS category
 # is showing — and the sheet remembers the pane you left it on. Select the category
 # before reaching for a chip.
 click_cat() {                     # click_cat <index>
@@ -453,7 +452,7 @@ wait_grep 'aboutvis=[0-9]' >/dev/null 2>&1 || true
 
 # Anchored on the name and then on `pub=` separately, rather than on the two
 # being adjacent: they stopped being adjacent the moment `peers=` was added to
-# the line (WIN-95), and a matcher that encodes field ORDER breaks on every new
+# the line, and a matcher that encodes field ORDER breaks on every new
 # field. This one only requires that both are on the smokevis row.
 vispub() { snap | grep -E '^  ch [0-9]+ "smokevis" ' | grep -oE 'pub=[01]' | head -1 | cut -d= -f2; }
 
@@ -584,7 +583,7 @@ if [ -n "${gid:-}" ]; then
   expect_eventually sel "$gid" "selecting it works by id"
 fi
 
-# --- the group-DM picker (WIN-93) -------------------------------------------
+# --- the group-DM picker -------------------------------------------
 # The engine half is asserted above through the `groupdm` verb. This is the
 # AFFORDANCE: gathering people by ticking them, which is what replaced a form
 # asking for "two to eight usernames, comma separated". Driven through the rects
@@ -624,7 +623,7 @@ sendpt=$(snap | awk '/^newmsg /{ for (i=1;i<=NF;i++) if ($i ~ /^send=/) { sub(/^
 expect_grep '^  ch [0-9]+ DM .*prev="three of us"' "sending creates the group and posts to it"
 "$DRIVE" view home >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; settle sbkind 1
 
-# --- avatars (WIN-47) -------------------------------------------------------
+# --- avatars -------------------------------------------------------
 # Two things are asserted, because the second was invisible for an hour: that the
 # avatar is set, AND that a screenshot can see an image at all. Every capture used
 # to suppress images (a D2D bitmap belongs to the target that made it), so the
@@ -644,10 +643,10 @@ if [ -f "$LIN_DIR/face.png" ]; then
   "$DRIVE" avatar 0 >/dev/null 2>&1
   expect_eventually myavatar 0 "clearing it works"
 else
-  say "   (no $LIN_DIR/face.png — skipping; create one to cover WIN-47)"
+  say "   (no $LIN_DIR/face.png — skipping; create one to cover avatar upload)"
 fi
 
-# --- user-defined sidebar sections (WIN-83) ---------------------------------
+# --- user-defined sidebar sections ---------------------------------
 # The interesting property is the appear-ONCE rule: a conversation in a custom
 # section leaves Channels, and a starred one leaves the custom section too. That is
 # a claim about the sidebar the core builds, so it is asserted from the row list
@@ -685,7 +684,7 @@ expect_grep '^  sbrow sec=16 header=0 cid=1 ' "#general sits under section 16"
 "$DRIVE" section rm 0 >/dev/null 2>&1
 expect_eventually sections 0 "removing the section leaves none"
 
-# --- appearance: text size, zoom, accent, density (WIN-78) ------------------
+# --- appearance: text size, zoom, accent, density ------------------
 # Each of these rebuilds the DirectWrite table or the palette, so "it did not take
 # effect" is a real failure mode and none of it is visible in a boolean. The dump
 # reports the three scale inputs ARCH-97 keeps apart plus their product.
@@ -766,7 +765,7 @@ if [ "$(key_of "$d" railcol)" = "$rail0" ]; then
   ok "... and the rail with it"
 else fail "the rail did not come back: $(key_of "$d" railcol)"; fi
 
-# --- the generic form on the modal frame (WIN-77) ---------------------------
+# --- the generic form on the modal frame ---------------------------
 # Sixteen call sites went through a native GDI popup with its own window class and
 # its own message loop. Now it is the app's modal frame with native EDITs on it, so
 # the things that were previously unassertable are asserted: that Cancel does not
@@ -798,7 +797,7 @@ expect_grep 'last=cancel' "Esc means CANCEL"
 expect_eventually modal none "Enter closes the form"
 expect_grep 'last=ok text="initial"' "Enter COMMITS the field values"
 
-# --- pane headers close with a ✕, not a caption (WIN-77) --------------------
+# --- pane headers close with a ✕, not a caption --------------------
 say "== pane header"
 "$DRIVE" view 0 >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; settle sbkind 1
 "$DRIVE" search "" >/dev/null 2>&1
@@ -816,7 +815,7 @@ else
   "$DRIVE" key esc >/dev/null 2>&1
 fi
 
-# --- the composer is ours (WIN-80) ------------------------------------------
+# --- the composer is ours ------------------------------------------
 # Every one of these was the RichEdit's job until today, which means every one of
 # them is now code that can be wrong. They are asserted through `chars` (real
 # WM_CHARs) rather than `type` (which sets the text), because typing is the path a
@@ -924,7 +923,7 @@ ed_step len 0 "the other channel starts empty"
 expect_grep '^ed .*text="a draft"' "and the draft comes back"
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1
 
-# --- formatting: the toolbar and its chords (WIN-96, REQ-220) ---------------
+# --- formatting: the toolbar and its chords (REQ-220) ---------------
 # Two paths into one operation — the buttons and the keys — so both are driven.
 # Every assertion is against the TEXT, because what the toolbar produces has to
 # be the plain markup a person could have typed (ARCH-100 §5); if these ever
@@ -956,11 +955,11 @@ expect_grep '^ed .*text="`run it`"' "Ctrl+Shift+C marks it as code"
 
 # The transcript's Ctrl+C used to claim the key whether or not it had a
 # selection, so the FIELD's copy never ran and Ctrl+C there put nothing on the
-# clipboard (WIN-98). Asserted as a round trip through the real clipboard.
+# clipboard. Asserted as a round trip through the real clipboard.
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key ctrl+c >/dev/null 2>&1
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
 "$DRIVE" key ctrl+v >/dev/null 2>&1
-expect_grep '^ed .*text="`run it`"' "Ctrl+C in the composer copies (WIN-98)"
+expect_grep '^ed .*text="`run it`"' "Ctrl+C in the composer copies"
 
 # Block markers apply to every line the selection touches, and number themselves.
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
@@ -994,7 +993,7 @@ expect_grep '^ed .*text="\*by hand\*"' "clicking B does what Ctrl+B does"
 expect_grep '^ed .*text="\*inside\*"' "with no selection it opens a pair to type into"
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
 
-# --- the field shows formatting, never markup (WIN-101) ---------------------
+# --- the field shows formatting, never markup ---------------------
 # The delimiters are still in the buffer — every assertion here is on the TEXT,
 # which is what gets sent — but they are drawn with no ink and no width. What
 # that costs is caret arithmetic, and these are the rules that pay it.
@@ -1035,7 +1034,7 @@ for _ in 1 2; do "$DRIVE" key left >/dev/null 2>&1; done
 expect_grep '^ed .*text="a  b"' "deleting the last character removes the emphasis whole"
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
 
-# --- the editor preference (WIN-103) ----------------------------------------
+# --- the editor preference ----------------------------------------
 # Two modes, and BOTH are driven here: a preference with one tested path has an
 # untested path, and this one changes what every keystroke does.
 say "== editor preference"
@@ -1059,7 +1058,7 @@ snap | grep -qE '^fmtbar hover=-?[0-9]+ (0,0,0,0 ?){7}$' \
 # Switching modes must not EDIT what you wrote. It did: the repair pass measures
 # against a snapshot of what was invisible, so after a switch to plain — where
 # nothing is hidden — the first keystroke read every delimiter as one that had
-# stopped parsing and deleted it (WIN-104). Reported as "text jumping".
+# stopped parsing and deleted it. Reported as "text jumping".
 fmt_reset 'a *bold* b' 10
 "$DRIVE" editor rich >/dev/null 2>&1
 "$DRIVE" editor plain >/dev/null 2>&1
@@ -1080,7 +1079,7 @@ ed_step caret 6 "rich text: the same five presses cross the invisible delimiter"
 # The caret spans the LINE, whatever runs are on it. It used to take its height
 # from the cluster it sat against, so the moment a hidden delimiter was next to
 # it the caret became 0.1 DIP tall and sat on the baseline — reported as "the
-# cursor is in the wrong alignment when formatting appears" (WIN-102). Asserted
+# cursor is in the wrong alignment when formatting appears". Asserted
 # as an equality rather than a number, so it holds at any DPI or text size.
 caret_h() { snap | awk '/^edcaret /{ for (i=1;i<=NF;i++) if ($i ~ /^h=/) { sub(/^h=/,"",$i); print $i } }'; }
 fmt_reset 'plain text' 10
@@ -1093,7 +1092,7 @@ checks=$((checks + 1))
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
 
 # The field's box must be at least as tall as a line, and the caret must not
-# move when nothing has changed. Both are the same defect (WIN-105): the box was
+# move when nothing has changed. Both are the same defect: the box was
 # a hardcoded 20 DIP while a line is 22 x the text scale, so every line was
 # clipped AND the caret-visibility scroll had no satisfiable answer — its two
 # branches alternated on every repaint and the line oscillated by the
@@ -1121,7 +1120,7 @@ before=$(caret_top)
 checks=$((checks + 1))
 [ "$(caret_top)" = "$before" ] \
   && ok "and the caret does not drift when nothing changes ($before)" \
-  || fail "caret moved across repaints: $before -> $(caret_top) (WIN-105 oscillation)"
+  || fail "caret moved across repaints: $before -> $(caret_top) (caret oscillation)"
 "$DRIVE" key ctrl+0 >/dev/null 2>&1
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
 
@@ -1185,8 +1184,8 @@ ed_step len 0 "reopening the pane starts empty"
 # the CONVERSATION composer, and leaving the pane up pointed them at its field.
 "$DRIVE" view home >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; settle conv 1
 
-# --- selecting text with the mouse (WIN-100) --------------------------------
-# The self-drawn field (WIN-80) replaced a native EDIT, and word selection left
+# --- selecting text with the mouse --------------------------------
+# The self-drawn field replaced a native EDIT, and word selection left
 # with the control: the window class never asked for CS_DBLCLKS, so Windows was
 # not even sending WM_LBUTTONDBLCLK and a double-click just moved the caret
 # twice. Nothing caught it because the harness could not express a gesture at
@@ -1238,7 +1237,7 @@ fi
 expect_grep '^ed .*text="the quick brown fox jumps"' "and Ctrl+C copies what was selected"
 "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; ed_wait len 0
 
-# --- clickable links (WIN-112, REQ-220) --------------------------------------
+# --- clickable links (REQ-220) --------------------------------------
 # The autolink BOUNDARY rules are unit-tested where they belong
 # (tests/test_richtext.c, which can enumerate them). What only this suite can
 # show is that the client agrees with the parser about which bytes are the link
@@ -1267,8 +1266,8 @@ fi
 "$DRIVE" move 5 5 >/dev/null 2>&1
 expect_grep '^link hover=""$' "and leaving the transcript clears it"
 
-# --- drafts that outlive the process (WIN-91, REQ-223, ARCH-101) -------------
-# WIN-27's drafts were 24 slots in memory: a switch survived them, a restart did
+# --- drafts that outlive the process (REQ-223, ARCH-101) -------------
+# Drafts used to be 24 slots in memory: a switch survived them, a restart did
 # not. They now live on the daemon, so the assertion that matters is the one the
 # old ones could never pass — kill the client and find the text still there.
 say "== drafts"
@@ -1362,7 +1361,7 @@ if [ -n "${n:-}" ] && [ "$n" -ge 2 ]; then ok "the paint pass described $n eleme
 else fail "nothing published to the accessibility tree (items=${n:-?})"; fi
 
 # Announcements. What is SAID cannot be observed from here — the same honest
-# limit as the tray balloon (WIN-18) — so what is asserted is that the path runs:
+# limit as the tray balloon — so what is asserted is that the path runs:
 # a failure raises one, and your own message does not, because being read your
 # own words back is noise.
 ann() { snap | grep -oE 'announced=[0-9]+' | cut -d= -f2; }
@@ -1407,7 +1406,7 @@ else
   say "   (could not stage uia_probe.ps1 — skipping the external check)"
 fi
 
-# --- keywords, priority people, schedule (WIN-94, REQ-135/136) -------------
+# --- keywords, priority people, schedule (REQ-135/136) -------------
 # All three are SERVER state reached through a modal form, which is why the
 # harness learned `formnext`: a form blocks the command loop, so every setting
 # behind one was undrivable and therefore untested end to end.
@@ -1488,7 +1487,7 @@ expect_grep '^keywords="deploy,release train" nvip=1 schedmode=3 .*scheddays=7' 
 expect_grep '^keywords=.* schedmode=0 ' "turning the schedule off leaves nothing behind"
 "$DRIVE" key esc >/dev/null 2>&1; settle modal none
 
-# --- the chrome survives scaling (WIN-111) ---------------------------------
+# --- the chrome survives scaling ---------------------------------
 # The defects this covers appear ONLY when something scales, which is why they
 # went unseen: at 100% the shell is clean. `chromefit` is computed from the same
 # element rects the automation surface publishes (REQ-290) — siblings that
@@ -1551,8 +1550,8 @@ case "$line" in
 esac
 
 # --- "The Notifications card clips its own content at high DPI" -------------
-# Cited by title, not by number: a backlog position moves whenever an item is
-# added or closed, and a number here would rot silently.
+# Cited by title, not by number: an issue number in a comment rots as soon as
+# the issue is closed, renamed or superseded.
 # `chromefit` above cannot see this: it compares published rectangles, and the
 # card's own rows were published at coordinates well past its bottom edge while
 # every element it does know about sat inside. The card's content is a fixed
@@ -1660,7 +1659,7 @@ else fail "Sunday is unreachable at every scroll offset"; fi
 "$DRIVE" dpi 96 >/dev/null 2>&1; "$DRIVE" zoom 0 >/dev/null 2>&1; "$DRIVE" textsize 1 >/dev/null 2>&1
 sleep 0.4
 
-# --- pausing notifications (WIN-92, REQ-278) -------------------------------
+# --- pausing notifications (REQ-278) -------------------------------
 # The pause is SERVER state, not a client mood: the restart below is the point of
 # the section — a client that only remembered it locally would pass every other
 # check here and still show "not paused" to somebody who is.
@@ -1690,7 +1689,7 @@ else fail "pause lost across a restart: $(snap | grep '^snoozed=')"; fi
 "$DRIVE" menu 57 >/dev/null 2>&1          # resume
 expect_grep '^snoozed=0 snooze_until=0 ' "resuming ends it, and ends it now"
 
-# --- Threads, across channels (WIN-108, REQ-062) ---------------------------
+# --- Threads, across channels (REQ-062) ---------------------------
 # The claim is that this is a SERVER answer: threads I am in wherever they are,
 # with unread counts a channel cursor cannot produce. So it is seeded from a
 # second account and driven through the shelf row.
@@ -1735,7 +1734,7 @@ expect_grep '^threads n=0 unreadonly=1' "unreads-only asks again and comes back 
 [ -n "$ubtn" ] && "$DRIVE" click $ubtn >/dev/null 2>&1
 expect_grep '^threads n=[1-9] unreadonly=0' "and back"
 
-# --- People (WIN-109, REQ-289) ---------------------------------------------
+# --- People (REQ-289) ---------------------------------------------
 # The directory exists because the roster now carries title/timezone/status. The
 # check that matters is that it filters, since the pane is otherwise a list.
 say "== people"
@@ -1747,7 +1746,7 @@ expect_grep '^people n=1 q="bob"' "typing a name filters to one person"
 expect_grep '^people n=[3-9] q=""' "clearing it restores everyone"
 "$DRIVE" view 0 >/dev/null 2>&1; settle sbkind 1
 
-# --- one selected row at a time (WIN-106) ----------------------------------
+# --- one selected row at a time ----------------------------------
 # Reported from a screenshot: the Drafts pane lit its own shelf row AND left the
 # conversation lit underneath it, so two places claimed to be where you were.
 say "== sidebar selection"
@@ -1757,7 +1756,7 @@ expect_grep '^sbsel=1' "Home: the open conversation is the one selected row"
 expect_grep '^sbsel=1' "Drafts: its shelf row is selected and the conversation is not"
 "$DRIVE" view 0 >/dev/null 2>&1; settle sbkind 1
 
-# --- Activity: the three unread tabs (WIN-97) ------------------------------
+# --- Activity: the three unread tabs ------------------------------
 # These tabs are a different QUESTION, not a client-side filter of the involved-me
 # feed, so they are asserted end to end: a message arrives from SOMEBODY ELSE
 # (demo_client as bob — one session cannot make itself an unread), and the tab is

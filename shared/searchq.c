@@ -1,5 +1,5 @@
 /*
- * Search query parsing (REQ-081, WIN-39). See searchq.h.
+ * Search query parsing (REQ-081). See searchq.h.
  */
 
 #include "searchq.h"

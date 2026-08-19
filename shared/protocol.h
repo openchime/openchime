@@ -54,7 +54,7 @@
  * (REQ-122/278). One byte appended to a fixed frame is still a layout change,
  * and the rule above has no exception for small ones.
  *
- * 4: USER_LIST carries each user's avatar attachment id (WIN-47). A frame LAYOUT
+ * 4: USER_LIST carries each user's avatar attachment id. A frame LAYOUT
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
  * "connection lost" (ARCH-61 ships the two together). */
@@ -149,18 +149,18 @@ typedef enum {
     OC_MSG_DELETE_WEBHOOK     = 0x005D, /* C->S, remove a webhook */
     OC_MSG_WEBHOOK_DELETED    = 0x005E, /* S->C, ack for DELETE_WEBHOOK */
     OC_MSG_UPDATE_CHANNEL     = 0x005F, /* C->S (REQ-034/035/036), mutate a channel */
-    /* Webhook lifecycle (WIN-48). `webhooks.disabled` already existed and nothing
+    /* Webhook lifecycle. `webhooks.disabled` already existed and nothing
      * could set it. **Reveal is impossible and deliberately absent**: only the
      * token's SHA-256 is stored, so a lost token can be rotated but never shown
      * again — the UI has to say so rather than offer a button that cannot work. */
-    /* Mute (REQ-137, WIN-40) and mark-unread (REQ-235, WIN-52). SET_READ_CURSOR is
+    /* Mute (REQ-137) and mark-unread (REQ-235). SET_READ_CURSOR is
      * deliberately NOT the ack path: CLIENT_ACK only ever advances (the daemon takes
      * MAX), because a replayed ack must not rewind anyone's cursor. Marking unread is
      * an explicit act and gets an explicit op. */
-    /* Custom status (REQ-241/122, WIN-53) and profile fields (REQ-240, WIN-47).
+    /* Custom status (REQ-241/122) and profile fields (REQ-240).
      * PROFILE carries everything a client shows about a person, so a roster needs one
      * frame per user rather than one per field. */
-    /* WIN-82: which channels hold files, and how many. The Files view's left column
+    /* which channels hold files, and how many. The Files view's left column
      * was built from the 200-row page, so a channel whose last upload was older than
      * that simply did not appear. One aggregate query answers it exactly. */
     /* REQ-182: the caller's own active sessions. `sessions` has carried device_label
@@ -169,7 +169,7 @@ typedef enum {
     /* REQ-134: the level for channels with no per-channel override. Rides the
      * NOTIFY_PREFS frame back, so a client learns it with the rest. */
     OC_MSG_SET_NOTIFY_DEFAULT = 0x0077,
-    OC_MSG_SET_AVATAR         = 0x0078, /* C->S, my avatar attachment id (WIN-47) */
+    OC_MSG_SET_AVATAR         = 0x0078, /* C->S, my avatar attachment id */
     OC_MSG_OPEN_GROUP_DM      = 0x0079, /* C->S, open/create a group DM (REQ-056) */
     OC_MSG_ADD_EMOJI          = 0x007A, /* C->S, name + attachment id (REQ-072) */
     OC_MSG_DELETE_EMOJI       = 0x007B, /* C->S, name */
@@ -308,7 +308,7 @@ typedef enum {
     OC_MSG_SET_DISPLAY_NAME = 0x0048, /* C->S, change your own display name (REQ-020) */
     OC_MSG_CHANGE_PASSWORD  = 0x0049, /* C->S, change your own local password (verify old) */
     OC_MSG_PROFILE_UPDATED  = 0x004A, /* S->C, a user's display name changed (also the self ack) */
-    /* Invite management (REQ-026, WIN-46). The `invites` table has always carried
+    /* Invite management (REQ-026). The `invites` table has always carried
      * role, expires_at_ms and consumed_at_ms — nothing could READ them, so a minted
      * invite was write-only: no way to see what was outstanding or to revoke one.
      * No migration; two ops and a list frame. */
@@ -483,8 +483,8 @@ oc_result oc_negotiate_version(uint16_t client_min, uint16_t client_max,
 
 /* Synced client settings (the daemon-side settings bucket). */
 #define OC_MAX_CLIENT_SETTINGS 128u /* cap on a CLIENT_SETTINGS snapshot */
-#define OC_MAX_INVITES     64u  /* cap on an INVITE_LIST (WIN-46) */
-#define OC_MAX_FILE_CHANNELS 128u /* cap on a FILE_CHANNELS list (WIN-82) */
+#define OC_MAX_INVITES     64u  /* cap on an INVITE_LIST */
+#define OC_MAX_FILE_CHANNELS 128u /* cap on a FILE_CHANNELS list */
 #define OC_MAX_SESSIONS      32u  /* cap on a SESSION_LIST (REQ-182) */
 #define OC_CLIENT_TYPE_MAX     32u  /* client_type string cap (bytes) */
 #define OC_SETTING_KEY_MAX     64u  /* setting key string cap (bytes) */
@@ -746,16 +746,16 @@ typedef struct { uint64_t webhook_id; uint64_t channel_id; oc_slice token; } oc_
 typedef struct { uint64_t channel_id; } oc_list_webhooks;
 typedef struct { uint64_t webhook_id; uint64_t channel_id; oc_slice label; uint8_t disabled; } oc_webhook_list_entry;
 typedef struct { uint16_t count; const oc_webhook_list_entry *entries; } oc_webhook_list;  /* tokens never listed */
-/* WIN-48. ROTATE replies with a WEBHOOK_INFO carrying the new token — the same
+/* ROTATE replies with a WEBHOOK_INFO carrying the new token — the same
  * shown-once frame CREATE uses, because it is the same situation. */
 typedef struct { uint64_t webhook_id; uint8_t disabled; } oc_set_webhook_state;
 typedef struct { uint64_t webhook_id; } oc_rotate_webhook;
-/* WIN-40 / WIN-52. `message_id` 0 in SET_READ_CURSOR means "everything unread". */
-/* WIN-53 / WIN-47. `expires_at` 0 means "until I change it"; the DAEMON enforces the
+/* / `message_id` 0 in SET_READ_CURSOR means "everything unread". */
+/* / `expires_at` 0 means "until I change it"; the DAEMON enforces the
  * expiry, because a client that is not running cannot clear its own status. */
 typedef struct { oc_slice emoji; oc_slice text; uint64_t expires_at; } oc_set_status;
 typedef struct { oc_slice title; oc_slice timezone; } oc_set_profile;
-/* WIN-47. An id, not bytes: the image goes up through the ordinary attachment
+/* An id, not bytes: the image goes up through the ordinary attachment
  * upload (REQ-140) and this points at the result, so dedup, size caps and the blob
  * store all keep working. 0 clears the avatar. */
 typedef struct { uint64_t attachment_id; } oc_set_avatar;
@@ -774,7 +774,7 @@ typedef struct { uint64_t user_id; oc_slice display_name; oc_slice email;
                  oc_slice status_emoji; oc_slice status_text; uint64_t status_expires;
                  oc_slice title; oc_slice timezone; uint64_t avatar_id;
                  uint8_t role; } oc_profile_info;
-/* WIN-82. Counts, not rows: the column shows "#design 12", so the wire carries
+/* Counts, not rows: the column shows "#design 12", so the wire carries
  * exactly that and nothing more. */
 /* REQ-182. `current` marks the connection asking — you should be able to tell which
  * row is the machine in front of you before revoking one. No token, ever: only its
@@ -865,7 +865,7 @@ typedef struct { uint8_t platform; oc_slice token; } oc_register_device_token;
 typedef struct { uint8_t ok; uint16_t code; } oc_device_token_ack;
 /* `muted` appended per entry — which IS a layout change, not a compatible one: this
  * is a repeated list, so an extra byte per entry shifts every entry after the first.
- * My first note here claimed otherwise. Hence the bump to protocol 3, which WIN-38's
+ * My first note here claimed otherwise. Hence the bump to protocol 3, which the
  * search cursor needs regardless. */
 typedef struct { uint64_t channel_id; uint8_t level; uint8_t muted; } oc_notify_pref_entry;
 typedef struct { uint8_t level; } oc_set_notify_default;
@@ -983,7 +983,7 @@ typedef struct { uint8_t role; } oc_invite_user;
 typedef struct { uint64_t user_id; } oc_remove_user;
 typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; } oc_user_updated;
 typedef struct { oc_slice token; uint8_t role; uint64_t expires_at; } oc_invite_created;
-/* WIN-46. An outstanding invite, identified by a server-side id rather than its
+/* An outstanding invite, identified by a server-side id rather than its
  * token: the token is not recoverable (only its hash is stored) and putting one on
  * the wire again would hand it to anyone who could read a list. */
 typedef struct { uint64_t invite_id; uint8_t role; uint64_t created_at; uint64_t expires_at;
@@ -996,18 +996,18 @@ typedef struct { oc_slice name; } oc_set_display_name;
 typedef struct { oc_slice old_password; oc_slice new_password; } oc_change_password;
 typedef struct { uint64_t user_id; oc_slice display_name; } oc_profile_updated;
 /* SEARCH carries the parsed FILTERS as fields and the leftover text as the FTS
- * query (REQ-081, WIN-39): `from:`/`in:`/`has:`/dates are predicates on columns, and
+ * query (REQ-081): `from:`/`in:`/`has:`/dates are predicates on columns, and
  * MATCHing them as literal text would find messages that merely mention them.
  * Parsing lives in shared/searchq.c so both frontends mean the same thing.
  *
- * `before_id` is WIN-38's paging cursor: results come back newest-first ordered by
+ * `before_id` is the paging cursor: results come back newest-first ordered by
  * id, so "give me the page before this id" is a keyset cursor — stable under
  * concurrent posting, unlike an offset. 0 = the first page. */
 typedef struct {
     oc_slice query;          /* free text for FTS; may be empty when filters carry it */
     uint16_t limit;
-    uint64_t before_id;      /* WIN-38 */
-    oc_slice from_name;      /* WIN-39: author, as typed; "" = any */
+    uint64_t before_id;      /* */
+    oc_slice from_name;      /* author, as typed; "" = any */
     oc_slice in_channel;     /* channel name, as typed; "" = any */
     uint8_t  has_mask;       /* OC_SQ_HAS_* */
     uint64_t after_ms, before_ms;   /* 0 = unbounded; resolved by the CLIENT, which

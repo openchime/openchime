@@ -397,7 +397,7 @@ int run_storage_tests(void) {
         CHECK(reclaimed(db, 11) == 0);
     }
 
-    /* An AVATAR is an attachment no message references (WIN-47), so it looks exactly
+    /* An AVATAR is an attachment no message references, so it looks exactly
      * like an orphan to tier 1 and like any other old file to tiers 2a and 2b. It
      * must survive all three, or every profile picture in the workspace goes blank an
      * hour after being set. */

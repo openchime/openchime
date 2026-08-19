@@ -32,14 +32,15 @@ REQ-027.
 
 ## The documents
 
-Seventeen, and each has one job. **Start with the first three**: they answer what
-the product is meant to do, what is wrong with it today, and why it is built the
-way it is.
+Sixteen, and each has one job. **Start with the first two**: they answer what the
+product is meant to do and why it is built the way it is. What is *wrong* with it
+today is no longer a document — it is the
+[issue tracker](https://github.com/openchime/openchime/issues), which replaced
+`docs/BACKLOG.md` on 2026-08-19.
 
 | Document | What it is |
 |---|---|
 | [REQUIREMENTS.md](docs/REQUIREMENTS.md) | The product specification — every `REQ-NNN`, written as a contract in present-perfect. Each requirement carries a marker saying whether it is built, so a shipped guarantee reads differently from an intention. |
-| [BACKLOG.md](docs/BACKLOG.md) | **The project's only issue list.** 118 numbered items covering the Win32 client and the daemon, ordered lowest impact to highest, each with the evidence that verified it. |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | The `ARCH-N` decision record: every architectural choice, its rationale, and what later decisions amended or withdrew it. Design decisions live here; product scope lives in REQUIREMENTS.md. |
 | [PROTOCOL.md](docs/PROTOCOL.md) | The byte-level wire protocol — frame layout, the handshake, every message type and its payload, the error codes, and the connection state machine. Its §9 registry is generated from the codec and is the authority on which opcodes are taken. |
 | [SCHEMA.md](docs/SCHEMA.md) | The SQLite schema and the migration mechanism, documenting all 36 migrations and why each table is shaped the way it is. |
@@ -73,8 +74,8 @@ daemon also emits **mobile push** to the control-plane gateway (ARCH-85) and
 signaling and the UDP sidecar are built; the client-side codec is not
 ([docs/AUDIO.md](docs/AUDIO.md)).
 
-For what is known to be wrong with it, see
-**[docs/BACKLOG.md](docs/BACKLOG.md)**. Two daemon defects are open there: a
+For what is known to be wrong with it, see the
+**[issue tracker](https://github.com/openchime/openchime/issues)**. Two daemon defects are open there: a
 webhook can post into an archived channel, and two message types share an opcode
 so editing a profile drops the connection. Remaining
 server-side scope includes a CA-signed certificate for the webhook endpoint
@@ -209,8 +210,8 @@ all shipped with their daemon halves on 2026-08-01/02.
 
 Its `scripts/gui_smoke.sh` gate reported **247 of 249 checks passing** on
 2026-08-02. The two failures, two further defects the gate structurally cannot
-see, and the verification gap underneath them are in
-[docs/BACKLOG.md](docs/BACKLOG.md). Next is **TUI catch-up**, then GTK (Linux),
+see, and the verification gap underneath them are in the
+[issue tracker](https://github.com/openchime/openchime/issues). Next is **TUI catch-up**, then GTK (Linux),
 AppKit (macOS), a web DOM UI, and mobile.
 
 ## Local development environment

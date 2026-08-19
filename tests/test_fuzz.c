@@ -1,4 +1,4 @@
-/* Codec fuzzer (robustness backlog #5). Feeds deterministic pseudo-random and
+/* Codec fuzzer. Feeds deterministic pseudo-random and
  * semi-structured bytes through oc_parse_frame and every decoder, asserting the
  * codec never crashes, never reads out of bounds, and always returns a
  * well-defined result on garbage. Reproducible: fixed PRNG seed, no I/O.

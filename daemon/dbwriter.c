@@ -220,7 +220,7 @@ static void free_attach_meta(oc_attach_meta *a, size_t n) {
 void oc_dbres_free(oc_dbres *r) {
     if (!r) return;
     free(r->body);
-    /* WIN-47/53's profile strings, alongside every other heap field. */
+    /* 53's profile strings, alongside every other heap field. */
     free(r->st_emoji); free(r->st_text); free(r->pf_title); free(r->pf_tz);
     free(r->fchans);
     for (size_t i = 0; i < r->n_sessions; i++) free((void *)r->sessions[i].device_label.ptr);
@@ -832,7 +832,7 @@ static oc_dbres *process_list_users(sqlite3 *db, const oc_job *j) {
         arr[n].disabled     = (uint8_t)(sqlite3_column_int(st, 2) != 0);
         arr[n].email        = strdup((const char *)sqlite3_column_text(st, 3));
         arr[n].display_name = strdup((const char *)sqlite3_column_text(st, 4));
-        /* The roster carries the avatar (WIN-47) so a transcript can draw every
+        /* The roster carries the avatar so a transcript can draw every
          * author's picture without a PROFILE_INFO round trip per author. */
         arr[n].avatar_id    = (uint64_t)sqlite3_column_int64(st, 5);
         /* REQ-289: the profile fields, so a client learns them for everyone
@@ -2326,7 +2326,7 @@ static oc_dbres *process_add_emoji(sqlite3 *db, const oc_job *j) {
         r->type = OC_RES_LIST_ERR; r->err_code = OC_ERR_MALFORMED_FRAME; return r;
     }
     /* The image must exist, be finalized, be an image, and be one THIS user
-     * uploaded — the same rule as an avatar (WIN-47) and for the same reason: an
+     * uploaded — the same rule as an avatar and for the same reason: an
      * emoji is readable workspace-wide, so the id has to be one the setter was
      * entitled to. */
     sqlite3_stmt *ck = NULL;
@@ -2536,7 +2536,7 @@ static oc_dbres *process_list_members(sqlite3 *db, const oc_job *j) {
  * a message was never shared with anyone. Reclaimed rows are KEPT and flagged,
  * because "this was here and the bytes are gone" (REQ-215/217) is information
  * where a silently missing row is not. */
-/* Which channels hold files, with counts (WIN-82).
+/* Which channels hold files, with counts.
  *
  * The client used to build this from the 200-row LIST_FILES page, so a channel whose
  * newest upload fell outside that window was invisible in the Files column. One
@@ -3336,7 +3336,7 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
     char fts[1024];
     int have_text = (j->body && j->body_len > 0 &&
                      build_fts_query((const char *)j->body, j->body_len, fts, sizeof fts) != 0);
-    /* WIN-39: filters alone are a valid search — "everything alice posted in #design"
+    /* filters alone are a valid search — "everything alice posted in #design"
      * needs no words. Only a query with NEITHER text nor filters is empty. */
     int have_filter = (j->sq_from && j->sq_from[0]) || (j->sq_in && j->sq_in[0]) ||
                       j->sq_has || j->sq_after || j->sq_before;
@@ -3360,7 +3360,7 @@ static oc_dbres *process_search(sqlite3 *db, const oc_job *j) {
         have_text ? "messages_fts JOIN" : "",
         have_text ? "ON m.id = messages_fts.rowid" : "");
     if (have_text) k += snprintf(sql + k, sizeof sql - (size_t)k, " AND messages_fts MATCH ?1 ");
-    /* Keyset cursor (WIN-38): id < before, which is stable while people keep posting —
+    /* Keyset cursor: id < before, which is stable while people keep posting —
      * an OFFSET would skip or repeat rows as the table grows underneath. */
     if (j->message_id) k += snprintf(sql + k, sizeof sql - (size_t)k, " AND m.id < ?4 ");
     if (j->sq_from && j->sq_from[0])
@@ -3683,7 +3683,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
-/* Page backwards through one channel (§6.3, WIN-16): the newest `search_limit`
+/* Page backwards through one channel (§6.3): the newest `search_limit`
  * top-level messages strictly older than `message_id`. Answers with the same
  * BACKFILL_OK shape as the forward replay, so the net thread needs no new
  * emit path and the client folds the rows in the same way.
@@ -4000,7 +4000,7 @@ static oc_dbres *process_attach_lookup(sqlite3 *db, const oc_job *j) {
     const void *dg  = sqlite3_column_blob(st, 5);
     int dglen       = sqlite3_column_bytes(st, 5);
 
-    /* An AVATAR is readable by every authenticated user (WIN-47), regardless of the
+    /* An AVATAR is readable by every authenticated user, regardless of the
      * channel the image was uploaded to. It has to be: a picture is drawn beside
      * every message its owner wrote, in channels the viewer shares with them but the
      * uploader's own upload channel is not. The exposure is bounded by
@@ -4237,7 +4237,7 @@ static oc_dbres *process_set_notify_pref(sqlite3 *db, const oc_job *j) {
     sqlite3_stmt *st = NULL;
     /* UPSERT on the level ALONE, not INSERT OR REPLACE: replacing the row would
      * reset `muted` to its default every time somebody changed the level, silently
-     * un-muting a conversation as a side effect of an unrelated setting (WIN-40). */
+     * un-muting a conversation as a side effect of an unrelated setting. */
     sqlite3_prepare_v2(db,
         "INSERT INTO notification_prefs(user_id, channel_id, level) VALUES(?1, ?2, ?3) "
         "ON CONFLICT(user_id, channel_id) DO UPDATE SET level=excluded.level;",
@@ -4252,7 +4252,7 @@ static oc_dbres *process_set_notify_pref(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
-/* The global notification default (REQ-134, WIN-54): the level for a channel with no
+/* The global notification default (REQ-134): the level for a channel with no
  * per-channel row. Answers with the whole prefs snapshot, so a client's view of "what
  * happens by default" cannot drift from the server's. */
 static oc_dbres *process_set_notify_default(sqlite3 *db, const oc_job *j) {
@@ -4274,7 +4274,7 @@ static oc_dbres *process_set_notify_default(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
-/* Mute a conversation (REQ-137, WIN-40). Distinct from level=none: this one also
+/* Mute a conversation (REQ-137). Distinct from level=none: this one also
  * de-emphasises the row and suppresses its badge, which the client does from the
  * flag. Same upsert discipline as the level above — touch one column. */
 static oc_dbres *process_set_mute(sqlite3 *db, const oc_job *j) {
@@ -4303,7 +4303,7 @@ static oc_dbres *process_set_mute(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
-/* Mark unread (REQ-235, WIN-52): set the read cursor DELIBERATELY, including
+/* Mark unread (REQ-235): set the read cursor DELIBERATELY, including
  * backwards, which the ack path must never do.
  *
  * process_client_ack upserts MAX(message_id, excluded.message_id) so a replayed ack
@@ -4435,7 +4435,7 @@ static oc_dbres *process_set_profile(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
-/* The avatar (WIN-47). An attachment id, validated here rather than trusted: it must
+/* The avatar. An attachment id, validated here rather than trusted: it must
  * exist, be finalized, be an image, and be one THIS user uploaded. Without the last
  * check any member could point their avatar at somebody else's private-channel
  * attachment and have the daemon serve it to the whole workspace — the relaxation in
@@ -4498,7 +4498,7 @@ static uint64_t snooze_until(sqlite3 *db, uint64_t uid) {
     return (until && until <= dbw_now_ms()) ? 0 : until;
 }
 
-/* Pause notifications until an instant (REQ-278, WIN-92). The wire carries
+/* Pause notifications until an instant (REQ-278). The wire carries
  * MINUTES FROM NOW, as Slack's `dnd.setSnooze` does — every preset is a duration
  * and only the client knows the timezone that turns "until tomorrow" into a
  * moment — so the instant is resolved here, once. 0 minutes ends the pause:
@@ -4743,7 +4743,7 @@ static void build_schedule(sqlite3 *db, uint64_t uid, oc_dbres *r) {
     fill_schedule(db, uid, r);
 }
 
-/* Set the schedule (REQ-136, WIN-94). Replaces what was there — including the
+/* Set the schedule (REQ-136). Replaces what was there — including the
  * per-weekday rows, which are deleted before the new ones land, because a
  * schedule is one fact and a merge would leave a day nobody can see set. */
 static oc_dbres *process_set_schedule(sqlite3 *db, const oc_job *j) {
@@ -4932,7 +4932,7 @@ static oc_dbres *process_prune_device_token(sqlite3 *db, const oc_job *j) {
 }
 
 /* The caller's full notification settings (REQ-130/131). Read. */
-/* ---- invite management (REQ-026, WIN-46) ------------------------------------
+/* ---- invite management (REQ-026) ------------------------------------
  *
  * The `invites` table has carried role, expires_at_ms and consumed_at_ms since
  * migration 0002; nothing could read them, so a minted invite was write-only —
@@ -5006,7 +5006,7 @@ static oc_dbres *process_revoke_invite(sqlite3 *db, const oc_job *j) {
     return r;
 }
 
-/* ---- webhook lifecycle (WIN-48) --------------------------------------------
+/* ---- webhook lifecycle --------------------------------------------
  *
  * `webhooks.disabled` has existed since migration 0016 and nothing could set it.
  * Reveal is absent because it is IMPOSSIBLE: only the token's SHA-256 is stored, so
@@ -5974,7 +5974,7 @@ static oc_dbres *process_storage_maint(sqlite3 *db, const oc_job *j) {
     if (sqlite3_prepare_v2(db,
             "SELECT id, storage_key FROM attachments "
             "WHERE message_id IS NULL AND reclaimed_at_ms = 0 AND created_at_ms < ?1 "
-            /* An AVATAR is an attachment no message references (WIN-47), so it looks
+            /* An AVATAR is an attachment no message references, so it looks
              * exactly like an orphan to this sweep — and would have been collected an
              * hour after being set, leaving every profile picture in the workspace
              * silently blank. The other two tiers below need the same exclusion for

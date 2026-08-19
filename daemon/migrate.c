@@ -513,7 +513,7 @@ static const char MIGRATION_0025[] =
     "ALTER TABLE users ADD COLUMN activity_seen_ms INTEGER NOT NULL DEFAULT 0;";
 
 static const char MIGRATION_0026[] =
-    /* Mute (REQ-137, WIN-40) is NOT the same as notification level "none", which is
+    /* Mute (REQ-137) is NOT the same as notification level "none", which is
      * why it needs a column of its own rather than a fourth level. `level` decides
      * whether the daemon NOTIFIES you; mute additionally de-emphasises the row and
      * suppresses its unread badge. Slack keeps them separate for the same reason: you
@@ -521,7 +521,7 @@ static const char MIGRATION_0026[] =
     "ALTER TABLE notification_prefs ADD COLUMN muted INTEGER NOT NULL DEFAULT 0 "
     "  CHECK (muted IN (0,1));"
 
-    /* Mark-unread (REQ-235, WIN-52). The read cursor is monotonic BY CONSTRUCTION —
+    /* Mark-unread (REQ-235). The read cursor is monotonic BY CONSTRUCTION —
      * process_client_ack upserts MAX(message_id, excluded.message_id) — because a
      * replayed ack must never be able to move it backwards. That is a correctness
      * property worth keeping, so marking unread cannot reuse the ack path; it gets
@@ -531,8 +531,8 @@ static const char MIGRATION_0026[] =
     "CREATE INDEX IF NOT EXISTS idx_cursors_user ON delivery_cursors(user_id, channel_id);";
 
 static const char MIGRATION_0027[] =
-    /* Custom status (REQ-241/122, WIN-53) and the richer profile fields
-     * (REQ-240, WIN-47). All on `users`, because they are facts about a person and
+    /* Custom status (REQ-241/122) and the richer profile fields
+     * (REQ-240). All on `users`, because they are facts about a person and
      * there is exactly one row per person — a side table would buy nothing but a
      * join.
      *
@@ -551,7 +551,7 @@ static const char MIGRATION_0027[] =
     "ALTER TABLE users ADD COLUMN avatar_attachment_id INTEGER;";
 
 static const char MIGRATION_0028[] =
-    /* Global notification default (REQ-134, WIN-54). `notification_prefs` is a
+    /* Global notification default (REQ-134). `notification_prefs` is a
      * PER-CHANNEL override, so there was no answer for "a channel I have never
      * touched" other than a compiled-in constant — which meant the user could not
      * change it. One column on `users`, and the per-channel rows keep overriding it. */
@@ -652,7 +652,7 @@ static const char MIGRATION_0032[] =
     "CREATE INDEX idx_sched_user ON scheduled_messages(user_id, send_at_ms);";
 
 static const char MIGRATION_0033[] =
-    /* Pausing notifications (REQ-278, WIN-92). An ABSOLUTE instant, not a
+    /* Pausing notifications (REQ-278). An ABSOLUTE instant, not a
      * duration: the wire takes minutes-from-now because that is what the presets
      * are, and the daemon resolves them once, here, so a pause cannot drift with
      * the reader's clock.
@@ -670,7 +670,7 @@ static const char MIGRATION_0033[] =
     "ALTER TABLE users ADD COLUMN dnd_until_ms INTEGER NOT NULL DEFAULT 0;";
 
 static const char MIGRATION_0034[] =
-    /* The notification SCHEDULE (REQ-136, ARCH-103, WIN-94). It REPLACES the
+    /* The notification SCHEDULE (REQ-136, ARCH-103). It REPLACES the
      * single daily window rather than joining it: Slack has exactly one
      * recurring mechanism, and two things able to disagree about "am I quiet
      * now" would need a precedence rule nobody could remember.
@@ -735,7 +735,7 @@ static const char MIGRATION_0035[] =
     ") WITHOUT ROWID;";
 
 static const char MIGRATION_0036[] =
-    /* The aggregated Threads view (REQ-062, ARCH-104, WIN-108).
+    /* The aggregated Threads view (REQ-062, ARCH-104).
      *
      * Participation is DERIVED, never stored: you are in a thread if you wrote
      * its root or any reply, which the messages table already knows. So this
@@ -765,7 +765,7 @@ static const char MIGRATION_0036[] =
     ") WITHOUT ROWID;";
 
 static const char MIGRATION_0037[] =
-    /* Make UPLOAD_BEGIN idempotent (BACKLOG "`UPLOAD_BEGIN` is not idempotent").
+    /* Make UPLOAD_BEGIN idempotent.
      *
      * The frame has always carried a 16-byte idempotency token and the daemon
      * has always copied it into the job — and then never read it, so a retry

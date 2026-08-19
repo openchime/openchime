@@ -27,8 +27,7 @@ oc_net *oc_net_start(const char *host, int port, const char *token,
 
 /* Cut short the reconnect backoff so the next attempt happens immediately (no-op
  * if not currently backing off). */
-/* Redeem an invite on the FIRST connect instead of authenticating (WIN-32,
- * REQ-268): REDEEM_INVITE creates the account and authenticates in one step, so
+/* Redeem an invite on the FIRST connect instead of authenticating (REQ-268): REDEEM_INVITE creates the account and authenticates in one step, so
  * the reply is an ordinary AUTH_OK and everything after is unchanged. Call right
  * after oc_net_start; cleared once used, so a later reconnect re-auths normally
  * with the session token rather than replaying a spent invite. */

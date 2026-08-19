@@ -982,7 +982,7 @@ jobs:
       # box can install from them -- the apt path below shares the signing key
       # and the object layout, so it catches faults in those, but nothing
       # exercises dnf itself. First reported by a RHEL user is not where this
-      # should surface; see the FIXED-pending note in docs/BACKLOG.md.
+      # should surface; see the release-pipeline issues in the tracker.
       - name: Smoke the published apt repository
         # Skipped only when explicitly asked. The default stays a hard failure:
         # this step existing to fail while DIST_BASE_URL is unserved is a

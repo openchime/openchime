@@ -324,7 +324,7 @@ static void test_backfill(void) {
     cleanup_db(path);
 }
 
-/* Paging BACKWARDS (§6.3, WIN-16). A cursorless backfill only ever hands out the
+/* Paging BACKWARDS (§6.3). A cursorless backfill only ever hands out the
  * newest page, so without this a client could never reach older history at all. */
 static oc_dbres *history(oc_dbwriter *w, uint64_t uid, uint64_t ch,
                          uint64_t before, uint16_t limit) {
@@ -1673,7 +1673,7 @@ static void test_scheduled(void) {
     cleanup_db(path);
 }
 
-/* --- Activity's unread views (REQ-139, WIN-97) ---------------------------- */
+/* --- Activity's unread views (REQ-139) ---------------------------- */
 
 static oc_dbres *activity(oc_dbwriter *w, uint64_t uid, uint8_t filter) {
     oc_job *j = oc_job_new(OC_JOB_LIST_ACTIVITY, 920);
@@ -1682,7 +1682,7 @@ static oc_dbres *activity(oc_dbwriter *w, uint64_t uid, uint8_t filter) {
     return wait_result(w);
 }
 
-/* Keyword alerts (REQ-135, WIN-94). The claim under test is the one ARCH-103
+/* Keyword alerts (REQ-135). The claim under test is the one ARCH-103
  * rests on: a hit IS a mention — same table, same kind column — which is what
  * makes it notify, appear in the activity feed and highlight without any of the
  * three learning about keywords at all. */
@@ -2661,7 +2661,7 @@ static oc_dbres *search(oc_dbwriter *w, uint64_t uid, const char *query, uint16_
 }
 
 
-/* Search filters (REQ-081, WIN-39) and paging (WIN-38).
+/* Search filters (REQ-081) and paging.
  *
  * This asserts that every filter combination BUILDS and EXECUTES — no malformed SQL,
  * no crash, a well-formed SEARCH result each time — and the relative property that a
@@ -2672,8 +2672,7 @@ static oc_dbres *search(oc_dbwriter *w, uint64_t uid, const char *query, uint16_
  * the identical SQL run against the same database by hand returns all six. The
  * filters-only path (which never touches FTS) is empty too, so the read-only
  * connection (ARCH-66) is not seeing the writer's committed rows at all in this
- * scenario. That is a real defect and a bigger one than this feature — filed as
- * WIN-84. Asserting counts here would either fail for a reason unrelated to filters
+ * scenario. That is a real defect and a bigger one than this feature — filed separately. Asserting counts here would either fail for a reason unrelated to filters
  * or, worse, be "fixed" by weakening them until they said nothing.
  *
  * The filter SQL itself was verified by capturing the generated statement and running
@@ -2717,7 +2716,7 @@ static void test_search_filters_and_paging(void) {
     /* This suite previously asserted r->n_replay and therefore asserted NOTHING:
      * search results land in r->search / r->n_search (the netloop reads those), so
      * every count was a constant zero and every "filter narrows" check passed
-     * vacuously. It was filed as WIN-84 — "the read connection sees no rows" — on
+     * vacuously. It was filed as "the read connection sees no rows" — on
      * that evidence. The read connection was fine; the test was reading the wrong
      * field, which is a sharper warning than the bug it was mistaken for: a search
      * test that cannot see results cannot tell a working search from a broken one. */
@@ -2740,7 +2739,7 @@ static void test_search_filters_and_paging(void) {
     CHECK(r && r->n_search == 0);
     oc_dbres_free(r);
 
-    /* Filters ALONE are a search (WIN-39): no text, so the FTS join disappears. */
+    /* Filters ALONE are a search: no text, so the FTS join disappears. */
     r = search_f(w, alice, NULL, "sf-bob", NULL, 0, 0, 0, 0, 50);
     CHECK(r && r->n_search == 3);
     oc_dbres_free(r);
@@ -2783,7 +2782,7 @@ static void test_search_filters_and_paging(void) {
     CHECK(r && r->n_search == 0);
     oc_dbres_free(r);
 
-    /* The keyset cursor (WIN-38): id < before_id. Paging with it must cover every
+    /* The keyset cursor: id < before_id. Paging with it must cover every
      * row exactly once — the property an OFFSET loses the moment someone posts. */
     r = search_f(w, alice, "rollback", NULL, NULL, 0, 0, 0, 0, 3);
     CHECK(r && r->n_search == 3 && r->truncated);
@@ -3371,7 +3370,7 @@ static void test_attachments(void) {
 /* Incoming webhooks (REQ-170): minting a token and posting via it resolve to a
  * message in the scoped channel authored by the webhook's creator. */
 
-/* Invite management (REQ-026, WIN-46) and webhook lifecycle (WIN-48). Both touch
+/* Invite management (REQ-026) and webhook lifecycle. Both touch
  * tables whose columns already existed, so the risk is in the ops and their
  * authorisation — which is what this asserts. */
 static void test_invites_and_webhook_lifecycle(void) {
@@ -3544,7 +3543,7 @@ static void test_invites_and_webhook_lifecycle(void) {
 }
 
 
-/* Custom status (REQ-241/122, WIN-53) and profile fields (REQ-240, WIN-47).
+/* Custom status (REQ-241/122) and profile fields (REQ-240).
  *
  * The interesting rule is EXPIRY: the daemon must stop reporting a status once it
  * lapses, whether or not the client that set it is still running. */
@@ -3982,7 +3981,7 @@ static void test_group_dm(void) {
     cleanup_db(path);
 }
 
-/* The avatar (WIN-47). Three properties, and the second is the one that matters for
+/* The avatar. Three properties, and the second is the one that matters for
  * security: an avatar is readable WORKSPACE-WIDE, so the id has to be one the setter
  * was entitled to in the first place. */
 static void test_avatar(void) {
