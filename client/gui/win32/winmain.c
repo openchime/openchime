@@ -22,6 +22,7 @@
 #include <shellapi.h>         /* CommandLineToArgvW, Shell_NotifyIconW */
 #include <commdlg.h>          /* GetSaveFileNameW (attachment download) */
 #include <dwmapi.h>           /* DwmSetWindowAttribute (dark title bar) */
+#include <shobjidl.h>         /* ITaskbarList3: the overlay badge (REQ-138) */
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wincodec.h>       /* WIC: decode an inline image from memory */
@@ -56,6 +57,12 @@
  * locally so we don't depend on the toolchain's GUID table for DWrite. */
 static const GUID OC_IID_IDWriteFactory =
     { 0xb859ee5a, 0xd838, 0x4b5b, { 0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48 } };
+/* Same story for the taskbar: CLSID_TaskbarList is in libuuid, its ITaskbarList3
+ * interface id is not in every toolchain's table. */
+static const GUID OC_CLSID_TaskbarList =
+    { 0x56fdf344, 0xfd6d, 0x11d0, { 0x95, 0x8a, 0x00, 0x60, 0x97, 0xc9, 0xa0, 0x90 } };
+static const GUID OC_IID_ITaskbarList3 =
+    { 0xea1afb91, 0x9e28, 0x4b86, { 0x90, 0xe9, 0x9e, 0x9f, 0x8a, 0x5e, 0xef, 0xaf } };
 
 #define TIMER_TICK 1
 
@@ -720,6 +727,161 @@ static void notify_toast(const char *title, const char *body) {
     to_w(title, g_tray.szInfoTitle, 64);
     to_w(body,  g_tray.szInfo, 256);
     Shell_NotifyIconW(NIM_MODIFY, &g_tray);
+}
+
+/* ---- taskbar badge + flash (REQ-138, REQ-286) -----------------------------
+ * The taskbar is the notification surface that keeps working when toasts are
+ * suppressed — by Focus Assist, by the per-app Windows setting, or by the
+ * balloon channel failing — so neither signal here sits behind the toast
+ * preference. Two signals: an overlay badge carrying the unread count, and a
+ * flash for a message that names you. The badge counts what the sidebar
+ * counts — every unread message in every conversation that is not muted; mute
+ * is the half of the counting rule REQ-137 already decides, and REQ-284's
+ * finer rule (count only what would have notified) is still an open call. */
+enum { FLASH_NEVER = 0, FLASH_IDLE = 1, FLASH_ALWAYS = 2 };
+static int  g_pref_flash = FLASH_IDLE;
+static int  g_flashes_raised;       /* observable by the harness; see test_dump */
+static int  g_badge_shown = -1;     /* overlay count last applied; -1 = never */
+static ITaskbarList3 *g_taskbar;
+static int  g_taskbar_dead;         /* creation failed once; stop retrying */
+static UINT g_taskbar_created_msg;  /* "TaskbarButtonCreated" (shell restart) */
+
+/* A 32-bit icon for the overlay: the sidebar badge's notice-coloured disc with
+ * the count in white, drawn by hand at SM_CXSMICON. GDI text zeroes the alpha
+ * byte of every 32bpp pixel it touches, so the glyphs are rendered first as a
+ * grayscale mask (white on black; ANTIALIASED_QUALITY, because ClearType would
+ * leave colour fringes in the mask), and disc, text and alpha are then composed
+ * per pixel — the disc's coverage from a 4x4 supersample rather than a sqrt,
+ * which nothing else in this file needs. */
+static HICON badge_icon(int count) {
+    int s = GetSystemMetrics(SM_CXSMICON);
+    if (s < 16) s = 16;
+    BITMAPINFO bi;
+    ZeroMemory(&bi, sizeof bi);
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = s; bi.bmiHeader.biHeight = -s;   /* top-down */
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    HDC mem = CreateCompatibleDC(NULL);
+    void *bits = NULL;
+    HBITMAP dib = mem ? CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, NULL, 0) : NULL;
+    if (!dib || !bits) {
+        if (dib) DeleteObject(dib);
+        if (mem) DeleteDC(mem);
+        return NULL;
+    }
+    HGDIOBJ oldbm = SelectObject(mem, dib);
+    char t[4];
+    if (count > 9) snprintf(t, sizeof t, "9+");
+    else           snprintf(t, sizeof t, "%d", count);
+    WCHAR wt[4];
+    to_w(t, wt, 4);
+    HFONT font = CreateFontW(-(s * (count > 9 ? 10 : 12) / 16), 0, 0, 0, FW_BOLD,
+                             0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                             CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    HGDIOBJ oldf = SelectObject(mem, font);
+    SetTextColor(mem, RGB(255, 255, 255));
+    SetBkMode(mem, TRANSPARENT);
+    RECT tr = { 0, 0, s, s };
+    DrawTextW(mem, wt, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    GdiFlush();
+    uint32_t disc = OC_COL_NOTICE;
+    unsigned dr = (disc >> 16) & 0xFF, dg = (disc >> 8) & 0xFF, db = disc & 0xFF;
+    uint32_t *px = (uint32_t *)bits;
+    for (int y = 0; y < s; y++) {
+        for (int x = 0; x < s; x++) {
+            /* Subsample centres in 1/8-pixel units: pixel x covers
+             * [8x, 8x+8), samples at 8x + 2k + 1; the disc's centre is 4s and
+             * its radius (4s - 2), a quarter pixel in from the icon edge. */
+            int hits = 0;
+            for (int sy = 0; sy < 4; sy++)
+                for (int sx = 0; sx < 4; sx++) {
+                    int ddx = 8 * x + 2 * sx + 1 - 4 * s;
+                    int ddy = 8 * y + 2 * sy + 1 - 4 * s;
+                    if (ddx * ddx + ddy * ddy <= (4 * s - 2) * (4 * s - 2)) hits++;
+                }
+            unsigned a  = (unsigned)(hits * 255 / 16);
+            unsigned tc = (px[y * s + x] >> 8) & 0xFF;      /* text coverage */
+            unsigned r8 = (dr * (255 - tc) + 255 * tc) / 255;
+            unsigned g8 = (dg * (255 - tc) + 255 * tc) / 255;
+            unsigned b8 = (db * (255 - tc) + 255 * tc) / 255;
+            px[y * s + x] = (a << 24) | (r8 << 16) | (g8 << 8) | b8;
+        }
+    }
+    SelectObject(mem, oldf);
+    DeleteObject(font);
+    SelectObject(mem, oldbm);
+    /* ICONINFO requires a mask even though the 32bpp alpha supersedes it; a
+     * zeroed one, because CreateBitmap with no bits is uninitialised memory. */
+    int mrow = ((s + 15) / 16) * 2;
+    uint8_t *mb = calloc((size_t)mrow * s, 1);
+    HBITMAP mask = mb ? CreateBitmap(s, s, 1, 1, mb) : NULL;
+    free(mb);
+    ICONINFO ii = { TRUE, 0, 0, mask, dib };
+    HICON ic = mask ? CreateIconIndirect(&ii) : NULL;
+    if (mask) DeleteObject(mask);
+    DeleteObject(dib);
+    DeleteDC(mem);
+    return ic;
+}
+
+/* Apply `count` to the taskbar button (0 clears; anything past 9 renders as
+ * "9+"), creating the ITaskbarList3 on first use — COM is already initialised
+ * for WIC. The description string carries the number for a screen reader,
+ * since the overlay's pixels cannot. */
+static HRESULT g_taskbar_hr;    /* the failing step's answer; see test_dump */
+static void taskbar_badge_apply(HWND hwnd, int count) {
+    /* A failed apply is retried, but not at tick rate: the caller re-enters
+     * every ~30ms while the count disagrees with what was applied, and
+     * rebuilding a DIB, a font and an icon 33 times a second is the wrong
+     * response to the low-GDI condition that most likely caused the miss. */
+    static ULONGLONG backoff;
+    if (backoff && GetTickCount64() < backoff) return;
+    backoff = 0;
+    if (g_taskbar_dead) return;
+    if (!g_taskbar) {
+        g_taskbar_hr = CoCreateInstance(&OC_CLSID_TaskbarList, NULL, CLSCTX_INPROC_SERVER,
+                                        &OC_IID_ITaskbarList3, (void **)&g_taskbar);
+        if (SUCCEEDED(g_taskbar_hr) && g_taskbar)
+            g_taskbar_hr = ITaskbarList3_HrInit(g_taskbar);
+        if (FAILED(g_taskbar_hr) || !g_taskbar) {
+            if (g_taskbar) { ITaskbarList3_Release(g_taskbar); g_taskbar = NULL; }
+            g_taskbar_dead = 1;         /* no ITaskbarList3: live without a badge */
+            return;
+        }
+    }
+    HICON ic = NULL;
+    WCHAR alt[24] = L"";
+    if (count > 0) {
+        ic = badge_icon(count);
+        if (!ic) { backoff = GetTickCount64() + 1000; return; }
+        char a[24];
+        if (count > 9) snprintf(a, sizeof a, "9+ unread");
+        else           snprintf(a, sizeof a, "%d unread", count);
+        to_w(a, alt, 24);
+    }
+    if (SUCCEEDED(ITaskbarList3_SetOverlayIcon(g_taskbar, hwnd, ic,
+                                               count > 0 ? alt : NULL)))
+        g_badge_shown = count;
+    else
+        backoff = GetTickCount64() + 1000;
+    if (ic) DestroyIcon(ic);
+}
+
+/* Flash the taskbar button for a message that NAMES you (REQ-286), until the
+ * window comes forward. "When idle" is the split the always case forces —
+ * essential when you have stepped away, intrusive when you are typing in the
+ * next window — read as no keyboard or mouse input for thirty seconds. */
+static void taskbar_flash(HWND hwnd) {
+    if (g_pref_flash == FLASH_NEVER) return;
+    if (g_pref_flash == FLASH_IDLE) {
+        LASTINPUTINFO li = { sizeof li, 0 };
+        if (GetLastInputInfo(&li) && GetTickCount() - li.dwTime < 30000) return;
+    }
+    FLASHWINFO fi = { sizeof fi, hwnd, FLASHW_TRAY | FLASHW_TIMERNOFG, 0, 0 };
+    FlashWindowEx(&fi);
+    g_flashes_raised++;
 }
 
 /* ---- inline image thumbnails -------------------------------------
@@ -4648,6 +4810,10 @@ static void a11y_publish_scene(const oc_model *m);  /* fwd — ARCH-99; defined 
 static void show_and_focus(HWND hwnd) {
     if (!hwnd) return;
     if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOW);
+    /* A minimised window IS "visible" to IsWindowVisible, and SW_SHOW does not
+     * un-minimise — so without this, "show and focus" left an iconic window
+     * iconic: focused, painting nothing, every hit-box zero. */
+    if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
     SetForegroundWindow(hwnd);
     SetActiveWindow(hwnd);
     SetFocus(hwnd);
@@ -5535,7 +5701,7 @@ static float pref_row(ID2D1RenderTarget *rt, D2D1_RECT_F body, float y, int row,
 enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
        PREF_ROW_NOTIFY, PREF_ROW_QUICK, PREF_ROW_ACCENT, PREF_ROW_TEXTSIZE,
        PREF_ROW_DENSITY, PREF_ROW_ZOOM, PREF_ROW_DPI, PREF_ROW_RESET,
-       PREF_ROW_EDITOR };
+       PREF_ROW_EDITOR, PREF_ROW_FLASH };
 
 /* Preferences is two-paned: categories left, one category's rows right.
  * A single scrolling list was fine at six rows and is not at fourteen — and the
@@ -5710,6 +5876,10 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
         y = pref_row(rt, body, y, PREF_ROW_NOTIFY, "Desktop notifications",
                      "When OpenChime is not in front, and outside Do Not Disturb.",
                      NOTIF, 3, g_pref_notify);
+        static const char *FLASHV[3] = { "Never", "When idle", "Always" };
+        y = pref_row(rt, body, y, PREF_ROW_FLASH, "Flash the taskbar",
+                     "For a mention, a keyword, a priority person or a DM.",
+                     FLASHV, 3, g_pref_flash);
         /* Levels, quiet hours and the global default live in their own sheet, and
          * this points at it rather than duplicating it: two places to set the same
          * value is how they end up disagreeing. */
@@ -7594,6 +7764,7 @@ static struct {
     unsigned dpi;
     char quick[160];
     int  richtext;
+    int  flash;
 } g_prefs_snap;
 
 static void prefs_snapshot(void) {
@@ -7602,6 +7773,7 @@ static void prefs_snapshot(void) {
     g_prefs_snap.members = g_pref_members;
     g_prefs_snap.daysep  = g_pref_daysep;
     g_prefs_snap.notify  = g_pref_notify;
+    g_prefs_snap.flash   = g_pref_flash;
     g_prefs_snap.accent   = oc_theme_scheme();
     g_prefs_snap.textsize = g_pref_textsize;
     g_prefs_snap.density  = g_pref_density;
@@ -7617,6 +7789,7 @@ static void prefs_restore(void) {
     g_pref_members = g_prefs_snap.members;
     g_pref_daysep  = g_prefs_snap.daysep;
     g_pref_notify  = g_prefs_snap.notify;
+    g_pref_flash   = g_prefs_snap.flash;
     if (oc_theme_scheme() != g_prefs_snap.accent) oc_theme_set_scheme(g_prefs_snap.accent);
     g_pref_density = g_prefs_snap.density;
     g_density      = g_prefs_snap.density ? 1.0f : 0.6f;
@@ -13079,6 +13252,7 @@ static int on_click(HWND hwnd, int x, int y) {
                 if (composer_remeasure()) layout_composer(hwnd);
                 break;
             case PREF_ROW_NOTIFY:  g_pref_notify = v; break;
+            case PREF_ROW_FLASH:   g_pref_flash = v; break;
             /* Appearance applies LIVE while the sheet is open — a colour, a text
              * size and a density are their own preview and cannot be judged from a
              * label — and reverts with everything else on Cancel. */
@@ -13104,6 +13278,7 @@ static int on_click(HWND hwnd, int x, int y) {
                 oc_theme_set_scheme(OC_SCHEME_MIDNIGHT);
                 g_pref_time24 = 1; g_pref_members = 1; g_pref_daysep = 1;
                 g_pref_notify = NOTIFY_FULL;
+                g_pref_flash = FLASH_IDLE;
                 g_pref_textsize = 1; g_pref_density = 1; g_density = 1.0f;
                 g_zoom_step = 0;
                 snprintf(g_quick_names, sizeof g_quick_names, "%s", QUICK_DEFAULT);
@@ -14910,7 +15085,7 @@ static void prefs_save(void) {
      * build, which stops at `q:`, still reads everything it understands. */
     {
         size_t at = strlen(enc);
-        snprintf(enc + at, sizeof enc - at, ";k:%d", g_skin_tone);
+        snprintf(enc + at, sizeof enc - at, ";k:%d;f:%d", g_skin_tone, g_pref_flash);
     }
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
 }
@@ -14940,6 +15115,7 @@ static void prefs_load(const oc_model *m) {
             }
             else if (k == 'k') g_skin_tone = (val < 0 || val >= OC_SKIN_COUNT)
                                              ? OC_SKIN_DEFAULT : val;
+            else if (k == 'f') g_pref_flash = (val < 0 || val > 2) ? FLASH_IDLE : val;
             else if (k == 'q') {
                 size_t n2 = 0;
                 for (const char *q = p + 2; *q && *q != ';' && n2 + 1 < sizeof g_quick_names; q++)
@@ -16135,6 +16311,12 @@ static void test_dump(const char *path) {
             (unsigned long long)g_sel_f_mid, g_sel_f_pos);
     fprintf(f, "tray_live=%d notify_pref=%d toasts_raised=%d dnd=%d\n",
             g_tray_live, g_pref_notify, g_toasts_raised, dnd_active(m));
+    /* `taskbar`: -1 the ITaskbarList3 could not be created, 0 not yet asked
+     * for, 1 live — because "badge=0" alone cannot distinguish "no unreads"
+     * from "the overlay never applied", and that ambiguity cost a smoke run. */
+    fprintf(f, "badge=%d flash_pref=%d flashes=%d taskbar=%d hr=0x%08lx\n",
+            g_badge_shown < 0 ? 0 : g_badge_shown, g_pref_flash, g_flashes_raised,
+            g_taskbar_dead ? -1 : (g_taskbar ? 1 : 0), (unsigned long)g_taskbar_hr);
     fprintf(f, "lightbox=%llu thumb_hits=%d\n", (unsigned long long)g_lightbox, g_n_thumb_hits);
     fprintf(f, "thumb_hover=%llu thumb_tools=%d\n", (unsigned long long)g_thumb_hover, g_n_thumb_dl);
     for (int i = 0; i < g_n_thumb_dl; i++)
@@ -16282,6 +16464,14 @@ static void test_poll(HWND hwnd) {
     } else if (!strcmp(verb, "size")) {
         int w = 0, h = 0; sscanf(arg, "%d %d", &w, &h);
         if (w > 0 && h > 0) SetWindowPos(hwnd, NULL, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
+        test_ack("ok");
+    } else if (!strcmp(verb, "min")) {
+        /* Really minimise: the taskbar flash is gated on not being the
+         * foreground window, and only losing it for real exercises that. */
+        ShowWindow(hwnd, SW_MINIMIZE);
+        test_ack("ok");
+    } else if (!strcmp(verb, "restore")) {
+        show_and_focus(hwnd);
         test_ack("ok");
     } else if (!strcmp(verb, "find")) {
         snprintf(g_find_filter, sizeof g_find_filter, "%s", arg);
@@ -16781,6 +16971,14 @@ static void test_poll(HWND hwnd) {
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    /* Explorer restarted: its new taskbar has no overlay and the old COM proxy
+     * points at the dead shell. Drop both; the next tick re-applies the badge. */
+    if (g_taskbar_created_msg && msg == g_taskbar_created_msg) {
+        if (g_taskbar) { ITaskbarList3_Release(g_taskbar); g_taskbar = NULL; }
+        g_taskbar_dead = 0;
+        g_badge_shown = -1;
+        return 0;
+    }
     switch (msg) {
     case WM_CREATE:
         /* Before any child: the provider must exist by the time the first
@@ -16835,6 +17033,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     oc_client_tick(g_wss[wi].client);
             /* And the sign-in attempt, which is not in a slot yet. */
             if (g_si_client) oc_client_tick(g_si_client);
+            /* Signing out of the last workspace leaves no client, so the tick
+             * below — which owns the badge — never runs again, and an overlay
+             * advertising unread mail in a session that no longer exists would
+             * sit over the sign-in view for good. Cleared from here instead. */
+            if (!g_client && g_badge_shown > 0) taskbar_badge_apply(hwnd, 0);
         }
         if (wp == TIMER_TICK && g_client) {
             oc_client_tick(g_client);
@@ -16985,8 +17188,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * the window is not in front; whether one is warranted is the
              * shared evaluator's call (oc_notify_decide). The first pass after
              * connecting only records the marks: the backfill is not "new
-             * mail". */
-            if (g_pref_notify != NOTIFY_OFF) {
+             * mail".
+             *
+             * The loop runs regardless of the toast preference: it advances
+             * the per-channel seen marks and feeds TWO signals that gate
+             * themselves — the toast (Off/Count/Preview) and the taskbar
+             * flash (Never/When idle/Always). It used to sit behind the toast
+             * preference whole, which froze the marks while toasts were Off
+             * and replayed the accrued delta as a burst the moment they came
+             * back on. */
+            {
                 int fg = (GetForegroundWindow() == hwnd);
                 /* Every workspace, not just the visible one — a background
                  * workspace's mail is exactly what you cannot otherwise see. */
@@ -17035,7 +17246,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                      * Muted conversations still say nothing: mute means "do not
                      * interrupt me about this", which is a statement about
                      * attention, not about eyesight. */
-                    if (is_active && !c->muted && oc_a11y_available()) {
+                    if (g_pref_notify != NOTIFY_OFF &&
+                        is_active && !c->muted && oc_a11y_available()) {
                         const oc_msg *lm = c->n_msgs ? &c->msgs[c->n_msgs - 1] : NULL;
                         /* Not your own — you just sent it, and being read your
                          * own words back is noise, not information. The toast
@@ -17071,32 +17283,76 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         kw_hit = oc_model_keyword_hit(wm, last->body, blen,
                                                       NULL, NULL);
                     }
+                    int vip = last ? oc_model_is_priority(wm, last->author_id) : 0;
                     if (!oc_notify_decide(last && last->author_id == wm->user_id,
-                                          c->muted,
-                                          last ? oc_model_is_priority(wm, last->author_id) : 0,
+                                          c->muted, vip,
                                           c->notify_level, mentioned, kw_hit,
                                           ws_quiet, ws_paused))
                         continue;
-                    char label[96], title[160], body[256];
-                    channel_label(wm, c, label, sizeof label);
-                    /* Name the workspace when it is not the one on screen, or
-                     * "#general" alone is ambiguous across several of them. */
-                    if (is_active) snprintf(title, sizeof title, "%s", label);
-                    else snprintf(title, sizeof title, "%s \u2014 %s",
-                                  oc_model_workspace_name(wm), label);
-                    if (g_pref_notify == NOTIFY_FULL && last && last->body) {
-                        const char *who = last->author_name[0] ? last->author_name
-                                        : oc_model_user_name(wm, last->author_id);
-                        snprintf(body, sizeof body, "%s: %s", (who && who[0]) ? who : "someone",
-                                 last->body);
-                    } else {
-                        snprintf(body, sizeof body, "%d new message%s",
-                                 c->unread, c->unread == 1 ? "" : "s");
+                    if (g_pref_notify != NOTIFY_OFF) {
+                        char label[96], title[160], body[256];
+                        channel_label(wm, c, label, sizeof label);
+                        /* Name the workspace when it is not the one on screen,
+                         * or "#general" alone is ambiguous across several. */
+                        if (is_active) snprintf(title, sizeof title, "%s", label);
+                        else snprintf(title, sizeof title, "%s \u2014 %s",
+                                      oc_model_workspace_name(wm), label);
+                        if (g_pref_notify == NOTIFY_FULL && last && last->body) {
+                            const char *who = last->author_name[0] ? last->author_name
+                                            : oc_model_user_name(wm, last->author_id);
+                            snprintf(body, sizeof body, "%s: %s",
+                                     (who && who[0]) ? who : "someone", last->body);
+                        } else {
+                            snprintf(body, sizeof body, "%d new message%s",
+                                     c->unread, c->unread == 1 ? "" : "s");
+                        }
+                        notify_toast(title, body);
                     }
-                    notify_toast(title, body);
+                    /* The flash is for a message that names you — a mention, a
+                     * keyword hit, a priority person, or a DM, which is
+                     * addressed to you by existing — never for every message a
+                     * level happens to let through: a taskbar that flashes for
+                     * everything is one you train yourself to ignore. Not while
+                     * the window is foreground; you are already looking. */
+                    if (!fg && (mentioned || kw_hit || vip ||
+                                c->kind == OC_CHANNEL_KIND_DM))
+                        taskbar_flash(hwnd);
                   }
                 }
                 g_notify_primed = 1;
+            }
+            /* The overlay badge, deliberately OUTSIDE the toast preference:
+             * turning toasts off says "do not interrupt me", not "tell me
+             * nothing" — and the badge is the channel that still works when
+             * the OS suppresses the balloons. Recomputed every tick, applied
+             * only on change. */
+            {
+                /* The shell broadcasts this when it (re)creates our taskbar
+                 * button; an Explorer restart wipes the overlay, and this is
+                 * the signal to put it back. The filter, because an elevated
+                 * process is deaf to a medium-integrity Explorer's broadcast
+                 * without it (UIPI). */
+                if (!g_taskbar_created_msg) {
+                    g_taskbar_created_msg = RegisterWindowMessageW(L"TaskbarButtonCreated");
+                    if (g_taskbar_created_msg)
+                        ChangeWindowMessageFilterEx(hwnd, g_taskbar_created_msg,
+                                                    MSGFLT_ALLOW, NULL);
+                }
+                int total = 0;
+                for (int wi = 0; wi < (g_n_wss > 0 ? g_n_wss : 1); wi++) {
+                    const oc_model *wm = (g_n_wss > 0)
+                        ? (g_wss[wi].client ? oc_client_model(g_wss[wi].client) : NULL) : m;
+                    if (!wm || !wm->authed) continue;
+                    for (size_t ci = 0; ci < wm->n_channels; ci++)
+                        if (!wm->channels[ci].muted) total += wm->channels[ci].unread;
+                    /* Thread replies count too: they do not bump a channel's
+                     * unread (a separate counter feeds the Threads shelf), and
+                     * a day of activity that is all thread replies must not
+                     * leave the taskbar claiming there is nothing. */
+                    total += (int)oc_model_thread_unread(wm);
+                }
+                if (total > 10) total = 10;         /* rendered as "9+" */
+                if (total != g_badge_shown) taskbar_badge_apply(hwnd, total);
             }
             /* An inline image arrived: decode and cache it. */
             {
@@ -17895,6 +18151,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     /* Before anything else, so a crash during startup is reported too. */
     SetUnhandledExceptionFilter(crash_filter);
     crumb("start");
+
+    /* COM, single-threaded apartment, for the UI thread's registered classes —
+     * ITaskbarList3 (the overlay badge) and WIC (inline images). Nothing had
+     * ever initialised it: D2D and DWrite do not need it, so every
+     * CoCreateInstance in this file was quietly living on borrowed luck. */
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     /* Automation hook: OPENCHIME_TEST_DIR enables the file command channel. */
     { const char *td = getenv("OPENCHIME_TEST_DIR");
