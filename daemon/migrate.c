@@ -794,6 +794,29 @@ static const char MIGRATION_0037[] =
     "  ON attachments(channel_id, uploader_id, idem_token)"
     "  WHERE idem_token IS NOT NULL;";
 
+static const char MIGRATION_0038[] =
+    /* Link unfurls (REQ-222, ARCH-105): the fetched title + description of a
+     * URL in a message, keyed per (message, url) so pinning twice cannot
+     * happen and an EDIT that keeps a URL keeps its preview.
+     *
+     * Rows exist only for COMPLETED fetches — there is no pending state,
+     * because a fetch that never finishes should leave nothing to clean up
+     * and nothing to replay. `channel_id` is denormalised from the message
+     * exactly as `mentions` and `pins` do it: the backfill replay reads by
+     * message and must not join per row.
+     *
+     * No thumbnail column: og:image is deferred (ARCH-105), and adding the
+     * column now would be pretending otherwise. */
+    "CREATE TABLE unfurls ("
+    "  message_id    INTEGER NOT NULL REFERENCES messages(id),"
+    "  channel_id    INTEGER NOT NULL REFERENCES channels(id),"
+    "  url           TEXT    NOT NULL,"
+    "  title         TEXT,"
+    "  descr         TEXT,"
+    "  created_at_ms INTEGER NOT NULL,"
+    "  PRIMARY KEY (message_id, url)"
+    ");";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -832,6 +855,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 35, MIGRATION_0035 },
     { 36, MIGRATION_0036 },
     { 37, MIGRATION_0037 },
+    { 38, MIGRATION_0038 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

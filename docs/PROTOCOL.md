@@ -17,13 +17,13 @@ profile (§5.16b), audio-call signaling (§5.17, REQ-150–152), and push device
 tokens.
 
 **§9 is the complete list; §5's prose is not.** The registry is generated from
-`shared/protocol.h` and carries all 154 message types. The narrative sections
+`shared/protocol.h` and carries all 158 message types. The narrative sections
 below specify the payload layouts for the families they name, and a number of
 later families — drafts, scheduled send, the notification schedule and pause,
 keywords, custom emoji, group DMs, invite and session management, webhook
 enable/rotate, cross-channel threads, unresolved-mention notices, and the
 per-channel file census — are listed in §9 with their opcodes and directions but
-are specified in §§5.16d–5.16i. The remaining protocol-level deferral is the
+are specified in §§5.16d–5.16j. The remaining protocol-level deferral is the
 **screenshare** addition reserved in §5.17 (REQ-161, unbuilt).
 
 **Status.** Implemented. The frames in this document are realized in
@@ -1750,6 +1750,25 @@ thread inside it, and threads are deliberately outside the main scroll (REQ-060)
 The follow and read acks return the one row that changed rather than a fresh
 list, so opening a thread does not cost the whole view.
 
+### 5.16j Link unfurls (REQ-222, ARCH-105)
+
+**`UNFURL` (S → C), `0x00D7`** — a URL's fetched preview, arriving after the
+BROADCAST it belongs to — whenever the daemon's fetch completes, or never.
+
+    message_id (u64), channel_id (u64), url (str), title (str), descr (str)
+
+There is no request frame: the daemon extracts a committed message's URLs with
+the **shared address scanner** (`shared/url.c` — the same rules the client
+autolinks by, so an unfurl can never sit under text a client does not render as
+a link), fetches the first 3 off the hot path behind an SSRF gate, and fans the
+result to the channel's connected members. **Replayed on backfill and history**
+after the `REACTION_UPDATED` frames, because an unfurl travels only on this
+frame and a replay that omitted it would silently lose every preview on reload
+— the defect class the reaction and pin replays exist to prevent. An **edit
+drops the message's stored unfurls** and re-fetches from the new body, so a
+removed URL's preview cannot be replayed. Always on — there is no switch. Adding the frame needed no
+protocol-version bump; a peer that does not know it never expects it.
+
 ### 5.17 Audio call signaling (REQ-150, REQ-152)
 
 Audio is **server-relayed** (no P2P/ICE, ARCH-18): the media itself flows over a
@@ -2013,7 +2032,7 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 ## 9. Message type registry
 
 **Generated from `shared/protocol.h`** — every `OC_MSG_*` the codec defines, in
-opcode order, 157 of them. The sections above specify the payload layouts; this
+opcode order, 158 of them. The sections above specify the payload layouts; this
 table is the index and the authority on which values are taken.
 
 One opcode is **used by two message types** (`0x0070`), marked below:
@@ -2181,6 +2200,7 @@ exception, so this table cannot silently regain a shared value.
 | `0x00D4` | `SET_THREAD_FOLLOW` | C → S | follow/unfollow one thread |
 | `0x00D5` | `MARK_THREAD_READ` | C → S | its replies are read up to here |
 | `0x00D6` | `SET_TZ_OFFSET` | C → S | minutes east of UTC, refreshed on every connect |
+| `0x00D7` | `UNFURL` | S → C | a URL's fetched preview (REQ-222); also replayed on backfill |
 
 ## 10. Connection state machine
 

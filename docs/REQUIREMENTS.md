@@ -1439,12 +1439,22 @@ None are yet backed by an architecture decision.*
   gates, not the one first estimated: mention resolution, the activity-feed query
   (where it actually lands — without that the row is stored and nobody ever sees
   it), and push, which was left alone on purpose.
-- **REQ-222.** *(Not built)* A URL in a message has optionally been **unfurled** into a preview
+- **REQ-222.** *(Partly built)* A URL in a message has been **unfurled** into a preview
   (title, description, thumbnail) fetched from the linked page. The fetch has been
   performed **server-side by the daemon or an isolated helper** — never by pushing
-  arbitrary client-side fetches — consistent with the island model, and
-  disable-able per tenant for privacy/egress reasons. **[needs ARCH decision —
-  unfurl-fetcher placement + egress/SSRF controls; likely out-of-daemon.]**
+  arbitrary client-side fetches — consistent with the island model. **Amended
+  2026-08-20: the per-tenant disable this requirement originally carried is
+  withdrawn — unfurling is simply on, with no switch.** The safety this feature
+  needs lives in the fetch itself (the SSRF gate and its caps), not in an off
+  button. **Built per ARCH-105 (daemon side):** an in-daemon fetch worker behind
+  an SSRF gate, always on, the URL boundary rules shared (`shared/url.c`) so the
+  daemon unfurls exactly what a client links, the `UNFURL` frame fanned on fetch
+  completion and replayed on backfill/history, edits dropping stale previews.
+  The app-core folds the frame into the message model, and the **Win32 client
+  renders the card** — title and description under the message, the way Slack
+  lays them. What keeps the marker partial: the **thumbnail** is deferred
+  (title + description only), and the TUI does not render the card (the fixed
+  frontend order; its gap is untracked by design).
 - **REQ-223.** An unsent composer's contents (per channel/thread/DM) have been
   preserved as a **draft** across app restarts and, for a signed-in identity,
   synced across that user's devices, so a half-written message has not been lost.

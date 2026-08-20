@@ -17,6 +17,7 @@
 #include "enroll.h"
 #include "netloop.h"
 #include "push.h"
+#include "unfurl.h"
 #include "tls.h"
 
 #include <arpa/inet.h>
@@ -351,6 +352,13 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Link unfurls (REQ-222, ARCH-105): always on, no switch. The worker
+     * fetches previews off the hot path; its SSRF gate is what makes
+     * user-supplied destinations safe to dial at all. */
+    oc_unfurler *unfurler = oc_unfurler_start(db, cfg->unfurl.ca_bundle, cfg->unfurl.allow_private);
+    if (unfurler) oc_netloop_set_unfurler(unfurler);
+    else fprintf(stderr, "openchimed: unfurl worker failed to start\n");
+
     free(enroll_privkey);
     free(enroll_audience);
 
@@ -434,6 +442,7 @@ int main(int argc, char **argv) {
     oc_netloop_run(proto_port, &tls, db, &g_stop);
 
     oc_push_stop(push);
+    oc_unfurler_stop(unfurler);
     oc_tls_server_free(&tls);
     oc_dbwriter_stop(db);
     fprintf(stderr, "openchimed: shutdown complete\n");

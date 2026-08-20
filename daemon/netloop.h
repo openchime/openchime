@@ -36,4 +36,11 @@ void oc_netloop_set_audio(int ipc_fd, uint16_t udp_port);
 struct oc_push;
 void oc_netloop_set_push(struct oc_push *push);
 
+/* Wire the link-unfurl worker (REQ-222, ARCH-105). When set, a committed SEND
+ * or EDIT has its URLs extracted and queued for fetching, and a stored unfurl
+ * fans an UNFURL frame to the channel. Call before oc_netloop_run; NULL (the
+ * default, and the OPENCHIME_UNFURL=off state) disables unfurls. */
+struct oc_unfurler;
+void oc_netloop_set_unfurler(struct oc_unfurler *u);
+
 #endif /* OPENCHIME_NETLOOP_H */

@@ -297,6 +297,14 @@ typedef enum {
      * on SET_SCHEDULE because refreshing the offset must not require, or rewrite,
      * a schedule. */
     OC_MSG_SET_TZ_OFFSET    = 0x00D6, /* C->S, minutes east of UTC, right now */
+    /* A link unfurl (REQ-222, ARCH-105): the fetched title + description of a
+     * URL in a message. Arrives asynchronously after the BROADCAST — when the
+     * fetch completes, or never — and is REPLAYED on backfill, because state
+     * that only travels on a live fan-out disappears on reload (the defect
+     * class the reaction and pin replays exist to prevent). Adding a frame
+     * needs no protocol-version bump: a peer that does not know it never
+     * sends or expects it. */
+    OC_MSG_UNFURL           = 0x00D7, /* S->C, a URL's fetched preview */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -639,6 +647,11 @@ typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; u
                   * rendered as a blank row in the pins list. */
                  oc_slice attach_name; } oc_pinned_msg;
 typedef struct { uint64_t channel_id; uint32_t count; } oc_pins;
+/* A link unfurl (REQ-222, ARCH-105): fan-out on fetch completion, and the
+ * backfill replay entry. `title`/`descr` are what the daemon's fetcher
+ * extracted; a client renders them under the message's link. */
+typedef struct { uint64_t message_id; uint64_t channel_id;
+                 oc_slice url; oc_slice title; oc_slice descr; } oc_unfurl;
 
 /* A channel's members (REQ-031) and its shared files (REQ-143, ARCH-91). Both
  * follow the LIST_PINS shape — stream the entries, then a terminator — because
@@ -1058,6 +1071,7 @@ oc_result oc_encode_reaction_updated(oc_wbuf *w, uint16_t version, const oc_reac
 oc_result oc_encode_list_reactions(oc_wbuf *w, uint16_t version, const oc_list_reactions *m);
 oc_result oc_encode_pin(oc_wbuf *w, uint16_t version, const oc_pin *m);
 oc_result oc_encode_pin_updated(oc_wbuf *w, uint16_t version, const oc_pin_updated *m);
+oc_result oc_encode_unfurl(oc_wbuf *w, uint16_t version, const oc_unfurl *m);
 oc_result oc_encode_list_pins(oc_wbuf *w, uint16_t version, const oc_list_pins *m);
 oc_result oc_encode_pinned_msg(oc_wbuf *w, uint16_t version, const oc_pinned_msg *m);
 oc_result oc_encode_pins(oc_wbuf *w, uint16_t version, const oc_pins *m);
@@ -1243,6 +1257,7 @@ oc_result oc_decode_reaction_updated(oc_rbuf *p, oc_reaction_updated *m);
 oc_result oc_decode_list_reactions(oc_rbuf *p, oc_list_reactions *m);
 oc_result oc_decode_pin(oc_rbuf *p, oc_pin *m);
 oc_result oc_decode_pin_updated(oc_rbuf *p, oc_pin_updated *m);
+oc_result oc_decode_unfurl(oc_rbuf *p, oc_unfurl *m);
 oc_result oc_decode_list_pins(oc_rbuf *p, oc_list_pins *m);
 oc_result oc_decode_pinned_msg(oc_rbuf *p, oc_pinned_msg *m);
 oc_result oc_decode_pins(oc_rbuf *p, oc_pins *m);
