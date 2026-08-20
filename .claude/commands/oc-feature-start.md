@@ -1,5 +1,5 @@
 ---
-description: Start a feature — verify everything is clean, find or create the issue, branch feature/<number>-<kebab> from staging
+description: Start a feature — verify everything is clean, find or create the issue, branch feature/oc-<number>-<kebab> from staging
 argument-hint: <issue number | short description of the work>
 ---
 
@@ -29,8 +29,8 @@ around a dirty state.
   `git checkout staging && git pull --ff-only origin staging`. If the
   fast-forward fails, refuse.
 - **No branch already carries this issue.** If any local or remote branch is
-  named `feature/<this issue's number>-…`, refuse and point at it — the work
-  may already be in flight.
+  named `feature/oc-<this issue's number>-…`, refuse and point at it — the
+  work may already be in flight.
 
 ## 2. The issue
 
@@ -57,13 +57,14 @@ The issue number may appear in the **branch name** and in **commit messages**
 From the tip of the now-current `staging`:
 
 ```
-git checkout -b feature/<number>-<short-kebab-description> staging
+git checkout -b feature/oc-<number>-<short-kebab-description> staging
 ```
 
-The description is a few kebab-case words naming the **change**, usually
-distilled from the issue title — for the issue "The daemon exits 0, silently,
-when it cannot start", the branch is `feature/144-daemon-exit-nonzero`. One
-logical change per branch.
+`oc` is this issue board's prefix and is always present, lowercase. The
+description is a few kebab-case words naming the **change**, usually distilled
+from the issue title — for the issue "The daemon exits 0, silently, when it
+cannot start", the branch is `feature/oc-144-daemon-exit-nonzero`. One logical
+change per branch.
 
 ## 4. Context before code
 
