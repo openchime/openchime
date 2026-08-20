@@ -5799,8 +5799,11 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
         fill(rt, rf(reg.left, rowbot + 8, reg.right, rowbot + 9), OC_COL_BORDER);
         body = rf(reg.left, rowbot + 9, reg.right, reg.bottom);
     } else {
-        D2D1_RECT_F cats = rf(reg.left - MODAL_PAD + 1, reg.top,
-                              reg.left - MODAL_PAD + catw, reg.bottom);
+        /* Entirely INSIDE the body: the caller clips the body to itself, so a
+         * rail bled left to the card edge lost its left strip to the clip —
+         * the selected pill arrived cut and every category name lost its
+         * first pixels. What the clip owns, the rail respects. */
+        D2D1_RECT_F cats = rf(reg.left, reg.top, reg.left + catw - MODAL_PAD, reg.bottom);
         fill(rt, cats, OC_COL_SIDEBAR);
         fill(rt, rf(cats.right - 1, cats.top, cats.right, cats.bottom), OC_COL_BORDER);
         float cy = cats.top + 10;
@@ -5814,7 +5817,7 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
             g_pref_cats[i] = r;
             cy = r.bottom + 2;
         }
-        body = rf(cats.right + MODAL_PAD - 24, reg.top, reg.right, reg.bottom);
+        body = rf(cats.right, reg.top, reg.right, reg.bottom);
     }
 
     /* The ROWS scroll; the categories do not. Preferences had no scroller at all,
@@ -5897,7 +5900,9 @@ static void draw_prefs(ID2D1RenderTarget *rt, D2D1_RECT_F reg) {
         static const char *DPIS[4] = { "96", "120", "144", "192" };
         char dh[96];
         snprintf(dh, sizeof dh, "Currently %d. For layout checks.", g_dpi);
-        y = pref_row(rt, body, y, PREF_ROW_DPI, "DPI override", dh, DPIS, 4, -1);
+        int dsel = g_dpi == 96 ? 0 : g_dpi == 120 ? 1 : g_dpi == 144 ? 2
+                 : g_dpi == 192 ? 3 : -1;
+        y = pref_row(rt, body, y, PREF_ROW_DPI, "DPI override", dh, DPIS, 4, dsel);
 
         static const char *RESET1[1] = { "Reset" };
         y = pref_row(rt, body, y, PREF_ROW_RESET, "Reset preferences",
