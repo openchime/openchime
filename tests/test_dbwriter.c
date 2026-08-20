@@ -52,7 +52,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 37);
+    CHECK(oc_schema_version(db) == 38);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -4337,6 +4337,79 @@ static void test_dm(void) {
 }
 
 /* CP-7: the registered-user cap (OPENCHIME_MAX_USERS). */
+/* Link unfurls (REQ-222, ARCH-105): the store job re-validates the message,
+ * refuses a URL the body no longer carries, and the stored row rides the
+ * backfill replay; an edit drops the old body's rows. */
+static void test_unfurl_store(void) {
+    const char *path = "build/test_dbwriter_unfurl.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t u = reg(w, "uf-user", "pw", OC_ROLE_MEMBER);
+    CHECK(u != 0);
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0xD1, sizeof idem);
+    uint64_t mid = send_msg(w, u, idem, "see https://example.com/x today");
+    CHECK(mid != 0);
+
+    /* A completed fetch for a URL the body carries: stored, fanned. */
+    oc_job *j = oc_job_new(OC_JOB_UNFURL_STORE, 0);
+    j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = mid;
+    j->unf_url = strdup("https://example.com/x");
+    j->unf_title = strdup("Example X");
+    j->unf_descr = strdup("About X");
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    CHECK(r && r->type == OC_RES_UNFURL_STORED);
+    CHECK(r->message_id == mid && r->channel_id == OC_DEFAULT_CHANNEL);
+    CHECK(r->unf_url && strcmp(r->unf_url, "https://example.com/x") == 0);
+    CHECK(r->unf_title && strcmp(r->unf_title, "Example X") == 0);
+    CHECK(r->n_members >= 1);
+    oc_dbres_free(r);
+
+    /* A URL the body does NOT carry — a fetch that outlived an edit, or a
+     * forged worker result — is silently refused. */
+    j = oc_job_new(OC_JOB_UNFURL_STORE, 0);
+    j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = mid;
+    j->unf_url = strdup("https://elsewhere.example/y");
+    j->unf_title = strdup("Nope");
+    j->unf_descr = strdup("");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_OK);
+    oc_dbres_free(r);
+
+    /* The stored row rides the replay (the same guarantee as reactions/pins). */
+    r = backfill(w, u, OC_DEFAULT_CHANNEL, 0);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK);
+    CHECK(r->n_runfurl == 1);
+    if (r->n_runfurl == 1) {
+        CHECK(r->runfurl[0].message_id == mid);
+        CHECK(strcmp(r->runfurl[0].url, "https://example.com/x") == 0);
+        CHECK(strcmp(r->runfurl[0].title, "Example X") == 0);
+        CHECK(strcmp(r->runfurl[0].descr, "About X") == 0);
+    }
+    oc_dbres_free(r);
+
+    /* An edit drops the old body's unfurls, so a replay cannot resurrect a
+     * preview for text that is gone. */
+    j = oc_job_new(OC_JOB_EDIT, 1);
+    j->user_id = u; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = mid;
+    oc_job_set_body(j, "no links any more", 17);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_EDIT_OK);
+    oc_dbres_free(r);
+
+    r = backfill(w, u, OC_DEFAULT_CHANNEL, 0);
+    CHECK(r && r->n_runfurl == 0);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_max_users(void) {
     const char *path = "build/test_dbwriter_cap.db";
     cleanup_db(path);
@@ -4406,5 +4479,6 @@ int run_dbwriter_tests(void) {
     test_history_around();
     test_delete_clears_message_extras();
     test_max_users();
+    test_unfurl_store();
     return failures;
 }

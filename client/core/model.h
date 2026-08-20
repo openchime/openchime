@@ -41,6 +41,10 @@ typedef struct {
     uint8_t  reclaimed;
 } oc_attachment;
 
+/* One link preview under a message (REQ-222, ARCH-105): the daemon's fetched
+ * title + description for a URL the body carries. All heap. */
+typedef struct { char *url, *title, *descr; } oc_msg_unfurl;
+
 typedef struct {
     char    *body;         /* heap */
     char     author_name[64]; /* author display name ("" = fall back to id) */
@@ -62,6 +66,10 @@ typedef struct {
      * replayed after a reconnect so a bookmark survives a reload. */
     uint8_t      saved;
     uint64_t     saved_at;
+    /* Link previews (REQ-222): fanned after the BROADCAST, replayed on
+     * backfill, cleared on edit (the daemon drops and re-fetches). */
+    oc_msg_unfurl *unfurls;   /* heap, NULL until one arrives */
+    uint8_t        n_unfurls, cap_unfurls;
 } oc_msg;
 
 typedef struct {

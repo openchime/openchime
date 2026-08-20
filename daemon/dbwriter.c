@@ -9,6 +9,8 @@
 
 #include "mention.h"      /* the shared @mention scanner (ARCH-89) */
 #include "dbwriter.h"
+#include "unfurl.h"   /* OC_UNFURL_MAX_URLS: the store re-validates presence */
+#include "url.h"
 #include "migrate.h"
 #include "protocol.h"
 #include "auth.h"
@@ -209,12 +211,54 @@ static void job_free(oc_job *j) {
     free(j->pf_old_pw);
     free(j->pf_new_pw);
     free(j->device_token);
+    free(j->unf_url);
+    free(j->unf_title);
+    free(j->unf_descr);
     free(j);
 }
 
 /* Free the heap metadata of an attachment list (filename/mime per entry). */
 static void free_attach_meta(oc_attach_meta *a, size_t n) {
     for (size_t i = 0; i < n; i++) { free(a[i].filename); free(a[i].mime); }
+}
+
+/* Unfurl rows for a replayed window (REQ-222, ARCH-105). A BROADCAST carries
+ * none — an unfurl is fetched after the send and travels on its own frame — so
+ * without this every preview vanished on reload, the same defect class the
+ * reaction and pin replays exist to prevent. One query per replayed message,
+ * the shape the reaction aggregates already use. */
+static void fill_replay_unfurls(sqlite3 *db, oc_dbres *r) {
+    if (!r->n_replay) return;
+    size_t cap = 8, n = 0;
+    struct oc_replay_unfurl *ua = malloc(cap * sizeof *ua);
+    for (size_t i = 0; i < r->n_replay && ua; i++) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db,
+                "SELECT url, COALESCE(title,''), COALESCE(descr,'') "
+                "FROM unfurls WHERE message_id=?1 ORDER BY url;", -1, &st, NULL) != SQLITE_OK)
+            break;
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)r->replay[i].message_id);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            if (n == cap) {
+                cap *= 2;
+                struct oc_replay_unfurl *g = realloc(ua, cap * sizeof *ua);
+                if (!g) break;
+                ua = g;
+            }
+            const char *u = (const char *)sqlite3_column_text(st, 0);
+            const char *t = (const char *)sqlite3_column_text(st, 1);
+            const char *d = (const char *)sqlite3_column_text(st, 2);
+            ua[n].message_id = r->replay[i].message_id;
+            ua[n].channel_id = r->replay[i].channel_id;
+            ua[n].url   = strdup(u ? u : "");
+            ua[n].title = strdup(t ? t : "");
+            ua[n].descr = strdup(d ? d : "");
+            n++;
+        }
+        sqlite3_finalize(st);
+    }
+    r->runfurl = ua;
+    r->n_runfurl = n;
 }
 
 void oc_dbres_free(oc_dbres *r) {
@@ -232,6 +276,13 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->replay);
     for (size_t i = 0; i < r->n_rreact; i++) free(r->rreact[i].emoji);
     free(r->rreact);
+    for (size_t i = 0; i < r->n_runfurl; i++) {
+        free(r->runfurl[i].url); free(r->runfurl[i].title); free(r->runfurl[i].descr);
+    }
+    free(r->runfurl);
+    free(r->unf_url);
+    free(r->unf_title);
+    free(r->unf_descr);
     for (size_t i = 0; i < r->n_plist; i++) { free(r->plist[i].body); free(r->plist[i].attach_name); }
     free(r->plist);
     free(r->cmlist);
@@ -1700,10 +1751,78 @@ static oc_dbres *process_edit(sqlite3 *db, const oc_job *j) {
         r->type = OC_RES_EDIT_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
 
+    /* Any stored unfurls describe the OLD body. Drop them all; the net thread
+     * re-extracts from the new body and re-fetches, and the store step
+     * re-validates presence — so a URL that survived the edit gets its preview
+     * back within seconds, and one that left cannot be replayed (ARCH-105). */
+    sqlite3_prepare_v2(db, "DELETE FROM unfurls WHERE message_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+
     r->type = OC_RES_EDIT_OK;
     r->author_id = author;
     r->server_time = ts;   /* edited_at_ms */
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
+    load_members(db, j->channel_id, r);
+    return r;
+}
+
+/* Store a completed link unfurl (REQ-222, ARCH-105) and hand the net thread
+ * its fan-out. Submitted by the unfurl worker (conn_id 0), never by a client
+ * frame. The message is re-validated here: it may have been tombstoned — or
+ * edited so the URL is gone — while the fetch was in flight, and a preview for
+ * text that no longer exists must be neither stored nor announced. The silent
+ * outcome is OC_RES_OK, which the net thread ignores. Write. */
+static oc_dbres *process_unfurl_store(sqlite3 *db, const oc_job *j) {
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = 0;
+    r->type = OC_RES_OK;
+    if (!j->unf_url || !j->unf_title) return r;
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT channel_id, deleted_at_ms IS NOT NULL, body "
+            "FROM messages WHERE id=?1;", -1, &st, NULL) != SQLITE_OK)
+        return r;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+    int present = 0;
+    if (sqlite3_step(st) == SQLITE_ROW &&
+        (uint64_t)sqlite3_column_int64(st, 0) == j->channel_id &&
+        sqlite3_column_int(st, 1) == 0) {
+        const char *body = (const char *)sqlite3_column_blob(st, 2);
+        size_t body_len  = (size_t)sqlite3_column_bytes(st, 2);
+        oc_url_span sp[OC_UNFURL_MAX_URLS];
+        size_t nn = body ? oc_url_extract(body, body_len, sp, OC_UNFURL_MAX_URLS) : 0;
+        size_t ul = strlen(j->unf_url);
+        for (size_t i = 0; i < nn; i++)
+            if (sp[i].len == ul && memcmp(body + sp[i].start, j->unf_url, ul) == 0)
+                { present = 1; break; }
+    }
+    sqlite3_finalize(st);
+    if (!present) return r;
+
+    uint64_t ts = dbw_now_ms();
+    sqlite3_prepare_v2(db,
+        "INSERT OR REPLACE INTO unfurls(message_id, channel_id, url, title, descr, created_at_ms) "
+        "VALUES(?, ?, ?, ?, ?, ?);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->channel_id);
+    sqlite3_bind_text(st, 3, j->unf_url, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 4, j->unf_title, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 5, j->unf_descr ? j->unf_descr : "", -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)ts);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return r;
+
+    r->type = OC_RES_UNFURL_STORED;
+    r->message_id = j->message_id;
+    r->channel_id = j->channel_id;
+    r->unf_url   = strdup(j->unf_url);
+    r->unf_title = strdup(j->unf_title);
+    r->unf_descr = strdup(j->unf_descr ? j->unf_descr : "");
     load_members(db, j->channel_id, r);
     return r;
 }
@@ -1758,6 +1877,10 @@ static oc_dbres *process_delete(sqlite3 *db, const oc_job *j) {
     /* A tombstone has nothing to pin to either (REQ-052/230). Dropped before the
      * reactions so the order matches the table dependencies. */
     sqlite3_prepare_v2(db, "DELETE FROM pins WHERE message_id=?;", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
+
+    /* A tombstone has no links to preview either (REQ-052/222). */
+    sqlite3_prepare_v2(db, "DELETE FROM unfurls WHERE message_id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->message_id); sqlite3_step(st); sqlite3_finalize(st);
 
     /* A tombstone has no body to react to; drop its reactions (REQ-052/070). */
@@ -3680,6 +3803,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
         r->rreact = ra;
         r->n_rreact = rn;
     }
+    fill_replay_unfurls(db, r);
     return r;
 }
 
@@ -3791,6 +3915,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
             sqlite3_finalize(mt);
         }
     }
+    fill_replay_unfurls(db, r);
     return r;
 }
 
@@ -5723,6 +5848,7 @@ static oc_dbres *process_write(oc_dbwriter *w, const oc_job *j) {
     if (j->type == OC_JOB_SET_ROLE)      return process_set_role(w->db, j);
     if (j->type == OC_JOB_LOGOUT)        return process_logout(w->db, j);
     if (j->type == OC_JOB_EDIT)          return process_edit(w->db, j);
+    if (j->type == OC_JOB_UNFURL_STORE)  return process_unfurl_store(w->db, j);
     if (j->type == OC_JOB_DELETE)        return process_delete(w->db, j);
     if (j->type == OC_JOB_CREATE_CHANNEL) return process_create_channel(w->db, j);
     if (j->type == OC_JOB_JOIN_CHANNEL)   return process_join_channel(w->db, j);

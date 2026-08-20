@@ -418,6 +418,16 @@ oc_result oc_encode_pin_updated(oc_wbuf *w, uint16_t version, const oc_pin_updat
     return oc_frame_end(w, off);
 }
 
+oc_result oc_encode_unfurl(oc_wbuf *w, uint16_t version, const oc_unfurl *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_UNFURL);
+    oc_w_u64(w, m->message_id);
+    oc_w_u64(w, m->channel_id);
+    oc_w_str(w, m->url);
+    oc_w_str(w, m->title);
+    oc_w_str(w, m->descr);
+    return oc_frame_end(w, off);
+}
+
 oc_result oc_encode_list_pins(oc_wbuf *w, uint16_t version, const oc_list_pins *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_LIST_PINS);
     oc_w_u64(w, m->channel_id);
@@ -1910,6 +1920,15 @@ oc_result oc_decode_pin_updated(oc_rbuf *p, oc_pin_updated *m) {
     m->user_id = oc_r_u64(p);
     m->op = oc_r_u8(p);
     m->pinned_at = oc_r_u64(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_unfurl(oc_rbuf *p, oc_unfurl *m) {
+    m->message_id = oc_r_u64(p);
+    m->channel_id = oc_r_u64(p);
+    m->url = oc_r_str(p);
+    m->title = oc_r_str(p);
+    m->descr = oc_r_str(p);
     return r_done(p);
 }
 

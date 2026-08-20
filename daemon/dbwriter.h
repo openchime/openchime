@@ -130,7 +130,10 @@ enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 
         * Fire-and-forget: nothing is returned, because nothing about the
         * session changes — it only keeps the stored offset from going stale
         * when the user travels or crosses a daylight-saving boundary. */
-       OC_JOB_SET_TZ_OFFSET = 95 };
+       OC_JOB_SET_TZ_OFFSET = 95,
+       /* Store a completed link unfurl (REQ-222, ARCH-105). Submitted by the
+        * unfurl worker with conn_id 0 — never by a client frame. */
+       OC_JOB_UNFURL_STORE = 96 };
 
 /* Per-channel reconnect cursor: replay messages with id > after_message_id. */
 typedef struct { uint64_t channel_id; uint64_t after_message_id; } oc_bf_cursor;
@@ -273,6 +276,12 @@ typedef struct oc_job {
     char          *pf_old_pw;      /* heap */
     char          *pf_new_pw;      /* heap */
 
+    /* UNFURL_STORE (REQ-222): the fetched preview for one URL of message_id.
+     * All heap; the writer re-validates the message before storing. */
+    char          *unf_url;
+    char          *unf_title;
+    char          *unf_descr;
+
     /* Storage maintenance pass inputs (ARCH-78). */
     uint64_t       maint_max_age_ms;  /* expire attachments older than this (0 = never) */
     uint64_t       maint_grace_ms;    /* never reclaim anything younger than this */
@@ -355,7 +364,10 @@ enum { OC_RES_AUTH_OK = 1, OC_RES_AUTH_ERR = 2, OC_RES_SEND_OK = 3,
        /* The aggregated thread list, and the ack for a follow/read change —
         * which carries the ONE row that changed, so a client folds it without
         * re-listing (the shape DRAFT already uses). */
-       OC_RES_THREAD_LIST = 86, OC_RES_THREAD_ONE = 87 };
+       OC_RES_THREAD_LIST = 86, OC_RES_THREAD_ONE = 87,
+       /* A stored link unfurl to fan out (REQ-222): message/channel ids,
+        * unf_* strings, and `members` for the recipients. */
+       OC_RES_UNFURL_STORED = 88 };
 
 /* One thread in the aggregated view (REQ-062). Mirrors oc_thread_summary on the
  * wire; `preview` is heap. */
@@ -582,6 +594,16 @@ typedef struct oc_dbres {
     struct oc_replay_react { uint64_t message_id, channel_id, user_id, count; char *emoji; }
                   *rreact;
     size_t         n_rreact;
+    /* Link unfurls for the replayed messages (REQ-222, ARCH-105) — the same
+     * reasoning as the reactions above: a BROADCAST carries none, an unfurl
+     * travels on its own frame, and a client that reloads must not silently
+     * lose every preview. Also carries UNFURL_STORED's own strings. */
+    struct oc_replay_unfurl { uint64_t message_id, channel_id; char *url, *title, *descr; }
+                  *runfurl;
+    size_t         n_runfurl;
+    char          *unf_url;    /* heap; UNFURL_STORED */
+    char          *unf_title;  /* heap */
+    char          *unf_descr;  /* heap */
     uint64_t       high_water;
     uint8_t        truncated;  /* results hit the per-response cap (backfill/search/thread) */
 

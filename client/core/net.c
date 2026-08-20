@@ -775,6 +775,23 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                 oc_ev *e = oc_ev_new(OC_EV_PINS_END);
                 if (e) { e->channel_id = pn.channel_id; e->count = pn.count; oc_queue_push(to_ui, e); }
             }
+        } else if (hdr.msg_type == OC_MSG_UNFURL) {
+            oc_unfurl uf;
+            if (oc_decode_unfurl(&p, &uf) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_UNFURL);
+                if (e) {
+                    e->channel_id = uf.channel_id;
+                    e->message_id = uf.message_id;
+                    e->body = malloc(uf.url.len + 1);
+                    if (e->body) { memcpy(e->body, uf.url.ptr, uf.url.len); e->body[uf.url.len] = '\0'; }
+                    e->topic = malloc(uf.title.len + 1);
+                    if (e->topic) { memcpy(e->topic, uf.title.ptr, uf.title.len); e->topic[uf.title.len] = '\0'; }
+                    e->preview = malloc(uf.descr.len + 1);
+                    if (e->preview) { memcpy(e->preview, uf.descr.ptr, uf.descr.len); e->preview[uf.descr.len] = '\0'; }
+                    if (e->body && e->topic && e->preview) oc_queue_push(to_ui, e);
+                    else oc_ev_free(e);
+                }
+            }
         } else if (hdr.msg_type == OC_MSG_REACTION_UPDATED) {
             oc_reaction_updated ru;
             if (oc_decode_reaction_updated(&p, &ru) == OC_OK) {

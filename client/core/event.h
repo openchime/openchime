@@ -132,7 +132,13 @@ enum {
     /* REQ-287: people you named who are not in this channel. body = their names,
      * comma-joined for display; `peers`/`n_peers` carry their ids so the client
      * can offer to add them; status packs can_add|is_private. */
-    OC_EV_MENTION_UNRESOLVED
+    OC_EV_MENTION_UNRESOLVED,
+    /* A link preview (REQ-222, ARCH-105): channel_id + message_id, body = the
+     * url, topic = the fetched title, preview = the description — reusing the
+     * three heap slots the way ATTACHMENT reuses author_name for a mime type.
+     * Arrives after the BROADCAST it belongs to (or on replay), and again for
+     * the same url if the daemon re-fetched: the fold is an upsert. */
+    OC_EV_UNFURL
 };
 
 typedef struct {
