@@ -1797,6 +1797,69 @@ else
   say "   (demo_client unavailable — skipping the unread-tab checks)"
 fi
 
+# --- the taskbar badge and flash (REQ-138, REQ-286) --------------------------
+# The overlay badge is the notification surface that still works when the OS
+# suppresses toasts, so it earns transition assertions, not a state peek: bob
+# posts and the count rises; reading the channel brings it back down. The flash
+# is driven at both poles, deterministically: with the preference on Never the
+# counter must hold still whatever the host desktop's focus or idle state is
+# doing (bob is a priority person from the keywords section, so his messages
+# ARE flash-class); with it on Always and the window genuinely minimised, one
+# message from him must move it.
+say "== taskbar badge + flash"
+expect_grep '^badge=[0-9]+ flash_pref=[0-2] flashes=[0-9]+ taskbar=1' "the taskbar list is live and the dump carries its state"
+
+# set_flash <val> — commit the flash preference through the real card, the way
+# a person would, so the row's hit-box and the Save path are exercised too.
+set_flash() {
+  "$DRIVE" prefs >/dev/null 2>&1; settle modal prefs
+  click_cat 2; settle prefcat 2
+  click_pref 13 "$1"; settle flash_pref "$1"
+  "$DRIVE" key enter >/dev/null 2>&1; settle modal none
+}
+ff=$(key_of "$(snap)" flash_pref)      # as found, restored below
+
+# Esc still restores the snapshot like every other row on the card.
+"$DRIVE" prefs >/dev/null 2>&1; settle modal prefs
+click_cat 2; settle prefcat 2
+fo=$([ "$ff" = "2" ] && echo 1 || echo 2)
+click_pref 13 "$fo"
+expect_eventually flash_pref "$fo" "the flash choice applies while the sheet is open"
+"$DRIVE" key esc >/dev/null 2>&1; settle modal none
+expect_eventually flash_pref "$ff" "and Esc restores it"
+
+if [ -x "$HERE/build/demo_client" ] && [ -n "${gid:-}" ]; then
+  set_flash 0
+  f0=$(key_of "$(snap)" flashes)
+  "$DRIVE" view 0 >/dev/null 2>&1; "$DRIVE" channel solo >/dev/null 2>&1; settle re 1
+  sleep 1
+  b0=$(key_of "$(snap)" badge)
+  if [ -n "$b0" ] && [ "$b0" -lt 9 ]; then
+    "$HERE/build/demo_client" 127.0.0.1 "$OC_DEV_PORT" bob pw send "$gid" "one for the badge" >/dev/null 2>&1
+    expect_eventually badge $((b0 + 1)) "an unread in a channel you are not reading raises the overlay"
+    "$DRIVE" channel general >/dev/null 2>&1; settle re 1
+    expect_eventually badge "$b0" "reading the channel takes it back down"
+  else
+    say "   (badge already at the cap — skipping the transition)"
+  fi
+  expect_eventually flashes "$f0" "Never means never, even for a priority person"
+
+  # The positive pole: Always, window minimised for real, one flash-class
+  # message. Asserted as a transition — the counter, not the pixels.
+  set_flash 2
+  "$DRIVE" min >/dev/null 2>&1
+  sleep 1        # SW_MINIMIZE drops foreground synchronously; settling, not asserting
+  "$HERE/build/demo_client" 127.0.0.1 "$OC_DEV_PORT" bob pw send "$gid" "one for the flash" >/dev/null 2>&1
+  expect_eventually flashes $((f0 + 1)) "a priority person's message flashes a minimised window"
+  "$DRIVE" restore >/dev/null 2>&1
+  sleep 1
+  "$DRIVE" channel general >/dev/null 2>&1; settle re 1   # read the flash message
+  set_flash "$ff"
+  expect_eventually flash_pref "$ff" "the run left the flash preference as it found it"
+else
+  say "   (demo_client unavailable — skipping the badge and flash transitions)"
+fi
+
 # --- the composer cue tracks the conversation ------------------------------
 # It was a cached global that went stale on a channel switch ("Message bob" while
 # reading alice), so it is asserted rather than eyeballed.
