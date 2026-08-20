@@ -57,4 +57,11 @@ int oc_unfurl_extract_html(const char *html, size_t len,
                            char *title, size_t title_cap,
                            char *descr, size_t descr_cap);
 
+/* 1 when the extracted title/descr reads as a BLOCK PAGE — a bot wall's
+ * access-denied, a verification challenge, a soft not-found — served with a
+ * 200 the status check cannot catch. A preview of the refusal is worse than
+ * no preview, so these fetches produce nothing. A false positive costs only
+ * a missing card, which is this feature's normal outcome (ARCH-105). */
+int oc_unfurl_blocked(const char *title, const char *descr);
+
 #endif /* OPENCHIME_UNFURL_H */

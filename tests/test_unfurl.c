@@ -130,11 +130,38 @@ static int test_html_extract(void) {
     return failures;
 }
 
+/* Block pages served with a 200 (issue phrasing: microsoft.com answering
+ * "your request has been blocked") must produce NO unfurl. */
+static int test_block_pages(void) {
+    int failures = 0;
+
+    CHECK(oc_unfurl_blocked("Your request has been blocked", ""));
+    CHECK(oc_unfurl_blocked("Access Denied", ""));
+    CHECK(oc_unfurl_blocked("Attention Required! | Cloudflare", ""));
+    CHECK(oc_unfurl_blocked("Just a moment...", ""));
+    CHECK(oc_unfurl_blocked("Robot or human?", "Verify you are human to continue"));
+    CHECK(oc_unfurl_blocked("Page not found - Example", ""));
+    CHECK(oc_unfurl_blocked("Error", "Access to this page has been denied."));
+    CHECK(oc_unfurl_blocked("503 Service Unavailable", ""));
+
+    /* Real titles pass, including ones ABOUT blocking — the list is phrases,
+     * not words. */
+    CHECK(!oc_unfurl_blocked("Example Domain", ""));
+    CHECK(!oc_unfurl_blocked("How ad blocking works", "A primer on request filtering"));
+    CHECK(!oc_unfurl_blocked("The Momentum of a Moment", ""));
+    CHECK(!oc_unfurl_blocked("", ""));
+    CHECK(!oc_unfurl_blocked(NULL, NULL));
+
+    return failures;
+}
+
 int run_unfurl_tests(void) {
     int failures = 0;
     printf("unfurl: SSRF gate\n");
     failures += test_ssrf_gate();
     printf("unfurl: HTML extraction\n");
     failures += test_html_extract();
+    printf("unfurl: block pages\n");
+    failures += test_block_pages();
     return failures;
 }
