@@ -216,6 +216,41 @@ static int meta_content(const char *h, size_t n, const char *key, char *out, siz
     return 0;
 }
 
+/* The refusal phrasings the big CDNs and bot walls serve with a 200. Matched
+ * case-insensitively as substrings of the cleaned title or description. The
+ * list is deliberately specific — "blocked" alone would refuse a legitimate
+ * article about blocking — and errs toward specificity because a miss shows a
+ * odd card once, while a false positive silently costs a real preview. */
+static const char *UF_BLOCK_PHRASES[] = {
+    "request has been blocked",
+    "request blocked",
+    "access denied",
+    "access to this page has been denied",
+    "attention required",
+    "just a moment",
+    "pardon our interruption",
+    "verify you are human",
+    "verifying you are human",
+    "are you a robot",
+    "unusual traffic",
+    "enable javascript and cookies",
+    "page not found",
+    "service unavailable",
+    "temporarily unavailable",
+};
+
+int oc_unfurl_blocked(const char *title, const char *descr) {
+    const char *fields[2] = { title, descr };
+    for (int f = 0; f < 2; f++) {
+        const char *t = fields[f];
+        if (!t || !t[0]) continue;
+        size_t tn = strlen(t);
+        for (size_t i = 0; i < sizeof UF_BLOCK_PHRASES / sizeof UF_BLOCK_PHRASES[0]; i++)
+            if (ci_find(t, tn, 0, UF_BLOCK_PHRASES[i]) != (size_t)-1) return 1;
+    }
+    return 0;
+}
+
 int oc_unfurl_extract_html(const char *html, size_t len,
                            char *title, size_t title_cap,
                            char *descr, size_t descr_cap) {
@@ -520,6 +555,9 @@ static void uf_do(oc_unfurler *u, struct uf_job *job) {
     int ok = oc_unfurl_extract_html(page, page_len, title, sizeof title, descr, sizeof descr);
     free(page);
     if (ok != 0) return;
+    /* A block page that arrived as a 200: the fetch "succeeded" and the site
+     * still refused us. Produce nothing, exactly as any other failed fetch. */
+    if (oc_unfurl_blocked(title, descr)) return;
 
     /* Hand the store to the writer (conn_id 0: no connection owns this). The
      * writer re-validates the message — it may have been tombstoned or edited
