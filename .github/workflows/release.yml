@@ -169,11 +169,11 @@ jobs:
       - name: Install build dependencies
         run: |
           set -euo pipefail
-          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
           # apt config, not per-command flags: it has to cover `install`, which
           # fetches from the same mirror, and not just `update`.
           # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls (issue #35). Retries and timeouts are
+          # runners point at, and it stalls. Retries and timeouts are
           # not enough on their own: apt gives up on azure, falls back to
           # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
           # and sits there until the job timeout. Measured on ubuntu-24.04 --
@@ -372,11 +372,11 @@ jobs:
       - name: Install buildah
         run: |
           set -euo pipefail
-          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
           # apt config, not per-command flags: it has to cover `install`, which
           # fetches from the same mirror, and not just `update`.
           # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls (issue #35). Retries and timeouts are
+          # runners point at, and it stalls. Retries and timeouts are
           # not enough on their own: apt gives up on azure, falls back to
           # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
           # and sits there until the job timeout. Measured on ubuntu-24.04 --
@@ -430,11 +430,11 @@ jobs:
       - name: Install buildah
         run: |
           set -euo pipefail
-          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
           # apt config, not per-command flags: it has to cover `install`, which
           # fetches from the same mirror, and not just `update`.
           # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls (issue #35). Retries and timeouts are
+          # runners point at, and it stalls. Retries and timeouts are
           # not enough on their own: apt gives up on azure, falls back to
           # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
           # and sits there until the job timeout. Measured on ubuntu-24.04 --
@@ -484,11 +484,11 @@ jobs:
 
       - name: Install the mingw-w64 toolchain
         run: |
-          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
           # apt config, not per-command flags: it has to cover `install`, which
           # fetches from the same mirror, and not just `update`.
           # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls (issue #35). Retries and timeouts are
+          # runners point at, and it stalls. Retries and timeouts are
           # not enough on their own: apt gives up on azure, falls back to
           # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
           # and sits there until the job timeout. Measured on ubuntu-24.04 --
@@ -766,11 +766,11 @@ jobs:
 
       - name: Install repository tooling
         run: |
-          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
           # apt config, not per-command flags: it has to cover `install`, which
           # fetches from the same mirror, and not just `update`.
           # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls (issue #35). Retries and timeouts are
+          # runners point at, and it stalls. Retries and timeouts are
           # not enough on their own: apt gives up on azure, falls back to
           # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
           # and sits there until the job timeout. Measured on ubuntu-24.04 --
@@ -995,11 +995,11 @@ jobs:
             -o /usr/share/keyrings/openchime-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] $DIST_BASE_URL/apt stable main" \
             | sudo tee /etc/apt/sources.list.d/openchime.list >/dev/null
-          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
           # apt config, not per-command flags: it has to cover `install`, which
           # fetches from the same mirror, and not just `update`.
           # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls (issue #35). Retries and timeouts are
+          # runners point at, and it stalls. Retries and timeouts are
           # not enough on their own: apt gives up on azure, falls back to
           # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
           # and sits there until the job timeout. Measured on ubuntu-24.04 --
@@ -1064,11 +1064,11 @@ jobs:
       - name: Move :latest to the released version
         run: |
           set -euo pipefail
-          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
           # apt config, not per-command flags: it has to cover `install`, which
           # fetches from the same mirror, and not just `update`.
           # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls (issue #35). Retries and timeouts are
+          # runners point at, and it stalls. Retries and timeouts are
           # not enough on their own: apt gives up on azure, falls back to
           # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
           # and sits there until the job timeout. Measured on ubuntu-24.04 --

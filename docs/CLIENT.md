@@ -830,7 +830,7 @@ to change a DirectWrite size, so any preference that moves the scale must call
   DNS workspace resolution (REQ-010/011), the local **Sign in** dialog, and the
   **Windows TUI** (ARCH-81). See §5–§6.
 - **Done — Windows GUI depth.** The Win32 GUI surfaces every engine feature
-  (ARCH-82) and its depth backlog is **closed**: the error/toast + connection
+  (ARCH-82) and its depth work is **closed**: the error/toast + connection
   surface (**REQ-263**), search with jump-to-match, keyset paging and operators
   (REQ-080), the sidebar overhaul (**REQ-267**), composer autocomplete + emoji
   picker (**REQ-265**), the preferences hub (**REQ-261**), the other-user profile

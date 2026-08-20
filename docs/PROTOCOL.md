@@ -656,7 +656,7 @@ skim — and it is per *channel*, not per DM, so the ordinary sidebar can use it
 `CHANNEL_ARCHIVED` (3019). **The incoming-webhook post path does not call it** —
 it resolves the token and inserts the message, so a third party can still post
 into an archived channel and archiving does not disable a channel's webhooks.
-That is a defect, not a design; it is #133. It is hidden from `CHANNEL_LIST` for
+That is a defect, not a design, and is tracked as one. It is hidden from `CHANNEL_LIST` for
 non-members; members keep it, flagged, so they can find their way back in.
 History, search and membership are untouched — archiving is the reversible
 alternative to a deletion that is not offered for channels holding history.
@@ -1307,7 +1307,7 @@ rejects it before the handler sees it), `404` (unknown or disabled token), `405`
 (non-POST), `413` (the raw request exceeded the read buffer, `MAX_BODY_SIZE` plus
 16 KiB, before parsing completed), `429` (per-token rate limit, 60/min).
 
-One gap, #132: REQ-171's CA-signed certificate for this
+One gap, tracked: REQ-171's CA-signed certificate for this
 endpoint is not implemented, so it answers on the daemon's TOFU cert. **An
 archived channel does not stop a webhook post** — the archived check that
 `SEND` performs is absent here.
@@ -1581,8 +1581,7 @@ somebody else's private-channel attachment.
 > **`SET_PROFILE` cannot be delivered.** Its opcode `0x0070` is also
 > `SET_PRESENCE`; the daemon dispatches presence first, and a title/timezone
 > payload fails the presence decoder, so the connection is dropped. Do not
-> implement against `0x0070` for this frame until the number is resolved. See
-> #134.
+> implement against `0x0070` for this frame until the number is resolved.
 
 ### 5.16f Drafts and scheduled messages
 
@@ -2018,8 +2017,8 @@ opcode order, 157 of them. The sections above specify the payload layouts; this
 table is the index and the authority on which values are taken.
 
 One opcode is **used by two message types** (`0x0070`), marked below:
-`SET_PROFILE`/`SET_PRESENCE` are both client→server and collide for real. See
-#134. The other two shared values are gone — `TYPING` and
+`SET_PROFILE`/`SET_PRESENCE` are both client→server and collide for real, and
+that is tracked. The other two shared values are gone — `TYPING` and
 `TYPING_UPDATE` moved to `0x007E`/`0x007F` in v8, leaving `0x0072` to
 `PROFILE_INFO` and `0x0073` to `LIST_FILE_CHANNELS` alone. `scripts/check_opcodes.sh`
 (run by `make test` and CI) fails on any duplicate outside that one tracked

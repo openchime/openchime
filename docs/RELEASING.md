@@ -189,7 +189,7 @@ a cleanup. What replaced them:
   with the rpm repository, so faults in those still surface there.
 
 This trade was made to remove Docker from the pipeline entirely (ARCH-36). It is
-tracked as #141 rather than treated as settled.
+tracked as an open issue rather than treated as settled.
 
 ## Windows signing is optional
 

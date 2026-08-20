@@ -57,11 +57,11 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install build deps
         run: |
-          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
           # apt config, not per-command flags: it has to cover `install`, which
           # fetches from the same mirror, and not just `update`.
           # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls (issue #35). Retries and timeouts are
+          # runners point at, and it stalls. Retries and timeouts are
           # not enough on their own: apt gives up on azure, falls back to
           # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
           # and sits there until the job timeout. Measured on ubuntu-24.04 --
@@ -82,6 +82,8 @@ jobs:
       # fails as itself rather than inside the test step.
       - name: Check opcode uniqueness
         run: make check-opcodes
+      - name: No file cites an issue by number
+        run: make check-refs
       - name: Run unit tests
         run: make test
 
@@ -93,11 +95,11 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install deps
         run: |
-          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
           # apt config, not per-command flags: it has to cover `install`, which
           # fetches from the same mirror, and not just `update`.
           # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls (issue #35). Retries and timeouts are
+          # runners point at, and it stalls. Retries and timeouts are
           # not enough on their own: apt gives up on azure, falls back to
           # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
           # and sits there until the job timeout. Measured on ubuntu-24.04 --
@@ -139,8 +141,8 @@ jobs:
           # fails on a runner, oc_netloop_run returns -1 without printing
           # anything, and the daemon exits 0 having logged "healthz listening on
           # :8080" — so it looks like a healthy daemon that mysteriously will not
-          # answer. Diagnosed by reproducing it locally; see #144 for
-          # the silent-failure defect underneath.
+          # answer. Diagnosed by reproducing it locally; the silent-failure
+          # defect underneath it is tracked separately.
           #
           # The bootstrap variable is the OPENCHIME_-prefixed name; the OC_ form
           # compose used is a deprecated alias and the daemon warns about it.
@@ -193,11 +195,11 @@ jobs:
       # (tests/test_client_core.c). bzip2 for the vendored mbedTLS tarball.
       - name: Install build deps
         run: |
-          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
           # apt config, not per-command flags: it has to cover `install`, which
           # fetches from the same mirror, and not just `update`.
           # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls (issue #35). Retries and timeouts are
+          # runners point at, and it stalls. Retries and timeouts are
           # not enough on their own: apt gives up on azure, falls back to
           # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
           # and sits there until the job timeout. Measured on ubuntu-24.04 --
@@ -227,11 +229,11 @@ jobs:
       # tarball that build_mbedtls_windows.sh fetches and cross-builds.
       - name: Install cross toolchain
         run: |
-          # A stalled Ubuntu mirror must fail over, not hang (issue #35). Set as
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
           # apt config, not per-command flags: it has to cover `install`, which
           # fetches from the same mirror, and not just `update`.
           # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls (issue #35). Retries and timeouts are
+          # runners point at, and it stalls. Retries and timeouts are
           # not enough on their own: apt gives up on azure, falls back to
           # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
           # and sits there until the job timeout. Measured on ubuntu-24.04 --

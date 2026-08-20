@@ -463,7 +463,7 @@ Server-authoritative notification settings, synced across a user's devices.
   IANA zone per push (ARCH-103). **The client writes it only as part of
   `SET_SCHEDULE`**, so it is refreshed when the user edits their schedule and at
   no other time; ARCH-103's stated design of a connect-time refresh is not built,
-  and a stale offset is a backlog item rather than a property of this column.
+  and a stale offset is a tracked defect rather than a property of this column.
 
 ### `notify_schedule` (migration 0034)
 - `(user_id, weekday)` (PK), `enabled`, `start_min`, `end_min` — used by

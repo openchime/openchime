@@ -211,7 +211,7 @@ the requirement says so explicitly rather than implying one.
   because the daemon verifies and the control plane mints while nothing carries
   the token between them — `scripts/demo-oidc.sh` proves the mint↔verify contract
   with a dev endpoint that deliberately bypasses the browser flow. That last one
-  is the open item (#137); the first two are settled.
+  is the open item, and is tracked; the first two are settled.
 
 ### 1.3 Authorization and Roles
 

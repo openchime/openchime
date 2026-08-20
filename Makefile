@@ -80,7 +80,7 @@ endif
 TUI_INC   := $(CORE_INC) -Iclient/tui -Iclient/shared -Ithird_party/termbox2 -Ithird_party/utf8proc
 TUI_BIN   := build/openchime-tui
 
-.PHONY: all run test check-opcodes core tui bench clean s3-smoke windows-tui windows-gui tuikit-demo demo-client
+.PHONY: all run test check-opcodes check-refs core tui bench clean s3-smoke windows-tui windows-gui tuikit-demo demo-client
 
 all: $(BIN)
 
@@ -107,9 +107,17 @@ $(MBEDTLS_A):
 check-opcodes:
 	scripts/check_opcodes.sh shared/protocol.h
 
+# No file cites an issue by number (CONTRIBUTING.md). Like check-opcodes this is
+# a source check rather than a C test: what it inspects is the text of the tree,
+# not the behaviour of the program. A commit cites the issue it closes; a file
+# says the thing instead, because a number in a comment rots silently the moment
+# the issue does.
+check-refs:
+	scripts/check_refs.sh
+
 # Unit + in-process integration tests, one binary (docs/TESTING.md §2). Built
 # -O0 -g; a non-zero exit fails the build and CI.
-test: check-opcodes $(TEST_BIN)
+test: check-opcodes check-refs $(TEST_BIN)
 	./$(TEST_BIN)
 
 $(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(HDRS) $(wildcard tests/*.h client/core/*.h) $(MBEDTLS_A) | build

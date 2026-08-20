@@ -35,8 +35,7 @@ REQ-027.
 Sixteen, and each has one job. **Start with the first two**: they answer what the
 product is meant to do and why it is built the way it is. What is *wrong* with it
 today is no longer a document — it is the
-[issue tracker](https://github.com/openchime/openchime/issues), which replaced
-`docs/BACKLOG.md` on 2026-08-19.
+[issue tracker](https://github.com/openchime/openchime/issues).
 
 | Document | What it is |
 |---|---|
@@ -191,7 +190,7 @@ roster, channel topic/rename/archive, mute, star, mark-unread, the activity feed
 in-app preferences and themes — plus webhook *deletion* and log-out-everywhere.
 All of them already exist in the app-core, so closing the gap is TUI work alone.
 The frontend order is fixed — all of Win32 first — so the TUI's gap is not
-tracked as backlog. Some frames the daemon speaks reach no client at all yet —
+tracked as open work. Some frames the daemon speaks reach no client at all yet —
 see [docs/CLIENT.md](docs/CLIENT.md) §3. The app-core **writes nothing to disk** (ARCH-88/REQ-201): one credential per
 workspace in the OS credential store carries the session token, the TOFU pin and
 the workspace book, so it reconnects silently across restarts and queues sends
