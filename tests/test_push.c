@@ -342,6 +342,38 @@ static void test_collect(void) {
         CHECK(oc_notify_quiet(OC_DND_EVERY_DAY, 1320, 480, 0, 0, 0, 0, 720, 3) == 1);
     }
 
+    /* --- the notify decision is ONE function, and these pin its ORDER ---
+     * (REQ-135, REQ-137, ARCH-89.) The push query below exercises the same
+     * precedence against real rows; this exercises the shared statement of it
+     * that a client's toast gate feeds, where the order is exactly the part
+     * that had drifted. Arguments read:
+     *   (own, muted, vip, level, mentioned, keyword, quiet, paused). */
+    {
+        /* Plain traffic: ALL notifies, NONE does not, MENTIONS needs a reason. */
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_ALL,      0, 0, 0, 0) == 1);
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_NONE,     0, 0, 0, 0) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 0, 0, 0, 0) == 0);
+        /* At MENTIONS an @-mention and a keyword hit are the same event:
+         * REQ-135 makes keywords part of the level, not a separate switch. */
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 1, 0, 0, 0) == 1);
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 0, 1, 0, 0) == 1);
+        /* NONE means none: a mention does not pierce it. Only a person does. */
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_NONE,     1, 1, 0, 0) == 0);
+        CHECK(oc_notify_decide(0, 0, 1, OC_NOTIFY_NONE,     0, 0, 0, 0) == 1);
+        /* Your own message is not news, whoever you are to yourself. */
+        CHECK(oc_notify_decide(1, 0, 1, OC_NOTIFY_ALL,      1, 1, 0, 0) == 0);
+        /* Mute is absolute (REQ-137): not even a priority person pierces it. */
+        CHECK(oc_notify_decide(0, 1, 1, OC_NOTIFY_ALL,      1, 1, 0, 0) == 0);
+        /* A priority person pierces the schedule and the pause alike:
+         * both say WHEN, and a priority person is a WHO. */
+        CHECK(oc_notify_decide(0, 0, 1, OC_NOTIFY_MENTIONS, 0, 0, 1, 1) == 1);
+        /* For everyone else the schedule and the pause each silence
+         * everything, a mention included (REQ-136, REQ-278). */
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_ALL,      0, 0, 1, 0) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_ALL,      0, 0, 0, 1) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 1, 0, 0, 1) == 0);
+    }
+
     /* --- a PRIORITY person pierces the level and the pause (REQ-135) --------
      * dave is set to mentions-only below; a message naming nobody would not
      * reach him. Making alice a priority person must, because a level says WHEN

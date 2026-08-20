@@ -16982,12 +16982,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 show_and_focus(hwnd);
             }
             /* OS notifications. Raised for messages that arrive while
-             * the window is not in front, subject to the channel's level and the
-             * DND window. The first pass after connecting only records the
-             * marks: the backfill is not "new mail". */
+             * the window is not in front; whether one is warranted is the
+             * shared evaluator's call (oc_notify_decide). The first pass after
+             * connecting only records the marks: the backfill is not "new
+             * mail". */
             if (g_pref_notify != NOTIFY_OFF) {
                 int fg = (GetForegroundWindow() == hwnd);
-                int quiet = dnd_active(m);
                 /* Every workspace, not just the visible one — a background
                  * workspace's mail is exactly what you cannot otherwise see. */
                 for (int wi = 0; wi < (g_n_wss > 0 ? g_n_wss : 1); wi++) {
@@ -16995,6 +16995,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                       ? (g_wss[wi].client ? oc_client_model(g_wss[wi].client) : NULL) : m;
                   if (!wm || !wm->authed) continue;
                   int is_active = (g_n_wss == 0) || (wi == g_ws_active);
+                  /* THIS workspace's schedule and pause, not the visible
+                   * one's: each account keeps its own quiet hours, exactly as
+                   * the daemon evaluates each recipient's own (REQ-136,
+                   * REQ-278). The pause's end is compared to NOW rather than
+                   * read as a flag, because its passing is nobody's event:
+                   * the daemon checks the instant at decision time and never
+                   * announces expiry, so a bare "is set" test would keep
+                   * silencing toasts after a lapsed pause until the next
+                   * reconnect. The rail's dot may lag; the gate must not. */
+                  int ws_quiet  = dnd_active(wm);
+                  int ws_paused = wm->snooze_until_ms != 0 &&
+                                  wm->snooze_until_ms > (uint64_t)time(NULL) * 1000ull;
                   for (size_t ci = 0; ci < wm->n_channels; ci++) {
                     const oc_channel *c = &wm->channels[ci];
                     int slot = -1;
@@ -17041,21 +17053,30 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     }
 
                     if (fg && is_active && c->channel_id == g_sel) continue;   /* you are reading it */
-                    if (quiet) continue;
-                    /* MENTIONS now has an answer (REQ-221): the same scanner
-                     * the daemon resolves with, so the toast a client raises and
-                     * the push the server sends agree by construction. */
-                    if (c->notify_level == OC_NOTIFY_NONE) continue;
-                    if (c->notify_level == OC_NOTIFY_MENTIONS) {
-                        const oc_msg *lm = c->n_msgs ? &c->msgs[c->n_msgs - 1] : NULL;
-                        const char *me = oc_model_user_name(wm, wm->user_id);
-                        if (!lm || !lm->body ||
-                            !oc_mention_targets(lm->body, strlen(lm->body), me))
-                            continue;
-                    }
-
+                    /* Whether this notifies is the shared evaluator's answer
+                     * (oc_notify_decide), under the same precedence the push
+                     * path applies (ARCH-89, ARCH-103): mute wins, a priority
+                     * person pierces the level, the schedule and the pause,
+                     * and MENTIONS counts a keyword hit as it counts an
+                     * @-mention (REQ-135). This loop only computes the inputs,
+                     * with the scanners the daemon resolves with (REQ-221), so
+                     * toast and push agree on what a mention and a keyword hit
+                     * are by construction. */
                     const oc_msg *last = c->n_msgs ? &c->msgs[c->n_msgs - 1] : NULL;
-                    if (last && last->author_id == wm->user_id) continue;   /* your own */
+                    int mentioned = 0, kw_hit = 0;
+                    if (last && last->body) {
+                        size_t blen = strlen(last->body);
+                        mentioned = oc_mention_targets(last->body, blen,
+                                        oc_model_user_name(wm, wm->user_id));
+                        kw_hit = oc_model_keyword_hit(wm, last->body, blen,
+                                                      NULL, NULL);
+                    }
+                    if (!oc_notify_decide(last && last->author_id == wm->user_id,
+                                          c->muted,
+                                          last ? oc_model_is_priority(wm, last->author_id) : 0,
+                                          c->notify_level, mentioned, kw_hit,
+                                          ws_quiet, ws_paused))
+                        continue;
                     char label[96], title[160], body[256];
                     channel_label(wm, c, label, sizeof label);
                     /* Name the workspace when it is not the one on screen, or
