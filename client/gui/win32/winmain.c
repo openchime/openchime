@@ -10148,6 +10148,31 @@ static void ed_hidden_build(void) {
 
 static void ed_delete_range(int a, int b);   /* fwd */
 
+/* ---- typing intent ---------------------------------------------------------
+ * Two pieces of TYPING state (never document state) that make the field behave
+ * like a rich editor while the buffer stays plain dialect:
+ *
+ *  - PENDING: a style toggled on with nothing to wrap. Nothing is inserted
+ *    until the first printable character arrives, so an empty delimiter pair
+ *    can never sit visible in the field — which it did, as two characters
+ *    nobody typed.
+ *  - CONTINUATION: whitespace typed at the back edge of a formatted run. The
+ *    dialect cannot hold a space against a closing delimiter (MARKDOWN.md §2),
+ *    so the space goes OUTSIDE the run — and the next printable character
+ *    pulls the closer forward over the gap, putting the caret back inside.
+ *    "Turn bold on, type several words" therefore stays bold, the contract of
+ *    every rich editor; before this, the space made the closer unparseable and
+ *    the orphan repair deleted the whole construct — formatting that turned
+ *    itself off mid-sentence, mechanised.
+ *
+ * Any caret move, click, undo, mode switch or buffer replacement clears both:
+ * they describe what the NEXT keystroke means, and after any of those it no
+ * longer means it. */
+static WCHAR g_ed_pending[4];
+static int   g_ed_n_pending;
+static int   g_ed_cont;
+static void ed_intent_clear(void) { g_ed_n_pending = 0; g_ed_cont = 0; }
+
 /* The buffer as it was before the current edit, and what was invisible in it.
  * Kept for one reason: see ed_repair_orphans(). */
 static WCHAR         g_ed_prev[ED_MAX + 1];
@@ -10239,6 +10264,7 @@ static void ed_remember(void) {
  * plain text and typing a character silently ate the markup it was showing you,
  * which is the opposite of what that mode promises. */
 static void ed_mode_changed(void) {
+    ed_intent_clear();
     ed_invalidate_layout();
     ed_hidden_build();
     ed_remember();
@@ -10304,12 +10330,14 @@ static void ed_begin_edit(void) {
 }
 
 static void ed_undo(void) {
+    ed_intent_clear();
     if (!g_ed_n_undo) return;
     ed_snap_push(g_ed_redo, &g_ed_n_redo);
     ed_snap_apply(&g_ed_undo[--g_ed_n_undo]);
 }
 
 static void ed_redo(void) {
+    ed_intent_clear();
     if (!g_ed_n_redo) return;
     ed_snap_push(g_ed_undo, &g_ed_n_undo);
     ed_snap_apply(&g_ed_redo[--g_ed_n_redo]);
@@ -10356,6 +10384,7 @@ static int ed_get(WCHAR *out, int cap) {
 }
 
 static void ed_set(const WCHAR *s) {
+    ed_intent_clear();
     ed_begin_edit();
     int n = s ? lstrlenW(s) : 0;
     if (n > ED_MAX) n = ED_MAX;
@@ -10371,6 +10400,7 @@ static void ed_clear(void) { ed_set(L""); g_ed_n_undo = g_ed_n_redo = 0; }
 static void ed_insert(const WCHAR *s) { ed_begin_edit(); ed_insert_n(s, s ? lstrlenW(s) : 0); }
 
 static void ed_replace_range(int a, int b, const WCHAR *s) {
+    ed_intent_clear();
     ed_begin_edit();
     g_ed_caret = g_ed_anchor = a;
     ed_delete_range(a, b);
@@ -10387,19 +10417,66 @@ static void ed_select_all(void) { g_ed_anchor = 0; g_ed_caret = g_ed_len; }
  * these functions edit the plain body, and the field's live rendering
  * shows what the parser made of the result.
  *
- * Which means this toolbar can do something a WYSIWYG one cannot: produce
- * markup that does not take. Bolding "bar" inside "foobar" gives `foo*bar*`,
- * and MARKDOWN.md §2's word-boundary rule says that is not emphasis. We insert
- * it anyway rather than quietly moving somebody's selection somewhere they did
- * not put it — and because the field renders formatting as you type, the
- * asterisks simply stay unstyled, which says so immediately and honestly. */
+ * The rule that governs every case below: **a toggle must never leave markup
+ * that does not parse**. An earlier version inserted `foo*bar*` for a mid-word
+ * selection and called the visible asterisks honesty; in practice they read as
+ * a glitch, travelled into the sent message, and were reported as one. Where
+ * the dialect cannot represent the exact request, the toggle now does what a
+ * rich editor does instead: it snaps a mid-word edge outward to the word,
+ * absorbs same-style runs the range touches (partly-bold + toggle = all bold),
+ * SPLITS an enclosing run when the request is to unformat a piece of it, and
+ * wraps a multi-line range one line at a time, because a run cannot cross a
+ * line break. */
 
 static int ed_is_space(WCHAR c) { return c == L' ' || c == L'\t' || c == L'\n' || c == L'\r'; }
 
-/* Wrap (or unwrap) the selection in `d`. */
+/* The run of invisible CLOSERS starting at `pos`. Caret positions canonicalise
+ * left, so a caret at the back edge of a formatted run sits with the closers
+ * immediately AT it — this is how the typing paths recognise that edge. */
+static int ed_closer_run_at(int pos) {
+    int n = 0;
+    while (pos + n < g_ed_len && ed_char_hidden(pos + n) == ED_H_CLOSE) n++;
+    return n;
+}
+
+/* Does a PARSED run of delimiter `d0` enclose [a,b)? Scans outward for the
+ * nearest invisible `d0` on each side, walking through content and other
+ * styles' delimiters, stopping at a line break (a run cannot cross one).
+ * Fills the innermost delimiter offsets when it does. */
+static int ed_enclosing_run(int a, int b, WCHAR d0, int *op, int *cl) {
+    int k, found = 0;
+    for (k = a; k > 0; k--) {
+        WCHAR c = g_ed[k - 1];
+        if (c == L'\n') return 0;
+        if (ed_char_hidden(k - 1) && c == d0) {
+            if (ed_char_hidden(k - 1) != ED_H_OPEN) return 0;   /* after a closed run */
+            *op = k - 1;
+            found = 1;
+            break;
+        }
+    }
+    if (!found) return 0;
+    for (k = b; k < g_ed_len; k++) {
+        WCHAR c = g_ed[k];
+        if (c == L'\n') return 0;
+        if (ed_char_hidden(k) && c == d0) {
+            if (ed_char_hidden(k) != ED_H_CLOSE) return 0;
+            *cl = k;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Wrap (or unwrap) the selection in `d` — see the module comment above for
+ * the rules. */
 static void ed_fmt_inline(const WCHAR *d) {
     int dl = lstrlenW(d);
     int a = ed_sel_lo(), b = ed_sel_hi();
+    /* A toggle FROM a selection leaves the text selected (the second press is
+     * the undo); a toggle from a bare caret collapses back to one — leaving
+     * the word selected meant the next keystroke silently replaced it. */
+    int had_sel = a < b;
     size_t db = (size_t)dl * sizeof(WCHAR);
 
     /* Trim to the non-space core. A delimiter next to a space is not a
@@ -10427,27 +10504,68 @@ static void ed_fmt_inline(const WCHAR *d) {
         g_ed_anchor = a; g_ed_caret = b - 2 * dl;
         return;
     }
+    if (a < b) {
+        /* A mid-word EDGE cannot hold a delimiter (the word-boundary rule), so
+         * it snaps OUTWARD to the word — selecting "bar" inside "foobar" and
+         * pressing italic italicises the word, the way a rich editor grows the
+         * range, instead of leaving `foo_bar_` sitting unparsed on screen. The
+         * scan stops at spaces and at invisible delimiters, which already ARE
+         * boundaries. Then the unwrap tests run once more, because the snapped
+         * range may be exactly a run that should come off. */
+        int a0 = a, b0 = b;
+        while (a > 0 && !ed_is_space(g_ed[a - 1]) && !ed_char_hidden(a - 1)) a--;
+        while (b < g_ed_len && !ed_is_space(g_ed[b]) && !ed_char_hidden(b)) b++;
+        if ((a != a0 || b != b0)) {
+            if (a >= dl && b + dl <= g_ed_len &&
+                !memcmp(g_ed + a - dl, d, db) && !memcmp(g_ed + b, d, db)) {
+                ed_delete_range(b, b + dl);
+                ed_delete_range(a - dl, a);
+                g_ed_anchor = a - dl; g_ed_caret = b - dl;
+                return;
+            }
+            if (b - a >= 2 * dl && !memcmp(g_ed + a, d, db) && !memcmp(g_ed + b - dl, d, db)) {
+                ed_delete_range(b - dl, b);
+                ed_delete_range(a, a + dl);
+                g_ed_anchor = a; g_ed_caret = b - 2 * dl;
+                return;
+            }
+        }
+    }
     if (a >= b) {
         /* No selection: take the WORD the caret is in or against, the way every
-         * editor with a bold button does. The old behaviour — insert the pair
-         * and sit between them — is what left markdown residue all over the
-         * composer: with the caret after "hello" it produced "hello**", which
-         * cannot parse (MARKDOWN.md §2's word-boundary rule), so it did not
-         * hide, and two asterisks nobody typed stayed on screen. Pressing B on
-         * a word now bolds the word. */
+         * editor with a bold button does. The scan stops at INVISIBLE
+         * characters as well as spaces — a word at the edge of a formatted run
+         * must not swallow that run's delimiters into itself, which is how a
+         * second press at the end of freshly-typed bold once wrapped the
+         * closing delimiter in another pair. */
         int ws = a, we = a;
-        while (ws > 0 && !ed_is_space(g_ed[ws - 1])) ws--;
-        while (we < g_ed_len && !ed_is_space(g_ed[we])) we++;
+        while (ws > 0 && !ed_is_space(g_ed[ws - 1]) && !ed_char_hidden(ws - 1)) ws--;
+        while (we < g_ed_len && !ed_is_space(g_ed[we]) && !ed_char_hidden(we)) we++;
         if (we > ws) { a = ws; b = we; }
         else {
-            /* Genuinely nothing to wrap — in whitespace or an empty composer.
-             * The pair with the caret between it is then the ONLY thing the
-             * press can mean ("start typing bold here"), and typing makes it
-             * parse immediately. */
-            g_ed_caret = g_ed_anchor = a;
-            ed_insert_n(d, dl);
-            ed_insert_n(d, dl);
-            g_ed_caret = g_ed_anchor = (a + dl <= g_ed_len) ? a + dl : g_ed_len;
+            /* Genuinely nothing to wrap — whitespace, or an empty composer.
+             * Inserting an empty pair here left it VISIBLE (an empty pair
+             * cannot parse), so the press now arms a PENDING style instead:
+             * the first character typed arrives already wrapped, and pressing
+             * the button again before typing disarms it. If a continuation
+             * for this very style is armed (bold, space, bold off again), the
+             * press ends the continuation. */
+            if (g_ed_cont && dl == 1) {
+                int w = g_ed_caret;
+                while (w > 0 && (g_ed[w - 1] == L' ' || g_ed[w - 1] == L'\t')) w--;
+                if (w > 0 && ed_char_hidden(w - 1) == ED_H_CLOSE && g_ed[w - 1] == d[0]) {
+                    g_ed_cont = 0;
+                    return;
+                }
+            }
+            for (int i = 0; i < g_ed_n_pending; i++)
+                if (g_ed_pending[i] == d[0]) {
+                    memmove(&g_ed_pending[i], &g_ed_pending[i + 1],
+                            (size_t)(g_ed_n_pending - i - 1) * sizeof(WCHAR));
+                    g_ed_n_pending--;
+                    return;
+                }
+            if (g_ed_n_pending < 4 && dl == 1) g_ed_pending[g_ed_n_pending++] = d[0];
             return;
         }
         /* The word may already be wrapped — "*hello*" with the caret in it is
@@ -10467,12 +10585,93 @@ static void ed_fmt_inline(const WCHAR *d) {
             return;
         }
     }
-    /* The closer first, so the opener's offset is still the one we measured. */
-    g_ed_caret = g_ed_anchor = b; ed_insert_n(d, dl);
-    g_ed_caret = g_ed_anchor = a; ed_insert_n(d, dl);
-    g_ed_anchor = a + dl;               /* leave the text selected, not the markup,
-                                         * so a second press is the undo */
-    g_ed_caret  = (b + dl <= g_ed_len) ? b + dl : g_ed_len;
+
+    /* The range sits INSIDE a larger run of this style: the press means "take
+     * the style off this piece", so the run is SPLIT around it — close before
+     * it, reopen after it — dropping whichever half comes out empty. This is
+     * what un-bolding a word in the middle of a bold sentence means in every
+     * rich editor; wrapping again here would nest same-style delimiters, which
+     * the dialect reads as literal characters on screen. */
+    if (dl == 1) {
+        int op = -1, cl = -1;
+        if (ed_enclosing_run(a, b, d[0], &op, &cl)) {
+            int op0 = op, cl1 = cl + 1;
+            while (op0 > 0 && ed_char_hidden(op0 - 1) && g_ed[op0 - 1] == d[0]) op0--;
+            while (cl1 < g_ed_len && ed_char_hidden(cl1) && g_ed[cl1] == d[0]) cl1++;
+            int run = op - op0 + 1;
+            int la_end = a;                       /* left half content end */
+            while (la_end > op + 1 && ed_is_space(g_ed[la_end - 1])) la_end--;
+            int rb = b;                           /* right half content start */
+            while (rb < cl && ed_is_space(g_ed[rb])) rb++;
+            int left_has  = la_end > op + 1;
+            int right_has = rb < cl;
+            /* Right side first, so the left offsets stay the ones measured. */
+            if (right_has) {                       /* reopen before the rest */
+                g_ed_caret = g_ed_anchor = rb;
+                for (int k = 0; k < run; k++) ed_insert_n(d, 1);
+            } else {                               /* nothing follows: closer goes */
+                ed_delete_range(cl, cl1);
+            }
+            if (left_has) {                        /* close after the lead-in */
+                g_ed_caret = g_ed_anchor = la_end;
+                for (int k = 0; k < run; k++) ed_insert_n(d, 1);
+            } else {                               /* nothing precedes: opener goes */
+                ed_delete_range(op0, op0 + run);
+            }
+            /* The now-plain text, at its shifted offsets: reselected when the
+             * press came from a selection, a bare caret at its end otherwise. */
+            {
+                int shift = left_has ? run : -run;
+                g_ed_caret = b + shift;
+                if (g_ed_caret > g_ed_len) g_ed_caret = g_ed_len;
+                g_ed_anchor = had_sel ? a + shift : g_ed_caret;
+                if (g_ed_anchor < 0) g_ed_anchor = 0;
+            }
+            return;
+        }
+    }
+
+    /* Absorb same-style delimiters the range touches: toggling bold across a
+     * range that is already partly bold makes the WHOLE range bold, as a rich
+     * editor does. The hidden map is snapshotted first — deleting one half of
+     * a pair makes its partner visible mid-loop, and the partner must still be
+     * recognised as absorbed markup rather than kept as text. A partner left
+     * OUTSIDE the range becomes an orphan, which the repair pass deletes. */
+    if (dl == 1) {
+        if (!g_ed_hidden_valid) ed_hidden_build();
+        static unsigned char inh[ED_MAX + 1];
+        memcpy(inh, g_ed_hidden, (size_t)g_ed_len);
+        for (int i = b - 1; i >= a; i--)
+            if (inh[i] && g_ed[i] == d[0]) { ed_delete_range(i, i + 1); b--; }
+    }
+
+    /* Wrap — one line's segment at a time, because a run cannot cross a line
+     * break (MARKDOWN.md §2.2): wrapping a multi-line selection whole would
+     * produce a pair that never parses and immediately repairs itself away,
+     * a button that visibly does nothing. */
+    {
+        int segs[16][2], nseg = 0, i2 = a;
+        while (i2 < b && nseg < 16) {
+            int e3 = i2;
+            while (e3 < b && g_ed[e3] != L'\n') e3++;
+            int s3 = i2, t3 = e3;
+            while (s3 < t3 && ed_is_space(g_ed[s3])) s3++;
+            while (t3 > s3 && ed_is_space(g_ed[t3 - 1])) t3--;
+            if (t3 > s3) { segs[nseg][0] = s3; segs[nseg][1] = t3; nseg++; }
+            i2 = e3 + 1;
+        }
+        for (int k = nseg - 1; k >= 0; k--) {
+            g_ed_caret = g_ed_anchor = segs[k][1]; ed_insert_n(d, dl);
+            g_ed_caret = g_ed_anchor = segs[k][0]; ed_insert_n(d, dl);
+        }
+        if (nseg) {
+            /* INSIDE the final closer — one short of past it, or the range a
+             * second press sees is off by the delimiter and leaves an orphan. */
+            g_ed_caret = segs[nseg - 1][1] + (2 * nseg - 1) * dl;
+            if (g_ed_caret > g_ed_len) g_ed_caret = g_ed_len;
+            g_ed_anchor = had_sel ? segs[0][0] + dl : g_ed_caret;
+        }
+    }
 }
 
 /* The block marker already on the line starting at `p`, if any: its offset and
@@ -10568,6 +10767,14 @@ static void ed_fmt_block(int kind) {
  * way for a multi-line selection.
  */
 static void ed_newline(void) {
+    /* Enter at the back edge of a formatted run: the newline goes OUTSIDE the
+     * closer — a run cannot cross a line (MARKDOWN.md §2.2), and inserting it
+     * inside stopped the closer parsing and un-formatted the line above. */
+    if (!ed_has_sel() && g_pref_richtext) {
+        int cr = ed_closer_run_at(g_ed_caret);
+        if (cr > 0) g_ed_caret = g_ed_anchor = g_ed_caret + cr;
+    }
+    ed_intent_clear();
     int ls = g_ed_caret, le = g_ed_caret, at = 0, len = 0, kind = -1, i, empty = 1;
     while (ls > 0 && g_ed[ls - 1] != L'\n') ls--;
     while (le < g_ed_len && g_ed[le] != L'\n') le++;
@@ -10898,6 +11105,62 @@ static int ed_char(HWND hwnd, WCHAR ch) {
     if (ch == L'\t') return 1;               /* Tab is navigation, never text */
     if (ch < 0x20 && ch != L'\n') return 1;  /* control chars: eaten, not inserted */
     WCHAR s[2] = { ch, 0 };
+    if (!ed_has_sel() && g_pref_richtext) {
+        if (ch == L' ' || ch == L'\n') {
+            /* Whitespace at the back edge of a formatted run: the dialect
+             * cannot hold it against the closer (MARKDOWN.md §2), so it goes
+             * OUTSIDE — and for a space, the CONTINUATION arms, so the next
+             * word pulls the formatting forward. A newline ends the run
+             * outright: a run cannot cross a line. Before this, the space
+             * landed inside, stopped the closer parsing, and the orphan
+             * repair silently unbolded what you were mid-way through typing. */
+            int cr = ed_closer_run_at(g_ed_caret);
+            if (cr > 0) {
+                g_ed_caret = g_ed_anchor = g_ed_caret + cr;
+                ed_insert(s);
+                g_ed_cont = (ch == L' ');
+                ed_changed(hwnd);
+                return 1;
+            }
+            if (ch == L'\n') g_ed_cont = 0;
+        } else {
+            if (g_ed_cont) {
+                /* The word after the gap: pull the closer run forward over the
+                 * whitespace so this character lands back inside the run. */
+                int w = g_ed_caret;
+                while (w > 0 && (g_ed[w - 1] == L' ' || g_ed[w - 1] == L'\t')) w--;
+                int cr = 0;
+                while (w - cr > 0 && ed_char_hidden(w - cr - 1) == ED_H_CLOSE) cr++;
+                if (w < g_ed_caret && cr > 0 && cr <= 8) {
+                    WCHAR run[8];
+                    int tgt = g_ed_caret - cr;
+                    for (int i = 0; i < cr; i++) run[i] = g_ed[w - cr + i];
+                    ed_begin_edit();
+                    ed_delete_range(w - cr, w);
+                    g_ed_caret = g_ed_anchor = tgt;
+                    ed_insert_n(s, 1);
+                    ed_insert_n(run, cr);
+                    g_ed_caret = g_ed_anchor = g_ed_caret - cr;
+                    ed_changed(hwnd);
+                    return 1;
+                }
+                g_ed_cont = 0;                 /* the pattern is gone; disarm */
+            }
+            if (g_ed_n_pending) {
+                /* The style(s) toggled on with nothing to wrap: the first
+                 * character arrives already wrapped, caret inside. */
+                int np = g_ed_n_pending;
+                ed_begin_edit();
+                for (int i = 0; i < np; i++) ed_insert_n(&g_ed_pending[i], 1);
+                ed_insert_n(s, 1);
+                for (int i = np - 1; i >= 0; i--) ed_insert_n(&g_ed_pending[i], 1);
+                g_ed_caret = g_ed_anchor = g_ed_caret - np;
+                g_ed_n_pending = 0;
+                ed_changed(hwnd);
+                return 1;
+            }
+        }
+    }
     if (!ed_has_sel()) g_ed_caret = g_ed_anchor = ed_caret_for_typing();
     ed_insert(s);
     ed_changed(hwnd);
@@ -10952,6 +11215,7 @@ static int ed_key(HWND hwnd, WPARAM vk) {
      * ends in, as it would in any rich editor. */
     case VK_END:  g_ed_caret = ed_canon(g_ed_len); moved = 1; break;
     case VK_BACK:
+        ed_intent_clear();
         if (ed_has_sel()) { ed_begin_edit(); ed_delete_range(ed_sel_lo(), ed_sel_hi()); }
         else if (g_ed_caret > 0) {
             ed_begin_edit();
@@ -10963,6 +11227,7 @@ static int ed_key(HWND hwnd, WPARAM vk) {
         }
         changed = 1; break;
     case VK_DELETE:
+        ed_intent_clear();
         if (ed_has_sel()) { ed_begin_edit(); ed_delete_range(ed_sel_lo(), ed_sel_hi()); }
         else if (g_ed_caret < g_ed_len) {
             ed_begin_edit();
@@ -11016,6 +11281,7 @@ static int ed_key(HWND hwnd, WPARAM vk) {
     }
 
     if (moved) {
+        ed_intent_clear();               /* the intent described the OLD caret */
         if (!shift) g_ed_anchor = g_ed_caret;
         ed_invalidate_layout();          /* the composition splice moves with the caret */
         g_ed_blink = GetTickCount64();
@@ -11047,6 +11313,7 @@ static int ed_hit(float x, float y) {
 static int ed_mouse_down(HWND hwnd, float x, float y) {
     if (!in_rect(g_ed_box, x, y)) return 0;
     ed_focus(hwnd);
+    ed_intent_clear();
     g_ed_caret = g_ed_anchor = ed_canon(ed_hit(x, y));
     g_ed_dragging = 1;
     SetCapture(hwnd);
@@ -16549,6 +16816,17 @@ static void test_poll(HWND hwnd) {
             WCHAR w[1024]; to_w(arg, w, 1024);
             ed_set(w);
             ac_rebuild();
+            test_ack("ok");
+        }
+    } else if (!strcmp(verb, "typekeys")) {
+        /* Through the REAL character path (WM_CHAR -> ed_char), one keystroke
+         * at a time — unlike `type`, which SETS the buffer. The rich-mode
+         * typing rules (pending styles, continuation across spaces, whitespace
+         * stepping outside a closer) live in ed_char, so only this verb can
+         * exercise them; `type` bypasses everything they exist to do. */
+        {
+            WCHAR w[1024]; to_w(arg, w, 1024);
+            for (int i = 0; w[i]; i++) SendMessageW(hwnd, WM_CHAR, (WPARAM)w[i], 0);
             test_ack("ok");
         }
     } else if (!strcmp(verb, "dirfind")) {
