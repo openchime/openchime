@@ -143,8 +143,8 @@ URL exactly as it steps over a code span — so an `_` in a path cannot end an
 italic run that opened before it.
 
 REQ-222's **unfurl** (fetching a title and thumbnail for a link) is a different
-feature and remains unbuilt: it needs a server-side fetcher, and it is a backlog
-item rather than a property of this dialect.
+feature and remains unbuilt: it needs a server-side fetcher, and it is tracked
+as open work rather than being a property of this dialect.
 
 **No underline.** Slack's toolbar offers it; its `mrkdwn` has no syntax for it,
 and an underline is indistinguishable from a link in most renderings.
