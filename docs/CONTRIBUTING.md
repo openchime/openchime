@@ -5,19 +5,35 @@ The branch, commit, and CI policy for this repo. The private control-plane repo
 
 ## Branches & merging
 
-- **Trunk-based.** `main` is always releasable and kept **linear**.
-- **Non-trivial changes** (any code, or structural/multi-file docs) happen on a
-  **short-lived branch** named descriptively in kebab-case for the change:
-  `message-management`, `tuikit-phase-4`.
-- **Docs-only changes** may go straight to `main` (they skip CI via
-  `paths-ignore`) or use a branch — either is fine.
-- **Gate merges on CI.** Push the branch, **wait for its CI to pass**, then
-  **fast-forward merge** to `main`. Because a fast-forward puts the *identical*
-  commit on `main`, a green branch keeps `main` green.
-- **Fast-forward only** (no merge commits) → linear history. After merging,
-  **delete the branch** (local + remote).
-- **PRs are optional** — use one for a review record or branch protection; merge
-  only after checks pass.
+- **`staging` is the integration branch.** All feature work lands on `staging`
+  through a pull request; `main` receives staging's history when it is
+  promoted. *(This supersedes the trunk-on-`main` flow this file used to
+  describe. The old text outlived the practice, and a session followed it
+  faithfully into the wrong branch — which is exactly the failure a stale
+  workflow document produces, and why the change is now written down.)*
+  Promotion of `staging` to `main` is not yet mechanised; until it is, nothing
+  lands on `main` directly except docs-only changes.
+- **Every feature has exactly one GitHub issue**, and its branch is named for
+  it: `feature/oc-<issue number>-<short-kebab-description>`, cut from a clean,
+  current `staging`. The repo's `/oc-feature-start` command runs the preflight
+  (clean tree, `staging` in sync with origin, no branch already carrying the
+  issue) and refuses rather than repairs.
+- **Land by pull request to `staging`,** squashed to a **single** house-format
+  commit whose message cites the issue — `Closes` plus its number when the
+  merge should close it. Note GitHub auto-closes only from the default branch,
+  so closing the issue on a merge to `staging` is a deliberate act, done with a
+  short comment saying what landed. The PR body stays **empty**: the issue and
+  the commit already say everything. `/oc-feature-pr` runs the sequence: tests
+  clean with zero warnings, squash, push (`--force-with-lease` after a squash
+  is the one acceptable force-push, and only ever on a `feature/*` branch),
+  raise the PR.
+- **Gate merges on CI.** Merge only when every check on the pull request is
+  green, with a **rebase merge** — no merge commits, history stays linear.
+  Delete the branch, local and remote, after.
+- **Docs-only changes still go straight to `main`** (they skip the build jobs
+  via `paths-ignore`; the attribution guard runs on every push regardless).
+- **Sign off every commit** (`git commit -s`) — the DCO applies to every path
+  into the tree, including a cherry-pick.
 - **One logical change per branch.**
 
 ## Commits
