@@ -26,11 +26,9 @@ replaces the DND window, and keywords + priority people; **0036** (§3ab) thread
 follows and per-thread read cursors; **0037** the attachment idempotency token;
 **0038** (§3ac) link unfurls.
 
-*Corrected: an earlier revision of this line said presence, notification config,
-and attachments were "intentionally not here yet." Notification config landed in
-0012 and attachments in 0009. **Presence and typing remain deliberately
-schema-less** — they are ephemeral in-memory net-thread state by design
-(ARCH-67/68) and will never get a table.*
+*Presence and typing are deliberately
+schema-less — ephemeral in-memory net-thread state by design
+(ARCH-67/68) — and will never get a table.*
 
 Section ordering note: §3 onward is numbered by the migration's *documentation*
 section rather than strictly by migration number, so the attachment-tombstone
@@ -75,8 +73,7 @@ Foreign keys are declared for integrity; the daemon runs with
 ### `users`
 A tenant user, provisioned by **either** auth mode (REQ-023) — `subject` is the
 unique identity key, namespaced by source: `local:<username>` or
-`oidc:<issuer>|<sub>` (ARCH-19; an earlier revision of this line said "resolved
-from the OIDC token," which predates local mode). `id` is the tenant-local
+`oidc:<issuer>|<sub>` (ARCH-19). `id` is the tenant-local
 `user_id` carried in `AUTH_OK` and `BROADCAST.author_id`. Columns added by later
 migrations — `role`/`avatar_key` (0002), `disabled` (0003), and the DND window
 (0012) — are documented in their own sections below.
@@ -196,10 +193,10 @@ and extends `users`. Appended as `MIGRATION_0002` + a `{ 2, ... }` entry in
 `ALTER TABLE ADD COLUMN` (SQLite-supported; existing rows default).
 
 ### `users` — read path (REQ-289)
-`title`, `timezone`, `status_emoji` and `status_text` now travel on `USER_LIST`
-as well as `PROFILE_INFO`. They always existed; `PROFILE_INFO` is sent only to the
-user who edited them, so no client learned anyone else's — which is why the
-profile card claimed the fields were not built. Expired status reads as absent
+`title`, `timezone`, `status_emoji` and `status_text` travel on `USER_LIST`
+as well as `PROFILE_INFO` — `PROFILE_INFO` is sent only to the
+user who edited them, so the roster is the one place every client learns
+everyone else's. Expired status reads as absent
 here too, applying `build_profile`'s rule in the second place that needs it.
 
 ### `users` (added columns)
@@ -461,10 +458,10 @@ Server-authoritative notification settings, synced across a user's devices.
   push, not in-app unread.
 - `tz_offset_min` (INTEGER) — minutes east of UTC. A per-weekday window is only
   meaningful on the user's local calendar day, and the daemon cannot resolve an
-  IANA zone per push (ARCH-103). **The client writes it only as part of
-  `SET_SCHEDULE`**, so it is refreshed when the user edits their schedule and at
-  no other time; ARCH-103's stated design of a connect-time refresh is not built,
-  and a stale offset is a tracked defect rather than a property of this column.
+  IANA zone per push (ARCH-103). **The app-core refreshes it on every connect**
+  (`SET_TZ_OFFSET`, sent straight after `AUTH_OK` so no frontend has to
+  remember to), and it also rides `SET_SCHEDULE` — so travel and
+  daylight-saving turnover correct themselves at the next connect.
 
 ### `notify_schedule` (migration 0034)
 - `(user_id, weekday)` (PK), `enabled`, `start_min`, `end_min` — used by
@@ -588,13 +585,12 @@ Adds `channels.dm_key` and a **partial unique index** over it
   `"1,2"` for a pair. Written by `process_open_dm` and matched with one indexed
   probe.
 
-*Why.* A DM used to be identified by its membership rows — a count-join asserting
-"exactly these participants". That was correct but fragile: **anything that
-deleted a membership row left a DM the lookup could no longer match**, so the next
-`OPEN_DM` created a *duplicate conversation*. `remove_user` did exactly that, for
-DMs as well as named channels. Making the participant set a unique key means the
-duplicate state cannot be represented at all, rather than being prevented by
-every write path remembering to.
+*Why.* A DM identified only by its membership rows — a count-join asserting
+"exactly these participants" — is fragile: **anything that deletes a membership
+row leaves a DM the lookup can no longer match**, and the next
+`OPEN_DM` creates a *duplicate conversation*. Making the participant set a
+unique key means the duplicate state cannot be represented at all, rather than
+being prevented by every write path remembering to.
 
 The backfill uses `MIN`/`MAX` rather than `group_concat`, whose ordering SQLite
 does not guarantee — the key must be byte-identical to the one the daemon
@@ -615,11 +611,10 @@ Adds a **partial unique index** on `lower(name)` `WHERE kind='channel'`, so two
 `#test` channels cannot coexist and `#Test` cannot shadow `#test`. DMs are
 excluded because their `name` is legitimately NULL.
 
-*Why.* `process_create_channel` inserted unconditionally — there was no
-duplicate-name check anywhere — so the workspace accumulated same-named channels
-that were indistinguishable in the sidebar. This is the same defect class as
+*Why.* Without the index, same-named channels accumulate and are
+indistinguishable in the sidebar. This is the same defect class as
 §3o: the constraint belongs in the schema, where it cannot be forgotten, rather
-than in the one write path that happens to remember it. The daemon now also
+than in the one write path that happens to remember it. The daemon also
 pre-checks and returns `CHANNEL_EXISTS` (3017) so the client gets a usable
 message instead of a constraint failure.
 
@@ -659,7 +654,7 @@ the channel's membership, which is already a table.
 *Rows are written by the daemon at send time*, resolving each name
 case-insensitively against `users JOIN channel_members` for that channel — a name
 that is not a member of the channel is not a mention, so nobody is notified about
-a message they cannot open. `remove_user` (REQ-025) deletes a departing user's
+a message they cannot open. `remove_user` (REQ-033) deletes a departing user's
 mention rows before their messages, in the dependency order §3p established.
 
 ---
@@ -683,7 +678,7 @@ per-user and private; the two read alike in a menu and are opposite in the
 schema.
 
 *`pinned_by` is nullable* for the same reason: it is attribution, not ownership,
-and the pin must survive the account that placed it. Removing a user (REQ-025)
+and the pin must survive the account that placed it. Removing a user (REQ-033)
 disables rather than deletes the row (§3), so this does not dangle in practice —
 but a DM's pins are deleted along with its messages, in the dependency order
 §3p established.
@@ -973,8 +968,8 @@ Tracked here so the omissions are deliberate, not forgotten:
 - **Thread notifications** (REQ-061) — still deferred. Its dependency, @mentions
   (REQ-221), is now built (§3q), so what remains is deciding *when a reply
   notifies a thread's participants*, not the mention machinery underneath it.
-- **Polls** (REQ-225) — forward scope, no ARCH decision and no schema. (**Link
-  unfurls** left this list with migration 0038, §3ac.) **Snippets** (REQ-226) have half of what they need:
+- **Polls** (REQ-225) — forward scope, no ARCH decision and no schema.
+  **Snippets** (REQ-226) have half of what they need:
   fenced code blocks parse and render (REQ-220), but a titled snippet *object*
   does not exist.
 - **Retention policy** (REQ-250) — opt-in message ageing, distinct from REQ-217's
@@ -982,21 +977,5 @@ Tracked here so the omissions are deliberate, not forgotten:
 - **Legal hold** (REQ-252), **compliance capture** (REQ-276) and **DLP**
   (REQ-277) — scoped in REQUIREMENTS.md, no schema.
 
-  *Off this list since it was written:* rich text needs no schema at all (it is
-  in-band in the body, ARCH-100); saved items are §3u; permalinks are ids plus a
-  history mode, not storage (ARCH-96); profiles are §3w; drafts, scheduled send,
-  starred/sections, mark-unread and mute are §3z/§3aa/§3v and `client_settings`.
 - **Screenshare** (REQ-161) — needs no schema; it is ephemeral media state on the
   same relay path as audio (ARCH-86, [VIDEO.md](./VIDEO.md)).
-
-(Previously listed here and **now built**: roles, sessions/revocation, local
-credentials, delivery cursors, server identity, and attachment metadata
-(migrations 0002, 0007–0009); **@mentions** (migration 0021, ARCH-89) and
-**pins** (migration 0022, ARCH-90), both of which were "forward scope, no ARCH
-decision" above until this week; the **channel files listing** (REQ-143) needed
-only an index (migration 0023) and the **channel member listing** (REQ-031) no
-migration at all; **push device tokens** for APNs/FCM (migration 0018,
-ARCH-85) — the notification *settings* they are gated by are migration 0012.
-**Audio** call state (REQ-150–152) was correctly predicted to need no schema: the
-roster is ephemeral net-thread state (ARCH-73). **Presence/typing** (REQ-120/121)
-likewise stayed in-memory by design, ARCH-67/68.)

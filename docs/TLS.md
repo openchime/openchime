@@ -32,7 +32,7 @@ overhead. The final binaries already link `-lpthread`.
 
 **Why vendored, not the distro package:** Ubuntu ships mbedTLS 2.28 and Alpine
 ships 3.6.x, whose APIs are not source-compatible. Pinning one version from
-source gives local, CI, and the Docker image an identical library and avoids
+source gives local, CI, and the container image an identical library and avoids
 `#ifdef` version shims. The client's TUI libraries (termbox2, utf8proc) are
 likewise vendored — as committed single-file source, both MIT (ARCH-75).
 
@@ -52,7 +52,7 @@ likewise vendored — as committed single-file source, both MIT (ARCH-75).
   new cert). The client therefore does not enforce the pin for loopback
   (`client/core/net.c:is_loopback`), matching how tools skip TLS verification for
   localhost. Remote workspaces are always pinned; if a remote cert genuinely
-  changes, the client now reports that distinctly ("the server's security
+  changes, the client reports that distinctly ("the server's security
   certificate has changed") rather than "could not reach the server", so the user
   can forget the workspace to re-pin.
 - **Fingerprint** = SHA-256 of the certificate DER; it may be published
@@ -67,8 +67,8 @@ matches the pin. After the handshake, `oc_tls_handshake` inspects
 `mbedtls_ssl_get_verify_result()`: a pinned mismatch leaves `BADCERT_NOT_TRUSTED`
 set and the connection is rejected. A **server** connection performs no peer
 verification, so its result is exactly `BADCERT_SKIP_VERIFY`, which is masked off
-— everything else is a real failure. (Both of these were live bugs found while
-building `shared/tls.c`; the test guards against regressions.)
+— everything else is a real failure. (The test guards both rules against
+regression.)
 
 ## Non-blocking integration
 

@@ -1,18 +1,17 @@
 # OpenChime — Client
 
 The client's architecture and how it's built. Cross-referenced from
-ARCHITECTURE.md (ARCH-11, **ARCH-74**, and the superseded ARCH-12/62/63/65) and
+ARCHITECTURE.md (ARCH-11, **ARCH-74**) and
 PROTOCOL.md (the wire flow the core drives).
 
 **Direction (ARCH-74).** The client is **one shared C app-core with a native UI
 per platform** — the *tdlib* model — chosen for real native feel over a
-custom-rendered single UI. The earlier raylib + `gfx.h` + HarfBuzz plan is
-dropped; there is no shared rendering layer, because each platform's OS shapes
-its own text and provides its own widgets.
+custom-rendered single UI. There is no shared rendering layer, because each
+platform's OS shapes its own text and provides its own widgets.
 
-**Status.** Building the app-core + a **TUI** frontend first (the fastest usable,
-CI-testable client). Native GUIs (Win32, GTK, AppKit, Android, a web DOM UI)
-and mobile follow.
+**Status.** The app-core, the **TUI** and the **Win32 GUI** (the reference
+client) are built. Further native GUIs (GTK, AppKit, Android, a web DOM UI)
+and mobile follow, in the fixed frontend order of §8.
 
 ---
 
@@ -24,7 +23,7 @@ client/core/   the app-core — frontend-agnostic, headless-testable C:
                net thread + session + credential store + the view-model
                (channels, messages, roster, presence, unread) + reducers
 client/tui/    terminal frontend over the core                (first frontend)
-client/gui/win32/  the native Win32 GUI over the same core    (in progress)
+client/gui/win32/  the native Win32 GUI over the same core    (reference client)
 client/shared/ assets shared by graphical frontends (baked Lucide icon paths)
 [client/gui/gtk, client/gui/mac, ...]  further native GUIs    (later)
 ```
@@ -92,14 +91,13 @@ model; translate input to intents }, stop.
   wide-character / emoji width**, so emoji reactions (REQ-070/071) and wrapped
   messages don't corrupt the layout — utf8proc's `utf8proc_charwidth` + UAX #29
   segmentation (with bundled UCD tables) gives us that without hand-rolling.
-  **notcurses was rejected on licensing** — it hard-depends on libunistring
+  **notcurses is rejected on licensing** — it hard-depends on libunistring
   (LGPL); termbox2 + utf8proc keep the whole client permissive. **The TUI is
   text-only and never renders graphics — no images, ever.** Built on the host
   like the daemon (`make tui`), zero transitive dependencies. The widget/
   formatting layer above termbox2 is the in-tree **`tuikit`** toolbox (ARCH-83,
   [TUIKIT.md](./TUIKIT.md)): panels, modal lists, a command palette, text
-  prompts, and a 256-color theme. The menu/screen-driven redesign built on it
-  has shipped and replaced the slash-command UX.
+  prompts, and a 256-color theme.
 
   **Interaction model — modeless and menu-driven, not slash-command-driven.**
   The input line is always ready to type a message (Enter sends only); every
@@ -122,8 +120,8 @@ model; translate input to intents }, stop.
   drawn cell-by-cell, re-laid-out on resize, measuring glyph width with utf8proc.
   **Navigation mode** (Esc from the composer, or Tab on an empty composer): a
   panel is focused (bright border); Tab cycles Channels / Messages / Members,
-  the arrow keys move a highlighted selection (`j`/`k` were dropped with the
-  tuikit redesign), Esc returns to the composer. On the Messages
+  the arrow keys move a highlighted selection (there are no `j`/`k`
+  bindings), Esc returns to the composer. On the Messages
   panel, Enter opens an action menu (Reply in thread / Add reaction / Download /
   Edit / Delete / Who reacted); single-key accelerators act directly: `t`
   thread, `r` react (opens a filterable emoji picker), `e` edit (prefills the
@@ -157,9 +155,8 @@ model; translate input to intents }, stop.
   Win32 client identifies as, so
   frontends never step on each other. The TUI pulls the daemon bucket on connect
   and layers it over the machine-local `~/.config/openchime/config` file. Most
-  display prefs are read-only there — the interactive `/set` writer went with the
-  slash-command UX, so editing the file is how they change — but the TUI **does**
-  write one thing back: its sidebar sort, filter and collapse state, persisted
+  display prefs are read-only there — editing the file is how they change — but
+  the TUI **does** write one thing back: its sidebar sort, filter and collapse state, persisted
   through `oc_client_set_setting`. Which server you connect to
   (`workspace`) is deliberately machine-local and never synced.
   **Storage report (REQ-214):** the launcher's "Storage usage" opens an admin overlay showing free
@@ -194,10 +191,10 @@ model; translate input to intents }, stop.
   context-aware completions — `#channel` names, `@user` names, and `:emoji:`
   shortcodes (inserting the real Unicode emoji). Tab accepts the first and
   cycles; on an empty composer Tab enters navigation mode.
-  **Build order:** the lean core loop landed first (sidebar, focus/switch, history
+  **Feature surface**, over the lean core loop (sidebar, focus/switch, history
   backfill on open, live messages + display names, send, unread, scrollback,
-  reflow, per-nick colors), then each of the following surfaced one engine feature
-  already on the wire —
+  reflow, per-nick colors) — each of the following surfaces one engine feature
+  on the wire —
   - **reactions** — emoji aggregates with a `[n]` "you reacted" marker; `r` on a
     selected message (the emoji picker) or the message menu's "Add reaction"
     toggles a reaction (exercising the wide-char/emoji correctness that justified
@@ -219,7 +216,7 @@ model; translate input to intents }, stop.
     own presence.
   - **direct messages** — `n` in the Members pane (or a member menu's "Message")
     opens a 1:1 DM, titled `@peer` in the sidebar (the daemon reports the DM peer
-    in `CHANNEL_INFO` — a small protocol addition).
+    in `CHANNEL_INFO`).
   - **logout** — the launcher's "Log out" revokes this session server-side and
     quits once the connection drops.
   - **who-reacted** — `w` on a selected message (or the message menu's "Who
@@ -235,7 +232,7 @@ model; translate input to intents }, stop.
     member's read cursor to the others as `READ_CURSOR`, and the TUI renders a
     dim "✓ seen by …" footer under the last message naming everyone (bar you)
     who has read up to it.
-  - **self-service profile (REQ-020)** — the launcher's "Your profile" opens a
+  - **self-service profile (REQ-240)** — the launcher's "Your profile" opens a
     modal with your name, role, id, and presence; "Change display name" renames
     you (the daemon fans a `PROFILE_UPDATED` so every roster — and your own header
     — updates live); "Change password" rotates your local password (the server
@@ -249,9 +246,8 @@ model; translate input to intents }, stop.
     shown once atop the overlay, like an invite) — REQ-170, CREATE/LIST_WEBHOOK.
     **Deleting a webhook is not surfaced**: the core exposes
     `oc_client_delete_webhook` and the daemon handles `DELETE_WEBHOOK`, but the
-    overlay is read-only and its header still shows a stale `/webhook` slash-command
-    hint left over from the removed slash UX (both are known bugs, and
-    tracked).
+    overlay is read-only, and its header shows a `/webhook` hint that
+    corresponds to no command (both are known gaps, and tracked).
   - **attachments** — the launcher's "Upload a file" streams a local file through
     the daemon (UPLOAD_BEGIN → CHUNKs within the advertised window → END → OK) and
     links it into a message; the message menu's "Download file" saves an
@@ -260,16 +256,13 @@ model; translate input to intents }, stop.
     (id, filename, mime, size), rendered as a `📎 name (size) #id` line.
     Text-only, so files are never rendered inline (REQ-140/141).
 
-  **The TUI reaches a minority of the app-core today.** It was the reference
-  client until the July 2026 engine and GUI work; since then the core has roughly
-  doubled and the TUI has not followed, so **most `oc_client_*` entry points have
-  no TUI caller** — pins, saved items, the activity feed, the channel member and
+  **The TUI reaches a minority of the app-core today** — **most `oc_client_*`
+  entry points have no TUI caller** — pins, saved items, the activity feed, the channel member and
   file listings, mute, the notification default, group DMs, custom emoji, status
   and profile fields, drafts, scheduling, threads-follow, the People directory,
   search operators and paging, and webhook delete among them. The frontend order
   (all of Win32 first) makes that an accepted consequence rather than a defect;
-  the itemised list is the [issue tracker](https://github.com/openchime/openchime/issues). `oc_client_set_setting`, once
-  recorded here as callerless, **is called by both frontends** — the TUI persists
+  the itemised list is the [issue tracker](https://github.com/openchime/openchime/issues). `oc_client_set_setting` **is called by both frontends** — the TUI persists
   its sidebar sort/filter/collapse through it and the Win32 client its
   preferences.
 
@@ -288,22 +281,20 @@ model; translate input to intents }, stop.
   **the composer**, and every menu) and **native controls where they still earn
   their keep**: `EDIT` boxes (find, search, files-search, sign-in, palette, the
   form fields), the file picker, and the window frame. No WinUI, no .NET, no C++,
-  no cross-platform toolkit (ARCH-80/82). The composer and the context menus were
-  native once and are not any more — ARCH-98 took them back, so **`RichEdit`,
+  no cross-platform toolkit (ARCH-80/82). The composer and every menu are
+  drawn into the scene (ARCH-98), so **`RichEdit`,
   `TrackPopupMenu`, `CreatePopupMenu` and `AppendMenuW` appear nowhere in the
-  client**. The **Windows TUI** already shipped and validated the core port —
+  client**. The **Windows TUI** (ARCH-81) validates the core port —
   pthreads, DNS SRV, sockets — via a termbox2-API layer over the Windows Console
-  API (ARCH-81, done), so the GUI proceeds against a trusted core. Two earlier
-  GUI drafts were built and rejected (ARCH-82): a comctl32 GUI (too dated) and a
-  self-rendered Clay+raylib GUI (non-native, perpetually lags). **The GUI is
+  API, so a GUI bug is unambiguously a GUI bug. **The GUI is
   affordance-driven — buttons/menus/dialogs/drag-drop, never slash commands**
-  (those belong to the TUI).
+  (those do not exist anywhere; the TUI is menu-driven too, ARCH-83).
 
   **Shell layout.** A **global left-nav rail** (Lucide icons stroked as D2D path
   geometry) holds the workspace avatar → switcher, six primary views (Home, DMs,
   Activity, Files, Later, Admin — the last owner/admin-gated, with a "More"
   overflow flyout), and a bottom cluster of New (+) / profile avatar.
-  Three custom D2D dropdowns replace the old native app menu — **workspace**
+  Three custom D2D dropdowns hang off the rail — **workspace**
   (invite, preferences, storage/audit, reconnect, sign out / sign out
   everywhere), **profile** (presence, DND, display name, password), and **New**
   (channel, DM, upload, search). Right of the rail sits the channel column
@@ -462,91 +453,81 @@ toolchains over the core; release artifacts come from CI/CD, never a dev machine
 
 A native child window — the find/search/files-search/palette boxes, the sign-in
 fields, the form fields — composites **above** the Direct2D output. There is no
-z-order to lose and nothing can be drawn over one. (The composer was one of these
-until the composer was rewritten; it is part of the scene now, which is what removed a whole class of
-this bug rather than managing it.) A child left visible while the
+z-order to lose and nothing can be drawn over one. (The composer is deliberately NOT
+one of these — it is part of the scene, ARCH-98, which removes this whole class
+of bug for it rather than managing it.) A child left visible while the
 surface it belongs to is not drawn therefore appears as a bare control floating
 over whatever *is* drawn, which reads as corruption rather than as a bug.
 
-This recurred four times before it was fixed as a class, so the rule is written
+This is a recurring failure class, so the rule is written
 down: **every native child's visibility is decided in `layout_natives()`**, from
 three shared predicates —
 
 - `sidebar_kind()` — what the second column currently holds (channels · DMs ·
   activity). Anything that depends on the column's *content* asks this, not
   `view_has_sidebar()`, which only says whether a column exists. Conflating the
-  two is what let the find box leak into three separate views.
+  two is how a find box leaks into views it does not belong in.
 - `main_is_conversation()` — whether the middle column is something you can type
   into. The DMs view has a sidebar but shows an index until you pick someone.
 - `window_is_covered()` — whether a modal, the palette, the lightbox, a menu or
   the sign-in card owns the whole window.
 
-**And the drawing must ask the same question as the control.** Hiding the
-composer while still painting its box and buttons produced an input you could not
-type into, which is its own defect — the rule outlived the RichEdit that taught
-it, and `main_is_conversation()` now decides both the field's rect and its focus.
+**And the drawing must ask the same question as the control.** Hiding an input
+while still painting its box and buttons produces a field you cannot type into,
+which is its own defect — `main_is_conversation()` decides both the field's rect
+and its focus.
 
 A new view or overlay has to name itself in one of those predicates. It cannot
 silently inherit another surface's children.
 
 **Two traps this fix walked into itself, both worth keeping in mind.**
 
-*A predicate whose default is a real answer.* `sidebar_kind()` first returned
-`CHANNELS` as its fallback, which handed that answer to every view its author had
-not thought about — so the find box appeared over the Files view's filter chips.
-It now returns `NONE` for a view with no second column, and `NONE` is the enum's
-zero.
+*A predicate whose default is a real answer.* `sidebar_kind()` returns `NONE`
+for a view with no second column, and `NONE` is the enum's zero — a fallback
+that is a real answer (`CHANNELS`, say) hands that answer to every view its
+author has not thought about.
 
-*The harness could not see the bug.* `gui_drive.sh shot` used to render Direct2D
-only, so a stray native child was **invisible to it** — which is why this class
-kept reaching the user rather than being caught in verification. **That is fixed:
-`shot` now composites the children on top of the scene** (see "Seeing the whole
-window" below), so a screenshot shows what the user sees. The dump reports each
+*The harness must see what the user sees.* **`shot` composites the native
+children on top of the Direct2D scene** (see "Seeing the whole
+window" below), so a screenshot shows what the user sees — a capture that
+rendered the scene alone would make a stray native child invisible to
+verification. The dump reports each
 child's `IsWindowVisible` alongside the three predicates as well, because a
 boolean is a better assertion than an image when what you want to know is
 *whether* a control is shown. Read `re=` with the self-drawn composer in mind: the composer has no
-child window any more, so that field reports whether its **rect is non-empty**,
+child window, so that field reports whether its **rect is non-empty**,
 not a child's visibility. Every other flag is still an `IsWindowVisible`:
 
 ```
 natives re=1 find=1 ffind=0 srch=0 pick=0 pal=0 si_ws=0 sbkind=1 conv=1 covered=0
 ```
 
-The rule earned its keep immediately: the Files view's own "Search files" box
-(`g_ffind`) was added next, gated on `g_view == VIEW_FILES` rather than on any
-predicate that merely happened to be true there, and checked across all six
-views from the dump before it was shown to anybody.
-
-**And the same principle applies to painted chrome.** Hiding the RichEdit under
-the Files/Pins/About tabs still left the composer's box, buttons and send arrow
-DRAWN there — an input you cannot type into, which is the thing hiding the child
-was meant to prevent. `main_is_conversation()` now decides both.
+A new gated child (the Files view's "Search files" box, `g_ffind`, is the
+model) is gated on the view it belongs to — never on a predicate that merely
+happens to be true there — and checked across all views from the dump before it
+is shown to anybody.
 
 ## Check CI after pushing
 
-Both workflows run on every push. `ci` includes a black-box end-to-end run against
-the containerised daemon, and it is the only thing that proves the wire actually
-works end to end — the unit suite links the shared modules directly and never
-performs a handshake.
-
-It went red for **eleven consecutive pushes** on 2026-07-29 because
-`tests/e2e_client.c` sent a hard-coded HELLO range of `{1, 1}` while
-`OC_PROTOCOL_VERSION` had been bumped to 2, and nobody looked. `make test` was
-green the whole time, which is exactly why a green local suite is not a substitute
-for reading the run. Push, then check.
+Both workflows run on every push. `ci`'s integration job drives a natively-run
+daemon end to end over a real socket, and it is the only thing that proves the
+wire actually works — the unit suite links the shared modules directly and never
+performs a handshake. A green local `make test` is therefore not a substitute
+for reading the run: the class of fault it cannot see (a client and daemon
+disagreeing about the wire) is exactly the class only the end-to-end run
+catches. Push, then check.
 
 ## Shortcuts belong in the message loop, not a window proc
 
 `SHORTCUTS[]` in winmain.c drives **both** the sheet (Ctrl+/) and the keys, and
 `accel_dispatch()` runs from the message loop before any window sees the message.
 
-This is not tidiness. The chords used to be handled in the main window's
-`WM_KEYDOWN`, and the main window almost never has focus — **the composer does**.
-A native child consumes what it does not recognise, so Ctrl+K, Ctrl+F and Ctrl+/
-were dead whenever the caret was in the message box, which is to say always, while
-the shortcut sheet advertised them. The find box, search box, palette box, picker
-and sign-in fields were the same black hole; each had to re-implement any chord it
-wanted to let through, and F6's two ends duly drifted apart.
+This is not tidiness. The main window almost never has focus — a native child
+usually does — and a native child consumes what it does not recognise, so a
+chord handled in a window proc is dead whenever the caret sits in any EDIT box,
+while the shortcut sheet advertises it anyway. Dispatching from the message
+loop, before any window sees the message, is what makes a chord work from every
+focus.
 
 - **A new global shortcut goes in `SHORTCUTS[]`** with an `ACC_*` action. It then
   works from every focus and appears in the sheet, because they read the same rows.
@@ -557,34 +538,28 @@ wanted to let through, and F6's two ends duly drifted apart.
   Esc and Enter reach it through `modal_key`.
 - Test with `gui_drive.sh key ctrl+k` (also `alt+shift+up`, `ctrl+slash`, `esc`).
   The verb really holds the modifiers via `SetKeyboardState`, because
-  `accel_dispatch` reads `GetKeyState`; posting a bare key proves nothing. Before
-  it existed, **no chord in the app was testable at all**.
+  `accel_dispatch` reads `GetKeyState`; posting a bare key proves nothing.
 
 ## Modals: one frame, explicit commit
 
 Every modal is drawn by `modal_frame()` (winmain.c) from an `oc_modal_spec`. The
 frame owns the scrim, the card, the title bar with its close button, the footer
 rule and the button row; a caller draws only content and decides none of that.
-Before it there were **five** dialog idioms in one product: four D2D cards each
-computing its own geometry, six middle-column panes borrowing the modal header
-(including its "Esc to close" caption, which is not a modal concept), sixteen
-native GDI popups and four MessageBoxes. All five are now one:
+One frame, four callers:
 
-- the four cards are `oc_modal_spec`s,
-- the six panes use **`pane_header()`** instead — its own header with a real ✕ and
-  no modal furniture, because a pane is not a modal: it fills the middle column and
-  the rest of the app stays live beside it,
-- the sixteen GDI popups are `form_dialog()` **on the frame** (below),
-- and the MessageBoxes are `confirm()`. Exactly one native message box survives, in
+- a dialog card is an `oc_modal_spec`,
+- a middle-column pane uses **`pane_header()`** instead — its own header with a
+  real ✕ and no modal furniture, because a pane is not a modal: it fills the
+  middle column and the rest of the app stays live beside it,
+- a typed form is `form_dialog()` **on the frame** (below),
+- and a confirmation is `confirm()`. Exactly one native message box exists, in
   `WM_CLOSE`: quit has to be answered before the window goes away, and our own
   frame needs a message loop that is about to end.
 
 **Explicit commit, never live-apply.** A form modal declares `snapshot`/`restore`
 and the frame copies its values on open, so `Save` commits and `Cancel`/`✕`/`Esc`
 put them back — all three meaning the same thing. Live-apply makes Cancel a lie:
-it either does nothing, or has to undo changes nobody recorded. The old
-Preferences had no buttons at all and expected Esc, which is the dead end that
-prompted this.
+it either does nothing, or has to undo changes nobody recorded.
 
 Not every modal is a form. Workspaces performs immediate irreversible actions and
 Shortcuts is a reference sheet, so neither snapshots and both carry one dismissing
@@ -597,10 +572,8 @@ that actually changed.
 `form_dialog(owner, title, fields, n)` is the generic typed form (`FF_TEXT`,
 `FF_PASSWORD`, `FF_CHECK`, `FF_CHOICE`) behind every typed form in the client —
 topics, renames, webhooks, invites, quick reactions, sign-up, keywords, priority
-people, the custom pause time, profile fields, sections and more. It used to be a native
-popup with its own window class, STATIC labels, BUTTONs, a `WS_CAPTION` title bar
-and the stock shell font. The justification was that the platform's focus, tab order
-and IME handling beat matching the palette — and **half of that still holds**:
+people, the custom pause time, profile fields, sections and more. It splits the
+work deliberately:
 
 - the **text fields are native `EDIT`s** and always will be, so caret, selection,
   IME, clipboard and undo remain the platform's problem, not ours;
@@ -616,13 +589,12 @@ Two consequences worth knowing before touching it:
   modal; the modal is what covers the window.
 - **Esc and Enter are answered by the field**, in `form_edit_proc`. A single-line
   EDIT eats both, and a key sent straight to the focused child never reaches the
-  message loop — so handling them in the loop left the frame's
-  Enter-commits/Esc-cancels dead in the one modal where you are always typing. The
-  smoke caught that.
+  message loop — so handling them in the loop would leave the frame's
+  Enter-commits/Esc-cancels dead in the one modal where you are always typing.
 
 It stays **synchronous**, by a nested message loop, because every caller reads
-the answer on the next line. That loop is the one the old popup ran and it already
-ran from inside `on_click`, so the re-entrancy is not new.
+the answer on the next line. The loop runs from inside `on_click`; that
+re-entrancy is a known, accepted property.
 
 **Two rules the frame cannot enforce for you:**
 
@@ -630,10 +602,10 @@ ran from inside `on_click`, so the re-entrancy is not new.
   transient overlays are closed. The command palette and emoji picker each claim
   *every* click while open, and `layout_natives` hides their boxes whenever
   something covers the window — so a palette left open behind a modal is invisible
-  and eats every click meant for the card. That was a live bug found by the smoke.
-- **A click inside the card that matches no control stops there.** It used to fall
-  through to the shell underneath, so a stray click in a modal's empty space could
-  change channel behind the dimmed card.
+  and eats every click meant for the card.
+- **A click inside the card that matches no control stops there.** Letting it
+  fall through to the shell underneath means a stray click in a modal's empty
+  space can change channel behind the dimmed card.
 
 ## Preferences is two-paned, and appearance applies live
 
@@ -662,8 +634,8 @@ and follows the account. Zoom (Ctrl+`=` / Ctrl+`-` / Ctrl+`0`) is this window on
 and is deliberately **not** persisted — a temporary magnification following you to
 another machine is not what you asked for. DPI belongs to the display. `g_text_scale`
 is the product of the first two, so nothing downstream has to know there are two
-inputs; anything that caches a font size of its own (the RichEdit's CHARFORMAT, the
-placeholder HFONT, the form fields' HFONT) is rebuilt by `scale_apply`.
+inputs; anything that caches a font size of its own (the form fields' HFONT among
+them) is rebuilt by `scale_apply`.
 
 ## Two standing UI rules
 
@@ -694,7 +666,7 @@ set. Consequences worth knowing before touching it:
   Undo is whole-text snapshots rather than a journal: a message is at most 4000 UTF-16
   units, so a snapshot is 8KB, and it cannot get out of step with the buffer.
 - **`ed_changed()` is the one post-edit path** — it re-measures the box, fires the
-  typing indicator (which used to ride `EN_CHANGE`), refreshes the completion popover
+  typing indicator, refreshes the completion popover
   and resets the caret blink. A key handler that mutates text and skips it will look
   almost right.
 - **The IME composition string is spliced into the layout at the caret**, not appended
@@ -703,19 +675,19 @@ set. Consequences worth knowing before touching it:
   length again, because it is in the layout and not in the text.
 - **Anything that replaces `g_body` must call `ed_invalidate_layout()`** (see
   `scale_apply`). A stale layout is not visibly broken, which is worse than broken.
+- **Rich mode carries a typing-intent layer** — pending styles and continuation
+  across whitespace — described with the dialect in
+  [MARKDOWN.md](./MARKDOWN.md) §6, since it is a property of how the editor
+  keeps markup out of sight rather than of this window plumbing.
 
-## Screenshots can see images (and once could not)
+## Screenshots can see images
 
-`test_shot` renders the scene into its own DC render target. A D2D bitmap belongs to
-the target that created it, so the capture used to switch images off entirely — which
-means **every screenshot ever taken of this app was a picture with the pictures
-missing**, including the inline-image feature whose whole point is the
-picture. That cost an hour of diagnosing a working avatar as broken.
-
-The decoded PBGRA pixels are now kept beside each cached bitmap, and a capture creates
-its own bitmaps from them for its own target (released when the shot ends). Only the
-*fetch* is still suppressed during a capture, so driving the harness cannot generate
-transfer traffic.
+`test_shot` renders the scene into its own DC render target, and a D2D bitmap
+belongs to the target that created it — so the decoded PBGRA pixels are kept
+beside each cached bitmap, and a capture creates its own bitmaps from them for
+its own target (released when the shot ends). Without that, every screenshot
+would be a picture with the pictures missing. Only the *fetch* is suppressed
+during a capture, so driving the harness cannot generate transfer traffic.
 
 **If you add another cached GPU resource, keep the bytes too.** Anything that lives
 only as a render-target-owned object is invisible to every screenshot, and therefore
@@ -753,8 +725,8 @@ same discipline as reading CI.
 ## Seeing the whole window (Win32 harness)
 
 `scripts/gui_drive.sh shot <name>` produces one image of the entire application,
-Direct2D surface **and** native children. Getting there took two dead ends, both
-worth recording so nobody re-walks them:
+Direct2D surface **and** native children. Two obvious routes do not work,
+recorded so nobody re-walks them:
 
 | Route | D2D content | Native children |
 |---|---|---|
@@ -763,23 +735,21 @@ worth recording so nobody re-walks them:
 
 The first misses children because they are separate windows. The second returns a
 blank client area because our `WM_PAINT` renders through a D2D **HWND** target
-straight to the screen and never touches the HDC Windows supplies — measured, not
-assumed: the capture was white with the RichEdit's placeholder floating in it.
+straight to the screen and never touches the HDC Windows supplies.
 
 So `test_shot` does what the window does: render the scene, then walk
 `EnumChildWindows` and blit each visible child on top, at its real position.
 `EnumChildWindows` rather than a list of handles, because a list is one more place
 a seventh child must be registered, and forgetting is this area's recurring
 failure. Each child is asked twice — `PrintWindow` first, then `WM_PRINTCLIENT` —
-because neither works for every control class: `PrintWindow` on a *child* returned
-an empty box for the RichEdit, while `WM_PRINTCLIENT` is what a control
+because neither works for every control class: `PrintWindow` on a *child*
+returns an empty box for some classes, while `WM_PRINTCLIENT` is what a control
 implements for this purpose.
 
-**A control that paints itself must handle `WM_PRINTCLIENT` too.** The composer's
-cue text was drawn only to `GetDC(hwnd)`, so it existed on screen and nowhere
-else — the one string in the composer that users read could not be checked by any
-capture. `re_proc` now overlays it on both `WM_PAINT` and `WM_PRINTCLIENT`. Any
-future self-painted control needs the same pair.
+**A control that paints itself must handle `WM_PRINTCLIENT` too.** A string
+drawn only to `GetDC(hwnd)` exists on screen and nowhere else — no capture can
+check it. Any self-painted native control needs the `WM_PAINT`/`WM_PRINTCLIENT`
+pair.
 
 ## Typography (graphical clients) — ARCH-97
 
@@ -795,14 +765,13 @@ ARCH-97; what a frontend author needs is the table and two rules.
 | `meta` | 12.5 | 400 | timestamps, sublabels, chips, counts |
 | `micro` | 10 | 600 | rail labels |
 
-**Rule one: name the role, never the size.** The Win32 client's formats were
-`g_hdr`, `g_small`, `g_time`, `g_ava`, `g_rail` — five names describing a size or
-a single call site, which is why `g_small` accumulated 208 uses covering
-timestamps, chips, counts, hints and section headers with no way to change one
-without changing all of them. They are now `g_display`, `g_title`, `g_body`,
+**Rule one: name the role, never the size.** The Win32 client's formats are
+`g_display`, `g_title`, `g_body`,
 `g_ui`/`g_ui_b`, `g_meta`/`g_meta_w`/`g_meta_r`, `g_avatar`, `g_micro` — the same
 tokens the other graphical clients will declare, so a reviewer moving between
-them reads one vocabulary.
+them reads one vocabulary. A size-named format (a `g_small`) accumulates uses
+across unrelated roles — timestamps, chips, counts, hints, section headers —
+until none of them can change without changing all of them.
 
 **Rule two: two weights.** Regular 400 and Semibold 600 in all chrome. Bold 700
 belongs to markdown `**strong**` in message bodies and nowhere else, so weight
@@ -816,19 +785,17 @@ to change a DirectWrite size, so any preference that moves the scale must call
 
 ## 8. Roadmap
 
-- **Now:** app-core + termbox2 TUI shipped. On top of the lean core loop
+- **Built — the core and the TUI.** On top of the lean core loop
   (sidebar, backfill on open, send, display names, unread, scrollback), the TUI
   surfaces: reactions, edit/delete, typing, threads, search, channel management,
   roster + presence, DMs, logout, who-reacted, notification prefs/DND, admin,
-  webhook management, attachments, and audit log (see §3 for where each lives).
-  **Nearly every capability the app-core exposes is reachable from the TUI** —
-  §3 lists the two that are not (webhook delete, log-out-everywhere) and the
-  daemon frames no client reaches yet.
-- **Also shipped since:** the **local store** and reconnect/offline (REQ-100/101/102
-  — silent session-token reconnect across restarts, persisted TOFU pin, cached
-  history, offline outbox, workspace book), **multiple workspaces** (REQ-012–015),
-  DNS workspace resolution (REQ-010/011), the local **Sign in** dialog, and the
-  **Windows TUI** (ARCH-81). See §5–§6.
+  webhook management, attachments, and audit log (see §3 for where each lives —
+  and for the honest scope: the TUI reaches a **minority** of the app-core).
+  Also built: the **credential store** and reconnect/offline (REQ-100/101/102
+  — silent session-token reconnect across restarts, persisted TOFU pin,
+  in-memory offline outbox, workspace book), **multiple workspaces**
+  (REQ-012–015), DNS workspace resolution (REQ-010/011), the local **Sign in**
+  dialog, and the **Windows TUI** (ARCH-81). See §5–§6.
 - **Done — Windows GUI depth.** The Win32 GUI surfaces every engine feature
   (ARCH-82) and its depth work is **closed**: the error/toast + connection
   surface (**REQ-263**), search with jump-to-match, keyset paging and operators
@@ -846,19 +813,18 @@ to change a DirectWrite size, so any preference that moves the scale must call
   `InvokePattern` on every actionable element (**REQ-290**), verified
   from outside the process by `scripts/uia_probe.ps1`. Rich text and its toolbar
   are built too (**REQ-220**, ARCH-100: a shared parser in `client/core/` plus
-  DirectWrite ranges). The items that once waited on a daemon requirement —
+  DirectWrite ranges). The items that pair a client half with a daemon half —
   drafts, scheduled send, the notification schedule, keywords and priority
-  people, the pause, cross-channel threads, the People directory — all landed
-  with their server halves on 2026-08-01/02. Open work is in the
+  people, the pause, cross-channel threads, the People directory — are built
+  end to end. Open work is in the
   [issue tracker](https://github.com/openchime/openchime/issues).
 - **The frontend order is fixed: all of Win32, then the TUI, then GTK, then
   macOS.** Win32 is the reference client and it is finished *first* — including
   the items now waiting on a daemon requirement, which are Win32 work waiting on
   their other half, not work deferred behind another frontend. The TUI being
   behind is an accepted consequence of that order, not a reason to reorder it.
-- **Then — TUI catch-up.** The two frontends have swapped places: the TUI was
-  the reference client and is now behind the GUI by **more than twenty** features,
-  every one of which already exists in the app-core — @mentions (REQ-221), pins
+- **Then — TUI catch-up.** The TUI is behind the GUI by **more than twenty**
+  features, every one of which already exists in the app-core — @mentions (REQ-221), pins
   (REQ-230), saved items (REQ-231), the channel files listing (REQ-143), the
   per-channel roster (REQ-031), channel management (REQ-034/035/036/038), mute and
   star (REQ-137/234), mark-unread (REQ-235), the activity feed (REQ-139), in-app

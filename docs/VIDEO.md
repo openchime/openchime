@@ -38,7 +38,7 @@ legitimate.
 | Screen audio is **not** captured; voice rides the existing audio path | Recording the share |
 | One sharer at a time per call | Simultaneous shares / picture-in-picture grids |
 
-**REQ-160 is amended, not repealed.** Camera video calling and general video
+**REQ-160 stands.** Camera video calling and general video
 playback remain a deliberate exclusion. Screenshare is admitted as REQ-161
 because its content profile (mostly static, low frame rate, one sender) is
 fundamentally cheaper than camera video and its use case is concrete.
@@ -173,11 +173,8 @@ grid. The TUI's ceiling is showing *that* a share is in progress and who is
 sharing — roster state, not pixels.
 
 That leaves screenshare as a **graphical-frontend-only** feature, and today the
-only graphical frontend is the Windows GUI. *(Updated 2026-07-28: the specific
-gaps this paragraph used to cite — no error/toast surface, no settings screen, no
-working search, no workspace switcher — are all closed. The argument does not
-depend on them; it depends on there being exactly one graphical client, which is
-still true, and on the audio prerequisite below, which is untouched.)*
+only graphical frontend is the Windows GUI. The argument depends on there being
+exactly one graphical client, and on the audio prerequisite below.
 
 Capture APIs are per-platform (DXGI Desktop Duplication, ScreenCaptureKit,
 PipeWire portals) and that is fine — **capture is a frontend concern, the codec
@@ -196,13 +193,10 @@ twice.
 
 The order that follows from this document:
 
-1. ~~Win32 GUI P0 depth gaps (error/toast surface, search, sidebar, settings).~~
-   **Done** — the client build order was re-ordered around
-   what is actually left.
-2. AUDIO.md phases 1–5 — device layer, Opus, `CALL_*` signaling, UDP media,
+1. AUDIO.md phases 1–5 — device layer, Opus, `CALL_*` signaling, UDP media,
    jitter buffer, mixing.
-3. The transport gaps of §5, which audio needs in simpler form anyway.
-4. Screenshare, revisiting the §4 codec choice against whatever hardware
+2. The transport gaps of §5, which audio needs in simpler form anyway.
+3. Screenshare, revisiting the §4 codec choice against whatever hardware
    encode landscape exists by then.
 
 ## 9. Bandwidth and the flat-plan collision

@@ -7,7 +7,7 @@ file the loader opens is the OIDC public-key PEM named by
 `OPENCHIME_OIDC_PUBKEY_FILE`.
 
 Under systemd this is an `Environment=` / `EnvironmentFile=` block (ARCH-20);
-under Docker/Fly it is the container environment (ARCH-4/36). Nothing here is
+in the container image it is the container environment (ARCH-4). Nothing here is
 ever fetched from a control plane at runtime, in any deployment model — a
 federated deployment contacts its opted-in services for their own function, never
 to learn how to run (ARCH-26/76).
@@ -141,15 +141,6 @@ rather than client state (ARCH-88/REQ-201).
 | `OPENCHIME_SUFFIX` | `resolve.c` | Overrides the DNS suffix appended to a bare workspace name (`acme` → `acme.<suffix>`), ARCH-14. **Defaults to `openchime.io`** (`OC_SERVICE_SUFFIX` in `client/core/resolve.h`, returned by `oc_default_suffix()`) — the hosted case is the common one, so a bare name resolves under the service domain unless this says otherwise. A dotted domain or an explicit `:port` bypasses suffixing entirely. |
 | `OPENCHIME_CRED` | TUI | Credential passed as `user:password`, so a password never lands in the process arguments. |
 | `OPENCHIME_TEST_DIR` | Win32 GUI | Enables the in-app automation hook — a file command channel plus the screenshot / state-dump drop directory — set by `scripts/gui_drive.sh` (which exports it across the WSL boundary via `WSLENV`) and used by `scripts/gui_smoke.sh` through it. `scripts/gui_snap.sh` neither sets nor reads it: that script captures the window from outside with `PrintWindow`. Dev only. |
-
-## Compose-only — none, and there is no Compose
-
-This section listed `OPENCHIME_BUCKET` (default `openchime-dev`), read by
-`docker-compose.yml` to create a MinIO bucket in the dev stack. The daemon never
-read it — its bucket is `OPENCHIME_S3_BUCKET` — and per ARCH-38 the MinIO service
-never had a consumer. The Compose stack, the MinIO service and `.env.example`
-were all deleted when Docker was removed from the project (ARCH-36), so the
-variable now has no reader anywhere and is not set by anything.
 
 ## Test-only knobs
 

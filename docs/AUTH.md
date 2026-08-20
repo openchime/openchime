@@ -173,8 +173,7 @@ central and recorded in central's workspace registry (§3.6); central mints a
 token only for a **registered** audience. It is deliberately **decoupled from the
 workspace address** — a workspace can change its domain or add a vanity name
 (ARCH-14) without invalidating its OIDC identity, and the audience registry is
-never consulted for discovery. This **supersedes the earlier `aud = acme.example`
-illustration**, which conflated the audience with the hostname. (The enrollment
+never consulted for discovery. (The enrollment
 flow itself — how the id is proposed and bound — is a control-plane concern,
 out of scope for this doc.)
 

@@ -142,9 +142,10 @@ Emphasis never reaches inside an address either — the closer search steps over
 URL exactly as it steps over a code span — so an `_` in a path cannot end an
 italic run that opened before it.
 
-REQ-222's **unfurl** (fetching a title and thumbnail for a link) is a different
-feature and remains unbuilt: it needs a server-side fetcher, and it is tracked
-as open work rather than being a property of this dialect.
+REQ-222's **unfurl** (fetching a title and description for a link) is a
+different feature with its own design (ARCH-105): the daemon fetches
+server-side, using this same shared address scanner so it unfurls exactly what
+a client links. It is not a property of this dialect.
 
 **No underline.** Slack's toolbar offers it; its `mrkdwn` has no syntax for it,
 and an underline is indistinguishable from a link in most renderings.
@@ -153,9 +154,8 @@ and an underline is indistinguishable from a link in most renderings.
 
 - **No WYSIWYG-only constructs.** Anything the toolbar can produce must be
   expressible in text, or the two authoring paths diverge and a message becomes
-  uneditable in one of them. (The toolbar itself, and `Ctrl+B`/`Ctrl+I`, are the formatting toolbar —
-  **built 2026-07-31**, once the parser existed to make them worth anything. It
-  inserts delimiters into the plain body and nothing else, so the constraint
+  uneditable in one of them. (The toolbar, and `Ctrl+B`/`Ctrl+I`, insert
+  delimiters into the plain body and nothing else, so the constraint
   holds by construction rather than by discipline: there is no second
   representation for the two paths to disagree about.)
 - **No tables, headings, images or HTML.** A chat message is a paragraph, not a
@@ -172,7 +172,7 @@ and an underline is indistinguishable from a link in most renderings.
 Each frontend maps spans to its own facilities, and the mapping is the frontend's
 business:
 
-- **Win32** — **built 2026-07-31.** DirectWrite ranges on the existing
+- **Win32** — **built.** DirectWrite ranges on the existing
   layout, the same mechanism `@mention` highlighting already uses
   (`body_layout`), so formatting composes with mentions and custom emoji rather
   than fighting them. **Both the transcript and the composer remove the inline
@@ -218,8 +218,8 @@ business:
   `ShellExecuteW` re-checks the scheme even though the parser already guaranteed
   it, because that call is the dangerous end.
 - **TUI** — tuikit attributes; code blocks and blockquotes get in-band markers
-  since a terminal has no proportional styling to lean on. **Not built yet** —
-  the parser is shared and waiting for it, and until then the TUI shows the
+  since a terminal has no proportional styling to lean on. **Not built** —
+  the parser is shared and waiting for it; the TUI shows the
   markup as source, which the dialect guarantees is legible.
 
 **The composer shows formatting as you type**, which is only affordable because

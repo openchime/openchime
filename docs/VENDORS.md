@@ -16,8 +16,7 @@ are four ways a dependency enters the build; each row below says which:
 **License posture:** everything linked into the shipping **daemon** and **TUI**
 is permissive — MIT, Apache-2.0, Public Domain, or (for the *optional, dynamically
 linked* libsecret/glib) LGPL-2.1. No GPL/AGPL code is linked into any shipped
-binary. The only AGPL component (MinIO) is **dev/test infrastructure only** — a
-separate process the daemon talks to over S3, never linked.
+binary.
 
 ---
 
@@ -32,9 +31,8 @@ CI builds share byte-identical sources with zero transitive dependencies
 | **termbox2** | v2.5.0 | Terminal cell grid + input | tuikit (→ TUI) | https://github.com/termbox/termbox2 | MIT |
 | **utf8proc** | v2.11.3 | Unicode width + grapheme segmentation (correct emoji/CJK width) | tuikit (→ TUI) | https://github.com/JuliaStrings/utf8proc | MIT (bundled Unicode data under the Unicode license) |
 | **jsmn** | commit-pinned (upstream has no release tags) | Minimal JSON tokenizer | Daemon (OIDC/webhook JSON) | https://github.com/zserge/jsmn | MIT |
-| ~~**SQLite (amalgamation)**~~ | — | **Removed (ARCH-88).** It was vendored so the Windows *client* could have a store; no client embeds a database engine any more, and `third_party/sqlite` is deleted. The daemon still uses system SQLite — see below for why it stays that way. | — | — | — |
 
-**Why the daemon keeps system SQLite rather than vendoring it back (ARCH-20).**
+**Why the daemon uses system SQLite rather than vendoring it (ARCH-20; no client links SQLite at all, ARCH-88).**
 Packaging the daemon raised the question, since a statically linked SQLite would
 leave the `.deb` and `.rpm` depending on nothing but glibc. It stays dynamic
 deliberately: mbedTLS is already static, so **we** already own TLS CVE response,
@@ -95,8 +93,8 @@ exits. Override for a new version with `MBEDTLS_SHA256=<sum>`.
 
 ## 3. System / OS packages (linked at build)
 
-Provided by the host toolchain (local dev / CI) or the Alpine base image
-(Docker); their versions track the OS, not this repo.
+Provided by the host toolchain (local dev / CI) or the Alpine base of the
+published container image; their versions track the OS, not this repo.
 
 | Package | Purpose | Used by | Link | Source | License |
 |---------|---------|---------|------|--------|---------|
@@ -129,18 +127,10 @@ One image, and it is an **output** rather than a tool: the OCI image published t
 GHCR for the hosted model (ARCH-20/76). Runtime Alpine packages: `sqlite-libs`,
 `ca-certificates`.
 
-**Everything else that was in this table is gone**, because the project no
-longer runs containers for development or testing (ARCH-36). Removed with the
-Compose stacks: **MinIO** and **MinIO Client** (AGPL-3.0, the dev-only
-S3 simulation for ARCH-38, which never had a consumer), **curl**
-(digest-pinned, the one-shot enrolment reserve in the federated stack) and
-**`postgres:17`** (the federated stack's database — now something you start
-yourself; see docs/TESTING.md).
-
-The digest-pinning convention those entries documented no longer applies to
-anything: the sole remaining image reference is the `FROM alpine:3.20` in
-`Dockerfile`, a tag rather than a digest, which is the upstream's own stability
-contract for a base OS.
+The project runs no containers for development or testing (ARCH-36), so this
+table holds exactly one row. The sole image reference in the repo is the
+`FROM alpine:3.20` in `Dockerfile` — a tag rather than a digest, which is the
+upstream's own stability contract for a base OS.
 
 ## 5. Build & dev tooling (not linked into the product)
 
@@ -160,17 +150,10 @@ contract for a base OS.
   build, not to test, not locally, not in CI. This is a standing constraint;
   see ARCH-36 and the header of `.github/workflows/release.yml`.
 
-## 6. Vestigial — present locally but in NO current build
+## 6. Windows cross-compile artifacts
 
-The self-rendered GUI direction (Clay layout + raylib/OpenGL) was tried and
-rejected in favour of native per-platform UIs (**ARCH-82**): a self-rendered UI
-is non-native and perpetually lags. **raylib and Clay have been removed** — the
-`clay/`, `raylib-6.0-win`, `raylib-install-*` trees, the `build_raylib_*.sh`
-scripts, the **old self-rendered `client/gui` (Clay+raylib)**, and the comctl32
-`client/win32` client are all deleted. (The **current** native Win32 GUI lives at
-`client/gui/win32/` — ARCH-82, pure Win32 + Direct2D — and is unrelated to the
-removed self-rendered `client/gui`.) Retained Windows artifacts below are for the
-**Windows TUI and GUI** cross-compile (ARCH-81/82).
+The native Win32 GUI lives at `client/gui/win32/` (ARCH-82, pure Win32 +
+Direct2D). Its cross-compile, and the Windows TUI's (ARCH-81), use:
 
 | Item | Version | Note | License |
 |------|---------|------|---------|
@@ -239,11 +222,8 @@ paths ship; nothing is fetched at runtime.
 | **BSD-3-Clause** | libvpx (VP9) — **planned, not yet fetched** | Screenshare codec (REQ-161, ARCH-87). Client-side only; the daemon links no codec. Permissive, within this repo's posture — see §7 |
 | **Public Domain** | SQLite | System-linked, **daemon only** — no client links it (ARCH-88) |
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
-| **zlib/libpng** | raylib | Dropped self-rendered-GUI toolkit (ARCH-82); unused, not linked |
-| **zlib** | Clay | Dropped GUI layout engine (ARCH-82); unused, not linked |
-| **AGPL-3.0** | MinIO, mc | **Dev/test infra only — never linked into a shipped binary** |
 | **Unicode license** | utf8proc bundled data tables | Alongside utf8proc's MIT code |
 
 **Bottom line:** the shipped daemon and TUI are permissively licensed
-(MIT/Apache/Public-Domain, plus optional dynamic LGPL). AGPL exists only in the
-optional MinIO dev container, isolated behind the S3 API.
+(MIT/Apache/Public-Domain, plus optional dynamic LGPL). No AGPL third-party
+code exists anywhere in the build.

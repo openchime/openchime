@@ -34,15 +34,15 @@ REQ-027.
 
 Sixteen, and each has one job. **Start with the first two**: they answer what the
 product is meant to do and why it is built the way it is. What is *wrong* with it
-today is no longer a document — it is the
+today is not a document — it is the
 [issue tracker](https://github.com/openchime/openchime/issues).
 
 | Document | What it is |
 |---|---|
 | [REQUIREMENTS.md](docs/REQUIREMENTS.md) | The product specification — every `REQ-NNN`, written as a contract in present-perfect. Each requirement carries a marker saying whether it is built, so a shipped guarantee reads differently from an intention. |
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | The `ARCH-N` decision record: every architectural choice, its rationale, and what later decisions amended or withdrew it. Design decisions live here; product scope lives in REQUIREMENTS.md. |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | The `ARCH-N` decision record: every architectural choice and its rationale. Design decisions live here; product scope lives in REQUIREMENTS.md. |
 | [PROTOCOL.md](docs/PROTOCOL.md) | The byte-level wire protocol — frame layout, the handshake, every message type and its payload, the error codes, and the connection state machine. Its §9 registry is generated from the codec and is the authority on which opcodes are taken. |
-| [SCHEMA.md](docs/SCHEMA.md) | The SQLite schema and the migration mechanism, documenting all 36 migrations and why each table is shaped the way it is. |
+| [SCHEMA.md](docs/SCHEMA.md) | The SQLite schema and the migration mechanism, documenting every migration and why each table is shaped the way it is. |
 | [CLIENT.md](docs/CLIENT.md) | The client architecture: one shared C app-core with a native UI per platform, and the internals of the Win32 GUI — its self-drawn composer, modal frame, and native-child rules. |
 | [AUTH.md](docs/AUTH.md) | The two authentication modes — local PBKDF2 accounts and OIDC brokered by a central relay — and the daemon-issued session both converge on. |
 | [TLS.md](docs/TLS.md) | How the daemon terminates TLS and how a client trusts it: trust-on-first-use certificate pinning against a self-signed cert, with no CA anywhere on the client-facing path. |
@@ -56,7 +56,7 @@ today is no longer a document — it is the
 | [CONTRIBUTING.md](docs/CONTRIBUTING.md) | Branch, commit and CI policy, including the attribution guard that runs on every push. |
 | [RELEASING.md](docs/RELEASING.md) | How a version is published to apt, dnf, GHCR and WinGet — the release-number reservation, the pool guard that stops an index delisting prior releases, the archive signing key's properties, and what a dry run cannot test. |
 
-The daemon is a **feature-complete v1 chat core**. On the foundations — the v1
+The daemon is a **feature-complete v1 chat core**. On the foundations — the
 wire-protocol frame codec (PROTOCOL.md), the two-thread model (ARCH-5: an epoll
 network loop + a single DB-writer thread, refined by ARCH-66 into a third
 read-only query thread), TLS termination with self-signed TOFU certs (ARCH-10,
@@ -65,8 +65,11 @@ messaging path end to end: **two-mode authentication** (local PBKDF2 accounts or
 an OIDC token re-issued by the central relay, converging on a daemon-issued
 session, [docs/AUTH.md](docs/AUTH.md)), roles and full tenant administration,
 public/private channels and DMs, edit/delete, reactions, threads, FTS5 search,
-presence and typing, notification preferences and DND, **@mentions** and
-**pinned messages**, attachments proxied to object storage with per-channel file
+presence and typing, notification preferences with the schedule, pause,
+keywords and priority people, **@mentions** and
+**pinned messages**, saved items and the activity feed, drafts and scheduled
+send, custom emoji, **link unfurls** fetched in-daemon behind an SSRF gate,
+attachments proxied to object storage with per-channel file
 and member listings, incoming webhooks, an audit log, and reconnect backfill. The
 daemon also emits **mobile push** to the control-plane gateway (ARCH-85) and
 **enrolls** with it for federated deployments (ARCH-84). Server-relayed **audio**
@@ -182,9 +185,8 @@ menus, dialogs, and a Ctrl+K command palette; there are no slash commands. It
 covers live messaging with history backfill, reactions, edit/delete, typing,
 threads, search, channel + DM management, roster + presence, who-reacted,
 notification prefs + DND, admin (roles/invite/remove), webhooks, attachments,
-storage and audit overlays, multiple workspaces, and logout. It reached nearly
-every capability the app-core exposes until the July 2026 engine and GUI work;
-it is now behind the Windows GUI by **more than twenty** features — among them
+storage and audit overlays, multiple workspaces, and logout. It is
+behind the Windows GUI by **more than twenty** features — among them
 @mentions, pins, saved items, the channel files listing, the per-channel member
 roster, channel topic/rename/archive, mute, star, mark-unread, the activity feed,
 in-app preferences and themes — plus webhook *deletion* and log-out-everywhere.
@@ -204,12 +206,13 @@ provider over the self-drawn UI, a system caret and spoken notifications), with
 an automation id and an invoke pattern on every actionable element (REQ-290),
 both verified by a real UIA client from outside the process. Rich text and its
 toolbar (REQ-220/ARCH-100), drafts, scheduled send, the notification schedule
-with keywords and priority people, cross-channel threads and the People directory
-all shipped with their daemon halves on 2026-08-01/02.
+with keywords and priority people, cross-channel threads, the People directory
+and link-unfurl cards are all built end to end with their daemon halves.
 
-Its `scripts/gui_smoke.sh` gate reported **247 of 249 checks passing** on
-2026-08-02. The two failures, two further defects the gate structurally cannot
-see, and the verification gap underneath them are in the
+Its `scripts/gui_smoke.sh` gate prints the total it ran — read that rather
+than a number quoted here; the suite grows. A handful of standing failures are
+the known baseline (TESTING.md records them); defects the gate structurally
+cannot see are in the
 [issue tracker](https://github.com/openchime/openchime/issues). Next is **TUI catch-up**, then GTK (Linux),
 AppKit (macOS), a web DOM UI, and mobile.
 
@@ -232,12 +235,6 @@ build/openchime-tui 127.0.0.1 8443 alice:pw
 
 Stop it with Ctrl-C. To start from scratch, delete `/tmp/openchime-dev` — there
 are no volumes and no daemon holding state anywhere else.
-
-There used to be a `Scripts/run.sh` / `stop.sh` / `reset.sh` trio wrapping a
-Docker Compose stack, plus a MinIO service standing in for S3 (ARCH-38). All of
-it is gone: the stack was removed along with every other use of Docker in the
-project, and the MinIO service had no consumer, since the daemon's S3 blob
-backend (ARCH-70) defaults to the local filesystem.
 
 ### Verify the health check
 
@@ -269,15 +266,10 @@ See [LICENSING.md](LICENSING.md) for the full map, including `third_party/`.
 
 ## Known fidelity gaps
 
-- **Local development does not approximate the deployment target at all.** It
-  used to, loosely: the Compose stack capped the daemon at 256MB / 1 CPU to
-  stand in for Fly.io's smallest instance (ARCH-4, REQ-210). That stack is gone
-  with the rest of the project's Docker usage, and `make run` applies no limits
-  whatsoever. Resource-constraint behaviour is now unexercised until deploy.
-- The gap that replaced was never large — Docker shares the host kernel while
-  Fly.io runs Firecracker microVMs, and its `cpus` limit did not reproduce Fly's
-  shared-vCPU throttling — but "loose approximation" and "none" are different,
-  and this is the latter.
+- **Local development does not approximate the deployment target.**
+  `make run` applies no resource limits, so nothing stands in for Fly.io's
+  smallest instance (ARCH-4, REQ-210) and resource-constraint behaviour is
+  unexercised until deploy.
 - The published container image is built by the release but **exercised by no
   test**. The end-to-end suite drives a natively-built daemon, so the daemon's
   behaviour is covered and its packaging into an image is not.

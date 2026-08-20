@@ -1,4 +1,4 @@
-# OpenChime Wire Protocol — v1 (core messaging path)
+# OpenChime Wire Protocol
 
 This document specifies the OpenChime binary wire protocol at the byte level.
 It is the detailed realization of the frame decisions in
@@ -6,11 +6,11 @@ It is the detailed realization of the frame decisions in
 resolves the protocol-shaped `[needs ARCH decision]` items in
 [REQUIREMENTS.md](./REQUIREMENTS.md).
 
-**Scope of this revision.** This covers connection handshake and version
+**Scope.** This covers connection handshake and version
 negotiation, authentication, the message send/broadcast/ack cycle, message
 edit/delete (§5.5/5.6), reactions (§5.9), threads (§5.10), search (§5.11),
 direct messages (§5.12), channel management (§5.7), tenant administration (§5.8),
-and reconnect backfill, plus the error frame. It **also now covers** presence and
+reconnect backfill and the error frame — plus presence and
 typing (§5.13, REQ-120/121), attachments (§5.14), incoming webhooks (§5.15),
 notification preferences (§5.16), synced client settings (§5.16a), self-service
 profile (§5.16b), audio-call signaling (§5.17, REQ-150–152), and push device
@@ -29,10 +29,10 @@ are specified in §§5.16d–5.16j. The remaining protocol-level deferral is the
 **Status.** Implemented. The frames in this document are realized in
 `shared/protocol.c` (codec), `daemon/dbwriter.c` (handlers), and
 `daemon/netloop.c` (dispatch). Coverage is uneven: the auth-and-message vertical
-is exercised end to end against the deployed container, and the rest in-process
+is exercised end to end over a real socket, and the rest in-process
 (TESTING.md §3.3). Where this document and the codec disagree, the codec is
-right — three such disagreements were found on 2026-08-02 and are recorded as
-issues rather than silently corrected here.
+right, and the disagreement is tracked as an issue rather than silently
+corrected here.
 
 ---
 
@@ -161,35 +161,20 @@ type-specific payload. All multi-byte integers are **network byte order**
 > surfaces as a decode error mid-session rather than a clean rejection.
 >
 > **Reassigning an opcode is the same kind of change** and gets the same bump,
-> even though no payload moved: v8 moved `TYPING`/`TYPING_UPDATE` to
-> `0x007E`/`0x007F`, and to a v7 peer a v8 `TYPING` frame *is* a `PROFILE_INFO` —
-> decoded as the wrong struct rather than rejected, which is precisely what the
-> version number exists to prevent.
+> even though no payload moved: to a peer one version behind, a frame on a
+> reassigned opcode decodes as the wrong struct rather than being rejected —
+> precisely what the version number exists to prevent.
 >
-> This is written down because it was learned the hard way: `CHANNEL_INFO` and
-> `CHANNEL_LIST` both grew fields while the version stayed at 1, and a client
-> built from the new source talking to a daemon still running the old binary
-> connected happily and then dropped the link, reporting only "connection lost —
-> reconnecting". Both sides send the version as `min` **and** `max`, so a bump
-> turns exactly that situation into a `REJECT` carrying `VERSION_TOO_OLD` /
-> `VERSION_TOO_NEW`, which says what is wrong.
+> Both sides send the version as `min` **and** `max`, so a mismatched pair gets a
+> `REJECT` carrying `VERSION_TOO_OLD` / `VERSION_TOO_NEW`, which says what is
+> wrong, instead of connecting happily and then dropping the link on the first
+> undecodable frame.
 >
-> **Current version: 7.** Since the client and daemon ship together (ARCH-61)
-> there is no compatibility window to preserve — only a mismatch to detect
-> loudly, which is why a frame *layout* change moves the number even when it adds
-> one byte.
->
-> | Version | Change |
-> |---|---|
-> | 2 | `CHANNEL_INFO` gained `topic`/`archived` and made `peer_id` unconditional; `CHANNEL_LIST` gained `topic`, `archived`, `created_at`, `preview`, `preview_author` (2026-07-29). |
-> | 3 | Mute and mark-unread (REQ-137/235, migration 0026). |
-> | 4 | `USER_LIST` carries each user's avatar attachment id. A repeated list, so the added field shifts every entry after the first. |
-> | 5 | `PRESENCE_UPDATE` carries the do-not-disturb **fact** beside the status byte (REQ-122/278). |
-> | 6 | `NOTIFY_PREFS` **drops** the three DND-window fields: the recurring schedule is its own frame (REQ-136) and `SET_DND` is retired with them. |
-> | 7 | `USER_LIST` carries `title`, `timezone` and custom status (REQ-289). |
->
-> Versions 4–7 are recorded in `shared/protocol.h`; version 3's entry is not, and
-> is reconstructed here from the commit that raised it.
+> **The current version is 8** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> which is the authority; the per-version change notes live beside it). Since the
+> client and daemon ship together (ARCH-61) there is no compatibility window to
+> preserve — only a mismatch to detect loudly, which is why a frame *layout*
+> change moves the number even when it adds one byte.
 
 ### 2.1 Size limits (ARCH-30, REQ-054)
 
@@ -553,7 +538,7 @@ msg_type `0x0051`** describing the channel and the caller's membership:
 | `is_public`  | u8   | `1` public, `0` private.                          |
 | `joined`     | u8   | `1` if the recipient is now a member.             |
 | `created_at` | u64  | Creation time, ms since epoch UTC.                |
-| `peer_id`    | u64  | Always written since protocol 2 (`0` when not a DM). For a 1:1 DM, the other participant *from the recipient's view*. |
+| `peer_id`    | u64  | Always written (`0` when not a DM). For a 1:1 DM, the other participant *from the recipient's view*. |
 | `topic`      | str  | Empty when unset (REQ-034). |
 | `archived`   | u8   | `1` when the channel is archived and read-only (REQ-035). |
 | `n_peers`    | u16  | Participant count, then that many `u64` ids — a group DM's people (REQ-056). `0` for a named channel. |
@@ -643,13 +628,12 @@ truncated to 120 bytes, tombstones skipped) and its **`preview_author`**. A clie
 that caches nothing (ARCH-88) has no other way to show a conversation list you can
 skim — and it is per *channel*, not per DM, so the ordinary sidebar can use it too.
 
-> **Layout note.** `CHANNEL_INFO`'s `peer_id` used to be an *optional trailing*
-> field, written only for DMs. That trick does not survive a second optional
-> field, so as of this change the layout is **fixed**: `peer_id` is always
-> written (0 when not a DM), followed by `topic` and `archived`. `CHANNEL_LIST`
-> entries gained `topic`, `archived` and `created_at` for the same reason — a
-> client that caches nothing (ARCH-88) must be able to render the sidebar and the
-> channel's About surface from the list alone.
+> **Layout note.** `CHANNEL_INFO`'s layout is **fixed** — `peer_id` is always
+> written (0 when not a DM), followed by `topic` and `archived` — because an
+> *optional trailing* field does not survive a second optional field beside it.
+> `CHANNEL_LIST` entries carry `topic`, `archived` and `created_at` for the same
+> reason a client that caches nothing (ARCH-88) must be able to render the
+> sidebar and the channel's About surface from the list alone.
 
 **An archived channel is read-only** on the client-facing wire: `SEND`,
 `SEND_REPLY` and `UPLOAD_BEGIN` share one access check and all return
@@ -675,12 +659,6 @@ role policy (owner/admin/member, ARCH-60, AUTH.md §6); enumeration is open to a
 authenticated user.
 
 **`LIST_USERS` (client → server), msg_type `0x0040`** — empty payload; replies
-**`USER_LIST` (server → client), msg_type `0x0041`** — as of protocol 7 each entry
-also carries `title`, `timezone`, `status_emoji` and `status_text` (REQ-289).
-They existed on `PROFILE_INFO` alone, which is sent only to the user who edited
-them, so no client ever learned anyone else's; the people directory needs them,
-and so did the profile card that had to say the fields were not built.
-
 **`USER_LIST` (server → client), msg_type `0x0041`**:
 
 | Field       | Type            | Notes                                                        |
@@ -694,12 +672,12 @@ Each entry, in wire order:
 `display_name` (str) · `avatar_id` (u64) · `title` (str) · `timezone` (str) ·
 `status_emoji` (str) · `status_text` (str).
 
-`avatar_id` arrived at protocol 4 and the last four at protocol 7. Because this
-is a repeated list, an added field shifts **every** entry after the first — which
-is why each of those raised the protocol version rather than riding along.
-`title` and `timezone` are here, and not only on `PROFILE_INFO`, because that
-frame is sent to the person who edited them: before REQ-289 no client ever
-learned anybody else's.
+Because this is a repeated list, an added field shifts **every** entry after the
+first — which is why adding one always raises the protocol version rather than
+riding along. `title`, `timezone` and the status fields are here, and not only on
+`PROFILE_INFO`, because that frame is sent to the person who edited them: the
+people directory (REQ-289) and everyone else's profile card need them from the
+roster.
 
 **`SET_ROLE` (client → server), msg_type `0x0042`** `{ user_id: u64, role: u8 }` —
 changes a user's tenant role. Enforced by the role policy: only owner/admin may
@@ -843,8 +821,9 @@ Tombstoned messages are excluded from the list and lose their pin outright
 
 **Pin state is replayed on backfill.** A `BROADCAST` has no field for it, so
 after replaying a channel's messages the daemon emits a `PIN_UPDATED` for each
-pinned one (§6). Without this every pin silently vanished the moment a client
-reconnected — the same failure the reaction replay exists to prevent.
+pinned one (§6) — state that only travels on a live fan-out silently vanishes on
+reconnect, the same failure the reaction replay exists to prevent. (The
+history-paging path, §6.3, does not yet do this; that gap is tracked.)
 
 Failures are non-fatal `ERROR` frames carrying the `message_id` (8 bytes,
 big-endian) in `context`: `UNKNOWN_MESSAGE` (no such message in that channel, or
@@ -914,19 +893,24 @@ omitted: leaving a channel must stop it leaking through your saved list.
 ### Drafts (REQ-223, ARCH-101)
 
 **`SET_DRAFT` (client → server), msg_type `0x00C0`**
-`{ channel_id: u64, thread_root: u64, body: str }`. Upserts the draft for that
-conversation; **an empty body deletes it**, which is the same frame rather than a
-second op. Requires membership of the channel — a draft is user content *about* a
-conversation, and storing one for a channel you cannot see would report its
-existence back to you on every other device. Bodies over `OC_DRAFT_BODY_MAX`
-(16 KB) are **truncated, not refused**: no composer can type one that long, so a
-frame that size is a bug or a probe, and losing its tail beats losing the draft.
+`{ channel_id: u64, thread_root: u64, recipients: str, body: str }`. Upserts the
+draft for that conversation; **an empty body deletes it**, which is the same
+frame rather than a second op. A draft may be **unaddressed** (REQ-229):
+`channel_id` 0 with a comma-separated `recipients` id list beside it. An
+addressed draft requires membership of the channel — a draft is user content
+*about* a conversation, and storing one for a channel you cannot see would
+report its existence back to you on every other device. Bodies over
+`OC_DRAFT_BODY_MAX` (16 KB) are **truncated, not refused**: no composer can type
+one that long, so a frame that size is a bug or a probe, and losing its tail
+beats losing the draft.
 
-**`DRAFT` (`0x00C2`)** `{ channel_id, thread_root, updated_ms, body }` is sent to
-the writer's **other** connections as a device sync — never back to the
-connection that wrote it, which already has the text and would otherwise be at
-risk of overwriting a composer still being typed in. A delete arrives as the same
-frame with an empty body.
+**`DRAFT` (`0x00C2`)** `{ id, channel_id, thread_root, updated_ms, recipients,
+body }` is sent to the writer's **other** connections as a device sync — never
+back to the connection that wrote it, which already has the text and would
+otherwise be at risk of overwriting a composer still being typed in. A delete
+arrives as the same frame with an empty body. The surrogate `id` is what
+distinguishes unaddressed drafts from each other — they all share `channel_id`
+0, so the conversation key cannot tell them apart.
 
 **`LIST_DRAFTS` (`0x00C1`)** (no body) streams **`DRAFT` (`0x00C2`)** newest
 first, then **`DRAFTS` (`0x00C3`)** `{ count: u16 }`, capped at 256. Entries for
@@ -966,11 +950,11 @@ read state, which would require the table ARCH-95 argues against.
 an id, `limit/2` either side, so a jump target lands mid-screen with context
 rather than pinned to an edge.
 
-It replies as an ordinary **backfill replay** (§6): same rows, same ascending
-order, same attachments and reply counts, so the client's high-water dedup
-(ARCH-45) and every downstream fold work unchanged — only the `WHERE` differs
-from the backwards paging of §6.3. Read access is checked exactly as it is there:
-a permalink is not a way around membership.
+It replies with the **history replay encoding of §6.3**: same rows, same
+ascending order, same attachments and reply counts (and §6.3's reaction/pin
+gap), so the client's high-water dedup (ARCH-45) and every downstream fold work
+unchanged — only the `WHERE` differs from the backwards paging. Read access is
+checked exactly as it is there: a permalink is not a way around membership.
 
 ### 5.10 Threads (REQ-060)
 
@@ -1327,11 +1311,11 @@ absent pref falls back to the user's own default (`SET_NOTIFY_DEFAULT`, REQ-134)
 not to a fixed "all". Refused with `ERROR NOT_A_MEMBER` for a
 channel the caller can't access, or an invalid level.
 
-**`SET_DND` (`0x0091`) is RETIRED.** REQ-136 replaced the single quiet window
-with a schedule that states the hours notifications are **allowed** — the same
-two integers, the opposite sense — so the op number is retired rather than
-redefined. A number that means the reverse of what a peer thinks it means is how
-two sides agree loudly and behave differently.
+**Opcode `0x0091` is RETIRED and carries no frame.** The recurring schedule
+(`SET_SCHEDULE`, `0x00CC`) states the hours notifications are **allowed**; a
+retired opcode is never redefined, because a number that means the reverse of
+what a peer thinks it means is how two sides agree loudly and behave
+differently.
 
 **`LIST_NOTIFY_PREFS` (C → S), `0x0092`** (empty) — request the caller's full
 settings.
@@ -1387,11 +1371,12 @@ assemble its notification settings from four round trips or decide what to show
 while half of them are outstanding.
 
 *Why separate frames.* `NOTIFY_PREFS` ends in a repeated list, so anything added
-to its fixed part shifts every entry after the first — the trap that cost protocol
-version 3. And the separation is the design, not just an encoding convenience: the
-**pause** is manual and one-shot, the **schedule** at `0x0091` is recurring and
-planned, cancelling one has never cancelled the other, and a pause only ever *adds*
-silence — so the two can never disagree in a way needing a precedence rule.
+to its fixed part shifts every entry after the first — the repeated-list trap that
+forces a version bump. And the separation is the design, not just an encoding
+convenience: the **pause** is manual and one-shot, the **schedule** (`0x00CC`) is
+recurring and planned, cancelling one never cancels the other, and a pause only
+ever *adds* silence — so the two can never disagree in a way needing a precedence
+rule.
 
 ---
 
@@ -1419,7 +1404,7 @@ devices without leaking one frontend's bucket to another.
 
 ---
 
-### 5.16b Self-service profile (REQ-020)
+### 5.16b Self-service profile (REQ-240, ARCH-59)
 
 A user editing their own account: renaming themselves and rotating their local
 password. Both act on the **authenticated** user (`user_id` from the session, not
@@ -1470,10 +1455,7 @@ the password; that an invite was redeemed, never the token (ARCH-79).
 ### 5.16d Notification schedule, pause, and the notify default
 
 Everything a user says about *when* they are notified, beyond §5.16's per-channel
-level. `SET_DND` (`0x0091`) is **retired**: REQ-136's schedule replaced it and
-states the hours notifications are **allowed** — the same two integers with the
-opposite meaning, which is why the opcode was retired rather than redefined
-(ARCH-103).
+level. Opcode `0x0091` is **retired and never reused** (§5.16, ARCH-103).
 
 Each of these answers with a full `NOTIFY_PREFS` (`0x0093`) to **all** of the
 user's connections, followed by `SNOOZE`, `SCHEDULE` and `ALERT_PREFS`. That
@@ -1519,7 +1501,7 @@ actor's new position to the channel's other members, and every other member's
 position back to the actor (REQ-090's seen-by).
 
 `SNOOZE` is **self-only**. Other people learn *that* someone is not to be
-disturbed, through the DND byte on `PRESENCE_UPDATE` (protocol 5), and never
+disturbed, through the DND byte on `PRESENCE_UPDATE`, and never
 when they are back (REQ-122). The instant is enforced on read: a stamp already in
 the past reports as `0`, so no sweep and no shared clock are needed to agree a
 pause is over.
@@ -1761,13 +1743,13 @@ There is no request frame: the daemon extracts a committed message's URLs with
 the **shared address scanner** (`shared/url.c` — the same rules the client
 autolinks by, so an unfurl can never sit under text a client does not render as
 a link), fetches the first 3 off the hot path behind an SSRF gate, and fans the
-result to the channel's connected members. **Replayed on backfill and history**
-after the `REACTION_UPDATED` frames, because an unfurl travels only on this
-frame and a replay that omitted it would silently lose every preview on reload
-— the defect class the reaction and pin replays exist to prevent. An **edit
-drops the message's stored unfurls** and re-fetches from the new body, so a
-removed URL's preview cannot be replayed. Always on — there is no switch. Adding the frame needed no
-protocol-version bump; a peer that does not know it never expects it.
+result to the channel's connected members. **Replayed on backfill (§6.2) and on
+history paging (§6.3)**, because an unfurl travels only on this frame and a
+replay that omitted it would silently lose every preview on reload — the defect
+class the reaction and pin replays exist to prevent. An **edit drops the
+message's stored unfurls** and re-fetches from the new body, so a removed URL's
+preview cannot be replayed. Always on — there is no switch. Adding the frame
+needed no protocol-version bump; a peer that does not know it never expects it.
 
 ### 5.17 Audio call signaling (REQ-150, REQ-152)
 
@@ -1936,11 +1918,16 @@ and no further — permanently, since clients keep no local history (ARCH-88).
 Adding a field to the existing cursor entry would have changed a frame already
 in use; a new opcode is additive.
 
-The response reuses §6.2 exactly: `BROADCAST` frames in **ascending** id order
-(the order the client's high-water dedup expects), the matching
-`REACTION_UPDATED` frames, then `BACKFILL_DONE`. On this path `more` means
-**"older messages exist above this page"**, which is how a client knows to stop
-asking rather than retrying at the top of a channel forever.
+The response uses §6.2's replay encoding: `BROADCAST` frames in **ascending** id
+order (the order the client's high-water dedup expects) — each with its
+attachments, reply counts and author-name overrides — the matching `UNFURL`
+frames, then `BACKFILL_DONE`. **This path does not replay reaction or pin
+state:** messages loaded by paging backwards arrive without their reactions and
+pins. That is a defect, not a design — the same class §6.2's reaction replay and
+§5.9a's pin replay exist to prevent — and it is tracked as an issue. On this
+path `more` means **"older messages exist above this page"**, which is how a
+client knows to stop asking rather than retrying at the top of a channel
+forever.
 
 Read access is checked as everywhere else; a channel the user cannot read
 returns an empty page rather than an error.
@@ -2037,11 +2024,9 @@ table is the index and the authority on which values are taken.
 
 One opcode is **used by two message types** (`0x0070`), marked below:
 `SET_PROFILE`/`SET_PRESENCE` are both client→server and collide for real, and
-that is tracked. The other two shared values are gone — `TYPING` and
-`TYPING_UPDATE` moved to `0x007E`/`0x007F` in v8, leaving `0x0072` to
-`PROFILE_INFO` and `0x0073` to `LIST_FILE_CHANNELS` alone. `scripts/check_opcodes.sh`
+that is tracked. `scripts/check_opcodes.sh`
 (run by `make test` and CI) fails on any duplicate outside that one tracked
-exception, so this table cannot silently regain a shared value.
+exception, so this table cannot silently gain a shared value.
 
 | msg_type | Name | Direction | Notes |
 |---|---|---|---|
@@ -2140,7 +2125,8 @@ exception, so this table cannot silently regain a shared value.
 | `0x0074` | `FILE_CHANNELS` | S → C | (channel_id, count) pairs |
 | `0x0075` | `LIST_SESSIONS` | C → S |  |
 | `0x0076` | `SESSION_LIST` | S → C | never the tokens |
-| `0x0077` | `SET_NOTIFY_DEFAULT` | — |  |
+| `0x0077` | `SET_NOTIFY_DEFAULT` | C → S | the global fallback level (REQ-134) |
+| `0x0078` | `SET_AVATAR` | C → S | point my avatar at an uploaded attachment (REQ-240) |
 | `0x0079` | `OPEN_GROUP_DM` | C → S | open/create a group DM (REQ-056) |
 | `0x007A` | `ADD_EMOJI` | C → S | name + attachment id (REQ-072) |
 | `0x007B` | `DELETE_EMOJI` | C → S | name |
@@ -2176,7 +2162,7 @@ exception, so this table cannot silently regain a shared value.
 | `0x00B0` | `REGISTER_DEVICE_TOKEN` | C → S | register a mobile push token (REQ-132) |
 | `0x00B1` | `UNREGISTER_DEVICE_TOKEN` | C → S | drop a push token (logout / token change) |
 | `0x00B2` | `DEVICE_TOKEN_ACK` | S → C | register/unregister acknowledged |
-| `0x00B3` | `MENTION_UNRESOLVED` | — | Drafts (REQ-223, ARCH-101). DRAFT is deliberately BOTH the streamed list * entry and the dev… |
+| `0x00B3` | `MENTION_UNRESOLVED` | S → C | to the sender only: which mentioned names reached nobody (REQ-287) |
 | `0x00C0` | `SET_DRAFT` | C → S | upsert a draft (empty body = delete) |
 | `0x00C1` | `LIST_DRAFTS` | C → S | all of my drafts |
 | `0x00C2` | `DRAFT` | S → C | one draft: a list entry AND the sync push |
@@ -2248,7 +2234,7 @@ exception, so this table cannot silently regain a shared value.
 | REQ-140     | Chunked upload/download proxied through the daemon; blob in object storage, pointer in SQLite (§5.14, ARCH-69/70). |
 | REQ-141     | Every byte proxied, so access control is the ordinary membership check on the attached message — no signed URLs (§5.14, ARCH-69). |
 | REQ-170     | `CREATE_WEBHOOK`/`WEBHOOK_INFO` mint a hashed per-channel token; `POST /webhook/<token>` (ALPN-demuxed HTTP) posts as the creator (§5.15, ARCH-71). |
-| REQ-130/136/278 | `SET_NOTIFY_PREF`/`SET_NOTIFY_DEFAULT`/`SET_MUTE`/`SET_SCHEDULE`/`SET_SNOOZE`/`LIST_NOTIFY_PREFS` → `NOTIFY_PREFS`; server-authoritative settings synced to all the user's devices (§5.16, ARCH-72/103). REQ-131's `SET_DND` is retired — the schedule replaced it. |
+| REQ-130/136/278 | `SET_NOTIFY_PREF`/`SET_NOTIFY_DEFAULT`/`SET_MUTE`/`SET_SCHEDULE`/`SET_SNOOZE`/`LIST_NOTIFY_PREFS` → `NOTIFY_PREFS`; server-authoritative settings synced to all the user's devices (§5.16, ARCH-72/103). Opcode `0x0091` is retired and never reused. |
 
 Related decisions newly recorded in ARCHITECTURE.md: ARCH-41 (handshake &
 version negotiation), ARCH-42 (primitive field encodings), ARCH-43 (message id

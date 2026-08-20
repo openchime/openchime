@@ -20,8 +20,7 @@ what the finished system does, so without it a reader cannot tell a shipped
 guarantee from an intention. **Every marked requirement has a corresponding
 issue** in the [tracker](https://github.com/openchime/openchime/issues), which is the project's only issue list and the
 place priority is expressed — this document says *what*, an issue says *what is
-missing and what it costs*. The markers were assigned by checking the code,
-not by reading a prior status document.
+missing and what it costs*. The markers are assigned by checking the code.
 
 The daemon is a feature-complete v1 chat core: messaging, auth, roles, channels,
 DMs, reactions, threads, search, presence and typing, notification settings with
@@ -622,42 +621,18 @@ the requirement says so explicitly rather than implying one.
   Built (ARCH-72): `SET_NOTIFY_PREF` stores the level in `notification_prefs`
   (server-authoritative), and a `NOTIFY_PREFS` snapshot syncs it to all the
   user's devices.
-- **REQ-131.** Each user has been able to configure a **recurring daily**
-  do-not-disturb window that has suppressed push notification delivery without
-  altering in-app unread state (badges/counts have still updated). Built
-  (ARCH-72): `SET_DND` stores a daily UTC minutes-of-day window on `users`
-  (wrapping past midnight); it governs push only. The push *delivery* it gates
-  (REQ-132/133) is built as the daemon push emitter (ARCH-85), which honors the
-  window.
-
-  > **Superseded by REQ-136 (2026-07-31), which absorbs it.** Slack has one
-  > recurring mechanism, not two: *Every day* with one start and end is this
-  > requirement's case. What is written here stays as the record of what was
-  > built and how it behaves; the target state is REQ-136's schedule, and the two
-  > minutes-of-day columns below are replaced by it.
-  >
-  > **Naming, matched to Slack (2026-07-31).** Slack calls this half the **DND
-  > schedule** (`dnd_enabled`, `next_dnd_start_ts`, `next_dnd_end_ts`) and the
-  > manual one **snooze** (`snooze_*`). They are separate APIs with separate ways
-  > to cancel — `dnd.endDnd` ends the current scheduled period, `dnd.endSnooze`
-  > ends a pause — and cancelling one has never cancelled the other. Ours should
-  > read the same way so the two are never confused for versions of each other.
-  >
-  > **Correction (2026-07-31):** the line below says this "governs push only".
-  > That understates what is built — the Win32 client already suppresses desktop
-  > toasts while DND is active (`quiet = dnd_active(m)` gates the notify loop),
-  > which is right and matches Slack, where pausing notifications pauses the ones
-  > you can see. What DND does *not* touch is in-app unread state: badges and
-  > counts keep updating, because they are a record rather than an interruption.
-  >
-  > **Scope note.** This is one of **three** distinct mechanisms
-  > Slack ships, and for a long time this requirement was treated as if it were
-  > all of them. It is the *recurring* one. A **transient pause to an absolute
-  > instant** ("do not disturb until 17:00") is **REQ-278** and is **not
-  > expressible in this model at all** — a minutes-of-day window is periodic by
-  > construction, so storing "until 5pm today" here would silence 5pm *every*
-  > day. A **richer recurring schedule** (per-weekday windows) is REQ-136, and a
-  > **workspace-level default** is REQ-279.
+- **REQ-131.** Absorbed by **REQ-136**, the single recurring quiet-hours
+  mechanism: a daily do-not-disturb window is REQ-136's *Every day* mode with one
+  start and end. What this requirement contributes survives there — quiet hours
+  suppress notification delivery (push, and the client's own desktop toasts)
+  without altering in-app unread state, because badges and counts are a record
+  rather than an interruption. The **transient pause** to an absolute instant is
+  REQ-278 (a different type — a minutes-of-day window is periodic by
+  construction and cannot express "until 5pm today"), and a **workspace-level
+  default** is REQ-279. The naming follows Slack's: the recurring half is the
+  **schedule**, the manual half is the **pause/snooze**, they are separate
+  mechanisms with separate ways to cancel, and cancelling one never cancels the
+  other.
 - **REQ-132.** *(Built in the daemon; no client reaches it)* Push notifications have been delivered via APNs on iOS/macOS
   and FCM on Android (ARCH-16), at no per-notification cost, per the
   providers' free tiers as of this writing.
@@ -720,11 +695,8 @@ the requirement says so explicitly rather than implying one.
   REQ-137 deliberately separated it from level as the strongest "I do not want to
   hear from this", and a VIP that overrode it would make mute unreliable at the
   moment somebody is reaching for it. Slack documents the pause case only and is
-  silent on the other two; these are ours. **[needs ARCH decision — keyword and
-  priority-person storage, and where the match→notify test lives; it must be the
-  same shared scanner path as mentions (ARCH-89) or the highlight a reader sees
-  and the notification the server sends will drift.]** **Settled by ARCH-103
-  (2026-08-01):** keywords one per row in `notify_keywords`, priority people as a
+  silent on the other two; these are ours. **Settled by ARCH-103:**
+  keywords one per row in `notify_keywords`, priority people as a
   relation in `priority_people`, and a hit written into `mentions` with its own
   kind — so the push query, the activity feed and the reader's highlight all keep
   working unchanged. Matched by `shared/mention.c`, never by SQL.
@@ -737,21 +709,19 @@ the requirement says so explicitly rather than implying one.
   expressible as one daily range. A user's own schedule has overridden any
   workspace-level default (REQ-279).
 
-  **This is the ONLY recurring mechanism — it absorbs REQ-131 (2026-07-31).**
+  **This is the ONLY recurring mechanism — it absorbs REQ-131.**
   Slack has exactly one: *Every day* with a single start and end simply **is**
   the daily-window case, which is why its API exposes one schedule and not two
-  settings. Keeping our single window beside a per-weekday schedule would leave
+  settings. A single window beside a per-weekday schedule would be
   two things able to disagree about the same question, which is the trap REQ-278
-  was written to avoid. REQ-131 therefore records what was built and defers here;
-  its two minutes-of-day columns are replaced rather than supplemented. There are
-  no live deployments, so the schema change need not preserve existing values.
+  is written to avoid.
 
   **Stored against the user's local calendar day** (their timezone, REQ-241), not
   UTC. A per-weekday window is only meaningful locally: in UTC somebody's "Friday
   evening" silently becomes Saturday for a large part of the world.
 
-  **Settled by ARCH-103 (2026-08-01):** `dnd_enabled` becomes `dnd_mode`
-  (off/every day/weekdays/custom), the existing window columns carry the first
+  **Settled by ARCH-103:** `dnd_mode` selects
+  off/every day/weekdays/custom, the window columns carry the first
   three, and only *custom* adds rows to `notify_schedule`. The local day is
   resolved against a stored UTC offset the client refreshes on connect, not an
   IANA zone the daemon would have to parse per push.
@@ -780,7 +750,7 @@ the requirement says so explicitly rather than implying one.
   knows the user's timezone, so "until tomorrow morning" is a different moment
   per user), exactly as custom status does.
 
-  **Settled 2026-07-31: match Slack's model, which its API states exactly.**
+  **Settled: match Slack's model, which its API states exactly.**
   `dnd.info` exposes two independent mechanisms, and naming them apart is the
   whole design:
 
@@ -833,14 +803,21 @@ the requirement says so explicitly rather than implying one.
 - **REQ-137.** *(Partly built)* A user has been able to **mute a channel or DM**: muting has
   suppressed its notifications **and de-emphasized it in the sidebar** (dimmed,
   excluded from the unread badge) without the user leaving it — distinct from
-  setting its level to `none` (REQ-130), which governs notification only. **[needs
-  ARCH decision — mute storage (per-user, per-conversation) + its interaction with
-  unread accounting.]**
-- **REQ-138.** *(Not built)* A client has surfaced **OS-native desktop notifications** (a system
+  setting its level to `none` (REQ-130), which governs notification only.
+  Storage exists: `notification_prefs.muted` (migration 0026), set with
+  `SET_MUTE`; push excludes a muted conversation unconditionally, so mute
+  outranks both the level and a priority person. **[needs ARCH decision — the
+  unread-accounting half: what a muted conversation contributes to badges and
+  aggregate unread views.]**
+- **REQ-138.** *(Partly built)* A client has surfaced **OS-native desktop notifications** (a system
   toast) for messages due under the user's notification settings (REQ-130/134),
   with a content-preview toggle, plus optional **notification sounds and unread
   badges** on the app icon. These are per-client rendering of the server's notify
-  decision (ARCH-72), not a new server surface.
+  decision (ARCH-72), not a new server surface. **Built on Win32:** toasts and
+  tray balloons gated by the shared notify evaluator (`shared/notify.c`,
+  REQ-281), a taskbar overlay **unread badge**, and a taskbar **flash** on
+  notification (REQ-286). Not built: the content-preview toggle, sounds, and
+  every other frontend.
 
   **Sounds have been per event type, not one sound for everything** — a distinct,
   user-chosen sound for a new message, a priority-person message (REQ-135), a
@@ -886,8 +863,10 @@ the requirement says so explicitly rather than implying one.
   filter set larger than this one, and inventing persistence for view
   combinations before the filters exist would be building the lid before the box.
 - **REQ-280.** *(Excluded by decision)* **Email notifications have not been provided, in any deployment
-  model.** No digest, no "you were mentioned" mail, no unread summary, and no
-  outbound SMTP of any kind. Two reasons, both deliberate. **Operationally**, it
+  model.** No digest, no "you were mentioned" mail, no unread summary — no
+  notification email of any kind. (The one outbound-mail path contemplated
+  anywhere in the product is REQ-276's opt-in compliance journaling, which is an
+  operator-configured compliance export, not a notification.) Two reasons, both deliberate. **Operationally**, it
   would oblige every self-hoster to run or rent a mail relay and inherit
   deliverability, bounce, and unsubscribe handling — a second delivery system
   with its own failure modes, for a product whose entire delivery story is
@@ -904,37 +883,37 @@ the requirement says so explicitly rather than implying one.
   state is waiting when they return. That is an acceptable, even coherent, trade
   for an air-gappable deployment, but an operator has been told it up front
   rather than inferring it after choosing stand-alone.
-- **REQ-281.** *(Not built)* The decision *whether to notify a given user about a given
+- **REQ-281.** *(Partly built)* The decision *whether to notify a given user about a given
   message* has been made in **exactly one evaluator**, with a **documented
   precedence order**, and covered by a **truth table** rather than case-by-case
-  tests. Every input has fed that one function: the per-channel level (REQ-130),
+  tests. **The evaluator exists:** `shared/notify.c` (`oc_notify_decide`, with
+  `oc_notify_quiet` for the schedule) states the precedence — own message never;
+  mute is absolute; a priority person pierces everything else; then the schedule
+  and the pause; then the level, with keywords part of *mentions* — and the Win32
+  client's toast gate consults it. **What keeps the marker partial:** the
+  daemon's push query still states the same order in SQL (a test suite pins the
+  two against each other), and the intended end state is that it fetches rows
+  and asks the shared function instead. Every input has fed that one function: the per-channel level (REQ-130),
   the global default (REQ-134), mute (REQ-137), follow-every-thread (REQ-282),
   the recurring DND window (REQ-131), the per-weekday schedule (REQ-136), the
   transient pause (REQ-278), the workspace default (REQ-279), keywords and
   priority people (REQ-135), and mention resolution (REQ-221).
 
-  **This exists because the failure mode is already proven here.** Building
-  REQ-134 uncovered two live push defects of exactly this shape: the level
-  fallback was hardcoded to `ALL`, and `notification_prefs.muted` was **never
-  consulted at all** — so a user who had explicitly muted a conversation was
-  notified anyway. Both were silent, both were precedence errors, and both
-  survived because the decision was assembled inline rather than owned. Three
-  more inputs (REQ-136/278/279) are about to join it.
-
-  **Two properties have made the order testable rather than merely written
-  down.** First, the evaluator has been **pure** — inputs in, a decision out, no
+  **This exists because the failure mode is precedence errors assembled
+  inline** — silent, and invisible until somebody who muted a conversation is
+  notified anyway. Two properties make the order testable rather than merely
+  written down. First, the evaluator is **pure** — inputs in, a decision out, no
   I/O — so the truth table is a unit test with no daemon, matching how
   `shared/mention.c` and `shared/searchq.c` are already shared and tested.
-  Second, it has been the **single** implementation both the push worker and
+  Second, it must be the **single** implementation both the push worker and
   every client consult, for the same reason ARCH-89 gives for the mention
   scanner: two copies of a notify rule will disagree, and the disagreement will
   be invisible — one side silently notifying where the other would not.
-  **[needs ARCH decision — the precedence order itself. Proposed: most specific
-  and most recent wins. Mute beats level; a transient pause (278) beats a
-  schedule (136); a schedule beats the workspace default (279); an explicit
-  per-channel level beats the global default (134). The genuinely contested cell
-  is whether priority people (135) pierce a pause — see REQ-278's open question
-  on sender override — and it should be answered once, here, not twice.]**
+  **[needs ARCH decision — the evaluator is implemented without a decision
+  record; the precedence it enforces (mute absolute; priority people piercing
+  the level, the schedule and the pause but never a mute; keywords inside the
+  *mentions* level) should be recorded as an ARCH entry when the push query is
+  folded into it.]**
 - **REQ-283.** *(Not built)* A user has been able to set a **reminder** — on a message ("remind
   me about this" at a chosen time) and as a **due date on a saved item**
   (REQ-231) — and has been notified when it came due, through the same notify
@@ -991,7 +970,7 @@ the requirement says so explicitly rather than implying one.
   client rather than before it. **[needs ARCH decision — whether call-start is a
   level a user can set independently, as Slack does, or simply follows the
   conversation's level.]**
-- **REQ-286.** *(Not built)* A desktop client's **window and notification-area behaviour has
+- **REQ-286.** *(Partly built)* A desktop client's **window and notification-area behaviour has
   been specified and user-controllable**: whether closing the window **quits the
   application or leaves it running in the notification area / tray** still
   receiving notifications, and whether the taskbar entry is **flashed or
@@ -999,11 +978,12 @@ the requirement says so explicitly rather than implying one.
   in the tray, because a chat client that stops notifying the moment its window
   is closed silently breaks every other notification requirement in this section.
 
-  **Written because the behaviour already exists without a contract.** The Win32
-  client ships a tray icon and raises tray balloons (REQ-138) while `WM_CLOSE`
-  quits after warning about a non-empty outbox — so today, closing the window
-  ends notifications, and nothing anywhere says whether that is intended. This is
-  per-platform surface (ARCH-92), not a server concern. **[needs ARCH decision —
+  **The flash half is built on Win32** (the taskbar entry flashes, and carries an
+  unread overlay badge, REQ-138). **The close-to-tray half is not:** the Win32
+  client ships a tray icon and raises tray balloons while `WM_CLOSE` quits after
+  warning about a non-empty outbox — so closing the window ends notifications,
+  against this requirement's stated default. This is per-platform surface
+  (ARCH-92), not a server concern. **[needs ARCH decision —
   none expected; this is a client preference in the synced bucket, but the
   *default* is a product call.]**
 
@@ -1043,8 +1023,8 @@ the requirement says so explicitly rather than implying one.
   a filename line, for the common image types. This is a graphical-frontend
   capability; the **text-only TUI is exempt** (ARCH-75, no graphics), continuing
   to show the attachment line. Non-image types have shown a typed placeholder.
-  **[needs ARCH decision — inline-render type set + thumbnail generation/caching
-  (client vs. server).]**
+  The Win32 implementation decodes the common image types client-side (WIC) with
+  a client-side thumbnail cache; no server-side thumbnailing exists.
 - **REQ-143.** A user has been able to browse a channel's **files** — a view
   listing the attachments shared in a channel (and, per-user, files they shared or
   that were shared with them) — building on the attachment metadata already
@@ -1085,7 +1065,7 @@ the requirement says so explicitly rather than implying one.
 - **REQ-160.** *(Excluded by decision)* **Camera video** calling, and video streaming or playback beyond
   generic file-attachment handling (REQ-140), have not been supported. This is a
   deliberate scope exclusion, not a deferred feature pending an architecture
-  decision. **Amended (ARCH-86):** this exclusion is now scoped to *camera* video
+  decision. **Scoped by ARCH-86:** the exclusion covers *camera* video
   and general playback; **screenshare** is admitted separately as REQ-161, whose
   content profile (mostly static, low frame rate, a single sender) is
   fundamentally cheaper and whose use case is concrete. The exclusion is narrowed,
@@ -1442,11 +1422,10 @@ None are yet backed by an architecture decision.*
 - **REQ-222.** *(Partly built)* A URL in a message has been **unfurled** into a preview
   (title, description, thumbnail) fetched from the linked page. The fetch has been
   performed **server-side by the daemon or an isolated helper** — never by pushing
-  arbitrary client-side fetches — consistent with the island model. **Amended
-  2026-08-20: the per-tenant disable this requirement originally carried is
-  withdrawn — unfurling is simply on, with no switch.** The safety this feature
+  arbitrary client-side fetches — consistent with the island model. **Unfurling
+  is simply on — no switch, no per-tenant disable.** The safety this feature
   needs lives in the fetch itself (the SSRF gate and its caps), not in an off
-  button. **Built per ARCH-105 (daemon side):** an in-daemon fetch worker behind
+  button. **Built per ARCH-105:** an in-daemon fetch worker behind
   an SSRF gate, always on, the URL boundary rules shared (`shared/url.c`) so the
   daemon unfurls exactly what a client links, the `UNFURL` frame fanned on fetch
   completion and replayed on backfill/history, edits dropping stale previews.
@@ -1477,10 +1456,9 @@ None are yet backed by an architecture decision.*
   **The surface follows Slack's as closely as it can.** A conversation holding an
   unsent draft is marked in the sidebar, the draft is restored into the composer
   on returning to it, and it clears on send — the behaviour people already have
-  the habit for. The hub Slack pairs this with is **REQ-228**, built 2026-08-01
-  together with the scheduled half (REQ-224); until then this requirement's
-  surface was the sidebar mark alone, and a Drafts destination briefly appeared
-  in the *rail*, which is not where Slack puts it and was corrected with REQ-228.
+  the habit for. The hub Slack pairs this with is **REQ-228** — the Drafts,
+  scheduled & sent pane, reached from the Home sidebar rather than the rail,
+  which is not where Slack puts it.
 
   The sidebar marks a conversation that has a draft because a draft you
   cannot see you have is one you never return to. It is not counted as unread:
@@ -1512,7 +1490,7 @@ None are yet backed by an architecture decision.*
   count of the drafts waiting in it.
 
   **The sent half needs no new server work** and is recorded as a requirement so
-  it stops being an unnumbered feature: REQ-104's search already accepts a
+  it stops being an unnumbered feature: REQ-080's search already accepts a
   filters-only query, scopes results to what the user may read, orders newest
   first and pages on a keyset cursor, so "everything I sent" is `from:me` through
   the query that exists.
@@ -1520,7 +1498,7 @@ None are yet backed by an architecture decision.*
 - **REQ-229.** A user has been able to start a message **before choosing who it
   is for** — composing in a first-class pane, addressing it to any mix of
   channels and people, with the half-written result **preserved as an
-  unaddressed draft** (REQ-223, ARCH-101 as amended) so closing the pane has not
+  unaddressed draft** (REQ-223, ARCH-101) so closing the pane has not
   lost it. Sending has resolved the recipients into the right conversation:
   an existing channel, a direct message, or a group DM (REQ-056).
 
@@ -1563,14 +1541,13 @@ architecture decision.*
   built from a name would rot the moment it was. The half that matters is
   `HISTORY_AROUND`, a second mode on the history read that returns the messages
   surrounding an id: every surface that points at a message (pins, files,
-  activity, saved items, search) previously dead-ended with "that message is
+  activity, saved items, search) otherwise dead-ends with "that message is
   older than the loaded history". *Not built:* registering the `openchime://`
   scheme with the OS — a machine-wide registry write is an install-time act, not
   something a chat client should do as a side effect.
-- **REQ-233.** *(Not built)* A user has been able to set a **reminder** on a message or a
-  free-text note for a chosen time, delivered to them (typically as a bot DM) when
-  due. **[needs ARCH decision — reminder storage + delivery, cf. the scheduled-
-  delivery mechanism of REQ-224.]**
+- **REQ-233.** Folded into **REQ-283**, the single reminder requirement — one
+  mechanism, one delivery path (the activity feed and the notify path, never a
+  bot DM, per REQ-275).
 - **REQ-234.** A user has been able to **star (favorite)** channels and DMs and
   organize their sidebar into **custom sections** — per-user view state that has
   synced across their devices without affecting other users. **DONE** (2026-07-30):
@@ -1626,20 +1603,22 @@ messages (author name, ARCH-74). Not yet backed by an architecture decision.*
   with.
 - **REQ-289.** A user has been able to **browse the people in the workspace** — a
   directory listing everyone with their avatar, display name, title, custom status
-  and presence, searchable by name or title, opening a person's profile. Slack has
-  this and we did not; the channels directory (REQ-038) had no counterpart for
-  people, so the only ways to find somebody were the DM picker and the command
-  palette, both of which answer "who do I already know the name of".
+  and presence, searchable by name or title, opening a person's profile. Without
+  it the channels directory (REQ-038) has no counterpart for people, and the only
+  ways to find somebody are the DM picker and the command palette, both of which
+  answer "who do I already know the name of".
 
-  **It also fixed a gap in REQ-240, which was marked DONE.** Title and timezone
-  were carried only on `PROFILE_INFO`, which the daemon sends *to the person who
-  edited them* — so no client ever learned anyone else's, and the profile card
-  said the fields "are not built" although they were. They ride `USER_LIST` now,
-  which is why the protocol moved to 7.
+  Title, timezone and custom status ride `USER_LIST` as well as `PROFILE_INFO`
+  for this directory's sake: `PROFILE_INFO` goes only to the person who edited
+  the fields, so the roster is the one place every client can learn everyone
+  else's (a repeated-list layout change, hence a protocol-version bump).
 - **REQ-241.** A user has been able to set a transient **custom status** — a
   short text plus an emoji, with an optional expiry — shown alongside their name
-  and presence (Section 4). **[needs ARCH decision — status storage + expiry and
-  its relation to presence (ARCH-67).]**
+  and presence (Section 4). **Built** (migration 0027): `status_emoji` /
+  `status_text` / `status_expires_ms` on `users`, set with `SET_STATUS`, expiry
+  **enforced by the daemon on read** (a client that is not running cannot clear
+  its own state), carried on `PROFILE_INFO` and `USER_LIST`, and shown beside
+  names in the member pane and profile (REQ-122/240).
 
 ---
 
@@ -1681,11 +1660,18 @@ None are yet backed by an architecture decision.*
 - **REQ-252.** *(Not built)* A tenant subject to legal/compliance obligations has been able to
   place a **legal hold** on message history (including DMs, subject to
   authorization policy), suspending retention (REQ-250) for the held scope.
-  **Narrowed 2026-07-30:** the *export* and *DLP* halves of this requirement are
-  now REQ-276 and REQ-277, because they are different features with different
-  risk — one reads, the other writes to other people's messages — and carrying
-  them as one line hid that. Legal hold stays here.
+  The *export* and *DLP* halves are their own requirements — REQ-276 and
+  REQ-277 — because they are different features with different risk: one reads,
+  the other writes to other people's messages. Legal hold is this requirement.
   **[needs ARCH decision — hold model and its interaction with retention.]**
+
+- **REQ-253.** *(Not built)* A tenant has been able to **provision and deprovision
+  accounts via SCIM**, brokered as a **federated function** (ARCH-76): the
+  project-operated service carries provisioning metadata only — which accounts to
+  create, update or disable — never message content (REQ-041). A self-hosted
+  stand-alone deployment, which federates nothing, manages accounts locally
+  instead (REQ-024/033). **[needs ARCH decision — the SCIM surface's placement
+  (control plane vs. daemon) and its mapping onto the local account model.]**
 
 - **REQ-276.** *(Not built)* A tenant has been able to **capture its history for compliance** —
   every message, thread, file, channel and user, including **edits and deletions**
@@ -1773,7 +1759,7 @@ None are yet backed by an architecture decision.*
   saved items, files, exports — and accepts that the original was already delivered
   to everyone. Redacting **at send time** removes all of that: there is no
   after-the-fact mutation of other people's messages, no second deletion semantics
-  beside REQ-058's, and nothing to un-show.
+  beside REQ-052's, and nothing to un-show.
 
   **The example we ship and test: US Social Security numbers.** A reference webhook
   that rewrites `123-45-6789` to a redaction marker, exercised in the test suite so
@@ -1863,19 +1849,17 @@ REQ-269, whose accessibility half is a real open decision.*
   to the platform's accessibility layer, so a screen reader can convey a
   conversation rather than an unlabelled rectangle.
 
-  *Status: in progress on Win32 (ARCH-99, 2026-07-31).* The client is
-  keyboard-operable in the ordinary paths (composer, completion, conversation
-  movement, command palette, shortcut sheet) and, until now, exposed **no
-  accessibility surface at all** — it draws its own UI with Direct2D and
-  answered no `WM_GETOBJECT`, so a screen reader saw one blank window with nine
-  edit boxes in it. A self-drawn UI gets nothing for free here, which is exactly
-  why this is a requirement and not an assumption: the cost grows with every
-  pane added.
+  *Status: built on Win32 (ARCH-99); other frontends pending, which is what
+  keeps the marker partial.* The client is keyboard-operable in the ordinary
+  paths (composer, completion, conversation movement, command palette, shortcut
+  sheet) and answers `WM_GETOBJECT` with a **UI Automation provider over the
+  self-drawn UI**, raising UIA events and carrying a real system caret. A
+  self-drawn UI gets nothing for free here, which is exactly why this is a
+  requirement and not an assumption: the cost grows with every pane added.
 
-  **The approach is settled (ARCH-99): a UI Automation provider over the
-  self-drawn UI.** The custom controls are not walked back to native ones — they
-  are the product's rendering strategy (ARCH-82/98) and a deliberate choice, so
-  accessibility is implemented *for* them rather than by retreating from them.
+  **The approach (ARCH-99): accessibility is implemented *for* the custom
+  controls, not by retreating from them** — the self-drawn surfaces are the
+  product's rendering strategy (ARCH-82/98) and a deliberate choice.
 
 - **REQ-290.** Every element a user can act on in a graphical client has carried a
   **stable, unique automation identifier** — Win32's UIA `AutomationId`, and the

@@ -1,8 +1,7 @@
 # Releasing
 
 How `release.yml` publishes a version, and the things about it that are not
-obvious from reading the file. Written after the pipeline's first real run, so
-it records what was learned by executing it rather than what was intended.
+obvious from reading the file.
 
 ## Shape
 
@@ -32,7 +31,11 @@ sharing a version is the one thing apt cannot recover from.
 Reserving inverts the failure: the worst case is a **burnt number**, which costs
 nothing. The terminal `unreserve` job deletes the tag when `publish` did not
 succeed, which is safe precisely because nothing names it — no index, no GitHub
-release, no `:latest`.
+release, no `:latest`. One guard sharpens that: `publish` sets an output the
+moment the apt index lands, and `unreserve` requires it to be **unset** —
+returning a number is only safe while nothing has been published under it, and
+a failure *after* the repositories go live must burn the number rather than
+hand it back.
 
 `publish` therefore **asserts** the tag exists rather than creating it. If that
 assertion ever fires, something deleted the reservation mid-run.
@@ -53,21 +56,21 @@ does not exist.
 
 `publish` moves it at the end with `skopeo copy --all`, which re-points the tag
 registry-side without pulling, preserving the digest. `--all` copies the whole
-manifest list rather than just the runner's architecture. It replaced
-`docker buildx imagetools create`, which did the same job with a daemon.
+manifest list rather than just the runner's architecture.
 
 ## The apt/dnf pool guard
 
 Both repositories are regenerated from the **full** pool, not from this release's
 packages alone, or the index silently drops every prior release.
 
-The pool is fetched with `rclone`, and the fetch used to end in `|| true`. That
-cannot distinguish "prefix does not exist yet" from "credentials rejected" or
-"endpoint returned 503" — on any failure the pool was empty, the index was built
-from one release, and the upload replaced `Release`/`InRelease` in the bucket.
-The old objects survive; the index naming them does not.
+The pool is fetched with `rclone`, and the fetch must not swallow failure: a
+`|| true` cannot distinguish "prefix does not exist yet" from "credentials
+rejected" or "endpoint returned 503" — on any failure the pool reads as empty,
+the index is built from one release, and the upload replaces
+`Release`/`InRelease` in the bucket. The old objects survive; the index naming
+them does not.
 
-It is now two independent checks: `rclone lsjson` proves the prefix is reachable,
+So it is two independent checks: `rclone lsjson` proves the prefix is reachable,
 and the **tag count** is a second witness of what the pool should contain. An
 empty pool with prior release tags is a hard stop.
 
@@ -80,8 +83,8 @@ Verified against a real Tigris endpoint, four cases:
 | valid endpoint, bad credentials | **fail** |
 | prefix populated, prior releases exist | pass |
 
-The third case is the bug: with `|| true` it passed, with `pool_count=0`, and
-would have published a one-version index.
+The third case is the one the guard exists for: swallowed, it publishes a
+one-version index.
 
 ## Object storage
 
@@ -102,9 +105,8 @@ revoked without breaking the other. Splitting them needs a read-only key from th
 Tigris dashboard; `flyctl storage` has no key management (create, list, status,
 update, destroy, and nothing else).
 
-**The keys cannot be read back** from GitHub or Fly. `destroy && create` was the
-free way to rotate while the bucket was empty; once it holds the repositories,
-that throws them away. Rotation is a dashboard operation from here.
+**The keys cannot be read back** from GitHub or Fly, and `destroy && create`
+would throw the repositories away. Rotation is a dashboard operation.
 
 ## The archive signing key
 
@@ -133,75 +135,65 @@ Properties worth knowing before touching it:
 ## The unit file is validated, because nothing else validates it
 
 `openchimed.service` is 60 lines of `ProtectSystem`, `DynamicUser` and
-`RestrictAddressFamilies` that CI produces and, until recently, nothing ever
-parsed: both maintainer scripts gate the enable path on `[ -d /run/systemd/system ]`.
+`RestrictAddressFamilies` that nothing at install time parses strictly: both
+maintainer scripts gate the enable path on `[ -d /run/systemd/system ]`.
 
-The release runs `systemd-analyze verify` against it. This check needed a
-container originally, for exactly the reason above — `docker run` has no
-`/run/systemd/system`, so a container had to install systemd to have anything
-that would parse the unit. The runner is the opposite case: it boots systemd for
-real, so the check now runs directly on it, against a newer systemd than the
-bookworm container offered.
+The release runs `systemd-analyze verify` against it, directly on the runner —
+which boots systemd for real, so no container is needed to have something that
+parses the unit.
 
 Three things about the check are measured, not assumed:
 
 1. **`systemd-analyze verify` exits 0 for a directive it does not recognise.** Its
    status is worthless; the output must be grepped.
 2. **The pattern is `Unknown key`, not `Unknown key name`.** systemd words it
-   `Unknown key 'ProtectSystm' in section [Service], ignoring.` A first draft
-   matching `Unknown key name` passed a unit with a typo'd `ProtectSystem` — the
-   exact bug the step exists to catch.
+   `Unknown key 'ProtectSystm' in section [Service], ignoring.` — match the
+   wrong phrase and a typo'd `ProtectSystem` sails through, the exact bug the
+   step exists to catch.
 3. **The output must be scoped to our unit before it is matched.** `verify` walks
    the dependency graph and reports on everything it loads. In the container that
    was only `openchimed.service`; on the runner it is also the runner's own
    units, and `ubuntu-22.04` ships two that trip the patterns above —
    `snapd.service` has an `Unknown key name 'RestartMode'`, and
    `netplan-ovs-cleanup.service` gives `Failed to open ...: Permission denied`.
-   The first dry run after moving this check off the container failed on exactly
-   those, with nothing wrong in `openchimed.service`. Grepping for `openchimed`
+   Grepping for `openchimed`
    first is what makes the check about us; every message that concerns a unit is
    prefixed with its name or its path and line.
 
 Tested against three fixtures: real unit passes, typo'd key fails, bad `Type=`
 value fails.
 
-## What the clean-room install used to catch, and no longer does
+## Install coverage, and the rpm gap
 
-The release used to install each built package inside a pristine `debian:bookworm`
-and `rockylinux:9` container and run the binary — on the reasoning that a package
-which builds but does not install is precisely the failure a release pipeline
-exists to catch, and only an install finds it.
+A package which builds but does not install is precisely the failure a release
+pipeline exists to catch, and only an install finds it. Coverage today, without
+containers (ARCH-36):
 
-Both containers are gone, and this is a **deliberate reduction in coverage**, not
-a cleanup. What replaced them:
-
-- **The `.deb`** is installed on the runner itself and the binary is executed.
-  Weaker: Ubuntu rather than Debian, and a runner that is not pristine. It still
-  proves the package unpacks, its dependencies resolve, and what it lays down
-  runs.
-- **The `.rpm` has no replacement at all.** Nothing on a hosted runner can
+- **The `.deb`** is installed on the runner itself and the binary is executed —
+  Ubuntu rather than Debian, and a runner that is not pristine, but it proves
+  the package unpacks, its dependencies resolve, and what it lays down runs.
+- **The `.rpm` is never installed by anything.** Nothing on a hosted runner can
   install one. Between the identical-binary check and the apt repository smoke
   test, the *binary* and the *signing and object layout* are both covered — but
   nothing exercises `dnf`, so an rpm that builds and signs correctly yet fails to
   install on the RHEL family will not be caught before it is published.
-- **The published-repository smoke test lost its dnf half** for the same reason.
+- **The published-repository smoke test has no dnf half** for the same reason.
   The apt half runs on the runner and shares the signing key and object layout
   with the rpm repository, so faults in those still surface there.
 
-This trade was made to remove Docker from the pipeline entirely (ARCH-36). It is
-tracked as an open issue rather than treated as settled.
+The rpm gap is tracked as an open issue rather than treated as settled.
 
 ## Windows signing is optional
 
 `SIGN` requires a real release **and** all three `TRUSTED_SIGNING_*` secrets to
 be non-empty.
 
-The second half is load-bearing. It used to be `dry_run == false` alone, so a
-real release invoked `azure/trusted-signing-action` against an empty endpoint
-whether or not credentials existed. That fails `windows-package`, and `publish`
-needs it — so with no certificate the first real release would have published
-**nothing at all**: not the Windows installer, which cannot be signed, but also
-not apt, dnf, the image or the GitHub release, none of which needs a certificate.
+The second half is load-bearing: gating on a real release alone would invoke
+`azure/trusted-signing-action` against an empty endpoint whenever credentials
+are absent. That fails `windows-package`, and `publish` needs it — so with no
+certificate a release would publish **nothing at all**: not the Windows
+installer, which cannot be signed, but also not apt, dnf, the image or the
+GitHub release, none of which needs a certificate.
 
 Without the secrets the release ships an unsigned installer and says so twice: a
 `::warning::` plus step summary in the job, and a paragraph in the release notes
@@ -210,9 +202,9 @@ with no edit.
 
 ## Downloads are pinned
 
-`wingetcreate` is pinned to a versioned asset with a `Get-FileHash` check.
-`https://aka.ms/wingetcreate/latest` is a mutable redirect, and it was being
-executed with `WINGET_TOKEN` in scope. Bump `WINGETCREATE_VERSION` and
+`wingetcreate` is pinned to a versioned asset with a `Get-FileHash` check —
+`https://aka.ms/wingetcreate/latest` is a mutable redirect, and the tool runs
+with `WINGET_TOKEN` in scope. Bump `WINGETCREATE_VERSION` and
 `WINGETCREATE_SHA256` together; the hash is Microsoft's own, published beside the
 asset as `wingetcreate.exe.txt`.
 
@@ -229,58 +221,7 @@ Same rule as `build_mbedtls.sh`, which refuses to fetch without a known SHA-256.
 | `DIST_S3_ENDPOINT` / `DIST_BUCKET` | variable | rclone configuration |
 
 `GITHUB_TOKEN` covers GHCR; nothing extra is needed for the image. It is passed
-to `buildah login` and `skopeo --creds`, which replaced `docker login` when the
-pipeline stopped using Docker — the credential and its scope are unchanged.
-
-## What the first real release found
-
-It took **four attempts**, and every failure was in the release machinery rather
-than in anything being released. Every build, on every platform, was green from
-the first attempt onward. Recorded in order, because the pattern matters more
-than any single fault: each one was invisible to review and obvious the moment
-the pipeline ran.
-
-**Attempt 1 — the pool guard counted its own reservation.** `version` reserves
-`release-N` before anything is built; the guard counts `release-*` tags to tell
-"first publish" from "the fetch failed". On a first release those meet — pool
-empty, one tag — and it refused itself. Both mechanisms correct alone, wrong
-together. The count now excludes the current version.
-
-**Attempt 2 — the corrected count killed its own step, silently.** Once this
-release's tag is filtered out, a first release leaves `grep -vx` with no match.
-grep exits 1, `pipefail` propagates, `set -e` aborts the assignment. The step
-died in under a second having printed nothing at all: no notice, no error. This
-is the same defect as the dead error path in `winget/render.sh`, fixed hours
-earlier and reintroduced here — a no-match grep is not an error, but under
-`set -euo pipefail` it reads as one.
-
-**Attempt 3 — apt and dnf published, then the release step could not find the
-installer.** `no matches found for dist/windows-x64/*-setup.exe`. It had been
-built and uploaded correctly: `pattern: windows-*` matches exactly one artifact
-and unpacked it flat into `dist/`, while `pattern: linux-*` matches two and nests
-each in a named directory. The windows artifact is now downloaded by name.
-
-That attempt exposed a second, worse fault. It failed *after* the repositories
-were live, and `unreserve` dutifully handed the number back — leaving release 1
-visible to apt clients with no tag naming it. That is the published-but-untagged
-state reserving the number exists to prevent, reached from the other direction.
-`publish` now sets an output the moment the apt index lands, and `unreserve`
-requires it to be unset. **Returning a number is only safe while nothing has been
-published under it.**
-
-**Alongside all this — a docs-only pull request could not merge at all.**
-`ci.yml`'s `pull_request` trigger carried `paths-ignore: '**.md'` while those four
-jobs are required status checks, and a job that never triggers never *reports*,
-so the PR waited forever on a check that would not run. Found by opening one to
-write this file. `paths-ignore` stays on `push` and is gone from `pull_request`.
-
-**Attempt 4 — green.** Tag, GitHub release with six assets, apt and dnf live and
-smoked, `:latest` moved to `1`, and the WinGet pull request opened.
-
-The lesson worth keeping: **every one of these fixes was reviewed and statically
-sound, and three of the four faults were interactions between two correct
-changes.** No amount of re-reading either half would have surfaced them. A dry
-run would not have either — it withholds exactly the steps that failed.
+to `buildah login` and `skopeo --creds`.
 
 ## Dry runs
 

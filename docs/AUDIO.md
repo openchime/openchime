@@ -368,10 +368,8 @@ the canceller unchanged.
 
 ## 8. TUI surface
 
-**Corrected: there are no slash commands.** An earlier revision of this section
-specified `/call` and `/hangup`; the slash-command dispatcher was **deleted** in
-the TUI redesign (ARCH-83), and the TUI is now menu- and screen-driven. Joining
-and leaving a huddle are therefore actions in the **Ctrl+K command palette** and
+**There are no slash commands** (ARCH-83) — the TUI is menu- and screen-driven,
+so joining and leaving a huddle are actions in the **Ctrl+K command palette** and
 the channel action menu, exactly like every other TUI action.
 
 The roster renders in the Members panel or a dedicated overlay, showing

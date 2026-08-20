@@ -12,7 +12,11 @@ the DB-writer handlers, storage/maintenance, enrollment, push, and the shared
 and every client link that one implementation, ARCH-89), the message-formatting
 parser (`test_richtext`, REQ-220/ARCH-100 — same reasoning one level down: both
 frontends render from that one parser, and its edge cases are where a dialect
-eats text somebody meant literally), plus in-process
+eats text somebody meant literally), the shared URL scanner (`test_url` — the
+address-boundary rules the client autolinks by and the daemon unfurls by,
+shared for the same reason), the unfurl fetcher's pure halves (`test_unfurl` —
+the SSRF gate's per-address verdict, the HTML title/description scan, and the
+block-page refusal), and the shared notify evaluator, plus in-process
 integration suites that drive the real epoll server over TLS (`itest_netloop`,
 `itest_tls`, `itest_slow_blob`) and the headless client app-core
 (`test_client_core.c`) — all compiled into one `build/tests` binary by `make test`.
@@ -21,10 +25,6 @@ The black-box integration tier drives a natively-run daemon over a real socket
 30k random + 15k framed; clean under
 ASan/UBSan) and a concurrency load test (`tests/bench_load.c`, driven by
 `Scripts/bench.sh`) round it out.
-
-*Note: the replication/restore pipeline this document once exercised is gone —
-ARCH-3 withdrew replication from this repo entirely; off-box durability is a
-deployment concern (hosted lives in `openchime-saas`).*
 
 ---
 
@@ -177,37 +177,27 @@ further. `CLIENT_ACK`, backfill, version rejection and session revocation are
 exercised in the **in-process** integration suites (`itest_netloop`), not by this
 client.
 
-**Client-side TLS (settled).** The wire protocol runs over TLS with TOFU
+**Client-side TLS.** The wire protocol runs over TLS with TOFU
 pinning (ARCH-10, REQ-180); there is no plaintext fallback. The TLS library is
 mbedTLS (ARCH-51, [TLS.md](./TLS.md)), used by both the daemon and the test
-client; `shared/tls.c` already provides a TOFU-pinning client, so socket-level
-integration scenarios are no longer gated. `tests/itest_tls.c` exercises the
-handshake + pinning end-to-end today.
+client; `shared/tls.c` provides the TOFU-pinning client, and
+`tests/itest_tls.c` exercises the handshake + pinning end-to-end.
 
 ### 3.2 Runner: a natively-run daemon in CI
 
 Integration tests run **against the daemon binary CI just built**, started
-directly on the runner with the environment the Compose `daemon` service used to
-set, then driven by `build/e2e_client`.
+directly on the runner and driven by `build/e2e_client`.
 
-This replaced the previous runner and is a **weaker arrangement**, so the change
-is worth stating rather than glossing. Integration tests used to run against the
-Docker Compose environment defined for local dev (ARCH-36/38/39) — the same
-`daemon` + `minio` + `minio-init` topology — chosen precisely so that what CI
-exercised was *the image that ships*. The project no longer uses Docker
-anywhere (ARCH-36), so that stack, and the `Scripts/test-integration.sh` wrapper
-that drove it, were deleted rather than reimplemented.
-
-**Consequence: no test anywhere exercises the published container image.** The
+**No test anywhere exercises the published container image.** The
 release builds it with buildah and pushes it to GHCR; nothing pulls it, starts
 it or asserts anything about it. A fault confined to the `Dockerfile`, the
 entrypoint (ARCH-39) or the Alpine/musl build would not be caught before it
-reached users. The daemon's own behaviour remains covered by the assertions
+reached users. The daemon's own behaviour is covered by the assertions
 below and by the in-process suites.
 
-**There is also no local runner any more.** The two assertions live inline in
-the `integration` job of `.github/workflows/ci.yml`; `make integration` is gone.
-`make build/e2e_client` still builds the driver, so you can point it at a daemon
+**There is no local runner.** The two assertions live inline in
+the `integration` job of `.github/workflows/ci.yml`.
+`make build/e2e_client` builds the driver, so you can point it at a daemon
 you started yourself (`make run` starts one on `127.0.0.1:8443`).
 
 ### 3.3 Scenarios
@@ -217,9 +207,8 @@ part that matters**, because the two tiers reach different things: the black-box
 tier drives the daemon over a real socket from a separate process, and the
 in-process suites reach states a black-box client cannot drive.
 
-Note what this list no longer claims. The black-box tier used to prove that the
-shipped *image* works; it now proves that the built *binary* works. Nothing
-proves the image works (§3.2).
+Note the scope of the claim: the black-box tier proves that the built *binary*
+works. Nothing proves the shipped *image* works (§3.2).
 
 **Black-box, against a natively-run daemon (the `integration` job in
 `.github/workflows/ci.yml`) — two checks:**
@@ -259,10 +248,13 @@ proves the image works (§3.2).
 ## 4. Continuous integration
 
 CI is GitHub Actions (`.github/workflows/ci.yml`), mirroring openblocks'
-conventions: it triggers on **every branch push** — deliberately unfiltered, so
-the branch gate CONTRIBUTING.md's merge policy depends on is real — and on pull
-requests targeting `main`. It skips doc-only changes via `paths-ignore` and uses
-a `concurrency` group to cancel superseded runs.
+conventions. The `push` trigger runs on **every branch except `main`** — main is
+covered by the required checks on pull requests and by the release workflow's
+`workflow_call`, so a standalone push run would only cancel its twin in the same
+`concurrency` group — and skips doc-only changes via `paths-ignore`. The
+`pull_request` trigger targets `main` and deliberately has **no** `paths-ignore`:
+the jobs are required status checks, and a job that never triggers never
+reports, so a docs-only PR would wait forever on a check that will not run.
 
 Jobs:
 
@@ -270,8 +262,8 @@ Jobs:
   Fast feedback on compile + unit tests.
 - **`integration`** — the daemon end-to-end, natively: build it and the e2e
   client, start the daemon on the runner, wait for `/healthz`, then drive the
-  protocol vertical over TLS with the e2e client. It used to build the image and
-  bring up the Compose stack instead; see §3.2 for what that change gave up.
+  protocol vertical over TLS with the e2e client (§3.2 — the published image is
+  tested by nothing).
 - **`core`** — a standalone compile-check of the client app-core (ARCH-74).
 - **`windows`** — the Windows cross-compile of the TUI and GUI
   (`make windows-tui windows-gui`), so the ported client stays building.
@@ -295,8 +287,8 @@ New unit-test binaries are added to the `build` job's `make test`.
 ## 5. Capacity benchmark (REQ-210/211)
 
 Measured answers to "how much memory does the daemon use, and how many
-concurrent connections does it hold" — the two requirements that were previously
-plausible-but-unmeasured. Reproduced by `Scripts/bench.sh`, which drives the
+concurrent connections does it hold" — measured, not assumed. Reproduced by
+`Scripts/bench.sh`, which drives the
 running daemon with the `tests/bench_load.c` load client and samples the
 daemon's resident memory (`/proc/<pid>/status` `VmRSS`) while the load runs.
 
@@ -330,18 +322,6 @@ Representative figures (they vary a few KB/ms run to run):
 | 200 idle connections | ~15–18 MB total |
 | Message round-trip (persist + `SEND_ACK`), 32 concurrent senders | **p50 ~2–3 ms, p90 ~80 ms, p99 ~130 ms** |
 | Connection *setup* throughput | **~2 logins/sec** (see bottleneck below) |
-
-> **Corrected 2026-07-19.** The two figures above were previously recorded as
-> *p99 ~20–40 ms* and *~6–7 logins/sec*. Both were measured against a harness
-> that was silently dropping most of its connections: `bench_load` used a 10 s
-> read timeout while authentication is a 600k-iteration PBKDF2 serialized on the
-> single writer, so a 32-connection burst only ever landed ~10 authenticated
-> clients — and `Scripts/bench.sh` stripped the `connections_ok=` prefix that
-> would have shown it. The latency percentiles were therefore measured at about a
-> third of the intended concurrency, which flattered them by roughly 5×. With the
-> timeout raised so all 32 connect, p99 is ~130 ms. The per-connection memory
-> figure survived the correction largely unchanged (~58–60 KB), because peak RSS
-> had included the connections that later timed out.
 
 The per-connection cost is dominated by the mbedTLS session buffers plus the
 per-connection frame reassembler and output buffer — flat and predictable, with
@@ -406,10 +386,10 @@ entirely, which is what a real reconnect storm uses.
 ### Slow-backend isolation (ARCH-69)
 
 `itest_slow_blob` (in `make test`) answers the question the transfer pool exists
-for and that nothing previously tested: **does a slow blob backend stall message
-delivery?** Every earlier test ran against the local filesystem, where a blob
-operation completes in microseconds — the ~100 ms/op regime the pool was built
-for was never exercised.
+for: **does a slow blob backend stall message delivery?** Every other test runs
+against the local filesystem, where a blob operation completes in microseconds —
+so without this one, the ~100 ms/op regime the pool exists for would go
+unexercised.
 
 The test points the daemon's S3 backend at a loopback endpoint that dribbles a
 download 16 KB at a time with a 120 ms delay between pieces, then measures one
@@ -421,8 +401,8 @@ backend 120 ms/op, 3 slow segment(s) served DURING the measurement
   (= 360 ms of backend stall the loop did not absorb)
 ```
 
-**The test discriminates.** Temporarily reverting `download_pump` to read inline
-on the epoll thread (pre-ARCH-69 behavior) makes the run **time out entirely** —
+**The test discriminates.** Reverting `download_pump` to read inline
+on the epoll thread (the behaviour ARCH-69 forbids) makes the run **time out entirely** —
 the loop freezes on the slow reads and the daemon stops serving anyone. A test
 that cannot fail proves nothing, so this was verified rather than assumed.
 
@@ -447,29 +427,19 @@ Running the storage maintenance pass every 200 ms — 25× more often than the
 | KB per connection | 55–57 | 52–65 |
 | Round-trip latency | unchanged | unchanged |
 
-### Known harness limitations
+### Harness conventions worth knowing
 
-**Diagnosed and fixed.** The shortfall was `bench_load`'s own 10-second read
-timeout, not a daemon limit. Authentication is a 600k-iteration PBKDF2 that runs
-**serialized on the single writer thread**, measured here at **~2 logins/sec**
-(≈500 ms each — the expected cost of 600k iterations). A burst of N clients
-therefore takes N/2 seconds to drain, so everything past roughly the 20th client
-gave up mid-authentication and was counted as a connection failure.
+- `bench_load`'s read timeout is 180 s, so the serialized PBKDF2 auth ramp
+  (~2 logins/sec, ≈500 ms each) is never the limit — a burst of N clients takes
+  N/2 seconds to drain, and a short timeout would count slow-but-fine clients
+  as connection failures.
+- `Scripts/bench.sh` prints the whole result line, `connections_ok=` included —
+  a failed connection reports `rtt 0.00`, so hiding the count makes a degenerate
+  run read like an outstanding result.
+- The memory table reports **requested vs connected** and divides by the
+  connections that actually established.
 
-The knee is sharp and reproducible: 8/8 and 16/16 connect, 24 drops to 22/24.
-
-Three fixes, all in the harness — the daemon was behaving exactly as designed:
-
-- `bench_load`'s read timeout is now 180 s, so the auth ramp is never the limit.
-- `Scripts/bench.sh` prints the whole result line. It previously piped through a
-  `sed` that kept only `rtt_ms...` and dropped the `connections_ok=` prefix —
-  and failed connections report `rtt 0.00`, so a degenerate run printed
-  `p50=0.00 p90=0.00 p99=0.00`, which reads like an outstanding result rather
-  than no result at all.
-- The memory table now reports **requested vs connected** and divides by the
-  connections that actually established, rather than by the number requested.
-
-**The real constraint this exposes** is that connection setup is bounded at
+**The real constraint** is that connection setup is bounded at
 ~2/sec by design (REQ-191 wants PBKDF2 expensive). A server restart with a few
 hundred clients reconnecting takes minutes to fully re-authenticate them, and
 session-token reconnect (ARCH-58) — which skips PBKDF2 entirely — is what makes
@@ -497,14 +467,8 @@ outbound wires (enrollment, ARCH-84; push, ARCH-85). Verified end to end.
 
 ### Run it — scripted, against a control plane you started yourself
 
-This is now the only way to run it. There used to be a one-command
-`docker compose -f docker-compose.federated.yml up --build` that stood up
-Postgres + the control plane + a hands-off-enrolling daemon in one go; that file
-was deleted along with every other use of Docker in the project (ARCH-36), and
-the hands-off enrollment shortcut it orchestrated (a shared volume for
-`OPENCHIME_ENROLL_CODE_FILE` plus an `enroll-init` step calling the dev reserve
-endpoint) went with it. **Bringing up Postgres and the control plane is now
-your job.**
+**Bringing up Postgres and the control plane is your job** — there is no
+one-command stack for it (ARCH-36).
 
 Start the control plane directly (e.g. `dotnet run` with `Push:Log:Enabled=true`
 against a Postgres you started), then:
@@ -536,8 +500,7 @@ That is the daemon→central push wire firing end to end (signed, contentless).
 plane **mints** an ES256 identity token and a daemon in **OIDC mode verifies** it against
 the central key it pins. It generates an ES256 keypair (private → the control plane's
 signing key, public → the daemon), starts both — **it needs a Postgres already
-listening on `localhost:5432`, which it used to start itself via the sibling
-repo's compose stack and no longer does** — mints a token via the dev endpoint
+listening on `localhost:5432`** — and mints a token via the dev endpoint
 `POST /api/dev/oidc/token` (gated on `Oidc:DevMintEnabled` — never in prod), and runs:
 
 ```sh
@@ -605,15 +568,19 @@ real time three times in a single day before the guard existed.
 skips the build and `OC_DRIVE_NO_DAEMON=1` leaves the daemon alone — for when a
 mismatched pair is the thing under test, such as the version-reject path.
 
-> **The smoke owns its own daemon (fixed 2026-07-31).** It defaults to
+**Two verbs put text in the composer, and they are not interchangeable.**
+`type` sets the buffer directly (`ed_set`), bypassing the editor's own rules;
+`typekeys` sends each character as a real `WM_CHAR` through the editor, so the
+rich-mode typing rules (pending styles, continuation, delimiter handling) run
+exactly as they do for a user. Testing an editor behaviour with `type` proves
+nothing about typing.
+
+> **The smoke owns its own daemon.** It defaults to
 > port **9500** and `/tmp/oc-smoke`, wipes that directory, and **verifies the
 > workspace it reached is the fixture** — name plus the presence of alice, bob
-> and carol — refusing to run otherwise. Before that it silently adopted whatever
-> was listening: during the 2026-07-30 review it bound to a nine-hour-old daemon
-> holding real workspace data and reported confident failures for group DMs and
-> `@`-completion because the fixture users did not exist there. It also no longer
-> leaves `smokevis` / `smokedrafts` channels in anyone's workspace, since it
-> starts from an empty one.
+> and carol — refusing to run otherwise. Silently adopting whatever daemon is
+> listening means asserting fixture users against somebody's real workspace and
+> reporting confident nonsense, which is exactly what the fixture check refuses.
 >
 > **Kill a dev daemon by its environment, not its command line.** It is started
 > as `env OPENCHIME_PROTO_PORT=… openchimed`, so the port never appears in the
@@ -623,61 +590,32 @@ mismatched pair is the thing under test, such as the version-reject path.
 > writes to the unlinked inode), and every upload fails with an opaque
 > `transfer error`. Match `/proc/<pid>/environ`, as `gui_smoke.sh` now does.
 
-## Known flakiness
+## Reading the GUI smoke
 
-*None currently known in the GUI smoke.*
+**The suite is deterministic — no known flakiness.** Two disciplines keep it
+that way: an assertion **waits on the state it is about to assert**
+(`expect_eventually`, `wait_grep`, `settle`) rather than sleeping, so a true
+assertion returns on the first poll and only a real failure pays the timeout;
+and chords and overlays assert the whole closed→open→closed **round trip**,
+refusing to credit a close whose open never happened. The plain sleeps that
+remain sit *between* driving steps as settling time, never as assertion timing —
+a new assertion does not add a sleep. Tune the patience with `OC_SMOKE_WAIT_MS`
+(default 6000), and read the total the run prints rather than quoting a number
+from a document: the suite grows, and helpers like `fitcheck` assert in loops.
 
-**Resolved 2026-07-31 — the suite was flaky and is now deterministic.**
-Five consecutive runs used to give 2 failures, clean, clean, 2 failures, 4
-failures, with the failing assertions *moving between runs*. Every failure was a
-harness artifact, not a product defect. Two causes, both fixed:
-
-1. **It slept instead of waiting.** 96 hand-tuned `sleep`s guarded 91
-   assertions. `ack` means the verb's *handler ran*, not that its effect is
-   observable — most dump fields are recorded during `WM_PAINT`, and anything
-   that reaches the server lands a round trip later. The suite now waits on the
-   state it is about to assert (`expect_eventually`, `wait_grep`, `settle`), so
-   a true assertion returns on the first poll and only a real failure pays the
-   timeout. Seven `sleep`s remain, all inside those poll loops.
-2. **It asserted states, not transitions** — so "Esc closes the palette" passed
-   when the palette never opened, inflating the pass count on exactly the runs
-   where something was broken. Chords and zoom now assert the whole
-   closed→open→closed round trip and refuse to credit the close if the open
-   never happened.
-
-After the fix the suite went six consecutive runs clean. It has grown a great
-deal since — it reported **249 checks** on 2026-08-02 — so read the total the run
-prints rather than quoting a number from here. Tune the patience with
-`OC_SMOKE_WAIT_MS` (default 6000).
-
-**Not every `sleep` is inside a poll loop.** The determinism rewrite replaced the
-sleeps that *guarded assertions*, and those are gone; the suite still uses plain
-inter-action sleeps between driving steps (roughly two dozen), which are settling
-time rather than assertion timing. A new assertion waits on the state it is about
-to assert — it does not add a sleep.
+**Standing failures — the current baseline.** Six checks fail on a healthy
+tree, none of them flaky, reproducing identically run to run: the drafts pane's
+Sent-tab check, a four-check `chromefit` cluster around the shelf's drafts row
+and the composer's send control (siblings overlapping at some DPI × zoom ×
+text-size points), and one composer-typing residue check. A run whose failures
+match this baseline is clean; a run with a *different* failure has found
+something.
 
 *One caveat when reading a failure message:* the dump's `comp=` field is the
 **IME composition length**, not the autocomplete popover — the dump exposes no
-popover state, so `comp=0` beside a completion failure means nothing. The fields
-worth reading are `error_seq` and `last_error`, added 2026-07-31: without them a
-failed intent and an intent that was never sent look identical.
-
-**Resolved 2026-07-29 — the one intermittent assertion.** `test_client_core`'s
-live two-client section failed occasionally on
-`WAIT_FOR(a, m->last_error[0] != '\0')` after a deliberately-rejected password
-change, and passed on the retry.
-
-The cause is a **fragile assertion, not a slow one**: `last_error` is *cleared*
-on `OC_EV_CONNECTED` and `OC_EV_AUTH_OK`, so any reconnect between the rejection
-arriving and the check erases the evidence the test is waiting for. The wait is
-5 s (500 × 10 ms), which was never the problem.
-
-It now asserts on **`error_seq`**, which only ever increments — the model's own
-comment says that field exists precisely so a repeated failure cannot be
-un-observed. An assertion on monotonic state cannot be raced by a clear.
-
-**Honesty about the diagnosis:** this was not reproduced on demand — 12
-consecutive runs stayed green, including six under 8-way CPU load — so the
-*trigger* for the reconnect is unproven. What is proven is that the old
-assertion could be defeated by one, and the new one cannot. If something in this
-area fails again, that is new information and worth chasing rather than retrying.
+popover state, so `comp=0` beside a completion failure means nothing. The
+fields worth reading are `error_seq` and `last_error`: without them a failed
+intent and an intent that was never sent look identical. Prefer asserting on
+`error_seq`, which only ever increments — `last_error` is cleared on
+`OC_EV_CONNECTED`/`OC_EV_AUTH_OK`, so a reconnect between the failure and the
+check can erase the evidence a wait is polling for.

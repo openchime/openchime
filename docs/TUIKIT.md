@@ -99,29 +99,9 @@ supplies a function that formats item *i* into a styled string. This is the rule
 Compiled into the TUI targets (repo style — one gcc invocation, no separate archive step):
 `TUIKIT_SRC := $(filter-out tuikit/demo.c,$(wildcard tuikit/*.c))` + `-Ituikit`, added to both
 `tui` and `windows-tui` (`demo.c` is filtered out — it carries its own `main()`).
-`tk_term` absorbs the former `client/tui/termbox2_win.c`. `termbox2.h`/`utf8proc` stay
+`tk_term` owns the Windows console backend. `termbox2.h`/`utf8proc` stay
 vendored in `third_party/`. `libtuikit.a` (an `ar` archive of `tuikit/*.o`) is a documented
 option for reuse elsewhere, not required now.
 
 `tuikit/demo.c` (`make tuikit-demo`) exercises each widget standalone — the library's own
 smoke, no daemon needed.
-
-## Build order (shipped)
-
-The toolbox and the redesign it enables are complete. It landed in this order:
-
-1. **Terminal merge + `tk_draw`/`tk_style`** — zero behaviour change; the TUI runs identically
-   on POSIX and Windows. De-risked the library before any widget work.
-2. **`tk_key`** — the keymap/help model; converted the TUI's hint bar + help screen to it.
-3. **The widgets** — `tk_list`, `tk_input`, `tk_textarea`, `tk_viewport`, `tk_modal`, with
-   `tuikit/demo.c`.
-4. **Migrated the chat TUI onto the widgets**, then **deleted the slash-command dispatcher** —
-   the composer's Enter only sends; actions moved to context menus, dialogs, and the Ctrl+K /
-   `:` command palette. This menu/screen-driven UX is the reason `tuikit` exists.
-5. **Round 2** — 256-color output + `tk_theme`, the `tk_palette` command launcher, arrow-nav
-   (dropped `j/k`), and on-screen key hints in `Ctrl+X` form.
-
-The reuse map (which former `client/tui/main.c` helper seeded which module): `cp_width`/
-`draw_clip`/`fill_row` → `tk_draw`; `draw_panel`/`draw_frame` → `tk_style`; `fuzzy`/
-`palette_build`/pickers → `tk_list`+`tk_modal`+`tk_palette`; `draw_field`/composer edit →
-`tk_input`; `wrap_push` → `tk_textarea`/`tk_viewport`; the hint strings + `draw_help` → `tk_key`.
