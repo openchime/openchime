@@ -196,7 +196,16 @@ business:
   draws in the same place, arrows cross an invisible run within one keypress,
   typed text lands inside an adjacent run rather than breaking it, and a
   delimiter that stops parsing because of an edit elsewhere is **deleted** — the
-  formatting goes, the markup never appears. That last rule is forced: keeping
+  formatting goes, the markup never appears. Two pieces of **typing intent**
+  carry the rich-editor contract over the places the dialect cannot express
+  directly: a style toggled with nothing to wrap is *pending* (nothing inserted
+  until the first character, so an empty pair never sits visible), and
+  whitespace typed at a run's back edge steps *outside* the closer and arms a
+  *continuation* that pulls the closer forward over the gap at the next word —
+  so "bold on, type a sentence" stays bold across its spaces. A toggle also
+  snaps a mid-word edge outward to the word, absorbs same-style runs the range
+  touches, and splits an enclosing run to un-format a piece of it; every one of
+  those exists so a toggle can never leave markup that does not parse. That last rule is forced: keeping
   `x` emphasised in `a*x*` would need the word-boundary rule of §2 to bend, and
   that rule is what stops `a_variable_name` becoming italic.
   **A link is accent + underline, and the cursor is the affordance**.

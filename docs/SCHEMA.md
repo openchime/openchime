@@ -4,7 +4,7 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Status.** **Migrations 0001–0037 are applied** (`daemon/migrate.c`,
+**Status.** **Migrations 0001–0038 are applied** (`daemon/migrate.c`,
 `OC_MIGRATIONS`). 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
 credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
@@ -23,7 +23,8 @@ global notification default; **0029** (§3y) custom emoji; **0030–0031** (§3z
 drafts, then unaddressed drafts; **0032** (§3aa) scheduled messages;
 **0033–0035** (§3j) the notification pause, the per-weekday schedule that
 replaces the DND window, and keywords + priority people; **0036** (§3ab) thread
-follows and per-thread read cursors; **0037** the attachment idempotency token.
+follows and per-thread read cursors; **0037** the attachment idempotency token;
+**0038** (§3ac) link unfurls.
 
 *Corrected: an earlier revision of this line said presence, notification config,
 and attachments were "intentionally not here yet." Notification config landed in
@@ -933,6 +934,32 @@ The partial `idx_sched_due` is what the ~15 s firing sweep reads
 shown to the author, because a message promised and not sent is the one case
 where silence is indefensible.
 
+## 3ac. Migration 0038 — link unfurls (REQ-222, ARCH-105)
+
+```sql
+CREATE TABLE unfurls (
+  message_id    INTEGER NOT NULL REFERENCES messages(id),
+  channel_id    INTEGER NOT NULL REFERENCES channels(id),
+  url           TEXT    NOT NULL,
+  title         TEXT,
+  descr         TEXT,
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (message_id, url));
+```
+
+**Completed fetches only — there is no pending state.** A fetch that fails or
+never finishes leaves nothing to clean up, nothing to sweep, and nothing to
+replay. The primary key makes a re-fetch (after an edit re-adds a URL, or on the
+`INSERT OR REPLACE` a duplicate store performs) an upsert rather than a second
+row.
+
+*`channel_id` is denormalised* from the message exactly as `mentions` (§3q) and
+`pins` (§3r) do it: the backfill replay reads unfurls by message and must not
+join per row. *No thumbnail column* — og:image is deferred (ARCH-105), and a
+column now would pretend otherwise. Rows are deleted with the message's other
+body-attached state on tombstone (§3r's reasoning) and wholesale on edit, since
+they describe the old body; the net thread re-fetches from the new one.
+
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 
 Documented with the notification tables in §3j, since they arrived together.
@@ -946,8 +973,8 @@ Tracked here so the omissions are deliberate, not forgotten:
 - **Thread notifications** (REQ-061) — still deferred. Its dependency, @mentions
   (REQ-221), is now built (§3q), so what remains is deciding *when a reply
   notifies a thread's participants*, not the mention machinery underneath it.
-- **Link unfurls** (REQ-222) and **polls** (REQ-225) — forward scope, no ARCH
-  decision and no schema. **Snippets** (REQ-226) have half of what they need:
+- **Polls** (REQ-225) — forward scope, no ARCH decision and no schema. (**Link
+  unfurls** left this list with migration 0038, §3ac.) **Snippets** (REQ-226) have half of what they need:
   fenced code blocks parse and render (REQ-220), but a titled snippet *object*
   does not exist.
 - **Retention policy** (REQ-250) — opt-in message ageing, distinct from REQ-217's
