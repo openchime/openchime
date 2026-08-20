@@ -2820,53 +2820,54 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
         for (size_t si = 0; si < sizeof SHELF / sizeof SHELF[0]; si++) {
             int on = (g_view == SHELF[si].view);
             if (on) g_n_sbsel++;
-            D2D1_RECT_F row = rf(sx0, sy, sx1, sy + ROW_H);
+            /* Inset 2px exactly as a conversation row's selection is: two
+             * highlight shapes in one column read as a defect, not a style. */
+            D2D1_RECT_F row = rf(sx0, sy + 2, sx1, sy + ROW_H - 2);
             if (on) fill_round(rt, row, 6.0f, OC_COL_SELECT);
             else if (g_shelf_hover == (int)si) fill_round(rt, row, 6.0f, OC_COL_HOVER);
-            draw_lucide(rt, SHELF[si].icon, rf(sx0 + 10, sy + 7, sx0 + 28, sy + 25),
+            /* Everything here scales with UIS and centres on ROW_H — raw
+             * pixel offsets drifted at Large text and zoom (ARCH-97). */
+            float ic = UIS(18.0f), iy = sy + (ROW_H - ic) / 2;
+            draw_lucide(rt, SHELF[si].icon, rf(sx0 + UIS(10), iy, sx0 + UIS(10) + ic, iy + ic),
                         on ? OC_COL_TEXT : OC_COL_MUTED);
-            /* Reserve what the badge MEASURES, not a constant 40: at large text
-             * the count ran over its own label — "Drafts, schedule✎ 2". */
+            /* The badge is computed ONCE — its text, then the width the
+             * label must leave for it — and drawn below with the same
+             * numbers. It used to measure a reserve here and draw into a
+             * different, fixed window there, which is how a wide count crowded
+             * its own label. */
+            char  badge[24] = "";
             float badge_w = 0;
+            int   badge_warn = 0;
             if (SHELF[si].view == VIEW_THREADS) {
                 uint32_t un = oc_model_thread_unread(m);
-                if (un) { char b[24]; snprintf(b, sizeof b, "%u", un);
-                          badge_w = text_width(b, g_micro) + UIS(26); }
+                if (un) { snprintf(badge, sizeof badge, "%u", un);
+                          badge_w = text_width(badge, g_micro) + UIS(14); }
             } else if (SHELF[si].view == VIEW_DRAFTS) {
                 size_t nd = m->n_drafts, nf = oc_model_scheduled_failed(m);
-                if (nd || nf) { char b[24]; snprintf(b, sizeof b, "%s%zu", nf ? "\u26A0 " : "\u270E ", nd + nf);
-                                badge_w = text_width(b, g_meta) + UIS(20); }
+                if (nd || nf) { badge_warn = nf != 0;
+                                snprintf(badge, sizeof badge, "%s%zu", nf ? "\u26A0 " : "\u270E ", nd + nf);
+                                badge_w = text_width(badge, g_meta) + UIS(4); }
             }
             draw_text(rt, SHELF[si].label, on ? g_ui_b : g_ui,
-                      rf(sx0 + 34, sy, sx1 - UIS(12) - badge_w, sy + ROW_H),
+                      rf(sx0 + UIS(34), sy, sx1 - UIS(12) - (badge_w > 0 ? badge_w + UIS(8) : 0), sy + ROW_H),
                       on ? OC_COL_TEXT : OC_COL_MUTED);
-            /* Threads carry the count Slack shows there: unread REPLIES, which
-             * is the number the row exists to report. */
-            if (SHELF[si].view == VIEW_THREADS) {
-                uint32_t un = oc_model_thread_unread(m);
-                if (un) {
-                    char badge[24];
-                    snprintf(badge, sizeof badge, "%u", un);
-                    float bw = text_width(badge, g_micro) + 14;
-                    D2D1_RECT_F pill = rf(sx1 - 12 - bw, sy + 8, sx1 - 12, sy + 26);
-                    fill_round(rt, pill, 9.0f, OC_COL_ACCENT);
-                    IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_CENTER);
-                    draw_text(rt, badge, g_micro, pill, 0xFFFFFF);
-                    IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_LEADING);
-                }
-            }
-            /* The count Slack shows: drafts waiting, and anything that FAILED to
-             * send, which is the one number worth interrupting somebody for. */
-            if (SHELF[si].view == VIEW_DRAFTS) {
-                size_t nd = m->n_drafts, nf = oc_model_scheduled_failed(m);
-                if (nd || nf) {
-                    char badge[24];
-                    snprintf(badge, sizeof badge, "%s%zu", nf ? "\u26A0 " : "\u270E ", nd + nf);
-                    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
-                    draw_text(rt, badge, g_meta, rf(sx1 - UIS(60), sy, sx1 - UIS(8), sy + ROW_H),
-                              nf ? OC_COL_AWAY : OC_COL_MUTED);
-                    IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
-                }
+            if (badge[0] && SHELF[si].view == VIEW_THREADS) {
+                /* Unread REPLIES, the number the row exists to report — an
+                 * accent pill, vertically centred whatever the text scale. */
+                float ph = UIS(18.0f), py = sy + (ROW_H - ph) / 2;
+                D2D1_RECT_F pill = rf(sx1 - UIS(12) - badge_w, py, sx1 - UIS(12), py + ph);
+                fill_round(rt, pill, ph / 2, OC_COL_ACCENT);
+                IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_CENTER);
+                draw_text(rt, badge, g_micro, pill, 0xFFFFFF);
+                IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_LEADING);
+            } else if (badge[0]) {
+                /* Drafts waiting + anything that FAILED to send — drawn in
+                 * the exact window the label reserved. */
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_TRAILING);
+                draw_text(rt, badge, g_meta,
+                          rf(sx1 - UIS(12) - badge_w, sy, sx1 - UIS(12), sy + ROW_H),
+                          badge_warn ? OC_COL_AWAY : OC_COL_MUTED);
+                IDWriteTextFormat_SetTextAlignment(g_meta, DWRITE_TEXT_ALIGNMENT_LEADING);
             }
             g_shelf_rows[si].top = sy; g_shelf_rows[si].bot = sy + ROW_H;
             g_shelf_rows[si].view = SHELF[si].view;
@@ -2946,7 +2947,11 @@ static void draw_sidebar(ID2D1RenderTarget *rt, const oc_model *m, float h) {
                     snprintf(cnt, sizeof cnt, "%u", (unsigned)rc->n_peers);
                     IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_CENTER);
                     draw_text(rt, cnt, g_micro, av, selected ? OC_COL_TEXT : OC_COL_MUTED);
-                    IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_CENTER);
+                    /* LEADING — the format's resting state. This restored
+                     * CENTER (a copy of the set above), so every later g_micro
+                     * draw — the rail labels among them — inherited
+                     * centred alignment whenever a group DM painted first. */
+                    IDWriteTextFormat_SetTextAlignment(g_micro, DWRITE_TEXT_ALIGNMENT_LEADING);
                 } else {
                 draw_user_avatar(rt, m, r->peer_id, r->label, av, g_meta, 1, 5.0f);
                 /* INSET into the avatar, not hung off its corner: at
@@ -13484,7 +13489,11 @@ static int on_click(HWND hwnd, int x, int y) {
     /* The Files view has no sidebar, so its clicks must be served before the
      * transcript-only guard below. */
     if (g_view == VIEW_FILES && files_click(hwnd, x, y)) return 1;
-    if (g_view == VIEW_DIRECTORY) {
+    /* Scoped to the pane's own column: empty pane space must swallow a click
+     * (the modal-background rule), but the SIDEBAR is not this pane — it is
+     * drawn, hoverable, and its shelf/conversation handlers live further down.
+     * The unscoped swallow made the whole sidebar dead in this view. */
+    if (g_view == VIEW_DIRECTORY && (float)x > RAIL_W + SIDEBAR_W) {
         for (int i = 0; i < g_n_listrows; i++)
             if (in_rect(g_listrows[i].row, x, y)) {
                 profile_open(g_listrows[i].mid);
@@ -13492,7 +13501,8 @@ static int on_click(HWND hwnd, int x, int y) {
             }
         return 1;
     }
-    if (g_view == VIEW_THREADS) {
+    /* Scoped exactly as the Directory block above, for the same reason. */
+    if (g_view == VIEW_THREADS && (float)x > RAIL_W + SIDEBAR_W) {
         if (in_rect(g_threads_unread_btn, x, y)) {
             /* Re-asks rather than filtering what is loaded: "unread" is the
              * server's answer, and a client-side filter would go stale the
@@ -13630,8 +13640,18 @@ static int on_click(HWND hwnd, int x, int y) {
             }
         }
     }
-    /* Everything below is only meaningful in the transcript views. */
-    if (!transcript_shell()) return 1;
+    /* Everything below is only meaningful in the transcript views — EXCEPT
+     * the sidebar column, which the Threads, People, Drafts and New Message
+     * panes keep (sidebar_kind() == SBK_CHANNELS) and whose handlers live
+     * below: the workspace header, the destinations shelf, the channel rows.
+     * Swallowing the whole window here left that column drawn, hoverable and
+     * dead in every pane view — this guard is about the MIDDLE column. Middle-
+     * column rects below cannot misfire on a sidebar click: every one of them
+     * lives right of RAIL_W + SIDEBAR_W. */
+    if (!transcript_shell() &&
+        !(sidebar_kind() == SBK_CHANNELS &&
+          (float)x >= RAIL_W && (float)x < RAIL_W + SIDEBAR_W))
+        return 1;
 
     /* Header buttons + workspace header. */
     if (in_rect(g_hdr_gear, x, y))    { open_ws_menu(hwnd); return 1; }
@@ -13931,8 +13951,15 @@ static int on_click(HWND hwnd, int x, int y) {
                     oc_sb_set_collapsed(&g_sb, g_rows[i].sec,
                                         (uint8_t)!oc_sb_collapsed_of(&g_sb, g_rows[i].sec));
                     sidebar_opts_save();
-                } else if (g_rows[i].cid != g_sel) {
-                    select_channel(g_rows[i].cid);
+                } else {
+                    if (g_rows[i].cid != g_sel) select_channel(g_rows[i].cid);
+                    /* From a pane view (Threads, People, Drafts, New Message)
+                     * choosing a conversation must also LEAVE the pane:
+                     * selecting a channel the middle column then refuses to
+                     * show reads as a dead click — which is how it was
+                     * reported. Includes re-choosing the current channel,
+                     * which is the "take me back to it" gesture. */
+                    if (!transcript_shell()) { g_view = VIEW_HOME; layout_composer(hwnd); }
                 }
                 return 1;
             }
@@ -17786,9 +17813,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_mouse_x = mx; g_mouse_y = my;
             if (modal_open()) InvalidateRect(hwnd, NULL, FALSE);   /* frame hovers */
         }
-        {   /* Shelf hover (REQ-228). */
+        {   /* Shelf hover (REQ-228) — gated exactly as the CLICK is, or
+             * the two disagree: a row that glows but refuses the click is the
+             * defect this gate exists to prevent. */
             int sh = -1;
-            if ((float)mx >= RAIL_W && (float)mx < RAIL_W + SIDEBAR_W)
+            if (sidebar_kind() == SBK_CHANNELS && !window_is_covered() &&
+                (float)mx >= RAIL_W && (float)mx < RAIL_W + SIDEBAR_W)
                 for (int i = 0; i < g_n_shelf; i++)
                     if ((float)my >= g_shelf_rows[i].top && (float)my < g_shelf_rows[i].bot) sh = i;
             if (sh != g_shelf_hover) { g_shelf_hover = sh; InvalidateRect(hwnd, NULL, FALSE); }

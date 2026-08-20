@@ -1693,6 +1693,37 @@ expect_grep '^snoozed=0 snooze_until=0 ' "resuming ends it, and ends it now"
 # The claim is that this is a SERVER answer: threads I am in wherever they are,
 # with unread counts a channel cursor cannot produce. So it is seeded from a
 # second account and driven through the shelf row.
+# --- "The Home sidebar is drawn but dead in the Threads and People views" ---
+# Cited by title, not by number. The pane views keep the sidebar; on_click used
+# to swallow every click in them before the shelf and channel-row handlers were
+# reached, so the rows hovered and did nothing. These drive REAL clicks at the
+# coordinates the dump publishes — the `view` verb bypasses on_click entirely,
+# which is exactly why the suite never noticed.
+say "== sidebar stays clickable inside the pane views"
+"$DRIVE" view 0 >/dev/null 2>&1; settle view 0
+sh_line=$(snap | grep -E '^shelf ')
+row_mid() { printf '%s' "$sh_line" | grep -o "$1:[0-9.]*-[0-9.]*" | head -1 | \
+            awk -F'[:-]' '{ printf "%d", ($2 + $3) / 2 }'; }
+TY=$(row_mid 8); DY=$(row_mid 5); PY=$(row_mid 9)
+if [ -n "$TY" ] && [ -n "$DY" ] && [ -n "$PY" ]; then
+  "$DRIVE" click 150 "$TY" >/dev/null 2>&1
+  expect_eventually view 8 "clicking the Threads shelf row opens it"
+  "$DRIVE" click 150 "$DY" >/dev/null 2>&1
+  expect_eventually view 5 "from Threads, the Drafts shelf row still accepts a click"
+  "$DRIVE" click 150 "$PY" >/dev/null 2>&1
+  expect_eventually view 9 "from Drafts, the People shelf row still accepts a click"
+  "$DRIVE" click 150 "$TY" >/dev/null 2>&1
+  expect_eventually view 8 "and back to Threads"
+  # A conversation row: past the shelf divider (6) and the section header (one
+  # ROW_H of 32), landing mid-row on the first channel.
+  P_BOT=$(printf '%s' "$sh_line" | grep -o "9:[0-9.]*-[0-9.]*" | head -1 | awk -F'[:-]' '{ printf "%d", $3 }')
+  CH_Y=$((P_BOT + 6 + 32 + 16))
+  "$DRIVE" click 150 "$CH_Y" >/dev/null 2>&1
+  expect_eventually view 0 "from Threads, a channel row leaves the pane for the conversation"
+else
+  checks=$((checks + 1)); fail "no shelf rows in the dump — cannot drive the sidebar"
+fi
+
 say "== threads"
 "$DRIVE" view 0 >/dev/null 2>&1; "$DRIVE" channel general >/dev/null 2>&1; settle conv 1
 gid=$(snap | grep -oE '^  ch [0-9]+ "general"' | grep -oE '[0-9]+' | head -1)
