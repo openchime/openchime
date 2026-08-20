@@ -1693,6 +1693,42 @@ expect_grep '^snoozed=0 snooze_until=0 ' "resuming ends it, and ends it now"
 # The claim is that this is a SERVER answer: threads I am in wherever they are,
 # with unread counts a channel cursor cannot produce. So it is seeded from a
 # second account and driven through the shelf row.
+# --- "The rich-mode composer leaks its own markup and drops formatting" -----
+# Cited by title, not by number. Driven with `typekeys` — REAL WM_CHAR
+# keystrokes through ed_char — because `type` sets the buffer wholesale and
+# bypasses every rule under test, which is why none of this was testable
+# before the verb existed.
+say "== rich mode typing intent"
+"$DRIVE" view 0 >/dev/null 2>&1; settle sbkind 1
+ebox=$(snap | grep -m1 -oE 'box=[0-9]+,[0-9]+,[0-9]+,[0-9]+' | head -1 | cut -d= -f2)
+if [ -n "$ebox" ]; then
+  EX=$(( ($(echo "$ebox" | cut -d, -f1) + $(echo "$ebox" | cut -d, -f3)) / 2 ))
+  EY=$(( ($(echo "$ebox" | cut -d, -f2) + $(echo "$ebox" | cut -d, -f4)) / 2 ))
+  "$DRIVE" click "$EX" "$EY" >/dev/null 2>&1
+  edclear() { "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key backspace >/dev/null 2>&1; }
+  edclear
+  "$DRIVE" key ctrl+b >/dev/null 2>&1
+  expect_grep 'text=""' "a pending style inserts nothing — no visible pair"
+  "$DRIVE" typekeys "hello world" >/dev/null 2>&1
+  expect_grep 'text="\*hello world\*"' "bold survives the space between words"
+  "$DRIVE" key ctrl+b >/dev/null 2>&1
+  expect_grep 'text="\*hello\* world"' "bold off at the caret splits the run around the word"
+  edclear
+  "$DRIVE" typekeys "foobar" >/dev/null 2>&1
+  "$DRIVE" key shift+left >/dev/null 2>&1; "$DRIVE" key shift+left >/dev/null 2>&1; "$DRIVE" key shift+left >/dev/null 2>&1
+  "$DRIVE" key ctrl+i >/dev/null 2>&1
+  expect_grep 'text="_foobar_"' "a mid-word selection snaps to the word — no leaked markup"
+  "$DRIVE" key ctrl+i >/dev/null 2>&1
+  expect_grep 'text="foobar"' "and the second press takes it back off, cleanly"
+  edclear
+  "$DRIVE" typekeys "keep *bold* and plain" >/dev/null 2>&1
+  "$DRIVE" key ctrl+a >/dev/null 2>&1; "$DRIVE" key ctrl+b >/dev/null 2>&1
+  expect_grep 'text="\*keep bold and plain\*"' "toggling over a partly-bold range absorbs the inner run"
+  edclear
+else
+  checks=$((checks + 1)); fail "no composer box in the dump — cannot drive rich mode"
+fi
+
 # --- "The Home sidebar is drawn but dead in the Threads and People views" ---
 # Cited by title, not by number. The pane views keep the sidebar; on_click used
 # to swallow every click in them before the shelf and channel-row handlers were
