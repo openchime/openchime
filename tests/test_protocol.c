@@ -296,6 +296,19 @@ static void test_thread_frames(void) {
     }
 }
 
+static void test_unfurl_frame(void) {
+    /* UNFURL (REQ-222, ARCH-105): the async preview fan-out + backfill replay. */
+    oc_unfurl in = { 1001, 7, oc_slice_str("https://example.com/a"),
+                     oc_slice_str("Example Title"), oc_slice_str("A description.") };
+    ROUNDTRIP(oc_encode_unfurl(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_UNFURL, h, p);
+    oc_unfurl out;
+    CHECK(oc_decode_unfurl(&p, &out) == OC_OK);
+    CHECK(out.message_id == 1001 && out.channel_id == 7);
+    CHECK(slice_eq_str(out.url, "https://example.com/a"));
+    CHECK(slice_eq_str(out.title, "Example Title"));
+    CHECK(slice_eq_str(out.descr, "A description."));
+}
+
 static void test_reaction_frames(void) {
     {
         oc_react in = { 7, 1001, oc_slice_str("\xF0\x9F\x91\x8D"), OC_REACT_ADD };
@@ -1275,6 +1288,7 @@ int run_protocol_tests(void) {
     test_auth_frames();
     test_messaging_frames();
     test_reaction_frames();
+    test_unfurl_frame();
     test_thread_frames();
     test_channel_frames();
     test_admin_frames();

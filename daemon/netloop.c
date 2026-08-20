@@ -8,6 +8,8 @@
 #include "blobstore.h"
 #include "config.h"
 #include "push.h"
+#include "unfurl.h"
+#include "url.h"
 #include "xferpool.h"
 #include "storage.h"
 #include "framebuf.h"
@@ -436,6 +438,26 @@ static oc_push *g_push;
 
 void oc_netloop_set_push(struct oc_push *push) {
     g_push = push;
+}
+
+/* Link-unfurl worker (REQ-222, ARCH-105), NULL = unfurls disabled. */
+static oc_unfurler *g_unfurler;
+
+void oc_netloop_set_unfurler(struct oc_unfurler *u) {
+    g_unfurler = u;
+}
+
+/* Queue the URLs of a just-committed body for fetching — the first
+ * OC_UNFURL_MAX_URLS of them, extracted by the shared scanner so the daemon
+ * fetches exactly the addresses a client links. Fire-and-forget. */
+static void unfurl_enqueue(const uint8_t *body, size_t len,
+                           uint64_t channel_id, uint64_t message_id) {
+    if (!g_unfurler || !body || !len) return;
+    oc_url_span sp[OC_UNFURL_MAX_URLS];
+    size_t n = oc_url_extract((const char *)body, len, sp, OC_UNFURL_MAX_URLS);
+    for (size_t i = 0; i < n; i++)
+        oc_unfurler_fetch(g_unfurler, channel_id, message_id,
+                          (const char *)body + sp[i].start, sp[i].len);
 }
 
 /* Send one length-prefixed IPC message (type + payload) to the sidecar. */
@@ -2091,6 +2113,10 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
              * push emitter — members minus author, level/DND-gated, off this
              * thread. Fire-and-forget; a no-op when push is unconfigured. */
             oc_push_notify(g_push, r->channel_id, r->author_id, r->message_id);
+            /* Link previews (REQ-222): queue this body's URLs for fetching.
+             * Off the hot path — the fetch completes as an UNFURL_STORED
+             * result later, or never. */
+            unfurl_enqueue(r->body, r->body_len, r->channel_id, r->message_id);
         }
         break;
     }
@@ -2127,6 +2153,10 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
                 send_bytes(ep, conns, fd, g_enc, blen);
         }
+        /* The writer dropped the old body's unfurls; re-fetch for the new one
+         * (REQ-222). The store step re-validates presence, so a URL the edit
+         * removed cannot come back. */
+        unfurl_enqueue(r->body, r->body_len, r->channel_id, r->message_id);
         break;
     }
     case OC_RES_DELETE_OK: {
@@ -3353,6 +3383,24 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         send_bytes(ep, conns, jc->fd, g_enc, w.len);
         break;
     }
+    case OC_RES_UNFURL_STORED: {
+        /* Fan the stored preview to every connected member (REQ-222). The same
+         * shape as an edit fan-out; there is no requester to ack — the job was
+         * the unfurl worker's. */
+        oc_wbuf_init(&w, g_enc, sizeof g_enc);
+        oc_unfurl uf = { r->message_id, r->channel_id,
+                         oc_slice_str(r->unf_url ? r->unf_url : ""),
+                         oc_slice_str(r->unf_title ? r->unf_title : ""),
+                         oc_slice_str(r->unf_descr ? r->unf_descr : "") };
+        oc_encode_unfurl(&w, OC_PROTOCOL_VERSION, &uf);
+        size_t blen = w.len;
+        for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+            conn *c = conns[fd];
+            if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
+                send_bytes(ep, conns, fd, g_enc, blen);
+        }
+        break;
+    }
     case OC_RES_BACKFILL_OK: {
         conn *c = find_by_id(conns, r->conn_id);
         if (!c) return;
@@ -3414,6 +3462,19 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
                                        oc_slice_str(r->rreact[i].emoji ? r->rreact[i].emoji : ""),
                                        OC_REACT_ADD, r->rreact[i].count };
             oc_encode_reaction_updated(&w, OC_PROTOCOL_VERSION, &ru);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+        }
+
+        /* And the link previews (REQ-222), for the same reason once more: an
+         * unfurl travels on its own frame, so a replay that omitted it would
+         * silently lose every preview on reload. */
+        for (size_t i = 0; i < r->n_runfurl && conns[fd]; i++) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_unfurl uf = { r->runfurl[i].message_id, r->runfurl[i].channel_id,
+                             oc_slice_str(r->runfurl[i].url ? r->runfurl[i].url : ""),
+                             oc_slice_str(r->runfurl[i].title ? r->runfurl[i].title : ""),
+                             oc_slice_str(r->runfurl[i].descr ? r->runfurl[i].descr : "") };
+            oc_encode_unfurl(&w, OC_PROTOCOL_VERSION, &uf);
             send_bytes(ep, conns, fd, g_enc, w.len);
         }
         if (!conns[fd]) return;

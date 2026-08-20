@@ -67,6 +67,10 @@ typedef struct {
 
     /* Outbound push emitter (ARCH-85). */
     struct { const char *url, *ca_bundle; } push;
+
+    /* Link unfurls (REQ-222, ARCH-105). Always on — there is no switch.
+     * `allow_private` disables the SSRF gate and exists only for tests. */
+    struct { const char *ca_bundle; int allow_private; } unfurl;
 } oc_config;
 
 /* Load the daemon config from the environment into the process-global singleton.

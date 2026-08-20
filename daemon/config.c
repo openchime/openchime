@@ -125,5 +125,10 @@ int oc_config_load(char *err, size_t errcap) {
     c->push.url       = env_or2("OPENCHIME_PUSH_URL",       "OC_PUSH_URL",       NULL);
     c->push.ca_bundle = env_or2("OPENCHIME_PUSH_CA_BUNDLE", "OC_PUSH_CA_BUNDLE", NULL);
 
+    /* Link unfurls (REQ-222, ARCH-105). Always on — no switch. An air-gapped
+     * box needs none: its fetches simply fail, bounded and silent. */
+    c->unfurl.ca_bundle     = env_or2("OPENCHIME_UNFURL_CA_BUNDLE", NULL, NULL);
+    c->unfurl.allow_private = env_int("OPENCHIME_UNFURL_ALLOW_PRIVATE", NULL, 0);
+
     return 0;
 }

@@ -22,7 +22,19 @@ void oc_model_init(oc_model *m) {
     memset(m, 0, sizeof *m);
 }
 
-static void msg_free(oc_msg *m) { free(m->body); free(m->reactions); free(m->attach); }
+static void msg_clear_unfurls(oc_msg *m) {
+    for (uint8_t i = 0; i < m->n_unfurls; i++) {
+        free(m->unfurls[i].url); free(m->unfurls[i].title); free(m->unfurls[i].descr);
+    }
+    free(m->unfurls);
+    m->unfurls = NULL;
+    m->n_unfurls = m->cap_unfurls = 0;
+}
+
+static void msg_free(oc_msg *m) {
+    free(m->body); free(m->reactions); free(m->attach);
+    msg_clear_unfurls(m);
+}
 
 static void channel_free(oc_channel *c) {
     for (size_t i = 0; i < c->n_msgs; i++) msg_free(&c->msgs[i]);
@@ -45,6 +57,7 @@ static void msg_tombstone(oc_msg *msg) {
     free(msg->attach);
     msg->attach = NULL;
     msg->n_attach = msg->cap_attach = 0;
+    msg_clear_unfurls(msg);
     msg->pinned = 0;
     msg->pinned_by = msg->pinned_at = 0;
     msg->saved = 0;
@@ -1243,6 +1256,36 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         }
         break;
     }
+    case OC_EV_UNFURL: {
+        /* Upsert by url: a re-fetch (after an edit re-added the address, or a
+         * replay after reconnect) replaces rather than duplicates (REQ-222). */
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (!c || !e->body || !e->topic) break;
+        oc_msg *msg = NULL;
+        for (size_t i = 0; i < c->n_msgs; i++)
+            if (c->msgs[i].message_id == e->message_id) { msg = &c->msgs[i]; break; }
+        if (!msg || msg->deleted) break;
+        oc_msg_unfurl *slot = NULL;
+        for (uint8_t i = 0; i < msg->n_unfurls; i++)
+            if (strcmp(msg->unfurls[i].url, e->body) == 0) { slot = &msg->unfurls[i]; break; }
+        if (!slot) {
+            if (msg->n_unfurls >= 3) break;   /* the daemon caps at 3 per message */
+            if (msg->n_unfurls == msg->cap_unfurls) {
+                uint8_t cap = msg->cap_unfurls ? (uint8_t)(msg->cap_unfurls * 2) : 2;
+                oc_msg_unfurl *g = realloc(msg->unfurls, cap * sizeof *g);
+                if (!g) break;
+                msg->unfurls = g;
+                msg->cap_unfurls = cap;
+            }
+            slot = &msg->unfurls[msg->n_unfurls++];
+            memset(slot, 0, sizeof *slot);
+        }
+        free(slot->url); free(slot->title); free(slot->descr);
+        slot->url   = e->body;    e->body = NULL;     /* steal, like an edit does */
+        slot->title = e->topic;   e->topic = NULL;
+        slot->descr = e->preview; e->preview = NULL;
+        break;
+    }
     case OC_EV_EDIT: {
         oc_channel *c = oc_model_channel(m, e->channel_id);
         if (c) {
@@ -1252,6 +1295,9 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                     c->msgs[i].body = e->body;   /* steal the new text */
                     e->body = NULL;
                     c->msgs[i].edited = 1;
+                    /* The previews described the OLD body; the daemon dropped
+                     * its rows and re-fetches, so the model matches (REQ-222). */
+                    msg_clear_unfurls(&c->msgs[i]);
                     break;
                 }
             }

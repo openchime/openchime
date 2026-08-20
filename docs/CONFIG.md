@@ -104,6 +104,18 @@ exactly the self-hosted stand-alone model (ARCH-76).
 | `OPENCHIME_PUSH_URL` *(alias)* | *(none)* | Push-gateway base URL. Push requires **both** this and an active enrollment, which is why it is absent in stand-alone deployments (ARCH-16/85). |
 | `OPENCHIME_PUSH_CA_BUNDLE` *(alias)* | *(system)* | CA bundle for the push HTTPS client. |
 
+## Link unfurls (REQ-222, ARCH-105)
+
+Always on — there is deliberately **no on/off variable**. Every fetch passes an
+SSRF gate (no loopback, private, link-local, CGNAT, multicast or reserved
+destination — checked on every resolved address and re-checked per redirect)
+and is capped in bytes, redirects and time; an air-gapped box's fetches simply
+fail, bounded and silent.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OPENCHIME_UNFURL_CA_BUNDLE` | *(system)* | CA bundle for the fetcher's HTTPS client — the fourth CA consumer beside S3, enrollment and push (ARCH-10). |
+
 ## Audio
 
 | Variable | Default | Meaning |
@@ -142,7 +154,9 @@ variable now has no reader anywhere and is not set by anything.
 ## Test-only knobs
 
 Compile-time or test-harness values, listed so they are not mistaken for
-deployment configuration: `OC_FUZZ_RANDOM_ITERS` / `OC_FUZZ_FRAMED_ITERS` (fuzz
+deployment configuration: `OPENCHIME_UNFURL_ALLOW_PRIVATE` (disables the unfurl
+fetcher's SSRF gate so a test can fetch a loopback fixture — never set it in a
+deployment), `OC_FUZZ_RANDOM_ITERS` / `OC_FUZZ_FRAMED_ITERS` (fuzz
 depth, defaults 30000 / 15000), `OC_NETLOOP_MAX_FD` (4096, a compile-time
 constant, **not** an environment variable), and `OC_AUDIO_SILENCE_MS` (sidecar
 UDP silence sweep).

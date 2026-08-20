@@ -3317,6 +3317,15 @@ static float g_density = 1.0f;         /* 0.6 compact, 1.0 cozy */
 #define MSG_PIN_H UIS(17.0f)
 #define MSG_PIN(msg) ((msg)->pinned ? MSG_PIN_H : 0.0f)
 
+/* A link-preview card (REQ-222): accent bar, the fetched title, and — when the
+ * page offered one — a description line. One height function shared by the
+ * measure and draw passes, because two copies of a height are how a transcript
+ * scrolls to the wrong place. */
+#define UNFURL_GAP 6.0f
+static float unfurl_card_h(const oc_msg_unfurl *u) {
+    return UIS(12.0f) + LINE_H + ((u->descr && u->descr[0]) ? LINE_H : 0.0f);
+}
+
 /* A message's rendered height for a given content width (creates + returns the
  * body layout so the draw pass can reuse it; *wlen gets its UTF-16 length). */
 static float msg_height(const oc_msg *msg, float content_w, int grouped,
@@ -3344,6 +3353,8 @@ static float msg_height(const oc_msg *msg, float content_w, int grouped,
             extra++;
     }
     if (msg->reply_count) extra++;
+    for (int i = 0; i < msg->n_unfurls; i++)
+        thumbs += unfurl_card_h(&msg->unfurls[i]) + UNFURL_GAP;
     return MSG_PIN(msg) + MSG_BODY_DY(grouped) + body_h +
            (float)extra * LINE_H + thumbs + MSG_BOT(next_grouped);
 }
@@ -3536,6 +3547,28 @@ static void draw_message(ID2D1RenderTarget *rt, const oc_model *m, const oc_msg 
         draw_text(rt, line, g_meta, rf(tx, by, x0 + content_w + AVA + 12, by + LINE_H), OC_COL_ACCENT);
         by += LINE_H;
     }
+
+    /* Link previews (REQ-222): one card per unfurl — a border-coloured bar, the
+     * fetched title, and the description when the page offered one — under the
+     * body and the attachment lines, the way Slack lays them. Content, not a
+     * control: no hit-box and no automation id, because the card offers no
+     * action the link in the body does not already carry. */
+    for (int i = 0; i < msg->n_unfurls; i++) {
+        const oc_msg_unfurl *u = &msg->unfurls[i];
+        float card_h = unfurl_card_h(u);
+        float right = x0 + content_w + AVA + 12;
+        float pad = UIS(6.0f);
+        D2D1_RECT_F bar = rf(tx, by + 2, tx + 3, by + card_h - 2);
+        fill_round(rt, bar, 1.5f, OC_COL_BORDER);
+        float ix = tx + 12, ly = by + pad;
+        draw_text(rt, u->title && u->title[0] ? u->title : u->url, g_ui_b,
+                  rf(ix, ly, right, ly + LINE_H), OC_COL_TEXT);
+        ly += LINE_H;
+        if (u->descr && u->descr[0])
+            draw_text(rt, u->descr, g_meta, rf(ix, ly, right, ly + LINE_H), OC_COL_MUTED);
+        by += card_h + UNFURL_GAP;
+    }
+
     if (msg->reply_count) {
         char line[64];
         snprintf(line, sizeof line, "\xE2\x86\xB3 %u %s", msg->reply_count,
