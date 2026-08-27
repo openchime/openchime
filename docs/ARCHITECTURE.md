@@ -292,6 +292,16 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **REQ-282 (follow every thread in a channel) is deliberately not built here.** Its storage is a column on `notification_prefs` beside `level` and `muted`, since it is per (user, channel) exactly as they are; when it lands it composes with this by adding a fourth arm to the union above.
 
+- **ARCH-108 (Text metrics — the app owns the baseline):** Every single-line format in the GUI is pinned to an integer line box and baseline derived from its size token — `baseline = ceil(ascent)`, `line box = round(2·baseline − cap height)` — the same pair for every weight and style of that size, re-derived at each text scale rather than scaled.
+
+  **DirectWrite's natural metrics are per-font-file and fractional, so an unpinned label's position was an accident.** Regular and Semibold are different files with different ascent tables; a row that swaps to bold on selection re-seated its label from different numbers, a string with a descender centred differently from one without, and fractional line heights landed text off the pixel grid — everywhere, because every label flows through one seating function. Pinning through DirectWrite's uniform line spacing makes a layout's height and baseline exact and font-independent; the seat becomes a function of (rect, token) alone.
+
+  **Seating and snapping are the blit's job, in device pixels.** MID placement centres the pinned line box; the BASELINE — not the ink top — is then snapped to the device grid, because an integer DIP is not an integer device pixel at 150% DPI, and rounding tops lets two weights of one size land a row apart. The cap-centre-on-box-centre derivation is also what makes a MID-seated label agree with a geometrically centred icon without per-site nudges. Mixed sizes on one visual line (a name and its timestamp) share a baseline via `baseline_align`, which computes the companion's rect from both formats' pinned pairs — replacing the hand +1/+2 offsets that were right for one font version.
+
+  **Rejected, and still rejected:** centring each string's ink box (two generations of it — per-string ink and per-string layout metrics — both moved labels on state changes, because both derived the seat from the string); snapping inside sdltext (the library speaks DIPs and stays presentation-agnostic, ARCH-106 — the consumer owns the grid); pinning the emoji and Georgia decoration formats (they sit on nobody's shared baseline, and an emoji square centres by its own ink correctly).
+
+  **The invariant is checked, not remembered:** `make windows-sdltext-test` proves metrics and baselines identical across weights, styles and descenders under a pin, and stable under scale; the client's test dump emits a `textmetrics` line — the live pinned pairs plus a rendered probe that both UI weights lay out to the identical line box — which the GUI smoke asserts.
+
 - **ARCH-107 (oc_gfx — portable drawing primitives over SDL3, vendored fetched-at-build):** The drawing layer the GUI's portable application code targets: fills, rounded rectangles and their strokes, lines, an axis-aligned clip stack, textures (straight RGBA for decoded images, premultiplied BGRA for rasterized text — the format sdltext's sink emits, ARCH-106), and the Lucide icons. Coordinates are DIPs; the DPI×zoom scale is applied inside the layer, so scene code never carries it.
 
   **Everything that is not a plain rect is triangles.** SDL's renderer draws rects, textures and geometry, and nothing else — no rounded rect, no path, no bezier. So the rounded shapes are corner-arc fans, strokes are rings, and the Lucide paths are stroke-tessellated (cubics flattened, polylines expanded with round caps and joins as literal discs) by a pure-geometry translation unit with no SDL dependency. This replaces `ID2D1PathGeometry` + stroke styles; the tessellator is the portable property Direct2D's geometry never was.
@@ -372,14 +382,16 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **The size scale is ours, and is identical in every graphical client.** The roles must not drift between the desktop front-ends, or "the same product" stops being true — and the sizes are the one part of typography that carries product meaning rather than platform convention. Six tokens, named for their ROLE rather than their size, because `small` is a measurement and `meta` is a decision:
 
-  | Token | DIP | Weight | Used for |
-  |---|---|---|---|
-  | `display` | 17 | 600 | view + workspace titles |
-  | `title` | 15 | 600 | channel header, author names |
-  | `body` | 15 | 400 | message text and the composer — one constant, so they cannot disagree |
-  | `ui` | 14 | 400 / 600 | controls, list rows, buttons |
-  | `meta` | 12.5 | 400 | timestamps, sublabels, chips, counts |
-  | `micro` | 10 | 600 | rail labels |
+  | Token | DIP | Weight | Line box / baseline (scale 1) | Used for |
+  |---|---|---|---|---|
+  | `display` | 17 | 600 | 26 / 19 | view + workspace titles |
+  | `title` | 15 | 600 | 23 / 17 | channel header, author names |
+  | `body` | 15 | 400 | 22 / 17 | message text and the composer — one constant, so they cannot disagree |
+  | `ui` | 14 | 400 / 600 | 22 / 16 | controls, list rows, buttons |
+  | `meta` | 12.5 | 400 | 19 / 14 | timestamps, sublabels, chips, counts |
+  | `micro` | 10 | 600 | 15 / 11 | rail labels |
+
+  The line box and baseline are pinned per token across every weight and style; ARCH-108 owns the derivation (the pairs above are the scale-1 outputs, not stored constants — body's roomier 22 line box is the one override, keeping its readability height with the token's baseline).
 
   **Two weights only: Regular 400 and Semibold 600.** Bold 700 is reserved for markdown `**strong**` inside message bodies, so weight means exactly one thing in chrome and a different, deliberate thing in content — never both at once.
 

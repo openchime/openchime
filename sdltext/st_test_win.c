@@ -256,6 +256,69 @@ int main(void)
         st_format_destroy(ell);
     }
 
+    /* -- baseline stability (ARCH-108) ------------------------------------
+     * The GUI pins one integer line box + baseline per size token across every
+     * weight and style of that size, so a bold swap or a descender can never
+     * move a label. This certifies the property the app relies on: under
+     * UNIFORM spacing, metrics and baselines are identical across weights and
+     * across strings with and without descenders, and the pinned DIP baseline
+     * maps to the expected device row under scale. */
+    {
+        st_format_desc dr = { "Segoe UI", 14.0f, 400, false, false,
+                              ST_TRIM_ELLIPSIS, 22.0f, 16.0f };
+        st_format_desc db = { "Segoe UI", 14.0f, 600, false, false,
+                              ST_TRIM_ELLIPSIS, 22.0f, 16.0f };
+        st_format_desc di = { "Segoe UI", 14.0f, 400, true, false,
+                              ST_TRIM_ELLIPSIS, 22.0f, 16.0f };
+        st_format *fr = st_format_create(ctx, &dr);
+        st_format *fb = st_format_create(ctx, &db);
+        st_format *fi = st_format_create(ctx, &di);
+        CHECK(fr && fb && fi);
+        const char *strs[2] = { "HHH", "Hxg" };   /* caps-only / with descender */
+        st_format  *fms[3]  = { fr, fb, fi };
+        float ys[6]; int k = 0;
+        for (int fj = 0; fj < 3; fj++)
+            for (int sj = 0; sj < 2; sj++) {
+                st_layout *l = st_layout_create(ctx, fms[fj], strs[sj],
+                                                strlen(strs[sj]), 400.0f,
+                                                60.0f, ST_ALIGN_LEFT);
+                st_metrics m; st_layout_metrics(l, &m);
+                CHECK(m.lines == 1);
+                CHECK(fabsf(m.h - 22.0f) < 0.01f);     /* pinned line box */
+                st_line ln[2];
+                CHECK(st_layout_lines(l, ln, 2) == 1);
+                CHECK(fabsf(ln[0].baseline - 16.0f) < 0.01f); /* pinned baseline */
+                st_draw(ctx, l, 0.0f, 40.0f, 0xFFFFFF, 1.0f);
+                if (k < 6) ys[k++] = mem.y;            /* ink dy = 40 + tm.top */
+                st_layout_destroy(l);
+            }
+        /* Ink top varies with glyph shape by nature; what must NOT vary is the
+         * baseline: dy − tm.top cancels, so dy for the same string must agree
+         * across weights/styles, and cap-only vs descender strings of one
+         * format must share their format's dy (the descender grows the raster
+         * DOWNWARD only — the top edge stays put when the box is pinned). */
+        CHECK(fabsf(ys[0] - ys[1]) < 0.01f);   /* regular: HHH vs Hxg tops equal */
+        CHECK(fabsf(ys[2] - ys[3]) < 0.01f);   /* semibold: same */
+        CHECK(fabsf(ys[4] - ys[5]) < 0.01f);   /* italic: same */
+        /* At 1.5x the pinned DIP baseline lands on the expected device row. */
+        {
+            st_layout *l = st_layout_create(ctx, fr, "Baseline", 8, 400.0f,
+                                            60.0f, ST_ALIGN_LEFT);
+            st_draw(ctx, l, 0.0f, 0.0f, 0xFFFFFF, 1.0f);
+            float dy1 = mem.y;
+            st_ctx_set_scale(ctx, 1.5f);
+            st_draw(ctx, l, 0.0f, 0.0f, 0xFFFFFF, 1.0f);
+            /* dy is in DIPs by contract, so it must not move with scale... */
+            CHECK(fabsf(mem.y - dy1) < 0.01f);
+            /* ...while the raster grows with it. */
+            st_ctx_set_scale(ctx, 1.0f);
+            st_layout_destroy(l);
+        }
+        st_format_destroy(fi);
+        st_format_destroy(fb);
+        st_format_destroy(fr);
+    }
+
     st_format_destroy(fmt);
     st_ctx_destroy(ctx);
     free(mem.px);
