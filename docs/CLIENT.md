@@ -4,13 +4,17 @@ The client's architecture and how it's built. Cross-referenced from
 ARCHITECTURE.md (ARCH-11, **ARCH-74**) and
 PROTOCOL.md (the wire flow the core drives).
 
-**Direction (ARCH-74).** The client is **one shared C app-core with a native UI
-per platform** — the *tdlib* model — chosen for real native feel over a
-custom-rendered single UI. There is no shared rendering layer, because each
-platform's OS shapes its own text and provides its own widgets.
+**Direction (ARCH-74, ARCH-80).** The client is **one shared C app-core** —
+the *tdlib* model's core-and-view split — under **one portable, self-rendered
+desktop GUI** (SDL3 + the portable text layer, per-platform text backends and
+native shims) plus the TUI. Text shaping and the accessibility anchor stay
+native per platform; everything else in the view is written once. The Win32
+client is the reference implementation and runs on the portable stack: an SDL3
+renderer on its own native window, primitives through oc_gfx, text through
+sdltext's DirectWrite backend.
 
 **Status.** The app-core, the **TUI** and the **Win32 GUI** (the reference
-client) are built. Further native GUIs (GTK, AppKit, Android, a web DOM UI)
+client) are built. Further platforms (the portable GUI on Linux/macOS, Android, a web DOM UI)
 and mobile follow, in the fixed frontend order of §8.
 
 ---
@@ -25,7 +29,8 @@ client/core/   the app-core — frontend-agnostic, headless-testable C:
 client/tui/    terminal frontend over the core                (first frontend)
 client/gui/win32/  the native Win32 GUI over the same core    (reference client)
 client/shared/ assets shared by graphical frontends (baked Lucide icon paths)
-[client/gui/gtk, client/gui/mac, ...]  further native GUIs    (later)
+[further desktops]  the same portable GUI layer + a per-platform
+                    text backend and native shim               (later)
 ```
 
 The **app-core is the one shared asset.** It holds *all* logic and state; a
@@ -276,12 +281,14 @@ model; translate input to intents }, stop.
   (`oc_client_channel_invite` / `_channel_kick` / `_redeem_invite`) and the Win32
   client surfaces all three.
 - **Windows (`client/gui/win32/`):** **Win32 in pure C** over the
-  core — **Direct2D/DirectWrite
-  (+ WIC)** for the custom surfaces (message transcript, sidebar, rails,
-  **the composer**, and every menu) and **native controls where they still earn
-  their keep**: `EDIT` boxes (find, search, files-search, sign-in, palette, the
-  form fields), the file picker, and the window frame. No WinUI, no .NET, no C++,
-  no cross-platform toolkit (ARCH-80/82). The composer and every menu are
+  core — the portable rendering stack (ARCH-80) for the custom surfaces
+  (message transcript, sidebar, rails, **the composer**, and every menu): an
+  **SDL3 renderer wrapping the client's own native window**, primitives through
+  **oc_gfx** (ARCH-107), text shaped by **DirectWrite through sdltext**
+  (ARCH-106), inline images decoded by **WIC** — and **native controls where
+  they still earn their keep**: `EDIT` boxes (find, search, files-search,
+  sign-in, palette, the form fields), the file picker, and the window frame.
+  No WinUI, no .NET, no C++. The composer and every menu are
   drawn into the scene (ARCH-98), so **`RichEdit`,
   `TrackPopupMenu`, `CreatePopupMenu` and `AppendMenuW` appear nowhere in the
   client**. The **Windows TUI** (ARCH-81) validates the core port —
@@ -290,8 +297,8 @@ model; translate input to intents }, stop.
   affordance-driven — buttons/menus/dialogs/drag-drop, never slash commands**
   (those do not exist anywhere; the TUI is menu-driven too, ARCH-83).
 
-  **Shell layout.** A **global left-nav rail** (Lucide icons stroked as D2D path
-  geometry) holds the workspace avatar → switcher, six primary views (Home, DMs,
+  **Shell layout.** A **global left-nav rail** (Lucide icons stroke-tessellated
+  by oc_gfx) holds the workspace avatar → switcher, six primary views (Home, DMs,
   Activity, Files, Later, Admin — the last owner/admin-gated, with a "More"
   overflow flyout), and a bottom cluster of New (+) / profile avatar.
   Three custom D2D dropdowns hang off the rail — **workspace**
@@ -309,12 +316,14 @@ model; translate input to intents }, stop.
   REQ-289 and REQ-261. Per-feature status is the marker on each
   requirement in [REQUIREMENTS.md](./REQUIREMENTS.md); open work is in the
   [issue tracker](https://github.com/openchime/openchime/issues).
-- **Linux GUI (later):** **GTK in pure C** — GTK is the native Linux toolkit and
-  a C library (ARCH-80). Distributed as an AppImage/Flatpak, not a static binary
-  (GTK cannot cleanly static-link).
-- **macOS/iOS (later):** AppKit/UIKit over the core. **Objective-C, not pure C** —
-  there is no C-native GUI on modern macOS (ARCH-80); Obj-C is a C superset, so
-  the UI shell calls the core with no FFI.
+- **Linux GUI (later):** the **same portable client** (ARCH-80) — the shared
+  app layer over SDL3, with a FreeType/fontconfig text backend and a small
+  native shim (tray, AT-SPI accessibility, libsecret). Not a GTK app: by the
+  time a second desktop was due, the client self-drew everything a toolkit
+  would have supplied. Packaging is decided when it lands.
+- **macOS/iOS (later):** the portable client over SDL3 on macOS, with a
+  CoreText backend and an Obj-C native shim where Apple leaves no C surface;
+  UIKit on iOS is its own effort over the core.
 - **Android (later):** Android views (Kotlin) over the core.
 - **Web (later):** a DOM UI — WASM can't use native desktop widgets; the core
   compiles to WASM and drives a JS/TS view.
@@ -449,10 +458,10 @@ v2.5.0 / utf8proc v2.11.3), both MIT, so local and CI share identical sources wi
 zero transitive dependencies (ARCH-75). Native GUIs build with their platform
 toolchains over the core; release artifacts come from CI/CD, never a dev machine.
 
-## Native children over Direct2D (Win32)
+## Native children over the drawn scene (Win32)
 
 A native child window — the find/search/files-search/palette boxes, the sign-in
-fields, the form fields — composites **above** the Direct2D output. There is no
+fields, the form fields — composites **above** the rendered scene. There is no
 z-order to lose and nothing can be drawn over one. (The composer is deliberately NOT
 one of these — it is part of the scene, ARCH-98, which removes this whole class
 of bug for it rather than managing it.) A child left visible while the
@@ -488,7 +497,7 @@ that is a real answer (`CHANNELS`, say) hands that answer to every view its
 author has not thought about.
 
 *The harness must see what the user sees.* **`shot` composites the native
-children on top of the Direct2D scene** (see "Seeing the whole
+children on top of the drawn scene** (see "Seeing the whole
 window" below), so a screenshot shows what the user sees — a capture that
 rendered the scene alone would make a stray native child invisible to
 verification. The dump reports each
@@ -618,8 +627,8 @@ reopens on the pane you left it on.
 density are their own preview; you cannot judge any of them from a label. The
 snapshot therefore covers the accent, the text size, the density, the zoom step and
 the DPI, and `prefs_restore` re-applies each through the one path that knows what it
-costs (`scale_apply` rebuilds every DirectWrite format; `dpi_set` drops the render
-target, the brushes and the thumbnail cache).
+costs (`scale_apply` rebuilds every text format and drops the raster caches;
+`dpi_set` lets the next paint's scale pass rebuild them lazily).
 
 **A colour scheme is a PAIR** — the nav rail and the accent — because they are seen
 together: an accent chosen against a fixed rail could fight it, and that looked like a
@@ -654,7 +663,7 @@ an empty list gives the same silence to both.
 
 ## The composer is ours (ARCH-98)
 
-There is no RichEdit and **no child window**. The field is drawn into the Direct2D
+There is no RichEdit and **no child window**. The field is drawn into the
 scene by `ed_draw()`, and the **main window** owns the keyboard while `g_ed_focus` is
 set. Consequences worth knowing before touching it:
 
@@ -725,7 +734,7 @@ same discipline as reading CI.
 ## Seeing the whole window (Win32 harness)
 
 `scripts/gui_drive.sh shot <name>` produces one image of the entire application,
-Direct2D surface **and** native children. Two obvious routes do not work,
+drawn scene **and** native children. Two obvious routes do not work,
 recorded so nobody re-walks them:
 
 | Route | D2D content | Native children |
@@ -780,7 +789,7 @@ carries one meaning in the UI and a different, deliberate one in content.
 Sizes are DIPs and are multiplied by the user's **text size** factor when the
 formats are built (`fonts_build`); system DPI and window zoom are applied
 separately, for the reasons ARCH-97 gives. Rebuilding the formats is the only way
-to change a DirectWrite size, so any preference that moves the scale must call
+to change a format's size, so any preference that moves the scale must call
 `fonts_build` and then force a relayout.
 
 ## 8. Roadmap
@@ -813,13 +822,14 @@ to change a DirectWrite size, so any preference that moves the scale must call
   `InvokePattern` on every actionable element (**REQ-290**), verified
   from outside the process by `scripts/uia_probe.ps1`. Rich text and its toolbar
   are built too (**REQ-220**, ARCH-100: a shared parser in `client/core/` plus
-  DirectWrite ranges). The items that pair a client half with a daemon half —
+  sdltext byte ranges). The items that pair a client half with a daemon half —
   drafts, scheduled send, the notification schedule, keywords and priority
   people, the pause, cross-channel threads, the People directory — are built
   end to end. Open work is in the
   [issue tracker](https://github.com/openchime/openchime/issues).
-- **The frontend order is fixed: all of Win32, then the TUI, then GTK, then
-  macOS.** Win32 is the reference client and it is finished *first* — including
+- **The frontend order is fixed: all of Win32, then the TUI, then the
+  portable-layer migration of the GUI, then further desktops on that layer
+  (ARCH-80).** Win32 is the reference client and it is finished *first* — including
   the items now waiting on a daemon requirement, which are Win32 work waiting on
   their other half, not work deferred behind another frontend. The TUI being
   behind is an accepted consequence of that order, not a reason to reorder it.
@@ -842,6 +852,6 @@ to change a DirectWrite size, so any preference that moves the scale must call
 - **Then — the rest of the specified scope.** REQUIREMENTS.md §§1–16 carries it,
   each requirement marked with whether it is built; whatever is not built and
   matters is an issue in the [tracker](https://github.com/openchime/openchime/issues).
-- **Then — remaining platforms + screenshare.** The other native GUIs (GTK,
-  AppKit), a web DOM UI, and mobile — and, gated behind the audio client,
+- **Then — remaining platforms + screenshare.** The portable GUI on Linux and
+  macOS (a text backend + native shim each, ARCH-80), a web DOM UI, and mobile — and, gated behind the audio client,
   **screenshare** (REQ-161, [VIDEO.md](./VIDEO.md)).

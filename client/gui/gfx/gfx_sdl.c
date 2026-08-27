@@ -212,6 +212,66 @@ void gfx_line(gfx *g, float x0, float y0, float x1, float y1, float w,
     geometry(g, NULL, v, 4, idx, 6);
 }
 
+enum { ESEG = 28 };
+
+void gfx_ellipse(gfx *g, float cx, float cy, float rx, float ry, uint32_t rgb,
+                 float a)
+{
+    SDL_FColor c = fcol(rgb, a);
+    SDL_Vertex v[ESEG + 1];
+    v[0].position.x = cx * g->scale;
+    v[0].position.y = cy * g->scale;
+    v[0].color = c;
+    v[0].tex_coord.x = v[0].tex_coord.y = 0.0f;
+    for (int i = 0; i < ESEG; i++) {
+        float t = (float)i / ESEG * 6.2831853f;
+        v[i + 1].position.x = (cx + rx * cosf(t)) * g->scale;
+        v[i + 1].position.y = (cy + ry * sinf(t)) * g->scale;
+        v[i + 1].color = c;
+        v[i + 1].tex_coord.x = v[i + 1].tex_coord.y = 0.0f;
+    }
+    int idx[ESEG * 3];
+    int ni = 0;
+    for (int i = 0; i < ESEG; i++) {
+        idx[ni++] = 0;
+        idx[ni++] = 1 + i;
+        idx[ni++] = 1 + (i + 1) % ESEG;
+    }
+    geometry(g, NULL, v, ESEG + 1, idx, ni);
+}
+
+void gfx_ellipse_stroke(gfx *g, float cx, float cy, float rx, float ry,
+                        float w, uint32_t rgb, float a)
+{
+    SDL_FColor c = fcol(rgb, a);
+    float h = w / 2.0f;
+    SDL_Vertex v[ESEG * 2];
+    for (int i = 0; i < ESEG; i++) {
+        float t = (float)i / ESEG * 6.2831853f;
+        float co = cosf(t), si = sinf(t);
+        v[i * 2].position.x = (cx + (rx + h) * co) * g->scale;
+        v[i * 2].position.y = (cy + (ry + h) * si) * g->scale;
+        v[i * 2 + 1].position.x = (cx + (rx - h) * co) * g->scale;
+        v[i * 2 + 1].position.y = (cy + (ry - h) * si) * g->scale;
+        for (int k = 0; k < 2; k++) {
+            v[i * 2 + k].color = c;
+            v[i * 2 + k].tex_coord.x = v[i * 2 + k].tex_coord.y = 0.0f;
+        }
+    }
+    int idx[ESEG * 6];
+    int ni = 0;
+    for (int i = 0; i < ESEG; i++) {
+        int j = (i + 1) % ESEG;
+        idx[ni++] = i * 2;
+        idx[ni++] = j * 2;
+        idx[ni++] = i * 2 + 1;
+        idx[ni++] = j * 2;
+        idx[ni++] = j * 2 + 1;
+        idx[ni++] = i * 2 + 1;
+    }
+    geometry(g, NULL, v, ESEG * 2, idx, ni);
+}
+
 void gfx_clip_push(gfx *g, gfx_rect r)
 {
     SDL_Rect px = { (int)floorf(r.x * g->scale), (int)floorf(r.y * g->scale),

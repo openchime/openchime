@@ -236,12 +236,25 @@ $(WIN_TUI_BIN): $(TUI_SRC) $(TUIKIT_SRC) $(CORE_SRC) $(SHARED_SRC) $(UTF8PROC) $
 # but compiles the client/gui/win32 sources instead of the
 # TUI/tuikit stack and links the Direct2D stack. -municode gives the wWinMain
 # Unicode entry point; -mwindows selects the GUI subsystem (no console).
+SDL3_VERSION := 3.4.14
+SDL3_WIN     := third_party/sdl3-$(SDL3_VERSION)-win
+SDL3_WIN_LIB := $(SDL3_WIN)/lib/libSDL3.a
+# The OS libraries a static SDL3 needs beyond what the GUI already links.
+WIN_SDL_SYSLIBS := -lm -lkernel32 -luser32 -lgdi32 -lwinmm -limm32 -lole32 \
+                   -loleaut32 -lversion -luuid -ladvapi32 -lsetupapi -lshell32 -ldinput8
+GFX_SRC := client/gui/gfx/gfx_sdl.c client/gui/gfx/gfx_icons.c
+
+$(SDL3_WIN_LIB):
+	scripts/build_sdl3_windows.sh
+
 WIN_GUI_BIN := build/openchime.exe
 # Debug symbols, split out of the shipped binary (see the strip step below).
 WIN_GUI_SYMS := build/openchime.debug
-GUI_SRC := $(wildcard client/gui/win32/*.c) client/shared/icons.c client/shared/secret_win.c
+GUI_SRC := $(wildcard client/gui/win32/*.c) client/shared/icons.c client/shared/secret_win.c \
+           $(SDLTEXT_WIN) $(GFX_SRC)
 WIN_GUI_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
-               $(CORE_INC) -Iclient/gui/win32 -Iclient/shared
+               $(CORE_INC) -Iclient/gui/win32 -Iclient/shared \
+               $(SDLTEXT_INC) -Iclient/gui/gfx -I$(SDL3_WIN)/include
 
 # Resources (app icon + VERSIONINFO). Regenerate the .ico with
 # scripts/gen_appicon.py.
@@ -252,11 +265,12 @@ $(WIN_GUI_RES): client/gui/win32/res/openchime.rc client/gui/win32/res/openchime
 
 windows-gui: $(WIN_GUI_BIN)
 $(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
-                $(wildcard client/gui/win32/*.h client/core/*.h shared/*.h) $(WIN_MBEDLIBS) | build
+                $(wildcard client/gui/win32/*.h client/core/*.h shared/*.h sdltext/*.h client/gui/gfx/*.h) \
+                $(WIN_MBEDLIBS) $(SDL3_WIN_LIB) | build
 	$(WINCC) $(WIN_CFLAGS) -Wno-unused-result -municode -mwindows $(WIN_GUI_INC) -Iclient/gui/win32/res \
 	    $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
-	    $(WIN_MBEDLIBS) -lws2_32 -ldnsapi -lbcrypt -lole32 -lshell32 -lcomdlg32 -lgdi32 -ladvapi32 \
-	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -luuid -limm32 -loleaut32 -static -o $@
+	    $(WIN_MBEDLIBS) -L$(SDL3_WIN)/lib -lSDL3 -lws2_32 -ldnsapi -lbcrypt -lcomdlg32 \
+	    -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -limm32 $(WIN_SDL_SYSLIBS) -static -o $@
 # Split the debug info out rather than discarding it. The client writes real
 # minidumps on a crash (crash_filter, winmain.c), and symbolicating a mingw
 # build needs its DWARF -- a plain strip would shrink the download by trading
@@ -283,16 +297,6 @@ $(WIN_SDLTEXT_TEST): $(SDLTEXT_WIN) sdltext/st_test_win.c $(wildcard sdltext/*.h
 # over an SDL3 renderer. SDL3 is the "fetched at build" vendoring class
 # (docs/VENDORS.md §2), pinned + cross-built by scripts/build_sdl3_windows.sh,
 # statically linked like everything else.
-SDL3_VERSION := 3.4.14
-SDL3_WIN     := third_party/sdl3-$(SDL3_VERSION)-win
-SDL3_WIN_LIB := $(SDL3_WIN)/lib/libSDL3.a
-# The OS libraries a static SDL3 needs beyond what the GUI already links.
-WIN_SDL_SYSLIBS := -lm -lkernel32 -luser32 -lgdi32 -lwinmm -limm32 -lole32 \
-                   -loleaut32 -lversion -luuid -ladvapi32 -lsetupapi -lshell32 -ldinput8
-GFX_SRC := client/gui/gfx/gfx_sdl.c client/gui/gfx/gfx_icons.c
-
-$(SDL3_WIN_LIB):
-	scripts/build_sdl3_windows.sh
 
 # The gfx test program: SDL's software renderer on a plain surface — no
 # window, no GPU — asserting pixels. Exit code is the failure count

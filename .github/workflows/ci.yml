@@ -11,7 +11,7 @@ name: ci
 #                  assertions run against the binary the job builds.
 #   - core:        standalone compile check of the client app-core (ARCH-74).
 #   - windows:     mingw cross-compile check of the Windows front-ends (TUI + the
-#                  native Direct2D/DirectWrite GUI, ARCH-82). Build breaks only.
+#                  SDL3/sdltext GUI, ARCH-80/106/107). Build breaks only.
 #
 # There is deliberately no GUI smoke job. scripts/gui_smoke.sh needs a Windows host
 # for the client and a Linux one for the epoll-based daemon at the same time, which
