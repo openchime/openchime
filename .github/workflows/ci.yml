@@ -245,12 +245,20 @@ jobs:
           printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
           sudo apt-get update
+          # g++-mingw-w64-x86-64 solely for the SDL3 cross-build: SDL's
+          # Windows branch enables CXX unconditionally (see
+          # scripts/build_sdl3_windows.sh). Nothing of ours compiles as C++.
           sudo apt-get install -y --no-install-recommends \
-            gcc-mingw-w64-x86-64 bzip2 curl
+            gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 bzip2 curl
       - name: Cross-build the vendored Windows mbedTLS
         run: scripts/build_mbedtls_windows.sh
+      # cmake is preinstalled on the hosted runners; SDL's own build is CMake,
+      # invoked by the fetch script (VENDORS.md §2).
+      - name: Cross-build the vendored Windows SDL3
+        run: scripts/build_sdl3_windows.sh
       # Both Windows front-ends share the app-core + shared wire code; a clean
       # link proves the pure-C Win32 (incl. Direct2D/DirectWrite-from-C, ARCH-82)
-      # builds under mingw.
+      # builds under mingw. The gfx test program compiles the oc_gfx layer
+      # (ARCH-107) against the static SDL3.
       - name: Compile the Windows front-ends
-        run: make windows-tui windows-gui windows-sdltext-test
+        run: make windows-tui windows-gui windows-sdltext-test windows-gfx-test

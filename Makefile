@@ -277,6 +277,34 @@ $(WIN_SDLTEXT_TEST): $(SDLTEXT_WIN) sdltext/st_test_win.c $(wildcard sdltext/*.h
 	    $(SDLTEXT_WIN) sdltext/st_test_win.c \
 	    -ld2d1 -ldwrite -lwindowscodecs -lole32 -luuid -static -o $@
 
+# --- oc_gfx (portable primitives over SDL3) -----------------------------------
+# The drawing layer the GUI's portable application code targets: fills,
+# rounded rects, clips, lines, textures and the Lucide stroke tessellator,
+# over an SDL3 renderer. SDL3 is the "fetched at build" vendoring class
+# (docs/VENDORS.md §2), pinned + cross-built by scripts/build_sdl3_windows.sh,
+# statically linked like everything else.
+SDL3_VERSION := 3.4.14
+SDL3_WIN     := third_party/sdl3-$(SDL3_VERSION)-win
+SDL3_WIN_LIB := $(SDL3_WIN)/lib/libSDL3.a
+# The OS libraries a static SDL3 needs beyond what the GUI already links.
+WIN_SDL_SYSLIBS := -lm -lkernel32 -luser32 -lgdi32 -lwinmm -limm32 -lole32 \
+                   -loleaut32 -lversion -luuid -ladvapi32 -lsetupapi -lshell32 -ldinput8
+GFX_SRC := client/gui/gfx/gfx_sdl.c client/gui/gfx/gfx_icons.c
+
+$(SDL3_WIN_LIB):
+	scripts/build_sdl3_windows.sh
+
+# The gfx test program: SDL's software renderer on a plain surface — no
+# window, no GPU — asserting pixels. Exit code is the failure count
+# (docs/TESTING.md, the platform-backend exception).
+WIN_GFX_TEST := build/gfx_test.exe
+windows-gfx-test: $(WIN_GFX_TEST)
+$(WIN_GFX_TEST): $(GFX_SRC) client/gui/gfx/gfx_test_win.c client/shared/icons.c \
+                 $(wildcard client/gui/gfx/*.h) $(SDL3_WIN_LIB) | build
+	$(WINCC) $(WIN_CFLAGS) -Iclient/gui/gfx -Iclient/shared -I$(SDL3_WIN)/include \
+	    $(GFX_SRC) client/gui/gfx/gfx_test_win.c client/shared/icons.c \
+	    -L$(SDL3_WIN)/lib -lSDL3 $(WIN_SDL_SYSLIBS) -static -o $@
+
 # --- tuikit demo (ARCH-83) ----------------------------------------------------
 # Standalone harness exercising every tuikit widget — no core, no daemon, no TLS.
 # The toolbox's own smoke test.
