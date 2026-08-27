@@ -691,15 +691,22 @@ void st_draw(st_ctx *c, st_layout *l, float x, float y, uint32_t rgb,
     if (!c->sink.blit)
         return;
 
-    st_metrics m;
-    st_layout_metrics(l, &m);
-    int pw = (int)ceilf((m.w + 2.0f) * c->scale);
-    int ph = (int)ceilf((m.h + 2.0f) * c->scale);
+    /* Raster the INK, not the layout box: an aligned layout positions its ink
+     * inside the box (centered text sits at maxw/2), and a surface sized to
+     * the ink would otherwise capture the box's empty left edge. The ink
+     * offset travels to the sink through dip_x/dip_y, so the caller places
+     * the texture exactly where the layout put the glyphs. */
+    DWRITE_TEXT_METRICS tm;
+    memset(&tm, 0, sizeof tm);
+    IDWriteTextLayout_GetMetrics(l->lay, &tm);
+    int pw = (int)ceilf((tm.width + 2.0f) * c->scale);
+    int ph = (int)ceilf((tm.height + 2.0f) * c->scale);
     if (!st__surf_ensure(c, pw, ph))
         return;
 
     ID2D1RenderTarget_BeginDraw(c->surf_rt);
-    D2D1_MATRIX_3X2_F sc = {{{ c->scale, 0.0f, 0.0f, c->scale, 0.0f, 0.0f }}};
+    D2D1_MATRIX_3X2_F sc = {{{ c->scale, 0.0f, 0.0f, c->scale,
+                               -tm.left * c->scale, -tm.top * c->scale }}};
     ID2D1RenderTarget_SetTransform(c->surf_rt, &sc);
     D2D1_COLOR_F clear = { 0, 0, 0, 0 };
     ID2D1RenderTarget_Clear(c->surf_rt, &clear);
@@ -715,9 +722,28 @@ void st_draw(st_ctx *c, st_layout *l, float x, float y, uint32_t rgb,
         IWICBitmapLock_GetStride(lock, &stride);
         IWICBitmapLock_GetDataPointer(lock, &sz, &ptr);
         if (ptr)
-            c->sink.blit(c->sink.user, ptr, (int)stride, pw, ph, x, y);
+            c->sink.blit(c->sink.user, ptr, (int)stride, pw, ph,
+                         x + tm.left, y + tm.top);
         IWICBitmapLock_Release(lock);
     }
+}
+
+int st_dwrite_family_present(st_ctx *c, const char *family)
+{
+    WCHAR *fam = st__wide(family, strlen(family));
+    if (!fam)
+        return 0;
+    IDWriteFontCollection *fc = NULL;
+    int ok = 0;
+    if (SUCCEEDED(IDWriteFactory_GetSystemFontCollection(c->dw, &fc, FALSE)) && fc) {
+        UINT32 ix = 0;
+        BOOL found = FALSE;
+        IDWriteFontCollection_FindFamilyName(fc, fam, &ix, &found);
+        IDWriteFontCollection_Release(fc);
+        ok = found ? 1 : 0;
+    }
+    free(fam);
+    return ok;
 }
 
 void st_dwrite_draw_rt(st_ctx *c, st_layout *l, void *d2d_render_target,

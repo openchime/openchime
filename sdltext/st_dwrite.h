@@ -41,4 +41,8 @@ st_ctx *st_dwrite_create(const st_sink *sink);
 void st_dwrite_draw_rt(st_ctx *, st_layout *, void *d2d_render_target,
                        float x, float y, uint32_t rgb, float alpha);
 
+/* Is `family` (UTF-8) actually installed? DirectWrite silently substitutes for
+ * a missing one, so callers that care must ask. */
+int st_dwrite_family_present(st_ctx *, const char *family);
+
 #endif /* ST_DWRITE_H */

@@ -42,6 +42,11 @@ void gfx_fill_round  (gfx *, gfx_rect r, float radius, uint32_t rgb, float a);
 void gfx_stroke_round(gfx *, gfx_rect r, float radius, float w, uint32_t rgb, float a);
 void gfx_line        (gfx *, float x0, float y0, float x1, float y1,
                       float w, uint32_t rgb, float a);
+/* Center + radii, DIPs — presence dots, avatar discs, radio marks. */
+void gfx_ellipse       (gfx *, float cx, float cy, float rx, float ry,
+                        uint32_t rgb, float a);
+void gfx_ellipse_stroke(gfx *, float cx, float cy, float rx, float ry,
+                        float w, uint32_t rgb, float a);
 
 /* Axis-aligned clip stack; a push intersects with the current clip, matching
  * how nested Direct2D clips composed in the client. */
