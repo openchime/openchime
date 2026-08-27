@@ -17,20 +17,18 @@
 /* Flattening and fan granularity. A transcript icon is 16-24 DIPs; at that
  * size 12 chords per cubic and 10 triangles per disc are below a pixel of
  * error even at 2x scale. */
-enum { BEZ_STEPS = 12, DISC_TRIS = 10, MAX_POLY = 256 };
+enum { BEZ_STEPS = 12, DISC_TRIS = 10, MAX_POLY = 1024 };
 
 typedef struct {
     float *xy;
-    int cap, n;      /* floats written, or -1 after overflow */
+    int cap, n;      /* floats written; overflow just stops adding */
 } emit;
 
 static void tri(emit *e, float ax, float ay, float bx, float by, float cx,
                 float cy)
 {
-    if (e->n < 0 || e->n + 6 > e->cap) {
-        e->n = -1;
+    if (e->n + 6 > e->cap)
         return;
-    }
     e->xy[e->n++] = ax;
     e->xy[e->n++] = ay;
     e->xy[e->n++] = bx;
@@ -62,8 +60,12 @@ static void segment(emit *e, float ax, float ay, float bx, float by, float r)
     tri(e, ax + nx, ay + ny, bx - nx, by - ny, ax - nx, ay - ny);
 }
 
-/* Expand one polyline: quads along it, discs at both ends and every joint. */
-static void stroke_poly(emit *e, const float *p, int n, int closed, float r)
+/* Expand one polyline: quads along it, discs at the ends and at REAL corners
+ * only (`joint[i]`). A flattened bezier's interior points are smooth — the
+ * quads already overlap there — and a disc at each of them is what blew the
+ * vertex budget and dropped whole icons. */
+static void stroke_poly(emit *e, const float *p, const unsigned char *joint,
+                        int n, int closed, float r)
 {
     if (n < 2) {
         if (n == 1)
@@ -75,7 +77,8 @@ static void stroke_poly(emit *e, const float *p, int n, int closed, float r)
     if (closed)
         segment(e, p[(n - 1) * 2], p[(n - 1) * 2 + 1], p[0], p[1], r);
     for (int i = 0; i < n; i++)
-        disc(e, p[i * 2], p[i * 2 + 1], r);
+        if (joint[i] || i == 0 || i == n - 1)
+            disc(e, p[i * 2], p[i * 2 + 1], r);
 }
 
 int gfx__icon_points(int icon_id, float bx, float by, float bw, float bh,
@@ -93,6 +96,7 @@ int gfx__icon_points(int icon_id, float bx, float by, float bw, float bh,
 
     emit e = { xy, cap, 0 };
     float poly[MAX_POLY * 2];
+    unsigned char joint[MAX_POLY];
     int pn = 0, closed = 0;
     float cx = 0, cy = 0;   /* pen, viewBox units */
 
@@ -101,13 +105,14 @@ int gfx__icon_points(int icon_id, float bx, float by, float bw, float bh,
         switch (g->op) {
         case 'M':
             if (pn)
-                stroke_poly(&e, poly, pn, closed, r);
+                stroke_poly(&e, poly, joint, pn, closed, r);
             pn = 0;
             closed = 0;
             cx = g->x0;
             cy = g->y0;
             poly[pn * 2] = ox + cx * s;
             poly[pn * 2 + 1] = oy + cy * s;
+            joint[pn] = 1;
             pn = 1;
             break;
         case 'L':
@@ -116,6 +121,7 @@ int gfx__icon_points(int icon_id, float bx, float by, float bw, float bh,
                 cy = g->y0;
                 poly[pn * 2] = ox + cx * s;
                 poly[pn * 2 + 1] = oy + cy * s;
+                joint[pn] = 1;
                 pn++;
             }
             break;
@@ -128,6 +134,7 @@ int gfx__icon_points(int icon_id, float bx, float by, float bw, float bh,
                            3 * u * t * t * g->y1 + t * t * t * g->y2;
                 poly[pn * 2] = ox + px * s;
                 poly[pn * 2 + 1] = oy + py * s;
+                joint[pn] = (unsigned char)(k == BEZ_STEPS);
                 pn++;
             }
             cx = g->x2;
@@ -141,6 +148,6 @@ int gfx__icon_points(int icon_id, float bx, float by, float bw, float bh,
         }
     }
     if (pn)
-        stroke_poly(&e, poly, pn, closed, r);
-    return e.n < 0 ? 0 : e.n;
+        stroke_poly(&e, poly, joint, pn, closed, r);
+    return e.n;
 }
