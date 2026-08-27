@@ -56,6 +56,13 @@ order" belongs in integration.
   `build/tests`, run by `make test`. There is deliberately no per-test binary:
   the tests exercise public APIs, so each `tests/*.c` links the real module
   objects rather than `#include`-ing the `.c` under test.
+- The one exception is platform-backend code that cannot execute on the build
+  host: sdltext's DirectWrite backend (ARCH-106) has its own console program,
+  `make windows-sdltext-test` → `build/sdltext_test.exe`, same
+  failure-count-as-exit-code contract. CI cross-compiles it (the compile is
+  the header/vtable check mingw keeps honest); a Windows host runs it. The
+  portable half of sdltext (the byte↔UTF-16 offset map) stays in `make test`
+  like everything else.
 - A subject's tests live in one translation unit exposing a single entry point,
   `int run_<subject>_tests(void)`, which runs its groups and returns its
   failure count. `tests/main.c` calls each and sums; a non-zero total exits
