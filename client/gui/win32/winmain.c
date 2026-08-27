@@ -1366,6 +1366,12 @@ enum {
 };
 static rectf g_fmt_btn[FMT_COUNT];
 static int         g_fmt_hover = -1;
+/* Tooltip dwell for the toolbar (REQ-none; icon-only buttons need names).
+ * Armed by the hover machine, shown after the pointer RESTS — a tip that
+ * chases every pass over the bar is noise, not help. */
+#define FMT_TIP_MS 500
+static ULONGLONG   g_fmt_hover_since;   /* tick when g_fmt_hover last changed */
+static int         g_fmt_tip_shown;     /* dwell crossed; repainted once */
 /* Which half of the composer's send split-button the pointer is over:
  * 0 neither, 1 Send, 2 the "send later" dropdown. */
 static int         g_send_hover = 0;
@@ -7204,10 +7210,15 @@ static void draw_fmt_toolbar(gfx *rt, float bx0, float by0, float bx1) {
         "Bold", "Italic", "Strikethrough", "Code", "Blockquote",
         "Bulleted list", "Numbered list"
     };
+    /* The chord beside the name, exactly as ed_key binds it — a tooltip that
+     * teaches the shortcut retires itself. */
+    static const char *CHORDS[FMT_COUNT] = {
+        "Ctrl+B", "Ctrl+I", "Ctrl+Shift+X", "Ctrl+Shift+C",
+        "Ctrl+Shift+9", "Ctrl+Shift+8", "Ctrl+Shift+7"
+    };
     float sq = COMPOSER_FMT;
     float y = by0 + (COMPOSER_TB - sq) / 2;
     float x = bx0 + 8;
-    (void)TIPS;
     for (int i = 0; i < FMT_COUNT; i++) {
         /* A gap before the block forms: emphasis wraps a selection, a block
          * marker changes whole lines, and the two are not the same gesture. */
@@ -7225,6 +7236,31 @@ static void draw_fmt_toolbar(gfx *rt, float bx0, float by0, float bx1) {
         if (g_fmt_hover == i) fill_round(rt, g_fmt_btn[i], 5.0f, OC_COL_HOVER);
         draw_fmt_icon(rt, i, g_fmt_btn[i], g_fmt_hover == i ? OC_COL_TEXT : OC_COL_MUTED);
         x += sq + 2;
+    }
+    /* The tooltip, once the pointer has RESTED on a button. Drawn in the
+     * floating style the image hover-toolbar established — dark panel, light
+     * text, theme-agnostic — above the button so it never covers the field,
+     * clamped so a bar flush to the window edge keeps its tip on screen. */
+    if (g_fmt_hover >= 0 && g_fmt_hover < FMT_COUNT &&
+        g_fmt_btn[g_fmt_hover].right > 0 &&
+        GetTickCount64() - g_fmt_hover_since >= FMT_TIP_MS) {
+        const rectf *b = &g_fmt_btn[g_fmt_hover];
+        float nw = text_width(TIPS[g_fmt_hover], g_meta);
+        float cw = text_width(CHORDS[g_fmt_hover], g_meta);
+        float tw = nw + 10 + cw + 24, th = 26.0f;
+        float cx = (b->left + b->right) / 2;
+        float tx = cx - tw / 2;
+        if (tx < bx0 - 4) tx = bx0 - 4;          /* keep the tip over the composer, */
+        if (tx + tw > bx1 + 4) tx = bx1 + 4 - tw; /* which is always on screen */
+        rectf tip = rf(tx, b->top - th - 6, tx + tw, b->top - 6);
+        fill_round(rt, rf(tip.left + 1, tip.top + 2, tip.right + 1, tip.bottom + 2),
+                   6.0f, OC_COL_RAIL);                        /* shadow */
+        fill_round_a(rt, tip, 6.0f, 0x000000, 0.82f);
+        draw_text(rt, TIPS[g_fmt_hover], g_meta,
+                  rf(tip.left + 12, tip.top, tip.right, tip.bottom), 0xFFFFFF);
+        draw_text(rt, CHORDS[g_fmt_hover], g_meta,
+                  rf(tip.left + 12 + nw + 10, tip.top, tip.right, tip.bottom),
+                  0xA8ADB4);
     }
 }
 
@@ -17510,6 +17546,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     oc_client_tick(g_wss[wi].client);
             /* And the sign-in attempt, which is not in a slot yet. */
             if (g_si_client) oc_client_tick(g_si_client);
+            /* The toolbar tooltip's dwell: nothing repaints while the pointer
+             * rests, so the tick fires the one paint that reveals it. */
+            if (g_fmt_hover >= 0 && !g_fmt_tip_shown &&
+                GetTickCount64() - g_fmt_hover_since >= FMT_TIP_MS) {
+                g_fmt_tip_shown = 1;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
             /* Poll the attempt's outcome HERE, not only in the g_client-gated
              * block below: signing in from the signed-out state has no g_client,
              * and gating the poll on one left that sign-in on "Signing in…"
@@ -18254,7 +18297,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!pointer_blocked())
                 for (int i = 0; i < FMT_COUNT; i++)
                     if (in_rect(g_fmt_btn[i], (float)mx, (float)my)) { fh = i; break; }
-            if (fh != g_fmt_hover) { g_fmt_hover = fh; InvalidateRect(hwnd, NULL, FALSE); }
+            if (fh != g_fmt_hover) {
+                g_fmt_hover = fh;
+                g_fmt_hover_since = GetTickCount64();   /* tooltip dwell restarts */
+                g_fmt_tip_shown = 0;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
         }
         {   /* Send split-button hover, same reasoning as above: two
              * rects, asked every move, kept out of the surface hover machine. */
