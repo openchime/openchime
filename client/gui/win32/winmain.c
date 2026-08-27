@@ -568,6 +568,10 @@ static struct { float top, bot; uint64_t cid; int header; int sec; char label[96
 static oc_sidebar_opts g_sb;          /* per-section sort/filter/collapse */
 static float g_sb_scroll, g_sb_content, g_sb_view;
 static int   g_sb_hover_sec = -1;     /* header hovered -> reveal its kebab */
+static uint64_t g_sb_hover_cid;       /* conversation row under the pointer */
+static int   g_chrome_hover;          /* small chrome buttons (gear/compose/…): which one */
+static uint64_t g_mem_hover;          /* member-pane row under the pointer (uid) */
+static int   g_pick_hover = -1;       /* emoji-picker cell under the pointer */
 static rectf g_sb_kebab;
 static int   g_sb_menu_sec = -1;
 static int   g_sb_settings_pending;   /* waiting for the synced prefs after auth */
@@ -1734,22 +1738,27 @@ static void txt_blit(gfx *rt, txt_ent *e, rectf r, int align, int para) {
     if (!e) return;
     float scale = gfx_scale(rt);
     float dw = e->pw / scale, dh = e->ph / scale;
-    /* CENTER/RIGHT and MID/BOT place the INK box, not the layout box: for a
-     * lone avatar initial or a toolbar letter the line's ascender gap reads
-     * as a 1-2px up-left bias, which at 18px is plainly visible. LEFT/TOP
-     * keep the layout's own offsets so runs of text align by baseline. */
+    /* CENTER/RIGHT place the INK box horizontally: for a lone avatar initial
+     * or a toolbar letter the line's side bearings read as an off-center
+     * glyph, and horizontal optical centering is what a centered label wants.
+     *
+     * VERTICALLY the rule is the opposite, and it used to be the same: MID/BOT
+     * centered each string's INK, so every string found its own baseline —
+     * "Threads" (cap-only ink) sat low, "People" (descender ink) rode high,
+     * and every label next to a geometrically-centered icon disagreed with its
+     * neighbours by a pixel or two. Endemic, because every row label goes
+     * through here. MID/BOT now place the LAYOUT box (e->mh) and let the ink
+     * fall at its own offset inside it (e->oy): one format, one baseline,
+     * whatever the letters are. */
     float rw = r.right - r.left, rh = r.bottom - r.top;
-    /* The raster pads two DIPs below-right of the ink (see st_draw); center
-     * the INK, not the padded box, or every centered glyph sits a pixel
-     * up-left — plainly visible on an 18px avatar initial. */
-    float iw = dw - 2.0f, ih = dh - 2.0f;
+    /* The raster pads two DIPs below-right of the ink (see st_draw). */
+    float iw = dw - 2.0f;
     float x = align == ST_ALIGN_CENTER ? r.left + (rw - iw) / 2.0f
             : align == ST_ALIGN_RIGHT  ? r.right - iw
                                        : r.left + e->ox;
-    float y = para == PARA_MID && rh > ih ? r.top + (rh - ih) / 2.0f
-            : para == PARA_BOT && rh > ih ? r.bottom - ih
-                                          : r.top + e->oy;
-    if (para == PARA_MID && rh <= ih) y = r.top + e->oy;
+    float y = para == PARA_MID ? r.top + (rh - e->mh) / 2.0f + e->oy
+            : para == PARA_BOT ? r.bottom - e->mh + e->oy
+                               : r.top + e->oy;
     gfx_rect dst = { x, y, dw, dh };
     gfx_clip_push(rt, gr(r));
     gfx_tex_draw(rt, e->tex, dst, 0.0f, 1.0f);
@@ -2076,6 +2085,17 @@ static int any_overlay(const oc_model *m) {
 }
 
 static void ac_close(void);   /* fwd */
+static void picker_close(HWND hwnd);   /* fwd — accel_dispatch's Esc closes it */
+static int  modal_open(void);          /* fwd — pointer_blocked() asks */
+/* Is a floating surface between the pointer and the shell? Hover must not track
+ * the pointer under a menu, the emoji picker, the palette, a flyout, the time
+ * dropdown, the lightbox or a modal — rows lighting up around an open menu was
+ * the visible symptom. window_is_covered() is the whole-window subset of this;
+ * it lives later in the file and gates native children rather than hover. */
+static int pointer_blocked(void) {
+    return g_menu != MENU_NONE || g_pick_open || g_pal_open || g_more_open ||
+           g_tp_open || g_lightbox || modal_open() || g_view == VIEW_SIGNIN;
+}
 
 /* Write the composer's contents to the daemon as `cid`'s draft — but only if
  * they differ from what we last wrote (ARCH-101). An empty composer deletes it,
@@ -2362,6 +2382,9 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
     rectf av = rf(cx - 18, 14, cx + 18, 50);
     g_rail_btn = av;
     fill_round(rt, av, 12.0f, OC_COL_ACCENT);
+    /* The same hover cue every other rail item gives — the switcher was the one
+     * clickable thing on the rail with no feedback at all. */
+    if (g_nav_hover == NAV_SWITCHER) fill_round_a(rt, av, 12.0f, 0xFFFFFF, 0.12f);
     char wsn[80]; ws_display_name(m, wsn, sizeof wsn);
     char init[2] = { (char)(wsn[0] ? (wsn[0] >= 'a' && wsn[0] <= 'z' ? wsn[0] - 32 : wsn[0]) : 'O'), 0 };
     draw_text(rt, init, g_avatar, av, 0xFFFFFF);
@@ -2633,9 +2656,18 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                         g_hdr_compose.right - 2, g_hdr_compose.bottom - 2);
     rectf gi = rf(g_hdr_gear.left + 2, g_hdr_gear.top + 2,
                         g_hdr_gear.right - 2, g_hdr_gear.bottom - 2);
-    draw_lucide(rt, OC_ICON_SQUARE_PEN, ci, OC_COL_MUTED);
-    draw_lucide(rt, OC_ICON_SETTINGS,   gi, OC_COL_MUTED);
+    /* Hover feedback on the two icon buttons — they were click targets with no
+     * cue at all, next to shelf rows that light up. */
+    if (g_chrome_hover == 2) fill_round(rt, g_hdr_compose, 6.0f, OC_COL_HOVER);
+    if (g_chrome_hover == 1) fill_round(rt, g_hdr_gear,    6.0f, OC_COL_HOVER);
+    draw_lucide(rt, OC_ICON_SQUARE_PEN, ci,
+                g_chrome_hover == 2 ? OC_COL_TEXT : OC_COL_MUTED);
+    draw_lucide(rt, OC_ICON_SETTINGS,   gi,
+                g_chrome_hover == 1 ? OC_COL_TEXT : OC_COL_MUTED);
     g_ws_hdr_btn = rf(RAIL_W, 0, g_hdr_gear.left - 4, HEADER_H);
+    if (g_chrome_hover == 3)
+        fill_round(rt, rf(g_ws_hdr_btn.left + 8, 10, g_ws_hdr_btn.right, HEADER_H - 10),
+                   6.0f, OC_COL_HOVER);
     char wsname[80]; ws_display_name(m, wsname, sizeof wsname);
     draw_text(rt, wsname, g_display, rf(RAIL_W + 16, 0, g_hdr_gear.left - 22, HEADER_H), OC_COL_TEXT);
     /* Chevron and connection dot both hug the NAME, in that order — the chevron
@@ -2837,6 +2869,10 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
             int muted = rc && rc->muted;
             int unread = (r->unread > 0) && !muted;
             if (selected) fill_round(rt, rf(sx0, ry + 2, sx1, ry + ROW_H - 2), 6.0f, OC_COL_SELECT);
+            /* Hover, the cue the shelf rows two inches up already give. Never on
+             * the selected row — SELECT already owns it. */
+            else if (g_sb_hover_cid && r->channel_id == g_sb_hover_cid)
+                fill_round(rt, rf(sx0, ry + 2, sx1, ry + ROW_H - 2), 6.0f, OC_COL_HOVER);
             /* Ask what the ROW IS, not where it happens to be filed. Starring a DM
              * moves it into Starred, and this test used to be
              * `section == OC_SB_DMS` — so a starred person rendered with the channel
@@ -3671,6 +3707,10 @@ static void draw_msglist(gfx *rt, const oc_model *m,
     }
 
     float y = (reg.bottom - total) + *scroll;     /* g_scroll 0 => newest pinned to bottom */
+    /* A short thread reads top-down under its parent — pinning one reply to the
+     * bottom of the pane leaves a void between it and the "N replies" rule. Only
+     * the main transcript keeps the pinned-to-bottom reading for short content. */
+    if (mode == MSGLIST_THREAD && total <= visible) y = reg.top;
 
     gfx_clip_push(rt, gr(reg));
     /* Chip hit-boxes reset unconditionally: the thread pane draws chips too, and
@@ -4926,6 +4966,23 @@ static int accel_dispatch(HWND hwnd, const MSG *m) {
         if (g_menu)      { g_menu = MENU_NONE; g_menu_hover = -1; InvalidateRect(hwnd, NULL, FALSE); return 1; }
         if (g_more_open) { g_more_open = 0;    InvalidateRect(hwnd, NULL, FALSE); return 1; }
         if (g_lightbox)  { g_lightbox = 0;     InvalidateRect(hwnd, NULL, FALSE); return 1; }
+        /* Focus-specific Esc (drop the completion list, cancel an edit, clear a
+         * selection) stays with the control that owns it — fall through. */
+        if (g_n_ac > 0 || g_edit_msg || g_has_sel) return 0;
+        /* The picker and the transcript-replacing panes are transient overlays
+         * too, and the shortcuts sheet promises Esc closes them — but their
+         * closing lived only in the procs of children that rarely own focus, so
+         * with the caret in the composer (the normal state) Esc did nothing. */
+        if (g_pick_open) { picker_close(hwnd); return 1; }
+        {
+            const oc_model *pm = model();
+            if (pm && (pm->thread_open || pm->search_open || pm->pinlist_open ||
+                       pm->weblist_open || pm->storage_open || pm->audit_open)) {
+                close_overlays();
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 1;
+            }
+        }
         return 0;
     }
     unsigned mods = 0;
@@ -6170,6 +6227,15 @@ static void select_tab(int t) {
     if (mm && g_sel && !tab_applies(oc_model_channel((oc_model *)mm, g_sel), t)) t = TAB_MESSAGES;
     if (mm && mm->pinlist_open)  oc_client_close_pins(g_client);
     if (mm && mm->filelist_open) oc_client_close_files(g_client);
+    /* Every OTHER transcript-replacing pane too: picking a tab is picking what
+     * the middle column shows, and a webhook list or storage report left open
+     * kept the pane while the underline moved — the strip saying Messages over
+     * a pane showing Webhooks. */
+    if (mm && mm->thread_open)   oc_client_close_thread(g_client);
+    if (mm && mm->search_open)   oc_client_close_search(g_client);
+    if (mm && mm->weblist_open)  oc_client_close_webhooks(g_client);
+    if (mm && mm->storage_open)  oc_client_toggle_storage(g_client, 0);
+    if (mm && mm->audit_open)    oc_client_toggle_audit(g_client, 0);
     g_tab = t;
     if (!g_sel) { g_tab = TAB_MESSAGES; return; }
     if (t == TAB_PINS)  oc_client_list_pins(g_client, g_sel);
@@ -6461,15 +6527,21 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
                       : g_rp_mode == RP_REACTORS ? "REACTIONS" : "MEMBERS";
     g_rp_back = g_rp_mode == RP_MEMBERS ? rf(0, 0, 0, 0) : rf(x0 + 8, 8, x0 + 30, 30);
     if (g_rp_mode != RP_MEMBERS) {
+        if (g_chrome_hover == 5) fill_round(rt, g_rp_back, 6.0f, OC_COL_HOVER);
         g_ui->align = ST_ALIGN_CENTER;
-        draw_text(rt, "\xE2\x80\xB9", g_ui, g_rp_back, OC_COL_MUTED);
+        draw_text(rt, "\xE2\x80\xB9", g_ui, g_rp_back,
+                  g_chrome_hover == 5 ? OC_COL_TEXT : OC_COL_MUTED);
         g_ui->align = ST_ALIGN_LEFT;
     }
     draw_text(rt, title, g_meta,
               rf(x0 + (g_rp_mode == RP_MEMBERS ? 16 : 34), 10, W - 34, 34), OC_COL_FAINT);
     g_rp_close = rf(W - 30, 8, W - 8, 30);
+    /* Hover on the pane's close — pane_header's X already has one; this one
+     * lacked it only because the context pane draws its own header. */
+    if (g_chrome_hover == 4) fill_round(rt, g_rp_close, 6.0f, OC_COL_HOVER);
     g_meta->align = ST_ALIGN_CENTER;
-    draw_text(rt, "\xC3\x97", g_meta, g_rp_close, OC_COL_MUTED);
+    draw_text(rt, "\xC3\x97", g_meta, g_rp_close,
+              g_chrome_hover == 4 ? OC_COL_TEXT : OC_COL_MUTED);
     g_meta->align = ST_ALIGN_LEFT;
 
     if (g_rp_mode == RP_PROFILE)  { g_n_memrows = 0; draw_profile_card(rt, m, rf(x0, 40, W, H)); return; }
@@ -6490,8 +6562,14 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
         const oc_chan_member *cm = &m->chanmem[i];
         if (y > H) break;
         const char *nm = oc_model_user_name((oc_model *)m, cm->user_id);
+        /* A member row opens the profile — say so on the way in, as every other
+         * clickable row in the app does. */
+        if (g_mem_hover && cm->user_id == g_mem_hover)
+            fill_round(rt, rf(x0 + 4, y + 1, W - 4, y + ROW_H - 1), 6.0f, OC_COL_HOVER);
         draw_presence_dot_dnd(rt, x0 + 22, y + ROW_H / 2, 4.5f,
-                              oc_model_presence_of(m, cm->user_id), OC_COL_SIDEBAR,
+                              oc_model_presence_of(m, cm->user_id),
+                              (g_mem_hover && cm->user_id == g_mem_hover)
+                                  ? OC_COL_HOVER : OC_COL_SIDEBAR,
                               oc_model_dnd_of(m, cm->user_id));
         const char *disp = (nm && nm[0]) ? nm : "user";
         draw_text(rt, disp, g_ui, rf(x0 + 34, y, W - 14, y + ROW_H), OC_COL_TEXT);
@@ -6594,8 +6672,13 @@ static void draw_signin(gfx *rt, float W, float H) {
     draw_text(rt, head, g_display, rf(x0 + 12, y, x0 + SI_W - 12, y + 30), OC_COL_TEXT);
     y += 30;
     if (g_si_step == 2) {
+        /* The heading already names the workspace; repeat the endpoint only when
+         * it says something the heading does not (a NAMED workspace resolving to
+         * a host). "Sign in to 127.0.0.1:8443" over "127.0.0.1:8443" was the same
+         * string twice. */
         char sub[300]; snprintf(sub, sizeof sub, "%s:%d", g_si_host, g_si_port);
-        draw_text(rt, sub, g_meta, rf(x0 + 12, y, x0 + SI_W - 12, y + 20), OC_COL_MUTED);
+        draw_text(rt, strcmp(head + 11, sub) ? sub : "Enter your credentials",
+                  g_meta, rf(x0 + 12, y, x0 + SI_W - 12, y + 20), OC_COL_MUTED);
     } else {
         draw_text(rt, "Enter your workspace address", g_meta,
                   rf(x0 + 12, y, x0 + SI_W - 12, y + 20), OC_COL_MUTED);
@@ -6840,6 +6923,8 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
                 if (y + cell >= body.top && y <= body.bottom) {
                     rectf r = rf(x, y, x + cell, y + cell);
                     if (g_n_pick_cells < 256) {
+                        if (g_pick_hover == g_n_pick_cells)
+                            fill_round(rt, r, 6.0f, OC_COL_HOVER);
                         g_pick_cells[g_n_pick_cells].r = r;
                         g_pick_cells[g_n_pick_cells].emoji = pool[i];
                         g_n_pick_cells++;
@@ -6875,6 +6960,8 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
                 tn++;
             }
             if (g_n_pick_cells < 256) {
+                if (g_pick_hover == g_n_pick_cells)
+                    fill_round(rt, r, 6.0f, OC_COL_HOVER);
                 g_pick_cells[g_n_pick_cells].r = r;
                 g_pick_cells[g_n_pick_cells].emoji = glyph;
                 g_n_pick_cells++;
@@ -6960,13 +7047,16 @@ static void draw_fmt_icon(gfx *rt, int which, rectf b, uint32_t c) {
     float cx = (b.left + b.right) / 2, cy = (b.top + b.bottom) / 2;
     switch (which) {
     case FMT_BOLD:
-        draw_text(rt, "B", g_fmt_bold, b, c);
+        /* Ink-measured nudges (96 DPI sweep): the cached raster's pad estimate
+         * biases these single letters ~1px down-right of optical centre under
+         * either seating rule; measured B pads L9 R7 T8 B6 -> shift up-left 1. */
+        draw_text(rt, "B", g_fmt_bold, rf(b.left - 1, b.top - 1, b.right - 1, b.bottom - 1), c);
         break;
     case FMT_ITALIC:
         draw_text(rt, "I", g_fmt_ital, b, c);
         break;
     case FMT_STRIKE:
-        draw_text(rt, "S", g_fmt_bold, b, c);
+        draw_text(rt, "S", g_fmt_bold, rf(b.left, b.top - 1, b.right, b.bottom - 1), c);
         fmt_bar(rt, cx - 6, cy - 0.5f, 12, 1.4f, c);      /* the line is the point */
         break;
     case FMT_CODE: {
@@ -8314,6 +8404,7 @@ static void draw_dm_list(gfx *rt, const oc_model *m, float h) {
 
     draw_text(rt, "Direct messages", g_display, rf(x0 + 16, 0, x1 - 40, HEADER_H), OC_COL_TEXT);
     g_dm_compose_btn = rf(x1 - 36, 16, x1 - 12, 40);
+    if (g_chrome_hover == 6) fill_round(rt, g_dm_compose_btn, 6.0f, OC_COL_HOVER);
     draw_lucide(rt, OC_ICON_SQUARE_PEN, rf(g_dm_compose_btn.left + 2, g_dm_compose_btn.top + 2,
                                            g_dm_compose_btn.right - 2, g_dm_compose_btn.bottom - 2),
                 OC_COL_MUTED);
@@ -9496,7 +9587,11 @@ static void draw_drafts(gfx *rt, const oc_model *m, rectf reg) {
             if (g_n_listrows < (int)(sizeof g_listrows / sizeof g_listrows[0])) {
                 g_listrows[g_n_listrows].row = row;
                 g_listrows[g_n_listrows].act = rf(0, 0, 0, 0);
-                g_listrows[g_n_listrows].mid = 0;
+                /* The hover machine keys on .mid, and the painter above compares
+                 * g_listrow_hover to the channel id — a draft has no message id,
+                 * and storing 0 here meant a draft row could never read as
+                 * hoverable. Key both sides on the channel id. */
+                g_listrows[g_n_listrows].mid = dv->channel_id;
                 g_listrows[g_n_listrows].cid = dv->channel_id;
                 g_n_listrows++;
             }
@@ -12395,6 +12490,16 @@ static LRESULT CALLBACK pal_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return CallWindowProcW(g_pal_prev, hwnd, msg, wp, lp);
 }
 
+/* The emoji picker's search box: Esc closes the picker, exactly as the
+ * shortcuts sheet says it does. Unsubclassed, the default EDIT proc swallowed
+ * the key, so the picker was undismissable from its own search field. */
+static WNDPROC g_pick_prev;
+static LRESULT CALLBACK pick_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_KEYDOWN && wp == VK_ESCAPE) { picker_close(GetParent(hwnd)); return 0; }
+    if (msg == WM_CHAR && (wp == VK_RETURN || wp == VK_ESCAPE)) return 0;   /* no bell */
+    return CallWindowProcW(g_pick_prev, hwnd, msg, wp, lp);
+}
+
 static LRESULT CALLBACK srch_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_KEYDOWN && wp == VK_RETURN) { search_submit(); return 0; }
     if (msg == WM_CHAR && (wp == VK_RETURN || wp == VK_ESCAPE)) return 0;  /* no MessageBeep */
@@ -13594,6 +13699,11 @@ static int on_click(HWND hwnd, int x, int y) {
         for (int i = 0; i < g_n_moreflyrows; i++)
             if ((float)y >= g_moreflyrows[i].top && (float)y < g_moreflyrows[i].bot &&
                 (float)x >= RAIL_W && (float)x < RAIL_W + 6 + 196) {
+                if (g_view == VIEW_ADMIN && g_moreflyrows[i].act != VIEW_ADMIN) {
+                    const oc_model *am = model();   /* see the rail-item comment */
+                    if (am && am->storage_open) oc_client_toggle_storage(g_client, 0);
+                    if (am && am->audit_open)   oc_client_toggle_audit(g_client, 0);
+                }
                 g_view = g_moreflyrows[i].act; g_more_open = 0; layout_composer(hwnd);
                 if (g_view == VIEW_FILES) {
                     g_file_chan = 0; g_filelist_from_view = 1;
@@ -13611,6 +13721,16 @@ static int on_click(HWND hwnd, int x, int y) {
             if ((float)y >= g_navrows[i].top && (float)y < g_navrows[i].bot) {
                 int act = g_navrows[i].act;
                 if (act >= 0)                  {
+                    /* Leaving Admin closes its report panes: the admin Storage
+                     * and Audit tabs share the model's pane flags with the
+                     * channel-tools versions, and a flag left set replaced the
+                     * Home transcript with a storage report — no tab selected
+                     * it, and neither Esc nor a tab click could dismiss it. */
+                    if (g_view == VIEW_ADMIN && act != VIEW_ADMIN) {
+                        const oc_model *am = model();
+                        if (am && am->storage_open) oc_client_toggle_storage(g_client, 0);
+                        if (am && am->audit_open)   oc_client_toggle_audit(g_client, 0);
+                    }
                     g_view = act; layout_composer(hwnd);
                     /* Entering a report view fetches it: both are point-in-time
                      * and a stale one is worse than a moment's wait. */
@@ -17099,6 +17219,11 @@ static void test_poll(HWND hwnd) {
                 !strcmp(arg, "newmsg")   ? VIEW_NEWMSG :
                 !strcmp(arg, "admin")    ? VIEW_ADMIN : atoi(arg);
         if (v >= 0 && v < VIEW_COUNT) {
+            if (g_view == VIEW_ADMIN && v != VIEW_ADMIN) {
+                const oc_model *am = model();   /* see the rail-item comment */
+                if (am && am->storage_open) oc_client_toggle_storage(g_client, 0);
+                if (am && am->audit_open)   oc_client_toggle_audit(g_client, 0);
+            }
             g_view = v; layout_composer(hwnd);
             if (v == VIEW_ACTIVITY) oc_client_list_activity(g_client, act_wire_filter());
             if (v == VIEW_THREADS)  oc_client_list_threads(g_client,
@@ -17226,6 +17351,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_pick_edit) {
             SendMessageW(g_pick_edit, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
             SendMessageW(g_pick_edit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search emoji");
+            g_pick_prev = (WNDPROC)SetWindowLongPtrW(g_pick_edit, GWLP_WNDPROC, (LONG_PTR)pick_proc);
         }
         signin_create(hwnd);
         DragAcceptFiles(hwnd, TRUE);              /* drop files anywhere to upload */
@@ -17257,6 +17383,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     oc_client_tick(g_wss[wi].client);
             /* And the sign-in attempt, which is not in a slot yet. */
             if (g_si_client) oc_client_tick(g_si_client);
+            /* Poll the attempt's outcome HERE, not only in the g_client-gated
+             * block below: signing in from the signed-out state has no g_client,
+             * and gating the poll on one left that sign-in on "Signing in…"
+             * forever — success, failure and the timeout all unread. */
+            if (!g_client && g_view == VIEW_SIGNIN && g_si_connecting) signin_poll(hwnd);
             /* Signing out of the last workspace leaves no client, so the tick
              * below — which owns the badge — never runs again, and an overlay
              * advertising unread mail in a session that no longer exists would
@@ -17967,7 +18098,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_MOUSEMOVE: {
         int mx = (int)DIPF(GET_X_LPARAM(lp)), my = (int)DIPF(GET_Y_LPARAM(lp));
-        cursor_want(g_link_hover[0] ? 2 : 0);   /* the hand is the affordance */
+        /* Hand over a link, I-BEAM over the composer's text: the field is a
+         * custom control, so nothing else will ever ask for the text cursor —
+         * the I-beam SDL cursor existed from day one and had no caller. */
+        cursor_want(g_link_hover[0] ? 2
+                    : (!pointer_blocked() && main_is_conversation() &&
+                       in_rect(g_ed_box, (float)mx, (float)my)) ? 1 : 0);
         /* Recorded before anything consumes the message, so shared chrome can ask
          * where the pointer is without every widget tracking its own hover. */
         if (mx != g_mouse_x || g_mouse_y != my) {
@@ -17978,7 +18114,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * the two disagree: a row that glows but refuses the click is the
              * defect this gate exists to prevent. */
             int sh = -1;
-            if (sidebar_kind() == SBK_CHANNELS && !window_is_covered() &&
+            if (sidebar_kind() == SBK_CHANNELS && !pointer_blocked() &&
                 (float)mx >= RAIL_W && (float)mx < RAIL_W + SIDEBAR_W)
                 for (int i = 0; i < g_n_shelf; i++)
                     if ((float)my >= g_shelf_rows[i].top && (float)my < g_shelf_rows[i].bot) sh = i;
@@ -17988,16 +18124,46 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * and it keeps the seven buttons out of the hover state machine
              * below — they are chrome over the composer, not a surface. */
             int fh = -1;
-            for (int i = 0; i < FMT_COUNT; i++)
-                if (in_rect(g_fmt_btn[i], (float)mx, (float)my)) { fh = i; break; }
+            if (!pointer_blocked())
+                for (int i = 0; i < FMT_COUNT; i++)
+                    if (in_rect(g_fmt_btn[i], (float)mx, (float)my)) { fh = i; break; }
             if (fh != g_fmt_hover) { g_fmt_hover = fh; InvalidateRect(hwnd, NULL, FALSE); }
         }
         {   /* Send split-button hover, same reasoning as above: two
              * rects, asked every move, kept out of the surface hover machine. */
-            int sh2 = !composer_ready() ? 0
+            int sh2 = (pointer_blocked() || !composer_ready()) ? 0
                     : in_rect(g_send_btn,  (float)mx, (float)my) ? 1
                     : in_rect(g_sched_btn, (float)mx, (float)my) ? 2 : 0;
             if (sh2 != g_send_hover) { g_send_hover = sh2; InvalidateRect(hwnd, NULL, FALSE); }
+        }
+        {   /* Small chrome buttons (sidebar gear/compose, workspace header, the
+             * context pane's back/close, the DM-list compose): one tracked id so
+             * entering or leaving any of them repaints; the painters test the
+             * recorded pointer against their own rect. */
+            int ch = 0;
+            if (!pointer_blocked()) {
+                float fx2 = (float)mx, fy2 = (float)my;
+                if      (in_rect(g_hdr_gear, fx2, fy2))       ch = 1;
+                else if (in_rect(g_hdr_compose, fx2, fy2))    ch = 2;
+                else if (in_rect(g_ws_hdr_btn, fx2, fy2))     ch = 3;
+                else if (in_rect(g_rp_close, fx2, fy2))       ch = 4;
+                else if (in_rect(g_rp_back, fx2, fy2))        ch = 5;
+                else if (in_rect(g_dm_compose_btn, fx2, fy2)) ch = 6;
+            }
+            if (ch != g_chrome_hover) { g_chrome_hover = ch; InvalidateRect(hwnd, NULL, FALSE); }
+            /* Member rows are click targets (they open the profile) — track them. */
+            uint64_t mh = 0;
+            if (!pointer_blocked())
+                for (int i = 0; i < g_n_memrows; i++)
+                    if (in_rect(g_memrows[i].r, (float)mx, (float)my)) { mh = g_memrows[i].uid; break; }
+            if (mh != g_mem_hover) { g_mem_hover = mh; InvalidateRect(hwnd, NULL, FALSE); }
+            /* Emoji-picker cells: the picker floats, so this is tracked while it
+             * is open — its own surface, exempt from pointer_blocked. */
+            int pkh = -1;
+            if (g_pick_open)
+                for (int i = 0; i < g_n_pick_cells; i++)
+                    if (in_rect(g_pick_cells[i].r, (float)mx, (float)my)) { pkh = i; break; }
+            if (pkh != g_pick_hover) { g_pick_hover = pkh; InvalidateRect(hwnd, NULL, FALSE); }
         }
         if (g_ed_dragging) { ed_mouse_move(hwnd, (float)mx, (float)my); return 0; }
         /* Link hover. UNCONDITIONAL, before the rail/sidebar/transcript
@@ -18050,16 +18216,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                    (float)mx < RAIL_W + SIDEBAR_W) {
             /* Reveal a header's kebab while the cursor is on its row, as Slack
              * does: there when you look for it, out of the way when you don't. */
-            int sec = -1;
-            for (int i = 0; i < g_n_rows; i++)
-                if (g_rows[i].header && (float)my >= g_rows[i].top && (float)my < g_rows[i].bot) {
-                    sec = g_rows[i].sec; break;
-                }
+            int sec = -1; uint64_t scid = 0;
+            if (!pointer_blocked())
+                for (int i = 0; i < g_n_rows; i++)
+                    if ((float)my >= g_rows[i].top && (float)my < g_rows[i].bot) {
+                        if (g_rows[i].header) sec = g_rows[i].sec;
+                        else scid = g_rows[i].cid;
+                        break;
+                    }
             if (sec != g_sb_hover_sec) { g_sb_hover_sec = sec; InvalidateRect(hwnd, NULL, FALSE); }
+            if (scid != g_sb_hover_cid) { g_sb_hover_cid = scid; InvalidateRect(hwnd, NULL, FALSE); }
         } else {
             uint64_t th = 0;
-            for (int i = 0; i < g_n_thumb_hits; i++)
-                if (in_rect(g_thumb_hits[i].r, mx, my)) { th = g_thumb_hits[i].id; break; }
+            if (!pointer_blocked())
+                for (int i = 0; i < g_n_thumb_hits; i++)
+                    if (in_rect(g_thumb_hits[i].r, mx, my)) { th = g_thumb_hits[i].id; break; }
             /* Keep the toolbar up while the cursor is on it, not just on the
              * image — it sits inside the image bounds, so this is only about
              * not flickering at the edges. */
@@ -18070,35 +18241,50 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if ((float)mx < RAIL_W) {
             /* Rail hover. */
             int a = -100;
-            for (int i = 0; i < g_n_navrows; i++)
-                if ((float)my >= g_navrows[i].top && (float)my < g_navrows[i].bot) { a = g_navrows[i].act; break; }
+            if (!pointer_blocked())
+                for (int i = 0; i < g_n_navrows; i++)
+                    if ((float)my >= g_navrows[i].top && (float)my < g_navrows[i].bot) { a = g_navrows[i].act; break; }
             if (a != g_nav_hover) { g_nav_hover = a; InvalidateRect(hwnd, NULL, FALSE); }
         } else {
             if (g_nav_hover != -100) { g_nav_hover = -100; InvalidateRect(hwnd, NULL, FALSE); }
-            if (g_sb_hover_sec != -1)  { g_sb_hover_sec = -1;  InvalidateRect(hwnd, NULL, FALSE); }
-            int r = (any_overlay(model()) || !transcript_shell()) ? -1 : msgrow_at(mx, my);
+            /* Clear the section/row hover only when the pointer has LEFT the
+             * sidebar — this reset used to run for every mx >= RAIL_W, which
+             * includes the sidebar itself, so the branch above set the hover and
+             * this one wiped it in the same message: the kebab could never
+             * appear and its click path was dead. */
+            if (!(transcript_shell() && (float)mx >= RAIL_W &&
+                  (float)mx < RAIL_W + SIDEBAR_W)) {
+                if (g_sb_hover_sec != -1) { g_sb_hover_sec = -1; InvalidateRect(hwnd, NULL, FALSE); }
+                if (g_sb_hover_cid)       { g_sb_hover_cid = 0;  InvalidateRect(hwnd, NULL, FALSE); }
+            }
+            int r = (any_overlay(model()) || pointer_blocked() || !transcript_shell())
+                        ? -1 : msgrow_at(mx, my);
             uint64_t h = r >= 0 ? g_msgrows[r].mid : 0;
             if (h != g_hover_mid) { g_hover_mid = h; InvalidateRect(hwnd, NULL, FALSE); }
             /* Activity / Later row hover. */
             uint64_t lh = 0;
-            for (int i = 0; i < g_n_listrows; i++)
-                if (in_rect(g_listrows[i].row, (float)mx, (float)my)) { lh = g_listrows[i].mid; break; }
+            if (!pointer_blocked())
+                for (int i = 0; i < g_n_listrows; i++)
+                    if (in_rect(g_listrows[i].row, (float)mx, (float)my)) { lh = g_listrows[i].mid; break; }
             if (lh != g_listrow_hover) { g_listrow_hover = lh; InvalidateRect(hwnd, NULL, FALSE); }
             /* DMs-index row hover. */
             uint64_t dh = 0;
-            for (int i = 0; i < g_n_dmrows; i++)
-                if (in_rect(g_dmrows[i].r, (float)mx, (float)my)) { dh = g_dmrows[i].cid; break; }
-            for (int i = 0; i < g_n_pickrows && !dh; i++)
-                if (in_rect(g_pickrows[i].r, (float)mx, (float)my)) { dh = g_pickrows[i].uid; break; }
+            if (!pointer_blocked()) {
+                for (int i = 0; i < g_n_dmrows; i++)
+                    if (in_rect(g_dmrows[i].r, (float)mx, (float)my)) { dh = g_dmrows[i].cid; break; }
+                for (int i = 0; i < g_n_pickrows && !dh; i++)
+                    if (in_rect(g_pickrows[i].r, (float)mx, (float)my)) { dh = g_pickrows[i].uid; break; }
+            }
             if (dh != g_dm_hover) { g_dm_hover = dh; InvalidateRect(hwnd, NULL, FALSE); }
             /* Tab strip hover. */
             int th2 = -1;
-            for (int i = 0; i < TAB_COUNT; i++)
-                if (in_rect(g_tab_r[i], (float)mx, (float)my)) { th2 = i; break; }
+            if (!pointer_blocked())
+                for (int i = 0; i < TAB_COUNT; i++)
+                    if (in_rect(g_tab_r[i], (float)mx, (float)my)) { th2 = i; break; }
             if (th2 != g_tab_hover) { g_tab_hover = th2; InvalidateRect(hwnd, NULL, FALSE); }
             /* Files-list row hover. */
             uint64_t fh = 0;
-            {
+            if (!pointer_blocked()) {
                 const oc_model *fm = model();
                 for (int i = 0; i < g_n_filerows && fm; i++)
                     if (in_rect(g_filerows[i].row, (float)mx, (float)my) &&
@@ -18109,8 +18295,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (fh != g_hover_filerow) { g_hover_filerow = fh; InvalidateRect(hwnd, NULL, FALSE); }
             /* Pins-overlay row hover, so a row reads as the clickable thing it is. */
             uint64_t ph = 0;
-            for (int i = 0; i < g_n_pinrows; i++)
-                if (in_rect(g_pinrows[i].row, (float)mx, (float)my)) { ph = g_pinrows[i].mid; break; }
+            if (!pointer_blocked())
+                for (int i = 0; i < g_n_pinrows; i++)
+                    if (in_rect(g_pinrows[i].row, (float)mx, (float)my)) { ph = g_pinrows[i].mid; break; }
             if (ph != g_hover_pinrow) { g_hover_pinrow = ph; InvalidateRect(hwnd, NULL, FALSE); }
         }
         return 0;

@@ -2267,7 +2267,7 @@ static void *net_thread(void *arg) {
              * UI adds its own affordance (the TUI a Ctrl+R hint, the GUI its
              * "Retry now" button). A TUI chord leaking into the GUI banner is
              * what this used to do. */
-            snprintf(msg, sizeof msg, "connection lost — reconnecting in %ds…",
+            snprintf(msg, sizeof msg, "Connection lost — reconnecting in %ds…",
                      (backoff_ms + 999) / 1000);
             push_err(n->to_ui, msg);
         }
