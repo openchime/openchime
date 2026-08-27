@@ -712,6 +712,31 @@ else
   "$DRIVE" key ctrl+0 >/dev/null 2>&1
 fi
 
+# The pinned text metrics (ARCH-108): the dump reports each token's live
+# line-box/baseline pair plus a rendered probe that both UI weights lay out to
+# the identical line box — the property that stops a bold swap moving a label.
+# Asserted at the smallest and largest text size, where the re-derived integers
+# differ most from the scale-1 pairs.
+checks=$((checks + 3))
+tm=$(snap | grep -oE 'textmetrics [^\n]*' | head -1)
+case "$tm" in
+  *"ui=22/16"*"ui_mh_eq=1"*) ok "pinned metrics at default size: ${tm#textmetrics }" ;;
+  *) fail "textmetrics wrong at default size: $tm" ;;
+esac
+"$DRIVE" textsize 0 >/dev/null 2>&1; settle textsize 0
+tm=$(snap | grep -oE 'textmetrics [^\n]*' | head -1)
+case "$tm" in
+  *"ui_mh_eq=1"*) ok "both UI weights share one line box at Small" ;;
+  *) fail "UI weights diverged at Small: $tm" ;;
+esac
+"$DRIVE" textsize 3 >/dev/null 2>&1; settle textsize 3
+tm=$(snap | grep -oE 'textmetrics [^\n]*' | head -1)
+case "$tm" in
+  *"ui_mh_eq=1"*) ok "both UI weights share one line box at Larger" ;;
+  *) fail "UI weights diverged at Larger: $tm" ;;
+esac
+"$DRIVE" textsize 1 >/dev/null 2>&1; settle textsize 1
+
 # Ctrl+, opens Preferences, and it opens on a category rather than a flat list.
 "$DRIVE" key ctrl+, >/dev/null 2>&1
 expect_eventually modal prefs "Ctrl+, opens Preferences"

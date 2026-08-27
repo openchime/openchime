@@ -78,7 +78,8 @@ typedef struct {
     int   para;       /* PARA_* — vertical placement inside the draw rect */
     int   wrap;
     float size;
-    float line_h;     /* uniform line height when set (g_body), else 0 */
+    float line_h;     /* pinned uniform line height; 0 = natural (decorations) */
+    float baseline;   /* pinned baseline within the line box; 0 = unpinned */
 } fmtw;
 
 /* Same story for the taskbar: CLSID_TaskbarList is in libuuid, its ITaskbarList3
@@ -295,6 +296,28 @@ enum { NAV_SWITCHER = -2, NAV_NEW = -3, NAV_PROFILE = -4, NAV_MORE = -5 };
 #define FONT_UI       14.0f       /* controls, list rows */
 #define FONT_META     12.5f       /* timestamps, sublabels, chips, counts */
 #define FONT_MICRO    10.0f       /* rail labels */
+
+/* Pinned vertical metrics per token (ARCH-108): the app owns the baseline.
+ * DirectWrite's natural metrics are per-font-file and fractional, so a label's
+ * seat depended on which weight drew it and which letters it contained. Every
+ * Segoe format is pinned instead: an integer baseline and line box derived
+ * from the token size, identical across weights and styles of that size.
+ *
+ * The derivation, not a table of constants, so it holds at every text scale:
+ *   baseline = ceil(ascent)          — the raster has no headroom above line 1,
+ *                                      so ink must not rise past the box top;
+ *   line_h   = round(2·bl − cap)     — puts the cap-ink centre on the line-box
+ *                                      centre, which is what makes a MID-seated
+ *                                      label agree with a geometrically centred
+ *                                      icon without per-site nudges.
+ * Ratios are Segoe UI's (unitsPerEm 2048: ascent 2210, cap 1434). At scale 1
+ * this yields display 26/19, title 23/17, ui 22/16, meta 19/14, micro 15/11. */
+#define SEGOE_ASC 1.0791f
+#define SEGOE_CAP 0.7002f
+static void pin_metrics(float size_scaled, float *lh, float *bl) {
+    *bl = ceilf(SEGOE_ASC * size_scaled - 0.02f);
+    *lh = roundf(2.0f * *bl - SEGOE_CAP * size_scaled);
+}
 
 /* Per-user avatar tints, shared by the transcript and the sidebar's DM rows so
  * one person is the same colour everywhere. */
@@ -1734,7 +1757,29 @@ static txt_ent *txt_get(const char *s, fmtw *fm, float w, uint32_t rgb) {
 /* Blit a cached raster into `r` honouring the wrapper's paragraph alignment.
  * The texture is drawn at its natural DIP size — never scaled — so glyphs stay
  * exactly as DirectWrite rasterized them. */
-static void txt_blit(gfx *rt, txt_ent *e, rectf r, int align, int para) {
+/* Where the LAYOUT BOX's top sits inside `r` for this format's para mode.
+ * Shared by the blit below and draw_text_hl, so highlight fills and glyphs
+ * cannot disagree about the origin again. */
+static float txt_seat_y(const fmtw *fm, float mh, rectf r) {
+    float rh = r.bottom - r.top;
+    return fm->para == PARA_MID ? r.top + (rh - mh) / 2.0f
+         : fm->para == PARA_BOT ? r.bottom - mh
+                                : r.top;
+}
+
+/* The rect in which `of` must be drawn (MID) so its pinned baseline lands on
+ * the baseline `af` gets when MID-seated in `anchor` — how a timestamp sits on
+ * its author's baseline, a chevron on the workspace name's, a status on the
+ * member's. Replaces the hand +1/+2 nudges that were right for one font
+ * version and wrong for the next. Both formats must be pinned. */
+static rectf baseline_align(rectf anchor, const fmtw *af, const fmtw *of,
+                            float l, float r) {
+    float dy = (af->baseline - of->baseline)
+             - (af->line_h - of->line_h) / 2.0f;
+    return rf(l, anchor.top + dy, r, anchor.bottom + dy);
+}
+
+static void txt_blit(gfx *rt, txt_ent *e, rectf r, const fmtw *fm) {
     if (!e) return;
     float scale = gfx_scale(rt);
     float dw = e->pw / scale, dh = e->ph / scale;
@@ -1742,23 +1787,30 @@ static void txt_blit(gfx *rt, txt_ent *e, rectf r, int align, int para) {
      * or a toolbar letter the line's side bearings read as an off-center
      * glyph, and horizontal optical centering is what a centered label wants.
      *
-     * VERTICALLY the rule is the opposite, and it used to be the same: MID/BOT
-     * centered each string's INK, so every string found its own baseline —
-     * "Threads" (cap-only ink) sat low, "People" (descender ink) rode high,
-     * and every label next to a geometrically-centered icon disagreed with its
-     * neighbours by a pixel or two. Endemic, because every row label goes
-     * through here. MID/BOT now place the LAYOUT box (e->mh) and let the ink
-     * fall at its own offset inside it (e->oy): one format, one baseline,
-     * whatever the letters are. */
-    float rw = r.right - r.left, rh = r.bottom - r.top;
+     * VERTICALLY the FORMAT owns everything (ARCH-108): the line box and the
+     * baseline are pinned per size token, so e->mh is string-independent and
+     * the seat below is a function of (rect, token) only. The string owns
+     * nothing — which is precisely what stops a bold swap or a descender
+     * moving a label. The baseline, not the ink top, is snapped to the device
+     * pixel grid: integer DIPs are not integer device pixels at 150% DPI, and
+     * rounding the top would let two weights of one size land a device row
+     * apart. Unpinned formats (emoji, Georgia decorations) keep the natural
+     * layout-box seat. */
+    float rw = r.right - r.left;
     /* The raster pads two DIPs below-right of the ink (see st_draw). */
     float iw = dw - 2.0f;
-    float x = align == ST_ALIGN_CENTER ? r.left + (rw - iw) / 2.0f
-            : align == ST_ALIGN_RIGHT  ? r.right - iw
-                                       : r.left + e->ox;
-    float y = para == PARA_MID ? r.top + (rh - e->mh) / 2.0f + e->oy
-            : para == PARA_BOT ? r.bottom - e->mh + e->oy
-                               : r.top + e->oy;
+    float x = fm->align == ST_ALIGN_CENTER ? r.left + (rw - iw) / 2.0f
+            : fm->align == ST_ALIGN_RIGHT  ? r.right - iw
+                                           : r.left + e->ox;
+    float y_layout = txt_seat_y(fm, e->mh, r);
+    float y;
+    if (fm->baseline > 0.0f) {
+        float top_dev = roundf((y_layout + fm->baseline) * scale)
+                      - roundf((fm->baseline - e->oy) * scale);
+        y = top_dev / scale;
+    } else {
+        y = y_layout + e->oy;
+    }
     gfx_rect dst = { x, y, dw, dh };
     gfx_clip_push(rt, gr(r));
     gfx_tex_draw(rt, e->tex, dst, 0.0f, 1.0f);
@@ -1808,7 +1860,7 @@ static void draw_emoji_fmt(gfx *rt, const char *s, rectf r, fmtw *fmt) {
      * row goes through here, so one test covers all of them. */
     if (s && s[0] == ':' && draw_custom_emoji(rt, s, r)) return;
     if (!fmt) return;
-    txt_blit(rt, txt_get(s, fmt, r.right - r.left, OC_COL_TEXT), r, fmt->align, fmt->para);
+    txt_blit(rt, txt_get(s, fmt, r.right - r.left, OC_COL_TEXT), r, fmt);
 }
 static void draw_emoji_glyph(gfx *rt, const char *s, rectf r) {
     draw_emoji_fmt(rt, s, r, g_emoji);
@@ -1817,7 +1869,7 @@ static void draw_emoji_glyph(gfx *rt, const char *s, rectf r) {
 static void draw_text(gfx *rt, const char *s, fmtw *fmt,
                       rectf r, uint32_t rgb) {
     if (!fmt) return;
-    txt_blit(rt, txt_get(s, fmt, r.right - r.left, rgb), r, fmt->align, fmt->para);
+    txt_blit(rt, txt_get(s, fmt, r.right - r.left, rgb), r, fmt);
 }
 
 /* Like draw_text, but tints every occurrence of a whitespace-separated term from
@@ -1833,6 +1885,10 @@ static void draw_text_hl(gfx *rt, const char *s, fmtw *fmt,
                                      r.right - r.left, r.bottom - r.top,
                                      fmt->align);
     if (tl) {
+        /* Highlight fills and glyphs must share one origin: the seat the blit
+         * will use, not the rect top — for MID formats those differ. */
+        st_metrics hm; st_layout_metrics(tl, &hm);
+        float hy0 = txt_seat_y(fmt, hm.h, r);
         /* Case-fold both sides byte-wise (ASCII); the daemon's LIKE fold is the
          * same, so highlight and hit agree. */
         size_t n = strlen(s);
@@ -1856,9 +1912,9 @@ static void draw_text_hl(gfx *rt, const char *s, fmtw *fmt,
                 int nr = st_hit_range(tl, (size_t)(at - low), tn, hr, 8);
                 if (nr > 8) nr = 8;
                 for (int k = 0; k < nr; k++)
-                    fill_round_a(rt, rf(r.left + hr[k].x - 1, r.top + hr[k].y,
+                    fill_round_a(rt, rf(r.left + hr[k].x - 1, hy0 + hr[k].y,
                                         r.left + hr[k].x + hr[k].w + 1,
-                                        r.top + hr[k].y + hr[k].h),
+                                        hy0 + hr[k].y + hr[k].h),
                                  2.0f, OC_COL_NOTICE, 0.34f);
             }
         }
@@ -1875,7 +1931,8 @@ static void draw_lucide(gfx *rt, int id, rectf box, uint32_t rgb) {
 /* ---- Direct2D / DirectWrite setup ---------------------------------------- */
 
 static fmtw *mk_fmt_s(const char *family, float size, int wt,
-                      int ta, int pa, int wrap, int italic, float line_h) {
+                      int ta, int pa, int wrap, int italic,
+                      float line_h, float baseline) {
     fmtw *fm = calloc(1, sizeof *fm);
     if (!fm) return NULL;
     st_format_desc d;
@@ -1889,21 +1946,29 @@ static fmtw *mk_fmt_s(const char *family, float size, int wt,
      * otherwise; ellipsis here, once, rather than at fifty call sites.
      * Wrapping formats wrap by design and get none. */
     d.trimming = wrap ? ST_TRIM_NONE : ST_TRIM_ELLIPSIS;
+    /* The pin (ARCH-108): with both set, DirectWrite's uniform spacing makes
+     * every line exactly line_h tall with the baseline exactly here — the same
+     * numbers for every weight and style of the size, which is what stops a
+     * bold swap or a descender moving a label. 0/0 = natural metrics, kept
+     * only for decorations that sit on no shared baseline (emoji, Georgia). */
     d.line_height = line_h;
-    d.baseline = line_h * 0.75f;
+    d.baseline = baseline;
     fm->f = st_format_create(g_st, &d);
     fm->align = ta;
     fm->para = pa;
     fm->wrap = wrap;
     fm->size = size;
     fm->line_h = line_h;
+    fm->baseline = baseline;
     if (!fm->f) { free(fm); return NULL; }
     return fm;
 }
 
 static fmtw *mk_fmt(const char *family, float size, int wt,
                     int ta, int pa, int wrap) {
-    return mk_fmt_s(family, size, wt, ta, pa, wrap, 0, 0.0f);
+    float lh, bl;
+    pin_metrics(size, &lh, &bl);
+    return mk_fmt_s(family, size, wt, ta, pa, wrap, 0, lh, bl);
 }
 
 /* Modal content inset. One number, so no two modals disagree about their gutter.
@@ -1971,8 +2036,14 @@ static void fonts_build(void) {
 
     g_display = mk_fmt(UI, FONT_DISPLAY * k, SEM, L, MID, 0);
     g_title   = mk_fmt(UI, FONT_TITLE   * k, SEM, L, MID, 0);
-    /* Roomier line height on message bodies for readability (Slack-like). */
-    g_body    = mk_fmt_s(UI, FONT_BODY  * k, REG, L, TOP, 1, 0, 22.0f * k);
+    /* Roomier line height on message bodies for readability (Slack-like); the
+     * baseline is still the pinned one for its size, so body text and the
+     * composer agree with everything else about where 15px text sits. */
+    {
+        float blh, bbl;
+        pin_metrics(FONT_BODY * k, &blh, &bbl);
+        g_body = mk_fmt_s(UI, FONT_BODY * k, REG, L, TOP, 1, 0, 22.0f * k, bbl);
+    }
     g_ui      = mk_fmt(UI, FONT_UI      * k, REG, L, MID, 0);
     g_ui_b    = mk_fmt(UI, FONT_UI      * k, SEM, L, MID, 0);
     g_meta    = mk_fmt(UI, FONT_META    * k, REG, L, MID, 0);
@@ -1984,14 +2055,19 @@ static void fonts_build(void) {
     /* The ONE italic in the app (ARCH-97 names weights, not styles). It marks text
      * that is not content — an empty section's "Empty" — so it cannot be mistaken for
      * a conversation called Empty. A style, not a seventh size token. */
-    g_meta_i  = mk_fmt_s(UI, FONT_META  * k, REG, L, MID, 0, 1, 0.0f);
+    {
+        float ilh, ibl;
+        pin_metrics(FONT_META * k, &ilh, &ibl);
+        g_meta_i = mk_fmt_s(UI, FONT_META * k, REG, L, MID, 0, 1, ilh, ibl);
+    }
     /* The toolbar's B and I; see the format table's history for why the italic
      * is serif (a sans italic capital I reads as a slash, not a letter). */
     g_fmt_bold = mk_fmt(UI, FONT_UI * k, 700, C, MID, 0);
-    g_fmt_ital = mk_fmt_s("Georgia", (FONT_UI + 1.0f) * k, REG, C, MID, 0, 1, 0.0f);
+    /* Georgia is a decoration here, on nobody's baseline — unpinned. */
+    g_fmt_ital = mk_fmt_s("Georgia", (FONT_UI + 1.0f) * k, REG, C, MID, 0, 1, 0.0f, 0.0f);
     /* Oversized on purpose: a quotation mark occupies the top third of its em
      * box, so at text size it is a speck in the middle of a 24 px button. */
-    g_fmt_quote = mk_fmt("Georgia", (FONT_UI + 9.0f) * k, 700, C, MID, 0);
+    g_fmt_quote = mk_fmt_s("Georgia", (FONT_UI + 9.0f) * k, 700, C, MID, 0, 0, 0.0f, 0.0f);
 }
 
 /* The emoji formats, rebuilt on every scale change like the rest.
@@ -2001,8 +2077,10 @@ static void emoji_fonts_build(void) {
     const float k = g_text_scale;
     fmt_release(&g_emoji);
     fmt_release(&g_emoji_s);
-    g_emoji = mk_fmt("Segoe UI Emoji", 22.0f * k, 400, ST_ALIGN_CENTER, PARA_MID, 0);
-    g_emoji_s = mk_fmt("Segoe UI Emoji", 13.0f * k, 400, ST_ALIGN_CENTER, PARA_MID, 0);
+    /* Emoji are colour squares, not glyphs on a text baseline: they centre by
+     * their own ink and never sit beside pinned text on one line — unpinned. */
+    g_emoji = mk_fmt_s("Segoe UI Emoji", 22.0f * k, 400, ST_ALIGN_CENTER, PARA_MID, 0, 0, 0.0f, 0.0f);
+    g_emoji_s = mk_fmt_s("Segoe UI Emoji", 13.0f * k, 400, ST_ALIGN_CENTER, PARA_MID, 0, 0, 0.0f, 0.0f);
 }
 
 /* Bring up the rendering stack against the SDL window: renderer, gfx, the
@@ -2678,7 +2756,10 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
         float nx  = RAIL_W + 16 + text_width(wsname, g_display);
         float lim = g_hdr_gear.left - 30;              /* never crowd the gear */
         if (nx > lim) nx = lim;
-        draw_text(rt, "\xE2\x96\xBE", g_meta, rf(nx + 6, 2, nx + 22, HEADER_H), OC_COL_MUTED);
+        draw_text(rt, "\xE2\x96\xBE", g_meta,
+                  baseline_align(rf(RAIL_W + 16, 0, g_hdr_gear.left - 22, HEADER_H),
+                                 g_display, g_meta, nx + 6, nx + 22),
+                  OC_COL_MUTED);
 
         float dx = nx + 22;
         if (dx > g_hdr_gear.left - 20) dx = g_hdr_gear.left - 20;
@@ -2799,9 +2880,10 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                 float ph = UIS(18.0f), py = sy + (ROW_H - ph) / 2;
                 rectf pill = rf(sx1 - UIS(12) - badge_w, py, sx1 - UIS(12), py + ph);
                 fill_round(rt, pill, ph / 2, OC_COL_ACCENT);
-                g_micro->align = ST_ALIGN_CENTER;
-                draw_text(rt, badge, g_micro, pill, 0xFFFFFF);
-                g_micro->align = ST_ALIGN_LEFT;
+                { int oa = g_micro->align;
+                  g_micro->align = ST_ALIGN_CENTER;
+                  draw_text(rt, badge, g_micro, pill, 0xFFFFFF);
+                  g_micro->align = oa; }
             } else if (badge[0]) {
                 /* Drafts waiting + anything that FAILED to send — drawn in
                  * the exact window the label reserved. */
@@ -2891,13 +2973,13 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                     stroke_round(rt, av, 5.0f, OC_COL_BORDER, 1.0f);
                     char cnt[8];
                     snprintf(cnt, sizeof cnt, "%u", (unsigned)rc->n_peers);
-                    g_micro->align = ST_ALIGN_CENTER;
-                    draw_text(rt, cnt, g_micro, av, selected ? OC_COL_TEXT : OC_COL_MUTED);
-                    /* LEADING — the format's resting state. This restored
-                     * CENTER (a copy of the set above), so every later g_micro
-                     * draw — the rail labels among them — inherited
-                     * centred alignment whenever a group DM painted first. */
-                    g_micro->align = ST_ALIGN_LEFT;
+                    /* Save/restore, never a literal (ARCH-108 hygiene):
+                     * g_micro is BUILT centred, and a hard-coded restore is a
+                     * standing bet about state someone else owns. */
+                    { int oa = g_micro->align;
+                      g_micro->align = ST_ALIGN_CENTER;
+                      draw_text(rt, cnt, g_micro, av, selected ? OC_COL_TEXT : OC_COL_MUTED);
+                      g_micro->align = oa; }
                 } else {
                 draw_user_avatar(rt, m, r->peer_id, r->label, av, g_meta, 1, 5.0f);
                 /* INSET into the avatar, not hung off its corner: at
@@ -2923,7 +3005,9 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                  * still addressed by account name (Slack's treatment). */
                 float w = text_width(r->label, unread ? g_ui_b : g_ui);
                 draw_text(rt, "you", g_meta,
-                          rf(sx0 + 34 + w + 8, ry, sx1 - UIS(44), ry + ROW_H), OC_COL_FAINT);
+                          baseline_align(rf(sx0 + 34, ry, sx1 - UIS(44), ry + ROW_H),
+                                         g_ui, g_meta, sx0 + 34 + w + 8, sx1 - UIS(44)),
+                          OC_COL_FAINT);
             }
             if (unread) {
                 char badge[16]; snprintf(badge, sizeof badge, "%d", r->unread);
@@ -3373,7 +3457,9 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
                 strftime(when, sizeof when, g_pref_time24 ? "%H:%M" : "%I:%M %p", &tv);
             float wx = tx + text_width(nm, g_title) + 8;
             if (wx < hl.right - 60)
-                draw_text(rt, when, g_meta, rf(wx, ty + 2, hl.right, ty + 20), OC_COL_FAINT);
+                draw_text(rt, when, g_meta,
+                          baseline_align(hl, g_title, g_meta, wx, hl.right),
+                          OC_COL_FAINT);
         }
     }
 
@@ -5181,7 +5267,10 @@ static void draw_pinlist(gfx *rt, const oc_model *m, rectf reg) {
             char lbl[96];
             snprintf(lbl, sizeof lbl, "pinned by %s", pby);
             g_meta->align = ST_ALIGN_RIGHT;
-            draw_text(rt, lbl, g_meta, rf(row.left, y + 4, row.right - 12, y + 22), OC_COL_FAINT);
+            draw_text(rt, lbl, g_meta,
+                      baseline_align(rf(row.left + 10, y + 4, row.right - 90, y + 24),
+                                     g_title, g_meta, row.left, row.right - 12),
+                      OC_COL_FAINT);
             g_meta->align = ST_ALIGN_LEFT;
         }
         rectf un = rf(row.right - 74, y + 24, row.right - 12, y + 46);
@@ -6027,8 +6116,11 @@ static void draw_wsmgr(gfx *rt, rectf reg) {
          * collided with the buttons whenever the pane was narrow. */
         const char *state = g_sw[i].current ? "current" : live ? "connected" : "signed out";
         uint32_t sc = g_sw[i].current ? OC_COL_ACCENT : live ? OC_COL_ONLINE : OC_COL_FAINT;
-        draw_text(rt, state, g_meta, rf(body.left + 24 + text_width(g_sw[i].label, g_ui_b) + 12,
-                                         y, body.left + 340, y + 22), sc);
+        draw_text(rt, state, g_meta,
+                  baseline_align(rf(body.left + 24, y, body.left + 300, y + 22),
+                                 g_ui_b, g_meta,
+                                 body.left + 24 + text_width(g_sw[i].label, g_ui_b) + 12,
+                                 body.left + 340), sc);
         char sub[320];
         snprintf(sub, sizeof sub, "%s%s%s", g_sw[i].ws,
                  g_sw[i].user[0] ? "  \u00b7  " : "", g_sw[i].user);
@@ -6448,7 +6540,9 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
         draw_text(rt, hit[i].label, g_ui, rf(px + 18, y, px + pw - 90, y + rowh),
                   i == g_pal_sel ? 0xFFFFFF : OC_COL_TEXT);
         g_meta->align = ST_ALIGN_RIGHT;
-        draw_text(rt, hit[i].kind, g_meta, rf(px + 18, y, px + pw - 18, y + rowh),
+        draw_text(rt, hit[i].kind, g_meta,
+                  baseline_align(rf(px + 18, y, px + pw - 90, y + rowh),
+                                 g_ui, g_meta, px + 18, px + pw - 18),
                   i == g_pal_sel ? 0xFFFFFF : OC_COL_FAINT);
         g_meta->align = ST_ALIGN_LEFT;
         g_pal_rows[g_n_pal_rows].r = r;
@@ -6602,7 +6696,10 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
                          mu->status_emoji[0] && mu->status_text[0] ? " " : "",
                          mu->status_text);
                 if (sx + 20 < W - 14)
-                    draw_text(rt, st, g_meta, rf(sx, y, W - 14, y + ROW_H), OC_COL_FAINT);
+                    draw_text(rt, st, g_meta,
+                              baseline_align(rf(x0 + 34, y, W - 14, y + ROW_H),
+                                             g_ui, g_meta, sx, W - 14),
+                              OC_COL_FAINT);
             }
         }
         if (g_n_memrows < (int)(sizeof g_memrows / sizeof g_memrows[0])) {
@@ -7047,16 +7144,16 @@ static void draw_fmt_icon(gfx *rt, int which, rectf b, uint32_t c) {
     float cx = (b.left + b.right) / 2, cy = (b.top + b.bottom) / 2;
     switch (which) {
     case FMT_BOLD:
-        /* Ink-measured nudges (96 DPI sweep): the cached raster's pad estimate
-         * biases these single letters ~1px down-right of optical centre under
-         * either seating rule; measured B pads L9 R7 T8 B6 -> shift up-left 1. */
-        draw_text(rt, "B", g_fmt_bold, rf(b.left - 1, b.top - 1, b.right - 1, b.bottom - 1), c);
+        /* One measured horizontal nudge: the raster's fixed 2-DIP pad estimate
+         * biases this lone letter a pixel right (ink pads L9 R7 at 96 DPI).
+         * Vertical needs nothing — the pinned metrics seat it (ARCH-108). */
+        draw_text(rt, "B", g_fmt_bold, rf(b.left - 1, b.top, b.right - 1, b.bottom), c);
         break;
     case FMT_ITALIC:
         draw_text(rt, "I", g_fmt_ital, b, c);
         break;
     case FMT_STRIKE:
-        draw_text(rt, "S", g_fmt_bold, rf(b.left, b.top - 1, b.right, b.bottom - 1), c);
+        draw_text(rt, "S", g_fmt_bold, b, c);
         fmt_bar(rt, cx - 6, cy - 0.5f, 12, 1.4f, c);      /* the line is the point */
         break;
     case FMT_CODE: {
@@ -8461,7 +8558,9 @@ static void draw_dm_list(gfx *rt, const oc_model *m, float h) {
         char when[24];
         rel_time(best->last_message_at, when, sizeof when);
         g_meta->align = ST_ALIGN_RIGHT;
-        draw_text(rt, when, g_meta, rf(row.left + 48, y + 6, row.right - 10, y + 24),
+        draw_text(rt, when, g_meta,
+                  baseline_align(rf(row.left + 48, y + 5, row.right - 60, y + 25),
+                                 g_ui, g_meta, row.left + 48, row.right - 10),
                   unread ? OC_COL_ACCENT : OC_COL_FAINT);
         g_meta->align = ST_ALIGN_LEFT;
 
@@ -8707,7 +8806,10 @@ static void draw_activity_list(gfx *rt, const oc_model *m, float h) {
         draw_text(rt, (who && who[0]) ? who : "someone", g_ui_b,
                   rf(row.left + 46, y + 4, row.right - 56, y + 24), OC_COL_TEXT);
         g_meta->align = ST_ALIGN_RIGHT;
-        draw_text(rt, when, g_meta, rf(row.left + 46, y + 5, row.right - 8, y + 23), OC_COL_FAINT);
+        draw_text(rt, when, g_meta,
+                  baseline_align(rf(row.left + 46, y + 4, row.right - 56, y + 24),
+                                 g_ui_b, g_meta, row.left + 46, row.right - 8),
+                  OC_COL_FAINT);
         g_meta->align = ST_ALIGN_LEFT;
 
         /* What kind, and where — the line Slack puts under the name. */
@@ -9227,9 +9329,13 @@ static void draw_empty_state(gfx *rt, rectf body, int icon,
         /* Centred by DirectWrite in BOTH axes rather than by a hand-picked top
          * inset: the inset was right for one text size and dropped the label
          * onto the button's bottom edge at every other. */
+        /* Save/restore, never a literal: g_ui is BUILT PARA_MID, and the old
+         * restore-to-TOP left every later g_ui draw mis-seated until the next
+         * fonts_build — a whole-app alignment bug from one button. */
+        int opara = g_ui->para;
         g_ui->para = PARA_MID;
         draw_text(rt, cta, g_ui, b, 0xFFFFFF);
-        g_ui->para = PARA_TOP;
+        g_ui->para = opara;
         *out_btn = b;
     }
     g_ui->align = ST_ALIGN_LEFT;
@@ -9254,7 +9360,9 @@ static void draw_msgish_row(gfx *rt, const oc_model *m, rectf row,
               OC_COL_TEXT);
     if (when && when[0]) {
         g_meta->align = ST_ALIGN_RIGHT;
-        draw_text(rt, when, g_meta, rf(row.right - 86, row.top + 6, row.right - 10, row.top + 26),
+        draw_text(rt, when, g_meta,
+                  baseline_align(rf(row.left + 42, row.top + 6, row.right - 90, row.top + 26),
+                                 g_ui_b, g_meta, row.right - 86, row.right - 10),
                   OC_COL_FAINT);
         g_meta->align = ST_ALIGN_LEFT;
     }
@@ -9497,9 +9605,10 @@ static void draw_threads(gfx *rt, const oc_model *m, rectf reg) {
                 float px2 = card.left + 56 + text_width(rc, g_meta) + 10;
                 rectf pill = rf(px2, fy, px2 + pw, fy + 19);
                 fill_round(rt, pill, 9.0f, OC_COL_ACCENT);
-                g_micro->align = ST_ALIGN_CENTER;
-                draw_text(rt, up, g_micro, pill, 0xFFFFFF);
-                g_micro->align = ST_ALIGN_LEFT;
+                { int oa = g_micro->align;
+                  g_micro->align = ST_ALIGN_CENTER;
+                  draw_text(rt, up, g_micro, pill, 0xFFFFFF);
+                  g_micro->align = oa; }
             }
         }
 
@@ -16491,6 +16600,24 @@ static void test_dump(const char *path) {
         #undef contains
         fprintf(f, "chromefit overlaps=%d outside=%d n=%d ov=\"%s\" out=\"%s\"\n",
                 overlaps, outside, g_a11y_n, first_ov, first_out);
+    }
+    /* ARCH-108: the pinned metrics, checked, not remembered — the live
+     * line_h/baseline pairs per token, plus a real render probe that the two
+     * UI weights lay out to the identical line box (the property that stops a
+     * bold swap moving a label). Uses the text cache; costs two lookups. */
+    {
+        txt_ent *ra = txt_get("Threads", g_ui,   400.0f, OC_COL_TEXT);
+        txt_ent *rb = txt_get("Threads", g_ui_b, 400.0f, OC_COL_TEXT);
+        fprintf(f, "textmetrics scale=%.2f display=%g/%g title=%g/%g body=%g/%g "
+                   "ui=%g/%g meta=%g/%g micro=%g/%g ui_mh_eq=%d\n",
+                (double)g_text_scale,
+                (double)g_display->line_h, (double)g_display->baseline,
+                (double)g_title->line_h,   (double)g_title->baseline,
+                (double)g_body->line_h,    (double)g_body->baseline,
+                (double)g_ui->line_h,      (double)g_ui->baseline,
+                (double)g_meta->line_h,    (double)g_meta->baseline,
+                (double)g_micro->line_h,   (double)g_micro->baseline,
+                (ra && rb && ra->mh == rb->mh) ? 1 : 0);
     }
     /* Whether this window actually HAS the keyboard, which is the condition the
      * composer's auto-focus turns on — "focus=0" alone cannot tell you whether
