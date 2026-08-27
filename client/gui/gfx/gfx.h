@@ -65,6 +65,12 @@ void     gfx_tex_destroy(gfx_tex *);
  * rounded polygon by UV, not clipped, so edges stay antialias-free but
  * geometry-exact at any scale. `a` multiplies the texture's own alpha. */
 void     gfx_tex_draw(gfx *, gfx_tex *, gfx_rect dst, float radius, float a);
+/* Cover-fit: draw the rounded `shape` (a circle when radius reaches half its
+ * side) sampling the texture as if it filled `map` — the enlarged, centered
+ * rect a crop computes. The shape's geometry is exact; the overflow is what
+ * gets cropped, which is what an avatar disc is. */
+void     gfx_tex_draw_shaped(gfx *, gfx_tex *, gfx_rect shape, float radius,
+                             gfx_rect map, float a);
 void     gfx_tex_size(const gfx_tex *, int *w, int *h);
 
 /* A Lucide icon (client/shared/icons.h), stroke-tessellated: beziers

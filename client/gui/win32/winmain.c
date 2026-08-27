@@ -1018,14 +1018,14 @@ static int draw_avatar_image(gfx *rt, uint64_t aid, rectf box,
     gfx_tex *bmp = aid ? thumb_get(rt, aid, &iw, &ih) : NULL;
     if (!bmp || !iw || !ih) return 0;
     float bw = box.right - box.left, bh = box.bottom - box.top;
-    /* Cover-fit: scale so the image fills the box, center the overflow, and let
-     * the rounded draw cut the shape (a circle is radius = half the side). */
+    /* Cover-fit: the SHAPE is the box (a disc, or a rounded square) drawn
+     * exactly; the image is sampled as if it filled the enlarged, centered
+     * rect, so a non-square photo is cropped rather than squashed — the same
+     * geometry the old bitmap-brush transform produced. */
     float scale = (iw * bh > ih * bw) ? (bh / (float)ih) : (bw / (float)iw);
     float dw = iw * scale, dh = ih * scale;
-    gfx_rect dst = { box.left + (bw - dw) / 2, box.top + (bh - dh) / 2, dw, dh };
-    gfx_clip_push(rt, gr(box));
-    gfx_tex_draw(rt, bmp, dst, square ? radius : bw / 2.0f, 1.0f);
-    gfx_clip_pop(rt);
+    gfx_rect map = { box.left + (bw - dw) / 2, box.top + (bh - dh) / 2, dw, dh };
+    gfx_tex_draw_shaped(rt, bmp, gr(box), square ? radius : bw / 2.0f, map, 1.0f);
     return 1;
 }
 
@@ -1730,17 +1730,27 @@ static txt_ent *txt_get(const char *s, fmtw *fm, float w, uint32_t rgb) {
 /* Blit a cached raster into `r` honouring the wrapper's paragraph alignment.
  * The texture is drawn at its natural DIP size — never scaled — so glyphs stay
  * exactly as DirectWrite rasterized them. */
-static void txt_blit(gfx *rt, txt_ent *e, rectf r, int para) {
+static void txt_blit(gfx *rt, txt_ent *e, rectf r, int align, int para) {
     if (!e) return;
     float scale = gfx_scale(rt);
     float dw = e->pw / scale, dh = e->ph / scale;
-    float y = r.top + e->oy;
-    float free_h = (r.bottom - r.top) - e->mh;
-    if (free_h > 0) {
-        if (para == PARA_MID) y += free_h / 2.0f;
-        else if (para == PARA_BOT) y += free_h;
-    }
-    gfx_rect dst = { r.left + e->ox, y, dw, dh };
+    /* CENTER/RIGHT and MID/BOT place the INK box, not the layout box: for a
+     * lone avatar initial or a toolbar letter the line's ascender gap reads
+     * as a 1-2px up-left bias, which at 18px is plainly visible. LEFT/TOP
+     * keep the layout's own offsets so runs of text align by baseline. */
+    float rw = r.right - r.left, rh = r.bottom - r.top;
+    /* The raster pads two DIPs below-right of the ink (see st_draw); center
+     * the INK, not the padded box, or every centered glyph sits a pixel
+     * up-left — plainly visible on an 18px avatar initial. */
+    float iw = dw - 2.0f, ih = dh - 2.0f;
+    float x = align == ST_ALIGN_CENTER ? r.left + (rw - iw) / 2.0f
+            : align == ST_ALIGN_RIGHT  ? r.right - iw
+                                       : r.left + e->ox;
+    float y = para == PARA_MID && rh > ih ? r.top + (rh - ih) / 2.0f
+            : para == PARA_BOT && rh > ih ? r.bottom - ih
+                                          : r.top + e->oy;
+    if (para == PARA_MID && rh <= ih) y = r.top + e->oy;
+    gfx_rect dst = { x, y, dw, dh };
     gfx_clip_push(rt, gr(r));
     gfx_tex_draw(rt, e->tex, dst, 0.0f, 1.0f);
     gfx_clip_pop(rt);
@@ -1789,7 +1799,7 @@ static void draw_emoji_fmt(gfx *rt, const char *s, rectf r, fmtw *fmt) {
      * row goes through here, so one test covers all of them. */
     if (s && s[0] == ':' && draw_custom_emoji(rt, s, r)) return;
     if (!fmt) return;
-    txt_blit(rt, txt_get(s, fmt, r.right - r.left, OC_COL_TEXT), r, fmt->para);
+    txt_blit(rt, txt_get(s, fmt, r.right - r.left, OC_COL_TEXT), r, fmt->align, fmt->para);
 }
 static void draw_emoji_glyph(gfx *rt, const char *s, rectf r) {
     draw_emoji_fmt(rt, s, r, g_emoji);
@@ -1798,7 +1808,7 @@ static void draw_emoji_glyph(gfx *rt, const char *s, rectf r) {
 static void draw_text(gfx *rt, const char *s, fmtw *fmt,
                       rectf r, uint32_t rgb) {
     if (!fmt) return;
-    txt_blit(rt, txt_get(s, fmt, r.right - r.left, rgb), r, fmt->para);
+    txt_blit(rt, txt_get(s, fmt, r.right - r.left, rgb), r, fmt->align, fmt->para);
 }
 
 /* Like draw_text, but tints every occurrence of a whitespace-separated term from
@@ -5023,21 +5033,29 @@ static void draw_about(gfx *rt, const oc_model *m, rectf reg) {
          * is where they belong — they were reachable only from a right-click
          * menu, which is not somewhere anyone looks for configuration. */
         g_about_hooks = rf(x + 480, y, x + 600, y + 28);
+        if (in_rect(g_about_hooks, g_mouse_x, g_mouse_y))
+            fill_round(rt, g_about_hooks, 6.0f, OC_COL_HOVER);
         stroke_round(rt, g_about_hooks, 6.0f, OC_COL_BORDER, 1.0f);
         g_meta->align = ST_ALIGN_CENTER;
         draw_text(rt, "Webhooks", g_meta, g_about_hooks, OC_COL_MUTED);
         g_meta->align = ST_ALIGN_LEFT;
 
         g_about_rename = rf(x, y, x + 150, y + 28);
+        if (in_rect(g_about_rename, g_mouse_x, g_mouse_y))
+            fill_round(rt, g_about_rename, 6.0f, OC_COL_HOVER);
         stroke_round(rt, g_about_rename, 6.0f, OC_COL_BORDER, 1.0f);
         g_meta->align = ST_ALIGN_CENTER;
         draw_text(rt, "Rename channel", g_meta, g_about_rename, OC_COL_MUTED);
         /* Visibility (REQ-031), beside the other two channel-shape actions. */
         g_about_visibility = rf(x + 160, y, x + 310, y + 28);
+        if (in_rect(g_about_visibility, g_mouse_x, g_mouse_y))
+            fill_round(rt, g_about_visibility, 6.0f, OC_COL_HOVER);
         stroke_round(rt, g_about_visibility, 6.0f, OC_COL_BORDER, 1.0f);
         draw_text(rt, c->is_public ? "Make private" : "Make public", g_meta,
                   g_about_visibility, OC_COL_MUTED);
         g_about_archive = rf(x + 320, y, x + 470, y + 28);
+        if (in_rect(g_about_archive, g_mouse_x, g_mouse_y))
+            fill_round(rt, g_about_archive, 6.0f, OC_COL_HOVER);
         stroke_round(rt, g_about_archive, 6.0f, OC_COL_BORDER, 1.0f);
         draw_text(rt, c->archived ? "Unarchive" : "Archive channel", g_meta,
                   g_about_archive, c->archived ? OC_COL_NOTICE : OC_COL_DANGER);
@@ -17156,6 +17174,26 @@ static void test_poll(HWND hwnd) {
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
+/* The pointer, spoken through SDL (its subclass owns WM_SETCURSOR for the
+ * client area): 0 arrow, 1 I-beam, 2 hand. Cursors are created once and set
+ * only on change — SDL_SetCursor per mouse move would be free anyway, but the
+ * intent reads better as an edge. */
+static void cursor_want(int kind) {
+    static SDL_Cursor *cur[3];
+    static int have, current = -1;
+    if (!have) {
+        cur[0] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_DEFAULT);
+        cur[1] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_TEXT);
+        cur[2] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
+        have = 1;
+    }
+    if (kind < 0 || kind > 2 || kind == current)
+        return;
+    if (cur[kind])
+        SDL_SetCursor(cur[kind]);
+    current = kind;
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     /* Explorer restarted: its new taskbar has no overlay and the old COM proxy
      * points at the dead shell. Drop both; the next tick re-applies the badge. */
@@ -17929,6 +17967,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_MOUSEMOVE: {
         int mx = (int)DIPF(GET_X_LPARAM(lp)), my = (int)DIPF(GET_Y_LPARAM(lp));
+        cursor_want(g_link_hover[0] ? 2 : 0);   /* the hand is the affordance */
         /* Recorded before anything consumes the message, so shared chrome can ask
          * where the pointer is without every widget tracking its own hover. */
         if (mx != g_mouse_x || g_mouse_y != my) {
@@ -18098,16 +18137,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_link_down[0] = 0;
         return 0;
     }
-    case WM_SETCURSOR:
-        /* The hand is the affordance; the accent and underline only say a run is
-         * special. Driven off the hover state WM_MOUSEMOVE already computes
-         * rather than re-deriving it here, because this arrives for every move
-         * and re-laying out a message body per message is not free. */
-        if (LOWORD(lp) == HTCLIENT && g_link_hover[0]) {
-            SetCursor(LoadCursorW(NULL, IDC_HAND));
-            return TRUE;
-        }
-        break;
+    /* No WM_SETCURSOR arm: SDL's window proc answers it for the client area
+     * with the SDL cursor (and does not chain), so the app's cursor choice is
+     * pushed through SDL_SetCursor from the hover machine instead —
+     * cursor_apply(), called from WM_MOUSEMOVE. */
     case WM_KEYDOWN:
         /* Ctrl+C copies the TRANSCRIPT selection — but only when there is one,
          * and only unshifted. It used to claim the key outright, which meant
