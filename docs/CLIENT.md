@@ -4,13 +4,17 @@ The client's architecture and how it's built. Cross-referenced from
 ARCHITECTURE.md (ARCH-11, **ARCH-74**) and
 PROTOCOL.md (the wire flow the core drives).
 
-**Direction (ARCH-74).** The client is **one shared C app-core with a native UI
-per platform** — the *tdlib* model — chosen for real native feel over a
-custom-rendered single UI. There is no shared rendering layer, because each
-platform's OS shapes its own text and provides its own widgets.
+**Direction (ARCH-74, ARCH-80).** The client is **one shared C app-core** —
+the *tdlib* model's core-and-view split — under **one portable, self-rendered
+desktop GUI** (SDL3 + the portable text layer, per-platform text backends and
+native shims) plus the TUI. Text shaping and the accessibility anchor stay
+native per platform; everything else in the view is written once. The Win32
+client is the reference implementation; it still presents through Direct2D
+today, and its migration onto the portable layer is in flight in the issue
+tracker.
 
 **Status.** The app-core, the **TUI** and the **Win32 GUI** (the reference
-client) are built. Further native GUIs (GTK, AppKit, Android, a web DOM UI)
+client) are built. Further platforms (the portable GUI on Linux/macOS, Android, a web DOM UI)
 and mobile follow, in the fixed frontend order of §8.
 
 ---
@@ -25,7 +29,8 @@ client/core/   the app-core — frontend-agnostic, headless-testable C:
 client/tui/    terminal frontend over the core                (first frontend)
 client/gui/win32/  the native Win32 GUI over the same core    (reference client)
 client/shared/ assets shared by graphical frontends (baked Lucide icon paths)
-[client/gui/gtk, client/gui/mac, ...]  further native GUIs    (later)
+[further desktops]  the same portable GUI layer + a per-platform
+                    text backend and native shim               (later)
 ```
 
 The **app-core is the one shared asset.** It holds *all* logic and state; a
@@ -309,12 +314,14 @@ model; translate input to intents }, stop.
   REQ-289 and REQ-261. Per-feature status is the marker on each
   requirement in [REQUIREMENTS.md](./REQUIREMENTS.md); open work is in the
   [issue tracker](https://github.com/openchime/openchime/issues).
-- **Linux GUI (later):** **GTK in pure C** — GTK is the native Linux toolkit and
-  a C library (ARCH-80). Distributed as an AppImage/Flatpak, not a static binary
-  (GTK cannot cleanly static-link).
-- **macOS/iOS (later):** AppKit/UIKit over the core. **Objective-C, not pure C** —
-  there is no C-native GUI on modern macOS (ARCH-80); Obj-C is a C superset, so
-  the UI shell calls the core with no FFI.
+- **Linux GUI (later):** the **same portable client** (ARCH-80) — the shared
+  app layer over SDL3, with a FreeType/fontconfig text backend and a small
+  native shim (tray, AT-SPI accessibility, libsecret). Not a GTK app: by the
+  time a second desktop was due, the client self-drew everything a toolkit
+  would have supplied. Packaging is decided when it lands.
+- **macOS/iOS (later):** the portable client over SDL3 on macOS, with a
+  CoreText backend and an Obj-C native shim where Apple leaves no C surface;
+  UIKit on iOS is its own effort over the core.
 - **Android (later):** Android views (Kotlin) over the core.
 - **Web (later):** a DOM UI — WASM can't use native desktop widgets; the core
   compiles to WASM and drives a JS/TS view.
@@ -818,8 +825,9 @@ to change a DirectWrite size, so any preference that moves the scale must call
   people, the pause, cross-channel threads, the People directory — are built
   end to end. Open work is in the
   [issue tracker](https://github.com/openchime/openchime/issues).
-- **The frontend order is fixed: all of Win32, then the TUI, then GTK, then
-  macOS.** Win32 is the reference client and it is finished *first* — including
+- **The frontend order is fixed: all of Win32, then the TUI, then the
+  portable-layer migration of the GUI, then further desktops on that layer
+  (ARCH-80).** Win32 is the reference client and it is finished *first* — including
   the items now waiting on a daemon requirement, which are Win32 work waiting on
   their other half, not work deferred behind another frontend. The TUI being
   behind is an accepted consequence of that order, not a reason to reorder it.
@@ -842,6 +850,6 @@ to change a DirectWrite size, so any preference that moves the scale must call
 - **Then — the rest of the specified scope.** REQUIREMENTS.md §§1–16 carries it,
   each requirement marked with whether it is built; whatever is not built and
   matters is an issue in the [tracker](https://github.com/openchime/openchime/issues).
-- **Then — remaining platforms + screenshare.** The other native GUIs (GTK,
-  AppKit), a web DOM UI, and mobile — and, gated behind the audio client,
+- **Then — remaining platforms + screenshare.** The portable GUI on Linux and
+  macOS (a text backend + native shim each, ARCH-80), a web DOM UI, and mobile — and, gated behind the audio client,
   **screenshare** (REQ-161, [VIDEO.md](./VIDEO.md)).
