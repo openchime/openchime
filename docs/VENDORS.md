@@ -76,6 +76,7 @@ verbatim from the notice in `jsmn.h`, which is where upstream keeps it). `.gitig
 | Package | Version | Purpose | Used by | Source | License |
 |---------|---------|---------|---------|--------|---------|
 | **Mbed TLS** | 3.6.2 | TLS transport (client + daemon), TOFU cert handling, SHA-256/PBKDF2, ES256 verify | Daemon + client (`shared/tls.c`) | https://github.com/Mbed-TLS/mbedtls | Apache-2.0 **OR** GPL-2.0-or-later (dual; we use it under Apache-2.0) |
+| **SDL3** | 3.4.14 | Windowing, input, GPU-accelerated 2D renderer for the graphical clients | GUI client (`client/gui/gfx/`, oc_gfx) | https://github.com/libsdl-org/SDL | zlib (no notice required in binary distributions) |
 
 Fetched + built by `scripts/build_mbedtls.sh` from the official GitHub release
 tarball into `third_party/mbedtls-3.6.2/` (gitignored). Version pinned by
@@ -90,6 +91,18 @@ refuse a mismatch, deleting the bad file rather than extracting it. Bumping
 `MBEDTLS_VERSION` without supplying a matching sum is **refused**, not fetched
 unverified: the script prints the `curl` that retrieves the upstream sum and
 exits. Override for a new version with `MBEDTLS_SHA256=<sum>`.
+
+**SDL3** follows the identical arrangement one script over:
+`scripts/build_sdl3_windows.sh` fetches the pinned release tarball
+(SHA-256-verified, refuses an unpinned bump), cross-builds a **static-only**
+`libSDL3.a` with mingw into `third_party/sdl3-3.4.14-win/` (gitignored), and
+`make windows-gfx-test` links it. SDL's own build is CMake; the script invoking
+it is the same arrangement as invoking mbedTLS's make — the dependency's build
+system stays its own business, and this tree's stays make. It is the first
+genuinely large dependency in the tree, which is exactly why it sits in this
+class and not the committed-single-file one (the reasoning §7 recorded for
+libvpx, now applied). zlib-licensed: no notice needs to travel with a shipped
+binary, so `packaging/licenses.sh` (daemon-only regardless) is untouched.
 
 ## 3. System / OS packages (linked at build)
 
@@ -158,6 +171,7 @@ Direct2D). Its cross-compile, and the Windows TUI's (ARCH-81), use:
 | Item | Version | Note | License |
 |------|---------|------|---------|
 | `scripts/build_mbedtls_windows.sh`, `third_party/mbedtls-3.6.2-win` | 3.6.2 | Windows cross-compile (mingw); used by `make windows-tui` and `make windows-gui` | Apache-2.0 |
+| `scripts/build_sdl3_windows.sh`, `third_party/sdl3-3.4.14-win` | 3.4.14 | Windows cross-compile (mingw, static, CMake invoked by the script); used by `make windows-gfx-test` | zlib |
 
 ## 7. Planned — not yet a dependency
 
