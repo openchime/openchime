@@ -253,4 +253,4 @@ jobs:
       # link proves the pure-C Win32 (incl. Direct2D/DirectWrite-from-C, ARCH-82)
       # builds under mingw.
       - name: Compile the Windows front-ends
-        run: make windows-tui windows-gui
+        run: make windows-tui windows-gui windows-sdltext-test

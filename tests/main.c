@@ -34,6 +34,7 @@ int run_searchq_tests(void);
 int run_richtext_tests(void);
 int run_url_tests(void);
 int run_unfurl_tests(void);
+int run_sdltext_map_tests(void);
 
 int main(void) {
     int total = 0;
@@ -64,6 +65,7 @@ int main(void) {
     total += run_richtext_tests();
     total += run_url_tests();
     total += run_unfurl_tests();
+    total += run_sdltext_map_tests();
 
     if (total == 0) { printf("\nOK: all suites passed\n"); return 0; }
     printf("\nFAILED: %d check(s) across all suites\n", total);

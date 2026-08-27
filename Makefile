@@ -51,6 +51,15 @@ TEST_BIN  := build/tests
 CORE_SRC := $(wildcard client/core/*.c)
 CORE_INC := -Iclient/core
 
+# --- sdltext (portable text layer) --------------------------------------------
+# One text API for every graphical client: layout, measurement, hit-testing,
+# byte-offset range styling. The portable core (the byte<->UTF-16 offset map)
+# compiles everywhere and is covered by `make test`; the DirectWrite backend
+# compiles only into Windows builds. See sdltext/sdltext.h.
+SDLTEXT_COMMON := sdltext/st_common.c
+SDLTEXT_WIN    := sdltext/st_common.c sdltext/st_dwrite.c
+SDLTEXT_INC    := -Isdltext
+
 # --- Client TUI frontend (ARCH-75) --------------------------------------------
 # termbox2 (cell grid + input) + utf8proc (Unicode width/grapheme), both vendored
 # as committed MIT single-file source. Builds on the host like the daemon.
@@ -120,9 +129,9 @@ check-refs:
 test: check-opcodes check-refs $(TEST_BIN)
 	./$(TEST_BIN)
 
-$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(HDRS) $(wildcard tests/*.h client/core/*.h) $(MBEDTLS_A) | build
+$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(SDLTEXT_COMMON) $(HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h) $(MBEDTLS_A) | build
 	$(CC) $(CFLAGS) -O0 -g $(INC) $(CORE_INC) -Itests \
-	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(MBEDTLS_LIBS) -lsqlite3 -lresolv -lpthread -o $@
+	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(SDLTEXT_COMMON) $(MBEDTLS_LIBS) -lsqlite3 -lresolv -lpthread -o $@
 
 # There is no `integration` target any more. It ran Scripts/test-integration.sh,
 # which drove the daemon through a Docker Compose stack; the project no longer
@@ -256,6 +265,17 @@ $(WIN_GUI_BIN): $(GUI_SRC) $(CORE_SRC) $(SHARED_SRC) $(WIN_GUI_RES) \
 	$(WINOBJCOPY) --only-keep-debug $@ $(WIN_GUI_SYMS)
 	$(WINOBJCOPY) --strip-debug --strip-unneeded $@
 	$(WINOBJCOPY) --add-gnu-debuglink=$(WIN_GUI_SYMS) $@
+
+# The DirectWrite backend's test program (sdltext/st_test_win.c). A console
+# .exe whose exit code is its failure count; CI cross-compiles it (the compile
+# is itself the header/vtable check mingw keeps honest), a Windows host — or
+# WSL interop — runs it. docs/TESTING.md records the split.
+WIN_SDLTEXT_TEST := build/sdltext_test.exe
+windows-sdltext-test: $(WIN_SDLTEXT_TEST)
+$(WIN_SDLTEXT_TEST): $(SDLTEXT_WIN) sdltext/st_test_win.c $(wildcard sdltext/*.h) | build
+	$(WINCC) $(WIN_CFLAGS) $(SDLTEXT_INC) \
+	    $(SDLTEXT_WIN) sdltext/st_test_win.c \
+	    -ld2d1 -ldwrite -lwindowscodecs -lole32 -luuid -static -o $@
 
 # --- tuikit demo (ARCH-83) ----------------------------------------------------
 # Standalone harness exercising every tuikit widget — no core, no daemon, no TLS.
