@@ -1877,6 +1877,61 @@ if snap | grep -q '^  statussugg [5-8] '; then ok "the saved status joined the r
 "$DRIVE" key esc >/dev/null 2>&1
 "$DRIVE" status "" "" >/dev/null 2>&1   # leave no status behind for later checks
 
+# --- the profile popover ------------------------------------------
+# The You menu is the reference's profile card: identity header, an input-look
+# status row, ONE away/active toggle, a pause flyout (the app's only submenu),
+# Profile / Preferences / Sign out. Rows are published (menurow/subrow), so
+# every assertion clicks a measured rect.
+say "== profile popover"
+row_xy() { snap | grep "^  menurow cmd=$1 " | grep -oE ' r=[0-9.,-]+' | cut -d= -f2 | awk -F, '{printf "%d %d", ($1+$3)/2, ($2+$4)/2}'; }
+sub_xy() { snap | grep "^  subrow cmd=$1 " | grep -oE ' r=[0-9.,-]+' | cut -d= -f2 | awk -F, '{printf "%d %d", ($1+$3)/2, ($2+$4)/2}'; }
+# The You item is the rail's bottom cluster: fixed geometry from the window.
+"$DRIVE" click 35 719 >/dev/null 2>&1
+expect_grep '^profilemenu open=1' "the popover opens from the rail"
+checks=$((checks + 2))
+if snap | grep -q '^  menurow cmd=51 kind=5'; then ok "the status row is an input-look row"; else fail "no status row"; fi
+if snap | grep -qE '^  menurow cmd=1[01] kind=0'; then ok "one presence toggle, worded from live presence"; else fail "presence toggle missing"; fi
+prow=$(row_xy -100)
+[ -n "$prow" ] && "$DRIVE" move $prow >/dev/null 2>&1
+expect_grep '^profilemenu open=1 sub=1' "hovering Pause notifications arms the flyout"
+s30=$(sub_xy 58)
+[ -n "$s30" ] && "$DRIVE" click $s30 >/dev/null 2>&1
+expect_grep '^snoozed=1' "a flyout duration snoozes"
+"$DRIVE" click 35 719 >/dev/null 2>&1
+expect_grep '^  menurow cmd=-100.*' "the popover reopens with the flyout parent"
+prow=$(row_xy -100)
+[ -n "$prow" ] && "$DRIVE" move $prow >/dev/null 2>&1
+sres=$(sub_xy 57)
+[ -n "$sres" ] && "$DRIVE" click $sres >/dev/null 2>&1
+expect_grep '^snoozed=0' "Resume clears the snooze"
+"$DRIVE" click 35 719 >/dev/null 2>&1
+base_pres=$(snap | grep -oE '^presence=[0-9]+' | cut -d= -f2)
+trow=$(row_xy 11); [ -z "$trow" ] && trow=$(row_xy 10)
+[ -n "$trow" ] && "$DRIVE" click $trow >/dev/null 2>&1
+checks=$((checks + 1))
+if wait_grep "^presence=[0-9]"; then
+  new_pres=$(snap | grep -oE '^presence=[0-9]+' | cut -d= -f2)
+  if [ "$new_pres" != "$base_pres" ]; then ok "the toggle flips presence ($base_pres -> $new_pres)"
+  else fail "presence unchanged at $base_pres"; fi
+else fail "no presence field in the dump"; fi
+"$DRIVE" click 35 719 >/dev/null 2>&1
+trow=$(row_xy 10); [ -z "$trow" ] && trow=$(row_xy 11)
+[ -n "$trow" ] && "$DRIVE" click $trow >/dev/null 2>&1   # restore
+"$DRIVE" click 35 719 >/dev/null 2>&1
+prof=$(row_xy 65)
+[ -n "$prof" ] && "$DRIVE" click $prof >/dev/null 2>&1
+expect_grep '^  selfcardbtn cmd=53 ' "Profile opens the self card with its action buttons"
+checks=$((checks + 1))
+nbtn=$(snap | grep -c '^  selfcardbtn ')
+if [ "$nbtn" -ge 5 ]; then ok "profile and account groups are populated ($nbtn buttons)"
+else fail "self card has $nbtn buttons"; fi
+"$DRIVE" key esc >/dev/null 2>&1
+# the workspace menu still owns workspace sign-out
+"$DRIVE" click 140 28 >/dev/null 2>&1
+checks=$((checks + 1))
+if snap | grep -q '^  menurow cmd=3 '; then ok "the workspace menu still lists Sign out"; else fail "ws menu lost Sign out"; fi
+"$DRIVE" key esc >/dev/null 2>&1
+
 # --- one selected row at a time ----------------------------------
 # Reported from a screenshot: the Drafts pane lit its own shelf row AND left the
 # conversation lit underneath it, so two places claimed to be where you were.

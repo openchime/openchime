@@ -616,6 +616,11 @@ static int g_prefs_open;
  * roster actually knows today rather than inventing placeholders for them. */
 static uint64_t g_profile_uid;
 static rectf g_prof_dm_btn;
+/* The SELF card's action buttons — the commands the profile popover no longer
+ * lists top-level. Each carries a menu_dispatch cmd; the bodies are all
+ * self-contained. */
+static struct { rectf r; int cmd; } g_selfcard_btn[6];
+static int g_n_selfcard_btn;
 static int g_pref_time24    = 1;   /* 24-hour timestamps */
 static int g_pref_members   = 1;   /* members pane shown by default */
 static int g_pref_daysep    = 1;   /* date dividers in the transcript */
@@ -1322,9 +1327,16 @@ static int g_n_moreflyrows;
 enum { MENU_NONE = 0, MENU_WS, MENU_PROFILE, MENU_NEW, MENU_SWITCHER, MENU_SECTION,
        MENU_MSG, MENU_MEMBER, MENU_CHANNEL, MENU_THUMB, MENU_SCHED, MENU_THREAD };
 /* MK_EMOJIROW is one row holding the quick reactions side by side, each its own
- * hit-box. The native menu had them as a submenu; the custom menu has no submenus,
- * and six separate rows would bury the rest of the message actions. */
-enum { MK_ITEM = 0, MK_SECTION, MK_SEP, MK_EMOJIROW };
+ * hit-box (it predates the flyout below and stays a row — six separate rows
+ * would bury the rest of the message actions).
+ * MK_USERHEADER / MK_STATUSROW / MK_SUB exist for the profile popover: an
+ * identity header, an input-styled "Update your status" row, and the ONE
+ * deliberate nested flyout in the app — Pause notifications. Append-only. */
+enum { MK_ITEM = 0, MK_SECTION, MK_SEP, MK_EMOJIROW,
+       MK_USERHEADER,   /* avatar + name + presence; display-only */
+       MK_STATUSROW,    /* input-look status row; dispatches its cmd */
+       MK_SUB };        /* arms the flyout instead of dispatching */
+#define SUBCMD_PAUSE  (-100)   /* MK_SUB sentinel: the pause-notifications flyout */
 struct menuitem { int kind, cmd, icon, danger; char label[72]; };
 static int   g_menu;                     /* which menu is open (MENU_NONE = none) */
 static struct menuitem g_mi[28];
@@ -1336,8 +1348,16 @@ static uint64_t g_menu_target;               /* what a context menu is about */
 static uint64_t g_menu_target2;             /* its channel, for a message */
 static rectf g_menu_emoji[8];         /* per-glyph hit-boxes in MK_EMOJIROW */
 static int   g_n_menu_emoji;
-static struct { float top, bot; int cmd; } g_mirows[28];
+static struct { float top, bot; int cmd, kind; const char *label; } g_mirows[28];
 static int   g_n_mirows;
+/* The pause-notifications flyout (the app's one submenu): its own state, on
+ * the More-flyout pattern — g_menu stays a single panel. */
+static int   g_sub_open;                    /* 0 or SUBCMD_PAUSE */
+static float g_sub_anchor_top;              /* the parent row's top */
+static rectf g_sub_panel;
+static struct { float top, bot; int cmd; char label[48]; } g_subrows[8];
+static int   g_n_subrows;
+static void  submenu_close(void);           /* defined beside draw_menu */
 /* Workspace switcher list (built from the store book at open time). */
 enum { WS_MAX = 8 };
 typedef struct {
@@ -2588,15 +2608,29 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
         draw_presence_dot_dnd(rt, cx + 11, py + 35, 4.5f,
                               m ? oc_model_presence_of(m, m->user_id) : OC_PRESENCE_OFFLINE,
                               OC_COL_RAIL, m ? oc_model_snoozed(m) : 0);
-        /* QUIET HOURS on the TOP hemisphere, deliberately opposite the presence dot:
-         * they answer different questions — "am I here" versus "will this reach me" —
-         * and stacking them in one corner would read as one compound state. A "z"
-         * rather than a bell-with-slash: at 11px the slash is a smudge, and the
-         * letterform survives the size. */
-        if (dnd_now(m)) {
-                        gfx_ellipse(rt, cx + 11, py + 13, 6.6f, 6.6f, OC_COL_RAIL, 1.0f);
-                        gfx_ellipse(rt, cx + 11, py + 13, 5.2f, 5.2f, OC_COL_NOTICE, 1.0f);
-            draw_text(rt, "z", g_micro, rf(cx + 5, py + 7, cx + 17, py + 19), OC_COL_RAIL);
+        /* The TOP hemisphere, opposite the presence dot: they answer different
+         * questions — "am I here" versus "what am I doing / will this reach
+         * me". The STATUS EMOJI owns the spot when one is set (the reference
+         * wears it on the avatar exactly here); quiet hours' "z" shows only
+         * when there is no emoji to show — the snoozed state is still encoded
+         * in the presence dot either way, so nothing is lost. */
+        {
+            const char *se = NULL;
+            if (m) for (size_t si2 = 0; si2 < m->n_users; si2++)
+                if (m->users[si2].user_id == m->user_id) {
+                    if (m->users[si2].status_emoji[0]) se = m->users[si2].status_emoji;
+                    break;
+                }
+            if (se) {
+                /* A rail-coloured backing disc separates the glyph from the
+                 * photo underneath, the same cutout the presence dot uses. */
+                gfx_ellipse(rt, cx + 10, py + 12, 9.0f, 9.0f, OC_COL_RAIL, 1.0f);
+                draw_emoji_glyph(rt, se, rf(cx + 3, py + 5, cx + 17, py + 19));
+            } else if (dnd_now(m)) {
+                gfx_ellipse(rt, cx + 11, py + 13, 6.6f, 6.6f, OC_COL_RAIL, 1.0f);
+                gfx_ellipse(rt, cx + 11, py + 13, 5.2f, 5.2f, OC_COL_NOTICE, 1.0f);
+                draw_text(rt, "z", g_micro, rf(cx + 5, py + 7, cx + 17, py + 19), OC_COL_RAIL);
+            }
         }
         draw_text(rt, "You", g_micro, rf(0, py + 45, RAIL_W, py + 61), OC_COL_RAIL_ICON);
         rail_hit(py, py + RAIL_IH, NAV_PROFILE);
@@ -2643,6 +2677,9 @@ static void mi_add(int kind, int cmd, const char *label, int danger) {
 #define mi_section(label)      mi_add(MK_SECTION, 0, (label), 0)
 #define mi_sep()               mi_add(MK_SEP, 0, NULL, 0)
 #define mi_emojirow()          mi_add(MK_EMOJIROW, 0, NULL, 0)
+#define mi_userheader()        mi_add(MK_USERHEADER, 0, NULL, 0)
+#define mi_statusrow(cmd)      mi_add(MK_STATUSROW, (cmd), NULL, 0)
+#define mi_subitem(cmd, label) mi_add(MK_SUB, (cmd), (label), 0)
 
 /* Workspace display name, or the host's leading label as a fallback. */
 static void ws_display_name(const oc_model *m, char *out, size_t cap) {
@@ -2665,7 +2702,10 @@ static void ws_mode_line(const oc_model *m, char *out, size_t cap) {
 
 static float menu_item_h(int kind) {
     return kind == MK_ITEM ? 36.0f : kind == MK_SECTION ? 24.0f
-         : kind == MK_EMOJIROW ? 40.0f : 11.0f;
+         : kind == MK_EMOJIROW ? 40.0f
+         : kind == MK_USERHEADER ? 64.0f
+         : kind == MK_STATUSROW ? 46.0f
+         : kind == MK_SUB ? 36.0f : 11.0f;
 }
 
 static void draw_menu(gfx *rt) {
@@ -2727,17 +2767,136 @@ static void draw_menu(gfx *rt) {
                 g_menu_emoji[g_n_menu_emoji++] = cell;
                 ex = cell.right + 2;
             }
+        } else if (g_mi[i].kind == MK_USERHEADER) {
+            /* The signed-in user: avatar with the LIVE presence dot and quiet-
+             * hours badge (the rail's recipe, on the menu's surface), name and
+             * a presence line. Display-only — "Profile" is a row below, and a
+             * clickable header would be the same door twice. */
+            rectf av = rf(x + 14, cy + 10, x + 54, cy + 50);
+            const char *nm = m ? oc_model_user_name(m, m->user_id) : "";
+            draw_user_avatar(rt, m, m ? m->user_id : 0,
+                             (nm && nm[0]) ? nm : "U", av, g_avatar, 0, 0);
+            uint8_t pres = m ? oc_model_presence_of(m, m->user_id) : 0;
+            int snoozed = m ? oc_model_snoozed(m) : 0;
+            draw_presence_dot_dnd(rt, av.right - 3, av.bottom - 3, 4.5f,
+                                  pres, OC_COL_INPUT, snoozed);
+            draw_text(rt, (nm && nm[0]) ? nm : "you", g_ui_b,
+                      rf(x + 62, cy + 12, panel.right - 12, cy + 32), OC_COL_TEXT);
+            char pl[48];
+            snprintf(pl, sizeof pl, "%s%s",
+                     pres == OC_PRESENCE_ONLINE ? "Active" : "Away",
+                     snoozed ? " \xC2\xB7 notifications paused" : "");
+            draw_text(rt, pl, g_meta,
+                      rf(x + 62, cy + 32, panel.right - 12, cy + 50), OC_COL_MUTED);
+        } else if (g_mi[i].kind == MK_STATUSROW) {
+            /* An input-look row, exactly the affordance the status dialog's own
+             * field presents: emoji slot + the current status, or a smiley and
+             * an invitation. Clicking it opens the dialog. */
+            rectf box = rf(x + 10, cy + 4, panel.right - 10, cy + 42);
+            int hov = (g_menu_hover == i);
+            fill_round(rt, box, 6.0f, OC_COL_BASE);
+            stroke_round(rt, box, 6.0f, hov ? OC_COL_ACCENT : OC_COL_BORDER,
+                         hov ? 1.5f : 1.0f);
+            char se[24] = "", st[80] = "";
+            if (m) for (size_t u = 0; u < m->n_users; u++)
+                if (m->users[u].user_id == m->user_id) {
+                    snprintf(se, sizeof se, "%s", m->users[u].status_emoji);
+                    snprintf(st, sizeof st, "%s", m->users[u].status_text);
+                    break;
+                }
+            rectf slot = rf(box.left + 6, box.top + 6, box.left + 32, box.bottom - 6);
+            if (se[0]) draw_emoji_glyph(rt, se, slot);
+            else draw_lucide(rt, OC_ICON_SMILE, rf(slot.left + 2, slot.top + 2,
+                                                   slot.right - 2, slot.bottom - 2),
+                             OC_COL_MUTED);
+            draw_text(rt, st[0] ? st : "Update your status", g_ui,
+                      rf(box.left + 40, box.top, box.right - 8, box.bottom),
+                      st[0] ? OC_COL_TEXT : OC_COL_FAINT);
+            if (g_n_mirows < (int)(sizeof g_mirows / sizeof g_mirows[0])) {
+                g_mirows[g_n_mirows].top = cy; g_mirows[g_n_mirows].bot = cy + ih;
+                g_mirows[g_n_mirows].cmd = g_mi[i].cmd;
+                g_mirows[g_n_mirows].kind = MK_STATUSROW;
+                g_mirows[g_n_mirows].label = g_mi[i].label;
+                g_n_mirows++;
+            }
         } else {
-            if (g_menu_hover == i)
+            /* MK_ITEM and MK_SUB share the row body; SUB adds the chevron and
+             * keeps its pill lit while its flyout is open. */
+            int lit = (g_menu_hover == i) ||
+                      (g_mi[i].kind == MK_SUB && g_sub_open == g_mi[i].cmd);
+            if (lit)
                 fill_round(rt, rf(x + 5, cy + 2, panel.right - 5, cy + ih - 2), 7.0f, OC_COL_HOVER);
             uint32_t col = g_mi[i].danger ? OC_COL_DANGER : OC_COL_TEXT;
             draw_text(rt, g_mi[i].label, g_ui, rf(x + 16, cy, panel.right - 12, cy + ih), col);
+            if (g_mi[i].kind == MK_SUB) {
+                g_meta->align = ST_ALIGN_RIGHT;
+                draw_text(rt, "\xE2\x80\xBA", g_meta,
+                          rf(panel.right - 30, cy, panel.right - 14, cy + ih), OC_COL_MUTED);
+                g_meta->align = ST_ALIGN_LEFT;
+            }
             if (g_n_mirows < (int)(sizeof g_mirows / sizeof g_mirows[0])) {
                 g_mirows[g_n_mirows].top = cy; g_mirows[g_n_mirows].bot = cy + ih;
-                g_mirows[g_n_mirows].cmd = g_mi[i].cmd; g_n_mirows++;
+                g_mirows[g_n_mirows].cmd = g_mi[i].cmd;
+                g_mirows[g_n_mirows].kind = g_mi[i].kind;
+                g_mirows[g_n_mirows].label = g_mi[i].label;
+                g_n_mirows++;
             }
         }
         cy += ih;
+    }
+}
+
+static void submenu_close(void) {
+    g_sub_open = 0; g_n_subrows = 0;
+    g_sub_panel = rf(0, 0, 0, 0);
+}
+
+/* The pause-notifications flyout: the app's one submenu, drawn ABOVE the menu
+ * panel (render order) and anchored beside its parent row. Rows are plain
+ * items; hover is paint-time (the scene repaints every tick). */
+static void draw_submenu(gfx *rt, float W, float H) {
+    g_n_subrows = 0;
+    if (!g_menu || !g_sub_open) { g_sub_panel = rf(0, 0, 0, 0); return; }
+    const oc_model *m = model();
+    struct subrow { int cmd; const char *label; } rows[8];
+    int n = 0, sep_before = -1;
+    if (m && oc_model_snoozed(m)) { rows[n].cmd = 57; rows[n].label = "Resume notifications"; n++; }
+    rows[n].cmd = 58; rows[n].label = "For 30 minutes"; n++;
+    rows[n].cmd = 59; rows[n].label = "For 1 hour"; n++;
+    rows[n].cmd = 62; rows[n].label = "For 2 hours"; n++;
+    rows[n].cmd = 63; rows[n].label = "Until tomorrow"; n++;
+    rows[n].cmd = 64; rows[n].label = "Custom\xE2\x80\xA6"; n++;
+    sep_before = n;
+    rows[n].cmd = 50; rows[n].label = "Set a notification schedule"; n++;
+
+    float w = 210.0f, rowh = 36.0f, pad = 6.0f;
+    float total = pad * 2 + n * rowh + 11.0f;   /* + the one separator */
+    float px = g_menu_x + g_menu_w - 4;
+    float py = g_sub_anchor_top - pad;
+    if (px + w > W - 8) px = g_menu_x - w + 4;   /* flip left when cramped */
+    if (py + total > H - 8) py = H - 8 - total;
+    if (py < 8) py = 8;
+    g_sub_panel = rf(px, py, px + w, py + total);
+    fill_round(rt, rf(px + 2, py + 4, px + w + 2, py + total + 4), 12.0f, OC_COL_RAIL);
+    fill_round(rt, g_sub_panel, 12.0f, OC_COL_INPUT);
+    stroke_round(rt, g_sub_panel, 12.0f, OC_COL_BORDER, 1.0f);
+    float cy = py + pad;
+    for (int i = 0; i < n; i++) {
+        if (i == sep_before) {
+            fill(rt, rf(px + 10, cy + 5, px + w - 10, cy + 6), OC_COL_BORDER);
+            cy += 11.0f;
+        }
+        rectf r = rf(px, cy, px + w, cy + rowh);
+        if (in_rect(r, g_mouse_x, g_mouse_y))
+            fill_round(rt, rf(px + 5, cy + 2, px + w - 5, cy + rowh - 2), 7.0f, OC_COL_HOVER);
+        draw_text(rt, rows[i].label, g_ui, rf(px + 16, cy, px + w - 12, cy + rowh), OC_COL_TEXT);
+        if (g_n_subrows < (int)(sizeof g_subrows / sizeof g_subrows[0])) {
+            g_subrows[g_n_subrows].top = cy; g_subrows[g_n_subrows].bot = cy + rowh;
+            g_subrows[g_n_subrows].cmd = rows[i].cmd;
+            snprintf(g_subrows[g_n_subrows].label, sizeof g_subrows[0].label, "%s", rows[i].label);
+            g_n_subrows++;
+        }
+        cy += rowh;
     }
 }
 
@@ -5073,6 +5232,7 @@ static int accel_dispatch(HWND hwnd, const MSG *m) {
      * claims the key when one of these four is actually up. */
     if (m->message == WM_KEYDOWN && m->wParam == VK_ESCAPE) {
         if (g_tp_open)   { g_tp_open = 0; InvalidateRect(hwnd, NULL, FALSE); return 1; }
+        if (g_sub_open)  { submenu_close(); InvalidateRect(hwnd, NULL, FALSE); return 1; }
         if (g_menu)      { g_menu = MENU_NONE; g_menu_hover = -1; InvalidateRect(hwnd, NULL, FALSE); return 1; }
         if (g_more_open) { g_more_open = 0;    InvalidateRect(hwnd, NULL, FALSE); return 1; }
         if (g_lightbox)  { g_lightbox = 0;     InvalidateRect(hwnd, NULL, FALSE); return 1; }
@@ -6030,6 +6190,7 @@ static void draw_prefs(gfx *rt, rectf reg) {
  * version was a wide avatar-beside-text block built for the full middle column,
  * which does not fit 300px and would fit less as REQ-240/241 add fields. */
 static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
+    g_n_selfcard_btn = 0;
     const char *nm = oc_model_user_name(m, g_profile_uid);
     if (!nm || !nm[0]) nm = "user";
     float cx = (reg.left + reg.right) / 2, y = reg.top + 18;
@@ -6067,9 +6228,41 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
         y += 44;
     } else {
         g_prof_dm_btn = rf(0, 0, 0, 0);
-        draw_text(rt, "This is you.", g_meta,
-                  rf(reg.left + 24, y, reg.right - 12, y + 20), OC_COL_FAINT);
-        y += 28;
+        /* Your own card is where the profile-shaped ACTIONS live — the popover
+         * points here with "Profile", and photo/name/password/sessions moved
+         * off its top level. Two labelled groups of stacked bordered buttons,
+         * the About-tab admin idiom. */
+        struct { const char *label; int cmd; int show; } B[6] = {
+            { "Edit profile",        53, 1 },
+            { "Change photo",        55, 1 },
+            { "Remove photo",        56, avatar_of(m, m->user_id) != 0 },
+            { "Change display name", 30, 1 },
+            { "Change password",     31, 1 },
+            { "Active sessions",     54, 1 },
+        };
+        for (int gi = 0; gi < 2; gi++) {
+            draw_text(rt, gi == 0 ? "PROFILE" : "ACCOUNT", g_meta,
+                      rf(reg.left + 24, y, reg.right - 12, y + 18), OC_COL_FAINT);
+            y += 22;
+            for (int bi = gi * 3; bi < gi * 3 + 3; bi++) {
+                if (!B[bi].show) continue;
+                rectf b = rf(reg.left + 24, y, reg.right - 24, y + 28);
+                int hov = in_rect(b, g_mouse_x, g_mouse_y);
+                if (hov) fill_round(rt, b, 6.0f, OC_COL_HOVER);
+                stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
+                g_meta->align = ST_ALIGN_CENTER;
+                draw_text(rt, B[bi].label, g_meta, b,
+                          hov ? OC_COL_TEXT : OC_COL_MUTED);
+                g_meta->align = ST_ALIGN_LEFT;
+                if (g_n_selfcard_btn < (int)(sizeof g_selfcard_btn / sizeof g_selfcard_btn[0])) {
+                    g_selfcard_btn[g_n_selfcard_btn].r = b;
+                    g_selfcard_btn[g_n_selfcard_btn].cmd = B[bi].cmd;
+                    g_n_selfcard_btn++;
+                }
+                y += 34;
+            }
+            y += 8;
+        }
     }
     /* The profile fields (REQ-240/241). They reach a client for EVERYONE as of
      * REQ-289 — before that only PROFILE_INFO carried them and it never left the
@@ -8368,9 +8561,21 @@ static const oc_modal_spec *modal_current(void) {
         sp.title = "Set a status";
         sp.size = MODAL_SM;
         sp.want_h = status_want_h();
-        sp.buttons[0] = (oc_mbtn){ "Cancel", MB_NORMAL,  MODAL_CANCEL };
-        sp.buttons[1] = (oc_mbtn){ "Save",   MB_PRIMARY, MODAL_OK };
-        sp.n_buttons = 2;
+        /* "Clear status" lives HERE now, not on the profile popover — but only
+         * when there is a status to clear (cmd 52 clears and closes), placed
+         * FIRST so the frame's layout keeps Save on the outside. */
+        sp.n_buttons = 0;
+        {
+            const oc_model *cm = model();
+            if (cm) for (size_t i = 0; i < cm->n_users; i++)
+                if (cm->users[i].user_id == cm->user_id) {
+                    if (cm->users[i].status_text[0] || cm->users[i].status_emoji[0])
+                        sp.buttons[sp.n_buttons++] = (oc_mbtn){ "Clear status", MB_NORMAL, 52 };
+                    break;
+                }
+        }
+        sp.buttons[sp.n_buttons++] = (oc_mbtn){ "Cancel", MB_NORMAL,  MODAL_CANCEL };
+        sp.buttons[sp.n_buttons++] = (oc_mbtn){ "Save",   MB_PRIMARY, MODAL_OK };
         sp.commit = status_commit;
     } else if (g_form_open) {
         /* A form is the one modal whose height depends on its content, so the
@@ -8469,6 +8674,7 @@ static void modal_enter(HWND hwnd, int *flag) {
     if (g_pal_open)  palette_close(hwnd);
     if (g_pick_open) picker_close(hwnd);
     g_menu = MENU_NONE; g_menu_hover = -1;
+    submenu_close();
     g_more_open = 0;
     *flag = 1;
     g_view = keep_view ? prev_view : VIEW_HOME;
@@ -10483,6 +10689,7 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
     draw_more_flyout(rt);   /* floats over the pane when open */
     draw_palette(rt, m, W, H);   /* the palette dims and covers the app */
     draw_menu(rt);          /* dropdown menus float on top of everything */
+    draw_submenu(rt, W, H); /* ...and the pause flyout above its menu */
     draw_time_picker(rt, W, H);   /* ...and the time dropdown above the overlay it belongs to */
     if (g_pick_target == PICK_STATUS)   /* the status dialog's emoji picker floats
                                          * over its card, exactly like the time
@@ -12218,6 +12425,32 @@ static void a11y_publish_scene(const oc_model *m) {
      * a message the user cannot see, and made chromefit compare a card's
      * content against chrome underneath it. Skip straight to the modal block. */
     if (modal_open()) goto modal_items;
+    /* An open MENU owns it for the same reason: the click handler consumes
+     * every click while one is up. Menus were invisible to AT entirely — now
+     * their rows (and the pause flyout's) are the tree while they are open. */
+    if (g_menu) {
+        for (int i = 0; i < g_n_mirows && n < OC_ACC_MAX; i++) {
+            if (g_mirows[i].kind == MK_SUB) continue;   /* the flyout speaks below */
+            char aid[OC_ACC_AID_MAX];
+            snprintf(aid, sizeof aid, "menu.%d", g_mirows[i].cmd);
+            acc_push(items, &n, OC_ACC_BUTTON, aid,
+                     (g_mirows[i].label && g_mirows[i].label[0])
+                         ? g_mirows[i].label : "Update your status",
+                     rf(g_menu_x, g_mirows[i].top, g_menu_x + g_menu_w, g_mirows[i].bot),
+                     ATOK(AT_MENU, g_mirows[i].cmd));
+        }
+        for (int i = 0; i < g_n_subrows && n < OC_ACC_MAX; i++) {
+            char aid[OC_ACC_AID_MAX];
+            snprintf(aid, sizeof aid, "menu.%d", g_subrows[i].cmd);
+            acc_push(items, &n, OC_ACC_BUTTON, aid, g_subrows[i].label,
+                     rf(g_sub_panel.left, g_subrows[i].top,
+                        g_sub_panel.right, g_subrows[i].bot),
+                     ATOK(AT_MENU, g_subrows[i].cmd));
+        }
+        g_a11y_n = n;
+        oc_a11y_publish(items, n, NULL, 0, 0);
+        return;
+    }
 
     /* Conversations. Headers are skipped: "Channels" is a label, not a place you
      * can go, and a screen reader offering it as a list item invites the user to
@@ -14065,6 +14298,13 @@ static int on_click(HWND hwnd, int x, int y) {
                 }
         }
     }
+    /* The self card's action buttons — dispatch the moved-off-menu commands. */
+    if (g_profile_uid && model() && g_profile_uid == model()->user_id)
+        for (int i = 0; i < g_n_selfcard_btn; i++)
+            if (in_rect(g_selfcard_btn[i].r, x, y)) {
+                menu_dispatch(hwnd, g_selfcard_btn[i].cmd);
+                return 1;
+            }
     if (g_profile_uid && in_rect(g_prof_dm_btn, x, y)) {
         uint64_t uid = g_profile_uid;
         close_overlays();
@@ -14311,10 +14551,33 @@ static int on_click(HWND hwnd, int x, int y) {
      * anywhere else dismisses it. */
     if (g_menu) {
         if (g_menu != MENU_THREAD) g_thread_menu_root = 0;
+        /* The flyout FIRST: the fall-through below dismisses on any unmatched
+         * click, which would eat a click aimed at the second panel. */
+        if (g_sub_open) {
+            if (in_rect(g_sub_panel, x, y)) {
+                for (int i = 0; i < g_n_subrows; i++)
+                    if ((float)y >= g_subrows[i].top && (float)y < g_subrows[i].bot) {
+                        int cmd = g_subrows[i].cmd;
+                        submenu_close();
+                        g_menu = MENU_NONE; g_menu_hover = -1;
+                        menu_dispatch(hwnd, cmd);
+                        return 1;
+                    }
+                return 1;   /* panel but no row: consumed, stays open */
+            }
+        }
         for (int i = 0; i < g_n_mirows; i++)
             if ((float)y >= g_mirows[i].top && (float)y < g_mirows[i].bot &&
                 (float)x >= g_menu_x && (float)x < g_menu_x + g_menu_w) {
+                /* A submenu parent toggles its flyout and keeps the menu up. */
+                if (g_mirows[i].kind == MK_SUB) {
+                    if (g_sub_open) submenu_close();
+                    else { g_sub_open = g_mirows[i].cmd; g_sub_anchor_top = g_mirows[i].top; }
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 1;
+                }
                 int cmd = g_mirows[i].cmd, kind = g_menu;
+                submenu_close();
                 g_menu = MENU_NONE; g_menu_hover = -1;
                 /* Per-kind dispatch: a context menu's numbers are its own, so 21
                  * means Edit on a message and a notification level in a dropdown. */
@@ -14335,6 +14598,7 @@ static int on_click(HWND hwnd, int x, int y) {
                     msg_menu_react(i);
                     return 1;
                 }
+        submenu_close();
         g_menu = MENU_NONE; g_menu_hover = -1; return 1;
     }
     /* The "More" overflow flyout takes clicks next. */
@@ -15348,7 +15612,7 @@ static void ws_load(int i) {
     /* Cross-workspace leftovers: a selection, an edit or a toast from the other
      * workspace means nothing here. */
     g_has_sel = 0; g_edit_msg = 0; g_n_toast = 0; g_err_seen[0] = '\0';
-    g_menu = MENU_NONE; g_more_open = 0;
+    g_menu = MENU_NONE; g_more_open = 0; submenu_close();
 }
 
 /* Collect the remembered workspaces, so boot can connect them all. */
@@ -15440,7 +15704,7 @@ static void reset_session(void) {
         g_client = NULL;
     }
     g_sel = 0; g_scroll = 0; g_post_auth = 0; g_has_sel = 0;
-    g_n_backfilled = 0; g_more_open = 0; g_menu = MENU_NONE;
+    g_n_backfilled = 0; g_more_open = 0; g_menu = MENU_NONE; submenu_close();
     g_edit_msg = 0; g_n_toast = 0; g_err_seen[0] = '\0'; g_err_seq = 0;
 }
 
@@ -15924,6 +16188,15 @@ static void snooze_label(uint64_t until_ms, char *out, size_t cap) {
     snprintf(out, cap, "PAUSED UNTIL %s", when);
 }
 
+/* The same fact in sentence case, for a menu ROW rather than a section head. */
+static void snooze_until_sentence(uint64_t until_ms, char *out, size_t cap) {
+    time_t t = (time_t)(until_ms / 1000);
+    struct tm tv; char when[24] = "";
+    if (oc_localtime_r(&t, &tv))
+        strftime(when, sizeof when, g_pref_time24 ? "%H:%M" : "%I:%M %p", &tv);
+    snprintf(out, cap, "Paused until %s", when);
+}
+
 /* Minutes from now until `hh:mm` LOCAL, tomorrow if that has already passed
  * today. The wire takes minutes precisely so this arithmetic happens where the
  * timezone is known (REQ-278) — the daemon would have to guess. */
@@ -15939,73 +16212,38 @@ static uint32_t minutes_until_local(int hh, int mm, int force_tomorrow) {
 }
 
 static void open_profile_menu(HWND hwnd) {
+    /* The reference's profile popover, item for item (its shape, not a copy):
+     * identity header, an input-look status row, ONE away/active toggle worded
+     * from live presence, "Pause notifications \xE2\x80\xBA" whose durations
+     * live in the app's one deliberate flyout (drawn beside this panel), then
+     * Profile / Preferences / Sign out. The commands this menu no longer
+     * lists — photo, display name, password, sessions — live as buttons on
+     * the SELF profile card, where Slack keeps their equivalents too. */
+    const oc_model *pm = model();
+    uint8_t pres = pm ? oc_model_presence_of((oc_model *)pm, pm->user_id) : 0;
     g_n_mi = 0;
-    mi_item(10, "Set status: Online");
-    mi_item(11, "Set status: Away");
-    /* Pausing (REQ-278) sits here because Slack puts it here, and because this is
-     * the menu you reach for when you want to be left alone. Presets are
-     * DURATIONS — the wire takes minutes and only this side knows the timezone
-     * that turns "until tomorrow" into an instant.
-     *
-     * Flat rather than a submenu: five items is not a hierarchy, and every other
-     * menu in this app is one level. */
-    {
-        const oc_model *sm = model();
-        if (sm && oc_model_snoozed(sm)) {
-            char lbl[64];
-            snooze_label(sm->snooze_until_ms, lbl, sizeof lbl);
-            mi_section(lbl);
-            mi_item(57, "Resume notifications");
-        } else {
-            mi_section("PAUSE NOTIFICATIONS");
-            mi_item(58, "For 30 minutes");
-            mi_item(59, "For 1 hour");
-            mi_item(62, "For 2 hours");
-            mi_item(63, "Until tomorrow");
-            mi_item(64, "Custom\u2026");
-        }
+    mi_userheader();
+    mi_statusrow(51);
+    mi_item(pres == OC_PRESENCE_ONLINE ? 11 : 10,
+            pres == OC_PRESENCE_ONLINE ? "Set yourself as away"
+                                       : "Set yourself as active");
+    if (pm && oc_model_snoozed(pm)) {
+        char lbl[64];
+        snooze_until_sentence(pm->snooze_until_ms, lbl, sizeof lbl);
+        mi_subitem(SUBCMD_PAUSE, lbl);
+    } else {
+        mi_subitem(SUBCMD_PAUSE, "Pause notifications");
     }
-    mi_item(50, "Notification schedule");
     mi_sep();
-    /* Custom status (REQ-241/122) — distinct from presence above: presence is
-     * "am I here", status is "what am I doing", and Slack keeps both. */
-    {
-        const oc_model *pm = model();
-        const oc_member *me = NULL;
-        if (pm) for (size_t i = 0; i < pm->n_users; i++)
-            if (pm->users[i].user_id == pm->user_id) { me = &pm->users[i]; break; }
-        if (me && (me->status_text[0] || me->status_emoji[0])) {
-            char cur[96];
-            snprintf(cur, sizeof cur, "%s%s%s", me->status_emoji,
-                     me->status_emoji[0] ? "  " : "", me->status_text);
-            mi_section(cur);
-            mi_item(52, "Clear status");
-            mi_item(51, "Change status");
-        } else {
-            mi_item(51, "Set a status");
-        }
-    }
-    mi_item(53, "Edit profile");
-    /* Two items rather than a field in the profile form: choosing a file is
-     * an OS dialog, and burying it behind a text form would mean opening one modal to
-     * reach another. "Remove" only appears when there is a photo to remove. */
-    mi_item(55, "Change photo");
-    {
-        const oc_model *am = model();
-        if (am && avatar_of(am, am->user_id)) mi_item(56, "Remove photo");
-    }
-    mi_item(54, "Active sessions");   /* REQ-182 */
-    /* Preferences hangs off YOU as well as off the workspace menu. It was
-     * only on the workspace menu, which is the same category error as the
-     * connection dot in the channel header: how the app looks to you is not a
-     * property of the workspace. */
+    mi_item(65, "Profile");
     mi_item(70, "Preferences  (Ctrl+,)");
     mi_sep();
-    mi_item(30, "Change display name");
-    mi_item(31, "Change password");
-    g_menu = MENU_PROFILE; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 224;
+    mi_item_d(3, "Sign out");
+    g_menu = MENU_PROFILE; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 248;
+    submenu_close();
     RECT rc; GetClientRect(hwnd, &rc);
-    float profile_top = rc.bottom - 3 * RAIL_IH - 6 + 2 * RAIL_IH;
+    /* DIPF, as every other anchor does — raw pixels put the menu low at >100%. */
+    float profile_top = DIPF(rc.bottom) - 3 * RAIL_IH - 6 + 2 * RAIL_IH;
     g_menu_x = RAIL_W + 8;
     g_menu_y = profile_top - menu_total_height();
     if (g_menu_y < 8) g_menu_y = 8;
@@ -16323,8 +16561,14 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         oc_client_list_sessions(g_client);
         modal_enter(hwnd, &g_sessions_open);
         break;
-    case 52:     /* clear */
+    case 65: {   /* Profile — your own card in the context pane */
+        const oc_model *m65 = model();
+        if (m65) { g_view = VIEW_HOME; profile_open(m65->user_id); }
+        break; }
+    case 52:     /* clear — and when invoked from the status dialog's own
+                  * footer, close the card: the clear IS the outcome. */
         oc_client_set_status(g_client, "", "", 0);
+        if (g_status_open) modal_finish(0);
         break;
     case 53: {   /* */
         oc_field f[2] = {
@@ -16860,6 +17104,21 @@ static void test_dump(const char *path) {
      * assertable rather than eyeballed — Cancel silently behaving like Save is
      * exactly the bug this design exists to prevent. */
     fprintf(f, "host=\"%s\"\n", g_host);
+    fprintf(f, "profilemenu open=%d sub=%d\n",
+            g_menu == MENU_PROFILE, g_sub_open != 0);
+    for (int i = 0; i < g_n_mirows && g_menu; i++)
+        fprintf(f, "  menurow cmd=%d kind=%d r=%.0f,%.0f,%.0f,%.0f\n",
+                g_mirows[i].cmd, g_mirows[i].kind,
+                g_menu_x, g_mirows[i].top, g_menu_x + g_menu_w, g_mirows[i].bot);
+    for (int i = 0; i < g_n_subrows && g_sub_open; i++)
+        fprintf(f, "  subrow cmd=%d r=%.0f,%.0f,%.0f,%.0f\n",
+                g_subrows[i].cmd, g_sub_panel.left, g_subrows[i].top,
+                g_sub_panel.right, g_subrows[i].bot);
+    for (int i = 0; i < g_n_selfcard_btn; i++)
+        fprintf(f, "  selfcardbtn cmd=%d r=%.0f,%.0f,%.0f,%.0f\n",
+                g_selfcard_btn[i].cmd,
+                g_selfcard_btn[i].r.left, g_selfcard_btn[i].r.top,
+                g_selfcard_btn[i].r.right, g_selfcard_btn[i].r.bottom);
     fprintf(f, "menu=%d more=%d lightbox=%llu\n", g_menu, g_more_open,
             (unsigned long long)g_lightbox);
     fprintf(f, "lastclick %s\n", g_modal_lastclick);
@@ -17075,6 +17334,8 @@ static void test_dump(const char *path) {
         if (m) for (size_t i = 0; i < m->n_users; i++)
             if (m->users[i].user_id != m->user_id && oc_model_dnd_of(m, m->users[i].user_id))
                 others++;
+        fprintf(f, "presence=%d\n",
+                m ? oc_model_presence_of((oc_model *)m, m->user_id) : 0);
         fprintf(f, "snoozed=%d snooze_until=%llu dnd_others=%d\n",
                 m ? oc_model_snoozed(m) : 0,
                 (unsigned long long)(m ? m->snooze_until_ms : 0), others);
@@ -18889,6 +19150,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             selection_update(mx, my);
             InvalidateRect(hwnd, NULL, FALSE);
         } else if (g_menu) {
+            /* Pointer inside the flyout: keep it and the parent pill lit — the
+             * recompute below would close it the instant the pointer crossed
+             * onto the second panel. Repaint for the flyout's own row hover. */
+            if (g_sub_open && in_rect(g_sub_panel, mx, my)) {
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else {
             /* Dropdown-menu hover. */
             int h = -1;
             for (int i = 0; i < g_n_mirows; i++)
@@ -18897,11 +19164,32 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     /* map row index back to item index for hover highlight */
                     h = i; break;
                 }
-            /* g_menu_hover indexes g_mi[]; approximate by matching the row's cmd. */
+            /* g_menu_hover indexes g_mi[]; approximate by matching the row's
+             * position among the RECORDABLE kinds (item, status row, sub). */
             int hi = -1;
             if (h >= 0) for (int i = 0, r = 0; i < g_n_mi; i++)
-                if (g_mi[i].kind == MK_ITEM) { if (r == h) { hi = i; break; } r++; }
+                if (g_mi[i].kind == MK_ITEM || g_mi[i].kind == MK_STATUSROW ||
+                    g_mi[i].kind == MK_SUB) {
+                    if (r == h) { hi = i; break; }
+                    r++;
+                }
+            /* Hovering the SUB row arms its flyout; hovering a DIFFERENT row
+             * closes it; leaving both panels leaves it standing (the flyout
+             * persists until another row takes over — the reference behavior). */
+            if (h >= 0) {
+                if (g_mirows[h].kind == MK_SUB) {
+                    if (g_sub_open != g_mirows[h].cmd) {
+                        g_sub_open = g_mirows[h].cmd;
+                        g_sub_anchor_top = g_mirows[h].top;
+                        InvalidateRect(hwnd, NULL, FALSE);
+                    }
+                } else if (g_sub_open) {
+                    submenu_close();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
+            }
             if (hi != g_menu_hover) { g_menu_hover = hi; InvalidateRect(hwnd, NULL, FALSE); }
+            }
         } else if (transcript_shell() && (float)mx >= RAIL_W &&
                    (float)mx < RAIL_W + SIDEBAR_W) {
             /* Reveal a header's kebab while the cursor is on its row, as Slack
@@ -19037,6 +19325,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == VK_ESCAPE && g_rp_mode != RP_MEMBERS) {
             rp_pop(); InvalidateRect(hwnd, NULL, FALSE); return 0;
         }
+        if (wp == VK_ESCAPE && g_sub_open) { submenu_close(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
         if (wp == VK_ESCAPE && g_menu) { g_menu = MENU_NONE; g_menu_hover = -1; InvalidateRect(hwnd, NULL, FALSE); return 0; }
         /* Esc and Enter both go to modal_key, so cancel-vs-commit is decided in
          * one place rather than by whichever handler saw the key first. */
@@ -19101,7 +19390,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         }
         case AT_CONV:      select_channel(arg); break;
-        case AT_MENU:      menu_dispatch(hwnd, (int)arg); break;
+        case AT_MENU:
+            /* An a11y invoke of a menu row acts like the click: the menu (and
+             * its flyout) close BEFORE the command runs, or the command's own
+             * surface opens underneath a stale panel. */
+            if (g_menu) { g_menu = MENU_NONE; g_menu_hover = -1; submenu_close(); }
+            menu_dispatch(hwnd, (int)arg);
+            break;
         case AT_SEND:      composer_send(); break;
         case AT_DTAB:      g_dtab = (int)arg; g_ovl_scroll = 0; break;
         case AT_ACTFILTER: {
