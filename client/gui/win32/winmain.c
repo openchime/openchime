@@ -2506,6 +2506,16 @@ static void draw_group_avatar(gfx *rt, const oc_model *m,
     g_micro->align = ST_ALIGN_CENTER;
 }
 
+/* Extra height the You slot claims when a status emoji is set: the emoji is
+ * a FULL-SIZE element stacked above the avatar — reserved space, never a
+ * badge squeezed into leftover pixels. 0 when there is no status emoji. */
+static float you_slot_extra(const oc_model *m) {
+    if (m) for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == m->user_id)
+            return m->users[i].status_emoji[0] ? 20.0f : 0.0f;
+    return 0.0f;
+}
+
 static void draw_rail(gfx *rt, const oc_model *m, float h) {
     fill(rt, rf(0, 0, RAIL_W, h), OC_COL_RAIL);
     g_n_navrows = 0;
@@ -2548,7 +2558,11 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
     }
 
     float y = UISW(64);                             /* below the workspace + divider */
-    float by = h - 2 * RAIL_IH - 6;                 /* bottom cluster top */
+    /* The You slot GROWS when a status emoji is set — the emoji gets real,
+     * reserved space above the avatar, and the destinations above fold a row
+     * earlier if the window is short, instead of anything clipping. */
+    float youext = you_slot_extra(m);
+    float by = h - 2 * RAIL_IH - 6 - youext;        /* bottom cluster top */
     /* How many rows — destinations plus the "More" that replaces the tail — fit
      * above the bottom cluster. Nothing may be placed past `by`, because New and
      * You are anchored there and do not move.
@@ -2596,21 +2610,28 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
     /* Profile: a colored initial avatar for the signed-in user. */
     {
         float py = by + RAIL_IH;
+        /* Everything keeps its familiar offsets from `base`; when a status
+         * emoji is set, base sits `youext` lower and the freed space above
+         * holds the emoji — a FULL glyph, nearly the avatar's size, stacked
+         * with a clear gap. Nothing overlaps and nothing is clipped: the slot
+         * was grown for it (see `by` above). */
+        float base = py + youext;
+        /* The hover wrap keeps UNIFORM 3px padding around the stack's true
+         * bounds: 3px above the emoji pill when one is set, 3px above the
+         * avatar when not — the resting state is exactly the original. */
         if (NAV_PROFILE == g_nav_hover)
-            fill_round_a(rt, rf(cx - 18, py + 9, cx + 18, py + 45), 10.0f, 0xFFFFFF, 0.08f);
+            fill_round_a(rt, rf(cx - 18, youext > 0 ? base - 11 : base + 9,
+                                cx + 18, base + 45), 10.0f, 0xFFFFFF, 0.08f);
         const char *nm = m ? oc_model_user_name(m, m->user_id) : "";
         /* A ROUNDED SQUARE, as the reference's rail avatars are (the switcher
-         * above is one already) — the circle read as a different product. The
-         * avatar sits low in its slot so the status emoji can FLOAT ABOVE it,
-         * a free-standing glyph on the rail overlapping the top edge, never a
-         * cutout over the face. */
-        rectf av2 = rf(cx - 15, py + 12, cx + 15, py + 42);
+         * above is one already) — the circle read as a different product. */
+        rectf av2 = rf(cx - 15, base + 12, cx + 15, base + 42);
         draw_user_avatar(rt, m, m ? m->user_id : 0, (nm && nm[0]) ? nm : "U",
                          av2, g_avatar, 1, 8.0f);
         /* Your own presence, notched into the bottom-right corner — the same
          * dot, from the same helper, that every person in the DM list and the
          * member pane carries. */
-        draw_presence_dot_dnd(rt, cx + 12, py + 39, 4.5f,
+        draw_presence_dot_dnd(rt, cx + 12, base + 39, 4.5f,
                               m ? oc_model_presence_of(m, m->user_id) : OC_PRESENCE_OFFLINE,
                               OC_COL_RAIL, m ? oc_model_snoozed(m) : 0);
         {
@@ -2621,19 +2642,30 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
                     break;
                 }
             if (se) {
-                /* Above the avatar, centred, overlapping its top edge by a
-                 * couple of pixels — the rail itself is the backdrop. */
-                draw_emoji_glyph(rt, se, rf(cx - 8, py - 2, cx + 8, py + 14));
+                /* The status pill, as the reference actually draws it: the
+                 * SAME WIDTH as the avatar, sitting FLUSH on the avatar's top
+                 * edge — no gap, one continuous column — rounded only at its
+                 * top corners. The rect extends under the avatar (drawn next),
+                 * which squares the seam for free. Third shade, always shown.
+                 * The glyph is the SMALL emoji format (draw_emoji_glyph paints
+                 * the 22px face at natural size and clips — the source of
+                 * every truncated attempt), centred in the visible band. */
+                rectf pill = rf(cx - 15, base - 8, cx + 15, base + 20);
+                fill_round_a(rt, pill, 8.0f, 0xFFFFFF, 0.24f);
+                draw_emoji_fmt(rt, se, rf(cx - 8, base - 6, cx + 8, base + 10),
+                               g_emoji_s);
             } else if (dnd_now(m)) {
-                /* Quiet hours' "z", only when no emoji claims the spot; the
-                 * snoozed state stays encoded in the presence dot either way. */
-                gfx_ellipse(rt, cx, py + 6, 6.6f, 6.6f, OC_COL_RAIL, 1.0f);
-                gfx_ellipse(rt, cx, py + 6, 5.2f, 5.2f, OC_COL_NOTICE, 1.0f);
-                draw_text(rt, "z", g_micro, rf(cx - 6, py, cx + 6, py + 12), OC_COL_RAIL);
+                /* Quiet hours' "z" BADGES the avatar's top-right corner, as it
+                 * always did — a lone dot floating in the stack's empty band
+                 * read as a defect. Only when no status emoji claims the top;
+                 * the snoozed state stays encoded in the presence dot. */
+                gfx_ellipse(rt, cx + 11, base + 16, 6.6f, 6.6f, OC_COL_RAIL, 1.0f);
+                gfx_ellipse(rt, cx + 11, base + 16, 5.2f, 5.2f, OC_COL_NOTICE, 1.0f);
+                draw_text(rt, "z", g_micro, rf(cx + 5, base + 10, cx + 17, base + 22), OC_COL_RAIL);
             }
         }
-        draw_text(rt, "You", g_micro, rf(0, py + 45, RAIL_W, py + 61), OC_COL_RAIL_ICON);
-        rail_hit(py, py + RAIL_IH, NAV_PROFILE);
+        draw_text(rt, "You", g_micro, rf(0, base + 45, RAIL_W, base + 61), OC_COL_RAIL_ICON);
+        rail_hit(py, py + RAIL_IH + youext, NAV_PROFILE);
     }
 }
 
@@ -16242,8 +16274,10 @@ static void open_profile_menu(HWND hwnd) {
     g_menu = MENU_PROFILE; g_menu_headerblock = 0; g_menu_hover = -1; g_menu_w = 248;
     submenu_close();
     RECT rc; GetClientRect(hwnd, &rc);
-    /* DIPF, as every other anchor does — raw pixels put the menu low at >100%. */
-    float profile_top = DIPF(rc.bottom) - 3 * RAIL_IH - 6 + 2 * RAIL_IH;
+    /* DIPF, as every other anchor does — raw pixels put the menu low at >100%.
+     * The You slot grows when a status emoji is stacked above the avatar, and
+     * the menu anchors to the slot's true top. */
+    float profile_top = DIPF(rc.bottom) - RAIL_IH - 6 - you_slot_extra(model());
     g_menu_x = RAIL_W + 8;
     g_menu_y = profile_top - menu_total_height();
     if (g_menu_y < 8) g_menu_y = 8;
