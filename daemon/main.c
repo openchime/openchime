@@ -439,12 +439,30 @@ int main(int argc, char **argv) {
     }
 
     /* Serve the binary protocol until a shutdown signal. */
-    oc_netloop_run(proto_port, &tls, db, &g_stop);
+    int served = oc_netloop_run(proto_port, &tls, db, &g_stop);
 
+    /* Tear down either way — a daemon that could not start still holds a
+     * database handle, a TLS context and two worker threads. */
     oc_push_stop(push);
     oc_unfurler_stop(unfurler);
     oc_tls_server_free(&tls);
     oc_dbwriter_stop(db);
+
+    /* THE EXIT CODE IS THE POINT. `oc_netloop_run` returning -1 means the
+     * daemon never served, and saying so is what changes the behaviour of
+     * whatever started it: under `Type=simple` a clean 0 is read as "ran and
+     * finished", so `Restart=on-failure` does not fire and a daemon that cannot
+     * open its blob store stops and stays stopped, with `systemctl status`
+     * showing no error at all.
+     *
+     * The health check makes it worse rather than catching it: `/healthz` binds
+     * and answers BEFORE this call, so a monitor polling it sees a healthy
+     * daemon for the moment before exit (ARCH-25). Neither the log nor the probe
+     * nor the exit code told the truth; this fixes the one that systemd reads. */
+    if (served < 0) {
+        fprintf(stderr, "openchimed: exiting: the server never started\n");
+        return 1;
+    }
     fprintf(stderr, "openchimed: shutdown complete\n");
     return 0;
 }
