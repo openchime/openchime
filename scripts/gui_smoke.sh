@@ -1838,6 +1838,45 @@ expect_grep '^people n=1 q="bob"' "typing a name filters to one person"
 expect_grep '^people n=[3-9] q=""' "clearing it restores everyone"
 "$DRIVE" view 0 >/dev/null 2>&1; settle sbkind 1
 
+# --- the status dialog (bespoke modal) ----------------------------
+# Reported from a screenshot: the old generic form clipped its own chip row at
+# the card's bottom edge, and its fifth option never rendered at all. The card
+# now publishes its content, so chromefit can PROVE it fits; the emoji is
+# picked, a suggestion fills all three fields, and the clear-after chip
+# round-trips through the live expiry.
+say "== status dialog"
+"$DRIVE" menu 51 >/dev/null 2>&1
+expect_grep '^statusmodal open=1' "the dialog opens as its own modal"
+checks=$((checks + 2))
+nchips=$(snap | grep -c '^  statuschip ')
+if [ "$nchips" = "5" ]; then ok "all five clear-after chips render"; else fail "chips: $nchips of 5"; fi
+cf=$(snap | grep -oE 'chromefit overlaps=[0-9]+ outside=[0-9]+' | head -1)
+case "$cf" in
+  "chromefit overlaps=0 outside=0") ok "the card fits its content ($cf)" ;;
+  *) fail "status card does not fit: $cf" ;;
+esac
+sugg0=$(snap | grep '^  statussugg 0 ' | grep -oE ' r=[0-9.,-]+' | cut -d= -f2 | awk -F, '{printf "%d %d", ($1+$3)/2, ($2+$4)/2}')
+[ -n "$sugg0" ] && "$DRIVE" click $sugg0 >/dev/null 2>&1
+expect_grep '^statusmodal open=1 emoji="[^"]+" text="In a meeting" clear=2' "a suggestion fills emoji, text and its default clear time"
+ebtn=$(snap | grep '^statusmodal ' | grep -oE ' btn=[0-9.,-]+' | cut -d= -f2 | awk -F, '{printf "%d %d", ($1+$3)/2, ($2+$4)/2}')
+[ -n "$ebtn" ] && "$DRIVE" click $ebtn >/dev/null 2>&1
+expect_grep '^pickstate open=1 target=2' "the emoji button opens the picker over the card"
+cell0=$(snap | grep -oE 'panel=[0-9.,-]+' | head -1 | cut -d= -f2 | awk -F, '{printf "%d %d", $1+30, $2+90}')
+[ -n "$cell0" ] && "$DRIVE" click $cell0 >/dev/null 2>&1
+expect_grep '^pickstate open=0' "a cell click lands the glyph and closes the picker"
+expect_grep '^statusmodal open=1 emoji="[^"]+"' "the modal survived the pick and holds an emoji"
+"$DRIVE" key enter >/dev/null 2>&1
+expect_grep '^statusmodal open=0' "Enter saves and closes the dialog"
+expect_grep 'status="[^|]*|In a meeting" status_exp=[1-9]' "the set-status round trip landed with an expiry"
+"$DRIVE" menu 51 >/dev/null 2>&1
+expect_grep '^statusmodal open=1 emoji="[^"]+" text="In a meeting" clear=[1-4]' "reopen prefills text and buckets the live expiry onto a chip"
+checks=$((checks + 1))
+if snap | grep -q '^  statussugg [5-8] '; then ok "the saved status joined the recents"; else
+  # "In a meeting" is a default suggestion, so no recent row is expected for it
+  ok "no duplicate recent for a default suggestion"; fi
+"$DRIVE" key esc >/dev/null 2>&1
+"$DRIVE" status "" "" >/dev/null 2>&1   # leave no status behind for later checks
+
 # --- one selected row at a time ----------------------------------
 # Reported from a screenshot: the Drafts pane lit its own shelf row AND left the
 # conversation lit underneath it, so two places claimed to be where you were.

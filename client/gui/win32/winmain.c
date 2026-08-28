@@ -1157,6 +1157,16 @@ enum { WSM_GO = 0, WSM_SIGNOUT, WSM_FORGET };
 
 /* Notification-prefs review + the shortcut sheet. */
 static int g_notify_open, g_keys_open;
+/* The status dialog (bespoke modal body, not the generic form): its emoji is
+ * PICKED, its text suggested, its clear-after chip prefilled from the live
+ * expiry. g_status_emoji and g_status_edit are declared beside the picker,
+ * which fills the one and refocuses the other. */
+static int   g_status_open;
+static int   g_status_clear;                 /* chip index 0..4 */
+static rectf g_status_emoji_btn, g_status_erect;
+static rectf g_status_chip_hits[5];
+static struct { char emoji[24]; char text[80]; uint8_t clear; rectf r; } g_status_suggs[9];
+static int   g_n_status_suggs;
 static struct { rectf r; uint64_t cid; uint8_t level; } g_notify_hits[128];
 /* The two Edit buttons on the notifications overlay (REQ-135). */
 static rectf g_notify_kw_btn, g_notify_vip_btn;
@@ -1245,6 +1255,12 @@ static HWND     g_srch;                 /* search-overlay query box (native EDIT
  * catalogue either way, so the reaction set is no longer six hardcoded glyphs. */
 static int      g_pick_open;
 static uint64_t g_pick_mid;
+/* Who the picked emoji is FOR. The mid alone could not say "the status
+ * dialog's emoji slot", and the target also decides where the panel anchors
+ * and whether it may float over a modal. */
+enum { PICK_COMPOSER = 0, PICK_REACT, PICK_STATUS };
+static int      g_pick_target = PICK_COMPOSER;
+static rectf    g_pick_anchor;          /* PICK_STATUS: the emoji button */
 static HWND     g_pick_edit;        /* native search box */
 static float    g_pick_scroll;
 static rectf g_pick_panel, g_pick_box;
@@ -2179,6 +2195,20 @@ static int  modal_open(void);          /* fwd — pointer_blocked() asks */
 static int pointer_blocked(void) {
     return g_menu != MENU_NONE || g_pick_open || g_pal_open || g_more_open ||
            g_tp_open || g_lightbox || modal_open() || g_view == VIEW_SIGNIN;
+}
+
+static int in_rect(rectf r, int x, int y);   /* fwd */
+/* ONE chip, everywhere. Accent when on; a hover fill when the pointer rests
+ * on it — the scene repaints every tick, so paint-time hover costs nothing and
+ * no site needs a tracker; label centred in the FULL rect (the per-site +4
+ * top insets seated every chip label low once the metrics were pinned). */
+static void draw_chip_r(gfx *rt, rectf b, const char *label, int on) {
+    int hover = !on && in_rect(b, g_mouse_x, g_mouse_y);
+    fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : hover ? OC_COL_HOVER : OC_COL_INPUT);
+    if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
+    g_meta->align = ST_ALIGN_CENTER;
+    draw_text(rt, label, g_meta, b, on ? 0xFFFFFF : hover ? OC_COL_TEXT : OC_COL_MUTED);
+    g_meta->align = ST_ALIGN_LEFT;
 }
 
 /* Write the composer's contents to the daemon as `cid`'s draft — but only if
@@ -4252,11 +4282,7 @@ static void draw_audit(gfx *rt, const oc_model *m, rectf reg, int embedded) {
         float fw = text_width(FAMS[f], g_meta) + 22;
         rectf b = rf(fx, body.top + 6, fx + fw, body.top + 30);
         int on = (g_audit_family == f);
-        fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
-        if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
-        g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, FAMS[f], g_meta, b, on ? 0xFFFFFF : OC_COL_MUTED);
-        g_meta->align = ST_ALIGN_LEFT;
+        draw_chip_r(rt, b, FAMS[f], on);
         if (g_n_audit_filters < 5) g_audit_filters[g_n_audit_filters++] = b;
         fx += fw + 6;
     }
@@ -4528,11 +4554,7 @@ static float notify_rowh(rectf body) {
 static void notify_chip_one(gfx *rt, rectf b, int L,
                             uint64_t cid, uint8_t level) {
     int on = (level == L);
-    fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
-    if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
-    g_meta->align = ST_ALIGN_CENTER;
-    draw_text(rt, NOTIFY_LEVELS[L], g_meta, b, on ? 0xFFFFFF : OC_COL_MUTED);
-    g_meta->align = ST_ALIGN_LEFT;
+    draw_chip_r(rt, b, NOTIFY_LEVELS[L], on);
     if (g_n_notify_hits < 128) {
         g_notify_hits[g_n_notify_hits].r = b;
         g_notify_hits[g_n_notify_hits].cid = cid;
@@ -4711,11 +4733,7 @@ static void draw_notify_prefs(gfx *rt, const oc_model *m, rectf reg) {
             }
             rectf b = rf(mx, my, mx + bw, my + 26);
             int on = (m->dnd_mode == i);
-            fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
-            if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
-            g_meta->align = ST_ALIGN_CENTER;
-            draw_text(rt, MODES[i], g_meta, b, on ? 0xFFFFFF : OC_COL_MUTED);
-            g_meta->align = ST_ALIGN_LEFT;
+            draw_chip_r(rt, b, MODES[i], on);
             g_sched_mode_hit[i] = b;
             mx = b.right + 8;
         }
@@ -5459,10 +5477,12 @@ static void files_index(const oc_model *m) {
 static rectf chip(gfx *rt, float x, float y, const char *label,
                         int on, uint32_t on_col) {
     rectf b = rf(x, y, x + text_width(label, g_meta) + 22, y + 24);
-    fill_round(rt, b, 6.0f, on ? on_col : OC_COL_INPUT);
+    int hover = !on && in_rect(b, g_mouse_x, g_mouse_y);
+    fill_round(rt, b, 6.0f, on ? on_col : hover ? OC_COL_HOVER : OC_COL_INPUT);
     if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
     g_meta->align = ST_ALIGN_CENTER;
-    draw_text(rt, label, g_meta, b, on ? 0xFFFFFF : OC_COL_MUTED);
+    draw_text(rt, label, g_meta, b,
+              on ? 0xFFFFFF : hover ? OC_COL_TEXT : OC_COL_MUTED);
     g_meta->align = ST_ALIGN_LEFT;
     return b;
 }
@@ -5475,10 +5495,12 @@ static rectf drop_btn(gfx *rt, float right, float y, const char *label,
     char txt[64];
     snprintf(txt, sizeof txt, "%s \xE2\x96\xBE", label);
     rectf b = rf(right - (text_width(txt, g_meta) + 22), y, right, y + 24);
-    fill_round(rt, b, 6.0f, OC_COL_INPUT);
+    int hover = in_rect(b, g_mouse_x, g_mouse_y);
+    fill_round(rt, b, 6.0f, hover ? OC_COL_HOVER : OC_COL_INPUT);
     stroke_round(rt, b, 6.0f, active ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
     g_meta->align = ST_ALIGN_CENTER;
-    draw_text(rt, txt, g_meta, b, active ? OC_COL_TEXT : OC_COL_MUTED);
+    draw_text(rt, txt, g_meta, b,
+              (active || hover) ? OC_COL_TEXT : OC_COL_MUTED);
     g_meta->align = ST_ALIGN_LEFT;
     return b;
 }
@@ -5773,11 +5795,7 @@ static float pref_row(gfx *rt, rectf body, float y, int row,
         float w = text_width(opts[i], g_meta) + 26;
         rectf b = rf(bx - w, y + 2, bx, y + 28);
         int on = (i == cur);
-        fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
-        if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
-        g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, opts[i], g_meta, b, on ? 0xFFFFFF : OC_COL_MUTED);
-        g_meta->align = ST_ALIGN_LEFT;
+        draw_chip_r(rt, b, opts[i], on);
         if (g_n_pref_hits < 24) {
             g_pref_hits[g_n_pref_hits].r = b;
             g_pref_hits[g_n_pref_hits].row = row;
@@ -5880,11 +5898,7 @@ static void draw_prefs(gfx *rt, rectf reg) {
             if (mx > reg.left && mx + bw > reg.right) { mx = reg.left; my += 32; }
             rectf r = rf(mx, my, mx + bw, my + 28);
             int on = (i == g_pref_cat);
-            fill_round(rt, r, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
-            if (!on) stroke_round(rt, r, 6.0f, OC_COL_BORDER, 1.0f);
-            g_meta->align = ST_ALIGN_CENTER;
-            draw_text(rt, PC_NAME[i], g_meta, r, on ? 0xFFFFFF : OC_COL_MUTED);
-            g_meta->align = ST_ALIGN_LEFT;
+            draw_chip_r(rt, r, PC_NAME[i], on);
             g_pref_cats[i] = r;
             mx = r.right + 6;
             rowbot = r.bottom;
@@ -6934,15 +6948,29 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
 
     float pw = 360; if (pw > w - 40) pw = w - 40;
     float ph = 300; if (ph > h - HEADER_H - g_composer_h - 20) ph = h - HEADER_H - g_composer_h - 20;
-    float px = x0 + 20, py = h - g_composer_h - ph - 6;
-    if (py < HEADER_H + 6) py = HEADER_H + 6;
+    float px, py;
+    if (g_pick_target == PICK_STATUS) {
+        /* Anchored to the status dialog's emoji button, like the time picker
+         * to its field: below the button, flipped above when the window's
+         * bottom edge would clip it, clamped inside the window either way. */
+        px = g_pick_anchor.left;
+        if (px + pw > x0 + w - 8) px = x0 + w - 8 - pw;
+        if (px < x0 + 8) px = x0 + 8;
+        py = g_pick_anchor.bottom + 6;
+        if (py + ph > h - 8) py = g_pick_anchor.top - ph - 6;
+        if (py < 8) py = 8;
+    } else {
+        px = x0 + 20; py = h - g_composer_h - ph - 6;
+        if (py < HEADER_H + 6) py = HEADER_H + 6;
+    }
     g_pick_panel = rf(px, py, px + pw, py + ph);
 
     fill_round(rt, rf(px + 2, py + 4, px + pw + 2, py + ph + 4), 10.0f, OC_COL_RAIL);
     fill_round(rt, g_pick_panel, 10.0f, OC_COL_INPUT);
     stroke_round(rt, g_pick_panel, 10.0f, OC_COL_BORDER, 1.0f);
 
-    draw_text(rt, g_pick_mid ? "Add reaction" : "Emoji", g_title,
+    draw_text(rt, g_pick_target == PICK_STATUS ? "Status emoji"
+                : g_pick_mid ? "Add reaction" : "Emoji", g_title,
               rf(px + 14, py + 8, px + pw - 14, py + 30), OC_COL_TEXT);
 
     g_pick_box = rf(px + 12, py + 32, px + pw - 12, py + 62);
@@ -7090,6 +7118,7 @@ static int  reaction_is_mine(const oc_msg *msg, const char *emoji);   /* fwd */
 /* Open the picker for the composer (mid == 0) or for reacting to a message. */
 static void picker_open(HWND hwnd, uint64_t mid) {
     g_pick_open = 1; g_pick_mid = mid; g_pick_scroll = 0;
+    g_pick_target = mid ? PICK_REACT : PICK_COMPOSER;
     ac_close();
     if (g_pick_edit) {
         SetWindowTextW(g_pick_edit, L"");
@@ -7099,16 +7128,42 @@ static void picker_open(HWND hwnd, uint64_t mid) {
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
+/* The status dialog's variant: same picker, anchored to the emoji button and
+ * allowed to float over the card that opened it (the time-picker pattern). */
+static void picker_open_status(HWND hwnd, rectf anchor) {
+    g_pick_open = 1; g_pick_mid = 0; g_pick_scroll = 0;
+    g_pick_target = PICK_STATUS;
+    g_pick_anchor = anchor;
+    if (g_pick_edit) {
+        SetWindowTextW(g_pick_edit, L"");
+        ShowWindow(g_pick_edit, SW_SHOW);
+        SetFocus(g_pick_edit);
+    }
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static HWND g_status_edit;                /* fwd-declared here: picker_close
+                                           * hands focus back to it */
 static void picker_close(HWND hwnd) {
+    int was_status = g_pick_target == PICK_STATUS;
     g_pick_open = 0; g_pick_mid = 0;
+    g_pick_target = PICK_COMPOSER;
     if (g_pick_edit) ShowWindow(g_pick_edit, SW_HIDE);
-    ed_focus(hwnd);
+    /* Focus goes back to whoever the picker was working for. */
+    if (was_status) { if (g_status_edit) SetFocus(g_status_edit); }
+    else ed_focus(hwnd);
     if (hwnd) InvalidateRect(hwnd, NULL, FALSE);
 }
 
 /* Apply the chosen emoji to whichever caller opened the picker. */
+static char g_status_emoji[24];           /* fwd-declared: the picker fills it */
 static void picker_choose(HWND hwnd, const char *emoji) {
     if (!emoji || !g_client) { picker_close(hwnd); return; }
+    if (g_pick_target == PICK_STATUS) {
+        snprintf(g_status_emoji, sizeof g_status_emoji, "%s", emoji);
+        picker_close(hwnd);
+        return;
+    }
     if (g_pick_mid) {
         const oc_model *m = model();
         const oc_channel *c = m ? oc_model_channel((oc_model *)m, g_sel) : NULL;
@@ -7128,6 +7183,307 @@ static void picker_choose(HWND hwnd, const char *emoji) {
         }
     }
     picker_close(hwnd);
+}
+
+
+/* ---- the status dialog (bespoke modal body) ------------------------------
+ * Emoji is PICKED (the picker floats over the card, time-picker style), text
+ * is typed or taken from a suggestion, and "Clear after" is prefilled from
+ * the live expiry. The generic form stays for forms; this is not one. */
+
+static WNDPROC g_status_prev;
+static HFONT form_font(void);              /* fwd — the status field shares it */
+/* The status field's own proc. NOT form_edit_proc: that one forwards to the
+ * FORM's saved wndproc (g_form_edit_prev), which is unset unless a generic
+ * form ran first — subclassing this edit with it sent every message of a
+ * visible control into a NULL proc, and the paint/caret traffic of a focused
+ * EDIT became a spin that starved the timer. Same keys, own chain. */
+static void modal_finish(int save);            /* fwd */
+static int  modal_open(void);                  /* fwd */
+static LRESULT CALLBACK status_edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_KEYDOWN && modal_open()) {
+        if (wp == VK_RETURN) { modal_finish(1); return 0; }
+        if (wp == VK_ESCAPE) {
+            /* Picker first, card second — the dropdown rule. */
+            if (g_pick_open && g_pick_target == PICK_STATUS)
+                picker_close(GetParent(hwnd));
+            else
+                modal_finish(0);
+            return 0;
+        }
+    }
+    if (msg == WM_CHAR && (wp == '\r' || wp == 27)) return 0;   /* no beep */
+    return CallWindowProcW(g_status_prev, hwnd, msg, wp, lp);
+}
+
+#define STATUS_SETTING_KEY "status.recents"
+#define STATUS_RECENTS_MAX 4
+static struct { char emoji[24]; char text[80]; uint8_t clear; } g_status_recents[STATUS_RECENTS_MAX];
+static int g_n_status_recents;
+
+/* emoji,clear,text;… — text last so only it needs escaping (\\ \; \,). */
+static void status_recents_load(const oc_model *m) {
+    g_n_status_recents = 0;
+    const char *v = m ? oc_model_setting((oc_model *)m, STATUS_SETTING_KEY) : NULL;
+    if (!v) return;
+    while (*v && g_n_status_recents < STATUS_RECENTS_MAX) {
+        char emo[24] = "", txt[80] = ""; int clear = 0;
+        size_t k = 0;
+        while (*v && *v != ',' && k + 1 < sizeof emo) emo[k++] = *v++;
+        emo[k] = 0;
+        if (*v == ',') v++;
+        clear = atoi(v);
+        while (*v && *v != ',') v++;
+        if (*v == ',') v++;
+        k = 0;
+        while (*v && *v != ';' && k + 1 < sizeof txt) {
+            char c = *v++;
+            if (c == '\\' && *v) c = *v++;
+            txt[k++] = c;
+        }
+        txt[k] = 0;
+        if (*v == ';') v++;
+        if (!txt[0]) continue;
+        snprintf(g_status_recents[g_n_status_recents].emoji,
+                 sizeof g_status_recents[0].emoji, "%s", emo);
+        snprintf(g_status_recents[g_n_status_recents].text,
+                 sizeof g_status_recents[0].text, "%s", txt);
+        g_status_recents[g_n_status_recents].clear = (uint8_t)(clear >= 0 && clear <= 4 ? clear : 0);
+        g_n_status_recents++;
+    }
+}
+
+static void status_recents_save(void) {
+    char enc[512]; size_t o = 0;
+    for (int i = 0; i < g_n_status_recents && o + 120 < sizeof enc; i++) {
+        o += (size_t)snprintf(enc + o, sizeof enc - o, "%s,%d,",
+                              g_status_recents[i].emoji, g_status_recents[i].clear);
+        for (const char *t = g_status_recents[i].text; *t && o + 3 < sizeof enc; t++) {
+            if (*t == '\\' || *t == ';' || *t == ',') enc[o++] = '\\';
+            enc[o++] = *t;
+        }
+        enc[o++] = ';';
+    }
+    enc[o] = 0;
+    if (g_client) oc_client_set_setting(g_client, STATUS_SETTING_KEY, enc);
+}
+
+static void status_recents_push(const char *emoji, const char *text, int clear) {
+    if (!text || !text[0]) return;
+    /* MRU with case-insensitive dedupe on the text. */
+    int found = -1;
+    for (int i = 0; i < g_n_status_recents; i++)
+        if (!_stricmp(g_status_recents[i].text, text)) { found = i; break; }
+    if (found < 0) {
+        if (g_n_status_recents < STATUS_RECENTS_MAX) g_n_status_recents++;
+        found = g_n_status_recents - 1;
+    }
+    for (int i = found; i > 0; i--) g_status_recents[i] = g_status_recents[i - 1];
+    snprintf(g_status_recents[0].emoji, sizeof g_status_recents[0].emoji, "%s", emoji ? emoji : "");
+    snprintf(g_status_recents[0].text,  sizeof g_status_recents[0].text,  "%s", text);
+    g_status_recents[0].clear = (uint8_t)clear;
+    status_recents_save();
+}
+
+/* The suggestion list: five defaults (the reference's), then recents that do
+ * not repeat a default. Each row carries its own default clear chip. */
+static void status_suggs_build(void) {
+    static const struct { const char *emoji, *text; uint8_t clear; } DEF[5] = {
+        { "\xF0\x9F\x97\x93\xEF\xB8\x8F", "In a meeting",     2 },  /* 1 hour  */
+        { "\xF0\x9F\x9A\x8C",                "Commuting",        1 },  /* 30 min  */
+        { "\xF0\x9F\xA4\x92",                "Out sick",         4 },  /* Today   */
+        { "\xF0\x9F\x8C\xB4",                "Vacationing",      0 },  /* Never   */
+        { "\xF0\x9F\x8F\xA0",                "Working remotely", 4 },  /* Today   */
+    };
+    g_n_status_suggs = 0;
+    for (int i = 0; i < 5; i++) {
+        snprintf(g_status_suggs[g_n_status_suggs].emoji, sizeof g_status_suggs[0].emoji, "%s", DEF[i].emoji);
+        snprintf(g_status_suggs[g_n_status_suggs].text,  sizeof g_status_suggs[0].text,  "%s", DEF[i].text);
+        g_status_suggs[g_n_status_suggs].clear = DEF[i].clear;
+        g_n_status_suggs++;
+    }
+    for (int i = 0; i < g_n_status_recents &&
+                    g_n_status_suggs < (int)(sizeof g_status_suggs / sizeof g_status_suggs[0]); i++) {
+        int dup = 0;
+        for (int k = 0; k < 5; k++)
+            if (!_stricmp(g_status_recents[i].text, g_status_suggs[k].text)) { dup = 1; break; }
+        if (dup) continue;
+        snprintf(g_status_suggs[g_n_status_suggs].emoji, sizeof g_status_suggs[0].emoji, "%s", g_status_recents[i].emoji);
+        snprintf(g_status_suggs[g_n_status_suggs].text,  sizeof g_status_suggs[0].text,  "%s", g_status_recents[i].text);
+        g_status_suggs[g_n_status_suggs].clear = g_status_recents[i].clear;
+        g_n_status_suggs++;
+    }
+}
+
+static const char *STATUS_CLEARS[5] = { "Never", "30 minutes", "1 hour", "4 hours", "Today" };
+
+/* Chip index -> absolute expiry, the arithmetic the old form used verbatim. */
+static uint64_t status_expiry_ms(int pick) {
+    static const uint64_t MINS[5] = { 0, 30, 60, 240, 0 };
+    if (pick >= 1 && pick <= 3) return (uint64_t)time(NULL) * 1000ull + MINS[pick] * 60000ull;
+    if (pick == 4) {
+        time_t now = time(NULL); struct tm tv;
+        if (oc_localtime_r(&now, &tv)) {
+            tv.tm_hour = 23; tv.tm_min = 59; tv.tm_sec = 59;
+            return (uint64_t)mktime(&tv) * 1000ull;
+        }
+    }
+    return 0;
+}
+
+static void status_commit(void) {
+    char txt[128] = "";
+    if (g_status_edit) {
+        WCHAR w[128]; GetWindowTextW(g_status_edit, w, 128);
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, txt, sizeof txt, NULL, NULL);
+    }
+    if (g_client)
+        oc_client_set_status(g_client, g_status_emoji, txt, status_expiry_ms(g_status_clear));
+    if (txt[0]) status_recents_push(g_status_emoji, txt, g_status_clear);
+}
+
+static void status_open(HWND hwnd) {
+    const oc_model *sm = model();
+    g_status_emoji[0] = 0;
+    g_status_clear = 0;
+    char cur[80] = "";
+    if (sm) for (size_t i = 0; i < sm->n_users; i++)
+        if (sm->users[i].user_id == sm->user_id) {
+            snprintf(g_status_emoji, sizeof g_status_emoji, "%s", sm->users[i].status_emoji);
+            snprintf(cur, sizeof cur, "%s", sm->users[i].status_text);
+            /* Bucket the live expiry back onto a chip — the old form always
+             * reopened on "Never" whatever was actually set. */
+            if (sm->users[i].status_expires) {
+                uint64_t now = (uint64_t)time(NULL) * 1000ull;
+                uint64_t rem = sm->users[i].status_expires > now
+                             ? sm->users[i].status_expires - now : 0;
+                g_status_clear = rem <= 45ull * 60000ull ? 1
+                               : rem <= 120ull * 60000ull ? 2
+                               : rem <= 360ull * 60000ull ? 3 : 4;
+            }
+            break;
+        }
+    status_recents_load(sm);
+    status_suggs_build();
+    if (!g_status_edit) {
+        g_status_edit = CreateWindowExW(0, L"EDIT", L"",
+            WS_CHILD | ES_AUTOHSCROLL, 0, 0, 10, 10, hwnd,
+            (HMENU)(INT_PTR)0xF7, GetModuleHandleW(NULL), NULL);
+        if (g_status_edit) {
+            SendMessageW(g_status_edit, EM_SETCUEBANNER, TRUE,
+                         (LPARAM)L"What are you up to?");
+            g_status_prev = (WNDPROC)SetWindowLongPtrW(g_status_edit, GWLP_WNDPROC,
+                                                       (LONG_PTR)status_edit_proc);
+        }
+    }
+    /* The FORM's font, at the current text scale, re-applied on every open —
+     * the stock DEFAULT_GUI_FONT is the tiny legacy shell face and sat both
+     * small and high in the 30px box. */
+    if (g_status_edit) {
+        HFONT ff = form_font();
+        SendMessageW(g_status_edit, WM_SETFONT,
+                     ff ? (WPARAM)ff : (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    }
+    if (g_status_edit) {
+        WCHAR w[128];
+        MultiByteToWideChar(CP_UTF8, 0, cur, -1, w, 128);
+        SetWindowTextW(g_status_edit, w);
+    }
+    modal_enter(hwnd, &g_status_open);   /* paints once; rects exist after */
+    if (g_status_edit) { ShowWindow(g_status_edit, SW_SHOW); SetFocus(g_status_edit); }
+}
+
+static void draw_status_body(gfx *rt, rectf body) {
+    float y = body.top + 4;
+    /* Emoji button + the text box beside it. */
+    g_status_emoji_btn = rf(body.left, y, body.left + 34, y + 34);
+    int eb_hover = in_rect(g_status_emoji_btn, (float)g_mouse_x, (float)g_mouse_y);
+    fill_round(rt, g_status_emoji_btn, 6.0f, OC_COL_INPUT);
+    stroke_round(rt, g_status_emoji_btn, 6.0f,
+                 (g_pick_open && g_pick_target == PICK_STATUS) ? OC_COL_ACCENT
+                 : eb_hover ? OC_COL_ACCENT : OC_COL_BORDER,
+                 eb_hover ? 1.5f : 1.0f);
+    if (g_status_emoji[0])
+        draw_emoji_glyph(rt, g_status_emoji,
+                         rf(g_status_emoji_btn.left + 4, g_status_emoji_btn.top + 4,
+                            g_status_emoji_btn.right - 4, g_status_emoji_btn.bottom - 4));
+    else
+        draw_lucide(rt, OC_ICON_SMILE,
+                    rf(g_status_emoji_btn.left + 8, g_status_emoji_btn.top + 8,
+                       g_status_emoji_btn.right - 8, g_status_emoji_btn.bottom - 8),
+                    OC_COL_MUTED);
+    g_status_erect = rf(body.left + 42, y + 2, body.right, y + 32);
+    fill_round(rt, g_status_erect, 6.0f, OC_COL_INPUT);
+    {
+        int focused = (g_status_edit && GetFocus() == g_status_edit);
+        stroke_round(rt, g_status_erect, 6.0f,
+                     focused ? OC_COL_ACCENT : OC_COL_BORDER, focused ? 1.5f : 1.0f);
+    }
+    y += UIS(46.0f);
+
+    draw_text(rt, "Suggestions", g_ui_b, rf(body.left, y, body.right, y + 20), OC_COL_TEXT);
+    y += UIS(24.0f);
+    for (int i = 0; i < g_n_status_suggs; i++) {
+        rectf row = rf(body.left, y, body.right, y + UIS(32.0f));
+        g_status_suggs[i].r = row;
+        if (in_rect(row, (float)g_mouse_x, (float)g_mouse_y))
+            fill_round(rt, row, 6.0f, OC_COL_HOVER);
+        draw_emoji_glyph(rt, g_status_suggs[i].emoji,
+                         rf(row.left + 6, row.top + 4, row.left + 30, row.top + 28));
+        draw_text(rt, g_status_suggs[i].text, g_ui,
+                  rf(row.left + 38, row.top, row.right - 100, row.bottom), OC_COL_TEXT);
+        g_meta->align = ST_ALIGN_RIGHT;
+        draw_text(rt, STATUS_CLEARS[g_status_suggs[i].clear], g_meta,
+                  baseline_align(rf(row.left + 38, row.top, row.right - 100, row.bottom),
+                                 g_ui, g_meta, row.right - 96, row.right - 8),
+                  OC_COL_FAINT);
+        g_meta->align = ST_ALIGN_LEFT;
+        y += UIS(32.0f);
+    }
+    y += UIS(10.0f);
+
+    draw_text(rt, "Clear after", g_ui_b, rf(body.left, y, body.right, y + 20), OC_COL_TEXT);
+    {
+        float bx = body.left, cy = y + UIS(24.0f);
+        for (int k = 0; k < 5; k++) {
+            float bw = text_width(STATUS_CLEARS[k], g_meta) + 24;
+            if (bx > body.left && bx + bw > body.right) { bx = body.left; cy += UIS(34.0f); }
+            rectf b = rf(bx, cy, bx + bw, cy + 28);
+            int on = (k == g_status_clear);
+            draw_chip_r(rt, b, STATUS_CLEARS[k], on);
+            g_status_chip_hits[k] = b;
+            bx = b.right + 8;
+        }
+    }
+}
+
+
+/* The picker's click handling, one body for both homes (over the composer,
+ * over the status card). Returns 1 always — a click during an open picker is
+ * the picker's to consume, wherever it lands. */
+static void prefs_save(void);   /* fwd */
+static int picker_click(HWND hwnd, int x, int y) {
+    if (in_rect(g_pick_panel, (float)x, (float)y)) {
+        /* A tone is a preference, so choosing one re-renders the picker
+         * and stays open — it is a change to what you are looking at, not
+         * a selection. Saved immediately: it survives to the next window
+         * and the next device through the settings bucket. */
+        for (int i = 0; i < g_n_pick_tones; i++)
+            if (in_rect(g_pick_tones[i].r, (float)x, (float)y)) {
+                g_skin_tone = g_pick_tones[i].tone;
+                prefs_save();
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 1;
+            }
+        for (int i = 0; i < g_n_pick_cells; i++)
+            if (in_rect(g_pick_cells[i].r, (float)x, (float)y)) {
+                picker_choose(hwnd, g_pick_cells[i].emoji);
+                return 1;
+            }
+        return 1;   /* inside the panel but not on a cell: stay open */
+    }
+    picker_close(hwnd);
+    return 1;
 }
 
 static void composer_cue(const oc_model *m, char *out, size_t cap);   /* fwd */
@@ -7449,7 +7805,8 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
  * your place in the conversation. */
 static int modal_open(void) {
     return g_prefs_open || g_keys_open || g_wsmgr_open || g_notify_open ||
-           g_browse_open || g_confirm_open || g_sessions_open || g_form_open;
+           g_browse_open || g_confirm_open || g_sessions_open || g_form_open ||
+           g_status_open;
 }
 
 static rectf g_modal_card;
@@ -7582,6 +7939,10 @@ typedef struct {
     void      (*snapshot)(void);            /* NULL when the modal is not a form */
     void      (*restore)(void);
     void      (*commit)(void);
+    float       want_h;                     /* content-measured height in DIPs;
+                                             * 0 = the size class's default. A
+                                             * REQUEST, clamped to the window —
+                                             * never a floor. */
 } oc_modal_spec;
 
 /* Frame-owned hit-boxes, valid after a paint. */
@@ -7616,7 +7977,11 @@ static rectf modal_frame(gfx *rt, const oc_modal_spec *s,
      * clipped — the overflow painted over the shell behind the card, with the
      * footer buttons underneath its own rows. */
     float want_w = UIS((s->size == MODAL_LG) ? 720.0f : 460.0f);
-    float want_h = UIS((s->size == MODAL_LG) ? 620.0f : 300.0f);
+    /* Content-measured when the spec says so: the two-value enum gave a
+     * three-field form a 300px card whatever its rows added up to, and the
+     * status form's chip row was CLIPPED at the card's bottom edge. */
+    float want_h = s->want_h > 0 ? UIS(s->want_h)
+                                 : UIS((s->size == MODAL_LG) ? 620.0f : 300.0f);
     float cw = W - 96, ch = H - 96;
     if (cw > want_w) cw = want_w;
     if (ch > want_h) ch = want_h;
@@ -7766,9 +8131,28 @@ static const oc_modal_spec *modal_current(void);
  * the size of a three-field sign-up. Checks and choices are drawn with the same
  * chips the rest of the app uses rather than native BUTTONs: a radio button is
  * fine, but two idioms on one card is what this whole item was about. */
-static float form_rowh(const oc_field *f) {
+static float form_rowh(const oc_field *f, float w) {
     if (f->kind == FF_CHECK)  return UIS(34);
-    if (f->kind == FF_CHOICE) return UIS(54);
+    if (f->kind == FF_CHOICE) {
+        /* Measured, and wrapped like the painter wraps: a five-option row at
+         * Large text does not fit one line, and a height that ignores that is
+         * how the last chips fell off the card. */
+        int rows = 1;
+        float bx = 0;
+        const char *p2 = f->hint ? f->hint : "";
+        int k = 0;
+        while (*p2 && k < 8) {
+            char opt[48]; int oi = 0;
+            while (*p2 && *p2 != '|' && oi + 1 < (int)sizeof opt) opt[oi++] = *p2++;
+            opt[oi] = '\0';
+            if (*p2 == '|') p2++;
+            float bw = text_width(opt, g_meta) + 24;
+            if (bx > 0 && bx + bw > w) { rows++; bx = 0; }
+            bx += bw + 8;
+            k++;
+        }
+        return UIS(24.0f) + (float)rows * UIS(34.0f) + UIS(2.0f);
+    }
     return (f->hint && f->hint[0]) ? UIS(74.0f) : UIS(54.0f);
 }
 
@@ -7778,7 +8162,7 @@ static void draw_form(gfx *rt, rectf body) {
     float y = body.top + 4;
     for (int i = 0; i < g_form_n; i++) {
         const oc_field *f = &g_form_f[i];
-        float rh = form_rowh(f);
+        float rh = form_rowh(f, body.right - body.left);
         if (f->kind == FF_CHECK) {
             rectf box = rf(body.left, y + 4, body.left + 20, y + 24);
             int on = atoi(f->value) != 0;
@@ -7800,21 +8184,20 @@ static void draw_form(gfx *rt, rectf body) {
         } else if (f->kind == FF_CHOICE) {
             draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + 20), OC_COL_TEXT);
             int cur = atoi(f->value), k = 0;
-            float bx = body.left;
+            float bx = body.left, cy = y + 24;
             const char *p2 = f->hint ? f->hint : "";
-            while (*p2 && k < 4) {
+            while (*p2 && k < 8) {
                 char opt[48]; int oi = 0;
                 while (*p2 && *p2 != '|' && oi + 1 < (int)sizeof opt) opt[oi++] = *p2++;
                 opt[oi] = '\0';
                 if (*p2 == '|') p2++;
                 float bw = text_width(opt, g_meta) + 24;
-                rectf b = rf(bx, y + 24, bx + bw, y + 52);
+                /* Wrap, exactly as form_rowh counted: a chip that would cross
+                 * the body edge starts a new line instead of vanishing. */
+                if (bx > body.left && bx + bw > body.right) { bx = body.left; cy += UIS(34.0f); }
+                rectf b = rf(bx, cy, bx + bw, cy + 28);
                 int on = (k == cur);
-                fill_round(rt, b, 6.0f, on ? OC_COL_ACCENT : OC_COL_INPUT);
-                if (!on) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
-                g_meta->align = ST_ALIGN_CENTER;
-                draw_text(rt, opt, g_meta, rf(b.left, b.top + 4, b.right, b.bottom), on ? 0xFFFFFF : OC_COL_MUTED);
-                g_meta->align = ST_ALIGN_LEFT;
+                draw_chip_r(rt, b, opt, on);
                 if (g_n_form_hits < (int)(sizeof g_form_hits / sizeof g_form_hits[0])) {
                     g_form_hits[g_n_form_hits].r = b;
                     g_form_hits[g_n_form_hits].field = i;
@@ -7893,6 +8276,7 @@ static void draw_modal(gfx *rt, const oc_model *m, float W, float H) {
     else if (g_browse_open) draw_browse(rt, m, body);
     else if (g_confirm_open) draw_confirm(rt, body);
     else if (g_sessions_open) draw_sessions(rt, m, body);
+    else if (g_status_open) draw_status_body(rt, body);
     else if (g_form_open)   draw_form(rt, body);
     gfx_clip_pop(rt);
 }
@@ -7969,14 +8353,41 @@ static void prefs_restore(void) {
  * is the levels as they were when the sheet opened, and restore re-sends only the
  * rows that differ — silence for the untouched ones. */
 
+/* Content-measured card height for the status body, in unscaled DIPs. */
+static float status_want_h(void) {
+    float rows = UIS(4.0f) + UIS(46.0f) + UIS(24.0f)
+               + (float)g_n_status_suggs * UIS(32.0f)
+               + UIS(10.0f) + UIS(24.0f) + UIS(34.0f) + UIS(8.0f);
+    return (MODAL_TITLE_H + rows + MODAL_FOOT_H + UIS(16.0f)) / g_text_scale;
+}
+
 static const oc_modal_spec *modal_current(void) {
     static oc_modal_spec sp;
     memset(&sp, 0, sizeof sp);
-    if (g_form_open) {
-        /* A form is the one modal whose height depends on its content, so the size
-         * is chosen from the field count rather than fixed per surface. */
+    if (g_status_open) {
+        sp.title = "Set a status";
+        sp.size = MODAL_SM;
+        sp.want_h = status_want_h();
+        sp.buttons[0] = (oc_mbtn){ "Cancel", MB_NORMAL,  MODAL_CANCEL };
+        sp.buttons[1] = (oc_mbtn){ "Save",   MB_PRIMARY, MODAL_OK };
+        sp.n_buttons = 2;
+        sp.commit = status_commit;
+    } else if (g_form_open) {
+        /* A form is the one modal whose height depends on its content, so the
+         * height is MEASURED from its rows — the field-count heuristic gave a
+         * three-field card 300px whatever the rows added up to, and the status
+         * form's chips clipped at the bottom edge. Width stays the small
+         * class; every current form fits 460. */
         sp.title = g_form_title;
-        sp.size = (g_form_n > 3) ? MODAL_LG : MODAL_SM;
+        sp.size = MODAL_SM;
+        {
+            float bw = UIS(460.0f) - 2 * MODAL_PAD;
+            float rows = 4;
+            for (int i = 0; i < g_form_n; i++) rows += form_rowh(&g_form_f[i], bw);
+            /* want_h is in unscaled DIPs (modal_frame applies UIS); the sums
+             * above are already scaled, so divide the scale back out. */
+            sp.want_h = (MODAL_TITLE_H + rows + MODAL_FOOT_H + UIS(16.0f)) / g_text_scale;
+        }
         sp.buttons[0] = (oc_mbtn){ "Cancel", MB_NORMAL,  MODAL_CANCEL };
         sp.buttons[1] = (oc_mbtn){ "OK",     MB_PRIMARY, MODAL_OK };
         sp.n_buttons = 2;
@@ -8078,6 +8489,8 @@ static const char *g_modal_closed_by = "";   /* diagnosis only; see the dump */
 
 static void modal_finish(int save) {
     g_tp_open = 0;   /* nothing floating may outlive the card it was opened from */
+    if (g_pick_open && g_pick_target == PICK_STATUS) picker_close(NULL);
+    if (g_status_edit) ShowWindow(g_status_edit, SW_HIDE);
     const oc_modal_spec *s = modal_current();
     /* A confirmation's "commit" is its action. Handled here rather than through
      * spec->commit so the action can take the window handle. */
@@ -8086,7 +8499,7 @@ static void modal_finish(int save) {
     if (save) { if (s->commit) s->commit(); }
     else      { if (s->restore) s->restore(); }
     g_prefs_open = g_keys_open = g_wsmgr_open = g_notify_open = g_browse_open = 0;
-    g_confirm_open = g_sessions_open = 0;
+    g_confirm_open = g_sessions_open = g_status_open = 0;
     g_modal_closed_by = save ? "save" : "cancel";
 }
 
@@ -8138,6 +8551,11 @@ static int modal_key(HWND hwnd, WPARAM vk) {
      * pre-translate handler that would have caught this returns early while a
      * modal is up (deliberately: shortcuts must not open surfaces behind it). */
     if (vk == VK_ESCAPE && g_tp_open) { g_tp_open = 0; return 1; }
+    /* Same rule for the status dialog's emoji picker. */
+    if (vk == VK_ESCAPE && g_pick_open && g_pick_target == PICK_STATUS) {
+        picker_close(hwnd);
+        return 1;
+    }
     if (vk == VK_ESCAPE) { modal_finish(0); g_modal_closed_by = "esc"; return 1; }
     if (vk == VK_RETURN) {
         if (g_modal_primary_cmd == MODAL_OK) modal_finish(1);
@@ -8211,12 +8629,25 @@ static void layout_natives(HWND hwnd) {
                    PX(b.right - b.left - 18), PX(b.bottom - b.top - 10), TRUE);
     }
     if (g_pick_edit) {
-        if (g_pick_open && !covered) {
+        /* Over a modal only when the STATUS dialog owns the picker — the one
+         * companion allowed to float above a card (the time-picker rule). */
+        if (g_pick_open && (!covered || g_pick_target == PICK_STATUS)) {
             ShowWindow(g_pick_edit, SW_SHOW);
             MoveWindow(g_pick_edit, PX(g_pick_box.left + 30), PX(g_pick_box.top + 6),
                        PX(g_pick_box.right - g_pick_box.left - 40), PX(18), TRUE);
         } else {
             ShowWindow(g_pick_edit, SW_HIDE);
+        }
+    }
+    if (g_status_edit) {
+        /* Like the form's fields: the status modal IS the cover and owns it. */
+        rectf b = g_status_erect;
+        if (g_status_open && b.right > b.left) {
+            ShowWindow(g_status_edit, SW_SHOW);
+            MoveWindow(g_status_edit, PX(b.left + 9), PX(b.top + 5),
+                       PX(b.right - b.left - 18), PX(b.bottom - b.top - 10), TRUE);
+        } else {
+            ShowWindow(g_status_edit, SW_HIDE);
         }
     }
 }
@@ -8808,9 +9239,12 @@ static void draw_activity_list(gfx *rt, const oc_model *m, float h) {
         if (fx > x0 + 12 && fx + fw > x1 - 8) { fx = x0 + 12; fy += 26; }
         rectf b = rf(fx, fy, fx + fw, fy + 22);
         int on = (g_act_filter == i);
+        int hover = !on && in_rect(b, g_mouse_x, g_mouse_y);
         if (on) fill_round(rt, b, 6.0f, OC_COL_ACCENT);
+        else if (hover) fill_round(rt, b, 6.0f, OC_COL_HOVER);
         g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, L[i], g_meta, b, on ? 0xFFFFFF : OC_COL_MUTED);
+        draw_text(rt, L[i], g_meta, b,
+                  on ? 0xFFFFFF : hover ? OC_COL_TEXT : OC_COL_MUTED);
         g_meta->align = ST_ALIGN_LEFT;
         g_act_filters[i] = b;
         fx = b.right + 3;
@@ -9558,7 +9992,11 @@ static void draw_threads(gfx *rt, const oc_model *m, rectf reg) {
         const char *lbl = g_threads_unread ? "Unreads only" : "All threads";
         float w = text_width(lbl, g_meta) + 24;
         rectf b = rf(body.right - 24 - w, body.top + 10, body.right - 24, body.top + 36);
-        fill_round(rt, b, 6.0f, g_threads_unread ? OC_COL_ACCENT : OC_COL_INPUT);
+        {
+            int hover2 = in_rect(b, g_mouse_x, g_mouse_y);
+            fill_round(rt, b, 6.0f, g_threads_unread ? OC_COL_ACCENT
+                                    : hover2 ? OC_COL_HOVER : OC_COL_INPUT);
+        }
         if (!g_threads_unread) stroke_round(rt, b, 6.0f, OC_COL_BORDER, 1.0f);
         g_meta->align = ST_ALIGN_CENTER;
         draw_text(rt, lbl, g_meta, b, g_threads_unread ? 0xFFFFFF : OC_COL_MUTED);
@@ -9990,12 +10428,15 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
          * prevent. One predicate now decides both. */
         if (main_is_conversation()) draw_composer(rt, main_x, main_w, H);
         draw_autocomplete(rt, main_x, main_w, H);
-        draw_emoji_picker(rt, main_x, main_w, H);
+        if (g_pick_target != PICK_STATUS)
+            draw_emoji_picker(rt, main_x, main_w, H);
         if (members > 0) draw_members(rt, m, W, H);
         else g_n_memrows = 0;
     } else {
         g_n_ac = 0;
-        g_pick_open = 0;
+        /* The STATUS dialog's picker belongs to the modal, not the composer,
+         * and the modal opens from any view — it must survive this branch. */
+        if (g_pick_target != PICK_STATUS) g_pick_open = 0;
         g_banner_on = 0;
         rectf reg = rf(RAIL_W, 0, W, H);
         switch (g_view) {
@@ -10043,6 +10484,10 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
     draw_palette(rt, m, W, H);   /* the palette dims and covers the app */
     draw_menu(rt);          /* dropdown menus float on top of everything */
     draw_time_picker(rt, W, H);   /* ...and the time dropdown above the overlay it belongs to */
+    if (g_pick_target == PICK_STATUS)   /* the status dialog's emoji picker floats
+                                         * over its card, exactly like the time
+                                         * dropdown over the notifications sheet */
+        draw_emoji_picker(rt, 0, W, H);
     if (si_over) {          /* the sign-in card, over a dimmed live shell */
         rectf all = rf(0, 0, W, H);
         gfx_fill(rt, gr(all), 0x000000, 0.55f);
@@ -11710,7 +12155,10 @@ enum {
     AT_EMOJI,         /* the composer's emoji picker */
     AT_MENTION,       /* insert the @ trigger, as typing it does */
     AT_SCHEDMENU,     /* the send-later menu */
-    AT_THREADFILTER   /* the Threads pane's unreads-only toggle */
+    AT_THREADFILTER,  /* the Threads pane's unreads-only toggle */
+    AT_STATUSEMOJI,   /* the status dialog's emoji button */
+    AT_STATUSSUGG,    /* payload: status suggestion row index */
+    AT_STATUSCHIP     /* payload: status clear-after chip index */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -11761,6 +12209,15 @@ static oc_acc_item g_acc_items[OC_ACC_MAX];
 static void a11y_publish_scene(const oc_model *m) {
     oc_acc_item *items = g_acc_items;
     int n = 0;
+    const WCHAR *ctext = NULL;
+    int caret = 0, anchor = 0;
+
+    /* A MODAL OWNS THE TREE. While a card covers the window, the shell's rows
+     * and buttons are unreachable by pointer and must be unreachable by AT and
+     * by the harness alike — publishing them invited a screen reader to invoke
+     * a message the user cannot see, and made chromefit compare a card's
+     * content against chrome underneath it. Skip straight to the modal block. */
+    if (modal_open()) goto modal_items;
 
     /* Conversations. Headers are skipped: "Channels" is a label, not a place you
      * can go, and a screen reader offering it as a list item invites the user to
@@ -11813,8 +12270,7 @@ static void a11y_publish_scene(const oc_model *m) {
     /* The composer, and its text, so it can be read back rather than only typed
      * into. Published even when the box is empty — an Edit element that vanishes
      * when you clear it is worse than one that says it is empty. */
-    const WCHAR *ctext = NULL;
-    int caret = 0, anchor = 0;
+    /* declared before the modal short-circuit above may jump the block */
     if (main_is_conversation() && g_ed_box.right > g_ed_box.left && n < OC_ACC_MAX) {
         oc_acc_item *it = &items[n++];
         memset(it, 0, sizeof *it);
@@ -11923,6 +12379,7 @@ static void a11y_publish_scene(const oc_model *m) {
 
     /* A modal's buttons: the one surface where "press the primary" is the whole
      * interaction, and where clicking a measured point is least forgivable. */
+modal_items:
     if (modal_open()) {
         for (int i = 0; i < g_n_modal_btns && n < OC_ACC_MAX; i++) {
             char aid[OC_ACC_AID_MAX];
@@ -11933,6 +12390,26 @@ static void a11y_publish_scene(const oc_model *m) {
             snprintf(aid, sizeof aid, "modal.button.%s", low);
             acc_push(items, &n, OC_ACC_BUTTON, aid, g_modal_btns[i].label,
                      g_modal_btns[i].r, ATOK(AT_MODALBTN, i));
+        }
+        /* The status dialog publishes its content, which is what lets
+         * chromefit PROVE the card fits — the defect this dialog had was a
+         * chip row clipped at the card's own edge, invisible to every
+         * rect-based check because the rects were never published. */
+        if (g_status_open) {
+            acc_push(items, &n, OC_ACC_BUTTON, "status.emoji", "Status emoji",
+                     g_status_emoji_btn, ATOK(AT_STATUSEMOJI, 0));
+            for (int i = 0; i < g_n_status_suggs && n < OC_ACC_MAX; i++) {
+                char aid[OC_ACC_AID_MAX];
+                snprintf(aid, sizeof aid, "status.suggest.%d", i);
+                acc_push(items, &n, OC_ACC_BUTTON, aid, g_status_suggs[i].text,
+                         g_status_suggs[i].r, ATOK(AT_STATUSSUGG, i));
+            }
+            for (int k = 0; k < 5 && n < OC_ACC_MAX; k++) {
+                char aid[OC_ACC_AID_MAX];
+                snprintf(aid, sizeof aid, "status.clear.%d", k);
+                acc_push(items, &n, OC_ACC_TAB, aid, STATUS_CLEARS[k],
+                         g_status_chip_hits[k], ATOK(AT_STATUSCHIP, k));
+            }
         }
     }
 
@@ -13302,6 +13779,13 @@ static int on_click(HWND hwnd, int x, int y) {
     /* The frame owns ✕, the footer buttons and the scrim; a modal's own content
      * never sees those clicks. Dismissal by any of the three means CANCEL, so the
      * three cannot disagree. */
+    /* The emoji picker first WHEN IT FLOATS OVER A MODAL: the frame's
+     * outside-the-card rule would read a click on the panel as scrim-cancel.
+     * An outside click closes the picker and is consumed — never the card. */
+    if (g_pick_open && g_pick_target == PICK_STATUS) {
+        picker_click(hwnd, x, y);
+        return 1;
+    }
     if (modal_frame_click(hwnd, x, y)) return 1;
     if (g_lightbox) { g_lightbox = 0; return 1; }   /* any click dismisses it */
     /* A pane's ✕. One test for every pane, because there is one header:
@@ -13376,26 +13860,7 @@ static int on_click(HWND hwnd, int x, int y) {
             }
         }
     }
-    if (g_pick_open) {
-        if (in_rect(g_pick_panel, x, y)) {
-            /* A tone is a preference, so choosing one re-renders the picker
-             * and stays open — it is a change to what you are looking at, not
-             * a selection. Saved immediately: it survives to the next window
-             * and the next device through the settings bucket. */
-            for (int i = 0; i < g_n_pick_tones; i++)
-                if (in_rect(g_pick_tones[i].r, x, y)) {
-                    g_skin_tone = g_pick_tones[i].tone;
-                    prefs_save();
-                    InvalidateRect(hwnd, NULL, FALSE);
-                    return 1;
-                }
-            for (int i = 0; i < g_n_pick_cells; i++)
-                if (in_rect(g_pick_cells[i].r, x, y)) { picker_choose(hwnd, g_pick_cells[i].emoji); return 1; }
-            return 1;   /* inside the panel but not on a cell: stay open */
-        }
-        picker_close(hwnd);
-        return 1;
-    }
+    if (g_pick_open && picker_click(hwnd, x, y)) return 1;
     {
         const oc_model *om = model();
         if (om && om->storage_open && in_rect(g_storage_refresh, x, y)) {
@@ -13407,6 +13872,39 @@ static int on_click(HWND hwnd, int x, int y) {
                 if (in_rect(g_audit_filters[i], x, y)) {
                     g_audit_family = i; g_ovl_scroll = 0; return 1;
                 }
+        }
+        if (g_status_open) {
+            if (in_rect(g_status_emoji_btn, x, y)) {
+                picker_open_status(hwnd, g_status_emoji_btn);
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 1;
+            }
+            if (in_rect(g_status_erect, x, y)) {
+                if (g_status_edit) SetFocus(g_status_edit);
+                return 1;
+            }
+            for (int i = 0; i < g_n_status_suggs; i++)
+                if (in_rect(g_status_suggs[i].r, x, y)) {
+                    /* A suggestion fills all three: emoji, text, and its own
+                     * default clear time — one click, whole status. */
+                    snprintf(g_status_emoji, sizeof g_status_emoji, "%s",
+                             g_status_suggs[i].emoji);
+                    if (g_status_edit) {
+                        WCHAR w[96];
+                        MultiByteToWideChar(CP_UTF8, 0, g_status_suggs[i].text, -1, w, 96);
+                        SetWindowTextW(g_status_edit, w);
+                    }
+                    g_status_clear = g_status_suggs[i].clear;
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 1;
+                }
+            for (int k = 0; k < 5; k++)
+                if (in_rect(g_status_chip_hits[k], x, y)) {
+                    g_status_clear = k;
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 1;
+                }
+            return 1;   /* the card swallows what nothing above claimed */
         }
         if (g_notify_open) {
             /* The time dropdown is above everything else in this overlay, so it
@@ -15818,37 +16316,9 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 7:  g_view = VIEW_HOME; upload_file(hwnd); break;
     case 10: oc_client_set_presence(g_client, OC_PRESENCE_ONLINE); break;
     case 11: oc_client_set_presence(g_client, OC_PRESENCE_AWAY); break;
-    case 51: {   /* */
-        oc_field f[3] = {
-            { FF_TEXT,   "Emoji",  "A shortcode, e.g. :pizza: — or leave it empty.", "" },
-            { FF_TEXT,   "Status", "What you are doing. Empty clears it.",           "" },
-            { FF_CHOICE, "Clear after", "Never|30 minutes|1 hour|4 hours|Today",     "0" },
-        };
-        const oc_model *sm = model();
-        if (sm) for (size_t i = 0; i < sm->n_users; i++)
-            if (sm->users[i].user_id == sm->user_id) {
-                snprintf(f[0].value, sizeof f[0].value, "%s", sm->users[i].status_emoji);
-                snprintf(f[1].value, sizeof f[1].value, "%s", sm->users[i].status_text);
-                break;
-            }
-        if (!form_dialog(hwnd, "Status", f, 3)) break;
-        /* The expiry is computed HERE and sent as an absolute time, so the daemon
-         * does not have to know what "4 hours" meant or when the request was made. */
-        static const uint64_t MINS[5] = { 0, 30, 60, 240, 0 };
-        int pick = atoi(f[2].value);
-        uint64_t exp = 0;
-        if (pick >= 1 && pick <= 3) exp = (uint64_t)time(NULL) * 1000ull + MINS[pick] * 60000ull;
-        else if (pick == 4) {
-            /* "Today" = local midnight, which is a different instant per user and so
-             * cannot be a fixed offset. */
-            time_t now = time(NULL); struct tm tv;
-            if (oc_localtime_r(&now, &tv)) {
-                tv.tm_hour = 23; tv.tm_min = 59; tv.tm_sec = 59;
-                exp = (uint64_t)mktime(&tv) * 1000ull;
-            }
-        }
-        oc_client_set_status(g_client, f[0].value, f[1].value, exp);
-        break; }
+    case 51:     /* the status dialog — bespoke modal, see status_open */
+        status_open(hwnd);
+        break;
     case 54:     /* REQ-182 */
         oc_client_list_sessions(g_client);
         modal_enter(hwnd, &g_sessions_open);
@@ -16359,8 +16829,18 @@ static void test_dump(const char *path) {
     /* WHO is signed in. Absent until 2026-07-31, which made any two-account test
      * unfalsifiable: a stored session token silently re-auths the previous user,
      * and every other line in this dump looks identical either way. */
-    fprintf(f, "me id=%llu name=\"%s\"\n", (unsigned long long)m->user_id,
+    fprintf(f, "me id=%llu name=\"%s\"", (unsigned long long)m->user_id,
             oc_model_user_name(m, m->user_id) ? oc_model_user_name(m, m->user_id) : "");
+    /* Own status, so a test can WAIT for the set-status round trip instead of
+     * guessing at it — the dialog's reopen-prefill is only as fresh as this. */
+    for (size_t i = 0; i < m->n_users; i++)
+        if (m->users[i].user_id == m->user_id) {
+            fprintf(f, " status=\"%s|%s\" status_exp=%llu",
+                    m->users[i].status_emoji, m->users[i].status_text,
+                    (unsigned long long)m->users[i].status_expires);
+            break;
+        }
+    fprintf(f, "\n");
     fprintf(f, "users n=%u names=\"", (unsigned)m->n_users);
     for (size_t i = 0; i < m->n_users && i < 32; i++)
         fprintf(f, "%s%s", i ? "," : "", m->users[i].name);
@@ -16482,6 +16962,33 @@ static void test_dump(const char *path) {
                 i, g_form_f[i].kind, g_form_edit[i] ? 1 : 0,
                 g_form_erect[i].left, g_form_erect[i].top,
                 g_form_erect[i].right, g_form_erect[i].bottom, cur);
+    }
+    {
+        char stxt[128] = "";
+        if (g_status_edit) {
+            WCHAR w[128]; GetWindowTextW(g_status_edit, w, 128);
+            WideCharToMultiByte(CP_UTF8, 0, w, -1, stxt, (int)sizeof stxt, NULL, NULL);
+        }
+        fprintf(f, "statusmodal open=%d emoji=\"%s\" text=\"%s\" clear=%d nsugg=%d "
+                   "btn=%.0f,%.0f,%.0f,%.0f erect=%.0f,%.0f,%.0f,%.0f\n",
+                g_status_open, g_status_emoji, stxt, g_status_clear, g_n_status_suggs,
+                g_status_emoji_btn.left, g_status_emoji_btn.top,
+                g_status_emoji_btn.right, g_status_emoji_btn.bottom,
+                g_status_erect.left, g_status_erect.top,
+                g_status_erect.right, g_status_erect.bottom);
+        for (int i = 0; i < g_n_status_suggs && g_status_open; i++)
+            fprintf(f, "  statussugg %d text=\"%s\" clear=%d r=%.0f,%.0f,%.0f,%.0f\n",
+                    i, g_status_suggs[i].text, g_status_suggs[i].clear,
+                    g_status_suggs[i].r.left, g_status_suggs[i].r.top,
+                    g_status_suggs[i].r.right, g_status_suggs[i].r.bottom);
+        for (int k = 0; k < 5 && g_status_open; k++)
+            fprintf(f, "  statuschip %d r=%.0f,%.0f,%.0f,%.0f\n", k,
+                    g_status_chip_hits[k].left, g_status_chip_hits[k].top,
+                    g_status_chip_hits[k].right, g_status_chip_hits[k].bottom);
+        fprintf(f, "pickstate open=%d target=%d panel=%.0f,%.0f,%.0f,%.0f\n",
+                g_pick_open, g_pick_target,
+                g_pick_panel.left, g_pick_panel.top,
+                g_pick_panel.right, g_pick_panel.bottom);
     }
     fprintf(f, "workspaces=%d active=%d elsewhere=%d\n", g_n_wss, g_ws_active, ws_unread_elsewhere());
     for (int i = 0; i < g_n_wss; i++) {
@@ -18159,6 +18666,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
+        if (g_pick_open && in_rect(g_pick_panel, (float)wpt.x, (float)wpt.y)) {
+            /* The picker never scrolled by wheel at all — its grid only moved
+             * by search. Same dropdown rule as the time list above. */
+            g_pick_scroll -= dy;
+            if (g_pick_scroll < 0) g_pick_scroll = 0;
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         /* A MODAL OWNS THE WHEEL, ahead of every shell surface below.
          *
          * This has to come first, not merely before the sidebar. The branches
@@ -18619,6 +19134,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case AT_FMT:       ed_format((int)arg); break;
         case AT_EMOJI:     picker_open(hwnd, 0); break;
+        case AT_STATUSEMOJI:
+            if (g_status_open) picker_open_status(hwnd, g_status_emoji_btn);
+            break;
+        case AT_STATUSSUGG:
+            if (g_status_open && (int)arg < g_n_status_suggs) {
+                snprintf(g_status_emoji, sizeof g_status_emoji, "%s",
+                         g_status_suggs[arg].emoji);
+                if (g_status_edit) {
+                    WCHAR w[96];
+                    MultiByteToWideChar(CP_UTF8, 0, g_status_suggs[arg].text, -1, w, 96);
+                    SetWindowTextW(g_status_edit, w);
+                }
+                g_status_clear = g_status_suggs[arg].clear;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            break;
+        case AT_STATUSCHIP:
+            if (g_status_open && (int)arg < 5) {
+                g_status_clear = (int)arg;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            break;
         case AT_MENTION:   ed_focus(hwnd); ed_insert(L"@"); ac_rebuild(); break;
         case AT_SCHEDMENU:
             /* The same menu the chevron opens, built where it is built — a second
