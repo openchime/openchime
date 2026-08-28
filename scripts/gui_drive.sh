@@ -92,7 +92,13 @@ case "${1:-}" in
     # Exactly one instance, always. A leftover client reads the same command file
     # and answers for the one under test — which once produced a "crash" that was
     # really an orphan from an earlier run.
-    powershell.exe -NoProfile -Command "Get-Process openchime -EA SilentlyContinue|Stop-Process -Force" >/dev/null 2>&1 || true
+    # CLOSE it, and only force it if that fails. Stop-Process -Force is a
+    # TerminateProcess, which the client correctly reports as a death that ran
+    # no handler — so force-killing on every launch would fill the test dir with
+    # post-mortems for kills the harness did on purpose, and bury the one that
+    # matters. CloseMainWindow posts WM_CLOSE, which reaches WM_DESTROY and marks
+    # the run clean.
+    powershell.exe -NoProfile -Command "\$p = Get-Process openchime -EA SilentlyContinue; if (\$p) { \$p.CloseMainWindow() | Out-Null; if (-not \$p.WaitForExit(3000)) { \$p | Stop-Process -Force } }" >/dev/null 2>&1 || true
     sleep 1
     rm -f "$LIN_DIR"/cmd "$LIN_DIR"/ack
     # WSLENV is required for the env var to cross into the Windows process.
@@ -100,7 +106,8 @@ case "${1:-}" in
         setsid "$EXE" "$ws" "$cred" >/dev/null 2>&1 < /dev/null &
     disown; sleep 3; echo "launched"; exit 0 ;;
   kill)
-    powershell.exe -NoProfile -Command "Get-Process openchime -EA SilentlyContinue|Stop-Process -Force" >/dev/null 2>&1 || true
+    # Graceful first, for the reason the launch path gives.
+    powershell.exe -NoProfile -Command "\$p = Get-Process openchime -EA SilentlyContinue; if (\$p) { \$p.CloseMainWindow() | Out-Null; if (-not \$p.WaitForExit(3000)) { \$p | Stop-Process -Force } }" >/dev/null 2>&1 || true
     echo killed; exit 0 ;;
   "") echo "usage: gui_drive.sh launch|<cmd...>|kill" >&2; exit 2 ;;
 esac
