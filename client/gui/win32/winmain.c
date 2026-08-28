@@ -27,6 +27,7 @@
 #include <dbghelp.h>        /* MINIDUMP_* types; the function is loaded at run time */
 #include "a11y.h"           /* the UIA provider (REQ-269, ARCH-99) */
 
+#include <signal.h>
 #include <stdarg.h>          /* va_list — the crash breadcrumb ring */
 #include <stdio.h>
 #include <stdlib.h>
@@ -1690,19 +1691,67 @@ static char g_test_dir[512];
  * handler that allocates can fault inside the fault, and a heap corruption is
  * exactly the kind of bug this is trying to catch.
  */
+/*
+ * THE RING IS MEMORY-MAPPED, and that is the whole of why this works when the
+ * exception filter below does not.
+ *
+ * A filter only runs if the process gets to run code on the way out. Three
+ * classes of death do not: `__fastfail` (what the CRT's buffer-overrun and
+ * heap-corruption checks raise) goes straight past every handler by design; a
+ * stack overflow may have no stack left to run one on; and `TerminateProcess`
+ * from outside runs nothing at all. Any library that installs its own
+ * unhandled-exception filter after ours silently wins too. Each of those leaves
+ * exactly what was reported: a process that is simply gone.
+ *
+ * So the breadcrumbs are written into a file-backed mapping rather than into
+ * process memory. Nothing has to run at death time — the pages are the file, and
+ * the memory manager writes them back whatever killed us. The next start reads
+ * any ring left behind and turns it into a report.
+ *
+ * Still deliberately dumb: fixed storage, no allocation, no locks. A crash
+ * handler that allocates can fault inside the fault, and heap corruption is one
+ * of the things this exists to catch.
+ */
 #define OC_CRUMBS 64
+#define OC_CRUMB_MAGIC 0x4F43524Bu      /* "OCRK" */
 typedef struct { char text[96]; DWORD tick; } oc_crumb;
-static oc_crumb g_crumbs[OC_CRUMBS];
-static volatile LONG g_crumb_n;          /* monotonic; index = n % OC_CRUMBS */
+typedef struct {
+    volatile LONG magic;
+    volatile LONG n;          /* monotonic; index = n % OC_CRUMBS */
+    volatile LONG clean;      /* 1 once the process has exited normally */
+    DWORD    pid;
+    DWORD    start_tick;
+    oc_crumb c[OC_CRUMBS];
+} oc_crumb_ring;
+
+/* The fallback is used when the mapping cannot be made, so a crumb() call is
+ * always safe. It costs the post-mortem, not the live report. */
+static oc_crumb_ring  g_crumbs_local;
+static oc_crumb_ring *g_ring = &g_crumbs_local;
+static HANDLE g_ring_map, g_ring_file;
+static char   g_ring_path[700];
 
 static void crumb(const char *fmt, ...) {
-    LONG slot = InterlockedIncrement(&g_crumb_n) - 1;
-    oc_crumb *c = &g_crumbs[slot % OC_CRUMBS];
+    oc_crumb_ring *r = g_ring;
+    LONG slot = InterlockedIncrement(&r->n) - 1;
+    oc_crumb *c = &r->c[slot % OC_CRUMBS];
     va_list ap; va_start(ap, fmt);
     _vsnprintf(c->text, sizeof c->text - 1, fmt, ap);
     va_end(ap);
     c->text[sizeof c->text - 1] = 0;
     c->tick = GetTickCount();
+}
+
+/* Write a ring's breadcrumbs into an open report. Shared by the live crash
+ * filter and the post-mortem, so a report reads the same either way. */
+static void crumbs_dump(FILE *f, const oc_crumb_ring *r, DWORD now) {
+    LONG total = r->n;
+    LONG first = total > OC_CRUMBS ? total - OC_CRUMBS : 0;
+    fprintf(f, "-- last %ld of %ld breadcrumbs --\n", total - first, total);
+    for (LONG i = first; i < total; i++) {
+        const oc_crumb *c = &r->c[i % OC_CRUMBS];
+        fprintf(f, "  -%5lums %s\n", (unsigned long)(now - c->tick), c->text);
+    }
 }
 
 /* Where a crash report goes. The test dir when the harness is driving, because
@@ -1716,8 +1765,112 @@ static void crash_dir(char *out, size_t cap) {
     CreateDirectoryA(out, NULL);
 }
 
+/* Turn one ring left behind by a dead process into a report. Called for every
+ * `live-*.crumbs` found at startup; the file goes either way, so a ring is
+ * reported once and does not accumulate. */
+static void crumbs_postmortem(const char *dir, const char *name) {
+    char path[700]; snprintf(path, sizeof path, "%s\\%s", dir, name);
+    HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fh == INVALID_HANDLE_VALUE) return;
+    HANDLE mp = CreateFileMappingW(fh, NULL, PAGE_READONLY, 0, 0, NULL);
+    oc_crumb_ring *r = mp ? (oc_crumb_ring *)MapViewOfFile(mp, FILE_MAP_READ, 0, 0,
+                                                           sizeof(oc_crumb_ring)) : NULL;
+    if (r && r->magic == (LONG)OC_CRUMB_MAGIC && !r->clean) {
+        char out[700];
+        snprintf(out, sizeof out, "%s\\postmortem-%lu.txt", dir, (unsigned long)r->pid);
+        FILE *f = fopen(out, "wb");
+        if (f) {
+            /* Say plainly what this is. A report with no exception record is
+             * evidence of a death that ran no handler — which is itself the
+             * finding, and is why it is not silently shaped like a crash log. */
+            fprintf(f, "openchime post-mortem\n");
+            fprintf(f, "pid=%lu ran_for=%lums\n", (unsigned long)r->pid,
+                    (unsigned long)(r->c[(r->n ? r->n - 1 : 0) % OC_CRUMBS].tick - r->start_tick));
+            fprintf(f, "the previous run ended WITHOUT a clean exit and without\n"
+                       "running the exception filter: no fault was reported, so this\n"
+                       "was a fastfail, a stack overflow, an external kill, or a\n"
+                       "handler installed over ours. The breadcrumbs are what it was\n"
+                       "doing; there is no fault address to report.\n");
+            crumbs_dump(f, r, r->c[(r->n ? r->n - 1 : 0) % OC_CRUMBS].tick);
+            fclose(f);
+        }
+    }
+    if (r) UnmapViewOfFile(r);
+    if (mp) CloseHandle(mp);
+    CloseHandle(fh);
+    DeleteFileA(path);
+}
+
+/* Report anything the last run left, then map our own ring. */
+static void crumbs_start(void) {
+    char dir[600]; crash_dir(dir, sizeof dir);
+
+    WIN32_FIND_DATAA fd;
+    char pat[700]; snprintf(pat, sizeof pat, "%s\\live-*.crumbs", dir);
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do { crumbs_postmortem(dir, fd.cFileName); } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+
+    snprintf(g_ring_path, sizeof g_ring_path, "%s\\live-%lu.crumbs", dir,
+             (unsigned long)GetCurrentProcessId());
+    g_ring_file = CreateFileA(g_ring_path, GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, NULL);
+    if (g_ring_file == INVALID_HANDLE_VALUE) { g_ring_file = NULL; return; }
+    g_ring_map = CreateFileMappingW(g_ring_file, NULL, PAGE_READWRITE, 0,
+                                    sizeof(oc_crumb_ring), NULL);
+    oc_crumb_ring *r = g_ring_map ? (oc_crumb_ring *)MapViewOfFile(
+                           g_ring_map, FILE_MAP_ALL_ACCESS, 0, 0,
+                           sizeof(oc_crumb_ring)) : NULL;
+    if (!r) return;                       /* keep the static fallback */
+    memset(r, 0, sizeof *r);
+    r->magic = (LONG)OC_CRUMB_MAGIC;
+    r->pid = GetCurrentProcessId();
+    r->start_tick = GetTickCount();
+    g_ring = r;
+}
+
+/* A clean exit marks the ring and removes it, so the next start has nothing to
+ * report. Anything that does NOT reach here leaves the file, which is exactly
+ * the signal the post-mortem reads. */
+static void crumbs_clean_exit(void) {
+    if (g_ring != &g_crumbs_local) {
+        g_ring->clean = 1;
+        FlushViewOfFile(g_ring, sizeof(oc_crumb_ring));
+        UnmapViewOfFile(g_ring);
+        g_ring = &g_crumbs_local;
+    }
+    if (g_ring_map)  { CloseHandle(g_ring_map);  g_ring_map = NULL; }
+    if (g_ring_file) { CloseHandle(g_ring_file); g_ring_file = NULL; }
+    if (g_ring_path[0]) DeleteFileA(g_ring_path);
+}
+
 typedef BOOL (WINAPI *mdwd_fn)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
                                const MINIDUMP_EXCEPTION_INFORMATION *, void *, void *);
+
+/* The CRT's two ways out that never reach an exception filter. Both raise a
+ * real exception so the ordinary path writes the ordinary report, with the
+ * breadcrumbs that say what the app was doing — rather than the process simply
+ * vanishing, which is what was reported. */
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep);   /* fwd */
+
+static void crt_raise(const char *what) {
+    crumb("FATAL %s", what);
+    /* RaiseException synthesises the EXCEPTION_POINTERS the filter wants; the
+     * code is ours, so a report from here is distinguishable from a real fault. */
+    RaiseException(0xE0C11A5Du, EXCEPTION_NONCONTINUABLE, 0, NULL);
+}
+
+static void crt_bad_param(const wchar_t *expr, const wchar_t *fn, const wchar_t *file,
+                          unsigned line, uintptr_t reserved) {
+    (void)expr; (void)fn; (void)file; (void)line; (void)reserved;
+    crt_raise("CRT invalid parameter");
+}
+
+static void crt_on_abort(int sig) { (void)sig; crt_raise("abort()"); }
 
 static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
     char dir[600]; crash_dir(dir, sizeof dir);
@@ -1746,14 +1899,7 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
 
         /* The breadcrumbs, oldest first, with ms before the crash — the answer to
          * "what was it doing", which is the question a bare stack cannot answer. */
-        LONG total = g_crumb_n;
-        LONG first = total > OC_CRUMBS ? total - OC_CRUMBS : 0;
-        DWORD now = GetTickCount();
-        fprintf(f, "-- last %ld of %ld breadcrumbs --\n", total - first, total);
-        for (LONG i = first; i < total; i++) {
-            oc_crumb *c = &g_crumbs[i % OC_CRUMBS];
-            fprintf(f, "  -%5lums %s\n", (unsigned long)(now - c->tick), c->text);
-        }
+        crumbs_dump(f, g_ring, GetTickCount());
         /* The dump is attempted here, while the report is still open, so the
          * report can say whether one exists. A zero-length .dmp sitting beside a
          * crash log is worse than no file: it looks like evidence. */
@@ -18464,6 +18610,21 @@ static void test_poll(HWND hwnd) {
         }
         oc_client_set_status(g_client, emo, txt, 0);
         test_ack("ok");
+    } else if (!strcmp(verb, "die")) {
+        /* Force one class of death, to prove the evidence path rather than wait
+         * for the real thing. Each is a way a process has actually been seen to
+         * vanish: `av` runs the exception filter; `abort` and `badparam` go
+         * through the CRT, which never reaches a filter; `fastfail` bypasses
+         * every handler by design and is the case only the memory-mapped ring
+         * can report. Test hook only — reachable solely through
+         * OPENCHIME_TEST_DIR. */
+        crumb("die %s requested", arg);
+        test_ack("ok");
+        if      (!strcmp(arg, "av"))       { *(volatile int *)0 = 1; }
+        else if (!strcmp(arg, "abort"))    { abort(); }
+        else if (!strcmp(arg, "badparam")) { printf(NULL); }
+        else if (!strcmp(arg, "fastfail")) { __fastfail(1); }
+        else if (!strcmp(arg, "kill"))     { TerminateProcess(GetCurrentProcess(), 3); }
     } else if (!strcmp(verb, "profile_set")) {
         /* `profile_set <tz>|<full name>|<title>|<pronouns>|<phone>` — pipe
          * separated because every field but the timezone may contain spaces,
@@ -19944,6 +20105,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_wss[i].client && g_wss[i].client != g_client) oc_client_stop(g_wss[i].client);
         g_n_wss = 0;
         if (g_client) { oc_client_stop(g_client); g_client = NULL; }
+        /* The ring is marked and removed HERE rather than after the message
+         * loop, because reaching WM_DESTROY is what "exited normally" means —
+         * and anything that does not reach it leaves the file, which is exactly
+         * the signal the next start reports on. */
+        crumb("clean exit");
+        crumbs_clean_exit();
         PostQuitMessage(0);
         return 0;
     default:
@@ -19959,7 +20126,20 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
 
     /* Before anything else, so a crash during startup is reported too. */
     SetUnhandledExceptionFilter(crash_filter);
-    crumb("start");
+
+    /* A stack overflow is one of the deaths that runs no handler, because there
+     * is no stack left to run one on. Reserving a slice up front is what lets
+     * the filter execute at all in that case. */
+    { ULONG guard = 64 * 1024; SetThreadStackGuarantee(&guard); }
+
+    /* The CRT does not fault on its own errors — it calls abort(), which never
+     * reaches an exception filter. Both are routed to the same report. The
+     * SIGABRT handler runs BEFORE the CRT's default behaviour, so it also means
+     * no abort dialog: a message box on a driven client is a hang, not a
+     * diagnostic. (`_set_abort_behavior` would say so explicitly but is absent
+     * from mingw's import library, and the handler makes it redundant.) */
+    _set_invalid_parameter_handler(crt_bad_param);
+    signal(SIGABRT, crt_on_abort);
 
     /* COM, single-threaded apartment, for the UI thread's registered classes —
      * ITaskbarList3 (the overlay badge) and WIC (inline images). Nothing had
@@ -19970,6 +20150,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     /* Automation hook: OPENCHIME_TEST_DIR enables the file command channel. */
     { const char *td = getenv("OPENCHIME_TEST_DIR");
       if (td && td[0]) snprintf(g_test_dir, sizeof g_test_dir, "%s", td); }
+
+    /* AFTER the test dir is known, because that is where a report belongs when
+     * the harness is driving — and reporting the last run has to happen before
+     * this one starts overwriting anything. */
+    crumbs_start();
+    crumb("start");
 
     /* Open the OS credential store first: the "do we have a session?" probe
      * below reads through it. */
@@ -20050,6 +20236,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
      * loop, the tray, IME and the UIA provider all keep their Win32 handling
      * untouched; SDL supplies the renderer the gfx layer draws through. */
     if (!SDL_Init(SDL_INIT_VIDEO)) return 1;
+    /* SDL installs its own unhandled-exception filter, and the last installer
+     * wins — so ours is re-asserted after it. A filter that is silently replaced
+     * looks exactly like a crash that produced no report, which is one of the
+     * things being investigated here. */
+    SetUnhandledExceptionFilter(crash_filter);
     {
         SDL_PropertiesID props = SDL_CreateProperties();
         SDL_SetPointerProperty(props, SDL_PROP_WINDOW_CREATE_WIN32_HWND_POINTER, hwnd);

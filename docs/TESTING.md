@@ -545,6 +545,37 @@ build/openchime-tui 127.0.0.1 8443 alice:pw    # <host> <port> [user:pass] direc
 - `demo_client` (`make demo-client`) is the flexible black-box tool: `token <apns|fcm>
   <tok>` or `send <channel> <text>` against a running daemon.
 
+## A death always leaves evidence
+
+The client writes a crash report and a minidump from an unhandled-exception
+filter — but a filter only runs if the process gets to run code on the way out,
+and three classes of death do not. `__fastfail`, which the CRT's buffer-overrun
+and heap-corruption checks raise, goes past every handler by design. A stack
+overflow may have no stack left to run one on. `TerminateProcess` from outside
+runs nothing at all. Any library installing its own filter after ours wins, too.
+Each of those leaves a process that is simply gone, which is not a bug report.
+
+So the **breadcrumb ring is a file-backed memory mapping**, not process memory.
+Nothing has to run at death time: the pages are the file, and the memory manager
+writes them back whatever killed us. A clean exit marks the ring and deletes it
+at `WM_DESTROY`; anything that does not reach there leaves it behind, and the
+next start turns it into a `postmortem-<pid>.txt` naming what the app was doing.
+An absent fault address is itself the finding — it means no handler ran.
+
+The CRT's two exits are routed in as well: `abort()` and an invalid-parameter
+call both raise a real exception now, so they produce the ordinary report
+instead of vanishing.
+
+**Prove it rather than wait for it.** `gui_drive.sh die <av|abort|badparam|fastfail|kill>`
+forces one class each. `av`, `abort` and `badparam` produce a crash report;
+`fastfail` and `kill` produce none, by construction, and are caught by the ring.
+
+**The harness closes the client gracefully** (`CloseMainWindow`, falling back to
+force after three seconds) for a reason that matters here: `Stop-Process -Force`
+is a `TerminateProcess`, which is correctly reported as a death that ran no
+handler. Force-killing on every launch would fill the test directory with
+post-mortems the harness caused on purpose and bury the one that matters.
+
 ## Symbolicating a Win32 crash
 
 `make windows-gui` ships a **stripped** `build/openchime.exe` and keeps the
