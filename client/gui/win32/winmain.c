@@ -2623,6 +2623,33 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
             fill_round_a(rt, rf(cx - 18, youext > 0 ? base - 11 : base + 9,
                                 cx + 18, base + 45), 10.0f, 0xFFFFFF, 0.08f);
         const char *nm = m ? oc_model_user_name(m, m->user_id) : "";
+        const char *se = NULL;
+        if (m) for (size_t si2 = 0; si2 < m->n_users; si2++)
+            if (m->users[si2].user_id == m->user_id) {
+                if (m->users[si2].status_emoji[0]) se = m->users[si2].status_emoji;
+                break;
+            }
+        /* THE PILL IS DRAWN BEFORE THE AVATAR, and that ordering is the whole
+         * of what makes it look like one column instead of two overlapping
+         * shapes. The rect deliberately extends 8px past the avatar's top edge
+         * so the seam between them is squared rather than showing two rounded
+         * corners meeting; the avatar's fill is opaque, so those 8px are hidden
+         * the moment it is painted over them. Painted the other way round — the
+         * pill last — the same geometry instead lays a 24%-white wash and two
+         * rounded corners ACROSS the top of the avatar, which is what "the
+         * sections overlap" looks like on screen. Geometry alone cannot fix
+         * that, which is why several attempts at the numbers did not.
+         *
+         * The glyph is the SMALL emoji format (draw_emoji_glyph paints the 22px
+         * face at natural size and clips — the source of every truncated
+         * attempt), centred in the band that stays visible above the avatar.
+         * It sits entirely above the avatar's top edge, so it is safe here. */
+        if (se) {
+            rectf pill = rf(cx - 15, base - 8, cx + 15, base + 20);
+            fill_round_a(rt, pill, 8.0f, 0xFFFFFF, 0.24f);
+            draw_emoji_fmt(rt, se, rf(cx - 8, base - 6, cx + 8, base + 10),
+                           g_emoji_s);
+        }
         /* A ROUNDED SQUARE, as the reference's rail avatars are (the switcher
          * above is one already) — the circle read as a different product. */
         rectf av2 = rf(cx - 15, base + 12, cx + 15, base + 42);
@@ -2635,26 +2662,10 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
                               m ? oc_model_presence_of(m, m->user_id) : OC_PRESENCE_OFFLINE,
                               OC_COL_RAIL, m ? oc_model_snoozed(m) : 0);
         {
-            const char *se = NULL;
-            if (m) for (size_t si2 = 0; si2 < m->n_users; si2++)
-                if (m->users[si2].user_id == m->user_id) {
-                    if (m->users[si2].status_emoji[0]) se = m->users[si2].status_emoji;
-                    break;
-                }
-            if (se) {
-                /* The status pill, as the reference actually draws it: the
-                 * SAME WIDTH as the avatar, sitting FLUSH on the avatar's top
-                 * edge — no gap, one continuous column — rounded only at its
-                 * top corners. The rect extends under the avatar (drawn next),
-                 * which squares the seam for free. Third shade, always shown.
-                 * The glyph is the SMALL emoji format (draw_emoji_glyph paints
-                 * the 22px face at natural size and clips — the source of
-                 * every truncated attempt), centred in the visible band. */
-                rectf pill = rf(cx - 15, base - 8, cx + 15, base + 20);
-                fill_round_a(rt, pill, 8.0f, 0xFFFFFF, 0.24f);
-                draw_emoji_fmt(rt, se, rf(cx - 8, base - 6, cx + 8, base + 10),
-                               g_emoji_s);
-            } else if (dnd_now(m)) {
+            /* The quiet-hours badge stays AFTER the avatar, unlike the pill: it
+             * badges the avatar's own top-right corner, so it has to sit on top
+             * of it rather than under. */
+            if (!se && dnd_now(m)) {
                 /* Quiet hours' "z" BADGES the avatar's top-right corner, as it
                  * always did — a lone dot floating in the stack's empty band
                  * read as a defect. Only when no status emoji claims the top;
