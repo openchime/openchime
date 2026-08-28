@@ -447,6 +447,82 @@ static void test_admin_frames(void) {
         CHECK(out[1].user_id == 2 && out[1].disabled == 1 && slice_eq_str(out[1].display_name, "Bob"));
     }
     {
+        /* The roster's profile fields (REQ-240/289), on a REPEATED list — so the
+         * second entry is the one that matters: a field added to the entry
+         * shifts everything after the first, and only reading entry [1] back
+         * proves the encoder and decoder agree about the stride. */
+        oc_user_list_entry ents[2] = {
+            { 1, OC_ROLE_OWNER,  0, oc_slice_str("a@x.io"), oc_slice_str("Alice"), 9,
+              oc_slice_str("Principal Engineer"), oc_slice_str("America/New_York"),
+              oc_slice_str("\xf0\x9f\x8c\xb4"), oc_slice_str("On holiday"),
+              oc_slice_str("Alice Liddell"), oc_slice_str("she/her") },
+            /* Every string empty, which is the common case and the one where an
+             * off-by-one in the stride is easiest to miss. */
+            { 2, OC_ROLE_MEMBER, 0, oc_slice_str(""), oc_slice_str("Bob"), 0,
+              oc_slice_str(""), oc_slice_str(""), oc_slice_str(""), oc_slice_str(""),
+              oc_slice_str(""), oc_slice_str("") },
+        };
+        oc_user_list in = { 2, ents };
+        ROUNDTRIP(oc_encode_user_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_USER_LIST, h, p);
+        oc_user_list_entry out[2]; uint16_t n = 0;
+        CHECK(oc_decode_user_list(&p, out, 2, &n) == OC_OK);
+        CHECK(n == 2);
+        CHECK(slice_eq_str(out[0].full_name, "Alice Liddell"));
+        CHECK(slice_eq_str(out[0].pronouns, "she/her"));
+        CHECK(slice_eq_str(out[0].title, "Principal Engineer"));
+        CHECK(out[1].user_id == 2 && slice_eq_str(out[1].display_name, "Bob"));
+        CHECK(out[1].full_name.len == 0 && out[1].pronouns.len == 0);
+    }
+    {
+        /* SET_PROFILE — the whole screen in one frame, at its own opcode. It
+         * shared 0x0070 with SET_PRESENCE, where the dispatch chain reached
+         * presence first and this frame could not be delivered at all. */
+        oc_set_profile in = { oc_slice_str("Alice Liddell"), oc_slice_str("Principal Engineer"),
+                              oc_slice_str("she/her"), oc_slice_str("+1 555 0100"),
+                              oc_slice_str("America/New_York") };
+        ROUNDTRIP(oc_encode_set_profile(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_PROFILE, h, p);
+        CHECK(h.msg_type != OC_MSG_SET_PRESENCE);
+        oc_set_profile out;
+        CHECK(oc_decode_set_profile(&p, &out) == OC_OK);
+        CHECK(slice_eq_str(out.full_name, "Alice Liddell"));
+        CHECK(slice_eq_str(out.title, "Principal Engineer"));
+        CHECK(slice_eq_str(out.pronouns, "she/her"));
+        CHECK(slice_eq_str(out.phone, "+1 555 0100"));
+        CHECK(slice_eq_str(out.timezone, "America/New_York"));
+    }
+    {
+        /* Every field empty: clearing the profile is a thing a user does, and
+         * an all-empty frame must survive the round trip rather than truncate. */
+        oc_set_profile in = { oc_slice_str(""), oc_slice_str(""), oc_slice_str(""),
+                              oc_slice_str(""), oc_slice_str("") };
+        ROUNDTRIP(oc_encode_set_profile(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_PROFILE, h, p);
+        oc_set_profile out;
+        CHECK(oc_decode_set_profile(&p, &out) == OC_OK);
+        CHECK(out.full_name.len == 0 && out.title.len == 0 && out.pronouns.len == 0);
+        CHECK(out.phone.len == 0 && out.timezone.len == 0);
+    }
+    {
+        /* PROFILE_INFO carries phone, which USER_LIST deliberately does not. */
+        oc_profile_info in;
+        memset(&in, 0, sizeof in);
+        in.user_id = 4; in.display_name = oc_slice_str("Alice");
+        in.email = oc_slice_str("a@x.io");
+        in.status_emoji = oc_slice_str(""); in.status_text = oc_slice_str("");
+        in.title = oc_slice_str("Principal Engineer");
+        in.timezone = oc_slice_str("America/New_York");
+        in.avatar_id = 11; in.role = OC_ROLE_ADMIN;
+        in.full_name = oc_slice_str("Alice Liddell");
+        in.pronouns = oc_slice_str("she/her");
+        in.phone = oc_slice_str("+1 555 0100");
+        ROUNDTRIP(oc_encode_profile_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_PROFILE_INFO, h, p);
+        oc_profile_info out;
+        CHECK(oc_decode_profile_info(&p, &out) == OC_OK);
+        CHECK(out.user_id == 4 && out.avatar_id == 11 && out.role == OC_ROLE_ADMIN);
+        CHECK(slice_eq_str(out.full_name, "Alice Liddell"));
+        CHECK(slice_eq_str(out.pronouns, "she/her"));
+        CHECK(slice_eq_str(out.phone, "+1 555 0100"));
+    }
+    {
         oc_set_role in = { 7, OC_ROLE_ADMIN };
         ROUNDTRIP(oc_encode_set_role(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_ROLE, h, p);
         oc_set_role out;

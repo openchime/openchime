@@ -1606,6 +1606,8 @@ oc_result oc_encode_user_list(oc_wbuf *w, uint16_t version, const oc_user_list *
         oc_w_str(w, m->entries[i].timezone);
         oc_w_str(w, m->entries[i].status_emoji);   /* REQ-241 */
         oc_w_str(w, m->entries[i].status_text);
+        oc_w_str(w, m->entries[i].full_name);      /* REQ-240/289 */
+        oc_w_str(w, m->entries[i].pronouns);
     }
     return oc_frame_end(w, off);
 }
@@ -2396,6 +2398,11 @@ oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries,
         oc_slice tz = oc_r_str(p);
         oc_slice semoji = oc_r_str(p);
         oc_slice stext = oc_r_str(p);
+        /* Read unconditionally, like every field above: the cap bounds what is
+         * STORED, never what is consumed, or an entry past it desynchronises
+         * the rest of the list. */
+        oc_slice fname = oc_r_str(p);
+        oc_slice prn = oc_r_str(p);
         if (i < cap) {
             entries[i].user_id = uid;
             entries[i].role = role;
@@ -2407,6 +2414,8 @@ oc_result oc_decode_user_list(oc_rbuf *p, oc_user_list_entry *entries,
             entries[i].timezone = tz;
             entries[i].status_emoji = semoji;
             entries[i].status_text = stext;
+            entries[i].full_name = fname;
+            entries[i].pronouns = prn;
         }
     }
     return r_done(p);
@@ -2681,14 +2690,20 @@ oc_result oc_decode_set_status(oc_rbuf *p, oc_set_status *m) {
 
 oc_result oc_encode_set_profile(oc_wbuf *w, uint16_t version, const oc_set_profile *m) {
     size_t off = oc_frame_begin(w, version, OC_MSG_SET_PROFILE);
+    oc_w_str(w, m->full_name);
     oc_w_str(w, m->title);
+    oc_w_str(w, m->pronouns);
+    oc_w_str(w, m->phone);
     oc_w_str(w, m->timezone);
     return oc_frame_end(w, off);
 }
 
 oc_result oc_decode_set_profile(oc_rbuf *p, oc_set_profile *m) {
-    m->title    = oc_r_str(p);
-    m->timezone = oc_r_str(p);
+    m->full_name = oc_r_str(p);
+    m->title     = oc_r_str(p);
+    m->pronouns  = oc_r_str(p);
+    m->phone     = oc_r_str(p);
+    m->timezone  = oc_r_str(p);
     return r_done(p);
 }
 
@@ -2706,6 +2721,9 @@ oc_result oc_encode_profile_info(oc_wbuf *w, uint16_t version, const oc_profile_
     oc_w_str(w, m->timezone);
     oc_w_u64(w, m->avatar_id);
     oc_w_u8(w, m->role);
+    oc_w_str(w, m->full_name);
+    oc_w_str(w, m->pronouns);
+    oc_w_str(w, m->phone);
     return oc_frame_end(w, off);
 }
 
@@ -2720,6 +2738,9 @@ oc_result oc_decode_profile_info(oc_rbuf *p, oc_profile_info *m) {
     m->timezone       = oc_r_str(p);
     m->avatar_id      = oc_r_u64(p);
     m->role           = oc_r_u8(p);
+    m->full_name      = oc_r_str(p);
+    m->pronouns       = oc_r_str(p);
+    m->phone          = oc_r_str(p);
     return r_done(p);
 }
 

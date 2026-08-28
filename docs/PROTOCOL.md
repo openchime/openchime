@@ -170,7 +170,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 8** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 9** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
@@ -670,7 +670,13 @@ Each entry, in wire order:
 
 `user_id` (u64) · `role` (u8) · `disabled` (u8) · `email` (str) ·
 `display_name` (str) · `avatar_id` (u64) · `title` (str) · `timezone` (str) ·
-`status_emoji` (str) · `status_text` (str).
+`status_emoji` (str) · `status_text` (str) · `full_name` (str) ·
+`pronouns` (str).
+
+A **phone number is deliberately absent**: it is contact detail rather than
+something drawn beside a name, and every member's number in every roster
+fan-out is a size and privacy cost with nothing asking for it. `PROFILE_INFO`
+carries it to whoever opened the card.
 
 Because this is a repeated list, an added field shifts **every** entry after the
 first — which is why adding one always raises the protocol version rather than
@@ -1535,9 +1541,14 @@ notified on. Priority people pierce a level and a pause but never a mute
 
     emoji (str), text (str), expires_at (u64)
 
-**`SET_PROFILE` (C → S), `0x0070`** — Set my job title and timezone. (REQ-240)
+**`SET_PROFILE` (C → S), `0x00D8`** — Set my profile: full name, title, pronouns, phone and timezone. (REQ-240)
 
-    title (str), timezone (str)
+    full_name (str), title (str), pronouns (str), phone (str), timezone (str)
+
+The whole profile in one frame, because it is edited on one screen and
+committed by one button — a field-at-a-time wire would let Cancel mean "some of
+it stuck". An empty field CLEARS that column: the user deleted it, which is a
+thing they did, and is a different fact from never having set it.
 
 **`SET_AVATAR` (C → S), `0x0078`** — Point my avatar at an already-uploaded attachment, or clear it. (REQ-240; the image travels via the REQ-140 upload path)
 
@@ -1545,7 +1556,7 @@ notified on. Priority people pierce a level and a pause but never a mute
 
 **`PROFILE_INFO` (S → C), `0x0072`** — One person's complete profile — everything a roster shows about them — as the reply to a profile read and to any of SET_STATUS / SET_PROFILE / SET_AVATAR. (REQ-240, REQ-241)
 
-    user_id (u64), display_name (str), email (str), status_emoji (str), status_text (str), status_expires (u64), title (str), timezone (str), avatar_id (u64), role (u8)
+    user_id (u64), display_name (str), email (str), status_emoji (str), status_text (str), status_expires (u64), title (str), timezone (str), avatar_id (u64), role (u8), full_name (str), pronouns (str), phone (str)
 
 An **empty `text` on `SET_STATUS` clears all three fields together** — emoji,
 text and expiry — because "no status" is one state rather than two, and a client
@@ -1559,11 +1570,6 @@ trusted: it must exist, be finalized, carry an `image/*` MIME type, **and have
 been uploaded by the caller**. That last check is load-bearing — avatars are
 readable workspace-wide, so without it a member could point their avatar at
 somebody else's private-channel attachment.
-
-> **`SET_PROFILE` cannot be delivered.** Its opcode `0x0070` is also
-> `SET_PRESENCE`; the daemon dispatches presence first, and a title/timezone
-> payload fails the presence decoder, so the connection is dropped. Do not
-> implement against `0x0070` for this frame until the number is resolved.
 
 ### 5.16f Drafts and scheduled messages
 
@@ -2022,11 +2028,9 @@ carries the same `code`; the other codes are delivered via `ERROR`.
 opcode order, 158 of them. The sections above specify the payload layouts; this
 table is the index and the authority on which values are taken.
 
-One opcode is **used by two message types** (`0x0070`), marked below:
-`SET_PROFILE`/`SET_PRESENCE` are both client→server and collide for real, and
-that is tracked. `scripts/check_opcodes.sh`
-(run by `make test` and CI) fails on any duplicate outside that one tracked
-exception, so this table cannot silently gain a shared value.
+**Every opcode carries exactly one message type.** `scripts/check_opcodes.sh`
+(run by `make test` and CI) fails on any duplicate, with no exception list, so
+this table cannot silently gain a shared value.
 
 | msg_type | Name | Direction | Notes |
 |---|---|---|---|
@@ -2117,8 +2121,7 @@ exception, so this table cannot silently gain a shared value.
 | `0x006D` | `SET_MUTE` | C → S | mute/unmute a conversation |
 | `0x006E` | `SET_READ_CURSOR` | C → S | set the cursor (may move BACK) |
 | `0x006F` | `SET_STATUS` | C → S | my custom status (empty text clears) |
-| `0x0070` | `SET_PRESENCE` | C → S | set own presence (REQ-120) **(opcode shared)** |
-| `0x0070` | `SET_PROFILE` | C → S | my title/timezone **(opcode shared)** |
+| `0x0070` | `SET_PRESENCE` | C → S | set own presence (REQ-120) |
 | `0x0071` | `PRESENCE_UPDATE` | S → C | a user's presence changed |
 | `0x0072` | `PROFILE_INFO` | S → C | a user's full profile (also a push) |
 | `0x0073` | `LIST_FILE_CHANNELS` | C → S |  |
@@ -2187,6 +2190,7 @@ exception, so this table cannot silently gain a shared value.
 | `0x00D5` | `MARK_THREAD_READ` | C → S | its replies are read up to here |
 | `0x00D6` | `SET_TZ_OFFSET` | C → S | minutes east of UTC, refreshed on every connect |
 | `0x00D7` | `UNFURL` | S → C | a URL's fetched preview (REQ-222); also replayed on backfill |
+| `0x00D8` | `SET_PROFILE` | C → S | my profile fields (REQ-240) |
 
 ## 10. Connection state machine
 

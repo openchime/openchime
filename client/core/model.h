@@ -136,6 +136,15 @@ typedef struct {
     char     title[64];
     char     timezone[48];
     uint64_t avatar_id;
+    /* Read beside the name, so they ride USER_LIST with the fields above
+     * (REQ-240/289). A phone number does not: it reaches the card through
+     * PROFILE_INFO, and is not held for every member of the roster. */
+    char     full_name[64];
+    char     pronouns[32];
+    /* Filled by PROFILE_INFO only, never by USER_LIST: a phone number reaches
+     * the person who opened the card, not every roster fan-out. Empty until a
+     * card is fetched, which is what "not on the roster" means here. */
+    char     phone[40];
 } oc_member;
 
 /* An ephemeral "user is typing in channel" mark, expiring on a timeout. */

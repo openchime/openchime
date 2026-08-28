@@ -279,7 +279,9 @@ void oc_client_list_file_channels(oc_client *c);   /* */
 void oc_client_list_sessions(oc_client *c);        /* REQ-182 */
 void oc_client_set_status(oc_client *c, const char *emoji, const char *text,
                           uint64_t expires_at);
-void oc_client_set_profile(oc_client *c, const char *title, const char *timezone);
+void oc_client_set_profile(oc_client *c, const char *full_name, const char *title,
+                           const char *pronouns, const char *phone,
+                           const char *timezone);
 void oc_client_set_read_cursor(oc_client *c, uint64_t channel_id, uint64_t message_id);
 
 /* Attachments (REQ-140/141). Upload a local file and post it to `channel_id`

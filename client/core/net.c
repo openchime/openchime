@@ -551,6 +551,16 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     if (n2) memcpy(e->author_name, ue[i].status_text.ptr, n2);
                     e->author_name[n2] = '\0';
                 }
+                {
+                    size_t n2 = ue[i].full_name.len < sizeof e->pf_full_name - 1 ? ue[i].full_name.len : sizeof e->pf_full_name - 1;
+                    if (n2) memcpy(e->pf_full_name, ue[i].full_name.ptr, n2);
+                    e->pf_full_name[n2] = '\0';
+                }
+                {
+                    size_t n2 = ue[i].pronouns.len < sizeof e->pf_pronouns - 1 ? ue[i].pronouns.len : sizeof e->pf_pronouns - 1;
+                    if (n2) memcpy(e->pf_pronouns, ue[i].pronouns.ptr, n2);
+                    e->pf_pronouns[n2] = '\0';
+                }
                 oc_queue_push(to_ui, e);
             }
         } else if (hdr.msg_type == OC_MSG_PRESENCE_UPDATE) {
@@ -1266,15 +1276,20 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                  * with \x1f separators rather than growing oc_ev by four pointers for
                  * one event. Unpacked in model.c, next to the struct it fills. */
                 size_t need = pi.display_name.len + pi.status_emoji.len +
-                              pi.status_text.len + pi.title.len + pi.timezone.len + 8;
+                              pi.status_text.len + pi.title.len + pi.timezone.len +
+                              pi.full_name.len + pi.pronouns.len + pi.phone.len + 16;
                 e->body = malloc(need);
                 if (e->body) {
-                    int k = snprintf(e->body, need, "%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s",
+                    int k = snprintf(e->body, need,
+                                     "%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s\x1f%.*s",
                                      (int)pi.display_name.len, (const char *)pi.display_name.ptr,
                                      (int)pi.status_emoji.len, (const char *)pi.status_emoji.ptr,
                                      (int)pi.status_text.len,  (const char *)pi.status_text.ptr,
                                      (int)pi.title.len,        (const char *)pi.title.ptr,
-                                     (int)pi.timezone.len,     (const char *)pi.timezone.ptr);
+                                     (int)pi.timezone.len,     (const char *)pi.timezone.ptr,
+                                     (int)pi.full_name.len,    (const char *)pi.full_name.ptr,
+                                     (int)pi.pronouns.len,     (const char *)pi.pronouns.ptr,
+                                     (int)pi.phone.len,        (const char *)pi.phone.ptr);
                     (void)k;
                 }
                 oc_queue_push(to_ui, e);
@@ -2023,9 +2038,19 @@ static int run_connection(oc_net *n, int reconnecting,
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }
             if (c->type == OC_CMD_SET_PROFILE) {
-                uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
-                oc_set_profile sp = { oc_slice_str(c->body ? c->body : ""),
-                                      oc_slice_str(c->body2 ? c->body2 : "") };
+                uint8_t buf[1024]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+                /* Unpack the five \x1f-separated fields client.c packed, beside
+                 * the encode that consumes them. A field the sender left empty
+                 * stays empty here and clears the column: that is the user
+                 * deleting it, which is a thing they did. */
+                char pb[512]; const char *pf[5] = { "", "", "", "", "" };
+                snprintf(pb, sizeof pb, "%s", c->body ? c->body : "");
+                int np = 0; pf[np++] = pb;
+                for (char *q = pb; *q && np < 5; q++)
+                    if (*q == '\x1f') { *q = '\0'; pf[np++] = q + 1; }
+                oc_set_profile sp = { oc_slice_str(pf[0]), oc_slice_str(pf[1]),
+                                      oc_slice_str(pf[2]), oc_slice_str(pf[3]),
+                                      oc_slice_str(pf[4]) };
                 if (oc_encode_set_profile(&w, OC_PROTOCOL_VERSION, &sp) == OC_OK)
                     (void)write_all(&conn, fd, buf, w.len, &n->stop);
             }

@@ -182,6 +182,17 @@ typedef struct oc_job {
     char          *device_token;     /* heap */
     uint8_t        device_platform;  /* OC_PUSH_APNS / OC_PUSH_FCM */
 
+    /* SET_PROFILE (REQ-240). Its own named fields, for the reason the
+     * `hook_disabled` comment below gives: two of these used to ride `ch_name`
+     * and `body`, which was survivable at two fields and is not at five — a
+     * reader should not have to know that "ch_name" secretly means "title" for
+     * one job type. All heap, all freed in job_free. */
+    char          *pf_full_name;
+    char          *pf_title;
+    char          *pf_pronouns;
+    char          *pf_phone;
+    char          *pf_timezone;
+
     /* REACT (channel_id + message_id above); emoji is heap, op is add/remove. */
     char          *emoji;      /* heap */
     uint8_t        react_op;
@@ -513,6 +524,11 @@ typedef struct {
     char    *timezone;      /* heap; may be "" */
     char    *status_emoji;  /* heap; may be "" */
     char    *status_text;   /* heap; may be "" */
+    /* Read BESIDE a name, so the roster is where every client learns them
+     * (REQ-240/289). `phone` is deliberately not here: it is contact detail,
+     * and PROFILE_INFO carries it to whoever opened the card. */
+    char    *full_name;     /* heap; may be "" */
+    char    *pronouns;      /* heap; may be "" */
 } oc_user_row;
 
 /* One message to replay on reconnect (rendered as a BROADCAST by the net thread),
@@ -757,6 +773,7 @@ typedef struct oc_dbres {
      * `reclaim` and `n_reclaim`, splitting a pointer from its count, which is exactly
      * the pairing a reader relies on. */
     char                   *st_emoji, *st_text, *pf_title, *pf_tz;
+    char                   *pf_full_name, *pf_pronouns, *pf_phone;
     uint64_t                st_expires, pf_avatar;
     /* OC_RES_FILE_CHANNELS. */
     oc_file_channel_entry  *fchans;

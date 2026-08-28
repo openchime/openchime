@@ -253,7 +253,7 @@ the requirement says so explicitly rather than implying one.
   member keeps it (and the way back). Owner/admin only.
 - **REQ-036a.** A channel's **visibility has been changeable** by an owner/admin —
   public to private and back — without touching its membership or its history.
-  **Built (2026-07-30, ARCH-93):** two ops (`OC_CHUP_PRIVATE` / `OC_CHUP_PUBLIC`)
+  **Built (ARCH-93):** two ops (`OC_CHUP_PRIVATE` / `OC_CHUP_PUBLIC`)
   rather than one toggle, so the request names a target state and two admins acting
   at once cannot flip it twice. No membership surgery in either direction: read
   access is already `is_public=1 OR is_member`, so **private** pins the audience to
@@ -383,7 +383,7 @@ the requirement says so explicitly rather than implying one.
   supported as a first-class conversation distinct from a named channel — a
   participant-defined, unnamed DM any participant could post to but not rename or
   govern membership on. It has ridden the same message model as a 1:1 or self-DM
-  (REQ-050/055), extended to N participants. **DONE** (2026-07-30). The decision:
+  (REQ-050/055), extended to N participants. The decision:
   **a group DM is a DM with more than two participants** — the same `channels.kind`,
   identified by the same `dm_key` (the sorted participant ids under a unique index)
   the 1:1 case has always used. No migration, no second code path for membership or
@@ -443,7 +443,7 @@ the requirement says so explicitly rather than implying one.
   under admin control of who may add them. A reaction (REQ-070) references an
   emoji by a stable shortcode that resolves to either a Unicode sequence or a
   tenant custom-emoji asset; a text-only client (the TUI) shows the shortcode
-  rather than the image. **DONE** (2026-07-30), with one accepted limitation.
+  rather than the image, with one accepted limitation.
   Storage: the image is an **attachment id** (migration 0029's `custom_emoji`), so the
   existing store handles upload, the size cap, dedup and reclamation — a second binary
   store in SQLite would be a second thing to back up and a second thing to get wrong.
@@ -664,7 +664,7 @@ the requirement says so explicitly rather than implying one.
 - **REQ-134.** Each user has had a **global (workspace-default) notification
   level** — all / mentions / none — applying to every channel lacking an explicit
   per-channel override (REQ-130), so a user has not had to set each channel
-  individually. Where a per-channel level was set, it has won. **DONE** (2026-07-30):
+  individually. Where a per-channel level was set, it has won. Built:
   `users.notify_default` (migration 0028), `SET_NOTIFY_DEFAULT` (0x0077), carried on
   every `NOTIFY_PREFS` snapshot so no client infers it, and honoured by the push
   decision as `COALESCE(np.level, u.notify_default)`. Storage is on `users` rather
@@ -675,8 +675,8 @@ the requirement says so explicitly rather than implying one.
   (REQ-130/134) — and to designate **priority people** whose messages always
   notify. Both have driven notification like a mention (REQ-221).
 
-  **Keywords are part of the `mentions` level, not a switch of their own**
-  (2026-07-31). Slack's middle level is literally "Mentions & keywords", so a
+  **Keywords are part of the `mentions` level, not a switch of their own.**
+  Slack's middle level is literally "Mentions & keywords", so a
   channel set to *mentions* notifies on both and a channel set to *none* notifies
   on neither. Matching is **case-insensitive and exact** — "deploy" does not
   match "deployment" — and phrases are allowed, as Slack's are. A hit surfaces in
@@ -842,7 +842,7 @@ the requirement says so explicitly rather than implying one.
   current membership. `users.activity_seen_ms` is a watermark — enough to mark
   what is new, deliberately not per-item read state.
 
-  **Extended 2026-07-31 to Slack's filter set.** The three kinds above answer
+  **The filter set is Slack's.** The three kinds above answer
   "what involved me". Slack's Activity also answers "what have I not read",
   through three further filters that are now in scope:
 
@@ -1350,7 +1350,7 @@ None are yet backed by an architecture decision.*
   in-band, so no schema change is required, and a client that does not render a
   construct has shown its literal source legibly.
 
-  **Settled by ARCH-100 (2026-07-31):** a Slack-compatible subset for inline
+  **Settled by ARCH-100:** a Slack-compatible subset for inline
   emphasis, extended with the list syntax Slack's markup lacks, parsed
   **client-side in `client/core/`** and never by the daemon, returning spans over
   the unchanged body. Full dialect, the escaping rules, and the places we
@@ -1365,8 +1365,7 @@ None are yet backed by an architecture decision.*
   kind and byte span; `shared/mention.c` is the one scanner both sides link, so
   highlight and notify cannot disagree. Known limitation: `@here` is treated as a
   broadcast for *push*, because presence is not visible to the push worker.
-- **REQ-287.** *(Built in the Win32 client only)* *(Built 2026-07-31 — daemon, wire and the Win32 client; the TUI
-  does not surface it yet.)* Mentioning someone who is **not in the channel** has
+- **REQ-287.** *(Built in the Win32 client only)* Mentioning someone who is **not in the channel** has
   never been silent. The sender has been told — privately, in a notice only they see, since
   it concerns their action and not the conversation — that the mention reached
   nobody, and offered the remedy that fits the channel: **add them**, or **send
@@ -1410,7 +1409,7 @@ None are yet backed by an architecture decision.*
   joins `channel_members` for every channel kind — correct reasoning for private,
   applied too widely.
 
-  **Built 2026-07-31, and deliberately narrow.** Delivery is the **activity feed
+  **Built, and deliberately narrow.** Delivery is the **activity feed
   only**: push stays membership-gated, so this never rings a phone about a
   channel somebody never joined. The mention notifies **regardless of notification
   level**, because a mention is a direct address and a non-member has no
@@ -1437,7 +1436,7 @@ None are yet backed by an architecture decision.*
 - **REQ-223.** An unsent composer's contents (per channel/thread/DM) have been
   preserved as a **draft** across app restarts and, for a signed-in identity,
   synced across that user's devices, so a half-written message has not been lost.
-  **Settled by ARCH-101 (2026-07-31):** server-stored, in its own `drafts` table
+  **Settled by ARCH-101:** server-stored, in its own `drafts` table
   keyed `(user_id, channel_id, thread_root)` with its own ops — deliberately not
   the `client_settings` bucket, which is partitioned per frontend and would leave
   a GUI draft invisible in the TUI. `thread_root` is in the key from the start
@@ -1467,7 +1466,7 @@ None are yet backed by an architecture decision.*
 - **REQ-224.** A user has been able to **schedule a message** for future delivery
   to a channel or DM; the message has been held until its send time, then
   delivered through the ordinary path (REQ-090), and cancelable before it fired.
-  **Settled by ARCH-102 (2026-08-01):** held in its own `scheduled_messages`
+  **Settled by ARCH-102:** held in its own `scheduled_messages`
   table rather than in `messages` — it is not a message yet, and a "pending" flag
   would make every history, search, backfill and unread query responsible for
   excluding it. Fired by a daemon sweep on its own ~15 s timer (storage
@@ -1550,7 +1549,7 @@ architecture decision.*
   bot DM, per REQ-275).
 - **REQ-234.** A user has been able to **star (favorite)** channels and DMs and
   organize their sidebar into **custom sections** — per-user view state that has
-  synced across their devices without affecting other users. **DONE** (2026-07-30):
+  synced across their devices without affecting other users. Built:
   both halves live in `oc_sidebar_opts` and persist through the daemon's
   `client_settings` bucket, so the client stores nothing locally (ARCH-88) and the
   state follows the account. A conversation appears exactly once — a section lifts it
@@ -1588,19 +1587,33 @@ architecture decision.*
 *Per-user identity presentation beyond the display name already carried on
 messages (author name, ARCH-74). Not yet backed by an architecture decision.*
 
-- **REQ-240.** *(Partly built)* Each user has had a **profile** — display name, avatar image,
-  title/role text, timezone, and pronouns — set by the user (some fields possibly
-  admin-managed in a corporate deployment) and shown wherever the user appears.
-  Avatars have been stored as image assets in object storage (ARCH-17), not
-  SQLite. **DONE** (2026-07-30) except **pronouns**, which is a field nobody has
-  asked for yet and would be added the same way: display name, title, timezone and
-  the avatar are all editable and carried on `PROFILE_INFO`. The avatar is an
-  ordinary attachment id (`users.avatar_attachment_id`), so it lands in the existing
-  blob store — object storage where one is configured — rather than inventing
-  storage; it is readable workspace-wide, and only an attachment the setter uploaded
-  can become one. Edit authority is the user's own: no admin-managed fields, which
-  is the simpler half of the choice and the one a self-hosted deployment can live
-  with.
+- **REQ-240.** Each user has had a **profile** — full name, display name, avatar
+  image, title/role text, pronouns, phone, and timezone — set by the user and
+  shown wherever the user appears. Avatars have been stored as image assets in
+  object storage (ARCH-17), not SQLite.
+
+  **One screen owns it.** The fields are edited together on a single Edit
+  profile card and committed by one button, rather than scattered across a
+  dialog per field: two sheets both titled "Edit profile" is one more than a
+  person can tell apart. Status is deliberately not on it — it is transient and
+  has its own dialog (REQ-241).
+
+  **Full name and display name are both carried, and answer different
+  questions** — what somebody is called on paper, and what a transcript calls
+  them. Neither substitutes for the other.
+
+  **Timezone is chosen from a list, not typed.** A free-text box asks a person
+  to recall an IANA zone from memory and validates nothing. The list leads with
+  US and North American zones. What it records is *where somebody is*: quiet
+  hours run on the offset the client refreshes from the OS on each connect
+  (REQ-136, ARCH-103), not on this field.
+
+  The avatar is an ordinary attachment id (`users.avatar_attachment_id`), so it
+  lands in the existing blob store — object storage where one is configured —
+  rather than inventing storage; it is readable workspace-wide, and only an
+  attachment the setter uploaded can become one. Edit authority is the user's
+  own: no admin-managed fields, which is the simpler half of the choice and the
+  one a self-hosted deployment can live with.
 - **REQ-289.** A user has been able to **browse the people in the workspace** — a
   directory listing everyone with their avatar, display name, title, custom status
   and presence, searchable by name or title, opening a person's profile. Without
@@ -1608,10 +1621,13 @@ messages (author name, ARCH-74). Not yet backed by an architecture decision.*
   ways to find somebody are the DM picker and the command palette, both of which
   answer "who do I already know the name of".
 
-  Title, timezone and custom status ride `USER_LIST` as well as `PROFILE_INFO`
-  for this directory's sake: `PROFILE_INFO` goes only to the person who edited
-  the fields, so the roster is the one place every client can learn everyone
-  else's (a repeated-list layout change, hence a protocol-version bump).
+  Full name, pronouns, title, timezone and custom status ride `USER_LIST` as
+  well as `PROFILE_INFO` for this directory's sake: `PROFILE_INFO` goes only to
+  the person who edited the fields, so the roster is the one place every client
+  can learn everyone else's (a repeated-list layout change, hence a
+  protocol-version bump). A **phone number does not ride the roster** — it is
+  contact detail rather than a name decoration, and reaches a client through
+  `PROFILE_INFO` when a card is opened.
 - **REQ-241.** A user has been able to set a transient **custom status** — a
   short text plus an emoji, with an optional expiry — shown alongside their name
   and presence (Section 4). **Built** (migration 0027): `status_emoji` /
@@ -1891,7 +1907,7 @@ REQ-269, whose accessibility half is a real open decision.*
   conversation tomorrow. The id is derived from the thing's identity, never from
   where it happens to be drawn.
 
-  *Status: built on Win32 (2026-08-02).* Every rail and shelf row,
+  *Status: built on Win32.* Every rail and shelf row,
   conversation, message, composer control, formatting button, filter chip, tab,
   pane row and modal button carries an id and — where it is a control rather than
   content — an `InvokePattern`, so a client can press it rather than click at a

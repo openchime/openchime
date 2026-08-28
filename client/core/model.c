@@ -1096,18 +1096,21 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         for (size_t i = 0; i < m->n_users; i++)
             if (m->users[i].user_id == e->user_id) { mem = &m->users[i]; break; }
         if (!mem) break;                 /* not in the roster: nothing to attach to */
-        const char *f[5] = { "", "", "", "", "" };
-        char buf[512];
+        const char *f[8] = { "", "", "", "", "", "", "", "" };
+        char buf[768];
         snprintf(buf, sizeof buf, "%s", e->body ? e->body : "");
         int nf = 0;
         f[nf++] = buf;
-        for (char *q = buf; *q && nf < 5; q++)
+        for (char *q = buf; *q && nf < 8; q++)
             if (*q == '\x1f') { *q = '\0'; f[nf++] = q + 1; }
         if (f[0][0]) snprintf(mem->name, sizeof mem->name, "%s", f[0]);
         snprintf(mem->status_emoji, sizeof mem->status_emoji, "%s", f[1]);
         snprintf(mem->status_text,  sizeof mem->status_text,  "%s", f[2]);
         snprintf(mem->title,        sizeof mem->title,        "%s", f[3]);
         snprintf(mem->timezone,     sizeof mem->timezone,     "%s", f[4]);
+        snprintf(mem->full_name,    sizeof mem->full_name,    "%s", f[5]);
+        snprintf(mem->pronouns,     sizeof mem->pronouns,     "%s", f[6]);
+        snprintf(mem->phone,        sizeof mem->phone,        "%s", f[7]);
         mem->status_expires = e->server_time;
         mem->avatar_id      = e->message_id;
         if (e->op) mem->role = e->op;
@@ -1482,6 +1485,8 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                 snprintf(m->users[i].timezone, sizeof m->users[i].timezone, "%s", e->pf_tz);
                 snprintf(m->users[i].status_emoji, sizeof m->users[i].status_emoji, "%s", e->emoji);
                 snprintf(m->users[i].status_text, sizeof m->users[i].status_text, "%s", e->author_name);
+                snprintf(m->users[i].full_name, sizeof m->users[i].full_name, "%s", e->pf_full_name);
+                snprintf(m->users[i].pronouns, sizeof m->users[i].pronouns, "%s", e->pf_pronouns);
                 break;
             }
         break;

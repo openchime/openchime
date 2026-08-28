@@ -817,6 +817,30 @@ static const char MIGRATION_0038[] =
     "  PRIMARY KEY (message_id, url)"
     ");";
 
+static const char MIGRATION_0039[] =
+    /* The rest of the profile (REQ-240). On `users` for the same reason 0027's
+     * fields are: they are facts about a person, there is exactly one row per
+     * person, and a side table would buy nothing but a join.
+     *
+     * `full_name` beside `display_name` is the split the reference product
+     * makes, and the two answer different questions — what you are called on
+     * paper, and what a transcript calls you. Neither substitutes for the
+     * other, which is why one column could not serve both.
+     *
+     * `pronouns` completes REQ-240. It is read beside a name, so it rides
+     * USER_LIST as well as PROFILE_INFO.
+     *
+     * `phone` does NOT ride USER_LIST. It is contact detail rather than a name
+     * decoration, and every member's number in every roster fan-out is a size
+     * and privacy cost with nothing asking for it — PROFILE_INFO carries it to
+     * the one person who opened the card.
+     *
+     * All nullable, no defaults: an absent value means the person has not said,
+     * which is a different thing from an empty string they typed. */
+    "ALTER TABLE users ADD COLUMN full_name TEXT;"
+    "ALTER TABLE users ADD COLUMN phone TEXT;"
+    "ALTER TABLE users ADD COLUMN pronouns TEXT;";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -856,6 +880,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 36, MIGRATION_0036 },
     { 37, MIGRATION_0037 },
     { 38, MIGRATION_0038 },
+    { 39, MIGRATION_0039 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

@@ -842,13 +842,26 @@ void oc_client_set_status(oc_client *c, const char *emoji, const char *text,
     oc_queue_push(&c->cmds, cmd);
 }
 
-/* Profile fields (REQ-240). */
-void oc_client_set_profile(oc_client *c, const char *title, const char *timezone) {
+/* Profile fields (REQ-240). One call for the whole screen, because they are
+ * edited and committed together — a field-at-a-time API would let Cancel mean
+ * "some of it stuck".
+ *
+ * The five are packed \x1f-separated into `body` rather than given five slots on
+ * oc_cmd: the envelope is shared by every command type, and PROFILE_INFO
+ * already packs the same way in the other direction (net.c). Unpacked where it
+ * is encoded, so the two halves are read together. */
+void oc_client_set_profile(oc_client *c, const char *full_name, const char *title,
+                           const char *pronouns, const char *phone,
+                           const char *timezone) {
     if (!c) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SET_PROFILE);
     if (!cmd) return;
-    cmd->body  = strdup(title ? title : "");
-    cmd->body2 = strdup(timezone ? timezone : "");
+    char packed[512];
+    snprintf(packed, sizeof packed, "%s\x1f%s\x1f%s\x1f%s\x1f%s",
+             full_name ? full_name : "", title ? title : "",
+             pronouns ? pronouns : "", phone ? phone : "",
+             timezone ? timezone : "");
+    cmd->body = strdup(packed);
     oc_queue_push(&c->cmds, cmd);
 }
 

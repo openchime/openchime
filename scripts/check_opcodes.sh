@@ -10,16 +10,19 @@
 #
 # Run by `make check-opcodes` and by CI's build job.
 #
-# KNOWN_SHARED lists the opcodes that are still shared and are tracked as open
-# issues. An entry here is a defect on the record, not an exemption: delete the
-# value when it is fixed, and the check starts enforcing it.
+# KNOWN_SHARED lists opcodes that are still shared and tracked as open issues.
+# An entry here is a defect on the record, not an exemption: delete the value
+# when it is fixed, and the check starts enforcing it.
+#
+# It is EMPTY, and every opcode carries exactly one message type. Keep it that
+# way: the last entry was a pair that was not direction-disjoint, where the
+# dispatch chain reached the first branch and the second message type could not
+# be delivered at all.
 set -eu
 
 HDR="${1:-shared/protocol.h}"
 
-# 0x0070 — SET_PROFILE (C->S) and SET_PRESENCE (C->S). NOT direction-disjoint:
-# editing a profile drops the connection and saves nothing.
-KNOWN_SHARED="0x0070"
+KNOWN_SHARED=""
 
 [ -r "$HDR" ] || { echo "check_opcodes: cannot read $HDR" >&2; exit 2; }
 
