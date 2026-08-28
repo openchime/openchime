@@ -616,6 +616,22 @@ re-entrancy is a known, accepted property.
   fall through to the shell underneath means a stray click in a modal's empty
   space can change channel behind the dimmed card.
 
+### The status dialog is bespoke, and its emoji is picked
+
+Set a status (the profile menu) is not a `form_dialog`: its card is a
+content-measured bespoke body. The emoji slot is a button that opens the real
+emoji picker floating *over* the card — the time-dropdown rule: drawn after
+`draw_modal`, clicks claimed ahead of the frame's scrim-cancel, Esc closes it
+before it closes the card, and `modal_finish` closes it with the card. The text
+field offers suggested statuses (five defaults plus recent ones, kept under the
+`status.recents` settings key); choosing one fills emoji, text and its default
+clear time in one click. The "Clear after" chips are prefilled by bucketing the
+member's live `status_expires`, so the dialog reopens showing what is actually
+set. The card publishes its buttons, suggestion rows and chips to the a11y
+tree, which is what lets `chromefit` prove the card holds its own content — the
+defect that motivated the rebuild was a chip row clipped at the card's edge,
+invisible to any check that never saw its rects.
+
 ## Preferences is two-paned, and appearance applies live
 
 Categories left (**Appearance / Messages / Notifications / Advanced**), one pane's
