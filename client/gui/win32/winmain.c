@@ -380,7 +380,12 @@ static void draw_presence_dot_dnd(gfx *rt, float cx, float cy, float r,
 
 
 /* Typed modal form fields; form_dialog() is defined further down. */
-enum { FF_TEXT = 0, FF_PASSWORD, FF_CHECK, FF_CHOICE };
+/* FF_SELECT is FF_CHOICE's long-list sibling: a closed field that opens a
+ * scrolling list, where a chip row wraps and stops being readable. The rule for
+ * choosing is the option COUNT — chips for a handful you want to see at once, a
+ * select for a list you scan. Both carry their options in `hint` as "a|b|c" and
+ * both write the chosen INDEX into `value`, so a caller reads them the same way. */
+enum { FF_TEXT = 0, FF_PASSWORD, FF_CHECK, FF_CHOICE, FF_SELECT };
 
 typedef struct {
     int         kind;
@@ -422,6 +427,113 @@ static HWND       g_form_edit[FORM_MAX_FIELDS];       /* FF_TEXT / FF_PASSWORD o
 static rectf g_form_erect[FORM_MAX_FIELDS];     /* where the painter put each */
 /* One hit-box per clickable non-text control: a checkbox, or one chip of a choice. */
 static struct { rectf r; int field, val; } g_form_hits[FORM_MAX_FIELDS * 4];
+/* FF_SELECT. `g_form_sel_box` is where each closed field was drawn (its click
+ * target); the rest is the open list, and only one is ever open.
+ *
+ * The list is drawn INSIDE the card body and flips upward when it would not fit
+ * below — rather than floating over the card the way the emoji picker does. The
+ * body is clipped to itself (draw_modal), so a panel drawn past its bottom edge
+ * is simply cut off; keeping it inside the clip means the geometry is the whole
+ * of the fix, with no second draw pass and no click-ordering rule to get right. */
+/* Every stroked box on the form sits this far inside the body.
+ *
+ * NOT cosmetic padding. `draw_modal` clips the body to itself and a stroke is
+ * centred on its path, so a box laid flush across the body has half its stroke
+ * outside the clip — and what survives is asymmetric: the LEFT edge disappears
+ * entirely while the right keeps a sliver, so every field rendered as a
+ * rounded rectangle missing one side. One DIP clears the 0.75 half-width of the
+ * 1.5 stroke. `make windows-gfx-test` measures both the trap and this rule. */
+#define FORM_BOX_INSET 1.0f
+static rectf g_form_sel_box[FORM_MAX_FIELDS];
+static int   g_form_sel_field = -1;      /* which field's list is open, -1 none */
+static int   g_form_sel_scroll;          /* first visible row */
+static rectf g_form_sel_panel;
+#define FORM_SEL_VISIBLE 8               /* rows on screen; the rest scroll */
+static struct { rectf r; int val; } g_form_sel_rows[FORM_SEL_VISIBLE];
+static int   g_n_form_sel_rows;
+
+/* Copy option `idx` out of a "a|b|c" list. Returns 0 when idx is past the end. */
+static int sel_opt(const char *hint, int idx, char *out, size_t cap) {
+    if (out && cap) out[0] = '\0';
+    if (!hint) return 0;
+    int k = 0;
+    for (const char *p = hint; ; ) {
+        const char *e = p;
+        while (*e && *e != '|') e++;
+        if (k == idx) {
+            size_t n = (size_t)(e - p);
+            if (n > cap - 1) n = cap - 1;
+            if (out && cap) { memcpy(out, p, n); out[n] = '\0'; }
+            return 1;
+        }
+        if (!*e) return 0;
+        p = e + 1; k++;
+    }
+}
+
+/* The timezone list (REQ-240). US and the rest of North America FIRST, because
+ * that is where the people using this are; the rest follows, roughly west to
+ * east, and is deliberately a short list of zones people actually pick rather
+ * than the whole IANA database — a select you scroll for a minute is a text box
+ * with extra steps.
+ *
+ * The stored value is the IANA name, which is what `users.timezone` holds and
+ * what a profile shows. It is NOT what quiet hours run on: the schedule is
+ * evaluated against `users.tz_offset_min`, which the app-core refreshes from
+ * the OS on every connect (ARCH-103). Setting a zone here says where you are,
+ * not when to stop notifying you — wiring the two together would mean carrying
+ * tzdata into a daemon thread that answers per push, which ARCH-103 declined. */
+#define OC_TZ_UNSET "Not set"
+#define OC_TZ_OPTIONS \
+    OC_TZ_UNSET "|" \
+    "Pacific/Honolulu|America/Anchorage|America/Los_Angeles|America/Phoenix|" \
+    "America/Denver|America/Chicago|America/New_York|America/Toronto|" \
+    "America/Vancouver|America/Halifax|America/Mexico_City|America/Bogota|" \
+    "America/Sao_Paulo|Atlantic/Reykjavik|Europe/Lisbon|Europe/London|" \
+    "Europe/Dublin|Europe/Paris|Europe/Berlin|Europe/Madrid|Europe/Rome|" \
+    "Europe/Warsaw|Europe/Athens|Europe/Kyiv|Europe/Istanbul|Europe/Moscow|" \
+    "Africa/Lagos|Africa/Johannesburg|Africa/Nairobi|Asia/Jerusalem|Asia/Dubai|" \
+    "Asia/Karachi|Asia/Kolkata|Asia/Dhaka|Asia/Bangkok|Asia/Shanghai|" \
+    "Asia/Singapore|Asia/Hong_Kong|Asia/Tokyo|Asia/Seoul|" \
+    "Australia/Perth|Australia/Adelaide|Australia/Sydney|Pacific/Auckland"
+
+static int sel_opt(const char *hint, int idx, char *out, size_t cap);   /* fwd */
+
+/* Where `tz` sits in `opts`, or -1 when it is not there. */
+static int tz_find(const char *opts, const char *tz) {
+    if (!tz || !tz[0]) return -1;
+    char opt[64];
+    for (int i = 0; sel_opt(opts, i, opt, sizeof opt); i++)
+        if (!strcmp(opt, tz)) return i;
+    return -1;
+}
+
+/* The option list to offer for a stored zone: the standard set, plus that zone
+ * appended when it is not among them.
+ *
+ * Without the append, a value this build does not list would resolve to index 0
+ * — "Not set" — and the next Save would SILENTLY CLEAR a timezone the user
+ * never touched. `users.timezone` holds free text and the field it replaced was
+ * a text box, so zones outside this list demonstrably exist. Offering the
+ * stored value back is what makes opening the screen a safe act: a select can
+ * only write one of its own options, so its options have to include whatever it
+ * was given. */
+static char g_tz_opts[2048];
+static const char *tz_options_for(const char *tz) {
+    snprintf(g_tz_opts, sizeof g_tz_opts, "%s", OC_TZ_OPTIONS);
+    if (tz && tz[0] && tz_find(g_tz_opts, tz) < 0) {
+        size_t n = strlen(g_tz_opts);
+        snprintf(g_tz_opts + n, sizeof g_tz_opts - n, "|%s", tz);
+    }
+    return g_tz_opts;
+}
+
+static int sel_count(const char *hint) {
+    if (!hint || !hint[0]) return 0;
+    int n = 1;
+    for (const char *p = hint; *p; p++) if (*p == '|') n++;
+    return n;
+}
 static int g_n_form_hits;
 
 /* The quick reactions offered inline by the message menu. Shortcodes,
@@ -6275,13 +6387,17 @@ static void draw_profile_card(gfx *rt, const oc_model *m, rectf reg) {
          * points here with "Profile", and photo/name/password/sessions moved
          * off its top level. Two labelled groups of stacked bordered buttons,
          * the About-tab admin idiom. */
+        /* "Change display name" is NOT here: it is a field on the Edit profile
+         * screen (cmd 53), which is the whole point of consolidating it. Two
+         * buttons opening two sheets both titled "Edit profile" is what this
+         * replaced. */
         struct { const char *label; int cmd; int show; } B[6] = {
             { "Edit profile",        53, 1 },
             { "Change photo",        55, 1 },
             { "Remove photo",        56, avatar_of(m, m->user_id) != 0 },
-            { "Change display name", 30, 1 },
             { "Change password",     31, 1 },
             { "Active sessions",     54, 1 },
+            { NULL,                   0, 0 },
         };
         for (int gi = 0; gi < 2; gi++) {
             draw_text(rt, gi == 0 ? "PROFILE" : "ACCOUNT", g_meta,
@@ -6688,7 +6804,7 @@ static const struct { const char *label; int cmd; } PALETTE[] = {
     { "Notifications",           71 },
     { "Keyboard shortcuts",      72 },
     { "Mark all as read",        73 },
-    { "Edit display name",       30 },
+    { "Edit profile",            53 },
     { "Change password",         31 },
     { "Threads",                 74 },
     { "People",                  75 },
@@ -8394,6 +8510,9 @@ static float form_rowh(const oc_field *f, float w) {
 
 static void draw_form(gfx *rt, rectf body) {
     g_n_form_hits = 0;
+    g_n_form_sel_rows = 0;
+    g_form_sel_panel = rf(0, 0, 0, 0);
+    for (int i = 0; i < FORM_MAX_FIELDS; i++) g_form_sel_box[i] = rf(0, 0, 0, 0);
     if (!g_form_f) return;
     float y = body.top + 4;
     for (int i = 0; i < g_form_n; i++) {
@@ -8443,19 +8562,129 @@ static void draw_form(gfx *rt, rectf body) {
                 bx = b.right + 8;
                 k++;
             }
+        } else if (f->kind == FF_SELECT) {
+            draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + 20), OC_COL_TEXT);
+            rectf box = rf(body.left + FORM_BOX_INSET, y + 22,
+                           body.right - FORM_BOX_INSET, y + 50);
+            int open = (g_form_sel_field == i);
+            fill_round(rt, box, 6.0f, OC_COL_INPUT);
+            /* The accent ring while the list is open, matching what a focused
+             * text field wears: the same "this control has the keyboard" cue,
+             * because while a list is open it does. */
+            stroke_round(rt, box, 6.0f, open ? OC_COL_ACCENT : OC_COL_BORDER, 1.5f);
+            g_form_sel_box[i] = box;
+            char cur[96];
+            if (!sel_opt(f->hint, atoi(f->value), cur, sizeof cur)) cur[0] = '\0';
+            draw_text(rt, cur, g_ui, rf(box.left + 9, box.top + 4, box.right - 26, box.bottom),
+                      cur[0] ? OC_COL_TEXT : OC_COL_FAINT);
+            /* A chevron, so the field reads as one that opens rather than one
+             * you type into — the only thing distinguishing the two shapes. */
+            draw_text(rt, open ? "▴" : "▾", g_meta,
+                      rf(box.right - 22, box.top + 5, box.right - 6, box.bottom), OC_COL_FAINT);
         } else {
             draw_text(rt, f->label, g_ui_b, rf(body.left, y, body.right, y + 20), OC_COL_TEXT);
-            rectf box = rf(body.left, y + 22, body.right, y + 50);
+            rectf box = rf(body.left + FORM_BOX_INSET, y + 22,
+                           body.right - FORM_BOX_INSET, y + 50);
             fill_round(rt, box, 6.0f, OC_COL_INPUT);
             /* The focused field gets the accent ring, so tabbing is visible: the
              * EDIT itself draws no border of ours. */
             int focused = (g_form_edit[i] && GetFocus() == g_form_edit[i]);
-            stroke_round(rt, box, 6.0f, focused ? OC_COL_ACCENT : OC_COL_BORDER, focused ? 1.5f : 1.0f);
+            /* ONE weight for both states; only the COLOUR says which has focus.
+             * A 1.0px stroke on a rounded rect antialiases to something so faint
+             * at 100% that an unfocused field read as a half-drawn box beside
+             * the focused one's crisp ring — reported as the field being broken,
+             * which it was not: both rows draw through this same line. Weight
+             * now says "this is a field", colour says "this one has the
+             * keyboard", and the two facts stop competing. */
+            stroke_round(rt, box, 6.0f, focused ? OC_COL_ACCENT : OC_COL_BORDER, 1.5f);
             g_form_erect[i] = box;
             if (f->hint && f->hint[0])
                 draw_text(rt, f->hint, g_meta, rf(body.left, y + 53, body.right, y + 73), OC_COL_FAINT);
         }
         y += rh;
+    }
+
+    /* The open list, drawn after every field so it covers the ones below it
+     * rather than being covered by them — the whole reason it is a second pass
+     * and not part of the FF_SELECT branch above. */
+    if (g_form_sel_field >= 0 && g_form_sel_field < g_form_n) {
+        const oc_field *f = &g_form_f[g_form_sel_field];
+        rectf box = g_form_sel_box[g_form_sel_field];
+        int total = sel_count(f->hint);
+        float rowh = UIS(26.0f);
+        /* How many rows FIT, not how many we would like. The body is clipped to
+         * itself, so a panel taller than the body is not "mostly visible" — it
+         * is cut, and cut flush against the clip it loses its border with the
+         * rows (see FORM_BOX_INSET). Sizing to the space is what keeps the list
+         * a list rather than a rectangle with one side. */
+        float avail = (body.bottom - body.top) - 2 * FORM_BOX_INSET - 8;
+        int fits = (int)(avail / rowh);
+        int vis = total;
+        if (vis > FORM_SEL_VISIBLE) vis = FORM_SEL_VISIBLE;
+        if (vis > fits) vis = fits;
+        if (vis > 0 && box.right > box.left) {
+            float ph = (float)vis * rowh + 8;
+            /* Below the field, or ABOVE it when there is not room. Wherever it
+             * lands it stays FORM_BOX_INSET inside the body on both edges, so
+             * its stroke is never flush with the clip. */
+            float lo = body.top + FORM_BOX_INSET, hi = body.bottom - FORM_BOX_INSET - ph;
+            float top = box.bottom + 2;
+            if (top > hi) {
+                float above = box.top - 2 - ph;
+                top = (above >= lo) ? above : hi;
+            }
+            if (top < lo) top = lo;
+            if (top > hi) top = hi;
+            /* Never leave a SLIVER of another field's box showing. The panel is
+             * opaque, so wherever its top edge lands inside a box, it covers all
+             * of that box except the few pixels above — and a stray rounded
+             * top edge four pixels above the panel's own reads as a doubled,
+             * broken line rather than as a list over a field. So the panel
+             * either clears a box completely or covers it completely: snap up
+             * first, and only down if up will not fit. */
+            for (int k = 0; k < g_form_n; k++) {
+                if (k == g_form_sel_field) continue;
+                rectf b2 = (g_form_f[k].kind == FF_SELECT) ? g_form_sel_box[k]
+                                                           : g_form_erect[k];
+                if (b2.right <= b2.left) continue;
+                if (top <= b2.top || top >= b2.bottom) continue;   /* clear already */
+                float up = b2.top - 2, down = b2.bottom + 2;
+                if (up >= lo)        top = up;
+                else if (down <= hi) top = down;
+                break;              /* one adjustment; the rows are far enough apart */
+            }
+            rectf panel = rf(box.left, top, box.right, top + ph);
+            g_form_sel_panel = panel;
+            /* NO drop shadow. The time dropdown (draw_tp) casts one in
+             * OC_COL_RAIL, which is invisible against the dark sidebar it opens
+             * over and a hard navy band against a white modal card — copying it
+             * here put a heavy dark line under the list. A card-borne dropdown
+             * gets its separation from its border, and from the surface it
+             * covers being a different shade. */
+            fill_round(rt, panel, 6.0f, OC_COL_BASE);
+            stroke_round(rt, panel, 6.0f, OC_COL_BORDER, 1.5f);
+            /* Clamp the scroll HERE, not at the wheel: the visible count depends
+             * on the panel, and the panel is decided in this pass. */
+            int maxs = total - vis; if (maxs < 0) maxs = 0;
+            if (g_form_sel_scroll > maxs) g_form_sel_scroll = maxs;
+            if (g_form_sel_scroll < 0) g_form_sel_scroll = 0;
+            int cur = atoi(f->value);
+            for (int k = 0; k < vis; k++) {
+                int idx = g_form_sel_scroll + k;
+                char opt[96];
+                if (!sel_opt(f->hint, idx, opt, sizeof opt)) break;
+                rectf r2 = rf(panel.left + 3, panel.top + 4 + (float)k * rowh,
+                              panel.right - 3, panel.top + 4 + (float)(k + 1) * rowh);
+                if (idx == cur) fill_round(rt, r2, 4.0f, OC_COL_SELECT);
+                draw_text(rt, opt, g_ui, rf(r2.left + 8, r2.top + 3, r2.right - 6, r2.bottom),
+                          OC_COL_TEXT);
+                if (g_n_form_sel_rows < FORM_SEL_VISIBLE) {
+                    g_form_sel_rows[g_n_form_sel_rows].r = r2;
+                    g_form_sel_rows[g_n_form_sel_rows].val = idx;
+                    g_n_form_sel_rows++;
+                }
+            }
+        }
     }
 }
 
@@ -8800,6 +9029,9 @@ static int modal_key(HWND hwnd, WPARAM vk) {
      * pre-translate handler that would have caught this returns early while a
      * modal is up (deliberately: shortcuts must not open surfaces behind it). */
     if (vk == VK_ESCAPE && g_tp_open) { g_tp_open = 0; return 1; }
+    /* And for a form's open FF_SELECT list: Escape closes the list, not the card
+     * it is standing on. */
+    if (vk == VK_ESCAPE && g_form_sel_field >= 0) { g_form_sel_field = -1; return 1; }
     /* Same rule for the status dialog's emoji picker. */
     if (vk == VK_ESCAPE && g_pick_open && g_pick_target == PICK_STATUS) {
         picker_close(hwnd);
@@ -8868,9 +9100,20 @@ static void layout_natives(HWND hwnd) {
     }
     /* The form's fields are part of the modal, so they do not consult `covered` —
      * the modal IS what covers the window. Positioned inside the rect the painter
-     * recorded, inset so the box reads as the control's border. */
+     * recorded, inset so the box reads as the control's border.
+     *
+     * ...but they DO consult the open FF_SELECT list, and that is the whole of
+     * why: a native child composites ABOVE the drawn scene, so a self-drawn
+     * dropdown is punched through by every EDIT it overlaps — three fields'
+     * worth of text floating on top of the list, which reads as corruption
+     * rather than as a z-order rule. There is no z-order to win here; the only
+     * answer is that the children are not shown. This is the predicate CLIENT.md
+     * requires every native child's visibility to be decided by, and a new one
+     * has to name itself here too. */
+    int sel_list_open = g_form_open && g_form_sel_field >= 0;
     for (int i = 0; i < FORM_MAX_FIELDS; i++) {
         if (!g_form_edit[i]) continue;
+        if (sel_list_open) { ShowWindow(g_form_edit[i], SW_HIDE); continue; }
         rectf b = g_form_erect[i];
         if (!g_form_open || b.right <= b.left) { ShowWindow(g_form_edit[i], SW_HIDE); continue; }
         ShowWindow(g_form_edit[i], SW_SHOW);
@@ -14437,6 +14680,36 @@ static int on_click(HWND hwnd, int x, int y) {
             }
     }
     if (g_form_open) {
+        /* An open list claims EVERY click while it is up, exactly as the emoji
+         * picker does over the status card: a row picks, and anything else
+         * closes it. Without the catch-all, a click meant to dismiss the list
+         * would fall through and also hit whatever is behind it. */
+        if (g_form_sel_field >= 0) {
+            for (int i = 0; i < g_n_form_sel_rows; i++)
+                if (in_rect(g_form_sel_rows[i].r, x, y)) {
+                    snprintf(g_form_f[g_form_sel_field].value,
+                             sizeof g_form_f[g_form_sel_field].value, "%d",
+                             g_form_sel_rows[i].val);
+                    g_form_sel_field = -1;
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 1;
+                }
+            g_form_sel_field = -1;
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 1;
+        }
+        for (int i = 0; i < g_form_n; i++)
+            if (g_form_sel_box[i].right > g_form_sel_box[i].left &&
+                in_rect(g_form_sel_box[i], x, y)) {
+                g_form_sel_field = i;
+                /* Open ON the current value rather than at the top: a list of
+                 * thirty that always opens at row one makes the setting you
+                 * already have the hardest one to see. */
+                g_form_sel_scroll = atoi(g_form_f[i].value) - FORM_SEL_VISIBLE / 2;
+                if (g_form_sel_scroll < 0) g_form_sel_scroll = 0;
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 1;
+            }
         for (int i = 0; i < g_n_form_hits; i++)
             if (in_rect(g_form_hits[i].r, x, y)) {
                 snprintf(g_form_f[g_form_hits[i].field].value,
@@ -16089,6 +16362,11 @@ static int form_dialog(HWND owner, const char *title, oc_field *f, int n) {
     }
 
     g_form_done = 0; g_form_result = 0;
+    /* No list is open when a form opens. It is per-form state, and a stale
+     * field index from the last form would point into a different set of
+     * fields — the same class of bug as a predicate whose default is a real
+     * answer. */
+    g_form_sel_field = -1; g_form_sel_scroll = 0;
     modal_enter(owner, &g_form_open);      /* paints once, so the rects exist */
     layout_natives(owner);
     for (int i = 0; i < n; i++)
@@ -16107,6 +16385,7 @@ static int form_dialog(HWND owner, const char *title, oc_field *f, int n) {
 
     for (int i = 0; i < n; i++)
         if (g_form_edit[i]) { DestroyWindow(g_form_edit[i]); g_form_edit[i] = NULL; }
+    g_form_sel_field = -1;
     g_form_f = NULL; g_form_n = 0;
     SetFocus(owner);
     layout_natives(owner);
@@ -16615,20 +16894,49 @@ static void menu_dispatch(HWND hwnd, int cmd) {
         oc_client_set_status(g_client, "", "", 0);
         if (g_status_open) modal_finish(0);
         break;
-    case 53: {   /* */
-        oc_field f[2] = {
-            { FF_TEXT, "Title",    "Your role, shown on your profile.", "" },
-            { FF_TEXT, "Timezone", "e.g. Europe/London.",               "" },
+    case 53: {   /* Edit profile — ONE screen owning identity (REQ-240) */
+        /* Five fields, in the reference product's order: who you are, what you
+         * are called here, what you do, how to refer to you, how to reach you,
+         * and where you are. Display name is on this card rather than in a
+         * dialog of its own — there were two sheets both titled "Edit profile",
+         * which is one more than a person can be expected to tell apart. */
+        oc_field f[FORM_MAX_FIELDS] = {
+            { FF_TEXT,   "Full name",    "Your name, as people would write it.", "" },
+            { FF_TEXT,   "Display name", "How you appear to everyone in this workspace.", "" },
+            { FF_TEXT,   "Title",        "Your role, shown on your profile.", "" },
+            { FF_TEXT,   "Pronouns",     "Shown beside your name.", "" },
+            { FF_TEXT,   "Phone",        "Only people in this workspace can see it.", "" },
+            { FF_SELECT, "Timezone",     OC_TZ_OPTIONS, "" },
         };
         const oc_model *pm2 = model();
+        const char *had_name = "";
         if (pm2) for (size_t i = 0; i < pm2->n_users; i++)
             if (pm2->users[i].user_id == pm2->user_id) {
-                snprintf(f[0].value, sizeof f[0].value, "%s", pm2->users[i].title);
-                snprintf(f[1].value, sizeof f[1].value, "%s", pm2->users[i].timezone);
+                snprintf(f[0].value, sizeof f[0].value, "%s", pm2->users[i].full_name);
+                snprintf(f[1].value, sizeof f[1].value, "%s", pm2->users[i].name);
+                snprintf(f[2].value, sizeof f[2].value, "%s", pm2->users[i].title);
+                snprintf(f[3].value, sizeof f[3].value, "%s", pm2->users[i].pronouns);
+                snprintf(f[4].value, sizeof f[4].value, "%s", pm2->users[i].phone);
+                /* A SELECT holds an INDEX, so the stored zone is looked up —
+                 * and the list is built around it, so a zone this build does
+                 * not ship still appears and still round-trips. Index 0 is
+                 * "Not set", which is also where an empty value lands. */
+                f[5].hint = tz_options_for(pm2->users[i].timezone);
+                { int ti = tz_find(f[5].hint, pm2->users[i].timezone);
+                  snprintf(f[5].value, sizeof f[5].value, "%d", ti < 0 ? 0 : ti); }
+                had_name = pm2->users[i].name;
                 break;
             }
-        if (!form_dialog(hwnd, "Edit profile", f, 2)) break;
-        oc_client_set_profile(g_client, f[0].value, f[1].value);
+        if (!form_dialog(hwnd, "Edit profile", f, 6)) break;
+        char tz[64]; sel_opt(f[5].hint, atoi(f[5].value), tz, sizeof tz);
+        if (!strcmp(tz, OC_TZ_UNSET)) tz[0] = '\0';
+        oc_client_set_profile(g_client, f[0].value, f[2].value, f[3].value, f[4].value, tz);
+        /* The display name is its own op on the wire (SET_DISPLAY_NAME), so the
+         * one screen makes two calls — and only when it CHANGED, because a
+         * rename fans a PROFILE_UPDATED to every connection in the workspace and
+         * doing that on every Save would announce a change nobody made. */
+        if (f[1].value[0] && strcmp(f[1].value, had_name))
+            oc_client_set_display_name(g_client, f[1].value);
         break; }
     case 55: {   /* choose an image, upload it, claim it as the avatar */
         if (!g_client) break;
@@ -17187,6 +17495,22 @@ static void test_dump(const char *path) {
         fprintf(f, "  sbrow sec=%d header=%d cid=%llu label=\"%s\"\n",
                 g_rows[i].sec, g_rows[i].header,
                 (unsigned long long)g_rows[i].cid, g_rows[i].label);
+    /* My own profile fields (REQ-240), so a harness can prove a save round-
+     * tripped through the daemon rather than inferring it from a screenshot.
+     * Read from the ROSTER entry, which is where a restarted client's copy
+     * comes from — the point being that it survived the process. */
+    {
+        const char *pfn = "", *ptl = "", *ppr = "", *pph = "", *ptz = "";
+        if (m) for (size_t i = 0; i < m->n_users; i++)
+            if (m->users[i].user_id == m->user_id) {
+                pfn = m->users[i].full_name; ptl = m->users[i].title;
+                ppr = m->users[i].pronouns;  pph = m->users[i].phone;
+                ptz = m->users[i].timezone;
+                break;
+            }
+        fprintf(f, "myprofile full=\"%s\" title=\"%s\" pronouns=\"%s\" phone=\"%s\" tz=\"%s\"\n",
+                pfn, ptl, ppr, pph, ptz);
+    }
     fprintf(f, "myavatar=%llu profileuid=%llu rpmode=%d prof_dm=%.0f,%.0f,%.0f,%.0f\n",
             (unsigned long long)avatar_of(m, m->user_id),
             (unsigned long long)g_profile_uid, g_rp_mode,
@@ -17262,11 +17586,24 @@ static void test_dump(const char *path) {
             WCHAR w[256]; GetWindowTextW(g_form_edit[i], w, 256);
             WideCharToMultiByte(CP_UTF8, 0, w, -1, cur, (int)sizeof cur, NULL, NULL);
         }
+        /* A SELECT has no native EDIT, so `cur` is empty for one and the rect
+         * that matters is its own box: report both, or the harness cannot tell a
+         * select that is not drawn from one whose value it cannot read. */
+        rectf fr = (g_form_f[i].kind == FF_SELECT) ? g_form_sel_box[i] : g_form_erect[i];
+        if (g_form_f[i].kind == FF_SELECT)
+            sel_opt(g_form_f[i].hint, atoi(g_form_f[i].value), cur, sizeof cur);
         fprintf(f, "  formfield %d kind=%d edit=%d r=%.0f,%.0f,%.0f,%.0f value=\"%s\"\n",
                 i, g_form_f[i].kind, g_form_edit[i] ? 1 : 0,
-                g_form_erect[i].left, g_form_erect[i].top,
-                g_form_erect[i].right, g_form_erect[i].bottom, cur);
+                fr.left, fr.top, fr.right, fr.bottom, cur);
     }
+    fprintf(f, "formsel open=%d field=%d scroll=%d rows=%d panel=%.0f,%.0f,%.0f,%.0f\n",
+            g_form_sel_field >= 0, g_form_sel_field, g_form_sel_scroll, g_n_form_sel_rows,
+            g_form_sel_panel.left, g_form_sel_panel.top,
+            g_form_sel_panel.right, g_form_sel_panel.bottom);
+    for (int i = 0; i < g_n_form_sel_rows; i++)
+        fprintf(f, "  formselrow i=%d val=%d r=%.0f,%.0f,%.0f,%.0f\n",
+                i, g_form_sel_rows[i].val, g_form_sel_rows[i].r.left, g_form_sel_rows[i].r.top,
+                g_form_sel_rows[i].r.right, g_form_sel_rows[i].r.bottom);
     {
         char stxt[128] = "";
         if (g_status_edit) {
@@ -18128,16 +18465,16 @@ static void test_poll(HWND hwnd) {
         oc_client_set_status(g_client, emo, txt, 0);
         test_ack("ok");
     } else if (!strcmp(verb, "profile_set")) {
-        /* `profile_set <timezone> <title...>` — timezone first because it has no
-         * spaces, so one sscanf-free split is unambiguous. */
-        char tz[48] = {0}; const char *title = "";
-        if (arg[0]) {
-            size_t k = 0;
-            while (arg[k] && arg[k] != ' ' && k + 1 < sizeof tz) { tz[k] = arg[k]; k++; }
-            tz[k] = 0;
-            title = arg[k] == ' ' ? arg + k + 1 : "";
-        }
-        oc_client_set_profile(g_client, title, tz);
+        /* `profile_set <tz>|<full name>|<title>|<pronouns>|<phone>` — pipe
+         * separated because every field but the timezone may contain spaces,
+         * and a positional split on spaces could not tell where one ends.
+         * Trailing fields may be omitted; each defaults to empty. */
+        char buf[512]; snprintf(buf, sizeof buf, "%s", arg);
+        const char *pf[5] = { "", "", "", "", "" };
+        int np = 0; pf[np++] = buf;
+        for (char *q = buf; *q && np < 5; q++)
+            if (*q == '|') { *q = '\0'; pf[np++] = q + 1; }
+        oc_client_set_profile(g_client, pf[1], pf[2], pf[3], pf[4], pf[0]);
         test_ack("ok");
     } else if (!strcmp(verb, "mkhook")) {
         /* Bypass the Create-webhook form, as mkchan and upload bypass theirs: the
@@ -18969,6 +19306,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         const oc_model *wm = model();
         if (g_tp_open) {   /* the open dropdown owns the wheel, as a dropdown does */
             g_tp_scroll -= dy;
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        /* Same rule for a form's open list — and it is what makes a
+         * thirty-option select usable at all, since only eight rows are on
+         * screen. In ROWS, not pixels: the panel's row height is decided during
+         * paint, and a pixel offset would have to guess it. */
+        if (g_form_sel_field >= 0) {
+            g_form_sel_scroll -= (GET_WHEEL_DELTA_WPARAM(wp) > 0) ? 3 : -3;
+            if (g_form_sel_scroll < 0) g_form_sel_scroll = 0;
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }

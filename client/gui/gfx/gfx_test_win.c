@@ -81,6 +81,76 @@ int main(void)
     CHECK(near_rgb(px(100, 200), 64, 128, 255));
     CHECK(near_rgb(px(100, 210), 0, 0, 0));
 
+    /* -- stroke_round: ALL FOUR EDGES ------------------------------------- */
+    /* Every field box, card and chip in the client is this primitive, and it
+     * had no test at all — which is how a rounded rect shipped drawing three of
+     * its four sides. The assertion is deliberately one probe per EDGE rather
+     * than a lit-pixel count: a count passes with a side missing, which is
+     * exactly the bug it would need to catch. */
+    gfx_begin(g, 0x000000);
+    gfx_stroke_round(g, (gfx_rect){ 100, 100, 200, 60 }, 6.0f, 2.0f, 0xFFFFFF, 1.0f);
+    CHECK(gfx_readback(g, shot, W, H));
+    {
+        /* Mid-edge probes, away from the corner arcs. A stroke centred on the
+         * path straddles the boundary, so scan a few pixels either side and
+         * require SOMETHING lit rather than pinning an exact column. */
+        int top = 0, bottom = 0, left = 0, right = 0;
+        for (int d = -2; d <= 2; d++) {
+            if (px(200, 100 + d)[0] > 100) top++;
+            if (px(200, 160 + d)[0] > 100) bottom++;
+            if (px(100 + d, 130)[0] > 100) left++;
+            if (px(300 + d, 130)[0] > 100) right++;
+        }
+        CHECK(top > 0);                      /* top edge drawn */
+        CHECK(bottom > 0);                   /* bottom edge drawn */
+        CHECK(left > 0);                     /* LEFT edge drawn */
+        CHECK(right > 0);                    /* right edge drawn */
+        CHECK(near_rgb(px(200, 130), 0, 0, 0));   /* and the middle stays empty */
+    }
+
+    /* THE CALLER'S RULE: a stroke must sit at least its half-width inside any
+     * clip that is active.
+     *
+     * A stroke is centred on its path, so a rect laid FLUSH with the clip has
+     * half its width outside — and what survives is not symmetric: the left
+     * edge vanishes completely while the right keeps a sliver. That is not a
+     * rounding subtlety anyone eyeballs, it is a rounded rectangle drawing
+     * three of its four sides, and it shipped exactly that way in the modal
+     * form, whose boxes spanned the full clipped body.
+     *
+     * Both cases are asserted. The flush one documents the trap by measuring
+     * it; the inset one is the rule, and is what callers do. */
+    gfx_begin(g, 0x000000);
+    gfx_clip_push(g, (gfx_rect){ 100, 100, 200, 60 });
+    gfx_stroke_round(g, (gfx_rect){ 100, 100, 200, 60 }, 6.0f, 1.5f, 0xFFFFFF, 1.0f);
+    gfx_clip_pop(g);
+    CHECK(gfx_readback(g, shot, W, H));
+    {
+        int left = 0;
+        for (int d = 0; d <= 2; d++)
+            if (px(100 + d, 130)[0] > 60) left++;
+        CHECK(left == 0);          /* the trap, measured rather than described */
+    }
+
+    gfx_begin(g, 0x000000);
+    gfx_clip_push(g, (gfx_rect){ 100, 100, 200, 60 });
+    gfx_stroke_round(g, (gfx_rect){ 101, 101, 198, 58 }, 6.0f, 1.5f, 0xFFFFFF, 1.0f);
+    gfx_clip_pop(g);
+    CHECK(gfx_readback(g, shot, W, H));
+    {
+        int top = 0, bottom = 0, left = 0, right = 0;
+        for (int d = -1; d <= 1; d++) {
+            if (px(200, 101 + d)[0] > 60) top++;
+            if (px(200, 159 + d)[0] > 60) bottom++;
+            if (px(101 + d, 130)[0] > 60) left++;
+            if (px(299 + d, 130)[0] > 60) right++;
+        }
+        CHECK(top > 0);
+        CHECK(bottom > 0);
+        CHECK(left > 0);           /* the edge the flush case loses */
+        CHECK(right > 0);
+    }
+
     /* -- icon tessellation ------------------------------------------------- */
     gfx_begin(g, 0x000000);
     gfx_icon(g, OC_ICON_PLUS, (gfx_rect){ 200, 100, 48, 48 }, 2.0f,

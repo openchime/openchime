@@ -183,6 +183,10 @@ typedef struct {
      * `author_name` already exist and carry the custom status's two halves. */
     char     pf_title[64];
     char     pf_tz[48];
+    char     pf_full_name[64];
+    char     pf_pronouns[32];
+    /* PROFILE_INFO only — a phone number is not on the roster. */
+    char     pf_phone[40];
     /* The recurring schedule (REQ-136) and the two alert lists (REQ-135). Inline
      * arrays: both are wire-capped and small, and a fixed array needs no
      * ownership rules — the same reasoning `peers` and `gids` already use. */

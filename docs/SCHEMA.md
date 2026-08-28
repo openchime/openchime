@@ -4,7 +4,7 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Status.** **Migrations 0001–0038 are applied** (`daemon/migrate.c`,
+**Status.** **Migrations 0001–0039 are applied** (`daemon/migrate.c`,
 `OC_MIGRATIONS`). 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
 credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
@@ -24,7 +24,7 @@ drafts, then unaddressed drafts; **0032** (§3aa) scheduled messages;
 **0033–0035** (§3j) the notification pause, the per-weekday schedule that
 replaces the DND window, and keywords + priority people; **0036** (§3ab) thread
 follows and per-thread read cursors; **0037** the attachment idempotency token;
-**0038** (§3ac) link unfurls.
+**0038** (§3ac) link unfurls; **0039** (§3ad) the rest of the profile.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -954,6 +954,38 @@ join per row. *No thumbnail column* — og:image is deferred (ARCH-105), and a
 column now would pretend otherwise. Rows are deleted with the message's other
 body-attached state on tombstone (§3r's reasoning) and wholesale on edit, since
 they describe the old body; the net thread re-fetches from the new one.
+
+## 3ad. Migration 0039 — the rest of the profile (REQ-240)
+
+```sql
+ALTER TABLE users ADD COLUMN full_name TEXT;
+ALTER TABLE users ADD COLUMN phone TEXT;
+ALTER TABLE users ADD COLUMN pronouns TEXT;
+```
+
+All on `users`, for the reason 0027's fields are: they are facts about a person,
+there is exactly one row per person, and a side table would buy nothing but a
+join.
+
+*`full_name` beside `display_name`* is the split the reference product makes,
+and the two answer different questions — what you are called on paper, and what
+a transcript calls you. Neither substitutes for the other, which is why one
+column could not serve both.
+
+*Two of the three ride the roster, one does not.* `full_name` and `pronouns` are
+read beside a name, so they travel on `USER_LIST` as well as `PROFILE_INFO` —
+the People directory (REQ-289) can learn them nowhere else, since `PROFILE_INFO`
+reaches only the person who edited it. **`phone` stays off the roster**: it is
+contact detail, and every member's number in every fan-out is a size and privacy
+cost nobody asked for.
+
+*All nullable, no defaults.* An absent value means the person has not said,
+which is a different thing from an empty string they typed and cleared.
+
+*`timezone` is unaffected and stays what it was* — the human-readable fact for
+the profile. Quiet hours run on `users.tz_offset_min`, which the client
+refreshes from the OS on every connect (ARCH-103); a zone chosen on the profile
+screen says where somebody is, not when to stop notifying them.
 
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 

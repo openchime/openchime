@@ -52,7 +52,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 38);
+    CHECK(oc_schema_version(db) == 39);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -3602,16 +3602,42 @@ static void test_status_and_profile(void) {
     CHECK(r && r->st_emoji[0] == '\0' && r->st_expires == 0);
     oc_dbres_free(r);
 
-    /* Profile fields round-trip and do not disturb the status. */
+    /* Profile fields round-trip and do not disturb the status. All five are
+     * written together, because the screen commits them together. */
     j = oc_job_new(OC_JOB_SET_PROFILE, 5);
     j->user_id = alice;
-    j->ch_name = strdup("Principal Engineer");
-    oc_job_set_body(j, "Europe/London", 13);
+    j->pf_full_name = strdup("Alice Liddell");
+    j->pf_title     = strdup("Principal Engineer");
+    j->pf_pronouns  = strdup("she/her");
+    j->pf_phone     = strdup("+1 555 0100");
+    j->pf_timezone  = strdup("America/New_York");
     oc_dbwriter_submit(w, j);
     r = wait_result(w);
     CHECK(r && r->pf_title && strcmp(r->pf_title, "Principal Engineer") == 0);
-    CHECK(r->pf_tz && strcmp(r->pf_tz, "Europe/London") == 0);
+    CHECK(r->pf_tz && strcmp(r->pf_tz, "America/New_York") == 0);
+    CHECK(r->pf_full_name && strcmp(r->pf_full_name, "Alice Liddell") == 0);
+    CHECK(r->pf_pronouns && strcmp(r->pf_pronouns, "she/her") == 0);
+    CHECK(r->pf_phone && strcmp(r->pf_phone, "+1 555 0100") == 0);
     CHECK(r->role == OC_ROLE_OWNER);
+    /* The status set above survives a profile write: one screen's fields must
+     * not clear another's. */
+    CHECK(r->st_emoji && r->st_emoji[0] == '\0');
+    oc_dbres_free(r);
+
+    /* An empty field CLEARS the column rather than leaving the old value: the
+     * user deleted it, which is a thing they did. */
+    j = oc_job_new(OC_JOB_SET_PROFILE, 5);
+    j->user_id = alice;
+    j->pf_full_name = strdup("");
+    j->pf_title     = strdup("");
+    j->pf_pronouns  = strdup("");
+    j->pf_phone     = strdup("");
+    j->pf_timezone  = strdup("");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->pf_title && r->pf_title[0] == '\0');
+    CHECK(r->pf_full_name && r->pf_full_name[0] == '\0');
+    CHECK(r->pf_phone && r->pf_phone[0] == '\0');
     oc_dbres_free(r);
 
     oc_dbwriter_stop(w);

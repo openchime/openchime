@@ -38,7 +38,14 @@
  * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
  * preview_author. Shipping client and daemon together (ARCH-61) means there is
  * no compatibility window to preserve — only a mismatch to detect loudly. */
-/* 8: TYPING and TYPING_UPDATE move to 0x007E/0x007F, off the two opcodes they
+/* 9: SET_PROFILE moves to 0x00D8, off the opcode it shared with SET_PRESENCE,
+ * and the profile frames grow. Both halves are wire changes the version exists
+ * to make loud: the two types were both C->S, so the dispatch chain reached
+ * presence first and a profile payload was decoded as a presence one; and
+ * SET_PROFILE, PROFILE_INFO and USER_LIST all gain fields, USER_LIST being a
+ * repeated list where one added field shifts every entry after the first.
+ *
+ * 8: TYPING and TYPING_UPDATE move to 0x007E/0x007F, off the two opcodes they
  * shared with PROFILE_INFO and LIST_FILE_CHANNELS. No frame's layout changed, so
  * this is the one case the rule above does not cover — but it is a wire change
  * of exactly the kind the version exists to make loud: a v7 peer's TYPING is a
@@ -58,7 +65,7 @@
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
  * "connection lost" (ARCH-61 ships the two together). */
-#define OC_PROTOCOL_VERSION 8u
+#define OC_PROTOCOL_VERSION 9u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -180,7 +187,7 @@ typedef enum {
     OC_MSG_LIST_FILE_CHANNELS = 0x0073, /* C->S */
     OC_MSG_FILE_CHANNELS      = 0x0074, /* S->C, (channel_id, count) pairs */
     OC_MSG_SET_STATUS         = 0x006F, /* C->S, my custom status (empty text clears) */
-    OC_MSG_SET_PROFILE        = 0x0070, /* C->S, my title/timezone */
+    OC_MSG_SET_PROFILE        = 0x00D8, /* C->S, my profile fields (REQ-240) */
     OC_MSG_PROFILE_INFO       = 0x0072, /* S->C, a user's full profile (also a push) */
     OC_MSG_SET_MUTE           = 0x006D, /* C->S, mute/unmute a conversation */
     OC_MSG_SET_READ_CURSOR    = 0x006E, /* C->S, set the cursor (may move BACK) */
@@ -204,8 +211,9 @@ typedef enum {
      * dispatch chains happening to hold one branch per value, which is a
      * property the next inbound branch silently removes. Typing moves rather
      * than the other two because it is the only contiguous pair among them, so
-     * two values buy back both collisions. 0x0070 still carries two types
-     * (SET_PROFILE/SET_PRESENCE) and is a live defect, tracked separately. */
+     * two values buy back both collisions. Every opcode now carries exactly one
+     * message type, which is what scripts/check_opcodes.sh enforces with no
+     * exceptions. */
     OC_MSG_TYPING           = 0x007E, /* C->S, "I am typing" in a channel (REQ-121) */
     OC_MSG_TYPING_UPDATE    = 0x007F, /* S->C, relay of a typing signal */
     OC_MSG_UPLOAD_BEGIN     = 0x0080, /* C->S, declare an attachment upload (REQ-140) */
@@ -767,7 +775,10 @@ typedef struct { uint64_t webhook_id; } oc_rotate_webhook;
 /* / `expires_at` 0 means "until I change it"; the DAEMON enforces the
  * expiry, because a client that is not running cannot clear its own status. */
 typedef struct { oc_slice emoji; oc_slice text; uint64_t expires_at; } oc_set_status;
-typedef struct { oc_slice title; oc_slice timezone; } oc_set_profile;
+/* The whole profile in one frame, because it is edited on one screen (REQ-240)
+ * and a field-at-a-time wire would make Cancel mean "some of it stuck". */
+typedef struct { oc_slice full_name; oc_slice title; oc_slice pronouns;
+                 oc_slice phone; oc_slice timezone; } oc_set_profile;
 /* An id, not bytes: the image goes up through the ordinary attachment
  * upload (REQ-140) and this points at the result, so dedup, size caps and the blob
  * store all keep working. 0 clears the avatar. */
@@ -783,10 +794,14 @@ typedef struct { oc_slice name; uint64_t attachment_id; } oc_add_emoji;
 typedef struct { oc_slice name; } oc_delete_emoji;
 typedef struct { oc_slice name; uint64_t attachment_id; uint64_t created_by; } oc_emoji_entry;
 typedef struct { uint16_t count; const oc_emoji_entry *entries; } oc_emoji_list;
+/* Everything a card shows about one person. `phone` is here and NOT on
+ * USER_LIST: this frame goes to the one person who asked for the card, where a
+ * roster fan-out would hand every member's number to everybody. */
 typedef struct { uint64_t user_id; oc_slice display_name; oc_slice email;
                  oc_slice status_emoji; oc_slice status_text; uint64_t status_expires;
                  oc_slice title; oc_slice timezone; uint64_t avatar_id;
-                 uint8_t role; } oc_profile_info;
+                 uint8_t role; oc_slice full_name; oc_slice pronouns;
+                 oc_slice phone; } oc_profile_info;
 /* Counts, not rows: the column shows "#design 12", so the wire carries
  * exactly that and nothing more. */
 /* REQ-182. `current` marks the connection asking — you should be able to tell which
@@ -989,7 +1004,11 @@ typedef struct { uint16_t count; const oc_channel_list_entry *entries; } oc_chan
 typedef struct { uint64_t user_id; uint8_t role; uint8_t disabled; oc_slice email;
                  oc_slice display_name; uint64_t avatar_id;
                  oc_slice title; oc_slice timezone;
-                 oc_slice status_emoji; oc_slice status_text; } oc_user_list_entry;
+                 oc_slice status_emoji; oc_slice status_text;
+                 /* Both are drawn BESIDE a name, so the directory (REQ-289) and
+                  * every roster need them from here — PROFILE_INFO reaches only
+                  * the person who edited it. `phone` is deliberately absent. */
+                 oc_slice full_name; oc_slice pronouns; } oc_user_list_entry;
 typedef struct { uint16_t count; const oc_user_list_entry *entries; } oc_user_list;
 typedef struct { uint64_t user_id; uint8_t role; } oc_set_role;
 typedef struct { uint8_t role; } oc_invite_user;

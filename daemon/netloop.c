@@ -227,6 +227,14 @@ static int set_nonblock(int fd) {
     return (fl < 0) ? -1 : fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
+/* A wire slice as a heap C string, empty rather than NULL for an absent value.
+ * An empty string is what the profile columns want: the caller cleared the
+ * field, which is a thing they did, and binding NULL would instead leave the
+ * old value in place on an UPDATE that names the column. */
+static char *slice_dup(oc_slice s) {
+    return s.len ? strndup((const char *)s.ptr, s.len) : strdup("");
+}
+
 /* Fixed-window send rate limit (REQ-190). Returns 1 if this send is within
  * budget for the current window, 0 if the cap is exceeded. */
 static int send_rate_ok(conn *c) {
@@ -1320,9 +1328,11 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             oc_job *j = oc_job_new(OC_JOB_SET_PROFILE, c->conn_id);
             if (!j) return -1;
             j->user_id = c->user_id;
-            j->ch_name = sp.title.len ? strndup((const char *)sp.title.ptr, sp.title.len)
-                                      : strdup("");
-            oc_job_set_body(j, sp.timezone.ptr, sp.timezone.len);
+            j->pf_full_name = slice_dup(sp.full_name);
+            j->pf_title     = slice_dup(sp.title);
+            j->pf_pronouns  = slice_dup(sp.pronouns);
+            j->pf_phone     = slice_dup(sp.phone);
+            j->pf_timezone  = slice_dup(sp.timezone);
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -2316,6 +2326,8 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             ents[i].timezone = oc_slice_str(r->ulist[i].timezone ? r->ulist[i].timezone : "");
             ents[i].status_emoji = oc_slice_str(r->ulist[i].status_emoji ? r->ulist[i].status_emoji : "");
             ents[i].status_text = oc_slice_str(r->ulist[i].status_text ? r->ulist[i].status_text : "");
+            ents[i].full_name = oc_slice_str(r->ulist[i].full_name ? r->ulist[i].full_name : "");
+            ents[i].pronouns = oc_slice_str(r->ulist[i].pronouns ? r->ulist[i].pronouns : "");
         }
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_user_list ul = { (uint16_t)n, ents };
@@ -2971,6 +2983,9 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         pi.timezone       = oc_slice_str(r->pf_tz ? r->pf_tz : "");
         pi.avatar_id      = r->pf_avatar;
         pi.role           = r->role;
+        pi.full_name      = oc_slice_str(r->pf_full_name ? r->pf_full_name : "");
+        pi.pronouns       = oc_slice_str(r->pf_pronouns ? r->pf_pronouns : "");
+        pi.phone          = oc_slice_str(r->pf_phone ? r->pf_phone : "");
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_encode_profile_info(&w, OC_PROTOCOL_VERSION, &pi);
         send_bytes(ep, conns, c->fd, g_enc, w.len);

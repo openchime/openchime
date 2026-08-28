@@ -579,7 +579,8 @@ that actually changed.
 ### `form_dialog()` — our frame, the platform's fields
 
 `form_dialog(owner, title, fields, n)` is the generic typed form (`FF_TEXT`,
-`FF_PASSWORD`, `FF_CHECK`, `FF_CHOICE`) behind every typed form in the client —
+`FF_PASSWORD`, `FF_CHECK`, `FF_CHOICE`, `FF_SELECT`) behind every typed form in
+the client —
 topics, renames, webhooks, invites, quick reactions, sign-up, keywords, priority
 people, the custom pause time, profile fields, sections and more. It splits the
 work deliberately:
@@ -589,6 +590,25 @@ work deliberately:
 - the **chrome is ours**, because sixteen grey Windows-95 boxes in the middle of a
   themed app were never worth it — and none of them was dismissible the way every
   other sheet is, screenshot-comparable, or reachable by the harness.
+
+**`FF_CHOICE` and `FF_SELECT` are the same question at two sizes.** Choice is a
+chip row — right for a handful of options you want to see at once. Select is a
+closed field opening a scrolling list, for a set you scan rather than survey
+(the timezone list, REQ-240). Both carry their options in `hint` as `"a|b|c"`
+and both write the chosen **index** into `value`, so a caller reads them alike.
+
+The list is drawn **inside the card body**, flipping above the field when there
+is no room below, rather than floating over the card the way the emoji picker
+does — the body is clipped to itself, so a panel drawn past its bottom edge is
+simply cut off, and keeping it inside the clip makes the geometry the whole fix.
+
+**Its native `EDIT`s are hidden while the list is open**, and that is not
+tidiness: a native child composites *above* the drawn scene, so an open list is
+punched through by every field it overlaps — three fields' worth of text
+floating on top of the list, which reads as corruption rather than as a z-order
+rule. There is no z-order to win; the children are simply not shown. This is the
+`layout_natives()` predicate rule above, and a new native child has to name
+itself there too.
 
 The fields are children of the **main** window, positioned by `layout_natives()`
 from rects the painter recorded — the arrangement the sign-in card already uses.

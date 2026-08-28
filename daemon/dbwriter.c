@@ -196,6 +196,11 @@ static void job_free(oc_job *j) {
     free(j->body);
     free(j->cursors);
     free(j->ch_name);
+    free(j->pf_full_name);
+    free(j->pf_title);
+    free(j->pf_pronouns);
+    free(j->pf_phone);
+    free(j->pf_timezone);
     free(j->emoji);
     free(j->cert_pem);
     free(j->key_pem);
@@ -266,6 +271,7 @@ void oc_dbres_free(oc_dbres *r) {
     free(r->body);
     /* 53's profile strings, alongside every other heap field. */
     free(r->st_emoji); free(r->st_text); free(r->pf_title); free(r->pf_tz);
+    free(r->pf_full_name); free(r->pf_pronouns); free(r->pf_phone);
     free(r->fchans);
     for (size_t i = 0; i < r->n_sessions; i++) free((void *)r->sessions[i].device_label.ptr);
     free(r->sessions);
@@ -302,6 +308,7 @@ void oc_dbres_free(oc_dbres *r) {
         free(r->ulist[i].email); free(r->ulist[i].display_name);
         free(r->ulist[i].title); free(r->ulist[i].timezone);
         free(r->ulist[i].status_emoji); free(r->ulist[i].status_text);
+        free(r->ulist[i].full_name); free(r->ulist[i].pronouns);
     }
     free(r->ulist);
     free(r->emoji);
@@ -872,7 +879,8 @@ static oc_dbres *process_list_users(sqlite3 *db, const oc_job *j) {
     sqlite3_prepare_v2(db,
         "SELECT id, role, disabled, COALESCE(email,''), COALESCE(display_name,''), "
         "       COALESCE(avatar_attachment_id,0), COALESCE(title,''), COALESCE(timezone,''), "
-        "       COALESCE(status_emoji,''), COALESCE(status_text,''), status_expires_ms "
+        "       COALESCE(status_emoji,''), COALESCE(status_text,''), status_expires_ms, "
+        "       COALESCE(full_name,''), COALESCE(pronouns,'') "
         "FROM users ORDER BY id;", -1, &st, NULL);
     size_t cap = 8, n = 0;
     oc_user_row *arr = malloc(cap * sizeof *arr);
@@ -897,6 +905,8 @@ static oc_dbres *process_list_users(sqlite3 *db, const oc_job *j) {
             arr[n].status_emoji = strdup(expired ? "" : (const char *)sqlite3_column_text(st, 8));
             arr[n].status_text  = strdup(expired ? "" : (const char *)sqlite3_column_text(st, 9));
         }
+        arr[n].full_name    = strdup((const char *)sqlite3_column_text(st, 11));
+        arr[n].pronouns     = strdup((const char *)sqlite3_column_text(st, 12));
         n++;
     }
     sqlite3_finalize(st);
@@ -4486,7 +4496,8 @@ static void build_profile(sqlite3 *db, uint64_t uid, oc_dbres *r) {
     sqlite3_prepare_v2(db,
         "SELECT COALESCE(display_name,''), COALESCE(email,''), COALESCE(status_emoji,''), "
         "       COALESCE(status_text,''), status_expires_ms, COALESCE(title,''), "
-        "       COALESCE(timezone,''), COALESCE(avatar_attachment_id,0), role "
+        "       COALESCE(timezone,''), COALESCE(avatar_attachment_id,0), role, "
+        "       COALESCE(full_name,''), COALESCE(pronouns,''), COALESCE(phone,'') "
         "  FROM users WHERE id=?;", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, (sqlite3_int64)uid);
     if (sqlite3_step(st) == SQLITE_ROW) {
@@ -4514,6 +4525,12 @@ static void build_profile(sqlite3 *db, uint64_t uid, oc_dbres *r) {
         r->role = (rl && !strcmp((const char *)rl, "owner")) ? OC_ROLE_OWNER
                 : (rl && !strcmp((const char *)rl, "admin")) ? OC_ROLE_ADMIN
                                                              : OC_ROLE_MEMBER;
+        const unsigned char *fn = sqlite3_column_text(st, 9);
+        const unsigned char *pr = sqlite3_column_text(st, 10);
+        const unsigned char *ph = sqlite3_column_text(st, 11);
+        r->pf_full_name = strdup(fn ? (const char *)fn : "");
+        r->pf_pronouns  = strdup(pr ? (const char *)pr : "");
+        r->pf_phone     = strdup(ph ? (const char *)ph : "");
     }
     sqlite3_finalize(st);
 }
@@ -4549,11 +4566,18 @@ static oc_dbres *process_set_profile(sqlite3 *db, const oc_job *j) {
     if (!r) return NULL;
     r->conn_id = j->conn_id;
     sqlite3_stmt *st = NULL;
-    sqlite3_prepare_v2(db, "UPDATE users SET title=?1, timezone=?2 WHERE id=?3;", -1, &st, NULL);
-    sqlite3_bind_text (st, 1, j->ch_name ? j->ch_name : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text (st, 2, j->body ? (const char *)j->body : "",
-                       j->body ? (int)j->body_len : 0, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->user_id);
+    /* One statement for the whole screen: the fields are edited together and
+     * committed together, so a partial write cannot leave the card showing a
+     * mix of what was saved and what was not. */
+    sqlite3_prepare_v2(db,
+        "UPDATE users SET full_name=?1, title=?2, pronouns=?3, phone=?4, timezone=?5 "
+        "  WHERE id=?6;", -1, &st, NULL);
+    sqlite3_bind_text (st, 1, j->pf_full_name ? j->pf_full_name : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 2, j->pf_title     ? j->pf_title     : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 3, j->pf_pronouns  ? j->pf_pronouns  : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 4, j->pf_phone     ? j->pf_phone     : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 5, j->pf_timezone  ? j->pf_timezone  : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)j->user_id);
     sqlite3_step(st);
     sqlite3_finalize(st);
     build_profile(db, j->user_id, r);
