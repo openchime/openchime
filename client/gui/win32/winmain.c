@@ -2597,23 +2597,22 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
     {
         float py = by + RAIL_IH;
         if (NAV_PROFILE == g_nav_hover)
-            fill_round_a(rt, rf(cx - 18, py + 6, cx + 18, py + 42), 10.0f, 0xFFFFFF, 0.08f);
+            fill_round_a(rt, rf(cx - 18, py + 9, cx + 18, py + 45), 10.0f, 0xFFFFFF, 0.08f);
         const char *nm = m ? oc_model_user_name(m, m->user_id) : "";
+        /* A ROUNDED SQUARE, as the reference's rail avatars are (the switcher
+         * above is one already) — the circle read as a different product. The
+         * avatar sits low in its slot so the status emoji can FLOAT ABOVE it,
+         * a free-standing glyph on the rail overlapping the top edge, never a
+         * cutout over the face. */
+        rectf av2 = rf(cx - 15, py + 12, cx + 15, py + 42);
         draw_user_avatar(rt, m, m ? m->user_id : 0, (nm && nm[0]) ? nm : "U",
-                         rf(cx - 15, py + 9, cx + 15, py + 39),
-                         g_avatar, 0, 0);
-        /* Your own presence, bottom-right — the same dot, from the same helper, that
-         * every person in the DM list and the member pane carries. It was missing
-         * only here, which is the one place you cannot see yourself any other way. */
-        draw_presence_dot_dnd(rt, cx + 11, py + 35, 4.5f,
+                         av2, g_avatar, 1, 8.0f);
+        /* Your own presence, notched into the bottom-right corner — the same
+         * dot, from the same helper, that every person in the DM list and the
+         * member pane carries. */
+        draw_presence_dot_dnd(rt, cx + 12, py + 39, 4.5f,
                               m ? oc_model_presence_of(m, m->user_id) : OC_PRESENCE_OFFLINE,
                               OC_COL_RAIL, m ? oc_model_snoozed(m) : 0);
-        /* The TOP hemisphere, opposite the presence dot: they answer different
-         * questions — "am I here" versus "what am I doing / will this reach
-         * me". The STATUS EMOJI owns the spot when one is set (the reference
-         * wears it on the avatar exactly here); quiet hours' "z" shows only
-         * when there is no emoji to show — the snoozed state is still encoded
-         * in the presence dot either way, so nothing is lost. */
         {
             const char *se = NULL;
             if (m) for (size_t si2 = 0; si2 < m->n_users; si2++)
@@ -2622,14 +2621,15 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
                     break;
                 }
             if (se) {
-                /* A rail-coloured backing disc separates the glyph from the
-                 * photo underneath, the same cutout the presence dot uses. */
-                gfx_ellipse(rt, cx + 10, py + 12, 9.0f, 9.0f, OC_COL_RAIL, 1.0f);
-                draw_emoji_glyph(rt, se, rf(cx + 3, py + 5, cx + 17, py + 19));
+                /* Above the avatar, centred, overlapping its top edge by a
+                 * couple of pixels — the rail itself is the backdrop. */
+                draw_emoji_glyph(rt, se, rf(cx - 8, py - 2, cx + 8, py + 14));
             } else if (dnd_now(m)) {
-                gfx_ellipse(rt, cx + 11, py + 13, 6.6f, 6.6f, OC_COL_RAIL, 1.0f);
-                gfx_ellipse(rt, cx + 11, py + 13, 5.2f, 5.2f, OC_COL_NOTICE, 1.0f);
-                draw_text(rt, "z", g_micro, rf(cx + 5, py + 7, cx + 17, py + 19), OC_COL_RAIL);
+                /* Quiet hours' "z", only when no emoji claims the spot; the
+                 * snoozed state stays encoded in the presence dot either way. */
+                gfx_ellipse(rt, cx, py + 6, 6.6f, 6.6f, OC_COL_RAIL, 1.0f);
+                gfx_ellipse(rt, cx, py + 6, 5.2f, 5.2f, OC_COL_NOTICE, 1.0f);
+                draw_text(rt, "z", g_micro, rf(cx - 6, py, cx + 6, py + 12), OC_COL_RAIL);
             }
         }
         draw_text(rt, "You", g_micro, rf(0, py + 45, RAIL_W, py + 61), OC_COL_RAIL_ICON);
