@@ -127,14 +127,23 @@ rm -f "$LIN_DIR/ack"
 printf '%s' "$cmd" > "$LIN_DIR/cmd.tmp"
 mv "$LIN_DIR/cmd.tmp" "$LIN_DIR/cmd"          # atomic handoff
 
-for _ in $(seq 1 100); do [ -f "$LIN_DIR/ack" ] && break; sleep 0.1; done
+# Poll finely. The client answers on its 30 ms tick, so a 100 ms sleep spent, on
+# average, half of every round trip waiting for an answer that had already
+# arrived — and a suite is nothing but round trips: the smoke makes tens of them
+# and the regression suite hundreds. The timeout is unchanged at 10s (500 x 20ms);
+# this buys latency, not patience.
+t=0
+while [ ! -f "$LIN_DIR/ack" ] && [ "$t" -lt 500 ]; do sleep 0.02; t=$((t + 1)); done
 ack="$(cat "$LIN_DIR/ack" 2>/dev/null || echo TIMEOUT)"
 echo "ack: $ack"
 
 # The contract of this wrapper is "ack means the handler ran". On timeout it means
-# exactly the opposite, and exiting 0 said it ran. gui_smoke.sh parses state rather
-# than status so it never noticed, but anything checking the exit code was told the
-# command succeeded when the client never answered.
+# exactly the opposite, and exiting 0 said it ran.
+#
+# CHECK THIS STATUS. gui_smoke.sh does, and it is why its failures can be read at
+# face value. A caller that parses state and discards status instead lets a verb
+# the client never answered go silent, and it then reports itself as the NEXT
+# assertion failing — a defect blamed on whatever ran after the dropped command.
 if [ "$ack" = TIMEOUT ]; then
   echo "gui_drive: no ack for '$1' after 10s — the client did not answer" >&2
   exit 1

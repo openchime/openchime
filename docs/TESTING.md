@@ -595,28 +595,41 @@ nothing about typing.
 > exiting 1, looking exactly like "nothing to kill". The daemon then keeps
 > running on a directory that has been deleted underneath it (SQLite happily
 > writes to the unlinked inode), and every upload fails with an opaque
-> `transfer error`. Match `/proc/<pid>/environ`, as `gui_smoke.sh` now does.
+> `transfer error`. Match `/proc/<pid>/environ`, as both harnesses do.
 
 ## Reading the GUI smoke
 
-**The suite is deterministic — no known flakiness.** Two disciplines keep it
-that way: an assertion **waits on the state it is about to assert**
-(`expect_eventually`, `wait_grep`, `settle`) rather than sleeping, so a true
-assertion returns on the first poll and only a real failure pays the timeout;
-and chords and overlays assert the whole closed→open→closed **round trip**,
-refusing to credit a close whose open never happened. The plain sleeps that
-remain sit *between* driving steps as settling time, never as assertion timing —
-a new assertion does not add a sleep. Tune the patience with `OC_SMOKE_WAIT_MS`
-(default 6000), and read the total the run prints rather than quoting a number
-from a document: the suite grows, and helpers like `fitcheck` assert in loops.
+`scripts/gui_smoke.sh` is the only GUI harness, and it answers one question —
+**does the client boot and run** — in about ten seconds across fourteen checks.
+It drives the client through the test hook (`OPENCHIME_TEST_DIR`) and stands up
+its own fixture daemon on its own port. It is the pre-push gate; it is not a
+feature suite and does not aspire to be one.
 
-**Standing failures — the current baseline.** Six checks fail on a healthy
-tree, none of them flaky, reproducing identically run to run: the drafts pane's
-Sent-tab check, a four-check `chromefit` cluster around the shelf's drafts row
-and the composer's send control (siblings overlapping at some DPI × zoom ×
-text-size points), and one composer-typing residue check. A run whose failures
-match this baseline is clean; a run with a *different* failure has found
-something.
+**Assertions wait on state, never on a clock.** `expect_eventually`, `wait_grep`
+and `settle` poll for the state being asserted, so a true assertion returns on
+the first poll and only a real failure pays the timeout; the palette is asserted
+as a whole closed→open→closed **round trip**, refusing to credit a close whose
+open never happened. Tune the patience with `OC_SMOKE_WAIT_MS` (default 6000).
+
+**Its failures can be believed on sight, which is a property that was built in
+rather than hoped for.** It checks the **exit status of every verb**: gui_drive
+exits non-zero when the client never acked, and a caller that discards that
+status turns a dropped command into the *next* assertion failing for an
+unrelated reason. That is not hypothetical — it is what made a previous, much
+larger suite's failures need interpretation before they could be trusted, and
+half of them turned out to be dropped verbs rather than defects.
+
+**Its checks cannot pass by accident either.** The message it sends carries a
+per-run unique string, so no assertion can be satisfied by something a previous
+run left in the database; and the run ends by making the client answer one more
+time, because every earlier check reads a dump file that looks identical whether
+the client is alive or died on the last keystroke.
+
+**Keeping it small is the maintenance rule.** The suite that preceded it held a
+few hundred assertions and ran for seven minutes, so it was skipped, so it
+caught nothing — the failure mode of a slow gate is not that it is slow, it is
+that it stops being run. Verify a feature by driving it, through
+`scripts/gui_drive.sh` or a harness scoped to that feature. Do not add it here.
 
 *One caveat when reading a failure message:* the dump's `comp=` field is the
 **IME composition length**, not the autocomplete popover — the dump exposes no

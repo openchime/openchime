@@ -720,31 +720,37 @@ unverifiable.
 
 ## Run the GUI smoke before pushing Win32 chrome
 
-`scripts/gui_smoke.sh` drives the client through the test hook and asserts a
-**dynamic count** — it prints the total it ran, which was **249** on 2026-08-02.
-Do not quote a fixed number: the suite grows, and helpers like `fitcheck` assert
-in loops. It covers, for each view, what is in the second column
-(`sidebar_kind`), whether the middle one is typeable (`main_is_conversation`),
-which native children are shown, and whether anything covers the window — plus
-the search overlay, the Pins tab, the Preferences modal, the command palette, the
-generic form (including that Esc does **not** commit and Enter does), a pane
-header's ✕, the composer cue naming the open conversation, the notification
-schedule and keyword editors, the pause, threads, the People directory, the
-Activity unread filters, and a **chrome-fit matrix across DPI × zoom × text
-size** (ARCH-97).
+`scripts/gui_smoke.sh` asks one question — **does the client boot and run?** —
+and answers it in about ten seconds across fourteen checks: it launches,
+connects and authenticates against its own fixture daemon; paints the Home shell
+(the `sidebar_kind` / `main_is_conversation` / `window_is_covered` predicates);
+takes the keyboard; types a message and gets it back from the daemon; opens and
+closes the command palette from the composer; and is still answering at the end.
+That is the whole of it, deliberately.
 
-Every one of those is a boolean, and booleans belong in a script. Three bugs
-reached the user in a day for want of this, one of them a regression,
-all of them chrome. It is verified to catch them: reintroducing Files
-returning `SBK_CHANNELS` — fails exactly two checks, the column kind and the leaked
-find box.
+**Run it before every push.** It is cheap enough that there is no excuse to skip
+it, and narrow enough that a failure means the client is broken rather than that
+one assertion among hundreds moved.
 
-**A new view or overlay is added to the matrix in that script as well as to the
-predicates in `winmain.c`.** That is the point of it.
+Two properties keep it honest. It checks the **exit status of every verb**, so a
+command the client never acked is reported where it happens instead of surfacing
+as the next assertion failing for an unrelated reason — that confusion is what
+made a larger suite's failures need interpretation. And the message it sends
+carries a **per-run unique string**, so no assertion can be satisfied by
+something an earlier run left in the database.
+
+**It is not a feature suite, and it must not grow into one.** A few hundred
+assertions covering the composer's editing rules, the modal frame, the schedule
+card and a DPI × zoom × text-size matrix lived here once; it took seven minutes,
+which meant it was skipped, which meant it caught nothing. Verifying a feature
+is done by driving it — by hand through `scripts/gui_drive.sh`, or with a
+harness scoped to that feature — not by making the boot check longer. A new view
+or overlay is added to the predicates in `winmain.c`; it does not get a line
+here.
 
 It is not in CI, and that gap is honest: the daemon is epoll-based so it is
 Linux-only, and GitHub's Windows runners cannot host it (no Linux containers). A
-hosted smoke needs a self-hosted Windows box. Until then, run it and read it — the
+hosted run needs a self-hosted Windows box. Until then, run it and read it — the
 same discipline as reading CI.
 
 ## Seeing the whole window (Win32 harness)

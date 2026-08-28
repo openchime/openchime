@@ -13,11 +13,11 @@ name: ci
 #   - windows:     mingw cross-compile check of the Windows front-ends (TUI + the
 #                  SDL3/sdltext GUI, ARCH-80/106/107). Build breaks only.
 #
-# There is deliberately no GUI smoke job. scripts/gui_smoke.sh needs a Windows host
-# for the client and a Linux one for the epoll-based daemon at the same time, which
-# no hosted runner provides; it was carried here for a self-hosted box gated on
+# There is deliberately no GUI job. scripts/gui_smoke.sh needs a Windows host for
+# the client and a Linux one for the epoll-based daemon at the same time, which no
+# hosted runner provides; a job was carried here for a self-hosted box gated on
 # vars.GUI_SMOKE and, with that variable never set, ran zero times while the release
-# inherited its skip as a pass. The script stays as the pre-push gate docs/CLIENT.md
+# inherited its skip as a pass. It stays as the pre-push gate docs/CLIENT.md
 # already makes it.
 # Doc-only changes skip CI. See docs/TESTING.md for the full strategy.
 
