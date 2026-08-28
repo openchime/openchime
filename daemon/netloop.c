@@ -3746,13 +3746,22 @@ static void deliver_xfer_result(int ep, conn **conns, oc_dbwriter *dbw, oc_xfer_
     if (conns[fd]) update_interest(ep, c);
 }
 
+/* Every startup failure says what failed and why, on stderr (ARCH-53), before
+ * returning. A daemon that cannot serve used to be indistinguishable from one
+ * that was asked to stop: six bare `return -1`s, and the last thing in the
+ * journal was `healthz listening`. That cost about forty minutes of diagnosing
+ * a daemon that logged nothing wrong. `errno` is read immediately, because
+ * anything between the call and the message can overwrite it. */
+#define NETLOOP_FAIL(op) \
+    fprintf(stderr, "openchimed: cannot start: %s: %s\n", (op), strerror(errno))
+
 int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
                    volatile sig_atomic_t *stop) {
     conn **conns = calloc(OC_NETLOOP_MAX_FD, sizeof *conns);
-    if (!conns) return -1;
+    if (!conns) { NETLOOP_FAIL("allocating the connection table"); return -1; }
 
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (lfd < 0) { free(conns); return -1; }
+    if (lfd < 0) { NETLOOP_FAIL("socket"); free(conns); return -1; }
     int yes = 1;
     setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
     struct sockaddr_in addr;
@@ -3760,13 +3769,25 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons((uint16_t)port);
-    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) < 0 ||
-        listen(lfd, 128) < 0 || set_nonblock(lfd) < 0) {
+    /* Named separately: "bind" on the proto port is the one an operator can act
+     * on — the port is taken, or is privileged and the unit lacks
+     * CAP_NET_BIND_SERVICE (ARCH-54) — and lumping three calls under one
+     * message would hide which. */
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+        fprintf(stderr, "openchimed: cannot start: bind port %d: %s\n",
+                port, strerror(errno));
+        close(lfd); free(conns); return -1;
+    }
+    if (listen(lfd, 128) < 0) {
+        NETLOOP_FAIL("listen"); close(lfd); free(conns); return -1;
+    }
+    if (set_nonblock(lfd) < 0) {
+        NETLOOP_FAIL("setting the listening socket non-blocking");
         close(lfd); free(conns); return -1;
     }
 
     int ep = epoll_create1(0);
-    if (ep < 0) { close(lfd); free(conns); return -1; }
+    if (ep < 0) { NETLOOP_FAIL("epoll_create1"); close(lfd); free(conns); return -1; }
     int evfd = oc_dbwriter_eventfd(dbw);
 
     /* Attachment blob store (ARCH-70) + upload size cap (REQ-140). Bytes are
@@ -3775,7 +3796,15 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
         const oc_config *cfg = oc_config_get();
         const char *bd = cfg->blob_dir;
         g_blobs = oc_blobstore_open(bd);
-        if (!g_blobs) { close(ep); close(lfd); free(conns); return -1; }
+        if (!g_blobs) {
+            /* The path is in the message because this is the failure that
+             * actually happens: every path default points into `/data`, which
+             * exists in the image and nowhere else, so it fires the moment the
+             * daemon runs outside a container (CONFIG.md). */
+            fprintf(stderr, "openchimed: cannot start: opening the blob store "
+                            "at \"%s\": %s\n", bd ? bd : "(unset)", strerror(errno));
+            close(ep); close(lfd); free(conns); return -1;
+        }
         g_max_attach = cfg->max_attach_size;
 
         /* Blob I/O runs here, off the net thread (ARCH-69). Worker count from
@@ -3795,6 +3824,8 @@ int oc_netloop_run(int port, oc_tls_server *tls, oc_dbwriter *dbw,
 
         g_xfers = oc_xferpool_start(g_blobs, nw);
         if (!g_xfers) {
+            fprintf(stderr, "openchimed: cannot start: starting %d transfer "
+                            "worker(s): %s\n", nw, strerror(errno));
             oc_blobstore_close(g_blobs); g_blobs = NULL;
             close(ep); close(lfd); free(conns); return -1;
         }
