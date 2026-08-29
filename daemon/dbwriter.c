@@ -227,6 +227,52 @@ static void free_attach_meta(oc_attach_meta *a, size_t n) {
     for (size_t i = 0; i < n; i++) { free(a[i].filename); free(a[i].mime); }
 }
 
+/* Reaction aggregates for a replayed window (REQ-070/071). A BROADCAST has no
+ * room for them, so a client that stores nothing (ARCH-88) loses every reaction
+ * on any reload that does not go through the live fan-out.
+ *
+ * Shared by BOTH replay paths deliberately. It was inline in the reconnect
+ * backfill and simply absent from the history page, so scrolling back or
+ * following a permalink rendered messages permanently without their reactions —
+ * the defect class this replay exists to prevent, reintroduced by a second
+ * copy that was never written. One filler, both callers, as the unfurl fill
+ * below already does it. */
+static void fill_replay_reactions(sqlite3 *db, oc_dbres *r, uint64_t for_user) {
+    if (!r->n_replay) return;
+    size_t cap = 16, n = 0;
+    struct oc_replay_react *ra = malloc(cap * sizeof *ra);
+    for (size_t i = 0; i < r->n_replay && ra; i++) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db,
+                "SELECT emoji, COUNT(*), "
+                /* Prefer the requesting user's own id so the client can mark
+                 * the chip as theirs; MIN() just picks a stable stand-in. */
+                "  COALESCE(MAX(CASE WHEN user_id=?2 THEN user_id END), MIN(user_id)) "
+                "FROM reactions WHERE message_id=?1 GROUP BY emoji ORDER BY emoji;",
+                -1, &st, NULL) != SQLITE_OK) break;
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)r->replay[i].message_id);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)for_user);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            if (n == cap) {
+                cap *= 2;
+                struct oc_replay_react *g = realloc(ra, cap * sizeof *ra);
+                if (!g) break;
+                ra = g;
+            }
+            const char *em = (const char *)sqlite3_column_text(st, 0);
+            ra[n].message_id = r->replay[i].message_id;
+            ra[n].channel_id = r->replay[i].channel_id;
+            ra[n].count      = (uint64_t)sqlite3_column_int64(st, 1);
+            ra[n].user_id    = (uint64_t)sqlite3_column_int64(st, 2);
+            ra[n].emoji      = strdup(em ? em : "");
+            n++;
+        }
+        sqlite3_finalize(st);
+    }
+    r->rreact = ra;
+    r->n_rreact = n;
+}
+
 /* Unfurl rows for a replayed window (REQ-222, ARCH-105). A BROADCAST carries
  * none — an unfurl is fetched after the send and travels on its own frame — so
  * without this every preview vanished on reload, the same defect class the
@@ -3776,43 +3822,9 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
     r->n_replay = n;
     r->truncated = (n >= OC_BACKFILL_MAX);   /* hit the per-response cap */
 
-    /* Reaction aggregates for what we just replayed. One statement per message
-     * rather than one big IN(...) because the id list is unbounded and building
-     * the SQL text for it would be the only place in this file that does. */
-    if (n > 0) {
-        size_t rcap = 16, rn = 0;
-        struct oc_replay_react *ra = malloc(rcap * sizeof *ra);
-        for (size_t i = 0; i < n && ra; i++) {
-            sqlite3_stmt *rst = NULL;
-            if (sqlite3_prepare_v2(db,
-                    "SELECT emoji, COUNT(*), "
-                    /* Prefer the requesting user's own id so the client can mark
-                     * the chip as theirs; MIN() just picks a stable stand-in. */
-                    "  COALESCE(MAX(CASE WHEN user_id=?2 THEN user_id END), MIN(user_id)) "
-                    "FROM reactions WHERE message_id=?1 GROUP BY emoji ORDER BY emoji;",
-                    -1, &rst, NULL) != SQLITE_OK) break;
-            sqlite3_bind_int64(rst, 1, (sqlite3_int64)arr[i].message_id);
-            sqlite3_bind_int64(rst, 2, (sqlite3_int64)j->user_id);
-            while (sqlite3_step(rst) == SQLITE_ROW) {
-                if (rn == rcap) {
-                    rcap *= 2;
-                    struct oc_replay_react *g = realloc(ra, rcap * sizeof *ra);
-                    if (!g) break;
-                    ra = g;
-                }
-                const char *em = (const char *)sqlite3_column_text(rst, 0);
-                ra[rn].message_id = arr[i].message_id;
-                ra[rn].channel_id = arr[i].channel_id;
-                ra[rn].count      = (uint64_t)sqlite3_column_int64(rst, 1);
-                ra[rn].user_id    = (uint64_t)sqlite3_column_int64(rst, 2);
-                ra[rn].emoji      = strdup(em ? em : "");
-                rn++;
-            }
-            sqlite3_finalize(rst);
-        }
-        r->rreact = ra;
-        r->n_rreact = rn;
-    }
+    /* Reactions and unfurls for the window just built. Both are shared with the
+     * history page (§6.3), so the two replay paths cannot drift. */
+    fill_replay_reactions(db, r, j->user_id);
     fill_replay_unfurls(db, r);
     return r;
 }
@@ -3856,11 +3868,22 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
     "         m.body AS body," \
     "         (SELECT COUNT(*) FROM messages c WHERE c.parent_id=m.id) AS reply_count," \
     "         (SELECT COALESCE(MAX(c.created_at_ms),0) FROM messages c WHERE c.parent_id=m.id) AS last_reply," \
-    "         COALESCE(NULLIF(m.author_name,''), u.display_name, '') AS author_name" \
-    "    FROM messages m LEFT JOIN users u ON u.id = m.author_id"
+    "         COALESCE(NULLIF(m.author_name,''), u.display_name, '') AS author_name," \
+    /* Pin and saved state, exactly as the reconnect replay carries them: a
+     * BROADCAST has no field for either, so a client that keeps nothing
+     * (ARCH-88) loses both on any reload that is not a reconnect — which is
+     * every scroll-back and every permalink. `saved` is keyed on the REQUESTING
+     * user because it is private (REQ-231), where a pin belongs to the channel. */ \
+    "         COALESCE(p.pinned_by,0) AS pinned_by," \
+    "         COALESCE(p.created_at_ms,0) AS pinned_at," \
+    "         COALESCE(s.created_at_ms,0) AS saved_at" \
+    "    FROM messages m LEFT JOIN users u ON u.id = m.author_id" \
+    "                    LEFT JOIN pins p ON p.message_id = m.id" \
+    "                    LEFT JOIN saved_items s ON s.message_id = m.id AND s.user_id = ?4"
 
     const char *sql = j->hist_around
-        ? "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name FROM ("
+        ? "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name,"
+          "       pinned_by, pinned_at, saved_at FROM ("
           "  SELECT * FROM (" OC_HIST_COLS
           "   WHERE m.channel_id=?1 AND m.parent_id IS NULL AND m.id<=?2"
           "   ORDER BY m.id DESC LIMIT ?3)"
@@ -3869,7 +3892,8 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
           "   WHERE m.channel_id=?1 AND m.parent_id IS NULL AND m.id>?2"
           "   ORDER BY m.id ASC LIMIT ?3)"
           ") ORDER BY id;"
-        : "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name FROM ("
+        : "SELECT id, author_id, created_at_ms, body, reply_count, last_reply, author_name,"
+          "       pinned_by, pinned_at, saved_at FROM ("
           OC_HIST_COLS
           "   WHERE m.channel_id=?1 AND m.id<?2 AND m.parent_id IS NULL"
           "   ORDER BY m.id DESC LIMIT ?3"
@@ -3879,6 +3903,10 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_int64(st, 1, (sqlite3_int64)j->channel_id);
     sqlite3_bind_int64(st, 2, (sqlite3_int64)before);
     sqlite3_bind_int64(st, 3, (sqlite3_int64)lim);
+    /* Numbered explicitly, like the backfill query: an anonymous marker takes
+     * the next unused index, so adding one inside OC_HIST_COLS would silently
+     * renumber the three above and the query would see NULLs. */
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)j->user_id);
 
     size_t cap = 16, n = 0;
     oc_replay_msg *arr = malloc(cap * sizeof *arr);
@@ -3905,6 +3933,10 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
         m->last_reply_at = (uint64_t)sqlite3_column_int64(st, 5);
         const char *an = (const char *)sqlite3_column_text(st, 6);
         if (an && an[0]) m->author_name = strdup(an);
+        m->pinned_by = (uint64_t)sqlite3_column_int64(st, 7);
+        m->pinned_at = (uint64_t)sqlite3_column_int64(st, 8);
+        m->saved_at  = (uint64_t)sqlite3_column_int64(st, 9);
+        m->saved     = m->saved_at != 0;
         load_message_attachments(db, m->message_id, m->attach, &m->n_attach);
         n++;
     }
@@ -3925,6 +3957,10 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
             sqlite3_finalize(mt);
         }
     }
+    /* The same two fills the reconnect replay runs. Reactions were absent here
+     * entirely, which is what made a scroll-back or a permalink render messages
+     * permanently without them. */
+    fill_replay_reactions(db, r, j->user_id);
     fill_replay_unfurls(db, r);
     return r;
 }

@@ -387,6 +387,77 @@ static void test_history_paging(void) {
     CHECK(r && r->n_replay == 0);
     oc_dbres_free(r);
 
+    /* A PAGE CARRIES THE SAME SIDE-STATE A RECONNECT DOES (REQ-070/230/231).
+     *
+     * The reconnect replay filled reactions, pins and saved marks; this path
+     * filled none of them, so every message reached by scrolling back — or by
+     * following a permalink — rendered permanently without its reactions and
+     * pins. A client stores nothing (ARCH-88), so "permanently" is literal:
+     * there is no second source to recover them from.
+     *
+     * Asserted on the PAGE rather than on the tables, because the tables were
+     * always right; what was missing was the replay carrying them. */
+    {
+        uint64_t mid = ids[20];   /* in the newest page: ids[15]..ids[24] */
+        {
+            oc_job *j = oc_job_new(OC_JOB_REACT, 311);
+            j->user_id = u; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = mid;
+            j->react_op = OC_REACT_ADD; j->emoji = strdup("\xF0\x9F\x91\x8D");
+            oc_dbwriter_submit(w, j);
+            oc_dbres_free(wait_result(w));
+        }
+        {   /* Inline rather than the `pin` helper, which is declared below. */
+            oc_job *j = oc_job_new(OC_JOB_PIN, 314);
+            j->user_id = u; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = mid;
+            j->pin_op = OC_PIN_ADD;
+            oc_dbwriter_submit(w, j);
+            oc_dbres_free(wait_result(w));
+        }
+        {
+            oc_job *j = oc_job_new(OC_JOB_SAVE_ITEM, 312);
+            j->user_id = u; j->message_id = mid; j->save_op = OC_SAVE_ADD;
+            oc_dbwriter_submit(w, j);
+            oc_dbres_free(wait_result(w));
+        }
+
+        r = history(w, u, OC_DEFAULT_CHANNEL, 0, 10);
+        CHECK(r && r->n_replay > 0);
+        int found = 0, pinned = 0, saved = 0;
+        for (size_t i = 0; i < r->n_replay; i++)
+            if (r->replay[i].message_id == mid) {
+                found = 1;
+                pinned = r->replay[i].pinned_by == u && r->replay[i].pinned_at != 0;
+                saved  = r->replay[i].saved && r->replay[i].saved_at != 0;
+            }
+        CHECK(found);
+        CHECK(pinned);                       /* the pin rides the page */
+        CHECK(saved);                        /* and this user's saved mark */
+        int reacted = 0;
+        for (size_t i = 0; i < r->n_rreact; i++)
+            if (r->rreact[i].message_id == mid && r->rreact[i].count == 1 &&
+                r->rreact[i].user_id == u) reacted = 1;
+        CHECK(reacted);                      /* and the reaction aggregate */
+        oc_dbres_free(r);
+
+        /* The around-an-id mode is the same replay through a different window
+         * (ARCH-96), and shares the projection — so it carries them too. */
+        {
+            oc_job *j = oc_job_new(OC_JOB_HISTORY, 313);
+            j->user_id = u; j->channel_id = OC_DEFAULT_CHANNEL;
+            j->message_id = mid; j->search_limit = 10; j->hist_around = 1;
+            oc_dbwriter_submit(w, j);
+            r = wait_result(w);
+        }
+        int apinned = 0, areacted = 0;
+        for (size_t i = 0; r && i < r->n_replay; i++)
+            if (r->replay[i].message_id == mid && r->replay[i].pinned_by == u) apinned = 1;
+        for (size_t i = 0; r && i < r->n_rreact; i++)
+            if (r->rreact[i].message_id == mid) areacted = 1;
+        CHECK(apinned);
+        CHECK(areacted);
+        oc_dbres_free(r);
+    }
+
     oc_dbwriter_stop(w);
     cleanup_db(path);
 }
