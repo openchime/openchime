@@ -828,8 +828,9 @@ Tombstoned messages are excluded from the list and lose their pin outright
 **Pin state is replayed on backfill.** A `BROADCAST` has no field for it, so
 after replaying a channel's messages the daemon emits a `PIN_UPDATED` for each
 pinned one (§6) — state that only travels on a live fan-out silently vanishes on
-reconnect, the same failure the reaction replay exists to prevent. (The
-history-paging path, §6.3, does not yet do this; that gap is tracked.)
+reconnect, the same failure the reaction replay exists to prevent. The
+history-paging path (§6.3) replays it too, so a pin survives a scroll-back and a
+permalink as well as a reconnect.
 
 Failures are non-fatal `ERROR` frames carrying the `message_id` (8 bytes,
 big-endian) in `context`: `UNKNOWN_MESSAGE` (no such message in that channel, or
@@ -1926,13 +1927,20 @@ in use; a new opcode is additive.
 
 The response uses §6.2's replay encoding: `BROADCAST` frames in **ascending** id
 order (the order the client's high-water dedup expects) — each with its
-attachments, reply counts and author-name overrides — the matching `UNFURL`
-frames, then `BACKFILL_DONE`. **This path does not replay reaction or pin
-state:** messages loaded by paging backwards arrive without their reactions and
-pins. That is a defect, not a design — the same class §6.2's reaction replay and
-§5.9a's pin replay exist to prevent — and it is tracked as an issue. On this
-path `more` means **"older messages exist above this page"**, which is how a
-client knows to stop asking rather than retrying at the top of a channel
+attachments, reply counts and author-name overrides — followed by the same
+side-state a reconnect carries: `REACTION_UPDATED` per (message, emoji),
+`PIN_UPDATED` for each pinned message, `SAVED_UPDATED` for the requester's own
+saved marks, the matching `UNFURL` frames, then `BACKFILL_DONE`.
+
+That list is the point of the path, not a detail of it. A client stores nothing
+(ARCH-88), so state which travels only on a live fan-out is lost on any reload
+that is not a reconnect — which is every scroll-back and every permalink. The
+reaction aggregates are built by the **same filler the reconnect replay uses**,
+because the two paths having their own copies is exactly how this one came to be
+missing them.
+
+On this path `more` means **"older messages exist above this page"**, which is
+how a client knows to stop asking rather than retrying at the top of a channel
 forever.
 
 Read access is checked as everywhere else; a channel the user cannot read
