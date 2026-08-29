@@ -45,6 +45,19 @@ typedef struct {
  * title + description for a URL the body carries. All heap. */
 typedef struct { char *url, *title, *descr; } oc_msg_unfurl;
 
+/* What a forwarded message points at (REQ-057). Resolved by the daemon and
+ * carried on its own frame, so it survives a reload the way a reaction does.
+ * The files stay on the source message, so `n_attach` counts them and
+ * `attach_name` is the first one's name: the card NAMES them and the permalink
+ * reaches them, rather than offering a download the recipient may not be
+ * allowed to make. */
+typedef struct {
+    uint64_t src_channel, src_message, src_author;
+    char    *excerpt;      /* heap; a snapshot taken when the forward was sent */
+    char    *attach_name;  /* heap; the first file's name, "" = none */
+    uint16_t n_attach;
+} oc_msg_forward;
+
 typedef struct {
     char    *body;         /* heap */
     char     author_name[64]; /* author display name ("" = fall back to id) */
@@ -70,6 +83,8 @@ typedef struct {
      * backfill, cleared on edit (the daemon drops and re-fetches). */
     oc_msg_unfurl *unfurls;   /* heap, NULL until one arrives */
     uint8_t        n_unfurls, cap_unfurls;
+    /* The forward reference (REQ-057), NULL unless this message is a forward. */
+    oc_msg_forward *forward;
 } oc_msg;
 
 typedef struct {

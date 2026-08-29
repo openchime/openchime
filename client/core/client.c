@@ -69,6 +69,23 @@ void oc_client_send(oc_client *c, uint64_t channel_id, const char *body) {
     oc_queue_push(&c->cmds, cmd);
 }
 
+/* Forward a message into another conversation (REQ-057). `note` is the
+ * forwarder's own words and may be empty; the attribution is NOT prose in the
+ * body — the two source ids travel with the send and the daemon resolves the
+ * rest, so the recipient's client renders a card it can recognise rather than
+ * string-matching a sentence someone could equally have typed by hand. */
+void oc_client_forward(oc_client *c, uint64_t to_channel, const char *note,
+                       uint64_t src_channel, uint64_t src_message) {
+    if (!c) return;
+    oc_cmd *cmd = oc_cmd_new(OC_CMD_SEND);
+    if (!cmd) return;
+    cmd->channel_id = to_channel;
+    cmd->body = strdup(note ? note : "");
+    cmd->src_channel = src_channel;
+    cmd->src_message = src_message;
+    oc_queue_push(&c->cmds, cmd);
+}
+
 void oc_client_backfill(oc_client *c, uint64_t channel_id) {
     if (!c) return;
     /* Ask at most once per channel; a known channel gets its flag set, an

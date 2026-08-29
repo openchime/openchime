@@ -842,6 +842,12 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             uint16_t na = s.n_attach > OC_MAX_ATTACH ? OC_MAX_ATTACH : s.n_attach;
             for (uint16_t i = 0; i < na; i++) j->attach_ids[i] = s.attach_ids[i];
             j->n_attach = na;
+            /* The forward source (REQ-057). Passed through unchecked on
+             * purpose: the writer holds the row and does both the read-access
+             * gate and the resolution, so nothing here can be talked into
+             * quoting a channel the sender cannot read. */
+            j->src_channel = s.src_channel;
+            j->src_message = s.src_message;
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -2122,6 +2128,25 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             /* Offline mobile delivery (ARCH-85): hand the notify decision to the
              * push emitter — members minus author, level/DND-gated, off this
              * thread. Fire-and-forget; a no-op when push is unconfigured. */
+            /* The forward reference, to the same members and right behind the
+             * BROADCAST it describes (REQ-057). One entry at most here; the
+             * array is shared with the replay so both read the same rows. */
+            for (size_t i = 0; i < r->n_rfwd; i++) {
+                oc_wbuf_init(&w, g_enc, sizeof g_enc);
+                oc_forward fw = { r->rfwd[i].message_id, r->rfwd[i].channel_id,
+                                  r->rfwd[i].src_channel, r->rfwd[i].src_message,
+                                  r->rfwd[i].src_author,
+                                  oc_slice_str(r->rfwd[i].excerpt ? r->rfwd[i].excerpt : ""),
+                                  r->rfwd[i].n_attach,
+                                  oc_slice_str(r->rfwd[i].attach_name ? r->rfwd[i].attach_name : "") };
+                if (oc_encode_forward(&w, OC_PROTOCOL_VERSION, &fw) != OC_OK) break;
+                size_t flen = w.len;
+                for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                    conn *c = conns[fd];
+                    if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
+                        send_bytes(ep, conns, fd, g_enc, flen);
+                }
+            }
             oc_push_notify(g_push, r->channel_id, r->author_id, r->message_id, 0);
             /* Link previews (REQ-222): queue this body's URLs for fetching.
              * Off the hot path — the fetch completes as an UNFURL_STORED
@@ -3506,6 +3531,22 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
                              oc_slice_str(r->runfurl[i].title ? r->runfurl[i].title : ""),
                              oc_slice_str(r->runfurl[i].descr ? r->runfurl[i].descr : "") };
             oc_encode_unfurl(&w, OC_PROTOCOL_VERSION, &uf);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+        }
+
+        /* And what each replayed forward points at (REQ-057) — the reference
+         * rides its own frame, so a replay without this loses the attribution
+         * the moment the client reloads, which is exactly what the reaction,
+         * pin and unfurl replays above each exist to prevent. */
+        for (size_t i = 0; i < r->n_rfwd && conns[fd]; i++) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_forward fw = { r->rfwd[i].message_id, r->rfwd[i].channel_id,
+                              r->rfwd[i].src_channel, r->rfwd[i].src_message,
+                              r->rfwd[i].src_author,
+                              oc_slice_str(r->rfwd[i].excerpt ? r->rfwd[i].excerpt : ""),
+                              r->rfwd[i].n_attach,
+                              oc_slice_str(r->rfwd[i].attach_name ? r->rfwd[i].attach_name : "") };
+            oc_encode_forward(&w, OC_PROTOCOL_VERSION, &fw);
             send_bytes(ep, conns, fd, g_enc, w.len);
         }
         if (!conns[fd]) return;

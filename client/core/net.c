@@ -51,7 +51,11 @@ struct oc_net {
  * that writes nothing to disk cannot honour more than that. A message still
  * queued when the app exits is lost, which is why a frontend should warn on quit
  * while oc_net_outbox_pending() is non-zero. */
-typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; char *body; } obox_row;
+/* src_channel/src_message ride the row so a RESEND is still the same forward
+ * (REQ-057). Without them, a message that went out once as a forward would come
+ * back after a reconnect as a bare note with its attribution silently gone. */
+typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; char *body;
+                 uint64_t src_channel, src_message; } obox_row;
 typedef struct { obox_row *v; size_t n, cap; } obox;
 
 /* The UI thread must not walk the outbox (net-thread-owned), so the net thread
@@ -61,7 +65,8 @@ static volatile int g_obox_pending;
 static void obox_publish(const obox *o) { g_obox_pending = (int)o->n; }
 int oc_net_outbox_pending(oc_net *n) { (void)n; return g_obox_pending; }
 
-static void obox_add(obox *o, const uint8_t idem[OC_IDEM_SIZE], uint64_t cid, const char *body) {
+static void obox_add(obox *o, const uint8_t idem[OC_IDEM_SIZE], uint64_t cid, const char *body,
+                     uint64_t src_channel, uint64_t src_message) {
     for (size_t i = 0; i < o->n; i++)
         if (memcmp(o->v[i].idem, idem, OC_IDEM_SIZE) == 0) return;
     if (o->n == o->cap) {
@@ -73,6 +78,8 @@ static void obox_add(obox *o, const uint8_t idem[OC_IDEM_SIZE], uint64_t cid, co
     memcpy(o->v[o->n].idem, idem, OC_IDEM_SIZE);
     o->v[o->n].channel_id = cid;
     o->v[o->n].body = body ? strdup(body) : NULL;
+    o->v[o->n].src_channel = src_channel;
+    o->v[o->n].src_message = src_message;
     o->n++;
     obox_publish(o);
 }
@@ -188,12 +195,17 @@ static int write_all(oc_tls_conn *c, int fd, const uint8_t *buf, size_t len, vol
  * from the outbox reuses it and the daemon dedups). */
 static void send_message(oc_tls_conn *c, int fd, volatile int *stop,
                          uint64_t channel_id, const uint8_t idem[OC_IDEM_SIZE],
-                         const char *body) {
+                         const char *body, uint64_t src_channel, uint64_t src_message) {
     uint8_t buf[OC_MAX_FRAME_SIZE]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
     oc_send s; memset(&s, 0, sizeof s);   /* n_attach = 0: a plain text message */
     s.channel_id = channel_id ? channel_id : 1;
     memcpy(s.idem, idem, OC_IDEM_SIZE);
     s.body = oc_slice_str(body ? body : "");
+    /* The forward source (REQ-057), 0/0 for an ordinary message. Only the two
+     * ids: the daemon resolves the author and the excerpt, so this client
+     * cannot claim someone said something they did not. */
+    s.src_channel = src_channel;
+    s.src_message = src_message;
     if (oc_encode_send(&w, OC_PROTOCOL_VERSION, &s) == OC_OK)
         (void)write_all(c, fd, buf, w.len, stop);
 }
@@ -784,6 +796,30 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
             if (oc_decode_pins(&p, &pn) == OC_OK) {
                 oc_ev *e = oc_ev_new(OC_EV_PINS_END);
                 if (e) { e->channel_id = pn.channel_id; e->count = pn.count; oc_queue_push(to_ui, e); }
+            }
+        } else if (hdr.msg_type == OC_MSG_FORWARD) {
+            oc_forward fw;
+            if (oc_decode_forward(&p, &fw) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_FORWARD);
+                if (e) {
+                    e->channel_id   = fw.channel_id;
+                    e->message_id   = fw.message_id;
+                    e->src_channel  = fw.src_channel;
+                    e->src_message  = fw.src_message;
+                    e->author_id    = fw.src_author;
+                    e->src_n_attach = fw.n_attach;
+                    if (fw.src_attach_name.len < sizeof e->src_attach_name) {
+                        memcpy(e->src_attach_name, fw.src_attach_name.ptr,
+                               fw.src_attach_name.len);
+                        e->src_attach_name[fw.src_attach_name.len] = '\0';
+                    }
+                    e->body = malloc(fw.src_excerpt.len + 1);
+                    if (e->body) {
+                        memcpy(e->body, fw.src_excerpt.ptr, fw.src_excerpt.len);
+                        e->body[fw.src_excerpt.len] = '\0';
+                    }
+                    oc_queue_push(to_ui, e);
+                }
             }
         } else if (hdr.msg_type == OC_MSG_UNFURL) {
             oc_unfurl uf;
@@ -1613,7 +1649,8 @@ static int run_connection(oc_net *n, int reconnecting,
         if (cs && cs->obox) {
             for (size_t i = 0; i < cs->obox->n; i++)
                 send_message(&conn, fd, &n->stop, cs->obox->v[i].channel_id,
-                             cs->obox->v[i].idem, cs->obox->v[i].body ? cs->obox->v[i].body : "");
+                             cs->obox->v[i].idem, cs->obox->v[i].body ? cs->obox->v[i].body : "",
+                             cs->obox->v[i].src_channel, cs->obox->v[i].src_message);
         }
     }
 
@@ -1652,8 +1689,9 @@ static int run_connection(oc_net *n, int reconnecting,
                  * SEND_ACK leaves it there to be resent, deduped by the idem. */
                 uint8_t idem[OC_IDEM_SIZE]; gen_idem(idem);
                 uint64_t cid = c->channel_id ? c->channel_id : 1;
-                if (ctx.obox) obox_add(ctx.obox, idem, cid, c->body);
-                send_message(&conn, fd, &n->stop, cid, idem, c->body);
+                if (ctx.obox) obox_add(ctx.obox, idem, cid, c->body, c->src_channel, c->src_message);
+                send_message(&conn, fd, &n->stop, cid, idem, c->body,
+                             c->src_channel, c->src_message);
             }
             if (c->type == OC_CMD_REACT && c->body) {
                 uint8_t buf[128]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);

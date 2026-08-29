@@ -240,6 +240,11 @@ typedef struct oc_job {
     /* SEND: attachment ids to link to this message (REQ-140). */
     uint64_t       attach_ids[OC_MAX_ATTACH];
     uint16_t       n_attach;
+    /* SEND: the forward source (REQ-057), 0/0 when not a forward. The client
+     * sends only these two ids; the author, the excerpt and the attachment
+     * count are resolved here from the row the daemon already holds, so a
+     * client cannot assert who said what. */
+    uint64_t       src_channel, src_message;
 
     /* Notification prefs (REQ-130/131). SET_NOTIFY_PREF uses channel_id + level;
      * SET_DND uses the dnd_* fields. */
@@ -617,6 +622,17 @@ typedef struct oc_dbres {
     struct oc_replay_unfurl { uint64_t message_id, channel_id; char *url, *title, *descr; }
                   *runfurl;
     size_t         n_runfurl;
+    /* Forward references (REQ-057), for the same reason as the two above: the
+     * reference travels on its own FORWARD frame rather than in the
+     * BROADCAST, so a replay that omitted it would lose the attribution on
+     * every reload. ONE array serves both the live send (one entry) and the
+     * replay (one per forwarded message in the window), so the two cannot
+     * drift the way reactions once did. */
+    struct oc_replay_forward { uint64_t message_id, channel_id,
+                                        src_channel, src_message, src_author;
+                               char *excerpt, *attach_name; uint16_t n_attach; }
+                  *rfwd;
+    size_t         n_rfwd;
     char          *unf_url;    /* heap; UNFURL_STORED */
     char          *unf_title;  /* heap */
     char          *unf_descr;  /* heap */

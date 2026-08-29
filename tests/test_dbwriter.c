@@ -52,7 +52,7 @@ static void test_start_migrates_and_stops(void) {
 
     sqlite3 *db = NULL;
     CHECK(sqlite3_open(path, &db) == SQLITE_OK);
-    CHECK(oc_schema_version(db) == 39);
+    CHECK(oc_schema_version(db) == 40);
     CHECK(table_exists(db, "messages"));
     CHECK(table_exists(db, "sessions"));
     sqlite3_close(db);
@@ -4580,6 +4580,222 @@ static void test_unfurl_store(void) {
     cleanup_db(path);
 }
 
+/* Forwarding (REQ-057). The reference is resolved by the DAEMON from the two
+ * source ids the client sends: what a recipient is told about the original is
+ * what the row says, not what the sender claimed. It survives BOTH replay
+ * paths, and a source the forwarder cannot read yields no reference at all —
+ * without that gate, forwarding is a way to read a channel you were never in
+ * by asking the daemon to quote it at you. */
+static uint64_t forward_msg(oc_dbwriter *w, uint64_t uid, uint64_t to_channel,
+                            const uint8_t idem[OC_IDEM_LEN], const char *note,
+                            uint64_t src_channel, uint64_t src_message, int want_ref) {
+    oc_job *j = oc_job_new(OC_JOB_SEND, 1);
+    j->user_id = uid; j->channel_id = to_channel;
+    memcpy(j->idem, idem, OC_IDEM_LEN);
+    oc_job_set_body(j, note, strlen(note));
+    j->src_channel = src_channel;
+    j->src_message = src_message;
+    oc_dbwriter_submit(w, j);
+    oc_dbres *r = wait_result(w);
+    uint64_t id = 0;
+    if (r && r->type == OC_RES_SEND_OK) {
+        id = r->message_id;
+        /* The live send carries the reference too, from the same array the
+         * replay reads — so the two cannot describe the original differently. */
+        CHECK(r->n_rfwd == (size_t)(want_ref ? 1 : 0));
+        if (want_ref && r->n_rfwd == 1) CHECK(r->rfwd[0].message_id == id);
+    }
+    oc_dbres_free(r);
+    return id;
+}
+
+static void test_forward(void) {
+    const char *path = "build/test_dbwriter_forward.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+
+    uint64_t alice = reg(w, "fwd-alice", "pw", OC_ROLE_MEMBER);
+    uint64_t bob   = reg(w, "fwd-bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice != 0 && bob != 0);
+
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0xF0, sizeof idem);
+    uint64_t src = send_msg(w, alice, idem, "the original text");
+    CHECK(src != 0);
+
+    /* A destination channel both can read. */
+    oc_dbres *cr = create_channel(w, alice, "fwd-dest", 1);
+    CHECK(cr && cr->type == OC_RES_CHANNEL_INFO);
+    uint64_t dest = cr ? cr->channel_id : 0;
+    oc_dbres_free(cr);
+    CHECK(dest != 0);
+
+    memset(idem, 0xF1, sizeof idem);
+    uint64_t fwd = forward_msg(w, alice, dest, idem, "worth reading",
+                               OC_DEFAULT_CHANNEL, src, 1);
+    CHECK(fwd != 0);
+
+    /* The reference survives the reconnect backfill (ARCH-88: the client keeps
+     * nothing, so anything that rides only the live fan-out is gone on reload). */
+    oc_dbres *r = backfill(w, alice, dest, 0);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK);
+    CHECK(r->n_rfwd == 1);
+    if (r->n_rfwd == 1) {
+        CHECK(r->rfwd[0].message_id == fwd && r->rfwd[0].channel_id == dest);
+        CHECK(r->rfwd[0].src_channel == OC_DEFAULT_CHANNEL);
+        CHECK(r->rfwd[0].src_message == src);
+        CHECK(r->rfwd[0].src_author == alice);          /* resolved, not asserted */
+        CHECK(r->rfwd[0].excerpt && strcmp(r->rfwd[0].excerpt, "the original text") == 0);
+        CHECK(r->rfwd[0].n_attach == 0);
+        CHECK(r->rfwd[0].attach_name && r->rfwd[0].attach_name[0] == '\0');
+    }
+    oc_dbres_free(r);
+
+    /* And the history page — the second replay path, which is where reactions
+     * and pins were each forgotten before. */
+    r = history_around(w, alice, dest, fwd, 20);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK);
+    CHECK(r->n_rfwd == 1);
+    if (r->n_rfwd == 1) CHECK(r->rfwd[0].src_message == src);
+    oc_dbres_free(r);
+
+    /* A source carrying a FILE: the reference names it and counts it, and the
+     * file itself stays where it is. Copying it would mean either a second row
+     * sharing a storage_key — which breaks the orphan model reclamation counts
+     * on — or duplicating the bytes. */
+    uint8_t aidem[OC_IDEM_LEN]; memset(aidem, 0xA7, sizeof aidem);
+    uint8_t sha[32]; for (int i = 0; i < 32; i++) sha[i] = (uint8_t)i;
+    oc_job *j = oc_job_new(OC_JOB_ATTACH_CREATE, 1);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->att_size = 64;
+    memcpy(j->idem, aidem, sizeof aidem);
+    j->filename = strdup("report.txt"); j->mime = strdup("text/plain");
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_CREATED);
+    uint64_t aid = r ? r->attachment_id : 0;
+    oc_dbres_free(r);
+    CHECK(aid != 0);
+
+    j = oc_job_new(OC_JOB_ATTACH_FINALIZE, 1);
+    j->user_id = alice; j->attachment_id = aid; j->att_size = 64;
+    memcpy(j->att_sha256, sha, 32);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_ATTACH_OK);
+    oc_dbres_free(r);
+
+    memset(idem, 0xF5, sizeof idem);
+    j = oc_job_new(OC_JOB_SEND, 1);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL;
+    memcpy(j->idem, idem, OC_IDEM_LEN);
+    oc_job_set_body(j, "here it is", 10);
+    j->attach_ids[0] = aid; j->n_attach = 1;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_SEND_OK);
+    uint64_t with_file = r ? r->message_id : 0;
+    oc_dbres_free(r);
+    CHECK(with_file != 0);
+
+    memset(idem, 0xF6, sizeof idem);
+    uint64_t fwd_file = forward_msg(w, alice, dest, idem, "", OC_DEFAULT_CHANNEL,
+                                    with_file, 1);
+    CHECK(fwd_file != 0);
+    r = backfill(w, alice, dest, 0);
+    CHECK(r && r->type == OC_RES_BACKFILL_OK);
+    int seen = 0;
+    for (size_t i = 0; r && i < r->n_rfwd; i++) {
+        if (r->rfwd[i].message_id != fwd_file) continue;
+        seen = 1;
+        CHECK(r->rfwd[i].n_attach == 1);
+        CHECK(r->rfwd[i].attach_name && strcmp(r->rfwd[i].attach_name, "report.txt") == 0);
+    }
+    CHECK(seen == 1);
+    oc_dbres_free(r);
+
+    /* And the file did NOT travel: the forward carries no attachment of its
+     * own, the source keeps the one row, and nothing shares its storage key. */
+    {
+        sqlite3 *db = NULL;
+        CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM attachments WHERE message_id=?;",
+                           -1, &st, NULL);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)fwd_file);
+        CHECK(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 0);
+        sqlite3_finalize(st);
+        sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM attachments;", -1, &st, NULL);
+        CHECK(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 1);
+        sqlite3_finalize(st);
+        sqlite3_close(db);
+    }
+
+    /* A source in a PRIVATE channel the forwarder does not belong to: the
+     * message still sends, and carries no reference. Sending anyway is
+     * deliberate — a refusal would turn a stale permalink into a failure the
+     * sender cannot act on. */
+    cr = create_channel(w, bob, "fwd-secret", 0);
+    CHECK(cr && cr->type == OC_RES_CHANNEL_INFO);
+    uint64_t secret = cr ? cr->channel_id : 0;
+    oc_dbres_free(cr);
+    CHECK(secret != 0);
+
+    memset(idem, 0xF2, sizeof idem);
+    j = oc_job_new(OC_JOB_SEND, 1);
+    j->user_id = bob; j->channel_id = secret;
+    memcpy(j->idem, idem, OC_IDEM_LEN);
+    oc_job_set_body(j, "bob's private note", 18);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_SEND_OK);
+    uint64_t secret_mid = r ? r->message_id : 0;
+    oc_dbres_free(r);
+    CHECK(secret_mid != 0);
+
+    memset(idem, 0xF3, sizeof idem);
+    j = oc_job_new(OC_JOB_SEND, 1);
+    j->user_id = alice; j->channel_id = dest;
+    memcpy(j->idem, idem, OC_IDEM_LEN);
+    oc_job_set_body(j, "look at this", 12);
+    j->src_channel = secret; j->src_message = secret_mid;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_SEND_OK);   /* sent, not rejected */
+    CHECK(r && r->n_rfwd == 0);              /* and quoting nothing */
+    oc_dbres_free(r);
+
+    /* The channel still has exactly the two references it earned: the denied
+     * forward left no row behind. */
+    r = backfill(w, alice, dest, 0);
+    CHECK(r && r->n_rfwd == 2);
+    oc_dbres_free(r);
+
+    /* A TOMBSTONED source (REQ-052) likewise: nothing to quote, still sent. */
+    j = oc_job_new(OC_JOB_DELETE, 1);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = src;
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_DELETE_OK);
+    oc_dbres_free(r);
+
+    memset(idem, 0xF4, sizeof idem);
+    uint64_t fwd2 = forward_msg(w, alice, dest, idem, "gone now",
+                                OC_DEFAULT_CHANNEL, src, 0);
+    CHECK(fwd2 != 0);
+    r = backfill(w, alice, dest, 0);
+    CHECK(r && r->n_rfwd == 2);              /* still just the two that landed */
+    if (r && r->n_rfwd == 2) CHECK(r->rfwd[0].message_id == fwd);
+    /* The excerpt is a SNAPSHOT: deleting (or editing) the original afterwards
+     * does not rewrite what was forwarded. */
+    if (r && r->n_rfwd == 2)
+        CHECK(strcmp(r->rfwd[0].excerpt, "the original text") == 0);
+    oc_dbres_free(r);
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_max_users(void) {
     const char *path = "build/test_dbwriter_cap.db";
     cleanup_db(path);
@@ -4650,5 +4866,6 @@ int run_dbwriter_tests(void) {
     test_delete_clears_message_extras();
     test_max_users();
     test_unfurl_store();
+    test_forward();
     return failures;
 }
