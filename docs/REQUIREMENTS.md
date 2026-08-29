@@ -399,9 +399,25 @@ the requirement says so explicitly rather than implying one.
 - **REQ-057.** *(Built in the Win32 client only)* A user has been able to **forward (share) a message** to another
   channel or DM they can post to, carrying a reference to the original — its
   author and a quoted excerpt — rather than copying the text opaquely, so a
-  forwarded message has stayed attributable to its source. **[needs ARCH decision
-  — forward encoding (quote reference vs. embedded copy) and whether the
-  original's attachments travel with it.]**
+  forwarded message has stayed attributable to its source.
+  The reference is **structured, not prose** (ARCH-108): the client sends the two
+  source ids on `SEND` and the daemon resolves the author, the excerpt and the
+  attachment count from the row it holds, so a client cannot claim someone said
+  something they did not, and the recipient renders a card it recognises rather
+  than string-matching a sentence anyone could have typed by hand. The excerpt is
+  a **snapshot** taken when the forward was sent — editing the original later does
+  not rewrite what was forwarded.
+  The forwarder must be able to **read the source**, or the message sends with no
+  reference at all: without that gate, forwarding is a way to read a channel you
+  were never in by asking the daemon to quote it at you. A source that is gone or
+  unreadable degrades to an ordinary message rather than an error, because a stale
+  permalink is not a failure the sender can act on.
+  **The original's attachments do not travel.** The card names them — the first
+  by filename, the rest as a count — and clicking the card opens the original; one attachment belongs to one message, so copying would
+  mean either a second row sharing a `storage_key` — which breaks the orphan model
+  reclamation counts on (ARCH-77/78) — or duplicating the bytes. Naming rather
+  than offering is also what a recipient who cannot read the source needs: a
+  download button would fail for exactly the people most likely to press it.
 
 ### 2.2 Threads
 

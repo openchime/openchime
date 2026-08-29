@@ -170,7 +170,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 9** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 10** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
@@ -366,6 +366,18 @@ continue).
 | `channel_id`         | u64    | Target channel or DM conversation.                                    |
 | `idempotency_token`  | 16 B   | Client-generated random 128-bit token (§7 `idem`). Enables safe retry (REQ-093). Distinct from the server message id. |
 | `body`               | lstr   | Message body, u32-length-prefixed UTF-8 (§7), `<= MAX_BODY_SIZE` (REQ-054). |
+| `src_channel`        | u64    | Forward source channel (REQ-057), `0` when the message forwards nothing.  |
+| `src_message`        | u64    | Forward source message (REQ-057), `0` when the message forwards nothing.  |
+| *(optional tail)*    | u16 + u64[] | Attachment ids to link (REQ-140), written only when present.        |
+
+**Forwarding (REQ-057, ARCH-108).** The client sends only the two source ids.
+The daemon resolves the source author, a truncated excerpt and the attachment
+count from the row it already holds, and announces them on a `FORWARD` frame —
+so a client cannot claim someone said something they did not. The two fields sit
+in the **fixed part, ahead of the optional attachment tail**: a second block
+sharing that tail is how a decoder loses its place (§2). The forwarder must be
+able to read the source or no reference is stored; a source that is gone or
+unreadable makes this an ordinary send rather than an error.
 
 On accept, the daemon's single DB-writer thread assigns a `message_id` and a
 server timestamp inside the WAL commit, then answers `SEND_ACK`. The client
@@ -1746,6 +1758,29 @@ list, so opening a thread does not cost the whole view.
 
 ### 5.16j Link unfurls (REQ-222, ARCH-105)
 
+**`FORWARD` (S → C), `0x00D9`** — what a forwarded message points at (REQ-057),
+fanned to the channel's members immediately behind the `BROADCAST` it describes.
+
+    message_id (u64), channel_id (u64), src_channel (u64), src_message (u64),
+    src_author (u64), src_excerpt (str), n_attach (u16),
+    src_attach_name (str)
+
+`message_id`/`channel_id` name the forward itself; the rest describe the
+original. Every field is **resolved by the daemon**, never taken from the
+sender, and all of it is a **snapshot** taken when the forward was sent —
+editing the original afterwards does not rewrite what was forwarded.
+**Replayed on backfill (§6.2) and on history paging (§6.3)**, for the reason the
+reaction, pin and unfurl replays exist: the reference travels only on this
+frame, a client stores nothing (ARCH-88), and a replay that omitted it would
+lose the attribution on every reload.
+
+`n_attach` counts the original's files and `src_attach_name` is the **first
+one's name** — the card says "report.txt and 2 more" rather than listing a wall
+of them, and clicking the card opens the original. The files themselves stay
+with the original, because one attachment belongs to one message and copying
+would mean either a shared `storage_key` — which breaks the orphan model
+reclamation counts on (ARCH-77/78) — or duplicated bytes.
+
 **`UNFURL` (S → C), `0x00D7`** — a URL's fetched preview, arriving after the
 BROADCAST it belongs to — whenever the daemon's fetch completes, or never.
 
@@ -2204,6 +2239,7 @@ this table cannot silently gain a shared value.
 | `0x00D6` | `SET_TZ_OFFSET` | C → S | minutes east of UTC, refreshed on every connect |
 | `0x00D7` | `UNFURL` | S → C | a URL's fetched preview (REQ-222); also replayed on backfill |
 | `0x00D8` | `SET_PROFILE` | C → S | my profile fields (REQ-240) |
+| `0x00D9` | `FORWARD` | S → C | what a forwarded message points at (REQ-057); also replayed on backfill |
 
 ## 10. Connection state machine
 

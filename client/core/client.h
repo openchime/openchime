@@ -43,6 +43,11 @@ const oc_model *oc_client_model(oc_client *c);
 
 /* Queue a message to `channel_id` for the network thread to send. */
 void oc_client_send(oc_client *c, uint64_t channel_id, const char *body);
+/* Forward `src_message` into `to_channel` with an optional note (REQ-057).
+ * The reference is structured, not prose: the daemon resolves the source
+ * author, excerpt and attachment count from the ids. */
+void oc_client_forward(oc_client *c, uint64_t to_channel, const char *note,
+                       uint64_t src_channel, uint64_t src_message);
 
 /* Request history for `channel_id` (once per channel — a frontend calls this the
  * first time a channel is opened). Replayed messages fold into the model. */

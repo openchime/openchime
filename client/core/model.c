@@ -32,6 +32,8 @@ static void msg_clear_unfurls(oc_msg *m) {
 }
 
 static void msg_free(oc_msg *m) {
+    if (m->forward) { free(m->forward->excerpt); free(m->forward->attach_name);
+                      free(m->forward); m->forward = NULL; }
     free(m->body); free(m->reactions); free(m->attach);
     msg_clear_unfurls(m);
 }
@@ -1257,6 +1259,32 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
                 }
             }
         }
+        break;
+    }
+    case OC_EV_FORWARD: {
+        /* What a forwarded message points at (REQ-057). Replace rather than
+         * append: a message forwards exactly one thing, so the replay after a
+         * reconnect must overwrite what the live frame already set rather than
+         * accumulate a second copy of it. */
+        oc_channel *c = oc_model_channel(m, e->channel_id);
+        if (!c) break;
+        oc_msg *msg = NULL;
+        for (size_t i = 0; i < c->n_msgs; i++)
+            if (c->msgs[i].message_id == e->message_id) { msg = &c->msgs[i]; break; }
+        if (!msg || msg->deleted) break;
+        if (!msg->forward) {
+            msg->forward = calloc(1, sizeof *msg->forward);
+            if (!msg->forward) break;
+        }
+        free(msg->forward->excerpt);
+        free(msg->forward->attach_name);
+        msg->forward->attach_name = strdup(e->src_attach_name);
+        msg->forward->src_channel = e->src_channel;
+        msg->forward->src_message = e->src_message;
+        msg->forward->src_author  = e->author_id;
+        msg->forward->n_attach    = e->src_n_attach;
+        msg->forward->excerpt     = e->body;   /* steal, like an edit does */
+        e->body = NULL;
         break;
     }
     case OC_EV_UNFURL: {
