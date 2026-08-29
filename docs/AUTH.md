@@ -121,19 +121,36 @@ The central service **never connects to a self-hosted daemon** — the client
 carries the token from center to daemon. This preserves the island model
 (ARCH-4): no central→daemon link.
 
+**The client never talks to the provider directly, and never mints PKCE.** It
+starts at central, and central runs the whole Authorization-Code-+-PKCE exchange
+as the Relying Party. That is what makes the flow completable: the verifier stays
+with the party that redeems the code, which is central. A client-minted challenge
+would have to be handed over to be of any use, and there would be nothing to hand
+it over on.
+
 ```
-  ┌────────┐   1. authorize (central's client_id,        ┌──────────┐
-  │ client │──────redirect_uri, PKCE, state=workspace)───▶│ provider │
-  │ (app)  │◀──────────────── 2. login ──────────────────│ (Google) │
-  └───┬────┘                                              └────┬─────┘
-      │                                    3. auth code        │
-      │                                    ┌────────────────◀──┘
-      │                                    ▼
-      │                            ┌───────────────┐
-      │  4. ES256 JWT              │   central     │  exchanges code (secret),
-      │◀──(aud=<opaque ws id>)─────│   service      │  verifies, mints JWT
-      │                            └───────────────┘
-      │  5. AUTH{method=oidc, token}
+  ┌────────┐  1. GET central /oidc/authorize        ┌───────────────┐
+  │ client │─────(workspace, redirect_uri)─────────▶│    central    │
+  │ (app)  │                                        │    service    │
+  └───┬────┘                                        └───────┬───────┘
+      │                              2. redirect to provider │
+      │                                 (central's client_id,│
+      │                                  central's PKCE,     │
+      │                                  state = {workspace, │
+      │                                    client redirect}) │
+      │                                        ┌─────────────┘
+      │                                        ▼
+      │                                  ┌──────────┐
+      │                3. user logs in   │ provider │
+      │                                  │ (Google) │
+      │                                  └────┬─────┘
+      │                    4. auth code ──────┘
+      │                       to central's callback
+      │                            │
+      │  5. redirect to the client's own redirect_uri,
+      │◀─────carrying the ES256 JWT (aud=<opaque ws id>)
+      │
+      │  6. AUTH{method=oidc, token}
       ▼
   ┌────────────────┐  verifies signature vs central's pinned key,
   │ daemon         │  checks audience==self + not expired,
@@ -141,18 +158,33 @@ carries the token from center to daemon. This preserves the island model
   └────────────────┘
 ```
 
-1. The client opens a browser to the provider's authorize endpoint using
-   **central's** `client_id` and redirect URI (e.g.
-   `https://auth.openchime.io/callback`), a PKCE challenge, and a `state` that
-   encodes the **target workspace** + a client nonce.
-2. The user authenticates at the provider.
-3. The provider redirects to central's callback with an auth code.
-4. Central exchanges the code (with its client secret), verifies the provider
-   token, extracts identity (subject, email, name), and mints an **ES256 JWT
-   scoped to that workspace** (`aud = <the workspace's opaque id>`, not its DNS
-   name — see §3.3), returned to the *client*.
-5. The client presents that token to the `acme.example` daemon in `AUTH`
+1. The client opens a browser at **central's** `/oidc/authorize`, naming the
+   target **workspace** and its own `redirect_uri` — a loopback `127.0.0.1` URI
+   on desktop (RFC 8252), or a configured `https` destination.
+2. **Central validates that `redirect_uri` before the user authenticates**,
+   against an allowlist: loopback per RFC 8252, or exact-match https. Doing it
+   at authorize rather than at callback is the point — an unvalidated
+   destination is an open redirect that would carry a live token, and by
+   callback the user has already logged in.
+   Central then redirects to the provider with **its own** `client_id` and
+   **its own** PKCE challenge, sealing the workspace and the client's
+   `redirect_uri` into `state`.
+3. The user authenticates at the provider.
+4. The provider redirects to central's callback with an auth code.
+5. Central exchanges the code (its own verifier plus its client secret),
+   verifies the provider token, extracts identity (subject, email, name), and
+   mints an **ES256 JWT scoped to that workspace** (`aud = <the workspace's
+   opaque id>`, not its DNS name — see §3.3). It returns it by redirecting to
+   the client's `redirect_uri`: **in the query for loopback**, and **in the
+   fragment for a configured web destination**, so a browser destination never
+   puts the token in a server log.
+6. The client presents that token to the `acme.example` daemon in `AUTH`
    (method `oidc`). The daemon verifies it (§3.3) and mints a session.
+
+The client half of this — the browser launch, the loopback listener and the
+`ASWebAuthenticationSession` path on Apple platforms — is the remaining
+unbuilt piece of REQ-020; the daemon's verification half is built and tested
+(§3.6).
 
 ### 3.3 The identity token — an ES256 JWT (ARCH-57)
 
@@ -160,7 +192,7 @@ Central issues a **standard JWT** signed with **ES256** (ECDSA P-256 + SHA-256),
 carrying the identity claims:
 
 ```
-{ "iss": "https://auth.openchime.io",   // the central service
+{ "iss": "https://central.example",     // the central service — see below
   "aud": "ws_7f3a…9c21",                 // the target workspace's opaque id
   "sub": "<provider issuer>|<subject>",  // stable identity
   "email": "...", "name": "...",
@@ -176,6 +208,12 @@ workspace address** — a workspace can change its domain or add a vanity name
 never consulted for discovery. (The enrollment
 flow itself — how the id is proposed and bound — is a control-plane concern,
 out of scope for this doc.)
+
+**The issuer above is illustrative, not normative.** It is a string the daemon
+compares with `strcmp` and never dereferences — there is no JWKS fetch and no
+discovery document, because the key is pinned in configuration (§3.4). Any
+value both sides agree on works, and an implementer should not read the example
+as a URL that has to resolve, or as requiring a particular subdomain.
 
 The daemon validates it by **pinning both the key and the algorithm**:
 
