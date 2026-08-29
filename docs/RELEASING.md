@@ -5,16 +5,38 @@ obvious from reading the file.
 
 ## Shape
 
-    guard ─┐
-           ├─▶ version ─┬─▶ packages (amd64, arm64) ─┐
-    test ──┘            │                            │
-                        ├─▶ image                    ├─▶ publish ─▶ winget
-                        └─▶ windows-build ─▶ windows-package
-                                                     └─▶ unreserve (on failure)
+    guard ────┐
+    test ─────┼─▶ version ─┬─▶ packages (amd64, arm64) ─┐
+    preflight ┘            │                            │
+                           ├─▶ image                    ├─▶ publish ─▶ winget
+                           └─▶ windows-build ─▶ windows-package
+                                                        └─▶ unreserve (on failure)
 
 `test` is `ci.yml` reused, not re-implemented: a release that ran a weaker suite
 than CI would be worse than no gate, because it would look like one. `guard` is
 the attribution guard, gated via `workflow_call`.
+
+## The credentials are checked before anything is built
+
+`preflight` asserts that every required secret and variable is set, and it takes
+seconds. Each one used to be read only at its point of use, and every step that
+reads one is skipped on a dry run — so the first time a missing value could
+surface was a real release, after the CI gate, both package builds, the image
+and the Windows binaries had all run.
+
+It gates **`version`**, not merely `publish`, and that is the point: the release
+number is reserved before anything is built and only returned when nothing was
+published, so a run that cannot possibly publish would otherwise burn a number
+for nothing.
+
+A **dry run reports and continues** rather than failing. Its job is to prove the
+build, and failing it would stop anyone verifying one on a fork with no secrets —
+but surfacing the gap in a dry run is exactly what was impossible before.
+
+Authenticode signing is checked separately because it is optional (see *Windows
+signing is optional* below). The state worth naming is a **partial** trio: `SIGN`
+requires all three values, so one or two set reads as configured and silently
+ships unsigned. Preflight warns on that specifically.
 
 ## The release number is reserved, not assigned at the end
 
