@@ -247,9 +247,12 @@ the requirement says so explicitly rather than implying one.
   been restorable. Archiving (reversible) is distinct from deletion, which is not
   offered for channels holding history. **Built (ARCH-93, migration 0024):**
   `archived_at_ms` non-NULL *is* the flag, so "when" is free and unarchive is one
-  NULL write. Read-only is enforced in `channel_post_access`, so **every** write
-  path inherits it — send, threaded reply, attachment upload and webhook post all
-  return `CHANNEL_ARCHIVED`. Hidden from the channel list for non-members; a
+  NULL write. Read-only holds for **every** writer. Send, threaded reply
+  and attachment upload inherit it from `channel_post_access` and return
+  `CHANNEL_ARCHIVED`; the incoming webhook is the one writer with no user behind
+  it, so it cannot use that check — going through it would also re-test the
+  creator's membership — and tests the same archived helper directly, answering
+  `403`. The webhook itself is untouched, so unarchiving restores it. Hidden from the channel list for non-members; a
   member keeps it (and the way back). Owner/admin only.
 - **REQ-036a.** A channel's **visibility has been changeable** by an owner/admin —
   public to private and back — without touching its membership or its history.

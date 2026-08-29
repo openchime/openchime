@@ -1389,10 +1389,16 @@ enum { CH_OK = 0, CH_UNKNOWN = 1, CH_DENIED = 2, CH_ARCHIVED = 3 };
 static int channel_post_access(sqlite3 *db, uint64_t channel_id, uint64_t user_id) {
     uint8_t is_public = 0;
     if (!channel_exists(db, channel_id, &is_public)) return CH_UNKNOWN;
-    /* Archived is read-only (REQ-035), enforced here so every write path — send,
-     * threaded reply, webhook post — inherits it rather than each remembering.
-     * Checked before membership so an archived channel refuses uniformly, and
-     * so a public one does not silently auto-join someone into a dead room. */
+    /* Archived is read-only (REQ-035), enforced here so every write path that
+     * has a user behind it — send, threaded reply, attachment upload — inherits
+     * it rather than each remembering. Checked before membership so an archived
+     * channel refuses uniformly, and so a public one does not silently auto-join
+     * someone into a dead room.
+     *
+     * The incoming-webhook post is the one writer with NO user to check, so it
+     * cannot come through here and tests channel_is_archived directly. This
+     * comment used to claim it inherited the rule; it did not, and a token
+     * holder could write into an archived channel. */
     if (channel_is_archived(db, channel_id)) return CH_ARCHIVED;
     if (is_member(db, channel_id, user_id)) return CH_OK;
     if (is_public) { add_membership(db, channel_id, user_id); return CH_OK; }
@@ -4268,6 +4274,26 @@ static oc_dbres *process_webhook_post(sqlite3 *db, const oc_job *j) {
     char *label_dup = (label && label[0]) ? strdup(label) : NULL;  /* copy before finalize */
     sqlite3_finalize(st);
     if (!found) { free(label_dup); r->type = OC_RES_WEBHOOK_ERR; r->err_code = OC_ERR_UNKNOWN_WEBHOOK; return r; }
+
+    /* Archived is read-only (REQ-035), and that has to hold for the ONE writer
+     * that is not a client. SEND, SEND_REPLY and UPLOAD_BEGIN inherit it from
+     * channel_post_access; a webhook post cannot use that function, because it
+     * would also re-check the creator's membership and so silently break every
+     * webhook whose creator has since left the channel — a different change
+     * from this one. The archived test is therefore made directly, against the
+     * same helper that function uses, so the two cannot disagree about what
+     * archived means.
+     *
+     * Without it a third party holding a token wrote into a channel the product
+     * presents as read-only: the composer is locked, the About panel says
+     * "Archived", and the message was still stored, broadcast to every member,
+     * and answered with {"ok":true}. */
+    if (channel_is_archived(db, cid)) {
+        free(label_dup);
+        r->type = OC_RES_WEBHOOK_ERR;
+        r->err_code = OC_ERR_CHANNEL_ARCHIVED;
+        return r;
+    }
 
     /* Post as the webhook's label (display-name override, REQ-170), falling back
      * to the creator's identity if the webhook was created without a label. */
