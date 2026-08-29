@@ -15975,13 +15975,35 @@ static void remember_workspace(const char *ws, const char *user) {
 
 /* Unread across every workspace that is NOT the one on screen — the number the
  * rail badge exists to show. */
+/* What ONE workspace contributes to a badge.
+ *
+ * Both badges ask this, and that is the fix rather than an tidiness: the rail's
+ * "N elsewhere" and the taskbar overlay each summed unread themselves, and the
+ * two rules drifted — the taskbar honoured mute and counted thread replies, the
+ * rail did neither, so muting a noisy channel in a background workspace still
+ * lit the rail. Two places computing "unread" is what produced that, so there
+ * is now one.
+ *
+ * The rule is the one the taskbar comment already stated and REQ-137 already
+ * decided: every unread message in every conversation that is NOT muted, plus
+ * thread replies, which bump no channel's unread (a separate counter feeds the
+ * Threads shelf) and would otherwise let a day of nothing but replies leave a
+ * badge claiming there is nothing. REQ-284's finer rule — count only what would
+ * have notified — is still an open call and is deliberately not decided here. */
+static int ws_unread_of(const oc_model *m) {
+    if (!m) return 0;
+    int total = 0;
+    for (size_t c = 0; c < m->n_channels; c++)
+        if (!m->channels[c].muted) total += m->channels[c].unread;
+    total += (int)oc_model_thread_unread(m);
+    return total;
+}
+
 static int ws_unread_elsewhere(void) {
     int total = 0;
     for (int i = 0; i < g_n_wss; i++) {
         if (i == g_ws_active || !g_wss[i].client) continue;
-        const oc_model *m = oc_client_model(g_wss[i].client);
-        if (!m) continue;
-        for (size_t c = 0; c < m->n_channels; c++) total += m->channels[c].unread;
+        total += ws_unread_of(oc_client_model(g_wss[i].client));
     }
     return total;
 }
@@ -18625,6 +18647,16 @@ static void test_poll(HWND hwnd) {
         else if (!strcmp(arg, "badparam")) { printf(NULL); }
         else if (!strcmp(arg, "fastfail")) { __fastfail(1); }
         else if (!strcmp(arg, "kill"))     { TerminateProcess(GetCurrentProcess(), 3); }
+    } else if (!strcmp(verb, "mute")) {
+        /* `mute <channel_id> <0|1>` — bypasses the channel context menu, which
+         * needs a right-click on a specific row and a menu target the harness
+         * cannot set. Same reason mkchan and emoji_add exist: without it the
+         * badge rules mute participates in are unassertable. */
+        unsigned long long cid = 0; int on = 1;
+        if (sscanf(arg, "%llu %d", &cid, &on) >= 1 && g_client && cid) {
+            oc_client_set_mute(g_client, (uint64_t)cid, on ? 1 : 0);
+            test_ack("ok");
+        } else test_ack("err");
     } else if (!strcmp(verb, "profile_set")) {
         /* `profile_set <tz>|<full name>|<title>|<pronouns>|<phone>` — pipe
          * separated because every field but the timezone may contain spaces,
@@ -19186,13 +19218,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     const oc_model *wm = (g_n_wss > 0)
                         ? (g_wss[wi].client ? oc_client_model(g_wss[wi].client) : NULL) : m;
                     if (!wm || !wm->authed) continue;
-                    for (size_t ci = 0; ci < wm->n_channels; ci++)
-                        if (!wm->channels[ci].muted) total += wm->channels[ci].unread;
-                    /* Thread replies count too: they do not bump a channel's
-                     * unread (a separate counter feeds the Threads shelf), and
-                     * a day of activity that is all thread replies must not
-                     * leave the taskbar claiming there is nothing. */
-                    total += (int)oc_model_thread_unread(wm);
+                    /* The same rule the rail badge uses (ws_unread_of): mute
+                     * excluded, thread replies included. They were two sums
+                     * and disagreed. */
+                    total += ws_unread_of(wm);
                 }
                 if (total > 10) total = 10;         /* rendered as "9+" */
                 if (total != g_badge_shown) taskbar_badge_apply(hwnd, total);

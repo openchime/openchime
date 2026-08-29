@@ -818,15 +818,25 @@ the requirement says so explicitly rather than implying one.
   notification preference, and this is deliberately the latter. **[needs ARCH
   decision — tenant-level setting storage (no tenant settings surface exists
   today, REQ-042) and the resolution order against REQ-131/136/278.]**
-- **REQ-137.** *(Partly built)* A user has been able to **mute a channel or DM**: muting has
+- **REQ-137.** A user has been able to **mute a channel or DM**: muting has
   suppressed its notifications **and de-emphasized it in the sidebar** (dimmed,
   excluded from the unread badge) without the user leaving it — distinct from
   setting its level to `none` (REQ-130), which governs notification only.
-  Storage exists: `notification_prefs.muted` (migration 0026), set with
-  `SET_MUTE`; push excludes a muted conversation unconditionally, so mute
-  outranks both the level and a priority person. **[needs ARCH decision — the
-  unread-accounting half: what a muted conversation contributes to badges and
-  aggregate unread views.]**
+  Storage is `notification_prefs.muted` (migration 0026), set with `SET_MUTE`;
+  push excludes a muted conversation unconditionally, so mute outranks both the
+  level and a priority person.
+
+  **What a muted conversation contributes to a badge is nothing**, and every
+  badge asks one function for it. A muted conversation's unread is excluded;
+  thread replies are included, because they bump no channel's unread and a day
+  of nothing but replies must not leave a badge claiming there is nothing. The
+  taskbar overlay and the workspace rail's "N elsewhere" both read that one
+  rule — they each summed it themselves once, and disagreed, which is how a
+  muted channel in a background workspace still lit the rail.
+
+  REQ-284's finer question — whether a badge should count every unread or only
+  what would have notified — is still open and is deliberately not answered
+  here.
 - **REQ-138.** *(Partly built)* A client has surfaced **OS-native desktop notifications** (a system
   toast) for messages due under the user's notification settings (REQ-130/134),
   with a content-preview toggle, plus optional **notification sounds and unread
