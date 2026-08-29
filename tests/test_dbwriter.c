@@ -3579,6 +3579,50 @@ static void test_invites_and_webhook_lifecycle(void) {
     CHECK(r && r->type == OC_RES_WEBHOOK_POSTED);   /* the new one works */
     oc_dbres_free(r);
 
+    /* ARCHIVING STOPS A WEBHOOK TOO (REQ-035).
+     *
+     * A webhook is the one writer with no user behind it, so it cannot inherit
+     * the read-only rule from channel_post_access the way SEND and SEND_REPLY
+     * do — and it did not have one of its own. A live token wrote into a channel
+     * the product presents as read-only and was answered {"ok":true}.
+     *
+     * The token stays VALID: this asserts the archived error specifically, not
+     * merely that the post failed, because failing as "unknown webhook" would
+     * tell an integration its token had been revoked — a different problem with
+     * a different fix. */
+    {
+        oc_job *aj = oc_job_new(OC_JOB_UPDATE_CHANNEL, 15);
+        aj->user_id = owner; aj->channel_id = OC_DEFAULT_CHANNEL;
+        aj->chup_op = OC_CHUP_ARCHIVE;
+        oc_dbwriter_submit(w, aj);
+        oc_dbres_free(wait_result(w));
+    }
+    j = oc_job_new(OC_JOB_WEBHOOK_POST, 16);
+    oc_job_set_token(j, tok2, sizeof tok2);
+    oc_job_set_body(j, "while archived", 14);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_ERR);
+    CHECK(r && r->err_code == OC_ERR_CHANNEL_ARCHIVED);
+    oc_dbres_free(r);
+
+    /* And unarchiving restores it, so this is read-only rather than a token
+     * that has been quietly burned. */
+    {
+        oc_job *uj = oc_job_new(OC_JOB_UPDATE_CHANNEL, 17);
+        uj->user_id = owner; uj->channel_id = OC_DEFAULT_CHANNEL;
+        uj->chup_op = OC_CHUP_UNARCHIVE;
+        oc_dbwriter_submit(w, uj);
+        oc_dbres_free(wait_result(w));
+    }
+    j = oc_job_new(OC_JOB_WEBHOOK_POST, 18);
+    oc_job_set_token(j, tok2, sizeof tok2);
+    oc_job_set_body(j, "after unarchive", 15);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_WEBHOOK_POSTED);
+    oc_dbres_free(r);
+
     /* Authorisation is by CHANNEL membership, and the default channel is public, so
      * `member` legitimately CAN rotate that one — the earlier version of this test
      * asserted the opposite and failed, which was the test being wrong about its own

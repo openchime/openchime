@@ -2905,6 +2905,13 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         if (c->http) {
             int status = 404; const char *reason = "Not Found"; const char *msg = "unknown webhook\n";
             if (r->err_code == OC_ERR_INTERNAL) { status = 500; reason = "Internal Server Error"; msg = "error\n"; }
+            /* 403, not 404: the token is real and the sender is entitled to use
+             * it — the CHANNEL is read-only (REQ-035). Answering "not found"
+             * would tell an integration its token had been revoked, which is a
+             * different problem with a different fix. */
+            else if (r->err_code == OC_ERR_CHANNEL_ARCHIVED) {
+                status = 403; reason = "Forbidden"; msg = "channel is archived\n";
+            }
             http_reply(c, status, reason, "text/plain", msg, strlen(msg));
             flush_out(c);
             conn_close(ep, conns, c->fd);

@@ -635,12 +635,15 @@ skim — and it is per *channel*, not per DM, so the ordinary sidebar can use it
 > reason a client that caches nothing (ARCH-88) must be able to render the
 > sidebar and the channel's About surface from the list alone.
 
-**An archived channel is read-only** on the client-facing wire: `SEND`,
-`SEND_REPLY` and `UPLOAD_BEGIN` share one access check and all return
-`CHANNEL_ARCHIVED` (3019). **The incoming-webhook post path does not call it** —
-it resolves the token and inserts the message, so a third party can still post
-into an archived channel and archiving does not disable a channel's webhooks.
-That is a defect, not a design, and is tracked as one. It is hidden from `CHANNEL_LIST` for
+**An archived channel is read-only** for every writer. `SEND`, `SEND_REPLY` and
+`UPLOAD_BEGIN` share one access check and all return `CHANNEL_ARCHIVED` (3019).
+The incoming-webhook post cannot use that check — it is the one writer with no
+user behind it, and going through it would also re-test the creator's
+membership — so it tests the same archived helper directly and answers
+**`403 Forbidden`**. Deliberately not `404`: the token is real and the sender is
+entitled to use it, and "not found" would tell an integration its token had been
+revoked. The webhook itself is untouched, so unarchiving restores it. It is
+hidden from `CHANNEL_LIST` for
 non-members; members keep it, flagged, so they can find their way back in.
 History, search and membership are untouched — archiving is the reversible
 alternative to a deletion that is not offered for channels holding history.
@@ -1294,14 +1297,13 @@ webhook's **label as a display-name override** (the `author_name` field on
 members as an ordinary `BROADCAST` (§5.3) and included in backfill.
 Responses: `200 {"ok":true,"message_id":N}` on success; `400` (empty or bad
 body, **including a declared `Content-Length` over `MAX_BODY_SIZE`** — the parser
-rejects it before the handler sees it), `404` (unknown or disabled token), `405`
+rejects it before the handler sees it), `403` (the channel is archived and
+therefore read-only, REQ-035), `404` (unknown or disabled token), `405`
 (non-POST), `413` (the raw request exceeded the read buffer, `MAX_BODY_SIZE` plus
 16 KiB, before parsing completed), `429` (per-token rate limit, 60/min).
 
 One gap, tracked: REQ-171's CA-signed certificate for this
-endpoint is not implemented, so it answers on the daemon's TOFU cert. **An
-archived channel does not stop a webhook post** — the archived check that
-`SEND` performs is absent here.
+endpoint is not implemented, so it answers on the daemon's TOFU cert.
 
 ---
 
