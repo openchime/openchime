@@ -66,9 +66,98 @@ jobs:
     permissions:
       contents: write
 
+  # Assert the credentials EXIST before anything expensive runs.
+  #
+  # Every credential used to be read only at its point of use, and every step
+  # that reads one is skipped on a dry run -- so the first time a missing value
+  # could surface was a real release, after the CI gate, both package builds,
+  # the image and the Windows binaries had all run. Twenty-five minutes to learn
+  # a secret was unset. This job runs in parallel with the CI gate and takes
+  # seconds.
+  #
+  # It gates `version` deliberately, not just the publish. The release NUMBER is
+  # reserved before anything is built and only returned when nothing was
+  # published, so letting a run that cannot possibly publish reserve one burns a
+  # number for no reason.
+  preflight:
+    name: check release credentials
+    runs-on: ubuntu-22.04
+    timeout-minutes: 2
+    env:
+      # Mapped in rather than read inline: a secret cannot be tested in an `if:`
+      # at job level, and mapping makes the required set one readable list.
+      DIST_S3_ACCESS_KEY: ${{ secrets.DIST_S3_ACCESS_KEY }}
+      DIST_S3_SECRET_KEY: ${{ secrets.DIST_S3_SECRET_KEY }}
+      DIST_S3_ENDPOINT:   ${{ vars.DIST_S3_ENDPOINT }}
+      DIST_BUCKET:        ${{ vars.DIST_BUCKET }}
+      REPO_SIGNING_KEY:   ${{ secrets.REPO_SIGNING_KEY }}
+      WINGET_TOKEN:       ${{ secrets.WINGET_TOKEN }}
+      TS_ENDPOINT:        ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+      TS_ACCOUNT:         ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+      TS_PROFILE:         ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+      DRY: ${{ inputs.dry_run }}
+    steps:
+      - name: required credentials
+        run: |
+          set -u
+          missing=""
+          for v in DIST_S3_ACCESS_KEY DIST_S3_SECRET_KEY DIST_S3_ENDPOINT \
+                   DIST_BUCKET REPO_SIGNING_KEY WINGET_TOKEN; do
+            eval "val=\${$v:-}"
+            [ -n "$val" ] || missing="$missing $v"
+          done
+
+          # Authenticode signing is OPTIONAL by design (RELEASING.md): without it
+          # the release ships an unsigned installer and says so. But the three
+          # values are all-or-nothing -- `SIGN` requires all three -- so a
+          # PARTIAL set is the dangerous state: it reads as configured and
+          # silently ships unsigned. Named separately for that reason.
+          ts_set=0
+          for v in TS_ENDPOINT TS_ACCOUNT TS_PROFILE; do
+            eval "val=\${$v:-}"
+            [ -n "$val" ] && ts_set=$((ts_set + 1))
+          done
+
+          {
+            echo "### Release credentials"
+            echo
+            if [ -n "$missing" ]; then
+              echo "**Missing (required):**"
+              for m in $missing; do echo "- \`$m\`"; done
+            else
+              echo "All required credentials are present."
+            fi
+            echo
+            case "$ts_set" in
+              3) echo "Authenticode signing: configured." ;;
+              0) echo "Authenticode signing: not configured — the installer ships unsigned, as designed." ;;
+              *) echo "Authenticode signing: **PARTIALLY configured ($ts_set of 3)** — signing will be skipped and the installer will ship unsigned. Set all three or none." ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$ts_set" != 0 ] && [ "$ts_set" != 3 ]; then
+            echo "::warning::Authenticode signing is partially configured ($ts_set of 3); the installer will ship unsigned."
+          fi
+
+          if [ -z "$missing" ]; then
+            echo "all required release credentials present"
+            exit 0
+          fi
+
+          # A dry run REPORTS and continues: its job is to prove the build, and
+          # failing it would stop anyone verifying a build on a fork with no
+          # secrets. Reporting is still the fix -- surfacing the gap in a dry run
+          # is exactly what was impossible before.
+          if [ "$DRY" = "true" ]; then
+            echo "::warning::missing release credentials:$missing (dry run — not failing)"
+            exit 0
+          fi
+          echo "::error::missing release credentials:$missing"
+          exit 1
+
   version:
     name: allocate the release number
-    needs: [test, guard]
+    needs: [test, guard, preflight]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     permissions:
