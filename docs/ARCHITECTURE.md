@@ -288,6 +288,14 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **One query, bounded, ordered by last reply.** Roots I authored ∪ roots I replied to ∪ roots I follow, minus unfollowed, restricted to channels I am still in and to roots that actually have replies — a root with none is a message, not a thread. It is the first cross-channel thread query in the product; the activity feed's reply arm is parent-author-only and ungrouped, so it could not be reused.
 
+  **The same predicate is the notify audience.** A thread reply notifies the
+  people this rule names (REQ-061), so the push query asks it too rather than
+  falling back to the channel's membership — the view and the notification
+  cannot then disagree about who is in a thread, and the unfollow keeps
+  outranking participation in both. Being a participant satisfies the *mentions*
+  level the way ARCH-103's keywords do: a way to pass the level, never a way
+  around mute, the schedule or the pause.
+
   **The follow and read acks return the ONE row that changed**, not a fresh list. A client folds a summary the same way whether it came from a list or a push, which is the shape `DRAFT` already uses, and re-listing after every read mark would make opening a thread cost the whole view.
 
   **REQ-282 (follow every thread in a channel) is deliberately not built here.** Its storage is a column on `notification_prefs` beside `level` and `muted`, since it is per (user, channel) exactly as they are; when it lands it composes with this by adding a fourth arm to the union above.

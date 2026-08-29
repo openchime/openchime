@@ -1053,10 +1053,13 @@ thread:
 `UNKNOWN_MESSAGE` (no such parent, or it is tombstoned), `NOT_A_MEMBER` /
 `UNKNOWN_CHANNEL` (cannot post to / read the channel).
 
-*Thread notifications (REQ-061) — notifying a thread's prior participants per
-their per-channel notification setting — depend on notification configuration
-(REQ-130) and are a later revision; today a `THREAD_REPLY` reaches every
-connected channel member.*
+A `THREAD_REPLY` also drives a notify decision (REQ-061): the reply's root goes
+to the push emitter with it, which notifies the thread's **participants** —
+derived from `messages.parent_id` with `thread_follows` as overrides (ARCH-104)
+— under each recipient's own per-channel level. Being a participant satisfies
+the *mentions* level the way a keyword hit does, so mute, the schedule and the
+pause still silence it. The live fan-out above is unchanged and still reaches
+every connected channel member.
 
 ### 5.11 Search (REQ-080)
 

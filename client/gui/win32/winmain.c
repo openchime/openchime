@@ -19123,6 +19123,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (!oc_notify_decide(last && last->author_id == wm->user_id,
                                           c->muted, vip,
                                           c->notify_level, mentioned, kw_hit,
+                                          /* Always 0 here: this loop watches a
+                                           * channel's high_water, and a thread
+                                           * reply is deliberately not in the
+                                           * main scroll (REQ-060), so it never
+                                           * sees one. Wiring it needs a flag on
+                                           * THREAD_REPLY and is tracked. */
+                                          0,
                                           ws_quiet, ws_paused))
                         continue;
                     if (g_pref_notify != NOTIFY_OFF) {
