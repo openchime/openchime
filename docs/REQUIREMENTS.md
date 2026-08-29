@@ -409,10 +409,25 @@ the requirement says so explicitly rather than implying one.
   thread. A thread reply has not appeared inline in the parent channel's
   main scroll; the parent message has displayed a reply count and the most
   recent repliers.
-- **REQ-061.** *(Not built)* Replying in a thread has notified the thread's participants
+- **REQ-061.** Replying in a thread has notified the thread's participants
   (message author plus prior repliers) according to their per-channel
   notification setting (REQ-130), independent of whether they were
   `@mentioned`.
+
+  **Participation is the audience, and it is derived rather than stored**
+  (ARCH-104): you are in a thread if you wrote its root or any reply, with
+  `thread_follows` carrying only overrides — an explicit follow of one you never
+  wrote in, and an explicit unfollow that **outranks having replied**, because
+  otherwise "turn off replies" does nothing for the person most likely to want
+  it. The push decision asks the same predicate the cross-channel thread list
+  asks, so the view and the notification cannot disagree about who is in a
+  thread.
+
+  Being a participant satisfies the **mentions** level, exactly as a keyword hit
+  does (REQ-135) — it is another way to pass the level, not a way around it, so
+  mute, the schedule and the pause all still silence a reply and `none` still
+  passes nothing. An `@mention` in a reply is an ordinary mention, stored and
+  resolved as one anywhere else.
 - **REQ-062.** *(Partly built)* A user has been able to **follow or unfollow a thread**
   independently of having replied to it, and has had a **followed-threads view**
   aggregating every thread they participate in or follow across channels, with

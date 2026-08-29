@@ -328,8 +328,8 @@ int oc_push_dnd_active(int enabled, int start_min, int end_min, int now_min) {
 }
 
 int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
-                    uint64_t message_id, int now_min, uint64_t now_ms,
-                    oc_push_target *out, int max) {
+                    uint64_t message_id, uint64_t root_id, int now_min,
+                    uint64_t now_ms, oc_push_target *out, int max) {
     sqlite3_stmt *st = NULL;
     /* Level ALL (0) always; level MENTIONS (1) only when this message actually
      * names the recipient — the deferred half of ARCH-72, which waited on
@@ -381,7 +381,34 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
             "                   WHERE pp.user_id = cm.user_id AND pp.person_id = ?2) "
             "        OR ( COALESCE(np.level, u.notify_default) = 1 AND ?3 <> 0 AND EXISTS ("
             "               SELECT 1 FROM mentions mn WHERE mn.message_id = ?3 "
-            "                 AND (mn.user_id = cm.user_id OR mn.kind <> 0)) ) );",
+            "                 AND (mn.user_id = cm.user_id OR mn.kind <> 0)) ) "
+            /* A reply in a thread you are IN satisfies MENTIONS too (REQ-061):
+             * participants are notified per their level, "independent of
+             * whether they were @mentioned". It sits in this OR group rather
+             * than above it deliberately — it is another way to pass the level,
+             * so mute, the schedule and the pause all still silence it, and
+             * NONE still passes nothing.
+             *
+             * Participation is DERIVED, never stored (ARCH-104): you are in a
+             * thread if you wrote its root or any reply. `thread_follows`
+             * carries only overrides — state 1 an explicit follow of one you
+             * never wrote in, state 0 an explicit unfollow — and the UNFOLLOW
+             * OUTRANKS having replied, which is the whole meaning of "turn off
+             * replies" and the rule most easily lost by writing this as a
+             * plain OR. Same predicate the cross-channel thread list uses, so
+             * the view and the notification cannot disagree about who is in a
+             * thread. */
+            "        OR ( COALESCE(np.level, u.notify_default) = 1 AND ?5 <> 0 "
+            "             AND NOT EXISTS(SELECT 1 FROM thread_follows tf "
+            "                             WHERE tf.user_id = cm.user_id "
+            "                               AND tf.root_id = ?5 AND tf.state = 0) "
+            "             AND ( EXISTS(SELECT 1 FROM messages rm "
+            "                           WHERE rm.id = ?5 AND rm.author_id = cm.user_id) "
+            "                OR EXISTS(SELECT 1 FROM messages rp "
+            "                           WHERE rp.parent_id = ?5 AND rp.author_id = cm.user_id) "
+            "                OR EXISTS(SELECT 1 FROM thread_follows tf "
+            "                           WHERE tf.user_id = cm.user_id "
+            "                             AND tf.root_id = ?5 AND tf.state = 1) ) ) );",
             -1, &st, NULL) != SQLITE_OK) {
         return 0;
     }
@@ -389,6 +416,9 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
     sqlite3_bind_int64(st, 2, (sqlite3_int64)author_id);
     sqlite3_bind_int64(st, 3, (sqlite3_int64)message_id);
     sqlite3_bind_int64(st, 4, (sqlite3_int64)now_ms);
+    /* 0 for an ordinary send: the branch above is then dead by its own ?5 <> 0
+     * test, so a channel message keeps exactly the audience it had. */
+    sqlite3_bind_int64(st, 5, (sqlite3_int64)root_id);
 
     int n = 0;
     while (n < max && sqlite3_step(st) == SQLITE_ROW) {
@@ -497,6 +527,7 @@ typedef struct pnode {
     uint64_t channel_id;
     uint64_t author_id;
     uint64_t message_id;   /* what makes the MENTIONS level answerable */
+    uint64_t root_id;      /* thread root for a reply, 0 for a channel send */
     struct pnode *next;
 } pnode;
 
@@ -522,13 +553,14 @@ static void prune_cb(void *ud, const char *token) {
 }
 
 static void do_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
-                      uint64_t message_id) {
+                      uint64_t message_id, uint64_t root_id) {
     time_t nowsec = time(NULL);
     int now_min = (int)((nowsec / 60) % 1440);      /* minutes-of-day UTC */
 
     oc_push_target targets[OC_PUSH_MAX_TARGETS];
-    int n = oc_push_collect(p->rdb, channel_id, author_id, message_id, now_min,
-                            (uint64_t)nowsec * 1000ull, targets, OC_PUSH_MAX_TARGETS);
+    int n = oc_push_collect(p->rdb, channel_id, author_id, message_id, root_id,
+                            now_min, (uint64_t)nowsec * 1000ull, targets,
+                            OC_PUSH_MAX_TARGETS);
     if (n <= 0) return;
 
     size_t cap = (size_t)n * (OC_DEVICE_TOKEN_MAX + 96) + 64;
@@ -562,7 +594,7 @@ static void *worker(void *arg) {
         p->qlen--;
         pthread_mutex_unlock(&p->mu);
 
-        do_notify(p, node->channel_id, node->author_id, node->message_id);
+        do_notify(p, node->channel_id, node->author_id, node->message_id, node->root_id);
         free(node);
     }
     return NULL;
@@ -605,7 +637,7 @@ fail:
 }
 
 void oc_push_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
-                    uint64_t message_id) {
+                    uint64_t message_id, uint64_t root_id) {
     if (!p) return;
     pthread_mutex_lock(&p->mu);
     if (p->stopping || p->qlen >= OC_PUSH_MAX_QUEUE) { pthread_mutex_unlock(&p->mu); return; }
@@ -614,6 +646,7 @@ void oc_push_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
     node->channel_id = channel_id;
     node->author_id = author_id;
     node->message_id = message_id;
+    node->root_id = root_id;
     if (p->tail) p->tail->next = node; else p->head = node;
     p->tail = node;
     p->qlen++;

@@ -1495,6 +1495,29 @@ static void store_keyword_hits(sqlite3 *db, uint64_t mid, uint64_t channel_id,
     sqlite3_finalize(q);
 }
 
+/* What the sender can DO about a name that resolved to nobody here (REQ-287),
+ * answered where the channel is in hand rather than guessed at by the client.
+ * Shared by SEND and SEND_REPLY: a mention in a thread is still a mention, and
+ * the notice it produces has to say the same things. */
+static void fill_unresolved_context(sqlite3 *db, uint64_t channel_id,
+                                    oc_mention_unresolved *unres) {
+    if (!unres->count) return;
+    sqlite3_stmt *ci = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT kind, is_public, archived_at_ms FROM channels WHERE id = ?1;",
+            -1, &ci, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(ci, 1, (sqlite3_int64)channel_id);
+    if (sqlite3_step(ci) == SQLITE_ROW) {
+        const unsigned char *kind = sqlite3_column_text(ci, 0);
+        int is_dm = kind && strcmp((const char *)kind, "dm") == 0;
+        unres->is_private = sqlite3_column_int(ci, 1) ? 0 : 1;
+        /* A DM has nobody to add, and an archived channel takes no writes
+         * (REQ-035): offering the action would be offering a failure. */
+        unres->can_add = (!is_dm && sqlite3_column_type(ci, 2) == SQLITE_NULL) ? 1 : 0;
+    }
+    sqlite3_finalize(ci);
+}
+
 static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
                            const void *body, size_t body_len, uint64_t ts,
                            oc_mention_unresolved *unres) {
@@ -1706,26 +1729,7 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     r->unres.message_id = mid;
     store_mentions(db, mid, j->channel_id, j->body, j->body_len, ts, &r->unres);
     store_keyword_hits(db, mid, j->channel_id, j->user_id, j->body, j->body_len, ts);
-    if (r->unres.count) {
-        /* Whether the sender can do anything about it, answered here where the
-         * channel is in hand rather than guessed at by the client. */
-        sqlite3_stmt *ci = NULL;
-        if (sqlite3_prepare_v2(db,
-                "SELECT kind, is_public, archived_at_ms FROM channels WHERE id = ?1;",
-                -1, &ci, NULL) == SQLITE_OK) {
-            sqlite3_bind_int64(ci, 1, (sqlite3_int64)j->channel_id);
-            if (sqlite3_step(ci) == SQLITE_ROW) {
-                const unsigned char *kind = sqlite3_column_text(ci, 0);
-                int is_dm = kind && strcmp((const char *)kind, "dm") == 0;
-                r->unres.is_private = sqlite3_column_int(ci, 1) ? 0 : 1;
-                /* A DM has nobody to add, and an archived channel takes no
-                 * writes (REQ-035): offering the action would be offering a
-                 * failure. */
-                r->unres.can_add = (!is_dm && sqlite3_column_type(ci, 2) == SQLITE_NULL) ? 1 : 0;
-            }
-            sqlite3_finalize(ci);
-        }
-    }
+    fill_unresolved_context(db, j->channel_id, &r->unres);
 
     sqlite3_prepare_v2(db,
         "INSERT INTO sent_messages(channel_id, idempotency_token, message_id, created_at_ms) "
@@ -3391,12 +3395,20 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
         r->type = OC_RES_REPLY_ERR; r->err_code = OC_ERR_INTERNAL; return r;
     }
     uint64_t mid = (uint64_t)sqlite3_last_insert_rowid(db);
+    /* A reply's mentions are stored exactly as a channel message's are. They
+     * were not, and nothing downstream could work without them: the push
+     * MENTIONS branch, the activity feed's mention arm and the reader's
+     * highlight all read this table, so naming somebody in a thread reached
+     * them nowhere at all. */
+    r->unres.channel_id = j->channel_id;
+    r->unres.message_id = mid;
+    store_mentions(db, mid, j->channel_id, j->body, j->body_len, ts, &r->unres);
     /* Keywords fire in THREADS (REQ-135), which is a deliberate divergence:
      * Slack's help says keywords in thread messages never notify, and a thread
      * is where the substantive discussion usually is — the worst place to go
-     * deaf. (@mentions in replies remain a separate gap; REQ-061 notifies thread
-     * participants by a different route.) */
+     * deaf. */
     store_keyword_hits(db, mid, j->channel_id, j->user_id, j->body, j->body_len, ts);
+    fill_unresolved_context(db, j->channel_id, &r->unres);
     sqlite3_prepare_v2(db,
         "INSERT INTO sent_messages(channel_id, idempotency_token, message_id, created_at_ms) "
         "VALUES(?, ?, ?, ?);", -1, &st, NULL);

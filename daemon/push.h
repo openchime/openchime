@@ -29,7 +29,7 @@ oc_push *oc_push_start(const char *db_path, oc_dbwriter *dbw,
 /* Enqueue a notify decision for a just-committed message. Fire-and-forget; never
  * blocks the caller (the net loop). A no-op if p is NULL. */
 void oc_push_notify(oc_push *p, uint64_t channel_id, uint64_t author_id,
-                    uint64_t message_id);
+                    uint64_t message_id, uint64_t root_id);
 
 void oc_push_stop(oc_push *p);
 
@@ -51,9 +51,12 @@ typedef struct { uint8_t platform; char token[OC_DEVICE_TOKEN_MAX]; } oc_push_ta
 /* `now_min` is the minute of the day the recurring window is compared against;
  * `now_ms` is the wall instant a pause is compared against (REQ-278). Both are
  * passed in rather than read here, so a test can state the moment it means. */
+/* `root_id` is the thread root for a reply and 0 for a channel send; a reply
+ * additionally notifies the thread's participants at level MENTIONS (REQ-061,
+ * ARCH-104). */
 int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
-                    uint64_t message_id, int now_min, uint64_t now_ms,
-                    oc_push_target *out, int max);
+                    uint64_t message_id, uint64_t root_id, int now_min,
+                    uint64_t now_ms, oc_push_target *out, int max);
 
 /* Sign the CP-12 canonical string for `body` with the enrollment key ->
  * base64(DER ECDSA) into sig_b64. Returns 0 on success. */

@@ -2122,7 +2122,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             /* Offline mobile delivery (ARCH-85): hand the notify decision to the
              * push emitter — members minus author, level/DND-gated, off this
              * thread. Fire-and-forget; a no-op when push is unconfigured. */
-            oc_push_notify(g_push, r->channel_id, r->author_id, r->message_id);
+            oc_push_notify(g_push, r->channel_id, r->author_id, r->message_id, 0);
             /* Link previews (REQ-222): queue this body's URLs for fetching.
              * Off the hot path — the fetch completes as an UNFURL_STORED
              * result later, or never. */
@@ -2610,6 +2610,15 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
                 if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
                     send_bytes(ep, conns, fd, g_enc, blen);
             }
+            /* And the notify decision, which a reply never produced at all
+             * (REQ-061): the root goes with it, so the emitter can notify the
+             * thread's PARTICIPANTS and not merely whoever the channel level
+             * would have caught. Fire-and-forget beside the send path's own
+             * call, and a no-op when push is unconfigured. */
+            oc_push_notify(g_push, r->channel_id, r->author_id, r->message_id,
+                           r->parent_id);
+            /* A reply's URLs unfurl like any other body's (REQ-222). */
+            unfurl_enqueue(r->body, r->body_len, r->channel_id, r->message_id);
         }
         break;
     }

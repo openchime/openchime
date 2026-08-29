@@ -708,6 +708,35 @@ static void test_mentions_stored(void) {
     oc_dbres_free(r);
     CHECK(mention_rows(path, m6, carol, OC_MENTION_USER) == 0);
 
+    /* A REPLY'S MENTIONS ARE STORED TOO (REQ-061/221).
+     *
+     * They were not, and the consequence was larger than it sounds: the push
+     * MENTIONS branch, the activity feed's mention arm and the reader's
+     * highlight all read this table, so naming somebody in a thread reached
+     * them nowhere at all. A mention in a thread is still a mention. */
+    memset(idem, 0xA7, sizeof idem);
+    j = oc_job_new(OC_JOB_SEND, 91);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL;
+    memcpy(j->idem, idem, OC_IDEM_LEN);
+    oc_job_set_body(j, "thread root", 11);
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_SEND_OK);
+    uint64_t root = r->message_id;
+    oc_dbres_free(r);
+
+    memset(idem, 0xA8, sizeof idem);
+    j = oc_job_new(OC_JOB_SEND_REPLY, 92);
+    j->user_id = alice; j->channel_id = OC_DEFAULT_CHANNEL; j->parent_id = root;
+    memcpy(j->idem, idem, OC_IDEM_LEN);
+    oc_job_set_body(j, "@bob in a thread", strlen("@bob in a thread"));
+    oc_dbwriter_submit(w, j);
+    r = wait_result(w);
+    CHECK(r && r->type == OC_RES_REPLY_OK);
+    uint64_t rmid = r->message_id;
+    oc_dbres_free(r);
+    CHECK(mention_rows(path, rmid, bob, OC_MENTION_USER) == 1);
+
     oc_dbwriter_stop(w);
     cleanup_db(path);
 }

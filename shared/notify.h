@@ -41,8 +41,14 @@ int oc_notify_quiet(int mode, int base_start, int base_end,
  *   level, the schedule, the pause — because those say WHEN and a priority
  *   person is a WHO; then the schedule (REQ-136) and the pause (REQ-278)
  *   silence the rest; then the level: ALL passes, NONE passes nothing, and
- *   MENTIONS passes an @-mention or a keyword hit, which REQ-135 makes part
- *   of the level rather than a separate switch.
+ *   MENTIONS passes an @-mention, a keyword hit — which REQ-135 makes part of
+ *   the level rather than a separate switch — or a reply in a thread you are
+ *   in, which REQ-061 states the same way: participants are notified according
+ *   to their level, "independent of whether they were @mentioned".
+ *
+ * `thread_reply` is therefore a third way to satisfy MENTIONS, not a fourth
+ * level and not a bypass: it is tested inside the level, so mute, a schedule
+ * and a pause all still silence it, and NONE still passes nothing.
  *
  * In shared/ for ARCH-89's reason, taken one step further: the daemon's push
  * query and each client's toast gate answer the SAME question, and those
@@ -58,6 +64,7 @@ int oc_notify_quiet(int mode, int base_start, int base_end,
  * global default (REQ-134): the fallback is the caller's to apply, because
  * only the caller knows whether a per-channel preference exists. */
 int oc_notify_decide(int own, int muted, int vip, unsigned level,
-                     int mentioned, int keyword_hit, int quiet, int paused);
+                     int mentioned, int keyword_hit, int thread_reply,
+                     int quiet, int paused);
 
 #endif /* OC_NOTIFY_H */

@@ -27,12 +27,13 @@ int oc_notify_quiet(int mode, int base_start, int base_end,
 }
 
 int oc_notify_decide(int own, int muted, int vip, unsigned level,
-                     int mentioned, int keyword_hit, int quiet, int paused) {
+                     int mentioned, int keyword_hit, int thread_reply,
+                     int quiet, int paused) {
     if (own) return 0;              /* your own words are not news */
     if (muted) return 0;            /* mute is absolute: nothing pierces it (REQ-137) */
     if (vip) return 1;              /* a priority person pierces all of the below (REQ-135) */
     if (quiet || paused) return 0;  /* the schedule and the pause (REQ-136, REQ-278) */
     if (level == OC_NOTIFY_ALL) return 1;
-    if (level == OC_NOTIFY_MENTIONS) return mentioned || keyword_hit;
+    if (level == OC_NOTIFY_MENTIONS) return mentioned || keyword_hit || thread_reply;
     return 0;                       /* OC_NOTIFY_NONE, and anything unrecognised */
 }

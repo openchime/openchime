@@ -194,12 +194,12 @@ static void test_collect(void) {
 
     /* At 10:30 (630): author excluded, carol muted, bob in DND → only dave. */
     oc_push_target t[8];
-    int n = oc_push_collect(rdb, 1, alice, 0, 630, (uint64_t)630 * 60000ull, t, 8);
+    int n = oc_push_collect(rdb, 1, alice, 0, 0, 630, (uint64_t)630 * 60000ull, t, 8);
     CHECK(n == 1);
     if (n == 1) CHECK(strcmp(t[0].token, "tok-dave") == 0);
 
     /* At 01:40 (100): bob no longer in DND → bob + dave (carol still muted). */
-    n = oc_push_collect(rdb, 1, alice, 0, 100, (uint64_t)100 * 60000ull, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 0, 0, 100, (uint64_t)100 * 60000ull, t, 8);
     CHECK(n == 2);
     int saw_bob = 0, saw_dave = 0, saw_carol = 0, saw_alice = 0;
     for (int i = 0; i < n; i++) {
@@ -221,7 +221,7 @@ static void test_collect(void) {
 
     CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
     /* A message that mentions nobody: dave is on MENTIONS, so he is out. */
-    n = oc_push_collect(rdb, 1, alice, 0, 100, (uint64_t)100 * 60000ull, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 0, 0, 100, (uint64_t)100 * 60000ull, t, 8);
     int only_bob = (n == 1) && strcmp(t[0].token, "tok-bob") == 0;
     CHECK(only_bob);
 
@@ -236,7 +236,7 @@ static void test_collect(void) {
         CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
         sqlite3_close(wdb);
     }
-    n = oc_push_collect(rdb, 1, alice, 4242, 100, (uint64_t)100 * 60000ull, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 4242, 0, 100, (uint64_t)100 * 60000ull, t, 8);
     int saw_d = 0, saw_b = 0;
     for (int i = 0; i < n; i++) {
         if (strcmp(t[i].token, "tok-dave") == 0) saw_d = 1;
@@ -246,7 +246,7 @@ static void test_collect(void) {
 
     /* A DIFFERENT message still leaves him out: the gate is per message, not a
      * sticky "dave gets mentions" flag. */
-    n = oc_push_collect(rdb, 1, alice, 4243, 100, (uint64_t)100 * 60000ull, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 4243, 0, 100, (uint64_t)100 * 60000ull, t, 8);
     saw_d = 0;
     for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-dave") == 0) saw_d = 1;
     CHECK(!saw_d);
@@ -261,7 +261,7 @@ static void test_collect(void) {
             " VALUES(4244,1,NULL,2,0,8,1);", NULL, NULL, NULL) == SQLITE_OK);
         sqlite3_close(wdb);
     }
-    n = oc_push_collect(rdb, 1, alice, 4244, 100, (uint64_t)100 * 60000ull, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 4244, 0, 100, (uint64_t)100 * 60000ull, t, 8);
     saw_d = 0; int saw_c = 0;
     for (int i = 0; i < n; i++) {
         if (strcmp(t[i].token, "tok-dave") == 0)  saw_d = 1;
@@ -269,6 +269,88 @@ static void test_collect(void) {
     }
     CHECK(saw_d);
     CHECK(!saw_c);
+
+    /* --- a REPLY notifies the thread's PARTICIPANTS (REQ-061, ARCH-104) -----
+     *
+     * dave is on MENTIONS, so an ordinary channel message leaves him out. A
+     * reply in a thread he is IN must reach him anyway: participants are
+     * notified per their level, "independent of whether they were @mentioned".
+     *
+     * Participation is derived, never stored — you are in a thread if you wrote
+     * its root or any reply — with thread_follows carrying only overrides. All
+     * four of those rules are exercised below against the same user, so a change
+     * to any one of them fails here. */
+    {
+        sqlite3 *wdb = NULL;
+        CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        char sql[512];
+        /* A root dave wrote, and a reply from alice under it. */
+        snprintf(sql, sizeof sql,
+                 "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms)"
+                 " VALUES(5000,1,%llu,'root',1);"
+                 "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms,parent_id)"
+                 " VALUES(5001,1,%llu,'reply',2,5000);",
+                 (unsigned long long)dave, (unsigned long long)alice);
+        CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(wdb);
+    }
+
+    /* He wrote the root, so the reply reaches him. */
+    n = oc_push_collect(rdb, 1, alice, 5001, 5000, 100, (uint64_t)100 * 60000ull, t, 8);
+    saw_d = 0; saw_c = 0;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(t[i].token, "tok-dave") == 0)  saw_d = 1;
+        if (strcmp(t[i].token, "tok-carol") == 0) saw_c = 1;
+    }
+    CHECK(saw_d);
+    /* And mute still wins over participation: carol is in the channel and
+     * muted, and nothing pierces mute (REQ-137). */
+    CHECK(!saw_c);
+
+    /* The SAME message with no root is an ordinary send, and he is out again —
+     * so this is the thread branch doing the work, not the message. */
+    n = oc_push_collect(rdb, 1, alice, 5001, 0, 100, (uint64_t)100 * 60000ull, t, 8);
+    saw_d = 0;
+    for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-dave") == 0) saw_d = 1;
+    CHECK(!saw_d);
+
+    /* AN EXPLICIT UNFOLLOW OUTRANKS HAVING WRITTEN IN IT. This is the rule most
+     * easily lost by writing the predicate as a plain OR, and it is the whole
+     * meaning of "turn off replies" for the person most likely to press it. */
+    {
+        sqlite3 *wdb = NULL;
+        CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        char sql[256];
+        snprintf(sql, sizeof sql,
+                 "INSERT INTO thread_follows(user_id,root_id,channel_id,state)"
+                 " VALUES(%llu,5000,1,0);", (unsigned long long)dave);
+        CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(wdb);
+    }
+    n = oc_push_collect(rdb, 1, alice, 5001, 5000, 100, (uint64_t)100 * 60000ull, t, 8);
+    saw_d = 0;
+    for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-dave") == 0) saw_d = 1;
+    CHECK(!saw_d);
+
+    /* And an explicit FOLLOW reaches someone who never wrote in it: the root is
+     * reassigned to alice so dave is no longer a participant by derivation, and
+     * only the override is left to carry him. */
+    {
+        sqlite3 *wdb = NULL;
+        CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        char sql[256];
+        snprintf(sql, sizeof sql,
+                 "UPDATE thread_follows SET state=1 WHERE user_id=%llu AND root_id=5000;"
+                 "UPDATE messages SET author_id=%llu WHERE id=5000;",
+                 (unsigned long long)dave, (unsigned long long)alice);
+        CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(wdb);
+    }
+    n = oc_push_collect(rdb, 1, alice, 5001, 5000, 100, (uint64_t)100 * 60000ull, t, 8);
+    saw_d = 0;
+    for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-dave") == 0) saw_d = 1;
+    CHECK(saw_d);
+
     sqlite3_close(rdb);
 
     /* --- a PAUSE silences regardless of the window (REQ-278) --------
@@ -285,14 +367,14 @@ static void test_collect(void) {
         oc_dbres_free(sr);
 
         CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
-        n = oc_push_collect(rdb, 1, alice, 0, 100, until - 1000, t, 8);
+        n = oc_push_collect(rdb, 1, alice, 0, 0, 100, until - 1000, t, 8);
         int saw_b2 = 0;
         for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-bob") == 0) saw_b2 = 1;
         CHECK(!saw_b2);                       /* paused: no push, window or not */
 
         /* One millisecond past the end it is over, with nothing having cleared
          * it — the stamp is enforced on READ, so there is no sweep to wait for. */
-        n = oc_push_collect(rdb, 1, alice, 0, 100, until + 1, t, 8);
+        n = oc_push_collect(rdb, 1, alice, 0, 0, 100, until + 1, t, 8);
         saw_b2 = 0;
         for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-bob") == 0) saw_b2 = 1;
         CHECK(saw_b2);
@@ -306,7 +388,7 @@ static void test_collect(void) {
         CHECK(sr && sr->type == OC_RES_SNOOZE && sr->snooze_until_ms == 0);
         oc_dbres_free(sr);
         CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
-        n = oc_push_collect(rdb, 1, alice, 0, 100, until - 1000, t, 8);
+        n = oc_push_collect(rdb, 1, alice, 0, 0, 100, until - 1000, t, 8);
         saw_b2 = 0;
         for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-bob") == 0) saw_b2 = 1;
         CHECK(saw_b2);
@@ -347,31 +429,44 @@ static void test_collect(void) {
      * precedence against real rows; this exercises the shared statement of it
      * that a client's toast gate feeds, where the order is exactly the part
      * that had drifted. Arguments read:
-     *   (own, muted, vip, level, mentioned, keyword, quiet, paused). */
+     *   (own, muted, vip, level, mentioned, keyword, thread_reply, quiet,
+     *    paused). */
     {
         /* Plain traffic: ALL notifies, NONE does not, MENTIONS needs a reason. */
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_ALL,      0, 0, 0, 0) == 1);
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_NONE,     0, 0, 0, 0) == 0);
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 0, 0, 0, 0) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_ALL, 0, 0, 0, 0, 0) == 1);
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_NONE, 0, 0, 0, 0, 0) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 0, 0, 0, 0, 0) == 0);
         /* At MENTIONS an @-mention and a keyword hit are the same event:
          * REQ-135 makes keywords part of the level, not a separate switch. */
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 1, 0, 0, 0) == 1);
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 0, 1, 0, 0) == 1);
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 1, 0, 0, 0, 0) == 1);
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 0, 1, 0, 0, 0) == 1);
+        /* And so is a reply in a thread you are in (REQ-061): participants are
+         * notified per their level, "independent of whether they were
+         * @mentioned" — the same shape keywords have, one input further. */
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 0, 0, 1, 0, 0) == 1);
+        /* But it satisfies the LEVEL rather than bypassing anything: NONE still
+         * passes nothing, mute still wins, and the schedule still silences. */
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_NONE,     0, 0, 1, 0, 0) == 0);
+        CHECK(oc_notify_decide(0, 1, 0, OC_NOTIFY_MENTIONS, 0, 0, 1, 0, 0) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 0, 0, 1, 1, 0) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 0, 0, 1, 0, 1) == 0);
+        /* Your own reply is still not news. */
+        CHECK(oc_notify_decide(1, 0, 0, OC_NOTIFY_MENTIONS, 0, 0, 1, 0, 0) == 0);
         /* NONE means none: a mention does not pierce it. Only a person does. */
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_NONE,     1, 1, 0, 0) == 0);
-        CHECK(oc_notify_decide(0, 0, 1, OC_NOTIFY_NONE,     0, 0, 0, 0) == 1);
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_NONE, 1, 1, 0, 0, 0) == 0);
+        CHECK(oc_notify_decide(0, 0, 1, OC_NOTIFY_NONE, 0, 0, 0, 0, 0) == 1);
         /* Your own message is not news, whoever you are to yourself. */
-        CHECK(oc_notify_decide(1, 0, 1, OC_NOTIFY_ALL,      1, 1, 0, 0) == 0);
+        CHECK(oc_notify_decide(1, 0, 1, OC_NOTIFY_ALL, 1, 1, 0, 0, 0) == 0);
         /* Mute is absolute (REQ-137): not even a priority person pierces it. */
-        CHECK(oc_notify_decide(0, 1, 1, OC_NOTIFY_ALL,      1, 1, 0, 0) == 0);
+        CHECK(oc_notify_decide(0, 1, 1, OC_NOTIFY_ALL, 1, 1, 0, 0, 0) == 0);
         /* A priority person pierces the schedule and the pause alike:
          * both say WHEN, and a priority person is a WHO. */
-        CHECK(oc_notify_decide(0, 0, 1, OC_NOTIFY_MENTIONS, 0, 0, 1, 1) == 1);
+        CHECK(oc_notify_decide(0, 0, 1, OC_NOTIFY_MENTIONS, 0, 0, 0, 1, 1) == 1);
         /* For everyone else the schedule and the pause each silence
          * everything, a mention included (REQ-136, REQ-278). */
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_ALL,      0, 0, 1, 0) == 0);
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_ALL,      0, 0, 0, 1) == 0);
-        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 1, 0, 0, 1) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_ALL, 0, 0, 0, 1, 0) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_ALL, 0, 0, 0, 0, 1) == 0);
+        CHECK(oc_notify_decide(0, 0, 0, OC_NOTIFY_MENTIONS, 1, 0, 0, 0, 1) == 0);
     }
 
     /* --- a PRIORITY person pierces the level and the pause (REQ-135) --------
@@ -392,7 +487,7 @@ static void test_collect(void) {
         oc_dbres_free(pr);
     }
     CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
-    n = oc_push_collect(rdb, 1, alice, 0, 100, (uint64_t)100 * 60000ull, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 0, 0, 100, (uint64_t)100 * 60000ull, t, 8);
     { int saw_d3 = 0;
       for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-dave") == 0) saw_d3 = 1;
       CHECK(saw_d3); }
@@ -406,7 +501,7 @@ static void test_collect(void) {
         uint64_t until = sr ? sr->snooze_until_ms : 0;
         oc_dbres_free(sr);
         CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
-        n = oc_push_collect(rdb, 1, alice, 0, 100, until - 1000, t, 8);
+        n = oc_push_collect(rdb, 1, alice, 0, 0, 100, until - 1000, t, 8);
         int saw_d4 = 0;
         for (int i = 0; i < n; i++) if (strcmp(t[i].token, "tok-dave") == 0) saw_d4 = 1;
         CHECK(saw_d4);
@@ -434,7 +529,7 @@ static void test_collect(void) {
     CHECK(token_count(path, "tok-dave") == 0);
 
     CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
-    n = oc_push_collect(rdb, 1, alice, 0, 100, (uint64_t)100 * 60000ull, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 0, 0, 100, (uint64_t)100 * 60000ull, t, 8);
     CHECK(n == 1);   /* dave pruned → only bob */
     if (n == 1) CHECK(strcmp(t[0].token, "tok-bob") == 0);
     sqlite3_close(rdb);
@@ -475,7 +570,7 @@ static void test_default_and_mute(void) {
     oc_push_target t[8];
     sqlite3 *rdb = NULL;
     CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
-    CHECK(oc_push_collect(rdb, 1, alice, 0, 100, (uint64_t)100 * 60000ull, t, 8) == 2);   /* the default default is ALL */
+    CHECK(oc_push_collect(rdb, 1, alice, 0, 0, 100, (uint64_t)100 * 60000ull, t, 8) == 2);   /* the default default is ALL */
     sqlite3_close(rdb);
 
     /* Bob sets his global default to MENTIONS, having no row for channel 1. */
@@ -488,7 +583,7 @@ static void test_default_and_mute(void) {
         oc_dbres_free(r);
     }
     CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
-    int n = oc_push_collect(rdb, 1, alice, 0, 100, (uint64_t)100 * 60000ull, t, 8);
+    int n = oc_push_collect(rdb, 1, alice, 0, 0, 100, (uint64_t)100 * 60000ull, t, 8);
     CHECK(n == 1 && strcmp(t[0].token, "tok-c") == 0);          /* bob is out */
 
     /* ... and a message that names him is in, through the same default. */
@@ -502,13 +597,13 @@ static void test_default_and_mute(void) {
         CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
         sqlite3_close(wdb);
     }
-    CHECK(oc_push_collect(rdb, 1, alice, 9001, 100, (uint64_t)100 * 60000ull, t, 8) == 2);
+    CHECK(oc_push_collect(rdb, 1, alice, 9001, 0, 100, (uint64_t)100 * 60000ull, t, 8) == 2);
     sqlite3_close(rdb);
 
     /* An explicit per-channel row still OVERRIDES the default, in both directions. */
     set_level(w, bob, 1, OC_NOTIFY_ALL);
     CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
-    CHECK(oc_push_collect(rdb, 1, alice, 0, 100, (uint64_t)100 * 60000ull, t, 8) == 2);
+    CHECK(oc_push_collect(rdb, 1, alice, 0, 0, 100, (uint64_t)100 * 60000ull, t, 8) == 2);
     sqlite3_close(rdb);
 
     /* Mute wins over the level: carol is at ALL and hears nothing. */
@@ -520,7 +615,7 @@ static void test_default_and_mute(void) {
         oc_dbres_free(r);
     }
     CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
-    n = oc_push_collect(rdb, 1, alice, 0, 100, (uint64_t)100 * 60000ull, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 0, 0, 100, (uint64_t)100 * 60000ull, t, 8);
     CHECK(n == 1 && strcmp(t[0].token, "tok-b") == 0);
     /* ... not even for a message that names her: mute means mute. */
     {
@@ -533,7 +628,7 @@ static void test_default_and_mute(void) {
         CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
         sqlite3_close(wdb);
     }
-    n = oc_push_collect(rdb, 1, alice, 9002, 100, (uint64_t)100 * 60000ull, t, 8);
+    n = oc_push_collect(rdb, 1, alice, 9002, 0, 100, (uint64_t)100 * 60000ull, t, 8);
     CHECK(n == 1 && strcmp(t[0].token, "tok-b") == 0);
     sqlite3_close(rdb);
 
@@ -622,7 +717,7 @@ static void test_notify_roundtrip(void) {
     oc_push *p = oc_push_start(path, w, url, NULL, aud, pk);
     CHECK(p != NULL);
     if (p) {
-        oc_push_notify(p, 1, alice, 0);   /* alice sent → bob should be notified */
+        oc_push_notify(p, 1, alice, 0, 0);   /* alice sent → bob should be notified */
         /* stop drains the in-flight notify: the worker completes do_notify (POST +
          * the fire-and-forget prune submit) before it exits — deterministic, no poll. */
         oc_push_stop(p);
