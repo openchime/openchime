@@ -7521,8 +7521,12 @@ static int url_handoff(const char *url) {
 #define NTOAST_MAX   3
 #define NTOAST_MS    8000            /* longer than the in-app toast: this one is read cold */
 #define NTOAST_W     360.0f
-#define NTOAST_H     92.0f
 #define NTOAST_PAD   12.0f
+#define NTOAST_GAP   8.0f
+#define NTOAST_ICON  UIS(28.0f)
+/* The tallest a row can get, so the window can be created once and only moved.
+ * Not a layout constant -- the layout is measured -- just an upper bound. */
+#define NTOAST_HMAX  UIS(160.0f)
 
 static HWND          g_nt_hwnd;
 static SDL_Window   *g_nt_win;
@@ -7539,6 +7543,34 @@ static int  g_nt_shown;              /* observable by the harness; see test_dump
 
 static void nt_layout(void);
 static void nt_paint(void);
+
+/* Where everything in one row goes. ONE function, because a notification laid
+ * out twice is a notification whose icon and text disagree — and because the
+ * offsets were fixed pixels against a fixed 92pt card, which left two lines of
+ * text floating in the top half with fifty points of dead air beneath and got
+ * worse at every larger text size. Now the row is as tall as its content. */
+typedef struct { float h, icon_x, icon_y, text_x, title_y, title_h, body_y, body_h; } nt_geom;
+static nt_geom nt_measure(const char *title, const char *body) {
+    nt_geom g;
+    g.icon_x = NTOAST_PAD + 2;
+    g.text_x = g.icon_x + NTOAST_ICON + UIS(10.0f);
+    float tw = NTOAST_W - g.text_x - NTOAST_PAD;
+    g.title_h = text_height(title && title[0] ? title : "x", g_ui_b, tw);
+    /* The body WRAPS, to two lines. A message is arbitrary text and clipping it
+     * at one line is how a notification shows you half a sentence. */
+    g.body_h  = text_height(body && body[0] ? body : "x", g_meta_w, tw);
+    float two = 2.0f * text_height("x", g_meta_w, tw);
+    if (g.body_h > two) g.body_h = two;
+    float content = g.title_h + g.body_h;
+    if (content < NTOAST_ICON) content = NTOAST_ICON;   /* never shorter than the mark */
+    g.h = content + 2.0f * UIS(NTOAST_PAD);
+    if (g.h > NTOAST_HMAX) g.h = NTOAST_HMAX;
+    /* Icon and text share one centre line, which is the whole fix. */
+    g.icon_y  = (g.h - NTOAST_ICON) / 2.0f;
+    g.title_y = (g.h - (g.title_h + g.body_h)) / 2.0f;
+    g.body_y  = g.title_y + g.title_h;
+    return g;
+}
 static void ws_save_active(void);   /* fwd — a notification may name another workspace */
 static void ws_load(int slot);      /* fwd */
 
@@ -7599,17 +7631,27 @@ static void toast_action_perform(char *p2) {
     }
 }
 
+/* Which row a click landed on. Walked rather than divided: the rows are no
+ * longer a uniform height, so `y / row_h` would pick the wrong one the moment
+ * a message wrapped -- and pick it silently, opening the wrong conversation. */
+static int nt_row_at(int y_px) {
+    float y = (float)y_px / ((float)g_dpi / 96.0f), top = 0;
+    for (int i = 0; i < g_n_nt; i++) {
+        float h = nt_measure(g_nt[i].title, g_nt[i].body).h;
+        if (y >= top && y < top + h) return i;
+        top += h + NTOAST_GAP;
+    }
+    return -1;
+}
+
 static LRESULT CALLBACK nt_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_LBUTTONUP: {
-        int y = GET_Y_LPARAM(l);
-        int idx = (int)((float)y / (NTOAST_H + 8.0f));
-        nt_activate(idx);
+        nt_activate(nt_row_at(GET_Y_LPARAM(l)));
         return 0;
     }
     case WM_MOUSEMOVE: {
-        int y = GET_Y_LPARAM(l);
-        g_nt_hover = (int)((float)y / (NTOAST_H + 8.0f));
+        g_nt_hover = nt_row_at(GET_Y_LPARAM(l));
         TRACKMOUSEEVENT tme = { sizeof tme, TME_LEAVE, h, 0 };
         TrackMouseEvent(&tme);
         return 0;
@@ -7649,7 +7691,7 @@ static int nt_create(void) {
     {
         float sc0 = (float)g_dpi / 96.0f;
         int w0 = (int)(NTOAST_W * sc0);
-        int h0 = (int)((NTOAST_H + 8.0f) * sc0) * NTOAST_MAX;
+        int h0 = (int)((NTOAST_HMAX + NTOAST_GAP) * sc0) * NTOAST_MAX;
         g_nt_hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
                                     L"OpenChimeNotify", L"", WS_POPUP,
                                     0, 0, w0, h0, NULL, NULL, inst, NULL);
@@ -7669,6 +7711,15 @@ static int nt_create(void) {
     return 1;
 }
 
+/* How tall the stack actually is, measured — the rows differ, because each is
+ * as tall as what it says. */
+static float nt_stack_h(void) {
+    float t = 0;
+    for (int i = 0; i < g_n_nt; i++)
+        t += nt_measure(g_nt[i].title, g_nt[i].body).h + NTOAST_GAP;
+    return t > 0 ? t - NTOAST_GAP : 0;
+}
+
 /* Bottom-right of the WORK AREA, not the screen: over the taskbar is where a
  * notification is least readable and most in the way. */
 static void nt_layout(void) {
@@ -7676,7 +7727,8 @@ static void nt_layout(void) {
     RECT wa; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
     float sc = (float)g_dpi / 96.0f;
     int w = (int)(NTOAST_W * sc);
-    int h = (int)((NTOAST_H + 8.0f) * sc) * (g_n_nt ? g_n_nt : 1);
+    int h = (int)(nt_stack_h() * sc);
+    if (h <= 0) h = (int)(NTOAST_HMAX * sc);
     /* MOVED, never resized: the window is created at its full height and the
      * unused rows below the stack simply are not drawn, so SDL's backbuffer and
      * the window agree for the whole session. */
@@ -7701,28 +7753,31 @@ static void nt_paint(void) {
     {
         float sc = (float)g_dpi / 96.0f;
         HRGN rgn = CreateRectRgn(0, 0, (int)(NTOAST_W * sc),
-                                 (int)((NTOAST_H + 8.0f) * sc) * g_n_nt);
+                                 (int)(nt_stack_h() * sc));
         SetWindowRgn(g_nt_hwnd, rgn, FALSE);   /* the window owns the region now */
     }
+    float top = 0;
     for (int i = 0; i < g_n_nt; i++) {
-        float top = i * (NTOAST_H + 8.0f);
-        rectf r = rf(0, top, NTOAST_W, top + NTOAST_H);
+        nt_geom g = nt_measure(g_nt[i].title, g_nt[i].body);
+        rectf r = rf(0, top, NTOAST_W, top + g.h);
         fill(g_nt_gfx, r, g_nt_hover == i ? OC_COL_HOVER : OC_COL_INPUT);
         stroke_round(g_nt_gfx, r, 2.0f, OC_COL_BORDER, 1.0f);
         fill(g_nt_gfx, rf(r.left, r.top, r.left + 4, r.bottom), OC_COL_ACCENT);
         /* The APP'S MARK, not its name. Windows already labels its own toasts
-         * with the application, and spending the title line on "OpenChime" tells
-         * you the one thing you can see from the icon -- so the title is the
-         * conversation and the body is who said what. */
-        float ic = 28.0f, ix = r.left + NTOAST_PAD + 2, iy = r.top + (NTOAST_H - ic) / 2;
-        fill_round(g_nt_gfx, rf(ix, iy, ix + ic, iy + ic), 6.0f, OC_COL_ACCENT);
+         * with the application, and spending a line on "OpenChime" says the one
+         * thing the icon already says. */
+        float ix = r.left + g.icon_x, iy = r.top + g.icon_y;
+        float pad = UIS(6.0f);
+        fill_round(g_nt_gfx, rf(ix, iy, ix + NTOAST_ICON, iy + NTOAST_ICON), 6.0f, OC_COL_ACCENT);
         draw_lucide(g_nt_gfx, OC_ICON_DMS,
-                    rf(ix + 6, iy + 6, ix + ic - 6, iy + ic - 6), 0xFFFFFF);
-        float tx = ix + ic + 10;
+                    rf(ix + pad, iy + pad, ix + NTOAST_ICON - pad, iy + NTOAST_ICON - pad),
+                    0xFFFFFF);
+        float tx = r.left + g.text_x, tr = r.right - NTOAST_PAD;
         draw_text(g_nt_gfx, g_nt[i].title, g_ui_b,
-                  rf(tx, r.top + 12, r.right - NTOAST_PAD, r.top + 34), OC_COL_TEXT);
-        draw_text(g_nt_gfx, g_nt[i].body, g_meta,
-                  rf(tx, r.top + 34, r.right - NTOAST_PAD, r.bottom - 10), OC_COL_MUTED);
+                  rf(tx, r.top + g.title_y, tr, r.top + g.title_y + g.title_h), OC_COL_TEXT);
+        draw_text(g_nt_gfx, g_nt[i].body, g_meta_w,
+                  rf(tx, r.top + g.body_y, tr, r.top + g.body_y + g.body_h), OC_COL_MUTED);
+        top += g.h + NTOAST_GAP;
     }
     gfx_end(g_nt_gfx);
     g_txt_target = prev;
