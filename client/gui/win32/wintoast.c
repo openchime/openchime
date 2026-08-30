@@ -17,6 +17,7 @@
 #include <propvarutil.h>
 #include <propkey.h>
 #include <propsys.h>
+#include "openchime_res.h"   /* IDI_APPICON */
 #include <stdio.h>
 #include <string.h>
 
@@ -510,6 +511,76 @@ void oc_wintoast_activator_unregister(void) {
     if (g_class_cookie) { CoRevokeClassObject(g_class_cookie); g_class_cookie = 0; }
 }
 
+/* Write this application's icon out as a real .ico file, locally, and return
+ * its path.
+ *
+ * THE TASKBAR BUTTON'S ICON COMES FROM THE SHORTCUT once an AppUserModelID is
+ * set -- "the command line, icon, and text of the shortcut are used" -- so the
+ * shortcut must name an icon Windows can actually read. Pointing it at the exe
+ * is the obvious thing and it fails when the exe is on a UNC path: the shell
+ * will not extract icons across one, so the button silently falls back to the
+ * generic application icon while the WINDOW keeps the right one. That is
+ * exactly how it looks: correct in the thumbnail, wrong on the button.
+ *
+ * So the icon is written somewhere local and the shortcut points there. The
+ * bytes come from our own resource, so there is nothing extra to install and
+ * nothing that can go stale against the binary.
+ *
+ * An .ico file is a directory of images. The RT_GROUP_ICON resource is that
+ * directory with a resource id per image where the file wants a byte offset;
+ * everything else is copied across unchanged. */
+#pragma pack(push, 1)
+typedef struct { BYTE w, h, colors, reserved; WORD planes, bits; DWORD bytes; WORD id; } grp_entry;
+typedef struct { WORD reserved, type, count; } ico_head;
+typedef struct { BYTE w, h, colors, reserved; WORD planes, bits; DWORD bytes, offset; } ico_entry;
+#pragma pack(pop)
+
+static int write_local_icon(WCHAR *out, size_t cap) {
+    HMODULE me = GetModuleHandleW(NULL);
+    HRSRC grp = FindResourceW(me, MAKEINTRESOURCEW(IDI_APPICON), (LPCWSTR)RT_GROUP_ICON);
+    if (!grp) return 0;
+    HGLOBAL gh = LoadResource(me, grp);
+    const ico_head *gd = gh ? (const ico_head *)LockResource(gh) : NULL;
+    if (!gd || gd->count == 0) return 0;
+    const grp_entry *ge = (const grp_entry *)(gd + 1);
+
+    WCHAR dir[MAX_PATH];
+    if (FAILED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, dir))) return 0;
+    _snwprintf(dir + wcslen(dir), MAX_PATH - wcslen(dir), L"\\OpenChime");
+    CreateDirectoryW(dir, NULL);
+    _snwprintf(out, cap, L"%s\\openchime.ico", dir);
+
+    HANDLE f = CreateFileW(out, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+
+    DWORD wrote = 0;
+    ico_head h = { 0, 1, gd->count };
+    WriteFile(f, &h, sizeof h, &wrote, NULL);
+    /* Offsets follow the whole directory, so they are known before any image
+     * is written -- which is why this can be done in one pass. */
+    DWORD off = (DWORD)(sizeof(ico_head) + (size_t)gd->count * sizeof(ico_entry));
+    for (WORD i = 0; i < gd->count; i++) {
+        ico_entry e;
+        e.w = ge[i].w; e.h = ge[i].h; e.colors = ge[i].colors; e.reserved = 0;
+        e.planes = ge[i].planes; e.bits = ge[i].bits;
+        e.bytes = ge[i].bytes; e.offset = off;
+        WriteFile(f, &e, sizeof e, &wrote, NULL);
+        off += ge[i].bytes;
+    }
+    int ok = 1;
+    for (WORD i = 0; i < gd->count; i++) {
+        HRSRC r = FindResourceW(me, MAKEINTRESOURCEW(ge[i].id), (LPCWSTR)RT_ICON);
+        HGLOBAL rh = r ? LoadResource(me, r) : NULL;
+        const void *bits = rh ? LockResource(rh) : NULL;
+        if (!bits) { ok = 0; break; }
+        WriteFile(f, bits, ge[i].bytes, &wrote, NULL);
+    }
+    CloseHandle(f);
+    if (!ok) DeleteFileW(out);
+    return ok;
+}
+
 /* The shortcut. Windows resolves BOTH the AppUserModelID and the activator
  * CLSID through it for an unpackaged app, and Inno cannot write the second --
  * so the app writes its own rather than shipping a toast that silently cannot
@@ -522,6 +593,10 @@ int oc_wintoast_ensure_shortcut(const char *aumid, const char *display_name) {
     _snwprintf(path + wcslen(path), MAX_PATH - wcslen(path), L"\\Programs\\%s.lnk", wname);
     WCHAR exe[MAX_PATH];
     if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return 0;
+    /* The icon the shortcut will name: a local file when we can write one,
+     * else the exe, which is right whenever the exe is local anyway. */
+    WCHAR icon[MAX_PATH];
+    if (!write_local_icon(icon, MAX_PATH)) wcscpy(icon, exe);
 
     /* EXISTING IS NOT THE SAME AS CORRECT. This used to return as soon as the
      * file was there, so a shortcut written by an older build -- before it
@@ -549,7 +624,7 @@ int oc_wintoast_ensure_shortcut(const char *aumid, const char *display_name) {
                     if (FAILED(old->lpVtbl->GetPath(old, had, MAX_PATH, &fd, 0)))
                         had[0] = 0;
                     old->lpVtbl->GetIconLocation(old, ico, MAX_PATH, &idx);
-                    if (!ico[0] || _wcsicmp(ico, exe) != 0) had[0] = 0;
+                    if (!ico[0] || _wcsicmp(ico, icon) != 0) had[0] = 0;
                 }
                 oldf->lpVtbl->Release(oldf);
             }
@@ -572,7 +647,7 @@ int oc_wintoast_ensure_shortcut(const char *aumid, const char *display_name) {
      * replaces the application's icon with a generic square. Named explicitly
      * rather than left to the shell to extract from the target, which it does
      * not reliably do when the target sits on a network path. */
-    link->lpVtbl->SetIconLocation(link, exe, 0);
+    link->lpVtbl->SetIconLocation(link, icon, 0);
     link->lpVtbl->SetDescription(link, L"OpenChime");
     if (SUCCEEDED(link->lpVtbl->QueryInterface(link, &IID_IPropertyStore, (void **)&store))
         && store) {
