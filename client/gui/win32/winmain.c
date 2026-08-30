@@ -1073,7 +1073,7 @@ static void toast_action_cb(const char *arg, const char *reply) {
  *
  * `g_delivered_by` records which one actually carried it, because "asked for
  * OS" and "got OS" are different facts and the test needs the second. */
-static void notify_deliver(const char *title, const char *body,
+static void notify_deliver(const char *title, const char *body, const char *source,
                            uint64_t ws_slot, uint64_t channel_id, int snd) {
     /* `snd` is an SNDV_* index: WHICH system sound this event asks for. Who
      * plays it depends on the backend and is decided below -- Windows for the
@@ -1124,7 +1124,7 @@ static void notify_deliver(const char *title, const char *body,
                      (unsigned long long)ws_slot, (unsigned long long)channel_id);
             const char *labels[2] = { "Send", emo };
             const char *args[2]   = { send_arg, react_arg };
-            shown = oc_wintoast_show_actions(title, body, tag, grp, arg,
+            shown = oc_wintoast_show_actions(title, body, source, tag, grp, arg,
                                              SNDV[snd].winsound, "Reply", labels, args, 2);
         }
         if (!shown && g_wintoast_ok)
@@ -19296,7 +19296,7 @@ static void test_poll(HWND hwnd) {
          * -- including which backend actually carried it. */
         /* Same SHAPE a real message uses -- conversation on top, "who: what"
          * below -- so what the harness renders is what a user sees. */
-        notify_deliver("#general", arg[0] ? arg : "bob: test notification", 0, 0,
+        notify_deliver("bob", arg[0] ? arg : "test notification", "#general", 0, 0,
                        sound_choice_for(0, 0));
         test_ack("ok");
     } else if (!strcmp(verb, "toastaction")) {
@@ -20106,19 +20106,44 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         channel_label(wm, c, label, sizeof label);
                         /* Name the workspace when it is not the one on screen,
                          * or "#general" alone is ambiguous across several. */
-                        if (is_active) snprintf(title, sizeof title, "%s", label);
-                        else snprintf(title, sizeof title, "%s \u2014 %s",
-                                      oc_model_workspace_name(wm), label);
-                        if (g_pref_notify == NOTIFY_FULL && last && last->body) {
-                            const char *who = last->author_name[0] ? last->author_name
-                                            : oc_model_user_name(wm, last->author_id);
-                            snprintf(body, sizeof body, "%s: %s",
-                                     (who && who[0]) ? who : "someone", last->body);
-                        } else {
+                        /* WHO said it, WHAT they said, and WHERE — in that
+                         * order, which is the documented shape for a chat
+                         * notification and not the shape a sidebar row wants.
+                         * channel_label writes "@ alice", right in a list of
+                         * conversations and a typo in a toast.
+                         *
+                         * The person leads because that is what you recognise
+                         * first; the channel is attribution, which the shell
+                         * renders smaller and below, because it only matters
+                         * when the name and the message leave it ambiguous. A
+                         * direct message has no source at all — the person IS
+                         * the conversation, and naming them twice tells you
+                         * one thing in two places. */
+                        int one_to_one = (c->kind == OC_CHANNEL_KIND_DM && c->n_peers <= 2);
+                        const char *who = (last && last->author_name[0])
+                                        ? last->author_name
+                                        : (last ? oc_model_user_name(wm, last->author_id) : NULL);
+                        char source[128] = "";
+                        if (!one_to_one) snprintf(source, sizeof source, "%s", label);
+                        /* Several workspaces: say which, or "#general" is
+                         * ambiguous across them. */
+                        if (!is_active) {
+                            char wsn[96];
+                            snprintf(wsn, sizeof wsn, "%s", oc_model_workspace_name(wm));
+                            if (source[0]) {
+                                char both[128];
+                                snprintf(both, sizeof both, "%s \u2014 %s", wsn, source);
+                                snprintf(source, sizeof source, "%s", both);
+                            } else snprintf(source, sizeof source, "%s", wsn);
+                        }
+                        snprintf(title, sizeof title, "%s",
+                                 (who && who[0]) ? who : (one_to_one ? "Direct message" : label));
+                        if (g_pref_notify == NOTIFY_FULL && last && last->body)
+                            snprintf(body, sizeof body, "%s", last->body);
+                        else
                             snprintf(body, sizeof body, "%d new message%s",
                                      c->unread, c->unread == 1 ? "" : "s");
-                        }
-                        notify_deliver(title, body, (uint64_t)wi, c->channel_id,
+                        notify_deliver(title, body, source, (uint64_t)wi, c->channel_id,
                                        sound_choice_for(mentioned || kw_hit || vip,
                                                         c->kind == OC_CHANNEL_KIND_DM));
                     }

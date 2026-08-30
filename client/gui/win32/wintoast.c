@@ -566,6 +566,7 @@ int oc_wintoast_ensure_shortcut(const char *aumid, const char *display_name) {
 }
 
 int oc_wintoast_show_actions(const char *title, const char *body,
+                             const char *source,
                              const char *tag, const char *group,
                              const char *arg, const char *sound,
                              const char *reply_placeholder,
@@ -597,10 +598,19 @@ int oc_wintoast_show_actions(const char *title, const char *body,
     }
     o += (size_t)_snwprintf(acts + o, 2048 - o, L"</actions>");
 
-    WCHAR wtitle[512], wbody[1024], warg[512], wsnd[128];
+    WCHAR wtitle[512], wbody[1024], warg[512], wsnd[128], wsrc[192];
     xml_escape(title, wtitle, 512);
     xml_escape(body,  wbody,  1024);
     xml_escape(arg,   warg,   512);
+    /* WHERE it was said, as attribution rather than a third ordinary line: the
+     * schema renders attribution smaller and below, which is the right weight
+     * for context you only need when the name and the message are ambiguous.
+     * A direct message has no source -- the person IS the conversation. */
+    wsrc[0] = 0;
+    if (source && source[0]) {
+        WCHAR sc[160]; xml_escape(source, sc, 160);
+        _snwprintf(wsrc, 192, L"<text placement=\"attribution\">%s</text>", sc);
+    }
     wsnd[0] = 0;
     if (sound && sound[0]) { WCHAR n[96]; xml_escape(sound, n, 96);
                              _snwprintf(wsnd, 128, L"<audio src=\"%s\"/>", n); }
@@ -614,9 +624,11 @@ int oc_wintoast_show_actions(const char *title, const char *body,
     _snwprintf(xml, 4096,
         L"<toast launch=\"%s\" activationType=\"protocol\">"
         L"<visual><binding template=\"ToastGeneric\">"
-        L"<text>%s</text><text>%s</text>"
+        /* One line for the name, however long it is: wrapping a person's name
+         * onto two lines pushes the message off the toast entirely. */
+        L"<text hint-maxLines=\"1\">%s</text><text>%s</text>%s"
         L"</binding></visual>%s%s</toast>",
-        warg, wtitle, wbody, acts, wsnd);
+        warg, wtitle, wbody, wsrc, acts, wsnd);
     return oc_wintoast_show_xml(xml, tag, group);
 }
 
