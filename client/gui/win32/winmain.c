@@ -21508,6 +21508,27 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         SDL_DestroyProperties(props);
     }
     if (!g_win || !gfx_stack_init()) return 1;
+    /* THE WINDOW'S OWN ICON, set after SDL has wrapped the HWND.
+     *
+     * The window CLASS carries one, which is normally enough -- but SDL sets a
+     * window icon of its own when it adopts a foreign HWND, and a window icon
+     * beats the class icon everywhere the shell looks. That is why the taskbar
+     * button and the window thumbnail could disagree about what this
+     * application looks like.
+     *
+     * LoadImage at the shell's own metrics rather than LoadIcon: LoadIcon hands
+     * back a single system-sized icon and lets the shell stretch it, which is
+     * how a crisp 32px mark turns into a blurred one in the taskbar. */
+    {
+        HICON big = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
+                                      GetSystemMetrics(SM_CXICON),
+                                      GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
+        HICON sml = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
+                                      GetSystemMetrics(SM_CXSMICON),
+                                      GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+        if (big) SendMessageW(hwnd, WM_SETICON, ICON_BIG,   (LPARAM)big);
+        if (sml) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)sml);
+    }
     apply_titlebar(hwnd);
     /* When we are auto-connecting, hold the window back until the settings
      * bucket arrives so it can open where it was left rather than snapping
