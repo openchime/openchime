@@ -892,9 +892,22 @@ the requirement says so explicitly rather than implying one.
   line is handed to the **already-running** client rather than starting a
   second one.
 
-  **Sounds are per event and one switch mutes them all.** Exactly one sound
-  plays: when the client has a sound for an event it tells the OS toast to be
-  silent, because otherwise one message makes two noises.
+  **Sounds are the SYSTEM'S OWN, named rather than shipped.** Windows already
+  has notification sounds and the user has already chosen how they behave, so
+  both surfaces ask for one by name — the toast XML through `ms-winsoundevent:`,
+  the client's own window through `PlaySound`'s `SND_ALIAS`. Nothing is bundled,
+  and somebody who has quietened or changed their notification sound is followed
+  rather than talked over. Per event, because a cue is only useful if it
+  distinguishes, with one mute that leaves the individual choices intact.
+  Exactly one thing plays it: Windows for the toast — which is also the only way
+  the sound obeys Focus Assist — and the client for its own window.
+
+  **A notification can be acted on without opening the app**: a reply box and a
+  quick reaction, sent from the toast itself. The reply is the reason the
+  client registers a COM activator at all — Windows delivers an `<input>`'s text
+  only to one, and protocol activation, which carries the toast body's own
+  click, cannot. Buttons activate in the *background*, because reacting to a
+  message should not drag you into the application.
 
   **Closing the window HIDES it; the app keeps running and keeps notifying.**
   A chat client that stops notifying the moment its window closes has stopped
