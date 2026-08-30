@@ -532,6 +532,14 @@ int oc_wintoast_ensure_shortcut(const char *aumid, const char *display_name) {
     if (FAILED(CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
                                 &IID_IShellLinkW, (void **)&link)) || !link) return 0;
     link->lpVtbl->SetPath(link, exe);
+    /* AND ITS ICON. Setting an explicit AppUserModelID hands Windows the
+     * taskbar identity, and from then on the button's icon comes from THIS
+     * shortcut rather than from the window class -- so a shortcut without one
+     * replaces the application's icon with a generic square. Named explicitly
+     * rather than left to the shell to extract from the target, which it does
+     * not reliably do when the target sits on a network path. */
+    link->lpVtbl->SetIconLocation(link, exe, 0);
+    link->lpVtbl->SetDescription(link, L"OpenChime");
     if (SUCCEEDED(link->lpVtbl->QueryInterface(link, &IID_IPropertyStore, (void **)&store))
         && store) {
         PROPVARIANT pv;

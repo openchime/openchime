@@ -7729,12 +7729,18 @@ static void nt_layout(void) {
     int w = (int)(NTOAST_W * sc);
     int h = (int)(nt_stack_h() * sc);
     if (h <= 0) h = (int)(NTOAST_HMAX * sc);
-    /* MOVED, never resized: the window is created at its full height and the
-     * unused rows below the stack simply are not drawn, so SDL's backbuffer and
-     * the window agree for the whole session. */
+    /* SIZED TO THE STACK, and this is what stops the window being a white slab
+     * reaching down to the taskbar.
+     *
+     * It is CREATED tall enough for the largest stack, because SDL takes its
+     * backbuffer when it wraps the HWND and never grows it -- but shrinking the
+     * WINDOW is fine: SDL keeps rendering into its full surface and the window
+     * simply reveals the top of it. Clipping with SetWindowRgn was the previous
+     * attempt and did not hold, which left the cleared background visible below
+     * the card for the whole height the window was created at. */
     SetWindowPos(g_nt_hwnd, HWND_TOPMOST,
-                 wa.right - w - (int)(16 * sc), wa.bottom - h - (int)(16 * sc),
-                 0, 0, SWP_NOACTIVATE | SWP_NOSIZE);
+                 wa.right - w - (int)(16 * sc), wa.bottom - h - (int)(12 * sc),
+                 w, h, SWP_NOACTIVATE);
     /* SDL took the window's size when it wrapped the HWND -- which was the 10x10
      * the window was created at, because it cannot be positioned until we know
      * how many notifications it holds. Without this the renderer keeps clipping
@@ -7748,14 +7754,6 @@ static void nt_paint(void) {
     g_txt_target = TXT_TARGET_TOAST;
     gfx_set_scale(g_nt_gfx, (float)g_dpi / 96.0f);
     gfx_begin(g_nt_gfx, OC_COL_INPUT);
-    /* The window is full height; only the rows in use are painted, and the
-     * region below them is cut away so an empty row is not a white slab. */
-    {
-        float sc = (float)g_dpi / 96.0f;
-        HRGN rgn = CreateRectRgn(0, 0, (int)(NTOAST_W * sc),
-                                 (int)(nt_stack_h() * sc));
-        SetWindowRgn(g_nt_hwnd, rgn, FALSE);   /* the window owns the region now */
-    }
     float top = 0;
     for (int i = 0; i < g_n_nt; i++) {
         nt_geom g = nt_measure(g_nt[i].title, g_nt[i].body);
