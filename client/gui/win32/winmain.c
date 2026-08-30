@@ -1108,24 +1108,43 @@ static void notify_deliver(const char *title, const char *body, const char *sour
          * verb's notification names no channel and gets the plain shape. */
         int shown = 0;
         if (g_wintoast_ok && channel_id) {
-            char react_arg[160];
-            /* A GLYPH, and never NULL. REACT_EMO holds resolved glyphs, but
-             * quick_rebuild's fallback path can leave an entry NULL when a
-             * configured name is not in the catalogue -- and a name that does
-             * not resolve would also render as literal text in the chip the
-             * reaction creates. The thumb is spelled out so neither can
-             * happen. */
-            const char *emo = (g_n_quick > 0 && REACT_EMO[0]) ? REACT_EMO[0]
-                                                              : "\xF0\x9F\x91\x8D";
-            snprintf(react_arg, sizeof react_arg, "react|%llu|%llu|%s",
-                     (unsigned long long)ws_slot, (unsigned long long)channel_id, emo);
+            /* SEND, THEN THE QUICK REACTIONS -- the same ones the message menu
+             * offers, so the toast and the app cannot disagree about what your
+             * quick reactions are.
+             *
+             * Windows allows five buttons on a toast, counting context-menu
+             * items, and Send takes one. Three reactions is what fits the row
+             * without crowding it and leaves a slot spare. */
+            #define TOAST_REACTS 3
+            static char rargs[TOAST_REACTS][160];
             char send_arg[160];
+            const char *labels[1 + TOAST_REACTS];
+            const char *args[1 + TOAST_REACTS];
             snprintf(send_arg, sizeof send_arg, "reply|%llu|%llu|",
                      (unsigned long long)ws_slot, (unsigned long long)channel_id);
-            const char *labels[2] = { "Send", emo };
-            const char *args[2]   = { send_arg, react_arg };
+            labels[0] = "Send"; args[0] = send_arg;
+            int nb = 1;
+            for (int q = 0; q < g_n_quick && nb < 1 + TOAST_REACTS; q++) {
+                /* Never a NULL: quick_rebuild leaves an entry empty when a
+                 * configured name is not in the catalogue, and a name that does
+                 * not resolve would render as literal text in the chip the
+                 * reaction creates. */
+                if (!REACT_EMO[q]) continue;
+                snprintf(rargs[nb - 1], sizeof rargs[0], "react|%llu|%llu|%s",
+                         (unsigned long long)ws_slot, (unsigned long long)channel_id,
+                         REACT_EMO[q]);
+                labels[nb] = REACT_EMO[q];
+                args[nb]   = rargs[nb - 1];
+                nb++;
+            }
+            /* A thumb, spelled out, when the catalogue gave us nothing at all. */
+            if (nb == 1) {
+                snprintf(rargs[0], sizeof rargs[0], "react|%llu|%llu|\xF0\x9F\x91\x8D",
+                         (unsigned long long)ws_slot, (unsigned long long)channel_id);
+                labels[1] = "\xF0\x9F\x91\x8D"; args[1] = rargs[0]; nb = 2;
+            }
             shown = oc_wintoast_show_actions(title, body, source, tag, grp, arg,
-                                             SNDV[snd].winsound, "Reply", labels, args, 2);
+                                             SNDV[snd].winsound, "Reply", labels, args, nb);
         }
         if (!shown && g_wintoast_ok)
             shown = oc_wintoast_show(title, body, tag, grp, arg, SNDV[snd].winsound);

@@ -930,6 +930,15 @@ static const struct { const char *from; const char *to; } EMOJI_ALIASES[] = {
     {"check","white_check_mark"},
     {"heavy_check","heavy_check_mark"},
     {"eyes_symbol","eye"},
+    /* The two Slack spells with punctuation. They are KEYWORDS of thumbsup and
+     * thumbsdown, not names, so a lookup failed and every caller silently
+     * dropped them: the default quick-reaction set is "+1,heart,joy,..." and
+     * quietly became five reactions instead of six, with the first one missing
+     * -- which is what a toast offering a heart where a thumb was meant looks
+     * like. A reaction another client stored as ":+1:" also rendered as literal
+     * text in the chip, for the same reason. */
+    {"+1","thumbsup"},
+    {"-1","thumbsdown"},
 };
 
 const char *oc_emoji_by_name(const char *name) {
