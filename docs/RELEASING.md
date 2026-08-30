@@ -8,13 +8,47 @@ obvious from reading the file.
     guard ────┐
     test ─────┼─▶ version ─┬─▶ packages (amd64, arm64) ─┐
     preflight ┘            │                            │
-                           ├─▶ image                    ├─▶ publish ─▶ winget
-                           └─▶ windows-build ─▶ windows-package
+                           ├─▶ image                    ├─▶ publish ─┬─▶ winget ─▶ smoke
+                           └─▶ windows-build ─▶ windows-package      │
                                                         └─▶ unreserve (on failure)
 
 `test` is `ci.yml` reused, not re-implemented: a release that ran a weaker suite
 than CI would be worse than no gate, because it would look like one. `guard` is
 the attribution guard, gated via `workflow_call`.
+
+## Verification is terminal, and publishing is not interrupted by it
+
+`smoke` — install the daemon from the repository that was just published — is
+the last job, not a step in the middle of `publish`.
+
+It used to be a step, sitting between writing the repositories and finishing the
+release. That made a postcondition abort the steps after it: a failed smoke
+skipped the GitHub release, the tarballs, `:latest` and the `winget`
+submission, while apt and dnf were already live. Packages published with nothing
+naming them is the worst reachable state, and it needed a manual repair twice.
+
+Once the apt index is written the release is irreversible, so **completing it is
+strictly better than stopping half way**. A red run that says "released, and the
+public URL does not serve it" is true, actionable, and leaves nothing to fix by
+hand. `skip_repo_smoke` still turns the check off; the default is still a hard
+failure, for the reason below.
+
+## The control plane serving `/dist` is an external dependency
+
+`DIST_BASE_URL` is `https://openchime.io/dist`, and the **control plane** serves
+it by reading the bucket. Nothing in this repository can make that true, and it
+has not been true for any release so far: `openchime.io` answers, but `/dist/*`
+returns the application's own 404 — the same body as any unrouted path — so the
+route does not exist in the deployed build.
+
+The smoke therefore fails by default, deliberately. Auto-detecting the outage
+would mask a genuinely broken repository once serving is live.
+
+What `preflight` adds is only *timing*: one HEAD request says at minute one what
+the smoke would otherwise say at minute nine, after every build has run. It
+**warns and continues** — failing there would make releases impossible until an
+external dependency lands, and a release is perfectly publishable without it.
+Only the public URL is unreachable.
 
 ## The credentials are checked before anything is built
 

@@ -96,6 +96,8 @@ jobs:
       TS_ACCOUNT:         ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
       TS_PROFILE:         ${{ secrets.TRUSTED_SIGNING_PROFILE }}
       DRY: ${{ inputs.dry_run }}
+      # As in `publish`, which is where this value is defined and explained.
+      DIST_BASE_URL: https://openchime.io/dist
     steps:
       - name: required credentials
         run: |
@@ -154,6 +156,41 @@ jobs:
           fi
           echo "::error::missing release credentials:$missing"
           exit 1
+
+      # The published base is a URL somebody else serves: the control plane
+      # reads the bucket and exposes it at DIST_BASE_URL. Nothing in this
+      # repository can make that true, and it has not been true for three
+      # releases -- so this REPORTS and never fails.
+      #
+      # It exists for the reason the credential check above does. That check was
+      # added because a missing value first surfaced during a real release,
+      # after the CI gate and every build had run; this one surfaced later still,
+      # after apt and dnf were already live. Knowing at minute one what you would
+      # otherwise learn at minute nine costs one HEAD request.
+      #
+      # Failing here was considered and rejected: it would make releases
+      # impossible until an external dependency lands, and the release is
+      # perfectly publishable without it -- only unreachable at the public URL.
+      - name: probe the published base URL
+        if: ${{ !inputs.skip_repo_smoke }}
+        run: |
+          set -u
+          if curl -fsI --max-time 20 "$DIST_BASE_URL/openchime-archive-keyring.gpg" >/dev/null 2>&1; then
+            echo "published base URL serves: $DIST_BASE_URL"
+            echo "Published base URL (\`$DIST_BASE_URL\`): serving." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::$DIST_BASE_URL does not serve the archive keyring -- \
+          the repositories will publish, and the terminal smoke job will fail. \
+          The release itself still completes."
+            {
+              echo
+              echo "**Published base URL (\`$DIST_BASE_URL\`): NOT serving.**"
+              echo
+              echo "The repositories will publish and the release will complete;"
+              echo "the terminal \`smoke\` job will fail. Serving \`/dist\` is the"
+              echo "control plane's job, and it is not in this repository."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   version:
     name: allocate the release number
@@ -1052,64 +1089,6 @@ jobs:
           EOF
           rclone copy repo/meta "dist:${DIST_BUCKET}/" --fast-list
 
-      # Installing from the PUBLISHED URL, not from a local file and not from the
-      # bucket. This is the only step that exercises the whole path end to end:
-      # signing, index generation, the object layout, AND the control plane
-      # serving it. A local install would pass with every one of those broken.
-      #
-      # It therefore depends on the control plane already serving DIST_BASE_URL
-      # (openchime-saas). Until that ships, this step is what fails, which is the
-      # correct place for the dependency to surface.
-      #
-      # The apt half runs directly on the runner, which is ephemeral, so polluting
-      # its package state costs nothing.
-      #
-      # The dnf half is GONE, and this is a real hole rather than a tidy-up. It
-      # needed a RHEL-family userland, which no hosted runner provides and which
-      # a container used to supply. The rpm repository's signing, its repodata
-      # and the .repo definition are now published with nothing proving a RHEL
-      # box can install from them -- the apt path below shares the signing key
-      # and the object layout, so it catches faults in those, but nothing
-      # exercises dnf itself. First reported by a RHEL user is not where this
-      # should surface; see the release-pipeline issues in the tracker.
-      - name: Smoke the published apt repository
-        # Skipped only when explicitly asked. The default stays a hard failure:
-        # this step existing to fail while DIST_BASE_URL is unserved is a
-        # recorded decision, not an oversight, and auto-detecting the outage
-        # would silently mask a genuinely broken repository later.
-        if: ${{ !inputs.skip_repo_smoke }}
-        run: |
-          set -euo pipefail
-          sudo curl -fsSL "$DIST_BASE_URL/openchime-archive-keyring.gpg" \
-            -o /usr/share/keyrings/openchime-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] $DIST_BASE_URL/apt stable main" \
-            | sudo tee /etc/apt/sources.list.d/openchime.list >/dev/null
-          # A stalled Ubuntu mirror must fail over, not hang. Set as
-          # apt config, not per-command flags: it has to cover `install`, which
-          # fetches from the same mirror, and not just `update`.
-          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
-          # runners point at, and it stalls. Retries and timeouts are
-          # not enough on their own: apt gives up on azure, falls back to
-          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
-          # and sits there until the job timeout. Measured on ubuntu-24.04 --
-          # every noble entry came back Ign: and the step hung 20 minutes.
-          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
-            /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
-            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openchimed
-          openchimed --version
-
-      - name: Note the skipped smoke test
-        if: ${{ inputs.skip_repo_smoke }}
-        run: |
-          echo "::warning::published-repository smoke test SKIPPED by request -- "\
-            "nothing has verified that the apt repository installs"
-          echo '> :warning: The published-repository smoke test was skipped.' >> "$GITHUB_STEP_SUMMARY"
-
       - name: Tag the release and attach the tarballs
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1305,6 +1284,74 @@ jobs:
   #
   # D-6: openchime has zero webhooks and nothing else consumes its tags, so a tag
   # appearing and disappearing on a failed run has no external observer.
+  # VERIFICATION IS TERMINAL, and that is the whole point of this job.
+  #
+  # These steps used to sit inside `publish`, between writing the repositories
+  # and finishing the release. Being a postcondition in the middle of an
+  # irreversible sequence made a failure here truncate everything after it: the
+  # GitHub release, the tarballs, :latest and the winget submission were all
+  # skipped, while apt and dnf were already live. That is the worst reachable
+  # state -- packages published with nothing naming them -- and it cost a manual
+  # repair twice (release 2 in ea7201c, release 3).
+  #
+  # Once the apt index is written the release is irreversible, so completing it
+  # is strictly better than stopping half way. A red run saying "released, and
+  # the public URL does not serve it" is true, actionable, and leaves nothing to
+  # repair by hand.
+  smoke:
+    name: smoke the published repository
+    needs: [publish, winget]
+    # always(), so that winget being skipped -- it has conditions of its own --
+    # does not skip the smoke with it. Gated on publish having SUCCEEDED because
+    # there is nothing to smoke if nothing was published.
+    if: ${{ always() && inputs.dry_run == false && needs.publish.result == 'success' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      # The published base, as in `publish` -- which is where this value is
+      # defined and explained. Repeated rather than shared because a job cannot
+      # read another job's env.
+      DIST_BASE_URL: https://openchime.io/dist
+    steps:
+      - name: Smoke the published apt repository
+        # Skipped only when explicitly asked. The default stays a hard failure:
+        # this step existing to fail while DIST_BASE_URL is unserved is a
+        # recorded decision, not an oversight, and auto-detecting the outage
+        # would silently mask a genuinely broken repository later.
+        if: ${{ !inputs.skip_repo_smoke }}
+        run: |
+          set -euo pipefail
+          sudo curl -fsSL "$DIST_BASE_URL/openchime-archive-keyring.gpg" \
+            -o /usr/share/keyrings/openchime-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] $DIST_BASE_URL/apt stable main" \
+            | sudo tee /etc/apt/sources.list.d/openchime.list >/dev/null
+          # A stalled Ubuntu mirror must fail over, not hang. Set as
+          # apt config, not per-command flags: it has to cover `install`, which
+          # fetches from the same mirror, and not just `update`.
+          # azure.archive.ubuntu.com is the Azure-local Ubuntu mirror the hosted
+          # runners point at, and it stalls. Retries and timeouts are
+          # not enough on their own: apt gives up on azure, falls back to
+          # archive.ubuntu.com for InRelease, then wedges on the Packages fetch
+          # and sits there until the job timeout. Measured on ubuntu-24.04 --
+          # every noble entry came back Ign: and the step hung 20 minutes.
+          # Point apt at archive.ubuntu.com so the broken mirror is never tried.
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+            /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openchimed
+          openchimed --version
+
+      - name: Note the skipped smoke test
+        if: ${{ inputs.skip_repo_smoke }}
+        run: |
+          echo "::warning::published-repository smoke test SKIPPED by request -- "\
+            "nothing has verified that the apt repository installs"
+          echo '> :warning: The published-repository smoke test was skipped.' >> "$GITHUB_STEP_SUMMARY"
+
+
   unreserve:
     name: return the release number
     needs: [version, publish]
