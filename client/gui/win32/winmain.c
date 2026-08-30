@@ -7522,6 +7522,7 @@ static int url_handoff(const char *url) {
 #define NTOAST_MS    8000            /* longer than the in-app toast: this one is read cold */
 #define NTOAST_W     360.0f
 #define NTOAST_PAD   12.0f
+#define NTOAST_VPAD  12.0f           /* vertical; see nt_measure */
 #define NTOAST_GAP   8.0f
 #define NTOAST_ICON  UIS(28.0f)
 /* The tallest a row can get, so the window can be created once and only moved.
@@ -7539,6 +7540,7 @@ static struct {
 } g_nt[NTOAST_MAX];
 static int  g_n_nt;
 static int  g_nt_hover = -1;         /* hovering holds it open */
+static int  g_nt_close_hover = -1;   /* the close box under the pointer, -1 none */
 static int  g_nt_shown;              /* observable by the harness; see test_dump */
 
 static void nt_layout(void);
@@ -7549,12 +7551,22 @@ static void nt_paint(void);
  * offsets were fixed pixels against a fixed 92pt card, which left two lines of
  * text floating in the top half with fifty points of dead air beneath and got
  * worse at every larger text size. Now the row is as tall as its content. */
-typedef struct { float h, icon_x, icon_y, text_x, title_y, title_h, body_y, body_h; } nt_geom;
+typedef struct { float h, icon_x, icon_y, text_x, title_y, title_h, body_y, body_h,
+                 close_x, close_y, close_sz; } nt_geom;
 static nt_geom nt_measure(const char *title, const char *body) {
     nt_geom g;
     g.icon_x = NTOAST_PAD + 2;
     g.text_x = g.icon_x + NTOAST_ICON + UIS(10.0f);
-    float tw = NTOAST_W - g.text_x - NTOAST_PAD;
+    /* A CLOSE BOX, top-right. The OS backend gets one for free -- the shell owns
+     * a toast's attribution area and puts a close and a context menu there, and
+     * an app cannot draw into it. This window has no shell behind it, so it
+     * draws its own; without it the only way to be rid of a notification is to
+     * wait it out or open the conversation you were not ready to read. */
+    g.close_sz = UIS(16.0f);
+    g.close_x  = NTOAST_W - NTOAST_PAD - g.close_sz;
+    g.close_y  = UIS(8.0f);
+    /* The text stops short of it, or a long name runs under the cross. */
+    float tw = g.close_x - g.text_x - UIS(8.0f);
     g.title_h = text_height(title && title[0] ? title : "x", g_ui_b, tw);
     /* The body WRAPS, to two lines. A message is arbitrary text and clipping it
      * at one line is how a notification shows you half a sentence. */
@@ -7563,7 +7575,13 @@ static nt_geom nt_measure(const char *title, const char *body) {
     if (g.body_h > two) g.body_h = two;
     float content = g.title_h + g.body_h;
     if (content < NTOAST_ICON) content = NTOAST_ICON;   /* never shorter than the mark */
-    g.h = content + 2.0f * UIS(NTOAST_PAD);
+    /* A SMALL pad, because the line boxes already carry their own leading.
+     * At the full 12 the card read bottom-heavy: above the title you see the
+     * padding alone, but below the body you see the padding PLUS that line's
+     * trailing leading, so the same number top and bottom does not look the
+     * same. The text's own metrics supply most of the breathing room; this is
+     * what is left over. */
+    g.h = content + 2.0f * UIS(NTOAST_VPAD);
     if (g.h > NTOAST_HMAX) g.h = NTOAST_HMAX;
     /* Icon and text share one centre line, which is the whole fix. */
     g.icon_y  = (g.h - NTOAST_ICON) / 2.0f;
@@ -7644,19 +7662,50 @@ static int nt_row_at(int y_px) {
     return -1;
 }
 
+/* The close box under a point, or -1. Asked before the row's own click, because
+ * the cross sits inside the row and dismissing is not opening. */
+static int nt_close_at(int x_px, int y_px) {
+    float sc = (float)g_dpi / 96.0f;
+    float x = (float)x_px / sc, y = (float)y_px / sc, top = 0;
+    for (int i = 0; i < g_n_nt; i++) {
+        nt_geom g = nt_measure(g_nt[i].title, g_nt[i].body);
+        if (y >= top && y < top + g.h) {
+            if (x >= g.close_x && x <= g.close_x + g.close_sz &&
+                y >= top + g.close_y && y <= top + g.close_y + g.close_sz) return i;
+            return -1;
+        }
+        top += g.h + NTOAST_GAP;
+    }
+    return -1;
+}
+
+/* Dismiss ONE notification, leaving the rest. */
+static void nt_drop(int i) {
+    if (i < 0 || i >= g_n_nt) return;
+    for (int k = i; k < g_n_nt - 1; k++) g_nt[k] = g_nt[k + 1];
+    g_n_nt--;
+    g_nt_hover = g_nt_close_hover = -1;
+    if (!g_n_nt) { if (g_nt_hwnd) ShowWindow(g_nt_hwnd, SW_HIDE); g_nt_shown = 0; }
+    else { nt_layout(); nt_paint(); }
+}
+
 static LRESULT CALLBACK nt_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_LBUTTONUP: {
+        { int ci = nt_close_at(GET_X_LPARAM(l), GET_Y_LPARAM(l));
+          if (ci >= 0) { nt_drop(ci); return 0; } }
         nt_activate(nt_row_at(GET_Y_LPARAM(l)));
         return 0;
     }
     case WM_MOUSEMOVE: {
         g_nt_hover = nt_row_at(GET_Y_LPARAM(l));
+        g_nt_close_hover = nt_close_at(GET_X_LPARAM(l), GET_Y_LPARAM(l));
         TRACKMOUSEEVENT tme = { sizeof tme, TME_LEAVE, h, 0 };
         TrackMouseEvent(&tme);
+        nt_paint();                      /* the cross lights under the pointer */
         return 0;
     }
-    case WM_MOUSELEAVE: g_nt_hover = -1; return 0;
+    case WM_MOUSELEAVE: g_nt_hover = g_nt_close_hover = -1; nt_paint(); return 0;
     /* Repaint on demand. Painting only when a notification is pushed was not
      * enough: the window is resized to fit the stack immediately afterwards, so
      * the first render went to the old surface and what stayed on screen was an
@@ -7724,11 +7773,28 @@ static float nt_stack_h(void) {
  * notification is least readable and most in the way. */
 static void nt_layout(void) {
     if (!g_nt_hwnd) return;
-    RECT wa; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    /* THE WORK AREA OF THE MONITOR THIS WINDOW IS ON, not SPI_GETWORKAREA.
+     *
+     * SPI_GETWORKAREA answers for the primary monitor and its answer depends on
+     * the calling thread's DPI context, so it returned 1896 here and 1920 to
+     * the test dump moments later -- which put the card 24px off the right edge
+     * while every measurement insisted it was flush. MonitorFromWindow is the
+     * per-monitor question and the only one worth asking of a window that is
+     * placed relative to a screen corner. */
+    RECT wa;
+    {
+        HMONITOR mon = MonitorFromWindow(g_nt_hwnd, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFO mi; mi.cbSize = sizeof mi;
+        if (mon && GetMonitorInfoW(mon, &mi)) wa = mi.rcWork;
+        else SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    }
     float sc = (float)g_dpi / 96.0f;
-    int w = (int)(NTOAST_W * sc);
-    int h = (int)(nt_stack_h() * sc);
-    if (h <= 0) h = (int)(NTOAST_HMAX * sc);
+    /* CEIL, not truncate. The card is drawn in DIPs and the window is sized in
+     * pixels, so 53 DIP at 1.5 is 79.5 -- and a window of 79 clips the half
+     * pixel the bottom border lives in. */
+    int w = (int)ceilf(NTOAST_W * sc);
+    int h = (int)ceilf(nt_stack_h() * sc);
+    if (h <= 0) h = (int)ceilf(NTOAST_HMAX * sc);
     /* SIZED TO THE STACK, and this is what stops the window being a white slab
      * reaching down to the taskbar.
      *
@@ -7739,7 +7805,12 @@ static void nt_layout(void) {
      * attempt and did not hold, which left the cleared background visible below
      * the card for the whole height the window was created at. */
     SetWindowPos(g_nt_hwnd, HWND_TOPMOST,
-                 wa.right - w - (int)(16 * sc), wa.bottom - h - (int)(12 * sc),
+                 /* THE CORNER OF THE WORK AREA, both axes, with nothing
+                  * subtracted. wa.right and wa.bottom already exclude the
+                  * taskbar; an inset on top of that is a second gap, and having
+                  * one on the right and not the bottom is why the card looked
+                  * wedged into one edge and floating off the other. */
+                 wa.right - w, wa.bottom - h,
                  w, h, SWP_NOACTIVATE);
     /* SDL took the window's size when it wrapped the HWND -- which was the 10x10
      * the window was created at, because it cannot be positioned until we know
@@ -7757,9 +7828,20 @@ static void nt_paint(void) {
     float top = 0;
     for (int i = 0; i < g_n_nt; i++) {
         nt_geom g = nt_measure(g_nt[i].title, g_nt[i].body);
+        /* THE FILL BLEEDS TO THE EDGE; ONLY THE STROKE IS INSET.
+         *
+         * Insetting the whole card was the previous attempt, and it left a
+         * one-DIP margin of the window's clear colour outside the border --
+         * white on white, invisible against a light background and a visible
+         * sliver against the taskbar, which read as the card sitting too low.
+         *
+         * A stroke is centred on its path, so it needs half its width inside
+         * the surface and no more. Half of 1.0 is 0.5. */
         rectf r = rf(0, top, NTOAST_W, top + g.h);
         fill(g_nt_gfx, r, g_nt_hover == i ? OC_COL_HOVER : OC_COL_INPUT);
-        stroke_round(g_nt_gfx, r, 2.0f, OC_COL_BORDER, 1.0f);
+        stroke_round(g_nt_gfx, rf(r.left + 0.5f, r.top + 0.5f,
+                                  r.right - 0.5f, r.bottom - 0.5f),
+                     2.0f, OC_COL_BORDER, 1.0f);
         fill(g_nt_gfx, rf(r.left, r.top, r.left + 4, r.bottom), OC_COL_ACCENT);
         /* The APP'S MARK, not its name. Windows already labels its own toasts
          * with the application, and spending a line on "OpenChime" says the one
@@ -7775,6 +7857,16 @@ static void nt_paint(void) {
                   rf(tx, r.top + g.title_y, tr, r.top + g.title_y + g.title_h), OC_COL_TEXT);
         draw_text(g_nt_gfx, g_nt[i].body, g_meta_w,
                   rf(tx, r.top + g.body_y, tr, r.top + g.body_y + g.body_h), OC_COL_MUTED);
+        {
+            rectf cb = rf(r.left + g.close_x, r.top + g.close_y,
+                          r.left + g.close_x + g.close_sz, r.top + g.close_y + g.close_sz);
+            int on = (g_nt_close_hover == i);
+            if (on) fill_round(g_nt_gfx, cb, 3.0f, OC_COL_HOVER);
+            float k = g.close_sz * 0.3f;
+            uint32_t cc = on ? OC_COL_TEXT : OC_COL_MUTED;
+            gfx_line(g_nt_gfx, cb.left + k, cb.top + k, cb.right - k, cb.bottom - k, 1.4f, cc, 1.0f);
+            gfx_line(g_nt_gfx, cb.right - k, cb.top + k, cb.left + k, cb.bottom - k, 1.4f, cc, 1.0f);
+        }
         top += g.h + NTOAST_GAP;
     }
     gfx_end(g_nt_gfx);
@@ -18988,6 +19080,19 @@ static void test_dump(const char *path) {
             g_tray_live, g_pref_notify, g_toasts_raised, dnd_active(m));
     /* WHICH backend carried the last one, not which was asked for: the chain
      * falls back, and a test that cannot tell them apart is not testing it. */
+    /* Where the notification window actually IS, reported by the app rather
+     * than probed from outside: two attempts to read it with a P/Invoke came
+     * back all zeroes, and a screenshot of a window that lives eight seconds
+     * catches an empty screen as often as not. */
+    if (g_nt_hwnd) {
+        RECT nr; GetWindowRect(g_nt_hwnd, &nr);
+        RECT wa; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+        fprintf(f, "ntrect l=%ld t=%ld r=%ld b=%ld  work r=%ld b=%ld  "
+                   "right_gap=%ld bottom_gap=%ld dpi=%d vis=%d\n",
+                nr.left, nr.top, nr.right, nr.bottom, wa.right, wa.bottom,
+                wa.right - nr.right, wa.bottom - nr.bottom,
+                g_dpi, IsWindowVisible(g_nt_hwnd) ? 1 : 0);
+    }
     fprintf(f, "notify deliver=%d by=%d wintoast=%d aumid=\"%s\" ntwin=%d ntn=%d muted=%d\n",
             g_pref_deliver, g_delivered_by, g_wintoast_ok, g_aumid,
             g_nt_shown, g_n_nt, g_snd_muted);
