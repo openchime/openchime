@@ -64,7 +64,14 @@ int oc_wintoast_show(const char *title, const char *body,
  *
  * `btn_arg[i]` comes back verbatim as the activation argument; the reply box's
  * text arrives beside it. */
+/* `title` is WHO, `body` is WHAT THEY SAID, and `source` is where — a channel
+ * name, or NULL for a direct message. That is Microsoft's own documented shape
+ * for a chat notification (the canonical example is a person's name, then their
+ * message, with the conversation as attribution), and it is not the shape a
+ * sidebar row wants: the app's own name never appears, because the shell puts
+ * it in the attribution area itself and cannot be overridden. */
 int oc_wintoast_show_actions(const char *title, const char *body,
+                             const char *source,
                              const char *tag, const char *group,
                              const char *arg, const char *sound,
                              const char *reply_placeholder,
