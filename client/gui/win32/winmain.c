@@ -2161,10 +2161,39 @@ static int custom_emoji_id(const char *s, char *name, size_t cap) {
  * rasters COLR layers when the layout asks for them. */
 static int draw_custom_emoji(gfx *rt, const char *s, rectf r);  /* fwd */
 
+static void rel_time(uint64_t ms, char *out, size_t cap);   /* fwd */
+
 static void draw_emoji_fmt(gfx *rt, const char *s, rectf r, fmtw *fmt) {
     /* A custom emoji first (REQ-072): every reaction chip, picker cell and reactor
      * row goes through here, so one test covers all of them. */
     if (s && s[0] == ':' && draw_custom_emoji(rt, s, r)) return;
+    /* Then a SHORTCODE NAME. A reaction is stored as whatever the client that
+     * sent it stored: this GUI's picker stores the glyph, but ":tada:" and a
+     * bare "tada" are both legal on the wire and another client may send either.
+     * Drawn literally they came out as ellipsized text in the chip -- "t... 1" --
+     * which reads as a rendering bug rather than as a reaction.
+     *
+     * Resolved here rather than in the chip renderer because this is the one
+     * place every emoji surface passes through, and a fix in only one of them
+     * would leave the reactor list and the picker still showing the name. The
+     * catalogue lookup fails closed: a glyph, or anything not in the table,
+     * falls through to the text path exactly as before. */
+    char name[64];
+    if (s && s[0]) {
+        const char *look = NULL;
+        size_t len = strlen(s);
+        if (s[0] == ':' && len > 2 && s[len - 1] == ':' && len - 2 < sizeof name) {
+            memcpy(name, s + 1, len - 2);
+            name[len - 2] = '\0';
+            look = name;
+        } else if ((unsigned char)s[0] < 0x80 && len < sizeof name) {
+            look = s;                    /* ASCII: a bare name, never a glyph */
+        }
+        if (look) {
+            const char *glyph = oc_emoji_by_name(look);
+            if (glyph) s = glyph;
+        }
+    }
     if (!fmt) return;
     txt_blit(rt, txt_get(s, fmt, r.right - r.left, OC_COL_TEXT), r, fmt);
 }
@@ -4668,11 +4697,15 @@ static void draw_search(gfx *rt, const oc_model *m, rectf reg) {
         const char *au = oc_model_user_name(m, r->author_id);
         const oc_channel *ch = oc_model_channel((oc_model *)m, r->channel_id);
         char head[160];
-        /* 17 bytes minimum for "YYYY-MM-DD HH:MM" plus the NUL — at 16 strftime
-         * silently writes nothing and every result showed a blank time. */
-        char when[32] = "";
-        if (r->server_time) { time_t t = (time_t)(r->server_time / 1000); struct tm tv;
-            if (oc_localtime_r(&t, &tv)) strftime(when, sizeof when, "%Y-%m-%d %H:%M", &tv); }
+        /* The same relative form every other surface uses -- the transcript, the
+         * DM list, activity, threads, Later. A result here and the same message
+         * in the transcript were wearing two different time formats, which reads
+         * as two different messages.
+         *
+         * The audit log keeps its absolute stamp on purpose: an audit entry is a
+         * record of when something happened, and "3h" is not a record. */
+        char when[24] = "";
+        rel_time(r->server_time, when, sizeof when);
         snprintf(head, sizeof head, "%s  ·  %s  ·  %s",
                  (au && au[0]) ? au : "user", (ch && ch->name) ? ch->name : "channel", when);
         draw_text(rt, head, g_meta, rf(body.left + 20, y, body.right - 16, y + 20), OC_COL_MUTED);
@@ -6327,10 +6360,29 @@ static float pref_row(gfx *rt, rectf body, float y, int row,
         chips_left = b.left;
     }
     draw_text(rt, label, g_ui_b, rf(body.left + 24, y, chips_left - 12, y + 22), OC_COL_TEXT);
-    if (hint && hint[0])
-        draw_text(rt, hint, g_meta, rf(body.left + 24, y + 20, chips_left - 12, y + 40), OC_COL_FAINT);
-    fill(rt, rf(body.left + 24, y + 46, body.right - 24, y + 47), OC_COL_BORDER);
-    return y + 62;
+    /* The hint runs the FULL width, BELOW the chips, and wraps.
+     *
+     * It used to share the label's line box -- capped at the chips' left edge
+     * and clipped to one line -- so a row with four choices left it a narrow
+     * column and it ellipsized mid-sentence: "Follows your account, not this
+     * machi...". Shortening the copy was the alternative and was rejected: it
+     * fixes the sentences that exist today and breaks again at the next larger
+     * text size, because the width the hint gets shrinks as the chips grow.
+     *
+     * The row's height is MEASURED from the wrapped text rather than fixed at
+     * 62, so a hint that needs two lines gets two. `g_prefs_content_h` is
+     * accumulated from the returned y, so the scroll extent follows for free. */
+    float hint_h = 0;
+    if (hint && hint[0]) {
+        float hw = (body.right - 24) - (body.left + 24);
+        hint_h = text_height(hint, g_meta_w, hw);
+        draw_text(rt, hint, g_meta_w,
+                  rf(body.left + 24, y + 30, body.right - 24, y + 30 + hint_h),
+                  OC_COL_FAINT);
+    }
+    float rule = y + 30 + hint_h + 8;
+    fill(rt, rf(body.left + 24, rule, body.right - 24, rule + 1), OC_COL_BORDER);
+    return rule + 15;
 }
 
 enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
