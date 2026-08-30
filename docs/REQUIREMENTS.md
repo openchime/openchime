@@ -866,6 +866,24 @@ the requirement says so explicitly rather than implying one.
   notification (REQ-286). Not built: the content-preview toggle, sounds, and
   every other frontend.
 
+  **Closing the window HIDES it; the app keeps running and keeps notifying.**
+  A chat client that stops notifying the moment its window closes has stopped
+  being one, and the tray icon existed as a mailbox with nothing behind it. The
+  window is restored by clicking the tray icon, and quitting is a deliberate act
+  — Ctrl+Q, or Quit from the tray menu — which is where the unsent-outbox
+  question is now asked. **Said once**, by a balloon the first time it happens:
+  an app that vanishes without a word reads as a crash. That notice is remembered
+  per account, because the thing you learn is what closing does, and you learn it
+  once.
+  The fallback matters: if the tray icon could not be created there is nothing to
+  restore the window from, so closing quits as it always did rather than leaving
+  a process that can be neither reached nor closed.
+  A **hidden window can still be the foreground window** — `SW_HIDE` hands the
+  foreground to nobody — so "are you looking at this?" is answered by
+  foreground **and** visible **and** not minimised. Asking only the first
+  suppressed every toast while the window was closed to the tray, which is
+  exactly the case this exists for.
+
   **Sounds have been per event type, not one sound for everything** — a distinct,
   user-chosen sound for a new message, a priority-person message (REQ-135), a
   call starting (REQ-285), and a direct message received while already viewing
