@@ -845,6 +845,18 @@ static int  g_n_notify_hw;
 static int  g_notify_primed;   /* the first tick after auth only records */
 static NOTIFYICONDATAW g_tray;
 #define TRAY_UID 1
+/* The tray icon's own callback. WM_APP rather than WM_USER: WM_USER+n is
+ * per-window-class space that a subclass may already be using, WM_APP+n is the
+ * application's. */
+#define WM_APP_TRAY (WM_APP + 1)
+/* Closing the window HIDES it (REQ-138): a chat client that stops notifying the
+ * moment you close it has stopped doing the one thing it is for. Said once, the
+ * first time, because an app that vanishes without a word reads as a crash. */
+static int  g_close_to_tray_told;
+static int  g_hidden_to_tray;      /* observable by the harness; see test_dump */
+/* Set only by app_quit. WM_CLOSE hides unless this says the close was ASKED
+ * for -- one message, two meanings, and the flag is which. */
+static int  g_quitting;
 
 /* Is `t` (minutes since midnight) inside the DND window? Windows may wrap past
  * midnight, which is why this is not a plain range test. */
@@ -879,7 +891,11 @@ static void tray_init(HWND hwnd) {
     g_tray.cbSize = sizeof g_tray;
     g_tray.hWnd = hwnd;
     g_tray.uID = TRAY_UID;
-    g_tray.uFlags = NIF_ICON | NIF_TIP;
+    /* NIF_MESSAGE is what makes it a control rather than a mailbox: without a
+     * callback the icon could raise balloons and take no clicks, so there was no
+     * way back to a hidden window and no way to quit from it. */
+    g_tray.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+    g_tray.uCallbackMessage = WM_APP_TRAY;
     g_tray.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_APPICON));
     if (!g_tray.hIcon) g_tray.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     lstrcpynW(g_tray.szTip, L"OpenChime", 128);
@@ -5448,6 +5464,11 @@ static void a11y_publish_scene(const oc_model *m);  /* fwd — ARCH-99; defined 
  * regression and then refused to reproduce. */
 static void show_and_focus(HWND hwnd) {
     if (!hwnd) return;
+    /* Whatever brought the window back -- the tray icon, a permalink, the test
+     * harness -- it is no longer hidden. Cleared HERE because this is the one
+     * function that shows it; clearing at each call site is how the flag and the
+     * window drifted apart the first time. */
+    g_hidden_to_tray = 0;
     if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOW);
     /* A minimised window IS "visible" to IsWindowVisible, and SW_SHOW does not
      * un-minimise — so without this, "show and focus" left an iconic window
@@ -5513,7 +5534,7 @@ static void nav_conversation(HWND hwnd, int delta, int unread_only) {
  */
 enum { ACC_NONE = 0, ACC_PALETTE, ACC_SEARCH, ACC_KEYS,
        ACC_NAV_PREV, ACC_NAV_NEXT, ACC_NAV_PREV_UNREAD, ACC_NAV_NEXT_UNREAD,
-       ACC_FOCUS, ACC_PREFS, ACC_ZOOM_IN, ACC_ZOOM_OUT, ACC_ZOOM_RESET };
+       ACC_FOCUS, ACC_PREFS, ACC_ZOOM_IN, ACC_ZOOM_OUT, ACC_ZOOM_RESET, ACC_QUIT };
 #define AM_CTRL  1u
 #define AM_ALT   2u
 #define AM_SHIFT 4u
@@ -5550,6 +5571,7 @@ static const struct {
      * keyboard will reach for them. */
     { AM_CTRL,            VK_ADD,       ACC_ZOOM_IN,  NULL, NULL },
     { AM_CTRL,            VK_SUBTRACT,  ACC_ZOOM_OUT, NULL, NULL },
+    { AM_CTRL,            'Q',        ACC_QUIT,    "Ctrl+Q",           "Quit OpenChime (closing the window only hides it)" },
     { 0,                  VK_F6,      ACC_FOCUS,   "F6",               "Move focus between the composer and the filter box" },
     { 0,                  0,          ACC_NONE,  "Mouse wheel",        "Scroll the transcript, sidebar or open pane" },
     { 0,                  0,          ACC_NONE,  "Right-click",        "Actions for a message, member or channel" },
@@ -5561,8 +5583,11 @@ static void modal_enter(HWND hwnd, int *flag); /* fwd */
 static void modal_finish(int save);            /* fwd */
 static int  modal_open(void);                  /* fwd */
 
+static void app_quit(HWND hwnd);   /* fwd — the deliberate exit (REQ-138) */
+
 static void accel_run(HWND hwnd, int action) {
     switch (action) {
+    case ACC_QUIT:    app_quit(hwnd);     break;
     case ACC_PALETTE: palette_open(hwnd); break;
     case ACC_SEARCH:  search_open(hwnd);  break;
     case ACC_KEYS:    if (g_keys_open) modal_finish(0); else modal_enter(hwnd, &g_keys_open); break;
@@ -16834,6 +16859,25 @@ static void open_ws_menu(HWND hwnd) {
     g_menu_x = RAIL_W + 8; g_menu_y = HEADER_H - 6; g_menu_w = 268;
 }
 
+/* The tray's own menu (REQ-138). Deliberately short: this is reached from an
+ * icon, so it offers the two things the icon is for — getting back to the
+ * window, and leaving — plus the pause, because "stop bothering me" is the
+ * thought somebody has while looking at a tray icon.
+ *
+ * MENU_WS's command numbers are reused rather than duplicated: 8 is the
+ * palette, 71 is Notifications, 3 is Sign out. One dispatcher, one meaning per
+ * number. */
+static void tray_menu_open(void) {
+    g_n_mi = 0;
+    mi_item(1000, "Open OpenChime");
+    mi_sep();
+    mi_item(71, "Notifications");
+    mi_sep();
+    mi_item_d(1001, "Quit OpenChime");
+    g_menu = MENU_WS; g_menu_headerblock = 0; g_menu_hover = -1;
+    g_menu_x = RAIL_W + 8; g_menu_y = HEADER_H - 6; g_menu_w = 268;
+}
+
 /* "Notifications paused until 5:03 PM" — the one place a pause's end time
  * appears at all. It is MY pause: the server never sends anyone else's instant
  * (REQ-122), so there is deliberately no version of this for another person. */
@@ -16958,7 +17002,8 @@ static void prefs_save(void) {
      * build, which stops at `q:`, still reads everything it understands. */
     {
         size_t at = strlen(enc);
-        snprintf(enc + at, sizeof enc - at, ";k:%d;f:%d", g_skin_tone, g_pref_flash);
+        snprintf(enc + at, sizeof enc - at, ";k:%d;f:%d;c:%d",
+                 g_skin_tone, g_pref_flash, g_close_to_tray_told);
     }
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
 }
@@ -16989,6 +17034,9 @@ static void prefs_load(const oc_model *m) {
             else if (k == 'k') g_skin_tone = (val < 0 || val >= OC_SKIN_COUNT)
                                              ? OC_SKIN_DEFAULT : val;
             else if (k == 'f') g_pref_flash = (val < 0 || val > 2) ? FLASH_IDLE : val;
+            /* Told once per ACCOUNT, not per machine: the surprise is learning
+             * what closing does, and you only learn it once. */
+            else if (k == 'c') g_close_to_tray_told = val ? 1 : 0;
             else if (k == 'q') {
                 size_t n2 = 0;
                 for (const char *q = p + 2; *q && *q != ';' && n2 + 1 < sizeof g_quick_names; q++)
@@ -17155,6 +17203,18 @@ static void open_switcher(HWND hwnd) {
     g_menu_x = RAIL_W + 8; g_menu_y = 12; g_menu_w = 244;
 }
 
+/* The deliberate exit. Everything that ends the process comes through here, so
+ * the unsent-outbox question is asked once and in one place — it used to live in
+ * WM_CLOSE, which no longer means "quit". */
+static void app_quit(HWND hwnd) {
+    g_quitting = 1;
+    if (hwnd) {
+        if (g_sel) draft_flush(g_sel);
+        if (geom_capture(hwnd) && g_geom_applied) prefs_save();
+        SendMessageW(hwnd, WM_CLOSE, 0, 0);
+    }
+}
+
 static void menu_dispatch(HWND hwnd, int cmd) {
     const oc_model *m = model();
     switch (cmd) {
@@ -17169,6 +17229,8 @@ static void menu_dispatch(HWND hwnd, int cmd) {
     case 900: case 901: case 902: case 903: g_file_filter = cmd - 900; break;
     case 910: case 911: case 912:           g_file_sort   = cmd - 910; break;
     case 920: case 921: case 922:           g_file_scope  = cmd - 920; break;
+    case 1000: show_and_focus(hwnd); break;
+    case 1001: app_quit(hwnd); break;
     case 8:  palette_open(hwnd); break;                    /* */
     case 9:  modal_enter(hwnd, &g_browse_open); break;     /* REQ-038 */
     /* Pausing notifications (REQ-278). Presets are durations, as Slack's
@@ -18287,6 +18349,11 @@ static void test_dump(const char *path) {
             (unsigned long long)g_sel_f_mid, g_sel_f_pos);
     fprintf(f, "tray_live=%d notify_pref=%d toasts_raised=%d dnd=%d\n",
             g_tray_live, g_pref_notify, g_toasts_raised, dnd_active(m));
+    fprintf(f, "hidden=%d visible=%d told=%d connected=%d\n",
+            g_hidden_to_tray,
+            g_main_hwnd ? (IsWindowVisible(g_main_hwnd) ? 1 : 0) : 0,
+            g_close_to_tray_told,
+            (m && m->connected) ? 1 : 0);
     /* `taskbar`: -1 the ITaskbarList3 could not be created, 0 not yet asked
      * for, 1 live — because "badge=0" alone cannot distinguish "no unreads"
      * from "the overlay never applied", and that ambiguity cost a smoke run. */
@@ -18445,6 +18512,18 @@ static void test_poll(HWND hwnd) {
         /* Really minimise: the taskbar flash is gated on not being the
          * foreground window, and only losing it for real exercises that. */
         ShowWindow(hwnd, SW_MINIMIZE);
+        test_ack("ok");
+    } else if (!strcmp(verb, "close")) {
+        /* WM_CLOSE through the real path, so what the harness drives is what a
+         * click on the title bar's X does. `close quit` is the deliberate exit. */
+        if (!strcmp(arg, "quit")) app_quit(hwnd);
+        else SendMessageW(hwnd, WM_CLOSE, 0, 0);
+        test_ack("ok");
+    } else if (!strcmp(verb, "traymenu")) {
+        /* The right-click path without a right click: the tray icon is outside
+         * the window, so no click verb can reach it. */
+        show_and_focus(hwnd); tray_menu_open();
+        InvalidateRect(hwnd, NULL, FALSE);
         test_ack("ok");
     } else if (!strcmp(verb, "restore")) {
         show_and_focus(hwnd);
@@ -19263,7 +19342,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              * and replayed the accrued delta as a burst the moment they came
              * back on. */
             {
-                int fg = (GetForegroundWindow() == hwnd);
+                /* "Can the user see this right now?", which is what every use
+                 * of `fg` below actually means -- the toast is skipped for a
+                 * message you are looking at, and the flash for a window you are
+                 * already in.
+                 *
+                 * GetForegroundWindow alone does not answer it. A HIDDEN window
+                 * can still be the foreground window: SW_HIDE does not hand the
+                 * foreground to anyone else, so after closing to the tray this
+                 * read stayed true and every toast was suppressed as "you are
+                 * reading it" while the window was not even on screen. Minimising
+                 * activates another window, which is why that path looked fine
+                 * and this one did not. */
+                int fg = (GetForegroundWindow() == hwnd) &&
+                         IsWindowVisible(hwnd) && !IsIconic(hwnd);
                 /* Every workspace, not just the visible one — a background
                  * workspace's mail is exactly what you cannot otherwise see. */
                 for (int wi = 0; wi < (g_n_wss > 0 ? g_n_wss : 1); wi++) {
@@ -20297,13 +20389,32 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ERASEBKGND:
         return 1;
     case WM_CLOSE:
-        /* The draft goes with the window. Before the outbox prompt
-         * below, because that prompt can be answered "stay" — and a draft
-         * written on the way to a decision you reversed is still correct. */
+        /* The draft goes with the window. Before anything below, because a
+         * decision you reverse still leaves the draft correct. */
         if (g_sel) draft_flush(g_sel);
-        /* the outbox is in memory now (ARCH-88), so quitting with a send
-         * still queued loses it. Make that a choice rather than a surprise. */
         if (geom_capture(hwnd) && g_geom_applied) prefs_save();
+        /* CLOSING HIDES. The connection, the clients and every notification go
+         * on running behind the tray icon; quitting is Ctrl+Q or the tray menu.
+         * A chat client that stops notifying the moment its window closes has
+         * stopped being one, which is what this used to do.
+         *
+         * Only when the tray icon actually exists. If Shell_NotifyIcon failed
+         * there is nothing to restore the window from, and hiding would leave a
+         * process the user cannot reach OR close — so the old quit path stays as
+         * the fallback rather than being deleted. */
+        if (g_tray_live && !g_quitting) {
+            ShowWindow(hwnd, SW_HIDE);
+            g_hidden_to_tray = 1;
+            if (!g_close_to_tray_told) {
+                g_close_to_tray_told = 1;
+                prefs_save();
+                notify_toast("OpenChime is still running",
+                             "Messages will keep arriving. Open it from the "
+                             "notification area, or quit with Ctrl+Q.");
+            }
+            return 0;
+        }
+        /* fall through to the quit path */
         {
             /* Across EVERY workspace, not just the visible one: a
              * message stranded in a background workspace is the easiest of all
@@ -20330,6 +20441,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         return DefWindowProcW(hwnd, msg, wp, lp);   /* proceed with the close */
+    case WM_APP_TRAY:
+        /* The tray icon is a control now. Left click shows the window; right
+         * click shows it AND opens the app's own menu inside it.
+         *
+         * Restoring first is deliberate rather than a compromise. ARCH-98 bans
+         * TrackPopupMenu — it runs its own modal loop, which the harness cannot
+         * drive and which this app has no other instance of — and a tray menu
+         * has no window of its own to draw into. Showing the window gives the
+         * self-drawn menu somewhere to live, keeps every tray action drivable,
+         * and reuses the menu that already exists instead of adding a second
+         * kind. */
+        if (LOWORD(lp) == WM_LBUTTONUP || LOWORD(lp) == WM_LBUTTONDBLCLK) {
+            show_and_focus(hwnd);
+        } else if (LOWORD(lp) == WM_RBUTTONUP) {
+            show_and_focus(hwnd);
+            tray_menu_open();
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_TICK);
         oc_a11y_shutdown();   /* tell UIA the provider is going, before the window does */
