@@ -254,10 +254,15 @@ int oc_wintoast_show(const char *title, const char *body,
 
     /* ToastGeneric, not one of the legacy ToastText templates: the legacy ones
      * cannot carry a launch argument, and the launch argument is the entire
-     * mechanism by which a click knows which conversation to open. */
+     * mechanism by which a click knows which conversation to open.
+     *
+     * activationType="protocol" means the launch argument is a URL and Windows
+     * opens it. That is what lets this work with no COM activator, no CLSID
+     * under HKCU and no LocalServer32 -- the app already registers openchime://
+     * and already knows how to follow one. */
     WCHAR xml[3072];
     _snwprintf(xml, sizeof xml / sizeof xml[0],
-        L"<toast launch=\"%s\" activationType=\"foreground\">"
+        L"<toast launch=\"%s\" activationType=\"protocol\">"
         L"<visual><binding template=\"ToastGeneric\">"
         L"<text>%s</text><text>%s</text>"
         L"</binding></visual>%s</toast>",

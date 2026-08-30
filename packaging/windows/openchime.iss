@@ -74,12 +74,27 @@ Source: "..\..\build\openchime-tui.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\README.md";               DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\OpenChime";        Filename: "{app}\openchime.exe"
+; AppUserModelID is not decoration. Windows resolves a toast's identity through
+; the Start-menu shortcut, so an unpackaged install with no AUMID here cannot
+; raise a Notification Center toast at all -- it falls back to the tray balloon
+; and nobody is told why. The string must match OC_AUMID in the client exactly.
+Name: "{group}\OpenChime";        Filename: "{app}\openchime.exe"; \
+    AppUserModelID: "BronzeVenture.OpenChime"
 Name: "{group}\Uninstall OpenChime"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\OpenChime";  Filename: "{app}\openchime.exe"; Tasks: desktopicon
 Name: "{userstartup}\OpenChime";  Filename: "{app}\openchime.exe"; Tasks: startup
 
 [Registry]
+; openchime:// -- how a notification's click gets back to the app. The client
+; also writes these on every start (a portable copy or a dev build has no
+; installer), but a fresh install should work before the first launch rather
+; than after it.
+Root: HKCU; Subkey: "Software\Classes\openchime"; ValueType: string; \
+    ValueName: ""; ValueData: "URL:OpenChime"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\openchime"; ValueType: string; \
+    ValueName: "URL Protocol"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\openchime\shell\open\command"; ValueType: string; \
+    ValueName: ""; ValueData: """{app}\openchime.exe"" ""%1"""
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; \
     ValueData: "{olddata};{app}"; Tasks: addtopath; \
     Check: NeedsAddPath(ExpandConstant('{app}'))
