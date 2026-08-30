@@ -344,7 +344,7 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **The reference is replayed, not just fanned.** One loader serves the live send and both read paths, so what a sender is told and what a reloading client is told come from the same query. Reactions, pins and unfurls were each added to a fan-out and forgotten in a replay; a client stores nothing (ARCH-88), so anything riding only the live fan-out is gone on reload.
 
-- **ARCH-107 (oc_gfx — portable drawing primitives over SDL3, vendored fetched-at-build):** The drawing layer the GUI's portable application code targets: fills, rounded rectangles and their strokes, lines, an axis-aligned clip stack, textures (straight RGBA for decoded images, premultiplied BGRA for rasterized text — the format sdltext's sink emits, ARCH-106), and the Lucide icons. Coordinates are DIPs; the DPI×zoom scale is applied inside the layer, so scene code never carries it.
+- **ARCH-107 (oc_gfx — portable drawing primitives over SDL3, vendored fetched-at-build):** The drawing layer the GUI's portable application code targets: fills, rounded rectangles and their strokes, lines, an axis-aligned clip stack, textures (straight RGBA for decoded images, premultiplied BGRA for rasterized text — the format sdltext's sink emits, ARCH-106), and the Lucide icons. Coordinates are DIPs; the display's DPI scale is applied inside the layer, so scene code never carries it.
 
   **Everything that is not a plain rect is triangles.** SDL's renderer draws rects, textures and geometry, and nothing else — no rounded rect, no path, no bezier. So the rounded shapes are corner-arc fans, strokes are rings, and the Lucide paths are stroke-tessellated (cubics flattened, polylines expanded with round caps and joins as literal discs) by a pure-geometry translation unit with no SDL dependency. This replaces `ID2D1PathGeometry` + stroke styles; the tessellator is the portable property Direct2D's geometry never was.
 
@@ -451,8 +451,18 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
   row at the largest text size clips its own descenders. `UIS()` puts those
   metrics through the same scale as the fonts.
 
+  **There are TWO scales, not three.** A per-window zoom existed alongside the
+  text-size preference and was removed. It was never really per-window — the app
+  has one window and the step was a process-wide global — so all it added over
+  the text-size preference was being *forgotten on restart*, which is not a
+  property anyone wants from a size they chose. It also put a control in the
+  preferences pane that the Save button did not save, and a third multiplier into
+  every layout that had to agree with the other two. What remains is the text
+  size, which the user sets and which follows the account, and the display's DPI,
+  which is the display's business.
+
   **The shell's furniture is capped by the window.** Column widths and the rail's
-  pitch scale too — Slack grows its sidebar, and a zoom control that left it
+  pitch scale too — Slack grows its sidebar, and a text-size control that left it
   behind would read as broken — but a width has a limit a height does not: the
   rail and sidebar together may not take more than half the window, and the rail's
   four irreducible items must fit its height. `UISW()` is that capped scale, never
