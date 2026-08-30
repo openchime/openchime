@@ -866,6 +866,14 @@ static int  g_pref_deliver = DELIVER_OS;
  * identity, and a test that cannot tell them apart is not testing the chain. */
 enum { DELIVERED_NONE = 0, DELIVERED_WINRT, DELIVERED_BALLOON, DELIVERED_OWN };
 static int  g_delivered_by;
+/* What the last notification was ABOUT. The balloon cannot carry a launch
+ * argument the way a toast can, so the only way its click can open the right
+ * conversation is to remember. */
+static uint64_t g_last_notify_ws, g_last_notify_cid;
+/* A URL this process was started FOR, held until there is a session to open it
+ * in. Following it before the channels exist selects a conversation the model
+ * has never heard of. */
+static char g_pending_url[512];
 static int  g_wintoast_ok;         /* oc_wintoast_init's answer, once */
 static char g_aumid[128];
 /* The AppUserModelID. A constant, not a setting: it identifies the application
@@ -938,6 +946,11 @@ static void tray_init(HWND hwnd) {
     if (!g_tray.hIcon) g_tray.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     lstrcpynW(g_tray.szTip, L"OpenChime", 128);
     g_tray_live = Shell_NotifyIconW(NIM_ADD, &g_tray) ? 1 : 0;
+    /* Version 4 behaviour, and it is not optional: without NIM_SETVERSION the
+     * shell never sends NIN_BALLOONUSERCLICK at all, so a balloon stays a
+     * poster however carefully its click is handled. */
+    if (g_tray_live) { g_tray.uVersion = NOTIFYICON_VERSION_4;
+                       Shell_NotifyIconW(NIM_SETVERSION, &g_tray); }
 }
 
 static void tray_done(void) {
@@ -1011,6 +1024,7 @@ static void notify_deliver(const char *title, const char *body,
      * sound, and who plays it -- from being able to disagree. */
     int silent = snd != NULL;
     g_delivered_by = DELIVERED_NONE;
+    g_last_notify_ws = ws_slot; g_last_notify_cid = channel_id;
     if (g_pref_deliver == DELIVER_NONE) return;
     g_toasts_raised++;
     /* Ours, when one is chosen. `silent` already told the OS backend to keep
@@ -1023,10 +1037,13 @@ static void notify_deliver(const char *title, const char *body,
         char tag[64], grp[64], arg[96];
         snprintf(tag, sizeof tag, "c%llu", (unsigned long long)channel_id);
         snprintf(grp, sizeof grp, "w%llu", (unsigned long long)ws_slot);
-        /* What the click gets handed back. Parsed by the activator, which is
-         * the only reason a toast can open the right conversation. */
-        snprintf(arg, sizeof arg, "open?w=%llu&c=%llu",
-                 (unsigned long long)ws_slot, (unsigned long long)channel_id);
+        /* A REAL openchime:// URL, because the app already speaks them. With
+         * activationType="protocol" the click needs no COM activator and no
+         * registered CLSID -- Windows just opens the URL, the scheme points at
+         * this exe, and the running instance follows it. The conversation, not
+         * a line in it: a notification is about the former. */
+        snprintf(arg, sizeof arg, "openchime://%s/c/%llu",
+                 g_host[0] ? g_host : "workspace", (unsigned long long)channel_id);
         if (g_wintoast_ok && oc_wintoast_show(title, body, tag, grp, arg, silent)) {
             g_delivered_by = DELIVERED_WINRT;
             return;
@@ -7341,6 +7358,57 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
         g_n_pal_rows++;
         y += rowh;
     }
+}
+
+/* ---- openchime:// and one instance (REQ-138, ARCH-96) --------------------
+ *
+ * Clicking a Windows toast opens its `launch` URL, and the app already speaks
+ * openchime:// permalinks -- so the notification's click needs no COM activator,
+ * no registered CLSID and no LocalServer32. It reuses the thing that already
+ * exists. `activationType="protocol"` is the whole mechanism.
+ *
+ * That leaves ONE new requirement: a click must reach the RUNNING client rather
+ * than starting a second one. A named mutex answers "am I first", and the
+ * second process hands its URL to the first through WM_COPYDATA and exits.
+ * Worth having on its own account -- two clients on one machine fighting over
+ * the same session was always possible and never intended. */
+#define OC_URL_SCHEME "openchime"
+#define OC_COPYDATA_URL 0x4F43     /* 'OC' — the payload is a UTF-8 URL */
+
+/* Register the scheme for THIS USER. Under HKCU rather than HKCR because it
+ * needs no elevation and follows the person rather than the machine; the
+ * installer writes the same keys so a fresh install works before first run. */
+static void url_scheme_register(void) {
+    WCHAR exe[MAX_PATH];
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return;
+    WCHAR cmd[MAX_PATH + 16];
+    _snwprintf(cmd, MAX_PATH + 16, L"\"%s\" \"%%1\"", exe);
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER,
+            L"Software\\Classes\\openchime", 0, NULL, 0, KEY_WRITE, NULL, &k, NULL)
+        != ERROR_SUCCESS) return;
+    RegSetValueExW(k, NULL, 0, REG_SZ, (const BYTE *)L"URL:OpenChime", 28);
+    RegSetValueExW(k, L"URL Protocol", 0, REG_SZ, (const BYTE *)L"", 2);
+    RegCloseKey(k);
+    if (RegCreateKeyExW(HKEY_CURRENT_USER,
+            L"Software\\Classes\\openchime\\shell\\open\\command",
+            0, NULL, 0, KEY_WRITE, NULL, &k, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(k, NULL, 0, REG_SZ, (const BYTE *)cmd,
+                       (DWORD)((wcslen(cmd) + 1) * sizeof(WCHAR)));
+        RegCloseKey(k);
+    }
+}
+
+/* Hand `url` to an already-running client. Returns 1 when one took it. */
+static int url_handoff(const char *url) {
+    HWND other = FindWindowW(L"OpenChimeWin", NULL);
+    if (!other) return 0;
+    COPYDATASTRUCT cds;
+    cds.dwData = OC_COPYDATA_URL;
+    cds.cbData = (DWORD)(strlen(url) + 1);
+    cds.lpData = (void *)url;
+    SendMessageW(other, WM_COPYDATA, 0, (LPARAM)&cds);
+    return 1;
 }
 
 /* ---- the notification window (REQ-138) -----------------------------------
@@ -14902,7 +14970,13 @@ static int permalink_parse(const char *text, char *host, size_t hostcap,
     p += 3;
     char *end = NULL;
     *chan = strtoull(p, &end, 10);
-    if (!end || end == p || strncmp(end, "/m/", 3) != 0) return 0;
+    if (!end || end == p) return 0;
+    /* A CHANNEL-ONLY link is legal: "/c/7" means open the conversation, with no
+     * message to jump to. A notification points at one of these -- it is about a
+     * conversation having something new, not about a particular line -- and
+     * without this form it would need a second, parallel way of saying where to
+     * go. */
+    if (strncmp(end, "/m/", 3) != 0) { *msg = 0; return *chan ? 1 : 0; }
     p = end + 3;
     *msg = strtoull(p, &end, 10);
     return (*chan && *msg) ? 1 : 0;
@@ -14973,8 +15047,12 @@ static int permalink_follow(HWND hwnd, const char *text) {
     /* The same arming the Activity and Files rows use: if the message is outside
      * the loaded window the tick fetches around it (ARCH-96) and the flash lands
      * when it arrives. */
-    g_jump_mid = mid;
-    g_jump_deadline = GetTickCount64() + 4000;
+    /* Zero means the link named a conversation and not a line in it, so there
+     * is nothing to arm and nothing to flash. */
+    if (mid) {
+        g_jump_mid = mid;
+        g_jump_deadline = GetTickCount64() + 4000;
+    }
     select_tab(TAB_MESSAGES);
     layout_composer(hwnd);
     InvalidateRect(hwnd, NULL, FALSE);
@@ -19550,6 +19628,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (setid) { WCHAR w[128]; to_w(g_aumid, w, 128); setid(w); }
         }
         g_wintoast_ok = oc_wintoast_init(g_aumid);
+        /* So a toast's click has somewhere to land. Written on every start
+         * rather than at install time only: a developer build, a portable copy
+         * and an upgraded path all need it to point at THIS exe. */
+        url_scheme_register();
         return 0;
     case WM_DROPFILES: {
         HDROP drop = (HDROP)wp;
@@ -19596,6 +19678,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == TIMER_TICK && g_client) {
             oc_client_tick(g_client);
             nt_tick();               /* the notification window expires on this tick too */
+            /* A URL this process was launched for, followed once there is
+             * something to follow it into: selecting a channel before the model
+             * knows any is a no-op that looks like the link failing. */
+            const oc_model *pm = model();
+            if (g_pending_url[0] && pm && pm->authed && pm->n_channels) {
+                char u[512]; snprintf(u, sizeof u, "%s", g_pending_url);
+                g_pending_url[0] = '\0';
+                permalink_follow(hwnd, u);
+            }
             files_view_sync();
             /* The debounced draft write. On this tick rather than a
              * timer of its own: there is already one heartbeat driving the
@@ -20854,6 +20945,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         return DefWindowProcW(hwnd, msg, wp, lp);   /* proceed with the close */
+    case WM_COPYDATA: {
+        /* Another launch of this app handing us a URL it was asked to open --
+         * a toast click, or a permalink from a browser. Following it here is
+         * what makes the second process unnecessary. */
+        const COPYDATASTRUCT *cds = (const COPYDATASTRUCT *)lp;
+        if (cds && cds->dwData == OC_COPYDATA_URL && cds->lpData) {
+            char url[512];
+            snprintf(url, sizeof url, "%.*s", (int)cds->cbData, (const char *)cds->lpData);
+            show_and_focus(hwnd);
+            permalink_follow(hwnd, url);
+        }
+        return 1;
+    }
     case WM_APP_TRAY:
         /* The tray icon is a control now. Left click shows the window; right
          * click shows it AND opens the app's own menu inside it.
@@ -20867,6 +20971,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * kind. */
         if (LOWORD(lp) == WM_LBUTTONUP || LOWORD(lp) == WM_LBUTTONDBLCLK) {
             show_and_focus(hwnd);
+        } else if (LOWORD(lp) == NIN_BALLOONUSERCLICK) {
+            /* Clicking the BALLOON opens what it was about. The tray icon has
+             * had a callback since the close-to-tray work; this is the record of
+             * which conversation raised the last one, without which there is
+             * nothing to select. */
+            show_and_focus(hwnd);
+            if (g_last_notify_cid) {
+                if ((int)g_last_notify_ws != g_ws_active && (int)g_last_notify_ws < g_n_wss)
+                    { ws_save_active(); ws_load((int)g_last_notify_ws); }
+                g_view = VIEW_HOME; close_overlays(); select_channel(g_last_notify_cid);
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
         } else if (LOWORD(lp) == WM_RBUTTONUP) {
             show_and_focus(hwnd);
             tray_menu_open();
@@ -20949,6 +21065,20 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     static char pre_ws[256], pre_user[128];
     int direct = 0;
     int argc = 0; LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    /* A URL on the command line -- a toast click, or a permalink from a browser
+     * -- belongs to the client that is ALREADY RUNNING. Hand it over and stop;
+     * a second client would fight the first over the same session, and the
+     * notification would open a conversation in a window nobody was looking at. */
+    if (argv && argc >= 2) {
+        char maybe_url[512];
+        WideCharToMultiByte(CP_UTF8, 0, argv[1], -1, maybe_url, sizeof maybe_url, NULL, NULL);
+        if (strncmp(maybe_url, OC_URL_SCHEME "://", sizeof OC_URL_SCHEME + 1) == 0) {
+            if (url_handoff(maybe_url)) { LocalFree(argv); return 0; }
+            /* Nobody running: fall through and start normally, then follow it
+             * once there is a session to follow it into. */
+            snprintf(g_pending_url, sizeof g_pending_url, "%s", maybe_url);
+        }
+    }
     if (argv && argc >= 3) {
         WideCharToMultiByte(CP_UTF8, 0, argv[1], -1, aws, sizeof aws, NULL, NULL);
         WideCharToMultiByte(CP_UTF8, 0, argv[2], -1, acred, sizeof acred, NULL, NULL);

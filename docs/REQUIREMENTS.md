@@ -863,8 +863,38 @@ the requirement says so explicitly rather than implying one.
   decision (ARCH-72), not a new server surface. **Built on Win32:** toasts and
   tray balloons gated by the shared notify evaluator (`shared/notify.c`,
   REQ-281), a taskbar overlay **unread badge**, and a taskbar **flash** on
-  notification (REQ-286). Not built: the content-preview toggle, sounds, and
-  every other frontend.
+  notification (REQ-286). Not built: every other frontend.
+
+  **Two settings, because there are two questions.** *Where* a notification
+  appears — Windows' notification centre, OpenChime's own window, or nowhere —
+  and *how much* it says (Off / Count / Preview). Someone who wants the OS
+  surface and someone who wants a preview are not answering the same thing.
+
+  **The default is the real OS notification**, and it is a real one: a
+  Notification Center toast, not a tray balloon. **Delivery is a CHAIN, not a
+  mechanism** — OS toast, else the balloon, else the client's own window. The
+  balloon is no longer how notifications arrive but remains the one surface
+  needing no identity, and the chain exists because a single mechanism that
+  fails silently is what this replaced: a `Shell_NotifyIcon` that failed at
+  logon dropped every notification for the session with nothing to reach for.
+
+  **The client's own notification is its own window** — borderless, topmost,
+  and never taking focus — not a panel inside the shell. A notification exists
+  for when you are *not* looking at the app, and since closing the window hides
+  it the shell's resting state is invisible. It shows the app's mark, the
+  conversation, and who said what; Windows already labels its own toasts with
+  the application, so spending the title on the app name says only what the
+  icon says.
+
+  **A click opens the conversation**, on every surface. The OS toast carries an
+  `openchime://` permalink and is activated by protocol, so it needs no COM
+  activator: the app already speaks those links. A URL arriving on the command
+  line is handed to the **already-running** client rather than starting a
+  second one.
+
+  **Sounds are per event and one switch mutes them all.** Exactly one sound
+  plays: when the client has a sound for an event it tells the OS toast to be
+  silent, because otherwise one message makes two noises.
 
   **Closing the window HIDES it; the app keeps running and keeps notifying.**
   A chat client that stops notifying the moment its window closes has stopped
