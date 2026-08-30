@@ -80,6 +80,7 @@ struct oc_dbwriter {
 static uint64_t snooze_until(sqlite3 *db, uint64_t uid);   /* fwd — auth and the prefs snapshot both read it */
 static void fill_schedule(sqlite3 *db, uint64_t uid, oc_dbres *r);      /* fwd — REQ-136 */
 static void fill_alert_prefs(sqlite3 *db, uint64_t uid, oc_dbres *r);   /* fwd — REQ-135 */
+static void build_schedule(sqlite3 *db, uint64_t uid, oc_dbres *r);     /* fwd — REQ-136 */
 
 static uint64_t dbw_now_ms(void) {
     struct timespec ts;
@@ -312,6 +313,48 @@ static void fill_replay_unfurls(sqlite3 *db, oc_dbres *r) {
     r->n_runfurl = n;
 }
 
+/* Append the forward reference of ONE message, if it has one (REQ-057).
+ *
+ * The same function serves the live send and both replay paths, which is the
+ * whole point: reactions, pins and unfurls each got added to a fan-out and
+ * forgotten in a replay, so the reference a client sees on send and the one it
+ * sees after a reload are produced by a single query or they will eventually
+ * disagree. The live caller reads the row BACK after inserting it, so what the
+ * sender is told is what was actually stored. */
+static void append_forward(sqlite3 *db, oc_dbres *r, uint64_t message_id, uint64_t channel_id) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT src_channel, src_message, src_author, excerpt, n_attach, attach_name "
+            "FROM forwards WHERE message_id=?1;", -1, &st, NULL) != SQLITE_OK)
+        return;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)message_id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        struct oc_replay_forward *g = realloc(r->rfwd, (r->n_rfwd + 1) * sizeof *g);
+        if (g) {
+            r->rfwd = g;
+            struct oc_replay_forward *f = &g[r->n_rfwd];
+            const char *ex = (const char *)sqlite3_column_text(st, 3);
+            const char *an = (const char *)sqlite3_column_text(st, 5);
+            f->message_id = message_id;
+            f->channel_id = channel_id;
+            f->src_channel = (uint64_t)sqlite3_column_int64(st, 0);
+            f->src_message = (uint64_t)sqlite3_column_int64(st, 1);
+            f->src_author  = (uint64_t)sqlite3_column_int64(st, 2);
+            f->excerpt     = strdup(ex ? ex : "");
+            f->n_attach    = (uint16_t)sqlite3_column_int(st, 4);
+            f->attach_name = strdup(an ? an : "");
+            r->n_rfwd++;
+        }
+    }
+    sqlite3_finalize(st);
+}
+
+/* Forward references for a replayed window (REQ-057). */
+static void fill_replay_forwards(sqlite3 *db, oc_dbres *r) {
+    for (size_t i = 0; i < r->n_replay; i++)
+        append_forward(db, r, r->replay[i].message_id, r->replay[i].channel_id);
+}
+
 void oc_dbres_free(oc_dbres *r) {
     if (!r) return;
     free(r->body);
@@ -332,6 +375,8 @@ void oc_dbres_free(oc_dbres *r) {
         free(r->runfurl[i].url); free(r->runfurl[i].title); free(r->runfurl[i].descr);
     }
     free(r->runfurl);
+    for (size_t i = 0; i < r->n_rfwd; i++) { free(r->rfwd[i].excerpt); free(r->rfwd[i].attach_name); }
+    free(r->rfwd);
     free(r->unf_url);
     free(r->unf_title);
     free(r->unf_descr);
@@ -816,9 +861,14 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
     r->user_id = uid;
     r->role = role;
     r->session_id = sess_id;   /* REQ-182: which row this connection is using */
-    /* The pause rides along (REQ-278): the net thread keeps the FACT in memory
-     * so presence fan-out can carry it, and it has no database of its own. */
+    /* Do-not-disturb rides along, BOTH halves: the net thread keeps the FACT in
+     * memory so presence fan-out can carry it, and it has no database of its
+     * own. The pause is an instant (REQ-278); the schedule is a rule the net
+     * thread evaluates per tick (REQ-136). Seeding the schedule here rather
+     * than waiting for the client to ask for its preferences means a colleague
+     * inside their quiet hours reads as such from the first frame. */
     r->snooze_until_ms = snooze_until(db, uid);
+    fill_schedule(db, uid, r);
     if (fresh) {
         uint8_t token[OC_SESSION_TOKEN_LEN]; uint64_t expiry = 0;
         if (mint_session(db, uid, token, &expiry, &sess_id) != 0) {
@@ -1112,6 +1162,7 @@ static oc_dbres *process_redeem(oc_dbwriter *w, const oc_job *j) {
     r->user_id = uid;
     r->role = role;
     r->snooze_until_ms = snooze_until(db, uid);
+    fill_schedule(db, uid, r);              /* REQ-136, as above */
     memcpy(r->session_token, token, sizeof token);
     r->has_session_token = 1;
     r->session_expiry = sexp;
@@ -1674,6 +1725,80 @@ static void drop_draft(sqlite3 *db, uint64_t user_id, uint64_t channel_id, uint6
     sqlite3_finalize(st);
 }
 
+/* Record what a forward points at (REQ-057), inside the send's transaction.
+ *
+ * The forwarder's read access to the SOURCE is checked with the same gate every
+ * other read uses. Without it, forwarding is a way to read a channel you were
+ * never in: ask the daemon to quote it at you and it obligingly does.
+ *
+ * A source that cannot be read, or no longer exists, is NOT an error. The
+ * message sends as an ordinary message with no reference — refusing would turn
+ * a stale permalink into a failure the sender cannot act on, and a forward of
+ * something since deleted is a nuisance, not an attack.
+ *
+ * The author, the excerpt and the attachment count are read here rather than
+ * taken from the client, and they are a SNAPSHOT: editing the original later
+ * does not rewrite what was forwarded. The excerpt is truncated on a UTF-8
+ * boundary — splitting a sequence would put invalid bytes in a TEXT column. */
+#define OC_FORWARD_EXCERPT_MAX 240
+static void store_forward(sqlite3 *db, uint64_t mid, const oc_job *j) {
+    if (!j->src_channel || !j->src_message) return;
+    if (!channel_read_access(db, j->src_channel, j->user_id)) return;
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT m.author_id, COALESCE(m.body, ''), "
+            "       (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id), "
+            /* The FIRST file's name, which is what a card can show; the count
+             * beside it covers the rest ("report.txt and 2 more"). */
+            "       COALESCE((SELECT a.filename FROM attachments a "
+            "                 WHERE a.message_id = m.id ORDER BY a.id LIMIT 1), '') "
+            "FROM messages m WHERE m.id=?1 AND m.channel_id=?2 "
+            "  AND m.deleted_at_ms IS NULL;", -1, &st, NULL) != SQLITE_OK)
+        return;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)j->src_message);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->src_channel);
+    uint64_t author = 0, n_attach = 0;
+    char excerpt[OC_FORWARD_EXCERPT_MAX + 1];
+    char aname[256] = "";
+    size_t ex_len = 0;
+    int found = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *b = sqlite3_column_text(st, 1);
+        size_t bl = (size_t)sqlite3_column_bytes(st, 1);
+        author   = (uint64_t)sqlite3_column_int64(st, 0);
+        n_attach = (uint64_t)sqlite3_column_int64(st, 2);
+        const char *an = (const char *)sqlite3_column_text(st, 3);
+        if (an) snprintf(aname, sizeof aname, "%s", an);
+        if (bl > OC_FORWARD_EXCERPT_MAX) {
+            bl = OC_FORWARD_EXCERPT_MAX;
+            /* Back off any trailing continuation bytes so the cut lands
+             * between characters. */
+            while (bl > 0 && (b[bl] & 0xC0) == 0x80) bl--;
+        }
+        if (bl && b) memcpy(excerpt, b, bl);
+        ex_len = bl;
+        found = 1;
+    }
+    sqlite3_finalize(st);
+    if (!found) return;
+    excerpt[ex_len] = 0;
+
+    sqlite3_prepare_v2(db,
+        "INSERT INTO forwards(message_id, src_channel, src_message, src_author, "
+        "                     excerpt, n_attach, attach_name) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?);", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)mid);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)j->src_channel);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)j->src_message);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)author);
+    sqlite3_bind_text (st, 5, excerpt, (int)ex_len, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)n_attach);
+    sqlite3_bind_text (st, 7, aname, -1, SQLITE_STATIC);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
 static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     oc_dbres *r = calloc(1, sizeof *r);
     if (!r) return NULL;
@@ -1748,6 +1873,9 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
         load_message_attachments(db, mid, r->attach, &r->n_attach);
     }
 
+    /* What this message forwards, if anything (REQ-057). */
+    store_forward(db, mid, j);
+
     /* The draft this message came from is gone (REQ-223, ARCH-101), in the same
      * transaction as the send. Server-side rather than a client courtesy: a
      * client that dies between the send and its own cleanup would otherwise
@@ -1760,6 +1888,9 @@ static oc_dbres *process_send(sqlite3 *db, const oc_job *j) {
     r->message_id = mid;
     r->server_time = ts;
     r->author_name = lookup_display_name(db, j->user_id);   /* name for the live BROADCAST */
+    /* Read the reference back rather than echoing what was asked for: what the
+     * channel is told is what actually landed in the table, or nothing. */
+    append_forward(db, r, mid, j->channel_id);
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
     load_members(db, j->channel_id, r);
     return r;
@@ -3844,6 +3975,7 @@ static oc_dbres *process_backfill(sqlite3 *db, const oc_job *j) {
      * history page (§6.3), so the two replay paths cannot drift. */
     fill_replay_reactions(db, r, j->user_id);
     fill_replay_unfurls(db, r);
+    fill_replay_forwards(db, r);
     return r;
 }
 
@@ -3980,6 +4112,7 @@ static oc_dbres *process_history(sqlite3 *db, const oc_job *j) {
      * permanently without them. */
     fill_replay_reactions(db, r, j->user_id);
     fill_replay_unfurls(db, r);
+    fill_replay_forwards(db, r);
     return r;
 }
 
@@ -4732,6 +4865,15 @@ static uint64_t snooze_until(sqlite3 *db, uint64_t uid) {
  * window is currently in force on the recipient's own calendar day. Clamped to
  * the range real offsets occupy, so a broken or hostile client cannot move
  * somebody's local day by an arbitrary amount. */
+/* The offset quiet hours are evaluated against (ARCH-103), refreshed by the
+ * client from the OS on every connect.
+ *
+ * It ANSWERS, with the schedule the offset belongs to. It used to return NULL,
+ * which meant a timezone change reached the net thread through nothing — and
+ * that is the common path rather than an edge case, because the refresh lands
+ * AFTER the AUTH_OK that seeded the cache. A first connect from a new machine
+ * would otherwise have evaluated somebody's quiet hours against a stale
+ * offset, or against zero. */
 static oc_dbres *process_set_tz_offset(sqlite3 *db, const oc_job *j) {
     int off = j->tz_offset_min;
     if (off < -720) off = -720;        /* UTC-12, the westmost real offset */
@@ -4742,7 +4884,12 @@ static oc_dbres *process_set_tz_offset(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
     sqlite3_step(st);
     sqlite3_finalize(st);
-    return NULL;
+
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    build_schedule(db, j->user_id, r);
+    return r;
 }
 
 static oc_dbres *process_set_snooze(sqlite3 *db, const oc_job *j) {

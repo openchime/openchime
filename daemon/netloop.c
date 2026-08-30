@@ -3,6 +3,7 @@
  */
 
 #include "netloop.h"
+#include "notify.h"
 #include "audio.h"
 #include "auth.h"
 #include "blobstore.h"
@@ -130,6 +131,23 @@ typedef struct {
      * this thread has none (ARCH-66/67), and presence — the thing it rides
      * beside — already lives in exactly this memory. */
     uint64_t     dnd_until_ms;
+    /* The recurring schedule (REQ-136), cached here for the same reason and
+     * refreshed from the same places. Other people's DND badge is computed from
+     * BOTH halves: without this one, a colleague inside their quiet hours showed
+     * as ordinarily interruptible, which is the case the badge exists for.
+     *
+     * `sc_tz_offset_min` is users.tz_offset_min (ARCH-103) — the same column the
+     * push query reads — so delivery and the badge cannot disagree about what
+     * time it is for someone. */
+    uint8_t         sc_mode;
+    int16_t         sc_tz_offset_min;
+    uint16_t        sc_start_min, sc_end_min;
+    oc_schedule_day sc_days[OC_SCHEDULE_DAYS];
+    uint8_t         sc_n_days;
+    /* The DND bit this user was last ANNOUNCED as. A schedule boundary passes
+     * with no event to hang a fan-out on, so the tick compares against this and
+     * sends only on a change — a quiet box stays quiet. */
+    uint8_t      dnd_announced;
     conn_xfer    xfer;           /* in-flight attachment transfer, if any */
     /* HTTP mode (ARCH-32/54): a connection that did not negotiate the oc/1 ALPN
      * is a webhook/HTTP client, not a binary-protocol peer. `hin` accumulates the
@@ -383,16 +401,69 @@ static void presence_send(int ep, conn *c, const uint8_t *buf, size_t len) {
     if (out_append(c, buf, len) == 0) { flush_out(c); update_interest(ep, c); }
 }
 
-/* Is this user paused right now? Any of their connections carrying a stamp in
- * the future answers yes; a stamp that has passed answers no without anyone
- * having to clear it, which is the same rule the database applies on read. */
+/* Is this user not to be disturbed right now? BOTH halves of do-not-disturb
+ * answer, because a viewer deciding whether to write cares about the fact and
+ * not which mechanism produced it (REQ-122):
+ *
+ *   the PAUSE (REQ-278) — any of their connections carrying a stamp in the
+ *   future answers yes; a stamp that has passed answers no without anyone
+ *   having to clear it, which is the same rule the database applies on read;
+ *
+ *   the SCHEDULE (REQ-136) — through oc_notify_quiet, the SHARED evaluator the
+ *   push path already decides delivery with. Not re-implemented here: the
+ *   daemon decides whether to notify and the client decides whether to show
+ *   itself as quiet, and a third copy of the rule would disagree with both in
+ *   a way none of the three could see (shared/notify.h).
+ *
+ * The schedule is a per-user fact, so every connection holds the same copy and
+ * the first authenticated one answers for all of them. */
 static int dnd_of(conn **conns, uint64_t uid) {
     uint64_t now = (uint64_t)time(NULL) * 1000ull;
+    int paused = 0, quiet = 0, seen = 0;
     for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
         conn *c = conns[fd];
-        if (c && c->authed && c->user_id == uid && c->dnd_until_ms > now) return 1;
+        if (!c || !c->authed || c->user_id != uid) continue;
+        if (c->dnd_until_ms > now) paused = 1;
+        if (seen) continue;
+        seen = 1;
+        /* The USER'S clock, never the server's (ARCH-103): a per-weekday window
+         * against a UTC day puts a large part of the world's Friday evening on
+         * Saturday. 1970-01-01 was a Thursday, hence the +4. */
+        long long lmin = (long long)(now / 60000) + c->sc_tz_offset_min;
+        int local_min  = (int)(((lmin % 1440) + 1440) % 1440);
+        int weekday    = (int)(((lmin / 1440) + 4) % 7);
+        if (weekday < 0) weekday += 7;
+        int day_present = 0, day_enabled = 0, day_start = 0, day_end = 0;
+        for (uint8_t i = 0; i < c->sc_n_days; i++)
+            if (c->sc_days[i].weekday == weekday) {
+                day_present = 1;
+                day_enabled = c->sc_days[i].enabled;
+                day_start   = c->sc_days[i].start_min;
+                day_end     = c->sc_days[i].end_min;
+                break;
+            }
+        quiet = oc_notify_quiet(c->sc_mode, c->sc_start_min, c->sc_end_min,
+                                day_present, day_enabled, day_start, day_end,
+                                local_min, weekday);
     }
-    return 0;
+    return (paused || quiet) ? 1 : 0;
+}
+
+/* Cache one user's schedule on every connection they hold. A schedule is a fact
+ * about a person, not about a device: leaving one connection on the old one
+ * would be two answers to "when am I quiet", which is what REQ-136 exists to
+ * prevent. */
+static void cache_schedule(conn **conns, uint64_t uid, const oc_dbres *r) {
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+        conn *c = conns[fd];
+        if (!c || !c->authed || c->user_id != uid) continue;
+        c->sc_mode          = r->sc_mode;
+        c->sc_tz_offset_min = r->sc_tz_offset_min;
+        c->sc_start_min     = r->sc_start_min;
+        c->sc_end_min       = r->sc_end_min;
+        c->sc_n_days        = r->sc_n_days > OC_SCHEDULE_DAYS ? OC_SCHEDULE_DAYS : r->sc_n_days;
+        for (uint8_t i = 0; i < c->sc_n_days; i++) c->sc_days[i] = r->sc_days[i];
+    }
 }
 
 static void encode_presence(uint8_t *buf, size_t cap, size_t *outlen, uint64_t uid,
@@ -410,7 +481,16 @@ static void encode_presence(uint8_t *buf, size_t cap, size_t *outlen, uint64_t u
  * own presence locally. */
 static void broadcast_presence(int ep, conn **conns, uint64_t uid, uint8_t status) {
     uint8_t buf[32]; size_t len = 0;
-    encode_presence(buf, sizeof buf, &len, uid, status, dnd_of(conns, uid));
+    uint8_t dnd = (uint8_t)dnd_of(conns, uid);
+    encode_presence(buf, sizeof buf, &len, uid, status, dnd);
+    /* Record what was said, on every connection this user holds, whatever
+     * prompted the announcement. The maintenance tick fires on a DIFFERENCE, so
+     * this is the one place that can honestly answer "what do other people
+     * currently believe" — updating it at the tick alone would make an ordinary
+     * presence change look like a DND change on the next turn. */
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
+        if (conns[fd] && conns[fd]->authed && conns[fd]->user_id == uid)
+            conns[fd]->dnd_announced = dnd;
     for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++)
         if (conns[fd] && conns[fd]->authed && conns[fd]->user_id != uid)
             presence_send(ep, conns[fd], buf, len);
@@ -842,6 +922,12 @@ static int drain_frames(int ep, conn **conns, conn *c, oc_dbwriter *dbw) {
             uint16_t na = s.n_attach > OC_MAX_ATTACH ? OC_MAX_ATTACH : s.n_attach;
             for (uint16_t i = 0; i < na; i++) j->attach_ids[i] = s.attach_ids[i];
             j->n_attach = na;
+            /* The forward source (REQ-057). Passed through unchecked on
+             * purpose: the writer holds the row and does both the read-access
+             * gate and the resolution, so nothing here can be talked into
+             * quoting a channel the sender cannot read. */
+            j->src_channel = s.src_channel;
+            j->src_message = s.src_message;
             oc_dbwriter_submit(dbw, j);
             continue;
         }
@@ -2007,6 +2093,7 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         c->session_id = r->session_id;   /* REQ-182 */
         c->presence = OC_PRESENCE_ONLINE;
         c->dnd_until_ms = r->snooze_until_ms;   /* REQ-278, already expiry-checked */
+        cache_schedule(conns, r->user_id, r);   /* REQ-136, the other DND half */
         int fd = c->fd;
         uint64_t uid = r->user_id;
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
@@ -2122,6 +2209,25 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             /* Offline mobile delivery (ARCH-85): hand the notify decision to the
              * push emitter — members minus author, level/DND-gated, off this
              * thread. Fire-and-forget; a no-op when push is unconfigured. */
+            /* The forward reference, to the same members and right behind the
+             * BROADCAST it describes (REQ-057). One entry at most here; the
+             * array is shared with the replay so both read the same rows. */
+            for (size_t i = 0; i < r->n_rfwd; i++) {
+                oc_wbuf_init(&w, g_enc, sizeof g_enc);
+                oc_forward fw = { r->rfwd[i].message_id, r->rfwd[i].channel_id,
+                                  r->rfwd[i].src_channel, r->rfwd[i].src_message,
+                                  r->rfwd[i].src_author,
+                                  oc_slice_str(r->rfwd[i].excerpt ? r->rfwd[i].excerpt : ""),
+                                  r->rfwd[i].n_attach,
+                                  oc_slice_str(r->rfwd[i].attach_name ? r->rfwd[i].attach_name : "") };
+                if (oc_encode_forward(&w, OC_PROTOCOL_VERSION, &fw) != OC_OK) break;
+                size_t flen = w.len;
+                for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+                    conn *c = conns[fd];
+                    if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
+                        send_bytes(ep, conns, fd, g_enc, flen);
+                }
+            }
             oc_push_notify(g_push, r->channel_id, r->author_id, r->message_id, 0);
             /* Link previews (REQ-222): queue this body's URLs for fetching.
              * Off the hot path — the fetch completes as an UNFURL_STORED
@@ -3099,6 +3205,9 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             }
         }
         {
+            /* The schedule rides the same answer, and into the net thread's own
+             * copy: other people's DND badge is computed from it. */
+            cache_schedule(conns, r->user_id, r);
             oc_schedule sc = { r->sc_mode, r->sc_tz_offset_min, r->sc_start_min,
                                r->sc_end_min, r->sc_n_days, r->sc_days };
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
@@ -3177,6 +3286,9 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             if (c && c->authed && c->user_id == r->user_id)
                 send_bytes(ep, conns, fd, g_enc, w.len);
         }
+        /* And into the net thread's own copy, which is what other people's DND
+         * badge is computed from. The tick below announces the change. */
+        cache_schedule(conns, r->user_id, r);
         break;
     }
     case OC_RES_ALERT_PREFS: {
@@ -3508,6 +3620,22 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             oc_encode_unfurl(&w, OC_PROTOCOL_VERSION, &uf);
             send_bytes(ep, conns, fd, g_enc, w.len);
         }
+
+        /* And what each replayed forward points at (REQ-057) — the reference
+         * rides its own frame, so a replay without this loses the attribution
+         * the moment the client reloads, which is exactly what the reaction,
+         * pin and unfurl replays above each exist to prevent. */
+        for (size_t i = 0; i < r->n_rfwd && conns[fd]; i++) {
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            oc_forward fw = { r->rfwd[i].message_id, r->rfwd[i].channel_id,
+                              r->rfwd[i].src_channel, r->rfwd[i].src_message,
+                              r->rfwd[i].src_author,
+                              oc_slice_str(r->rfwd[i].excerpt ? r->rfwd[i].excerpt : ""),
+                              r->rfwd[i].n_attach,
+                              oc_slice_str(r->rfwd[i].attach_name ? r->rfwd[i].attach_name : "") };
+            oc_encode_forward(&w, OC_PROTOCOL_VERSION, &fw);
+            send_bytes(ep, conns, fd, g_enc, w.len);
+        }
         if (!conns[fd]) return;
         oc_wbuf_init(&w, g_enc, sizeof g_enc);
         oc_backfill_done done = { r->high_water, r->truncated };
@@ -3568,11 +3696,18 @@ static void maybe_fire_scheduled(oc_dbwriter *dbw) {
     if (j) oc_dbwriter_submit(dbw, j);
 }
 
-/* A pause that has simply RUN OUT. Nothing needs to clear the stamp — every
- * reader treats a passed one as absent — but other people were told the fact,
- * and only a frame can untell them. So the tick that notices an expiry
- * re-announces that user's presence, and does nothing at all otherwise
- * (REQ-278). */
+/* Do-not-disturb changing with no frame to hang it on.
+ *
+ * Both halves end by the CLOCK rather than by anyone doing something. A pause
+ * runs out (REQ-278); quiet hours begin at 18:00 and end at 09:00 (REQ-136).
+ * Nothing needs to clear a passed pause stamp — every reader treats one as
+ * absent — but other people were told the fact, and only a frame can untell
+ * them. Without this the badge would be right only for whoever happened to
+ * reconnect after the boundary.
+ *
+ * So: clear lapsed stamps, then re-announce any user whose DND answer differs
+ * from what they were last announced as. Comparing rather than announcing every
+ * tick is what keeps a quiet box quiet — this runs on every epoll turn. */
 static void expire_snoozes(int ep, conn **conns) {
     uint64_t now = (uint64_t)time(NULL) * 1000ull;
     for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
@@ -3582,7 +3717,14 @@ static void expire_snoozes(int ep, conn **conns) {
         for (int g = 0; g < OC_NETLOOP_MAX_FD; g++)      /* every connection they hold */
             if (conns[g] && conns[g]->authed && conns[g]->user_id == uid)
                 conns[g]->dnd_until_ms = 0;
-        broadcast_presence(ep, conns, uid, presence_of(conns, uid));
+    }
+    for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
+        conn *c = conns[fd];
+        if (!c || !c->authed) continue;
+        if ((uint8_t)dnd_of(conns, c->user_id) == c->dnd_announced) continue;
+        /* broadcast_presence stamps every connection this user holds, so they
+         * are announced once however many devices they are on. */
+        broadcast_presence(ep, conns, c->user_id, presence_of(conns, c->user_id));
     }
 }
 

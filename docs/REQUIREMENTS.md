@@ -399,9 +399,25 @@ the requirement says so explicitly rather than implying one.
 - **REQ-057.** *(Built in the Win32 client only)* A user has been able to **forward (share) a message** to another
   channel or DM they can post to, carrying a reference to the original — its
   author and a quoted excerpt — rather than copying the text opaquely, so a
-  forwarded message has stayed attributable to its source. **[needs ARCH decision
-  — forward encoding (quote reference vs. embedded copy) and whether the
-  original's attachments travel with it.]**
+  forwarded message has stayed attributable to its source.
+  The reference is **structured, not prose** (ARCH-108): the client sends the two
+  source ids on `SEND` and the daemon resolves the author, the excerpt and the
+  attachment count from the row it holds, so a client cannot claim someone said
+  something they did not, and the recipient renders a card it recognises rather
+  than string-matching a sentence anyone could have typed by hand. The excerpt is
+  a **snapshot** taken when the forward was sent — editing the original later does
+  not rewrite what was forwarded.
+  The forwarder must be able to **read the source**, or the message sends with no
+  reference at all: without that gate, forwarding is a way to read a channel you
+  were never in by asking the daemon to quote it at you. A source that is gone or
+  unreadable degrades to an ordinary message rather than an error, because a stale
+  permalink is not a failure the sender can act on.
+  **The original's attachments do not travel.** The card names them — the first
+  by filename, the rest as a count — and clicking the card opens the original; one attachment belongs to one message, so copying would
+  mean either a second row sharing a `storage_key` — which breaks the orphan model
+  reclamation counts on (ARCH-77/78) — or duplicating the bytes. Naming rather
+  than offering is also what a recipient who cannot read the source needs: a
+  download button would fail for exactly the people most likely to press it.
 
 ### 2.2 Threads
 
@@ -587,12 +603,16 @@ the requirement says so explicitly rather than implying one.
   typing never leaks to non-members; the server keeps no expiry timer. Resolved:
   the indicator expires **client-side after ~6 seconds**, refreshed by each new
   `TYPING` signal — no "stopped typing" frame is sent.
-- **REQ-122.** *(Partly built)* A user's **do-not-disturb, out-of-office, or custom status**
-  (REQ-131/241) has been surfaced to other users alongside their presence
-  (REQ-120) — a distinct indicator on the presence dot plus a status line in the
-  roster — so a colleague has known someone was unavailable before messaging
-  them. This has been display only: it has not changed delivery, which DND
-  governs separately (REQ-131).
+- **REQ-122.** A user's **do-not-disturb and custom status** (REQ-136/278/241)
+  has been surfaced to other users alongside their presence (REQ-120) — a
+  distinct indicator on the presence dot plus a status line in the roster — so a
+  colleague has known someone was unavailable before messaging them. This has
+  been display only: it has not changed delivery, which the schedule and the
+  pause govern separately.
+  **Being away is said with the pause and the custom status**, not with a
+  separate out-of-office state: "back Monday" is a status, and not being
+  interrupted until then is a pause. A third mechanism would be a third thing to
+  set and a third thing to forget to clear.
 
   **Availability and do-not-disturb are two INDEPENDENT axes, as in Slack.**
   Presence (REQ-120) answers *are they around* — active / away / offline.
@@ -614,21 +634,20 @@ the requirement says so explicitly rather than implying one.
   behaviour ever matters it would have to be observed against Slack, whose docs
   do not say.)
 
-  **Partially built, and the unbuilt half is the DND half.** Custom status with
-  expiry shipped (migration 0027) and is shown beside names in the member
-  pane and profile. **Do-not-disturb is still self-only:** `dnd_enabled` /
-  `dnd_start_min` / `dnd_end_min` live on the model's *own-user* block, and
-  `oc_user` — the roster entry for everybody else — carries no DND field at all,
-  so the Win32 client's quiet-hours badge is something you can see only about
-  yourself. Slack shows a snooze icon to everyone, which is the point of the
-  indicator: it exists for the *sender*. This gets more valuable with REQ-278,
-  where a pause is transient and a sender has no other way to know.
-  **[needs ARCH decision — how DND/OOO/custom-status is projected into the
-  `PRESENCE_UPDATE` surface (ARCH-67); note ARCH-89 already records that presence
-  is invisible to the push worker's read-only connection, which is a related
-  constraint on where this state can be read. `PRESENCE_UPDATE` carries one
-  status byte today and needs a second, INDEPENDENT DND bit rather than a fourth
-  status value — see the two-axis note above.]**
+  **How it is projected.** `PRESENCE_UPDATE` carries a second, **independent**
+  DND byte beside the status byte — not a fourth status value, per the two-axis
+  note above. **Both** do-not-disturb mechanisms answer it: the recurring
+  schedule (REQ-136) and the transient pause (REQ-278). A sender wants the fact,
+  and which mechanism produced it is not their business.
+
+  The schedule half is evaluated through the shared `oc_notify_quiet`, the same
+  rule the push path decides delivery with, so a colleague's badge and a phone's
+  silence cannot disagree. Both halves are held in the net thread's memory, which
+  has no database of its own (ARCH-67) — and are re-announced by its maintenance
+  tick when the clock, rather than a person, changes the answer.
+
+  Custom status with expiry (migration 0027) is shown beside names in the member
+  pane and profile.
 
 ---
 

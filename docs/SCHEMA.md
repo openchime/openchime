@@ -4,7 +4,7 @@ The SQLite schema (ARCH-2) and how it evolves. The migration *mechanism* is
 ARCH-27; the *content* below is applied by migration 0001. New tables/columns
 arrive as later numbered migrations, never as edits to an existing one.
 
-**Status.** **Migrations 0001–0039 are applied** (`daemon/migrate.c`,
+**Status.** **Migrations 0001–0040 are applied** (`daemon/migrate.c`,
 `OC_MIGRATIONS`). 0001 establishes the core
 messaging tables; **0002** (§3) the authentication data model (sessions, local
 credentials, invites, `users` role/avatar, [AUTH.md](./AUTH.md)); **0003** (§3a) the
@@ -24,7 +24,8 @@ drafts, then unaddressed drafts; **0032** (§3aa) scheduled messages;
 **0033–0035** (§3j) the notification pause, the per-weekday schedule that
 replaces the DND window, and keywords + priority people; **0036** (§3ab) thread
 follows and per-thread read cursors; **0037** the attachment idempotency token;
-**0038** (§3ac) link unfurls; **0039** (§3ad) the rest of the profile.
+**0038** (§3ac) link unfurls; **0039** (§3ad) the rest of the profile;
+**0040** (§3ae) what a forward points at.
 
 *Presence and typing are deliberately
 schema-less — ephemeral in-memory net-thread state by design
@@ -986,6 +987,45 @@ which is a different thing from an empty string they typed and cleared.
 the profile. Quiet hours run on `users.tz_offset_min`, which the client
 refreshes from the OS on every connect (ARCH-103); a zone chosen on the profile
 screen says where somebody is, not when to stop notifying them.
+
+## 3ae. Migration 0040 — what a forward points at (REQ-057, ARCH-108)
+
+```sql
+CREATE TABLE forwards (
+  message_id  INTEGER PRIMARY KEY REFERENCES messages(id),
+  src_channel INTEGER NOT NULL,
+  src_message INTEGER NOT NULL,
+  src_author  INTEGER NOT NULL,
+  excerpt     TEXT    NOT NULL,
+  n_attach    INTEGER NOT NULL,
+  attach_name TEXT    NOT NULL DEFAULT ''
+);
+```
+
+*A side table, not columns on `messages`*, following `unfurls` (§3ac): almost no
+message is a forward, and five sparse columns on the hot table would be paid for
+on every row to serve a rare one. One row per message, so the primary key is the
+message.
+
+*`src_channel` and `src_message` are deliberately NOT foreign keys.* The source
+may be tombstoned (REQ-052) or its channel archived, and a forward has to outlive
+both — it records what was forwarded, it is not a live pointer. A foreign key
+would make deleting the original either fail or silently erase the record that
+the forward ever happened.
+
+*`src_author`, `excerpt` and `n_attach` are a snapshot* taken when the forward
+was sent, and all three are resolved **by the daemon** from the source row rather
+than taken from the client: what the destination is told about the original is
+what the daemon read, not what the sender claimed. Editing the original
+afterwards does not rewrite what was forwarded.
+
+*`n_attach` counts the source's files and `attach_name` holds the first one's
+name.* That is what a card can show — five filenames is a wall, "report.txt and
+4 more" is a sentence. The files themselves stay on the source message
+(`attachments.message_id`, §3g, is one row, one message), so the card **names**
+them and the card itself opens the original. Copying would mean either a second
+row sharing a `storage_key`, which breaks the orphan model reclamation counts on
+(ARCH-77/78), or duplicating the bytes.
 
 ## 3ab. Migration 0036 — thread follows and per-thread reads (REQ-062, ARCH-104)
 

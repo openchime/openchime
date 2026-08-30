@@ -1086,6 +1086,12 @@ static uint64_t g_thumb_pending;                /* one fetch in flight */
  * rect. */
 static struct { rectf r; uint64_t id; } g_thumb_hits[32];
 static int      g_n_thumb_hits;
+/* Forward quote cards (REQ-057): clicking one goes to the original, which is
+ * the whole point of a reference — the card names the source's files, and this
+ * is how a reader reaches them without a download button that would fail for
+ * anyone who cannot read that channel. */
+static struct { rectf r; uint64_t chan, mid; } g_fwd_hits[32];
+static int      g_n_fwd_hits;
 static uint64_t g_lightbox;
 /* Slack's pattern: the image itself is the click target for a bigger view, and
  * saving it is a button that appears on hover — so the affordance is there when
@@ -3881,6 +3887,20 @@ static float unfurl_card_h(const oc_msg_unfurl *u) {
     return UIS(12.0f) + LINE_H + ((u->descr && u->descr[0]) ? LINE_H : 0.0f);
 }
 
+/* A forwarded message's quote card (REQ-057): an accent bar, "Forwarded from
+ * <who>", the source excerpt, and — when the original carried files — a line
+ * NAMING them. The same shared-height rule as the unfurl card above.
+ *
+ * The files are named, not offered. They stay on the source message, and a
+ * recipient who cannot read that channel cannot open them, so a download button
+ * here would be one that fails for exactly the people most likely to press it —
+ * the rule REQ-215's reclaimed attachments already follow. The permalink in the
+ * card reaches them for anyone who can. */
+#define FWD_GAP 6.0f
+static float forward_card_h(const oc_msg_forward *f) {
+    return UIS(12.0f) + LINE_H * 2.0f + (f->n_attach ? LINE_H : 0.0f);
+}
+
 /* A message's rendered height for a given content width (creates + returns the
  * body layout so the draw pass can reuse it; *wlen gets its UTF-16 length). */
 static float msg_height(const oc_msg *msg, float content_w, int grouped,
@@ -3906,6 +3926,7 @@ static float msg_height(const oc_msg *msg, float content_w, int grouped,
     if (msg->reply_count) extra++;
     for (int i = 0; i < msg->n_unfurls; i++)
         thumbs += unfurl_card_h(&msg->unfurls[i]) + UNFURL_GAP;
+    if (msg->forward) thumbs += forward_card_h(msg->forward) + FWD_GAP;
     return MSG_PIN(msg) + MSG_BODY_DY(grouped) + body_h +
            (float)extra * LINE_H + thumbs + MSG_BOT(next_grouped);
 }
@@ -3987,6 +4008,45 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
             }
             by += body->mh;
         }
+    }
+
+    /* What this message forwards (REQ-057), directly under the forwarder's own
+     * words and above everything the message itself carries. */
+    if (msg->forward) {
+        const oc_msg_forward *f = msg->forward;
+        float card_h = forward_card_h(f);
+        float right = x0 + content_w + AVA + 12;
+        float pad = UIS(6.0f);
+        fill_round(rt, rf(tx, by + 2, tx + 3, by + card_h - 2), 1.5f, OC_COL_ACCENT);
+        float ix = tx + 12, ly = by + pad;
+        char line[256];
+        const char *who = oc_model_user_name((oc_model *)m, f->src_author);
+        snprintf(line, sizeof line, "Forwarded from %s", (who && who[0]) ? who : "someone");
+        draw_text(rt, line, g_ui_b, rf(ix, ly, right, ly + LINE_H), OC_COL_MUTED);
+        ly += LINE_H;
+        draw_text(rt, (f->excerpt && f->excerpt[0]) ? f->excerpt : "(no text)",
+                  g_meta, rf(ix, ly, right, ly + LINE_H), OC_COL_TEXT);
+        ly += LINE_H;
+        if (f->n_attach) {
+            /* Named, not offered: the file stays on the original, so this says
+             * what it is and the card opens the place it lives. A second file
+             * is a count rather than a second line — five filenames is a wall,
+             * "report.txt and 4 more" is a sentence. */
+            const char *nm = (f->attach_name && f->attach_name[0]) ? f->attach_name : "a file";
+            if (f->n_attach > 1)
+                snprintf(line, sizeof line, "\xF0\x9F\x93\x8E %s and %u more on the original",
+                         nm, (unsigned)(f->n_attach - 1));
+            else
+                snprintf(line, sizeof line, "\xF0\x9F\x93\x8E %s on the original", nm);
+            draw_text(rt, line, g_meta, rf(ix, ly, right, ly + LINE_H), OC_COL_MUTED);
+        }
+        if (g_n_fwd_hits < 32) {
+            g_fwd_hits[g_n_fwd_hits].r = rf(tx, by, right, by + card_h);
+            g_fwd_hits[g_n_fwd_hits].chan = f->src_channel;
+            g_fwd_hits[g_n_fwd_hits].mid  = f->src_message;
+            g_n_fwd_hits++;
+        }
+        by += card_h + FWD_GAP;
     }
     /* "(edited)" is drawn inline by body_layout (faint, after the last word). */
 
@@ -4299,7 +4359,7 @@ static void draw_msglist(gfx *rt, const oc_model *m,
      * only one of the two lists is drawn per frame — resetting only on `capture`
      * would leave the thread's chips pointing at stale rectangles. */
     g_n_chips = 0;
-    if (capture) { g_n_msgrows = 0; g_n_thumb_hits = 0; g_n_thumb_dl = 0; }
+    if (capture) { g_n_msgrows = 0; g_n_thumb_hits = 0; g_n_thumb_dl = 0; g_n_fwd_hits = 0; }
     else if (hits) g_n_thrrows = 0;
     for (size_t i = 0; i < n; i++) {
         if (sep[i]) {
@@ -14343,20 +14403,8 @@ static int permalink_parse(const char *text, char *host, size_t hostcap,
     return (*chan && *msg) ? 1 : 0;
 }
 
-/* Follow one. Returns 0 with a toast when it cannot, rather than failing quietly:
- * a link that does nothing is indistinguishable from a broken app. */
-/* Send `mid` on to another conversation as a quote (REQ-057).
- *
- * A quote, not a copy of the attachment: `link_attachments` will only link a file
- * whose `message_id IS NULL` and whose uploader and channel match the sender, so an
- * existing attachment **cannot** be re-linked to a second message. That is a
- * deliberate server-side guard (it is also why forwarding cannot leak a private
- * channel's file), so the forward NAMES any attachment instead of pretending to
- * carry it. Re-sharing the bytes needs a server-side copy op, which does not exist.
- *
- * The body is plain UTF-8 with the quote in-band, because that is all a body is
- * until REQ-220 lands (ARCH: REQ-054). A permalink is appended so the reader can
- * reach the original in its own context. */
+/* Send `mid` on to another conversation as a structured reference (REQ-057,
+ * ARCH-108) — the ids only; see the note in the body below. */
 static void forward_send(HWND hwnd, uint64_t to_cid) {
     const oc_model *m = model();
     if (!m || !g_client || !g_fwd_mid || !to_cid) return;
@@ -14364,28 +14412,17 @@ static void forward_send(HWND hwnd, uint64_t to_cid) {
     const oc_msg *msg = find_msg(src, g_fwd_mid);
     if (!msg) { toast_push("That message is no longer loaded.", 1); g_fwd_mid = 0; return; }
 
-    const char *who = msg->author_name[0] ? msg->author_name
-                                          : oc_model_user_name((oc_model *)m, msg->author_id);
-    char where[96] = "";
-    if (src && src->kind != OC_CHANNEL_KIND_DM && src->name[0])
-        snprintf(where, sizeof where, " in #%s", src->name);
-
-    char linkhost[288];
-    if (g_port && g_port != OC_DEFAULT_PORT)
-        snprintf(linkhost, sizeof linkhost, "%s:%d", g_host[0] ? g_host : "workspace", g_port);
-    else
-        snprintf(linkhost, sizeof linkhost, "%s", g_host[0] ? g_host : "workspace");
-
-    char att[160] = "";
-    if (msg->n_attach > 0)
-        snprintf(att, sizeof att, "\n[attachment: %s]", msg->attach[0].filename);
-
-    char body[1400];
-    snprintf(body, sizeof body, "Forwarded from %s%s:\n> %s%s\nopenchime://%s/c/%llu/m/%llu",
-             (who && who[0]) ? who : "someone", where,
-             (msg->body && msg->body[0]) ? msg->body : "(no text)", att,
-             linkhost, (unsigned long long)g_fwd_cid, (unsigned long long)g_fwd_mid);
-    oc_client_send(g_client, to_cid, body);
+    /* The attribution is NOT prose in the body (REQ-057). The two source ids
+     * travel with the send and the daemon resolves the author, the excerpt and
+     * the attachment count from the row it holds — so the recipient's client
+     * renders a card it can recognise, rather than string-matching a sentence
+     * anyone could equally have typed by hand, and this client cannot claim
+     * someone said something they did not.
+     *
+     * The body carries no forwarder's note today: the transcript has no place
+     * to type one at the moment the menu item is chosen. An empty body with a
+     * reference is a bare forward, which is what the action means. */
+    oc_client_forward(g_client, to_cid, "", g_fwd_cid, g_fwd_mid);
 
     const oc_channel *dst = oc_model_channel((oc_model *)m, to_cid);
     char note[160];
@@ -14400,6 +14437,8 @@ static void forward_send(HWND hwnd, uint64_t to_cid) {
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
+/* Follow one. Returns 0 with a toast when it cannot, rather than failing quietly:
+ * a link that does nothing is indistinguishable from a broken app. */
 static int permalink_follow(HWND hwnd, const char *text) {
     char host[256]; uint64_t chan = 0, mid = 0;
     if (!permalink_parse(text, host, sizeof host, &chan, &mid)) return 0;
@@ -15458,6 +15497,26 @@ static int on_click(HWND hwnd, int x, int y) {
     }
     for (int i = 0; i < g_n_thumb_hits; i++)
         if (in_rect(g_thumb_hits[i].r, x, y)) { g_lightbox = g_thumb_hits[i].id; return 1; }
+    /* A forward card goes to the message it quotes (REQ-057), through the same
+     * arming a permalink uses: if the original is outside the loaded window the
+     * tick fetches around it (ARCH-96) and the flash lands when it arrives. */
+    for (int i = 0; i < g_n_fwd_hits; i++)
+        if (in_rect(g_fwd_hits[i].r, x, y)) {
+            const oc_model *fm = model();
+            if (!fm || !oc_model_channel((oc_model *)fm, g_fwd_hits[i].chan)) {
+                toast_push("That conversation is not one you can see.", 1);
+                return 1;
+            }
+            g_view = VIEW_HOME;
+            close_overlays();
+            select_channel(g_fwd_hits[i].chan);
+            g_jump_mid = g_fwd_hits[i].mid;
+            g_jump_deadline = GetTickCount64() + 4000;
+            select_tab(TAB_MESSAGES);
+            layout_composer(hwnd);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 1;
+        }
     if (in_rect(g_unread_jump, x, y)) {
         /* Jump to the first message past the marker, reusing the search-hit
          * machinery: same scroll-into-view and flash. */
@@ -18709,6 +18768,21 @@ static void test_poll(HWND hwnd) {
         if (!mid && sc2 && sc2->n_msgs) mid = sc2->msgs[sc2->n_msgs - 1].message_id;
         if (g_client && mid) { oc_client_save_item(g_client, (uint64_t)mid, OC_SAVE_ADD); test_ack("ok"); }
         else test_ack("err");
+    } else if (!strcmp(verb, "forward")) {
+        /* forward <to-channel-id> [message-id] — the destination the palette
+         * would have picked, plus the message the kebab would have chosen
+         * (default: the newest in the open channel). Through forward_send, so
+         * the verb takes the same path the menu does. */
+        unsigned long long to_cid = 0, mid = 0;
+        sscanf(arg, "%llu %llu", &to_cid, &mid);
+        const oc_model *fm = model();
+        const oc_channel *fc = fm && g_sel ? oc_model_channel((oc_model *)fm, g_sel) : NULL;
+        if (!mid && fc && fc->n_msgs) mid = fc->msgs[fc->n_msgs - 1].message_id;
+        if (g_client && to_cid && mid) {
+            g_fwd_mid = (uint64_t)mid; g_fwd_cid = g_sel;
+            forward_send(hwnd, (uint64_t)to_cid);
+            test_ack("ok");
+        } else test_ack("err");
     } else if (!strcmp(verb, "view")) {
         /* By NAME as well as by number. The numbers are enum positions, so
          * inserting a view renumbers every one after it — which has now twice

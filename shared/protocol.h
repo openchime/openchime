@@ -38,7 +38,13 @@
  * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
  * preview_author. Shipping client and daemon together (ARCH-61) means there is
  * no compatibility window to preserve — only a mismatch to detect loudly. */
-/* 9: SET_PROFILE moves to 0x00D8, off the opcode it shared with SET_PRESENCE,
+/* 10: SEND carries an optional forward SOURCE (channel + message), and FORWARD
+ * (0x00D9) carries the reference the daemon resolves from it (REQ-057). The
+ * source rides SEND's fixed part rather than its tail: that tail already holds
+ * an optional attachment list, BROADCAST's holds two optional fields, and a
+ * third sharing one is how a decoder loses its place.
+ *
+ * 9: SET_PROFILE moves to 0x00D8, off the opcode it shared with SET_PRESENCE,
  * and the profile frames grow. Both halves are wire changes the version exists
  * to make loud: the two types were both C->S, so the dispatch chain reached
  * presence first and a profile payload was decoded as a presence one; and
@@ -65,7 +71,7 @@
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
  * "connection lost" (ARCH-61 ships the two together). */
-#define OC_PROTOCOL_VERSION 9u
+#define OC_PROTOCOL_VERSION 10u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -313,6 +319,7 @@ typedef enum {
      * needs no protocol-version bump: a peer that does not know it never
      * sends or expects it. */
     OC_MSG_UNFURL           = 0x00D7, /* S->C, a URL's fetched preview */
+    OC_MSG_FORWARD          = 0x00D9, /* S->C, a forwarded message's source (REQ-057) */
     OC_MSG_LIST_USERS       = 0x0040, /* C->S, tenant user enumeration */
     OC_MSG_USER_LIST        = 0x0041, /* S->C */
     OC_MSG_SET_ROLE         = 0x0042, /* C->S (ARCH-60, REQ-030) */
@@ -623,7 +630,13 @@ typedef struct { uint8_t scope; oc_slice session_token; } oc_logout;
  * static config. deployment_mode ∈ {0 standalone,1 federated,2 managed};
  * workspace_name may be empty (client falls back to the host subdomain). */
 typedef struct { uint8_t deployment_mode; uint32_t max_users; oc_slice workspace_name; } oc_workspace_info;
+/* src_channel/src_message are the forward source (REQ-057), zero when the
+ * message is not a forward. The client asserts nothing but the two ids: the
+ * daemon resolves the author, the excerpt and the attachment count from the
+ * row it already holds, so a client cannot claim someone said something they
+ * did not. They sit in the fixed part, ahead of the optional attachment tail. */
 typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; oc_slice body;
+                 uint64_t src_channel; uint64_t src_message;
                  uint16_t n_attach; uint64_t attach_ids[OC_MAX_ATTACH]; } oc_send;
 typedef struct { uint8_t idem[OC_IDEM_SIZE]; uint64_t channel_id; uint64_t message_id; uint64_t server_time; } oc_send_ack;
 typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t author_id; uint64_t server_time; oc_slice body;
@@ -660,6 +673,16 @@ typedef struct { uint64_t channel_id; uint32_t count; } oc_pins;
  * extracted; a client renders them under the message's link. */
 typedef struct { uint64_t message_id; uint64_t channel_id;
                  oc_slice url; oc_slice title; oc_slice descr; } oc_unfurl;
+/* The resolved reference a forward carries (REQ-057). src_author/excerpt/
+ * n_attach are a SNAPSHOT taken when the forward was sent: editing the
+ * original afterwards does not rewrite what was forwarded. The files stay with
+ * the source message, so n_attach counts them and src_attach_name is the FIRST
+ * one's name — enough for the card to say what it is naming rather than offer a
+ * download the recipient may not be allowed to make (ARCH-77/78). */
+typedef struct { uint64_t message_id; uint64_t channel_id;
+                 uint64_t src_channel; uint64_t src_message; uint64_t src_author;
+                 oc_slice src_excerpt; uint16_t n_attach;
+                 oc_slice src_attach_name; } oc_forward;
 
 /* A channel's members (REQ-031) and its shared files (REQ-143, ARCH-91). Both
  * follow the LIST_PINS shape — stream the entries, then a terminator — because
@@ -1091,6 +1114,7 @@ oc_result oc_encode_list_reactions(oc_wbuf *w, uint16_t version, const oc_list_r
 oc_result oc_encode_pin(oc_wbuf *w, uint16_t version, const oc_pin *m);
 oc_result oc_encode_pin_updated(oc_wbuf *w, uint16_t version, const oc_pin_updated *m);
 oc_result oc_encode_unfurl(oc_wbuf *w, uint16_t version, const oc_unfurl *m);
+oc_result oc_encode_forward(oc_wbuf *w, uint16_t version, const oc_forward *m);
 oc_result oc_encode_list_pins(oc_wbuf *w, uint16_t version, const oc_list_pins *m);
 oc_result oc_encode_pinned_msg(oc_wbuf *w, uint16_t version, const oc_pinned_msg *m);
 oc_result oc_encode_pins(oc_wbuf *w, uint16_t version, const oc_pins *m);
@@ -1277,6 +1301,7 @@ oc_result oc_decode_list_reactions(oc_rbuf *p, oc_list_reactions *m);
 oc_result oc_decode_pin(oc_rbuf *p, oc_pin *m);
 oc_result oc_decode_pin_updated(oc_rbuf *p, oc_pin_updated *m);
 oc_result oc_decode_unfurl(oc_rbuf *p, oc_unfurl *m);
+oc_result oc_decode_forward(oc_rbuf *p, oc_forward *m);
 oc_result oc_decode_list_pins(oc_rbuf *p, oc_list_pins *m);
 oc_result oc_decode_pinned_msg(oc_rbuf *p, oc_pinned_msg *m);
 oc_result oc_decode_pins(oc_rbuf *p, oc_pins *m);

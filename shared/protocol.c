@@ -280,6 +280,9 @@ oc_result oc_encode_send(oc_wbuf *w, uint16_t version, const oc_send *m) {
     oc_w_u64(w, m->channel_id);
     oc_w_idem(w, m->idem);
     oc_w_lstr(w, m->body);
+    /* Forward source (REQ-057); 0/0 when this is an ordinary message. */
+    oc_w_u64(w, m->src_channel);
+    oc_w_u64(w, m->src_message);
     /* Optional trailing attachment-id list (REQ-140): written only when present,
      * so a message with no attachments matches the original layout exactly. */
     if (m->n_attach) {
@@ -425,6 +428,19 @@ oc_result oc_encode_unfurl(oc_wbuf *w, uint16_t version, const oc_unfurl *m) {
     oc_w_str(w, m->url);
     oc_w_str(w, m->title);
     oc_w_str(w, m->descr);
+    return oc_frame_end(w, off);
+}
+
+oc_result oc_encode_forward(oc_wbuf *w, uint16_t version, const oc_forward *m) {
+    size_t off = oc_frame_begin(w, version, OC_MSG_FORWARD);
+    oc_w_u64(w, m->message_id);
+    oc_w_u64(w, m->channel_id);
+    oc_w_u64(w, m->src_channel);
+    oc_w_u64(w, m->src_message);
+    oc_w_u64(w, m->src_author);
+    oc_w_str(w, m->src_excerpt);
+    oc_w_u16(w, m->n_attach);
+    oc_w_str(w, m->src_attach_name);
     return oc_frame_end(w, off);
 }
 
@@ -1802,6 +1818,8 @@ oc_result oc_decode_send(oc_rbuf *p, oc_send *m) {
     m->channel_id = oc_r_u64(p);
     oc_r_idem(p, m->idem);
     m->body = oc_r_lstr(p);
+    m->src_channel = oc_r_u64(p);
+    m->src_message = oc_r_u64(p);
     /* Optional trailing attachment-id list (REQ-140): present only if bytes
      * remain after the body. Absent -> zero attachments (original layout). */
     m->n_attach = 0;
@@ -1931,6 +1949,18 @@ oc_result oc_decode_unfurl(oc_rbuf *p, oc_unfurl *m) {
     m->url = oc_r_str(p);
     m->title = oc_r_str(p);
     m->descr = oc_r_str(p);
+    return r_done(p);
+}
+
+oc_result oc_decode_forward(oc_rbuf *p, oc_forward *m) {
+    m->message_id = oc_r_u64(p);
+    m->channel_id = oc_r_u64(p);
+    m->src_channel = oc_r_u64(p);
+    m->src_message = oc_r_u64(p);
+    m->src_author = oc_r_u64(p);
+    m->src_excerpt = oc_r_str(p);
+    m->n_attach = oc_r_u16(p);
+    m->src_attach_name = oc_r_str(p);
     return r_done(p);
 }
 

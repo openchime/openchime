@@ -138,7 +138,8 @@ enum {
      * three heap slots the way ATTACHMENT reuses author_name for a mime type.
      * Arrives after the BROADCAST it belongs to (or on replay), and again for
      * the same url if the daemon re-fetched: the fold is an upsert. */
-    OC_EV_UNFURL
+    OC_EV_UNFURL,
+    OC_EV_FORWARD
 };
 
 typedef struct {
@@ -177,6 +178,13 @@ typedef struct {
     /* One aggregated thread (REQ-062). `count`/`op` carry the reply and unread
      * counts, `pinned_at` the last reply's time — reusing the generic fields the
      * way every other list event here does. */
+    /* FORWARD (REQ-057): the reference the daemon resolved for a forwarded
+     * message. `message_id`/`channel_id` above name the forward itself;
+     * `author_id` is the SOURCE's author. The excerpt rides `body`, which is
+     * already the heap-string field every text-bearing event uses. */
+    uint64_t src_channel, src_message;
+    uint16_t src_n_attach;
+    char     src_attach_name[128];   /* the first file's name; "" = none */
     uint32_t reply_count, unread_count;
     uint8_t  following;
     /* REQ-289: the profile fields carried on a USER entry. `emoji` and
@@ -309,6 +317,8 @@ typedef struct {
     uint64_t server_time;  /* SCHEDULE: when to send (ms) */
     char    *body;         /* heap; SEND body / REACT emoji / SET_SETTING key */
     char    *body2;        /* heap; SET_SETTING value, else NULL */
+    /* SEND: what this message forwards (REQ-057), 0/0 when it forwards nothing. */
+    uint64_t src_channel, src_message;
     /* OPEN_GROUP_DM (REQ-056): the other participants. Inline, because the wire
      * caps the count and a fixed array needs no ownership rules. */
     uint64_t gids[8];

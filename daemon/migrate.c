@@ -841,6 +841,39 @@ static const char MIGRATION_0039[] =
     "ALTER TABLE users ADD COLUMN phone TEXT;"
     "ALTER TABLE users ADD COLUMN pronouns TEXT;";
 
+static const char MIGRATION_0040[] =
+    /* What a forward points at (REQ-057). A side table keyed on the message,
+     * following `unfurls` rather than columns on `messages`: almost no message
+     * is a forward, and five sparse columns on the hot table would be paid for
+     * on every row to serve a rare one.
+     *
+     * `src_channel` and `src_message` are deliberately NOT foreign keys. The
+     * source may be tombstoned (REQ-052) or its channel archived, and a forward
+     * has to outlive both — it records what was forwarded, it is not a live
+     * pointer. A FK would make deleting the original either fail or silently
+     * erase the record of the forward.
+     *
+     * `src_author`, `excerpt` and `n_attach` are a snapshot taken at forward
+     * time. Editing the original later does not rewrite what was forwarded.
+     *
+     * `n_attach` counts the source's files and `attach_name` holds the FIRST
+     * one's name, which is what a card can actually show — a list of five
+     * filenames is a wall, "report.txt and 4 more" is a sentence. The files
+     * themselves stay on the source message (attachments.message_id is one row,
+     * one message): the card names them and the permalink reaches them. Copying
+     * would mean either a second row sharing a storage_key — which breaks the
+     * orphan model reclamation counts on (ARCH-77/78) — or duplicating the
+     * bytes. */
+    "CREATE TABLE forwards ("
+    "  message_id  INTEGER PRIMARY KEY REFERENCES messages(id),"
+    "  src_channel INTEGER NOT NULL,"
+    "  src_message INTEGER NOT NULL,"
+    "  src_author  INTEGER NOT NULL,"
+    "  excerpt     TEXT    NOT NULL,"
+    "  n_attach    INTEGER NOT NULL,"
+    "  attach_name TEXT    NOT NULL DEFAULT ''"
+    ");";
+
 const oc_migration OC_MIGRATIONS[] = {
     { 1, MIGRATION_0001 },
     { 2, MIGRATION_0002 },
@@ -881,6 +914,7 @@ const oc_migration OC_MIGRATIONS[] = {
     { 37, MIGRATION_0037 },
     { 38, MIGRATION_0038 },
     { 39, MIGRATION_0039 },
+    { 40, MIGRATION_0040 },
 };
 const int OC_MIGRATIONS_COUNT = (int)(sizeof OC_MIGRATIONS / sizeof OC_MIGRATIONS[0]);
 

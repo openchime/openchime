@@ -170,7 +170,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 9** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 10** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
@@ -366,6 +366,18 @@ continue).
 | `channel_id`         | u64    | Target channel or DM conversation.                                    |
 | `idempotency_token`  | 16 B   | Client-generated random 128-bit token (§7 `idem`). Enables safe retry (REQ-093). Distinct from the server message id. |
 | `body`               | lstr   | Message body, u32-length-prefixed UTF-8 (§7), `<= MAX_BODY_SIZE` (REQ-054). |
+| `src_channel`        | u64    | Forward source channel (REQ-057), `0` when the message forwards nothing.  |
+| `src_message`        | u64    | Forward source message (REQ-057), `0` when the message forwards nothing.  |
+| *(optional tail)*    | u16 + u64[] | Attachment ids to link (REQ-140), written only when present.        |
+
+**Forwarding (REQ-057, ARCH-108).** The client sends only the two source ids.
+The daemon resolves the source author, a truncated excerpt and the attachment
+count from the row it already holds, and announces them on a `FORWARD` frame —
+so a client cannot claim someone said something they did not. The two fields sit
+in the **fixed part, ahead of the optional attachment tail**: a second block
+sharing that tail is how a decoder loses its place (§2). The forwarder must be
+able to read the source or no reference is stored; a source that is gone or
+unreadable makes this an ordinary send rather than an error.
 
 On accept, the daemon's single DB-writer thread assigns a `message_id` and a
 server timestamp inside the WAL commit, then answers `SEND_ACK`. The client
@@ -1145,14 +1157,25 @@ is excluded from its own broadcast). On authenticating, a client also receives a
 **one-shot snapshot** — one `PRESENCE_UPDATE` per currently-online user — so it
 starts with an accurate roster without polling.
 
-`dnd` is the do-not-disturb **fact** (REQ-122/278) — that the user is not to be
-disturbed, never when they will be back. It is a second axis beside presence, not
-a status value: somebody can be online and paused, and collapsing the two would
-make "away" and "do not disturb" indistinguishable. The net thread holds each
-connected user's pause instant in memory (seeded at `AUTH_OK`, ARCH-66/67 gives it
-no database of its own) and compares it per frame, so an expiry needs no sweep —
-but a pause that runs out is re-announced on the next tick, since only a frame can
-untell the people who were told.
+`dnd` is the do-not-disturb **fact** (REQ-122/136/278) — that the user is not to
+be disturbed, never when they will be back. It is a second axis beside presence,
+not a status value: somebody can be online and paused, and collapsing the two
+would make "away" and "do not disturb" indistinguishable.
+
+**Both halves of do-not-disturb answer it**, because a viewer deciding whether to
+write cares about the fact and not which mechanism produced it: the transient
+**pause** (`SET_SNOOZE`, REQ-278) and the recurring **schedule**
+(`SET_SCHEDULE`, REQ-136). The schedule half is evaluated through the shared
+`oc_notify_quiet` — the same rule the push path decides delivery with — so what a
+colleague sees and what reaches a phone cannot disagree.
+
+The net thread holds both in memory, seeded at `AUTH_OK` and refreshed wherever
+each already fans out (ARCH-66/67 gives it no database of its own). The pause is
+an instant compared per frame, so an expiry needs no sweep. Neither half ends
+because anyone did something — a pause runs out, quiet hours begin at 18:00 — so
+a maintenance tick re-announces a user whose answer differs from what they were
+last announced as. Only a frame can untell the people who were told, and
+comparing rather than re-announcing keeps an idle deployment silent.
 
 **`TYPING` (client → server), msg_type `0x007E`** `{ channel_id: u64 }` — the
 caller signals they are composing in `channel_id`. The server resolves the
@@ -1348,6 +1371,12 @@ none. Sent to **that user's own connections only**, after a `SET_SNOOZE` and
 alongside every `NOTIFY_PREFS`. Other people are told the *fact* through
 `PRESENCE_UPDATE`'s `dnd` byte and never the instant (REQ-122/278): a colleague
 needs to know whether to write; when you are back is a movement report.
+
+**`SET_TZ_OFFSET`** answers with a `SCHEDULE` (below) rather than silently: the
+offset is what quiet hours are evaluated against, the client refreshes it from
+the OS on every connect — so it lands *after* the `AUTH_OK` that seeded the net
+thread's copy — and a presence badge computed against a stale offset is wrong for
+the whole session.
 
 **`SET_SCHEDULE` (C → S), `0x00CC`** and **`SCHEDULE` (S → C), `0x00CD`**
 `{ mode: u8, tz_offset_min: i16, start_min: u16, end_min: u16, count: u8,
@@ -1745,6 +1774,29 @@ The follow and read acks return the one row that changed rather than a fresh
 list, so opening a thread does not cost the whole view.
 
 ### 5.16j Link unfurls (REQ-222, ARCH-105)
+
+**`FORWARD` (S → C), `0x00D9`** — what a forwarded message points at (REQ-057),
+fanned to the channel's members immediately behind the `BROADCAST` it describes.
+
+    message_id (u64), channel_id (u64), src_channel (u64), src_message (u64),
+    src_author (u64), src_excerpt (str), n_attach (u16),
+    src_attach_name (str)
+
+`message_id`/`channel_id` name the forward itself; the rest describe the
+original. Every field is **resolved by the daemon**, never taken from the
+sender, and all of it is a **snapshot** taken when the forward was sent —
+editing the original afterwards does not rewrite what was forwarded.
+**Replayed on backfill (§6.2) and on history paging (§6.3)**, for the reason the
+reaction, pin and unfurl replays exist: the reference travels only on this
+frame, a client stores nothing (ARCH-88), and a replay that omitted it would
+lose the attribution on every reload.
+
+`n_attach` counts the original's files and `src_attach_name` is the **first
+one's name** — the card says "report.txt and 2 more" rather than listing a wall
+of them, and clicking the card opens the original. The files themselves stay
+with the original, because one attachment belongs to one message and copying
+would mean either a shared `storage_key` — which breaks the orphan model
+reclamation counts on (ARCH-77/78) — or duplicated bytes.
 
 **`UNFURL` (S → C), `0x00D7`** — a URL's fetched preview, arriving after the
 BROADCAST it belongs to — whenever the daemon's fetch completes, or never.
@@ -2204,6 +2256,7 @@ this table cannot silently gain a shared value.
 | `0x00D6` | `SET_TZ_OFFSET` | C → S | minutes east of UTC, refreshed on every connect |
 | `0x00D7` | `UNFURL` | S → C | a URL's fetched preview (REQ-222); also replayed on backfill |
 | `0x00D8` | `SET_PROFILE` | C → S | my profile fields (REQ-240) |
+| `0x00D9` | `FORWARD` | S → C | what a forwarded message points at (REQ-057); also replayed on backfill |
 
 ## 10. Connection state machine
 

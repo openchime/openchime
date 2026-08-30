@@ -184,6 +184,32 @@ static void test_messaging_frames(void) {
         CHECK(out.channel_id == 7);
         CHECK(memcmp(out.idem, idem, OC_IDEM_SIZE) == 0);
         CHECK(slice_eq_str(out.body, "hello channel"));
+        CHECK(out.src_channel == 0 && out.src_message == 0);   /* not a forward */
+    }
+    {
+        /* SEND carrying a forward source (REQ-057), with and without the
+         * optional attachment tail behind it — the tail is what the two new
+         * fixed fields sit in front of, so both orders have to decode. */
+        oc_send in = {0}; in.channel_id = 7; memcpy(in.idem, idem, OC_IDEM_SIZE);
+        in.body = oc_slice_str("worth reading");
+        in.src_channel = 3; in.src_message = 909;
+        ROUNDTRIP(oc_encode_send(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEND, h, p);
+        oc_send out = {0};
+        CHECK(oc_decode_send(&p, &out) == OC_OK);
+        CHECK(out.src_channel == 3 && out.src_message == 909);
+        CHECK(slice_eq_str(out.body, "worth reading"));
+        CHECK(out.n_attach == 0);
+    }
+    {
+        oc_send in = {0}; in.channel_id = 7; memcpy(in.idem, idem, OC_IDEM_SIZE);
+        in.body = oc_slice_str("with a file");
+        in.src_channel = 3; in.src_message = 909;
+        in.n_attach = 1; in.attach_ids[0] = 555;
+        ROUNDTRIP(oc_encode_send(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEND, h, p);
+        oc_send out = {0};
+        CHECK(oc_decode_send(&p, &out) == OC_OK);
+        CHECK(out.src_channel == 3 && out.src_message == 909);
+        CHECK(out.n_attach == 1 && out.attach_ids[0] == 555);
     }
     {
         oc_send_ack in; memcpy(in.idem, idem, OC_IDEM_SIZE);
@@ -307,6 +333,33 @@ static void test_unfurl_frame(void) {
     CHECK(slice_eq_str(out.url, "https://example.com/a"));
     CHECK(slice_eq_str(out.title, "Example Title"));
     CHECK(slice_eq_str(out.descr, "A description."));
+}
+
+static void test_forward_frame(void) {
+    /* FORWARD (REQ-057): the resolved reference, fanned after the BROADCAST and
+     * replayed on backfill. Populated and empty, per TESTING.md 2.2. */
+    {
+        oc_forward in = { 1001, 7, 3, 909, 42, oc_slice_str("the original text"), 2,
+                          oc_slice_str("report.txt") };
+        ROUNDTRIP(oc_encode_forward(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_FORWARD, h, p);
+        oc_forward out;
+        CHECK(oc_decode_forward(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1001 && out.channel_id == 7);
+        CHECK(out.src_channel == 3 && out.src_message == 909 && out.src_author == 42);
+        CHECK(slice_eq_str(out.src_excerpt, "the original text"));
+        CHECK(out.n_attach == 2);
+        CHECK(slice_eq_str(out.src_attach_name, "report.txt"));
+    }
+    {
+        /* An empty excerpt is ordinary: a message can be nothing but a file. */
+        oc_forward in = { 1002, 7, 3, 910, 42, oc_slice_str(""), 0, oc_slice_str("") };
+        ROUNDTRIP(oc_encode_forward(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_FORWARD, h, p);
+        oc_forward out;
+        CHECK(oc_decode_forward(&p, &out) == OC_OK);
+        CHECK(out.src_excerpt.len == 0 && out.n_attach == 0);
+        CHECK(out.src_attach_name.len == 0);
+        CHECK(out.src_message == 910);
+    }
 }
 
 static void test_reaction_frames(void) {
@@ -1365,6 +1418,7 @@ int run_protocol_tests(void) {
     test_messaging_frames();
     test_reaction_frames();
     test_unfurl_frame();
+    test_forward_frame();
     test_thread_frames();
     test_channel_frames();
     test_admin_frames();
