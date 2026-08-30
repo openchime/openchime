@@ -453,7 +453,14 @@ static int dnd_of(conn **conns, uint64_t uid) {
  * about a person, not about a device: leaving one connection on the old one
  * would be two answers to "when am I quiet", which is what REQ-136 exists to
  * prevent. */
+/* Something that can change a DND answer happened. The maintenance tick is
+ * otherwise gated to one pass a minute (see expire_snoozes), which is right for
+ * the clock but far too slow for a person: setting quiet hours on one device
+ * should reach everybody else's roster now, not on the next minute boundary. */
+static int g_dnd_dirty;
+
 static void cache_schedule(conn **conns, uint64_t uid, const oc_dbres *r) {
+    g_dnd_dirty = 1;
     for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
         conn *c = conns[fd];
         if (!c || !c->authed || c->user_id != uid) continue;
@@ -3717,7 +3724,29 @@ static void expire_snoozes(int ep, conn **conns) {
         for (int g = 0; g < OC_NETLOOP_MAX_FD; g++)      /* every connection they hold */
             if (conns[g] && conns[g]->authed && conns[g]->user_id == uid)
                 conns[g]->dnd_until_ms = 0;
+        g_dnd_dirty = 1;
     }
+
+    /* The re-announce sweep is O(connections squared) — dnd_of rescans the
+     * table for each connection — and this function runs on EVERY epoll turn,
+     * which under a busy transfer is many times a second. Paying that per turn
+     * put real work on the hot path for an answer that had not changed.
+     *
+     * Two things can change it, and neither needs the hot path:
+     *
+     *   the CLOCK, at minute granularity, because that is the resolution quiet
+     *   hours are expressed in — so once a minute is not an approximation, it
+     *   is exactly often enough;
+     *
+     *   a PERSON, which sets the dirty flag, because waiting up to a minute to
+     *   tell everyone you just turned quiet hours on would be a visible lag.
+     */
+    static uint64_t last_min;
+    uint64_t this_min = now / 60000ull;
+    if (!g_dnd_dirty && this_min == last_min) return;
+    last_min = this_min;
+    g_dnd_dirty = 0;
+
     for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
         conn *c = conns[fd];
         if (!c || !c->authed) continue;
