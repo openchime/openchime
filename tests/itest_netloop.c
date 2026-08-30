@@ -972,6 +972,129 @@ static void test_presence_typing(int port, const uint8_t *pin) {
     client_close(&b);
 }
 
+/* Do-not-disturb is visible to OTHER PEOPLE, and both halves of it are
+ * (REQ-122/136/278). The badge exists for the sender — someone deciding whether
+ * to write — so a colleague inside their configured quiet hours reading as
+ * ordinarily interruptible is the one case it was built for.
+ *
+ * Driven end to end through a real netloop because that is where the defect
+ * lived: the rule itself (oc_notify_quiet) was always right and always unit
+ * tested, and the presence path simply never asked it. */
+static void wait_presence_dnd(client *c, uint64_t of_user, int want) {
+    oc_header hdr; oc_rbuf p;
+    /* The schedule half is announced by the maintenance TICK, not by the frame
+     * that changed it, so this reads until the answer arrives; presence frames
+     * for other users and other transitions can legitimately precede it.
+     *
+     * With a receive deadline, because the failure being guarded against is a
+     * frame that never comes — and a test that blocks forever on that reports a
+     * hung suite rather than a broken assertion, which is the harder of the two
+     * to read. Five seconds is many times the tick's own 500 ms. */
+    struct timeval tv = { 5, 0 };
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    int got = 0;
+    for (int i = 0; i < 40; i++) {
+        if (read_frame_raw(c, &hdr, &p) != 0) break;      /* timed out or closed */
+        if (hdr.msg_type != OC_MSG_PRESENCE_UPDATE) continue;
+        oc_presence_update pu;
+        CHECK(oc_decode_presence_update(&p, &pu) == OC_OK);
+        if (pu.user_id != of_user) continue;
+        if (pu.dnd == (want ? 1 : 0)) { got = 1; break; }
+    }
+    tv.tv_sec = 0;
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    CHECK(got);   /* no PRESENCE_UPDATE carrying the expected dnd bit */
+}
+
+static void set_schedule(client *c, uint8_t mode, int16_t tz,
+                         uint16_t start, uint16_t end) {
+    uint8_t buf[256]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_schedule sc = { mode, tz, start, end, 0, NULL };
+    CHECK(oc_encode_set_schedule(&w, OC_PROTOCOL_VERSION, &sc) == OC_OK);
+    CHECK(send_frame(c, buf, w.len) == 0);
+}
+
+static void set_tz(client *c, int16_t off) {
+    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_tz_offset tz = { off };
+    CHECK(oc_encode_set_tz_offset(&w, OC_PROTOCOL_VERSION, &tz) == OC_OK);
+    CHECK(send_frame(c, buf, w.len) == 0);
+}
+
+/* An offset that puts this user's local clock at `want_local` right now, inside
+ * the range SET_TZ_OFFSET accepts. Computed rather than hardcoded because the
+ * assertions below are about a real wall clock: a fixed "quiet after 18:00"
+ * window would pass or fail depending on the hour the suite happened to run. */
+static int16_t offset_for_local(int want_local) {
+    int utc_min = (int)(((long long)time(NULL) / 60) % 1440);
+    int off = want_local - utc_min;
+    if (off < -720) off += 1440;        /* UTC-12 is the westmost real offset */
+    return (int16_t)off;
+}
+
+static void set_snooze(client *c, uint32_t minutes) {
+    uint8_t buf[64]; oc_wbuf w; oc_wbuf_init(&w, buf, sizeof buf);
+    oc_set_snooze sn = { minutes };
+    CHECK(oc_encode_set_snooze(&w, OC_PROTOCOL_VERSION, &sn) == OC_OK);
+    CHECK(send_frame(c, buf, w.len) == 0);
+}
+
+static void test_presence_dnd(int port, const uint8_t *pin) {
+    client a, b;
+    CHECK(client_open(&a, port, pin) == 0);
+    CHECK(do_handshake(&a) == 0);
+    uint64_t ua = 0;
+    CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
+
+    CHECK(client_open(&b, port, pin) == 0);
+    CHECK(do_handshake(&b) == 0);
+    uint64_t ub = 0;
+    CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    (void)ub;
+
+    /* Quiet ALWAYS: the window is the hours notifications are ALLOWED, and an
+     * empty one allows nothing. Independent of the wall clock, which is what
+     * makes this the assertion the issue is actually about — before the fix the
+     * schedule reached the presence path through nothing at all. */
+    set_schedule(&a, OC_DND_EVERY_DAY, 0, 0, 0);
+    wait_presence_dnd(&b, ua, 1);
+
+    /* And it CLEARS. A latch would satisfy the line above and be useless. */
+    set_schedule(&a, OC_DND_OFF, 0, 0, 0);
+    wait_presence_dnd(&b, ua, 0);
+
+    /* The offset is consulted, and SET_TZ_OFFSET reaches the net thread.
+     *
+     * Allowed 00:00-12:00, with the offset chosen so alice's local clock is at
+     * 13:20 — quiet — and then moved so it reads 05:00, which is not. Nothing
+     * about the schedule changes between the two: only where she is. Both
+     * offsets are computed from the current time so each step is a real
+     * transition whatever hour this runs at.
+     *
+     * The second half is the one that was unwired: SET_TZ_OFFSET returned no
+     * result at all, so the net thread went on evaluating against whatever
+     * offset AUTH_OK had seeded. */
+    set_schedule(&a, OC_DND_EVERY_DAY, offset_for_local(800), 0, 720);
+    wait_presence_dnd(&b, ua, 1);
+    set_tz(&a, offset_for_local(300));
+    wait_presence_dnd(&b, ua, 0);
+
+    /* The pause still works, and works ALONGSIDE the schedule rather than
+     * instead of it — the regression this change could most easily cause. */
+    set_snooze(&a, 30);
+    wait_presence_dnd(&b, ua, 1);
+    set_snooze(&a, 0);
+    wait_presence_dnd(&b, ua, 0);
+
+    /* Leave the account as it was found: these tests share one daemon. The
+     * schedule is already off in effect, so this asserts no further frame —
+     * waiting for one would be waiting for a transition that does not happen. */
+    set_schedule(&a, OC_DND_OFF, 0, 0, 0);
+
+    client_close(&a);
+    client_close(&b);
+}
+
 /* Issue DOWNLOAD_BEGIN for `aid` and reassemble the streamed blob into `out`
  * (bounded by `cap`), verifying DOWNLOAD_INFO's digest matches `expect_sha` and
  * that chunk sequence numbers are contiguous. Returns the bytes received. */
@@ -2154,6 +2277,7 @@ int run_netloop_tests(void) {
         test_dm_vertical(arg.port, pin);
         test_drafts_vertical(arg.port, pin);
         test_presence_typing(arg.port, pin);
+        test_presence_dnd(arg.port, pin);
         test_attachments_vertical(arg.port, pin);
         test_upload_abandoned(arg.port, pin);
         test_webhook_vertical(arg.port, pin);

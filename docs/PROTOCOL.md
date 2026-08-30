@@ -1157,14 +1157,25 @@ is excluded from its own broadcast). On authenticating, a client also receives a
 **one-shot snapshot** — one `PRESENCE_UPDATE` per currently-online user — so it
 starts with an accurate roster without polling.
 
-`dnd` is the do-not-disturb **fact** (REQ-122/278) — that the user is not to be
-disturbed, never when they will be back. It is a second axis beside presence, not
-a status value: somebody can be online and paused, and collapsing the two would
-make "away" and "do not disturb" indistinguishable. The net thread holds each
-connected user's pause instant in memory (seeded at `AUTH_OK`, ARCH-66/67 gives it
-no database of its own) and compares it per frame, so an expiry needs no sweep —
-but a pause that runs out is re-announced on the next tick, since only a frame can
-untell the people who were told.
+`dnd` is the do-not-disturb **fact** (REQ-122/136/278) — that the user is not to
+be disturbed, never when they will be back. It is a second axis beside presence,
+not a status value: somebody can be online and paused, and collapsing the two
+would make "away" and "do not disturb" indistinguishable.
+
+**Both halves of do-not-disturb answer it**, because a viewer deciding whether to
+write cares about the fact and not which mechanism produced it: the transient
+**pause** (`SET_SNOOZE`, REQ-278) and the recurring **schedule**
+(`SET_SCHEDULE`, REQ-136). The schedule half is evaluated through the shared
+`oc_notify_quiet` — the same rule the push path decides delivery with — so what a
+colleague sees and what reaches a phone cannot disagree.
+
+The net thread holds both in memory, seeded at `AUTH_OK` and refreshed wherever
+each already fans out (ARCH-66/67 gives it no database of its own). The pause is
+an instant compared per frame, so an expiry needs no sweep. Neither half ends
+because anyone did something — a pause runs out, quiet hours begin at 18:00 — so
+a maintenance tick re-announces a user whose answer differs from what they were
+last announced as. Only a frame can untell the people who were told, and
+comparing rather than re-announcing keeps an idle deployment silent.
 
 **`TYPING` (client → server), msg_type `0x007E`** `{ channel_id: u64 }` — the
 caller signals they are composing in `channel_id`. The server resolves the
@@ -1360,6 +1371,12 @@ none. Sent to **that user's own connections only**, after a `SET_SNOOZE` and
 alongside every `NOTIFY_PREFS`. Other people are told the *fact* through
 `PRESENCE_UPDATE`'s `dnd` byte and never the instant (REQ-122/278): a colleague
 needs to know whether to write; when you are back is a movement report.
+
+**`SET_TZ_OFFSET`** answers with a `SCHEDULE` (below) rather than silently: the
+offset is what quiet hours are evaluated against, the client refreshes it from
+the OS on every connect — so it lands *after* the `AUTH_OK` that seeded the net
+thread's copy — and a presence badge computed against a stale offset is wrong for
+the whole session.
 
 **`SET_SCHEDULE` (C → S), `0x00CC`** and **`SCHEDULE` (S → C), `0x00CD`**
 `{ mode: u8, tz_offset_min: i16, start_min: u16, end_min: u16, count: u8,

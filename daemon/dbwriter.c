@@ -80,6 +80,7 @@ struct oc_dbwriter {
 static uint64_t snooze_until(sqlite3 *db, uint64_t uid);   /* fwd — auth and the prefs snapshot both read it */
 static void fill_schedule(sqlite3 *db, uint64_t uid, oc_dbres *r);      /* fwd — REQ-136 */
 static void fill_alert_prefs(sqlite3 *db, uint64_t uid, oc_dbres *r);   /* fwd — REQ-135 */
+static void build_schedule(sqlite3 *db, uint64_t uid, oc_dbres *r);     /* fwd — REQ-136 */
 
 static uint64_t dbw_now_ms(void) {
     struct timespec ts;
@@ -860,9 +861,14 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
     r->user_id = uid;
     r->role = role;
     r->session_id = sess_id;   /* REQ-182: which row this connection is using */
-    /* The pause rides along (REQ-278): the net thread keeps the FACT in memory
-     * so presence fan-out can carry it, and it has no database of its own. */
+    /* Do-not-disturb rides along, BOTH halves: the net thread keeps the FACT in
+     * memory so presence fan-out can carry it, and it has no database of its
+     * own. The pause is an instant (REQ-278); the schedule is a rule the net
+     * thread evaluates per tick (REQ-136). Seeding the schedule here rather
+     * than waiting for the client to ask for its preferences means a colleague
+     * inside their quiet hours reads as such from the first frame. */
     r->snooze_until_ms = snooze_until(db, uid);
+    fill_schedule(db, uid, r);
     if (fresh) {
         uint8_t token[OC_SESSION_TOKEN_LEN]; uint64_t expiry = 0;
         if (mint_session(db, uid, token, &expiry, &sess_id) != 0) {
@@ -1156,6 +1162,7 @@ static oc_dbres *process_redeem(oc_dbwriter *w, const oc_job *j) {
     r->user_id = uid;
     r->role = role;
     r->snooze_until_ms = snooze_until(db, uid);
+    fill_schedule(db, uid, r);              /* REQ-136, as above */
     memcpy(r->session_token, token, sizeof token);
     r->has_session_token = 1;
     r->session_expiry = sexp;
@@ -4858,6 +4865,15 @@ static uint64_t snooze_until(sqlite3 *db, uint64_t uid) {
  * window is currently in force on the recipient's own calendar day. Clamped to
  * the range real offsets occupy, so a broken or hostile client cannot move
  * somebody's local day by an arbitrary amount. */
+/* The offset quiet hours are evaluated against (ARCH-103), refreshed by the
+ * client from the OS on every connect.
+ *
+ * It ANSWERS, with the schedule the offset belongs to. It used to return NULL,
+ * which meant a timezone change reached the net thread through nothing — and
+ * that is the common path rather than an edge case, because the refresh lands
+ * AFTER the AUTH_OK that seeded the cache. A first connect from a new machine
+ * would otherwise have evaluated somebody's quiet hours against a stale
+ * offset, or against zero. */
 static oc_dbres *process_set_tz_offset(sqlite3 *db, const oc_job *j) {
     int off = j->tz_offset_min;
     if (off < -720) off = -720;        /* UTC-12, the westmost real offset */
@@ -4868,7 +4884,12 @@ static oc_dbres *process_set_tz_offset(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_int64(st, 2, (sqlite3_int64)j->user_id);
     sqlite3_step(st);
     sqlite3_finalize(st);
-    return NULL;
+
+    oc_dbres *r = calloc(1, sizeof *r);
+    if (!r) return NULL;
+    r->conn_id = j->conn_id;
+    build_schedule(db, j->user_id, r);
+    return r;
 }
 
 static oc_dbres *process_set_snooze(sqlite3 *db, const oc_job *j) {

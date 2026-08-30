@@ -603,12 +603,16 @@ the requirement says so explicitly rather than implying one.
   typing never leaks to non-members; the server keeps no expiry timer. Resolved:
   the indicator expires **client-side after ~6 seconds**, refreshed by each new
   `TYPING` signal — no "stopped typing" frame is sent.
-- **REQ-122.** *(Partly built)* A user's **do-not-disturb, out-of-office, or custom status**
-  (REQ-131/241) has been surfaced to other users alongside their presence
-  (REQ-120) — a distinct indicator on the presence dot plus a status line in the
-  roster — so a colleague has known someone was unavailable before messaging
-  them. This has been display only: it has not changed delivery, which DND
-  governs separately (REQ-131).
+- **REQ-122.** A user's **do-not-disturb and custom status** (REQ-136/278/241)
+  has been surfaced to other users alongside their presence (REQ-120) — a
+  distinct indicator on the presence dot plus a status line in the roster — so a
+  colleague has known someone was unavailable before messaging them. This has
+  been display only: it has not changed delivery, which the schedule and the
+  pause govern separately.
+  **Being away is said with the pause and the custom status**, not with a
+  separate out-of-office state: "back Monday" is a status, and not being
+  interrupted until then is a pause. A third mechanism would be a third thing to
+  set and a third thing to forget to clear.
 
   **Availability and do-not-disturb are two INDEPENDENT axes, as in Slack.**
   Presence (REQ-120) answers *are they around* — active / away / offline.
@@ -630,21 +634,20 @@ the requirement says so explicitly rather than implying one.
   behaviour ever matters it would have to be observed against Slack, whose docs
   do not say.)
 
-  **Partially built, and the unbuilt half is the DND half.** Custom status with
-  expiry shipped (migration 0027) and is shown beside names in the member
-  pane and profile. **Do-not-disturb is still self-only:** `dnd_enabled` /
-  `dnd_start_min` / `dnd_end_min` live on the model's *own-user* block, and
-  `oc_user` — the roster entry for everybody else — carries no DND field at all,
-  so the Win32 client's quiet-hours badge is something you can see only about
-  yourself. Slack shows a snooze icon to everyone, which is the point of the
-  indicator: it exists for the *sender*. This gets more valuable with REQ-278,
-  where a pause is transient and a sender has no other way to know.
-  **[needs ARCH decision — how DND/OOO/custom-status is projected into the
-  `PRESENCE_UPDATE` surface (ARCH-67); note ARCH-89 already records that presence
-  is invisible to the push worker's read-only connection, which is a related
-  constraint on where this state can be read. `PRESENCE_UPDATE` carries one
-  status byte today and needs a second, INDEPENDENT DND bit rather than a fourth
-  status value — see the two-axis note above.]**
+  **How it is projected.** `PRESENCE_UPDATE` carries a second, **independent**
+  DND byte beside the status byte — not a fourth status value, per the two-axis
+  note above. **Both** do-not-disturb mechanisms answer it: the recurring
+  schedule (REQ-136) and the transient pause (REQ-278). A sender wants the fact,
+  and which mechanism produced it is not their business.
+
+  The schedule half is evaluated through the shared `oc_notify_quiet`, the same
+  rule the push path decides delivery with, so a colleague's badge and a phone's
+  silence cannot disagree. Both halves are held in the net thread's memory, which
+  has no database of its own (ARCH-67) — and are re-announced by its maintenance
+  tick when the clock, rather than a person, changes the answer.
+
+  Custom status with expiry (migration 0027) is shown beside names in the member
+  pane and profile.
 
 ---
 
