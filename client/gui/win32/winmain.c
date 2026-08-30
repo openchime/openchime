@@ -8360,11 +8360,32 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
      * feature invisible until you typed — and being unfindable is the defect
      * this control was added to fix. A greyed half says both "this exists" and
      * "not yet", which is what a disabled control is for. */
-    float chev = UIS(22);                     /* the dropdown half */
-    float gx1 = bx1 - COMPOSER_GUTTER, gx0 = gx1 - sq - chev;
-    rectf body = rf(gx0, cy, gx1, cy + sq);
-    g_send_btn  = rf(gx0, cy, gx0 + sq, cy + sq);
-    g_sched_btn = rf(gx0 + sq, cy, gx1, cy + sq);
+    /* THE CLUSTER FITS INSIDE THE BOX, or it shrinks. It never grows out of it.
+     *
+     * gx0 was `gx1 - sq - chev` and nothing checked it against the box's own
+     * left edge. On a very narrow main column — DPI and zoom and text size all
+     * stacked, so the rail and sidebar take almost the whole window — the two
+     * halves are wider than the composer, and gx0 landed LEFT of bx0: the
+     * control drawn outside the container that owns it, and far enough left to
+     * reach into the sidebar and collide with the Drafts shelf row. Two
+     * hit-boxes then claimed the same pixels, so a click meant for Send could
+     * land on the shelf instead.
+     *
+     * Shrinking is the only move left. The optional left icons already drop off
+     * for this reason and Send cannot: it is the one control that must always be
+     * there, so when there is nothing else to give it gives its own size. */
+    float ssq = sq, chev = UIS(22);           /* the dropdown half */
+    float gx1 = bx1 - COMPOSER_GUTTER;
+    float inner = gx1 - (bx0 + COMPOSER_GUTTER);
+    if (inner < 0) inner = 0;
+    if (ssq + chev > inner) {
+        float k = inner / (ssq + chev);
+        ssq *= k; chev *= k;
+    }
+    float gx0 = gx1 - ssq - chev;
+    rectf body = rf(gx0, cy, gx1, cy + ssq);
+    g_send_btn  = rf(gx0, cy, gx0 + ssq, cy + ssq);
+    g_sched_btn = rf(gx0 + ssq, cy, gx1, cy + ssq);
     fill_round(rt, body, 8.0f, has_text ? OC_COL_ACCENT : OC_COL_INPUT);
     if (!has_text) stroke_round(rt, body, 8.0f, OC_COL_BORDER, 1.0f);
     if (has_text) {
@@ -8400,8 +8421,11 @@ static void draw_composer(gfx *rt, float x0, float w, float h) {
         gfx_line(rt, ccx - d, ccy - d / 2, ccx, ccy + d / 2, 1.6f, cc2, 1.0f);
         gfx_line(rt, ccx, ccy + d / 2, ccx + d, ccy - d / 2, 1.6f, cc2, 1.0f);
     }
-    draw_lucide(rt, OC_ICON_SEND, rf(g_send_btn.left + 8, g_send_btn.top + 8,
-                                     g_send_btn.right - 8, g_send_btn.bottom - 8),
+    /* Proportional, not a raw 8: against a shrunken square a fixed inset
+     * eventually inverts the icon's own rect. */
+    float si = ssq * 0.235f;
+    draw_lucide(rt, OC_ICON_SEND, rf(g_send_btn.left + si, g_send_btn.top + si,
+                                     g_send_btn.right - si, g_send_btn.bottom - si),
                 has_text ? 0xFFFFFF : OC_COL_FAINT);
 }
 
