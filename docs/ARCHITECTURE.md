@@ -326,6 +326,10 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
 
   **Delivery is a chain — OS toast, balloon, own window — and that is the point.** The previous design had one mechanism that returned silently when unavailable. A notification that cannot be delivered at all is a bug, not a state.
 
+  **Two activation routes, and the split is not arbitrary.** The toast BODY activates by protocol — see below — but its BUTTONS and its reply box go through a COM activator (`INotificationActivationCallback`, a C vtable, one static object because there is one per process and it outlives everything). That is not a preference: Windows delivers an `<input>`'s text **only** to an activator, and protocol activation cannot carry it. So the cheap route carries the click and the expensive one carries the data. The activator hands its result to the UI thread as a message rather than acting on the COM thread, the same discipline the net thread follows.
+
+  **The app writes its own Start-menu shortcut.** Windows resolves both the AppUserModelID and the activator CLSID through it for an unpackaged install, and Inno Setup cannot write the second property — so shipping a toast whose buttons silently do nothing was the alternative.
+
   **Clicking uses the protocol, not an activator.** The toast's launch argument is an `openchime://` permalink and `activationType="protocol"`; the app already registers the scheme and already knows how to follow one, so the whole COM-activator apparatus — a CLSID, a `LocalServer32`, an `INotificationActivationCallback` — is unnecessary. What it *does* require is that a second launch hand its URL to the running client (`WM_COPYDATA`) instead of starting a rival instance.
 
   **The client's own notification is a second window with its own renderer**, and therefore its own text raster cache: an SDL texture belongs to the renderer that created it, so one shared cache would hand the notification window a texture belonging to the shell and draw nothing.
