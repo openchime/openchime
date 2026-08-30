@@ -50,6 +50,8 @@
 #include "protocol.h"         /* OC_CHANNEL_KIND_DM, OC_PRESENCE_* */
 #include "openchime_res.h"    /* IDI_APPICON */
 #include "theme.h"
+#include "wintoast.h"    /* the real Windows notification (REQ-138) */
+#include <mmsystem.h>       /* PlaySoundW, the notification sound (REQ-138) */
 #include "icons.h"            /* baked Lucide vector icons (cross-platform) */
 
 #include <SDL3/SDL.h>         /* the window + renderer (ARCH-80) */
@@ -607,14 +609,30 @@ static st_ctx       *g_st;
 /* The sdltext sink, in capture mode: st_draw hands premultiplied-BGRA pixels
  * here, we make a texture and either draw it now or hand it to the text cache.
  * One slot — the UI thread draws one layout at a time. */
+/* Declared here rather than beside the test hook: the notification window
+ * (below) needs the shell's HWND to restore it, and is defined earlier. */
+static HWND g_main_hwnd;
+
 static gfx_tex *g_cap_tex;
 static int      g_cap_w, g_cap_h;
 static float    g_cap_dx, g_cap_dy;   /* ink offset, DIPs — aligned layouts */
+/* WHICH renderer text is being rasterised for. There are two windows now: the
+ * shell, and the notification window that has to keep working when the shell is
+ * hidden (REQ-138). An SDL texture belongs to the renderer that created it and
+ * cannot be drawn by another, so the raster cache is per target and so is this.
+ *
+ * A single index rather than a struct per target: the cache is the only thing
+ * that has to split, and threading a context through every draw call would
+ * touch several hundred call sites to say what one variable says. */
+enum { TXT_TARGET_MAIN = 0, TXT_TARGET_TOAST = 1, TXT_TARGET_COUNT };
+static int   g_txt_target;
+static gfx  *g_gfx_for[TXT_TARGET_COUNT];
 static void cap_blit(void *user, const void *bgra, int stride, int pw, int ph,
                      float dx, float dy) {
     (void)user;
+    gfx *dst = g_gfx_for[g_txt_target] ? g_gfx_for[g_txt_target] : g_gfx;
     if (g_cap_tex) { gfx_tex_destroy(g_cap_tex); g_cap_tex = NULL; }
-    g_cap_tex = gfx_tex_create_text(g_gfx, bgra, stride, pw, ph);
+    g_cap_tex = gfx_tex_create_text(dst, bgra, stride, pw, ph);
     g_cap_w = pw; g_cap_h = ph;
     g_cap_dx = dx; g_cap_dy = dy;
 }
@@ -834,6 +852,34 @@ static int to_w(const char *s, WCHAR *out, int cap);   /* fwd */
 
 enum { NOTIFY_OFF = 0, NOTIFY_COUNT = 1, NOTIFY_FULL = 2 };
 static int  g_pref_notify = NOTIFY_FULL;
+/* WHERE a notification appears, which is a different question from how much it
+ * says (NOTIFY_* above). Slack asks both, and so does this: one setting for the
+ * surface, one for the content.
+ *
+ * The default is the real Windows notification. Until now the only surface was
+ * a tray balloon, which cannot carry a button, an image or a replace-by-tag,
+ * and which vanished entirely if Shell_NotifyIcon happened to fail at logon. */
+enum { DELIVER_OS = 0, DELIVER_OWN = 1, DELIVER_NONE = 2 };
+static int  g_pref_deliver = DELIVER_OS;
+/* Which backend actually carried the last notification -- not which one was
+ * asked for. The chain below falls back, so these differ on a machine without
+ * identity, and a test that cannot tell them apart is not testing the chain. */
+enum { DELIVERED_NONE = 0, DELIVERED_WINRT, DELIVERED_BALLOON, DELIVERED_OWN };
+static int  g_delivered_by;
+/* What the last notification was ABOUT. The balloon cannot carry a launch
+ * argument the way a toast can, so the only way its click can open the right
+ * conversation is to remember. */
+static uint64_t g_last_notify_ws, g_last_notify_cid;
+/* A URL this process was started FOR, held until there is a session to open it
+ * in. Following it before the channels exist selects a conversation the model
+ * has never heard of. */
+static char g_pending_url[512];
+static int  g_wintoast_ok;         /* oc_wintoast_init's answer, once */
+static char g_aumid[128];
+/* The AppUserModelID. A constant, not a setting: it identifies the application
+ * to Windows and must match the installer's shortcut exactly. Changing it
+ * orphans every notification setting a user has already made. */
+#define OC_AUMID "BronzeVenture.OpenChime" 
 static int  g_tray_live;
 /* Per-channel high-water as of the last tick. A message is "new" when a
  * channel's mark advances, which is the same signal the unread count uses —
@@ -900,6 +946,11 @@ static void tray_init(HWND hwnd) {
     if (!g_tray.hIcon) g_tray.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     lstrcpynW(g_tray.szTip, L"OpenChime", 128);
     g_tray_live = Shell_NotifyIconW(NIM_ADD, &g_tray) ? 1 : 0;
+    /* Version 4 behaviour, and it is not optional: without NIM_SETVERSION the
+     * shell never sends NIN_BALLOONUSERCLICK at all, so a balloon stays a
+     * poster however carefully its click is handled. */
+    if (g_tray_live) { g_tray.uVersion = NOTIFYICON_VERSION_4;
+                       Shell_NotifyIconW(NIM_SETVERSION, &g_tray); }
 }
 
 static void tray_done(void) {
@@ -908,14 +959,99 @@ static void tray_done(void) {
 
 static int g_toasts_raised;      /* observable by the harness; see test_dump */
 
-static void notify_toast(const char *title, const char *body) {
-    if (!g_tray_live) return;
-    g_toasts_raised++;
+/* ---- notification sounds (REQ-138) ---------------------------------------
+ * The client was silent. A notification you have to be looking at the screen to
+ * receive is half a notification, and the audible half is the one that works
+ * when the window is behind something.
+ *
+ * PER EVENT, not one sound for everything, because REQ-138 argues the point
+ * directly: a cue is only useful if it distinguishes, and one sound for
+ * everything trains you to ignore it. An empty path means "the system default
+ * for this event", which on the OS backend means letting Windows play the
+ * toast's own sound rather than layering a second one over it. */
+enum { OCSND_MESSAGE = 0, OCSND_PRIORITY, OCSND_DM, OCSND_CALL, OCSND_COUNT };
+static char g_snd_path[OCSND_COUNT][260];
+static int  g_snd_muted;           /* one switch, leaving the choices intact */
+
+/* Which sound this event wants, or NULL for "nothing of ours". NULL is not the
+ * same as silence: on the OS backend it hands the sound back to Windows. */
+static const char *sound_for_event(int is_priority, int is_dm) {
+    if (g_snd_muted) return NULL;
+    int which = is_priority ? OCSND_PRIORITY : is_dm ? OCSND_DM : OCSND_MESSAGE;
+    return g_snd_path[which][0] ? g_snd_path[which] : NULL;
+}
+
+static void sound_play(const char *path) {
+    if (!path || !path[0]) return;
+    WCHAR w[260];
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 260);
+    /* ASYNC so a notification never blocks the tick; NODEFAULT so a missing
+     * file is silence rather than the Windows ding, which would be a worse lie
+     * than saying nothing. */
+    PlaySoundW(w, NULL, SND_ASYNC | SND_FILENAME | SND_NODEFAULT);
+}
+
+/* The tray balloon. No longer the mechanism -- it is the middle of the chain
+ * below -- but kept, because it is the one surface that needs no identity. */
+static int notify_balloon(const char *title, const char *body) {
+    if (!g_tray_live) return 0;
     g_tray.uFlags = NIF_INFO;
     g_tray.dwInfoFlags = NIIF_NONE;
     to_w(title, g_tray.szInfoTitle, 64);
     to_w(body,  g_tray.szInfo, 256);
-    Shell_NotifyIconW(NIM_MODIFY, &g_tray);
+    return Shell_NotifyIconW(NIM_MODIFY, &g_tray) ? 1 : 0;
+}
+
+static void own_toast_show(const char *title, const char *body,
+                           uint64_t ws_slot, uint64_t channel_id);   /* fwd */
+
+/* Deliver one notification (REQ-138). ONE call site, three backends, and a
+ * FALLBACK CHAIN rather than a single mechanism.
+ *
+ * The chain is the point. The old code had exactly one surface and returned
+ * silently when it was unavailable -- so a Shell_NotifyIcon that failed at
+ * logon, which is the common case on a busy shell, dropped every notification
+ * for the rest of the session with no setting to reach for and no way to tell.
+ * Now: the real toast, else the balloon, else the client's own window. A
+ * notification that cannot be delivered at all is a bug, not a state.
+ *
+ * `g_delivered_by` records which one actually carried it, because "asked for
+ * OS" and "got OS" are different facts and the test needs the second. */
+static void notify_deliver(const char *title, const char *body,
+                           uint64_t ws_slot, uint64_t channel_id, const char *snd) {
+    /* `snd` non-NULL means WE play it, so the OS toast is told to stay silent.
+     * Passing the sound rather than a bare flag keeps the two facts -- which
+     * sound, and who plays it -- from being able to disagree. */
+    int silent = snd != NULL;
+    g_delivered_by = DELIVERED_NONE;
+    g_last_notify_ws = ws_slot; g_last_notify_cid = channel_id;
+    if (g_pref_deliver == DELIVER_NONE) return;
+    g_toasts_raised++;
+    /* Ours, when one is chosen. `silent` already told the OS backend to keep
+     * quiet in that case, so exactly one sound plays either way. */
+    if (snd) sound_play(snd);
+
+    if (g_pref_deliver == DELIVER_OS) {
+        /* Tag and group are per conversation, so a second message REPLACES the
+         * first rather than stacking three deep for one busy channel. */
+        char tag[64], grp[64], arg[96];
+        snprintf(tag, sizeof tag, "c%llu", (unsigned long long)channel_id);
+        snprintf(grp, sizeof grp, "w%llu", (unsigned long long)ws_slot);
+        /* A REAL openchime:// URL, because the app already speaks them. With
+         * activationType="protocol" the click needs no COM activator and no
+         * registered CLSID -- Windows just opens the URL, the scheme points at
+         * this exe, and the running instance follows it. The conversation, not
+         * a line in it: a notification is about the former. */
+        snprintf(arg, sizeof arg, "openchime://%s/c/%llu",
+                 g_host[0] ? g_host : "workspace", (unsigned long long)channel_id);
+        if (g_wintoast_ok && oc_wintoast_show(title, body, tag, grp, arg, silent)) {
+            g_delivered_by = DELIVERED_WINRT;
+            return;
+        }
+        if (notify_balloon(title, body)) { g_delivered_by = DELIVERED_BALLOON; return; }
+    }
+    own_toast_show(title, body, ws_slot, channel_id);
+    g_delivered_by = DELIVERED_OWN;
 }
 
 /* ---- taskbar badge + flash (REQ-138, REQ-286) -----------------------------
@@ -2026,7 +2162,11 @@ typedef struct {
     float     ox, oy;         /* ink offset inside the layout box, DIPs */
     unsigned  gen, stamp;
 } txt_ent;
-static txt_ent  g_txt[TXT_CACHE];
+/* One cache per render target, for the reason cap_blit gives: a texture cannot
+ * cross renderers, so a shared cache would hand the notification window a
+ * texture belonging to the shell and draw nothing. */
+static txt_ent  g_txt_c[TXT_TARGET_COUNT][TXT_CACHE];
+#define g_txt (g_txt_c[g_txt_target])
 static unsigned g_txt_gen = 1, g_txt_stamp;
 
 static uint64_t txt_hash(const char *s, const fmtw *fm, float w, uint32_t rgb) {
@@ -6410,6 +6550,7 @@ static float pref_row(gfx *rt, rectf body, float y, int row,
     return rule + 15;
 }
 
+enum { PREF_ROW_DELIVER = 90, PREF_ROW_SNDMUTE = 91 };
 enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
        PREF_ROW_NOTIFY, PREF_ROW_QUICK, PREF_ROW_ACCENT, PREF_ROW_TEXTSIZE,
        PREF_ROW_DENSITY, PREF_ROW_ZOOM, PREF_ROW_DPI, PREF_ROW_RESET,
@@ -6580,10 +6721,21 @@ static void draw_prefs(gfx *rt, rectf reg) {
             y = pref_row(rt, body, y, PREF_ROW_QUICK, "", "", EDIT1, 1, -1);
         }
     } else if (g_pref_cat == PC_NOTIFICATIONS) {
+        /* WHERE, then how much. Two questions, because they are two questions:
+         * a person who wants Windows' own notifications and a person who wants
+         * a preview are not answering the same thing. */
+        static const char *DELIV[3] = { "Windows", "OpenChime", "Off" };
+        y = pref_row(rt, body, y, PREF_ROW_DELIVER, "Show notifications with",
+                     "Windows' notification centre, or OpenChime's own window.",
+                     DELIV, 3, g_pref_deliver);
         static const char *NOTIF[3] = { "Off", "Count", "Preview" };
         y = pref_row(rt, body, y, PREF_ROW_NOTIFY, "Desktop notifications",
                      "When OpenChime is not in front, and outside Do Not Disturb.",
                      NOTIF, 3, g_pref_notify);
+        static const char *MUTEV[2] = { "On", "Muted" };
+        y = pref_row(rt, body, y, PREF_ROW_SNDMUTE, "Notification sound",
+                     "Muting keeps your per-event choices; it just stops playing them.",
+                     MUTEV, 2, g_snd_muted);
         static const char *FLASHV[3] = { "Never", "When idle", "Always" };
         y = pref_row(rt, body, y, PREF_ROW_FLASH, "Flash the taskbar",
                      "For a mention, a keyword, a priority person or a DM.",
@@ -7206,6 +7358,294 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
         g_n_pal_rows++;
         y += rowh;
     }
+}
+
+/* ---- openchime:// and one instance (REQ-138, ARCH-96) --------------------
+ *
+ * Clicking a Windows toast opens its `launch` URL, and the app already speaks
+ * openchime:// permalinks -- so the notification's click needs no COM activator,
+ * no registered CLSID and no LocalServer32. It reuses the thing that already
+ * exists. `activationType="protocol"` is the whole mechanism.
+ *
+ * That leaves ONE new requirement: a click must reach the RUNNING client rather
+ * than starting a second one. A named mutex answers "am I first", and the
+ * second process hands its URL to the first through WM_COPYDATA and exits.
+ * Worth having on its own account -- two clients on one machine fighting over
+ * the same session was always possible and never intended. */
+#define OC_URL_SCHEME "openchime"
+#define OC_COPYDATA_URL 0x4F43     /* 'OC' — the payload is a UTF-8 URL */
+
+/* Register the scheme for THIS USER. Under HKCU rather than HKCR because it
+ * needs no elevation and follows the person rather than the machine; the
+ * installer writes the same keys so a fresh install works before first run. */
+static void url_scheme_register(void) {
+    WCHAR exe[MAX_PATH];
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return;
+    WCHAR cmd[MAX_PATH + 16];
+    _snwprintf(cmd, MAX_PATH + 16, L"\"%s\" \"%%1\"", exe);
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER,
+            L"Software\\Classes\\openchime", 0, NULL, 0, KEY_WRITE, NULL, &k, NULL)
+        != ERROR_SUCCESS) return;
+    RegSetValueExW(k, NULL, 0, REG_SZ, (const BYTE *)L"URL:OpenChime", 28);
+    RegSetValueExW(k, L"URL Protocol", 0, REG_SZ, (const BYTE *)L"", 2);
+    RegCloseKey(k);
+    if (RegCreateKeyExW(HKEY_CURRENT_USER,
+            L"Software\\Classes\\openchime\\shell\\open\\command",
+            0, NULL, 0, KEY_WRITE, NULL, &k, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(k, NULL, 0, REG_SZ, (const BYTE *)cmd,
+                       (DWORD)((wcslen(cmd) + 1) * sizeof(WCHAR)));
+        RegCloseKey(k);
+    }
+}
+
+/* Hand `url` to an already-running client. Returns 1 when one took it. */
+static int url_handoff(const char *url) {
+    HWND other = FindWindowW(L"OpenChimeWin", NULL);
+    if (!other) return 0;
+    COPYDATASTRUCT cds;
+    cds.dwData = OC_COPYDATA_URL;
+    cds.cbData = (DWORD)(strlen(url) + 1);
+    cds.lpData = (void *)url;
+    SendMessageW(other, WM_COPYDATA, 0, (LPARAM)&cds);
+    return 1;
+}
+
+/* ---- the notification window (REQ-138) -----------------------------------
+ *
+ * A SECOND WINDOW, and that is the whole point. `toast_push` above draws inside
+ * the shell and stays exactly as it is -- it is in-app feedback ("Forwarded to
+ * #x", a refused send), which only means anything while you are looking at the
+ * app. A NOTIFICATION is the opposite case by definition: it exists for when
+ * you are not. Since closing the window now hides it, the shell's resting state
+ * is invisible, so a notification drawn inside it reaches nobody.
+ *
+ * Borderless, topmost, and NOACTIVATE -- it must never steal focus from what you
+ * are typing into. TOOLWINDOW keeps it out of the taskbar and out of Alt+Tab.
+ *
+ * It draws through the same oc_gfx primitives and the same sdltext as the shell
+ * (ARCH-80), on its own SDL renderer and its own raster cache -- see
+ * TXT_TARGET_TOAST at cap_blit. Implemented HERE rather than in its own
+ * translation unit because it needs the fonts, the colour tokens and the draw
+ * helpers, every one of which is static to this file; exporting them to buy a
+ * separate .c would be a larger change than the window itself.
+ */
+#define NTOAST_MAX   3
+#define NTOAST_MS    8000            /* longer than the in-app toast: this one is read cold */
+#define NTOAST_W     360.0f
+#define NTOAST_H     92.0f
+#define NTOAST_PAD   12.0f
+
+static HWND          g_nt_hwnd;
+static SDL_Window   *g_nt_win;
+static SDL_Renderer *g_nt_ren;
+static gfx          *g_nt_gfx;
+static struct {
+    char      title[128], body[256];
+    uint64_t  ws_slot, channel_id;
+    ULONGLONG born;
+} g_nt[NTOAST_MAX];
+static int  g_n_nt;
+static int  g_nt_hover = -1;         /* hovering holds it open */
+static int  g_nt_shown;              /* observable by the harness; see test_dump */
+
+static void nt_layout(void);
+static void nt_paint(void);
+static void ws_save_active(void);   /* fwd — a notification may name another workspace */
+static void ws_load(int slot);      /* fwd */
+
+/* Open what a notification is about: restore the shell, switch workspace if the
+ * message was not in the visible one, select the conversation. The same three
+ * steps a permalink takes, and the same ones the tray balloon's click will. */
+static void nt_activate(int i) {
+    if (i < 0 || i >= g_n_nt) return;
+    uint64_t ws = g_nt[i].ws_slot, cid = g_nt[i].channel_id;
+    g_n_nt = 0;
+    if (g_nt_hwnd) ShowWindow(g_nt_hwnd, SW_HIDE);
+    g_nt_shown = 0;
+    if (g_main_hwnd) {
+        show_and_focus(g_main_hwnd);
+        if ((int)ws != g_ws_active && (int)ws < g_n_wss) { ws_save_active(); ws_load((int)ws); }
+        if (cid) { g_view = VIEW_HOME; close_overlays(); select_channel(cid); }
+        InvalidateRect(g_main_hwnd, NULL, FALSE);
+    }
+}
+
+static LRESULT CALLBACK nt_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_LBUTTONUP: {
+        int y = GET_Y_LPARAM(l);
+        int idx = (int)((float)y / (NTOAST_H + 8.0f));
+        nt_activate(idx);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        int y = GET_Y_LPARAM(l);
+        g_nt_hover = (int)((float)y / (NTOAST_H + 8.0f));
+        TRACKMOUSEEVENT tme = { sizeof tme, TME_LEAVE, h, 0 };
+        TrackMouseEvent(&tme);
+        return 0;
+    }
+    case WM_MOUSELEAVE: g_nt_hover = -1; return 0;
+    /* Repaint on demand. Painting only when a notification is pushed was not
+     * enough: the window is resized to fit the stack immediately afterwards, so
+     * the first render went to the old surface and what stayed on screen was an
+     * unpainted window. */
+    case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(h, &ps); nt_paint(); EndPaint(h, &ps); return 0; }
+    case WM_ERASEBKGND: return 1;   /* we draw every pixel; erasing only flickers */
+    /* Never take the foreground: answering WM_MOUSEACTIVATE this way is what
+     * keeps a notification from stealing the caret out of another app. */
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static int nt_create(void) {
+    if (g_nt_hwnd) return 1;
+    static int registered;
+    HINSTANCE inst = GetModuleHandleW(NULL);
+    if (!registered) {
+        WNDCLASSEXW wc; ZeroMemory(&wc, sizeof wc);
+        wc.cbSize = sizeof wc; wc.lpfnWndProc = nt_proc; wc.hInstance = inst;
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.lpszClassName = L"OpenChimeNotify";
+        if (!RegisterClassExW(&wc)) return 0;
+        registered = 1;
+    }
+    /* Created at the size it will actually be, BEFORE SDL wraps it. SDL takes
+     * the backbuffer from the HWND at wrap time and resizing a foreign window
+     * afterwards does not grow it -- which showed as a correctly positioned
+     * window that painted its clear colour and a 10px corner of the first thing
+     * drawn into it. The stack only ever grows downward from one row, so the
+     * full height is knowable here. */
+    {
+        float sc0 = (float)g_dpi / 96.0f;
+        int w0 = (int)(NTOAST_W * sc0);
+        int h0 = (int)((NTOAST_H + 8.0f) * sc0) * NTOAST_MAX;
+        g_nt_hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                                    L"OpenChimeNotify", L"", WS_POPUP,
+                                    0, 0, w0, h0, NULL, NULL, inst, NULL);
+    }
+    if (!g_nt_hwnd) return 0;
+    SDL_PropertiesID props = SDL_CreateProperties();
+    SDL_SetPointerProperty(props, SDL_PROP_WINDOW_CREATE_WIN32_HWND_POINTER, g_nt_hwnd);
+    g_nt_win = SDL_CreateWindowWithProperties(props);
+    SDL_DestroyProperties(props);
+    if (!g_nt_win) return 0;
+    g_nt_ren = SDL_CreateRenderer(g_nt_win, NULL);
+    if (!g_nt_ren) return 0;
+    g_nt_gfx = gfx_create(g_nt_ren);
+    if (!g_nt_gfx) return 0;
+    g_gfx_for[TXT_TARGET_TOAST] = g_nt_gfx;
+    g_gfx_for[TXT_TARGET_MAIN]  = g_gfx;
+    return 1;
+}
+
+/* Bottom-right of the WORK AREA, not the screen: over the taskbar is where a
+ * notification is least readable and most in the way. */
+static void nt_layout(void) {
+    if (!g_nt_hwnd) return;
+    RECT wa; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    float sc = (float)g_dpi / 96.0f;
+    int w = (int)(NTOAST_W * sc);
+    int h = (int)((NTOAST_H + 8.0f) * sc) * (g_n_nt ? g_n_nt : 1);
+    /* MOVED, never resized: the window is created at its full height and the
+     * unused rows below the stack simply are not drawn, so SDL's backbuffer and
+     * the window agree for the whole session. */
+    SetWindowPos(g_nt_hwnd, HWND_TOPMOST,
+                 wa.right - w - (int)(16 * sc), wa.bottom - h - (int)(16 * sc),
+                 0, 0, SWP_NOACTIVATE | SWP_NOSIZE);
+    /* SDL took the window's size when it wrapped the HWND -- which was the 10x10
+     * the window was created at, because it cannot be positioned until we know
+     * how many notifications it holds. Without this the renderer keeps clipping
+     * to 10x10 and the window paints a corner of the accent bar and nothing
+     * else, which is exactly what it did. */
+}
+
+static void nt_paint(void) {
+    if (!g_nt_gfx || !g_n_nt) return;
+    int prev = g_txt_target;
+    g_txt_target = TXT_TARGET_TOAST;
+    gfx_set_scale(g_nt_gfx, (float)g_dpi / 96.0f);
+    gfx_begin(g_nt_gfx, OC_COL_INPUT);
+    /* The window is full height; only the rows in use are painted, and the
+     * region below them is cut away so an empty row is not a white slab. */
+    {
+        float sc = (float)g_dpi / 96.0f;
+        HRGN rgn = CreateRectRgn(0, 0, (int)(NTOAST_W * sc),
+                                 (int)((NTOAST_H + 8.0f) * sc) * g_n_nt);
+        SetWindowRgn(g_nt_hwnd, rgn, FALSE);   /* the window owns the region now */
+    }
+    for (int i = 0; i < g_n_nt; i++) {
+        float top = i * (NTOAST_H + 8.0f);
+        rectf r = rf(0, top, NTOAST_W, top + NTOAST_H);
+        fill(g_nt_gfx, r, g_nt_hover == i ? OC_COL_HOVER : OC_COL_INPUT);
+        stroke_round(g_nt_gfx, r, 2.0f, OC_COL_BORDER, 1.0f);
+        fill(g_nt_gfx, rf(r.left, r.top, r.left + 4, r.bottom), OC_COL_ACCENT);
+        /* The APP'S MARK, not its name. Windows already labels its own toasts
+         * with the application, and spending the title line on "OpenChime" tells
+         * you the one thing you can see from the icon -- so the title is the
+         * conversation and the body is who said what. */
+        float ic = 28.0f, ix = r.left + NTOAST_PAD + 2, iy = r.top + (NTOAST_H - ic) / 2;
+        fill_round(g_nt_gfx, rf(ix, iy, ix + ic, iy + ic), 6.0f, OC_COL_ACCENT);
+        draw_lucide(g_nt_gfx, OC_ICON_DMS,
+                    rf(ix + 6, iy + 6, ix + ic - 6, iy + ic - 6), 0xFFFFFF);
+        float tx = ix + ic + 10;
+        draw_text(g_nt_gfx, g_nt[i].title, g_ui_b,
+                  rf(tx, r.top + 12, r.right - NTOAST_PAD, r.top + 34), OC_COL_TEXT);
+        draw_text(g_nt_gfx, g_nt[i].body, g_meta,
+                  rf(tx, r.top + 34, r.right - NTOAST_PAD, r.bottom - 10), OC_COL_MUTED);
+    }
+    gfx_end(g_nt_gfx);
+    g_txt_target = prev;
+}
+
+/* Push one. Newest at the bottom, oldest falls off the top, and a second
+ * message in the SAME conversation replaces rather than stacks -- the same rule
+ * the OS backend gets from tag/group, so the two backends behave alike. */
+static void own_toast_show(const char *title, const char *body,
+                           uint64_t ws_slot, uint64_t channel_id) {
+    if (!nt_create()) return;
+    for (int i = 0; i < g_n_nt; i++)
+        if (g_nt[i].channel_id == channel_id && g_nt[i].ws_slot == ws_slot) {
+            snprintf(g_nt[i].title, sizeof g_nt[i].title, "%s", title ? title : "");
+            snprintf(g_nt[i].body,  sizeof g_nt[i].body,  "%s", body ? body : "");
+            g_nt[i].born = GetTickCount64();
+            nt_layout(); nt_paint();
+            return;
+        }
+    if (g_n_nt == NTOAST_MAX) {
+        for (int k = 0; k < NTOAST_MAX - 1; k++) g_nt[k] = g_nt[k + 1];
+        g_n_nt--;
+    }
+    snprintf(g_nt[g_n_nt].title, sizeof g_nt[g_n_nt].title, "%s", title ? title : "");
+    snprintf(g_nt[g_n_nt].body,  sizeof g_nt[g_n_nt].body,  "%s", body ? body : "");
+    g_nt[g_n_nt].ws_slot = ws_slot;
+    g_nt[g_n_nt].channel_id = channel_id;
+    g_nt[g_n_nt].born = GetTickCount64();
+    g_n_nt++;
+    nt_layout();
+    ShowWindow(g_nt_hwnd, SW_SHOWNOACTIVATE);
+    g_nt_shown = 1;
+    nt_paint();
+}
+
+/* Expire on the shell's tick. Hovering holds a notification open, because the
+ * one you are reading is the one about to vanish. */
+static void nt_tick(void) {
+    if (!g_n_nt) return;
+    nt_paint();                    /* cheap: three rects and two strings */
+    ULONGLONG now = GetTickCount64();
+    int changed = 0;
+    for (int i = g_n_nt - 1; i >= 0; i--) {
+        if (i == g_nt_hover) continue;
+        if (now - g_nt[i].born < NTOAST_MS) continue;
+        for (int k = i; k < g_n_nt - 1; k++) g_nt[k] = g_nt[k + 1];
+        g_n_nt--; changed = 1;
+    }
+    if (!changed) return;
+    if (g_n_nt == 0) { if (g_nt_hwnd) ShowWindow(g_nt_hwnd, SW_HIDE); g_nt_shown = 0; }
+    else { nt_layout(); nt_paint(); }
 }
 
 static void draw_toasts(gfx *rt, float W, float H) {
@@ -14530,7 +14970,13 @@ static int permalink_parse(const char *text, char *host, size_t hostcap,
     p += 3;
     char *end = NULL;
     *chan = strtoull(p, &end, 10);
-    if (!end || end == p || strncmp(end, "/m/", 3) != 0) return 0;
+    if (!end || end == p) return 0;
+    /* A CHANNEL-ONLY link is legal: "/c/7" means open the conversation, with no
+     * message to jump to. A notification points at one of these -- it is about a
+     * conversation having something new, not about a particular line -- and
+     * without this form it would need a second, parallel way of saying where to
+     * go. */
+    if (strncmp(end, "/m/", 3) != 0) { *msg = 0; return *chan ? 1 : 0; }
     p = end + 3;
     *msg = strtoull(p, &end, 10);
     return (*chan && *msg) ? 1 : 0;
@@ -14601,8 +15047,12 @@ static int permalink_follow(HWND hwnd, const char *text) {
     /* The same arming the Activity and Files rows use: if the message is outside
      * the loaded window the tick fetches around it (ARCH-96) and the flash lands
      * when it arrives. */
-    g_jump_mid = mid;
-    g_jump_deadline = GetTickCount64() + 4000;
+    /* Zero means the link named a conversation and not a line in it, so there
+     * is nothing to arm and nothing to flash. */
+    if (mid) {
+        g_jump_mid = mid;
+        g_jump_deadline = GetTickCount64() + 4000;
+    }
     select_tab(TAB_MESSAGES);
     layout_composer(hwnd);
     InvalidateRect(hwnd, NULL, FALSE);
@@ -15064,6 +15514,8 @@ static int on_click(HWND hwnd, int x, int y) {
                 break;
             case PREF_ROW_NOTIFY:  g_pref_notify = v; break;
             case PREF_ROW_FLASH:   g_pref_flash = v; break;
+            case PREF_ROW_DELIVER: g_pref_deliver = v; break;
+            case PREF_ROW_SNDMUTE: g_snd_muted = v; break;
             /* Appearance applies LIVE while the sheet is open — a colour, a text
              * size and a density are their own preview and cannot be judged from a
              * label — and reverts with everything else on Cancel. */
@@ -17002,8 +17454,9 @@ static void prefs_save(void) {
      * build, which stops at `q:`, still reads everything it understands. */
     {
         size_t at = strlen(enc);
-        snprintf(enc + at, sizeof enc - at, ";k:%d;f:%d;c:%d",
-                 g_skin_tone, g_pref_flash, g_close_to_tray_told);
+        snprintf(enc + at, sizeof enc - at, ";k:%d;f:%d;c:%d;v:%d;u:%d",
+                 g_skin_tone, g_pref_flash, g_close_to_tray_told,
+                 g_pref_deliver, g_snd_muted);
     }
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
 }
@@ -17037,6 +17490,10 @@ static void prefs_load(const oc_model *m) {
             /* Told once per ACCOUNT, not per machine: the surprise is learning
              * what closing does, and you only learn it once. */
             else if (k == 'c') g_close_to_tray_told = val ? 1 : 0;
+            /* WHERE notifications appear (REQ-138), distinct from how much they
+             * say -- which is `n:` above. */
+            else if (k == 'v') g_pref_deliver = (val < 0 || val > 2) ? DELIVER_OS : val;
+            else if (k == 'u') g_snd_muted = val ? 1 : 0;
             else if (k == 'q') {
                 size_t n2 = 0;
                 for (const char *q = p + 2; *q && *q != ';' && n2 + 1 < sizeof g_quick_names; q++)
@@ -17767,7 +18224,6 @@ static void test_ack(const char *msg) {
 
 /* The main window, for the dump's own use: the harness needs to ask about THIS
  * window rather than about whatever happens to be active. */
-static HWND g_main_hwnd;
 static HWND test_main_window(void) { return g_main_hwnd; }
 
 static void test_dump(const char *path) {
@@ -18349,6 +18805,11 @@ static void test_dump(const char *path) {
             (unsigned long long)g_sel_f_mid, g_sel_f_pos);
     fprintf(f, "tray_live=%d notify_pref=%d toasts_raised=%d dnd=%d\n",
             g_tray_live, g_pref_notify, g_toasts_raised, dnd_active(m));
+    /* WHICH backend carried the last one, not which was asked for: the chain
+     * falls back, and a test that cannot tell them apart is not testing it. */
+    fprintf(f, "notify deliver=%d by=%d wintoast=%d aumid=\"%s\" ntwin=%d ntn=%d muted=%d\n",
+            g_pref_deliver, g_delivered_by, g_wintoast_ok, g_aumid,
+            g_nt_shown, g_n_nt, g_snd_muted);
     fprintf(f, "hidden=%d visible=%d told=%d connected=%d\n",
             g_hidden_to_tray,
             g_main_hwnd ? (IsWindowVisible(g_main_hwnd) ? 1 : 0) : 0,
@@ -18703,7 +19164,19 @@ static void test_poll(HWND hwnd) {
                                      layout_composer(hwnd); test_ack("ok"); }
         else test_ack("err");
     } else if (!strcmp(verb, "toast")) {
-        notify_toast("OpenChime", arg[0] ? arg : "test notification"); test_ack("ok");
+        /* Through the real chain, so the harness exercises what a message does
+         * -- including which backend actually carried it. */
+        /* Same SHAPE a real message uses -- conversation on top, "who: what"
+         * below -- so what the harness renders is what a user sees. */
+        notify_deliver("#general", arg[0] ? arg : "bob: test notification", 0, 0, NULL);
+        test_ack("ok");
+    } else if (!strcmp(verb, "deliver")) {
+        /* deliver 0|1|2 -- Windows / OpenChime's own / off. Drivable because the
+         * three backends are the thing under test and a preference the harness
+         * cannot set is a backend the harness cannot reach. */
+        int v = atoi(arg);
+        if (v >= 0 && v <= 2) { g_pref_deliver = v; prefs_save(); test_ack("ok"); }
+        else test_ack("err");
     } else if (!strcmp(verb, "notify")) {
         modal_enter(hwnd, &g_notify_open);
         oc_client_list_notify_prefs(g_client); test_ack("ok");
@@ -19139,7 +19612,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DragAcceptFiles(hwnd, TRUE);              /* drop files anywhere to upload */
         g_dpi = dpi_for_window(hwnd);
         SetTimer(hwnd, TIMER_TICK, 30, NULL);
-        tray_init(hwnd);   /* the notification surface */
+        tray_init(hwnd);   /* the fallback notification surface */
+        /* Identity for the real Windows notification (REQ-138). The same string
+         * the installer puts on the Start-menu shortcut: Windows resolves a
+         * toast's identity through that shortcut, and a mismatch is the failure
+         * that looks like nothing happening. Tried ONCE, here, so the delivery
+         * chain knows for the whole session which backend it has rather than
+         * discovering it per notification. */
+        snprintf(g_aumid, sizeof g_aumid, "%s", OC_AUMID);
+        {
+            HRESULT (WINAPI *setid)(PCWSTR) = NULL;
+            HMODULE sh = LoadLibraryW(L"shell32.dll");
+            if (sh) setid = (HRESULT (WINAPI *)(PCWSTR))(void *)
+                            GetProcAddress(sh, "SetCurrentProcessExplicitAppUserModelID");
+            if (setid) { WCHAR w[128]; to_w(g_aumid, w, 128); setid(w); }
+        }
+        g_wintoast_ok = oc_wintoast_init(g_aumid);
+        /* So a toast's click has somewhere to land. Written on every start
+         * rather than at install time only: a developer build, a portable copy
+         * and an upgraded path all need it to point at THIS exe. */
+        url_scheme_register();
         return 0;
     case WM_DROPFILES: {
         HDROP drop = (HDROP)wp;
@@ -19185,6 +19677,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (wp == TIMER_TICK && g_client) {
             oc_client_tick(g_client);
+            nt_tick();               /* the notification window expires on this tick too */
+            /* A URL this process was launched for, followed once there is
+             * something to follow it into: selecting a channel before the model
+             * knows any is a no-op that looks like the link failing. */
+            const oc_model *pm = model();
+            if (g_pending_url[0] && pm && pm->authed && pm->n_channels) {
+                char u[512]; snprintf(u, sizeof u, "%s", g_pending_url);
+                g_pending_url[0] = '\0';
+                permalink_follow(hwnd, u);
+            }
             files_view_sync();
             /* The debounced draft write. On this tick rather than a
              * timer of its own: there is already one heartbeat driving the
@@ -19470,7 +19972,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             snprintf(body, sizeof body, "%d new message%s",
                                      c->unread, c->unread == 1 ? "" : "s");
                         }
-                        notify_toast(title, body);
+                        notify_deliver(title, body, (uint64_t)wi, c->channel_id,
+                                       sound_for_event(mentioned || kw_hit || vip,
+                                                       c->kind == OC_CHANNEL_KIND_DM));
                     }
                     /* The flash is for a message that names you — a mention, a
                      * keyword hit, a priority person, or a DM, which is
@@ -20408,7 +20912,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!g_close_to_tray_told) {
                 g_close_to_tray_told = 1;
                 prefs_save();
-                notify_toast("OpenChime is still running",
+                notify_balloon("OpenChime is still running",
                              "Messages will keep arriving. Open it from the "
                              "notification area, or quit with Ctrl+Q.");
             }
@@ -20441,6 +20945,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         return DefWindowProcW(hwnd, msg, wp, lp);   /* proceed with the close */
+    case WM_COPYDATA: {
+        /* Another launch of this app handing us a URL it was asked to open --
+         * a toast click, or a permalink from a browser. Following it here is
+         * what makes the second process unnecessary. */
+        const COPYDATASTRUCT *cds = (const COPYDATASTRUCT *)lp;
+        if (cds && cds->dwData == OC_COPYDATA_URL && cds->lpData) {
+            char url[512];
+            snprintf(url, sizeof url, "%.*s", (int)cds->cbData, (const char *)cds->lpData);
+            show_and_focus(hwnd);
+            permalink_follow(hwnd, url);
+        }
+        return 1;
+    }
     case WM_APP_TRAY:
         /* The tray icon is a control now. Left click shows the window; right
          * click shows it AND opens the app's own menu inside it.
@@ -20454,6 +20971,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * kind. */
         if (LOWORD(lp) == WM_LBUTTONUP || LOWORD(lp) == WM_LBUTTONDBLCLK) {
             show_and_focus(hwnd);
+        } else if (LOWORD(lp) == NIN_BALLOONUSERCLICK) {
+            /* Clicking the BALLOON opens what it was about. The tray icon has
+             * had a callback since the close-to-tray work; this is the record of
+             * which conversation raised the last one, without which there is
+             * nothing to select. */
+            show_and_focus(hwnd);
+            if (g_last_notify_cid) {
+                if ((int)g_last_notify_ws != g_ws_active && (int)g_last_notify_ws < g_n_wss)
+                    { ws_save_active(); ws_load((int)g_last_notify_ws); }
+                g_view = VIEW_HOME; close_overlays(); select_channel(g_last_notify_cid);
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
         } else if (LOWORD(lp) == WM_RBUTTONUP) {
             show_and_focus(hwnd);
             tray_menu_open();
@@ -20536,6 +21065,20 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     static char pre_ws[256], pre_user[128];
     int direct = 0;
     int argc = 0; LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    /* A URL on the command line -- a toast click, or a permalink from a browser
+     * -- belongs to the client that is ALREADY RUNNING. Hand it over and stop;
+     * a second client would fight the first over the same session, and the
+     * notification would open a conversation in a window nobody was looking at. */
+    if (argv && argc >= 2) {
+        char maybe_url[512];
+        WideCharToMultiByte(CP_UTF8, 0, argv[1], -1, maybe_url, sizeof maybe_url, NULL, NULL);
+        if (strncmp(maybe_url, OC_URL_SCHEME "://", sizeof OC_URL_SCHEME + 1) == 0) {
+            if (url_handoff(maybe_url)) { LocalFree(argv); return 0; }
+            /* Nobody running: fall through and start normally, then follow it
+             * once there is a session to follow it into. */
+            snprintf(g_pending_url, sizeof g_pending_url, "%s", maybe_url);
+        }
+    }
     if (argv && argc >= 3) {
         WideCharToMultiByte(CP_UTF8, 0, argv[1], -1, aws, sizeof aws, NULL, NULL);
         WideCharToMultiByte(CP_UTF8, 0, argv[2], -1, acred, sizeof acred, NULL, NULL);
