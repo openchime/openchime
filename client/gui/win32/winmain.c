@@ -10817,26 +10817,58 @@ static void draw_drafts(gfx *rt, const oc_model *m, rectf reg) {
     /* The tab bar, drawn like the channel tabs so the two read as the same
      * control doing the same job in a different pane. */
     {
+        /* MEASURE FIRST, then lay out. The strip used to advance by each label's
+         * width with no bound, no wrap and no scroller: past a certain
+         * accumulated width the last tab's rectangle lay beyond the pane, where
+         * it was neither drawn nor clickable — which is how the Sent list, and
+         * the `from:me` search behind it, became unreachable at large text size.
+         *
+         * PADDING is what gives, because squeezing the gaps keeps every label
+         * legible and that matters more than the space between them. Below a
+         * floor the tabs are clamped to the pane instead: a label may then be
+         * clipped, but a tab's rect — and therefore its hit box and its
+         * accessibility item — is never laid out off-window, which is the part
+         * that made the tab unreachable rather than merely ugly. */
         static const char *NAMES[DTAB_COUNT] = { "Drafts", "Scheduled", "Sent" };
-        float tx = body.left + 24, ty = body.top;
+        char labels[DTAB_COUNT][48];
+        float lw[DTAB_COUNT], total = 0;
         for (int i = 0; i < DTAB_COUNT; i++) {
-            char label[48];
             if (i == DTAB_DRAFTS && m->n_drafts)
-                snprintf(label, sizeof label, "%s %zu", NAMES[i], m->n_drafts);
+                snprintf(labels[i], sizeof labels[i], "%s %zu", NAMES[i], m->n_drafts);
             else if (i == DTAB_SCHEDULED && m->n_scheds)
-                snprintf(label, sizeof label, "%s %zu", NAMES[i], m->n_scheds);
-            else snprintf(label, sizeof label, "%s", NAMES[i]);
-            float w = text_width(label, g_ui_b) + 28;
-            rectf t = rf(tx, ty, tx + w, ty + UIS(34));
-            draw_text(rt, label, g_dtab == i ? g_ui_b : g_ui,
-                      rf(t.left + 14, t.top + 7, t.right, t.bottom),
-                      g_dtab == i ? OC_COL_TEXT : OC_COL_MUTED);
-            if (g_dtab == i) fill(rt, rf(t.left + 10, t.bottom - 2, t.right - 4, t.bottom),
-                                  OC_COL_ACCENT);
-            g_dtab_hit[i] = t;
-            tx += w;
+                snprintf(labels[i], sizeof labels[i], "%s %zu", NAMES[i], m->n_scheds);
+            else snprintf(labels[i], sizeof labels[i], "%s", NAMES[i]);
+            lw[i] = text_width(labels[i], g_ui_b);
+            total += lw[i];
         }
-        fill(rt, rf(body.left, ty + 34, body.right, ty + 35), OC_COL_BORDER);
+        float tx = body.left + UIS(24), ty = body.top;
+        float avail = body.right - tx;
+        /* Every one of these used to be a raw constant while the boxes scaled,
+         * so the strip crowded its own labels as the text grew. */
+        float pad = UIS(28), pad_min = UIS(10);
+        if (total + DTAB_COUNT * pad > avail) {
+            pad = (avail - total) / (float)DTAB_COUNT;
+            if (pad < pad_min) pad = pad_min;
+        }
+        for (int i = 0; i < DTAB_COUNT; i++) {
+            float right = tx + lw[i] + pad;
+            if (right > body.right) right = body.right;
+            if (tx > body.right) tx = body.right;      /* nothing starts off-pane */
+            rectf t = rf(tx, ty, right, ty + UIS(34));
+            draw_text(rt, labels[i], g_dtab == i ? g_ui_b : g_ui,
+                      rf(t.left + pad * 0.5f, t.top + UIS(7), t.right, t.bottom),
+                      g_dtab == i ? OC_COL_TEXT : OC_COL_MUTED);
+            if (g_dtab == i) {
+                float ul = t.left + pad * 0.5f - UIS(4), ur = t.right - UIS(4);
+                if (ur > ul) fill(rt, rf(ul, t.bottom - UIS(2), ur, t.bottom), OC_COL_ACCENT);
+            }
+            g_dtab_hit[i] = t;
+            tx = t.right;
+        }
+        /* Under the strip, not through it: this was a raw 34/35 while the tab
+         * boxes were UIS(34), so at any scale above 1 the rule was drawn across
+         * the labels. */
+        fill(rt, rf(body.left, ty + UIS(34), body.right, ty + UIS(34) + 1), OC_COL_BORDER);
         body.top = ty + UIS(44);
     }
 
@@ -17979,6 +18011,21 @@ static void test_dump(const char *path) {
             if (a->r <= 0 || a->b <= 0 || a->l >= rcw.right || a->t >= rcw.bottom) {
                 outside++;
                 if (!first_out[0]) snprintf(first_out, sizeof first_out, "%s", a->aid);
+            /* HORIZONTALLY, straddling is a defect too, and the leniency above
+             * does not apply: nothing here scrolls sideways, so a rect running
+             * past the right edge is not "below the fold", it is chrome laid out
+             * where it cannot be reached.
+             *
+             * The drafts tab strip is why this is here. It ran 26 DIP past the
+             * pane at large text size — the Sent tab neither drawn nor clickable
+             * — and reported outside=0 for the whole time, because its LEFT edge
+             * was still on screen. A check with an exemption shaped like the bug
+             * is not a check; that lesson is already recorded two paragraphs
+             * below about the overlap test, and this is the same mistake on the
+             * other axis. */
+            } else if (a->r > rcw.right) {
+                outside++;
+                if (!first_out[0]) snprintf(first_out, sizeof first_out, "past-right:%s", a->aid);
             } else if (md && !strncmp(a->aid, "modal.", 6) &&
                        (a->r <= ml || a->b <= mt || a->l >= mr || a->t >= mb)) {
                 /* Only the MODAL's own elements are required inside the card. The
