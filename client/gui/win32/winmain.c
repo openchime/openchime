@@ -1073,7 +1073,7 @@ static void toast_action_cb(const char *arg, const char *reply) {
  *
  * `g_delivered_by` records which one actually carried it, because "asked for
  * OS" and "got OS" are different facts and the test needs the second. */
-static void notify_deliver(const char *title, const char *body,
+static void notify_deliver(const char *title, const char *body, const char *source,
                            uint64_t ws_slot, uint64_t channel_id, int snd) {
     /* `snd` is an SNDV_* index: WHICH system sound this event asks for. Who
      * plays it depends on the backend and is decided below -- Windows for the
@@ -1108,24 +1108,43 @@ static void notify_deliver(const char *title, const char *body,
          * verb's notification names no channel and gets the plain shape. */
         int shown = 0;
         if (g_wintoast_ok && channel_id) {
-            char react_arg[160];
-            /* A GLYPH, and never NULL. REACT_EMO holds resolved glyphs, but
-             * quick_rebuild's fallback path can leave an entry NULL when a
-             * configured name is not in the catalogue -- and a name that does
-             * not resolve would also render as literal text in the chip the
-             * reaction creates. The thumb is spelled out so neither can
-             * happen. */
-            const char *emo = (g_n_quick > 0 && REACT_EMO[0]) ? REACT_EMO[0]
-                                                              : "\xF0\x9F\x91\x8D";
-            snprintf(react_arg, sizeof react_arg, "react|%llu|%llu|%s",
-                     (unsigned long long)ws_slot, (unsigned long long)channel_id, emo);
+            /* SEND, THEN THE QUICK REACTIONS -- the same ones the message menu
+             * offers, so the toast and the app cannot disagree about what your
+             * quick reactions are.
+             *
+             * Windows allows five buttons on a toast, counting context-menu
+             * items, and Send takes one. Three reactions is what fits the row
+             * without crowding it and leaves a slot spare. */
+            #define TOAST_REACTS 3
+            static char rargs[TOAST_REACTS][160];
             char send_arg[160];
+            const char *labels[1 + TOAST_REACTS];
+            const char *args[1 + TOAST_REACTS];
             snprintf(send_arg, sizeof send_arg, "reply|%llu|%llu|",
                      (unsigned long long)ws_slot, (unsigned long long)channel_id);
-            const char *labels[2] = { "Send", emo };
-            const char *args[2]   = { send_arg, react_arg };
-            shown = oc_wintoast_show_actions(title, body, tag, grp, arg,
-                                             SNDV[snd].winsound, "Reply", labels, args, 2);
+            labels[0] = "Send"; args[0] = send_arg;
+            int nb = 1;
+            for (int q = 0; q < g_n_quick && nb < 1 + TOAST_REACTS; q++) {
+                /* Never a NULL: quick_rebuild leaves an entry empty when a
+                 * configured name is not in the catalogue, and a name that does
+                 * not resolve would render as literal text in the chip the
+                 * reaction creates. */
+                if (!REACT_EMO[q]) continue;
+                snprintf(rargs[nb - 1], sizeof rargs[0], "react|%llu|%llu|%s",
+                         (unsigned long long)ws_slot, (unsigned long long)channel_id,
+                         REACT_EMO[q]);
+                labels[nb] = REACT_EMO[q];
+                args[nb]   = rargs[nb - 1];
+                nb++;
+            }
+            /* A thumb, spelled out, when the catalogue gave us nothing at all. */
+            if (nb == 1) {
+                snprintf(rargs[0], sizeof rargs[0], "react|%llu|%llu|\xF0\x9F\x91\x8D",
+                         (unsigned long long)ws_slot, (unsigned long long)channel_id);
+                labels[1] = "\xF0\x9F\x91\x8D"; args[1] = rargs[0]; nb = 2;
+            }
+            shown = oc_wintoast_show_actions(title, body, source, tag, grp, arg,
+                                             SNDV[snd].winsound, "Reply", labels, args, nb);
         }
         if (!shown && g_wintoast_ok)
             shown = oc_wintoast_show(title, body, tag, grp, arg, SNDV[snd].winsound);
@@ -7521,8 +7540,13 @@ static int url_handoff(const char *url) {
 #define NTOAST_MAX   3
 #define NTOAST_MS    8000            /* longer than the in-app toast: this one is read cold */
 #define NTOAST_W     360.0f
-#define NTOAST_H     92.0f
 #define NTOAST_PAD   12.0f
+#define NTOAST_VPAD  12.0f           /* vertical; see nt_measure */
+#define NTOAST_GAP   8.0f
+#define NTOAST_ICON  UIS(28.0f)
+/* The tallest a row can get, so the window can be created once and only moved.
+ * Not a layout constant -- the layout is measured -- just an upper bound. */
+#define NTOAST_HMAX  UIS(160.0f)
 
 static HWND          g_nt_hwnd;
 static SDL_Window   *g_nt_win;
@@ -7535,10 +7559,55 @@ static struct {
 } g_nt[NTOAST_MAX];
 static int  g_n_nt;
 static int  g_nt_hover = -1;         /* hovering holds it open */
+static int  g_nt_close_hover = -1;   /* the close box under the pointer, -1 none */
 static int  g_nt_shown;              /* observable by the harness; see test_dump */
 
 static void nt_layout(void);
 static void nt_paint(void);
+
+/* Where everything in one row goes. ONE function, because a notification laid
+ * out twice is a notification whose icon and text disagree — and because the
+ * offsets were fixed pixels against a fixed 92pt card, which left two lines of
+ * text floating in the top half with fifty points of dead air beneath and got
+ * worse at every larger text size. Now the row is as tall as its content. */
+typedef struct { float h, icon_x, icon_y, text_x, title_y, title_h, body_y, body_h,
+                 close_x, close_y, close_sz; } nt_geom;
+static nt_geom nt_measure(const char *title, const char *body) {
+    nt_geom g;
+    g.icon_x = NTOAST_PAD + 2;
+    g.text_x = g.icon_x + NTOAST_ICON + UIS(10.0f);
+    /* A CLOSE BOX, top-right. The OS backend gets one for free -- the shell owns
+     * a toast's attribution area and puts a close and a context menu there, and
+     * an app cannot draw into it. This window has no shell behind it, so it
+     * draws its own; without it the only way to be rid of a notification is to
+     * wait it out or open the conversation you were not ready to read. */
+    g.close_sz = UIS(16.0f);
+    g.close_x  = NTOAST_W - NTOAST_PAD - g.close_sz;
+    g.close_y  = UIS(8.0f);
+    /* The text stops short of it, or a long name runs under the cross. */
+    float tw = g.close_x - g.text_x - UIS(8.0f);
+    g.title_h = text_height(title && title[0] ? title : "x", g_ui_b, tw);
+    /* The body WRAPS, to two lines. A message is arbitrary text and clipping it
+     * at one line is how a notification shows you half a sentence. */
+    g.body_h  = text_height(body && body[0] ? body : "x", g_meta_w, tw);
+    float two = 2.0f * text_height("x", g_meta_w, tw);
+    if (g.body_h > two) g.body_h = two;
+    float content = g.title_h + g.body_h;
+    if (content < NTOAST_ICON) content = NTOAST_ICON;   /* never shorter than the mark */
+    /* A SMALL pad, because the line boxes already carry their own leading.
+     * At the full 12 the card read bottom-heavy: above the title you see the
+     * padding alone, but below the body you see the padding PLUS that line's
+     * trailing leading, so the same number top and bottom does not look the
+     * same. The text's own metrics supply most of the breathing room; this is
+     * what is left over. */
+    g.h = content + 2.0f * UIS(NTOAST_VPAD);
+    if (g.h > NTOAST_HMAX) g.h = NTOAST_HMAX;
+    /* Icon and text share one centre line, which is the whole fix. */
+    g.icon_y  = (g.h - NTOAST_ICON) / 2.0f;
+    g.title_y = (g.h - (g.title_h + g.body_h)) / 2.0f;
+    g.body_y  = g.title_y + g.title_h;
+    return g;
+}
 static void ws_save_active(void);   /* fwd — a notification may name another workspace */
 static void ws_load(int slot);      /* fwd */
 
@@ -7599,22 +7668,63 @@ static void toast_action_perform(char *p2) {
     }
 }
 
+/* Which row a click landed on. Walked rather than divided: the rows are no
+ * longer a uniform height, so `y / row_h` would pick the wrong one the moment
+ * a message wrapped -- and pick it silently, opening the wrong conversation. */
+static int nt_row_at(int y_px) {
+    float y = (float)y_px / ((float)g_dpi / 96.0f), top = 0;
+    for (int i = 0; i < g_n_nt; i++) {
+        float h = nt_measure(g_nt[i].title, g_nt[i].body).h;
+        if (y >= top && y < top + h) return i;
+        top += h + NTOAST_GAP;
+    }
+    return -1;
+}
+
+/* The close box under a point, or -1. Asked before the row's own click, because
+ * the cross sits inside the row and dismissing is not opening. */
+static int nt_close_at(int x_px, int y_px) {
+    float sc = (float)g_dpi / 96.0f;
+    float x = (float)x_px / sc, y = (float)y_px / sc, top = 0;
+    for (int i = 0; i < g_n_nt; i++) {
+        nt_geom g = nt_measure(g_nt[i].title, g_nt[i].body);
+        if (y >= top && y < top + g.h) {
+            if (x >= g.close_x && x <= g.close_x + g.close_sz &&
+                y >= top + g.close_y && y <= top + g.close_y + g.close_sz) return i;
+            return -1;
+        }
+        top += g.h + NTOAST_GAP;
+    }
+    return -1;
+}
+
+/* Dismiss ONE notification, leaving the rest. */
+static void nt_drop(int i) {
+    if (i < 0 || i >= g_n_nt) return;
+    for (int k = i; k < g_n_nt - 1; k++) g_nt[k] = g_nt[k + 1];
+    g_n_nt--;
+    g_nt_hover = g_nt_close_hover = -1;
+    if (!g_n_nt) { if (g_nt_hwnd) ShowWindow(g_nt_hwnd, SW_HIDE); g_nt_shown = 0; }
+    else { nt_layout(); nt_paint(); }
+}
+
 static LRESULT CALLBACK nt_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_LBUTTONUP: {
-        int y = GET_Y_LPARAM(l);
-        int idx = (int)((float)y / (NTOAST_H + 8.0f));
-        nt_activate(idx);
+        { int ci = nt_close_at(GET_X_LPARAM(l), GET_Y_LPARAM(l));
+          if (ci >= 0) { nt_drop(ci); return 0; } }
+        nt_activate(nt_row_at(GET_Y_LPARAM(l)));
         return 0;
     }
     case WM_MOUSEMOVE: {
-        int y = GET_Y_LPARAM(l);
-        g_nt_hover = (int)((float)y / (NTOAST_H + 8.0f));
+        g_nt_hover = nt_row_at(GET_Y_LPARAM(l));
+        g_nt_close_hover = nt_close_at(GET_X_LPARAM(l), GET_Y_LPARAM(l));
         TRACKMOUSEEVENT tme = { sizeof tme, TME_LEAVE, h, 0 };
         TrackMouseEvent(&tme);
+        nt_paint();                      /* the cross lights under the pointer */
         return 0;
     }
-    case WM_MOUSELEAVE: g_nt_hover = -1; return 0;
+    case WM_MOUSELEAVE: g_nt_hover = g_nt_close_hover = -1; nt_paint(); return 0;
     /* Repaint on demand. Painting only when a notification is pushed was not
      * enough: the window is resized to fit the stack immediately afterwards, so
      * the first render went to the old surface and what stayed on screen was an
@@ -7649,7 +7759,7 @@ static int nt_create(void) {
     {
         float sc0 = (float)g_dpi / 96.0f;
         int w0 = (int)(NTOAST_W * sc0);
-        int h0 = (int)((NTOAST_H + 8.0f) * sc0) * NTOAST_MAX;
+        int h0 = (int)((NTOAST_HMAX + NTOAST_GAP) * sc0) * NTOAST_MAX;
         g_nt_hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
                                     L"OpenChimeNotify", L"", WS_POPUP,
                                     0, 0, w0, h0, NULL, NULL, inst, NULL);
@@ -7669,20 +7779,58 @@ static int nt_create(void) {
     return 1;
 }
 
+/* How tall the stack actually is, measured — the rows differ, because each is
+ * as tall as what it says. */
+static float nt_stack_h(void) {
+    float t = 0;
+    for (int i = 0; i < g_n_nt; i++)
+        t += nt_measure(g_nt[i].title, g_nt[i].body).h + NTOAST_GAP;
+    return t > 0 ? t - NTOAST_GAP : 0;
+}
+
 /* Bottom-right of the WORK AREA, not the screen: over the taskbar is where a
  * notification is least readable and most in the way. */
 static void nt_layout(void) {
     if (!g_nt_hwnd) return;
-    RECT wa; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    /* THE WORK AREA OF THE MONITOR THIS WINDOW IS ON, not SPI_GETWORKAREA.
+     *
+     * SPI_GETWORKAREA answers for the primary monitor and its answer depends on
+     * the calling thread's DPI context, so it returned 1896 here and 1920 to
+     * the test dump moments later -- which put the card 24px off the right edge
+     * while every measurement insisted it was flush. MonitorFromWindow is the
+     * per-monitor question and the only one worth asking of a window that is
+     * placed relative to a screen corner. */
+    RECT wa;
+    {
+        HMONITOR mon = MonitorFromWindow(g_nt_hwnd, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFO mi; mi.cbSize = sizeof mi;
+        if (mon && GetMonitorInfoW(mon, &mi)) wa = mi.rcWork;
+        else SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    }
     float sc = (float)g_dpi / 96.0f;
-    int w = (int)(NTOAST_W * sc);
-    int h = (int)((NTOAST_H + 8.0f) * sc) * (g_n_nt ? g_n_nt : 1);
-    /* MOVED, never resized: the window is created at its full height and the
-     * unused rows below the stack simply are not drawn, so SDL's backbuffer and
-     * the window agree for the whole session. */
+    /* CEIL, not truncate. The card is drawn in DIPs and the window is sized in
+     * pixels, so 53 DIP at 1.5 is 79.5 -- and a window of 79 clips the half
+     * pixel the bottom border lives in. */
+    int w = (int)ceilf(NTOAST_W * sc);
+    int h = (int)ceilf(nt_stack_h() * sc);
+    if (h <= 0) h = (int)ceilf(NTOAST_HMAX * sc);
+    /* SIZED TO THE STACK, and this is what stops the window being a white slab
+     * reaching down to the taskbar.
+     *
+     * It is CREATED tall enough for the largest stack, because SDL takes its
+     * backbuffer when it wraps the HWND and never grows it -- but shrinking the
+     * WINDOW is fine: SDL keeps rendering into its full surface and the window
+     * simply reveals the top of it. Clipping with SetWindowRgn was the previous
+     * attempt and did not hold, which left the cleared background visible below
+     * the card for the whole height the window was created at. */
     SetWindowPos(g_nt_hwnd, HWND_TOPMOST,
-                 wa.right - w - (int)(16 * sc), wa.bottom - h - (int)(16 * sc),
-                 0, 0, SWP_NOACTIVATE | SWP_NOSIZE);
+                 /* THE CORNER OF THE WORK AREA, both axes, with nothing
+                  * subtracted. wa.right and wa.bottom already exclude the
+                  * taskbar; an inset on top of that is a second gap, and having
+                  * one on the right and not the bottom is why the card looked
+                  * wedged into one edge and floating off the other. */
+                 wa.right - w, wa.bottom - h,
+                 w, h, SWP_NOACTIVATE);
     /* SDL took the window's size when it wrapped the HWND -- which was the 10x10
      * the window was created at, because it cannot be positioned until we know
      * how many notifications it holds. Without this the renderer keeps clipping
@@ -7696,33 +7844,49 @@ static void nt_paint(void) {
     g_txt_target = TXT_TARGET_TOAST;
     gfx_set_scale(g_nt_gfx, (float)g_dpi / 96.0f);
     gfx_begin(g_nt_gfx, OC_COL_INPUT);
-    /* The window is full height; only the rows in use are painted, and the
-     * region below them is cut away so an empty row is not a white slab. */
-    {
-        float sc = (float)g_dpi / 96.0f;
-        HRGN rgn = CreateRectRgn(0, 0, (int)(NTOAST_W * sc),
-                                 (int)((NTOAST_H + 8.0f) * sc) * g_n_nt);
-        SetWindowRgn(g_nt_hwnd, rgn, FALSE);   /* the window owns the region now */
-    }
+    float top = 0;
     for (int i = 0; i < g_n_nt; i++) {
-        float top = i * (NTOAST_H + 8.0f);
-        rectf r = rf(0, top, NTOAST_W, top + NTOAST_H);
+        nt_geom g = nt_measure(g_nt[i].title, g_nt[i].body);
+        /* THE FILL BLEEDS TO THE EDGE; ONLY THE STROKE IS INSET.
+         *
+         * Insetting the whole card was the previous attempt, and it left a
+         * one-DIP margin of the window's clear colour outside the border --
+         * white on white, invisible against a light background and a visible
+         * sliver against the taskbar, which read as the card sitting too low.
+         *
+         * A stroke is centred on its path, so it needs half its width inside
+         * the surface and no more. Half of 1.0 is 0.5. */
+        rectf r = rf(0, top, NTOAST_W, top + g.h);
         fill(g_nt_gfx, r, g_nt_hover == i ? OC_COL_HOVER : OC_COL_INPUT);
-        stroke_round(g_nt_gfx, r, 2.0f, OC_COL_BORDER, 1.0f);
+        stroke_round(g_nt_gfx, rf(r.left + 0.5f, r.top + 0.5f,
+                                  r.right - 0.5f, r.bottom - 0.5f),
+                     2.0f, OC_COL_BORDER, 1.0f);
         fill(g_nt_gfx, rf(r.left, r.top, r.left + 4, r.bottom), OC_COL_ACCENT);
         /* The APP'S MARK, not its name. Windows already labels its own toasts
-         * with the application, and spending the title line on "OpenChime" tells
-         * you the one thing you can see from the icon -- so the title is the
-         * conversation and the body is who said what. */
-        float ic = 28.0f, ix = r.left + NTOAST_PAD + 2, iy = r.top + (NTOAST_H - ic) / 2;
-        fill_round(g_nt_gfx, rf(ix, iy, ix + ic, iy + ic), 6.0f, OC_COL_ACCENT);
+         * with the application, and spending a line on "OpenChime" says the one
+         * thing the icon already says. */
+        float ix = r.left + g.icon_x, iy = r.top + g.icon_y;
+        float pad = UIS(6.0f);
+        fill_round(g_nt_gfx, rf(ix, iy, ix + NTOAST_ICON, iy + NTOAST_ICON), 6.0f, OC_COL_ACCENT);
         draw_lucide(g_nt_gfx, OC_ICON_DMS,
-                    rf(ix + 6, iy + 6, ix + ic - 6, iy + ic - 6), 0xFFFFFF);
-        float tx = ix + ic + 10;
+                    rf(ix + pad, iy + pad, ix + NTOAST_ICON - pad, iy + NTOAST_ICON - pad),
+                    0xFFFFFF);
+        float tx = r.left + g.text_x, tr = r.right - NTOAST_PAD;
         draw_text(g_nt_gfx, g_nt[i].title, g_ui_b,
-                  rf(tx, r.top + 12, r.right - NTOAST_PAD, r.top + 34), OC_COL_TEXT);
-        draw_text(g_nt_gfx, g_nt[i].body, g_meta,
-                  rf(tx, r.top + 34, r.right - NTOAST_PAD, r.bottom - 10), OC_COL_MUTED);
+                  rf(tx, r.top + g.title_y, tr, r.top + g.title_y + g.title_h), OC_COL_TEXT);
+        draw_text(g_nt_gfx, g_nt[i].body, g_meta_w,
+                  rf(tx, r.top + g.body_y, tr, r.top + g.body_y + g.body_h), OC_COL_MUTED);
+        {
+            rectf cb = rf(r.left + g.close_x, r.top + g.close_y,
+                          r.left + g.close_x + g.close_sz, r.top + g.close_y + g.close_sz);
+            int on = (g_nt_close_hover == i);
+            if (on) fill_round(g_nt_gfx, cb, 3.0f, OC_COL_HOVER);
+            float k = g.close_sz * 0.3f;
+            uint32_t cc = on ? OC_COL_TEXT : OC_COL_MUTED;
+            gfx_line(g_nt_gfx, cb.left + k, cb.top + k, cb.right - k, cb.bottom - k, 1.4f, cc, 1.0f);
+            gfx_line(g_nt_gfx, cb.right - k, cb.top + k, cb.left + k, cb.bottom - k, 1.4f, cc, 1.0f);
+        }
+        top += g.h + NTOAST_GAP;
     }
     gfx_end(g_nt_gfx);
     g_txt_target = prev;
@@ -18935,6 +19099,19 @@ static void test_dump(const char *path) {
             g_tray_live, g_pref_notify, g_toasts_raised, dnd_active(m));
     /* WHICH backend carried the last one, not which was asked for: the chain
      * falls back, and a test that cannot tell them apart is not testing it. */
+    /* Where the notification window actually IS, reported by the app rather
+     * than probed from outside: two attempts to read it with a P/Invoke came
+     * back all zeroes, and a screenshot of a window that lives eight seconds
+     * catches an empty screen as often as not. */
+    if (g_nt_hwnd) {
+        RECT nr; GetWindowRect(g_nt_hwnd, &nr);
+        RECT wa; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+        fprintf(f, "ntrect l=%ld t=%ld r=%ld b=%ld  work r=%ld b=%ld  "
+                   "right_gap=%ld bottom_gap=%ld dpi=%d vis=%d\n",
+                nr.left, nr.top, nr.right, nr.bottom, wa.right, wa.bottom,
+                wa.right - nr.right, wa.bottom - nr.bottom,
+                g_dpi, IsWindowVisible(g_nt_hwnd) ? 1 : 0);
+    }
     fprintf(f, "notify deliver=%d by=%d wintoast=%d aumid=\"%s\" ntwin=%d ntn=%d muted=%d\n",
             g_pref_deliver, g_delivered_by, g_wintoast_ok, g_aumid,
             g_nt_shown, g_n_nt, g_snd_muted);
@@ -19296,7 +19473,7 @@ static void test_poll(HWND hwnd) {
          * -- including which backend actually carried it. */
         /* Same SHAPE a real message uses -- conversation on top, "who: what"
          * below -- so what the harness renders is what a user sees. */
-        notify_deliver("#general", arg[0] ? arg : "bob: test notification", 0, 0,
+        notify_deliver("bob", arg[0] ? arg : "test notification", "#general", 0, 0,
                        sound_choice_for(0, 0));
         test_ack("ok");
     } else if (!strcmp(verb, "toastaction")) {
@@ -20106,19 +20283,44 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         channel_label(wm, c, label, sizeof label);
                         /* Name the workspace when it is not the one on screen,
                          * or "#general" alone is ambiguous across several. */
-                        if (is_active) snprintf(title, sizeof title, "%s", label);
-                        else snprintf(title, sizeof title, "%s \u2014 %s",
-                                      oc_model_workspace_name(wm), label);
-                        if (g_pref_notify == NOTIFY_FULL && last && last->body) {
-                            const char *who = last->author_name[0] ? last->author_name
-                                            : oc_model_user_name(wm, last->author_id);
-                            snprintf(body, sizeof body, "%s: %s",
-                                     (who && who[0]) ? who : "someone", last->body);
-                        } else {
+                        /* WHO said it, WHAT they said, and WHERE — in that
+                         * order, which is the documented shape for a chat
+                         * notification and not the shape a sidebar row wants.
+                         * channel_label writes "@ alice", right in a list of
+                         * conversations and a typo in a toast.
+                         *
+                         * The person leads because that is what you recognise
+                         * first; the channel is attribution, which the shell
+                         * renders smaller and below, because it only matters
+                         * when the name and the message leave it ambiguous. A
+                         * direct message has no source at all — the person IS
+                         * the conversation, and naming them twice tells you
+                         * one thing in two places. */
+                        int one_to_one = (c->kind == OC_CHANNEL_KIND_DM && c->n_peers <= 2);
+                        const char *who = (last && last->author_name[0])
+                                        ? last->author_name
+                                        : (last ? oc_model_user_name(wm, last->author_id) : NULL);
+                        char source[128] = "";
+                        if (!one_to_one) snprintf(source, sizeof source, "%s", label);
+                        /* Several workspaces: say which, or "#general" is
+                         * ambiguous across them. */
+                        if (!is_active) {
+                            char wsn[96];
+                            snprintf(wsn, sizeof wsn, "%s", oc_model_workspace_name(wm));
+                            if (source[0]) {
+                                char both[128];
+                                snprintf(both, sizeof both, "%s \u2014 %s", wsn, source);
+                                snprintf(source, sizeof source, "%s", both);
+                            } else snprintf(source, sizeof source, "%s", wsn);
+                        }
+                        snprintf(title, sizeof title, "%s",
+                                 (who && who[0]) ? who : (one_to_one ? "Direct message" : label));
+                        if (g_pref_notify == NOTIFY_FULL && last && last->body)
+                            snprintf(body, sizeof body, "%s", last->body);
+                        else
                             snprintf(body, sizeof body, "%d new message%s",
                                      c->unread, c->unread == 1 ? "" : "s");
-                        }
-                        notify_deliver(title, body, (uint64_t)wi, c->channel_id,
+                        notify_deliver(title, body, source, (uint64_t)wi, c->channel_id,
                                        sound_choice_for(mentioned || kw_hit || vip,
                                                         c->kind == OC_CHANNEL_KIND_DM));
                     }
@@ -21306,6 +21508,27 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         SDL_DestroyProperties(props);
     }
     if (!g_win || !gfx_stack_init()) return 1;
+    /* THE WINDOW'S OWN ICON, set after SDL has wrapped the HWND.
+     *
+     * The window CLASS carries one, which is normally enough -- but SDL sets a
+     * window icon of its own when it adopts a foreign HWND, and a window icon
+     * beats the class icon everywhere the shell looks. That is why the taskbar
+     * button and the window thumbnail could disagree about what this
+     * application looks like.
+     *
+     * LoadImage at the shell's own metrics rather than LoadIcon: LoadIcon hands
+     * back a single system-sized icon and lets the shell stretch it, which is
+     * how a crisp 32px mark turns into a blurred one in the taskbar. */
+    {
+        HICON big = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
+                                      GetSystemMetrics(SM_CXICON),
+                                      GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
+        HICON sml = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
+                                      GetSystemMetrics(SM_CXSMICON),
+                                      GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+        if (big) SendMessageW(hwnd, WM_SETICON, ICON_BIG,   (LPARAM)big);
+        if (sml) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)sml);
+    }
     apply_titlebar(hwnd);
     /* When we are auto-connecting, hold the window back until the settings
      * bucket arrives so it can open where it was left rather than snapping
