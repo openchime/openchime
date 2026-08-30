@@ -520,10 +520,44 @@ int oc_wintoast_ensure_shortcut(const char *aumid, const char *display_name) {
     WCHAR wname[128];
     MultiByteToWideChar(CP_UTF8, 0, display_name ? display_name : "OpenChime", -1, wname, 128);
     _snwprintf(path + wcslen(path), MAX_PATH - wcslen(path), L"\\Programs\\%s.lnk", wname);
-    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return 1;   /* already there */
-
     WCHAR exe[MAX_PATH];
     if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return 0;
+
+    /* EXISTING IS NOT THE SAME AS CORRECT. This used to return as soon as the
+     * file was there, so a shortcut written by an older build -- before it
+     * carried an icon, or pointing at a different copy of the exe -- was never
+     * repaired, and the application silently lost its taskbar icon for good.
+     * Setting an AppUserModelID hands Windows the taskbar identity and it reads
+     * the icon from HERE, so a stale shortcut is not cosmetic.
+     *
+     * Verified rather than trusted: read the target back and rewrite unless it
+     * names this binary. */
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+        IShellLinkW *old = NULL; IPersistFile *oldf = NULL;
+        WCHAR had[MAX_PATH] = L"";
+        if (SUCCEEDED(CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
+                                       &IID_IShellLinkW, (void **)&old)) && old) {
+            if (SUCCEEDED(old->lpVtbl->QueryInterface(old, &IID_IPersistFile,
+                                                      (void **)&oldf)) && oldf) {
+                if (SUCCEEDED(oldf->lpVtbl->Load(oldf, path, STGM_READ))) {
+                    /* The TARGET, and the icon. Comparing only the icon was the
+                     * first attempt and passed a shortcut pointing at an
+                     * entirely different program, because its icon happened to
+                     * be right. Both have to name this binary. */
+                    WIN32_FIND_DATAW fd;
+                    WCHAR ico[MAX_PATH] = L""; int idx = 0;
+                    if (FAILED(old->lpVtbl->GetPath(old, had, MAX_PATH, &fd, 0)))
+                        had[0] = 0;
+                    old->lpVtbl->GetIconLocation(old, ico, MAX_PATH, &idx);
+                    if (!ico[0] || _wcsicmp(ico, exe) != 0) had[0] = 0;
+                }
+                oldf->lpVtbl->Release(oldf);
+            }
+            old->lpVtbl->Release(old);
+        }
+        if (had[0] && _wcsicmp(had, exe) == 0) return 1;   /* correct already */
+        DeleteFileW(path);                                  /* wrong: write it again */
+    }
 
     IShellLinkW *link = NULL;
     IPersistFile *file = NULL;
