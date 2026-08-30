@@ -9,6 +9,14 @@
  * windows.ui.notifications.h and windows.data.xml.dom.h are not here. */
 #include <winstring.h>
 #include <roapi.h>
+/* The Start-menu shortcut needs IShellLink and the property store; propkey.h
+ * carries the two AppUserModel keys Windows resolves a toast's identity and its
+ * activator through. */
+#include <shlobj.h>
+#include <shlguid.h>
+#include <propvarutil.h>
+#include <propkey.h>
+#include <propsys.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -242,15 +250,26 @@ static void xml_escape(const char *s, WCHAR *out, size_t cap) {
     out[o] = 0;
 }
 
+static int oc_wintoast_show_xml(const WCHAR *xml, const char *tag, const char *group);
+
 int oc_wintoast_show(const char *title, const char *body,
                      const char *tag, const char *group,
-                     const char *arg, int silent) {
+                     const char *arg, const char *sound) {
     if (!g_ready) return 0;
 
-    WCHAR wtitle[512], wbody[1024], warg[512];
+    WCHAR wtitle[512], wbody[1024], warg[512], wsnd[128];
     xml_escape(title, wtitle, sizeof wtitle / sizeof wtitle[0]);
     xml_escape(body,  wbody,  sizeof wbody  / sizeof wbody[0]);
     xml_escape(arg,   warg,   sizeof warg   / sizeof warg[0]);
+    /* The audio element, or nothing at all. "" is an explicit silence; NULL
+     * leaves the element out and Windows plays its default. */
+    wsnd[0] = 0;
+    if (sound && sound[0]) {
+        WCHAR n[96]; xml_escape(sound, n, 96);
+        _snwprintf(wsnd, 128, L"<audio src=\"%s\"/>", n);
+    } else if (sound) {
+        _snwprintf(wsnd, 128, L"<audio silent=\"true\"/>");
+    }
 
     /* ToastGeneric, not one of the legacy ToastText templates: the legacy ones
      * cannot carry a launch argument, and the launch argument is the entire
@@ -266,9 +285,14 @@ int oc_wintoast_show(const char *title, const char *body,
         L"<visual><binding template=\"ToastGeneric\">"
         L"<text>%s</text><text>%s</text>"
         L"</binding></visual>%s</toast>",
-        warg, wtitle, wbody,
-        silent ? L"<audio silent=\"true\"/>" : L"");
+        warg, wtitle, wbody, wsnd);
+    return oc_wintoast_show_xml(xml, tag, group);
+}
 
+/* Everything from "here is the XML" onward, shared by the plain toast and the
+ * one with actions: the difference between them is the document, and nothing
+ * after it. */
+static int oc_wintoast_show_xml(const WCHAR *xml, const char *tag, const char *group) {
     int ok = 0;
     IXmlDocument *doc = NULL;
     IXmlDocumentIO *io = NULL;
@@ -340,6 +364,260 @@ done:
     if (io)       io->lpVtbl->Release(io);
     if (doc)      doc->lpVtbl->Release(doc);
     return ok;
+}
+
+/* ---- acting on a toast ---------------------------------------------------
+ *
+ * INotificationActivationCallback, implemented as a C vtable. The interface has
+ * exactly one method beyond IUnknown, and Windows calls it with the action's
+ * argument and whatever the user typed. This is the only route by which an
+ * <input>'s text comes back -- protocol activation cannot carry it -- which is
+ * why the whole apparatus exists.
+ *
+ * A SINGLE STATIC OBJECT, not a heap-allocated one: there is one activator per
+ * process, it lives as long as the process, and reference counting an object
+ * that can never be destroyed only invents a way to get it wrong. */
+
+/* {6A1B2C3D-4E5F-4A6B-9C8D-0E1F2A3B4C5D} — this application's activator. It is
+ * written into the registry and onto the Start-menu shortcut, so it is a
+ * permanent identifier: changing it orphans every toast already on screen. */
+static const CLSID CLSID_OC_ACTIVATOR =
+    { 0x6a1b2c3d, 0x4e5f, 0x4a6b, { 0x9c, 0x8d, 0x0e, 0x1f, 0x2a, 0x3b, 0x4c, 0x5d } };
+static const char CLSID_OC_ACTIVATOR_STR[] = "{6A1B2C3D-4E5F-4A6B-9C8D-0E1F2A3B4C5D}";
+/* mingw's propkey.h stops short of this one. The AppUserModel property set is
+ * {9F4C2855-...} and the activator CLSID is PID 26 -- stable published values,
+ * like the IIDs above. */
+static const PROPERTYKEY OC_PKEY_ToastActivatorCLSID = {
+    { 0x9F4C2855, 0x9F79, 0x4B39, { 0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3 } }, 26 };
+
+static const IID IID_INotificationActivationCallback =
+    { 0x53e31837, 0x6600, 0x4a81, { 0x93, 0x95, 0x75, 0xcf, 0xfe, 0x74, 0x6f, 0x94 } };
+
+const char *oc_wintoast_activator_clsid(void) { return CLSID_OC_ACTIVATOR_STR; }
+
+/* One entry per <input> the toast declared. */
+typedef struct { LPCWSTR Key, Value; } OC_USER_INPUT;
+
+typedef struct INotifAct INotifAct;
+typedef struct INotifActVtbl {
+    HRESULT (WINAPI *QueryInterface)(INotifAct *, REFIID, void **);
+    ULONG   (WINAPI *AddRef)(INotifAct *);
+    ULONG   (WINAPI *Release)(INotifAct *);
+    HRESULT (WINAPI *Activate)(INotifAct *, LPCWSTR appUserModelId, LPCWSTR invokedArgs,
+                               const OC_USER_INPUT *data, ULONG count);
+} INotifActVtbl;
+struct INotifAct { const INotifActVtbl *lpVtbl; };
+
+static oc_wintoast_action_cb g_action_cb;
+static DWORD g_class_cookie;
+
+static void w2u(LPCWSTR w, char *out, int cap) {
+    if (!w) { out[0] = 0; return; }
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap, NULL, NULL);
+}
+
+static HRESULT WINAPI act_QI(INotifAct *self, REFIID riid, void **out) {
+    if (!out) return E_POINTER;
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+        IsEqualIID(riid, &IID_INotificationActivationCallback)) {
+        *out = self; return S_OK;
+    }
+    *out = NULL; return E_NOINTERFACE;
+}
+static ULONG WINAPI act_AddRef(INotifAct *self)  { (void)self; return 2; }
+static ULONG WINAPI act_Release(INotifAct *self) { (void)self; return 1; }
+
+static HRESULT WINAPI act_Activate(INotifAct *self, LPCWSTR aumid, LPCWSTR args,
+                                   const OC_USER_INPUT *data, ULONG count) {
+    (void)self; (void)aumid;
+    char a[512] = "", reply[1024] = "";
+    w2u(args, a, sizeof a);
+    /* The reply box, when the toast had one. Matched by KEY rather than by
+     * position: a toast with a button and a text box delivers them in no
+     * promised order. */
+    for (ULONG i = 0; i < count && data; i++) {
+        char k[64]; w2u(data[i].Key, k, sizeof k);
+        if (strcmp(k, "reply") == 0) { w2u(data[i].Value, reply, sizeof reply); break; }
+    }
+    if (g_action_cb) g_action_cb(a, reply);
+    return S_OK;
+}
+
+static const INotifActVtbl g_act_vtbl = { act_QI, act_AddRef, act_Release, act_Activate };
+static INotifAct g_activator = { &g_act_vtbl };
+
+/* The class factory. Same reasoning: one static object, no reference counting. */
+typedef struct IClsFac IClsFac;
+typedef struct IClsFacVtbl {
+    HRESULT (WINAPI *QueryInterface)(IClsFac *, REFIID, void **);
+    ULONG   (WINAPI *AddRef)(IClsFac *);
+    ULONG   (WINAPI *Release)(IClsFac *);
+    HRESULT (WINAPI *CreateInstance)(IClsFac *, IUnknown *, REFIID, void **);
+    HRESULT (WINAPI *LockServer)(IClsFac *, BOOL);
+} IClsFacVtbl;
+struct IClsFac { const IClsFacVtbl *lpVtbl; };
+
+static HRESULT WINAPI cf_QI(IClsFac *self, REFIID riid, void **out) {
+    if (!out) return E_POINTER;
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IClassFactory)) {
+        *out = self; return S_OK;
+    }
+    *out = NULL; return E_NOINTERFACE;
+}
+static ULONG WINAPI cf_AddRef(IClsFac *s)  { (void)s; return 2; }
+static ULONG WINAPI cf_Release(IClsFac *s) { (void)s; return 1; }
+static HRESULT WINAPI cf_Create(IClsFac *s, IUnknown *outer, REFIID riid, void **out) {
+    (void)s;
+    if (outer) return CLASS_E_NOAGGREGATION;
+    return g_activator.lpVtbl->QueryInterface(&g_activator, riid, out);
+}
+static HRESULT WINAPI cf_Lock(IClsFac *s, BOOL b) { (void)s; (void)b; return S_OK; }
+static const IClsFacVtbl g_cf_vtbl = { cf_QI, cf_AddRef, cf_Release, cf_Create, cf_Lock };
+static IClsFac g_class_factory = { &g_cf_vtbl };
+
+/* Point the CLSID at this exe, per user. Written on every start rather than at
+ * install time: a portable copy, a developer build and an upgraded path all
+ * need it to name THIS binary. */
+static void activator_register_clsid(void) {
+    WCHAR exe[MAX_PATH];
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return;
+    WCHAR key[160], cmd[MAX_PATH + 8];
+    _snwprintf(key, 160, L"Software\\Classes\\CLSID\\%hs\\LocalServer32",
+               CLSID_OC_ACTIVATOR_STR);
+    _snwprintf(cmd, MAX_PATH + 8, L"\"%s\" -ToastActivated", exe);
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, key, 0, NULL, 0, KEY_WRITE, NULL, &k, NULL)
+        == ERROR_SUCCESS) {
+        RegSetValueExW(k, NULL, 0, REG_SZ, (const BYTE *)cmd,
+                       (DWORD)((wcslen(cmd) + 1) * sizeof(WCHAR)));
+        RegCloseKey(k);
+    }
+}
+
+int oc_wintoast_activator_register(oc_wintoast_action_cb cb) {
+    g_action_cb = cb;
+    activator_register_clsid();
+    /* MULTIPLEUSE so the running client services activations itself. Windows
+     * starts a second copy only when nobody has the class registered -- which
+     * is the cold-start case, and the reason -ToastActivated exists at all. */
+    HRESULT hr = CoRegisterClassObject(&CLSID_OC_ACTIVATOR, (IUnknown *)&g_class_factory,
+                                       CLSCTX_LOCAL_SERVER, REGCLS_MULTIPLEUSE,
+                                       &g_class_cookie);
+    return SUCCEEDED(hr);
+}
+
+void oc_wintoast_activator_unregister(void) {
+    if (g_class_cookie) { CoRevokeClassObject(g_class_cookie); g_class_cookie = 0; }
+}
+
+/* The shortcut. Windows resolves BOTH the AppUserModelID and the activator
+ * CLSID through it for an unpackaged app, and Inno cannot write the second --
+ * so the app writes its own rather than shipping a toast that silently cannot
+ * be clicked. Idempotent: rewritten only when absent. */
+int oc_wintoast_ensure_shortcut(const char *aumid, const char *display_name) {
+    WCHAR path[MAX_PATH];
+    if (FAILED(SHGetFolderPathW(NULL, CSIDL_STARTMENU, NULL, 0, path))) return 0;
+    WCHAR wname[128];
+    MultiByteToWideChar(CP_UTF8, 0, display_name ? display_name : "OpenChime", -1, wname, 128);
+    _snwprintf(path + wcslen(path), MAX_PATH - wcslen(path), L"\\Programs\\%s.lnk", wname);
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return 1;   /* already there */
+
+    WCHAR exe[MAX_PATH];
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return 0;
+
+    IShellLinkW *link = NULL;
+    IPersistFile *file = NULL;
+    IPropertyStore *store = NULL;
+    int ok = 0;
+    if (FAILED(CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
+                                &IID_IShellLinkW, (void **)&link)) || !link) return 0;
+    link->lpVtbl->SetPath(link, exe);
+    if (SUCCEEDED(link->lpVtbl->QueryInterface(link, &IID_IPropertyStore, (void **)&store))
+        && store) {
+        PROPVARIANT pv;
+        WCHAR w[160];
+        MultiByteToWideChar(CP_UTF8, 0, aumid, -1, w, 160);
+        pv.vt = VT_LPWSTR; pv.pwszVal = w;
+        store->lpVtbl->SetValue(store, &PKEY_AppUserModel_ID, &pv);
+        /* As a CLSID, not a string: the property is typed, and a shortcut whose
+         * activator is the wrong type reads as no activator at all -- a toast
+         * that appears and cannot be clicked. */
+        /* Built by hand: propsys's InitPropVariantFromCLSID is not in mingw's
+         * import library, and the variant is two fields. */
+        PROPVARIANT cv;
+        PropVariantInit(&cv);
+        cv.vt = VT_CLSID;
+        cv.puuid = (CLSID *)CoTaskMemAlloc(sizeof(CLSID));
+        if (cv.puuid) {
+            *cv.puuid = CLSID_OC_ACTIVATOR;
+            store->lpVtbl->SetValue(store, &OC_PKEY_ToastActivatorCLSID, &cv);
+            PropVariantClear(&cv);
+        }
+        store->lpVtbl->Commit(store);
+        store->lpVtbl->Release(store);
+    }
+    if (SUCCEEDED(link->lpVtbl->QueryInterface(link, &IID_IPersistFile, (void **)&file))
+        && file) {
+        ok = SUCCEEDED(file->lpVtbl->Save(file, path, TRUE));
+        file->lpVtbl->Release(file);
+    }
+    link->lpVtbl->Release(link);
+    return ok;
+}
+
+int oc_wintoast_show_actions(const char *title, const char *body,
+                             const char *tag, const char *group,
+                             const char *arg, const char *sound,
+                             const char *reply_placeholder,
+                             const char *const *btn_label,
+                             const char *const *btn_arg, int n_btn) {
+    if (!g_ready) return 0;
+    WCHAR acts[2048]; acts[0] = 0;
+    size_t o = 0;
+    o += (size_t)_snwprintf(acts + o, 2048 - o, L"<actions>");
+    if (reply_placeholder && reply_placeholder[0]) {
+        WCHAR ph[128]; xml_escape(reply_placeholder, ph, 128);
+        o += (size_t)_snwprintf(acts + o, 2048 - o,
+                 L"<input id=\"reply\" type=\"text\" placeHolderContent=\"%s\"/>", ph);
+    }
+    for (int i = 0; i < n_btn && o < 1700; i++) {
+        WCHAR l[96], a[192];
+        xml_escape(btn_label[i], l, 96);
+        xml_escape(btn_arg[i],   a, 192);
+        /* BACKGROUND activation: the click is handled without the window being
+         * raised, which is the point of a quick reaction -- reacting should not
+         * drag you into the app. The reply button is the same: you answered
+         * already. hint-inputId ties the button to the text box, and is what
+         * makes Windows render them as one row. */
+        o += (size_t)_snwprintf(acts + o, 2048 - o,
+                 L"<action content=\"%s\" arguments=\"%s\" activationType=\"background\"%s/>",
+                 l, a,
+                 (reply_placeholder && reply_placeholder[0] && i == 0)
+                     ? L" hint-inputId=\"reply\"" : L"");
+    }
+    o += (size_t)_snwprintf(acts + o, 2048 - o, L"</actions>");
+
+    WCHAR wtitle[512], wbody[1024], warg[512], wsnd[128];
+    xml_escape(title, wtitle, 512);
+    xml_escape(body,  wbody,  1024);
+    xml_escape(arg,   warg,   512);
+    wsnd[0] = 0;
+    if (sound && sound[0]) { WCHAR n[96]; xml_escape(sound, n, 96);
+                             _snwprintf(wsnd, 128, L"<audio src=\"%s\"/>", n); }
+    else if (sound)        { _snwprintf(wsnd, 128, L"<audio silent=\"true\"/>"); }
+
+    WCHAR xml[4096];
+    /* The toast BODY still activates by protocol -- clicking the notification
+     * itself opens the conversation through the permalink, which needs nothing
+     * from the activator. Only the buttons and the reply box route through COM,
+     * because only they carry data back. */
+    _snwprintf(xml, 4096,
+        L"<toast launch=\"%s\" activationType=\"protocol\">"
+        L"<visual><binding template=\"ToastGeneric\">"
+        L"<text>%s</text><text>%s</text>"
+        L"</binding></visual>%s%s</toast>",
+        warg, wtitle, wbody, acts, wsnd);
+    return oc_wintoast_show_xml(xml, tag, group);
 }
 
 void oc_wintoast_done(void) {
