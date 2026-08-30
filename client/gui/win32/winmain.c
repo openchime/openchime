@@ -901,6 +901,42 @@ static NOTIFYICONDATAW g_tray;
 /* Closing the window HIDES it (REQ-138): a chat client that stops notifying the
  * moment you close it has stopped doing the one thing it is for. Said once, the
  * first time, because an app that vanishes without a word reads as a crash. */
+/* START WITH WINDOWS. Read live from the registry rather than mirrored into the
+ * settings bucket: the installer writes a startup shortcut too, and a copy of
+ * this in two places is a copy that can disagree. The registry IS the setting. */
+#define OC_RUN_KEY   L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define OC_RUN_VALUE L"OpenChime"
+static int startup_enabled(void) {
+    HKEY k; int on = 0;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, OC_RUN_KEY, 0, KEY_READ, &k) == ERROR_SUCCESS) {
+        on = RegQueryValueExW(k, OC_RUN_VALUE, NULL, NULL, NULL, NULL) == ERROR_SUCCESS;
+        RegCloseKey(k);
+    }
+    return on;
+}
+static void startup_set(int on) {
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, OC_RUN_KEY, 0, NULL, 0, KEY_WRITE, NULL, &k, NULL)
+        != ERROR_SUCCESS) return;
+    if (on) {
+        WCHAR exe[MAX_PATH], q[MAX_PATH + 4];
+        if (GetModuleFileNameW(NULL, exe, MAX_PATH)) {
+            _snwprintf(q, MAX_PATH + 4, L"\"%s\"", exe);
+            RegSetValueExW(k, OC_RUN_VALUE, 0, REG_SZ, (const BYTE *)q,
+                           (DWORD)((wcslen(q) + 1) * sizeof(WCHAR)));
+        }
+    } else RegDeleteValueW(k, OC_RUN_VALUE);
+    RegCloseKey(k);
+}
+
+/* WHAT THE CLOSE BUTTON DOES. Defaulting to Quit is a deliberate reversal:
+ * hiding was unconditional when it shipped, and close meaning close is what
+ * most people expect from a window. The cost is real and worth naming -- a
+ * client that quits on close stops notifying, which is the whole reason hiding
+ * existed -- so it is one switch away rather than gone. */
+enum { CLOSE_QUITS = 0, CLOSE_HIDES = 1 };
+static int  g_pref_close = CLOSE_QUITS;
+static int  g_pref_min_tray;        /* minimise hides too, off by default */
 static int  g_close_to_tray_told;
 static int  g_hidden_to_tray;      /* observable by the harness; see test_dump */
 /* Set only by app_quit. WM_CLOSE hides unless this says the close was ASKED
@@ -6658,7 +6694,8 @@ static float pref_row(gfx *rt, rectf body, float y, int row,
     return rule + 15;
 }
 
-enum { PREF_ROW_DELIVER = 90, PREF_ROW_SNDMUTE = 91 };
+enum { PREF_ROW_DELIVER = 90, PREF_ROW_SNDMUTE = 91,
+       PREF_ROW_CLOSE = 92, PREF_ROW_MINTRAY = 93, PREF_ROW_STARTUP = 94 };
 enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
        PREF_ROW_NOTIFY, PREF_ROW_QUICK, PREF_ROW_ACCENT, PREF_ROW_TEXTSIZE,
        PREF_ROW_DENSITY, PREF_ROW_ZOOM, PREF_ROW_DPI, PREF_ROW_RESET,
@@ -6672,8 +6709,13 @@ enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
  *
  * Categories are an enum rather than strings so the click router and the painter
  * cannot disagree about which is showing. */
-enum { PC_APPEARANCE = 0, PC_MESSAGES, PC_NOTIFICATIONS, PC_ADVANCED, PC_COUNT };
-static const char *PC_NAME[PC_COUNT] = { "Appearance", "Messages", "Notifications", "Advanced" };
+enum { PC_APPEARANCE = 0, PC_MESSAGES, PC_NOTIFICATIONS, PC_SYSTEM, PC_ADVANCED, PC_COUNT };
+/* SYSTEM is where the application behaves as an application rather than as a
+ * chat surface: what the close button does, whether it starts with Windows.
+ * Those had no home, which is why closing to the tray shipped with no way to
+ * turn it off. */
+static const char *PC_NAME[PC_COUNT] = { "Appearance", "Messages", "Notifications",
+                                         "System", "Advanced" };
 static int g_pref_cat = PC_APPEARANCE;
 static rectf g_pref_cats[PC_COUNT];
 
@@ -6758,7 +6800,10 @@ static void draw_prefs(gfx *rt, rectf reg) {
          * the selected pill arrived cut and every category name lost its
          * first pixels. What the clip owns, the rail respects. */
         rectf cats = rf(reg.left, reg.top, reg.left + catw - MODAL_PAD, reg.bottom);
-        fill(rt, cats, OC_COL_SIDEBAR);
+        /* NO FILL. The column was painted in the sidebar colour, which put a
+         * grey slab down one side of a white card for no work: the hairline
+         * below already separates the two panes, and the selected row already
+         * carries its own highlight. */
         fill(rt, rf(cats.right - 1, cats.top, cats.right, cats.bottom), OC_COL_BORDER);
         float cy = cats.top + 10;
         for (int i = 0; i < PC_COUNT; i++) {
@@ -6804,6 +6849,14 @@ static void draw_prefs(gfx *rt, rectf reg) {
                      DENS, 2, g_pref_density);
         y = pref_row(rt, body, y, PREF_ROW_MEMBERS, "Members pane",
                      "Shown by default when you open a channel.", ONOFF, 2, g_pref_members);
+        /* Zoom sits with the other display settings rather than under Advanced:
+         * it is the third of ARCH-97's three scales and the only one that was
+         * filed somewhere else. */
+        static const char *ZOOMB[3] = { "\u2212", "Reset", "+" };
+        char zh[96];
+        snprintf(zh, sizeof zh, "Currently %d%%. This window only.",
+                 (int)(zoom_mult() * 100.0f + 0.5f));
+        y = pref_row(rt, body, y, PREF_ROW_ZOOM, "Zoom", zh, ZOOMB, 3, -1);
     } else if (g_pref_cat == PC_MESSAGES) {
         y = pref_row(rt, body, y, PREF_ROW_TIME, "Time format",
                      "How message timestamps are shown.", TIMES, 2, g_pref_time24);
@@ -6825,7 +6878,12 @@ static void draw_prefs(gfx *rt, rectf reg) {
                 snprintf(cur + strlen(cur), sizeof cur - strlen(cur), "%s ", REACT_EMO[i]);
             draw_text(rt, "Quick reactions", g_ui_b, rf(body.left + 24, y, body.left + 320, y + 22), OC_COL_TEXT);
             draw_emoji_fmt(rt, "", rf(0, 0, 0, 0), g_emoji_s);      /* keep the format warm */
-            draw_text(rt, cur, g_emoji_s, rf(body.left + 24, y + 20, body.left + 340, y + 42), OC_COL_TEXT);
+            /* Where pref_row puts a HINT, so this row lines up with every other
+             * one. It draws its own label and glyphs rather than going through
+             * pref_row because colour emoji need the emoji format -- but that is
+             * a reason to match pref_row's geometry, not to ignore it. The hint
+             * moved down when hints started wrapping and this did not follow. */
+            draw_text(rt, cur, g_emoji_s, rf(body.left + 24, y + 30, body.left + 340, y + 52), OC_COL_TEXT);
             y = pref_row(rt, body, y, PREF_ROW_QUICK, "", "", EDIT1, 1, -1);
         }
     } else if (g_pref_cat == PC_NOTIFICATIONS) {
@@ -6855,23 +6913,34 @@ static void draw_prefs(gfx *rt, rectf reg) {
         y = pref_row(rt, body, y, PREF_ROW_NOTIFY + 100, "Per-conversation levels",
                      "Mute, mention-only, quiet hours and the workspace default.",
                      OPEN1, 1, -1);
+    } else if (g_pref_cat == PC_SYSTEM) {
+        static const char *CLOSEV[2] = { "Quit", "Hide to tray" };
+        y = pref_row(rt, body, y, PREF_ROW_CLOSE, "Close button",
+                     "Hiding keeps OpenChime running so messages still reach you.",
+                     CLOSEV, 2, g_pref_close);
+        static const char *ONOFF2[2] = { "Off", "On" };
+        y = pref_row(rt, body, y, PREF_ROW_MINTRAY, "Minimise to tray",
+                     "Minimising hides the window instead of leaving it on the taskbar.",
+                     ONOFF2, 2, g_pref_min_tray ? 1 : 0);
+        y = pref_row(rt, body, y, PREF_ROW_STARTUP, "Start with Windows",
+                     "Sign in and start receiving messages when you log in.",
+                     ONOFF2, 2, startup_enabled() ? 1 : 0);
     } else {
-        static const char *ZOOMB[3] = { "\u2212", "Reset", "+" };
-        char zh[96];
-        snprintf(zh, sizeof zh, "Currently %d%%. This window only.",
-                 (int)(zoom_mult() * 100.0f + 0.5f));
-        y = pref_row(rt, body, y, PREF_ROW_ZOOM, "Zoom", zh, ZOOMB, 3, -1);
-
-        static const char *DPIS[4] = { "96", "120", "144", "192" };
-        char dh[96];
-        snprintf(dh, sizeof dh, "Currently %d. For layout checks.", g_dpi);
-        int dsel = g_dpi == 96 ? 0 : g_dpi == 120 ? 1 : g_dpi == 144 ? 2
-                 : g_dpi == 192 ? 3 : -1;
-        y = pref_row(rt, body, y, PREF_ROW_DPI, "DPI override", dh, DPIS, 4, dsel);
-
         static const char *RESET1[1] = { "Reset" };
         y = pref_row(rt, body, y, PREF_ROW_RESET, "Reset preferences",
                      "Back to the defaults; applied on Save.", RESET1, 1, -1);
+        /* THE DPI OVERRIDE IS A TEST AFFORDANCE, and its own hint said so --
+         * "for layout checks". It exists to drive the scale matrix from the
+         * harness, so it appears only when the harness is attached rather than
+         * shipping to everyone as an Advanced setting. */
+        if (g_test_dir[0]) {
+            static const char *DPIS[4] = { "96", "120", "144", "192" };
+            char dh[96];
+            snprintf(dh, sizeof dh, "Currently %d. For layout checks.", g_dpi);
+            int dsel = g_dpi == 96 ? 0 : g_dpi == 120 ? 1 : g_dpi == 144 ? 2
+                     : g_dpi == 192 ? 3 : -1;
+            y = pref_row(rt, body, y, PREF_ROW_DPI, "DPI override", dh, DPIS, 4, dsel);
+        }
     }
 
     g_prefs_content_h = y - rows_top;
@@ -15808,6 +15877,12 @@ static int on_click(HWND hwnd, int x, int y) {
             case PREF_ROW_FLASH:   g_pref_flash = v; break;
             case PREF_ROW_DELIVER: g_pref_deliver = v; break;
             case PREF_ROW_SNDMUTE: g_snd_muted = v; break;
+            case PREF_ROW_CLOSE:   g_pref_close = v; break;
+            case PREF_ROW_MINTRAY: g_pref_min_tray = v; break;
+            /* Applied immediately, not on Save: it is a registry fact rather
+             * than a value in the settings bucket, and a checkbox that lies
+             * until you press Save is worse than no checkbox. */
+            case PREF_ROW_STARTUP: startup_set(v); break;
             /* Appearance applies LIVE while the sheet is open — a colour, a text
              * size and a density are their own preview and cannot be judged from a
              * label — and reverts with everything else on Cancel. */
@@ -17746,9 +17821,9 @@ static void prefs_save(void) {
      * build, which stops at `q:`, still reads everything it understands. */
     {
         size_t at = strlen(enc);
-        snprintf(enc + at, sizeof enc - at, ";k:%d;f:%d;c:%d;v:%d;u:%d",
+        snprintf(enc + at, sizeof enc - at, ";k:%d;f:%d;c:%d;v:%d;u:%d;g:%d;i:%d",
                  g_skin_tone, g_pref_flash, g_close_to_tray_told,
-                 g_pref_deliver, g_snd_muted);
+                 g_pref_deliver, g_snd_muted, g_pref_close, g_pref_min_tray);
     }
     oc_client_set_setting(g_client, PREFS_SETTING_KEY, enc);
 }
@@ -17786,6 +17861,8 @@ static void prefs_load(const oc_model *m) {
              * say -- which is `n:` above. */
             else if (k == 'v') g_pref_deliver = (val < 0 || val > 2) ? DELIVER_OS : val;
             else if (k == 'u') g_snd_muted = val ? 1 : 0;
+            else if (k == 'g') g_pref_close = (val == CLOSE_HIDES) ? CLOSE_HIDES : CLOSE_QUITS;
+            else if (k == 'i') g_pref_min_tray = val ? 1 : 0;
             else if (k == 'q') {
                 size_t n2 = 0;
                 for (const char *q = p + 2; *q && *q != ';' && n2 + 1 < sizeof g_quick_names; q++)
@@ -21254,7 +21331,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
          * there is nothing to restore the window from, and hiding would leave a
          * process the user cannot reach OR close — so the old quit path stays as
          * the fallback rather than being deleted. */
-        if (g_tray_live && !g_quitting) {
+        if (g_tray_live && !g_quitting && g_pref_close == CLOSE_HIDES) {
             ShowWindow(hwnd, SW_HIDE);
             g_hidden_to_tray = 1;
             if (!g_close_to_tray_told) {
@@ -21312,6 +21389,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 1;
     }
+    case WM_SYSCOMMAND:
+        /* MINIMISE CAN HIDE TOO, when asked. Separate from the close setting
+         * because they are separate wishes: some people want the window gone
+         * from the taskbar while working, and still want close to mean close. */
+        if ((wp & 0xFFF0) == SC_MINIMIZE && g_pref_min_tray && g_tray_live) {
+            ShowWindow(hwnd, SW_HIDE);
+            g_hidden_to_tray = 1;
+            return 0;
+        }
+        break;
     case WM_APP_TRAY:
         /* The tray icon is a control now. Left click shows the window; right
          * click shows it AND opens the app's own menu inside it.
