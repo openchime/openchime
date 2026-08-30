@@ -2625,16 +2625,12 @@ static fmtw *mk_fmt(const char *family, float size, int wt,
  * there are two inputs. */
 static int   g_pref_textsize = 1;      /* 0 Small … 3 Largest */
 static int   g_pref_density = 1;       /* 0 compact, 1 cozy */
-static int   g_zoom_step;              /* -2 … +4, per window, not persisted */
+
 
 static float textsize_mult(void) {
     static const float M[4] = { 0.90f, 1.00f, 1.12f, 1.25f };
     int i = (g_pref_textsize < 0) ? 0 : (g_pref_textsize > 3 ? 3 : g_pref_textsize);
     return M[i];
-}
-static float zoom_mult(void) {
-    int z = g_zoom_step < -2 ? -2 : (g_zoom_step > 4 ? 4 : g_zoom_step);
-    return 1.0f + 0.08f * (float)z;
 }
 
 /* Is a family actually installed? DirectWrite silently substitutes for a
@@ -5818,7 +5814,7 @@ static void nav_conversation(HWND hwnd, int delta, int unread_only) {
  */
 enum { ACC_NONE = 0, ACC_PALETTE, ACC_SEARCH, ACC_KEYS,
        ACC_NAV_PREV, ACC_NAV_NEXT, ACC_NAV_PREV_UNREAD, ACC_NAV_NEXT_UNREAD,
-       ACC_FOCUS, ACC_PREFS, ACC_ZOOM_IN, ACC_ZOOM_OUT, ACC_ZOOM_RESET, ACC_QUIT };
+       ACC_FOCUS, ACC_PREFS, ACC_QUIT };
 #define AM_CTRL  1u
 #define AM_ALT   2u
 #define AM_SHIFT 4u
@@ -5848,13 +5844,8 @@ static const struct {
     { AM_CTRL,            'F',        ACC_SEARCH,  "Ctrl+F",           "Search messages" },
     { AM_CTRL,            VK_OEM_2,   ACC_KEYS,    "Ctrl+/",           "This list" },
     { AM_CTRL,            VK_OEM_COMMA, ACC_PREFS,  "Ctrl+,",           "Preferences" },
-    { AM_CTRL,            VK_OEM_PLUS,  ACC_ZOOM_IN,  "Ctrl+= / Ctrl+- / Ctrl+0", "Zoom this window in / out / reset" },
-    { AM_CTRL,            VK_OEM_MINUS, ACC_ZOOM_OUT, NULL, NULL },
-    { AM_CTRL,            '0',          ACC_ZOOM_RESET, NULL, NULL },
     /* The numeric keypad's +/- are different virtual keys and a user with a full
      * keyboard will reach for them. */
-    { AM_CTRL,            VK_ADD,       ACC_ZOOM_IN,  NULL, NULL },
-    { AM_CTRL,            VK_SUBTRACT,  ACC_ZOOM_OUT, NULL, NULL },
     { AM_CTRL,            'Q',        ACC_QUIT,    "Ctrl+Q",           "Quit OpenChime (closing the window only hides it)" },
     { 0,                  VK_F6,      ACC_FOCUS,   "F6",               "Move focus between the composer and the filter box" },
     { 0,                  0,          ACC_NONE,  "Mouse wheel",        "Scroll the transcript, sidebar or open pane" },
@@ -5876,9 +5867,6 @@ static void accel_run(HWND hwnd, int action) {
     case ACC_SEARCH:  search_open(hwnd);  break;
     case ACC_KEYS:    if (g_keys_open) modal_finish(0); else modal_enter(hwnd, &g_keys_open); break;
     case ACC_PREFS:   if (g_prefs_open) modal_finish(0); else modal_enter(hwnd, &g_prefs_open); break;
-    case ACC_ZOOM_IN:    if (g_zoom_step < 4)  { g_zoom_step++; scale_apply(hwnd); } break;
-    case ACC_ZOOM_OUT:   if (g_zoom_step > -2) { g_zoom_step--; scale_apply(hwnd); } break;
-    case ACC_ZOOM_RESET: if (g_zoom_step) { g_zoom_step = 0; scale_apply(hwnd); } break;
     case ACC_NAV_PREV:        nav_conversation(hwnd, -1, 0); break;
     case ACC_NAV_NEXT:        nav_conversation(hwnd,  1, 0); break;
     case ACC_NAV_PREV_UNREAD: nav_conversation(hwnd, -1, 1); break;
@@ -6698,7 +6686,7 @@ enum { PREF_ROW_DELIVER = 90, PREF_ROW_SNDMUTE = 91,
        PREF_ROW_CLOSE = 92, PREF_ROW_MINTRAY = 93, PREF_ROW_STARTUP = 94 };
 enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
        PREF_ROW_NOTIFY, PREF_ROW_QUICK, PREF_ROW_ACCENT, PREF_ROW_TEXTSIZE,
-       PREF_ROW_DENSITY, PREF_ROW_ZOOM, PREF_ROW_DPI, PREF_ROW_RESET,
+       PREF_ROW_DENSITY, PREF_ROW_DPI, PREF_ROW_RESET,
        PREF_ROW_EDITOR, PREF_ROW_FLASH };
 
 /* Preferences is two-paned: categories left, one category's rows right.
@@ -6849,14 +6837,6 @@ static void draw_prefs(gfx *rt, rectf reg) {
                      DENS, 2, g_pref_density);
         y = pref_row(rt, body, y, PREF_ROW_MEMBERS, "Members pane",
                      "Shown by default when you open a channel.", ONOFF, 2, g_pref_members);
-        /* Zoom sits with the other display settings rather than under Advanced:
-         * it is the third of ARCH-97's three scales and the only one that was
-         * filed somewhere else. */
-        static const char *ZOOMB[3] = { "\u2212", "Reset", "+" };
-        char zh[96];
-        snprintf(zh, sizeof zh, "Currently %d%%. This window only.",
-                 (int)(zoom_mult() * 100.0f + 0.5f));
-        y = pref_row(rt, body, y, PREF_ROW_ZOOM, "Zoom", zh, ZOOMB, 3, -1);
     } else if (g_pref_cat == PC_MESSAGES) {
         y = pref_row(rt, body, y, PREF_ROW_TIME, "Time format",
                      "How message timestamps are shown.", TIMES, 2, g_pref_time24);
@@ -9874,7 +9854,7 @@ static void close_overlays(void);                /* fwd */
  * judge a theme from a label — but it reverts with the rest on Cancel. */
 static struct {
     int theme, time24, members, daysep, notify;
-    int accent, textsize, density, zoom;
+    int accent, textsize, density;
     unsigned dpi;
     char quick[160];
     int  richtext;
@@ -9892,7 +9872,6 @@ static void prefs_snapshot(void) {
     g_prefs_snap.textsize = g_pref_textsize;
     g_prefs_snap.density  = g_pref_density;
     g_prefs_snap.richtext = g_pref_richtext;
-    g_prefs_snap.zoom     = g_zoom_step;
     g_prefs_snap.dpi      = g_dpi;
     snprintf(g_prefs_snap.quick, sizeof g_prefs_snap.quick, "%s", g_quick_names);
 }
@@ -9914,9 +9893,8 @@ static void prefs_restore(void) {
     /* Text size, zoom and DPI each cost a font-table rebuild, so restore them
      * through the one path that knows that — and only when they actually moved. */
     if (g_dpi != g_prefs_snap.dpi) dpi_set(GetActiveWindow(), g_prefs_snap.dpi);
-    if (g_pref_textsize != g_prefs_snap.textsize || g_zoom_step != g_prefs_snap.zoom) {
+    if (g_pref_textsize != g_prefs_snap.textsize) {
         g_pref_textsize = g_prefs_snap.textsize;
-        g_zoom_step     = g_prefs_snap.zoom;
         scale_apply(GetActiveWindow());
     }
 }
@@ -14890,7 +14868,7 @@ static void dpi_set(HWND hwnd, UINT dpi) {
  * native children that carry their own font, and relaying out — three steps that
  * were each forgettable at each call site. */
 static void scale_apply(HWND hwnd) {
-    g_text_scale = textsize_mult() * zoom_mult();
+    g_text_scale = textsize_mult();
     fonts_build();      /* g_body's uniform line spacing scales inside it */
     mlay_drop_all();
     /* The composer draws through g_body, which fonts_build() just replaced, so its
@@ -15889,14 +15867,7 @@ static int on_click(HWND hwnd, int x, int y) {
             case PREF_ROW_ACCENT:   oc_theme_set_scheme(v); break;
             case PREF_ROW_TEXTSIZE: g_pref_textsize = v; scale_apply(hwnd); break;
             case PREF_ROW_DENSITY:  g_pref_density = v; g_density = v ? 1.0f : 0.6f; break;
-            case PREF_ROW_ZOOM:
-                if (v == 0)      g_zoom_step--;
-                else if (v == 1) g_zoom_step = 0;
-                else             g_zoom_step++;
-                if (g_zoom_step < -2) g_zoom_step = -2;
-                if (g_zoom_step >  4) g_zoom_step =  4;
-                scale_apply(hwnd);
-                break;
+
             case PREF_ROW_DPI: {
                 static const int DPIV[4] = { 96, 120, 144, 192 };
                 dpi_set(hwnd, (UINT)DPIV[v < 0 ? 0 : (v > 3 ? 3 : v)]);
@@ -15910,7 +15881,6 @@ static int on_click(HWND hwnd, int x, int y) {
                 g_pref_notify = NOTIFY_FULL;
                 g_pref_flash = FLASH_IDLE;
                 g_pref_textsize = 1; g_pref_density = 1; g_density = 1.0f;
-                g_zoom_step = 0;
                 snprintf(g_quick_names, sizeof g_quick_names, "%s", QUICK_DEFAULT);
                 quick_rebuild();
                 scale_apply(hwnd);
@@ -17882,7 +17852,7 @@ static void prefs_load(const oc_model *m) {
     /* After theme_set: the accent pair is resolved per mode, so the mode has to be
      * in force first. scale_apply needs a window and prefs_load runs before one is
      * around on some paths, so the caller's next layout picks it up. */
-    g_text_scale = textsize_mult() * zoom_mult();
+    g_text_scale = textsize_mult();
     fonts_build();
 }
 
@@ -18706,9 +18676,9 @@ static void test_dump(const char *path) {
      * another one silently matched twice in the smoke's extractor and produced a
      * two-line "expected" value. Names in this dump are read by grep, so they have to
      * be unambiguous to grep. */
-    fprintf(f, "textsize=%d zoom=%d scale=%.3f dpi=%u density=%d "
+    fprintf(f, "textsize=%d scale=%.3f dpi=%u density=%d "
                "scheme=%d railcol=%06X accentcol=%06X\n",
-            g_pref_textsize, g_zoom_step, g_text_scale, g_dpi, g_pref_density,
+            g_pref_textsize, g_text_scale, g_dpi, g_pref_density,
             oc_theme_scheme(), (unsigned)OC_COL_RAIL, (unsigned)OC_COL_ACCENT);
     /* The sidebar AS BUILT, which is where the appear-once rule lives: a
      * conversation in a custom section leaves Channels, a starred one leaves both.
@@ -19704,11 +19674,6 @@ static void test_poll(HWND hwnd) {
          * can only ever check the one it happens to be at. */
         int v = atoi(arg);
         if (v >= 0 && v <= 3) { g_pref_textsize = v; scale_apply(hwnd); prefs_save(); test_ack("ok"); }
-        else test_ack("err");
-    } else if (!strcmp(verb, "zoom")) {
-        /* -2 .. +4, the per-window zoom Ctrl+= drives. */
-        int v = atoi(arg);
-        if (v >= -2 && v <= 4) { g_zoom_step = v; scale_apply(hwnd); test_ack("ok"); }
         else test_ack("err");
     } else if (!strcmp(verb, "prefs")) {
         modal_enter(hwnd, &g_prefs_open); test_ack("ok");
