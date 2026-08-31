@@ -909,7 +909,21 @@ the requirement says so explicitly rather than implying one.
   click, cannot. Buttons activate in the *background*, because reacting to a
   message should not drag you into the application.
 
-  **Closing the window HIDES it; the app keeps running and keeps notifying.**
+  **Text size is the only size control.** A per-window zoom was removed: it was
+  a process-wide global in an application with one window, so its only distinction
+  from the text-size preference was being forgotten on restart. Display scaling is
+  the display's, read from the OS and applied at the rendering seam.
+
+  **Closing the window quits, unless you ask it not to.** The close button is a
+  setting — *Quit* or *Hide to tray* — under System, and it defaults to **Quit**,
+  because close meaning close is what a window button is generally taken to
+  mean. The cost is real and is the reason the other option exists: a client
+  that quits on close stops notifying, which is the whole point of the
+  application. Minimising is a separate switch, off by default, because wanting
+  the taskbar button gone while working is a different wish from wanting the
+  close button to mean something unusual.
+
+  **When set to hide, the app keeps running and keeps notifying.**
   A chat client that stops notifying the moment its window closes has stopped
   being one, and the tray icon existed as a mailbox with nothing behind it. The
   window is restored by clicking the tray icon, and quitting is a deliberate act

@@ -79,6 +79,40 @@ int  oc_theme_is_light(void);
 int  oc_theme_mode(void);            /* the mode last applied (not the resolved one) */
 const char *oc_theme_mode_name(int mode);
 
+/* CORNER RADII, in DIPs.
+ *
+ * Windows 11 names three and only three. 8 for anything that floats above the
+ * content -- windows, dialogs, flyouts, menus, popovers. 4 for anything living
+ * inside a surface -- buttons, boxes, chips, list backplates. 0 where an edge
+ * meets another straight edge. The system exposes the first two as
+ * `OverlayCornerRadius` and `ControlCornerRadius`, and they scale with the
+ * display, which is why these are DIPs and not pixels.
+ *
+ * They live HERE, beside the colours, rather than in oc_gfx. The drawing layer
+ * takes a radius as an argument and should hold no opinion about it: the right
+ * number is a platform convention, not a property of a rounded rectangle. A
+ * frontend under another desktop's conventions supplies its own set without
+ * touching a primitive.
+ *
+ * Two more that Windows does not name but the app needs:
+ *
+ * OC_R_PILL is a capsule -- the fully-rounded end on unread badges, scrollbar
+ * thumbs and the thin indicator bars. It is deliberately larger than any shape
+ * it is used on, because gfx_fill_round clamps a radius to half the shorter
+ * side: "larger than possible" IS "as round as it goes", and the call site
+ * does not have to restate a height it was already handed. That is what the
+ * literals it replaces were doing by hand, and getting wrong whenever the
+ * height moved.
+ *
+ * OC_R_AVATAR_* are the rounded squares standing in for a person or a
+ * workspace. They stay proportional to the tile rather than fixed: a 36px tile
+ * and an 18px one with the same radius do not read as the same shape. */
+#define OC_R_OVERLAY     8.0f
+#define OC_R_CONTROL     4.0f
+#define OC_R_PILL      999.0f
+#define OC_R_AVATAR_LG  12.0f   /* the 36px tile: rail, menu header, sign-in mark */
+#define OC_R_AVATAR_SM   5.0f   /* 18-20px, in a row or a chip */
+
 #define OC_COL_ACCENT      oc_theme[TH_ACCENT]
 #define OC_COL_ACCENT_DIM  oc_theme[TH_ACCENT_DIM]
 #define OC_COL_RAIL        oc_theme[TH_RAIL]

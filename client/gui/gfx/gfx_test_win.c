@@ -108,15 +108,46 @@ int main(void)
         CHECK(near_rgb(px(200, 130), 0, 0, 0));   /* and the middle stays empty */
     }
 
+    /* -- THE EDGE RAMP ------------------------------------------------------
+     *
+     * The property that makes a rounded corner look drawn rather than
+     * stair-stepped: pixels along the arc hold values BETWEEN the shape and
+     * the background, in proportion to how much of them the shape covers.
+     * SDL_RenderGeometry has no antialiasing of its own, so this holds only
+     * while gfx_fill_round emits its coverage ramp — remove the ramp and every
+     * pixel here snaps to one end or the other and the count goes to zero.
+     *
+     * Counted over one whole corner box of a 40px radius, whose arc is some
+     * 63 pixels long: 40 of them come out partial. The bar is set below that
+     * and far above what a hard edge can produce, which is nothing. */
+    gfx_begin(g, 0x000000);
+    gfx_fill_round(g, (gfx_rect){ 100, 100, 120, 120 }, 40.0f, 0xFFFFFF, 1.0f);
+    CHECK(gfx_readback(g, shot, W, H));
+    {
+        int mid = 0, solid = 0, empty = 0;
+        for (int y = 100; y < 140; y++)
+            for (int x = 100; x < 140; x++) {
+                int v = px(x, y)[0];
+                if (v > 30 && v < 225) mid++;
+                else if (v >= 225) solid++;
+                else empty++;
+            }
+        CHECK(mid >= 25);     /* the ramp: partial coverage is rendered */
+        CHECK(solid > 0);     /* still opaque inside it */
+        CHECK(empty > 0);     /* still transparent outside it */
+        CHECK(near_rgb(px(160, 160), 255, 255, 255));
+    }
+
     /* THE CALLER'S RULE: a stroke must sit at least its half-width inside any
      * clip that is active.
      *
      * A stroke is centred on its path, so a rect laid FLUSH with the clip has
      * half its width outside — and what survives is not symmetric: the left
-     * edge vanishes completely while the right keeps a sliver. That is not a
-     * rounding subtlety anyone eyeballs, it is a rounded rectangle drawing
-     * three of its four sides, and it shipped exactly that way in the modal
-     * form, whose boxes spanned the full clipped body.
+     * edge thins to a ghost while the right keeps its full weight. That is not
+     * a rounding subtlety anyone eyeballs, it is a rounded rectangle drawing
+     * one of its sides at a third the strength of the opposite one, and it
+     * shipped exactly that way in the modal form, whose boxes spanned the full
+     * clipped body.
      *
      * Both cases are asserted. The flush one documents the trap by measuring
      * it; the inset one is the rule, and is what callers do. */
@@ -126,10 +157,15 @@ int main(void)
     gfx_clip_pop(g);
     CHECK(gfx_readback(g, shot, W, H));
     {
-        int left = 0;
+        /* Summed, not counted. Since edges carry a coverage ramp, a clipped
+         * stroke does not vanish outright — it thins — and counting lit
+         * columns cannot tell a full edge from a ghost of one. */
+        int left = 0, right = 0;
         for (int d = 0; d <= 2; d++)
-            if (px(100 + d, 130)[0] > 60) left++;
-        CHECK(left == 0);          /* the trap, measured rather than described */
+            left += px(100 + d, 130)[0];
+        for (int d = -2; d <= 0; d++)
+            right += px(300 + d, 130)[0];
+        CHECK(left * 2 < right);   /* the trap, measured rather than described */
     }
 
     gfx_begin(g, 0x000000);

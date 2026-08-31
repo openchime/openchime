@@ -147,34 +147,111 @@ static void geometry(gfx *g, SDL_Texture *tex, const SDL_Vertex *v, int nv,
     SDL_RenderGeometry(g->r, tex, v, nv, idx, ni);
 }
 
+/* THE EDGE RAMP.
+ *
+ * SDL_RenderGeometry has no antialiasing. Every triangle edge lands on a hard
+ * pixel boundary, so an arc drawn as chords comes out a staircase with no
+ * shading between the shape and what is behind it -- which next to
+ * DirectWrite's antialiased text reads as "low resolution". More chords do not
+ * help: the steps are per pixel, not per chord.
+ *
+ * Discs (disc_tex) and icons (icon_raster) each already solve this their own
+ * way, and rounded rectangles can use neither -- too large to cache, too
+ * varied to raster. So the coverage goes into the geometry. Every rounded
+ * outline is emitted TWICE, half a device pixel inside the true edge at full
+ * alpha and half a device pixel outside it at zero, with a triangle strip
+ * between; the hardware interpolates, and that strip is the one-pixel coverage
+ * ramp a real rasterizer would have computed.
+ *
+ * It costs nothing on the straight runs. An axis-aligned edge sitting on a
+ * pixel boundary puts the ramp's two endpoints exactly on the pixel centers
+ * either side of it, so those pixels sample 0 and 1 and the edge stays crisp.
+ * Only where the outline cuts a pixel diagonally -- the corners -- does the
+ * ramp produce intermediate values, which is precisely where they were
+ * missing. */
+
+enum { RN = (CSEG + 1) * 4 };   /* points in one rounded outline */
+
+/* Half a device pixel, expressed in the layout units the callers speak. */
+static float feather_u(const gfx *g)
+{
+    float s = g->scale > 0.01f ? g->scale : 1.0f;
+    return 0.5f / s;
+}
+
+/* `r`'s outline pushed outward by `t` (negative insets it), corners following. */
+static int round_ring(gfx_rect r, float rad, float t, float scale,
+                      SDL_FPoint *out)
+{
+    gfx_rect o = { r.x - t, r.y - t, r.w + 2.0f * t, r.h + 2.0f * t };
+    float rr = rad + t;
+    if (rr < 0.0f)
+        rr = 0.0f;
+    return round_outline(o, rr, scale, out);
+}
+
+/* A filled rounded shape with the ramp: fan from the center out to the inset
+ * ring, then the ramp strip out to the outset one.
+ *
+ * `tex` NULL fills with `c`. Otherwise every vertex is UV-mapped through the
+ * device-pixel rect (mx, my, mw, mh) -- the ramp ring maps slightly outside
+ * [0,1], which clamp sampling handles and zero alpha hides regardless. */
+static void fan_round(gfx *g, gfx_rect shape, float radius, SDL_FColor c,
+                      SDL_Texture *tex, float mx, float my, float mw, float mh)
+{
+    float e = feather_u(g);
+    SDL_FPoint in[RN], out[RN];
+    int n = round_ring(shape, radius, -e, g->scale, in);
+    round_ring(shape, radius, e, g->scale, out);
+    SDL_FColor c0 = c;
+    c0.a = 0.0f;
+
+    SDL_Vertex v[RN * 2 + 1];
+    v[0].position.x = (shape.x + shape.w / 2.0f) * g->scale;
+    v[0].position.y = (shape.y + shape.h / 2.0f) * g->scale;
+    v[0].color = c;
+    for (int i = 0; i < n; i++) {
+        v[1 + i].position = in[i];
+        v[1 + i].color = c;
+        v[1 + n + i].position = out[i];
+        v[1 + n + i].color = c0;
+    }
+    for (int i = 0; i < 1 + n * 2; i++) {
+        if (tex) {
+            v[i].tex_coord.x = (v[i].position.x - mx) / mw;
+            v[i].tex_coord.y = (v[i].position.y - my) / mh;
+        } else {
+            v[i].tex_coord.x = v[i].tex_coord.y = 0.0f;
+        }
+    }
+
+    int idx[RN * 9];
+    int ni = 0;
+    for (int i = 0; i < n; i++) {
+        int j = (i + 1) % n;
+        idx[ni++] = 0;
+        idx[ni++] = 1 + i;
+        idx[ni++] = 1 + j;
+        idx[ni++] = 1 + i;
+        idx[ni++] = 1 + j;
+        idx[ni++] = 1 + n + i;
+        idx[ni++] = 1 + j;
+        idx[ni++] = 1 + n + j;
+        idx[ni++] = 1 + n + i;
+    }
+    geometry(g, tex, v, 1 + n * 2, idx, ni);
+}
+
 void gfx_fill_round(gfx *g, gfx_rect r, float radius, uint32_t rgb, float a)
 {
-    if (radius <= 0.5f) {
+    float e = feather_u(g);
+    /* Below the ramp's own width there is no room for it, and a square fill is
+     * what the radius rounds to anyway. */
+    if (radius <= 0.5f || r.w <= 2.0f * e || r.h <= 2.0f * e) {
         gfx_fill(g, r, rgb, a);
         return;
     }
-    SDL_FPoint pts[(CSEG + 1) * 4];
-    int n = round_outline(r, radius, g->scale, pts);
-    SDL_FColor c = fcol(rgb, a);
-
-    SDL_Vertex v[(CSEG + 1) * 4 + 1];
-    v[0].position.x = (r.x + r.w / 2.0f) * g->scale;
-    v[0].position.y = (r.y + r.h / 2.0f) * g->scale;
-    v[0].color = c;
-    v[0].tex_coord.x = v[0].tex_coord.y = 0.0f;
-    for (int i = 0; i < n; i++) {
-        v[i + 1].position = pts[i];
-        v[i + 1].color = c;
-        v[i + 1].tex_coord.x = v[i + 1].tex_coord.y = 0.0f;
-    }
-    int idx[(CSEG + 1) * 4 * 3];
-    int ni = 0;
-    for (int i = 0; i < n; i++) {
-        idx[ni++] = 0;
-        idx[ni++] = 1 + i;
-        idx[ni++] = 1 + (i + 1) % n;
-    }
-    geometry(g, NULL, v, n + 1, idx, ni);
+    fan_round(g, r, radius, fcol(rgb, a), NULL, 0.0f, 0.0f, 1.0f, 1.0f);
 }
 
 void gfx_stroke_round(gfx *g, gfx_rect r, float radius, float w, uint32_t rgb,
@@ -182,38 +259,53 @@ void gfx_stroke_round(gfx *g, gfx_rect r, float radius, float w, uint32_t rgb,
 {
     /* Centered on the path, like the Direct2D stroke it replaces. */
     float h = w / 2.0f;
-    gfx_rect outer = { r.x - h, r.y - h, r.w + w, r.h + w };
-    gfx_rect inner = { r.x + h, r.y + h, r.w - w, r.h - w };
-    if (inner.w < 0.0f || inner.h < 0.0f) {
+    float e = feather_u(g);
+    if (r.w - 2.0f * (h + e) < 0.0f || r.h - 2.0f * (h + e) < 0.0f) {
+        /* Thicker than the shape: there is no hole left, so it is a fill. */
+        gfx_rect outer = { r.x - h, r.y - h, r.w + w, r.h + w };
         gfx_fill_round(g, outer, radius + h, rgb, a);
         return;
     }
-    SDL_FPoint po[(CSEG + 1) * 4], pi[(CSEG + 1) * 4];
-    int n = round_outline(outer, radius + h, g->scale, po);
-    round_outline(inner, radius - h, g->scale, pi);
+    /* Four rings: the ramp's outer lip, the opaque band, the ramp's inner lip.
+     * A stroke thinner than the ramp collapses the band to the path itself and
+     * becomes a triangular ramp two pixels wide -- the right answer for a
+     * hairline, and the reason `hi` is clamped rather than allowed to invert
+     * the geometry. */
+    float hi = h - e;
+    if (hi < 0.0f)
+        hi = 0.0f;
+    const float off[4] = { h + e, hi, -hi, -(h + e) };
+    SDL_FColor c = fcol(rgb, a), c0 = c;
+    c0.a = 0.0f;
+    const SDL_FColor *col[4] = { &c0, &c, &c, &c0 };
 
-    SDL_FColor c = fcol(rgb, a);
-    SDL_Vertex v[(CSEG + 1) * 8];
-    for (int i = 0; i < n; i++) {
-        v[i * 2].position = po[i];
-        v[i * 2].color = c;
-        v[i * 2].tex_coord.x = v[i * 2].tex_coord.y = 0.0f;
-        v[i * 2 + 1].position = pi[i];
-        v[i * 2 + 1].color = c;
-        v[i * 2 + 1].tex_coord.x = v[i * 2 + 1].tex_coord.y = 0.0f;
-    }
-    int idx[(CSEG + 1) * 4 * 6];
+    SDL_FPoint ring[4][RN];
+    int n = 0;
+    for (int k = 0; k < 4; k++)
+        n = round_ring(r, radius, off[k], g->scale, ring[k]);
+
+    SDL_Vertex v[RN * 4];
+    for (int k = 0; k < 4; k++)
+        for (int i = 0; i < n; i++) {
+            SDL_Vertex *p = &v[k * n + i];
+            p->position = ring[k][i];
+            p->color = *col[k];
+            p->tex_coord.x = p->tex_coord.y = 0.0f;
+        }
+    int idx[RN * 18];
     int ni = 0;
-    for (int i = 0; i < n; i++) {
-        int j = (i + 1) % n;
-        idx[ni++] = i * 2;
-        idx[ni++] = j * 2;
-        idx[ni++] = i * 2 + 1;
-        idx[ni++] = j * 2;
-        idx[ni++] = j * 2 + 1;
-        idx[ni++] = i * 2 + 1;
-    }
-    geometry(g, NULL, v, n * 2, idx, ni);
+    for (int k = 0; k < 3; k++)
+        for (int i = 0; i < n; i++) {
+            int j = (i + 1) % n;
+            int o = k * n, q = (k + 1) * n;
+            idx[ni++] = o + i;
+            idx[ni++] = o + j;
+            idx[ni++] = q + i;
+            idx[ni++] = o + j;
+            idx[ni++] = q + j;
+            idx[ni++] = q + i;
+        }
+    geometry(g, NULL, v, n * 4, idx, ni);
 }
 
 void gfx_line(gfx *g, float x0, float y0, float x1, float y1, float w,
@@ -322,33 +414,56 @@ static int disc_draw(gfx *g, float cx, float cy, float r, float w,
     return 1;
 }
 
+/* Non-circular ellipses only -- a circle went to disc_tex above, which is
+ * exact. These get the same ramp the rounded rects get, for the same reason. */
+static void ellipse_ring(gfx *g, float cx, float cy, float rx, float ry,
+                         float t, SDL_FPoint *out)
+{
+    float ax = rx + t, ay = ry + t;
+    if (ax < 0.0f) ax = 0.0f;
+    if (ay < 0.0f) ay = 0.0f;
+    for (int i = 0; i < ESEG; i++) {
+        float th = (float)i / ESEG * 6.2831853f;
+        out[i].x = (cx + ax * cosf(th)) * g->scale;
+        out[i].y = (cy + ay * sinf(th)) * g->scale;
+    }
+}
+
 void gfx_ellipse(gfx *g, float cx, float cy, float rx, float ry, uint32_t rgb,
                  float a)
 {
     if (rx > 0 && ry > 0 && rx - ry < 0.01f && ry - rx < 0.01f &&
         disc_draw(g, cx, cy, rx, 0.0f, rgb, a))
         return;
-    SDL_FColor c = fcol(rgb, a);
-    SDL_Vertex v[ESEG + 1];
+    float e = feather_u(g);
+    SDL_FColor c = fcol(rgb, a), c0 = c;
+    c0.a = 0.0f;
+    SDL_FPoint in[ESEG], out[ESEG];
+    ellipse_ring(g, cx, cy, rx, ry, -e, in);
+    ellipse_ring(g, cx, cy, rx, ry, e, out);
+
+    SDL_Vertex v[ESEG * 2 + 1];
     v[0].position.x = cx * g->scale;
     v[0].position.y = cy * g->scale;
     v[0].color = c;
-    v[0].tex_coord.x = v[0].tex_coord.y = 0.0f;
     for (int i = 0; i < ESEG; i++) {
-        float t = (float)i / ESEG * 6.2831853f;
-        v[i + 1].position.x = (cx + rx * cosf(t)) * g->scale;
-        v[i + 1].position.y = (cy + ry * sinf(t)) * g->scale;
-        v[i + 1].color = c;
-        v[i + 1].tex_coord.x = v[i + 1].tex_coord.y = 0.0f;
+        v[1 + i].position = in[i];
+        v[1 + i].color = c;
+        v[1 + ESEG + i].position = out[i];
+        v[1 + ESEG + i].color = c0;
     }
-    int idx[ESEG * 3];
+    for (int i = 0; i < ESEG * 2 + 1; i++)
+        v[i].tex_coord.x = v[i].tex_coord.y = 0.0f;
+
+    int idx[ESEG * 9];
     int ni = 0;
     for (int i = 0; i < ESEG; i++) {
-        idx[ni++] = 0;
-        idx[ni++] = 1 + i;
-        idx[ni++] = 1 + (i + 1) % ESEG;
+        int j = (i + 1) % ESEG;
+        idx[ni++] = 0; idx[ni++] = 1 + i; idx[ni++] = 1 + j;
+        idx[ni++] = 1 + i; idx[ni++] = 1 + j; idx[ni++] = 1 + ESEG + i;
+        idx[ni++] = 1 + j; idx[ni++] = 1 + ESEG + j; idx[ni++] = 1 + ESEG + i;
     }
-    geometry(g, NULL, v, ESEG + 1, idx, ni);
+    geometry(g, NULL, v, ESEG * 2 + 1, idx, ni);
 }
 
 void gfx_ellipse_stroke(gfx *g, float cx, float cy, float rx, float ry,
@@ -357,33 +472,37 @@ void gfx_ellipse_stroke(gfx *g, float cx, float cy, float rx, float ry,
     if (rx > 0 && ry > 0 && rx - ry < 0.01f && ry - rx < 0.01f &&
         disc_draw(g, cx, cy, rx + w / 2.0f, w, rgb, a))
         return;
-    SDL_FColor c = fcol(rgb, a);
-    float h = w / 2.0f;
-    SDL_Vertex v[ESEG * 2];
-    for (int i = 0; i < ESEG; i++) {
-        float t = (float)i / ESEG * 6.2831853f;
-        float co = cosf(t), si = sinf(t);
-        v[i * 2].position.x = (cx + (rx + h) * co) * g->scale;
-        v[i * 2].position.y = (cy + (ry + h) * si) * g->scale;
-        v[i * 2 + 1].position.x = (cx + (rx - h) * co) * g->scale;
-        v[i * 2 + 1].position.y = (cy + (ry - h) * si) * g->scale;
-        for (int k = 0; k < 2; k++) {
-            v[i * 2 + k].color = c;
-            v[i * 2 + k].tex_coord.x = v[i * 2 + k].tex_coord.y = 0.0f;
+    float h = w / 2.0f, e = feather_u(g);
+    float hi = h - e;
+    if (hi < 0.0f)
+        hi = 0.0f;
+    const float off[4] = { h + e, hi, -hi, -(h + e) };
+    SDL_FColor c = fcol(rgb, a), c0 = c;
+    c0.a = 0.0f;
+    const SDL_FColor *col[4] = { &c0, &c, &c, &c0 };
+
+    SDL_FPoint ring[4][ESEG];
+    for (int k = 0; k < 4; k++)
+        ellipse_ring(g, cx, cy, rx, ry, off[k], ring[k]);
+
+    SDL_Vertex v[ESEG * 4];
+    for (int k = 0; k < 4; k++)
+        for (int i = 0; i < ESEG; i++) {
+            SDL_Vertex *p = &v[k * ESEG + i];
+            p->position = ring[k][i];
+            p->color = *col[k];
+            p->tex_coord.x = p->tex_coord.y = 0.0f;
         }
-    }
-    int idx[ESEG * 6];
+    int idx[ESEG * 18];
     int ni = 0;
-    for (int i = 0; i < ESEG; i++) {
-        int j = (i + 1) % ESEG;
-        idx[ni++] = i * 2;
-        idx[ni++] = j * 2;
-        idx[ni++] = i * 2 + 1;
-        idx[ni++] = j * 2;
-        idx[ni++] = j * 2 + 1;
-        idx[ni++] = i * 2 + 1;
-    }
-    geometry(g, NULL, v, ESEG * 2, idx, ni);
+    for (int k = 0; k < 3; k++)
+        for (int i = 0; i < ESEG; i++) {
+            int j = (i + 1) % ESEG;
+            int o = k * ESEG, q = (k + 1) * ESEG;
+            idx[ni++] = o + i; idx[ni++] = o + j; idx[ni++] = q + i;
+            idx[ni++] = o + j; idx[ni++] = q + j; idx[ni++] = q + i;
+        }
+    geometry(g, NULL, v, ESEG * 4, idx, ni);
 }
 
 void gfx_clip_push(gfx *g, gfx_rect r)
@@ -487,34 +606,15 @@ void gfx_tex_draw(gfx *g, gfx_tex *t, gfx_rect dst, float radius, float a)
         SDL_SetTextureAlphaModFloat(t->t, 1.0f);
         return;
     }
-    /* Rounded corners by geometry: the outline fanned from the center, each
-     * vertex UV-mapped back into the texture. */
-    SDL_FPoint pts[(CSEG + 1) * 4];
-    int n = round_outline(dst, radius, g->scale, pts);
-    SDL_FColor c = { 1.0f, 1.0f, 1.0f, 1.0f };
-
-    SDL_Vertex v[(CSEG + 1) * 4 + 1];
+    /* Rounded corners by geometry, UV-mapped back into the texture, and with
+     * the same edge ramp every other rounded shape gets -- an avatar is the
+     * one place a jagged arc sits right beside a face. */
     float sx = dst.x * g->scale, sy = dst.y * g->scale;
     float sw = dst.w * g->scale, sh = dst.h * g->scale;
-    v[0].position.x = sx + sw / 2.0f;
-    v[0].position.y = sy + sh / 2.0f;
-    v[0].color = c;
-    v[0].tex_coord.x = 0.5f;
-    v[0].tex_coord.y = 0.5f;
-    for (int i = 0; i < n; i++) {
-        v[i + 1].position = pts[i];
-        v[i + 1].color = c;
-        v[i + 1].tex_coord.x = (pts[i].x - sx) / sw;
-        v[i + 1].tex_coord.y = (pts[i].y - sy) / sh;
-    }
-    int idx[(CSEG + 1) * 4 * 3];
-    int ni = 0;
-    for (int i = 0; i < n; i++) {
-        idx[ni++] = 0;
-        idx[ni++] = 1 + i;
-        idx[ni++] = 1 + (i + 1) % n;
-    }
-    geometry(g, t->t, v, n + 1, idx, ni);
+    if (sw < 1.0f) sw = 1.0f;
+    if (sh < 1.0f) sh = 1.0f;
+    SDL_FColor c = { 1.0f, 1.0f, 1.0f, 1.0f };
+    fan_round(g, dst, radius, c, t->t, sx, sy, sw, sh);
     SDL_SetTextureAlphaModFloat(t->t, 1.0f);
 }
 
@@ -522,35 +622,12 @@ void gfx_tex_draw_shaped(gfx *g, gfx_tex *t, gfx_rect shape, float radius,
                          gfx_rect map, float a)
 {
     SDL_SetTextureAlphaModFloat(t->t, a);
-    SDL_FPoint pts[(CSEG + 1) * 4];
-    int n = round_outline(shape, radius, g->scale, pts);
-    SDL_FColor c = { 1.0f, 1.0f, 1.0f, 1.0f };
-
     float mx = map.x * g->scale, my = map.y * g->scale;
     float mw = map.w * g->scale, mh = map.h * g->scale;
     if (mw < 1.0f) mw = 1.0f;
     if (mh < 1.0f) mh = 1.0f;
-
-    SDL_Vertex v[(CSEG + 1) * 4 + 1];
-    v[0].position.x = (shape.x + shape.w / 2.0f) * g->scale;
-    v[0].position.y = (shape.y + shape.h / 2.0f) * g->scale;
-    v[0].color = c;
-    v[0].tex_coord.x = (v[0].position.x - mx) / mw;
-    v[0].tex_coord.y = (v[0].position.y - my) / mh;
-    for (int i = 0; i < n; i++) {
-        v[i + 1].position = pts[i];
-        v[i + 1].color = c;
-        v[i + 1].tex_coord.x = (pts[i].x - mx) / mw;
-        v[i + 1].tex_coord.y = (pts[i].y - my) / mh;
-    }
-    int idx[(CSEG + 1) * 4 * 3];
-    int ni = 0;
-    for (int i = 0; i < n; i++) {
-        idx[ni++] = 0;
-        idx[ni++] = 1 + i;
-        idx[ni++] = 1 + (i + 1) % n;
-    }
-    geometry(g, t->t, v, n + 1, idx, ni);
+    SDL_FColor c = { 1.0f, 1.0f, 1.0f, 1.0f };
+    fan_round(g, shape, radius, c, t->t, mx, my, mw, mh);
     SDL_SetTextureAlphaModFloat(t->t, 1.0f);
 }
 
