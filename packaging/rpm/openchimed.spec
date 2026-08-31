@@ -34,9 +34,9 @@ Version:        %{_version}
 Release:        1%{?dist}
 Summary:        OpenChime chat daemon
 
-# The daemon's own code is not open source; the components it links are. RPM
-# expects one field, so both are named.
-License:        Proprietary AND Apache-2.0 AND MIT
+# The daemon's own code and the components it links. RPM expects one field, so
+# all are named.
+License:        AGPL-3.0-or-later AND Apache-2.0 AND MIT
 URL:            https://openchime.io
 BuildArch:      %{_target_cpu}
 

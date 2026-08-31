@@ -248,16 +248,17 @@ Should return `OK`.
 
 ## Licence
 
-Two licences, split by what the code is:
+One licence for everything we wrote: **AGPL-3.0-or-later** (`LICENSE`) — daemon,
+clients, `shared/`, `tuikit/`, and the surrounding scripts, packaging, docs and
+tests alike.
 
-- **`daemon/`** and everything not listed below: **AGPL-3.0-or-later** (`LICENSE`).
-  Section 13 is the point of choosing it: run a modified openchimed as a service
-  for other people, and those users are entitled to your modified source.
-- **`client/`, `shared/`, `tuikit/`**: **MIT** (`LICENSE-MIT`).
+Section 13 is the point of choosing it: run a modified openchimed as a service
+for other people, and those users are entitled to your modified source. The
+clients carry the same terms rather than a permissive licence, so the strategy is
+not half-applied and the daemon/client link raises no questions.
 
-`shared/` is MIT rather than AGPL because the client links it — had it been
-AGPL, every client binary would be a work based on AGPL code and the MIT label
-would have been decorative.
+`third_party/` is other people's work under their own permissive licences and is
+unaffected.
 
 Contributions are taken under the Developer Certificate of Origin (`DCO.txt`);
 sign off with `git commit -s`. There is no CLA and copyright is not assigned.

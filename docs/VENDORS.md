@@ -13,10 +13,12 @@ are four ways a dependency enters the build; each row below says which:
 | **System / OS package** | Provided by the host or base image, linked at build | Pinned by the OS, not by us |
 | **Container image** | Base of the published deployment image; not used for dev or test | Per the image tag |
 
-**License posture:** everything linked into the shipping **daemon** and **TUI**
-is permissive — MIT, Apache-2.0, Public Domain, or (for the *optional, dynamically
-linked* libsecret/glib) LGPL-2.1. No GPL/AGPL code is linked into any shipped
-binary.
+**License posture:** our own code is AGPL-3.0-or-later throughout
+([LICENSING.md](../LICENSING.md)); every *third-party* component linked into the
+shipping **daemon** and **TUI** is permissive — MIT, Apache-2.0, Public Domain,
+or (for the *optional, dynamically linked* libsecret/glib) LGPL-2.1-or-later. No
+third-party GPL/AGPL code is linked into any shipped binary, and every one of
+these is compatible with the AGPL.
 
 ---
 
@@ -238,6 +240,7 @@ paths ship; nothing is fetched at runtime.
 | **LGPL-2.1** | libsecret, glib, glibc (resolv/pthreads) | Dynamically linked / optional — LGPL satisfied by dynamic linking |
 | **Unicode license** | utf8proc bundled data tables | Alongside utf8proc's MIT code |
 
-**Bottom line:** the shipped daemon and TUI are permissively licensed
-(MIT/Apache/Public-Domain, plus optional dynamic LGPL). No AGPL third-party
-code exists anywhere in the build.
+**Bottom line:** every third-party dependency in the shipped daemon and TUI is
+permissively licensed (MIT/Apache/Public-Domain, plus optional dynamic LGPL), so
+all of them are compatible with the AGPL-3.0-or-later terms our own code carries.
+No third-party AGPL code exists anywhere in the build.

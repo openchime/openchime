@@ -48,8 +48,8 @@ The complete corresponding source is at https://github.com/openchime/openchime
 and the licence is reproduced below. Note section 13: if you run a modified
 openchimed as a network service, its users are entitled to that modified source.
 
-The client (client/, shared/ and tuikit/ in that repository) is MIT-licensed and
-is not covered by the AGPL; see LICENSING.md there.
+The clients (client/, shared/ and tuikit/ in that repository) are covered by the
+same licence; see LICENSING.md there.
 
 THIRD-PARTY COMPONENTS
 ======================

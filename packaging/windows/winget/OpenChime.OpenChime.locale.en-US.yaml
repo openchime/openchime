@@ -12,10 +12,11 @@ PublisherSupportUrl: https://openchime.io
 PackageName: OpenChime
 PackageUrl: https://openchime.io
 
-# The daemon and the client share a source tree that is not public, so the
-# binary ships under the same terms packaging/licenses.sh states.
-License: Proprietary
-Copyright: Copyright (c) Danny Heskett. All rights reserved.
+# The daemon and the client share one source tree under one licence; the binary
+# ships under the same terms packaging/licenses.sh states.
+License: AGPL-3.0-or-later
+LicenseUrl: https://github.com/openchime/openchime/blob/main/LICENSE
+Copyright: Copyright (c) Danny Heskett.
 
 ShortDescription: Desktop client for a self-hostable business chat system.
 Description: |-
