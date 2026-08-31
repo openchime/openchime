@@ -6683,7 +6683,7 @@ enum { PREF_ROW_DELIVER = 90, PREF_ROW_SNDMUTE = 91,
        PREF_ROW_CLOSE = 92, PREF_ROW_MINTRAY = 93, PREF_ROW_STARTUP = 94 };
 enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
        PREF_ROW_NOTIFY, PREF_ROW_QUICK, PREF_ROW_ACCENT, PREF_ROW_TEXTSIZE,
-       PREF_ROW_DENSITY, PREF_ROW_DPI, PREF_ROW_RESET,
+       PREF_ROW_DENSITY, PREF_ROW_RESET,
        PREF_ROW_EDITOR, PREF_ROW_FLASH };
 
 /* Preferences is two-paned: categories left, one category's rows right.
@@ -6694,13 +6694,13 @@ enum { PREF_ROW_THEME = 0, PREF_ROW_TIME, PREF_ROW_MEMBERS, PREF_ROW_DAYSEP,
  *
  * Categories are an enum rather than strings so the click router and the painter
  * cannot disagree about which is showing. */
-enum { PC_APPEARANCE = 0, PC_MESSAGES, PC_NOTIFICATIONS, PC_SYSTEM, PC_ADVANCED, PC_COUNT };
+enum { PC_APPEARANCE = 0, PC_MESSAGES, PC_NOTIFICATIONS, PC_SYSTEM, PC_COUNT };
 /* SYSTEM is where the application behaves as an application rather than as a
  * chat surface: what the close button does, whether it starts with Windows.
  * Those had no home, which is why closing to the tray shipped with no way to
  * turn it off. */
 static const char *PC_NAME[PC_COUNT] = { "Appearance", "Messages", "Notifications",
-                                         "System", "Advanced" };
+                                         "System" };
 static int g_pref_cat = PC_APPEARANCE;
 static rectf g_pref_cats[PC_COUNT];
 
@@ -6761,7 +6761,19 @@ static void draw_prefs(gfx *rt, rectf reg) {
      * becomes a wrapping chip row above the rows it filters, which is the same
      * move the notifications card's mode chips make and costs one line instead of
      * a column. The width is scaled now too: the names are text. */
-    float catw = UIS(168.0f);
+    /* THE COLUMN IS AS WIDE AS ITS WIDEST NAME. A flat 168 DIP was a guess, and
+     * it left the divider some 35 DIP clear of the longest label -- a stripe of
+     * empty column that read as the content pane being indented rather than as
+     * the rail being roomy. Measured in the BOLD face, which is what a selected
+     * name is drawn in and therefore the widest the column ever has to hold. */
+    float catw = 0.0f;
+    for (int i = 0; i < PC_COUNT; i++) {
+        float w = text_width(PC_NAME[i], g_ui_b);
+        if (w > catw) catw = w;
+    }
+    /* 8 out to the pill and 12 more to the text, the same 12 back out, and the 9
+     * the row already keeps clear of the divider. */
+    catw += UIS(41.0f) + MODAL_PAD;
     int narrow = (reg.right - reg.left) < catw + UIS(260.0f);
     rectf body;
 
@@ -6902,22 +6914,15 @@ static void draw_prefs(gfx *rt, rectf reg) {
         y = pref_row(rt, body, y, PREF_ROW_STARTUP, "Start with Windows",
                      "Sign in and start receiving messages when you log in.",
                      ONOFF2, 2, startup_enabled() ? 1 : 0);
-    } else {
+        /* Reset ends the category it belongs to. "Advanced" held this and a DPI
+         * override and nothing else; the override was a harness affordance that
+         * had no business being a user-facing setting, and one button is not a
+         * category. The app manages DPI from what Windows reports (ARCH-97) and
+         * the harness drives it through the `dpi` verb, which never went through
+         * here. */
         static const char *RESET1[1] = { "Reset" };
         y = pref_row(rt, body, y, PREF_ROW_RESET, "Reset preferences",
                      "Back to the defaults; applied on Save.", RESET1, 1, -1);
-        /* THE DPI OVERRIDE IS A TEST AFFORDANCE, and its own hint said so --
-         * "for layout checks". It exists to drive the scale matrix from the
-         * harness, so it appears only when the harness is attached rather than
-         * shipping to everyone as an Advanced setting. */
-        if (g_test_dir[0]) {
-            static const char *DPIS[4] = { "96", "120", "144", "192" };
-            char dh[96];
-            snprintf(dh, sizeof dh, "Currently %d. For layout checks.", g_dpi);
-            int dsel = g_dpi == 96 ? 0 : g_dpi == 120 ? 1 : g_dpi == 144 ? 2
-                     : g_dpi == 192 ? 3 : -1;
-            y = pref_row(rt, body, y, PREF_ROW_DPI, "DPI override", dh, DPIS, 4, dsel);
-        }
     }
 
     g_prefs_content_h = y - rows_top;
@@ -15882,10 +15887,6 @@ static int on_click(HWND hwnd, int x, int y) {
             case PREF_ROW_TEXTSIZE: g_pref_textsize = v; scale_apply(hwnd); break;
             case PREF_ROW_DENSITY:  g_pref_density = v; g_density = v ? 1.0f : 0.6f; break;
 
-            case PREF_ROW_DPI: {
-                static const int DPIV[4] = { 96, 120, 144, 192 };
-                dpi_set(hwnd, (UINT)DPIV[v < 0 ? 0 : (v > 3 ? 3 : v)]);
-                break; }
             case PREF_ROW_RESET:
                 /* Not persisted here: Save commits, like every other control on
                  * this card. Cancel puts the old values back from the snapshot. */
