@@ -654,15 +654,21 @@ invisible to any check that never saw its rects.
 
 ## Preferences is two-paned, and appearance applies live
 
-Categories left (**Appearance / Messages / Notifications / Advanced**), one pane's
-rows right. A row's hit-boxes exist only while its category is showing — the click
+Categories left (**Appearance / Messages / Notifications / System**), one pane's
+rows right. **System** is where the app behaves as an application rather than as a
+chat surface — what the close button does, whether it starts with Windows — and it
+ends with Reset. There is no *Advanced*: it held Reset and a DPI override, the
+override was a harness affordance rather than a setting (the app takes its scale
+from what Windows reports, ARCH-97), and one button is not a category.
+
+A row's hit-boxes exist only while its category is showing — the click
 router and the painter share `g_pref_cat` so they cannot disagree — and the sheet
 reopens on the pane you left it on.
 
 **Appearance applies live and reverts on Cancel.** A colour, a text size and a
 density are their own preview; you cannot judge any of them from a label. The
-snapshot therefore covers the accent, the text size, the density, the zoom step and
-the DPI, and `prefs_restore` re-applies each through the one path that knows what it
+snapshot therefore covers the accent, the text size, the density and the DPI, and
+`prefs_restore` re-applies each through the one path that knows what it
 costs (`scale_apply` rebuilds every text format and drops the raster caches;
 `dpi_set` lets the next paint's scale pass rebuild them lazily).
 
