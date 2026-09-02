@@ -1692,6 +1692,10 @@ enum { TAB_MESSAGES = 0, TAB_FILES, TAB_PINS, TAB_ABOUT, TAB_COUNT };
  * the channel tabs above: they share a drawing routine, not a meaning. */
 enum { DTAB_DRAFTS = 0, DTAB_SCHEDULED, DTAB_SENT, DTAB_COUNT };
 static int g_dtab;
+/* The About tab's scroll offset and the room it has to move (REQ-034/035/036):
+ * its content is prose whose height follows the text scale, so at the larger
+ * sizes it outgrows the pane. */
+static float g_about_scroll, g_about_h, g_about_max;
 
 /* Does this tab exist for this conversation?
  *
@@ -6080,7 +6084,19 @@ static void draw_about(gfx *rt, const oc_model *m, rectf reg) {
     const oc_channel *c = oc_model_channel((oc_model *)m, g_sel);
     if (!c) { overlay_empty(rt, reg, "No channel."); return; }
 
-    float x = reg.left + 24, w = reg.right - reg.left - 48, y = reg.top + 20;
+    /* THE PANE SCROLLS, AND IS CLIPPED TO ITSELF. Its content is prose and
+     * buttons whose height follows the text scale, and at the larger sizes it
+     * is taller than the pane -- so the tail of it was drawn below the bottom
+     * of the window, where it could be neither read nor clicked, and there was
+     * no way to bring it up.
+     *
+     * Clipping alone would have been cosmetic: the content is equally
+     * unreachable clipped or not, and only a check could tell the difference.
+     * What was actually missing is a way to reach it, so the pane takes the
+     * wheel and offsets its content, and the clip is what keeps that honest. */
+    gfx_clip_push(rt, gr(reg));
+    float x = reg.left + 24, w = reg.right - reg.left - 48;
+    float y = reg.top + 20 - g_about_scroll;
     char line[320];
 
     snprintf(line, sizeof line, "%s%s", c->kind == OC_CHANNEL_KIND_DM ? "@ " :
@@ -6190,19 +6206,41 @@ static void draw_about(gfx *rt, const oc_model *m, rectf reg) {
         /* The visibility line says what the NEXT click would do, and says the
          * dangerous direction plainly: going public is not "a setting", it is
          * publishing everything already said in here. */
-        draw_text(rt, c->is_public
-                      ? "Making it private keeps its history for members only; people who never "
-                        "joined lose access."
-                      : "Making it public shows this channel AND ITS WHOLE HISTORY to everyone in "
-                        "the workspace. Flipping it back does not un-show it.",
-                  g_meta_w, rf(x, y, x + w, y + 40), c->is_public ? OC_COL_FAINT : OC_COL_NOTICE);
-        y += 42;
-        draw_text(rt, c->archived
-                      ? "Unarchiving makes the channel writable again."
-                      : "Archiving makes it read-only and hides it from people who are not in it. "
-                        "History stays searchable, and it can be undone.",
-                  g_meta_w, rf(x, y, x + w, y + 56), OC_COL_FAINT);
+        /* MEASURED, not assumed. Both of these are wrapping prose in boxes that
+         * were a fixed 40 and 56 DIP tall, which held while the text fitted two
+         * lines and stopped holding the moment the text size grew it to three:
+         * the first paragraph was cut mid-sentence and the second began
+         * immediately under the cut, so the two read as one mangled block. The
+         * sentences say what publishing a channel's whole history does, which
+         * is not a sentence to deliver half of. */
+        const char *vis_s = c->is_public
+                ? "Making it private keeps its history for members only; people who never "
+                  "joined lose access."
+                : "Making it public shows this channel AND ITS WHOLE HISTORY to everyone in "
+                  "the workspace. Flipping it back does not un-show it.";
+        const char *arc_s = c->archived
+                ? "Unarchiving makes the channel writable again."
+                : "Archiving makes it read-only and hides it from people who are not in it. "
+                  "History stays searchable, and it can be undone.";
+        float vh = text_height(vis_s, g_meta_w, w);
+        draw_text(rt, vis_s, g_meta_w, rf(x, y, x + w, y + vh),
+                  c->is_public ? OC_COL_FAINT : OC_COL_NOTICE);
+        y += vh + 8;
+        float ah = text_height(arc_s, g_meta_w, w);
+        draw_text(rt, arc_s, g_meta_w, rf(x, y, x + w, y + ah), OC_COL_FAINT);
+        y += ah + 8;
     }
+    /* What the wheel is allowed to move, measured from what was just laid out
+     * rather than guessed -- the content's height changes with the text size,
+     * the role and whether the channel is archived. */
+    g_about_h = (y + g_about_scroll) - reg.top + 20;
+    float over = g_about_h - (reg.bottom - reg.top);
+    g_about_max = over > 0 ? over : 0;
+    if (g_about_scroll > g_about_max) {
+        g_about_scroll = g_about_max;
+        InvalidateRect(g_main_hwnd, NULL, FALSE);
+    }
+    gfx_clip_pop(rt);
 }
 
 static void draw_pinlist(gfx *rt, const oc_model *m, rectf reg) {
@@ -7686,7 +7724,29 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
     /* The mode label needs its own band, or it collides with the first row — which
      * it did. Panel height and row origin both account for it. */
     float hint_h = g_fwd_mid ? 18.0f : 0.0f;
-    float ph = 58 + hint_h + (nh ? nh * rowh : rowh) + 10;
+    /* THE PANEL STAYS INSIDE THE WINDOW. Its height was the row count times a
+     * scaled row height plus its chrome, with nothing bounding it, so at large
+     * text sizes it grew past the bottom of the window and its lower rows were
+     * drawn where they could not be seen or clicked -- while the keyboard
+     * happily selected them.
+     *
+     * The rows are what give way, and they scroll rather than being truncated:
+     * Up and Down cycle through every match, so a list that only DREW the first
+     * few would let Enter accept something never shown. */
+    int vis = nh;
+    {
+        float chrome = 58 + hint_h + 10;
+        float room = H - py - 16 - chrome;
+        int fits = (int)(room / rowh);
+        if (fits < 1) fits = 1;
+        if (vis > fits) vis = fits;
+    }
+    int pfirst = 0;
+    if (g_pal_sel >= vis) pfirst = g_pal_sel - vis + 1;
+    if (pfirst > nh - vis) pfirst = nh - vis;
+    if (pfirst < 0) pfirst = 0;
+
+    float ph = 58 + hint_h + (nh ? vis * rowh : rowh) + 10;
     g_pal_panel = rf(px, py, px + pw, py + ph);
     fill_round(rt, rf(px + 3, py + 5, px + pw + 3, py + ph + 5), OC_R_OVERLAY, 0x000000);
     fill_round(rt, g_pal_panel, OC_R_OVERLAY, OC_COL_INPUT);
@@ -7709,7 +7769,7 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
                   rf(px + 20, y, px + pw - 20, y + rowh), OC_COL_FAINT);
         return;
     }
-    for (int i = 0; i < nh; i++) {
+    for (int i = pfirst; i < pfirst + vis; i++) {
         rectf r = rf(px + 6, y, px + pw - 6, y + rowh);
         if (i == g_pal_sel) fill_round(rt, r, OC_R_CONTROL, OC_COL_ACCENT);
         draw_text(rt, hit[i].label, g_ui, rf(px + 18, y, px + pw - 90, y + rowh),
@@ -11400,7 +11460,8 @@ static int tgt_char(WCHAR ch) {
 
 /* Draw the field and, when there is something to show, the list under it.
  * Returns the field's height so the caller can place what follows. */
-static float tgt_draw(gfx *rt, const oc_model *m, rectf box, int focused) {
+static float tgt_draw(gfx *rt, const oc_model *m, rectf box, int focused,
+                      float list_max_h) {
     g_tgt_box = box;
     fill_round(rt, box, OC_R_CONTROL, OC_COL_INPUT);
     stroke_round(rt, box, OC_R_CONTROL, focused ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
@@ -11433,12 +11494,35 @@ static float tgt_draw(gfx *rt, const oc_model *m, rectf box, int focused) {
     if (!g_n_tgt) return box.bottom - box.top;
 
     float rowh = UIS(34), ly = box.bottom + UIS(4);
-    float lh = (float)g_n_tgt * rowh + 8;
+    /* THE LIST TAKES ONLY THE ROOM IT WAS GIVEN. It used to size itself to the
+     * number of matches and push the composer down by exactly that much, so a
+     * long list at a large text size pushed the composer -- and the list's own
+     * lower rows -- off the bottom of the window, where they were still drawn
+     * and could not be seen or clicked. A suggestion nobody can reach is worse
+     * than a shorter list, so the list is what gives way. */
+    int shown = g_n_tgt;
+    if (list_max_h > 0) {
+        int fits = (int)((list_max_h - 8) / rowh);
+        if (fits < 1) fits = 1;          /* one row, or the field says nothing */
+        if (shown > fits) shown = fits;
+    }
+    /* The window SCROLLS to hold the selection rather than the match list being
+     * truncated to fit. Up and Down cycle through every match, so a cap alone
+     * would let the selection walk off the end of what is drawn -- pressing
+     * Enter would then accept something the field never showed, which is worse
+     * than the clipping this is fixing. */
+    int first = 0;
+    if (g_tgt_sel >= shown) first = g_tgt_sel - shown + 1;
+    if (first > g_n_tgt - shown) first = g_n_tgt - shown;
+    if (first < 0) first = 0;
+    for (int i = 0; i < g_n_tgt; i++)
+        if (i < first || i >= first + shown) g_tgt_rows[i] = rf(0, 0, 0, 0);
+    float lh = (float)shown * rowh + 8;
     rectf list = rf(box.left, ly, box.right, ly + lh);
     fill_round(rt, list, OC_R_CONTROL, OC_COL_BASE);
     stroke_round(rt, list, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
     float y = ly + 4;
-    for (int i = 0; i < g_n_tgt; i++) {
+    for (int i = first; i < first + shown; i++) {
         rectf row = rf(list.left + 4, y, list.right - 4, y + rowh);
         if (i == g_tgt_sel) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
         if (g_tgt[i].is_channel) {
@@ -11487,12 +11571,15 @@ static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
 
     float pad = 24;
     rectf tobox = rf(body.left + pad, body.top + 16, body.right - pad, body.top + 54);
-    float grew = tgt_draw(rt, m, tobox, g_nm_to_focus);
+    float eh = 150;   /* toolbar + text + the action row */
+    /* What is left for the suggestion list once the composer has its room. The
+     * composer is the point of the pane, so it is not the thing that yields. */
+    float list_max = (body.bottom - 16 - eh - 16) - (tobox.bottom + UIS(4.0f));
+    float grew = tgt_draw(rt, m, tobox, g_nm_to_focus, list_max);
 
     /* The composer sits below whatever the picker's list took, so an open list
      * pushes it down rather than covering it. */
     float ey = tobox.top + grew + 16;
-    float eh = 150;   /* toolbar + text + the action row */
     rectf edbox = rf(body.left + pad, ey, body.right - pad, ey + eh);
     fill_round(rt, edbox, OC_R_CONTROL, OC_COL_INPUT);
     stroke_round(rt, edbox, OC_R_CONTROL, g_nm_to_focus ? OC_COL_BORDER : OC_COL_ACCENT, 1.0f);
@@ -19496,6 +19583,9 @@ static void test_dump(const char *path) {
          * scroll" has three different causes — the wheel never reached it, the
          * content height came out zero, or the offset is being reset every frame
          * — and from outside they look identical. */
+        /* The About pane's, for the same three-causes-one-symptom reason. */
+        fprintf(f, "about tab=%d scroll=%.0f max=%.0f h=%.0f\n",
+                g_tab, g_about_scroll, g_about_max, g_about_h);
         fprintf(f, "ovl kind=%d scroll=%.0f max=%.0f notifyh=%.0f\n",
                 g_ovl_kind, g_ovl_scroll, g_ovl_max, g_notify_content_h);
         fprintf(f, "schedbase=%.0f,%.0f %.0f,%.0f tpopen=%d tprows=%d\n",
@@ -21214,6 +21304,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_thr_scroll += dy;
             if (g_thr_scroll < 0) g_thr_scroll = 0;
             if (g_thr_scroll > g_thr_scroll_max) g_thr_scroll = g_thr_scroll_max;
+        } else if (g_tab == TAB_ABOUT && transcript_shell() && g_sel) {
+            /* The About pane is prose that outgrows its pane at the larger text
+             * sizes, and it has no other way to be reached.
+             *
+             * NOT gated on main_is_conversation(): that predicate answers "can
+             * you type into this column", and About is precisely a tab where you
+             * cannot -- so gating on it made this branch unreachable in the only
+             * place it applies. The question here is which SURFACE owns the
+             * wheel, which is a different question with a different answer. */
+            g_about_scroll -= dy;
+            if (g_about_scroll < 0) g_about_scroll = 0;
+            if (g_about_scroll > g_about_max) g_about_scroll = g_about_max;
         } else if (g_view == VIEW_LATER || g_view == VIEW_FILES) {
             /* The Later and Files lists share the overlay offset (OVL_LATER /
              * OVL_FILES), so the wheel has to reach it here or they scroll only by
