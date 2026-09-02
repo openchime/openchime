@@ -6100,15 +6100,29 @@ static void draw_about(gfx *rt, const oc_model *m, rectf reg) {
 
     draw_text(rt, "TOPIC", g_meta, rf(x, y, x + w, y + 20), OC_COL_FAINT);
     y += 22;
-    draw_text(rt, (c->topic && c->topic[0]) ? c->topic : "No topic set.", g_ui,
-              rf(x, y, x + w - 120, y + 44),
-              (c->topic && c->topic[0]) ? OC_COL_TEXT : OC_COL_FAINT);
-    g_about_topic = rf(reg.right - 24 - 110, y - 4, reg.right - 24, y + 24);
-    stroke_round(rt, g_about_topic, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-    g_meta->align = ST_ALIGN_CENTER;
-    draw_text(rt, "Set topic", g_meta, g_about_topic, OC_COL_MUTED);
-    g_meta->align = ST_ALIGN_LEFT;
-    y += 56;
+    /* The button is MEASURED and the topic gets what is left -- and when what is
+     * left is not enough to read, the button drops to its own line instead.
+     * Both used to be fixed: the button 110 DIP at a fixed inset, the topic
+     * given `w - 120` whatever w was. At the largest scales that left the topic
+     * 48 device pixels and "No topic set." was ellipsized to "N...", which
+     * says nothing at all while still occupying a row. */
+    {
+        float bw = text_width("Set topic", g_meta) + 32;
+        float avail = w - bw - 16;
+        const char *topic = (c->topic && c->topic[0]) ? c->topic : "No topic set.";
+        /* Enough for a few characters, or the row is not worth splitting. */
+        int inline_btn = avail >= text_width("No topic set.", g_ui);
+        draw_text(rt, topic, g_ui,
+                  rf(x, y, x + (inline_btn ? avail : w), y + 44),
+                  (c->topic && c->topic[0]) ? OC_COL_TEXT : OC_COL_FAINT);
+        float by = inline_btn ? y - 4 : y + 30;
+        g_about_topic = rf(reg.right - 24 - bw, by, reg.right - 24, by + 28);
+        stroke_round(rt, g_about_topic, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, "Set topic", g_meta, g_about_topic, OC_COL_MUTED);
+        g_meta->align = ST_ALIGN_LEFT;
+        y += inline_btn ? 56 : 90;
+    }
 
     /* Facts worth having in one place, none of which needed a new query. */
     const char *nm = oc_model_user_name((oc_model *)m, 0);
@@ -6133,38 +6147,46 @@ static void draw_about(gfx *rt, const oc_model *m, rectf reg) {
         y += 18;
         draw_text(rt, "ADMIN", g_meta, rf(x, y, x + w, y + 20), OC_COL_FAINT);
         y += 24;
-        /* Webhooks are channel-scoped admin, so the channel's own settings page
-         * is where they belong — they were reachable only from a right-click
+        /* THE ROW MEASURES ITS BUTTONS AND WRAPS. Each of these used to be a
+         * fixed 150 DIP wide at a fixed offset -- 0, 160, 320, 480 -- adding up
+         * to 600 DIP of row in a pane that is not always 600 DIP wide. Past
+         * 125% the last of them was laid out beyond the window edge and drawn
+         * there: present, clickable in principle, and unreachable. Archiving a
+         * channel is not an action to leave in that state.
+         *
+         * Nothing is dropped, because all four are distinct destructive-ish
+         * actions and none is decoration. They wrap instead, which costs a row
+         * of height and keeps every one of them on screen at any width.
+         *
+         * Webhooks are channel-scoped admin, so the channel's own settings page
+         * is where they belong -- they were reachable only from a right-click
          * menu, which is not somewhere anyone looks for configuration. */
-        g_about_hooks = rf(x + 480, y, x + 600, y + 28);
-        if (in_rect(g_about_hooks, g_mouse_x, g_mouse_y))
-            fill_round(rt, g_about_hooks, OC_R_CONTROL, OC_COL_HOVER);
-        stroke_round(rt, g_about_hooks, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-        g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, "Webhooks", g_meta, g_about_hooks, OC_COL_MUTED);
-        g_meta->align = ST_ALIGN_LEFT;
-
-        g_about_rename = rf(x, y, x + 150, y + 28);
-        if (in_rect(g_about_rename, g_mouse_x, g_mouse_y))
-            fill_round(rt, g_about_rename, OC_R_CONTROL, OC_COL_HOVER);
-        stroke_round(rt, g_about_rename, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-        g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, "Rename channel", g_meta, g_about_rename, OC_COL_MUTED);
-        /* Visibility (REQ-031), beside the other two channel-shape actions. */
-        g_about_visibility = rf(x + 160, y, x + 310, y + 28);
-        if (in_rect(g_about_visibility, g_mouse_x, g_mouse_y))
-            fill_round(rt, g_about_visibility, OC_R_CONTROL, OC_COL_HOVER);
-        stroke_round(rt, g_about_visibility, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-        draw_text(rt, c->is_public ? "Make private" : "Make public", g_meta,
-                  g_about_visibility, OC_COL_MUTED);
-        g_about_archive = rf(x + 320, y, x + 470, y + 28);
-        if (in_rect(g_about_archive, g_mouse_x, g_mouse_y))
-            fill_round(rt, g_about_archive, OC_R_CONTROL, OC_COL_HOVER);
-        stroke_round(rt, g_about_archive, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-        draw_text(rt, c->archived ? "Unarchive" : "Archive channel", g_meta,
-                  g_about_archive, c->archived ? OC_COL_NOTICE : OC_COL_DANGER);
-        g_meta->align = ST_ALIGN_LEFT;
-        y += 36;
+        {
+            struct { const char *label; uint32_t col; rectf *out; } BTN[] = {
+                { "Rename channel", OC_COL_MUTED, &g_about_rename },
+                { c->is_public ? "Make private" : "Make public",
+                  OC_COL_MUTED, &g_about_visibility },
+                { c->archived ? "Unarchive" : "Archive channel",
+                  c->archived ? OC_COL_NOTICE : OC_COL_DANGER, &g_about_archive },
+                { "Webhooks", OC_COL_MUTED, &g_about_hooks },
+            };
+            const int NBTN = (int)(sizeof BTN / sizeof BTN[0]);
+            float bx = x, by = y;
+            g_meta->align = ST_ALIGN_CENTER;
+            for (int i = 0; i < NBTN; i++) {
+                float bw = text_width(BTN[i].label, g_meta) + 32;
+                if (bx > x && bx + bw > x + w) { bx = x; by += 36; }   /* wrap */
+                rectf b = rf(bx, by, bx + bw, by + 28);
+                if (in_rect(b, g_mouse_x, g_mouse_y))
+                    fill_round(rt, b, OC_R_CONTROL, OC_COL_HOVER);
+                stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+                draw_text(rt, BTN[i].label, g_meta, b, BTN[i].col);
+                *BTN[i].out = b;
+                bx = b.right + 10;
+            }
+            g_meta->align = ST_ALIGN_LEFT;
+            y = by + 36;
+        }
         /* The visibility line says what the NEXT click would do, and says the
          * dangerous direction plainly: going public is not "a setting", it is
          * publishing everything already said in here. */
@@ -7467,16 +7489,53 @@ static float draw_tabbar(gfx *rt, const oc_model *m, float x0, float w) {
         { "About",         OC_ICON_SETTINGS },
     };
     const oc_channel *tc = oc_model_channel((oc_model *)m, g_sel);
+
+    /* THE STRIP FITS THE WIDTH IT IS GIVEN, or it stops showing labels.
+     *
+     * `tx` used to advance by each tab's measured width with nothing checking
+     * it against the pane's right edge, so once the labels grew past 100% the
+     * last tabs were laid out beyond it: "About" cut mid-word with no ellipsis
+     * to say it had been cut, and at larger scales drawn entirely off the
+     * window -- present, clickable in principle, and unreachable.
+     *
+     * Nothing here scrolls sideways, so running past the right edge is not
+     * "below the fold", it is a control placed where it cannot be used. The
+     * strip therefore measures the whole run first and drops to icons when the
+     * labelled form does not fit, keeping the label on the SELECTED tab so the
+     * strip still says where you are. An icon row is a smaller thing to read
+     * than a truncated word, and every tab stays reachable, which is the part
+     * that was actually broken. */
+    float avail = w - 32;
+    float need_full = 0, need_icons = 0;
+    int n_tabs = 0;
+    for (int i = 0; i < TAB_COUNT; i++) {
+        if (!tab_applies(tc, i)) continue;
+        n_tabs++;
+        need_full  += 26 + text_width(TABS[i].label, g_ui) + 16 + 4;
+        need_icons += 34 + 4;
+        if (g_tab == i) need_icons += text_width(TABS[i].label, g_ui) + 8;
+    }
+    /* Two thresholds, not one. Keeping the label on the SELECTED tab is worth a
+     * tier of its own -- an icon row says nothing about where you are -- but it
+     * is not worth pushing the last tab off the window, which is what happened
+     * when only the first threshold was checked: the icons fitted, the selected
+     * label did not, and the strip ran past the edge anyway. */
+    int labels = (need_full <= avail);
+    int sel_label = labels || (need_icons <= avail);
+
     float tx = x0 + 16;
     for (int i = 0; i < TAB_COUNT; i++) {
         if (!tab_applies(tc, i)) continue;      /* leaves g_tab_r[i] zeroed above */
-        float tw = 26 + text_width(TABS[i].label, g_ui) + 16;
-        rectf r = rf(tx, HEADER_H + 2, tx + tw, HEADER_H + TABBAR_H - 1);
         int on = (g_tab == i);
+        int show_label = labels || (on && sel_label);
+        float tw = show_label ? 26 + text_width(TABS[i].label, g_ui) + 16 : 34;
+        rectf r = rf(tx, HEADER_H + 2, tx + tw, HEADER_H + TABBAR_H - 1);
         uint32_t col = on ? OC_COL_TEXT : OC_COL_MUTED;
         if (g_tab_hover == i && !on) fill_round(rt, r, OC_R_CONTROL, OC_COL_HOVER);
-        draw_lucide(rt, TABS[i].icon, rf(r.left + 6, r.top + 8, r.left + 22, r.bottom - 8), col);
-        draw_text(rt, TABS[i].label, g_ui, rf(r.left + 26, r.top, r.right, r.bottom), col);
+        float ix = show_label ? r.left + 6 : r.left + 9;
+        draw_lucide(rt, TABS[i].icon, rf(ix, r.top + 8, ix + 16, r.bottom - 8), col);
+        if (show_label)
+            draw_text(rt, TABS[i].label, g_ui, rf(r.left + 26, r.top, r.right, r.bottom), col);
         /* The selected tab is marked by an underline on the strip's own border,
          * which is how a tab reads as a tab rather than as a button. */
         if (on) fill(rt, rf(r.left + 4, r.bottom - 2, r.right - 4, r.bottom), OC_COL_ACCENT);
@@ -8557,15 +8616,55 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
     fill_round(rt, g_pick_panel, OC_R_OVERLAY, OC_COL_INPUT);
     stroke_round(rt, g_pick_panel, OC_R_OVERLAY, OC_COL_BORDER, 1.0f);
 
-    draw_text(rt, g_pick_target == PICK_STATUS ? "Status emoji"
-                : g_pick_mid ? "Add reaction" : "Emoji", g_title,
-              rf(px + 14, py + 8, px + pw - 14, py + 30), OC_COL_TEXT);
+    /* THE TITLE STOPS WHERE THE SWATCHES START. Its rect used to run the full
+     * width of the panel while the tone swatches were drawn, right-aligned,
+     * into the same band -- fine while the title was short, and at the largest
+     * text sizes "Add reaction" grew until it ran underneath six hands and
+     * neither could be read.
+     *
+     * The swatch run is measured here, once, and both the title and the
+     * swatches below take their geometry from it, so the two cannot disagree
+     * about where the boundary is. The cell follows the text scale for the same
+     * reason: the glyph inside it is drawn in an emoji format that grows, and a
+     * cell fixed at 24 DIP was a cell the glyph outgrew. */
+    /* THE WHOLE HEADER BAND FOLLOWS THE TEXT SCALE. Its offsets were plain
+     * DIPs -- title at +8, swatches at +6 with a 22 tall cell, search box at
+     * +32, grid at +68 -- while everything DRAWN in them is text and grows.
+     * Scaling only the swatch cell's width, as the first pass did, left its
+     * height at 22 and the taller glyph overflowed the cell and was cut by the
+     * panel's own top edge: the row of hands came out with their tops shaved
+     * off. A band whose height is fixed while its contents scale has a size at
+     * which it clips, and the only question is which size. */
+    float tone_w = UIS(24.0f), tone_h = UIS(22.0f);
+    float hdr_pad = UIS(6.0f);
+    float box_top = py + hdr_pad + tone_h + UIS(4.0f);
+    float box_bot = box_top + UIS(30.0f);
+    float tones_w = tone_w * OC_SKIN_COUNT;
+    float title_r = px + pw - 14 - tones_w - 8;
+    /* When there is not room for both, the TITLE goes. The swatches are a
+     * control and the title is a label for a panel you just opened on purpose,
+     * so the title is what can be spared. Clamping it to a minimum instead --
+     * which is what the first attempt did -- gave it a rect too small for its
+     * ink and let the ink run out of the rect and under the swatches, which is
+     * the same collision arriving through the fix for it. */
+    const char *ptitle = g_pick_target == PICK_STATUS ? "Status emoji"
+                       : g_pick_mid ? "Add reaction" : "Emoji";
+    if (title_r - (px + 14) >= text_width(ptitle, g_title))
+        draw_text(rt, ptitle, g_title,
+                  rf(px + 14, py + hdr_pad, title_r, py + hdr_pad + tone_h),
+                  OC_COL_TEXT);
 
-    g_pick_box = rf(px + 12, py + 32, px + pw - 12, py + 62);
+    g_pick_box = rf(px + 12, box_top, px + pw - 12, box_bot);
     fill_round(rt, g_pick_box, OC_R_CONTROL, OC_COL_BASE);
     stroke_round(rt, g_pick_box, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-    draw_lucide(rt, OC_ICON_SEARCH, rf(g_pick_box.left + 8, g_pick_box.top + 7,
-                                       g_pick_box.left + 24, g_pick_box.top + 23), OC_COL_MUTED);
+    {   /* Centred in the box it sits in, so it follows the box rather than a
+         * pair of offsets that were right at one scale. */
+        float ic = (g_pick_box.bottom - g_pick_box.top - 16.0f) / 2.0f;
+        draw_lucide(rt, OC_ICON_SEARCH,
+                    rf(g_pick_box.left + 8, g_pick_box.top + ic,
+                       g_pick_box.left + 24, g_pick_box.top + ic + 16),
+                    OC_COL_MUTED);
+    }
 
     char q[64] = "";
     if (g_pick_edit) {
@@ -8589,10 +8688,10 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
         for (size_t i = 0; i < all_n && !sample; i++) if (all[i].tonable) sample = &all[i];
         if (sample) {
             static char sw[OC_SKIN_COUNT][24];
-            float tw = 24, tx = px + pw - 14 - tw * OC_SKIN_COUNT;
-            float ty = py + 6;
+            float tw = tone_w, tx = px + pw - 14 - tones_w;
+            float ty = py + hdr_pad;
             for (int t = 0; t < OC_SKIN_COUNT; t++) {
-                rectf r = rf(tx, ty, tx + tw - 2, ty + 22);
+                rectf r = rf(tx, ty, tx + tw - 2, ty + tone_h);
                 oc_emoji_with_tone(sample, (uint8_t)t, sw[t], sizeof sw[t]);
                 if (t == g_skin_tone) fill_round(rt, r, OC_R_CONTROL, OC_COL_ACCENT_DIM);
                 draw_emoji_glyph(rt, sw[t], r);
@@ -8606,7 +8705,7 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
         }
     }
 
-    rectf body = rf(px + 8, py + 68, px + pw - 8, py + ph - 8);
+    rectf body = rf(px + 8, box_bot + UIS(6.0f), px + pw - 8, py + ph - 8);
     gfx_clip_push(rt, gr(body));
 
     /* Sized by the catalogue's own bound, not a round number: at 256 a browse
