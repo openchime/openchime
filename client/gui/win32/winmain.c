@@ -12373,9 +12373,18 @@ static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
      * the next one to rediscover this. An array that is empty unless drawn
      * cannot be read stale by anybody, which is why the reset is here and not
      * at the call sites. Anything else the scene accumulates per frame belongs
-     * in this block for the same reason. */
+     * in this block for the same reason.
+     *
+     * THE CONVERSATION LIST IS THE THIRD OF THESE, and it is why the paragraph
+     * above is written as a rule rather than as two special cases. Admin fills
+     * the window and draws no sidebar at all, so it inherited whatever the last
+     * view with one had left behind and offered a screen reader channels that
+     * were not on screen. Each of the three was found separately, by a
+     * different route -- and each was the same sentence: an array filled during
+     * a draw and cleared only by that draw. */
     g_n_msgrows = 0;
     g_n_shelf = 0;
+    g_n_rows = 0;
     /* The caller cleared to OC_COL_BASE via gfx_begin; grayscale text AA and
      * the DIP scale live inside the gfx/sdltext layers (ARCH-106/107). */
     /* Sign-in owns the whole window only when there is nothing behind it. With a
