@@ -6427,6 +6427,15 @@ static rectf chip(gfx *rt, float x, float y, const char *label,
 /* A dropdown button: "Types ▾", showing the current choice rather than the
  * axis name when one is set, so the row states the filter instead of hiding it
  * behind a click. */
+/* What drop_btn WILL be, without drawing it. The row above has to know whether
+ * an arrangement fits before it commits to one, and measuring by drawing and
+ * then regretting it is how the two runs came to overlap in the first place. */
+static float drop_w(const char *label) {
+    char txt[64];
+    snprintf(txt, sizeof txt, "%s \xE2\x96\xBE", label);
+    return text_width(txt, g_meta) + 22;
+}
+
 static rectf drop_btn(gfx *rt, float right, float y, const char *label,
                             int active) {
     char txt[64];
@@ -6474,36 +6483,82 @@ static float draw_file_filters(gfx *rt, rectf body, int full) {
     for (int i = 0; i < FS_SCOPES; i++) g_file_scopes[i] = rf(0, 0, 0, 0);
     for (int i = 0; i < FF_KINDS;  i++) g_file_filters[i] = rf(0, 0, 0, 0);
 
-    if (full) {
-        /* Left: ownership, the axis you switch most often, so it stays one
-         * click. Right: type and sort, folded into dropdowns — as four
-         * always-visible chips, type cost the width the filename column wanted
-         * to state an axis most users leave on "All". */
-        float fx = body.left + 20;
-        for (int i = 0; i < FS_SCOPES; i++) {
-            g_file_scopes[i] = chip(rt, fx, y, FS_LABEL[i], g_file_scope == i, OC_COL_ACCENT);
-            fx = g_file_scopes[i].right + 6;
+    /* THE RUNS HAVE TO BE TOLD ABOUT EACH OTHER.
+     *
+     * The chips are laid left to right from the pane's left edge and the
+     * dropdowns right to left from its right edge, and until now neither
+     * measured the other. At 100% they happened to clear; from 125% up the
+     * labels grew until the runs met and the row drew one on top of the other
+     * -- "Shared by you" buried under "Types", a fragment of a third label
+     * showing through the gap, and the click targets overlapping with them, so
+     * pressing a filter could select the one underneath.
+     *
+     * The arrangement is a MEASUREMENT now, not a property of which pane this
+     * is. Three tiers, each tried against the width actually available and the
+     * first that fits taken: chips for the axis you switch most, then that axis
+     * folded into a dropdown like the channel tab already does, then sort
+     * dropped -- it is the axis with a sensible default and the least traffic,
+     * so it is the right thing to lose last and the only thing to lose.
+     *
+     * Deciding by measurement rather than by pane is what stops this coming
+     * back at a scale nobody tried: there is no width at which the row lays out
+     * two runs into the same pixels, because it does not lay out a tier it has
+     * not confirmed fits. */
+    {
+        const char *type_lbl = g_file_filter == FF_ALL ? "Types" : FF_LABEL[g_file_filter];
+        const char *scope_lbl = g_file_scope == FS_ALL ? "Anyone" : FS_LABEL[g_file_scope];
+        float avail = (body.right - 20) - (body.left + 20);
+        float w_chips = 0;
+        for (int i = 0; i < FS_SCOPES; i++)
+            w_chips += text_width(FS_LABEL[i], g_meta) + 22 + 6;
+        float w_type  = drop_w(type_lbl),  w_sort = drop_w(FSORT_LABEL[g_file_sort]);
+        float w_scope = drop_w(scope_lbl);
+        /* A gap the two runs may not close: touching, they read as one control. */
+        const float GAP = 16.0f;
+
+        int tier;
+        if (full && w_chips + GAP + w_type + 8 + w_sort <= avail)          tier = 0;
+        else if (full && w_scope + 8 + w_type + 8 + w_sort <= avail)       tier = 1;
+        else                                                              tier = 2;
+
+        if (tier == 0) {
+            /* Left: ownership, the axis you switch most often, so it stays one
+             * click. Right: type and sort, folded into dropdowns — as four
+             * always-visible chips, type cost the width the filename column
+             * wanted to state an axis most users leave on "All". */
+            float fx = body.left + 20;
+            for (int i = 0; i < FS_SCOPES; i++) {
+                g_file_scopes[i] = chip(rt, fx, y, FS_LABEL[i], g_file_scope == i,
+                                        OC_COL_ACCENT);
+                fx = g_file_scopes[i].right + 6;
+            }
+            g_file_sort_btn  = drop_btn(rt, body.right - 20, y,
+                                        FSORT_LABEL[g_file_sort],
+                                        g_file_sort != FSORT_RECENT);
+            g_file_type_btn  = drop_btn(rt, g_file_sort_btn.left - 8, y, type_lbl,
+                                        g_file_filter != FF_ALL);
+            g_file_scope_btn = rf(0, 0, 0, 0);
+        } else {
+            /* The channel TAB is ~300px of a middle column, and the full view at
+             * the largest scales is no wider in the sense that matters. Chips do
+             * not fit: scope alone measures nearly the whole width, and drawing
+             * both axes as chips overlapped them into an unreadable smear. Sort
+             * survives the fold only while there is room for it AND only in the
+             * full view, which is the one place it can be reached at all —
+             * inside a channel, newest-first is the order people expect and the
+             * list is short. */
+            float rx = body.right - 20;
+            if (tier == 1) {
+                g_file_sort_btn = drop_btn(rt, rx, y, FSORT_LABEL[g_file_sort],
+                                           g_file_sort != FSORT_RECENT);
+                rx = g_file_sort_btn.left - 8;
+            } else {
+                g_file_sort_btn = rf(0, 0, 0, 0);
+            }
+            g_file_scope_btn = drop_btn(rt, rx, y, scope_lbl, g_file_scope != FS_ALL);
+            g_file_type_btn  = drop_btn(rt, g_file_scope_btn.left - 8, y, type_lbl,
+                                        g_file_filter != FF_ALL);
         }
-        g_file_sort_btn  = drop_btn(rt, body.right - 20, y, FSORT_LABEL[g_file_sort],
-                                    g_file_sort != FSORT_RECENT);
-        g_file_type_btn  = drop_btn(rt, g_file_sort_btn.left - 8, y,
-                                    g_file_filter == FF_ALL ? "Types" : FF_LABEL[g_file_filter],
-                                    g_file_filter != FF_ALL);
-        g_file_scope_btn = rf(0, 0, 0, 0);
-    } else {
-        /* The channel TAB is ~300px of a middle column. Chips do not fit there:
-         * scope alone measures nearly the full width, and drawing both axes as
-         * chips overlapped them into an unreadable smear. Both fold into
-         * dropdowns, which is also the arrangement that leaves the pane to its
-         * content. Sort stays out — inside one channel, newest-first is the
-         * order people expect and the list is short. */
-        g_file_scope_btn = drop_btn(rt, body.right - 20, y,
-                                    g_file_scope == FS_ALL ? "Anyone" : FS_LABEL[g_file_scope],
-                                    g_file_scope != FS_ALL);
-        g_file_type_btn  = drop_btn(rt, g_file_scope_btn.left - 8, y,
-                                    g_file_filter == FF_ALL ? "Types" : FF_LABEL[g_file_filter],
-                                    g_file_filter != FF_ALL);
-        g_file_sort_btn  = rf(0, 0, 0, 0);
     }
     return y + 32;
 }
@@ -12113,23 +12168,28 @@ static void draw_lightbox(gfx *rt, float W, float H);   /* fwd */
 
 static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
     shell_scale_update(W, H);   /* the shell's furniture is capped by the window */
-    /* THE TRANSCRIPT'S ROWS BELONG TO THE FRAME THAT DREW THEM. Emptied here,
-     * before anything is drawn, so a row can only exist because this frame laid
-     * it out. draw_msglist repopulates it; every path that does not reach
-     * draw_msglist — People, Drafts, Threads, Admin, the storage and audit
-     * panes, "select a channel", an empty channel — leaves it empty, which is
-     * the truth about what is on screen.
+    /* A ROW BELONGS TO THE FRAME THAT DREW IT. Both arrays are emptied here,
+     * before anything is drawn, so an entry can only exist because this frame
+     * laid it out. The transcript repopulates the first and the Home sidebar
+     * the second; every view that draws neither leaves them empty, which is the
+     * truth about what is on screen.
      *
-     * Resetting inside draw_msglist alone was not enough, and the gap was not
-     * theoretical: the published scene walks this array, so a view with no
-     * transcript at all offered a screen reader the LAST conversation's
-     * messages, at the coordinates they held in it, and the layout fit check
-     * built from the same scene reported overlaps between those phantoms and
-     * the real rows of the view actually on screen. Gating each consumer would
-     * have fixed the two that exist today and left the next one to rediscover
-     * this; an array that is empty unless drawn cannot be read stale by
-     * anybody. */
+     * The gap was not theoretical, and it was found twice. The published scene
+     * walks both arrays, so a view with no transcript offered a screen reader
+     * the LAST conversation's messages at the coordinates they held in it, and
+     * the Files view offered Threads, Drafts and People while its own channel
+     * column stood in their place. The layout fit check is built from that same
+     * scene, so it compared those phantoms against the rows really on screen
+     * and reported collisions nobody could see -- and, worse, reported the
+     * views clean where it should not have.
+     *
+     * Gating each CONSUMER would have fixed the ones that exist today and left
+     * the next one to rediscover this. An array that is empty unless drawn
+     * cannot be read stale by anybody, which is why the reset is here and not
+     * at the call sites. Anything else the scene accumulates per frame belongs
+     * in this block for the same reason. */
     g_n_msgrows = 0;
+    g_n_shelf = 0;
     /* The caller cleared to OC_COL_BASE via gfx_begin; grayscale text AA and
      * the DIP scale live inside the gfx/sdltext layers (ARCH-106/107). */
     /* Sign-in owns the whole window only when there is nothing behind it. With a
@@ -13916,7 +13976,13 @@ enum {
     AT_THREADFILTER,  /* the Threads pane's unreads-only toggle */
     AT_STATUSEMOJI,   /* the status dialog's emoji button */
     AT_STATUSSUGG,    /* payload: status suggestion row index */
-    AT_STATUSCHIP     /* payload: status clear-after chip index */
+    AT_STATUSCHIP,    /* payload: status clear-after chip index */
+    AT_FSCOPE,        /* payload: Files ownership-scope index */
+    AT_FSORT,         /* the Files sort dropdown */
+    AT_FTYPE,         /* the Files type dropdown */
+    AT_FUPLOAD,       /* the Files view's Upload button */
+    AT_FCHAN,         /* payload: channel id, or 0 for "All files" */
+    AT_FILEROW        /* payload: file id — open it */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -14148,6 +14214,62 @@ static void a11y_publish_scene(const oc_model *m) {
             snprintf(nm, sizeof nm, "thread %llu", (unsigned long long)g_listrows[i].mid);
             acc_push(items, &n, OC_ACC_LISTITEM, aid, nm, g_listrows[i].row,
                      ATOK(AT_THREAD, g_listrows[i].mid));
+        }
+    }
+    /* THE FILES VIEW'S OWN CONTROLS. Everything below was drawn, clickable and
+     * absent from this tree, so the view offered a screen reader the rail and
+     * the shelf and nothing else in it -- and REQ-290 asks the opposite.
+     *
+     * The second cost is the one that took longest to see. The layout fit check
+     * is built from this tree, so a view that publishes nothing is a view the
+     * check has no opinion about: the filter chips have been overlapping each
+     * other above 100% scale, visibly, with one label buried under the next,
+     * and the check called the view clean because as far as it knew the view
+     * was empty. An element that is not published is not merely unreachable, it
+     * is unwatched. */
+    if (g_view == VIEW_FILES) {
+        acc_push(items, &n, OC_ACC_BUTTON, "files.upload", "Upload",
+                 g_file_up_btn, ATOK(AT_FUPLOAD, 0));
+        for (int i = 0; i < FS_SCOPES && n < OC_ACC_MAX; i++) {
+            char aid[OC_ACC_AID_MAX];
+            snprintf(aid, sizeof aid, "files.scope.%d", i);
+            acc_push(items, &n, OC_ACC_TAB, aid, FS_LABEL[i], g_file_scopes[i],
+                     ATOK(AT_FSCOPE, i));
+        }
+        acc_push(items, &n, OC_ACC_BUTTON, "files.type",
+                 g_file_filter == FF_ALL ? "Types" : FF_LABEL[g_file_filter],
+                 g_file_type_btn, ATOK(AT_FTYPE, 0));
+        acc_push(items, &n, OC_ACC_BUTTON, "files.sort",
+                 FSORT_LABEL[g_file_sort], g_file_sort_btn, ATOK(AT_FSORT, 0));
+        /* The left column's destinations. "All files" is index 0 and carries a
+         * channel id of 0, exactly as the click path reads it. */
+        for (int i = 0; i < g_n_fchan_rows && n < OC_ACC_MAX; i++) {
+            uint64_t cid = (i == 0) ? 0 : g_fchan[i - 1].id;
+            char aid[OC_ACC_AID_MAX], nm[OC_ACC_NAME_MAX];
+            snprintf(aid, sizeof aid, "files.channel.%llu", (unsigned long long)cid);
+            /* The channel's NAME comes from the model: this column's rows carry
+             * an id and a count, not a name. */
+            const oc_channel *fc = cid ? oc_model_channel((oc_model *)m, cid) : NULL;
+            if (cid) snprintf(nm, sizeof nm, "#%s",
+                              (fc && fc->name[0]) ? fc->name : "channel");
+            else     snprintf(nm, sizeof nm, "All files");
+            acc_push(items, &n, OC_ACC_LISTITEM, aid, nm, g_fchan_rows[i],
+                     ATOK(AT_FCHAN, cid));
+        }
+    }
+    /* The file rows, in BOTH places they are drawn -- the view and the
+     * conversation's Files tab. Named by file id, so a row keeps its name when
+     * the sort changes; `file.row.3` would be whichever file happens to be
+     * third under today's ordering. */
+    if (m && (g_view == VIEW_FILES || g_tab == TAB_FILES)) {
+        for (int i = 0; i < g_n_filerows && n < OC_ACC_MAX; i++) {
+            if ((size_t)g_filerows[i].ix >= m->n_files) continue;
+            const oc_file_view *f = &m->files[g_filerows[i].ix];
+            char aid[OC_ACC_AID_MAX];
+            snprintf(aid, sizeof aid, "file.row.%llu", (unsigned long long)f->id);
+            acc_push(items, &n, OC_ACC_LISTITEM, aid,
+                     f->filename[0] ? f->filename : "file", g_filerows[i].row,
+                     ATOK(AT_FILEROW, f->id));
         }
     }
     if (g_view == VIEW_DIRECTORY && m) {
