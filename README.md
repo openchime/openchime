@@ -43,11 +43,11 @@ today is not a document — it is the
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | The `ARCH-N` decision record: every architectural choice and its rationale. Design decisions live here; product scope lives in REQUIREMENTS.md. |
 | [PROTOCOL.md](docs/PROTOCOL.md) | The byte-level wire protocol — frame layout, the handshake, every message type and its payload, the error codes, and the connection state machine. Its §9 registry is generated from the codec and is the authority on which opcodes are taken. |
 | [SCHEMA.md](docs/SCHEMA.md) | The SQLite schema and the migration mechanism, documenting every migration and why each table is shaped the way it is. |
-| [CLIENT.md](docs/CLIENT.md) | The client architecture: one shared C app-core with a native UI per platform, and the internals of the Win32 GUI — its self-drawn composer, modal frame, and native-child rules. |
+| [CLIENT.md](docs/CLIENT.md) | The client architecture: one shared C app-core with a native UI per platform, and the internals of the Win32 GUI — its self-drawn composer, modal frame, native-child rules, and the paint ledger the audit reads. |
 | [AUTH.md](docs/AUTH.md) | The two authentication modes — local PBKDF2 accounts and OIDC brokered by a central relay — and the daemon-issued session both converge on. |
 | [TLS.md](docs/TLS.md) | How the daemon terminates TLS and how a client trusts it: trust-on-first-use certificate pinning against a self-signed cert, with no CA anywhere on the client-facing path. |
 | [CONFIG.md](docs/CONFIG.md) | Every environment variable the daemon reads, with its default and meaning. There is no configuration file. |
-| [TESTING.md](docs/TESTING.md) | The test strategy and its two tiers, what CI runs, the measured capacity benchmark, and how to bring the federated stack up by hand. |
+| [TESTING.md](docs/TESTING.md) | The test strategy and its two tiers, what CI runs, the measured capacity benchmark, how to bring the federated stack up by hand, and the GUI's two harnesses — the boot check and the visual audit that checks a render against itself rather than against a second binary. |
 | [MARKDOWN.md](docs/MARKDOWN.md) | The message-formatting dialect — a Slack-compatible subset plus real lists — where it is parsed, and the places it deliberately differs. |
 | [AUDIO.md](docs/AUDIO.md) | The design for server-relayed audio calls: the huddle model, client-side mixing, and echo cancellation. The server half is built; the client half is not. |
 | [VIDEO.md](docs/VIDEO.md) | The screenshare design: why the codec is a wire contract rather than a per-platform choice, and why it is sequenced behind the audio client. Not started. |
@@ -77,11 +77,10 @@ signaling and the UDP sidecar are built; the client-side codec is not
 ([docs/AUDIO.md](docs/AUDIO.md)).
 
 For what is known to be wrong with it, see the
-**[issue tracker](https://github.com/openchime/openchime/issues)**. Two daemon defects are open there: a
-webhook can post into an archived channel, and two message types share an opcode
-so editing a profile drops the connection. Remaining
-server-side scope includes a CA-signed certificate for the webhook endpoint
-(REQ-171).
+**[issue tracker](https://github.com/openchime/openchime/issues)**. No daemon
+defect is open there at present; every open defect is in the Windows GUI. What
+remains on the server side is scope rather than repair — a CA-signed certificate
+for the webhook endpoint (REQ-171) among it.
 
 ## Install the daemon
 
@@ -199,9 +198,16 @@ the workspace book, so it reconnects silently across restarts and queues sends
 made while disconnected — in memory, for the life of the process. History comes
 from the server's own read cursor rather than a local cache (REQ-100/101/102).
 
-A native **Windows GUI** (Win32 + Direct2D/DirectWrite, pure C — ARCH-82) is the
-most complete client: every tracked engine feature is reachable, and it leads the
-TUI by a wide margin. Accessibility is built (REQ-269/ARCH-99: a UI Automation
+A native **Windows GUI**, pure C, presents through an **SDL3 renderer on its own
+Win32 window**: every primitive is drawn by the in-tree `oc_gfx` layer and every
+glyph is laid out and rasterized by **sdltext** over DirectWrite
+(ARCH-80/106/107). The window class, message loop, tray, IME and the
+accessibility provider stay Win32. Direct2D survives only as sdltext's
+rasterizer on this platform — it is no longer the client's presentation layer.
+
+Under that it is the most complete client by some distance: every tracked engine
+feature is reachable, and it leads the TUI by a wide margin. Accessibility is
+built (REQ-269/ARCH-99: a UI Automation
 provider over the self-drawn UI, a system caret and spoken notifications), with
 an automation id and an invoke pattern on every actionable element (REQ-290),
 both verified by a real UIA client from outside the process. Rich text and its
@@ -209,12 +215,23 @@ toolbar (REQ-220/ARCH-100), drafts, scheduled send, the notification schedule
 with keywords and priority people, cross-channel threads, the People directory
 and link-unfurl cards are all built end to end with their daemon halves.
 
-Its `scripts/gui_smoke.sh` gate prints the total it ran — read that rather
-than a number quoted here; the suite grows. A handful of standing failures are
-the known baseline (TESTING.md records them); defects the gate structurally
-cannot see are in the
-[issue tracker](https://github.com/openchime/openchime/issues). Next is **TUI catch-up**, then GTK (Linux),
-AppKit (macOS), a web DOM UI, and mobile.
+**Two harnesses, and they answer different questions.** `scripts/gui_smoke.sh`
+asks whether the client boots and runs — fourteen assertions in about ten
+seconds, run before every push, and deliberately kept that size: the suite that
+preceded it held a few hundred assertions, took seven minutes, and was therefore
+skipped. `scripts/gui_audit.sh` is the long one, walking every surface across
+themes, DPI settings and text sizes and checking each captured scene against
+properties it must hold on its own — a string that fits its box, ink that can be
+read against what is behind it, one label not drawn over another, nothing drawn
+where it cannot be reached. It needs no reference image, which is the point: the
+render it would once have been compared against is gone. See
+[TESTING.md](docs/TESTING.md).
+
+Next is **TUI catch-up**, then the remaining desktops. Those are no longer a
+per-toolkit list: ARCH-80 settled on one portable self-rendered application layer
+over SDL3 and sdltext for every desktop, with a thin native shim per platform, so
+Linux and macOS are ports of that layer rather than GTK and AppKit rewrites. A
+web DOM UI and mobile stay their own frontends.
 
 ## Local development environment
 
