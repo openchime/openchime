@@ -697,6 +697,18 @@ nothing. Ellipses survive only where they mean *continuation*: "Loading…",
 "Reconnecting…", "alice is typing…", and the `:…:` placeholder for an emoji whose
 image has not arrived.
 
+**A marker on a tile is sized and seated BY the tile.** The presence dot is the
+one that taught this: every call site passed its own centre and its own radius,
+the radius was 4.5 at all six of them, and it had been tuned for the 18 DIP
+sidebar tile. On that tile the marker covered better than a third of the picture
+and put a grey donut through the initial; on the 40 DIP menu avatar the same
+marker at a constant inset floated clear off the disc, because a fixed inset
+from a bounding box is not a point on a circle. `draw_avatar_presence()` takes
+the tile and nothing else — size is a fraction of it, the ring scales with the
+dot, and the seat is where the bottom-right diagonal crosses the edge. A call
+site cannot pass an inset, so no call site can get one wrong, and a new avatar
+size is right on the day it is added.
+
 **An expanded section that is empty says so**, in italics — the app's only italic
 (ARCH-97 names weights, not styles) precisely so it cannot be read as a conversation
 called "Empty". It says "No matches" instead when a find filter is what emptied it,
@@ -739,6 +751,23 @@ beside each cached bitmap, and a capture creates its own bitmaps from them for
 its own target (released when the shot ends). Without that, every screenshot
 would be a picture with the pictures missing. Only the *fetch* is suppressed
 during a capture, so driving the harness cannot generate transfer traffic.
+
+**A capture is a picture, and a picture is not the only evidence.** The scene
+also keeps a **paint ledger** when the harness is driving — every primitive the
+frame drew, in order, with its rect, its clip, its colour and a tag
+(`gfx_ledger_dump`). It exists because a screenshot answers "what does this look
+like" and nothing else: a label clipped to nothing, ink the colour of the
+surface behind it, and two strings drawn over each other all produce a picture
+that looks right to a comparison and wrong to a person. `scripts/gui_audit.sh`
+reads it; [TESTING.md](./TESTING.md) explains what it can and cannot be asked.
+
+Two rules for anything drawing text through it. A text raster carries its colour
+in its pixels, so the ledger cannot read one back — the call site declares it
+with `gfx_ink`, which also carries the rasterizer's transparent padding so the
+recorded rect is the ink and not the bitmap. And a colour that is **content**
+rather than a theme choice — an avatar disc derived from a user id, a swatch for
+a colour scheme you have not picked — says so with a `content:` tag, or the
+palette check reports it as a surface that will not follow the theme.
 
 **If you add another cached GPU resource, keep the bytes too.** Anything that lives
 only as a render-target-owned object is invisible to every screenshot, and therefore

@@ -20,3 +20,4 @@ dist/
 *.db-wal
 .env
 .playwright-mcp/
+__pycache__/

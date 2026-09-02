@@ -670,3 +670,132 @@ intent and an intent that was never sent look identical. Prefer asserting on
 `error_seq`, which only ever increments — `last_error` is cleared on
 `OC_EV_CONNECTED`/`OC_EV_AUTH_OK`, so a reconnect between the failure and the
 check can erase the evidence a wait is polling for.
+
+## The visual audit — checking a render with no render to compare it to
+
+`scripts/gui_audit.sh` walks every surface of the Win32 client across themes,
+DPI settings and text sizes, and checks each captured scene against properties
+it must hold **on its own**. It is not the smoke and must not become one: the
+smoke asks "does the client boot" in ten seconds and runs before every push;
+this runs a few hundred states, takes minutes, and is for when GUI chrome
+changes.
+
+**Why there is no reference image.** The first version of this audit diffed the
+SDL render against the Direct2D binary it was ported from, ranked the pairs by
+PSNR and walked the ranking. That rig did the job a diff can do and is finished.
+A diff finds *divergence*, so it is blind by construction to anything both
+renderers did the same way — and the defects left are exactly those. Three of
+them were logged against that audit while it was still running, each found by
+eye and none by the diff, and the note on the third says why in one line: *the
+old client has identical geometry.* A picture that looks fine to a diff and
+wrong to a person is the whole remaining category.
+
+So the reference is gone. What replaced it is the client's own account of what
+it drew.
+
+**The paint ledger** (`gfx_ledger_dump`, verb `ledger <path>`) is one row per
+primitive, in draw order, with the rect, the clip in force, the colour and a
+tag — see the note in `client/gui/gfx/gfx.h`. It is allocated only when
+`OPENCHIME_TEST_DIR` is set. From it, `scripts/audit/oracles.py` asks questions
+a single frame can answer:
+
+- a string whose raster runs past its clip is **truncated**, and nothing on
+  screen says so;
+- two strings sharing pixels with no opaque fill between them are
+  **overprinted**;
+- ink measured against the surface beneath it is a **contrast** ratio;
+- a rect drawn outside the window is **unreachable chrome**;
+- a colour that resolves to no palette token is a surface that **will not
+  follow the theme**.
+
+**Read the asymmetries, they are deliberate.** A text row's *width* is the
+advance width of the glyphs, so a rect wider than its clip is a cut string.
+Its *height* is the line box — ascent, descent and leading, pinned per size
+token (ARCH-108) — which legitimately overhangs its seat, and a row half below
+the fold of a scrolling list is ordinary rather than broken. So horizontal
+clipping is reported and vertical clipping is not, and a clip that removes an
+element *entirely* is not reported at all: that is how scrolling works, and
+from a ledger row a scrolled-out row and a stray one are the same thing. The
+instrument that can tell those apart is the fit check inside the client, which
+is built from the accessibility tree and therefore only ever sees what is
+reachable.
+
+The same discipline decides the rest. A scrim is a layer boundary — a modal
+owns the window, the accessibility publisher already skips the shell behind
+one, and the ledger checks do too, or a sidebar label two hundred pixels away
+comes back "overprinted" by a modal row. A colour tagged `content:` is data
+rather than a theme choice (an avatar disc derived from a user id, a swatch for
+a scheme you have not picked) and is exempt from the palette check by that
+declaration rather than by a list of exceptions here.
+
+**Every one of these started as a false positive and was fixed rather than
+muted.** The first run reported sixty-five findings on a healthy screen. A
+check that fires on correct code is one people learn to skip, which is how the
+client's own fit check came to report phantom overlaps for months without
+anybody reading it.
+
+**`scripts/audit/pair.py`** compares two captures of one surface in two states
+and reports what MOVED. Some defects are invisible in one frame: a label that
+shifts a pixel when its row goes semibold looks correct in both screenshots and
+reads as a twitch in use. The property is that changing a state must not change
+a position.
+
+**Two accounts of one frame, cross-checked.** The client also publishes its
+accessibility tree into the dump, one line per element. An element published at
+coordinates the ledger painted nothing at is a **phantom** — a screen reader is
+invited to activate something that is not there, and every check built from the
+tree alone compares it against real elements and reports collisions nobody can
+see. Nothing internal to the tree can catch that, because the tree is
+consistent with itself; only the other account knows. This is what found the
+Admin view still offering conversation rows for a sidebar it does not draw.
+
+**The checks that need pixels** (`scripts/audit/pixels.py`) close the gap
+between what the app asked for and what the renderer produced. The stroke
+tessellator once blew its vertex budget and discarded nine icons whole: the draw
+call happened, the ledger would have recorded it, and nothing appeared. So a
+filled shape must *be* its colour (holes mean uncovered tessellation), an icon
+box must not come back one flat colour, and a disc's rim must be a ramp rather
+than a step. Each is asked only of shapes nothing was drawn over afterwards —
+without that filter every button in the app is a finding.
+
+**The states that must agree** (`scripts/audit/consistency.py`) compare the
+client against itself. A theme reached by a live switch must render as a cold
+start in that theme does; 96 → 192 → 96 must equal a cold 96; a conversation
+reached twice must look the same both times. The first version made the theme
+case a *round trip* — X to Y and back to X — and it passed while the defect it
+was written for was live in the build, because a cache whose key forgets the
+theme is stale in both directions and lands on the right colours by being wrong
+twice. It is one switch now, from a cold start in the other theme.
+
+**Contact sheets** (`scripts/audit/sheets.py`) are for the findings no check
+will ever make. "A 13px marker on an 18px tile looks bad" is a judgement, not a
+property. The sheets do not replace the eye; they change what it is asked to
+do — every icon at every size on one page, every avatar composite on another,
+the corner arc of every rounded rect on a third. A thing that is wrong is then
+sitting beside eleven things that are right, which is a glance rather than a
+hunt through 224 screenshots.
+
+**`scripts/audit/selftest.py` proves every check can fail**, with a synthetic
+scene per check and, for the pixel ones, a real capture handed a ledger that
+lies about it. Run it after touching anything in that directory; it needs no
+client. A check that has never failed has not been shown to check anything, and
+this project has the scars: the client's own fit check spent months reporting
+phantoms nobody read.
+
+**Three tags a call site can declare**, all of them narrowing what the checks
+may ask rather than excusing a result:
+
+- `content:` — this colour is DATA, not a theme choice (an avatar disc derived
+  from a user id, a swatch for a scheme you have not picked).
+- `content:emoji` — a COLOUR glyph: its raster is not the ink it was asked for
+  and its advance is not its ink, so neither contrast nor truncation applies.
+- `transient:` — present in some frames and not others by design (the composer
+  caret blinks on a 530ms phase), so frame-equality checks skip it.
+
+**Reading a run.** Scenes and how to reach them live in
+`scripts/audit/scenes.tsv`, one row per surface with the verbs and — not
+optional — a dump key to wait for. A verb acks when its handler *ran*, not when
+the frame showing its effect has been painted, and several of these views paint
+"Loading…" until the daemon answers; an earlier pass slept a fixed time instead
+and captured Admin mid-load, which read as a layout defect and cost a round to
+explain.

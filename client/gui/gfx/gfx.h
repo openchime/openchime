@@ -84,4 +84,36 @@ void gfx_icon(gfx *, int icon_id, gfx_rect box, float stroke_w,
  * on failure. */
 int gfx_readback(gfx *, void *rgba, int w, int h);
 
+/* ---- the paint ledger (test hook) ---------------------------------------
+ *
+ * A record of what the frame actually drew: one row per primitive, in draw
+ * order, with the rect, the clip in force, the colour and a caller-supplied
+ * tag. It exists because a screenshot answers "what does this look like" and
+ * nothing else — a label clipped to nothing, text drawn under an opaque fill,
+ * or ink the same colour as the surface behind it all produce a picture that
+ * looks fine to a diff and wrong to a person. The ledger answers those by
+ * construction rather than by comparison, and needs no reference image, which
+ * is the point: the render it would be compared against is gone.
+ *
+ * Off by default and allocated only when enabled, so a shipped client pays
+ * nothing. Recording MUST NOT change what is drawn — the audit checks that by
+ * capturing the same scene twice, once recording and once not.
+ */
+void gfx_ledger_enable(gfx *, int on);
+int  gfx_ledger_enabled(const gfx *);
+/* Declare the ink colour of the text raster about to be drawn. A text texture
+ * carries its colour in its pixels, so the ledger cannot read it back — and the
+ * colour is exactly what a legibility question needs. The caller knows it;
+ * this is how it says so. Cleared after each text draw, so an unset ink is
+ * reported as unknown rather than inherited from an earlier label. */
+/* `pad_w`/`pad_h` are the transparent margin the rasterizer leaves around the
+ * glyphs, in DIPs, so the ledger can record the INK and not the bitmap. */
+void gfx_ink(gfx *, uint32_t rgb, float pad_w, float pad_h);
+/* Label the primitives that follow. The tag is copied and stays in force until
+ * changed or until the next frame; NULL or "" clears it. A tag is how a row in
+ * the dump says "sidebar.row" rather than only "a rect at 12,340". */
+void gfx_tag(gfx *, const char *tag);
+/* Write the frame just ended as tab-separated rows. Returns 0 on failure. */
+int  gfx_ledger_dump(gfx *, const char *path);
+
 #endif /* OC_GFX_H */
