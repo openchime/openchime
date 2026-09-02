@@ -364,20 +364,79 @@ static void draw_conn_dot(gfx *rt, float cx, float cy, float r, int live) {
  * out of the same dot rather than as a colour that would have to replace one.
  * Slack shows a moon for exactly this reason. */
 static void draw_presence_dot_dnd(gfx *rt, float cx, float cy, float r,
-                                  uint8_t presence, uint32_t surface, int dnd) {
+                                  uint8_t presence, uint32_t surface, int dnd,
+                                  float ring) {
     uint32_t c = presence == OC_PRESENCE_ONLINE ? OC_COL_ONLINE
                : presence == OC_PRESENCE_AWAY   ? OC_COL_AWAY : OC_COL_FAINT;
-    /* A 2px ring in the surface colour, as Slack's has: the dot sits ON the
-     * avatar, and without a ring it reads as a speck stuck to the edge. */
-        gfx_ellipse(rt, cx, cy, r + 2.0f, r + 2.0f, surface, 1.0f);
+    /* A ring in the surface colour, as Slack's has: the dot sits ON the
+     * avatar, and without a ring it reads as a speck stuck to the edge. The
+     * WIDTH is the caller's, because a ring that stays 2 DIP while the dot
+     * scales with its tile is most of a small marker. */
+        gfx_ellipse(rt, cx, cy, r + ring, r + ring, surface, 1.0f);
         gfx_ellipse(rt, cx, cy, r, r, dnd ? OC_COL_MUTED : c, 1.0f);
-    /* Offline reads as an outline, so "not here" is not just a dim fill. */
+    /* Offline reads as an outline, so "not here" is not just a dim fill. The
+     * hole is a fraction of the dot for the same reason the ring is: a fixed
+     * 1.3 DIP hole in a small dot is a filled dot, and in a large one it is a
+     * hairline. */
     if (!dnd && presence != OC_PRESENCE_ONLINE && presence != OC_PRESENCE_AWAY) {
-                gfx_ellipse(rt, cx, cy, r - 1.3f, r - 1.3f, surface, 1.0f);
+                gfx_ellipse(rt, cx, cy, r * 0.55f, r * 0.55f, surface, 1.0f);
     }
     if (dnd) {   /* carve the crescent with the surface colour */
                 gfx_ellipse(rt, cx + r * 0.55f, cy - r * 0.55f, r * 0.95f, r * 0.95f, surface, 1.0f);
     }
+}
+
+/* ONE presence marker on an avatar, sized and seated BY THE TILE.
+ *
+ * Every call site used to pass its own centre and its own radius, and the
+ * radius was 4.5 at all of them -- tuned for the 18 DIP tile in the sidebar and
+ * then repeated onto tiles twice that size. The results disagreed in both
+ * directions at once: on the 18px tile a marker better than a third of its
+ * width collided with the initial underneath (and offline, a hollow ring, put a
+ * grey donut through the glyph), while on the 40px menu avatar the same marker
+ * at the same fixed inset floated clear OFF the disc entirely, because a
+ * constant inset from a bounding box is not a point on a circle.
+ *
+ * So no call site passes geometry any more. Everything here derives from the
+ * tile:
+ *
+ *   SIZE is a fraction of the tile, with the ring scaled too. A ring that stays
+ *   2 DIP wide while the dot shrinks is most of a small marker.
+ *
+ *   THE SEAT is the rim at 45 degrees -- the point where the bottom-right
+ *   diagonal crosses the tile's edge -- so the marker straddles the boundary
+ *   and overlaps the picture by its own radius rather than being pushed into
+ *   the middle of it. For a rounded square the corner arc is where that
+ *   diagonal crosses, which is the same construction with the radius of the
+ *   corner rather than of the tile.
+ *
+ * The structural part is that `tile` is the only geometry in the signature. A
+ * call site cannot pass an inset, so no call site can get one wrong, and a new
+ * avatar size is right on the day it is added rather than on the day somebody
+ * notices. */
+static void draw_avatar_presence(gfx *rt, rectf tile, float corner,
+                                 uint8_t presence, uint32_t surface, int dnd) {
+    float w = tile.right - tile.left, h = tile.bottom - tile.top;
+    float side = w < h ? w : h;
+    if (side < 8.0f) return;          /* nothing this small can say anything */
+
+    float r = side * 0.15f;
+    if (r < 2.5f) r = 2.5f;
+    if (r > 7.0f) r = 7.0f;
+    float ring = r * 0.45f;
+    if (ring < 1.0f) ring = 1.0f;
+
+    /* Where the bottom-right diagonal leaves the tile. A circle (corner >= half
+     * the side) crosses it at 1/sqrt(2) of the radius on each axis; a rounded
+     * square crosses on its corner arc, whose centre is inset by the corner
+     * radius. Both reduce to the same expression with the right centre. */
+    float half = side / 2.0f;
+    if (corner > half) corner = half;
+    float cx0 = tile.right - corner, cy0 = tile.bottom - corner;
+    const float DIAG = 0.70710678f;
+    float cx = cx0 + corner * DIAG, cy = cy0 + corner * DIAG;
+
+    draw_presence_dot_dnd(rt, cx, cy, r, presence, surface, dnd, ring);
 }
 
 
@@ -612,6 +671,11 @@ static st_ctx       *g_st;
 /* Declared here rather than beside the test hook: the notification window
  * (below) needs the shell's HWND to restore it, and is defined earlier. */
 static HWND g_main_hwnd;
+
+/* sdltext rasterizes into a bitmap two DIPs wider and taller than the ink, so
+ * antialiasing at the edges has somewhere to go (st_draw). Anything measuring a
+ * text raster has to subtract it or it is measuring the margin. */
+#define ST_RASTER_PAD 2.0f
 
 static gfx_tex *g_cap_tex;
 static int      g_cap_w, g_cap_h;
@@ -1628,6 +1692,10 @@ enum { TAB_MESSAGES = 0, TAB_FILES, TAB_PINS, TAB_ABOUT, TAB_COUNT };
  * the channel tabs above: they share a drawing routine, not a meaning. */
 enum { DTAB_DRAFTS = 0, DTAB_SCHEDULED, DTAB_SENT, DTAB_COUNT };
 static int g_dtab;
+/* The About tab's scroll offset and the room it has to move (REQ-034/035/036):
+ * its content is prose whose height follows the text scale, so at the larger
+ * sizes it outgrows the pane. */
+static float g_about_scroll, g_about_h, g_about_max;
 
 /* Does this tab exist for this conversation?
  *
@@ -2304,6 +2372,7 @@ typedef struct {
     int       pw, ph;         /* texture pixels */
     float     mw, mh;         /* layout metrics, DIPs */
     float     ox, oy;         /* ink offset inside the layout box, DIPs */
+    uint32_t  rgb;            /* the ink, kept for the paint ledger to report */
     unsigned  gen, stamp;
 } txt_ent;
 /* One cache per render target, for the reason cap_blit gives: a texture cannot
@@ -2355,6 +2424,7 @@ static txt_ent *txt_get(const char *s, fmtw *fm, float w, uint32_t rgb) {
     best->pw = g_cap_w; best->ph = g_cap_h;
     best->ox = g_cap_dx; best->oy = g_cap_dy;
     best->mw = m.w; best->mh = m.h;
+    best->rgb = rgb;
     best->gen = g_txt_gen;
     best->stamp = ++g_txt_stamp;
     return best;
@@ -2419,6 +2489,10 @@ static void txt_blit(gfx *rt, txt_ent *e, rectf r, const fmtw *fm) {
     }
     gfx_rect dst = { x, y, dw, dh };
     gfx_clip_push(rt, gr(r));
+    /* The ledger cannot read a colour out of a raster, and must not mistake
+     * sdltext's padding for ink — both are told to it here (see st_draw, which
+     * rasterizes at width+2 x height+2). */
+    gfx_ink(rt, e->rgb, ST_RASTER_PAD, ST_RASTER_PAD);
     gfx_tex_draw(rt, e->tex, dst, 0.0f, 1.0f);
     gfx_clip_pop(rt);
 }
@@ -2495,7 +2569,16 @@ static void draw_emoji_fmt(gfx *rt, const char *s, rectf r, fmtw *fmt) {
         }
     }
     if (!fmt) return;
+    /* Declared as content for the audit, and it is the honest label: a COLOUR
+     * glyph's raster is not tinted ink, so the colour handed to txt_get is not
+     * the colour on screen and asking what contrast it has against the surface
+     * behind it produces a number about nothing. Its advance is not its ink
+     * either -- an emoji cell clips a few pixels of trailing advance and looks
+     * perfectly correct doing it, which the truncation check would otherwise
+     * report once per cell, forty times a picker. */
+    gfx_tag(rt, "content:emoji");
     txt_blit(rt, txt_get(s, fmt, r.right - r.left, OC_COL_TEXT), r, fmt);
+    gfx_tag(rt, NULL);
 }
 static void draw_emoji_glyph(gfx *rt, const char *s, rectf r) {
     draw_emoji_fmt(rt, s, r, g_emoji);
@@ -2720,6 +2803,10 @@ static int gfx_stack_init(void) {
     if (!g_ren) return 0;
     g_gfx = gfx_create(g_ren);
     if (!g_gfx) return 0;
+    /* The paint ledger costs an allocation and a row per primitive, so it is on
+     * only while the harness is driving — the same gate every other test hook
+     * uses. A shipped client never allocates it. */
+    if (g_test_dir[0]) gfx_ledger_enable(g_gfx, 1);
     st_sink sink = { NULL, cap_blit };
     g_st = st_dwrite_create(&sink);
     if (!g_st) return 0;
@@ -3059,6 +3146,12 @@ static void draw_user_avatar(gfx *rt, const oc_model *m, uint64_t uid,
         if (draw_avatar_image(rt, aid, box, radius, square)) return;
         avatar_want(aid);        /* not here yet: fall through to the initial */
     }
+    /* Tagged for the audit: an avatar's colour is derived from the user id, so
+     * it is CONTENT and deliberately outside the theme palette. Without the
+     * tag the palette check reports every person in the workspace as an
+     * unthemed colour, and a check that fires on correct code is one people
+     * learn to skip. */
+    gfx_tag(rt, "content:avatar");
     if (square) {
         fill_round(rt, box, radius, tint);
     } else {
@@ -3070,6 +3163,7 @@ static void draw_user_avatar(gfx *rt, const oc_model *m, uint64_t uid,
     fmt->align = ST_ALIGN_CENTER;
     draw_text(rt, ini, fmt, box, 0xFFFFFF);
     fmt->align = prev;
+    gfx_tag(rt, NULL);
 }
 
 /* A group conversation's marker: how many people are in it, not one of their
@@ -3246,9 +3340,9 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
         /* Your own presence, notched into the bottom-right corner — the same
          * dot, from the same helper, that every person in the DM list and the
          * member pane carries. */
-        draw_presence_dot_dnd(rt, cx + 12, base + 39, 4.5f,
-                              m ? oc_model_presence_of(m, m->user_id) : OC_PRESENCE_OFFLINE,
-                              OC_COL_RAIL, m ? oc_model_snoozed(m) : 0);
+        draw_avatar_presence(rt, av2, 8.0f,
+                             m ? oc_model_presence_of(m, m->user_id) : OC_PRESENCE_OFFLINE,
+                             OC_COL_RAIL, m ? oc_model_snoozed(m) : 0);
         {
             /* The quiet-hours badge stays AFTER the avatar, unlike the pill: it
              * badges the avatar's own top-right corner, so it has to sit on top
@@ -3409,8 +3503,8 @@ static void draw_menu(gfx *rt) {
                              (nm && nm[0]) ? nm : "U", av, g_avatar, 0, 0);
             uint8_t pres = m ? oc_model_presence_of(m, m->user_id) : 0;
             int snoozed = m ? oc_model_snoozed(m) : 0;
-            draw_presence_dot_dnd(rt, av.right - 3, av.bottom - 3, 4.5f,
-                                  pres, OC_COL_INPUT, snoozed);
+            draw_avatar_presence(rt, av, (av.bottom - av.top) / 2.0f,
+                                 pres, OC_COL_INPUT, snoozed);
             draw_text(rt, (nm && nm[0]) ? nm : "you", g_ui_b,
                       rf(x + 62, cy + 12, panel.right - 12, cy + 32), OC_COL_TEXT);
             char pl[48];
@@ -3807,14 +3901,10 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                       g_micro->align = oa; }
                 } else {
                 draw_user_avatar(rt, m, r->peer_id, r->label, av, g_meta, 1, 5.0f);
-                /* INSET into the avatar, not hung off its corner: at
-                 * (right-1, bottom-1) most of the dot was outside the picture,
-                 * which is what made it read as an artifact rather than a status
-                 * (reported from a screenshot). */
-                draw_presence_dot_dnd(rt, av.right - 4, av.bottom - 4, 4.5f,
-                                      oc_model_presence_of(m, r->peer_id),
-                                      selected ? OC_COL_SELECT : OC_COL_SIDEBAR,
-                                      oc_model_dnd_of(m, r->peer_id));
+                draw_avatar_presence(rt, av, OC_R_AVATAR_SM,
+                                     oc_model_presence_of(m, r->peer_id),
+                                     selected ? OC_COL_SELECT : OC_COL_SIDEBAR,
+                                     oc_model_dnd_of(m, r->peer_id));
                 }
             } else {
                 const char *mark = r->is_private ? "\xF0\x9F\x94\x92" : "#";
@@ -4039,6 +4129,7 @@ typedef struct {
     gfx_tex   *tex;
     int        pw, ph;
     float      mh;        /* layout height, DIPs */
+    uint32_t   rgb;       /* the ink, kept for the paint ledger to report */
     size_t     blen;      /* body byte length (selection clamps to it) */
     /* the inline boxes (custom emoji): where they landed + which image */
     int        nbox;
@@ -4159,7 +4250,8 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     if (nb < best->nbox) best->nbox = nb;
 
     /* Raster now, once; the texture is what frames blit. */
-    st_draw(g_st, lay, 0, 0, msg->deleted ? OC_COL_FAINT : OC_COL_TEXT, 1.0f);
+    best->rgb = msg->deleted ? OC_COL_FAINT : OC_COL_TEXT;
+    st_draw(g_st, lay, 0, 0, best->rgb, 1.0f);
     best->mid = msg->message_id;
     best->sig = sig;
     best->cw = cw;
@@ -4313,6 +4405,7 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
             if (body->tex) {
                 float sc = gfx_scale(rt);
                 gfx_rect dst = { tx, by, body->pw / sc, body->ph / sc };
+                gfx_ink(rt, body->rgb, ST_RASTER_PAD, ST_RASTER_PAD);
                 gfx_tex_draw(rt, body->tex, dst, 0.0f, 1.0f);
             }
             /* Custom emoji (REQ-072) composited into the boxes the layout
@@ -5991,7 +6084,19 @@ static void draw_about(gfx *rt, const oc_model *m, rectf reg) {
     const oc_channel *c = oc_model_channel((oc_model *)m, g_sel);
     if (!c) { overlay_empty(rt, reg, "No channel."); return; }
 
-    float x = reg.left + 24, w = reg.right - reg.left - 48, y = reg.top + 20;
+    /* THE PANE SCROLLS, AND IS CLIPPED TO ITSELF. Its content is prose and
+     * buttons whose height follows the text scale, and at the larger sizes it
+     * is taller than the pane -- so the tail of it was drawn below the bottom
+     * of the window, where it could be neither read nor clicked, and there was
+     * no way to bring it up.
+     *
+     * Clipping alone would have been cosmetic: the content is equally
+     * unreachable clipped or not, and only a check could tell the difference.
+     * What was actually missing is a way to reach it, so the pane takes the
+     * wheel and offsets its content, and the clip is what keeps that honest. */
+    gfx_clip_push(rt, gr(reg));
+    float x = reg.left + 24, w = reg.right - reg.left - 48;
+    float y = reg.top + 20 - g_about_scroll;
     char line[320];
 
     snprintf(line, sizeof line, "%s%s", c->kind == OC_CHANNEL_KIND_DM ? "@ " :
@@ -6011,15 +6116,29 @@ static void draw_about(gfx *rt, const oc_model *m, rectf reg) {
 
     draw_text(rt, "TOPIC", g_meta, rf(x, y, x + w, y + 20), OC_COL_FAINT);
     y += 22;
-    draw_text(rt, (c->topic && c->topic[0]) ? c->topic : "No topic set.", g_ui,
-              rf(x, y, x + w - 120, y + 44),
-              (c->topic && c->topic[0]) ? OC_COL_TEXT : OC_COL_FAINT);
-    g_about_topic = rf(reg.right - 24 - 110, y - 4, reg.right - 24, y + 24);
-    stroke_round(rt, g_about_topic, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-    g_meta->align = ST_ALIGN_CENTER;
-    draw_text(rt, "Set topic", g_meta, g_about_topic, OC_COL_MUTED);
-    g_meta->align = ST_ALIGN_LEFT;
-    y += 56;
+    /* The button is MEASURED and the topic gets what is left -- and when what is
+     * left is not enough to read, the button drops to its own line instead.
+     * Both used to be fixed: the button 110 DIP at a fixed inset, the topic
+     * given `w - 120` whatever w was. At the largest scales that left the topic
+     * 48 device pixels and "No topic set." was ellipsized to "N...", which
+     * says nothing at all while still occupying a row. */
+    {
+        float bw = text_width("Set topic", g_meta) + 32;
+        float avail = w - bw - 16;
+        const char *topic = (c->topic && c->topic[0]) ? c->topic : "No topic set.";
+        /* Enough for a few characters, or the row is not worth splitting. */
+        int inline_btn = avail >= text_width("No topic set.", g_ui);
+        draw_text(rt, topic, g_ui,
+                  rf(x, y, x + (inline_btn ? avail : w), y + 44),
+                  (c->topic && c->topic[0]) ? OC_COL_TEXT : OC_COL_FAINT);
+        float by = inline_btn ? y - 4 : y + 30;
+        g_about_topic = rf(reg.right - 24 - bw, by, reg.right - 24, by + 28);
+        stroke_round(rt, g_about_topic, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+        g_meta->align = ST_ALIGN_CENTER;
+        draw_text(rt, "Set topic", g_meta, g_about_topic, OC_COL_MUTED);
+        g_meta->align = ST_ALIGN_LEFT;
+        y += inline_btn ? 56 : 90;
+    }
 
     /* Facts worth having in one place, none of which needed a new query. */
     const char *nm = oc_model_user_name((oc_model *)m, 0);
@@ -6044,54 +6163,84 @@ static void draw_about(gfx *rt, const oc_model *m, rectf reg) {
         y += 18;
         draw_text(rt, "ADMIN", g_meta, rf(x, y, x + w, y + 20), OC_COL_FAINT);
         y += 24;
-        /* Webhooks are channel-scoped admin, so the channel's own settings page
-         * is where they belong — they were reachable only from a right-click
+        /* THE ROW MEASURES ITS BUTTONS AND WRAPS. Each of these used to be a
+         * fixed 150 DIP wide at a fixed offset -- 0, 160, 320, 480 -- adding up
+         * to 600 DIP of row in a pane that is not always 600 DIP wide. Past
+         * 125% the last of them was laid out beyond the window edge and drawn
+         * there: present, clickable in principle, and unreachable. Archiving a
+         * channel is not an action to leave in that state.
+         *
+         * Nothing is dropped, because all four are distinct destructive-ish
+         * actions and none is decoration. They wrap instead, which costs a row
+         * of height and keeps every one of them on screen at any width.
+         *
+         * Webhooks are channel-scoped admin, so the channel's own settings page
+         * is where they belong -- they were reachable only from a right-click
          * menu, which is not somewhere anyone looks for configuration. */
-        g_about_hooks = rf(x + 480, y, x + 600, y + 28);
-        if (in_rect(g_about_hooks, g_mouse_x, g_mouse_y))
-            fill_round(rt, g_about_hooks, OC_R_CONTROL, OC_COL_HOVER);
-        stroke_round(rt, g_about_hooks, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-        g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, "Webhooks", g_meta, g_about_hooks, OC_COL_MUTED);
-        g_meta->align = ST_ALIGN_LEFT;
-
-        g_about_rename = rf(x, y, x + 150, y + 28);
-        if (in_rect(g_about_rename, g_mouse_x, g_mouse_y))
-            fill_round(rt, g_about_rename, OC_R_CONTROL, OC_COL_HOVER);
-        stroke_round(rt, g_about_rename, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-        g_meta->align = ST_ALIGN_CENTER;
-        draw_text(rt, "Rename channel", g_meta, g_about_rename, OC_COL_MUTED);
-        /* Visibility (REQ-031), beside the other two channel-shape actions. */
-        g_about_visibility = rf(x + 160, y, x + 310, y + 28);
-        if (in_rect(g_about_visibility, g_mouse_x, g_mouse_y))
-            fill_round(rt, g_about_visibility, OC_R_CONTROL, OC_COL_HOVER);
-        stroke_round(rt, g_about_visibility, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-        draw_text(rt, c->is_public ? "Make private" : "Make public", g_meta,
-                  g_about_visibility, OC_COL_MUTED);
-        g_about_archive = rf(x + 320, y, x + 470, y + 28);
-        if (in_rect(g_about_archive, g_mouse_x, g_mouse_y))
-            fill_round(rt, g_about_archive, OC_R_CONTROL, OC_COL_HOVER);
-        stroke_round(rt, g_about_archive, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-        draw_text(rt, c->archived ? "Unarchive" : "Archive channel", g_meta,
-                  g_about_archive, c->archived ? OC_COL_NOTICE : OC_COL_DANGER);
-        g_meta->align = ST_ALIGN_LEFT;
-        y += 36;
+        {
+            struct { const char *label; uint32_t col; rectf *out; } BTN[] = {
+                { "Rename channel", OC_COL_MUTED, &g_about_rename },
+                { c->is_public ? "Make private" : "Make public",
+                  OC_COL_MUTED, &g_about_visibility },
+                { c->archived ? "Unarchive" : "Archive channel",
+                  c->archived ? OC_COL_NOTICE : OC_COL_DANGER, &g_about_archive },
+                { "Webhooks", OC_COL_MUTED, &g_about_hooks },
+            };
+            const int NBTN = (int)(sizeof BTN / sizeof BTN[0]);
+            float bx = x, by = y;
+            g_meta->align = ST_ALIGN_CENTER;
+            for (int i = 0; i < NBTN; i++) {
+                float bw = text_width(BTN[i].label, g_meta) + 32;
+                if (bx > x && bx + bw > x + w) { bx = x; by += 36; }   /* wrap */
+                rectf b = rf(bx, by, bx + bw, by + 28);
+                if (in_rect(b, g_mouse_x, g_mouse_y))
+                    fill_round(rt, b, OC_R_CONTROL, OC_COL_HOVER);
+                stroke_round(rt, b, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
+                draw_text(rt, BTN[i].label, g_meta, b, BTN[i].col);
+                *BTN[i].out = b;
+                bx = b.right + 10;
+            }
+            g_meta->align = ST_ALIGN_LEFT;
+            y = by + 36;
+        }
         /* The visibility line says what the NEXT click would do, and says the
          * dangerous direction plainly: going public is not "a setting", it is
          * publishing everything already said in here. */
-        draw_text(rt, c->is_public
-                      ? "Making it private keeps its history for members only; people who never "
-                        "joined lose access."
-                      : "Making it public shows this channel AND ITS WHOLE HISTORY to everyone in "
-                        "the workspace. Flipping it back does not un-show it.",
-                  g_meta_w, rf(x, y, x + w, y + 40), c->is_public ? OC_COL_FAINT : OC_COL_NOTICE);
-        y += 42;
-        draw_text(rt, c->archived
-                      ? "Unarchiving makes the channel writable again."
-                      : "Archiving makes it read-only and hides it from people who are not in it. "
-                        "History stays searchable, and it can be undone.",
-                  g_meta_w, rf(x, y, x + w, y + 56), OC_COL_FAINT);
+        /* MEASURED, not assumed. Both of these are wrapping prose in boxes that
+         * were a fixed 40 and 56 DIP tall, which held while the text fitted two
+         * lines and stopped holding the moment the text size grew it to three:
+         * the first paragraph was cut mid-sentence and the second began
+         * immediately under the cut, so the two read as one mangled block. The
+         * sentences say what publishing a channel's whole history does, which
+         * is not a sentence to deliver half of. */
+        const char *vis_s = c->is_public
+                ? "Making it private keeps its history for members only; people who never "
+                  "joined lose access."
+                : "Making it public shows this channel AND ITS WHOLE HISTORY to everyone in "
+                  "the workspace. Flipping it back does not un-show it.";
+        const char *arc_s = c->archived
+                ? "Unarchiving makes the channel writable again."
+                : "Archiving makes it read-only and hides it from people who are not in it. "
+                  "History stays searchable, and it can be undone.";
+        float vh = text_height(vis_s, g_meta_w, w);
+        draw_text(rt, vis_s, g_meta_w, rf(x, y, x + w, y + vh),
+                  c->is_public ? OC_COL_FAINT : OC_COL_NOTICE);
+        y += vh + 8;
+        float ah = text_height(arc_s, g_meta_w, w);
+        draw_text(rt, arc_s, g_meta_w, rf(x, y, x + w, y + ah), OC_COL_FAINT);
+        y += ah + 8;
     }
+    /* What the wheel is allowed to move, measured from what was just laid out
+     * rather than guessed -- the content's height changes with the text size,
+     * the role and whether the channel is archived. */
+    g_about_h = (y + g_about_scroll) - reg.top + 20;
+    float over = g_about_h - (reg.bottom - reg.top);
+    g_about_max = over > 0 ? over : 0;
+    if (g_about_scroll > g_about_max) {
+        g_about_scroll = g_about_max;
+        InvalidateRect(g_main_hwnd, NULL, FALSE);
+    }
+    gfx_clip_pop(rt);
 }
 
 static void draw_pinlist(gfx *rt, const oc_model *m, rectf reg) {
@@ -6338,6 +6487,15 @@ static rectf chip(gfx *rt, float x, float y, const char *label,
 /* A dropdown button: "Types ▾", showing the current choice rather than the
  * axis name when one is set, so the row states the filter instead of hiding it
  * behind a click. */
+/* What drop_btn WILL be, without drawing it. The row above has to know whether
+ * an arrangement fits before it commits to one, and measuring by drawing and
+ * then regretting it is how the two runs came to overlap in the first place. */
+static float drop_w(const char *label) {
+    char txt[64];
+    snprintf(txt, sizeof txt, "%s \xE2\x96\xBE", label);
+    return text_width(txt, g_meta) + 22;
+}
+
 static rectf drop_btn(gfx *rt, float right, float y, const char *label,
                             int active) {
     char txt[64];
@@ -6385,36 +6543,82 @@ static float draw_file_filters(gfx *rt, rectf body, int full) {
     for (int i = 0; i < FS_SCOPES; i++) g_file_scopes[i] = rf(0, 0, 0, 0);
     for (int i = 0; i < FF_KINDS;  i++) g_file_filters[i] = rf(0, 0, 0, 0);
 
-    if (full) {
-        /* Left: ownership, the axis you switch most often, so it stays one
-         * click. Right: type and sort, folded into dropdowns — as four
-         * always-visible chips, type cost the width the filename column wanted
-         * to state an axis most users leave on "All". */
-        float fx = body.left + 20;
-        for (int i = 0; i < FS_SCOPES; i++) {
-            g_file_scopes[i] = chip(rt, fx, y, FS_LABEL[i], g_file_scope == i, OC_COL_ACCENT);
-            fx = g_file_scopes[i].right + 6;
+    /* THE RUNS HAVE TO BE TOLD ABOUT EACH OTHER.
+     *
+     * The chips are laid left to right from the pane's left edge and the
+     * dropdowns right to left from its right edge, and until now neither
+     * measured the other. At 100% they happened to clear; from 125% up the
+     * labels grew until the runs met and the row drew one on top of the other
+     * -- "Shared by you" buried under "Types", a fragment of a third label
+     * showing through the gap, and the click targets overlapping with them, so
+     * pressing a filter could select the one underneath.
+     *
+     * The arrangement is a MEASUREMENT now, not a property of which pane this
+     * is. Three tiers, each tried against the width actually available and the
+     * first that fits taken: chips for the axis you switch most, then that axis
+     * folded into a dropdown like the channel tab already does, then sort
+     * dropped -- it is the axis with a sensible default and the least traffic,
+     * so it is the right thing to lose last and the only thing to lose.
+     *
+     * Deciding by measurement rather than by pane is what stops this coming
+     * back at a scale nobody tried: there is no width at which the row lays out
+     * two runs into the same pixels, because it does not lay out a tier it has
+     * not confirmed fits. */
+    {
+        const char *type_lbl = g_file_filter == FF_ALL ? "Types" : FF_LABEL[g_file_filter];
+        const char *scope_lbl = g_file_scope == FS_ALL ? "Anyone" : FS_LABEL[g_file_scope];
+        float avail = (body.right - 20) - (body.left + 20);
+        float w_chips = 0;
+        for (int i = 0; i < FS_SCOPES; i++)
+            w_chips += text_width(FS_LABEL[i], g_meta) + 22 + 6;
+        float w_type  = drop_w(type_lbl),  w_sort = drop_w(FSORT_LABEL[g_file_sort]);
+        float w_scope = drop_w(scope_lbl);
+        /* A gap the two runs may not close: touching, they read as one control. */
+        const float GAP = 16.0f;
+
+        int tier;
+        if (full && w_chips + GAP + w_type + 8 + w_sort <= avail)          tier = 0;
+        else if (full && w_scope + 8 + w_type + 8 + w_sort <= avail)       tier = 1;
+        else                                                              tier = 2;
+
+        if (tier == 0) {
+            /* Left: ownership, the axis you switch most often, so it stays one
+             * click. Right: type and sort, folded into dropdowns — as four
+             * always-visible chips, type cost the width the filename column
+             * wanted to state an axis most users leave on "All". */
+            float fx = body.left + 20;
+            for (int i = 0; i < FS_SCOPES; i++) {
+                g_file_scopes[i] = chip(rt, fx, y, FS_LABEL[i], g_file_scope == i,
+                                        OC_COL_ACCENT);
+                fx = g_file_scopes[i].right + 6;
+            }
+            g_file_sort_btn  = drop_btn(rt, body.right - 20, y,
+                                        FSORT_LABEL[g_file_sort],
+                                        g_file_sort != FSORT_RECENT);
+            g_file_type_btn  = drop_btn(rt, g_file_sort_btn.left - 8, y, type_lbl,
+                                        g_file_filter != FF_ALL);
+            g_file_scope_btn = rf(0, 0, 0, 0);
+        } else {
+            /* The channel TAB is ~300px of a middle column, and the full view at
+             * the largest scales is no wider in the sense that matters. Chips do
+             * not fit: scope alone measures nearly the whole width, and drawing
+             * both axes as chips overlapped them into an unreadable smear. Sort
+             * survives the fold only while there is room for it AND only in the
+             * full view, which is the one place it can be reached at all —
+             * inside a channel, newest-first is the order people expect and the
+             * list is short. */
+            float rx = body.right - 20;
+            if (tier == 1) {
+                g_file_sort_btn = drop_btn(rt, rx, y, FSORT_LABEL[g_file_sort],
+                                           g_file_sort != FSORT_RECENT);
+                rx = g_file_sort_btn.left - 8;
+            } else {
+                g_file_sort_btn = rf(0, 0, 0, 0);
+            }
+            g_file_scope_btn = drop_btn(rt, rx, y, scope_lbl, g_file_scope != FS_ALL);
+            g_file_type_btn  = drop_btn(rt, g_file_scope_btn.left - 8, y, type_lbl,
+                                        g_file_filter != FF_ALL);
         }
-        g_file_sort_btn  = drop_btn(rt, body.right - 20, y, FSORT_LABEL[g_file_sort],
-                                    g_file_sort != FSORT_RECENT);
-        g_file_type_btn  = drop_btn(rt, g_file_sort_btn.left - 8, y,
-                                    g_file_filter == FF_ALL ? "Types" : FF_LABEL[g_file_filter],
-                                    g_file_filter != FF_ALL);
-        g_file_scope_btn = rf(0, 0, 0, 0);
-    } else {
-        /* The channel TAB is ~300px of a middle column. Chips do not fit there:
-         * scope alone measures nearly the full width, and drawing both axes as
-         * chips overlapped them into an unreadable smear. Both fold into
-         * dropdowns, which is also the arrangement that leaves the pane to its
-         * content. Sort stays out — inside one channel, newest-first is the
-         * order people expect and the list is short. */
-        g_file_scope_btn = drop_btn(rt, body.right - 20, y,
-                                    g_file_scope == FS_ALL ? "Anyone" : FS_LABEL[g_file_scope],
-                                    g_file_scope != FS_ALL);
-        g_file_type_btn  = drop_btn(rt, g_file_scope_btn.left - 8, y,
-                                    g_file_filter == FF_ALL ? "Types" : FF_LABEL[g_file_filter],
-                                    g_file_filter != FF_ALL);
-        g_file_sort_btn  = rf(0, 0, 0, 0);
     }
     return y + 32;
 }
@@ -6716,8 +6920,14 @@ static float pref_accent_row(gfx *rt, rectf body, float y) {
          * they have on screen, where the accent appears ON the rail. Two half-discs
          * were the alternative and read as a single two-tone colour rather than as
          * a surface and a highlight. */
+        /* Tagged as content for the audit: a swatch shows a scheme you have
+         * NOT picked, so three of the four are deliberately colours the theme
+         * in force does not name. Untagged, the palette check reports the
+         * chooser as four unthemed surfaces every time it is opened. */
+                gfx_tag(rt, "content:swatch");
                 gfx_ellipse(rt, cx, cy, 11, 11, oc_theme_scheme_rail(i), 1.0f);
                 gfx_ellipse(rt, cx, cy, 5.5f, 5.5f, oc_theme_scheme_accent(i), 1.0f);
+                gfx_tag(rt, NULL);
         if (i == oc_theme_scheme()) {
             /* A ring, not a tick: a tick in the accent colour on the accent colour is
              * invisible, and one in white is invisible on the light swatches. */
@@ -7317,16 +7527,53 @@ static float draw_tabbar(gfx *rt, const oc_model *m, float x0, float w) {
         { "About",         OC_ICON_SETTINGS },
     };
     const oc_channel *tc = oc_model_channel((oc_model *)m, g_sel);
+
+    /* THE STRIP FITS THE WIDTH IT IS GIVEN, or it stops showing labels.
+     *
+     * `tx` used to advance by each tab's measured width with nothing checking
+     * it against the pane's right edge, so once the labels grew past 100% the
+     * last tabs were laid out beyond it: "About" cut mid-word with no ellipsis
+     * to say it had been cut, and at larger scales drawn entirely off the
+     * window -- present, clickable in principle, and unreachable.
+     *
+     * Nothing here scrolls sideways, so running past the right edge is not
+     * "below the fold", it is a control placed where it cannot be used. The
+     * strip therefore measures the whole run first and drops to icons when the
+     * labelled form does not fit, keeping the label on the SELECTED tab so the
+     * strip still says where you are. An icon row is a smaller thing to read
+     * than a truncated word, and every tab stays reachable, which is the part
+     * that was actually broken. */
+    float avail = w - 32;
+    float need_full = 0, need_icons = 0;
+    int n_tabs = 0;
+    for (int i = 0; i < TAB_COUNT; i++) {
+        if (!tab_applies(tc, i)) continue;
+        n_tabs++;
+        need_full  += 26 + text_width(TABS[i].label, g_ui) + 16 + 4;
+        need_icons += 34 + 4;
+        if (g_tab == i) need_icons += text_width(TABS[i].label, g_ui) + 8;
+    }
+    /* Two thresholds, not one. Keeping the label on the SELECTED tab is worth a
+     * tier of its own -- an icon row says nothing about where you are -- but it
+     * is not worth pushing the last tab off the window, which is what happened
+     * when only the first threshold was checked: the icons fitted, the selected
+     * label did not, and the strip ran past the edge anyway. */
+    int labels = (need_full <= avail);
+    int sel_label = labels || (need_icons <= avail);
+
     float tx = x0 + 16;
     for (int i = 0; i < TAB_COUNT; i++) {
         if (!tab_applies(tc, i)) continue;      /* leaves g_tab_r[i] zeroed above */
-        float tw = 26 + text_width(TABS[i].label, g_ui) + 16;
-        rectf r = rf(tx, HEADER_H + 2, tx + tw, HEADER_H + TABBAR_H - 1);
         int on = (g_tab == i);
+        int show_label = labels || (on && sel_label);
+        float tw = show_label ? 26 + text_width(TABS[i].label, g_ui) + 16 : 34;
+        rectf r = rf(tx, HEADER_H + 2, tx + tw, HEADER_H + TABBAR_H - 1);
         uint32_t col = on ? OC_COL_TEXT : OC_COL_MUTED;
         if (g_tab_hover == i && !on) fill_round(rt, r, OC_R_CONTROL, OC_COL_HOVER);
-        draw_lucide(rt, TABS[i].icon, rf(r.left + 6, r.top + 8, r.left + 22, r.bottom - 8), col);
-        draw_text(rt, TABS[i].label, g_ui, rf(r.left + 26, r.top, r.right, r.bottom), col);
+        float ix = show_label ? r.left + 6 : r.left + 9;
+        draw_lucide(rt, TABS[i].icon, rf(ix, r.top + 8, ix + 16, r.bottom - 8), col);
+        if (show_label)
+            draw_text(rt, TABS[i].label, g_ui, rf(r.left + 26, r.top, r.right, r.bottom), col);
         /* The selected tab is marked by an underline on the strip's own border,
          * which is how a tab reads as a tab rather than as a button. */
         if (on) fill(rt, rf(r.left + 4, r.bottom - 2, r.right - 4, r.bottom), OC_COL_ACCENT);
@@ -7477,7 +7724,29 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
     /* The mode label needs its own band, or it collides with the first row — which
      * it did. Panel height and row origin both account for it. */
     float hint_h = g_fwd_mid ? 18.0f : 0.0f;
-    float ph = 58 + hint_h + (nh ? nh * rowh : rowh) + 10;
+    /* THE PANEL STAYS INSIDE THE WINDOW. Its height was the row count times a
+     * scaled row height plus its chrome, with nothing bounding it, so at large
+     * text sizes it grew past the bottom of the window and its lower rows were
+     * drawn where they could not be seen or clicked -- while the keyboard
+     * happily selected them.
+     *
+     * The rows are what give way, and they scroll rather than being truncated:
+     * Up and Down cycle through every match, so a list that only DREW the first
+     * few would let Enter accept something never shown. */
+    int vis = nh;
+    {
+        float chrome = 58 + hint_h + 10;
+        float room = H - py - 16 - chrome;
+        int fits = (int)(room / rowh);
+        if (fits < 1) fits = 1;
+        if (vis > fits) vis = fits;
+    }
+    int pfirst = 0;
+    if (g_pal_sel >= vis) pfirst = g_pal_sel - vis + 1;
+    if (pfirst > nh - vis) pfirst = nh - vis;
+    if (pfirst < 0) pfirst = 0;
+
+    float ph = 58 + hint_h + (nh ? vis * rowh : rowh) + 10;
     g_pal_panel = rf(px, py, px + pw, py + ph);
     fill_round(rt, rf(px + 3, py + 5, px + pw + 3, py + ph + 5), OC_R_OVERLAY, 0x000000);
     fill_round(rt, g_pal_panel, OC_R_OVERLAY, OC_COL_INPUT);
@@ -7500,7 +7769,7 @@ static void draw_palette(gfx *rt, const oc_model *m, float W, float H) {
                   rf(px + 20, y, px + pw - 20, y + rowh), OC_COL_FAINT);
         return;
     }
-    for (int i = 0; i < nh; i++) {
+    for (int i = pfirst; i < pfirst + vis; i++) {
         rectf r = rf(px + 6, y, px + pw - 6, y + rowh);
         if (i == g_pal_sel) fill_round(rt, r, OC_R_CONTROL, OC_COL_ACCENT);
         draw_text(rt, hit[i].label, g_ui, rf(px + 18, y, px + pw - 90, y + rowh),
@@ -8116,11 +8385,13 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
          * clickable row in the app does. */
         if (g_mem_hover && cm->user_id == g_mem_hover)
             fill_round(rt, rf(x0 + 4, y + 1, W - 4, y + ROW_H - 1), OC_R_CONTROL, OC_COL_HOVER);
+        /* The primitive rather than the composite: this row has no avatar, so
+         * the dot is chrome in its own right and has no tile to be sized by. */
         draw_presence_dot_dnd(rt, x0 + 22, y + ROW_H / 2, 4.5f,
                               oc_model_presence_of(m, cm->user_id),
                               (g_mem_hover && cm->user_id == g_mem_hover)
                                   ? OC_COL_HOVER : OC_COL_SIDEBAR,
-                              oc_model_dnd_of(m, cm->user_id));
+                              oc_model_dnd_of(m, cm->user_id), 2.0f);
         const char *disp = (nm && nm[0]) ? nm : "user";
         draw_text(rt, disp, g_ui, rf(x0 + 34, y, W - 14, y + ROW_H), OC_COL_TEXT);
         /* Role glyph INLINE, immediately after the name — not in a column of its
@@ -8405,15 +8676,55 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
     fill_round(rt, g_pick_panel, OC_R_OVERLAY, OC_COL_INPUT);
     stroke_round(rt, g_pick_panel, OC_R_OVERLAY, OC_COL_BORDER, 1.0f);
 
-    draw_text(rt, g_pick_target == PICK_STATUS ? "Status emoji"
-                : g_pick_mid ? "Add reaction" : "Emoji", g_title,
-              rf(px + 14, py + 8, px + pw - 14, py + 30), OC_COL_TEXT);
+    /* THE TITLE STOPS WHERE THE SWATCHES START. Its rect used to run the full
+     * width of the panel while the tone swatches were drawn, right-aligned,
+     * into the same band -- fine while the title was short, and at the largest
+     * text sizes "Add reaction" grew until it ran underneath six hands and
+     * neither could be read.
+     *
+     * The swatch run is measured here, once, and both the title and the
+     * swatches below take their geometry from it, so the two cannot disagree
+     * about where the boundary is. The cell follows the text scale for the same
+     * reason: the glyph inside it is drawn in an emoji format that grows, and a
+     * cell fixed at 24 DIP was a cell the glyph outgrew. */
+    /* THE WHOLE HEADER BAND FOLLOWS THE TEXT SCALE. Its offsets were plain
+     * DIPs -- title at +8, swatches at +6 with a 22 tall cell, search box at
+     * +32, grid at +68 -- while everything DRAWN in them is text and grows.
+     * Scaling only the swatch cell's width, as the first pass did, left its
+     * height at 22 and the taller glyph overflowed the cell and was cut by the
+     * panel's own top edge: the row of hands came out with their tops shaved
+     * off. A band whose height is fixed while its contents scale has a size at
+     * which it clips, and the only question is which size. */
+    float tone_w = UIS(24.0f), tone_h = UIS(22.0f);
+    float hdr_pad = UIS(6.0f);
+    float box_top = py + hdr_pad + tone_h + UIS(4.0f);
+    float box_bot = box_top + UIS(30.0f);
+    float tones_w = tone_w * OC_SKIN_COUNT;
+    float title_r = px + pw - 14 - tones_w - 8;
+    /* When there is not room for both, the TITLE goes. The swatches are a
+     * control and the title is a label for a panel you just opened on purpose,
+     * so the title is what can be spared. Clamping it to a minimum instead --
+     * which is what the first attempt did -- gave it a rect too small for its
+     * ink and let the ink run out of the rect and under the swatches, which is
+     * the same collision arriving through the fix for it. */
+    const char *ptitle = g_pick_target == PICK_STATUS ? "Status emoji"
+                       : g_pick_mid ? "Add reaction" : "Emoji";
+    if (title_r - (px + 14) >= text_width(ptitle, g_title))
+        draw_text(rt, ptitle, g_title,
+                  rf(px + 14, py + hdr_pad, title_r, py + hdr_pad + tone_h),
+                  OC_COL_TEXT);
 
-    g_pick_box = rf(px + 12, py + 32, px + pw - 12, py + 62);
+    g_pick_box = rf(px + 12, box_top, px + pw - 12, box_bot);
     fill_round(rt, g_pick_box, OC_R_CONTROL, OC_COL_BASE);
     stroke_round(rt, g_pick_box, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
-    draw_lucide(rt, OC_ICON_SEARCH, rf(g_pick_box.left + 8, g_pick_box.top + 7,
-                                       g_pick_box.left + 24, g_pick_box.top + 23), OC_COL_MUTED);
+    {   /* Centred in the box it sits in, so it follows the box rather than a
+         * pair of offsets that were right at one scale. */
+        float ic = (g_pick_box.bottom - g_pick_box.top - 16.0f) / 2.0f;
+        draw_lucide(rt, OC_ICON_SEARCH,
+                    rf(g_pick_box.left + 8, g_pick_box.top + ic,
+                       g_pick_box.left + 24, g_pick_box.top + ic + 16),
+                    OC_COL_MUTED);
+    }
 
     char q[64] = "";
     if (g_pick_edit) {
@@ -8437,10 +8748,10 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
         for (size_t i = 0; i < all_n && !sample; i++) if (all[i].tonable) sample = &all[i];
         if (sample) {
             static char sw[OC_SKIN_COUNT][24];
-            float tw = 24, tx = px + pw - 14 - tw * OC_SKIN_COUNT;
-            float ty = py + 6;
+            float tw = tone_w, tx = px + pw - 14 - tones_w;
+            float ty = py + hdr_pad;
             for (int t = 0; t < OC_SKIN_COUNT; t++) {
-                rectf r = rf(tx, ty, tx + tw - 2, ty + 22);
+                rectf r = rf(tx, ty, tx + tw - 2, ty + tone_h);
                 oc_emoji_with_tone(sample, (uint8_t)t, sw[t], sizeof sw[t]);
                 if (t == g_skin_tone) fill_round(rt, r, OC_R_CONTROL, OC_COL_ACCENT_DIM);
                 draw_emoji_glyph(rt, sw[t], r);
@@ -8454,7 +8765,7 @@ static void draw_emoji_picker(gfx *rt, float x0, float w, float h) {
         }
     }
 
-    rectf body = rf(px + 8, py + 68, px + pw - 8, py + ph - 8);
+    rectf body = rf(px + 8, box_bot + UIS(6.0f), px + pw - 8, py + ph - 8);
     gfx_clip_push(rt, gr(body));
 
     /* Sized by the catalogue's own bound, not a round number: at 256 a browse
@@ -9895,14 +10206,21 @@ static void prefs_snapshot(void) {
     snprintf(g_prefs_snap.quick, sizeof g_prefs_snap.quick, "%s", g_quick_names);
 }
 
+static void theme_set(int mode);      /* fwd — a cancel restores the palette */
+static void scheme_set(int scheme);   /* fwd — and the scheme with it */
+
 static void prefs_restore(void) {
-    if (oc_theme_mode() != g_prefs_snap.theme) oc_theme_apply(g_prefs_snap.theme);
+    /* Through theme_set, not oc_theme_apply: CANCELLING a preference change is a
+     * palette change like any other, and restoring the old palette while every
+     * raster still holds the previewed one is the same defect arriving by the
+     * back door. */
+    if (oc_theme_mode() != g_prefs_snap.theme) theme_set(g_prefs_snap.theme);
     g_pref_time24  = g_prefs_snap.time24;
     g_pref_members = g_prefs_snap.members;
     g_pref_daysep  = g_prefs_snap.daysep;
     g_pref_notify  = g_prefs_snap.notify;
     g_pref_flash   = g_prefs_snap.flash;
-    if (oc_theme_scheme() != g_prefs_snap.accent) oc_theme_set_scheme(g_prefs_snap.accent);
+    if (oc_theme_scheme() != g_prefs_snap.accent) scheme_set(g_prefs_snap.accent);
     g_pref_density = g_prefs_snap.density;
     g_density      = g_prefs_snap.density ? 1.0f : 0.6f;
     g_pref_richtext = g_prefs_snap.richtext;
@@ -10605,11 +10923,11 @@ static void draw_dm_list(gfx *rt, const oc_model *m, float h) {
             /* A stack of people rather than one face: the row is about a set. */
             draw_group_avatar(rt, m, best, rf(row.left + 9, y + 11, row.left + 39, y + 41));
         } else {
-            draw_user_avatar(rt, m, best->peer_id, nm,
-                             rf(row.left + 9, y + 11, row.left + 39, y + 41), g_ui, 0, 0);
-            draw_presence_dot_dnd(rt, row.left + 34, y + 36, 5.0f,
-                                  oc_model_presence_of(m, best->peer_id), OC_COL_SIDEBAR,
-                                  oc_model_dnd_of(m, best->peer_id));
+            rectf dav = rf(row.left + 9, y + 11, row.left + 39, y + 41);
+            draw_user_avatar(rt, m, best->peer_id, nm, dav, g_ui, 0, 0);
+            draw_avatar_presence(rt, dav, (dav.bottom - dav.top) / 2.0f,
+                                 oc_model_presence_of(m, best->peer_id), OC_COL_SIDEBAR,
+                                 oc_model_dnd_of(m, best->peer_id));
         }
 
         int unread = best->unread > 0;
@@ -11142,7 +11460,8 @@ static int tgt_char(WCHAR ch) {
 
 /* Draw the field and, when there is something to show, the list under it.
  * Returns the field's height so the caller can place what follows. */
-static float tgt_draw(gfx *rt, const oc_model *m, rectf box, int focused) {
+static float tgt_draw(gfx *rt, const oc_model *m, rectf box, int focused,
+                      float list_max_h) {
     g_tgt_box = box;
     fill_round(rt, box, OC_R_CONTROL, OC_COL_INPUT);
     stroke_round(rt, box, OC_R_CONTROL, focused ? OC_COL_ACCENT : OC_COL_BORDER, 1.0f);
@@ -11175,12 +11494,35 @@ static float tgt_draw(gfx *rt, const oc_model *m, rectf box, int focused) {
     if (!g_n_tgt) return box.bottom - box.top;
 
     float rowh = UIS(34), ly = box.bottom + UIS(4);
-    float lh = (float)g_n_tgt * rowh + 8;
+    /* THE LIST TAKES ONLY THE ROOM IT WAS GIVEN. It used to size itself to the
+     * number of matches and push the composer down by exactly that much, so a
+     * long list at a large text size pushed the composer -- and the list's own
+     * lower rows -- off the bottom of the window, where they were still drawn
+     * and could not be seen or clicked. A suggestion nobody can reach is worse
+     * than a shorter list, so the list is what gives way. */
+    int shown = g_n_tgt;
+    if (list_max_h > 0) {
+        int fits = (int)((list_max_h - 8) / rowh);
+        if (fits < 1) fits = 1;          /* one row, or the field says nothing */
+        if (shown > fits) shown = fits;
+    }
+    /* The window SCROLLS to hold the selection rather than the match list being
+     * truncated to fit. Up and Down cycle through every match, so a cap alone
+     * would let the selection walk off the end of what is drawn -- pressing
+     * Enter would then accept something the field never showed, which is worse
+     * than the clipping this is fixing. */
+    int first = 0;
+    if (g_tgt_sel >= shown) first = g_tgt_sel - shown + 1;
+    if (first > g_n_tgt - shown) first = g_n_tgt - shown;
+    if (first < 0) first = 0;
+    for (int i = 0; i < g_n_tgt; i++)
+        if (i < first || i >= first + shown) g_tgt_rows[i] = rf(0, 0, 0, 0);
+    float lh = (float)shown * rowh + 8;
     rectf list = rf(box.left, ly, box.right, ly + lh);
     fill_round(rt, list, OC_R_CONTROL, OC_COL_BASE);
     stroke_round(rt, list, OC_R_CONTROL, OC_COL_BORDER, 1.0f);
     float y = ly + 4;
-    for (int i = 0; i < g_n_tgt; i++) {
+    for (int i = first; i < first + shown; i++) {
         rectf row = rf(list.left + 4, y, list.right - 4, y + rowh);
         if (i == g_tgt_sel) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
         if (g_tgt[i].is_channel) {
@@ -11229,12 +11571,15 @@ static void draw_newmsg(gfx *rt, const oc_model *m, rectf reg) {
 
     float pad = 24;
     rectf tobox = rf(body.left + pad, body.top + 16, body.right - pad, body.top + 54);
-    float grew = tgt_draw(rt, m, tobox, g_nm_to_focus);
+    float eh = 150;   /* toolbar + text + the action row */
+    /* What is left for the suggestion list once the composer has its room. The
+     * composer is the point of the pane, so it is not the thing that yields. */
+    float list_max = (body.bottom - 16 - eh - 16) - (tobox.bottom + UIS(4.0f));
+    float grew = tgt_draw(rt, m, tobox, g_nm_to_focus, list_max);
 
     /* The composer sits below whatever the picker's list took, so an open list
      * pushes it down rather than covering it. */
     float ey = tobox.top + grew + 16;
-    float eh = 150;   /* toolbar + text + the action row */
     rectf edbox = rf(body.left + pad, ey, body.right - pad, ey + eh);
     fill_round(rt, edbox, OC_R_CONTROL, OC_COL_INPUT);
     stroke_round(rt, edbox, OC_R_CONTROL, g_nm_to_focus ? OC_COL_BORDER : OC_COL_ACCENT, 1.0f);
@@ -11525,11 +11870,11 @@ static void draw_directory(gfx *rt, const oc_model *m, rectf reg) {
         rectf row = rf(body.left + 16, y, body.right - 16, y + ROWH2 - 4);
         if (g_listrow_hover == u->user_id) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
 
-        draw_user_avatar(rt, m, u->user_id, u->name[0] ? u->name : "?",
-                         rf(row.left + 12, y + 10, row.left + 44, y + 42), g_ui, 0, 0);
-        draw_presence_dot_dnd(rt, row.left + 40, y + 38, 4.5f,
-                              oc_model_presence_of(m, u->user_id), OC_COL_BASE,
-                              oc_model_dnd_of(m, u->user_id));
+        rectf uav = rf(row.left + 12, y + 10, row.left + 44, y + 42);
+        draw_user_avatar(rt, m, u->user_id, u->name[0] ? u->name : "?", uav, g_ui, 0, 0);
+        draw_avatar_presence(rt, uav, (uav.bottom - uav.top) / 2.0f,
+                             oc_model_presence_of(m, u->user_id), OC_COL_BASE,
+                             oc_model_dnd_of(m, u->user_id));
         /* Title, or the custom status when there is one — Slack shows the status
          * in its place, because it is the more current of the two. */
         char sub[160];
@@ -12009,6 +12354,28 @@ static void draw_lightbox(gfx *rt, float W, float H);   /* fwd */
 
 static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
     shell_scale_update(W, H);   /* the shell's furniture is capped by the window */
+    /* A ROW BELONGS TO THE FRAME THAT DREW IT. Both arrays are emptied here,
+     * before anything is drawn, so an entry can only exist because this frame
+     * laid it out. The transcript repopulates the first and the Home sidebar
+     * the second; every view that draws neither leaves them empty, which is the
+     * truth about what is on screen.
+     *
+     * The gap was not theoretical, and it was found twice. The published scene
+     * walks both arrays, so a view with no transcript offered a screen reader
+     * the LAST conversation's messages at the coordinates they held in it, and
+     * the Files view offered Threads, Drafts and People while its own channel
+     * column stood in their place. The layout fit check is built from that same
+     * scene, so it compared those phantoms against the rows really on screen
+     * and reported collisions nobody could see -- and, worse, reported the
+     * views clean where it should not have.
+     *
+     * Gating each CONSUMER would have fixed the ones that exist today and left
+     * the next one to rediscover this. An array that is empty unless drawn
+     * cannot be read stale by anybody, which is why the reset is here and not
+     * at the call sites. Anything else the scene accumulates per frame belongs
+     * in this block for the same reason. */
+    g_n_msgrows = 0;
+    g_n_shelf = 0;
     /* The caller cleared to OC_COL_BASE via gfx_begin; grayscale text AA and
      * the DIP scale live inside the gfx/sdltext layers (ARCH-106/107). */
     /* Sign-in owns the whole window only when there is nothing behind it. With a
@@ -13699,8 +14066,15 @@ static void ed_draw(gfx *rt, rectf box) {
     if (g_ed_focus) {
         rectf cr;
         if (ed_caret_rect(box, &cr) &&
-            ((GetTickCount64() - g_ed_blink) / 530) % 2 == 0)
+            ((GetTickCount64() - g_ed_blink) / 530) % 2 == 0) {
+            /* Declared transient for the audit: this bar is present in half the
+             * frames by design, so any check that asserts two frames are equal
+             * has to know not to compare it. Without the tag the consistency
+             * run reported a phase difference as a rendering disagreement. */
+            gfx_tag(rt, "transient:caret");
             fill(rt, cr, OC_COL_TEXT);
+            gfx_tag(rt, NULL);
+        }
     }
     gfx_clip_pop(rt);
 
@@ -13788,7 +14162,13 @@ enum {
     AT_THREADFILTER,  /* the Threads pane's unreads-only toggle */
     AT_STATUSEMOJI,   /* the status dialog's emoji button */
     AT_STATUSSUGG,    /* payload: status suggestion row index */
-    AT_STATUSCHIP     /* payload: status clear-after chip index */
+    AT_STATUSCHIP,    /* payload: status clear-after chip index */
+    AT_FSCOPE,        /* payload: Files ownership-scope index */
+    AT_FSORT,         /* the Files sort dropdown */
+    AT_FTYPE,         /* the Files type dropdown */
+    AT_FUPLOAD,       /* the Files view's Upload button */
+    AT_FCHAN,         /* payload: channel id, or 0 for "All files" */
+    AT_FILEROW        /* payload: file id — open it */
 };
 #define ATOK(kind, payload) (((uint64_t)(kind) << 56) | (uint64_t)(payload))
 
@@ -14020,6 +14400,62 @@ static void a11y_publish_scene(const oc_model *m) {
             snprintf(nm, sizeof nm, "thread %llu", (unsigned long long)g_listrows[i].mid);
             acc_push(items, &n, OC_ACC_LISTITEM, aid, nm, g_listrows[i].row,
                      ATOK(AT_THREAD, g_listrows[i].mid));
+        }
+    }
+    /* THE FILES VIEW'S OWN CONTROLS. Everything below was drawn, clickable and
+     * absent from this tree, so the view offered a screen reader the rail and
+     * the shelf and nothing else in it -- and REQ-290 asks the opposite.
+     *
+     * The second cost is the one that took longest to see. The layout fit check
+     * is built from this tree, so a view that publishes nothing is a view the
+     * check has no opinion about: the filter chips have been overlapping each
+     * other above 100% scale, visibly, with one label buried under the next,
+     * and the check called the view clean because as far as it knew the view
+     * was empty. An element that is not published is not merely unreachable, it
+     * is unwatched. */
+    if (g_view == VIEW_FILES) {
+        acc_push(items, &n, OC_ACC_BUTTON, "files.upload", "Upload",
+                 g_file_up_btn, ATOK(AT_FUPLOAD, 0));
+        for (int i = 0; i < FS_SCOPES && n < OC_ACC_MAX; i++) {
+            char aid[OC_ACC_AID_MAX];
+            snprintf(aid, sizeof aid, "files.scope.%d", i);
+            acc_push(items, &n, OC_ACC_TAB, aid, FS_LABEL[i], g_file_scopes[i],
+                     ATOK(AT_FSCOPE, i));
+        }
+        acc_push(items, &n, OC_ACC_BUTTON, "files.type",
+                 g_file_filter == FF_ALL ? "Types" : FF_LABEL[g_file_filter],
+                 g_file_type_btn, ATOK(AT_FTYPE, 0));
+        acc_push(items, &n, OC_ACC_BUTTON, "files.sort",
+                 FSORT_LABEL[g_file_sort], g_file_sort_btn, ATOK(AT_FSORT, 0));
+        /* The left column's destinations. "All files" is index 0 and carries a
+         * channel id of 0, exactly as the click path reads it. */
+        for (int i = 0; i < g_n_fchan_rows && n < OC_ACC_MAX; i++) {
+            uint64_t cid = (i == 0) ? 0 : g_fchan[i - 1].id;
+            char aid[OC_ACC_AID_MAX], nm[OC_ACC_NAME_MAX];
+            snprintf(aid, sizeof aid, "files.channel.%llu", (unsigned long long)cid);
+            /* The channel's NAME comes from the model: this column's rows carry
+             * an id and a count, not a name. */
+            const oc_channel *fc = cid ? oc_model_channel((oc_model *)m, cid) : NULL;
+            if (cid) snprintf(nm, sizeof nm, "#%s",
+                              (fc && fc->name[0]) ? fc->name : "channel");
+            else     snprintf(nm, sizeof nm, "All files");
+            acc_push(items, &n, OC_ACC_LISTITEM, aid, nm, g_fchan_rows[i],
+                     ATOK(AT_FCHAN, cid));
+        }
+    }
+    /* The file rows, in BOTH places they are drawn -- the view and the
+     * conversation's Files tab. Named by file id, so a row keeps its name when
+     * the sort changes; `file.row.3` would be whichever file happens to be
+     * third under today's ordering. */
+    if (m && (g_view == VIEW_FILES || g_tab == TAB_FILES)) {
+        for (int i = 0; i < g_n_filerows && n < OC_ACC_MAX; i++) {
+            if ((size_t)g_filerows[i].ix >= m->n_files) continue;
+            const oc_file_view *f = &m->files[g_filerows[i].ix];
+            char aid[OC_ACC_AID_MAX];
+            snprintf(aid, sizeof aid, "file.row.%llu", (unsigned long long)f->id);
+            acc_push(items, &n, OC_ACC_LISTITEM, aid,
+                     f->filename[0] ? f->filename : "file", g_filerows[i].row,
+                     ATOK(AT_FILEROW, f->id));
         }
     }
     if (g_view == VIEW_DIRECTORY && m) {
@@ -14904,13 +15340,52 @@ static void scale_apply(HWND hwnd) {
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
-/* Every theme switch goes through here so no caller can forget the children. */
-static void theme_set(int mode) {
-    oc_theme_apply(mode);
+/* EVERYTHING A PALETTE CHANGE HAS TO DO. Both switches below funnel through it,
+ * so neither can do half the job.
+ *
+ * THE RASTER CACHES ARE PART OF THAT JOB, and this is where they were missed.
+ * Text is rasterized once and re-blitted for free on the frames between
+ * changes; a cached raster therefore holds not only the glyphs but the COLOUR
+ * they were drawn in. The chrome cache survived a theme change by accident --
+ * txt_hash folds the colour into its key, so a label whose colour moved landed
+ * on a fresh key and re-rasterized. The message-layout cache is keyed on the
+ * message, a content signature, the column width and the generation, and on
+ * nothing about the palette, so it kept handing back the OUTGOING theme's ink.
+ * Switching to dark left every message body near-black on the dark canvas -- a
+ * measured 1.07:1, against 13.56:1 for the sender name on the same row, which
+ * is why the two halves of one message disagreed.
+ *
+ * Bumping the generation is the fix rather than adding the colour to that one
+ * key, because the generation is the mechanism EVERY raster cache in this file
+ * already consults. A cache cannot opt out of it, so the next one added is
+ * correct the day it is written; a second key taught to fold in a colour would
+ * only have moved the trap one cache along.
+ *
+ * The rule, stated once: a raster cache key names every input the raster
+ * depends on, and the palette is one of those inputs. */
+static void palette_changed(void) {
+    txt_drop_all();
     theme_restyle_children();
     /* The caption is not ours to paint, so it has to be told. */
     HWND top = GetActiveWindow();
     if (top) apply_titlebar(top);
+    if (g_main_hwnd) InvalidateRect(g_main_hwnd, NULL, FALSE);
+}
+
+/* Every theme switch goes through here so no caller can forget the children. */
+static void theme_set(int mode) {
+    oc_theme_apply(mode);
+    palette_changed();
+}
+
+/* And every SCHEME switch through here, for the same reason. A scheme changes
+ * the rail and the accent rather than the ink, so it has not yet been seen to
+ * strand a raster -- but "has not yet" is the state the theme switch was in
+ * until somebody looked, and the two are one event as far as a cache is
+ * concerned. */
+static void scheme_set(int scheme) {
+    oc_theme_set_scheme(scheme);
+    palette_changed();
 }
 
 /* Where the RichEdit used to be created. Nothing to create: the composer is part of
@@ -15883,7 +16358,7 @@ static int on_click(HWND hwnd, int x, int y) {
             /* Appearance applies LIVE while the sheet is open — a colour, a text
              * size and a density are their own preview and cannot be judged from a
              * label — and reverts with everything else on Cancel. */
-            case PREF_ROW_ACCENT:   oc_theme_set_scheme(v); break;
+            case PREF_ROW_ACCENT:   scheme_set(v); break;
             case PREF_ROW_TEXTSIZE: g_pref_textsize = v; scale_apply(hwnd); break;
             case PREF_ROW_DENSITY:  g_pref_density = v; g_density = v ? 1.0f : 0.6f; break;
 
@@ -15891,7 +16366,7 @@ static int on_click(HWND hwnd, int x, int y) {
                 /* Not persisted here: Save commits, like every other control on
                  * this card. Cancel puts the old values back from the snapshot. */
                 theme_set(OC_THEME_SYSTEM);
-                oc_theme_set_scheme(OC_SCHEME_MIDNIGHT);
+                scheme_set(OC_SCHEME_MIDNIGHT);
                 g_pref_time24 = 1; g_pref_members = 1; g_pref_daysep = 1;
                 g_pref_notify = NOTIFY_FULL;
                 g_pref_flash = FLASH_IDLE;
@@ -17826,7 +18301,7 @@ static void prefs_load(const oc_model *m) {
             if (k == 't') t = val; else if (k == 'h') h = val;
             else if (k == 'm') mm = val; else if (k == 'd') d = val;
             else if (k == 'n') g_pref_notify = (val < 0 || val > 2) ? NOTIFY_FULL : val;
-            else if (k == 'a') oc_theme_set_scheme(val);
+            else if (k == 'a') scheme_set(val);
             else if (k == 's') g_pref_textsize = (val < 0 || val > 3) ? 1 : val;
             else if (k == 'y') { g_pref_density = val ? 1 : 0; g_density = val ? 1.0f : 0.6f; }
             else if (k == 'r') { g_pref_richtext = val ? 1 : 0; ed_mode_changed(); }
@@ -18695,6 +19170,24 @@ static void test_dump(const char *path) {
                "scheme=%d railcol=%06X accentcol=%06X\n",
             g_pref_textsize, g_text_scale, g_dpi, g_pref_density,
             oc_theme_scheme(), (unsigned)OC_COL_RAIL, (unsigned)OC_COL_ACCENT);
+    /* THE WHOLE PALETTE, by token name. The audit asks two questions this
+     * answers and nothing else can: is a colour on screen one the theme
+     * actually names (a literal that resolves to no token is a surface that
+     * will not follow the theme), and what is the contrast between a label and
+     * the surface behind it. Both need the names, not just the two colours the
+     * line above happens to expose. */
+    {
+        static const char *const TOK[TH_COUNT] = {
+            "accent", "accent_dim", "rail", "sidebar", "base", "header",
+            "input", "select", "hover", "border", "rail_icon", "text",
+            "muted", "faint", "danger", "notice", "online", "away"
+        };
+        fprintf(f, "palette mode=%d light=%d n=%d", oc_theme_mode(),
+                oc_theme_is_light(), (int)TH_COUNT);
+        for (int i = 0; i < TH_COUNT; i++)
+            fprintf(f, " %s=%06X", TOK[i], (unsigned)oc_theme[i]);
+        fprintf(f, "\n");
+    }
     /* The sidebar AS BUILT, which is where the appear-once rule lives: a
      * conversation in a custom section leaves Channels, a starred one leaves both.
      * Counting a label in this list is the only way to assert that. */
@@ -19006,8 +19499,37 @@ static void test_dump(const char *path) {
             }
         }
         #undef contains
-        fprintf(f, "chromefit overlaps=%d outside=%d n=%d ov=\"%s\" out=\"%s\"\n",
-                overlaps, outside, g_a11y_n, first_ov, first_out);
+        /* IDS ARE UNIQUE (REQ-290), and until now nothing said so. An id is how
+         * a test, a screen reader and this audit all address an element; two
+         * elements answering to one name makes one of them unaddressable and
+         * the other ambiguous, which is the same failure the rail's three
+         * "more" rows had — found by reading the code rather than by any check,
+         * because there was no check. */
+        int dup = 0;
+        char first_dup[96] = "";
+        for (int i = 0; i < g_a11y_n && !first_dup[0]; i++)
+            for (int j = i + 1; j < g_a11y_n; j++)
+                if (!strcmp(g_acc_items[i].aid, g_acc_items[j].aid)) {
+                    dup++;
+                    if (!first_dup[0])
+                        snprintf(first_dup, sizeof first_dup, "%s", g_acc_items[i].aid);
+                    break;
+                }
+        fprintf(f, "chromefit overlaps=%d outside=%d dup=%d n=%d ov=\"%s\" out=\"%s\" dupid=\"%s\"\n",
+                overlaps, outside, dup, g_a11y_n, first_ov, first_out, first_dup);
+        /* THE TREE ITSELF, one line per element, so a check outside the client
+         * can ask questions this loop cannot. The one it exists for: does
+         * anything actually get DRAWN inside each of these rects? An element
+         * published at coordinates nothing painted is a phantom — the stale
+         * transcript rows were exactly that, and were invisible to every check
+         * here because they were internally consistent. Comparing the published
+         * tree against the paint ledger catches the whole class rather than the
+         * instance. */
+        for (int i = 0; i < g_a11y_n; i++) {
+            const oc_acc_item *a = &g_acc_items[i];
+            fprintf(f, "a11yitem %s %d %d %d %d\n", a->aid[0] ? a->aid : "-",
+                    a->l, a->t, a->r, a->b);
+        }
     }
     /* ARCH-108: the pinned metrics, checked, not remembered — the live
      * line_h/baseline pairs per token, plus a real render probe that the two
@@ -19061,6 +19583,9 @@ static void test_dump(const char *path) {
          * scroll" has three different causes — the wheel never reached it, the
          * content height came out zero, or the offset is being reset every frame
          * — and from outside they look identical. */
+        /* The About pane's, for the same three-causes-one-symptom reason. */
+        fprintf(f, "about tab=%d scroll=%.0f max=%.0f h=%.0f\n",
+                g_tab, g_about_scroll, g_about_max, g_about_h);
         fprintf(f, "ovl kind=%d scroll=%.0f max=%.0f notifyh=%.0f\n",
                 g_ovl_kind, g_ovl_scroll, g_ovl_max, g_notify_content_h);
         fprintf(f, "schedbase=%.0f,%.0f %.0f,%.0f tpopen=%d tprows=%d\n",
@@ -19270,6 +19795,17 @@ static void test_poll(HWND hwnd) {
         *(volatile int *)0 = 1;
     } else if (!strcmp(verb, "shot")) {
         test_ack(test_shot(hwnd, arg) ? "ok" : "err");
+    } else if (!strcmp(verb, "ledger")) {
+        /* The frame the window last painted, as a list of primitives. Repaint
+         * first and let the message loop run it, so the dump describes the
+         * scene as it stands NOW rather than whatever was on screen when the
+         * previous verb happened to leave it — the trap `shot` documents.
+         *
+         * The ledger belongs to the WINDOW's target. test_shot renders into its
+         * own, which is the right thing for a picture and the wrong thing here:
+         * a capture's ledger would describe the capture. */
+        UpdateWindow(hwnd);
+        test_ack(gfx_ledger_dump(g_gfx, arg) ? "ok" : "err");
     } else if (!strcmp(verb, "send")) {
         { WCHAR w[1024]; to_w(arg, w, 1024); ed_set(w); composer_send(); }
         test_ack("ok");
@@ -19698,7 +20234,17 @@ static void test_poll(HWND hwnd) {
         if (v >= 0 && v <= 3) { g_pref_textsize = v; scale_apply(hwnd); prefs_save(); test_ack("ok"); }
         else test_ack("err");
     } else if (!strcmp(verb, "prefs")) {
-        modal_enter(hwnd, &g_prefs_open); test_ack("ok");
+        /* `prefs [category]` — the category by INDEX, because the alternative
+         * is clicking a row whose y moves with the DPI and the text size, and
+         * the audit's whole job is to walk those. A scene that can only be
+         * reached at one scale cannot be checked at the others. */
+        modal_enter(hwnd, &g_prefs_open);
+        if (arg[0]) {
+            int cat = atoi(arg);
+            if (cat >= 0 && cat < PC_COUNT) g_pref_cat = cat;
+        }
+        InvalidateRect(hwnd, NULL, FALSE);
+        test_ack("ok");
     } else if (!strcmp(verb, "theme")) {
         theme_set(atoi(arg)); prefs_save(); test_ack("ok");
     } else if (!strcmp(verb, "emoji")) {
@@ -20758,6 +21304,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_thr_scroll += dy;
             if (g_thr_scroll < 0) g_thr_scroll = 0;
             if (g_thr_scroll > g_thr_scroll_max) g_thr_scroll = g_thr_scroll_max;
+        } else if (g_tab == TAB_ABOUT && transcript_shell() && g_sel) {
+            /* The About pane is prose that outgrows its pane at the larger text
+             * sizes, and it has no other way to be reached.
+             *
+             * NOT gated on main_is_conversation(): that predicate answers "can
+             * you type into this column", and About is precisely a tab where you
+             * cannot -- so gating on it made this branch unreachable in the only
+             * place it applies. The question here is which SURFACE owns the
+             * wheel, which is a different question with a different answer. */
+            g_about_scroll -= dy;
+            if (g_about_scroll < 0) g_about_scroll = 0;
+            if (g_about_scroll > g_about_max) g_about_scroll = g_about_max;
         } else if (g_view == VIEW_LATER || g_view == VIEW_FILES) {
             /* The Later and Files lists share the overlay offset (OVL_LATER /
              * OVL_FILES), so the wheel has to reach it here or they scroll only by
