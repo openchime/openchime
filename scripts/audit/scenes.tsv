@@ -1,0 +1,57 @@
+# Every surface the audit walks, and how to reach it.
+#
+# id <TAB> verbs (semicolon-separated) <TAB> settle key <TAB> settled value
+#
+# THE SETTLE COLUMN IS NOT OPTIONAL. A verb acks when its handler RAN, not when
+# the frame that shows its effect has been painted, and several of these views
+# ask the daemon for their content and paint "Loading..." until it answers. An
+# earlier pass at this audit slept a fixed time instead and captured Admin
+# mid-load, which read as a layout defect and cost a round to explain. Every row
+# names a key from the state dump and the value that means "this scene is what
+# it is going to be"; the runner polls for it and fails the scene if it never
+# arrives, which is a true statement about the client rather than a picture of
+# it half-built.
+#
+# Keep the ids stable: they name the findings, the captures and the contact
+# sheet tiles, and a renamed scene loses its history.
+#
+# --- the ten views ---------------------------------------------------------
+home	view home;channel general	view	0
+dms	view dms	view	1
+activity	view activity	view	2
+files	view files	view	3
+later	view later	view	4
+drafts	view drafts	view	5
+newmsg	view newmsg	view	6
+admin	view admin;dump settle	view	7
+threads	view threads	view	8
+people	view people	view	9
+# --- a conversation, in the states a conversation has ----------------------
+convo-empty	view home;channel releases	view	0
+convo-typed	view home;channel general;type Ready to send	view	0
+# --- modals ----------------------------------------------------------------
+prefs-appearance	view home;prefs 0	modal	prefs
+prefs-messages	view home;prefs 1	modal	prefs
+prefs-notifications	view home;prefs 2	modal	prefs
+prefs-system	view home;prefs 3	modal	prefs
+shortcuts	view home;keys	modal	keys
+# --- overlays and floating surfaces ----------------------------------------
+palette	view home;palette	view	0
+search	view home;channel general;search render	view	0
+pins	view home;channel general;pins	view	0
+profile	view home;channel general;profile 2	view	0
+# --- floating surfaces that own the pointer --------------------------------
+# A menu, a picker and a palette each take the pointer and the keyboard while
+# they are up. They are also where the z-order rules live, so a scene that never
+# opens one never checks them.
+menu-tray	view home;traymenu	menu	1
+emoji-picker	view home;channel general;emoji 1	pick	1
+dm-compose	view dms;dmcompose	view	1
+# --- conversations that are not channels -----------------------------------
+# A group DM has no name and a stack of faces rather than one, so it exercises
+# the composite that a named channel row never reaches.
+dm-index	view dms	view	1
+# --- tabs on a conversation ------------------------------------------------
+tab-files	view home;channel general;tab 1	view	0
+tab-pins	view home;channel general;tab 2	view	0
+tab-about	view home;channel general;tab 3	view	0

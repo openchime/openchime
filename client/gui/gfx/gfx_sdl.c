@@ -32,6 +32,42 @@ typedef struct {
     unsigned     stamp;
 } icon_ent;
 
+/* ---- the paint ledger ----------------------------------------------------
+ *
+ * One row per primitive, in draw order. Rects are recorded in PIXELS, after
+ * the DIP scale, because that is the space a screenshot is measured in and the
+ * space a clip is enforced in — a row that has to be re-scaled before it can be
+ * compared to the picture it describes is a row that will be re-scaled wrong.
+ *
+ * The cap is a hard ceiling rather than a growing buffer: a frame that draws
+ * more than this has a runaway in it, and the dump says so (`truncated`)
+ * instead of quietly allocating for a bug. Ordinary frames are far under it.
+ */
+enum { LEDGER_MAX = 8192, LEDGER_TAG = 32 };
+
+enum {
+    LOP_CLEAR = 0, LOP_FILL, LOP_FILL_ROUND, LOP_STROKE_ROUND, LOP_LINE,
+    LOP_ELLIPSE, LOP_ELLIPSE_STROKE, LOP_TEX, LOP_TEXT, LOP_TEX_SHAPED,
+    LOP_ICON, LOP_COUNT
+};
+
+static const char *const LOP_NAME[LOP_COUNT] = {
+    "clear", "fill", "fill_round", "stroke_round", "line",
+    "ellipse", "ellipse_stroke", "tex", "text", "tex_shaped", "icon"
+};
+
+typedef struct {
+    unsigned  seq;
+    int       op;
+    float     x, y, w, h;      /* pixels */
+    float     cx, cy, cw, ch;  /* the clip in force, pixels; w<0 = none */
+    uint32_t  rgb;
+    float     a;
+    float     radius;
+    char      rgbs[8];   /* "RRGGBB", or "-" when the colour is not knowable */
+    char      tag[LEDGER_TAG];
+} gfx_op;
+
 struct gfx {
     SDL_Renderer *r;
     float         scale;
@@ -41,12 +77,71 @@ struct gfx {
     unsigned      icon_stamp;
     disc_ent      discs[DISC_CACHE_N];
     unsigned      disc_stamp;
+    /* ledger */
+    gfx_op       *led;
+    int           nled, led_lost;
+    char          tag[LEDGER_TAG];
+    uint32_t      ink;
+    float         ink_pad_w, ink_pad_h;
+    int           ink_set;
 };
 
 struct gfx_tex {
     SDL_Texture *t;
     int          w, h;
+    int          is_text;   /* from gfx_tex_create_text — text is the interesting kind */
 };
+
+/* Record one primitive. Rects arrive in DIPs and are scaled here, once, so no
+ * call site can forget to. Cheap enough to call unconditionally: the first test
+ * returns immediately when the ledger is off, which is always in a shipped
+ * client. */
+/* The pixel-space form. Everything below funnels through it; led_put is the
+ * DIP-space convenience over it. Two forms rather than one because the text
+ * path knows its FINAL device rect — snapped to the grid, which is not a
+ * transform of the rect it was asked for — and a ledger that reported the
+ * pre-snap position would report a fractional placement the renderer had
+ * already corrected. The first version did exactly that, and every label in
+ * the app came back as a defect. */
+static void led_put_px(gfx *g, int op, float x, float y, float w, float h,
+                       uint32_t rgb, float a, float radius)
+{
+    if (!g->led)
+        return;
+    if (g->nled >= LEDGER_MAX) { g->led_lost++; return; }
+    gfx_op *o = &g->led[g->nled++];
+    o->seq = (unsigned)g->nled;
+    o->op = op;
+    o->x = x; o->y = y; o->w = w; o->h = h;
+    if (g->nclip > 0) {
+        SDL_Rect c = g->clips[g->nclip - 1];
+        o->cx = (float)c.x; o->cy = (float)c.y;
+        o->cw = (float)c.w; o->ch = (float)c.h;
+    } else {
+        o->cx = o->cy = 0.0f; o->cw = o->ch = -1.0f;
+    }
+    o->rgb = rgb;
+    /* A texture's colour lives in its pixels. Saying "000000" for one would be
+     * a measurement, and it is not — "-" is. */
+    if (op == LOP_TEX || op == LOP_TEX_SHAPED ||
+        (op == LOP_TEXT && !g->ink_set))
+        memcpy(o->rgbs, "-", 2);
+    else
+        SDL_snprintf(o->rgbs, sizeof o->rgbs, "%06X",
+                     (unsigned)(rgb & 0xFFFFFFu));
+    o->a = a;
+    o->radius = radius;
+    memcpy(o->tag, g->tag, sizeof o->tag);
+}
+
+static void led_put(gfx *g, int op, gfx_rect r, uint32_t rgb, float a,
+                    float radius)
+{
+    if (!g->led)
+        return;
+    led_put_px(g, op, r.x * g->scale, r.y * g->scale, r.w * g->scale,
+               r.h * g->scale, rgb, a, radius);
+}
 
 static SDL_FColor fcol(uint32_t rgb, float a)
 {
@@ -79,6 +174,7 @@ void gfx_destroy(gfx *g)
     for (int i = 0; i < DISC_CACHE_N; i++)
         if (g->discs[i].tex)
             SDL_DestroyTexture(g->discs[i].tex);
+    free(g->led);
     free(g);
 }
 
@@ -96,6 +192,15 @@ void gfx_begin(gfx *g, uint32_t clear_rgb)
 {
     SDL_FColor c = fcol(clear_rgb, 1.0f);
     g->nclip = 0;
+    /* A ledger describes ONE frame. Reset here rather than after the dump: the
+     * harness dumps whenever it likes, and a ledger that accumulated across
+     * frames would report every rect the app had ever drawn as though they were
+     * on screen together. The tag goes with it — a label must not survive into
+     * a frame that never set one. */
+    g->nled = 0;
+    g->led_lost = 0;
+    g->tag[0] = '\0';
+    led_put(g, LOP_CLEAR, (gfx_rect){ 0, 0, 0, 0 }, clear_rgb, 1.0f, 0.0f);
     SDL_SetRenderClipRect(g->r, NULL);
     SDL_SetRenderDrawColorFloat(g->r, c.r, c.g, c.b, 1.0f);
     SDL_RenderClear(g->r);
@@ -108,6 +213,7 @@ void gfx_end(gfx *g)
 
 void gfx_fill(gfx *g, gfx_rect r, uint32_t rgb, float a)
 {
+    led_put(g, LOP_FILL, r, rgb, a, 0.0f);
     SDL_FColor c = fcol(rgb, a);
     SDL_FRect fr = { r.x * g->scale, r.y * g->scale, r.w * g->scale,
                      r.h * g->scale };
@@ -244,6 +350,7 @@ static void fan_round(gfx *g, gfx_rect shape, float radius, SDL_FColor c,
 
 void gfx_fill_round(gfx *g, gfx_rect r, float radius, uint32_t rgb, float a)
 {
+    led_put(g, LOP_FILL_ROUND, r, rgb, a, radius);
     float e = feather_u(g);
     /* Below the ramp's own width there is no room for it, and a square fill is
      * what the radius rounds to anyway. */
@@ -257,6 +364,7 @@ void gfx_fill_round(gfx *g, gfx_rect r, float radius, uint32_t rgb, float a)
 void gfx_stroke_round(gfx *g, gfx_rect r, float radius, float w, uint32_t rgb,
                       float a)
 {
+    led_put(g, LOP_STROKE_ROUND, r, rgb, a, radius);
     /* Centered on the path, like the Direct2D stroke it replaces. */
     float h = w / 2.0f;
     float e = feather_u(g);
@@ -311,6 +419,16 @@ void gfx_stroke_round(gfx *g, gfx_rect r, float radius, float w, uint32_t rgb,
 void gfx_line(gfx *g, float x0, float y0, float x1, float y1, float w,
               uint32_t rgb, float a)
 {
+    /* Recorded as the segment's bounding box, grown by the stroke: the ledger
+     * speaks rects, and a hairline's box is what a fit or overlap question is
+     * actually asking about. */
+    {
+        float lx = x0 < x1 ? x0 : x1, ly = y0 < y1 ? y0 : y1;
+        float hx = x0 > x1 ? x0 : x1, hy = y0 > y1 ? y0 : y1;
+        gfx_rect bb = { lx - w / 2.0f, ly - w / 2.0f,
+                        (hx - lx) + w, (hy - ly) + w };
+        led_put(g, LOP_LINE, bb, rgb, a, 0.0f);
+    }
     float dx = x1 - x0, dy = y1 - y0;
     float len = sqrtf(dx * dx + dy * dy);
     if (len < 1e-6f)
@@ -432,6 +550,8 @@ static void ellipse_ring(gfx *g, float cx, float cy, float rx, float ry,
 void gfx_ellipse(gfx *g, float cx, float cy, float rx, float ry, uint32_t rgb,
                  float a)
 {
+    led_put(g, LOP_ELLIPSE, (gfx_rect){ cx - rx, cy - ry, rx * 2.0f, ry * 2.0f },
+            rgb, a, rx < ry ? rx : ry);
     if (rx > 0 && ry > 0 && rx - ry < 0.01f && ry - rx < 0.01f &&
         disc_draw(g, cx, cy, rx, 0.0f, rgb, a))
         return;
@@ -469,6 +589,10 @@ void gfx_ellipse(gfx *g, float cx, float cy, float rx, float ry, uint32_t rgb,
 void gfx_ellipse_stroke(gfx *g, float cx, float cy, float rx, float ry,
                         float w, uint32_t rgb, float a)
 {
+    led_put(g, LOP_ELLIPSE_STROKE,
+            (gfx_rect){ cx - rx - w / 2.0f, cy - ry - w / 2.0f,
+                        (rx + w / 2.0f) * 2.0f, (ry + w / 2.0f) * 2.0f },
+            rgb, a, rx < ry ? rx : ry);
     if (rx > 0 && ry > 0 && rx - ry < 0.01f && ry - rx < 0.01f &&
         disc_draw(g, cx, cy, rx + w / 2.0f, w, rgb, a))
         return;
@@ -565,6 +689,7 @@ gfx_tex *gfx_tex_create_text(gfx *g, const void *bgra_premul, int stride,
     SDL_SetTextureBlendMode(t->t, SDL_BLENDMODE_BLEND_PREMULTIPLIED);
     t->w = w;
     t->h = h;
+    t->is_text = 1;
     return t;
 }
 
@@ -582,6 +707,33 @@ void gfx_tex_size(const gfx_tex *t, int *w, int *h)
         *w = t->w;
     if (h)
         *h = t->h;
+}
+
+/* Record a texture draw at the device rect it will actually occupy.
+ *
+ * For TEXT the recorded rect is the INK, not the raster: sdltext pads its
+ * bitmap below and right of the glyphs, so the raster is a couple of DIPs
+ * taller and wider than anything a reader can see. Reporting the raster made
+ * every timestamp "overlap" the message body under it and every sidebar label
+ * "spill" three pixels past its clip -- defects in the measurement, not in the
+ * app, and the kind that teach people to ignore a check. The pad comes from
+ * the caller through gfx_ink, because the padding is a property of the
+ * rasterizer, not of a rectangle. */
+static void led_tex(gfx *g, gfx_tex *t, float x, float y, float w, float h,
+                    float a, float radius)
+{
+    if (!g->led)
+        return;
+    int text = t->is_text;
+    if (text && g->ink_set) {
+        w -= g->ink_pad_w * g->scale;
+        h -= g->ink_pad_h * g->scale;
+        if (w < 0.0f) w = 0.0f;
+        if (h < 0.0f) h = 0.0f;
+    }
+    led_put_px(g, text ? LOP_TEXT : LOP_TEX, x, y, w, h,
+               g->ink_set ? g->ink : 0u, a, radius);
+    g->ink_set = 0;
 }
 
 void gfx_tex_draw(gfx *g, gfx_tex *t, gfx_rect dst, float radius, float a)
@@ -602,6 +754,7 @@ void gfx_tex_draw(gfx *g, gfx_tex *t, gfx_rect dst, float radius, float a)
             fr.w = (float)t->w;
             fr.h = (float)t->h;
         }
+        led_tex(g, t, fr.x, fr.y, fr.w, fr.h, a, radius);
         SDL_RenderTexture(g->r, t->t, NULL, &fr);
         SDL_SetTextureAlphaModFloat(t->t, 1.0f);
         return;
@@ -611,6 +764,7 @@ void gfx_tex_draw(gfx *g, gfx_tex *t, gfx_rect dst, float radius, float a)
      * one place a jagged arc sits right beside a face. */
     float sx = dst.x * g->scale, sy = dst.y * g->scale;
     float sw = dst.w * g->scale, sh = dst.h * g->scale;
+    led_tex(g, t, sx, sy, sw, sh, a, radius);
     if (sw < 1.0f) sw = 1.0f;
     if (sh < 1.0f) sh = 1.0f;
     SDL_FColor c = { 1.0f, 1.0f, 1.0f, 1.0f };
@@ -621,6 +775,11 @@ void gfx_tex_draw(gfx *g, gfx_tex *t, gfx_rect dst, float radius, float a)
 void gfx_tex_draw_shaped(gfx *g, gfx_tex *t, gfx_rect shape, float radius,
                          gfx_rect map, float a)
 {
+    /* The SHAPE, not the map: the map is the oversized rect the crop samples
+     * from and is deliberately larger than anything on screen. Recording it
+     * would report every avatar as overflowing its row. */
+    led_put(g, LOP_TEX_SHAPED, shape, 0, a, radius);
+    g->ink_set = 0;
     SDL_SetTextureAlphaModFloat(t->t, a);
     float mx = map.x * g->scale, my = map.y * g->scale;
     float mw = map.w * g->scale, mh = map.h * g->scale;
@@ -705,6 +864,14 @@ void gfx_icon(gfx *g, int icon_id, gfx_rect box, float stroke_w, uint32_t rgb,
               float a)
 {
     float side = box.w < box.h ? box.w : box.h;
+    /* The FITTED square, not `box`: an icon preserves its 24x24 aspect inside
+     * whatever it is handed, so the box asked for and the box inked are
+     * different rects, and only one of them is the answer to "did this icon
+     * land where it should". */
+    led_put(g, LOP_ICON,
+            (gfx_rect){ box.x + (box.w - side) / 2.0f,
+                        box.y + (box.h - side) / 2.0f, side, side },
+            rgb, a, 0.0f);
     int pw = (int)(side * g->scale + 0.5f);
     if (pw < 2)
         return;
@@ -745,6 +912,74 @@ void gfx_icon(gfx *g, int icon_id, gfx_rect box, float stroke_w, uint32_t rgb,
     SDL_RenderTexture(g->r, e->tex, NULL, &dst);
     SDL_SetTextureColorModFloat(e->tex, 1.0f, 1.0f, 1.0f);
     SDL_SetTextureAlphaModFloat(e->tex, 1.0f);
+}
+
+void gfx_ledger_enable(gfx *g, int on)
+{
+    if (on && !g->led) {
+        g->led = calloc(LEDGER_MAX, sizeof *g->led);
+        g->nled = 0;
+        g->led_lost = 0;
+    } else if (!on && g->led) {
+        free(g->led);
+        g->led = NULL;
+        g->nled = 0;
+    }
+}
+
+int gfx_ledger_enabled(const gfx *g)
+{
+    return g->led != NULL;
+}
+
+void gfx_ink(gfx *g, uint32_t rgb, float pad_w, float pad_h)
+{
+    if (!g->led)
+        return;
+    g->ink = rgb;
+    g->ink_pad_w = pad_w;
+    g->ink_pad_h = pad_h;
+    g->ink_set = 1;
+}
+
+void gfx_tag(gfx *g, const char *tag)
+{
+    if (!g->led)          /* the tag is ledger furniture; off means free */
+        return;
+    if (!tag || !tag[0]) { g->tag[0] = '\0'; return; }
+    size_t n = strlen(tag);
+    if (n >= sizeof g->tag) n = sizeof g->tag - 1;
+    memcpy(g->tag, tag, n);
+    g->tag[n] = '\0';
+}
+
+int gfx_ledger_dump(gfx *g, const char *path)
+{
+    if (!g->led || !path)
+        return 0;
+    SDL_IOStream *io = SDL_IOFromFile(path, "wb");
+    if (!io)
+        return 0;
+    /* A header naming the columns, so the file is readable without the reader
+     * and a column inserted later cannot silently shift every field. */
+    /* The output size belongs in the file: every "is this on screen" question
+     * needs it, and a reader that has to be told the size separately is a
+     * reader that will one day be told the wrong one. */
+    int ow = 0, oh = 0;
+    SDL_GetCurrentRenderOutputSize(g->r, &ow, &oh);
+    SDL_IOprintf(io, "# scale=%.4f out=%dx%d ops=%d lost=%d\n", g->scale,
+                 ow, oh, g->nled, g->led_lost);
+    SDL_IOprintf(io, "seq\top\tx\ty\tw\th\tcx\tcy\tcw\tch\trgb\ta\tradius\ttag\n");
+    for (int i = 0; i < g->nled; i++) {
+        const gfx_op *o = &g->led[i];
+        SDL_IOprintf(io,
+            "%u\t%s\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%s\t%.3f\t%.2f\t%s\n",
+            o->seq, LOP_NAME[o->op], o->x, o->y, o->w, o->h,
+            o->cx, o->cy, o->cw, o->ch, o->rgbs,
+            o->a, o->radius, o->tag);
+    }
+    SDL_CloseIO(io);
+    return 1;
 }
 
 int gfx_readback(gfx *g, void *rgba, int w, int h)

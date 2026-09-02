@@ -364,20 +364,79 @@ static void draw_conn_dot(gfx *rt, float cx, float cy, float r, int live) {
  * out of the same dot rather than as a colour that would have to replace one.
  * Slack shows a moon for exactly this reason. */
 static void draw_presence_dot_dnd(gfx *rt, float cx, float cy, float r,
-                                  uint8_t presence, uint32_t surface, int dnd) {
+                                  uint8_t presence, uint32_t surface, int dnd,
+                                  float ring) {
     uint32_t c = presence == OC_PRESENCE_ONLINE ? OC_COL_ONLINE
                : presence == OC_PRESENCE_AWAY   ? OC_COL_AWAY : OC_COL_FAINT;
-    /* A 2px ring in the surface colour, as Slack's has: the dot sits ON the
-     * avatar, and without a ring it reads as a speck stuck to the edge. */
-        gfx_ellipse(rt, cx, cy, r + 2.0f, r + 2.0f, surface, 1.0f);
+    /* A ring in the surface colour, as Slack's has: the dot sits ON the
+     * avatar, and without a ring it reads as a speck stuck to the edge. The
+     * WIDTH is the caller's, because a ring that stays 2 DIP while the dot
+     * scales with its tile is most of a small marker. */
+        gfx_ellipse(rt, cx, cy, r + ring, r + ring, surface, 1.0f);
         gfx_ellipse(rt, cx, cy, r, r, dnd ? OC_COL_MUTED : c, 1.0f);
-    /* Offline reads as an outline, so "not here" is not just a dim fill. */
+    /* Offline reads as an outline, so "not here" is not just a dim fill. The
+     * hole is a fraction of the dot for the same reason the ring is: a fixed
+     * 1.3 DIP hole in a small dot is a filled dot, and in a large one it is a
+     * hairline. */
     if (!dnd && presence != OC_PRESENCE_ONLINE && presence != OC_PRESENCE_AWAY) {
-                gfx_ellipse(rt, cx, cy, r - 1.3f, r - 1.3f, surface, 1.0f);
+                gfx_ellipse(rt, cx, cy, r * 0.55f, r * 0.55f, surface, 1.0f);
     }
     if (dnd) {   /* carve the crescent with the surface colour */
                 gfx_ellipse(rt, cx + r * 0.55f, cy - r * 0.55f, r * 0.95f, r * 0.95f, surface, 1.0f);
     }
+}
+
+/* ONE presence marker on an avatar, sized and seated BY THE TILE.
+ *
+ * Every call site used to pass its own centre and its own radius, and the
+ * radius was 4.5 at all of them -- tuned for the 18 DIP tile in the sidebar and
+ * then repeated onto tiles twice that size. The results disagreed in both
+ * directions at once: on the 18px tile a marker better than a third of its
+ * width collided with the initial underneath (and offline, a hollow ring, put a
+ * grey donut through the glyph), while on the 40px menu avatar the same marker
+ * at the same fixed inset floated clear OFF the disc entirely, because a
+ * constant inset from a bounding box is not a point on a circle.
+ *
+ * So no call site passes geometry any more. Everything here derives from the
+ * tile:
+ *
+ *   SIZE is a fraction of the tile, with the ring scaled too. A ring that stays
+ *   2 DIP wide while the dot shrinks is most of a small marker.
+ *
+ *   THE SEAT is the rim at 45 degrees -- the point where the bottom-right
+ *   diagonal crosses the tile's edge -- so the marker straddles the boundary
+ *   and overlaps the picture by its own radius rather than being pushed into
+ *   the middle of it. For a rounded square the corner arc is where that
+ *   diagonal crosses, which is the same construction with the radius of the
+ *   corner rather than of the tile.
+ *
+ * The structural part is that `tile` is the only geometry in the signature. A
+ * call site cannot pass an inset, so no call site can get one wrong, and a new
+ * avatar size is right on the day it is added rather than on the day somebody
+ * notices. */
+static void draw_avatar_presence(gfx *rt, rectf tile, float corner,
+                                 uint8_t presence, uint32_t surface, int dnd) {
+    float w = tile.right - tile.left, h = tile.bottom - tile.top;
+    float side = w < h ? w : h;
+    if (side < 8.0f) return;          /* nothing this small can say anything */
+
+    float r = side * 0.15f;
+    if (r < 2.5f) r = 2.5f;
+    if (r > 7.0f) r = 7.0f;
+    float ring = r * 0.45f;
+    if (ring < 1.0f) ring = 1.0f;
+
+    /* Where the bottom-right diagonal leaves the tile. A circle (corner >= half
+     * the side) crosses it at 1/sqrt(2) of the radius on each axis; a rounded
+     * square crosses on its corner arc, whose centre is inset by the corner
+     * radius. Both reduce to the same expression with the right centre. */
+    float half = side / 2.0f;
+    if (corner > half) corner = half;
+    float cx0 = tile.right - corner, cy0 = tile.bottom - corner;
+    const float DIAG = 0.70710678f;
+    float cx = cx0 + corner * DIAG, cy = cy0 + corner * DIAG;
+
+    draw_presence_dot_dnd(rt, cx, cy, r, presence, surface, dnd, ring);
 }
 
 
@@ -612,6 +671,11 @@ static st_ctx       *g_st;
 /* Declared here rather than beside the test hook: the notification window
  * (below) needs the shell's HWND to restore it, and is defined earlier. */
 static HWND g_main_hwnd;
+
+/* sdltext rasterizes into a bitmap two DIPs wider and taller than the ink, so
+ * antialiasing at the edges has somewhere to go (st_draw). Anything measuring a
+ * text raster has to subtract it or it is measuring the margin. */
+#define ST_RASTER_PAD 2.0f
 
 static gfx_tex *g_cap_tex;
 static int      g_cap_w, g_cap_h;
@@ -2304,6 +2368,7 @@ typedef struct {
     int       pw, ph;         /* texture pixels */
     float     mw, mh;         /* layout metrics, DIPs */
     float     ox, oy;         /* ink offset inside the layout box, DIPs */
+    uint32_t  rgb;            /* the ink, kept for the paint ledger to report */
     unsigned  gen, stamp;
 } txt_ent;
 /* One cache per render target, for the reason cap_blit gives: a texture cannot
@@ -2355,6 +2420,7 @@ static txt_ent *txt_get(const char *s, fmtw *fm, float w, uint32_t rgb) {
     best->pw = g_cap_w; best->ph = g_cap_h;
     best->ox = g_cap_dx; best->oy = g_cap_dy;
     best->mw = m.w; best->mh = m.h;
+    best->rgb = rgb;
     best->gen = g_txt_gen;
     best->stamp = ++g_txt_stamp;
     return best;
@@ -2419,6 +2485,10 @@ static void txt_blit(gfx *rt, txt_ent *e, rectf r, const fmtw *fm) {
     }
     gfx_rect dst = { x, y, dw, dh };
     gfx_clip_push(rt, gr(r));
+    /* The ledger cannot read a colour out of a raster, and must not mistake
+     * sdltext's padding for ink — both are told to it here (see st_draw, which
+     * rasterizes at width+2 x height+2). */
+    gfx_ink(rt, e->rgb, ST_RASTER_PAD, ST_RASTER_PAD);
     gfx_tex_draw(rt, e->tex, dst, 0.0f, 1.0f);
     gfx_clip_pop(rt);
 }
@@ -2495,7 +2565,16 @@ static void draw_emoji_fmt(gfx *rt, const char *s, rectf r, fmtw *fmt) {
         }
     }
     if (!fmt) return;
+    /* Declared as content for the audit, and it is the honest label: a COLOUR
+     * glyph's raster is not tinted ink, so the colour handed to txt_get is not
+     * the colour on screen and asking what contrast it has against the surface
+     * behind it produces a number about nothing. Its advance is not its ink
+     * either -- an emoji cell clips a few pixels of trailing advance and looks
+     * perfectly correct doing it, which the truncation check would otherwise
+     * report once per cell, forty times a picker. */
+    gfx_tag(rt, "content:emoji");
     txt_blit(rt, txt_get(s, fmt, r.right - r.left, OC_COL_TEXT), r, fmt);
+    gfx_tag(rt, NULL);
 }
 static void draw_emoji_glyph(gfx *rt, const char *s, rectf r) {
     draw_emoji_fmt(rt, s, r, g_emoji);
@@ -2720,6 +2799,10 @@ static int gfx_stack_init(void) {
     if (!g_ren) return 0;
     g_gfx = gfx_create(g_ren);
     if (!g_gfx) return 0;
+    /* The paint ledger costs an allocation and a row per primitive, so it is on
+     * only while the harness is driving — the same gate every other test hook
+     * uses. A shipped client never allocates it. */
+    if (g_test_dir[0]) gfx_ledger_enable(g_gfx, 1);
     st_sink sink = { NULL, cap_blit };
     g_st = st_dwrite_create(&sink);
     if (!g_st) return 0;
@@ -3059,6 +3142,12 @@ static void draw_user_avatar(gfx *rt, const oc_model *m, uint64_t uid,
         if (draw_avatar_image(rt, aid, box, radius, square)) return;
         avatar_want(aid);        /* not here yet: fall through to the initial */
     }
+    /* Tagged for the audit: an avatar's colour is derived from the user id, so
+     * it is CONTENT and deliberately outside the theme palette. Without the
+     * tag the palette check reports every person in the workspace as an
+     * unthemed colour, and a check that fires on correct code is one people
+     * learn to skip. */
+    gfx_tag(rt, "content:avatar");
     if (square) {
         fill_round(rt, box, radius, tint);
     } else {
@@ -3070,6 +3159,7 @@ static void draw_user_avatar(gfx *rt, const oc_model *m, uint64_t uid,
     fmt->align = ST_ALIGN_CENTER;
     draw_text(rt, ini, fmt, box, 0xFFFFFF);
     fmt->align = prev;
+    gfx_tag(rt, NULL);
 }
 
 /* A group conversation's marker: how many people are in it, not one of their
@@ -3246,9 +3336,9 @@ static void draw_rail(gfx *rt, const oc_model *m, float h) {
         /* Your own presence, notched into the bottom-right corner — the same
          * dot, from the same helper, that every person in the DM list and the
          * member pane carries. */
-        draw_presence_dot_dnd(rt, cx + 12, base + 39, 4.5f,
-                              m ? oc_model_presence_of(m, m->user_id) : OC_PRESENCE_OFFLINE,
-                              OC_COL_RAIL, m ? oc_model_snoozed(m) : 0);
+        draw_avatar_presence(rt, av2, 8.0f,
+                             m ? oc_model_presence_of(m, m->user_id) : OC_PRESENCE_OFFLINE,
+                             OC_COL_RAIL, m ? oc_model_snoozed(m) : 0);
         {
             /* The quiet-hours badge stays AFTER the avatar, unlike the pill: it
              * badges the avatar's own top-right corner, so it has to sit on top
@@ -3409,8 +3499,8 @@ static void draw_menu(gfx *rt) {
                              (nm && nm[0]) ? nm : "U", av, g_avatar, 0, 0);
             uint8_t pres = m ? oc_model_presence_of(m, m->user_id) : 0;
             int snoozed = m ? oc_model_snoozed(m) : 0;
-            draw_presence_dot_dnd(rt, av.right - 3, av.bottom - 3, 4.5f,
-                                  pres, OC_COL_INPUT, snoozed);
+            draw_avatar_presence(rt, av, (av.bottom - av.top) / 2.0f,
+                                 pres, OC_COL_INPUT, snoozed);
             draw_text(rt, (nm && nm[0]) ? nm : "you", g_ui_b,
                       rf(x + 62, cy + 12, panel.right - 12, cy + 32), OC_COL_TEXT);
             char pl[48];
@@ -3807,14 +3897,10 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                       g_micro->align = oa; }
                 } else {
                 draw_user_avatar(rt, m, r->peer_id, r->label, av, g_meta, 1, 5.0f);
-                /* INSET into the avatar, not hung off its corner: at
-                 * (right-1, bottom-1) most of the dot was outside the picture,
-                 * which is what made it read as an artifact rather than a status
-                 * (reported from a screenshot). */
-                draw_presence_dot_dnd(rt, av.right - 4, av.bottom - 4, 4.5f,
-                                      oc_model_presence_of(m, r->peer_id),
-                                      selected ? OC_COL_SELECT : OC_COL_SIDEBAR,
-                                      oc_model_dnd_of(m, r->peer_id));
+                draw_avatar_presence(rt, av, OC_R_AVATAR_SM,
+                                     oc_model_presence_of(m, r->peer_id),
+                                     selected ? OC_COL_SELECT : OC_COL_SIDEBAR,
+                                     oc_model_dnd_of(m, r->peer_id));
                 }
             } else {
                 const char *mark = r->is_private ? "\xF0\x9F\x94\x92" : "#";
@@ -4039,6 +4125,7 @@ typedef struct {
     gfx_tex   *tex;
     int        pw, ph;
     float      mh;        /* layout height, DIPs */
+    uint32_t   rgb;       /* the ink, kept for the paint ledger to report */
     size_t     blen;      /* body byte length (selection clamps to it) */
     /* the inline boxes (custom emoji): where they landed + which image */
     int        nbox;
@@ -4159,7 +4246,8 @@ static mlay_ent *body_layout(const oc_msg *msg, float cw) {
     if (nb < best->nbox) best->nbox = nb;
 
     /* Raster now, once; the texture is what frames blit. */
-    st_draw(g_st, lay, 0, 0, msg->deleted ? OC_COL_FAINT : OC_COL_TEXT, 1.0f);
+    best->rgb = msg->deleted ? OC_COL_FAINT : OC_COL_TEXT;
+    st_draw(g_st, lay, 0, 0, best->rgb, 1.0f);
     best->mid = msg->message_id;
     best->sig = sig;
     best->cw = cw;
@@ -4313,6 +4401,7 @@ static void draw_message(gfx *rt, const oc_model *m, const oc_msg *msg,
             if (body->tex) {
                 float sc = gfx_scale(rt);
                 gfx_rect dst = { tx, by, body->pw / sc, body->ph / sc };
+                gfx_ink(rt, body->rgb, ST_RASTER_PAD, ST_RASTER_PAD);
                 gfx_tex_draw(rt, body->tex, dst, 0.0f, 1.0f);
             }
             /* Custom emoji (REQ-072) composited into the boxes the layout
@@ -6716,8 +6805,14 @@ static float pref_accent_row(gfx *rt, rectf body, float y) {
          * they have on screen, where the accent appears ON the rail. Two half-discs
          * were the alternative and read as a single two-tone colour rather than as
          * a surface and a highlight. */
+        /* Tagged as content for the audit: a swatch shows a scheme you have
+         * NOT picked, so three of the four are deliberately colours the theme
+         * in force does not name. Untagged, the palette check reports the
+         * chooser as four unthemed surfaces every time it is opened. */
+                gfx_tag(rt, "content:swatch");
                 gfx_ellipse(rt, cx, cy, 11, 11, oc_theme_scheme_rail(i), 1.0f);
                 gfx_ellipse(rt, cx, cy, 5.5f, 5.5f, oc_theme_scheme_accent(i), 1.0f);
+                gfx_tag(rt, NULL);
         if (i == oc_theme_scheme()) {
             /* A ring, not a tick: a tick in the accent colour on the accent colour is
              * invisible, and one in white is invisible on the light swatches. */
@@ -8116,11 +8211,13 @@ static void draw_members(gfx *rt, const oc_model *m, float W, float H) {
          * clickable row in the app does. */
         if (g_mem_hover && cm->user_id == g_mem_hover)
             fill_round(rt, rf(x0 + 4, y + 1, W - 4, y + ROW_H - 1), OC_R_CONTROL, OC_COL_HOVER);
+        /* The primitive rather than the composite: this row has no avatar, so
+         * the dot is chrome in its own right and has no tile to be sized by. */
         draw_presence_dot_dnd(rt, x0 + 22, y + ROW_H / 2, 4.5f,
                               oc_model_presence_of(m, cm->user_id),
                               (g_mem_hover && cm->user_id == g_mem_hover)
                                   ? OC_COL_HOVER : OC_COL_SIDEBAR,
-                              oc_model_dnd_of(m, cm->user_id));
+                              oc_model_dnd_of(m, cm->user_id), 2.0f);
         const char *disp = (nm && nm[0]) ? nm : "user";
         draw_text(rt, disp, g_ui, rf(x0 + 34, y, W - 14, y + ROW_H), OC_COL_TEXT);
         /* Role glyph INLINE, immediately after the name — not in a column of its
@@ -9895,14 +9992,21 @@ static void prefs_snapshot(void) {
     snprintf(g_prefs_snap.quick, sizeof g_prefs_snap.quick, "%s", g_quick_names);
 }
 
+static void theme_set(int mode);      /* fwd — a cancel restores the palette */
+static void scheme_set(int scheme);   /* fwd — and the scheme with it */
+
 static void prefs_restore(void) {
-    if (oc_theme_mode() != g_prefs_snap.theme) oc_theme_apply(g_prefs_snap.theme);
+    /* Through theme_set, not oc_theme_apply: CANCELLING a preference change is a
+     * palette change like any other, and restoring the old palette while every
+     * raster still holds the previewed one is the same defect arriving by the
+     * back door. */
+    if (oc_theme_mode() != g_prefs_snap.theme) theme_set(g_prefs_snap.theme);
     g_pref_time24  = g_prefs_snap.time24;
     g_pref_members = g_prefs_snap.members;
     g_pref_daysep  = g_prefs_snap.daysep;
     g_pref_notify  = g_prefs_snap.notify;
     g_pref_flash   = g_prefs_snap.flash;
-    if (oc_theme_scheme() != g_prefs_snap.accent) oc_theme_set_scheme(g_prefs_snap.accent);
+    if (oc_theme_scheme() != g_prefs_snap.accent) scheme_set(g_prefs_snap.accent);
     g_pref_density = g_prefs_snap.density;
     g_density      = g_prefs_snap.density ? 1.0f : 0.6f;
     g_pref_richtext = g_prefs_snap.richtext;
@@ -10605,11 +10709,11 @@ static void draw_dm_list(gfx *rt, const oc_model *m, float h) {
             /* A stack of people rather than one face: the row is about a set. */
             draw_group_avatar(rt, m, best, rf(row.left + 9, y + 11, row.left + 39, y + 41));
         } else {
-            draw_user_avatar(rt, m, best->peer_id, nm,
-                             rf(row.left + 9, y + 11, row.left + 39, y + 41), g_ui, 0, 0);
-            draw_presence_dot_dnd(rt, row.left + 34, y + 36, 5.0f,
-                                  oc_model_presence_of(m, best->peer_id), OC_COL_SIDEBAR,
-                                  oc_model_dnd_of(m, best->peer_id));
+            rectf dav = rf(row.left + 9, y + 11, row.left + 39, y + 41);
+            draw_user_avatar(rt, m, best->peer_id, nm, dav, g_ui, 0, 0);
+            draw_avatar_presence(rt, dav, (dav.bottom - dav.top) / 2.0f,
+                                 oc_model_presence_of(m, best->peer_id), OC_COL_SIDEBAR,
+                                 oc_model_dnd_of(m, best->peer_id));
         }
 
         int unread = best->unread > 0;
@@ -11525,11 +11629,11 @@ static void draw_directory(gfx *rt, const oc_model *m, rectf reg) {
         rectf row = rf(body.left + 16, y, body.right - 16, y + ROWH2 - 4);
         if (g_listrow_hover == u->user_id) fill_round(rt, row, OC_R_CONTROL, OC_COL_HOVER);
 
-        draw_user_avatar(rt, m, u->user_id, u->name[0] ? u->name : "?",
-                         rf(row.left + 12, y + 10, row.left + 44, y + 42), g_ui, 0, 0);
-        draw_presence_dot_dnd(rt, row.left + 40, y + 38, 4.5f,
-                              oc_model_presence_of(m, u->user_id), OC_COL_BASE,
-                              oc_model_dnd_of(m, u->user_id));
+        rectf uav = rf(row.left + 12, y + 10, row.left + 44, y + 42);
+        draw_user_avatar(rt, m, u->user_id, u->name[0] ? u->name : "?", uav, g_ui, 0, 0);
+        draw_avatar_presence(rt, uav, (uav.bottom - uav.top) / 2.0f,
+                             oc_model_presence_of(m, u->user_id), OC_COL_BASE,
+                             oc_model_dnd_of(m, u->user_id));
         /* Title, or the custom status when there is one — Slack shows the status
          * in its place, because it is the more current of the two. */
         char sub[160];
@@ -12009,6 +12113,23 @@ static void draw_lightbox(gfx *rt, float W, float H);   /* fwd */
 
 static void render_scene(gfx *rt, const oc_model *m, float W, float H) {
     shell_scale_update(W, H);   /* the shell's furniture is capped by the window */
+    /* THE TRANSCRIPT'S ROWS BELONG TO THE FRAME THAT DREW THEM. Emptied here,
+     * before anything is drawn, so a row can only exist because this frame laid
+     * it out. draw_msglist repopulates it; every path that does not reach
+     * draw_msglist — People, Drafts, Threads, Admin, the storage and audit
+     * panes, "select a channel", an empty channel — leaves it empty, which is
+     * the truth about what is on screen.
+     *
+     * Resetting inside draw_msglist alone was not enough, and the gap was not
+     * theoretical: the published scene walks this array, so a view with no
+     * transcript at all offered a screen reader the LAST conversation's
+     * messages, at the coordinates they held in it, and the layout fit check
+     * built from the same scene reported overlaps between those phantoms and
+     * the real rows of the view actually on screen. Gating each consumer would
+     * have fixed the two that exist today and left the next one to rediscover
+     * this; an array that is empty unless drawn cannot be read stale by
+     * anybody. */
+    g_n_msgrows = 0;
     /* The caller cleared to OC_COL_BASE via gfx_begin; grayscale text AA and
      * the DIP scale live inside the gfx/sdltext layers (ARCH-106/107). */
     /* Sign-in owns the whole window only when there is nothing behind it. With a
@@ -13699,8 +13820,15 @@ static void ed_draw(gfx *rt, rectf box) {
     if (g_ed_focus) {
         rectf cr;
         if (ed_caret_rect(box, &cr) &&
-            ((GetTickCount64() - g_ed_blink) / 530) % 2 == 0)
+            ((GetTickCount64() - g_ed_blink) / 530) % 2 == 0) {
+            /* Declared transient for the audit: this bar is present in half the
+             * frames by design, so any check that asserts two frames are equal
+             * has to know not to compare it. Without the tag the consistency
+             * run reported a phase difference as a rendering disagreement. */
+            gfx_tag(rt, "transient:caret");
             fill(rt, cr, OC_COL_TEXT);
+            gfx_tag(rt, NULL);
+        }
     }
     gfx_clip_pop(rt);
 
@@ -14904,13 +15032,52 @@ static void scale_apply(HWND hwnd) {
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
-/* Every theme switch goes through here so no caller can forget the children. */
-static void theme_set(int mode) {
-    oc_theme_apply(mode);
+/* EVERYTHING A PALETTE CHANGE HAS TO DO. Both switches below funnel through it,
+ * so neither can do half the job.
+ *
+ * THE RASTER CACHES ARE PART OF THAT JOB, and this is where they were missed.
+ * Text is rasterized once and re-blitted for free on the frames between
+ * changes; a cached raster therefore holds not only the glyphs but the COLOUR
+ * they were drawn in. The chrome cache survived a theme change by accident --
+ * txt_hash folds the colour into its key, so a label whose colour moved landed
+ * on a fresh key and re-rasterized. The message-layout cache is keyed on the
+ * message, a content signature, the column width and the generation, and on
+ * nothing about the palette, so it kept handing back the OUTGOING theme's ink.
+ * Switching to dark left every message body near-black on the dark canvas -- a
+ * measured 1.07:1, against 13.56:1 for the sender name on the same row, which
+ * is why the two halves of one message disagreed.
+ *
+ * Bumping the generation is the fix rather than adding the colour to that one
+ * key, because the generation is the mechanism EVERY raster cache in this file
+ * already consults. A cache cannot opt out of it, so the next one added is
+ * correct the day it is written; a second key taught to fold in a colour would
+ * only have moved the trap one cache along.
+ *
+ * The rule, stated once: a raster cache key names every input the raster
+ * depends on, and the palette is one of those inputs. */
+static void palette_changed(void) {
+    txt_drop_all();
     theme_restyle_children();
     /* The caption is not ours to paint, so it has to be told. */
     HWND top = GetActiveWindow();
     if (top) apply_titlebar(top);
+    if (g_main_hwnd) InvalidateRect(g_main_hwnd, NULL, FALSE);
+}
+
+/* Every theme switch goes through here so no caller can forget the children. */
+static void theme_set(int mode) {
+    oc_theme_apply(mode);
+    palette_changed();
+}
+
+/* And every SCHEME switch through here, for the same reason. A scheme changes
+ * the rail and the accent rather than the ink, so it has not yet been seen to
+ * strand a raster -- but "has not yet" is the state the theme switch was in
+ * until somebody looked, and the two are one event as far as a cache is
+ * concerned. */
+static void scheme_set(int scheme) {
+    oc_theme_set_scheme(scheme);
+    palette_changed();
 }
 
 /* Where the RichEdit used to be created. Nothing to create: the composer is part of
@@ -15883,7 +16050,7 @@ static int on_click(HWND hwnd, int x, int y) {
             /* Appearance applies LIVE while the sheet is open — a colour, a text
              * size and a density are their own preview and cannot be judged from a
              * label — and reverts with everything else on Cancel. */
-            case PREF_ROW_ACCENT:   oc_theme_set_scheme(v); break;
+            case PREF_ROW_ACCENT:   scheme_set(v); break;
             case PREF_ROW_TEXTSIZE: g_pref_textsize = v; scale_apply(hwnd); break;
             case PREF_ROW_DENSITY:  g_pref_density = v; g_density = v ? 1.0f : 0.6f; break;
 
@@ -15891,7 +16058,7 @@ static int on_click(HWND hwnd, int x, int y) {
                 /* Not persisted here: Save commits, like every other control on
                  * this card. Cancel puts the old values back from the snapshot. */
                 theme_set(OC_THEME_SYSTEM);
-                oc_theme_set_scheme(OC_SCHEME_MIDNIGHT);
+                scheme_set(OC_SCHEME_MIDNIGHT);
                 g_pref_time24 = 1; g_pref_members = 1; g_pref_daysep = 1;
                 g_pref_notify = NOTIFY_FULL;
                 g_pref_flash = FLASH_IDLE;
@@ -17826,7 +17993,7 @@ static void prefs_load(const oc_model *m) {
             if (k == 't') t = val; else if (k == 'h') h = val;
             else if (k == 'm') mm = val; else if (k == 'd') d = val;
             else if (k == 'n') g_pref_notify = (val < 0 || val > 2) ? NOTIFY_FULL : val;
-            else if (k == 'a') oc_theme_set_scheme(val);
+            else if (k == 'a') scheme_set(val);
             else if (k == 's') g_pref_textsize = (val < 0 || val > 3) ? 1 : val;
             else if (k == 'y') { g_pref_density = val ? 1 : 0; g_density = val ? 1.0f : 0.6f; }
             else if (k == 'r') { g_pref_richtext = val ? 1 : 0; ed_mode_changed(); }
@@ -18695,6 +18862,24 @@ static void test_dump(const char *path) {
                "scheme=%d railcol=%06X accentcol=%06X\n",
             g_pref_textsize, g_text_scale, g_dpi, g_pref_density,
             oc_theme_scheme(), (unsigned)OC_COL_RAIL, (unsigned)OC_COL_ACCENT);
+    /* THE WHOLE PALETTE, by token name. The audit asks two questions this
+     * answers and nothing else can: is a colour on screen one the theme
+     * actually names (a literal that resolves to no token is a surface that
+     * will not follow the theme), and what is the contrast between a label and
+     * the surface behind it. Both need the names, not just the two colours the
+     * line above happens to expose. */
+    {
+        static const char *const TOK[TH_COUNT] = {
+            "accent", "accent_dim", "rail", "sidebar", "base", "header",
+            "input", "select", "hover", "border", "rail_icon", "text",
+            "muted", "faint", "danger", "notice", "online", "away"
+        };
+        fprintf(f, "palette mode=%d light=%d n=%d", oc_theme_mode(),
+                oc_theme_is_light(), (int)TH_COUNT);
+        for (int i = 0; i < TH_COUNT; i++)
+            fprintf(f, " %s=%06X", TOK[i], (unsigned)oc_theme[i]);
+        fprintf(f, "\n");
+    }
     /* The sidebar AS BUILT, which is where the appear-once rule lives: a
      * conversation in a custom section leaves Channels, a starred one leaves both.
      * Counting a label in this list is the only way to assert that. */
@@ -19006,8 +19191,37 @@ static void test_dump(const char *path) {
             }
         }
         #undef contains
-        fprintf(f, "chromefit overlaps=%d outside=%d n=%d ov=\"%s\" out=\"%s\"\n",
-                overlaps, outside, g_a11y_n, first_ov, first_out);
+        /* IDS ARE UNIQUE (REQ-290), and until now nothing said so. An id is how
+         * a test, a screen reader and this audit all address an element; two
+         * elements answering to one name makes one of them unaddressable and
+         * the other ambiguous, which is the same failure the rail's three
+         * "more" rows had — found by reading the code rather than by any check,
+         * because there was no check. */
+        int dup = 0;
+        char first_dup[96] = "";
+        for (int i = 0; i < g_a11y_n && !first_dup[0]; i++)
+            for (int j = i + 1; j < g_a11y_n; j++)
+                if (!strcmp(g_acc_items[i].aid, g_acc_items[j].aid)) {
+                    dup++;
+                    if (!first_dup[0])
+                        snprintf(first_dup, sizeof first_dup, "%s", g_acc_items[i].aid);
+                    break;
+                }
+        fprintf(f, "chromefit overlaps=%d outside=%d dup=%d n=%d ov=\"%s\" out=\"%s\" dupid=\"%s\"\n",
+                overlaps, outside, dup, g_a11y_n, first_ov, first_out, first_dup);
+        /* THE TREE ITSELF, one line per element, so a check outside the client
+         * can ask questions this loop cannot. The one it exists for: does
+         * anything actually get DRAWN inside each of these rects? An element
+         * published at coordinates nothing painted is a phantom — the stale
+         * transcript rows were exactly that, and were invisible to every check
+         * here because they were internally consistent. Comparing the published
+         * tree against the paint ledger catches the whole class rather than the
+         * instance. */
+        for (int i = 0; i < g_a11y_n; i++) {
+            const oc_acc_item *a = &g_acc_items[i];
+            fprintf(f, "a11yitem %s %d %d %d %d\n", a->aid[0] ? a->aid : "-",
+                    a->l, a->t, a->r, a->b);
+        }
     }
     /* ARCH-108: the pinned metrics, checked, not remembered — the live
      * line_h/baseline pairs per token, plus a real render probe that the two
@@ -19270,6 +19484,17 @@ static void test_poll(HWND hwnd) {
         *(volatile int *)0 = 1;
     } else if (!strcmp(verb, "shot")) {
         test_ack(test_shot(hwnd, arg) ? "ok" : "err");
+    } else if (!strcmp(verb, "ledger")) {
+        /* The frame the window last painted, as a list of primitives. Repaint
+         * first and let the message loop run it, so the dump describes the
+         * scene as it stands NOW rather than whatever was on screen when the
+         * previous verb happened to leave it — the trap `shot` documents.
+         *
+         * The ledger belongs to the WINDOW's target. test_shot renders into its
+         * own, which is the right thing for a picture and the wrong thing here:
+         * a capture's ledger would describe the capture. */
+        UpdateWindow(hwnd);
+        test_ack(gfx_ledger_dump(g_gfx, arg) ? "ok" : "err");
     } else if (!strcmp(verb, "send")) {
         { WCHAR w[1024]; to_w(arg, w, 1024); ed_set(w); composer_send(); }
         test_ack("ok");
@@ -19698,7 +19923,17 @@ static void test_poll(HWND hwnd) {
         if (v >= 0 && v <= 3) { g_pref_textsize = v; scale_apply(hwnd); prefs_save(); test_ack("ok"); }
         else test_ack("err");
     } else if (!strcmp(verb, "prefs")) {
-        modal_enter(hwnd, &g_prefs_open); test_ack("ok");
+        /* `prefs [category]` — the category by INDEX, because the alternative
+         * is clicking a row whose y moves with the DPI and the text size, and
+         * the audit's whole job is to walk those. A scene that can only be
+         * reached at one scale cannot be checked at the others. */
+        modal_enter(hwnd, &g_prefs_open);
+        if (arg[0]) {
+            int cat = atoi(arg);
+            if (cat >= 0 && cat < PC_COUNT) g_pref_cat = cat;
+        }
+        InvalidateRect(hwnd, NULL, FALSE);
+        test_ack("ok");
     } else if (!strcmp(verb, "theme")) {
         theme_set(atoi(arg)); prefs_save(); test_ack("ok");
     } else if (!strcmp(verb, "emoji")) {
