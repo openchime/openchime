@@ -1253,6 +1253,41 @@ jobs:
           }
           Write-Output "wingetcreate $env:WINGETCREATE_VERSION verified"
 
+      # Sync the fork before submitting, every time.
+      #
+      # wingetcreate pushes a branch to a fork of microsoft/winget-pkgs under the
+      # token's account, and refuses when GitHub will not fast-forward that fork:
+      # "The forked repository could not be synced with the upstream commits."
+      # Releases 6 and 7 both died here, at the last job, with everything else
+      # already published. Upstream takes hundreds of commits a day and ours is
+      # touched once per release, so the fork is behind by thousands of commits
+      # by the time anyone looks -- 10,650 when release 7 was measured.
+      #
+      # Unconditional, and safe to be: the fork carries NOTHING of ours. Every
+      # submission is a branch that lives only until its PR merges upstream, so
+      # the fork's default branch was 0 ahead as well as 10,650 behind. There is
+      # no state to preserve, which is why this is a sync and not a merge, and
+      # why it needs no judgement about what to keep.
+      #
+      # `|| true`, deliberately: a fork that is already current, or an API blip,
+      # must not fail a release that has already published everything else. If
+      # the sync genuinely did not work, the submit below fails with the message
+      # it always did, which is a better error than anything this step could
+      # invent.
+      - name: Sync the submission fork with upstream
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          set -uo pipefail
+          owner=$(gh api user --jq .login)
+          echo "fork owner: $owner"
+          gh api "repos/microsoft/winget-pkgs/compare/microsoft:master...$owner:master" \
+            --jq '"before: \(.status), ahead \(.ahead_by), behind \(.behind_by)"' || true
+          gh repo sync "$owner/winget-pkgs" --source microsoft/winget-pkgs --branch master || true
+          gh api "repos/microsoft/winget-pkgs/compare/microsoft:master...$owner:master" \
+            --jq '"after:  \(.status), ahead \(.ahead_by), behind \(.behind_by)"' || true
+
       # Forks winget-pkgs under the token's account, commits the three files to
       # manifests/o/OpenChime/OpenChime/<version>/, and opens the PR. Merging is
       # gated on Microsoft's automated validation plus moderation, so the
