@@ -266,6 +266,22 @@ asset as `wingetcreate.exe.txt`.
 
 Same rule as `build_mbedtls.sh`, which refuses to fetch without a known SHA-256.
 
+## The WinGet fork syncs itself
+
+`wingetcreate` pushes a branch to a fork of `microsoft/winget-pkgs` under the
+token's account, and refuses outright when GitHub will not fast-forward that
+fork. Upstream takes hundreds of commits a day and ours is touched once per
+release, so the fork falls thousands of commits behind between releases — 10,650
+when release 7 measured it. Releases 6 and 7 both died at this one job, with
+every other channel already published.
+
+The `winget` job now runs `gh repo sync` against the fork immediately before
+submitting. It is unconditional and needs no judgement, because the fork carries
+nothing of ours: each submission is a branch that lives only until its PR merges
+upstream, so the default branch is always 0 ahead. The step logs the drift
+before and after, and cannot fail the release — if the sync really did not work,
+`wingetcreate` fails with the message it always did.
+
 ## Secrets and variables
 
 | name | kind | required for |
