@@ -331,16 +331,17 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
                     uint64_t message_id, uint64_t root_id, int now_min,
                     uint64_t now_ms, oc_push_target *out, int max) {
     sqlite3_stmt *st = NULL;
-    /* Level ALL (0) always; level MENTIONS (1) only when this message actually
-     * names the recipient — the deferred half of ARCH-72, which waited on
-     * REQ-221 because there was no way to answer "does it mention me".
+    /* ONE evaluator, asked once per recipient. This query FETCHES the nine
+     * inputs the notify decision takes and decides none of them; the order they
+     * compose in is oc_notify_decide()'s, in shared/, which the clients call
+     * too (ARCH-89, ARCH-103, REQ-134/135/136/137/061/278).
      *
-     * A broadcast (@here/@channel/@everyone) counts for everyone. @here means
-     * "people around right now", but presence lives in the net thread's memory,
-     * not the database, and the push worker holds its own read-only connection
-     * (ARCH-66) — so for the PUSH decision all three broadcasts are treated
-     * alike. Recorded rather than silently approximated: the cost is that
-     * @here may push someone who was already looking. */
+     * It used to state that order here, in the WHERE clause, while each client
+     * stated it again in its own toast gate — nine inputs feeding one boolean
+     * in three places. They had drifted: keywords, priority people and mute
+     * were honoured by push and ignored by the desktop toast, and the SQL read
+     * one recipient's keyword row as an audience for the whole channel. A rule
+     * written once cannot disagree with itself. */
     if (sqlite3_prepare_v2(db,
             "SELECT dt.platform, dt.token, u.dnd_mode, u.allow_start_min, u.allow_end_min, "
             "       u.dnd_until_ms, u.tz_offset_min, "
@@ -348,11 +349,64 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
             "       COALESCE(ns.start_min,0), COALESCE(ns.end_min,0), "
             /* Is the AUTHOR one of this recipient's priority people (REQ-135)?
              * A statement about who, evaluated against the sender — which is why
-             * it cannot be a level, and why it is answered here rather than in
-             * the WHERE clause: it must pierce the level and the pause, not
-             * merely pass them. */
+             * it cannot be a level. */
             "       EXISTS(SELECT 1 FROM priority_people pp "
-            "               WHERE pp.user_id = cm.user_id AND pp.person_id = ?2) "
+            "               WHERE pp.user_id = cm.user_id AND pp.person_id = ?2), "
+            /* Mute (REQ-137) and the resolved level (REQ-134): the fallback is
+             * the user's GLOBAL default, not a hardcoded ALL — "notify me only
+             * when mentioned, everywhere" has to hold for the channels the user
+             * never opened a preference on, which is most of them. */
+            "       COALESCE(np.muted, 0), "
+            "       COALESCE(np.level, u.notify_default), "
+            /* MENTIONED: this message names this recipient, personally or by a
+             * broadcast audience. @here means "people around right now", but
+             * presence lives in the net thread's memory, not the database, and
+             * the push worker holds its own read-only connection (ARCH-66) — so
+             * for the PUSH decision all three broadcasts are treated alike.
+             * Recorded rather than silently approximated: the cost is that
+             * @here may push someone who was already looking.
+             *
+             * The broadcast kinds are NAMED (1,2,3) rather than tested as
+             * `kind <> 0`. A keyword hit is kind 4 in this same table (ARCH-103,
+             * SCHEMA §3q), so `<> 0` made one recipient\'s private keyword row
+             * read as an audience: every MENTIONS-level member of the channel
+             * was pushed because somebody else\'s word appeared. A kind this
+             * predicate does not know is not a broadcast. */
+            "       EXISTS(SELECT 1 FROM mentions mn WHERE mn.message_id = ?3 "
+            "               AND (  (mn.user_id = cm.user_id AND mn.kind = 0) "
+            "                   OR mn.kind IN (1,2,3) )), "
+            /* KEYWORD_HIT, separately: REQ-135 makes it part of the MENTIONS
+             * level rather than a switch of its own, and it is always personal
+             * — the row carries the user whose term matched. */
+            "       EXISTS(SELECT 1 FROM mentions mn WHERE mn.message_id = ?3 "
+            "               AND mn.user_id = cm.user_id AND mn.kind = 4), "
+            /* THREAD_REPLY: a reply in a thread you are IN (REQ-061), which
+             * satisfies MENTIONS the same way an @-mention does — another way
+             * to pass the level, not a bypass of it.
+             *
+             * Participation is DERIVED, never stored (ARCH-104): you are in a
+             * thread if you wrote its root or any reply. `thread_follows`
+             * carries only overrides — state 1 an explicit follow of one you
+             * never wrote in, state 0 an explicit unfollow — and the UNFOLLOW
+             * OUTRANKS having replied, which is the whole meaning of "turn off
+             * replies" and the rule most easily lost by writing this as a
+             * plain OR. Same predicate the cross-channel thread list uses, so
+             * the view and the notification cannot disagree about who is in a
+             * thread.
+             *
+             * 0 for an ordinary send: the ?5 <> 0 test makes this false, so a
+             * channel message keeps exactly the audience it had. */
+            "       ( ?5 <> 0 "
+            "         AND NOT EXISTS(SELECT 1 FROM thread_follows tf "
+            "                         WHERE tf.user_id = cm.user_id "
+            "                           AND tf.root_id = ?5 AND tf.state = 0) "
+            "         AND ( EXISTS(SELECT 1 FROM messages rm "
+            "                       WHERE rm.id = ?5 AND rm.author_id = cm.user_id) "
+            "            OR EXISTS(SELECT 1 FROM messages rp "
+            "                       WHERE rp.parent_id = ?5 AND rp.author_id = cm.user_id) "
+            "            OR EXISTS(SELECT 1 FROM thread_follows tf "
+            "                       WHERE tf.user_id = cm.user_id "
+            "                         AND tf.root_id = ?5 AND tf.state = 1) ) ) "
             "FROM channel_members cm "
             "JOIN device_tokens dt ON dt.user_id = cm.user_id "
             "JOIN users u ON u.id = cm.user_id "
@@ -363,52 +417,14 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
             "LEFT JOIN notify_schedule ns "
             "  ON ns.user_id = cm.user_id "
             " AND ns.weekday = ((((?4/60000) + u.tz_offset_min)/1440) + 4) % 7 "
-            "WHERE cm.channel_id = ?1 AND cm.user_id <> ?2 AND u.disabled = 0 "
-            /* The fallback is the user's GLOBAL default (REQ-134), not a hardcoded
-             * ALL: "notify me only when mentioned, everywhere" has to hold for the
-             * channels the user never opened a preference on — which is most of
-             * them, and the whole point of having a default.
-             *
-             * A MUTED channel never pushes (REQ-137). Mute was being
-             * honoured in the sidebar and ignored here, so a muted channel at level
-             * ALL still rang the phone. */
-            "  AND COALESCE(np.muted, 0) = 0 "
-            /* A priority person pierces the LEVEL (REQ-135): "always notify me
-             * about them" is meaningless if a channel set to mentions-only can
-             * silence it. Mute above still wins — that is the deliberate limit. */
-            "  AND ( COALESCE(np.level, u.notify_default) = 0 "
-            "        OR EXISTS(SELECT 1 FROM priority_people pp "
-            "                   WHERE pp.user_id = cm.user_id AND pp.person_id = ?2) "
-            "        OR ( COALESCE(np.level, u.notify_default) = 1 AND ?3 <> 0 AND EXISTS ("
-            "               SELECT 1 FROM mentions mn WHERE mn.message_id = ?3 "
-            "                 AND (mn.user_id = cm.user_id OR mn.kind <> 0)) ) "
-            /* A reply in a thread you are IN satisfies MENTIONS too (REQ-061):
-             * participants are notified per their level, "independent of
-             * whether they were @mentioned". It sits in this OR group rather
-             * than above it deliberately — it is another way to pass the level,
-             * so mute, the schedule and the pause all still silence it, and
-             * NONE still passes nothing.
-             *
-             * Participation is DERIVED, never stored (ARCH-104): you are in a
-             * thread if you wrote its root or any reply. `thread_follows`
-             * carries only overrides — state 1 an explicit follow of one you
-             * never wrote in, state 0 an explicit unfollow — and the UNFOLLOW
-             * OUTRANKS having replied, which is the whole meaning of "turn off
-             * replies" and the rule most easily lost by writing this as a
-             * plain OR. Same predicate the cross-channel thread list uses, so
-             * the view and the notification cannot disagree about who is in a
-             * thread. */
-            "        OR ( COALESCE(np.level, u.notify_default) = 1 AND ?5 <> 0 "
-            "             AND NOT EXISTS(SELECT 1 FROM thread_follows tf "
-            "                             WHERE tf.user_id = cm.user_id "
-            "                               AND tf.root_id = ?5 AND tf.state = 0) "
-            "             AND ( EXISTS(SELECT 1 FROM messages rm "
-            "                           WHERE rm.id = ?5 AND rm.author_id = cm.user_id) "
-            "                OR EXISTS(SELECT 1 FROM messages rp "
-            "                           WHERE rp.parent_id = ?5 AND rp.author_id = cm.user_id) "
-            "                OR EXISTS(SELECT 1 FROM thread_follows tf "
-            "                           WHERE tf.user_id = cm.user_id "
-            "                             AND tf.root_id = ?5 AND tf.state = 1) ) ) );",
+            /* Everything left in WHERE is ADDRESSING, not policy: who is in the
+             * room, who can be reached, and whose account is live. Every rule
+             * about whether a reachable member wants this message is a column
+             * above and is decided by oc_notify_decide below. That split is the
+             * point of this query (ARCH-89, ARCH-103): the precedence order used
+             * to be stated twice, once in SQL and once in each client, and the
+             * two had already drifted. */
+            "WHERE cm.channel_id = ?1 AND cm.user_id <> ?2 AND u.disabled = 0;",
             -1, &st, NULL) != SQLITE_OK) {
         return 0;
     }
@@ -432,23 +448,33 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
         int day_start   = sqlite3_column_int(st, 9);
         int day_end     = sqlite3_column_int(st, 10);
         int vip         = sqlite3_column_int(st, 11);
+        int muted       = sqlite3_column_int(st, 12);
+        unsigned level  = (unsigned)sqlite3_column_int(st, 13);
+        int mentioned   = sqlite3_column_int(st, 14);
+        int keyword_hit = sqlite3_column_int(st, 15);
+        int thread_reply= sqlite3_column_int(st, 16);
         /* The recipient's own clock, not the server's (REQ-136). */
         long long lmin  = (long long)(now_ms / 60000) + tz_off;
         int local_min   = (int)(((lmin % 1440) + 1440) % 1440);
         int weekday     = (int)(((lmin / 1440) + 4) % 7);
         if (weekday < 0) weekday += 7;
         (void)now_min;
-        /* A priority person pierces a schedule and a pause alike (REQ-135): both
-         * say WHEN, and this says WHO. Mute is checked in the query above and is
-         * deliberately not pierced. */
-        if (!vip) {
-            if (oc_notify_quiet(mode, base_start, base_end, day_present, day_enabled,
-                                day_start, day_end, local_min, weekday)) continue;
-            /* A PAUSE (REQ-278), the other half of do-not-disturb: an absolute
-             * instant, checked here rather than swept anywhere, and it only ever
-             * ADDS silence — so it needs no precedence rule against the schedule. */
-            if (until && until > (uint64_t)now_ms) continue;
-        }
+
+        int quiet  = oc_notify_quiet(mode, base_start, base_end,
+                                     day_present, day_enabled,
+                                     day_start, day_end, local_min, weekday);
+        /* A PAUSE (REQ-278), the other half of do-not-disturb: an absolute
+         * instant, compared to now rather than swept anywhere. */
+        int paused = until && until > (uint64_t)now_ms;
+
+        /* `own` is 0, not because the author never matches but because the
+         * query already excluded them (cm.user_id <> ?2) — that is addressing,
+         * not policy: an author has no device row to push to in this audience
+         * at all. The argument stays in the call so the shape of the decision
+         * is the same one the clients make, where the author IS in the model. */
+        if (!oc_notify_decide(0, muted, vip, level,
+                              mentioned, keyword_hit, thread_reply,
+                              quiet, paused)) continue;
 
         const char *platform = (const char *)sqlite3_column_text(st, 0);
         const char *token    = (const char *)sqlite3_column_text(st, 1);

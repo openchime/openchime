@@ -4,6 +4,7 @@
 
 #include "model.h"
 #include "mention.h"   /* oc_keyword_match — the client half of ARCH-103 */
+#include "notify.h"    /* oc_notify_decide — the one notify rule (ARCH-103) */
 
 #include "protocol.h"   /* OC_PRESENCE_OFFLINE */
 
@@ -773,6 +774,13 @@ static oc_channel *channel_ensure(oc_model *m, uint64_t channel_id) {
     c = &m->channels[m->n_channels++];
     memset(c, 0, sizeof *c);
     c->channel_id = channel_id;
+    /* A channel that appears mid-session starts at the user's GLOBAL default
+     * (REQ-134), not at the zero memset leaves — which is OC_NOTIFY_ALL, the
+     * one level the user may have explicitly turned off everywhere. The
+     * NOTIFY_PREFS sync seeds every channel it knows about; a channel created
+     * after it arrived was getting ALL, so "only when mentioned" held until
+     * somebody made a new channel and then stopped holding there. */
+    c->notify_level = m->notify_default;
     return c;
 }
 
@@ -870,6 +878,46 @@ int oc_model_is_priority(const oc_model *m, uint64_t user_id) {
     for (uint8_t i = 0; i < m->n_pri_people; i++)
         if (m->pri_people[i] == user_id) return 1;
     return 0;
+}
+
+const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
+                                   uint64_t since_id, int quiet, int paused,
+                                   int *mentioned, int *keyword_hit, int *vip) {
+    if (mentioned)   *mentioned   = 0;
+    if (keyword_hit) *keyword_hit = 0;
+    if (vip)         *vip         = 0;
+    if (!m || !c) return NULL;
+
+    const char *me = oc_model_user_name(m, m->user_id);
+    const oc_msg *pick = NULL;
+    for (size_t i = 0; i < c->n_msgs; i++) {
+        const oc_msg *msg = &c->msgs[i];
+        if (msg->message_id <= since_id) continue;   /* already accounted for */
+        if (msg->deleted) continue;
+        /* Your own words are not news. The evaluator would answer the same
+         * way; it is a filter here because a message of yours must not become
+         * the subject of somebody else's notification either. */
+        if (msg->author_id == m->user_id) continue;
+
+        int men = 0, kw = 0;
+        if (msg->body) {
+            size_t blen = strlen(msg->body);
+            men = oc_mention_targets(msg->body, blen, me);
+            kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
+        }
+        int is_vip = oc_model_is_priority(m, msg->author_id);
+        /* thread_reply is 0: this watches a channel's main scroll, and a thread
+         * reply is deliberately not in it (REQ-060), so it never sees one.
+         * Wiring it needs a flag on THREAD_REPLY and is tracked. */
+        if (!oc_notify_decide(0, c->muted, is_vip, c->notify_level,
+                              men, kw, 0, quiet, paused)) continue;
+
+        pick = msg;                      /* ascending ids: the newest wins */
+        if (mentioned)   *mentioned   |= men;
+        if (keyword_hit) *keyword_hit |= kw;
+        if (vip)         *vip         |= is_vip;
+    }
+    return pick;
 }
 
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id) {
@@ -1105,14 +1153,24 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         f[nf++] = buf;
         for (char *q = buf; *q && nf < 8; q++)
             if (*q == '\x1f') { *q = '\0'; f[nf++] = q + 1; }
-        if (f[0][0]) snprintf(mem->name, sizeof mem->name, "%s", f[0]);
-        snprintf(mem->status_emoji, sizeof mem->status_emoji, "%s", f[1]);
-        snprintf(mem->status_text,  sizeof mem->status_text,  "%s", f[2]);
-        snprintf(mem->title,        sizeof mem->title,        "%s", f[3]);
-        snprintf(mem->timezone,     sizeof mem->timezone,     "%s", f[4]);
-        snprintf(mem->full_name,    sizeof mem->full_name,    "%s", f[5]);
-        snprintf(mem->pronouns,     sizeof mem->pronouns,     "%s", f[6]);
-        snprintf(mem->phone,        sizeof mem->phone,        "%s", f[7]);
+        /* Each field is a bounded copy out of the 768-byte split buffer above,
+         * so the precision states the destination's own bound rather than
+         * leaving a compiler to work out that a pointer into `buf` could carry
+         * 767 bytes into a 64-byte field. It is the same fact snprintf already
+         * enforces, said where a reader and a compiler can both see it -- and
+         * which of the two notices depends on the compiler's version, which is
+         * not a thing worth having an opinion vary on. */
+#define FOLD_FIELD(dst, src) \
+        snprintf((dst), sizeof (dst), "%.*s", (int)(sizeof (dst) - 1), (src))
+        if (f[0][0]) FOLD_FIELD(mem->name, f[0]);
+        FOLD_FIELD(mem->status_emoji, f[1]);
+        FOLD_FIELD(mem->status_text,  f[2]);
+        FOLD_FIELD(mem->title,        f[3]);
+        FOLD_FIELD(mem->timezone,     f[4]);
+        FOLD_FIELD(mem->full_name,    f[5]);
+        FOLD_FIELD(mem->pronouns,     f[6]);
+        FOLD_FIELD(mem->phone,        f[7]);
+#undef FOLD_FIELD
         mem->status_expires = e->server_time;
         mem->avatar_id      = e->message_id;
         if (e->op) mem->role = e->op;
