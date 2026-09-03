@@ -215,6 +215,40 @@ jobs:
       - name: Compile the app-core
         run: make core
 
+  # The tree is -Werror (see the Makefile), and a warning gate is only worth
+  # what the compilers behind it see. Every other job here compiles with the
+  # runner's gcc; the RELEASE compiles every package with `zig cc`, which is
+  # Clang, and the two disagree about what is worth warning on. Release 7 found
+  # that out the expensive way -- a C11 typedef repetition that gcc accepts
+  # without a word is fatal under Clang, so the tree was green on every push and
+  # unbuildable on the one path that ships.
+  #
+  # Clang rather than zig: it is the same front end and the same diagnostics,
+  # one apt package instead of a pinned toolchain download, and what is being
+  # checked is which warnings fire, not which libc is linked. `make test` builds
+  # the widest set of translation units in the tree, so it is the one that
+  # exercises the most.
+  second-compiler:
+    name: second compiler (clang)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build deps
+        run: |
+          set -euo pipefail
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+            /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bzip2 clang libsqlite3-dev
+      - name: Build and test with clang
+        run: make CC=clang test
+      - name: Compile the app-core with clang
+        run: make CC=clang core
+
   windows:
     name: windows cross-compile (TUI + GUI)
     # 24.04, not 22.04: the older runner's mingw-w64 headers declare
