@@ -20875,28 +20875,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                      * with the scanners the daemon resolves with (REQ-221), so
                      * toast and push agree on what a mention and a keyword hit
                      * are by construction. */
-                    const oc_msg *last = c->n_msgs ? &c->msgs[c->n_msgs - 1] : NULL;
-                    int mentioned = 0, kw_hit = 0;
-                    if (last && last->body) {
-                        size_t blen = strlen(last->body);
-                        mentioned = oc_mention_targets(last->body, blen,
-                                        oc_model_user_name(wm, wm->user_id));
-                        kw_hit = oc_model_keyword_hit(wm, last->body, blen,
-                                                      NULL, NULL);
-                    }
-                    int vip = last ? oc_model_is_priority(wm, last->author_id) : 0;
-                    if (!oc_notify_decide(last && last->author_id == wm->user_id,
-                                          c->muted, vip,
-                                          c->notify_level, mentioned, kw_hit,
-                                          /* Always 0 here: this loop watches a
-                                           * channel's high_water, and a thread
-                                           * reply is deliberately not in the
-                                           * main scroll (REQ-060), so it never
-                                           * sees one. Wiring it needs a flag on
-                                           * THREAD_REPLY and is tracked. */
-                                          0,
-                                          ws_quiet, ws_paused))
-                        continue;
+                    /* Whether any of this interrupts you is the shared
+                     * rule's answer, asked through the shared scan
+                     * (oc_model_notify_scan -> oc_notify_decide), which is the
+                     * same function the daemon's push query asks (ARCH-89,
+                     * ARCH-103): mute wins, a priority person pierces the
+                     * level, the schedule and the pause, and MENTIONS counts a
+                     * keyword hit as it counts an @-mention (REQ-135).
+                     *
+                     * It scans EVERY message this tick brought, not just the
+                     * newest in the channel. This loop runs on a timer, so a
+                     * batch landing between two ticks arrives together:
+                     * sampling only the last row meant a mention went silent
+                     * whenever an ordinary message happened to follow it, and
+                     * the toast named whoever spoke last rather than whoever
+                     * needed you. Deleted messages are skipped there too — the
+                     * announce path above already skipped them, this one did
+                     * not, so a message deleted before the tick still raised a
+                     * toast with an empty body. */
+                    int mentioned = 0, kw_hit = 0, vip = 0;
+                    const oc_msg *last = oc_model_notify_scan(wm, c, prev,
+                                                              ws_quiet, ws_paused,
+                                                              &mentioned, &kw_hit, &vip);
+                    if (!last) continue;
                     if (g_pref_notify != NOTIFY_OFF) {
                         char label[96], title[160], body[256];
                         channel_label(wm, c, label, sizeof label);

@@ -370,6 +370,193 @@ static void test_group_dm_title(void) {
     oc_model_free(&m);
 }
 
+/* A channel that appears AFTER the settings sync starts at the user's global
+ * default (REQ-134), not at whatever zeroed memory means.
+ *
+ * NOTIFY_PREFS is a full sync: its header sets the default and re-seeds every
+ * channel the model already holds, then the per-channel entries set the
+ * exceptions. A channel created later never passed through that, so it was born
+ * with notify_level 0 — which is OC_NOTIFY_ALL, the one level a user who set
+ * "only when mentioned" has explicitly said they do not want. The setting held
+ * until somebody made a channel and then quietly stopped holding there. */
+static void test_new_channel_takes_the_default_level(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+
+    oc_ev e;
+    /* The sync: "mentions only, everywhere". */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_DND; e.op = OC_NOTIFY_MENTIONS; oc_model_apply(&m, &e);
+    CHECK(m.notify_default == OC_NOTIFY_MENTIONS);
+
+    /* A channel that arrives afterwards. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 42; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("late"); e.server_time = 500;
+    oc_model_apply(&m, &e);
+
+    const oc_channel *c = oc_model_channel(&m, 42);
+    CHECK(c != NULL);
+    if (c) CHECK(c->notify_level == OC_NOTIFY_MENTIONS);
+
+    /* An explicit per-channel preference still outranks the default, so this
+     * is a floor and not a new way to ignore what the user set. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_NOTIFY_PREF; e.channel_id = 42; e.op = OC_NOTIFY_ALL; e.status = 0;
+    oc_model_apply(&m, &e);
+    c = oc_model_channel(&m, 42);
+    if (c) CHECK(c->notify_level == OC_NOTIFY_ALL);
+
+    /* And a default of ALL still means ALL: the seeding must not have been
+     * written as "anything but zero". */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_DND; e.op = OC_NOTIFY_ALL; oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 43; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("later"); e.server_time = 600;
+    oc_model_apply(&m, &e);
+    c = oc_model_channel(&m, 43);
+    CHECK(c != NULL);
+    if (c) CHECK(c->notify_level == OC_NOTIFY_ALL);
+
+    oc_model_free(&m);
+}
+
+/* The client's half of the one notify decision (ARCH-89, ARCH-103).
+ *
+ * oc_model_notify_scan gathers the inputs and asks oc_notify_decide, the same
+ * function the daemon's push query asks — so what is worth testing here is not
+ * the precedence order (test_push sweeps that against the daemon over all 192
+ * states) but the SCAN: which messages it considers at all. That is where the
+ * client's copy was wrong in ways the shared rule could not see, because it was
+ * never asked about the messages that were skipped. */
+static void test_notify_scan(void) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = 1;
+
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("alice"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob");   oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 10; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("general"); e.server_time = 10;
+    oc_model_apply(&m, &e);
+
+    oc_channel *c = oc_model_channel(&m, 10);
+    CHECK(c != NULL);
+    if (!c) { oc_model_free(&m); return; }
+    c->notify_level = OC_NOTIFY_MENTIONS;
+
+    /* A BATCH: a message that names me, then two that do not. The tick sees all
+     * three at once. Sampling only the newest — which is what the toast gate
+     * used to do — asks the rule about "afternoon all" and gets silence, so the
+     * mention two rows above it is never announced at all. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 1; e.author_id = 2;
+    e.server_time = 100; e.body = strdup("@alice can you look"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 2; e.author_id = 2;
+    e.server_time = 200; e.body = strdup("never mind"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 3; e.author_id = 2;
+    e.server_time = 300; e.body = strdup("afternoon all"); oc_model_apply(&m, &e);
+
+    int men = 0, kw = 0, vip = 0;
+    const oc_msg *pick = oc_model_notify_scan(&m, c, 0, 0, 0, &men, &kw, &vip);
+    CHECK(pick != NULL);
+    if (pick) CHECK(pick->message_id == 1);   /* the only one that notifies */
+    CHECK(men == 1);
+    CHECK(kw == 0 && vip == 0);
+
+    /* `since_id` is honoured: nothing above message 3 is new. */
+    pick = oc_model_notify_scan(&m, c, 3, 0, 0, &men, &kw, &vip);
+    CHECK(pick == NULL);
+    CHECK(men == 0);   /* the out-params are cleared, not left from last time */
+
+    /* The NEWEST notifying message is the subject when several qualify, and the
+     * flags are the OR across all of them — the sound and the taskbar flash ask
+     * "did any of this name me?", not "did the last one?". */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 4; e.author_id = 2;
+    e.server_time = 400; e.body = strdup("@alice again"); oc_model_apply(&m, &e);
+    pick = oc_model_notify_scan(&m, c, 0, 0, 0, &men, &kw, &vip);
+    if (pick) CHECK(pick->message_id == 4);
+    CHECK(men == 1);
+
+    /* A DELETED message is not news. The tombstone stays for the reader, but it
+     * has no body to preview and nothing left to interrupt for — this used to
+     * raise a toast with an empty body. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_DELETE; e.channel_id = 10; e.message_id = 4; oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_DELETE; e.channel_id = 10; e.message_id = 1; oc_model_apply(&m, &e);
+    pick = oc_model_notify_scan(&m, c, 0, 0, 0, &men, &kw, &vip);
+    CHECK(pick == NULL);        /* both mentions are tombstones now */
+    CHECK(men == 0);
+
+    /* My OWN message never notifies me, whatever it says. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 5; e.author_id = 1;
+    e.server_time = 500; e.body = strdup("@alice talking to myself");
+    oc_model_apply(&m, &e);
+    pick = oc_model_notify_scan(&m, c, 0, 0, 0, &men, &kw, &vip);
+    CHECK(pick == NULL);
+
+    /* The shared rule still governs: mute silences a mention, and so does the
+     * schedule and the pause. Precedence itself is test_push's sweep; this only
+     * proves the scan actually routes through it rather than deciding on its
+     * own. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 6; e.author_id = 2;
+    e.server_time = 600; e.body = strdup("@alice one more"); oc_model_apply(&m, &e);
+    CHECK(oc_model_notify_scan(&m, c, 5, 0, 0, NULL, NULL, NULL) != NULL);
+    CHECK(oc_model_notify_scan(&m, c, 5, 1, 0, NULL, NULL, NULL) == NULL);   /* quiet */
+    CHECK(oc_model_notify_scan(&m, c, 5, 0, 1, NULL, NULL, NULL) == NULL);   /* paused */
+    c->muted = 1;
+    CHECK(oc_model_notify_scan(&m, c, 5, 0, 0, NULL, NULL, NULL) == NULL);   /* muted */
+    c->muted = 0;
+
+    /* A KEYWORD hit passes the MENTIONS level as an @-mention does (REQ-135),
+     * through the same scanner the daemon resolved with (ARCH-103) — the client
+     * used to ignore keywords entirely, so the phone rang and the desktop did
+     * not. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 7; e.author_id = 2;
+    e.server_time = 700; e.body = strdup("the deploy is done"); oc_model_apply(&m, &e);
+    CHECK(oc_model_notify_scan(&m, c, 6, 0, 0, NULL, NULL, NULL) == NULL);
+    snprintf(m.kw_terms[0], sizeof m.kw_terms[0], "deploy");
+    m.n_kw_terms = 1;
+    men = kw = vip = 0;
+    pick = oc_model_notify_scan(&m, c, 6, 0, 0, &men, &kw, &vip);
+    CHECK(pick != NULL);
+    if (pick) CHECK(pick->message_id == 7);
+    CHECK(kw == 1 && men == 0);
+    /* Still inside the level, not around it: mute and the schedule silence a
+     * keyword exactly as they silence a mention. */
+    CHECK(oc_model_notify_scan(&m, c, 6, 1, 0, NULL, NULL, NULL) == NULL);
+    m.n_kw_terms = 0;
+
+    /* A PRIORITY PERSON pierces the level, the schedule and the pause alike —
+     * the one input that says WHO where the rest say WHEN. Mute is the
+     * deliberate limit and still wins. */
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 8; e.author_id = 2;
+    e.server_time = 800; e.body = strdup("morning"); oc_model_apply(&m, &e);
+    CHECK(oc_model_notify_scan(&m, c, 7, 1, 1, NULL, NULL, NULL) == NULL);
+    m.pri_people[0] = 2; m.n_pri_people = 1;
+    men = kw = vip = 0;
+    pick = oc_model_notify_scan(&m, c, 7, 1, 1, &men, &kw, &vip);
+    CHECK(pick != NULL);            /* through both the schedule and the pause */
+    CHECK(vip == 1);
+    c->muted = 1;
+    CHECK(oc_model_notify_scan(&m, c, 7, 0, 0, NULL, NULL, NULL) == NULL);
+    c->muted = 0;
+
+    oc_model_free(&m);
+}
+
 static void test_sidebar(void) {
     oc_model m; oc_model_init(&m);
     m.user_id = 1;
@@ -851,6 +1038,8 @@ int run_client_core_tests(void) {
 
     test_group_dm_title();
     test_sidebar();
+    test_new_channel_takes_the_default_level();
+    test_notify_scan();
     test_pins();
     test_resolve();
     test_last_error();

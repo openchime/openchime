@@ -739,16 +739,224 @@ static void test_notify_roundtrip(void) {
     cleanup_db(path);
 }
 
+/* --- a keyword hit is one person's, not an audience --------------------------
+ *
+ * REQ-135 puts keywords inside the MENTIONS level and stores a hit in the
+ * `mentions` table with kind 4 (ARCH-103, SCHEMA §3q), so the push gate, the
+ * activity feed and the reader's highlight all keep working unchanged. The gate
+ * used to read "kind <> 0" as "a broadcast audience", which made one person's
+ * private term an @channel: every MENTIONS-level member of the channel was
+ * pushed because somebody else's word appeared in the message.
+ *
+ * Nothing in the tree could see it. The row is real, the level is real, and the
+ * query is self-consistent — it just answers a question nobody asked. */
+static void test_keyword_is_not_a_broadcast(void) {
+    const char *path = "build/test_push_keyword.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    if (!w) return;
+
+    uint64_t alice = oc_dbwriter_register_local(w, "alice", "pw", OC_ROLE_OWNER,  2048);
+    uint64_t bob   = oc_dbwriter_register_local(w, "bob",   "pw", OC_ROLE_MEMBER, 2048);
+    uint64_t carol = oc_dbwriter_register_local(w, "carol", "pw", OC_ROLE_MEMBER, 2048);
+    CHECK(alice && bob && carol);
+    CHECK(oc_dbwriter_register_device_token(w, bob,   OC_PUSH_APNS, "tok-bob"));
+    CHECK(oc_dbwriter_register_device_token(w, carol, OC_PUSH_APNS, "tok-carol"));
+
+    /* Both on MENTIONS: neither wants the channel's ordinary traffic. */
+    set_level(w, bob,   1, OC_NOTIFY_MENTIONS);
+    set_level(w, carol, 1, OC_NOTIFY_MENTIONS);
+
+    /* CAROL's keyword matched this message. Bob's did not, and he is not named. */
+    {
+        sqlite3 *wdb = NULL;
+        CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        char sql[256];
+        snprintf(sql, sizeof sql,
+                 "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms)"
+                 " VALUES(7001,1,%llu,4,0,6,1);", (unsigned long long)carol);
+        CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(wdb);
+    }
+
+    sqlite3 *rdb = NULL;
+    CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    oc_push_target t[8];
+    int n = oc_push_collect(rdb, 1, alice, 7001, 0, 100, (uint64_t)100 * 60000ull, t, 8);
+    int saw_bob = 0, saw_carol = 0;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(t[i].token, "tok-bob")   == 0) saw_bob = 1;
+        if (strcmp(t[i].token, "tok-carol") == 0) saw_carol = 1;
+    }
+    CHECK(saw_carol);       /* her term, her notification */
+    CHECK(!saw_bob);        /* not his, and not the channel's */
+    CHECK(n == 1);
+
+    /* The real broadcasts still are broadcasts — the fix names kinds 1/2/3
+     * rather than widening to "not 0", so this must not have been narrowed
+     * into silence. */
+    {
+        sqlite3 *wdb = NULL;
+        CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+        CHECK(sqlite3_exec(wdb,
+            "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms)"
+            " VALUES(7002,1,NULL,2,0,8,1);", NULL, NULL, NULL) == SQLITE_OK);
+        sqlite3_close(wdb);
+    }
+    n = oc_push_collect(rdb, 1, alice, 7002, 0, 100, (uint64_t)100 * 60000ull, t, 8);
+    CHECK(n == 2);          /* @channel reaches both */
+
+    sqlite3_close(rdb);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
+/* --- the daemon and the evaluator, swept against each other ------------------
+ *
+ * The point of the single evaluator is that ONE function decides, so the way to
+ * prove it is not a list of cases somebody thought of — that is how the two copies drifted in
+ * the first place, each passing its own tests. This sweeps every combination of
+ * the seven inputs the push path can express (mute x level x priority x mention
+ * x keyword x schedule x pause: 2*3*2*2*2*2 = 192 states), sets each one up in
+ * the database, and requires oc_push_collect's answer to equal
+ * oc_notify_decide's for the same inputs.
+ *
+ * `thread_reply` is the eighth input and is not swept here: it is derived from
+ * message rows rather than set as a flag, and test_collect covers it directly.
+ * It is passed as 0 to both sides, which is what a non-threaded send means.
+ *
+ * A BYSTANDER sits in the channel for every one of those states: on MENTIONS,
+ * never named, never a priority person, with no term of their own. Nothing in
+ * the sweep is about them, which is the point — every state is also a test that
+ * one recipient's settings do not become somebody else's notification. Without
+ * them the sweep passed against the query that read a keyword row as an
+ * audience, because with a single recipient a row addressed to that recipient
+ * answers the same either way. That is the shape of the bug this whole change
+ * is about, and a sweep that cannot see it is agreement by coincidence. */
+static void test_collect_matches_evaluator(void) {
+    const char *path = "build/test_push_parity.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    if (!w) return;
+
+    uint64_t alice = oc_dbwriter_register_local(w, "alice", "pw", OC_ROLE_OWNER,  2048);
+    uint64_t bob   = oc_dbwriter_register_local(w, "bob",   "pw", OC_ROLE_MEMBER, 2048);
+    uint64_t zoe   = oc_dbwriter_register_local(w, "zoe",   "pw", OC_ROLE_MEMBER, 2048);
+    CHECK(alice && bob && zoe);
+    CHECK(oc_dbwriter_register_device_token(w, bob, OC_PUSH_APNS, "tok-bob"));
+    CHECK(oc_dbwriter_register_device_token(w, zoe, OC_PUSH_APNS, "tok-zoe"));
+    set_level(w, zoe, 1, OC_NOTIFY_MENTIONS);       /* the bystander, permanently */
+    oc_dbwriter_stop(w);        /* the rest is set directly, one state per pass */
+
+    /* tz_offset_min 0 and this instant put the recipient's local clock at
+     * 00:40 on a Thursday, which the allow-window below excludes. */
+    const uint64_t now_ms = (uint64_t)100 * 60000ull;
+    const int allow_start = 600, allow_end = 660;   /* 10:00-11:00 */
+
+    sqlite3 *wdb = NULL;
+    CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
+
+    int idx = 0, mismatches = 0, notified = 0;
+    for (int muted = 0; muted < 2; muted++)
+    for (unsigned level = 0; level < 3; level++)
+    for (int vip = 0; vip < 2; vip++)
+    for (int mentioned = 0; mentioned < 2; mentioned++)
+    for (int keyword = 0; keyword < 2; keyword++)
+    for (int quiet = 0; quiet < 2; quiet++)
+    for (int paused = 0; paused < 2; paused++) {
+        uint64_t msg = 900000ull + (uint64_t)idx++;
+        char sql[1024];
+        snprintf(sql, sizeof sql,
+            "DELETE FROM notification_prefs WHERE user_id=%llu AND channel_id=1;"
+            "INSERT INTO notification_prefs(user_id,channel_id,level,muted) VALUES(%llu,1,%u,%d);"
+            "DELETE FROM priority_people WHERE user_id=%llu;"
+            "UPDATE users SET dnd_mode=%d, allow_start_min=%d, allow_end_min=%d,"
+            "                 dnd_until_ms=%llu, tz_offset_min=0 WHERE id=%llu;",
+            (unsigned long long)bob,
+            (unsigned long long)bob, level, muted,
+            (unsigned long long)bob,
+            quiet ? OC_DND_EVERY_DAY : OC_DND_OFF, allow_start, allow_end,
+            (unsigned long long)(paused ? now_ms + 60000ull : 0ull),
+            (unsigned long long)bob);
+        CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
+        if (vip) {
+            snprintf(sql, sizeof sql,
+                "INSERT INTO priority_people(user_id,person_id) VALUES(%llu,%llu);",
+                (unsigned long long)bob, (unsigned long long)alice);
+            CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
+        }
+        if (mentioned) {
+            snprintf(sql, sizeof sql,
+                "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms)"
+                " VALUES(%llu,1,%llu,0,0,4,1);",
+                (unsigned long long)msg, (unsigned long long)bob);
+            CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
+        }
+        if (keyword) {
+            snprintf(sql, sizeof sql,
+                "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms)"
+                " VALUES(%llu,1,%llu,4,0,6,1);",
+                (unsigned long long)msg, (unsigned long long)bob);
+            CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
+        }
+
+        sqlite3 *rdb = NULL;
+        CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+        oc_push_target t[8];
+        int n = oc_push_collect(rdb, 1, alice, msg, 0, 100, now_ms, t, 8);
+        sqlite3_close(rdb);
+
+        /* What the shared rule says, from the same inputs. The schedule is
+         * asked of the shared evaluator too, rather than restated as `quiet`,
+         * so this pins the daemon's clock arithmetic as well as its order. */
+        int want_quiet = oc_notify_quiet(quiet ? OC_DND_EVERY_DAY : OC_DND_OFF,
+                                         allow_start, allow_end,
+                                         0, 0, 0, 0,
+                                         (int)((now_ms / 60000) % 1440),
+                                         (int)((((now_ms / 60000) / 1440) + 4) % 7));
+        int want = oc_notify_decide(0, muted, vip, level,
+                                    mentioned, keyword, 0, want_quiet, paused);
+        /* Bob if and only if the rule says so, and the bystander never. */
+        int got_bob = 0, got_zoe = 0;
+        for (int i = 0; i < n; i++) {
+            if (strcmp(t[i].token, "tok-bob") == 0) got_bob = 1;
+            if (strcmp(t[i].token, "tok-zoe") == 0) got_zoe = 1;
+        }
+        if (got_bob != want || got_zoe || n != want) {
+            mismatches++;
+            printf("  parity: muted=%d level=%u vip=%d men=%d kw=%d quiet=%d paused=%d"
+                   " -> bob %d (rule says %d), bystander %d, total %d\n",
+                   muted, level, vip, mentioned, keyword, quiet, paused,
+                   got_bob, want, got_zoe, n);
+        }
+        notified += want;
+    }
+    sqlite3_close(wdb);
+
+    CHECK(idx == 192);
+    CHECK(mismatches == 0);
+    /* Both answers occur across the sweep: a rule that says no to everything
+     * would otherwise agree with a collector that returns nothing. */
+    CHECK(notified > 0 && notified < idx);
+    cleanup_db(path);
+}
+
 int run_push_tests(void) {
     printf("test_push: DND window (incl wrap-around), recipient collect "
            "(level/DND/author gating), CP-12 sign+verify, contentless body, "
            "global default + mute as push gates, "
+           "a keyword hit that is one person's and not an audience, "
+           "collect swept against the shared evaluator over all 192 states, "
            "device-token register/unregister/prune, notify->relay->prune round-trip\n");
     test_dnd();
     test_build_body();
     test_sign_verify();
     test_collect();
     test_default_and_mute();
+    test_keyword_is_not_a_broadcast();
+    test_collect_matches_evaluator();
     test_notify_roundtrip();
     return failures;
 }
