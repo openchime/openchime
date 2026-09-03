@@ -786,7 +786,7 @@ static void test_search_vertical(int port, const uint8_t *pin) {
 
     /* bob searches and finds it, with the right ids and a non-empty snippet. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_search sq = { oc_slice_str("orbital"), 10 };
+    oc_search sq = { .query = oc_slice_str("orbital"), .limit = 10 };
     CHECK(oc_encode_search(&w, OC_PROTOCOL_VERSION, &sq) == OC_OK);
     CHECK(send_frame(&b, buf, w.len) == 0);
     CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SEARCH_RESULTS);
@@ -812,7 +812,7 @@ static void test_search_vertical(int port, const uint8_t *pin) {
 
     /* bob (not a member of the private channel) cannot find it. */
     oc_wbuf_init(&w, buf, sizeof buf);
-    oc_search sq2 = { oc_slice_str("nuclear"), 10 };
+    oc_search sq2 = { .query = oc_slice_str("nuclear"), .limit = 10 };
     CHECK(oc_encode_search(&w, OC_PROTOCOL_VERSION, &sq2) == OC_OK);
     CHECK(send_frame(&b, buf, w.len) == 0);
     CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_SEARCH_RESULTS);

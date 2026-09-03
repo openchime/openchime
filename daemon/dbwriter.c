@@ -1645,8 +1645,19 @@ static void store_mentions(sqlite3 *db, uint64_t mid, uint64_t channel_id,
                             if (!dup) {
                                 const unsigned char *dn = sqlite3_column_text(w, 1);
                                 unres->who[unres->count].user_id = outsider;
+                                /* The fallback is the mention token AS TYPED,
+                                 * which the scanner allows to be longer than
+                                 * any legal display name -- so this copy is
+                                 * bounded on purpose, and the precision says
+                                 * so rather than leaving the compiler to
+                                 * notice the buffer is the smaller of the
+                                 * two. An @-token that does not fit cannot
+                                 * name a real user anyway, which is why it is
+                                 * in the unresolved list. */
                                 snprintf(unres->who[unres->count].name,
-                                         sizeof unres->who[unres->count].name, "%s",
+                                         sizeof unres->who[unres->count].name,
+                                         "%.*s",
+                                         (int)(sizeof unres->who[unres->count].name - 1),
                                          dn ? (const char *)dn : m[i].name);
                                 unres->count++;
                             }
