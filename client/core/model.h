@@ -145,7 +145,11 @@ typedef struct {
      * status without a second lookup — the roster is small and already in memory.
      * An EXPIRED status arrives empty: the daemon applies that rule, so no client
      * needs its own clock to decide. */
-    char     status_emoji[24];
+    /* Sized to the event field it is copied from (oc_ev.emoji), not to what a
+     * status emoji "should" need: a shorter buffer truncated the copy, and
+     * truncating UTF-8 at a byte offset splits a codepoint and produces a
+     * status nothing can render. Matching the source makes the copy total. */
+    char     status_emoji[40];
     char     status_text[80];
     uint64_t status_expires;
     char     title[64];

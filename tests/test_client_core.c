@@ -28,7 +28,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <dirent.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -867,51 +866,10 @@ static void mock_del(void *ctx, const char *a) {
         if (g_mock[i].used && strcmp(g_mock[i].account, a) == 0) g_mock[i].used = 0;
 }
 
-static void count_msg_cb(void *ctx, uint64_t ch, uint64_t id, uint64_t aid,
-                         const char *an, uint64_t t, const char *body, int e, int d) {
-    (void)ch; (void)id; (void)aid; (void)an; (void)t; (void)body; (void)e; (void)d;
-    (*(int *)ctx)++;
-}
-static void count_outbox_cb(void *ctx, const uint8_t idem[OC_IDEM_SIZE],
-                            uint64_t ch, const char *body) {
-    (void)idem; (void)ch; (void)body;
-    (*(int *)ctx)++;
-}
-
-/* Capturing variants, for asserting the folded content and not just the count. */
-struct msg_capture { int n; uint64_t id[8]; char body[8][64]; int edited[8], deleted[8]; };
-static void msg_cb(void *ctx, uint64_t ch, uint64_t id, uint64_t aid,
-                   const char *an, uint64_t t, const char *body, int e, int d) {
-    (void)ch; (void)aid; (void)an; (void)t;
-    struct msg_capture *c = ctx;
-    if (c->n >= 8) return;
-    c->id[c->n] = id;
-    snprintf(c->body[c->n], sizeof c->body[0], "%s", body ? body : "");
-    c->edited[c->n] = e; c->deleted[c->n] = d; c->n++;
-}
-struct out_capture { int n; char body[8][64]; };
-static void out_cb(void *ctx, const uint8_t idem[OC_IDEM_SIZE], uint64_t ch, const char *body) {
-    (void)idem; (void)ch;
-    struct out_capture *c = ctx;
-    if (c->n >= 8) return;
-    snprintf(c->body[c->n], sizeof c->body[0], "%s", body ? body : "");
-    c->n++;
-}
-/* The store names its per-workspace files by a hash we do not export; find the
- * one .log in the state dir instead of recomputing it. */
-static int find_log_file(const char *dir, char *out, size_t cap) {
-    DIR *d = opendir(dir);
-    if (!d) return 0;
-    struct dirent *e; int found = 0;
-    while ((e = readdir(d)) != NULL) {
-        size_t n = strlen(e->d_name);
-        if (n > 4 && strcmp(e->d_name + n - 4, ".log") == 0) {
-            snprintf(out, cap, "%s/%s", dir, e->d_name); found = 1; break;
-        }
-    }
-    closedir(d);
-    return found;
-}
+/* The message/outbox replay callbacks and the .log finder that used to live
+ * here went with the client's SQLite store (ARCH-88): the API they fed no
+ * longer exists, so they were five definitions nothing could call. Kept as a
+ * note rather than as code, because dead scaffolding reads like coverage. */
 
 /* Capture the workspace book in call order (most-recently-used first). */
 struct book_capture { int n; char ws[4][64]; char label[4][64]; char user[4][64]; };

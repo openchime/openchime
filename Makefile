@@ -1,5 +1,30 @@
 CC ?= cc
-CFLAGS ?= -std=c99 -D_GNU_SOURCE -Wall -Wextra -O2
+
+# -Werror, everywhere, always. A warning is a build failure and not a note in
+# the scroll-back, because the cost of a warning is never the one warning: it is
+# that the next one arrives into a stream a reader has already trained
+# themselves to skip. Fifteen of them accumulated here over the life of the
+# tree, every one in code that worked, and together they made the sixteenth
+# invisible -- which is the only one that would have mattered.
+#
+# This is not a lint preference. Nothing else in the build refuses to produce an
+# artifact over a warning, so "we do not ship warnings" was a thing said rather
+# than a thing enforced, and the feature-PR checklist asked for a clean build it
+# could not actually get. A check that is always waived is not a check.
+#
+# The escape hatch is deliberately per-file and visible: add -Wno-<thing> to one
+# target's flags, in this file, with a comment saying why. There is no global
+# opt-out and no NOWARN=1, because both would be used once in a hurry and then
+# forever.
+WARN_CFLAGS := -Wall -Wextra -Werror
+CFLAGS ?= -std=c99 -D_GNU_SOURCE -O2
+# APPENDED, not folded into the ?= above, and that is the whole point. `CFLAGS ?=`
+# is one `make CFLAGS=...` away from being replaced wholesale -- and the release
+# workflow does pass variables on the command line (CC, OC_VERSION), so the one
+# build that must not carry warnings is exactly the one best placed to drop the
+# flag that forbids them. `override` is what makes this hold: a plain `+=` still
+# loses to a command-line assignment, which is precisely the case being guarded.
+override CFLAGS += $(WARN_CFLAGS)
 LDFLAGS ?= -lsqlite3 -lpthread
 
 # Release identity (ARCH-20). The release workflow passes the release number it
@@ -213,7 +238,11 @@ WIN_TUI_BIN := build/openchime-tui.exe
 # -g: debug info, so a crash RVA from the report (see crash_filter) resolves to a
 # file and line via addr2line. Without it the report can only say "somewhere in
 # winmain.c", which is not a lead. No runtime cost; strip on release if size matters.
-WIN_CFLAGS := -std=c99 -Wall -Wextra -O2 -g -D_WIN32_WINNT=0x0601 -DUTF8PROC_STATIC
+# The Windows flags are their own variable rather than an addition to CFLAGS, so
+# they carry WARN_CFLAGS explicitly. They must: the cross build is where the two
+# implicit float declarations hid, because nothing on the native side compiles
+# winmain.c at all.
+WIN_CFLAGS := -std=c99 $(WARN_CFLAGS) -O2 -g -D_WIN32_WINNT=0x0601 -DUTF8PROC_STATIC
 WIN_INC := -Ishared -Idaemon -Ithird_party/jsmn -I$(MBEDTLS_WIN)/include \
            $(CORE_INC) -Iclient/tui -Iclient/shared -Ituikit -Ithird_party/termbox2 -Ithird_party/utf8proc
 

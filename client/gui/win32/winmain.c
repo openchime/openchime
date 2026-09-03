@@ -27,6 +27,11 @@
 #include <dbghelp.h>        /* MINIDUMP_* types; the function is loaded at run time */
 #include "a11y.h"           /* the UIA provider (REQ-269, ARCH-99) */
 
+/* ceilf/roundf, in the text metrics below. Without it they were implicitly
+ * declared as returning INT, so every baseline and line height was computed by
+ * truncating a float through an integer return -- a rendering defect the
+ * compiler was reporting all along, in the stream of warnings nobody read. */
+#include <math.h>
 #include <signal.h>
 #include <stdarg.h>          /* va_list — the crash breadcrumb ring */
 #include <stdio.h>
@@ -18168,16 +18173,11 @@ static void tray_menu_open(void) {
 
 /* "Notifications paused until 5:03 PM" — the one place a pause's end time
  * appears at all. It is MY pause: the server never sends anyone else's instant
- * (REQ-122), so there is deliberately no version of this for another person. */
-static void snooze_label(uint64_t until_ms, char *out, size_t cap) {
-    time_t t = (time_t)(until_ms / 1000);
-    struct tm tv; char when[24] = "";
-    if (oc_localtime_r(&t, &tv))
-        strftime(when, sizeof when, g_pref_time24 ? "%H:%M" : "%I:%M %p", &tv);
-    snprintf(out, cap, "PAUSED UNTIL %s", when);
-}
-
-/* The same fact in sentence case, for a menu ROW rather than a section head. */
+ * (REQ-122), so there is deliberately no version of this for another person.
+ *
+ * The ALL-CAPS section-head form that used to sit above this went with the
+ * menu that had a section head: the You menu became the profile popover, and
+ * nothing has called it since. */
 static void snooze_until_sentence(uint64_t until_ms, char *out, size_t cap) {
     time_t t = (time_t)(until_ms / 1000);
     struct tm tv; char when[24] = "";
@@ -20311,7 +20311,13 @@ static void test_poll(HWND hwnd) {
         test_ack("ok");
         if      (!strcmp(arg, "av"))       { *(volatile int *)0 = 1; }
         else if (!strcmp(arg, "abort"))    { abort(); }
-        else if (!strcmp(arg, "badparam")) { printf(NULL); }
+        /* Passing NULL IS the test: this hook exists to prove the crash
+         * handler catches an invalid-parameter fault. The null goes through a
+         * volatile pointer so the call is still the one being tested but the
+         * compiler can no longer prove the argument is null and warn about it
+         * -- a diagnostic that is correct about the code and wrong about the
+         * intent. A pragma cannot go here: it would split the else-if chain. */
+        else if (!strcmp(arg, "badparam")) { const char *volatile nofmt = NULL; printf(nofmt); }
         else if (!strcmp(arg, "fastfail")) { __fastfail(1); }
         else if (!strcmp(arg, "kill"))     { TerminateProcess(GetCurrentProcess(), 3); }
     } else if (!strcmp(verb, "mute")) {

@@ -410,7 +410,10 @@ static void test_channel_frames(void) {
         CHECK(slice_eq_str(out.name, "engineering") && out.is_public == 0);
     }
     {
-        oc_channel_info in = { 5, OC_CHANNEL_KIND, oc_slice_str("engineering"), 0, 1, 1751200500000ull, 0 };
+        oc_channel_info in = { .channel_id = 5, .kind = OC_CHANNEL_KIND,
+                               .name = oc_slice_str("engineering"),
+                               .is_public = 0, .joined = 1,
+                               .created_at = 1751200500000ull, .peer_id = 0 };
         ROUNDTRIP(oc_encode_channel_info(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANNEL_INFO, h, p);
         oc_channel_info out;
         CHECK(oc_decode_channel_info(&p, &out) == OC_OK);
@@ -428,8 +431,10 @@ static void test_channel_frames(void) {
     }
     {
         oc_channel_list_entry ents[2] = {
-            { 1, oc_slice_str("general"),   1, 1, OC_CHANNEL_KIND },
-            { 9, oc_slice_str(""),          0, 1, OC_CHANNEL_KIND_DM },
+            { .channel_id = 1, .name = oc_slice_str("general"),
+              .is_public = 1, .joined = 1, .kind = OC_CHANNEL_KIND },
+            { .channel_id = 9, .name = oc_slice_str(""),
+              .is_public = 0, .joined = 1, .kind = OC_CHANNEL_KIND_DM },
         };
         oc_channel_list in = { 2, ents };
         ROUNDTRIP(oc_encode_channel_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_CHANNEL_LIST, h, p);
@@ -487,8 +492,10 @@ static void test_admin_frames(void) {
     }
     {
         oc_user_list_entry ents[2] = {
-            { 1, OC_ROLE_OWNER,  0, oc_slice_str("a@x.io"), oc_slice_str("Alice") },
-            { 2, OC_ROLE_MEMBER, 1, oc_slice_str(""),       oc_slice_str("Bob") },
+            { .user_id = 1, .role = OC_ROLE_OWNER,  .disabled = 0,
+              .email = oc_slice_str("a@x.io"), .display_name = oc_slice_str("Alice") },
+            { .user_id = 2, .role = OC_ROLE_MEMBER, .disabled = 1,
+              .email = oc_slice_str(""),       .display_name = oc_slice_str("Bob") },
         };
         oc_user_list in = { 2, ents };
         ROUNDTRIP(oc_encode_user_list(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_USER_LIST, h, p);
@@ -626,7 +633,7 @@ static void test_admin_frames(void) {
 
 static void test_search_frames(void) {
     {
-        oc_search in = { oc_slice_str("deploy pipeline"), 25 };
+        oc_search in = { .query = oc_slice_str("deploy pipeline"), .limit = 25 };
         ROUNDTRIP(oc_encode_search(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SEARCH, h, p);
         oc_search out;
         CHECK(oc_decode_search(&p, &out) == OC_OK);
@@ -822,7 +829,10 @@ static void test_notify_frames(void) {
         CHECK(oc_decode_set_notify_default(&p, &out) == OC_OK && out.level == OC_NOTIFY_NONE);
     }
     {
-        oc_notify_pref_entry ents[2] = { { 7, OC_NOTIFY_MENTIONS }, { 9, OC_NOTIFY_NONE } };
+        oc_notify_pref_entry ents[2] = {
+            { .channel_id = 7, .level = OC_NOTIFY_MENTIONS },
+            { .channel_id = 9, .level = OC_NOTIFY_NONE },
+        };
         oc_notify_prefs in;
         in.notify_default = OC_NOTIFY_MENTIONS;   /* REQ-134 */
         in.count = 2; in.entries = ents;

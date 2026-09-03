@@ -1153,14 +1153,24 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
         f[nf++] = buf;
         for (char *q = buf; *q && nf < 8; q++)
             if (*q == '\x1f') { *q = '\0'; f[nf++] = q + 1; }
-        if (f[0][0]) snprintf(mem->name, sizeof mem->name, "%s", f[0]);
-        snprintf(mem->status_emoji, sizeof mem->status_emoji, "%s", f[1]);
-        snprintf(mem->status_text,  sizeof mem->status_text,  "%s", f[2]);
-        snprintf(mem->title,        sizeof mem->title,        "%s", f[3]);
-        snprintf(mem->timezone,     sizeof mem->timezone,     "%s", f[4]);
-        snprintf(mem->full_name,    sizeof mem->full_name,    "%s", f[5]);
-        snprintf(mem->pronouns,     sizeof mem->pronouns,     "%s", f[6]);
-        snprintf(mem->phone,        sizeof mem->phone,        "%s", f[7]);
+        /* Each field is a bounded copy out of the 768-byte split buffer above,
+         * so the precision states the destination's own bound rather than
+         * leaving a compiler to work out that a pointer into `buf` could carry
+         * 767 bytes into a 64-byte field. It is the same fact snprintf already
+         * enforces, said where a reader and a compiler can both see it -- and
+         * which of the two notices depends on the compiler's version, which is
+         * not a thing worth having an opinion vary on. */
+#define FOLD_FIELD(dst, src) \
+        snprintf((dst), sizeof (dst), "%.*s", (int)(sizeof (dst) - 1), (src))
+        if (f[0][0]) FOLD_FIELD(mem->name, f[0]);
+        FOLD_FIELD(mem->status_emoji, f[1]);
+        FOLD_FIELD(mem->status_text,  f[2]);
+        FOLD_FIELD(mem->title,        f[3]);
+        FOLD_FIELD(mem->timezone,     f[4]);
+        FOLD_FIELD(mem->full_name,    f[5]);
+        FOLD_FIELD(mem->pronouns,     f[6]);
+        FOLD_FIELD(mem->phone,        f[7]);
+#undef FOLD_FIELD
         mem->status_expires = e->server_time;
         mem->avatar_id      = e->message_id;
         if (e->op) mem->role = e->op;
