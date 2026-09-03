@@ -430,7 +430,11 @@ static int uf_header(const char *h, size_t n, const char *name, char *out, size_
     return 0;
 }
 
-typedef struct oc_unfurler {
+/* The header already does `typedef struct oc_unfurler oc_unfurler;` so callers
+ * can hold an opaque pointer; this only defines the struct. Repeating the
+ * typedef here is a C11 feature and C99 does not allow it -- gcc accepts it
+ * silently, clang does not, and the release builds with `zig cc`. */
+struct oc_unfurler {
     oc_dbwriter    *dbw;
     oc_tls_client   tls;
     int             tls_ok;
@@ -442,7 +446,7 @@ typedef struct oc_unfurler {
     int             stop;
     int             depth;
     struct uf_job { struct uf_job *next; uint64_t channel_id, message_id; char *url; } *head, *tail;
-} oc_unfurler;
+};
 
 /* GET one URL, following up to UF_MAX_REDIRECTS, each hop re-gated. On success
  * the response body (headers stripped) is in *out, heap, *out_len set. */
