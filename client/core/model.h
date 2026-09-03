@@ -698,6 +698,32 @@ int oc_model_keyword_hit(const oc_model *m, const char *body, size_t len,
                          size_t *span_start, size_t *span_len);
 /* Is `user_id` one of my priority people? */
 int oc_model_is_priority(const oc_model *m, uint64_t user_id);
+
+/* Which of a channel's NEW messages should interrupt me, if any?
+ *
+ * The client half of the one notify decision (ARCH-89, ARCH-103). It walks
+ * every message newer than `since_id` — the channel's previous high-water mark
+ * — computes each one's inputs with the scanners the daemon resolved with
+ * (REQ-221), and asks oc_notify_decide, the same function the daemon's push
+ * query asks. Returns the NEWEST message that notifies, or NULL if none does.
+ *
+ * It walks the batch rather than sampling the newest message because this runs
+ * on a timer: everything that arrived between two ticks is present at once, so
+ * a mention followed by an ordinary message would otherwise go unannounced, and
+ * the toast would name whoever spoke last rather than whoever needed you.
+ * Deleted messages are skipped — the tombstone stays in the model for the
+ * reader, but there is no body to preview and nothing left to interrupt for —
+ * and so are your own.
+ *
+ * `mentioned`, `keyword_hit` and `vip` (each optional) come back as the OR
+ * across every message that notified, not just the returned one: they drive the
+ * sound and the taskbar flash, which ask "did any of this name me?".
+ *
+ * `quiet` and `paused` are the caller's, because they belong to the WORKSPACE
+ * rather than the channel and a client may hold several at once. */
+const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
+                                   uint64_t since_id, int quiet, int paused,
+                                   int *mentioned, int *keyword_hit, int *vip);
 /* Record a presence value (used for our own presence, which the server does not
  * echo back to us). */
 void oc_model_note_presence(oc_model *m, uint64_t user_id, uint8_t status);
