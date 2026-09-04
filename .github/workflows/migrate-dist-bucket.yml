@@ -1,0 +1,84 @@
+# One-time bucket migration (see the issue this closes).
+#
+# The release workflow wrote to a bucket in the `personal` Fly organisation
+# while the control plane, which is what serves openchime.io/dist, reads a
+# bucket in the `openchime` org. A Tigris key is org-scoped, so no credential
+# could span the two and the published repositories were unreachable.
+#
+# This copies the tree into the bucket both sides will use from now on. It runs
+# HERE, and only here, because this is the one place both keypairs already
+# exist: the old one has never been readable outside this repository's secrets
+# and does not need to be. Nothing is printed and nothing is deleted -- the
+# source bucket is left exactly as it was, so a failed copy costs a re-run.
+#
+# Delete this file once the migration has run.
+name: migrate-dist-bucket
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  copy:
+    name: copy the repository tree to the new bucket
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      SRC_BUCKET: ${{ vars.DIST_BUCKET }}
+      DST_BUCKET: openchime-packages
+      ENDPOINT: ${{ vars.DIST_S3_ENDPOINT }}
+      SRC_KEY: ${{ secrets.DIST_S3_ACCESS_KEY }}
+      SRC_SECRET: ${{ secrets.DIST_S3_SECRET_KEY }}
+      DST_KEY: ${{ secrets.DIST_S3_ACCESS_KEY_NEW }}
+      DST_SECRET: ${{ secrets.DIST_S3_SECRET_KEY_NEW }}
+    steps:
+      - name: Install rclone
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+
+      - name: Configure both remotes
+        run: |
+          set -euo pipefail
+          for v in SRC_BUCKET DST_BUCKET ENDPOINT SRC_KEY SRC_SECRET DST_KEY DST_SECRET; do
+            [ -n "${!v}" ] || { echo "::error::$v is not set"; exit 1; }
+          done
+          mkdir -p ~/.config/rclone
+          # provider = Other for the same reason the release workflow uses it:
+          # rclone has no Tigris profile and the generic S3 path is documented.
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [src]
+          type = s3
+          provider = Other
+          access_key_id = ${SRC_KEY}
+          secret_access_key = ${SRC_SECRET}
+          endpoint = ${ENDPOINT}
+          region = auto
+
+          [dst]
+          type = s3
+          provider = Other
+          access_key_id = ${DST_KEY}
+          secret_access_key = ${DST_SECRET}
+          endpoint = ${ENDPOINT}
+          region = auto
+          EOF
+
+      - name: Copy
+        run: |
+          set -euo pipefail
+          echo "source tree:"
+          rclone ls "src:${SRC_BUCKET}" | head -40
+          echo "objects: $(rclone ls "src:${SRC_BUCKET}" | wc -l)"
+          rclone copy "src:${SRC_BUCKET}" "dst:${DST_BUCKET}" --fast-list --transfers 8
+
+      - name: Verify the two agree
+        run: |
+          set -euo pipefail
+          # check, not just a count: a repository whose index and packages
+          # disagree is worse than one that is absent.
+          rclone check "src:${SRC_BUCKET}" "dst:${DST_BUCKET}" --one-way --fast-list
+          echo "destination now holds $(rclone ls "dst:${DST_BUCKET}" | wc -l) objects"
