@@ -1043,10 +1043,20 @@ jobs:
           # so every existing installation's `apt-get update` saw a repository
           # containing one version. The old objects survive; the index naming them
           # does not.
-          if rclone lsjson "dist:${DIST_BUCKET}/rpm" >/dev/null 2>&1; then
+          # COUNTED, not probed -- the same correction the apt step carries, and
+          # for the same reason: `rclone lsjson` exits 0 on a prefix that does
+          # not exist, reporting an empty listing rather than an error. Testing
+          # its exit status called every bucket "existing", so the guard below
+          # refused a genuinely first publish. Fixing one of the two copies and
+          # not the other is how the rpm half stayed broken after the apt half
+          # was proved working.
+          existing=$( { rclone ls "dist:${DIST_BUCKET}/rpm" 2>/dev/null || true; } | wc -l )
+          if [ "$existing" -gt 0 ]; then
+            had_prefix=1
             rclone copy "dist:${DIST_BUCKET}/rpm" repo/rpm --fast-list
           else
-            echo "::notice::no existing rpm prefix in ${DIST_BUCKET}; treating as first publish"
+            had_prefix=0
+            echo "::notice::no existing rpm objects in ${DIST_BUCKET}; treating as first publish"
           fi
 
           # lsjson proves the prefix is reachable, not that the copy completed, so
@@ -1064,7 +1074,12 @@ jobs:
           # step died in under a second with no output at all -- the same shape as
           # the dead error path in winget/render.sh, reintroduced here.
           prior=$( { git tag -l 'release-*' | grep -vx "release-${VERSION}" || true; } | wc -l )
-          if [ "$pool_count" -eq 0 ] && [ "$prior" -gt 0 ]; then
+          # `had_prefix` separates the two ways to reach an empty pool. A prefix
+          # that EXISTS and yields no .rpm means the copy above did not complete,
+          # and an index published from it delists every prior release -- the case
+          # this guard was built for. No objects at all is a bucket nothing has
+          # published into, which the branch above already announces.
+          if [ "$had_prefix" = 1 ] && [ "$pool_count" -eq 0 ] && [ "$prior" -gt 0 ]; then
             echo "::error::rpm pool is empty but ${prior} release tag(s) exist -- refusing to publish an index that would delist them"
             exit 1
           fi
