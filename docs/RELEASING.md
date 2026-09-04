@@ -155,19 +155,17 @@ configured from four values:
 | `DIST_S3_ENDPOINT` | variable | `https://fly.storage.tigris.dev` |
 | `DIST_BUCKET` | variable | `openchime-dist-prod` |
 
-**The control plane holds the same keypair, and that is a known gap.** It serves
-the bucket at `openchime.io/dist` by reading it, and the pair it reads with --
-`DIST_ACCESSKEY`/`DIST_SECRETKEY` in that repository -- is byte-identical to the
-one here. Both came from the single `flyctl storage create` that provisioned the
-bucket, so the credential on a public anonymous read path can also write to the
-repository operators trust by GPG key. That is the wrong posture and it is
-tracked; the control plane's own `docs/SECURITY.md` claims a separate read-only
-pair, which is not true today.
+**The control plane holds a different key, and a read-only one.** It serves the
+bucket at `openchime.io/dist` by reading it, with a pair scoped by IAM policy to
+`s3:GetObject` and `s3:ListBucket` on this bucket alone -- verified by what it
+cannot do: a `PutObject` returns `403`, as does a read of any other bucket in the
+organisation. The pair here is the write half and is not shared with it.
 
-Splitting it needs a read-only key scoped to this bucket, which is a Tigris
-dashboard operation: `flyctl storage` has no key management -- create, list,
-status, update, destroy, and nothing else -- and `create` refuses a bucket that
-already exists.
+That key is issued through Tigris's IAM-compatible API at `iam.storage.dev`
+(`CreateAccessKey`, `CreatePolicy`, `AttachUserPolicy`), not through the console.
+`flyctl storage` has no key management -- create, list, status, update, destroy,
+and nothing else -- and `create` refuses a bucket that already exists, which is
+what makes the IAM API the only scriptable route.
 
 **Both sides sit in the `openchime` Fly organisation**, and must. A Tigris key is
 scoped to the organisation that owns the bucket, so a key issued elsewhere is
@@ -175,11 +173,6 @@ refused with `403 AccessDenied`. Note what that does *not* mean: the caller's ow
 organisation is irrelevant, and this workflow proves it every release by writing
 here from a GitHub-hosted runner that belongs to no Fly organisation at all.
 Authorization follows the key, never the caller.
-
-**`openchime-dist` is a cold archive, not the live bucket.** It sits in the
-`personal` organisation and holds releases 1-8, published before the move. The
-live pool starts at release 9. Nothing reads it, nothing writes to it, and it is
-kept deliberately rather than destroyed -- those packages exist nowhere else.
 
 **The keys cannot be read back** from GitHub or Fly, and `destroy && create`
 would throw the repositories away. Rotation is a dashboard operation.
