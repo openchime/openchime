@@ -155,11 +155,26 @@ configured from four values:
 | `DIST_S3_ENDPOINT` | variable | `https://fly.storage.tigris.dev` |
 | `DIST_BUCKET` | variable | `openchime-dist` |
 
-**The control plane shares this keypair.** It only reads — it serves the bucket
-at `openchime.io/dist` — but it holds write credentials, and neither side can be
-revoked without breaking the other. Splitting them needs a read-only key from the
-Tigris dashboard; `flyctl storage` has no key management (create, list, status,
-update, destroy, and nothing else).
+**The control plane does not share this keypair, and cannot use it as it
+stands.** It serves the bucket at `openchime.io/dist` with a key of its own,
+held as `DIST_ACCESSKEY`/`DIST_SECRETKEY` in that repository — a separate pair,
+which is what its `docs/SECURITY.md` §9 has always claimed. An earlier version of
+this paragraph said they were shared; they never were.
+
+The live problem is the opposite one. A Tigris key is scoped to the Fly
+organisation that owns the bucket: this bucket lives in `personal`, the control
+plane's key was issued in `openchime`, and a signed request with it comes back
+`403 AccessDenied`. Note what that does *not* mean — the caller's own
+organisation is irrelevant, and this workflow proves it every release by writing
+here from a GitHub-hosted runner that belongs to no Fly organisation at all.
+Authorization follows the key, never the caller.
+
+So the control plane needs a key issued in `personal` against this bucket, and
+it should be **read-only**: it serves an anonymous public path and must never be
+able to write to a repository operators trust by GPG key. That is a Tigris
+dashboard operation — `flyctl storage` has no key management (create, list,
+status, update, destroy, and nothing else) and refuses to issue keys for a
+bucket that already exists.
 
 **The keys cannot be read back** from GitHub or Fly, and `destroy && create`
 would throw the repositories away. Rotation is a dashboard operation.
