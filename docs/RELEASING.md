@@ -175,7 +175,12 @@ here from a GitHub-hosted runner that belongs to no Fly organisation at all.
 Authorization follows the key, never the caller.
 
 **The keys cannot be read back** from GitHub or Fly, and `destroy && create`
-would throw the repositories away. Rotation is a dashboard operation.
+would throw the repositories away. Rotation goes through Tigris's IAM API
+instead: `CreateAccessKey` for the replacement, set it in both places, then
+`DeleteAccessKey` on the old one. Two undocumented details, learned by doing it
+-- a new key starts with **no** permissions rather than inheriting any, and
+`AttachUserPolicy` takes the access key **ID** as its `UserName`, not the
+friendly name, which otherwise fails with `Access key not found`.
 
 ## The archive signing key
 
