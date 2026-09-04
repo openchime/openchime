@@ -960,8 +960,10 @@ jobs:
           # containing one version. The old objects survive; the index naming them
           # does not.
           if rclone lsjson "dist:${DIST_BUCKET}/apt" >/dev/null 2>&1; then
+            had_prefix=1
             rclone copy "dist:${DIST_BUCKET}/apt" repo/apt --fast-list
           else
+            had_prefix=0
             echo "::notice::no existing apt prefix in ${DIST_BUCKET}; treating as first publish"
           fi
 
@@ -980,7 +982,15 @@ jobs:
           # step died in under a second with no output at all -- the same shape as
           # the dead error path in winget/render.sh, reintroduced here.
           prior=$( { git tag -l 'release-*' | grep -vx "release-${VERSION}" || true; } | wc -l )
-          if [ "$pool_count" -eq 0 ] && [ "$prior" -gt 0 ]; then
+          # `had_prefix` is what separates the two ways to arrive at an empty pool,
+          # and only one of them is a fault. A prefix that EXISTS and yields no
+          # .deb means the copy above silently did not complete -- publishing then
+          # writes an index that delists every prior release, which is the case
+          # this guard was built for. No prefix at all means a bucket nothing has
+          # published into yet, which the branch above already recognises and
+          # announces as a first publish; refusing it made the guard contradict
+          # that notice and made moving to a new bucket impossible.
+          if [ "$had_prefix" = 1 ] && [ "$pool_count" -eq 0 ] && [ "$prior" -gt 0 ]; then
             echo "::error::apt pool is empty but ${prior} release tag(s) exist -- refusing to publish an index that would delist them"
             exit 1
           fi
