@@ -19,7 +19,7 @@ permissions:
 jobs:
   copy:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       SRC_BUCKET: ${{ vars.DIST_BUCKET }}
       DST_BUCKET: openchime-dist-prod
@@ -61,7 +61,9 @@ jobs:
           # Listed to a file: `rclone ls | head` dies of SIGPIPE under pipefail.
           rclone ls "src:${SRC_BUCKET}" > /tmp/src.txt
           echo "source objects: $(wc -l < /tmp/src.txt)"
-          rclone copy "src:${SRC_BUCKET}" "dst:${DST_BUCKET}" --fast-list --transfers 8
-          rclone check "src:${SRC_BUCKET}" "dst:${DST_BUCKET}" --one-way --fast-list
+          rclone copy "src:${SRC_BUCKET}" "dst:${DST_BUCKET}" \
+            --transfers 4 --checkers 4 -v --stats 20s --stats-one-line \
+            --contimeout 30s --timeout 120s --low-level-retries 3 --retries 2
+          rclone check "src:${SRC_BUCKET}" "dst:${DST_BUCKET}" --one-way
           rclone ls "dst:${DST_BUCKET}" > /tmp/dst.txt
           echo "destination objects: $(wc -l < /tmp/dst.txt)"
