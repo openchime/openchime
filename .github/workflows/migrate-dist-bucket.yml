@@ -70,9 +70,12 @@ jobs:
       - name: Copy
         run: |
           set -euo pipefail
-          echo "source tree:"
-          rclone ls "src:${SRC_BUCKET}" | head -40
-          echo "objects: $(rclone ls "src:${SRC_BUCKET}" | wc -l)"
+          # Listed into a file first: `rclone ls | head` closes the pipe and
+          # rclone dies of SIGPIPE, which under `pipefail` fails the job with
+          # 141 for a reason that has nothing to do with the copy.
+          rclone ls "src:${SRC_BUCKET}" > /tmp/src.txt
+          echo "source objects: $(wc -l < /tmp/src.txt)"
+          head -40 /tmp/src.txt
           rclone copy "src:${SRC_BUCKET}" "dst:${DST_BUCKET}" --fast-list --transfers 8
 
       - name: Verify the two agree
