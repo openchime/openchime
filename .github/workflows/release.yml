@@ -1409,11 +1409,39 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openchimed
           openchimed --version
 
+      # The dnf half, and it is not decoration. The apt check above proved one of
+      # the two channels and the .rpm went out with nothing having attempted to
+      # install it -- the gap OC issue 142 records, left when the rockylinux:9
+      # container step went with the project's Docker usage.
+      #
+      # podman, not docker: this pipeline is daemon-free by standing constraint,
+      # which is why the image is built with buildah rather than a daemon. podman
+      # is that same family and needs no daemon either, so the rule is kept
+      # rather than bent. rockylinux:9 is the floor the glibc 2.34 target exists
+      # to support, so this also exercises the oldest supported RHEL.
+      #
+      # The whole point is to consume the repository the way an operator does:
+      # over HTTPS from DIST_BASE_URL, with the published key and the published
+      # .repo file, on a machine that has never seen this project.
+      - name: Smoke the published dnf repository
+        if: ${{ !inputs.skip_repo_smoke }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends podman
+          podman run --rm rockylinux:9 bash -euo pipefail -c "
+            curl -fsSL '${DIST_BASE_URL}/openchime-archive-keyring.asc' -o /tmp/oc.asc
+            rpm --import /tmp/oc.asc
+            curl -fsSL '${DIST_BASE_URL}/openchime.repo' -o /etc/yum.repos.d/openchime.repo
+            dnf install -y openchimed
+            openchimed --version
+          "
+
       - name: Note the skipped smoke test
         if: ${{ inputs.skip_repo_smoke }}
         run: |
           echo "::warning::published-repository smoke test SKIPPED by request -- "\
-            "nothing has verified that the apt repository installs"
+            "nothing has verified that the apt or dnf repositories install"
           echo '> :warning: The published-repository smoke test was skipped.' >> "$GITHUB_STEP_SUMMARY"
 
 

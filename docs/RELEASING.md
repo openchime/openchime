@@ -153,28 +153,33 @@ configured from four values:
 | `DIST_S3_ACCESS_KEY` | secret | |
 | `DIST_S3_SECRET_KEY` | secret | |
 | `DIST_S3_ENDPOINT` | variable | `https://fly.storage.tigris.dev` |
-| `DIST_BUCKET` | variable | `openchime-dist` |
+| `DIST_BUCKET` | variable | `openchime-dist-prod` |
 
-**The control plane does not share this keypair, and cannot use it as it
-stands.** It serves the bucket at `openchime.io/dist` with a key of its own,
-held as `DIST_ACCESSKEY`/`DIST_SECRETKEY` in that repository — a separate pair,
-which is what its `docs/SECURITY.md` §9 has always claimed. An earlier version of
-this paragraph said they were shared; they never were.
+**The control plane holds the same keypair, and that is a known gap.** It serves
+the bucket at `openchime.io/dist` by reading it, and the pair it reads with --
+`DIST_ACCESSKEY`/`DIST_SECRETKEY` in that repository -- is byte-identical to the
+one here. Both came from the single `flyctl storage create` that provisioned the
+bucket, so the credential on a public anonymous read path can also write to the
+repository operators trust by GPG key. That is the wrong posture and it is
+tracked; the control plane's own `docs/SECURITY.md` claims a separate read-only
+pair, which is not true today.
 
-The live problem is the opposite one. A Tigris key is scoped to the Fly
-organisation that owns the bucket: this bucket lives in `personal`, the control
-plane's key was issued in `openchime`, and a signed request with it comes back
-`403 AccessDenied`. Note what that does *not* mean — the caller's own
+Splitting it needs a read-only key scoped to this bucket, which is a Tigris
+dashboard operation: `flyctl storage` has no key management -- create, list,
+status, update, destroy, and nothing else -- and `create` refuses a bucket that
+already exists.
+
+**Both sides sit in the `openchime` Fly organisation**, and must. A Tigris key is
+scoped to the organisation that owns the bucket, so a key issued elsewhere is
+refused with `403 AccessDenied`. Note what that does *not* mean: the caller's own
 organisation is irrelevant, and this workflow proves it every release by writing
 here from a GitHub-hosted runner that belongs to no Fly organisation at all.
 Authorization follows the key, never the caller.
 
-So the control plane needs a key issued in `personal` against this bucket, and
-it should be **read-only**: it serves an anonymous public path and must never be
-able to write to a repository operators trust by GPG key. That is a Tigris
-dashboard operation — `flyctl storage` has no key management (create, list,
-status, update, destroy, and nothing else) and refuses to issue keys for a
-bucket that already exists.
+**`openchime-dist` is a cold archive, not the live bucket.** It sits in the
+`personal` organisation and holds releases 1-8, published before the move. The
+live pool starts at release 9. Nothing reads it, nothing writes to it, and it is
+kept deliberately rather than destroyed -- those packages exist nowhere else.
 
 **The keys cannot be read back** from GitHub or Fly, and `destroy && create`
 would throw the repositories away. Rotation is a dashboard operation.
