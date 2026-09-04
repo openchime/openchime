@@ -959,12 +959,17 @@ jobs:
           # so every existing installation's `apt-get update` saw a repository
           # containing one version. The old objects survive; the index naming them
           # does not.
-          if rclone lsjson "dist:${DIST_BUCKET}/apt" >/dev/null 2>&1; then
+          # COUNTED, not probed. `rclone lsjson` exits 0 on a prefix that does not
+          # exist -- it reports an empty listing rather than an error -- so testing
+          # its exit status called every bucket "existing" and the guard below then
+          # refused a genuinely first publish.
+          existing=$( { rclone ls "dist:${DIST_BUCKET}/apt" 2>/dev/null || true; } | wc -l )
+          if [ "$existing" -gt 0 ]; then
             had_prefix=1
             rclone copy "dist:${DIST_BUCKET}/apt" repo/apt --fast-list
           else
             had_prefix=0
-            echo "::notice::no existing apt prefix in ${DIST_BUCKET}; treating as first publish"
+            echo "::notice::no existing apt objects in ${DIST_BUCKET}; treating as first publish"
           fi
 
           # lsjson proves the prefix is reachable, not that the copy completed, so
