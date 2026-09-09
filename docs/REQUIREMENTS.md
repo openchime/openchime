@@ -1978,6 +1978,19 @@ REQ-269, whose accessibility half is a real open decision.*
   light, dark, and follow-system — applied in-app. The TUI ships a 256-color theme
   (ARCH-83); the GUIs honor the OS dark-mode signal (ARCH-80). **[needs ARCH
   decision — theme model + whether the preference is client-local or synced.]**
+
+  **A theme's ink has cleared 3:1 against the surface it is drawn on**, which is
+  what WCAG asks of non-text UI and the floor below which an element is not dim
+  but absent. The guarantee has belonged to the *pair*, not the colour: an ink is
+  asked for together with the surface beneath it and answered with the next
+  stronger one where the pair would not clear, so the faint tier survives where
+  it reads and is abandoned only where it never did. Palette-wide and asserted
+  from the palette rather than from a screenshot — every ink against every
+  surface, in both modes and all four colour schemes — because a check that
+  grades captured frames can only fail on a pixel something actually painted, and
+  both defects that prompted this were invisible to one: no scene left a draft,
+  so the marker was never drawn, and the selected-row fill is derived per scheme
+  so seven of its eight values were never rendered at all.
 - **REQ-263.** Every client has presented a **transient error/toast and
   connection-status surface** — a visible, non-blocking channel for failures
   (failed send, rate-limit REQ-190, bad login, storage pressure REQ-214) and for

@@ -29,6 +29,19 @@ people	view people	view	9
 # --- a conversation, in the states a conversation has ----------------------
 convo-empty	view home;channel releases	view	0
 convo-typed	view home;channel general;type Ready to send	view	0
+# A conversation left with unsent text, so the SIDEBAR carries a draft marker.
+# Switching channels is what writes the draft (select_channel flushes the one you
+# are leaving), so the second `channel` verb is the point of this scene, not
+# navigation. Without it no scene in this file ever draws the pencil, and the
+# contrast check passed for years while the marker sat at 2.03:1 on a selected
+# row -- an empirical check cannot fail on a pixel nothing painted.
+#
+# It comes BACK to the drafted channel deliberately. Leaving writes the draft;
+# returning is what puts the marker on a SELECTED row, which is the pair that was
+# worst in the app (2.03:1 under Midnight, 1.58:1 under Teal). A scene that
+# stopped after the switch would draw the pencil on a resting row, which was
+# never the broken case.
+convo-draft	view home;channel general;type Unsent text;channel releases;channel general	view	0
 # --- modals ----------------------------------------------------------------
 prefs-appearance	view home;prefs 0	modal	prefs
 prefs-messages	view home;prefs 1	modal	prefs

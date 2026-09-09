@@ -4,10 +4,18 @@
 
 #include "theme.h"
 
-#ifndef WIN32_LEAN_AND_MEAN
-#  define WIN32_LEAN_AND_MEAN
+#include <math.h>
+
+/* Windows only for the one registry read below. Everything else here is colour
+ * arithmetic, and it is compiled into the test binary on Linux so the contrast
+ * guarantee can be asserted by `make test` rather than only by an audit somebody
+ * remembers to run on a Windows box. */
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
 #endif
-#include <windows.h>
 
 /* Dark: a deep-blue accent on a dark neutral shell, with real elevation steps
  * (darkest rail -> lightest canvas) so the panes read as distinct layers. */
@@ -96,6 +104,12 @@ static uint32_t mix(uint32_t a, uint32_t b, float t) {
 
 /* The user's app theme, from the same registry value the shell reads. Anything
  * unreadable means dark: this app was designed dark, so that is the safe miss. */
+#ifndef _WIN32
+/* Off Windows there is no shell preference to read. Dark is the documented safe
+ * miss, and the tests drive LIGHT and DARK explicitly rather than through
+ * SYSTEM, so this never decides anything they assert. */
+static int system_prefers_light(void) { return 0; }
+#else
 static int system_prefers_light(void) {
     HKEY k;
     DWORD v = 0, sz = sizeof v, type = 0;
@@ -106,6 +120,78 @@ static int system_prefers_light(void) {
     LONG rc = RegQueryValueExW(k, L"AppsUseLightTheme", NULL, &type, (LPBYTE)&v, &sz);
     RegCloseKey(k);
     return (rc == ERROR_SUCCESS && type == REG_DWORD && v == 1);
+}
+#endif  /* _WIN32 */
+
+/* --- the contrast guarantee (REQ-262) --------------------------------------
+ *
+ * An ink token is legible on some surfaces and not others, and until this
+ * existed nothing said which. FAINT reads well enough on the canvas and the
+ * sidebar and falls apart on everything a row or a field is filled with: the
+ * composer cue sat at 2.73:1 on the input, the draft pencil at 2.03:1 on a
+ * selected row under the default scheme and 1.58:1 under Teal. WCAG asks 3:1 of
+ * non-text UI and more of text; below 3:1 is not dim, it is gone.
+ *
+ * The rule is a PAIR, so it is asked as a pair. oc_ink_on(ink, surface) returns
+ * the ink if it clears the floor there and the next-stronger one if it does not,
+ * which keeps the two-step hierarchy exactly where the hierarchy is legible and
+ * abandons it only where it was never readable. That is why this is not a
+ * retuned FAINT: to clear the worst surface a single colour would have to move
+ * so far it became MUTED, and the palette would keep two names for one colour.
+ *
+ * Resolved once per theme apply rather than per paint. TH_SELECT is derived from
+ * the scheme, so there are eight of it and none of them are constants — a table
+ * computed after the derivation covers every scheme without naming any. */
+
+static float srgb_ch(unsigned v) {
+    float c = (float)v / 255.0f;
+    return c <= 0.03928f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+}
+
+float oc_theme_luminance(uint32_t rgb) {
+    return 0.2126f * srgb_ch((rgb >> 16) & 0xFF) +
+           0.7152f * srgb_ch((rgb >>  8) & 0xFF) +
+           0.0722f * srgb_ch(rgb & 0xFF);
+}
+
+float oc_theme_contrast(uint32_t a, uint32_t b) {
+    float la = oc_theme_luminance(a), lb = oc_theme_luminance(b);
+    if (la < lb) { float t = la; la = lb; lb = t; }
+    return (la + 0.05f) / (lb + 0.05f);
+}
+
+/* The escalation order, weakest first. Asking for a rung returns that rung or a
+ * later one, never an earlier: an ink may be strengthened to stay legible, never
+ * weakened to stay pretty. */
+static const int INK_LADDER[] = { TH_FAINT, TH_MUTED, TH_TEXT };
+#define INK_LADDER_N ((int)(sizeof INK_LADDER / sizeof INK_LADDER[0]))
+
+/* [ink rung][surface token] -> the token to actually use. */
+static uint8_t g_ink_on[INK_LADDER_N][TH_COUNT];
+
+static void resolve_ink_table(void) {
+    for (int r = 0; r < INK_LADDER_N; r++) {
+        for (int s = 0; s < TH_COUNT; s++) {
+            int chosen = INK_LADDER[r];
+            for (int k = r; k < INK_LADDER_N; k++) {
+                chosen = INK_LADDER[k];
+                if (oc_theme_contrast(oc_theme[chosen], oc_theme[s]) >= OC_CONTRAST_FLOOR)
+                    break;
+            }
+            /* Falling out of that loop without clearing leaves the strongest
+             * rung, which is the most legible thing the palette has. A surface
+             * that TEXT cannot clear is a broken surface, and the test says so
+             * rather than this silently papering over it. */
+            g_ink_on[r][s] = (uint8_t)chosen;
+        }
+    }
+}
+
+uint32_t oc_ink_on(int ink, int surface) {
+    if (surface < 0 || surface >= TH_COUNT) return oc_theme[ink];
+    for (int r = 0; r < INK_LADDER_N; r++)
+        if (INK_LADDER[r] == ink) return oc_theme[g_ink_on[r][surface]];
+    return oc_theme[ink];      /* not a laddered ink: DANGER, ONLINE and friends */
 }
 
 void oc_theme_apply(int mode) {
@@ -126,6 +212,9 @@ void oc_theme_apply(int mode) {
      * scheme looked like a bug rather than a neutral, and it is the second most
      * prominent coloured surface after the rail. */
     oc_theme[TH_SELECT] = mix(oc_theme[TH_ACCENT], oc_theme[TH_SIDEBAR], light ? 0.22f : 0.34f);
+    /* Last, because it reads every colour above it — including the SELECT that
+     * was just derived. */
+    resolve_ink_table();
 }
 
 void oc_theme_set_scheme(int scheme) {
