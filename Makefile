@@ -154,9 +154,15 @@ check-refs:
 test: check-opcodes check-refs $(TEST_BIN)
 	./$(TEST_BIN)
 
-$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(SDLTEXT_COMMON) $(HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h) $(MBEDTLS_A) | build
-	$(CC) $(CFLAGS) -O0 -g $(INC) $(CORE_INC) -Itests \
-	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(SDLTEXT_COMMON) $(MBEDTLS_LIBS) -lsqlite3 -lresolv -lpthread -o $@
+# theme.c is GUI source and is compiled in anyway: it is colour arithmetic with
+# one Windows call behind an #ifdef, and the contrast guarantee it carries has to
+# be asserted somewhere that RUNS. The audit that would otherwise check it needs
+# a Windows host and a developer who remembers; this needs neither.
+THEME_SRC := client/gui/win32/theme.c
+
+$(TEST_BIN): $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(HDRS) $(wildcard tests/*.h client/core/*.h sdltext/*.h client/gui/win32/theme.h) $(MBEDTLS_A) | build
+	$(CC) $(CFLAGS) -O0 -g $(INC) $(CORE_INC) -Itests -Iclient/gui/win32 \
+	    $(TEST_SRC) $(APP_SRC) $(CORE_SRC) $(SDLTEXT_COMMON) $(THEME_SRC) $(MBEDTLS_LIBS) -lsqlite3 -lresolv -lpthread -lm -o $@
 
 # There is no `integration` target any more. It ran Scripts/test-integration.sh,
 # which drove the daemon through a Docker Compose stack; the project no longer

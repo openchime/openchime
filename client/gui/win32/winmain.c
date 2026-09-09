@@ -3874,11 +3874,19 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
             const oc_channel *rc = oc_model_channel((oc_model *)m, r->channel_id);
             int muted = rc && rc->muted;
             int unread = (r->unread > 0) && !muted;
-            if (selected) fill_round(rt, rf(sx0, ry + 2, sx1, ry + ROW_H - 2), OC_R_CONTROL, OC_COL_SELECT);
-            /* Hover, the cue the shelf rows two inches up already give. Never on
-             * the selected row — SELECT already owns it. */
-            else if (g_sb_hover_cid && r->channel_id == g_sb_hover_cid)
-                fill_round(rt, rf(sx0, ry + 2, sx1, ry + ROW_H - 2), OC_R_CONTROL, OC_COL_HOVER);
+            /* Which fill this row has, decided ONCE and then both painted and
+             * asked about. The faint inks below sit on whichever it is, and
+             * FAINT clears 3:1 on the sidebar and on neither of the other two —
+             * so a row's ink cannot be chosen without knowing its surface, and
+             * a second place deciding it is a second place to get it wrong.
+             * Hover is the cue the shelf rows two inches up already give; never
+             * on the selected row, because SELECT already owns it. */
+            int row_surface = selected ? TH_SELECT
+                            : (g_sb_hover_cid && r->channel_id == g_sb_hover_cid) ? TH_HOVER
+                            : TH_SIDEBAR;
+            if (row_surface != TH_SIDEBAR)
+                fill_round(rt, rf(sx0, ry + 2, sx1, ry + ROW_H - 2), OC_R_CONTROL,
+                           oc_theme[row_surface]);
             /* Ask what the ROW IS, not where it happens to be filed. Starring a DM
              * moves it into Starred, and this test used to be
              * `section == OC_SB_DMS` — so a starred person rendered with the channel
@@ -3908,16 +3916,20 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                 draw_user_avatar(rt, m, r->peer_id, r->label, av, g_meta, 1, 5.0f);
                 draw_avatar_presence(rt, av, OC_R_AVATAR_SM,
                                      oc_model_presence_of(m, r->peer_id),
-                                     selected ? OC_COL_SELECT : OC_COL_SIDEBAR,
+                                     oc_theme[row_surface],
                                      oc_model_dnd_of(m, r->peer_id));
                 }
             } else {
                 const char *mark = r->is_private ? "\xF0\x9F\x94\x92" : "#";
                 draw_text(rt, mark, g_ui, rf(sx0 + 12, ry, sx0 + 34, ry + ROW_H),
-                          selected ? OC_COL_TEXT : OC_COL_FAINT);
+                          selected ? OC_COL_TEXT : OC_INK_ON(TH_FAINT, row_surface));
             }
-            uint32_t fg = muted ? OC_COL_FAINT
-                        : (selected || unread) ? OC_COL_TEXT : OC_COL_MUTED;
+            /* A muted conversation's label is the faint tier, and on a hovered
+             * or selected row that tier was under the floor (2.81:1 and worse).
+             * Muting a conversation dims it; it does not delete it. */
+            uint32_t fg = muted ? OC_INK_ON(TH_FAINT, row_surface)
+                        : (selected || unread) ? OC_COL_TEXT
+                        : OC_INK_ON(TH_MUTED, row_surface);
             draw_text(rt, r->label, unread ? g_ui_b : g_ui,
                       rf(sx0 + 34, ry, sx1 - UIS(44), ry + ROW_H), fg);
             if (r->is_self) {
@@ -3927,7 +3939,7 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                 draw_text(rt, "you", g_meta,
                           baseline_align(rf(sx0 + 34, ry, sx1 - UIS(44), ry + ROW_H),
                                          g_ui, g_meta, sx0 + 34 + w + 8, sx1 - UIS(44)),
-                          OC_COL_FAINT);
+                          OC_INK_ON(TH_FAINT, row_surface));
             }
             if (unread) {
                 char badge[16]; snprintf(badge, sizeof badge, "%d", r->unread);
@@ -3942,8 +3954,13 @@ static void draw_sidebar(gfx *rt, const oc_model *m, float h) {
                  * else said something, and your own half-written line is not
                  * news. Only where no badge is, so a count is never displaced by
                  * a pencil. */
+                /* Against the fill this row actually has. A marker whose only
+                 * job is to be noticed was 2.03:1 on a selected row under the
+                 * default scheme and 1.58:1 under Teal \u2014 worst pair in the app,
+                 * and on the row you are most likely to be looking at. */
                 draw_text(rt, "\u270E", g_meta,
-                          rf(sx1 - UIS(34), ry, sx1 - UIS(10), ry + ROW_H), OC_COL_FAINT);
+                          rf(sx1 - UIS(34), ry, sx1 - UIS(10), ry + ROW_H),
+                          OC_INK_ON(TH_FAINT, row_surface));
             }
         }
         if (g_n_rows < (int)(sizeof g_rows / sizeof g_rows[0])) {
@@ -14029,8 +14046,11 @@ static void ed_draw(gfx *rt, rectf box) {
     if (!g_ed_len && !g_ed_comp_len) {
         char cue[160];
         composer_cue(model(), cue, sizeof cue);
+        /* On the INPUT fill, which FAINT does not clear in dark (2.73:1). The
+         * cue is the app's standing invitation to type and was the faintest
+         * thing in the window. */
         if (cue[0]) draw_text(rt, cue, g_body, rf(box.left, box.top, box.right, box.top + 20),
-                              OC_COL_FAINT);
+                              OC_INK_ON(TH_FAINT, TH_INPUT));
     }
 
     gfx_clip_push(rt, gr(box));

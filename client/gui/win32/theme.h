@@ -135,4 +135,32 @@ const char *oc_theme_mode_name(int mode);
 #define OC_COL_ONLINE      oc_theme[TH_ONLINE]
 #define OC_COL_AWAY        oc_theme[TH_AWAY]
 
+/* --- ink against the surface under it (REQ-262) ----------------------------
+ *
+ * WCAG asks 3:1 of non-text UI and more of text. Below 3:1 an element is not
+ * dim, it is absent, so 3:1 is the floor a colour has to clear to be used at
+ * all rather than a grade to aim past.
+ *
+ * `OC_INK_ON(ink, surface)` is how a faint ink is asked for. It answers with
+ * that ink where the pair clears the floor and with the next-stronger one where
+ * it does not, so a call site names the effect it wants and cannot quietly get
+ * an unreadable one. Use it wherever FAINT or MUTED lands on a surface that is
+ * not the plain canvas — a row fill, a field fill, a selection — and pass the
+ * surface actually beneath, not the one usually beneath.
+ *
+ * The pairs are resolved when the theme is applied, so this costs a lookup.
+ * TH_SELECT is derived from the colour scheme and has eight values, none of
+ * them a constant; resolving after the derivation covers all of them without a
+ * table naming any. tests/test_theme.c asserts the floor holds for every
+ * (ink, surface, mode, scheme), which is what makes this a guarantee rather
+ * than an intention. */
+#define OC_CONTRAST_FLOOR 3.0f
+
+uint32_t oc_ink_on(int ink, int surface);
+#define OC_INK_ON(ink, surface) oc_ink_on((ink), (surface))
+
+/* Exposed for the test, and for anyone checking a pair by hand. */
+float oc_theme_luminance(uint32_t rgb);
+float oc_theme_contrast(uint32_t a, uint32_t b);
+
 #endif /* OC_GUI_THEME_H */
