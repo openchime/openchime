@@ -2672,6 +2672,230 @@ static oc_dbres *list_thread_r(oc_dbwriter *w, uint64_t uid, uint64_t ch, uint64
     return wait_result(w);
 }
 
+static oc_dbres *list_threads_r(oc_dbwriter *w, uint64_t uid, uint8_t filter) {
+    oc_job *j = oc_job_new(OC_JOB_LIST_THREADS, 130);
+    j->user_id = uid; j->thread_filter = filter;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *set_follow(oc_dbwriter *w, uint64_t uid, uint64_t ch,
+                            uint64_t root, uint8_t on) {
+    oc_job *j = oc_job_new(OC_JOB_SET_THREAD_FOLLOW, 131);
+    j->user_id = uid; j->channel_id = ch; j->parent_id = root; j->follow_on = on;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+static oc_dbres *mark_thread_read(oc_dbwriter *w, uint64_t uid, uint64_t root, uint64_t up_to) {
+    oc_job *j = oc_job_new(OC_JOB_MARK_THREAD_READ, 132);
+    j->user_id = uid; j->parent_id = root; j->message_id = up_to;
+    oc_dbwriter_submit(w, j);
+    return wait_result(w);
+}
+
+/* Does the list hold this root, and what does it say about it? */
+static const oc_thread_row *row_for(const oc_dbres *r, uint64_t root) {
+    if (!r) return NULL;
+    for (size_t i = 0; i < r->n_threads; i++)
+        if (r->threads[i].root_id == root) return &r->threads[i];
+    return NULL;
+}
+
+/* The cross-channel Threads view (REQ-062, ARCH-104).
+ *
+ * Participation is DERIVED and `thread_follows` holds only overrides, so what
+ * has to be pinned is not "does a row exist" but the resolution: wrote the root,
+ * wrote a reply, followed without writing, and an unfollow that OUTRANKS having
+ * replied. That last one is the rule ARCH-104 says is most easily lost by
+ * writing the predicate as a plain OR — and it is now one shared fragment three
+ * callers ask, so a test here defends the push audience and THREAD_REPLY's
+ * per-recipient byte as well as this view. */
+static void test_thread_list(void) {
+    const char *path = "build/test_dbwriter_threadlist.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    if (!w) return;
+
+    uint64_t alice = reg(w, "tl-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "tl-bob",   "pw", OC_ROLE_MEMBER);
+    uint64_t carol = reg(w, "tl-carol", "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob && carol);
+
+    uint8_t idem[OC_IDEM_LEN];
+    memset(idem, 0xE1, sizeof idem);
+    uint64_t root_a = send_msg(w, alice, idem, "alice's root");
+    memset(idem, 0xE2, sizeof idem);
+    uint64_t root_b = send_msg(w, bob, idem, "bob's root");
+    CHECK(root_a && root_b);
+
+    /* A root with no replies is not a thread yet. Both exist; neither lists. */
+    oc_dbres *r = list_threads_r(w, alice, OC_THREADF_ALL);
+    CHECK(r && r->type == OC_RES_THREAD_LIST);
+    CHECK(row_for(r, root_a) == NULL && row_for(r, root_b) == NULL);
+    oc_dbres_free(r);
+
+    /* bob replies under alice's root. alice is in it because she WROTE it; bob
+     * because he replied; carol has done neither. */
+    oc_dbres *rp = send_reply(w, bob, OC_DEFAULT_CHANNEL, root_a, "bob's reply");
+    CHECK(rp && rp->type == OC_RES_REPLY_OK);
+    uint64_t reply1 = rp->message_id;
+    oc_dbres_free(rp);
+
+    r = list_threads_r(w, alice, OC_THREADF_ALL);
+    const oc_thread_row *row = row_for(r, root_a);
+    CHECK(row != NULL);
+    if (row) {
+        CHECK(row->root_author == alice && row->channel_id == OC_DEFAULT_CHANNEL);
+        CHECK(row->reply_count == 1);
+        CHECK(row->unread == 1);            /* bob's reply, and she has read none */
+        CHECK(row->following == 1);
+        CHECK(row->preview && strstr(row->preview, "alice's root") != NULL);
+    }
+    oc_dbres_free(r);
+
+    r = list_threads_r(w, bob, OC_THREADF_ALL);
+    CHECK(row_for(r, root_a) != NULL);      /* he replied in it */
+    row = row_for(r, root_a);
+    /* His own reply is not unread to him — you have read what you wrote. */
+    if (row) CHECK(row->unread == 0);
+    oc_dbres_free(r);
+
+    r = list_threads_r(w, carol, OC_THREADF_ALL);
+    CHECK(row_for(r, root_a) == NULL);      /* in the channel, not in the thread */
+    oc_dbres_free(r);
+
+    /* An explicit follow carries someone who never wrote in it. */
+    oc_dbres *fr = set_follow(w, carol, OC_DEFAULT_CHANNEL, root_a, 1);
+    CHECK(fr != NULL);
+    oc_dbres_free(fr);
+    r = list_threads_r(w, carol, OC_THREADF_ALL);
+    row = row_for(r, root_a);
+    CHECK(row != NULL);
+    if (row) CHECK(row->following == 1 && row->unread == 1);
+    oc_dbres_free(r);
+
+    /* And an explicit unfollow OUTRANKS having replied — the rule the whole
+     * override shape exists for. bob wrote a reply in this thread and still
+     * leaves it when he says so. */
+    fr = set_follow(w, bob, OC_DEFAULT_CHANNEL, root_a, 0);
+    CHECK(fr != NULL);
+    oc_dbres_free(fr);
+    r = list_threads_r(w, bob, OC_THREADF_ALL);
+    CHECK(row_for(r, root_a) == NULL);
+    oc_dbres_free(r);
+    /* Alice is unaffected: a follow row is per user, not per thread. */
+    r = list_threads_r(w, alice, OC_THREADF_ALL);
+    CHECK(row_for(r, root_a) != NULL);
+    oc_dbres_free(r);
+
+    /* Re-following restores him, so the unfollow is a value and not a
+     * tombstone: upserting the same (user, root) has to flip the state rather
+     * than insert a second row. */
+    fr = set_follow(w, bob, OC_DEFAULT_CHANNEL, root_a, 1);
+    CHECK(fr != NULL);
+    oc_dbres_free(fr);
+    r = list_threads_r(w, bob, OC_THREADF_ALL);
+    CHECK(row_for(r, root_a) != NULL);
+    oc_dbres_free(r);
+
+    /* The read cursor is the thread's own (ARCH-104): the channel cursor sweeps
+     * past replies, because they are not in the main scroll. */
+    oc_dbres *mr = mark_thread_read(w, alice, root_a, reply1);
+    CHECK(mr != NULL);
+    oc_dbres_free(mr);
+    r = list_threads_r(w, alice, OC_THREADF_ALL);
+    row = row_for(r, root_a);
+    CHECK(row != NULL);
+    if (row) CHECK(row->unread == 0);
+    oc_dbres_free(r);
+
+    /* A newer reply lands past that cursor and counts again. */
+    rp = send_reply(w, bob, OC_DEFAULT_CHANNEL, root_a, "a second reply");
+    CHECK(rp && rp->type == OC_RES_REPLY_OK);
+    oc_dbres_free(rp);
+    r = list_threads_r(w, alice, OC_THREADF_ALL);
+    row = row_for(r, root_a);
+    CHECK(row != NULL);
+    if (row) CHECK(row->unread == 1 && row->reply_count == 2);
+    oc_dbres_free(r);
+
+    /* up_to 0 means "everything in it", which is what opening a thread means. */
+    mr = mark_thread_read(w, alice, root_a, 0);
+    CHECK(mr != NULL);
+    oc_dbres_free(mr);
+    r = list_threads_r(w, alice, OC_THREADF_ALL);
+    row = row_for(r, root_a);
+    if (row) CHECK(row->unread == 0);
+    oc_dbres_free(r);
+
+    /* The unread-only filter hides a thread with nothing new, and shows it
+     * again the moment there is. */
+    r = list_threads_r(w, alice, OC_THREADF_UNREAD);
+    CHECK(row_for(r, root_a) == NULL);
+    oc_dbres_free(r);
+    rp = send_reply(w, bob, OC_DEFAULT_CHANNEL, root_a, "a third reply");
+    CHECK(rp != NULL);
+    oc_dbres_free(rp);
+    r = list_threads_r(w, alice, OC_THREADF_UNREAD);
+    CHECK(row_for(r, root_a) != NULL);
+    oc_dbres_free(r);
+
+    /* A deleted reply does not keep you in a thread.
+     *
+     * The thread must SURVIVE the deletion for this to test anything: a root
+     * with no live replies is not a thread yet and leaves the list for that
+     * reason alone, which would make this pass whether participation consulted
+     * the tombstone or not. So alice replies first and stays, and carol's own
+     * deleted reply is then the only thing that ever tied her to it. Written the
+     * other way round first, and the mutation that ignores `deleted_at_ms` in
+     * the participation predicate went undetected. */
+    {
+        oc_dbres *keep = send_reply(w, alice, OC_DEFAULT_CHANNEL, root_b, "alice keeps it alive");
+        CHECK(keep && keep->type == OC_RES_REPLY_OK);
+        oc_dbres_free(keep);
+
+        oc_dbres *dr = send_reply(w, carol, OC_DEFAULT_CHANNEL, root_b, "carol's only reply");
+        CHECK(dr && dr->type == OC_RES_REPLY_OK);
+        uint64_t only = dr->message_id;
+        oc_dbres_free(dr);
+        r = list_threads_r(w, carol, OC_THREADF_ALL);
+        CHECK(row_for(r, root_b) != NULL);
+        oc_dbres_free(r);
+
+        oc_job *j = oc_job_new(OC_JOB_DELETE, 133);
+        j->user_id = carol; j->channel_id = OC_DEFAULT_CHANNEL; j->message_id = only;
+        oc_dbwriter_submit(w, j);
+        oc_dbres *del = wait_result(w);
+        CHECK(del != NULL);
+        oc_dbres_free(del);
+
+        /* Still a thread — alice's reply is live — and alice is still in it. */
+        r = list_threads_r(w, alice, OC_THREADF_ALL);
+        CHECK(row_for(r, root_b) != NULL);
+        oc_dbres_free(r);
+        /* But carol is not: the only reply she wrote is a tombstone. */
+        r = list_threads_r(w, carol, OC_THREADF_ALL);
+        CHECK(row_for(r, root_b) == NULL);
+        oc_dbres_free(r);
+    }
+
+    /* Leaving the channel takes its threads with it: a thread in a conversation
+     * you are no longer in is not yours to see. */
+    {
+        oc_dbres *lv = chan_ref(w, OC_JOB_LEAVE_CHANNEL, alice, OC_DEFAULT_CHANNEL);
+        CHECK(lv != NULL);
+        oc_dbres_free(lv);
+        r = list_threads_r(w, alice, OC_THREADF_ALL);
+        CHECK(row_for(r, root_a) == NULL);
+        oc_dbres_free(r);
+    }
+
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 /* What the daemon's channel badge counts (REQ-284), swept against the evaluator.
  *
  * The badge is a COUNT over a channel's backlog rather than a decision about one
@@ -4938,6 +5162,7 @@ int run_dbwriter_tests(void) {
     test_admin_ops();
     test_reactions();
     test_threads();
+    test_thread_list();
     test_badge_matches_evaluator();
     test_search();
     test_search_filters_and_paging();

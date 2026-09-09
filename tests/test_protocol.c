@@ -358,6 +358,139 @@ static void test_thread_frames(void) {
     }
 }
 
+/* The CROSS-CHANNEL thread view's frames (REQ-062, ARCH-104) — a different set
+ * from the ones above, which open one thread in one channel.
+ *
+ * THREAD_SUMMARY is the one that earns the care: it is a repeated list, streamed
+ * one frame per thread, and a repeated list is the shape where an added or
+ * misplaced field shifts every entry after the first rather than corrupting the
+ * one it is in. That is the failure the protocol version exists to make loud,
+ * and it has moved for exactly this reason before (USER_LIST, twice). */
+static void test_thread_list_frames(void) {
+    {
+        oc_list_threads in = { OC_THREADF_UNREAD };
+        ROUNDTRIP(oc_encode_list_threads(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_THREADS, h, p);
+        oc_list_threads out;
+        CHECK(oc_decode_list_threads(&p, &out) == OC_OK);
+        CHECK(out.filter == OC_THREADF_UNREAD);
+    }
+    {
+        oc_list_threads in = { OC_THREADF_ALL };
+        ROUNDTRIP(oc_encode_list_threads(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_LIST_THREADS, h, p);
+        oc_list_threads out;
+        CHECK(oc_decode_list_threads(&p, &out) == OC_OK);
+        CHECK(out.filter == OC_THREADF_ALL);
+    }
+    /* Every field distinct, and none of them a value another field could hold —
+     * a round-trip whose fields all read 0 or 1 passes just as happily when two
+     * of them are swapped. */
+    {
+        oc_thread_summary in = { 0 };
+        in.root_id = 0x1122334455667788ull;
+        in.channel_id = 77;
+        in.root_author = 4242;
+        in.root_at = 1751200500000ull;
+        in.last_reply_at = 1751200999000ull;
+        in.reply_count = 17;
+        in.unread = 5;
+        in.following = 1;
+        in.preview = oc_slice_str("the root's first line");
+        ROUNDTRIP(oc_encode_thread_summary(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_SUMMARY, h, p);
+        oc_thread_summary out = { 0 };
+        CHECK(oc_decode_thread_summary(&p, &out) == OC_OK);
+        CHECK(out.root_id == 0x1122334455667788ull);
+        CHECK(out.channel_id == 77 && out.root_author == 4242);
+        CHECK(out.root_at == 1751200500000ull && out.last_reply_at == 1751200999000ull);
+        /* reply_count and unread are adjacent u32s of the same width: the one
+         * pair a shifted field would swap without any decode error at all. */
+        CHECK(out.reply_count == 17 && out.unread == 5);
+        CHECK(out.following == 1);
+        CHECK(slice_eq_str(out.preview, "the root's first line"));
+    }
+    /* An unfollowed thread with nothing unread and no preview. `following` is
+     * the flag the client drops a row on, so the false case has to decode as
+     * false rather than as whatever the last frame left behind. */
+    {
+        oc_thread_summary in = { 0 };
+        in.root_id = 900; in.channel_id = 1; in.root_author = 2;
+        in.reply_count = 0; in.unread = 0; in.following = 0;
+        in.preview = oc_slice_str("");
+        ROUNDTRIP(oc_encode_thread_summary(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_SUMMARY, h, p);
+        oc_thread_summary out = { 0 };
+        out.following = 1;                       /* poison: must be overwritten */
+        CHECK(oc_decode_thread_summary(&p, &out) == OC_OK);
+        CHECK(out.root_id == 900 && out.following == 0);
+        CHECK(out.reply_count == 0 && out.unread == 0 && out.preview.len == 0);
+    }
+    /* Two summaries back to back in ONE buffer, decoded in sequence. This is how
+     * they actually arrive, and it is the only arrangement that catches an
+     * encoder writing a field the decoder does not read: a single frame is
+     * bounded by its own length and hides the drift. */
+    {
+        oc_thread_summary a = { 0 }, b = { 0 };
+        a.root_id = 11; a.channel_id = 1; a.root_author = 2; a.root_at = 100;
+        a.last_reply_at = 200; a.reply_count = 3; a.unread = 1; a.following = 1;
+        a.preview = oc_slice_str("first");
+        b.root_id = 22; b.channel_id = 2; b.root_author = 3; b.root_at = 300;
+        b.last_reply_at = 400; b.reply_count = 9; b.unread = 4; b.following = 0;
+        b.preview = oc_slice_str("second");
+        oc_wbuf w2; oc_wbuf_init(&w2, frame, sizeof frame);
+        CHECK(oc_encode_thread_summary(&w2, OC_PROTOCOL_VERSION, &a) == OC_OK);
+        CHECK(oc_encode_thread_summary(&w2, OC_PROTOCOL_VERSION, &b) == OC_OK);
+        size_t pos = 0;
+        oc_thread_summary got[2] = {{0}};
+        for (int i = 0; i < 2; i++) {
+            oc_header hh; oc_rbuf pp;
+            CHECK(oc_parse_frame(frame + pos, w2.len - pos, &hh, &pp) == OC_OK);
+            CHECK(hh.msg_type == OC_MSG_THREAD_SUMMARY);
+            CHECK(oc_decode_thread_summary(&pp, &got[i]) == OC_OK);
+            pos += (size_t)hh.length + 4u;
+        }
+        CHECK(pos == w2.len);                    /* nothing left over, nothing short */
+        CHECK(got[0].root_id == 11 && got[0].unread == 1 && got[0].following == 1);
+        CHECK(slice_eq_str(got[0].preview, "first"));
+        CHECK(got[1].root_id == 22 && got[1].unread == 4 && got[1].following == 0);
+        CHECK(slice_eq_str(got[1].preview, "second"));
+    }
+    {
+        oc_threads in = { 42 };
+        ROUNDTRIP(oc_encode_threads(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREADS, h, p);
+        oc_threads out;
+        CHECK(oc_decode_threads(&p, &out) == OC_OK);
+        CHECK(out.count == 42);
+    }
+    {
+        oc_set_thread_follow in = { 500, 7, 1 };
+        ROUNDTRIP(oc_encode_set_thread_follow(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_THREAD_FOLLOW, h, p);
+        oc_set_thread_follow out = { 0, 0, 0 };
+        CHECK(oc_decode_set_thread_follow(&p, &out) == OC_OK);
+        CHECK(out.root_id == 500 && out.channel_id == 7 && out.on == 1);
+    }
+    {   /* The unfollow, which outranks having replied — so it must survive the
+         * wire as 0 and not as "field absent". */
+        oc_set_thread_follow in = { 501, 8, 0 };
+        ROUNDTRIP(oc_encode_set_thread_follow(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_SET_THREAD_FOLLOW, h, p);
+        oc_set_thread_follow out = { 0, 0, 1 };  /* poison */
+        CHECK(oc_decode_set_thread_follow(&p, &out) == OC_OK);
+        CHECK(out.root_id == 501 && out.channel_id == 8 && out.on == 0);
+    }
+    {
+        oc_mark_thread_read in = { 500, 1234 };
+        ROUNDTRIP(oc_encode_mark_thread_read(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MARK_THREAD_READ, h, p);
+        oc_mark_thread_read out;
+        CHECK(oc_decode_mark_thread_read(&p, &out) == OC_OK);
+        CHECK(out.root_id == 500 && out.up_to == 1234);
+    }
+    {   /* up_to 0 means "everything in it", which is what opening a thread
+         * means — a documented value, not an unset field. */
+        oc_mark_thread_read in = { 500, 0 };
+        ROUNDTRIP(oc_encode_mark_thread_read(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_MARK_THREAD_READ, h, p);
+        oc_mark_thread_read out = { 0, 999 };    /* poison */
+        CHECK(oc_decode_mark_thread_read(&p, &out) == OC_OK);
+        CHECK(out.root_id == 500 && out.up_to == 0);
+    }
+}
+
 static void test_unfurl_frame(void) {
     /* UNFURL (REQ-222, ARCH-105): the async preview fan-out + backfill replay. */
     oc_unfurl in = { 1001, 7, oc_slice_str("https://example.com/a"),
@@ -1466,6 +1599,7 @@ int run_protocol_tests(void) {
     test_unfurl_frame();
     test_forward_frame();
     test_thread_frames();
+    test_thread_list_frames();
     test_channel_frames();
     test_admin_frames();
     test_search_frames();
