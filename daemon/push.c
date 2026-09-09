@@ -382,31 +382,15 @@ int oc_push_collect(sqlite3 *db, uint64_t channel_id, uint64_t author_id,
             "               AND mn.user_id = cm.user_id AND mn.kind = 4), "
             /* THREAD_REPLY: a reply in a thread you are IN (REQ-061), which
              * satisfies MENTIONS the same way an @-mention does — another way
-             * to pass the level, not a bypass of it.
-             *
-             * Participation is DERIVED, never stored (ARCH-104): you are in a
-             * thread if you wrote its root or any reply. `thread_follows`
-             * carries only overrides — state 1 an explicit follow of one you
-             * never wrote in, state 0 an explicit unfollow — and the UNFOLLOW
-             * OUTRANKS having replied, which is the whole meaning of "turn off
-             * replies" and the rule most easily lost by writing this as a
-             * plain OR. Same predicate the cross-channel thread list uses, so
-             * the view and the notification cannot disagree about who is in a
-             * thread.
+             * to pass the level, not a bypass of it. The rule itself is
+             * OC_THREAD_PARTICIPANT_SQL, which the thread list and the
+             * per-recipient byte on THREAD_REPLY also ask, so the view, the
+             * toast and the push cannot disagree about who is in a thread.
              *
              * 0 for an ordinary send: the ?5 <> 0 test makes this false, so a
              * channel message keeps exactly the audience it had. */
-            "       ( ?5 <> 0 "
-            "         AND NOT EXISTS(SELECT 1 FROM thread_follows tf "
-            "                         WHERE tf.user_id = cm.user_id "
-            "                           AND tf.root_id = ?5 AND tf.state = 0) "
-            "         AND ( EXISTS(SELECT 1 FROM messages rm "
-            "                       WHERE rm.id = ?5 AND rm.author_id = cm.user_id) "
-            "            OR EXISTS(SELECT 1 FROM messages rp "
-            "                       WHERE rp.parent_id = ?5 AND rp.author_id = cm.user_id) "
-            "            OR EXISTS(SELECT 1 FROM thread_follows tf "
-            "                       WHERE tf.user_id = cm.user_id "
-            "                         AND tf.root_id = ?5 AND tf.state = 1) ) ) "
+            "       ( ?5 <> 0 AND "
+                    OC_THREAD_PARTICIPANT_SQL("cm.user_id", "?5") " ) "
             "FROM channel_members cm "
             "JOIN device_tokens dt ON dt.user_id = cm.user_id "
             "JOIN users u ON u.id = cm.user_id "

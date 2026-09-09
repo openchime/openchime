@@ -365,6 +365,7 @@ void oc_dbres_free(oc_dbres *r) {
     for (size_t i = 0; i < r->n_sessions; i++) free((void *)r->sessions[i].device_label.ptr);
     free(r->sessions);
     free(r->members);
+    free(r->member_participant);
     free(r->author_name);
     free_attach_meta(r->attach, r->n_attach);
     for (size_t i = 0; i < r->n_replay; i++) { free(r->replay[i].body); free(r->replay[i].author_name); free_attach_meta(r->replay[i].attach, r->replay[i].n_attach); }
@@ -1370,6 +1371,46 @@ static void load_members(sqlite3 *db, uint64_t channel_id, oc_dbres *r) {
     r->n_members = n;
 }
 
+/* Answer ARCH-104's participation question for every member already in
+ * r->members, so the net thread can stamp THREAD_REPLY's per-recipient byte
+ * without a database of its own. One prepared statement stepped per member: the
+ * audience is a channel's membership, and the alternative — a second copy of the
+ * predicate shaped as a join — is the duplication OC_THREAD_PARTICIPANT_SQL
+ * exists to prevent.
+ *
+ * On allocation failure the array stays NULL, which the fan-out reads as "nobody
+ * is a participant": a missed toast, not a wrong one. */
+static uint8_t thread_participant(sqlite3 *db, uint64_t user_id, uint64_t root_id) {
+    if (!root_id) return 0;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT " OC_THREAD_PARTICIPANT_SQL("?1", "?2") ";",
+                           -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)user_id);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)root_id);
+    uint8_t in = (sqlite3_step(st) == SQLITE_ROW) ? (uint8_t)(sqlite3_column_int(st, 0) != 0) : 0;
+    sqlite3_finalize(st);
+    return in;
+}
+
+static void load_thread_participation(sqlite3 *db, uint64_t root_id, oc_dbres *r) {
+    if (!r->members || !r->n_members || !root_id) return;
+    uint8_t *flags = calloc(r->n_members, sizeof *flags);
+    if (!flags) return;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT " OC_THREAD_PARTICIPANT_SQL("?1", "?2") ";",
+            -1, &st, NULL) != SQLITE_OK) { free(flags); return; }
+    for (size_t i = 0; i < r->n_members; i++) {
+        sqlite3_reset(st);
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)r->members[i]);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)root_id);
+        if (sqlite3_step(st) == SQLITE_ROW)
+            flags[i] = (uint8_t)(sqlite3_column_int(st, 0) != 0);
+    }
+    sqlite3_finalize(st);
+    r->member_participant = flags;
+}
+
 /* Does the channel exist (any kind — a named channel or a DM)? Fills *is_public.
  * Used by the read/post-access gate, which applies to DMs too. */
 static int channel_exists(sqlite3 *db, uint64_t channel_id, uint8_t *is_public) {
@@ -2344,10 +2385,37 @@ static oc_dbres *process_list_channels(sqlite3 *db, const oc_job *j) {
          * — so a cache-less client can sort and badge the sidebar immediately. */
         "  (SELECT COALESCE(MAX(x.created_at_ms),0) FROM messages x "
         "     WHERE x.channel_id=c.id AND x.parent_id IS NULL), "
+        /* A badge counts what WOULD HAVE NOTIFIED, with the schedule and the
+         * pause left out: those govern when to interrupt you, not whether a
+         * message mattered, so a night of quiet hours still leaves a count in
+         * the morning. Everything else is the evaluator's — mute silences
+         * absolutely, a priority person pierces the level, and MENTIONS is
+         * satisfied by a mention or a keyword hit. Thread replies are not here
+         * by construction (parent_id IS NULL); they badge the Threads view.
+         *
+         * This is oc_notify_decide reduced for quiet=0, paused=0 and written as
+         * SQL, because a badge is a COUNT over a channel's backlog rather than a
+         * decision about one message. It is a restatement, and the parity sweep
+         * is what stops it drifting: every state it can express is compared
+         * against the evaluator's own answer. */
         "  (SELECT COUNT(*) FROM messages x "
         "     WHERE x.channel_id=c.id AND x.parent_id IS NULL AND x.author_id<>?1 "
+        "       AND x.deleted_at_ms IS NULL "
         "       AND x.id > COALESCE((SELECT dc.message_id FROM delivery_cursors dc "
-        "                             WHERE dc.user_id=?1 AND dc.channel_id=c.id),0)), "
+        "                             WHERE dc.user_id=?1 AND dc.channel_id=c.id),0) "
+        "       AND COALESCE((SELECT np.muted FROM notification_prefs np "
+        "                      WHERE np.user_id=?1 AND np.channel_id=c.id),0) = 0 "
+        "       AND ( EXISTS(SELECT 1 FROM priority_people pp "
+        "                     WHERE pp.user_id=?1 AND pp.person_id=x.author_id) "
+        "          OR COALESCE((SELECT np.level FROM notification_prefs np "
+        "                        WHERE np.user_id=?1 AND np.channel_id=c.id), "
+        "                      (SELECT u2.notify_default FROM users u2 WHERE u2.id=?1)) = 0 "
+        "          OR ( COALESCE((SELECT np.level FROM notification_prefs np "
+        "                          WHERE np.user_id=?1 AND np.channel_id=c.id), "
+        "                        (SELECT u2.notify_default FROM users u2 WHERE u2.id=?1)) = 1 "
+        "               AND EXISTS(SELECT 1 FROM mentions mn WHERE mn.message_id=x.id "
+        "                           AND ((mn.user_id=?1 AND mn.kind IN (0,4)) "
+        "                                OR mn.kind IN (1,2,3))) ) ) ), "
         /* A DM has no name; the client titles it by its peer, so send that too —
          * otherwise a cache-less client shows "direct message" until it opens one. */
         "  COALESCE((SELECT m2.user_id FROM channel_members m2 "
@@ -3584,6 +3652,9 @@ static oc_dbres *process_send_reply(sqlite3 *db, const oc_job *j) {
     r->reply_count = count;
     if (j->body_len) { r->body = malloc(j->body_len); if (r->body) { memcpy(r->body, j->body, j->body_len); r->body_len = j->body_len; } }
     load_members(db, j->channel_id, r);
+    /* Asked AFTER the reply is committed, so the author of the reply being
+     * fanned out counts as a participant on the strength of it. */
+    load_thread_participation(db, root, r);
     return r;
 }
 
@@ -3603,6 +3674,7 @@ static oc_dbres *process_list_thread(sqlite3 *db, const oc_job *j) {
     if (!channel_read_access(db, j->channel_id, j->user_id)) {
         r->err_code = OC_ERR_NOT_A_MEMBER; return r;
     }
+    r->list_participant = thread_participant(db, j->user_id, j->parent_id);
 
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
@@ -4972,15 +5044,10 @@ static oc_dbres *process_list_threads(sqlite3 *db, const oc_job *j) {
         "  FROM messages r "
         "  JOIN channel_members cm ON cm.channel_id = r.channel_id AND cm.user_id = ?1 "
         " WHERE r.parent_id IS NULL AND r.deleted_at_ms IS NULL "
-        /* In it, one way or another: I wrote it, I replied to it, or I said so. */
-        "   AND ( r.author_id = ?1 "
-        "      OR EXISTS(SELECT 1 FROM messages y WHERE y.parent_id = r.id "
-        "                 AND y.author_id = ?1 AND y.deleted_at_ms IS NULL) "
-        "      OR EXISTS(SELECT 1 FROM thread_follows f WHERE f.user_id = ?1 "
-        "                 AND f.root_id = r.id AND f.state = 1) ) "
-        /* ...unless I said otherwise, which outranks having replied. */
-        "   AND COALESCE((SELECT tf2.state FROM thread_follows tf2 "
-        "                  WHERE tf2.user_id = ?1 AND tf2.root_id = r.id), 1) = 1 "
+        /* In it, one way or another — and not if I said otherwise, which
+         * outranks having replied. The same predicate the push audience and
+         * THREAD_REPLY's per-recipient byte ask (ARCH-104). */
+        "   AND " OC_THREAD_PARTICIPANT_SQL("?1", "r.id") " "
         "   AND EXISTS(SELECT 1 FROM messages z WHERE z.parent_id = r.id "
         "               AND z.deleted_at_ms IS NULL) "
         "   AND (?4 = 0 OR unread > 0) "

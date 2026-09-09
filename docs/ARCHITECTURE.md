@@ -304,6 +304,24 @@ Business, product, and scope decisions live in [REQUIREMENTS.md](./REQUIREMENTS.
   level the way ARCH-103's keywords do: a way to pass the level, never a way
   around mute, the schedule or the pause.
 
+  **Written once, asked three times.** The push audience, the cross-channel list
+  and `THREAD_REPLY`'s per-recipient byte are one SQL fragment
+  (`OC_THREAD_PARTICIPANT_SQL`), not three statements of the same rule. The two
+  hand-written copies that preceded it had already drifted — the list excluded
+  deleted replies from participation and the push audience did not — which is
+  the drift this decision's own "the view and the notification cannot disagree"
+  exists to prevent. A deleted reply does not keep you in a thread; deriving
+  rather than storing is what makes that answerable at all.
+
+  **The client is told, because it cannot derive.** Participation is a fact about
+  message rows a client does not hold — it keeps at most one thread's replies,
+  and only while that thread is open — so `THREAD_REPLY` carries a `participant`
+  byte, the only per-recipient field on a fan-out frame. The daemon therefore
+  encodes that frame twice, once each way, and sends whichever matches. The byte
+  is the evaluator's *input*, never its verdict: a client still applies its own
+  mute, level, priority people, schedule and pause, so ARCH-103's one-decider
+  rule survives a decision that needs a fact only the server has.
+
   **The follow and read acks return the ONE row that changed**, not a fresh list. A client folds a summary the same way whether it came from a list or a push, which is the shape `DRAFT` already uses, and re-listing after every read mark would make opening a thread cost the whole view.
 
   **REQ-282 (follow every thread in a channel) is deliberately not built here.** Its storage is a column on `notification_prefs` beside `level` and `muted`, since it is per (user, channel) exactly as they are; when it lands it composes with this by adding a fourth arm to the union above.

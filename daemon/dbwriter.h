@@ -24,6 +24,40 @@
  * create/join is a later feature. */
 #define OC_DEFAULT_CHANNEL 1
 
+/* ARCH-104's participation predicate, written ONCE. Three callers ask "is this
+ * user in this thread" — the push audience (REQ-061), the cross-channel thread
+ * list (REQ-062), and the per-recipient byte on THREAD_REPLY — and ARCH-104
+ * requires that they cannot disagree, because a view that lists a thread while
+ * the notification skips it is two answers to one question.
+ *
+ * Participation is DERIVED, never stored: you are in a thread if you wrote its
+ * root or a live reply to it. `thread_follows` carries only overrides — state 1
+ * an explicit follow of one you never wrote in, state 0 an explicit unfollow.
+ * The UNFOLLOW is an outer guard rather than an arm of the OR, because it
+ * OUTRANKS having replied: that is the whole meaning of "turn off replies", and
+ * it is the rule a plain OR silently loses.
+ *
+ * A deleted reply does not keep you in a thread. Deriving rather than storing is
+ * what makes that answerable at all (ARCH-104's own argument for the shape), and
+ * the two hand-written copies this replaces disagreed about it — the list
+ * excluded deleted replies and the push audience did not.
+ *
+ * `usr` and `root` are SQL expressions, so a caller substitutes its own column
+ * or bind parameter. Both are used more than once; neither may have side
+ * effects. */
+#define OC_THREAD_PARTICIPANT_SQL(usr, root)                                    \
+    "( NOT EXISTS(SELECT 1 FROM thread_follows tfx "                            \
+    "              WHERE tfx.user_id = " usr " AND tfx.root_id = " root " "     \
+    "                AND tfx.state = 0) "                                       \
+    "  AND ( EXISTS(SELECT 1 FROM messages rmx "                                \
+    "                WHERE rmx.id = " root " AND rmx.author_id = " usr ") "     \
+    "     OR EXISTS(SELECT 1 FROM messages rpx "                                \
+    "                WHERE rpx.parent_id = " root " AND rpx.author_id = " usr " " \
+    "                  AND rpx.deleted_at_ms IS NULL) "                         \
+    "     OR EXISTS(SELECT 1 FROM thread_follows tfy "                          \
+    "                WHERE tfy.user_id = " usr " AND tfy.root_id = " root " "   \
+    "                  AND tfy.state = 1) ) )"
+
 /* --- Jobs (net thread -> writer) ---------------------------------------- */
 
 enum { OC_JOB_AUTH = 1, OC_JOB_SEND = 2, OC_JOB_BACKFILL = 3, OC_JOB_REGISTER = 4,
@@ -594,6 +628,15 @@ typedef struct oc_dbres {
     size_t         body_len;
     uint64_t      *members;   /* heap; user ids to fan the broadcast out to */
     size_t         n_members;
+    /* REPLY_OK only: parallel to members, 1 where that member is in the thread
+     * (ARCH-104). THREAD_REPLY's `participant` byte is the one per-recipient
+     * field on a fan-out frame, and the net thread has no database to ask, so
+     * the answer travels with the audience. NULL for every other result. */
+    uint8_t       *member_participant;
+    /* THREAD only: the caller's own answer to the same question, for the
+     * THREAD_REPLY frames a LIST_THREAD replay streams back. One recipient, so
+     * one flag rather than an array. */
+    uint8_t        list_participant;
     int            duplicate; /* idempotent replay: ack only, no broadcast */
     oc_attach_meta attach[OC_MAX_ATTACH];  /* SEND_OK: attachments linked to this message */
     /* SEND_OK: names that are people here but not in this channel (REQ-287).

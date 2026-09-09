@@ -60,6 +60,12 @@ const oc_model *oc_client_model(oc_client *c) {
     return c ? &c->model : NULL;
 }
 
+size_t oc_client_thread_notify_take(oc_client *c, int quiet, int paused,
+                                    oc_thread_notice *out, size_t max) {
+    if (!c) return 0;
+    return oc_model_thread_notify_take(&c->model, quiet, paused, out, max);
+}
+
 void oc_client_send(oc_client *c, uint64_t channel_id, const char *body) {
     if (!c || !body) return;
     oc_cmd *cmd = oc_cmd_new(OC_CMD_SEND);

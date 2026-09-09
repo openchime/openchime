@@ -444,6 +444,17 @@ the requirement says so explicitly rather than implying one.
   mute, the schedule and the pause all still silence a reply and `none` still
   passes nothing. An `@mention` in a reply is an ordinary mention, stored and
   resolved as one anywhere else.
+
+  **The desktop has raised a toast for one too**, not only the phone. A client
+  cannot derive its own participation — it holds a thread's replies only while
+  that thread is open — so `THREAD_REPLY` has carried the answer as a
+  per-recipient byte, and the client has asked the shared evaluator with it
+  rather than being told the verdict. The daemon and the desktop therefore agree
+  about a reply for the same reason they agree about a message: one function
+  decides, and both ask it. Replies streamed back by `LIST_THREAD` have carried
+  the same true byte and raised nothing, because history a user asked for is not
+  news; a reply that arrived while a client was disconnected has surfaced in the
+  thread's unread count (REQ-062) rather than as a toast on reconnect.
 - **REQ-062.** *(Partly built)* A user has been able to **follow or unfollow a thread**
   independently of having replied to it, and has had a **followed-threads view**
   aggregating every thread they participate in or follow across channels, with
@@ -853,9 +864,9 @@ the requirement says so explicitly rather than implying one.
   rule — they each summed it themselves once, and disagreed, which is how a
   muted channel in a background workspace still lit the rail.
 
-  REQ-284's finer question — whether a badge should count every unread or only
-  what would have notified — is still open and is deliberately not answered
-  here.
+  REQ-284 answers the finer question — a badge counts what would have notified,
+  with the schedule and the pause left out — and mute remains the first thing it
+  asks.
 - **REQ-138.** *(Partly built)* A client has surfaced **OS-native desktop notifications** (a system
   toast) for messages due under the user's notification settings (REQ-130/134),
   with a content-preview toggle, plus optional **notification sounds and unread
@@ -1061,23 +1072,36 @@ the requirement says so explicitly rather than implying one.
   sweep is that pass or its own, and the granularity guarantee: a reminder that
   may fire minutes late is a different product promise from one that fires on the
   minute, and the maintenance interval defaults to 5 minutes.]**
-- **REQ-284.** *(Not built)* What the **unread badge counts** has been defined and
-  user-controllable, rather than left implicit. A user has been able to choose
-  whether the badge counts **every unread message** in a conversation or only
-  messages that would notify them under their settings, and whether **thread
-  replies that do not mention them** count toward it at all. The default has been
-  the quieter reading — the badge reflects what was worth notifying — because a
-  badge that counts everything is a badge nobody reads.
+- **REQ-284.** *(Partly built)* What the **unread badge counts** has been defined
+  rather than left implicit: a conversation's badge has counted the messages that
+  **would have notified** the user under their settings (REQ-130/134/135/137) —
+  the quieter reading, because a badge that counts everything is a badge nobody
+  reads. Both the daemon's channel list and the client's own tally have computed
+  it, and have computed the same thing.
 
-  **This is a requirement about meaning, not three settings.** Today the product
-  ships badges (REQ-138) and per-channel unread (REQ-014) with no statement
-  anywhere of what a number on a conversation *represents*, which is how two
-  clients end up disagreeing about the same count and both looking correct.
-  Mute already removes a conversation from the badge (REQ-137); this defines the
-  rest of the rule. **[needs ARCH decision — whether the choice is a client
-  preference or server state; it affects the count a client displays, not the
-  notify decision, which argues for the synced `client_settings` bucket rather
-  than a new server surface.]**
+  **The schedule and the pause are left out of that question** (REQ-136,
+  REQ-278). They govern *when* to interrupt someone, not whether a message
+  mattered, so a night of quiet hours has still left a count to find in the
+  morning — the evaluator asked with `quiet` and `paused` both false. Everything
+  else applies: mute silences absolutely, a priority person pierces the level,
+  and a mention or a keyword hit satisfies `mentions`.
+
+  **Thread replies have counted in the thread's own badge, not the channel's**
+  (REQ-060/061/062). A reply is deliberately not in the main scroll, so counting
+  it against the channel would badge a conversation for something no one can find
+  by opening it.
+
+  **This is a requirement about meaning, not three settings.** The product ships
+  badges (REQ-138) and per-channel unread (REQ-014), and before this there was no
+  statement anywhere of what a number on a conversation *represents*, which is
+  how two clients end up disagreeing about the same count and both looking
+  correct.
+
+  **Not built: the user-facing choice.** The rule above is fixed, not a
+  preference. **[needs ARCH decision — whether making it selectable belongs in a
+  client preference or server state; it affects the count a client displays, not
+  the notify decision, which argues for the synced `client_settings` bucket
+  rather than a new server surface.]**
 - **REQ-285.** *(Not built)* A user has been **notified when a call has started** in a channel
   or DM they are a member of, subject to the same notification settings as a
   message (REQ-281) — because a call is time-sensitive in a way a message is not:

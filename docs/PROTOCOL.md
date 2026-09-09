@@ -170,7 +170,7 @@ type-specific payload. All multi-byte integers are **network byte order**
 > wrong, instead of connecting happily and then dropping the link on the first
 > undecodable frame.
 >
-> **The current version is 10** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
+> **The current version is 11** (`OC_PROTOCOL_VERSION` in `shared/protocol.h`,
 > which is the authority; the per-version change notes live beside it). Since the
 > client and daemon ship together (ARCH-61) there is no compatibility window to
 > preserve — only a mismatch to detect loudly, which is why a frame *layout*
@@ -1006,7 +1006,23 @@ member of the channel:
 | `author_id`   | u64  | Who replied.                                             |
 | `server_time` | u64  | Server timestamp, ms since epoch UTC.                    |
 | `reply_count` | u32  | The root's total reply count after this reply (REQ-060). |
+| `participant` | u8   | 1 if **this recipient** is in the thread (REQ-061).      |
 | `body`        | lstr | The reply body.                                          |
+
+`participant` is the only per-recipient field on a fan-out frame, so the daemon
+encodes this frame twice — once each way — and sends whichever matches the peer
+it is writing to. It answers ARCH-104's question, "are you in this thread": you
+wrote the root or a reply, or explicitly followed, and did not explicitly
+unfollow. The client cannot derive it, because it holds a thread's replies only
+while that thread is open.
+
+It carries the **input**, not the verdict. The recipient still asks
+`oc_notify_decide` with its own mute, level, priority people, schedule and pause,
+so participation satisfies the *mentions* level exactly as a keyword hit does
+rather than bypassing it — and one thing, not two, decides whether a message
+notifies (ARCH-103). A `LIST_THREAD` replay carries the true value too; a client
+suppresses its own toasts for history it asked for rather than the daemon
+misreporting participation to achieve it.
 
 **`LIST_THREAD` (client → server), msg_type `0x002E`**
 `{ channel_id: u64, parent_id: u64 }` opens a thread. The daemon **streams** the

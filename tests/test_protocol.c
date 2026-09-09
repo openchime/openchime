@@ -285,8 +285,15 @@ static void test_thread_frames(void) {
         CHECK(slice_eq_str(out.body, "a reply"));
         CHECK(out.n_attach == 1 && out.attach_ids[0] == 321);
     }
+    /* THREAD_REPLY, participant set, WITH the optional attachment tail behind
+     * it. `participant` is a fixed field sitting in front of that tail, so both
+     * orders have to decode — the tail is exactly what a misplaced fixed field
+     * runs into. */
     {
-        oc_thread_reply in = { 1002, 7, 500, 42, 1751200500000ull, 3, oc_slice_str("a reply"), 0, {{0}} };
+        oc_thread_reply in = { .message_id = 1002, .channel_id = 7, .parent_id = 500,
+                               .author_id = 42, .server_time = 1751200500000ull,
+                               .reply_count = 3, .participant = 1,
+                               .body = oc_slice_str("a reply") };
         in.n_attach = 1; in.attach[0].id = 321; in.attach[0].filename = oc_slice_str("t.pdf");
         in.attach[0].mime = oc_slice_str("application/pdf"); in.attach[0].size = 88;
         ROUNDTRIP(oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_REPLY, h, p);
@@ -294,9 +301,38 @@ static void test_thread_frames(void) {
         CHECK(oc_decode_thread_reply(&p, &out) == OC_OK);
         CHECK(out.message_id == 1002 && out.channel_id == 7 && out.parent_id == 500);
         CHECK(out.author_id == 42 && out.server_time == 1751200500000ull && out.reply_count == 3);
+        CHECK(out.participant == 1);
         CHECK(slice_eq_str(out.body, "a reply"));
         CHECK(out.n_attach == 1 && out.attach[0].id == 321 && out.attach[0].size == 88);
         CHECK(slice_eq_str(out.attach[0].filename, "t.pdf"));
+    }
+    /* The same frame with participant clear and NO tail — the common case, and
+     * the one where a stray byte would be read as the start of an attachment
+     * count rather than simply shifting a field. */
+    {
+        oc_thread_reply in = { .message_id = 1003, .channel_id = 7, .parent_id = 500,
+                               .author_id = 42, .server_time = 1751200500001ull,
+                               .reply_count = 4, .participant = 0,
+                               .body = oc_slice_str("not yours") };
+        ROUNDTRIP(oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_REPLY, h, p);
+        oc_thread_reply out = {0};
+        CHECK(oc_decode_thread_reply(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1003 && out.reply_count == 4);
+        CHECK(out.participant == 0);
+        CHECK(slice_eq_str(out.body, "not yours"));
+        CHECK(out.n_attach == 0);
+    }
+    /* Participant set, no tail: the byte must not be mistaken for one. */
+    {
+        oc_thread_reply in = { .message_id = 1004, .channel_id = 7, .parent_id = 500,
+                               .author_id = 42, .server_time = 1751200500002ull,
+                               .reply_count = 5, .participant = 1,
+                               .body = oc_slice_str("") };
+        ROUNDTRIP(oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &in), OC_MSG_THREAD_REPLY, h, p);
+        oc_thread_reply out = {0};
+        CHECK(oc_decode_thread_reply(&p, &out) == OC_OK);
+        CHECK(out.message_id == 1004 && out.participant == 1 && out.n_attach == 0);
+        CHECK(out.body.len == 0);
     }
     {
         oc_list_thread in = { 7, 500 };

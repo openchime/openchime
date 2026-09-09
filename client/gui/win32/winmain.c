@@ -20809,6 +20809,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 /* Every workspace, not just the visible one — a background
                  * workspace's mail is exactly what you cannot otherwise see. */
                 for (int wi = 0; wi < (g_n_wss > 0 ? g_n_wss : 1); wi++) {
+                  oc_client *wc = (g_n_wss > 0) ? g_wss[wi].client : g_client;
                   const oc_model *wm = (g_n_wss > 0)
                       ? (g_wss[wi].client ? oc_client_model(g_wss[wi].client) : NULL) : m;
                   if (!wm || !wm->authed) continue;
@@ -20959,6 +20960,68 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (!fg && (mentioned || kw_hit || vip ||
                                 c->kind == OC_CHANNEL_KIND_DM))
                         taskbar_flash(hwnd);
+                  }
+
+                  /* Thread replies (REQ-061). A separate pass because a reply is
+                   * deliberately not in the main scroll (REQ-060): it never
+                   * moves a channel's high-water mark, so the loop above cannot
+                   * see one however carefully it looks. The model queued the
+                   * ones the daemon said are mine (ARCH-104); the verdict is
+                   * still oc_notify_decide's, asked inside the take.
+                   *
+                   * Drained even before priming, and even with toasts off, so
+                   * the queue cannot accrue a backlog and replay it as a burst —
+                   * the same reason the loop above advances its marks
+                   * unconditionally. */
+                  {
+                    oc_thread_notice tn[OC_MAX_THREAD_NOTICES];
+                    size_t ntn = oc_client_thread_notify_take(wc, ws_quiet, ws_paused,
+                                                              tn, OC_MAX_THREAD_NOTICES);
+                    if (!g_notify_primed) ntn = 0;   /* the first pass is not new mail */
+                    for (size_t ti = 0; ti < ntn; ti++) {
+                        const oc_thread_notice *n = &tn[ti];
+                        const oc_channel *c = NULL;
+                        for (size_t ci = 0; ci < wm->n_channels; ci++)
+                            if (wm->channels[ci].channel_id == n->channel_id) { c = &wm->channels[ci]; break; }
+                        if (!c) continue;
+                        /* "You are looking at it" is the OPEN THREAD here, not
+                         * merely the channel: a reply lands in a pane the
+                         * channel's scroll does not show, so being in the
+                         * channel is not having seen it. */
+                        int reading = fg && is_active && wm->thread_open &&
+                                      wm->thread_parent == n->parent_id;
+                        if (reading) continue;
+                        if (g_pref_notify != NOTIFY_OFF) {
+                            char label[96], title[160], body[256], source[128];
+                            channel_label(wm, c, label, sizeof label);
+                            const char *who = oc_model_user_name(wm, n->author_id);
+                            /* The thread is the point — a reply in one reads as
+                             * a different place from the channel it lives in,
+                             * and a source that said only "#general" would send
+                             * you looking down a scroll it is not in. */
+                            snprintf(source, sizeof source, "%s — thread", label);
+                            if (!is_active) {
+                                char both[128];
+                                snprintf(both, sizeof both, "%s — %s",
+                                         oc_model_workspace_name(wm), source);
+                                snprintf(source, sizeof source, "%s", both);
+                            }
+                            snprintf(title, sizeof title, "%s", (who && who[0]) ? who : label);
+                            if (g_pref_notify == NOTIFY_FULL && n->body[0])
+                                snprintf(body, sizeof body, "%s", n->body);
+                            else
+                                snprintf(body, sizeof body, "New reply");
+                            notify_deliver(title, body, source, (uint64_t)wi, c->channel_id,
+                                           sound_choice_for(n->mentioned || n->keyword_hit ||
+                                                            oc_model_is_priority(wm, n->author_id),
+                                                            c->kind == OC_CHANNEL_KIND_DM));
+                        }
+                        /* Flashed unconditionally, unlike a channel message: a
+                         * reply reaching here already means a thread of YOURS,
+                         * which is the same "this is addressed to me" the
+                         * channel gate spells out as mention-or-DM. */
+                        if (!fg) taskbar_flash(hwnd);
+                    }
                   }
                 }
                 g_notify_primed = 1;

@@ -161,6 +161,11 @@ typedef struct {
 /* Scratch for encoding one outgoing frame; net thread only, so a single static
  * buffer is safe and avoids per-send allocation (bodies can be ~64KB). */
 static uint8_t g_enc[OC_MAX_FRAME_SIZE];
+/* A SECOND such buffer, for the one frame that differs per recipient: a thread
+ * reply carries whether the peer being written to is in the thread (REQ-061), so
+ * the fan-out holds both encodings at once and sends whichever matches. Two
+ * buffers rather than an encode per member, because the field is a boolean. */
+static uint8_t g_enc_participant[OC_MAX_FRAME_SIZE];
 /* Scheduled-send sweep state (REQ-224, ARCH-102). `more` is set by the result
  * path when a send arrives with no connection behind it — that is one the sweep
  * fired, and there may be another right behind it. */
@@ -660,6 +665,14 @@ static void call_conn_closed(int ep, conn **conns, uint64_t conn_id) {
 
 static int in_members(uint64_t uid, const uint64_t *m, size_t n) {
     for (size_t i = 0; i < n; i++) if (m[i] == uid) return 1;
+    return 0;
+}
+
+/* in_members, but reporting WHERE — a thread reply carries a per-recipient byte
+ * (ARCH-104) held in an array parallel to the audience, so the fan-out needs the
+ * index and not merely the membership. */
+static int member_index(uint64_t uid, const uint64_t *m, size_t n, size_t *out) {
+    for (size_t i = 0; i < n; i++) if (m[i] == uid) { *out = i; return 1; }
     return 0;
 }
 
@@ -2711,17 +2724,45 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
             send_bytes(ep, conns, sender->fd, g_enc, w.len);
         }
         if (!r->duplicate) {
-            oc_wbuf_init(&w, g_enc, sizeof g_enc);
+            /* `participant` is per-RECIPIENT (REQ-061, ARCH-104) — the only
+             * field on a fan-out frame that is. It is a boolean, so the frame
+             * is encoded twice rather than once per member: two encodes for a
+             * channel of any size, and the loop below picks the one that
+             * matches. Designated initialisers, because a positional list over
+             * a struct that just grew a field shifts every later value with no
+             * compiler error at all. */
             oc_slice body = { r->body, r->body_len };
-            oc_thread_reply tr = { r->message_id, r->channel_id, r->parent_id,
-                                   r->author_id, r->server_time, r->reply_count, body, 0, {{0}} };
+            oc_thread_reply tr = { .message_id  = r->message_id,
+                                   .channel_id  = r->channel_id,
+                                   .parent_id   = r->parent_id,
+                                   .author_id   = r->author_id,
+                                   .server_time = r->server_time,
+                                   .reply_count = r->reply_count,
+                                   .participant = 0,
+                                   .body        = body };
             tr.n_attach = fill_attach_entries(tr.attach, r->attach, r->n_attach);
+
+            oc_wbuf_init(&w, g_enc, sizeof g_enc);
             oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &tr);
-            size_t blen = w.len;
+            size_t out_len = w.len;
+
+            oc_wbuf pw;
+            oc_wbuf_init(&pw, g_enc_participant, sizeof g_enc_participant);
+            tr.participant = 1;
+            oc_encode_thread_reply(&pw, OC_PROTOCOL_VERSION, &tr);
+            size_t in_len = pw.len;
+
             for (int fd = 0; fd < OC_NETLOOP_MAX_FD; fd++) {
                 conn *c = conns[fd];
-                if (c && c->authed && in_members(c->user_id, r->members, r->n_members))
-                    send_bytes(ep, conns, fd, g_enc, blen);
+                if (!c || !c->authed) continue;
+                size_t idx = 0;
+                if (!member_index(c->user_id, r->members, r->n_members, &idx)) continue;
+                /* No flags means the participation lookup could not allocate:
+                 * treat everyone as outside the thread, so the failure costs a
+                 * toast rather than inventing one. */
+                int in_thread = r->member_participant && r->member_participant[idx];
+                if (in_thread) send_bytes(ep, conns, fd, g_enc_participant, in_len);
+                else           send_bytes(ep, conns, fd, g_enc,   out_len);
             }
             /* And the notify decision, which a reply never produced at all
              * (REQ-061): the root goes with it, so the emitter can notify the
@@ -2761,12 +2802,25 @@ static void deliver_result(int ep, conn **conns, oc_dbres *r) {
         /* Stream each reply as a self-framed THREAD_REPLY (a 64KB body is fine),
          * then close with the THREAD terminator (like BACKFILL_DONE). */
         int fd = c->fd;
+        /* One recipient — the caller — so participation is asked once. It is
+         * the TRUE answer: a replay reports who is in the thread just as the
+         * live fan-out does, and the client suppresses its own toasts for
+         * history it asked for. Reporting 0 here to stop the toasts would make
+         * the byte mean something different depending on the path, which is
+         * how the two copies of the rule drifted the first time. */
+        int in_thread = r->list_participant;
         for (size_t i = 0; i < r->n_thread && conns[fd]; i++) {
             oc_replay_msg *m = &r->thread[i];
             oc_wbuf_init(&w, g_enc, sizeof g_enc);
             oc_slice body = { m->body, m->body_len };
-            oc_thread_reply tr = { m->message_id, m->channel_id, r->parent_id,
-                                   m->author_id, m->server_time, (uint32_t)r->n_thread, body, 0, {{0}} };
+            oc_thread_reply tr = { .message_id  = m->message_id,
+                                   .channel_id  = m->channel_id,
+                                   .parent_id   = r->parent_id,
+                                   .author_id   = m->author_id,
+                                   .server_time = m->server_time,
+                                   .reply_count = (uint32_t)r->n_thread,
+                                   .participant = (uint8_t)(in_thread != 0),
+                                   .body        = body };
             tr.n_attach = fill_attach_entries(tr.attach, m->attach, m->n_attach);
             oc_encode_thread_reply(&w, OC_PROTOCOL_VERSION, &tr);
             send_bytes(ep, conns, fd, g_enc, w.len);
