@@ -87,6 +87,28 @@ typedef struct {
     oc_msg_forward *forward;
 } oc_msg;
 
+/* How many live thread replies can be waiting for the toast pass at once. The
+ * pass runs every tick, so this only has to survive a burst between two of
+ * them; a deeper queue would only mean toasting something older. */
+#define OC_MAX_THREAD_NOTICES 32
+
+/* A live thread reply that may deserve a toast (REQ-061). `mentioned` and
+ * `keyword_hit` are resolved WHEN THE REPLY ARRIVES, against the full body,
+ * because the body itself is not kept — the excerpt below is for the toast, and
+ * scanning a truncated body would silently lose a mention past the cut. Whether
+ * it actually notifies is decided later, from state that can change in between:
+ * the channel's mute and level, the author's priority, the schedule and the
+ * pause. */
+typedef struct {
+    uint64_t channel_id;
+    uint64_t message_id;
+    uint64_t parent_id;
+    uint64_t author_id;
+    uint8_t  mentioned;
+    uint8_t  keyword_hit;
+    char     body[256];    /* NUL-terminated excerpt, for the toast */
+} oc_thread_notice;
+
 typedef struct {
     uint64_t channel_id;
     char    *name;         /* heap; NULL until a CHANNEL_LIST entry names it */
@@ -285,6 +307,18 @@ typedef struct {
     uint64_t  thread_channel, thread_parent;
     oc_msg   *thread_msgs;
     size_t    n_thread_msgs, cap_thread_msgs;
+    /* A LIST_THREAD replay is in flight: set when the thread is opened, cleared
+     * by its THREAD terminator. History and a live reply arrive as the same
+     * frame, and only the second is worth interrupting anyone for. */
+    uint8_t   thread_replay;
+    /* Replies that arrived live and may be worth a toast (REQ-061). A thread
+     * reply never enters a channel's scroll (REQ-060) and so never moves the
+     * high-water mark the toast pass watches, and its body is dropped entirely
+     * unless its thread happens to be open — so what a toast needs is kept here
+     * as it arrives, and nowhere else. Bounded and oldest-dropping: a burst
+     * costs the oldest notice, never memory. */
+    oc_thread_notice notices[OC_MAX_THREAD_NOTICES];
+    size_t    n_notices;
     /* The open search view (REQ-080): the query and its hits. */
     uint8_t   search_open;
     char      search_query[128];
@@ -728,6 +762,26 @@ int oc_model_is_priority(const oc_model *m, uint64_t user_id);
 const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
                                    uint64_t since_id, int quiet, int paused,
                                    int *mentioned, int *keyword_hit, int *vip);
+
+/* The same question for THREAD REPLIES, which oc_model_notify_scan structurally
+ * cannot answer: it walks a channel's scroll, and a reply is deliberately not in
+ * one (REQ-060), so it never sees a reply and passes 0 for the evaluator's
+ * thread_reply input.
+ *
+ * A sibling rather than a parameter, because the two gather from different
+ * places — a scroll the client keeps, and a queue of replies it was TOLD about
+ * (ARCH-104), since it cannot derive its own participation. Both then ask
+ * oc_notify_decide, which stays the only thing that decides.
+ *
+ * DRAINS the queue — every pending notice is considered exactly once, whether or
+ * not it notifies — and writes those that do into `out`, newest last, returning
+ * how many were written. Notices past `max` are dropped rather than left behind,
+ * so a caller with a small buffer cannot make the queue grow.
+ *
+ * `quiet` and `paused` are the caller's, as they are for the scan: they belong
+ * to the workspace rather than the channel. */
+size_t oc_model_thread_notify_take(oc_model *m, int quiet, int paused,
+                                   oc_thread_notice *out, size_t max);
 /* Record a presence value (used for our own presence, which the server does not
  * echo back to us). */
 void oc_model_note_presence(oc_model *m, uint64_t user_id, uint8_t status);

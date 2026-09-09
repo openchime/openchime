@@ -5,6 +5,7 @@
 
 #include "dbwriter.h"
 #include "migrate.h"
+#include "notify.h"   /* the badge asks the same rule a toast does */
 #include "protocol.h"
 #include "issuer.h"
 #include "check.h"
@@ -2671,6 +2672,97 @@ static oc_dbres *list_thread_r(oc_dbwriter *w, uint64_t uid, uint64_t ch, uint64
     return wait_result(w);
 }
 
+/* What the daemon's channel badge counts (REQ-284), swept against the evaluator.
+ *
+ * The badge is a COUNT over a channel's backlog rather than a decision about one
+ * message, so it is the one place oc_notify_decide is restated as SQL instead of
+ * asked. That restatement is only safe if something compares the two, which is
+ * this: every state the count can express, set up for real and checked against
+ * the rule's own answer.
+ *
+ * The schedule and the pause are deliberately absent — REQ-284 leaves them out,
+ * so the evaluator is asked with both false and a quiet-hours arrival still
+ * counts. */
+static void test_badge_matches_evaluator(void) {
+    const char *path = "build/test_dbwriter_badge.db";
+    cleanup_db(path);
+    oc_dbwriter *w = oc_dbwriter_start(path);
+    CHECK(w != NULL);
+    if (!w) return;
+
+    uint64_t alice = reg(w, "bg-alice", "pw", OC_ROLE_OWNER);
+    uint64_t bob   = reg(w, "bg-bob",   "pw", OC_ROLE_MEMBER);
+    CHECK(alice && bob);
+
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open(path, &db) == SQLITE_OK);
+
+    int idx = 0, mismatches = 0, counted = 0;
+    for (int muted = 0; muted < 2; muted++)
+    for (unsigned level = 0; level < 3; level++)
+    for (int vip = 0; vip < 2; vip++)
+    for (int mentioned = 0; mentioned < 2; mentioned++)
+    for (int keyword = 0; keyword < 2; keyword++) {
+        idx++;
+        char sql[1024];
+        /* One state at a time, from a clean slate: the badge counts a backlog,
+         * so leaving the previous state's message behind would make every count
+         * after the first a sum of states nobody configured. */
+        snprintf(sql, sizeof sql,
+            "DELETE FROM messages; DELETE FROM mentions; DELETE FROM delivery_cursors;"
+            "DELETE FROM notification_prefs WHERE user_id=%llu;"
+            "DELETE FROM priority_people WHERE user_id=%llu;"
+            "INSERT INTO notification_prefs(user_id,channel_id,level,muted) VALUES(%llu,1,%u,%d);"
+            "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms)"
+            " VALUES(5000,1,%llu,'a message',1);",
+            (unsigned long long)bob, (unsigned long long)bob,
+            (unsigned long long)bob, level, muted,
+            (unsigned long long)alice);
+        CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+        if (vip) {
+            snprintf(sql, sizeof sql,
+                "INSERT INTO priority_people(user_id,person_id) VALUES(%llu,%llu);",
+                (unsigned long long)bob, (unsigned long long)alice);
+            CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+        }
+        if (mentioned) {
+            snprintf(sql, sizeof sql,
+                "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms)"
+                " VALUES(5000,1,%llu,0,0,4,1);", (unsigned long long)bob);
+            CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+        }
+        if (keyword) {
+            snprintf(sql, sizeof sql,
+                "INSERT INTO mentions(message_id,channel_id,user_id,kind,span_start,span_len,created_at_ms)"
+                " VALUES(5000,1,%llu,4,0,6,1);", (unsigned long long)bob);
+            CHECK(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+        }
+
+        int want = oc_notify_decide(0, muted, vip, level, mentioned, keyword, 0, 0, 0);
+        oc_dbres *r = list_channels(w, bob);
+        int got = -1;
+        if (r) {
+            for (size_t i = 0; i < r->n_chlist; i++)
+                if (r->chlist[i].channel_id == 1) got = (int)r->chlist[i].unread;
+            oc_dbres_free(r);
+        }
+        if (got != want) {
+            mismatches++;
+            printf("  badge: muted=%d level=%u vip=%d men=%d kw=%d -> %d (rule says %d)\n",
+                   muted, level, vip, mentioned, keyword, got, want);
+        }
+        counted += want;
+    }
+    sqlite3_close(db);
+
+    CHECK(idx == 48);
+    CHECK(mismatches == 0);
+    /* Both answers occur, or a badge stuck at zero would agree with everything. */
+    CHECK(counted > 0 && counted < idx);
+    oc_dbwriter_stop(w);
+    cleanup_db(path);
+}
+
 static void test_threads(void) {
     const char *path = "build/test_dbwriter_threads.db";
     cleanup_db(path);
@@ -4846,6 +4938,7 @@ int run_dbwriter_tests(void) {
     test_admin_ops();
     test_reactions();
     test_threads();
+    test_badge_matches_evaluator();
     test_search();
     test_search_filters_and_paging();
     test_setup_invite();

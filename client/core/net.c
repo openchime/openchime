@@ -889,11 +889,21 @@ static int dispatch(oc_framebuf *fb, oc_queue *to_ui, disp_ctx *ctx) {
                     e->author_id = tr.author_id;
                     e->server_time = tr.server_time;
                     e->count = tr.reply_count;
+                    e->participant = tr.participant;
                     e->body = malloc(tr.body.len + 1);
                     if (e->body) { memcpy(e->body, tr.body.ptr, tr.body.len); e->body[tr.body.len] = '\0'; }
                     oc_queue_push(to_ui, e);
                     push_attachments(to_ui, tr.channel_id, tr.message_id, tr.attach, tr.n_attach);
                 }
+            }
+        } else if (hdr.msg_type == OC_MSG_THREAD) {
+            /* The replay's terminator. Decoded so the model can tell a thread's
+             * HISTORY from a reply that just happened: both arrive as
+             * THREAD_REPLY, and only the second one is news. */
+            oc_thread th;
+            if (oc_decode_thread(&p, &th) == OC_OK) {
+                oc_ev *e = oc_ev_new(OC_EV_THREAD_END);
+                if (e) { e->parent_id = th.parent_id; e->count = th.count; oc_queue_push(to_ui, e); }
             }
         } else if (hdr.msg_type == OC_MSG_THREAD_META) {
             oc_thread_meta tm;

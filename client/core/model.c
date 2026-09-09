@@ -576,6 +576,10 @@ void oc_model_close_thread(oc_model *m) {
     m->n_thread_msgs = m->cap_thread_msgs = 0;
     m->thread_open = 0;
     m->thread_parent = m->thread_channel = 0;
+    /* Cleared here as well as by the terminator, because a thread can be closed
+     * before its replay arrives — or instead of it, if the request failed. A
+     * flag that only ever cleared on success would silence every later toast. */
+    m->thread_replay = 0;
 }
 
 void oc_model_open_thread(oc_model *m, uint64_t channel_id, uint64_t parent_id) {
@@ -583,6 +587,9 @@ void oc_model_open_thread(oc_model *m, uint64_t channel_id, uint64_t parent_id) 
     m->thread_open = 1;
     m->thread_channel = channel_id;
     m->thread_parent = parent_id;
+    /* A LIST_THREAD goes out with this, and its replies come back as ordinary
+     * THREAD_REPLY frames. They are history, and history does not toast. */
+    m->thread_replay = 1;
 }
 
 /* Append a thread reply, stealing ownership of `*body` (NULL on success). */
@@ -908,7 +915,7 @@ const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
         int is_vip = oc_model_is_priority(m, msg->author_id);
         /* thread_reply is 0: this watches a channel's main scroll, and a thread
          * reply is deliberately not in it (REQ-060), so it never sees one.
-         * Wiring it needs a flag on THREAD_REPLY and is tracked. */
+         * Replies are answered by oc_model_thread_notify_take instead. */
         if (!oc_notify_decide(0, c->muted, is_vip, c->notify_level,
                               men, kw, 0, quiet, paused)) continue;
 
@@ -918,6 +925,58 @@ const oc_msg *oc_model_notify_scan(const oc_model *m, const oc_channel *c,
         if (vip)         *vip         |= is_vip;
     }
     return pick;
+}
+
+/* Remember a live reply that might deserve a toast. Called as the reply
+ * arrives, because this is the only moment its body exists: unless its thread
+ * happens to be open, the model keeps nothing of a reply but a count on the
+ * parent. The mention and keyword scans therefore run here, against the whole
+ * body, and only the excerpt is kept. */
+static void notice_push(oc_model *m, const oc_ev *e) {
+    if (m->n_notices == OC_MAX_THREAD_NOTICES) {
+        /* Full: drop the oldest. A toast for something that just happened is
+         * worth more than one for the message before it. */
+        memmove(&m->notices[0], &m->notices[1],
+                (OC_MAX_THREAD_NOTICES - 1) * sizeof m->notices[0]);
+        m->n_notices--;
+    }
+    oc_thread_notice *n = &m->notices[m->n_notices++];
+    memset(n, 0, sizeof *n);
+    n->channel_id = e->channel_id;
+    n->message_id = e->message_id;
+    n->parent_id  = e->parent_id;
+    n->author_id  = e->author_id;
+    if (e->body) {
+        size_t blen = strlen(e->body);
+        const char *me = oc_model_user_name(m, m->user_id);
+        n->mentioned   = (uint8_t)(oc_mention_targets(e->body, blen, me) != 0);
+        n->keyword_hit = (uint8_t)(oc_model_keyword_hit(m, e->body, blen, NULL, NULL) != 0);
+        snprintf(n->body, sizeof n->body, "%s", e->body);
+    }
+}
+
+size_t oc_model_thread_notify_take(oc_model *m, int quiet, int paused,
+                                   oc_thread_notice *out, size_t max) {
+    if (!m) return 0;
+    size_t kept = 0;
+    for (size_t i = 0; i < m->n_notices; i++) {
+        oc_thread_notice *n = &m->notices[i];
+        const oc_channel *c = NULL;
+        for (size_t k = 0; k < m->n_channels; k++)
+            if (m->channels[k].channel_id == n->channel_id) { c = &m->channels[k]; break; }
+        if (!c) continue;          /* a channel we no longer hold */
+        int is_vip = oc_model_is_priority(m, n->author_id);
+        /* thread_reply is 1 by construction: the daemon told us this reply is
+         * one of ours (ARCH-104), and only such replies are queued. Everything
+         * else is ours to supply, and mute, the schedule and the pause still
+         * silence it — participation satisfies the mentions LEVEL, it does not
+         * step around it. */
+        if (!oc_notify_decide(0, c->muted, is_vip, c->notify_level,
+                              n->mentioned, n->keyword_hit, 1, quiet, paused)) continue;
+        if (out && kept < max) out[kept++] = *n;
+    }
+    m->n_notices = 0;              /* considered once, whatever the verdict */
+    return kept;
 }
 
 uint8_t oc_model_presence_of(const oc_model *m, uint64_t user_id) {
@@ -1003,9 +1062,27 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
             c->preview_author = e->author_id;
         }
         if (c && channel_append(c, e->author_id, e->author_name, e->message_id, e->server_time, &e->body)) {
-            /* Count as unread only messages from others past the read marker; a
-             * frontend clears this by marking the focused channel read. */
-            if (e->author_id != m->user_id && e->message_id > c->read_marker)
+            /* A badge counts what WOULD HAVE NOTIFIED, with the schedule and
+             * the pause left out — they say when to interrupt you, not whether
+             * a message mattered, and a badge that emptied itself overnight
+             * would hide the morning's backlog. The daemon counts the same
+             * thing the same way, which is what makes the seeded count and this
+             * one the same number rather than two plausible ones.
+             *
+             * Asked of the evaluator rather than restated: the message is in
+             * hand, so there is no reason to guess at what it would have said.
+             * Own messages are excluded by `own`, not by a second test. */
+            const oc_msg *msg = &c->msgs[c->n_msgs - 1];
+            int men = 0, kw = 0;
+            if (msg->body) {
+                size_t blen = strlen(msg->body);
+                men = oc_mention_targets(msg->body, blen, oc_model_user_name(m, m->user_id));
+                kw  = oc_model_keyword_hit(m, msg->body, blen, NULL, NULL);
+            }
+            if (e->message_id > c->read_marker &&
+                oc_notify_decide(e->author_id == m->user_id, c->muted,
+                                 oc_model_is_priority(m, e->author_id),
+                                 c->notify_level, men, kw, 0, 0, 0))
                 c->unread++;
         }
         break;
@@ -1411,8 +1488,24 @@ void oc_model_apply(oc_model *m, oc_ev *e) {
     }
     case OC_EV_THREAD_REPLY:
         bump_reply_count(m, e->parent_id, e->count);   /* mark the parent in scroll */
+        /* Worth interrupting for? Only if the daemon says this thread is one of
+         * mine (REQ-061), only if I did not write it, and only if this is news
+         * rather than the history I just asked for — a replay's frames are
+         * these same frames, and its participation byte is just as true. */
+        if (e->participant && e->author_id != m->user_id && !m->thread_replay) {
+            notice_push(m, e);
+            /* The Threads view's unread is server-supplied and refreshed only by
+             * a list (REQ-062), so move it here too: the badge should follow the
+             * toast, not wait for the next LIST_THREADS. */
+            for (size_t i = 0; i < m->n_threads; i++)
+                if (m->threads[i].root_id == e->parent_id) { m->threads[i].unread++; break; }
+        }
         if (m->thread_open && e->parent_id == m->thread_parent)
             thread_append(m, e->message_id, e->author_id, e->server_time, &e->body);
+        break;
+    case OC_EV_THREAD_END:
+        /* The replay is done; anything arriving from here is live. */
+        if (e->parent_id == m->thread_parent) m->thread_replay = 0;
         break;
     case OC_EV_THREAD_META:
         bump_reply_count(m, e->message_id, e->count);

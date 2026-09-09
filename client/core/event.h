@@ -52,6 +52,7 @@ enum {
     OC_EV_DELETE,          /* a MSG_DELETED: channel/message tombstone */
     OC_EV_TYPING,          /* a TYPING_UPDATE: user_id is typing in channel_id */
     OC_EV_THREAD_REPLY,    /* a THREAD_REPLY: parent_id/message + body + count */
+    OC_EV_THREAD_END,      /* a THREAD: the LIST_THREAD replay is complete (parent_id) */
     OC_EV_THREAD_META,     /* a THREAD_META: message_id + reply count (backfill) */
     OC_EV_SEARCH_RESULT,   /* a SEARCH_RESULTS entry: channel/message/author + snippet(body) */
     OC_EV_REACTIONS,       /* a REACTIONS entry: message_id + one reactor (user_id + emoji) */
@@ -161,6 +162,9 @@ typedef struct {
     char    *topic;        /* heap; CHANNEL: the channel topic, NULL = none (REQ-034).
                               Its own field because a topic is up to 250 bytes and
                               every fixed buffer here is smaller. */
+    uint8_t  participant;  /* THREAD_REPLY: this user is in the thread (REQ-061).
+                              Derived server-side (ARCH-104) because the client
+                              holds a thread's replies only while it is open. */
     uint8_t  archived;     /* CHANNEL: the channel is archived (REQ-035) */
     uint64_t created_at;   /* CHANNEL (from CHANNEL_INFO): when it was created */
     char    *preview;      /* heap; CHANNEL: newest message text (REQ-050 sidebar) */

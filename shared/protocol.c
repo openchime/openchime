@@ -577,6 +577,10 @@ oc_result oc_encode_thread_reply(oc_wbuf *w, uint16_t version, const oc_thread_r
     oc_w_u64(w, m->author_id);
     oc_w_u64(w, m->server_time);
     oc_w_u32(w, m->reply_count);
+    /* Ahead of the body, so it stays in the fixed part: the tail below is
+     * already optional, and a second field sharing it is how a decoder loses
+     * its place. */
+    oc_w_u8(w, m->participant ? 1u : 0u);
     oc_w_lstr(w, m->body);
     /* Optional trailing attachment metadata (REQ-140), as on BROADCAST. */
     if (m->n_attach) {
@@ -2094,6 +2098,7 @@ oc_result oc_decode_thread_reply(oc_rbuf *p, oc_thread_reply *m) {
     m->author_id = oc_r_u64(p);
     m->server_time = oc_r_u64(p);
     m->reply_count = oc_r_u32(p);
+    m->participant = oc_r_u8(p);
     m->body = oc_r_lstr(p);
     m->n_attach = 0;
     if (!p->underflow && p->pos < p->len) {

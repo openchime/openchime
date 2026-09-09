@@ -38,7 +38,18 @@
  * unconditional; CHANNEL_LIST gained topic/archived/created_at/preview/
  * preview_author. Shipping client and daemon together (ARCH-61) means there is
  * no compatibility window to preserve — only a mismatch to detect loudly. */
-/* 10: SEND carries an optional forward SOURCE (channel + message), and FORWARD
+/* 11: THREAD_REPLY carries whether the recipient is a PARTICIPANT in the thread
+ * (REQ-061, ARCH-104). Participation is derived from message rows the client
+ * does not hold — it keeps at most one thread's replies, and only while that
+ * thread is open — so the client cannot compute its own, and without being told
+ * it passed 0 for the evaluator's thread_reply input and never raised a toast
+ * for a reply the daemon had already decided was worth one. The byte rides the
+ * fixed part rather than the tail, which already holds the optional attachment
+ * list. It carries the INPUT, not the verdict: the recipient still asks
+ * oc_notify_decide with its own mute, level, priority people, schedule and
+ * pause, because a second thing deciding is what ARCH-103 exists to prevent.
+ *
+ * 10: SEND carries an optional forward SOURCE (channel + message), and FORWARD
  * (0x00D9) carries the reference the daemon resolves from it (REQ-057). The
  * source rides SEND's fixed part rather than its tail: that tail already holds
  * an optional attachment list, BROADCAST's holds two optional fields, and a
@@ -71,7 +82,7 @@
  * change, not merely a new frame, so the version must move — a v3 client decoding a
  * v4 user list reads the next entry's fields shifted by eight bytes and reports only
  * "connection lost" (ARCH-61 ships the two together). */
-#define OC_PROTOCOL_VERSION 10u
+#define OC_PROTOCOL_VERSION 11u
 
 /* The version stamped on HELLO, WELCOME and REJECT, forever. Negotiation cannot
  * be allowed to depend on its own outcome: if the handshake frames carried the
@@ -726,7 +737,12 @@ typedef struct { uint64_t channel_id; uint32_t count; } oc_files;
 
 typedef struct { uint64_t channel_id; uint8_t idem[OC_IDEM_SIZE]; uint64_t parent_id; oc_slice body;
                  uint16_t n_attach; uint64_t attach_ids[OC_MAX_ATTACH]; } oc_send_reply;
-typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t parent_id; uint64_t author_id; uint64_t server_time; uint32_t reply_count; oc_slice body;
+/* `participant` is per-RECIPIENT, which no other field on a fan-out frame is:
+ * it answers "are you in this thread" (REQ-061, ARCH-104) for the peer being
+ * written to, so the daemon encodes the frame twice — once each way — and sends
+ * whichever matches. It is the evaluator's thread_reply INPUT and not a verdict;
+ * the recipient still decides with its own mute, level and schedule. */
+typedef struct { uint64_t message_id; uint64_t channel_id; uint64_t parent_id; uint64_t author_id; uint64_t server_time; uint32_t reply_count; uint8_t participant; oc_slice body;
                  uint16_t n_attach; oc_attach_entry attach[OC_MAX_ATTACH]; } oc_thread_reply;
 typedef struct { uint64_t channel_id; uint64_t parent_id; } oc_list_thread;
 /* THREAD is the terminator of a LIST_THREAD response: the daemon streams the

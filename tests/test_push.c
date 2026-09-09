@@ -11,6 +11,10 @@
 #include "enroll.h"
 #include "migrate.h"
 #include "protocol.h"
+/* The client's half of the same decision (ARCH-103): the sweep below compares
+ * three answers, and this is the third. */
+#include "model.h"
+#include "event.h"
 
 #include <mbedtls/base64.h>
 #include <mbedtls/pk.h>
@@ -822,9 +826,16 @@ static void test_keyword_is_not_a_broadcast(void) {
  * the database, and requires oc_push_collect's answer to equal
  * oc_notify_decide's for the same inputs.
  *
- * `thread_reply` is the eighth input and is not swept here: it is derived from
- * message rows rather than set as a flag, and test_collect covers it directly.
- * It is passed as 0 to both sides, which is what a non-threaded send means.
+ * `thread_reply` is the eighth, and it IS swept — by building the message rows it
+ * is derived from (a root bob wrote, and a reply to it) rather than by setting a
+ * flag, which is the only way to sweep something the daemon derives. That
+ * doubles the sweep to 384.
+ *
+ * THREE answers are compared, not two. The daemon's SQL, the shared rule, and —
+ * because a thread reply now reaches the desktop too (REQ-061) — the CLIENT's
+ * own path, fed the participation byte the daemon just computed. The client is
+ * the reason the byte exists, so a sweep that stopped at the daemon would prove
+ * agreement between the two halves that never disagreed.
  *
  * A BYSTANDER sits in the channel for every one of those states: on MENTIONS,
  * never named, never a priority person, with no term of their own. Nothing in
@@ -834,6 +845,59 @@ static void test_keyword_is_not_a_broadcast(void) {
  * audience, because with a single recipient a row addressed to that recipient
  * answers the same either way. That is the shape of the bug this whole change
  * is about, and a sweep that cannot see it is agreement by coincidence. */
+/* Drive the CLIENT's thread-reply path for one state and report whether it would
+ * raise a toast.
+ *
+ * The client is given exactly what the wire gives it: the participation byte the
+ * daemon computed for this recipient, and a body. Everything else is the
+ * client's own state, set the way the server's frames would have set it — which
+ * is the point of comparing it against the same rule the daemon asked. `own` is
+ * not swept: the model refuses to queue a reply the user wrote, so passing one
+ * here would test nothing the model would ever see. */
+static int client_would_toast(uint64_t me, uint64_t author,
+                              uint64_t message_id, uint64_t root_id, int participant,
+                              int muted, unsigned level, int vip,
+                              int mentioned, int keyword, int quiet, int paused) {
+    oc_model m; oc_model_init(&m);
+    m.user_id = me;
+
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = me; e.body = strdup("bob"); oc_model_apply(&m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 1; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("general"); e.server_time = 10;
+    oc_model_apply(&m, &e);
+
+    oc_channel *c = oc_model_channel(&m, 1);
+    if (!c) { oc_model_free(&m); return -1; }
+    c->muted = (uint8_t)muted;
+    c->notify_level = (uint8_t)level;
+    if (vip) { m.n_pri_people = 1; m.pri_people[0] = author; }
+    if (keyword) { m.n_kw_terms = 1; snprintf(m.kw_terms[0], sizeof m.kw_terms[0], "%s", "widget"); }
+
+    /* The body carries the mention and the keyword, because the client resolves
+     * both from text (REQ-221) rather than being handed flags — the same
+     * scanners the daemon wrote its `mentions` rows with. */
+    char body[128];
+    snprintf(body, sizeof body, "%s%s reply text",
+             mentioned ? "@bob " : "", keyword ? "widget " : "");
+
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_THREAD_REPLY;
+    e.channel_id = 1; e.parent_id = root_id; e.message_id = message_id;
+    e.author_id = author; e.server_time = 100; e.count = 1;
+    e.participant = (uint8_t)participant;
+    e.body = strdup(body);
+    oc_model_apply(&m, &e);
+    free(e.body);
+
+    oc_thread_notice out[OC_MAX_THREAD_NOTICES];
+    size_t n = oc_model_thread_notify_take(&m, quiet, paused, out, OC_MAX_THREAD_NOTICES);
+    oc_model_free(&m);
+    return n > 0;
+}
+
 static void test_collect_matches_evaluator(void) {
     const char *path = "build/test_push_parity.db";
     cleanup_db(path);
@@ -858,7 +922,21 @@ static void test_collect_matches_evaluator(void) {
     sqlite3 *wdb = NULL;
     CHECK(sqlite3_open(path, &wdb) == SQLITE_OK);
 
-    int idx = 0, mismatches = 0, notified = 0;
+    /* The thread the swept replies hang off: bob wrote the root, so he is a
+     * participant by derivation (ARCH-104) and zoe is not. Written once — the
+     * predicate reads message rows, and the rows do not change per state. */
+    const uint64_t root = 800000ull;
+    {
+        char sql[512];
+        snprintf(sql, sizeof sql,
+            "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms) "
+            "VALUES(%llu,1,%llu,'the root',1);",
+            (unsigned long long)root, (unsigned long long)bob);
+        CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
+    }
+
+    int idx = 0, mismatches = 0, notified = 0, client_mismatches = 0;
+    for (int thread = 0; thread < 2; thread++)
     for (int muted = 0; muted < 2; muted++)
     for (unsigned level = 0; level < 3; level++)
     for (int vip = 0; vip < 2; vip++)
@@ -868,6 +946,18 @@ static void test_collect_matches_evaluator(void) {
     for (int paused = 0; paused < 2; paused++) {
         uint64_t msg = 900000ull + (uint64_t)idx++;
         char sql[1024];
+        /* In the thread half the swept message is a real reply to that root, so
+         * `thread_reply` is derived exactly as it is in production. In the other
+         * half no row is written and root_id is 0, which is what an ordinary
+         * channel send means. */
+        if (thread) {
+            snprintf(sql, sizeof sql,
+                "INSERT INTO messages(id,channel_id,author_id,body,created_at_ms,parent_id) "
+                "VALUES(%llu,1,%llu,'a reply',2,%llu);",
+                (unsigned long long)msg, (unsigned long long)alice,
+                (unsigned long long)root);
+            CHECK(sqlite3_exec(wdb, sql, NULL, NULL, NULL) == SQLITE_OK);
+        }
         snprintf(sql, sizeof sql,
             "DELETE FROM notification_prefs WHERE user_id=%llu AND channel_id=1;"
             "INSERT INTO notification_prefs(user_id,channel_id,level,muted) VALUES(%llu,1,%u,%d);"
@@ -905,7 +995,7 @@ static void test_collect_matches_evaluator(void) {
         sqlite3 *rdb = NULL;
         CHECK(sqlite3_open_v2(path, &rdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
         oc_push_target t[8];
-        int n = oc_push_collect(rdb, 1, alice, msg, 0, 100, now_ms, t, 8);
+        int n = oc_push_collect(rdb, 1, alice, msg, thread ? root : 0, 100, now_ms, t, 8);
         sqlite3_close(rdb);
 
         /* What the shared rule says, from the same inputs. The schedule is
@@ -917,7 +1007,7 @@ static void test_collect_matches_evaluator(void) {
                                          (int)((now_ms / 60000) % 1440),
                                          (int)((((now_ms / 60000) / 1440) + 4) % 7));
         int want = oc_notify_decide(0, muted, vip, level,
-                                    mentioned, keyword, 0, want_quiet, paused);
+                                    mentioned, keyword, thread, want_quiet, paused);
         /* Bob if and only if the rule says so, and the bystander never. */
         int got_bob = 0, got_zoe = 0;
         for (int i = 0; i < n; i++) {
@@ -926,17 +1016,37 @@ static void test_collect_matches_evaluator(void) {
         }
         if (got_bob != want || got_zoe || n != want) {
             mismatches++;
-            printf("  parity: muted=%d level=%u vip=%d men=%d kw=%d quiet=%d paused=%d"
+            printf("  parity: thread=%d muted=%d level=%u vip=%d men=%d kw=%d quiet=%d paused=%d"
                    " -> bob %d (rule says %d), bystander %d, total %d\n",
-                   muted, level, vip, mentioned, keyword, quiet, paused,
+                   thread, muted, level, vip, mentioned, keyword, quiet, paused,
                    got_bob, want, got_zoe, n);
+        }
+
+        /* The THIRD answer: the desktop's. A thread reply reaches it through a
+         * different path from a channel message — the model is TOLD it is a
+         * participant (ARCH-104) and queues the reply, because no scroll it
+         * keeps contains one — so the client is driven the way the wire drives
+         * it, with the byte the daemon just computed, and asked what it would
+         * raise. Bob is the recipient here, so the model is bob's. */
+        if (thread) {
+            int client_says = client_would_toast(bob, alice, msg, root, got_bob,
+                                                 muted, level, vip, mentioned, keyword,
+                                                 want_quiet, paused);
+            if (client_says != want) {
+                client_mismatches++;
+                printf("  client parity: muted=%d level=%u vip=%d men=%d kw=%d "
+                       "quiet=%d paused=%d -> toast %d (rule says %d)\n",
+                       muted, level, vip, mentioned, keyword, quiet, paused,
+                       client_says, want);
+            }
         }
         notified += want;
     }
     sqlite3_close(wdb);
 
-    CHECK(idx == 192);
+    CHECK(idx == 384);
     CHECK(mismatches == 0);
+    CHECK(client_mismatches == 0);
     /* Both answers occur across the sweep: a rule that says no to everything
      * would otherwise agree with a collector that returns nothing. */
     CHECK(notified > 0 && notified < idx);

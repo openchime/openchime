@@ -41,6 +41,13 @@ void oc_client_tick(oc_client *c);
 /* The current view-model (owned by the client; valid until oc_client_stop). */
 const oc_model *oc_client_model(oc_client *c);
 
+/* Drain the live thread replies worth interrupting for (REQ-061). The model is
+ * handed out const, and taking the queue necessarily empties it — considering a
+ * reply twice would toast it twice — so it goes through the client like every
+ * other mutation. See oc_model_thread_notify_take. */
+size_t oc_client_thread_notify_take(oc_client *c, int quiet, int paused,
+                                    oc_thread_notice *out, size_t max);
+
 /* Queue a message to `channel_id` for the network thread to send. */
 void oc_client_send(oc_client *c, uint64_t channel_id, const char *body);
 /* Forward `src_message` into `to_channel` with an optional note (REQ-057).

@@ -991,13 +991,209 @@ static void test_secret_routing(void) {
     unlink(sp); unlink("build/itest_core_secret.db-wal"); unlink("build/itest_core_secret.db-shm");
 }
 
+/* Build a model with one channel and one other user, ready to be fed replies. */
+static void notice_fixture(oc_model *m) {
+    oc_model_init(m);
+    m->user_id = 1;
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 1; e.body = strdup("alice"); oc_model_apply(m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_USER; e.user_id = 2; e.body = strdup("bob"); oc_model_apply(m, &e);
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_CHANNEL; e.channel_id = 10; e.status = 1; e.op = OC_CHANNEL_KIND;
+    e.is_public = 1; e.body = strdup("general"); e.server_time = 10;
+    oc_model_apply(m, &e);
+}
+
+static void feed_reply(oc_model *m, uint64_t message_id, uint64_t author,
+                       int participant, const char *body) {
+    oc_ev e;
+    memset(&e, 0, sizeof e);
+    e.type = OC_EV_THREAD_REPLY;
+    e.channel_id = 10; e.parent_id = 500; e.message_id = message_id;
+    e.author_id = author; e.server_time = 100 + message_id; e.count = 1;
+    e.participant = (uint8_t)participant;
+    e.body = strdup(body);
+    oc_model_apply(m, &e);
+    free(e.body);
+}
+
+/* WHICH thread replies the client considers at all (REQ-061).
+ *
+ * The precedence order is test_push's, swept against the daemon over all 384
+ * states. What is left — and what the client alone can get wrong — is the
+ * gathering: a reply is not in any scroll the client keeps, so everything about
+ * whether it is even a candidate lives here. */
+static void test_thread_notices(void) {
+    oc_thread_notice out[OC_MAX_THREAD_NOTICES];
+    {   /* The daemon says it is not mine: nothing to consider. */
+        oc_model m; notice_fixture(&m);
+        feed_reply(&m, 1, 2, 0, "not your thread");
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 0);
+        oc_model_free(&m);
+    }
+    {   /* Mine, from someone else: a toast, and the body travels with it. */
+        oc_model m; notice_fixture(&m);
+        feed_reply(&m, 1, 2, 1, "here is the answer");
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 1);
+        CHECK(out[0].message_id == 1 && out[0].author_id == 2);
+        CHECK(strcmp(out[0].body, "here is the answer") == 0);
+        oc_model_free(&m);
+    }
+    {   /* My own reply, in my own thread. Your own words are not news, and the
+         * model must not queue one at all — a later take cannot tell it apart. */
+        oc_model m; notice_fixture(&m);
+        feed_reply(&m, 1, 1, 1, "my own reply");
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 0);
+        oc_model_free(&m);
+    }
+    {   /* A LIST_THREAD replay. The frames are identical to live ones and carry
+         * the same true participation byte, so only the in-flight mark tells
+         * history from news — and the terminator ends it. */
+        oc_model m; notice_fixture(&m);
+        oc_model_open_thread(&m, 10, 500);
+        feed_reply(&m, 1, 2, 1, "an old reply");
+        feed_reply(&m, 2, 2, 1, "another old one");
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 0);
+        oc_ev e;
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_THREAD_END; e.parent_id = 500; e.count = 2;
+        oc_model_apply(&m, &e);
+        feed_reply(&m, 3, 2, 1, "a live one");
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 1);
+        CHECK(out[0].message_id == 3);
+        oc_model_free(&m);
+    }
+    {   /* Closing a thread clears the mark too. A replay that never arrives —
+         * the request failed, or the user closed the pane first — would
+         * otherwise silence every reply for the rest of the session. */
+        oc_model m; notice_fixture(&m);
+        oc_model_open_thread(&m, 10, 500);
+        oc_model_close_thread(&m);
+        feed_reply(&m, 1, 2, 1, "live after a closed thread");
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 1);
+        oc_model_free(&m);
+    }
+    {   /* Taking DRAINS: a reply is considered once, whatever the verdict, or a
+         * timer that runs every tick would toast it every tick. */
+        oc_model m; notice_fixture(&m);
+        feed_reply(&m, 1, 2, 1, "once");
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 1);
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 0);
+        /* Silenced by quiet hours, and still drained — it was considered. */
+        feed_reply(&m, 2, 2, 1, "during quiet hours");
+        CHECK(oc_model_thread_notify_take(&m, 1, 0, out, OC_MAX_THREAD_NOTICES) == 0);
+        CHECK(oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES) == 0);
+        oc_model_free(&m);
+    }
+    {   /* The queue is bounded and drops the OLDEST: a burst costs the stalest
+         * notice, never memory, and what survives is what just happened. */
+        oc_model m; notice_fixture(&m);
+        for (uint64_t i = 1; i <= OC_MAX_THREAD_NOTICES + 5; i++)
+            feed_reply(&m, i, 2, 1, "burst");
+        size_t n = oc_model_thread_notify_take(&m, 0, 0, out, OC_MAX_THREAD_NOTICES);
+        CHECK(n == OC_MAX_THREAD_NOTICES);
+        CHECK(out[n - 1].message_id == OC_MAX_THREAD_NOTICES + 5);
+        CHECK(out[0].message_id == 6);
+        oc_model_free(&m);
+    }
+    {   /* The Threads badge moves with the toast, rather than waiting for the
+         * next LIST_THREADS to say so (REQ-062). */
+        oc_model m; notice_fixture(&m);
+        oc_ev e;
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_THREAD_SUMMARY; e.message_id = 500; e.channel_id = 10;
+        e.author_id = 2; e.server_time = 10; e.reply_count = 1; e.unread_count = 0;
+        e.following = 1; e.body = strdup("the root");
+        oc_model_apply(&m, &e);
+        CHECK(oc_model_thread_unread(&m) == 0);
+        feed_reply(&m, 1, 2, 1, "a reply");
+        CHECK(oc_model_thread_unread(&m) == 1);
+        oc_model_free(&m);
+    }
+}
+
+/* What a channel's badge counts (REQ-284): the messages that would have
+ * NOTIFIED, with the schedule and the pause left out. */
+static void test_unread_counts_what_notifies(void) {
+    {   /* On MENTIONS, only the one that names me. Before REQ-284 this counted
+         * every message and the daemon counted something else again. */
+        oc_model m; notice_fixture(&m);
+        oc_channel *c = oc_model_channel(&m, 10);
+        CHECK(c != NULL);
+        if (c) c->notify_level = OC_NOTIFY_MENTIONS;
+        oc_ev e;
+        for (int i = 1; i <= 3; i++) {
+            memset(&e, 0, sizeof e);
+            e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = (uint64_t)i;
+            e.author_id = 2; e.server_time = 100 + i;
+            e.body = strdup(i == 2 ? "@alice look" : "chatter");
+            oc_model_apply(&m, &e);
+        }
+        CHECK(channel_unread(&m, 10) == 1);
+        oc_model_free(&m);
+    }
+    {   /* Muted counts nothing, whatever the level says. */
+        oc_model m; notice_fixture(&m);
+        oc_channel *c = oc_model_channel(&m, 10);
+        if (c) { c->notify_level = OC_NOTIFY_ALL; c->muted = 1; }
+        oc_ev e;
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 1; e.author_id = 2;
+        e.server_time = 100; e.body = strdup("@alice look"); oc_model_apply(&m, &e);
+        CHECK(channel_unread(&m, 10) == 0);
+        oc_model_free(&m);
+    }
+    {   /* A priority person pierces the level, exactly as they pierce a toast. */
+        oc_model m; notice_fixture(&m);
+        oc_channel *c = oc_model_channel(&m, 10);
+        if (c) c->notify_level = OC_NOTIFY_MENTIONS;
+        m.n_pri_people = 1; m.pri_people[0] = 2;
+        oc_ev e;
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 1; e.author_id = 2;
+        e.server_time = 100; e.body = strdup("nothing special"); oc_model_apply(&m, &e);
+        CHECK(channel_unread(&m, 10) == 1);
+        oc_model_free(&m);
+    }
+    {   /* My own messages never badge, and NONE passes nothing. */
+        oc_model m; notice_fixture(&m);
+        oc_channel *c = oc_model_channel(&m, 10);
+        if (c) c->notify_level = OC_NOTIFY_ALL;
+        oc_ev e;
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 1; e.author_id = 1;
+        e.server_time = 100; e.body = strdup("mine"); oc_model_apply(&m, &e);
+        CHECK(channel_unread(&m, 10) == 0);
+        if (c) c->notify_level = OC_NOTIFY_NONE;
+        memset(&e, 0, sizeof e);
+        e.type = OC_EV_MESSAGE; e.channel_id = 10; e.message_id = 2; e.author_id = 2;
+        e.server_time = 101; e.body = strdup("@alice look"); oc_model_apply(&m, &e);
+        CHECK(channel_unread(&m, 10) == 0);
+        oc_model_free(&m);
+    }
+    {   /* A thread reply badges the THREAD, never the channel: it is not in the
+         * scroll, so a channel badge would point at something you cannot find
+         * by opening it. */
+        oc_model m; notice_fixture(&m);
+        oc_channel *c = oc_model_channel(&m, 10);
+        if (c) c->notify_level = OC_NOTIFY_ALL;
+        feed_reply(&m, 1, 2, 1, "a reply");
+        CHECK(channel_unread(&m, 10) == 0);
+        oc_model_free(&m);
+    }
+}
+
 int run_client_core_tests(void) {
-    printf("test_client_core: sidebar, resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread, backfill, attachments, webhooks, client-settings, profile, seen-by, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox\n");
+    printf("test_client_core: sidebar, resolve, last-error, secret-routing, connect+auth, channel-list, send round-trip, unread (what a badge counts), thread-reply notices, backfill, attachments, webhooks, client-settings, profile, seen-by, persisted store, v3 workspace upgrade, workspace book, cached history, session reconnect, offline outbox\n");
 
     test_group_dm_title();
     test_sidebar();
     test_new_channel_takes_the_default_level();
     test_notify_scan();
+    test_thread_notices();
+    test_unread_counts_what_notifies();
     test_pins();
     test_resolve();
     test_last_error();

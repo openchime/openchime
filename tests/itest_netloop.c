@@ -678,6 +678,14 @@ static void test_threads_vertical(int port, const uint8_t *pin) {
     uint64_t ua = 0, ub = 0;
     CHECK(do_auth(&a, "alice", "pw-alice", &ua) == 0);
     CHECK(do_auth(&b, "bob", "pw-bob", &ub) == 0);
+    /* A third member who never touches the thread. THREAD_REPLY's `participant`
+     * byte is per-recipient (REQ-061) and the fan-out encodes the frame twice to
+     * carry it, so proving it needs someone the answer differs for. */
+    client d;
+    CHECK(client_open(&d, port, pin) == 0);
+    CHECK(do_handshake(&d) == 0);
+    uint64_t ud = 0;
+    CHECK(do_auth(&d, "carol", "pw", &ud) == 0);
 
     uint8_t buf[256]; oc_wbuf w; oc_header hdr; oc_rbuf p;
 
@@ -694,22 +702,38 @@ static void test_threads_vertical(int port, const uint8_t *pin) {
     }
     CHECK(mid != 0);
     CHECK(read_frame(&b, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BROADCAST);
+    CHECK(read_frame(&d, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_BROADCAST);
 
-    /* bob replies: he gets a SEND_ACK, and both members get a THREAD_REPLY (not
+    /* bob replies: he gets a SEND_ACK, and every member gets a THREAD_REPLY (not
      * a BROADCAST — the reply stays out of the main scroll). */
     oc_wbuf_init(&w, buf, sizeof buf);
     oc_send_reply sr = {0}; sr.channel_id = 1; memset(sr.idem, 0x72, OC_IDEM_SIZE);
     sr.parent_id = mid; sr.body = oc_slice_str("first reply");
     CHECK(oc_encode_send_reply(&w, OC_PROTOCOL_VERSION, &sr) == OC_OK);
     CHECK(send_frame(&b, buf, w.len) == 0);
+    oc_thread_reply tr = {0};
     for (int i = 0; i < 2; i++) {          /* bob: SEND_ACK + THREAD_REPLY */
         CHECK(read_frame(&b, &hdr, &p) == 0);
         CHECK(hdr.msg_type == OC_MSG_SEND_ACK || hdr.msg_type == OC_MSG_THREAD_REPLY);
+        if (hdr.msg_type == OC_MSG_THREAD_REPLY) {
+            CHECK(oc_decode_thread_reply(&p, &tr) == OC_OK);
+            CHECK(tr.participant == 1);    /* he wrote the reply */
+        }
     }
     CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_THREAD_REPLY);
-    oc_thread_reply tr = {0}; CHECK(oc_decode_thread_reply(&p, &tr) == OC_OK);
+    CHECK(oc_decode_thread_reply(&p, &tr) == OC_OK);
     CHECK(tr.parent_id == mid && tr.author_id == ub && tr.reply_count == 1);
     CHECK(tr.body.len == 11 && memcmp(tr.body.ptr, "first reply", 11) == 0);
+    CHECK(tr.participant == 1);            /* alice wrote the root */
+    /* The same reply, the same instant, the other answer: carol is in the
+     * channel and not in the thread. One encoding could not have carried both,
+     * which is the whole reason the fan-out encodes two. */
+    CHECK(read_frame(&d, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_THREAD_REPLY);
+    oc_thread_reply trc = {0};
+    CHECK(oc_decode_thread_reply(&p, &trc) == OC_OK);
+    CHECK(trc.message_id == tr.message_id);
+    CHECK(trc.participant == 0);
+    CHECK(trc.body.len == 11 && memcmp(trc.body.ptr, "first reply", 11) == 0);
 
     /* alice opens the thread: the reply is streamed, then a THREAD terminator. */
     oc_wbuf_init(&w, buf, sizeof buf);
@@ -718,6 +742,9 @@ static void test_threads_vertical(int port, const uint8_t *pin) {
     CHECK(send_frame(&a, buf, w.len) == 0);
     CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_THREAD_REPLY);
     CHECK(oc_decode_thread_reply(&p, &tr) == OC_OK && tr.parent_id == mid);
+    /* A replay reports participation truthfully — it is the same question, and
+     * the client suppresses its own toasts for history it asked for. */
+    CHECK(tr.participant == 1);
     CHECK(read_frame(&a, &hdr, &p) == 0 && hdr.msg_type == OC_MSG_THREAD);
     oc_thread th; CHECK(oc_decode_thread(&p, &th) == OC_OK);
     CHECK(th.parent_id == mid && th.count == 1);
@@ -753,6 +780,7 @@ static void test_threads_vertical(int port, const uint8_t *pin) {
     client_close(&a);
     client_close(&b);
     client_close(&c);
+    client_close(&d);
 }
 
 /* Full-text search over the wire (REQ-080): a member searches and gets matching
