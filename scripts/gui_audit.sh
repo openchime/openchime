@@ -182,7 +182,15 @@ done
 
 echo
 echo "audit: $scenes_run scenes captured, $pass clean, $fail with findings"
-if [ ${#FINDINGS[@]} -gt 0 ]; then
+# `${#FINDINGS[@]}` is the obvious test and it is the one that broke: an
+# associative array with no elements counts as UNSET, so under `set -u` (line 23)
+# asking its length on a clean run was an unbound-variable reference. The failure
+# landed the wrong way round -- a run that found nothing ended in a shell error
+# and read as broken, while a run with findings populated the array and behaved.
+# `${arr[*]+x}` is the form that asks "is there anything here" without reading
+# it. The loop below is safe either way; iterating an empty array is not an
+# error, only measuring one is.
+if [ -n "${FINDINGS[*]+x}" ]; then
   echo "by check:"
   for k in "${!FINDINGS[@]}"; do echo "  $k: ${FINDINGS[$k]}"; done
 fi
