@@ -514,7 +514,7 @@ the requirement says so explicitly rather than implying one.
 - **REQ-080.** Full-text search has covered the complete message history
   visible to the searching user (i.e., channels they are a member of, per
   REQ-031), with no retention cutoff, implemented via SQLite FTS5 (ARCH-15).
-- **REQ-081.** *(Partly built)* Search has accepted **structured operators** that scope a query —
+- **REQ-081.** Search has accepted **structured operators** that scope a query —
   at minimum `from:<user>`, `in:<channel>`, `has:<attachment|link>`, and a date
   range (`before:`/`after:`/`on:`) — combined with free-text terms, all still
   bounded to history the searcher may read (REQ-031). **[needs ARCH decision —

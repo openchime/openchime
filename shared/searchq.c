@@ -91,6 +91,19 @@ void oc_searchq_parse(const char *q, oc_searchq *out) {
             if (out->after[0]) out->n_filters++;
             continue;
         }
+        if ((k = sq_prefix(p, "on:"))) {
+            /* A single day is "after this midnight AND before that one" — one
+             * filter, expressed as the same date in both fields, so the caller
+             * (client/core/net.c) needs no third case beyond before:/after:. */
+            char v[16];
+            p = sq_take(p + k, v, sizeof v);
+            if (v[0]) {
+                snprintf(out->before, sizeof out->before, "%s", v);
+                snprintf(out->after,  sizeof out->after,  "%s", v);
+                out->n_filters++;
+            }
+            continue;
+        }
 
         /* Not an operator: it is search text. */
         {
@@ -119,8 +132,14 @@ void oc_searchq_describe(const oc_searchq *sq, char *out, size_t cap) {
     if (sq->has & OC_SQ_HAS_FILE)  SQ_ADD("%shas:file",  n ? " " : "");
     if (sq->has & OC_SQ_HAS_LINK)  SQ_ADD("%shas:link",  n ? " " : "");
     if (sq->has & OC_SQ_HAS_IMAGE) SQ_ADD("%shas:image", n ? " " : "");
-    if (sq->after[0])  SQ_ADD("%safter:%s",  n ? " " : "", sq->after);
-    if (sq->before[0]) SQ_ADD("%sbefore:%s", n ? " " : "", sq->before);
+    /* before == after is what on: parsed into; describe it back the way it was
+     * typed rather than as two operators that happen to agree. */
+    if (sq->after[0] && sq->before[0] && !strcmp(sq->after, sq->before)) {
+        SQ_ADD("%son:%s", n ? " " : "", sq->after);
+    } else {
+        if (sq->after[0])  SQ_ADD("%safter:%s",  n ? " " : "", sq->after);
+        if (sq->before[0]) SQ_ADD("%sbefore:%s", n ? " " : "", sq->before);
+    }
     if (sq->text[0])   SQ_ADD("%s%s",        n ? " " : "", sq->text);
     #undef SQ_ADD
 }

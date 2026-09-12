@@ -54,6 +54,19 @@ static void test_operators(void) {
     CHECK(strcmp(q.after, "2026-01-01") == 0);
     CHECK(strcmp(q.before, "2026-02-01") == 0);
     CHECK(strcmp(q.text, "x") == 0);
+
+    /* on: is one filter, not two, expressed as the same day in both fields —
+     * the caller already turns before:/after: into a range with no third case. */
+    oc_searchq_parse("on:2026-03-05 standup", &q);
+    CHECK(strcmp(q.after, "2026-03-05") == 0);
+    CHECK(strcmp(q.before, "2026-03-05") == 0);
+    CHECK(strcmp(q.text, "standup") == 0);
+    CHECK(q.n_filters == 1);
+
+    /* A bare on: constrains nothing, same rule as every other operator. */
+    oc_searchq_parse("on: standup", &q);
+    CHECK(q.after[0] == '\0' && q.before[0] == '\0' && q.n_filters == 0);
+    CHECK(strcmp(q.text, "standup") == 0);
 }
 
 static void test_not_swallowed(void) {
@@ -99,6 +112,14 @@ static void test_describe(void) {
     char tiny[8];
     oc_searchq_describe(&q, tiny, sizeof tiny);
     CHECK(strlen(tiny) < sizeof tiny);
+
+    /* on: describes as itself, not as the after:/before: pair it parsed into —
+     * showing the user back what they typed, not an equivalent they didn't. */
+    oc_searchq_parse("on:2026-03-05 standup", &q);
+    oc_searchq_describe(&q, out, sizeof out);
+    CHECK(strstr(out, "on:2026-03-05") != NULL);
+    CHECK(strstr(out, "after:") == NULL && strstr(out, "before:") == NULL);
+    CHECK(strstr(out, "standup") != NULL);
 }
 
 int run_searchq_tests(void) {
