@@ -1801,10 +1801,13 @@ None are yet backed by an architecture decision.*
   the message store** (ARCH-79). The catalog has covered four families:
   **administrative** (role change, user invite/remove, channel archive,
   retention or storage-policy change), **account lifecycle** (registration,
-  password change, invite redeemed, owner bootstrap), **security** (session
-  revocation, failed authentication, denied privileged action), and
+  password change, invite redeemed, owner bootstrap), **security** (a successful
+  sign-in, session revocation, failed authentication, denied privileged action), and
   **moderation** (a moderator deleting another user's message, removing a member
-  from a channel). Each entry has recorded when, who acted, what action, on what
+  from a channel). A sign-in is recorded when a credential is proven — a password
+  or an identity-provider token — and not when an already-authenticated session
+  reconnects, so the log answers "who signed in, when" rather than counting
+  reconnects. Each entry has recorded when, who acted, what action, on what
   target, and the outcome — **never the secret involved**: that a password
   changed, never the password; that an invite was redeemed, never the token.
 - **REQ-251a.** The audit log has been **bounded**, since an unbounded table on a

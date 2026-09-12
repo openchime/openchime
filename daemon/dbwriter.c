@@ -878,6 +878,10 @@ static oc_dbres *process_auth(oc_dbwriter *w, const oc_job *j) {
         memcpy(r->session_token, token, sizeof token);
         r->has_session_token = 1;
         r->session_expiry = expiry;
+        /* Only a fresh local/OIDC login, never a session reconnect (REQ-251):
+         * "who signed in, when" means a new credential was proven, not that an
+         * already-authenticated connection resumed. */
+        audit_actor(db, OC_AUDIT_SECURITY, "auth.success", uid, 0, NULL, 1, NULL);
     } else {
         r->has_session_token = 0;   /* no new token on reconnect (PROTOCOL.md §4.3) */
         r->session_expiry = sess_exp;
@@ -1106,14 +1110,21 @@ static oc_dbres *process_redeem(oc_dbwriter *w, const oc_job *j) {
     }
     sqlite3_stmt *st = NULL;
     sqlite3_prepare_v2(db,
-        "SELECT role, expires_at_ms, consumed_at_ms FROM invites WHERE token_hash=?;",
+        "SELECT role, expires_at_ms, consumed_at_ms, created_by FROM invites WHERE token_hash=?;",
         -1, &st, NULL);
     sqlite3_bind_blob(st, 1, hash, sizeof hash, SQLITE_STATIC);
     uint8_t role = OC_ROLE_MEMBER; uint64_t expiry = 0; int consumed = 1, found = 0;
+    /* NULL created_by is the first-run setup token (REQ-024, mint_invite's own
+     * created_by==0 -> NULL convention) — the signal that this redemption is an
+     * owner bootstrap, not an ordinary invite; role alone can't tell them apart,
+     * since an owner may also invite another owner at an ordinary role. */
+    uint64_t created_by = 0;
     if (sqlite3_step(st) == SQLITE_ROW) {
-        role     = role_to_u8((const char *)sqlite3_column_text(st, 0));
-        expiry   = (uint64_t)sqlite3_column_int64(st, 1);
-        consumed = sqlite3_column_type(st, 2) != SQLITE_NULL;
+        role       = role_to_u8((const char *)sqlite3_column_text(st, 0));
+        expiry     = (uint64_t)sqlite3_column_int64(st, 1);
+        consumed   = sqlite3_column_type(st, 2) != SQLITE_NULL;
+        created_by = sqlite3_column_type(st, 3) != SQLITE_NULL
+                     ? (uint64_t)sqlite3_column_int64(st, 3) : 0;
         found = 1;
     }
     sqlite3_finalize(st);
@@ -1157,6 +1168,14 @@ static oc_dbres *process_redeem(oc_dbwriter *w, const oc_job *j) {
     uint8_t token[OC_SESSION_TOKEN_LEN]; uint64_t sexp = 0, sid = 0;
     if (mint_session(db, uid, token, &sexp, &sid) != 0) {
         r->type = OC_RES_AUTH_ERR; r->err_code = OC_ERR_INTERNAL; return r;
+    }
+    /* Two distinct actions (REQ-251), not one "invite consumed": a bootstrap has
+     * no inviting actor to name (mint_invite's created_by is NULL), an ordinary
+     * invite always does. */
+    if (created_by) {
+        audit_actor(db, OC_AUDIT_ACCOUNT, "invite.redeem", uid, 0, NULL, 1, NULL);
+    } else {
+        audit_log(db, OC_AUDIT_ACCOUNT, "user.bootstrap", 0, NULL, uid, user, 1, NULL);
     }
     r->type = OC_RES_AUTH_OK;
     r->session_id = sid;
@@ -2585,6 +2604,10 @@ static oc_dbres *process_remove_channel(sqlite3 *db, const oc_job *j) {
     sqlite3_bind_int64(st, 2, (sqlite3_int64)j->target_user_id);
     sqlite3_step(st);
     sqlite3_finalize(st);
+    /* REQ-251's moderation family names this explicitly: removing a member from
+     * a channel, alongside a moderator deleting another user's message. */
+    audit_actor(db, OC_AUDIT_MODERATION, "channel.member.remove", j->user_id,
+                j->target_user_id, NULL, 1, NULL);
 
     r->type = OC_RES_CHANNEL_INFO;
     load_channel_info(db, j->channel_id, j->user_id, r);
