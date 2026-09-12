@@ -32,8 +32,9 @@ jobs:
           set -uo pipefail
           fail=0
 
-          # GitHub appends " (#42)" when it squashes, so the committed subject
-          # is longer than the title. Check what will actually be committed.
+          # GitHub appends the pull request number in parentheses when it
+          # squashes, so the committed subject is longer than the title.
+          # Check what will actually be committed.
           SUBJECT="${TITLE} (#${NUMBER})"
 
           # dependabot has no issue to reference, and inventing one would put
