@@ -1,0 +1,82 @@
+# Pull request policy. The title becomes the commit subject once merged
+# (squash-only merges, repo setting), so the title is what is checked here.
+# The body must be empty; the description lives in the issue, not the PR.
+name: pr-policy
+
+on:
+  pull_request:
+    # 'edited' matters: the title is a checked artifact and the default type
+    # list does not include it.
+    types: [opened, synchronize, reopened, edited]
+    branches: [staging, main]
+
+jobs:
+  policy:
+    name: pr policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Title and body
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Through env, never inline: an expression is substituted as text
+          # before bash parses the line, and a title is attacker-controlled.
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -uo pipefail
+          fail=0
+
+          # GitHub appends " (#42)" when it squashes, so the committed subject
+          # is longer than the title. Check what will actually be committed.
+          SUBJECT="${TITLE} (#${NUMBER})"
+
+          # dependabot has no issue to reference, and inventing one would put
+          # a fabricated record in the tracker. The exemption is paired with
+          # the author so a human cannot use the prefix to skip issue tracking.
+          if printf '%s' "$TITLE" | grep -q '^deps: '; then
+            if [ "$AUTHOR" = 'dependabot[bot]' ]; then
+              echo "dependency bump by dependabot, exempt"
+              exit 0
+            fi
+            echo "::error::'deps:' is dependabot's prefix but this was opened by '${AUTHOR}'. Use 'OC-<issue>: ...'."
+            exit 1
+          fi
+
+          if ! printf '%s' "$TITLE" \
+             | grep -qE '^OC-[0-9]+: [A-Z]([^[:cntrl:]]*[^.,;:!?[:space:]])?$'; then
+            echo "::error::Title must read 'OC-<issue>: Capitalised description' with no trailing punctuation. Got: ${TITLE}"
+            fail=1
+          fi
+
+          if [ "${#SUBJECT}" -gt 72 ]; then
+            echo "::error::Subject will be ${#SUBJECT} chars once GitHub appends ' (#${NUMBER})', limit 72."
+            fail=1
+          fi
+
+          if [ -n "${BODY//[$'\r\n\t ']/}" ]; then
+            echo "::error::Pull request body must be empty. The description belongs in the issue."
+            fail=1
+          fi
+
+          # The number must be an OPEN ISSUE. Issues and pull requests share
+          # one counter, so a format-only check accepts a pull request number.
+          N=$(printf '%s' "$TITLE" | sed -nE 's/^OC-([0-9]+):.*/\1/p')
+          if [ -n "$N" ]; then
+            if ! J=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${N}" 2>/tmp/e); then
+              grep -qi 'not found' /tmp/e \
+                && echo "::error::OC-${N} is not an issue in this repository." \
+                || echo "::error::Could not check OC-${N}: $(head -1 /tmp/e)"
+              fail=1
+            elif [ "$(jq -r 'if .pull_request then "pr" else .state end' <<<"$J")" != open ]; then
+              echo "::error::OC-${N} is not an open issue."
+              fail=1
+            fi
+          fi
+
+          [ "$fail" = 0 ] && echo "pr policy ok" || exit 1

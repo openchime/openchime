@@ -1,0 +1,35 @@
+#!/bin/sh
+# Post-removal cleanup.
+#
+# `purge` deliberately does NOT delete /var/lib/openchime. That directory holds
+# the tenant's entire message history, and the daemon has no replication or
+# backup component by design (ARCH-3) -- the operator's copy of that file may be
+# the only one. A package removal is not consent to destroy it, and a purge that
+# silently did would be unrecoverable. The path is printed instead.
+set -e
+
+case "$1" in
+  purge)
+    rm -f /etc/openchime/openchimed.env.dpkg-* 2>/dev/null || true
+    rmdir /etc/openchime 2>/dev/null || true
+
+    if [ -d /var/lib/openchime ]; then
+      echo "openchimed: /var/lib/openchime left in place (database, blobs, TLS identity)."
+      echo "openchimed: remove it yourself if you are certain: rm -rf /var/lib/openchime"
+    fi
+    ;;
+
+  remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+    ;;
+
+  *)
+    echo "postrm called with unknown argument '$1'" >&2
+    exit 1
+    ;;
+esac
+
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+exit 0

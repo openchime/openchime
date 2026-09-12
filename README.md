@@ -1,0 +1,293 @@
+# OpenChime
+
+A self-hostable business chat system: a C daemon, a shared C client app-core,
+and native frontends.
+
+**Three deployment models** (ARCH-76 in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
+
+| Model | Who runs the daemon | Depends on OpenChime-operated services |
+|---|---|---|
+| **Self-hosted stand-alone** | you | **none** — fully independent, and air-gappable. Federated-only features are absent, most visibly mobile push. |
+| **Self-hosted federated** | you | opt-in, per function: OIDC login, push delivery, the app directory, SCIM, an optional DNS name, package distribution. You still run the daemon and own **all message data**. |
+| **Hosted** | OpenChime | all of the above, operated for you. |
+
+In every model, **no OpenChime-operated service is ever in the message path** —
+the federated services broker identity, notification, discovery, and
+provisioning metadata, and none can read message content. Federating trades
+availability independence for capability, never message confidentiality
+(REQ-040/041).
+
+**Where this differs from the reference products.** Per-message read receipts
+("seen by", REQ-090) exist here and in neither Slack nor Pumble, which both
+decline them deliberately. Self-hosting, data residency and the three deployment
+models are ours alone — both references are single-cloud and SaaS-only. The
+clients are native C rather than Electron or web-tech. Two things are **not**
+differentiators and are recorded as such: unlimited history is matched by
+Pumble's free tier, so the argument there is data ownership rather than
+retention; and on breadth of client platforms both references are ahead, since
+this project ships a Windows GUI and a Linux/Windows TUI and no macOS, Linux
+GUI, web or mobile client. On single sign-on the position is weaker still — see
+REQ-027.
+
+## The documents
+
+Sixteen, and each has one job. **Start with the first two**: they answer what the
+product is meant to do and why it is built the way it is. What is *wrong* with it
+today is not a document — it is the
+[issue tracker](https://github.com/openchime/openchime/issues).
+
+| Document | What it is |
+|---|---|
+| [REQUIREMENTS.md](docs/REQUIREMENTS.md) | The product specification — every `REQ-NNN`, written as a contract in present-perfect. Each requirement carries a marker saying whether it is built, so a shipped guarantee reads differently from an intention. |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | The `ARCH-N` decision record: every architectural choice and its rationale. Design decisions live here; product scope lives in REQUIREMENTS.md. |
+| [PROTOCOL.md](docs/PROTOCOL.md) | The byte-level wire protocol — frame layout, the handshake, every message type and its payload, the error codes, and the connection state machine. Its §9 registry is generated from the codec and is the authority on which opcodes are taken. |
+| [SCHEMA.md](docs/SCHEMA.md) | The SQLite schema and the migration mechanism, documenting every migration and why each table is shaped the way it is. |
+| [CLIENT.md](docs/CLIENT.md) | The client architecture: one shared C app-core with a native UI per platform, and the internals of the Win32 GUI — its self-drawn composer, modal frame, native-child rules, and the paint ledger the audit reads. |
+| [AUTH.md](docs/AUTH.md) | The two authentication modes — local PBKDF2 accounts and OIDC brokered by a central relay — and the daemon-issued session both converge on. |
+| [TLS.md](docs/TLS.md) | How the daemon terminates TLS and how a client trusts it: trust-on-first-use certificate pinning against a self-signed cert, with no CA anywhere on the client-facing path. |
+| [CONFIG.md](docs/CONFIG.md) | Every environment variable the daemon reads, with its default and meaning. There is no configuration file. |
+| [TESTING.md](docs/TESTING.md) | The test strategy and its two tiers, what CI runs, the measured capacity benchmark, how to bring the federated stack up by hand, and the GUI's two harnesses — the boot check and the visual audit that checks a render against itself rather than against a second binary. |
+| [MARKDOWN.md](docs/MARKDOWN.md) | The message-formatting dialect — a Slack-compatible subset plus real lists — where it is parsed, and the places it deliberately differs. |
+| [AUDIO.md](docs/AUDIO.md) | The design for server-relayed audio calls: the huddle model, client-side mixing, and echo cancellation. The server half is built; the client half is not. |
+| [VIDEO.md](docs/VIDEO.md) | The screenshare design: why the codec is a wire contract rather than a per-platform choice, and why it is sequenced behind the audio client. Not started. |
+| [TUIKIT.md](docs/TUIKIT.md) | The in-tree TUI widget toolbox the terminal client is built on — deliberately generic, and knowing nothing about chat. |
+| [VENDORS.md](docs/VENDORS.md) | Every third-party dependency, how it enters the build, and its licence. |
+| [CONTRIBUTING.md](docs/CONTRIBUTING.md) | Branch, commit and CI policy, including the attribution guard that runs on every push. |
+| [RELEASING.md](docs/RELEASING.md) | How a version is published to apt, dnf, GHCR and WinGet — the release-number reservation, the pool guard that stops an index delisting prior releases, the archive signing key's properties, and what a dry run cannot test. |
+
+The daemon is a **feature-complete v1 chat core**. On the foundations — the
+wire-protocol frame codec (PROTOCOL.md), the two-thread model (ARCH-5: an epoll
+network loop + a single DB-writer thread, refined by ARCH-66 into a third
+read-only query thread), TLS termination with self-signed TOFU certs (ARCH-10,
+mbedTLS), and schema migrations applied on boot (ARCH-27) — it runs the whole
+messaging path end to end: **two-mode authentication** (local PBKDF2 accounts or
+an OIDC token re-issued by the central relay, converging on a daemon-issued
+session, [docs/AUTH.md](docs/AUTH.md)), roles and full tenant administration,
+public/private channels and DMs, edit/delete, reactions, threads, FTS5 search,
+presence and typing, notification preferences with the schedule, pause,
+keywords and priority people, **@mentions** and
+**pinned messages**, saved items and the activity feed, drafts and scheduled
+send, custom emoji, **link unfurls** fetched in-daemon behind an SSRF gate,
+attachments proxied to object storage with per-channel file
+and member listings, incoming webhooks, an audit log, and reconnect backfill. The
+daemon also emits **mobile push** to the control-plane gateway (ARCH-85) and
+**enrolls** with it for federated deployments (ARCH-84). Server-relayed **audio**
+signaling and the UDP sidecar are built; the client-side codec is not
+([docs/AUDIO.md](docs/AUDIO.md)).
+
+For what is known to be wrong with it, see the
+**[issue tracker](https://github.com/openchime/openchime/issues)**. No daemon
+defect is open there at present; every open defect is in the Windows GUI. What
+remains on the server side is scope rather than repair — a CA-signed certificate
+for the webhook endpoint (REQ-171) among it.
+
+## Install the daemon
+
+Four channels, one release number (ARCH-20). Packages are signed; the daemon
+runs under systemd as a transient user with its state in `/var/lib/openchime`.
+
+**Debian / Ubuntu** — bookworm or 22.04 and newer:
+
+```sh
+curl -fsSL https://openchime.io/dist/openchime-archive-keyring.gpg \
+  | sudo tee /usr/share/keyrings/openchime-archive-keyring.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/openchime-archive-keyring.gpg] https://openchime.io/dist/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/openchime.list
+sudo apt update && sudo apt install openchimed
+```
+
+**RHEL / Rocky / Alma / Fedora** — RHEL 9 and newer:
+
+```sh
+sudo curl -fsSL https://openchime.io/dist/openchime.repo -o /etc/yum.repos.d/openchime.repo
+sudo rpm --import https://openchime.io/dist/openchime-archive-keyring.asc
+sudo dnf install openchimed
+```
+
+**Anything else, and the offline case.** The tarballs on each
+[release](https://github.com/openchime/openchime/releases) carry the binary,
+the unit and the config with an `install.sh`. Nothing is fetched at install
+time — TLS is statically linked — so this is the channel for an air-gapped box.
+Verify the `.sha256` beside it.
+
+**Container** — for any OCI runtime (Podman, Docker, containerd, Fly):
+
+```sh
+podman run ghcr.io/openchime/openchime:latest --version
+```
+
+The image is published for deployment — it is what the hosted model feeds to Fly
+Machines, which ingest an image and cannot install a package. OpenChime itself
+does not use containers to build or test anything; the image is an output, not a
+tool. There is no Compose stack in this repository.
+
+After installing, the daemon starts and mints a one-time owner setup token:
+
+```sh
+journalctl -u openchimed | grep -i 'setup token'
+```
+
+Configuration is entirely environment variables in
+`/etc/openchime/openchimed.env` (every one of them:
+[docs/CONFIG.md](docs/CONFIG.md)). It listens on **8443** out of the box so
+installing cannot collide with a web server on 443; switch
+`OPENCHIME_PROTO_PORT=443` for a real deployment, which needs no root because
+the unit already carries `CAP_NET_BIND_SERVICE`.
+
+**Requirements:** glibc **2.34+** and libsqlite3. Everything else, TLS included,
+is statically linked. Debian bullseye (glibc 2.31) is too old.
+
+## Local build (daemon)
+
+```
+make
+```
+
+Requires a C toolchain and SQLite development headers (`sqlite3.h`,
+`libsqlite3`) on the host. `make OC_VERSION=<n>` stamps a release number into
+`openchimed --version`; an unstamped build reports `dev`.
+
+To build the distributable packages from an already-built binary:
+
+```sh
+packaging/build-deb.sh     <version> amd64 ./openchimed dist
+packaging/build-rpm.sh     <version>       ./openchimed dist   # needs rpmbuild
+packaging/build-tarball.sh <version> amd64 ./openchimed dist
+```
+
+Note the release does **not** build with the host toolchain. It builds with
+[`zig cc`](https://ziglang.org) targeting `glibc 2.34`, the oldest supported
+target, because a binary linked against a newer glibc will not start on an older
+one — and every hosted runner carries a newer one. Zig ships glibc stub
+libraries for each version and links against whichever it is told to, so the
+floor holds without a container. The release asserts the result rather than
+trusting it: if the built binary needs a symbol above `GLIBC_2.34`, the build
+fails. Nothing in the pipeline uses Docker.
+
+## Client (app-core + native frontends)
+
+The client ([docs/CLIENT.md](docs/CLIENT.md)) is **one shared C app-core with a
+native UI per platform** (the tdlib model, ARCH-74). The app-core
+(`client/core/`) is frontend-agnostic — it links the daemon's exact `shared/`
+wire code, owns the network thread and the view-model, and is driven headlessly
+by `make test` (`tests/test_client_core.c`). A standalone compile check:
+
+```
+make core
+```
+
+The first frontend is a **TUI** (`make tui`, built on the in-tree `tuikit`
+toolbox over termbox2 + utf8proc, ARCH-83), built on the host like the daemon and
+also shipping on Windows (ARCH-81). It is menu- and screen-driven — panels, context
+menus, dialogs, and a Ctrl+K command palette; there are no slash commands. It
+covers live messaging with history backfill, reactions, edit/delete, typing,
+threads, search, channel + DM management, roster + presence, who-reacted,
+notification prefs + DND, admin (roles/invite/remove), webhooks, attachments,
+storage and audit overlays, multiple workspaces, and logout. It is
+behind the Windows GUI by **more than twenty** features — among them
+@mentions, pins, saved items, the channel files listing, the per-channel member
+roster, channel topic/rename/archive, mute, star, mark-unread, the activity feed,
+in-app preferences and themes — plus webhook *deletion* and log-out-everywhere.
+All of them already exist in the app-core, so closing the gap is TUI work alone.
+The frontend order is fixed — all of Win32 first — so the TUI's gap is not
+tracked as open work. Some frames the daemon speaks reach no client at all yet —
+see [docs/CLIENT.md](docs/CLIENT.md) §3. The app-core **writes nothing to disk** (ARCH-88/REQ-201): one credential per
+workspace in the OS credential store carries the session token, the TOFU pin and
+the workspace book, so it reconnects silently across restarts and queues sends
+made while disconnected — in memory, for the life of the process. History comes
+from the server's own read cursor rather than a local cache (REQ-100/101/102).
+
+A native **Windows GUI**, pure C, presents through an **SDL3 renderer on its own
+Win32 window**: every primitive is drawn by the in-tree `oc_gfx` layer and every
+glyph is laid out and rasterized by **sdltext** over DirectWrite
+(ARCH-80/106/107). The window class, message loop, tray, IME and the
+accessibility provider stay Win32. Direct2D survives only as sdltext's
+rasterizer on this platform — it is no longer the client's presentation layer.
+
+Under that it is the most complete client by some distance: every tracked engine
+feature is reachable, and it leads the TUI by a wide margin. Accessibility is
+built (REQ-269/ARCH-99: a UI Automation
+provider over the self-drawn UI, a system caret and spoken notifications), with
+an automation id and an invoke pattern on every actionable element (REQ-290),
+both verified by a real UIA client from outside the process. Rich text and its
+toolbar (REQ-220/ARCH-100), drafts, scheduled send, the notification schedule
+with keywords and priority people, cross-channel threads, the People directory
+and link-unfurl cards are all built end to end with their daemon halves.
+
+**Two harnesses, and they answer different questions.** `scripts/gui_smoke.sh`
+asks whether the client boots and runs — fourteen assertions in about ten
+seconds, run before every push, and deliberately kept that size: the suite that
+preceded it held a few hundred assertions, took seven minutes, and was therefore
+skipped. `scripts/gui_audit.sh` is the long one, walking every surface across
+themes, DPI settings and text sizes and checking each captured scene against
+properties it must hold on its own — a string that fits its box, ink that can be
+read against what is behind it, one label not drawn over another, nothing drawn
+where it cannot be reached. It needs no reference image, which is the point: the
+render it would once have been compared against is gone. See
+[TESTING.md](docs/TESTING.md).
+
+Next is **TUI catch-up**, then the remaining desktops. Those are no longer a
+per-toolkit list: ARCH-80 settled on one portable self-rendered application layer
+over SDL3 and sdltext for every desktop, with a thin native shim per platform, so
+Linux and macOS are ports of that layer rather than GTK and AppKit rewrites. A
+web DOM UI and mobile stay their own frontends.
+
+## Local development environment
+
+Nothing in this project runs in a container. Build the daemon and run it
+directly:
+
+```
+make run
+```
+
+This builds the daemon and the TUI, then starts a dev daemon on
+`127.0.0.1:8443` with its database and blobs under `/tmp/openchime-dev` and two
+bootstrap users (`alice/pw`, `bob/pw`). Connect with the TUI it just built:
+
+```
+build/openchime-tui 127.0.0.1 8443 alice:pw
+```
+
+Stop it with Ctrl-C. To start from scratch, delete `/tmp/openchime-dev` — there
+are no volumes and no daemon holding state anywhere else.
+
+### Verify the health check
+
+The dev daemon serves `/healthz` on `OPENCHIME_HEALTH_PORT` (8080 by default):
+
+```
+curl http://localhost:8080/healthz
+```
+
+Should return `OK`.
+
+## Licence
+
+One licence for everything we wrote: **AGPL-3.0-or-later** (`LICENSE`) — daemon,
+clients, `shared/`, `tuikit/`, and the surrounding scripts, packaging, docs and
+tests alike.
+
+Section 13 is the point of choosing it: run a modified openchimed as a service
+for other people, and those users are entitled to your modified source. The
+clients carry the same terms rather than a permissive licence, so the strategy is
+not half-applied and the daemon/client link raises no questions.
+
+`third_party/` is other people's work under their own permissive licences and is
+unaffected.
+
+Contributions are taken under the Developer Certificate of Origin (`DCO.txt`);
+sign off with `git commit -s`. There is no CLA and copyright is not assigned.
+
+See [LICENSING.md](LICENSING.md) for the full map, including `third_party/`.
+
+## Known fidelity gaps
+
+- **Local development does not approximate the deployment target.**
+  `make run` applies no resource limits, so nothing stands in for Fly.io's
+  smallest instance (ARCH-4, REQ-210) and resource-constraint behaviour is
+  unexercised until deploy.
+- The published container image is built by the release but **exercised by no
+  test**. The end-to-end suite drives a natively-built daemon, so the daemon's
+  behaviour is covered and its packaging into an image is not.

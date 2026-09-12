@@ -1,0 +1,347 @@
+/*
+ * OpenChime client — the events/commands crossing the UI↔net queues (ARCH-62).
+ * net→UI events report connection + protocol state; UI→net commands carry user
+ * actions. Variable-length bodies are heap-owned by the struct.
+ */
+
+#ifndef OC_EVENT_H
+#define OC_EVENT_H
+
+#include <stdint.h>
+
+/* For the schedule and alert-list shapes carried on events and commands: they
+ * are wire types, and re-declaring them here would be a second definition to
+ * keep in step (REQ-135/136). */
+#include "protocol.h"
+
+/* Storage usage, policy, and what maintenance has reclaimed (REQ-214/215),
+ * carried on OC_EV_STORAGE and folded into the model for the frontend to
+ * render. Owner/admin only — the daemon refuses the request otherwise. */
+typedef struct {
+    uint64_t total_bytes, avail_bytes, attach_bytes, attach_count;
+    uint64_t rec_orphan, rec_expired, rec_evicted, last_reclaim_ms;
+    uint64_t max_age_days, reserve_bytes;
+    uint8_t  evict_enabled, under_pressure;
+} oc_storage_view;
+
+/* One audit entry as the frontend sees it (REQ-251). Fixed-size strings: a page
+ * is bounded and short-lived, so this avoids per-entry heap churn. */
+typedef struct {
+    uint64_t at_ms;
+    uint64_t actor_id;
+    uint64_t target_id;
+    char     actor_name[64];
+    char     action[48];
+    char     target[64];
+    char     detail[96];
+    uint8_t  family;    /* 1 admin, 2 account, 3 security, 4 moderation */
+    uint8_t  outcome;   /* 1 ok, 0 denied/failed */
+} oc_audit_view;
+
+/* net thread -> UI thread */
+enum {
+    OC_EV_CONNECTED = 1,   /* TLS + handshake up */
+    OC_EV_AUTH_OK,         /* authenticated; user_id set */
+    OC_EV_WORKSPACE_INFO,  /* a WORKSPACE_INFO: status=deployment_mode, count=max_users, body=name */
+    OC_EV_MESSAGE,         /* a BROADCAST: channel/author/message_id/time + body */
+    OC_EV_CHANNEL,         /* a CHANNEL_LIST entry / CHANNEL_INFO: channel_id + name(body)
+                              + status, plus topic (author_name) and archived (REQ-034/035) */
+    OC_EV_PRESENCE,        /* a PRESENCE_UPDATE: user_id + status */
+    OC_EV_REACTION,        /* a REACTION_UPDATED: channel/message/user + emoji/op/count */
+    OC_EV_EDIT,            /* a MSG_EDITED: channel/message + new body */
+    OC_EV_DELETE,          /* a MSG_DELETED: channel/message tombstone */
+    OC_EV_TYPING,          /* a TYPING_UPDATE: user_id is typing in channel_id */
+    OC_EV_THREAD_REPLY,    /* a THREAD_REPLY: parent_id/message + body + count */
+    OC_EV_THREAD_END,      /* a THREAD: the LIST_THREAD replay is complete (parent_id) */
+    OC_EV_THREAD_META,     /* a THREAD_META: message_id + reply count (backfill) */
+    OC_EV_SEARCH_RESULT,   /* a SEARCH_RESULTS entry: channel/message/author + snippet(body) */
+    OC_EV_REACTIONS,       /* a REACTIONS entry: message_id + one reactor (user_id + emoji) */
+    OC_EV_DND,             /* a NOTIFY_PREFS header (frame start): status=enabled, count=(start<<16|end) */
+    OC_EV_SNOOZE,          /* a SNOOZE: server_time = when the pause ends, 0 = not paused (REQ-278) */
+    OC_EV_SCHEDULE,        /* a SCHEDULE frame: the recurring allowed-hours schedule (REQ-136) */
+    OC_EV_ALERT_PREFS,     /* an ALERT_PREFS frame: my keywords + priority people (REQ-135) */
+    OC_EV_THREAD_SUMMARY,  /* one aggregated thread (REQ-062): a list entry AND the push */
+    OC_EV_THREADS_END,     /* the thread list's terminator */
+    OC_EV_NOTIFY_PREF,     /* a NOTIFY_PREFS entry: channel_id + level(op) */
+    OC_EV_USER_UPDATED,    /* a USER_UPDATED: user_id + role(status) + disabled(op) */
+    OC_EV_INVITE,          /* an INVITE_CREATED: body=token, op=role, server_time=expires_at */
+    /* One outstanding invite (message_id=invite_id, op=role,
+     * server_time=expires_at, user_id=created_by); END terminates a list; REVOKED is
+     * the ack. No token: only its hash is stored, so a list cannot carry one. */
+    OC_EV_INVITE_ROW,
+    OC_EV_INVITE_END,
+    OC_EV_INVITE_REVOKED,
+    /* A PROFILE_INFO (53): user_id + the fields, carried in the ev's slices. */
+    OC_EV_PROFILE_INFO,
+    /* one census row (channel_id + count in `count`); BEGIN clears. */
+    /* REQ-182: one live session (message_id=id, server_time=created, pinned_at=last
+     * seen, channel_id=expiry, op=is-current, body=device label); END terminates. */
+    OC_EV_SESSION_ROW,
+    OC_EV_SESSIONS_END,
+    OC_EV_FILE_CHANNELS_BEGIN,
+    OC_EV_FILE_CHANNEL,
+    OC_EV_USER,            /* a USER_LIST entry: user_id + name(body) + role(status) + disabled(op) */
+    OC_EV_WEBHOOK_INFO,    /* a WEBHOOK_INFO: message_id=webhook_id + channel_id + body=token (shown once) */
+    OC_EV_WEBHOOK,         /* a WEBHOOK_LIST entry: message_id=webhook_id + channel_id + body=label + op=disabled */
+    OC_EV_WEBHOOK_DELETED, /* a WEBHOOK_DELETED: message_id=webhook_id */
+    OC_EV_ATTACHMENT,      /* a message's attachment: channel_id + message_id + parent_id=attachment_id + server_time=size + body=filename + author_name=mime */
+    OC_EV_ATTACHMENT_DATA, /* in-memory download finished: message_id=attachment_id, count=bytes, body=the bytes (NOT a C string) */
+    OC_EV_XFER,            /* a transfer notice: op=phase (0 progress, 1 done, 2 error), body=status text */
+    OC_EV_READ_STATE,      /* channel_id: mark its currently-loaded messages read (replayed cache is not "unread") */
+    /* Custom emoji (REQ-072): BEGIN clears the catalogue, then one per entry —
+     * the same shape as the settings snapshot below, and for the same reason: the
+     * server's list is the whole truth. */
+    OC_EV_EMOJI_BEGIN,
+    OC_EV_EMOJI,
+    OC_EV_SETTINGS_BEGIN,  /* a CLIENT_SETTINGS frame start: clears the synced bucket before its entries */
+    OC_EV_SETTING,         /* one synced setting: author_name=key, body=value */
+    OC_EV_PROFILE,         /* a PROFILE_UPDATED: user_id + body=display_name (own = the change ack) */
+    OC_EV_READ_CURSOR,     /* a READ_CURSOR: user_id read up to message_id in channel_id (seen-by) */
+    OC_EV_STORAGE,         /* a STORAGE_STATUS: usage + policy report (REQ-214) */
+    OC_EV_AUDIT_BEGIN,     /* an AUDIT_PAGE starts: clears the model's page */
+    OC_EV_AUDIT,           /* one audit entry (REQ-251) */
+    OC_EV_PIN,             /* a PIN_UPDATED: channel/message + user_id=pinner, op=add/remove,
+                              server_time=when it was pinned (REQ-230) */
+    OC_EV_PINNED_MSG,      /* one entry of a pins list: message/author/body + pinner in user_id */
+    OC_EV_PINS_END,        /* the pins list is complete: channel_id + count */
+    OC_EV_CHAN_MEMBER,     /* one channel member: channel_id + user_id + status=role,
+                              server_time=joined_at (REQ-031) */
+    OC_EV_CHAN_MEMBERS_END,/* the member list is complete: channel_id + count */
+    OC_EV_FILE,            /* one shared file (REQ-143): attach_id + its own channel_id +
+                              message_id it was posted with + author_id=uploader +
+                              size/reclaimed + body=filename, emoji=mime */
+    OC_EV_FILES_END,       /* the files list is complete: channel_id + count */
+    OC_EV_SAVED_UPDATED,   /* a message was saved/unsaved: message_id + op (REQ-231) */
+    OC_EV_SAVED_MSG,       /* one saved item (streamed) */
+    OC_EV_SAVED_END,       /* the saved list is complete: count */
+    /* Drafts (REQ-223). One draft — a list entry AND the device-sync push, which
+     * the model folds identically: channel_id, message_id = thread root,
+     * server_time = updated_ms, body (empty means it is gone). END completes a
+     * LIST and lets the model drop anything the server did not mention. */
+    OC_EV_DRAFT,
+    OC_EV_DRAFTS_END,
+    /* One scheduled message — a list entry AND the push, folded identically:
+     * message_id = its id, channel_id, server_time = send_at_ms, op = state,
+     * body, author_name = the failure reason when there is one. */
+    OC_EV_SCHEDULED,
+    OC_EV_SCHEDULED_END,
+    OC_EV_ACTIVITY,        /* one activity item: status=kind, user_id=actor (REQ-139) */
+    OC_EV_ACTIVITY_END,    /* the feed is complete: count + pinned_at = seen watermark */
+    OC_EV_DISCONNECTED,    /* connection dropped/closed */
+    OC_EV_BACKOFF,         /* next reconnect attempt: server_time = deadline (ms), 0 = clear */
+    OC_EV_ERROR,           /* protocol/transport error; body = human message */
+    /* REQ-287: people you named who are not in this channel. body = their names,
+     * comma-joined for display; `peers`/`n_peers` carry their ids so the client
+     * can offer to add them; status packs can_add|is_private. */
+    OC_EV_MENTION_UNRESOLVED,
+    /* A link preview (REQ-222, ARCH-105): channel_id + message_id, body = the
+     * url, topic = the fetched title, preview = the description — reusing the
+     * three heap slots the way ATTACHMENT reuses author_name for a mime type.
+     * Arrives after the BROADCAST it belongs to (or on replay), and again for
+     * the same url if the daemon re-fetched: the fold is an upsert. */
+    OC_EV_UNFURL,
+    OC_EV_FORWARD
+};
+
+typedef struct {
+    int      type;
+    uint64_t user_id;
+    uint64_t channel_id;
+    uint64_t author_id;
+    uint64_t message_id;
+    uint64_t parent_id;    /* THREAD_REPLY: the parent message this replies to */
+    uint64_t server_time;
+    uint8_t  status;       /* PRESENCE: online/away/offline; CHANNEL: joined flag */
+    uint8_t  is_public;    /* CHANNEL: 1 public, 0 private/DM */
+    oc_storage_view storage;  /* OC_EV_STORAGE */
+    oc_audit_view   audit;    /* OC_EV_AUDIT */
+    uint8_t  op;           /* REACTION: add/remove */
+    uint32_t count;        /* REACTION: running aggregate count for the emoji */
+    uint64_t pinned_at;    /* PINNED_MSG: when it was pinned (REQ-230). Its own field
+                              because a ms timestamp does not fit in `count`. */
+    char    *topic;        /* heap; CHANNEL: the channel topic, NULL = none (REQ-034).
+                              Its own field because a topic is up to 250 bytes and
+                              every fixed buffer here is smaller. */
+    uint8_t  participant;  /* THREAD_REPLY: this user is in the thread (REQ-061).
+                              Derived server-side (ARCH-104) because the client
+                              holds a thread's replies only while it is open. */
+    uint8_t  archived;     /* CHANNEL: the channel is archived (REQ-035) */
+    uint64_t created_at;   /* CHANNEL (from CHANNEL_INFO): when it was created */
+    char    *preview;      /* heap; CHANNEL: newest message text (REQ-050 sidebar) */
+    uint64_t preview_author;
+    /* CHANNEL: a GROUP DM's participants (REQ-056). Empty for everything else; the
+     * single peer of a 1:1 DM stays in `user_id`. */
+    uint64_t peers[9];
+    uint16_t n_peers;
+    uint64_t size;         /* FILE: byte size (REQ-143) */
+    uint64_t attach_id;    /* FILE: the attachment's own id */
+    uint8_t  reclaimed;    /* FILE: bytes reclaimed; the row is a tombstone */
+    char     emoji[40];    /* REACTION: the emoji */
+    char     author_name[64]; /* MESSAGE: author display name ("" = fall back to id) */
+    char    *body;         /* heap; MESSAGE/ERROR/CHANNEL(name) only, else NULL */
+    /* One aggregated thread (REQ-062). `count`/`op` carry the reply and unread
+     * counts, `pinned_at` the last reply's time — reusing the generic fields the
+     * way every other list event here does. */
+    /* FORWARD (REQ-057): the reference the daemon resolved for a forwarded
+     * message. `message_id`/`channel_id` above name the forward itself;
+     * `author_id` is the SOURCE's author. The excerpt rides `body`, which is
+     * already the heap-string field every text-bearing event uses. */
+    uint64_t src_channel, src_message;
+    uint16_t src_n_attach;
+    char     src_attach_name[128];   /* the first file's name; "" = none */
+    uint32_t reply_count, unread_count;
+    uint8_t  following;
+    /* REQ-289: the profile fields carried on a USER entry. `emoji` and
+     * `author_name` already exist and carry the custom status's two halves. */
+    char     pf_title[64];
+    char     pf_tz[48];
+    char     pf_full_name[64];
+    char     pf_pronouns[32];
+    /* PROFILE_INFO only — a phone number is not on the roster. */
+    char     pf_phone[40];
+    /* The recurring schedule (REQ-136) and the two alert lists (REQ-135). Inline
+     * arrays: both are wire-capped and small, and a fixed array needs no
+     * ownership rules — the same reasoning `peers` and `gids` already use. */
+    oc_schedule_day sched_days[OC_SCHEDULE_DAYS];
+    uint8_t  n_sched_days;
+    uint8_t  sched_mode;
+    int16_t  tz_offset_min;
+    uint16_t sched_start_min, sched_end_min;
+    char     kw_terms[OC_MAX_KEYWORDS][OC_KEYWORD_MAX];
+    uint8_t  n_kw_terms;
+    uint64_t pri_people[OC_MAX_PRIORITY];
+    uint8_t  n_pri_people;
+} oc_ev;
+
+oc_ev *oc_ev_new(int type);
+void   oc_ev_free(oc_ev *e);
+
+/* UI thread -> net thread */
+enum {
+    OC_CMD_SEND = 1,       /* send `body` to `channel_id` */
+    OC_CMD_BACKFILL,       /* request history for `channel_id` (from id 0) */
+    OC_CMD_REACT,          /* react to `message_id` in `channel_id`: body=emoji, op */
+    OC_CMD_EDIT,           /* edit `message_id` in `channel_id`: body=new text */
+    OC_CMD_DELETE,         /* delete `message_id` in `channel_id` */
+    OC_CMD_TYPING,         /* signal "I am typing" in `channel_id` */
+    OC_CMD_OPEN_THREAD,    /* request a thread's replies: `message_id` = parent */
+    OC_CMD_REPLY,          /* reply in a thread: `message_id` = parent, body=text */
+    OC_CMD_SEARCH,         /* full-text search: body = query */
+    OC_CMD_CREATE_CHANNEL,  /* create a public channel: body = name */
+    OC_CMD_JOIN_CHANNEL,    /* join `channel_id` */
+    OC_CMD_LEAVE_CHANNEL,   /* leave `channel_id` */
+    OC_CMD_LIST_CHANNELS,   /* refresh the channel list (discover new channels) */
+    OC_CMD_LIST_USERS,      /* request the tenant roster */
+    OC_CMD_SET_PRESENCE,    /* set own presence: op = OC_PRESENCE_ONLINE / _AWAY */
+    OC_CMD_OPEN_DM,         /* open/get a 1:1 DM with `channel_id` (reused as target user id) */
+    OC_CMD_PIN,            /* pin/unpin `message_id` in `channel_id`: op = add/remove */
+    OC_CMD_LIST_PINS,      /* list `channel_id`'s pinned messages */
+    OC_CMD_UPDATE_CHANNEL, /* set topic / rename / archive / unarchive `channel_id`:
+                              op = OC_CHUP_*, body = the new topic or name (REQ-034/035/036) */
+    OC_CMD_SAVE_ITEM,      /* save/unsave `message_id`: op = add/remove (REQ-231) */
+    OC_CMD_LIST_SAVED,     /* my saved items */
+    OC_CMD_LIST_ACTIVITY,  /* what involved me — or what I have not read: op = OC_ACTF_* (REQ-139) */
+    OC_CMD_HISTORY_AROUND, /* the messages around `message_id` in `channel_id` (REQ-232) */
+    OC_CMD_LIST_MEMBERS,   /* list `channel_id`'s members (REQ-031) */
+    OC_CMD_LIST_FILES,     /* list files in `channel_id` (0 = everywhere I can read) */
+    OC_CMD_LIST_REACTIONS,  /* inspect who reacted to `message_id` in `channel_id` */
+    OC_CMD_SET_NOTIFY_PREF, /* set `channel_id`'s notification level (op = level) */
+    OC_CMD_SET_DND,         /* set the DND window: op = enabled, channel_id = start_min, message_id = end_min */
+    OC_CMD_SET_SNOOZE,      /* pause notifications: message_id = minutes from now, 0 ends it (REQ-278) */
+    OC_CMD_SET_SCHEDULE,    /* the recurring schedule (REQ-136), carried in cmd->sched */
+    OC_CMD_SET_KEYWORDS,    /* replace my keyword list (REQ-135), carried in cmd->list */
+    OC_CMD_SET_PRIORITY,    /* replace my priority-people list (REQ-135) */
+    OC_CMD_LIST_THREADS,    /* threads I am in (REQ-062): op = filter */
+    OC_CMD_THREAD_FOLLOW,   /* follow/unfollow: channel_id + message_id = root, op = on */
+    OC_CMD_MARK_THREAD_READ,/* its replies are read: message_id = root, server_time = up to */
+    OC_CMD_LIST_NOTIFY_PREFS, /* request all notification settings (DND + per-channel) */
+    OC_CMD_SET_SETTING,     /* upsert a synced client setting: body=key, body2=value (empty value deletes) */
+    OC_CMD_LIST_SETTINGS,   /* request the synced client-settings bucket */
+    /* Drafts (REQ-223, ARCH-101). SET carries channel_id + message_id as the
+     * THREAD ROOT (0 = the channel itself) + body; an empty body deletes, which
+     * is the same command rather than a second one. */
+    OC_CMD_SET_DRAFT,
+    OC_CMD_LIST_DRAFTS,
+    /* Scheduled messages (REQ-224). SCHEDULE: channel_id + message_id as the
+     * thread root + server_time as the send time + body. CANCEL/UPDATE use
+     * message_id as the scheduled row's id. */
+    OC_CMD_SCHEDULE,
+    OC_CMD_LIST_SCHEDULED,
+    OC_CMD_CANCEL_SCHEDULED,
+    OC_CMD_UPDATE_SCHEDULED,
+    OC_CMD_SET_DISPLAY_NAME, /* change your own display name: body=name */
+    OC_CMD_CHANGE_PASSWORD, /* change your own password: body=old, body2=new */
+    OC_CMD_MARK_READ,       /* CLIENT_ACK: read `channel_id` up to `message_id` (drives seen-by) */
+    OC_CMD_STORAGE_STATUS,  /* ask for the storage usage report (owner/admin) */
+    OC_CMD_AUDIT_QUERY,     /* page the audit log (owner/admin): message_id = before_ms */
+    OC_CMD_SET_ROLE,        /* set a user's tenant role: channel_id = user_id, op = role */
+    OC_CMD_INVITE_USER,     /* mint a tenant invite token: op = role */
+    OC_CMD_REMOVE_USER,     /* remove/disable a user: channel_id = user_id */
+    OC_CMD_CREATE_WEBHOOK,  /* mint an incoming webhook for `channel_id`: body = label */
+    OC_CMD_LIST_WEBHOOKS,   /* list `channel_id`'s webhooks */
+    OC_CMD_DELETE_WEBHOOK,  /* delete a webhook: message_id = webhook_id */
+    /* / message_id carries the invite or webhook id; `flag` the
+     * desired disabled state for SET_WEBHOOK_STATE. */
+    OC_CMD_LIST_INVITES,
+    OC_CMD_REVOKE_INVITE,
+    OC_CMD_SET_WEBHOOK_STATE,
+    OC_CMD_ROTATE_WEBHOOK,
+    /* / channel_id + op (muted), and channel_id + message_id. */
+    OC_CMD_SET_MUTE,
+    OC_CMD_SET_READ_CURSOR,
+    /* / body=emoji, body2=text, server_time=expiry / body=title,
+     * body2=timezone. */
+    OC_CMD_SET_STATUS,
+    OC_CMD_SET_PROFILE,
+    OC_CMD_GET_PROFILE,
+    OC_CMD_LIST_FILE_CHANNELS,   /* */
+    OC_CMD_LIST_SESSIONS,        /* REQ-182 */
+    OC_CMD_SET_NOTIFY_DEFAULT,   /* REQ-134: op = level */
+    OC_CMD_SET_AVATAR,           /* message_id = attachment id, 0 clears */
+    OC_CMD_OPEN_GROUP_DM,        /* REQ-056: gids[0..n_gids) */
+    OC_CMD_ADD_EMOJI,            /* REQ-072: body = name, message_id = attachment */
+    OC_CMD_DELETE_EMOJI,         /* REQ-072: body = name */
+    OC_CMD_LIST_EMOJI,
+    OC_CMD_UPLOAD,          /* upload+post a file to `channel_id`: body = local path */
+    OC_CMD_DOWNLOAD,        /* download an attachment: message_id = attachment_id, body = dest path */
+    OC_CMD_LOGOUT,          /* revoke this session (op = scope) and close the connection */
+    OC_CMD_CHANNEL_INVITE,  /* add a user to a channel: channel_id + message_id = user id */
+    OC_CMD_CHANNEL_KICK,    /* remove a user from a channel: same fields */
+    OC_CMD_REDEEM_INVITE,   /* pre-auth: body = token, body2 = "user:pass" */
+    OC_CMD_FETCH,           /* download an attachment INTO MEMORY: message_id = attachment_id */
+    OC_CMD_HISTORY,         /* page backwards: channel_id, message_id = before-id (0 = newest) */
+    OC_CMD_QUIT
+};
+
+typedef struct {
+    int      type;
+    uint64_t channel_id;
+    uint64_t message_id;   /* REACT */
+    uint8_t  op;           /* REACT: add/remove */
+    uint64_t server_time;  /* SCHEDULE: when to send (ms) */
+    char    *body;         /* heap; SEND body / REACT emoji / SET_SETTING key */
+    char    *body2;        /* heap; SET_SETTING value, else NULL */
+    /* SEND: what this message forwards (REQ-057), 0/0 when it forwards nothing. */
+    uint64_t src_channel, src_message;
+    /* OPEN_GROUP_DM (REQ-056): the other participants. Inline, because the wire
+     * caps the count and a fixed array needs no ownership rules. */
+    uint64_t gids[8];
+    int      n_gids;
+    /* SET_SCHEDULE / SET_KEYWORDS / SET_PRIORITY (REQ-135/136), all inline and
+     * all wholesale — each command carries the whole setting, because that is
+     * what the ops are. */
+    oc_schedule_day sched_days[OC_SCHEDULE_DAYS];
+    uint8_t  n_sched_days;
+    uint8_t  sched_mode;
+    int16_t  tz_offset_min;
+    uint16_t sched_start_min, sched_end_min;
+    char     kw_terms[OC_MAX_KEYWORDS][OC_KEYWORD_MAX];
+    uint8_t  n_kw_terms;
+    uint64_t pri_people[OC_MAX_PRIORITY];
+    uint8_t  n_pri_people;
+} oc_cmd;
+
+oc_cmd *oc_cmd_new(int type);
+void    oc_cmd_free(oc_cmd *c);
+
+#endif /* OC_EVENT_H */

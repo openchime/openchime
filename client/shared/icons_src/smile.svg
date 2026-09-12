@@ -1,0 +1,13 @@
+<!-- Hand-authored for OpenChime, not from Lucide — kept out of third_party so
+     the ISC attribution there stays accurate. Drawn to Lucide's conventions:
+     24x24 box, 2px stroke, round caps/joins. Used for the composer's emoji
+     BUTTON, which is chrome and must be monochrome like the + and send beside
+     it; the coloured glyphs belong to content. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+     fill="none" stroke="currentColor" stroke-width="2"
+     stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="12" cy="12" r="9.2" />
+  <path d="M7.8 14.2 C9.0 16.2 15.0 16.2 16.2 14.2" />
+  <circle cx="9" cy="9.6" r="0.5" />
+  <circle cx="15" cy="9.6" r="0.5" />
+</svg>

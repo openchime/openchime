@@ -1,0 +1,55 @@
+#!/bin/sh
+# Debian post-install. Enables and starts the daemon, then points the operator at
+# the one thing they need and cannot guess: the first-run owner setup token.
+set -e
+
+case "$1" in
+  configure)
+    # No user or directory to create: the unit uses DynamicUser + StateDirectory,
+    # so systemd allocates the user at start and owns /var/lib/openchime.
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+
+      # `enable --now` on first install; on an upgrade, restart only if it was
+      # already running, so an operator who deliberately stopped it stays stopped.
+      if [ -z "${2:-}" ]; then
+        systemctl enable --now openchimed.service >/dev/null 2>&1 || true
+      else
+        systemctl try-restart openchimed.service >/dev/null 2>&1 || true
+      fi
+    fi
+
+    # Only on first install — an upgrade has an owner already, and repeating this
+    # every upgrade trains people to ignore it.
+    if [ -z "${2:-}" ]; then
+      cat <<'EOF'
+
+OpenChime is installed and starting.
+
+  Configuration:  /etc/openchime/openchimed.env   (edit, then: systemctl restart openchimed)
+  State:          /var/lib/openchime/
+  Logs:           journalctl -u openchimed
+
+The first-run owner setup token is printed to the log once, at first start. Claim
+it before anyone else can:
+
+  journalctl -u openchimed | grep -i 'setup token'
+
+The daemon listens on 8443 by default so installing could not collide with a web
+server on 443. For a real deployment set OPENCHIME_PROTO_PORT=443 in the config
+file above -- the service already holds CAP_NET_BIND_SERVICE, so no root needed.
+
+EOF
+    fi
+    ;;
+
+  abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+
+  *)
+    echo "postinst called with unknown argument '$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0
