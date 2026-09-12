@@ -85,8 +85,9 @@ jobs:
               continue
             fi
 
-            # GitHub appends " (#42)" on squash; strip it before matching so a
-            # trailing full stop before the suffix is still caught.
+            # GitHub appends the pull request number in parentheses on squash;
+            # strip it before matching so a trailing full stop before the
+            # suffix is still caught.
             core=$(printf '%s' "$subject" | sed -E 's/ \(#[0-9]+\)$//')
             printf '%s' "$core" \
               | grep -qE '^OC-[0-9]+: [A-Z]([^[:cntrl:]]*[^.,;:!?[:space:]])?$' \
