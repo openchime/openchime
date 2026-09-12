@@ -7,7 +7,7 @@
  * if those two ever disagree the product is broken in a way neither side can see.
  *
  * This is pure text parsing. It splits a query into FILTERS (`from:`, `in:`, `has:`,
- * `before:`, `after:`) and the remaining free TEXT. It resolves nothing: a name is
+ * `before:`, `after:`, `on:`) and the remaining free TEXT. It resolves nothing: a name is
  * left as text because only the caller knows the roster, and dates are left as the
  * user typed them because only the caller knows the timezone.
  *
