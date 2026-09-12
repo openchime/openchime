@@ -681,9 +681,12 @@ jobs:
       # either. Same shape the game repos use for absent Play signing secrets: an
       # incomplete config degrades the artifact, it does not fail the release.
       #
-      # Nothing needs editing when Trusted Signing is provisioned; setting the
-      # three secrets turns signing back on by itself.
-      SIGN: ${{ inputs.dry_run == false && secrets.TRUSTED_SIGNING_ENDPOINT != '' && secrets.TRUSTED_SIGNING_ACCOUNT != '' && secrets.TRUSTED_SIGNING_PROFILE != '' }}
+      # Nothing needs editing when Artifact Signing is provisioned; setting the
+      # six secrets below turns signing back on by itself. All six are required:
+      # the first three name the signing profile, the last three are the service
+      # principal that proves the caller may use it -- the action authenticates
+      # via DefaultAzureCredential and has nothing to authenticate with otherwise.
+      SIGN: ${{ inputs.dry_run == false && secrets.TRUSTED_SIGNING_ENDPOINT != '' && secrets.TRUSTED_SIGNING_ACCOUNT != '' && secrets.TRUSTED_SIGNING_PROFILE != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' }}
       # Same convention as the packages job: artifacts land in dist/<platform>/
       # and the artifact is named for that platform. build/ stays the staging
       # area -- the unpackaged binaries and the MSIX layout are inputs to a
@@ -731,11 +734,22 @@ jobs:
       # inside the packages unsigned.
       - name: Sign the binaries
         if: env.SIGN == 'true'
-        uses: azure/trusted-signing-action@v2
+        uses: Azure/artifact-signing-action@v2
         with:
           endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
-          trusted-signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
           files-folder: build
           files-folder-filter: exe
           file-digest: SHA256
@@ -759,18 +773,29 @@ jobs:
         if: ${{ inputs.dry_run == false && env.SIGN != 'true' }}
         shell: bash
         run: |
-          echo "::warning::Trusted Signing credentials are not set; the Windows installer and binaries in this release are UNSIGNED. Users will see a SmartScreen warning."
+          echo "::warning::Artifact Signing credentials are not set; the Windows installer and binaries in this release are UNSIGNED. Users will see a SmartScreen warning."
           echo "### Windows artifacts are unsigned" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "TRUSTED_SIGNING_ENDPOINT / _ACCOUNT / _PROFILE are unset, so signing was skipped. Set all three to turn it back on; nothing else needs changing." >> "$GITHUB_STEP_SUMMARY"
+          echo "TRUSTED_SIGNING_ENDPOINT / _ACCOUNT / _PROFILE and AZURE_TENANT_ID / _CLIENT_ID / _CLIENT_SECRET are unset, so signing was skipped. Set all six to turn it back on; nothing else needs changing." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Sign the installer
         if: env.SIGN == 'true'
-        uses: azure/trusted-signing-action@v2
+        uses: Azure/artifact-signing-action@v2
         with:
           endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
-          trusted-signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
           files-folder: ${{ env.DIST }}
           files-folder-filter: exe
           file-digest: SHA256

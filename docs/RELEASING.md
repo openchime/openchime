@@ -259,11 +259,16 @@ The rpm gap is tracked as an open issue rather than treated as settled.
 
 ## Windows signing is optional
 
-`SIGN` requires a real release **and** all three `TRUSTED_SIGNING_*` secrets to
-be non-empty.
+`SIGN` requires a real release **and** all three `TRUSTED_SIGNING_*` secrets
+**and** all three Azure service-principal secrets (`AZURE_TENANT_ID` /
+`_CLIENT_ID` / `_CLIENT_SECRET`) to be non-empty — six in total. The first
+three name the signing profile; the last three are what let the action's
+`DefaultAzureCredential` prove the caller may use it. Naming the profile
+without proving identity is not enough — the profile inputs are not a
+credential.
 
 The second half is load-bearing: gating on a real release alone would invoke
-`azure/trusted-signing-action` against an empty endpoint whenever credentials
+`Azure/artifact-signing-action` against an empty endpoint whenever credentials
 are absent. That fails `windows-package`, and `publish` needs it — so with no
 certificate a release would publish **nothing at all**: not the Windows
 installer, which cannot be signed, but also not apt, dnf, the image or the
@@ -271,7 +276,7 @@ GitHub release, none of which needs a certificate.
 
 Without the secrets the release ships an unsigned installer and says so twice: a
 `::warning::` plus step summary in the job, and a paragraph in the release notes
-for whoever meets SmartScreen. Setting the three secrets turns signing back on
+for whoever meets SmartScreen. Setting all six secrets turns signing back on
 with no edit.
 
 ## Downloads are pinned
@@ -308,6 +313,7 @@ before and after, and cannot fail the release — if the sync really did not wor
 | `REPO_SIGNING_KEY` | secret | signing the indexes and packages |
 | `WINGET_TOKEN` | secret | the WinGet submission PR |
 | `TRUSTED_SIGNING_ACCOUNT` / `_ENDPOINT` / `_PROFILE` | secret | Authenticode; **optional** |
+| `AZURE_TENANT_ID` / `_CLIENT_ID` / `_CLIENT_SECRET` | secret | Authenticode signing auth; **optional** |
 | `DIST_S3_ENDPOINT` / `DIST_BUCKET` | variable | rclone configuration |
 
 `GITHUB_TOKEN` covers GHCR; nothing extra is needed for the image. It is passed
